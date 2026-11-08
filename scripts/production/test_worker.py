@@ -28,7 +28,7 @@ from scripts.direct import assign, progress_history
 from scripts.direct.recorder_fixture import invoke_recorder
 from scripts.production.cli_fixture import invoke_cli
 from scripts.production import staff, worker, worker_admission
-from scripts.production.staff_test_support import fixture_member
+from scripts.production.staff_test_support import fixture_member, fixture_runtime_id, fixture_worker
 from scripts.lib import atomic_file, unit_runs
 from scripts.lib.test_models_registry import write_registry
 from scripts.lib.test_hang_guard import LauncherHangGuard
@@ -1576,6 +1576,216 @@ class WorkerCommandTests(unittest.TestCase):
         self.assertEqual(roles.call_count, 1)
         self.assertEqual(enumerated, [self.fixture.root])
         self.assertEqual(self.agent.submitted, [])
+
+    def recorded_list_fixture(self) -> tuple[staff.StaffRow, staff.StaffRow, list[Path]]:
+        first = self.fixture.worker("same-name")
+        manager = fixture_member("showrunner", name="TEST-other-manager")
+        second = fixture_worker("same-name", manager.id)
+        mesh_manager = fixture_member("showrunner", name="TEST-mesh-manager")
+        mesh = fixture_worker("mesh-worker", mesh_manager.id)
+        paths: list[Path] = []
+        for row, owner, status, family, transport in (
+                (first, self.fixture.parent, "active", "codex", "herdr"),
+                (second, manager, "completed", "claude", "herdr"),
+                (mesh, mesh_manager, "active", "codex", "mesh")):
+            run = self.fixture.root / ("recorded-" + owner.name)
+            path = run / unit_runs.STATE_FILE
+            atomic_file.write_text_atomic(path, json.dumps({"owner_staff_id": owner.id, "pass": {
+                row.name: {"worker_id": row.id, "worker_name": row.name, "kind": "review", "status": status,
+                           "activity": "Check the saved work.", "started_at": 10, "called_agent": {"family": family}}}}))
+            atomic_file.write_text_atomic(run / "worker_transport", transport + "\n")
+            paths.append(path)
+        atomic_file.write_text_atomic(accounts.groups_file(), json.dumps({"units": "claude2"}))
+        atomic_file.write_text_atomic(accounts.accounts_config_file(), json.dumps({"workers": "codex2"}))
+        return first, second, paths
+
+    def test_list_all_groups_pane_workers_by_manager_from_records(self) -> None:
+        first, second, _paths = self.recorded_list_fixture()
+        code, output, errors = self.command("list", "--json", "--all")
+        self.assertEqual(code, 0, errors)
+        rows = {str(row["id"]): row for row in cast(list[dict[str, object]], json.loads(output))}
+        self.assertEqual(set(rows), {first.id, second.id})
+        self.assertEqual([rows[row.id]["manager"] for row in (first, second)], [self.fixture.parent.name, "TEST-other-manager"])
+        self.assertEqual([rows[row.id]["state"] for row in (first, second)], ["active", "completed"])
+        self.assertEqual([rows[row.id]["work"] for row in (first, second)], ["busy", "idle"])
+        self.assertEqual([rows[row.id]["account"] for row in (first, second)], ["codex2", "claude2"])
+        for row, label in ((first, "codex2"), (second, "claude2")):
+            self.assertEqual(rows[row.id]["role"], "review")
+            self.assertEqual(rows[row.id]["activity"], "Check the saved work.")
+            self.assertEqual(rows[row.id]["home"], str(Path.home() / ("." + label)))
+
+    def test_list_all_keeps_a_refused_pass_over_an_equal_time_start_event(self) -> None:
+        first, _second, paths = self.recorded_list_fixture()
+        state = cast(dict[str, object], json.loads(paths[0].read_text()))
+        slots = cast(dict[str, dict[str, object]], state["pass"])
+        slots[first.name]["status"] = "refused"
+        history = self.fixture.root / "refused-history.jsonl"
+        state["history_file"] = str(history)
+        atomic_file.write_text_atomic(paths[0], json.dumps(state))
+        atomic_file.write_text_atomic(history, json.dumps({
+            "event_type": "pass_started", "worker_id": first.id, "worker_name": first.name,
+            "pass_kind": "review", "pass_activity": "Start the work.", "timestamp_epoch": 10,
+            "called_agent": {"family": "codex"}}) + "\n")
+        code, output, errors = self.command("list", "--json", "--all")
+        self.assertEqual(code, 0, errors)
+        rows = {str(row["id"]): row for row in cast(list[dict[str, object]], json.loads(output))}
+        self.assertEqual((rows[first.id]["state"], rows[first.id]["work"], rows[first.id]["activity"]),
+                         ("refused", "unknown", "Check the saved work."))
+
+    def test_list_all_resolves_the_legacy_unit_account_once_from_stored_history(self) -> None:
+        _first, second, _paths = self.recorded_list_fixture()
+        atomic_file.write_text_atomic(accounts.groups_file(), json.dumps({"units": "default"}))
+        atomic_file.write_text_atomic(accounts.roles_history_file(), json.dumps({
+            "role": "unit", "label": "default", "account_label": "claude2", "at": "2026-10-08T00:00:00Z"}) + "\n")
+        with patch.object(accounts, "resolve_history_label", wraps=accounts.resolve_history_label) as resolved:
+            code, output, errors = self.command("list", "--json", "--all")
+        self.assertEqual(code, 0, errors)
+        rows = {str(row["id"]): row for row in cast(list[dict[str, object]], json.loads(output))}
+        self.assertEqual(rows[second.id]["account"], "claude2")
+        self.assertEqual(rows[second.id]["home"], str(Path.home() / ".claude2"))
+        resolved.assert_called_once()
+
+    def test_list_all_keeps_valid_history_events_beside_an_incomplete_line(self) -> None:
+        first, second, paths = self.recorded_list_fixture()
+        history = self.fixture.root / "saved-history.jsonl"
+        for path in paths[:2]:
+            state = cast(dict[str, object], json.loads(path.read_text()))
+            state["history_file"] = str(history)
+            state["pass"] = {}
+            atomic_file.write_text_atomic(path, json.dumps(state))
+        events = [{"event_type": "pass_finished", "worker_id": row.id, "worker_name": row.name,
+                   "pass_kind": role, "status": "completed", "pass_activity": activity,
+                   "timestamp_epoch": stamp, "called_agent": {"family": family}}
+                  for row, role, activity, stamp, family in (
+                      (first, "impl", "Earlier work.", 1, "codex"),
+                      (first, "fix", "First saved activity.", 20, "codex"),
+                      (second, "review", "Second saved activity.", 30, "claude"))]
+        bad = '{"event_type":"pass_finished","worker_id":"' + str(first.id) + '",broken}\n'
+        atomic_file.write_text_atomic(history, json.dumps(events[0]) + "\n" + bad
+            + "".join(json.dumps(event) + "\n" for event in events[1:]) + bad)
+        original_open = Path.open
+        with (patch.object(json, "loads", wraps=json.loads) as decoded,
+              patch.object(Path, "open", autospec=True, side_effect=original_open) as opened):
+            code, output, errors = self.command("list", "--json", "--all")
+        self.assertEqual(code, 0, errors)
+        self.assertEqual(sum(isinstance(cast(object, call.args[0]), bytes) for call in decoded.call_args_list), 3)
+        self.assertEqual(sum(cast(tuple[object, ...], call.args)[0] == history for call in opened.call_args_list), 1)
+        rows = {str(row["id"]): row for row in cast(list[dict[str, object]], json.loads(output))}
+        self.assertEqual([rows[row.id]["state"] for row in (first, second)], ["completed", "completed"])
+        self.assertEqual([rows[row.id]["role"] for row in (first, second)], ["fix", "review"])
+        self.assertEqual([rows[row.id]["activity"] for row in (first, second)],
+                         ["First saved activity.", "Second saved activity."])
+
+    def test_list_all_resolves_a_fixed_manager_id_after_its_session_changes(self) -> None:
+        first, _second, paths = self.recorded_list_fixture()
+        state = cast(dict[str, object], json.loads(paths[0].read_text()))
+        _ = state.pop("owner_staff_id")
+        state["main_agent"] = {"session_id": self.fixture.parent.id}
+        state["pass"] = {}
+        history = self.fixture.root / "legacy-history.jsonl"
+        state["history_file"] = str(history)
+        atomic_file.write_text_atomic(paths[0], json.dumps(state))
+        atomic_file.write_text_atomic(history, json.dumps({
+            "event_type": "pass_finished", "worker_id": first.id, "pass_kind": "fix",
+            "pass_activity": "Repair the saved work.", "status": "completed", "timestamp_epoch": 20,
+            "called_agent": {"family": "codex"}}) + "\n")
+        _ = staff.update_current_session(self.fixture.parent.current_session, staff.StaffId(fixture_runtime_id("TEST-new-manager-session")))
+        code, output, errors = self.command("list", "--json", "--all")
+        self.assertEqual(code, 0, errors)
+        rows = {str(row["id"]): row for row in cast(list[dict[str, object]], json.loads(output))}
+        self.assertEqual((rows[first.id]["state"], rows[first.id]["role"], rows[first.id]["activity"]),
+                         ("completed", "fix", "Repair the saved work."))
+
+    def test_list_all_reads_only_the_needed_default_account_history_once(self) -> None:
+        _first, second, _paths = self.recorded_list_fixture()
+        atomic_file.write_text_atomic(accounts.groups_file(), json.dumps({"units": "default", "showrunners": "default"}))
+        history = accounts.roles_history_file()
+        atomic_file.write_text_atomic(history, "".join(json.dumps(row) + "\n" for row in (
+            {"role": "unit", "label": "default", "account_label": "claude2", "at": "2026-10-08T00:00:00Z"},
+            {"group": "showrunners", "label": "default", "account_label": "claude3", "at": "2026-10-08T00:00:00Z"})))
+        original = Path.read_text
+        reads: list[Path] = []
+        def read(path: Path, *args: object, **kwargs: object) -> str:
+            reads.append(path)
+            return original(path, *args, **kwargs)  # pyright: ignore[reportArgumentType]
+        with (patch.object(Path, "read_text", autospec=True, side_effect=read),
+              patch.object(accounts, "resolve_history_label", wraps=accounts.resolve_history_label) as resolve):
+            code, output, errors = self.command("list", "--json", "--all")
+        self.assertEqual(code, 0, errors)
+        rows = {str(row["id"]): row for row in cast(list[dict[str, object]], json.loads(output))}
+        self.assertEqual(rows[second.id]["account"], "claude2")
+        self.assertEqual(reads.count(history), 1)
+        self.assertEqual([call.args[0] for call in resolve.call_args_list], ["claude2"])
+
+    def test_list_all_bounds_a_history_when_another_worker_is_absent(self) -> None:
+        first, _second, paths = self.recorded_list_fixture()
+        absent = fixture_worker("absent-worker", self.fixture.parent.id,
+                                runtime_id="00000001-86a0-7000-8000-000000000001")
+        other = self.fixture.worker("other-history-worker")
+        state = cast(dict[str, object], json.loads(paths[0].read_text()))
+        history = self.fixture.root / "bounded-history.jsonl"
+        state["history_file"] = str(history)
+        state["pass"] = {}
+        atomic_file.write_text_atomic(paths[0], json.dumps(state))
+        other_history = self.fixture.root / "newer-history.jsonl"
+        other_run = self.fixture.root / "newer-run"
+        atomic_file.write_text_atomic(other_run / unit_runs.STATE_FILE, json.dumps({
+            "owner_staff_id": self.fixture.parent.id, "history_file": str(other_history), "pass": {}}))
+        atomic_file.write_text_atomic(other_run / "worker_transport", "herdr\n")
+        atomic_file.write_text_atomic(other_history, json.dumps({"event_type": "pass_started", "worker_id": other.id,
+            "pass_kind": "review", "timestamp_epoch": 200, "called_agent": {"family": "codex"}}) + "\n")
+        old = {"event_type": "pass_finished", "worker_id": first.id, "pass_kind": "impl",
+               "status": "completed", "timestamp_epoch": 1}
+        latest = {**old, "pass_kind": "fix", "timestamp_epoch": 20, "pass_activity": "Latest work."}
+        content = (json.dumps(old) + "\n" + (json.dumps({"event_type": "progress", "timestamp_epoch": 5,
+                   "text": "Earlier progress." * 100}) + "\n") * 200 + json.dumps(latest) + "\n").encode()
+        positions: list[int] = []
+        class HistoryReads(io.BytesIO):
+            @override
+            def read(self, size: int | None = -1) -> bytes:
+                positions.append(self.tell())
+                return super().read(size)
+        original = cast(Callable[..., object], Path.open)
+        def opened(path: Path, *args: object, **kwargs: object) -> object:
+            return HistoryReads(content) if path == history else original(path, *args, **kwargs)
+        with patch.object(Path, "open", autospec=True, side_effect=opened):
+            code, output, errors = self.command("list", "--json", "--all")
+        self.assertEqual(code, 0, errors)
+        rows = {str(row["id"]): row for row in cast(list[dict[str, object]], json.loads(output))}
+        self.assertEqual((rows[first.id]["role"], rows[first.id]["activity"]), ("fix", "Latest work."))
+        self.assertEqual(rows[absent.id]["state"], "unknown")
+        self.assertEqual(rows[other.id]["state"], "active")
+        self.assertTrue(positions)
+        self.assertGreater(min(positions), 0)
+
+    def test_list_all_needs_no_caller_staff_row(self) -> None:
+        _ = self.recorded_list_fixture()
+        with patch.object(staff, "runtime_id", side_effect=AssertionError("no caller lookup")):
+            code, output, errors = self.command("list", "--json", "--all")
+        self.assertEqual(code, 0, errors)
+        self.assertEqual(len(cast(list[object], json.loads(output))), 2)
+
+    def test_list_all_reads_each_record_once_without_live_calls(self) -> None:
+        _first, _second, paths = self.recorded_list_fixture()
+        reads: list[Path] = []
+        original = Path.read_text
+        def read(path: Path, *args: object, **kwargs: object) -> str:
+            reads.append(path)
+            return original(path, *args, **kwargs)  # pyright: ignore[reportArgumentType]
+        with (patch.object(Path, "read_text", side_effect=None, autospec=True) as reader,
+              patch.object(staff, "snapshot", side_effect=AssertionError("use the local record")),
+              patch.object(staff, "_found_backends", side_effect=AssertionError("no backend scan")),
+              patch.object(sessions, "running_sessions", side_effect=AssertionError("no process scan")),
+              patch.object(herdr, "Herdr", side_effect=AssertionError("no pane read")),
+              patch.object(herdr, "codex_conversations", side_effect=AssertionError("no thread scan")),
+              patch.object(subprocess, "run", side_effect=AssertionError("no live command"))):
+            reader.side_effect = read
+            code, output, errors = self.command("list", "--json", "--all")
+        self.assertEqual(code, 0, errors)
+        self.assertEqual(len(cast(list[object], json.loads(output))), 2)
+        for path in (*paths, staff.record_path(), accounts.accounts_config_file(),
+                     accounts.groups_file()):
+            self.assertEqual(reads.count(path), 1, str(path))
 
     def test_text_list_numbers_rows_and_keeps_the_worker_fields(self) -> None:
         self.assertEqual(self.command("list"), (0, "", ""))

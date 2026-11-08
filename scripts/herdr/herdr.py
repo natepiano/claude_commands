@@ -1690,10 +1690,14 @@ class Herdr:
         row = record.by_id(staff.StaffId(row_id))
         if row is None:
             raise HerdrFailure(f"no staff row {row_id!r}")
+        title = row.name
+        if row.kind == "worker":
+            agent_name = cast(Callable[[staff.StaffRow, str], str], import_module("scripts.herdr.worker_panes").agent_name)
+            title = agent_name(record.rows_by_id[cast(staff.ReportsTo, row.parent).id], row.name)
         with _LayoutLock(self.session):
             scan = self.scan_row_panes(record, self.listed("pane"))
             matches = scan.found.get(row.id, [])
-            changed = any([self._retitle(pane, row.name, tab=row.kind != "worker") for pane in matches])
+            changed = any([self._retitle(pane, title, tab=row.kind != "worker") for pane in matches])
             if changed:
                 if row.kind != "worker":
                     for workspace in dict.fromkeys(json_text(pane.get("workspace_id"), "workspace id") for pane in matches):

@@ -96,7 +96,7 @@ class HerdrTabTitleTests(unittest.TestCase):
             self.assertTrue(herdr_tab_title.sync({"session_id": unit.current_session}, environment))
         self.assertEqual(reads.call_count, 1)
         self.assertEqual(self.retitled, [("w3:p7", "render")])
-        self.assertIn("/showrunner:rename", errors.getvalue())
+        self.assertIn("/agents rename", errors.getvalue())
         self.assertIn("typed-name", errors.getvalue())
         self.assertIn("render", errors.getvalue())
         self.assertEqual(len(errors.getvalue().splitlines()), 1)
@@ -124,7 +124,7 @@ class HerdrTabTitleTests(unittest.TestCase):
             self.assertTrue(herdr_tab_title.sync({"session_id": runner.current_session},
                 {"HERDR_PANE_ID": "w3:p7", "HERDR_SESSION": "agents", "SHOWRUNNER_" + "UNIT_ID": "wrong-unit"}))
         self.assertEqual(self.retitled, [("w3:p7", runner.name)])
-        self.assertNotIn("/showrunner:rename", errors.getvalue())
+        self.assertNotIn("/agents rename", errors.getvalue())
         self.assertEqual(herdr_tab_title.current_name(runner.current_session), "typed-production")
         self.assertEqual((self.staff_file.read_bytes(), self.staff_file.stat().st_mtime_ns), before)
 
@@ -159,7 +159,7 @@ class HerdrTabTitleTests(unittest.TestCase):
 
         def rename(_client: herdr.Herdr, *arguments: str, deadline: float = math.inf) -> str:
             del deadline
-            self.assertEqual(arguments, ("pane", "rename", "w3:p7", worker.name))
+            self.assertEqual(arguments, ("pane", "rename", "w3:p7", "render-impl1"))
             pane["label"] = arguments[-1]
             return ""
 
@@ -175,7 +175,7 @@ class HerdrTabTitleTests(unittest.TestCase):
               redirect_stderr(io.StringIO()) as errors):
             self.assertTrue(herdr_tab_title.sync({"session_id": worker.current_session}, environment))
             self.assertFalse(herdr_tab_title.sync({"session_id": worker.current_session}, environment))
-        self.assertEqual(pane["label"], "impl1")
+        self.assertEqual(pane["label"], "render-impl1")
         self.assertEqual(writes.call_count, 1)
         self.assertEqual(self.retitled, [])
         self.assertEqual(errors.getvalue(), "")
@@ -209,7 +209,7 @@ class HerdrTabTitleTests(unittest.TestCase):
         self.assertEqual(reads.call_count, 1)
         self.assertIn("no staff row", errors.getvalue())
         self.assertIn(pending, errors.getvalue())
-        self.assertNotIn("/showrunner:rename", errors.getvalue())
+        self.assertNotIn("/agents rename", errors.getvalue())
         self.assertEqual(self.retitled, [("w3:p7", "typed-name")])
         self.assertEqual((self.staff_file.read_bytes(), self.staff_file.stat().st_mtime_ns), before)
         self.assertEqual((retained.read_bytes(), retained.stat().st_mtime_ns), retained_before)
@@ -218,7 +218,7 @@ class HerdrTabTitleTests(unittest.TestCase):
         with redirect_stderr(io.StringIO()) as errors:
             self.assertTrue(herdr_tab_title.sync({"session_id": pending}, environment))
         self.assertEqual(self.retitled[-1], ("w3:p7", unit.name))
-        self.assertIn("/showrunner:rename", errors.getvalue())
+        self.assertIn("/agents rename", errors.getvalue())
         self.assertEqual((self.staff_file.read_bytes(), self.staff_file.stat().st_mtime_ns), completed)
         self.assertEqual((retained.read_bytes(), retained.stat().st_mtime_ns), retained_before)
 

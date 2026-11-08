@@ -4,6 +4,37 @@ Code reviews now use the unit's persistent `review` and `review2` workers
 through `assign.sh --role review`. Any pool maintenance paths described below
 remain only for the pending archive cleanup; they do not dispatch new reviews.
 
+## Failed module output
+
+Each merge gate record keeps a gzip log for each failed module attempt.
+The first failure keeps its log when the retry passes.
+Passing attempts and attempts stopped for a hold have an empty `log` field.
+The gate removes each temporary job folder after reading its output.
+
+`gate_modules.log` gives the saved path relative to `BUILDLOG_DIR`.
+The default build log root is `~/.local/state/buildlog`.
+Find the path with this command:
+
+```sh
+buildlog query "SELECT run_id, suite, module, attempt, log FROM gate_modules WHERE log IS NOT NULL AND log != '' ORDER BY started_at DESC LIMIT 20"
+```
+
+Set `log` to a path from that result, then read the output:
+
+```sh
+log='natedev/logs/YYYY-MM/<record-id>.log.gz'
+zcat "${BUILDLOG_DIR:-$HOME/.local/state/buildlog}/$log"
+```
+
+`GATE_FAILURE_LOG_KIB` in `config/test_times.conf` limits the saved tail to 64 KiB by default.
+The writer reads this setting for each record that has failed attempts.
+The first line states how many bytes the writer cut from the start.
+That line is outside the limit.
+A failed log write reports an error and preserves the gate verdict.
+These logs have no pruning job.
+They remain until someone removes them.
+Older records without a `log` field have SQL NULL in that column.
+
 ## Cloud gate route
 
 Merge gates and targeted tests use one fresh Spot instance for each attempt after the user deploys the gate resources.

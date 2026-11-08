@@ -5194,7 +5194,6 @@ class RunPlaceTests(unittest.TestCase):
         from scripts.aws_target.config import ControlSettings, read_control_settings
         from scripts.build_queue import head_facts
         from scripts.build_queue.queue_lines import plain
-        from scripts.lib import conf
 
         with AdmissionFixture() as fixture:
             run = fixture.run_owner()

@@ -346,6 +346,7 @@ class FastTrackTests(MergeCheckpointFixture):
     def move_main_during_check(self) -> str:
         writer = self.control / "writer"
         _ = self.git("clone", "-b", "main", str(self.origin), str(writer), cwd=self.root)
+        _ = self.git("config", "maintenance.auto", "false", cwd=writer)
         _ = self.git("config", "user.name", "Concurrent Writer", cwd=writer)
         _ = self.git("config", "user.email", "writer@example.invalid", cwd=writer)
         self.write(writer, "concurrent.txt", "another fix\n")
@@ -1098,7 +1099,7 @@ class FastTrackTests(MergeCheckpointFixture):
                       "scripts/production/staff_sources.py", "scripts/production/add_unit.py",
                       "scripts/production/add_showrunner.py", "scripts/shutdown/shutdown.py",
                       "scripts/production/promote_showrunner.py", "scripts/production/transfer_unit.py",
-                      "scripts/accounts/moves.py", "scripts/production/rename.py",
+                      "scripts/accounts/moves.py", "scripts/shutdown/shutdown.py",
                       "scripts/shutdown/shutdown.py", "scripts/production/merge_gate.py",
                       "scripts/production/merge_checkpoint.py", "scripts/direct/verify.sh",
                       "scripts/production/build_hold.py", "scripts/production/fast_track.py",

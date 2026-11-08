@@ -459,7 +459,7 @@ At the start and on every resume, run:
 This session's name is written nowhere: the update timer is addressed to its
 Claude session id, and every tool looks the name up from that when it needs it.
 The showrunner staff name must be this session's name (user, 2026-10-27). Register
-warns for a session with another name, names the `/showrunner:rename` to run,
+warns for a session with another name, names the `/agents rename` to run,
 and registers it: an account move restarts a showrunner on its own, so register
 must not fail. `attach` refuses that name for a new production.
 `add_showrunner.py` and `promote_showrunner.py` use the showrunner staff name for a new session.
