@@ -731,8 +731,6 @@ def execute_herdr(args: Arguments, run: Path, phase: str, prompt: Path,
     with log.open("a") as output:
         result = subprocess.run(command, env=env, text=True, stdout=output, stderr=subprocess.STDOUT)
     if result.returncode == 0:
-        env["UNIT_PASS_OWNER"] = "launcher"
-        _ = call([PYTHON, PROGRESS, "finish-pass", "--session-dir", str(run), "--status", "completed"], env)
         write_text_atomic(summary, reply.read_text())
         if args.summary:
             write_text_atomic(Path(args.summary), summary.read_text())
@@ -921,7 +919,7 @@ def execute_consultation(args: Arguments, cwd: Path) -> int:
     return result
 
 
-def execute_durable(args: Arguments, env: dict[str, str]) -> int:
+def execute_durable(args: Arguments) -> int:
     """Start or dispatch a durable role through its explicit target."""
     name = staff.WorkerName.parse(args.to or args.new_worker)
     role = cast(staff.WorkerRole, args.policy)
@@ -937,13 +935,10 @@ def execute_durable(args: Arguments, env: dict[str, str]) -> int:
     if not prompt.is_file() or not args.session_dir or not args.phase:
         refuse("durable dispatch requires --prompt, --session-dir, and --phase")
     result = staff_worker.dispatch(target.parent, name, role, prompt, session_dir=Path(args.session_dir),
-        slot=name.value, phase=args.phase, kind="astra", reply=Path(args.summary), policy=policy,
+        slot=name.value, phase=args.phase, kind="astra",
+        reply=Path(args.summary) if args.summary else staff_worker.REPLY_BESIDE_PROMPT, policy=policy,
         launcher_command=["bash", str(SCRIPTS / "assign.sh"), *sys.argv[1:]])
-    if result:
-        return result
-    env.update(UNIT_TEAM_ROLE=name.value, UNIT_PASS_OWNER="launcher")
-    return call([PYTHON, PROGRESS, "finish-pass", "--session-dir", args.session_dir,
-                 "--status", "completed"], env, check=False).returncode
+    return result
 
 
 def execute_astra_review_herdr(args: Arguments, run: Path, cwd: Path, prompt: Path,
@@ -974,13 +969,11 @@ def execute_astra_review_herdr(args: Arguments, run: Path, cwd: Path, prompt: Pa
             reply=Path(args.summary), policy=policy, started=current,
             launcher_command=["bash", str(SCRIPTS / "assign.sh"), *sys.argv[1:]])
         env.update(UNIT_PASS_OWNER="launcher", UNIT_TEAM_ROLE=args.new_worker)
-        finished = subprocess.run([PYTHON, PROGRESS, "finish-pass", "--session-dir", str(run),
-                       "--status", "error" if result else "completed"], env=env, text=True,
-                       stderr=subprocess.STDOUT, check=False).returncode
         if result:
+            _ = subprocess.run([PYTHON, PROGRESS, "finish-pass", "--session-dir", str(run),
+                                "--status", "error"], env=env, text=True,
+                               stderr=subprocess.STDOUT, check=False)
             print(f"assign.sh: reviewer dispatch exited {result}; pending input is retained", flush=True)
-        else:
-            result = finished
     except (OSError, ValueError) as error:
         print(f"assign.sh: reviewer role unavailable: {error}", file=sys.stderr)
         result = 1
@@ -1104,7 +1097,7 @@ def main() -> int:
             refuse("--cwd must be a directory")
         return execute_consultation(args, cwd)
     if args.target == "durable-design-role":
-        return execute_durable(args, env)
+        return execute_durable(args)
     if args.operation in RECOVERY_OPERATIONS:
         try:
             admitted = worker_admission.admit(args.to, Path(args.session_dir).expanduser().resolve())

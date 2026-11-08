@@ -3579,7 +3579,7 @@ Test rows: a new launch with a foreign rollout open publishes the pane's reporte
 
 `worker_admission.transcript_entry` reads Claude `api-request-blob` records (`message.role` `user`, text holding the whole request) as user turns, so `transcript_receipt` stops reading the reply after one, and a Claude pass gives exit 3 with its DONE line in the transcript. Fix: read only Claude records whose top-level `type` is `user` or `assistant`. Acceptance adds the Claude part of the 28a proof (the pass completes with no second dispatch) and closes `answerproof` (w16:p6A) with `worker_panes.py close --interrupt` (its newest pass is `error`, which a plain close refuses; add no close policy). Work Order: written at phase start.
 
-### Phase 28f — A done worker exits and its pane closes  · status: todo
+### Phase 28f — A done worker exits and its pane closes  · status: done
 
 **Depends on:** Phase 28b (both edit `scripts/herdr/worker_panes.py` and `scripts/production/worker.py`). Phase 28e moved into Phase 34. User via sdlc [a4f3b7b5], 2026-11-08: "done workers need to exited and the pane removed".
 
