@@ -237,7 +237,7 @@ class RustReleaseTests(unittest.TestCase):
               mock.patch.dict(os.environ, {"RELEASE_SEND_EXIT": "0"})):
             self.assertTrue(rust_release.send_release_text(render("rust.passed", version="1.100.0", pin="1.99.0")))
             self.assertEqual(run.call_args.args[0], command)
-            self.assertEqual(run.call_args.kwargs["timeout"], 225)
+            self.assertEqual(run.call_args.kwargs["timeout"], 238)
         with (mock.patch.object(session_send, "SEND_SCRIPT", sender),
               mock.patch.object(review, "user_send_seconds", return_value=85),
               mock.patch.dict(os.environ, {"RELEASE_SEND_EXIT": "3"})):
@@ -263,7 +263,7 @@ class RustReleaseTests(unittest.TestCase):
         with (mock.patch.object(review, "NOTIFY_CONFIG", config),
               mock.patch.object(subprocess, "run", return_value=done) as run):
             self.assertTrue(rust_release.send_release_text(render("rust.passed", version="1.100.0", pin="1.99.0")))
-            self.assertEqual(run.call_args.kwargs["timeout"], review.user_send_seconds() + 140)
+            self.assertEqual(run.call_args.kwargs["timeout"], review.user_send_seconds() + 153)
 
     def test_newer_stable_is_fetched_once_per_local_day(self) -> None:
         fetches: list[str] = []
