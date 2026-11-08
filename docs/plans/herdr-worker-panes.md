@@ -3362,7 +3362,7 @@ Live check on 2026-11-07 22:56 EST: herdr reported no session for morty's pane w
 7. `worker.py restore` touches only stopped workers: it restarted the busy `cargo-liner-handler-expand-impl` in the middle of a repair.
 8. The launch claim reads `phase_baseline` in the repository where the phase works, not only `--cwd` (cargo-liner tile [a55f755d]: a phase in a separate git copy fails with `names no single commit`).
 
-### Phase 38 — One worker's assign reads only its own pane and row · status: todo
+### Phase 38 — One worker's assign reads only its own pane and row · status: done
 
 **Depends on:** Phase 37 (it runs right after the Phase 37 checkpoint, before Phase 29; sdlc [b9d4c514], 2026-11-07).
 
