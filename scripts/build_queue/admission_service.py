@@ -22,6 +22,7 @@ import struct
 import subprocess
 import sys
 import threading
+import time
 from types import MappingProxyType
 from typing import Callable, Protocol, cast
 
@@ -1924,6 +1925,27 @@ class AdmissionServer:
 
     def handle_request(self, request: wire.Request, connection: Connection | NoConnection = NO_CONNECTION
                        ) -> list[wire.Reply]:
+        started, cpu_started = self.clock.monotonic(), time.process_time()
+        try:
+            return self._handle_request(request, connection)
+        finally:
+            self._log_request_timing(request, started, cpu_started)
+
+    def _log_request_timing(self, request: wire.Request, started: float, cpu_started: float) -> None:
+        try:
+            with conf.diagnostics(report=False) as messages:
+                limit = conf.read("build_admission").number("request_slow_seconds")
+        except conf.Unusable as error:
+            records.warn_configuration_diagnostics((records.ConfigurationDiagnostic(str(error)),))
+        else:
+            records.warn_configuration_diagnostics(records.configuration_diagnostics(messages))
+            wall, cpu = self.clock.monotonic() - started, time.process_time() - cpu_started
+            if wall > limit:
+                print(f"admission request {type(request).__name__}: wall={wall:.3f}s cpu={cpu:.3f}s",
+                      file=sys.stderr, flush=True)
+
+    def _handle_request(self, request: wire.Request, connection: Connection | NoConnection
+                        ) -> list[wire.Reply]:
         refusal = self._authorize(request, peer_uid(connection))
         if refusal:
             return [wire.Refused(refusal)]

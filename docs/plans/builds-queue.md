@@ -673,6 +673,16 @@ Phase 18c makes the staff row id the copy owner, under its `RoleOwner` boundary 
 
 **Workers:** 1 writer, 1 tester. **Gate:** targeted test, basedpyright 0/0/0, adversary review.
 
+### Phase 29 — A gate with no running module waits in line for a CPU slot  · status: done
+
+The stall of 2026-11-07 18:20 to 19:20: six merge gates were admitted by the memory queue. The fix-rounds gate ran 60 minutes with no module, while a gate that started 30 minutes later held 11 CPU slots. Each gate takes a slot from the shared pool `/dev/steve` (32 slots) before each module (`merge_gate.py` `SharedCPUPool.try_acquire`). When no slot is free, the gate sleeps 0.05 s and tries again, and it logs nothing. cargo and rustc wait in a blocking read, so the pool gives them each freed slot first. Builds ruled (a) and the request timing on 2026-11-07 19:30; it ruled out a cap on full gates.
+
+1. **Wait in line.** A gate with no running module and a pending module waits in a blocking read on the pool, in line with cargo. A gate with a running module keeps its present non-blocking try, so it still samples memory and collects results.
+2. **One wait line.** The gate prints `waits for a CPU slot` once when such a wait starts, and the wait time when it ends.
+3. **Signals.** A stop signal during the wait stops the gate at once and returns every slot it holds. A slot read just as the signal comes is returned.
+4. **Request timing.** `admission_service.py` logs the wall time and the CPU time of each request that takes longer than a configured limit (new key; start 0.25 s). The log line names the request kind. The next "no answer in 0.5 s" then shows whether the time goes to CPU work in the service or to a wait.
+5. **Proof.** Tests with a fake pool: a gate with no running module blocks and starts its module when a slot comes back; the wait line prints once; a stop signal during the wait returns the slots. A service test logs a slow request and logs no fast one.
+
 ### Phase 10m — The build page is a repository tool and shows leftover-process ages  · status: todo
 
 **Depends on:** 10z (the page reads the room evidence 10z publishes) and report-unit Phase 15 on builds (builds ruling, 2026-11-05). report Phase 15 builds one typed provider, `charts.page_data(days, n=3) -> PageData | IndexUnavailable`, and starts at once. report-unit waits for 10m only in its Phase 26.

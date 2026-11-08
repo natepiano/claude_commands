@@ -5216,6 +5216,46 @@ class RunPlaceTests(unittest.TestCase):
 
 
 class AdmissionConfigurationTests(unittest.TestCase):
+    def test_slow_requests_log_wall_cpu_and_kind_but_fast_requests_do_not(self) -> None:
+        for slow_configuration in (False, True):
+            with self.subTest(slow_configuration=slow_configuration), AdmissionFixture() as fixture:
+                write_memory_config(fixture.root / "build_admission.conf", request_slow_seconds="0.25")
+                durations = iter((0.5, 0.1))
+                read = conf.read
+
+                def measured(request: wire.Request, connection: service.Connection | service.NoConnection) -> list[wire.Reply]:
+                    del request, connection
+                    if not slow_configuration:
+                        fixture.clock.advance(next(durations))
+                    return [wire.BuildHistoryReply(0)]
+
+                def configuration(stem: str) -> conf.ConfigRead:
+                    if slow_configuration:
+                        fixture.clock.advance(next(durations))
+                    return read(stem)
+
+                output = io.StringIO()
+                with mock.patch.object(fixture.server, "_handle_request", side_effect=measured), \
+                        mock.patch.object(conf, "read", side_effect=configuration), \
+                        mock.patch.object(time, "process_time", side_effect=(2.0, 2.125, 3.0, 3.01)), \
+                        redirect_stderr(output):
+                    for _ in range(2):
+                        self.assertEqual(fixture.server.handle_request(wire.BuildHistoryRequest()), [wire.BuildHistoryReply(0)])
+                self.assertEqual(output.getvalue(), "admission request BuildHistoryRequest: wall=0.500s cpu=0.125s\n")
+
+    def test_bad_request_timing_limit_logs_once_and_keeps_requests_and_cleanup_available(self) -> None:
+        with AdmissionFixture() as fixture:
+            grant = only_admitted(fixture.server.handle_request(fixture.request()))
+            write_memory_config(fixture.root / "build_admission.conf", request_slow_seconds="invalid")
+            output = io.StringIO()
+            with mock.patch.object(records, "_warned_configuration_diagnostics", set[records.ConfigurationDiagnostic]()), \
+                    redirect_stderr(output):
+                for _ in range(2):
+                    self.assertIsInstance(fixture.connect(wire.BuildHistoryRequest()).replies()[0], wire.BuildHistoryReply)
+                fixture.release(grant)
+            self.assertEqual(output.getvalue().count("request_slow_seconds"), 1)
+            self.assertFalse(fixture.server.reservations)
+
 
     def test_ledger_grants_restore_replay_and_release_without_usable_configuration(self) -> None:
         with AdmissionFixture() as fixture:
@@ -5240,7 +5280,8 @@ class AdmissionConfigurationTests(unittest.TestCase):
                 fixture.allow_next_start()
             self.assertEqual(only_admitted(fixture.server.handle_request(saved_request)), saved_grant)
             self.assertEqual(fixture.server.ledger["absent"].reply, wire.Ok())
-            with mock.patch.object(conf, "read", side_effect=AssertionError("release read config")):
+            with mock.patch.object(fixture.server, "_log_request_timing"), \
+                    mock.patch.object(conf, "read", side_effect=AssertionError("release read config")):
                 for grant in (expected, saved_grant):
                     self.assertEqual(fixture.server.handle_request(
                         wire.ReleaseRequest(f"release-{grant.reservation}", grant.reservation, 0)), [wire.Ok()])
@@ -5582,7 +5623,8 @@ class AdmissionConfigurationTests(unittest.TestCase):
             granted = only_admitted(fixture.server.handle_request(request))
             fixture.scoped_peak(granted, 7 * GIB)
             write_memory_config(fixture.root / "build_admission.conf", replay_retention_seconds="invalid")
-            with mock.patch.object(conf, "read", side_effect=AssertionError("release read config")):
+            with mock.patch.object(fixture.server, "_log_request_timing"), \
+                    mock.patch.object(conf, "read", side_effect=AssertionError("release read config")):
                 self.assertEqual(fixture.server.handle_request(wire.ReleaseRequest("release-bad-config", granted.reservation, 137)), [wire.Ok()])
                 fixture.server.persist()
             self.assertNotIn(request.episode, fixture.server.reservations)
