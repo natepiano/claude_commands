@@ -14,17 +14,19 @@ question has fallen due, so a render runs no Python while nothing changed. The c
 The cache's time is when the reading began, so a file changed while it ran is newer than it.
 """
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import os
 import sys
 import time
 from pathlib import Path
 
-SCRIPTS = Path(__file__).resolve().parent.parent
-sys.path[:0] = [str(SCRIPTS / "hooks"), str(SCRIPTS / "production")]
-import showrunner_footer  # noqa: E402
+from scripts.hooks import showrunner_footer  # noqa: E402
 from scripts.production import staff
-from update_registration import QuestionStaff
+from scripts.production.update_registration import QuestionStaff
 
 
 def cache_path(name: str) -> Path:
@@ -50,8 +52,8 @@ def row(instance: Path, *, identities: QuestionStaff | None = None) -> tuple[str
         sources.append(doc)
     if production is None:
         return "", "", sources
-    import footer_counts
-    from update_registration import QuestionStaff, RegistrationFailure
+    from scripts.production import footer_counts
+    from scripts.production.update_registration import QuestionStaff, RegistrationFailure
 
     identities = QuestionStaff.read() if identities is None else identities
     sources.extend(footer_counts.sources(production.doc, identities=identities))

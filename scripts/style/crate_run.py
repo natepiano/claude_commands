@@ -1,10 +1,14 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
 """Identified serial crate batches, entered through bulk_run --crate.
 
 Canonical Git and the ledger own claims and publication. Private checkouts own edits and
 validation. The existing workspace validation and exact-tree test proof are unchanged.
 """
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import fcntl
 import hashlib
@@ -21,17 +25,17 @@ from enum import StrEnum
 from pathlib import Path
 from typing import NotRequired, Protocol, TypedDict, cast
 
-import bulk_rename as bulk
-import bulk_run as run
-import coverage_report
+from scripts.style import bulk_rename as bulk
+from scripts.style import bulk_run as run
+from scripts.style import coverage_report
 from scripts.lib import copy_record, scratch
-import rules
-import style_ledger as ledger_api
-import style_proposals
-import style_footprint
-import style_sync
+from scripts.style import rules
+from scripts.style import style_ledger as ledger_api
+from scripts.style import style_proposals
+from scripts.style import style_footprint
+from scripts.style import style_sync
 from scripts.copies import copies
-from style_ledger import _path_attributes  # pyright: ignore[reportPrivateUsage]
+from scripts.style.style_ledger import _path_attributes  # pyright: ignore[reportPrivateUsage]
 
 
 class CrateStage(StrEnum):
@@ -813,6 +817,7 @@ class CrateRun:
                 if isinstance(skipped, run.OpenTicketRefusal):
                     directory = style_proposals.crate_for(directories, skipped.path)
                     held_by_crate[directory][skipped.finding_id] = list(skipped.ticket_ids)
+            checkout_parent = copies.workspace_path(self.owner, self.repo, f"crate-{self.run_id}.selected").parent
             for member in members:
                 if not re.fullmatch(r"[A-Za-z0-9_-]+", member.package_name):
                     raise bulk.BulkRenameError("unsafe package name")
@@ -829,8 +834,7 @@ class CrateRun:
                     frozen.append({"id": finding.finding_id, "path": finding.path, "proposal": proposal,
                                    "rule_blob": finding.rule_blob, "evidence": evidence(finding),
                                    "proposal_sha256": hashlib.sha256(Path(proposal).read_bytes()).hexdigest()})
-                checkout = copies.workspace_path(self.owner, self.repo,
-                                                 f"crate-{self.run_id}.{member.package_name}")
+                checkout = checkout_parent / f"crate-{self.run_id}.{member.package_name}"
                 records[member.package_name] = {
                     "directory": member.directory, "checkout": str(checkout),
                     "branch": f"refs/heads/style-crate/{self.run_id}/workers/{member.package_name}",

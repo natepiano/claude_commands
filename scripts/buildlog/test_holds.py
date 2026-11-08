@@ -11,13 +11,13 @@ from pathlib import Path
 from typing import Literal, TypedDict, cast, override
 from unittest.mock import patch
 
-import holds
-import build_hold
-import mac_test
-from user_zone import user_zone
-import index
-import store
-from test_index import Record, point_root_at
+from scripts.buildlog import holds
+from scripts.build_hold import build_hold
+from scripts.mac_test import mac_test
+from scripts.lib.user_zone import user_zone
+from scripts.buildlog import index
+from scripts.buildlog import store
+from scripts.buildlog.test_index import Record, point_root_at
 import tempfile
 
 NOW = datetime(2026, 10, 12, 16, tzinfo=UTC)

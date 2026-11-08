@@ -1,8 +1,12 @@
 """Repair known reasons an eligible verify call waits while the Mac is idle."""
 
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
-
+from collections.abc import Iterable, Mapping
 import fcntl
 import hashlib
 import json
@@ -13,44 +17,23 @@ import subprocess
 import sys
 import time
 from dataclasses import asdict, dataclass, replace
+from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, cast
 
-import store
+from scripts.buildlog import store
 
 SCRIPTS = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(SCRIPTS.parent))
-sys.path.insert(0, str(SCRIPTS / "message"))
-if TYPE_CHECKING:
-    from ..message import send_budget, session_send
-else:
-    import send_budget
-    from scripts.message import session_send
-sys.path.insert(0, str(SCRIPTS / "mac_test"))
-sys.path.insert(0, str(SCRIPTS / "notify"))
 
 if TYPE_CHECKING:
-    from ..lint import memory_admit
-    from ..build_queue import admission_client, admission_protocol
-    from ..direct import step_record
-    from ..mac_test import mac_test
-    from ..notify import push_texts
-    from ..notify.push_catalog import mac_idle_reservation
-    from . import mac_idle_alert
-    from ..lib.process_failure import failure_detail
-    from ..lib.user_zone import user_zone
-    from ..message.unit_labels import unit_labels_for
-else:
     from scripts.lint import memory_admit
-    from scripts.build_queue import admission_client, admission_protocol
     from scripts.direct import step_record
-    import mac_test
-    import push_texts
-    from scripts.notify.push_catalog import mac_idle_reservation
+    from scripts.mac_test import mac_test
     from scripts.buildlog import mac_idle_alert
-    from scripts.lib.process_failure import failure_detail
-    from scripts.lib.user_zone import user_zone
-    from scripts.message.unit_labels import unit_labels_for
+    from scripts.message.unit_labels import UnitLabels
+else:
+    from scripts.direct import step_record
+    from scripts.buildlog import mac_idle_alert
 
 SESSION_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]*")
 
@@ -103,6 +86,7 @@ class VerifyCall:
     local_reason: str = ""
     kind: str = "test"
     wait_state: step_record.StepState = step_record.StepState.WAITING_MAC
+    updated: str = ""
 
 
 def read_record(path: Path) -> dict[str, object]:
@@ -173,6 +157,8 @@ class AdmissionQueryFailed:
 
 
 def admission_waiters() -> AdmissionWaiters | AdmissionQueryFailed:
+    from scripts.build_queue import admission_client, admission_protocol
+
     try:
         return AdmissionWaiters([row for _, row in admission_client.view().ordered])
     except admission_protocol.AdmissionUnavailable as error:
@@ -233,7 +219,8 @@ def waiting_calls(paths: MacIdlePaths, live: dict[int, LiveProcess]) -> tuple[Ve
             continue
         if not isinstance(record, step_record.StepRecord):
             continue
-        disk_excluded = isinstance(record.runs_on, step_record.NatedevOnly) and record.runs_on.reason == "disk"
+        disk_excluded = (isinstance(record.runs_on, step_record.AnyTarget) and bool(record.mac_disk_exclusions)) or (
+            isinstance(record.runs_on, step_record.NatedevOnly) and record.runs_on.reason == "disk")
         if disk_excluded:
             if record.state not in (step_record.StepState.WAITING_HOLD, step_record.StepState.WAITING_MAC,
                                     step_record.StepState.ON_NATEDEV):
@@ -261,7 +248,8 @@ def waiting_calls(paths: MacIdlePaths, live: dict[int, LiveProcess]) -> tuple[Ve
         if call.local_reason and call.local_reason != "disk" and not disk_excluded:
             continue
         calls.append(replace(call, repo=str(record.repo), package=step_record.package_name(record.package), kind=record.kind,
-                             wait_state=record.state, local_reason="disk" if disk_excluded else call.local_reason))
+                             wait_state=record.state, updated=record.updated,
+                             local_reason="disk" if disk_excluded else call.local_reason))
     if diagnostics != old_diagnostics:
         write_record(paths.state / "step_diagnostics.json", diagnostics)
     return tuple(calls)
@@ -296,8 +284,18 @@ def outage_repeat_minutes(since: float, now: float, settings: mac_idle_alert.Mac
 
 
 def notify_showrunner(text: str, *, identity: OutageMessage | RepairMessage = REPAIR_MESSAGE) -> bool:
+    if TYPE_CHECKING:
+        from scripts.message import send_budget, session_send
+        from scripts.notify import push_texts
+        from scripts.lib.process_failure import failure_detail
+    else:
+        from scripts.message import send_budget
+        from scripts.message import session_send
+        from scripts.notify import push_texts
+        from scripts.lib.process_failure import failure_detail
+
     try:
-        result = subprocess.run([sys.executable, str(SCRIPTS / "production/showrunners.py"), "address", "builds"],
+        result = subprocess.run([str(SCRIPTS / "lib/py"), str(SCRIPTS / "production/showrunners.py"), "address", "builds"],
                                 capture_output=True, text=True, timeout=send_budget.seconds(), check=False)
         address = result.stdout.strip()
         if result.returncode != 0 or not address:
@@ -356,6 +354,8 @@ class MacStateUnreadable:
 
 def mac_work(paths: MacIdlePaths, now: float) -> NatedevJobOnMac | IdleMac | MacUnreachable | MacStateUnreadable:
     """Use the claim owner's live rule and its saved work reading; never contact the Mac."""
+    from scripts.mac_test import mac_test
+
     try:
         # read_run is the single JSON boundary for claim records.
         try:
@@ -391,6 +391,8 @@ def mac_work(paths: MacIdlePaths, now: float) -> NatedevJobOnMac | IdleMac | Mac
 def notify_outage(paths: MacIdlePaths, saved: mac_idle_alert.SavedAlert, now: float,
                   calls: tuple[VerifyCall, ...], live: dict[int, LiveProcess],
                   admission: AdmissionWaiters | AdmissionQueryFailed) -> bool:
+    from scripts.lib.user_zone import user_zone
+
     line = mac_idle_alert.alert_line(paths.state / "alert.json", now, user_zone())
     waiters = admission.waiters if isinstance(admission, AdmissionWaiters) else []
     text = (line or "") + "".join(
@@ -401,6 +403,11 @@ def notify_outage(paths: MacIdlePaths, saved: mac_idle_alert.SavedAlert, now: fl
 
 
 def push_outage(saved: mac_idle_alert.SavedAlert, now: float) -> bool:
+    from scripts.notify import push_texts
+    from scripts.notify.push_catalog import mac_idle_reservation
+    from scripts.lib.process_failure import failure_detail
+    from scripts.lib.user_zone import user_zone
+
     holder, detail = saved["holder"] or "none", saved["detail"] or "no block and no claim"
     blocked = saved["cause"] == "blocked"
     clears = (f"/build:mac unblock by {holder}" if blocked else f"release of the idle claim {detail}"
@@ -438,8 +445,38 @@ def record_case(call: VerifyCall, cause: str, action: str, wait: str, now: float
         "session": call.session, "repo": call.repo, "package": call.package, "wait": wait, "cause": cause, "action": action})
 
 
+def unit_labels_for(session_ids: Iterable[str], environment: Mapping[str, str]) -> dict[str, UnitLabels]:
+    """Load holder labels when the watch needs them. Keep the test patch point."""
+    from scripts.message import unit_labels
+
+    return unit_labels.unit_labels_for(session_ids, environment)
+
+
+def calls_past_wait_limit(paths: MacIdlePaths, calls: tuple[VerifyCall, ...], now: float,
+                         alert_seconds: float) -> tuple[VerifyCall, ...]:
+    path = paths.state / "wait_starts.json"
+    previous = read_record(path)
+    starts: dict[str, str] = {}
+    ready: list[VerifyCall] = []
+    for call in calls:
+        identity = json.dumps([call.call_id, call.start])
+        starts[identity] = str(previous.get(identity, call.updated))
+        try:
+            started = datetime.fromisoformat(starts[identity].replace("Z", "+00:00")).timestamp()
+        except ValueError:
+            ready.append(call)
+            continue
+        if now - started >= alert_seconds:
+            ready.append(call)
+    if starts != previous:
+        write_record(path, starts)
+    return tuple(ready)
+
+
 def watch_once(paths: MacIdlePaths, now: float, monotonic: float) -> None:
     """Save the one idle reading, notify its outage and repair free-Mac waits."""
+    from scripts.mac_test import mac_test
+
     paths.state.mkdir(parents=True, exist_ok=True)
     with (paths.state / "watch.lock").open("a+") as lock:
         try:
@@ -451,6 +488,8 @@ def watch_once(paths: MacIdlePaths, now: float, monotonic: float) -> None:
         has_steps = any(step_record.record_directory().glob("*.json"))
         live: dict[int, LiveProcess] = {}
         calls = waiting_calls(paths, live) if has_steps else ()
+        settings = mac_idle_alert.read_idle_config()
+        calls = calls_past_wait_limit(paths, calls, now, settings.alert_seconds)
         previous = mac_idle_alert.read_alert(paths.state / "alert.json")
         saved: mac_idle_alert.SavedAlert = {"version": 1, "written": now, "state": "busy", "since": 0.0,
             "waiting": len(calls), "cause": "", "holder": "", "detail": "", "until": 0.0,
@@ -499,7 +538,6 @@ def watch_once(paths: MacIdlePaths, now: float, monotonic: float) -> None:
                 saved["cause"] = "disk"
             saved["detail"] = (saved["detail"] + "; " if saved["detail"] else "") + "Mac disk exclusion"
         write_record(paths.state / "alert.json", saved)
-        settings = mac_idle_alert.read_idle_config()
         if not isinstance(reading, IdleMac) or now - saved["since"] < settings.alert_seconds or not calls:
             return
         # Only wait evidence and repairs need the process ancestry.

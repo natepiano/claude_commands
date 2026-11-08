@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
 """Claude gets one phone reminder when a low account lacks an account-move entry.
 
 Codex refusal reruns reach only the stopped command's director; other notices are logged.
@@ -7,6 +7,10 @@ its episode silently; /quota_refresh still refreshes readings.
 """
 
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import fcntl
 import asyncio
@@ -27,12 +31,11 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, NamedTuple, NotRequired, Protocol, TypedDict, cast
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
-import process_group
+from scripts.lib import process_group
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.lib.process_failure import failure_detail
 from scripts.message import send_result, send_budget, session_send
+from scripts.shutdown import remote
 from scripts.whoami import note_file
 
 from scripts.lib import conf, models_registry  # noqa: E402
@@ -42,8 +45,7 @@ from scripts.whoami import agent_accounts
 from scripts.accounts import moves, next_moves, refusals, role_map
 from scripts.whoami import usage_store
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "notify"))
-import review
+from scripts.notify import review
 
 from scripts.whoami.note_file import reset_time
 from scripts.whoami.agent_accounts import (ClaudeAccountsInUse, CodexHomeSource, Report,
@@ -51,7 +53,7 @@ from scripts.whoami.agent_accounts import (ClaudeAccountsInUse, CodexHomeSource,
                             codex_homes, codex_live, observe_workers_home, NoWorkersHome)
 
 if TYPE_CHECKING:
-    from ..notify.push_texts import RenderedPush
+    from scripts.notify.push_texts import RenderedPush
     from scripts.whoami import run_out
     from scripts.accounts import accounts
     from scripts.accounts.accounts import CodexWorkersAccount
@@ -581,7 +583,7 @@ class UserPush(NamedTuple):
 
     @property
     def ask(self) -> Ask:
-        from user_action import ActionRequired
+        from scripts.notify.user_action import ActionRequired
         assert isinstance(self.rendered.action, ActionRequired)
         assert self.rendered.need in ("decision", "blocked")
         return Ask(self.rendered.need, self.rendered.action.text)
@@ -1107,7 +1109,7 @@ def credit_line(note: AgentNote) -> str:
 
 def claude_next_move_push(note: AgentNote, selection: ClaudeAccountsInUse) -> QuotaNotice:
     """A phone reminder only when an in-use account has an uncovered group."""
-    from push_texts import render
+    from scripts.notify.push_texts import render
 
     aliases = {"unit": "units", "unit directors": "units", "units": "units",
                "showrunner": "showrunners", "showrunners": "showrunners"}
@@ -1134,7 +1136,7 @@ def codex_next_move_push(note: AgentNote, fallback: CodexQuotaFallback = NO_CODE
                          now: datetime | None = None, *,
                          history: moves.RecordedAutoEntries | moves.UnreadableMoveJournal | moves.ReadCurrentMoveJournal
                          = moves.READ_CURRENT_MOVE_JOURNAL) -> QuotaNotice:
-    from push_texts import render
+    from scripts.notify.push_texts import render
     from scripts.accounts import accounts
 
     left = remaining(note)
@@ -1489,7 +1491,7 @@ def _workers_next_move_pass(readings: CodexAlertPassReadings, now: datetime) -> 
 
 def refusal_push(note: AgentNote, switch: CodexQuotaFallback, failed: str | None, already: bool) -> QuotaNotice:
     """The one direct user message sent when Codex refuses this episode."""
-    from push_texts import render
+    from scripts.notify.push_texts import render
 
     if not isinstance(switch, NoCodexQuotaFallback):
         verb = "had already moved" if already else "moved"
@@ -1545,7 +1547,7 @@ PushDelivery = PushSent | PushFailed
 
 def tell_user(push: RenderedPush) -> PushDelivery:
     """Convert the sender process result into the user delivery state."""
-    from push_texts import user_send_argv
+    from scripts.notify.push_texts import user_send_argv
 
     user_send_timeout = review.user_send_seconds()
     command = user_send_argv(push, timeout=user_send_timeout)
@@ -1770,7 +1772,7 @@ def _paid_credits_notice(label: str, report: Report,
     except ValueError:
         credits_left = "unlimited" if report.credit_balance == "unlimited" else "unknown"
     return ZeroEpisodeNotice(id="quota.paid_credits", values={
-        "sender": "quota_alert", "account": label, "machine": os.uname().nodename, "credits": credits_left,
+        "sender": "quota_alert", "account": label, "machine": remote.local_machine(), "credits": credits_left,
         "refill": reset_display(refusals.KnownReset(reset)),
         "next_reset": reset_display(refusals.KnownReset(next_reset)),
     })
@@ -1824,7 +1826,7 @@ def _current_notice(label: str, notice: ZeroEpisodeNotice, *, workers_queued: bo
 
 
 def _codex_zero_alert(config: Config, readings: CodexAlertPassReadings, now: datetime) -> list[str]:
-    from push_texts import render
+    from scripts.notify.push_texts import render
 
     del config
 

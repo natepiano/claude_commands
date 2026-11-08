@@ -18,6 +18,7 @@ from typing import Literal, cast
 from unittest import mock
 from zoneinfo import ZoneInfo
 
+from scripts.lib.build_steps import read_step_names
 from scripts.lint import memory_admit as gate
 from scripts.build_queue import admission_client as client, admission_protocol as wire, queue_evidence
 from scripts.build_queue import admission_code, admission_records as records
@@ -26,6 +27,33 @@ from scripts.build_queue.admission_test_support import AdmissionFixture, Exchang
 
 
 class ProtocolTests(unittest.TestCase):
+
+    def test_codec_reuses_shared_records_only_within_one_encode(self) -> None:
+        shared = {"name": "private", "values": [1, 2]}
+        encoded = cast(list[object], codec.snapshot_value([shared, shared]))
+        self.assertEqual(encoded, [shared, shared])
+        self.assertIs(encoded[0], encoded[1])
+        shared["name"] = "changed"
+        again = cast(list[object], codec.snapshot_value([shared, shared]))
+        self.assertEqual(again, [shared, shared])
+        self.assertIsNot(again[0], encoded[0])
+        for scalar in (None, True, 3, 2.5, "private"):
+            self.assertIs(codec.snapshot_value(scalar), scalar)
+
+    def test_reply_bytes_keep_the_existing_domain_representation(self) -> None:
+        with AdmissionFixture() as fixture:
+            request = fixture.request()
+            grant = fixture.server.handle_request(request)[0]
+            viewed = fixture.server.handle_request(wire.ViewRequest())[0]
+            explained = fixture.server.handle_request(wire.ExplainRequest())[0]
+            for reply, name in ((grant, "admitted"), (viewed, "view"), (explained, "explain")):
+                with self.subTest(name=name):
+                    expected = json.dumps({"v": wire.VERSION, "type": name,
+                        "data": codec.snapshot_value(reply)}, separators=(",", ":"),
+                        ensure_ascii=False, allow_nan=False) + "\n"
+                    self.assertEqual(wire.encode_reply(reply), expected)
+                    self.assertEqual(wire.parse_reply(expected), reply)
+            self.assertIsInstance(grant, wire.Admitted)
 
     def test_service_estimate_request_carries_identity_without_a_client_estimate(self) -> None:
         with AdmissionFixture() as fixture:
@@ -127,7 +155,7 @@ class ProtocolTests(unittest.TestCase):
                 self.assertEqual(parsed, reply)
                 assert isinstance(parsed, wire.ViewReply)
                 shown = queue_evidence.running_text(parsed.reading.explanation.running[0],
-                    parsed.reading.explanation, {}, ZoneInfo("UTC"))
+                    parsed.reading.explanation, {}, ZoneInfo("UTC"), names=read_step_names())
                 self.assertIn("0.1 GiB RAM; 2.0 GiB swapped", shown)
                 self.assertIn("running job, 2 min" if isinstance(state, RunningServiceJob) else "idle", shown)
 
@@ -160,13 +188,14 @@ class ProtocolTests(unittest.TestCase):
         with AdmissionFixture() as fixture:
             source = Path(__file__).resolve().parents[1]
             scripts = fixture.root / "scripts"
-            for relative in (*admission_code.ADMISSION_CODE_PATHS, "build_hold/override_guard.sh"):
+            for relative in (*admission_code.ADMISSION_CODE_PATHS, "build_hold/override_guard.sh", "lib/py"):
                 target = scripts / relative
                 target.parent.mkdir(parents=True, exist_ok=True)
                 _ = target.write_bytes((source / relative).read_bytes())
+                target.chmod((source / relative).stat().st_mode)
             before = wire.admission_code_version(scripts)
             environment = {key: value for key, value in os.environ.items() if key != "BUILDLOG_ADMISSION_CODE_VERSION"}
-            command = '''BUILDLOG_ADMISSION_CODE_VERSION="$(python3 "$3" code-version)" || exit 2
+            command = '''BUILDLOG_ADMISSION_CODE_VERSION="$("$4" "$3" code-version)" || exit 2
 export BUILDLOG_ADMISSION_CODE_VERSION
 source "$1"
 printf '%s\\n' "$BUILDLOG_ADMISSION_CODE_VERSION"
@@ -176,7 +205,7 @@ printf '%s\\n' "$BUILDLOG_ADMISSION_CODE_VERSION"
 '''
             result = subprocess.run(["bash", "-c", command, "bash", str(scripts / "lint/memory_gate.sh"),
                                      str(scripts / "build_queue/admission_code.py"),
-                                     str(source / "build_queue/admission_client.py")],
+                                     str(source / "build_queue/admission_client.py"), str(source / "lib/py")],
                                     env=environment, capture_output=True, text=True, timeout=10, check=False)
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(result.stdout.splitlines(), [before, before])
@@ -301,9 +330,11 @@ printf '%s\\n' "$BUILDLOG_ADMISSION_CODE_VERSION"
             self.assertEqual(parsed.explanation.decided_from, inputs)
             self.assertIsInstance(gate.smallest_head_release(parsed.explanation), gate.EstimateExpired)
             zone = ZoneInfo("UTC")
-            self.assertEqual(queue_evidence.release_text(gate.smallest_head_release(parsed.explanation), parsed.explanation, {}, zone),
-                             queue_evidence.release_text(gate.smallest_head_release(local), local, {}, zone))
-            self.assertTrue(queue_evidence.release_text(gate.smallest_head_release(parsed.explanation), parsed.explanation, {}, zone).startswith("the estimate expired at"))
+            names = read_step_names()
+            shown = queue_evidence.release_text(gate.smallest_head_release(parsed.explanation), parsed.explanation, {}, zone, names=names)
+            self.assertEqual(shown,
+                             queue_evidence.release_text(gate.smallest_head_release(local), local, {}, zone, names=names))
+            self.assertTrue(shown.startswith("the estimate expired at"))
             assert isinstance(local.head, gate.HeadExplanation)
             assert isinstance(local.head.cause, gate.EstimateExpired)
             assert isinstance(parsed.explanation.head, gate.HeadExplanation)

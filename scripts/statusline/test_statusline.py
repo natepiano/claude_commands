@@ -17,6 +17,7 @@ from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
 from scripts.accounts import new_account
+from scripts.lib.py_floor_test_support import seed_interpreter_cache
 from scripts.production import session_labels, staff
 from scripts.shutdown import remote
 from scripts.statusline import adhoc_items, assignment, rebuild_row
@@ -27,6 +28,8 @@ SHIPPED_COLORS = PROGRAM.parents[2] / "config/statusline.conf"
 COMMAND = f'statusline="{Path(__file__).parent}"; . "$statusline/statusline.sh"'
 USER_ZONE = ZoneInfo("America/New_York")
 ANSI = re.compile(r"\x1b\[[0-9;]*m")
+# Preserve the fixture PATH when NixOS starts a child shell.
+SHELL_ENVIRONMENT = {"__NIXOS_SET_ENVIRONMENT_DONE": "1", "__ETC_ZSHENV_SOURCED": "1"}
 SHELLS = ("/bin/sh", "zsh") if shutil.which("zsh") else ("/bin/sh",)
 # Where NixOS's glibc finds zone files; Claude Code's environment carries it.
 ZONE_FILES = {"TZDIR": os.environ["TZDIR"]} if "TZDIR" in os.environ else {}
@@ -56,13 +59,14 @@ def status_lines(*inputs: object, labels: Path | None = None, account: str = "cl
             ["jq", "-r", "--arg", "pwd", "/tmp", "--arg", "account", account,
              *stored, *parent, *configured, "-f", str(PROGRAM)],
             input=stdin, capture_output=True, text=True, check=True,
-            env={"PATH": os.environ["PATH"], "HOME": os.environ["HOME"], "TZ": USER_ZONE.key, **ZONE_FILES, **marks},
+            env={**SHELL_ENVIRONMENT, "PATH": os.environ["PATH"], "HOME": os.environ["HOME"], "TZ": USER_ZONE.key, **ZONE_FILES, **marks},
         )
     return result.stdout.splitlines()
 
 
 def seed_rebuild_cache(home: Path) -> None:
     """Keep shell tests on temporary answers without calling Nix or SSH."""
+    seed_interpreter_cache(home / ".cache")
     cache = home / ".local/state/showrunner/rebuilds"
     cache.parent.mkdir(parents=True, exist_ok=True)
     _ = cache.write_text("\n9999999999\n" + str(SHIPPED_COLORS) + "\n", encoding="utf-8")
@@ -105,7 +109,7 @@ class ColorTests(unittest.TestCase):
                          "--rawfile", "colors", str(colors), "-f", str(PROGRAM)],
                         input=json.dumps({"workspace": {"current_dir": "/tmp/project"}}),
                         capture_output=True, text=True, check=True,
-                        env={"PATH": os.environ["PATH"]},
+                        env={**SHELL_ENVIRONMENT, "PATH": os.environ["PATH"]},
                     )
                     line = result.stdout.splitlines()[0]
                     self.assertEqual(line, "/tmp/project")
@@ -295,7 +299,7 @@ class AdhocItemsTests(unittest.TestCase):
                 with self.subTest(remaining=remaining):
                     result = subprocess.run(
                         ["python3", str(Path(adhoc_items.__file__)), str(remaining)],
-                        env={"PATH": os.environ["PATH"], "HOME": directory,
+                        env={**SHELL_ENVIRONMENT, "PATH": os.environ["PATH"], "HOME": directory,
                              "CLAUDE_CODE_SESSION_ID": "review-session"},
                         capture_output=True, text=True, check=True,
                     )
@@ -480,7 +484,7 @@ class RoleTests(unittest.TestCase):
     def command_lines(self, payload: object, *, command: str = COMMAND, shell: str = "/bin/sh", **marks: str) -> list[str]:
         """Run the statusLine command as Claude Code does, with only `marks` beside a bare environment."""
         seed_rebuild_cache(self.home)
-        env = {"PATH": os.environ["PATH"], "HOME": str(self.home), **marks}
+        env = {**SHELL_ENVIRONMENT, "PATH": os.environ["PATH"], "HOME": str(self.home), **marks}
         result = subprocess.run(
             [shell, "-c", command], input=json.dumps(payload), capture_output=True, text=True,
             check=True, env=env, cwd=self.home,
@@ -720,6 +724,7 @@ class RoleTests(unittest.TestCase):
         for name in ("statusline.sh", "statusline.jq"):
             _ = (scripts / name).write_text((PROGRAM.parent / name).read_text(encoding="utf-8"), encoding="utf-8")
         (scripts / "assignment.py").symlink_to(PROGRAM.with_name("assignment.py"))
+        (scripts.parent / "lib").symlink_to(PROGRAM.parent.parent / "lib", target_is_directory=True)
         command = f'statusline="{scripts}"; . "$statusline/statusline.sh"'
         payload = {**limits({"used_percentage": 95}, {"used_percentage": 90}),
                    "context_window": ContextWindow(total_input_tokens=90_000, context_window_size=100_000)}
@@ -782,7 +787,7 @@ class CountsRowTests(unittest.TestCase):
         self.cache = self.home / f".local/state/showrunner/counts/{OWNER.id}"
         path = self.home / ".local/state/staff/staff.json"
         path.parent.mkdir(parents=True)
-        _ = path.write_text(staff_text(replace(OWNER, doc=staff.LiveDoc("natedev", doc))), encoding="utf-8")
+        _ = path.write_text(staff_text(replace(OWNER, doc=staff.LiveDoc(remote.local_machine(), doc))), encoding="utf-8")
 
 
     def questions(self, *items: OutstandingItem) -> None:
@@ -791,7 +796,7 @@ class CountsRowTests(unittest.TestCase):
         _ = path.write_text(json.dumps(list(items)), encoding="utf-8")
 
     def lines(self, session_id: str = OWNER.id, shell: str = "/bin/sh") -> list[str]:
-        env = {"PATH": os.environ["PATH"], "HOME": str(self.home), "STAFF_ID": OWNER.id, "HERDR_BIN": "/nonexistent/herdr",
+        env = {**SHELL_ENVIRONMENT, "PATH": os.environ["PATH"], "HOME": str(self.home), "STAFF_ID": OWNER.id, "HERDR_BIN": "/nonexistent/herdr",
                "STAFF_FILE": str(self.home / ".local/state/staff/staff.json")}
         result = subprocess.run([shell, "-c", COMMAND], input=json.dumps({"session_id": session_id}),
                                 capture_output=True, text=True, check=True, env=env, cwd=self.home)
@@ -811,7 +816,7 @@ class CountsRowTests(unittest.TestCase):
     def test_each_count_in_the_row_is_bold_inside_its_shipped_color(self) -> None:
         _ = self.ledger.write_text("- 2026-10-16 Idea (idea.md) — proposed\n", encoding="utf-8")
         self.questions(*(OutstandingItem(since="2026-10-16T19:00", text=f"Q{n}") for n in range(12)))
-        env = {"PATH": os.environ["PATH"], "HOME": str(self.home), "STAFF_ID": OWNER.id, "HERDR_BIN": "/nonexistent/herdr",
+        env = {**SHELL_ENVIRONMENT, "PATH": os.environ["PATH"], "HOME": str(self.home), "STAFF_ID": OWNER.id, "HERDR_BIN": "/nonexistent/herdr",
                "STAFF_FILE": str(self.home / ".local/state/staff/staff.json")}
         result = subprocess.run(["/bin/sh", "-c", COMMAND], input=json.dumps({"session_id": OWNER.id}),
                                 capture_output=True, text=True, check=True, env=env, cwd=self.home)
@@ -1060,7 +1065,7 @@ class RebuildRowTests(unittest.TestCase):
             built = cache.stat().st_mtime_ns
             for shell in SHELLS:
                 result = subprocess.run([shell, "-c", COMMAND], input="{}", capture_output=True, text=True,
-                                        check=True, env={"HOME": directory, "PATH": os.environ["PATH"]}, cwd=home)
+                                        check=True, env={**SHELL_ENVIRONMENT, "HOME": directory, "PATH": os.environ["PATH"]}, cwd=home)
                 self.assertEqual(result.stdout.splitlines()[-1], "For you: rebuild natedev")
                 self.assertEqual(result.stderr, "")
                 self.assertEqual(cache.stat().st_mtime_ns, built)

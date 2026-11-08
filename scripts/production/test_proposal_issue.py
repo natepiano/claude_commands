@@ -9,7 +9,6 @@ import io
 import threading
 import time
 import os
-import sys
 import tempfile
 import unittest
 from collections.abc import Generator
@@ -18,15 +17,12 @@ from pathlib import Path
 from typing import final, override
 from unittest import mock
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-
-import proposal_issue
-from issues import Issue
+from scripts.production import proposal_issue
+from scripts.production.issues import Issue
 from scripts.production import staff, unit_names
 from scripts.production.staff_test_support import fixture_runtime_id
-from user_zone import user_zone
+from scripts.lib.user_zone import user_zone
+from scripts.style import rules
 
 ISSUE = """---
 area: "[[tooling]]"
@@ -95,6 +91,12 @@ class ProposalIssueTests(unittest.TestCase):
         self.assertEqual(proposal_issue.proposal_unit(Issue(self.issue, {"unit": [row.id]})), "names")
         self.assertEqual(proposal_issue.proposal_unit(Issue(self.issue, {})), "")
 
+    def test_a_stored_unit_name_does_not_select_a_staff_row(self) -> None:
+        issue = Issue(self.issue, {"unit": ["retired-types"]})
+        result = proposal_issue.proposal_unit(issue)
+        self.assertEqual(result, "")
+        self.assertIsInstance(rules.style_family(result), rules.NotStyleUnit)
+
     def test_urgency_and_mark_important_set_the_review_fields_and_normal_removes_them(self) -> None:
         code, out, _ = self.run_cli("urgency", str(self.issue), "--level", "soon", "--due", "2026-10-22")
         self.assertEqual((code, out), (0, f"urgency {self.issue.name}: set review_urgency, review_due, date_modified\n"))
@@ -148,7 +150,7 @@ class ProposalIssueTests(unittest.TestCase):
                 self.assertEqual(code, 0, err)
                 self.assertIn(f"\n\nProposed ranking: {expected}\n\n<!-- style-decision:start -->\n# Findings\nBefore and after.\n",
                               destination.read_text())
-        from issues import frontmatter
+        from scripts.production.issues import frontmatter
         fields = frontmatter(issue)
         self.assertEqual(fields["tags"], ["issue", "proposal", "style"])
         self.assertNotIn("style_findings", fields)
@@ -424,7 +426,7 @@ class ProposalIssueTests(unittest.TestCase):
         self.assertTrue(proposal_issue.create(
             second, "alpha", "a", "style", ["style"], "global:rust/names.md", "beta", "abc", 1,
             "# Beta examples\n", template, date(2026, 10, 20), initial_fields={}))
-        from issues import frontmatter
+        from scripts.production.issues import frontmatter
         self.assertEqual((frontmatter(first)["proposal_id"], frontmatter(second)["proposal_id"]),
                          (["P1"], ["P2"]))
         self.assertEqual(first.read_bytes(), original)
@@ -441,7 +443,7 @@ class ProposalIssueTests(unittest.TestCase):
                 "--rule", "global:rust/names.md", "--crate", "alpha", "--rule-blob", "abc123", "--count", "1", "--rules", urls, "--template", str(template), "--body-file", str(body)]
         code, _, error = self.run_cli(*args)
         self.assertEqual(code, 0, error)
-        from issues import frontmatter
+        from scripts.production.issues import frontmatter
         self.assertEqual(frontmatter(issue)["style_rules"], sorted(urls.split(",")))
         original = issue.read_bytes()
         args[args.index("--rules") + 1] = "https://github.com/o/r/blob/main/changed.md"
@@ -467,7 +469,7 @@ class ProposalIssueTests(unittest.TestCase):
 
     def test_reopen_removes_every_close_field_and_keeps_the_answer(self) -> None:
         _ = proposal_issue.edit(self.issue, {"unit": "names", "plan": "unit.md", "stage": "active"}, date(2026, 10, 15))
-        from issues import frontmatter
+        from scripts.production.issues import frontmatter
         def fields() -> dict[str, list[str]]:
             return {key: value for key, value in frontmatter(self.issue).items() if key != "date_modified"}
         before = fields()
@@ -575,7 +577,7 @@ class ProposalIssueTests(unittest.TestCase):
                 self.assertIn(message, error)
                 self.assertFalse(issue.exists())
         self.assertEqual(self.run_cli(*arguments, '{"unit": "names"}')[0], 0)
-        from issues import frontmatter
+        from scripts.production.issues import frontmatter
         self.assertEqual(proposal_issue.staff_name(frontmatter(issue)["unit"][0]), "names")
         self.assertNotIn("plan", frontmatter(issue))
 
@@ -584,7 +586,7 @@ class ProposalIssueTests(unittest.TestCase):
         _ = template.write_text("---\nstatus: open\n---\n")
         body = self.root / "body.md"
         _ = body.write_text("# Examples\n")
-        from issues import frontmatter
+        from scripts.production.issues import frontmatter
         for name, fields, stage in (("approved", '{"unit": "names", "stage": "backlog"}', "active"),
                                     ("unanswered", '{"stage": "backlog"}', "backlog"),
                                     ("waiting", '{"stage": "waiting"}', "waiting"),
@@ -637,12 +639,12 @@ class ProposalIssueTests(unittest.TestCase):
         self.assertIn('approved_by: "user"\n', text)
         self.assertIn(f'approved_in: "{fixture_runtime_id("hana")}"\n', text)
         self.assertEqual(out, "approve a proposal.md: set plan, unit, approved_by, approved_in, stage, date_modified\n")
-        from issues import Issue, frontmatter
+        from scripts.production.issues import Issue, frontmatter
         self.assertEqual(proposal_issue.proposal_progress(Issue(self.issue, frontmatter(self.issue))),
                          proposal_issue.InProgress())
 
     def test_unapprove_sets_an_approved_proposal_back_to_waiting_for_approval(self) -> None:
-        from issues import Issue, frontmatter
+        from scripts.production.issues import Issue, frontmatter
         _ = self.issue.write_text(VAULT_ISSUE, encoding="utf-8")
         _ = self.run_cli("approve", str(self.issue), "--by", "showrunner", "--showrunner", "hana", "--unit", "u", "--plan", "p")
         approved = self.text()
@@ -717,7 +719,7 @@ class ProposalIssueTests(unittest.TestCase):
                     self.assertEqual(self.text(), before)
 
     def test_reopen_of_an_approved_proposal_closed_at_backlog_puts_it_in_progress(self) -> None:
-        from issues import frontmatter
+        from scripts.production.issues import frontmatter
         for name, fields, stage, changed in (("approved", {"unit": "names", "plan": "unit.md"}, "active",
                                               "reason, status, stage, date_modified"),
                                              ("unanswered", {}, "backlog", "reason, status, date_modified")):
@@ -734,11 +736,11 @@ class ProposalIssueTests(unittest.TestCase):
         _ = self.run_cli("approve", str(self.issue), "--by", "user", "--showrunner", "hana", "--unit", "u", "--plan", "p")
         code, _, error = self.run_cli("close", str(self.issue), "--reason", "built in u-1")
         self.assertEqual(code, 0, error)
-        from issues import frontmatter
+        from scripts.production.issues import frontmatter
         self.assertEqual((frontmatter(self.issue)["status"], frontmatter(self.issue)["stage"]), (["closed"], ["active"]))
 
     def test_proposal_progress_reads_an_approval_or_an_active_stage_as_in_progress(self) -> None:
-        from issues import Issue
+        from scripts.production.issues import Issue
         approval = {"unit": ["names"], "plan": ["unit.md"]}
         for name, fields, expected in (
                 ("approved at backlog", {**approval, "stage": ["backlog"]}, proposal_issue.InProgress()),

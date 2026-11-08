@@ -14,21 +14,16 @@ from collections.abc import Iterator
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, cast
+from typing import cast
 from unittest import mock
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
-from code_kind import is_test_code  # noqa: E402
+from scripts.lib.code_kind import is_test_code  # noqa: E402
 
-import gpu_xid
-import push_texts
-if TYPE_CHECKING:
-    from ..message import session_send
-else:
-    from scripts.message import session_send
-from push_texts import ActionTemplate, PushExample, PushText, SessionTemplate
-from user_action import ActionRequired, NO_SESSION_LINE, SessionLine
+from scripts.notify import gpu_xid
+from scripts.notify import push_texts
+from scripts.message import session_send
+from scripts.notify.push_texts import ActionTemplate, PushExample, PushText, SessionTemplate
+from scripts.notify.user_action import ActionRequired, NO_SESSION_LINE, SessionLine
 
 ROOT = Path(__file__).resolve().parents[2]
 EXEMPT = {"scripts/notify/push_texts.py", "scripts/notify/pushover.py", "scripts/message/send.py"}
@@ -274,7 +269,7 @@ class PushTextTests(unittest.TestCase):
     def test_gpu_xid_command_reports_known_codes_without_extra_output(self) -> None:
         for code, meaning in gpu_xid.XID_MEANINGS.items():
             with self.subTest(xid=code):
-                result = subprocess.run([sys.executable, str(Path(gpu_xid.__file__)), code],
+                result = subprocess.run([str(Path(gpu_xid.__file__).resolve().parents[1] / "lib" / "py"), str(Path(gpu_xid.__file__)), code],
                                         capture_output=True, text=True, check=False)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(result.stdout, meaning + "\n")
@@ -283,7 +278,7 @@ class PushTextTests(unittest.TestCase):
     def test_gpu_xid_command_refuses_unknown_codes_on_one_line(self) -> None:
         for code, shown in (("999", "'999'"), ("999\nsecond line", "'999\\nsecond line'")):
             with self.subTest(code=code):
-                result = subprocess.run([sys.executable, str(Path(gpu_xid.__file__)), code],
+                result = subprocess.run([str(Path(gpu_xid.__file__).resolve().parents[1] / "lib" / "py"), str(Path(gpu_xid.__file__)), code],
                                         capture_output=True, text=True, check=False)
                 self.assertEqual(result.returncode, 2)
                 self.assertEqual(result.stdout, "")
@@ -299,7 +294,7 @@ class PushTextTests(unittest.TestCase):
                 self.assertRegex(stopped, r"^(?:1 session|[1-9][0-9]* sessions)")
                 self.assertIn(stopped, push.message)
                 self.assertIn("Coding work stays stopped until the restart succeeds.", push.body)
-                self.assertEqual(cast(ActionRequired, push.action).text.count("/shutdown restart"), 1)
+                self.assertEqual(cast(ActionRequired, push.action).text.count("/agents restart"), 1)
                 self.assertIn("natedev", cast(ActionRequired, push.action).text)
                 self.assertLess(len(push.message), 500)
         self.assertEqual(entry.examples[0].values["stopped"], "5 sessions")
@@ -313,7 +308,7 @@ class PushTextTests(unittest.TestCase):
             self.assertIn(example.values["stopped"], push.body)
             action = cast(ActionRequired, push.action).text
             self.assertEqual(action.count("accounts.py trust"), 1)
-            self.assertEqual(action.count("/shutdown restart"), 1)
+            self.assertEqual(action.count("/agents restart"), 1)
             self.assertNotIn("cd /", push.message)
             self.assertLess(len(push.message), 500)
         unlisted = entries["shutdown.restart_untrusted_unlisted"]
@@ -325,7 +320,7 @@ class PushTextTests(unittest.TestCase):
             self.assertIn(f'Trust the folders of the stopped Claude sessions on {example.values["machine"]} from their shutdown records.',
                           cast(ActionRequired, push.action).text)
             self.assertNotIn("accounts.py trust", push.message)
-            self.assertNotIn("/shutdown restart", push.message)
+            self.assertNotIn("/agents restart", push.message)
             self.assertNotIn("cd /", push.message)
             self.assertLess(len(push.message), 500)
         self.assertNotIn("shutdown.move_untrusted", entries)
@@ -339,7 +334,7 @@ class PushTextTests(unittest.TestCase):
                 self.assertIn(example.values["stopped"], push.body)
                 self.assertIn(f'Resume the stopped Claude sessions on {example.values["machine"]} from their shutdown records.',
                               cast(ActionRequired, push.action).text)
-                self.assertNotIn("/shutdown restart", push.message)
+                self.assertNotIn("/agents restart", push.message)
                 self.assertLess(len(push.message), 500)
 
     def test_every_catalog_example_keeps_email_addresses_out_of_pushes(self) -> None:

@@ -146,7 +146,7 @@ for selection in plain filter target; do
     case "$selection" in
         plain) ARGS=(sample) ;;
         filter) ARGS=(sample --filter alpha) ;;
-        target) ARGS=(sample integration_suite) ;;
+        target) ARGS=(sample --test integration_suite) ;;
     esac
     compose_nextest_args
     printf '%s\0' "${NEXTEST_ARGS[@]}"
@@ -156,7 +156,7 @@ done
             result = subprocess.run(["bash", "-e", "-c", script], cwd=root,
                                     text=True, capture_output=True, timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        cases = (((), True), (("--filter", "alpha"), False), (("integration_suite",), False))
+        cases = (((), True), (("--filter", "alpha"), False), (("--test", "integration_suite"), False))
         answers = result.stdout.split("\0\0")[:-1]
         self.assertEqual(len(answers), len(cases))
         for (arguments, allow_empty), answer in zip(cases, answers, strict=True):

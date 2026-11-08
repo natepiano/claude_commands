@@ -203,6 +203,40 @@ class RepairRoundTests(unittest.TestCase):
         repairs = rounds.phase_rounds(events)
         self.assertEqual([repair["passes"] for repair in repairs], [2, 1])
 
+    def test_mixed_launch_metadata_keeps_one_batch_number_in_two_groups(self) -> None:
+        events = ledger_events()
+        events += pass_events(BASE + 10, BASE + 20, name="first", number=1)
+        events += pass_events(BASE + 30, BASE + 40, name="retry", ledger_round=1)
+        repairs = rounds.phase_rounds(events)
+        self.assertEqual([repair["ledger_rounds"] for repair in repairs], [[1], [1]])
+        self.assertEqual([repair["cause"] for repair in repairs], ["review-code", "other"])
+        self.assertEqual([repair["passes"] for repair in repairs], [1, 1])
+
+    def test_overlap_group_excludes_its_refunded_batch_number(self) -> None:
+        events = ledger_events() + ledger_events(number=2, at=BASE + 35, finding="F2")
+        events += pass_events(BASE + 10, BASE + 60, name="gate", number=99, activity="run tests")
+        events += pass_events(BASE + 20, BASE + 30, name="refunded", number=1)
+        events += pass_events(BASE + 40, BASE + 50, name="landed", number=2)
+        events.append(dict(event("finding_batch_abandoned", BASE + 70), round=1, edits_landed=False))
+        events.append(dict(event("finding_batch_landed", BASE + 80), round=2))
+        repair, = rounds.phase_rounds(events)
+        self.assertEqual(repair["ledger_rounds"], [2])
+        self.assertEqual(repair["passes"], 3)
+        self.assertEqual(repair["cause"], "review-code")
+
+    def test_missing_dispatch_keeps_ledger_identity_and_refund_rules(self) -> None:
+        events = pass_events(BASE, BASE + 10, name="batch", ledger_round=1)
+        events += pass_events(BASE + 20, BASE + 30, name="retry", ledger_round=1)
+        events += pass_events(BASE + 40, BASE + 50, name="gate", activity="run tests")
+        repairs = rounds.phase_rounds(events)
+        self.assertEqual([repair["ledger_rounds"] for repair in repairs], [[1], []])
+        self.assertEqual([repair["cause"] for repair in repairs], ["other", "gate"])
+        self.assertEqual([repair["passes"] for repair in repairs], [2, 1])
+        events.append(dict(event("finding_batch_abandoned", BASE + 60), round=1, edits_landed=False))
+        self.assertEqual([repair["ledger_rounds"] for repair in rounds.phase_rounds(events)], [[]])
+        events.append(dict(event("finding_batch_landed", BASE + 70), round=1))
+        self.assertEqual([repair["ledger_rounds"] for repair in rounds.phase_rounds(events)], [[1], []])
+
     def test_refunded_batch_adds_no_round_unless_it_later_lands(self) -> None:
         events = ledger_events() + pass_events(BASE + 10, BASE + 13, ledger_round=1, status="error")
         abandoned = dict(event("finding_batch_abandoned", BASE + 20), round=1, edits_landed=False)

@@ -519,9 +519,10 @@ Exit 1 means the trees differ; run the five steps:
 
 1. Merge the new tip into the style merge branch and run its Merge tests.
 2. Run `~/.claude/scripts/lib/py ~/.claude/scripts/style/style_sync.py lint --repo <checkout> --checkout <style checkout> --tip <branch-point tip>`.
-   This uses `bash ~/.claude/scripts/direct/verify.sh lint --workspace --no-cache --check`
-   at the exact requested commit in a standing gate checkout, with workspace mend,
-   rustfmt and clippy (`--all-targets --all-features`, workspace lint config).
+   This uses `bash ~/.claude/scripts/direct/verify.sh lint --no-cache --check`
+   at the exact requested commit in a standing gate checkout.
+   Without a package, lint checks the workspace with mend, rustfmt, and Clippy.
+   Clippy uses `--all-targets --all-features` and the workspace lint config.
    Nothing rewrites the tree: mend runs in report mode and rustfmt with `--check`.
    `copies.standing` holds the checkout's `.claude-busy` lock through lint and
    cleanup. Each checkout keeps its own real `target/`; a second busy checkout
@@ -1215,8 +1216,8 @@ from a new parent attaches through `resume`, which handles pending hand-offs.
 
 Standing gate checkouts retain their own `target/` after a sync or a production
 wrap. The floor sweep may reclaim an idle marked cache; it keeps a busy tree's
-cache. Use `copies.py remove --owner <style-production> --repo <repo>` to remove
-that production's idle checkouts (see `docs/as-built/gate-checkouts.md`).
+cache. A wrap leaves the standing checkouts in place.
+See `docs/as-built/gate-checkouts.md` for removal.
 
 ## Report
 

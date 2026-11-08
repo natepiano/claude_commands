@@ -18,7 +18,7 @@
 ### Command line
 
 ```
-python3 ~/.claude/scripts/screen_record/screen_record.py --window <title substring> --seconds <N> [--name <label>]
+~/.claude/scripts/lib/py ~/.claude/scripts/screen_record/screen_record.py --window <title substring> --seconds <N> [--name <label>]
 ```
 
 - `--seconds` is required with no default: a whole number from 1 to 60. Leading zeros are accepted (`007` is 7).

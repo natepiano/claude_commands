@@ -1,6 +1,10 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
 """Publish all change reviews, or retain an older selected-row link with --production NAME C27."""
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import argparse
 import html
@@ -18,7 +22,6 @@ from pathlib import Path
 from typing import Literal, TypedDict, cast
 from urllib.parse import parse_qs, urlsplit
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.production import change_review as change_review
 from scripts.production import unit_lookup
 from scripts.production import unrouted_alert, change_routing, delivery_state, next_item, showrunners, staff
@@ -560,8 +563,7 @@ def showrunner(page: ReviewPage) -> str:
 def row_production(page: ReviewPage, row: dict[str, str]) -> Path:
     """Resolve the row's Production cell for the existing feature-log closeout rule."""
     record = staff.snapshot()
-    if not row.get("Verdict") and (row.get("Producer")
-                                  or record.by_id(staff.StaffId(row.get(change_review.PRODUCTION, ""))) is not None):
+    if not row.get("Verdict"):
         assignment = change_routing.StaffRouting(record, {}).owner_and_production(page.review_list, row)
         if isinstance(assignment.production, Path):
             return assignment.production
@@ -602,7 +604,7 @@ def close_feature_log(page: ReviewPage, doc: Path, row_id: str, verdict: str) ->
     lines = doc.read_text(encoding="utf-8").splitlines()
     repo = Path(production_field(lines, "Showrunner checkout")).expanduser()
     script = str(Path(feature_log.__file__))
-    project = subprocess.run([sys.executable, script, "project-of", str(repo)],
+    project = subprocess.run([str(Path(__file__).resolve().parents[1] / "lib/py"), script, "project-of", str(repo)],
                              capture_output=True, text=True, check=True).stdout.strip()
     if project not in projects:
         return
@@ -610,12 +612,12 @@ def close_feature_log(page: ReviewPage, doc: Path, row_id: str, verdict: str) ->
     arguments = ["--review", review, "--if-proposed"]
     if command == "drop":
         arguments.append(f"--verdict={verdict}")
-    result = subprocess.run([sys.executable, script, command, *arguments],
+    result = subprocess.run([str(Path(__file__).resolve().parents[1] / "lib/py"), script, command, *arguments],
                             capture_output=True, text=True, check=False)
     # The writer names the required operation when a proposal replaces an old note.
     if command == "add" and result.returncode and (
             f"proposal {review} uses supersede; run supersede --review {review}" in result.stderr):
-        result = subprocess.run([sys.executable, script, "supersede", *arguments],
+        result = subprocess.run([str(Path(__file__).resolve().parents[1] / "lib/py"), script, "supersede", *arguments],
                                 capture_output=True, text=True, check=False)
     if result.returncode:
         raise RuntimeError((result.stderr or result.stdout).strip() or "feature-log operation failed")
@@ -698,7 +700,7 @@ def submit(page: ReviewPage, body: str, status: DeliveryStatus, *,
     recipients = verdict_recipients(owner, verdict)
     closeout_before_save(page, doc, row_id, verdict)
     attempt = status.begin(page, row_id, "verdict", recipients=recipients) if recipients else ""
-    result = subprocess.run([sys.executable, str(Path(change_review.__file__)), "verdict",
+    result = subprocess.run([str(Path(__file__).resolve().parents[1] / "lib/py"), str(Path(change_review.__file__)), "verdict",
                              "--production", unit_lookup.doc_owner(page.production, staff.snapshot()).name, "--list", str(page.review_list),
                              "--row", row_id, f"--verdict={verdict}"], capture_output=True, text=True, check=False)
     if result.returncode:

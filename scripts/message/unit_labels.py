@@ -2,22 +2,17 @@
 from __future__ import annotations
 
 import json
-import sys
 import time
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TypedDict, cast
 
-SCRIPTS = Path(__file__).resolve().parents[1]
-for directory in (SCRIPTS / "message", SCRIPTS / "production", SCRIPTS / "herdr", SCRIPTS / "lib", SCRIPTS.parent):
-    if str(directory) not in sys.path:
-        sys.path.insert(0, str(directory))
 from scripts.production import staff, showrunners
 from scripts.production import session_staff
-import unit_runs
-from sessions import SessionRecord, running_sessions
-from user_zone import user_zone_name
+from scripts.lib import unit_runs
+from scripts.message.sessions import SessionRecord, running_sessions
+from scripts.lib.user_zone import user_zone_name
 
 
 @dataclass(frozen=True)
@@ -279,7 +274,7 @@ def showrunner_ids(
 def every_labeled_session(record: staff.StaffSnapshot | None = None, *,
                       running: list[SessionRecord] | None = None) -> session_staff.LabeledProductions | OSError:
     """Every production's observed units, joined to one staff snapshot."""
-    import unit_lookup as process_units
+    from scripts.production import unit_lookup as process_units
 
     try:
         return process_units.every_labeled_session(record=record, running=running)

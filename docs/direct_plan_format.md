@@ -58,11 +58,11 @@ to rediscover after a context compaction lives in the doc.
 - **Key files:** <path — role> for each file a phase reads or modifies
 - **Test lanes:** <for each crate a phase touches, its `tests/` directory or
   `none` — what a Work Order's **Workers** opens the `test` worker against>
-- **Build:** <for Rust always `bash ~/.claude/scripts/direct/verify.sh check <pkg>`;
+- **Build:** <for Rust always `bash ~/.claude/scripts/direct/verify.sh check [<pkg>]`;
   otherwise the project's exact build command>
-- **Test:** <for Rust always `bash ~/.claude/scripts/direct/verify.sh test <pkg>`;
+- **Test:** <for Rust always `bash ~/.claude/scripts/direct/verify.sh test [<pkg>]`;
   otherwise the project's exact test command>
-- **Lint:** <for Rust always `bash ~/.claude/scripts/direct/verify.sh lint <pkg>`;
+- **Lint:** <for Rust always `bash ~/.claude/scripts/direct/verify.sh lint [<pkg>]`;
   never raw cargo commands. <PhaseChecks/> defines scope and the phase's
   style review under <ReviewPromptContract/>>
 - **Invariants:** <project-wide rules every phase must preserve; omit if none>
@@ -123,11 +123,10 @@ where one step can fail>
 re-derive — what earlier phases built, decisions that bind this phase. Empty for
 Phase 1. Maintained by /plan:phase_review.>
 
-**Acceptance gate:** <the build/test/behavior that proves this phase done —
-e.g. `bash ~/.claude/scripts/direct/verify.sh test <pkg>` green + a named
-test + an observable behavior. Gate commands are `verify.sh` lines only —
-`example`/integration-test lines appear solely in phases whose Files own
-them; nothing workspace-wide.>
+**Acceptance gate:** <name the build, test, and observable behavior that prove the phase complete.
+Use `bash ~/.claude/scripts/direct/verify.sh test [<pkg>]` with the package name and a named test.
+Use only `verify.sh` lines. Add example or integration test lines only when the phase's Files include them.
+Do not add workspace commands.>
 
 ### Phase N (transient closeout form) — exists only between review and shrink:
 

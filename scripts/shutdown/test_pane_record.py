@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from scripts.shutdown import remote
+
 import io
 import json
 import math
@@ -14,13 +16,13 @@ from pathlib import Path
 from typing import Literal, cast, final, override
 from unittest import mock
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from scripts.shutdown import pane_record
 from scripts.production import staff
-import herdr
-import sessions
+from scripts.production.staff_test_support import isolated_staff_file
+from scripts.herdr import herdr
+from scripts.message import sessions
+from scripts.message import sessions as runtime_sessions
 from scripts.shutdown.test_pane_restore import FakeClient
 from scripts.whoami import account  # noqa: E402  Imported before a test sets the platform to the Mac: urllib checks it on import.
 
@@ -59,6 +61,8 @@ class PaneRecordTests(unittest.TestCase):
             ('' + 'SHOWRUNNER_' + 'UNIT'): "demo", ('' + 'SHOWRUNNER_' + 'UNIT_ID'): "alpha",
             "CLAUDE_CODE_OAUTH_TOKEN": "secret", "UNRELATED": "x",
         }
+
+        _ = self.enterContext(isolated_staff_file(self.root / "staff.json", self.env))
 
     def start(self, pane: str, session_id: str, *flags: str, source: str = "startup") -> subprocess.CompletedProcess[str]:
         """The hook under a process whose argv is `claude <flags>`, as a pane's Claude runs it."""
@@ -162,6 +166,7 @@ class PaneRecordTests(unittest.TestCase):
               mock.patch.object(pane_record, "PROC", process.parent),
               mock.patch.object(pane_record, "RECORD_DIR", self.records),
               mock.patch.object(sessions, "process_start", return_value="fixture-start"),
+              mock.patch.object(runtime_sessions, "process_start", return_value="fixture-start"),
               mock.patch.object(staff, "initial_snapshot", return_value=staff.StaffSnapshot(rows)),
               mock.patch.object(herdr, "Herdr", return_value=client),
               mock.patch.object(client, "pane_tab", return_value=("morty", 1, {"name": reference})),
@@ -335,7 +340,7 @@ class PaneRecordTests(unittest.TestCase):
     def test_worker_resume_uses_the_typed_parent_for_its_folder(self) -> None:
         from scripts.shutdown import launch_names, session_types
 
-        location = staff.PresentWorktree("natedev", self.root / "unit")
+        location = staff.PresentWorktree(remote.local_machine(), self.root / "unit")
         unit = staff.StaffRow(staff.StaffId("unit"), "unit", "alpha", staff.StaffRoot(),
                              current_session=staff.StaffId("unit-session"),
                              worktree=location)
@@ -431,7 +436,7 @@ class PaneRecordTests(unittest.TestCase):
         from scripts.production import staff, session_staff
         from scripts.shutdown import pane_record
         from scripts.production.staff_test_support import isolated_staff_file, unit_membership
-        import sessions
+        from scripts.message import sessions
 
         environment = {"HERDR_PANE_RECORD_DIR": str(self.records)}
         with (mock.patch.dict(os.environ, environment),
@@ -495,7 +500,7 @@ class PaneRecordTests(unittest.TestCase):
         from scripts.production import staff, session_staff
         from scripts.shutdown import pane_record
         from scripts.production.staff_test_support import isolated_staff_file, unit_membership
-        import sessions
+        from scripts.message import sessions
 
         environment = {"HERDR_PANE_RECORD_DIR": str(self.records)}
         with (mock.patch.dict(os.environ, environment),

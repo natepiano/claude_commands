@@ -10,16 +10,18 @@
 # at once -- rather than N-1 point-to-point sends that can each fail.
 #
 # Usage:
-#   board.sh post    <session_dir> <agent> <kind> <message...>
-#   board.sh read    <session_dir> [--since N] [--from AGENT] [--kind KIND]
+#   board.sh post    [<session_dir>] <agent> <kind> <message...>
+#   board.sh read    [<session_dir>] [--since N] [--from AGENT] [--kind KIND]
 #   board.sh acquire <session_dir> <agent> <resource> [--pid PID] [--hold SECONDS] [--wait SECONDS]
 #                    (with --pid, the wait ends when that pid is gone: exit 4)
 #   board.sh release <session_dir> <agent> <resource> [--pid PID]
 #                    (without --pid, a token recorded for a live pid is refused)
 #   board.sh renew   <session_dir> <agent> <resource> [--hold SECONDS] [--pid PID]
-#   board.sh role    <session_dir> <slot> <role> [note...]
+#   board.sh role    [<session_dir>] <slot> <role> [note...]
 #   board.sh roles   <session_dir>
 #   board.sh locks   <session_dir>
+#
+# post, read, and role use UNIT_RUN_DIR when the first argument is not an absolute path.
 #
 # Post kinds (a closed set, so peers can scan for what concerns them):
 #   register  — "I am <slot>, opening in <role>". The launcher stamps the same
@@ -51,13 +53,16 @@
 # exactly one of N racing acquirers creates the directory and the rest fail.
 
 set -euo pipefail
-UNIT_ENV_SHIM="${BASH_SOURCE[0]%/*}/../lib/unit_env.sh"
+BOARD_SCRIPT=${BASH_SOURCE[0]}
+[[ ! -L "$BOARD_SCRIPT" && "$BOARD_SCRIPT" == */* ]] || BOARD_SCRIPT=$(readlink -f -- "$BOARD_SCRIPT")
+BOARD_DIR=${BOARD_SCRIPT%/*}
+UNIT_ENV_SHIM="$BOARD_DIR/../lib/unit_env.sh"
 [[ ! -r "$UNIT_ENV_SHIM" ]] || source "$UNIT_ENV_SHIM"
 
 MAX_MESSAGE_CHARS=900
 DEFAULT_HOLD_SECONDS=900
 # shellcheck source=/dev/null
-source "${BASH_SOURCE[0]%/*}/../lib/conf.sh"
+source "$BOARD_DIR/../lib/conf.sh"
 
 die() { printf 'board.sh: %s\n' "$1" >&2; exit 2; }
 
@@ -86,7 +91,7 @@ now_epoch() {
 # One line, no control characters, bounded length: the three properties that
 # keep a concurrent append atomic and the log parseable.
 flatten() {
-  "${BASH_SOURCE[0]%/*}/../lib/py" -c '
+  "$BOARD_DIR/../lib/py" -c '
 import sys
 text = sys.argv[2].translate(str.maketrans({"\n": " ", "\r": " ", "\t": " "}))
 print("".join(character for character in text if character.isprintable())[:int(sys.argv[1])], end="")
@@ -170,7 +175,7 @@ lock_guard() {
     return 2
   fi
   local status
-  if python3 -c 'import fcntl, sys
+  if "${BASH_SOURCE[0]%/*}/../lib/py" -c 'import fcntl, sys
 try:
     fcntl.flock(int(sys.argv[1]), fcntl.LOCK_EX | fcntl.LOCK_NB)
 except BlockingIOError:
@@ -227,7 +232,7 @@ pid_is_gone() {
 owned_group_matches() {
   local dir="$1"
   [[ -f "$dir/owned" ]] || return 1
-  "${BASH_SOURCE[0]%/*}/../lib/py" - "$dir/owned" <<'PYTHON'
+  "$BOARD_DIR/../lib/py" - "$dir/owned" <<'PYTHON'
 import json
 from pathlib import Path
 import sys
@@ -283,7 +288,7 @@ write_lock_meta() {
 cleanup_owned_group() {
   local dir="$1"
   [[ -f "$dir/owned" ]] || return 0
-  "${BASH_SOURCE[0]%/*}/../lib/py" - "$dir/owned" "${BASH_SOURCE[0]%/*}/../lib" <<'PY'
+  "$BOARD_DIR/../lib/py" - "$dir/owned" "$BOARD_DIR/../lib" <<'PY'
 from __future__ import annotations
 
 import json
@@ -615,6 +620,14 @@ main() {
   local command="${1:-}"
   [[ -n "$command" ]] || die "usage: board.sh {post|read|acquire|release|renew|role|roles|locks} <session_dir> ..."
   shift
+  case "$command" in
+    post|read|role)
+      if [[ "${1:-}" != /* ]]; then
+        [[ -n "${UNIT_RUN_DIR:-}" ]] || die "$command needs <session_dir> or UNIT_RUN_DIR"
+        set -- "$UNIT_RUN_DIR" "$@"
+      fi
+      ;;
+  esac
   case "$command" in
     post)    cmd_post "$@" ;;
     read)    cmd_read "$@" ;;

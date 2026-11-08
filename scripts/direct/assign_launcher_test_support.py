@@ -1,6 +1,8 @@
 """Share assignment setup with the recorder and loopback server."""
 from __future__ import annotations
 
+from scripts.shutdown import remote
+
 import fcntl
 import json
 import os
@@ -8,19 +10,22 @@ import sys
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
-from typing import cast, override
+from typing import ClassVar, TypedDict, cast, override
 from unittest.mock import patch
 
 from scripts.agents import codex_mesh, test_codex_mesh as mesh_fixture
 from scripts.direct import assign
 from scripts.direct.recorder_fixture import communicate_launcher, invoke_recorder
+from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.git_test_support import commit_repository
 from scripts.lib.test_hang_guard import LauncherHangGuard, TEST_HANG_GUARD_SECS
 from scripts.lib.test_models_registry import write_registry
+from scripts.lib.server_test_support import owned_server_record
 from scripts.lint.memory_test_support import config_environment, write_config_fixture
 from scripts.production import staff, unit_config
 from scripts.production.cli_fixture import invoke_cli
 from scripts.production.staff_test_support import fixture_worker_records
+from scripts.whoami import agent_accounts
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -98,6 +103,8 @@ class AssignLauncherFixture(mesh_fixture.MeshCommandFixture):
     @override
     def setUp(self) -> None:
         super().setUp()
+        write_text_atomic(self.session_dir / "worker_transport", "mesh\n")
+        _ = self.enterContext(owned_server_record(self.session_dir / "mesh_server.json"))
         self.lifecycle_clock.freeze()
         self.hang_guard = LauncherHangGuard(self.id())
         self.server.hang_guard = self.hang_guard
@@ -113,7 +120,7 @@ class AssignLauncherFixture(mesh_fixture.MeshCommandFixture):
         assert parent is not None
         _ = staff.rename(parent.id, "fixture-production")
         owner = staff.rename(owner.id, "fixture")
-        _ = staff.set_worktree(owner.id, staff.PresentWorktree("natedev", self.project), expected=owner.worktree)
+        _ = staff.set_worktree(owner.id, staff.PresentWorktree(remote.local_machine(), self.project), expected=owner.worktree)
         _ = (self.project / "plan.md").write_text("## Delegation Context\n\n- **Project:** Assignment fixture\n")
         self.history = self.session_dir.parent / "history"
         self.paths = self.session_dir.parent / "paths.txt"
@@ -197,29 +204,16 @@ class AssignLauncherFixture(mesh_fixture.MeshCommandFixture):
         director = self.session_dir.parent / family
         if not director.exists():
             director.symlink_to(sys.executable)
-        completion = self.session_dir.parent / "launcher-exit"
         script = "import subprocess, sys; raise SystemExit(subprocess.call(sys.argv[1:]))"
-        if isolate_ancestors:
-            completion.unlink(missing_ok=True)
-            script = "\n".join((
-                "import os, select, subprocess, sys",
-                "from pathlib import Path",
-                "starter = os.pidfd_open(os.getpid())",
-                "if os.fork(): os._exit(0)",
-                # The pidfd becomes readable after the kernel reparents the child.
-                "select.select([starter], [], [])",
-                "os.close(starter)",
-                f"Path({str(completion)!r}).write_text(str(subprocess.call(sys.argv[1:])))",
-            ))
         command = [str(director), "-c", script, *arguments]
+        if isolate_ancestors:
+            command = ["unshare", "--user", "--map-current-user", "--pid", "--fork", "--mount-proc",
+                       str(director), "-c", script, *arguments]
         with subprocess.Popen(command, env=os.environ.copy(), cwd=ROOT, text=True,
                               stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                               start_new_session=True) as child:
             output, errors = communicate_launcher(child)
-            if isolate_ancestors:
-                self.assertTrue(completion.exists(), output + errors)
-            code = int(completion.read_text()) if isolate_ancestors else child.returncode
-            return subprocess.CompletedProcess(arguments, code, output, errors)
+            return subprocess.CompletedProcess(arguments, child.returncode, output, errors)
 
     def successful(self, role: str = "implement", *options: str,
                    execution: AssignmentExecution = DEFAULT_ASSIGNMENT_EXECUTION) -> subprocess.CompletedProcess[str]:
@@ -284,3 +278,82 @@ class AssignLauncherFixture(mesh_fixture.MeshCommandFixture):
             "assign.call = call",
         )))
         return prepared
+
+
+@dataclass(frozen=True)
+class FirstDispatchArtifact:
+    """A completed first dispatch publishes this file."""
+
+    relative: Path
+    content: bytes
+    mode: int
+
+
+class FirstDispatchObservations(TypedDict):
+    requests: list[dict[str, object]]
+    turn_starts: int
+    turn_inputs: list[str]
+    started_turns: dict[str, str]
+    claims: list[dict[str, object]]
+    reservations: list[dict[str, object]]
+
+
+@dataclass(frozen=True)
+class CompletedFirstDispatch:
+    """Keep the real first dispatch output for later independent tests."""
+
+    root: Path
+    artifacts: tuple[FirstDispatchArtifact, ...]
+    observations: str
+
+
+class FirstDispatchFixture(AssignLauncherFixture):
+    """Copy completed first dispatch state before testing a later dispatch."""
+
+    first_dispatches: ClassVar[dict[tuple[str, ...], CompletedFirstDispatch]] = {}
+    turn_starts: int
+    turn_inputs: list[str]
+    started_turns: dict[str, str]
+    claims: list[dict[str, object]]
+    reservations: list[dict[str, object]]
+
+    @classmethod
+    @override
+    def setUpClass(cls) -> None:
+        super().setUpClass()
+        cls.first_dispatches = {}
+        cls.addClassCleanup(cls.first_dispatches.clear)
+
+    def first_assignment(self, role: str = "implement", *options: str) -> None:
+        root = self.session_dir.parent
+        key = (role, *options)
+        if key not in self.first_dispatches:
+            before = {path.relative_to(root): path.read_bytes() for path in root.rglob("*")
+                      if path.is_file() and not path.is_symlink()}
+            _ = self.successful(role, *options)
+            artifacts = tuple(FirstDispatchArtifact(path.relative_to(root), path.read_bytes(), path.stat().st_mode)
+                              for path in root.rglob("*")
+                              if path.is_file() and not path.is_symlink()
+                              and before.get(path.relative_to(root)) != path.read_bytes())
+            observations: FirstDispatchObservations = {
+                "requests": self.server.requests, "turn_starts": self.turn_starts,
+                "turn_inputs": self.turn_inputs, "started_turns": self.started_turns,
+                "claims": self.claims, "reservations": self.reservations,
+            }
+            self.first_dispatches[key] = CompletedFirstDispatch(root, artifacts, json.dumps(observations))
+            return
+        completed = self.first_dispatches[key]
+        for artifact in completed.artifacts:
+            path = root / artifact.relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            _ = path.write_bytes(artifact.content.replace(os.fsencode(completed.root), os.fsencode(root)))
+            path.chmod(artifact.mode)
+        saved = cast(FirstDispatchObservations, json.loads(
+            completed.observations.replace(str(completed.root), str(root))))
+        self.server.requests = saved["requests"]
+        self.turn_starts = saved["turn_starts"]
+        self.turn_inputs = saved["turn_inputs"]
+        self.started_turns = saved["started_turns"]
+        self.claims = saved["claims"]
+        self.reservations = saved["reservations"]
+        _ = self.start_stub_server(str(self.session_dir), agent_accounts.workers_home())

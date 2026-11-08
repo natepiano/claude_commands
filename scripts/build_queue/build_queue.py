@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """Show the build queue, or one step's place and why it waits."""
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 from dataclasses import dataclass
 
@@ -11,7 +15,6 @@ from pathlib import Path
 import sys
 import time
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from scripts.build_queue import head_facts, admission_client, admission_protocol
 from scripts.build_queue.queue_card import select_waiters
@@ -23,10 +26,11 @@ from scripts.buildlog.mac_idle_alert import alert_line, state_dir
 from scripts.lint import memory_admit
 from scripts.lib.user_zone import user_zone
 from scripts.message import unit_labels
+from scripts.production import staff
 
 
 def caller() -> str:
-    return os.environ.get("CODEX_THREAD_ID") or os.environ.get("CLAUDE_CODE_SESSION_ID") or ""
+    return staff.caller_identity()
 
 
 def default_columns() -> int:

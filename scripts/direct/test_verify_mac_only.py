@@ -6,16 +6,73 @@ import json
 import os
 import shlex
 import shutil
+import subprocess
+import sys
 import unittest
 from typing import cast, final
 
-from scripts.direct.verify_mac_offload_test_support import SLEEP_STUB, VerifyMacOffloadFixture
+from scripts.direct.verify_mac_offload_test_support import SLEEP_STUB, VERIFY, VerifyMacOffloadFixture
+from scripts.lib.shell_test_support import shell_functions
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
 @final
 class VerifyMacOnlyTests(VerifyMacOffloadFixture):
+    def isolate_automatic_environment(self) -> dict[str, str]:
+        selected_names = {
+            "NO_COLOR", "CLICOLOR", "CLICOLOR_FORCE", "FORCE_COLOR", "CI", "TZ", "LANG",
+            "LC_ALL", "LC_COLLATE", "LC_CTYPE", "LC_MESSAGES", "LC_MONETARY", "LC_NUMERIC",
+            "LC_TIME", "LC_ADDRESS", "LC_IDENTIFICATION", "LC_MEASUREMENT", "LC_NAME",
+            "LC_PAPER", "LC_TELEPHONE",
+            "RUST_LOG", "RUST_BACKTRACE", "RUST_LIB_BACKTRACE",
+        }
+        self.environment = {
+            name: value for name, value in self.environment.items()
+            if name not in selected_names
+            and not name.startswith(("HANA_", "WGPU_", "BEVY_", "INSTA_", "TRACE_"))
+        }
+        return {
+            "TERM": "xterm-256color", "COLORTERM": "truecolor", "TERM_PROGRAM": "verify",
+            "COLUMNS": "80", "LINES": "24",
+        }
+
+    def mac_result(self, *, extra: dict[str, str], fetch: str = "") -> subprocess.CompletedProcess[str]:
+        """Pass a runner result through the real result reader and call recorder."""
+        functions = shell_functions(
+            VERIFY, "target_for_settings", "target_platform", "step_state", "release_wait_claim",
+            "phase_wait_finish", "collect_routing_wait", "collect_hold_wait", "note_event",
+            "try_mac_test", "check_mac_only_result", "mac_only_refuse", "try_reserved_target",
+        )
+        # These calls start after routing. Other tests keep the watcher and admission boundaries.
+        script = functions + r'''
+set -euo pipefail
+CMD=test PKG=sample ARGS=(sample) MAC_ONLY=1 LOCAL_ONLY=0
+MAC_ENV_NAMES=() VERIFY_MAC_ENVIRONMENT=() NEXTEST_ARGS=()
+MAC_VERB=nextest MAC_SOURCE_ROOT="" MAC_IDLE_MARKER=""
+MAC_FINISH_CALL=1 FILTER_RUN=0 CALL_NOTED=0 CACHE_DIR=""
+STEP_RECORD_ACTIVE=0 STEP_RUNS_ON=mac_allowed
+TREE_WATCH_PID=caller-owned ROUTING_WAIT_STARTED=""
+BUILDLOG_MAC="" BUILDLOG_MAC_REASON="" BUILDLOG_MAC_S="" BUILDLOG_MAC_HOLDER=""
+BUILDLOG_MAC_COPY="" BUILDLOG_MAC_COPY_S=""
+BUILDLOG_MAC_COPY_COUNT="" BUILDLOG_MAC_COPY_NATEDEV_S=""
+BUILDLOG_LOCAL_REASON=""
+export BUILDLOG_CALL_ID="result-$$" BUILDLOG_LOCAL_REASON
+STEP_TARGET_TABLE=$(printf 'mac\teligible\t-\t%s\tmacos' "$MAC_SETTINGS")
+MAC_LEAVE_SETTINGS=$MAC_SETTINGS MAC_LEAVE_REASON=""
+try_reserved_target
+'''
+        return subprocess.run(
+            ["bash", "-c", script], cwd=self.root,
+            env={**self.environment, "PY": sys.executable, "MAC_RUNNER": str(self.runner),
+                 "MAC_SETTINGS": self.environment["MAC_TEST_CONFIG"],
+                 "DOC_REPO_TOP": str(self.root), "HOLD_WAIT_DIR": str(self.root / "tmp"),
+                 "BUILDLOG_RECORD": str(self.home / ".claude/scripts/buildlog/record.py"),
+                 "MAC_FETCH": fetch, "MAC_FETCH_GIVEN": "1" if fetch else "0", **extra},
+            text=True, capture_output=True, timeout=TEST_HANG_GUARD_SECS,
+        )
+
     def test_readonly_exports_reach_runner_without_shell_assignment(self) -> None:
+        automatic_environment = self.isolate_automatic_environment()
         for name, value in (
             ("SHELLOPTS", "braceexpand:errexit:hashall:interactive-comments:nounset:pipefail"),
             ("UID", str(os.getuid())),
@@ -26,14 +83,14 @@ class VerifyMacOnlyTests(VerifyMacOffloadFixture):
                 result = self.verify("test", "sample", "--mac", "why", "--env", name, extra=passed)
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 observed = cast(dict[str, str], json.loads((self.runner_state / "forwarded-environment.json").read_text()))
-                self.assertEqual(observed, {name: value})
+                self.assertEqual(observed, {**automatic_environment, name: value})
                 self.assertEqual(len(self.runner_events()), 1)
                 self.assertEqual(self.local_runs(), [])
                 self.clear_observations()
                 control = self.verify("test", "sample", "--mac", "why", "--no-cache", extra=passed)
                 self.assertEqual(control.returncode, 0, control.stdout + control.stderr)
                 self.assertEqual(len(self.runner_events()), 1)
-                self.assertEqual(json.loads((self.runner_state / "forwarded-environment.json").read_text()), {})
+                self.assertEqual(json.loads((self.runner_state / "forwarded-environment.json").read_text()), automatic_environment)
 
     def test_int_during_long_busy_poll_stops_every_child(self) -> None:
         real_sleep = shutil.which("sleep")
@@ -71,6 +128,7 @@ class VerifyMacOnlyTests(VerifyMacOffloadFixture):
         self.assertEqual(self.last_call()["mac_reason"], "blocked")
 
     def test_forwarded_environment_uses_callers_values_despite_shell_bindings(self) -> None:
+        automatic_environment = self.isolate_automatic_environment()
         for name in ("name", "PKG", "MAC_REASON", "ARGS"):
             with self.subTest(name=name):
                 self.clear_observations()
@@ -79,7 +137,7 @@ class VerifyMacOnlyTests(VerifyMacOffloadFixture):
                     name: value, "TEST_RUNNER_MAC": "passed", "TEST_RUNNER_STATUS": "0"})
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 observed = cast(dict[str, str], json.loads((self.runner_state / "forwarded-environment.json").read_text()))
-                self.assertEqual(observed, {name: value})
+                self.assertEqual(observed, {**automatic_environment, name: value})
                 self.clear_observations()
                 previous_calls = self.call_records()
                 refused = self.verify("test", "sample", "--mac", "why", "--env", name)
@@ -112,10 +170,9 @@ class VerifyMacOnlyTests(VerifyMacOffloadFixture):
 
     def test_policy_refusals_start_nothing(self) -> None:
         cases = (
-            (("test", "sample", "--mac"), '--mac needs a reason: --mac "<why this test must run on macOS>".'),
-            (("test", "sample", "--mac", "  "), '--mac needs a reason: --mac "<why this test must run on macOS>".'),
-            (("test", "sample", "--mac", "--filter"), '--mac needs a reason: --mac "<why this test must run on macOS>".'),
-            (("check", "sample", "--mac", "why"), '--mac applies only to test.'),
+            (("test", "sample", "--mac"), '--mac needs a reason: --mac "<why this command must run on macOS>".'),
+            (("test", "sample", "--mac", "  "), '--mac needs a reason: --mac "<why this command must run on macOS>".'),
+            (("test", "sample", "--mac", "--filter"), '--mac needs a reason: --mac "<why this command must run on macOS>".'),
             (("test", "sample", "--mac", "why", "--local", "requires Linux"), '--mac and --local cannot be used together.'),
             (("test", "sample", "--env", "SHOTS"), '--env and --fetch need --mac "<why>".'),
             (("test", "sample", "--fetch", "target/shots"), '--env and --fetch need --mac "<why>".'),
@@ -168,7 +225,7 @@ class VerifyMacOnlyTests(VerifyMacOffloadFixture):
             with self.subTest(reason=reason):
                 self.clear_observations()
                 mode = "lost" if reason == "lost" else "none" if reason == "runner" else "declined"
-                result = self.verify("test", "sample", "--mac", "why", extra={
+                result = self.mac_result(extra={
                     "TEST_RUNNER_MAC": mode, "TEST_RUNNER_REASON": reason, "TEST_RUNNER_STATUS": "75"})
                 self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
                 self.assertIn(f"verify.sh: test --mac refused: {text}; nothing ran on natedev.\n", result.stderr)
@@ -264,7 +321,7 @@ class VerifyMacOnlyTests(VerifyMacOffloadFixture):
         for word in ("missing", "too_large", "failed", "not_run", "absent"):
             with self.subTest(word=word):
                 self.clear_observations()
-                result = self.verify("test", "sample", "--mac", "why", "--fetch", "target/shots", extra={
+                result = self.mac_result(fetch="target/shots", extra={
                     "TEST_RUNNER_MAC": "passed", "TEST_RUNNER_STATUS": "0",
                     **({"TEST_RUNNER_FETCH": word} if word != "absent" else {})})
                 self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
@@ -275,7 +332,7 @@ class VerifyMacOnlyTests(VerifyMacOffloadFixture):
                 self.assertEqual(self.last_call()["status"], 2)
                 self.assertEqual(self.local_runs(), [])
                 self.assertEqual(self.saved_results(), [])
-        result = self.verify("test", "sample", "--mac", "why", "--fetch", "target/shots", extra={
+        result = self.mac_result(fetch="target/shots", extra={
             "TEST_RUNNER_MAC": "failed", "TEST_RUNNER_STATUS": "42", "TEST_RUNNER_FETCH": "missing"})
         self.assertEqual(result.returncode, 42, result.stdout + result.stderr)
 

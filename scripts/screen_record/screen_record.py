@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
 """Record a short MP4 of one X11 window selected by title."""
 
 from __future__ import annotations
@@ -21,6 +21,7 @@ DIRECTORY_LIMIT = 2_147_483_648
 MAX_AGE_SECONDS = 604_800
 WINDOW_IDS: re.Pattern[str] = re.compile(r"0x[0-9a-fA-F]+")
 WINDOW_NAME = re.compile(r'WM_NAME\((?:STRING|UTF8_STRING)\)\s*=\s*"((?:\\.|[^"\\])*)"')
+TREE_WINDOW = re.compile(r'^\s*(0x[0-9a-fA-F]+)\s+"(.*)": \(', re.MULTILINE)
 CLIP_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
 
 
@@ -158,11 +159,31 @@ def find_window(substring: str) -> FoundWindow:
             raise WindowLookupFailure("screen_record: xprop -root failed")
 
         ids: list[str] = WINDOW_IDS.findall(result.stdout.split("#", 1)[1]) if "#" in result.stdout else []
+        windows: dict[str, str] = {}
+        if not ids:
+            try:
+                result = subprocess.run(
+                    ["xwininfo", "-root", "-tree"],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    timeout=max(0.1, deadline - time.monotonic()),
+                )
+            except FileNotFoundError as exc:
+                raise WindowLookupFailure("screen_record: missing on PATH: xwininfo") from exc
+            except subprocess.TimeoutExpired as exc:
+                raise no_match() from exc
+            if result.returncode != 0:
+                raise WindowLookupFailure(result.stderr.rstrip("\n") or "screen_record: xwininfo -root -tree failed")
+            windows = {
+                match.group(1): match.group(2)
+                for match in TREE_WINDOW.finditer(result.stdout)
+            }
         matches: list[FoundWindow] = []
-        for window_id in ids:
+        for window_id in ids or windows:
             if time.monotonic() >= deadline:
                 raise no_match()
-            title = window_title(window_id, deadline)
+            title = window_title(window_id, deadline) if ids else windows[window_id]
             if title is None:
                 continue
             if title not in seen:

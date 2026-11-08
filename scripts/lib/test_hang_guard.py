@@ -10,7 +10,7 @@ import functools
 import signal
 import socket
 import threading
-import time
+from time import monotonic
 from types import FrameType
 
 
@@ -28,10 +28,10 @@ class LauncherHangGuard:
     """Bound a launcher handshake without letting machine load advance test time."""
 
     name: str
-    started: float = field(default_factory=time.monotonic)
+    started: float = field(default_factory=monotonic)
 
     def remaining(self) -> float:
-        remaining = TEST_HANG_GUARD_SECS - (time.monotonic() - self.started)
+        remaining = TEST_HANG_GUARD_SECS - (monotonic() - self.started)
         if remaining <= 0:
             raise TimeoutError(f"{self.name}: launcher hang guard expired")
         return remaining

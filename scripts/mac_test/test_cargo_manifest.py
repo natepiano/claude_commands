@@ -5,7 +5,7 @@ import tempfile
 from typing import final
 import unittest
 
-import cargo_manifest
+from scripts.mac_test import cargo_manifest
 
 
 @final

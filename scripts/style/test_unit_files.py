@@ -6,17 +6,15 @@ import errno
 from contextlib import redirect_stderr
 import io
 import subprocess
-import sys
 import unittest
 from pathlib import Path
 from typing import cast, override
 from unittest import mock
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-import unit_files
-import style_ledger
-from git_process import GitReadFailed
+from scripts.style import unit_files
+from scripts.style import style_ledger
+from scripts.style.git_process import GitReadFailed
 from scripts.production import session_staff, staff
 from scripts.shutdown import remote
 from scripts.production.staff_test_support import StaffTestCase, fixture_member, recorded_showrunner, recorded_unit

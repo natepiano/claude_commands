@@ -16,7 +16,6 @@ from pathlib import Path
 from typing import ClassVar, cast, final, override
 from unittest.mock import patch
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from scripts.lib.socket_test_support import short_socket_directory
 from scripts.production.staff_test_support import fixture_member, unit_membership, recorded_showrunner, StaffTestCase, fixture_worker, fixture_runtime_id, fixture_session, fixture_roster
@@ -24,18 +23,18 @@ from scripts.production import staff
 from scripts.lib import unit_runs as owned_runs
 from scripts.lib.resume_message import PausedSeat, Resumable, Idle, Unavailable
 from scripts.usage import agents_log
-from test_support import ShutdownTestCase, linux_process_fixture
-import inventory
-import unit_runs
+from scripts.shutdown.test_support import ShutdownTestCase, linux_process_fixture
+from scripts.shutdown import inventory
+from scripts.lib import unit_runs
 from scripts.whoami import account
-import herdr
-import sessions
+from scripts.herdr import herdr
+from scripts.message import sessions
 from scripts.production import showrunners
-import unit_lookup
-import shutdown
-from fake_herdr import CommandResponse
-from cli_fixture import ImmutableGitSeed, invoke_cli
-import fake_herdr
+from scripts.production import unit_lookup
+from scripts.shutdown import shutdown
+from scripts.herdr.fake_herdr import CommandResponse
+from scripts.production.cli_fixture import ImmutableGitSeed, invoke_cli
+from scripts.herdr import fake_herdr
 
 
 TARGET_LOGIN = "owner@example.com"
@@ -109,7 +108,8 @@ class InventoryImportTests(unittest.TestCase):
 import sys
 from pathlib import Path
 root = Path(sys.argv[1])
-sys.path.insert(0, str(root))
+with open(root / "scripts/lib/package_root.py") as package_root:
+    exec(package_root.read(), {"__file__": package_root.name})
 assert str(root / "scripts/shutdown") not in sys.path
 from scripts.shutdown import inventory
 from scripts.production import staff
@@ -178,7 +178,8 @@ class InventoryTests(ShutdownTestCase):
         run = self.root / "paused run"
         run.mkdir()
         command = ["bash", "/config/scripts/direct/review.sh", "--phase", "1", str(run), "/checkout with spaces", "/old/prompt.md", "review-task", "review instructions", "review task", "1", "api"]
-        outer = ["bash", "/config/scripts/direct/implement.sh", "outer arguments"]
+        outer = ["bash", "/config/scripts/direct/assign.sh", "--role", "implement",
+                 "--session-dir", str(run), "--cwd", "/checkout with spaces", "--prompt", "/old/prompt.md"]
         self.herdr_process(810, 811, ["python3", "codex_mesh.py", "follow"], {})
         self.herdr_process(811, 812, command, {})
         self.herdr_process(812, 1, outer, {})
@@ -509,10 +510,10 @@ class InventoryTests(ShutdownTestCase):
         )
         _process_environment_context = cast(
             object,
-            self.enterContext(patch("inventory._process_environment", return_value={})),
+            self.enterContext(patch("scripts.shutdown.inventory._process_environment", return_value={})),
         )
         _process_start_context: object = self.enterContext(
-            patch("inventory._process_start", return_value=CURRENT_PROCESS_START)
+            patch("scripts.shutdown.inventory._process_start", return_value=CURRENT_PROCESS_START)
         )
 
         self.director_pid = os.getpid()
@@ -1036,7 +1037,7 @@ elif "comm=" in joined:
     def test_user_tmux_is_unknown_despite_inherited_herdr_environment(self) -> None:
         self.herdr_process(71_001, 1, ["/fixture/herdr", "--session", "outer", "server"], {})
         self.herdr_process(DESKTOP_PID, 71_001, ["/bin/claude"], {"HERDR_PANE_ID": "w1:p1"})
-        with patch("inventory._process_environment", return_value={"TMUX_PANE": "%9", "HERDR_PANE_ID": "w1:p1"}):
+        with patch("scripts.shutdown.inventory._process_environment", return_value={"TMUX_PANE": "%9", "HERDR_PANE_ID": "w1:p1"}):
             found = inventory.inventory(TARGET_LOGIN)
         desktop = next(session for session in found["sessions"] if session["session_id"] == DESKTOP_ID)
         self.assertEqual(desktop["host"], {"kind": "unknown"})
@@ -1135,7 +1136,7 @@ elif "comm=" in joined:
         record["procStart"] = "recorded-before-pid-reuse"
         _ = path.write_text(json.dumps(record), encoding="utf-8")
 
-        with patch("inventory._process_start", return_value="live-reused-pid-start"):
+        with patch("scripts.shutdown.inventory._process_start", return_value="live-reused-pid-start"):
             found = inventory.inventory(TARGET_LOGIN)
 
         self.assertNotIn(DESKTOP_ID, {session["session_id"] for session in found["sessions"]})
@@ -1383,7 +1384,7 @@ elif "comm=" in joined:
         run = self.root / "paused run"
         run.mkdir()
         command = ["bash", "/config/scripts/direct/review.sh", "--phase", "1", str(run), "/checkout with spaces", "/old/prompt.md", "review-task", "review instructions", "review task", "1", "api"]
-        outer = ["bash", "/config/scripts/direct/implement.sh", "outer arguments"]
+        outer = ["bash", "/config/scripts/direct/assign.sh", "outer arguments"]
         self.herdr_process(810, 811, ["python3", "codex_mesh.py", "follow"], {})
         self.herdr_process(811, 812, command, {})
         self.herdr_process(812, 1, outer, {})

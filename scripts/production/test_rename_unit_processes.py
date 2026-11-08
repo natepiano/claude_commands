@@ -1,21 +1,22 @@
 """Check process ownership without the deleted rename shutdown step."""
 from __future__ import annotations
 
+from scripts.production.staff_test_support import foreign_hostname
+
 import json
 import os
-import sys
 import tempfile
+import unittest
 from pathlib import Path
-from typing import TYPE_CHECKING, NamedTuple, cast, final, override
+from typing import NamedTuple, cast, final, override
 from unittest import mock
 from scripts.production import staff, worker_admission
 from scripts.production.staff_test_support import fixture_worker
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-import retire_unit
-import unit_lookup
-import unit_move
+from scripts.production import retire_unit
+from scripts.production import unit_lookup
+from scripts.production import unit_move
 from scripts.production import staff_sources
 from scripts.production.staff_test_support import (
     StaffTestCase, fixture_unit_location, recorded_showrunner,
@@ -23,13 +24,14 @@ from scripts.production.staff_test_support import (
 from scripts.lib.conf import UseConfiguredValue
 from scripts.lib import conf
 from scripts.lint.memory_test_support import config_environment
-if TYPE_CHECKING:
-    from scripts.shutdown.unit_staff_test_support import PARENTS, isolated_parents
-else:
-    from unit_staff_test_support import PARENTS, isolated_parents
+from scripts.shutdown.unit_staff_test_support import PARENTS, isolated_parents
 
 SLUG = "demo"
 WATCHER = 'while kill -0 "$1"; do sleep "$5"; "$4" "$0" idle-stop --session-dir "$3" --pid "$1" --port "$2"; done'
+
+
+def setUpModule() -> None:
+    unittest.enterModuleContext(foreign_hostname())
 
 
 class FakeProcess(NamedTuple):
@@ -95,7 +97,7 @@ class RunProcessTests(StaffTestCase):
         (folder / retire_unit.DETACHED_RUNS).mkdir(parents=True)
         parent = recorded_showrunner("demo", self.root / "demo-production.md")
         member = fixture_unit_location(parent, worktree.name, worktree)
-        _ = (folder / "progress_history_state.json").write_text(json.dumps({"production": parent.name, "unit": member.name}))
+        _ = (folder / "progress_history_state.json").write_text(json.dumps({"owner_staff_id": member.id}))
         return folder
 
     def run_record(self, folder: Path, label: str, pid: int) -> Path:

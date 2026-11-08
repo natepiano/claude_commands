@@ -2,15 +2,13 @@
 # worker_name.sh — Print the mesh name a worker launches under.
 #
 # Usage: worker_name.sh <working_dir> <slot> <kind> [prefix]
-#   prefix — replaces the project name; implement.sh passes its 10th argument
+#   prefix — replaces the project name
 #
 # The name is `<project>-<slot>`: `hana_catalyst-impl`, `hana_catalyst-test`.
 # A repair worker -- slot impl, kind fix -- is `<project>-fix`.
 #
-# One script owns the rule because two callers need it: implement.sh launches
-# the worker under this name, and the unit director writes it into the peer's
-# prompt before that launch. Two copies of the rule would drift, and a peer
-# told the wrong name sends into nothing.
+# assign.py uses this rule for the worker name.
+# The unit director uses the same rule in peer prompts.
 #
 # <project> is the directory name of the working tree's git top level, so a
 # worktree is named for itself, the same name its interactive session carries

@@ -27,11 +27,8 @@ from scripts.lib.socket_test_support import short_socket_directory
 from scripts.production import staff
 from scripts.production.staff_test_support import fixture_member, fixture_worker, fixture_runtime_id, isolated_staff_file
 from scripts.lint import memory_admit as gate
-from typing import TYPE_CHECKING, cast
-if TYPE_CHECKING:
-    from scripts.lib import conf
-else:
-    import conf
+from typing import cast
+from scripts.lib import conf
 from scripts.build_queue import admission_client as client, admission_protocol as wire
 from scripts.build_queue import admission_records as records, queue_evidence, step_estimator
 from scripts.build_queue.admission_test_support import admitted_reply, wait_reply
@@ -51,6 +48,12 @@ def setUpModule() -> None:
 
 
 class ClientTests(unittest.TestCase):
+    def test_import_does_not_load_memory_admission(self) -> None:
+        result = subprocess.run([sys.executable, "-c",
+            "import sys\nfrom scripts.build_queue import admission_client\nprint('\\n'.join(sys.modules))"],
+            cwd=Path(__file__).resolve().parents[2], capture_output=True, text=True, check=True)
+        self.assertNotIn("scripts.lint.memory_admit", result.stdout.splitlines())
+
     def test_outage_message_reaches_builds_without_herdr_on_path(self) -> None:
         with short_socket_directory() as directory:
             root = Path(directory)
@@ -115,6 +118,7 @@ class ClientTests(unittest.TestCase):
                 child_environment = dict(os.environ)
                 _ = child_environment.pop("TEST_SENDER_GUARD", None)
                 _ = child_environment.pop("HERDR_BIN", None)
+                child_environment["PYTHONPATH"] = str(Path(__file__).resolve().parents[2])
                 message = "The build queue service has not answered. Builds wait."
                 with FakeDaemon(address, receive, repeat=True):
                     result = subprocess.run(command, input=message, text=True, capture_output=True,

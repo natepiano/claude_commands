@@ -1,6 +1,10 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
 """Find local Claude quota refusals and start safe, account-grouped moves."""
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import argparse
 import fcntl
@@ -24,9 +28,6 @@ from typing import TYPE_CHECKING, Literal, NotRequired, Protocol, TypedDict, cas
 from uuid import uuid4
 
 ROOT = Path(__file__).resolve().parents[2]
-sys.path.insert(0, str(ROOT))
-sys.path.insert(0, str(ROOT / "scripts" / "shutdown"))
-sys.path.insert(0, str(ROOT / "scripts" / "whoami"))
 from scripts.lib import conf
 from scripts.agents import codex_mesh
 from scripts.accounts import accounts, moves, next_moves, refusals, role_map
@@ -34,7 +35,7 @@ from scripts.whoami import account
 from scripts.whoami import agent_accounts
 from scripts.whoami.note_file import canonical_label
 from scripts.whoami import usage_store
-from quota_alert import (RefusedAt, _refusal_window, blocked_next_move_line, blocked_next_move_reason_key, notify_blocked_next_move,  # pyright: ignore[reportPrivateUsage]
+from scripts.whoami.quota_alert import (RefusedAt, _refusal_window, blocked_next_move_line, blocked_next_move_reason_key, notify_blocked_next_move,  # pyright: ignore[reportPrivateUsage]
                          BlockedHeadReason as BlockedHeadReason, NoTargetReading as NoTargetReading,
                          TargetReadingUnavailable as TargetReadingUnavailable,
                          TargetLoginRenewalFailed as TargetLoginRenewalFailed,
@@ -47,9 +48,9 @@ if TYPE_CHECKING:
     from scripts.herdr import herdr
     from scripts.message import sessions
 else:
-    inventory_module = import_module("inventory")
-    sessions = import_module("sessions")
-    herdr = import_module("herdr")
+    inventory_module = import_module("scripts.shutdown.inventory")
+    sessions = import_module('scripts.message.sessions')
+    herdr = import_module("scripts.herdr.herdr")
 
 
 CLAUDE_LIMIT_PHRASES = ("hit your session limit", "hit your weekly limit")
@@ -378,7 +379,7 @@ class LockedNextMoveEdit:
             if state != original:
                 _save_state(state)
             if discarded:
-                import quota_alert
+                from scripts.whoami import quota_alert
                 with quota_alert.state_file() as quota_state:
                     for entry_id in discarded:
                         _ = quota_state.get("workers_move_notices", {}).pop(entry_id, None)
@@ -665,7 +666,7 @@ def live_owners(*, only: frozenset[str] = NO_SESSION_FILTER) -> list[inventory_m
 
 
 def _notify_no_room(text: str, now: datetime) -> bool:
-    import quota_alert
+    from scripts.whoami import quota_alert
     config = quota_alert.load_config()
     return quota_alert.deliver_notice([quota_alert.Job("", recipient, text, "refusal")
         for recipient in quota_alert.recipients(config)], now.isoformat())
@@ -713,7 +714,7 @@ def _set_transition(state: WatchState, session_id: str, entry_id: str, transitio
 
 def _continue_session(session_id: str, entry_id: str) -> ContinuationDelivered | ContinuationNotDelivered:
     # Shutdown imports this watcher for its hold and cancellation; resolve its delivery boundary at use.
-    messenger = cast(LiveSessionMessenger, cast(object, import_module("restart_support")))
+    messenger = cast(LiveSessionMessenger, cast(object, import_module("scripts.shutdown.restart_support")))
     try:
         delivery = messenger.send_message(f"session:{session_id}", "Quota wait ended", "Continue where you stopped.",
             key=f"quota-continue-{session_id}-{entry_id}")

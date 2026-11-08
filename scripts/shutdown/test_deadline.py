@@ -5,7 +5,6 @@ import math
 import os
 import signal
 import subprocess
-import sys
 import tempfile
 import time
 import unittest
@@ -14,11 +13,8 @@ from pathlib import Path
 from typing import cast, override
 from unittest.mock import Mock, patch
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "herdr"))
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-import herdr
-import restart
+from scripts.herdr import herdr
+from scripts.shutdown import restart
 from scripts.lib import atomic_file, conf, operation_deadline
 from scripts.production import staff
 from scripts.shutdown import stop_resume
@@ -29,6 +25,7 @@ class DeadlineTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
+        _ = self.enterContext(patch.object(herdr, "herdr_binary", return_value=str(Path(herdr.__file__).with_name("fake_herdr.py"))))
         self.now = 100.0
         config = Path(self.enterContext(tempfile.TemporaryDirectory()))
         atomic_file.write_text_atomic(config / "shutdown.conf",

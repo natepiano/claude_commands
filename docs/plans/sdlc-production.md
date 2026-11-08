@@ -11,7 +11,7 @@
 - **Showrunner session:** sdlc
 - **Log:** `docs/plans/sdlc-log.md` — untracked: never added or committed (never `git add -A` or `-a`); one line per event
 - **Updates:** on demand (user, 2026-10-13: no timer unless asked); each update reports every unit in full
-- **Merge tests:** `env HERDR_BIN=/nonexistent/herdr ~/.claude/scripts/lib/py ~/.claude/scripts/production/merge_gate.py --checkout . --tests-only` and `basedpyright scripts/direct scripts/production` (pass is its `0 errors, 0 warnings` line), run in the showrunner checkout
+- **Merge tests:** `env HERDR_BIN=/nonexistent/herdr ~/.claude/scripts/lib/py ~/.claude/scripts/production/merge_gate.py --checkout . --tests-only` and `basedpyright scripts/direct scripts/production`, run in the showrunner checkout (basedpyright passes on its `0 errors, 0 warnings` line)
 - **Push:** git
 - **Promote:** ~/.claude, mac ~/.claude
 - **Capacity:** natedev has 32 cores and 60 GB of memory; four units. The work is mostly documents and Python scripts, so the load is low. Its seats share natedev's build slots with build-followups.

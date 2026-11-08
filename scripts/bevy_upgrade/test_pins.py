@@ -7,7 +7,7 @@ import unittest
 from pathlib import Path
 from typing import final, override
 
-import pins
+from scripts.bevy_upgrade import pins
 
 REGISTRY = "registry+https://github.com/rust-lang/crates.io-index"
 REVISION = "1234567890abcdef1234567890abcdef12345678"

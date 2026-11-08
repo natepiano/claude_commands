@@ -9,22 +9,20 @@ import contextlib
 import io
 import json
 import os
-import sys
 import tempfile
 import unittest
 from pathlib import Path
 from typing import cast, override
 from unittest import mock
 
-import fake_unit_host
-import unit_effort
-import unit_lookup
-import herdr
-from fake_herdr import CommandResponse
-from fake_unit_host import HostedUnit
-from unit_effort import Ready, Skipped
+from scripts.production import fake_unit_host
+from scripts.production import unit_effort
+from scripts.production import unit_lookup
+from scripts.herdr import herdr
+from scripts.herdr.fake_herdr import CommandResponse
+from scripts.production.fake_unit_host import HostedUnit
+from scripts.production.unit_effort import Ready, Skipped
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.lib import models_registry  # noqa: E402
 from scripts.production.staff_test_support import StaffTestCase, isolated_staff_file, fixture_runtime_id, fixture_member
 

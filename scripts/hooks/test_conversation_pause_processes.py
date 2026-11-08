@@ -3,14 +3,11 @@
 from __future__ import annotations
 
 import fcntl
-from pathlib import Path
 import subprocess
 import sys
 import unittest
 from typing import ClassVar
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "production"))
 
 from scripts.hooks.conversation_pause_test_support import (
     LIBRARY, PROMPT_HOOK, QUESTION, ConversationPauseFixture,
@@ -82,8 +79,8 @@ class ConversationPauseProcessTests(ConversationPauseFixture):
         _ = sessions.write_text(
             "".join((
                 "#!/usr/bin/env python3\n",
-                "import os, sys\n",
-                f"sys.path.insert(0, {str(LIBRARY.parents[2])!r})\n",
+                "import os\n",
+                f"with open({str(LIBRARY.parents[1] / 'lib/package_root.py')!r}) as package_root: exec(package_root.read(), {{'__file__': package_root.name}})\n",
                 "from scripts.direct.wait_for_test_state import wait_until\n",
                 "from pathlib import Path\n",
                 "Path(os.environ['LOOKUP_MARKER']).touch()\n",
@@ -188,8 +185,8 @@ class ConversationPauseProcessTests(ConversationPauseFixture):
         _ = send.write_text(
             "".join((
                 "#!/usr/bin/env python3\n",
-                "import os, sys\n",
-                f"sys.path.insert(0, {str(LIBRARY.parents[2])!r})\n",
+                "import os\n",
+                f"with open({str(LIBRARY.parents[1] / 'lib/package_root.py')!r}) as package_root: exec(package_root.read(), {{'__file__': package_root.name}})\n",
                 "from scripts.direct.wait_for_test_state import wait_until\n",
                 "from pathlib import Path\n",
                 "Path(os.environ['SEND_MARKER']).touch()\n",

@@ -11,27 +11,17 @@ import re
 import shutil
 import subprocess
 import sys
-from typing import TYPE_CHECKING, cast, override
+from typing import cast, override
 from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
 ROOT = Path(__file__).resolve().parents[2]
-for dependency in ("lib", "herdr", "production", "message", "shutdown", "notify", "whoami", "direct"):
-    sys.path.insert(0, str(ROOT / "scripts" / dependency))
-sys.path.insert(0, str(ROOT))
-if TYPE_CHECKING:
-    from scripts.herdr import herdr, herdr_sessions
-    from scripts.production import add_unit, add_showrunner
-    from scripts.notify import review
-    from scripts.notify.user_action import NoActionRequired
-else:
-    import herdr
-    import add_unit
-    import add_showrunner
-    import herdr_sessions
-    import review
-    from user_action import NoActionRequired
+from scripts.herdr import herdr, herdr_sessions
+from scripts.production import add_unit, add_showrunner
+from scripts.notify import review
+from scripts.notify.user_action import NoActionRequired
 from scripts.direct.assign_launcher_test_support import backend_fixture_command
+from scripts.direct import test_claude_worker
 from scripts.accounts import accounts
 from scripts.lib import nix_env
 from scripts.lib.test_models_registry import write_registry
@@ -68,6 +58,7 @@ class HerdrLaunchTests(NixFixture):
         super().setUp()
         _ = self.enterContext(patch.object(herdr, "shared_session", return_value="fixture-server"))
         _ = self.enterContext(patch.object(herdr, "start_server"))
+        _ = self.enterContext(patch.object(herdr.Herdr, "run_in_pane"))
         _ = self.enterContext(patch.object(os, "execvp", side_effect=AssertionError("unexpected fixture attach")))
         _ = self.enterContext(patch.object(account, "named_account_environment", return_value={"CLAUDE_CONFIG_DIR": str(self.home / ".claude3")}))
 
@@ -253,17 +244,14 @@ class ShellLaunchTests(NixFixture):
         self.scripts = self.home / ".claude/scripts"
         _ = shutil.copytree(ROOT / "scripts/lib", self.scripts / "lib", dirs_exist_ok=True,
                             ignore=shutil.ignore_patterns("__pycache__", "test_*"))
-        for relative in ("agents/agent_exec.sh", "agents/agent_bg.sh", "agents/worker_lifecycle.py", "cli_agent/cli_agent.sh", "berth_fix/launch.sh", "make_a_worktree/direnv_allow.sh"):
+        for relative in ("agents/agent_exec.sh", "agents/worker_lifecycle.py", "cli_agent/cli_agent.sh", "berth_fix/launch.sh", "make_a_worktree/direnv_allow.sh"):
             destination = self.scripts / relative
             destination.parent.mkdir(parents=True, exist_ok=True)
-            if relative in ("agents/agent_bg.sh", "agents/agent_exec.sh"):
+            if relative == "agents/agent_exec.sh":
                 destination.symlink_to(ROOT / "scripts" / relative)
             else:
                 _ = shutil.copyfile(ROOT / "scripts" / relative, destination)
         (self.scripts / "direct").symlink_to(ROOT / "scripts/direct", target_is_directory=True)
-        py = self.scripts / "lib/py"
-        _ = py.write_text('#!/bin/sh\nexec ' + sys.executable + ' "$@"\n')
-        py.chmod(0o755)
         _ = (self.scripts / "agents/claude_account.sh").write_text('claude_launch_environment() { return 0; }\n')
         _ = (self.scripts / "agents/models_config.sh").write_text(
             (ROOT / "scripts/agents/models_config.sh").read_text()
@@ -286,7 +274,10 @@ print('{"type":"result","result":"fixture completed"}')
 
     def run_script(self, relative: str, args: list[str], directory: Path) -> subprocess.CompletedProcess[str]:
         command, environment = ["bash", str(self.scripts / relative), *args], self.env
-        if relative in ("agents/agent_bg.sh", "agents/agent_exec.sh"):
+        if relative == "direct/claude_worker.py":
+            run, name, cwd, prompt, summary, log = args
+            command = test_claude_worker.worker_command(name, Path(run), Path(cwd), Path(prompt), Path(summary), Path(log))
+        if relative == "agents/agent_exec.sh":
             command, environment = backend_fixture_command(self.root / "assign-parent", command, environment)
         return subprocess.run(command, cwd=directory, env=environment, capture_output=True, text=True,
                               timeout=TEST_HANG_GUARD_SECS, check=False)
@@ -318,12 +309,15 @@ print('{"type":"result","result":"fixture completed"}')
     def test_cli_agent(self) -> None:
         self.launch_contract("cli_agent/cli_agent.sh", [], self.work)
 
-    def test_agent_bg(self) -> None:
+    def test_claude_worker(self) -> None:
+        _ = (self.home / ".claude.json").write_text(json.dumps({
+            "oauthAccount": {"emailAddress": "fixture@example.invalid"}}))
         (self.scripts / "production").symlink_to(ROOT / "scripts/production", target_is_directory=True)
+        self.env["CLAUDE_CONFIG_DIR"] = ""
         with isolated_staff_file(self.root / "staff.json", self.env):
             owner = unit_membership("child", "unit")
             self.env["CODEX_THREAD_ID"] = owner.id
-            self.launch_contract("agents/agent_bg.sh", ["--run", str(self.root / "run"), "fixture", str(self.work), str(self.root / "prompt"),
+            self.launch_contract("direct/claude_worker.py", [str(self.root / "run"), "fixture", str(self.work), str(self.root / "prompt"),
                 str(self.root / "result"), str(self.root / "launch.log")], self.work)
         rows = [cast(dict[str, object], json.loads(line)) for line in self.started.read_text().splitlines()]
         arguments = cast(list[str], rows[0]["args"])

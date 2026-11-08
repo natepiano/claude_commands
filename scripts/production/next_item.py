@@ -23,6 +23,10 @@ docs; a production with none has no efficiency items. A list that cannot be read
 one line on stderr.
 """
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import argparse
 import sys
@@ -32,24 +36,24 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, NamedTuple, TypeVar, cast
 
-import change_review
-import proposals_folder
-import proposals_table
-from footer_counts import efficiency_ledger
+from scripts.production import change_review
+from scripts.production import proposals_folder
+from scripts.production import proposals_table
+from scripts.production.footer_counts import efficiency_ledger
 from scripts.production.store_owner import document_id
 from scripts.production import staff
 from scripts.production.production_doc import Refusal, read_production
-from update_registration import QuestionStaff, RegistrationFailure, open_lists, question_queue
+from scripts.production.update_registration import QuestionStaff, RegistrationFailure, open_lists, question_queue
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
-import urgency  # noqa: E402
-from user_zone import user_zone  # noqa: E402
+from scripts.lib import urgency  # noqa: E402
+from scripts.lib.user_zone import user_zone  # noqa: E402
 
 if TYPE_CHECKING:
     from ..nightly_review import candidates
 else:
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "nightly_review"))
-    import candidates
+    from scripts.nightly_review import candidates
 
 CHANGE = "change"
 PROPOSAL = "proposal"

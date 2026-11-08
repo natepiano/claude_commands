@@ -1,7 +1,11 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
 """Stop tests and builds outside a natedev hold, independent of their launch path."""
 
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import argparse
 import fcntl
@@ -17,27 +21,15 @@ import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal, cast
+from typing import Literal, cast
 
-import build_hold
-from hold_applies import BUILDING_CARGO_VERBS, cargo_verb
+from scripts.build_hold import build_hold
+from scripts.build_hold.hold_applies import BUILDING_CARGO_VERBS, cargo_verb
+from scripts.lib.suite_runners import SUITE_RUNNERS, starts_suite_runner
 
-if TYPE_CHECKING:
-    from ..direct import step_record
-else:
-    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "direct"))
-    import step_record
-
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "buildlog"))
-
-if TYPE_CHECKING:
-    from ..buildlog import store
-    from ..lib.boot_identity import boot_identity
-else:
-    import store
-    from scripts.lib.boot_identity import boot_identity
-
-
+from scripts.direct import step_record
+from scripts.buildlog import store
+from scripts.lib.boot_identity import boot_identity
 
 @dataclass(frozen=True)
 class AllowedBuild:
@@ -149,12 +141,11 @@ def is_waiting_gate(process: build_hold.AuditProcess) -> bool:
     if not process.argv:
         return False
     executable = Path(process.argv[0]).name
-    if executable in {"verify.sh", "merge_gate.py"}:
+    if executable == "verify.sh" or starts_suite_runner(process.argv):
         return True
     if executable.startswith("python"):
         target = python_target(process.argv[1:])
-        return (target[:2] == ("-m", "scripts.production.merge_gate")
-                or bool(target) and Path(target[0]).name == "merge_gate.py")
+        return starts_suite_runner(target)
     if executable not in {"bash", "sh", "dash", "zsh"}:
         return False
     for argument in process.argv[1:]:
@@ -175,7 +166,7 @@ def is_build(process: build_hold.AuditProcess) -> bool:
             arguments = arguments[1:]
         if arguments in {("-vV",), ("-V",), ("--version",)}:
             return False
-    if names & ((build_hold.AUDIT_COMMANDS - {"cargo"}) | {"clippy-driver", "pytest", "py.test", "basedpyright", "merge_gate.py"}):
+    if names & ((build_hold.AUDIT_COMMANDS - {"cargo"}) | {"clippy-driver", "pytest", "py.test", "basedpyright"} | SUITE_RUNNERS):
         return True
     if "rust-analyzer" in names:
         # Ownership needs ancestors, so it is checked by decide_builds.
@@ -185,8 +176,8 @@ def is_build(process: build_hold.AuditProcess) -> bool:
             return True
         target = python_target(process.argv[1:])
         return (target[:2] in {("-m", "unittest"), ("-m", "pytest")}
-                or target[:2] == ("-m", "scripts.production.merge_gate")
-                or bool(target) and (Path(target[0]).name in {"pytest", "py.test", "merge_gate.py", "basedpyright"}
+                or starts_suite_runner(target)
+                or bool(target) and (Path(target[0]).name in {"pytest", "py.test", "basedpyright"}
                                      or Path(target[0]).match("test_*.py")))
     if names & {"node", "nodejs"}:
         return any(Path(argument).name in {"basedpyright", "basedpyright.js"} for argument in process.argv[1:])
@@ -233,7 +224,7 @@ def protected_reason(
         # Missing, stale and unreadable records grant no permission.
         return ""
     if is_waiting_gate(process):
-        return "verify.sh or merge_gate.py waits at its own hold gate"
+        return "verify.sh or a suite runner waits at its own hold gate"
     if any(is_sccache_server(item) for item in (process, *ancestors)):
         return "sccache server compiles for the holder too"
     lineage = (process, *ancestors)
@@ -436,7 +427,7 @@ class StopBuildsAndTests:
 def start() -> None:
     """Keep an active unit; otherwise start the service or one detached fallback."""
     script = Path(__file__).resolve()
-    python = str(Path(sys.executable).resolve())
+    python = str(script.parents[1] / "lib/py")
     if shutil.which("systemctl"):
         try:
             active = subprocess.run(["systemctl", "--user", "is-active", "build-hold-enforcer"],

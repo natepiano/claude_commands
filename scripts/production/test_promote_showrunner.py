@@ -10,7 +10,6 @@ import json
 import math
 import os
 import subprocess
-import sys
 import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
@@ -19,19 +18,16 @@ from pathlib import Path
 from typing import Callable, cast, final, override
 from unittest import mock
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-
-import add_showrunner
-import promote_showrunner
+from scripts.production import add_showrunner
+from scripts.production import promote_showrunner
 from scripts.production import showrunners, worker
 from scripts.shutdown import stop_resume
-import showrunner_tree
-import unit_effort
-import unit_lookup
-import herdr
-import sessions
+from scripts.production import showrunner_tree
+from scripts.production import unit_effort
+from scripts.production import unit_lookup
+from scripts.herdr import herdr
+from scripts.message import sessions
 from scripts.production.production_doc import ProductionDocument, Refusal, read_new_production, read_production
 from scripts.accounts import accounts
 from scripts.herdr import herdr as trust_reader, worker_panes
@@ -326,7 +322,6 @@ class PromoteShowrunnerTests(unittest.TestCase):
         del deadline
         self.events.append(f"stop member {session}")
         return stop_resume.Stopped(session, PID)
-
 
 
     def child_checked(self, _child: ProductionDocument, caller: str, ending: add_showrunner.EndingTab = add_showrunner.NO_ENDING_TAB, start_in: Path | None = None, *, config_dir: Path | None = None) -> None:

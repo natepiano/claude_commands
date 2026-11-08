@@ -2,28 +2,25 @@
 
 from __future__ import annotations
 
-import sys
 import fcntl
 import json
 import os
 import subprocess
 import unittest
-from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 from threading import Event
 from datetime import datetime, timedelta
 from unittest import mock
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.whoami import quota_alert_test_support as support
-import quota_alert
+from scripts.whoami import quota_alert
 from scripts.production import showrunners
 from scripts.whoami import agent_accounts
 from scripts.whoami.agent_accounts import Quota, Report
 from scripts.whoami import usage_store
-from agent_notes import local_reset
+from scripts.whoami.agent_notes import local_reset
 from scripts.accounts import accounts, moves, next_moves, role_map
-from user_action import ActionRequired
+from scripts.notify.user_action import ActionRequired
 from scripts.whoami.quota_alert_test_support import Notes, REAL_RECIPIENTS, REAL_TELL_USER, REGISTRY as REGISTRY, running
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 

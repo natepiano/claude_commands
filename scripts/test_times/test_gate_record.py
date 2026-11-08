@@ -8,13 +8,11 @@ import io
 import json
 import os
 from pathlib import Path
-import sys
 import tempfile
 from typing import cast, override
 import unittest
 from unittest import mock
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from scripts.test_times import gate_record
 from scripts.buildlog import record, store

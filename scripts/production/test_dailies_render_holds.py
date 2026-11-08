@@ -5,7 +5,6 @@ from __future__ import annotations
 import json
 import os
 import subprocess
-import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -117,7 +116,7 @@ class DailiesHoldTests(unittest.TestCase):
 
     def run_script(self, script: Path, *arguments: str) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
-            ["python3", str(script), *arguments],
+            [str(SCRIPT.parents[1] / "lib/py"), str(script), *arguments],
             capture_output=True,
             text=True,
             check=False,
@@ -252,11 +251,11 @@ class DailiesHoldTests(unittest.TestCase):
         self.assertFalse(any("build hold" in line or "QueuedUnconfirmed" in line for line in footer))
         status = self.run_script(HOLD_SCRIPT, "status")
         self.assertEqual(status.stdout.strip(), "no build hold")
-        buildlog = SCRIPT.parent.parent / "buildlog"
         checked = subprocess.run(
-            ["python3", "-c", "import rust_release; print(rust_release.build_hold_active())"],
+            [str(SCRIPT.parents[1] / "lib/py"), "-c",
+             "from scripts.buildlog import rust_release; print(rust_release.build_hold_active())"],
             capture_output=True, text=True, check=False,
-            env={**os.environ, "HOME": str(self.scratch), "PYTHONPATH": str(buildlog),
+            env={**os.environ, "HOME": str(self.scratch),
                  "BUILD_HOLD_DIR": str(self.folder), "BUILD_HOLD_RELEASE_DIR": str(self.scratch / "release"),
                  "BUILDLOG_MEMINFO": str(self.scratch / "meminfo")},
         )
@@ -405,14 +404,14 @@ class DailiesHoldTests(unittest.TestCase):
         units = [unit(True), {**unit(True), "unit": "frame-time", "label": "frame"}]
         # The child joins its recorder before the temporary log is removed.
         child = (
-            "import sys, threading; sys.path.insert(0, sys.argv.pop(1)); import build_hold; "
+            "import sys, threading; from scripts.build_hold import build_hold; "
             "status = build_hold.main(sys.argv[1:]); "
             f"[thread.join(timeout={TEST_HANG_GUARD_SECS}) for thread in threading.enumerate() if thread.name == 'hold-event-recorder']; "
             "assert not any(thread.name == 'hold-event-recorder' for thread in threading.enumerate()); "
             "sys.exit(status)"
         )
         release = subprocess.run(
-            [sys.executable, "-c", child, str(HOLD_SCRIPT.parent), "release", "--holder", "first"],
+            [str(SCRIPT.parents[1] / "lib/py"), "-c", child, "release", "--holder", "first"],
             capture_output=True, text=True, check=False, env=dict(os.environ))
         self.assertEqual(release.returncode, 0, release.stderr)
         self.assertIn("still held by second", release.stdout)

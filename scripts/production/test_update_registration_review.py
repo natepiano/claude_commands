@@ -15,28 +15,28 @@ from unittest import mock
 
 from scripts.production.update_registration_test_support import RegistrationFixture, registration, showrunners, dailies_render, read_production, review
 from scripts.production.cli_fixture import production_paths
-import showrunner_tree
+from scripts.production import showrunner_tree
 
 from scripts.production.update_registration_test_support import setUpModule as setUpModule
 
 
 class RegistrationTests(RegistrationFixture):
     def test_new_object_question_requires_full_text_but_log_remains_a_parser(self) -> None:
+        pending = self.question_instance() / "pending_reviewed.json"
         state = self.question_state([{"text": "Choose layout"}])
         parsed = registration.judgment_state(state, "log")
         self.assertIsInstance(parsed.outstanding, registration.ReplaceOutstanding)
         with self.assertRaisesRegex(registration.RegistrationFailure, "a new question needs its full text"):
             _ = self.run_questions(state)
         self.assertFalse(self.outstanding().exists())
-        self.assertFalse((self.state / "notifier/showrunner-example/pending_reviewed.json").exists())
+        self.assertFalse(pending.exists())
 
     def test_held_question_batch_writes_no_records_and_rerun_accepts_reviewed_text(self) -> None:
         outstanding = self.outstanding()
         _ = outstanding.write_text('[{"since":"2026-10-01T08:00","text":"Existing reminder"}]')
         history = outstanding.with_suffix(".history.jsonl")
         _ = history.write_text(json.dumps({"time": datetime.now(timezone.utc).isoformat(), "text": "Earlier"}) + "\n")
-        pending = self.state / "notifier/showrunner-example/pending_reviewed.json"
-        _ = self.question_instance()
+        pending = self.question_instance() / "pending_reviewed.json"
         _ = pending.write_text(json.dumps({"items": [{"kind": "reviewed", "text": "Earlier", "reviewed": "Earlier question?"}]}))
         before = [path.read_bytes() for path in (outstanding, history, pending)]
         full = "Build 42 failed.\nRetry (recommended) or stop?"
@@ -66,8 +66,7 @@ class RegistrationTests(RegistrationFixture):
         _ = outstanding.write_text("[]")
         history = outstanding.with_suffix(".history.jsonl")
         _ = history.write_text("")
-        pending = self.state / "notifier/showrunner-example/pending_reviewed.json"
-        pending.parent.mkdir(parents=True)
+        pending = self.question_instance() / "pending_reviewed.json"
         _ = pending.write_text('{"items":[]}')
         paths = (outstanding, history, pending)
         before = [path.read_bytes() for path in paths]

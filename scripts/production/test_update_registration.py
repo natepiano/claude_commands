@@ -16,20 +16,40 @@ from unittest import mock
 from zoneinfo import ZoneInfo
 
 from scripts.production import rename, session_staff, staff, showrunners
+from scripts.shutdown import remote
 from scripts.production.rename_test_support import RenameDisplays
 from scripts.production.cli_fixture import production_paths
 from scripts.production.staff_test_support import fixture_member, showrunner_relationship
 from scripts.production.update_registration_test_support import RegistrationFixture, review, dailies_render, registration
 
-import dailies_input
-import footer_counts
-import next_item
-import tidy_wrapped
+from scripts.production import dailies_input
+from scripts.production import footer_counts
+from scripts.production import next_item
+from scripts.production import tidy_wrapped
 from scripts.hooks import showrunner_footer
 
 
 
 class RegistrationTests(RegistrationFixture):
+    def test_unreadable_timer_reports_and_continues_prompt_adoption(self) -> None:
+        timer = self.state / "notifier" / f"showrunner-{self.owner_id}"
+        timer.mkdir(parents=True)
+        _ = (timer / "conf").write_bytes(b"TARGET=\xff\n")
+        prompt = self.state / "showrunner" / self.owner_id / "prompt.txt"
+        prompt.parent.mkdir(parents=True)
+        _ = prompt.write_text("old prompt\n")
+        with mock.patch.dict(os.environ, self.env), production_paths(self.env):
+            lookup = showrunners.timer_scratch(self.owner_id, record=staff.snapshot())
+        self.assertIsInstance(lookup, showrunners.TimerConfigurationUnreadable)
+
+        result = self.run_command("log", "adopt the prompt")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(len(result.stderr.splitlines()), 1)
+        self.assertIn("timer configuration unreadable", result.stderr)
+        self.assertIn("decode", result.stderr)
+        self.assertIn(f"rewrote {prompt} from produce.md", result.stdout)
+        self.assertIn(str(self.state / "showrunner" / self.owner_id / "session"), prompt.read_text())
+
     def test_start_and_resume_retarget_only_updates_and_retire_old_session(self) -> None:
         doc_bytes = self.doc.read_bytes()
         first = self.run_command("register")
@@ -169,7 +189,7 @@ class QuestionIdentityTests(RegistrationFixture):
         self.timer("example")
         parent = showrunner_relationship("example")
         self.asker_id = fixture_member("unit", name="alpha", parent=parent.id,
-                                       worktree=staff.PresentWorktree("natedev", self.root / "alpha")).id
+                                       worktree=staff.PresentWorktree(remote.local_machine(), self.root / "alpha")).id
 
     def file_question(self, title: str = "Choose the layout", question: str = "Keep the layout?") -> None:
         with mock.patch.object(review, "review_question", return_value=review.QuestionAccepted(question)):
@@ -302,7 +322,7 @@ class QuestionIdentityTests(RegistrationFixture):
         assert row is not None
         removed = self.root / "removed-asker-worktree"
         self.assertFalse(removed.exists())
-        row = staff.set_worktree(row.id, staff.RemovedWorktree("natedev", removed),
+        row = staff.set_worktree(row.id, staff.RemovedWorktree(remote.local_machine(), removed),
                                  expected=row.worktree)
         displays = RenameDisplays(row, live=False)
         with (self.forbid_legacy_question_access(),
@@ -397,7 +417,7 @@ class QuestionIdentityTests(RegistrationFixture):
         owner = staff.by_id(self.asker_id)
         assert owner is not None
         second = fixture_member("unit", name="beta", parent=owner.parent,
-                                worktree=staff.PresentWorktree("natedev", self.root / "beta"))
+                                worktree=staff.PresentWorktree(remote.local_machine(), self.root / "beta"))
         legacy = [{"since": "2026-10-06T08:00", "text": "Choose the layout",
                    "question": "Keep the layout?", "asked_by": str(asker)}
                   for asker in (self.asker_id, second.id)]
@@ -436,7 +456,7 @@ class QuestionIdentityTests(RegistrationFixture):
         parent = staff.by_id(self.asker_id)
         assert parent is not None
         child = fixture_member("showrunner", name="child", parent=parent.parent,
-                               doc=staff.LiveDoc("natedev", child_doc))
+                               doc=staff.LiveDoc(remote.local_machine(), child_doc))
         self.write_open_for("child", {"since": "2026-10-06T08:00", "text": "Choose the compiler",
                                       "question": "Use this compiler?", "asked_by": str(child.id)})
         self.assertFalse((self.state / "notifier/showrunner-child").exists())
@@ -640,7 +660,7 @@ class QuestionIdentityTests(RegistrationFixture):
 
     def test_open_and_answer_use_the_document_owner_without_a_timer_after_rename(self) -> None:
         self.file_question()
-        owner = staff.snapshot().by_doc("natedev", self.doc)
+        owner = staff.snapshot().by_doc(remote.local_machine(), self.doc)
         assert owner is not None
         timer = self.state / f"notifier/showrunner-{self.fixture_staff_id()}"
         shutil.rmtree(timer)

@@ -16,23 +16,14 @@ from dataclasses import dataclass, replace
 from datetime import UTC, datetime, time, timedelta
 from pathlib import Path
 from enum import StrEnum
-from typing import TYPE_CHECKING
 from zoneinfo import ZoneInfo
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
+from scripts.lib import conf
+from scripts.buildlog import costs, index, moments
+from scripts.lib.user_zone import user_zone
+from scripts.buildlog.costs import CostUnavailable as CostUnavailable
 
-import conf
-import costs
-import index
-import moments
-from user_zone import user_zone
-from costs import CostUnavailable as CostUnavailable
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-if TYPE_CHECKING:
-    from ..review_links import review_link
-else:
-    from scripts.review_links import review_link
+from scripts.review_links import review_link
 
 
 @dataclass(frozen=True)
@@ -220,7 +211,7 @@ def read_snapshot(connection: sqlite3.Connection, start: datetime, end: datetime
 
 def collect_charts(connection: sqlite3.Connection, start: datetime, end: datetime, zone: ZoneInfo) -> ChartSet:
     """Keep one transaction and one shared read for the whole chart set."""
-    import record
+    from scripts.buildlog import record
 
     return build_series(read_snapshot(connection, start, end), start, end, zone, record.configured_targets())
 
@@ -282,7 +273,7 @@ def window_value(recent: ChartCost, window: ChartCost, recent_days: int, days: i
 
 def page_data(days: int, n: int = 3) -> PageData | IndexUnavailable:
     """Read the charts and recent costs from one index snapshot."""
-    import record
+    from scripts.buildlog import record
 
     settings = conf.read("buildlog")
     recent_days = settings.whole("TOP_COST_RECENT_DAYS")
@@ -404,7 +395,7 @@ def present_page(series: ChartSet, path: Path, no_open: bool) -> int:
 
 
 def main(args: list[str]) -> int:
-    from number_option import positive_window
+    from scripts.buildlog.number_option import positive_window
 
     no_open = "--no-open" in args or os.environ.get("BUILDLOG_CHARTS_NO_OPEN") == "1"
     words = [word for word in args if word != "--no-open"]

@@ -8,17 +8,13 @@ from decimal import Decimal
 import json
 from pathlib import Path
 from enum import Enum
-from typing import TYPE_CHECKING
 
 from scripts.aws_target import ledger
 from scripts.aws_target.ledger import ChargeRead as ChargeRead, read_charge as read_charge, charge_record as charge_record
 from scripts.aws_target.config import MeasurementUnavailable as MeasurementUnavailable, SpendingSettings, offload_enabled, read_settings
 from scripts.lib.atomic_file import create_text_atomic
 from scripts.lib import conf
-if TYPE_CHECKING:
-    from ..mac_test import mac_test
-else:
-    import mac_test
+from scripts.mac_test import mac_test
 
 
 class ControllerRecovery(Enum):

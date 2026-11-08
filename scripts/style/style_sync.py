@@ -1,7 +1,11 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
 """Notify standing style productions and record workspace lint coverage."""
 
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import argparse
 import json
@@ -16,24 +20,21 @@ from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.lib import build_folders
 from types import FrameType, MappingProxyType
 from typing import Literal, cast
 
 SCRIPTS = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(SCRIPTS / "production"))
-sys.path.insert(0, str(SCRIPTS / "lib"))
-import process_group
+from scripts.lib import process_group
 
-from add_style import NoStyleProduction, standing_style_production
+from scripts.style.add_style import NoStyleProduction, standing_style_production
 from scripts.production.production_doc import Refusal
 from scripts.copies import copies
 from scripts.message import send_result, send_budget, session_send
 from scripts.production import showrunners
-import style_ledger
-from process_failure import failure_detail
-import scratch
+from scripts.style import style_ledger
+from scripts.lib.process_failure import failure_detail
+from scripts.lib import scratch
 
 PYTHON = SCRIPTS / "lib/py"
 SEND_SECONDS = 10
@@ -260,7 +261,7 @@ def unblock_held_signals() -> None:
 
 def verifier_command(directory: Path, owner: int) -> list[str]:
     return ["sh", "-c", VERIFIER_WRAPPER, "sh", str(directory / VERIFIER_FILE), str(owner),
-            "bash", str(VERIFY), "lint", "--workspace", "--check", "--no-cache"]
+            "bash", str(VERIFY), "lint", "--check", "--no-cache"]
 
 
 def verify_lint(directory: Path) -> tuple[int, str]:
@@ -349,10 +350,13 @@ def sweep_stale_lint_dirs() -> None:
 
 def gate_owner(repo: Path) -> str:
     """Use the registered style production, or the calling production."""
+    from scripts.production import staff, unit_lookup
+
     standing = standing_style_production(repo)
     if not isinstance(standing, NoStyleProduction):
-        return standing.name
-    return showrunners.own_name() or copies.fallback_owner("style")
+        return str(unit_lookup.doc_owner(standing.doc, staff.local_snapshot()).id)
+    row = staff.local_snapshot().owner_of(staff.caller_identity())
+    return str(row.id) if row is not None else copies.fallback_owner("style")
 
 
 def lint(repo: Path, checkout: Path, tip: str) -> int:

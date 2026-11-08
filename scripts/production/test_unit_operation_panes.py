@@ -6,7 +6,6 @@ import io
 from contextlib import redirect_stderr
 import math
 import os
-import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -15,11 +14,10 @@ from unittest import mock
 
 from scripts.production.staff_test_support import StaffTestCase, unit_membership
 from scripts.production.fake_unit_host import PaneShellFixture
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-import unit_move
-import herdr
-import unit_lookup
-from rename_state import RenameRefused
+from scripts.production import unit_move
+from scripts.herdr import herdr
+from scripts.production import unit_lookup
+from scripts.production.rename_state import RenameRefused
 
 
 @final

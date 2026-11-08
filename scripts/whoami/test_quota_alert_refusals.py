@@ -9,7 +9,7 @@ import unittest
 from datetime import timedelta
 from unittest import mock
 from scripts.whoami import quota_alert_test_support as support
-import quota_alert
+from scripts.whoami import quota_alert
 from scripts.whoami import agent_accounts
 from scripts.accounts import refusals
 from scripts.whoami.quota_alert_test_support import Notes, REFUSAL_ACTION, REGISTRY as REGISTRY

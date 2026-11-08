@@ -20,7 +20,7 @@ original text.
 import re
 from typing import TypedDict
 
-from banned_words_lib import is_read_only_command
+from scripts.hooks.banned_words_lib import is_read_only_command
 
 
 class EditEntry(TypedDict, total=False):

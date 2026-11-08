@@ -5,20 +5,19 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-from pathlib import Path
 import shutil
 import sys
 import unittest
 from typing import cast
 from unittest.mock import patch
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "production"))
 
-import session_pane
-import herdr
+from scripts.production import session_pane
+from scripts.production import staff
+from scripts.production.staff_test_support import fixture_member, fixture_runtime_id
+from scripts.herdr import herdr
 from scripts.message.relay_identity import relay_session_name
-from unit_lookup import Place
+from scripts.production.unit_lookup import Place
 from scripts.hooks import hook_dispatch
 from scripts.lib import script_prompts, test_hang_guard
 from scripts.lib.script_envelope import script_prompt
@@ -71,13 +70,41 @@ class ConversationPauseRegistrationTests(unittest.TestCase):
 
 
 class ConversationPauseTests(ConversationPauseFixture):
+    def test_unreadable_staff_reports_the_error_and_keeps_the_native_timer_pause(self) -> None:
+        instance = self.create_instance("unit-native")
+        other = self.create_instance("showrunner-other", session_id="another-owner")
+        _ = (self.root / "staff.json").write_text("invalid staff JSON\n")
+        result = self.run_prompt("hello")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(
+            f"conversation-pause: timer lookup: cannot read staff record {self.root / 'staff.json'}: invalid staff JSON:",
+            result.stderr,
+        )
+        reply = cast(dict[str, object], json.loads(result.stdout))
+        self.assertEqual(reply["systemMessage"],
+                         f"Automatic updates paused while we talk: status reports. {RETURN_SCHEDULE}")
+        self.assertTrue((instance / "state").read_text().startswith("ENABLED=0\n"))
+        self.assertTrue((other / "state").read_text().startswith("ENABLED=1\n"))
+
+    def test_staff_timer_is_found_after_the_showrunner_session_changes(self) -> None:
+        owner = fixture_member("showrunner", name="timer-owner")
+        timer = self.create_instance(f"showrunner-{owner.id}", session_id=owner.id)
+        current = staff.native_id(fixture_runtime_id("timer-owner-cleared"))
+        _ = staff.update_current_session(owner.current_session, current)
+        unit = self.create_instance("unit-native", session_id=current)
+        with patch.dict(os.environ, self.environment):
+            self.assertEqual(conversation_pause.session_reports(current), [
+                conversation_pause.Report(timer.name, True),
+                conversation_pause.Report(unit.name, True),
+            ])
+
     def test_session_lookup_hang_escapes_product_timeout_recovery(self) -> None:
         blocked = self.root / "blocked_lookup.py"
         _ = blocked.write_text("import signal\nsignal.pause()\n")
         blocked.chmod(0o755)
         lookup = self.root / "lookup.py"
         _ = lookup.write_text(
-            "import conversation_pause\nconversation_pause._session_lookup('session-1')\n"
+            "from scripts.hooks import conversation_pause\nconversation_pause._session_lookup('session-1')\n"
         )
         with (
             patch.object(conversation_pause, "sessions_command", return_value=[str(blocked)]),

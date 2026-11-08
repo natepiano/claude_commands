@@ -38,6 +38,10 @@ Each case is one JSON file in STATE, which is $XDG_STATE_HOME/message/rca or ~/.
 `open` never fails its caller: the alert already went out, so an error prints to stderr and it exits 0.
 """
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import argparse
 import fcntl
@@ -55,21 +59,16 @@ from enum import Enum
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from typing import Literal, NamedTuple, NotRequired, TypedDict, cast
 
 from scripts.lib import conf
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "production"))
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "notify"))
-import push_texts  # noqa: E402
-import review  # noqa: E402
-import sessions  # noqa: E402
+from scripts.notify import push_texts  # noqa: E402
+from scripts.notify import review  # noqa: E402
+from scripts.message import sessions  # noqa: E402
 from scripts.production import showrunners  # noqa: E402
-import silence  # noqa: E402
-from user_zone import user_zone  # noqa: E402
+from scripts.notify import silence  # noqa: E402
+from scripts.lib.user_zone import user_zone  # noqa: E402
 from scripts.production import staff  # noqa: E402
 
 STATE = Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local" / "state") / "message" / "rca"

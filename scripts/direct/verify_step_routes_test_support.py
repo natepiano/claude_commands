@@ -23,7 +23,7 @@ with Path(os.environ["TEST_ROUTE_EVENTS"]).open("a") as output:
     output.write(json.dumps({"command": command, "args": sys.argv[2:], "call_id": os.environ.get("BUILDLOG_CALL_ID", "")}) + "\n")
 if command == "eligible":
     allowed = os.environ.get("TEST_MAC_ALLOWED", "1") == "1"
-    print("mac_allowed" if allowed else "natedev_only makes natedev artifacts")
+    print("any_target" if allowed else "natedev_only makes natedev artifacts")
     print("natedev\teligible\t-\t-\t-")
     if allowed:
         print("mac\teligible\t-\t" + os.environ["MAC_TEST_CONFIG"] + "\tmacos")

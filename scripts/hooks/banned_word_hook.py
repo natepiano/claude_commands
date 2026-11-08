@@ -5,12 +5,15 @@ The two hooks stay registered in settings.json permanently. This flips the
 switch they read, so enforcement changes without touching settings.json --
 which carries a git clean filter and would need JSON surgery on every flip.
 """
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).parent))
-from banned_words_lib import HOOK_CONFIG, hooks_enabled
+from scripts.hooks.banned_words_lib import HOOK_CONFIG, hooks_enabled
 
 GOVERNED_HOOKS = (
     ("PostToolUse", "post-tool-use-banned-words.py", "blocks and messages the violation"),
