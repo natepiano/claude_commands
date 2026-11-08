@@ -19,8 +19,6 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Literal, NamedTuple, cast, final
 
-if __package__ in (None, ""):
-    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.lib.process_failure import failure_detail
 from scripts.lib.atomic_file import write_text_atomic
 

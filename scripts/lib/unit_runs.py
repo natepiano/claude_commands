@@ -31,11 +31,6 @@ from pathlib import Path
 from importlib import import_module
 from typing import TYPE_CHECKING, Literal, NamedTuple, cast
 
-if __name__ == "unit_runs":
-    _ = sys.modules.setdefault("scripts.lib.unit_runs", sys.modules[__name__])
-elif __name__ == "scripts.lib.unit_runs":
-    _ = sys.modules.setdefault("unit_runs", sys.modules[__name__])
-
 if TYPE_CHECKING:
     from scripts.production import staff
 

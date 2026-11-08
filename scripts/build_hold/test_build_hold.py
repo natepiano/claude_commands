@@ -2529,13 +2529,32 @@ class BuildAuditTests(IsolatedBuildHoldTest):
         _ = self.process(10, "cargo", environment={"CLAUDE_CODE_SESSION_ID": "other"})
         _ = self.process(20, "cargo", argv=("cargo", "check", "--package", "unowned"))
         (self.holders / "holder").unlink()
-        for action in ("hold", "status", "audit"):
+        for action, entry in (("hold", "import"), ("status", "import"),
+                              ("audit", "import"), ("audit", "__main__")):
             args = [action, "--proc-root", str(self.proc)]
             if action == "hold":
                 args.extend(["--holder", "holder", "--for", "app test"])
             output = io.StringIO()
-            with redirect_stdout(output):
-                self.assertEqual(build_hold.main(args), 0)
+            if entry == "__main__":
+                program = """import runpy, sys
+from unittest import mock
+path = sys.argv.pop(1)
+def exit_code(status):
+    module = sys.modules["__main__"]
+    assert module.hold_enforcer().build_hold is module, "the enforcer loads a second module"
+    assert "build_hold" not in sys.modules, "the CLI registers a bare alias"
+    assert status == 0, status
+with mock.patch("sys.exit", side_effect=exit_code):
+    runpy.run_path(path, run_name="__main__")
+"""
+                with self.subTest(entry=entry):
+                    result = subprocess.run([str(SCRIPT.parents[1] / "lib/py"), "-c", program, str(SCRIPT), *args],
+                                            capture_output=True, text=True, timeout=test_hang_guard.TEST_HANG_GUARD_SECS)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                _ = output.write(result.stdout)
+            else:
+                with redirect_stdout(output):
+                    self.assertEqual(build_hold.main(args), 0)
             self.assertIn("other_session: other, pid 10: cargo test", output.getvalue())
             if action == "audit":
                 self.assertNotIn("unowned", output.getvalue())

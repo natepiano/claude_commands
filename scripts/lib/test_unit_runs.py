@@ -6,32 +6,27 @@ import io
 import json
 import os
 import subprocess
-import sys
 import tempfile
 from pathlib import Path
-from typing import TYPE_CHECKING
 from unittest.mock import patch
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.lib import unit_runs  # noqa: E402
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.production import staff
 from scripts.production.staff_test_support import StaffTestCase, fixture_member, fixture_runtime_id, fixture_worker, showrunner_relationship
-if TYPE_CHECKING:
-    from scripts.message import sessions
-else:
-    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "message"))
-    from scripts.message import sessions
+from scripts.message import sessions
 
 
 class UnitRunsTest(StaffTestCase):
     def test_anomaly_prints_once_across_both_import_names(self) -> None:
         repository = Path(__file__).resolve().parents[2]
-        environment = {**os.environ, "PYTHONPATH": os.pathsep.join((str(repository / "scripts/lib"), str(repository)))}
-        for names in (("unit_runs", "scripts.lib.unit_runs"), ("scripts.lib.unit_runs", "unit_runs")):
-            with self.subTest(names=names):
-                command = f"import importlib; [importlib.import_module(name).report_anomaly('anomaly: import test') for name in {names!r}]"
-                result = subprocess.run([sys.executable, "-c", command], cwd=self.root, env=environment,
+        imports = ("from scripts.lib import unit_runs", "import scripts.lib.unit_runs as packaged")
+        for statements in (imports, tuple(reversed(imports))):
+            with self.subTest(names=statements):
+                command = ("; ".join(statements) + "; assert unit_runs is packaged; "
+                           + "[module.report_anomaly('anomaly: import test') for module in (unit_runs, packaged)]")
+                result = subprocess.run([str(repository / "scripts/lib/py"), "-c", command], cwd=self.root,
+                                        env={key: value for key, value in os.environ.items() if key != "PYTHONPATH"},
                                         capture_output=True, text=True, check=False)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(result.stderr.splitlines(), ["anomaly: import test"])

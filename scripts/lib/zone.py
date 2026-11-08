@@ -32,7 +32,6 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo, available_timezones
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib import main_publish, user_zone  # noqa: E402
 from scripts.lib.main_publish import Refusal as Refusal

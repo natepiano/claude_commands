@@ -549,7 +549,7 @@ class MergeGateFixture(unittest.TestCase):
     def prepare_affected_subject(self) -> tuple[Path, str]:
         subject = self.checkout / "scripts/hooks/affected_subject.py"
         self.write(subject, "VALUE = 1\n")
-        self.write(self.checkout / "scripts/hooks/test_first.py", "import affected_subject\n" + SUITE_MODULE)
+        self.write(self.checkout / "scripts/hooks/test_first.py", "from scripts.hooks import affected_subject\n" + SUITE_MODULE)
         return subject, self.commit(self.checkout, "dependency fixture")
 
     def run_gate(self, *extra: str, checkpoint: str = "", previous: str = "",
