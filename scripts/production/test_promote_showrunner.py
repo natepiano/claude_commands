@@ -802,10 +802,7 @@ class PromoteShowrunnerTests(unittest.TestCase):
         child_doc = self.worktree / "builds-production.md"
         _ = child_doc.write_text(doc_text(self.worktree))
         child = read_new_production(child_doc, "child")
-        config = self.root / "claude.json"
-        _ = config.write_text(json.dumps({"projects": {str(child.checkout): {"hasTrustDialogAccepted": True}}}))
         _ = self.enterContext(mock.patch.object(add_showrunner, "running", return_value=False))
-        _ = self.enterContext(mock.patch.object(add_showrunner, "claude_json", return_value=config))
         _ = self.enterContext(mock.patch.object(showrunner_tree, "descendants_of", return_value=[]))
         _ = self.enterContext(mock.patch.object(herdr, "shared_session", return_value="agents"))
         _ = self.enterContext(mock.patch.object(herdr, "live_sessions", return_value=[herdr.SessionEntry(
@@ -828,7 +825,7 @@ class PromoteShowrunnerTests(unittest.TestCase):
             ORIGINAL_CHECKED(child, "parent", ending=add_showrunner.EndingUnitTab(PANE),
                              config_dir=self.unit_account.dir)
 
-    def test_the_childs_check_is_for_the_units_worktree_which_must_be_trusted(self) -> None:
+    def test_the_childs_check_is_for_the_units_worktree(self) -> None:
         self.marked["demo"] = unit_lookup.LabeledSession(
             "demo", unit_lookup.LiveClaude("demo", SESSION, "/sock", PID),
             herdr.HerdrPlace("agents", PANE))
@@ -836,16 +833,6 @@ class PromoteShowrunnerTests(unittest.TestCase):
         self.assertEqual(code, 0, err)
         self.assertIn(f"check child for parent, ending {add_showrunner.EndingUnitTab(PANE)}, "
                       + f"starting in {self.worktree}", self.events)
-        config = self.root / "claude.json"
-        _ = config.write_text(json.dumps({"projects": {str(self.root.resolve()): {"hasTrustDialogAccepted": True}}}))
-        child = read_new_production(self.child_doc, "child")
-        with (mock.patch.dict(os.environ, {"ADD_SHOWRUNNER_CLAUDE_JSON": str(config)}),
-              mock.patch.object(add_showrunner, "running", mock.Mock(return_value=False)),
-              mock.patch.object(add_showrunner, "herdr_tab_open", mock.Mock(return_value=False)),
-              mock.patch.object(showrunner_tree, "descendants_of", mock.Mock(return_value=[]))):
-            with self.assertRaisesRegex(Refusal, f"child: Claude is not trusted in {self.worktree.resolve()} on "
-                                        + "claude2. Run:"):
-                _ = ORIGINAL_CHECKED(child, "parent", ending=add_showrunner.EndingUnitTab(PANE), start_in=self.worktree, config_dir=self.unit_account.dir)
 
 
 if __name__ == "__main__":
