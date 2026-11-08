@@ -239,6 +239,7 @@ class GateWorker:
                 links = {key: ledger.text(request, key) for key in ('attempt', 'commit', 'tree', 'mode', 'origin')}
                 bucket = 's3://' + ledger.text(deployment, 'bucket')
                 links.update(production='true', step='size', expires=str(request['expires']),
+                             region=self.api.region,
                              guest=bucket + '/requests/' + ledger.text(request, 'attempt') + '.guest.py',
                              request=bucket + '/requests/' + ledger.text(request, 'attempt') + '.json',
                              log='s3://' + ledger.text(deployment, 'bucket') + '/' + prefix + '/gate.log',

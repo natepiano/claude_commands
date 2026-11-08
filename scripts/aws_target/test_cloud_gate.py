@@ -253,6 +253,7 @@ class CloudGateTests(CostFixture):
         encoded = ledger.text(self.fake.launches[0], 'UserData')
         import base64
         data = base64.b64decode(encoded).decode()
+        self.assertIn('export AWS_DEFAULT_REGION=fixture-region', data)
         self.assertLess(len(encoded), 25600)
         self.assertNotIn('test_module_0000.py', data)
         self.assertIn('requests/attempt.guest.py', data)

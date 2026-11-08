@@ -44,24 +44,19 @@ def presign(method: str, host: str, key: str, region: str, credentials: SigningK
 
 # This program runs inside the instance's tool shell, not on natedev.
 GUEST = r'''import contextlib, json, os, pathlib, sqlite3, subprocess, sys, threading, time, traceback, urllib.request
-root = pathlib.Path('/var/lib/gate-trial')
+root = pathlib.Path(os.environ.get('GATE_BOX_DIR', '/var/lib/gate-trial'))
 links = json.loads((root / 'links.json').read_text())
 if links.get('production'):
     gate_request = json.loads((root / 'request.json').read_text())
-    request = urllib.request.Request('http://169.254.169.254/latest/api/token', method='PUT',
-                                     headers={'X-aws-ec2-metadata-token-ttl-seconds': '60'})
-    with urllib.request.urlopen(request, timeout=5) as response:
-        token = response.read().decode()
-    request = urllib.request.Request('http://169.254.169.254/latest/meta-data/instance-id',
-                                     headers={'X-aws-ec2-metadata-token': token})
-    with urllib.request.urlopen(request, timeout=5) as response:
-        instance = response.read().decode()
+    instance = (root / 'instance-id').read_text().strip()
     links = {key: value.replace('__INSTANCE_ID__', instance) if isinstance(value, str) else value
              for key, value in links.items()}
-    (root / 'instance-id').write_text(instance)
 links['boot'] = 'warm' if (root / 'prepared').exists() else 'cold'
 result = {'nix_ready_at': time.time(), 'verdict': 'ready', 'tests': 0, 'skips': 0, 'failed_modules': [], 'memory_peak_bytes': None}
 log = root / 'gate.log'
+def stage(name):
+    with (root / 'boot.log').open('a') as output:
+        output.write(time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()) + ' stage=' + name + '\n')
 def get(url, destination):
     if url.startswith('s3://'):
         subprocess.run(['aws', 's3', 'cp', url, str(destination), '--only-show-errors'], check=True)
@@ -121,6 +116,7 @@ try:
             if tree != links['tree']:
                 raise ValueError('The source tree differs from the request')
             subprocess.run(['git', '-C', str(repo), 'remote', 'set-url', 'origin', links['origin']], check=True)
+        stage('source ready')
         home = pathlib.Path.home() / '.claude'
         home.mkdir(exist_ok=True)
         (home / 'config').symlink_to(repo / 'config', target_is_directory=True)
@@ -139,6 +135,7 @@ try:
         sample_memory()
         memory_thread = threading.Thread(target=monitor_memory, args=(memory_stop,), daemon=True)
         memory_thread.start()
+        stage('tests start')
         with log.open('w') as output, contextlib.redirect_stdout(output), contextlib.redirect_stderr(output):
             with merge_gate.rollback_signals():
                 cpu_started = busy_cpu_seconds()
@@ -214,11 +211,11 @@ finally:
 def log_upload(links: dict[str, str]) -> str:
     if links.get('production'):
         prefix, suffix = links['log'].split('__INSTANCE_ID__')
-        destination = shlex.quote(prefix) + '"$(cat /var/lib/gate-trial/instance-id)"' + shlex.quote(suffix)
+        destination = shlex.quote(prefix) + '"$(instance_id)"' + shlex.quote(suffix)
         transfer = f'aws s3 cp - {destination} --only-show-errors'
     else:
         transfer = f'curl --fail --silent --show-error --max-time 30 -X PUT --data-binary @- {shlex.quote(links["log"])}'
-    return f'''{{ cat /var/lib/gate-trial/boot.log /var/lib/gate-trial/gate.log /var/lib/gate-trial/timeline.log 2>/dev/null || :
+    return f'''{{ cat "${{box_dir:-/var/lib/gate-trial}}/boot.log" "${{box_dir:-/var/lib/gate-trial}}/gate.log" "${{box_dir:-/var/lib/gate-trial}}/timeline.log" 2>/dev/null || :
     ps -eo etimes,pcpu,rss,args --sort=-etimes 2>/dev/null | awk '!/curl/ {{print substr($0,1,200); if (++n==60) exit}}' || :
     printf '\\n'
     date -u '+UTC: %Y-%m-%dT%H:%M:%SZ'
@@ -234,7 +231,7 @@ def log_push_loop(links: dict[str, str], interval_s: float) -> str:
         set -- $(cpu_ticks)
         busy=$(awk -v total="$(($1-previous_total))" -v idle="$(($2-previous_idle))" 'BEGIN {{printf "%.2f", (total>0 ? 100*(total-idle)/total : 0)}}')
         previous_total=$1 previous_idle=$2
-        printf '%s loadavg=%s %s processes=%s cpu_busy_percent=%s\\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$(cat /proc/loadavg)" "$(awk '/^MemAvailable:/' /proc/meminfo)" "$(ps -e --no-headers | wc -l)" "$busy" >> /var/lib/gate-trial/timeline.log || :
+        printf '%s loadavg=%s %s processes=%s cpu_busy_percent=%s\\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$(cat /proc/loadavg)" "$(awk '/^MemAvailable:/' /proc/meminfo)" "$(ps -e --no-headers | wc -l)" "$busy" >> "${{box_dir:-/var/lib/gate-trial}}/timeline.log" || :
         {log_upload(links)}
     done
 }}
@@ -247,16 +244,23 @@ def boot_trap(links: dict[str, str]) -> str:
     """Publish a shell failure before the tool shell can publish a result."""
     cold = links['result'] if links['step'] == 'size' else links['ready-cold']
     warm = links['result'] if links['step'] == 'size' else links['ready-warm']
+    if links.get('production'):
+        prefix, suffix = cold.split('__INSTANCE_ID__')
+        destination = shlex.quote(prefix) + '"$(instance_id)"' + shlex.quote(suffix)
+        transfer = 'aws s3 cp "${box_dir:-/var/lib/gate-trial}/boot-error.json" "$destination" --only-show-errors || :'
+    else:
+        destination = shlex.quote(cold)
+        transfer = 'curl --fail --silent --show-error --max-time 30 -X PUT --data-binary @"${box_dir:-/var/lib/gate-trial}/boot-error.json" "$destination" || :'
     return f'''boot_failed() {{
     status=$?
     trap - EXIT
     if [ -n "${{log_push_pid:-}}" ]; then kill "$log_push_pid" 2>/dev/null || :; fi
     if [ "$status" -ne 0 ]; then
-        destination={shlex.quote(cold)}
-        if [ -e /var/lib/gate-trial/prepared ]; then destination={shlex.quote(warm)}; fi
+        destination={destination}
+        if [ -e "${{box_dir:-/var/lib/gate-trial}}/prepared" ]; then destination={shlex.quote(warm)}; fi
         {log_upload(links)}
-        printf '{{"verdict":"error","error":"Tool preparation failed (exit %s)"}}' "$status" > /var/lib/gate-trial/boot-error.json
-        curl --fail --silent --show-error --max-time 30 -X PUT --data-binary @/var/lib/gate-trial/boot-error.json "$destination" || :
+        printf '{{"verdict":"error","error":"Tool preparation failed (exit %s)"}}' "$status" > "${{box_dir:-/var/lib/gate-trial}}/boot-error.json"
+        {transfer}
     fi
     exit "$status"
 }}
@@ -270,41 +274,69 @@ def user_data(links: dict[str, str], revision: str, lifetime_minutes: int, log_p
     packages = conf.read_or_repository('cloud_gate').words('packages')
     tools = ' '.join(shlex.quote(f'github:NixOS/nixpkgs/{revision}#{name}') for name in packages)
     def download(key: str, name: str) -> str:
-        url, destination = shlex.quote(links[key]), '/var/lib/gate-trial/' + name
+        url, destination = shlex.quote(links[key]), '"$box_dir/' + name + '"'
         return (f'aws s3 cp {url} {destination} --only-show-errors\n' if links[key].startswith('s3://') else
                 f'curl --fail --silent --show-error --max-time 60 {url} -o {destination}\n')
     downloads = download('guest', 'guest.py')
     if links.get('production'):
         downloads += download('request', 'request.json')
-    session = (log_push_loop(links, log_push_s) if links.get('production') else '') + downloads + f'''ln -sf "$(command -v bash)" /bin/bash
+    session = '''printf '%s stage=tools ready\\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+''' + downloads + f'''ln -sf "$(command -v bash)" /bin/bash
 ln -sf "$(command -v zsh)" /bin/zsh
-mkdir -p /run/gate-trial-bin
-cp -a /run/current-system/sw/bin/. /run/gate-trial-bin/
-ln -sf "$(command -v python3)" /run/gate-trial-bin/python3
-ln -sf "$(command -v chromium)" /run/gate-trial-bin/google-chrome
-mount --bind /run/gate-trial-bin /run/current-system/sw/bin
-chown -R gate-trial:users /var/lib/gate-trial
+mkdir -p "$box_dir/tool-profile"
+cp -a /run/current-system/sw/bin/. "$box_dir/tool-profile/"
+ln -sf "$(command -v python3)" "$box_dir/tool-profile/python3"
+ln -sf "$(command -v chromium)" "$box_dir/tool-profile/google-chrome"
+mount --bind "$box_dir/tool-profile" /run/current-system/sw/bin
+chown -R gate-trial:users "$box_dir"
 runuser -u gate-trial -- env HOME=/home/gate-trial XDG_RUNTIME_DIR=/run/user/$(id -u gate-trial) DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$(id -u gate-trial)/bus bash -c '
 tool_path=$PATH
 unset __NIXOS_SET_ENVIRONMENT_DONE __ETC_PROFILE_SOURCED
 . /etc/profile
 export PATH="$tool_path:$PATH"
-exec python3 /var/lib/gate-trial/guest.py'
+exec python3 "$box_dir/guest.py"'
 {('shutdown -h now' if links.get('production') else '')}
 '''
     deadline = (f'systemd-run --unit=cloud-gate-expiry --on-calendar=@{int(links["expires"])} /run/current-system/sw/bin/shutdown -h now'
                 if links.get('production') else f'shutdown -h +{lifetime_minutes}')
+    bootstrap = ''
+    if links.get('production'):
+        aws_tools = shlex.quote(f'github:NixOS/nixpkgs/{revision}#awscli2')
+        bootstrap = f'''aws() {{
+    if [ -n "${{aws_bin:-}}" ]; then "$aws_bin" "$@"; else
+        nix --extra-experimental-features 'nix-command flakes' shell {aws_tools} --command aws "$@"
+    fi
+}}
+instance_id() {{
+    if [ ! -s "$box_dir/instance-id" ]; then
+        token=$(curl --fail --silent --show-error --max-time 5 -X PUT -H 'X-aws-ec2-metadata-token-ttl-seconds: 60' http://169.254.169.254/latest/api/token)
+        curl --fail --silent --show-error --max-time 5 -H "X-aws-ec2-metadata-token: $token" http://169.254.169.254/latest/meta-data/instance-id -o "$box_dir/instance-id"
+    fi
+    cat "$box_dir/instance-id"
+}}
+'''
+        preparation = f'''instance_id >/dev/null
+aws_bin=$(nix --extra-experimental-features 'nix-command flakes' shell {aws_tools} --command sh -c 'command -v aws')
+printf '%s stage=aws ready\\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+{log_upload(links)}
+{log_push_loop(links, log_push_s)}'''
+    else:
+        preparation = log_push_loop(links, log_push_s)
     return f'''#!/bin/sh
 {deadline}
 set -eu
 umask 077
-mkdir -p /var/lib/gate-trial
-exec > /var/lib/gate-trial/boot.log 2>&1
-export PATH=/run/current-system/sw/bin:$PATH
-{'' if links.get('production') else log_push_loop(links, log_push_s)}{boot_trap(links)}cat > /var/lib/gate-trial/links.json <<'GATE_LINKS'
+box_dir=${{GATE_BOX_DIR:-/var/lib/gate-trial}}
+export box_dir GATE_BOX_DIR="$box_dir"
+mkdir -p "$box_dir"
+exec > "$box_dir/boot.log" 2>&1
+export PATH=$PATH:/run/current-system/sw/bin
+export AWS_DEFAULT_REGION={shlex.quote(links.get('region', ''))}
+{bootstrap}{boot_trap(links)}printf '%s stage=boot\\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+{preparation}cat > "$box_dir/links.json" <<'GATE_LINKS'
 {json.dumps({**links, 'module_time_limit_s': module_time_limit_s})}
 GATE_LINKS
-touch /var/lib/gate-trial/timeline.log
+touch "$box_dir/timeline.log"
 id -u gate-trial >/dev/null 2>&1 || useradd -m -g users gate-trial
 loginctl enable-linger gate-trial
 export PYTHONUNBUFFERED=1
