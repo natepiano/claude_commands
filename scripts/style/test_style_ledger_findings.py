@@ -6,19 +6,14 @@ from scripts.style.ledger_test_support import ticket_owner_id
 
 import hashlib
 import json
-import os
 import re
 import sqlite3
-import tempfile
 import unittest
-from collections.abc import Callable, Generator
-from contextlib import closing, contextmanager
-from pathlib import Path
-from typing import cast, final, override
+from collections.abc import Callable
+from contextlib import closing
+from typing import cast, final
 from unittest import mock
-from scripts.production.staff_test_support import isolated_staff_file
 from scripts.style import style_ledger
-from scripts.style import ledger_test_support
 from scripts.style import rules
 from scripts.style.approved_renames import AppliedInCode, Folder, NoAppliedCheck, NoOuterBindingBlock, RenameNotApplied
 from scripts.style import declarations
@@ -28,36 +23,6 @@ from scripts.style.ledger_test_support import (remove_generation_schema, LedgerT
 
 @final
 class StyleLedgerFindingsTests(LedgerTestCase):
-    staff_seed_root: Path = Path()
-
-    @classmethod
-    @override
-    def setUpClass(cls) -> None:
-        super().setUpClass()
-        cls.staff_seed_root = Path(cls.enterClassContext(tempfile.TemporaryDirectory()))
-        with ledger_test_support.style_staff_fixture(cls.staff_seed_root, cls.template_repo):
-            pass
-        _ = cls.enterClassContext(mock.patch.object(
-            ledger_test_support, "style_staff_fixture", cls.copied_staff_fixture,
-        ))
-
-    @classmethod
-    @contextmanager
-    def copied_staff_fixture(cls, root: Path, repo: Path) -> Generator[None]:
-        """Copy the real staff seed and give each case its own paths."""
-        source = (cls.staff_seed_root / "staff.json").read_text()
-        source = source.replace(str(cls.staff_seed_root), str(root))
-        source = source.replace(str(cls.template_repo), str(repo))
-        _ = (root / "staff.json").write_text(source)
-        with isolated_staff_file(root / "staff.json", {}), mock.patch.dict(
-            os.environ, {"HERDR_BIN": "/nonexistent/herdr"},
-        ):
-            yield
-
-    @override
-    def git(self, *arguments: str) -> str:
-        return super().git("-c", "maintenance.auto=false", *arguments)
-
     def test_current_parameters_control_every_ledger_built_boundary(self) -> None:
         from scripts.style.test_approved_renames import PARAMETER_CHANGES
         for label, source, current, blocked in PARAMETER_CHANGES:
