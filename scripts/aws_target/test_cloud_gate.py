@@ -524,6 +524,7 @@ class CloudRouteTests(CostFixture):
         self.assertEqual(sidecar, folder / 'reservation.cgroup')
         self.assertIn('--setenv=AWS_SHARED_CREDENTIALS_FILE=' + str(self.root / '.config/aws-build/credentials'), commands[0])
         self.assertIn('--property=KillMode=control-group', commands[0])
+        self.assertIn('--working-directory=' + str(self.root / '.claude'), commands[0])
         self.assertEqual(ledger.mapping(cast(object, json.loads(destination.read_text())))['host'], 'remote-host')
 
     def test_absent_stack_needs_no_service_or_aws_call(self) -> None:
