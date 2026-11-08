@@ -29,7 +29,7 @@ from scripts.buildlog.mac_idle_test_support import NotificationGuardedTestCase, 
 from scripts.message import roster
 from scripts.buildlog import record, store
 from scripts.build_targets.test_targets import END, NOW, SHIPPED_CONFIG, SINCE, IsolatedTargetTest
-from scripts.lint.memory_test_support import write_config_fixture
+from scripts.lint.memory_test_support import config_environment, write_config_fixture
 from scripts.lib import test_hang_guard
 
 SHIPPED_STATUS = "\n".join((
@@ -61,10 +61,13 @@ class FolderInvocationTests(NotificationGuardedTestCase):
     def test_clean_target_import_omits_admission_service_and_loads_mac_test_once(self) -> None:
         environment = {key: value for key, value in os.environ.items() if key != "PYTHONPATH"}
         directory = self.enterContext(tempfile.TemporaryDirectory())
-        environment.update({"HOME": directory, "BUILDLOG_DIR": directory})
+        root = Path(directory)
+        environment.update({**config_environment(root), "HOME": directory, "BUILDLOG_DIR": directory,
+                            "MAC_TEST_STATE_DIR": str(root / "mac-state")})
         result = REAL_SUBPROCESS_RUN([str(Path(__file__).resolve().parents[1] / "lib/py"), "-c",
-            "import sys; from scripts.build_targets import build_targets; "
+            "import os,sys; from pathlib import Path; from scripts.build_targets import build_targets; "
             + "assert 'scripts.build_queue.admission_service' not in sys.modules; "
+            + "build_targets.target_state(build_targets.SshTarget('mac', 'macos', Path(os.environ['CONF_DIR']) / 'mac_test.conf')); "
             + "names=[n for n,m in list(sys.modules.items()) if getattr(m,'__file__','') "
             + "and m.__file__.endswith('/mac_test/mac_test.py')]; "
             + "assert len(names)==1, names"], cwd=Path(__file__).parent, env=environment,

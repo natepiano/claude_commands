@@ -1070,117 +1070,110 @@ Checkpoint `1f9e9c484` on `verify-not-mac-wait`, merged to builds as `a62793f07`
 
 **Ruled out:** a new timer; an SSH call from `free_now`; the timed backoff for a version mismatch (it stops every repository on the target).
 
-### Phase 41n — One build_targets.py start per verify.sh step  · status: todo
+### Phase 41p — Each build_targets.py subcommand imports only what it uses  · status: done
 
 **Depends on:** Phase 41e.
 
+#### As-built
+
+- `build_targets.py` loads project modules (`build_hold`, `mac_test`, `offload`, `roster`, `aws_target`, `buildlog`, `target_config` and the lib helpers) inside the functions that use them. The module top keeps only stdlib modules: those already loaded by argparse, dataclasses, contextvars, pathlib and typing (`os`, `sys`, `io`, `time`, `contextlib`, `collections.abc`, `importlib`, `types`, `typing`), and cheap ones (`json`, `fcntl`, `signal`, `datetime`, `decimal`, `calendar`). `subprocess` loads inside its users.
+- `command_eligibility(args)` holds the `eligible` flag handling.
+- `command_wait_local` loads `release_waiter` through `importlib`, because this CLI's import root excludes the worker module.
+- `targets.py`: `target_state` dispatches to `local_hold_state` (loads `build_hold` only) and `ssh_target_state` (claim records); `read_aws_status` loads its AWS and record modules inside. No `sys.path` inserts remain.
+- Same-load interleaved pairs, median CPU per start: `eligible` 0.79 → 0.59 s, `reserve` 0.79 → 0.60 s, `release-wait` 0.71 → 0.55 s. Output, exit status and side effects are unchanged.
+
+**Files:**
+- `scripts/build_targets/build_targets.py` — the CLI, with function-level project imports.
+- `scripts/build_targets/targets.py` — target state readers, split into local and SSH state.
+- `scripts/build_targets/test_build_targets.py` — the mac_test-once test reads an SSH target state before it counts loads.
+
+**Gotchas:**
+- Import of `build_targets` alone loads no `mac_test`. A test that counts `mac_test` loads must first call `target_state` with an SSH target.
+- Compare CPU only in interleaved pairs under the same load. Test-module CPU is noisy under a changing load; per-start CPU is the stable measure.
+
+**Ruled out:** one step-start JSON command for all step facts (starts per step local 1→1, pinned SSH 4→3, Mac-only 3→3; `test_verify_mac_only.py` CPU −2.8%).
+
+### Phase 41q — Load mac_test and offload only for an SSH target  · status: todo
+
+**Depends on:** Phase 41p.
+
 #### Work Order
 
-**Source:** builds showrunner, 2026-11-07 17:50, ruling option B. natest measured about 6 `build_targets.py` starts per `verify.sh` start, each about 0.71 CPU s, almost all imports (`targets` 375 ms, `build_hold` 218 ms, `roster` 206 ms, `admission_service` 193 ms, `mac_test` 125 ms). In `test_verify_mac_only.py`, 84 starts cost 60 of 96.5 CPU s.
+**Source:** builds showrunner, 2026-11-08, from queue's import trace of the Phase 41p tree: `/tmp/claude/unit/2ac94b9b-8a9d-4a9b-b908-b4f87dd4d5d0/phases/31/notes/trace.md` (table "Imports above 10 ms cumulative", `measurements.json` beside it). The trace uses a fixture with one local Linux target and no SSH target.
 
-**Goal:** a `verify.sh` step reads its initial routing facts from one `build_targets.py` start, as one JSON answer. Calls at a later time boundary stay separate.
-
-**Calls and their time boundaries** (`scripts/direct/verify.sh` at fe32afe8f):
-
-| Call | Boundary | Disposition |
-| --- | --- | --- |
-| `eligible`, `initialize_step_record` (line 2271) | step start | goes into the new command |
-| `register-local`, first routing check (line 2250) | step start, no wait before it | goes into the new command where the route needs it |
-| pinned `eligible`, first pass (line 2675) | step start, repeats the initial read | reuses the initial answer |
-| `reserve` (printed at line 2549) | changes claim ownership | stays separate |
-| pinned `eligible`, later passes (line 2675) | after a target wait | stays separate and fresh |
-| `register-local`, later checks (line 2250) | during routing and between steps | stays separate |
-| eligibility refresh in `run_step` (line 695) | before a later step, only when a listed mark exists | stays separate |
-| `release-wait` (line 2525) | releases a reservation | stays separate |
-| `interrupt-local` (line 1638) | cleanup | stays separate |
-| `wait-local` (line 3186) | blocking wait and its leave hook | stays separate |
+**Goal:** `eligible`, `reserve` and `release-wait` load `mac_test`, `offload` and their heavy children only when an SSH target needs them. No behavior changes. Upper bound of the cut per start: `eligible` 222 ms, `reserve` 230 ms, `release-wait` 300 ms.
 
 **Spec:**
 
-1. Add one `build_targets.py` command that returns the initial routing facts as one JSON object. Name its result type `StepStartFacts`.
-2. Include the routing decision, its reason, and the ordered target rows: name, eligibility, exclusion reason, settings path and platform.
-3. Include each evaluated target's `FreeNowAnswer`. Show capacity that was not read with an explicit variant (as `CapacityNotRead` does), not a null.
-4. Include the initial local hold admission result and its diagnostic when the route needs that check. Keep admission statuses 0, 10 and 12 and their effects. Use an explicit variant for "not checked".
-5. Include the probe mark paths and the remote verb-to-kind map that `final` needs.
-6. `verify.sh` decodes the JSON once. Start no interpreter for each field.
-7. The first pass of a pinned wait reuses the initial answer. Later passes read fresh eligibility.
-8. Take no reservation at step start, before the cache decision, or before the previous step's reservation is released.
-9. Keep target order, claim adoption, busy claim handling, refusals, diagnostics and exit statuses.
-10. Read `free_now` once per target eligibility evaluation, and pass that answer through Mac eligibility.
-11. Keep the fresh capacity checks at later reservation boundaries.
-12. Keep `--new-step` on the initial read, and the mark-triggered refresh before later steps.
-13. Start at most one recovery per target at a time. Start none on pinned reads or waiting retries.
-14. Keep recovery's script copy, tree copy, claim ownership, interrupt cleanup and repository decline retention.
-15. Keep each old subcommand that other callers use.
-16. Add no per-subcommand lazy imports (builds' ruling: option B, not A).
-17. Reuse what still applies from old Phase 1 (766b3e87d): `VERIFY_PY_TRACE=<file>` writes one line per helper start. `verify_metadata.py` is already on `builds`.
-18. In the checkpoint summary, list each remaining `BUILD_TARGETS_SCRIPT` call and its boundary.
+1. Measure first: CPU s per start of `eligible`, `reserve` and `release-wait`, with a local-only fixture and with an SSH-target fixture. Use interleaved before and after pairs under the same load, as in Phase 41p's repair. Name the method.
+2. `build_targets.py`: `reserve` and `release-wait` import `mac_test` (`command_reserve` at line 680, `command_release_wait` at line 751) but call none of its functions when no SSH target passes the filter (about 300 ms). Import it only after an SSH target passes. `command_reserve` reads a saved reservation with `mac_test` before its target loop (line 693); keep that path working.
+3. `build_targets.py` `command_eligibility` (line 1075) imports `offload` for every `eligible` call (about 222 ms). Load it only where a call uses it: the `--probe-marks-file` and `--remote-kinds-file` flags (lines 1078 and 1089), and Mac or SSH targets in `target_eligibility` (`targets.py:265` reads `offload.repository_identity`, `targets.py:274` applies Mac policy). A bare `eligible` with only a local Linux target loads no `offload`. `reserve` calls `offload.remote_step_kinds()`; keep that import unless the call can wait until an SSH target passes.
+4. `scripts/mac_test/offload.py:38` and `scripts/mac_test/mac_test.py:35` import `scripts.lint.sweep` at module top (126-156 ms). Its users are `offload.repository_identity()` (three repository helpers), `offload.report_cleanup()` (`sweep.gib`, line 938) and `mac_test.free_now()` (`sweep.repo_name`, line 2322). Import `sweep` inside each of those functions.
+5. `scripts/mac_test/mac_test.py:32` imports `build_hold` at module top (32-63 ms). No measured command calls a hold function. Import it inside the functions that use it. (`offload.py` already imports `build_hold` only inside `holder_session()`; its line 35 imports `override_guard`, which stays.)
+6. `scripts/mac_test/offload.py:42` imports `scripts.buildlog.record` at module top (16-21 ms). Import it inside the functions that record an attempt.
+7. Do not edit `scripts/lint/sweep.py`, `scripts/lint/tmp_sweep.py` or `scripts/build_hold/build_hold.py`. queue Phase 31 changes them. Report other import facts in the final reply.
+8. Keep each command line, output, exit status and side effect the same.
 
 **Files:**
-- `scripts/direct/verify.sh`
 - `scripts/build_targets/build_targets.py`
-- `scripts/mac_test/test_failed_probe_mark.py` — its observer at line 587 matches the literal `eligible` command
-- `scripts/build_targets/test_step_start_facts.py` — new tests
+- `scripts/build_targets/targets.py`
+- `scripts/mac_test/offload.py`
+- `scripts/mac_test/mac_test.py`
+- `scripts/build_targets/test_build_targets.py`
 
-**Workers:** 1 writer: a new worker, not fix16 (builds, 2026-11-07 18:40).
+**Workers:** 1 writer: impl41n.
 
 **Constraints from prior phases:**
-- Read for the contract, without edits: `scripts/build_targets/targets.py`, `scripts/mac_test/mac_test.py`, `scripts/mac_test/offload.py`.
-- `initialize_step_record` runs once per call. `run_step` reads eligibility again only when a listed mark exists.
-- The probe mark paths hold the target failure marks and this repository's version decline records.
-- Pinned eligibility starts no recovery, also on repeated reads during a wait.
-- Recovery keeps the repository decline record after a good probe.
-- A test cleanup that signals a process group uses `scripts.lib.process_group.send_process_group`. The process-group guard in `lib/test_process_group.py` fails on a raw `os.killpg`.
-- natest owns the `test_verify*` files. Put new tests in a new file. Name natest in the notice for any change to its files.
+- Phase 41p's rule holds: modules that Python has loaded before the module body runs (`os`, `sys`, `io`, `time`, `contextlib`, `collections.abc`, `importlib`, `types`, `typing`) stay at module top. Defer only imports with a measured cost.
+- `offload.OffloadRequest.repository_scope` reads `copies.ALL_REPOSITORIES` at import (`offload.py:440`). Keep the `copies` import.
+- `ssh_target_eligibility` reads `free_now` once and passes it to `mac_target_eligibility`. A `"bad"` answer on a new step's first read starts one detached `recover-probe`. Keep both.
+- natest owns the `test_verify*` files. This phase changes none of them.
 - Add no guard, refusal or check that this Spec does not ask for.
 - Tests use a temporary state folder.
 
 **Acceptance gate:**
-- `VERIFY_PY_TRACE` counts, before and after, for the same uncached local, pinned SSH and Mac-only fixtures. One initial facts command runs before the first routing wait or target run. Count reservation, release, interrupt and wait commands on their own lines. Report every helper start, so the JSON decode hides no cost.
-- The first pinned pass starts no second eligibility command. A target change forced during a wait reaches the next pass.
-- Local admission results 0, 10 and 12 keep their diagnostics.
-- Target order, settings paths, exclusion reasons and the `final` remote kind map match the old output.
-- A cache hit takes no reservation. The previous step's reservation is released before the next one starts.
-- One capacity read per eligibility evaluation while recovery changes the claim state.
-- Phase 41e's recovery, capacity order, status and repository decline tests pass, with the `test_failed_probe_mark.py` observer moved to the new command.
-- The CPU of `test_verify_mac_only.py`, measured before and after under the same load, goes down. Report both numbers.
-- `test_verify_wait_holder.py`, `test_failed_probe_mark.py`, `test_ssh_eligibility.py`, `test_build_targets.py` and `test_verify_ssh_targets.py` pass.
-- `bash -n`, shellcheck with no new findings, and basedpyright 0/0/0 on the changed Python files.
+- Per subcommand and fixture (local-only, SSH target): CPU s per start, before and after, in interleaved pairs, with the load beside each pair. Each local-only CPU goes down, or the reply says why it cannot.
+- A fresh-process import check (one table row per case in the existing `test_clean_target_import_loads_mac_test_once` test, or a new test beside it) proves: a bare local-only `eligible` loads neither `mac_test` nor `offload`; `release-wait` with no SSH reservation loads no `mac_test`; `reserve` with every SSH target excluded by its filter loads no `mac_test`.
+- No output, exit status or side effect changes: the Phase 41p modules plus `test_offload.py`, `test_offload_cleanup.py`, `test_mac_test.py`, `test_target_state.py` and `test_failed_probe_mark.py` (its version-decline checks) pass.
+- basedpyright 0/0/0 on the changed Python files.
 - The director runs the targeted test (`targeted_test.py`) before the checkpoint.
 
-### Phase 41o — Remove the socket close race in the token release test  · status: todo
+### Phase 41r — Stop two verify test modules from growing without limit  · status: done
 
-**Depends on:** Phase 41e.
+**Depends on:** none.
 
 #### Work Order
 
-**Source:** builds showrunner, 2026-11-07. natest saw `scripts/direct/test_verify_token_release.py` fail once with `BrokenPipeError` at a socket send. It passed when run alone. devtools 8r fixed a like failure in `test_claude_worker`, but that does not prove the same cause here.
+**Source:** builds showrunner, 2026-11-08, top priority after Phase 41q. Evidence: `/tmp/claude/unit/20523639-3e08-48d6-9277-73e052bca297/phases/83/memory_kill_report.md` (resources Phase 83).
 
-**Goal:** remove the reported socket close race, and keep token release, the step failure status and process cleanup.
-
-**Facts found (review of fe32afe8f):** `test_verify_token_release.py` holds no socket call. Its fixture starts the private admission server through `caller_admission`. The server sends at `admission_service.py:2192`, and line 2205 already catches `BrokenPipeError`. `scripts/lib/test_hang_guard.py` sends on a timer socket and catches `OSError`.
+**Goal:** `test_verify_mac_memory_handoff.py` and `test_verify_mac_local_release.py` finish in bounded memory on every attempt. A test row fails without the fix.
 
 **Spec:**
 
-1. Get the original traceback from natest or the run record. Name the send that raised it.
-2. Find the order of events that closes the other end first. Prove it with a forced order, with no repeat loop and no timing sleep.
-3. Fix the cause where it is: in the fixture if the fixture closes early, in the code if the code sends after a stop.
-4. Do not retry the send, and do not catch `BrokenPipeError` in the test.
+1. Find the cause of the growth. Candidates: a test fixture, a loop in the `verify.sh` code under test, or a read or wait with no end. Name the file, line and the input or timing that starts it.
+2. Fix the growth at its cause. Keep the behavior that each test checks.
+3. Add a test row that fails without the fix and passes with it. Add it to the existing test of the same behavior when one exists.
+4. Run every reproduction in a memory-capped scope: `systemd-run --user --scope -p MemoryMax=3G -p MemorySwapMax=0 <command>`. A run with no cap can stop other units' gates.
 
 **Files:**
-- `scripts/direct/test_verify_token_release.py` — natest owns it; name natest in the notice
-- `scripts/direct/verify_token_wait_test_support.py` — fixture setup, process cleanup, caller lifetime
-- `scripts/build_queue/admission_test_support.py` — private server lifetime and thread failures (queue owns it)
-- `scripts/build_queue/admission_service.py` — the socket send and disconnect handling (queue owns it)
-- `scripts/build_queue/admission_client.py` — request sends and transport errors (queue owns it)
-- `scripts/lib/test_hang_guard.py` — the timer socket send
+- `scripts/direct/test_verify_mac_memory_handoff.py`
+- `scripts/direct/test_verify_mac_local_release.py`
+- `scripts/direct/verify.sh`
 
-**Workers:** 1 writer.
+**Workers:** 1 writer: impl41n.
+
+**Constraints from prior phases:**
+- The facts in the evidence report come from a herdr merge gate at commit 7c5e53574 (2026-11-08 11:19 UTC). The first attempt of `test_verify_mac_memory_handoff.py` grew to 27.0 GiB in 604 s. The first attempt of `test_verify_mac_local_release.py` grew to 9.4 GiB in 374 s. earlyoom killed both, with 0 tests done. Their retries passed at about 250 MiB in 25 s. The machine samples show large shmem growth; gate `TMPDIR` is a tmpfs, so a file that grows there counts as shmem. The earlyoom victim RSS of the Python processes was 8672 MiB and 26070 MiB.
+- natest owns the `test_verify*` files in general; builds assigned this fault to this unit. Name the change to natest in the checkpoint notice.
+- `test_verify_ssh_targets_results.py` fails about 3 runs in 10 before this phase; natest owns that defect (natest Phase 91). Do not change it.
+- Add no guard, refusal or check that this Spec does not ask for. A bound on the growing read, loop or wait is the fix, not an extra guard.
+- Tests use a temporary state folder.
 
 **Acceptance gate:**
-- A test forces the failing order. It fails before the fix and passes after it, with no repeat and no sleep.
-- Token release, the step failure status and process cleanup are asserted in that test.
-- After that proof, `test_verify_token_release.py` passes 50 runs in a row under load.
+- The final reply names the cause: file, line, and the input or timing that starts the growth.
+- The new test row fails without the fix and passes with it. The reply shows both runs.
+- `test_verify_mac_memory_handoff.py` and `test_verify_mac_local_release.py` pass five times each in a capped scope, with peak memory beside each run.
+- basedpyright 0/0/0 on the changed Python files. `bash -n` and ShellCheck show no new findings on a changed shell file.
 - The director runs the targeted test (`targeted_test.py`) before the checkpoint.
 
 ### Phase 41c — Send a lint that waits for memory to a free Mac  · status: done
