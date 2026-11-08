@@ -1167,88 +1167,110 @@ Checkpoint `1f9e9c484` on `verify-not-mac-wait`, merged to builds as `a62793f07`
 
 ### Phase 41t — The copy guard refuses only what makes a repository tree  · status: done
 
-**Depends on:** none. (Queue Phase 16 moved here by builds, 2026-11-08. Its queue dependencies are met: queue 18c is done, and verify Phase 35 is on builds.)
+**Depends on:** none.
+
+#### As-built
+
+- `shell_syntax` gives each word one of two states: a literal word or an expanded word. `copy_guard` turns them into `KnownArgument` and `UnknownArgument`, and an expanded word keeps its known text. After a lexer error, `readable_program` continues at the next `;`, `&`, `|` or newline, so a bad span does not hide the commands after it. No `bash -n` subprocess runs per hook call.
+- An expansion in an interpreter program is an unknown word, not an unknown program. `ExpandedProgramInput` sits beside `LiteralProgramInput`. Joined Python text keeps its known parts, and an attached `-c` with an expansion is a program. Python that does not parse passes, except an expanded program that holds a tree-making word: that one gets `cannot parse Python program`.
+- `refusal()`, the argv branch of `hook_refusal()` and `TreeCreation.__str__()` add the `copies.py` instruction only to a tree-making operation. An unresolved input gets a message that names what the guard could not read. A known tree-making operation keeps its refusal when an unresolved input comes before it in the same command.
+- A later assignment replaces an earlier one. `if`, `case`, `&&`, `||` and loop branches merge their values into `ArgumentChoices`; nested choices flatten and repeat values drop. `guard_choice_limit` (`config/copies.conf`, 32) bounds the combinations read for one command; above it the value is an `UnresolvedChoices`, so a tree-making position keeps its refusal.
+- The 22 commands of the phase command list give their expected results, and all 268 refused transcript commands pass. `scan_scripts` on `scripts/` reports no findings.
+- Four `scripts/direct` test flakes are closed: the run-place package root, the ssh-target claim in a child process, fixed clocks in the step record, and the hold-events environment restore. `local_hold_environment` restores only the keys it changed, in place of `mock.patch.dict`, which cleared `os.environ` while the `admission-readings` thread read it.
+
+**Files:**
+- `scripts/copies/shell_syntax.py` — word states and lexer recovery.
+- `scripts/copies/copy_guard.py` — program inputs, refusal text, branch value merges and the choice bound.
+- `scripts/copies/copies.py` — `guard_choice_limit()`: reads `config_settings()`, with a fallback to the repository `config/copies.conf` when the key is missing.
+- `config/copies.conf` — `guard_choice_limit=32` with its comment.
+- `scripts/copies/test_copy_guard.py` — command rows and `test_branch_arguments_require_linear_invocation_work`, which counts `inspect_invocation` calls.
+- `scripts/direct/verify_hold_wait_test_support.py`, `test_verify_hold_events.py`, `test_verify_run_place.py`, `test_verify_ssh_targets_retained.py`, `test_step_record.py` — the flake fixes.
+
+**Binds later work:** a new copies config key follows the required-key form of `guard_choice_limit()`. A guard change keeps `scan_scripts` on `scripts/` under one second per file, and keeps `test_branch_arguments_require_linear_invocation_work` green.
+
+**Gotchas:**
+- Without the bound, branch-aware merges grow as a product of branches and variables: `scripts/rust_style/load-rust-style.sh` took 63 s of CPU against a 10 s hook budget.
+- The hold-events cause is a race found by reading the code; no process that outlives the test was found.
+- Above the bound, a choice-limited interpreter program is refused even when it makes no tree; the phase "A command that makes no tree passes at the copy guard's branch limit" removes that refusal.
+
+### Phase 41v — A command that makes no tree passes at the copy guard's branch limit  · status: todo
+
+**Depends on:** 41t.
 
 #### Work Order
 
-**Source:** builds, 2026-11-08, moving queue-unit Phase 16 (`docs/plans/builds-queue.md`) to this unit. The builds ruling of 2026-11-05 stands: "A broken guard is fixed at once".
+**Source:** phase 41t architect review, 2026-11-08. This is a defect in what 41t shipped, so it runs before 41u.
 
-**Goal:** a command that makes no repository tree passes the copy guard, and a refusal says what the guard could not read.
+**Goal:** a command that makes no repository tree passes the copy guard, also when its variable values go above `guard_choice_limit`.
 
 **Spec:**
-1. **Refused today.** Real commands from the Claude transcripts of 2026-11-05 to 2026-11-08: 268 distinct commands were refused with a "cannot ..." reason, and 247 of them are still refused on builds at f3e397bdd. None of them makes a tree. The classes:
-   - 119 `cannot resolve interpreter program`: for example `python3 -c "...open('$f')..."` with an expansion in the program text.
-   - 54 `cannot resolve interpreter invocation`: for example `python3 "$f" --diff` or `python3 $(ls …/copies.py | head -1) --help`.
-   - 46 `cannot resolve expanded interpreter stdin`: `python3 - <<EOF` whose body holds `$S`.
-   - 9 `cannot parse Python program`: for example a `python3 - <<'EOF'` program that rewrites a showrunner state file.
-   - 19 `cannot parse shell program`: ANSI-C `$'\x1b'`, a backtick fence inside a grep pattern, an unterminated expansion, and similar.
-   Queue's text also named `python3 /dev/stdin`, `sed` loops and `bash -n`; a plain form of each passes today, and `bash -n "$f"` in a `for` loop over a glob is still refused.
-2. **Fix.** A form with no tree-making operation passes. Where the guard cannot read an input, it reads what it can. An expansion is an unknown word, not an unknown program. Parse valid Python whose strings hold nested quotes. An input that the guard still cannot read gets a message that names what it could not read. The message names `copies.py` only for a tree-making operation.
-   - Today `refusal()`, the argv branch of `hook_refusal()` and `TreeCreation.__str__()` add the `copies.py` instruction to an unresolved input. Change all three.
-   - `shell_syntax.Word.literal()` returns `str | None`; `None` means the word holds an expansion. Replace it with two named states: a literal word and an expanded word. Convert them to the existing `KnownArgument` and `UnknownArgument` results, and keep the known text of an expanded word.
-   - A known tree-making operation keeps its refusal when an unresolved input comes before it in the same command.
-3. **Keep.** Each tree-making form in `test_copy_guard.py` stays refused. Change an assertion only for a form that item 1 names, and give the reason in the summary.
-4. **Proof.** One regression row for each class in item 1, with the real command text from `refused_commands.md`. Add rows to the existing tests of the same behavior. Test the new messages through `refusal()`, the argv branch of `hook_refusal()` and `TreeCreation`. Add one row with an unresolved interpreter argument followed by a known `git clone`: the tree-making refusal wins.
-5. **Command list.** Before dispatch, the director writes `<phase folder>/refused_commands.md`: real commands from each class, each with its expected result, and the tree-making forms that stay refused. The prompt names this file.
-6. **Run-place fixture (builds, 2026-11-08).** `scripts/direct/test_verify_run_place.py` fails without `PYTHONPATH`. Its fixture copies `scripts` but not `lib/package_root.py`, so the repo-root import fails. Add that file to the fixture. The tester owns this item.
-7. **Retained-claim flake (builds, 2026-11-08).** `test_verify_ssh_targets_retained.py` `test_mac_memory_retry_cleans_a_retained_claim_after_its_owner_exits` fails with `LiveMemoryReading` while a real build runs in `builds.slice`; `slice_working_set` (`memory_admit.py:2641`) reads the live scope. `VerifySshTargetsFixture.setUp()` already calls `caller_admission`, which sets a fake `BUILDLOG_BUILDS_CGROUP` and the live-read tripwire. The direct claim call in the test also runs under `self.environment`. First find which run escapes that isolation (for example a child process with a different environment). Then close that path in the test. Do not add a second cgroup fixture. The tester owns this item.
-8. **Clock offset flake (builds, 2026-11-08).** `test_step_record.py` `test_write_reports_the_clock_offset_and_both_record_paths` failed under load 138 and passed alone. Find the wall-clock bound that load breaks, and remove it from the test. The tester owns this item.
-9. **Hold-events cleanup flake (builds, 2026-11-08).** On an aws cloud gate (32 modules at once), two local-admission tests in `scripts/direct/test_verify_hold_events.py` failed the first run with "a fixture cleanup failed; a process may have outlived the test", then passed alone. Find the process that outlives the test, and close that path in the test or its fixture (`scripts/direct/verify_hold_wait_test_support.py`). The tester owns this item.
+1. **Defect.** The command below gets `unresolved relevant operation: cannot resolve interpreter program choices`. Four or five such `if` assignments pass.
+   ```
+   if test condition; then value0=left; else value0=right; fi; … (six such assignments, value0 to value5) …; bash -c "printf %s ${value0}${value1}${value2}${value3}${value4}${value5}"
+   ```
+   Cause: 2^6 combinations go above `guard_choice_limit=32` (`config/copies.conf`). `_choice_vectors` (`copy_guard.py:137`) puts an `UnresolvedChoices` word in place of the values. `_program_input` (`copy_guard.py:211`) makes it a `ChoiceLimitedProgramInput`. `copy_guard.py:364` then refuses each such program, also one that parses and holds no tree-making operation. The 41t round 3 spec asked for an unknown word above the limit, not a refusal of the whole program.
+2. **Required.** Read a choice-limited program the same way as an expanded program (`ExpandedProgramInput`): inspect its known text, and treat the unresolved part as an unknown word.
+   - A known tree-making operation keeps its refusal.
+   - An unknown word in a tree-making position, for example the command name before `clone`, keeps its refusal.
+   - A Python program that does not parse keeps the `cannot parse Python program` rule of `ExpandedProgramInput` (`copy_guard.py:355`).
+   - If `ChoiceLimitedProgramInput` then has no behavior that `ExpandedProgramInput` does not have, remove it.
+3. **Bound.** The work for one command stays linear in branches and variables.
 
 **Files:**
-- `scripts/copies/copy_guard.py`, `scripts/copies/shell_syntax.py` — the parser and the messages.
-- `scripts/copies/test_copy_guard.py` — the tests.
-- `scripts/direct/test_verify_run_place.py` — the fixture (item 6).
-- `scripts/direct/test_verify_ssh_targets_retained.py` — the faked cgroup (item 7).
-- `scripts/direct/test_step_record.py` — the clock offset test (item 8).
-- `scripts/direct/test_verify_hold_events.py`, `scripts/direct/verify_hold_wait_test_support.py` — the hold-events cleanup (item 9).
+- `scripts/copies/copy_guard.py` — the program input rule.
+- `scripts/copies/test_copy_guard.py` — the rows.
 
 **Constraints from prior phases:**
-- Phase 41s: `config/copies.conf` keeps `allow.worktree/worktrees.py`. `test_original_worktree_helper_is_allowed_but_bare_worktree_add_is_refused` keeps its private `WORKTREES_STATE_DIR`, so the test writes no record to the real worktree state folder.
-- Phase 41s: `scripts/worktree/test_worktrees.py` and the worktree row in `scripts/production/test_merge_checkpoint.py` stay green.
+- Phase 41t: `guard_choice_limit()` (`copies.py:301`) reads `config_settings()` and falls back to the repository `config/copies.conf` when the key is missing. Keep the key and the fallback.
+- Phase 41t: `test_branch_arguments_require_linear_invocation_work` counts `inspect_invocation` calls. It stays green with no change to its bound.
+- Phase 41t: every command in `refused_commands.md` gives its expected result, and all 268 corpus commands in `transcript_refusals.jsonl` pass. `scan_scripts` on `scripts/` reports no findings.
 
-**Workers:** 1 writer + 1 tester.
+**Workers:** 1 writer — `impl` owns `copy_guard.py` and `test_copy_guard.py`.
 
 **Acceptance gate:**
-- Every command in `refused_commands.md` gives its expected result.
-- `test_verify_run_place.py` passes with no `PYTHONPATH` set.
-- The retained-claim test reads no live `builds.slice` scope, and the summary names the run that escaped the fixture.
-- Unresolved input gets a message that does not name `copies.py`, through each of the three refusal entry points.
-- The clock offset test has no wall-clock bound that load can break.
-- The summary names the cause of the hold-events cleanup failure, and the fix keeps every assertion. As built: no outside process was proven. The cause found is a race: `mock.patch.dict` cleared `os.environ` while the `admission-readings` thread read it. `local_hold_environment` now restores only the changed keys.
+- New rows in the existing branch-row test of `test_copy_guard.py`, each with six two-value `if` assignments:
+  - `bash -c "printf %s <the six values>"` passes. This row fails on the 41t tree.
+  - `bash -c "git clone <the six values> dest"` refuses and names `copies.py`.
+  - Values `git` or `echo`, and `bash -c "$runner clone source destination"`, refuses.
 - The copies and hook suites pass; `basedpyright` reports 0 errors and 0 warnings on the changed files.
 - The director runs the targeted test.
-- Change-Review: a command that the guard refused now runs.
+- Change-Review: a long branch command that the guard refused now runs.
 
 ### Phase 41u — copies.py list shows remote mirrors  · status: todo
 
-**Depends on:** 41t. (Queue Phase 17 moved here by builds, 2026-11-08. Queue order: 18c, then 16, then 17.)
+**Depends on:** 41t. Runs after 41v.
 
 #### Work Order
 
-**Source:** builds, 2026-11-08, moving queue-unit Phase 17 to this unit. Builds rulings of 2026-11-05: the verify 35b unit keeps the 26 simplify items; the copy start object scan moved to natest's copies.py Git-work speed phase. On `copies.py` the second lander resolves.
+**Source:** builds, 2026-11-08, moving queue-unit Phase 17 to this unit. Queue order was 18c, then 16, then 17. Builds rulings of 2026-11-05: the verify 35b unit keeps the 26 simplify items; the copy start object scan moved to natest's copies.py Git-work speed phase. On `copies.py` the second lander resolves.
 
 **Goal:** `copies.py list` answers who holds a mirror.
 
 **Spec:**
-1. **List.** `copies.py list` prints a header row with labeled columns, the number column included: owner, repository, host, path and session. It shows remote mirrors. The owner column shows the current staff name, looked up from the row id; a role owner shows its role name. Today it shows local standing checkouts only and skips `.remote-mirrors` (`copies.py:804`). Local rows keep the facts they show today: commit, busy state, holder pid and target size. `test_list_reports_tree_owner_repo_commit_busy_pid_and_target_size` keeps its assertions.
-2. **Holder states (architect review of queue 18, 2026-11-06).** `RemoteMirror.session` stays stored after `remote_lease()` ends, so it can name a former holder. The session column names a holder only with live lease evidence. A mirror is in one of three named states: held (the current staff name, read through queue 18c's row id), idle, or unavailable.
-   - `held_remote_mirrors()` (`copies.py:1325`) returns `()` when `/proc/locks` cannot be read, and `file_lock.lock_holder()` returns `None` for several outcomes. Neither tells idle from unavailable.
+1. **List.** `copies.py list` prints a header row with labeled columns, the number column included: owner, repository, host, path and session. It shows remote mirrors. The owner column shows the current staff name, looked up from the row id; a role owner shows its role name. Today it shows local standing checkouts only and skips `.remote-mirrors` (`list_trees`, `copies.py:1038`). Local rows keep the facts they show today: commit, busy state, holder pid and target size. `test_list_reports_tree_owner_repo_commit_busy_pid_and_target_size` keeps its assertions.
+2. **Holder states (architect review of queue 18, 2026-11-06).** `RemoteMirror.session` stays stored after `remote_lease()` ends, so it can name a former holder. The session column names a holder only with live lease evidence. A mirror is in one of three named states: held (the holder's current staff name, read from its session), idle, or unavailable.
+   - **A live lease does not prove the stored holder (architect review of 41t, 2026-11-08).** A run takes `remote_lease()` (`offload.py:2333`) before it publishes its session with `register_remote()` (`offload.py:2124`). During admission and copy, the record can still name the former holder. `register_remote()` (`copies.py:1357`) already stores `holder_pid` (`os.getpid()`). Name the holder only when the lease pid from `held_flock_keys` equals the record's `holder_pid`. When the pids differ, or the record has no `holder_pid`, the mirror is held with the holder not yet recorded. Prove on the real call path that the lease and the registration come from one process.
+   - **Holder name (architect review of 41t).** The stored session is a session id or `pid-<pid>` (`holder_session()`, `offload.py:2447`), not a staff row id. Look up the name with `staff.local_snapshot().by_current_session()` (`scripts/production/staff.py:484`). Convert its `None` result, or a staff read error, into a named holder-name-unavailable state at that boundary. A held mirror with an unavailable holder name stays held.
+   - `held_remote_mirrors()` (`copies.py:1340`) returns `()` when `/proc/locks` cannot be read, and `file_lock.lock_holder()` returns `None` for several outcomes. Neither tells idle from unavailable.
    - Add a list reader in `copies.py` that reads `file_lock.held_flock_keys` once and calls `file_lock.device_key` per mirror. An unreadable lock table makes every mirror unavailable. A missing lease file makes the mirror idle. Any other read error makes it unavailable.
    - Do not change `held_remote_mirrors()`, `lock_holder()` or `scripts/lib/file_lock.py`; their other callers keep their behavior.
-3. **Owner and holder are two columns (architect review of queue 18c, 2026-11-07).** `request_mirror` carries an owner and a holder as two values (`offload.py:2233`). The owner column shows the mirror's owner. The session column shows the live holder. Each has its own display rule. A role owner keeps its fixed role name.
-4. **Owner name states (architect review of queue 18c).** `owner_name` returns the raw row id when the staff read fails or the row is missing (`copies.py:82`). The list must not show a row id. The owner is in one of these named states: a current staff name, a role name, or unavailable. An unavailable owner keeps its row in the list and keeps its lease state.
-   - `owner_name()` also gives names to `tree_paths()` and `gate_name()`, so a change to its fallback can move checkout folders. Do not change `owner_name()`. Add a list-only owner display result with the three states, convert a missing staff row at that boundary, and keep the stored owner identity.
-5. **Proof.** List tests for remote-only records and for mixed local and remote records. Lease-state tests for held, idle and unavailable, with a former holder that the list does not name. A renamed owner with a different live holder shows the new owner name and the holder. A missing staff row shows the owner as unavailable, keeps the row and keeps its lease state. Lease-evidence tests: a missing lease file shows idle; an unreadable lock table shows unavailable; on macOS, where `/proc/locks` does not exist, the list shows unavailable and does not fail. A test proves that `tree_paths()` and `gate_name()` give the same folders as before.
+3. **Owner and holder are two columns (architect review of queue 18c, 2026-11-07).** `request_mirror` carries an owner and a holder as two values (`offload.py:2342`). The owner column shows the mirror's owner. The session column shows the live holder. Each has its own display rule. A role owner keeps its fixed role name.
+4. **Owner name states (architect review of queue 18c).** `owner_name` returns the raw row id when the staff read fails or the row is missing (`copies.py:84`). The list must not show a row id. The owner is in one of these named states: a current staff name, a role name, or unavailable. An unavailable owner keeps its row in the list and keeps its lease state.
+   - `owner_name()` also gives names to `tree_paths()` (`copies.py:431`) and `_scratch_gate_word()` (`copies.py:559`), so a change to its fallback can move checkout folders. Do not change `owner_name()`. Add a list-only owner display result with the three states, convert a missing staff row at that boundary, and keep the stored owner identity.
+5. **Proof.** List tests for remote-only records and for mixed local and remote records. Lease-state tests for held, idle and unavailable, with a former holder that the list does not name. A renamed owner with a different live holder shows the new owner name and the holder. A missing staff row shows the owner as unavailable, keeps the row and keeps its lease state. Lease-evidence tests: a missing lease file shows idle; an unreadable lock table shows unavailable; on macOS, where `/proc/locks` does not exist, the list shows unavailable and does not fail. A test proves that `tree_paths()` and `_scratch_gate_word()` give the same folders as before. Holder tests: a held lease whose pid differs from the record's `holder_pid` does not name the stored session; a held lease with no staff row for the holder session stays held with the holder name unavailable.
 
 **Files:**
 - `scripts/copies/copies.py` — the list.
 - `scripts/copies/test_copies.py`, `scripts/copies/test_remote_copies.py` — the tests.
 
+**Constraints from prior phases:**
+- Phase 41t: `guard_choice_limit()` (`copies.py:301`) reads `config_settings()` and falls back to the repository `config/copies.conf` when the key is missing. A new copies key follows the same required-key form. Keep the key, the fallback and the bound.
+- Phase 41t: `test_branch_arguments_require_linear_invocation_work` in `test_copy_guard.py` stays green.
+
 **Workers:** 1 writer + 1 tester — `impl` owns `copies.py`; `test` owns `test_copies.py` and `test_remote_copies.py`.
 
 **Acceptance gate:**
-- The copies suites pass; `basedpyright` reports 0 errors and 0 warnings on the changed files.
+- The copies suites pass, `test_copy_guard.py` included; `basedpyright` reports 0 errors and 0 warnings on the changed files.
 - The director runs the targeted test.
 - Change-Review: `copies.py list` output.
 
