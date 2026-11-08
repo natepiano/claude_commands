@@ -664,9 +664,9 @@ def trim_build_folder(target: Path, environment: dict[str, str]) -> int:
     code = '\n'.join((
         'import sys',
         'from pathlib import Path',
-        "sys.path.insert(0, str(Path.home() / '.claude/scripts/lint'))",
-        'import sweep',
-        'import conf',
+        "sys.path.insert(0, str(Path.home() / '.claude'))",
+        'from scripts.lint import sweep',
+        'from scripts.lib import conf',
         'config = conf.read(conf.path("lint"))',
         'recent_seconds = int(config.number(sweep.RECENT_KEY) * 60)',
         'import os',

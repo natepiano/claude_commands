@@ -558,6 +558,19 @@ class LinuxShellTests(unittest.TestCase):
         self.assertEqual((self.mirror / "target/warm-proof").read_text(), "warm\n")
         self.assertEqual(other.read_text(), "another slot\n")
 
+        with self.subTest(execution="child", folder="new-build"):
+            child_home = self.root / "child-home"
+            scripts = child_home / ".claude/scripts"
+            scripts.parent.mkdir(parents=True)
+            scripts.symlink_to(Path(__file__).resolve().parents[1], target_is_directory=True)
+            environment = {
+                **self.environment, "HOME": str(child_home), "PYTHONPATH": "",
+                "BUILDLOG_WORKSPACE": str(self.mirror),
+            }
+            with chdir(self.root):
+                status = linux_runner.trim_build_folder(self.mirror / "new-build", environment)
+            self.assertEqual(status, 0)
+
     def test_budget_trims_old_output_and_keeps_recent_output_until_the_disk_floor(self) -> None:
         self.use_real_sweep = True
         _ = self.settings.write_text(self.settings.read_text().replace(
