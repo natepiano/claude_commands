@@ -743,47 +743,29 @@ All of `scripts/buildlog` and every outside importer of its modules use the repo
 - Moving `sessions` and `unit_runs` in this phase: other files import them bare in large numbers.
 
 ### Phase 34 — A failed merge gate module keeps its failure text  · status: done
-**Depends on:** none
 
-From the builds showrunner (not the user), 2026-11-06: "a new item for you, next after your current phase. A failed gate must keep its failure text, so a unit can read it after the gate ends. Today finish_gate_job at merge_gate.py:697 deletes the temporary log, and the record keeps only the test name. natest could read no past failure for its flake work. Keep only the failing modules' output (bounded size, a config key for the limit), next to the gate record, and prune it with the record."
+#### As-built
 
-Decided by the director: the text goes through the build log's one kept-log path, `record.keep_log`, under `<host>/logs/<YYYY-MM>/`. The build log prunes neither records nor logs, so no prune code exists to join; the text lasts as long as the record.
-
-From the builds showrunner (not the user), 2026-11-06: "Phase 34 design accepted. No prune code; the per-file limit bounds the growth."
-
-From the builds showrunner (not the user), 2026-11-08: "go. Fix gate_box.py, cloud_gate.py and their tests in Phase 34 yourself. aws has no unlanded change in scripts/aws_target/, so there is no overlap. I tell aws. Name the files in your checkpoint notice."
-
-#### Work Order
-
-**Goal:** After a merge gate ends, a unit can read the output of each failed module attempt, also a first run that passed on its rerun. A passing module keeps no output.
-
-**Spec:**
-- `scripts/test_times/gate_record.py`: `Execution` (about line 110) gets `output: str`. `ModuleRun` gets `log: str`, the path of the kept log relative to the build log root, empty when no log is kept.
-- `write_gate_run` keeps one log for each attempt whose `status` is not 0 and whose `restart` is empty. It uses `record.keep_log(data, host, epoch, record_id)` (`scripts/buildlog/record.py` about line 602) with the record's `host`, `epoch` and a name from the record id, suite, module and attempt. It keeps only the last `GATE_FAILURE_LOG_KIB` KiB of the output, and it starts the text with one line that gives the count of bytes it cut. A failed keep is reported through `report_not_written` and does not change the gate verdict.
-- `config/test_times.conf`: new key `GATE_FAILURE_LOG_KIB`, read at use through `conf`. Start value 64; state the basis in the comment.
-- `scripts/production/merge_gate.py` `record_gate_run` (about line 936): pass `job.output` to `Execution`. `finish_gate_job` (about line 746) stays as it is, and it still removes the temporary folder.
-- `scripts/buildlog/index.py`: `GATE_MODULE_COLUMNS` (about line 212) gets `("log", "TEXT", "gzipped output of a failed attempt; empty otherwise")`. Bump `SCHEMA_VERSION` from 35 (Phase 27) to 36.
-- Docs: `docs/as-built/merge-gate-and-test-speed.md` says where the text is, how to read it (`buildlog query` for the path, then `zcat`), and that nothing prunes it.
-- Add no guard, no refusal and no check that this Work Order does not name.
+A failed merge gate attempt keeps the end of its output in the build log, for local and cloud gates. A passing or restarted attempt keeps no log. Nothing prunes the logs; the per-file limit bounds the growth.
+- `gate_record.Execution` has a required `output: str`, and `ModuleRun` has `log: str`: the kept log's path relative to the build log root, or empty.
+- `gate_record.keep_failure_logs(record_id, host, epoch, modules, executions)` pairs modules with executions by `zip(..., strict=True)`. For each attempt with a non-zero `status` and an empty `restart`, it writes the last `GATE_FAILURE_LOG_KIB` KiB through `record.keep_log`, after one line that gives the count of cut bytes. The log name is the record id plus a sha256 of (suite, module, attempt). A failed write goes to `report_not_written`; the verdict and the record stay.
+- `write_gate_run(run, executions)` takes its executions with no default and calls `keep_failure_logs`. `merge_gate.record_gate_run` passes each `job.output`.
+- Cloud: `gate_box.execution_records(run)` builds the one `Execution` list, with output, from `run.executions or run.jobs`; `completion_record` uses it. `cloud_gate.import_record` decodes `row['gate']` and calls `keep_failure_logs` on natedev with the record's id, host and start epoch before it appends the box's record.
+- `index.py`: `gate_modules.log` column, `SCHEMA_VERSION` 36. A record without `log` indexes the column as NULL.
 
 **Files:**
-- `scripts/test_times/gate_record.py` — `Execution.output`, `ModuleRun.log`, the kept logs.
-- `scripts/test_times/test_gate_record.py` — the new tests.
-- `config/test_times.conf` — `GATE_FAILURE_LOG_KIB`.
+- `scripts/test_times/gate_record.py` — `Execution.output`, `ModuleRun.log`, `keep_failure_logs`, `write_gate_run`.
+- `scripts/test_times/gate_record_test_support.py` — `fixture_executions`, the one fixture that builds executions from module rows.
+- `config/test_times.conf` — `GATE_FAILURE_LOG_KIB=64`.
 - `scripts/production/merge_gate.py` — passes the output.
-- `scripts/production/test_merge_gate_test_times.py` — a real gate run with a failing module.
-- `scripts/buildlog/index.py`, `scripts/buildlog/test_gate_index.py` — the `log` column.
-- `docs/as-built/merge-gate-and-test-speed.md` — where the text is and how to read it.
+- `scripts/aws_target/gate_box.py`, `scripts/aws_target/cloud_gate.py` — the cloud list builder and the import that keeps the logs.
+- `scripts/buildlog/index.py` — the `log` column.
+- Tests: `test_gate_record.py`, `test_merge_gate_test_times.py`, `test_gate_index.py` (`test_query_recovers_failure_log_paths_after_an_index_rebuild`), `test_cloud_gate.py` (`test_import_uses_real_remote_host_and_appends_once` with a failed first attempt), `test_gate_box.py`, `test_show.py`.
+- `docs/as-built/merge-gate-and-test-speed.md` — "Failed module output": the `buildlog query` for the path, then `zcat`.
 
-**Workers:** 1 writer — `rowcpu` owns all files; the record, its caller and its index change together.
+**Gotchas:**
+- The cloud gate builds its record on the box, so the box cannot write a natedev log; the import on natedev keeps the logs.
+- A new required field on `Execution` or `write_gate_run` reaches every test fixture that builds a gate record; type-check every file that names `gate_record`.
 
-**State:** one new field in new gate records. Old records have no `log` key and index as empty, by the existing `pick`.
-
-**Constraints from prior phases:** Phase 33 and builds' package import form: every import uses the package form (`from scripts.buildlog import y`), a patch string names that form, and no module adds a `sys.path` line. Keep each `if TYPE_CHECKING:` import block as it is. Phase 27: a step row's `target_directory` and `build_directory` are a real pair or `unknown` for both; do not change that. Line references were checked against the tree on 2026-11-08; recheck them after a builds merge. A test makes the project it needs in a tempdir at run time.
-
-**Acceptance gate:**
-- A test runs a gate with one module that fails and one that passes, and reads the failing module's traceback back from the path in its record. The passing module's `log` is empty.
-- A test with a module that fails once and passes on its rerun finds the first attempt's traceback through that attempt's row.
-- A test with output above the limit keeps the end of the output, at most the limit plus the first line, and names the cut bytes. A changed config value changes the kept size with no code change.
-- `buildlog query` returns the `log` path from `gate_modules` on an index that `index.update()` rebuilt.
-- The caller suites of the changed files pass with no assertion weakened. `basedpyright` on the changed files: 0 errors, 0 warnings, 0 notes.
+**Ruled out:**
+- Prune code for the logs: the build log prunes neither records nor logs (builds showrunner, 2026-11-06).

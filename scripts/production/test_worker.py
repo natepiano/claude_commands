@@ -27,8 +27,8 @@ from scripts.herdr import worker_panes
 from scripts.direct import assign, progress_history
 from scripts.direct.recorder_fixture import invoke_recorder
 from scripts.production.cli_fixture import invoke_cli
-from scripts.production import staff, worker, worker_admission
-from scripts.production.staff_test_support import fixture_member, fixture_runtime_id, fixture_worker
+from scripts.production import fake_unit_host, staff, worker, worker_admission
+from scripts.production.staff_test_support import fixture_member, fixture_session, record_fixture_claude_start, fixture_runtime_id, fixture_worker
 from scripts.lib import atomic_file, unit_runs
 from scripts.lib.test_models_registry import write_registry
 from scripts.lib.test_hang_guard import LauncherHangGuard
@@ -48,6 +48,8 @@ class DispatchAgent:
         self.replies: list[str] = []
         self.questions: dict[str, str | herdr.HerdrFailure] = {}
         self.answers: list[tuple[str, str]] = []
+        self.answer_inputs: dict[str, str] = {}
+        self.answer_enters: dict[str, int] = {}
         self.waited: list[str] = []
         self.finish_after = 0
         self.wait_count = 0
@@ -79,6 +81,8 @@ class DispatchAgent:
         else:
             backend = staff.backend(row)
             assert isinstance(backend, (staff.ClaudeBackend, staff.CodexBackend))
+            if isinstance(backend, staff.ClaudeBackend) and not sessions.transcript_locations(row.current_session):
+                fixture_session(row.current_session, backend)
             path = worker_admission.transcript_source(row, backend)
         record = ({"type": "event_msg", "payload": {"type": "user_message" if role == "user" else "agent_message", "message": text}}
                   if isinstance(backend, staff.CodexBackend) else
@@ -97,6 +101,19 @@ class DispatchAgent:
 
     def pane_commands(self, case: unittest.TestCase) -> None:
         run = self.fixture.world.run
+        composer = self.fixture.world.composer
+
+        def accept(pane: str, text: str) -> None:
+            del self.questions[pane]
+            _ = self.answer_inputs.pop(pane, None)
+            _ = self.answer_enters.pop(pane, None)
+            self.answers.append((pane, text))
+            self.append(pane, "user", text)
+            self.error = ""
+            self.fixture.world.locations[pane]["agent_status"] = "working"
+
+        def question_input(pane: str) -> herdr.ComposerInput | herdr.NoComposer:
+            return herdr.ComposerInput(self.answer_inputs.get(pane, "")) if pane in self.questions else composer(pane)
 
         def command(*arguments: str, deadline: float = math.inf) -> str:
             result = run(*arguments, deadline=deadline)
@@ -106,15 +123,22 @@ class DispatchAgent:
                     raise question
                 return question
             if arguments[:2] == ("agent", "prompt") and arguments[2] in self.questions:
-                pane, text = arguments[2:4]
-                del self.questions[pane]
-                self.answers.append((pane, text))
-                self.append(pane, "user", text)
-                self.error = ""
-                self.fixture.world.locations[pane]["agent_status"] = "working"
+                accept(*arguments[2:4])
+            elif arguments[:2] == ("pane", "send-text") and arguments[2] in self.questions:
+                self.answer_inputs[arguments[2]] = arguments[3]
+            elif arguments[:2] == ("pane", "send-keys") and arguments[2] in self.questions:
+                pane, key = arguments[2:4]
+                if key == "shift+left":
+                    self.answer_inputs[pane] = ""
+                    self.answer_enters[pane] = 0
+                elif key == "enter":
+                    self.answer_enters[pane] += 1
+                    if self.answer_enters[pane] == 2:
+                        accept(pane, self.answer_inputs[pane])
             return result
 
         _ = case.enterContext(patch.object(self.fixture.world, "run", side_effect=command))
+        _ = case.enterContext(patch.object(self.fixture.world, "composer", side_effect=question_input))
 
     def consultations(self, case: unittest.TestCase) -> None:
         run = self.fixture.world.run
@@ -1037,6 +1061,11 @@ class WorkerCommandTests(unittest.TestCase):
                 self.assertEqual(self.agent.answers[-1][0], opened.pane)
                 self.assertIn(answer_text, self.agent.answers[-1][1])
                 self.assertEqual(self.fixture.world.locations[opened.pane]["agent_status"], "working")
+        answer_commands = [command for command in self.fixture.world.commands
+                           if command[:2] in (("pane", "send-keys"), ("pane", "send-text"))]
+        self.assertEqual(answer_commands, [("pane", "send-keys", opened.pane, "shift+left"),
+            ("pane", "send-text", opened.pane, answer_text), ("pane", "send-keys", opened.pane, "enter"),
+            ("pane", "send-keys", opened.pane, "enter")] * 2)
         self.assertEqual(self.dispatch(), worker.ExitCode.OK)
         self.assertEqual(len(self.agent.submitted), 1)
         self.assertEqual(self.agent.waited, [opened.pane])
@@ -1051,6 +1080,57 @@ class WorkerCommandTests(unittest.TestCase):
         self.assertEqual(self.command("answer", foreign.name, "--text", "Use Markdown."),
                          (worker.ExitCode.REFUSED, "", "foreign: no worker staff row\n"))
         self.assertEqual(len(self.agent.answers), 2)
+
+    def test_answer_uses_prompt_for_an_idle_worker(self) -> None:
+        opened = self.opened()
+        self.agent.questions[opened.pane] = "Which format?"
+        self.fixture.world.locations[opened.pane]["agent_status"] = "idle"
+        with patch.object(self.fixture.world, "answer_question", wraps=self.fixture.world.answer_question) as answer:
+            self.assertEqual(self.command("answer", "impl", "--text", "Use JSON."), (0, "done\n", ""))
+        answer.assert_not_called()
+        self.assertEqual(len(self.agent.answers), 1)
+        self.assertIn("Use JSON.", self.agent.answers[0][1])
+
+    def test_answer_keeps_prompt_for_a_blocked_claude_worker(self) -> None:
+        _ = write_registry(self.fixture.root / "conf/models.conf", {"assignments": {"direct": "claude"}})
+        opened = self.opened()
+        self.agent.questions[opened.pane] = "Which format?"
+        self.fixture.world.locations[opened.pane]["agent_status"] = "blocked"
+        with patch.object(self.fixture.world, "answer_question", wraps=self.fixture.world.answer_question) as answer:
+            self.assertEqual(self.command("answer", "impl", "--text", "Use JSON."), (0, "done\n", ""))
+        answer.assert_not_called()
+        self.assertEqual(len(self.agent.answers), 1)
+        self.assertIn("Use JSON.", self.agent.answers[0][1])
+
+    def test_claude_without_a_transcript_receives_its_first_dispatch_prompt(self) -> None:
+        _ = write_registry(self.fixture.root / "conf/models.conf", {"assignments": {"direct": "claude"}})
+        opened = self.opened()
+        backend = staff.backend(opened.row)
+        self.assertIsInstance(backend, staff.ClaudeBackend)
+        assert isinstance(backend, staff.ClaudeBackend)
+        source = worker_admission.transcript_source(opened.row, backend)
+        pid = self.fixture.world.foreground[opened.pane][0]
+        with fake_unit_host.private_process_registry():
+            with patch.dict(os.environ, {"FAKE_CLAUDE_PID": str(pid)}):
+                record_fixture_claude_start(["--resume", opened.row.current_session])
+            source.unlink()
+            self.assertIsInstance(worker.dispatch_receipt(opened.row, "first prompt", "first-dispatch", run=self.run_dir),
+                                  worker.DispatchNotSubmitted)
+            self.assertFalse(source.exists())
+            self.assertEqual(self.dispatch(), worker.ExitCode.OK)
+            self.assertEqual(len(self.agent.submitted), 1)
+            self.assertIn(self.agent.final, self.reply.read_text())
+            self.assertTrue(source.exists())
+
+    def test_codex_without_a_transcript_keeps_its_receipt_unknown(self) -> None:
+        opened = self.opened()
+        backend = staff.backend(opened.row)
+        assert isinstance(backend, staff.CodexBackend)
+        for source in (backend.codex_home / "sessions").rglob(f"*{opened.row.current_session}.jsonl"):
+            source.unlink()
+        self.assertIsInstance(worker.dispatch_receipt(opened.row, "first prompt", "first-dispatch", run=self.run_dir),
+                              worker.DispatchEvidenceUnknown)
+        self.assertEqual(self.agent.submitted, [])
 
     def test_working_worker_that_reaches_done_receives_one_prompt(self) -> None:
         opened = self.opened()
@@ -1923,6 +2003,19 @@ class WorkerCommandTests(unittest.TestCase):
         self.assertIn("working", errors)
         self.assertEqual(self.fixture.staff_state(), before)
         self.assertIn(opened.pane, self.fixture.world.foreground)
+
+    def test_end_removes_an_idle_worker_with_an_interrupted_pass(self) -> None:
+        opened = self.opened()
+        self.fixture.dispatch(opened.row, "impl")
+        state = self.run_dir / "progress_history_state.json"
+        atomic_file.write_text_atomic(state, state.read_text().replace('"active"', '"interrupted"'))
+        self.fixture.world.locations[opened.pane]["agent_status"] = "idle"
+        with patch.object(sessions, "session_liveness", return_value=sessions.SessionNotLive()), \
+             patch("scripts.production.staff_sources.require_worker_stopped"):
+            self.assertEqual(worker.end(self.fixture.parent.id, staff.WorkerName.parse("impl")), worker.ExitCode.OK)
+        self.assertIsNone(staff.by_id(opened.row.id))
+        self.assertNotIn(opened.pane, self.fixture.world.locations)
+        self.assertIn("w1:p0", self.fixture.world.locations)
 
     def test_end_removes_only_the_confirmed_closed_worker(self) -> None:
         opened = self.opened()
