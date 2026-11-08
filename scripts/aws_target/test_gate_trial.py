@@ -1238,7 +1238,8 @@ class GuestTests(unittest.TestCase):
                 run = original_run(repo, full=full, machine=machine, module_time_limit_s=module_time_limit_s)
                 _ = (root / 'stat').write_text('cpu 500 0 100 20000 5000 0 0 400 20000 20000\n')
                 return run
-            with (mock.patch.dict(os.environ, {'MERGE_GATE_BASEDPYRIGHT': str(types), 'MERGE_GATE_PYTHON': sys.executable}),
+            with (mock.patch.dict(os.environ, {'MERGE_GATE_BASEDPYRIGHT': str(types), 'MERGE_GATE_PYTHON': sys.executable,
+                                                 'GATE_BOX_DIR': str(root)}),
                   mock.patch.object(sys, 'path', list(sys.path)),
                   mock.patch.object(Path, 'home', return_value=root),
                   mock.patch('subprocess.run', side_effect=transport),
@@ -1289,6 +1290,7 @@ class GuestTests(unittest.TestCase):
                 environment = ledger.mapping(call['env'])
                 for key in ('TEST_TIMES_OUT', 'TMPDIR', 'STAFF_FILE', 'BUILDLOG_DIR', 'BUILDLOG_LIVE_MEMORY_TRIPWIRE'):
                     self.assertIn(key, environment)
+                self.assertNotIn('GATE_BOX_DIR', environment)
             self.assertFalse((root / 'types-args').exists())
             content = uploads[links['log']].decode()
             self.assertLess(content.index('fixture/test_broken.py exit=1'), content.index('fixture/test_stuck.py exit=-15'))
