@@ -48,7 +48,7 @@
 
 **Gotchas:** `install` compares timeouts with `==`, and `10.0 == 10` in Python, so `install` does not rewrite an old file. An old `hooks.json` needs a one-time edit of `10.0` to `10`, then `install` in each Codex home, then `check`. natedev and the Mac were migrated on 2026-11-08.
 
-### Phase 3 — A Codex worker launch proves its thread without reading its rollout file  · status: todo
+### Phase 3 — A Codex worker launch proves its thread without reading its rollout file  · status: done
 
 **Depends on:** Phase 2. panes Phase 28f runs after it.
 
