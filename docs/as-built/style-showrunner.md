@@ -36,7 +36,7 @@ A style production is a standing child production named `<repo>-style`. A repo's
 | `scripts/production/proposals_table.py`, `footer_counts.py` | Proposal states and the footer count |
 | `scripts/production/dailies_input.py`, `dailies_render.py` | The style line in the parent's dailies |
 | `scripts/production/production_lifecycle.py` | Wrap detaches style children |
-| `commands/unit/direct.md` `<StandingPlanRefill>`, `commands/unit/checkpoint.md` | Unit director side of refill and checkpoint |
+| `docs/direct/standing_plan_refill.md` `<StandingPlanRefill>`, `commands/unit/checkpoint.md` | Unit director side of refill and checkpoint |
 | `commands/showrunner/add_style.md`, `style_report.md`, `proposal.md` | Showrunner commands |
 | `docs/style_production.md` | Runtime procedure (Tiers, Families, Ticket queue, Ledger, Sync, Merging back, Yielding, Big changes, Lifetime, Report) |
 
@@ -271,7 +271,21 @@ Findings left counts filed findings whose decision is approved. When all filed f
 
 Schema 25 also adds `held_findings.built_at`. For old built findings it uses the merged build ticket's `updated_at`, or the finding's `updated_at` when there is no merged build ticket. `style_ledger.legacy_built_at_sql(finding)` returns this rule as SQL, for migration 25 and for the Units report on a ledger before schema 25. The report opens the ledger read-only and does not migrate it. It reads `built_at` when the column exists, also when later writes changed `updated_at`. Without the column it uses `legacy_built_at_sql("h")`, but a ledger without the `tickets` table or the `build_ticket` column uses the finding's `updated_at`, because that SQL fails there. Its last-24-hours count also supplies the totals line's ETA. Each build transition sets an empty `built_at` once: proposal ticket merge, declaration follow, `held built` and `mark_built_at_merge`. Later writes keep that time. Returning a built finding to filed, waiving it or withdrawing it as a duplicate clears the time.
 
-**Unit side** (`commands/unit/direct.md` `<StandingPlanRefill>`, `commands/unit/checkpoint.md`): refill runs `style_plan.py next-phase --unit <unit> --plan <unit worktree>/<Plan cell> --repo <unit worktree>` at startup, after compaction or restart, and at each `<NextPhase/>`. It first resumes checkpoint step 7 for any reservation record in `checkpoint_committed_awaiting_release_confirmation`. Exit 3, 4, 5 report once and end the turn blocked (`waiting on the showrunner: sync | board | ticket <id> merge`). A sync message, any showrunner message (board), or `ticket <id> merged; refill.` wakes it. Exit 6: `git fetch origin <style branch> && git merge --ff-only origin/<style branch>`, then refill; a refused or empty fast-forward goes to the showrunner. A standing plan never runs FinalGate, RunAsBuilt, final PeriodicCI, CICleanup, RunSummary or shrink.
+**Unit side** (`docs/direct/standing_plan_refill.md` `<StandingPlanRefill>`, `commands/unit/checkpoint.md`): refill uses this command:
+
+`style_plan.py next-phase --unit <unit> --plan <unit worktree>/<Plan cell> --repo <unit worktree>`
+
+It runs at startup, after compaction or restart, and at each `<NextPhase/>`.
+It first resumes checkpoint step 7 for any reservation record in `checkpoint_committed_awaiting_release_confirmation`.
+Exits 3, 4 and 5 report once and end the turn blocked.
+The message is `waiting on the showrunner: sync | board | ticket <id> merge`.
+A sync message or `ticket <id> merged; refill.` resumes a sync wait.
+A sync message or any showrunner message resumes a board wait.
+The message `ticket <id> merged; refill.` resumes a ticket wait.
+Exit 6 runs `git fetch origin <style branch> && git merge --ff-only origin/<style branch>`, then runs refill.
+A refused or empty fast-forward goes to the showrunner.
+A standing plan never runs FinalGate, RunAsBuilt, final PeriodicCI, CICleanup, RunSummary or shrink.
+
 - Units sync at phase start with that `--ff-only` merge (the `docs/production_format.md` item 5 exception).
 - Checkpoint: gate exit 0 stages only code paths from `git status --porcelain` (rename pairs together), commits once, records `phase_reservation.py committed --ticket <id>` (the pending record names the ticket and the worktree, and step 7 releases nothing), then `ticket checkpoint --session-dir <run> --phase <id>`, which stores the run folder and phase on the ticket in the same write as its state (migration 22: `reservation_session_dir`, `reservation_phase`); a repeat at the same commit stores them when the first checkpoint named none, and refuses a different pair. `ticket merge`, and every `reconcile` for each merged ticket that still names a record, then run `Ledger.release_held_reservation`, which calls `phase_reservation.py release-held --merged <style branch tip>`: it releases an `active` reservation from the recorded worktree when its HEAD is the checkpoint, confirms `outstanding` or `released_after_checkpoint` on the board when its `protected_tip` is the checkpoint, or descends from it and is in the style branch tip (a unit that merged style/main after its checkpoint releases at that merge), and clears the record. Exit 0 also clears the ticket's two columns, so a later merge or reconcile makes no berth call. An earlier confirmed release is not made again, a record not held for the ticket prints `no reservation held`, and a moved worktree or an unconfirmed release keeps it held and keeps the columns (`ticket merge` exits 2 with `rerun ticket merge`; `reconcile` prints the line and retries on its next run). A ticket checkpoint without the two flags merges as before. The plan, `docs/style-production/` and pinned rules never appear in `git add`. Exit 1 keeps the reservation and returns to repair; exit 2 keeps the reservation and reruns the gate, and stops when the same error comes back.
 - No-change ticket (no tracked diff): no commit; `git merge-base --is-ancestor HEAD refs/heads/<style branch>` (else report, ticket stays assigned); the committed-awaiting-release record with that `HEAD` and `--ticket <id>`; `ticket checkpoint --commit HEAD --session-dir <run> --phase <id>`; `ticket merge`, which releases the reservation and clears the record; report `From <unit>: ticket <id> closed with no code change; <n> held.`; refill at once.

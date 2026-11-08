@@ -22,7 +22,7 @@ from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, cast
 
-from scripts.message import send_budget
+from scripts.message import send_budget, session_send
 from scripts.lib.script_envelope import SCRIPT_ENVELOPE_END, SCRIPT_ENVELOPE_START
 
 if TYPE_CHECKING:
@@ -259,9 +259,7 @@ def sessions_command() -> list[str]:
 
 def send_command() -> list[str]:
     override = os.environ.get("CONVERSATION_PAUSE_SEND")
-    if override:
-        return [override]
-    return [sys.executable, str(Path(__file__).resolve().parent.parent / "message" / "send.py")]
+    return [override] if override else session_send.send_argv()
 
 
 def first_error_line(message: str) -> str:
