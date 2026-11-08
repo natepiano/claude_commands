@@ -6,12 +6,14 @@ except FileNotFoundError:
     pass
 
 import argparse
-from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+from collections.abc import Callable, Generator, Sequence
+from contextlib import contextmanager
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from decimal import Decimal
 from hashlib import sha256
 import json
+import os
 from pathlib import Path
 import re
 import subprocess
@@ -23,11 +25,13 @@ from uuid import uuid4
 from scripts.aws_target import gate_box, ledger
 from scripts.aws_target.aws_target import AwsCli, AwsUnavailable, control_lock
 from scripts.aws_target.config import money, read_settings
-from scripts.build_queue import progress_profile
+from scripts.build_queue import admission_client, admission_protocol as wire, cloud_progress, progress_profile
+from scripts.build_queue.queue_place import defer_cleanup_signals
 from scripts.build_targets import target_config
 from scripts.buildlog import store
 from scripts.lib import conf
 from scripts.lib.atomic_file import write_text_atomic
+from scripts.lint import memory_admit
 from scripts.production import affected_modules
 from scripts.production.gate_modules import GateRefused, discover_test_modules
 from scripts.production import merge_gate as gate
@@ -90,6 +94,59 @@ def log_progress(text: str) -> progress_profile.ProgressCounter | progress_profi
             if total else progress_profile.NoCounter('The box has no module counter yet'))
 
 
+def log_cloud_progress(text: str, size_vcpus: int, updated_at: float) -> cloud_progress.CloudProgress:
+    """Read the current phase and each module's latest result."""
+    state: cloud_progress.CloudState = 'setup'
+    failed: set[str] = set()
+    for line in text.splitlines():
+        start = re.fullmatch(r'Runner: \d+ modules, whole machine, (\d+) CPUs', line)
+        if start:
+            state, size_vcpus = 'running', int(start[1])
+        result = re.fullmatch(r'(\S+) exit=(-?\d+) seconds=\d+\.\d+(?: stopped)?', line)
+        if result:
+            if int(result[2]):
+                failed.add(result[1])
+            else:
+                failed.discard(result[1])
+        if line == 'Cloud gate: uploading':
+            state = 'uploading'
+    return cloud_progress.CloudProgress(state, size_vcpus, len(failed), updated_at)
+
+
+@dataclass
+class CloudReservation:
+    sidecar: Path
+    status: int = 1
+
+
+@contextmanager
+def cloud_reservation(repo: Path, sidecar: Path, mode: gate.SuiteMode) -> Generator[CloudReservation]:
+    """Keep the route's cloud slot until its result or fallback returns."""
+    pid = os.getpid()
+    start = memory_admit.process_start_time(pid)
+    if start is None:
+        raise GateRefused('The cloud route has no live process identity')
+    owner, episode, since = wire.Owner(pid, start), uuid4().hex, time.time()
+    profile = memory_admit.ProgramProfile(mode.value, str(Path(__file__).resolve().parents[2]), str(repo.resolve()),
+        memory_admit.HistoryPeakSizing(0, memory_admit.FirstProgramPeak(0), 0.0))
+    def refresh() -> wire.AdmitRequest:
+        request = admission_client.step_request([mode.value], str(repo), owner, since, str(sidecar), episode,
+            profile, run=wire.RunIdentity(pid, start))
+        return replace(request, place=wire.CloudPlace('aws'))
+    output = admission_client.WaitOutput()
+    reply = admission_client.admit(refresh(), output, refresh)
+    if isinstance(reply, wire.Refused):
+        raise GateRefused(reply.reason)
+    if isinstance(reply, admission_client.LeftQueue):
+        raise GateRefused('The cloud route left the admission queue')
+    reservation = CloudReservation(sidecar)
+    try:
+        yield reservation
+    finally:
+        with defer_cleanup_signals():
+            _ = admission_client.release(reply.reservation, reservation.status, reply.cleanup_timing)
+
+
 @final
 class GateWorker:
     """Own one durable launch, result transfer, and confirmed termination."""
@@ -101,11 +158,14 @@ class GateWorker:
         self.sidecar = sidecar
         self.clock = clock
         self.pause = pause
+        self.size_vcpus: int = 0
 
     def publish_log(self, folder: Path) -> None:
-        counter = log_progress((folder / 'gate.log').read_text())
+        text = (folder / 'gate.log').read_text()
+        counter = log_progress(text)
         if isinstance(counter, progress_profile.ProgressCounter):
             progress_profile.publish_counter(self.sidecar, counter)
+        cloud_progress.publish(self.sidecar, log_cloud_progress(text, self.size_vcpus, self.clock()))
 
     def charges(self) -> None:
         def fetch(start: int, end: int) -> Decimal:
@@ -191,6 +251,8 @@ class GateWorker:
                               settings().number('log_push_s'), float(str(request['module_time_limit_s']))).encode()).decode()}
                 launch = {'variant': offset, 'arguments': arguments}
                 save(path, launch)
+            self.size_vcpus = int(ledger.text(arguments, 'InstanceType').split('.')[1].removesuffix('xlarge')) * 4
+            cloud_progress.publish(self.sidecar, cloud_progress.CloudProgress('requesting', self.size_vcpus, 0, self.clock()))
             if self.clock() >= ledger.instant(request, 'expires'):
                 reply = self.api.call('describe-instances', '--filters',
                                       'Name=client-token,Values=' + ledger.text(arguments, 'ClientToken'))
@@ -235,6 +297,7 @@ class GateWorker:
     def execute(self, folder: Path, request: dict[str, object], deployment: dict[str, object]) -> dict[str, object]:
         attempt = ledger.text(request, 'attempt')
         try:
+            cloud_progress.publish(self.sidecar, cloud_progress.CloudProgress('requesting', 0, 0, self.clock()))
             if not (folder / 'launch.json').exists():
                 try:
                     self.reconcile()
@@ -257,6 +320,9 @@ class GateWorker:
             if isinstance(launched, LocalFallback):
                 return {'status': 'fallback', 'reason': launched.reason}
             instance = launched
+            arguments = ledger.mapping(read(folder / 'launch.json')['arguments'])
+            self.size_vcpus = int(ledger.text(arguments, 'InstanceType').split('.')[1].removesuffix('xlarge')) * 4
+            cloud_progress.publish(self.sidecar, cloud_progress.CloudProgress('setup', self.size_vcpus, 0, self.clock()))
             prefix = ledger.text(deployment, 'artifact_prefix') + instance + '/' + attempt
             row: dict[str, object] = {}
             try:
@@ -378,9 +444,7 @@ def run(repo: Path, *, mode: gate.SuiteMode, full: bool, module_time_limit_s: fl
         folder = root / ledger.text(previous, 'attempt') if same_request else root / uuid4().hex
         if (folder / 'outcome.json').exists() and read(folder / 'outcome.json').get('status') != 'pending':
             folder = root / uuid4().hex
-        request = read(folder / 'request.json') if (folder / 'request.json').exists() else prepare(repo, folder, mode, full, module_time_limit_s)
-        save(current, {'attempt': folder.name, **identity})
-        save(folder / 'deployment.json', deployment)
+        folder.mkdir(parents=True, exist_ok=True)
         sidecar = folder / 'reservation.cgroup'
         credential = str(Path(settings().text('credential_file')).expanduser())
         command = ['systemd-run', '--user', '--wait', '--pipe', '--collect', '--unit=cloud-gate-' + folder.name,
@@ -391,25 +455,37 @@ def run(repo: Path, *, mode: gate.SuiteMode, full: bool, module_time_limit_s: fl
                    '--working-directory=' + str(Path(__file__).resolve().parents[2]),
                    sys.executable, '-m', 'scripts.aws_target.cloud_gate', '--worker', str(folder), '--directory', str(directory),
                    '--sidecar', str(sidecar)]
-        # The service owns every AWS call. The session only reads local evidence.
-        _ = service(command)
-        if not (folder / 'outcome.json').exists():
-            return CloudCompleted(failed('The scaler service has no final result; its saved attempt remains recoverable'))
-        outcome = read(folder / 'outcome.json')
-        if outcome.get('status') == 'fallback':
-            return LocalFallback(ledger.text(outcome, 'reason'))
-        if outcome.get('status') != 'complete':
-            return CloudCompleted(failed(ledger.text(outcome, 'reason')))
-        row = ledger.mapping(outcome['result'])
-        try:
-            validate_result(row, request)
-        except (ValueError, KeyError, TypeError) as error:
-            return CloudCompleted(failed(str(error)))
-        if gate.checked_git(repo, 'rev-parse', 'HEAD') != request['commit']:
-            return CloudCompleted(failed('The checkout changed during the cloud attempt'))
-        import_record(folder, row)
-        print((folder / 'gate.log').read_text(), end='', flush=True)
-        return CloudCompleted(gate_box.decode_run(row['gate']))
+        with cloud_reservation(repo, sidecar, mode) as reservation:
+            request = read(folder / 'request.json') if (folder / 'request.json').exists() else prepare(repo, folder, mode, full, module_time_limit_s)
+            save(current, {'attempt': folder.name, **identity})
+            save(folder / 'deployment.json', deployment)
+            cloud_progress.publish(reservation.sidecar, cloud_progress.CloudProgress('requesting', 0, 0, time.time()))
+            outcome = run_service(repo, folder, request, command, service)
+            reservation.status = int(not outcome.run.passed) if isinstance(outcome, CloudCompleted) else 0
+            return outcome
+
+
+def run_service(repo: Path, folder: Path, request: dict[str, object], command: Sequence[str],
+                service: Callable[[Sequence[str]], int]) -> LocalFallback | CloudCompleted:
+    # The service owns every AWS call. The session only reads local evidence.
+    _ = service(command)
+    if not (folder / 'outcome.json').exists():
+        return CloudCompleted(failed('The scaler service has no final result; its saved attempt remains recoverable'))
+    outcome = read(folder / 'outcome.json')
+    if outcome.get('status') == 'fallback':
+        return LocalFallback(ledger.text(outcome, 'reason'))
+    if outcome.get('status') != 'complete':
+        return CloudCompleted(failed(ledger.text(outcome, 'reason')))
+    row = ledger.mapping(outcome['result'])
+    try:
+        validate_result(row, request)
+    except (ValueError, KeyError, TypeError) as error:
+        return CloudCompleted(failed(str(error)))
+    if gate.checked_git(repo, 'rev-parse', 'HEAD') != request['commit']:
+        return CloudCompleted(failed('The checkout changed during the cloud attempt'))
+    import_record(folder, row)
+    print((folder / 'gate.log').read_text(), end='', flush=True)
+    return CloudCompleted(gate_box.decode_run(row['gate']))
 
 
 def main() -> int:

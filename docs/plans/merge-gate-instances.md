@@ -206,7 +206,7 @@ The production route uses one fresh Spot instance for each merge gate or targete
 `config/cloud_gate.conf` sets the order to `m7a.8xlarge`, then `m7a.4xlarge`.
 The route tries every deployed public zone at 32 vCPU before it tries 16 vCPU.
 It never requests On-Demand capacity.
-The configured slot count is nine. The queue phase will enforce that value.
+The build queue enforces nine cloud slots through `cloud_gate_slots` in `build_admission.conf`.
 The route adds no AWS work queue or autoscaling group.
 
 Each attempt uses one `RunInstances` request and a saved idempotency token.
@@ -761,7 +761,12 @@ The box sends logs every `log_push_s=5` seconds.
 The route reads module counters from each log download.
 It writes the existing queue progress format through `progress_profile.publish_counter`.
 
-The route passes an attempt sidecar path to the scaler service.
-The service writes module progress beside that path.
-Cloud admission and cloud status remain separate work for the queue interface order.
-The route does not request local memory for a cloud gate.
+The route admits with `CloudPlace("aws")` before it requests a box.
+The route uses its own pid as the run identity.
+The build queue releases the slot when the route ends.
+The route passes the reservation sidecar path to the scaler service.
+The service writes module progress and `CloudProgress` beside that path.
+The cloud state records the phase, vCPU count, failed module count, and update time.
+The phases are `requesting`, `setup`, `running`, and `uploading`.
+The route releases cloud admission before local fallback requests memory.
+The route requests no local memory for a cloud gate.

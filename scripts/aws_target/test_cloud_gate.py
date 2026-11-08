@@ -1,12 +1,13 @@
 """Exercise durable cloud gates with private files and a fake AWS transport."""
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import redirect_stdout
 from decimal import Decimal
 from io import StringIO
 import json
+import os
 from pathlib import Path
 import subprocess
 from typing import cast, override
@@ -16,7 +17,8 @@ from scripts.aws_target import cloud_gate, gate_box, ledger
 from scripts.aws_target.aws_target import AwsCli
 from scripts.aws_target.config import read_settings
 from scripts.aws_target.ledger_test_support import CostFixture, instant
-from scripts.build_queue import admission_client, progress_profile
+from scripts.build_queue import admission_client, admission_protocol as wire, cloud_progress, progress_profile
+from scripts.build_queue.admission_test_support import AdmissionFixture, caller_admission
 from scripts.buildlog import store
 from scripts.build_targets import target_config
 from scripts.production import affected_modules
@@ -148,6 +150,32 @@ class CloudGateTests(CostFixture):
         self.assertIsInstance(cloud_gate.log_progress('Preparing tools\n'), progress_profile.NoCounter)
         self.assertIsInstance(cloud_gate.log_progress('Runner: 0 modules, whole machine, 32 CPUs\n'),
                               progress_profile.NoCounter)
+
+    def test_each_log_download_publishes_cloud_state_and_latest_failures(self) -> None:
+        self.fake.log = ('Runner: 2 modules, whole machine, 16 CPUs\n'
+                        + 'fixture/test_one.py exit=1 seconds=1.00\n'
+                        + 'fixture/test_two.py exit=-15 seconds=2.00 stopped\n'
+                        + 'fixture/test_one.py exit=0 seconds=1.00\n'
+                        + 'Cloud gate: uploading\n')
+        with mock.patch.object(cloud_progress, 'publish', wraps=cloud_progress.publish) as publish:
+            self.assertEqual(self.execute()['status'], 'complete')
+        expected = cloud_progress.CloudProgress('uploading', 16, 1, self.now)
+        sidecar = self.folder / 'reservation.cgroup'
+        self.assertEqual(cloud_progress.read(sidecar), expected)
+        self.assertEqual(publish.call_args_list[-2:], [mock.call(sidecar, expected), mock.call(sidecar, expected)])
+        states = [cast(cloud_progress.CloudProgress, call.args[1]).state for call in publish.call_args_list]
+        self.assertEqual(states, ['requesting', 'requesting', 'setup', 'uploading', 'uploading'])
+
+    def test_cloud_state_tracks_setup_running_and_capacity_fallback_size(self) -> None:
+        self.assertEqual(cloud_gate.log_cloud_progress('Preparing tools\n', 32, 1),
+                         cloud_progress.CloudProgress('setup', 32, 0, 1))
+        self.assertEqual(cloud_gate.log_cloud_progress('Runner: 3 modules, whole machine, 16 CPUs\n', 32, 2),
+                         cloud_progress.CloudProgress('running', 16, 0, 2))
+        self.fake.refusals = ['InsufficientInstanceCapacity'] * 3
+        with mock.patch.object(cloud_progress, 'publish', wraps=cloud_progress.publish) as publish:
+            self.assertEqual(self.execute()['status'], 'complete')
+        sizes = [cast(cloud_progress.CloudProgress, call.args[1]).size_vcpus for call in publish.call_args_list]
+        self.assertEqual(sizes, [0, 32, 32, 16, 16, 16, 16, 16])
 
     def test_instance_and_volume_tags_use_the_machine_name(self) -> None:
         self.assertEqual(self.execute()['status'], 'complete')
@@ -312,6 +340,7 @@ class CloudGateTests(CostFixture):
 class CloudRouteTests(CostFixture):
     repo: Path = Path()
     modules: list[tuple[str, Path]] = []
+    admission: AdmissionFixture = cast(AdmissionFixture, cast(object, None))
 
     @override
     def setUp(self) -> None:
@@ -331,8 +360,7 @@ class CloudRouteTests(CostFixture):
         self.modules = [('fixture', path) for path in sorted(folder.glob('test_*.py'))]
         _ = self.enterContext(mock.patch.object(cloud_gate, 'discover_test_modules', return_value=self.modules))
         _ = self.enterContext(mock.patch.object(target_config, 'ssh_target_state_directory', return_value=self.state))
-        _ = self.enterContext(mock.patch.object(admission_client, 'admit',
-                              side_effect=AssertionError('A cloud gate must take no local memory')))
+        self.admission = caller_admission(self, self.root, {'BUILDLOG_DIR': str(self.root / 'buildlog')})
 
     def test_bundle_keeps_exact_tree_main_and_current_branch(self) -> None:
         folder = self.root / 'attempt'
@@ -392,3 +420,65 @@ class CloudRouteTests(CostFixture):
                                  module_time_limit_s=1800, service=service)
         self.assertIsInstance(outcome, cloud_gate.LocalFallback)
         service.assert_not_called()
+
+    def test_cloud_admission_uses_route_identity_and_no_local_memory(self) -> None:
+        cloud_gate.save(self.state / 'gate-deployment.json', {'image': 'fixture-image', 'template': 'fixture-template'})
+        self.admission.free(0)
+        requests: list[wire.AdmitRequest] = []
+        admit = admission_client.admit
+        def record(request: wire.AdmitRequest, on_wait: Callable[[wire.Wait], None],
+                   refresh: Callable[[], wire.AdmitRequest]) -> wire.Admitted | wire.Refused | admission_client.LeftQueue:
+            requests.append(request)
+            return admit(request, on_wait, refresh)
+        def service(command: Sequence[str]) -> int:
+            record, = self.admission.caller_reservations().values()
+            self.assertEqual(record.need, 0)
+            sidecar = Path(command[command.index('--sidecar') + 1])
+            self.assertEqual(str(sidecar), requests[-1].sidecar)
+            initial = cloud_progress.read(sidecar)
+            self.assertIsInstance(initial, cloud_progress.CloudProgress)
+            assert isinstance(initial, cloud_progress.CloudProgress)
+            self.assertEqual(initial.state, 'requesting')
+            folder = Path(command[command.index('--worker') + 1])
+            cloud_gate.save(folder / 'outcome.json', {'status': 'fallback', 'reason': 'capacity'})
+            return 0
+        with mock.patch.object(admission_client, 'admit', side_effect=record):
+            for mode in (gate.SuiteMode.MERGE_GATE, gate.SuiteMode.TARGETED_TEST):
+                outcome = cloud_gate.run(self.repo, mode=mode, full=True, module_time_limit_s=1800, service=service)
+                self.assertIsInstance(outcome, cloud_gate.LocalFallback)
+                self.assertTrue(self.admission.callers_released())
+                request = requests[-1]
+                self.assertEqual(request.place, wire.CloudPlace('aws'))
+                self.assertEqual(request.identity.step, mode.value)
+                self.assertEqual(request.owner.pid, os.getpid())
+                self.assertEqual(request.run, wire.RunIdentity(request.owner.pid, request.owner.start_time))
+
+    def test_cloud_fallback_releases_before_local_memory_admission(self) -> None:
+        cloud_gate.save(self.state / 'gate-deployment.json', {'image': 'fixture-image', 'template': 'fixture-template'})
+        def service(command: Sequence[str]) -> int:
+            record, = self.admission.caller_reservations().values()
+            self.assertEqual(record.need, 0)
+            folder = Path(command[command.index('--worker') + 1])
+            cloud_gate.save(folder / 'outcome.json', {'status': 'fallback', 'reason': 'capacity'})
+            return 0
+        run = cloud_gate.run
+        def route(repo: Path, **_kwargs: object) -> cloud_gate.LocalFallback | cloud_gate.CloudCompleted:
+            return run(repo, mode=gate.SuiteMode.TARGETED_TEST, full=True, module_time_limit_s=1800, service=service)
+        def local(repo: Path, *_args: object, **_kwargs: object) -> gate.GateRun:
+            self.assertTrue(self.admission.callers_released())
+            with gate.gate_reservation(repo, self.root, gate.BuildHoldWait(), mode=gate.SuiteMode.TARGETED_TEST) as place:
+                record, = self.admission.caller_reservations().values()
+                self.assertGreater(record.need, 0)
+                place.status = 0
+            return gate.GateRun((), 0, 0)
+        with (mock.patch.object(cloud_gate, 'run', side_effect=route),
+              mock.patch.object(gate, 'run_suites', side_effect=local), redirect_stdout(StringIO())):
+            _ = gate.run_gate_suites(self.repo, full=True, mode=gate.SuiteMode.TARGETED_TEST)
+        self.assertTrue(self.admission.callers_released())
+
+    def test_cloud_service_error_releases_its_slot(self) -> None:
+        cloud_gate.save(self.state / 'gate-deployment.json', {'image': 'fixture-image', 'template': 'fixture-template'})
+        with self.assertRaises(OSError):
+            _ = cloud_gate.run(self.repo, mode=gate.SuiteMode.MERGE_GATE, full=True, module_time_limit_s=1800,
+                               service=mock.Mock(side_effect=OSError('fixture service error')))
+        self.assertTrue(self.admission.callers_released())

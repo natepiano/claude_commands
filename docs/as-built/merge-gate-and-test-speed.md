@@ -8,7 +8,7 @@ remain only for the pending archive cleanup; they do not dispatch new reviews.
 
 Merge gates and targeted tests use one fresh Spot instance for each attempt after the user deploys the gate resources.
 The route returns the existing `GateRun` and exit behavior.
-The queue phase will enforce the configured nine slots and show remote progress.
+The build queue enforces nine cloud slots and shows remote progress.
 
 The route selects targeted modules on natedev.
 It transfers a Git bundle with the exact commit, tree, `origin/main`, and current branch history.
@@ -745,7 +745,12 @@ The box sends logs every `log_push_s=5` seconds.
 The route reads module counters from each log download.
 It writes the existing queue progress format through `progress_profile.publish_counter`.
 
-The route passes an attempt sidecar path to the scaler service.
-The service writes module progress beside that path.
-Cloud admission and cloud status remain separate work for the queue interface order.
-The route does not request local memory for a cloud gate.
+The route admits with `CloudPlace("aws")` before it requests a box.
+The route uses its own pid as the run identity.
+The build queue releases the slot when the route ends.
+The route passes the reservation sidecar path to the scaler service.
+The service writes module progress and `CloudProgress` beside that path.
+The cloud state records the phase, vCPU count, failed module count, and update time.
+The phases are `requesting`, `setup`, `running`, and `uploading`.
+The route releases cloud admission before local fallback requests memory.
+The route requests no local memory for a cloud gate.

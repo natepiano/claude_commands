@@ -186,6 +186,9 @@ finally:
         memory_thread.join()
         sample_memory()
     try:
+        if links.get('production'):
+            with log.open('a') as output:
+                output.write('Cloud gate: uploading\n')
         content = b''.join(path.read_bytes() for path in (root / 'boot.log', log, root / 'timeline.log') if path.exists())
         try:
             snapshot = subprocess.run(['ps', '-eo', 'etimes,pcpu,rss,args', '--sort=-etimes'], capture_output=True, text=True)
