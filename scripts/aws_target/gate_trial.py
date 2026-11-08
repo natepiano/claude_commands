@@ -221,7 +221,7 @@ class GateTrial:
     def projection(self, prices: Prices, step: str) -> float:
         lifetime = conf.read(self.settings.path).whole('gate_trial_lifetime_minutes') * 60
         return (prices.lifetime(lifetime, self.settings.root_gib) * (2 if step == 'start' else 1)
-                + prices.put * (4 + math.floor(lifetime / self.option('log_push_s')) * (2 if step == 'start' else 1))
+                + prices.put * (5 + (2 if step == 'start' else 1) + math.floor(lifetime / self.option('log_push_s')) * (2 if step == 'start' else 1))
                 + prices.get * (lifetime * 2 / self.option('poll_pause_s') + 100))
 
     def reserve_attempt(self, identity: tuple[int, int], projected: float, reserve: float) -> bool:
@@ -405,6 +405,10 @@ class GateTrial:
                 _ = self.api.call('put-object', '--bucket', self.bucket, '--key', 'module_seconds.json',
                                   '--body', str(timings), service='s3api')
                 self.puts += 1
+            guest = bundle.with_name('guest.py')
+            _ = guest.write_text(GUEST)
+            _ = self.api.call('put-object', '--bucket', self.bucket, '--key', 'guest.py', '--body', str(guest), service='s3api')
+            self.puts += 1
             reply = self.api.call('create-security-group', '--group-name', 'gate-trial-' + self.run_id,
                                  '--description', 'Disposable gate trial; egress only', '--vpc-id', self.settings.vpc)
             self.group = ledger.text(reply, 'GroupId')
@@ -416,6 +420,7 @@ class GateTrial:
             return presign(method, host, name, self.settings.region, self.signing, datetime.fromtimestamp(self.clock(), UTC),
                            conf.read(self.settings.path).whole('gate_trial_url_lifetime_s'))
         return {'step': step, 'commit': self.commit, 'boot': 'cold', 'source': url('GET', 'source.bundle'),
+                'guest': url('GET', 'guest.py'),
                 **({'module_seconds': url('GET', 'module_seconds.json')} if self.module_seconds else {}),
                 **{name: url('PUT', key + '/' + name) for name in ('result', 'log', 'ready-cold', 'ready-warm')}}
 
@@ -628,7 +633,7 @@ class GateTrial:
                     self.finish_times(attempt)
                     with self.changed:
                         self.spent += sum(row.dollars for row in rows)
-                        self.puts += 2 if step == 'size' else 4
+                        self.puts += 3 if step == 'size' else 6
                         self.puts += math.floor(lifetime / self.option('log_push_s')) * sum(
                             bool(row.instance_id and row.request_at) for row in rows)
                         _ = self.reservations.pop(identity, None)

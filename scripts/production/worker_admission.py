@@ -211,6 +211,8 @@ def transcript_source(row: staff.StaffRow, backend: staff.ClaudeBackend | staff.
 
 
 def transcript_entry(fields: dict[str, object], changed: set[str]) -> str:
+    if isinstance(fields.get("message"), dict) and fields.get("type") not in ("user", "assistant"):
+        return ""
     raw = fields.get("message", fields.get("payload", {}))
     if not isinstance(raw, dict):
         return ""

@@ -3623,10 +3623,29 @@ start_token_renewer() {
     renew_token || return 1
     local renew_parent=${BASHPID:-$$}
     (
-        trap 'kill $(jobs -p) 2>/dev/null || true; wait; exit 0' INT TERM HUP
+        local renew_sleep_pid="" renew_previous_pid="" renew_sleep_starting=0
+        # Bash can retain pipeline jobs that this subshell cannot wait for.
+        # Stop and collect only the sleep that this renewer started.
+        trap '
+            trap "" INT TERM HUP
+            # Bash sets $! before it can run this trap after the sleep starts.
+            if (( renew_sleep_starting )) && [[ "${!:-}" != "$renew_previous_pid" ]]; then
+                renew_sleep_pid=$!
+            fi
+            if [[ -n "$renew_sleep_pid" ]]; then
+                kill "$renew_sleep_pid" 2>/dev/null || true
+                wait "$renew_sleep_pid" 2>/dev/null || true
+            fi
+            exit 0
+        ' INT TERM HUP
         while kill -0 "$$" 2>/dev/null && kill -0 "$renew_parent" 2>/dev/null; do
+            renew_previous_pid=${!:-}
+            renew_sleep_starting=1
             sleep "$TOKEN_RENEW_S" &
-            wait "$!" || break
+            renew_sleep_pid=$!
+            renew_sleep_starting=0
+            wait "$renew_sleep_pid" || break
+            renew_sleep_pid=""
             renew_token || break
         done
     ) &
@@ -4093,7 +4112,7 @@ run_lint_sequence() {
                 exit "$mend_status"
             fi
             if grep -qiE 'rolled back|revert' "$MEND_LOG"; then
-                echo "verify.sh: cargo mend --fix rolled its rewrites back; the tree reproduces it — run /mend_fix" >&2
+                echo "verify.sh: cargo mend --fix rolled its rewrites back; stop and keep the tree for inspection" >&2
             else
                 echo "verify.sh: cargo mend --fix failed; see the output above" >&2
             fi

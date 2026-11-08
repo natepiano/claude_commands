@@ -313,7 +313,8 @@ def _uncertain(row: staff.StaffRow, reason: str) -> UncertainWorker:
 
 def agent_name(owner: staff.StaffRow, name: str) -> str:
     """Use the owner name to distinguish workers on the shared server."""
-    return f"{owner.name}-{name}"
+    prefix = f"{owner.name}-"
+    return name if name.startswith(prefix) else prefix + name
 
 
 def rename_workers(owner: staff.StaffRow, client: herdr.Herdr) -> None:

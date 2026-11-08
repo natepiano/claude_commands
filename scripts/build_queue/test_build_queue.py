@@ -802,7 +802,7 @@ class QueueTests(NotificationGuardedTestCase):
         text = plain(queue_card.render_selection(model, "first", 400))
         row = next(row for row in text.splitlines() if "Selected running step:" in row)
         self.assertIn("8.0", row)
-        self.assertIn("anonymous use unavailable:", row)
+        self.assertIn("swap-backed use unavailable:", row)
         self.assertNotIn("second", text)
         self.assertNotIn("two", text)
         self.assertNotIn("anonymous use 0.0 GiB", row)
