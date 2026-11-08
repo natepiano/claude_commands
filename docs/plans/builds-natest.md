@@ -1416,7 +1416,7 @@ SIGINT at its default did not prove the cause of any failure in Spec step 5. `ev
 **Gotchas:**
 - `test_verify_mac_only.py` stays at its floor until `verify.sh` makes one `build_targets.py` call per start that returns one JSON (verify owns this work). Count the file at this floor until then.
 
-### Phase 68 — The assign launcher tests use half their CPU  · status: todo
+### Phase 68 — The assign launcher tests use half their CPU  · status: done
 **Depends on:** Phase 54
 
 #### Work Order
@@ -1844,3 +1844,76 @@ Merge 82e4ed73a puts builds 7ab78b74e into this branch with phases 35 to 83. Its
 
 **Ruled out:**
 - Rule 2 removal as a CPU tool for these modules: no measured gain.
+
+### Phase 88 — The fast-track, staff and add-unit tests build their temporary Git repository once per module  · status: todo
+**Depends on:** none
+
+#### Work Order
+
+**Source:** the showrunner, 2026-11-07, on the Phase 87 result: "Add a phase after 85 that makes that setup once per module (one shared fixture repo, copied per test where a test writes), for test_fast_track, test_staff and add_unit first. Measure CPU before and after."
+
+**Goal:** `production/test_fast_track.py` (57.5 CPU s same-load, 52 tests), `production/test_staff.py` (28.6 CPU s, 128 tests) and `production/test_add_unit.py` (64 tests) build their temporary Git repository once per module, and use half their CPU, or a measured floor shows why they cannot, with every checked behavior kept.
+
+**Spec:**
+1. Follow the Speed method. Measure CPU with `module_cost.py --tests 10 --commands 10` first, and find the share that the Git setup takes.
+2. Build one fixture repository per module, in `setUpModule` or `setUpClass`, in a tempdir.
+3. A test that only reads the repository uses the shared fixture. A test that writes to it gets its own copy of the fixture, made by a file copy, not by a new `git init` and commits.
+4. The shared fixture sets `maintenance.auto false` before its first commit (Phase 81).
+5. Read the importers of a shared fixture before you change it. Every importer stays green.
+6. Add no guard, refusal or check (user rule, 2026-11-05).
+
+**Files:**
+- `scripts/production/test_fast_track.py`
+- `scripts/production/test_staff.py`
+- `scripts/production/test_add_unit.py`
+
+**Workers:** 2 writers; split by module
+- `impl` — `test_fast_track.py` and `test_add_unit.py`, role impl
+- `test` — `test_staff.py`, opens as impl
+
+**Constraints from prior phases:**
+- Phase 87: rule 2 removal gave no CPU gain in these modules. The cost is the temporary Git repository that each test builds.
+- `scripts/production/staff_test_support.py` is not natest's to edit (standing rule). A gain that needs a change there goes to the director as an architecture proposal with its measured gain.
+- Tests never read or write live state: `~/.claude` main, `~/.local/state/merge-gate`, `/tmp/claude`.
+
+**Acceptance gate:**
+- The behavior map has a row for each assertion. No assertion is removed.
+- CPU s, processes, execs and wall s before and after, from `module_cost.py` and same-load pairs, in the checkpoint notice.
+- Each changed file and every importer of a changed fixture pass.
+- the targeted test green on the phase commit merged with `origin/builds`
+- `basedpyright` on the changed files prints `0 errors, 0 warnings, 0 notes`
+
+### Phase 89 — The main assign launcher test file uses half its CPU  · status: todo
+**Depends on:** Phase 68
+
+#### Work Order
+
+**Source:** Phase 68 contract review (F001). Phase 68 same-load pairs cut the four assign launcher files from 482.4 to 303.6 CPU s (37%), short of half. The director split the rest of the work into this phase, so the Phase 68 gain lands now.
+
+**Goal:** `scripts/direct/test_assign_launcher.py` (61 tests, 214.8 CPU s same-load median after Phase 68, 286.6 before) uses half its Phase 68 CPU, or a measured floor shows why it cannot, with every checked behavior kept.
+
+**Spec:**
+1. Follow the Speed method. Measure CPU with `module_cost.py --tests 10 --commands 10` first. Name each test's CPU, and each real launcher process that it starts.
+2. Move each test that does not test the process boundary to `InProcessAssignment`, as Phase 68 did. Keep the process tests that the Phase 68 behavior map names: ancestor check, launcher ownership, worker failure and concurrent review stages.
+3. Measure the recorder and resolver children (58.6 CPU s in the Phase 68 command profile). If only a production API change can cut them, write the floor and send the director an architecture proposal with its measured gain.
+4. Read the importers of a changed fixture before you change it. Every importer stays green.
+5. Add no guard, refusal or check (user rule, 2026-11-05).
+
+**Files:**
+- `scripts/direct/test_assign_launcher.py`
+- `scripts/direct/assign_launcher_test_support.py`
+
+**Workers:** 1 writer; one test file and its fixture do not split
+- `impl` — `test_assign_launcher.py`, hub: `assign_launcher_test_support.py`
+
+**Constraints from prior phases:**
+- Phase 68: `invoke_assignment` in `assign_launcher_test_support.py` runs the real coordinator in process and calls the recorder, `workers.py` and `codex_mesh` in process. `snapshot_files` and `changed_files` share the first-dispatch snapshot.
+- Phase 68 behavior map: `/tmp/claude/unit/2113de4f-9913-485a-9a51-61558bfd81db/phases/68/profile/behavior_map.md`.
+- Tests never read or write live state: `~/.claude` main, `~/.local/state/merge-gate`, `/tmp/claude`.
+
+**Acceptance gate:**
+- The behavior map has a row for each assertion. No assertion is removed.
+- CPU s, processes, execs and wall s before and after, from `module_cost.py` and same-load pairs, in the checkpoint notice.
+- The changed file and every importer of a changed fixture pass.
+- the targeted test green on the phase commit merged with `origin/builds`
+- `basedpyright` on the changed files prints `0 errors, 0 warnings, 0 notes`
