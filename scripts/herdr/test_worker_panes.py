@@ -25,7 +25,7 @@ from scripts.production import staff, worker_admission
 from scripts.shutdown import restart
 from scripts.production.staff_test_support import StaffTestCase, fixture_member, fixture_runtime_id, fixture_session, fixture_worker
 from scripts.lib.atomic_file import write_text_atomic
-from scripts.lib import process_start, unit_runs
+from scripts.lib import models_registry, process_start, unit_runs
 from scripts.message import sessions
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib.test_models_registry import write_registry
@@ -472,7 +472,7 @@ class WorkerPaneTests(StaffTestCase):
             self.assertEqual(worker_panes.observe_parents([], staff.snapshot()), {})
 
     def start(self, name: str = "impl2", role: staff.WorkerRole | worker_panes.WorkerRoleUnavailable = "impl",
-              *, account: worker_panes.ConfiguredWorkerAccount | worker_panes.DestinationWorkerAccount = worker_panes.ConfiguredWorkerAccount.CURRENT) -> worker_panes.WorkerStart:
+              *, account: worker_panes.ConfiguredWorkerAccount | worker_panes.DestinationWorkerAccount | accounts.AccountSelection = worker_panes.ConfiguredWorkerAccount.CURRENT) -> worker_panes.WorkerStart:
         return worker_panes.start_or_resume(self.parent.id, staff.WorkerName.parse(name), role, account=account)
 
     def test_a_worker_name_with_its_owner_prefix_keeps_one_prefix_on_the_pane(self) -> None:
@@ -1698,6 +1698,62 @@ class WorkerPaneTests(StaffTestCase):
         self.assertIn("invalid role configuration", errors)
         self.assertIn("missing", errors)
         self.assertEqual(self.world.launches, [])
+
+    def test_launch_environment_matches_the_policy_family_for_typed_accounts(self) -> None:
+        codex = accounts.CodexWorkersAccount("codex", self.root / ".codex")
+        claude = accounts.NamedAccount("claude", self.root / ".claude")
+        configured_codex = accounts.CodexWorkersAccount("codex1", self.root / "configured-codex")
+        configured_claude = accounts.NamedAccount("claude1", self.root / "configured-claude")
+        for family in ("codex", "claude"):
+            policy = worker_panes.worker_policy(models_registry.LaunchSettings(family, "fixture", "high", ""))
+            for selection in (codex, claude):
+                with (self.subTest(family=family, account=selection.label),
+                      patch.object(accounts, "role_account", return_value=configured_codex) as codex_role,
+                      patch.object(accounts, "account_for_unscoped_launch", return_value=configured_claude) as claude_role,
+                      redirect_stderr(io.StringIO()) as errors):
+                    result = worker_panes.launch_environment(policy, selection, resume=True)
+                self.assertIsInstance(result, dict)
+                assert isinstance(result, dict)
+                selected_family = "codex" if isinstance(selection, accounts.CodexWorkersAccount) else "claude"
+                matched = selected_family == family
+                if family == "codex":
+                    self.assertEqual(result["CODEX_HOME"], str(codex.home if matched else configured_codex.home))
+                    self.assertNotIn("CLAUDE_CONFIG_DIR", result)
+                else:
+                    self.assertEqual(result["CLAUDE_CONFIG_DIR"], str(claude.dir if matched else configured_claude.dir))
+                    self.assertNotIn("CODEX_HOME", result)
+                self.assertEqual(errors.getvalue(), "" if matched else
+                    f"anomaly: {selection.label}: account family {selected_family} does not match the {family} worker; "
+                    + "using the configured account\n")
+                if not matched and family == "codex":
+                    codex_role.assert_called_once_with("workers")
+                else:
+                    codex_role.assert_not_called()
+                if not matched and family == "claude":
+                    claude_role.assert_called_once_with(os.environ, workers=True)
+                else:
+                    claude_role.assert_not_called()
+
+    def test_typed_account_selections_reach_their_launch_homes_without_label_resolution(self) -> None:
+        for family in ("codex", "claude"):
+            with self.subTest(family=family):
+                _ = write_registry(self.root / "conf/models.conf", {"assignments": {"direct": family}})
+                row = self.worker("typed-" + family, family=family)
+                pane = "w1:p-typed-" + family
+                self.world.add(row, pane, live=False)
+                destination = self.root / (".codex" if family == "codex" else ".claude")
+                selected = (accounts.CodexWorkersAccount("codex", destination) if family == "codex" else
+                            accounts.NamedAccount("claude", destination))
+                with (patch.object(agent_accounts, "codex_account_home", wraps=agent_accounts.codex_account_home) as codex,
+                      patch.object(accounts, "prepare_claude_launch", wraps=accounts.prepare_claude_launch) as claude):
+                    result = self.start(row.name, account=selected)
+                self.assertIsInstance(result, worker_panes.OpenWorker)
+                assert isinstance(result, worker_panes.OpenWorker)
+                self.assertEqual((result.row.current_session, result.pane), (row.current_session, pane))
+                self.assertEqual(self.world.requests[-1][2]["CODEX_HOME" if family == "codex" else
+                                                          "CLAUDE_CONFIG_DIR"], str(destination))
+                codex.assert_not_called()
+                claude.assert_not_called()
 
     def test_each_family_resumes_on_destination_and_source_accounts_in_one_terminal(self) -> None:
         for family in ("claude", "codex"):

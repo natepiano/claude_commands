@@ -113,7 +113,7 @@ def measure_cli_work(command: str, environment: dict[str, str], row_count: int) 
     result = subprocess.run(
         [str(Path(__file__).resolve().parents[1] / "lib/py"), "-c", "import os; environment = dict(os.environ); from scripts.buildlog.test_report import probe_cli; os.environ.update(environment); from scripts.buildlog import record, store; store.host_name = lambda: record.local_step_identity().hosts[0]; probe_cli()", command],
         cwd=Path(__file__).resolve().parents[2],
-        env={**environment, "PYTHONPATH": str(Path(__file__).resolve().parent), "BUILDLOG_TEST_INSTRUCTION_LIMIT": str(row_count * 500)},
+        env={**environment, "PYTHONPATH": str(Path(__file__).resolve().parents[2]), "BUILDLOG_TEST_INSTRUCTION_LIMIT": str(row_count * 500)},
         capture_output=True, text=True, check=False, timeout=test_hang_guard.TEST_HANG_GUARD_SECS,
     )
     if result.returncode != 0:

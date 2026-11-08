@@ -274,7 +274,7 @@ class LaunchRecordingTests(unittest.TestCase):
                 "import json, sys",
                 "before = list(sys.path)",
                 "import scripts.hana_shot.hana_shot",
-                "print(json.dumps({'before': before, 'after': sys.path, 'record': 'record' in sys.modules}))",
+                "print(json.dumps({'before': before, 'after': sys.path, 'record': 'scripts.buildlog.record' in sys.modules}))",
             ))],
             cwd=Path(__file__).resolve().parents[2],
             env={name: value for name, value in os.environ.items() if name != "PYTHONPATH"},

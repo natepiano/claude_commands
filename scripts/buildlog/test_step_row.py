@@ -73,7 +73,7 @@ class RecorderCompatibilityTests(unittest.TestCase):
             "import sys; from scripts.buildlog import repository; "
             "assert repository.remote_identity('git@EXAMPLE.com:owner/project.git', '/fixture') "
             "== 'https://example.com/owner/project'; assert 'urllib.parse' not in sys.modules; "
-            "assert 'record' not in sys.modules; assert 'scripts.buildlog.record' not in sys.modules"
+            "assert 'scripts.buildlog.record' not in sys.modules"
         )
         result = subprocess.run([str(Path(__file__).resolve().parents[1] / "lib/py"), "-c", source],
                                 capture_output=True, text=True, env={

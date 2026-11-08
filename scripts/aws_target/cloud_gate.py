@@ -35,6 +35,7 @@ from scripts.lint import memory_admit
 from scripts.production import affected_modules
 from scripts.production.gate_modules import GateRefused, discover_test_modules
 from scripts.production import merge_gate as gate
+from scripts.test_times import gate_record
 
 
 @dataclass(frozen=True)
@@ -387,6 +388,9 @@ def import_record(folder: Path, row: dict[str, object]) -> None:
         _ = handle.seek(0)
         records = [ledger.mapping(cast(object, json.loads(line))) for line in handle if line.endswith(b'\n')]
         if not any(previous.get('id') == record['id'] for previous in records):
+            run = gate_box.decode_run(row['gate'])
+            gate_record.keep_failure_logs(ledger.text(record, 'id'), host, at,
+                cast(list[gate_record.ModuleRun], record['modules']), gate_box.execution_records(run))
             store.append_locked(handle, record)
     save(folder / 'imported.json', {'id': record['id']})
 

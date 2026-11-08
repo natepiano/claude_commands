@@ -131,7 +131,6 @@
       "extraPaths": [
         ".",
         "scripts/mac_test",
-        "scripts/buildlog",
         "scripts/build_hold",
         "scripts/lib"
       ]

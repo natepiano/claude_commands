@@ -21,13 +21,16 @@ from dataclasses import dataclass, replace
 from enum import Enum, IntEnum
 from functools import partial
 from importlib import import_module
-from typing import Literal, cast, final
+from typing import TYPE_CHECKING, Literal, cast, final
 
 from scripts.herdr import herdr, pane_launch
 from scripts.lib import conf, models_registry, nix_env, unit_runs
 from scripts.production import staff, worker_admission
 from scripts.agents import worker_lifecycle
 from scripts.direct import recorder_state
+
+if TYPE_CHECKING:
+    from scripts.accounts import accounts
 
 StaffId = staff.StaffId
 WorkerName = staff.WorkerName
@@ -686,11 +689,21 @@ def launch_arguments(policy: LaunchPolicy, identity: str, directory: Path | str)
     return launch + _policy_arguments(policy)
 
 
-def launch_environment(policy: LaunchPolicy, account: ConfiguredWorkerAccount | DestinationWorkerAccount,
+def launch_environment(policy: LaunchPolicy, account: ConfiguredWorkerAccount | DestinationWorkerAccount | accounts.AccountSelection,
                          resume: bool) -> dict[str, str] | StartRefused:
     from scripts.accounts import accounts
     from scripts.whoami import account as account_reader, agent_accounts
     try:
+        if policy.settings.kind == "codex":
+            if isinstance(account, accounts.CodexWorkersAccount):
+                return {"CODEX_HOME": str(account.home)}
+        elif isinstance(account, accounts.NamedAccount):
+            return account_reader.named_account_environment(account.dir)
+        if isinstance(account, (accounts.CodexWorkersAccount, accounts.NamedAccount)):
+            family = "codex" if isinstance(account, accounts.CodexWorkersAccount) else "claude"
+            print(f"anomaly: {account.label}: account family {family} does not match the {policy.settings.kind} worker; "
+                  + "using the configured account", file=sys.stderr)
+            account = ConfiguredWorkerAccount.CURRENT
         if policy.settings.kind == "codex":
             selected = (agent_accounts.codex_account_home(account.label) if isinstance(account, DestinationWorkerAccount)
                         else accounts.role_account("workers"))
@@ -775,7 +788,7 @@ def _destination(parent: staff.StaffRow, name: str, evidence: PaneEvidence,
 
 
 def start_or_resume(parent: StaffId, name: WorkerName, role: WorkerRole | WorkerRoleUnavailable, *,
-                    account: ConfiguredWorkerAccount | DestinationWorkerAccount = ConfiguredWorkerAccount.CURRENT,
+                    account: ConfiguredWorkerAccount | DestinationWorkerAccount | accounts.AccountSelection = ConfiguredWorkerAccount.CURRENT,
                     lock: WorkerLockHold | WorkerLockAtUse = WorkerLockAtUse.ACQUIRE,
                     policy: LaunchPolicy | None = None, runs: dict[str, list[str]] | None = None,
                     codex: herdr.CodexConversations | herdr.CodexLaunchRead = herdr.CodexLaunchRead.CURRENT) -> WorkerStart:
@@ -843,7 +856,7 @@ def _codex_start_session(client: herdr.Herdr, pane: str, *,
 
 
 def _start_locked(owner: staff.StaffRow, name: WorkerName, role: WorkerRole, policy: LaunchPolicy,
-                  account: ConfiguredWorkerAccount | DestinationWorkerAccount,
+                  account: ConfiguredWorkerAccount | DestinationWorkerAccount | accounts.AccountSelection,
                   allowed: worker_admission.WorkerStartAllowed, lock: WorkerLockHold,
                   codex: herdr.CodexConversations | herdr.CodexLaunchRead) -> WorkerStart:
     started = time.monotonic()
