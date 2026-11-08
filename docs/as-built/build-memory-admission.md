@@ -1058,7 +1058,37 @@ Before its checks, the scratch guard uses the session-start path helper to resto
 
 Each Claude session's `TMPDIR` is `/tmp/claude/session/<session id>`: `hooks/session-start-temp-root.py` makes it at start, resume, clear and compact, and writes `export TMPDIR=...` to `$CLAUDE_ENV_FILE`. A run's workers, its codex app-server (`codex_mesh.py`) and `verify.sh --session-dir` use `<run folder>/tmp`. So mktemp, tempfile and Rust `.tmpXXXXXX` folders land there, and the hourly tmp sweep judges each entry with its 4 h rule; the root goes only once its session or director stops, and nothing waits on that. In /tmp and the other temp folders a folder's ctime is no change, since `systemd-tmpfiles-clean` moves it every day (its 26 Oct run kept month-old folders such as `cargo-installQOkrzS` looking fresh to the 7-day rule).
 
-The daily folder audit (`scripts/lint/folder_audit.py --send`, a `nate.jobs` job on natedev and on the Mac) is the backstop for loose folders that can hold work: ~/rust, ~/rust/scratch, and the /tmp, /tmp/claude and `$TMPDIR` folders the sweep leaves. A folder in ~/rust is loose when its name is not in `config/rust_roots.txt` (one list for both machines) and it is not `repro` or `scratch`; every folder in ~/rust/scratch is loose, since `scratch.py` never makes one there; a folder in /tmp, /tmp/claude or `$TMPDIR` is loose when it is no session scratchpad, scratch root, run folder root, tempfile folder, `verify.sh` run folder or folder that holds only folders (the sweep judges those) or name a system tool owns. When `config/rust_roots.txt` cannot be read (an old checkout), nothing in ~/rust is judged. Only folders this user owns that did not change for a day count. Idle time comes from the newest mtime of the folder and of what is in it down to 3 folders (`target/`, `node_modules/` and `.git/` passed over), and of each git repo's `HEAD`, `index` and `logs/HEAD`, so a commit counts; ctime never counts. A folder with more than 50,000 entries in that depth stays and is named. A loose folder idle 7 days (`folder_remove_after_seconds`) is removed when no open hold names it, a folder in it or a folder that holds it; no process works in it or has a file in it open or mapped (the sweep's `/proc` or lsof scan); no socket in it is bound by a live process (`/proc/net/unix`; on the Mac any socket keeps it); and no git repo in it holds work on no remote (`scratch.unsaved_work`: uncommitted changes, a stash, commits on no remote, or a repo git cannot read). A removed linked worktree is pruned from its source repo, and each removal appends a line to `~/.local/state/folder-sweep/removed.jsonl`. It removes only once armed: `folder_audit.py arm` writes `~/.local/state/folder-sweep/armed` and `disarm` removes it; until then each line says `would remove`. Its first dry runs (2026-10-27) found 106 loose folders on natedev, 36 to remove (all old /tmp leftovers), and 13 on the Mac, 8 to remove (mostly ~/rust/scratch). The maker is the earliest-started session whose transcript holds a command (a JSON `"command"` string) that names the folder, since a listing in a command's output names every folder it shows, found in one ripgrep pass over all transcripts (about 6 s over 22 GB; a Python scan took 4 h 24 min); the name must end at a path boundary. Each maker gets one message that lists its folders with what happened to each and names `scratch.py adopt` and `scratch.py hold`; a folder no transcript names is printed only.
+The daily folder audit (`scripts/lint/folder_audit.py --send`) checks loose folders that can hold work.
+A `nate.jobs` job runs it on natedev and the Mac.
+It checks ~/rust, ~/rust/scratch, /tmp, /tmp/claude and `$TMPDIR`.
+In ~/rust, `config/rust_roots.txt`, `repro` and `scratch` name kept folders.
+Every folder in ~/rust/scratch is loose.
+In temporary roots, system folders, session scratchpads, scratch roots and run roots stay.
+The audit also keeps `/tmp/codex-daemon-<uid>`, which holds sockets for running Codex processes.
+The sweep checks tempfile folders, `verify.sh` folders and folders that contain only folders.
+If the audit cannot read `config/rust_roots.txt`, it does not check ~/rust.
+Only folders owned by this user and idle for a day enter the audit.
+The audit checks modification times down to three folder levels and each repository's `HEAD`, `index` and `logs/HEAD`.
+It skips `target/`, `node_modules/` and `.git/` during that scan.
+It keeps folders with more than 50,000 entries at that depth.
+A loose folder idle for `folder_remove_after_seconds` can be removed after seven days.
+An open hold, process use, live socket or unsaved git work keeps it.
+On the Mac, any socket in a folder keeps it.
+A failed git check also keeps it.
+The audit prunes removed linked worktrees from their source repositories.
+It records each removal in `~/.local/state/folder-sweep/removed.jsonl`.
+`folder_audit.py arm` enables removal, and `disarm` disables it.
+Before arming, each selected folder prints `would remove`.
+The first dry runs on 2026-10-27 found 106 loose folders on natedev and 13 on the Mac.
+They selected 36 and eight folders for removal.
+
+The maker is the earliest-started session whose own command creates the folder.
+The audit uses the scratch guard's `commands()` and `targets()` parser and resolves targets against the transcript row's `cwd`.
+Read-only commands, command output and message text do not prove ownership.
+One ripgrep pass selects possible transcript rows by folder name before the parser checks their commands.
+Each proven maker receives one message with its folders, outcomes, `scratch.py adopt` and `scratch.py hold`.
+A folder without a proven maker prints `maker unknown` and receives no message.
+
 
 ### Disk-floor alerts (`scripts/lint/sweep.py`, `scripts/buildlog/disk.py`)
 
