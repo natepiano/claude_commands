@@ -1138,6 +1138,44 @@ Checkpoint `1f9e9c484` on `verify-not-mac-wait`, merged to builds as `a62793f07`
 - basedpyright 0/0/0 on the changed Python files.
 - The director runs the targeted test (`targeted_test.py`) before the checkpoint.
 
+### Phase 41r — Stop two verify test modules from growing without limit  · status: done
+
+**Depends on:** none.
+
+#### Work Order
+
+**Source:** builds showrunner, 2026-11-08, top priority after Phase 41q. Evidence: `/tmp/claude/unit/20523639-3e08-48d6-9277-73e052bca297/phases/83/memory_kill_report.md` (resources Phase 83).
+
+**Goal:** `test_verify_mac_memory_handoff.py` and `test_verify_mac_local_release.py` finish in bounded memory on every attempt. A test row fails without the fix.
+
+**Spec:**
+
+1. Find the cause of the growth. Candidates: a test fixture, a loop in the `verify.sh` code under test, or a read or wait with no end. Name the file, line and the input or timing that starts it.
+2. Fix the growth at its cause. Keep the behavior that each test checks.
+3. Add a test row that fails without the fix and passes with it. Add it to the existing test of the same behavior when one exists.
+4. Run every reproduction in a memory-capped scope: `systemd-run --user --scope -p MemoryMax=3G -p MemorySwapMax=0 <command>`. A run with no cap can stop other units' gates.
+
+**Files:**
+- `scripts/direct/test_verify_mac_memory_handoff.py`
+- `scripts/direct/test_verify_mac_local_release.py`
+- `scripts/direct/verify.sh`
+
+**Workers:** 1 writer: impl41n.
+
+**Constraints from prior phases:**
+- The facts in the evidence report come from a herdr merge gate at commit 7c5e53574 (2026-11-08 11:19 UTC). The first attempt of `test_verify_mac_memory_handoff.py` grew to 27.0 GiB in 604 s. The first attempt of `test_verify_mac_local_release.py` grew to 9.4 GiB in 374 s. earlyoom killed both, with 0 tests done. Their retries passed at about 250 MiB in 25 s. The machine samples show large shmem growth; gate `TMPDIR` is a tmpfs, so a file that grows there counts as shmem. The earlyoom victim RSS of the Python processes was 8672 MiB and 26070 MiB.
+- natest owns the `test_verify*` files in general; builds assigned this fault to this unit. Name the change to natest in the checkpoint notice.
+- `test_verify_ssh_targets_results.py` fails about 3 runs in 10 before this phase; natest owns that defect (natest Phase 91). Do not change it.
+- Add no guard, refusal or check that this Spec does not ask for. A bound on the growing read, loop or wait is the fix, not an extra guard.
+- Tests use a temporary state folder.
+
+**Acceptance gate:**
+- The final reply names the cause: file, line, and the input or timing that starts the growth.
+- The new test row fails without the fix and passes with it. The reply shows both runs.
+- `test_verify_mac_memory_handoff.py` and `test_verify_mac_local_release.py` pass five times each in a capped scope, with peak memory beside each run.
+- basedpyright 0/0/0 on the changed Python files. `bash -n` and ShellCheck show no new findings on a changed shell file.
+- The director runs the targeted test (`targeted_test.py`) before the checkpoint.
+
 ### Phase 41c — Send a lint that waits for memory to a free Mac  · status: done
 
 #### As-built
