@@ -65,7 +65,6 @@
       "Read(//var/folders/rf/twhh0jfd243fpltn5k0w1t980000gn/T/**)",
       "Read(/private/tmp*)",
       "mcp__brp",
-      "Bash(~/.claude/scripts/berth_fix/*)",
       "Bash(zsh ~/.claude/scripts/direct/unit_notifier.sh *)",
       "Bash(bash ~/.claude/scripts/direct/verify.sh *)",
       "Bash(bash ~/.claude/scripts/direct/implement.sh *)",
