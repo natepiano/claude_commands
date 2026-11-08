@@ -19,11 +19,22 @@ Two policies in the cargo layer that every session's builds go through. First, e
 - `nextest_physical_cores [sysfs_root]` sets `LINT_PHYSICAL_CORES` once per shell. On Linux it counts distinct `physical_package_id:core_id` pairs under `${1:-/sys/devices/system/cpu}/cpu[0-9]*/topology/`; on darwin it reads `sysctl -n hw.physicalcpu`. A value that is not a positive integer leaves it empty.
 - `nextest_logical_cores` sets `LINT_LOGICAL_CORES` once from `getconf _NPROCESSORS_ONLN`, with the same rule.
 - `nextest_width_arm EPOCH` sets `LINT_TEST_WIDTH_ARM` to `physical` when `(EPOCH / 6000) % 2 == 0`, else `logical`. `trial` mode passes `${EPOCHSECONDS:-$(date +%s)}`.
-- `run_nextest` runs `require_nextest`, waits out any build hold (`build_hold_wait_local`), then picks the width and runs `cargo nextest run --test-threads <N> "$@"`. It adds no flag when `NEXTEST_TEST_THREADS` is set, when an argument before `--` is `--test-threads`, `--test-threads=*`, `-j` or `-j*`, or when the core count is unreadable. Arguments after `--` belong to the test binaries and never suppress the width. The exit status passes through unchanged.
+- `run_nextest` runs `require_nextest`, waits out any build hold (`build_hold_wait_local`), then picks the width and runs `cargo nextest run --test-threads <N> "$@"`. It adds no flag when `NEXTEST_TEST_THREADS` is set, when an argument before `--` is `--test-threads`, `--test-threads=*`, `--jobs`, `--jobs=*`, `-j` or `-j*`, or when the core count is unreadable. Arguments after `--` belong to the test binaries and never suppress the width. The exit status passes through unchanged.
 
 ### Shared width (`scripts/lint/nextest_budget.py`)
 
-In `physical` and `logical` mode, local runs share the mode's width. `run_nextest_shared WIDTH ARGS...` runs `run cargo nextest run --test-threads WIDTH ARGS...` with `LINT_NEXTEST_SHARE=<dir>/<name>`, the directory `${BUILDLOG_DIR:-~/.local/state/buildlog}/admission/nextest/`. Once the memory gate admits the step, `run_once` calls `nextest_share_claim`, which opens fd 9 on `<name>.new` and runs `nextest_budget.py claim DIR NAME WIDTH 9`. Under the directory's `lock`, the claim flocks fd 9, renames the marker to `<name>.run`, counts the `.run` markers still locked (itself included), unlinks the unlocked ones, and prints `shared_width(full, runs) = min(full, max(FLOOR, full // runs))`, `FLOOR` 4. A narrower share replaces the width in the step's argv, prints `nextest: <shared> of <full> test threads, shared with the runs in flight`, and is written into the step's memory reservation (`memory_admit.py width`). The test process runs with fd 9 closed, `nextest_share_end` closes fd 9 as soon as it exits, before the build log write and the sweep start, and the marker is removed after `run` returns.
+In `physical` and `logical` mode, local runs share the mode's width. `run_nextest_shared WIDTH ARGS...` runs `run cargo nextest run --test-threads WIDTH ARGS...` with `LINT_NEXTEST_SHARE=<dir>/<name>`, the directory `${BUILDLOG_DIR:-~/.local/state/buildlog}/admission/nextest/`. Once the memory gate admits the step, `run_once` calls `nextest_share_claim`, which opens fd 9 on `<name>.new` and runs `nextest_budget.py claim DIR NAME WIDTH 9`. Under the directory's `lock`, the claim flocks fd 9, renames the marker to `<name>.run`, counts the `.run` markers still locked (itself included), unlinks the unlocked ones, and prints `shared_width(full, runs) = min(full, max(FLOOR, full // runs))`, `FLOOR` 4. Every test run prints `nextest: <granted> of <requested> test threads; load <one-minute load> on <cpu count> CPUs (<host>)`.
+A narrower share appends `; shared with the runs in flight`.
+The line reads the load once after admission, on the machine that runs the tests.
+A full-width grant, caller-supplied width and trial width all print this line.
+A failed claim or unavailable marker folder prints the requested width as the granted width.
+The Python formatter prints `load unknown` if it cannot read the load.
+A full-width grant does not prove that later runs or other processes leave the machine idle.
+A missing line means that the load is unknown.
+A narrower share replaces the width in the step's argv and updates the memory reservation (`memory_admit.py width`).
+The test process runs with fd 9 closed.
+`nextest_share_end` closes fd 9 when it exits, before the build log write and the sweep start.
+The marker is removed after `run` returns.
 
 - The claim comes after admission (2026-10-20, nightly 2026-10-16): when it came before, a run waiting for memory counted as in flight, so on 10-14 to 10-16 154 of 230 whole-hana runs ran at width 4, with a mean memory wait of 537 s against 50-113 s at widths 16 and 32. A run that leaves the memory wait for the Mac claims nothing.
 

@@ -39,6 +39,7 @@ PHASE_GRANT = json.dumps({
     "test_phase_charge_use": {"kind": "NoTestPhaseChargeUse"},
 })
 
+from scripts.lib import cargo_target_config
 from scripts.lib.cargo_output import CargoOutputRoots
 from scripts.lib.cargo_output_test_support import fake_cargo_output_roots
 
@@ -410,6 +411,43 @@ class RecorderCompatibilityTests(unittest.TestCase):
         ):
             step_context.step_context(NEXTEST, "")
         self.assertEqual(output.getvalue(), "tree\n/fixture/target\n")
+
+
+class CargoFolderPrecedenceTests(unittest.TestCase):
+    def test_each_folder_source_overrides_the_lower_sources(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary).resolve()
+            workspace = base / "workspace"
+            workspace.mkdir()
+            config = workspace / ".cargo/config.toml"
+            config.parent.mkdir()
+            _ = config.write_text('[build]\ntarget-dir="file-target"\nbuild-dir="file-build"\n')
+            cargo_home = base / "cargo-home"
+            cargo_home.mkdir()
+            environment = {"CARGO_HOME": str(cargo_home)}
+            _ = (cargo_home / "config.toml").write_text(
+                '[build]\ntarget-dir="home-target"\nbuild-dir="home-build"\n')
+            build_environment = {**environment, "CARGO_BUILD_TARGET_DIR": "env-target",
+                                 "CARGO_BUILD_BUILD_DIR": "env-build"}
+            separate = ["--config", 'build.target-dir="cli-target"', "--config", 'build.build-dir="cli-build"']
+            joined = ['--config=build.target-dir="cli-target"', '--config=build.build-dir="cli-build"']
+            cases: tuple[tuple[str, list[str], dict[str, str], str, str], ...] = (
+                ("file", [], environment, "file-target", "file-build"),
+                ("build environment", [], build_environment, "env-target", "env-build"),
+                ("separate config", separate, build_environment, "cli-target", "cli-build"),
+                ("joined config", joined, build_environment, "cli-target", "cli-build"),
+                ("target environment", separate, {**build_environment, "CARGO_TARGET_DIR": "target-env"},
+                 "target-env", "cli-build"),
+            )
+            for name, options, variables, target, build in cases:
+                for policy in cargo_target_config.CargoConfigPolicy:
+                    with self.subTest(source=name, policy=policy):
+                        settings = cargo_target_config.cargo_folder_settings(
+                            ["cargo", "check", *options], str(workspace), variables, policy=policy)
+                        self.assertEqual(settings["target-dir"], cargo_target_config.CargoFolderSetting(target, workspace))
+                        self.assertEqual(settings["build-dir"], cargo_target_config.CargoFolderSetting(build, workspace))
+            chosen = step_context.resolve_target_folder(["cargo", "check"], str(workspace), build_environment)
+            self.assertEqual(step_context.target_folder_text(chosen), str(workspace / "env-target"))
 
 
 class StepOutputFolderFixture(unittest.TestCase):

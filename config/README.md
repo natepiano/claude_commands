@@ -154,7 +154,7 @@ The `folder_*` keys control the folder audit. The `sweep_*` keys control the bui
 | `sweep_snapshot_max_age_seconds` | Maximum age of a current disk snapshot. |
 | `sweep_alert_interval_seconds` | Minimum interval between disk alerts. |
 | `sweep_push_text_limit` | Maximum length of a phone alert. |
-| `sweep_page_paths` | Maximum paths in a phone alert. |
+| `sweep_crossing_repeat_minutes` | Delivery key lifetime for a disk crossing, in minutes. |
 | `sweep_unexplained_fall_bytes` | Unexplained disk loss that triggers an alert. |
 | `sweep_large_removal_bytes` | Removed bytes that trigger an alert. |
 | `sweep_floor_search_depth` | Maximum folder depth for target discovery. |
