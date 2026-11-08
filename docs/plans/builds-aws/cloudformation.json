@@ -94,6 +94,68 @@
     "BudgetName": {
       "Type": "String",
       "Default": ""
+    },
+    "EnableGates": {
+      "Type": "String",
+      "AllowedValues": [
+        "false",
+        "true"
+      ],
+      "Default": "false"
+    },
+    "GateImage": {
+      "Type": "String",
+      "Default": ""
+    },
+    "GateSubnets": {
+      "Type": "CommaDelimitedList",
+      "Default": ""
+    },
+    "GateInstanceTypes": {
+      "Type": "CommaDelimitedList",
+      "Default": ""
+    },
+    "GateRootGiB": {
+      "Type": "Number",
+      "Default": 40
+    },
+    "GateSpotMaxPrice": {
+      "Type": "String",
+      "Default": ""
+    },
+    "GateArtifactDays": {
+      "Type": "Number",
+      "Default": 7
+    },
+    "GateExpiryMinutes": {
+      "Type": "Number",
+      "Default": 1
+    },
+    "GateExpiryTimeout": {
+      "Type": "Number",
+      "Default": 30
+    },
+    "GateExpiryMemory": {
+      "Type": "Number",
+      "Default": 128
+    },
+    "GateLogDays": {
+      "Type": "Number",
+      "Default": 7,
+      "AllowedValues": [
+        1,
+        3,
+        5,
+        7,
+        14,
+        30,
+        60,
+        90,
+        120,
+        150,
+        180,
+        365
+      ]
     }
   },
   "Conditions": {
@@ -141,6 +203,22 @@
             ""
           ]
         }
+      ]
+    },
+    "Gates": {
+      "Fn::Equals": [
+        {
+          "Ref": "EnableGates"
+        },
+        "true"
+      ]
+    },
+    "GateEveryMinute": {
+      "Fn::Equals": [
+        {
+          "Ref": "GateExpiryMinutes"
+        },
+        1
       ]
     }
   },
@@ -888,6 +966,720 @@
           ]
         }
       }
+    },
+    "GateBucket": {
+      "Type": "AWS::S3::Bucket",
+      "Condition": "Gates",
+      "Properties": {
+        "PublicAccessBlockConfiguration": {
+          "BlockPublicAcls": true,
+          "IgnorePublicAcls": true,
+          "BlockPublicPolicy": true,
+          "RestrictPublicBuckets": true
+        },
+        "BucketEncryption": {
+          "ServerSideEncryptionConfiguration": [
+            {
+              "ServerSideEncryptionByDefault": {
+                "SSEAlgorithm": "AES256"
+              }
+            }
+          ]
+        },
+        "LifecycleConfiguration": {
+          "Rules": [
+            {
+              "Id": "GateArtifacts",
+              "Status": "Enabled",
+              "ExpirationInDays": {
+                "Ref": "GateArtifactDays"
+              },
+              "AbortIncompleteMultipartUpload": {
+                "DaysAfterInitiation": 1
+              }
+            }
+          ]
+        },
+        "Tags": [
+          {
+            "Key": {
+              "Ref": "CostTagKey"
+            },
+            "Value": {
+              "Ref": "CostTagValue"
+            }
+          },
+          {
+            "Key": "GateDeployment",
+            "Value": {
+              "Ref": "DeploymentId"
+            }
+          },
+          {
+            "Key": "Workload",
+            "Value": "cloud-claude-gate"
+          },
+          {
+            "Key": "Name",
+            "Value": "cloud-claude-gate"
+          }
+        ],
+        "BucketName": {
+          "Fn::Sub": "cloud-claude-gate-${DeploymentId}"
+        }
+      }
+    },
+    "GateBucketPolicy": {
+      "Type": "AWS::S3::BucketPolicy",
+      "Condition": "Gates",
+      "Properties": {
+        "Bucket": {
+          "Ref": "GateBucket"
+        },
+        "PolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Effect": "Deny",
+              "Principal": "*",
+              "Action": "s3:*",
+              "Resource": [
+                {
+                  "Fn::GetAtt": [
+                    "GateBucket",
+                    "Arn"
+                  ]
+                },
+                {
+                  "Fn::Sub": "${GateBucket.Arn}/*"
+                }
+              ],
+              "Condition": {
+                "Bool": {
+                  "aws:SecureTransport": "false"
+                }
+              }
+            }
+          ]
+        }
+      }
+    },
+    "GateRole": {
+      "Type": "AWS::IAM::Role",
+      "Condition": "Gates",
+      "Properties": {
+        "AssumeRolePolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Effect": "Allow",
+              "Principal": {
+                "Service": "ec2.amazonaws.com"
+              },
+              "Action": "sts:AssumeRole"
+            }
+          ]
+        },
+        "Tags": [
+          {
+            "Key": {
+              "Ref": "CostTagKey"
+            },
+            "Value": {
+              "Ref": "CostTagValue"
+            }
+          },
+          {
+            "Key": "GateDeployment",
+            "Value": {
+              "Ref": "DeploymentId"
+            }
+          },
+          {
+            "Key": "Workload",
+            "Value": "cloud-claude-gate"
+          },
+          {
+            "Key": "Name",
+            "Value": "cloud-claude-gate"
+          }
+        ],
+        "Policies": [
+          {
+            "PolicyName": "GateObjects",
+            "PolicyDocument": {
+              "Version": "2012-10-17",
+              "Statement": [
+                {
+                  "Effect": "Allow",
+                  "Action": [
+                    "s3:GetObject"
+                  ],
+                  "Resource": [
+                    {
+                      "Fn::Sub": "${GateBucket.Arn}/source/*"
+                    },
+                    {
+                      "Fn::Sub": "${GateBucket.Arn}/requests/*"
+                    }
+                  ]
+                },
+                {
+                  "Effect": "Allow",
+                  "Action": [
+                    "s3:PutObject"
+                  ],
+                  "Resource": {
+                    "Fn::Sub": "${GateBucket.Arn}/artifacts/${!aws:userid}/*"
+                  }
+                }
+              ]
+            }
+          }
+        ],
+        "RoleName": {
+          "Fn::Sub": "cloud-claude-gate-${DeploymentId}"
+        }
+      }
+    },
+    "GateProfile": {
+      "Type": "AWS::IAM::InstanceProfile",
+      "Condition": "Gates",
+      "Properties": {
+        "Roles": [
+          {
+            "Ref": "GateRole"
+          }
+        ],
+        "InstanceProfileName": {
+          "Fn::Sub": "cloud-claude-gate-${DeploymentId}"
+        }
+      }
+    },
+    "GateSecurityGroup": {
+      "Type": "AWS::EC2::SecurityGroup",
+      "Condition": "Gates",
+      "Properties": {
+        "GroupDescription": "Outbound gate object and package transfers",
+        "VpcId": {
+          "Ref": "VpcId"
+        },
+        "SecurityGroupEgress": [
+          {
+            "IpProtocol": "-1",
+            "CidrIp": "0.0.0.0/0"
+          }
+        ],
+        "Tags": [
+          {
+            "Key": {
+              "Ref": "CostTagKey"
+            },
+            "Value": {
+              "Ref": "CostTagValue"
+            }
+          },
+          {
+            "Key": "GateDeployment",
+            "Value": {
+              "Ref": "DeploymentId"
+            }
+          },
+          {
+            "Key": "Workload",
+            "Value": "cloud-claude-gate"
+          },
+          {
+            "Key": "Name",
+            "Value": "cloud-claude-gate"
+          }
+        ],
+        "GroupName": {
+          "Fn::Sub": "cloud-claude-gate-${DeploymentId}"
+        }
+      }
+    },
+    "GateLaunchTemplate": {
+      "Type": "AWS::EC2::LaunchTemplate",
+      "Condition": "Gates",
+      "Properties": {
+        "LaunchTemplateData": {
+          "ImageId": {
+            "Ref": "GateImage"
+          },
+          "IamInstanceProfile": {
+            "Arn": {
+              "Fn::GetAtt": [
+                "GateProfile",
+                "Arn"
+              ]
+            }
+          },
+          "InstanceMarketOptions": {
+            "MarketType": "spot",
+            "SpotOptions": {
+              "SpotInstanceType": "one-time",
+              "InstanceInterruptionBehavior": "terminate",
+              "MaxPrice": {
+                "Ref": "GateSpotMaxPrice"
+              }
+            }
+          },
+          "InstanceInitiatedShutdownBehavior": "terminate",
+          "MetadataOptions": {
+            "HttpTokens": "required",
+            "HttpEndpoint": "enabled"
+          },
+          "BlockDeviceMappings": [
+            {
+              "DeviceName": {
+                "Ref": "RootDeviceName"
+              },
+              "Ebs": {
+                "VolumeSize": {
+                  "Ref": "GateRootGiB"
+                },
+                "VolumeType": "gp3",
+                "Encrypted": true,
+                "DeleteOnTermination": true
+              }
+            }
+          ]
+        },
+        "TagSpecifications": [
+          {
+            "ResourceType": "launch-template",
+            "Tags": [
+              {
+                "Key": {
+                  "Ref": "CostTagKey"
+                },
+                "Value": {
+                  "Ref": "CostTagValue"
+                }
+              },
+              {
+                "Key": "GateDeployment",
+                "Value": {
+                  "Ref": "DeploymentId"
+                }
+              },
+              {
+                "Key": "Workload",
+                "Value": "cloud-claude-gate"
+              },
+              {
+                "Key": "Name",
+                "Value": "cloud-claude-gate"
+              }
+            ]
+          }
+        ],
+        "LaunchTemplateName": {
+          "Fn::Sub": "cloud-claude-gate-${DeploymentId}"
+        }
+      }
+    },
+    "GateScalerPolicy": {
+      "Type": "AWS::IAM::Policy",
+      "Condition": "Gates",
+      "Properties": {
+        "Users": [
+          {
+            "Ref": "ScalerUser"
+          }
+        ],
+        "PolicyName": "CloudGateScaler",
+        "PolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Effect": "Allow",
+              "Action": [
+                "ec2:RunInstances"
+              ],
+              "Resource": [
+                {
+                  "Fn::Sub": "arn:${AWS::Partition}:ec2:${AWS::Region}::image/${GateImage}"
+                },
+                {
+                  "Fn::Sub": "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:security-group/${GateSecurityGroup}"
+                },
+                {
+                  "Fn::Sub": "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:launch-template/${GateLaunchTemplate}"
+                }
+              ]
+            },
+            {
+              "Effect": "Allow",
+              "Action": [
+                "ec2:RunInstances"
+              ],
+              "Resource": {
+                "Ref": "GateSubnets"
+              }
+            },
+            {
+              "Effect": "Allow",
+              "Action": [
+                "ec2:RunInstances"
+              ],
+              "Resource": {
+                "Fn::Sub": "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/*"
+              },
+              "Condition": {
+                "StringEquals": {
+                  "aws:RequestTag/GateDeployment": {
+                    "Ref": "DeploymentId"
+                  },
+                  "aws:RequestTag/Workload": "cloud-claude-gate",
+                  "ec2:InstanceType": {
+                    "Ref": "GateInstanceTypes"
+                  },
+                  "ec2:InstanceMarketType": "spot"
+                },
+                "Null": {
+                  "aws:RequestTag/GateAttempt": "false",
+                  "aws:RequestTag/ExpiresAt": "false"
+                },
+                "ArnEquals": {
+                  "ec2:LaunchTemplate": {
+                    "Fn::Sub": "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:launch-template/${GateLaunchTemplate}"
+                  },
+                  "ec2:InstanceProfile": {
+                    "Fn::GetAtt": [
+                      "GateProfile",
+                      "Arn"
+                    ]
+                  }
+                }
+              }
+            },
+            {
+              "Effect": "Allow",
+              "Action": [
+                "ec2:RunInstances"
+              ],
+              "Resource": {
+                "Fn::Sub": "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:volume/*"
+              },
+              "Condition": {
+                "StringEquals": {
+                  "aws:RequestTag/GateDeployment": {
+                    "Ref": "DeploymentId"
+                  },
+                  "aws:RequestTag/Workload": "cloud-claude-gate"
+                },
+                "Null": {
+                  "aws:RequestTag/GateAttempt": "false",
+                  "aws:RequestTag/ExpiresAt": "false"
+                }
+              }
+            },
+            {
+              "Effect": "Allow",
+              "Action": [
+                "ec2:RunInstances"
+              ],
+              "Resource": {
+                "Fn::Sub": "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:network-interface/*"
+              },
+              "Condition": {
+                "ArnEquals": {
+                  "ec2:LaunchTemplate": {
+                    "Fn::Sub": "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:launch-template/${GateLaunchTemplate}"
+                  },
+                  "ec2:Subnet": {
+                    "Ref": "GateSubnets"
+                  }
+                }
+              }
+            },
+            {
+              "Effect": "Allow",
+              "Action": [
+                "ec2:CreateTags"
+              ],
+              "Resource": [
+                {
+                  "Fn::Sub": "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/*"
+                },
+                {
+                  "Fn::Sub": "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:volume/*"
+                }
+              ],
+              "Condition": {
+                "StringEquals": {
+                  "ec2:CreateAction": "RunInstances",
+                  "aws:RequestTag/GateDeployment": {
+                    "Ref": "DeploymentId"
+                  },
+                  "aws:RequestTag/Workload": "cloud-claude-gate"
+                }
+              }
+            },
+            {
+              "Effect": "Allow",
+              "Action": [
+                "iam:PassRole"
+              ],
+              "Resource": {
+                "Fn::GetAtt": [
+                  "GateRole",
+                  "Arn"
+                ]
+              },
+              "Condition": {
+                "StringEquals": {
+                  "iam:PassedToService": "ec2.amazonaws.com"
+                }
+              }
+            },
+            {
+              "Effect": "Allow",
+              "Action": [
+                "ec2:TerminateInstances"
+              ],
+              "Resource": {
+                "Fn::Sub": "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/*"
+              },
+              "Condition": {
+                "StringEquals": {
+                  "ec2:ResourceTag/GateDeployment": {
+                    "Ref": "DeploymentId"
+                  },
+                  "ec2:ResourceTag/Workload": "cloud-claude-gate"
+                }
+              }
+            },
+            {
+              "Effect": "Allow",
+              "Action": [
+                "ec2:DescribeInstances"
+              ],
+              "Resource": "*"
+            },
+            {
+              "Effect": "Allow",
+              "Action": [
+                "ce:GetCostAndUsage"
+              ],
+              "Resource": "*"
+            },
+            {
+              "Effect": "Allow",
+              "Action": [
+                "s3:PutObject"
+              ],
+              "Resource": [
+                {
+                  "Fn::Sub": "${GateBucket.Arn}/source/*"
+                },
+                {
+                  "Fn::Sub": "${GateBucket.Arn}/requests/*"
+                }
+              ]
+            },
+            {
+              "Effect": "Allow",
+              "Action": [
+                "s3:GetObject"
+              ],
+              "Resource": {
+                "Fn::Sub": "${GateBucket.Arn}/artifacts/*"
+              }
+            }
+          ]
+        }
+      }
+    },
+    "GateExpiryRole": {
+      "Type": "AWS::IAM::Role",
+      "Condition": "Gates",
+      "Properties": {
+        "AssumeRolePolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Effect": "Allow",
+              "Principal": {
+                "Service": "lambda.amazonaws.com"
+              },
+              "Action": "sts:AssumeRole"
+            }
+          ]
+        },
+        "Policies": [
+          {
+            "PolicyName": "GateExpiry",
+            "PolicyDocument": {
+              "Version": "2012-10-17",
+              "Statement": [
+                {
+                  "Effect": "Allow",
+                  "Action": [
+                    "ec2:DescribeInstances"
+                  ],
+                  "Resource": "*"
+                },
+                {
+                  "Effect": "Allow",
+                  "Action": [
+                    "ec2:TerminateInstances"
+                  ],
+                  "Resource": {
+                    "Fn::Sub": "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/*"
+                  },
+                  "Condition": {
+                    "StringEquals": {
+                      "ec2:ResourceTag/GateDeployment": {
+                        "Ref": "DeploymentId"
+                      },
+                      "ec2:ResourceTag/Workload": "cloud-claude-gate"
+                    }
+                  }
+                },
+                {
+                  "Effect": "Allow",
+                  "Action": [
+                    "logs:CreateLogStream",
+                    "logs:PutLogEvents"
+                  ],
+                  "Resource": {
+                    "Fn::Sub": "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/cloud-claude-gate-${DeploymentId}-expiry:*"
+                  }
+                }
+              ]
+            }
+          }
+        ],
+        "RoleName": {
+          "Fn::Sub": "cloud-claude-gate-${DeploymentId}-expiry"
+        },
+        "Tags": [
+          {
+            "Key": "Workload",
+            "Value": "cloud-claude-gate"
+          },
+          {
+            "Key": "Name",
+            "Value": "cloud-claude-gate"
+          }
+        ]
+      }
+    },
+    "GateExpiryFunction": {
+      "Type": "AWS::Lambda::Function",
+      "Condition": "Gates",
+      "Properties": {
+        "FunctionName": {
+          "Fn::Sub": "cloud-claude-gate-${DeploymentId}-expiry"
+        },
+        "Runtime": "python3.13",
+        "Handler": "index.handler",
+        "Role": {
+          "Fn::GetAtt": [
+            "GateExpiryRole",
+            "Arn"
+          ]
+        },
+        "Timeout": {
+          "Ref": "GateExpiryTimeout"
+        },
+        "MemorySize": {
+          "Ref": "GateExpiryMemory"
+        },
+        "Environment": {
+          "Variables": {
+            "DEPLOYMENT": {
+              "Ref": "DeploymentId"
+            }
+          }
+        },
+        "Code": {
+          "ZipFile": "import os, time, boto3\n\ndef handler(event, context):\n    ec2 = boto3.client('ec2')\n    filters = [{'Name': 'tag:GateDeployment', 'Values': [os.environ['DEPLOYMENT']]},\n               {'Name': 'tag:Workload', 'Values': ['cloud-claude-gate']},\n               {'Name': 'instance-state-name', 'Values': ['pending', 'running', 'stopping', 'stopped']}]\n    for page in ec2.get_paginator('describe_instances').paginate(Filters=filters):\n        for group in page['Reservations']:\n            for instance in group['Instances']:\n                tags = {tag['Key']: tag['Value'] for tag in instance.get('Tags', [])}\n                try:\n                    expired = int(tags['ExpiresAt']) <= time.time()\n                except (KeyError, ValueError):\n                    expired = False\n                if expired:\n                    ec2.terminate_instances(InstanceIds=[instance['InstanceId']])\n"
+        },
+        "Tags": [
+          {
+            "Key": "Workload",
+            "Value": "cloud-claude-gate"
+          },
+          {
+            "Key": "Name",
+            "Value": "cloud-claude-gate"
+          }
+        ]
+      },
+      "DependsOn": "GateExpiryLog"
+    },
+    "GateExpiryLog": {
+      "Type": "AWS::Logs::LogGroup",
+      "Condition": "Gates",
+      "Properties": {
+        "LogGroupName": {
+          "Fn::Sub": "/aws/lambda/cloud-claude-gate-${DeploymentId}-expiry"
+        },
+        "RetentionInDays": {
+          "Ref": "GateLogDays"
+        },
+        "Tags": [
+          {
+            "Key": "Workload",
+            "Value": "cloud-claude-gate"
+          },
+          {
+            "Key": "Name",
+            "Value": "cloud-claude-gate"
+          }
+        ]
+      }
+    },
+    "GateExpirySchedule": {
+      "Type": "AWS::Events::Rule",
+      "Condition": "Gates",
+      "Properties": {
+        "ScheduleExpression": {
+          "Fn::If": [
+            "GateEveryMinute",
+            "rate(1 minute)",
+            {
+              "Fn::Sub": "rate(${GateExpiryMinutes} minutes)"
+            }
+          ]
+        },
+        "State": "ENABLED",
+        "Targets": [
+          {
+            "Arn": {
+              "Fn::GetAtt": [
+                "GateExpiryFunction",
+                "Arn"
+              ]
+            },
+            "Id": "GateExpiry"
+          }
+        ],
+        "Name": {
+          "Fn::Sub": "cloud-claude-gate-${DeploymentId}-expiry"
+        }
+      }
+    },
+    "GateExpiryPermission": {
+      "Type": "AWS::Lambda::Permission",
+      "Condition": "Gates",
+      "Properties": {
+        "Action": "lambda:InvokeFunction",
+        "FunctionName": {
+          "Ref": "GateExpiryFunction"
+        },
+        "Principal": "events.amazonaws.com",
+        "SourceArn": {
+          "Fn::GetAtt": [
+            "GateExpirySchedule",
+            "Arn"
+          ]
+        }
+      }
     }
   },
   "Outputs": {
@@ -929,6 +1721,42 @@
     "ScalerUserName": {
       "Value": {
         "Ref": "ScalerUser"
+      }
+    },
+    "GateBucket": {
+      "Condition": "Gates",
+      "Value": {
+        "Ref": "GateBucket"
+      }
+    },
+    "GateLaunchTemplate": {
+      "Condition": "Gates",
+      "Value": {
+        "Ref": "GateLaunchTemplate"
+      }
+    },
+    "GateLaunchVersion": {
+      "Condition": "Gates",
+      "Value": {
+        "Fn::GetAtt": [
+          "GateLaunchTemplate",
+          "LatestVersionNumber"
+        ]
+      }
+    },
+    "GateSecurityGroup": {
+      "Condition": "Gates",
+      "Value": {
+        "Ref": "GateSecurityGroup"
+      }
+    },
+    "GateRoleId": {
+      "Condition": "Gates",
+      "Value": {
+        "Fn::GetAtt": [
+          "GateRole",
+          "RoleId"
+        ]
       }
     }
   }

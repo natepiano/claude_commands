@@ -25,7 +25,7 @@ from unittest import mock
 from urllib.request import Request
 
 
-from scripts.aws_target import admin_secrets, aws_target, box, config as aws_config, deploy, ledger, measurement, remote
+from scripts.aws_target import admin_secrets, aws_target, box, config as aws_config, deploy, gate_trial, ledger, measurement, remote
 from scripts.aws_target.config import read_control_settings
 from scripts.aws_target.ledger_test_support import CostFixture
 from scripts.aws_target.measurement_test_support import DAY, narrow
@@ -618,6 +618,71 @@ sys.exit(7)
         self.set_clock(self.now + 1)
         _ = subject.prepare()
         return subject
+
+    def gate_fixture(self, change: str = 'GateBucket') -> tuple[deploy.Deployment, list[list[str]]]:
+        subject = self.update_fixture()
+        self.set_clock(self.now + 1)
+        _ = (self.root / 'cloud_gate.conf').write_bytes(
+            (deploy.TEMPLATE.parents[3] / 'config/cloud_gate.conf').read_bytes())
+        commands: list[list[str]] = []
+        outputs = {'GateBucket': 'fixture-bucket', 'GateLaunchTemplate': 'fixture-template',
+                   'GateLaunchVersion': '1', 'GateSecurityGroup': 'fixture-group', 'GateRoleId': 'fixture-role'}
+
+        def execute(arguments: Sequence[str], **_options: object) -> subprocess.CompletedProcess[str]:
+            args = list(arguments)
+            commands.append(args)
+            operation = args[args.index('--region') + 3]
+            reply: dict[str, object] = {}
+            if operation == 'describe-stacks':
+                reply = {'Stacks': [{'Parameters': [{'ParameterKey': key} for key in
+                    ('EnableCompute', 'InstanceType', 'ExistingDataVolumeId', 'NotificationEmail')]}]}
+            elif operation == 'describe-route-tables':
+                reply = {'RouteTables': [{'Associations': [{'Main': True}], 'Routes': [
+                    {'DestinationCidrBlock': '0.0.0.0/0', 'State': 'active', 'GatewayId': 'igw-fixture'}]}]}
+            elif operation == 'describe-subnets':
+                reply = {'Subnets': [{'SubnetId': 'fixture-' + zone, 'AvailabilityZone': zone, 'State': 'available'}
+                                    for zone in ('a', 'b')]}
+            elif operation == 'get-caller-identity':
+                reply = {'Account': 'fixture-account'}
+            elif operation == 'describe-change-set':
+                reply = {'Status': 'CREATE_COMPLETE', 'Changes': [{'ResourceChange': {'LogicalResourceId': change}}]}
+            elif operation not in ('create-change-set', 'execute-change-set', 'delete-change-set', 'wait'):
+                raise AssertionError(operation)
+            return subprocess.CompletedProcess(args, 0, json.dumps(reply), '')
+
+        _ = self.enterContext(mock.patch.object(subject, '_api', return_value=aws_target.AwsCli(
+            'build-admin', 'us-east-1', 1, execute=execute)))
+        _ = self.enterContext(mock.patch.object(subject, '_stack', return_value=outputs))
+        _ = self.enterContext(mock.patch.object(gate_trial, 'host_nixpkgs_revision', return_value='fixture-revision'))
+        return subject, commands
+
+    def test_gate_deployment_preserves_rust_parameters_and_records_scoped_resources(self) -> None:
+        subject, commands = self.gate_fixture()
+        before = ledger.CostLedger(self.state).read_snapshot().inventories[-1].resources
+        self.assertTrue(subject.gate_up(approve_resources=True))
+        arguments = next(args for args in commands if 'create-change-set' in args)
+        parameters = ledger.rows({'rows': cast(object, json.loads(arguments[arguments.index('--parameters') + 1]))}, 'rows')
+        by_name = {ledger.text(row, 'ParameterKey'): row for row in parameters}
+        for key in ('EnableCompute', 'InstanceType', 'ExistingDataVolumeId', 'NotificationEmail'):
+            self.assertEqual(by_name[key], {'ParameterKey': key, 'UsePreviousValue': True})
+        self.assertEqual(by_name['GateInstanceTypes']['ParameterValue'], 'm7a.8xlarge,m7a.4xlarge')
+        self.assertEqual(by_name['GateRootGiB']['ParameterValue'], '40')
+        self.assertEqual(by_name['GateSpotMaxPrice']['ParameterValue'], '0.8')
+        saved = remote.read_record(self.state / 'gate-deployment.json')
+        self.assertEqual(saved['artifact_prefix'], 'artifacts/fixture-role:')
+        self.assertEqual(saved['revision'], 'fixture-revision')
+        self.assertEqual([row['zone'] for row in ledger.rows(saved, 'subnets')], ['a', 'b'])
+        after = ledger.CostLedger(self.state).read_snapshot().inventories[-1].resources
+        self.assertEqual(after, before + (ledger.PricedResource('gate-shared', Decimal(1)),))
+        self.assertTrue(any('execute-change-set' in args for args in commands))
+
+    def test_gate_deployment_rejects_a_change_to_a_rust_resource(self) -> None:
+        subject, commands = self.gate_fixture('Instance')
+        with self.assertRaisesRegex(deploy.DeploymentRefused, 'Rust resource'):
+            _ = subject.gate_up(approve_resources=True)
+        self.assertFalse(any('execute-change-set' in args for args in commands))
+        self.assertTrue(any('delete-change-set' in args for args in commands))
+        self.assertFalse((self.state / 'gate-deployment.json').exists())
 
     def test_live_update_without_fingerprint_preserves_first_boot_and_saves_fingerprint(self) -> None:
         subject = self.update_fixture()
