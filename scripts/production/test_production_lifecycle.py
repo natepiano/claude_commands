@@ -608,11 +608,11 @@ class LifecycleTests(LifecycleFixture):
         self.assertEqual(self.git("rev-parse", "main", cwd=self.origin), tip)
 
     def test_showrunner_instructions_explain_stop_resume_and_account_move(self) -> None:
-        commands = Path(__file__).parents[2] / "commands/showrunner"
-        for name in ("produce.md", "move.md"):
+        commands = Path(__file__).parents[2] / "commands"
+        for name in ("showrunner/produce.md", "agents.md"):
             with self.subTest(command=name):
                 text = (commands / name).read_text(encoding="utf-8")
-                for command in ("agents stop", "agents resume", "accounts.py move"):
+                for command in ("agents stop", "agents resume", "agents move"):
                     self.assertIn(command, text)
                 self.assertIn("--why", text)
                 self.assertNotIn("<PauseForMove>", text)

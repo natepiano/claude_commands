@@ -49,7 +49,13 @@ Lint during a hold keeps local `cargo fmt` and `taplo fmt`. It then runs `mend-c
 - **Claim files and scopes.** `claims/<repo>.json` holds one repository's claim; `run.json` holds a claim whose worktree is in no repository. `claim_scope(worktree)` names the repository through `offload.repository_identity` (`sweep.repo_name`, the folder holding the shared repository directory), else `WHOLE_MAC`: `ClaimScope = RepositoryScope(name) | WholeMacScope`, and `claim_path(paths, scope)` maps it to its file. `scopes_overlap` is true when either side is the whole Mac or both name the same repository. `read_claims(paths) -> tuple[HeldClaim(scope, path, record), ...]` reads every file, oldest `since` first; a `claims/<repo>.json` scope comes from its file name, a `run.json` scope from its worktree, so a machine-wide `run.json` from an older install covers the repository its worktree is in, or every repository when that worktree is in none. A file it cannot read raises `ClaimStateUnreadable(path)`, a `StateReadError`. `live_claims` removes each claim whose owner ended and returns the rest.
 - Each claim file is `{pid, proc_start, what, worktree, since}` for `ProcessBoundClaim`, with `remote_host` added for `RemoteJobClaim`, and two optional keys on either: `holder_session` and `idle_since`. `read_run` accepts a record without them. `RunRecord` is their union. A process-bound claim is live only while `/proc/<pid>/stat` field 22 equals `proc_start`; a remote claim stays after that process dies because work may remain on its host. `run_is_kept` identifies those leftovers.
 - `claim --pid PID --what TEXT [--worktree PATH] [--wait SECONDS] [--remote HOST]` claims for the scope of `--worktree` (default the current directory) and exits 0 `claimed`, 10 `blocked by <holder>: <for>`, 11 `busy: <what> since <HH:MM>` for the oldest live claim whose scope overlaps (or `busy: leftovers of ...` for a kept claim), 12 `state unreadable: <path>` (`block.json`, `run.json`, `claims/<repo>.json` or the `claims` folder), and 1 for a pid that is not running. `claim_once` decides one attempt under `state.lock`: takeover, then block, then overlap, then a new file. A remote takeover applies only to a kept claim of the same scope; it replaces that claim's controller pid, keeps its job and host, prints `leftovers: <host>` and exits 13; the runner must check those leftovers before releasing it. `release --pid PID` removes every claim file whose `pid` matches, reading each file alone, so a damaged file of another repository cannot keep this owner's claim. `status` shows a kept claim as `running: leftovers of <what> on <host> since <time>, kept under pid <pid>`; after confirming the remote job ended, that pid permits a hand release. `release --pid` for a claim that is already gone exits 0. `status` prints one `running:` line per live claim, oldest first, and `free` when there is none. `claim` records `holder_session`: `build_hold.owning_session()` (the unit director first, then `CLAUDE_CODE_SESSION_ID`), else nothing; a takeover keeps the stored value. Both `status` lines end `, idle since <HH:MM>` while `idle_since` is set.
-- `free-now --settings FILE [--repo-root DIR]` answers, from local records alone (no lock, no ssh, no `gh`), whether a claim for `DIR`'s repository (default the current directory) could start now: `off`, `backoff`, `blocked`, `state`, `busy` (a live claim overlaps that scope) or `free`, exit 0 only for `free`. Another repository's claim leaves it `free`. The holder's own block lets it read on to `busy` or `free`. `verify.sh` passes its top level as `--repo-root`.
+- `free-now --settings FILE [--repo-root DIR]` reads local records without a lock or remote command.
+  It answers `off`, `backoff`, `blocked`, `state`, `busy`, `bad` or `free`, in that order.
+  It exits 0 only for `free`.
+  A live claim blocks only its repository.
+  A failed target probe blocks every repository.
+  A version decline blocks only its repository.
+  `verify.sh` passes its repository root with `--repo-root`.
 - `block --holder NAME --for TEXT [--hours N] [--showrunner NAME]` records the session from `build_hold.owning_session()`. A pending or active block admits that session's own claims; a block with no recorded session refuses every caller. A block lasts `block_hours`, at most `block_max_hours`; the holder is warned `block_warn_minutes` before it lifts by itself. A repeat block by the same holder keeps `since`. `unblock --holder NAME` lifts only the holder's own block.
 - **CI switch.** `block` turns the repository variable `ci_variable` (hana's `MACOS_CI`) off through `gh` and records a `ci` word: `off_by_this_block`, `off_before`, `not_configured`, `still_on`, `off_unconfirmed`. Unblock and expiry turn it back on only for `off_by_this_block` and `off_unconfirmed`, and list per branch the CI runs that skipped macOS meanwhile, with the `gh workflow run` line to rerun them. The report uses one paged REST list and one GraphQL request for the newest 200 runs; missing or partial job data produces a report error. A lift that cannot turn the switch back on keeps the block, messages the holder hourly and keeps trying. Expiry records that failure as `ExpiredBlockLiftFailed(gh_error_line)` on `SettleOutcome.expired_block_lift_failure` (otherwise `NO_EXPIRED_BLOCK_LIFT_FAILURE`), apart from `ci_problem`; while it lasts `status` prints `The block is past its time limit but could not lift: CI's Mac switch could not be turned back on (<gh line>). Run github-warmup, then unblock.`, and `block` names the same `gh` line. A new `ci` word goes into `CiSwitch`, `decoded_ci`, `ci_needs_restore` and `ci_may_still_be_on`.
 - **Pending until idle.** A block is pending while any claim is live (it waits on the oldest one's `what`), or while `ci_activity` reads busy: a queued or in-progress run of `ci_workflow` is busy until it lists a job named `ci_job` with status `completed`. A pending block says `a CI run may still use the Mac`; the stored `waiting_on` kind is `ci_job`.
@@ -397,3 +403,36 @@ Both routes use the staged copy and keep the existing target directory.
 The source index remains unchanged.
 A pass record still requires the original staged tree identity after the step.
 The token boundary, local repair rule, and step records remain in verify.sh.
+
+### Failed probes and recovery
+
+A failed reach writes `failed_probe` in the target state folder.
+The record has no expiry time.
+A successful `probe_mac` removes it.
+An unresolved startup or an interrupted target keeps the record unchanged.
+
+A tool version mismatch writes `version-decline-<repository>` in the same folder.
+This record stops only that repository.
+Only a matching run removes it, on Linux or macOS.
+A mismatch writes no target backoff.
+
+`free-now` answers `bad` when either record stops an otherwise free target.
+The answers `off`, `backoff`, `blocked`, `state` and `busy` keep their order.
+A waiting step cannot reserve a bad target.
+The first routing pass can use `reserve --new-step`.
+A pinned step starts no recovery probe and takes no reservation during eligibility.
+Its normal run probes the target and clears a successful target mark.
+
+Each step's first eligibility read can start one detached recovery probe per target.
+The probe takes the normal claim, copies tracked scripts, copies the repository tree, and probes the target.
+It releases the claim after the probe or a stop signal.
+It keeps repository version records unchanged.
+A busy claim skips recovery.
+A second step does not duplicate a running recovery probe.
+The step routes without waiting for recovery.
+Repeated reads from a waiting step start no recovery probe.
+
+Target status reports a failed probe as unreachable.
+The reach error shows only the last nonempty stderr line.
+A fixed target returns when the next new step probes it.
+Existing waits keep their place on natedev until then.

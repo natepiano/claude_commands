@@ -42,8 +42,8 @@ class VerifyMacReleaseTests(VerifyMacOffloadFixture):
 import os
 from pathlib import Path
 import sys
-sys.path.insert(0, {str(VERIFY.parent)!r})
-import local_release_wait
+with open({str(VERIFY.parent.parent / 'lib/package_root.py')!r}) as package_root: exec(package_root.read(), {{"__file__": package_root.name}})
+from scripts.direct import local_release_wait
 original_wait = local_release_wait.LocalReleaseEvents.wait
 def observe_wait(self, seconds):
     (Path(os.environ["TEST_RUNNER_STATE"]) / "routing-sleep").write_text("watching\\n")

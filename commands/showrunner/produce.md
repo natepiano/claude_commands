@@ -459,7 +459,7 @@ At the start and on every resume, run:
 This session's name is written nowhere: the update timer is addressed to its
 Claude session id, and every tool looks the name up from that when it needs it.
 The showrunner staff name must be this session's name (user, 2026-10-27). Register
-warns for a session with another name, names the `/showrunner:rename` to run,
+warns for a session with another name, names the `/agents rename` to run,
 and registers it: an account move restarts a showrunner on its own, so register
 must not fail. `attach` refuses that name for a new production.
 `add_showrunner.py` and `promote_showrunner.py` use the showrunner staff name for a new session.
@@ -1130,7 +1130,7 @@ land a phase sooner. Each design check covers every view of the change at once
 Stop a local session with `agents stop SESSION`.
 Resume it with `agents resume SESSION --why "reason"`.
 Worker stops retain their panes at the shell and keep their conversations for restore.
-Move sessions with `accounts.py move SESSION_OR_GROUP claudeN --why "reason"`.
+Move sessions with `agents move SESSION_OR_GROUP claudeN --why "reason"`.
 Worker account moves resume each conversation in its existing pane on the target account.
 Unknown evidence leaves that worker unchanged and prints its reason; other proved moves continue.
 See `commands/agents.md` and `docs/accounts.md`.

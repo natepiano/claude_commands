@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal, cast
 
 if TYPE_CHECKING:
-    from . import record
+    from scripts.buildlog import record
 
 MacRunOutcome = Literal["passed", "passed_filter", "passed_full", "failed"]
 OffloadDeclineReason = Literal[

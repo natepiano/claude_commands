@@ -424,7 +424,7 @@ print(observed.row.id)
             self.assertEqual(len(changes), 1)
             entry = pane_record.read("agents")["w4:p1"]
             self.assertEqual(entry["session_id"], owner.id)
-            self.assertEqual(entry["environment"], {"CLAUDE_CODE_SESSION_ID": owner.id})
+            self.assertEqual(entry["environment"], {})
             path = pane_record.record_path("agents")
             before = path.read_bytes(), path.stat().st_mtime_ns
             self.assertEqual(session_staff.repair_marks(), [])
@@ -467,7 +467,7 @@ print(observed.row.id)
             changes = session_staff.repair_marks()
             self.assertEqual(len(changes), 1)
             entry = pane_record.read("agents")["w4:p1"]
-            self.assertEqual(entry["environment"], {"CLAUDE_CODE_SESSION_ID": owner.id})
+            self.assertEqual(entry["environment"], {})
             path = pane_record.record_path("agents")
             before = path.read_bytes(), path.stat().st_mtime_ns
             self.assertEqual(session_staff.repair_marks(), [])

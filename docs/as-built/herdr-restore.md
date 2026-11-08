@@ -10,7 +10,8 @@ The saved launch selects each conversation and account.
   `HERDR_PANE_ID`.
 - Each entry holds the pane's Claude launch: the account folder (`CLAUDE_CONFIG_DIR`), the cwd,
   the `-n` name, the `--model` value, whether `--remote-control` was given, the conversation id
-  at that start, and the `SHOWRUNNER_*`, `ENABLE_TOOL_SEARCH` and probe marks. No credential
+  at that start (the fixed staff id for a staff member), and the `ENABLE_TOOL_SEARCH` and probe
+  marks. It saves no staff labels: a launch computes them from staff. No credential
   enters it: a resume rebuilds the account variables from the account folder.
 - `scripts/hooks/session-start-pane-record.py` writes the entry at SessionStart
   (startup, resume, clear, compact) from its own Claude process: the environment it inherits, and
@@ -42,6 +43,7 @@ The [launch-name policy](shutdown-and-restart.md#launch-names) supplies current 
   `agent_session` only when the pane has one.
 - `scripts/shutdown/pane_restore.py [--session NAME] [--dry-run]` first starts or adopts the shared server.
   It resumes staff rows through `restart.start_row`.
+  For a worker row, `start_row` resumes only that worker through `worker.restore` with the worker launch policy and the saved account. An idle worker prints `<name>: closed; its next assign resumes it` and stays closed.
   It resumes saved panes without staff rows through `herdr.launch_agent`.
   A pane without a saved entry or a staff row stays open.
 - Restore keeps live conversations. Unknown conversation evidence prints one anomaly line and permits a guarded launch.
@@ -58,7 +60,10 @@ The [launch-name policy](shutdown-and-restart.md#launch-names) supplies current 
   A failed start preserves the pane. A failed restore returns exit status 1.
 - Herdr keeps the restored layout. Unless its config sets `[session] resume_agents_on_restore = false`,
   herdr also resumes each pane itself on the server's account, and without the pane's `--env`.
-- `agents restart --all` stops and starts the local live Claude and Codex staff rows.
+- Before a power-off, run `agents stop --all`. It saves each local live staff row before its stop.
+- After login, run `agents restart`. Stop starts nothing.
+- `agents restart --all` uses the same selection and stop loop, then starts the selected rows.
+- The selection includes freestanding agents. A live session without a staff row prints one line and stays unsaved.
 - `agents restart` starts the missing rows from the saved row ID list.
 - Staff supplies the current session and worktree. Herdr saves tab order by staff row ID.
 - Restart sends no work prompt and does not restore unrelated panes.
@@ -115,3 +120,9 @@ Settings entry for the user, one more SessionEnd item:
 
 - Automatic boot restore is not installed on either machine.
 - Layout saving and detection-rule refresh run in `herdr-upkeep`.
+
+Claude launches write folder trust in the target account before the process starts.
+The write uses the repository trust key, or the folder itself outside a repository.
+A failed write prints one anomaly with the folder, account file, and error.
+The launch then returns its failure result without a process start.
+A composer with a draft waits until the deadline without changes to the draft.

@@ -1,6 +1,6 @@
 # Unit rename
 
-`rename.py plan|apply <old> <new>` renames one staff unit.
+`agents rename OLD NEW` renames one staff unit.
 The command reads the unit from its staff row.
 Use a staff id, `showrunner/name`, or a unique name; see `production-rename.md`.
 It keeps the staff id, current session, parent, and recorded role.
@@ -29,6 +29,6 @@ The command refuses an existing destination or a concurrent row operation.
 
 ## Tests
 
-The `test_rename_unit*.py` modules cover row names, display repair, moves, and stopped-session recovery.
+`scripts/shutdown/test_shutdown_cli.py` covers row names, display repair, moves, and stopped-session recovery.
 The `test_unit_move.py` module covers interruption recovery across the folder and branch operations.
 Tests use private staff records and fake process and terminal evidence.

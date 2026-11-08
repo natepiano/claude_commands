@@ -19,7 +19,7 @@ from collections.abc import Callable, Generator
 from pathlib import Path
 from contextlib import closing, contextmanager, redirect_stderr, redirect_stdout
 from datetime import datetime, timezone
-from typing import TypedDict, cast, override
+from typing import ClassVar, TypedDict, cast, override
 from unittest import mock
 from scripts.style import rules
 from scripts.style import style_ledger
@@ -203,6 +203,7 @@ class LedgerTestCase(unittest.TestCase):
 
     template_repo: Path = Path()
     template_tip: str = ""
+    staff_seed: ClassVar[str] = ""
 
     @classmethod
     @override
@@ -213,6 +214,7 @@ class LedgerTestCase(unittest.TestCase):
         fixture = cls(methodName="runTest")
         fixture.repo = cls.template_repo
         _ = fixture.git("init", "-q", "--initial-branch=main")
+        _ = fixture.git("config", "maintenance.auto", "false")
         _ = fixture.git("config", "user.name", "Ledger tests")
         _ = fixture.git("config", "user.email", "ledger-tests@example.invalid")
         fixture.write("Cargo.toml", '[workspace]\nmembers = ["crates/alpha", "crates/beta"]\nresolver = "2"\n')
@@ -228,6 +230,8 @@ class LedgerTestCase(unittest.TestCase):
         fixture.write("crates/alpha/vendor/embedded.rs", "pub fn embedded() {}\n")
         fixture.write("README.md", "A sample workspace\n")
         cls.template_tip = fixture.commit("Create workspace")
+        with style_staff_fixture(cls.template_repo.parent, cls.template_repo):
+            cls.staff_seed = (cls.template_repo.parent / "staff.json").read_text(encoding="utf-8")
 
     @override
     def setUp(self) -> None:
@@ -237,8 +241,17 @@ class LedgerTestCase(unittest.TestCase):
         _ = shutil.copytree(self.template_repo, self.repo, symlinks=True)
         self.rule_dir.mkdir(parents=True)
         self.initial_tip = self.template_tip
-        _ = self.enterContext(style_staff_fixture(self.root, self.repo))
+        record = cast(dict[str, object], json.loads(self.staff_seed))
+        for member in cast(list[dict[str, object]], record["rows"]):
+            for field in ("doc", "worktree"):
+                if field in member:
+                    location = cast(dict[str, str], member[field])
+                    relative = Path(location["path"]).relative_to(self.template_repo.parent)
+                    location["path"] = str(self.root / relative)
+        _ = (self.root / "staff.json").write_text(json.dumps(record), encoding="utf-8")
+        _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
+            "HERDR_BIN": "/nonexistent/herdr",
             "STYLE_LEDGER_STATE_DIR": str(self.root / "state"),
             "STYLE_HISTORY_NATE_STYLE_DIR": str(self.rule_dir.parent),
         })))
@@ -321,7 +334,7 @@ class LedgerTestCase(unittest.TestCase):
         return ledger
 
     def judgment_rows(self, database: Path) -> list[tuple[object, ...]]:
-        with sqlite3.connect(database) as connection:
+        with closing(sqlite3.connect(database)) as connection, connection:
             return cast(list[tuple[object, ...]], connection.execute("SELECT * FROM judgments ORDER BY id").fetchall())
 
     def site_fixture(self, family: rules.Family = "names", *, rule_name: str = "site-rule",

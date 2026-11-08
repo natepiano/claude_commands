@@ -32,7 +32,7 @@ They do not add records to the real build log.
 | `scripts/buildlog/test_index.py` | `use_test_log`, `point_root_at`, `LogIsolationTests`, and the record builders other tests import. |
 | `scripts/buildlog/test_report.py`, `test_disk.py`, `scripts/lint/test_sweep.py` | Report sections; the walk on fake trees; a hard link across two `directory_blocks` calls sharing `seen`. |
 | `commands/unit/direct.md` | The workers' command table; its `--filter` row reads `--filter <name> [--filter <name> …]`. |
-| `pyrightconfig.json` | `scripts/lint` on the `scripts/buildlog` environment's `extraPaths`, for `import sweep`. |
+| `pyrightconfig.json` | The buildlog environment uses the repository root in `extraPaths`. |
 | `/etc/nixos`, `nate.jobs.buildlog-disk` | The 10-minute timer that runs `buildlog disk` on natedev. Not in this repo. |
 
 ### Report layout
@@ -215,7 +215,7 @@ Measured by the buildlog disk job at 12:14 EDT: allocated blocks, each hard-link
 - To try a disk change by hand without replacing the live snapshot: `BUILDLOG_DIR=$(mktemp -d) scripts/lib/py scripts/buildlog/cli.py disk`, then `report` with the same `BUILDLOG_DIR`, and compare used and free with `df -B1 /`.
 - In a worktree, `./scripts/buildlog/buildlog` execs the live `~/.claude` CLI; render the worktree's report with `scripts/lib/py scripts/buildlog/cli.py report <day>`.
 - `test_report.py` has no `sys.path` setup and runs only under `~/.claude/scripts/lib/py -m unittest discover -s scripts/buildlog -p 'test_*.py'`.
-- `disk.py` puts `scripts/lint` at the front of `sys.path` to import `sweep`; basedpyright finds it through `extraPaths`.
+- `disk.py` imports `scripts.lint.sweep` by package name and changes no `sys.path`.
 - `basedpyright scripts/buildlog` exits 0 when clean. Its summary reads `0 errors, 0 warnings, 0 notes`.
 
 ## Why

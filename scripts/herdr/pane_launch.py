@@ -23,7 +23,6 @@ from scripts.production import staff
 
 # The launch environment a resume must give back. Credentials never enter the record.
 KEPT_NAMES = frozenset({"ENABLE_TOOL_SEARCH", PROBE_ENV})
-KEPT_PREFIXES = ("SHOWRUNNER_",)
 # Claude flags whose value the resume repeats; every other argument stays out of the record.
 NAME_FLAGS = frozenset({"-n", "--name"})
 MODEL_FLAGS = frozenset({"--model"})
@@ -153,7 +152,6 @@ class RecordedLabels:
                 or not sessions.running_session(record)):
             return values
         if self.membership is StaffLabelsRead.PENDING:
-            from scripts.production import staff
             from scripts.production.session_labels import StaffLabels
 
             try:
@@ -174,13 +172,22 @@ def locked(path: Path) -> Generator[None]:
         yield
 
 
+def without_staff_labels(entry: PaneLaunch) -> PaneLaunch:
+    """Keep pane observations without saved staff labels."""
+    current = entry.copy()
+    current["environment"] = {key: value for key, value in
+        legacy_identity.without_legacy_identity(entry["environment"]).items()
+        if key not in {"CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID"}}
+    return current
+
+
 def save(path: Path, entries: dict[str, PaneLaunch]) -> None:
     """Publish one retained launch file through the atomic writer."""
     atomic_file.write_text_atomic(path, json.dumps(entries, indent=2, sort_keys=True) + "\n")
 
 
 def write(path: Path, launch: PaneLaunch) -> None:
-    """Persist a member's fixed reference; keep the supplied launch observations."""
+    """Persist pane observations with the fixed staff reference."""
     try:
         owner = staff.initial_snapshot().by_current_session(launch["session_id"])
     except (staff.StaffUnreadable, OSError, ValueError):
@@ -399,7 +406,7 @@ def launch(pane_id: str, session_id: str, cwd: str, environment: Mapping[str, st
         "model": parsed.value(MODEL_FLAGS),
         "remote_control": any(argument.partition("=")[0] == "--remote-control" for argument in arguments),
         "environment": {key: value for key, value in sorted(environment.items())
-                        if key in KEPT_NAMES or key.startswith(KEPT_PREFIXES)},
+                        if key in KEPT_NAMES},
         "flags_read": bool(arguments),
         "ended": False,
         "written_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),

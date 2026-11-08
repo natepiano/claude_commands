@@ -43,7 +43,16 @@ Two environment variables change the defaults. Neither changes the address the s
 - `REVIEW_LINKS_ROOT` sets the snapshot root for both scripts. The default is `~/.local/share/review-links`. An empty value counts as unset.
 - `REVIEW_LINKS_HOST` sets the URL host, and the publisher then does not run `tailscale`. It uses the value as given and removes only a trailing dot.
 
-Each snapshot is a flat folder `<root>/<id>/`. The ID has six characters that `secrets.choice` picks from the lowercase letters and digits. An exclusive `mkdir` creates the folder. A taken ID gets a new pick, up to 10 tries, and then the run refuses. Each output keeps the name of its source file. A `.md` file (suffix in any case) gives two outputs: the source bytes and a rendered page `<stem>.html`. All other files, HTML and images included, are copied byte for byte. Files in one snapshot can link to each other by name.
+Each snapshot is a flat folder `<root>/<id>/`.
+The ID has six lowercase hex characters from `secrets.token_hex`.
+An exclusive `mkdir` creates the folder.
+If an ID already exists, the publisher tries another ID.
+The `snapshot_allocation_tries` setting starts at 10.
+After that many tries, the publisher refuses the run.
+Each output keeps the name of its source file.
+A `.md` file, with a suffix in any case, gives two outputs: the source bytes and a rendered page `<stem>.html`.
+The publisher copies all other files, including HTML and images, byte for byte.
+Files in one snapshot can link to each other by name.
 
 The publisher refuses the whole request, and writes nothing, for:
 

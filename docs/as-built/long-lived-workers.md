@@ -330,8 +330,16 @@ The rules live in `commands/unit/direct.md` `<LongLivedWorkers/>`, `docs/direct/
 A busy recipient gets only its `own_pass` continuation.
 An idle worker row receives no prompt.
 A director can receive the list of busy and idle worker children.
-Restore reopens only workers with active dispatches and retains launcher recovery.
-It shares dispatch reads across pane workers. Idle workers stay closed until their next assign.
+Restore reopens only workers with active dispatches.
+It reads each worker's dispatch record and transcript once to select the resume step.
+An accepted dispatch gets a continuation prompt only when the worker is idle.
+Restore holds the dispatch lock across the record read, receipt read, and prompt delivery.
+An unsubmitted dispatch keeps the saved assign command as its step.
+Restore, named resume, and director notes use the same receipt rule.
+Director notes keep the saved prompt path and reuse shared dispatch history reads.
+A dispatch with a DONE line or a finished record gets no resume note or step.
+Later chat does not reopen a completed dispatch.
+The restart shares its run index and snapshots. Idle workers stay closed until their next assign.
 Account moves must preserve closed idle workers.
 
 ### Cleanup
@@ -368,9 +376,12 @@ Account moves must preserve closed idle workers.
 The ledger stores fixed staff references, access policy, ownership, and events.
 Staff supplies current names, parents, worktrees, and backend identities.
 A rename or transfer preserves those fixed references.
-`rename.py` changes the unit row and repairs its session and display names.
-An explicit `--move-worktree --to-folder <path> --to-branch <name>` request also moves the worktree.
-See [unit rename](unit-rename.md) for explicit worktree moves.
+`agents rename OLD NEW` changes the unit row and repairs its session and display names.
+A changed unit name changes matching folder and branch suffixes.
+`--to-branch <name>` sets an explicit branch.
+Every unit branch change pushes the target to origin before sessions resume.
+Equal old and new unit names keep the folder and staff name.
+See [production rename](production-rename.md) for unit branch moves.
 
 ### Measurement: `scripts/whoami/worker_usage.py`
 
@@ -511,6 +522,23 @@ An unreadable design prints one warning per operation; other designs remain read
 | `list` | Reports roles and problems. A local read needs no network request. |
 
 A pane binding uses `worker.py` operations. A mesh binding uses `assign.sh` for prime and follow operations.
+`worker.py list --json` gives each pane worker row `name`, `id`, `current_session`, `state`, `role` and `activity`.
+It also computes three fields at read time and stores none of them:
+- `work`: `idle`, `busy` or `unknown`, from `worker_panes.worker_state`.
+- `account`: the label of the account the member opens on, from `member_account.resume_account`.
+- `home`: that account's home as an absolute path.
+With no staff backend entry, `account` is `{"state": "AccountUnavailable", "reason": ...}` and `home` is absent.
+`worker.py list --json --all` reads pane workers for every manager and adds each parent's name as `manager`.
+It needs no caller row and makes no process, pane, or thread read.
+`state` uses the saved dispatch status or staff hold; `activity` uses the saved pass activity, then its status.
+History lookup resolves fixed manager ids through the staff record, even after a session change.
+It merges history events from newest to oldest across files.
+It stops a file search when newer dispatches supply each worker's state or the remaining events precede each worker's creation.
+A fixed UUIDv7 staff id supplies its first conversation's creation time.
+Older id formats have no creation bound.
+It skips invalid lines and retains history events absent from the current pass slots.
+Stored account history resolves only the unit group and reads its history once.
+Per-manager listing keeps its live observations.
 An ended design identity cannot reopen.
 `config/design_roles.conf` controls new role creation.
 `[roles] new_open=false` preserves existing identities and refuses new opens.

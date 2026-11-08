@@ -175,7 +175,7 @@ class MergeCheckpointTests(MergeCheckpointFixture):
         (self.state / "slow-delivery").touch()
         command = (
             "import sys\nfrom pathlib import Path\n"
-            "sys.path.insert(0, sys.argv[1])\nimport merge_checkpoint as checkpoint\n"
+            'with open(Path(sys.argv[1]).parents[1] / "scripts/lib/package_root.py") as package_root: exec(package_root.read(), {"__file__": package_root.name})\nfrom scripts.production import merge_checkpoint as checkpoint\n'
             "path = Path(sys.argv[2])\ncheckpoint.send_result(path, checkpoint.read_record(path))\n"
         )
         output = self.enterContext((self.state / "slow-delivery.log").open("w"))

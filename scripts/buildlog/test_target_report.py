@@ -8,7 +8,7 @@ from pathlib import Path
 import sqlite3
 import subprocess
 import tempfile
-from typing import TYPE_CHECKING, cast, override
+from typing import cast, override
 import unittest
 from unittest import mock
 
@@ -16,10 +16,7 @@ from scripts.buildlog import index
 from scripts.buildlog import report
 from scripts.buildlog.test_index import Record, STAMP, call, encode, local_day, point_root_at, step
 
-if TYPE_CHECKING:
-    from ..lint.memory_test_support import write_config_fixture
-else:
-    from scripts.lint.memory_test_support import write_config_fixture
+from scripts.lint.memory_test_support import write_config_fixture
 
 
 class TargetReportTests(unittest.TestCase):

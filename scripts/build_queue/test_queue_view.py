@@ -15,18 +15,19 @@ from unittest import mock
 from scripts.build_queue.scope_activity import ScopeProcesses, NoLiveBuildRun, LiveBuildRun, IdleService, RunningServiceJob, NotServiceSlice
 from scripts.buildlog import store
 from scripts.build_queue import head_facts, queue_card, queue_view, queue_evidence
-from scripts.build_queue import admission_protocol as wire
+from scripts.build_queue import admission_protocol as wire, cloud_progress, progress_profile
 from scripts.build_queue.admission_test_support import AdmissionFixture
 from scripts.build_queue.admission_test_support import only_admitted
 from scripts.build_queue.queue_fixture import (
     ci_step,
-    ASKING_SESSION, GOLDEN, NOW, QueueFixtureTests, queue_read_fixture, waiting_rows, with_waiting,
+    ASKING_SESSION, GOLDEN, NOW, QueueFixture, QueueFixtureTests, queue_read_fixture, waiting_rows, with_waiting,
 )
 from scripts.build_queue.queue_lines import json_form, plain, wrap
 from scripts.lib.terminal_cells import terminal_width
 from scripts.lint import memory_admit as gate
 from scripts.lint.memory_test_support import fake_memory_readings
 from scripts.message.unit_labels import UnitLabels
+from scripts.message import unit_labels
 from scripts.build_queue.queue_fixture import write_memory_config
 
 
@@ -43,6 +44,128 @@ class BumpRecordsWithVisitCount(tuple[head_facts.BumpRecord, ...]):
         for record in super().__iter__():
             self.visits += 1
             yield record
+
+
+class CloudQueueViewTests(unittest.TestCase):
+    def cloud_model(self) -> tuple[queue_view.QueueModel, QueueFixture]:
+        fixture = self.enterContext(QueueFixture(captured=False))
+        write_memory_config(fixture.root / "build_admission.conf",
+            cloud_gate_slots="1", cloud_gate_stale_pushes="3")
+        _ = (fixture.root / "cloud_gate.conf").write_text(
+            "[cloud_gate]\n# range: 5e-324..\nlog_push_s=5\n")
+        model = fixture.model()
+        rows = (
+            wire.CloudRow(wire.Owner(700001, "100"),
+                wire.Identity("cloud-session", "route-one", "merge-gate", "/private/cloud", "cloud-unit"),
+                wire.CloudPlace("aws"), NOW - 245, NOW - 240,
+                cloud_progress.CloudProgress("running", 32, 1, NOW - 120),
+                progress_profile.ProgressCounter("modules", 7, 12), gate.ReadyForAdmission()),
+            wire.CloudRow(wire.Owner(700002, "200"),
+                wire.Identity("cloud-waiter", "route-two", "targeted-test", "/private/waiting", "waiting-unit"),
+                wire.CloudPlace("aws"), NOW - 60, 0,
+                cloud_progress.NoCloudProgress(), progress_profile.NoCounter(), wire.CloudSlotWait(1, 1)),
+        )
+        reading = model.reading
+        return replace(model, reading=wire.CloudQueueRead(reading.view, reading.explanation, reading.ordered,
+            reading.diagnostics, rows, 1, cloud_gate_stale_pushes=3)), fixture
+
+    def test_cloud_group_shows_slots_progress_size_elapsed_and_wait(self) -> None:
+        model, _fixture = self.cloud_model()
+        reading = model.reading
+        assert isinstance(reading, wire.CloudQueueRead)
+        row = reading.cloud[0]
+        assert isinstance(row.progress, cloud_progress.CloudProgress)
+        expected = (GOLDEN / "cloud_view.txt").read_text()
+        for failures, failure_text in ((1, "1 failed module"), (2, "2 failed modules")):
+            with self.subTest(failures=failures):
+                current = replace(row, progress=replace(row.progress, failed_modules=failures))
+                model = replace(model, reading=replace(reading, cloud=(current, *reading.cloud[1:])))
+                text = plain(queue_view.render_view(model, 140))
+                self.assertIn("Cloud", text)
+                self.assertIn("1 of 1 slots", text)
+                for value in ("cloud-unit", "merge-gate", "running", "waiting-unit", "targeted-test", "32", "vCPUs"):
+                    self.assertIn(value, text)
+                self.assertRegex(text, r"7(?: of |/)12")
+                self.assertIn("4 min", text)
+                self.assertIn("no update for 2 min", text)
+                self.assertIn("waits for a cloud slot: 1 of 1 in use", text)
+                self.assertEqual(text + "\n", expected.replace("1 failed module", failure_text))
+
+    def test_missing_cloud_progress_has_a_named_display_state(self) -> None:
+        model, _fixture = self.cloud_model()
+        reading = model.reading
+        assert isinstance(reading, wire.CloudQueueRead)
+        for reason in ("missing", "unreadable"):
+            with self.subTest(reason=reason):
+                row = replace(reading.cloud[0], progress=cloud_progress.NoCloudProgress(reason))
+                model = replace(model, reading=replace(reading, cloud=(row,)))
+                text = plain(queue_view.render_view(model, 140))
+                self.assertIn(reason, text)
+                self.assertNotIn("no update for", text)
+
+    def test_stale_age_uses_the_pass_threshold_and_the_current_push_interval(self) -> None:
+        model, fixture = self.cloud_model()
+        reading = model.reading
+        assert isinstance(reading, wire.CloudQueueRead)
+        row = reading.cloud[0]
+        assert isinstance(row.progress, cloud_progress.CloudProgress)
+        for seconds, expected in ((14, False), (15, True), (16, True)):
+            with self.subTest(seconds=seconds):
+                current = replace(row, progress=replace(row.progress, updated_at=NOW - seconds))
+                model = replace(model, reading=replace(reading, cloud=(current,)))
+                text = plain(queue_view.render_view(model, 140))
+                self.assertEqual("no update for" in text, expected)
+        write_memory_config(fixture.root / "build_admission.conf", cloud_gate_stale_pushes="4")
+        configuration = gate.read_admission_configuration()
+        assert isinstance(configuration, gate.UsableAdmissionConfiguration)
+        model = replace(model, reading=replace(model.reading,
+            cloud_gate_stale_pushes=configuration.cloud_gate_stale_pushes))
+        self.assertNotIn("no update for", plain(queue_view.render_view(model, 140)))
+        write_memory_config(fixture.root / "build_admission.conf", cloud_gate_stale_pushes="3")
+        configuration = gate.read_admission_configuration()
+        assert isinstance(configuration, gate.UsableAdmissionConfiguration)
+        model = replace(model, reading=replace(model.reading,
+            cloud_gate_stale_pushes=configuration.cloud_gate_stale_pushes))
+        _ = (fixture.root / "cloud_gate.conf").write_text(
+            "[cloud_gate]\n# range: 5e-324..\nlog_push_s=10\n")
+        self.assertNotIn("no update for", plain(queue_view.render_view(model, 140)))
+
+    def test_cloud_unit_uses_the_local_label_lookup_when_the_request_has_no_unit(self) -> None:
+        model, _fixture = self.cloud_model()
+        reading = model.reading
+        assert isinstance(reading, wire.CloudQueueRead)
+        row = reading.cloud[0]
+        row = replace(row, identity=replace(row.identity, unit=""))
+        model = replace(model, reading=replace(reading, cloud=(row,)))
+        with mock.patch.object(unit_labels, "unit_labels_for",
+                return_value={row.identity.session_id: UnitLabels("route-label", unit="lookup-unit")}) as lookup:
+            text = plain(queue_view.render_view(model, 140))
+            card = plain(queue_card.render_selection(model, "cloud-session", 140))
+        lookup.assert_called_once_with({row.identity.session_id}, os.environ)
+        for rendered in (text, card):
+            self.assertIn("lookup-unit", rendered)
+            self.assertNotIn("route-one", rendered)
+
+    def test_cloud_selection_accepts_the_folder_name_like_local_selection(self) -> None:
+        model, _fixture = self.cloud_model()
+        expected = plain(queue_card.render_selection(model, "cloud-session", 140))
+        self.assertEqual(plain(queue_card.render_selection(model, "cloud", 140)), expected)
+        self.assertIn("cloud-unit", expected)
+        self.assertNotIn("waiting-unit", expected)
+
+    def test_missing_push_file_or_key_omits_the_stale_age(self) -> None:
+        model, fixture = self.cloud_model()
+        config = fixture.root / "cloud_gate.conf"
+        for missing in ("key", "file"):
+            with self.subTest(missing=missing):
+                if missing == "key":
+                    _ = config.write_text("[cloud_gate]\n")
+                else:
+                    config.unlink()
+                text = plain(queue_view.render_view(model, 140))
+                self.assertIn("running", text)
+                self.assertRegex(text, r"7(?: of |/)12")
+                self.assertNotIn("no update for", text)
 
 
 class QueueViewTests(QueueFixtureTests):

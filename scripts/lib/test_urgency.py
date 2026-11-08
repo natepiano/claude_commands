@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import fcntl
 import os
-import sys
 import tempfile
 import threading
 import unittest
@@ -13,7 +12,6 @@ from datetime import datetime
 from pathlib import Path
 from unittest import mock
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.lib import urgency  # noqa: E402
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib.urgency import Entry, Urgency, UrgencyError  # noqa: E402

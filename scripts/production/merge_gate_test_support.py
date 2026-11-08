@@ -56,7 +56,8 @@ from pathlib import Path
 import sys
 
 TEST_HANG_GUARD_SECS = __TEST_HANG_GUARD_SECS__
-sys.path.insert(0, os.environ["MERGE_GATE_TEST_REPO"])
+with open(Path(os.environ["MERGE_GATE_TEST_REPO"]) / "scripts/lib/package_root.py") as package_root:
+    exec(package_root.read(), {"__file__": package_root.name})
 from scripts.direct.wait_for_test_state import wait_until
 state = Path(os.environ["MERGE_GATE_TEST_STATE"])
 name = Path(sys.argv[0]).name
@@ -548,7 +549,7 @@ class MergeGateFixture(unittest.TestCase):
     def prepare_affected_subject(self) -> tuple[Path, str]:
         subject = self.checkout / "scripts/hooks/affected_subject.py"
         self.write(subject, "VALUE = 1\n")
-        self.write(self.checkout / "scripts/hooks/test_first.py", "import affected_subject\n" + SUITE_MODULE)
+        self.write(self.checkout / "scripts/hooks/test_first.py", "from scripts.hooks import affected_subject\n" + SUITE_MODULE)
         return subject, self.commit(self.checkout, "dependency fixture")
 
     def run_gate(self, *extra: str, checkpoint: str = "", previous: str = "",
@@ -593,17 +594,17 @@ class MergeGateFixture(unittest.TestCase):
         if ignored_signals:
             source += ("[signal.signal(sig, signal.SIG_IGN) for sig in "
                        "(signal.SIGINT, signal.SIGTERM, signal.SIGHUP, signal.SIGQUIT)]; ")
-        source += (f"sys.path.insert(0, {str(SCRIPT.parents[2])!r}); "
-                   + "from scripts.production import merge_gate; \n"
+        source += ("from scripts.production import merge_gate; \n"
                    + ("from scripts.production import targeted_test as entry\n"
                       if self.suite_mode is merge_gate.SuiteMode.TARGETED_TEST else "entry = merge_gate\n")
                    + preamble + "\n"
                    + "raise SystemExit(entry.main(sys.argv[1:]))")
-        return [sys.executable, "-c", source]
+        return [str(SCRIPT.parents[1] / "lib/py"), "-c", source]
 
-    def run_promote_only(self, *extra: str) -> subprocess.CompletedProcess[str]:
+    def run_promote_only(self, *extra: str, explicit_checkout: bool = True) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
-            [str(SCRIPT.resolve().parents[1] / "lib" / "py"), str(SCRIPT), "--repo", str(self.checkout), "--merge-branch", "integration",
+            [str(SCRIPT.resolve().parents[1] / "lib" / "py"), str(SCRIPT),
+             *(["--repo", str(self.checkout)] if explicit_checkout else []), "--merge-branch", "integration",
              "--promote-only", "--main-repo", str(self.main),
              "--ssh", str(self.bin / "ssh"),
              *([] if "--production" in extra else ["--production", "quiet"]), *extra],

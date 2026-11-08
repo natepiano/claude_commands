@@ -22,7 +22,7 @@ class VerifyTokenWaitTests(VerifyTokenWaitFixture):
     def test_token_wait_restores_the_original_place_and_runs_with_memory_and_token(self) -> None:
         observer = self.root / "observe-token.py"
         observations = self.root / "token-observations.json"
-        _ = observer.write_text('import sys\n' + f'sys.path.insert(0, {str(Path(__file__).resolve().parents[2])!r})\n' + '''import json
+        _ = observer.write_text('import sys\n' + f"with open({str(Path(__file__).resolve().parents[2] / 'scripts/lib/package_root.py')!r}) as package_root: exec(package_root.read(), {{'__file__': package_root.name}})\n" + '''import json
 import os
 from pathlib import Path
 import sys

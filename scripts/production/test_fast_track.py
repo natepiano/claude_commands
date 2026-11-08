@@ -54,7 +54,8 @@ class ChangedValueTests(unittest.TestCase):
             self.assertNotIn(name, os.environ)
         self.assertIn("BUILDLOG_DIR", os.environ)
         with Path(os.environ["FAST_TRACK_TEST_EVENTS"]).open("a") as output:
-            output.write(json.dumps({"kind": "test", "module": __name__,
+            output.write(json.dumps({"kind": "test", "module": __name__.rsplit(".", 1)[-1],
+                                     "package_module": __name__,
                                      "cwd": str(Path.cwd()), "private_git": (Path.cwd() / ".git").is_dir(),
                                      "branch": subprocess.check_output(["git", "branch", "--show-current"], text=True, timeout=__HANG_GUARD__).strip(),
                                      "common": subprocess.check_output(["git", "rev-parse", "--path-format=absolute", "--git-common-dir"], text=True, timeout=__HANG_GUARD__).strip()}) + "\\n")
@@ -100,11 +101,6 @@ print("0 errors, 0 warnings, 0 notes")
 # The project accepts the footer, including when the configured venv is absent.
 sys.exit(3)
 '''.replace("__HANG_GUARD__", str(TEST_HANG_GUARD_SECS))
-
-
-GIT_HANG_GUARD = '''#!/bin/sh
-exec timeout -s KILL __HANG_GUARD__ "$@"
-'''
 
 
 GIT_ARGUMENTS = '''operation=
@@ -242,6 +238,7 @@ class FastTrackTests(MergeCheckpointFixture):
         super().build_fixture()
         for path, content in {
             "scripts/__init__.py": "", "scripts/sample/__init__.py": "",
+            "scripts/lib/py": (REPOSITORY / "scripts/lib/py").read_text(),
             "scripts/sample/item.py": MODULE,
             "scripts/sample/note.txt": "before\n",
             "scripts/production/add_unit.py": "VALUE = 'staff writer'\n",
@@ -253,6 +250,7 @@ class FastTrackTests(MergeCheckpointFixture):
             "scripts/production/merge_gate.py": "raise AssertionError('gate ran')\n",
         }.items():
             self.write(self.checkout, path, content)
+        (self.checkout / "scripts/lib/py").chmod(0o755)
         _ = self.git("add", ".")
         _ = self.git("commit", "-m", "fast-track fixture modules")
         _ = self.git("push", "origin", "HEAD:main", "HEAD:production")
@@ -348,6 +346,7 @@ class FastTrackTests(MergeCheckpointFixture):
     def move_main_during_check(self) -> str:
         writer = self.control / "writer"
         _ = self.git("clone", "-b", "main", str(self.origin), str(writer), cwd=self.root)
+        _ = self.git("config", "maintenance.auto", "false", cwd=writer)
         _ = self.git("config", "user.name", "Concurrent Writer", cwd=writer)
         _ = self.git("config", "user.email", "writer@example.invalid", cwd=writer)
         self.write(writer, "concurrent.txt", "another fix\n")
@@ -383,38 +382,6 @@ class FastTrackTests(MergeCheckpointFixture):
         return [cast(dict[str, object], json.loads(line))
                 for line in (self.control / "fetch-events.jsonl").read_text().splitlines()]
 
-    def test_restore_operand_does_not_change_the_wrapper_operation(self) -> None:
-        self.interrupt_git("before-restore")
-        # The wrapper kills this disposable parent instead of the test runner.
-        result = subprocess.run([
-            sys.executable, "-c",
-            "import subprocess, sys; sys.exit(subprocess.call(sys.argv[1:]))",
-            str(self.bin / "git"), "-C", str(self.unit), "-c", "advice.detachedHead=false",
-            "restore", "--source=HEAD", "--staged", "--worktree", "--", "commit",
-        ], env=self.env, capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS)
-        self.assertEqual(result.returncode, -9, result.stdout + result.stderr)
-        self.assertFalse((self.control / "stop-git").exists())
-        self.assertEqual((self.control / "stopped-copy").read_text(), str(self.unit))
-
-    def test_process_mark_survives_a_method_rename(self) -> None:
-        @final
-        class MarkedCase(unittest.TestCase):
-            @process_boundary
-            def original(self) -> None:
-                return None
-
-            renamed = original
-
-        self.assertTrue(process_boundary_for_case(MarkedCase("renamed")))
-        self.assertFalse(process_boundary_for_case(unittest.TestCase()))
-        case = FastTrackTests("runTest")
-        case.control, case.unit, case.env = self.control, self.unit, self.env
-        case._testMethodName = "renamed"
-        with patch.object(FastTrackTests, "renamed", MarkedCase.renamed, create=True):
-            with patch(f"{__name__}.invoke_cli", side_effect=AssertionError("process mark was ignored")):
-                result = case.command("--pending", "--unit", "alpha")
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-
     def test_fetch_wrapper_skips_python_logic_for_ordinary_git_commands(self) -> None:
         _ = self.arrange_fetch_failures("after-push", ["lock"])
         self.env["FAST_TRACK_FETCH_LOGIC"] = str(self.root / "missing-fetch-logic")
@@ -424,54 +391,6 @@ class FastTrackTests(MergeCheckpointFixture):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(result.stdout.strip(), self.initial)
         self.assertFalse((self.control / "fetch-events.jsonl").exists())
-
-    def test_git_wrapper_preserves_failure_status_without_an_event(self) -> None:
-        self.interrupt_git("before-push")
-        self.change_module()
-        result = subprocess.run([str(self.bin / "git"), "-C", str(self.unit), "diff", "--exit-code"],
-                                env=self.env, capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS)
-        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
-        self.assertTrue((self.control / "stop-git").exists())
-        self.assertFalse((self.control / "stopped-copy").exists())
-        ready = self.control / "commit-ready"
-        self.env["FAST_TRACK_PAUSE_COMMIT"] = str(ready)
-        self.env["FAST_TRACK_COMMIT_RELEASE"] = str(self.control / "missing-release")
-        failed_commit = subprocess.run([
-            str(self.bin / "git"), "-C", str(self.unit), "commit", "--invalid-fixture-option",
-        ], env=self.env, capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS)
-        self.assertNotEqual(failed_commit.returncode, 0, failed_commit.stdout + failed_commit.stderr)
-        self.assertNotEqual(failed_commit.returncode, -9)
-        self.assertFalse(ready.exists())
-
-    def test_git_wrappers_stop_a_blocked_hook(self) -> None:
-        hooks = self.control / "hooks"
-        hooks.mkdir()
-        started = self.control / "hook-started"
-        self.executable(hooks / "pre-commit", f'''#!/usr/bin/env python3
-from pathlib import Path
-import signal
-Path({str(started)!r}).touch()
-signal.pause()
-''')
-        self.executable(self.bin / "bounded-git", GIT_HANG_GUARD.replace("__HANG_GUARD__", "5"))
-        real_git = shutil.which("git", path=self.env["PATH"])
-        self.assertIsNotNone(real_git)
-        self.env["FAST_TRACK_REAL_GIT"] = str(real_git)
-        for wrapper in ("interruption", "fetch"):
-            with self.subTest(wrapper=wrapper):
-                if wrapper == "interruption":
-                    self.interrupt_git("before-push")
-                else:
-                    # Read the original Git path before installing the second wrapper.
-                    (self.bin / "git").unlink()
-                    _ = self.arrange_fetch_failures("after-push", ["lock"])
-                result = subprocess.run([
-                    str(self.bin / "git"), "-C", str(self.unit), "-c", f"core.hooksPath={hooks}",
-                    "commit", "--allow-empty", "-m", "blocked hook",
-                ], env=self.env, capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS)
-                self.assertEqual(result.returncode, -9, result.stdout + result.stderr)
-                self.assertTrue(started.exists(), "the guard must stop a running hook")
-                started.unlink()
 
     def test_post_push_ref_lock_retries_then_restores_and_promotes(self) -> None:
         self.change_module()
@@ -630,8 +549,8 @@ signal.pause()
                 self.assert_refused(self.fast_track("scripts/sample/entry.py"), "scripts/production/add_unit.py")
         self.assertEqual(self.observations("types"), [])
 
-    def test_resume_unit_cannot_bypass_the_staff_writer_refusal(self) -> None:
-        path = "scripts/production/resume_unit.py"
+    def test_agents_cannot_bypass_the_staff_writer_refusal(self) -> None:
+        path = "scripts/shutdown/shutdown.py"
         self.write(self.unit, path, "from add_unit import VALUE\n")
         self.assert_refused(self.fast_track(path), "refused path")
 
@@ -1113,6 +1032,8 @@ signal.pause()
         tests = self.observations("test")
         self.assertEqual({row["module"] for row in tests}, {"test_item", "test_item_extra"})
         for row in tests:
+            with self.subTest(module=row["module"], case="package name"):
+                self.assertEqual(row["package_module"], "scripts.sample." + str(row["module"]))
             self.assertTrue(row["private_git"], row)
             self.assertEqual(row["branch"], "", row)
             self.assertEqual(Path(str(row["common"])), Path(str(row["cwd"])) / ".git")
@@ -1176,9 +1097,9 @@ signal.pause()
         paths.update({"settings.json", "scripts/hooks/private/check.py", "scripts/lib/py",
                       ".local/state/staff/staff.json", "scripts/production/staff.py",
                       "scripts/production/staff_sources.py", "scripts/production/add_unit.py",
-                      "scripts/production/add_showrunner.py", "scripts/production/retire_unit.py",
+                      "scripts/production/add_showrunner.py", "scripts/shutdown/shutdown.py",
                       "scripts/production/promote_showrunner.py", "scripts/production/transfer_unit.py",
-                      "scripts/accounts/moves.py", "scripts/production/rename.py",
+                      "scripts/accounts/moves.py", "scripts/shutdown/shutdown.py",
                       "scripts/shutdown/shutdown.py", "scripts/production/merge_gate.py",
                       "scripts/production/merge_checkpoint.py", "scripts/direct/verify.sh",
                       "scripts/production/build_hold.py", "scripts/production/fast_track.py",

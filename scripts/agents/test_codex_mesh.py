@@ -13868,7 +13868,7 @@ class DirectorLifetimeTests(MeshCommandFixture):
         # The fixture replaces process discovery, signals, and unrelated cleanup.
         # The shell, stop, sweep, registry, staff membership, and worker ledger execute real code.
         _ = shim.write_text("#!/usr/bin/env python3\n" + "import sys\n"
-            + f"sys.path.insert(0, {str(Path(codex_mesh.__file__).resolve().parents[2])!r})\n"
+            + f"with open({str(Path(codex_mesh.__file__).resolve().parents[2] / 'scripts/lib/package_root.py')!r}) as package_root: exec(package_root.read(), {{'__file__': package_root.name}})\n"
             + '''import os, pathlib, runpy, sys
 from unittest.mock import patch
 from scripts.agents import codex_mesh, worker_lifecycle
