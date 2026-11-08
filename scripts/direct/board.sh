@@ -96,7 +96,7 @@ print("".join(character for character in text if character.isprintable())[:int(s
 }
 
 # `ask` and `answer` are deliberately absent. A question to a peer is a message
-# now -- SendMessage for a claude member, codex_mesh.py for a codex one -- and
+# through its native session, and
 # leaving the kinds here would give a worker two ways to ask one question,
 # with the board's way being the one nobody is listening on. Every kind that
 # remains is a record something later reads back: the progress table, a peer

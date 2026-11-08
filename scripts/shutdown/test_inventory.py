@@ -18,10 +18,11 @@ from unittest.mock import patch
 
 
 from scripts.lib.socket_test_support import short_socket_directory
-from scripts.production.staff_test_support import fixture_member, unit_membership, recorded_showrunner, StaffTestCase, fixture_worker, fixture_runtime_id, fixture_session, fixture_roster
+from scripts.production.staff_test_support import fixture_member, unit_membership, recorded_showrunner, StaffTestCase, fixture_worker
 from scripts.production import staff
 from scripts.lib import unit_runs as owned_runs
-from scripts.lib.resume_message import PausedSeat, Resumable, Idle, Unavailable
+from scripts.lib.atomic_file import write_text_atomic
+from scripts.lib.resume_message import ClaudeChildResume, Resumable, Idle, Unavailable
 from scripts.usage import agents_log
 from scripts.shutdown.test_support import ShutdownTestCase, linux_process_fixture
 from scripts.shutdown import inventory
@@ -143,36 +144,6 @@ class InventoryTests(ShutdownTestCase):
         cls.seed_head = fixture.head
         fixture.live_socket.close()
 
-    def test_paused_worker_reads_its_current_thread_from_the_staff_backend_record(self) -> None:
-        fixture = StaffTestCase()
-        fixture.setUp()
-        self.addCleanup(fixture.doCleanups)
-        owner = fixture_member("showrunner", name="owner")
-        unit = fixture_member("unit", name="unit", parent=owner.id)
-        worker = fixture_worker("impl2", unit.id,
-                                backend=staff.CodexBackend(self.root / "codex-home"))
-        current = staff.native_id(fixture_runtime_id("shutdown-replaced-thread"))
-        fixture_session(current, staff.CodexBackend(self.root / "codex-home"))
-        worker = staff.update_current_session(worker.current_session, current)
-        agents_log.append(current, "review", None, datetime.now(timezone.utc))
-        run = self.root / "paused-staff-worker"
-        run.mkdir()
-        _ = (run / "mesh_roster.json").write_text(json.dumps({
-            worker.name: {"staff_id": worker.id, "status": "paused", "role": "review"},
-        }))
-        before = Path(os.environ["STAFF_FILE"]).read_bytes()
-        with patch("scripts.lib.unit_runs.run_roots", return_value=(self.root,)), patch.dict(os.environ, {"UNIT_RUN_DIR": str(run)}):
-            found = inventory.worker_resumes(unit, staff.local_snapshot())
-        self.assertTrue(all(isinstance(result, Idle) for result in found))
-        seats = [result.seat for result in found if isinstance(result, Idle)]
-        self.assertEqual(len(seats), 1)
-        self.assertEqual(seats[0]["staff_id"], worker.id)
-        recorded = staff.by_id(staff.StaffId(seats[0]["staff_id"]))
-        assert recorded is not None
-        self.assertEqual(recorded.current_session, current)
-        self.assertEqual(seats[0]["role"], "review")
-        self.assertEqual(Path(os.environ["STAFF_FILE"]).read_bytes(), before)
-        self.assertNotIn("thread_id", (run / "mesh_roster.json").read_text())
 
     def test_worker_resumes_records_nearest_launcher_argv_for_direct_children(self) -> None:
         run = self.root / "paused run"
@@ -180,24 +151,27 @@ class InventoryTests(ShutdownTestCase):
         command = ["bash", "/config/scripts/direct/review.sh", "--phase", "1", str(run), "/checkout with spaces", "/old/prompt.md", "review-task", "review instructions", "review task", "1", "api"]
         outer = ["bash", "/config/scripts/direct/assign.sh", "--role", "implement",
                  "--session-dir", str(run), "--cwd", "/checkout with spaces", "--prompt", "/old/prompt.md"]
-        self.herdr_process(810, 811, ["python3", "codex_mesh.py", "follow"], {})
+        self.herdr_process(810, 811, ["claude"], {})
         self.herdr_process(811, 812, command, {})
         self.herdr_process(812, 1, outer, {})
-        _ = (run / "mesh_roster.json").write_text(json.dumps(fixture_roster(cast(dict[str, object], {
-            "busy": {"role": "review", "thread_id": "75863a97-cb41-5754-bb95-d7e89deccf43", "turn_id": "turn", "status": "running", "launcher_pid": 810},
-            "idle": {"role": "impl", "thread_id": "fe371221-a140-5ddf-8753-e906f9ce3519", "status": "done"},
-            "orphan": {"role": "impl", "thread_id": "ce8d52e6-a534-5e7f-9213-bc67b35f20aa", "status": "starting", "launcher_pid": 99999999},
-            "ended": {"role": "impl", "thread_id": "cbf7634e-e57a-51ad-99e2-5cfbeabec92b", "status": "ended"},
-        }), unit_membership("fixture", run.name.replace(" ", "-")).id, self.root / "codex-home")))
-        agents_log.append("75863a97-cb41-5754-bb95-d7e89deccf43", "review", None, datetime.now(timezone.utc))
-        agents_log.append("fe371221-a140-5ddf-8753-e906f9ce3519", "impl", None, datetime.now(timezone.utc))
-        agents_log.append("ce8d52e6-a534-5e7f-9213-bc67b35f20aa", "impl", None, datetime.now(timezone.utc))
+        unit = unit_membership("fixture", run.name.replace(" ", "-"))
+        write_text_atomic(run / "progress_history_state.json", json.dumps({"owner_staff_id": unit.id}))
+        for name, identity, status, launcher in (
+            ("busy", "75863a97-cb41-5754-bb95-d7e89deccf43", "implementing", 810),
+            ("idle", "fe371221-a140-5ddf-8753-e906f9ce3519", "completed", 0),
+            ("orphan", "ce8d52e6-a534-5e7f-9213-bc67b35f20aa", "implementing", 99999999),
+        ):
+            child = fixture_worker(name, unit.id, runtime_id=identity)
+            write_text_atomic(run / f"impl_worker_{name}.json", json.dumps({
+                "staff_id": child.id, "slot": name, "launcher_pid": launcher}))
+            write_text_atomic(run / f"impl_status_{name}", status)
+            agents_log.append(identity, "review" if name == "busy" else "impl", None, datetime.now(timezone.utc))
 
         def launcher_alive(pid: int) -> bool:
             return pid in {810, 811, 812}
         # An ended worker no longer belongs to the director's active children.
         unit = unit_membership("fixture", run.name.replace(" ", "-"))
-        membership = staff.StaffSnapshot(tuple(row for row in staff.local_snapshot().rows if row.current_session != "cbf7634e-e57a-51ad-99e2-5cfbeabec92b"))
+        membership = staff.local_snapshot()
         with (patch.object(inventory, "_pid_alive", side_effect=launcher_alive),
               patch("scripts.lib.unit_runs.run_roots", return_value=(self.root,)),
               patch.dict(os.environ, {"UNIT_RUN_DIR": str(run)})):
@@ -205,8 +179,11 @@ class InventoryTests(ShutdownTestCase):
         self.assertTrue(all(isinstance(result, (Resumable, Idle)) for result in found))
         seats = {result.seat["seat"]: result.seat for result in found if isinstance(result, (Resumable, Idle))}
         self.assertEqual(set(seats), {"busy", "idle", "orphan"})
-        self.assertEqual(seats["busy"], PausedSeat(run_dir=str(run), seat="busy", role="review", staff_id="75863a97-cb41-5754-bb95-d7e89deccf43", turn_live=True, launcher_command=command))
-        self.assertEqual(seats["idle"], PausedSeat(run_dir=str(run), seat="idle", role="impl", staff_id="fe371221-a140-5ddf-8753-e906f9ce3519", turn_live=False, launcher_command=[]))
+        busy = membership.by_current_session("75863a97-cb41-5754-bb95-d7e89deccf43")
+        idle = membership.by_current_session("fe371221-a140-5ddf-8753-e906f9ce3519")
+        assert busy is not None and idle is not None
+        self.assertEqual(seats["busy"], ClaudeChildResume(run_dir=str(run), seat="busy", role="review", staff_id=busy.id, turn_live=True, launcher_command=command))
+        self.assertEqual(seats["idle"], ClaudeChildResume(run_dir=str(run), seat="idle", role="impl", staff_id=idle.id, turn_live=False, launcher_command=[]))
         self.assertEqual(seats["orphan"]["launcher_command"], [])
 
         for launcher in ("assign.sh", "assign.py"):
@@ -845,32 +822,6 @@ elif "comm=" in joined:
             str(run_dir) + "\n", encoding="utf-8"
         )
         _ = (run_dir / "workers").write_text("aaaaaaaa\treview-worker\n", encoding="utf-8")
-        _ = (run_dir / "mesh_server.json").write_text(
-            json.dumps({"port": 45_678, "pid": os.getpid()}), encoding="utf-8"
-        )
-        _ = (run_dir / "mesh_roster.json").write_text(
-            json.dumps(
-                fixture_roster(cast(dict[str, object], {
-                    "busy-codex": {
-                        "thread_id": "fe0c4217-2bac-5469-b661-2b4d94550a98",
-                        "turn_id": "turn-busy",
-                        "status": "running",
-                        "launcher_pid": os.getpid(),
-                    },
-                    "busy-without-launcher": {
-                        "thread_id": "afeb2efd-6f41-5075-857b-c1f97cad78ab",
-                        "status": "running",
-                    },
-                    "orphaned-start": {
-                        "thread_id": "2b572040-6864-5d68-932f-e25da01f0cb7",
-                        "status": "starting",
-                        "launcher_pid": 999_999_999,
-                    },
-                    "finished-codex": {"thread_id": "4efc4edc-6d50-52e3-a71b-736c5dbfae93", "status": "done"},
-                }), unit_membership("fixture", run_dir.name).id, self.root / "codex-home")
-            ),
-            encoding="utf-8",
-        )
 
 
     def test_inventory_is_account_scoped_and_discovers_every_owned_resource(self) -> None:
@@ -915,16 +866,6 @@ elif "comm=" in joined:
             director["doc"], str(self.root / "build-followups-production.md")
         )
         self.assertEqual(director["run_dirs"], [str(self.runs / "phase-two")])
-        self.assertEqual(
-            director["codex_servers"],
-            [
-                {
-                    "run_dir": str(self.runs / "phase-two"),
-                    "pid": os.getpid(),
-                    "busy_workers": ["busy-codex"],
-                }
-            ],
-        )
 
         unit = cast(inventory.UnitSession, by_id[UNIT_ID])
         self.assertEqual(unit["kind"], "unit")
@@ -1083,26 +1024,7 @@ elif "comm=" in joined:
         self.assertEqual(host.get("supervisor"), {"kind": "no supervisor"})
 
 
-    def test_only_running_codex_workers_with_live_launchers_are_busy(self) -> None:
-        found = inventory.inventory(TARGET_LOGIN)
-        director = next(
-            session for session in found["sessions"] if session["session_id"] == DIRECTOR_ID
-        )
 
-        self.assertEqual(
-            director["codex_servers"][0]["busy_workers"],
-            ["busy-codex"],
-        )
-        self.assertNotIn("orphaned-start", director["codex_servers"][0]["busy_workers"])
-
-    def test_stale_running_entries_with_dead_or_missing_launchers_are_not_busy(self) -> None:
-        run_dir = self.runs / "phase-two"
-        roster = cast(dict[str, dict[str, object]], json.loads((run_dir / "mesh_roster.json").read_text()))
-        roster["orphaned-start"]["status"] = "running"
-        _ = (run_dir / "mesh_roster.json").write_text(json.dumps(fixture_roster(cast(dict[str, object], roster), unit_membership("fixture", run_dir.name).id, self.root / "codex-home")))
-        found = inventory.inventory(TARGET_LOGIN)
-        director = next(session for session in found["sessions"] if session["session_id"] == DIRECTOR_ID)
-        self.assertEqual(director["codex_servers"][0]["busy_workers"], ["busy-codex"])
 
     def test_a_showrunner_timer_naming_a_session_not_running_is_unregistered(self) -> None:
         before = {runner["name"] for runner in inventory.unregistered_showrunners()}
@@ -1380,95 +1302,8 @@ elif "comm=" in joined:
         self.assertEqual(parsed["host"], {"kind": "legacy tmux", "session_name": "legacy"})
 
 
-    def test_codex_seats_records_nearest_launcher_argv_and_excludes_ended_and_other_runs(self) -> None:
-        run = self.root / "paused run"
-        run.mkdir()
-        command = ["bash", "/config/scripts/direct/review.sh", "--phase", "1", str(run), "/checkout with spaces", "/old/prompt.md", "review-task", "review instructions", "review task", "1", "api"]
-        outer = ["bash", "/config/scripts/direct/assign.sh", "outer arguments"]
-        self.herdr_process(810, 811, ["python3", "codex_mesh.py", "follow"], {})
-        self.herdr_process(811, 812, command, {})
-        self.herdr_process(812, 1, outer, {})
-        _ = (run / "mesh_roster.json").write_text(json.dumps(fixture_roster(cast(dict[str, object], {
-            "busy": {"role": "review", "thread_id": "75863a97-cb41-5754-bb95-d7e89deccf43", "turn_id": "turn", "status": "running", "launcher_pid": 810},
-            "idle": {"role": "impl", "thread_id": "fe371221-a140-5ddf-8753-e906f9ce3519", "status": "done"},
-            "orphan": {"role": "impl", "thread_id": "ce8d52e6-a534-5e7f-9213-bc67b35f20aa", "status": "starting", "launcher_pid": 99999999},
-            "ended": {"role": "impl", "thread_id": "cbf7634e-e57a-51ad-99e2-5cfbeabec92b", "status": "ended"},
-        }), unit_membership("fixture", run.name.replace(" ", "-")).id, self.root / "codex-home")))
-        agents_log.append("75863a97-cb41-5754-bb95-d7e89deccf43", "review", None, datetime.now(timezone.utc))
-        agents_log.append("fe371221-a140-5ddf-8753-e906f9ce3519", "impl", None, datetime.now(timezone.utc))
-        agents_log.append("ce8d52e6-a534-5e7f-9213-bc67b35f20aa", "impl", None, datetime.now(timezone.utc))
-
-        def launcher_alive(pid: int) -> bool:
-            return pid in {810, 811, 812}
-        # An ended worker no longer belongs to the director's active children.
-        unit = unit_membership("fixture", run.name.replace(" ", "-"))
-        membership = staff.StaffSnapshot(tuple(row for row in staff.local_snapshot().rows if row.current_session != "cbf7634e-e57a-51ad-99e2-5cfbeabec92b"))
-        with (patch.object(inventory, "_pid_alive", side_effect=launcher_alive),
-              patch("scripts.lib.unit_runs.run_roots", return_value=(self.root,)),
-              patch.dict(os.environ, {"UNIT_RUN_DIR": str(run)})):
-            found = inventory.worker_resumes(unit, membership)
-        self.assertTrue(all(isinstance(result, (Resumable, Idle)) for result in found))
-        seats = {result.seat["seat"]: result.seat for result in found if isinstance(result, (Resumable, Idle))}
-        self.assertEqual(set(seats), {"busy", "idle", "orphan"})
-        self.assertEqual(seats["busy"], PausedSeat(run_dir=str(run), seat="busy", role="review", staff_id="75863a97-cb41-5754-bb95-d7e89deccf43", turn_live=True, launcher_command=command))
-        self.assertEqual(seats["idle"], PausedSeat(run_dir=str(run), seat="idle", role="impl", staff_id="fe371221-a140-5ddf-8753-e906f9ce3519", turn_live=False, launcher_command=[]))
-        self.assertEqual(seats["orphan"]["launcher_command"], [])
-
-        for launcher in ("assign.sh", "assign.py"):
-            with self.subTest(launcher=launcher):
-                command = ["bash" if launcher.endswith(".sh") else "python3",
-                           f"/config/scripts/direct/{launcher}", "--role", "review", "--to", "busy",
-                           "--session-dir", str(run), "--cwd", "/checkout with spaces",
-                           "--prompt", "/old/prompt.md", "--phase", "1", "--lens", "contract", "--pass", "2"]
-                self.herdr_process(811, 812, command, {})
-                with (patch.object(inventory, "_pid_alive", side_effect=launcher_alive),
-                      patch("scripts.lib.unit_runs.run_roots", return_value=(self.root,)),
-                      patch.dict(os.environ, {"UNIT_RUN_DIR": str(run)})):
-                    found = inventory.worker_resumes(unit, membership)
-                seats = {result.seat["seat"]: result.seat for result in found if isinstance(result, (Resumable, Idle))}
-                self.assertEqual(seats["busy"]["launcher_command"], command)
 
 
-    def test_codex_seats_leaves_out_a_run_its_director_left_after_an_earlier_stop_offered_it(self) -> None:
-        def run_with(name: str, statuses: dict[str, str], *, board_at: int, offered_at: int | None) -> Path:
-            run = self.root / name
-            run.mkdir()
-            _ = (run / "mesh_roster.json").write_text(json.dumps(fixture_roster(cast(dict[str, object], {
-                seat: {"role": "test", "thread_id": fixture_runtime_id(f"{name}-{seat}-thread"), "status": status}
-                for seat, status in statuses.items()
-            }), unit_membership("fixture", run.name.replace(" ", "-")).id, self.root / "codex-home")))
-            board = run / "board.log"
-            _ = board.write_text("[director] dispatch\n")
-            os.utime(board, (board_at, board_at))
-            if offered_at is not None:
-                for seat in statuses:
-                    prompt = run / f"{seat}.resume-prompt.md"
-                    _ = prompt.write_text("paused\n")
-                    os.utime(prompt, (offered_at, offered_at))
-            return run
-
-        left = run_with("left", {"a75-test": "paused", "p39a-impl": "paused"}, board_at=1_000, offered_at=2_000)
-        taken_back = run_with("taken back", {"impl": "paused"}, board_at=3_000, offered_at=2_000)
-        dispatched = run_with("dispatched", {"impl": "paused", "test": "done"}, board_at=1_000, offered_at=2_000)
-        never_offered = run_with("never offered", {"impl": "paused"}, board_at=1_000, offered_at=None)
-
-        departed = unit_membership("fixture", left.name.replace(" ", "-"))
-        successor = unit_membership("fixture", "successor")
-        for child in staff.local_snapshot().find(kind="worker", parent=departed.id):
-            _ = staff.move(child.id, staff.ReportsTo(successor.id))
-        membership = staff.local_snapshot()
-        for child in membership.find(kind="worker"):
-            agents_log.append(child.current_session, "test", None, datetime.now(timezone.utc))
-        with patch("scripts.lib.unit_runs.run_roots", return_value=(self.root,)):
-            results = [result for run in (left, taken_back, dispatched, never_offered)
-                       for result in inventory.worker_resumes(
-                           unit_membership("fixture", run.name.replace(" ", "-")), membership)]
-        found = [result.seat for result in results if isinstance(result, (Resumable, Idle))]
-
-        self.assertEqual(
-            sorted((Path(seat["run_dir"]).name, seat["seat"]) for seat in found),
-            [("dispatched", "impl"), ("dispatched", "test"), ("never offered", "impl"), ("taken back", "impl")],
-        )
 
 
 class ProcessEnvironmentTests(unittest.TestCase):
@@ -1568,10 +1403,17 @@ class WorkerResumeTests(StaffTestCase):
         _ = cast(object, self.enterContext(patch.dict(os.environ, {"UNIT_RUN_DIR": "", "PLAN_DELEGATE_BOARD_DIR": "",
                                                                 "USAGE_STATE_DIR": str(self.root / "usage")})))
 
-    def roster(self, name: str, entries: dict[str, object]) -> Path:
+    def child_run(self, name: str, entries: dict[str, object]) -> Path:
         run = self.runs / name
         run.mkdir()
-        self.write_json(run / "mesh_roster.json", entries)
+        self.write_json(run / "progress_history_state.json", {"owner_staff_id": self.owner.id})
+        for slot, value in entries.items():
+            assert isinstance(value, dict)
+            entry = cast(dict[str, object], value)
+            self.write_json(run / f"impl_worker_{slot}.json", {"staff_id": entry["staff_id"], "slot": slot})
+            with (run / f"impl_status_{slot}").open("w") as stream:
+                written = stream.write("implementing" if entry["status"] == "running" else "completed")
+                self.assertGreater(written, 0)
         return run
 
     def assigned(self, *rows: staff.StaffRow) -> None:
@@ -1586,9 +1428,9 @@ class WorkerResumeTests(StaffTestCase):
         claude = fixture_worker("claude-own", owner.id)
         idle = fixture_worker("idle-own", owner.id)
         self.assigned(codex, claude, idle)
-        first = self.roster("first", {"codex-own": {"staff_id": codex.id, "status": "running"},
+        first = self.child_run("first", {"codex-own": {"staff_id": codex.id, "status": "running"},
                                       "foreign": {"staff_id": foreign.id, "status": "running"}})
-        second = self.roster("second", {"codex-own": {"staff_id": codex.id, "status": "paused", "paused_turn": True},
+        second = self.child_run("second", {"codex-own": {"staff_id": codex.id, "status": "paused", "paused_turn": True},
                                         "idle-own": {"staff_id": idle.id, "status": "done"}})
         self.write_json(second / "impl_worker_impl.json", {"staff_id": claude.id, "slot": "impl", "model": "opus"})
         phase = second / "phases" / "build"
@@ -1601,48 +1443,19 @@ class WorkerResumeTests(StaffTestCase):
         self.assertEqual(read_tasks.call_count, 1)
         live = [result.seat for result in results if isinstance(result, Resumable)]
         waiting = [result.seat for result in results if isinstance(result, Idle)]
-        self.assertEqual({seat["staff_id"] for seat in live}, {codex.id, claude.id})
+        self.assertEqual({seat["staff_id"] for seat in live}, {claude.id})
         self.assertEqual([seat["staff_id"] for seat in waiting], [idle.id])
-        self.assertEqual(len(results), 3)
+        self.assertEqual(len(results), 2)
         self.assertEqual({seat["run_dir"] for seat in live}, {str(second)})
 
-    def test_capacity_workers_without_live_turns_are_idle(self) -> None:
-        owner = self.owner
-        child = fixture_worker("capacity", owner.id, backend=staff.CodexBackend(self.root / "codex"))
-        self.assigned(child)
-        run = self.roster("run", {})
-        for status in ("capacity_exhausted", "waiting_capacity"):
-            with self.subTest(status=status):
-                _ = (run / "mesh_roster.json").write_text(json.dumps({child.name: {"staff_id": child.id, "status": status}}))
-                results = inventory.worker_resumes(owner, staff.local_snapshot())
-                self.assertEqual([result.seat["staff_id"] for result in results if isinstance(result, Idle)], [child.id])
-                self.assertEqual(len(results), 1)
 
-    def test_roster_turn_state_wins_over_a_stale_slot_status(self) -> None:
-        owner = self.owner
-        child = fixture_worker("codex", owner.id, backend=staff.CodexBackend(self.root / "codex"))
-        self.assigned(child)
-        run = self.roster("run", {})
-        self.write_json(run / "impl_worker_impl.json", {"staff_id": child.id, "slot": "impl"})
-        for roster_status, slot_status, expected in (("running", "implemented", Resumable),
-                                                     ("done", "implementing", Idle)):
-            with self.subTest(roster=roster_status, slot=slot_status):
-                self.write_json(run / "mesh_roster.json", {child.name: {"staff_id": child.id, "status": roster_status}})
-                _ = (run / "impl_status_impl").write_text(slot_status + "\n")
-                results = inventory.worker_resumes(owner, staff.local_snapshot())
-                self.assertEqual(len(results), 1)
-                self.assertIsInstance(results[0], expected)
-                result = results[0]
-                assert isinstance(result, (Resumable, Idle))
-                self.assertEqual(result.seat["staff_id"], child.id)
-                self.assertEqual(result.seat["run_dir"], str(run))
 
     def test_newer_parent_run_without_the_worker_keeps_the_older_live_entry(self) -> None:
         owner = self.owner
         child = fixture_worker("working", owner.id)
         self.assigned(child)
-        older = self.roster("older", {child.name: {"staff_id": child.id, "status": "running"}})
-        newer = self.roster("newer", {})
+        older = self.child_run("older", {child.name: {"staff_id": child.id, "status": "running"}})
+        newer = self.child_run("newer", {})
         owned_runs.activate(newer, owner.current_session)
         os.utime(older, (1, 1))
         os.utime(newer, (2, 2))
@@ -1656,7 +1469,7 @@ class WorkerResumeTests(StaffTestCase):
         foreign = fixture_member("unit", name="foreign", parent=owner.id)
         _ = fixture_worker("foreign-worker", foreign.id)
         self.assigned(child)
-        run = self.roster("run", {child.name: {"staff_id": child.id, "status": "running"}})
+        run = self.child_run("run", {child.name: {"staff_id": child.id, "status": "running"}})
         active = self.runs / "active"
         active.mkdir()
         _ = (active / foreign.current_session).write_bytes(b"\xff")
@@ -1670,12 +1483,12 @@ class WorkerResumeTests(StaffTestCase):
         unassigned = fixture_worker("unassigned", owner.id)
         idle = fixture_worker("idle", owner.id)
         self.assigned(idle)
-        run = self.roster("run", {"unassigned": {"staff_id": unassigned.id, "status": "done"},
+        run = self.child_run("run", {"unassigned": {"staff_id": unassigned.id, "status": "done"},
                                   "idle": {"staff_id": idle.id, "status": "done"}})
         owned_runs.activate(run, owner.current_session)
         results = inventory.worker_resumes(owner, staff.local_snapshot())
         errors = {result.staff_id: result.reason for result in results if isinstance(result, Unavailable)}
-        self.assertIn("roster entry is unavailable", errors[missing.id])
+        self.assertIn("Claude child record is unavailable", errors[missing.id])
         self.assertIn("last assignment is unavailable", errors[unassigned.id])
         self.assertEqual([result.seat["staff_id"] for result in results if isinstance(result, Idle)], [idle.id])
         from scripts.lib.resume_message import ResumeWorkers, resume_message

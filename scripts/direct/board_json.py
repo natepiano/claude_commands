@@ -25,7 +25,6 @@ from zoneinfo import ZoneInfo
 
 from scripts.production import display_cells
 
-from scripts.agents import worker_lifecycle
 from scripts.direct import phase_table, plan_history
 from scripts.lib import unit_runs
 from scripts.production import session_staff, showrunners, staff, unit_run, unit_config
@@ -182,96 +181,56 @@ def read_pane_worker_rows(record: staff.StaffSnapshot) -> dict[staff.StaffId, li
         return PaneRowsUnreadable(str(error))
 
 
-def workers(session: Path, sources: set[Path], mesh_prefix: str = "", *,
+def worker_activity(session: Path, rows: list[dict[str, object]], record: staff.StaffSnapshot,
+                    sources: set[Path]) -> list[dict[str, object]]:
+    """Combine pane status with task settings and the latest worker post."""
+    tasks: dict[str, dict[str, object]] = {}
+    for path in session.glob("impl_worker_*.json"):
+        sources.add(path)
+        value = fields(cast(object, json.loads(path.read_text(encoding="utf-8"))))
+        member = record.by_id(staff.StaffId(text(value.get("staff_id"))))
+        if member is not None:
+            tasks[member.name] = value
+    posts: dict[str, str] = {}
+    log = session / "board.log"
+    if log.exists():
+        for line in log.read_text(encoding="utf-8").splitlines():
+            match = re.match(r"\S+ \[([^]]+)\] [^:]+: (.*)", line)
+            if match:
+                post = match[2].removeprefix("launcher: ")
+                posts[match[1]] = re.split(r"; (?:summary at|findings in)\s", post)[0].strip()[:80]
+    result: list[dict[str, object]] = []
+    for row in rows:
+        name = text(row.get("slot"))
+        task = tasks.get(name, {})
+        result.append({**row,
+                       **{key: task[key] for key in ("slot", "role", "model", "effort") if key in task},
+                       **({"doing": posts[name]} if name in posts else {})})
+    return result
+
+
+def workers(session: Path, sources: set[Path], *,
             record: staff.StaffSnapshot | unit_runs.RunStaffAtUse = unit_runs.RunStaffAtUse.LOCAL,
             pane_rows: dict[staff.StaffId, list[dict[str, object]]] | PaneRowsUnreadable | ReadPaneRows = ReadPaneRows.CURRENT) -> list[dict[str, object]]:
     try:
         record = staff.snapshot() if isinstance(record, unit_runs.RunStaffAtUse) else record
         state_path = session / unit_runs.STATE_FILE
-        transport = unit_runs.run_pin(session)
-        mesh_pinned = transport == "mesh"
-        if not mesh_pinned:
-            pane_rows = read_pane_worker_rows(record) if isinstance(pane_rows, ReadPaneRows) else pane_rows
-            if isinstance(pane_rows, PaneRowsUnreadable):
-                return [{"slot": "?", "role": "", "state": "incomplete", "model": "", "effort": "", "doing": pane_rows.reason}]
+        pane_rows = read_pane_worker_rows(record) if isinstance(pane_rows, ReadPaneRows) else pane_rows
+        if isinstance(pane_rows, PaneRowsUnreadable):
+            return [{"slot": "?", "role": "", "state": "incomplete", "model": "", "effort": "", "doing": pane_rows.reason}]
         owner: staff.StaffRow | unit_runs.RunOwnerUnrecorded = unit_runs.RunOwnerUnrecorded("run has no unit staff owner")
         if state_path.exists():
             state = cast(object, json.loads(state_path.read_text(encoding="utf-8")))
             if not isinstance(state, dict):
                 raise ValueError(f"{state_path}: expected an object")
             owner = unit_runs.run_owner(cast(dict[str, object], state), record)
-            if not mesh_pinned and isinstance(owner, staff.StaffRow) and isinstance(pane_rows, dict) and owner.id in pane_rows:
+            if isinstance(owner, staff.StaffRow):
                 sources.update((state_path, session, session / "board.log"))
-                return pane_rows[owner.id]
-        if transport == "herdr":
-            reason = owner.reason if isinstance(owner, unit_runs.RunOwnerUnrecorded) else f"{owner.name}: no local pane parent"
-            raise staff.StaffUnreadable(f"{session}: {reason}")
+                return worker_activity(session, pane_rows.get(owner.id, []), record, sources)
+        raise staff.StaffUnreadable(f"{session}: {owner.reason}")
     except (staff.StaffUnreadable, OSError, ValueError) as error:
         print(f"board_json: {session}: {error}", file=sys.stderr)
         return [{"slot": "?", "role": "", "state": "incomplete", "model": "", "effort": "", "doing": str(error)}]
-    try:
-        roster = read_object(session / "mesh_roster.json", required=mesh_pinned)
-    except (OSError, ValueError) as error:
-        return [{"name": "", "slot": "?", "role": "", "state": "incomplete", "model": "", "effort": "", "doing": str(error)}]
-    sources.update((session, session / "mesh_roster.json", session / "board.log"))
-    metadata = list(session.glob("impl_worker_*.json"))
-    sources.update(metadata)
-    by_name: dict[str, dict[str, object]] = {}
-    prefixes = {mesh_prefix} if mesh_prefix else set[str]()
-    for path in metadata:
-        entry = read_object(path)
-        entry["slot"] = text(entry.get("slot")) or path.stem.removeprefix("impl_worker_")
-        by_name[text(entry.get("name"))] = entry
-        name, slot = text(entry.get("name")), text(entry.get("slot"))
-        if name.endswith(f"-{slot}"):
-            prefixes.add(name[: -len(slot) - 1])
-
-    def short_slot(name: str) -> str:
-        for prefix in sorted(prefixes, key=len, reverse=True):
-            if name.startswith(f"{prefix}-"):
-                return name[len(prefix) + 1:]
-        return name
-
-    by_slot = {short_slot(text(entry.get("slot"))): entry for entry in by_name.values()}
-
-    def slot_for(name: str) -> str:
-        meta = by_name.get(name, {})
-        entry = fields(roster.get(name))
-        return short_slot(text(meta.get("slot")) or text(entry.get("slot")) or name)
-
-    selected: dict[str, str] = {}
-    for name in roster:
-        slot = slot_for(name)
-        current_name = text(by_slot.get(slot, {}).get("name"))
-        if current_name and selected.get(slot) == current_name:
-            continue
-        selected[slot] = name
-
-    newest: dict[str, str] = {}
-    try:
-        lines = (session / "board.log").read_text(encoding="utf-8").splitlines()
-    except (OSError, UnicodeError):
-        lines = []
-    for line in lines:
-        match = re.match(r"\S+ \[([^]]+)\] [^:]+: (.*)", line)
-        if match:
-            activity = match[2].removeprefix("launcher: ")
-            newest[slot_for(match[1])] = re.split(r"; (?:summary at|findings in)\s", activity, maxsplit=1)[0].strip()[:80]
-    result: list[dict[str, object]] = []
-    for slot, name in selected.items():
-        entry = fields(roster[name])
-        meta = by_name.get(name, {}) or by_slot.get(slot, {})
-        status = text(entry.get("status"))
-        settings = worker_lifecycle.recorded_turn_settings(entry)
-        model_label = f"{settings.model}:{settings.effort}" if settings.model and settings.effort else settings.model
-        state = {"done": "idle"}.get(status, status)
-        task = text(entry.get("task"))
-        role = text(entry.get("role")) or (task.removeprefix("direct.") if task.startswith("direct.") else "")
-        result.append({"name": name, "slot": slot, "role": role, "state": state,
-                       "model": "/".join(part for part in (text(meta.get("family")), model_label) if part),
-                       "effort": settings.effort,
-                       "doing": newest.get(slot, "")})
-    return result
 
 
 def phase_steps(events: list[dict[str, object]], clock: BoardClock, current: phase_table.OpenPhase | phase_table.NoOpenPhase) -> list[list[object]]:
@@ -391,7 +350,6 @@ def unit(unit_name: str, unit_id: staff.StaffId, worktree: Path, plan_text: str,
         sources.add(path)
         events = display_cells.run_events(path)
         worker_rows = workers(session_directory(found.run_id), sources,
-                              re.sub(r"[^a-zA-Z0-9._-]", "-", worktree.name)[:40],
                               record=resolver.record, pane_rows=pane_rows)
     header = events[0] if events else {}
     run_plan = text(header.get("project_plan_doc")) or text(header.get("plan_doc"))

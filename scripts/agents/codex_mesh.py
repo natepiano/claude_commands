@@ -10,7 +10,6 @@ except FileNotFoundError:
 import argparse
 import base64
 import contextlib
-import ctypes
 import errno
 import fcntl
 import importlib
@@ -232,9 +231,9 @@ SERVER_START_FILE = "mesh_server_start.json"
 SERVER_LOG = "mesh_server.log"
 ROSTER_FILE = "mesh_roster.json"
 # Runs a worker detached with mesh_runs.py: one `<run id>.json` record and `<run id>.log` each.
-DETACHED_RUNS_DIR = "mesh_runs"
+from scripts.agents.worker_lifecycle import DETACHED_RUNS_DIR
 # A run record written before its supervisor's pid counts as live for this long.
-DETACHED_RUN_START_GRACE_SECS = 60.0
+from scripts.agents.worker_lifecycle import DETACHED_RUN_START_GRACE_SECS
 # mesh_runs.py ends a run whose supervisor is gone; its delivery may wait on send.py.
 MESH_RUNS_SCRIPT = Path(__file__).with_name("mesh_runs.py")
 DEAD_RUN_END_TIMEOUT_SECS = 300
@@ -757,222 +756,7 @@ class SocketOnlyWait:
 SOCKET_ONLY_WAIT = SocketOnlyWait()
 
 
-class SocketReady(Enum):
-    """The watched connection can be read without blocking."""
-
-    READY = "ready"
-
-
-class WaitDeadlineExpired(Enum):
-    """No relevant event arrived before the monotonic wait deadline."""
-
-    EXPIRED = "expired"
-
-
-@dataclass(frozen=True)
-class StateFilesChanged:
-    paths: frozenset[Path]
-
-
-FileWaitResult = SocketReady | StateFilesChanged | WaitDeadlineExpired
-
-# inotify's parent watches discover replacements; only file watches subscribe
-# to content writes. Unrelated logs and heartbeats never enter our event queue.
-_IN_MODIFY = 0x00000002
-_IN_ATTRIB = 0x00000004
-_IN_MOVED_FROM = 0x00000040
-_IN_MOVED_TO = 0x00000080
-_IN_CREATE = 0x00000100
-_IN_DELETE = 0x00000200
-_IN_DELETE_SELF = 0x00000400
-_IN_MOVE_SELF = 0x00000800
-_IN_Q_OVERFLOW = 0x00004000
-_IN_IGNORED = 0x00008000
-_IN_REPLACEMENT = _IN_MOVED_FROM | _IN_MOVED_TO | _IN_CREATE | _IN_DELETE
-_IN_INVALIDATED = _IN_DELETE_SELF | _IN_MOVE_SELF | _IN_IGNORED
-
-
-@final
-class LinuxFileChanges:
-    """Watch state files directly, and names in parents only for replacements."""
-
-    def __init__(self, paths: set[Path]) -> None:
-        library = ctypes.CDLL(None, use_errno=True)
-        initialize = cast(Callable[[int], int], library.inotify_init1)
-        self._add_watch = cast(Callable[[int, bytes, int], int], library.inotify_add_watch)
-        self._remove_watch = cast(Callable[[int, int], int], library.inotify_rm_watch)
-        self.descriptor: int = initialize(os.O_CLOEXEC | os.O_NONBLOCK)
-        if self.descriptor < 0:
-            raise OSError(ctypes.get_errno(), "cannot watch follower state")
-        self.paths: set[Path] = paths
-        self.watches: dict[int, Path] = {}
-        self.directories: set[Path] = set()
-        try:
-            self._arm()
-        except BaseException:
-            self.close()
-            raise
-
-    def _arm(self) -> None:
-        wanted: dict[Path, int] = {}
-        for path in self.paths:
-            directory = path.parent
-            while not directory.is_dir():
-                directory = directory.parent
-            self.directories.add(directory)
-            wanted[directory] = _IN_REPLACEMENT | _IN_DELETE_SELF | _IN_MOVE_SELF
-            if path.is_file():
-                # ensure_server touches its record to extend the server lease.
-                # That metadata-only write does not change its serving identity.
-                wanted[path] = _IN_MODIFY | _IN_DELETE_SELF | _IN_MOVE_SELF
-                if path.name != SERVER_FILE:
-                    wanted[path] |= _IN_ATTRIB
-        for path, mask in wanted.items():
-            if path in self.watches.values():
-                continue
-            watch = self._add_watch(self.descriptor, os.fsencode(path), mask)
-            if watch < 0:
-                if ctypes.get_errno() == errno.ENOENT:
-                    continue  # The already armed parent reports the next creation.
-                raise OSError(ctypes.get_errno(), f"cannot watch {path}")
-            self.watches[watch] = path
-
-    def wait(self, connection: socket.socket, deadline: float) -> FileWaitResult:
-        while time.monotonic() < deadline:
-            ready, _, _ = select.select(
-                [connection, self.descriptor], [], [], max(0.0, deadline - time.monotonic()))
-            changed: set[Path] = set()
-            if self.descriptor in ready:
-                data = os.read(self.descriptor, 65536)
-                offset = 0
-                while offset < len(data):
-                    watch, mask, _cookie, length = struct.unpack_from("iIII", data, offset)
-                    name = os.fsdecode(data[offset + 16:offset + 16 + length].split(b"\0", 1)[0])
-                    offset += 16 + length
-                    path = self.watches.get(watch)
-                    if mask & _IN_Q_OVERFLOW:
-                        changed.update(self.paths)
-                    if path is None:
-                        continue
-                    if path in self.directories:
-                        target = path / name
-                        changed.update(wanted for wanted in self.paths
-                                       if target == wanted or target in wanted.parents)
-                        # A replacement's pathname now names a different inode.
-                        for old_watch, old_path in tuple(self.watches.items()):
-                            if old_path == target and old_path not in self.directories:
-                                _ = self._remove_watch(self.descriptor, old_watch)
-                                _ = self.watches.pop(old_watch, None)
-                    else:
-                        changed.add(path)
-                    if mask & _IN_INVALIDATED:
-                        _ = self.watches.pop(watch, None)
-                self._arm()
-            if changed:
-                return StateFilesChanged(frozenset(changed))
-            if connection in ready:
-                return SocketReady.READY
-        return WaitDeadlineExpired.EXPIRED
-
-    def close(self) -> None:
-        os.close(self.descriptor)
-
-
-@dataclass(frozen=True)
-class WatchedFileVersion:
-    """The identity and content-write timestamp of a named state file."""
-
-    inode: int
-    size: int
-    modified_ns: int
-
-
-class MissingWatchedFile(Enum):
-    MISSING = "missing"
-
-
-def _watched_file_version(path: Path) -> WatchedFileVersion | MissingWatchedFile:
-    try:
-        record = path.stat()
-        return WatchedFileVersion(record.st_ino, record.st_size, record.st_mtime_ns)
-    except FileNotFoundError:
-        return MissingWatchedFile.MISSING
-
-
-@final
-class KqueueFileChanges:
-    """Filter parent vnode events through the versions of the watched files."""
-
-    def __init__(self, paths: set[Path]) -> None:
-        self.paths: set[Path] = paths
-        self.queue: select.kqueue = select.kqueue()
-        self.watches: dict[Path, int] = {}
-        self.versions: dict[Path, WatchedFileVersion | MissingWatchedFile] = {
-            path: _watched_file_version(path) for path in paths}
-        try:
-            self._arm()
-        except BaseException:
-            self.close()
-            raise
-
-    def _arm(self) -> None:
-        wanted = set(self.paths)
-        for path in self.paths:
-            directory = path.parent
-            while not directory.is_dir():
-                directory = directory.parent
-            wanted.add(directory)
-        for path in wanted - self.watches.keys():
-            try:
-                descriptor = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
-            except FileNotFoundError:
-                continue
-            self.watches[path] = descriptor
-            flags = select.KQ_NOTE_WRITE | select.KQ_NOTE_DELETE | select.KQ_NOTE_RENAME
-            if path in self.paths and path.name != SERVER_FILE:
-                flags |= select.KQ_NOTE_ATTRIB
-            _ = self.queue.control([select.kevent(descriptor, filter=select.KQ_FILTER_VNODE,
-                flags=select.KQ_EV_ADD | select.KQ_EV_CLEAR, fflags=flags)], 0)
-
-    def wait(self, connection: socket.socket, deadline: float) -> FileWaitResult:
-        descriptor = connection.fileno()
-        _ = self.queue.control([select.kevent(descriptor, filter=select.KQ_FILTER_READ,
-            flags=select.KQ_EV_ADD | select.KQ_EV_CLEAR)], 0)
-        try:
-            while time.monotonic() < deadline:
-                events = self.queue.control([], 64, max(0.0, deadline - time.monotonic()))
-                changed: set[Path] = set()
-                if any(event.filter == select.KQ_FILTER_VNODE for event in events):
-                    for path in self.paths:
-                        version = _watched_file_version(path)
-                        if version != self.versions[path]:
-                            self.versions[path] = version
-                            changed.add(path)
-                            old_descriptor = self.watches.pop(path, -1)
-                            if old_descriptor >= 0:
-                                os.close(old_descriptor)
-                    for event in events:
-                        if (event.filter == select.KQ_FILTER_VNODE
-                                and event.fflags & (select.KQ_NOTE_DELETE | select.KQ_NOTE_RENAME)):
-                            for path, watched_descriptor in tuple(self.watches.items()):
-                                if watched_descriptor == event.ident:
-                                    os.close(self.watches.pop(path))
-                    self._arm()
-                if changed:
-                    return StateFilesChanged(frozenset(changed))
-                if any(event.filter == select.KQ_FILTER_READ and event.ident == descriptor for event in events):
-                    return SocketReady.READY
-            return WaitDeadlineExpired.EXPIRED
-        finally:
-            # No READ registration for an earlier connection may wake a moved worker.
-            with contextlib.suppress(OSError):
-                _ = self.queue.control([select.kevent(descriptor, filter=select.KQ_FILTER_READ,
-                    flags=select.KQ_EV_DELETE)], 0)
-
-    def close(self) -> None:
-        self.queue.close()
-        for descriptor in self.watches.values():
-            os.close(descriptor)
+from scripts.agents.worker_lifecycle import (SocketReady as SocketReady, WaitDeadlineExpired as WaitDeadlineExpired, StateFilesChanged as StateFilesChanged, FileWaitResult, LinuxFileChanges as LinuxFileChanges, KqueueFileChanges as KqueueFileChanges)
 
 
 @final
@@ -1980,59 +1764,10 @@ def _run_servers(session_dir: str) -> list[int]:
     return ports
 
 
-def _loaded_thread_ids(client: Client, deadline: float) -> set[str]:
-    threads: set[str] = set()
-    cursor = ""
-    seen: set[str] = set()
-    while time.monotonic() < deadline:
-        params: dict[str, object] = {"cursor": cursor} if cursor else {}
-        listed = _require(client.call("thread/loaded/list", params,
-                                      timeout=max(0.01, deadline - time.monotonic())), "thread/loaded/list")
-        data = listed.get("data")
-        if not isinstance(data, list):
-            raise SystemExit("server returned no loaded-thread list")
-        for item in cast(list[object], data):
-            if not isinstance(item, str) or not item:
-                raise SystemExit("server returned an invalid loaded-thread id")
-            threads.add(item)
-        next_cursor = listed.get("nextCursor")
-        if next_cursor is None or next_cursor == "":
-            return threads
-        if not isinstance(next_cursor, str) or next_cursor in seen:
-            raise SystemExit("server returned an invalid loaded-thread cursor")
-        cursor = next_cursor
-        seen.add(cursor)
-    TransportDeadline(deadline, worker_lifecycle.effective_deadline()).check_operation()
-    raise SystemExit("loaded-thread list timed out")
+from scripts.herdr.herdr import loaded_thread_ids as _loaded_thread_ids
 
 
-def loaded_threads(run: Path, deadline: float) -> set[str]:
-    """Observe every live run server completely within one monotonic deadline."""
-    records: list[tuple[Path, dict[str, object]]] = []
-    records = [(run / SERVER_FILE, record) for record in _recorded_run_servers(str(run))]
-    loaded: set[str] = set()
-    ports: set[int] = set()
-    for path, record in records:
-        port, pid = record["port"], record["pid"]
-        if type(port) is not int or not 0 < port <= 65535:
-            raise worker_lifecycle.WorkerStateUnreadable(path, "invalid server port")
-        assert isinstance(pid, int)
-        if not _pid_alive(pid) or port in ports:
-            continue
-        ports.add(port)
-        try:
-            if time.monotonic() >= deadline:
-                raise TimeoutError("loaded-thread observation timed out")
-            client = Client(port, f"staff-fill-{os.getpid()}", operation_deadline=deadline)
-            try:
-                loaded.update(_loaded_thread_ids(client, deadline))
-            finally:
-                client.close()
-        except worker_lifecycle.OperationDeadlineExpired:
-            raise
-        except (SystemExit, OSError, ValueError) as error:
-            raise ValueError(f"{path}: Codex thread activity is unavailable: {error}") from error
-    return loaded
+from scripts.herdr.herdr import loaded_threads as loaded_threads
 
 
 def _server_holds(port: int, thread_id: str) -> bool:
@@ -4773,7 +4508,7 @@ def _on_quiet_poll(stream: TurnStream, log: TextIO) -> StreamStep | FailedWithTh
         return StreamStep.FINISH
     if stream.resident:
         entry = _as_dict(_read_json_object(_session_path(stream.session_dir, ROSTER_FILE)).get(stream.name))
-        if (_finished_run(stream.session_dir) or entry.get("status") in ("done", "failed", "paused", "ended")):
+        if (finished_run_status(stream.session_dir) or entry.get("status") in ("done", "failed", "paused", "ended")):
             if _ended_unseen(stream.client, stream.thread_id):
                 if stream.client.has_pending_frames:
                     stream.state_change_owed = True
@@ -6582,18 +6317,6 @@ def command_list(args: argparse.Namespace) -> int:
     return 0
 
 
-def _finished_run(session_dir: str) -> str:
-    """Name how this run finished, or "" while it has not.
-
-    `progress_history.py finish-run` stamps the run's progress state with its
-    final status and `finished_at`; start-phase can explicitly reactivate it.
-    """
-    state = _read_json_object(_session_path(session_dir, plan_history.STATE_FILENAME))
-    status = _as_str(state.get("status"))
-    if not status or status == "active" or "finished_at" not in state:
-        return ""
-    return status
-
 
 def command_reopen(args: argparse.Namespace) -> int:
     """Recover an ended or abandoned worker without creating a new thread."""
@@ -6603,7 +6326,7 @@ def command_reopen(args: argparse.Namespace) -> int:
         record = _lookup(session_dir, name)
         if record.get("held_design_id"):
             raise SystemExit("codex_mesh: held roles recover through design_roles.py")
-        finished = _finished_run(session_dir)
+        finished = finished_run_status(session_dir)
         if finished:
             print(f"codex_mesh: run finished ({finished}); use progress_history.py start-phase to reactivate this run, "
                   + f"or workers.py resolve --session-dir <new-run> --role {_as_str(session_staff.worker_name(record)) or 'impl'} "
@@ -6705,9 +6428,7 @@ def _recovery_idle_reason(session_dir: str, name: str, thread_id: str) -> str:
         return f"cannot establish idle state: {error}"
 
 
-def finished_run_status(session_dir: str) -> str:
-    """Public run-lifetime check used before a unit allocates any worker."""
-    return _finished_run(session_dir)
+from scripts.agents.worker_lifecycle import finished_run_status as finished_run_status
 
 
 def worker_launcher_attached(record: Mapping[str, object]) -> bool:
@@ -6742,7 +6463,7 @@ def _worker_idle_reason_with_inbox(
         return "missing thread id"
     if record.get("held_design_id"):
         return "held roles transfer through design_roles.py"
-    if not paused and unit_workers.allocation_is_live(record) and not _finished_run(session_dir):
+    if not paused and unit_workers.allocation_is_live(record) and not finished_run_status(session_dir):
         return "worker is reserved for its next dispatch"
     if worker_launcher_attached(record):
         return "launcher is attached"
@@ -8209,8 +7930,7 @@ def _server_ownership(
                 or (quiet is not None and quiet < SERVER_IDLE_SECS)
             ):
                 return CurrentRunServer(folder)
-        from scripts.astra import design_roles
-        for folder in design_roles.durable_meshes():
+        for folder in _durable_meshes():
             if _record_names_server(_read_json_object(folder / SERVER_FILE), pid, port) and any(
                 _as_dict(entry).get("held_design_id")
                 for entry in _read_json_object(folder / ROSTER_FILE).values()
@@ -8647,7 +8367,7 @@ def command_signin_changed(args: argparse.Namespace) -> int:
         from scripts.astra import design_roles
         design_staff: staff.StaffSnapshot | None = None
         folders = sorted({path.parent for root in roots for path in root.glob(f"*/{SERVER_FILE}")}
-                         | set(design_roles.durable_meshes()))
+                         | set(_durable_meshes()))
         for folder in folders:
             deadline = worker_lifecycle.effective_deadline()
             with _bulk_workers(str(folder), deadline=deadline, allow_held_roles=True) as operation, _server_lock(str(folder), deadline=deadline):
@@ -9613,6 +9333,14 @@ def main(argv: list[str] | None = None) -> int:
     except (RoleMapUnavailable, RoleAccountUnavailable) as error:
         print(error, file=sys.stderr)
         return 1
+
+
+
+
+def _durable_meshes() -> tuple[Path, ...]:
+    from scripts.astra import design_roles
+
+    return tuple(sorted(path.parent for path in design_roles.state_root().glob("*/mesh/mesh_roster.json")))
 
 
 if __name__ == "__main__":

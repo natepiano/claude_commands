@@ -3,7 +3,6 @@ from __future__ import annotations
 
 from scripts.shutdown import remote
 
-import argparse
 import io
 import json
 import os
@@ -18,17 +17,13 @@ from typing import Literal, cast
 from unittest import mock
 
 from scripts.accounts import accounts
-from scripts.agents import codex_mesh
-from scripts.direct import progress_history
-from scripts.lib import models_registry
-from scripts.lib.test_models_registry import registry_text
 from scripts.message import sessions
 from scripts.production import session_staff, staff, unit_move
 from scripts.production.add_unit_test_support import AddUnitTestCase
 from scripts.production.cli_fixture import invoke_cli
 from scripts.production.rename_unit_test_support import FolderRenameFixture, FolderSessionFixture
 from scripts.production.rename_rerun_test_support import file_versions, saved_fixture
-from scripts.production.staff_test_support import fixture_member, fixture_runtime_id, fixture_worker
+from scripts.production.staff_test_support import fixture_member, fixture_worker
 from scripts.shutdown import pane_record, restart, shutdown_record
 from scripts.herdr import herdr
 
@@ -171,9 +166,9 @@ class UnitFolderMoveTests(FolderRenameFixture):
                         self.assertEqual(result.stderr, "")
                     self.assert_finished_rerun(backend)
 
-    def test_history_mesh_and_launch_files_keep_their_bytes_and_times(self) -> None:
-        files = (self.records / "agents.json", self.root / "runs/mesh_roster.json",
-                 self.root / "runs/progress_history_state.json", self.root / "history.jsonl")
+    def test_history_and_launch_files_keep_their_bytes_and_times(self) -> None:
+        files = (self.records / "agents.json", self.root / "runs/progress_history_state.json",
+                 self.root / "history.jsonl")
         text = json.dumps({"session_id": self.owner.current_session, "cwd": str(self.source),
                            "branch": "cargo-liner-source", "queued_message": "Keep this task"}) + "\n"
         for path in files:
@@ -477,10 +472,6 @@ class UnitFolderMoveTests(FolderRenameFixture):
     def test_missing_launch_record_prints_one_line_and_finishes_the_move(self) -> None:
         self.test_missing_launch_record_finishes_the_move_without_writing_one()
 
-    def test_failed_worker_pause_prints_one_line_and_finishes_the_move(self) -> None:
-        with mock.patch.object(codex_mesh, "command_stop", return_value=1) as pause:
-            self.test_running_unit_stops_moves_and_resumes_current_session()
-        pause.assert_not_called()
 
     def test_crash_after_git_move_finishes_staff_paths_and_starts_the_unit(self) -> None:
         backend = FolderSessionFixture(self.owner, live=False)
@@ -607,16 +598,6 @@ class UnitFolderMoveTests(FolderRenameFixture):
                 self.assertEqual((backend.starts, backend.stops), ([], []))
                 restore()
 
-    def test_each_run_mesh_is_paused_when_the_unit_has_two_histories(self) -> None:
-        paths = tuple(self.root / "runs" / name / "mesh_roster.json" for name in ("first", "second"))
-        for path in paths:
-            path.parent.mkdir(parents=True)
-            _ = path.write_text('{"queued_message": "Keep this task"}\n')
-        before = [(path.read_bytes(), path.stat().st_mtime_ns) for path in paths]
-        with mock.patch.object(codex_mesh, "command_stop") as pause:
-            self.test_move_reads_only_members_and_resumes_their_current_sessions()
-        pause.assert_not_called()
-        self.assertEqual([(path.read_bytes(), path.stat().st_mtime_ns) for path in paths], before)
 
     def test_stopped_unit_with_a_closed_pane_moves_records_without_starting(self) -> None:
         self.test_stopped_unit_with_a_closed_pane_stays_stopped()
@@ -686,59 +667,6 @@ class UnitFolderMoveTests(FolderRenameFixture):
         self.test_move_reads_only_members_and_resumes_their_current_sessions()
 
 
-    def test_next_worker_dispatch_uses_the_moved_run_folder(self) -> None:
-        from scripts.agents import codex_mesh
-
-        run = self.root / "runs/move-run"
-        run.mkdir(parents=True)
-        _ = (run / "progress_history_state.json").write_text(json.dumps({
-            "owner_staff_id": str(self.owner.id), "status": "active", "run_id": "move-run",
-            "plan_doc": "kept.txt", "branch": "cargo-liner-source"}))
-        backend = FolderSessionFixture(self.owner, live=False)
-        with backend.installed():
-            result = self.move_folder()
-        self.assertEqual(result.returncode, 0, result.stderr)
-        native = fixture_runtime_id("worker-after-folder-move")
-        state = cast(Callable[[Path], dict[str, object]], getattr(progress_history, "_read_state"))(run)
-        requests: list[tuple[str, dict[str, object]]] = []
-
-        def request(_client: object, method: str, params: dict[str, object], **_options: object) -> dict[str, object]:
-            requests.append((method, params.copy()))
-            return {"thread": {"id": native}} if method == "thread/start" else {"turn": {"id": "first-turn"}}
-
-        client = mock.Mock()
-        client.configure_mock(**{"call.return_value": {"result": {}}})
-        def model(command: list[str], **options: object) -> subprocess.CompletedProcess[str]:
-            del options
-            self.assertEqual(command[:2], ["bash", "-c"])
-            self.assertIn("agents_resolve", command[2])
-            output = "gpt-fixture\nhigh\n" if "mesh-turn" in command else "codex gpt-fixture high default\n"
-            return subprocess.CompletedProcess(command, 0, output, "")
-
-        inherited = models_registry.LaunchModelConfiguration(self.root / "models.conf", registry_text(), ())
-        configuration = models_registry.launch_configuration(inherited.environment(os.environ))
-        with (mock.patch.dict(os.environ, configuration.environment(os.environ)),
-              mock.patch.object(subprocess, "run", side_effect=model),
-              mock.patch.object(codex_mesh, "workers_home", return_value=self.root / "home/.codex2"),
-              mock.patch.object(codex_mesh, "ensure_server", return_value=(12345, False)) as server,
-              mock.patch.object(codex_mesh, "Client", return_value=client),
-              mock.patch.object(codex_mesh, "_bind_serving_server"),
-              mock.patch.object(codex_mesh, "_serving_request", side_effect=request)):
-            opened = codex_mesh.open_unit_worker(str(run), "impl1", "impl", configuration=configuration)
-            self.assertEqual(session_staff.worker_session(opened, staff.local_snapshot()), native)
-            self.assertEqual(server.call_args.kwargs["cwd"], str(self.destination))
-            self.assertEqual(requests[0][1]["cwd"], str(self.destination))
-            arguments = argparse.Namespace(turn_cwd=state["working_dir"], session_dir=str(run), name="impl1",
-                                           model="gpt-fixture", effort="high", service_tier="default")
-            start = cast(Callable[..., str], getattr(codex_mesh, "_start_turn"))
-            with mock.patch.object(codex_mesh, "_turn_service_tier", return_value="default"):
-                self.assertEqual(start(client, arguments, native, codex_mesh.WORKER_SANDBOX, "Continue the task."), "first-turn")
-        self.assertEqual(requests[-1][0], "turn/start")
-        self.assertEqual(requests[-1][1]["cwd"], str(self.destination))
-        worker = staff.snapshot().by_current_session(native)
-        self.assertIsInstance(worker, staff.StaffRow)
-        assert isinstance(worker, staff.StaffRow)
-        self.assertEqual(worker.parent, staff.ReportsTo(self.owner.id))
 
 
 class FolderBranchRecoveryTests(FolderRenameFixture):

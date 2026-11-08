@@ -13,7 +13,6 @@ from pathlib import Path
 from typing import override
 from unittest.mock import patch
 
-from scripts.direct import workers
 from scripts.copies import copies
 from scripts.production.cli_fixture import ImmutableGitSeed
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
@@ -28,7 +27,7 @@ REMOVE_RUN_SCRATCH = Path(__file__).with_name("remove_run_scratch.py")
 
 
 class EndSessionTests(unittest.TestCase):
-    """A roster remains terminal even when its app-server record is gone."""
+    """Run cleanup keeps other directors' files."""
 
     temporary: tempfile.TemporaryDirectory[str]  # pyright: ignore[reportUninitializedInstanceVariable]
     root: Path  # pyright: ignore[reportUninitializedInstanceVariable]
@@ -49,7 +48,9 @@ class EndSessionTests(unittest.TestCase):
         session_id = fixture_runtime_id(f"end-session:{self.root.name}")
         _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
         owner = fixture_member("showrunner", name="end-owner")
-        _ = fixture_member("unit", name="end-unit", parent=owner.id, runtime_id=session_id)
+        member = fixture_member("unit", name="end-unit", parent=owner.id, runtime_id=session_id)
+        with (self.session_dir / "progress_history_state.json").open("w") as handle:
+            json.dump({"owner_staff_id": member.id}, handle)
         active_root = self.root / "active"
         active_root.mkdir()
         self.marker = active_root / session_id
@@ -60,9 +61,7 @@ class EndSessionTests(unittest.TestCase):
 
         scripts = self.root / "scripts"
         direct_dir = scripts / "direct"
-        agents = scripts / "agents"
         direct_dir.mkdir(parents=True)
-        agents.mkdir()
         (scripts / "lib").mkdir()
         (scripts / "copies").mkdir()
         (scripts / "copies/copies.py").symlink_to(Path(copies.__file__))
@@ -72,7 +71,6 @@ class EndSessionTests(unittest.TestCase):
         # Import the real package, so the script's current imports resolve.
         (direct_dir / "remove_run_scratch.py").symlink_to(REMOVE_RUN_SCRATCH)
         _ = (direct_dir / "remove_workers.py").write_text("", encoding="utf-8")
-        (agents / "codex_mesh.py").symlink_to(END_SESSION.parents[1] / "agents" / "codex_mesh.py")
 
         python_shim = scripts / "lib" / "py"
         _ = python_shim.write_text(
@@ -170,28 +168,6 @@ class EndSessionTests(unittest.TestCase):
                 self.assertTrue(tree.exists())
             self.assertFalse(self.marker.exists())
 
-    def test_roster_without_server_record_still_runs_mesh_stop(self) -> None:
-        parent = staff.local_snapshot().by_current_session(self.session_id)
-        assert parent is not None
-        worker = fixture_worker("project-impl", parent.id)
-        _ = (self.session_dir / "mesh_roster.json").write_text(json.dumps({
-            "project-impl": {"staff_id": worker.id, "status": "done"},
-        }), encoding="utf-8")
-        result = self.run_end(self.environment())
-
-        self.assertEqual(result.returncode, 0, result.stderr)
-        calls = self.calls.read_text(encoding="utf-8").splitlines()
-        self.assertEqual(len(calls), 5)
-        self.assertTrue(calls[0].endswith(f"astra/design_roles.py unbind-run {self.session_dir}"))
-        self.assertIn("remove_workers.py --session-dir", calls[1])
-        self.assertIn("codex_mesh.py stop", calls[2])
-        self.assertIn("--pause", calls[2])
-        self.assertIn("--session-dir", calls[2])
-        self.assertIn(str(self.session_dir), calls[2])
-        self.assertFalse(any("codex_mesh.py sweep" in call for call in calls))
-        self.assertTrue(calls[3].endswith(f"remove_run_scratch.py --tracked {self.session_dir}"))
-        self.assertTrue(calls[4].endswith("copies/copies.py remove"))
-        self.assertFalse(self.marker.exists())
 
     def make_run(self, name: str, director: str) -> Path:
         run = self.runs / name
@@ -200,7 +176,6 @@ class EndSessionTests(unittest.TestCase):
         _ = (run / "phases" / "p3" / "review.diff").write_text("diff\n", encoding="utf-8")
         (run / "p62_bin").mkdir()
         _ = (run / "p62_bin" / "CACHEDIR.TAG").write_text("tag\n", encoding="utf-8")
-        _ = (run / "mesh_server.json").write_text("{}", encoding="utf-8")
         membership = staff.local_snapshot()
         parent = membership.by_current_session(director)
         if parent is None:
@@ -209,8 +184,6 @@ class EndSessionTests(unittest.TestCase):
                                     runtime_id=fixture_runtime_id(director))
         _ = (run / "progress_history_state.json").write_text(
             json.dumps({"owner_staff_id": parent.id}), encoding="utf-8")
-        member = fixture_worker(name, parent.id)
-        _ = (run / "mesh_roster.json").write_text(json.dumps({name: {"staff_id": member.id, "status": "done"}}))
         return run
 
     def test_every_run_the_director_holds_is_cleaned_and_no_other(self) -> None:
@@ -229,19 +202,12 @@ class EndSessionTests(unittest.TestCase):
                                                     if "remove_workers.py" in call) for line in unbinds))
         removal = next(line for line in calls if "remove_workers.py" in line)
         self.assertEqual(removal.split()[1:], ["--session-dir", str(marked), "--session-dir", str(side)])
-        stops = [line.split()[line.split().index("--session-dir") + 1]
-                 for line in calls if "codex_mesh.py stop" in line]
-        self.assertTrue(all("--pause" in line.split() for line in calls if "codex_mesh.py stop" in line))
-        self.assertEqual(stops, [str(marked), str(side)])
-        sweeps = [line for line in calls if "codex_mesh.py sweep" in line]
-        self.assertEqual(sweeps, [])
         self.assertNotIn(str(other), "\n".join(calls))
         for run in (marked, side):
             self.assertFalse((run / "verify_cache").exists())
             self.assertFalse((run / "phases" / "p3" / "gate").exists())
             self.assertFalse((run / "p62_bin").exists())
             self.assertTrue((run / "phases" / "p3" / "review.diff").is_file())
-            self.assertTrue((run / "mesh_server.json").is_file())
         self.assertTrue((other / "verify_cache").is_dir())
         self.assertTrue((other / "phases" / "p3" / "gate" / ".git").is_dir())
         self.assertTrue((other / "p62_bin").is_dir())
@@ -293,17 +259,10 @@ class EndSessionTests(unittest.TestCase):
         environment.update({"UNIT_WORKERS_STATE": str(self.root / "unit-workers"),
             "SCRATCH_ROOT": str(scratch.parent), "SCRATCH_VISIBLE_ROOT": str(self.root / "visible-scratch"),
             "SCRATCH_HOLDS": str(self.root / "scratch-holds.json")})
-        with patch.dict(os.environ, environment, clear=True):
-            store = workers.UnitWorkerLedger(workers.ledger_path("demo", "builders"))
-            with store.locked() as ledger:
-                ledger.workers["w7"] = workers.UnitWorker("w7", "impl", "codex", "sol", "high", {},
-                    workers.CodexThread(member.current_session, str(self.root / "codex")), workers.Paused(),
-                    [workers.WorkerEvent("opened", "fixture", str(run), 1.0)], staff_id=member.id)
         result = self.run_end(environment)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertTrue(command_cwd.is_dir(), result.stdout + result.stderr)
         self.assertFalse(unused.exists(), result.stdout + result.stderr)
-        self.assertTrue(store.path.exists())
 
 
 

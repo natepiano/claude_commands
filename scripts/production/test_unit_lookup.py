@@ -401,7 +401,6 @@ print(observed.row.id)
         run.mkdir(parents=True)
         _ = (run / "director").write_text(owner.id)
         worker = fixture_worker("fix", owner.id, runtime_id=fixture_runtime_id("worker-thread"), backend=staff.CodexBackend(self.root / "codex-home"))
-        _ = (run / "mesh_roster.json").write_text(json.dumps({"fix": {"staff_id": worker.id, "status": "running"}}))
         registered = [{"name": "show", "session": "runner", "socket": "", "zone": "UTC", "doc": "/unused"}]
         with (mock.patch.object(unit_labels, "newest_sessions", return_value=[session]),
               mock.patch.object(unit_labels, "registered_showrunners", return_value=registered),

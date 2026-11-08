@@ -9,7 +9,6 @@ except FileNotFoundError:
 import argparse
 import json
 import os
-import signal
 import subprocess
 import sys
 import time
@@ -47,8 +46,6 @@ class WorkerUnavailable(Exception):
     """No safe ownership transition can be made from the current evidence."""
 
 
-class ClaudeCommandLookup(Protocol):
-    def claude_bin(self) -> str: ...
 
 
 class TitleRenderer(Protocol):
@@ -667,8 +664,6 @@ def director_pid(run: Path) -> int:
     raise WorkerUnavailable("run director pid is unknown; pass --owner-pid <pid>")
 
 
-def _write_inbox(handle: worker_lifecycle.WorkerStateFile, record: Mapping[str, object]) -> None:
-    handle.publish(json.dumps(record if record else worker_lifecycle.empty_inbox()))
 
 
 def _ledger_path(identity: staff.StaffId) -> Path:
@@ -681,13 +676,6 @@ def ledger_path(production: str, unit: str) -> Path:
     return _ledger_path(owner.id)
 
 
-def _runs(ledger: UnitWorkers) -> tuple[Path, ...]:
-    runs: set[Path] = set()
-    for worker in ledger.workers.values():
-        runs.update(Path(event.run) for event in worker.events)
-        if isinstance(worker.ownership, HeldBy):
-            runs.add(Path(worker.ownership.run))
-    return tuple(sorted(runs))
 
 
 def live_detached_runs(run: Path) -> tuple[tuple[Path, dict[str, object]], ...]:
@@ -709,15 +697,14 @@ def protected_working_directories(run: Path) -> tuple[Path, ...]:
 
 def retained_detached_runs(run: Path) -> tuple[tuple[Path, dict[str, object]], ...]:
     """Commands owned by unit workers, including workers about to be paused."""
-    store = ledger_for_run(run)
-    if not store.path.exists():
-        return ()
-    with store.locked() as ledger:
-        retained = {worker.name for worker in ledger.workers.values()
-                    if not isinstance(worker.ownership, Retired)}
-        return tuple((path, record) for history in _runs(ledger)
-                     for path, record in live_detached_runs(history)
-                     if record.get("worker") in retained)
+    membership = staff.local_snapshot()
+    owner = worker_admission.parent(membership, run=run)
+    members = membership.find(kind="worker", parent=owner.id)
+    references = {str(row.id) for row in members}
+    histories = {run, *(path for row in members for path in session_staff.worker_run_index(membership).get(row.id, ()))}
+    return tuple((path, record) for history in sorted(histories)
+                 for path, record in live_detached_runs(history)
+                 if record.get("staff_id") in references)
 
 
 def held_claude_sessions() -> set[str]:
@@ -726,90 +713,14 @@ def held_claude_sessions() -> set[str]:
             if isinstance(record.backends.get(row.id), staff.ClaudeBackend)}
 
 
-def end_unit(owner: staff.StaffRow) -> None:
-    from scripts.agents import codex_mesh
-    # Run cleanup reads this ledger too; load only its binary lookup interface
-    # here so neither module owns a static import cycle.
-    with worker_lifecycle.operation_deadline(timeout=codex_mesh.THREAD_RELEASE_TIMEOUT_SECS):
-        remove_workers = cast(ClaudeCommandLookup, cast(object, import_module("scripts.direct.remove_workers")))
-        store = UnitWorkerLedger(_ledger_path(owner.id))
-        if not store.path.exists():
-            return
-        saved = _read(store.path)
-        if saved.get("history") and not saved.get("workers"):
-            return
-        with store.locked() as ledger:
-            membership = staff.local_snapshot()
-            histories = _runs(ledger)
-            with worker_lifecycle.membership_operation(*histories):
-                for name, worker in list(ledger.workers.items()):
-                    member = membership.by_id(worker.staff_id)
-                    if member is None or not member.reports_to(owner.id):
-                        continue
-                    for run in histories:
-                        if not run.is_dir():
-                            continue
-                        with worker_lifecycle.membership_operation(run):
-                            with worker_lifecycle.lock_worker(run, name):
-                                with worker_lifecycle.locked_state(session_staff.worker_inbox_path(run, name)) as inbox:
-                                    pending = inbox.read_object()
-                                    raw_messages = pending.get("messages")
-                                    queued = [item for item in cast(list[object], raw_messages) if isinstance(item, str)] if isinstance(raw_messages, list) else []
-                                    for message in queued:
-                                        print(f"cancelled pending message of {name}: {message}")
-                                    _write_inbox(inbox, {})
-                                current = _object(_read_roster(run).get(name))
-                                if isinstance(worker.backend, CodexThread) and current:
-                                    result = codex_mesh.end_worker_locked(argparse.Namespace(session_dir=str(run), to=name))
-                                    if result:
-                                        raise WorkerUnavailable(f"cannot end worker {name} in {run}; retry retirement")
-                                for path, detached in live_detached_runs(run):
-                                    if detached.get("worker") != name:
-                                        continue
-                                    pid = detached["pid"]
-                                    if isinstance(pid, int) and mesh_run_process.supervises(pid, path):
-                                        try:
-                                            os.kill(pid, signal.SIGTERM)
-                                        except ProcessLookupError:
-                                            pass
-                                        print(f"cancelled detached run {path.stem} of {name} (pid {pid})")
-                                with _roster_locked(run) as (handle, roster):
-                                    record = _object(roster.get(name))
-                                    if not record:
-                                        continue
-                                    if record.get("continuation_owed"):
-                                        print(f"cancelled owed continuation of {name}")
-                                    if record.get("allocation_pending"):
-                                        print(f"cancelled reservation of {name}")
-                                    clear_allocation(record)
-                                    record.update({"continuation_owed": False, "status": "ended"})
-                                    codex_mesh.advance_worker_roster_revision(record)
-                                    _write_roster(handle, roster)
-                            # Worker locks are released before the retirement projection.
-                    if isinstance(worker.backend, ClaudeSession):
-                        claude = remove_workers.claude_bin()
-                        result = subprocess.run([claude, "rm", worker.backend.session_id], capture_output=True,
-                                                text=True, timeout=30, check=False)
-                        if result.returncode:
-                            raise WorkerUnavailable(f"cannot end Claude worker {name}: {result.stderr.strip()}")
-                    store.record_end(ledger, member.id, worker, histories[-1] if histories else store.path.parent)
-                    _ = staff.retire(member.id)
-                    del ledger.workers[name]
-                    worker.ownership = Retired()
-                    print(f"ended worker {name}: {store.path}")
-        if not ledger.history and not ledger.workers and not ledger.unresolved:
-            store.path.unlink(missing_ok=True)
 
 
 def shown_name(run: Path, address: str, *, role: str = "", held_design_id: str = "", held_role: str = "") -> str:
     """Render current unit context and stored assignment without changing the address."""
-    from scripts.agents import codex_mesh
     titles = cast(TitleRenderer, cast(object, import_module("scripts.message.roster")))
-    record = _object(_read_roster(run).get(address))
-    if held_design_id or record.get("held_design_id"):
-        return titles.mesh_title(str(run), address, {
-            **record, "held_design_id": held_design_id or record.get("held_design_id", ""),
-            "held_role": held_role or record.get("held_role", "")})
+    record: dict[str, object] = {}
+    if held_design_id:
+        return titles.mesh_title(str(run), address, {"held_design_id": held_design_id, "held_role": held_role})
     membership = staff.local_snapshot()
     member = worker_admission.member(run, address, membership)
     if member is None:
@@ -820,12 +731,17 @@ def shown_name(run: Path, address: str, *, role: str = "", held_design_id: str =
     if parent.kind != "unit":
         return titles.mesh_title(str(run), address, record)
     owner = membership.parent_of(parent)
+    assigned_role = role
+    if not assigned_role:
+        from scripts.direct import progress_history
+        dispatch = progress_history.last_dispatch(member.id)
+        assigned_role = dispatch.role if isinstance(dispatch, progress_history.RecordedDispatch) else ""
     jobs: dict[str, JobKey] = {"impl": "implementer", "test": "tester", "fix": "repair_worker",
                                "review": "code_reviewer"}
     peers = [row.name for row in membership.find(kind="worker", parent=parent.id)]
     ordinal = peers.index(address) + 1
     return titles.unit_worker_title(owner.name if owner is not None else "", parent.name,
-                                    jobs.get(role or _worker_task_role({"staff_id": member.id}, membership, codex_mesh.task_assignments()), "worker"),
+                                    jobs.get(assigned_role, "worker"),
                                     ordinal, address)
 
 

@@ -469,8 +469,6 @@ class NativePaneSessionTests(StaffTestCase):
                     _ = herdr.native_process(998073, "codex")
 
 
-
-
 class CodexAnomalyNameTests(StaffTestCase):
     @override
     def setUp(self) -> None:
@@ -1602,8 +1600,6 @@ class PromptSubmissionTests(unittest.TestCase):
         self.assertLessEqual(self.elapsed, 30)
 
 
-
-
     def test_enter_retry_uses_the_real_target_check_and_key_transport(self) -> None:
         self.submit_on_enter = 1
         commands: list[tuple[str, ...]] = []
@@ -1872,8 +1868,6 @@ class LaunchDestinationTests(StaffTestCase):
                 signalled.assert_not_called()
 
 
-
-
     def test_refused_environment_command_never_starts_an_agent(self) -> None:
         client = herdr.Herdr("agents")
         commands: list[tuple[str, ...]] = []
@@ -2026,8 +2020,6 @@ class ConfirmedPaneCloseTests(unittest.TestCase):
             closed.assert_called_once_with("w1:p1")
             self.assertEqual(errors.getvalue(), "herdr fixture:w1:p1: closure is pending; record retained\n")
             self.assertEqual(pane_launch.read_strict(path)["w1:p1"], entry)
-
-
 
 
     def test_a_pane_that_stays_open_keeps_its_launch_record(self) -> None:
@@ -2831,7 +2823,6 @@ class HerdrTests(unittest.TestCase):
         self.assertEqual(calls[2], opener)
         self.assertEqual(calls[3:5], [["--session", "fixture", "status", "server"]] * 2)
         self.assertFalse(any(row[2:] == ["server"] or row[2:4] == ["workspace", "close"] for row in calls))
-
 
 
     def test_darwin_server_start_does_not_inherit_the_heal_proof(self) -> None:
@@ -5194,8 +5185,6 @@ class HerdrTests(unittest.TestCase):
                     _ = client.panes()
 
 
-
-
     def test_tab_sessions_rejects_invalid_workspace_labels(self) -> None:
         self.configure_herdr(["pane", "list"], json.dumps({"result": {"panes": []}}))
         self.configure_herdr(["workspace", "list"], json.dumps({"result": {"workspaces": [
@@ -5383,10 +5372,6 @@ class HerdrTests(unittest.TestCase):
         self.assertEqual([call.args for call in pause.call_args_list], [(0.1,), (0.1,)])
 
 
-
-
-
-
     def test_read_sources_formats_keys_and_close(self) -> None:
         client = self.herdr
         with (patch.object(client, "panes", return_value=[{
@@ -5534,7 +5519,6 @@ class HerdrTests(unittest.TestCase):
         config = self.root / "account file.json"
         self.assertEqual(str(herdr.UnreadableTrustFile(self.root, config, "PermissionError")),
                          f"cannot read {config} to check Claude trust (PermissionError)")
-
 
 
 def layout_row_ids(names: list[str]) -> list[str]:
@@ -6577,9 +6561,52 @@ class SavedLayoutTests(unittest.TestCase):
         self.assertEqual(fresh.layout(), [("hana", ["late-session"])])
 
 
-
-
-
-
 if __name__ == "__main__":
     _ = unittest.main()
+
+
+class RunLoadedThreadsTests(unittest.TestCase):
+    def test_current_and_retired_servers_are_read_with_all_pages(self) -> None:
+        from scripts.agents.codex_mesh_test_support import StubAppServer
+        from scripts.lib.unit_runs import SERVER_FILE
+
+        def respond(request: dict[str, object]) -> list[dict[str, object]]:
+            params = request.get("params", {})
+            result: dict[str, object] = {}
+            if request.get("method") == "thread/loaded/list":
+                result = ({"data": ["second"]} if params else {"data": ["first"], "nextCursor": "page2"})
+            return [{"id": request["id"], "result": result}]
+
+        with tempfile.TemporaryDirectory() as folder:
+            current, retired = StubAppServer(respond), StubAppServer(respond)
+            self.addCleanup(current.close)
+            self.addCleanup(retired.close)
+            path = Path(folder) / SERVER_FILE
+            _ = path.write_text(json.dumps({"pid": os.getpid(), "port": current.port,
+                "previous_servers": [{"pid": os.getpid(), "port": retired.port}]}))
+            self.assertEqual(herdr.loaded_threads(Path(folder), time.monotonic() + TEST_HANG_GUARD_SECS),
+                             {"first", "second"})
+            for server in (retired, current):
+                self.assertEqual([request["params"] for request in server.requests
+                                  if request["method"] == "thread/loaded/list"], [{}, {"cursor": "page2"}])
+
+    def test_a_failed_page_gives_no_partial_result_and_expiry_prevents_a_connection(self) -> None:
+        from scripts.agents.codex_mesh_test_support import StubAppServer
+        from scripts.lib.unit_runs import SERVER_FILE
+
+        def respond(request: dict[str, object]) -> list[dict[str, object]]:
+            if request.get("method") == "thread/loaded/list":
+                return [{"id": request["id"], "error": {"message": "probe failed"}}]
+            return [{"id": request["id"], "result": {}}]
+
+        with tempfile.TemporaryDirectory() as folder:
+            server = StubAppServer(respond)
+            self.addCleanup(server.close)
+            path = Path(folder) / SERVER_FILE
+            _ = path.write_text(json.dumps({"pid": os.getpid(), "port": server.port}))
+            with self.assertRaisesRegex(ValueError, "probe failed"):
+                _ = herdr.loaded_threads(Path(folder), time.monotonic() + TEST_HANG_GUARD_SECS)
+            requests = list(server.requests)
+            with self.assertRaisesRegex(ValueError, "timed out"):
+                _ = herdr.loaded_threads(Path(folder), time.monotonic())
+            self.assertEqual(server.requests, requests)

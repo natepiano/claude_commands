@@ -152,14 +152,6 @@ class NoDirector(TypedDict):
 WorkerOwner = DirectorOwner | NoDirector
 
 
-class CodexServer(TypedDict):
-    """A live Codex app-server owned by one Claude session's run folder."""
-
-    run_dir: str
-    pid: int
-    busy_workers: list[str]
-
-
 class UnknownFolder(TypedDict):
     kind: Literal["unknown folder"]
 
@@ -178,7 +170,6 @@ class SessionFields(TypedDict):
     model: LastModel
     checkout: CheckoutState
     run_dirs: list[str]
-    codex_servers: list[CodexServer]
     timers: list[str]
 
 
@@ -450,19 +441,6 @@ def _parse_owner(value: object, place: str) -> WorkerOwner:
     raise InvalidInventory(f"{place}.kind is invalid")
 
 
-def _parse_codex_server(value: object, place: str) -> CodexServer:
-    data = wire_object(value, place)
-    return {
-        "run_dir": wire_string(
-            wire_required(data, "run_dir", place), f"{place}.run_dir"
-        ),
-        "pid": wire_integer(wire_required(data, "pid", place), f"{place}.pid"),
-        "busy_workers": wire_strings(
-            wire_required(data, "busy_workers", place), f"{place}.busy_workers"
-        ),
-    }
-
-
 def unit_worktree(session_id: str) -> staff.PresentWorktree | staff.RemovedWorktree | staff.WorktreeUnfilled:
     """Join a unit or its worker to the unit's staff location."""
     try:
@@ -510,12 +488,9 @@ def parse_session(value: object, place: str) -> Session:
         "model": _parse_model(wire_required(data, "model", place), f"{place}.model"),
         "checkout": _parse_checkout(wire_required(data, "checkout", place), f"{place}.checkout"),
         "run_dirs": wire_strings(data.get("run_dirs", []), f"{place}.run_dirs"),
-        "codex_servers": [],
         "timers": wire_strings(data.get("timers", []), f"{place}.timers"),
         "probe": data.get("probe") is True,
     }
-    parsed["codex_servers"] = [_parse_codex_server(item, f"{place}.codex_servers[{index}]")
-        for index, item in enumerate(wire_list(data.get("codex_servers", []), f"{place}.codex_servers"))]
     if "config_dir" in data:
         parsed["config_dir"] = wire_string(
             data["config_dir"], f"{place}.config_dir"

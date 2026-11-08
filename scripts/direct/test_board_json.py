@@ -17,6 +17,7 @@ import unittest
 from collections.abc import Generator
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
+from functools import cached_property
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import cast, override
@@ -26,11 +27,12 @@ from scripts.direct import board_json
 from scripts.lib import unit_runs
 from scripts.production import fake_showrunner, showrunner_parent, staff, showrunners
 from scripts.production.cli_fixture import invoke_cli
-from scripts.production.staff_test_support import StaffTestCase, fixture_worker, isolated_staff_file, production_membership, showrunner_launch
+from scripts.production.staff_test_support import StaffTestCase, fixture_worker, isolated_staff_file, production_membership, showrunner_launch, unit_membership
 from scripts.lib.atomic_file import write_text_atomic
 from contextlib import redirect_stderr
 import io
 from scripts.herdr import worker_panes
+from scripts.herdr.test_worker_panes import PaneWorld
 from scripts.herdr import herdr
 from scripts.shutdown import pane_record
 from scripts.production import display_cells
@@ -62,34 +64,10 @@ class ProductionFixture:
 
 
 class BoardJsonTests(unittest.TestCase):
-    def test_invalid_run_pin_keeps_build_and_main_available_with_a_problem_worker(self) -> None:
-        fixture = self.production()
-        history = self.write_run(fixture, self.delivery_events())
-        run = self.session_files()
-        parent = self.unit_member(fixture.name)
-        worker = fixture_worker("reader", parent.id)
-        assert isinstance(worker.parent, staff.ReportsTo)
-        write_text_atomic(run / unit_runs.STATE_FILE, json.dumps({unit_runs.OWNER_FIELD: worker.parent.id}))
-        write_text_atomic(run / "worker_transport", "junk\n")
-        error = io.StringIO()
-        with self.source_readers(), patch.dict(os.environ, self.environment), patch.object(
-                unit_runs, "run_roots", return_value=(self.run_root, self.former_root)), redirect_stderr(error):
-            subtree = board_json.resolve(fixture.name)
-            self.assertIsInstance(subtree, board_json.BoardSubtree)
-            assert isinstance(subtree, board_json.BoardSubtree)
-            document = board_json.build(subtree.runners[0].runner, record=subtree.record)
-        units = array_items(document["units"])
-        rows = array_items(object_fields(units[0])["workers"])
-        self.assertEqual(object_fields(rows[0])["state"], "incomplete")
-        self.assertIn("invalid worker transport: junk", str(object_fields(rows[0])["doing"]))
-        self.assertIn(str(run / "worker_transport"), error.getvalue())
-        self.assertIn(str(history), array_items(document["sources"]))
-        result = self.invoke("--production", fixture.name)
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertIn("invalid worker transport: junk", result.stderr)
-        cached = object_fields(cast(object, json.loads(self.cache_path(fixture.name).read_text())))
-        cached_rows = array_items(object_fields(array_items(cached["units"])[0])["workers"])
-        self.assertEqual(object_fields(cached_rows[0])["state"], "incomplete")
+
+    @cached_property
+    def pane_world(self) -> PaneWorld:
+        return PaneWorld()
 
     def test_wrapped_child_is_not_a_board_descendant_even_when_its_timer_and_parent_remain(self) -> None:
         root = self.production("root")
@@ -168,6 +146,13 @@ class BoardJsonTests(unittest.TestCase):
         }
         _ = self.enterContext(isolated_staff_file(self.root / "staff.json", self.environment))
         production_membership("fixture")
+        self.addCleanup(self.pane_world.process_directory.cleanup)
+        pane_patches = [
+            cast(object, self.enterContext(patch.object(worker_panes, "_client", return_value=self.pane_world))),
+            cast(object, self.enterContext(patch.object(herdr, "native_process", side_effect=self.pane_world.native_process))),
+            cast(object, self.enterContext(patch.object(herdr, "_startup_processes", side_effect=self.pane_world.descendants))),
+        ]
+        self.addCleanup(pane_patches.clear)
 
     def production(self, name: str = "show", *, running: bool = True,
                    unit_name: str = "alpha") -> ProductionFixture:
@@ -321,6 +306,10 @@ class BoardJsonTests(unittest.TestCase):
             "\n".join(json.dumps(event) for event in [first, *events]) + "\n",
             encoding="utf-8",
         )
+        run = self.run_root / name
+        if not (self.former_root / name).exists():
+            run.mkdir(exist_ok=True)
+            write_text_atomic(run / unit_runs.STATE_FILE, json.dumps({"owner_staff_id": member.id}))
         return path
 
     def delivery_events(self, *, open_phase: bool = True) -> list[dict[str, object]]:
@@ -343,19 +332,22 @@ class BoardJsonTests(unittest.TestCase):
     def session_files(self, name: str = "current", *, former: bool = False) -> Path:
         directory = (self.former_root if former else self.run_root) / name
         directory.mkdir(exist_ok=True)
-        write_text_atomic(directory / "worker_transport", "mesh\n")
-        _ = (directory / "mesh_roster.json").write_text(json.dumps({
-            "alpha-impl": {"slot": "1", "role": "impl", "status": "running",
-                           "thread_id": "thread-one", "turn_id": "turn-one",
-                           "model": "legacy-identity", "effort": "low",
-                           "turn_model": "fixture-turn-model", "turn_effort": "high"},
-            "alpha-test": {"slot": "test", "role": "test", "status": "idle",
-                           "thread_id": "thread-test", "turn_id": "turn-test"},
-        }), encoding="utf-8")
+        parents = staff.find(kind="unit")
+        parent = parents[0] if parents else unit_membership("fixture", "alpha")
+        member = fixture_worker("alpha-impl", parent.id, backend=staff.CodexBackend(self.root / "codex"))
+        tester = fixture_worker("alpha-test", parent.id)
+        self.pane_world.add(parent, "w1:p1")
+        self.pane_world.add(member, "w1:p2", family="codex")
+        self.pane_world.locations["w1:p2"]["agent_status"] = "running"
+        self.pane_world.add(tester, "w1:p3")
+        write_text_atomic(directory / unit_runs.STATE_FILE, json.dumps({"owner_staff_id": parent.id}))
         _ = (directory / "impl_worker_1.json").write_text(json.dumps({
-            "name": "alpha-impl", "slot": "1", "family": "codex",
-            "model": "fixture-model", "worker_id": "thread-one",
+            "name": "alpha-impl", "slot": "1", "role": "impl", "family": "codex",
+            "model": "codex/fixture-turn-model:high", "effort": "high", "staff_id": member.id,
         }), encoding="utf-8")
+        write_text_atomic(directory / "impl_worker_test.json", json.dumps({
+            "slot": "test", "role": "test", "staff_id": tester.id,
+        }))
         _ = (directory / "board.log").write_text(
             "\n".join((
                 "2026-10-16T17:00:00Z [alpha-impl] status: obsolete task",
@@ -1540,137 +1532,10 @@ class BoardJsonTests(unittest.TestCase):
         self.assertNotIn("obsolete", doing)
         self.assertEqual(workers["test"]["doing"], "checking the delivery")
 
-    def test_workers_shorten_mesh_names_using_the_worktree_prefix(self) -> None:
-        fixture = self.production()
-        _ = self.write_run(fixture, self.delivery_events())
-        directory = self.session_files()
-        _ = (directory / "impl_worker_test.json").write_text(json.dumps({
-            "name": "claude-build-followups-style-test", "slot": "test",
-            "family": "codex", "model": "fixture-model",
-        }), encoding="utf-8")
-        _ = (directory / "mesh_roster.json").write_text(json.dumps({
-            "claude-build-followups-style-impl": {
-                "slot": "claude-build-followups-style-impl", "role": "", "status": "running",
-            },
-            "claude-build-followups-style-test": {"role": "test", "status": "paused"},
-        }), encoding="utf-8")
-        _ = (directory / "board.log").write_text(
-            "2026-10-16T17:02:00Z [claude-build-followups-style-impl] status: building the current phase\n",
-            encoding="utf-8",
-        )
 
-        _, unit = self.unit(fixture)
 
-        rows = [object_fields(row) for row in array_items(unit["workers"])]
-        self.assertEqual({str(row["slot"]) for row in rows}, {"impl", "test"})
-        worker = next(row for row in rows if row["slot"] == "impl")
-        self.assertEqual(worker["state"], "running")
-        self.assertEqual(worker["doing"], "building the current phase")
 
-    def test_worker_metadata_selects_state_while_latest_slot_activity_is_retained(self) -> None:
-        fixture = self.production()
-        _ = self.write_run(fixture, self.delivery_events())
-        directory = self.session_files()
-        _ = (directory / "impl_worker_impl.json").write_text(json.dumps({
-            "name": "claude-build-followups-style-impl", "slot": "impl",
-            "family": "codex", "model": "fixture-model",
-        }), encoding="utf-8")
-        aliases = [
-            ("claude-build-followups-style-impl", {"role": "impl", "status": "paused"}),
-            ("impl", {"slot": "impl", "role": "fix", "status": "running"}),
-        ]
-        _ = (directory / "board.log").write_text(
-            "2026-10-16T17:01:00Z [claude-build-followups-style-impl] status: old assignment\n"
-            + "2026-10-16T17:02:00Z [impl] status: repairing the latest phase\n",
-            encoding="utf-8",
-        )
 
-        for entries in (aliases, list(reversed(aliases))):
-            with self.subTest(roster_order=[name for name, _ in entries]):
-                _ = (directory / "mesh_roster.json").write_text(
-                    json.dumps(dict(entries)), encoding="utf-8",
-                )
-
-                _, unit = self.unit(fixture)
-
-                rows = [object_fields(row) for row in array_items(unit["workers"])]
-                self.assertEqual(len(rows), 1)
-                self.assertEqual(rows[0]["slot"], "impl")
-                self.assertEqual(rows[0]["state"], "paused")
-                self.assertEqual(rows[0]["role"], "impl")
-                self.assertEqual(rows[0]["doing"], "repairing the latest phase")
-
-    def test_current_worker_metadata_overrides_obsolete_alias_revisions_and_roster_order(self) -> None:
-        fixture = self.production()
-        _ = self.write_run(fixture, self.delivery_events())
-        directory = self.session_files()
-        current = "claude-build-followups-style-fix"
-        obsolete = "claude-build-followups-style-impl"
-        _ = (directory / "impl_worker_impl.json").write_text(json.dumps({
-            "name": current, "slot": "impl", "family": "codex", "model": "fixture-model",
-        }), encoding="utf-8")
-        aliases = [
-            (current, {"role": "fix", "status": "done", "revision": 438}),
-            (obsolete, {"role": "review", "status": "paused", "revision": 547}),
-        ]
-        _ = (directory / "board.log").write_text(
-            f"2026-10-16T17:01:00Z [{current}] status: repair completed\n"
-            + f"2026-10-16T17:02:00Z [{obsolete}] status: latest slot activity\n",
-            encoding="utf-8",
-        )
-        for entries in (aliases, list(reversed(aliases))):
-            with self.subTest(roster_order=[name for name, _ in entries]):
-                _ = (directory / "mesh_roster.json").write_text(json.dumps(dict(entries)), encoding="utf-8")
-
-                rows = board_json.workers(directory, set(), "claude-build-followups-style")
-
-                self.assertEqual(len(rows), 1)
-                self.assertEqual(rows[0]["slot"], "impl")
-                self.assertEqual(rows[0]["state"], "idle")
-                self.assertEqual(rows[0]["role"], "fix")
-                self.assertEqual(rows[0]["doing"], "latest slot activity")
-
-    def test_worker_aliases_without_metadata_use_the_last_roster_entry(self) -> None:
-        fixture = self.production()
-        _ = self.write_run(fixture, self.delivery_events())
-        directory = self.session_files()
-        aliases = [
-            ("old-name", {"slot": "impl", "role": "review", "status": "paused", "revision": 547}),
-            ("new-name", {"slot": "impl", "role": "fix", "status": "running", "revision": 1}),
-        ]
-        _ = (directory / "board.log").write_text(
-            "2026-10-16T17:01:00Z [new-name] status: initial repair\n"
-            + "2026-10-16T17:02:00Z [old-name] status: newest activity on this slot\n",
-            encoding="utf-8",
-        )
-        for entries in (aliases, list(reversed(aliases))):
-            with self.subTest(roster_order=[name for name, _ in entries]):
-                _ = (directory / "mesh_roster.json").write_text(json.dumps(dict(entries)), encoding="utf-8")
-
-                rows = board_json.workers(directory, set())
-
-                self.assertEqual(len(rows), 1)
-                self.assertEqual(rows[0]["role"], entries[-1][1]["role"])
-                self.assertEqual(rows[0]["state"], entries[-1][1]["status"])
-                self.assertEqual(rows[0]["doing"], "newest activity on this slot")
-
-    def test_worker_states_distinguish_a_finished_turn_from_a_closed_thread(self) -> None:
-        fixture = self.production()
-        _ = self.write_run(fixture, self.delivery_events())
-        directory = self.session_files()
-        statuses = {"running": "running", "paused": "paused", "idle": "idle",
-                    "done": "idle", "ended": "ended", "connecting": "connecting"}
-        _ = (directory / "mesh_roster.json").write_text(json.dumps({
-            f"worker-{status}": {"slot": status, "role": "test", "status": status,
-                                 "thread_id": f"thread-{status}", "turn_id": ""}
-            for status in statuses
-        }), encoding="utf-8")
-
-        _, unit = self.unit(fixture)
-
-        self.assertEqual({str(worker["slot"]): worker["state"] for worker in
-                          (object_fields(row) for row in array_items(unit["workers"]))},
-                         statuses)
 
     def test_worker_activity_removes_launcher_and_report_paths_from_latest_message(self) -> None:
         fixture = self.production()
@@ -1698,6 +1563,9 @@ class BoardJsonTests(unittest.TestCase):
                 self.assertEqual(worker["doing"], expected)
 
     def test_worker_activity_trims_whitespace_after_removing_report_paths(self) -> None:
+        fixture = self.production()
+        history = self.write_run(fixture, self.delivery_events())
+        self.addCleanup(history.unlink)
         directory = self.session_files()
         for message in (
             "launcher:  review finished  ; summary at /tmp/summary.md",
@@ -1817,11 +1685,10 @@ class BoardJsonTests(unittest.TestCase):
         document, _ = self.unit(fixture)
 
         sources = {Path(str(path)) for path in array_items(document["sources"])}
-        expected = {old, current, fixture.plan, fixture.document, self.history / "runs", directory,
-                    directory / "mesh_roster.json", directory / "impl_worker_1.json", directory / "board.log"}
+        expected = {old, current, fixture.plan, fixture.document, self.history / "runs"}
         self.assertTrue(expected <= sources, expected - sources)
         self.assertNotIn(unrelated, sources)
-        self.assertNotIn(directory / "impl_worker_test.json", sources)
+        self.assertIn(directory / "impl_worker_test.json", sources)
         self.assertTrue(all(path.is_absolute() and path.exists() for path in sources))
 
     def test_sources_allow_discovery_of_a_run_and_later_session_files(self) -> None:
@@ -1834,7 +1701,7 @@ class BoardJsonTests(unittest.TestCase):
         before = (self.history / "runs").stat().st_mtime_ns
         _ = self.write_run(fixture, self.delivery_events())
         directory = self.run_root / "current"
-        directory.mkdir()
+        directory.mkdir(exist_ok=True)
         self.assertGreater((self.history / "runs").stat().st_mtime_ns, before)
         document, unit = self.unit(fixture)
         self.assertEqual(unit["state"], "running")
@@ -1848,15 +1715,16 @@ class BoardJsonTests(unittest.TestCase):
 
     def test_session_lookup_uses_first_existing_root_and_supports_the_former_root(self) -> None:
         fixture = self.production()
-        _ = self.write_run(fixture, self.delivery_events())
         former = self.session_files(former=True)
+        self.addCleanup(self.write_run(fixture, self.delivery_events()).unlink)
         _, unit = self.unit(fixture)
         self.assertEqual(len(array_items(unit["workers"])), 2)
         current = self.run_root / "current"
         current.mkdir()
-        _ = (current / "mesh_roster.json").write_text("{}", encoding="utf-8")
+        member = self.unit_member(fixture.name)
+        write_text_atomic(current / unit_runs.STATE_FILE, json.dumps({"owner_staff_id": member.id}))
         document, unit = self.unit(fixture)
-        self.assertEqual(unit["workers"], [])
+        self.assertEqual(len(array_items(unit["workers"])), 2)
         self.assertIn(str(current), array_items(document["sources"]))
         self.assertNotIn(str(former / "board.log"), array_items(document["sources"]))
 
@@ -1970,17 +1838,6 @@ class PaneBoardTests(StaffTestCase):
             supplied = board_json.workers(run, set(), record=record, pane_rows={parent.id: rows})
         self.assertEqual(supplied, rows)
 
-    def test_unreadable_pin_names_the_cause_and_keeps_a_problem_worker(self) -> None:
-        run = self.pane_run()[0]
-        pin = run / "worker_transport"
-        pin.unlink()
-        pin.mkdir()
-        error = io.StringIO()
-        with patch.object(unit_runs, "held", return_value=[str(run)]), redirect_stderr(error):
-            rows = board_json.workers(run, set())
-        self.assertEqual(rows[0]["state"], "incomplete")
-        self.assertIn(str(pin), str(rows[0]["doing"]))
-        self.assertIn(str(pin), error.getvalue())
 
     def test_five_pane_states_keep_the_pane_and_the_reason(self) -> None:
         run, parent, worker = self.pane_run()
@@ -2025,26 +1882,7 @@ class PaneBoardTests(StaffTestCase):
         self.assertEqual(panes.call_count, 1)
         self.assertEqual(list(self.root.rglob("worker_transport")), [])
 
-    def test_mesh_run_does_not_observe_panes_or_write_a_pin(self) -> None:
-        write_text_atomic(self.staff_file, '{"schema": 2, "rows": []}')
-        run = self.root / "run"
-        run.mkdir()
-        write_text_atomic(run / "mesh_roster.json", json.dumps({"reader": {"status": "paused", "role": "test"}}))
-        with patch.object(worker_panes, "observe_parents", side_effect=AssertionError("mesh pane read")):
-            rows = board_json.workers(run, set())
-        self.assertEqual([(row["slot"], row["state"]) for row in rows], [("reader", "paused")])
-        self.assertFalse((run / "worker_transport").exists())
 
-    def test_mesh_worker_rows_keep_full_names_beside_short_slots(self) -> None:
-        write_text_atomic(self.staff_file, '{"schema": 2, "rows": []}')
-        run = self.root / "named-run"
-        run.mkdir()
-        name = "unit-full-review"
-        write_text_atomic(run / "worker_transport", "mesh\n")
-        write_text_atomic(run / "mesh_roster.json", json.dumps({
-            name: {"slot": "review", "status": "running", "task": "direct.review"}}))
-        rows = board_json.workers(run, set())
-        self.assertEqual([(row["name"], row["slot"], row["role"]) for row in rows], [(name, "review", "review")])
 
     def test_unreachable_owner_gives_a_problem_worker(self) -> None:
         run = self.pane_run()[0]

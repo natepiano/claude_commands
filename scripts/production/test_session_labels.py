@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 from dataclasses import replace
-import json
 import io
 from contextlib import redirect_stderr
 import shlex
@@ -70,23 +69,6 @@ class NativeSessionLabelTests(StaffTestCase):
 
 
 class RowResolverTests(StaffTestCase):
-    def test_retired_worker_keeps_its_fixed_inbox_path_for_cleanup_retries(self) -> None:
-        _, _, worker = self.tree()
-        run = self.root / "run"
-        run.mkdir()
-        roster = run / "mesh_roster.json"
-        write_text_atomic(roster, json.dumps({worker.name: {"staff_id": worker.id, "status": "ended"}}))
-        before = session_staff.worker_inbox_path(str(run), worker.name)
-        self.assertEqual(before, session_staff.inbox_path(worker.id))
-        write_text_atomic(before, json.dumps({"messages": ["cleanup evidence"]}))
-        evidence = before.read_bytes()
-        _ = staff.retire(worker.id)
-        self.assertIsNone(staff.by_id(worker.id))
-        for _ in range(2):
-            after = session_staff.worker_inbox_path(str(run), worker.name)
-            self.assertEqual(after, before)
-            self.assertEqual(after.read_bytes(), evidence)
-
     def test_unit_and_worker_read_the_row_location_config_and_git_from_one_snapshot(self) -> None:
         fixture = self.row_production()
         record = staff.snapshot()

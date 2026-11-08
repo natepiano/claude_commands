@@ -22,7 +22,6 @@ from scripts.direct.verify_token_wait_test_support import VERIFY
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
-
 def cancellation_lines(output: str, command: str) -> list[re.Match[str]]:
     pattern = re.compile(
         re.escape(f"verify.sh: cancelled — the tree changed while {command} ran")
@@ -213,8 +212,7 @@ import sys
 from unittest.mock import patch
 from scripts.agents import mesh_runs
 with (patch.object(mesh_runs, "deliver", return_value="private fixture"),
-      patch.object(mesh_runs.staff, "local_snapshot", return_value=mesh_runs.staff.StaffSnapshot(())),
-      patch.object(mesh_runs.session_staff, "worker_directory", return_value=os.environ["PACKAGE_ROOT"])):
+      patch.object(mesh_runs.staff, "local_snapshot", return_value=mesh_runs.staff.StaffSnapshot(()))):
     raise SystemExit(mesh_runs.main(["supervise", sys.argv[1]]))
 """
             arguments = [str(Path(__file__).resolve().parents[2] / "scripts/lib/py"), "-c", supervisor, str(record_path)]

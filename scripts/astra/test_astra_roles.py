@@ -88,10 +88,6 @@ class AstraRolesTests(StaffTestCase):
              design_roles.RoleInstance("reviewer", "unused-reviewer", design_roles.RoleNotOpened())))
         with mock.patch.dict(os.environ, self.environment):
             design_roles._save(design)  # pyright: ignore[reportPrivateUsage]
-            mesh = design_roles.mesh_directory(design_id)
-            mesh.mkdir(parents=True)
-            _ = (mesh / "mesh_roster.json").write_text(json.dumps({"lasting-astra-designer": {
-                "staff_id": "99340615-2159-5777-b1c8-71572890df55", "status": "failed"}}))
             held = astra_roles.hold("designer", astra_roles.HeldDesignRole(design_id, "designer"),
                                     "99340615-2159-5777-b1c8-71572890df55")
             assert not isinstance(held, astra_roles.HoldWorkerUnavailable)

@@ -46,8 +46,8 @@ A change that old code cannot read safely requires a new schema number.
 `WorkerObservation.identity` is `ClaudeSession`, `CodexThread`, or `BackendUnavailable`.
 
 Run records identify workers through fixed staff references.
-The [worker lifecycle](long-lived-workers.md#roster-fields) defines their stored fields.
-Its [admission boundary](long-lived-workers.md#staff-identity-and-admission) publishes the current runtime.
+The [worker lifecycle](long-lived-workers.md#staff-membership-and-dispatch) defines their stored fields.
+Its [admission boundary](long-lived-workers.md#staff-membership-and-dispatch) publishes the current runtime.
 
 `set_worktree` compares an expected `PresentWorktree`, `RemovedWorktree`, or `WorktreeUnfilled` under the staff lock.
 The comparison includes the machine and path when present.
@@ -94,16 +94,18 @@ They also include `set_doc`, `set_worktree`, `update_current_session`, `pause`, 
 | `scripts/direct/assign_launcher_test_support.py` | write | by_id, local_snapshot, rename, set_worktree |
 | `scripts/direct/board_json.py` | read | active, snapshot |
 | `scripts/direct/claude_worker.py` | read | runtime_id |
+| `scripts/direct/clear_phase_review.sh` | read | local_snapshot |
 | `scripts/direct/phase_reservation.py` | read | snapshot, WorktreeUnfilled |
 | `scripts/direct/phase_table.py` | read | active, snapshot |
 | `scripts/direct/plan_history.py` | read | snapshot |
 | `scripts/direct/progress_history.py` | read | active, initial_snapshot, snapshot |
 | `scripts/direct/recorder_fixture.py` | read | PresentWorktree |
-| `scripts/direct/remove_workers.py` | write | local_snapshot, retire |
+| `scripts/direct/remove_workers.py` | read | local_snapshot, runtime_id |
 | `scripts/direct/review.sh` | read | local_snapshot, StaffRow |
 | `scripts/direct/review_launcher_test_support.py` | write | local_snapshot, native_id, update_current_session |
 | `scripts/direct/verify.sh` | read | snapshot, by_id, StaffId, StaffRow |
-| `scripts/direct/workers.py` | read | initial_snapshot |
+| `scripts/direct/worker_state.py` | read | StaffRow |
+| `scripts/direct/workers.py` | read | initial_snapshot, local_snapshot |
 | `scripts/hana_shot/hana_shot.py` | read | local_snapshot, runtime_id |
 | `scripts/herdr/herdr.py` | read | active, initial_snapshot, native_id, runtime_id |
 | `scripts/herdr/herdr_sessions.py` | read | initial_snapshot |
@@ -200,7 +202,6 @@ They also include `set_doc`, `set_worktree`, `update_current_session`, `pause`, 
 | `scripts/production/waiting.py` | read | snapshot |
 | `scripts/production/worker.py` | write | backend, snapshot, runtime_id, row_operation, retire |
 | `scripts/production/worker_admission.py` | write | by_current_session, ensure_worker, native_id, runtime_id, snapshot, update_current_session |
-| `scripts/production/worker_fill.py` | write | ensure_worker, native_id, snapshot |
 | `scripts/review_links/change_browser.py` | read | none (ReportsTo type) |
 | `scripts/review_links/change_page.py` | read | snapshot |
 | `scripts/shutdown/inventory.py` | read | local_snapshot |
@@ -233,7 +234,7 @@ They also include `set_doc`, `set_worktree`, `update_current_session`, `pause`, 
 | `scripts/usage/waste_watch.py` | read | snapshot |
 | `~/rust/cargo-liner-handler/crates/cargo-handler/src/census/hierarchy.rs` | read | StaffFileReader reads staff.json (Rust, direct) |
 
-165 accessors: 32 write, 132 read, 1 owner.
+169 accessors: 30 write, 138 read, 1 owner.
 
 ## Approved copies
 

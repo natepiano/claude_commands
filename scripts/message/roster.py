@@ -16,7 +16,7 @@ import subprocess
 import sys
 from collections.abc import Iterable, Mapping
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import asdict, dataclass, field, fields
+from dataclasses import asdict, dataclass, field, fields, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from types import ModuleType
@@ -32,6 +32,7 @@ from scripts.message import process_table  # noqa: E402
 from scripts.message import sessions  # noqa: E402
 from scripts.astra import design_roles  # noqa: E402
 from scripts.production import staff, session_staff, worker_admission
+from scripts.production.production_doc import Refusal as ProductionDocumentRefused
 from scripts.usage import agents_log
 from scripts.lib import names  # noqa: E402
 from scripts.lib.names import JobKey  # noqa: E402
@@ -93,7 +94,6 @@ from scripts.message.unit_labels import (
     LiveRun as _LiveRun,
     ClaudeDetails as _ClaudeDetails,
     RunPlace as _RunPlace,
-    MeshWorker as _MeshWorker,
     as_string as _as_string,
     read_object as _read_object,
     problem as _problem,
@@ -105,8 +105,6 @@ from scripts.message.unit_labels import (
     unit_labels_for as unit_labels_for,
     live_runs as _live_runs,
     stopped_run_place as _stopped_run_place,
-    mesh_records as _mesh_records,
-    listed_mesh_worker as _listed_mesh_worker,
 )
 
 
@@ -351,7 +349,7 @@ def shown_name(entry: RosterEntry) -> ShownName:
         job = ShownJob("designer" if entry.role == "astra-designer" else "design_reviewer", Unqualified())
     elif entry.role == "worker" and isinstance(entry.assignment, WorkerAssignment):
         assignment = entry.assignment
-        record = str(Path(assignment.session_dir) / ("mesh_roster.json" if entry.kind == "codex" else "board.log")) if assignment.session_dir else entry.name
+        record = str(Path(assignment.session_dir) / "board.log") if assignment.session_dir else entry.name
         if isinstance(assignment.role, AssignmentUnrecorded):
             job = JobUnassigned(f"assignment not recorded: {record}")
         elif isinstance(assignment.role, AssignmentUnreadable):
@@ -924,26 +922,8 @@ def _run_place(
     )
 
 
-def _between_turns_reason(director: DirectorRelationship) -> str:
-    match director:
-        case UnderDirector():
-            return "between turns; its unit director resumes it"
-        case _:
-            return "between turns; no unit director is running"
 
 
-def _run_server_homes(run: _LiveRun) -> dict[int, Path]:
-    """Homes of serving servers, including turns finishing on retired servers."""
-    homes: dict[int, Path] = {}
-    from scripts.agents import codex_mesh
-    records = codex_mesh.run_server_records(run.path)
-    for record in records:
-        port, home = record.get("port"), record.get("codex_home")
-        if isinstance(port, int) and not isinstance(port, bool):
-            _ = homes.pop(port, None)
-            if isinstance(home, str) and home:
-                homes[port] = Path(home)
-    return homes
 
 
 def _codex_home_account(home: Path) -> AccountLabel | AccountUnread:
@@ -972,43 +952,10 @@ def _process_account(pid: int, kind: str, *,
     return _codex_home_account(home.home if isinstance(home, account.ProcessCodexHome) else Path.home() / ".codex")
 
 
-def _worker_account(run: _LiveRun, worker: _MeshWorker, homes: dict[int, Path]) -> AccountLabel | AccountUnread:
-    port = worker.get("port")
-    if port is None:
-        try:
-            port = _read_object(run.path / "mesh_server.json").get("port")
-        except (OSError, UnicodeError, ValueError):
-            pass
-    if isinstance(port, int) and not isinstance(port, bool) and port in homes:
-        return _codex_home_account(homes[port])
-    # Idle shutdown removes server metadata; the next turn uses the workers home.
-    try:
-        return _codex_home_account(agent_accounts.workers_home())
-    except ValueError as error:
-        return AccountUnread(str(error))
 
 
-def _worker_status(status: str) -> str:
-    return {
-        "done": "idle",
-        "waiting_capacity": "waiting for capacity",
-        "capacity_exhausted": "out of capacity",
-    }.get(status, status)
 
 
-def _process_cwds(table: Mapping[int, process_table.Process]) -> dict[tuple[str, str], str]:
-    found: dict[tuple[str, str], str] = {}
-    for process in table.values():
-        try:
-            words = shlex.split(process.arguments)
-        except ValueError:
-            words = process.arguments.split()
-        options = dict(zip(words, words[1:]))
-        name = options.get("--name") or options.get("--to")
-        directory = options.get("--session-dir")
-        if process_table.is_codex_agent(process) and name and directory:
-            found[(name, str(Path(directory).resolve()))] = options.get("--cwd", "")
-    return found
 
 
 def _ledger_workers(
@@ -1017,13 +964,23 @@ def _ledger_workers(
 ) -> dict[str, _WorkerPlace]:
     workers: dict[str, _WorkerPlace] = {}
     records_list = list(records)
+    owner_runs: dict[staff.StaffId, list[str]] = {}
     for run in sorted(runs, key=lambda run: (isinstance(run.director, _NoRunningDirector),
                                              not (run.path / unit_runs.STATE_FILE).exists())):
         for member in _worker_ledger(run, problems, membership):
+            owner = membership.parent_of(member)
+            if owner is not None:
+                if owner.id not in owner_runs:
+                    owner_runs[owner.id] = unit_runs.held(owner.current_session, os.environ.get("ROSTER_RUN_ROOT"),
+                                                        record=membership)
+                preferred = owner_runs[owner.id]
+                if preferred and run.path.resolve() != Path(preferred[0]).resolve():
+                    continue
             for record in records_list:
                 session_id = record["sessionId"]
                 if session_id == member.current_session:
-                    _ = workers.setdefault(session_id, _WorkerPlace(run, member))
+                    if session_id not in workers:
+                        workers[session_id] = _WorkerPlace(run, member)
     return workers
 
 
@@ -1216,19 +1173,17 @@ def _unit_workers(
     except (OSError, ValueError, subprocess.SubprocessError) as error:
         _problem(problems, "process table", error)
         table = {}
-    process_cwds = _process_cwds(table)
     entries: list[RosterEntry] = []
     worker_threads: set[str] = set()
     role_log = _role_log()
-    pane_parent_ids: set[str] = set()
     try:
         parents = session_staff.pane_parents(membership)
-        pane_parent_ids = {parent.current_session for parent in parents}
         if parents:
             from scripts.herdr import worker_panes
 
             observations = worker_panes.observe_parents(parents, membership)
             for parent in parents:
+                run = worker_panes.worker_run(parent, record=membership)
                 for state in observations[parent.id]:
                     row = state.row
                     backend = membership.backends.get(row.id)
@@ -1236,6 +1191,10 @@ def _unit_workers(
                         membership, row, {key: item.name for key, item in claude_entries.items()},
                         {key: item.showrunner for key, item in claude_entries.items()})
                     worker_threads.add(row.current_session)
+                    existing = claude_entries.get(row.current_session)
+                    if not isinstance(backend, staff.CodexBackend) and existing is not None:
+                        entries.append(replace(existing, role="worker", director=director, showrunner=showrunner))
+                        continue
                     if isinstance(state, worker_panes.OpenWorker):
                         status = f"{state.status}; pane {state.pane}"
                         reach: MessageReach = Messageable(f"worker:{parent.name}/{row.name}")
@@ -1250,74 +1209,18 @@ def _unit_workers(
                         role="worker", name=row.name, status=status, reach=reach,
                         cwd=str(session_staff.worker_directory(membership, row.id)),
                         showrunner=showrunner, director=director,
-                        assignment=_worker_assignment("", row.name, {"staff_id": row.id}, membership, role_log),
+                        assignment=_worker_assignment(run, _slot_role(row.name), {"staff_id": row.id}, membership, role_log),
                         thread=CodexThread(row.current_session) if isinstance(backend, staff.CodexBackend) else NoCodexThread(),
                         session=ClaudeSession(row.current_session) if isinstance(backend, staff.ClaudeBackend) else NoClaudeSession(),
                         account=AccountUnread("worker account not read")))
-    except (OSError, ValueError, herdr.HerdrFailure) as error:
+    except (OSError, ValueError, herdr.HerdrFailure, ProductionDocumentRefused) as error:
         _problem(problems, "pane workers", error)
     for run in runs:
-        try:
-            transport = unit_runs.run_pin(run.path)
-            if (transport == "herdr" or transport is unit_runs.NoRunPin.ABSENT and isinstance(run.director, _DirectorSession)
-                    and run.director.session_id in pane_parent_ids):
-                continue
-        except (OSError, ValueError) as error:
-            _problem(problems, f"worker transport {run.path}", error)
-        server_homes = _run_server_homes(run)
         try:
             place = _run_place(run, claude_entries, production_places, membership)
         except staff.StaffUnreadable as error:
             _problem(problems, str(run.path), error)
             continue
-        for name, record in sorted(_mesh_records(run, problems).items()):
-            if not _listed_mesh_worker(record):
-                continue
-            try:
-                record = cast(_MeshWorker, cast(object, record))
-            except staff.StaffUnreadable as error:
-                _problem(problems, f"{run.path}: {name}", error)
-                continue
-            member = membership.by_id(staff.StaffId(_as_string(record.get("staff_id"))))
-            if member is not None and isinstance(membership.backends.get(member.id), staff.ClaudeBackend):
-                continue
-            parent = (membership.by_id(member.parent.id)
-                      if member is not None and isinstance(member.parent, staff.ReportsTo) else None)
-            if parent is None:
-                _problem(problems, f"{run.path}: {name}", "worker parent is unavailable")
-                continue
-            assert member is not None
-            director, showrunner = staff_relationships(
-                membership, member, {key: item.name for key, item in claude_entries.items()},
-                {key: item.showrunner for key, item in claude_entries.items()})
-            status = _as_string(record.get("status"))
-            thread_id = _as_string(session_staff.worker_session(record, membership))
-            if thread_id:
-                worker_threads.add(thread_id)
-            run_path = str(run.path.resolve())
-            cwd = (
-                process_cwds.get((name, run_path), "")
-                or place.cwd
-            )
-            entries.append(RosterEntry(
-                machine=machine,
-                kind="codex",
-                role="worker",
-                name=name,
-                status=_worker_status(status),
-                reach=(
-                    Messageable(f"worker:{run.path.name}/{name}")
-                    if status in MESSAGEABLE_WORKER_STATUSES
-                    else CannotReceiveMessages(_between_turns_reason(director))
-                ),
-                cwd=cwd,
-                showrunner=showrunner,
-                director=director,
-                assignment=_worker_assignment(Path(run_path), _worker_slot(run.path, name, record, problems), record, membership,
-                                              role_log),
-                thread=CodexThread(thread_id) if thread_id else NoCodexThread(),
-                account=_worker_account(run, record, server_homes),
-            ))
         entries.extend(_review_workers(machine, run, place, table, problems, home_state=home_state))
     return entries, worker_threads
 
@@ -1329,31 +1232,29 @@ def _durable_roles(machine: str, claude: Mapping[str, RosterEntry], warnings: li
     for path in sorted(design_roles.state_root().glob('*/design.json')):
         try:
             design = design_roles.read_design(path.parent.name)
-            mesh = design_roles.mesh_directory(design.placement.design_id)
-            roster = _read_object(mesh / 'mesh_roster.json') if (mesh / 'mesh_roster.json').exists() else {}
             for instance in design.roles:
                 if isinstance(instance.lifecycle, (design_roles.RoleNotOpened, design_roles.RoleEnded)):
                     continue
                 parent = design_roles.worker_parent(design, instance.role, membership)
                 showrunner, director = _held_location(parent, membership, claude)
-                raw_entry = roster.get(instance.name, {})
-                if not isinstance(raw_entry, dict):
-                    raise ValueError('durable roster entry is not an object')
-                entry = cast(dict[str, object], raw_entry)
-                thread = session_staff.worker_session(entry, membership)
+                member = next((row for row in membership.find(kind="worker", parent=parent.id)
+                               if row.name == instance.name), None)
+                evidence = session_staff.worker_backend(membership, member.id) if member is not None else session_staff.WorkerBackendUnavailable("worker is absent")
+                thread = (member.current_session if member is not None and isinstance(evidence, session_staff.RecordedWorker)
+                          and isinstance(evidence.backend, staff.CodexBackend) else "")
                 if not thread:
                     print(f"anomaly: {instance.name}: held role has no Codex backend", file=sys.stderr)
                     continue
                 if thread in threads:
                     continue
                 threads.add(thread)
-                status = _as_string(entry.get('status')) or type(instance.lifecycle).__name__
+                status = type(instance.lifecycle).__name__
                 entries.append(RosterEntry(machine=machine, kind='codex',
                     role='astra-designer' if instance.role == 'designer' else 'astra-reviewer',
                     name=instance.name, status=status, reach=CannotReceiveMessages(
                         'held role; add pending messages through design_roles.py'),
                     cwd=design.repository, showrunner=showrunner, director=director,
-                    assignment=HeldDesignRole(instance.role, str(mesh)), thread=CodexThread(thread),
+                    assignment=HeldDesignRole(instance.role, str(path.parent)), thread=CodexThread(thread),
                     account=AccountUnread('serving home not read')))
         except (OSError, ValueError, TypeError) as error:
             _problem(warnings, 'durable role ' + str(path), error)

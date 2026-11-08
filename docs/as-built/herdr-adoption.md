@@ -2,7 +2,7 @@
 
 ## What it is
 
-Every showrunner, unit director and standalone Claude session uses a tab in the shared herdr session, `agents`, on both machines. Each production has one workspace. Each standalone session has a workspace with its tab name. A unit uses its fixed parent row's production workspace. No launcher starts a separate herdr session. `start_server` and `restore_server` refuse other session names. Open `agents` with `herdr session attach agents` (`hsa agents`). Use `herdr_sessions.py attach-remote <host> <tab>` for a tab on the other machine. Codex workers remain headless `codex app-server` threads. Crash recovery also restores interactive Codex conversations into tabs in `agents`. tmux remains only in old records, which produce manual restart instructions. The implementation uses `scripts/herdr/`, `scripts/production/`, `scripts/message/roster.py` and `scripts/shutdown/`. See [herdr-trial.md](herdr-trial.md) for the trial results.
+Every showrunner, unit director and standalone Claude session uses a tab in the shared herdr session, `agents`, on both machines. Each production has one workspace. Each standalone session has a workspace with its tab name. A unit uses its fixed parent row's production workspace. No launcher starts a separate herdr session. `start_server` and `restore_server` refuse other session names. Open `agents` with `herdr session attach agents` (`hsa agents`). Use `herdr_sessions.py attach-remote <host> <tab>` for a tab on the other machine. Workers use interactive Claude or Codex panes under their staff parent. Crash recovery also restores interactive Codex conversations into tabs in `agents`. tmux remains only in old records, which produce manual restart instructions. The implementation uses `scripts/herdr/`, `scripts/production/`, `scripts/message/roster.py` and `scripts/shutdown/`. See [herdr-trial.md](herdr-trial.md) for the trial results.
 
 ## How it works
 
@@ -373,10 +373,10 @@ Pane worker account moves use the shared stop, resume, and prompt APIs. The move
 
 ## Ruled out
 
-- Interactive Codex panes for workers. They stalled at the trust screen, lost Work Orders and hid from the roster, while headless workers ask nothing and the roster already finds them.
+- The earlier worker trial used headless Codex threads. Current workers use staff membership and interactive panes.
 - Installing herdr's Claude integration. It writes `~/.claude` hooks and settings that every session loads.
 - Ancestor folder keys as trust, and a trusted default start folder. Nothing records which folder the user last worked in, and a session opened somewhere unasked is worse than one prompt.
-- A Codex trust check. No launcher starts new Codex work in herdr, and crash restore only resumes a Codex session in the folder it already ran in.
+- A separate Codex trust check during crash restore. Restore resumes the saved conversation in its recorded folder.
 - Probing pane process info to detect shell readiness, because herdr sends no field that tells them apart. Killing an in-flight `agent start` at the deadline, because it leaves a half-started agent.
 - Copying the caller's environment into a pane. Only named marks and account variables pass.
 - A store-path fallback in `herdr_binary`, because a garbage-collected path fails late.

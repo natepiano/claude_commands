@@ -2,7 +2,7 @@
 """Hold and release Astra roles, and list the threads that still hold them.
 
 Records are local files under ASTRA_ROLES_STATE (default ~/.local/state/astra/roles).
-Reading live roles needs only a mesh roster or a local process check.
+Live roles use pane observations or a local process check.
 """
 from __future__ import annotations
 try:
@@ -80,7 +80,6 @@ class HeldRole(TypedDict):
     role: AstraRole
     staff_id: str
     thread_id: str
-    codex_home: str
     manager: str
     held_at: str
     lifetime: MeshWorker | ExecProcess | HeldDesignRole
@@ -162,7 +161,7 @@ def hold(role: AstraRole, lifetime: ExecProcess | HeldDesignRole | MeshWorker,
     if not isinstance(task, agents_log.Assignment) or task.role != task_role:
         agents_log.append(member.current_session, task_role, None, datetime.now(timezone.utc))
     held = HeldRole(role=role, staff_id=member.id, thread_id=member.current_session,
-                    codex_home="", manager="", held_at=datetime.now(timezone.utc).isoformat(), lifetime=lifetime)
+                    manager="", held_at=datetime.now(timezone.utc).isoformat(), lifetime=lifetime)
     record = _role_record(held)
     path = _record_path(member.id)
     held = _parse_record(record, path, membership)
@@ -220,12 +219,11 @@ def _parse_record(record: dict[str, object] | RoleRecord, path: Path, membership
     else:
         raise ValueError("worker does not hold an Astra role")
     thread_id, manager = member.current_session, parent.current_session
-    codex_home = str(backend.codex_home) if isinstance(backend, staff.CodexBackend) else ""
     held_at = _record_text(fields, "held_at")
     if path.stem != member.id:
         raise ValueError("staff id differs from file name")
     lifetime = _role_lifetime(fields, role)
-    return HeldRole(staff_id=member.id, role=role, thread_id=thread_id, codex_home=codex_home,
+    return HeldRole(staff_id=member.id, role=role, thread_id=thread_id,
                     manager=manager, held_at=held_at, lifetime=lifetime)
 
 
@@ -265,14 +263,20 @@ def _worker_state(entry: dict[str, object]) -> RoleState:
     return "busy" if isinstance(pid, int) and not isinstance(pid, bool) and pid > 0 and _pid_running(pid) else "idle"
 
 
-def live_roles(membership: staff.StaffSnapshot) -> list[LiveRole]:
+class AllHeldRoles(Enum):
+    ALL = "all held roles"
+
+
+def live_roles(membership: staff.StaffSnapshot, *,
+               selection: frozenset[staff.StaffId] | AllHeldRoles = AllHeldRoles.ALL) -> list[LiveRole]:
     """Return readable live holds with current state; remove holds known to have ended."""
     roles: list[LiveRole] = []
     parents = [row for row in membership.rows if row.kind in ("unit", "showrunner")]
     observations: dict[staff.StaffId, list[worker_panes.WorkerPane]] = {}
     scanned = False
     try:
-        paths = sorted(state_root().glob("*.json"))
+        paths = sorted(path for path in state_root().glob("*.json")
+                       if isinstance(selection, AllHeldRoles) or staff.StaffId(path.stem) in selection)
     except OSError as error:
         print(f"astra_roles: cannot read roles: {error}", file=sys.stderr)
         return roles
@@ -331,7 +335,7 @@ def live_roles(membership: staff.StaffSnapshot) -> list[LiveRole]:
                     raise ValueError("exec process lifetime is unknown; hold retained")
                 state = "busy"
             live = LiveRole(staff_id=record["staff_id"], role=record["role"], thread_id=record["thread_id"],
-                                  codex_home=record["codex_home"], manager=record["manager"],
+                                  manager=record["manager"],
                                   held_at=record["held_at"], lifetime=lifetime, state=state)
             roles.append(live)
         except (OSError, UnicodeError, ValueError) as error:

@@ -694,3 +694,22 @@ Do we have a unit director that is dedicated to, I guess it's showrunners and pr
 - Limit: this protects only processes that start after it lands. No live Mac call was run. The test gives the owner the same input that the remote command gives.
 
 **Files:** `scripts/production/staff.py`, `scripts/production/test_staff.py`, `docs/as-built/staff-accessors.md`.
+
+### Phase 30 — Delete the mesh and rename the detached runs  · status: todo
+
+Moved from herdr-unit (sdlc, 2026-11-07 14:22 EST, user: "have some other unit do this work right now"). The Work Order is `### Phase 19 — Delete the mesh and rename the detached runs` in `docs/plans/herdr-worker-panes.md`. Read that section; this phase copies none of its text.
+
+#### Work Order
+
+**Goal:** the goal of herdr Phase 19: the mesh, the old worker records and `WORKER_TRANSPORT` are gone, and no live name holds the word mesh.
+
+**Spec:** follow the Spec, the drain gate, the constraints and the three acceptance gates of `docs/plans/herdr-worker-panes.md` → Phase 19. sdlc rulings (2026-11-07):
+1. herdr Phase 34 is not a prerequisite. Under Spec item 5, move the Stage 2 file watchers that `worker._wait_for_dispatch` reads out of `codex_mesh.py` to one kept owner. herdr Phase 34 later deletes the wait loop.
+2. Start on files no running phase holds. Take `scripts/herdr/worker_panes.py` (herdr 32, 33, 35), `scripts/production/worker.py` (agents 15b), `scripts/direct/assign.py` (herdr 28, 29), `scripts/shutdown/stop_resume.py` and `scripts/shutdown/restart.py` (agents 15) only after their holders merge, and build on their trees.
+3. devtools 3t is done. models-unit reviews the retained `workers.py` and `codex_mesh.py` code and owns `config/models.conf`; send it the `[direct.options]` change.
+4. At landing, tell queue-unit (Spec item 13).
+
+**Files:**
+- `docs/plans/herdr-worker-panes.md` — every path in the Files list of its Phase 19.
+
+**Workers:** the Workers line of `docs/plans/herdr-worker-panes.md` → Phase 19.

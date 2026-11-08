@@ -101,7 +101,8 @@ class PublishedWorker:
 def parent(record: staff.StaffSnapshot, sources: session_staff.MemberSources | None = None, *,
            staff_id: str = "", production: str = "", unit: str = "",
            run: Path | None = None, roster: Mapping[str, object] | None = None) -> staff.StaffRow:
-    """Resolve the recorded run owner before the roster and caller."""
+    """Resolve the recorded run owner before the caller."""
+    del roster
     if run is not None:
         try:
             state = worker_lifecycle.read_json_object(run / unit_runs.STATE_FILE)
@@ -120,15 +121,6 @@ def parent(record: staff.StaffSnapshot, sources: session_staff.MemberSources | N
             found = sources.member(session_staff.UnitMember(production, unit), record)
             if isinstance(found, session_staff.MemberFound):
                 return found.row
-    if run is not None:
-        entries = roster if roster is not None else worker_lifecycle.read_worker_state(run / "mesh_roster.json")
-        for raw in entries.values():
-            if not isinstance(raw, dict):
-                continue
-            child = record.by_id(staff.StaffId(str(cast(dict[str, object], raw).get("staff_id", ""))))
-            owner = record.parent_of(child) if child is not None else None
-            if owner is not None:
-                return owner
     row = record.owner_of(staff_id) if staff_id else None
     if row is not None and row.kind in ("unit", "showrunner"):
         return row
@@ -139,7 +131,7 @@ def parent(record: staff.StaffSnapshot, sources: session_staff.MemberSources | N
             return found.row
     if unit or production:
         raise ValueError(f"no unit staff row for {unit}" if unit else f"no showrunner staff row for {production}")
-    raise ValueError(f"this run has no owner because {unit_runs.STATE_FILE} and mesh_roster.json name no unit, production or staff row"
+    raise ValueError(f"this run has no owner because {unit_runs.STATE_FILE} names no staff row"
                      if run is not None else "the caller has no staff row and names no unit or production")
 
 

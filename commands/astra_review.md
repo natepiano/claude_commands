@@ -36,10 +36,9 @@ changes no file.
      line that the astra review is running, then end the turn or do other work.
      The task notification is the wait. Never poll it, sleep or read its output
      before then. A review at xhigh can take many minutes.
-   - **Pane or mesh worker:** start it with
+   - **Pane worker:** start it with
      `~/.claude/scripts/lib/py ~/.claude/scripts/agents/mesh_runs.py start --label "astra review" -- <the command>`
      End your turn; the result arrives as your next message.
-     This detached-run command serves pane runs and existing mesh-pinned runs.
      Exit 3 means the caller is not a worker; run attached in one call only for that exit.
      A live twin takes priority over `config/mesh_runs.conf` `LIVE_RUN_LIMIT`.
      Exit 4 refuses a new run at that limit and names the live runs.

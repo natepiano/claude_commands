@@ -15,20 +15,8 @@ Codex review prompts also include section 3's command block.
    Use opening wording for a replacement conversation.
 2. Boundaries: prohibit commits, branches, and unrelated edits.
    State both file sets under <TeamFilePartition/>. Block changes to a peer's files.
-   For an existing `mesh` pin, require the summary as the last act at the full `${PHASE_DIR}/impl_summary_<slot>.txt` path.
-   For `herdr`, require the summary in the final reply, because the launcher saves that reply as the summary.
-   Include files, reasons, deviations, doubts, unverified checks, and edits outside the file set.
-   Implementation, fix and test prompts carry verbatim:
-   "Do not open the `rust_style` skill or run `load-rust-style.sh`; the reviewer worker owns the phase style review."
-   Review prompts use
-   <ReviewPromptContract/>'s style assignment instead.
 3. Narration: require this command when a herdr pane worker's activity changes:
    `bash ~/.claude/scripts/direct/board.sh post <slot> status "<activity>"`.
-   For an existing `mesh` pin, insert the concrete run folder after `post`.
-   For a read-only pane reviewer, require short output lines instead of board posts.
-   Assign its required suites to the director or a writer.
-   Use short present-tense text. Do not read the heartbeat file or post unchanged activity.
-   Include this command block verbatim after section 2 in every Codex prompt:
 
    ```
    ## Builds and tests
@@ -59,19 +47,12 @@ Codex review prompts also include section 3's command block.
    Claude workers use `run_in_background: true` and end the turn until the result arrives.
    Before a role change, require this command from herdr pane writers:
    `bash ~/.claude/scripts/direct/board.sh role <slot> <impl|fix|test|review> "<why>"`.
-   For existing mesh-pinned writers and reviewers, insert the concrete run folder after `role`.
-   The director records a pane reviewer's role change.
-   Use the prompt's slot. Check that different prompts name different slots.
-   Omit the run folder from pane worker board commands. They read `UNIT_RUN_DIR`.
 4. `## Team`: copy the Workers assignment and file ownership, including one owner for each hub file.
    Copy the <CoordinationBoard/> commands. State that `verify.sh` may pause for a peer.
    Prohibit cargo token requests, acquisition, and discussion under <BuildTokenContract/>.
    Send questions by message. Record decisions on the board. State each source when passing information.
    Label the user's words only when the unit director relays them.
    Include each worker address and its concrete contact command under <PhaseMesh/>.
-   For an existing mesh-pinned run, use its registered names and contact route.
-   If a member has no message route, require it to read the board.
-   For repairs, list the file set, other workers' files as read-only, and the token prohibition under <FixDispatch/>.
 5. `## Project Context`: include the current context. Omit plan **Style** metadata.
 6. `## Work Specification`: include the following instructions verbatim.
    "Do not weaken, delete or turn off an existing assertion or test to make a test pass. If one must change, post blocked with the test, the old assertion, the new assertion and why."
@@ -161,12 +142,10 @@ phase records two passes. The recorder keys them by slot and closes only that sl
 Run both workers through `assign.sh` in separate background shells of the director session.
 Give each worker its own `--prompt`, `--paths`, and `--role`.
 Use `--to <short name>` for a retained pane worker.
-For an existing mesh pin, use the full registered name with `--to`.
 Apply <DispatchContract/> once for the team.
 See <LaunchImplementation/> for the command format.
 
 Complete the phase only when every dispatch has a terminal status at its returned path.
-An existing mesh pin uses `${PHASE_DIR}/impl_status_<slot>`.
 Completion ends the turns and retains the worker conversations.
 </PhaseTeam>
 
@@ -175,7 +154,6 @@ The team uses the run's `board.log`. Write it only through `bash ~/.claude/scrip
 The board keeps decisions and activity across stops and restarts. Send questions by message under <PhaseMesh/>.
 
 Herdr pane workers use these forms. The commands read `UNIT_RUN_DIR`.
-Directors and workers with an existing `mesh` pin insert `<session_dir>` after the verb.
 
 - `board.sh post <slot> <kind> <message>` adds one board line.
   Kinds are `register`, `claim`, `release`, `status`, `blocked`, `handoff`, and `done`.
@@ -202,24 +180,6 @@ A stopped, blocked, closed, or uncertain worker's holder receives the text and r
 Unknown process evidence produces one anomaly line and sends the text to the holder without pane input.
 A missing worker row returns `REFUSED`, exits 2, and reaches nobody.
 Read problem lines as incomplete evidence, never as an empty worker list.
-
-The following routes apply only when the existing run's pin is `mesh`:
-
-- Read each registered name from the board or the run's roster.
-  Use `worker_name.sh "${WORKING_DIR}" <slot> <kind>` when a launch needs a new name.
-  Do not compose a name.
-- For `reach=SendMessage`, address the Claude member by its registered name.
-  Use `ListAgents` to confirm its session.
-- For `reach=codex_mesh.py`, use `~/.claude/scripts/lib/py ~/.claude/scripts/agents/codex_mesh.py send
-  --session-dir <concrete SESSION_DIR> --to <name> --message "<text>"`.
-  Use `steer` only when the current work must stop.
-  Use `list --session-dir <dir>` to read the registered workers.
-  These calls use the run's `codex app-server`.
-- For `mesh=none`, read the member's board posts. Do not expect a message reply.
-- A finished Claude member can receive a message until cleanup.
-  A finished Codex turn retains messages for its next `assign.sh --to <worker>` dispatch.
-  Only the director starts that next turn.
-- A Codex mesh worker contacts the director through the board.
 
 Message a peer when its answer changes your work or your work blocks it.
 Record each decision on the board.

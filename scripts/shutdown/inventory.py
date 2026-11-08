@@ -29,8 +29,8 @@ from scripts.message import sessions
 from scripts.message.sessions import process_start as _process_start
 from scripts.production import showrunners, staff, session_staff
 from scripts.usage import agents_log
-from scripts.direct.worker_state import ROSTER_LIVE, worker_status_path
-from scripts.lib.resume_message import PausedSeat, Resumable, Idle, Unavailable, WorkerResume
+from scripts.direct.worker_state import worker_status_path
+from scripts.lib.resume_message import ClaudeChildResume, Resumable, Idle, Unavailable, WorkerResume
 from scripts.production import unit_lookup
 from scripts.whoami.account import Account, label_for
 
@@ -76,7 +76,6 @@ from scripts.shutdown.session_types import (
     DirectorOwner as DirectorOwner,
     NoDirector as NoDirector,
     WorkerOwner as WorkerOwner,
-    CodexServer as CodexServer,
     SessionFields as SessionFields,
     ShowrunnerSession as ShowrunnerSession,
     UnitSession as UnitSession,
@@ -255,8 +254,6 @@ def _string(value: object, default: str = "") -> str:
     return value if isinstance(value, str) else default
 
 
-def _positive_int(value: object) -> int | None:
-    return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else None
 
 
 def _pid_alive(pid: int) -> bool:
@@ -788,8 +785,9 @@ def _launcher_command(pid: int) -> list[str]:
 
 
 def worker_resumes(parent: staff.StaffRow, membership: staff.StaffSnapshot) -> list[WorkerResume]:
-    """Return one resume result for each direct worker child, across both families."""
-    children = membership.find(kind="worker", parent=parent.id)
+    """Return one resume result for each Claude child."""
+    children = [child for child in membership.find(kind="worker", parent=parent.id)
+                if isinstance(membership.backends.get(child.id), staff.ClaudeBackend)]
     if not children:
         return []
     try:
@@ -803,41 +801,20 @@ def worker_resumes(parent: staff.StaffRow, membership: staff.StaffSnapshot) -> l
         try:
             found = next(reversed(runs.get(child.id, ())), None)
             if found is None:
-                raise ValueError("worker roster entry is unavailable in its recorded runs")
+                raise ValueError("Claude child record is unavailable in its recorded runs")
             directory, entry = found
             task = agents_log.role_at(tasks, child.current_session, moment)
             if not isinstance(task, agents_log.Assignment):
                 raise ValueError("last assignment is unavailable" + (f": {'; '.join(tasks.problems)}" if tasks.problems else ""))
-            status = worker_status_path(directory, str(entry["slot"])).read_text().strip() if "slot" in entry else entry.get("status")
-            live = status == "implementing" if "slot" in entry else status in ROSTER_LIVE or entry.get("paused_turn") is True
+            status = worker_status_path(directory, str(entry["slot"])).read_text().strip()
+            live = status == "implementing"
             launcher = entry.get("launcher_pid", 0)
-            seat = PausedSeat(run_dir=str(directory), seat=child.name, role=task.role, staff_id=child.id, turn_live=live,
+            seat = ClaudeChildResume(run_dir=str(directory), seat=child.name, role=task.role, staff_id=child.id, turn_live=live,
                               launcher_command=_launcher_command(launcher) if isinstance(launcher, int) else [])
             results.append(Resumable(seat) if live else Idle(seat))
         except (OSError, ValueError) as error:
             results.append(Unavailable(child.id, child.name, str(error).replace("\n", " ")))
     return results
-
-
-def _codex_servers(run_directories: list[Path]) -> list[CodexServer]:
-    servers: list[CodexServer] = []
-    for directory in run_directories:
-        record = _json_object(directory / "mesh_server.json")
-        pid = _positive_int(record.get("pid"))
-        if pid is None or not _pid_alive(pid):
-            continue
-        busy: list[str] = []
-        for name, raw_entry in sorted(_json_object(directory / "mesh_roster.json").items()):
-            if not isinstance(raw_entry, dict):
-                continue
-            entry = cast(dict[str, object], raw_entry)
-            launcher = _positive_int(entry.get("launcher_pid"))
-            # Saved status alone does not prove a launcher is still doing work.
-            launcher_is_live = launcher is not None and _pid_alive(launcher)
-            if entry.get("status") in ROSTER_LIVE and launcher_is_live:
-                busy.append(name)
-        servers.append({"run_dir": str(directory), "pid": pid, "busy_workers": busy})
-    return servers
 
 
 def _timers(session_id: str) -> list[str]:
@@ -987,7 +964,7 @@ def _session_details(record: SessionFile, entry: ListedSession, *, directories: 
         "updated_at": _wire_integer(record.get("updatedAt", 0), "session.updatedAt"),
         "model": _model(entry.session_id, entry.config_dir), "checkout": {"kind": "not a checkout"},
         "run_dirs": [str(directory) for directory in directories],
-        "codex_servers": _codex_servers(directories), "timers": timers, "host": host,
+        "timers": timers, "host": host,
         "kind": "top-level" if entry.kind == "unit" and host["kind"] == "unknown" else entry.kind,
     }
     if entry.kind == "showrunner":

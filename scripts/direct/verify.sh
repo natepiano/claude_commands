@@ -1413,18 +1413,13 @@ if kind == "token":
     if payload == "director":
         owner = unit_runs.director(board)
     elif payload and payload != "unknown":
-        roster = fields(read(board / "mesh_roster.json"))
-        matches = [entry for name, entry in roster.items() if isinstance(entry, dict)
-                   and name == payload]
+        matches = []
         if not matches:
             for path in board.glob("impl_worker_*.json"):
                 worker = fields(read(path))
                 if (text(worker.get("slot")) == payload
                         or path.stem == "impl_worker_" + payload):
                     matches.append(worker)
-        if not matches:
-            matches = [entry for entry in roster.values() if isinstance(entry, dict)
-                       and entry.get("slot") == payload]
         state = fields(read(board / "progress_history_state.json"))
         if matches:
             reference = text(matches[0].get("staff_id")) if len(matches) == 1 else ""

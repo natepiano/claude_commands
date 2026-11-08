@@ -81,9 +81,13 @@ def worker_status_path(run: Path, slot: str) -> Path:
 
 def worker_record_path(run: Path, name: str, slot: str) -> Path:
     """Find task settings through the fixed staff reference."""
-    record = worker_lifecycle.read_worker_state(run / "mesh_roster.json")
-    entry = record.get(name)
-    reference = str(cast(dict[str, object], entry).get("staff_id", "")) if isinstance(entry, dict) else ""
+    from scripts.production import staff, worker_admission
+
+    try:
+        member = worker_admission.member(run, name)
+    except ValueError:
+        member = None
+    reference = str(member.id) if isinstance(member, staff.StaffRow) else ""
     for path in sorted(run.glob("impl_worker_*.json")):
         try:
             value = cast(object, json.loads(path.read_text(encoding="utf-8")))

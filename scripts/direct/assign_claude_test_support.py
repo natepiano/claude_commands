@@ -224,7 +224,6 @@ class AssignClaudeLauncherFixture(LauncherFixture):
         sender = self.root / "send"
         _ = sender.write_text(STUB_SEND, encoding="utf-8")
         sender.chmod(0o755)
-        _ = shutil.copy2(DIRECT_DIR.parent / "production/worker_fill.py", self.root / "scripts/production/worker_fill.py")
         opening_sender = self.root / "opening-send.py"
         _ = opening_sender.write_text("import json, os, pathlib, sys\n"
             + "root = pathlib.Path(os.environ['STUB_CLAUDE_ROOT'])\n"

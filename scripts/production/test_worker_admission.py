@@ -13,7 +13,6 @@ from pathlib import Path
 from typing import Literal
 from unittest import mock
 
-from scripts.agents import worker_lifecycle
 from scripts.lib import unit_runs
 from scripts.production import fake_unit_host, session_staff, staff, worker_admission, showrunners
 from scripts.production.staff_test_support import (
@@ -32,7 +31,7 @@ class RecordedDirectorAdmissionTests(StaffTestCase):
         with self.assertRaises(ValueError) as missing_run:
             _ = worker_admission.parent(record, run=run)
         self.assertEqual(str(missing_run.exception),
-                         f"this run has no owner because {unit_runs.STATE_FILE} and mesh_roster.json name no unit, production or staff row")
+                         f"this run has no owner because {unit_runs.STATE_FILE} names no staff row")
         with self.assertRaises(ValueError) as missing_caller:
             _ = worker_admission.parent(record)
         self.assertEqual(str(missing_caller.exception), "the caller has no staff row and names no unit or production")
@@ -204,60 +203,8 @@ class FamilyHandoffTests(StaffTestCase):
         return worker_admission.WorkerStartAllowed(row.name, unit.id, run,
             worker_admission.ExistingWorkerSlot(row)), path, evidence
 
-    def test_dispatch_update_preserves_a_request_replaced_before_the_exclusive_lock(self) -> None:
-        allowed, _, _ = self.source("claude")
-        worker_admission.record_dispatch(allowed, "old-request", worker_admission.SwitchState.DISPATCH_IN_FLIGHT)
-        original = worker_lifecycle.acquire_flock
-        saved: list[bytes] = []
-        path = allowed.run / "mesh_roster.json"
 
-        def supersede(handle: int | worker_lifecycle.LockFileDescriptor, *, mode: int = fcntl.LOCK_EX,
-                      deadline: float = worker_lifecycle.NO_LOCK_DEADLINE) -> None:
-            if mode == fcntl.LOCK_EX and not saved:
-                with mock.patch.object(worker_lifecycle, "acquire_flock", original):
-                    worker_admission.record_dispatch(allowed, "new-request",
-                                                     worker_admission.SwitchState.CREATION_INTENT_RECORDED)
-                saved.append(path.read_bytes())
-            original(handle, mode=mode, deadline=deadline)
 
-        with mock.patch.object(worker_lifecycle, "acquire_flock", side_effect=supersede):
-            worker_admission.record_dispatch(allowed, "old-request",
-                worker_admission.SwitchState.ASSIGNMENT_ACCEPTED, expected_request="old-request")
-        self.assertEqual(path.read_bytes(), saved[0])
-        self.assertEqual(worker_admission.dispatch_record(allowed.run, allowed.name), worker_admission.DispatchRecord(
-            "new-request", worker_admission.SwitchState.CREATION_INTENT_RECORDED))
-        worker_admission.record_dispatch(allowed, "new-request",
-            worker_admission.SwitchState.ASSIGNMENT_ACCEPTED, expected_request="new-request")
-        self.assertEqual(worker_admission.dispatch_record(allowed.run, allowed.name), worker_admission.DispatchRecord(
-            "new-request", worker_admission.SwitchState.ASSIGNMENT_ACCEPTED))
-
-    def test_pending_dispatch_accepts_an_unset_state_and_reports_an_unreadable_roster(self) -> None:
-        allowed, _, _ = self.source("claude")
-        prompt = allowed.run / "assignment.txt"
-        _ = prompt.write_text("Complete this assignment.\n")
-        worker_admission.record_dispatch(allowed, worker_admission.assignment_id(prompt), worker_admission.SwitchState.NO_RECORD)
-        self.assertTrue(worker_admission.dispatch_pending(allowed.run, allowed.name, prompt))
-        path = allowed.run / "mesh_roster.json"
-        _ = path.write_text("{torn")
-        with redirect_stderr(io.StringIO()) as errors:
-            pending = worker_admission.dispatch_pending(allowed.run, allowed.name, prompt)
-        self.assertFalse(pending)
-        self.assertEqual(len(errors.getvalue().splitlines()), 1)
-        self.assertIn(f"anomaly: {allowed.name}:", errors.getvalue())
-        self.assertIn(str(path), errors.getvalue())
-
-    def test_unknown_dispatch_state_reports_an_anomaly_and_allows_admission(self) -> None:
-        allowed, _, _ = self.source("claude")
-        _ = (allowed.run / "mesh_roster.json").write_text(json.dumps({allowed.name: {"dispatch_state": "invalid"}}))
-        before = self.staff_state()
-        with redirect_stderr(io.StringIO()) as errors:
-            record = worker_admission.dispatch_record(allowed.run, allowed.name)
-            repeated = worker_admission.admit(allowed.name, allowed.run, reference=allowed.lock_reference)
-        self.assertEqual(errors.getvalue().splitlines(),
-                         [f"anomaly: {allowed.name}: unknown dispatch_state 'invalid'; using NO_RECORD"])
-        self.assertEqual(record.state, worker_admission.SwitchState.NO_RECORD)
-        self.assertEqual(repeated, allowed)
-        self.assertEqual(self.staff_state(), before)
 
     def test_source_run_discovery_only_follows_an_idle_codex_source(self) -> None:
         cases: tuple[tuple[Literal["claude", "codex"], bool], ...] = (("claude", False), ("codex", True))
@@ -360,14 +307,12 @@ class FamilyHandoffTests(StaffTestCase):
                 _ = inbox.write_text(json.dumps({"messages": ["held work"], "accepting_messages": True}))
                 previous_run = self.root / (f"previous-director-{family}-{interrupted}")
                 previous_run.mkdir()
-                reference = previous_run / "mesh_roster.json"
-                _ = reference.write_text(json.dumps({old.name: {"staff_id": old.id, "status": "done"}}))
                 parent = staff.by_id(allowed.parent)
                 assert parent is not None
                 _ = staff.update_current_session(parent.current_session, staff.native_id(
                     fixture_runtime_id(f"next-director-{family}-{interrupted}")))
-                before = self.staff_file.read_bytes(), inbox.read_bytes(), reference.read_bytes()
                 tree = session_staff.worker_directory(staff.snapshot(), old.id)
+                before = self.staff_state()
                 events: list[str] = []
                 attempts: list[worker_admission.FamilyHandoff] = []
 
@@ -427,7 +372,6 @@ class FamilyHandoffTests(StaffTestCase):
                 assert isinstance(attempts[-1], worker_admission.TranscriptHandoff)
                 self.assertEqual(attempts[-1].source, source)
                 self.assert_only_current_session_changed(before[0], old, identity)
-                self.assertEqual((inbox.read_bytes(), reference.read_bytes()), before[1:])
                 self.assertEqual(session_staff.worker_directory(staff.snapshot(), old.id), tree)
                 saved = self.staff_state()
                 with redirect_stdout(io.StringIO()) as output:
@@ -457,8 +401,6 @@ class FamilyHandoffTests(StaffTestCase):
                 old = source.slot.row
                 run = source.run / ("prime" if deferred else "dispatch")
                 run.mkdir()
-                _ = (run / "mesh_roster.json").write_text(json.dumps({old.name: {"staff_id": old.id, "status": "done"}}))
-                _ = (run / "mesh_server.json").write_text(json.dumps({"previous_servers": [{"pid": 987654321, "port": 9}]}))
                 allowed = worker_admission.admit(old.name, run, reference=old.id)
                 created: list[str] = []
                 dispatched: list[str] = []

@@ -6,7 +6,7 @@ import time
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TypedDict, cast
+from typing import cast
 
 from scripts.production import staff, showrunners
 from scripts.production import session_staff
@@ -147,15 +147,6 @@ class RunPlace:
     cwd: str
 
 
-class MeshWorker(TypedDict, total=False):
-    port: int
-    thread_id: str
-    status: str
-    launcher_pid: int
-    role: str
-    lens: str
-    cwd: str
-    held_design_id: str
 
 
 def as_string(value: object) -> str:
@@ -329,6 +320,7 @@ def production_places(
 
 def unit_labels_for(session_ids: Iterable[str], environment: Mapping[str, str]) -> dict[str, UnitLabels]:
     """Resolve Claude and Codex holders from files, without process scans, mesh calls or account reads."""
+    del environment
     wanted = set(session_ids)
     if not wanted:
         return {}
@@ -368,7 +360,7 @@ def unit_labels_for(session_ids: Iterable[str], environment: Mapping[str, str]) 
                 director = (UnderDirector(unit, names[owner], f"session:{owner}")
                             if owner in names else UnitWithoutRunningDirector(unit))
             labels[session_id] = make_labels(names[session_id], showrunner, director)
-        labels.update(codex_unit_labels(wanted - labels.keys(), environment, records, places, problems, membership=record))
+        labels.update(codex_unit_labels(wanted - labels.keys(), records, places, membership=record))
         return labels
     except Exception:
         return {}
@@ -426,39 +418,18 @@ def stopped_run_place(run: Path, record: staff.StaffSnapshot) -> RunPlace:
         state = read_object(run / unit_runs.STATE_FILE)
     except (OSError, UnicodeError, ValueError):
         return RunPlace(NoDirector(), NoShowrunner(), "")
-    from scripts.direct import plan_history
-    if state.get(unit_runs.OWNER_FIELD):
-        state = plan_history.staff_directory(state, record)
-    cwd = as_string(state.get("working_dir"))
-    # Older runs may keep their identity only in the plan. Import the history
-    # reader for that fallback, not for every lookup of recorded labels.
-    from scripts.direct.progress_history import ProductionUnitIdentity, resolve_production_unit
-
-    identity = resolve_production_unit(state, resolver=session_staff.RowResolver(record))
-    if isinstance(identity, ProductionUnitIdentity):
-        return RunPlace(UnitWithoutRunningDirector(identity.unit),
-                         ProductionWithoutRunningShowrunner(identity.production), cwd)
-    return RunPlace(NoDirector(), NoShowrunner(), cwd)
+    owner = unit_runs.run_owner(state, record)
+    if isinstance(owner, unit_runs.RunOwnerUnrecorded):
+        return RunPlace(NoDirector(), NoShowrunner(), "")
+    runner = record.parent_of(owner)
+    showrunner: ShowrunnerRelationship = (
+        ProductionWithoutRunningShowrunner(runner.name) if runner is not None else NoShowrunner())
+    cwd = str(owner.worktree.path) if isinstance(owner.worktree, staff.PresentWorktree) else ""
+    return RunPlace(UnitWithoutRunningDirector(owner.name), showrunner, cwd)
 
 
-def mesh_records(run: LiveRun, problems: list[str]) -> dict[str, MeshWorker]:
-    path = run.path / "mesh_roster.json"
-    if not path.exists():
-        return {}
-    try:
-        stored = read_object(path)
-    except (OSError, UnicodeError, ValueError, json.JSONDecodeError) as error:
-        problem(problems, f"Codex roster {path}", error)
-        return {}
-    records: dict[str, MeshWorker] = {}
-    for name, value in stored.items():
-        if isinstance(value, dict):
-            records[name] = cast("MeshWorker", cast("object", value))
-    return records
 
 
-def listed_mesh_worker(record: MeshWorker) -> bool:
-    return not (record.get("status") == "ended" or record.get("held_design_id"))
 
 
 def staff_relationships(membership: staff.StaffSnapshot, member: staff.StaffRow,
@@ -481,46 +452,18 @@ def staff_relationships(membership: staff.StaffSnapshot, member: staff.StaffRow,
 
 
 def codex_unit_labels(
-    wanted: set[str], environment: Mapping[str, str], records: list[SessionRecord],
-    places: Mapping[str, ProductionPlace], problems: list[str],
+    wanted: set[str], records: list[SessionRecord],
+    places: Mapping[str, ProductionPlace],
     *, membership: staff.StaffSnapshot,
 ) -> dict[str, UnitLabels]:
-    if not wanted:
-        return {}
-    roots = unit_runs.run_roots(environment.get("ROSTER_RUN_ROOT"))
-    matches: dict[Path, dict[str, str]] = {}
-    # Check requested thread IDs before discovering live runs. Claude-only
-    # lookups and unknown IDs need no live-run discovery or account data.
-    for root in roots:
-        try:
-            paths = sorted(root.glob("*/mesh_roster.json"))
-        except OSError as error:
-            problem(problems, f"Codex rosters in {root}", error)
-            continue
-        for path in paths:
-            run = LiveRun(path.parent, NoRunningDirector())
-            workers: dict[str, str] = {}
-            for name, entry in sorted(mesh_records(run, problems).items()):
-                try:
-                    current = cast(Mapping[str, object], entry)
-                except staff.StaffUnreadable as error:
-                    problem(problems, f"Codex worker {path}:{name}", error)
-                    continue
-                thread = as_string(session_staff.worker_session(current, membership))
-                if thread in wanted and listed_mesh_worker(entry):
-                    workers[thread] = name
-            if workers:
-                matches[path.parent.resolve()] = workers
-    if not matches:
-        return {}
-    names: dict[str, str] = {item["sessionId"]: item["name"] for item in records}
+    names = {item["sessionId"]: item["name"] for item in records}
     labels: dict[str, UnitLabels] = {}
-    for workers in matches.values():
-        for thread in workers:
-            member = membership.by_current_session(thread)
-            if member is None or not isinstance(member.parent, staff.ReportsTo):
-                continue
-            director, showrunner = staff_relationships(membership, member, names,
-                                                        {key: place.showrunner for key, place in places.items()})
-            labels[thread] = make_labels(member.name, showrunner, director)
+    for member in membership.find(kind="worker"):
+        evidence = session_staff.worker_backend(membership, member.id)
+        if (member.current_session not in wanted or not isinstance(evidence, session_staff.RecordedWorker)
+                or not isinstance(evidence.backend, staff.CodexBackend)):
+            continue
+        director, showrunner = staff_relationships(membership, member, names,
+                                                   {key: place.showrunner for key, place in places.items()})
+        labels[member.current_session] = make_labels(member.name, showrunner, director)
     return labels

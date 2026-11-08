@@ -19,6 +19,9 @@ try:
 except FileNotFoundError:
     pass
 
+import base64
+import secrets
+import struct
 import json
 import hashlib
 import ctypes
@@ -35,13 +38,12 @@ import time
 from contextlib import contextmanager
 from contextvars import ContextVar
 from functools import cache, cached_property
-from importlib import import_module
 from dataclasses import dataclass, field
 from enum import Enum, StrEnum
 from datetime import datetime, timezone
 from pathlib import Path
 from collections.abc import Callable, Generator, Iterable, Mapping, Sequence, Set
-from typing import TYPE_CHECKING, Literal, NamedTuple, Never, NotRequired, TypedDict, TypeVar, cast, final, override
+from typing import TYPE_CHECKING, Literal, NamedTuple, Never, NotRequired, TypedDict, TypeVar, Protocol, cast, final, override
 
 
 from scripts.herdr import pane_launch
@@ -2471,7 +2473,6 @@ class Herdr:
         return agents
 
 
-
 def _pane_process_ids(info: dict[str, object], context: str) -> tuple[int, int]:
     values = (info.get("shell_pid"), info.get("foreground_process_group_id"))
     if any(isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0 for pid in values):
@@ -3511,12 +3512,168 @@ class CodexConversations:
     unknown: tuple[str, ...]
 
 
+@final
+class _RunServerClient:
+    """Read JSON-RPC replies from a run server within one deadline."""
+
+    def __init__(self, port: int, deadline: float) -> None:
+        self.deadline: float = deadline
+        self.connection: socket.socket = socket.create_connection(("127.0.0.1", port), timeout=self.remaining())
+        self.buffer: bytearray = bytearray()
+        self.counter: int = 0
+        try:
+            key = base64.b64encode(secrets.token_bytes(16)).decode()
+            self.connection.sendall((f"GET / HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n"
+                f"Upgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {key}\r\n"
+                "Sec-WebSocket-Version: 13\r\n\r\n").encode())
+            while b"\r\n\r\n" not in self.buffer:
+                self.receive()
+            header, _, rest = self.buffer.partition(b"\r\n\r\n")
+            if b" 101 " not in header.split(b"\r\n")[0]:
+                raise ValueError("server refused the websocket handshake")
+            self.buffer = bytearray(rest)
+            _ = self.call("initialize", {"clientInfo": {"name": "staff-observe", "version": "1.0"},
+                                         "capabilities": {"experimentalApi": True}})
+        except BaseException:
+            self.connection.close()
+            raise
+
+    def remaining(self) -> float:
+        if time.monotonic() >= worker_lifecycle.effective_deadline():
+            raise worker_lifecycle.OperationDeadlineExpired("shutdown incomplete: RPC operation deadline expired")
+        remaining = min(self.deadline, worker_lifecycle.effective_deadline()) - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("loaded-thread observation timed out")
+        return remaining
+
+    def receive(self) -> None:
+        self.connection.settimeout(self.remaining())
+        data = self.connection.recv(262144)
+        if not data:
+            raise ConnectionError("server closed the connection")
+        self.buffer.extend(data)
+
+    def take(self, size: int) -> bytes:
+        while len(self.buffer) < size:
+            self.receive()
+        data = bytes(self.buffer[:size])
+        del self.buffer[:size]
+        return data
+
+    def call(self, method: str, params: dict[str, object], timeout: float = math.inf) -> dict[str, object]:
+        deadline = self.deadline
+        self.deadline = min(deadline, time.monotonic() + timeout)
+        try:
+            self.counter += 1
+            data = json.dumps({"jsonrpc": "2.0", "id": self.counter, "method": method, "params": params}).encode()
+            mask = secrets.token_bytes(4)
+            length = len(data)
+            header = bytes((0x81, 0x80 | length)) if length < 126 else (
+                bytes((0x81, 0xFE)) + struct.pack(">H", length) if length < 65536
+                else bytes((0x81, 0xFF)) + struct.pack(">Q", length))
+            self.connection.settimeout(self.remaining())
+            self.connection.sendall(header + mask + bytes(byte ^ mask[index % 4] for index, byte in enumerate(data)))
+            while True:
+                header = self.take(2)
+                length = header[1] & 0x7F
+                if length in (126, 127):
+                    length = int.from_bytes(self.take(2 if length == 126 else 8), "big")
+                payload = self.take(length)
+                if header[0] & 0x0F == 8:
+                    raise ConnectionError("server sent close")
+                if header[0] & 0x0F not in (1, 2):
+                    continue
+                message = cast(object, json.loads(payload))
+                if not isinstance(message, dict):
+                    continue
+                reply = cast(dict[str, object], message)
+                if reply.get("id") != self.counter:
+                    continue
+                return reply
+        finally:
+            self.deadline = deadline
+
+
+class LoadedThreadClient(Protocol):
+    def call(self, method: str, params: dict[str, object], timeout: float = ...) -> Mapping[str, object]: ...
+
+
+def loaded_thread_ids(client: LoadedThreadClient, deadline: float) -> set[str]:
+    """Read every loaded-thread page before the supplied deadline."""
+    threads: set[str] = set()
+    cursor = ""
+    seen: set[str] = set()
+    while time.monotonic() < deadline:
+        response = client.call("thread/loaded/list", {"cursor": cursor} if cursor else {},
+                               timeout=max(0.01, deadline - time.monotonic()))
+        if response.get("error"):
+            raise SystemExit(f"thread/loaded/list failed: {response['error']}")
+        result = response.get("result")
+        listed = cast(dict[str, object], result) if isinstance(result, dict) else {}
+        data = listed.get("data")
+        if not isinstance(data, list):
+            raise SystemExit("server returned no loaded-thread list")
+        for item in cast(list[object], data):
+            if not isinstance(item, str) or not item:
+                raise SystemExit("server returned an invalid loaded-thread id")
+            threads.add(item)
+        next_cursor = listed.get("nextCursor")
+        if next_cursor is None or next_cursor == "":
+            return threads
+        if not isinstance(next_cursor, str) or next_cursor in seen:
+            raise SystemExit("server returned an invalid loaded-thread cursor")
+        cursor = next_cursor
+        seen.add(cursor)
+    if time.monotonic() >= worker_lifecycle.effective_deadline():
+        raise worker_lifecycle.OperationDeadlineExpired("shutdown incomplete: RPC operation deadline expired")
+    raise SystemExit("loaded-thread list timed out")
+
+
+def loaded_threads(run: Path, deadline: float) -> set[str]:
+    """Read all loaded threads from every live server of a run."""
+    from scripts.lib.unit_runs import SERVER_FILE
+
+    path = run / SERVER_FILE
+    current = worker_lifecycle.read_worker_state(path)
+    previous = current.get("previous_servers", [])
+    records = list(cast(list[object], previous)) if isinstance(previous, list) else []
+    if "pid" in current:
+        records.append(current)
+    ports: set[int] = set()
+    loaded: set[str] = set()
+    for value in records:
+        if not isinstance(value, dict):
+            raise worker_lifecycle.WorkerStateUnreadable(path, "invalid server record")
+        record = cast(dict[str, object], value)
+        port, pid = record.get("port"), record.get("pid")
+        if type(port) is not int or not 0 < port <= 65535:
+            raise worker_lifecycle.WorkerStateUnreadable(path, "invalid server port")
+        if not worker_lifecycle.is_process_pid(pid):
+            raise worker_lifecycle.WorkerStateUnreadable(path, "invalid server pid")
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            continue
+        if port in ports:
+            continue
+        ports.add(port)
+        try:
+            client = _RunServerClient(port, deadline)
+            try:
+                loaded.update(loaded_thread_ids(client, deadline))
+            finally:
+                client.connection.close()
+        except worker_lifecycle.OperationDeadlineExpired:
+            raise
+        except (SystemExit, OSError, ValueError) as error:
+            raise ValueError(f"{path}: Codex thread activity is unavailable: {error}") from error
+    return loaded
+
+
 def codex_conversations(*, wanted: str = "") -> CodexConversations:
     from scripts.lib import unit_runs
     from scripts.message import codex_daemon
 
-    # A static import would close the cycle codex_mesh -> session_staff -> herdr -> codex_mesh.
-    loaded_threads = cast(Callable[[Path, float], set[str]], import_module("scripts.agents.codex_mesh").loaded_threads)
     candidates: list[tuple[int, list[str]]] = []
     unknown: list[tuple[int, str] | str] = []
     try:

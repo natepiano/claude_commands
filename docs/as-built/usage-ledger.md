@@ -7,7 +7,7 @@ Each request records token classes, model, effort, and the role held at that tim
 The same store records runs, phases, reviews, findings, checkpoints, compactions, readings, and account-role changes.
 Named SQL queries compare usage across roles, models, and outcomes.
 The assignment log preserves role history independently of temporary run folders.
-The [worker design](long-lived-workers.md#roster-fields) defines the staff references in current run records.
+The [worker design](long-lived-workers.md#staff-membership-and-dispatch) defines the staff references in current run records.
 
 ## How it works
 
@@ -34,7 +34,7 @@ The code that assigns a role records it when it assigns it, in an append-only `<
 | `scripts/production/update_registration.py register` | `showrunner`, at every showrunner start and resume |
 | `scripts/direct/claude_worker.py` | Records the dispatch role under the full destination id before delivery. A call without a role records nothing, so the session stays `interactive`. |
 | `scripts/agents/codex_mesh.py` | the worker's role and `--lens` on a new thread and on a follow-up claim; the previous role again when a claim is released |
-| `scripts/direct/review.sh` | Passes `--lens` to `codex_mesh.py`; records each fresh simplify session as `review` with lens `simplify`. |
+| `scripts/direct/review.sh` | Records each fresh review session as `review` with its lens. |
 | `scripts/hooks/session-start-agents-log.py` | `subagent` for a payload with a non-empty `agent_id`, else `interactive` for `session_id`, through `register_default` |
 
 The hook is registered twice in `settings.json`, with the command `"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/hooks/session-start-agents-log.py"`: in the `hooks.SessionStart` entry with no `matcher` (startup, resume, clear, compact) and in a `hooks.SubagentStart` entry with no `matcher`. `SubagentStart` delivers the parent `session_id` and the `agent_id` before the subagent's first request; `SessionStart` does not fire for a subagent. The lens lives only in `agents.jsonl`, never in `mesh_roster.json`.
@@ -227,11 +227,15 @@ A new metric, dimension or outcome is one registry entry. The report reads `turn
 
 The hourly pass lives outside this repository, in `/etc/nixos/modules/linux/usage-collect.nix` (`nate.jobs.usage-collect`, `intervalSeconds = 3600`, `TimeoutStartSec = "45min"`): `exec "$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/usage/collect.py"` with the user's PATH, one hour after the last pass ended and one hour after login. The collector's only message is the waste watch's alert to a showrunner; its output, and any alert with no showrunner, goes to the journal. It takes effect at a NixOS rebuild.
 
-### Worker roster guards in `scripts/agents/codex_mesh.py`
+### Held worker roster guards in `scripts/agents/codex_mesh.py`
+
+The held assignment launcher still calls these mesh helpers.
+Round 2 removes them after the launcher migration.
+Current role readers use the assignment log and staff membership.
 
 The roster stores the context size that controls launcher compaction.
 Staff resolves the current thread; the assignment log supplies the role.
-The [worker design](long-lived-workers.md#roster-fields) defines the stored fields and ownership rules.
+The [worker design](long-lived-workers.md#staff-membership-and-dispatch) defines the stored fields and ownership rules.
 Conditional writes prevent an earlier thread or compaction from replacing a newer record.
 These writes do not enter the usage store.
 

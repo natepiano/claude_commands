@@ -8,6 +8,12 @@ error; callers must pass ownership down instead of reacquiring it.
 """
 from __future__ import annotations
 
+import ctypes
+import errno
+import socket
+import struct
+from enum import Enum
+
 import fcntl
 import contextlib
 import os
@@ -23,6 +29,7 @@ from pathlib import Path
 from typing import Protocol, TypeGuard, final, cast
 
 from scripts.lib.atomic_file import write_text_atomic
+from scripts.lib.unit_runs import SERVER_FILE
 
 
 @dataclass(frozen=True)
@@ -419,3 +426,234 @@ def locked_state(path: Path, *, mode: int = fcntl.LOCK_EX,
 def empty_inbox() -> dict[str, object]:
     """An admission has no staff reference before publication."""
     return {"messages": [], "accepting_messages": True}
+
+
+class SocketReady(Enum):
+    """The watched connection can be read without blocking."""
+
+    READY = "ready"
+
+
+class WaitDeadlineExpired(Enum):
+    """No relevant event arrived before the monotonic wait deadline."""
+
+    EXPIRED = "expired"
+
+
+@dataclass(frozen=True)
+class StateFilesChanged:
+    paths: frozenset[Path]
+
+
+FileWaitResult = SocketReady | StateFilesChanged | WaitDeadlineExpired
+
+# inotify's parent watches discover replacements; only file watches subscribe
+# to content writes. Unrelated logs and heartbeats never enter our event queue.
+_IN_MODIFY = 0x00000002
+_IN_ATTRIB = 0x00000004
+_IN_MOVED_FROM = 0x00000040
+_IN_MOVED_TO = 0x00000080
+_IN_CREATE = 0x00000100
+_IN_DELETE = 0x00000200
+_IN_DELETE_SELF = 0x00000400
+_IN_MOVE_SELF = 0x00000800
+_IN_Q_OVERFLOW = 0x00004000
+_IN_IGNORED = 0x00008000
+_IN_REPLACEMENT = _IN_MOVED_FROM | _IN_MOVED_TO | _IN_CREATE | _IN_DELETE
+_IN_INVALIDATED = _IN_DELETE_SELF | _IN_MOVE_SELF | _IN_IGNORED
+
+
+@final
+class LinuxFileChanges:
+    """Watch state files directly, and names in parents only for replacements."""
+
+    def __init__(self, paths: set[Path]) -> None:
+        library = ctypes.CDLL(None, use_errno=True)
+        initialize = cast(Callable[[int], int], library.inotify_init1)
+        self._add_watch = cast(Callable[[int, bytes, int], int], library.inotify_add_watch)
+        self._remove_watch = cast(Callable[[int, int], int], library.inotify_rm_watch)
+        self.descriptor: int = initialize(os.O_CLOEXEC | os.O_NONBLOCK)
+        if self.descriptor < 0:
+            raise OSError(ctypes.get_errno(), "cannot watch follower state")
+        self.paths: set[Path] = paths
+        self.watches: dict[int, Path] = {}
+        self.directories: set[Path] = set()
+        try:
+            self._arm()
+        except BaseException:
+            self.close()
+            raise
+
+    def _arm(self) -> None:
+        wanted: dict[Path, int] = {}
+        for path in self.paths:
+            directory = path.parent
+            while not directory.is_dir():
+                directory = directory.parent
+            self.directories.add(directory)
+            wanted[directory] = _IN_REPLACEMENT | _IN_DELETE_SELF | _IN_MOVE_SELF
+            if path.is_file():
+                # ensure_server touches its record to extend the server lease.
+                # That metadata-only write does not change its serving identity.
+                wanted[path] = _IN_MODIFY | _IN_DELETE_SELF | _IN_MOVE_SELF
+                if path.name != SERVER_FILE:
+                    wanted[path] |= _IN_ATTRIB
+        for path, mask in wanted.items():
+            if path in self.watches.values():
+                continue
+            watch = self._add_watch(self.descriptor, os.fsencode(path), mask)
+            if watch < 0:
+                if ctypes.get_errno() == errno.ENOENT:
+                    continue  # The already armed parent reports the next creation.
+                raise OSError(ctypes.get_errno(), f"cannot watch {path}")
+            self.watches[watch] = path
+
+    def wait(self, connection: socket.socket, deadline: float) -> FileWaitResult:
+        while time.monotonic() < deadline:
+            ready, _, _ = select.select(
+                [connection, self.descriptor], [], [], max(0.0, deadline - time.monotonic()))
+            changed: set[Path] = set()
+            if self.descriptor in ready:
+                data = os.read(self.descriptor, 65536)
+                offset = 0
+                while offset < len(data):
+                    watch, mask, _cookie, length = struct.unpack_from("iIII", data, offset)
+                    name = os.fsdecode(data[offset + 16:offset + 16 + length].split(b"\0", 1)[0])
+                    offset += 16 + length
+                    path = self.watches.get(watch)
+                    if mask & _IN_Q_OVERFLOW:
+                        changed.update(self.paths)
+                    if path is None:
+                        continue
+                    if path in self.directories:
+                        target = path / name
+                        changed.update(wanted for wanted in self.paths
+                                       if target == wanted or target in wanted.parents)
+                        # A replacement's pathname now names a different inode.
+                        for old_watch, old_path in tuple(self.watches.items()):
+                            if old_path == target and old_path not in self.directories:
+                                _ = self._remove_watch(self.descriptor, old_watch)
+                                _ = self.watches.pop(old_watch, None)
+                    else:
+                        changed.add(path)
+                    if mask & _IN_INVALIDATED:
+                        _ = self.watches.pop(watch, None)
+                self._arm()
+            if changed:
+                return StateFilesChanged(frozenset(changed))
+            if connection in ready:
+                return SocketReady.READY
+        return WaitDeadlineExpired.EXPIRED
+
+    def close(self) -> None:
+        os.close(self.descriptor)
+
+
+@dataclass(frozen=True)
+class WatchedFileVersion:
+    """The identity and content-write timestamp of a named state file."""
+
+    inode: int
+    size: int
+    modified_ns: int
+
+
+class MissingWatchedFile(Enum):
+    MISSING = "missing"
+
+
+def _watched_file_version(path: Path) -> WatchedFileVersion | MissingWatchedFile:
+    try:
+        record = path.stat()
+        return WatchedFileVersion(record.st_ino, record.st_size, record.st_mtime_ns)
+    except FileNotFoundError:
+        return MissingWatchedFile.MISSING
+
+
+@final
+class KqueueFileChanges:
+    """Filter parent vnode events through the versions of the watched files."""
+
+    def __init__(self, paths: set[Path]) -> None:
+        self.paths: set[Path] = paths
+        self.queue: select.kqueue = select.kqueue()
+        self.watches: dict[Path, int] = {}
+        self.versions: dict[Path, WatchedFileVersion | MissingWatchedFile] = {
+            path: _watched_file_version(path) for path in paths}
+        try:
+            self._arm()
+        except BaseException:
+            self.close()
+            raise
+
+    def _arm(self) -> None:
+        wanted = set(self.paths)
+        for path in self.paths:
+            directory = path.parent
+            while not directory.is_dir():
+                directory = directory.parent
+            wanted.add(directory)
+        for path in wanted - self.watches.keys():
+            try:
+                descriptor = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+            except FileNotFoundError:
+                continue
+            self.watches[path] = descriptor
+            flags = select.KQ_NOTE_WRITE | select.KQ_NOTE_DELETE | select.KQ_NOTE_RENAME
+            if path in self.paths and path.name != SERVER_FILE:
+                flags |= select.KQ_NOTE_ATTRIB
+            _ = self.queue.control([select.kevent(descriptor, filter=select.KQ_FILTER_VNODE,
+                flags=select.KQ_EV_ADD | select.KQ_EV_CLEAR, fflags=flags)], 0)
+
+    def wait(self, connection: socket.socket, deadline: float) -> FileWaitResult:
+        descriptor = connection.fileno()
+        _ = self.queue.control([select.kevent(descriptor, filter=select.KQ_FILTER_READ,
+            flags=select.KQ_EV_ADD | select.KQ_EV_CLEAR)], 0)
+        try:
+            while time.monotonic() < deadline:
+                events = self.queue.control([], 64, max(0.0, deadline - time.monotonic()))
+                changed: set[Path] = set()
+                if any(event.filter == select.KQ_FILTER_VNODE for event in events):
+                    for path in self.paths:
+                        version = _watched_file_version(path)
+                        if version != self.versions[path]:
+                            self.versions[path] = version
+                            changed.add(path)
+                            old_descriptor = self.watches.pop(path, -1)
+                            if old_descriptor >= 0:
+                                os.close(old_descriptor)
+                    for event in events:
+                        if (event.filter == select.KQ_FILTER_VNODE
+                                and event.fflags & (select.KQ_NOTE_DELETE | select.KQ_NOTE_RENAME)):
+                            for path, watched_descriptor in tuple(self.watches.items()):
+                                if watched_descriptor == event.ident:
+                                    os.close(self.watches.pop(path))
+                    self._arm()
+                if changed:
+                    return StateFilesChanged(frozenset(changed))
+                if any(event.filter == select.KQ_FILTER_READ and event.ident == descriptor for event in events):
+                    return SocketReady.READY
+            return WaitDeadlineExpired.EXPIRED
+        finally:
+            # No READ registration for an earlier connection may wake a moved worker.
+            with contextlib.suppress(OSError):
+                _ = self.queue.control([select.kevent(descriptor, filter=select.KQ_FILTER_READ,
+                    flags=select.KQ_EV_DELETE)], 0)
+
+    def close(self) -> None:
+        self.queue.close()
+        for descriptor in self.watches.values():
+            os.close(descriptor)
+
+
+def finished_run_status(session_dir: str) -> str:
+    """Return the final run status, or an empty string for an unfinished run."""
+    from scripts.lib.unit_runs import STATE_FILE
+
+    state = read_json_object(Path(session_dir) / STATE_FILE)
+    status = state.get("status")
+    return status if isinstance(status, str) and status != "active" and "finished_at" in state else ""
+
+
+DETACHED_RUNS_DIR = "mesh_runs"
+DETACHED_RUN_START_GRACE_SECS = 60.0

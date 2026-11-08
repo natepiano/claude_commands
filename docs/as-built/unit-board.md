@@ -77,17 +77,11 @@ progress_history.py eta --session-dir <dir> --time <t> --basis <basis>
   - It is `build_plan` on that plan; when that has no phases, `build_run(plan, events)` from the run's events.
   - A run on another plan than its production row (hana `demo`) shows its real phase.
   - `plan` is the Plan cell, and is empty when that file no longer exists.
-- `workers` combines the run roster, slot metadata, and each slot's newest board activity.
-  `recorded_turn_settings` supplies the accepted model and effort.
-  `done` displays as `idle`; `ended` stays unchanged.
-  The reader displays raw role and family values when the records contain them.
-  Missing values display as empty fields.
-  The [worker design](long-lived-workers.md#roster-fields) defines the current records without copied role or family fields.
-  - Slots drop the worktree's mesh prefix.
-  - Roster entries that become one slot merge into the entry its `impl_worker_<slot>.json` names, else the last in roster order. Roster `revision` values are per-entry counters, never compared.
-  - `doing` is less a leading `launcher: ` and a trailing `; summary at …` or `; findings in …`, stripped and cut to 80 characters.
+- `workers` reads the run owner and that owner's staff workers.
+  It displays pane state and the cause of unknown or incomplete evidence.
+  Worker posts and launcher writes update the watched run folder and `board.log`.
 - `eta.at`/`first`/`trail` are stated promises only; `schedule_end` is the chain's end and never a trail entry.
-- `sources` lists existing paths only: each unit's run `.jsonl`, `mesh_roster.json`, `board.log`, every `impl_worker_<slot>.json`, the plan doc, every `plan_runs` `.jsonl`, a standing unit's style ledger, the production doc, plus each session dir, the run roots and the history `runs/` dir (or the history root while `runs/` is missing), so a run that starts later moves a watched mtime.
+- `sources` lists existing paths only: each unit's run `.jsonl`, the run state file, `board.log`, the plan doc, every `plan_runs` `.jsonl`, a standing unit's style ledger, the production doc, plus each session dir, the run roots and the history `runs/` dir (or the history root while `runs/` is missing), so a run that starts later moves a watched mtime.
 
 ### The mod
 

@@ -16,7 +16,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.lib import unit_runs  # noqa: E402
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.production import staff
-from scripts.production.staff_test_support import StaffTestCase, fixture_member, fixture_runtime_id, fixture_worker, showrunner_relationship
+from scripts.production.staff_test_support import StaffTestCase, fixture_member, fixture_runtime_id, showrunner_relationship
 if TYPE_CHECKING:
     from scripts.message import sessions
 else:
@@ -25,6 +25,20 @@ else:
 
 
 class UnitRunsTest(StaffTestCase):
+    def test_showrunner_run_resolves_both_session_and_fixed_owner_records(self) -> None:
+        owner = fixture_member("showrunner", name="production-owner")
+        run = self.root / "production-run"
+        run.mkdir()
+        record = staff.snapshot()
+        states = (
+            {"main_agent": {"session_id": owner.current_session}},
+            {unit_runs.OWNER_FIELD: owner.id},
+        )
+        for state in states:
+            with self.subTest(state=state):
+                self.write_json(run / unit_runs.STATE_FILE, state)
+                self.assertEqual(unit_runs.director(run, record=record), owner.current_session)
+
     def test_anomaly_prints_once_across_both_import_names(self) -> None:
         repository = Path(__file__).resolve().parents[2]
         environment = {**os.environ, "PYTHONPATH": os.pathsep.join((str(repository / "scripts/lib"), str(repository)))}
@@ -51,8 +65,8 @@ class UnitRunsTest(StaffTestCase):
             write_text_atomic(first / unit_runs.STATE_FILE, json.dumps({unit_runs.OWNER_FIELD: "gone"}))
             self.assertEqual(unit_runs.director(first, record=record), "")
         self.assertEqual(errors.getvalue().splitlines(), [
-            f"anomaly: {first}: this run has no owner because {unit_runs.STATE_FILE} and mesh_roster.json name no unit, production or staff row",
-            f"anomaly: {second}: this run has no owner because {unit_runs.STATE_FILE} and mesh_roster.json name no unit, production or staff row",
+            f"anomaly: {first}: this run has no owner because {unit_runs.STATE_FILE} names no staff row",
+            f"anomaly: {second}: this run has no owner because {unit_runs.STATE_FILE} names no staff row",
             f"anomaly: {first}: run owner gone: unit staff row is unavailable"])
 
     def test_parent_transport_reads_the_first_held_pin_without_writing(self) -> None:
@@ -65,10 +79,9 @@ class UnitRunsTest(StaffTestCase):
         self.staff_owner(first, session)
         self.staff_owner(second, session)
         runner = fixture_member("showrunner", name="roster-parent")
-        worker = fixture_worker("impl", runner.id)
         roster_run = runs / "c-roster"
         roster_run.mkdir()
-        write_text_atomic(roster_run / "mesh_roster.json", json.dumps({"impl": {"staff_id": worker.id}}))
+        write_text_atomic(roster_run / unit_runs.STATE_FILE, json.dumps({unit_runs.OWNER_FIELD: runner.id}))
         with (patch.object(unit_runs, "RUN_ROOT", runs),
               patch.object(unit_runs, "FORMER_RUN_ROOT", self.root / "former"),
               patch.dict(os.environ, {"CONF_DIR": str(config), "ROSTER_RUN_ROOT": str(runs)})):
@@ -95,17 +108,6 @@ class UnitRunsTest(StaffTestCase):
                 self.assertEqual(unit_runs.parent_transport(session, record=record), "mesh")
             self.assertEqual(reads.call_count, 0)
 
-    def test_roster_only_run_keeps_its_mesh_pin_with_herdr_configured(self) -> None:
-        owner = fixture_member("showrunner", name="roster-owner")
-        worker = fixture_worker("impl", owner.id)
-        run, config = self.root / "runs/roster-only", self.root / "config"
-        run.mkdir(parents=True)
-        config.mkdir()
-        write_text_atomic(run / "mesh_roster.json", json.dumps({"impl": {"staff_id": worker.id}}))
-        write_text_atomic(run / "worker_transport", "mesh\n")
-        write_text_atomic(config / "direct.conf", "WORKER_TRANSPORT=herdr\n")
-        with patch.dict(os.environ, {"CONF_DIR": str(config), "ROSTER_RUN_ROOT": str(run.parent)}):
-            self.assertEqual(unit_runs.parent_transport(owner.current_session, record=staff.snapshot()), "mesh")
 
     def test_run_pin_reads_absent_valid_and_invalid_values_without_writing(self) -> None:
         run = self.root / "read-pin"
@@ -189,18 +191,6 @@ class UnitRunsTest(StaffTestCase):
         owner = fixture_member("unit", name="owner-" + session_id[:8], parent=parent.id, runtime_id=session_id)
         _ = (run / unit_runs.STATE_FILE).write_text(json.dumps({"production": parent.name, "unit": owner.name, "owner_staff_id": owner.id}))
 
-    def test_director_without_progress_state_resolves_roster_parent_without_output(self) -> None:
-        production = fixture_member("showrunner", name="roster-production")
-        owner = fixture_member("unit", name="roster", parent=production.id)
-        worker = fixture_worker("impl", owner.id)
-        run = self.root / "roster-run"
-        run.mkdir()
-        _ = (run / "mesh_roster.json").write_text(json.dumps({"impl": {"staff_id": worker.id}}))
-        self.assertFalse((run / unit_runs.STATE_FILE).exists())
-        with contextlib.redirect_stdout(io.StringIO()) as output, contextlib.redirect_stderr(io.StringIO()) as errors:
-            self.assertEqual(unit_runs.director(run), owner.current_session)
-        self.assertEqual(output.getvalue(), "")
-        self.assertEqual(errors.getvalue(), "")
 
     def test_director_reports_existing_invalid_or_unreadable_progress_state(self) -> None:
         _ = fixture_member("showrunner", name="state-diagnostics")
@@ -309,6 +299,19 @@ class UnitRunsTest(StaffTestCase):
             with contextlib.redirect_stdout(io.StringIO()) as shown:
                 self.assertEqual(unit_runs.main(["held", fixture_runtime_id("sid-me"), "--root", str(new), "--active", str(active)]), 0)
             self.assertEqual(shown.getvalue().splitlines(), [str(new / "run-marked"), str(new / "run-side")])
+
+    def test_held_uses_the_override_roots_active_marker(self) -> None:
+        root = self.root / "override"
+        active = root / "active"
+        active.mkdir(parents=True)
+        session = fixture_runtime_id("director")
+        for name in ("a-side", "z-marked"):
+            run = root / name
+            run.mkdir()
+            self.staff_owner(run, session)
+        with (active / session).open("w") as stream:
+            stream.writelines([str(root / "z-marked") + "\n"])
+        self.assertEqual(unit_runs.held(session, root), [str(root / "z-marked"), str(root / "a-side")])
 
     def test_held_scan_excludes_marker_folders_from_both_default_roots(self) -> None:
         current, former = self.root / "unit", self.root / "delegate"

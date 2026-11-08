@@ -40,9 +40,10 @@ def record_wait_workers(root: Path, session: Path, environment: dict[str, str],
         roster = {name: {"staff_id": fixture_worker(name, parent.id, runtime_id=fixture_runtime_id(identity)).id}
                   for name, identity in workers.items()}
     session.mkdir(parents=True, exist_ok=True)
+    # The recorder still reads historical aliases from this roster.
     _ = (session / "mesh_roster.json").write_text(json.dumps(roster))
-
-
+    for name, entry in roster.items():
+        _ = (session / f"impl_worker_{name}.json").write_text(json.dumps({"slot": name, **entry}))
 
 
 LEGACY_RECORDER_ARGUMENTS = """

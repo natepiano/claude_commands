@@ -12,7 +12,6 @@ from unittest.mock import call, patch
 
 
 from scripts.herdr import herdr
-from scripts.agents import codex_mesh
 from scripts.lib import unit_runs
 from scripts.lib import operation_deadline
 from scripts.message import codex_daemon, sessions
@@ -193,7 +192,7 @@ class ConversationReaderTests(StaffTestCase):
     def test_idle_app_server_with_an_empty_run_read_is_proved_stopped(self) -> None:
         run = self.runs / "test-run"
         self.codex(rollout=False, arguments=["codex", "app-server"], environment={"UNIT_RUN_DIR": str(run)})
-        with patch.object(codex_mesh, "loaded_threads", return_value=set()) as loaded:
+        with patch.object(herdr, "loaded_threads", return_value=set()) as loaded:
             snapshot = herdr.codex_conversations()
         loaded.assert_called_once()
         self.assertEqual(loaded.call_args.args[0], run)
@@ -202,7 +201,7 @@ class ConversationReaderTests(StaffTestCase):
     def test_idle_app_server_with_a_failed_run_read_is_unknown_once(self) -> None:
         run = self.runs / "test-run"
         self.codex(rollout=False, arguments=["codex", "app-server"], environment={"UNIT_RUN_DIR": str(run)})
-        with patch.object(codex_mesh, "loaded_threads", side_effect=ValueError("server unavailable")):
+        with patch.object(herdr, "loaded_threads", side_effect=ValueError("server unavailable")):
             snapshot = herdr.codex_conversations()
         self.assertEqual(snapshot.unknown, ("test-run (Codex hosted threads unknown: server unavailable)",))
 
@@ -256,15 +255,6 @@ class ConversationReaderTests(StaffTestCase):
         scan.assert_not_called()
         self.assertEqual(errors.getvalue(), "anomaly: test-tab unknown; not blocking\n")
 
-    def test_snapshot_scan_keeps_the_operation_deadline(self) -> None:
-        run = self.runs / "test-run"
-        run.mkdir()
-        (run / codex_mesh.SERVER_FILE).touch()
-        with (operation_deadline.within(deadline := time.monotonic() + 0.5),
-              patch.object(codex_mesh, "loaded_threads", return_value={self.identity}) as loaded):
-            snapshot = herdr.codex_conversations()
-        self.assertEqual(snapshot.live, {self.identity: ()})
-        self.assertLessEqual(cast(float, loaded.call_args.args[1]), deadline + 0.001)
 
     def test_daemon_snapshot_read_runs_inside_the_operation_deadline(self) -> None:
         observed_deadlines: list[float] = []
@@ -317,40 +307,8 @@ class ConversationReaderTests(StaffTestCase):
         with patch.object(sessions, "session_liveness", return_value=sessions.SessionLivenessUnknown("private record unavailable")):
             self.assertEqual(herdr.read_conversation(self.identity), herdr.LiveConversation("codex", (998071,)))
 
-    def test_app_server_loaded_threads_prove_live_without_a_tui(self) -> None:
-        run = self.runs / "test-run"
-        run.mkdir()
-        (run / codex_mesh.SERVER_FILE).touch()
-        with patch.object(codex_mesh, "loaded_threads", return_value={self.identity}) as loaded:
-            self.assertEqual(herdr.read_conversation(self.identity, "codex"), herdr.LiveConversation("codex", ()))
-        loaded.assert_called_once()
-        self.assertEqual(loaded.call_args.args[0], run)
-        self.assertGreater(cast(float, loaded.call_args.args[1]), 0)
 
-    def test_idle_astra_app_server_proves_its_thread_live_without_an_unknown_pid(self) -> None:
-        run = unit_runs.ASTRA_RUN_ROOT / "test-review"
-        run.mkdir(parents=True)
-        _ = (run / codex_mesh.SERVER_FILE).write_text(json.dumps({"pid": 998071}))
-        self.codex(rollout=False, arguments=["codex", "app-server"],
-                   environment={"CODEX_HOME": str(self.root / "account")})
-        with patch.object(codex_mesh, "loaded_threads", return_value={self.identity}) as loaded:
-            snapshot = herdr.codex_conversations()
-        self.assertEqual(herdr.read_conversation(self.identity, "codex", codex=snapshot), herdr.LiveConversation("codex", ()))
-        self.assertEqual(snapshot.unknown, ())
-        loaded.assert_called_once()
-        self.assertEqual(loaded.call_args.args[0], run)
-        self.assertGreater(cast(float, loaded.call_args.args[1]), 0)
 
-    def test_failed_app_server_read_is_unknown(self) -> None:
-        run = self.runs / "test-run"
-        run.mkdir()
-        (run / codex_mesh.SERVER_FILE).touch()
-        with patch.object(codex_mesh, "loaded_threads", side_effect=ValueError("loaded threads unavailable")):
-            observed = herdr.read_conversation(self.identity, "codex")
-        self.assertIsInstance(observed, herdr.UnknownConversation)
-        assert isinstance(observed, herdr.UnknownConversation)
-        self.assertIn("test-run", observed.reason)
-        self.assertIn("loaded threads unavailable", observed.reason)
 
     def test_managed_daemon_rollout_alone_does_not_prove_live(self) -> None:
         self.codex(arguments=["codex", "app-server", "--managed-daemon"])

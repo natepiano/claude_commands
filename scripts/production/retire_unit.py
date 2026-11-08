@@ -37,7 +37,6 @@ from scripts.lib import unit_runs
 from scripts.production.production_doc import Production, Refusal, read_production
 
 SCRIPTS = Path(__file__).resolve().parent.parent
-MESH = SCRIPTS / "agents" / "codex_mesh.py"
 DETACHED_RUNS = "mesh_runs"
 BUILD_HOLD = SCRIPTS / "build_hold" / "build_hold.py"
 MAC_CLAIMS = Path.home() / ".local/state/mac-test/claims"
@@ -313,12 +312,6 @@ def live_claims(claims: tuple[MacClaim, ...]) -> tuple[MacClaim, ...]:
     return tuple(claim for claim in claims if _alive(claim.pid) and proc_start(claim.pid) == claim.proc_start)
 
 
-class MeshRun(NamedTuple):
-    run: Path
-    pid: int
-    seats: tuple[str, ...]
-
-
 def runs_of(worktree: Path) -> list[Path]:
     """Read run ownership through the staff row's session identities."""
     record = staff.snapshot()
@@ -333,19 +326,6 @@ def runs_of(worktree: Path) -> list[Path]:
     return found
 
 
-def mesh_runs(runs: list[Path]) -> tuple[MeshRun, ...]:
-    found: list[MeshRun] = []
-    for folder in runs:
-        pid = _json(folder / "mesh_server.json").get("pid")
-        if not isinstance(pid, int) or isinstance(pid, bool) or not _alive(pid):
-            continue
-        roster = _json(folder / "mesh_roster.json")
-        seats = tuple(name for name, entry in roster.items()
-                      if isinstance(entry, dict) and cast(dict[str, object], entry).get("status") != "ended")
-        found.append(MeshRun(folder, pid, seats))
-    return tuple(found)
-
-
 def _session_of(pid: int) -> int:
     try:
         return os.getsid(pid)
@@ -354,18 +334,11 @@ def _session_of(pid: int) -> int:
 
 
 def run_processes(worktree: Path, inside: list[int], *, settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT) -> dict[int, str]:
-    """The processes inside the worktree that its runs leave behind once their sessions stop, each named.
-
-    A run's detached command (mesh_runs.py supervise) is found by its record, which holds the
-    supervisor's pid and is in the supervisor's arguments; an app-server by its run's
-    mesh_server.json; a live server's idle-stop watcher by its mesh entry point and run folder
-    arguments. A dead server's watcher needs no matching run history: its own kill -0 rule would
-    end it at its next wake. Each leads its own session, so its children go with it.
-    """
+    """Name the detached command processes that remain in the worktree."""
     if isinstance(settings, UseConfiguredValue):
         settings = conf.read("production")
     runs = runs_of(worktree)
-    leaders = {item.pid: f"app-server {item.pid} of run {item.run.name}" for item in mesh_runs(runs)}
+    leaders: dict[int, str] = {}
     for folder in runs:
         for path in sorted((folder / DETACHED_RUNS).glob("*.json")):
             record = _json(path)
@@ -373,22 +346,6 @@ def run_processes(worktree: Path, inside: list[int], *, settings: conf.ConfigRea
             if (record.get("status") == "running" and isinstance(pid, int) and not isinstance(pid, bool)
                     and pid > 0 and str(path) in command_line(pid, settings=settings)):
                 leaders[pid] = f"run supervisor {pid} of {record.get('label', path.stem)} in run {folder.name}"
-    folders = {str(folder.resolve()): folder.name for folder in runs}
-    for pid in inside:
-        words = command_line(pid, settings=settings)
-        if (len(words) < 7 or Path(words[0]).name != "sh" or words[1] != "-c"
-                or "idle-stop" not in words[2] or Path(words[3]).resolve() != MESH.resolve()):
-            continue
-        try:
-            server = int(words[4])
-        except ValueError:
-            continue
-        if server <= 0:
-            continue
-        if not _alive(server):
-            leaders[pid] = f"app-server watcher {pid} of dead server {server}"
-        elif (folder := str(Path(words[6]).resolve())) in folders:
-            leaders[pid] = f"app-server watcher {pid} of run {folders[folder]}"
     return {pid: f"process {pid} ({_command_name(pid)}) of the {leaders[leader]}"
             for pid in inside if (leader := _session_of(pid)) in leaders}
 
@@ -519,10 +476,8 @@ def retire(unit: Unit, *, settings: conf.ConfigRead,
                                             row.current_session, unit_config.Branch(unit.branch)))
         _ = unit_config.write_parked(row.id, replace(config, retired=facts))
     owned = members(unit, record)
-    pane_run = worker_panes.worker_run(row)
-    pane_workers = worker_panes.observe(row.id, record) if unit_runs.worker_transport(pane_run) == "herdr" else []
+    pane_workers = worker_panes.observe(row.id, record)
     pane_ids = {item.row.id for item in pane_workers}
-    _ = stop_resume.stop_unit_workers(row.id, record)
     for member in owned:
         if member.id in pane_ids or isinstance(record.backends.get(member.id), staff.CodexBackend):
             continue
@@ -532,6 +487,9 @@ def retire(unit: Unit, *, settings: conf.ConfigRead,
                 print(f"anomaly: {member.name}: {outcome.reason}")
         except (OSError, ValueError, herdr.HerdrFailure) as error:
             print(f"anomaly: {member.name}: {' '.join(str(error).splitlines())}")
+    stop_reasons = stop_resume.stop_unit_workers(row.id, record)
+    for reason in stop_reasons:
+        print(f"anomaly: {reason}")
     for key in holds({member.current_session for member in owned}):
         result = run([sys.executable, str(BUILD_HOLD), "release", "--holder", key], settings=settings)
         if result.returncode:

@@ -12,18 +12,16 @@ import io
 import json
 import os
 import tempfile
-import time
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from typing import cast, final, override
-from unittest.mock import Mock, patch
+from unittest.mock import patch
 
 from scripts.shutdown.test_support import ShutdownSendLeaf, ShutdownTestCase
 from scripts.shutdown import shutdown, restart, shutdown_record, stop_resume, inventory
 from scripts.herdr import worker_panes
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.production import staff
-from scripts.agents import codex_mesh
 from scripts.whoami.account import UnreadableAccount
 from scripts.shutdown.inventory import Inventory
 
@@ -118,26 +116,6 @@ class ShutdownStatusTests(ShutdownTestCase):
               patch.object(restart, "live_rows", return_value=[row]), patch.object(shutdown, "wait_for_workers", side_effect=window)):
             self.assertEqual(shutdown.main(["held-sessions"]), 0)
 
-    def test_readiness_names_a_running_worker_and_waits_until_its_turn_ends(self) -> None:
-        row = staff.StaffRow(staff.StaffId("worker-row"), "worker", "test-worker", staff.StaffRoot(),
-                             current_session=staff.StaffId("current-thread"))
-        client = Mock()
-        replies = iter([{"type": "active"}, {"type": "idle"}])
-        def reply(method: str, _params: object, **_options: object) -> dict[str, object]:
-            if method == "thread/read":
-                return {"result": {"thread": {"status": next(replies)}}}
-            return {"result": {"data": ["current-thread"] if method == "thread/loaded/list" else []}}
-        cast(Mock, client.call).side_effect = reply
-        with (patch("scripts.shutdown.restart.live_rows", return_value=[]),
-              patch.object(staff, "initial_snapshot", return_value=staff.StaffSnapshot((row,))),
-              patch.object(codex_mesh, "_running_servers", return_value=[codex_mesh.WebSocketServer(10, 20, 1)]),
-              patch.object(codex_mesh, "Client", return_value=client),
-              patch.object(time, "sleep") as wait,
-              redirect_stdout(io.StringIO()) as output):
-            self.assertEqual(shutdown.main(["held-sessions"]), 0)
-        wait.assert_called_once_with(1)
-        self.assertRegex(output.getvalue().splitlines()[0], r"^saved 0 rows for restart at \d{2}:\d{2}$")
-        self.assertEqual(output.getvalue().splitlines()[1:], ["test-worker: current-thread: waiting for worker turn"])
 
     def __init__(self, methodName: str = "runTest") -> None:
         super().__init__(methodName)

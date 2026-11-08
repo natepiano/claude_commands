@@ -54,6 +54,5 @@ def scratch_account_home(home: Path, environment: Mapping[str, str], *, clear: b
         with (scratch_accounts_config() as config,
               patch.object(accounts, "trust_settings_file", return_value=settings),
               patch.dict(os.environ, {**environment, "HOME": str(home), "CONF_DIR": str(config)}, clear=clear),
-              scratch_showrunner_registry(home),
-              patch.object(accounts, "WORKERS_RUN_ROOTS", (home / "worker-runs",))):
+              scratch_showrunner_registry(home)):
             yield

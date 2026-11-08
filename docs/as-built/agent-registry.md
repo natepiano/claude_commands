@@ -228,10 +228,12 @@ An executable invocation runs `assign_gate.py` before dispatch.
 ### Addressable workers
 
 `assign.sh` is the worker launch entry point.
-`assign.py` reads the run's transport pin.
+The held `assign.py` reads the run's transport pin in Phase 30, round 1.
 A mesh run uses `codex_mesh.py` for Codex workers; a herdr run uses `worker.py` and a pane.
 Claude workers of a mesh run use `scripts/direct/claude_worker.py` in the assign process.
-The [worker design](long-lived-workers.md) owns admission, staff identity, family switches, retries, messages, and server lifecycle.
+Round 2 removes the held mesh launch branches after their owning units release these files.
+Live displays read staff membership and pane evidence.
+The [worker design](long-lived-workers.md) describes admission, staff identity, family changes, retries, and messages.
 The plain `codex exec` worker fallback is absent.
 
 `design_roles.py` uses `worker.py add`, `assign`, and `end` for held Astra roles.
@@ -246,7 +248,7 @@ The herdr transport adds, assigns, and ends the reviewer through `worker.py`.
 The mesh transport keeps the hold until the end of the worker succeeds.
 The pane transport keeps the hold while `assign.sh` runs; after a failed end, the staff row is the record of the reviewer.
 `assign.py` also retains `dispatch`, `adopt`, and `resume-account-move`.
-The two recovery operations remain until Phase 18.
+Round 2 removes these held mesh recovery operations.
 
 ### Catalog sync (`scripts/agents/sync_codex_catalog.sh`)
 

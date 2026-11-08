@@ -97,7 +97,6 @@ State:
   launch names the phase with `--phase`, so status, summaries, findings and
   logs never collide with a phase running beside it. Run-wide files
   (`board.log`, `heartbeat.log`, the findings ledger and recorder state) stay in `${SESSION_DIR}`.
-  An existing mesh-pinned run also keeps `mesh_server.json` and `mesh_roster.json` there.
 - `PHASE_RESERVATION_STATE`: the tagged state persisted at
   `${PHASE_DIR}/delegated_phase_reservation_state.json`; see
   <PhaseReservationContract/>.
@@ -144,11 +143,6 @@ the director neither prepares style inputs nor pastes a style assignment.
 </TagReferenceContract>
 
 <LongLivedWorkers>
-Read the run's transport through `unit_runs.worker_transport(run)` once.
-Use the pinned transport for <WorkerRuns/>, <WorkerLaunchFailure/>, <FixDispatch/>, and <PhaseCleanup/>.
-The configuration selects a new run's transport. Never change an existing run's pin.
-Apply mesh instructions only when that existing pin is `mesh`.
-
 For `herdr`, dispatch through `assign.sh --role implement|test|fix|review --prompt <path> --cwd <worktree>`.
 The launcher calls `worker.py assign` with the explicit role.
 Use `worker.py list` to inspect workers and `worker.py restore` to resume retained workers.
@@ -178,7 +172,6 @@ Use `--session-dir "${SESSION_DIR}" --phase "<phase id>"`.
 Read-only pane reviewers post no board lines and run no suites.
 The director or a writer handles required board posts and suites.
 A Codex pane worker compacts itself at `UNIT_COMPACT_ABOVE_TOKENS` through a launch option, and the launcher makes no compaction call.
-Do not use mesh claims, mesh roster entries, or phase dispatch locks for this transport.
 
 Shutdown leaves proved stopped workers at the shell and retains their rows and conversations.
 Restore resumes the same conversations through `worker.py restore`.
@@ -191,20 +184,6 @@ Unrelated proved moves can continue.
 A completed restore or move rerun prints one `unchanged` line and exits 0 without a restart notice.
 An interrupted split rebuild can leave panes in the source workspace and lose the split ratio.
 Inspect the tab and panes named by the anomaly line. A retry does not rebuild that split.
-
-For an existing `mesh` pin, keep each worker's thread through the existing unit ledger.
-Use `docs/as-built/long-lived-workers.md` for pause, move, end, and compaction.
-A failed compaction keeps the thread available for its own compaction.
-Never create another reviewer while its retained thread exists.
-At the next phase start, the director of a run with a `mesh` pin must follow these steps:
-
-1. Finish the current pass, or record the unfinished work in the plan.
-2. Keep the run's history, saved launcher arguments, and durable design bindings.
-3. Run `progress_history.py finish-run --status stopped`, then `end_session.sh`.
-4. Confirm with one `ps` read that no process of that run remains.
-   This includes `mesh_runs.py supervise`, `codex_mesh.py`, and `codex app-server`.
-   `end_session.sh` continues past a cleanup failure. Its exit does not prove that these processes stopped.
-5. Start a new run with `prepare_session.sh`. It pins herdr. Continue at the same plan phase.
 
 Every review prompt names `config/review/code.md` under <ReviewPromptContract/>.
 Other prompts carry the Three Gods and Type Design Contract under <WritePromptContract/>.
@@ -353,13 +332,6 @@ Applies to every implementation, test, fix, and review launcher.
 5. Codex: apply <CodexDispatchWait/>. Never end the turn while the launcher is
    active; its terminal result drives the next workflow step.
 6. For `herdr`, recover an incomplete pass under <LongLivedWorkers/> before another role's dispatch.
-   For an existing `mesh` pin, a launcher killed at its time limit leaves its Codex
-   worker running with no one watching. Arm a Monitor on
-   `${SESSION_DIR}/board.log` until that worker
-   posts its own `done`, not a `launcher:` line. Once it has, and its last lint
-   and test passed after its last edit, retain its native conversation under
-   <LongLivedWorkers/> and record the outcome the launcher would have; for a
-   repair, that is <FixDispatch/>'s third outcome.
 </DispatchContract>
 
 <WorkerRuns>
@@ -382,7 +354,6 @@ Stopped, blocked, closed, or uncertain workers' results go to their holder with 
 Unknown process evidence produces one anomaly line and permits no pane input.
 Use the result without sending another dispatch prompt.
 
-For an existing `mesh` pin, a result can report that no launcher is attached.
 Dispatch that worker through `assign.sh --role implement --to <full worker name>` when it must act on the result.
 
 When a decision makes a running or queued test, lint or build run useless,
@@ -420,46 +391,6 @@ Keep incomplete, unpublished, busy, and unknown workers unchanged.
 A failed fresh start prints `publication failed: ...` and retains its pane without a saved pass.
 Rerun the original launcher command; it publishes once from that pane.
 For a published worker, resume the same pass through its saved launcher command.
-The following recovery rules apply only when the existing run's pin is `mesh`.
-A dispatch that dies in seconds never reached the provider, and a provider
-message it prints is a message some earlier call received. Workers launched
-together that fail within seconds of each other carrying **byte-identical text,
-the same retry-at timestamp included, are a local fault**: separate API calls do
-not produce identical text. Confirm it against
-`${SESSION_DIR}/mesh_server.log` — a launch that got out of this machine wrote
-to it, and one that added no line was answered by the session's own
-`codex app-server` from what it had cached. Never report workers as
-unavailable, or a usage limit as reached, on the error text alone.
-
-`codex exec` cannot test this and must not be used to. It opens its own process
-against the API, where a dispatch attaches a thread to the long-lived server
-recorded in `${SESSION_DIR}/mesh_server.json` — a different path that can fail
-while `codex exec` answers. That disagreement is the wedged server's signature,
-not evidence workers are back. The only valid probe is the dispatch itself.
-
-The launcher already tried. On a fast failure with no work done, or a stale Codex
-sign-in (`access token could not be refreshed`) even after the thread exists, `codex_mesh.py`
-abandons the inherited server, starts one of its own and runs the worker again,
-printing `retrying on a new app-server` to the worker's log. So an error that
-reaches you has usually already been tested against a clean server and is real.
-Read the log for that line before doing anything by hand: present, the retry
-happened and the failure survived it; absent, the launcher held back — the worker
-had already done work, or the failure took too long to be local — and the
-paragraphs above are yours to apply.
-
-A new Codex sign-in moves the run by itself. A message from `codex-sign-in` names
-the server it retired; the next dispatch starts on a new one, a worker mid-turn
-finishes first, and nothing is owed in reply.
-
-Recovering by hand, in that case only. Check that no peer run claims the
-recorded pid or port before signalling anything —
-`grep -l '<pid>\|<port>' /tmp/claude/unit/*/mesh_server.json /tmp/claude/delegate/*/mesh_server.json` should name
-only this session's file, and any second file means leave the process alone.
-Then kill that pid, move `mesh_server.json` aside, and relaunch verbatim; the
-next launcher starts a fresh server. Leave `mesh_roster.json` alone — its other
-entries may name threads still live on a server that is fine. If the log **is**
-growing and the error arrives new on each launch, the limit is real and none of
-this applies.
 </WorkerLaunchFailure>
 
 <CodexDispatchWait>
@@ -720,8 +651,6 @@ A refunded batch adds no round unless it later lands.
 `dispatch` leaves its batch `repair_in_flight`.
 `gate` and `verdict` refuse a finding that remains in flight.
 For `herdr`, apply the completion and recovery rules in <LongLivedWorkers/>.
-For an existing `mesh` pin, `assign.sh` runs `landed` after a clean exit or `abandon --edits-landed` after an error.
-When that mesh launcher is gone, run `abandon --reason "<how it ended>"` before the next workflow step.
 Report the interruption and the reopened findings in one line.
 Pass `--edits-landed` only when repair edits exist in the tree.
 Without that flag, the ledger refunds the attempt, which preserves the budget that decides
@@ -1320,7 +1249,6 @@ without `none:` records P5 exposure (the user, 2026-10-28).
 
 For `herdr`, dispatch repairs through `assign.sh --role fix --prompt <path> --cwd <worktree> --fix-cause "<defect>"`.
 The worker command selects the worker and keeps its native session.
-For an existing `mesh` pin, use `assign.sh --role fix --to <full-worker-name>` with the repair prompt and phase options.
 Omit `--to` only for a new worker allowed by <LongLivedWorkers/>.
 Use messages only for questions; the launcher sends the assignment prompt.
 
@@ -1366,7 +1294,6 @@ UNIT_RESOLVES_ROUND=1 bash ~/.claude/scripts/direct/assign.sh --role fix \
   --fix-cause "<failed gate or defect>" --pass "${FIX_ROUND}" &
 ```
 
-For an existing `mesh` pin, `UNIT_RESOLVES_ROUND=1` makes the launcher resolve the round.
 For `herdr`, apply the completion and recovery rules in <LongLivedWorkers/>.
 Each further worker uses `UNIT_RESOLVES_ROUND=0`, its own prompt, and its slot.
 The round ends only after every worker completes.
@@ -1414,7 +1341,6 @@ A successful dispatch continues as above. An error applies <WorkerLaunchFailure/
 If the error remains, apply <RetainPhaseReservation/> and report the fix log.
 Record the error, clear the session marker, and stop.
 The launcher records either outcome in the ledger.
-For an existing `mesh` pin, if a dispatch ends without a terminal status, resolve its round with `findings.py abandon` under <FindingsLedger/>.
 For `herdr`, apply the recovery in <LongLivedWorkers/> first, because the pane worker can still finish the round.
 Run `abandon` only when that recovery cannot finish it.
 Then apply <RetainPhaseReservation/> before review, another dispatch, or a report about the round.
@@ -1619,14 +1545,7 @@ plan-doc edit acquires that phase's reservation in an enrolled repository.
 For `herdr`, retain worker rows and panes for the next phase.
 Use `worker.py end <name>` only when permanent removal is required.
 
-For an existing `mesh` pin, run this command at <PhaseEnd/>'s worker cleanup point:
-`~/.claude/scripts/lib/py ~/.claude/scripts/direct/remove_workers.py --session-dir "${SESSION_DIR}"`.
-It removes the completed phase's Claude workers and any worker a dead run left
-alive; a failure is one line in the report, never a stop. Under
-<LongLivedWorkers/>, do not end this run's Codex workers: their turns finish, their
-threads stay open, and `end_session.sh` ends them with the run.
-
-For both transports, stop each Claude Agent helper and end finished launchers.
+For each phase, stop each Claude Agent helper and end finished launchers.
 Shut down every Hana or example app this phase launched. Never touch what another session started.
 Mid-phase, stop each helper once its result is read and each app once no step
 uses it.

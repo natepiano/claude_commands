@@ -865,7 +865,7 @@ class StaffTestCase(unittest.TestCase):
         return path
 
     def worker_run(self, production_name: str, unit: str, director: str) -> Path:
-        """A unit run with actual state, roster, server and director records."""
+        """A unit run with state and director records."""
         run = Path(os.environ["ROSTER_RUN_ROOT"]) / f"{production_name}-{unit}"
         run.mkdir(parents=True, exist_ok=True)
         self.write_json(run / "progress_history_state.json", {
@@ -873,8 +873,6 @@ class StaffTestCase(unittest.TestCase):
             "main_agent": {"family": "claude", "session_id": director},
         })
         write_text_atomic(run / "director", director + "\n")
-        self.write_json(run / "mesh_roster.json", {})
-        self.write_json(run / "mesh_server.json", {"pid": os.getpid(), "port": 12345, "codex_home": str(self.root / "codex")})
         return run
 
     @contextmanager

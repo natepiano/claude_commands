@@ -6,7 +6,7 @@ every message follows are /message (~/.claude/commands/message.md).
 
   send.py --to NAME|uds:<path>|session:<id>|worker:<unit>/<worker>|codex:<thread>
           [--from NAME] [--summary TEXT] [--key KEY [--repeat-minutes N]]
-          [--here | --machine HOST] [--codex --session-dir DIR] [--timeout SECONDS]
+          [--here | --machine HOST] [--timeout SECONDS]
           (--text TEXT | --file PATH | stdin)
   send.py --to user --text-id ID --value KEY=VALUE ...    a registered push; --help lists
                                                           the ones a session or script sends
@@ -20,7 +20,6 @@ every message follows are /message (~/.claude/commands/message.md).
   send.py clear-check     retire each live emergency push whose --clears-when check passes
 
 Pane workers use worker:<unit>/<worker>.
-Workers in mesh-pinned runs use worker:<run id>/<worker>.
 
 Delivery. A Claude recipient is tried through the postmaster outbox first when
 its heartbeat is fresh. Every path without confirmed delivery falls back to a
@@ -31,8 +30,6 @@ name is separate from the sender, who is named in the message. Delivery is read 
 SendMessage tool result in the relay's stream, never from what the model says;
 the last stream per recipient stays in STATE/relay/<to>.jsonl.
 Staff `worker:` paths deliver through observed panes or their holders.
-Mesh `worker:` addresses keep their existing queues.
-Staff worker addresses use the run's pinned transport.
 Other `codex:` addresses queue through the shared Codex daemon.
 One staff snapshot selects each staff recipient.
 Unit names use the staff names. Ambiguous staff names stop delivery.
@@ -41,7 +38,6 @@ A non-staff name uses a unique live roster session, locally before the peer.
 A name without a staff row or live session is refused without a relay or queue.
 Explicit non-staff addresses keep their transport and queue behavior.
 Worker addresses use native IDs from the local or peer roster for staff lookup.
-`--codex` with `--session-dir` selects a run-scoped slot without staff lookup.
 Each message records its runtime sender ID separately from `--from`.
 Only the configured Morty ID adds `Authority: morty (speaks for the user)`.
 Queues and SSH forwarding retain the original sender ID.
@@ -143,7 +139,7 @@ from typing import TYPE_CHECKING, Literal, NamedTuple, NoReturn, NotRequired, Ty
 
 from scripts.lib import process_group
 from scripts.production import staff, unit_names
-from scripts.lib import conf, models_registry, process_start, unit_runs
+from scripts.lib import conf, models_registry, process_start
 from scripts.lib.atomic_file import write_text_atomic as write_atomic
 from scripts.notify import decision_priority
 from scripts.message import morty_identity, send_budget
@@ -176,7 +172,6 @@ from scripts.notify.user_action import (FIX, REFUSED_BEFORE_SENDING, ActionRefus
 STATE = Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local" / "state") / "message"
 CLAUDE = Path.home() / ".local" / "bin" / "claude"
 SESSIONS = Path.home() / ".claude" / "sessions"
-CODEX_MESH = Path(__file__).resolve().parent.parent / "agents" / "codex_mesh.py"
 USER = "user"
 USER_CHANNEL = Path(__file__).resolve().parent.parent / "notify" / "pushover.py"
 # On the remote host: its own interpreter shim and copy of this script.
@@ -597,13 +592,6 @@ class ClaudeRecipient:
 
 
 @dataclass(frozen=True)
-class CodexWorkerRecipient:
-    address: str
-    name: str
-    session_dir: str
-
-
-@dataclass(frozen=True)
 class CodexSessionRecipient:
     address: str
     thread_id: str
@@ -616,7 +604,7 @@ class PaneWorkerRecipient:
     row: staff.StaffRow
 
 
-SessionRecipient = ClaudeRecipient | CodexWorkerRecipient | CodexSessionRecipient
+SessionRecipient = ClaudeRecipient | CodexSessionRecipient
 
 
 @dataclass(frozen=True)
@@ -699,13 +687,7 @@ class RosterLookup:
     to: str
 
 
-@dataclass(frozen=True)
-class MeshWorker:
-    session_dir: str
-    worker: str
-
-
-RecipientSelection = RosterLookup | MeshWorker
+RecipientSelection = RosterLookup
 
 
 @dataclass(frozen=True)
@@ -752,7 +734,7 @@ class Options(NamedTuple):
 
     @property
     def to(self) -> str:
-        return self.selection.to if isinstance(self.selection, RosterLookup) else self.selection.worker
+        return self.selection.to
 
 
 # ---------------------------------------------------------------------------
@@ -1793,10 +1775,6 @@ def _messageable_recipient(entry: roster.RosterEntry) -> SessionRecipient:
     if not isinstance(entry.reach, roster.Messageable):
         raise AssertionError("a messageable recipient needs an address")
     address = entry.reach.address
-    if address.startswith("worker:"):
-        if not isinstance(entry.assignment, roster.WorkerAssignment):
-            usage_error(f"{address} is not assigned to a Codex worker")
-        return CodexWorkerRecipient(address, entry.name, entry.assignment.session_dir)
     if address.startswith("codex:"):
         if not isinstance(entry.daemon, codex_daemon.CodexDaemon):
             usage_error(f"{address} has no owning Codex daemon")
@@ -1999,16 +1977,10 @@ def resolve_recipient(
             usage_error(member.reason)
         if (not isinstance(scope, NamedMachine)
                 and isinstance(member, staff.StaffRow) and member.kind == "worker"):
-            from scripts.herdr import worker_panes
-
             holder = membership.parent_of(member)
             if holder is not None and (isinstance(holder.worktree, staff.WorktreeUnfilled)
                                        or holder.worktree.machine == roster.remote.local_machine()):
-                run = worker_panes.worker_run(holder, record=membership)
-                if unit_runs.worker_transport(run) == "herdr":
-                    return PaneWorkerRecipient(member)
-                if to.startswith("worker:") and not _sender_label_matches(to, observed.entries):
-                    return CodexWorkerRecipient(to, member.name, str(run))
+                return PaneWorkerRecipient(member)
         if to.startswith("uds:"):
             return socket_recipient(to, socket_records, {}, membership=membership)
         if isinstance(member, staff.StaffRow):
@@ -2231,20 +2203,6 @@ def relay_plan(message: Message) -> RelayPlan:
     )
 
 
-def codex(message: Message, session_dir: str, timeout: float) -> Result:
-    command = [sys.executable, str(CODEX_MESH), "send", "--session-dir", session_dir, "--to", message.to,
-               "--no-accounting", "--report-recipient", "--guard-text", message.text, "--from", message.sender, "--message", agent_text(message),
-               *(["--human"] if message.human else [])]
-    code, out, err = run(command, "", timeout)
-    receiver, err = recipient_report(err)
-    if code == 4:
-        return Result("held", one_line(out), receiver=receiver)
-    if code == 0:
-        return Result("sent", one_line(out) or "queued on the codex thread", receiver=receiver)
-    why = one_line(err or out) or ("timed out" if code is None else f"exit {code}")
-    return Result("failed", f"codex_mesh.py send: {why}", receiver=receiver)
-
-
 def codex_session(
     message: Message,
     recipient: CodexSessionRecipient,
@@ -2450,8 +2408,6 @@ def remote(message: Message, host: str, options: Options) -> Result:
         if isinstance(options.action, NoUserRecipient):
             raise AssertionError("a user message must state its action")
         forwarded += action_arguments(options.action)
-    if isinstance(options.selection, MeshWorker):
-        forwarded += ["--codex", "--session-dir", options.selection.session_dir]
     if options.repeat_minutes is not None:
         forwarded += ["--repeat-minutes", f"{options.repeat_minutes:g}"]
     elif message.to == USER and options.need == "blocked" and message.key is not None:
@@ -2700,8 +2656,6 @@ def parse(argv: list[str]) -> Options:
     location = parser.add_mutually_exclusive_group()
     _ = location.add_argument("--machine", help="deliver from this ssh host instead (mac)")
     _ = location.add_argument("--here", action="store_true", help="resolve and deliver only here")
-    _ = parser.add_argument("--codex", action="store_true", help="the recipient is a codex_mesh.py thread")
-    _ = parser.add_argument("--session-dir", help="the codex_mesh.py session directory")
     _ = parser.add_argument("--timeout", type=float, default=delivery_timeout(), help=f"delivery seconds (default {delivery_timeout():g})")
     body = parser.add_mutually_exclusive_group()
     _ = body.add_argument("--text")
@@ -2799,11 +2753,7 @@ def parse(argv: list[str]) -> Options:
         if isinstance(parsed_action, ActionUnstated):
             parser.error(FIX)
         action = parsed_action
-    session_dir = optional_str(attr(args, "session_dir"))
-    is_codex = attr(args, "codex") is True
-    if is_codex != (session_dir is not None):
-        parser.error("--codex and --session-dir go together")
-    selection: RecipientSelection = MeshWorker(session_dir, to) if session_dir is not None else RosterLookup(to)
+    selection = RosterLookup(to)
     host = optional_str(attr(args, "machine"))
     forwarded_sender = optional_str(attr(args, "forwarded_shown_sender"))
     if forwarded_sender is not None and (attr(args, "here") is not True or not forwarded_sender):
@@ -2827,7 +2777,7 @@ def parse(argv: list[str]) -> Options:
                       shown_sender=ShownSender(forwarded_sender) if forwarded_sender is not None else SenderNotResolved(),
                       sender_origin=origin, due=due, reference=reference,
                       recipient_identity=LogicalRecipientIdentity(recipient_key) if recipient_key else TransportRecipientIdentity())
-    if options.to == USER and (options.summary is None or isinstance(options.selection, MeshWorker)):
+    if options.to == USER and options.summary is None:
         parser.error("--to user needs --summary, its title, and takes no --codex")
     if options.to != USER and options.need != "note":
         parser.error("--need goes with --to user")
@@ -2970,7 +2920,7 @@ def delivered_text(message: Message, entry_id: str) -> str:
 
 def send(options: Options) -> Result:
     try:
-        membership = (staff.snapshot() if options.to != USER and isinstance(options.selection, RosterLookup)
+        membership = (staff.snapshot() if options.to != USER
                       else staff.StaffSnapshot(()))
     except staff.StaffUnreadable as error:
         usage_error(f"staff lookup for {options.to!r}: {error}")
@@ -3032,11 +2982,11 @@ def _send(options: Options, *, membership: staff.StaffSnapshot) -> Result:
     first = next(iter(text.strip().splitlines()), options.summary or "")
     summary = options.summary or (first if len(first) <= 60 else first[:59] + "…")
     # A forwarded display is authoritative; only recipient lookup may read the receiver's roster.
-    needs_recipient_roster = (isinstance(options.selection, RosterLookup) and options.to != USER
+    needs_recipient_roster = (options.to != USER
                               and not options.to.startswith("uds:") and not isinstance(options.scope, NamedMachine))
     needs_sender_roster = options.to != USER and isinstance(options.shown_sender, SenderNotResolved)
     reads_registry = (needs_recipient_roster or needs_sender_roster
-                      or (options.to != USER and isinstance(options.selection, RosterLookup)))
+                      or (options.to != USER))
     registry = sessions.read_registry() if reads_registry else sessions.RegistryRead((), ())
     running = sessions.running_records(registry)
     if reads_registry:
@@ -3044,12 +2994,8 @@ def _send(options: Options, *, membership: staff.StaffSnapshot) -> Result:
     observed = (roster.roster(os.environ, roster.ThisMachine(), membership=membership, registry=registry) if needs_recipient_roster or needs_sender_roster
                 else roster.Roster([], []))
     records = [record for record in running if sessions.messaging_socket_exists(record)]
-    if isinstance(options.selection, MeshWorker):
-        route: DeliveryRoute = (
-            RemoteDelivery(options.scope.host, options.to) if isinstance(options.scope, NamedMachine)
-            else CodexWorkerRecipient(options.to, options.to, options.selection.session_dir)
-        )
-    elif options.to == USER:
+    route: DeliveryRoute
+    if options.to == USER:
         route = (RemoteDelivery(options.scope.host, USER) if isinstance(options.scope, NamedMachine)
                  else UserDelivery())
     else:
@@ -3102,7 +3048,7 @@ def _send(options: Options, *, membership: staff.StaffSnapshot) -> Result:
             posted_on=options.scope.host if isinstance(options.scope, NamedMachine) else machine())
     log_route: Route = NO_CLAUDE_ROUTE
     guarded = repeat_guard.Decision()
-    if not refused and held is None and isinstance(claim_result, ClaimGranted) and not isinstance(route, (RecipientLookupFailed, CodexWorkerRecipient, RemoteDelivery)):
+    if not refused and held is None and isinstance(claim_result, ClaimGranted) and not isinstance(route, (RecipientLookupFailed, RemoteDelivery)):
         guarded = repeat_guard.check(STATE / "repeats", repeat_guard.Attempt(
             sender, stable.value,
             text, machine(), started.timestamp(), options.human or sender.casefold() == USER or options.to == USER))
@@ -3126,18 +3072,6 @@ def _send(options: Options, *, membership: staff.StaffSnapshot) -> Result:
         result = user(message, options.need, options.action, options.timeout, answerable=options.answerable, text_id=options.text_id, values=options.values, due=options.due, reference=options.reference, remote_forward=isinstance(options.sender_origin, ForwardedSender))
         if options.text_id == AUTO_MODE_TEXT and result.outcome in ("sent", "kept"):
             _ = rca.open_case(refusal_report(options), defer_owner=True)
-    elif isinstance(route, CodexWorkerRecipient):
-        transport = Message(
-            route.name,
-            message.sender,
-            message.summary,
-            message.text,
-            message.key,
-            message.shown_sender,
-            message.human,
-            message.stamp,
-        )
-        result = codex(transport, route.session_dir, options.timeout)
     elif isinstance(route, CodexSessionRecipient):
         result = codex_session(message, route, options.timeout)
     elif isinstance(route, PaneWorkerRecipient):

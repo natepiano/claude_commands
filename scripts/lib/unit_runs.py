@@ -84,14 +84,14 @@ def run_owner(fields: Mapping[str, object], record: staff.StaffSnapshot) -> staf
     reference = fields.get(OWNER_FIELD)
     if isinstance(reference, str) and reference:
         row = record.by_id(staff.StaffId(reference))
-        if row is None or row.kind != "unit":
+        if row is None or row.kind not in ("unit", "showrunner"):
             raise staff.StaffUnreadable(f"run owner {reference}: unit staff row is unavailable")
         return row
     identity = fields.get("main_agent")
     agent = cast(dict[str, object], identity) if isinstance(identity, dict) else {}
     reference = agent.get("session_id") or fields.get("owner_session") or fields.get("director_session")
     row = record.owner_of(reference) if isinstance(reference, str) and reference else None
-    return row if row is not None and row.kind == "unit" else RunOwnerUnrecorded("run has no unit staff owner")
+    return row if row is not None and row.kind in ("unit", "showrunner") else RunOwnerUnrecorded("run has no unit staff owner")
 
 
 def environ(name: str) -> str:
@@ -265,7 +265,7 @@ def held_by_session(root_override: str | Path | None = None, *,
     """Read each run's director once, in root and name order."""
     found: dict[str, list[str]] = {}
     for folder in run_folders(root_override):
-        if any((folder / name).is_file() for name in (STATE_FILE, "mesh_roster.json")):
+        if (folder / STATE_FILE).is_file():
             found.setdefault(director(folder, record=record), []).append(str(folder))
     return found
 
@@ -278,8 +278,9 @@ def held(session_id: str, root_override: str | Path | None = None,
     if not session_id:
         return []
     folders = held_by_session(root_override, record=record) if scanned is None else scanned
+    active = Path(root_override) / "active" if root_override is not None and active_override is None else active_override
     try:
-        lines = marker(session_id, active_override).read_text(encoding="utf-8").splitlines()
+        lines = marker(session_id, active).read_text(encoding="utf-8").splitlines()
     except (OSError, UnicodeError):
         lines = []
     runs: list[str] = []

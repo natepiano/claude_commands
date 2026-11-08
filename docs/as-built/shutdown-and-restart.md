@@ -102,7 +102,8 @@ A session move selects only worker rows whose staff `parent` names the moved row
 Owning a run does not select every worker in that run.
 The fixed staff ID identifies each child once, even when several runs name it.
 
-`inventory.worker_resumes` returns `WorkerResume` values from `resume_message.py`.
+`inventory.worker_resumes` returns `WorkerResume` results from `resume_message.py`.
+`Resumable` and `Idle` carry `ClaudeChildResume` values.
 Each child has one result:
 
 | Result | Evidence | Message |
@@ -111,11 +112,12 @@ Each child has one result:
 | `Idle` | The child's readable turn was not live | `idle` and `nothing to run now` |
 | `Unavailable` | The run, worker record, or last assignment is unavailable | One `anomaly:` line with the child and reason |
 
-The reader takes one assignment-log snapshot and finds each child's newest run with a real worker record.
-A Codex roster record takes precedence over a slot record for the same worker in one run.
-A Claude worker uses its `impl_worker_<slot>.json` record and the matching status file.
+The reader selects staff members under the moved parent.
+It reads each member's backend and current native session.
+A Claude child uses its `impl_worker_<slot>.json` record and the matching status file.
+The held stop and restart code retains `PausedSeat` until round 2.
 The status reader searches the run root and `phases/*`; it does not search `tmp/**`.
-A readable non-live roster status, including `capacity_exhausted`, gives `Idle`.
+A readable status other than `implementing`, including `capacity_exhausted`, gives `Idle`.
 An unavailable child does not hide another child's result.
 
 `session_staff.worker_run_entries(snapshot, rows)` returns real `(run, entry)` pairs.

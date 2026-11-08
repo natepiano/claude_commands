@@ -55,12 +55,23 @@ class PausedSeat(TypedDict):
     launcher_command: list[str]
 
 
+class ClaudeChildResume(TypedDict):
+    """A Claude child keeps its launcher command and assignment."""
+
+    run_dir: str
+    seat: str
+    role: str
+    staff_id: str
+    turn_live: bool
+    launcher_command: list[str]
+
+
 class Resumable(NamedTuple):
-    seat: PausedSeat
+    seat: ClaudeChildResume
 
 
 class Idle(NamedTuple):
-    seat: PausedSeat
+    seat: ClaudeChildResume
 
 
 class Unavailable(NamedTuple):
@@ -122,7 +133,7 @@ def resume_message(why: str, *, move: NoAccountMove | AccountMove = NO_ACCOUNT_M
     return script_prompt(text)
 
 
-def resume_worker_command(seat: PausedSeat, cwd: str) -> str:
+def resume_worker_command(seat: ClaudeChildResume, cwd: str) -> str:
     """Build an assignment command for the worker's existing thread."""
     prompt = str(Path(seat["run_dir"]) / f"{seat['seat']}.resume-prompt.md")
     if seat["turn_live"] and seat["launcher_command"]:
@@ -140,7 +151,7 @@ def resume_worker_command(seat: PausedSeat, cwd: str) -> str:
     return _assignment_command(seat, cwd, prompt, list(options.items()))
 
 
-def _assignment_command(seat: PausedSeat, cwd: str, prompt: str, options: list[tuple[str, str]]) -> str:
+def _assignment_command(seat: ClaudeChildResume, cwd: str, prompt: str, options: list[tuple[str, str]]) -> str:
     """Supply the current folder, prompt, and authorized phase paths."""
     values = dict(options)
     role = values["--role"]
@@ -154,7 +165,7 @@ def _assignment_command(seat: PausedSeat, cwd: str, prompt: str, options: list[t
         seat["run_dir"], seat["seat"], role,
         [*refreshed.items(), *((option, value) for option, value in options if option not in refreshed)])
 
-def _resume_task(seat: PausedSeat, cwd: str, prompt: str) -> str:
+def _resume_task(seat: ClaudeChildResume, cwd: str, prompt: str) -> str:
     """Convert a saved launcher command into an assignment command."""
     command = seat["launcher_command"]
     index = next((i for i, value in enumerate(command) if Path(value).name in assign_gate.WORKER_LAUNCHERS), -1)

@@ -5,31 +5,27 @@ import contextlib
 import io
 import json
 import os
-import shlex
 import subprocess
 import sys
 import unittest
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import cast, final, override
+from typing import cast, override
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from scripts.agents import test_codex_mesh as mesh_fixture  # noqa: E402
+from scripts.agents import codex_mesh_test_support as mesh_fixture  # noqa: E402
 from scripts.astra import astra_review  # noqa: E402
 from scripts.astra import astra_roles, astra_work, design_roles  # noqa: E402
 from scripts.production.staff_test_support import StaffTestCase, fixture_runtime_id, fixture_worker, unit_membership
 from scripts.production import staff  # noqa: E402
-from scripts.production.test_worker import PaneCommandRouter, WorkerCommandTests
+from scripts.production import test_worker as worker_tests
 from scripts.production.cli_fixture import invoke_cli
 from scripts.herdr.test_worker_panes import PaneWorld
 from scripts.herdr import herdr, side_pane
 from scripts.direct import assign
-from scripts.astra.design_role_test_support import write_mesh_server_record  # noqa: E402
 from scripts.lib.signal_test_support import install_signal_pid_guard  # noqa: E402
-from scripts.lib.server_test_support import owned_server_record  # noqa: E402
 from scripts.lib import conf, unit_runs
-from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.test_models_registry import write_registry
 
 STUB = """#!/usr/bin/env python3
@@ -57,8 +53,8 @@ class AstraReviewTests(StaffTestCase):
 
     def __init__(self, methodName: str = "runTest") -> None:
         super().__init__(methodName)
-        self.fixture: WorkerCommandTests = WorkerCommandTests("runTest")
-        self.router: PaneCommandRouter = PaneCommandRouter()
+        self.fixture: worker_tests.WorkerCommandTests = worker_tests.WorkerCommandTests("runTest")
+        self.router: worker_tests.PaneCommandRouter = worker_tests.PaneCommandRouter()
 
     @property
     def world(self) -> PaneWorld:
@@ -98,7 +94,7 @@ class AstraReviewTests(StaffTestCase):
     def saved_prompt(self) -> Path:
         return max((self.root / "runs").glob("*/prompt.md"), key=lambda path: path.stat().st_mtime_ns)
 
-    def held_reviewer(self, status: str = "done") -> design_roles.HeldDesign:
+    def held_reviewer(self, *, busy: bool = False) -> design_roles.HeldDesign:
         worker = fixture_worker("demo-proposal-astra-reviewer", unit_membership("demo", "proposal-unit").id,
                                 runtime_id=fixture_runtime_id("held-thread"),
                                 backend=staff.CodexBackend(self.root / "codex-home"))
@@ -107,14 +103,9 @@ class AstraReviewTests(StaffTestCase):
                                   str(self.root), str(self.document), "proposal", "2026-10-21T12:00:00+00:00",
                                   design_roles.DesignUnbound(),
                                   (design_roles.RoleInstance("designer", "demo-proposal-astra-designer", design_roles.RoleNotOpened()),
-                                   design_roles.RoleInstance("reviewer", "demo-proposal-astra-reviewer", design_roles.RoleOpen(worker.id))))
+                                   design_roles.RoleInstance("reviewer", "demo-proposal-astra-reviewer", design_roles.RoleOpen(worker.id),
+                                                          assignment_claim="active-dispatch" if busy else "")))
         design_roles._save(design)  # pyright: ignore[reportPrivateUsage]
-        mesh = design_roles.mesh_directory(design_id)
-        mesh.mkdir(parents=True)
-        _ = (mesh / "mesh_roster.json").write_text(json.dumps({"demo-proposal-astra-reviewer": {
-            "staff_id": worker.id, "status": status, "held_design_id": design_id, "held_role": "reviewer"}}))
-        # The fixture's cleanups run after the os.kill guard ends, so the record's real process is stopped then.
-        self.fixture.enterContext(write_mesh_server_record(mesh, self.root / "codex-home"))
         return design
 
     def test_document_with_a_held_reviewer_resumes_that_thread_and_saves_each_reply(self) -> None:
@@ -158,7 +149,7 @@ class AstraReviewTests(StaffTestCase):
                 patch.object(design_roles, "dispatch_turn", side_effect=AssertionError("busy role dispatched")), \
                 patch.object(astra_review, "workers_label", side_effect=AssertionError("busy role used fresh exec")), \
                 contextlib.redirect_stderr(io.StringIO()) as errors:
-            design = self.held_reviewer("running")
+            design = self.held_reviewer(busy=True)
             self.assertEqual(astra_review.main([str(self.document)]), 1)
             self.assertEqual(list(design_roles.design_directory(design.placement.design_id).glob("prompts/*.md")), [])
         self.assertIn("busy", errors.getvalue())
@@ -409,116 +400,6 @@ class AstraReviewTests(StaffTestCase):
         self.assertIn(self.fixture.agent.replies[-1], result.stdout)
         self.assertEqual(self.world.requests[-1][1][self.world.requests[-1][1].index("--sandbox") + 1], "read-only")
 
-
-@final
-class ManagedAstraReviewTests(mesh_fixture.MeshCommandFixture):
-    @override
-    def setUp(self) -> None:
-        super().setUp()
-        _ = self.enterContext(owned_server_record(self.session_dir / "mesh_server.json"))
-        _ = cast(object, self.enterContext(patch.dict(os.environ, {
-            "ASTRA_ROLES_STATE": str(self.session_dir / "astra-roles"),
-            "PROCESS_TABLE_PS": "true",
-            "CLAUDE_CODE_SESSION_ID": "",
-        })))
-        director = self.session_dir.parent / "codex"
-        director.symlink_to(sys.executable)
-        scripts = self.session_dir.parent / "caller-scripts"
-        (scripts / "direct").mkdir(parents=True)
-        command = [str(director), "-c", "import subprocess, sys; raise SystemExit(subprocess.call(sys.argv[1:]))",
-                   "bash", str(astra_review.SCRIPTS / "direct/assign.sh")]
-        _ = (scripts / "direct/assign.sh").write_text("exec " + shlex.join(command) + ' "$@"\n')
-        _ = self.enterContext(patch.object(astra_review, "SCRIPTS", scripts))
-
-    def assert_review_transport(self, held_transport: str, configured_transport: str) -> None:
-        owner = unit_membership("natedev", "models")
-        write_text_atomic(self.session_dir / unit_runs.STATE_FILE, json.dumps({"owner_staff_id": owner.id}))
-        config = self.home / "transport-config"
-        config.mkdir()
-        write_text_atomic(config / "direct.conf", f"WORKER_TRANSPORT={configured_transport}\n")
-        write_text_atomic(self.session_dir / "worker_transport", held_transport + "\n")
-        run = self.session_dir / "astra-review"
-        run.mkdir()
-        write_text_atomic(astra_review.SCRIPTS / "direct/assign.sh", """while [ "$#" -gt 0 ]; do
-    case "$1" in
-        --session-dir) run="$2"; shift ;;
-        --summary) review="$2"; shift ;;
-    esac
-    shift
-done
-cat "$run/worker_transport" > "$review"
-""")
-        review = run / "review.md"
-        with patch.dict(os.environ, {"CONF_DIR": str(config)}):
-            code = astra_review.run_review(review, "Review the proposal.", run / "codex.log")
-        self.assertEqual(code, 0)
-        self.assertEqual(unit_runs.run_pin(run), held_transport)
-        self.assertEqual(review.read_text(), held_transport + "\n")
-
-    def test_mesh_pinned_caller_keeps_mesh_for_astra_review(self) -> None:
-        self.assert_review_transport("mesh", "herdr")
-
-    def test_herdr_pinned_caller_keeps_herdr_for_astra_review(self) -> None:
-        self.assert_review_transport("herdr", "mesh")
-
-    def run_review(self) -> tuple[int, str]:
-        document = self.session_dir / "proposal.md"
-        _ = document.write_text("# Proposal\n")
-        output, errors = io.StringIO(), io.StringIO()
-        with (patch.object(astra_review, "workers_label", return_value="codex9"),
-              patch.object(astra_review, "run_folder", return_value=self.session_dir),
-              patch.object(design_roles, "held_document", return_value=design_roles.NotHeldDocument()),
-              contextlib.redirect_stdout(output), contextlib.redirect_stderr(errors)):
-            code = astra_review.main([str(document)])
-        return code, errors.getvalue()
-
-    def assert_review_lifetime(self, failed: bool) -> None:
-        self.outcomes = ["failed"] if failed else []
-        records: list[dict[str, object]] = []
-        rows: list[staff.StaffRow] = []
-        lifetimes: list[astra_roles.ExecProcess | astra_roles.HeldDesignRole | astra_roles.MeshWorker] = []
-        respond = self.server.respond
-
-        def observe(request: dict[str, object]) -> list[dict[str, object]] | None:
-            frames = respond(request)
-            if request.get("method") == "turn/start":
-                rows.extend(staff.find(kind="worker"))
-                lifetimes.extend(role["lifetime"] for role in astra_roles.live_roles(staff.snapshot()))
-                records.extend(cast(dict[str, object], json.loads(path.read_text()))
-                               for path in (self.session_dir / "astra-roles").glob("*.json"))
-                if frames is not None and not failed:
-                    frames.insert(-1, {"method": "item/completed", "params": {
-                        "threadId": mesh_fixture.THREAD_ID, "turnId": f"turn-{self.turn_starts}",
-                        "item": {"id": "review-reply", "type": "agentMessage", "text": "Verdict: clear."},
-                    }})
-            return frames
-
-        self.server.respond = observe
-        code, errors = self.run_review()
-        self.assertEqual(code, 1 if failed else 0, errors)
-        self.assertEqual(len(rows), 1)
-        self.assertEqual(len(records), 1)
-        row = rows[0]
-        self.assertEqual((row.id, row.name, row.parent), (
-            staff.native_id(mesh_fixture.THREAD_ID), f"astra-reviewer{os.getpid()}",
-            staff.ReportsTo(staff.native_id(os.environ["CODEX_THREAD_ID"]))))
-        self.assertEqual({key: value for key, value in records[0].items() if key != "held_at"}, {
-            "staff_id": row.id, "pid": None,
-            "session_dir": str(self.session_dir), "worker": row.name,
-        })
-        self.assertEqual(len(self.methods("thread/start")), 1)
-        self.assertEqual(len(self.methods("turn/start")), 1)
-        self.assertFalse(list((self.session_dir / "astra-roles").glob("*.json")))
-        self.assertIsNone(staff.by_id(row.id))
-        self.assertEqual(lifetimes, [astra_roles.MeshWorker(str(self.session_dir), row.name)])
-        if not failed:
-            self.assertEqual((self.session_dir / "review.md").read_text().strip(), "Verdict: clear.")
-
-    def test_the_reviewer_role_exists_during_success_and_is_released_afterward(self) -> None:
-        self.assert_review_lifetime(False)
-
-    def test_the_reviewer_role_exists_during_failure_and_is_released_afterward(self) -> None:
-        self.assert_review_lifetime(True)
 
 if __name__ == "__main__":
     _ = unittest.main()

@@ -6,7 +6,6 @@ from scripts.herdr import worker_panes
 from scripts.herdr.test_worker_panes import PaneWorld
 
 import io
-import json
 import os
 import unittest
 from contextlib import redirect_stderr
@@ -87,32 +86,6 @@ class StaffSourcesTests(StaffTestCase):
             self.assertEqual(self.staff_file.read_bytes(), before)
             self.assertEqual(list((self.root / "runs").glob("**/worker_transport*")), [])
 
-    def test_live_reports_a_bad_run_pin_and_keeps_mesh_members(self) -> None:
-        fixture = self.row_production()
-        _ = self.session_record(fixture.unit.current_session, fixture.unit.name)
-        worker = fixture_worker("mesh-worker", fixture.unit.id)
-        run = self.root / "runs/pinned"
-        run.mkdir(parents=True)
-        write_text_atomic(run / "mesh_roster.json", json.dumps({"mesh-worker": {"staff_id": worker.id}}))
-        pin = run / "worker_transport"
-        for failure in ("invalid", "unreadable"):
-            with self.subTest(failure=failure):
-                if failure == "invalid":
-                    write_text_atomic(pin, "junk\n")
-                else:
-                    pin.unlink()
-                    pin.mkdir()
-                with (mock.patch.dict(os.environ, {"ROSTER_RUN_ROOT": str(run.parent)}),
-                      redirect_stderr(io.StringIO()) as errors):
-                    document = staff_sources.live()
-                self.assertFalse(document["complete"])
-                self.assertIn(str(pin), errors.getvalue())
-                problems = cast(list[str], document["problems"])
-                self.assertTrue(any(str(pin) in problem for problem in problems), problems)
-                if failure == "invalid":
-                    self.assertTrue(any("junk" in problem for problem in problems), problems)
-                members = cast(list[dict[str, object]], document["members"])
-                self.assertIn(worker.id, [member["id"] for member in members])
 
     def test_live_reports_unreadable_owner_and_record_without_an_empty_member_list(self) -> None:
         _ = self.row_production()
