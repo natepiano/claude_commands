@@ -1727,7 +1727,7 @@ The style ledger ticket and finding tests use 49% less CPU, with all tests kept.
 - The per-test cost is in `LedgerTestCase.setUp`, which six modules share. Phase 90 moves the seed there and removes the two module copies.
 - A text replace of paths misses a JSON-escaped path. Phase 90 decodes the JSON to rewrite them.
 
-### Phase 86 — We know which tests to remove, merge or move to streamline the suite  · status: todo
+### Phase 86 — We know which tests to remove, merge or move to streamline the suite  · status: done
 **Depends on:** none
 
 #### Work Order
