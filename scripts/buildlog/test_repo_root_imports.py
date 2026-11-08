@@ -76,7 +76,7 @@ for name, module in list(sys.modules.items()):
     if isinstance(filename, str):
         path = str(Path(filename).resolve())
         if path in names:
-            names[path].append(name)
+            names[path].append([name, id(module)])
 print("module_names " + json.dumps(names))
 """
         with tempfile.TemporaryDirectory() as temporary:
@@ -93,10 +93,11 @@ print("module_names " + json.dumps(names))
                     self.assertEqual(process.returncode, 0, output + errors)
                     payload = next(line.removeprefix("module_names ") for line in output.splitlines()
                                    if line.startswith("module_names "))
-                    names = cast(dict[str, list[str]], json.loads(payload))
+                    names = cast(dict[str, list[tuple[str, int]]], json.loads(payload))
                     for filename, loaded in names.items():
                         with self.subTest(module=filename):
-                            self.assertEqual(len(loaded), 1, loaded)
+                            # An alias name for the same module object is one instance.
+                            self.assertEqual(len({instance for _, instance in loaded}), 1, loaded)
 
 
 if __name__ == "__main__":
