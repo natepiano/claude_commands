@@ -412,7 +412,7 @@ def new_queue_order() -> QueueOrder:
             for queue in (STATE / "queue").glob("*.jsonl"):
                 try:
                     entries = read_queue(queue)
-                except UnicodeError:
+                except (OSError, UnicodeError):
                     continue
                 previous = max(previous, max((entry.get("send_order", 0) for entry in entries), default=0))
         order = QueueOrder(previous + 1)
@@ -882,7 +882,7 @@ def _queued_message(value: object) -> QueuedMessage | None:
 def read_queue(path: Path) -> list[QueuedMessage]:
     try:
         lines = path.read_text(encoding="utf-8").splitlines()
-    except OSError:
+    except FileNotFoundError:
         return []
     messages = (_queued_message(loads(line)) for line in lines)
     return [message for message in messages if message is not None]
@@ -947,7 +947,7 @@ def enqueue(message: Message, reason: str, at: datetime, *,
                     continue
                 try:
                     queues.append((previous, read_queue(previous)))
-                except UnicodeError:
+                except (OSError, UnicodeError):
                     continue
         if message.key is not None and any(
             _matches_queued_key(old, message.key, recipient, own_path=previous == path)
@@ -994,7 +994,7 @@ def remove_queued_key(to: str, key: str, *,
         for path in candidates:
             try:
                 entries = read_queue(path)
-            except UnicodeError:
+            except (OSError, UnicodeError):
                 if path in paths:
                     raise
                 continue
@@ -1680,30 +1680,53 @@ def recover_socket_queues(records: list[sessions.SessionRecord], at: datetime) -
     return code, lines
 
 
-def pending(to: str | None, *, emit: bool = False) -> str:
+@dataclass(frozen=True)
+class CodexQueueOwner:
+    thread_id: str
+
+
+@dataclass(frozen=True)
+class CodexHookContext:
+    event: Literal["SessionStart", "PostToolUse"]
+
+
+class PendingTextFormat(Enum):
+    TEXT = "text"
+
+
+def pending(to: str | CodexQueueOwner | None, *, emit: bool = False,
+            output: PendingTextFormat | CodexHookContext = PendingTextFormat.TEXT) -> str:
     """Print and clear queued messages for the selected session.
 
     Current staff owners also receive their messages from queues for previous sessions.
     Names from previous sessions remain eligible when no other live session uses them.
     """
-    records = sessions.live_sessions()
-    if to is None:
-        own = os.environ.get("CLAUDE_CODE_SESSION_ID", "")
-        session = next((record for record in records if own and record["sessionId"] == own), None)
-        if session is None:
-            raise ValueError("pending without a name runs inside a live Claude session")
+    if isinstance(to, str) and to.startswith("codex:"):
+        to = CodexQueueOwner(to.removeprefix("codex:"))
+    if isinstance(to, CodexQueueOwner):
+        own = to.thread_id
+        keys = [f"session-{own}", f"session:{own}", f"codex:{own}", own]
     else:
-        session = sessions.addressed(to, records)
-    keys = [] if to is None else [to]
-    if session is not None:
-        taken = {record["name"] for record in records if record["sessionId"] != session["sessionId"]}
-        keys = [session_key(session), session["name"], f"uds:{session['messagingSocketPath']}",
-                *(name for name in session["formerNames"] if name not in taken), *keys]
+        records = sessions.live_sessions()
+        if to is None:
+            own = os.environ.get("CLAUDE_CODE_SESSION_ID", "")
+            session = next((record for record in records if own and record["sessionId"] == own), None)
+            if session is None:
+                raise ValueError("pending without a name runs inside a live Claude session")
+        else:
+            session = sessions.addressed(to, records)
+        keys = [] if to is None else [to]
+        own = session["sessionId"] if session is not None else ""
+        if session is not None:
+            taken = {record["name"] for record in records if record["sessionId"] != session["sessionId"]}
+            keys = [session_key(session), session["name"], f"uds:{session['messagingSocketPath']}",
+                    *(name for name in session["formerNames"] if name not in taken), *keys]
     paths = list(dict.fromkeys(queue_path(key) for key in keys if key))
     stable_values = set(keys)
-    if session is not None:
+    if own:
         try:
-            member = staff.snapshot().by_current_session(session["sessionId"])
+            membership = staff.local_snapshot() if isinstance(to, CodexQueueOwner) else staff.snapshot()
+            member = membership.by_current_session(own)
         except staff.StaffUnreadable:
             member = None
         if member is not None:
@@ -1717,7 +1740,7 @@ def pending(to: str | None, *, emit: bool = False) -> str:
             kept: list[QueuedMessage] = []
             try:
                 queued = read_queue(path)
-            except UnicodeError:
+            except (OSError, UnicodeError):
                 if path in paths:
                     raise
                 continue
@@ -1751,7 +1774,9 @@ def pending(to: str | None, *, emit: bool = False) -> str:
             "\n" + entry["text"].rstrip(), read_sender_stamp(entry.get("sender_native_id", "unavailable")))
             for index, entry in enumerate(entries, 1))
         if emit and text:
-            print(text, flush=True)
+            rendered = (json.dumps({"hookSpecificOutput": {"hookEventName": output.event, "additionalContext": text}})
+                        if isinstance(output, CodexHookContext) else text)
+            print(rendered, flush=True)
         for path, kept in rewrites:
             _rewrite_queue(path, kept)
         return text

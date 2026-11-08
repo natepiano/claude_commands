@@ -554,7 +554,10 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
         _ = self.enterContext(mock.patch.object(names, "load_names", return_value=fixture_names()))
         super().setUp()
         self.staff_rows: dict[str, staff.StaffRow] = {}
-        _ = self.enterContext(mock.patch.object(staff, "snapshot", side_effect=lambda: staff.StaffSnapshot(tuple(self.staff_rows.values()))))
+        def read_membership() -> staff.StaffSnapshot:
+            return staff.StaffSnapshot(tuple(self.staff_rows.values()))
+        for reader in ("snapshot", "local_snapshot"):
+            _ = self.enterContext(mock.patch.object(staff, reader, side_effect=read_membership))
         for identity in ("absent", "gone", "id-1", "id-2", "restarted", "remote-thread", "missing", "recipient"):
             self.staff_member(identity, identity)
         directory = short_socket_directory()
@@ -2671,6 +2674,31 @@ runpy.run_path(sys.argv[0], run_name="__main__")
         self.assertEqual(self.send("--key", "k", "--text", "hello").outcome, "sent")
         self.assertIn("nothing to reopen", send.reopen("never"))
 
+    def test_codex_pending_uses_an_explicit_native_thread_without_a_claude_record(self) -> None:
+        thread = "codex-recipient"
+        self.staff_member(thread, "Agent")
+        send.enqueue(send.Message(f"session:{thread}", "reviewer", "Review", "Read the review.", "review"),
+                     "session unavailable", send.now(), recipient=send.StableRecipient(f"staff:{thread}"))
+        with mock.patch.dict(os.environ, {"CODEX_THREAD_ID": thread}), redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(send.main(["pending", f"codex:{thread}"]), 0)
+        self.assertIn("Read the review.", output.getvalue())
+        self.assertIn("from reviewer", output.getvalue())
+        self.assertEqual(send.pending(send.CodexQueueOwner(thread)), "")
+
+    def test_codex_pending_follows_the_stable_owner_after_a_thread_change(self) -> None:
+        member = staff.StaffRow(staff.StaffId("fixed"), "agent", "Agent", staff.StaffRoot(),
+                               current_session=staff.StaffId("next-thread"))
+        self.staff_rows = {"fixed": member}
+        for thread, owner, text in (("old-thread", "fixed", "Keep this review."),
+                                    ("other-thread", "other", "Another review.")):
+            send.enqueue(send.Message(f"session:{thread}", "reviewer", "Review", text, "review"),
+                         "session unavailable", send.now(), recipient=send.StableRecipient(f"staff:{owner}"))
+        delivered = send.pending("codex:next-thread")
+        self.assertIn("Keep this review.", delivered)
+        self.assertNotIn("Another review.", delivered)
+        self.assertEqual(send.pending("codex:next-thread"), "")
+        self.assertIn("Another review.", send.queue_path("session-other-thread").read_text())
+
     def test_undelivered_is_queued_latest_per_key_and_pending_clears(self) -> None:
         self.outcome = send.Result("queued", "no agent named bogus")
         _ = self.send("--key", "k", "--text", "first\nbody")
@@ -2700,7 +2728,7 @@ runpy.run_path(sys.argv[0], run_name="__main__")
         # A send to the staff name after the session label changes is still kept for that session.
         _ = send.send(local_options(["--to", "old", "--from", "test", "--text", "by the old name"]))
         self.assertEqual(send.pending("someone-else"), "")
-        with mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "id-1"}):
+        with mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "id-1", "CODEX_THREAD_ID": "inherited-parent"}):
             text = send.pending(None)
         for sent in ("Queued message 1 of 3", "by name", "by socket", "by the old name"):
             self.assertIn(sent, text)
