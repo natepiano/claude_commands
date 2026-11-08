@@ -2,13 +2,24 @@
 from __future__ import annotations
 
 import json
+import os
+import socket
+import subprocess
 from pathlib import Path
 import sys
 import unittest
-from typing import cast
+from threading import Thread
+from typing import cast, override
+from unittest import mock
 
 from scripts.direct import step_record
 from scripts.direct.verify_step_routes_test_support import VerifyStepRoutesFixture, TARGETS
+from scripts.direct.verify_mac_offload_test_support import VERIFY
+from scripts.lib.shell_test_support import shell_functions
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+
+
+INVOKE = VERIFY.parent.parent / "lint/invoke.sh"
 
 
 def read_step_row(call_id: str) -> dict[str, object]:
@@ -31,22 +42,16 @@ def read_step_row(call_id: str) -> dict[str, object]:
 OBSERVER = r'''
 import json
 import os
-from pathlib import Path
+import socket
 import sys
-sys.path.insert(0, os.environ["TEST_STATE_REPOSITORY"])
-from scripts.direct.test_verify_step_state import read_step_row
-from scripts.direct import step_record
+
 call_id = os.environ.get("BUILDLOG_CALL_ID", "")
 if call_id:
-    path = step_record.record_path(call_id)
-    text = path.read_text()
-    original = Path(os.environ["TEST_STATE_ORIGINAL"])
-    if sys.argv[1] == "initialize_step_record":
-        original.write_text(text)
-    row = read_step_row(call_id)
-    row.update(event=sys.argv[1], unchanged=text == original.read_text())
-    with Path(os.environ["TEST_STATE_ROWS"]).open("a") as output:
-        output.write(json.dumps(row) + "\n")
+    with socket.create_connection(("127.0.0.1", int(os.environ["TEST_STATE_PORT"]))) as connection:
+        with connection.makefile("rwb") as channel:
+            channel.write(json.dumps([call_id, sys.argv[1]]).encode() + b"\n")
+            channel.flush()
+            json.loads(channel.readline())
 '''
 
 SHELL_OBSERVER = r'''
@@ -69,8 +74,55 @@ trap observe_step_return RETURN
 
 
 class VerifyStepStateTests(VerifyStepRoutesFixture):
+    @override
+    def setUp(self) -> None:
+        super().setUp()
+        self.fixture.environment.update({
+            "ROSTER_RUN_ROOT": str(self.fixture.root / "roster-runs"),
+            "UNIT_RUN_ROOT": str(self.fixture.root / "unit-runs"),
+            "SCRATCH_ROOT": str(self.fixture.root / "scratch"),
+        })
+
     def observe(self) -> Path:
         root = self.fixture.root
+        self.enterContext(mock.patch.dict(os.environ, {
+            "VERIFY_STEPS_DIR": self.fixture.environment["VERIFY_STEPS_DIR"],
+        }))
+        listener = socket.socket()
+        listener.bind(("127.0.0.1", 0))
+        listener.listen()
+        address = cast(tuple[str, int], listener.getsockname())
+
+        def receive() -> None:
+            while True:
+                connection = listener.accept()[0]
+                with connection, connection.makefile("rwb") as channel:
+                    request = channel.readline()
+                    if request == b"\n":
+                        return
+                    call_id, event = cast(list[str], json.loads(request))
+                    text = step_record.record_path(call_id).read_text()
+                    original = root / "original-record"
+                    if event == "initialize_step_record":
+                        _ = original.write_text(text)
+                    row = read_step_row(call_id)
+                    row.update(event=event, unchanged=text == original.read_text())
+                    with (root / "state-rows").open("a") as output:
+                        _ = output.write(json.dumps(row) + "\n")
+                    _ = channel.write(b"null\n")
+                    channel.flush()
+
+        thread = Thread(target=receive, daemon=True)
+        thread.start()
+
+        def close() -> None:
+            with socket.create_connection(address) as connection:
+                connection.sendall(b"\n")
+            thread.join(timeout=TEST_HANG_GUARD_SECS)
+            listener.close()
+
+        self.addCleanup(close)
+        self.fixture.environment["TEST_STATE_PORT"] = str(address[1])
         observer = root / "state-observer.py"
         _ = observer.write_text(OBSERVER)
         shell = root / "state-observer.sh"
@@ -84,12 +136,44 @@ os.execv(os.environ["TEST_REAL_PYTHON"], [os.environ["TEST_REAL_PYTHON"], *sys.a
 ''')
         self.fixture.environment.update({
             "BASH_ENV": str(shell), "TEST_STATE_OBSERVER": str(observer),
-            "TEST_STATE_REPOSITORY": str(Path(__file__).resolve().parents[2]),
-            "TEST_STATE_ORIGINAL": str(root / "original-record"),
-            "TEST_STATE_ROWS": str(root / "state-rows"), "TEST_PYTHON_STARTS": str(starts),
+            "TEST_PYTHON_STARTS": str(starts),
             "TEST_REAL_PYTHON": sys.executable, "CLAUDE_PYTHON": str(self.fixture.bin_directory / "python3"),
         })
         return starts
+
+    def call_step_functions(
+        self, body: str, *, kind: str, package: str = "sample", pinned: str = "",
+    ) -> subprocess.CompletedProcess[str]:
+        functions = shell_functions(
+            VERIFY, "initialize_step_record", "publish_step_state", "step_state", "step_writes_tree",
+            "run", "run_step", "finish_step_token", "route_compiling_step",
+            "sync_token_state", "acquire_token", "record_token_wait", "build_hold_wait_local",
+            "run_lint_sequence", "run_lint_held_sequence", "run_lint_judgment",
+            "read_metadata", "load_metadata", "workspace_taplo",
+        )
+        scripts = Path(step_record.__file__).resolve().parent.parent
+        functions += shell_functions(INVOKE, "buildlog_step_compiles", "fmt_cargo", "invoke_mend", "invoke_clippy", "invoke_clippy_fix")
+        functions += shell_functions(scripts / "lint/memory_gate.sh", "build_hold_applies", "buildlog_target_admitted")
+        setup = r'''
+PY=${CLAUDE_PYTHON:-$TEST_REAL_PYTHON}
+STEP_RECORD_SCRIPT=$TEST_REAL_DIRECT/step_record.py
+CMD=$TEST_STATE_KIND
+ARGS=()
+if [[ -n "$TEST_STATE_PACKAGE" ]]; then ARGS=("$TEST_STATE_PACKAGE"); fi
+PINNED_TARGET=$TEST_STATE_PINNED
+STEP_RECORD_PATH="" STEP_STATE_PATH="" STEP_RECORD_TEXT=""
+TOKEN_USED=0 TOKEN_WAITED=0
+HOLD_LINT=0 CHECK_LINT=0 METADATA_READY=0
+FEATURE_FLAGS=()
+VERIFY_METADATA_SCRIPT=$TEST_REAL_DIRECT/verify_metadata.py
+source "$LINT_CONFIG_READER"
+run_once() { "$@"; }
+BUILDLOG_RUN_START="$("$PY" "$STEP_RECORD_SCRIPT" start "$$")"
+initialize_step_record
+'''
+        return self.fixture.call_mac_functions(functions + setup + body, extra={
+            "TEST_STATE_KIND": kind, "TEST_STATE_PACKAGE": package, "TEST_STATE_PINNED": pinned,
+        })
 
     def verbs(self, starts: Path) -> list[str]:
         words = [cast(list[str], json.loads(line)) for line in starts.read_text().splitlines()]
@@ -117,7 +201,7 @@ if "--version" not in arguments and ("fmt" in arguments or ("mend" in arguments 
     import subprocess
     subprocess.run([sys.executable, os.environ["TEST_STATE_OBSERVER"], "tree"], check=True)
 '''))
-        result = self.run_verify("lint", "--no-cache")
+        result = self.call_step_functions("run_lint_sequence\n", kind="lint", package="")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         rows = self.observations()
         initial = rows[0]
@@ -134,11 +218,7 @@ if "--version" not in arguments and ("fmt" in arguments or ("mend" in arguments 
     def test_published_states_preserve_the_call_fields_and_select_the_target(self) -> None:
         _ = self.observe()
         self.fixture.environment["TEST_STATE_SEQUENCE"] = "1"
-        targets = Path(self.fixture.environment["BUILD_TARGETS_SCRIPT"])
-        _ = targets.write_text(TARGETS
-                              + 'if command == "reserve":\n'
-                              + '    Path(sys.argv[sys.argv.index("--reservation-file") + 1]).write_text("mac\\t" + os.environ["MAC_TEST_CONFIG"] + "\\n")\n')
-        result = self.run_verify("test", "sample", "--target", "mac")
+        result = self.call_step_functions("", kind="test", pinned="mac")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         rows = self.observations()
         initial = rows[0]
@@ -157,10 +237,8 @@ if "--version" not in arguments and ("fmt" in arguments or ("mend" in arguments 
         targets = Path(self.fixture.environment["BUILD_TARGETS_SCRIPT"])
         _ = targets.write_text(TARGETS
             + 'if command == "eligible":\n'
-            + '    print("linux-box\\teligible\\t-\\t/tmp/linux.conf\\tlinux")\n'
-            + 'if command == "reserve":\n'
-            + '    Path(sys.argv[sys.argv.index("--reservation-file") + 1]).write_text("mac\\t" + os.environ["MAC_TEST_CONFIG"] + "\\n")\n')
-        result = self.run_verify("test", "sample", "--target", "mac")
+            + '    print("linux-box\\teligible\\t-\\t/tmp/linux.conf\\tlinux")\n')
+        result = self.call_step_functions("", kind="test", pinned="mac")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         initial = next(row for row in self.observations() if row["event"] == "initialize_step_record")
         self.assertEqual(initial["runs_on"], {"kind": "any_target", "mac_targets": ["mac"]})
@@ -183,7 +261,7 @@ if "--version" not in arguments and ("fmt" in arguments or ("mend" in arguments 
     raise SystemExit(10 if any(holders.iterdir()) else 0)''')
                 _ = targets.write_text(source)
                 self.fixture.environment["TEST_RECORD_DAMAGE"] = damage
-                result = self.run_verify("check", "sample")
+                result = self.call_step_functions("run cargo check -p sample\n", kind="check")
                 self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
                 self.assertIn("step refused", result.stderr)
                 self.assertEqual(self.mac_rows(), [])

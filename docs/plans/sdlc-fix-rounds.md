@@ -390,7 +390,7 @@ The moved groups:
 
 As built: the core is 45 KB, not 30-40 KB. The five largest core sections are needed by every run, so they stay. Each moved group has one stub and one `<TagReferenceContract/>` row, so `_contract_revision` and `tag_inventory.py` cover every new file. After compaction, the hooks say to read the core in full, then each stub file whose moment is live.
 
-### Phase 10d — A merge adds change rows only for its own production, with the producing unit  · status: todo
+### Phase 10d — A merge adds change rows only for its own production, with the producing unit  · status: done
 **Depends on:** Phase 10c
 
 From the sdlc showrunner, 2026-11-07, a defect from builds. When builds merges main, `merge_checkpoint` adds a row for every Change-Review line in the merged commits, with builds as Producer. So rows C1179-C1183 (merge 429d1528) show the builds session, and the user asks builds about sdlc work.
@@ -404,6 +404,8 @@ The user, through builds and sdlc, 2026-11-07: "shutdown was part of sdlc not na
 
 Add no new check.
 
+As built: `change_review.list_ready` reads only the merges whose subject ends ` into <merge branch>`, so a foreign merge that a fast-forward brings in adds no row. It skips each commit already on the origin merge branch of a production outside this one's scope (`reviewed_merge_refs`); for such a branch that later took in the merge, `_publication_exclusions` skips only the history it had before, so a rescan or a held-step release gives the same rows. The Producer is the unit the checkpoint branch resolves to; the requesting unit's id applies when the branch resolves to it or to no unit. The Production cell is the fixed staff id of the producing unit's showrunner. `foreign_units` is gone. `merge_gate.py --promote-only` locks and scans the promoted main repository, not the working directory it runs from.
+
 ### Phase 10e — Two test rules in the direct contract  · status: done
 **Depends on:** Phase 10c (it moves FixDispatch)
 
@@ -415,3 +417,12 @@ From the user, through natest and the sdlc showrunner, 2026-11-07 (the user's wo
 Places: the FixDispatch regression-test sentence ("writes, for each testable finding, the regression test that would have caught it"), the test rules line in `write_prompt_contract.md`, and the test worker prompt. Each rule has one place; the other places point to it. This phase is doc-only.
 
 As built: both rules are in `docs/direct/write_prompt_contract.md` item 6, which implementation, fix and test prompts carry verbatim. FixDispatch, the main-read closure check and `<ClosureReview/>` ask for coverage under item 6, not one new regression test for each finding. The test worker paragraph points to item 6.
+
+### Phase 10f — A checkpoint named for its plan without "-plan" gets its Producer  · status: done
+**Depends on:** Phase 10d
+
+From hana's showrunner, through sdlc, 2026-11-07. `change_review.py list-ready` printed `no staff row for unit info-panels; Producer stays empty` for demo's rows. demo's plan is `docs/hana/info-panels-plan.md`, its branch is `tool-based-ui-demo-36`, and it commits `checkpoint(info-panels): …`. The checkpoint aliases hold the plan stem (`info-panels-plan`), not the stem without `-plan`. Hana's main uses both forms for one plan: `info-panels-plan` and `info-panels`, `widget-enhancements-plan` and `widget-enhancements`.
+
+Fix: the checkpoint aliases of a unit also hold its plan stem without a trailing `-plan`. Add no new check.
+
+As built: `_branches_from_units` adds `plan.removesuffix("-plan")` right after the plan stem, so `checkpoint(info-panels)` resolves to demo.

@@ -96,6 +96,7 @@ class FolderAuditTests(unittest.TestCase):
         _ = self.enterContext(unittest.mock.patch.object(os, "scandir", side_effect=recorded_scan))
         state = self.root / "state"
         self.enterContext(unittest.mock.patch.dict(os.environ, {"FOLDER_SWEEP_STATE_DIR": str(state),
+                                                                "HOME": str(self.root),
                                                                 "SCRATCH_HOLDS": str(state / "holds.json"),
                                                                 "SCRATCH_ROOT": str(self.root / "scratch"),
                                                                 "SCRATCH_VISIBLE_ROOT": str(self.root / "repro"),
