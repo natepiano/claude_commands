@@ -19,7 +19,7 @@ import re
 import subprocess
 import sys
 import time
-from typing import cast, final
+from typing import Literal, cast, final
 from uuid import uuid4
 
 from scripts.aws_target import gate_box, ledger
@@ -60,11 +60,6 @@ def save(path: Path, row: dict[str, object]) -> None:
     write_text_atomic(path, json.dumps(row, sort_keys=True) + '\n')
 
 
-def failed(reason: str) -> gate.GateRun:
-    print('cloud: RED: ' + reason, flush=True)
-    return gate.GateRun((gate.GateJobResult('cloud', 'attempt', 1, 0, reason, kind=gate.GateJobKind.RUNNER_FAILURE),), 0, 0)
-
-
 def capacity_error(reason: str) -> bool:
     return any(code in reason for code in ('InsufficientInstanceCapacity', 'InsufficientSpotCapacity',
                                            'MaxSpotInstanceCountExceeded', 'VcpuLimitExceeded', 'SpotMaxPriceTooLow'))
@@ -75,9 +70,9 @@ def aws_down(reason: str) -> bool:
                                            'ServiceUnavailable', 'InternalError', 'RequestTimeout', 'Connection timed out'))
 
 
-def image_missing(reason: str) -> bool:
-    return any(code in reason for code in ('NoSuchBucket', 'InvalidAMIID.NotFound', 'InvalidAMIID.Unavailable',
-                                           'InvalidLaunchTemplateId.NotFound'))
+def launch_error_code(reason: str) -> str:
+    code = re.search(r'\(([A-Za-z0-9_.-]+)\)', reason) or re.match(r'[A-Za-z0-9_.-]+', reason)
+    return code[1] if code and code.lastindex else code[0] if code else ''
 
 
 def log_progress(text: str) -> progress_profile.ProgressCounter | progress_profile.NoCounter:
@@ -215,6 +210,17 @@ class GateWorker:
                 if self.api.observe(instance, int(self.clock())).state == 'terminated':
                     self.book.resolve_gate(reservation.attempt, ledger.GateTerminated(int(self.clock()), instance))
 
+    def record_launch(self, request: dict[str, object], size: str, zone: str,
+                      result: Literal['launched', 'refused'], reason: str = '') -> None:
+        error_code = launch_error_code(reason)
+        row: dict[str, object] = {'time': self.clock(), 'attempt': request['attempt'], 'instance_type': size,
+            'vcpus': self.size_vcpus, 'availability_zone': zone, 'result': result,
+            'error_code': error_code, 'reason': reason}
+        with store.locked_append(self.book.directory / 'cloud-gate-launches.jsonl') as handle:
+            store.append_locked(handle, row)
+        if result == 'refused':
+            print(f'Cloud gate refused: {size} in {zone}: {error_code}', flush=True)
+
     def launch(self, folder: Path, request: dict[str, object], deployment: dict[str, object]) -> str | LocalFallback:
         path = folder / 'launch.json'
         launch: dict[str, object] = read(path) if path.exists() else {}
@@ -231,10 +237,14 @@ class GateWorker:
                 lifetime = max(1, (ledger.instant(request, 'expires') - int(self.clock()) + 59) // 60)
                 prefix = ledger.text(deployment, 'artifact_prefix') + '__INSTANCE_ID__/' + ledger.text(request, 'attempt')
                 links = {key: ledger.text(request, key) for key in ('attempt', 'commit', 'tree', 'mode', 'origin')}
-                links.update(production='true', step='size', expires=str(request['expires']), modules=json.dumps(request['modules']),
-                             source='s3://' + ledger.text(deployment, 'bucket') + '/' + ledger.text(request, 'source_key'),
+                bucket = 's3://' + ledger.text(deployment, 'bucket')
+                links.update(production='true', step='size', expires=str(request['expires']),
+                             guest=bucket + '/requests/' + ledger.text(request, 'attempt') + '.guest.py',
+                             request=bucket + '/requests/' + ledger.text(request, 'attempt') + '.json',
                              log='s3://' + ledger.text(deployment, 'bucket') + '/' + prefix + '/gate.log',
                              result='s3://' + ledger.text(deployment, 'bucket') + '/' + prefix + '/result.json')
+                if request['source_key']:
+                    links['source'] = bucket + '/' + ledger.text(request, 'source_key')
                 policy = read_settings(self.settings_path)
                 tags = [{'Key': 'GateDeployment', 'Value': ledger.text(deployment, 'deployment_id')},
                         {'Key': 'Workload', 'Value': 'cloud-claude-gate'}, {'Key': 'Name', 'Value': 'cloud-claude-gate'}, {'Key': 'GateAttempt', 'Value': ledger.text(request, 'attempt')},
@@ -269,10 +279,16 @@ class GateWorker:
                 for retry in range(settings().whole('launch_reply_tries')):
                     try:
                         reply = self.api.call('run-instances', '--cli-input-json', json.dumps(arguments))
+                        self.record_launch(request, size, ledger.text(subnet, 'zone'), 'launched')
                         break
                     except AwsUnavailable as error:
+                        self.record_launch(request, size, ledger.text(subnet, 'zone'), 'refused', str(error))
                         if not aws_down(str(error)) or retry + 1 == settings().whole('launch_reply_tries'):
                             raise
+                    except subprocess.SubprocessError as error:
+                        self.record_launch(request, size, ledger.text(subnet, 'zone'), 'refused',
+                                           type(error).__name__ + ': ' + str(error))
+                        raise
                 else:
                     raise AssertionError('The launch retry count must be positive')
             except AwsUnavailable as error:
@@ -281,10 +297,8 @@ class GateWorker:
                     launch = {}
                     save(path, {'variant': offset + 1})
                     continue
-                if image_missing(str(error)):
-                    self.book.resolve_gate(ledger.text(request, 'attempt'), ledger.GateAbsent(int(self.clock())))
-                    return LocalFallback('image or stack is absent')
-                raise
+                self.book.resolve_gate(ledger.text(request, 'attempt'), ledger.GateAbsent(int(self.clock())))
+                return LocalFallback(f'{size} in {ledger.text(subnet, "zone")}: {launch_error_code(str(error))}')
             instances = ledger.rows(reply, 'Instances')
             if len(instances) != 1:
                 raise AwsUnavailable('The launch reply has no unique instance')
@@ -297,36 +311,34 @@ class GateWorker:
 
     def execute(self, folder: Path, request: dict[str, object], deployment: dict[str, object]) -> dict[str, object]:
         attempt = ledger.text(request, 'attempt')
+        row: dict[str, object] = {}
         try:
             cloud_progress.publish(self.sidecar, cloud_progress.CloudProgress('requesting', 0, 0, self.clock()))
             if not (folder / 'launch.json').exists():
-                try:
-                    self.reconcile()
-                    self.charges()
-                    reservation = self.book.reserve_gate(self.settings_path, ledger.GateReservation(
-                        attempt, int(self.clock()), ledger.instant(request, 'expires'),
-                        money(str(settings().number('spot_max_usd_per_hour'))),
-                        money(str(settings().number('attempt_allowance_usd')))))
-                    if isinstance(reservation, ledger.GateCapReached):
-                        return {'status': 'fallback', 'reason': reservation.reason}
-                    bucket = ledger.text(deployment, 'bucket')
+                self.reconcile()
+                self.charges()
+                reservation = self.book.reserve_gate(self.settings_path, ledger.GateReservation(
+                    attempt, int(self.clock()), ledger.instant(request, 'expires'),
+                    money(str(settings().number('spot_max_usd_per_hour'))),
+                    money(str(settings().number('attempt_allowance_usd')))))
+                if isinstance(reservation, ledger.GateCapReached):
+                    return {'status': 'fallback', 'reason': reservation.reason}
+                bucket = ledger.text(deployment, 'bucket')
+                if request['source_key']:
                     self.upload(bucket, ledger.text(request, 'source_key'), folder / 'source.bundle')
-                    self.upload(bucket, 'requests/' + attempt + '.json', folder / 'request.json')
-                except AwsUnavailable as error:
-                    if aws_down(str(error)) or image_missing(str(error)):
-                        self.book.resolve_gate(attempt, ledger.GateAbsent(int(self.clock())))
-                        return {'status': 'fallback', 'reason': 'AWS is down' if aws_down(str(error)) else 'image or stack is absent'}
-                    raise
+                self.upload(bucket, 'requests/' + attempt + '.json', folder / 'request.json')
+                guest = folder / 'guest.py'
+                _ = guest.write_text(gate_box.GUEST)
+                self.upload(bucket, 'requests/' + attempt + '.guest.py', guest)
             launched = self.launch(folder, request, deployment)
             if isinstance(launched, LocalFallback):
                 return {'status': 'fallback', 'reason': launched.reason}
             instance = launched
-            arguments = ledger.mapping(read(folder / 'launch.json')['arguments'])
-            self.size_vcpus = int(ledger.text(arguments, 'InstanceType').split('.')[1].removesuffix('xlarge')) * 4
-            cloud_progress.publish(self.sidecar, cloud_progress.CloudProgress('setup', self.size_vcpus, 0, self.clock()))
             prefix = ledger.text(deployment, 'artifact_prefix') + instance + '/' + attempt
-            row: dict[str, object] = {}
             try:
+                arguments = ledger.mapping(read(folder / 'launch.json')['arguments'])
+                self.size_vcpus = int(ledger.text(arguments, 'InstanceType').split('.')[1].removesuffix('xlarge')) * 4
+                cloud_progress.publish(self.sidecar, cloud_progress.CloudProgress('setup', self.size_vcpus, 0, self.clock()))
                 while self.clock() < ledger.instant(request, 'expires'):
                     bucket = ledger.text(deployment, 'bucket')
                     if self.download(bucket, prefix + '/gate.log', folder / 'gate.log'):
@@ -334,8 +346,9 @@ class GateWorker:
                     if self.download(bucket, prefix + '/result.json', folder / 'remote-result.json'):
                         if not self.download(bucket, prefix + '/gate.log', folder / 'gate.log'):
                             raise ValueError('The final log is absent')
-                        row = read(folder / 'remote-result.json')
-                        validate_result(row, request)
+                        result = read(folder / 'remote-result.json')
+                        validate_result(result, request)
+                        row = result
                         self.publish_log(folder)
                         break
                     state = self.api.observe(instance, int(self.clock())).state
@@ -349,10 +362,11 @@ class GateWorker:
             return {'status': 'complete', 'instance': instance, 'result': row}
         except (OSError, ValueError, KeyError, TypeError, AwsUnavailable, subprocess.SubprocessError) as error:
             launch = read(folder / 'launch.json') if (folder / 'launch.json').exists() else {}
-            if not launch:
+            if not launch.get('instance'):
                 self.book.resolve_gate(attempt, ledger.GateAbsent(int(self.clock())))
-            pending = bool(launch.get('arguments')) and not launch.get('instance')
-            return {'status': 'pending' if pending else 'red', 'reason': str(error)}
+            if row and not gate_box.decode_run(row['gate']).passed:
+                return {'status': 'complete', 'result': row}
+            return {'status': 'fallback', 'reason': str(error)}
 
 
 def validate_result(row: dict[str, object], request: dict[str, object]) -> None:
@@ -408,8 +422,7 @@ def prepare(repo: Path, folder: Path, mode: gate.SuiteMode, full: bool, limit: f
         if isinstance(selection, affected_modules.AffectedSelection):
             modules = [(s, p) for s, p in modules if p in selection.modules]
     refs = ['HEAD']
-    if gate.git(repo, 'rev-parse', '--verify', 'refs/remotes/origin/main').returncode == 0:
-        refs.append('refs/remotes/origin/main')
+    origin_main = gate.checked_git(repo, 'rev-parse', 'refs/remotes/origin/main')
     branch = gate.git(repo, 'symbolic-ref', '--quiet', 'HEAD').stdout.strip()
     if branch:
         refs.append(branch)
@@ -418,10 +431,14 @@ def prepare(repo: Path, folder: Path, mode: gate.SuiteMode, full: bool, limit: f
     if urlsplit(origin).password or urlsplit(origin).query or ('://' in origin and urlsplit(origin).username):
         raise GateRefused('The origin URL must contain no credential')
     folder.mkdir(parents=True, exist_ok=True)
-    _ = gate.checked_git(repo, 'bundle', 'create', str(folder / 'source.bundle'), *refs)
-    digest = sha256((folder / 'source.bundle').read_bytes()).hexdigest()
+    source_key = ''
+    if int(gate.checked_git(repo, 'rev-list', '--count', 'HEAD', '--not', 'refs/remotes/origin/main')):
+        _ = gate.checked_git(repo, 'bundle', 'create', str(folder / 'source.bundle'), *refs, '--not', 'refs/remotes/origin/main')
+        digest = sha256((folder / 'source.bundle').read_bytes()).hexdigest()
+        source_key = 'source/' + digest + '.bundle'
     request: dict[str, object] = {'attempt': folder.name, 'commit': commit, 'tree': tree, 'origin': origin,
-        'mode': mode.value, 'modules': [str(p.relative_to(repo)) for _, p in modules], 'source_key': 'source/' + digest + '.bundle',
+        'origin_main': origin_main, 'clone_url': settings().text('clone_url'),
+        'mode': mode.value, 'modules': [str(p.relative_to(repo)) for _, p in modules], 'source_key': source_key,
         'expires': int(time.time()) + settings().whole('lifetime_minutes') * 60,
         'module_time_limit_s': min(limit, settings().number('module_time_limit_s'))}
     save(folder / 'request.json', request)
@@ -430,6 +447,14 @@ def prepare(repo: Path, folder: Path, mode: gate.SuiteMode, full: bool, limit: f
 
 def run(repo: Path, *, mode: gate.SuiteMode, full: bool, module_time_limit_s: float,
         service: Callable[[Sequence[str]], int] = lambda command: subprocess.call(command)) -> LocalFallback | CloudCompleted:
+    try:
+        return run_cloud(repo, mode=mode, full=full, module_time_limit_s=module_time_limit_s, service=service)
+    except (OSError, ValueError, KeyError, TypeError, AwsUnavailable, subprocess.SubprocessError, GateRefused) as error:
+        return LocalFallback(str(error))
+
+
+def run_cloud(repo: Path, *, mode: gate.SuiteMode, full: bool, module_time_limit_s: float,
+              service: Callable[[Sequence[str]], int]) -> LocalFallback | CloudCompleted:
     directory = target_config.ssh_target_state_directory('aws')
     deployment_path = directory / 'gate-deployment.json'
     if not deployment_path.exists():
@@ -474,19 +499,19 @@ def run_service(repo: Path, folder: Path, request: dict[str, object], command: S
     # The service owns every AWS call. The session only reads local evidence.
     _ = service(command)
     if not (folder / 'outcome.json').exists():
-        return CloudCompleted(failed('The scaler service has no final result; its saved attempt remains recoverable'))
+        return LocalFallback('The scaler service has no final result')
     outcome = read(folder / 'outcome.json')
     if outcome.get('status') == 'fallback':
         return LocalFallback(ledger.text(outcome, 'reason'))
     if outcome.get('status') != 'complete':
-        return CloudCompleted(failed(ledger.text(outcome, 'reason')))
+        return LocalFallback(ledger.text(outcome, 'reason'))
     row = ledger.mapping(outcome['result'])
     try:
         validate_result(row, request)
     except (ValueError, KeyError, TypeError) as error:
-        return CloudCompleted(failed(str(error)))
+        return LocalFallback(str(error))
     if gate.checked_git(repo, 'rev-parse', 'HEAD') != request['commit']:
-        return CloudCompleted(failed('The checkout changed during the cloud attempt'))
+        return LocalFallback('The checkout changed during the cloud attempt')
     import_record(folder, row)
     print((folder / 'gate.log').read_text(), end='', flush=True)
     return CloudCompleted(gate_box.decode_run(row['gate']))

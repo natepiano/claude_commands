@@ -254,6 +254,18 @@ def transcript_entries(source: Path, changed: set[str]) -> Generator[str | TornT
                 yield transcript_entry(cast(dict[str, object], fields), changed)
 
 
+def conversation_entries(row: staff.StaffRow, backend: staff.ClaudeBackend | staff.CodexBackend,
+                         changed: set[str]) -> Generator[str | TornTranscriptRecord]:
+    """Read a conversation; Claude has no entries before its first transcript."""
+    try:
+        source = transcript_source(row, backend)
+    except ValueError as error:
+        if isinstance(backend, staff.ClaudeBackend) and str(error) == "no source transcript found":
+            return
+        raise
+    yield from transcript_entries(source, changed)
+
+
 def handoff_path(run: Path, row: staff.StaffRow) -> Path:
     return run / f"{row.id}.handoff.md"
 
