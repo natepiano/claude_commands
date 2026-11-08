@@ -1728,7 +1728,7 @@ Merge 82e4ed73a puts builds 7ab78b74e into this branch with phases 35 to 83. Its
 - the targeted test green on the phase commit merged with `origin/builds`
 - `basedpyright` on the changed files prints `0 errors, 0 warnings, 0 notes`
 
-### Phase 85 — The style ledger ticket and finding tests use half their CPU  · status: todo
+### Phase 85 — The style ledger ticket and finding tests use half their CPU  · status: done
 **Depends on:** none
 
 #### Work Order
