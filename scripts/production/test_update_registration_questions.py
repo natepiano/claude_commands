@@ -28,7 +28,7 @@ class RegistrationTests(RegistrationFixture):
         destination_doc = self.doc.with_name("other-production.md")
         _ = destination_doc.write_text(self.doc.read_text())
         destination = fixture_member("showrunner", name="destination",
-                                     doc=staff.LiveDoc("natedev", destination_doc))
+                                     doc=staff.LiveDoc(remote.local_machine(), destination_doc))
         proposal = self.root / "issues/layout-proposal.md"
         _ = proposal.write_text("\n".join([
             "---", "status: open", "tags: [issue, proposal]", "proposal_id: P1",

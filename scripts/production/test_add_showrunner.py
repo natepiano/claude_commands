@@ -108,6 +108,7 @@ class AddShowrunnerTests(AddShowrunnerFixture):
     def setUp(self) -> None:
         super().setUp()
         _ = self.enterContext(patch.object(add_showrunner, "local_machine", return_value="natedev"))
+        _ = self.enterContext(patch.object(herdr.Herdr, "run_in_pane"))
         _ = fixture_member("showrunner", name="top", doc=staff.LiveDoc("natedev", self.doc("top")))
 
     @override

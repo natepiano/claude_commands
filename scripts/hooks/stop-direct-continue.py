@@ -36,7 +36,8 @@ REASON = """\
 /unit:direct run active, {tokens:,} / {trigger:,} tokens ({percent}%).
 Compaction runs when the context reaches {trigger:,} tokens. It does not run while the session is idle.
 Take the next workflow action now. Do not wait for compaction.
-Read ~/.claude/commands/unit/direct.md after compaction.
+After compaction, read ~/.claude/commands/unit/direct.md in full.
+Then read each stub file whose moment is live.
 If you need a user decision, state it in one line and end the turn."""
 
 

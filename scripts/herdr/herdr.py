@@ -862,10 +862,23 @@ class PaneProcessInfoResult(TypedDict):
     process_info: PaneProcessInfo
 
 
+@dataclass(frozen=True)
+class ReportedAgentSession:
+    """The agent reports its current native session id."""
+
+    session_id: str
+
+
+@dataclass(frozen=True)
+class NoReportedAgentSession:
+    """The agent has no reported native session id."""
+
+
 class AgentOccupant(TypedDict):
     pane_id: str
     agent: NotRequired[str | None]
     agent_status: AgentStatus
+    agent_session: ReportedAgentSession | NoReportedAgentSession
 
 
 class AgentListResult(TypedDict):
@@ -2511,10 +2524,16 @@ class Herdr:
             kind = agent.get("agent")
             if kind is not None and not isinstance(kind, str):
                 raise HerdrFailure("herdr agent kind: expected text or null")
+            session: ReportedAgentSession | NoReportedAgentSession = NoReportedAgentSession()
+            if "agent_session" in agent:
+                report = json_object(agent["agent_session"], "herdr agent session")
+                if json_text(report.get("kind"), "herdr agent session kind") == "id":
+                    session = ReportedAgentSession(json_text(report.get("value"), "herdr agent session id"))
             agents.append({
                 "pane_id": json_text(agent.get("pane_id"), "herdr agent pane id"),
                 "agent": kind,
                 "agent_status": AgentStatus.decode(agent.get("agent_status")),
+                "agent_session": session,
             })
         return agents
 
@@ -4992,8 +5011,9 @@ def launch_prepared_agent(name: str, destination: NewTab | SplitPane | ExistingP
     try:
         if isinstance(destination, SplitPane):
             client.label_pane(pane, destination.label)
+        script = f"unalias {kind} 2>/dev/null; "
         if isinstance(destination, ExistingPane):
-            # Change the existing shell, so the canonical agent inherits the proved environment.
+            # Set the environment in the existing shell before the agent starts.
             environment = _pane_environment(prepared.env)
             exports = shlex.join([f"{key}={value}" for key, value in environment.items()
                                   if not key.startswith("HERDR_") or key == "HERDR_AGENT_PANE"])
@@ -5001,12 +5021,12 @@ def launch_prepared_agent(name: str, destination: NewTab | SplitPane | ExistingP
                 "STAFF_ID", "CLAUDE_CONFIG_DIR", "CODEX_HOME",
                 "CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID", "CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY",
             }) - {"TERM", "COLORTERM"}
-            script = (f"unalias {kind} 2>/dev/null; "
-                      "for legacy_label in $(env); do case $legacy_label in SHOWRUNNER_*=*) "
+            script += ("for legacy_label in $(env); do case $legacy_label in SHOWRUNNER_*=*) "
                       'unset "${legacy_label%%=*}";; esac; done; '
                       f"cd -- {shlex.quote(str(prepared.directory))} && "
                       f"unset {shlex.join(sorted(key for key in removals if not key.startswith('HERDR_') and re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*', key)))} && export {exports}")
-            client.run_in_pane(pane, ["eval", script], terminal=destination.terminal)
+        client.run_in_pane(pane, ["eval", script],
+                           terminal=destination.terminal if isinstance(destination, ExistingPane) else "")
         server_name = agent_name if isinstance(agent_name, str) else agent
         outcome = start_agent(name, pane, kind, agent_arguments, opening, timeout_ms, agent=server_name)
     except AgentExited:

@@ -1606,6 +1606,7 @@ class LaunchDestinationTests(StaffTestCase):
             return herdr.PromptSubmissionNotRequired()
 
         with (patch.object(herdr, "open_tab", return_value="worker-pane"),
+              patch.object(herdr.Herdr, "run_in_pane"),
               patch.object(herdr, "start_agent", side_effect=start) as started):
             result = herdr.launch_prepared_agent("agents", herdr.NewTab("workers", "worker"),
                 prepared, "claude", [], herdr.NoOpeningPrompt(), 5000, agent="worker")
@@ -1658,6 +1659,9 @@ class LaunchDestinationTests(StaffTestCase):
 
     def test_all_destinations_start_and_label_before_start(self) -> None:
         run_in_pane = herdr.Herdr.run_in_pane
+        program = self.root / "bin" / "codex"
+        write_text_atomic(program, f"#!{sys.executable}\nimport os\nprint(os.environ['CODEX_HOME'])\n",
+                          new_file_mode=0o700)
         for destination in (herdr.NewTab("workers", "worker"),
                             herdr.SplitPane("parent", "right", 0.3, "worker"),
                             herdr.ExistingPane("worker-pane", "terminal-one")):
@@ -1685,8 +1689,15 @@ class LaunchDestinationTests(StaffTestCase):
                 cast(Mock, client.run_in_pane).side_effect = run_command
                 def start(*_args: object, **_kwargs: object) -> herdr.PromptSubmissionNotRequired:
                     events.append("start")
+                    command = cast(str, cast(Mock, client.run).call_args.args[3])
+                    alias = shlex.quote(f"CODEX_HOME=/wrong {shlex.quote(str(program))}")
+                    shell = subprocess.run([shutil.which("zsh") or "/bin/zsh", "-c",
+                                            f"alias codex={alias}\n{command}\ncodex\n"],
+                                           env=prepared.env, capture_output=True, text=True, check=True)
+                    self.assertEqual(shell.stdout.strip(), "/account")
                     return herdr.PromptSubmissionNotRequired()
-                prepared = herdr.PreparedAgentEnvironment(Path("/tmp"), {"CODEX_HOME": "/account", "PATH": "/bin"})
+                prepared = herdr.PreparedAgentEnvironment(Path("/tmp"),
+                    {"CODEX_HOME": "/account", "PATH": f"{program.parent}{os.pathsep}{os.defpath}"})
                 with (patch.object(herdr, "Herdr", return_value=client),
                       patch.object(herdr, "open_tab", return_value="worker-pane") as opened,
                       patch.object(herdr, "start_agent", side_effect=start) as started,
@@ -1699,12 +1710,13 @@ class LaunchDestinationTests(StaffTestCase):
                     herdr.NoOpeningPrompt(), 5000, agent="worker")
                 if isinstance(destination, herdr.NewTab):
                     opened.assert_called_once_with("agents", "workers", "worker", "/tmp", prepared.env)
+                    self.assertEqual(events, ["process-info", "start"])
                 else:
                     opened.assert_not_called()
                 if isinstance(destination, herdr.SplitPane):
-                    self.assertEqual(events, ["label", "start"])
+                    self.assertEqual(events, ["label", "process-info", "start"])
                     cast(Mock, client.label_pane).assert_called_once_with("worker-pane", "worker")
-                    args = cast(tuple[str, ...], cast(Mock, client.result).call_args.args)
+                    args = cast(tuple[str, ...], cast(Mock, client.result).call_args_list[0].args)
                     self.assertIn("--no-focus", args)
                     self.assertIn("CODEX_HOME=/account", args)
                 if isinstance(destination, herdr.ExistingPane):
@@ -2305,6 +2317,34 @@ class HerdrTests(unittest.TestCase):
                 if isinstance(observation, herdr.PromptInputReady):
                     self.assertEqual(observation.idle, state in {herdr.AgentStatus.IDLE, herdr.AgentStatus.DONE})
 
+    def test_agent_inventory_decodes_a_reported_session_id(self) -> None:
+        identity = fixture_runtime_id("agent-inventory-report")
+        self.configure_herdr(["agent", "list"], json.dumps({"result": {"agents": [{
+            "pane_id": "worker", "agent": "codex", "agent_status": "idle",
+            "agent_session": {"kind": "id", "value": identity},
+        }]}}))
+        self.assertEqual(self.herdr.agents()[0]["agent_session"], herdr.ReportedAgentSession(identity))
+
+    def test_agent_inventory_decodes_no_reported_session(self) -> None:
+        reports: list[dict[str, object]] = [{}, {"agent_session": {"kind": "pending"}}]
+        for report in reports:
+            with self.subTest(report=report):
+                self.configure_herdr(["agent", "list"], json.dumps({"result": {"agents": [{
+                    "pane_id": "worker", "agent": "codex", "agent_status": "idle", **report,
+                }]}}))
+                self.assertEqual(self.herdr.agents()[0]["agent_session"], herdr.NoReportedAgentSession())
+
+    def test_agent_inventory_rejects_a_malformed_session_report(self) -> None:
+        reports: list[object] = [None, "thread", [], {}, {"kind": 7}, {"kind": "id"},
+                                 {"kind": "id", "value": 7}]
+        for report in reports:
+            with self.subTest(report=report):
+                self.configure_herdr(["agent", "list"], json.dumps({"result": {"agents": [{
+                    "pane_id": "worker", "agent": "codex", "agent_status": "idle", "agent_session": report,
+                }]}}))
+                with self.assertRaisesRegex(herdr.HerdrFailure, "herdr agent session"):
+                    _ = self.herdr.agents()
+
     def test_label_pane_uses_a_persistent_pane_label(self) -> None:
         self.herdr.label_pane("worker", "dispatch-owner")
         self.assertEqual(self.commands()[-1], ["--session", "fixture", "pane", "rename", "worker", "dispatch-owner"])
@@ -2428,6 +2468,9 @@ class HerdrTests(unittest.TestCase):
 
     def configure_startup_shell(self, pane: str) -> None:
         """Supply private shell facts for the shared target check."""
+        if "--session fixture pane list" not in self.responses:
+            self.configure_herdr(["pane", "list"], json.dumps({"result": {"panes": [
+                {"pane_id": pane, "terminal_id": "terminal-one", "workspace_id": "w1"}]}}))
         if not (self.proc / "10").exists():
             self.startup_process(10, ["zsh"])
         self.configure_herdr(["pane", "process-info", "--pane", pane], self.startup_observation(["zsh"]))
@@ -4731,7 +4774,8 @@ class HerdrTests(unittest.TestCase):
         live = lookup.LiveClaude("Unit", unit.id, "/fixture/socket", 12)
         with (patch.object(herdr, "live_sessions", return_value=[{"name": "fixture"}]),
               patch.object(herdr.Herdr, "agents", return_value=[{
-                  "agent": "codex", "pane_id": "pane-codex", "agent_status": "idle",
+                  "agent": "codex", "pane_id": "pane-codex", "agent_status": herdr.AgentStatus.IDLE,
+                  "agent_session": herdr.ReportedAgentSession(str(codex.current_session)),
               }]),
               patch.object(lookup, "_claudes", return_value=(
                   {12: live}, lookup.UnreadAt({}, lookup.RecordsRead()))),
@@ -5042,7 +5086,9 @@ class HerdrTests(unittest.TestCase):
 
 
     def test_a_pane_of_the_heal_started_server_can_launch_another_session(self) -> None:
+        self.configure_startup_shell("pane")
         spawn, _ = self.detached_server()
+        self.darwin_startup_table(f"10 1 {os.getuid()} zsh")
         self.responses["--session fixture status server"] = [
             {"stdout": "status: stopped\n", "code": 0}, {"stdout": "status: running\n", "code": 0}]
         _ = self.responses_path.write_text(json.dumps(self.responses))
