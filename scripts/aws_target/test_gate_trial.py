@@ -641,11 +641,10 @@ class GateTrialTests(unittest.TestCase):
         self.assertIn('X-Amz-Credential=fixture-access', data)
         self.assertIn('X-Amz-Signature=', data)
         self.assertIn('nix --extra-experimental-features', data)
-        for package in ('git', 'taplo', 'zsh', 'bash', 'gh', 'python3', 'sqlite', 'chromium'):
+        for package in ('git', 'taplo', 'zsh', 'bash', 'gh', 'python3', 'sqlite', 'chromium', 'nodejs'):
             self.assertIn(f'github:NixOS/nixpkgs/{"f" * 40}#{package}', data)
         self.assertNotIn('#basedpyright', data)
         self.assertNotIn('#google-chrome', data)
-        self.assertNotIn('#nodejs', data)
         self.assertNotIn('uv tool install', data)
         self.assertNotIn('nodejs_wheel', data)
         self.assertNotIn('NIXPKGS_ALLOW_UNFREE', data)
