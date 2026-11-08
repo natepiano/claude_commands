@@ -3361,6 +3361,24 @@ def _open_codex_rollouts(pid: int) -> dict[Path, str]:
     return files
 
 
+class RolloutProofPhase(Enum):
+    STABLE = "stable conversation"
+    LAUNCH = "conversation opening during launch"
+
+
+_rollout_proof_phase: ContextVar[RolloutProofPhase] = ContextVar("rollout_proof_phase", default=RolloutProofPhase.STABLE)
+
+
+@contextmanager
+def launch_rollout_proof() -> Generator[None]:
+    """Allow rollout descriptors to open within the launch proof deadline."""
+    token = _rollout_proof_phase.set(RolloutProofPhase.LAUNCH)
+    try:
+        yield
+    finally:
+        _rollout_proof_phase.reset(token)
+
+
 def codex_rollout_threads(pid: int) -> set[str]:
     """Read every thread from stable open rollouts of one process."""
     started = _process_birth(pid)
@@ -3401,7 +3419,8 @@ def codex_rollout_threads(pid: int) -> set[str]:
             raise ValueError(f"pid {pid}: current Codex rollout or process changed")
         if current == files:
             break
-        if not current.items() < files.items() or time.monotonic() >= deadline:
+        opening = _rollout_proof_phase.get() == RolloutProofPhase.LAUNCH and files.items() < current.items()
+        if (not current.items() < files.items() and not opening) or time.monotonic() >= deadline:
             raise ValueError(f"pid {pid}: current Codex rollout or process changed")
     if not files:
         raise NoOpenCodexRollout(f"pid {pid}: current Codex rollout is unavailable")
