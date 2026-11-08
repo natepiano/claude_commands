@@ -9,7 +9,8 @@ import shutil
 import subprocess
 import sys
 import unittest
-from typing import cast, final
+from pathlib import Path
+from typing import cast, final, override
 
 from scripts.direct.verify_mac_offload_test_support import SLEEP_STUB, VERIFY, VerifyMacOffloadFixture
 from scripts.lib.shell_test_support import shell_functions
@@ -18,6 +19,43 @@ from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 @final
 class VerifyMacOnlyTests(VerifyMacOffloadFixture):
+    @override
+    def setUp(self) -> None:
+        super().setUp()
+        self.environment.update({
+            "ROSTER_RUN_ROOT": str(self.root / "roster-runs"),
+            "UNIT_RUN_ROOT": str(self.root / "unit-runs"),
+            "SCRATCH_ROOT": str(self.root / "scratch"),
+        })
+
+    def parser_results(self, cases: list[tuple[str, ...]]) -> list[subprocess.CompletedProcess[str]]:
+        repository = self.root / "parser-repository"
+        repository.mkdir(exist_ok=True)
+        git = shutil.which("git")
+        assert git is not None
+        _ = subprocess.run([git, "init", "-q", str(repository)], check=True)
+        _ = (repository / ".gitignore").write_text("target/\n")
+        output = self.root / "parser-results"
+        output.mkdir(exist_ok=True)
+        commands = ["set -u", shell_functions(VERIFY, "parse_routing_arguments")]
+        for index, arguments in enumerate(cases):
+            commands.append(
+                f"( CMD={shlex.quote(arguments[0])}; VERIFY_CALL_ENVIRONMENT=(); "
+                + f"parse_routing_arguments {shlex.join(arguments[1:])} ) "
+                + f">{shlex.quote(str(output / f'{index}.out'))} "
+                + f"2>{shlex.quote(str(output / f'{index}.err'))}; "
+                + f"printf '%s' \"$?\" >{shlex.quote(str(output / f'{index}.status'))}"
+            )
+        environment = {**self.environment, "PATH": str(Path(git).parent) + os.pathsep + self.environment["PATH"]}
+        _ = subprocess.run(["bash", "-c", "\n".join(commands)], cwd=repository, env=environment, check=True)
+        return [
+            subprocess.CompletedProcess(
+                arguments, int((output / f"{index}.status").read_text()),
+                (output / f"{index}.out").read_text(), (output / f"{index}.err").read_text(),
+            )
+            for index, arguments in enumerate(cases)
+        ]
+
     def isolate_automatic_environment(self) -> dict[str, str]:
         selected_names = {
             "NO_COLOR", "CLICOLOR", "CLICOLOR_FORCE", "FORCE_COLOR", "CI", "TZ", "LANG",
@@ -129,7 +167,8 @@ try_reserved_target
 
     def test_forwarded_environment_uses_callers_values_despite_shell_bindings(self) -> None:
         automatic_environment = self.isolate_automatic_environment()
-        for name in ("name", "PKG", "MAC_REASON", "ARGS"):
+        names = ("name", "PKG", "MAC_REASON", "ARGS")
+        for name in names:
             with self.subTest(name=name):
                 self.clear_observations()
                 value = "original 'value'\nwith trailing newline\n"
@@ -138,9 +177,11 @@ try_reserved_target
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 observed = cast(dict[str, str], json.loads((self.runner_state / "forwarded-environment.json").read_text()))
                 self.assertEqual(observed, {**automatic_environment, name: value})
-                self.clear_observations()
-                previous_calls = self.call_records()
-                refused = self.verify("test", "sample", "--mac", "why", "--env", name)
+        self.clear_observations()
+        previous_calls = self.call_records()
+        results = self.parser_results([("test", "sample", "--mac", "why", "--env", name) for name in names])
+        for name, refused in zip(names, results, strict=True):
+            with self.subTest(unset=name):
                 self.assertEqual(refused.returncode, 2, refused.stdout + refused.stderr)
                 self.assertEqual(refused.stderr, f"verify.sh: --env {name}: not set here; set it on the call (NAME=value verify.sh …).\n")
                 self.assertEqual(self.runner_events(), [])
@@ -169,12 +210,17 @@ try_reserved_target
         self.assertGreater(self.routing_record()["hold_wait_s"], 0)
 
     def test_policy_refusals_start_nothing(self) -> None:
+        result = self.verify("test", "sample", "--env", "SHOTS")
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertEqual(result.stderr, 'verify.sh: --env and --fetch need --mac "<why>".\n')
+        self.assertEqual(self.runner_events(), [])
+        self.assertEqual(self.cargo_events(), [])
+        self.assertEqual(self.call_records(), [])
         cases = (
-            (("test", "sample", "--mac"), '--mac needs a reason: --mac "<why this command must run on macOS>".'),
-            (("test", "sample", "--mac", "  "), '--mac needs a reason: --mac "<why this command must run on macOS>".'),
-            (("test", "sample", "--mac", "--filter"), '--mac needs a reason: --mac "<why this command must run on macOS>".'),
-            (("test", "sample", "--mac", "why", "--local", "requires Linux"), '--mac and --local cannot be used together.'),
-            (("test", "sample", "--env", "SHOTS"), '--env and --fetch need --mac "<why>".'),
+            (("final", "--saved", "--mac"), '--mac needs a reason: --mac "<why this command must run on macOS>".'),
+            (("lint", "--mac", "  "), '--mac needs a reason: --mac "<why this command must run on macOS>".'),
+            (("example", "--name", "sample", "--mac", "--filter"), '--mac needs a reason: --mac "<why this command must run on macOS>".'),
+            (("test", "sample", "--test", "case", "--mac", "why", "--local", "requires Linux"), '--mac and --local cannot be used together.'),
             (("test", "sample", "--fetch", "target/shots"), '--env and --fetch need --mac "<why>".'),
             (("test", "sample", "--mac", "why", "--env"), '--env : not a variable name.'),
             (("test", "sample", "--mac", "why", "--env", "1SHOTS"), '--env 1SHOTS: not a variable name.'),
@@ -184,9 +230,9 @@ try_reserved_target
             (("test", "sample", "--mac", "why", "--fetch", "target/a", "--fetch", "target/b"), '--fetch is given twice; name one folder.'),
             (("test", "sample", "--mac", "why", "--fetch", "src/shots"), '--fetch src/shots: git does not ignore it; name a folder the tests write, such as one under target/.'),
         )
-        for arguments, message in cases:
+        results = self.parser_results([case[0] for case in cases])
+        for (arguments, message), result in zip(cases, results, strict=True):
             with self.subTest(arguments=arguments):
-                result = self.verify(*arguments)
                 self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
                 self.assertEqual(result.stderr, "verify.sh: " + message + "\n")
                 self.assertEqual(self.runner_events(), [])
@@ -194,16 +240,25 @@ try_reserved_target
                 self.assertEqual(self.call_records(), [])
 
     def test_forwarding_rejects_reserved_names_and_nonplain_folders(self) -> None:
-        for name in ("PATH", "HOME", "MACOSX_DEPLOYMENT_TARGET", "RUSTFLAGS", "RUSTDOCFLAGS",
-                     "BUILDLOG_X", "LINT_X", "CARGO_X", "RUSTC", "RUSTC_WRAPPER", "NEXTEST_X",
-                     "DYLD_X", "MAC_TEST_X", "VERIFY_X"):
+        names = (
+            "PATH", "HOME", "MACOSX_DEPLOYMENT_TARGET", "RUSTFLAGS", "RUSTDOCFLAGS",
+            "BUILDLOG_X", "LINT_X", "CARGO_X", "RUSTC", "RUSTC_WRAPPER", "NEXTEST_X",
+            "DYLD_X", "MAC_TEST_X", "VERIFY_X",
+        )
+        folders = (
+            "/tmp/shots", "-shots", ".", "..", "target/../shots", "target/./shots",
+            "target//shots", "target/shots//", "target/shots x", "target/$shots",
+        )
+        results = self.parser_results(
+            [("test", "sample", "--mac", "why", "--env", name) for name in names]
+            + [("test", "sample", "--mac", "why", "--fetch", folder) for folder in folders]
+        )
+        for name, result in zip(names, results[:len(names)], strict=True):
             with self.subTest(name=name):
-                result = self.verify("test", "sample", "--mac", "why", "--env", name)
                 self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
                 self.assertEqual(result.stderr, f"verify.sh: --env {name}: the runner sets it, or it changes what Cargo builds; it is not forwarded.\n")
-        for folder in ("/tmp/shots", "-shots", ".", "..", "target/../shots", "target/./shots", "target//shots", "target/shots//", "target/shots x", "target/$shots"):
+        for folder, result in zip(folders, results[len(names):], strict=True):
             with self.subTest(folder=folder):
-                result = self.verify("test", "sample", "--mac", "why", "--fetch", folder)
                 self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
                 self.assertEqual(result.stderr, f"verify.sh: --fetch {folder.removesuffix('/')}: not a plain relative folder.\n")
         self.assertEqual(self.runner_events(), [])
