@@ -8,12 +8,12 @@ except FileNotFoundError:
 
 import argparse
 from collections.abc import Generator
-from contextlib import ExitStack, closing, redirect_stderr
+from contextlib import redirect_stderr
 from dataclasses import dataclass, replace
-import heapq
 import io
 import json
 import os
+import re
 import socket
 import time
 from pathlib import Path
@@ -774,32 +774,44 @@ class WorkerDispatchRecord:
     timestamp: float
 
 
-def _worker_history_events(path: Path) -> Generator[dict[str, object]]:
+WORKER_HISTORY_BYTES = 64 * 1024
+type WorkerHistoryTargets = dict[bytes, tuple[staff.StaffRow, Literal["mesh", "herdr"]]]
+
+
+def _worker_history_events(path: Path, wanted: WorkerHistoryTargets) -> Generator[dict[str, object]]:
+    identity_pattern = re.compile(rb'"worker_id"\s*:\s*"([^"\\]*)"')
+    name_pattern = re.compile(rb'"(?:worker_name|team_slot)"\s*:\s*("(?:[^"\\]|\\.)*")')
     bad_line_reported = False
     try:
         with path.open("rb") as history:
-            position = history.seek(0, os.SEEK_END)
-            carry = b""
-            while position:
-                size = min(position, 65536)
-                position -= size
-                _ = history.seek(position)
-                lines = (history.read(size) + carry).split(b"\n")
-                carry = lines.pop(0) if position else b""
-                for line in reversed(lines):
-                    if b'"pass_started"' not in line and b'"pass_finished"' not in line:
-                        continue
-                    try:
-                        value = cast(object, json.loads(line))
-                    except ValueError as error:
-                        if not bad_line_reported:
-                            print(f"anomaly: {path}: {error}", file=sys.stderr)
-                            bad_line_reported = True
-                        continue
-                    if isinstance(value, dict):
-                        entry = cast(dict[str, object], value)
-                        if entry.get("event_type") in ("pass_started", "pass_finished"):
-                            yield entry
+            offset = max(0, history.seek(0, os.SEEK_END) - WORKER_HISTORY_BYTES)
+            _ = history.seek(offset - 1 if offset else 0)
+            tail = history.read(WORKER_HISTORY_BYTES + bool(offset))
+        if offset:
+            boundary, tail = tail[:1], tail[1:]
+            if boundary != b"\n":
+                tail = tail.partition(b"\n")[2]
+        for line in reversed(tail.split(b"\n")):
+            if b'"pass_started"' not in line and b'"pass_finished"' not in line:
+                continue
+            identity = identity_pattern.search(line)
+            if identity is not None and identity[1]:
+                if identity[1] not in wanted:
+                    continue
+            elif not any(name[1] == json.dumps(row.name).encode()
+                         for name in name_pattern.finditer(line) for row, _transport in wanted.values()):
+                continue
+            try:
+                value = cast(object, json.loads(line))
+            except ValueError as error:
+                if not bad_line_reported:
+                    print(f"anomaly: {path}: {error}", file=sys.stderr)
+                    bad_line_reported = True
+                continue
+            if isinstance(value, dict):
+                entry = cast(dict[str, object], value)
+                if entry.get("event_type") in ("pass_started", "pass_finished"):
+                    yield entry
     except FileNotFoundError:
         pass
     except OSError as error:
@@ -820,19 +832,15 @@ def _recorded_worker_dispatches(record: staff.StaffSnapshot) -> tuple[dict[Staff
     if current := unit_runs.environ("RUN_DIR"):
         runs.append(Path(current))
     found: dict[StaffId, WorkerDispatchRecord] = {}
-    # A fixed UUIDv7 staff id records the first conversation's creation time.
-    earliest = {row.id: (identity.int >> 80) / 1000 if (identity := UUID(row.id)).version == 7 else 0.0
-                for row in workers}
     mesh: set[StaffId] = set()
     panes: set[StaffId] = set()
-    histories: dict[Path, dict[bytes, tuple[staff.StaffRow, Literal["mesh", "herdr"]]]] = {}
+    histories: dict[Path, WorkerHistoryTargets] = {}
 
     def keep(row: staff.StaffRow, entry: dict[str, object], transport: Literal["mesh", "herdr"]) -> None:
         stamp = entry.get("finished_at", entry.get("timestamp_epoch", entry.get("started_at", 0)))
         timestamp = float(stamp) if isinstance(stamp, (int, float)) else 0
         previous = found.get(row.id)
         if previous is None or timestamp > previous.timestamp:
-            earliest[row.id] = max(earliest[row.id], timestamp)
             found[row.id] = WorkerDispatchRecord({
                 "kind": entry.get("kind", entry.get("pass_kind", "")),
                 "activity": entry.get("activity", entry.get("pass_activity", "")),
@@ -877,23 +885,9 @@ def _recorded_worker_dispatches(record: staff.StaffSnapshot) -> tuple[dict[Staff
             if row is None or row.kind != "worker":
                 continue
             keep(row, entry, transport)
-    # Merge append-ordered histories so another file can satisfy an absent worker.
-    sources = list(histories.items())
-    with ExitStack() as opened:
-        events = [opened.enter_context(closing(_worker_history_events(path))) for path, _targets in sources]
-        newest: list[tuple[float, int, dict[str, object]]] = []
-        for index, source in enumerate(events):
-            entry = next(source, dict[str, object]())
-            if entry:
-                stamp = entry.get("timestamp_epoch", float("inf"))
-                heapq.heappush(newest, (-float(stamp) if isinstance(stamp, (int, float)) else -float("inf"), index, entry))
-        while newest:
-            negative_stamp, index, entry = heapq.heappop(newest)
-            _path, targets = sources[index]
-            pending = {key: pair for key, pair in targets.items()
-                       if earliest[pair[0].id] <= -negative_stamp}
-            if not pending:
-                continue
+    for path, targets in histories.items():
+        pending = targets.copy()
+        for entry in _worker_history_events(path, pending):
             identity = entry.get("worker_id")
             target = pending.get(identity.encode()) if isinstance(identity, str) and identity else None
             if target is None and not identity:
@@ -903,12 +897,9 @@ def _recorded_worker_dispatches(record: staff.StaffSnapshot) -> tuple[dict[Staff
                     target = matches[0]
             if target is not None:
                 keep(target[0], entry, target[1])
-            if all(earliest[pair[0].id] >= -negative_stamp for pair in targets.values()):
-                continue
-            entry = next(events[index], dict[str, object]())
-            if entry:
-                stamp = entry.get("timestamp_epoch", float("inf"))
-                heapq.heappush(newest, (-float(stamp) if isinstance(stamp, (int, float)) else -float("inf"), index, entry))
+                del pending[str(target[0].id).encode()]
+            if not pending:
+                break
     return found, mesh - panes
 
 
