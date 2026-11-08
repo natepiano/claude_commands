@@ -1692,7 +1692,7 @@ Merge 82e4ed73a puts builds 7ab78b74e into this branch with phases 35 to 83. Its
 **Files:**
 - `scripts/production/test_merge_gate_suites_types.py` — merge gate type-check tests with stubs only
 
-### Phase 84 — The lint cache version and step state tests use half their CPU  · status: todo
+### Phase 84 — The lint cache version and step state tests use half their CPU  · status: done
 **Depends on:** Phase 67
 
 #### Work Order
