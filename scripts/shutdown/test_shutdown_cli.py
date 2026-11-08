@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import cast, final, override
 from unittest import mock
 
+from scripts.accounts import accounts
 from scripts.agents import worker_lifecycle
 from scripts.copies import copies
 from scripts.copies.copies_test_support import copies_environment, fake_remote_removal, publish_mirror
@@ -104,7 +105,7 @@ class AgentsUsageTests(unittest.TestCase):
         self.assertEqual(status, 0)
         self.assertEqual(errors, "")
         self.assertEqual([line.split()[1] for line in output.splitlines()[1:]],
-                         ["help", "status", "pause", "exit", "pause", "resume", "resume", "retire", "rename", "restart", "stop"])
+                         ["help", "status", "pause", "exit", "pause", "resume", "resume", "retire", "rename", "move", "restart", "stop"])
         self.assertIn("resume NAME", output)
         self.assertIn("stop SESSION", output)
         self.assertIn("[ACCOUNT]", output)
@@ -148,6 +149,48 @@ def session(session_id: str, name: str, pid: int) -> SessionRecord:
                          updatedAt=0, tmux="", formerNames=[])
 
 @final
+class MoveTests(unittest.TestCase):
+    def test_help_teaches_only_numbered_claude_targets(self) -> None:
+        output = io.StringIO()
+        with redirect_stdout(output), self.assertRaises(SystemExit) as result:
+            _ = shutdown.main(["move", "--help"])
+        self.assertEqual(result.exception.code, 0)
+        self.assertIn("<claudeN>", output.getvalue())
+        self.assertNotIn("default", output.getvalue())
+
+    def test_session_delegates_once_with_the_reason_and_preserves_the_result(self) -> None:
+        with mock.patch.object(accounts, "main", return_value=1) as move:
+            code = shutdown.main(["move", "TEST-nightly-review", "claude 2", "--why", "weekly limit"])
+        self.assertEqual(code, 1)
+        move.assert_called_once_with(["move", "TEST-nightly-review", "claude2", "--why", "weekly limit"])
+
+    def test_group_and_preview_delegate_to_the_same_accounts_command(self) -> None:
+        for group in ("units", "showrunners"):
+            for preview in (False, True):
+                with self.subTest(group=group, preview=preview), mock.patch.object(
+                        accounts, "main", return_value=0) as move:
+                    argv = ["move", group, "claude1"] + (["--dry-run"] if preview else [])
+                    self.assertEqual(shutdown.main(argv), 0)
+                move.assert_called_once_with(argv)
+
+    def test_session_id_preview_keeps_the_reason_output_and_error(self) -> None:
+        identity = "11111111-2222-4333-8444-555555555555"
+
+        def move(arguments: list[str]) -> int:
+            self.assertEqual(arguments, ["move", identity, "claude2", "--dry-run", "--why", "TEST reason"])
+            print("TEST move report")
+            print("TEST move anomaly", file=sys.stderr)
+            return 2
+
+        with (mock.patch.object(accounts, "main", side_effect=move) as delegated,
+              redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as errors):
+            code = shutdown.main(["move", identity, "claude 2", "--dry-run", "--why", "TEST reason"])
+        self.assertEqual(code, 2)
+        self.assertEqual(output.getvalue(), "TEST move report\n")
+        self.assertEqual(errors.getvalue(), "TEST move anomaly\n")
+        self.assertEqual(delegated.call_count, 1)
+
+
 class RetireUnitTests(unittest.TestCase):
     def test_retirement_retains_the_identity_and_excludes_it_from_active_views(self) -> None:
         from scripts.direct import board_json
