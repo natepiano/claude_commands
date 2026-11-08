@@ -692,6 +692,16 @@ Builds asked on 2026-11-08 (verify 41p facts; the build_hold import chain item o
 3. **Measure.** CPU time (user + system) and wall time per `build_targets.py` start for eligible, reserve and release-wait, before and after, at the same load: interleave the runs, 15 each. Also `python3 -X importtime` for the top modules.
 4. **Proof.** A test proves `build_hold` and `build_targets` import without `scripts.build_queue.admission_service` in `sys.modules`. The existing build_hold, build_targets and admission service tests pass.
 
+### Phase 31 — A build target command starts with only the imports it uses  · status: done
+
+After Phase 30, `build_targets.py` eligible, reserve and release-wait still use about 530 ms of CPU per start. Builds asked on 2026-11-08: trace the rest now; base the measure and every edit on verify phase 41p, which changes `build_targets.py` imports (ETA 06:30 on builds). The queue unit edits only queue-owned files and sends facts on other owners' files to builds.
+
+1. **Trace.** `python3 -X importtime` and a CPU profile of each command's start. List each import over 10 ms cumulative: the module, its cost, which caller pulls it in, whether the command uses it, and the owner of the file that imports it.
+2. **Queue-owned edits.** For each queue-owned module on the path that the command does not use, move the import to its user. Queue-owned: `scripts/build_queue/`, `scripts/lint/memory_admit.py`, and the files earlier queue phases changed.
+3. **Facts to builds.** For each import in another owner's file, send builds the module, its cost and the proposed move.
+4. **Measure.** CPU (user + system, children counted) and wall per start, 15 interleaved runs before and after, on top of 41p.
+5. **Proof.** An import test for each moved import. The existing tests of each changed module pass.
+
 ### Phase 10m — The build page is a repository tool and shows leftover-process ages  · status: todo
 
 **Depends on:** 10z (the page reads the room evidence 10z publishes) and report-unit Phase 15 on builds (builds ruling, 2026-11-05). report Phase 15 builds one typed provider, `charts.page_data(days, n=3) -> PageData | IndexUnavailable`, and starts at once. report-unit waits for 10m only in its Phase 26.
