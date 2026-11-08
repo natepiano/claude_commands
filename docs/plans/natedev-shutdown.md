@@ -71,7 +71,7 @@ Each phase deletes the skill and the code it replaces when it lands. `staff.py` 
 - `agents status`, `agents restart` and `agents resume NAME`. Resume of a paused unit sends it a message to continue. Resume of an exited unit starts it again on the current role account, the same as `resume <unit>` at the shell, which stays as the short form.
 - Deletes `/shutdown` and the shutdown.py command surface that `agents` replaces.
 
-### Phase 11: pause and exit
+### Phase 11: pause and exit — done
 
 - `agents pause NAME`: stop now by default. Workers stop at once, and the unit holds at its prompt. The pause record holds the time, the caller and why. The board shows `paused`.
 - `agents exit NAME`: the same stop rule. The director and its workers quit, the herdr tab stays at the shell prompt, and the staff row stays. The board shows `exited`.
@@ -80,16 +80,26 @@ Each phase deletes the skill and the code it replaces when it lands. `staff.py` 
 - No draft keep: a move does not save or type back unsent composer text (user 2026-11-07, via sdlc: "this is overkill").
 - `agents stop --all` stops every live row and saves them for `agents restart`. Its dry run lists every live row and is fast.
 
-### Phase 11a: `agents restart ACCOUNT` selects only that account
+### Phase 11a: `agents restart ACCOUNT` selects only that account — done
 
 - Today `restart` reads ACCOUNT and does not use it. It restarts only the rows of that account.
 - Its own hash, so it merges alone. Tell accounts when it is on main.
 
-### Phase 11b: a unit rename takes `--to-branch`
+### Phase 11b: a unit rename takes `--to-branch` — done
 
 - `rename.py apply OLD NEW --to-branch BRANCH` works for a unit. NEW may equal the current name, so only the branch moves.
 - It uses the unit rename steps: stop, branch move, origin push and resume. The branch checks are one function for units and showrunners.
 - Request from cargo-liner, from the user 2026-11-07: "give the branch for the handler unit a better name".
+
+### Phase 11c: `agents restart` takes seconds — done
+
+- A restart takes one Codex snapshot, one worker-run search, one pane read and one process snapshot. Rows stop in parallel. Each output line names its row.
+- `agents restart --all --dry-run` took 457 s before and takes 2.0 s now. The restart record keeps the selection order.
+
+### Phase 11d: a real restart of stopped pane workers also takes one scan — done
+
+- Worker startup takes the shared run index and the shared Codex snapshot. Restore and stop find a worker's run through one resolver.
+- After a failed worker stop, a worker starts again only when the read proves its old process is gone.
 
 ### Phase 12: retire, and resume of a retired unit
 
@@ -120,7 +130,7 @@ Each phase deletes the skill and the code it replaces when it lands. `staff.py` 
 - `worker.py list --json` gives `work`, `account` and `home` for each pane worker, computed at read time. A worker with no backend entry reports `AccountUnavailable`.
 - `member_account.resume_account` is the one account rule for resume, restart and the worker list.
 
-### Phase 16: a launch trusts its folder; the draft stash goes
+### Phase 16: a launch trusts its folder; the draft stash goes — done
 
 - A launch by our tools writes Claude trust for the target folder in the target account before it starts. It reuses the `copy_claude_trust` write, in one place. No user step (user rule 2026-11-07: a move or start needs no user work).
 - When trust cannot be written, the launch prints one anomaly line and stops cleanly.
