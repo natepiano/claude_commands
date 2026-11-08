@@ -490,6 +490,123 @@ class WorkerPaneTests(StaffTestCase):
             code = worker_panes.main(list(arguments))
         return code, output.getvalue(), errors.getvalue()
 
+    def resume_fixture(self) -> tuple[staff.StaffRow, Path, str]:
+        row = self.worker("resume-worker")
+        self.world.add(row, "w1:p1")
+        self.world.locations["w1:p0"]["agent_session"] = {"value": self.parent.current_session}
+        self.world.locations["w1:p1"]["agent_session"] = {"value": row.current_session}
+        self.dispatch(row, "impl")
+        path = self.root / "run/progress_history_state.json"
+        fields = cast(dict[str, object], json.loads(path.read_text()))
+        passes = cast(dict[str, dict[str, object]], fields["pass"])
+        passes[row.name]["launcher_command"] = ["bash", "assign.sh", "saved prompt.md"]
+        write_text_atomic(path, json.dumps(fields))
+        backend = staff.backend(row)
+        assert isinstance(backend, staff.ClaudeBackend)
+        return row, worker_admission.transcript_source(row, backend), "dispatch-" + row.name
+
+    def test_restore_continues_a_submitted_dispatch_in_the_worker_conversation(self) -> None:
+        from scripts.production import worker
+        row, source, dispatch = self.resume_fixture()
+        text = f'Read the unchanged prompt file "saved prompt.md". End your final reply with DONE {dispatch}. '
+        write_text_atomic(source, json.dumps({"type": "user", "message": {"role": "user", "content": text}}) + "\n")
+        with (patch.object(self.world, "prompt", wraps=self.world.prompt) as prompt,
+              patch.object(progress_history, "active_dispatch", wraps=progress_history.active_dispatch) as records,
+              patch.object(worker_admission, "transcript_entries", wraps=worker_admission.transcript_entries) as transcripts,
+              patch.object(unit_runs, "held_by_session") as searches):
+            self.assertEqual(worker.restore(self.parent.id, record=staff.snapshot(),
+                runs={str(self.parent.current_session): [str(self.root / "run")]}), worker.ExitCode.OK)
+        prompt.assert_called_once()
+        self.assertEqual(prompt.call_args.args[0], "w1:p1")
+        text = cast(str, prompt.call_args.args[1])
+        self.assertIn("Continue pass " + dispatch, text)
+        self.assertNotIn("assign.sh", text)
+        self.assertEqual(prompt.call_args.kwargs["target"], row.current_session)
+        self.assertEqual((records.call_count, transcripts.call_count, searches.call_count), (1, 1, 0))
+
+    def test_restore_skips_busy_workers_and_dispatches_closed_before_delivery(self) -> None:
+        from scripts.production import worker
+        row, source, dispatch = self.resume_fixture()
+        text = f'End your final reply with DONE {dispatch}.'
+        write_text_atomic(source, json.dumps({"type": "user", "message": {"role": "user", "content": text}}) + "\n")
+        lock = worker_panes.worker_lock
+        for cause in ("working", "closed"):
+            with self.subTest(cause=cause):
+                self.world.locations["w1:p1"]["agent_status"] = "working" if cause == "working" else "idle"
+
+                @contextmanager
+                def close_before_read(parent: staff.StaffId, name: staff.WorkerName) -> Generator[worker_panes.WorkerLockHold | worker_panes.Kept]:
+                    with lock(parent, name) as hold:
+                        if cause == "closed":
+                            self.dispatch(row, "impl", completed=True)
+                        yield hold
+
+                with (patch.object(worker_panes, "worker_lock", side_effect=close_before_read),
+                      patch.object(self.world, "prompt", wraps=self.world.prompt) as prompt):
+                    self.assertEqual(worker.restore(self.parent.id, record=staff.snapshot(),
+                        runs={str(self.parent.current_session): [str(self.root / "run")]}), worker.ExitCode.OK)
+                prompt.assert_not_called()
+
+    def test_restore_checks_the_transcript_before_offering_an_unsubmitted_assignment(self) -> None:
+        from scripts.production import worker
+        _row, _source, dispatch = self.resume_fixture()
+        with (patch.object(self.world, "prompt", wraps=self.world.prompt) as prompt,
+              patch.object(progress_history, "active_dispatch", wraps=progress_history.active_dispatch) as records,
+              patch.object(worker_admission, "transcript_entries", wraps=worker_admission.transcript_entries) as transcripts):
+            self.assertEqual(worker.restore(self.parent.id, record=staff.snapshot(),
+                runs={str(self.parent.current_session): [str(self.root / "run")]}), worker.ExitCode.OK)
+        prompt.assert_called_once()
+        self.assertEqual(prompt.call_args.args[0], "w1:p0")
+        text = cast(str, prompt.call_args.args[1])
+        self.assertIn("bash assign.sh 'saved prompt.md'", text)
+        self.assertIn(dispatch, text)
+        self.assertEqual(prompt.call_args.kwargs["target"], self.parent.current_session)
+        self.assertEqual((records.call_count, transcripts.call_count), (1, 1))
+
+    def test_director_resume_uses_the_same_receipt_rule(self) -> None:
+        from scripts.production import worker
+        from scripts.lib.resume_message import BusyPass, PaneWorkerResume, UnsubmittedAssignment
+        row, source, dispatch = self.resume_fixture()
+        for receipt in ("unsubmitted", "submitted", "complete"):
+            with self.subTest(receipt=receipt):
+                text = f'End your final reply with DONE {dispatch}.'
+                entries = [] if receipt == "unsubmitted" else [{"type": "user", "message": {"role": "user", "content": text}}]
+                if receipt == "complete":
+                    entries.append({"type": "assistant", "message": {"role": "assistant", "content": "DONE " + dispatch}})
+                write_text_atomic(source, "".join(json.dumps(entry) + "\n" for entry in entries))
+                with patch.object(worker_admission, "transcript_entries", wraps=worker_admission.transcript_entries) as reads:
+                    result = worker.resume_workers(self.parent.id, staff.snapshot())
+                self.assertEqual(reads.call_count, 1)
+                self.assertEqual(result.results, [])
+                turn = (UnsubmittedAssignment(dispatch, ("bash", "assign.sh", "saved prompt.md"))
+                        if receipt == "unsubmitted" else BusyPass(dispatch))
+                self.assertEqual(result.panes, [PaneWorkerResume(row.id, turn)] if receipt != "complete" else [])
+
+    def test_restore_and_own_resume_leave_closed_dispatches_without_a_note(self) -> None:
+        from scripts.production import worker
+        from scripts.lib.resume_message import NoOwnPass
+        row, source, dispatch = self.resume_fixture()
+        for status in ("done", "done-after-chat", "done-stage-two", "completed", "error", "canceled", "interrupted"):
+            with self.subTest(status=status):
+                path = self.root / "run/progress_history_state.json"
+                fields = cast(dict[str, object], json.loads(path.read_text()))
+                passes = cast(dict[str, dict[str, object]], fields["pass"])
+                passes[row.name]["status"] = "active" if status.startswith("done") else status
+                write_text_atomic(path, json.dumps(fields))
+                if status.startswith("done"):
+                    self.reply_to_dispatch(row, worker_panes.stage_two_completion_id(dispatch)
+                                           if status == "done-stage-two" else dispatch)
+                    if status == "done-after-chat":
+                        write_text_atomic(source, source.read_text() + json.dumps({"type": "assistant",
+                            "message": {"role": "assistant", "content": "Later chat."}}) + "\n")
+                else:
+                    write_text_atomic(source, "")
+                with patch.object(self.world, "prompt", wraps=self.world.prompt) as prompt:
+                    self.assertEqual(worker.restore(self.parent.id, record=staff.snapshot(),
+                        runs={str(self.parent.current_session): [str(self.root / "run")]}), worker.ExitCode.OK)
+                    prompt.assert_not_called()
+                self.assertIsInstance(worker.own_pass(row, staff.snapshot()), NoOwnPass)
+
     def dispatch(self, row: staff.StaffRow, role: staff.WorkerRole, *, completed: bool = False) -> None:
         run = self.root / "run"
         run.mkdir(exist_ok=True)
