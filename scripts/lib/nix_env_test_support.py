@@ -51,6 +51,7 @@ class NixFixture(unittest.TestCase):
         self.env = {"CONF_DIR": str(configuration), "HOME": str(self.home), "PATH": str(self.bin) + os.pathsep + os.environ.get("PATH", os.defpath),
                     "XDG_STATE_HOME": str(self.root / "state"),
                     "XDG_CONFIG_HOME": str(self.root / "config"),
+                    "HERDR_BIN": "/nonexistent/herdr",
                     "DIRENV_LOG": str(self.root / "direnv.jsonl"),
                     "DIRENV_APPROVAL": str(self.root / "approved"),
                     "KEEP": "caller", "REMOVE": "old"}

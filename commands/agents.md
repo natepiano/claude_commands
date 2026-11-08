@@ -43,6 +43,19 @@ Restart keeps only row IDs whose starts fail.
 `stop --all --dry-run` prints each selected row and its position with `would stop and save`.
 `restart --dry-run` prints saved rows and identifies live rows outside the saved list.
 Both commands change nothing.
+
+Restart with ACCOUNT and `--all` selects live rows on that Claude or Codex account.
+Selected rows restart on ACCOUNT.
+Each worker matches its own account.
+Filtered restarts leave unselected owners and workers unchanged.
+A live worker without account evidence prints `NAME: left alone; account unknown` once.
+Without `--all`, ACCOUNT filters saved rows by their last session's account.
+An unknown ACCOUNT prints one error and returns status 2 before any stop.
+Without ACCOUNT, selection and role accounts stay unchanged.
+`--only ID[,ID...]` also limits `--all`; ACCOUNT and `--only` must both match.
+If a stop includes the caller, restart continues in a detached process before the first stop.
+The caller prints the restart log path and returns.
+Other restarts run in the caller's process.
 A row without a saved tab says so on the same line.
 One anomaly does not prevent unrelated work.
 Stop uses the limits in `config/shutdown.conf`.

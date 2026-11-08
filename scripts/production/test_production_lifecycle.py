@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from scripts.production.staff_test_support import foreign_hostname
+
 from scripts.shutdown import remote
 
 from scripts.production.staff_test_support import fixture_member
@@ -32,6 +34,10 @@ from scripts.production.production_doc import read_production, Refusal
 from scripts.production.staff_test_support import StaffTestCase, unit_membership
 from scripts.production.production_lifecycle_test_support import LifecycleFixture
 from scripts.lib.socket_test_support import short_socket_directory
+
+
+def setUpModule() -> None:
+    unittest.enterModuleContext(foreign_hostname())
 
 
 class ProductionReaderTests(StaffTestCase):
@@ -123,6 +129,7 @@ class LifecycleTests(LifecycleFixture):
     @override
     def setUp(self) -> None:
         super().setUp()
+        self.env["GATE_TEST_HOST"] = remote.local_machine()
         _ = self.enterContext(mock.patch.object(showrunners, "NOTIFIER_STATE_DIR", self.state / "notifier"))
 
     @override
