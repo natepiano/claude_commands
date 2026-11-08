@@ -298,7 +298,12 @@ class NativeClaudeWorkerTests(StaffTestCase):
                             launcher_pid = int(delivery.recv(32))
                             if cancel:
                                 os.kill(launcher_pid, signal.SIGTERM)
-                            delivery.sendall(b"1")
+                                try:
+                                    delivery.sendall(b"1")
+                                except (BrokenPipeError, ConnectionResetError):
+                                    pass
+                            else:
+                                delivery.sendall(b"1")
                         if not cancel:
                             for status in (b"busy", b"idle"):
                                 with gate.accept()[0] as turn:

@@ -246,6 +246,26 @@ ENTRIES = (
         (PushExample("typical", {"machine": "natedev"}),
          PushExample("long_machine", {"machine": "macbook-workstation"})),
         purpose="All Codex agents stopped. You can redeem your usage reset now."),
+    PushText("sweep.disk_floor", "disk_floor", "decision", "natedev disk is low; builds can fail",
+        ActionTemplate("{folder_action}"),
+        "natedev has {free} free, below the {floor} alert line, so builds can fail. {recommendation}",
+        (PushExample("available", {
+            "folder_action": "In the natedev Claude session, say which folders to delete.",
+            "free": "140.0 GiB", "floor": "150.0 GiB",
+            "recommendation": "Delete ~/.local/share/Trash (recommended): this frees 26.0 GiB, which covers the 10.0 GiB shortfall."}),
+         PushExample("unavailable", {
+            "folder_action": "In the natedev Claude session, reply measure or delete nothing.",
+            "free": "140.0 GiB", "floor": "150.0 GiB",
+            "recommendation": "Folder sizes are unknown. Measure (recommended): natedev lists folder sizes, then you choose. Delete nothing: free space stays low."}),
+         PushExample("insufficient", {
+            "folder_action": "In the natedev Claude session, say which folders to delete.",
+            "free": "120.0 GiB", "floor": "150.0 GiB",
+            "recommendation": "The largest folder is ~/Trash at 20.0 GiB. Deleting it frees only part of the 30.0 GiB shortfall; the natedev session lists every folder."}),
+         PushExample("protected", {
+            "folder_action": "In the natedev Claude session, say which folders to delete.",
+            "free": "140.0 GiB", "floor": "150.0 GiB",
+            "recommendation": "Review ~/old-output first (recommended): deleting it frees 26.0 GiB, which covers the 10.0 GiB shortfall."})),
+        purpose="A low-disk alert recommends one folder for natedev review."),
     # Current disk-floor.nix: alertGib=150, build floor=300 GiB.
     PushText("nixos.disk_low", "disk_floor", "note", "Builds need more disk space",
         ActionTemplate("In a terminal on natedev, delete {shortfall} GiB of personal files you no longer need."),

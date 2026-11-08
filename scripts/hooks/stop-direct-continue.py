@@ -29,12 +29,15 @@ from scripts.hooks.context_usage import (
     trigger_tokens,
 )
 from scripts.hooks.direct_run import active_run
+from scripts.hooks.conversation_pause import DirectorTurn, director_turn
+from scripts.lib.atomic_file import write_text_atomic
 
 REASON = """\
 /unit:direct run active, {tokens:,} / {trigger:,} tokens ({percent}%).
 Compaction runs when the context reaches {trigger:,} tokens. It does not run while the session is idle.
 Take the next workflow action now. Do not wait for compaction.
-Read ~/.claude/commands/unit/direct.md after compaction.
+After compaction, read ~/.claude/commands/unit/direct.md in full.
+Then read each stub file whose moment is live.
 If you need a user decision, state it in one line and end the turn."""
 
 
@@ -56,6 +59,8 @@ def main() -> None:
 
     session_id = payload.get("session_id")
     if not session_id:
+        return
+    if director_turn(session_id) is DirectorTurn.HOLD:
         return
     session_dir = active_run(session_id)
     if session_dir is None:
@@ -99,7 +104,7 @@ def main() -> None:
             return
     except FileNotFoundError:
         pass
-    _ = wake_line.write_text(status, encoding="utf-8")
+    write_text_atomic(wake_line, status)
 
     print(build_reason(tokens, trigger_tokens(window)), file=sys.stderr)
     raise SystemExit(2)

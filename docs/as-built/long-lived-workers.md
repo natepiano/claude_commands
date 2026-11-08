@@ -330,8 +330,16 @@ The rules live in `commands/unit/direct.md` `<LongLivedWorkers/>`, `docs/direct/
 A busy recipient gets only its `own_pass` continuation.
 An idle worker row receives no prompt.
 A director can receive the list of busy and idle worker children.
-Restore reopens only workers with active dispatches and retains launcher recovery.
-It shares dispatch reads across pane workers. Idle workers stay closed until their next assign.
+Restore reopens only workers with active dispatches.
+It reads each worker's dispatch record and transcript once to select the resume step.
+An accepted dispatch gets a continuation prompt only when the worker is idle.
+Restore holds the dispatch lock across the record read, receipt read, and prompt delivery.
+An unsubmitted dispatch keeps the saved assign command as its step.
+Restore, named resume, and director notes use the same receipt rule.
+Director notes keep the saved prompt path and reuse shared dispatch history reads.
+A dispatch with a DONE line or a finished record gets no resume note or step.
+Later chat does not reopen a completed dispatch.
+The restart shares its run index and snapshots. Idle workers stay closed until their next assign.
 Account moves must preserve closed idle workers.
 
 ### Cleanup
@@ -369,8 +377,11 @@ The ledger stores fixed staff references, access policy, ownership, and events.
 Staff supplies current names, parents, worktrees, and backend identities.
 A rename or transfer preserves those fixed references.
 `rename.py` changes the unit row and repairs its session and display names.
-An explicit `--move-worktree --to-folder <path> --to-branch <name>` request also moves the worktree.
-See [unit rename](unit-rename.md) for explicit worktree moves.
+A changed unit name changes matching folder and branch suffixes.
+`--to-branch <name>` sets an explicit branch.
+Every unit branch change pushes the target to origin before sessions resume.
+Equal old and new unit names keep the folder and staff name.
+See [production rename](production-rename.md) for unit branch moves.
 
 ### Measurement: `scripts/whoami/worker_usage.py`
 
@@ -419,8 +430,10 @@ See [unit rename](unit-rename.md) for explicit worktree moves.
 | `scripts/usage/rollouts.py` | `is_edit`, used by the collector |
 | `scripts/whoami/agent_notes.py` | `credits` on Codex readings |
 | `config/direct.conf` | `UNIT_COMPACT_ABOVE_TOKENS=100000`. `assign.py` compacts an idle mesh worker above it before new work. A pane worker has no in-turn compaction option. Codex keeps its own full-window limit. |
-| `commands/unit/direct.md` | `<LongLivedWorkers/>`, referenced from `<LaunchImplementation/>`, `<FixDispatch/>`, `<PhaseCleanup/>` and `<CompactionContract/>`; early review worker (`EARLY_REVIEW_SLOT`) |
-| `docs/direct/launch_implementation.md` | `codex_mesh.py list`, then `--to` for every slot with an open worker |
+| `commands/unit/direct.md` | Defines `<LongLivedWorkers/>`, with references from `<PhaseCleanup/>` and `<CompactionContract/>`. |
+| `docs/direct/repair_rounds.md` | References `<LongLivedWorkers/>` from `<FixDispatch/>`. |
+| `docs/direct/early_review.md` | Defines `<EarlyReviewArm/>` and uses the early review worker (`EARLY_REVIEW_SLOT`). |
+| `docs/direct/launch_implementation.md` | References `<LongLivedWorkers/>` from `<LaunchImplementation/>`; uses `codex_mesh.py list`, then `--to` for every slot with an open worker. |
 | `docs/direct/dual_review.md`, `docs/direct/run_phase_review.md`, `commands/plan/phase_review.md` | Review worker selection and `--to`/`--slot` calls |
 | `docs/direct/write_prompt_contract.md` | `<RoleReassignment/>`; Three Gods and Type Design in every prompt |
 
@@ -509,6 +522,12 @@ An unreadable design prints one warning per operation; other designs remain read
 | `list` | Reports roles and problems. A local read needs no network request. |
 
 A pane binding uses `worker.py` operations. A mesh binding uses `assign.sh` for prime and follow operations.
+`worker.py list --json` gives each pane worker row `name`, `id`, `current_session`, `state`, `role` and `activity`.
+It also computes three fields at read time and stores none of them:
+- `work`: `idle`, `busy` or `unknown`, from `worker_panes.worker_state`.
+- `account`: the label of the account the member opens on, from `member_account.resume_account`.
+- `home`: that account's home as an absolute path.
+With no staff backend entry, `account` is `{"state": "AccountUnavailable", "reason": ...}` and `home` is absent.
 An ended design identity cannot reopen.
 `config/design_roles.conf` controls new role creation.
 `[roles] new_open=false` preserves existing identities and refuses new opens.

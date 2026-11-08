@@ -1401,84 +1401,40 @@ SIGINT at its default did not prove the cause of any failure in Spec step 5. `ev
 - The `route()` form of Phase 61: 52% fewer process starts and no CPU gain, with command-line paths lost.
 - The `offload_result` fixture: 41.64 to 14.39 CPU s in the results file, but it calls each target itself and precomputes each attempt. A stop after a busy result and a lost `BUILDLOG_MEM_WAIT_SINCE` pass unseen. The two tests that could stay save about 8 CPU s, against a 90-line fixture that patches global state beside the admission thread.
 
-### Phase 67 — The lint judgment and parser cases move onto verify's new functions  · status: todo
+### Phase 67 — The lint judgment and parser cases move onto verify's new functions  · status: done
 **Depends on:** Phase 61
-**Blocked by:** verify's hash for its two function moves: the inline main lint sequence and the test argument parser.
 
-#### Work Order
+#### As-built
 
-**Source:** Phase 61 writers, 2026-11-06. `test_verify_lint_judgment.py` keeps 28 real starts, because `verify.sh:3704-3756` has no function boundary. The 38 parser cases of `test_verify_mac_only.py` also need a complete script setup. Verify takes both moves.
-
-**Goal:** `test_verify_lint_judgment.py` (123.5 CPU s) and `test_verify_mac_only.py` (107.4 CPU s after Phase 61) use half their CPU of Phase 61's base, or a measured floor shows why they cannot, with every checked behavior kept.
-
-**Spec:**
-1. Merge builds with verify's hash. Do not merge verify's branch.
-2. Follow the Speed method. Measure CPU with `module_cost.py --commands 10` first: a process count does not rank CPU.
-3. Move the judgment and parser cases onto direct calls of the two new functions. Keep the real starts that prove what no direct call can.
-4. A further cut in `verify.sh` goes to verify. Add no guard, refusal or check (user rule, 2026-11-05).
-5. Read the importers of a shared Mac fixture before you change it, and take the owner's word for any file another unit holds.
+- `test_verify_lint_judgment.py` calls `run_lint_judgment`, `run_lint_held_sequence` and `run_lint_sequence` through `shell_functions`. It keeps a real `verify.sh` start only for a path that no direct call proves. Same-load CPU: 68.3 → 19.1 s.
+- `test_verify_mac_only.py` checks its parser cases through `parse_routing_arguments`. `test_policy_refusals_start_nothing` keeps one real `verify test sample --env SHOTS` run: exit 2, the `--env and --fetch need --mac` line, and no runner, cargo or call-record event. Same-load CPU: 101.5 → 96.5 s.
 
 **Files:**
-- `scripts/direct/test_verify_lint_judgment.py`
-- `scripts/direct/test_verify_mac_only.py`
+- `scripts/direct/test_verify_lint_judgment.py` — lint judgment cases; direct calls plus the real starts only a real run proves.
+- `scripts/direct/test_verify_mac_only.py` — Mac-only policy and parser cases; one real refusal run.
 
-**Workers:** 2 writers; each file has its own fixture
-- `test` — `test_verify_lint_judgment.py`, opens as impl
-- `impl` — `test_verify_mac_only.py`, role impl
+**Gotchas:**
+- `test_verify_mac_only.py` stays at its floor until `verify.sh` makes one `build_targets.py` call per start that returns one JSON (verify owns this work). Count the file at this floor until then.
 
-**Constraints from prior phases:**
-- Phase 61: `test_verify_lint_cache_versions.py` holds the harness form for lint functions. `test_verify_mac_only.py`'s `mac_result()` holds the form for result functions.
-- Verify's functions: `run_lint_judgment`, `run_lint_held_sequence` and `run_lint_sequence` (7ea9b08ef), and `parse_routing_arguments` (0c855e894). Call them through `shell_functions`. The parser's arguments and globals are in `scripts/direct/test_verify_argument_parser.py`. After verify's 41g, new tests use the new forms: `final --saved`, `lint` with no package, `example --name` and `test --test`.
-- Phase 76: a fixture that starts `verify.sh` sets `ROSTER_RUN_ROOT`, `UNIT_RUN_ROOT` and `SCRATCH_ROOT` inside its test root, or `verify.sh:1272` reads the live `/tmp/claude/unit` through `progress_history.last_dispatch`, `unit_runs.held` and `_supplier_address`. `verify_lint_scope_test_support.py:276` and `verify_mac_offload_test_support.py:752` do not set all three. Set them in the owned test files; a shared support change needs its own owner.
-- Tests never read or write live state: `~/.claude` main, `~/.local/state/merge-gate`, `/tmp/claude`.
-
-**Acceptance gate:**
-- The behavior map has a row for each assertion. For each moved check, breaking the function fails the new test, shown on a tempdir copy.
-- CPU s, processes, execs and wall s before and after, from `module_cost.py` and same-load pairs, in the checkpoint notice.
-- The changed files pass. When `VerifyLintJudgmentFixture` or its constants change, these also pass: `test_verify_lint_cache.py`, `test_verify_lint_cache_fix_limit.py`, `test_verify_lint_fix_failures.py`, `test_verify_lint_fix_limit.py`, `test_verify_lint_fixes.py` and `test_verify_token_renew.py`.
-- the targeted test green on the phase commit merged with `origin/builds`, after both writers finish and the reviews converge
-- `basedpyright` on the changed files prints `0 errors, 0 warnings, 0 notes`
-
-### Phase 68 — The assign launcher tests use half their CPU  · status: todo
+### Phase 68 — The assign launcher tests use half their CPU  · status: done
 **Depends on:** Phase 54
-**Blocked by:** devtools' `assign.py` coordinator change on builds. The showrunner sends the word.
 
-#### Work Order
+#### As-built
 
-**Source:** the Phase 64 architect review, 2026-11-06. The coordinator change removes the recorder and resolver children from real dispatches, so a test replacement for those children made before it becomes obsolete.
+The four assign launcher test files use 37% less CPU, with every checked behavior kept. Three same-time pairs on `/tmp`: 482.4 to 303.6 CPU s. `test_assign_launcher.py` 286.6 to 214.8, `_reuse` 89.8 to 36.1, `_identity` 59.1 to 21.2, `_review` 46.9 to 31.5.
 
-**Goal:** the four assign launcher test files (300.9 CPU s per gate on 2026-11-06, before the coordinator change) use half their CPU, or a measured floor shows why they cannot, with every checked behavior kept.
-
-**Spec:** Follow the Speed method.
-1. Merge builds with the coordinator change. Take a new baseline with `module_cost.py --tests 10 --commands 10`. Measure the remaining CPU before you select a direct call. Name each file's test count, and each real launcher process that each test starts.
-2. Test launcher logic by direct calls. Keep a few real dispatches, each for a path that no direct call can prove. `FirstDispatchFixture` already shares first-dispatch state, and `DEFAULT_ASSIGNMENT_EXECUTION` keeps the real dispatches. A test that only needs the state of a first dispatch uses `FirstDispatchFixture.first_assignment` in `assign_launcher_test_support.py`. The Phase 54 wall floors of `_reuse` and `_identity` do not hold these files back.
-3. A cut in a production file goes to the director first, with the measured gain.
-4. Add no guard, refusal or check (user rule, 2026-11-05). Make any project that a test needs in a tempdir at run time.
+- `invoke_assignment` in `assign_launcher_test_support.py` runs the real coordinator in process. It calls the recorder, `workers.py` and `codex_mesh` in process, and patches `require_live_director` and `Dispatch.follow`. Forty tests use it.
+- `snapshot_files` and `changed_files` hold the first-dispatch snapshot. `FirstDispatchFixture.first_assignment` and `AssignClaudeLauncherFixture.first_worker_launch` both use them, and each keeps its own restoration.
+- The process tests that stay real cover the ancestor check, launcher ownership, worker failure and concurrent review stages.
 
 **Files:**
-- `scripts/direct/test_assign_launcher.py` — 120.7 CPU s
-- `scripts/direct/test_assign_launcher_reuse.py` — 71.9 CPU s
-- `scripts/direct/test_assign_launcher_identity.py` — 64.5 CPU s
-- `scripts/direct/test_assign_launcher_review.py` — 43.8 CPU s
-- `scripts/direct/assign_launcher_test_support.py` — the assign fixture
-- `scripts/direct/assign_claude_test_support.py` — the Phase 55 snapshot lines (`AssignClaudeLauncherFixture.first_worker_launch`)
+- `scripts/direct/assign_launcher_test_support.py` — the assign fixture, `invoke_assignment` and the snapshot helpers.
+- `scripts/direct/assign_claude_test_support.py` — the Claude launcher fixture.
+- `scripts/direct/test_assign_launcher.py`, `test_assign_launcher_reuse.py`, `test_assign_launcher_identity.py`, `test_assign_launcher_review.py` — the four test files.
 
-**Workers:** 1 writer on slot `impl4` (one fixture family)
-- `impl4` — all files above, role impl
-
-**Constraints from prior phases:**
-- Phase 55: `assign_claude_test_support.py` (renamed from `implement_launcher_test_support.py` on builds) repeats the snapshot lines of `FirstDispatchFixture.first_assignment`. Put both on one shared helper in `assign_launcher_test_support.py` in this phase. Keep each fixture's own restoration: `first_assignment` restores server observations, and `first_worker_launch` restores `staff_parent`.
-- Phase 54: one later launcher process takes 2.6-3.2 s, and `require_live_director` needs a live Claude or Codex ancestor. Before the coordinator change, the coordinator spends 1.80 s in 12 `subprocess.run` calls: follow 0.73 s, compact 0.39 s, recorder children 0.60 s, can-follow plus release-follow 0.66 s.
-- Phase 47's `/dev/shm` pairs do not reach this fixture through `TMPDIR`: `MeshCommandFixture.setUp` uses `dir="/tmp"` (`test_codex_mesh.py:1033`), the module setup patches `tempfile.tempdir` to `/tmp` (`:566`), and `AssignLauncherFixture.setUp` sets the child `TMPDIR` to `/tmp` (`assign_launcher_test_support.py:138`). Run each pair on `/tmp` at the same time, and state that in the result. Make no fixture-root option for the measure alone.
-- `assign.Dispatch` uses `None` for an absent worker claim and for a dispatch with no backend switch. The boundary belongs to the coordinator owner. New fixture helpers do not repeat those raw optional states.
-- Tests never read or write live state: `~/.claude` main, `~/.local/state/merge-gate`, `/tmp/claude`.
-
-**Acceptance gate:**
-- each changed file green; the behavior map has one row per assertion; for each moved check, breaking the function fails the new test on a tempdir copy
-- every importer of both fixtures green, in reverse test order, and each test of both fixture families green when run alone
-- CPU s, processes, execs and wall s before and after for each file, in the checkpoint notice
-- the targeted test green on the phase commit merged with `origin/builds`
-- `basedpyright` on the changed files prints `0 errors, 0 warnings, 0 notes`
+**Gotchas:**
+- `AssignLauncherFixture` inherits `MeshCommandFixture` and sets the child `TMPDIR` to `/tmp`, so `/dev/shm` pairs do not reach it. Pairs run on `/tmp` at the same time.
+- The remaining cost is the process tests in `test_assign_launcher.py` and the recorder and resolver children (58.6 CPU s in the command profile).
 
 ### Phase 69 — The remote copies review test uses half its CPU  · status: done
 **Depends on:** Phase 64
@@ -1735,3 +1691,200 @@ Merge 82e4ed73a puts builds 7ab78b74e into this branch with phases 35 to 83. Its
 
 **Files:**
 - `scripts/production/test_merge_gate_suites_types.py` — merge gate type-check tests with stubs only
+
+### Phase 84 — The lint cache version and step state tests use half their CPU  · status: done
+**Depends on:** Phase 67
+
+#### As-built
+
+The lint cache version and step state tests use 66% less CPU, with all 13 tests kept. Same-time pairs on `/dev/shm`: 50.9 to 17.1 CPU s. `test_verify_lint_cache_versions.py` 22.6 to 9.7, `test_verify_step_state.py` 28.3 to 7.4.
+
+- `test_verify_lint_cache_versions.py` checks the Mend, Rustfmt, Clippy and Taplo version keys by direct calls to the cache helper, with fresh version files per call. Two real `verify.sh` runs stay: startup with pass publication, and empty-version handling through startup.
+- `test_verify_step_state.py` shares one recorded lint sequence per class. The tree-step test calls the production `run_lint_sequence`, `fmt_cargo` and `invoke_mend` with the real `run`.
+
+**Files:**
+- `scripts/direct/test_verify_lint_cache_versions.py` — version-key tests by direct call, plus two real runs.
+- `scripts/direct/test_verify_step_state.py` — step-state tests on one recorded sequence per class.
+
+**Gotchas:**
+- A direct-call test goes through the production function that holds the checked branch. A test that calls a lower helper passes while that protection is bypassed; only a mutation of the branch shows it.
+
+### Phase 85 — The style ledger ticket and finding tests use half their CPU  · status: done
+**Depends on:** none
+
+#### As-built
+
+The style ledger ticket and finding tests use 49% less CPU, with all tests kept. Same-time pairs on `/dev/shm`: 89.4 to 45.2 CPU s. `test_style_ledger_tickets.py` 45.4 to 22.7, `test_style_ledger_findings.py` 44.0 to 22.5.
+
+- Each module runs `style_staff_fixture` once per class and copies the staff record to each test with its own paths.
+- Each module stops Git maintenance in its fixture repository, so no background repack writes during cleanup.
+
+**Files:**
+- `scripts/style/test_style_ledger_tickets.py` — class staff seed, copied per test.
+- `scripts/style/test_style_ledger_findings.py` — class staff seed, copied per test.
+
+**Gotchas:**
+- The per-test cost is in `LedgerTestCase.setUp`, which six modules share. Phase 90 moves the seed there and removes the two module copies.
+- A text replace of paths misses a JSON-escaped path. Phase 90 decodes the JSON to rewrite them.
+
+### Phase 86 — We know which tests to remove, merge or move to streamline the suite  · status: done
+
+#### As-built
+
+- Two reports sort every test module under `scripts/` into Retired, Trivial, Repeat, Cross-module repeat, Table and Wording candidates. They change no test.
+- Report A covers `production`, `direct`, `agents`, `lint`, `message`, `hooks` and `lib`: 433 modules and 8,320 test methods. It has no safe deletion, 309 Table candidates in 127 groups, 3 Wording candidates and 736 conditional Retired candidates (`agents/test_codex_mesh.py`).
+- Report B covers every other folder: 300 modules and 10,453 test methods. Its Table merges remove an estimated 307 methods and keep every input case.
+- Both reports credit CPU savings only to the codex_mesh retirement. Every Table merge credits 0 CPU s per gate.
+- Each report ends with growth patterns and one proposed rule for each. The user approved rules 1 and 2 on 2026-11-07.
+
+**Files:**
+- `docs/plans/builds-natest-streamline-a.md` — report A
+- `docs/plans/builds-natest-streamline-b.md` — report B
+
+**Gotchas:** a Table candidate is not proof of one body shape. A sample of ten groups found 9 of 10 in report A and 5 of 10 in report B with one shape. Check each group body before a merge.
+
+**Ruled out:** a Table-merge cleanup phase, because the merges save no CPU.
+
+### Phase 87 — The three costliest production modules keep only the rare-case tests that matter  · status: done
+**Depends on:** none
+
+#### As-built
+
+- Rule 2 (keep a rare-case test only when its defect shows the user a wrong result, damages saved state or loses work) applies to three production modules.
+- `test_fast_track.py` drops four fixture-only rare-case tests and `GIT_HANG_GUARD`: 56 → 52 tests.
+- `test_staff.py` drops the staff-row scan-count test, `CountedStaffRows` and its `Iterator` import: 129 → 128 tests. `DocumentLookupTests` sets `maintenance.auto false` in its main repository.
+- `test_add_unit.py` keeps every test: each is a main path or guards saved state.
+
+**Files:**
+- `scripts/production/test_fast_track.py` — fast-track main paths and the kept rare cases.
+- `scripts/production/test_staff.py` — staff record tests.
+
+**Gotchas:**
+- Same-load CPU did not change (fast_track 57.56 → 57.48 s, staff 28.65 → 28.60 s). The cost of these modules is the temporary git repository each test builds, not the rare-case tests.
+
+**Ruled out:**
+- Rule 2 removal as a CPU tool for these modules: no measured gain.
+
+### Phase 88 — The fast-track, staff and add-unit tests build their temporary Git repository once per module  · status: todo
+**Depends on:** none
+
+#### Work Order
+
+**Source:** the showrunner, 2026-11-07, on the Phase 87 result: "Add a phase after 85 that makes that setup once per module (one shared fixture repo, copied per test where a test writes), for test_fast_track, test_staff and add_unit first. Measure CPU before and after."
+
+**Goal:** `production/test_fast_track.py` (57.5 CPU s same-load, 52 tests), `production/test_staff.py` (28.6 CPU s, 128 tests) and `production/test_add_unit.py` (64 tests) do their Git setup once per class, and use half their CPU, or a measured floor shows why they cannot, with every checked behavior kept.
+
+**Spec:**
+1. Follow the Speed method. Measure CPU with `module_cost.py --tests 10 --commands 10` first. Name the share of each module's CPU that Git setup, per-test copies and process starts take.
+2. Two modules already have a class seed. `test_fast_track.py` uses `MergeCheckpointFixture` (`merge_checkpoint_test_support.py:255`), which builds a seed and copies it. `test_add_unit.py` uses `AddUnitTestCase` with `ImmutableGitSeed` (`add_unit_test_support.py:218`). Start from the measured remaining cost in these fixtures, not from a new seed.
+3. `test_staff.py` builds repositories in `DocumentLookupTests.checkouts` (`test_staff.py:409`). Build them once per class where the tests only read them.
+4. A test that writes to a shared repository gets its own copy, made by a file copy, not by a new `git init` and commits.
+5. A shared fixture sets `maintenance.auto false` before its first commit (Phase 81).
+6. Read the importers of a shared fixture before you change it. Every importer stays green.
+7. Add no guard, refusal or check (user rule, 2026-11-05).
+8. Showrunner order, 2026-11-07, after the first pass: in `FAKE_SSH` (`staff_test_support.py:549`), import the heavy modules after the `STAFF_TEST_SSH_FAIL` branch.
+9. Same order: share the owner imports across repeated fake SSH requests in one test. Keep a separate process where a test proves a lock or a process boundary.
+
+**First pass result (same-load pairs):** Git setup is not the cost. fast_track 55.5 -> 54.9 CPU s, add_unit 20.5 -> 20.5, staff 28.0 -> 28.0. The director dropped the `test_staff.py` class seed (no gain). Kept: `maintenance.auto false` in the seeds and two importer repairs in `add_unit_test_support.py`. The staff cost is 42 fake SSH starts (about 18-20 of 28 CPU s).
+
+**Files:**
+- `scripts/production/test_fast_track.py`
+- `scripts/production/test_add_unit.py`
+- `scripts/production/merge_checkpoint_test_support.py`
+- `scripts/production/add_unit_test_support.py`
+- `scripts/production/staff_test_support.py`
+
+**Workers:** 2 writers; split by module and its fixture
+- `impl` — `test_fast_track.py` and `test_add_unit.py`, hub: `merge_checkpoint_test_support.py`, `add_unit_test_support.py` (done)
+- `test` — Spec 8 and 9, hub: `staff_test_support.py`, opens as impl
+
+**Constraints from prior phases:**
+- Phase 87: rule 2 removal gave no CPU gain in these modules. The first pass (above) measured no Git setup gain; the staff cost is 42 fake SSH starts (about 18-20 of 28 CPU s). Keep the real lock and process boundaries.
+- The showrunner assigned `scripts/production/staff_test_support.py` to this phase (2026-11-07). The checkpoint notice says `also touches staff_test_support.py (owner sdlc), tested against origin/main`.
+- Tests never read or write live state: `~/.claude` main, `~/.local/state/merge-gate`, `/tmp/claude`.
+
+**Acceptance gate:**
+- The behavior map has a row for each assertion. No assertion is removed.
+- CPU s, processes, execs and wall s before and after, from `module_cost.py` and same-load pairs, in the checkpoint notice.
+- Each changed file and every importer of a changed fixture pass.
+- Same-load CPU before and after for `test_staff.py` and the other heaviest `StaffTestCase` users.
+- the targeted test green on the phase commit merged with `origin/builds`, and a trial merge with `origin/main` for `staff_test_support.py`
+- `basedpyright` on the changed files prints `0 errors, 0 warnings, 0 notes`
+
+### Phase 89 — The main assign launcher test file uses half its CPU  · status: todo
+**Depends on:** Phase 68
+**Blocked by:** hierarchies-unit Phase 30 on `origin/builds` — it deletes `agents/codex_mesh.py` and `agents/test_codex_mesh.py`, which this phase's fixture imports. Merge `origin/builds` at phase start.
+
+#### Work Order
+
+**Source:** Phase 68 contract review (F001). Phase 68 same-load pairs cut the four assign launcher files from 482.4 to 303.6 CPU s (37%), short of half. The director split the rest of the work into this phase, so the Phase 68 gain lands now.
+
+**Goal:** `scripts/direct/test_assign_launcher.py` (61 tests, 214.8 CPU s same-load median after Phase 68, 286.6 before) uses half its Phase 68 CPU, or a measured floor shows why it cannot, with every checked behavior kept.
+
+**Spec:**
+1. Follow the Speed method. Measure CPU with `module_cost.py --tests 10 --commands 10` first. Name each test's CPU, and each real launcher process that it starts.
+2. Move each test that does not test the process boundary to `InProcessAssignment`, as Phase 68 did. Keep the process tests that the Phase 68 behavior map names: ancestor check, launcher ownership, worker failure and concurrent review stages.
+3. Measure the recorder and resolver children (58.6 CPU s in the Phase 68 command profile). If only a production API change can cut them, write the floor and send the director an architecture proposal with its measured gain.
+4. Read the importers of a changed fixture before you change it. Every importer stays green.
+5. Add no guard, refusal or check (user rule, 2026-11-05).
+
+**Files:**
+- `scripts/direct/test_assign_launcher.py`
+- `scripts/direct/assign_launcher_test_support.py`
+
+**Workers:** 1 writer; one test file and its fixture do not split
+- `impl` — `test_assign_launcher.py`, hub: `assign_launcher_test_support.py`
+
+**Constraints from prior phases:**
+- Phase 68: `invoke_assignment` in `assign_launcher_test_support.py` runs the real coordinator in process and calls the recorder, `workers.py` and `codex_mesh` in process. `snapshot_files` and `changed_files` share the first-dispatch snapshot.
+- Phase 68 behavior map: `/tmp/claude/unit/2113de4f-9913-485a-9a51-61558bfd81db/phases/68/profile/behavior_map.md`.
+- Before hierarchies Phase 30, `AssignLauncherFixture` inherits `MeshCommandFixture` from `agents/test_codex_mesh.py`, and `invoke_assignment` routes `codex_mesh` calls in process (`assign_launcher_test_support.py:15`). After Phase 30, the fixture and that route go. Measure the new baseline with `module_cost.py` on the merged tree before any change. The 214.8 CPU s figure is the pre-deletion baseline.
+- Phase 68: `MeshCommandFixture.setUp` uses `dir="/tmp"` and `AssignLauncherFixture.setUp` sets the child `TMPDIR` to `/tmp`, so `/dev/shm` pairs do not reach the fixture. Run each pair on `/tmp` at the same time, and state that in the result. If the deletion moves the fixture root, state the new filesystem basis.
+- Tests never read or write live state: `~/.claude` main, `~/.local/state/merge-gate`, `/tmp/claude`.
+
+**Acceptance gate:**
+- The behavior map has a row for each assertion. No assertion is removed.
+- CPU s, processes, execs and wall s before and after, from `module_cost.py` and same-load pairs, in the checkpoint notice.
+- The changed file and every importer of a changed fixture pass.
+- the targeted test green on the phase commit merged with `origin/builds`
+- `basedpyright` on the changed files prints `0 errors, 0 warnings, 0 notes`
+
+### Phase 90 — The style ledger tests seed staff once per class and close every database  · status: done
+**Depends on:** Phase 85
+
+#### As-built
+
+The six `LedgerTestCase` modules use 28% less CPU, with all tests kept. Same-load pairs: 109.0 to 78.3 CPU s. `test_style_ledger_sites.py` 37.8 to 19.0, `test_style_ledger.py` 22.1 to 11.3, `test_style_ledger_corrections.py` 2.11 to 1.33, `test_refill_speed.py` 2.15 to 1.63. The tickets and findings modules keep their Phase 85 times (22.2 and 22.9).
+
+- `LedgerTestCase.setUpClass` runs `style_staff_fixture` once against the template repository and keeps the staff record text in `staff_seed`.
+- `LedgerTestCase.setUp` decodes that record, rewrites each `doc.path` and `worktree.path` under the test root, writes it, and enters `isolated_staff_file`.
+- The template repository sets `maintenance.auto false` before its first commit.
+- `judgment_rows` and the three database reads in `test_style_ledger_sites.py` use `closing(sqlite3.connect(...))`, so each connection commits and closes.
+- `test_style_ledger_tickets.py` and `test_style_ledger_findings.py` hold no seed code of their own.
+
+**Files:**
+- `scripts/style/ledger_test_support.py` — `LedgerTestCase` per-class staff seed and per-test copy.
+- `scripts/style/test_style_ledger_tickets.py`, `scripts/style/test_style_ledger_findings.py` — use the shared seed.
+- `scripts/style/test_style_ledger_sites.py` — closes its SQLite connections.
+
+**Gotchas:**
+- Path rewrites use `relative_to(template_repo.parent)` on the decoded JSON, never a text replace: a non-ASCII `TMPDIR` is escaped in the JSON text.
+
+### Phase 91 — The SSH result tests pass under load, whatever time an admission pass takes  · status: done
+**Depends on:** none
+
+#### As-built
+
+The eight SSH result tests no longer depend on how long an admission pass takes. `VerifySshTargetsFixture.control_admission_clock()` runs the admission client with a frozen monotonic clock (`ADMISSION_BEFORE_RETRY`), so no leave pass can fire before local admission. `test_verify_ssh_targets_results.py` calls it in `setUp`. No interval changed, and all 47 assertions and exact attempt counts stay. Under load: 20 of 20 passes. Module CPU 59.9 to 49.9 s.
+
+**Files:**
+- `scripts/direct/verify_ssh_targets_test_support.py` — the fixture; `install_admission_client(script)` routes `lib/py .../admission_client.py` to a test script (the frozen clock or the memory-hook observer)
+- `scripts/direct/test_verify_ssh_targets_results.py` — the result tests
+
+**Gotchas:**
+- While a local step waits for admission, the leave hook retries a free non-Mac target at each running pass. This is the intended production policy (verify-unit, 2026-11-08): fix such flakes in the tests, not in `verify.sh`.
+- The frozen clock also freezes the client's failure, silence and outage timers. An unreachable admission service in a result test ends at the test hang guard.
+
+**Ruled out:**
+- A longer `running_pass_seconds`: the frozen clock removes the dependence without a slower interval.
+- Live failure deadlines under the frozen clock: only a broken admission service reaches them, and the test still fails.

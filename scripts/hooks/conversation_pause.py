@@ -22,7 +22,7 @@ from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, cast
 
-from scripts.message import send_budget
+from scripts.message import send_budget, session_send
 from scripts.lib.script_envelope import SCRIPT_ENVELOPE_END, SCRIPT_ENVELOPE_START
 
 if TYPE_CHECKING:
@@ -259,9 +259,7 @@ def sessions_command() -> list[str]:
 
 def send_command() -> list[str]:
     override = os.environ.get("CONVERSATION_PAUSE_SEND")
-    if override:
-        return [override]
-    return [sys.executable, str(Path(__file__).resolve().parent.parent / "message" / "send.py")]
+    return [override] if override else session_send.send_argv()
 
 
 def first_error_line(message: str) -> str:
@@ -804,9 +802,31 @@ def _keep_context() -> str:
     )
 
 
+class DirectorTurn(Enum):
+    ACTIVE = "active"
+    HOLD = "hold"
+
+
+def director_turn(session_id: str) -> DirectorTurn:
+    """Read the staff hold before a director starts another turn."""
+    from scripts.production import staff
+
+    try:
+        row = staff.snapshot().by_current_session(session_id)
+    except (OSError, ValueError, staff.StaffRefused) as error:
+        print(f"anomaly: staff hold: {error}", file=sys.stderr)
+        return DirectorTurn.ACTIVE
+    return (DirectorTurn.HOLD if row is not None and
+            isinstance(row.paused, staff.Paused) else DirectorTurn.ACTIVE)
+
+
 def message_arrived(session_id: str, source: PromptSource, prompt: str, now: int) -> HookReply:
+    if director_turn(session_id) is DirectorTurn.HOLD:
+        return ContextOnly("This unit is paused. Hold at the prompt. Do not start new work. Wait for agents resume.")
     response = answer(prompt) if source is PromptSource.TYPED else NotAnAnswer()
     return_question = is_return_question(prompt)
+    if not return_question and not pauses(source):
+        return NoReply.NOTHING
     with record_lock():
         current = _record(session_id)
         if return_question:

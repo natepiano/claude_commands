@@ -35,6 +35,7 @@ from scripts.lib.script_envelope import script_prompt
 from scripts.lib.stop_injection_test_support import InjectedStop, stop_once, stop_in_child
 from scripts.lib.socket_test_support import ShortUnixSocket, short_socket_directory
 from scripts.message import send
+from scripts.message.roster import roster as read_roster
 from scripts.message import repeat_guard
 from scripts.message.relay_identity import relay_session_name
 from scripts.message.relay_test_support import write_relay_record
@@ -554,7 +555,10 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
         _ = self.enterContext(mock.patch.object(names, "load_names", return_value=fixture_names()))
         super().setUp()
         self.staff_rows: dict[str, staff.StaffRow] = {}
-        _ = self.enterContext(mock.patch.object(staff, "snapshot", side_effect=lambda: staff.StaffSnapshot(tuple(self.staff_rows.values()))))
+        def read_membership() -> staff.StaffSnapshot:
+            return staff.StaffSnapshot(tuple(self.staff_rows.values()))
+        for reader in ("snapshot", "local_snapshot"):
+            _ = self.enterContext(mock.patch.object(staff, reader, side_effect=read_membership))
         for identity in ("absent", "gone", "id-1", "id-2", "restarted", "remote-thread", "missing", "recipient"):
             self.staff_member(identity, identity)
         directory = short_socket_directory()
@@ -1562,7 +1566,7 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
             result = send.send(local_options(["--to", "session:gone", "--from", "Sender", "--text", "body"]))
         self.assertEqual(result.outcome, "queued")
         self.assertEqual(self.relayed, [])
-        self.assertEqual((self.log()[-1]["via"], self.log()[-1]["postmaster"]), ("queue", "unresolved"))
+        self.assertTrue({"via", "postmaster", "seconds"}.isdisjoint(self.log()[-1]))
 
     def test_skipped_message_has_no_claude_route_fields(self) -> None:
         _ = send.acknowledge("route-key")
@@ -2671,6 +2675,31 @@ runpy.run_path(sys.argv[0], run_name="__main__")
         self.assertEqual(self.send("--key", "k", "--text", "hello").outcome, "sent")
         self.assertIn("nothing to reopen", send.reopen("never"))
 
+    def test_codex_pending_uses_an_explicit_native_thread_without_a_claude_record(self) -> None:
+        thread = "codex-recipient"
+        self.staff_member(thread, "Agent")
+        send.enqueue(send.Message(f"session:{thread}", "reviewer", "Review", "Read the review.", "review"),
+                     "session unavailable", send.now(), recipient=send.StableRecipient(f"staff:{thread}"))
+        with mock.patch.dict(os.environ, {"CODEX_THREAD_ID": thread}), redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(send.main(["pending", f"codex:{thread}"]), 0)
+        self.assertIn("Read the review.", output.getvalue())
+        self.assertIn("from reviewer", output.getvalue())
+        self.assertEqual(send.pending(send.CodexQueueOwner(thread)), "")
+
+    def test_codex_pending_follows_the_stable_owner_after_a_thread_change(self) -> None:
+        member = staff.StaffRow(staff.StaffId("fixed"), "agent", "Agent", staff.StaffRoot(),
+                               current_session=staff.StaffId("next-thread"))
+        self.staff_rows = {"fixed": member}
+        for thread, owner, text in (("old-thread", "fixed", "Keep this review."),
+                                    ("other-thread", "other", "Another review.")):
+            send.enqueue(send.Message(f"session:{thread}", "reviewer", "Review", text, "review"),
+                         "session unavailable", send.now(), recipient=send.StableRecipient(f"staff:{owner}"))
+        delivered = send.pending("codex:next-thread")
+        self.assertIn("Keep this review.", delivered)
+        self.assertNotIn("Another review.", delivered)
+        self.assertEqual(send.pending("codex:next-thread"), "")
+        self.assertIn("Another review.", send.queue_path("session-other-thread").read_text())
+
     def test_undelivered_is_queued_latest_per_key_and_pending_clears(self) -> None:
         self.outcome = send.Result("queued", "no agent named bogus")
         _ = self.send("--key", "k", "--text", "first\nbody")
@@ -2700,7 +2729,7 @@ runpy.run_path(sys.argv[0], run_name="__main__")
         # A send to the staff name after the session label changes is still kept for that session.
         _ = send.send(local_options(["--to", "old", "--from", "test", "--text", "by the old name"]))
         self.assertEqual(send.pending("someone-else"), "")
-        with mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "id-1"}):
+        with mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "id-1", "CODEX_THREAD_ID": "inherited-parent"}):
             text = send.pending(None)
         for sent in ("Queued message 1 of 3", "by name", "by socket", "by the old name"):
             self.assertIn(sent, text)
@@ -3110,12 +3139,34 @@ runpy.run_path(sys.argv[0], run_name="__main__")
         ]))
 
         self.assertEqual(result.outcome, "queued")
-        self.assertIn("no live session answers to session:gone", result.detail)
+        self.assertEqual(result.detail, "no live Claude or Codex session answers to gone (gone), so it is kept for it")
         self.assertEqual(self.relayed, [])
         self.session("gone", "returned")
         with mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "gone"}):
             self.assertIn("wait for me", send.pending(None))
             self.assertEqual(send.pending(None), "")
+
+    def test_absent_staff_recipient_keeps_its_queue_until_claude_returns(self) -> None:
+        member = self.staff_rows["recipient"]
+        route = send.resolve_recipient(member.name, send.LocalOnly(), roster.Roster([], []),
+                                       membership=staff.snapshot())
+        self.assertIsInstance(route, send.QueuedStaffRecipient)
+        output = io.StringIO()
+        with redirect_stdout(output):
+            code = send.main(["--here", "--to", member.name, "--from", "fixture", "--text", "Keep this message."])
+        self.assertEqual(code, 1)
+        self.assertEqual(output.getvalue(),
+                         "QUEUED: no live Claude or Codex session answers to recipient (recipient), so it is kept for it\n")
+        queued = send.queue_path("session-recipient")
+        self.assertIn("Keep this message.", queued.read_text())
+        self.assertEqual(self.relayed, [])
+        self.session("recipient", "recipient")
+        with mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "recipient"}):
+            self.assertIn("Keep this message.", send.pending(None))
+            self.assertEqual(send.pending(None), "")
+        result = send.send(local_options(["--to", member.name, "--from", "fixture", "--text", "You have returned."]))
+        self.assertEqual(result.outcome, "sent", result.detail)
+        self.assertEqual([message.text for message in self.relayed], ["You have returned."])
 
     def test_a_delivered_keyed_send_retires_its_queued_copy(self) -> None:
         self.session("id-1", "recipient")
@@ -5484,6 +5535,72 @@ class PaneWorkerMessageTests(unittest.TestCase):
     def deliver(self, address: str, text: str) -> send.Result:
         return send.send(send.parse(["--here", "--to", address, "--from", "fixture",
                                      "--forwarded-shown-sender", "fixture", "--text", text]))
+
+    def codex_agent(self) -> tuple[staff.StaffRow, roster.Roster]:
+        """Add one private Codex agent and its pane route."""
+        from scripts.herdr import herdr
+
+        row = fixture_member("agent", name="pane-agent")
+        self.fixture.world.add(row, "w2:p1", family="codex", workspace="w2", tab="w2:t1")
+        pane_result = self.fixture.world.result
+
+        def result(*arguments: str, deadline: float = math.inf) -> dict[str, object]:
+            if arguments[:2] == ("agent", "list"):
+                return {"agents": [{"pane_id": "w2:p1", "agent": "codex", "agent_status": "idle"}]}
+            return pane_result(*arguments, deadline=deadline)
+
+        with (mock.patch.object(herdr, "live_sessions", return_value=[{"name": "reported"}]),
+              mock.patch.object(herdr, "herdr_processes", return_value=[]),
+              mock.patch.object(self.fixture.world, "result", side_effect=result)):
+            found = read_roster(os.environ, roster.ThisMachine())
+        observed = roster.Roster([entry for entry in found.entries
+                                  if entry.pane == herdr.HerdrPlace("reported", "w2:p1")], found.problems)
+        return row, observed
+
+    def test_codex_pane_agent_resolves_by_staff_and_thread_and_submits_once(self) -> None:
+        from scripts.herdr import herdr
+
+        row, observed = self.codex_agent()
+        self.assertEqual(observed.entries[0].thread, roster.CodexThread(str(row.current_session)))
+        self.assertEqual(observed.entries[0].reach, roster.Messageable(f"codex:{row.current_session}"))
+        routes = [send.resolve_recipient(address, send.LocalOnly(), observed, membership=staff.snapshot())
+                  for address in (row.name, f"codex:{row.current_session}")]
+        self.assertIsInstance(routes[0], send.CodexPaneRecipient)
+        self.assertEqual(routes[0], routes[1])
+        for address in (row.name, f"codex:{row.current_session}"):
+            with (self.subTest(address=address), mock.patch.object(roster, "roster", return_value=observed),
+                  mock.patch.object(herdr, "Herdr", return_value=self.fixture.world) as client,
+                  mock.patch.object(self.fixture.world, "prompt", wraps=self.fixture.world.prompt) as submit):
+                result = self.deliver(address, "Read the private report.")
+                self.assertEqual(result.outcome, "sent", result.detail)
+                client.assert_called_once_with("reported")
+                submit.assert_called_once()
+                self.assertEqual(submit.call_args.args[0], "w2:p1")
+                self.assertIn("Read the private report.", cast(str, submit.call_args.args[1]))
+                self.assertEqual(submit.call_args.kwargs,
+                                 {"target": row.current_session, "proof": herdr.SubmitStarts(40000)})
+        prompts = [command for command in self.fixture.world.commands if command[:2] == ("agent", "prompt")]
+        self.assertEqual([command[2] for command in prompts], ["w2:p1", "w2:p1"])
+
+    def test_codex_pane_failure_reports_the_herdr_error(self) -> None:
+        from scripts.herdr import herdr
+
+        row, observed = self.codex_agent()
+        pane_run = self.fixture.world.run
+
+        def run(*arguments: str, deadline: float = math.inf) -> str:
+            if arguments[:2] == ("agent", "prompt"):
+                raise herdr.HerdrFailure("agent_prompt_stalled: private pane did not start", code="agent_prompt_stalled")
+            return pane_run(*arguments, deadline=deadline)
+
+        output = io.StringIO()
+        with (mock.patch.object(roster, "roster", return_value=observed),
+              mock.patch.object(self.fixture.world, "run", side_effect=run), redirect_stdout(output)):
+            code = send.main(["--here", "--to", row.name, "--from", "fixture",
+                              "--forwarded-shown-sender", "fixture", "--text", "Read the failure report."])
+        self.assertEqual(code, 3)
+        self.assertEqual(output.getvalue(), "FAILED: agent_prompt_stalled: private pane did not start\n")
+        self.assertEqual(send.pending(f"staff:{row.id}"), "")
 
     def test_worker_message_requires_one_prompt_to_start_a_turn(self) -> None:
         message = "Detached run: private-run\nResult: PASS"

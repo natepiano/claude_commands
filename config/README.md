@@ -115,7 +115,7 @@ next run, so a change is immediate:
 
 Use `bash ~/.claude/scripts/direct/verify.sh lint [<package>] [--check]`.
 Without a package, lint covers the workspace. `--check` prevents repairs with
-or without a package. See `<VerificationContract/>` in `commands/unit/direct.md`
+or without a package. See `<VerificationContract/>` in `docs/direct/verification.md`
 for all command forms.
 
 Deliberately not gated: `verify.sh check`/`test`/`example`, the workspace check
@@ -154,7 +154,7 @@ The `folder_*` keys control the folder audit. The `sweep_*` keys control the bui
 | `sweep_snapshot_max_age_seconds` | Maximum age of a current disk snapshot. |
 | `sweep_alert_interval_seconds` | Minimum interval between disk alerts. |
 | `sweep_push_text_limit` | Maximum length of a phone alert. |
-| `sweep_page_paths` | Maximum paths in a phone alert. |
+| `sweep_crossing_repeat_minutes` | Delivery key lifetime for a disk crossing, in minutes. |
 | `sweep_unexplained_fall_bytes` | Unexplained disk loss that triggers an alert. |
 | `sweep_large_removal_bytes` | Removed bytes that trigger an alert. |
 | `sweep_floor_search_depth` | Maximum folder depth for target discovery. |
@@ -500,7 +500,7 @@ agent says something, not when it halts — the decision to stop is the user's,
 made from what gets reported.
 
 `UNIT_PROGRESS_INTERVAL_SECONDS` sets the Codex poll timeout, per
-`<CodexDispatchWait/>` in `commands/unit/direct.md`; Codex requires a positive
+`<CodexDispatchWait/>` in `docs/direct/codex_dispatch_wait.md`; Codex requires a positive
 integer. It is 3600, one hour (user, 2026-10-10). Unit reports come only when
 someone asks (2026-10-19): no notifier instance or timer sends them.
 

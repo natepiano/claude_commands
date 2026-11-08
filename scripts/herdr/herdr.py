@@ -33,6 +33,7 @@ import math
 import sys
 import time
 from contextlib import contextmanager
+from concurrent.futures import ThreadPoolExecutor
 from contextvars import ContextVar
 from functools import cache, cached_property
 from importlib import import_module
@@ -148,6 +149,10 @@ class HerdrFailure(Exception):
     def __init__(self, message: str, code: str = "") -> None:
         super().__init__(message)
         self.code: str = code
+
+
+class NativeRegistryUnavailable(ValueError):
+    """The process has no native registry identity."""
 
 
 class HerdrMissing(HerdrFailure):
@@ -282,11 +287,6 @@ class PromptInputNotReady:
 
 
 @dataclass(frozen=True)
-class PromptInputHoldsDraft:
-    screen: str
-
-
-@dataclass(frozen=True)
 class PromptInputTimedOut:
     """The destination did not become ready before the launch deadline."""
 
@@ -324,6 +324,11 @@ class AgentNotStarted(PromptNotSubmitted):
 
 
 @dataclass(frozen=True)
+class ClaudeTrustNotWritten(AgentNotStarted):
+    """The launch cannot start because the target account trust write failed."""
+
+
+@dataclass(frozen=True)
 class PromptSubmissionNotRequired:
     """The launch intentionally leaves the session without an opening prompt."""
 
@@ -340,6 +345,7 @@ class OpeningPrompt:
     text: str
     transcript: SessionTranscript | UnspecifiedPromptTranscript = UnspecifiedPromptTranscript()
     before_prompt: Callable[[SessionTranscript], object] = _no_staff_publication
+    cursor: TranscriptCursor | UnspecifiedPromptTranscript = UnspecifiedPromptTranscript()
 
 
 @dataclass(frozen=True)
@@ -367,6 +373,31 @@ class TranscriptCursor:
     sizes: dict[Path, int] = field(default_factory=dict)
     turns: dict[Path, list[tuple[datetime, dict[str, object]]]] = field(default_factory=dict)
     readability: TranscriptReadable | TranscriptUnreadable = field(default_factory=TranscriptReadable)
+
+    def skip_existing_turns(self) -> None:
+        """Skip complete rows before launch without parsing historical JSON."""
+        if not re.fullmatch(r"[A-Za-z0-9_-]+", self.transcript.session_id):
+            return
+        try:
+            paths = tuple((self.transcript.config_dir / "projects").glob(f"*/{self.transcript.session_id}.jsonl"))
+            for path in paths:
+                with path.open("rb") as stream:
+                    size = stream.seek(0, os.SEEK_END)
+                    position = size
+                    offset = 0
+                    while position:
+                        start = max(0, position - 4096)
+                        _ = stream.seek(start)
+                        chunk = stream.read(position - start)
+                        newline = chunk.rfind(b"\n")
+                        if newline >= 0:
+                            offset = start + newline + 1
+                            break
+                        position = start
+                    self.offsets[path] = offset
+                    self.sizes[path] = size
+        except OSError:
+            self.readability = TranscriptUnreadable()
 
     def read_turns(self) -> list[tuple[datetime, dict[str, object]]]:
         self.readability = TranscriptReadable()
@@ -861,10 +892,23 @@ class PaneProcessInfoResult(TypedDict):
     process_info: PaneProcessInfo
 
 
+@dataclass(frozen=True)
+class ReportedAgentSession:
+    """The agent reports its current native session id."""
+
+    session_id: str
+
+
+@dataclass(frozen=True)
+class NoReportedAgentSession:
+    """The agent has no reported native session id."""
+
+
 class AgentOccupant(TypedDict):
     pane_id: str
     agent: NotRequired[str | None]
     agent_status: AgentStatus
+    agent_session: ReportedAgentSession | NoReportedAgentSession
 
 
 class AgentListResult(TypedDict):
@@ -1228,6 +1272,30 @@ class SubmitStarts:
 SUBMIT_UNPROVED = SubmitUnproved()
 
 
+@dataclass
+class PaneObservations:
+    """Share read-only pane evidence until the report scope closes."""
+    replies: dict[tuple[str, tuple[str, ...]], dict[str, object]] = field(default_factory=dict)
+    process_batches: set[str] = field(default_factory=set)
+
+
+_pane_observations: ContextVar[PaneObservations | None] = ContextVar("pane_observations", default=None)
+
+
+@contextmanager
+def observation_snapshot() -> Generator[None]:
+    """Read each pane, process, and layout once for a status pass."""
+    if _pane_observations.get() is not None:
+        yield
+        return
+    token = _pane_observations.set(PaneObservations())
+    try:
+        with process_snapshot():
+            yield
+    finally:
+        _pane_observations.reset(token)
+
+
 class Herdr:
     def __init__(self, session: str) -> None:
         self.binary: str = herdr_binary()
@@ -1274,9 +1342,36 @@ class Herdr:
         _ = self.run("pane", "run", pane, shlex.join(command))
 
     def result(self, *arguments: str, deadline: float = math.inf) -> dict[str, object]:
+        observed = _pane_observations.get()
+        key = (self.session, arguments)
+        shared = observed is not None and arguments[:2] in (
+            ("pane", "list"), ("tab", "list"), ("workspace", "list"),
+            ("agent", "list"), ("pane", "process-info"))
+        if observed is not None and arguments[:2] == ("pane", "process-info"):
+            self._process_info_batch(observed)
+        if shared and observed is not None and key in observed.replies:
+            return observed.replies[key]
         output = self.run(*arguments) if deadline == math.inf else self.run(*arguments, deadline=deadline)
-        reply = decode_object(output, "herdr response")
-        return json_object(reply.get("result"), "herdr result")
+        reply = json_object(decode_object(output, "herdr response").get("result"), "herdr result")
+        if shared and observed is not None:
+            observed.replies[key] = reply
+        return reply
+
+    def _process_info_batch(self, observed: PaneObservations) -> None:
+        """Read all pane processes in one report batch without CLI subprocesses."""
+        if self.session in observed.process_batches:
+            return
+        observed.process_batches.add(self.session)
+        panes = [json_text(pane.get("pane_id"), "pane id") for pane in self.listed("pane")]
+        def read(pane: str) -> tuple[str, dict[str, object]]:
+            try:
+                return pane, self.socket_request("pane.process_info", pane_id=pane)
+            except (OSError, HerdrFailure):
+                return pane, {}
+        with ThreadPoolExecutor(max_workers=16) as pool:
+            for pane, reply in pool.map(read, panes):
+                if reply:
+                    observed.replies[self.session, ("pane", "process-info", "--pane", pane)] = reply
 
     def socket_request(self, method: str, **params: object) -> dict[str, object]:
         """Send one request to this session's socket."""
@@ -1292,7 +1387,7 @@ class Herdr:
         return json_object(response.get("result"), f"herdr {method} result")
 
     def listed(self, kind: str, *arguments: str, deadline: float = math.inf) -> list[dict[str, object]]:
-        return [json_object(item, f"herdr {kind}") for item in json_items(
+        return [json_object(item, f"herdr {kind}").copy() for item in json_items(
             self.result(kind, "list", *arguments, **({"deadline": deadline} if deadline != math.inf else {})).get(f"{kind}s"), f"herdr {kind} list")]
 
     def pane_row(self, pane: str) -> PaneIdentity | NoPane:
@@ -2138,7 +2233,7 @@ class Herdr:
             ready = False
         return {"agent_status": status, "interactive_ready": ready}
 
-    def prompt_input_state(self, pane: str) -> PromptInputReady | PromptInputHoldsDraft | PromptInputNotReady:
+    def prompt_input_state(self, pane: str) -> PromptInputReady | PromptInputNotReady:
         ready, idle = False, False
         try:
             observation = self.readiness(pane)
@@ -2154,23 +2249,19 @@ class Herdr:
         composer = _composer_input(raw)
         if isinstance(composer, ComposerInput):
             if composer.text.strip():
-                return PromptInputHoldsDraft(screen)
+                return PromptInputNotReady("destination composer holds a draft", screen)
             return PromptInputReady(screen, idle)
         return PromptInputNotReady("destination has no empty composer", screen)
 
     def wait_for_prompt_input(self, pane: str, timeout_ms: int) -> PromptInputReady | PromptInputTimedOut:
         deadline = time.monotonic() + operation_deadline.remaining(timeout_ms / 1000)
         screen: str | PromptScreenNotRead = PromptScreenNotRead()
-        draft_stashed = False
         while time.monotonic() < deadline:
             state = self.prompt_input_state(pane)
             if isinstance(state.screen, str):
                 screen = state.screen
             if isinstance(state, PromptInputReady):
                 return state
-            if isinstance(state, PromptInputHoldsDraft) and not draft_stashed:
-                self._send_keys(pane, "ctrl+s")
-                draft_stashed = True
             remaining = deadline - time.monotonic()
             if remaining > 0:
                 time.sleep(min(0.1, remaining))
@@ -2203,10 +2294,11 @@ class Herdr:
                               timeout_ms: int) -> PromptSubmitOutcome:
         if timeout_ms <= 0 or not opening.text.strip():
             return PromptNotSubmitted("opening prompt deadline elapsed or text is empty")
-        opening = OpeningPrompt(script_prompt(opening.text), opening.transcript, opening.before_prompt)
+        opening = OpeningPrompt(script_prompt(opening.text), opening.transcript, opening.before_prompt, opening.cursor)
         deadline = time.monotonic() + operation_deadline.remaining(timeout_ms / 1000)
-        cursor = (TranscriptCursor(opening.transcript, launched_at)
-                  if isinstance(opening.transcript, SessionTranscript) else UnspecifiedPromptTranscript())
+        cursor = opening.cursor
+        if not isinstance(cursor, TranscriptCursor) and isinstance(opening.transcript, SessionTranscript):
+            cursor = TranscriptCursor(opening.transcript, launched_at)
         screen: str | PromptScreenNotRead = PromptScreenNotRead()
         typings, enters, rejections = 0, 0, 0
         recipient: PromptRecipientProcess | PromptRecipientUnavailable = PromptRecipientUnavailable("transcript identity not supplied")
@@ -2463,10 +2555,16 @@ class Herdr:
             kind = agent.get("agent")
             if kind is not None and not isinstance(kind, str):
                 raise HerdrFailure("herdr agent kind: expected text or null")
+            session: ReportedAgentSession | NoReportedAgentSession = NoReportedAgentSession()
+            if "agent_session" in agent:
+                report = json_object(agent["agent_session"], "herdr agent session")
+                if json_text(report.get("kind"), "herdr agent session kind") == "id":
+                    session = ReportedAgentSession(json_text(report.get("value"), "herdr agent session id"))
             agents.append({
                 "pane_id": json_text(agent.get("pane_id"), "herdr agent pane id"),
                 "agent": kind,
                 "agent_status": AgentStatus.decode(agent.get("agent_status")),
+                "agent_session": session,
             })
         return agents
 
@@ -2628,11 +2726,7 @@ def check_target(target: str | AgentProcessIdentity, *, action: Literal["signal"
 
 
 def claude_trust(folder: Path, claude_json: Path) -> Trusted | Untrusted | UnreadableTrustFile:
-    """Check exact folder, repository-root and main-checkout keys, never ancestors.
-
-    Before creating a worktree, callers check repository_trust_key(checkout)
-    instead of the missing folder, so only the main checkout can authorize it.
-    """
+    """Check exact folder, repository-root and main-checkout keys, never ancestors."""
     folder = folder.resolve()
     try:
         raw = cast(object, json.loads(claude_json.read_text(encoding="utf-8")))
@@ -2670,27 +2764,54 @@ def copy_claude_trust(folder: Path, source: Path, target: Path) -> Trusted | Unt
     granted = claude_trust(folder, source)
     if not isinstance(granted, Trusted):
         return granted
+    return _write_claude_trust(folder, target, granted.project_key)
+
+
+def _write_claude_trust(folder: Path, target: Path, project_key: Path) -> Trusted | UnreadableTrustFile:
+    """Lock the account file through its read and atomic trust update."""
+    from scripts.accounts.accounts import claude_config_lock
+
     try:
-        try:
-            raw = cast(object, json.loads(target.read_text(encoding="utf-8")))
-        except FileNotFoundError:
-            raw = {}
-        if not isinstance(raw, dict):
-            raise ValueError()
-        settings = cast(dict[str, object], raw)
-        projects = settings.setdefault("projects", {})
-        if not isinstance(projects, dict):
-            raise ValueError()
-        entry = cast(dict[str, object], projects).setdefault(str(granted.project_key), {})
-        if not isinstance(entry, dict):
-            raise ValueError()
-        cast(dict[str, object], entry)["hasTrustDialogAccepted"] = True
-        if target.exists():
-            target.chmod(0o600)
-        write_text_atomic(target, json.dumps(settings, indent=2), new_file_mode=0o600)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with claude_config_lock(target):
+            try:
+                raw = cast(object, json.loads(target.read_text(encoding="utf-8")))
+            except FileNotFoundError:
+                raw = {}
+            if not isinstance(raw, dict):
+                raise ValueError()
+            settings = cast(dict[str, object], raw)
+            projects = settings.setdefault("projects", {})
+            if not isinstance(projects, dict):
+                raise ValueError()
+            entry = cast(dict[str, object], projects).setdefault(str(project_key), {})
+            if not isinstance(entry, dict):
+                raise ValueError()
+            cast(dict[str, object], entry)["hasTrustDialogAccepted"] = True
+            if target.exists():
+                target.chmod(0o600)
+            write_text_atomic(target, json.dumps(settings, indent=2), new_file_mode=0o600)
     except (OSError, UnicodeError, ValueError) as error:
         return UnreadableTrustFile(folder, target, type(error).__name__)
-    return Trusted(folder, target, granted.project_key)
+    return Trusted(folder, target, project_key)
+
+
+def trust_claude_launch(folder: Path, config_dir: Path) -> None:
+    """Write trust before either Claude launch path starts a process."""
+    from scripts.whoami.agent_accounts import claude_config_file
+
+    target = claude_config_file(config_dir)
+    try:
+        folder = folder.resolve()
+        result = _write_claude_trust(folder, target, repository_trust_key(folder))
+    except (OSError, subprocess.SubprocessError, HerdrFailure) as error:
+        reason = f"{folder}: trust anomaly: {target}: {error}"
+    else:
+        if isinstance(result, Trusted):
+            return
+        reason = f"{folder}: trust anomaly: {target}: {result.error_class}"
+    reason = " ".join(reason.splitlines())
+    raise HerdrFailure(reason)
 
 
 @dataclass(frozen=True)
@@ -2705,11 +2826,9 @@ class TrustCopied:
 def heal_claude_trust(
     folder: Path, target: Path, sources: Sequence[tuple[str, Path]], *, dry_run: bool,
 ) -> Trusted | TrustCopied | Untrusted | UnreadableTrustFile:
-    """Give the target account file the trust the first trusting source already gave this folder.
+    """Copy trust from the first source that trusts the folder.
 
-    `sources` pairs each account's label with its account file, in the order to try. The copy is
-    `copy_claude_trust`'s one key; a dry run copies nothing. With no trusting source, the target's
-    own `Untrusted` comes back, and the user accepts trust once.
+    A dry run reports the source without a write.
     """
     present = claude_trust(folder, target)
     if not isinstance(present, Untrusted):
@@ -3311,6 +3430,24 @@ def _open_codex_rollouts(pid: int) -> dict[Path, str]:
     return files
 
 
+class RolloutProofPhase(Enum):
+    STABLE = "stable conversation"
+    LAUNCH = "conversation opening during launch"
+
+
+_rollout_proof_phase: ContextVar[RolloutProofPhase] = ContextVar("rollout_proof_phase", default=RolloutProofPhase.STABLE)
+
+
+@contextmanager
+def launch_rollout_proof() -> Generator[None]:
+    """Allow rollout descriptors to open within the launch proof deadline."""
+    token = _rollout_proof_phase.set(RolloutProofPhase.LAUNCH)
+    try:
+        yield
+    finally:
+        _rollout_proof_phase.reset(token)
+
+
 def codex_rollout_threads(pid: int) -> set[str]:
     """Read every thread from stable open rollouts of one process."""
     started = _process_birth(pid)
@@ -3351,7 +3488,8 @@ def codex_rollout_threads(pid: int) -> set[str]:
             raise ValueError(f"pid {pid}: current Codex rollout or process changed")
         if current == files:
             break
-        if not current.items() < files.items() or time.monotonic() >= deadline:
+        opening = _rollout_proof_phase.get() == RolloutProofPhase.LAUNCH and files.items() < current.items()
+        if (not current.items() < files.items() and not opening) or time.monotonic() >= deadline:
             raise ValueError(f"pid {pid}: current Codex rollout or process changed")
     if not files:
         raise NoOpenCodexRollout(f"pid {pid}: current Codex rollout is unavailable")
@@ -3427,7 +3565,7 @@ def native_process(pid: int, kind: str, reported: str = "") -> NativeAgentProces
         except staff.StaffRefused as error:
             raise ValueError(f"pid {pid}: native registry identity is invalid") from error
         if not current:
-            raise ValueError(f"pid {pid}: native registry identity is unavailable")
+            raise NativeRegistryUnavailable(f"pid {pid}: native registry identity is unavailable")
         identity = EnvironmentThread(current)
     else:
         raise ValueError(f"pid {pid}: unknown agent kind {kind}")
@@ -4868,12 +5006,23 @@ class AgentNameSource(Enum):
     MEMBER_REFERENCE = "member_reference"
 
 
+class CodexLaunchRead(Enum):
+    CURRENT = "read Codex at launch"
+
+
 def launch_prepared_agent(name: str, destination: NewTab | SplitPane | ExistingPane, prepared: PreparedAgentEnvironment,
                           kind: str, agent_arguments: list[str], opening: OpeningPrompt | NoOpeningPrompt,
                           timeout_ms: int, *, agent: str, reported_unknown: str = "",
-                          agent_name: str | AgentNameSource = AgentNameSource.MEMBER_REFERENCE) -> AgentLaunched:
+                          agent_name: str | AgentNameSource = AgentNameSource.MEMBER_REFERENCE,
+                          codex: CodexConversations | CodexLaunchRead = CodexLaunchRead.CURRENT) -> AgentLaunched:
     """Launch the prepared environment. Use agent for staff lookup and agent_name for the server name."""
     _check_agent_arguments(kind, agent_arguments)
+    if kind == "claude":
+        try:
+            trust_claude_launch(prepared.directory, Path(prepared.env.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude"))
+        except HerdrFailure as error:
+            print(str(error), file=sys.stderr)
+            return AgentLaunched("", ClaudeTrustNotWritten(str(error)))
     session_id = next((agent_arguments[index + 1] for index, argument in enumerate(agent_arguments[:-1])
                        if argument in {"--resume", "--session-id", "resume"}), "")
     client = Herdr(name)
@@ -4882,7 +5031,9 @@ def launch_prepared_agent(name: str, destination: NewTab | SplitPane | ExistingP
         owner = membership.by_member_reference(session_id or agent) or membership.by_path(agent)
         if owner is not None:
             session_id = owner.current_session
-        observed = read_conversation(session_id, kind) if session_id else StoppedConversation()
+        observed = (read_conversation(session_id, kind,
+                    **({"codex": codex} if isinstance(codex, CodexConversations) else {}))
+                    if session_id else StoppedConversation())
     except (HerdrFailure, OSError, ValueError) as error:
         print(f"herdr {session_id}: live session evidence is unknown: {error}", file=sys.stderr)
     else:

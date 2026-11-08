@@ -1169,5 +1169,27 @@
       "sha256": "989d46760fdb1ef8da226097adc0a942cb8d54cdd96888cd845d984166303a3c",
       "time": "2026-10-23T09:50:57.721466-04:00"
     }
+  },
+  "sweep.disk_floor": {
+    "available": {
+      "reviewer": "opus",
+      "sha256": "8745df456cd23372fd5f5fb6f107b2573fddcb8c5b0910a634e718432db40a76",
+      "time": "2026-11-05T12:32:44.139656-05:00"
+    },
+    "insufficient": {
+      "reviewer": "opus",
+      "sha256": "8745df456cd23372fd5f5fb6f107b2573fddcb8c5b0910a634e718432db40a76",
+      "time": "2026-11-05T12:32:55.296319-05:00"
+    },
+    "protected": {
+      "reviewer": "opus",
+      "sha256": "8745df456cd23372fd5f5fb6f107b2573fddcb8c5b0910a634e718432db40a76",
+      "time": "2026-11-05T12:33:00.403543-05:00"
+    },
+    "unavailable": {
+      "reviewer": "opus",
+      "sha256": "8745df456cd23372fd5f5fb6f107b2573fddcb8c5b0910a634e718432db40a76",
+      "time": "2026-11-05T12:32:50.001653-05:00"
+    }
   }
 }

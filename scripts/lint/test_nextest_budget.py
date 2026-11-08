@@ -105,7 +105,7 @@ class ClaimTests(BudgetCase):
 
 
 class ShellTests(BudgetCase):
-    def run_nextest(self, mode: str, *arguments: str) -> str:
+    def run_nextest(self, mode: str, *arguments: str, logical_cores: int = 32, shell_setup: str = "") -> str:
         config_reader = self.root / "lint_config.sh"
         _ = config_reader.write_text("lint_config_enabled() { return 0; }\nlint_config_skip_notice() { :; }\n")
         script = f"""
@@ -113,21 +113,20 @@ set -euo pipefail
 source "$1"
 shift
 require_nextest() {{ :; }}
-# run_once claims the share once the memory gate admits the step; this stand-in admits at once.
-run() {{
-    if [[ -n "${{LINT_NEXTEST_SHARE:-}}" ]]; then
-        nextest_share_claim "$@"
-        set -- "${{LINT_NEXTEST_SHARED_ARGV[@]}}"
-    fi
+# Keep the real dispatch. Replace only admission and command execution.
+buildlog_step_compiles() {{ return 1; }}
+buildlog_finish_memory() {{ :; }}
+buildlog_exec() {{
     printf '<%s>' "$@"
     printf '\\n'
 }}
 # Bash ignores assignments to EPOCHSECONDS, and core counts come from the
 # machine: fix the trial arm and both widths so the case never reads either.
 nextest_width_arm() {{ LINT_TEST_WIDTH_ARM=logical; }}
-nextest_logical_cores() {{ LINT_LOGICAL_CORES=32; }}
+nextest_logical_cores() {{ LINT_LOGICAL_CORES={logical_cores}; }}
 nextest_physical_cores() {{ LINT_PHYSICAL_CORES=16; }}
 LINT_TEST_WIDTH={mode}
+{shell_setup}
 run_nextest "$@"
 """
         environment = {
@@ -136,6 +135,9 @@ run_nextest "$@"
             "BUILDLOG_OFF": "1",
             "BUILDLOG_CALL_ID": "",
             "BUILDLOG_CALLER": "",
+            "BUILDLOG_SCOPE": "0",
+            "LINT_SKIP_SWEEP": "1",
+            "TMPDIR": str(self.root),
             # Every lint step waits for natedev's hold: a real hold must not stop the case.
             "BUILD_HOLD_DIR": str(self.root / "holders"),
             "BUILD_HOLD_RELEASE_DIR": str(self.root / "release"),
@@ -147,27 +149,36 @@ run_nextest "$@"
         )
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(result.stderr, "")
-        return result.stdout
+        return result.stdout.partition("\n")[2]
 
     def test_run_alone_takes_the_full_width_and_leaves_no_marker(self) -> None:
-        output = self.run_nextest("logical", "--workspace")
-        self.assertEqual(output, "<cargo><nextest><run><--test-threads><32><--workspace>\n")
-        self.assertEqual(self.markers(), [])
+        for width in (12, 32):
+            with self.subTest(width=width):
+                output = self.run_nextest("logical", "--workspace", logical_cores=width)
+                self.assertRegex(output,
+                    rf"\Anextest: {width} of {width} test threads; load \d+\.\d{{2}} on [1-9]\d* CPUs "
+                    + rf"\([^()\n]+\)\n<cargo><nextest><run><--test-threads><{width}><--workspace>\n\Z")
+                self.assertEqual(self.markers(), [])
 
     def test_runs_in_flight_divide_the_width(self) -> None:
         _ = self.hold("a")
         _ = self.hold("b")
         output = self.run_nextest("logical", "--workspace")
-        self.assertEqual(output, "nextest: 10 of 32 test threads, shared with the runs in flight\n"
-                         + "<cargo><nextest><run><--test-threads><10><--workspace>\n")
+        self.assertRegex(output,
+            r"\Anextest: 10 of 32 test threads; load \d+\.\d{2} on [1-9]\d* CPUs "
+            + r"\([^()\n]+\); shared with the runs in flight\n"
+            + r"<cargo><nextest><run><--test-threads><10><--workspace>\n\Z")
         self.assertEqual(self.markers(), ["a.run", "b.run"])
 
     def test_caller_width_wins_over_runs_in_flight(self) -> None:
         _ = self.hold("a")
-        cases = (("--test-threads", "3"), ("-j4",))
-        for arguments in cases:
+        cases = ((("--test-threads", "3"), 3), (("-j4",), 4), (("--jobs", "5"), 5), (("--jobs=5",), 5))
+        for arguments, width in cases:
             with self.subTest(arguments=arguments):
-                output = self.run_nextest("logical", *arguments)
+                output = self.run_nextest("logical", *arguments, shell_setup="export NEXTEST_TEST_THREADS=3")
+                line, output = output.split("\n", 1)
+                self.assertRegex(line,
+                    rf"\Anextest: {width} of {width} test threads; load \d+\.\d{{2}} on [1-9]\d* CPUs \([^()\n]+\)\Z")
                 rendered = "".join(f"<{argument}>" for argument in arguments)
                 self.assertEqual(output, f"<cargo><nextest><run>{rendered}\n")
                 self.assertEqual(self.markers(), ["a.run"])
@@ -175,7 +186,37 @@ run_nextest "$@"
     def test_trial_mode_keeps_the_arm_width_for_width_trial(self) -> None:
         _ = self.hold("a")
         output = self.run_nextest("trial", "--workspace")
+        line, output = output.split("\n", 1)
+        self.assertRegex(line,
+            r"\Anextest: 32 of 32 test threads; load \d+\.\d{2} on [1-9]\d* CPUs \([^()\n]+\)\Z")
         self.assertEqual(output, "<cargo><nextest><run><--test-threads><32><--workspace>\n")
+
+    def test_marker_folder_failure_still_reports_the_full_width_and_runs(self) -> None:
+        self.directory.rmdir()
+        _ = self.directory.write_text("a file blocks the marker folder")
+        output = self.run_nextest("logical", "--workspace", logical_cores=12)
+        self.assertRegex(output,
+            r"\Anextest: 12 of 12 test threads; load \d+\.\d{2} on [1-9]\d* CPUs "
+            + r"\([^()\n]+\)\n<cargo><nextest><run><--test-threads><12><--workspace>\n\Z")
+
+    def test_failed_claim_still_reports_the_full_width_and_runs(self) -> None:
+        (self.directory / "lock").mkdir()
+        output = self.run_nextest("logical", "--workspace", logical_cores=12)
+        self.assertRegex(output,
+            r"\Anextest: 12 of 12 test threads; load \d+\.\d{2} on [1-9]\d* CPUs "
+            + r"\([^()\n]+\)\n<cargo><nextest><run><--test-threads><12><--workspace>\n\Z")
+
+    def test_unreadable_load_is_unknown_and_the_run_still_starts(self) -> None:
+        setup = """buildlog_memory_python() {
+    python3 -c 'import runpy, sys; from unittest.mock import patch
+script = sys.argv.pop(1)
+with patch("os.getloadavg", side_effect=OSError("load is unavailable")):
+    runpy.run_path(script, run_name="__main__")' "$@"
+} """
+        output = self.run_nextest("logical", "--workspace", logical_cores=12, shell_setup=setup)
+        self.assertRegex(output,
+            r"\Anextest: 12 of 12 test threads; load unknown on [1-9]\d* CPUs "
+            + r"\([^()\n]+\)\n<cargo><nextest><run><--test-threads><12><--workspace>\n\Z")
 
 
 if __name__ == "__main__":

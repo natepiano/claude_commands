@@ -98,7 +98,8 @@ class PhaseStyleReviewTests(unittest.TestCase):
         write = (REPO / "docs/direct/write_prompt_contract.md").read_text()
         standing = (REPO / "config/review/code.md").read_text()
         checks = (REPO / "docs/direct/phase_checks.md").read_text()
-        director = (REPO / "commands/unit/direct.md").read_text()
+        director = (REPO / "docs/direct/repair_rounds.md").read_text()
+        core = (REPO / "commands/unit/direct.md").read_text()
         closing = (REPO / "docs/direct/final_gate_commit.md").read_text()
 
         self.assertIn("Implementation, fix and test prompts carry verbatim:", write)
@@ -107,6 +108,7 @@ class PhaseStyleReviewTests(unittest.TestCase):
         self.assertIn("read-only reviewer assigned by <ReviewPromptContract/>", checks)
         self.assertIn("including a reviewer's style finding", director)
         self.assertNotIn("verification, smoke, style", director)
+        self.assertNotIn("verification, smoke, style", core)
         self.assertNotIn("style review and closing repairs", closing)
         self.assertIn("commands/unit/style_review.md", standing)
         self.assertNotIn("Read each applicable rule", standing)
