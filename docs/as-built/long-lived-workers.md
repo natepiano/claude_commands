@@ -528,6 +528,17 @@ It also computes three fields at read time and stores none of them:
 - `account`: the label of the account the member opens on, from `member_account.resume_account`.
 - `home`: that account's home as an absolute path.
 With no staff backend entry, `account` is `{"state": "AccountUnavailable", "reason": ...}` and `home` is absent.
+`worker.py list --json --all` reads pane workers for every manager and adds each parent's name as `manager`.
+It needs no caller row and makes no process, pane, or thread read.
+`state` uses the saved dispatch status or staff hold; `activity` uses the saved pass activity, then its status.
+History lookup resolves fixed manager ids through the staff record, even after a session change.
+It merges history events from newest to oldest across files.
+It stops a file search when newer dispatches supply each worker's state or the remaining events precede each worker's creation.
+A fixed UUIDv7 staff id supplies its first conversation's creation time.
+Older id formats have no creation bound.
+It skips invalid lines and retains history events absent from the current pass slots.
+Stored account history resolves only the unit group and reads its history once.
+Per-manager listing keeps its live observations.
 An ended design identity cannot reopen.
 `config/design_roles.conf` controls new role creation.
 `[roles] new_open=false` preserves existing identities and refuses new opens.

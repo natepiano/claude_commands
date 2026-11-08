@@ -365,10 +365,7 @@ class SyncTests(unittest.TestCase):
         if spec is None or spec.loader is None:
             self.fail(f"could not load {module_path}")
         module = importlib.util.module_from_spec(spec)
-        with (
-            mock.patch.object(sys, "path", [str(module_path.parent), *sys.path]),
-            mock.patch.dict(sys.modules, {spec.name: module}),
-        ):
+        with mock.patch.dict(sys.modules, {spec.name: module}):
             spec.loader.exec_module(module)
 
         mac_timeout = cast(int, getattr(module, "MAC_SSH_TIMEOUT_SECONDS"))

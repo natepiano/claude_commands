@@ -22,7 +22,6 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.astra import astra_work, design_roles  # noqa: E402
 from scripts.lib import unit_runs
 from scripts.production import staff

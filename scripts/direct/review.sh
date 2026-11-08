@@ -110,7 +110,7 @@ esac
 LENS_SLOT="$("${BASH_SOURCE[0]%/*}/../lib/py" - "${BASH_SOURCE[0]}" "${LENS}" <<'PYLENS'
 import sys
 from pathlib import Path
-sys.path.insert(0, str(Path(sys.argv[1]).resolve().parents[2]))
+with open(Path(sys.argv[1]).resolve().parents[2] / "scripts/lib/package_root.py") as package_root: exec(package_root.read(), {"__file__": package_root.name})
 from scripts.usage.agents_log import PHASE_REVIEW_LENSES
 lens = sys.argv[2]
 if lens and lens not in PHASE_REVIEW_LENSES:

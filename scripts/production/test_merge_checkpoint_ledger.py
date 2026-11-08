@@ -2,12 +2,10 @@
 
 from __future__ import annotations
 
-import sys
 import unittest
 from pathlib import Path
 from typing import final
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 # Importable once merge_checkpoint has put scripts/lib on the path.
 

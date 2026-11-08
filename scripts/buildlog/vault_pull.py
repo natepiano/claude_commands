@@ -10,17 +10,14 @@ import subprocess
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal, cast
+from typing import Literal, cast
 
 from scripts.buildlog import rust_release
 from scripts.buildlog import store
 from scripts.buildlog import sync
 from scripts.lib import conf
 
-if TYPE_CHECKING:
-    from ..notify import push_texts
-else:
-    from scripts.notify import push_texts
+from scripts.notify import push_texts
 
 STATE_NAME = "vault_pull.json"
 PUSH_TEXT_ID = "vault.stopped"
