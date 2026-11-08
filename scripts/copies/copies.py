@@ -725,6 +725,14 @@ def clone(source: Path, task: str = "", word: str = "hana", now: float | None = 
             checkout.mkdir()
             initialize_git(checkout, source.resolve())
             _ = git(checkout, "reset", "--hard", "--quiet")
+            from scripts.accounts import accounts
+
+            if accounts.source_has_claude_trust(source):
+                _ = scratch.update_record(path, lambda record: {
+                    **(record.fields if isinstance(record, copy_record.Registered) else {}),
+                    "claude_trust_folder": str(checkout.resolve()),
+                }, scratch_settings=scratch_settings)
+                accounts.set_claude_folder_trust(checkout, trusted=True)
             source_commit = git(checkout, "rev-parse", "HEAD").decode().strip()
             _ = scratch.update_record(path, lambda record: {
                 **(record.fields if isinstance(record, copy_record.Registered) else {}),
@@ -1631,8 +1639,12 @@ def mirror_remove(args: CopyArguments) -> int:
                 raise CopyError(f"{tree}: remote mirror belongs to another owner or repository")
             if tree.exists():
                 write_text_atomic(authority, json.dumps(raw) + "\n")
-                clear_mirror_content(tree)
-                tree.rmdir()
+                task_record = copy_record.record_path(tree)
+                if task_record is not None and task_record.parent != tree:
+                    scratch.remove_marked(task_record.parent, scratch.remove)
+                else:
+                    clear_mirror_content(tree)
+                    tree.rmdir()
             authority.unlink(missing_ok=True)
     return 0
 

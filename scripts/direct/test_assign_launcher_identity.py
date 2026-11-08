@@ -27,7 +27,7 @@ class AssignIdentityTests(launcher_fixture.FirstDispatchFixture):
         self.record("finish-phase", "--phase-id", "7", "--status", "completed")
         self.record("start-phase", "--phase-id", "8", "--phase-title", "Next phase")
         self.write_phase_prompt("8", "Next phase", "Review the next change.")
-        _ = self.successful("review", "--phase", "8", "--lens", "contract", "--pass", "2")
+        _ = self.successful("review", "--phase", "8", "--lens", "contract", "--pass", "2", execution=launcher_fixture.InProcessAssignment())
         records = self.assignment_records()
         self.assertEqual(set(records), {name})
         self.assertEqual(records[name]["thread_id"], thread)
@@ -46,7 +46,8 @@ class AssignIdentityTests(launcher_fixture.FirstDispatchFixture):
         for pass_number in ("1", "2"):
             option = "--new-worker" if pass_number == "1" else "--to"
             name = "project-review"
-            self.review_launcher(option, name, pass_number)
+            _ = self.successful("review", option, name, "--lens", "contract", "--pass", pass_number,
+                                execution=launcher_fixture.InProcessAssignment())
             turns_started = self.methods("turn/start")
             self.assertEqual(len(turns_started), int(pass_number))
             self.assertEqual(cast(dict[str, object], turns_started[-1]["params"])["sandboxPolicy"],
@@ -68,7 +69,7 @@ class AssignIdentityTests(launcher_fixture.FirstDispatchFixture):
     def test_a_review_worker_dispatched_for_implementation_keeps_one_durable_identity(self) -> None:
         self.first_assignment("review", "--lens", "contract", "--pass", "1")
         name, original = next(iter(self.assignment_records().items()))
-        _ = self.successful("implement", "--to", name)
+        _ = self.successful("implement", "--to", name, execution=launcher_fixture.InProcessAssignment())
         identities = [read_object(path) for path in self.session_dir.rglob("impl_worker_*.json")]
         matched = [identity for identity in identities if identity.get("staff_id") == original["staff_id"]]
         self.assertEqual(len(matched), 1, identities)
@@ -82,7 +83,7 @@ class AssignIdentityTests(launcher_fixture.FirstDispatchFixture):
         name, before = next(iter(self.assignment_records().items()))
         self.failing_method = "thread/resume"
         self.next_thread_id = fixture_runtime_id("replacement-implementation-thread")
-        _ = self.successful("implement", "--to", name)
+        _ = self.successful("implement", "--to", name, execution=launcher_fixture.InProcessAssignment())
         after = self.assignment_records()[name]
         self.assertNotEqual(after["thread_id"], before["thread_id"])
         replacement = cast(dict[str, object], self.methods("thread/start")[-1]["params"])
@@ -94,7 +95,7 @@ class AssignIdentityTests(launcher_fixture.FirstDispatchFixture):
 
     def test_a_saved_slot_keys_the_claim_and_board_for_a_full_worker_address(self) -> None:
         name = "project-impl"
-        _ = self.successful("implement", "--new-worker", name)
+        _ = self.successful("implement", "--new-worker", name, execution=launcher_fixture.InProcessAssignment())
         identity_path = self.identity_path(name)
         identity = read_object(identity_path)
         identity["slot"] = "impl"
@@ -112,7 +113,7 @@ class AssignIdentityTests(launcher_fixture.FirstDispatchFixture):
             return original(request)
 
         self.server.respond = observe_saved_slot
-        _ = self.successful("implement", "--to", name)
+        _ = self.successful("implement", "--to", name, execution=launcher_fixture.InProcessAssignment())
         self.assertEqual(self.turn_starts, 2)
         self.assertEqual(len(observed_claims), 1)
         self.assertEqual(observed_claims[0]["worker"], name)
@@ -125,9 +126,9 @@ class AssignIdentityTests(launcher_fixture.FirstDispatchFixture):
         self.assertFalse((self.session_dir / "impl_claim_impl.json").exists())
 
     def test_two_implementation_workers_have_distinct_board_slot_keys(self) -> None:
-        _ = self.successful("implement", "--new-worker", "impl")
+        _ = self.successful("implement", "--new-worker", "impl", execution=launcher_fixture.InProcessAssignment())
         self.next_thread_id = fixture_runtime_id("second-implementation-thread")
-        _ = self.successful("implement", "--new-worker", "impl2")
+        _ = self.successful("implement", "--new-worker", "impl2", execution=launcher_fixture.InProcessAssignment())
         registrations = [line for line in (self.session_dir / "board.log").read_text().splitlines()
                          if "] register:" in line]
         for address in ("impl", "impl2"):
@@ -154,14 +155,14 @@ class AssignIdentityTests(launcher_fixture.FirstDispatchFixture):
         self.first_assignment()
         name, original = next(iter(self.assignment_records().items()))
         self.record("finish-run", "--status", "completed")
-        _ = self.successful("implement", "--to", name)
+        _ = self.successful("implement", "--to", name, execution=launcher_fixture.InProcessAssignment())
         self.assertEqual(self.assignment_records()[name]["thread_id"], original["thread_id"])
         self.assertEqual(len(self.methods("thread/start")), 1)
         self.assertEqual(read_object(self.session_dir / "progress_history_state.json")["status"], "active")
         self.assertTrue(any(event.get("event_type") == "reopened" for event in self.events()))
 
     def test_new_worker_uses_its_requested_address_and_full_access_sandbox(self) -> None:
-        _ = self.successful("test", "--new-worker", "address-without-role")
+        _ = self.successful("test", "--new-worker", "address-without-role", execution=launcher_fixture.InProcessAssignment())
         self.assertEqual(set(self.assignment_records()), {"address-without-role"})
         self.assertEqual(self.assignment_records()["address-without-role"]["role"], "test")
         self.assertEqual(cast(dict[str, object], self.methods("thread/start")[0]["params"])["sandbox"],
