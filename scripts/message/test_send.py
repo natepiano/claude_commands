@@ -3629,8 +3629,7 @@ runpy.run_path(sys.argv[0], run_name="__main__")
         for recipient_form in (
             "a roster name", "uds:<path>", "session:<id>",
             "worker:<unit>/<worker> for a pane worker",
-            "worker:<run id>/<worker name>", "codex:<thread id>", "user",
-            "worker:<run id>/<worker name> for a run pinned to mesh",
+            "codex:<thread id>", "user",
         ):
             self.assertGreaterEqual(help_text.count(recipient_form), 2)
 
@@ -4834,7 +4833,7 @@ class PeerSendTests(RecipientStaffFixture, ShutdownTestCase):
                     self.assertEqual(forwarded[forwarded.index("--to") + 1], address)
         self.assertEqual(self.relayed + self.daemon_calls, [])
 
-    def test_remote_only_claude_mesh_and_daemon_recipients_forward_their_addresses(self) -> None:
+    def test_remote_only_claude_worker_and_daemon_recipients_forward_their_addresses(self) -> None:
         for address in ("session:peer", "worker:peer-run/impl", "codex:peer-thread"):
             with self.subTest(address=address):
                 self.staff_rows.clear()
@@ -5273,7 +5272,7 @@ class PaneWorkerMessageTests(unittest.TestCase):
         self.row_id = self.fixture.worker("impl").id
         self.fixture.world.add(self.row, "w1:p1")
         self.state = self.fixture.root / "messages"
-        _ = (self.fixture.root / "conf/direct.conf").write_text("WORKER_TRANSPORT=herdr\nWORKER_SPLIT_RATIO=0.667\n")
+        _ = (self.fixture.root / "conf/direct.conf").write_text("WORKER_SPLIT_RATIO=0.667\n")
         _ = self.enterContext(mock.patch.object(send, "STATE", self.state))
         _ = self.enterContext(mock.patch.object(roster, "roster", return_value=roster.Roster([], [])))
         _ = self.enterContext(mock.patch.object(sessions, "read_registry", return_value=sessions.RegistryRead((), ())))
@@ -5366,7 +5365,7 @@ class PaneWorkerMessageTests(unittest.TestCase):
 
     def test_worker_message_requires_one_prompt_to_start_a_turn(self) -> None:
         message = "Detached run: private-run\nResult: PASS"
-        result = send.deliver_worker_text(self.row, staff.snapshot(), message, sender="mesh-runs", timeout=60)
+        result = send.deliver_worker_text(self.row, staff.snapshot(), message, sender="detached-runs", timeout=60)
         self.assertIsInstance(result, send.PaneTextDelivered)
         self.assertEqual(result.outcome, "sent", result.detail)
         prompts = [command for command in self.fixture.world.commands if command[:2] == ("agent", "prompt")]
@@ -5387,7 +5386,7 @@ class PaneWorkerMessageTests(unittest.TestCase):
             return output
 
         with mock.patch.object(self.fixture.world, "run", side_effect=run):
-            result = send.deliver_worker_text(self.row, staff.snapshot(), message, sender="mesh-runs", timeout=60)
+            result = send.deliver_worker_text(self.row, staff.snapshot(), message, sender="detached-runs", timeout=60)
         self.assertEqual(result.outcome, "queued", result.detail)
         retained = send.pending(f"staff:{self.fixture.parent.id}")
         self.assertIn("Worker impl: agent_prompt_stalled: no working or blocked state", retained)
@@ -5511,7 +5510,7 @@ class PaneWorkerMessageTests(unittest.TestCase):
         self.assertIn("Use the current conversation.", prompts[0][3])
 
     def test_transcript_read_failure_routes_the_result_to_the_holder_without_pane_input(self) -> None:
-        result = send.deliver_worker_text(self.row, staff.snapshot(), "Run result 42.", sender="mesh-runs",
+        result = send.deliver_worker_text(self.row, staff.snapshot(), "Run result 42.", sender="detached-runs",
                                            timeout=send.delivery_timeout(), reason="transcript read failed")
         self.assertEqual(result.outcome, "queued", result.detail)
         retained = send.pending(f"staff:{self.fixture.parent.id}")

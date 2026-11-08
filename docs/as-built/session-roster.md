@@ -105,7 +105,7 @@ Codex rows:
   It reads session records, the showrunner registry, staff membership, and backend evidence.
   Staff parent rows select each worker's director and showrunner.
   It uses the worker's current native session.
-  It does not use the `environment` argument or read the process table, mesh records, or accounts.
+  It does not use the `environment` argument or read the process table or accounts.
   It omits unknown ids and returns `{}` after an error.
   `/build:status` uses this function (`docs/as-built/build-targets.md`).
 - Both paths use `session_staff.group_labeled_sessions`.

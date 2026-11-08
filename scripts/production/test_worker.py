@@ -21,7 +21,7 @@ from typing import Literal, TextIO, cast, final, override
 import unittest
 from unittest.mock import patch
 
-from scripts.agents import mesh_runs, worker_lifecycle
+from scripts.agents import detached_runs, worker_lifecycle
 from scripts.accounts import accounts
 from scripts.herdr import test_worker_panes as pane_fixtures
 from scripts.herdr import worker_panes
@@ -242,7 +242,7 @@ class WorkerCommandTests(unittest.TestCase):
         self.fixture.world.binary = "/nonexistent/herdr"
         self.addCleanup(self.fixture.doCleanups)
         config = self.fixture.root / "conf/direct.conf"
-        atomic_file.write_text_atomic(config, config.read_text().replace("WORKER_TRANSPORT=mesh", "WORKER_TRANSPORT=herdr")
+        atomic_file.write_text_atomic(config, config.read_text()
                                       + "# range: 1..600\nWORKER_SETTLE_SECONDS=30\n")
         self.agent = DispatchAgent(self.fixture)
         self.agent.pane_commands(self)
@@ -251,7 +251,6 @@ class WorkerCommandTests(unittest.TestCase):
         atomic_file.write_text_atomic(Path.home() / ".codex/sessions" / f"{self.fixture.parent.current_session}.jsonl",
                                       json.dumps({"type": "turn_context", "payload": {
                                           "model": "fixture", "effort": "high"}}) + "\n")
-        atomic_file.write_text_atomic(self.run_dir / "worker_transport", "herdr\n")
         self.prompt = self.run_dir / "prompt.md"
         atomic_file.write_text_atomic(self.prompt, "Read the source and preserve its behavior.\n")
         self.reply = self.run_dir / "reply.md"
@@ -262,7 +261,6 @@ class WorkerCommandTests(unittest.TestCase):
             "main_agent": {"session_id": str(self.fixture.parent.current_session),
                            "family": "claude", "model": "fixture", "effort": "high"},
         }))
-        atomic_file.write_text_atomic(self.run_dir / "worker_transport", "herdr\n")
         _ = cast(object, self.enterContext(patch.dict(os.environ, {"CODEX_THREAD_ID": str(self.fixture.parent.current_session),
             "UNIT_PASS_OWNER": "launcher", "UNIT_TEAM_ROLE": "impl", "UNIT_SYNC_WRITES": "0"})))
         _ = self.enterContext(patch.object(subprocess, "run", side_effect=self.agent.run))
@@ -771,8 +769,8 @@ class WorkerCommandTests(unittest.TestCase):
             return watch
 
         with subprocess.Popen([sys.executable, "-c", "import sys; sys.stdin.read()",
-                               "mesh_runs.py", "supervise", str(path)], stdin=subprocess.PIPE, text=True) as supervisor:
-            record: mesh_runs.RunRecord = {"run_id": "verification", "status": "running", "worker": opened.row.name,
+                               "detached_runs.py", "supervise", str(path)], stdin=subprocess.PIPE, text=True) as supervisor:
+            record: detached_runs.RunRecord = {"run_id": "verification", "status": "running", "worker": opened.row.name,
                 "staff_id": opened.row.id, "session_dir": str(self.run_dir), "label": "private verification",
                 "command": [], "log": str(directory / "verification.log"), "started_at": 0,
                 "pid": supervisor.pid, "director_dir": str(self.run_dir), "done_message_file": ""}
@@ -917,7 +915,7 @@ class WorkerCommandTests(unittest.TestCase):
         record["delivery"] = f"sent: worker {row.name} at {pane}"
         watch_class = worker_lifecycle.LinuxFileChanges if sys.platform.startswith("linux") else worker_lifecycle.KqueueFileChanges
         with subprocess.Popen([sys.executable, "-c", "import sys; sys.stdin.read()",
-                               "mesh_runs.py", "supervise", str(path)], stdin=subprocess.PIPE, text=True) as supervisor:
+                               "detached_runs.py", "supervise", str(path)], stdin=subprocess.PIPE, text=True) as supervisor:
             for live in (False, True):
                 with self.subTest(live=live):
                     record["status"] = "running" if live else "finished"
@@ -993,10 +991,10 @@ class WorkerCommandTests(unittest.TestCase):
         self.assertEqual(self.agent.submitted, [(pane, line)])
         self.assertEqual(self.agent.waited, [])
 
-    def detached_record(self, row: staff.StaffRow, run_id: str) -> tuple[Path, mesh_runs.RunRecord]:
+    def detached_record(self, row: staff.StaffRow, run_id: str) -> tuple[Path, detached_runs.RunRecord]:
         directory = self.run_dir / worker_lifecycle.DETACHED_RUNS_DIR
         directory.mkdir(exist_ok=True)
-        record: mesh_runs.RunRecord = {"run_id": run_id, "status": "finished", "worker": row.name,
+        record: detached_runs.RunRecord = {"run_id": run_id, "status": "finished", "worker": row.name,
             "staff_id": row.id, "session_dir": str(self.run_dir), "label": "private verification", "command": [],
             "log": str(directory / f"{run_id}.log"), "started_at": time.time(), "pid": 0,
             "director_dir": str(self.run_dir), "done_message_file": ""}
@@ -1291,7 +1289,7 @@ class WorkerCommandTests(unittest.TestCase):
         self.assertEqual(self.fixture.staff_state(), before)
 
     def test_dispatch_follows_the_current_native_session_after_replacement(self) -> None:
-        row = self.fixture.worker("impl")
+        row = self.fixture.worker("impl", family="codex")
         self.assertNotEqual(row.id, row.current_session)
         self.fixture.world.add(row, "w1:p9", live=False)
         opened = self.opened()
@@ -1535,7 +1533,6 @@ class WorkerCommandTests(unittest.TestCase):
             saved.mkdir()
             atomic_file.write_text_atomic(saved / "progress_history_state.json",
                 (self.run_dir / "progress_history_state.json").read_text())
-            atomic_file.write_text_atomic(saved / "worker_transport", "herdr\n")
             expected[name] = role
         started = time.perf_counter()
         enumerated: list[Path] = []

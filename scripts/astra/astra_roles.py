@@ -22,7 +22,7 @@ from typing import Literal, NotRequired, TypedDict, cast
 
 from scripts.lib import process_start
 from scripts.lib.atomic_file import write_text_atomic
-from scripts.production import staff, session_staff
+from scripts.production import staff
 from scripts.herdr import worker_panes
 from scripts.usage import agents_log
 
@@ -43,12 +43,6 @@ class RoleRecord(TypedDict):
     role_id: NotRequired[str]
 
 
-@dataclass(frozen=True)
-class MeshWorker:
-    """A hold that lasts until this mesh worker ends its thread."""
-
-    session_dir: str
-    worker: str
 
 
 class CaptureProcessStart(Enum):
@@ -81,7 +75,7 @@ class HeldRole(TypedDict):
     thread_id: str
     manager: str
     held_at: str
-    lifetime: MeshWorker | ExecProcess | HeldDesignRole
+    lifetime: ExecProcess | HeldDesignRole
 
 
 class LiveRole(HeldRole):
@@ -95,9 +89,7 @@ class RoleArguments(argparse.Namespace):
     command: str = ""
     role: AstraRole = "designer"
     staff_id: str = ""
-    session_dir: str | None = None
-    worker: str | None = None
-    pid: int | None = None
+    pid: int = 0
     json: bool = False
 
 
@@ -118,14 +110,6 @@ def _json_object(path: Path) -> dict[str, object]:
     return cast(dict[str, object], value)
 
 
-def _mesh_worker(session_dir: Path, worker: str, *, membership: staff.StaffSnapshot) -> dict[str, object]:
-    value = _json_object(session_dir / "mesh_roster.json").get(worker)
-    if not isinstance(value, dict):
-        raise ValueError(f"{session_dir}: roster has no worker {worker}")
-    entry = cast(dict[str, object], value)
-    if not session_staff.worker_session(entry, membership):
-        raise ValueError(f"{session_dir}: worker {worker} has no thread")
-    return entry
 
 
 @dataclass(frozen=True)
@@ -133,18 +117,11 @@ class HoldWorkerUnavailable:
     reason: str
 
 
-def hold(role: AstraRole, lifetime: ExecProcess | HeldDesignRole | MeshWorker,
+def hold(role: AstraRole, lifetime: ExecProcess | HeldDesignRole,
          staff_id: str = "") -> HeldRole | HoldWorkerUnavailable:
     """Save a role with one explicit lifetime."""
     membership = staff.local_snapshot()
-    if isinstance(lifetime, MeshWorker):
-        if staff_id:
-            raise ValueError("mesh holds resolve their worker staff row")
-        directory = Path(lifetime.session_dir).expanduser().resolve()
-        entry = _mesh_worker(directory, lifetime.worker, membership=membership)
-        staff_id = str(entry.get("staff_id", ""))
-        lifetime = MeshWorker(str(directory), lifetime.worker)
-    elif isinstance(lifetime, HeldDesignRole):
+    if isinstance(lifetime, HeldDesignRole):
         if not lifetime.design_id or lifetime.role_id != role:
             raise ValueError("durable hold differs from its role")
     elif isinstance(lifetime.pid, bool) or lifetime.pid <= 0 or not isinstance(lifetime.start, process_start.Started):
@@ -172,16 +149,6 @@ def hold(role: AstraRole, lifetime: ExecProcess | HeldDesignRole | MeshWorker,
 def release(staff_id: str) -> None:
     """Remove a hold, including one whose thread has already stopped."""
     _record_path(staff_id).unlink(missing_ok=True)
-
-
-def _pid_running(pid: int) -> bool:
-    try:
-        os.kill(pid, 0)
-    except PermissionError:
-        return True
-    except (OSError, OverflowError):
-        return False
-    return True
 
 
 def _record_text(record: dict[str, object], key: str) -> str:
@@ -226,29 +193,27 @@ def _parse_record(record: dict[str, object] | RoleRecord, path: Path, membership
                     manager=manager, held_at=held_at, lifetime=lifetime)
 
 
-def _role_lifetime(fields: dict[str, object], role: AstraRole) -> MeshWorker | ExecProcess | HeldDesignRole:
+def _role_lifetime(fields: dict[str, object], role: AstraRole) -> ExecProcess | HeldDesignRole:
     session_dir, worker, pid = fields["session_dir"], fields["worker"], fields["pid"]
-    lifetime: MeshWorker | ExecProcess | HeldDesignRole
+    lifetime: ExecProcess | HeldDesignRole
     if "design_id" in fields:
         if session_dir is not None or worker is not None or pid is not None or fields["role_id"] != role:
             raise ValueError("invalid durable role lifetime")
         lifetime = HeldDesignRole(_record_text(fields, "design_id"), _record_text(fields, "role_id"))
-    elif isinstance(session_dir, str) and session_dir.strip() and isinstance(worker, str) and worker.strip() and pid is None:
-        lifetime = MeshWorker(session_dir, worker)
     elif session_dir is None and worker is None and isinstance(pid, int) and not isinstance(pid, bool) and pid > 0:
         saved_start = fields.get("pid_start")
         lifetime = ExecProcess(pid, process_start.Started(saved_start) if isinstance(saved_start, str) and saved_start
                                else process_start.Unreadable("legacy hold has no process start; release it explicitly"))
     else:
-        raise ValueError("record needs a mesh worker or an exec pid")
+        raise ValueError("record needs a durable role or an exec pid")
     return lifetime
 
 
 def _role_record(role: HeldRole) -> RoleRecord:
     lifetime = role["lifetime"]
     record = RoleRecord(staff_id=role["staff_id"], held_at=role["held_at"],
-                      session_dir=lifetime.session_dir if isinstance(lifetime, MeshWorker) else None,
-                      worker=lifetime.worker if isinstance(lifetime, MeshWorker) else None,
+                      session_dir=None,
+                      worker=None,
                       pid=lifetime.pid if isinstance(lifetime, ExecProcess) else None)
     if isinstance(lifetime, HeldDesignRole):
         record.update(design_id=lifetime.design_id, role_id=lifetime.role_id)
@@ -257,9 +222,6 @@ def _role_record(role: HeldRole) -> RoleRecord:
     return record
 
 
-def _worker_state(entry: dict[str, object]) -> RoleState:
-    pid = entry.get("launcher_pid")
-    return "busy" if isinstance(pid, int) and not isinstance(pid, bool) and pid > 0 and _pid_running(pid) else "idle"
 
 
 class AllHeldRoles(Enum):
@@ -299,29 +261,6 @@ def live_roles(membership: staff.StaffSnapshot, *,
                 matches = [item for item in observations.get(parent.id, []) if item.row.id == instance.lifecycle.staff_id]
                 state = worker_panes.worker_state(matches[0]) if len(matches) == 1 else "unknown"
                 record["manager"] = parent.current_session
-            elif isinstance(lifetime, MeshWorker):
-                session_dir = Path(lifetime.session_dir)
-                if not session_dir.exists():
-                    path.unlink(missing_ok=True)
-                    continue
-                roster = _json_object(session_dir / "mesh_roster.json")
-                if lifetime.worker not in roster:
-                    path.unlink(missing_ok=True)
-                    continue
-                value = roster[lifetime.worker]
-                if not isinstance(value, dict):
-                    raise ValueError("mesh worker is not a JSON object")
-                entry = cast(dict[str, object], value)
-                thread = session_staff.worker_session(entry, membership)
-                if not thread:
-                    raise ValueError("mesh worker has no thread")
-                status = entry.get("status")
-                if not isinstance(status, str) or not status:
-                    raise ValueError("mesh worker has no status")
-                if status in ("ended", "failed") or thread != record["thread_id"]:
-                    path.unlink(missing_ok=True)
-                    continue
-                state = _worker_state(entry)
             else:
                 observed = process_start.process_start(lifetime.pid)
                 if (isinstance(observed, (process_start.Gone, process_start.Zombie))
@@ -347,9 +286,8 @@ def main(argv: list[str]) -> int:
     commands = parser.add_subparsers(dest="command", required=True)
     holding = commands.add_parser("hold")
     _ = holding.add_argument("role", choices=("designer", "reviewer"))
-    for flag in ("session-dir", "worker", "staff-id"):
-        _ = holding.add_argument(f"--{flag}")
-    _ = holding.add_argument("--pid", type=int)
+    _ = holding.add_argument("--staff-id", required=True)
+    _ = holding.add_argument("--pid", type=int, required=True)
     releasing = commands.add_parser("release")
     _ = releasing.add_argument("staff_id")
     listing = commands.add_parser("list")
@@ -357,12 +295,7 @@ def main(argv: list[str]) -> int:
     args = parser.parse_args(argv, namespace=RoleArguments())
     try:
         if args.command == "hold":
-            if args.session_dir is not None and args.worker and args.pid is None and not args.staff_id:
-                lifetime = MeshWorker(args.session_dir, args.worker)
-            elif args.session_dir is None and args.worker is None and args.pid is not None:
-                lifetime = ExecProcess(args.pid)
-            else:
-                raise ValueError("hold needs one mesh worker or one exec process")
+            lifetime = ExecProcess(args.pid)
             result = hold(args.role, lifetime, args.staff_id or "")
             if isinstance(result, HoldWorkerUnavailable):
                 return 1

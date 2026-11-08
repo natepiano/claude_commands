@@ -147,10 +147,10 @@ class OneLaunchPathTests(unittest.TestCase):
                 path.parent.mkdir(parents=True, exist_ok=True)
                 _ = path.write_text('command = ["review.sh"]\n')
             _ = (root / "inspect.py").write_text(
-                '# codex_mesh.py start\ntext = "review.sh worker"\n' +
-                'command = ["codex_mesh.py", "end"]\n')
+                '# worker.py add\ntext = "review.sh worker"\n' +
+                'command = ["worker.py", "end"]\n')
             _ = (root / "inspect.sh").write_text(
-                '# codex_mesh.py follow\necho "codex_mesh.py start"\n"$PY" codex_mesh.py send --to worker\n')
+                '# worker.py assign\necho "worker.py add"\n"$PY" worker.py send --to worker\n')
             self.assertEqual(forbidden_launches(root), [])
 
 

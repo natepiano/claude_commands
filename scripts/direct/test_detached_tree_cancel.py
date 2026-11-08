@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Callable, cast
 from unittest.mock import patch
 
-from scripts.agents import mesh_runs
+from scripts.agents import detached_runs
 from scripts.production import session_staff, staff
 from scripts.production.staff_test_support import fixture_member, fixture_runtime_id, isolated_staff_file, unit_membership
 from scripts.direct.verify_tree_cancel_test_support import cancellation_lines, VerifyTreeCancelFixture
@@ -26,7 +26,7 @@ PRIVATE_DELIVERY = """import json, os, sys
 sys.path.insert(0, os.environ["TEST_DETACHED_PACKAGE"])
 from pathlib import Path
 from unittest.mock import patch
-from scripts.agents import mesh_runs
+from scripts.agents import detached_runs
 from scripts.message import send
 from scripts.production import session_staff
 from scripts.lib.atomic_file import write_text_atomic
@@ -40,7 +40,7 @@ def deliver(member, membership, text, **options):
     return send.Result("queued", "private fixture")
 
 with patch.object(send, "deliver_worker_text", side_effect=deliver):
-    raise SystemExit(mesh_runs.main(sys.argv[1:]))
+    raise SystemExit(detached_runs.main(sys.argv[1:]))
 """
 
 
@@ -48,11 +48,10 @@ def setUpModule() -> None:
     install_guard_test_budget()
 
 
-class MeshTreeCancelTests(VerifyTreeCancelFixture):
+class DetachedTreeCancelTests(VerifyTreeCancelFixture):
     def start_detached(self, fixture: VerifyTreeCancelFixture, identity: str, *, done_message: bool = False) -> Path:
         session = fixture.board
         session.mkdir(parents=True, exist_ok=True)
-        write_text_atomic(session / "worker_transport", "herdr\n")
         native = fixture_runtime_id(identity)
         environment = {**fixture.environment, "CODEX_THREAD_ID": native,
                        "CODEX_HOME": str(fixture.root / "codex"), "TEST_FINISH": "1",
@@ -73,7 +72,7 @@ class MeshTreeCancelTests(VerifyTreeCancelFixture):
         # Only the message transport uses a private fixture.
         with patch.dict(os.environ, environment, clear=True), \
                 isolated_staff_file(fixture.root / "staff.json", environment), \
-                patch.object(mesh_runs, "RUN_ROOTS", (fixture.root,)), \
+                patch.object(detached_runs, "RUN_ROOTS", (fixture.root,)), \
                 patch.object(subprocess, "Popen", side_effect=capture), \
                 contextlib.chdir(fixture.workspace), contextlib.redirect_stdout(io.StringIO()) as output:
             parent = unit_membership("fixture", identity)
@@ -84,7 +83,7 @@ class MeshTreeCancelTests(VerifyTreeCancelFixture):
             state = cast(dict[str, object], json.loads(state_path.read_text())) if state_path.exists() else {}
             state["owner_staff_id"] = parent.id
             write_text_atomic(state_path, json.dumps(state))
-            wrapper = fixture.root / "scripts/agents/mesh_runs.py"
+            wrapper = fixture.root / "scripts/agents/detached_runs.py"
             wrapper.parent.mkdir(parents=True, exist_ok=True)
             library = fixture.root / "scripts/lib"
             library.mkdir(parents=True, exist_ok=True)
@@ -95,26 +94,26 @@ class MeshTreeCancelTests(VerifyTreeCancelFixture):
             os.environ["TEST_DETACHED_PACKAGE"] = environment["TEST_DETACHED_PACKAGE"]
             environment["PYTHONPATH"] = str(Path(__file__).resolve().parents[2])
             os.environ["PYTHONPATH"] = environment["PYTHONPATH"]
-            _ = self.enterContext(patch.object(mesh_runs, "__file__", str(wrapper)))
-            status = mesh_runs.main(["start", "--session-dir", str(session), "--to", identity,
+            _ = self.enterContext(patch.object(detached_runs, "__file__", str(wrapper)))
+            status = detached_runs.main(["start", "--session-dir", str(session), "--to", identity,
                                      "--label", identity + " verify test", *done_flags, "--",
                                      "bash", str(VERIFY), "test", "sample"])
         self.assertEqual(status, 0, output.getvalue())
-        records = list((session / mesh_runs.DETACHED_RUNS_DIR).glob("*.json"))
+        records = list((session / detached_runs.DETACHED_RUNS_DIR).glob("*.json"))
         self.assertEqual(len(records), 1)
-        record = cast(mesh_runs.RunRecord, json.loads(records[0].read_text()))
+        record = cast(detached_runs.RunRecord, json.loads(records[0].read_text()))
         fixture.started_groups.add(record["pid"])
         self.assertEqual(record["staff_id"], native)
         return records[0]
 
-    def finished_record(self, path: Path) -> mesh_runs.RunRecord:
+    def finished_record(self, path: Path) -> detached_runs.RunRecord:
         def finished() -> bool:
             return cast(dict[str, object], json.loads(path.read_text())).get("status") == "finished"
 
         # Directory events, not a status-file polling loop: completion replaces
         # the run record atomically after it has delivered the message.
         wait_until(finished, path.parent, timeout=TEST_HANG_GUARD_SECS)
-        return cast(mesh_runs.RunRecord, json.loads(path.read_text()))
+        return cast(detached_runs.RunRecord, json.loads(path.read_text()))
 
     def inbox_path(self, fixture: VerifyTreeCancelFixture, identity: str) -> Path:
         with isolated_staff_file(fixture.root / "staff.json", {}):

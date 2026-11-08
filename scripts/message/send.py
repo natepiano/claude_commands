@@ -2655,7 +2655,6 @@ def parse(argv: list[str]) -> Options:
                                          "Send one message to a roster name, uds:<path>, "
                                          "session:<id>, codex:<thread id>, or user. "
                                          "Use worker:<unit>/<worker> for a pane worker. "
-                                         "Use worker:<run id>/<worker name> for a run pinned to mesh."
                                      ),
                                      formatter_class=argparse.RawDescriptionHelpFormatter,
                                      epilog="Also: send.py ack KEY | reopen KEY | pending [NAME]\n\n"
@@ -2668,7 +2667,6 @@ def parse(argv: list[str]) -> Options:
             "a roster name, uds:<path>, session:<id>, "
             "codex:<thread id>, or user. "
             "Use worker:<unit>/<worker> for a pane worker. "
-            "Use worker:<run id>/<worker name> for a run pinned to mesh."
         ),
     )
     _ = parser.add_argument("--text-id", default="", help="registered script push")

@@ -132,7 +132,7 @@ class ClientTests(unittest.TestCase):
                 "DESIGN_ROLES_STATE": str(root / "roles"), "XDG_STATE_HOME": str(root / "state"),
                 **config_environment(root / "config")}
             direct_config = root / "config/direct.conf"
-            _ = direct_config.write_text(direct_config.read_text().replace("WORKER_TRANSPORT=mesh", "WORKER_TRANSPORT=herdr"))
+            _ = direct_config.write_text(direct_config.read_text())
             received: list[dict[str, object]] = []
 
             def receive(connection: socket.socket) -> None:

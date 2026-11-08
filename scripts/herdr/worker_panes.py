@@ -560,8 +560,8 @@ def _idle_checks(row: staff.StaffRow, run: Path,
     passed = worker_pass(row, run)
     if not closing_turn and passed.get("status") in ("active", "refused"):
         return Kept("launcher has not recorded a completed pass")
-    live_runs = cast(Callable[[Path, str], Sequence[object]], import_module("scripts.agents.mesh_runs").live_runs)
-    if live_runs(run / "mesh_runs", row.name):
+    live_runs = cast(Callable[[Path, str], Sequence[object]], import_module("scripts.agents.detached_runs").live_runs)
+    if live_runs(run / "detached_runs", row.name):
         return Kept("a detached run is live")
     return CloseAllowed()
 
@@ -757,6 +757,7 @@ def start_or_resume(parent: StaffId, name: WorkerName, role: WorkerRole | Worker
         run = worker_run(owner, record=record, scanned=runs)
     allowed = worker_admission.WorkerStartAllowed(name.value, parent, run,
         worker_admission.ExistingWorkerSlot(existing) if existing is not None else worker_admission.NewWorkerSlot())
+    keep_model = isinstance(policy, UseRolePolicy)
     try:
         policy = launch_policy(role) if isinstance(policy, UseRolePolicy) else policy
     except (OSError, ValueError, subprocess.SubprocessError) as error:
@@ -769,7 +770,7 @@ def start_or_resume(parent: StaffId, name: WorkerName, role: WorkerRole | Worker
             if not held.active or held.parent != parent or held.name != name:
                 return StartRefused(StartRefusal.BUSY_ROLE_CHANGE, "worker lock does not own this worker")
             with worker_admission.worker_operation(allowed):
-                return _start_locked(owner, name, role, policy, account, allowed, held, codex)
+                return _start_locked(owner, name, role, policy, account, allowed, held, codex, keep_model=keep_model)
     except (worker_admission.AdmissionRefused, staff.StaffRefused) as error:
         return AdmissionRefused(str(error))
 
@@ -809,7 +810,7 @@ def _codex_start_session(client: herdr.Herdr, pane: str, *,
 def _start_locked(owner: staff.StaffRow, name: WorkerName, role: WorkerRole, policy: LaunchPolicy,
                   account: ConfiguredWorkerAccount | DestinationWorkerAccount,
                   allowed: worker_admission.WorkerStartAllowed, lock: WorkerLockHold,
-                  codex: herdr.CodexConversations | herdr.CodexLaunchRead) -> WorkerStart:
+                  codex: herdr.CodexConversations | herdr.CodexLaunchRead, *, keep_model: bool) -> WorkerStart:
     started = time.monotonic()
     try:
         start_seconds = conf.read("direct").number("PANE_AGENT_START_SECONDS")
@@ -822,6 +823,8 @@ def _start_locked(owner: staff.StaffRow, name: WorkerName, role: WorkerRole, pol
     evidence = _evidence(owner.id, record, client, selection=selection)
     current = next((state for state in evidence.states if state.row.name == name.value), None)
     row = current.row if current is not None else None
+    backend = staff.backend(row) if row is not None else staff.BACKEND_UNAVAILABLE
+    switching = not isinstance(backend, staff.BackendUnavailable) and backend.family != policy.settings.kind
     if row is not None:
         lock.bind(row)
     if isinstance(current, (ProcessUnknownWorker, UncertainWorker)):
@@ -869,24 +872,29 @@ def _start_locked(owner: staff.StaffRow, name: WorkerName, role: WorkerRole, pol
             if (passed.get("status") != "active" or not current.status.idle
                     or isinstance(_completed_turn(current.row, passed.get("instance_id")), Kept)):
                 return StartRefused(StartRefusal.BUSY_ROLE_CHANGE, "active dispatch has another role")
-        matches = _live_policy(current, policy, client, same_role=passed.get("kind") == role)
-        if isinstance(matches, UncertainWorker):
-            return matches
-        same_run = True
-        if owner.kind == "unit" and matches and not passed:
-            try:
-                pane_row = next(pane for pane in evidence.panes if pane.get("pane_id") == current.pane)
-                launched = client.native_pane_process(current.pane, policy.settings.kind, herdr.PROGRAM_TIMEOUT_SECONDS, pane_row=pane_row)
-            except (herdr.HerdrFailure, OSError, ValueError, subprocess.SubprocessError) as error:
-                return _uncertain(current.row, f"running launch environment is unproved: {error}")
-            same_run = launched.environment.get("UNIT_RUN_DIR") == str(allowed.run)
-        if matches and same_run:
-            _layout(owner.id, evidence)
-            return current
+        if not switching:
+            matches = _live_policy(current, policy, client, same_role=keep_model and passed.get("kind") == role)
+            if isinstance(matches, UncertainWorker):
+                return matches
+            same_run = True
+            if owner.kind == "unit" and matches and not passed:
+                try:
+                    pane_row = next(pane for pane in evidence.panes if pane.get("pane_id") == current.pane)
+                    launched = client.native_pane_process(current.pane, policy.settings.kind, herdr.PROGRAM_TIMEOUT_SECONDS, pane_row=pane_row)
+                except (herdr.HerdrFailure, OSError, ValueError, subprocess.SubprocessError) as error:
+                    return _uncertain(current.row, f"running launch environment is unproved: {error}")
+                same_run = launched.environment.get("UNIT_RUN_DIR") == str(allowed.run)
+            if matches and same_run:
+                _layout(owner.id, evidence)
+                return current
+            closable = can_close(current, lock=lock)
+            if isinstance(closable, Kept):
+                return StartRefused(StartRefusal.BUSY_ROLE_CHANGE, closable.blocker)
+    if switching and isinstance(current, (OpenWorker, StoppedWorker)):
         closable = can_close(current, lock=lock)
         if isinstance(closable, Kept):
             return StartRefused(StartRefusal.BUSY_ROLE_CHANGE, closable.blocker)
-    environment = launch_environment(policy, account, row is not None)
+    environment = launch_environment(policy, account, row is not None and not switching)
     if isinstance(environment, StartRefused):
         return environment
     environment["UNIT_TEAM_ROLE"] = name.value
@@ -895,15 +903,15 @@ def _start_locked(owner: staff.StaffRow, name: WorkerName, role: WorkerRole, pol
     if temporary := os.environ.get("TMPDIR"):
         environment["TMPDIR"] = temporary
     directory = owner.worktree.path if isinstance(owner.worktree, staff.PresentWorktree) else Path.cwd()
-    prepared = herdr.prepare_session_environment(str(row.current_session) if row else "", str(directory), environment,
+    prepared = herdr.prepare_session_environment(str(row.current_session) if row is not None and not switching else "", str(directory), environment,
                                                frozenset({"STAFF_ID"}))
     if isinstance(prepared, nix_env.Refused):
         return StartRefused(StartRefusal.INVALID_ROLE_CONFIGURATION, str(prepared))
-    if isinstance(current, OpenWorker):
+    if isinstance(current, OpenWorker) and not switching:
         if not _stop_row(current.row, client, deadline=deadline):
             return _uncertain(current.row, "agent stop is incomplete; pane retained")
         current = StoppedWorker(current.row, current.pane, current.terminal)
-    if isinstance(current, StoppedWorker):
+    if isinstance(current, StoppedWorker) or switching and isinstance(current, OpenWorker):
         destination = herdr.ExistingPane(current.pane, current.terminal)
     else:
         try:
@@ -918,31 +926,52 @@ def _start_locked(owner: staff.StaffRow, name: WorkerName, role: WorkerRole, pol
             return _uncertain(row or owner, "terminal moved or duplicated before start")
         if not any(pane["pane_id"] == destination.pane and pane.get("terminal_id") == destination.terminal for pane in panes):
             return _uncertain(row or owner, "terminal moved before start")
-        if not isinstance(client.pane_activity(destination.pane), herdr.PaneAtShell):
+        if not switching and not isinstance(client.pane_activity(destination.pane), herdr.PaneAtShell):
             return StartRefused(StartRefusal.PANE_NOT_AT_SHELL, "recovery pane has foreground work")
-    try:
+    launches: list[herdr.AgentLaunched] = []
+
+    def start(handoff: worker_admission.FamilyHandoff) -> str:
+        del handoff
+        identity = str(row.current_session) if row is not None and not switching else ""
         launch = partial(herdr.launch_prepared_agent, codex=codex) if isinstance(codex, herdr.CodexConversations) else herdr.launch_prepared_agent
         launched = launch(client.session, destination, prepared, policy.settings.kind,
-            launch_arguments(policy, str(row.current_session) if row else "", directory), herdr.NoOpeningPrompt(),
+            launch_arguments(policy, identity, directory), herdr.NoOpeningPrompt(),
             int(start_seconds * 1000), agent=name.value, agent_name=f"{owner.name}-{name.value}")
-    except (herdr.HerdrFailure, OSError, ValueError, subprocess.SubprocessError) as error:
-        return _uncertain(row or owner, f"agent launch is incomplete; pane retained: {error}")
-    try:
+        launches.append(launched)
         with herdr.launch_rollout_proof():
-            if row is None and policy.settings.kind == "codex":
+            if not identity and policy.settings.kind == "codex":
                 if isinstance(launched.outcome, herdr.PromptNotSubmitted):
-                    return UnpublishedWorker(launched.pane, launched.outcome.reason)
-                identity = _codex_start_session(client, launched.pane)
-            else:
-                identity = client.native_session(launched.pane, policy.settings.kind, herdr.PROGRAM_TIMEOUT_SECONDS)
-        if row is not None and identity != row.current_session:
-            return _uncertain(row, "launch proves another native session; pane retained")
-        if row is None:
-            row = worker_admission.publish(allowed, identity).row
-            lock.bind(row)
+                    raise herdr.HerdrFailure(launched.outcome.reason)
+                return _codex_start_session(client, launched.pane)
+            return client.native_session(launched.pane, policy.settings.kind, herdr.PROGRAM_TIMEOUT_SECONDS)
+
+    def cleanup(identity: str) -> str | None:
+        if isinstance(destination, herdr.ExistingPane):
+            try:
+                client.quit_agent(destination.pane, destination.terminal, identity, start_seconds)
+            except (herdr.HerdrFailure, OSError, ValueError, subprocess.SubprocessError) as error:
+                return f"; destination cleanup failed: {error}"
+        return None
+
+    try:
+        if switching:
+            request = hashlib.sha256(f"{row.current_session if row else ''}:{policy.settings.kind}".encode()).hexdigest()
+            published = worker_admission.switch_worker(allowed, policy.settings.kind, start=start,
+                dispatch=worker_admission.DispatchOwner.TURN_SUBMISSION, cleanup=cleanup, request=request)
+            row = published.row
+        else:
+            identity = start(worker_admission.NoFamilyHandoff())
+            if row is not None and identity != row.current_session:
+                return _uncertain(row, "launch proves another native session; pane retained")
+            if row is None:
+                row = worker_admission.publish(allowed, identity).row
+                lock.bind(row)
     except (worker_admission.AdmissionRefused, herdr.HerdrFailure, OSError, ValueError, subprocess.SubprocessError) as error:
+        if not launches:
+            return _uncertain(row or owner, f"agent launch is incomplete; pane retained: {error}")
         return (_uncertain(row, f"launch proof is incomplete: {error}") if row is not None
-                else UnpublishedWorker(launched.pane, str(error)))
+                else UnpublishedWorker(launches[-1].pane, str(error)))
+    launched = launches[-1]
     if isinstance(launched.outcome, herdr.PromptNotSubmitted):
         return IncompleteStart(row, launched.pane, launched.outcome.reason)
     with herdr.launch_rollout_proof():

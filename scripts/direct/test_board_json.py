@@ -26,8 +26,8 @@ from typing import Literal, cast, override
 from unittest.mock import patch
 
 from scripts.direct import board_json, worker_runs
-from scripts.agents.codex_mesh import DETACHED_RUNS_DIR
-from scripts.agents.mesh_runs import RunRecord
+from scripts.agents.worker_lifecycle import DETACHED_RUNS_DIR
+from scripts.agents.detached_runs import RunRecord
 from scripts.lib import unit_runs
 from scripts.production import fake_showrunner, showrunner_parent, staff, showrunners
 from scripts.production.cli_fixture import invoke_cli
@@ -115,7 +115,7 @@ class BoardJsonTests(unittest.TestCase):
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         config = self.root / "config"
         config.mkdir()
-        write_text_atomic(config / "direct.conf", "# one of: mesh, herdr\nWORKER_TRANSPORT=mesh\n")
+        write_text_atomic(config / "direct.conf", "# Worker settings.\n")
         _ = cast(object, self.enterContext(patch.dict(os.environ, {"CONF_DIR": str(config)})))
         self.history = self.root / "history"
         (self.history / "runs").mkdir(parents=True)
@@ -380,7 +380,6 @@ class BoardJsonTests(unittest.TestCase):
         parent = self.unit_member(fixture.name)
         worker = fixture_worker("reader", parent.id)
         write_text_atomic(directory / unit_runs.STATE_FILE, json.dumps({unit_runs.OWNER_FIELD: parent.id}))
-        write_text_atomic(directory / "worker_transport", "herdr\n")
         return directory, parent, worker
 
     def detached_run(self, directory: Path, worker: staff.StaffRow, *,
@@ -1998,7 +1997,6 @@ class PaneBoardTests(StaffTestCase):
         run = self.root / "run"
         run.mkdir()
         write_text_atomic(run / unit_runs.STATE_FILE, json.dumps({unit_runs.OWNER_FIELD: parent.id}))
-        write_text_atomic(run / "worker_transport", "herdr\n")
         return run, parent, worker
 
     def test_pane_worker_sources_include_posts_and_launcher_writes(self) -> None:
@@ -2063,7 +2061,7 @@ class PaneBoardTests(StaffTestCase):
             world.add(worker, f"w1:p{index}")
             world.locations[f"w1:p{index}"]["agent_status"] = herdr.AgentStatus.WORKING
         record = staff.snapshot()
-        with patch.object(unit_runs, "parent_transport", return_value="herdr"), patch.object(
+        with patch.object(
                 worker_panes, "_client", return_value=world), patch.object(
                 herdr, "native_process", side_effect=world.native_process), patch.object(world, "panes", wraps=world.panes) as panes:
             rows = board_json.pane_worker_rows(record)
@@ -2071,7 +2069,6 @@ class PaneBoardTests(StaffTestCase):
         self.assertEqual({str(row["doing"]) for group in rows.values() for row in group}, {"w1:p0", "w1:p1"})
         self.assertEqual({str(row["state"]) for group in rows.values() for row in group}, {"working"})
         self.assertEqual(panes.call_count, 1)
-        self.assertEqual(list(self.root.rglob("worker_transport")), [])
 
 
 

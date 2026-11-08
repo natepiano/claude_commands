@@ -557,17 +557,17 @@ exit "$status"
             _ = first.wait(timeout=TEST_HANG_GUARD_SECS)
 
     def detach_environment(self, status: int) -> dict[str, str]:
-        """A Codex worker's environment whose mesh_runs.py stub records its argv and exits `status`."""
-        stub = self.root / "mesh_runs_stub.py"
+        """A Codex worker's environment whose detached_runs.py stub records its argv and exits `status`."""
+        stub = self.root / "detached_runs_stub.py"
         _ = stub.write_text("import json, os, sys\n"
-                            + "with open(os.environ['TEST_MESH_RUNS_CALLS'], 'a', encoding='utf-8') as calls:\n"
+                            + "with open(os.environ['TEST_DETACHED_RUNS_CALLS'], 'a', encoding='utf-8') as calls:\n"
                             + "    calls.write(json.dumps(sys.argv[1:]) + '\\n')\n"
-                            + "raise SystemExit(int(os.environ['TEST_MESH_RUNS_STATUS']))\n")
-        return {**self.environment, "UNIT_DETACHED_RUN": "", "CODEX_THREAD_ID": "thread-worker", "VERIFY_MESH_RUNS_SCRIPT": str(stub),
-                "TEST_MESH_RUNS_CALLS": str(self.root / "mesh-runs-calls"), "TEST_MESH_RUNS_STATUS": str(status)}
+                            + "raise SystemExit(int(os.environ['TEST_DETACHED_RUNS_STATUS']))\n")
+        return {**self.environment, "UNIT_DETACHED_RUN": "", "CODEX_THREAD_ID": "thread-worker", "VERIFY_DETACHED_RUNS_SCRIPT": str(stub),
+                "TEST_DETACHED_RUNS_CALLS": str(self.root / "detached-runs-calls"), "TEST_DETACHED_RUNS_STATUS": str(status)}
 
-    def mesh_runs_calls(self) -> list[list[str]]:
-        path = self.root / "mesh-runs-calls"
+    def detached_runs_calls(self) -> list[list[str]]:
+        path = self.root / "detached-runs-calls"
         if not path.exists():
             return []
         return [cast(list[str], json.loads(line)) for line in path.read_text(encoding="utf-8").splitlines()]

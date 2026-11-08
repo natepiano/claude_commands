@@ -836,7 +836,7 @@ print(observed.row.id)
         self.assertEqual(unit_lookup.every_labeled_session(), unit_lookup.LabeledProductions({}))
 
     def test_a_detached_run_carrying_the_marks_does_not_double_the_units_pane(self) -> None:
-        # A worker build that mesh_runs supervises keeps the unit's marks and an old pane id.
+        # A worker build that detached_runs supervises keeps the unit's marks and an old pane id.
         self.hosts({"$1": labeled("agents", "w2:pS", "trunk"), "$2": labeled("runs", "w2:pE", "trunk", CODEX_THREAD_ID="")})
         self.claude("trunk", "w2:pS")
         found = unit_lookup.every_labeled_session()

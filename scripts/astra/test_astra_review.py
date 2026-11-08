@@ -12,10 +12,10 @@ from pathlib import Path
 from typing import cast, override
 from unittest.mock import patch
 
-from scripts.agents import codex_mesh_test_support as mesh_fixture
+from scripts.agents import codex_test_support as codex_fixture
 from scripts.astra import astra_review  # noqa: E402
 from scripts.astra import astra_roles, astra_work, design_roles  # noqa: E402
-from scripts.production.staff_test_support import StaffTestCase, fixture_runtime_id, fixture_worker, unit_membership
+from scripts.production.staff_test_support import StaffTestCase, fixture_runtime_id, fixture_worker, transcript_fixture, unit_membership
 from scripts.production import staff  # noqa: E402
 from scripts.production import test_worker as worker_tests
 from scripts.production.cli_fixture import invoke_cli
@@ -41,7 +41,7 @@ raise AssertionError(arguments)
 
 def setUpModule() -> None:
     install_signal_pid_guard()
-    mesh_fixture.setUpModule()
+    codex_fixture.setUpModule()
 
 
 class AstraReviewTests(StaffTestCase):
@@ -396,6 +396,29 @@ class AstraReviewTests(StaffTestCase):
         self.assertEqual(self.saved_prompt().with_name("review.md").read_text().strip(), self.fixture.agent.replies[-1])
         self.assertIn(self.fixture.agent.replies[-1], result.stdout)
         self.assertEqual(self.world.requests[-1][1][self.world.requests[-1][1].index("--sandbox") + 1], "read-only")
+
+    def test_showrunner_review_opens_a_worker_under_the_calling_showrunner(self) -> None:
+        record = staff.snapshot()
+        owner = record.parent_of(self.fixture.fixture.parent)
+        assert owner is not None
+        self.environment["CODEX_THREAD_ID"] = str(owner.current_session)
+        source, _ = transcript_fixture(owner, staff.CodexBackend(Path.home() / ".codex"))
+        with source.open("a") as output:
+            _ = output.write(json.dumps({"type": "turn_context", "payload": {
+                "model": "gpt-main", "effort": "high"}}) + "\n")
+        self.world.activate(str(owner.current_session), "w1:p0", "codex")
+        self.fixture.agent.without_done = False
+        published: list[staff.StaffRow] = []
+        def observe() -> None:
+            published.extend(staff.snapshot().find(kind="worker", parent=owner.id))
+        self.fixture.agent.during_prompt = observe
+        result = self.run_script(str(self.document))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        reviewer, = published
+        self.assertEqual(reviewer.parent, staff.ReportsTo(owner.id))
+        self.assertEqual(len(self.world.launches), 1)
+        self.assertEqual(self.router.commands[-1][self.router.commands[-1].index("--target") + 1], "staff-worker")
+        self.assertEqual(self.saved_prompt().with_name("review.md").read_text().strip(), self.fixture.agent.replies[-1])
 
 
 if __name__ == "__main__":

@@ -1,6 +1,8 @@
 """Private homes, clocks and app-server fixtures for worker tests."""
 from __future__ import annotations
 
+import argparse
+import subprocess
 import base64
 import contextlib
 import dataclasses
@@ -18,13 +20,14 @@ import unittest
 from collections.abc import Callable
 from concurrent.futures import Future
 from pathlib import Path
-from typing import cast, final
+from typing import override, cast, final
 from unittest.mock import patch
 
 from scripts.accounts import role_map
 from scripts.lib.test_hang_guard import LauncherHangGuard, TEST_HANG_GUARD_SECS
 from scripts.lib.signal_test_support import install_signal_pid_guard
 from scripts.lib.test_models_registry import write_registry
+from scripts.lib import models_registry
 from scripts.message import process_table
 from scripts.message.repeat_guard_test_support import install_guard_test_budget
 from scripts.production import staff, showrunners
@@ -32,7 +35,7 @@ from scripts.production.staff_test_support import fixture_runtime_id, fixture_se
 from scripts.whoami import agent_accounts
 
 REAL_HOME = Path(pwd.getpwuid(os.getuid()).pw_dir).resolve()
-THREAD_ID = fixture_runtime_id("codex-mesh-thread")
+THREAD_ID = fixture_runtime_id("codex-fixture-thread")
 
 def fixture_write_metadata(home: Path) -> dict[Path, tuple[int, int]]:
     """Observe the synthetic sign-in's three files, never account contents or live trees.
@@ -61,7 +64,7 @@ def assert_real_codex_unchanged() -> None:
     changed = sorted(str(path) for path in REAL_FIXTURE_METADATA.keys() | current.keys()
                      if REAL_FIXTURE_METADATA.get(path) != current.get(path))
     if changed:
-        raise AssertionError("codex_mesh tests changed real-home fixture targets:\n" + "\n".join(changed))
+        raise AssertionError("Codex tests changed real-home fixture targets:\n" + "\n".join(changed))
 
 
 def refuse_real_home(path: Path, source: str) -> None:
@@ -73,7 +76,7 @@ def assert_fixture_environment() -> None:
     for name in ("HOME", "CODEX_HOME", "AGENT_NOTES_DIR", "MODELS_CONFIG_FILE"):
         value = os.environ.get(name)
         if not value:
-            raise AssertionError(f"{name} is unset; codex_mesh fixture requires setUpModule")
+            raise AssertionError(f"{name} is unset; Codex fixture requires setUpModule")
         refuse_real_home(Path(value), name)
 
 
@@ -229,7 +232,7 @@ def select_fixture_workers(home: Path, *, notes: Path) -> None:
                          ("fixture note", notes / "codex9.md"), ("fixture account config", config)):
         refuse_real_home(path, source)
     default.mkdir(exist_ok=True)
-    login = "mesh-fixture@example.invalid"
+    login = "codex-fixture@example.invalid"
     claims = base64.urlsafe_b64encode(json.dumps({"email": login}).encode()).decode().rstrip("=")
     _ = auth.write_text(json.dumps({"tokens": {"id_token": f"header.{claims}.signature"}}))
     os.utime(auth, (1, 1))
@@ -253,7 +256,7 @@ def setUpModule() -> None:
 
     unittest.addModuleCleanup(restore_pane_environment)
     # No test sees a real sign-in; the synthetic selection predates every fake server.
-    home = tempfile.TemporaryDirectory(dir="/tmp", prefix="codex-mesh-home-")
+    home = tempfile.TemporaryDirectory(dir="/tmp", prefix="codex-fixture-home-")
     usage = tempfile.TemporaryDirectory()
     restore_usage = set_environment("USAGE_STATE_DIR", usage.name)
     restore_home = set_environment("HOME", home.name)
@@ -572,3 +575,52 @@ def notice(method: str, params: dict[str, object]) -> dict[str, object]:
 def test_object(value: object) -> dict[str, object]:
     return cast("dict[str, object]", value) if isinstance(value, dict) else {}
 
+
+
+class CodexFixtureCase(unittest.TestCase):
+    @override
+    def setUp(self) -> None:
+        super().setUp()
+        assert_fixture_environment()
+
+
+class FixtureModelDefaults:
+    """Reuse real resolution only for the module's unchanged baseline fixture.
+
+    Custom registries and injected subprocess failures always run the product
+    resolver. No second registry parser or model-selection rule lives here.
+    """
+
+    def __init__(self, resolve: Callable[[argparse.Namespace, models_registry.LaunchModelConfiguration], tuple[str, str]]) -> None:
+        self.resolve: Callable[[argparse.Namespace, models_registry.LaunchModelConfiguration], tuple[str, str]] = resolve
+        self.environment: dict[str, str] = self.resolver_environment()
+        self.files: dict[Path, tuple[int, bytes]] = {
+            Path(os.environ[key]): (Path(os.environ[key]).stat().st_mtime_ns, Path(os.environ[key]).read_bytes())
+            for key in ("MODELS_CONFIG_FILE", "CODEX_CONFIG_FILE", "CODEX_PACER_TIER_FILE",
+                        "CODEX_CATALOG_SYNC_STATE_FILE")
+        }
+        self.run: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run
+        self.defaults: dict[tuple[str, ...], tuple[str, str]] = {}
+
+    @staticmethod
+    def resolver_environment() -> dict[str, str]:
+        return {key: value for key, value in os.environ.items()
+                if (key.startswith(("AGENTS_", "MODELS_", "CODEX_")) or key in ("BASH_ENV", "ENV", "PATH", "SHELLOPTS", "BASHOPTS"))
+                and key not in ("CODEX_HOME",)}
+
+    def unchanged(self) -> bool:
+        if self.resolver_environment() != self.environment or subprocess.run is not self.run:
+            return False
+        return all(path.is_file() and (path.stat().st_mtime_ns, path.read_bytes()) == value
+                   for path, value in self.files.items())
+
+    def __call__(self, args: argparse.Namespace, configuration: models_registry.LaunchModelConfiguration) -> tuple[str, str]:
+        if getattr(args, "model", "") not in ("", "gpt-test") or not self.unchanged():
+            return self.resolve(args, configuration)
+        key = tuple(str(getattr(args, name, "")) for name in ("role", "task", "model", "effort"))
+        if key not in self.defaults:
+            value = self.resolve(args, configuration)
+            if self.unchanged():
+                self.defaults[key] = value
+            return value
+        return self.defaults[key]

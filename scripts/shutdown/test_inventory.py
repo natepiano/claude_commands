@@ -19,7 +19,7 @@ from unittest.mock import patch
 
 from scripts.lib.socket_test_support import short_socket_directory
 from scripts.production.staff_test_support import fixture_member, unit_membership, recorded_showrunner, StaffTestCase, fixture_worker
-from scripts.production import staff
+from scripts.production import staff, worker_admission
 from scripts.lib import unit_runs as owned_runs
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.resume_message import ClaudeChildResume, Resumable, Idle, Unavailable
@@ -1450,12 +1450,15 @@ class WorkerResumeTests(StaffTestCase):
 
 
 
-    def test_newer_parent_run_without_the_worker_keeps_the_older_live_entry(self) -> None:
+    def test_newer_native_switch_record_keeps_the_saved_claude_launcher_entry(self) -> None:
         owner = self.owner
         child = fixture_worker("working", owner.id)
         self.assigned(child)
         older = self.child_run("older", {child.name: {"staff_id": child.id, "status": "running"}})
         newer = self.child_run("newer", {})
+        allowed = worker_admission.WorkerStartAllowed(
+            child.name, owner.id, newer, worker_admission.ExistingWorkerSlot(child))
+        worker_admission.record_dispatch(allowed, "native-assignment", worker_admission.SwitchState.ASSIGNMENT_ACCEPTED)
         owned_runs.activate(newer, owner.current_session)
         os.utime(older, (1, 1))
         os.utime(newer, (2, 2))

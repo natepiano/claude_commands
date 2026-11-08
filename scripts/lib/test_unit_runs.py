@@ -65,122 +65,12 @@ class UnitRunsTest(StaffTestCase):
             f"anomaly: {second}: this run has no owner because {unit_runs.STATE_FILE} names no staff row",
             f"anomaly: {first}: run owner gone: unit staff row is unavailable"])
 
-    def test_parent_transport_reads_the_first_held_pin_without_writing(self) -> None:
-        runs, config = self.root / "runs", self.root / "config"
-        config.mkdir()
-        session = fixture_runtime_id("transport-parent")
-        first, second = runs / "a-first", runs / "b-second"
-        first.mkdir(parents=True)
-        second.mkdir()
-        self.staff_owner(first, session)
-        self.staff_owner(second, session)
-        runner = fixture_member("showrunner", name="roster-parent")
-        roster_run = runs / "c-roster"
-        roster_run.mkdir()
-        write_text_atomic(roster_run / unit_runs.STATE_FILE, json.dumps({unit_runs.OWNER_FIELD: runner.id}))
-        with (patch.object(unit_runs, "RUN_ROOT", runs),
-              patch.object(unit_runs, "FORMER_RUN_ROOT", self.root / "former"),
-              patch.dict(os.environ, {"CONF_DIR": str(config), "ROSTER_RUN_ROOT": str(runs)})):
-            for transport in ("herdr", "mesh"):
-                write_text_atomic(config / "direct.conf", f"# one of: mesh, herdr\nWORKER_TRANSPORT={transport}\n")
-                before = sorted(path.relative_to(runs) for path in runs.rglob("*"))
-                self.assertEqual(unit_runs.parent_transport(session), transport)
-                self.assertEqual(unit_runs.parent_transport(runner.current_session), transport)
-                self.assertEqual(unit_runs.parent_transport(fixture_runtime_id("no-held-run")), transport)
-                self.assertEqual(sorted(path.relative_to(runs) for path in runs.rglob("*")), before)
-            write_text_atomic(first / "worker_transport", "herdr\n")
-            write_text_atomic(second / "worker_transport", "mesh\n")
-            before_pin = (first / "worker_transport").read_bytes(), (first / "worker_transport").stat().st_mtime_ns
-            self.assertEqual(unit_runs.parent_transport(session), "herdr")
-            self.assertEqual(((first / "worker_transport").read_bytes(),
-                              (first / "worker_transport").stat().st_mtime_ns), before_pin)
-            unit_runs.activate(second, session)
-            self.assertEqual(unit_runs.parent_transport(session), "mesh")
-            (second / "worker_transport").unlink()
-            self.assertEqual(unit_runs.parent_transport(session), "mesh")
-            self.assertFalse((second / "worker_transport").exists())
-            record = staff.snapshot()
-            with patch.object(staff, "local_snapshot", wraps=staff.local_snapshot) as reads:
-                self.assertEqual(unit_runs.parent_transport(session, record=record), "mesh")
-            self.assertEqual(reads.call_count, 0)
 
 
-    def test_run_pin_reads_absent_valid_and_invalid_values_without_writing(self) -> None:
-        run = self.root / "read-pin"
-        run.mkdir()
-        pin = run / "worker_transport"
-        self.assertIs(unit_runs.run_pin(run), unit_runs.NoRunPin.ABSENT)
-        self.assertEqual(list(run.iterdir()), [])
-        for selected in ("mesh", "herdr"):
-            with self.subTest(selected=selected):
-                write_text_atomic(pin, selected + "\n")
-                before = pin.stat().st_mtime_ns
-                self.assertEqual(unit_runs.run_pin(run), selected)
-                self.assertEqual(pin.read_text(), selected + "\n")
-                self.assertEqual(pin.stat().st_mtime_ns, before)
-        write_text_atomic(pin, "junk\n")
-        with self.assertRaisesRegex(ValueError, "invalid worker transport: junk") as error:
-            _ = unit_runs.run_pin(run)
-        self.assertIn(str(pin), str(error.exception))
-        self.assertEqual(pin.read_text(), "junk\n")
 
-    def test_run_transport_remains_pinned_after_configuration_changes(self) -> None:
-        with tempfile.TemporaryDirectory() as folder:
-            root = Path(folder)
-            config = root / "config"
-            config.mkdir()
-            run = root / "first"
-            run.mkdir()
-            write_text_atomic(run / "worker_transport", "mesh\n")
-            with patch.dict(os.environ, {"CONF_DIR": str(config)}):
-                write_text_atomic(config / "direct.conf", "# one of: mesh, herdr\nWORKER_TRANSPORT=mesh\n")
-                self.assertEqual(unit_runs.worker_transport(run), "mesh")
-                pin = run / "worker_transport"
-                unchanged = pin.stat().st_mtime_ns
-                write_text_atomic(config / "direct.conf", "# one of: mesh, herdr\nWORKER_TRANSPORT=herdr\n")
-                self.assertEqual(unit_runs.worker_transport(run), "mesh")
-                self.assertEqual(pin.read_text(), "mesh\n")
-                self.assertEqual(pin.stat().st_mtime_ns, unchanged)
-                self.assertEqual(unit_runs.worker_transport(root / "second"), "herdr")
-                second_pin = root / "second/worker_transport"
-                self.assertEqual(second_pin.read_text(), "herdr\n")
-                second_before = second_pin.read_bytes(), second_pin.stat().st_mtime_ns
-                self.assertEqual(unit_runs.worker_transport(root / "second"), "herdr")
-                self.assertEqual((second_pin.read_bytes(), second_pin.stat().st_mtime_ns), second_before)
 
-    def test_new_mesh_run_exits_two_with_one_error_line_and_no_pin(self) -> None:
-        config = self.root / "config"
-        config.mkdir()
-        write_text_atomic(config / "direct.conf", "# one of: mesh, herdr\nWORKER_TRANSPORT=mesh\n")
-        run = self.root / "new-mesh"
-        with (patch.dict(os.environ, {"CONF_DIR": str(config)}),
-              contextlib.redirect_stdout(io.StringIO()) as output,
-              contextlib.redirect_stderr(io.StringIO()) as errors):
-            with self.assertRaises(SystemExit) as failure:
-                _ = unit_runs.main(["worker-transport", str(run)])
-        self.assertEqual(failure.exception.code, 2)
-        self.assertEqual(output.getvalue(), "")
-        self.assertEqual(len(errors.getvalue().splitlines()), 1)
-        self.assertIn("mesh", errors.getvalue())
-        self.assertFalse((run / "worker_transport").exists())
 
-    def test_unreadable_transport_configuration_does_not_replace_a_saved_pin(self) -> None:
-        with tempfile.TemporaryDirectory() as folder:
-            root = Path(folder)
-            run = root / "run"
-            run.mkdir()
-            write_text_atomic(run / "worker_transport", "herdr\n")
-            with patch.dict(os.environ, {"CONF_DIR": str(root / "missing")}):
-                self.assertEqual(unit_runs.worker_transport(run), "herdr")
-            self.assertEqual((run / "worker_transport").read_text(), "herdr\n")
 
-    def test_invalid_saved_transport_stays_unchanged(self) -> None:
-        with tempfile.TemporaryDirectory() as folder:
-            run = Path(folder)
-            write_text_atomic(run / "worker_transport", "unknown\n")
-            with self.assertRaisesRegex(ValueError, "invalid worker transport"):
-                _ = unit_runs.worker_transport(run)
-            self.assertEqual((run / "worker_transport").read_text(), "unknown\n")
 
     def staff_owner(self, run: Path, session_id: str) -> None:
         parent = showrunner_relationship("runs-fixture")
@@ -229,7 +119,6 @@ class UnitRunsTest(StaffTestCase):
         phase.mkdir(parents=True)
         self.staff_owner(run, session)
         _ = (phase / "fixture-impl_status").write_text("idle\n")
-        _ = (run / "worker_transport").write_text("herdr\n")
         self.assertEqual(unit_runs.held(session, runs, active), [str(run)])
 
     def test_director_reports_a_missing_owner_for_active_pane_workers(self) -> None:

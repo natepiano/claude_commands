@@ -454,7 +454,7 @@ def main(argv: list[str] | None = None) -> int:
 
 SCRIPTS = Path(__file__).resolve().parent.parent
 
-DETACHED_RUNS = "mesh_runs"
+DETACHED_RUNS = "detached_runs"
 
 BUILD_HOLD = SCRIPTS / "build_hold" / "build_hold.py"
 

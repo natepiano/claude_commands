@@ -32,15 +32,15 @@ from pathlib import Path
 from types import FrameType
 from typing import Literal, NotRequired, TypedDict, cast
 
-from scripts.agents import mesh_run_process, worker_lifecycle
+from scripts.agents import detached_run_process, worker_lifecycle
 from scripts.buildlog import treekey
 from scripts.lib import conf, unit_runs
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.message import send_budget
 from scripts.production import staff, worker_admission
 
-# Exit status of `start` when the caller is not a mesh worker: run the command attached.
-NOT_A_MESH_WORKER = 3
+# Exit status of `start` when the caller is not a registered worker: run the command attached.
+NOT_A_DETACHED_WORKER = 3
 # A worker at its live-run limit must keep its command pending, never run it attached.
 LIVE_RUN_LIMIT_REACHED = 4
 # Lines of the log the result message carries.
@@ -92,7 +92,7 @@ class RunRecord(TypedDict):
 
 
 @dataclass(frozen=True)
-class NotMeshWorker:
+class NotDetachedWorker:
     """The caller is not a registered worker, so its command runs attached."""
 
 
@@ -105,7 +105,7 @@ class PaneCaller:
     staff_id: staff.StaffId
 
 
-Caller = PaneCaller | NotMeshWorker
+Caller = PaneCaller | NotDetachedWorker
 
 
 def caller_from_environment(environment: dict[str, str]) -> Caller:
@@ -121,7 +121,7 @@ def caller_from_environment(environment: dict[str, str]) -> Caller:
         parent = membership.parent_of(member)
         if parent is not None:
             return PaneCaller(str(worker_panes.worker_run(member, record=membership)), member.name, member.id)
-    return NotMeshWorker()
+    return NotDetachedWorker()
 
 
 def _worker_reference(session_dir: str, name: str) -> str:
@@ -154,7 +154,7 @@ def _write_record(path: Path, record: RunRecord) -> None:
 def _read_record(path: Path) -> RunRecord:
     raw = worker_lifecycle.read_json_object(path)
     if not raw.get("run_id") or not isinstance(raw.get("command"), list):
-        raise SystemExit(f"mesh_runs: {path} is not a run record")
+        raise SystemExit(f"detached_runs: {path} is not a run record")
     return cast(RunRecord, cast(object, raw))
 
 
@@ -192,7 +192,7 @@ def _orphaned(path: Path, raw: dict[str, object], now: float) -> bool:
         return False
     pid = _integer(raw.get("pid"))
     if pid > 0:
-        return not mesh_run_process.supervises(pid, path)
+        return not detached_run_process.supervises(pid, path)
     started = _number(raw.get("started_at"), now)
     return now - started >= DETACHED_RUN_START_GRACE_SECS
 
@@ -239,7 +239,7 @@ def _reap_orphans_locked(runs: Path, worker: str = "") -> list[str]:
                 delivery = ("nothing delivered: the supervisor is gone and a newer run of the same command answers"
                             if newer else deliver(record, command_result(record)))
             except RunDeliveryFailed as error:
-                print(f"mesh_runs: {record['run_id']}: {error}", file=sys.stderr)
+                print(f"detached_runs: {record['run_id']}: {error}", file=sys.stderr)
                 continue
             record = _read_record(path)
             record.update({
@@ -263,7 +263,7 @@ def live_twin(runs: Path, worker: str, command: list[str], tree_key: str) -> Run
         raw = worker_lifecycle.read_json_object(path)
         if (raw.get("status") == "running" and raw.get("worker") == worker and raw.get("command") == command
                 and raw.get("tree_key") == tree_key
-                and mesh_run_process.supervises(_integer(raw.get("pid")), path)):
+                and detached_run_process.supervises(_integer(raw.get("pid")), path)):
             return cast(RunRecord, cast(object, raw))
     return None
 
@@ -286,12 +286,12 @@ def delivered_worker_results(runs: Path, worker: str, *, since: float) -> set[st
 
 
 def live_runs(runs: Path, worker: str) -> list[RunRecord]:
-    """Return this worker's running records whose supervisors still own them."""
+    """Return running records whose supervisor still owns the record."""
     found: list[RunRecord] = []
     for path in sorted(runs.glob("*.json")):
         raw = worker_lifecycle.read_json_object(path)
         if (raw.get("status") == "running" and raw.get("worker") == worker
-                and mesh_run_process.supervises(_integer(raw.get("pid")), path)):
+                and detached_run_process.supervises(_integer(raw.get("pid")), path)):
             found.append(cast(RunRecord, cast(object, raw)))
     return found
 
@@ -301,18 +301,18 @@ def command_start(args: argparse.Namespace) -> int:
     if command and command[0] == "--":
         command = command[1:]
     if not command:
-        print("mesh_runs: start needs a command after --", file=sys.stderr)
+        print("detached_runs: start needs a command after --", file=sys.stderr)
         return 2
     session_dir = str(getattr(args, "session_dir", "") or "")
     name = str(getattr(args, "to", "") or "")
     if bool(session_dir) != bool(name):
-        print("mesh_runs: --session-dir and --to go together", file=sys.stderr)
+        print("detached_runs: --session-dir and --to go together", file=sys.stderr)
         return 2
     reference = ""
     if not session_dir:
         caller = caller_from_environment(dict(os.environ))
-        if isinstance(caller, NotMeshWorker):
-            return NOT_A_MESH_WORKER
+        if isinstance(caller, NotDetachedWorker):
+            return NOT_A_DETACHED_WORKER
         session_dir, name = caller.session_dir, caller.name
         reference = caller.staff_id
     else:
@@ -333,14 +333,14 @@ def command_start(args: argparse.Namespace) -> int:
                   + f"log {twin['log']}); started nothing; its result arrives as your next message")
             return 0
         try:
-            limit = conf.read("mesh_runs").whole("LIVE_RUN_LIMIT")
+            limit = conf.read("detached_runs").whole("LIVE_RUN_LIMIT")
         except conf.Unusable as error:
-            print(f"mesh_runs: {error}", file=sys.stderr)
+            print(f"detached_runs: {error}", file=sys.stderr)
             return 2
         active = live_runs(runs, name)
         if len(active) >= limit:
             details = "\n".join(f"  {run['run_id']}: {run['label']}" for run in active)
-            print(f"mesh_runs: live-run limit {limit} reached for {name}; started nothing.\n"
+            print(f"detached_runs: live-run limit {limit} reached for {name}; started nothing.\n"
                   + f"Live runs:\n{details}\n"
                   + "Wait for a run's result; it arrives as your next message. "
                   + "Or put more files in one run.", file=sys.stderr)
@@ -373,7 +373,7 @@ def _exit_status(returncode: int) -> int:
 
 
 def _cut_line(line: str) -> str:
-    limit = conf.read("mesh_runs").whole("RESULT_LINE_CHARS")
+    limit = conf.read("detached_runs").whole("RESULT_LINE_CHARS")
     if len(line) <= limit:
         return line
     return f"{line[:limit]} [cut: {len(line) - limit} more characters]"
@@ -443,7 +443,7 @@ def result_text(record: RunRecord, result: CommandResult) -> str:
         if cancellation:
             lines.extend(["", cancellation])
     header = "\n".join(lines)
-    limits = conf.read("mesh_runs")
+    limits = conf.read("detached_runs")
     tail_heading = f"\n\nLast log lines (lines over {limits.whole('RESULT_LINE_CHARS')} characters are cut):\n"
     tail = _tail(Path(record["log"]), RESULT_TAIL_LINES,
                  limits.whole("RESULT_TEXT_CHARS") - len(header) - len(tail_heading))
@@ -502,7 +502,7 @@ def deliver(record: RunRecord, result: CommandResult) -> str:
             reason = f"worker transcript is unavailable: {error}"
         timeout = send_budget.seconds()
         delivery = send.deliver_worker_text(member, membership, marker + "\n" + text,
-                                          sender="mesh-runs", timeout=timeout, reason=reason)
+                                          sender="detached-runs", timeout=timeout, reason=reason)
         if delivery.outcome in ("failed", "refused"):
             raise RunDeliveryFailed(f"{delivery.outcome}: {delivery.detail}")
         return f"{delivery.outcome}: {delivery.detail}"
@@ -526,7 +526,7 @@ def _run(command: list[str], environment: dict[str, str], log: Path) -> int:
                                      stdin=subprocess.DEVNULL, stdout=output, stderr=subprocess.STDOUT)
     except OSError as exc:
         with log.open("a", encoding="utf-8") as output:
-            _ = output.write(f"mesh_runs: command did not start: {exc}\n")
+            _ = output.write(f"detached_runs: command did not start: {exc}\n")
         return 127
 
     def forward(signum: int, _frame: FrameType | None) -> None:
@@ -566,7 +566,7 @@ def command_supervise(args: argparse.Namespace) -> int:
     try:
         delivery = deliver(record, CompletedCommand(exit_code))
     except RunDeliveryFailed as error:
-        print(f"mesh_runs: {record['run_id']}: {error}", file=sys.stderr)
+        print(f"detached_runs: {record['run_id']}: {error}", file=sys.stderr)
         return 1
     record = _read_record(record_path)
     record.update({

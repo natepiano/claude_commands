@@ -974,7 +974,7 @@ class OwnerTests(TmpSweepCase):
         marked = write(self.unit / "marked" / "board.log").parent
         idle = write(self.delegate / "idle" / "board.log").parent
         _ = write(self.unit / "active" / LIVE_SESSION, f"{marked}\n")
-        _ = write(self.unit / "active" / "mesh_roster.json.lock", "")
+        _ = write(self.unit / "active" / "progress_history_state.json.lock", "")
         result = self.sweep()
         self.assertTrue(marked.is_dir())
         self.assertEqual(result.kept[tmp_sweep.RunKeepReason.ACTIVE_MARKER.value], [str(marked)])
@@ -1028,11 +1028,11 @@ class OwnerTests(TmpSweepCase):
                          sorted(str(run) for run in runs))
         for run in runs:
             self.assertTrue((run / "board.log").is_file())
-            self.assertIn(mock.call(run / "mesh_roster.json"), reads.call_args_list)
+            self.assertIn(mock.call(run / "progress_history_state.json"), reads.call_args_list)
         for file in files:
             self.assertFalse(file.exists())
             self.assertIn(str(file), [entry["path"] for entry in result.deleted])
-            self.assertNotIn(mock.call(file / "mesh_roster.json"), reads.call_args_list)
+            self.assertNotIn(mock.call(file / "progress_history_state.json"), reads.call_args_list)
         self.assertFalse(any("Not a directory" in reason for reason in result.kept))
 
     def test_a_run_folder_whose_history_opens_with_a_live_session_stays(self) -> None:
@@ -1409,7 +1409,7 @@ class WorkerAndGitTests(TmpSweepCase):
                     self.pane_world.remove_leaf("w1:p2")
                     write_text_atomic(self.unit / "active" / LIVE_SESSION, str(run))
                 for exit_code in (0, 1, 143):
-                    write_text_atomic(run / "mesh_runs" / f"finished-{exit_code}.json", json.dumps({
+                    write_text_atomic(run / "detached_runs" / f"finished-{exit_code}.json", json.dumps({
                         "cwd": str(folder / "repo"), "status": "finished", "exit_code": exit_code,
                     }))
                 result = self.sweep()
@@ -1501,7 +1501,7 @@ with copies.standing("verify-unit", source, copies.WorktreeSource("HEAD", source
         write_text_atomic(run / unit_runs.STATE_FILE, json.dumps({unit_runs.OWNER_FIELD: unit.id}))
         self.pane_world.add(unit, "w1:p1")
         self.pane_world.add(worker, "w1:p2", family="codex", live=status != "ended")
-        _ = write(run / "mesh_runs" / "run.json", json.dumps({"cwd": str(cwd), "status": run_status}))
+        _ = write(run / "detached_runs" / "run.json", json.dumps({"cwd": str(cwd), "status": run_status}))
         return run
 
     def test_dirty_clone_without_worker_stays_and_plan_names_unsaved_work(self) -> None:
@@ -1601,47 +1601,47 @@ with copies.standing("verify-unit", source, copies.WorktreeSource("HEAD", source
         self.assertTrue(folder.exists())
         self.assertIn(str(folder), tmp_sweep.record(result, False, self.now)["kept_paths"][tmp_sweep.WORKER_USES])
         self.pane_world.foreground.clear()
-        write_text_atomic(run / "mesh_runs" / "run.json", json.dumps({"status": "finished"}))
+        write_text_atomic(run / "detached_runs" / "run.json", json.dumps({"status": "finished"}))
         _ = self.sweep()
         self.assertFalse(folder.exists())
 
 
-    def test_a_running_mesh_record_keeps_a_folder_among_finished_records(self) -> None:
+    def test_a_running_detached_record_keeps_a_folder_among_finished_records(self) -> None:
         self.now = time.time() + 8 * DAY
         folder = write(self.tmp / "scratch" / "running-worker" / "repo" / "file").parents[1]
         run = self.live_worker(folder / "repo")
         for exit_code in (0, 1):
-            _ = write(run / "mesh_runs" / f"finished-{exit_code}.json", json.dumps({
+            _ = write(run / "detached_runs" / f"finished-{exit_code}.json", json.dumps({
                 "cwd": str(folder / "repo"), "status": "finished", "exit_code": exit_code,
             }))
         result = self.sweep()
         self.assertTrue(folder.exists())
         self.assertIn(str(folder), result.kept[tmp_sweep.WORKER_USES])
-        _ = write(run / "mesh_runs" / "run.json", json.dumps({
+        _ = write(run / "detached_runs" / "run.json", json.dumps({
             "cwd": str(folder / "repo"), "status": "finished", "exit_code": 0,
         }))
         result = self.sweep()
         self.assertFalse(folder.exists())
         self.assertIn(str(folder), [entry["path"] for entry in result.deleted])
 
-    def test_active_run_mesh_record_keeps_its_working_folder_under_any_root(self) -> None:
+    def test_active_run_detached_record_keeps_its_working_folder_under_any_root(self) -> None:
         folder = write(self.tmp / "copy" / "repo" / "file").parents[1]
         run = self.unit / "marked-run"
-        _ = write(run / "mesh_runs" / "run.json", json.dumps({"cwd": str(folder / "repo"), "status": "running"}))
+        _ = write(run / "detached_runs" / "run.json", json.dumps({"cwd": str(folder / "repo"), "status": "running"}))
         _ = write(self.unit / "active" / LIVE_SESSION, str(run))
         result = self.sweep()
         self.assertTrue(folder.exists())
         self.assertIn(str(folder), result.kept[tmp_sweep.WORKER_USES])
 
-    def test_empty_pending_and_mesh_run_files_do_not_keep_an_idle_pushed_clone(self) -> None:
-        for kind in ("pending", "mesh", "both"):
+    def test_empty_pending_and_detached_run_files_do_not_keep_an_idle_pushed_clone(self) -> None:
+        for kind in ("pending", "detached", "both"):
             with self.subTest(kind=kind):
                 repo = self.clone(f"empty-{kind}")
                 run = self.live_worker(self.tmp.parent / "outside")
                 if kind in ("pending", "both"):
                     _ = write(run / "impl.pending.json", "")
-                if kind in ("mesh", "both"):
-                    _ = write(run / "mesh_runs" / "empty.json", "")
+                if kind in ("detached", "both"):
+                    _ = write(run / "detached_runs" / "empty.json", "")
                 errors = io.StringIO()
                 with redirect_stderr(errors):
                     result = self.sweep()
@@ -1654,7 +1654,7 @@ with copies.standing("verify-unit", source, copies.WorktreeSource("HEAD", source
         other = write(self.tmp / "unknown-copy" / "file").parent
         run = self.live_worker(self.tmp.parent / "unknown")
         temp = write(self.tmp / "session" / WORKER_SESSION / "tmpabcdefgh" / "file").parent
-        broken = write(run / "mesh_runs" / "bad.json", "{")
+        broken = write(run / "detached_runs" / "bad.json", "{")
         errors = io.StringIO()
         with redirect_stderr(errors):
             result = self.sweep()
@@ -1669,21 +1669,21 @@ with copies.standing("verify-unit", source, copies.WorktreeSource("HEAD", source
     def test_known_worker_folder_keeps_its_reason_when_another_record_is_unreadable(self) -> None:
         folder = write(self.tmp / "scratch" / "known" / "file").parent
         run = self.live_worker(folder)
-        _ = write(run / "mesh_runs" / "bad.json", "{")
+        _ = write(run / "detached_runs" / "bad.json", "{")
         with redirect_stderr(io.StringIO()):
             result = self.sweep()
         self.assertTrue(folder.exists())
         self.assertIn(str(folder), result.kept[tmp_sweep.WORKER_USES])
 
-    def test_only_mesh_run_cwd_keeps_a_working_folder(self) -> None:
+    def test_only_detached_run_cwd_keeps_a_working_folder(self) -> None:
         self.now = time.time() + 8 * DAY
         folder = write(self.tmp / "scratch" / "listed" / "file").parent
         unrelated = write(self.tmp / "unrelated" / "file").parent
         run = self.live_worker(folder)
         _ = write(run / "evidence.json", json.dumps(["pass", {"cwd": str(unrelated)}]))
         _ = write(run / "impl.pending.json", json.dumps({"working_dir": str(unrelated)}))
-        _ = write(run / "mesh_runs" / "results.json", json.dumps(["pass", {"cwd": str(unrelated)}]))
-        _ = write(run / "mesh_runs" / "run.json", json.dumps({
+        _ = write(run / "detached_runs" / "results.json", json.dumps(["pass", {"cwd": str(unrelated)}]))
+        _ = write(run / "detached_runs" / "run.json", json.dumps({
             "cwd": str(folder), "status": "running", "metadata": {"cwd": str(unrelated)},
         }))
         result = self.sweep()
@@ -1702,7 +1702,7 @@ with copies.standing("verify-unit", source, copies.WorktreeSource("HEAD", source
         self.assertFalse(old.exists())
         self.assertTrue(fresh.exists())
         self.pane_world.foreground.clear()
-        write_text_atomic(run / "mesh_runs" / "run.json", json.dumps({"status": "finished"}))
+        write_text_atomic(run / "detached_runs" / "run.json", json.dumps({"status": "finished"}))
         os.utime(fresh, (0, 0))
         _ = self.sweep()
         self.assertFalse(parent.exists())
@@ -1745,9 +1745,9 @@ class RunningSessionTests(unittest.TestCase):
 
 class PaneRunTests(TmpSweepCase):
     def test_live_director_keeps_its_run_without_an_extra_staff_read(self) -> None:
-        parent = fixture_member("unit", name="mesh-unit", parent=fixture_member("showrunner", name="runner").id,
+        parent = fixture_member("unit", name="native-unit", parent=fixture_member("showrunner", name="runner").id,
                                 runtime_id=LIVE_SESSION)
-        payload = write(self.unit / "mesh-run" / "payload")
+        payload = write(self.unit / "native-run" / "payload")
         write_text_atomic(payload.parent / unit_runs.STATE_FILE, json.dumps({unit_runs.OWNER_FIELD: parent.id}))
         with mock.patch.object(staff, "snapshot", wraps=staff.snapshot) as snapshot, mock.patch.object(
                 staff, "local_snapshot", side_effect=AssertionError("extra local staff read")):
@@ -1775,7 +1775,6 @@ class PaneRunTests(TmpSweepCase):
         for state, keep in cases:
             payload = write(run / "payload")
             write_text_atomic(run / unit_runs.STATE_FILE, json.dumps({unit_runs.OWNER_FIELD: parent.id}))
-            write_text_atomic(run / "worker_transport", "herdr\n")
             error = io.StringIO()
             with self.subTest(state=state), mock.patch.object(unit_runs, "held", return_value=[str(run)]), mock.patch.object(
                     worker_panes, "observe_parents", return_value={parent.id: [state]}), mock.patch.object(
@@ -1794,7 +1793,6 @@ class PaneRunTests(TmpSweepCase):
         run = self.unit / "pane-run"
         write_text_atomic(run / "payload", "payload")
         write_text_atomic(run / unit_runs.STATE_FILE, json.dumps({unit_runs.OWNER_FIELD: parent.id}))
-        write_text_atomic(run / "worker_transport", "herdr\n")
         state = worker_panes.ProcessUnknownWorker(worker, "p1", "t1", "process unreadable")
         with mock.patch.object(unit_runs, "held", return_value=[str(run)]), mock.patch.object(
                 worker_panes, "observe_parents", return_value={parent.id: [state]}):
@@ -1807,7 +1805,6 @@ class PaneRunTests(TmpSweepCase):
         payload = write(self.unit / "missing-member" / "payload")
         missing = fixture_runtime_id("absent-sweep-parent")
         write_text_atomic(payload.parent / unit_runs.STATE_FILE, json.dumps({unit_runs.OWNER_FIELD: missing}))
-        write_text_atomic(payload.parent / "worker_transport", "herdr\n")
         error = io.StringIO()
         with redirect_stderr(error):
             result = self.sweep()

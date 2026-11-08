@@ -17,7 +17,6 @@ from contextlib import AbstractContextManager, ExitStack, contextmanager
 from types import SimpleNamespace
 
 
-from scripts.direct import workers
 from scripts.production import staff, unit_config, fake_unit_host
 from scripts.production.staff_test_support import fixture_member, fixture_runtime_id, StaffTestCase, isolated_source_readers
 from scripts.lib.atomic_file import write_text_atomic
@@ -391,7 +390,10 @@ def run_rename(arguments: list[str], environment: dict[str, str], cwd: Path,
         if seconds != 2:
             raise AssertionError(f"unexpected rename wait: {seconds}")
 
-    with ExitStack() as scope:
+    # Restore file operations after each failure injection.
+    with (ExitStack() as scope,
+          mock.patch.object(os, "rename", os.rename),
+          mock.patch.object(os, "replace", os.replace)):
         for module, fields in (
             (showrunners, {"CONFIG": Path(environment["SHOWRUNNERS_CONFIG"]),
                            "NOTIFIER_STATE_DIR": Path(environment["NOTIFIER_STATE_DIR"]),
@@ -403,12 +405,6 @@ def run_rename(arguments: list[str], environment: dict[str, str], cwd: Path,
                 _ = scope.enter_context(mock.patch.object(module, name, value))
         _ = scope.enter_context(mock.patch.object(subprocess, "run", side_effect=run))
         _ = scope.enter_context(mock.patch.object(unit_move, "time", SimpleNamespace(sleep=trust_readback, monotonic=time.monotonic)))
-        # Failure injection scripts assign these names just as they do in a CLI
-        # subprocess. Each call restores them before another test can observe it.
-        for module, names in ((os, ("rename", "replace")),
-                              (workers, ("end_unit",))):
-            for name in names:
-                _ = scope.enter_context(mock.patch.object(module, name, cast(object, getattr(module, name))))
 
         def main() -> int:
             if wrapper:

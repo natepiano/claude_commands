@@ -305,7 +305,7 @@ class FamilyHandoffTests(StaffTestCase):
         worker_admission.record_dispatch(allowed, "old-request", worker_admission.SwitchState.DISPATCH_IN_FLIGHT)
         original = worker_lifecycle.acquire_flock
         saved: list[bytes] = []
-        path = allowed.run / "mesh_roster.json"
+        path = worker_admission.switch_record_path(allowed.run, allowed.name)
 
         def supersede(handle: int | worker_lifecycle.LockFileDescriptor, *, mode: int = fcntl.LOCK_EX,
                       deadline: float = worker_lifecycle.NO_LOCK_DEADLINE) -> None:
@@ -327,13 +327,13 @@ class FamilyHandoffTests(StaffTestCase):
         self.assertEqual(worker_admission.dispatch_record(allowed.run, allowed.name), worker_admission.DispatchRecord(
             "new-request", worker_admission.SwitchState.ASSIGNMENT_ACCEPTED))
 
-    def test_pending_dispatch_accepts_an_unset_state_and_reports_an_unreadable_roster(self) -> None:
+    def test_pending_dispatch_accepts_an_unset_state_and_reports_an_unreadable_record(self) -> None:
         allowed = self.source("claude")[0]
         prompt = allowed.run / "assignment.txt"
         write_text_atomic(prompt, "Complete this assignment.\n")
         worker_admission.record_dispatch(allowed, worker_admission.assignment_id(prompt), worker_admission.SwitchState.NO_RECORD)
         self.assertTrue(worker_admission.dispatch_pending(allowed.run, allowed.name, prompt))
-        path = allowed.run / "mesh_roster.json"
+        path = worker_admission.switch_record_path(allowed.run, allowed.name)
         write_text_atomic(path, "{torn")
         with redirect_stderr(io.StringIO()) as errors:
             pending = worker_admission.dispatch_pending(allowed.run, allowed.name, prompt)
@@ -344,7 +344,7 @@ class FamilyHandoffTests(StaffTestCase):
 
     def test_unknown_dispatch_state_reports_an_anomaly_and_allows_admission(self) -> None:
         allowed = self.source("claude")[0]
-        write_text_atomic(allowed.run / "mesh_roster.json", json.dumps({allowed.name: {"dispatch_state": "invalid"}}))
+        write_text_atomic(worker_admission.switch_record_path(allowed.run, allowed.name), json.dumps({"dispatch_state": "invalid"}))
         before = self.staff_state()
         with redirect_stderr(io.StringIO()) as errors:
             record = worker_admission.dispatch_record(allowed.run, allowed.name)
@@ -715,7 +715,7 @@ class ClaudeChildAdmissionTests(StaffTestCase):
         write_text_atomic(prompt, 'Complete the retry assignment.')
         source = transcript_fixture(row, staff.ClaudeBackend())[0]
         write_text_atomic(worker_admission.handoff_path(run, row), f'{worker_admission.HANDOFF_SOURCE_PREFIX}{source}\n')
-        write_text_atomic(run / 'mesh_roster.json', json.dumps({row.name: {'staff_id': row.id, 'assignment_id': worker_admission.assignment_id(prompt), 'dispatch_state': 'invalid'}}))
+        write_text_atomic(worker_admission.switch_record_path(run, row.name), json.dumps({'staff_id': row.id, 'assignment_id': worker_admission.assignment_id(prompt), 'dispatch_state': 'invalid'}))
         with redirect_stderr(io.StringIO()) as errors:
             result = claude_worker.open_worker(self.turn(row, run, prompt))
         self.assertIsInstance(result, claude_worker.Delivered)

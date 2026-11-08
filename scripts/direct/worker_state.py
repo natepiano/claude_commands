@@ -12,14 +12,19 @@ import sys
 from collections.abc import Generator
 from contextlib import contextmanager
 from dataclasses import dataclass
+from importlib import import_module
 from pathlib import Path
-from typing import TextIO, cast
+from typing import Protocol, TextIO, cast
 
 from scripts.agents import worker_lifecycle
 from scripts.lib import process_start
+from scripts.production import staff
 
 
-ROSTER_LIVE = frozenset({"running", "starting"})
+class WorkerMembership(Protocol):
+    """Read the worker that owns a retained task record."""
+
+    def member(self, run: Path, name: str) -> staff.StaffRow | None: ...
 
 
 @dataclass(frozen=True)
@@ -79,10 +84,9 @@ def worker_status_path(run: Path, slot: str) -> Path:
 
 def worker_record_path(run: Path, name: str, slot: str) -> Path:
     """Find task settings through the fixed staff reference."""
-    from scripts.production import staff, worker_admission
-
+    admission = cast(WorkerMembership, cast(object, import_module("scripts.production.worker_admission")))
     try:
-        member = worker_admission.member(run, name)
+        member = admission.member(run, name)
     except ValueError:
         member = None
     reference = str(member.id) if isinstance(member, staff.StaffRow) else ""

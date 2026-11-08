@@ -183,7 +183,6 @@ Pane workers move through their dispatch lock, fresh pane evidence, `restart.sto
 They keep the same conversation and reuse a stopped pane.
 Only an open pass receives resume text through the shared target check.
 `config/shutdown.conf` sets the stop deadline from `STOP_GRACE_SECONDS`, `KILL_GRACE_SECONDS`, and `MOVE_STOP_MARGIN_SECONDS`.
-Mesh-pinned runs keep the [worker design](long-lived-workers.md) server release path until herdr-worker-panes Phase 19.
 The [quota guide](../quota_alerts.md) owns phone episodes, forecasts, routing notices, and delivery retries.
 
 Login renewal uses named success and failure results.

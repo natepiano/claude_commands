@@ -19,7 +19,7 @@ import subprocess
 import sys
 from typing import cast, final
 
-from scripts.agents import mesh_runs, worker_lifecycle
+from scripts.agents import detached_runs, worker_lifecycle
 from scripts.accounts import accounts
 from scripts.direct import progress_history
 from scripts.herdr import worker_panes
@@ -188,7 +188,10 @@ def dispatch_receipt(row: staff.StaffRow, line: str, dispatch_id: str, *, run: P
     backend = staff.backend(row)
     if isinstance(backend, staff.BackendUnavailable):
         return DispatchEvidenceUnknown("worker transcript backend is unavailable")
-    transcript = transcript_receipt(worker_admission.transcript_source(row, backend), line, DoneReply(dispatch_id))
+    source = worker_admission.transcript_source(row, backend)
+    transcript = transcript_receipt(source, line, DoneReply(dispatch_id))
+    if isinstance(transcript.receipt, DispatchNotSubmitted):
+        transcript = transcript_receipt(source, DispatchPrompt(dispatch_id), DoneReply(dispatch_id))
     reply = transcript.receipt
     if isinstance(reply, (DispatchNotSubmitted, DispatchEvidenceUnknown)):
         return reply
@@ -197,8 +200,8 @@ def dispatch_receipt(row: staff.StaffRow, line: str, dispatch_id: str, *, run: P
     started = passed.get("started_at", 0)
     since = float(started) if isinstance(started, (int, float)) else 0
     directory = run / worker_lifecycle.DETACHED_RUNS_DIR
-    pending = mesh_runs.delivered_worker_results(directory, row.name, since=since) - received
-    live = mesh_runs.live_runs(directory, row.name)
+    pending = detached_runs.delivered_worker_results(directory, row.name, since=since) - received
+    live = detached_runs.live_runs(directory, row.name)
     pending.update(record["run_id"] for record in live)
     return DispatchWaitingForRuns(tuple(sorted(pending)), bool(live), reply) if pending else reply
 
@@ -286,10 +289,19 @@ def dispatch(parent: StaffId, name: WorkerName, role: WorkerRole, prompt: Path, 
         line = (f"Read the unchanged prompt file {json.dumps(str(prompt))}. End your final reply with DONE {dispatch_id}. "
                 "A reply that waits on a detached run is not final.")
         destination = reply if isinstance(reply, Path) else prompt.with_name(prompt.stem + "_reply.txt")
+        handoff = worker_admission.dispatch_record(session_dir, name.value)
+        if handoff.state in (worker_admission.SwitchState.CREATION_INTENT_RECORDED, worker_admission.SwitchState.DISPATCH_IN_FLIGHT):
+            extract = worker_admission.handoff_path(session_dir, started.row)
+            if extract.is_file():
+                line = f"Read the transcript extract: {extract}.\n" + line
         client = _client()
         result = _dispatch_turn(parent, started, client, line, dispatch_id, run=session_dir)
         if not isinstance(result, DispatchComplete):
             return result
+        if handoff.state in (worker_admission.SwitchState.CREATION_INTENT_RECORDED, worker_admission.SwitchState.DISPATCH_IN_FLIGHT):
+            allowed = worker_admission.WorkerStartAllowed(name.value, parent, session_dir, worker_admission.ExistingWorkerSlot(started.row))
+            worker_admission.record_dispatch(allowed, handoff.assignment_id, worker_admission.SwitchState.ASSIGNMENT_ACCEPTED,
+                                            expected_request=handoff.assignment_id)
         if isinstance(early_ready, Path):
             _wait_for_ready(early_ready)
             second_id = worker_panes.stage_two_completion_id(instance)
@@ -489,7 +501,8 @@ def add(parent: StaffId, role: WorkerRole, *, name: str = "") -> worker_panes.Wo
 def assign(parent: StaffId, role: WorkerRole, prompt: Path, *, session_dir: Path, slot: str,
            phase: str, kind: str, launcher_command: list[str], lens: str = "", name: str = "",
            reply: Path | ReplyBesidePrompt = REPLY_BESIDE_PROMPT, dispatch_id: str = "", fix_cause: str = "",
-           fix_pass: int = 0, activity: str = "", early_ready: Path | SingleStageReview = SINGLE_STAGE_REVIEW) -> ExitCode:
+           fix_pass: int = 0, activity: str = "", early_ready: Path | SingleStageReview = SINGLE_STAGE_REVIEW,
+           policy: worker_panes.UseRolePolicy | worker_panes.LaunchPolicy = worker_panes.UseRolePolicy.CURRENT) -> ExitCode:
     if not name:
         matched = progress_history.dispatch_worker(session_dir, slot=slot, phase=phase, role=role,
             prompt=prompt.resolve(), launcher_command=launcher_command)
@@ -523,7 +536,7 @@ def assign(parent: StaffId, role: WorkerRole, prompt: Path, *, session_dir: Path
         return startup_result(WorkerName.parse(role), chosen)
     return dispatch(parent, chosen, role, prompt, dispatch_id, session_dir=session_dir, slot=slot,
         phase=phase, kind=kind, lens=lens, launcher_command=launcher_command, reply=reply,
-        fix_cause=fix_cause, fix_pass=fix_pass, activity=activity, early_ready=early_ready)
+        fix_cause=fix_cause, fix_pass=fix_pass, activity=activity, early_ready=early_ready, policy=policy)
 
 
 def answer(parent: StaffId, name: WorkerName, text: str) -> ExitCode:
@@ -780,6 +793,8 @@ class Arguments(argparse.Namespace):
     activity: str = ""
     early_ready: str = ""
     launcher_command: str = ""
+    model: str = ""
+    effort: str = ""
     json: bool = False
 
 
@@ -806,7 +821,7 @@ def main(arguments: list[str] | None = None) -> int:
     _ = assignment.add_argument("--parent", default="")
     _ = assignment.add_argument("role", choices=staff.WORKER_ROLES)
     _ = assignment.add_argument("prompt")
-    for flag in ("session-dir", "slot", "phase", "kind", "lens", "name", "reply", "dispatch-id", "fix-cause", "activity", "early-ready"):
+    for flag in ("session-dir", "slot", "phase", "kind", "lens", "name", "reply", "dispatch-id", "fix-cause", "activity", "early-ready", "model", "effort"):
         aliases = {"name": "--to", "reply": "--reply-file"}
         flags = ["--" + flag, *([aliases[flag]] if flag in aliases else [])]
         _ = assignment.add_argument(*flags, default="", required=flag in ("session-dir", "slot", "phase", "kind"))
@@ -852,12 +867,17 @@ def main(arguments: list[str] | None = None) -> int:
                 return ExitCode.OK
             code = startup_result(WorkerName.parse(args.role), result)
         else:
+            policy: worker_panes.UseRolePolicy | worker_panes.LaunchPolicy = worker_panes.UseRolePolicy.CURRENT
+            if args.model or args.effort:
+                selected = worker_panes.launch_policy(cast(WorkerRole, args.role))
+                policy = replace(selected, settings=selected.settings._replace(
+                    model=args.model or selected.settings.model, effort=args.effort or selected.settings.effort))
             code = assign(owner.id, cast(WorkerRole, args.role), Path(args.prompt), session_dir=Path(args.session_dir),
                 slot=args.slot, phase=args.phase, kind=args.kind, lens=args.lens, name=args.name,
                 reply=Path(args.reply) if args.reply else REPLY_BESIDE_PROMPT, dispatch_id=args.dispatch_id,
                 launcher_command=_launcher_arguments(args.launcher_command), fix_cause=args.fix_cause,
                 fix_pass=args.fix_pass, activity=args.activity,
-                early_ready=Path(args.early_ready) if args.early_ready else SINGLE_STAGE_REVIEW)
+                early_ready=Path(args.early_ready) if args.early_ready else SINGLE_STAGE_REVIEW, policy=policy)
         if code == ExitCode.OK:
             print("done")
         return code

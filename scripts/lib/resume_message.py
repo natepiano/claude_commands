@@ -177,7 +177,7 @@ def _resume_task(seat: ClaudeChildResume, cwd: str, prompt: str) -> str:
         if position + 1 >= len(command):
             raise ValueError("the saved command has an incomplete option")
         option, value = command[position:position + 2]
-        if launcher in assign_gate.ASSIGN_LAUNCHERS or option not in {"--pool", "--lease", "--slot", "--mesh-label"}:
+        if launcher in assign_gate.ASSIGN_LAUNCHERS or option not in {"--pool", "--lease", "--slot"}:
             options.append((option, value))
         position += 2
     if launcher not in assign_gate.ASSIGN_LAUNCHERS:

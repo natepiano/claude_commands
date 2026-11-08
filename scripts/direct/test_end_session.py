@@ -104,7 +104,6 @@ class EndSessionTests(unittest.TestCase):
             "END_SESSION_CALLS": str(self.calls),
             "UNIT_ACTIVE_DIR": str(self.marker.parent),
             "UNIT_RUN_ROOT": str(self.runs),
-            "UNIT_WORKERS_STATE": str(self.root / "unit-workers"),
             "NOTIFIER_SESSIONS_DIR": str(self.root / "sessions"),
             "SHUTDOWN_STATE_DIR": str(self.root / "shutdown"),
             "SCRATCH_ROOT": str(self.root / "tracked-scratch"),
@@ -241,10 +240,10 @@ class EndSessionTests(unittest.TestCase):
         unused.mkdir()
         _ = (unused / ".scratch.json").write_text(json.dumps({"task": "run:run", "created": 1, "renewed": 1}))
         run = self.session_dir
-        (run / "mesh_runs").mkdir()
-        record = run / "mesh_runs" / "still-running.json"
+        (run / "detached_runs").mkdir()
+        record = run / "detached_runs" / "still-running.json"
         child = subprocess.Popen([sys.executable, "-c", "import sys; sys.stdin.read()",
-                                  "mesh_runs.py", "supervise", str(record)], stdin=subprocess.PIPE)
+                                  "detached_runs.py", "supervise", str(record)], stdin=subprocess.PIPE)
         self.addCleanup(lambda: child.communicate(timeout=TEST_HANG_GUARD_SECS))
         environment = self.environment()
         environment["CODEX_HOME"] = str(self.root / "codex")
@@ -256,8 +255,7 @@ class EndSessionTests(unittest.TestCase):
         member = fixture_worker("w7", parent.id, backend=staff.CodexBackend(Path(environment["CODEX_HOME"])))
         _ = record.write_text(json.dumps({
             "worker": "w7", "status": "running", "pid": child.pid, "staff_id": member.id}))
-        environment.update({"UNIT_WORKERS_STATE": str(self.root / "unit-workers"),
-            "SCRATCH_ROOT": str(scratch.parent), "SCRATCH_VISIBLE_ROOT": str(self.root / "visible-scratch"),
+        environment.update({"SCRATCH_ROOT": str(scratch.parent), "SCRATCH_VISIBLE_ROOT": str(self.root / "visible-scratch"),
             "SCRATCH_HOLDS": str(self.root / "scratch-holds.json")})
         result = self.run_end(environment)
         self.assertEqual(result.returncode, 0, result.stderr)

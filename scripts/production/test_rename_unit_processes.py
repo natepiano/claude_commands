@@ -59,7 +59,7 @@ class RunProcessTests(StaffTestCase):
         other = self.root / "claude-demo-beta"
         mine = self.run_folder("run-a", self.unit_folder)
         theirs = self.run_folder("run-b", other)
-        lint = ["python3", "mesh_runs.py", "supervise", str(self.run_record(mine, "lint", 101))]
+        lint = ["python3", "detached_runs.py", "supervise", str(self.run_record(mine, "lint", 101))]
         _ = self.run_record(mine, "test", 104)
         self.processes = {
             # The unit's detached lint run: the supervisor leads its session, verify.sh and tee are in it.
@@ -69,16 +69,15 @@ class RunProcessTests(StaffTestCase):
             104: FakeProcess(self.unit_folder, 104, ["cargo", "build"]),
             900: FakeProcess(self.unit_folder, 900, ["zsh"]),
             # Another unit's detached run, in its own worktree.
-            301: FakeProcess(other, 301, ["python3", "mesh_runs.py", "supervise",
+            301: FakeProcess(other, 301, ["python3", "detached_runs.py", "supervise",
                                           str(self.run_record(theirs, "lint", 301))]),
             302: FakeProcess(other, 301, ["bash", "verify.sh", "lint", "pkg"]),
         }
-        self.enterContext(mock.patch.dict(os.environ, {"RETIRE_UNIT_RUN_ROOT": str(self.root / "runs"),
-            "UNIT_WORKERS_STATE": str(self.root / "unit-workers")}))
+        self.enterContext(mock.patch.dict(os.environ, {"RETIRE_UNIT_RUN_ROOT": str(self.root / "runs")}))
         _ = self.enterContext(mock.patch.object(unit_move, "processes_inside", self.inside))
         _ = self.enterContext(mock.patch.object(shutdown, "retirement_command_line", self.arguments))
-        from scripts.agents import mesh_run_process
-        _ = self.enterContext(mock.patch.object(mesh_run_process, "process_args", self.arguments))
+        from scripts.agents import detached_run_process
+        _ = self.enterContext(mock.patch.object(detached_run_process, "process_args", self.arguments))
         _ = self.enterContext(mock.patch.object(os, "getsid", self.session))
         _ = self.enterContext(mock.patch.object(os, "kill", self.kill))
         _ = self.enterContext(mock.patch.object(unit_lookup, "labeled_session", return_value=None))

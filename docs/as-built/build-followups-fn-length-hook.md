@@ -172,7 +172,7 @@ Run files keep staff references instead of copied native identities.
 
 - Stalled detection belongs to the stall watcher, not `unit_status.sh`. Idleness rests on the pane hash plus transcript and `subagents/` mtimes, never on status-file text.
 
-- The follow-up claim must exist before any status record, so a refusal leaves no stale record. `assign_claude.py`'s final status write comes after every record step (`finish-pass`, `landed`); unit directors and `launch_implementation.md` read `impl_status_<slot>`. `codex_mesh.py`'s roster states are read by `can-follow`, `follow` and the launcher alike.
+- The follow-up claim must exist before any status record, so a refusal leaves no stale record. `assign_claude.py`'s final status write comes after every record step (`finish-pass`, `landed`); unit directors and `launch_implementation.md` read `impl_status_<slot>`.
 
 - `prepare_session.sh` calls `unit_notifier.sh` with the session id alone to create the instance; that form stays unchanged.
 

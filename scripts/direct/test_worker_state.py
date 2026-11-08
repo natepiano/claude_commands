@@ -9,12 +9,15 @@ import sys
 import tempfile
 import unittest
 from concurrent.futures import ThreadPoolExecutor
+from threading import Barrier
 from contextlib import redirect_stderr
 from pathlib import Path
 from typing import cast
 from unittest.mock import patch
 
-from scripts.direct import assign, worker_state, workers
+from scripts.direct import worker_state
+from scripts.herdr import worker_panes
+from scripts.production import worker
 from scripts.direct.worker_state import worker_claim_lock, worker_record_path, worker_slot, worker_status_path
 from scripts.production import staff
 from scripts.production.staff_test_support import StaffTestCase, fixture_worker, unit_membership
@@ -196,41 +199,43 @@ class WorkerStateTests(StaffTestCase):
                 self.assertEqual(worker_record_path(run, "w7", "impl"), identity)
                 self.assertEqual(json.loads(identity.read_text())["staff_id"], member.id)
 
-    def dispatch(self, run: Path, name: str) -> assign.Dispatch:
-        return assign.Dispatch(assign.Arguments(), run, run, run / "prompt", "7", "fix", name,
-                               "codex", "model", "high", "default", {}, {})
-
     def test_two_fix_workers_hold_distinct_claims_at_the_same_time(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             run = Path(directory)
             members = self.prepare_workers(run, "fix7", "fix7b")
-            records = {(run, member.name): {"staff_id": member.id} for member in members}
+            ready = Barrier(3, timeout=TEST_HANG_GUARD_SECS)
+            release = Barrier(3, timeout=TEST_HANG_GUARD_SECS)
+            held: list[worker_panes.WorkerLockHold] = []
 
-            def worker_record(path: Path, name: str) -> dict[str, staff.StaffId]:
-                return records[(path, name)]
+            def claim(member: staff.StaffRow) -> None:
+                assert isinstance(member.parent, staff.ReportsTo)
+                with worker_panes.worker_lock(member.parent.id, staff.WorkerName.parse(member.name)) as lock:
+                    assert isinstance(lock, worker_panes.WorkerLockHold)
+                    held.append(lock)
+                    _ = ready.wait()
+                    _ = release.wait()
 
-            with (patch.object(assign, "read_roster", side_effect=worker_record),
-                  patch.object(assign.Dispatch, "claim_follow"), ThreadPoolExecutor(max_workers=2) as pool):
-                claims = list(pool.map(assign.claim_worker,
-                                       [self.dispatch(run, member.name) for member in members]))
-            self.assertEqual({claim.slot for claim in claims}, {"fix7", "fix7b"})
-            self.assertEqual(len({claim.identity_path for claim in claims}), 2)
-            started = process_start.process_start(os.getpid())
-            assert isinstance(started, process_start.Started)
-            for claim in claims:
-                record = cast(dict[str, object], json.loads((run / f"impl_claim_{claim.slot}.json").read_text()))
-                self.assertEqual(record["pid"], os.getpid())
-                self.assertEqual(record["started"], started.start)
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                futures = [pool.submit(claim, member) for member in members]
+                _ = ready.wait()
+                try:
+                    self.assertEqual({lock.name.value for lock in held}, {"fix7", "fix7b"})
+                    self.assertEqual(len(held), 2)
+                    for member in members:
+                        assert isinstance(member.parent, staff.ReportsTo)
+                        self.assertTrue(any(lock.owns(member) for lock in held))
+                        with worker_panes.worker_lock(member.parent.id, staff.WorkerName.parse(member.name)) as attempt:
+                            self.assertIsInstance(attempt, worker_panes.Kept)
+                finally:
+                    _ = release.wait()
+                for future in futures:
+                    future.result()
 
     def test_refused_same_name_preserves_phase_status_and_summary(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             run = Path(directory)
             member, = self.prepare_workers(run, "fix7")
-            dispatch = self.dispatch(run, member.name)
-            roster_patch = self.enterContext(patch.object(assign, "read_roster", return_value={"staff_id": member.id}))
-            self.addCleanup(roster_patch.reset_mock)
-            with patch.object(assign.Dispatch, "claim_follow"):
-                claim = assign.claim_worker(dispatch)
+            assert isinstance(member.parent, staff.ReportsTo)
             phase = run / "phases/7"
             phase.mkdir(parents=True)
             files = [phase / name for name in ("fix_status", "fix_summary.txt", "fix7_status", "fix7_summary.txt")]
@@ -238,8 +243,12 @@ class WorkerStateTests(StaffTestCase):
                 _ = path.write_text("first worker evidence\n")
             before = {path: path.read_bytes() for path in files}
             errors = io.StringIO()
-            with patch.object(workers, "shown_name", return_value="first"), redirect_stderr(errors):
-                self.assertEqual(assign.execute(dispatch, []), 2)
-            self.assertIn(f"claimed by launcher {os.getpid()}", errors.getvalue())
-            self.assertEqual({path: path.read_bytes() for path in files}, before)
-            self.assertTrue((run / f"impl_claim_{claim.slot}.json").exists())
+            with worker_panes.worker_lock(member.parent.id, staff.WorkerName.parse(member.name)) as claim:
+                assert isinstance(claim, worker_panes.WorkerLockHold)
+                with redirect_stderr(errors):
+                    result = worker.dispatch(member.parent.id, staff.WorkerName.parse(member.name), "fix", run / "prompt",
+                        session_dir=run, slot=member.name, phase="7", kind="fix", launcher_command=[])
+                self.assertEqual(result, worker.ExitCode.BUSY)
+                self.assertIn("dispatch lock is held", errors.getvalue())
+                self.assertEqual({path: path.read_bytes() for path in files}, before)
+                self.assertTrue(claim.owns(member))

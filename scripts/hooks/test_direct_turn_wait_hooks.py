@@ -139,7 +139,7 @@ def director_wait_fixture() -> Generator[DirectorWaitFixture]:
 
 
 class DirectorTurnWaitHookTests(unittest.TestCase):
-    def test_worker_address_alias_matches_its_roster_thread_and_not_its_name(self) -> None:
+    def test_historical_worker_address_alias_matches_its_thread_and_not_its_name(self) -> None:
         with director_wait_fixture() as fixture:
             runs = fixture.root / "unit-runs"
             worker_run = runs / "supplier-run"

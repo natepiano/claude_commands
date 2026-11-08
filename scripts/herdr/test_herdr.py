@@ -4,6 +4,7 @@ from __future__ import annotations
 
 
 import json
+from importlib import import_module
 import io
 import ctypes
 from contextlib import contextmanager, nullcontext, redirect_stderr, redirect_stdout
@@ -2297,6 +2298,7 @@ class HerdrTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
+        _ = import_module("scripts.whoami.agent_accounts")
         _ = cast(object, self.enterContext(patch.object(herdr, "_PLATFORM", "linux")))
         # Server start mechanics do not depend on the name. The one-session rule has its own tests.
         # These fixtures specify process startup and argv; PromptSubmissionTests
@@ -6680,51 +6682,6 @@ class SavedLayoutTests(unittest.TestCase):
         self.assertEqual(fresh.layout(), [("hana", ["late-session"])])
 
 
-class RunLoadedThreadsTests(unittest.TestCase):
-    def test_current_and_retired_servers_are_read_with_all_pages(self) -> None:
-        from scripts.agents.codex_mesh_test_support import StubAppServer
-        from scripts.lib.unit_runs import SERVER_FILE
-
-        def respond(request: dict[str, object]) -> list[dict[str, object]]:
-            params = request.get("params", {})
-            result: dict[str, object] = {}
-            if request.get("method") == "thread/loaded/list":
-                result = ({"data": ["second"]} if params else {"data": ["first"], "nextCursor": "page2"})
-            return [{"id": request["id"], "result": result}]
-
-        with tempfile.TemporaryDirectory() as folder:
-            current, retired = StubAppServer(respond), StubAppServer(respond)
-            self.addCleanup(current.close)
-            self.addCleanup(retired.close)
-            path = Path(folder) / SERVER_FILE
-            _ = path.write_text(json.dumps({"pid": os.getpid(), "port": current.port,
-                "previous_servers": [{"pid": os.getpid(), "port": retired.port}]}))
-            self.assertEqual(herdr.loaded_threads(Path(folder), time.monotonic() + TEST_HANG_GUARD_SECS),
-                             {"first", "second"})
-            for server in (retired, current):
-                self.assertEqual([request["params"] for request in server.requests
-                                  if request["method"] == "thread/loaded/list"], [{}, {"cursor": "page2"}])
-
-    def test_a_failed_page_gives_no_partial_result_and_expiry_prevents_a_connection(self) -> None:
-        from scripts.agents.codex_mesh_test_support import StubAppServer
-        from scripts.lib.unit_runs import SERVER_FILE
-
-        def respond(request: dict[str, object]) -> list[dict[str, object]]:
-            if request.get("method") == "thread/loaded/list":
-                return [{"id": request["id"], "error": {"message": "probe failed"}}]
-            return [{"id": request["id"], "result": {}}]
-
-        with tempfile.TemporaryDirectory() as folder:
-            server = StubAppServer(respond)
-            self.addCleanup(server.close)
-            path = Path(folder) / SERVER_FILE
-            _ = path.write_text(json.dumps({"pid": os.getpid(), "port": server.port}))
-            with self.assertRaisesRegex(ValueError, "probe failed"):
-                _ = herdr.loaded_threads(Path(folder), time.monotonic() + TEST_HANG_GUARD_SECS)
-            requests = list(server.requests)
-            with self.assertRaisesRegex(ValueError, "timed out"):
-                _ = herdr.loaded_threads(Path(folder), time.monotonic())
-            self.assertEqual(server.requests, requests)
 
 
 if __name__ == "__main__":

@@ -126,7 +126,7 @@ class DetachedWorkerSafetyTests(StaffTestCase):
 
     def test_reused_supervisor_pid_does_not_retain_detached_work(self) -> None:
         run = self.detached_worker()[2]
-        records = run / "mesh_runs"
+        records = run / "detached_runs"
         records.mkdir()
         record = records / "abandoned.json"
         with subprocess.Popen([sys.executable, "-c", "import sys; sys.stdin.read()"],
@@ -144,13 +144,13 @@ class DetachedWorkerSafetyTests(StaffTestCase):
         parent, member, run = self.detached_worker()
         linked = run.parent / "linked-run"
         linked.symlink_to(run, target_is_directory=True)
-        records = run / "mesh_runs"
+        records = run / "detached_runs"
         records.mkdir()
         record = records / "linked-command.json"
         checkout = run / "phases" / "5" / "gate"
         checkout.mkdir(parents=True)
         child = subprocess.Popen([sys.executable, "-c", "import sys; sys.stdin.read()",
-            "mesh_runs.py", "supervise", str(linked / "mesh_runs" / record.name)], stdin=subprocess.PIPE)
+            "detached_runs.py", "supervise", str(linked / "detached_runs" / record.name)], stdin=subprocess.PIPE)
         self.addCleanup(child.communicate, timeout=TEST_HANG_GUARD_SECS)
         located = staff.set_worktree(parent.id, staff.PresentWorktree("natedev", checkout), expected=parent.worktree)
         assert isinstance(located.worktree, staff.PresentWorktree)

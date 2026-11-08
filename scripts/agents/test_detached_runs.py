@@ -1,4 +1,4 @@
-"""Tests for mesh_runs.py: detached runs that message the worker who started them."""
+"""Tests for detached_runs.py: detached runs that message the worker who started them."""
 
 from __future__ import annotations
 
@@ -24,7 +24,7 @@ from unittest.mock import MagicMock, patch
 
 from scripts.production.staff_test_support import isolated_staff_file
 from scripts.lib.signal_test_support import install_signal_pid_guard
-from scripts.agents import codex_mesh, mesh_run_process, mesh_runs
+from scripts.agents import detached_run_process, detached_runs
 from scripts.buildlog import treekey
 from scripts.direct import progress_history
 from scripts.lib import conf, unit_runs
@@ -38,11 +38,11 @@ from scripts.production import staff, session_staff, worker_admission
 from scripts.production.staff_test_support import StaffTestCase, fixture_runtime_id, fixture_session
 
 WORKER = "unit-impl"
-THREAD_ONE = fixture_runtime_id("mesh-run-thread-one")
-THREAD_TWO = fixture_runtime_id("mesh-run-thread-two")
-LASTING_THREAD = fixture_runtime_id("mesh-run-lasting-thread")
-ADOPTED_THREAD = fixture_runtime_id("mesh-run-adopted-thread")
-SHARED_THREAD = fixture_runtime_id("mesh-run-shared-thread")
+THREAD_ONE = fixture_runtime_id("detached-run-thread-one")
+THREAD_TWO = fixture_runtime_id("detached-run-thread-two")
+LASTING_THREAD = fixture_runtime_id("detached-run-lasting-thread")
+ADOPTED_THREAD = fixture_runtime_id("detached-run-adopted-thread")
+SHARED_THREAD = fixture_runtime_id("detached-run-shared-thread")
 DEAD_PID = 2 ** 22 + 12345
 
 
@@ -56,7 +56,7 @@ def private_supervisor(test: unittest.TestCase, path: Path) -> int:
     guard = LauncherHangGuard("detached supervisor startup and cleanup")
     stand_in = subprocess.Popen([sys.executable, "-c",
                                  "import sys; print('ready', flush=True); sys.stdin.read()",
-                                 "mesh_runs.py", "supervise", str(path)],
+                                 "detached_runs.py", "supervise", str(path)],
                                 stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
     test.addCleanup(lambda: stand_in.wait(timeout=guard.remaining()))
     test.addCleanup(stand_in.kill)
@@ -68,7 +68,7 @@ def private_supervisor(test: unittest.TestCase, path: Path) -> int:
     return stand_in.pid
 
 
-class MeshRunsTests(unittest.TestCase):
+class DetachedRunsTests(unittest.TestCase):
     root: Path  # pyright: ignore[reportUninitializedInstanceVariable]
     session: Path  # pyright: ignore[reportUninitializedInstanceVariable]
     stack: contextlib.ExitStack  # pyright: ignore[reportUninitializedInstanceVariable]
@@ -83,8 +83,7 @@ class MeshRunsTests(unittest.TestCase):
         _ = self.stack.enter_context(isolated_staff_file(self.root / "staff.json", {}))
         self.session = self.root / "unit" / "run-1"
         self.session.mkdir(parents=True)
-        write_text_atomic(self.session / "worker_transport", "herdr\n")
-        _ = self.stack.enter_context(patch.object(mesh_runs, "RUN_ROOTS", (self.root / "unit",)))
+        _ = self.stack.enter_context(patch.object(detached_runs, "RUN_ROOTS", (self.root / "unit",)))
         self.stack.enter_context(patch.dict(os.environ, {
                                                         "HOME": str(self.root),
                                                         "XDG_STATE_HOME": str(self.root / "state"),
@@ -93,7 +92,7 @@ class MeshRunsTests(unittest.TestCase):
                                                         "BUILDLOG_SCOPE": "0"}))
         config = self.root / "config"
         config.mkdir()
-        for name in ("mesh_runs", "send", "postmaster", "codex_daemon", "direct"):
+        for name in ("detached_runs", "send", "postmaster", "codex_daemon", "direct"):
             _ = (config / f"{name}.conf").write_text(
                 (Path(__file__).resolve().parents[2] / f"config/{name}.conf").read_text())
         self.stack.enter_context(patch.dict(os.environ, {"CONF_DIR": str(config)}))
@@ -143,9 +142,9 @@ class MeshRunsTests(unittest.TestCase):
         return cast(dict[str, object], json.loads(text)) if text.strip() else {}
 
     def record(self, command: list[str], **extra: str) -> Path:
-        runs = self.session / mesh_runs.DETACHED_RUNS_DIR
+        runs = self.session / detached_runs.DETACHED_RUNS_DIR
         runs.mkdir(exist_ok=True)
-        record: mesh_runs.RunRecord = {
+        record: detached_runs.RunRecord = {
             "run_id": "r1", "status": "running", "session_dir": str(self.session), "worker": WORKER,
             "staff_id": self.worker_id,
             "label": "verify.sh check", "command": command,
@@ -158,7 +157,7 @@ class MeshRunsTests(unittest.TestCase):
 
     def live_run(self, command: list[str], pid: int = 0) -> Path:
         """A running record from this folder at tree key key-1, with a stand-in supervisor whose
-        command line names mesh_runs.py supervise and the record, unless pid names another process."""
+        command line names detached_runs.py supervise and the record, unless pid names another process."""
         path = self.record(command)
         if not pid:
             pid = private_supervisor(self, path)
@@ -177,7 +176,7 @@ class MeshRunsTests(unittest.TestCase):
             guard = LauncherHangGuard("live-run limit fixture")
             child = subprocess.Popen(
                 [sys.executable, "-c", "import sys; print('ready', flush=True); sys.stdin.read()",
-                 "mesh_runs.py", "supervise", str(path)],
+                 "detached_runs.py", "supervise", str(path)],
                 stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
             self.addCleanup(child.wait, timeout=guard.remaining())
             self.addCleanup(child.kill)
@@ -201,13 +200,13 @@ class MeshRunsTests(unittest.TestCase):
         """Start command for seat `to`; the Popen mock and what start printed."""
         popen = MagicMock(return_value=SimpleNamespace(pid=4321))
         with patch.object(subprocess, "Popen", popen), contextlib.redirect_stdout(io.StringIO()) as output:
-            code = mesh_runs.main(["start", "--session-dir", str(self.session), "--to", to, "--", *command])
+            code = detached_runs.main(["start", "--session-dir", str(self.session), "--to", to, "--", *command])
         self.assertEqual(code, 0)
         return popen, output.getvalue()
 
-    def supervise(self, path: Path) -> mesh_runs.RunRecord:
-        self.assertEqual(mesh_runs.main(["supervise", str(path)]), 0)
-        return cast(mesh_runs.RunRecord, json.loads(path.read_text(encoding="utf-8")))
+    def supervise(self, path: Path) -> detached_runs.RunRecord:
+        self.assertEqual(detached_runs.main(["supervise", str(path)]), 0)
+        return cast(detached_runs.RunRecord, json.loads(path.read_text(encoding="utf-8")))
 
     # Criterion 1: start returns at once with a detached supervisor and a running record.
     def test_retired_worker_finishes_its_orphan_without_blocking_other_runs(self) -> None:
@@ -215,11 +214,11 @@ class MeshRunsTests(unittest.TestCase):
         self.update_record(path, pid=DEAD_PID, started_at=time.time() - 600)
         _ = staff.retire(self.worker_id)
         with contextlib.redirect_stderr(io.StringIO()) as errors:
-            self.assertEqual(mesh_runs.reap_orphans(str(self.session)), ["r1"])
+            self.assertEqual(detached_runs.reap_orphans(str(self.session)), ["r1"])
         record = cast(dict[str, object], json.loads(path.read_text()))
         self.assertEqual(record["status"], "finished")
         self.assertEqual(len(errors.getvalue().splitlines()), 1)
-        self.assertEqual(mesh_runs.reap_orphans(str(self.session)), [])
+        self.assertEqual(detached_runs.reap_orphans(str(self.session)), [])
         self.assertEqual(self.sent, [])
 
     def test_start_detaches_a_supervisor_and_records_the_run(self) -> None:
@@ -228,14 +227,14 @@ class MeshRunsTests(unittest.TestCase):
                        "UNIT_TEAM_ROLE": "test"}
         with patch.dict(os.environ, environment), patch.object(subprocess, "Popen", popen), \
                 contextlib.redirect_stdout(io.StringIO()) as output:
-            code = mesh_runs.main(["start", "--label", "verify.sh check", "--", "bash", "verify.sh", "check"])
+            code = detached_runs.main(["start", "--label", "verify.sh check", "--", "bash", "verify.sh", "check"])
         self.assertEqual(code, 0)
         kwargs = cast(dict[str, object], popen.call_args.kwargs)
         self.assertIs(kwargs["start_new_session"], True)
         self.assertEqual(kwargs["stdin"], subprocess.DEVNULL)
         self.assertEqual(kwargs["stderr"], subprocess.STDOUT)
         self.assertNotIn(kwargs["stdout"], (None, sys.stdout))
-        records = list((self.session / mesh_runs.DETACHED_RUNS_DIR).glob("*.json"))
+        records = list((self.session / detached_runs.DETACHED_RUNS_DIR).glob("*.json"))
         self.assertEqual(len(records), 1)
         record = cast(dict[str, object], json.loads(records[0].read_text(encoding="utf-8")))
         self.assertEqual((record["status"], record["pid"], record["worker"], record["staff_id"]),
@@ -255,7 +254,7 @@ class MeshRunsTests(unittest.TestCase):
         with contextlib.chdir(start_folder):
             supervisor, output = self.start(command)
         self.assertIn("started detached", output)
-        records = list((self.session / mesh_runs.DETACHED_RUNS_DIR).glob("*.json"))
+        records = list((self.session / detached_runs.DETACHED_RUNS_DIR).glob("*.json"))
         self.assertEqual(len(records), 1)
         with contextlib.chdir(cast(str, supervisor.call_args.kwargs["cwd"])):
             record = self.supervise(records[0])
@@ -268,7 +267,7 @@ class MeshRunsTests(unittest.TestCase):
         with patch.object(subprocess, "Popen") as popen, \
                 contextlib.redirect_stdout(io.StringIO()) as out, \
                 contextlib.redirect_stderr(io.StringIO()) as err:
-            code = mesh_runs.main(["start", "--session-dir", str(self.session), "--to", WORKER,
+            code = detached_runs.main(["start", "--session-dir", str(self.session), "--to", WORKER,
                                    "--label", "fourth check", "--", "new-check"])
         self.assertEqual(code, 4)
         popen.assert_not_called()
@@ -305,10 +304,10 @@ class MeshRunsTests(unittest.TestCase):
 
     def test_start_reads_the_live_run_limit_from_config(self) -> None:
         paths = self.seat_runs(1)
-        config = self.root / "config/mesh_runs.conf"
+        config = self.root / "config/detached_runs.conf"
         _ = config.write_text("# whole: 1..\nLIVE_RUN_LIMIT=1\n")
         with patch.object(subprocess, "Popen") as popen, contextlib.redirect_stderr(io.StringIO()) as err:
-            code = mesh_runs.main(["start", "--session-dir", str(self.session), "--to", WORKER,
+            code = detached_runs.main(["start", "--session-dir", str(self.session), "--to", WORKER,
                                    "--", "new-check"])
         self.assertEqual(code, 4)
         popen.assert_not_called()
@@ -326,20 +325,20 @@ class MeshRunsTests(unittest.TestCase):
         self.assertEqual(len(list(paths[0].parent.glob("*.json"))), 4)
 
     def test_parallel_starts_cannot_exceed_one_configured_place(self) -> None:
-        _ = (self.root / "config/mesh_runs.conf").write_text("# whole: 1..\nLIVE_RUN_LIMIT=1\n")
-        runs = self.session / mesh_runs.DETACHED_RUNS_DIR
+        _ = (self.root / "config/detached_runs.conf").write_text("# whole: 1..\nLIVE_RUN_LIMIT=1\n")
+        runs = self.session / detached_runs.DETACHED_RUNS_DIR
         runs.mkdir()
         script = """
 import sys
 from types import SimpleNamespace
 from unittest.mock import patch
-from scripts.agents import mesh_run_process, mesh_runs
+from scripts.agents import detached_run_process, detached_runs
 print('ready', flush=True)
 input()
-with (patch.object(mesh_run_process, 'supervises', return_value=True),
-      patch.object(mesh_runs.treekey, 'tree_key', return_value='fixture-tree'),
-      patch.object(mesh_runs.subprocess, 'Popen', return_value=SimpleNamespace(pid=4321))):
-    code = mesh_runs.main(['start', '--session-dir', sys.argv[1], '--to', sys.argv[2],
+with (patch.object(detached_run_process, 'supervises', return_value=True),
+      patch.object(detached_runs.treekey, 'tree_key', return_value='fixture-tree'),
+      patch.object(detached_runs.subprocess, 'Popen', return_value=SimpleNamespace(pid=4321))):
+    code = detached_runs.main(['start', '--session-dir', sys.argv[1], '--to', sys.argv[2],
                            '--', 'check', sys.argv[3]])
 sys.exit(code)
 """
@@ -363,25 +362,25 @@ sys.exit(code)
         self.assertEqual(len(list(runs.glob("*.json"))), 1)
 
     def test_start_and_reap_preserve_an_unpublished_record_under_the_start_lock(self) -> None:
-        _ = (self.root / "config/mesh_runs.conf").write_text("# whole: 1..\nLIVE_RUN_LIMIT=1\n")
+        _ = (self.root / "config/detached_runs.conf").write_text("# whole: 1..\nLIVE_RUN_LIMIT=1\n")
         script = """
 import fcntl
 import sys
 from types import SimpleNamespace
 from unittest.mock import patch
-from scripts.agents import mesh_runs
+from scripts.agents import detached_runs
 flock = fcntl.flock
 def lock(fd, operation):
     print('locking', flush=True)
     return flock(fd, operation)
 with (patch.object(fcntl, 'flock', lock),
-      patch.object(mesh_runs, 'deliver', return_value='fixture'),
-      patch.object(mesh_runs.treekey, 'tree_key', return_value='key-1'),
-      patch.object(mesh_runs.subprocess, 'Popen', return_value=SimpleNamespace(pid=4321))):
+      patch.object(detached_runs, 'deliver', return_value='fixture'),
+      patch.object(detached_runs.treekey, 'tree_key', return_value='key-1'),
+      patch.object(detached_runs.subprocess, 'Popen', return_value=SimpleNamespace(pid=4321))):
     args = [sys.argv[1], '--session-dir', sys.argv[2]]
     if sys.argv[1] == 'start':
         args += ['--to', sys.argv[3], '--', 'new-check']
-    code = mesh_runs.main(args)
+    code = detached_runs.main(args)
 sys.exit(code)
 """
         for verb, expected in (("start", 4), ("reap", 0)):
@@ -410,20 +409,20 @@ sys.exit(code)
                 self.assertEqual(list(path.parent.glob("*.json")), [path])
 
     def test_a_supervisor_holds_a_place_when_start_exits_before_its_pid_write(self) -> None:
-        _ = (self.root / "config/mesh_runs.conf").write_text("# whole: 1..\nLIVE_RUN_LIMIT=1\n")
+        _ = (self.root / "config/detached_runs.conf").write_text("# whole: 1..\nLIVE_RUN_LIMIT=1\n")
         script = """
 import os
 import sys
 from unittest.mock import patch
-from scripts.agents import mesh_runs
-write_record = mesh_runs._write_record
+from scripts.agents import detached_runs
+write_record = detached_runs._write_record
 def publish(path, record):
     if record['pid']:
         os._exit(99)
     write_record(path, record)
-with (patch.object(mesh_runs, '_write_record', publish),
-      patch.object(mesh_runs.treekey, 'tree_key', return_value='key-1')):
-    mesh_runs.main(sys.argv[1:])
+with (patch.object(detached_runs, '_write_record', publish),
+      patch.object(detached_runs.treekey, 'tree_key', return_value='key-1')):
+    detached_runs.main(sys.argv[1:])
 """
         command = """
 import socket
@@ -451,16 +450,16 @@ sys.exit(1)
             with connection:
                 connection.settimeout(guard.remaining())
                 self.assertEqual(connection.recv(5), b"ready")
-                paths = list((self.session / mesh_runs.DETACHED_RUNS_DIR).glob("*.json"))
+                paths = list((self.session / detached_runs.DETACHED_RUNS_DIR).glob("*.json"))
                 self.assertEqual(len(paths), 1)
-                record = cast(mesh_runs.RunRecord, json.loads(paths[0].read_text()))
+                record = cast(detached_runs.RunRecord, json.loads(paths[0].read_text()))
                 self.assertGreater(record["pid"], 0)
-                self.assertTrue(mesh_run_process.supervises(record["pid"], paths[0]))
+                self.assertTrue(detached_run_process.supervises(record["pid"], paths[0]))
                 supervisor = os.pidfd_open(record["pid"])
                 try:
                     with patch.object(subprocess, "Popen") as popen, \
                             contextlib.redirect_stderr(io.StringIO()) as errors:
-                        code = mesh_runs.main(["start", "--session-dir", str(self.session), "--to", WORKER,
+                        code = detached_runs.main(["start", "--session-dir", str(self.session), "--to", WORKER,
                                                "--", "another-check"])
                     self.assertEqual(code, 4, errors.getvalue())
                     popen.assert_not_called()
@@ -478,7 +477,7 @@ sys.exit(1)
         popen.assert_not_called()
         self.assertIn(f"run r1 is already running for {WORKER}", output)
         self.assertIn("next message", output)
-        self.assertEqual(len(list((self.session / mesh_runs.DETACHED_RUNS_DIR).glob("*.json"))), 1)
+        self.assertEqual(len(list((self.session / detached_runs.DETACHED_RUNS_DIR).glob("*.json"))), 1)
 
     def test_a_start_after_the_files_changed_or_with_no_tree_key_starts_a_new_run(self) -> None:
         command = ["bash", "verify.sh", "lint", "hana"]
@@ -488,13 +487,13 @@ sys.exit(1)
                 popen, _ = self.start(command)
             popen.assert_called_once()
         records = [cast(dict[str, object], json.loads(path.read_text(encoding="utf-8")))
-                   for path in (self.session / mesh_runs.DETACHED_RUNS_DIR).glob("*.json")]
+                   for path in (self.session / detached_runs.DETACHED_RUNS_DIR).glob("*.json")]
         self.assertEqual(sorted(str(record.get("tree_key")) for record in records), ["", "key-1", "key-2"])
 
     def test_another_command_seat_or_folder_starts_a_new_run(self) -> None:
         command = ["bash", "verify.sh", "lint", "hana"]
         _ = self.live_run(command)
-        _ = self.record_worker("unit-review", fixture_runtime_id("mesh-run-other-reviewer"))
+        _ = self.record_worker("unit-review", fixture_runtime_id("detached-run-other-reviewer"))
         for other_command, seat in ((["bash", "verify.sh", "check", "hana"], WORKER), (command, "unit-review")):
             popen, _ = self.start(other_command, seat)
             popen.assert_called_once()
@@ -519,7 +518,7 @@ sys.exit(1)
         self.update_record(path, pid=DEAD_PID)
         popen, _ = self.start(["bash", "verify.sh", "lint", "hana"])
         popen.assert_called_once()
-        record = cast(mesh_runs.RunRecord, json.loads(path.read_text(encoding="utf-8")))
+        record = cast(detached_runs.RunRecord, json.loads(path.read_text(encoding="utf-8")))
         self.assertEqual((record["status"], record.get("ended"), record.get("exit_code")),
                          ("finished", "supervisor gone", None))
         messages = cast(list[str], self.pending()["messages"])
@@ -530,7 +529,7 @@ sys.exit(1)
         for started in path.parent.glob("*.json"):
             if started != path:
                 started.unlink()
-        self.assertEqual(mesh_runs.reap_orphans(str(self.session)), [])
+        self.assertEqual(detached_runs.reap_orphans(str(self.session)), [])
         self.assertEqual(len(cast(list[str], self.pending()["messages"])), 1)
 
     def test_a_dead_run_that_a_newer_run_of_its_command_answers_delivers_nothing(self) -> None:
@@ -540,8 +539,8 @@ sys.exit(1)
         newer = older.with_name("r2.json")
         _ = newer.write_text(older.read_text(encoding="utf-8"), encoding="utf-8")
         self.update_record(newer, run_id="r2", started_at=time.time(), pid=DEAD_PID)
-        self.assertEqual(mesh_runs.reap_orphans(str(self.session), WORKER), ["r1", "r2"])
-        older_record = cast(mesh_runs.RunRecord, json.loads(older.read_text(encoding="utf-8")))
+        self.assertEqual(detached_runs.reap_orphans(str(self.session), WORKER), ["r1", "r2"])
+        older_record = cast(detached_runs.RunRecord, json.loads(older.read_text(encoding="utf-8")))
         self.assertIn("a newer run of the same command answers", older_record.get("delivery", ""))
         messages = cast(list[str], self.pending()["messages"])
         self.assertEqual(len(messages), 1, "only the newest dead run reports")
@@ -549,26 +548,26 @@ sys.exit(1)
 
     def test_a_supervisor_for_a_different_record_is_not_trusted(self) -> None:
         path = self.live_run(["echo", "x"])
-        original = cast(mesh_runs.RunRecord, json.loads(path.read_text()))
-        self.assertTrue(mesh_run_process.supervises(original["pid"], path))
+        original = cast(detached_runs.RunRecord, json.loads(path.read_text()))
+        self.assertTrue(detached_run_process.supervises(original["pid"], path))
         another = path.with_name("another.json")
         _ = another.write_text(path.read_text())
-        self.assertFalse(mesh_run_process.supervises(original["pid"], another))
-        self.assertFalse(mesh_run_process.supervises(os.getpid(), path))
+        self.assertFalse(detached_run_process.supervises(original["pid"], another))
+        self.assertFalse(detached_run_process.supervises(os.getpid(), path))
 
     def test_a_live_supervisor_is_not_ended(self) -> None:
         path = self.live_run(["bash", "verify.sh", "check"])
-        self.assertEqual(mesh_runs.reap_orphans(str(self.session)), [])
+        self.assertEqual(detached_runs.reap_orphans(str(self.session)), [])
         self.assertEqual(json.loads(path.read_text(encoding="utf-8"))["status"], "running")
 
-    def test_start_exits_3_for_a_caller_that_is_not_a_mesh_worker(self) -> None:
+    def test_start_exits_3_for_a_caller_without_a_registered_worker(self) -> None:
         popen = MagicMock(return_value=SimpleNamespace(pid=4321))
         for environment in ({"CODEX_THREAD_ID": "thread-unknown"}, {"CODEX_THREAD_ID": ""}):
             with patch.dict(os.environ, environment), patch.object(subprocess, "Popen", popen):
-                self.assertEqual(mesh_runs.main(["start", "--", "true"]), mesh_runs.NOT_A_MESH_WORKER)
+                self.assertEqual(detached_runs.main(["start", "--", "true"]), detached_runs.NOT_A_DETACHED_WORKER)
         _ = staff.retire(self.worker_id)
         with patch.dict(os.environ, {"CODEX_THREAD_ID": THREAD_ONE}), patch.object(subprocess, "Popen", popen):
-            self.assertEqual(mesh_runs.main(["start", "--", "true"]), mesh_runs.NOT_A_MESH_WORKER)
+            self.assertEqual(detached_runs.main(["start", "--", "true"]), detached_runs.NOT_A_DETACHED_WORKER)
         popen.assert_not_called()
 
     # Criterion 2: the result is held for the seat, then the record is marked finished.
@@ -579,30 +578,30 @@ sys.exit(1)
         marker = self.root / "r1.scope"
         on = {"XDG_RUNTIME_DIR": str(runtime)}
         with patch("shutil.which", return_value="/bin/systemd-run"):
-            self.assertEqual(mesh_runs.scope_prefix(marker, on), [])
+            self.assertEqual(detached_runs.scope_prefix(marker, on), [])
             with socket.socket(socket.AF_UNIX) as manager:
                 manager.bind(str(runtime / "systemd" / "private"))
-                prefix = mesh_runs.scope_prefix(marker, on)
-                self.assertEqual(mesh_runs.scope_prefix(marker, {**on, "BUILDLOG_SCOPE": "0"}), [])
+                prefix = detached_runs.scope_prefix(marker, on)
+                self.assertEqual(detached_runs.scope_prefix(marker, {**on, "BUILDLOG_SCOPE": "0"}), [])
         self.assertEqual(prefix[:2], ["systemd-run", "--user"])
         self.assertIn("--slice=builds.slice", prefix)
-        self.assertEqual(prefix[-4:], ["/bin/sh", "-c", mesh_runs.SCOPE_SCRIPT, str(marker)])
+        self.assertEqual(prefix[-4:], ["/bin/sh", "-c", detached_runs.SCOPE_SCRIPT, str(marker)])
         with patch("shutil.which", return_value=None):
-            self.assertEqual(mesh_runs.scope_prefix(marker, on), [])
+            self.assertEqual(detached_runs.scope_prefix(marker, on), [])
 
     def test_a_scope_runs_the_command_once_and_a_failed_scope_runs_it_plainly(self) -> None:
         count = self.root / "count"
         command = ["/bin/sh", "-c", f'echo run >> "{count}"']
-        scope = self.session / mesh_runs.DETACHED_RUNS_DIR / "r1.scope"
+        scope = self.session / detached_runs.DETACHED_RUNS_DIR / "r1.scope"
         # A scope without systemd-run: the same script, so the marker proves the command started.
-        with patch.object(mesh_runs, "scope_prefix", return_value=["/bin/sh", "-c", mesh_runs.SCOPE_SCRIPT, str(scope)]):
+        with patch.object(detached_runs, "scope_prefix", return_value=["/bin/sh", "-c", detached_runs.SCOPE_SCRIPT, str(scope)]):
             record = self.supervise(self.record(command))
         self.assertEqual((record.get("exit_code"), count.read_text(encoding="utf-8")), (0, "run\n"))
         self.assertFalse(scope.exists())
         count.unlink()
         (session_staff.inbox_path(self.worker_id)).unlink()
         # A scope that fails before the command starts leaves no marker.
-        with patch.object(mesh_runs, "scope_prefix", return_value=["/bin/sh", "-c", "exit 1", "scope"]):
+        with patch.object(detached_runs, "scope_prefix", return_value=["/bin/sh", "-c", "exit 1", "scope"]):
             record = self.supervise(self.record(command))
         self.assertEqual((record.get("exit_code"), count.read_text(encoding="utf-8")), (0, "run\n"))
 
@@ -632,7 +631,7 @@ sys.exit(1)
         self.assertEqual(record.get("exit_code"), 76)
 
     def test_a_line_over_codexs_input_limit_delivers_cut_under_the_cap(self) -> None:
-        limits = conf.read("mesh_runs")
+        limits = conf.read("detached_runs")
         line_chars = limits.whole("RESULT_LINE_CHARS")
         text_chars = limits.whole("RESULT_TEXT_CHARS")
         script = "print('x' * 1_100_000)\nfor n in range(30): print(str(n) * 5_000)\nprint('last line')"
@@ -647,21 +646,21 @@ sys.exit(1)
         self.assertLessEqual(len(message), text_chars)
 
     def test_result_text_caps_the_total_size_including_the_header(self) -> None:
-        record = cast(mesh_runs.RunRecord, json.loads(self.record(["true"]).read_text()))
+        record = cast(detached_runs.RunRecord, json.loads(self.record(["true"]).read_text()))
         record["label"] = "verification " * 1_000
         _ = Path(record["log"]).write_text("line " * 1_000 + "\n" + ("x" * 5_000 + "\n") * 20 + "last line\n")
 
-        text = mesh_runs.result_text(record, mesh_runs.CompletedCommand(1))
+        text = detached_runs.result_text(record, detached_runs.CompletedCommand(1))
 
         self.assertLessEqual(len(text), 2_000)
         self.assertIn("Result: FAIL (exit 1)", text)
         self.assertIn(f"Log: {record['log']}", text)
         self.assertTrue(text.endswith("\nlast line"))
 
-        config = self.root / "config/mesh_runs.conf"
+        config = self.root / "config/detached_runs.conf"
         _ = config.write_text(config.read_text().replace("RESULT_LINE_CHARS=300", "RESULT_LINE_CHARS=100")
                               .replace("RESULT_TEXT_CHARS=2000", "RESULT_TEXT_CHARS=1200"))
-        text = mesh_runs.result_text(record, mesh_runs.CompletedCommand(1))
+        text = detached_runs.result_text(record, detached_runs.CompletedCommand(1))
         self.assertLessEqual(len(text), 1_200)
         self.assertIn(f"{'x' * 100} [cut: {5_000 - 100} more characters]", text)
         self.assertIn("Result: FAIL (exit 1)", text)
@@ -669,12 +668,12 @@ sys.exit(1)
         self.assertTrue(text.endswith("\nlast line"))
 
     def test_result_text_collapses_consecutive_memory_wait_lines_before_taking_the_tail(self) -> None:
-        record = cast(mesh_runs.RunRecord, json.loads(self.record(["true"]).read_text()))
+        record = cast(detached_runs.RunRecord, json.loads(self.record(["true"]).read_text()))
         lines = ["first diagnostic", *(f"still waiting for memory: {n}" for n in range(30)),
                  "second diagnostic", "still waiting for memory: retry", "still waiting for memory: ready", "last line"]
         _ = Path(record["log"]).write_text("\n".join(lines))
 
-        text = mesh_runs.result_text(record, mesh_runs.CompletedCommand(0))
+        text = detached_runs.result_text(record, detached_runs.CompletedCommand(0))
 
         self.assertIn("first diagnostic", text)
         self.assertIn("second diagnostic", text)
@@ -693,10 +692,10 @@ sys.exit(1)
         record = cast(dict[str, object], json.loads(path.read_text(encoding="utf-8")))
         record["pid"] = 0
         _ = path.write_text(json.dumps(record), encoding="utf-8")
-        self.assertTrue(codex_mesh._detached_run_live(str(self.session), WORKER))  # pyright: ignore[reportPrivateUsage]
+        self.assertEqual(detached_runs.reap_orphans(str(self.session)), [])
         record["started_at"] = time.time() - 120
         _ = path.write_text(json.dumps(record), encoding="utf-8")
-        self.assertFalse(codex_mesh._detached_run_live(str(self.session), WORKER))  # pyright: ignore[reportPrivateUsage]
+        self.assertEqual(detached_runs.reap_orphans(str(self.session)), ["r1"])
 
 
 class PaneRunDeliveryTests(unittest.TestCase):
@@ -717,7 +716,7 @@ class PaneRunDeliveryTests(unittest.TestCase):
         self.defer_transcript = False
         self.pending_transcripts = []
         config = self.fixture.root / "conf"
-        for name in ("mesh_runs", "send", "postmaster", "codex_daemon"):
+        for name in ("detached_runs", "send", "postmaster", "codex_daemon"):
             write_text_atomic(config / f"{name}.conf",
                               (Path(__file__).resolve().parents[2] / f"config/{name}.conf").read_text())
         for name, keys in (("send", {"delivery_timeout", "kill_grace", "remote_transport_seconds",
@@ -729,7 +728,6 @@ class PaneRunDeliveryTests(unittest.TestCase):
                                              if line.split("=", 1)[0] in keys else line
                                              for line in path.read_text().splitlines()) + "\n")
         self.run_dir.mkdir()
-        write_text_atomic(self.run_dir / "worker_transport", "herdr\n")
         write_text_atomic(self.run_dir / unit_runs.STATE_FILE, json.dumps({"owner_staff_id": self.fixture.parent.id}))
         marker = unit_runs.marker(self.fixture.parent.current_session)
         marker.parent.mkdir(parents=True, exist_ok=True)
@@ -768,20 +766,20 @@ class PaneRunDeliveryTests(unittest.TestCase):
     def run_dir(self) -> Path:
         return self.fixture.root / "run"
 
-    def record(self, row: staff.StaffRow, run_id: str = "pane-result") -> mesh_runs.RunRecord:
-        runs = self.run_dir / mesh_runs.DETACHED_RUNS_DIR
+    def record(self, row: staff.StaffRow, run_id: str = "pane-result") -> detached_runs.RunRecord:
+        runs = self.run_dir / detached_runs.DETACHED_RUNS_DIR
         runs.mkdir(exist_ok=True)
         log = runs / f"{run_id}.log"
         write_text_atomic(log, "private verification output\n")
-        record: mesh_runs.RunRecord = {"run_id": run_id, "status": "running", "session_dir": str(self.run_dir),
+        record: detached_runs.RunRecord = {"run_id": run_id, "status": "running", "session_dir": str(self.run_dir),
                 "worker": row.name, "staff_id": row.id, "label": "fixture gate", "command": ["true"],
                 "log": str(log), "started_at": time.time(), "pid": 0,
                 "director_dir": str(self.run_dir), "done_message_file": ""}
         write_text_atomic(log.with_suffix(".json"), json.dumps(record))
         return record
 
-    def assert_holder_result(self, record: mesh_runs.RunRecord, reason: str) -> None:
-        result = mesh_runs.deliver(record, mesh_runs.CompletedCommand(1))
+    def assert_holder_result(self, record: detached_runs.RunRecord, reason: str) -> None:
+        result = detached_runs.deliver(record, detached_runs.CompletedCommand(1))
         self.assertIn("sent", result)
         self.assertEqual(self.inputs, [])
         self.assertEqual(len(self.notices), 1)
@@ -791,7 +789,7 @@ class PaneRunDeliveryTests(unittest.TestCase):
         self.assertIn(record["run_id"], text)
         self.assertIn("private verification output", text)
 
-    def test_detached_callers_use_current_native_sessions_without_a_mesh_roster(self) -> None:
+    def test_detached_callers_use_current_native_sessions_from_staff(self) -> None:
         families: tuple[tuple[Literal["claude", "codex"], str], ...] = (
             ("claude", "CLAUDE_CODE_SESSION_ID"), ("codex", "CODEX_THREAD_ID"))
         for family, variable in families:
@@ -800,14 +798,14 @@ class PaneRunDeliveryTests(unittest.TestCase):
                 before = self.fixture.staff_state()
                 with patch.dict(os.environ, {"CODEX_THREAD_ID": row.current_session}), \
                         patch.object(staff, "local_snapshot", wraps=staff.local_snapshot) as read:
-                    caller = mesh_runs.caller_from_environment({variable: row.current_session, "UNIT_RUN_DIR": str(self.run_dir)})
+                    caller = detached_runs.caller_from_environment({variable: row.current_session, "UNIT_RUN_DIR": str(self.run_dir)})
                 self.assertEqual(read.call_count, 1)
                 self.assertEqual(self.fixture.staff_state(), before)
-                self.assertIsInstance(caller, mesh_runs.PaneCaller)
-                assert isinstance(caller, mesh_runs.PaneCaller)
+                self.assertIsInstance(caller, detached_runs.PaneCaller)
+                assert isinstance(caller, detached_runs.PaneCaller)
                 self.assertEqual((caller.session_dir, caller.name, caller.staff_id), (str(self.run_dir), row.name, row.id))
                 with patch.dict(os.environ, {"CODEX_THREAD_ID": row.id}):
-                    self.assertIsInstance(mesh_runs.caller_from_environment({variable: row.id}), mesh_runs.NotMeshWorker)
+                    self.assertIsInstance(detached_runs.caller_from_environment({variable: row.id}), detached_runs.NotDetachedWorker)
 
     def test_run_started_for_a_pane_slot_stays_live_and_delivers_to_its_worker(self) -> None:
         _ = self.fixture.worker_run("a-first", "unit", self.fixture.parent.current_session,
@@ -829,7 +827,7 @@ class PaneRunDeliveryTests(unittest.TestCase):
                 dispatch_id = progress_history.begin_dispatch(self.run_dir, slot="test", phase="40", role="test",
                     worker_name=row.name, worker_id=row.id, launcher_command=["private-launcher"], prompt=prompt,
                     kind="test", lens="")
-                runs = self.run_dir / mesh_runs.DETACHED_RUNS_DIR
+                runs = self.run_dir / detached_runs.DETACHED_RUNS_DIR
                 before = set(runs.glob("*.json"))
                 input_count = len(self.inputs)
                 output = io.StringIO()
@@ -838,18 +836,18 @@ class PaneRunDeliveryTests(unittest.TestCase):
                       patch.object(treekey, "tree_key", return_value="private-tree"),
                       patch.object(subprocess, "Popen", return_value=SimpleNamespace(pid=0)),
                       contextlib.redirect_stdout(output)):
-                    code = mesh_runs.main(["start", *route, "--", "true"])
+                    code = detached_runs.main(["start", *route, "--", "true"])
                 self.assertEqual(code, 0, output.getvalue())
                 path, = set(runs.glob("*.json")) - before
-                record = cast(mesh_runs.RunRecord, json.loads(path.read_text()))
+                record = cast(detached_runs.RunRecord, json.loads(path.read_text()))
                 self.assertEqual((record["worker"], record["staff_id"]), (row.name, row.id))
                 record["pid"] = private_supervisor(self, path)
                 write_text_atomic(path, json.dumps(record))
-                self.assertEqual(mesh_runs.live_runs(runs, row.name), [record])
-                self.assertEqual(mesh_runs.worker_runs(runs, row.name), [record])
-                self.assertEqual(mesh_runs.live_runs(runs, "test"), [])
+                self.assertEqual(detached_runs.live_runs(runs, row.name), [record])
+                self.assertEqual(detached_runs.worker_runs(runs, row.name), [record])
+                self.assertEqual(detached_runs.live_runs(runs, "test"), [])
                 write_text_atomic(Path(record["log"]), "Private command completed.\n")
-                self.assertIn("sent", mesh_runs.deliver(record, mesh_runs.CompletedCommand(0)))
+                self.assertIn("sent", detached_runs.deliver(record, detached_runs.CompletedCommand(0)))
                 self.assertEqual(len(self.inputs), input_count + 1)
                 self.assertEqual(self.inputs[-1][0], pane)
                 self.assertIn(f"Detached run: {record['run_id']}", self.inputs[-1][1])
@@ -866,15 +864,14 @@ class PaneRunDeliveryTests(unittest.TestCase):
         os.rename(registry, registry.with_name(f"{os.getpid()}.json"))
         stale_run = self.fixture.root / "stale-run"
         stale_run.mkdir()
-        write_text_atomic(stale_run / "worker_transport", "herdr\n")
         for inherited in ({"CLAUDE_CODE_SESSION_ID": sibling.current_session,
                            "UNIT_RUN_DIR": str(stale_run)}, {}):
             with self.subTest(inherited=bool(inherited)), patch.dict(os.environ, {
                     "CODEX_THREAD_ID": "", "CLAUDE_CODE_SESSION_ID": inherited.get("CLAUDE_CODE_SESSION_ID", ""),
                     "UNIT_RUN_DIR": str(stale_run)}):
-                caller = mesh_runs.caller_from_environment(inherited)
-                self.assertIsInstance(caller, mesh_runs.PaneCaller)
-                assert isinstance(caller, mesh_runs.PaneCaller)
+                caller = detached_runs.caller_from_environment(inherited)
+                self.assertIsInstance(caller, detached_runs.PaneCaller)
+                assert isinstance(caller, detached_runs.PaneCaller)
                 self.assertEqual((caller.staff_id, caller.session_dir), (row.id, str(self.run_dir)))
 
     def test_failed_result_delivery_recovers_the_original_command_result(self) -> None:
@@ -890,16 +887,16 @@ class PaneRunDeliveryTests(unittest.TestCase):
             return send.Result("failed", "daemon unavailable")
 
         with patch.object(send, "_send", failed_holder):
-            self.assertEqual(mesh_runs.main(["supervise", str(path)]), 1)
-            pending = cast(mesh_runs.RunRecord, json.loads(path.read_text()))
+            self.assertEqual(detached_runs.main(["supervise", str(path)]), 1)
+            pending = cast(detached_runs.RunRecord, json.loads(path.read_text()))
             self.assertEqual(pending["status"], "running")
-            self.assertEqual(mesh_runs.reap_orphans(str(self.run_dir)), [])
-        self.assertEqual(mesh_runs.reap_orphans(str(self.run_dir)), [record["run_id"]])
-        finished = cast(mesh_runs.RunRecord, json.loads(path.read_text()))
+            self.assertEqual(detached_runs.reap_orphans(str(self.run_dir)), [])
+        self.assertEqual(detached_runs.reap_orphans(str(self.run_dir)), [record["run_id"]])
+        finished = cast(detached_runs.RunRecord, json.loads(path.read_text()))
         self.assertEqual(finished["status"], "finished")
         self.assertEqual(len(self.notices), 1)
         self.assertIn("FAIL (exit 9)", self.notices[0][1])
-        self.assertEqual(mesh_runs.reap_orphans(str(self.run_dir)), [])
+        self.assertEqual(detached_runs.reap_orphans(str(self.run_dir)), [])
 
     def test_delayed_transcript_publication_retypes_without_a_receipt(self) -> None:
         row = self.fixture.worker(family="codex")
@@ -916,7 +913,7 @@ class PaneRunDeliveryTests(unittest.TestCase):
             yield from entries
 
         with patch.object(worker_admission, "transcript_entries", delayed_entries), ThreadPoolExecutor(max_workers=2) as pool:
-            futures = (pool.submit(mesh_runs.deliver, record, mesh_runs.CompletedCommand(0)), pool.submit(mesh_runs.deliver, record, mesh_runs.CompletedCommand(0)))
+            futures = (pool.submit(detached_runs.deliver, record, detached_runs.CompletedCommand(0)), pool.submit(detached_runs.deliver, record, detached_runs.CompletedCommand(0)))
             results = [future.result() for future in futures]
         self.assertEqual(len(self.inputs), 2)
         self.assertEqual(sum("already delivered" in result for result in results), 0)
@@ -930,13 +927,13 @@ class PaneRunDeliveryTests(unittest.TestCase):
         write_text_atomic(path, json.dumps(record))
         self.defer_transcript = True
 
-        with contextlib.suppress(mesh_runs.RunDeliveryFailed):
-            _ = mesh_runs.deliver(record, mesh_runs.CompletedCommand(0))
-        recovered = mesh_runs.reap_orphans(str(self.run_dir))
+        with contextlib.suppress(detached_runs.RunDeliveryFailed):
+            _ = detached_runs.deliver(record, detached_runs.CompletedCommand(0))
+        recovered = detached_runs.reap_orphans(str(self.run_dir))
 
         self.assertEqual(len(self.inputs), 2)
         self.assertEqual(recovered, [record["run_id"]])
-        finished = cast(mesh_runs.RunRecord, json.loads(path.read_text()))
+        finished = cast(detached_runs.RunRecord, json.loads(path.read_text()))
         self.assertEqual(finished["status"], "finished")
         self.assertEqual(len(self.pending_transcripts), 2)
 
@@ -957,10 +954,10 @@ class PaneRunDeliveryTests(unittest.TestCase):
             return run(*arguments, deadline=deadline)
 
         with patch.object(self.fixture.world, "run", side_effect=delivery):
-            self.assertEqual(mesh_runs.main(["supervise", str(path)]), 0)
+            self.assertEqual(detached_runs.main(["supervise", str(path)]), 0)
         self.assertEqual(statuses, ["running"])
-        finished = cast(mesh_runs.RunRecord, json.loads(path.read_text()))
-        result = mesh_runs.deliver(finished, mesh_runs.CompletedCommand(0))
+        finished = cast(detached_runs.RunRecord, json.loads(path.read_text()))
+        result = detached_runs.deliver(finished, detached_runs.CompletedCommand(0))
 
         self.assertEqual(finished["status"], "finished")
         self.assertIn("sent", result)
@@ -979,22 +976,22 @@ class PaneRunDeliveryTests(unittest.TestCase):
 
         def interrupt_finish(target: Path, text: str) -> None:
             if target == path:
-                saved = cast(mesh_runs.RunRecord, json.loads(text))
+                saved = cast(detached_runs.RunRecord, json.loads(text))
                 if saved["status"] == "finished":
                     raise SystemExit("interrupted before the finished record")
             write_text_atomic(target, text)
 
-        with patch("scripts.agents.mesh_runs.write_text_atomic", interrupt_finish):
+        with patch("scripts.agents.detached_runs.write_text_atomic", interrupt_finish):
             with self.assertRaisesRegex(SystemExit, "interrupted before the finished record"):
-                _ = mesh_runs.main(["supervise", str(path)])
+                _ = detached_runs.main(["supervise", str(path)])
 
         self.assertEqual(len(self.inputs), 1)
-        self.assertEqual(mesh_runs.reap_orphans(str(self.run_dir)), [record["run_id"]])
+        self.assertEqual(detached_runs.reap_orphans(str(self.run_dir)), [record["run_id"]])
         self.assertEqual(len(self.inputs), 2)
         self.assertEqual(self.inputs[0], self.inputs[1])
-        finished = cast(mesh_runs.RunRecord, json.loads(path.read_text()))
+        finished = cast(detached_runs.RunRecord, json.loads(path.read_text()))
         self.assertEqual(finished["status"], "finished")
-        self.assertEqual(mesh_runs.reap_orphans(str(self.run_dir)), [])
+        self.assertEqual(detached_runs.reap_orphans(str(self.run_dir)), [])
         self.assertEqual(self.notices, [])
 
     def test_pane_result_arrives_after_the_launcher_exits(self) -> None:
@@ -1008,20 +1005,20 @@ class PaneRunDeliveryTests(unittest.TestCase):
             return SimpleNamespace(pid=998901)
 
         with patch.dict(os.environ, {"CODEX_THREAD_ID": row.current_session, "BUILDLOG_SCOPE": "0"}), \
-                patch.object(mesh_runs, "subprocess", SimpleNamespace(
+                patch.object(detached_runs, "subprocess", SimpleNamespace(
                     Popen=start_supervisor, DEVNULL=subprocess.DEVNULL, STDOUT=subprocess.STDOUT)):
             _ = os.environ.pop("UNIT_RUN_DIR", None)
             _ = os.environ.pop("PLAN_DELEGATE_BOARD_DIR", None)
-            self.assertEqual(mesh_runs.main(["start", "--label", "private result", "--",
+            self.assertEqual(detached_runs.main(["start", "--label", "private result", "--",
                                              sys.executable, "-c", "print('result after launcher exit')"]), 0)
-        paths = list((self.run_dir / mesh_runs.DETACHED_RUNS_DIR).glob("*.json"))
+        paths = list((self.run_dir / detached_runs.DETACHED_RUNS_DIR).glob("*.json"))
         self.assertEqual(len(paths), 1)
-        record = cast(mesh_runs.RunRecord, json.loads(paths[0].read_text()))
+        record = cast(detached_runs.RunRecord, json.loads(paths[0].read_text()))
         self.assertEqual(record["staff_id"], row.id)
         self.assertEqual(record["session_dir"], str(self.run_dir))
         self.assertIn("supervise", str(supervisors))
 
-        self.assertEqual(mesh_runs.main(["supervise", str(paths[0])]), 0)
+        self.assertEqual(detached_runs.main(["supervise", str(paths[0])]), 0)
 
         self.assertEqual([pane for pane, _ in self.inputs], ["w1:p1"])
         self.assertIn("result after launcher exit", self.inputs[0][1])
@@ -1036,7 +1033,7 @@ class PaneRunDeliveryTests(unittest.TestCase):
         sibling = self.fixture.worker("sibling", family="codex")
         self.fixture.world.add(sibling, "w1:p2", family="codex")
 
-        result = mesh_runs.deliver(record, mesh_runs.CompletedCommand(0))
+        result = detached_runs.deliver(record, detached_runs.CompletedCommand(0))
 
         self.assertIn("w2:p7", result)
         self.assertEqual([pane for pane, _ in self.inputs], ["w2:p7"])
@@ -1050,10 +1047,10 @@ class PaneRunDeliveryTests(unittest.TestCase):
         record = self.record(row)
         self.interrupt_after_input = True
         with self.assertRaisesRegex(SystemExit, "interrupted after pane input"):
-            _ = mesh_runs.deliver(record, mesh_runs.CompletedCommand(0))
+            _ = detached_runs.deliver(record, detached_runs.CompletedCommand(0))
         self.interrupt_after_input = False
 
-        result = mesh_runs.deliver(record, mesh_runs.CompletedCommand(0))
+        result = detached_runs.deliver(record, detached_runs.CompletedCommand(0))
 
         self.assertIn("already delivered", result)
         self.assertEqual(len(self.inputs), 1)
@@ -1064,7 +1061,7 @@ class PaneRunDeliveryTests(unittest.TestCase):
         self.fixture.world.add(row, "w1:p1", family="codex")
         record = self.record(row)
         with ThreadPoolExecutor(max_workers=2) as pool:
-            futures = [pool.submit(mesh_runs.deliver, record, mesh_runs.CompletedCommand(code)) for code in (0, 0)]
+            futures = [pool.submit(detached_runs.deliver, record, detached_runs.CompletedCommand(code)) for code in (0, 0)]
             results = [future.result() for future in futures]
         self.assertEqual(len(self.inputs), 1)
         self.assertEqual(sum("already delivered" in result for result in results), 1)
@@ -1078,8 +1075,8 @@ class PaneRunDeliveryTests(unittest.TestCase):
         for run_id in ("first", "second"):
             record = self.record(row, run_id)
             record["done_message_file"] = str(done)
-            _ = mesh_runs.deliver(record, mesh_runs.CompletedCommand(0))
-            _ = mesh_runs.deliver(record, mesh_runs.CompletedCommand(0))
+            _ = detached_runs.deliver(record, detached_runs.CompletedCommand(0))
+            _ = detached_runs.deliver(record, detached_runs.CompletedCommand(0))
         self.assertEqual(len(self.inputs), 2)
         self.assertIn("Detached run: first", self.inputs[0][1])
         self.assertIn("Detached run: second", self.inputs[1][1])

@@ -22,7 +22,6 @@ from typing import ClassVar, TypedDict, cast, override
 
 from scripts.direct.recorder_fixture import LauncherFixture, configure_launcher_fixture, launcher_environment, prepare_launcher_runtime
 from scripts.direct.assign_launcher_test_support import changed_files, snapshot_files
-from scripts.lib.atomic_file import write_text_atomic
 
 from scripts.lint.memory_test_support import config_environment, write_config_fixture
 
@@ -44,7 +43,7 @@ root = pathlib.Path(os.environ['STUB_CLAUDE_ROOT'])
 if sys.argv[1] == '--bg':
     settings = json.loads(sys.argv[sys.argv.index('--settings') + 1])['env']
     session = pathlib.Path(settings['UNIT_RUN_DIR'])
-    with (session / 'mesh_events.txt').open('a') as events:
+    with (session / 'dispatch_events.txt').open('a') as events:
         events.write('open\\n')
     baseline = session / 'phases/3/phase_baseline'
     if baseline.exists():
@@ -243,11 +242,11 @@ class AssignClaudeLauncherFixture(LauncherFixture):
     @override
     def start_phase(self, name: str) -> Path:
         session = super().start_phase(name)
-        write_text_atomic(session / "worker_transport", "mesh\n")
         state_file = session / "progress_history_state.json"
         state = cast(dict[str, object], json.loads(state_file.read_text()))
         state["owner_staff_id"] = self.staff_parent
         _ = state_file.write_text(json.dumps(state))
+        _ = cast(object, self.enterContext(isolated_staff_file(self.root / "staff.json", {})))
         return session
 
     def build_script_tree(self) -> Path:
@@ -267,6 +266,31 @@ class AssignClaudeLauncherFixture(LauncherFixture):
             _ = shutil.copy2(DIRECT_DIR.parent / "lib" / name, lib / name)
         _ = shutil.copy2(DIRECT_DIR.parent / "lib/nix_env.py", lib / "nix_env.py")
         configure_launcher_fixture(direct_dir / "assign.sh")
+        # Retained child tests call the child API through a private test entry.
+        child_entry = direct_dir / "assign.py"
+        _ = child_entry.write_text("\n".join((
+            "import os, sys",
+            "from pathlib import Path",
+            "import scripts.direct",
+            f"scripts.direct.__path__ = [{str(DIRECT_DIR)!r}, *scripts.direct.__path__]",
+            "from scripts.direct import assign, assign_claude",
+            "assign.SCRIPTS = assign_claude.SCRIPTS = Path(__file__).resolve().parent",
+            "assign.PYTHON = assign_claude.PYTHON = str(assign.SCRIPTS.parent / 'lib/py')",
+            "args = assign.parse_arguments()",
+            "env = dict(os.environ)",
+            "cwd, prompt = Path(args.cwd).resolve(), Path(args.prompt).resolve()",
+            "run, phase = assign.prepare_run(args, cwd, prompt, env)",
+            "role = 'impl' if args.role == 'implement' else args.role",
+            "model = assign.resolve_model(args, role, env)",
+            "check = assign.call([assign.PYTHON, str(assign.SCRIPTS / 'progress_history.py'), 'check-launch', '--session-dir', str(run), '--pass-kind', role, '--phase-id', phase, '--prompt-file', str(prompt), '--fix-cause', args.fix_cause], env, check=False)",
+            "if check.returncode: raise SystemExit(3 if check.returncode == 3 else 2)",
+            "slot = args.to or args.new_worker or role",
+            "before = assign.pass_start_count(run, slot)",
+            "worker = assign_claude.ClaudeFollowUp(args.to) if args.to else assign_claude.NewClaudeWorker()",
+            "code = assign_claude.run(assign_claude.ClaudeLaunch(run, phase, cwd, prompt, role, slot, args.fix_cause, args.pass_number, model[1], model[2], worker, ('bash', str(assign.SCRIPTS / 'assign.sh'), *sys.argv[1:]), env))",
+            "if code and assign.pass_start_count(run, slot) > before: assign.end_failed_launch(run, slot, env)",
+            "raise SystemExit(code)",
+        )) + "\n")
         _ = shutil.copy2(AGENTS_DIR / "claude_account.sh", agents / "claude_account.sh")
         claude = self.root / "claude-bin"
         _ = claude.write_text(STUB_CLAUDE, encoding="utf-8")
@@ -367,7 +391,7 @@ class AssignClaudeLauncherFixture(LauncherFixture):
         berth = binaries / "cargo-berth"
         _ = berth.write_text(f"""#!/usr/bin/env bash
 printf '%s %s\\n' "$CARGO_BERTH_SESSION_ID" "$*" >> {calls}
-printf 'claim\\n' >> {session / "mesh_events.txt"}
+printf 'claim\\n' >> {session / "dispatch_events.txt"}
 printf '%s\\n' '{answer}'
 """, encoding="utf-8")
         berth.chmod(0o755)

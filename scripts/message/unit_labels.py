@@ -319,7 +319,7 @@ def production_places(
 
 
 def unit_labels_for(session_ids: Iterable[str], environment: Mapping[str, str]) -> dict[str, UnitLabels]:
-    """Resolve Claude and Codex holders from files, without process scans, mesh calls or account reads."""
+    """Resolve Claude and Codex holders from files, without process scans or account reads."""
     del environment
     wanted = set(session_ids)
     if not wanted:

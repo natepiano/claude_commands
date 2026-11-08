@@ -51,7 +51,7 @@ both are true:
 These stay too: runs named by active markers, runs with any worker not ended (including
 paused workers), and runs using a live or paused session worktree. Unreadable ownership records
 keep runs too, including their temp entries. These runs also keep folders named by cwd in their
-mesh_runs/*.json records. Empty mesh_runs files are not records. Pending files are not read.
+detached_runs/*.json records. Empty detached_runs files are not records. Pending files are not read.
 A worker thread not ended keeps its session temp parent, but its old temp entries can go.
 An unreadable worker record keeps scratch entries and top-level /tmp/claude entries, and names
 the record in the log. Before an idle entry can go, a git check searches
@@ -863,7 +863,7 @@ def worker_use(guarded: dict[str, RunKeepReason], use: PaneRunUse) -> WorkerUse:
         except (staff.StaffUnreadable, OSError, UnicodeError, ValueError) as error:
             print(f"tmp sweep: {state_path}: {error}", file=sys.stderr)
             unreadable.append(str(state_path))
-        runs_path = Path(folder) / "mesh_runs"
+        runs_path = Path(folder) / "detached_runs"
         try:
             for path in record_entries(runs_path):
                 if path.suffix != ".json":

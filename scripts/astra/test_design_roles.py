@@ -733,7 +733,6 @@ class DurableRolesTests(HeldRolePaneCase):
                                         binding=self.binding(self.run_a))
         world = self.panes.world
         world.locations["w1:p2"]["agent_status"] = "working"
-        _ = (self.run_a / "worker_transport").write_text("herdr\n")
         reply = self.resume(design, "designer")
         self.assertEqual(reply.read_text(), "Saved reply from " + self.launches[0][1])
         current = design_roles.read_design(design.placement.design_id)
@@ -746,7 +745,6 @@ class DurableRolesTests(HeldRolePaneCase):
                                         binding=self.binding(self.run_a))
         world = self.panes.world
         world.unknown["w1:p2"] = "sibling process evidence is unreadable"
-        _ = (self.run_a / "worker_transport").write_text("herdr\n")
         rebound = design_roles.rebind(design.placement.design_id, expected_generation=1,
                                       reason="next phase", binding=self.binding(self.run_b))
         self.assertEqual(design_roles.read_design(design.placement.design_id).binding, self.binding(self.run_b))

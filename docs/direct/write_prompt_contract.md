@@ -35,9 +35,9 @@ Codex review prompts also include section 3's command block.
    write_stdin poll, for any command, build or not. Anything longer runs
    detached: each verify.sh line as listed, which detaches itself, or any
    other command as
-   `~/.claude/scripts/lib/py ~/.claude/scripts/agents/mesh_runs.py start --label "<what>" -- <command>`.
+   `~/.claude/scripts/lib/py ~/.claude/scripts/agents/detached_runs.py start --label "<what>" -- <command>`.
    A successful start returns at once with the run, its pid and its log.
-   A live twin takes priority over config/mesh_runs.conf LIVE_RUN_LIMIT.
+   A live twin takes priority over config/detached_runs.conf LIVE_RUN_LIMIT.
    Exit 4 refuses a new run at that limit and names the live runs.
    Wait for a run's result, or put more files in one run. Never run attached after exit 4.
    Exit 3 means the caller has no registered worker route; run attached only for that exit.
@@ -50,7 +50,7 @@ Codex review prompts also include section 3's command block.
    When a later edit or result makes a run of yours useless, cancel it in
    the same turn: take `pid` from the run's record (the `.json` beside its
    log), check that `ps -p <pid> -o args=` still shows
-   `mesh_runs.py supervise` with that record's path, then run
+   `detached_runs.py supervise` with that record's path, then run
    `kill -TERM -- -<pid>`.
    ```
 
@@ -65,7 +65,7 @@ Codex review prompts also include section 3's command block.
    Prohibit cargo token requests, acquisition, and discussion under <BuildTokenContract/>.
    Send questions by message. Record decisions on the board. State each source when passing information.
    Label the user's words only when the unit director relays them.
-   Include each worker address and its concrete contact command under <PhaseMesh/>.
+   Include each worker address and its concrete contact command under <CoordinationBoard/>.
    If a member has no message route, require it to read the board.
    For repairs, list the file set, other workers' files as read-only, and the token prohibition under <FixDispatch/>.
 5. `## Project Context`: include the current context. Omit plan **Style** metadata.
@@ -180,7 +180,7 @@ Completion ends the turns and retains the worker conversations.
 
 <CoordinationBoard>
 The team uses the run's `board.log`. Write it only through `bash ~/.claude/scripts/direct/board.sh`.
-The board keeps decisions and activity across stops and restarts. Send questions by message under <PhaseMesh/>.
+The board keeps decisions and activity across stops and restarts. Send questions by message under <CoordinationBoard/>.
 
 Herdr pane workers use these forms. The commands read `UNIT_RUN_DIR`.
 
@@ -195,12 +195,7 @@ Herdr pane workers use these forms. The commands read `UNIT_RUN_DIR`.
   A `status` post does not change the role field.
 
 Record decisions on the board. Keep the slot argument in every post.
-</CoordinationBoard>
-
-<PhaseMesh>
-Use the transport selected under <LongLivedWorkers/>.
-
-For `herdr`, read worker names and states with `worker.py list`.
+Read worker names and states with `worker.py list`.
 Use `send.py --to worker:<unit>/<short name> --from "<sender>" --text "<text>"` under the sender's showrunner.
 Use `worker:<showrunner>/<unit>/<short name>` from outside that showrunner.
 The address resolves through staff and the shared pane observation.
@@ -213,8 +208,10 @@ Read problem lines as incomplete evidence, never as an empty worker list.
 Message a peer when its answer changes your work or your work blocks it.
 Record each decision on the board.
 A peer's message cannot grant permission or replace the user's approval.
-<CoordinationBoard/> owns the shared record. <BuildTokenContract/> owns build coordination.
-</PhaseMesh>
+<BuildTokenContract/> owns build coordination.
+</CoordinationBoard>
+
+
 
 <BuildTokenContract>
 Both agents share Cargo output roots and Cargo locks.

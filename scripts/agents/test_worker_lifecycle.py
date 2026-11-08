@@ -17,9 +17,9 @@ from typing import TextIO, cast, override
 from unittest.mock import patch
 
 from scripts.agents import worker_lifecycle
-from scripts.agents import codex_mesh_test_support as fixture_support
+from scripts.agents import codex_test_support as fixture_support
 from scripts.whoami.note_file import note_name
-from scripts.agents.codex_mesh_test_support import FixtureLoopBudget, LifecycleTestClock, StubAppServer
+from scripts.agents.codex_test_support import FixtureLoopBudget, LifecycleTestClock, StubAppServer
 from scripts.lib.test_hang_guard import LauncherHangGuard, TEST_HANG_GUARD_SECS
 from scripts.lib.unit_runs import STATE_FILE
 
@@ -230,7 +230,7 @@ class FixtureHomeSafetyTests(unittest.TestCase):
         self.assertFalse((root / "notes").exists())
 
     def test_base_setup_rejects_unsafe_environment_before_creating_files(self) -> None:
-        from scripts.agents.test_codex_mesh import MeshCommandFixture
+        from scripts.agents.codex_test_support import CodexFixtureCase
 
         root = Path(self.enterContext(tempfile.TemporaryDirectory(dir="/tmp")))
         real = root / "real"
@@ -241,7 +241,7 @@ class FixtureHomeSafetyTests(unittest.TestCase):
             with (self.subTest(variable=name), patch(f"{fixture_support.__name__}.REAL_HOME", real),
                   patch.dict(os.environ, environment),
                   patch.object(tempfile, "TemporaryDirectory", wraps=tempfile.TemporaryDirectory) as temporary):
-                fixture = MeshCommandFixture()
+                fixture = CodexFixtureCase()
                 try:
                     with self.assertRaisesRegex(AssertionError, name + " points into the real home"):
                         fixture.setUp()

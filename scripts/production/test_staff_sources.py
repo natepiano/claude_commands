@@ -59,7 +59,7 @@ class StaffSourcesTests(StaffTestCase):
         world.add(rows[3], "w1:p4")
         config = self.root / "config"
         config.mkdir()
-        write_text_atomic(config / "direct.conf", "# one of: mesh, herdr\nWORKER_TRANSPORT=herdr\n")
+        write_text_atomic(config / "direct.conf", "# Worker settings.\n")
         before = self.staff_file.read_bytes()
         with (mock.patch.dict(os.environ, {"CONF_DIR": str(config), "ROSTER_RUN_ROOT": str(self.root / "runs")}),
               mock.patch.object(worker_panes, "_client", return_value=world),
@@ -84,7 +84,6 @@ class StaffSourcesTests(StaffTestCase):
             self.assertIn("unknown: process read denied", cast(list[str], document["problems"]))
             self.assertFalse(document["complete"])
             self.assertEqual(self.staff_file.read_bytes(), before)
-            self.assertEqual(list((self.root / "runs").glob("**/worker_transport*")), [])
 
 
     def test_live_reports_unreadable_owner_and_record_without_an_empty_member_list(self) -> None:

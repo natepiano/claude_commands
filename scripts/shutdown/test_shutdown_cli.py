@@ -16,6 +16,7 @@ import unittest
 from collections.abc import Callable, MutableMapping
 from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import replace
+from functools import cached_property
 from multiprocessing.connection import Connection
 from pathlib import Path
 from typing import cast, final, override
@@ -25,9 +26,9 @@ from scripts.agents import worker_lifecycle
 from scripts.copies import copies
 from scripts.copies.copies_test_support import copies_environment, fake_remote_removal, publish_mirror
 from scripts.copies.remote_test_support import local_remote_transport
-from scripts.direct import workers
 from scripts.herdr import herdr, worker_panes
 from scripts.herdr.herdr import HerdrPlace
+from scripts.herdr.test_worker_panes import PaneWorld
 from scripts.lib import process_group, atomic_file, conf
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.cargo_output_test_support import fake_cargo_output_roots
@@ -42,7 +43,6 @@ from scripts.production.staff import StaffId
 from scripts.production.staff_test_support import (
     foreign_hostname,
     fixture_member,
-    fixture_worker,
     StaffTestCase,
     fixture_runtime_id,
     CHECKOUT,
@@ -142,6 +142,10 @@ def session(session_id: str, name: str, pid: int) -> SessionRecord:
 
 @final
 class RetireUnitTests(unittest.TestCase):
+    @cached_property
+    def pane_world(self) -> PaneWorld:
+        return PaneWorld()
+
     def test_retirement_retains_the_identity_and_excludes_it_from_active_views(self) -> None:
         from scripts.direct import board_json
         from scripts.production import session_staff, showrunners
@@ -161,7 +165,12 @@ class RetireUnitTests(unittest.TestCase):
 
 
     def test_retirement_continues_after_a_member_stop_raises(self) -> None:
-        with (mock.patch.object(stop_resume, "stop", side_effect=[OSError("stop read failed"), stop_resume.NotRunning(SEAT)]) as stops,
+        def stop(identity: str, *, deadline: float = math.inf) -> stop_resume.Stopped | stop_resume.NotRunning:
+            if identity == DIRECTOR:
+                raise OSError("stop read failed")
+            return self.stop_session(identity, deadline=deadline)
+
+        with (mock.patch.object(stop_resume, "stop", side_effect=stop) as stops,
               mock.patch.object(shutdown, "retirement_refusals", return_value=[]),
               mock.patch.object(shutdown, "retirement_remove", return_value=[]) as remove):
             code, output = self.retire()
@@ -175,7 +184,6 @@ class RetireUnitTests(unittest.TestCase):
         states: list[worker_panes.WorkerPane] = [worker_panes.OpenWorker(row, "outside-pane", "same-terminal", herdr.AgentStatus.WORKING)]
         self.marked = None
         self.claude = [item for item in self.claude if item["sessionId"] != DIRECTOR]
-        atomic_file.write_text_atomic(self.run_folder / "worker_transport", "herdr\n")
         def observe(_parent: staff.StaffId, _record: staff.StaffSnapshot) -> list[worker_panes.WorkerPane]:
             return list(states)
         def stop(member: staff.StaffRow, client: herdr.Herdr, *, deadline: float) -> bool:
@@ -458,10 +466,7 @@ class RetireUnitTests(unittest.TestCase):
         runs = self.root / "runs"
         self.run_folder = runs / "run-1"
         self.run_folder.mkdir(parents=True)
-        atomic_file.write_text_atomic(self.run_folder / "worker_transport", "mesh\n")
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"UNIT_RUN_DIR": str(self.run_folder)})))
-        # The test's own pid stands in for the app-server: the mesh stand-in never signals it.
-        _ = (self.run_folder / "mesh_server.json").write_text(json.dumps({"pid": os.getpid()}), encoding="utf-8")
         holds = self.root / "holds"
         holds.mkdir()
         _ = (holds / DIRECTOR).write_text("{}", encoding="utf-8")
@@ -474,7 +479,11 @@ class RetireUnitTests(unittest.TestCase):
                          worktree=staff.PresentWorktree(remote.local_machine(), self.worktree)).id
         _ = unit_config.write(self.worktree, unit_config.UnitConfig(unit_config.PlanFile(Path("docs/plans/alpha.md")),
                                                                unit_config.AppPort(1), ("scripts",)))
-        _ = fixture_member("worker", name="seat", parent=self.unit_staff_id, runtime_id=SEAT)
+        member = fixture_member("worker", name="seat", parent=self.unit_staff_id, runtime_id=SEAT)
+        atomic_file.write_text_atomic(self.run_folder / "progress_history_state.json",
+                                     json.dumps({"owner_staff_id": str(self.unit_staff_id)}))
+        self.pane_world.add(member, "w1:p2")
+        self.addCleanup(self.pane_world.process_directory.cleanup)
         production = read_production("alpha")
 
         def production_of(_production_name: str, *, record: staff.StaffSnapshot) -> Production:
@@ -500,20 +509,9 @@ class RetireUnitTests(unittest.TestCase):
             return sessions.SessionNotLive()
 
         self.enterContext(mock.patch.dict(os.environ, {"RETIRE_UNIT_RUN_ROOT": str(runs),
-                                                       "UNIT_WORKERS_STATE": str(self.root / "unit-workers"),
                                                        "BUILD_HOLD_DIR": str(holds),
                                                        "DESIGN_ROLES_STATE": str(self.root / "design-roles"),
                                                        "DESIGN_OWNERSHIP_STATE": str(self.root / "design-ownership")}))
-        roster: dict[str, object] = {}
-        home = self.root / "codex"
-        store = workers.UnitWorkerLedger(workers.ledger_path("alpha", "alpha"))
-        with store.locked() as ledger:
-            for name, status in (("alpha-impl", "running"), ("alpha-old", "ended")):
-                row = fixture_worker(name, self.unit_staff_id, backend=staff.CodexBackend(home))
-                roster[name] = {"staff_id": row.id, "status": status}
-                ledger.workers[name] = workers.UnitWorker(name, "impl", "codex", "", "", {},
-                    workers.CodexThread(row.current_session, str(home)), workers.Paused(), [], staff_id=row.id)
-        _ = (self.run_folder / "mesh_roster.json").write_text(json.dumps(roster), encoding="utf-8")
         _ = self.enterContext(mock.patch.object(shutdown, "MAC_CLAIMS", self.root / "claims"))
         _ = self.enterContext(mock.patch.object(shutdown, "retirement_production_of", production_of))
         _ = self.enterContext(mock.patch.object(shutdown, "retirement_run", self.fake_run))
@@ -542,6 +540,13 @@ class RetireUnitTests(unittest.TestCase):
 
         _ = self.enterContext(mock.patch.object(unit_lookup, "labeled_session", labeled_session))
         _ = self.enterContext(mock.patch.object(herdr.Herdr, "result", side_effect=process_info))
+        pane_patches = [
+            cast(object, self.enterContext(mock.patch.object(worker_panes, "_client", return_value=self.pane_world))),
+            cast(object, self.enterContext(mock.patch.object(herdr, "Herdr", return_value=self.pane_world))),
+            cast(object, self.enterContext(mock.patch.object(herdr, "native_process", side_effect=self.pane_world.native_process))),
+            cast(object, self.enterContext(mock.patch.object(herdr, "_startup_processes", side_effect=self.pane_world.descendants))),
+        ]
+        self.addCleanup(pane_patches.clear)
         _ = self.enterContext(mock.patch.object(sessions, "config_dirs", lambda: [self.config]))
         self.transcript(self.worktree)
 
@@ -558,9 +563,7 @@ class RetireUnitTests(unittest.TestCase):
             return subprocess.run(argv, cwd=cwd, capture_output=True, text=True, check=False)
         call = [Path(argv[1]).name, *argv[2:]] if argv[0] == sys.executable else argv
         self.calls.append(call)
-        if call[:2] == ["codex_mesh.py", "stop"]:
-            (Path(call[call.index("--session-dir") + 1]) / "mesh_server.json").unlink(missing_ok=True)
-        elif call[:2] == ["build_hold.py", "release"]:
+        if call[:2] == ["build_hold.py", "release"]:
             (Path(os.environ["BUILD_HOLD_DIR"]) / call[call.index("--holder") + 1]).unlink(missing_ok=True)
         stdout = ""
         return subprocess.CompletedProcess(argv, 0, stdout, "")
@@ -570,6 +573,10 @@ class RetireUnitTests(unittest.TestCase):
         self.calls.append(["stop_resume.stop", identity])
         owner = next((item for item in self.claude if item["sessionId"] == identity), None)
         self.claude = [item for item in self.claude if item["sessionId"] != identity]
+        for pane, (pid, family, arguments) in tuple(self.pane_world.foreground.items()):
+            del family, arguments
+            if self.pane_world.processes[pid].identity.id == identity:
+                del self.pane_world.foreground[pane]
         if self.marked and isinstance(self.marked.claude, unit_lookup.LiveClaude) and self.marked.claude.session_id == identity:
             self.marked = None
         return stop_resume.Stopped(identity, owner["pid"]) if owner else stop_resume.NotRunning(identity)

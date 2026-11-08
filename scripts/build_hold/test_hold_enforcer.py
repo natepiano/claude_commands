@@ -243,14 +243,14 @@ class HoldEnforcerTests(unittest.TestCase):
         self.assertEqual(sent[-1], (30, signal.SIGKILL))
         self.assertEqual(len(sent), 4)
 
-    def test_codex_mac_idle_cargo_and_claude_unittest_and_reparented_mesh_test_are_stopped(self) -> None:
+    def test_codex_mac_idle_cargo_and_claude_unittest_and_reparented_worker_test_are_stopped(self) -> None:
         _ = self.process(10, "codex", start=100, environment={"CODEX_THREAD_ID": "codex-worker"})
         _ = self.process(20, "python3", parent=10, argv=("python3", "-m", "unittest", "scripts.direct.test_mac_idle"))
         cargo = self.process(21, "cargo", parent=20, start=11_001, argv=("/nix/store/rust/bin/cargo", "check", "--workspace"))
         (cargo / "cwd").unlink()
         (cargo / "cwd").symlink_to("/dev/shm/mac-idle-suite-123/tmp456")
         _ = self.process(30, "claude", start=100, session="claude-session")
-        _ = self.process(31, "python3", parent=30, argv=("python3", "-m", "unittest", "scripts.agents.test_codex_mesh"))
+        _ = self.process(31, "python3", parent=30, argv=("python3", "-m", "unittest", "scripts.agents.codex_test_support"))
         _ = self.process(40, "python3", argv=("python3", "-m", "unittest", "scripts.production.test_merge_gate"),
                          environment={"CLAUDE_CODE_SESSION_ID": "detached-session"})
         decisions = {item.process.identity.pid: item for item in self.decisions()}

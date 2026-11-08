@@ -141,7 +141,7 @@ class RosterTests(unittest.TestCase):
 
         transport_config = self.root / "config"
         transport_config.mkdir()
-        write_text_atomic(transport_config / "direct.conf", "# one of: mesh, herdr\nWORKER_TRANSPORT=mesh\n")
+        write_text_atomic(transport_config / "direct.conf", "# Worker settings.\n")
         config = self.root / "showrunners.json"
         _ = config.write_text(json.dumps({
             "threshold_percent": 2,
@@ -1320,7 +1320,7 @@ class RosterTests(unittest.TestCase):
         self.assertEqual(decoded.warnings, result.warnings)
         self.assertEqual(decoded.problems, [])
 
-    def test_mesh_titles_use_worker_parents_and_fall_back_when_the_design_is_unreadable(self) -> None:
+    def test_worker_titles_use_worker_parents_and_fall_back_when_the_design_is_unreadable(self) -> None:
         design_id = "00000000-0000-4000-8000-000000000099"
         unit = unit_membership("sdlc", "roles")
         runner = showrunner_relationship("sdlc")
@@ -1337,14 +1337,14 @@ class RosterTests(unittest.TestCase):
             for held_role, name, job in (("designer", "design-address", "designer"),
                                          ("reviewer", "review-address", "design reviewer")):
                 with self.subTest(parent=parent, role=held_role):
-                    shown = roster.mesh_shown_name(directory, name, {"held_design_id": design_id, "held_role": held_role})
+                    shown = roster.worker_shown_name(directory, name, {"held_design_id": design_id, "held_role": held_role})
                     self.assertEqual(shown.render(), f"{prefix} · {job}")
                     self.assertEqual(shown.address, name)
         _ = (design_roles.design_directory(design_id) / "design.json").write_text("broken JSON")
-        self.assertEqual(roster.mesh_shown_name(directory, "review-address", {
+        self.assertEqual(roster.worker_shown_name(directory, "review-address", {
             "held_design_id": design_id, "held_role": "reviewer"}).render(), "review-address")
 
-    def test_docless_row_keeps_repeated_mesh_title_reads_silent(self) -> None:
+    def test_docless_row_keeps_repeated_worker_title_reads_silent(self) -> None:
         showrunner = fixture_member("showrunner", name="docless")
         owner = fixture_member("unit", name="docless", parent=showrunner.id)
         run = self.root / "unplaced-run"
@@ -1353,7 +1353,7 @@ class RosterTests(unittest.TestCase):
         errors = io.StringIO()
         with redirect_stderr(errors):
             for _ in range(2):
-                self.assertEqual(roster.mesh_shown_name(
+                self.assertEqual(roster.worker_shown_name(
                     str(run), "unplaced-worker", {"role": "impl"}).render(),
                     "unplaced-worker")
         self.assertEqual(errors.getvalue(), "")
@@ -1377,17 +1377,17 @@ class RosterTests(unittest.TestCase):
             _ = roster.RosterSnapshot.decode(json.dumps(document))
 
     def test_held_design_roles_keep_jobs_json_and_legacy_snapshot_identity(self) -> None:
-        mesh = str(self.root / "held-design")
+        run_dir = str(self.root / "held-design")
         base = replace(self._entry("unrelated-name", "worker", "worker:held/arbitrary", kind="codex"),
                        showrunner=roster.ProductionWithoutRunningShowrunner("sdlc"),
                        director=roster.UnderDirector("roles", "director", "session:director"))
         entries = [
             replace(base, role="astra-designer", name="design-address",
-                    assignment=roster.HeldDesignRole("designer", mesh),
+                    assignment=roster.HeldDesignRole("designer", run_dir),
                     reach=roster.Messageable("worker:held/design-address"),
                     thread=roster.CodexThread("design-thread")),
             replace(base, role="astra-reviewer", name="review-address",
-                    assignment=roster.HeldDesignRole("reviewer", mesh),
+                    assignment=roster.HeldDesignRole("reviewer", run_dir),
                     reach=roster.Messageable("worker:held/review-address"),
                     thread=roster.CodexThread("review-thread")),
         ]
@@ -1401,7 +1401,7 @@ class RosterTests(unittest.TestCase):
                 self.assertEqual(restored, expected)
                 # A pre-change snapshot uses WorkerAssignment for the same held role.
                 rows[index]["assignment"] = {"tag": "WorkerAssignment", "slot_role": expected.role,
-                                             "session_dir": mesh}
+                                             "session_dir": run_dir}
                 legacy = roster.RosterSnapshot.decode(json.dumps(document)).result.entries[index]
                 self.assertEqual(legacy, expected)
 
@@ -1412,7 +1412,7 @@ class RosterTests(unittest.TestCase):
         flat = cast(list[dict[str, object]], rendered["entries"])
         for row, expected, job in zip(flat, entries, ("designer", "design reviewer"), strict=True):
             self.assertEqual((row["name"], row["role"], row["slot_role"], row["session_dir"]),
-                             (expected.name, expected.role, expected.role, mesh))
+                             (expected.name, expected.role, expected.role, run_dir))
             self.assertEqual(row["address"], f"worker:held/{expected.name}")
             self.assertEqual(row["shown_name"], f"sdlc · roles · {job}")
 
@@ -2192,7 +2192,7 @@ class RosterTests(unittest.TestCase):
         assert isinstance(entry.assignment, roster.WorkerAssignment)
         self.assertEqual(entry.assignment.slot, "test")
         self.assertEqual(roster.shown_name(entry).render(), "alpha · unit-one · worker test")
-        title = roster.mesh_shown_name(str(self.director_run), member.name, {"staff_id": member.id})
+        title = roster.worker_shown_name(str(self.director_run), member.name, {"staff_id": member.id})
         self.assertEqual(title.render(), "alpha · unit-one · worker test")
 
     def test_pane_workers_keep_their_backend_accounts_across_a_selection_change(self) -> None:
@@ -2245,7 +2245,7 @@ class RosterTests(unittest.TestCase):
                 assert isinstance(entry.assignment, roster.WorkerAssignment)
                 self.assertEqual(entry.assignment.slot, slot)
                 self.assertEqual(roster.shown_name(entry).render(), f"alpha · unit-one · worker {slot}")
-                title = roster.mesh_shown_name(str(self.director_run), name,
+                title = roster.worker_shown_name(str(self.director_run), name,
                                                {"staff_id": members[name].id, "slot": slot})
                 self.assertEqual(title.render(), f"alpha · unit-one · worker {slot}")
                 self.assertEqual(title.address, name)
@@ -2262,7 +2262,7 @@ class RosterTests(unittest.TestCase):
         self.assertEqual(found.thread, roster.CodexThread(current))
         self.assertIsInstance(found.director, roster.UnderDirector)
         self.assertEqual(Path(os.environ["STAFF_FILE"]).read_bytes(), before)
-        self.assertFalse((self.director_run / "mesh_roster.json").exists())
+        self.assertFalse(any(path.name.endswith("_roster.json") for path in self.director_run.iterdir()))
 
     def account_note(self, number: int, *, tool: str = "codex") -> Path:
         notes = self.root / "agents"
@@ -2498,7 +2498,7 @@ class PaneRosterTests(StaffTestCase):
         _ = self.session_record(fixture.unit.current_session, "director")
         config = self.root / "config"
         config.mkdir()
-        write_text_atomic(config / "direct.conf", "# one of: mesh, herdr\nWORKER_TRANSPORT=herdr\n")
+        write_text_atomic(config / "direct.conf", "# Worker settings.\n")
         with mock.patch.dict(os.environ, {"CONF_DIR": str(config)}), \
              mock.patch.object(herdr, "herdr_binary", side_effect=herdr.HerdrMissing("herdr is not installed")), \
              mock.patch.object(account, "process_config_dir", return_value=None), \
@@ -2525,7 +2525,7 @@ class PaneRosterTests(StaffTestCase):
         _ = self.session_record(rows[0].current_session, "registry-copy")
         config = self.root / "config"
         config.mkdir()
-        write_text_atomic(config / "direct.conf", "# one of: mesh, herdr\nWORKER_TRANSPORT=herdr\n")
+        write_text_atomic(config / "direct.conf", "# Worker settings.\n")
         before = self.staff_file.read_bytes()
         with (mock.patch.dict(os.environ, {"CONF_DIR": str(config), "ROSTER_RUN_ROOT": str(self.root / "runs")}),
               mock.patch.object(worker_panes, "_client", return_value=world),
@@ -2557,7 +2557,6 @@ class PaneRosterTests(StaffTestCase):
             self.assertIn("incomplete:", entries["closed"].status)
             self.assertIn("absence", entries["closed"].status)
             self.assertEqual(self.staff_file.read_bytes(), before)
-            self.assertEqual(list((self.root / "runs").glob("**/worker_transport*")), [])
 
     def test_roster_names_owner_and_record_failures(self) -> None:
         _ = self.row_production()
@@ -2837,7 +2836,7 @@ class UnitLabelsTests(unittest.TestCase):
              mock.patch.object(sessions, "running_session", return_value=True), \
              mock.patch.object(showrunners, "NOTIFIER_STATE_DIR", notifier), \
              mock.patch.object(unit_labels, "registered_showrunners", return_value=registered), \
-             mock.patch.object(unit_labels, "live_runs", side_effect=AssertionError("no meshes")) as meshes, \
+             mock.patch.object(unit_labels, "live_runs", side_effect=AssertionError("no run scans")) as runs, \
              mock.patch.object(unit_lookup, "every_labeled_session", side_effect=AssertionError("no mark scan")) as marks_read, \
              mock.patch.object(herdr, "herdr_places", side_effect=AssertionError("no process scan")) as places, \
              mock.patch.object(process_table, "snapshot", side_effect=AssertionError("no process table")) as processes, \
@@ -2851,7 +2850,7 @@ class UnitLabelsTests(unittest.TestCase):
             unit.parent.id: roster.UnitLabels("cargo-liner", "cargo-liner-style", "—"),
             "free-id": roster.UnitLabels("scratch", "—", "—"),
         })
-        meshes.assert_not_called()
+        runs.assert_not_called()
         marks_read.assert_not_called()
         places.assert_not_called()
         processes.assert_not_called()

@@ -203,7 +203,7 @@ def _restore_workers(row: staff.StaffRow, record: staff.StaffSnapshot, *,
     if row.kind in ("unit", "showrunner") and any(
             child.kind == "worker" and child.parent == staff.ReportsTo(row.id) for child in record.rows
             ):
-        result = (worker.restore(row.id) if observed is None else
+        result = (worker.restore(row.id, record=record) if observed is None else
                   worker.restore(row.id, record=record, runs=observed.runs, codex=observed.codex))
         if result != 0:
             raise OSError("worker restore is incomplete")

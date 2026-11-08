@@ -3648,8 +3648,8 @@ class CodexConversations:
 
 
 @final
-class _RunServerClient:
-    """Read JSON-RPC replies from a run server within one deadline."""
+class LoadedThreadRpc:
+    """Read native loaded-thread replies within one deadline."""
 
     def __init__(self, port: int, deadline: float) -> None:
         self.deadline: float = deadline
@@ -3733,7 +3733,7 @@ class LoadedThreadClient(Protocol):
     def call(self, method: str, params: dict[str, object], timeout: float = ...) -> Mapping[str, object]: ...
 
 
-def loaded_thread_ids(client: LoadedThreadClient, deadline: float) -> set[str]:
+def loaded_threads(client: LoadedThreadClient, deadline: float) -> set[str]:
     """Read every loaded-thread page before the supplied deadline."""
     threads: set[str] = set()
     cursor = ""
@@ -3742,71 +3742,31 @@ def loaded_thread_ids(client: LoadedThreadClient, deadline: float) -> set[str]:
         response = client.call("thread/loaded/list", {"cursor": cursor} if cursor else {},
                                timeout=max(0.01, deadline - time.monotonic()))
         if response.get("error"):
-            raise SystemExit(f"thread/loaded/list failed: {response['error']}")
+            raise ValueError(f"thread/loaded/list failed: {response['error']}")
         result = response.get("result")
         listed = cast(dict[str, object], result) if isinstance(result, dict) else {}
         data = listed.get("data")
         if not isinstance(data, list):
-            raise SystemExit("server returned no loaded-thread list")
+            raise ValueError("server returned no loaded-thread list")
         for item in cast(list[object], data):
             if not isinstance(item, str) or not item:
-                raise SystemExit("server returned an invalid loaded-thread id")
+                raise ValueError("server returned an invalid loaded-thread id")
             threads.add(item)
         next_cursor = listed.get("nextCursor")
         if next_cursor is None or next_cursor == "":
             return threads
         if not isinstance(next_cursor, str) or next_cursor in seen:
-            raise SystemExit("server returned an invalid loaded-thread cursor")
+            raise ValueError("server returned an invalid loaded-thread cursor")
         cursor = next_cursor
         seen.add(cursor)
     if time.monotonic() >= worker_lifecycle.effective_deadline():
         raise worker_lifecycle.OperationDeadlineExpired("shutdown incomplete: RPC operation deadline expired")
-    raise SystemExit("loaded-thread list timed out")
+    raise ValueError("loaded-thread list timed out")
 
 
-def loaded_threads(run: Path, deadline: float) -> set[str]:
-    """Read all loaded threads from every live server of a run."""
-    from scripts.lib.unit_runs import SERVER_FILE
-
-    path = run / SERVER_FILE
-    current = worker_lifecycle.read_worker_state(path)
-    previous = current.get("previous_servers", [])
-    records = list(cast(list[object], previous)) if isinstance(previous, list) else []
-    if "pid" in current:
-        records.append(current)
-    ports: set[int] = set()
-    loaded: set[str] = set()
-    for value in records:
-        if not isinstance(value, dict):
-            raise worker_lifecycle.WorkerStateUnreadable(path, "invalid server record")
-        record = cast(dict[str, object], value)
-        port, pid = record.get("port"), record.get("pid")
-        if type(port) is not int or not 0 < port <= 65535:
-            raise worker_lifecycle.WorkerStateUnreadable(path, "invalid server port")
-        if not worker_lifecycle.is_process_pid(pid):
-            raise worker_lifecycle.WorkerStateUnreadable(path, "invalid server pid")
-        try:
-            os.kill(pid, 0)
-        except ProcessLookupError:
-            continue
-        if port in ports:
-            continue
-        ports.add(port)
-        try:
-            client = _RunServerClient(port, deadline)
-            try:
-                loaded.update(loaded_thread_ids(client, deadline))
-            finally:
-                client.connection.close()
-        except worker_lifecycle.OperationDeadlineExpired:
-            raise
-        except (SystemExit, OSError, ValueError) as error:
-            raise ValueError(f"{path}: Codex thread activity is unavailable: {error}") from error
-    return loaded
 
 
 def codex_conversations(*, wanted: str = "") -> CodexConversations:
-    from scripts.lib import unit_runs
     from scripts.message import codex_daemon
 
     candidates: list[tuple[int, list[str]]] = []
@@ -3840,25 +3800,12 @@ def codex_conversations(*, wanted: str = "") -> CodexConversations:
         else:
             for session in observed:
                 _ = live.setdefault(session.thread_id, ())
-    runs: set[Path] = set()
-    for root in (*unit_runs.run_roots(os.environ.get("ROSTER_RUN_ROOT")), unit_runs.ASTRA_RUN_ROOT):
-        runs.update(path.parent for path in root.glob(f"*/{unit_runs.SERVER_FILE}"))
-    server_pids: set[int] = set()
-    for run in runs:
-        try:
-            pid = worker_lifecycle.read_json_object(run / unit_runs.SERVER_FILE).get("pid")
-            if isinstance(pid, int):
-                server_pids.add(pid)
-        except (OSError, ValueError):
-            pass
     for pid, arguments in candidates:
         if not is_codex_process(arguments) or codex_managed_daemon(arguments):
             continue
         environment: dict[str, str] | None = None
         try:
             environment = process_environment(pid)
-            if run := environment.get("UNIT_RUN_DIR"):
-                runs.add(Path(run))
             observed = native_process(pid, "codex")
             if isinstance(observed.identity, LaunchArgument):
                 unknown.append((pid, "Codex thread unknown"))
@@ -3879,23 +3826,12 @@ def codex_conversations(*, wanted: str = "") -> CodexConversations:
             except (HerdrFailure, OSError, ValueError):
                 pass
             if environment is not None:
-                if "app-server" in arguments:
-                    if environment.get("UNIT_RUN_DIR") or pid in server_pids:
-                        # The run read below resolves a server with no open rollout.
-                        continue
-                elif no_rollout and "--no-daemon" not in arguments:
+                if no_rollout and "--no-daemon" not in arguments:
                     home = Path(environment.get("CODEX_HOME", str(Path.home() / ".codex"))).expanduser()
                     if home in daemon_reads:
                         # A failed daemon read already has one note for its account.
                         continue
             unknown.append((pid, "Codex thread unknown"))
-    deadline = time.monotonic() + operation_deadline.remaining(PROGRAM_TIMEOUT_SECONDS)
-    for run in sorted(runs):
-        try:
-            for identity in loaded_threads(run, deadline):
-                _ = live.setdefault(identity, ())
-        except (OSError, ValueError) as error:
-            unknown.append(f"{run.name} (Codex hosted threads unknown: {error})")
     if wanted in live:
         return CodexConversations(live, ())
     return CodexConversations(live, tuple(

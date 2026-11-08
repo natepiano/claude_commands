@@ -78,9 +78,8 @@ They also include `set_doc`, `set_worktree`, `update_current_session`, `set_hold
 | `scripts/accounts/pane_moves.py` | read | local_snapshot, WorkerName.parse |
 | `scripts/accounts/refusal_watch.py` | read | initial_snapshot |
 | `scripts/accounts/unit_watchdog.py` | read | active, initial_snapshot, snapshot |
-| `scripts/agents/codex_mesh.py` | read | native_id, runtime_id, snapshot |
-| `scripts/agents/codex_mesh_test_support.py` | read | CodexBackend (fixture) |
-| `scripts/agents/mesh_runs.py` | read | local_snapshot |
+| `scripts/agents/codex_test_support.py` | read | CodexBackend (fixture) |
+| `scripts/agents/detached_runs.py` | read | local_snapshot |
 | `scripts/agents/test_agent_exec.sh` | read | staff.json (shell) |
 | `scripts/astra/astra_review.py` | read | runtime_id |
 | `scripts/astra/astra_roles.py` | read | local_snapshot |
@@ -119,7 +118,6 @@ They also include `set_doc`, `set_worktree`, `update_current_session`, `set_hold
 | `scripts/herdr/pane_launch.py` | read | initial_snapshot |
 | `scripts/herdr/side_pane.py` | read | runtime_id |
 | `scripts/herdr/worker_panes.py` | write | snapshot, runtime_id, row_operation, slot_operation; worker_admission.publish |
-| `scripts/hierarchies/worker_adoption.py` | read | local_snapshot, row_operation, ReportsTo, StaffId |
 | `scripts/hooks/conversation_pause.py` | read | snapshot; LiveDoc, WrappedDoc |
 | `scripts/hooks/conversation_pause_test_support.py` | write | LiveDoc; fixture_member calls ensure |
 | `scripts/hooks/herdr_tab_title.py` | read | snapshot |

@@ -1,22 +1,17 @@
 # Long-lived workers and held Astra roles
 
-## Phase 30, rounds 1 and 2a
+## Native workers and detached commands
 
 Live consumers read staff membership and backend evidence.
 `StaffSnapshot.backends` derives backend evidence from each current native session.
 `session_staff.worker_backend` returns recorded evidence or a reason for unavailable evidence.
 Worker displays and cleanup read `worker_panes.observe_parents`.
-They show stopped, closed, unknown and incomplete states without reading a mesh roster.
+They show stopped, closed, unknown and incomplete states.
 `inventory.worker_resumes` keeps Claude child commands in `ClaudeChildResume`.
 `refusal_watch.py` owns `QUOTA_REFUSAL`.
 
-Round 2a removes mesh selection from the worker command, stop, restart and pane restore.
-The pane owner holds the sandbox constants.
-Round 2b removes the held assignment launcher dependencies.
-It deletes `codex_mesh.py`, the worker ledger and the remaining allocation and adoption helpers.
-It removes `unit_runs.worker_transport`, `parent_transport`, run pins and the transport config keys.
-It renames `mesh_runs.py`, `mesh_run_process.py`, their config and the detached record folder.
-The current detached commands keep their existing names until that round.
+The assignment launcher uses native worker panes.
+Detached commands use `detached_runs.py` and the `detached_runs/` record folder.
 Completed run folders keep their roster files.
 `progress_history.py` and `usage/agents_log.py` keep their historical reads.
 
@@ -102,7 +97,7 @@ An unreadable record prints one anomaly and returns false.
 A family change still reaches the switch operation.
 A retry reuses the published destination and places the saved extract before the assignment.
 An accepted retry prints `unchanged`.
-The held launcher retains its original prompt identity and its dispatch record until round 2b.
+The launcher retains its original prompt identity and its dispatch record.
 `review.sh` has no pending dispatch check and does not restore a saved extract.
 
 ### Claude coordinator and friends
@@ -215,11 +210,8 @@ Run end does not start a sweep.
 It removes only the ending session's active marker.
 Another marker's live or unknown owner prevents removal of its former run folder.
 
-`scripts/direct/workers.py` stores each unit ledger at `~/.local/state/unit-workers/<staff id>.json`.
-`UNIT_WORKERS_STATE` selects a private root.
-The ledger stores fixed staff references, access policy, ownership, and events.
-Staff supplies current names, parents, worktrees, and backend identities.
-A rename or transfer preserves those fixed references.
+Staff supplies worker names, parents, worktrees, and backend identities.
+A rename or transfer preserves the fixed staff references.
 `rename.py` changes the unit row and repairs its session and display names.
 A changed unit name changes matching folder and branch suffixes.
 `--to-branch <name>` sets an explicit branch.
@@ -301,9 +293,9 @@ The claim permits one `dispatch_turn` call through `assign.sh --target durable-d
 Success removes only the included pending messages.
 Failure retains pending input and records recovery state.
 A role's `send` queues text for its next authorized assignment without waking the role.
-Detached command results use `mesh_runs.deliver` and `send.deliver_worker_text`.
+Detached command results use `detached_runs.deliver` and `send.deliver_worker_text`.
 The result carries `Detached run: <run_id>` as its stable marker.
-Under a per-run delivery lock, `mesh_runs.deliver` checks the worker transcript for that marker.
+Under a per-run delivery lock, `detached_runs.deliver` checks the worker transcript for that marker.
 It skips delivery when a user entry already contains the marker.
 The sender submits to a proved worker pane or sends the result and cause to the current holder.
 `check_patch` checks patch paths against the binding generation and phase reservation.
@@ -337,12 +329,13 @@ The [session roster](session-roster.md) shows open roles through their current s
 
 ## Worker operation fencing
 
-`scripts/agents/worker_lifecycle.py` owns worker lifecycle locks.
-`lock_worker` locks one identity.
-`lock_workers` sorts identities before a transfer.
-Recursive acquisition by the same thread fails and names both call sites.
-Competing threads and processes serialize through the file lock.
-Staff slot and row locks protect native identity publication.
+`scripts/herdr/worker_panes.py` owns `worker_lock` and `WorkerLockHold`.
+`worker_lock` holds the parent's named creation lock until the new worker has a fixed staff id.
+`WorkerLockHold.bind` locks that fixed id before creation serialization ends.
+A competing dispatch returns `Kept` when the lock is held.
+`scripts/production/staff.py` owns `slot_operation` and `row_operation`.
+These locks protect native identity publication and family changes.
+Inherited child processes share the staff lock through its file descriptor.
 
 Native stop paths use the caller's absolute monotonic deadline through row locks and worker stop calls.
 `operation_deadline` carries that limit through callbacks and nested helpers.
@@ -367,9 +360,6 @@ Native dispatch identity comes from the recorder's pass and history records.
 The held Claude launcher stores the fixed staff reference and slot in `impl_worker_<slot>.json`.
 `worker_state.worker_record_path` resolves the staff member before it selects the slot file.
 `worker_admission.parent` reads the run owner from the state file.
-It does not recover ownership from a mesh roster.
-The held launcher still uses allocation and publication helpers in this round.
-Round 2b removes those helpers after the other units release their files.
 
 ## Displays and messages
 
@@ -382,7 +372,6 @@ Staff worker addresses use `worker:<parent>/<worker>`.
 Message selection resolves the fixed staff id and current session.
 Pane delivery uses the observed pane and current holder.
 Daemon sessions retain their `codex:<thread>` route.
-The message command has no mesh recipient branch.
 
 ## Retirement and resume
 
@@ -400,19 +389,12 @@ Stopped or closed workers can supply end evidence.
 Unknown or incomplete evidence retains the folder and names the cause.
 Detached command records retain their own process and working directory checks.
 
-## Held interfaces
-
-`assign.py` still imports mesh launch helpers in this round.
-`production/worker.py`, shutdown and pane restore use staff membership and native evidence.
-`workers.py` keeps the ledger methods that the held assignment launcher calls.
-`worker_adoption.py` keeps the adoption helpers that `codex_mesh.py` calls.
-`session_staff` keeps roster publication for those launchers.
-These interfaces do not provide live display state.
+## Shared helpers
 
 `worker_lifecycle.py` owns watchers and watcher events.
 `finished_run_status` has the same owner.
 `herdr.py` owns `loaded_threads`.
-`codex_mesh_test_support.py` owns the shared launcher fixtures with their existing names.
+`codex_test_support.py` owns the shared launcher fixtures with their existing names.
 
 ## Pane closure and restore
 
@@ -437,7 +419,6 @@ That row has no `home` field.
 
 ## Assignment settings and command files
 
-`UNIT_COMPACT_ABOVE_TOKENS` controls idle mesh compaction until round 2b removes that path.
 Pane workers have no option for compaction during a turn.
 Codex keeps its own full-window limit.
 `commands/unit/direct.md` defines `<LongLivedWorkers/>`.

@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager, ExitStack, redirect_stderr, redirect_stdout
-from collections.abc import Callable, Generator, Mapping
+from collections.abc import Callable, Generator
 from dataclasses import dataclass, field
 from enum import StrEnum
 import io
@@ -104,9 +104,8 @@ class PublishedWorker:
 
 def parent(record: staff.StaffSnapshot, sources: session_staff.MemberSources | None = None, *,
            staff_id: str = "", production: str = "", unit: str = "",
-           run: Path | None = None, roster: Mapping[str, object] | None = None) -> staff.StaffRow:
+           run: Path | None = None) -> staff.StaffRow:
     """Resolve the recorded run owner before the caller."""
-    del roster
     if run is not None:
         try:
             state = worker_lifecycle.read_json_object(run / unit_runs.STATE_FILE)
@@ -143,24 +142,6 @@ def parent(record: staff.StaffSnapshot, sources: session_staff.MemberSources | N
 def find_worker(record: staff.StaffSnapshot, owner: staff.StaffId, name: str) -> staff.StaffRow | None:
     """Find the named worker under its staff parent."""
     return next((row for row in record.find(kind="worker", parent=owner) if row.name == name), None)
-
-
-def resolve_roster(run: Path, entries: dict[str, object]) -> dict[str, object]:
-    """Add staff references to old entries through the run's unit and worker name."""
-    missing = [(name, cast(dict[str, object], raw)) for name, raw in entries.items()
-               if isinstance(raw, dict) and "staff_id" not in raw]
-    if not missing:
-        return entries
-    record = staff.local_snapshot()
-    try:
-        owner = parent(record, staff_id=staff.runtime_id(), run=run, roster=entries)
-    except ValueError:
-        return entries
-    for name, entry in missing:
-        row = find_worker(record, owner.id, name)
-        if row is not None:
-            entry["staff_id"] = row.id
-    return entries
 
 
 def admit(name: str, run: Path, *, reference: str = "") -> WorkerStartAllowed:
@@ -306,9 +287,14 @@ def assignment_id(prompt: Path) -> str:
     return hashlib.sha256(str(prompt.resolve()).encode() + str(prompt.stat().st_mtime_ns).encode() + prompt.read_bytes()).hexdigest()
 
 
+def switch_record_path(run: Path, name: str) -> Path:
+    """Keep native switch state separate from saved Claude launcher records."""
+    return run / f"native_switch_{name}.json"
+
+
 def dispatch_record(run: Path, name: str, *, report_anomaly: bool = True) -> DispatchRecord:
-    entry = session_staff.read_worker_roster(run / "mesh_roster.json").get(name)
-    fields = cast(dict[str, object], entry) if isinstance(entry, dict) else {}
+    path = switch_record_path(run, name)
+    fields = worker_lifecycle.read_worker_state(path)
     try:
         return DispatchRecord(str(fields.get("assignment_id", "")),
                               SwitchState(fields.get("dispatch_state", SwitchState.NO_RECORD)))
@@ -328,17 +314,15 @@ def dispatch_pending(run: Path, name: str, prompt: Path) -> bool:
 
 
 def record_dispatch(allowed: WorkerStartAllowed, request: str, state: SwitchState, *, expected_request: str = "") -> None:
-    with worker_lifecycle.locked_state(allowed.run / "mesh_roster.json") as handle:
-        entries = handle.read_object()
-        previous = entries.get(allowed.name, {})
-        entry = dict(cast(dict[str, object], previous)) if isinstance(previous, dict) else {}
+    path = switch_record_path(allowed.run, allowed.name)
+    with worker_lifecycle.locked_state(path) as handle:
+        entry = handle.read_object()
         if expected_request and entry.get("assignment_id") != expected_request:
             return
         entry.update(assignment_id=request, dispatch_state=state)
         if isinstance(allowed.slot, ExistingWorkerSlot):
             entry["staff_id"] = allowed.slot.row.id
-        entries[allowed.name] = entry
-        session_staff.publish_worker_roster(handle, entries)
+        handle.publish(json.dumps(entry, indent=2, sort_keys=True))
 
 
 def publish_created(allowed: WorkerStartAllowed, identity: str,

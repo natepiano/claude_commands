@@ -37,10 +37,10 @@ changes no file.
      The task notification is the wait. Never poll it, sleep or read its output
      before then. A review at xhigh can take many minutes.
    - **Pane worker:** start it with
-     `~/.claude/scripts/lib/py ~/.claude/scripts/agents/mesh_runs.py start --label "astra review" -- <the command>`
+     `~/.claude/scripts/lib/py ~/.claude/scripts/agents/detached_runs.py start --label "astra review" -- <the command>`
      End your turn; the result arrives as your next message.
      Exit 3 means the caller is not a worker; run attached in one call only for that exit.
-     A live twin takes priority over `config/mesh_runs.conf` `LIVE_RUN_LIMIT`.
+     A live twin takes priority over `config/detached_runs.conf` `LIVE_RUN_LIMIT`.
      Exit 4 refuses a new run at that limit and names the live runs.
      Wait for a run's result, or put more files in one run. Never run attached after exit 4.
 3. When it finishes, read its output once.

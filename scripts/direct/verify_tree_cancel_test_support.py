@@ -15,7 +15,7 @@ import time
 from pathlib import Path
 from typing import cast, override
 
-from scripts.agents.mesh_runs import RunRecord
+from scripts.agents.detached_runs import RunRecord
 from scripts.direct.test_tree_watch import write_workspace
 from scripts.direct.verify_token_ownership_test_support import VerifyTokenOwnershipFixture
 from scripts.direct.verify_token_wait_test_support import VERIFY
@@ -210,10 +210,10 @@ class VerifyTreeCancelFixture(VerifyTokenOwnershipFixture):
 import os
 import sys
 from unittest.mock import patch
-from scripts.agents import mesh_runs
-with (patch.object(mesh_runs, "deliver", return_value="private fixture"),
-      patch.object(mesh_runs.staff, "local_snapshot", return_value=mesh_runs.staff.StaffSnapshot(()))):
-    raise SystemExit(mesh_runs.main(["supervise", sys.argv[1]]))
+from scripts.agents import detached_runs
+with (patch.object(detached_runs, "deliver", return_value="private fixture"),
+      patch.object(detached_runs.staff, "local_snapshot", return_value=detached_runs.staff.StaffSnapshot(()))):
+    raise SystemExit(detached_runs.main(["supervise", sys.argv[1]]))
 """
             arguments = [str(Path(__file__).resolve().parents[2] / "scripts/lib/py"), "-c", supervisor, str(record_path)]
         process = subprocess.Popen(arguments,

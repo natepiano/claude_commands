@@ -22,7 +22,8 @@ from unittest.mock import patch
 from weakref import finalize
 
 from scripts.production import staff, worker_admission
-from scripts.shutdown import restart
+from scripts.shutdown import restart, stop_resume
+from scripts.shutdown.stop_results import SourceReleased
 from scripts.production.staff_test_support import StaffTestCase, fixture_member, fixture_runtime_id, fixture_session, fixture_worker
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib import process_start, unit_runs
@@ -77,7 +78,7 @@ class PaneWorld(herdr.Herdr):
         """Install shared accounts, configuration, and process facts."""
         config = test.root / "conf"
         config.mkdir()
-        write_text_atomic(config / "direct.conf", "WORKER_TRANSPORT=mesh\n# range: 0.1..0.9\nWORKER_SPLIT_RATIO=0.667\n"
+        write_text_atomic(config / "direct.conf", "# range: 0.1..0.9\nWORKER_SPLIT_RATIO=0.667\n"
                           + "# whole: 1..\nUNIT_COMPACT_ABOVE_TOKENS=43000\n"
                           + "WORKER_FIRST_TURN_TEXT=Reply with ready. Do not use tools.\n"
                           + "# range: 1..600\nWORKER_FIRST_TURN_SECONDS=120\n"
@@ -621,7 +622,6 @@ class WorkerPaneTests(StaffTestCase):
         write_text_atomic(run / "progress_history_state.json", json.dumps({"owner_staff_id": str(self.parent.id), "pass": {
             row.name: {"instance_id": "dispatch-" + row.name, "worker_name": row.name,
                        "team_slot": row.name, "kind": role, "status": "completed" if completed else "active"}}}))
-        write_text_atomic(run / "worker_transport", "herdr\n")
 
     def completed_dispatch(self, row: staff.StaffRow, role: staff.WorkerRole) -> None:
         self.dispatch(row, role, completed=True)
@@ -650,7 +650,6 @@ class WorkerPaneTests(StaffTestCase):
         state = run / "progress_history_state.json"
         if not state.exists():
             run.mkdir(exist_ok=True)
-            write_text_atomic(run / "worker_transport", "herdr\n")
             write_text_atomic(state, json.dumps({"owner_staff_id": self.parent.id, "working_dir": str(self.root),
                 "phase": {"id": "earlier", "title": "Earlier", "instance_id": "earlier-phase", "started_at": 1,
                           "status": "active"}, "pass": {}, "events": [],
@@ -840,7 +839,7 @@ class WorkerPaneTests(StaffTestCase):
         return [command for command in self.world.commands if command[:2] == ("agent", "prompt")]
 
     def test_dispatch_holder_starts_its_worker_and_keeps_other_operations_out(self) -> None:
-        row = self.worker()
+        row = self.worker(family="codex")
         self.world.add(row, "w1:p1", live=False)
         name = staff.WorkerName.parse(row.name)
         with worker_panes.worker_lock(self.parent.id, name) as hold:
@@ -999,12 +998,11 @@ class WorkerPaneTests(StaffTestCase):
         self.assertEqual(self.world.closed, [])
 
     def test_live_detached_run_keeps_its_pane_until_the_result_finishes(self) -> None:
-        from scripts.agents import mesh_run_process
+        from scripts.agents import detached_run_process
 
         run = self.root / "run"
-        runs = run / "mesh_runs"
+        runs = run / "detached_runs"
         runs.mkdir(parents=True)
-        write_text_atomic(run / "worker_transport", "herdr\n")
         record = runs / "private-run.json"
 
         def supervisor(pid: int, path: Path) -> bool:
@@ -1020,7 +1018,7 @@ class WorkerPaneTests(StaffTestCase):
                 before = list(self.world.closed)
                 write_text_atomic(record, json.dumps({"worker": row.name, "staff_id": row.id,
                                                      "status": "running", "pid": 998901}))
-                with (patch.object(mesh_run_process, "supervises", supervisor),
+                with (patch.object(detached_run_process, "supervises", supervisor),
                       patch.object(self.world, "quit_agent", wraps=self.world.quit_agent) as quit_agent):
                     result = worker_panes.close(self.parent.id, staff.WorkerName.parse(row.name))
                     quit_agent.assert_not_called()
@@ -1434,7 +1432,7 @@ class WorkerPaneTests(StaffTestCase):
 
     def test_all_explicit_roles_reach_their_registry_settings(self) -> None:
         for role in staff.WORKER_ROLES:
-            with self.subTest(role=role), patch.dict(sys.modules, {"scripts.agents.codex_mesh": None}):
+            with self.subTest(role=role):
                 result = self.start("worker-" + role, role)
                 self.assertIsInstance(result, worker_panes.OpenWorker)
                 _, arguments, environment = self.world.requests[-1]
@@ -1491,6 +1489,63 @@ class WorkerPaneTests(StaffTestCase):
         self.assertIsInstance(repeated, worker_panes.OpenWorker)
         self.assertEqual(len(self.world.launches), 1)
         self.assertIn(result.pane, self.world.locations)
+
+    def test_family_change_keeps_busy_workers_and_live_detached_results(self) -> None:
+        from scripts.agents import detached_run_process
+
+        record = self.root / "run/detached_runs/private-run.json"
+        for index, (live, status, detached) in enumerate(((True, "working", False),
+                (True, "idle", True), (False, "idle", True)), 1):
+            with self.subTest(live=live, status=status, detached=detached):
+                row = self.worker(f"switch-{index}", family="claude")
+                pane = f"w1:p{index}"
+                self.world.add(row, pane, family="claude", live=live)
+                self.world.locations[pane]["agent_status"] = status
+                self.completed_dispatch(row, "impl")
+                write_text_atomic(record, json.dumps({"worker": row.name, "staff_id": row.id,
+                    "status": "running" if detached else "finished", "pid": 998901}))
+                before = self.staff_state(), self.world.foreground.copy(), len(self.world.launches), self.world.stops.copy()
+
+                def release(source: staff.StaffRow, backend: staff.ClaudeBackend | staff.CodexBackend | staff.BackendUnavailable) -> SourceReleased:
+                    del backend
+                    _ = self.world.stop(source, self.world)
+                    return SourceReleased()
+
+                def supervisor(pid: int, path: Path) -> bool:
+                    return pid == 998901 and path == record
+
+                with (patch.object(detached_run_process, "supervises", side_effect=supervisor),
+                      patch.object(stop_resume, "release_source", side_effect=release)):
+                    changed = self.start(row.name)
+                self.assertIsInstance(changed, worker_panes.StartRefused)
+                assert isinstance(changed, worker_panes.StartRefused)
+                self.assertIn("detached run is live" if detached else "agent state is working", changed.detail)
+                self.assertEqual((self.staff_state(), self.world.foreground, len(self.world.launches), self.world.stops), before)
+
+    def test_family_change_publication_failure_stops_the_destination_and_retries(self) -> None:
+        row = self.worker(family="claude")
+        self.world.add(row, "w1:p1", family="claude")
+        self.completed_dispatch(row, "impl")
+
+        def release(source: staff.StaffRow, backend: staff.ClaudeBackend | staff.CodexBackend | staff.BackendUnavailable) -> SourceReleased:
+            del backend
+            _ = self.world.stop(source, self.world)
+            return SourceReleased()
+
+        with patch.object(stop_resume, "release_source", side_effect=release):
+            with patch.object(staff, "update_current_session", side_effect=staff.StaffRefused("publication unavailable")):
+                failed = self.start()
+            self.assertIsInstance(failed, worker_panes.UncertainWorker)
+            self.assertEqual(staff.by_id(row.id), row)
+            self.assertNotIn("w1:p1", self.world.foreground)
+            self.assertEqual(len(self.world.launches), 1)
+            repeated = self.start()
+        self.assertIsInstance(repeated, worker_panes.OpenWorker)
+        assert isinstance(repeated, worker_panes.OpenWorker)
+        self.assertEqual((repeated.row.id, repeated.row.parent, repeated.pane), (row.id, row.parent, "w1:p1"))
+        self.assertNotEqual(repeated.row.current_session, row.current_session)
+        self.assertEqual(len(self.world.launches), 2)
+        self.assertEqual(self.world.closed, [])
 
     def test_failed_publication_retains_one_backend_and_publishes_once_on_rerun(self) -> None:
         with patch.object(staff, "ensure_worker", side_effect=staff.StaffRefused("fixture publication failure")):
@@ -1826,7 +1881,7 @@ class WorkerPaneTests(StaffTestCase):
                 self.world.foreground = {"w1:p0": self.world.foreground["w1:p0"]}
 
     def test_stale_session_mark_does_not_prevent_proved_shell_recovery(self) -> None:
-        row = self.worker()
+        row = self.worker(family="codex")
         self.world.add(row, "w1:p1", live=False)
         self.world.locations["w1:p1"]["agent_session"] = {"value": fixture_runtime_id("stale-mark")}
         observed = self.observation(row)

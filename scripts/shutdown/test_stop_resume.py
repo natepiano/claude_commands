@@ -32,7 +32,7 @@ from scripts.shutdown.stop_results import ClaudeStartState, StopResult
 
 from scripts.shutdown.stop_results import SourceReleased, SourceReleaseUnknown
 from scripts.shutdown.launch_names import LaunchNames
-from scripts.production import showrunners, staff, staff_sources, stall_watch
+from scripts.production import showrunners, staff, staff_sources, stall_watch, worker_admission
 from scripts.lib.resume_message import ClaudeChildResume
 from scripts.production.staff_test_support import StaffTestCase, fixture_member, fixture_worker, isolated_staff_file
 from scripts.usage import agents_log
@@ -664,6 +664,15 @@ class StopResumeTests(unittest.TestCase):
                 "worker_name": child.name, "status": "active", "instance_id": f"dispatch-{child.name}",
                 "launcher_command": ["assign.sh", "--to", child.name],
             } for child in (codex, claude, foreign)}})
+        for child in (codex, claude):
+            backend = staff.backend(child)
+            assert isinstance(backend, (staff.ClaudeBackend, staff.CodexBackend))
+            text = f"End your final reply with DONE dispatch-{child.name}."
+            event = ({"type": "user", "message": {"role": "user", "content": text}}
+                     if isinstance(backend, staff.ClaudeBackend) else
+                     {"type": "response_item", "payload": {"type": "message", "role": "user",
+                         "content": [{"type": "input_text", "text": text}]}})
+            atomic_file.write_text_atomic(worker_admission.transcript_source(child, backend), json.dumps(event) + "\n")
         from scripts.lib import unit_runs as owned_runs
         with (patch("scripts.lib.unit_runs.run_roots", return_value=(runs,)),
               patch.object(owned_runs, "held", return_value=[str(run)]),

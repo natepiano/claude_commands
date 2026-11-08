@@ -171,7 +171,6 @@ Pane worker resumes use `PaneWorkerResume` with a fixed staff id and an active d
 The director receives `Worker <staff id>: busy dispatch <dispatch id>` for each active direct child.
 The message names idle children separately.
 It keeps the account move source and destination.
-It supplies no saved mesh launcher command.
 Restart and pane restore select each worker's current staff parent directly.
 Closed idle workers stay closed until their next assignment.
 Pane worker resume uses the dispatch record and transcript to select one step.

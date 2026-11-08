@@ -17,10 +17,7 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import TYPE_CHECKING, NamedTuple, cast
-
-if TYPE_CHECKING:
-    from scripts.agents.worker_lifecycle import WorkerStateFile
+from typing import NamedTuple, cast
 
 from scripts.production import staff
 from scripts.production.session_labels import StaffLabels
@@ -241,10 +238,6 @@ def stored_worker_records(entries: Mapping[str, object]) -> dict[str, object]:
     return {name: {key: value for key, value in cast(dict[str, object], raw).items()
                    if key not in WORKER_FACT_KEYS}
             for name, raw in entries.items() if isinstance(raw, dict)}
-
-
-def publish_worker_roster(handle: WorkerStateFile, roster: Mapping[str, object]) -> None:
-    handle.publish(json.dumps(stored_worker_records(roster), indent=2, sort_keys=True))
 
 
 def read_worker_roster(path: Path) -> dict[str, object]:

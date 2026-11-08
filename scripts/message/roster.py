@@ -213,7 +213,7 @@ class NotAWorker:
 @dataclass(frozen=True)
 class HeldDesignRole:
     role: Literal["designer", "reviewer"]
-    mesh: str
+    run: str
 
 
 Assignment = WorkerAssignment | HeldDesignRole | NotAWorker
@@ -430,7 +430,7 @@ def _assignment_snapshot(assignment: Assignment) -> dict[str, object]:
         return {"tag": "NotAWorker"}
     if isinstance(assignment, HeldDesignRole):
         return {"tag": "HeldDesignRole", "slot_role": "astra-" + assignment.role,
-                "session_dir": assignment.mesh}
+                "session_dir": assignment.run}
     role = assignment.role
     encoded_role: object = role if isinstance(role, str) else {
         "tag": type(role).__name__, **cast(dict[str, str], asdict(role))}
@@ -659,7 +659,7 @@ def _slot_role_for(entry: RosterEntry) -> str:
 
 def _session_dir(entry: RosterEntry) -> str:
     if isinstance(entry.assignment, HeldDesignRole):
-        return entry.assignment.mesh
+        return entry.assignment.run
     return entry.assignment.session_dir if isinstance(entry.assignment, WorkerAssignment) else ""
 
 
@@ -833,11 +833,11 @@ def unit_worker_title(production: str, unit: str, job: JobKey, ordinal: int, add
     return ShownName(ProductionPart(production), UnitPart(unit), ShownJob(job, qualifier), address).render()
 
 
-def mesh_title(session_dir: str, name: str, record: Mapping[str, object]) -> str:
-    return mesh_shown_name(session_dir, name, record).render()
+def worker_title(session_dir: str, name: str, record: Mapping[str, object]) -> str:
+    return worker_shown_name(session_dir, name, record).render()
 
 
-def mesh_shown_name(session_dir: str, name: str, record: Mapping[str, object]) -> ShownName:
+def worker_shown_name(session_dir: str, name: str, record: Mapping[str, object]) -> ShownName:
     """Build a thread title with the same production and unit lookup as the roster."""
     run = Path(session_dir)
     if design_id := _as_string(record.get("held_design_id")):

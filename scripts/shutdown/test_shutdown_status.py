@@ -21,7 +21,6 @@ from scripts.shutdown.test_support import ShutdownSendLeaf, ShutdownTestCase
 from scripts.production.staff_test_support import fixture_member, fixture_worker
 from scripts.shutdown import shutdown, restart, shutdown_record, stop_resume, inventory
 from scripts.herdr import herdr, worker_panes
-from scripts.lib.atomic_file import write_text_atomic
 from scripts.production import staff, session_staff
 from scripts.whoami.account import UnreadableAccount
 from scripts.shutdown.inventory import Inventory
@@ -106,7 +105,6 @@ class ShutdownStatusTests(ShutdownTestCase):
         row = staff.StaffRow(staff.StaffId("worker"), "worker", "impl", staff.ReportsTo(parent.id),
                              current_session=staff.StaffId("worker-session"))
         record = staff.StaffSnapshot((parent, row))
-        write_text_atomic(self.root / "run/worker_transport", "herdr\n")
         def observe(_parent: staff.StaffId, _record: staff.StaffSnapshot) -> list[worker_panes.WorkerPane]:
             print("anomaly: impl: terminal changed", file=sys.stderr)
             return [worker_panes.UncertainWorker(row, "terminal changed")]

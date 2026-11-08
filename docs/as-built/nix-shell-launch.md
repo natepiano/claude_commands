@@ -84,7 +84,6 @@ resolver before calling `exec`.
 | `berth_fix/launch.sh` | Proves the worktree before opening a window; both window and current-terminal starts use `nix_env.py exec`. Worktree approval failure is fatal. |
 | `direct/claude_worker.py` | Calls `nix_env.ensure` once in the assign process. The settings and the Claude start use the same loaded environment. |
 | `agents/agent_exec.sh` | Claude print runs use `exec` after changing to their requested directory. |
-| `agents/codex_mesh.py` | The shared Codex app-server calls `ensure(worktree, environment)` and starts Codex directly with the loaded env. Protected account, run, temporary-directory and held-role values come from the caller. `Refused` logs the helper's line, remembers the failed shell, and falls back to the caller env so other workers keep their shared server. The recorded pid is the server's pid. |
 | `accounts/accounts.py` | Normal `exec` launches call `launch_shell_environment(cwd)`. It calls `ensure`, restores the caller's HOME, and refuses an unusable shell. `codex update` bypasses account launch. |
 | `cli_agent/cli_agent.sh` | Interactive and command Claude launches use `exec` in the caller's directory. |
 | `notify/review.py` | Loads the current directory's env before the Claude reviewer starts; refusal returns an unreviewed result. |
@@ -123,8 +122,7 @@ only its `nix_env:` line before verification runs. A caller already in the nix
 shell takes the original path silently. If the re-run loses shell proof while
 `NIX_ENV_ENVRC` still names the loaded file, it refuses with one line instead
 of another re-exec. The internal marker is removed before tool setup.
-The final command's exit status passes through. This also covers Codex workers
-whose shared mesh server cannot carry each worktree's environment.
+The final command's exit status passes through.
 `user_clock` runs `user_zone.py` with `python3 -S`; that helper and `/zone` share
 the `stored_zone` configuration reader.
 

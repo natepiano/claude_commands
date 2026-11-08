@@ -7050,7 +7050,7 @@ class PaneWorkerMoveTests(unittest.TestCase):
         config.mkdir()
         _ = (config / "accounts.conf").write_text(
             (Path(__file__).resolve().parents[2] / "config/accounts.conf").read_text())
-        _ = (config / "direct.conf").write_text("# range: 0.1..0.9\nWORKER_SPLIT_RATIO=0.667\nWORKER_TRANSPORT=herdr\n"
+        _ = (config / "direct.conf").write_text("# range: 0.1..0.9\nWORKER_SPLIT_RATIO=0.667\n"
                                                + "# whole: 1..\nUNIT_COMPACT_ABOVE_TOKENS=43000\n"
                                                + "# range: 1..600\nPANE_AGENT_START_SECONDS=90\n")
         _ = (config / "shutdown.conf").write_text("# whole: 1..300\nSTOP_GRACE_SECONDS=2\n# whole: 1..300\nKILL_GRACE_SECONDS=5\n# whole: 1..300\nMOVE_STOP_MARGIN_SECONDS=10\n")
@@ -9193,7 +9193,7 @@ class StatusProblemCauseTests(unittest.TestCase):
                        "sub.example.com", "EXAMPLE.ORG."):
             for noted in (False, True):
                 with self.subTest(domain=domain, noted=noted):
-                    reading = self.reading("mesh-fixture@" + domain, noted=noted)
+                    reading = self.reading("account-fixture@" + domain, noted=noted)
                     lines = [line for line in reading.notes if "test wrote" in line]
                     self.assertEqual(len(lines), 1)
                     line = lines[0]

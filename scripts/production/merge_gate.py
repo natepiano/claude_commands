@@ -102,10 +102,10 @@ NIGHTLY_TYPE_DIAGNOSTIC_LINES = 20
 # An unrecorded type job keeps its own fallback; recorded jobs all use one margin.
 TYPES_MEMORY_MIB = 3072
 MEMORY_PEAK_MARGIN = 1.2
-# A module this many times slower than the median of its last MODULE_HISTORY_RUNS times, and at least
-# the floor slower, is named in the report. On 2026-10-19 agents/test_codex_mesh.py went from 49 s to
-# 1264 s (four tests each waited a 300 s call timeout) and no line said so. Load alone moved modules
-# about 2x. The median names a regression on about three runs in a row, then takes it as the normal.
+# Report a module when its runtime exceeds this factor and the floor above its recent median.
+# On 2026-10-19, one module increased from 49 s to 1264 s without a report.
+# Four tests each reached a 300 s timeout. System load alone changed runtime by about 2x.
+# The median reports a repeated regression for about three runs before it becomes the baseline.
 SLOW_MODULE_FACTOR = 3.0
 SLOW_MODULE_FLOOR_S = 60.0
 MODULE_HISTORY_RUNS = 5

@@ -6237,8 +6237,8 @@ with patch.object(fcntl, "flock", admission):
         native = fixture_runtime_id("main-repaired")
         owner = fixture_member("showrunner", name="repair-owner")
         unit = fixture_member("unit", name="repair", parent=owner.id, runtime_id=native)
-        worker = fixture_worker("repair-worker", unit.id)
-        _ = (session_dir / "mesh_roster.json").write_text(json.dumps({worker.name: {"staff_id": worker.id}}))
+        state["owner_staff_id"] = unit.id
+        _ = (session_dir / "progress_history_state.json").write_text(json.dumps(state), encoding="utf-8")
         self.write_claude_transcript(native, "sonnet-5", "low")
         for identity in self.open_pass_and_activity(session_dir, started_at, native):
             self.assertEqual(

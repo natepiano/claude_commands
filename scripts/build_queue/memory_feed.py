@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """Publish the build memory page and its current queue reading."""
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import argparse
 import json
@@ -482,7 +486,7 @@ def reading() -> MemoryPage:
                 name, detail = row["name"], row["detail"]
             if not service and isinstance(memory, gate.UnownedSliceMemory) and isinstance(memory.activity, ScopeProcesses) and memory.bytes < GIB // 2:
                 program = memory.activity.program
-                group = "Codex servers" if program in ("codex", "codex-real", "mesh_runs.py") else "worker background runs"
+                group = "Codex servers" if program in ("codex", "codex-real", "detached_runs.py") else "worker background runs"
                 row["detail"] = " · ".join(part for part in (detail, program) if part)
                 groups.setdefault(group, []).append(row)
             else:
