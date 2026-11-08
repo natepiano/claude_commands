@@ -21,8 +21,9 @@ from typing import NotRequired, TypedDict, cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.herdr import herdr
-from scripts.production import session_staff, staff, worker
+from scripts.production import staff, worker
 from scripts.shutdown import pane_record
+from scripts.shutdown.launch_names import LaunchNames
 from scripts.lib.agent_program import resolve_program
 from scripts.lib.models_registry import agent_environment
 from scripts.lib.resume_message import NO_WORKERS, resume_message
@@ -45,8 +46,7 @@ def restored_launch(argv: list[str], environment: dict[str, str]) -> tuple[list[
     entry = pane_record.matching_launch(place, identity)
     if entry is None:
         return argv, environment
-    entry = session_staff.record_membership(entry)
-    restored = {**environment, **entry["environment"]}
+    restored = {**environment, **LaunchNames.read().environment(entry)}
     restored.update({key: environment[key] for key in NAMED_ACCOUNT_VARIABLES if key in environment})
     if not parsed.has_prompt and environment.get("RELAUNCH_PROMPT_DELIVERY") != "pane":
         workers = NO_WORKERS

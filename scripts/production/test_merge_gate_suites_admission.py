@@ -228,11 +228,13 @@ class SharedGateAdmissionTests(ServiceGateFixture):
             reply, = fixture.server.handle_request(older)
         self.assertIsInstance(reply, wire.Wait)
         handle_request = fixture.server.handle_request
+        first_gate_request = threading.Event()
 
         def fit_older(request: wire.Request,
                       connection: service.Connection | service.NoConnection = service.NO_CONNECTION) -> list[wire.Reply]:
             with fixture.loop_turn():
-                if isinstance(request, wire.AdmitRequest) and request.owner != older.owner:
+                if isinstance(request, wire.AdmitRequest) and request.owner != older.owner and not first_gate_request.is_set():
+                    first_gate_request.set()
                     self.assertIn(older.episode, fixture.server.waiters)
                     fixture.free(23 * memory_admit.GIB // 2)
                 return handle_request(request, connection)

@@ -263,13 +263,13 @@ other_names = ["Pending decision block"]
 [[terms]]
 name = "finding"
 kind = "record"
-defined_in = "commands/unit/direct.md#<FindingsLedger/>"
+defined_in = "docs/direct/repair_rounds.md#<FindingsLedger/>"
 other_names = ["issue"]
 
 [[terms]]
 name = "reservation"
 kind = "record"
-defined_in = "commands/unit/direct.md#<PhaseReservationContract/>"
+defined_in = "docs/direct/phase_reservation.md#<PhaseReservationContract/>"
 other_names = ["phase reservation", "delegated phase reservation"]
 
 [[terms]]

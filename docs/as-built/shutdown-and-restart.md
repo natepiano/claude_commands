@@ -45,9 +45,10 @@ The default reason is `resumed by name`.
 The shared resume path reads the saved environment, arguments, and folder.
 A named Codex resume uses the configured `workers` account, with or without a staff row.
 Claude units and showrunners use their configured role account, even without a pane launch record.
-Other Claude sessions keep their saved account.
+Other Claude sessions, and sessions with no staff row, use the configured units account.
+When the account does not change, the resume message names no move.
 `--to ACCOUNT` overrides the account for either family.
-Restart and folder moves use the role account.
+Restart without ACCOUNT and folder moves use the role account.
 A herdr server restore keeps the saved account for both families.
 It restores a closed tab when a saved launch exists.
 An explicit CLI resume can restore an intentionally stopped session.
@@ -145,6 +146,23 @@ Saved launch marks contain no copied `STAFF_ID`.
 The [pane restore](herdr-restore.md) uses this same naming policy.
 
 ## Restart
+
+`agents restart ACCOUNT --all` selects live rows on that Claude or Codex account.
+It reads the account from each observed process environment.
+A hosted Codex thread uses its daemon's account home.
+Selected rows restart on ACCOUNT.
+Each worker matches its own account.
+Filtered restarts leave unselected owners and workers unchanged.
+A live worker without account evidence prints `NAME: left alone; account unknown` once.
+Without `--all`, ACCOUNT filters saved rows by their last session's account.
+An unknown ACCOUNT prints one error and returns status 2 before any stop.
+`--dry-run` lists only selected rows and changes nothing.
+Without ACCOUNT, the existing selection and role accounts apply.
+
+`--only ID[,ID...]` also limits `--all`; ACCOUNT and `--only` must both match.
+If a stop includes the caller, restart continues in a detached process before the first stop.
+The caller prints the restart log path and returns.
+Other restarts run in the caller's process.
 
 `agents restart --all` selects live Claude and Codex rows on this machine from `staff.json`.
 It stops each session, then starts each session.
