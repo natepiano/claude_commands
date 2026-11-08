@@ -1895,3 +1895,129 @@ Every nextest run that lint starts prints one line after admission: `nextest: <g
 - A registered CI scope's reading enters the cap once: `unowned_slice_memory` and the service's unowned path subtract each registered scope's whole reading and leave its pids out of the process subtraction (`owned_scope_roots`).
 - `AnonymousRunUse` and `ProcessAnonymousUse` (`scripts/build_queue/admission_records.py`) keep their names: `snapshot_codec` uses the class name as the record kind, so a rename breaks saved snapshots and protocol replies. `sum_anonymous_use` is now `sum_swap_backed_use`.
 - Rows: 1 GiB anon + 27 GiB shmem reads 28 GiB; CI shmem counted once; a process with RssShmem. `docs/as-built/build-memory-admission.md` states the basis.
+
+### Phase 85 — The tmp sweep judges plain files in the scratch root by age  · status: done
+**Depends on:** none. Merge `origin/builds` first.
+
+**Approved:** builds showrunner, 2026-11-08 (change review C1267 returned: "`tmp_sweep.py --plan <file>` still keeps 535 entries with "Not a directory". Each one is a plain file in /tmp/claude/scratch, such as msg136.txt or wo.json, that the sweep reads as a folder for .scratch.json. Fix it where it lives, and add a test row.").
+
+#### Work Order
+
+**Goal:** a plain file directly in the scratch task root (`/tmp/claude/scratch`) is not a task folder. The sweep judges it like any other entry with no task record, by its idle age, and never keeps it with "Not a directory".
+
+**Measured (builds, 2026-11-08):** on natedev, `tmp_sweep.py --plan <file>` keeps 535 entries with "Not a directory", for example `msg136.txt` and `wo.json` in `/tmp/claude/scratch`. The scratch branch of the sweep's limit reads `<entry>/.scratch.json` through `scratch.task_of()` (`scripts/lib/scratch.py:743`) and `copy_record.read_record()` (`scripts/lib/copy_record.py`). For a plain file that read raises `NotADirectoryError`, which `read_record` turns into `UnreadableRecord`.
+
+**Spec:**
+1. Find where the "Not a directory" keep comes from, and fix it where it lives. A plain file (not a folder, not a symlink to one) in the scratch task root has no task record: it reads as `NotRegistered`, not `UnreadableRecord`. A folder whose `.scratch.json` cannot be read keeps its current unreadable result.
+2. The sweep then gives that plain file the same idle limit as other entries with no task record. Change no idle limit and no other root's rule.
+3. Add a test row in `scripts/lint/test_tmp_sweep.py` that fails before the fix: a plain file in a tempdir scratch root, older than the idle limit, is planned for removal and is not kept with "Not a directory". A second row: a plain file newer than the idle limit is kept as recent, not as unreadable.
+   The hand-cleanup plan (`--plan <file>`) keeps its end-evidence rule: a plain scratch file with no record stays with "no recorded end permits hand cleanup", never with "Not a directory" (director ruling, 2026-11-08). Add a row for that plan path.
+4. Correct `docs/as-built/` text that describes the scratch root rule if it does not match.
+
+**Files:**
+- `scripts/lib/scratch.py`
+- `scripts/lib/copy_record.py`
+- `scripts/lint/tmp_sweep.py`
+- `scripts/lint/test_tmp_sweep.py`
+- `scripts/lib/test_scratch.py`
+
+**Workers:** 1 writer + 1 tester.
+- writer: the fix in `scripts/lib/scratch.py`, `scripts/lib/copy_record.py` or `scripts/lint/tmp_sweep.py`, wherever the cause is, and any as-built text.
+- tester: the failing rows in `scripts/lint/test_tmp_sweep.py`, and in `scripts/lib/test_scratch.py` if the fix is in `scratch.py` or `copy_record.py`.
+
+**Acceptance gate:** the new rows fail before the fix and pass after; `test_tmp_sweep.py`, `test_scratch.py` and the targeted test pass; basedpyright reports 0 errors and 0 warnings on the changed Python files. Tests use tempdir roots only and never read or change the real `/tmp`. The checkpoint's Change-Review line gives the plan file argument: `tmp_sweep.py --plan <file>`.
+
+### Phase 86 — Mac rebuild works over ssh through a local sshd hop  · status: todo
+**Depends on:** none. Repository: nixos (worktree `/home/natepiano/worktrees/nixos-mac-ssh-rebuild`, branch `resources-mac-ssh-rebuild`, from nixos main `590edd7`). The showrunner pushes nixos main; this unit never does.
+
+**Approved:** builds showrunner, 2026-11-08, for the user: "i want to be able to rebuild over ssh - i made the configuration changes to settings that it suggested but it still does not work". Design: natedev.
+
+#### Work Order
+
+**Goal:** the user types `rebuild` in an `ssh mac` session and the Mac switch completes, the same as at the Mac's own terminal.
+
+**Measured (natedev, 2026-11-08):** over `ssh mac` (Tailscale SSH, a child of tailscaled), `rebuild` stops in nix-darwin's `ensureAppManagement`: a touch of `/Applications/Nix Apps/*.app/.DS_Store` fails, and the launchctl manager name is not `Aqua`. The Remote Login switch "Allow full disk access for remote users" covers only Apple's sshd (`modules/darwin/tailscale.nix:96-104`). The user has turned Remote Login on; Apple's sshd answers on 127.0.0.1:22 and on the LAN with password login.
+
+**Spec:**
+1. In `modules/common/rebuild.nix`, on Darwin only: when `rebuild` runs in an ssh session whose server address is not loopback (`SSH_CONNECTION` third field is not `127.0.0.1` or `::1`), it runs itself again through Apple's sshd on localhost with `ssh -t` and the hop key, with the same arguments, and exits with that run's status. The user still types only `rebuild`. At the Mac's terminal, and inside the hop, `rebuild` runs as before. Linux `rebuild` does not change.
+2. A Mac-local hop key: an ed25519 key with no passphrase, made on the Mac at activation when it is not there (owned by the user, mode 0600, under `~/.ssh/`). No private key goes in the repo. The key is authorized only from loopback: `from="127.0.0.1,::1"`. Use nix-darwin `users.users.<user>.openssh.authorizedKeys` when it can take a key made at activation; when it cannot, write the `from=` line at activation to a root-owned file that sshd reads through `AuthorizedKeysFile`, and say which route you took and why. `sudo` inside the hop still asks for the password.
+3. Lock Apple's sshd to localhost through nix-darwin's sshd config (`/etc/ssh/sshd_config.d/`): `AllowUsers <user>@127.0.0.1 <user>@::1`, `PasswordAuthentication no`, `KbdInteractiveAuthentication no`. Remote Login then admits no login from the LAN. Apple's sshd is started by launchd on port 22, so `ListenAddress` does not apply.
+4. Correct `modules/darwin/tailscale.nix` (it says Apple's sshd is off) and any other text this change makes wrong, in the same commit.
+
+**Files:**
+- `modules/common/rebuild.nix`
+- `modules/darwin/ssh.nix`
+- `modules/darwin/tailscale.nix`
+- `modules/darwin/default.nix`
+- `modules/darwin/local-ssh-hop.nix`
+- `modules/linux/ssh.nix`
+
+**Workers:** 1 writer (no separate tester; the repository has no test suite for these modules). `modules/darwin/local-ssh-hop.nix` is new and optional: use it when the key and sshd settings fit better in their own module.
+
+**Acceptance gate:** the Mac system configuration evaluates on natedev (`nix eval` of the darwin toplevel `drvPath`); the generated `rebuild` script passes `bash -n` and shellcheck; the generated sshd drop-in holds the three lines of Spec 3; the activation step makes the key only when it is missing and never prints the private key. The writer gives the exact steps the user runs to take it live, including the first switch, which still meets the old failure until this change is active. The commit is on branch `resources-mac-ssh-rebuild`, not on main.
+
+### Phase 87 — The Mac floor alert reaches the user's phone  · status: todo
+**Depends on:** none. Merge `origin/builds` first.
+
+**Approved:** builds showrunner, 2026-11-08: "Did the Mac floor job send that push? If not, find why and fix it in Phase 85 or a new phase. If it did, tell me its time. Find what besides the 110 GiB hana target holds the other Mac space, from a read-only size list, and send me the top five folders."
+
+**Approved:** builds showrunner, 2026-11-08: "Phase 87 go, after the Phase 85 checkpoint: the Mac floor uses the same crossing path, with a natedev message."
+
+**User answer (via builds, 2026-11-08), to "approve the Mac low-disk phone push text?":** "1." builds: "Change the existing sweep.disk_floor text so that the machine name is a value ({machine}), and use it for natedev and the Mac. Add no sweep.disk_floor_mac. Title: "{machine} disk is low; {machine} tests can fail". The body and action are your proposed words, with {machine} in place of "Mac". The natedev push keeps its meaning. Your Phase 87 sends the phone push for the Mac. Put the changed catalog entry in the checkpoint notice."
+
+#### Work Order
+
+**Goal:** when the Mac's free disk falls below the phone alert line, the user gets one phone push that names folders to delete. The showrunner also gets the five largest Mac folders other than the hana mirror target.
+
+**Measured (resources, 2026-11-08):** the Mac has 134 GiB free on `/System/Volumes/Data`; `sweep_phone_floor_gib` and the Mac sweep floor are both 150 GiB. The hana mirror target holds 110 GiB under a live claim. The Mac launchd job `org.nixos.disk-floor` (nixos `modules/darwin/disk-floor.nix`) runs `sweep.py --floor-only --host mac` every 120 s and is loaded (builds, 2026-11-08). Phase 81 round 4 found that Mac launchd jobs have a PATH without `/usr/sbin`.
+
+**Spec:**
+1. Find out, with read-only commands only, whether the Mac floor job sent the phone push for this crossing, and when. Read the job's log, the sweep's crossing record and the push record (`scripts/lint/sweep.py` `send_floor_alert`, `scripts/notify/`). Change no Mac setting, start no Mac test or build, and run no real sweep.
+2. If no push went, find why, and give the evidence.
+3. Make a read-only size list of the Mac home disk and give the five largest folders other than `~/.local/state/mac-test/mirror/hana/target`, with their sizes. Delete nothing.
+4. If a push should have gone and did not, fix the cause where it lives. If it lives in nixos (`modules/darwin/disk-floor.nix`), say so; the director makes that a nixos branch. Add a row to the existing alert test that fails without the fix.
+5. Correct as-built text that the fix makes wrong.
+6. **The push text.** Change `sweep.disk_floor` in `scripts/notify/push_catalog.py` so the machine name is a value. Add no second entry.
+   - Title: "{machine} disk is low; {machine} tests can fail"
+   - Body: "{machine} has {free} free, below the {floor} alert line, so {machine} test builds can fail. {recommendation}"
+   - Action: "{folder_action}", for example "In the natedev Claude session, say which {machine} folders to delete."
+   - The natedev push fills `natedev`; the Mac floor fills `Mac`. Report whether the change makes the existing approvals stale. Write no approval record.
+
+**Files:**
+- `scripts/lint/sweep.py`
+- `scripts/lint/test_sweep.py`
+- `scripts/notify/push_catalog.py`
+- `docs/as-built/build-memory-admission.md`
+
+**Workers:** 1 writer. The `test` slot takes the writer role: Spec 1 to 3 first (a report, no edits), then Spec 4 and 5 only when the director sends them.
+
+**Acceptance gate:** the report answers Spec 1 to 3 with evidence. When there is a fix: the new row fails before it and passes after; `test_sweep.py` and the targeted test pass; basedpyright reports 0 errors and 0 warnings on the changed Python files.
+
+### Phase 88 — The hana CI margin key goes after the runner activation  · status: todo
+
+**Depends on:** queue's 10d, natedev's confirmation that the runners are active behind the cargo front, and the user's approval of a config key deletion. Source: builds-queue Phase 22, moved to resources by builds on 2026-11-08 (queue had too much work).
+
+#### Work Order
+
+**Goal:** A registered CI job is charged only through its reservation. The fixed CI margin is gone.
+
+**Spec:**
+
+1. **The wait.** natedev confirms the runner activation. resources then files the key deletion with /unit:question, because a config key deletion needs the user's approval. Do not start before both answers are on the plan.
+2. **The deletion.** `ci_memory_margin_gib` leaves `config/build_admission.conf` and `AdmissionPolicy` (`ci_memory_margin_bytes`, `admission_records.py:78`). `ci_keep_aside` (`scripts/lint/memory_admit.py`) and the mixed rule go with it.
+3. **The limit.** A CI job that the front cannot cover has no keep-aside. `MemoryMax=34G` is its limit. The notice says so.
+4. **Proof.** Tests: registered jobs still have no keep-aside; an unregistered job counts once in the cap and now takes no margin, so the room rises only in that case. Remove the tests of the mixed rule only with an approved assertion change.
+
+**Files:**
+- `config/build_admission.conf`
+- `scripts/build_queue/admission_records.py`
+- `scripts/lint/memory_admit.py`
+- `scripts/lint/test_memory_admit.py`
+- `docs/as-built/build-memory-admission.md`
+
+**Workers:** `1 writer`
+- `impl` — the deletion and its tests.
+
+**Gate:** the targeted test, and `basedpyright` 0/0/0 on each changed file and each caller module.
+
+**Change-Review:** none — the queue view shows the same rows; the room rises only when an unregistered job caused the margin. Registered jobs take no margin today (`test_memory_admit.py:5809`).
