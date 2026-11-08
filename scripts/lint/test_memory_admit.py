@@ -3464,19 +3464,26 @@ class ProgramProfileTests(MemoryQueueFixture):
         _ = cast(object, self.enterContext(patch.dict(os.environ, fake_memory_readings(self.root))))
 
 
-    def test_legacy_gate_history_keeps_the_first_need_across_hosts_and_ages(self) -> None:
+    def test_gate_history_uses_recent_host_peaks_at_p90(self) -> None:
         history = gate.admission_dir(self.root) / "anon_peaks.jsonl"
-        rows = [{"step": "merge-gate", "host": "host", "anon_peak_bytes": value * GIB,
-                 "ended_at": store.utc_iso((NOW - timedelta(hours=1)).timestamp())}
-                for value in (1, 2, 3, 4, 5, 6, 7, 8, 9, 10)]
-        rows.extend([
+        excluded = [
             {"step": "nextest", "host": "host", "anon_peak_bytes": 100 * GIB, "ended_at": store.utc_iso(HISTORY_AT.timestamp())},
             {"step": "merge-gate", "host": "other", "anon_peak_bytes": 100 * GIB, "ended_at": store.utc_iso(HISTORY_AT.timestamp())},
             {"step": "merge-gate", "host": "host", "anon_peak_bytes": 100 * GIB,
              "ended_at": store.utc_iso((NOW - timedelta(days=gate.HISTORY_DAYS + 1)).timestamp())},
-        ])
-        _ = history.write_text("".join(json.dumps(row) + "\n" for row in rows))
-        self.assertEqual(gate.program_peak_estimate("merge-gate", "host", NOW, self.root, 4 * GIB), gate.FirstProgramPeak(4 * GIB))
+        ]
+        cases = (
+            (tuple(value * GIB for value in range(1, 11)), 9 * GIB),
+            ((9 * GIB // 2,) * 20 + (26 * GIB,), 9 * GIB // 2),
+        )
+        for peaks, expected in cases:
+            with self.subTest(peaks=peaks):
+                rows = [{"step": "merge-gate", "host": "host", "anon_peak_bytes": peak,
+                         "ended_at": store.utc_iso((NOW - timedelta(hours=1)).timestamp())}
+                        for peak in peaks]
+                _ = history.write_text("".join(json.dumps(row) + "\n" for row in [*rows, *excluded]))
+                self.assertEqual(gate.program_peak_estimate("merge-gate", "host", NOW, self.root, 4 * GIB),
+                                 gate.MeasuredProgramPeak(expected, len(peaks)))
 
     def test_expired_measured_gate_profile_retains_its_original_fallback_cap(self) -> None:
         profile = gate.ProgramProfile("merge-gate", "installed/.claude", "checkout",

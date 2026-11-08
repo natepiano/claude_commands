@@ -7,7 +7,6 @@ import json
 import os
 import shlex
 import subprocess
-import sys
 import tempfile
 import time
 import unittest
@@ -17,7 +16,6 @@ from pathlib import Path
 from typing import TYPE_CHECKING, cast, override
 from unittest import mock
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
 
 from scripts.buildlog import cli
 from scripts.lib import conf
@@ -25,7 +23,7 @@ from scripts.buildlog import rust_release, sync, vault_pull
 from scripts.buildlog.test_index import point_root_at
 
 if TYPE_CHECKING:
-    from ..notify.push_texts import RenderedPush
+    from scripts.notify.push_texts import RenderedPush
 
 
 # Run the production remote script against this one fake Git implementation.

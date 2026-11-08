@@ -381,7 +381,8 @@ class SpendingUnavailable(importlib.abc.MetaPathFinder):
         return None
 
 sys.meta_path.insert(0, SpendingUnavailable())
-sys.path.insert(0, sys.argv[1])
+with open(Path(sys.argv[1]) / "scripts/lib/package_root.py") as package_root:
+    exec(package_root.read(), {"__file__": package_root.name})
 from scripts.mac_test import linux_runner
 mirror = Path(sys.argv[2])
 values = {"selected_target": "spare", "selected_settings": "linux.conf", "shell_cache": "shells",

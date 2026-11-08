@@ -17,10 +17,7 @@ import tomllib
 from typing import Literal, cast
 
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lint"))
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "build_hold"))
 from scripts.build_hold import override_guard
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
 from scripts.lib import conf
 
 from scripts.mac_test import cargo_manifest, offload

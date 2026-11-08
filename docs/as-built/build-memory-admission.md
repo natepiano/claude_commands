@@ -1459,6 +1459,10 @@ No adaptive controller, fixed admission limit, order window, CI growth promise, 
 
 ### Progress memory profiles
 
+Merge gates start with the p90 of their host's recorded peaks from the last 14 days, as other programs do.
+Without history, they use `program_first_peak_gib.merge-gate` from `config/build_admission.conf`.
+Matching progress profiles still determine the running need; `progress_profile_rank` applies only to progress bins.
+
 Cargo build, check, clippy, mend, nextest, and merge gates record attributed swap-backed use in five-percent phase bins.
 Each bin selects the Nth-highest run value from matching completed profiles.
 `progress_profile_rank=2` sets N in `config/build_admission.conf`.

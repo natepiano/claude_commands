@@ -14,18 +14,12 @@ import shlex
 import subprocess
 import sys
 import tempfile
-from typing import TYPE_CHECKING
 import uuid
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'lib'))
 from scripts.mac_test import linux_runner
 from scripts.lib import conf
 
-if TYPE_CHECKING:
-    from ..lint import memory_admit
-else:
-    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'lint'))
-    from scripts.lint import memory_admit
+from scripts.lint import memory_admit
 
 
 REMOTE_PROOF = r"""
@@ -37,10 +31,10 @@ import sys
 
 home = Path(sys.argv[1])
 values = json.loads(sys.argv[2])
-sys.path.insert(0, str(home / '.claude/scripts/mac_test'))
-sys.path.insert(0, str(home / '.claude/scripts/lint'))
-import linux_runner
-from memory_test_support import fake_memory_readings, gate_isolation_environment
+with open(home / '.claude/scripts/lib/package_root.py') as package_root:
+    exec(package_root.read(), {'__file__': package_root.name})
+from scripts.mac_test import linux_runner
+from scripts.lint.memory_test_support import fake_memory_readings, gate_isolation_environment
 
 fixture = home / 'fixture'
 fixture.mkdir()
@@ -127,9 +121,10 @@ def main() -> int:
     ssh.append(host)
     task = 'gate:linux-loopback-' + uuid.uuid4().hex
     bootstrap = (
-        'import sys; from pathlib import Path; '
-        'sys.path.insert(0,str(Path.home()/".claude/scripts/lib")); '
-        'import scratch; print(scratch.new(task=sys.argv[1],word="linux-home"))'
+        'import sys; from pathlib import Path\n'
+        'with open(Path.home()/".claude/scripts/lib/package_root.py") as package_root:\n'
+        '    exec(package_root.read(), {"__file__": package_root.name})\n'
+        'from scripts.lib import scratch; print(scratch.new(task=sys.argv[1],word="linux-home"))'
     )
     created = subprocess.run([*ssh, shlex.join(['python3', '-c', bootstrap, task])],
                              capture_output=True, text=True, timeout=deadline, check=True)
@@ -157,9 +152,12 @@ def main() -> int:
                                    check=False, timeout=deadline)
         return completed.returncode
     finally:
-        cleanup = ('import sys; from pathlib import Path; '
-                   'sys.path.insert(0,str(Path.home()/".claude/scripts/lib")); '
-                   'import scratch; scratch.end(sys.argv[1])')
+        cleanup = (
+            'import sys; from pathlib import Path\n'
+            'with open(Path.home()/".claude/scripts/lib/package_root.py") as package_root:\n'
+            '    exec(package_root.read(), {"__file__": package_root.name})\n'
+            'from scripts.lib import scratch; scratch.end(sys.argv[1])'
+        )
         _ = subprocess.run([*ssh, shlex.join(['python3', '-c', cleanup, task])], check=True, timeout=deadline)
         print(f'loopback: removed the managed scratch home {home}', flush=True)
 

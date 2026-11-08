@@ -3,17 +3,13 @@
 from __future__ import annotations
 
 import sqlite3
-import sys
 from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
-from pathlib import Path
 from typing import Literal, TypedDict, cast
 
 from scripts.buildlog import store
 
-for directory in ("build_targets", "build_hold", "mac_test", "lint", "lib"):
-    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / directory))
 from scripts.lib.user_zone import user_zone
 
 HoldTarget = Literal["mac", "natedev"]
@@ -51,7 +47,6 @@ class CurrentHolds:
 
 def read_current_holds() -> CurrentHolds:
     # Historical reads need no live coordination modules.
-    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "build_targets"))
     from scripts.build_hold import build_hold
     from scripts.mac_test import mac_test
 

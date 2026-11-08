@@ -702,6 +702,17 @@ After Phase 30, `build_targets.py` eligible, reserve and release-wait still use 
 4. **Measure.** CPU (user + system, children counted) and wall per start, 15 interleaved runs before and after, on top of 41p.
 5. **Proof.** An import test for each moved import. The existing tests of each changed module pass.
 
+### Phase 32 — A merge gate claims the memory its runs used  · status: done
+
+1. **The ask (builds, 2026-11-08 06:50).** `step_estimator.py:244` `program_peak_estimate` returns `FirstProgramPeak` for every `merge-gate`, so admission claims the fixed 4 GiB. A herdr merge gate peaked at 26.4 GiB anonymous while admission counted 4 GiB; natedev went into earlyoom and hana's gate was killed twice. Evidence: `/tmp/claude/unit/20523639-3e08-48d6-9277-73e052bca297/phases/83/memory_kill_report.md`.
+2. **Measured claims.** A merge-gate claim uses the measured anonymous peak history of its host, as other programs do. The fixed value applies only when no history exists.
+3. **Outliers never set the claim.** The claim is the 90th percentile of the host's merge-gate peaks in 14 days, the rule other programs use. The research (phases/32/notes/research.md) withdrew the first rule, the 2nd-highest peak: 1,348 of 1,352 rows are 4.5-4.8 GiB, and 4 runaway rows (16.7-26.4 GiB, all after 2026-11-07 21:00) would set every gate's claim near 21 GiB for 14 days. The p90 is 4.65 GiB. The gate keeps itself near its own 4 GiB start limit (`merge_gate_governor_gib`), so a runaway test module is a gate defect, not a sizing input: verify fixes the tests, and a module memory limit in `merge_gate.py` belongs to its owner.
+4. **tmpfs is not in this phase.** The builds slice held up to 27 GiB of shmem in the same minutes, and no reservation counts it. Builds ruled (2026-11-08): `scripts/lint/memory_admit.py` is a resources file, so resources adds shmem to the slice's used memory. Verify fixes the two runaway tests.
+5. **Research first.** Why `merge-gate` was excluded (`a4d4c9988`, Phase 10o), where merge-gate peaks are written, and how gate claims and Phase 28 progress profiles relate.
+6. **Proof.** Tests: no history gives the fixed value; history gives the Nth-highest; one runaway peak does not set the claim. A replay of today's records shows the herdr gate claim before and after.
+
+**Workers:** 1 researcher, then 1 writer and tester. **Gate:** targeted test, basedpyright 0/0/0, adversary review.
+
 ### Phase 10m — The build page is a repository tool and shows leftover-process ages  · status: todo
 
 **Depends on:** 10z (the page reads the room evidence 10z publishes) and report-unit Phase 15 on builds (builds ruling, 2026-11-05). report Phase 15 builds one typed provider, `charts.page_data(days, n=3) -> PageData | IndexUnavailable`, and starts at once. report-unit waits for 10m only in its Phase 26.

@@ -11,14 +11,12 @@ from typing import cast
 from unittest import mock
 
 
-import sys
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from scripts.production import staff
 from scripts.production.staff_test_support import StaffTestCase
 from scripts.production.rename_test_support import stop_at_staff_write
-import showrunner_parent
+from scripts.production import showrunner_parent
 from scripts.production import showrunners
 from scripts.production import showrunner_tree
 

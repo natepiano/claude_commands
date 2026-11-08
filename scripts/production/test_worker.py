@@ -13,6 +13,7 @@ import sys
 import time
 from collections.abc import Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 from contextlib import redirect_stderr, redirect_stdout
 from threading import Event
 from typing import Literal, TextIO, cast, final, override
@@ -27,7 +28,7 @@ from scripts.direct import assign, progress_history
 from scripts.direct.recorder_fixture import invoke_recorder
 from scripts.production.cli_fixture import invoke_cli
 from scripts.production import staff, worker, worker_admission
-from scripts.production.staff_test_support import fixture_member
+from scripts.production.staff_test_support import fixture_member, fixture_runtime_id, fixture_worker
 from scripts.lib import atomic_file, unit_runs
 from scripts.lib.test_models_registry import write_registry
 from scripts.lib.test_hang_guard import LauncherHangGuard
@@ -45,6 +46,8 @@ class DispatchAgent:
         self.fixture = fixture
         self.submitted: list[tuple[str, str]] = []
         self.replies: list[str] = []
+        self.questions: dict[str, str | herdr.HerdrFailure] = {}
+        self.answers: list[tuple[str, str]] = []
         self.waited: list[str] = []
         self.finish_after = 0
         self.wait_count = 0
@@ -91,6 +94,27 @@ class DispatchAgent:
         self.append(pane, "assistant", response)
         self.fixture.world.locations[pane]["agent_status"] = "done"
         self.after_complete(pane)
+
+    def pane_commands(self, case: unittest.TestCase) -> None:
+        run = self.fixture.world.run
+
+        def command(*arguments: str, deadline: float = math.inf) -> str:
+            result = run(*arguments, deadline=deadline)
+            if arguments[:2] == ("pane", "read"):
+                question = self.questions.get(arguments[2], result)
+                if isinstance(question, herdr.HerdrFailure):
+                    raise question
+                return question
+            if arguments[:2] == ("agent", "prompt") and arguments[2] in self.questions:
+                pane, text = arguments[2:4]
+                del self.questions[pane]
+                self.answers.append((pane, text))
+                self.append(pane, "user", text)
+                self.error = ""
+                self.fixture.world.locations[pane]["agent_status"] = "working"
+            return result
+
+        _ = case.enterContext(patch.object(self.fixture.world, "run", side_effect=command))
 
     def consultations(self, case: unittest.TestCase) -> None:
         run = self.fixture.world.run
@@ -153,6 +177,8 @@ class DispatchAgent:
         else:
             raise AssertionError(args)
         if self.error:
+            if self.error == "agent_blocked":
+                self.fixture.world.locations[pane]["agent_status"] = "blocked"
             return subprocess.CompletedProcess(args, 1, json.dumps({"error": {"code": self.error, "message": self.error}}), "")
         return subprocess.CompletedProcess(args, 0, "{}", "")
 
@@ -218,6 +244,7 @@ class WorkerCommandTests(unittest.TestCase):
         atomic_file.write_text_atomic(config, config.read_text().replace("WORKER_TRANSPORT=mesh", "WORKER_TRANSPORT=herdr")
                                       + "# range: 1..600\nWORKER_SETTLE_SECONDS=30\n")
         self.agent = DispatchAgent(self.fixture)
+        self.agent.pane_commands(self)
         self.run_dir = self.fixture.root / "run"
         self.run_dir.mkdir(exist_ok=True)
         atomic_file.write_text_atomic(Path.home() / ".codex/sessions" / f"{self.fixture.parent.current_session}.jsonl",
@@ -256,13 +283,15 @@ class WorkerCommandTests(unittest.TestCase):
         return code, output.getvalue(), errors.getvalue()
 
     def test_restore_reuses_given_runs_for_two_workers(self) -> None:
+        first = self.fixture.worker_run("a-first", "unit", self.fixture.parent.current_session,
+                                       transport="herdr", director_run=True)
         for state in (self.opened("impl"), self.opened("review", "review")):
             _ = progress_history.begin_dispatch(self.run_dir, slot=state.row.name, phase="8", role="impl",
                 worker_name=state.row.name, worker_id=state.row.id, launcher_command=["assign.sh"],
                 prompt=self.prompt, kind="impl", lens="")
             _ = self.fixture.world.stop(state.row, self.fixture.world)
         record = staff.snapshot()
-        runs = {str(self.fixture.parent.current_session): [str(self.run_dir)]}
+        runs = {str(self.fixture.parent.current_session): [str(first), str(self.run_dir)]}
         with (patch.object(unit_runs, "held_by_session", return_value=runs) as searches,
               patch.object(progress_history, "active_dispatch", wraps=progress_history.active_dispatch) as active,
               patch.object(worker, "_resume_launcher", return_value=worker.ExitCode.OK),
@@ -317,25 +346,27 @@ class WorkerCommandTests(unittest.TestCase):
     def test_launcher_recovery_uses_the_real_lock_and_delivers_once(self) -> None:
         opened = self.opened()
         active = progress_history.ActiveDispatch("saved-pass", ("bash", "assign.sh", "argument with spaces"))
+        self.fixture.dispatch(opened.row, "impl")
         director = herdr.TabSession("director-pane", "unit", "workspace", str(self.fixture.parent.current_session))
         lock_path = staff.record_path().parent / "locks" / f"{opened.row.id}.lock"
         atomic_file.write_text_atomic(lock_path, "")
         for held in (True, False):
+            _ = self.fixture.world.stop(opened.row, self.fixture.world)
             with (self.subTest(held=held), lock_path.open("r") as lock,
                   patch.object(self.fixture.world, "tab_sessions", return_value=[director]),
                   patch.object(progress_history, "active_dispatch", return_value=active),
                   patch.object(self.fixture.world, "prompt") as prompt,
                   patch.object(herdr, "check_target", return_value=True),
-                  patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0)) as start):
+                  patch.object(subprocess, "run", wraps=self.agent.run) as start):
                 if held:
                     fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                self.assertEqual(worker.restore(self.fixture.parent.id), worker.ExitCode.OK)
+                self.assertEqual(worker.restore(self.fixture.parent.id), worker.ExitCode.REFUSED if held else worker.ExitCode.OK)
                 if held:
                     prompt.assert_not_called()
-                    start.assert_not_called()
+                    self.assertFalse(any("assign.sh" in str(call.args) for call in start.call_args_list))
                 else:
                     prompt.assert_called_once()
-                    start.assert_not_called()
+                    self.assertFalse(any("assign.sh" in str(call.args) for call in start.call_args_list))
                     self.assertEqual(prompt.call_args.args[0], director.pane_id)
                     text = cast(str, prompt.call_args.args[1])
                     self.assertIn("Run this saved command from your session shell: bash assign.sh 'argument with spaces'", text)
@@ -349,12 +380,14 @@ class WorkerCommandTests(unittest.TestCase):
     def test_launcher_delivery_failure_keeps_restore_uncertain(self) -> None:
         opened = self.opened()
         active = progress_history.ActiveDispatch("saved-pass", ("bash", "assign.sh"))
+        self.fixture.dispatch(opened.row, "impl")
+        _ = self.fixture.world.stop(opened.row, self.fixture.world)
         director = herdr.TabSession("director-pane", "unit", "workspace", str(self.fixture.parent.current_session))
         with (patch.object(self.fixture.world, "tab_sessions", return_value=[director]),
               patch.object(progress_history, "active_dispatch", return_value=active),
               patch.object(self.fixture.world, "prompt", side_effect=herdr.HerdrFailure("delivery failed")),
               patch.object(herdr, "check_target", return_value=True),
-              patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0)),
+              patch.object(subprocess, "run", side_effect=self.agent.run),
               redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as errors):
             self.assertEqual(worker.restore(self.fixture.parent.id), worker.ExitCode.UNCERTAIN)
         self.assertNotIn("unchanged", output.getvalue())
@@ -397,7 +430,7 @@ class WorkerCommandTests(unittest.TestCase):
                   patch.object(progress_history, "active_dispatch", return_value=active) as read,
                   redirect_stderr(io.StringIO()) as errors):
                 self.assertEqual(worker.own_pass(opened.row, staff.snapshot()), expected)
-            run.assert_called_once_with(self.fixture.parent)
+            run.assert_called_once_with(opened.row, record=staff.snapshot())
             read.assert_called_once_with(opened.row.id, self.run_dir)
             self.assertEqual(errors.getvalue(), "anomaly: impl: record unreadable\n"
                              if isinstance(active, progress_history.ActiveDispatchUnavailable) else "")
@@ -965,9 +998,59 @@ class WorkerCommandTests(unittest.TestCase):
         self.assertEqual(len(self.agent.submitted), 1)
 
     def test_blocked_dispatch_returns_blocked(self) -> None:
+        opened = self.opened()
+        question = "Which output format must I use?\nJSON or Markdown?\n"
+        cases = (("before", question), ("after", question),
+                 ("unreadable", herdr.HerdrFailure("pane read failed\nterminal unavailable")))
+        for stage, visible in cases:
+            with self.subTest(stage=stage):
+                self.agent.questions[opened.pane] = visible
+                self.agent.error = "" if stage == "before" else "agent_blocked"
+                self.fixture.world.locations[opened.pane]["agent_status"] = "idle" if stage == "after" else "blocked"
+                with redirect_stderr(io.StringIO()) as errors:
+                    self.assertEqual(self.dispatch(), worker.ExitCode.BLOCKED)
+                expected = visible if isinstance(visible, str) else "anomaly: impl: pane read failed terminal unavailable\n"
+                self.assertEqual(errors.getvalue(), f"question: impl pane {opened.pane}\n" + expected)
+                self.assertEqual(len(self.agent.submitted), 0 if stage == "before" else 1)
+        self.assertIn(("pane", "read", opened.pane, "--source", "recent", "--lines", "40"), self.fixture.world.commands)
+
+    def test_answer_continues_a_blocked_dispatch_and_refuses_another_parents_worker(self) -> None:
+        opened = self.opened()
+        self.agent.questions[opened.pane] = "Which output format must I use?"
         self.agent.error = "agent_blocked"
-        self.assertEqual(self.dispatch(), worker.ExitCode.BLOCKED)
+        with redirect_stderr(io.StringIO()):
+            self.assertEqual(self.dispatch(), worker.ExitCode.BLOCKED)
+        active = progress_history.active_dispatch(opened.row.id, self.run_dir)
+        self.assertIsInstance(active, progress_history.ActiveDispatch)
+        answer_text = "Use JSON."
+        for index, reported in enumerate((True, False), start=1):
+            with self.subTest(reported=reported):
+                self.agent.questions[opened.pane] = "Which output format must I use?"
+                self.fixture.world.locations[opened.pane]["agent_status"] = "blocked"
+                if not reported:
+                    _ = self.fixture.world.locations[opened.pane].pop("agent_session", None)
+                    pid = self.fixture.world.foreground[opened.pane][0]
+                    process = self.fixture.world.processes[pid]
+                    self.fixture.world.processes[pid] = replace(process, identity=herdr.RolloutThread(opened.row.current_session))
+                self.assertEqual(self.command("answer", "impl", "--text", answer_text), (0, "done\n", ""))
+                self.assertEqual(len(self.agent.answers), index)
+                self.assertEqual(self.agent.answers[-1][0], opened.pane)
+                self.assertIn(answer_text, self.agent.answers[-1][1])
+                self.assertEqual(self.fixture.world.locations[opened.pane]["agent_status"], "working")
+        self.assertEqual(self.dispatch(), worker.ExitCode.OK)
         self.assertEqual(len(self.agent.submitted), 1)
+        self.assertEqual(self.agent.waited, [opened.pane])
+        self.assertIn(self.agent.final, self.reply.read_text())
+        assert isinstance(active, progress_history.ActiveDispatch)
+        self.assertIn("DONE " + active.instance_id, self.reply.read_text())
+        self.assertEqual(progress_history.active_dispatch(opened.row.id, self.run_dir), active)
+        other = fixture_member("unit", name="other-unit", parent=self.fixture.parent.parent)
+        foreign = fixture_member("worker", name="foreign", parent=other.id)
+        self.fixture.world.add(foreign, "w2:p7", workspace="w2", tab="w2:t2")
+        self.agent.questions["w2:p7"] = "Which output format must I use?"
+        self.assertEqual(self.command("answer", foreign.name, "--text", "Use Markdown."),
+                         (worker.ExitCode.REFUSED, "", "foreign: no worker staff row\n"))
+        self.assertEqual(len(self.agent.answers), 2)
 
     def test_working_worker_that_reaches_done_receives_one_prompt(self) -> None:
         opened = self.opened()
@@ -983,6 +1066,52 @@ class WorkerCommandTests(unittest.TestCase):
         self.assertEqual(self.dispatch(), worker.ExitCode.OK)
         self.assertEqual(len(self.agent.submitted), 1)
         self.assertEqual(self.agent.submitted[0][0], opened.pane)
+
+    def test_a_prompt_delivered_during_settle_keeps_its_follower(self) -> None:
+        opened = self.opened()
+        self.fixture.world.locations[opened.pane]["agent_status"] = "working"
+        with patch.object(worker, "dispatch_receipt", wraps=worker.dispatch_receipt) as receipts:
+            def delivered(pane: str, timeout_ms: int) -> herdr.ObservedAgentState:
+                del timeout_ms
+                line = cast(str, receipts.call_args.args[1])
+                self.agent.submitted.append((pane, line))
+                self.agent.append(pane, "user", line)
+                return herdr.ObservedAgentState(herdr.AgentStatus.WORKING)
+            with patch.object(self.fixture.world, "wait_turn_end", side_effect=delivered):
+                code = self.dispatch()
+        self.assertEqual(code, worker.ExitCode.OK)
+        self.assertEqual(self.agent.waited, [opened.pane])
+        self.assertEqual(len(self.agent.submitted), 1)
+        self.assertIn("DONE ", self.reply.read_text())
+
+    def test_done_worker_can_take_a_fix_while_its_recorder_pass_is_active(self) -> None:
+        for effort in ("high", "low"):
+            with self.subTest(fix_effort=effort):
+                _ = write_registry(self.fixture.root / "conf/models.conf", {
+                    "direct.codex": {"fix": f"gpt-test:{effort}"},
+                }, update=True)
+                submitted = len(self.agent.submitted)
+                self.assertEqual(self.dispatch(), worker.ExitCode.OK)
+                row = self.agent.row(self.agent.submitted[-1][0])
+                self.assertEqual(worker_panes.worker_pass(row, self.run_dir)["status"], "active")
+                launches = len(self.fixture.world.launches)
+                self.assertEqual(worker.assign(self.fixture.parent.id, "fix", self.prompt, session_dir=self.run_dir,
+                    slot="impl", phase="8", kind="fix", name="impl", launcher_command=["assign.sh"], reply=self.reply,
+                    fix_cause="Repair the reported dispatch failure"), worker.ExitCode.OK)
+                self.assertEqual(worker_panes.worker_pass(row, self.run_dir)["kind"], "fix")
+                self.assertEqual(len(self.agent.submitted), submitted + 2)
+                self.assertEqual(len(self.fixture.world.launches), launches + (effort == "low"))
+
+    def test_restore_keeps_an_open_busy_worker_without_sending_a_launcher(self) -> None:
+        opened = self.opened()
+        self.fixture.dispatch(opened.row, "review")
+        self.fixture.world.locations[opened.pane]["agent_status"] = "working"
+        before = self.fixture.staff_state(), len(self.fixture.world.launches)
+        self.assertEqual(self.command("restore"), (0, "unit: workers unchanged\n", ""))
+        self.assertEqual((self.fixture.staff_state(), len(self.fixture.world.launches)), before)
+        self.assertEqual(self.fixture.world.stops, [])
+        self.assertEqual(self.agent.submitted, [])
+        self.assertEqual(self.fixture.world.locations[opened.pane]["agent_status"], "working")
 
     def test_busy_worker_receives_no_prompt(self) -> None:
         opened = self.opened()
@@ -1447,6 +1576,216 @@ class WorkerCommandTests(unittest.TestCase):
         self.assertEqual(roles.call_count, 1)
         self.assertEqual(enumerated, [self.fixture.root])
         self.assertEqual(self.agent.submitted, [])
+
+    def recorded_list_fixture(self) -> tuple[staff.StaffRow, staff.StaffRow, list[Path]]:
+        first = self.fixture.worker("same-name")
+        manager = fixture_member("showrunner", name="TEST-other-manager")
+        second = fixture_worker("same-name", manager.id)
+        mesh_manager = fixture_member("showrunner", name="TEST-mesh-manager")
+        mesh = fixture_worker("mesh-worker", mesh_manager.id)
+        paths: list[Path] = []
+        for row, owner, status, family, transport in (
+                (first, self.fixture.parent, "active", "codex", "herdr"),
+                (second, manager, "completed", "claude", "herdr"),
+                (mesh, mesh_manager, "active", "codex", "mesh")):
+            run = self.fixture.root / ("recorded-" + owner.name)
+            path = run / unit_runs.STATE_FILE
+            atomic_file.write_text_atomic(path, json.dumps({"owner_staff_id": owner.id, "pass": {
+                row.name: {"worker_id": row.id, "worker_name": row.name, "kind": "review", "status": status,
+                           "activity": "Check the saved work.", "started_at": 10, "called_agent": {"family": family}}}}))
+            atomic_file.write_text_atomic(run / "worker_transport", transport + "\n")
+            paths.append(path)
+        atomic_file.write_text_atomic(accounts.groups_file(), json.dumps({"units": "claude2"}))
+        atomic_file.write_text_atomic(accounts.accounts_config_file(), json.dumps({"workers": "codex2"}))
+        return first, second, paths
+
+    def test_list_all_groups_pane_workers_by_manager_from_records(self) -> None:
+        first, second, _paths = self.recorded_list_fixture()
+        code, output, errors = self.command("list", "--json", "--all")
+        self.assertEqual(code, 0, errors)
+        rows = {str(row["id"]): row for row in cast(list[dict[str, object]], json.loads(output))}
+        self.assertEqual(set(rows), {first.id, second.id})
+        self.assertEqual([rows[row.id]["manager"] for row in (first, second)], [self.fixture.parent.name, "TEST-other-manager"])
+        self.assertEqual([rows[row.id]["state"] for row in (first, second)], ["active", "completed"])
+        self.assertEqual([rows[row.id]["work"] for row in (first, second)], ["busy", "idle"])
+        self.assertEqual([rows[row.id]["account"] for row in (first, second)], ["codex2", "claude2"])
+        for row, label in ((first, "codex2"), (second, "claude2")):
+            self.assertEqual(rows[row.id]["role"], "review")
+            self.assertEqual(rows[row.id]["activity"], "Check the saved work.")
+            self.assertEqual(rows[row.id]["home"], str(Path.home() / ("." + label)))
+
+    def test_list_all_keeps_a_refused_pass_over_an_equal_time_start_event(self) -> None:
+        first, _second, paths = self.recorded_list_fixture()
+        state = cast(dict[str, object], json.loads(paths[0].read_text()))
+        slots = cast(dict[str, dict[str, object]], state["pass"])
+        slots[first.name]["status"] = "refused"
+        history = self.fixture.root / "refused-history.jsonl"
+        state["history_file"] = str(history)
+        atomic_file.write_text_atomic(paths[0], json.dumps(state))
+        atomic_file.write_text_atomic(history, json.dumps({
+            "event_type": "pass_started", "worker_id": first.id, "worker_name": first.name,
+            "pass_kind": "review", "pass_activity": "Start the work.", "timestamp_epoch": 10,
+            "called_agent": {"family": "codex"}}) + "\n")
+        code, output, errors = self.command("list", "--json", "--all")
+        self.assertEqual(code, 0, errors)
+        rows = {str(row["id"]): row for row in cast(list[dict[str, object]], json.loads(output))}
+        self.assertEqual((rows[first.id]["state"], rows[first.id]["work"], rows[first.id]["activity"]),
+                         ("refused", "unknown", "Check the saved work."))
+
+    def test_list_all_resolves_the_legacy_unit_account_once_from_stored_history(self) -> None:
+        _first, second, _paths = self.recorded_list_fixture()
+        atomic_file.write_text_atomic(accounts.groups_file(), json.dumps({"units": "default"}))
+        atomic_file.write_text_atomic(accounts.roles_history_file(), json.dumps({
+            "role": "unit", "label": "default", "account_label": "claude2", "at": "2026-10-08T00:00:00Z"}) + "\n")
+        with patch.object(accounts, "resolve_history_label", wraps=accounts.resolve_history_label) as resolved:
+            code, output, errors = self.command("list", "--json", "--all")
+        self.assertEqual(code, 0, errors)
+        rows = {str(row["id"]): row for row in cast(list[dict[str, object]], json.loads(output))}
+        self.assertEqual(rows[second.id]["account"], "claude2")
+        self.assertEqual(rows[second.id]["home"], str(Path.home() / ".claude2"))
+        resolved.assert_called_once()
+
+    def test_list_all_keeps_valid_history_events_beside_an_incomplete_line(self) -> None:
+        first, second, paths = self.recorded_list_fixture()
+        history = self.fixture.root / "saved-history.jsonl"
+        for path in paths[:2]:
+            state = cast(dict[str, object], json.loads(path.read_text()))
+            state["history_file"] = str(history)
+            state["pass"] = {}
+            atomic_file.write_text_atomic(path, json.dumps(state))
+        events = [{"event_type": "pass_finished", "worker_id": row.id, "worker_name": row.name,
+                   "pass_kind": role, "status": "completed", "pass_activity": activity,
+                   "timestamp_epoch": stamp, "called_agent": {"family": family}}
+                  for row, role, activity, stamp, family in (
+                      (first, "impl", "Earlier work.", 1, "codex"),
+                      (first, "fix", "First saved activity.", 20, "codex"),
+                      (second, "review", "Second saved activity.", 30, "claude"))]
+        bad = '{"event_type":"pass_finished","worker_id":"' + str(first.id) + '",broken}\n'
+        atomic_file.write_text_atomic(history, json.dumps(events[0]) + "\n" + bad
+            + "".join(json.dumps(event) + "\n" for event in events[1:]) + bad)
+        original_open = Path.open
+        with (patch.object(json, "loads", wraps=json.loads) as decoded,
+              patch.object(Path, "open", autospec=True, side_effect=original_open) as opened):
+            code, output, errors = self.command("list", "--json", "--all")
+        self.assertEqual(code, 0, errors)
+        self.assertEqual(sum(isinstance(cast(object, call.args[0]), bytes) for call in decoded.call_args_list), 3)
+        self.assertEqual(sum(cast(tuple[object, ...], call.args)[0] == history for call in opened.call_args_list), 1)
+        rows = {str(row["id"]): row for row in cast(list[dict[str, object]], json.loads(output))}
+        self.assertEqual([rows[row.id]["state"] for row in (first, second)], ["completed", "completed"])
+        self.assertEqual([rows[row.id]["role"] for row in (first, second)], ["fix", "review"])
+        self.assertEqual([rows[row.id]["activity"] for row in (first, second)],
+                         ["First saved activity.", "Second saved activity."])
+
+    def test_list_all_resolves_a_fixed_manager_id_after_its_session_changes(self) -> None:
+        first, _second, paths = self.recorded_list_fixture()
+        state = cast(dict[str, object], json.loads(paths[0].read_text()))
+        _ = state.pop("owner_staff_id")
+        state["main_agent"] = {"session_id": self.fixture.parent.id}
+        state["pass"] = {}
+        history = self.fixture.root / "legacy-history.jsonl"
+        state["history_file"] = str(history)
+        atomic_file.write_text_atomic(paths[0], json.dumps(state))
+        atomic_file.write_text_atomic(history, json.dumps({
+            "event_type": "pass_finished", "worker_id": first.id, "pass_kind": "fix",
+            "pass_activity": "Repair the saved work.", "status": "completed", "timestamp_epoch": 20,
+            "called_agent": {"family": "codex"}}) + "\n")
+        _ = staff.update_current_session(self.fixture.parent.current_session, staff.StaffId(fixture_runtime_id("TEST-new-manager-session")))
+        code, output, errors = self.command("list", "--json", "--all")
+        self.assertEqual(code, 0, errors)
+        rows = {str(row["id"]): row for row in cast(list[dict[str, object]], json.loads(output))}
+        self.assertEqual((rows[first.id]["state"], rows[first.id]["role"], rows[first.id]["activity"]),
+                         ("completed", "fix", "Repair the saved work."))
+
+    def test_list_all_reads_only_the_needed_default_account_history_once(self) -> None:
+        _first, second, _paths = self.recorded_list_fixture()
+        atomic_file.write_text_atomic(accounts.groups_file(), json.dumps({"units": "default", "showrunners": "default"}))
+        history = accounts.roles_history_file()
+        atomic_file.write_text_atomic(history, "".join(json.dumps(row) + "\n" for row in (
+            {"role": "unit", "label": "default", "account_label": "claude2", "at": "2026-10-08T00:00:00Z"},
+            {"group": "showrunners", "label": "default", "account_label": "claude3", "at": "2026-10-08T00:00:00Z"})))
+        original = Path.read_text
+        reads: list[Path] = []
+        def read(path: Path, *args: object, **kwargs: object) -> str:
+            reads.append(path)
+            return original(path, *args, **kwargs)  # pyright: ignore[reportArgumentType]
+        with (patch.object(Path, "read_text", autospec=True, side_effect=read),
+              patch.object(accounts, "resolve_history_label", wraps=accounts.resolve_history_label) as resolve):
+            code, output, errors = self.command("list", "--json", "--all")
+        self.assertEqual(code, 0, errors)
+        rows = {str(row["id"]): row for row in cast(list[dict[str, object]], json.loads(output))}
+        self.assertEqual(rows[second.id]["account"], "claude2")
+        self.assertEqual(reads.count(history), 1)
+        self.assertEqual([call.args[0] for call in resolve.call_args_list], ["claude2"])
+
+    def test_list_all_bounds_a_history_when_another_worker_is_absent(self) -> None:
+        first, _second, paths = self.recorded_list_fixture()
+        absent = fixture_worker("absent-worker", self.fixture.parent.id,
+                                runtime_id="00000001-86a0-7000-8000-000000000001")
+        other = self.fixture.worker("other-history-worker")
+        state = cast(dict[str, object], json.loads(paths[0].read_text()))
+        history = self.fixture.root / "bounded-history.jsonl"
+        state["history_file"] = str(history)
+        state["pass"] = {}
+        atomic_file.write_text_atomic(paths[0], json.dumps(state))
+        other_history = self.fixture.root / "newer-history.jsonl"
+        other_run = self.fixture.root / "newer-run"
+        atomic_file.write_text_atomic(other_run / unit_runs.STATE_FILE, json.dumps({
+            "owner_staff_id": self.fixture.parent.id, "history_file": str(other_history), "pass": {}}))
+        atomic_file.write_text_atomic(other_run / "worker_transport", "herdr\n")
+        atomic_file.write_text_atomic(other_history, json.dumps({"event_type": "pass_started", "worker_id": other.id,
+            "pass_kind": "review", "timestamp_epoch": 200, "called_agent": {"family": "codex"}}) + "\n")
+        old = {"event_type": "pass_finished", "worker_id": first.id, "pass_kind": "impl",
+               "status": "completed", "timestamp_epoch": 1}
+        latest = {**old, "pass_kind": "fix", "timestamp_epoch": 20, "pass_activity": "Latest work."}
+        content = (json.dumps(old) + "\n" + (json.dumps({"event_type": "progress", "timestamp_epoch": 5,
+                   "text": "Earlier progress." * 100}) + "\n") * 200 + json.dumps(latest) + "\n").encode()
+        positions: list[int] = []
+        class HistoryReads(io.BytesIO):
+            @override
+            def read(self, size: int | None = -1) -> bytes:
+                positions.append(self.tell())
+                return super().read(size)
+        original = cast(Callable[..., object], Path.open)
+        def opened(path: Path, *args: object, **kwargs: object) -> object:
+            return HistoryReads(content) if path == history else original(path, *args, **kwargs)
+        with patch.object(Path, "open", autospec=True, side_effect=opened):
+            code, output, errors = self.command("list", "--json", "--all")
+        self.assertEqual(code, 0, errors)
+        rows = {str(row["id"]): row for row in cast(list[dict[str, object]], json.loads(output))}
+        self.assertEqual((rows[first.id]["role"], rows[first.id]["activity"]), ("fix", "Latest work."))
+        self.assertEqual(rows[absent.id]["state"], "unknown")
+        self.assertEqual(rows[other.id]["state"], "active")
+        self.assertTrue(positions)
+        self.assertGreater(min(positions), 0)
+
+    def test_list_all_needs_no_caller_staff_row(self) -> None:
+        _ = self.recorded_list_fixture()
+        with patch.object(staff, "runtime_id", side_effect=AssertionError("no caller lookup")):
+            code, output, errors = self.command("list", "--json", "--all")
+        self.assertEqual(code, 0, errors)
+        self.assertEqual(len(cast(list[object], json.loads(output))), 2)
+
+    def test_list_all_reads_each_record_once_without_live_calls(self) -> None:
+        _first, _second, paths = self.recorded_list_fixture()
+        reads: list[Path] = []
+        original = Path.read_text
+        def read(path: Path, *args: object, **kwargs: object) -> str:
+            reads.append(path)
+            return original(path, *args, **kwargs)  # pyright: ignore[reportArgumentType]
+        with (patch.object(Path, "read_text", side_effect=None, autospec=True) as reader,
+              patch.object(staff, "snapshot", side_effect=AssertionError("use the local record")),
+              patch.object(staff, "_found_backends", side_effect=AssertionError("no backend scan")),
+              patch.object(sessions, "running_sessions", side_effect=AssertionError("no process scan")),
+              patch.object(herdr, "Herdr", side_effect=AssertionError("no pane read")),
+              patch.object(herdr, "codex_conversations", side_effect=AssertionError("no thread scan")),
+              patch.object(subprocess, "run", side_effect=AssertionError("no live command"))):
+            reader.side_effect = read
+            code, output, errors = self.command("list", "--json", "--all")
+        self.assertEqual(code, 0, errors)
+        self.assertEqual(len(cast(list[object], json.loads(output))), 2)
+        for path in (*paths, staff.record_path(), accounts.accounts_config_file(),
+                     accounts.groups_file()):
+            self.assertEqual(reads.count(path), 1, str(path))
 
     def test_text_list_numbers_rows_and_keeps_the_worker_fields(self) -> None:
         self.assertEqual(self.command("list"), (0, "", ""))

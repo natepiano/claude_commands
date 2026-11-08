@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
 
 import os
 from pathlib import Path
@@ -14,11 +13,7 @@ import unittest
 from typing import final, override
 
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lint"))
-if TYPE_CHECKING:
-    from ..lint.memory_test_support import write_config_fixture
-else:
-    from scripts.lint.memory_test_support import write_config_fixture
+from scripts.lint.memory_test_support import write_config_fixture
 
 SCRIPT = Path(__file__).with_name("audit.py")
 
