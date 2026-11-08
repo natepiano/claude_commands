@@ -1828,42 +1828,19 @@ Merge 82e4ed73a puts builds 7ab78b74e into this branch with phases 35 to 83. Its
 ### Phase 87 — The three costliest production modules keep only the rare-case tests that matter  · status: done
 **Depends on:** none
 
-#### Work Order
+#### As-built
 
-**Source:** the user, 2026-11-07: "do rules 1 and 2", on the Phase 86 findings. Rule 1: a fix adds a case to the existing test of its behavior, not a new test. Rule 2: keep a rare-case test only where its defect would matter. This phase is the first cleanup under rule 2. It measures the yield before the cleanup runs module by module across the suite.
-
-**Goal:** `production/test_add_unit.py` (64 tests, 60.9 CPU s per gate on 2026-11-07), `production/test_staff.py` (129 tests, 56.8 CPU s) and `production/test_fast_track.py` (57 tests, 52.5 CPU s) keep only the rare-case tests that rule 2 keeps. The checkpoint notice gives the test count and the CPU s before and after.
-
-**Spec:**
-1. Measure each module first: `python3 scripts/test_times/module_cost.py --tree . --tests 10 --commands 10 production/<file>`.
-2. Sort each test. A **main-path** test checks the normal use of a behavior. A **rare-case** test checks an edge case, a refusal, a malformed input or a failure path.
-3. Keep every main-path test. Keep a rare-case test only when its defect would do one of these:
-   - show the user a wrong result: a screen, report, notice, message or command output that the user reads;
-   - damage saved state: a file, Git history, a ledger, the staff record or a config;
-   - lose work: a commit, an edit, a message or a worker result.
-4. For each other rare-case test, merge its case as a row into the main-path test of the same behavior when the setup is the same (rule 1). Otherwise remove it.
-5. Write the list in your final reply: test name, the case it checked, the rule 2 result, and "kept", "merged into <test>" or "removed".
-6. Change no production file. Do not edit `scripts/production/staff_test_support.py`.
-7. Add no guard, refusal or check (user rule, 2026-11-05).
+- Rule 2 (keep a rare-case test only when its defect shows the user a wrong result, damages saved state or loses work) applies to three production modules.
+- `test_fast_track.py` drops four fixture-only rare-case tests and `GIT_HANG_GUARD`: 56 → 52 tests.
+- `test_staff.py` drops the staff-row scan-count test, `CountedStaffRows` and its `Iterator` import: 129 → 128 tests. `DocumentLookupTests` sets `maintenance.auto false` in its main repository.
+- `test_add_unit.py` keeps every test: each is a main path or guards saved state.
 
 **Files:**
-- `scripts/production/test_add_unit.py`
-- `scripts/production/test_staff.py`
-- `scripts/production/test_fast_track.py`
+- `scripts/production/test_fast_track.py` — fast-track main paths and the kept rare cases.
+- `scripts/production/test_staff.py` — staff record tests.
 
-**Workers:** 2 writers; split by module
-- `impl` — `test_add_unit.py` and `test_fast_track.py`, role impl
-- `test` — `test_staff.py`, opens as impl
+**Gotchas:**
+- Same-load CPU did not change (fast_track 57.56 → 57.48 s, staff 28.65 → 28.60 s). The cost of these modules is the temporary git repository each test builds, not the rare-case tests.
 
-**Constraints from prior phases:**
-- Phase 86: the reports `builds-natest-streamline-a.md` and `-b.md` found no copies. The suite grows by one new test for each case that a review finds.
-- `scripts/production/staff_test_support.py` is not natest's to edit (standing rule).
-- Phase 81: a fixture that commits in a tempdir repository sets `maintenance.auto false` before its first commit.
-- Tests never read or write live state: `~/.claude` main, `~/.local/state/merge-gate`, `/tmp/claude`.
-
-**Acceptance gate:**
-- The list names every removed or merged test, its case and its rule 2 result.
-- The test count and CPU s, processes and wall s before and after, from `module_cost.py` and same-load pairs, in the checkpoint notice.
-- Each changed file passes.
-- the targeted test green on the phase commit merged with `origin/builds`
-- `basedpyright` on the changed files prints `0 errors, 0 warnings, 0 notes`
+**Ruled out:**
+- Rule 2 removal as a CPU tool for these modules: no measured gain.
