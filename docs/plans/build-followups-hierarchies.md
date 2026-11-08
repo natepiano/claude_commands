@@ -697,7 +697,7 @@ Do we have a unit director that is dedicated to, I guess it's showrunners and pr
 
 **Files:** `scripts/production/staff.py`, `scripts/production/test_staff.py`, `docs/as-built/staff-accessors.md`.
 
-### Phase 30 — Delete the mesh and rename the detached runs  · status: todo
+### Phase 30 — Delete the mesh and rename the detached runs  · status: done
 
 Moved from herdr-unit (sdlc, 2026-11-07 14:22 EST, user: "have some other unit do this work right now"). The Work Order is `### Phase 19 — Delete the mesh and rename the detached runs` in `docs/plans/herdr-worker-panes.md`. Read that section; this phase copies none of its text.
 

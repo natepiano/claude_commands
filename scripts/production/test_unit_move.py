@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 from scripts.shutdown import remote
-from scripts.lib.atomic_file import write_text_atomic
 
 import io
 import json
