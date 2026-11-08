@@ -655,19 +655,19 @@ class GateTrialTests(unittest.TestCase):
         for shell in ('bash', 'zsh'):
             link = f'ln -sf "$(command -v {shell})" /bin/{shell}'
             self.assertIn(link, data)
-            self.assertLess(data.index(link), data.index('exec python3 /var/lib/gate-trial/guest.py'))
+            self.assertLess(data.index(link), data.index('exec python3 "$box_dir/guest.py"'))
         self.assertIn('. /etc/profile', data)
         self.assertNotIn('systemctl', data)
         self.assertNotIn('exec nix', data)
         self.assertNotIn('gate-trial.service', data)
-        self.assertIn('export PATH=/run/current-system/sw/bin:$PATH', data)
+        self.assertIn('export PATH=$PATH:/run/current-system/sw/bin', data)
         self.assertEqual(self.fake.bundles[-1].decode(), trial.GUEST)
         self.assertIn('guest.py?X-Amz-', data)
-        self.assertIn('-o /var/lib/gate-trial/guest.py', data)
+        self.assertIn('-o "$box_dir/guest.py"', data)
         self.assertNotIn('base64 -d', data)
         self.assertNotIn(trial.GUEST, data)
         self.assertIn('machine=merge_gate.WholeMachine(timings)', trial.GUEST)
-        self.assertLess(data.index('push_logs &'), data.index('trap boot_failed EXIT'))
+        self.assertLess(data.index('trap boot_failed EXIT'), data.index('push_logs &'))
         self.assertNotIn('admission_service.py', data)
         self.assertNotIn('governor_gib', data)
         self.assertNotIn('RERUN_LIMIT', data)
@@ -1115,7 +1115,7 @@ class GuestTests(unittest.TestCase):
             mount.chmod(0o700)
             session = self.tool_session()
             setup = session[session.index('ln -sf'):].split('chown -R', 1)[0]
-            setup = setup.replace('/run/current-system/sw/bin', str(system)).replace('/run/gate-trial-bin', str(root / 'profile'))
+            setup = setup.replace('/run/current-system/sw/bin', str(system)).replace('$box_dir/tool-profile', str(root / 'profile'))
             setup = setup.replace('/bin/bash', str(root / 'bash')).replace('/bin/zsh', str(root / 'zsh'))
             _ = subprocess.run(['bash', '-ec', setup], check=True, capture_output=True, text=True, timeout=10,
                 env={**os.environ, 'PATH': str(tools) + os.pathsep + os.environ['PATH']})
@@ -1125,7 +1125,7 @@ class GuestTests(unittest.TestCase):
             self.assertEqual((system / 'python3').resolve(), Path(sys.executable).resolve())
             self.assertEqual((system / 'google-chrome').resolve(), (tools / 'chromium').resolve())
             session = self.tool_session()
-            self.assertLess(session.index('/run/gate-trial-bin/google-chrome'), session.index('mount --bind'))
+            self.assertLess(session.index('$box_dir/tool-profile/google-chrome'), session.index('mount --bind'))
 
     def test_guest_samples_peak_machine_memory_every_two_seconds(self) -> None:
         for present in (True, False):
