@@ -179,8 +179,8 @@ esac
         seed_interpreter_cache(self.root / "cache")
         memory_event = self.root / "memory-event.py"
         _ = memory_event.write_text(
-            "import os, sys\nfrom pathlib import Path\n"
-            + f"sys.path.insert(0, {str(VERIFY.parents[2])!r})\n"
+            "import os\nfrom pathlib import Path\n"
+            + f"with open({str(VERIFY.parents[2] / 'scripts/lib/package_root.py')!r}) as package_root: exec(package_root.read(), {{'__file__': package_root.name}})\n"
             + "from scripts.direct.wait_for_test_state import wait_until\n"
             + "path = Path(os.environ['BUILDLOG_MEMINFO'])\n"
             + "wait_until(lambda: len(values := path.read_text().split()) > 1 and values[1] != '0', path.parent, "
@@ -444,7 +444,7 @@ esac
         stub = self.root / "build_targets_stub.py"
         _ = stub.write_text(r"""import os, sys
 from pathlib import Path
-sys.path.insert(0, os.environ["TEST_REPO"])
+with open(Path(os.environ["TEST_REPO"]) / "scripts/lib/package_root.py") as package_root: exec(package_root.read(), {"__file__": package_root.name})
 from scripts.direct.wait_for_test_state import wait_until
 root = Path(os.environ["TEST_HOLD_ROOT"])
 if sys.argv[1] == "eligible":

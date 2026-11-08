@@ -11,14 +11,11 @@ import unittest
 from unittest import mock
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import TYPE_CHECKING, cast, override
+from typing import cast, override
 
 from scripts.buildlog import launches
 from scripts.buildlog.test_index import Record, point_root_at
-if TYPE_CHECKING:
-    from ..lib import test_hang_guard
-else:
-    from scripts.lib import test_hang_guard
+from scripts.lib import test_hang_guard
 
 CLI = Path(__file__).with_name("cli.py")
 ENDED = "2026-10-02T16:40:18+00:00"

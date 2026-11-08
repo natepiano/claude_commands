@@ -120,7 +120,7 @@ def caller_from_environment(environment: dict[str, str]) -> Caller:
 
         parent = membership.parent_of(member)
         if parent is not None:
-            return PaneCaller(str(worker_panes.worker_run(parent, record=membership)), member.name, member.id)
+            return PaneCaller(str(worker_panes.worker_run(member, record=membership)), member.name, member.id)
     return NotMeshWorker()
 
 
@@ -159,9 +159,22 @@ def _read_record(path: Path) -> RunRecord:
 
 
 def seat_name(session_dir: str, name: str) -> str:
-    """Resolve the worker name through the run owner."""
-    member = worker_admission.member(Path(session_dir), name)
-    return member.name if member is not None else name
+    """Resolve the current staff worker through its active recorder slot."""
+    run = Path(session_dir)
+    membership = staff.local_snapshot()
+    owner = worker_admission.parent(membership, run=run)
+    state = worker_lifecycle.read_json_object(run / unit_runs.STATE_FILE)
+    passes = state.get("pass")
+    current = cast(dict[str, object], passes).get(name) if isinstance(passes, dict) else None
+    member = None
+    if isinstance(current, dict):
+        dispatch = cast(dict[str, object], current)
+        if dispatch.get("status") == "active":
+            name = str(dispatch.get("worker_name", "")) or name
+            member = membership.by_id(staff.StaffId(str(dispatch.get("worker_id", ""))))
+    if member is None:
+        member = worker_admission.find_worker(membership, owner.id, name)
+    return member.name if member is not None and member.kind == "worker" and member.reports_to(owner.id) else name
 
 
 def _integer(value: object) -> int:

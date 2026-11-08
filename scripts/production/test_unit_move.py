@@ -260,8 +260,9 @@ class UnitFolderMoveTests(FolderRenameFixture):
                 def launch(session: str, target: herdr.NewTab | herdr.SplitPane | herdr.ExistingPane,
                            environment: herdr.PreparedAgentEnvironment, family: str, arguments: list[str],
                            opening: herdr.OpeningPrompt | herdr.NoOpeningPrompt, timeout: int, *, agent: str,
-                           reported_unknown: str = "", kind: Literal["claude", "codex"] = kind) -> herdr.AgentLaunched:
-                    _ = (session, opening, timeout, agent)
+                           reported_unknown: str = "", codex: herdr.CodexConversations | herdr.CodexLaunchRead = herdr.CodexLaunchRead.CURRENT,
+                           kind: Literal["claude", "codex"] = kind) -> herdr.AgentLaunched:
+                    _ = (session, opening, timeout, agent, codex)
                     self.assertEqual(reported_unknown, "")
                     self.assertFalse(backend.live)
                     self.assertEqual(target, herdr.ExistingPane("w1:p1", "kept-terminal"))

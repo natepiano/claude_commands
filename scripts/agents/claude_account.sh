@@ -7,7 +7,7 @@ claude_launch_environment() {
 import os
 from pathlib import Path
 import sys
-sys.path.insert(0, str(Path(sys.argv[1]).resolve()))
+with open(Path(sys.argv[1]).resolve() / "scripts/lib/package_root.py") as package_root: exec(package_root.read(), {"__file__": package_root.name})
 from scripts.accounts import accounts
 try:
     selected = accounts.account_for_unscoped_launch(os.environ, workers=sys.argv[2] == "workers")

@@ -37,7 +37,7 @@ from zoneinfo import ZoneInfo
 from scripts.accounts.home_test_support import clear_notes_directory_cache, scratch_account_home, write_account_settings
 from scripts.accounts import accounts, next_moves, refusal_watch, refusals, role_map
 from scripts.accounts.nix_env_fake import FakeShellRefusal, fake_nix_loader, imports_with_nix_loader, installed_program
-from scripts.lib import atomic_file, conf
+from scripts.lib import atomic_file, conf, file_lock
 from scripts.production import showrunners, staff
 from scripts.production.staff_test_support import StaffTestCase, fixture_member, fixture_worker
 from scripts.shutdown import stop_resume
@@ -2368,7 +2368,7 @@ with path.with_name(path.name + ".lock").open("a") as lock:
     def test_trust_holds_one_publication_lock_through_preparation_and_sync(self) -> None:
         paths = self.write_trust_fixture()
         prepare = atomic_file.prepared_replacement
-        lock_config = accounts.claude_config_lock
+        lock_config = file_lock.claude_config_lock
         sync = os.fsync
         locks: list[Path] = []
         preparations: list[Path] = []
@@ -2407,7 +2407,7 @@ with path.with_name(path.name + ".lock").open("a") as lock:
             sync(descriptor)
 
         with (patch.object(atomic_file, "prepared_replacement", side_effect=prepare_under_lock),
-              patch.object(accounts, "claude_config_lock", side_effect=count_lock),
+              patch.object(file_lock, "claude_config_lock", side_effect=count_lock),
               patch.object(os, "fsync", side_effect=sync_under_lock)):
             code, _output, error = self.run_cli("trust")
         self.assertEqual(code, 0, error)
@@ -7035,7 +7035,6 @@ class PaneWorkerMoveTests(unittest.TestCase):
         self.addCleanup(self.fixture.doCleanups)
         self.root = self.fixture.root
         from scripts.herdr.test_worker_panes import PaneWorld
-        from scripts.herdr import worker_panes
         from scripts.shutdown import restart
         from scripts.lib.test_models_registry import write_registry
         from scripts.lib import unit_runs
@@ -7043,7 +7042,6 @@ class PaneWorkerMoveTests(unittest.TestCase):
         self.world = PaneWorld()
         self.run_dir = self.root / "run"
         self.run_dir.mkdir()
-        _ = (self.run_dir / "worker_transport").write_text("herdr\n")
         runner = fixture_member("showrunner", name="showrunner")
         self.owner_id = fixture_member("unit", name="director", parent=runner.id,
                                        worktree=staff.PresentWorktree("natedev", self.root)).id
@@ -7063,7 +7061,6 @@ class PaneWorkerMoveTests(unittest.TestCase):
         })))
         _ = self.enterContext(patch.object(unit_runs, "RUN_ROOT", self.root / "runs"))
         _ = self.enterContext(patch.object(unit_runs, "FORMER_RUN_ROOT", self.root / "former"))
-        _ = self.enterContext(patch.object(worker_panes, "worker_run", return_value=self.run_dir))
         _ = self.enterContext(patch.object(herdr, "Herdr", return_value=self.world))
         _ = self.enterContext(patch.object(herdr, "native_process", side_effect=self.world.native_process))
         _ = self.enterContext(patch.object(herdr, "_startup_processes", side_effect=self.world.descendants))
@@ -7137,7 +7134,7 @@ class PaneWorkerMoveTests(unittest.TestCase):
         atomic_file.write_text_atomic(self.run_dir / "progress_history_state.json", json.dumps({
             "owner_session": self.owner.current_session, "history_file": str(self.run_dir / "history.jsonl"),
             "pass": {row.name: {"worker_name": row.name, "team_slot": row.name, "kind": role,
-                                 "status": status, "instance_id": "dispatch-" + row.name,
+                                 "status": status, "started_at": time.time(), "instance_id": "dispatch-" + row.name,
                                  "launcher_command": ["assign.sh", "--to", row.name]}}}))
         if status == "completed":
             from scripts.production import worker_admission
@@ -7149,6 +7146,10 @@ class PaneWorkerMoveTests(unittest.TestCase):
 
     def test_busy_move_keeps_one_conversation_and_pane_and_rerun_changes_nothing(self) -> None:
         row = self.worker()
+        _ = self.fixture.worker_run("a-first", "unit", self.owner.current_session, director_run=True,
+            passes=({"worker_name": row.name, "kind": "review", "status": "active", "started_at": 0,
+                     "instance_id": "old-dispatch", "launcher_command": ["assign.sh", "--old"]},))
+        self.run_dir = self.fixture.worker_run("z-own", "unit", self.owner.current_session)
         self.dispatch(row)
         before = self.fixture.staff_state()
         result = self.move("claude2", why="quota")

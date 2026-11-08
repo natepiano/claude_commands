@@ -8,11 +8,7 @@ except FileNotFoundError:
 
 import math
 import sys
-from pathlib import Path
 
-SCRIPTS = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(SCRIPTS / "herdr"))
-sys.path.insert(0, str(SCRIPTS / "message"))
 from scripts.herdr import herdr  # noqa: E402
 from scripts.herdr.herdr import AgentBlocked, Herdr  # noqa: E402
 from scripts.herdr.herdr import HerdrFailure as HerdrFailure  # noqa: E402

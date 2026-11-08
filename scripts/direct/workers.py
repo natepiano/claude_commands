@@ -20,9 +20,6 @@ from importlib import import_module
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, Protocol, cast
 
-if not __package__:
-    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "production"))
 
 if TYPE_CHECKING:
     from scripts.production import unit_lookup

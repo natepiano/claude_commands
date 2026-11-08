@@ -538,7 +538,7 @@ class StyleLedgerSitesTests(LedgerTestCase):
         source = (self.repo / PARENT_FILE).read_text()
         before = ledger.synced_commit()
         deletion = self.commit_tip(ledger, {PARENT_FILE: None})
-        with sqlite3.connect(ledger.database) as connection:
+        with closing(sqlite3.connect(ledger.database)) as connection, connection:
             _ = connection.execute('INSERT INTO judgments(rule,rule_blob,input_fingerprint,path,"commit",verdict,verdict_detail,ticket,worker,recorded_at,input_scope,declared_scope) '
                                    + "VALUES (?,?, '',?,?,'removed','','removal','test','2000','file','rule')",
                                    (rule, self.blob(rule), PARENT_FILE, deletion))
@@ -565,7 +565,7 @@ class StyleLedgerSitesTests(LedgerTestCase):
             reading = original(ids, snapshot, approved)
             if not raced:
                 raced = True
-                with sqlite3.connect(ledger.database) as connection:
+                with closing(sqlite3.connect(ledger.database)) as connection, connection:
                     _ = connection.execute("UPDATE held_findings SET text='changed by another writer' WHERE finding_id=?", (finding.finding_id,))
             return reading
 
@@ -618,7 +618,7 @@ class StyleLedgerSitesTests(LedgerTestCase):
         ledger, _, finding = self.site_fixture()
         tip = self.commit_tip(ledger, {PARENT_FILE: "// shift\n" + (self.repo / PARENT_FILE).read_text()})
         self.assertIsInstance(ledger.finding_site(finding, tip), style_ledger.UnchangedSite)
-        with sqlite3.connect(ledger.database) as connection:
+        with closing(sqlite3.connect(ledger.database)) as connection, connection:
             _ = connection.execute("UPDATE rule_texts SET text=? WHERE blob=?", (b"family: names\n\xff", finding.rule_blob))
         self.assertIsInstance(ledger.finding_site(finding, tip), style_ledger.NeedsJudgment)
 

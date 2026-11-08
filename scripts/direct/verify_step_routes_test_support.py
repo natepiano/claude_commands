@@ -43,7 +43,7 @@ import sys
 
 words = sys.argv[1:]
 call_id = words[words.index("--call-id") + 1]
-sys.path.insert(0, str(Path.home() / ".claude"))
+with open(Path.home() / ".claude/scripts/lib/package_root.py") as package_root: exec(package_root.read(), {"__file__": package_root.name})
 from scripts.direct.test_verify_step_state import read_step_row
 record = read_step_row(call_id)
 with Path(os.environ["TEST_MAC_EVENTS"]).open("a") as output:
@@ -119,7 +119,7 @@ root = Path(os.environ["PACKAGE_ROOT"])
 finished = root / "mend-finished"
 if arguments[:1] == ["mend"]:
     import sys
-    sys.path.insert(0, str(Path.home() / ".claude"))
+    with open(Path.home() / ".claude/scripts/lib/package_root.py") as package_root: exec(package_root.read(), {"__file__": package_root.name})
     from scripts.direct.test_verify_step_state import read_step_row
     record = read_step_row(os.environ["BUILDLOG_CALL_ID"])
     (root / "mend-state").write_text(record["state"])
@@ -127,7 +127,7 @@ if arguments[:1] == ["mend"]:
     raise SystemExit(int(os.environ["TEST_MEND_STATUS"]))
 if finished.exists() and not Path(os.environ["TEST_MAC_EVENTS"]).exists() and (arguments[:1] == ["metadata"] or arguments == ["+nightly", "fmt", "--version"]):
     import sys
-    sys.path.insert(0, str(Path.home() / ".claude"))
+    with open(Path.home() / ".claude/scripts/lib/package_root.py") as package_root: exec(package_root.read(), {"__file__": package_root.name})
     from scripts.direct.test_verify_step_state import read_step_row
     record = read_step_row(os.environ["BUILDLOG_CALL_ID"])
     (Path(os.environ["BUILD_HOLD_DIR"]) / "other").write_text("hold after mend")

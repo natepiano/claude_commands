@@ -8,7 +8,6 @@ import subprocess
 import sys
 from typing import cast
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.agents import worker_lifecycle
 from scripts.production import staff, worker_admission
 from scripts.lib import unit_runs

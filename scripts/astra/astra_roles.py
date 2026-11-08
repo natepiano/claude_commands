@@ -20,7 +20,6 @@ from enum import Enum
 from pathlib import Path
 from typing import Literal, NotRequired, TypedDict, cast
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.lib import process_start
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.production import staff, session_staff
@@ -285,7 +284,6 @@ def live_roles(membership: staff.StaffSnapshot, *,
             record = _parse_record(_json_object(path), path, membership)
             lifetime = record["lifetime"]
             if isinstance(lifetime, HeldDesignRole):
-                sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
                 from scripts.astra import design_roles
                 design = design_roles.read_design(lifetime.design_id)
                 instance = next(role for role in design.roles if role.role == lifetime.role_id)

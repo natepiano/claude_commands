@@ -181,11 +181,21 @@ The original `review` worker appears only when a displayed stage assigns it.
 `inventory.worker_resumes` reads direct Claude worker children and preserves their saved launcher arguments.
 Pane observations supply native worker resume state.
 `AccountMove` names the source and destination accounts.
-A busy worker receives only its own pass continuation.
-An idle worker receives no prompt.
-A director can receive the list of its busy and idle worker children.
-Restore shares dispatch reads across pane workers.
-It reopens only workers with active dispatches.
+A busy recipient gets only its `own_pass` continuation.
+An idle worker row receives no prompt.
+A director can receive the list of busy and idle worker children.
+Restore reopens only workers with active dispatches.
+It reads each worker's dispatch record and transcript once to select the resume step.
+An accepted dispatch gets a continuation prompt only when the worker is idle.
+Restore holds the dispatch lock across the record read, receipt read, and prompt delivery.
+An unsubmitted dispatch keeps the saved assign command as its step.
+Restore, named resume, and director notes use the same receipt rule.
+Director notes keep the saved prompt path and reuse shared dispatch history reads.
+A dispatch with a DONE line or a finished record gets no resume note or step.
+Later chat does not reopen a completed dispatch.
+The restart shares its run index and snapshots.
+Idle workers stay closed until their next assign.
+Account moves must preserve closed idle workers.
 
 ### Cleanup
 
@@ -205,10 +215,17 @@ Run end does not start a sweep.
 It removes only the ending session's active marker.
 Another marker's live or unknown owner prevents removal of its former run folder.
 
-A rename or transfer preserves fixed worker references.
-`rename.py` repairs the unit's session and display names.
-An explicit worktree move also changes the worktree path and branch.
-See [unit rename](unit-rename.md) for worktree moves.
+`scripts/direct/workers.py` stores each unit ledger at `~/.local/state/unit-workers/<staff id>.json`.
+`UNIT_WORKERS_STATE` selects a private root.
+The ledger stores fixed staff references, access policy, ownership, and events.
+Staff supplies current names, parents, worktrees, and backend identities.
+A rename or transfer preserves those fixed references.
+`rename.py` changes the unit row and repairs its session and display names.
+A changed unit name changes matching folder and branch suffixes.
+`--to-branch <name>` sets an explicit branch.
+Every unit branch change pushes the target to origin before sessions resume.
+Equal old and new unit names keep the folder and staff name.
+See [production rename](production-rename.md) for unit branch moves.
 
 ### Measurement: `scripts/whoami/worker_usage.py`
 

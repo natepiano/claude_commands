@@ -2,10 +2,30 @@
 
 The `/agents` skill uses the `agents` program.
 `agents` and `agents help` print the same usage and return status 0.
-The public commands are `help`, `status`, `resume`, `restart`, and `stop`.
+The public commands are `help`, `status`, `pause`, `exit`, `resume`, `restart`, and `stop`.
 `agents status [ACCOUNT] [--json] [--here]` reports live sessions.
 `agents stop SESSION` stops the selected session and its workers.
+Add `--dry-run` to print their names without stopping them.
 `agents` runs `scripts/shutdown/shutdown.py`; script callers keep that path.
+
+`agents pause NAME --why TEXT` stops the workers now.
+The director finishes its current turn and holds at the prompt.
+`agents exit NAME --why TEXT` stops the director and its workers.
+Both commands preserve the staff rows, tabs, and shells.
+Add `--finish-step` to wait for the workers' current tasks before stopping them.
+The staff row records the time, caller, and reason under `paused` or `exited`.
+The board shows that state.
+`agents pause --production SHOWRUNNER [--except UNIT ...] --why TEXT` selects units within one production.
+`agents resume --production SHOWRUNNER` resumes its units.
+Resume removes a pause record and sends the director one continuation message.
+Queued or failed delivery restores the same pause record and returns failure.
+Resume starts an exited director through the shared role-account path and removes its exit record after success.
+The prompt hook retains a paused director's hold for every prompt source.
+It adds context without blocking or removing the message.
+An own-pane resume resolves the agent executable before it removes the exit record.
+It executes that path directly. A missing executable retains the exit record.
+The stop hook skips the automatic continuation for that director.
+Stop does not save or restore composer drafts.
 
 Stop, resume and account move use `scripts/shutdown/stop_resume.py`.
 
@@ -149,12 +169,19 @@ An unreadable root does not prevent reads of other roots.
 
 Pane worker resumes use `PaneWorkerResume` with a fixed staff id and an active dispatch id.
 The director receives `Worker <staff id>: busy dispatch <dispatch id>` for each active direct child.
-An idle child receives no new assignment.
 The message names idle children separately.
 It keeps the account move source and destination.
 It supplies no saved mesh launcher command.
 Restart and pane restore select each worker's current staff parent directly.
 Closed idle workers stay closed until their next assignment.
+Pane worker resume uses the dispatch record and transcript to select one step.
+An idle worker receives a continuation prompt when its transcript contains the open dispatch.
+Restore holds the dispatch lock across the record read, receipt read, and prompt delivery.
+Restore, named resume, and director notes use one receipt rule.
+An unsubmitted dispatch keeps the saved assign command and its saved prompt path.
+Director notes reuse shared dispatch history reads.
+A DONE line or a finished record closes the dispatch and suppresses its resume note and step.
+The decision reads the record and transcript once per worker and uses the restart's shared run index.
 
 ## Launch names
 
@@ -169,6 +196,32 @@ Saved launch marks contain no copied `STAFF_ID`.
 The [pane restore](herdr-restore.md) uses this same naming policy.
 
 ## Restart
+
+A status pass shares one Codex snapshot, one worker-run search, and one pane observation.
+It reads pane processes through a direct socket batch and reuses the results during that pass.
+The server accepts one request per socket. The batch reads those sockets in parallel.
+Read-only layout results share their data. Listed rows use shallow copies for caller edits.
+The launch helper uses the same Codex snapshot.
+Confirmed stops remove the selected rows' old Codex liveness entries.
+An unconfirmed stop checks only its target's current identity and process generation before a launch.
+A live target stays running. An unreadable target stays on the restart list.
+A missing rollout file or changed generation alone does not prove exit.
+Restart launches after a failed stop only when it proves absence or a different process running another conversation.
+Worker restore uses the shared run index.
+The stop helpers use the shared Codex snapshot.
+Action checks still prove the target process before a signal.
+Independent rows stop and start in parallel.
+Each restore line starts with the staff name, including worker restore results.
+
+Before a power-off, run `agents stop --all`.
+After login, run `agents restart`.
+
+`agents stop --all` selects live Claude and Codex rows on this machine from `staff.json`.
+The selection includes freestanding agents, such as brain and morty.
+It saves each row ID before its stop. It starts nothing.
+A live session without a staff row prints one anomaly line. Stop does not save it.
+`agents restart --all` uses the same selection and stop loop, then resumes the selected rows.
+It keeps only the row IDs whose starts failed.
 
 `agents restart ACCOUNT --all` selects live rows on that Claude or Codex account.
 It reads the account from each observed process environment.
@@ -186,10 +239,6 @@ Without ACCOUNT, the existing selection and role accounts apply.
 If a stop includes the caller, restart continues in a detached process before the first stop.
 The caller prints the restart log path and returns.
 Other restarts run in the caller's process.
-
-`agents restart --all` selects live Claude and Codex rows on this machine from `staff.json`.
-It stops each session, then starts each session.
-It saves only the row IDs whose starts failed.
 A stop checks the current conversation before it sends a signal.
 A failed row prints one anomaly line. Other rows continue.
 
@@ -199,9 +248,10 @@ A row leaves the saved list when it starts or already runs.
 A failed start adds the row to the list.
 A refused row lock changes no saved row.
 `--only` leaves other saved rows on the list.
-`--dry-run` prints each selected name, row ID, kind, and saved tab position.
+`stop --all --dry-run` prints each selected name, row ID, kind, and tab position with `would stop and save`.
+`restart --dry-run` prints saved rows and identifies live rows outside the saved list.
 A row without a saved tab says so on the same line.
-The command changes nothing.
+Both commands change nothing.
 `--only ID[,ID...]` selects staff rows for callers that resume a moved unit.
 
 `shutdown_record.py` stores only a JSON list of staff row IDs in `shutdown/restart.json`.
@@ -209,6 +259,8 @@ The record stores no session facts, progress, claims, recovery states, or pane p
 Herdr stores the tab order and associates each saved tab with its staff row ID.
 
 Start reads `current_session` and the worktree from staff.
+A freestanding agent without a recorded folder uses the home folder.
+The native pane reader identifies resumed Codex sessions without an open rollout file.
 It finds the transcript and its account by the current session ID.
 Claude uses `--resume ID`. Codex uses `resume ID` in the worktree.
 The launch sends no work prompt.
@@ -217,3 +269,17 @@ Restart does not send phone pushes or use `add_unit.py`.
 
 `restart_support.py` retains the continuation-message API for the quota watcher.
 `restart.wait_for_confirmation` supports the existing unit attachment path.
+
+Claude launches write folder trust in the target account before the process starts.
+The write uses the repository trust key, or the folder itself outside a repository.
+A failed write prints one anomaly with the folder, account file, and error.
+The launch then returns its failure result without a process start.
+A composer with a draft waits until the deadline without changes to the draft.
+
+Worker restore shares the command's run index and Codex snapshot through stopped-worker startup.
+Restore uses `worker_panes.worker_run` for run selection and fallback.
+Stop selects workers from their current staff parent.
+
+An unconfirmed worker stop needs targeted proof of process absence before restart can launch that worker.
+Live or unknown evidence leaves the worker pending.
+The worker check uses the same function as the Codex row check.

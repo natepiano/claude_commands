@@ -193,7 +193,11 @@ Own what a build may use and when it starts: memory admission and the memory que
 **Binds later work:** A new script whose owner must show in the table needs an Owns entry in its production doc. Regenerate `working_set_owners.json` from the production docs after an Owns cell changes.
 
 ### Phase 8 — Shared build state is written only by the installed copy  · status: todo
-**Depends on:** Phases 2, 10, 12 and 19. Phase 56 lands before Phase 11. Merge `origin/builds` first. Global order: 31 → 33 → 26 → 15/27 → 39 → 20 → 56 → 11 → 60 → 17 → 18 → 19 → 8. Phase 57 runs beside this chain. Its Spec 7 import repair lands before Phase 8, because both change `build_hold.py`. Phase 29 joins before Phase 11.
+**Depends on:** Phases 2, 10, 12 and 19. Merge `origin/builds` first. Global order: 31 → 33 → 26 → 15/27 → 39 → 20 → 56 → 11 → 60 → 17 → 18 → 19 → 8.
+
+**Held (2026-11-05):** the send.py freeze covers `build_hold.py`, so this phase starts after messaging's main hash.
+
+**User decision (2026-11-05, via the builds showrunner):** "A. Build Phase 8 with the refusals." The question was whether to add the installed-copy write guards; the user's 2026-11-05 rule sends a new check to the user first.
 
 **Approved:** showrunner 2026-10-29. The edit to `docs/plans/builds-production.md` is approved.
 
@@ -220,9 +224,7 @@ Own what a build may use and when it starts: memory admission and the memory que
    Guard `export_priority()` separately because it does not construct `AdmissionServer`.
    Validate each actual mutation path against the guarded directory. A private root does not authorize a real-state reservation path.
    Test direct imported calls to each mutation entry point. Refuse before any file changes.
-3. Guard the estimate-cache writer added by Phase 18 before it changes `admission/build_marks.json`.
-   Keep initial estimation in `admission_client` through `step_estimate()`.
-   Keep git work outside the service event loop and shared locks.
+3. Keep initial estimation in `admission_client` through `step_estimate()`. Phase 68 removes the estimate cache (`admission/build_marks.json`) and its writer; add no guard for it.
 4. Guard hold and release mutations through `build_hold.release_lock()`.
    Validate both the holder directory and the release directory.
    Introduce a named `ReleaseLockHeld` capability for helpers that change release state.
@@ -246,27 +248,26 @@ Own what a build may use and when it starts: memory admission and the memory que
    Fake both memory readings. Never change real coordination state in a test.
 
 **Constraints from prior phases:**
-- Phase 20: use `PassResult(rows, policy)` and `HeadPolicy.queued_head: QueuedHead | NoQueuedHead`.
-  Displays consume the resolved window. Preserve the recovery slot and the override for its own head.
-  `NoQueuedHead` means no eligible head. A first mark uses the active window from the same pass.
-  Keep an explicit inactive window for an old head without priority. Do not derive a deadline from the current time.
-  Use `head_policy` for the deployed policy. Add no separate window rule in a reader.
+- builds-queue Phase 10z replaced the Phase 20 active and inactive windows. One pass (`memory_admit.admission_walk`) uses the captured room.
+  It protects room for the head, lets a `ContinuationSlot` reuse its run's slot, and lets an oversized head start alone.
+  Displays, the client and the wait text use that pass's frozen result. Add no separate admission rule in a reader.
 - Phase 20: `PendingLeft` saves durable cancellation facts. Restart publishes one cancellation with its original time.
   Keep the one lifecycle outbox and the saved finalization intent. Add no second lifecycle writer.
 - Phase 20: an old `NoWaiter` place identity is migration input, not proof that a step ended.
-  `WaiterPlace.queue_identity` carries the logical identity. Preserve it through import, restart and owner exit.
+  `WaiterPlace.queue_identity` carries the logical identity. Preserve it through restart and owner exit.
+  builds-queue Phase 10x (89ba4f087) removed the legacy import and its test `test_imported_and_restored_places_record_one_owner_exit_after_restarts`.
   Add no user control or display for either migration or pending cancellation.
 - Phase 41: token waiters keep their arrival and priority times. They hold neither the head position nor head room.
   Preserve the saved offset and transition identity for priority publication retries.
 - Phases 22 and 23: hold recovery can migrate receipts and recover damaged release records.
   Guard those writes without changing the read-only status path.
-- Phase 18 owns the estimate-cache writer. Coordinate its guard with that phase instead of guarding a removed admission CLI.
+- Phase 68 removes Phase 18's estimate-cache writer and `admission/build_marks.json`. Nothing remains to guard there.
 
 **Files:**
 - `scripts/build_queue/admission_service.py`, `scripts/build_queue/admission_client.py` — service boundaries and installed routing.
 - `scripts/build_queue/test_admission_service.py`, `scripts/build_queue/test_admission_client.py` — refusal, recovery and routing tests.
-- `scripts/lint/memory_admit.py`, `scripts/lint/memory_gate.sh`, `scripts/lint/invoke.sh` — estimate-cache boundary and caller routing.
-- `scripts/lint/test_memory_admit.py`, `scripts/lint/test_invoke_scope.py` — private cache and caller tests.
+- `scripts/lint/memory_admit.py`, `scripts/lint/memory_gate.sh`, `scripts/lint/invoke.sh` — caller routing.
+- `scripts/lint/test_memory_admit.py`, `scripts/lint/test_invoke_scope.py` — caller tests.
 - `scripts/build_hold/override_guard.py`, `scripts/build_hold/build_hold.py` — shared guard and hold mutation boundary.
 - `scripts/build_hold/test_override_guard.py`, `scripts/build_hold/test_build_hold.py` — guard and hold recovery tests.
 - `scripts/build_queue/queue_view.py`, `scripts/build_queue/queue_card.py` — separate repository and step displays.
@@ -283,13 +284,14 @@ Own what a build may use and when it starts: memory admission and the memory que
 
 **Acceptance gate:**
 - Preserve these existing tests unchanged:
-  1. `test_first_priority_mark_agrees_in_the_card_overview_and_shell` in `scripts/build_queue/test_queue_view.py`.
-  2. `test_token_wait_preserves_backfill_and_strict_windows_until_its_next_admission` in `scripts/build_queue/test_admission_service.py`.
+  1. `test_live_priority_marks_and_cards_use_the_snapshot_without_bump_history` in `scripts/build_queue/test_queue_view.py`.
+  2. `test_token_wait_keeps_place_one_and_head_status_moves_to_the_eligible_row` in `scripts/build_queue/test_queue_view.py`.
   3. `test_priority_override_and_frozen_release_keep_the_resolved_head` in `scripts/build_queue/test_admission_service.py`.
-  4. `test_frozen_pass_keeps_one_window_for_admission_view_explanation_and_wait_text` in `scripts/lint/test_memory_admit.py`.
-  5. `test_recovery_release_keeps_required_endings_and_frozen_window` in `scripts/lint/test_memory_admit.py`.
+  4. `test_each_pass_matches_the_shared_rule_and_view_uses_its_frozen_limits` in `scripts/build_queue/test_admission_service.py`.
+  5. `test_view_release_and_admit_pass_capture_the_same_continuation_slot` in `scripts/build_queue/test_admission_service.py`.
+  6. `test_a_younger_run_cannot_take_the_room_protected_for_the_head` in `scripts/build_queue/test_admission_service.py`.
+  7. `test_an_oversized_head_starts_alone_but_unreadable_host_or_pressure_holds_it` in `scripts/build_queue/test_admission_service.py`.
 - Preserve `test_restart_retries_an_interrupted_cancellation_with_its_original_time` unchanged in `scripts/build_queue/test_admission_service.py`.
-- Preserve `test_imported_and_restored_places_record_one_owner_exit_after_restarts` unchanged in the same module.
 - Preserve `test_full_queue_holds_gate_until_the_running_charge_is_released` and `test_admission_error_refuses_before_any_module_starts` unchanged.
   Both tests are in `scripts/production/test_merge_gate_suites_admission.py`.
 - Preserve these hold tests unchanged in `scripts/build_hold/test_build_hold.py`:
@@ -299,7 +301,6 @@ Own what a build may use and when it starts: memory admission and the memory que
   4. `test_release_recovers_recipient_notices_from_a_damaged_referenced_cycle`.
   5. `test_status_names_unreadable_pending_records_and_cycles_without_hiding_them`.
 - Every changed module and caller passes its tests. Basedpyright reports `0 errors, 0 warnings, 0 notes` for those modules.
-- The client tests cover installed-copy refusal of the estimate cache writer (moved from Phase 18).
 - After installation, query the service and inspect its saved state. Repository and step fields remain separate.
   A checkout mutation attempt refuses before state changes. A private-state attempt still works.
 - Name queue-unit files as `also touches`, tested against `origin/builds-queue`.
@@ -541,201 +542,36 @@ The replay and 24 h check scripts live in the run folder (`phases/15/`), not in 
 - Compile-count bands for nextest promises: they raise under-half promises in ten repositories.
 - Landing reader facts with no caller: each fact lands with its first reader.
 
-### Phase 18 — History splits on the dylib feature and each step's commit, not on a time  · status: todo
-**Depends on:** Phases 11 and 60. Phase 17 measured compile bands and did not adopt them, so this phase needs no band. Merge `origin/builds` first. Global order: 31 → 33 → 26 → 15/27 → 39 → 20 → 56 → 11 → 60 → 17 → 18 → 19 → 8. Phase 57 runs beside this chain. Its Spec 7 import repair lands before Phase 8, because both change `build_hold.py`. Phase 29 joins before Phase 11.
-
-**Approved:** showrunner 2026-10-29 (no ETA given).
-
-#### Work Order
-
-**Goal:** a promise uses only history built the same way as the step it admits. The 14-day window crosses two hana build changes that cut memory, and a time cutoff mixes steps from both sides.
-
-**Measured:**
-- Bevy dylib: hana `11c5edbd6f` (2026-10-29 05:33 EDT); `9b60fcd76e` is only its merge. Every dylib step's argv carries `--features` with `hana/dynamic_linking` in a comma list, for example `"--features", "hana/dynamic_linking,hana/hotpatching"`. Index read 2026-10-29 22:59 EDT: 68 step rows carry it; 42 of them are `verify-mac` rows with no repo and no sha. The showrunner's count: a time or sha-ancestry cutoff misses 13 of 17 dylib runs.
-- opt-level 1: hana `ad25f045ff` (2026-10-28 23:54 EDT), merged by `2bbd4c1fba` (2026-10-29 00:59 EDT), changes only `Cargo.toml` `[profile.dev.package.<crate>]` for dev and test builds. Argv does not show it, and the build log has no profile or `Cargo.toml` field. Steps record `sha` (short commit) and `tree_key`, so a step's side is whether `ad25f045ff` is an ancestor of its own `sha`.
-- Anon rows carry no sha; they join to `steps` by `call_id` and step name (Phase 11 Spec 4).
-
-**Spec:**
-
-1. **Measure first.** Measure fourteen days of natedev hana steps on each side of each change.
-   Report step counts, anonymous peak p90 and rows without a usable sha or index match.
-   Rows without usable evidence count on neither side. Confirm that sha ancestry separates the opt-level peaks.
-   A failed peak published before its index row has no sha yet. Keep it on the admitted step's side until its index row arrives; never drop it.
-   Omit the opt-level split if the peaks do not separate. Report that result.
-   Compare current and split estimates by step.
-   Report promises below half the peak, promises above three times the peak and steps above their promise.
-   Keep modeled wait savings unavailable until queue calibration succeeds. Report observed waits separately.
-2. **One list of build changes.** A new `config/build_changes.json` holds each change: repository identity, kind (`argv_feature` with the feature name, or `commit` with the full sha), and a note. The two entries above are its first rows.
-3. **The split.** `expected_peak()` and `filtered_peak()` keep history from the same side of every listed change.
-   Read feature sets through `build_shape(argv).features`. Keep support for comma lists, `--features=`, `-F` and repeated flags.
-   Add no second argv parser. For commit changes, compare ancestry against the admitted step's HEAD and each history row's sha.
-   Extend Phase 11's shared join with sha. Add no second join.
-   Add only the `StepEvidence` facts this phase reads (Phase 17 ruling: a reader fact lands with its first caller). `phases/17/reader_facts_withdrawn.patch` in the run folder is a starting point; it carries no sha.
-   Give a step's commit a named state: a known full or short sha, or an unknown commit (no sha in the row, no index row). Never a bare `None`.
-   Give each ancestry answer a named outcome: after the change, before the change, ambiguous short sha, or unavailable (git failed or the commit is missing). Only before and after place a row on a side.
-   A failed peak with no index row yet keeps the admitted step's side until its index row arrives (Spec 1).
-   `admission_client.build_history_generation(configuration: gate.MemoryConfig | None = None)` (:126) becomes two named states: the current configuration read at use, and a supplied configuration. Replace the bare optional.
-   Run git once per distinct sha. Cache the answers in `admission/build_marks.json`.
-   Put the sole cache writer in `memory_admit.step_estimate()`'s estimation path.
-   `admission_client.step_request()` invokes that path before sending the admission request.
-   Use the same writer for refreshed estimates. Identify it as Phase 8's estimate-cache guard boundary.
-   Phase 8 guards the actual cache path at this writer. It adds no second cache writer.
-   Keep git work outside the service event loop and shared locks. Measure and report the added estimate time.
-   Release builds ignore the opt-level entry because it applies only to dev and test builds.
-   Read release status from `BuildShape.profile`. Preserve both `--release` and `--profile release`.
-4. **Fallback.** With fewer than 5 rows on the step's side, the tiers below apply as today, still on that side. Rows of the other side never fill a tier.
-5. **Tests** in `scripts/lint/test_memory_admit.py`: a step with the dylib feature in a comma list, and one with `--features=`, lands on the dylib side; a sha after and before a commit change; a row with no sha counts on neither side; an ambiguous short sha and an unavailable commit count on neither side; a failed peak before its index row stays on the admitted step's side; the cache file; a release `build` step keeps Phase 24's tiers, floor, factor and cap on its side; fake both memory readings. In `scripts/lint/test_build_shape.py`: the join's value carries `sha`, and a row without one carries the unknown-commit state. In `scripts/build_queue/test_admission_client.py`: callers of `build_history_generation` with the current configuration and with a supplied configuration. The existing `BuildShapePromiseTests` (same-shape promise and failed-peak floor) and the `need_basis` codec and rendering tests pass unchanged.
-6. **Docs.** `docs/as-built/build-memory-admission.md`: the list, the split rule and the replay table.
-
-**Constraints from prior phases:**
-- Phase 11: `compiling_history()` keeps a peak with no index row and selects by completion time (`memory_admit.py` :2106). A failed peak can be published before its index row. An unknown count keeps the peak, never reads as zero.
-  Keep unchanged: `test_repeated_attempts_combine_compile_states_in_either_order`, `test_undated_attempt_prevents_a_zero_compile_result`, `test_unknown_attempt_between_zero_attempts_keeps_its_compile_peak` and `test_failed_peak_refresh_precedes_indexing_and_zero_compile_evidence_removes_it`.
-- Phase 20: use `PassResult(rows, policy)` and `HeadPolicy.queued_head: QueuedHead | NoQueuedHead`.
-  Displays consume the resolved window. Preserve the recovery slot and the override for its own head.
-  `NoQueuedHead` means no eligible head. A first mark uses the active window from the same pass.
-  Keep an explicit inactive window for an old head without priority. Do not derive a deadline from the current time.
-  Use `head_policy` for the deployed policy. Add no separate window rule in a reader.
-- Phase 20 found insufficient calibration evidence. Estimate replay does not establish a calibrated queue model.
-  Keep the estimate comparisons and adoption conditions. Report modeled wait savings as unavailable until calibration succeeds.
-  Report observed waits separately. Do not label an estimate comparison as a queue replay.
-- Phase 33 (`5c9b01fd`): history rows are read only through `store.whole_rows(handle, start)` (`scripts/buildlog/store.py`); `anonymous_history_rows` (`memory_admit.py`) delegates its decoding to it. A row counts only when it ends in a newline; a cut-short, non-UTF-8 or non-object row is skipped. Add no second decode loop; keep the unfinished-JSON and split-UTF-8 consumer tests after any classification change.
-- Phase 11's compile split and Phase 60's selection rules apply inside each side. Phase 17 adopted no compile bands.
-- Build history inside each side: `build_expected_peak` (`memory_admit.py` :2195) keeps Phase 24's same-shape tiers (p90 with 10 or more rows, the largest with 1 to 9), failed-peak floor, the release factor (`ReleaseHeadroom`), the dev rule Phase 39 adopted (`DevSizeHeadroom`: ceil(base × factor + margin); the old single dev factor stays only to decode old saved rows, never restore it) and the cap at the configured build budget. `memory_config()` reads all four values at use from `config/build_admission.conf` `[memory]`: `release_headroom`, `dev_size_factor`, `dev_size_margin_gib` and `build_budget_gib` (`BUILDLOG_BUILD_BUDGET_GIB` overrides the budget; `build_budget_bytes()` :1811). Write no fixed factor, margin or cap anywhere, tests included. Keep the Phase 39 gates green unchanged: `need_text` prints a saved cap, prints `CapNotRecorded` as the build budget of that time, and renders `DevSizeHeadroom`; the basis codec round-trips each headroom class. A replay caps each promise at the budget in force when its step ran and names that budget, so a budget change does not read as this phase's effect. `ShapeFallback` (the profile fallback) has neither floor nor factor; feature-side filtering is already satisfied inside same-shape build tiers and remains necessary for profile fallback and other step histories. Determine release profile through `BuildShape.profile`, including `--profile release`, and test both release spellings. The split removes rows; it changes none of those values, and Phase 11's lower pool never replaces a same-shape `build` promise.
-- `scripts/lint/build_shape.py` holds the one Cargo shape parser (`build_shape()` :64) and the one anon-to-index join (`index_step_evidence` :137; Phase 24 Part A, Phase 11 widens it). Since Phase 60 the join keeps the decoded argv of test steps in `StepEvidence.arguments` and parses no test selection.
-- Phase 62 (`01bf65845`): `_step_index` (`build_shape.py` :129) opens the index read-only for two readers with different grouping rules. `index_step_evidence` keeps its call-and-step join; put the `sha` there. `recorded_output_roots` (:268) keeps host-wide attempt root pairs per workspace, skips rows whose argv sets a target folder or whose `target_folder` differs from `target_directory`, and names each root state (`AbsoluteRecordedRoot`, `UnknownRecordedRoot`, `RelativeRecordedRoot`, `RecordedRootsUnavailable`). Do not merge the two readers. Keep `scripts/lint/test_build_shape.py` recorded-root tests and the floor tests in `scripts/lint/test_sweep.py` green unchanged.
-- Phase 60 (`e88fb841d`): test selection is parsed only by `test_selection()` (`memory_admit.py` :162). `history_selection(item, evidence)` (:2091) is the one resolver of package, scope and filters for an anonymous row: a recorded field wins, and only a missing field is parsed from `arguments`. The side split filters rows after that resolver; add no second selection parser. Keep the tests for recorded-field precedence, missing-field recovery and test-only arguments (`test_indexed_test_arguments_remain_available_for_selection`, `test_missing_test_arguments_keep_the_compile_count`, `test_package_check_keeps_legacy_measured_peaks_without_package_fields`).
-- Phase 60: keep the full-package selection (`memory_admit.py` :2023–2026) and the larger of the exact-filter and package p90 in `filtered_peak` (:2506–2510) on each side of a split.
-- Initial estimates run through `admission_client.step_request()` and `memory_admit.step_estimate()`.
-  The service does not run git in its event loop. Phase 8 guards the sole estimate-cache writer before mutation.
-  Keep private fixture caches usable and real coordination state inaccessible to tests.
+### Phase 18 — History splits on the dylib feature and each step's commit, not on a time  · status: done
+#### As-built
+Phase 68 removed this split; this record is history.
+A memory promise keeps only history rows from the same side of each listed build change as the admitted step.
+- `config/build_changes.json` lists the hana changes: the `hana/dynamic_linking` feature (`argv_feature`) and the opt-level 1 commit `ad25f045ff` (`commit`). `read_build_changes()` decodes it; `UnusableBuildChanges` names a bad file.
+- `HistorySplit` (or `NO_HISTORY_SPLIT`) goes through `expected_peak`, `filtered_peak`, `build_expected_peak`, `build_peaks`, `fresh_test_peak` and `compiling_history`. `prepare_history_split()` builds it per estimate.
+- Feature sides come from `build_shape(argv).features`. Commit sides come from git ancestry of each row's sha (`ancestry_outcomes()`, one git call per sha), cached in `admission/build_marks.json` by `memory_admit.step_estimate()`.
+- `build_shape.step_commit()` gives `KnownStepCommit` or `UNKNOWN_STEP_COMMIT`; `AncestryOutcome` is after, before, ambiguous or unavailable. Only before and after place a row; other rows count on neither side. A failed peak with no index row keeps the admitted step's side.
+- `admission_client.build_history_generation` has two named configuration states (current, supplied).
 
 **Files:**
-- `scripts/build_queue/test_admission_service.py`, `scripts/build_queue/test_queue_view.py` — unchanged Phase 20 regression verification.
-- `scripts/build_queue/admission_client.py` — initial and refreshed estimate routing to the sole cache writer; the two configuration states of `build_history_generation`.
-- `scripts/build_queue/test_admission_client.py`, `scripts/build_queue/test_admission_client_wait.py` — cache routing, refresh and refusal tests.
-- `config/build_changes.json` — new — Spec 2.
-- `scripts/lint/memory_admit.py` — Spec 3–4.
-- `scripts/lint/build_shape.py` — Spec 3, `sha` and the unknown-commit state in the join's value.
-- `scripts/lint/test_memory_admit.py`, `scripts/lint/test_build_shape.py` — Spec 5.
-- `docs/as-built/build-memory-admission.md` — Specs 1 and 6.
+- `config/build_changes.json`, `scripts/lint/memory_admit.py`, `scripts/lint/build_shape.py`, `scripts/build_queue/admission_client.py`, `scripts/buildlog/width_trial.py` — the split and its callers.
+- `scripts/lint/build_change_test_support.py`, `scripts/lint/test_memory_admit.py`, `scripts/lint/test_build_shape.py`, `scripts/build_queue/test_admission_client.py` — tests.
+- `docs/as-built/build-memory-admission.md` — the list, the split rule and the replay table.
 
-**Workers:** `1 writer + 1 tester`
-- `impl` — `config/build_changes.json`, `memory_admit.py` (history filtering), `build_shape.py` (step evidence), `admission_client.py`, the as-built doc and the side-split replay.
-- `test` — `test_memory_admit.py`, `test_build_shape.py`, `test_admission_client.py` and `test_admission_client_wait.py`; replay fixtures.
-- `test` also runs the unchanged service and overview regressions named in the Acceptance gate.
+**Binds later work:** the replay shows no gain. With the split, nextest steps above their promise went from 106 to 108 and below half their peak from 6 to 9; the feature split alone gave the same result. "Memory estimates use all same-shape history again" deletes both splits, the change list, the build-marks cache and the commit states.
+**Gotchas:** after the dylib change the feature side has only 676 rows. Queue 10z removed the build budget cap; promises are uncapped.
 
-**Acceptance gate:**
-- The client tests cover the sole cache writer, initial estimates and refreshed estimates. The installed-copy refusal is Phase 8's gate.
-  Basedpyright covers the changed client modules and their callers, with `0 errors, 0 warnings, 0 notes`.
-- Preserve these existing tests unchanged:
-  1. `test_first_priority_mark_agrees_in_the_card_overview_and_shell` in `scripts/build_queue/test_queue_view.py`.
-  2. `test_token_wait_preserves_backfill_and_strict_windows_until_its_next_admission` in `scripts/build_queue/test_admission_service.py`.
-  3. `test_priority_override_and_frozen_release_keep_the_resolved_head` in `scripts/build_queue/test_admission_service.py`.
-  4. `test_frozen_pass_keeps_one_window_for_admission_view_explanation_and_wait_text` in `scripts/lint/test_memory_admit.py`.
-  5. `test_recovery_release_keeps_required_endings_and_frozen_window` in `scripts/lint/test_memory_admit.py`.
-- The memory admission and build-shape tests pass; `basedpyright` over `scripts/lint/memory_admit.py`, `scripts/lint/build_shape.py`, `scripts/lint/test_memory_admit.py` and `scripts/lint/test_build_shape.py` reports `0 errors, 0 warnings, 0 notes`; the merge gate is green.
-- The side counts, the peak per side, the added check time and the before/after replay are in the checkpoint notice.
-- Post-merge check, 24 h after the merge reaches main: hana steps above their promise and wait minutes against the 24 h before.
-- Change-Review line: a dylib hana test is promised only from dylib history | on natedev in `~/rust/hana`, run `~/.claude/scripts/direct/verify.sh test hana_diegetic` and read its first memory wait line | the need and its source match the dylib-side p90 that the replay gives.
-
-### Phase 19 — Measure where admission estimates come from, then make the 0.65 fallback rare  · status: todo
-**Depends on:** Phases 18 and 20. Phase 20 records the lifecycle events and supplies their reader. Merge `origin/builds` first. Global order: 31 → 33 → 26 → 15/27 → 39 → 20 → 56 → 11 → 60 → 17 → 18 → 19 → 8. Phase 57 runs beside this chain. Its Spec 7 import repair lands before Phase 8, because both change `build_hold.py`. Phase 29 joins before Phase 11.
-
-**Approved:** showrunner 2026-10-29, rescoped (no ETA given).
-
-#### Work Order
-
-**Goal:** most admissions use measured anon peaks. The build-log peak times `ANON_SHARE` is a fallback that few admissions take.
-
-**Measured (code, at `a650d945`):**
-- `ANON_SHARE = 0.65` (`memory_admit.py` :70 at `e88fb841d`) scales a build-log `peak_mem_bytes` (page cache included) to process memory: in `expected_peak` (:1993; the tier at :2058–2059 and the 1–4 row tier at :2065–2066) when a repository has fewer than 5 measured anon peaks, and in `filtered_peak` (:2468; index tiers :2544–2550). `ExpectedPeak` (:587) names its source.
-- Phase 60 (`e88fb841d`) already puts package anonymous history before both indexed tiers in `filtered_peak` (:2506–2510), with legacy rows' package, scope and filters recovered from the indexed argv. Its test: `test_legacy_package_selection_recovers_anonymous_peaks_for_an_unseen_filter` (`test_memory_admit.py`). Rows recorded before 2026-10-29 15:05Z lack those fields; they leave the 14-day window about 2026-11-12, which also lowers the `ANON_SHARE` share.
-- Before Phase 20 Spec 0, no record keeps the source of an admitted step's estimate: reservations have no source field, and waiter rows (report Phase 3 adds `need_source`) are deleted at admission. From Spec 0's merge, each `admitted` event in `admission/queue_times.jsonl` records the need source, and Phase 20's one interval reader in `memory_admit.py` rebuilds each step from those events.
-
-**Spec:**
-
-1. **Measure first.** Read the last seven days of retained natedev evidence through `read_queue_lifetimes()`.
-   Report the actual retained coverage. The lifecycle file's size cap can retain less than fourteen days.
-   Each `QueueStepLifetime` is one logical step. Its `ReservationInterval` values describe separate admissions.
-   Count interval sources for admission shares. Count each logical step's memory wait once.
-   Report `MemoryWaitIncomplete` separately. Do not replace it with zero or a partial wait.
-   A `TokenReturn` ends one reservation interval. It does not complete the logical step.
-   `NoPositiveSample` means no measured peak. Do not count it as a zero peak.
-   Keep recorded interval sources separate from reconstructed historical estimates.
-   For earlier steps, replay `expected_peak()` with history available before each step.
-   Reconstruct build shape from recorded argv through `build_shape()` and the shared step-evidence reader.
-   Report missing shape evidence separately from ordinary fallback admissions.
-   Keep `shape` and `cap` as distinct source rows. A chosen cap counts in neither fallback nor `ANON_SHARE` shares.
-   Report source shares by step kind: full nextest, filtered nextest, clippy, check, build, doc and other.
-   Report the `ANON_SHARE` share and compare those estimates with measured anonymous peaks.
-   Split recorded admissions by deployed estimator: before and after the Phase 60 merge, and before and after legacy rows leave the window (about 2026-11-12).
-   Count recovered legacy rows apart from rows with recorded selection fields. The queue card already shows source and count (`queue_evidence.py` :108); test the totals, add no user control.
-   Add a measurement test with two intervals, two sources and one logical step.
-   The test counts two admissions and one memory wait. Include token return and incomplete evidence.
-2. **Stop rule.** If the `× ANON_SHARE` share is already small, the phase is only this measurement: the table goes in the as-built doc and no code changes. The showrunner sets "small" from the table.
-3. **Otherwise, widen anon matching where the table still shows `ANON_SHARE` tiers.** Filtered estimates already use package anonymous history first (Phase 60). Work only on the measured remaining gaps, for example a full estimate where five or more indexed peaks (:2058–2059) win over one to four anonymous peaks.
-   Keep Phase 60's package selection and the max rule, and Phase 18's splits.
-   Keep the scope and every split from Phases 11 and 18.
-   Replay the source shares and estimate errors. Report steps above their promise.
-   Keep modeled wait savings unavailable until queue calibration succeeds. Report observed waits separately.
-4. **Drop 0.65 once rare.** Remove the `ANON_SHARE` tiers only below the showrunner's bound.
-   A step without anonymous history then uses the pooled tier, followed by fallback.
-   Keep the tiers if replay shows more promises below half the measured peak.
-   Stop only the producer. Keep old `buildlog` source values readable in the basis codec, wire codec, cards and `WaitOutput`.
-   No unknown-source type exists yet: `NeedSource = str` (`memory_admit.py` :265), and `admission_client.py` :548 renders any unlisted source as "no history, so the fallback".
-   This phase defines the boundary: a known source, or an unknown source that keeps its original wire text. Do not turn a future source into a fallback value.
-   The protocol (`admission_protocol.py`), the client wait lines (`admission_client.py`), the service (`admission_service.py`) and the queue card (`queue_card.py`, `queue_evidence.py`) carry and render it.
-5. **Tests** in `scripts/lint/test_memory_admit.py`: repo + step anon rows win over the index tier when the exact filter has none; with no anon history the next tier applies; a `build` step keeps Phase 24's same-shape rule when the widened match has rows of another shape; fake both memory readings. In the client and protocol tests: an unknown source keeps its wire text through a reconnect, a refreshed estimate and a historical row, and never renders as the fallback. If Spec 4 removes the tier: an old waiter row with `need_source` `buildlog` still renders in the queue card (`scripts/build_queue/test_queue_evidence.py`) and in `admission_client.WaitOutput`.
-6. **Docs.** `docs/as-built/build-memory-admission.md`: the tier share table; if changed, the `need` paragraph.
-
-**Constraints from prior phases:**
-- Phase 11: `compiling_history()` keeps a peak with no index row and selects by completion time (`memory_admit.py` :2106). A failed peak can be published before its index row. An unknown count keeps the peak, never reads as zero.
-  Keep unchanged: `test_repeated_attempts_combine_compile_states_in_either_order`, `test_undated_attempt_prevents_a_zero_compile_result`, `test_unknown_attempt_between_zero_attempts_keeps_its_compile_peak` and `test_failed_peak_refresh_precedes_indexing_and_zero_compile_evidence_removes_it`.
-- Phase 20: use `PassResult(rows, policy)` and `HeadPolicy.queued_head: QueuedHead | NoQueuedHead`.
-  Displays consume the resolved window. Preserve the recovery slot and the override for its own head.
-  `NoQueuedHead` means no eligible head. A first mark uses the active window from the same pass.
-  Keep an explicit inactive window for an old head without priority. Do not derive a deadline from the current time.
-  Use `head_policy` for the deployed policy. Add no separate window rule in a reader.
-- Phase 20 found insufficient calibration evidence. Estimate replay does not establish a calibrated queue model.
-  Keep the estimate comparisons and adoption conditions. Report modeled wait savings as unavailable until calibration succeeds.
-  Report observed waits separately. Do not label an estimate comparison as a queue replay.
-- Phase 33 (`5c9b01fd`): history rows are read only through `store.whole_rows(handle, start)` (`scripts/buildlog/store.py`); `anonymous_history_rows` (`memory_admit.py`) delegates its decoding to it. A row counts only when it ends in a newline; a cut-short, non-UTF-8 or non-object row is skipped. Add no second decode loop; keep the unfinished-JSON and split-UTF-8 consumer tests after any classification change.
-- Phases 11, 60 and 18 set which rows match; the widened match keeps every split, and reads rows through the one index join in `scripts/lint/build_shape.py` and the one selection resolver `history_selection` in `memory_admit.py` (no second join or argv parser).
-- Phase 24 owns the `build` promise: `build_expected_peak` (`memory_admit.py` :2195) keeps Phase 24's same-shape tiers (p90 with 10 or more rows, the largest with 1 to 9), failed-peak floor, the release factor (`ReleaseHeadroom`), the dev rule Phase 39 adopted (`DevSizeHeadroom`: ceil(base × factor + margin); the old single dev factor stays only to decode old saved rows, never restore it) and the cap at the configured build budget. `memory_config()` reads all four values at use from `config/build_admission.conf` `[memory]`: `release_headroom`, `dev_size_factor`, `dev_size_margin_gib` and `build_budget_gib` (`BUILDLOG_BUILD_BUDGET_GIB` overrides the budget; `build_budget_bytes()` :1811). Write no fixed factor, margin or cap anywhere, tests included. Keep the Phase 39 gates green unchanged: `need_text` prints a saved cap, prints `CapNotRecorded` as the build budget of that time, and renders `DevSizeHeadroom`; the basis codec round-trips each headroom class. A replay caps each promise at the budget in force when its step ran and names that budget, so a budget change does not read as this phase's effect. `ShapeFallback` (the profile fallback) has neither floor nor factor; feature-side filtering is already satisfied inside same-shape build tiers and remains necessary for profile fallback and other step histories. Determine release profile through `BuildShape.profile`, including `--profile release`, and test both release spellings. The widened match and the drop of 0.65 change other steps' tiers only.
-- The admission service owns transitions. `admission_client.WaitOutput` writes source text and `admission_protocol.py` carries source values.
-  Preserve historical and future-source decoding. Test first, periodic and refreshed wait lines.
-  Phase 20 supplies the lifecycle recording prerequisite. This phase still owns the source-share analysis.
-  Coordinate admission files with queue-unit. Record `tested against <queue tip>` in the notice.
-
+### Phase 19 — Measure where admission estimates come from, then make the 0.65 fallback rare  · status: done
+#### As-built
+The phase stopped at Spec 2. The builds showrunner ruled the `ANON_SHARE` share small on 2026-11-05: 10/4,267 (0.23%) of the reconstructed estimates, caps excluded, and 0/220 recorded admissions. Small means under 5% of estimates. Specs 3-5 were not built, and `ANON_SHARE` stays.
+- `memory_admit.count_queue_sources(lifetimes: Sequence[QueueStepLifetime]) -> QueueSourceCounts` counts each reservation interval's `need_source` as one admission and each logical step's memory wait once. `QueueSourceCounts` keeps `MemoryWaitIncomplete` (`incomplete_memory_waits`), `NoPositiveSample` (`unsampled_intervals`), open intervals and completed steps apart. A token return ends an interval, not the step.
+- `docs/as-built/build-memory-admission.md` `#### Phase 19 source shares` has the 7-day table by step kind, before and after Phase 60. The recorded admissions and the replayed estimates are separate populations, and `shape` and `cap` are their own columns. Recorded admissions covered only 16.30 hours, and the recovered legacy rows were still in the window.
 
 **Files:**
-- `scripts/build_queue/test_admission_service.py`, `scripts/build_queue/test_queue_view.py` — unchanged Phase 20 regression verification.
-- `scripts/lint/memory_admit.py` — Specs 3–4 (none if Spec 2 stops the phase), including the known/unknown source type.
-- `scripts/build_queue/admission_protocol.py`, `scripts/build_queue/admission_client.py`, `scripts/build_queue/admission_service.py`, `scripts/build_queue/queue_card.py`, `scripts/build_queue/queue_evidence.py` — Spec 4, the unknown-source boundary, only if Spec 4 runs (owner queue-unit; trial-merge against `origin/builds-queue`).
-- `scripts/lint/test_memory_admit.py` — Specs 1 and 5, including the two-interval measurement fixture.
-- `scripts/build_queue/test_queue_evidence.py` — Spec 5, the old `buildlog` row test, only if Spec 4 removes the tier (owner queue-unit; trial-merge against `origin/builds-queue`).
-- `scripts/build_queue/test_admission_client_wait.py`, `scripts/build_queue/test_admission_protocol.py` — Spec 5, the old-source wait lines and codec, only if Spec 4 removes the tier (owner queue-unit).
-- `docs/as-built/build-memory-admission.md` — Specs 1 and 6.
+- `scripts/lint/memory_admit.py` — `QueueSourceCounts` and `count_queue_sources`.
+- `scripts/lint/test_memory_admit.py` — `test_source_counts_separate_admissions_logical_waits_and_missing_evidence`: two intervals, two sources, one logical step, a token return, an incomplete wait and an unsampled peak.
+- `docs/as-built/build-memory-admission.md` — the source-share table.
 
-**Workers:** `1 writer + 1 tester`
-- `impl` — the measurement, any adopted tier change in `memory_admit.py`, the unknown-source boundary in the protocol, client, service and card files, and the as-built doc.
-- `test` — `test_memory_admit.py`, the named client and codec tests, old-source and unknown-source rendering tests (reconnect, refresh, historical rows) and measurement fixtures.
-- `test` also runs the unchanged service and overview regressions named in the Acceptance gate.
-
-**Acceptance gate:**
-- A two-interval measurement test counts both admission sources and one logical step's memory wait.
-  It reports incomplete waits and unsampled peaks separately. A token return does not count as completion.
-- Preserve `test_token_return_joins_intervals_without_completing_the_step` unchanged in `scripts/lint/test_memory_admit.py`.
-- Preserve `test_unknown_source_and_failed_poll_preserve_the_real_waiting_row` unchanged in `scripts/build_queue/test_admission_client_wait.py`.
-- Preserve these existing tests unchanged:
-  1. `test_first_priority_mark_agrees_in_the_card_overview_and_shell` in `scripts/build_queue/test_queue_view.py`.
-  2. `test_token_wait_preserves_backfill_and_strict_windows_until_its_next_admission` in `scripts/build_queue/test_admission_service.py`.
-  3. `test_priority_override_and_frozen_release_keep_the_resolved_head` in `scripts/build_queue/test_admission_service.py`.
-  4. `test_frozen_pass_keeps_one_window_for_admission_view_explanation_and_wait_text` in `scripts/lint/test_memory_admit.py`.
-  5. `test_recovery_release_keeps_required_endings_and_frozen_window` in `scripts/lint/test_memory_admit.py`.
-- The tier share table is in the phase report and the checkpoint notice, with the stop decision.
-- If code changed: the memory admission tests pass; `basedpyright` over both Python files reports `0 errors, 0 warnings, 0 notes`; the merge gate is green; the before/after replay is in the notice. Post-merge check, 24 h after the merge reaches main: steps above their promise and wait minutes against the 24 h before.
-- Change-Review line: few admissions use the 0.65 fallback | on natedev while builds wait, run `~/.claude/scripts/lib/py ~/.claude/scripts/build_queue/build_queue.py 1` | the waiting rows name source `measured` and few name `buildlog`. If Spec 2 stops the phase: Change-Review: none — measurement only.
+**Next:** the remeasure on or after 2026-11-12, when the legacy rows leave the window, is in `docs/plans/builds-resources-next.md`. Specs 3-4 come back as a phase only if the share then reaches 5%.
 
 ### Phase 20 — Replay a looser head rule, and adopt it only on the replay  · status: done
 
@@ -1504,69 +1340,34 @@ The replay and 24 h check scripts live in the run folder (`phases/15/`), not in 
 
 **Ruled out:** caller-side `store` imports in six files, replaced by the one re-export.
 
-### Phase 57 — The gate comparison shows Cargo waits with and without running gates  · status: todo
-**Depends on:** Phase 20 on `origin/main` for 24 hours. Global order: 31 → 33 → 26 → 15/27 → 39 → 20 → 56 → 11 → 60 → 17 → 18 → 19 → 8. Phase 57 runs beside this chain. Its measurement files are in the run folder. Its Spec 7 import repair shares `scripts/build_hold/build_hold.py` and `test_build_hold.py` with Phase 8: land that repair before Phase 8 starts.
+### Phase 57 — The gate comparison shows Cargo waits with and without running gates  · status: done
 
-#### Work Order
+#### As-built
 
-**Goal:** report Cargo memory waits with and without overlapping merge gates from the recorded queue lifetimes.
+A measurement script in the unit run folder splits Cargo memory waits by recorded merge-gate overlap for the first 24 hours after Phase 20 was installed. It changes no repository file.
 
-**Measured:**
-1. Phase 20 supplies `read_queue_lifetimes()` in `scripts/lint/memory_admit.py`.
-2. A `QueueStepLifetime` groups reservation intervals, token gaps and the logical step's end.
-3. The lifecycle file has an age limit and a size limit. Its retained coverage can be shorter than fourteen days.
-4. The buildlog sampler records cumulative memory stalls. It does not record the required memory PSI avg10 series.
-
-**Spec:**
-1. Start after Phase 20 has been on `origin/main` for 24 hours.
-   Record its deployment time and the comparison's due time in the phase report.
-   Compare the first 24 hours after deployment with the preceding 24 hours where usable evidence exists.
-   Report missing earlier evidence explicitly. Do not reconstruct gate intervals from unrelated Cargo step rows.
-2. Import `read_queue_lifetimes()` from the checkout. Add no second lifecycle parser or interval reader.
-   Use each gate's reservation intervals to identify overlapping running gates.
-   Unite overlapping gate intervals before classifying Cargo wait periods. Do not count overlapping gates twice.
-   Report Cargo memory-wait minutes with and without gate overlap. Keep token-gap minutes separate.
-   Count each logical step's memory wait once. Report `MemoryWaitIncomplete` separately.
-3. Preserve cancellation and incomplete evidence in the comparison.
-   A `TokenReturn` ends an interval, not the logical step. A `NoPositiveSample` value is not a measured zero peak.
-   Report open intervals and cancelled gates separately. State how the comparison treats each incomplete interval.
-4. Report the actual retained time range, missing intervals and the usable comparison period.
-   Report pressure comparisons as unavailable until the recorded PSI series supports them.
-   Do not infer avg10 hold durations from cumulative stall counters.
-5. Test overlapping gates, cancellation, token returns and incomplete intervals in private fixtures.
-   Test one logical step with multiple reservation intervals. Verify that token gaps do not become memory waits.
-   Keep the measurement script and its tests in the phase run folder. Spec 7 makes the only shared implementation change.
-6. Publish the comparison in a follow-up notice to builds.
-   Include coverage limits, Cargo wait totals and the unavailable pressure comparison, when applicable.
-7. Load `scripts/buildlog/store.py` as one module object (showrunner ruling 2026-11-04, Phase 56 simplify F006).
-   `memory_admit.py` and `hold_enforcer.py` import it at run time as `import store`, with `scripts/buildlog` on `sys.path`.
-   `build_hold.py` :44 and `head_facts.py` :17 import it as `scripts.buildlog.store`. Both files also load `memory_admit`, so one process holds two `store` modules.
-   Change both callers to the runtime name `memory_admit.py` uses. Keep their `TYPE_CHECKING` imports for the type checker.
-   Add one test per caller: after the import, `sys.modules` holds one `store` module object, and the caller and `memory_admit` share it.
-
-**Constraints from prior phases:**
-- Phase 20 owns lifecycle recording and the one reader. This phase owns the deferred Phase 16 gate comparison.
-- Use saved lifecycle identities and interval times. Missing identity evidence does not prove that a step ended.
-- This phase does not calibrate a queue model or adopt another head policy.
+- `compare_lifetimes(lifetimes, *, window_start, window_end) -> WindowComparison` reads only through `read_queue_lifetimes()`. It unites overlapping gate intervals and counts each logical wait once. It keeps token gaps, incomplete waits, open intervals, cancelled gates and missing peak samples separate.
+- Phase 20 reached the installed natedev copy at 2026-11-04 15:45:21 EST and origin/main at 15:45:22 EST, in `7e5c326df`. The comparison was due at 2026-11-05 15:45:21 EST.
+- The report has an After window only: 23.996 usable hours, with gates running 23.298 of them. It shows 241 Cargo steps, 240 complete waits and 1 incomplete wait. Cargo waits are 4313.325 minutes with gates, 12.495 minutes without gates and 2.230 minutes unknown.
+- 229 gates ran and 8 were cancelled. Two gate endings have no admission record. Token gaps are 0 minutes, because no token return is recorded. Four peak samples are missing.
+- Pressure comparison is unavailable, because the memory PSI avg10 series is not recorded.
+- The result does not show that gates cause Cargo waits.
 
 **Files:**
-- `phases/57/gate_comparison.py` — new measurement script, in the unit run folder.
-- `phases/57/test_gate_comparison.py` — in the unit run folder, new private measurement fixtures and tests.
-- `phases/57/gate_comparison_report.md` — in the unit run folder: deployment time, due time, totals and coverage limits.
-- `scripts/build_hold/build_hold.py`, `scripts/build_hold/test_build_hold.py` — Spec 7, the runtime `store` import and its test.
-- `scripts/build_queue/head_facts.py`, `scripts/build_queue/test_head_facts.py` — Spec 7 (owner queue-unit; name them as `also touches` in the notice, tested against `origin/builds-queue`).
+- `phases/57/gate_comparison.py`, in the unit run folder — the measurement script.
+- `phases/57/test_gate_comparison.py`, in the unit run folder — private fixtures and tests.
+- `phases/57/gate_comparison_report.md` and `phases/57/evidence/`, in the unit run folder — the report and the copied evidence.
 
-**Workers:** `1 writer + 1 tester`
-- `impl` owns the measurement script, report, follow-up notice and the Spec 7 imports.
-- `test` owns the measurement tests, private fixtures and the Spec 7 tests.
+**Gotchas:**
+- A commit time does not prove arrival on main. `4298a9aaf` at 16:30:03 EST was never an origin/main tip; the origin/main reflog gives the arrival.
+- Lifecycle recording began 13 seconds after the install, at 15:45:34 EST. `read_queue_lifetimes()` drops 110 older `token_gap` rows that have no `since`.
+- `read_queue_lifetimes()` discards an unmatched ending that is a `TokenReturn` or that has other intervals in its step. This evidence has neither case.
+- The no-gate rate rests on about 0.67 hours. A window 45 minutes later changes it from 19 to 362 wait minutes per hour.
 
-**Acceptance gate:**
-- The measurement tests pass. Basedpyright reports `0 errors, 0 warnings, 0 notes` over the script and its tests.
-- The report compares Cargo waits with and without overlapping gate intervals, with one memory wait per logical step.
-- The report names the actual retained coverage, cancelled gates, incomplete waits, open intervals and missing peak samples.
-- Pressure comparisons remain unavailable until the PSI record supports them.
-- The follow-up notice records the Phase 20 deployment time and the due time 24 hours later.
-- Spec 7: the build hold, head facts and memory admission tests pass on this branch and with `origin/builds-queue` merged in a copy. Basedpyright reports `0 errors, 0 warnings, 0 notes` over the four Spec 7 files.
+**Ruled out:**
+- A before and after comparison: recording began at the deployment.
+- Comparing the with-gate and no-gate rates: the no-gate period is too short.
+- A second lifecycle parser or gate intervals rebuilt from Cargo step rows.
 
 ### Phase 58 — The disk floor alert stays silent during a live sweep, and the floor pass finishes quickly  · status: done
 
@@ -1641,7 +1442,7 @@ The replay and 24 h check scripts live in the run folder (`phases/15/`), not in 
 - `FloorOutcome.assessment` holds a `tmp_sweep.SweepAssessment`. `notify_floor_problem` accepts `FloorOutcome | tmp_sweep.SweepAssessment`.
 - `send_floor_alert` returns `FloorAlertDelivery(natedev, phone)`, with one `FloorChannelOutcome` per channel (not attempted, delivered, queued or failed). `send_holder_message` is the natedev leg; it returns `FloorChannelOutcome` and logs "message to natedev ...".
 - The lock alert has one pure transition, `next_lock_alert(previous, holder, process, now)`, also used at lock acquisition. The record is written only when the state changes. An unreadable hold is `ObservedUnreadableFloorHold` or `ReportedUnreadableFloorHold`; an old `alert_delivered` true decodes as reported, false as observed. A pass that sees no holder keeps `DeliveredFloorLockAlert`, so the same holder does not alert again.
-- One copy of each floor rule: `class PhoneCrossing(Enum)`, `floor_record_or_new(previous, free)`, one pid check, `_command_text(bytes)`, `page_paths(measurement)`, and one `roots_for` lookup per distinct root. `target_dirs` is one loop over a named 3-level depth.
+- One copy of each floor rule: `class PhoneCrossing(Enum)`, `floor_record_or_new(previous, free)`, one pid check, `_command_text(bytes)`, and one `roots_for` lookup per distinct root. `target_dirs` is one loop over a named 3-level depth.
 - `config/lint.conf` sets `sweep_scan_workers.natedev=1` and `sweep_discovery_workers=4` (the directory-search pool). The code no longer forces one scan worker.
 - A real floor pass walks each idle target once, and walks again only the targets that had deletions to compute `after_caches`.
 
@@ -1687,46 +1488,343 @@ The replay and 24 h check scripts live in the run folder (`phases/15/`), not in 
 
 **Ruled out:** `target_folder` as the authoritative output root (builds ruling 2026-11-04).
 
-### Phase 63 — The phone gets one low-disk push under the alert line, with a text that passes the review  · status: todo
-**Depends on:** Phase 61 (both change `scripts/lint/sweep.py`).
+### Phase 63 — The phone gets one low-disk push under the alert line, with a text that passes the review  · status: done
 
-#### Work Order
+#### As-built
 
-**Goal:** when natedev free space falls under `sweep_phone_floor_gib`, the phone gets one push that passes the plain text review, and natedev still gets its alert.
-
-**Measured (Phase 58, builds ruling 2026-11-04 18:32 EST):** the plain review (`review.py texts --id sweep.disk_floor`, run 20261104T184217-1376377-29bf) failed both examples. Objections:
-- `typical`: every-choice-says-what-it-does and reader-starts-cold on the folder list. The reviewer asked which folder to delete and why, what the scratch folders hold, and what each deletion changes.
-- `no_free_space`: every-choice-says-what-it-does on the list total, and short-plain-sentences on "Deleting a folder removes its files."
-The rejected texts and the reviewer's suggested rewrites are in the resources run folder, `phases/58/impl_summary_floor-impl.txt`. Phase 58 sends the crossing to natedev only.
-
-**Spec:**
-1. Write the `sweep.disk_floor` text with the builds ruled header ("natedev disk is low; builds can fail"), action ("In the natedev Claude session, say which folders to delete.") and last line ("natedev checks your choice before it deletes anything."). Each listed folder says what it holds and what deleting it changes. Recommend one choice.
-2. Send the wording to the builds showrunner before the review (item 12). Run the plain review; record the approval with `review.py texts --id sweep.disk_floor --approve` only when every example passes. Never use `--user-spec`, and never write an approval record by hand.
-3. Send the push with the natedev alert on a crossing (`FloorAlertChannels.NATEDEV_AND_PHONE`). Keep one push per crossing.
-4. Use `sweep_push_text_limit` and `sweep_page_paths` in `config/lint.conf`, or remove them and their `config/README.md` rows. Phase 58 left them with no reader.
-5. Give the alert text a surface for each folder-choice state: measurements available (recommend one choice), measurement unavailable or stale (say so and name no folder), and no single choice frees enough (say what the largest choice frees). Never invent a deletion recommendation. Each state has a catalog example that passes the review.
-   - Protected folders (`NoRecordedEvidence`): since Phase 62 the natedev alert lists the largest of them with sizes (`protected_folder_lines`, from `FloorOutcome.protected`; `notify_floor_problem`, `sweep.py` :3525). The phone text uses the same measurement, labels these folders as protected (the floor never deletes them; only a person can), and says each one "holds" its size. They are never floor holders.
-6. Records from Phase 58 hold `PhoneCrossing.UNDER_PUSHED` after natedev delivery alone, so they prove no phone delivery. Keep the natedev and phone receipts as separate states for each crossing. An open episode in an old record gets its first phone push once, with no second natedev alert.
-   - Each crossing has a durable identity saved in the record before the first send (for example the time the pass first measured free space under the line). Each channel's send passes `send.py --key <channel>:<crossing identity>` with a `--repeat-minutes` window that covers a restart, so a send repeated after a crash between delivery and the saved receipt is skipped by `send.py`. The receipt is still saved after each accepted send.
-
-**Constraints from prior phases (Phase 61):**
-- `FloorOutcome` carries `assessment: tmp_sweep.SweepAssessment`; `notify_floor_problem` (`sweep.py` :3525) accepts `FloorOutcome | tmp_sweep.SweepAssessment`, and a skipped assessment changes no state.
-- `send_holder_message` is the natedev leg of `send_floor_alert` and returns `FloorChannelOutcome`; the phone leg is separate. Its log line reads "message to natedev ...".
-- A pass that sees no lock holder keeps a `DeliveredFloorLockAlert` receipt (`next_lock_alert`, `sweep.py` :1182). Keep `test_missing_lock_observation_preserves_the_delivered_holder_receipt` green and unchanged.
-- Workspace and temporary-sweep failures keep their own records (`workspace-<sha256>.json`, `temporary-sweep.json`) and never send a phone push.
-7. The `sweep_phone_floor_gib` comment ("Send one phone alert") and the `Phone` state names must be true at the checkpoint (builds 2026-11-04). If this phase cannot bring back the phone push, file the key rename with `/unit:question`: a rename deletes a key.
-8. If the text still fails the review, keep the alert natedev only and ask the builds showrunner.
+- When free space falls under `sweep_phone_floor_gib`, the floor finalizer sends one natedev message (`send_floor_alert`, key `natedev:<crossing identity>`) and, with a current text approval, one phone push (`send_phone_push`, key `phone:<crossing identity>`). Each channel keeps its own receipt in the floor record and retries alone. Both return `FloorChannelOutcome`.
+- The crossing identity is saved in the record before the first send. A crossing whose identity cannot be saved uses the key `natedev:unsaved-crossing` (`UNSAVED_CROSSING_KEY`) with the `sweep_alert_interval_seconds` window and sends no phone push. A failure message carries no crossing key; its acceptance stores `FailureReported`.
+- An old record with `PhoneCrossing.UNDER_PUSHED` gets its first phone push once, with no second natedev alert.
+- The `sweep.disk_floor` catalog text (`scripts/notify/push_catalog.py`) has four forms: available (recommends one choice), insufficient (says what the largest choice frees), protected (folders the floor never deletes, labelled as protected, with their sizes) and unavailable (names no folder). Each form ends with a do-nothing choice. Folder labels are full home-relative paths. `fit_disk_floor_push` trims the smallest choice to `sweep_push_text_limit` with the real values, then falls back to the unavailable form.
+- `disk_floor_channels()` keeps the phone off until `push_texts.approval_date("sweep.disk_floor")` exists. Until the user approves the text, `scripts/notify/test_push_texts.py` fails only on that missing approval.
 
 **Files:**
-- `scripts/lint/sweep.py`, `scripts/lint/test_sweep.py` — the phone push, receipt states and their tests.
-- `scripts/notify/push_catalog.py`, `scripts/notify/push_texts_reviewed.json` — the low-space text and its review record.
-- `config/lint.conf`, `config/README.md` — `sweep_push_text_limit`, `sweep_page_paths` and the `sweep_phone_floor_gib` comment.
+- `scripts/lint/sweep.py` — crossing receipts, `send_floor_alert` (natedev only), `send_phone_push`, `run_send`, the folder choices and `fit_disk_floor_push`.
+- `scripts/notify/push_catalog.py` — the `sweep.disk_floor` template and its four examples.
+- `config/lint.conf`, `config/README.md` — `sweep_crossing_repeat_minutes`, `sweep_push_text_limit`, `sweep_page_paths`.
+- `scripts/lint/test_sweep.py` — crossing, receipt, key and text tests.
 
-**Workers:** `1 writer + 1 tester`
-- `impl` owns `sweep.py`, `push_catalog.py`, `push_texts_reviewed.json`, `config/lint.conf` and `config/README.md`.
-- `test` owns `test_sweep.py` and the channel-retry and folder-choice cases, and runs `scripts/notify/test_push_texts.py` and `scripts/lint/test_tmp_sweep.py`.
+**Gotchas:**
+- `send.py` exits 0 for a skipped repeat key. Never key a message whose acceptance records new state.
+- Only the user records the text approval (`review.py texts --id sweep.disk_floor --approve`).
 
-**Acceptance gate:**
-- Tests prove: a fall under the alert line sends one push and one natedev alert; a second pass under the line sends none; free space exactly at the line keeps the episode; a rise above the line and a new fall sends one more; a failed phone delivery with a sent natedev alert retries only the phone, and the reverse retries only natedev; a restart mid-episode sends nothing twice, also when the pass stops after a send and before its receipt is saved; an old record's open episode gets one phone push; a sweep-failure alert sends no phone push; the unavailable-measurement text names no folder; protected folders appear labelled as protected, with the same sizes on both channels, and are never floor holders.
-- `scripts/notify/test_push_texts.py` passes with a normal approval record. `scripts/lint/test_sweep.py` and `scripts/lint/test_tmp_sweep.py` pass. Basedpyright reports `0 errors, 0 warnings, 0 notes` over the changed files.
-- Change-Review line: the phone gets one low-disk push | read the phone pushes after natedev free space falls under 150 GiB | one push arrives that says which folders to delete and what each one holds.
+**Ruled out:** Cargo labels for the measured folders (the measurement excludes Cargo targets); a director-recorded text approval (the approval is the user's).
+
+### Phase 64 — Recorded step outputs have one owner, distinct rows and row facts  · status: done
+
+#### As-built
+
+- `scripts/buildlog/step_outputs.py` owns the recorded-output reader. `recorded_output_roots(index_path, host)` opens the steps index read-only and returns `RecordedStepOutputs(rows)` or `RecordedRootsUnavailable(reason)`. It never creates an index.
+- Each `RecordedStepOutput` holds facts, not rules: worktree, cwd, target folder, build folder and recorded target folder (`AbsoluteRecordedRoot | UnknownRecordedRoot | RelativeRecordedRoot`), plus `TargetFolderOverride` (`ABSENT`/`PRESENT`).
+- The SQL `DISTINCT` covers the row facts only. A `target-dir` prefilter sets the override marker, so argv stays out of `DISTINCT`. `indexed_argv` decodes a stored argv.
+- `scripts/lint/sweep.py` `_recorded_mapping_rows` applies sweep's own rule: skip `PRESENT` rows and rows whose absolute target folder differs; the workspace is the worktree, else the cwd; all three roots must be absolute. One dedupe follows the resolve.
+- `scripts/lib/cargo_target_config.py` has `cargo_config_values(argv)`. `scripts/buildlog/width_trial.py` uses `indexed_argv`. `scripts/lint/build_shape.py` keeps only `index_step_evidence`.
+- Reader CPU on natedev is 117.65 ms (was 400.22 ms) for 1,120 distinct workspace pairs. A floor-only dry run takes 7.57 s.
+
+**Files:**
+- `scripts/buildlog/step_outputs.py` — the reader and its row-fact types.
+- `scripts/buildlog/step_outputs_test_support.py` — `create_step_index` and `record_root_attempt` for every steps-index test.
+- `scripts/buildlog/test_step_outputs.py` — reader tests.
+- `scripts/lint/sweep.py` — sweep's deletion rule over the facts.
+- `scripts/lib/cargo_target_config.py`, `scripts/buildlog/width_trial.py` — argv decoding through the shared helpers.
+
+**Binds later work:** Memory kill classification reads these rows and applies its own rule; `scripts/buildlog/memory.py` still calls `build_shape.recorded_output_roots`, and `scripts/buildlog/test_memory_window.py` still imports from `test_build_shape`, until the report-unit memory work merges. The floor's override-row evidence adds a row-time fact to `RecordedStepOutput`; the distinct row count and the reader CPU are measured again.
+
+**Gotchas:**
+- Keep one copy of each module in a process. At run time, import a `scripts/buildlog` module in the form its other importers use; `step_outputs` is bare today (`scripts/lint/sweep.py`, `scripts/buildlog/width_trial.py`). Type checking uses `if TYPE_CHECKING: from .x import …`.
+- `create_step_index` keeps each column's declared type word. TEXT for every column breaks the build_shape tests.
+- `scripts/build_queue/head_facts.py:17` loads a second `store` module copy through a bare import. Its owner fixes it.
+- The Phase 62 protections hold: no recorded evidence is `NoRecordedEvidence`, an override row gives sweep no evidence, and an unreadable index prints `lint sweep: recorded output roots unavailable: <reason>`.
+
+**Ruled out:** One reader that applies sweep's deletion rules for every caller (memory classification needs its own rule); argv inside `DISTINCT` (15,838 rows for 1,120 pairs).
+
+### Phase 65 — Memory kill classification reads the shared step output rows and applies its own rule  · status: done
+#### As-built
+`memory.build_output_roots` reads the recorded step rows through `step_outputs.recorded_output_roots` and applies memory's own rule to the row facts (`memory.py` :97-108). It imports nothing from `build_shape` for this.
+- `cargo_target_config.cargo_folder_settings` reads config files, then `CARGO_BUILD_TARGET_DIR`/`CARGO_BUILD_BUILD_DIR`, then the `--config` values through `cargo_config_values(argv)`, then `CARGO_TARGET_DIR`; report's strict configuration branch stays.
+- `memory.py` imports `step_outputs` in its bare runtime form, the same as `sweep.py` and `width_trial.py`, so a process holds one copy.
+
+**Files:**
+- `scripts/buildlog/memory.py`, `scripts/lib/cargo_target_config.py` — the caller rule and the config reader.
+- `scripts/buildlog/test_memory_window.py` — classification over override, differing target folder, usable and relative-worktree rows; its index comes from `step_outputs_test_support.py`.
+- `scripts/buildlog/test_step_row.py` — `CargoFolderPrecedenceTests`, under both `CargoConfigPolicy` values.
+
+**Binds later work:** report-unit Phase 25 deletes `memory.build_output_roots` and classifies a kill by `sweep.is_cargo_target` over the program's parent folders; after it lands, sweep is the only reader that applies a rule to the rows.
+**Gotchas:** a package-form import (`from scripts.buildlog import step_outputs`) at run time loads a second module copy beside the bare one.
+
+### Phase 66 — The floor takes evidence from target-folder override rows that the fixed recorder wrote  · status: done
+#### As-built
+A step row whose argv sets its own target folder gives the floor evidence when the fixed recorder wrote it.
+- `scripts/buildlog/step_outputs.py`: `RecordedStepOutput.newest_start: StepStart`, where `StepStart = KnownStepStart(instant) | UnknownStepStart`. The reader groups the distinct facts and the override flag and returns `MAX(started_at_us)` for each group, so the row count stays the distinct count (1,194 rows on natedev, 0.14 s of CPU). `started_at_us` is integer UTC microseconds; text `MAX(started_at)` ordered `…36Z` above `…36.001Z`.
+- `scripts/lint/sweep.py`: `TARGET_OVERRIDE_RECORDER_CUT = datetime(2026, 11, 5, 8, 31, 36, tzinfo=UTC)`, the time the fixed recorder reached natedev's installed `~/.claude` (from that checkout's reflog). `_recorded_mapping_rows()` has two guards: a target-folder mismatch is never evidence, and an override row is evidence only when its newest start is strictly after the cut. An unknown start keeps the override skip.
+- A zone-free stamp reads as UTC, as in the index.
+
+**Files:**
+- `scripts/buildlog/step_outputs.py` — the newest start as a row fact.
+- `scripts/lint/sweep.py` — the cut and the two guards.
+- `scripts/buildlog/step_outputs_test_support.py` (`record_root_attempt(..., started_at=None)` writes `started_at_us`), `scripts/buildlog/test_step_outputs.py`, `scripts/lint/test_sweep.py` — cut, unknown-start, mismatch and fractional-second tests.
+
+**Binds later work:** keep both guards in `_recorded_mapping_rows()` and the cut tests unchanged.
+
+**Gotchas:** `index.add_step` fills a missing output pair from the captured target folder, also a pair the fixed recorder chose not to write; the index fix belongs to report-unit.
+
+### Phase 67 — Importing offload or sweep loads no build coordination modules  · status: done
+#### As-built
+Importing `scripts/mac_test/offload.py` or `scripts/lint/sweep.py` loads no `build_hold`, `scripts.build_queue*` or `memory_admit` module.
+- `sweep.py` imports `build_hold` only inside `build_hold_targets()`. The import returns the module object in `sys.modules`, so `test_sweep.py`'s patch of `build_hold.live_sessions` holds. The `TYPE_CHECKING` import stays.
+- `holder_sessions` adds no path to `sys.path` on each call.
+- Offload import median: 218 ms before, 130 ms after.
+
+**Files:**
+- `scripts/lint/sweep.py` — the import cut.
+- `scripts/lint/test_sweep.py` — a fresh-interpreter import test for `offload` and `sweep`, and a test that repeated holder queries leave `sys.path` unchanged.
+- `scripts/build_queue/test_store_identity.py` — imports `sweep`, then `scripts.buildlog.store`, and checks one store module object.
+
+**Binds later work:** keep build coordination imports inside functions in `sweep.py`; the fresh-interpreter import test guards it.
+
+### Phase 68 — Memory estimates use all same-shape history again; the Phase 18 history splits go  · status: done
+#### As-built
+`expected_peak()` and `filtered_peak()` select history as before Phase 18: no build-change list, side filter, step-commit ancestry or estimate cache exists.
+- `config/build_changes.json`, `scripts/lint/build_change_test_support.py`, `HistorySplit`, the side filters, ancestry outcomes and the `admission/build_marks.json` writer are deleted. No estimate function takes `history_split`.
+- `compiling_history` returns `(item, evidence)` pairs again. `build_shape.step_index` is public; `expected_peak` opens the index only when the repository has a legacy name. `fresh_test_peak` uses `history_matches_repository`.
+- `admission_client.build_history_generation` keeps its two named configuration states.
+- The Phase 18 replay (1,064 runs) found no gain from the feature split: 106 steps above their promise without it, 108 with it.
+- The estimate median for the hana dev nextest request rose from 0.436 s to 0.536 s, because all same-shape history passes through three history decodes per filtered estimate.
+
+**Files:**
+- `scripts/lint/memory_admit.py`, `scripts/lint/build_shape.py`, `scripts/build_queue/admission_client.py`, `scripts/buildlog/width_trial.py` — the selection without splits.
+- `scripts/lint/test_memory_admit.py`, `scripts/lint/test_build_shape.py`, `scripts/build_queue/test_admission_client.py` — the pre-Phase-18 tests.
+- `docs/as-built/build-memory-admission.md` — one line: the replay found no gain, so no estimate splits its history.
+
+**Gotchas:** natedev keeps an orphan `admission/build_marks.json`; nothing reads it.
+
+**Ruled out:** splitting history by build feature or commit without a replay that shows fewer steps above their promise.
+
+### Phase 69 — A memory estimate reads its history file and its index rows once  · status: done
+#### As-built
+Each estimate decodes `admission/anon_peaks.jsonl` once and asks the index once, only for the window's call ids. The estimates are the same as before.
+- `read_estimate_history(root, host, steps, now, *, include_current_end=False) -> EstimateHistory` applies one parsed window to every tier: host, steps, `cutoff <= ended_at <= now` (`< now` unless `include_current_end`) and a positive int peak. `EstimateHistory` carries `root`, `host`, `now`, `steps`, `include_current_end` and `rows` by step.
+- `compiling_history(history)` takes only the history and joins its rows through `index_step_evidence`.
+- `expected_peak` reads once: a filtered request with a package reads `filtered_steps(step)` (`step`, `check`, `build` without repeats), others read `(step,)`. It tries `fresh_test_peak` (`ExpectedPeak | NoFreshHistory`), then `filtered_history_peak` or `full_history_peak`. No `filtered_peak` wrapper exists. `build_peaks` makes one read with `include_current_end=True`.
+- `index_step_evidence(index_path, host, steps: tuple[str, ...], call_ids: tuple[str, ...], before)` is one query over `json_each` call ids and steps with `+host=?`, so SQLite uses `steps_call`. It skips rows dated at or after `before`, keeps test arguments only for `TEST_STEPS`, and gives a `BuildShape` only to `build` rows (`NoBuildShape()` otherwise).
+- The hana dev nextest estimate median fell from 0.462 s to 0.276 s.
+
+**Files:**
+- `scripts/lint/memory_admit.py`, `scripts/lint/build_shape.py` — the single read and the bounded query.
+- `scripts/lint/test_memory_admit.py`, `scripts/lint/test_build_shape.py` — the decode-once helper `assert_history_decoded_once`, window-edge, query-plan and shared-call tests.
+
+**Binds later work:** an estimate reuses the one `EstimateHistory` read and the one evidence join; add no second history read, evidence join or tier window. The indexed fallback queries in `full_history_peak`, `filtered_history_peak` and `fresh_test_peak` are separate index reads by host, repository and step. Only `build_peaks` reads `StepEvidence.shape`.
+
+**Gotchas:** without `+host`, SQLite picks `steps_host_started` and reads every row for the host. `INDEXED BY steps_call` raises when the index lacks it (the frozen replay index does).
+
+**Ruled out:** a byte-offset start of the history read (the file is only close to append order); moving `program_peak_estimate` onto the shared read (it raises on an unreadable file); the fresh zero-compile rule inside the shared join (it changes fresh estimates).
+
+### Phase 70 — Memory and sweep find the enclosing Cargo target with one function  · status: done
+#### As-built
+One function finds the Cargo target folder that holds a path, and both parent walks use it.
+- `sweep.enclosing_cargo_target(path: str, *, lint_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT) -> EnclosingCargoTarget | NoEnclosingCargoTarget` resolves the path and returns the nearest folder, the path itself included, that `is_cargo_target` accepts. `EnclosingCargoTarget.folder` is a `str`, as the other sweep target paths are.
+- `record_target_deletes` skips a path whose real path is a known target and records the enclosing target of each other path; a path outside every target adds nothing.
+- `memory.build_output_program` passes the resolved program's parent folder, so a target folder itself is not a build program. It reads lint settings only through `is_cargo_target`, so only a cache-tag folder reads `lint.conf`.
+
+**Files:**
+- `scripts/lint/sweep.py` — the function, its two result types and `record_target_deletes`.
+- `scripts/buildlog/memory.py` — `build_output_program` calls the function.
+- `scripts/lint/test_sweep.py` — the cache-tagged target, the path itself, the nearest delete record and the outside delete.
+- `scripts/buildlog/test_memory_window.py` — a target folder is not a build program.
+
+**Gotchas:** the function includes the path itself; a caller that classifies a file passes its parent folder.
+
+**Ruled out:** moving the memory cache-tag and symlink tests to `test_sweep.py` (they pin memory's classification).
+
+### Phase 71 — The phone low-disk push carries only the free space, the alert line and one folder  · status: done
+#### As-built
+The `sweep.disk_floor` push body is `natedev has {free} free, below the {floor} alert line, so builds can fail. {recommendation}`. Its title and action lines did not change. The natedev session message carries the cleanup line, every measured folder and the choices. The phone stays off until the user approves the text (Phase 63).
+- `sweep.folder_recommendation(choices: FolderChoices, shortfall: int) -> str` writes the one folder fact both channels use. Trash: `Delete <folder> (recommended): this frees <size>, which covers the <shortfall> shortfall.` Protected, scratch or other: `Review <folder> first (recommended): deleting it frees …`. Insufficient: `The largest folder is <folder> at <size>. Deleting it frees only part of the <shortfall> shortfall.` Unavailable: `Folder sizes are unknown.`
+- `sweep.disk_floor_push(free: int, floor: int, choices: FolderChoices) -> RenderedPush` adds the push-only words: the measure and delete-nothing choices for the unavailable state, and `; the natedev session lists every folder.` for the insufficient state. The unavailable action is `In the natedev Claude session, reply measure or delete nothing.`
+- `sweep.fit_disk_floor_push(free, floor, choices, *, lint_settings) -> RenderedPush | NoPhoneAlert` renders the measured choices, then the unavailable form, and returns `NO_PHONE_ALERT` with a stderr line when both reach `sweep_push_text_limit`.
+- `sweep.folder_choice_lines(choices, shortfall, *, path_limit) -> list[str]` writes the session lines: one line per folder with its size and effect, the folder fact, `Delete nothing: builds can fail when the disk is full.` and `natedev checks your choice before it deletes anything.` The unavailable state has the fact, `Measure first (recommended): …` and `Delete nothing: the disk stays low and builds can fail.` `notify_floor_problem` computes the shortfall once and runs `folder_choices` once per crossing for both channels.
+- `folder_choices` returns every measured choice; the `sweep_page_paths` cut is gone. The measured list comes from the folder audit rows at depth 1-2 of at least `MIN_OUTSIDE_DIRECTORY_BYTES`.
+- `page_paths` and `classified_folder_choices` are deleted. The out-of-reach floor sends no phone page; holder sessions and natedev get their messages.
+- Catalog examples (longest message 285 characters): available 248, unavailable 283, insufficient 285, protected 253. Purpose: `A low-disk alert recommends one folder for natedev review.`
+
+**Files:**
+- `scripts/lint/sweep.py` — the folder fact, the push and session renderers, the fit fallback.
+- `scripts/notify/push_catalog.py` — the `sweep.disk_floor` template, its four examples and purpose.
+- `scripts/lint/test_sweep.py` — exact session lines, every folder listed, the action lines, the protected session label and `test_disk_floor_push_fit_falls_back_at_each_limit`.
+- `config/lint.conf`, `config/README.md` — `sweep_page_paths` removed.
+- `docs/as-built/build-memory-admission.md` — the out-of-reach paragraph.
+
+**Gotchas:** `test_push_texts.test_every_catalog_example_has_current_approval` stays red until the user approves `sweep.disk_floor`; only the user records that approval.
+
+**Ruled out:** shortening the push folder label before the unavailable fallback (Spec 6 sets the fallback; a label over about 220 characters is rare).
+
+### Phase 72 — One bad run marker keeps only its own run, and the sweep reads rosters only in folders  · status: done
+#### As-built
+One bad entry in a run marker folder keeps only its own session's runs; every other run is judged as usual.
+- `marked_runs(roots) -> RunMarkers` reads each marker on its own. `RunMarkers` holds `paths: dict[str, str]` (real run path to marker name) and `unreadable_sessions: frozenset[str]`. A marker is bad when it is not a regular file, cannot be read, or has no absolute path on its first line.
+- `run_folder_guards(roots, live) -> dict[str, RunKeepReason]` reads the markers and the session record in one `try`. A good marker keeps its run with `ACTIVE_MARKER`. A bad marker keeps only the run folders whose `unit_runs.director` is its name, with `UNREADABLE_RECORD`. When the marker folder or the session record cannot be read, every run folder (folders only, never files) gets `UNREADABLE_RECORD`.
+- `judge_entries` has no fallback of its own; `owner_reason` reads no markers. `cleanup_end_reason` skips a run-root entry that is not a folder, so a roster is read only inside a folder and a file never gets a raw error text as its keep reason.
+
+**Files:**
+- `scripts/lint/tmp_sweep.py` — `RunMarkers`, `marked_runs`, `run_folder_guards`, `owner_reason`, `cleanup_end_reason`.
+- `scripts/lint/test_tmp_sweep.py` — empty roster lock, bad marker cases (empty, relative, invalid UTF-8, NUL byte, directory, broken link), broken marker folder, and a good marker beside a bad one.
+
+**Gotchas:**
+- A NUL byte in a marker path makes `os.path.realpath` raise `ValueError`; the per-marker handler catches `OSError`, `UnicodeError` and `ValueError`.
+- The guard reads the director only for a folder not already kept, so a good marker keeps `ACTIVE_MARKER` when another marker is bad.
+- `session_staff.worker_run_index` lists the `active` folder as a run, and the shared roster lock creates `active/mesh_roster.json.lock`; models-rename-track owns that caller.
+
+**Ruled out:** a test that counts director reads (it needs a configured mock).
+
+### Phase 73 — Measure what drops the warm hana_rigging prelude build, and propose one fix  · status: done
+#### As-built
+A measurement only; no repository code changed. The report is in the unit run folder (`phases/73/prelude_cold_report.md`).
+- The test is `production_prelude_compiles_without_test_support` (hana `crates/hana_rigging/tests/external_client.rs:1931`); lines 1946-1948 put its build in `<target>/external-client`. A warm folder is 1.3 GB.
+- 2026-11-02 to 11-05 13:24 EST: the floor sweep removed one `external-client` folder (11-02 01:01, `hana_catalyst-hana-migration`, 1.5 GB). Three CI points in fresh clones ran the test cold on 11-02 (101, 117 and 99 s). One Mac run on 11-05 12:00 took 162 s with no matched cause.
+- The fresh-clone CI cause is gone: `ci_start` now uses standing copies (`scripts/production/ci_points.py`).
+
+**Ruled out:** a floor rule that keeps hana `target/external-client` — the builds showrunner dropped it on 2026-11-05: the fresh-clone cause is gone, and 1 eviction in 3 days does not pay for 1.3 GB per checkout. The Mac cold run is a next item.
+
+### Phase 74 — Find what made the 11-05 12:00 Mac prelude compile run cold  · status: done
+#### As-built
+A measurement only; no repository code changed. The report is in the unit run folder (`phases/74/mac_cold_report.md`).
+- The 162 s run (step `Nates-MacBook-Pro-2023-20261105T170021-b2e1fa`) used the Mac mirror `~/.local/state/mac-test/mirror/hana`, made on 2026-10-09; it was not a new mirror.
+- Its `target` folder was made again at 11:17:11 EST, after the same-path step that ended at 11:14:00. No record names what removed it.
+- The suspect is the post-run cleanup in `scripts/mac_test/offload.py:1640-1647`: it removes the whole target when free space is under the Mac floor (100 GiB). `report_cleanup` (`offload.py:905-912`) prints no line for a removal.
+- It is the only cold Mac run of the test from 11-02 to 11-05 13:47 EST (later runs: 33.9 s and 5.9 s).
+
+**Ruled out:** a fix — the cause does not repeat.
+
+### Phase 75 — The Mac post-run cleanup prints one line when it removes a target  · status: done
+
+#### As-built
+
+When free space on the Mac is under the floor, the post-run cleanup measures the mirror's `target` with `du -sk` before `rm`, then sends `mac_cleanup=0 <kib|-> <free GiB>`. The free-space test, the floor and the `rm` are unchanged.
+
+- `parse_cleanup` returns `CleanupDone(size, free_gib)` for that marker. `size` is `MeasuredCleanupSize(kib)` or `CleanupSizeNotMeasured`, and a failed `du` still removes the target.
+- A bare `mac_cleanup=0` from `linux_runner.py` is `CleanupRemovedWithoutFacts`: a confirmed removal that prints no line.
+- `report_cleanup` prints one line for `CleanupDone`: `Mac build output removed: ~/.local/state/mac-test/mirror/hana/target, 31.2 GiB; Mac free 59 GiB under the 60 GiB floor`. The line starts with the target label.
+- `mirror_target(repository, target, slot)` builds both the removed path and the printed path.
+
+**Files:**
+- `scripts/mac_test/offload.py` — the cleanup command, the outcome types, `parse_cleanup`, `report_cleanup`, `mirror_target`.
+- `scripts/mac_test/test_offload_cleanup.py`, `scripts/mac_test/test_offload_cleanup_results.py`, `scripts/mac_test/test_offload_forward.py`, `scripts/mac_test/offload_test_support.py` — the marker, the printed line, a failed `du`, and the command text.
+
+**Gotchas:** `claimed_run` and `parse_cleanup` serve the Mac and the Linux targets. `scripts/direct/verify_ssh_targets_test_support.py` keeps the bare marker because its fixture also stands for the Linux targets; the Mac marker there hides a break.
+
+**Ruled out:** `linux_runner.py` printing the new marker: the line's text says "Mac free", and that runner needs no line.
+
+### Phase 76 — Each --until folder has its own scratch task  · status: done
+
+#### As-built
+
+Each `--until` or default scratch folder now has the task `until:<stamp>/<id>`, with a new random id for each call. So `scratch.py end --task` removes only the folder that the task names. The cause was the 2026-11-05 19:54 EST incident: `end --task until:2026-11-07T0500Z` removed four clones of other units and one gate checkout.
+
+- `until_task(moment, *, scratch_settings)` adds the id. `random_suffix(scratch_settings)` makes the random text for `until_task` and `target`. `until_stamp(name)` reads the stamp for `task_end` and `target`.
+- Folder names do not change. `copies.py` and `end` do not change.
+- `end --task until:<stamp>` with no id removes no folder that has an id. `scratch.py list` shows a folder's task.
+- The fix reached builds on its own branch, `builds-resources-scratch-task`.
+
+**Files:**
+- `scripts/lib/scratch.py`, `docs/as-built/build-memory-admission.md`.
+- `scripts/lib/test_scratch.py`, `scripts/copies/test_copies.py` — two real `copies.py clone --until` calls with one value.
+
+**Gotchas:**
+- Fast track refuses `scratch.py`: `maker` imports `scripts/production/staff.py`, and the import walk reaches imports inside functions.
+- A task with no id still parses, and a hand-written `--task until:<stamp>` still passes `checked_task`. No script or doc writes that form.
+
+**Ruled out:**
+- `end` refusing a folder with uncommitted work, or a folder a gate holds: the user answered no on 2026-11-05, because no two folders share a task now.
+
+### Phase 77 — Random text uses the standard library  · status: done
+
+#### As-built
+
+The scratch suffix and the review link id come from `secrets.token_hex`, so two copies of a one-line random text loop are gone and no helper exists.
+
+- `random_suffix(scratch_settings)` returns `secrets.token_hex(length)[:length]`, with `length` from the scratch.conf `suffix_length`. `target` passes `suffix_length=len(suffix)` to `BuildFolderSpec`.
+- `review_link.py` makes each snapshot id with `secrets.token_hex(3)`.
+- Each suffix and id has 24 random bits, not about 31. Readers and tests of `[a-z0-9]{6}` accept the new form.
+
+**Files:**
+- `scripts/lib/scratch.py`, `scripts/review_links/review_link.py`.
+- `scripts/review_links/test_review_link.py` — the two collision tests patch `secrets.token_hex`.
+- `docs/as-built/review-links.md` — the id form and the `snapshot_allocation_tries` setting.
+
+**Gotchas:**
+- The collision tests patch the random call, so a change of that call changes them. The ten-try test counts ten calls, one for each id.
+
+**Ruled out:**
+- `token_hex` in `scripts/lib/build_folders.py`: `names.suffix_characters` in config sets its characters.
+- `secrets.token_hex` for `os.urandom(n).hex()` and `uuid4().hex[:8]`: each stays one call and no copy goes away.
+
+### Phase 78 — A target that goes away during a floor pass does not fail the pass  · status: done
+
+#### As-built
+
+A target that goes away during a floor pass counts as done. The pass finishes with status 0 and saves its floor record. Any other `OSError` still fails the pass.
+
+- `on_floor_filesystem` returns False when `output_device` raises `FileNotFoundError`: a missing target is on no filesystem. The `sweep_ci_targets` measure uses it.
+- `filesystem_floors` keeps its `isdir` check and skips a path that goes away after it.
+- Private `stamp_newer(root, moment)` returns False when `USE_STAMP` is missing. The paired trim uses it.
+- `removed` leaves out the blocks of an idle target that went away and that the pass did not take, so the alert states only what the pass removed. A block that a surviving target still links stays in.
+
+**Files:**
+- `scripts/lint/sweep.py`.
+- `scripts/lint/test_sweep.py` — a real private floor pass with a target removed during `shrink_floor`, the removal alert test, the `filesystem_floors` and `stamp_newer` tests, and a fixed alert channel in `test_protected_report_limits_paths_and_measures_each_folder_once_per_pass`.
+- `docs/as-built/build-memory-admission.md` — one bullet under the disk floor section.
+
+**Gotchas:**
+- The base floor fixture replaces `output_device`, so a test of a missing target restores the real call.
+- `before_caches` keeps the bytes of a target that went away, because the growth check compares it with `scanned_free`, and both are from before the take.
+
+**Ruled out:**
+- A probe of a secondary filesystem: on natedev it is always the home folder.
+
+### Phase 79 — The folder audit names a maker only on proof, and it skips the Codex daemon folder  · status: done
+
+#### As-built
+
+The folder audit names a session as a folder's maker only when one of that session's own commands makes that exact folder. A folder with no proven maker prints `maker unknown` in its `loose:` line and gets no message. The audit keeps `/tmp/codex-daemon-<uid>`.
+
+- The guard (`scripts/hooks/pre-tool-use-scratch-guard.py`) owns `creation_targets(text, cwd)`. It yields frozen `CreationTarget(path, repository_copy)` records. It skips environment words, follows `cd` (a bare `cd` goes to `~`), stops at a failed `cd`, and yields nothing for `make_a_worktree`. `loose_folders()` and the audit both use it.
+- `folder_audit.makers()` selects transcript lines with ripgrep on each folder name, parses each line as JSON, and needs an absolute `cwd`. It reads commands from `input`, `tool_input` and `tool_use` content. A target proves a folder only on exact path equality. The earliest-started transcript wins.
+- `KEPT_PREFIXES` adds `codex-daemon-` to the system temp prefixes.
+
+**Files:**
+- `scripts/lint/folder_audit.py` — the maker proof and the kept daemon folder.
+- `scripts/hooks/pre-tool-use-scratch-guard.py` — the shared creation walk.
+- `scripts/lint/test_folder_audit.py` — the maker proof test (child targets and an implicit clone destination), the `maker unknown` test, and the kept daemon folder test.
+- `docs/as-built/build-memory-admission.md` — the folder audit paragraph and the Mac socket rule.
+
+**Gotchas:**
+- A folder's name in message text (a `send.py --text` report, a cleanup message) is not proof. Each of the 6 real folders with a wrong maker came from such text.
+- `mktemp` targets resolve to the template path with its `X`s, so a folder made by `mktemp -d` has no proven maker.
+- Never run `folder_audit.py` or `audit()` against the real `/tmp` or `~/rust` in a test: an armed run removes folders.
+
+**Ruled out:**
+- Exit-status reasoning (`false && mkdir x`, `(cd x); mkdir y`): the static parser cannot know an exit status, and the earliest-session rule limits the risk.
+
+### Phase 80 — Every Mac test run states its threads and the Mac's load  · status: done
+
+#### As-built
+
+Every nextest run that lint starts prints one line after admission: `nextest: <granted> of <requested> test threads; load <one-minute load> on <cpu count> CPUs (<host>)`. A run narrowed by the share claim adds `; shared with the runs in flight`. A missing load prints `load unknown`. The line covers the share claim, a caller width (`--test-threads`, `--jobs`, `-j`), trial mode, and the fallback paths (no marker folder, a failed claim).
+
+- `scripts/lint/nextest_budget.py` owns the one formatter, `thread_line(granted, requested)`. Widths are `TestWidth = SpecifiedTestWidth | UnknownTestWidth`. `requested_threads(argv)` reads `--test-threads`, `--jobs`, `-j` (all spellings) before `--`, then `NEXTEST_TEST_THREADS`, then the CPU count. The `report` action prints the line for an unshared run; `claim ... --show-load` prints the width, then the line.
+- `scripts/lint/invoke.sh`: `run_step_attempt` calls `nextest_thread_report` for a `cargo nextest run` with no share marker. `nextest_share_claim` prints the claim's line, or the report line when the marker or claim fails. `run_nextest` treats `--jobs` and `--jobs=N` as a caller width, so it adds no second width option.
+- The cause report for the slow hana Mac runs (three runs that fastest-unit timed, 2026-11-07) proved overlapping load: another session's hana demo (about 220–250% CPU), cargo-liner checks, clippy and 6-thread nextest runs, Chrome and battery power. A full-width grant is not rebalanced when later runs start. Spotlight, Time Machine, thermal limits, swap and a cold cache stay unproven.
+
+**Files:**
+- `scripts/lint/nextest_budget.py` — the width types, the request reader and the formatter.
+- `scripts/lint/invoke.sh` — the report call on every nextest path.
+- `scripts/lint/test_nextest_budget.py` — the line on shared, full, caller-width (`--jobs` rows), trial, marker-failure, claim-failure and unreadable-load runs, through the real dispatch.
+- `scripts/lint/test_memory_admit.py` — the line on a shared admission.
+- `docs/as-built/nextest-width-and-lint-scope.md` — the line and its paths.
+
+**Gotchas:**
+- The test fixture keeps the real `run`, `run_once` and `run_step_attempt`. It replaces only admission and `buildlog_exec`, and it drops the command banner line.
+- Each run starts one more short Python process to read the load.
+
+**Ruled out:**
+- A timing comparison on a shared Mac: timing runs need a Mac with no interactive demo and the same power source. That is outside this code.

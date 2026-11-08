@@ -31,8 +31,6 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import TypedDict, cast
 
-if not __package__:
-    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.lib.user_zone import user_zone  # noqa: E402
 
 BUILDLOG = Path.home() / ".claude/scripts/buildlog/buildlog"

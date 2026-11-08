@@ -483,7 +483,7 @@ with (Path(os.environ["PACKAGE_ROOT"]) / "run-waits.jsonl").open("a") as output:
 
 RESERVATION_RACE_TOOL = '''import os, runpy, sys
 from pathlib import Path
-sys.path.insert(0, str(Path(os.environ["TEST_REAL_TARGETS"]).resolve().parents[2]))
+with open(Path(os.environ["TEST_REAL_TARGETS"]).resolve().parents[2] / "scripts/lib/package_root.py") as package_root: exec(package_root.read(), {"__file__": package_root.name})
 from scripts.mac_test import mac_test
 root = Path(os.environ["PACKAGE_ROOT"])
 if sys.argv[1] == "reserve" and not (root / "reservation-raced").exists():

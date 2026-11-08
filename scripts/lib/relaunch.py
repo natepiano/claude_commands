@@ -19,7 +19,6 @@ from pathlib import Path
 from types import FrameType
 from typing import NotRequired, TypedDict, cast
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.herdr import herdr
 from scripts.production import staff, worker
 from scripts.shutdown import pane_record

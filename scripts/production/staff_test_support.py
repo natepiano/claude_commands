@@ -41,9 +41,10 @@ def foreign_hostname() -> Generator[None]:
         startup = Path(directory) / "sitecustomize.py"
         _ = startup.write_text('import os, socket\nsocket.gethostname = lambda: os.environ.get("GATE_TEST_HOST", "gate-fixture")\n')
         pythonpath = os.pathsep.join((directory, os.environ.get("PYTHONPATH", "")))
-        from scripts.production import production_lifecycle, retire_unit, update_registration
+        from scripts.production import production_lifecycle, update_registration
+        from scripts.shutdown import shutdown
 
-        with (mock.patch.object(retire_unit, "local_machine", side_effect=lambda: remote.local_machine()),
+        with (mock.patch.object(shutdown, "local_machine", side_effect=lambda: remote.local_machine()),
               mock.patch.object(production_lifecycle, "local_machine", side_effect=lambda: remote.local_machine()),
               mock.patch.object(update_registration, "local_machine", side_effect=lambda: remote.local_machine()),
               mock.patch.object(socket, "gethostname", return_value="gate-fixture"),
@@ -467,7 +468,9 @@ def source_environment(source: Path) -> dict[str, str]:
 
 
 OWNER_CLI = """import os, runpy, sys
-sys.path.insert(0, os.environ['STAFF_TEST_CHECKOUT'])
+from pathlib import Path
+with open(Path(os.environ['STAFF_TEST_CHECKOUT']) / "scripts/lib/package_root.py") as package_root:
+    exec(package_root.read(), {"__file__": package_root.name})
 from scripts.production.staff_test_support import STAFF_SCRIPT, isolated_source_readers, observe_operation_lock
 observe_operation_lock()
 # Import platform-dependent Python support before selecting fake Mac transport.
@@ -548,7 +551,8 @@ def isolated_source_readers() -> Generator[None]:
 # canned response, so remote reads, writes, and error mapping must all agree.
 FAKE_SSH = """import json, os, runpy, shlex, sys
 from pathlib import Path
-sys.path.insert(0, os.environ['STAFF_TEST_CHECKOUT'])
+with open(Path(os.environ['STAFF_TEST_CHECKOUT']) / "scripts/lib/package_root.py") as package_root:
+    exec(package_root.read(), {"__file__": package_root.name})
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.production.staff_test_support import source_environment
 arguments = sys.argv[1:]
@@ -575,7 +579,6 @@ os.environ['STAFF_FILE'] = os.environ['STAFF_TEST_OWNER_FILE']
 source = Path(os.environ['STAFF_TEST_OWNER_SOURCE'])
 os.environ.update(source_environment(source))
 sys.platform = 'linux'
-sys.path.insert(0, os.environ['STAFF_TEST_CHECKOUT'])
 sys.argv = [os.environ['STAFF_TEST_SCRIPT'], *command[2:]]
 from scripts.production.staff_test_support import isolated_source_readers, observe_operation_lock
 from scripts.production import staff_sources
@@ -881,15 +884,21 @@ class StaffTestCase(unittest.TestCase):
         })
         return path
 
-    def worker_run(self, production_name: str, unit: str, director: str) -> Path:
-        """A unit run with state and director records."""
+    def worker_run(self, production_name: str, unit: str, director: str, *,
+                   passes: tuple[dict[str, object], ...] = (), director_run: bool = False) -> Path:
+        """Create private run evidence for a director and its worker passes."""
         run = Path(os.environ["ROSTER_RUN_ROOT"]) / f"{production_name}-{unit}"
         run.mkdir(parents=True, exist_ok=True)
         self.write_json(run / "progress_history_state.json", {
             "production": production_name, "unit": unit,
             "main_agent": {"family": "claude", "session_id": director},
+            "pass": {str(passed["worker_name"]): passed for passed in passes},
         })
         write_text_atomic(run / "director", director + "\n")
+        if director_run:
+            from scripts.lib import unit_runs
+
+            write_text_atomic(unit_runs.marker(director), str(run) + "\n")
         return run
 
     @contextmanager

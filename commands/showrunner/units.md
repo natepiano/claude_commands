@@ -8,7 +8,7 @@ Run this in the showrunner session. Run
 `"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/production/unit_phases.py"`
 and print its output exactly as it comes, with nothing added. It finds the
 production from this session's update timer. Print its total line too, when present.
-Both tables show only the production's staff units. **Status** is `paused` or `active`, including stopped units.
+Both tables show only the production's staff units. **Status** is `paused`, `exited`, or `active`.
 **Unit** is the unit's staff name, including stopped units and units without a session.
 
 For a production without `Kind: style`, the table is `| Unit | Status | Phase | Task |`:
@@ -60,17 +60,23 @@ Morty produces no anomaly when its thread matches `MORTY_NATIVE_ID` in `config/s
 The command sends one message with all anomaly lines to `UNIT_ANOMALIES_TO` in `config/production.conf` (`sdlc`).
 A failed send adds one anomaly line. It changes neither the table nor the exit code.
 
-Use `staff.py` to record a pause or resume:
+Use `agents` to pause, exit, or resume units:
 
-1. Run `~/.claude/scripts/lib/py ~/.claude/scripts/production/staff.py pause <unit> --why "<why>"` for one unit.
-2. Use `pause --production <showrunner name> [--except <unit>...] --why "<why>"` for a production.
-3. Use `resume <unit>` or `resume --production <showrunner name>` to remove the pause record.
+1. Run `agents pause <unit> --why "<why>"` to stop its workers and hold its director at the prompt.
+2. Run `agents exit <unit> --why "<why>"` to stop the director and its workers.
+3. Add `--finish-step` to wait for the workers' current tasks before either action.
+4. Run `agents pause --production <showrunner> [--except <unit> ...] --why "<why>"` to pause selected units.
+5. Run `agents resume <unit>` or `agents resume --production <showrunner>` to resume units.
 
-Each `--except` accepts a unit's staff name, its `-unit` form, or its staff id within that production.
-An unmatched value refuses the whole command before any row changes.
-The refusal names the value and the production. A unit of another production does not match.
-
-A pause records its time, caller and reason in the staff row. It stops nothing. Both commands are safe to repeat.
+Each `--except` accepts a staff name, its `-unit` form, or a staff id within that production.
+An unmatched value refuses the command before any row changes.
+The refusal names the value and the production.
+Pause and exit record the time, caller, and reason in the staff row.
+A pause lets the director finish its current turn. It starts no new work.
+An exit preserves the staff rows, tabs, and shells.
+Resume removes the record. A paused director receives one continuation message.
+An exited director starts on its configured role account.
+Stop does not save or restore composer drafts.
 
 The command reads process identities, terminal metadata, run records, decision files and read-only style ledgers.
 It never reads pane contents. Missing ledgers or tables supply no data. Report a non-zero exit as one error line.

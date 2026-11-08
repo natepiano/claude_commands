@@ -472,7 +472,6 @@ else:
     with open(filename, "rb") as script:
         source = script.read()
     sys.argv = arguments
-    sys.path.insert(0, os.path.dirname(os.path.abspath(filename)))
 module = types.ModuleType("__main__")
 module.__file__ = filename
 sys.modules["__main__"] = module
@@ -851,7 +850,7 @@ except (OSError, ValueError):
     sys.exit(2)
 print(",".join(features))
 if len(sys.argv) > 2 and sys.argv[2] in ("test", "final"):
-    sys.path.insert(0, str(Path(sys.argv[3]).resolve().parents[2]))
+    with open(Path(sys.argv[3]).resolve().parents[2] / "scripts/lib/package_root.py") as package_root: exec(package_root.read(), {"__file__": package_root.name})
     from scripts.direct.result_environment import read_policy
     policy = read_policy()
     print(" ".join(policy.forwarded_names))
@@ -1395,7 +1394,7 @@ import sys
 from uuid import UUID
 
 kind, payload, board_name, hold_name, recorder, repository = sys.argv[1:]
-sys.path.insert(0, str(Path(recorder).resolve().parents[2]))
+with open(Path(recorder).resolve().parents[2] / "scripts/lib/package_root.py") as package_root: exec(package_root.read(), {"__file__": package_root.name})
 
 
 def text(value):
@@ -1829,7 +1828,7 @@ doc_tree() {
     VERIFY_PY_HELPER=DOC_TREE_PY "$PY" - "$BUILD_FOLDERS_SCRIPT" <<'PYDOC'
 from pathlib import Path
 import sys
-sys.path.insert(0, str(Path(sys.argv[1]).resolve().parents[2]))
+with open(Path(sys.argv[1]).resolve().parents[2] / "scripts/lib/package_root.py") as package_root: exec(package_root.read(), {"__file__": package_root.name})
 from scripts.copies import copies
 print(copies.staged_tree(Path.cwd()))
 PYDOC
@@ -2096,7 +2095,6 @@ with open(3, "rb") as handoff:
             name, value = entry.split(b"=", 1)
             os.environb[name] = value
 sys.argv = sys.argv[1:]
-sys.path.insert(0, os.path.dirname(os.path.abspath(sys.argv[0])))
 runpy.run_path(sys.argv[0], run_name="__main__")
 '
     (
@@ -3553,7 +3551,7 @@ command = sys.argv[3:]
 def shell_status(status: int) -> int:
     return status if status >= 0 else 128 - status
 
-sys.path.insert(0, str(Path(os.environ["VERIFY_PROCESS_GROUP_LIB"]).resolve().parents[1]))
+with open(Path(os.environ["VERIFY_PROCESS_GROUP_LIB"]) / "package_root.py") as package_root: exec(package_root.read(), {"__file__": package_root.name})
 from scripts.lib.process_start import Started, process_start, process_start_format
 
 def identity(pid):
@@ -4248,9 +4246,10 @@ case "$CMD" in
     final)
         if [[ -n "$PINNED_TARGET" || "$MAC_ONLY" == 1 || "$LOCAL_ONLY" == 1 ]]; then
             VERIFY_PY_HELPER=FINAL_CLEAN_TREE_PY "$PY" -c '
+from pathlib import Path
 import sys
-sys.path.insert(0, sys.argv[1])
-from final_pass import clean_tree
+with open(Path(sys.argv[1]).resolve().parent / "lib/package_root.py") as package_root: exec(package_root.read(), {"__file__": package_root.name})
+from scripts.direct.final_pass import clean_tree
 clean_tree()
 ' "${FINAL_PASS_SCRIPT%/*}" || exit 2
         fi

@@ -135,8 +135,11 @@ Keep every busy or unknown worker unchanged.
 The transcript records prompt submission and the matching `DONE <dispatch id>` reply.
 Only exit 0 completes a pass.
 Exit 2 means refused.
-Exit 3 means no DONE reply. Exit 4 means blocked. Exit 5 means stalled.
-Exit 6 means busy. Exit 7 means retained. Exit 8 means uncertain.
+Exit 3 means no DONE reply. Exit 5 means stalled.
+Exit 4 means the worker asks a question or is blocked.
+Read `question: <worker> pane <pane>` and the question text.
+Run `worker.py answer <name> --text "<answer>"`, then rerun the worker's saved launcher command.
+Exit 6 means busy before submission. Exit 7 means retained. Exit 8 means uncertain.
 After an incomplete pass, inspect the named pane and rerun the saved launcher command before another role's dispatch.
 A rerun never types a prompt that the transcript records. It reads the transcript and waits for the worker.
 So when a turn ended with no DONE line, a rerun alone returns exit 3 (`NO_DONE`) again. Recover in this order:

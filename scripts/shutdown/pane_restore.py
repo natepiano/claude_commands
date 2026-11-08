@@ -97,6 +97,8 @@ def restore(session: str, *, dry_run: bool) -> int:
                 if row is not None:
                     with herdr.restore_staff(current):
                         _ = restart.start_row(row, current, client, target_account=target_accounts.get(holder.id, ""))
+        except restart.ClaudeTrustWriteFailed:
+            failures += 1
         except (herdr.HerdrFailure, OSError, ValueError, staff.StaffRefused) as error:
             failures += 1
             print(f"{holder.name}: not resumed: {error}", file=sys.stderr)

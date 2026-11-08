@@ -33,7 +33,6 @@ from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, NoReturn, NotRequired, NamedTuple, Protocol, TextIO, TypedDict, cast, final
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.accounts.role_map import is_role_map_host, role_map_command, RoleMapUnavailable, RoleAccountUnavailable  # noqa: E402
 from scripts.direct.worker_state import ROSTER_LIVE
 from scripts.direct import assign_gate, plan_history, progress_history

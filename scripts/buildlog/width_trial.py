@@ -12,7 +12,6 @@ import hashlib
 import json
 import random
 import sqlite3
-import sys
 from collections import Counter, defaultdict
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
@@ -21,12 +20,11 @@ from pathlib import Path
 from statistics import fmean, median
 from typing import Literal, NamedTuple, TypedDict, cast
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lint"))
 
 from scripts.buildlog import store
 from scripts.buildlog import index as buildlog_index
+from scripts.buildlog.step_outputs import indexed_argv
 from scripts.lint.memory_admit import expected_peak, git_identity, test_threads, read_memory_config
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
 from scripts.lib.user_zone import user_zone  # noqa: E402
 
 BLOCK_S = 6000
@@ -101,23 +99,6 @@ def _epoch(stamp: object) -> float:
     return parsed.timestamp()
 
 
-def _argv(value: object) -> list[str]:
-    if not isinstance(value, str):
-        return []
-    try:
-        decoded = cast(object, json.loads(value))
-    except (TypeError, ValueError):
-        return []
-    if not isinstance(decoded, list):
-        return []
-    arguments: list[str] = []
-    for item in cast(list[object], decoded):
-        if not isinstance(item, str):
-            return []
-        arguments.append(item)
-    return arguments
-
-
 def _filter_expression(argv: list[str]) -> str | None:
     for index, argument in enumerate(argv[:-1]):
         if argument == "-E":
@@ -153,7 +134,7 @@ def load_steps(index: Path, since: float, until: float, host: str) -> list[Step]
         request = _epoch(started_at) - wait
         if not since <= request < until:
             continue
-        argv = _argv(raw_argv)
+        argv = indexed_argv(raw_argv)
         duration = float(duration_s) if isinstance(duration_s, (int, float)) else None
         finished = float(finished_s) if isinstance(finished_s, (int, float)) else None
         steps.append({
@@ -358,7 +339,7 @@ def _test_timeouts(index: Path, step_ids: set[str]) -> int:
 
 
 def _uses_memory_gate(step_name: object, raw_argv: object) -> bool:
-    argv = _argv(raw_argv)
+    argv = indexed_argv(raw_argv)
     if step_name == "sweep" and any(argument.endswith("/sweep.py") for argument in argv):
         return False
     if argv and argv[0] == "taplo":

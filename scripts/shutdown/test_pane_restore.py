@@ -370,6 +370,18 @@ class PaneRestoreTests(unittest.TestCase):
                 self.assertEqual(start.call_args.kwargs["target_account"], accounts.CodexWorkersAccount(label, saved))
                 numbered.assert_not_called()
 
+    def test_failed_trust_write_reports_once_and_keeps_restore_failed(self) -> None:
+        self.entry()
+        target = self.config / ".claude.json"
+        write_text_atomic(target, "invalid JSON")
+        client = self.restored()
+        code, output = self.run_restore(client)
+        self.assertEqual(code, 1)
+        self.assertEqual(output.splitlines(), [f"/work/alpha: trust anomaly: {target}: JSONDecodeError"])
+        self.assertEqual(client.started, [])
+        self.assertEqual(client.closed, [])
+        self.assertEqual(self.opened, [])
+
     def test_restore_of_a_unit_uses_the_saved_account(self) -> None:
         self.row = replace(self.row, kind="unit")
         record = staff.StaffSnapshot((self.row,))

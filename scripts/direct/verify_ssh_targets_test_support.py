@@ -47,6 +47,29 @@ class CompletedMemoryHook(TypedDict):
     attempts: int
 
 
+ADMISSION_BEFORE_RETRY = r'''
+import os
+from pathlib import Path
+import sys
+
+with open(Path(os.environ["TEST_SOURCE_REPO"]) / "scripts/lib/package_root.py") as package_root:
+    exec(package_root.read(), {"__file__": package_root.name})
+from scripts.build_queue import admission_client
+from scripts.build_queue.system_clock import SystemClock
+
+
+class AdmissionBeforeRetryClock(SystemClock):
+    """Keep admission before the first retry deadline during a result check."""
+
+    def monotonic(self) -> float:
+        return 0.0
+
+
+admission_client.CLOCK = AdmissionBeforeRetryClock()
+raise SystemExit(admission_client.main(sys.argv[2:]))
+'''
+
+
 OBSERVE_MEMORY_HOOK = r'''
 import json
 import os
@@ -55,7 +78,7 @@ import sys
 from unittest import mock
 
 source = Path(os.environ["TEST_SOURCE_REPO"])
-sys.path.insert(0, str(source))
+with open(source / "scripts/lib/package_root.py") as package_root: exec(package_root.read(), {"__file__": package_root.name})
 from scripts.build_queue import admission_client
 from scripts.lib.atomic_file import write_text_atomic
 
@@ -96,17 +119,13 @@ import os
 from pathlib import Path
 import subprocess
 import shlex
-import sys
 import time
 from contextlib import nullcontext, redirect_stdout
 from unittest import mock
 
 source = Path(os.environ["TEST_SOURCE_REPO"])
-sys.path.insert(0, str(source))
-for name in ("mac_test", "build_targets", "build_hold", "buildlog", "lint", "lib"):
-    sys.path.insert(0, str(source / "scripts" / name))
-import offload
-import mac_test
+with open(source / "scripts/lib/package_root.py") as package_root: exec(package_root.read(), {"__file__": package_root.name})
+from scripts.mac_test import offload, mac_test
 
 args = offload.parser().parse_args(namespace=offload.CliArguments())
 request = offload.request_from_arguments(args)
@@ -193,7 +212,7 @@ def stream(arguments):
         generation = "fixture-generation" if mode == "interrupted" else "old-generation"
         wire, status = "aws_interrupted=" + generation + "\n", 255
     elif mode == "runner-sigterm":
-        import linux_runner
+        from scripts.mac_test import linux_runner
         from scripts.aws_target.runner_test_support import interrupt_runner, seed_runner_permission
 
         now = int(time.time())
@@ -356,6 +375,16 @@ source() {
         self.memory_hook_observer = observe
         observer = self.root / "observe-memory-hook.py"
         self.write_executable(observer, OBSERVE_MEMORY_HOOK)
+        self.install_admission_client(observer)
+        os.mkfifo(self.runner_state / "memory-hook-ack")
+
+    def control_admission_clock(self) -> None:
+        """Keep local admission ahead of retry passes in result checks."""
+        script = self.root / "admission-before-retry.py"
+        self.write_executable(script, ADMISSION_BEFORE_RETRY)
+        self.install_admission_client(script)
+
+    def install_admission_client(self, script: Path) -> None:
         library = self.home / ".claude/scripts/lib"
         if library.is_symlink():
             library.unlink()
@@ -368,8 +397,7 @@ source() {
                 (library / source.name).symlink_to(source)
         self.write_executable(library / "py", '#!/bin/sh\n'
             + 'case "${1:-}" in */admission_client.py)\n'
-            + f'  exec "{REPOSITORY}/scripts/lib/py" "{observer}" "$@" ;;\nesac\n' + launcher)
-        os.mkfifo(self.runner_state / "memory-hook-ack")
+            + f'  exec "{REPOSITORY}/scripts/lib/py" "{script}" "$@" ;;\nesac\n' + launcher)
 
     @override
     def verify(self, *arguments: str, extra: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
@@ -417,7 +445,6 @@ source() {
 
 
 RUN_BUILD_TARGETS = r'''
-sys.path.insert(0, str(source / "scripts/build_targets"))
 status = 0
 try:
     runpy.run_path(str(source / "scripts/build_targets/build_targets.py"), run_name="__main__")

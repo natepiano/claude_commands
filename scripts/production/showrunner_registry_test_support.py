@@ -1,6 +1,5 @@
 """One scratch showrunner registry for tests whose code reaches `registered_showrunners`."""
 
-import sys
 import os
 from contextlib import ExitStack, contextmanager
 from collections.abc import Generator
@@ -8,7 +7,6 @@ from pathlib import Path
 from typing import cast
 from unittest.mock import patch
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.production import showrunners
 
 

@@ -51,10 +51,31 @@ def setUpModule() -> None:
     _ = unittest.enterModuleContext(fake_cargo_output_roots())
 
 
+class ImportTests(unittest.TestCase):
+    def test_tmp_sweep_import_omits_unused_modules(self) -> None:
+        omitted = ("scripts.production.session_staff", "scripts.production.staff")
+        with tempfile.TemporaryDirectory() as directory:
+            environment = {**os.environ, "BUILDLOG_DIR": directory}
+            result = subprocess.run(
+                [sys.executable, "-c", "import sys; from scripts.lint import tmp_sweep; "
+                 + f"assert not set({omitted!r}).intersection(sys.modules)"],
+                cwd=Path(__file__).resolve().parents[2], env=environment,
+                capture_output=True, text=True, timeout=test_hang_guard.TEST_HANG_GUARD_SECS, check=False,
+            )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+
 def write(path: Path, text: str = "x" * 4096) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     _ = path.write_text(text)
     return path
+
+
+def remove_marker(path: Path) -> None:
+    if path.is_dir():
+        path.rmdir()
+    else:
+        path.unlink()
 
 
 def fake_process(proc: Path, pid: int, *, cwd: str = "/", fds: tuple[str, ...] = (), maps: str = "") -> None:
@@ -133,6 +154,12 @@ class TmpSweepCase(unittest.TestCase):
     def roots(self) -> tmp_sweep.Roots:
         return tmp_sweep.default_roots(str(self.tmp), (str(self.delegate), str(self.unit)), (str(self.session_root),), (),
                                        (str(self.tmp / "scratch"),), (), (str(self.tmp / "session"),))
+
+    def run_owner(self, run: Path, session: str) -> staff.StaffRow:
+        owner = fixture_member("showrunner", name="sweep")
+        unit = fixture_member("unit", name=run.name, parent=owner.id, runtime_id=session)
+        _ = write(run / "progress_history_state.json", json.dumps({unit_runs.OWNER_FIELD: unit.id}))
+        return unit
 
     def unreadable_sessions(self) -> None:
         self.live = None
@@ -921,10 +948,8 @@ class OwnerTests(TmpSweepCase):
         self.now: float = time.time() + 8 * DAY
         live = write(self.unit / "live" / "board.log").parent
         ended = write(self.delegate / "ended" / "board.log").parent
-        owner = fixture_member("showrunner", name="sweep")
         for run, session in ((live, LIVE_SESSION), (ended, ENDED_SESSION)):
-            unit = fixture_member("unit", name=run.name, parent=owner.id, runtime_id=session)
-            _ = write(run / "progress_history_state.json", json.dumps({"owner_staff_id": unit.id}))
+            _ = self.run_owner(run, session)
         unowned = write(self.unit / "unowned" / "board.log").parent
         result = self.sweep()
         self.assertTrue(live.is_dir())
@@ -944,13 +969,78 @@ class OwnerTests(TmpSweepCase):
         self.assertEqual(sorted(result.kept[tmp_sweep.RunKeepReason.ACTIVE_MARKER.value]),
                          sorted([str(marked), str(ended)]))
 
+    def test_an_empty_roster_lock_does_not_keep_idle_runs(self) -> None:
+        self.now = time.time() + 8 * DAY
+        marked = write(self.unit / "marked" / "board.log").parent
+        idle = write(self.delegate / "idle" / "board.log").parent
+        _ = write(self.unit / "active" / LIVE_SESSION, f"{marked}\n")
+        _ = write(self.unit / "active" / "mesh_roster.json.lock", "")
+        result = self.sweep()
+        self.assertTrue(marked.is_dir())
+        self.assertEqual(result.kept[tmp_sweep.RunKeepReason.ACTIVE_MARKER.value], [str(marked)])
+        self.assertFalse(idle.exists())
+        self.assertIn(str(idle), [entry["path"] for entry in result.deleted])
+
+    def test_a_good_marker_keeps_its_reason_when_another_marker_is_bad(self) -> None:
+        self.now = time.time() + 8 * DAY
+        run = write(self.unit / "marked" / "board.log").parent
+        _ = self.run_owner(run, ENDED_SESSION)
+        _ = write(self.unit / "active" / ENDED_SESSION, f"{run}\n")
+        _ = write(self.delegate / "active" / ENDED_SESSION, "")
+        result = self.sweep()
+        self.assertTrue((run / "board.log").is_file())
+        self.assertEqual(result.kept[tmp_sweep.RunKeepReason.ACTIVE_MARKER.value], [str(run)])
+        self.assertNotIn(str(run), result.kept.get(tmp_sweep.RunKeepReason.UNREADABLE_RECORD.value, []))
+
+    def test_a_bad_marker_keeps_only_its_directors_run(self) -> None:
+        self.now = time.time() + 8 * DAY
+        _ = self.run_owner(self.unit / "owned", ENDED_SESSION)
+        active = self.unit / "active"
+        active.mkdir()
+        marker = active / ENDED_SESSION
+        contents = {"empty": b"", "relative": b"relative/path", "invalid-utf8": b"\xff\n",
+                    "nul-byte": b"/bad\x00path\n"}
+        for kind in (*contents, "directory", "broken-link"):
+            with self.subTest(marker=kind):
+                run = write(self.unit / "owned" / "board.log").parent
+                other = write(self.delegate / "other" / "board.log").parent
+                if kind == "directory":
+                    marker.mkdir()
+                elif kind == "broken-link":
+                    marker.symlink_to(self.tmp / "missing-marker")
+                else:
+                    _ = marker.write_bytes(contents[kind])
+                result = self.sweep()
+                self.assertTrue((run / "board.log").is_file())
+                self.assertEqual(result.kept[tmp_sweep.RunKeepReason.UNREADABLE_RECORD.value], [str(run)])
+                self.assertFalse(other.exists())
+                self.assertIn(str(other), [entry["path"] for entry in result.deleted])
+                remove_marker(marker)
+
+    def test_a_broken_marker_folder_keeps_only_run_folders(self) -> None:
+        self.now = time.time() + 8 * DAY
+        runs = [write(root / "idle" / "board.log").parent for root in (self.unit, self.delegate)]
+        files = [write(self.unit / "wo.json"), write(self.delegate / ".scratch.json")]
+        (self.unit / "active").symlink_to(self.tmp / "missing-markers", target_is_directory=True)
+        with mock.patch.object(tmp_sweep, "record_object", wraps=tmp_sweep.record_object) as reads:
+            result = self.sweep()
+        self.assertEqual(sorted(result.kept[tmp_sweep.RunKeepReason.UNREADABLE_RECORD.value]),
+                         sorted(str(run) for run in runs))
+        for run in runs:
+            self.assertTrue((run / "board.log").is_file())
+            self.assertIn(mock.call(run / "mesh_roster.json"), reads.call_args_list)
+        for file in files:
+            self.assertFalse(file.exists())
+            self.assertIn(str(file), [entry["path"] for entry in result.deleted])
+            self.assertNotIn(mock.call(file / "mesh_roster.json"), reads.call_args_list)
+        self.assertFalse(any("Not a directory" in reason for reason in result.kept))
+
     def test_a_run_folder_whose_history_opens_with_a_live_session_stays(self) -> None:
         self.now = time.time() + 8 * DAY
         history = self.tmp.parent / "history"
         runs = {LIVE_SESSION: self.unit / "started", ENDED_SESSION: self.unit / "started-ended"}
-        owner = fixture_member("showrunner", name="sweep")
         for session, run in runs.items():
-            unit = fixture_member("unit", name=run.name, parent=owner.id, runtime_id=session)
+            unit = self.run_owner(run, session)
             log = write(history / f"{run.name}.jsonl", json.dumps(
                 {"event_type": "run_started", "main_agent": {"session_id": session}}) + "\n")
             _ = write(run / "progress_history_state.json", json.dumps({"owner_staff_id": unit.id, "history_file": str(log)}))
@@ -1155,6 +1245,7 @@ class RunFolderTests(TmpSweepCase):
                 payload = write(self.unit / name / "tmp" / "old" / "file")
                 run = payload.parents[2]
                 if name == "marker":
+                    _ = self.run_owner(run, ENDED_SESSION)
                     broken = self.unit / "active" / ENDED_SESSION
                     broken.mkdir(parents=True)
                 elif name == "history":
@@ -1168,10 +1259,7 @@ class RunFolderTests(TmpSweepCase):
                 result = self.sweep()
                 self.assertTrue(payload.is_file())
                 self.assertIn(str(run), result.kept[tmp_sweep.RunKeepReason.UNREADABLE_RECORD.value])
-                if broken.is_dir():
-                    broken.rmdir()
-                else:
-                    broken.unlink()
+                remove_marker(broken)
 
     def test_an_ended_idle_run_is_still_removed(self) -> None:
         for root in (self.unit, self.delegate):

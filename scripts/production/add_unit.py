@@ -463,7 +463,7 @@ def _is_excluded_standing_plan(production: Production, plan: Path) -> bool:
 
 def preflight(request: RequestedUnitLaunch, selected: ClaudeLaunchAccount, *,
               record: staff.StaffSnapshot | None = None) -> ReadyToLaunch:
-    from scripts.herdr.herdr import Untrusted, UnreadableTrustFile, claude_trust, repository_trust_key
+    del selected
 
     handoff: NoSessionHandoff | RunningSessionHandoff = NoSessionHandoff()
     resuming_opening = False
@@ -518,15 +518,6 @@ def preflight(request: RequestedUnitLaunch, selected: ClaudeLaunchAccount, *,
     )
     if launch.worktree.exists():
         git_exclude.require_untracked_ignored(launch.worktree, ".unit.toml", planned_pattern="/.unit.toml")
-    account = selected
-    account_file = account.dir / ".claude.json"
-    folder = request.session_cwd
-    check_folder = (repository_trust_key(production.checkout)
-                    if isinstance(request.session, NewSession) and not folder.exists() else folder)
-    trust = claude_trust(check_folder, account_file)
-    if isinstance(trust, (Untrusted, UnreadableTrustFile)):
-        reason = str(trust) if isinstance(trust, UnreadableTrustFile) else f"Claude has not trusted {check_folder}"
-        print(f"{request.unit}: trust anomaly: {reason}", file=sys.stderr)
     plan_transition: NoPlanTransition | BriefToPlanTransition = NoPlanTransition()
     if isinstance(existing, ExistingUnitRow):
         mode = recorded_mode(launch, existing.plan)
@@ -1253,7 +1244,7 @@ def ensure_staff_unit(production: Production, unit: str, *,
                       worktree: staff.PresentWorktree | staff.WorktreeUnfilled = staff.WORKTREE_UNFILLED,
                       runtime_id: str = "",
                       record: staff.StaffSnapshot | None = None) -> staff.StaffRow:
-    """Admit a unit with its location; only resume_unit reactivates a removed row."""
+    """Admit a unit with its location; only agents resume --retired reactivates a removed row."""
     record = staff.initial_snapshot() if record is None else record
     found = checked_unit_member(production, unit, record,
                                 identity=session_staff.LiveSession(runtime_id) if runtime_id else session_staff.NO_SESSION)
@@ -1382,6 +1373,8 @@ def _main(argv: list[str]) -> int:
                     outcome = recovered
                 if isinstance(recovered, herdr.PromptNotSubmitted):
                     raise Refusal(f"{request.identity.unit}: opening prompt not submitted: {recovered.reason}")
+            if isinstance(outcome, herdr.ClaudeTrustNotWritten):
+                return 1
             if isinstance(outcome, herdr.PromptNotSubmitted) and isinstance(labeled_session, NoLabeledSession):
                 if isinstance(handoff, StoppedSessionHandoff):
                     raise Refusal(f"ATTACH UNPROVEN for {handoff.session_id}: opening prompt not submitted: {outcome.reason}")

@@ -15,7 +15,6 @@ from pathlib import Path
 from typing import cast, override
 from unittest import mock
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.production import staff
 from scripts.production.staff_test_support import StaffTestCase, fixture_member, fixture_worker, fixture_runtime_id
 from scripts.astra import astra_roles  # noqa: E402
