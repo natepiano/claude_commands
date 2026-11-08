@@ -8,9 +8,13 @@ import math
 import json
 import os
 import signal
+import sys
 import tempfile
 import time
-from contextlib import redirect_stderr, redirect_stdout
+from contextlib import contextmanager, redirect_stderr, redirect_stdout
+from collections.abc import Generator
+from concurrent.futures import ThreadPoolExecutor
+from threading import Event
 from pathlib import Path
 from typing import Literal, cast, override
 from dataclasses import replace
@@ -59,6 +63,77 @@ class RestartTestCase(ShutdownTestCase):
         _ = self.enterContext(patch.object(accounts, "role_account", side_effect=role_account))
         _ = self.enterContext(patch.object(herdr.Herdr, "result", return_value={
             "panes": [], "tabs": [], "workspaces": []}))
+
+
+class ClaudeLaunchTrustTests(RestartTestCase):
+    def test_concurrent_claude_launches_keep_both_repository_trust_keys(self) -> None:
+        account = Path.home() / "account"
+        account.mkdir()
+        target = account / ".claude.json"
+        write_text_atomic(target, "{}")
+        folders = (Path.home() / "first-folder", Path.home() / "second-folder")
+        for folder in folders:
+            folder.mkdir()
+        first_at_write, second_attempt, first_written = Event(), Event(), Event()
+        read_text = Path.read_text
+        lock_config = accounts.claude_config_lock
+
+        def read(path: Path, encoding: str | None = None, errors: str | None = None) -> str:
+            text = read_text(path, encoding=encoding, errors=errors)
+            if path == target and first_at_write.is_set():
+                second_attempt.set()
+            return text
+
+        @contextmanager
+        def lock(path: Path) -> Generator[None]:
+            if first_at_write.is_set():
+                second_attempt.set()
+            with lock_config(path):
+                yield
+
+        def publish(path: Path, text: str, *, new_file_mode: int | None = None) -> None:
+            if not first_at_write.is_set():
+                first_at_write.set()
+                self.assertTrue(second_attempt.wait(5), "second writer did not attempt the account update")
+                write_text_atomic(path, text, new_file_mode=new_file_mode)
+                first_written.set()
+            else:
+                self.assertTrue(first_written.wait(5), "first writer did not publish its account update")
+                write_text_atomic(path, text, new_file_mode=new_file_mode)
+
+        with (patch.object(Path, "read_text", read),
+              patch.object(accounts, "claude_config_lock", lock),
+              patch.object(herdr, "write_text_atomic", publish),
+              ThreadPoolExecutor(max_workers=2) as writers):
+            first = writers.submit(herdr.trust_claude_launch, folders[0], account)
+            self.assertTrue(first_at_write.wait(5), "first writer did not reach publication")
+            second = writers.submit(herdr.trust_claude_launch, folders[1], account)
+            first.result(timeout=10)
+            second.result(timeout=10)
+        settings = cast(dict[str, dict[str, dict[str, bool]]], json.loads(target.read_text()))
+        self.assertEqual(settings["projects"], {
+            str(folder.resolve()): {"hasTrustDialogAccepted": True} for folder in folders})
+
+    def test_claude_launch_without_config_dir_writes_the_home_account_file(self) -> None:
+        folder = Path.home() / "launch-folder"
+        folder.mkdir()
+        target = Path.home() / ".claude.json"
+        prepared = herdr.PreparedAgentEnvironment(folder, {})
+
+        def start(*_args: object, **_kwargs: object) -> herdr.PromptSubmissionNotRequired:
+            self.assertTrue(target.is_file(), "legacy account trust must exist before the start")
+            settings = cast(dict[str, dict[str, dict[str, bool]]], json.loads(target.read_text()))
+            self.assertTrue(settings["projects"][str(folder.resolve())]["hasTrustDialogAccepted"])
+            return herdr.PromptSubmissionNotRequired()
+
+        with (patch.object(herdr, "open_tab", return_value="w1:p1"),
+              patch.object(herdr.Herdr, "run_in_pane"),
+              patch.object(herdr, "start_agent", side_effect=start) as started):
+            result = herdr.launch_prepared_agent("agents", herdr.NewTab("workers", "worker"),
+                prepared, "claude", [], herdr.NoOpeningPrompt(), 5000, agent="worker")
+        self.assertIsInstance(result.outcome, herdr.PromptSubmissionNotRequired)
+        started.assert_called_once()
+        self.assertFalse((Path.home() / ".claude/.claude.json").exists())
 
 
 class CodexSnapshotTests(RestartTestCase):
@@ -913,9 +988,6 @@ class RestartTests(RestartTestCase):
                   patch.object(restart, "named_account_environment", return_value=environment) as account,
                   patch.object(restart, "session_launch", return_value=("claude", {"CLAUDE_CONFIG_DIR": str(source)},
                       ["--resume", str(self.rows[0].current_session), "--name", self.rows[0].name])),
-                  patch("scripts.accounts.accounts.trust_sources", return_value=[("claude3", source / ".claude.json")]) as sources,
-                  patch.object(herdr, "heal_claude_trust", return_value=herdr.TrustCopied(self.root,
-                      target / ".claude.json", "claude3")) as trust,
                   patch.object(herdr, "prepare_session_environment",
                       return_value=herdr.PreparedAgentEnvironment(self.root, environment)) as prepare,
                   patch("scripts.accounts.accounts.account_dir", return_value=target)):
@@ -927,9 +999,6 @@ class RestartTests(RestartTestCase):
             else:
                 selection.assert_called_once_with("unit")
             account.assert_called_once_with(target)
-            sources.assert_called_once_with(target, source)
-            trust.assert_called_once_with(self.root, target / ".claude.json",
-                                          [("claude3", source / ".claude.json")], dry_run=False)
             prepare.assert_called_once_with(str(self.rows[0].current_session), str(self.root),
                                             environment, herdr.NO_ENVIRONMENT_REMOVALS)
             self.assertEqual(pane, "w1:p0")
@@ -1182,6 +1251,24 @@ class RestartTests(RestartTestCase):
             self.assertEqual(restart.restart(only=(str(self.rows[0].id),)), 0)
         self.assertEqual(shutdown_record.read(), [str(self.rows[1].id), other])
 
+    def test_failed_trust_write_keeps_the_pending_restart_and_reports_once(self) -> None:
+        self.running.clear()
+        row = self.rows[0]
+        shutdown_record.save([str(row.id)])
+        reason = f"{self.root}: trust anomaly: {self.root / '.claude2/.claude.json'}: PermissionError"
+
+        def launch(*_args: object, **_kwargs: object) -> herdr.AgentLaunched:
+            print(reason, file=sys.stderr)
+            return herdr.AgentLaunched("", herdr.ClaudeTrustNotWritten(reason))
+
+        with (patch.object(herdr, "launch_prepared_agent", side_effect=launch),
+              redirect_stderr(io.StringIO()) as errors):
+            result = restart.restart()
+        self.assertEqual(result, 1)
+        self.assertEqual(shutdown_record.read(), [str(row.id)])
+        self.assertEqual(errors.getvalue().splitlines(), [reason])
+        self.assertEqual(self.launches, [])
+
     def test_started_row_leaves_pending_when_layout_save_fails(self) -> None:
         self.running.clear()
         shutdown_record.save([str(self.rows[0].id)])
@@ -1394,6 +1481,65 @@ class RestartTests(RestartTestCase):
         self.assertEqual([name for name, _ in self.launches], [self.rows[0].name])
         self.assertEqual(shutdown_record.read(), ["missing-row"])
         self.assertIn("missing-row: restart anomaly: in the restart record, no fixed staff id", errors.getvalue())
+
+    def test_stop_all_saves_each_row_before_stop_and_starts_nothing(self) -> None:
+        def stop(identity: str, *, deadline: float = math.inf) -> stop_resume.Stopped:
+            row = next(row for row in self.rows if row.current_session == identity)
+            self.assertIn(str(row.id), shutdown_record.read())
+            return self.stop(identity, deadline=deadline)
+
+        with patch.object(stop_resume, "stop", side_effect=stop):
+            self.assertEqual(shutdown.main(["stop", "--all"]), 0)
+        self.assertEqual(shutdown_record.read(), [str(row.id) for row in self.rows])
+        self.assertEqual(self.stops, [str(row.id) for row in self.rows])
+        self.assertEqual(self.launches, [])
+
+    def test_stop_all_keeps_a_freestanding_agent_for_its_saved_tab(self) -> None:
+        row = replace(self.rows[0], kind="agent", name="TEST-agent", worktree=staff.WORKTREE_UNFILLED)
+        self.rows = (row,)
+        record = staff.StaffSnapshot(self.rows)
+        with patch.object(staff, "initial_snapshot", return_value=record):
+            self.assertEqual(shutdown.main(["stop", "--all"]), 0)
+            self.assertEqual(shutdown_record.read(), [str(row.id)])
+            self.assertEqual(self.launches, [])
+            self.assertEqual(restart.restart(), 0)
+        self.assertEqual(self.stops, [str(row.id)])
+        self.assertEqual(self.launches, [(row.name, herdr.NewTab("saved", row.name))])
+        self.assertEqual(shutdown_record.read(), [])
+
+    def test_stop_all_dry_run_saves_nothing_and_names_each_row_once(self) -> None:
+        with redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(shutdown.main(["stop", "--all", "--dry-run"]), 0)
+        self.assertEqual(output.getvalue().splitlines(), [
+            f"{row.name}: {row.id}, {row.kind}, workspace live, tab {n + 1} ({row.name}); would stop and save"
+            for n, row in enumerate(self.rows)])
+        self.assertFalse(shutdown_record.record_path().exists())
+        self.assertEqual((self.stops, self.launches), ([], []))
+
+    def test_live_rows_proves_a_codex_resume_without_an_open_rollout_from_its_pane(self) -> None:
+        row = replace(self.rows[0], kind="agent", name="TEST-brain", worktree=staff.WORKTREE_UNFILLED)
+        self.rows = (row,)
+        self.running.clear()
+        pane = {"pane_id": "w1:p0", "workspace_id": "w1", "tab_id": "w1:t0",
+                "terminal_id": "terminal-0", "agent": "codex"}
+        result = self.layout_result
+
+        def layout(*arguments: str) -> dict[str, object]:
+            if arguments == ("pane", "list"):
+                return {"panes": [pane]}
+            if arguments[:2] == ("pane", "process-info"):
+                return {"process_info": {"shell_pid": 990090, "foreground_process_group_id": 990100,
+                    "foreground_processes": [{"pid": 990100, "argv": ["codex", "resume", str(row.current_session)]}]}}
+            return result(*arguments)
+
+        with (patch.object(herdr, "codex_conversations", return_value=herdr.CodexConversations(
+                    {}, ("TEST-brain (Codex thread unknown)",))),
+              patch.object(herdr.Herdr, "result", side_effect=layout),
+              patch.object(herdr, "native_process", return_value=herdr.NativeAgentProcess(
+                    herdr.LaunchArgument(str(row.current_session)), "fixture-start", {})),
+              redirect_stderr(io.StringIO()) as errors):
+            self.assertEqual(restart.live_rows(staff.StaffSnapshot(self.rows), herdr.Herdr("agents")), [row])
+        self.assertEqual(errors.getvalue(), "")
 
     def test_restart_all_starts_each_row_in_its_saved_tab(self) -> None:
         with (patch.object(herdr.Herdr, "save_layout") as save,

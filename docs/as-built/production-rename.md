@@ -16,7 +16,7 @@ An unavailable display produces one anomaly line and a successful exit.
 
 ## Optional document and branch move
 
-Only showrunners accept the paired `--to-doc <path>` and `--to-branch <name>` options.
+Showrunners require the paired `--to-doc <path>` and `--to-branch <name>` options.
 The target document must remain inside the current Git checkout.
 The command reads the checkout and current branch from Git.
 It reads the document path from staff.
@@ -36,13 +36,39 @@ The checksum prevents recovery from claiming a different target file.
 A target file or target branch collision preserves the existing data.
 A wrapped document stays wrapped.
 A completed retry changes no journal bytes or timestamps.
-The command creates no commit and makes no push.
+The showrunner path creates no commit and makes no push.
+
+## Unit branch move
+
+Units accept `--to-branch <name>` without `--to-doc`.
+`apply handler handler --to-branch cargo-liner-handler` changes only the branch.
+A changed unit name also changes the matching folder suffix.
+The explicit branch replaces the branch suffix change.
+Every unit branch change pushes the target with `--set-upstream` before live sessions resume.
+The explicit refspec `<branch>:refs/heads/<branch>` prevents push configuration from changing the target.
+`plan` shows the source and target branch names.
+Units and showrunners use the same branch name and collision checks.
+
+1. Save the unit move through `unit_move.prepare_move`.
+2. Change the staff name if the request changes it.
+3. Repair the session and display names.
+4. Stop live sessions through `unit_move.move_folder`.
+5. Move the folder if the request changes its suffix.
+6. Rename the branch to the explicit target.
+7. Push the target branch to origin.
+8. Resume the stopped sessions.
+
+The unit move journal retains the target branch.
+A retry completes an interrupted folder move, branch move, or push.
+The command refuses a different requested branch while a move remains pending.
+The refusal names the pending branch.
+The command refuses `--to-doc` for a unit.
 
 ## Scope and tests
 
 Timers and stores keep their staff ids during a rename.
 The command edits no document fields, plan headers, prose, marks, or history.
-Unit renames change matching folder and branch suffixes; see `unit-rename.md`.
+Unit renames change matching folder and branch suffixes unless `--to-branch` supplies the branch; see `unit-rename.md`.
 Folder-only moves use `unit_move.py move-folder --unit <staff id> --to <path>`.
 
 `test_rename*.py` uses private staff records, temporary files, and a fake herdr.

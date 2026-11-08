@@ -55,6 +55,10 @@ class WorkerRestartScope(Enum):
     SELECTED_ROWS = "restart only selected rows"
 
 
+class ClaudeTrustWriteFailed(OSError):
+    """The shared launch already reported its failed trust write."""
+
+
 class WorkerRow(Protocol):
     row: staff.StaffRow
 
@@ -78,7 +82,6 @@ class MemberLifecycle(Protocol):
     def detach(self, arguments: list[str], task: str, *, program: Path) -> Path: ...
     def stop(self, session: str, *, deadline: float) -> StopResult: ...
     def stop_unit_workers(self, unit: staff.StaffId, record: staff.StaffSnapshot) -> list[str]: ...
-    def heal_account_trust(self, cwd: Path, destination: Path, source: Path, name: str) -> object: ...
 
 
 worker_panes = cast(WorkerPanes, cast(object, import_module("scripts.herdr.worker_panes")))
@@ -216,8 +219,6 @@ def start_row(row: staff.StaffRow, record: staff.StaffSnapshot, client: herdr.He
             if original is not None else session_launch(str(row.current_session), row.name))
         selected = member_account.resume_account(kind, row, to=target_account)
         if isinstance(selected, accounts.NamedAccount):
-            _ = stop_resume.heal_account_trust(folder, selected.dir,
-                Path(environment.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude"), row.name)
             environment = named_account_environment(selected.dir)
         else:
             environment = {"CODEX_HOME": str(selected.home)}
@@ -261,6 +262,8 @@ def start_row(row: staff.StaffRow, record: staff.StaffSnapshot, client: herdr.He
             int(operation_deadline.remaining(start_seconds) * 1000), agent=row.name,
             reported_unknown=(current.reason if isinstance(current, herdr.UnknownConversation) else
                               live.reason if isinstance(live, herdr.UnknownConversation) else ""))
+        if isinstance(result.outcome, herdr.ClaudeTrustNotWritten):
+            raise ClaudeTrustWriteFailed(result.outcome.reason)
         if isinstance(result.outcome, herdr.PromptNotSubmitted):
             if isinstance(target, herdr.ExistingPane) and not target.terminal:
                 return result.pane
@@ -301,6 +304,10 @@ def row_panes(rows: list[staff.StaffRow], client: herdr.Herdr) -> list[tuple[sta
                         key=lambda entry: entry["written_at"], default=None)
             if entry is not None and entry["pane_id"] in pane_ids:
                 found.append((row, entry["pane_id"]))
+        missing = [row for row in rows if row.kind == "agent" and not any(item.id == row.id for item, _pane in found)]
+        if missing:
+            scan = client.scan_row_panes(staff.StaffSnapshot(tuple(missing)), [dict(pane) for pane in panes])
+            found.extend((row, str(pane["pane_id"])) for row in missing for pane in scan.found.get(row.id, []))
         return found
     except (OSError, ValueError, herdr.HerdrFailure) as error:
         print(f"restart: layout anomaly: {str(error).splitlines()[0]}", file=sys.stderr)
@@ -358,6 +365,33 @@ def live_members(rows: Iterable[staff.StaffRow], record: staff.StaffSnapshot, *,
     return selected
 
 
+def _codex_conversations(client: herdr.Herdr) -> herdr.CodexConversations:
+    """Use the native pane reader for resumed Codex processes without open rollouts."""
+    observed = herdr.codex_conversations()
+    if not observed.unknown:
+        return observed
+    live = dict(observed.live)
+    unknown = list(observed.unknown)
+    try:
+        panes = client.listed("pane")
+    except (OSError, ValueError, herdr.HerdrFailure):
+        return observed
+    for pane in panes:
+        if pane.get("agent") != "codex":
+            continue
+        try:
+            pane_id = herdr.json_text(pane.get("pane_id"), "pane id")
+            info = herdr.json_object(client.result("pane", "process-info", "--pane", pane_id).get("process_info"),
+                                     "native pane processes")
+            identity = herdr.pane_native_process(info, "codex", pane).current_identity
+            _ = live.setdefault(identity, ())
+            name = client.pane_tab(pane_id)[2]["name"]
+            unknown = [reason for reason in unknown if reason != f"{name} (Codex thread unknown)"]
+        except (OSError, ValueError, herdr.HerdrFailure):
+            continue
+    return herdr.CodexConversations(live, tuple(unknown))
+
+
 def live_rows(record: staff.StaffSnapshot, client: herdr.Herdr, *, save_tabs: bool = False,
               resolver: session_staff.RowResolver | None = None,
               account: AllRestartAccounts | accounts.AccountSelection = ALL_RESTART_ACCOUNTS) -> list[staff.StaffRow]:
@@ -369,7 +403,7 @@ def live_rows(record: staff.StaffSnapshot, client: herdr.Herdr, *, save_tabs: bo
     except (OSError, ValueError) as error:
         print(f"restart: Claude registry anomaly: {error}", file=sys.stderr)
         candidates = {}
-    codex = herdr.codex_conversations()
+    codex = _codex_conversations(client)
     for identity in herdr.running_codex_threads(thread_host=herdr.codex_managed_daemon, codex=codex):
         _ = candidates.setdefault(identity, identity)
     owned = {row.current_session for row in record.rows}
@@ -401,8 +435,18 @@ def live_rows(record: staff.StaffSnapshot, client: herdr.Herdr, *, save_tabs: bo
     return selected
 
 
+class AfterStop(Enum):
+    RESTART = "resume the selected rows"
+    KEEP_STOPPED = "keep the selected rows for the next restart"
+
+
+def stop_all(*, dry_run: bool = False) -> int:
+    return restart(stop_all=True, dry_run=dry_run, after_stop=AfterStop.KEEP_STOPPED)
+
+
 def restart(*, stop_all: bool = False, dry_run: bool = False, only: tuple[str, ...] = (),
-            account: AllRestartAccounts | accounts.AccountSelection = ALL_RESTART_ACCOUNTS) -> int:
+            account: AllRestartAccounts | accounts.AccountSelection = ALL_RESTART_ACCOUNTS,
+            after_stop: AfterStop = AfterStop.RESTART) -> int:
     try:
         record = staff.initial_snapshot()
     except (OSError, ValueError, staff.StaffRefused) as error:
@@ -417,7 +461,8 @@ def restart(*, stop_all: bool = False, dry_run: bool = False, only: tuple[str, .
             requested = {row.id for reference in only if (row := record.by_member_reference(reference)) is not None}
             selected = [row for row in selected if row.id in requested]
     select_only = bool(only) and not stop_all
-    pending_ids = (list(only) if select_only else
+    pending_ids = ([] if after_stop == AfterStop.KEEP_STOPPED else
+                   list(only) if select_only else
                    [] if stop_all and (only or not isinstance(account, AllRestartAccounts)) else shutdown_record.read())
     if dry_run and not select_only and not stop_all and isinstance(account, AllRestartAccounts):
         path = shutdown_record.record_path()
@@ -459,7 +504,8 @@ def restart(*, stop_all: bool = False, dry_run: bool = False, only: tuple[str, .
             except (OSError, ValueError, herdr.HerdrFailure) as error:
                 _anomaly(row, error)
         for row in selected:
-            print(f"{row.name}: {row.id}, {row.kind}, {positions.get(str(row.id), 'no tab')}")
+            action = "; would stop and save" if after_stop == AfterStop.KEEP_STOPPED else ""
+            print(f"{row.name}: {row.id}, {row.kind}, {positions.get(str(row.id), 'no tab')}{action}")
         for row in {row.id: row for row, _pane in visible if row not in selected}.values():
             print(f"{row.name}: left alone; no proved local restart target")
         return 0
@@ -468,6 +514,7 @@ def restart(*, stop_all: bool = False, dry_run: bool = False, only: tuple[str, .
     started: list[str] = []
     worker_scope = (WorkerRestartScope.SELECTED_ROWS if only or not isinstance(account, AllRestartAccounts)
                     else WorkerRestartScope.FOLLOW_OWNER)
+    exit_code = 0
     holders: dict[staff.StaffId, staff.StaffRow] = {}
     members_by_holder: dict[staff.StaffId, list[str]] = {}
     selected_ids = {row.id for row in selected}
@@ -498,6 +545,8 @@ def restart(*, stop_all: bool = False, dry_run: bool = False, only: tuple[str, .
                 _anomaly(holder, error)
             except errors as error:
                 _anomaly(holder, error)
+    if after_stop == AfterStop.KEEP_STOPPED:
+        return 0
     present = False
     if holders:
         try:
@@ -523,6 +572,9 @@ def restart(*, stop_all: bool = False, dry_run: bool = False, only: tuple[str, .
                                   worker_scope=worker_scope)
             started.extend(members)
             present = False
+        except ClaudeTrustWriteFailed:
+            pending.extend(members)
+            exit_code = 1
         except staff.StaffRefused as error:
             _anomaly(holder, error)
         except errors as error:
@@ -535,7 +587,7 @@ def restart(*, stop_all: bool = False, dry_run: bool = False, only: tuple[str, .
             _ = client.sort_tabs()
         except errors as error:
             print(f"restart: layout anomaly: {str(error).splitlines()[0]}", file=sys.stderr)
-    return 0
+    return exit_code
 
 
 def main() -> int:

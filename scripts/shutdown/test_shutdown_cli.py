@@ -31,7 +31,7 @@ class AgentsUsageTests(unittest.TestCase):
         self.assertEqual(status, 0)
         self.assertEqual(errors, "")
         self.assertEqual([line.split()[1] for line in output.splitlines()[1:]],
-                         ["help", "status", "resume", "restart", "stop"])
+                         ["help", "status", "pause", "exit", "pause", "resume", "resume", "restart", "stop"])
         self.assertIn("resume NAME", output)
         self.assertIn("stop SESSION", output)
         self.assertIn("[ACCOUNT]", output)
