@@ -256,7 +256,6 @@ class GateWorker:
                         {'Key': 'Workload', 'Value': 'cloud-claude-gate'}, {'Key': 'Name', 'Value': 'cloud-claude-gate'}, {'Key': 'GateAttempt', 'Value': ledger.text(request, 'attempt')},
                         {'Key': 'ExpiresAt', 'Value': str(request['expires'])},
                         {'Key': policy.cost_explorer_tag_key, 'Value': policy.cost_explorer_tag_value}]
-                import base64
                 arguments: dict[str, object] = {
                     'LaunchTemplate': {'LaunchTemplateId': deployment['template'], 'Version': deployment['version']},
                     'MinCount': 1, 'MaxCount': 1, 'ClientToken': ledger.text(request, 'attempt') + '-' + str(offset),
@@ -264,8 +263,8 @@ class GateWorker:
                     'NetworkInterfaces': [{'DeviceIndex': 0, 'SubnetId': subnet['id'],
                                            'Groups': [deployment['security_group']], 'AssociatePublicIpAddress': True}],
                     'TagSpecifications': [{'ResourceType': kind, 'Tags': tags} for kind in ('instance', 'volume')],
-                    'UserData': base64.b64encode(gate_box.user_data(links, ledger.text(deployment, 'revision'), lifetime,
-                              settings().number('log_push_s'), float(str(request['module_time_limit_s']))).encode()).decode()}
+                    'UserData': gate_box.user_data(links, ledger.text(deployment, 'revision'), lifetime,
+                              settings().number('log_push_s'), float(str(request['module_time_limit_s'])))}
                 launch = {'variant': offset, 'arguments': arguments}
                 save(path, launch)
             self.size_vcpus = int(ledger.text(arguments, 'InstanceType').split('.')[1].removesuffix('xlarge')) * 4
