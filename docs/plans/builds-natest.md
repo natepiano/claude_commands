@@ -1765,7 +1765,7 @@ The style ledger ticket and finding tests use 49% less CPU, with all tests kept.
 **Ruled out:**
 - Rule 2 removal as a CPU tool for these modules: no measured gain.
 
-### Phase 88 — The fast-track, staff and add-unit tests build their temporary Git repository once per module  · status: todo
+### Phase 88 — The fast-track, staff and add-unit tests build their temporary Git repository once per module  · status: done
 **Depends on:** none
 
 #### Work Order
