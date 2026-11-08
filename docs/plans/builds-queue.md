@@ -629,7 +629,7 @@ Phase 18c makes the staff row id the copy owner, under its `RoleOwner` boundary 
 
 **Ruled out:** a nonzero send as the cause of the repeats; a new config key for the steady run.
 
-### Phase 26 — A cloud gate holds a cloud slot and shows its modules done  · status: todo
+### Phase 26 — A cloud gate holds a cloud slot and shows its modules done  · status: done
 
 **Depends on:** none. aws builds the runner (builds-aws-up phase 5) and calls this phase's publish function. Priority over 27 (builds, 2026-11-07).
 
