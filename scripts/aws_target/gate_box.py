@@ -104,17 +104,22 @@ try:
         result['tools_ready_at'] = time.time()
         links['boot'] = 'warm' if (root / 'prepared').exists() else 'cold'
     else:
-        get(links['source'], root / 'source.bundle')
-        subprocess.run(['git', 'clone', str(root / 'source.bundle'), str(root / 'repo')], check=True)
         repo = root / 'repo'
+        if links.get('production'):
+            subprocess.run(['git', 'clone', gate_request['clone_url'], str(repo)], check=True)
+            if links.get('source'):
+                get(links['source'], root / 'source.bundle')
+                subprocess.run(['git', '-C', str(repo), 'fetch', str(root / 'source.bundle'), 'HEAD'], check=True)
+            subprocess.run(['git', '-C', str(repo), 'update-ref', 'refs/remotes/origin/main', gate_request['origin_main']], check=True)
+        else:
+            get(links['source'], root / 'source.bundle')
+            subprocess.run(['git', 'clone', str(root / 'source.bundle'), str(repo)], check=True)
         subprocess.run(['git', '-C', str(repo), 'checkout', '--detach', links['commit']], check=True)
         if links.get('production'):
             from subprocess import check_output
             tree = check_output(['git', '-C', str(repo), 'rev-parse', 'HEAD^{tree}'], text=True).strip()
             if tree != links['tree']:
                 raise ValueError('The source tree differs from the request')
-            subprocess.run(['git', '-C', str(repo), 'fetch', str(root / 'source.bundle'),
-                            '+refs/remotes/origin/*:refs/remotes/origin/*'], check=True)
             subprocess.run(['git', '-C', str(repo), 'remote', 'set-url', 'origin', links['origin']], check=True)
         home = pathlib.Path.home() / '.claude'
         home.mkdir(exist_ok=True)
