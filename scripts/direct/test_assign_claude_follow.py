@@ -110,7 +110,7 @@ class AssignClaudeLauncherWorkerTests(ClaudeLauncherFixture):
         original = sender.read_text()
         probe = "\n".join((
             "import json, os, sys",
-            f"sys.path.insert(0, {str(Path(__file__).resolve().parents[2])!r})",
+            f"with open({str(Path(__file__).resolve().parents[2] / 'scripts/lib/package_root.py')!r}) as package_root: exec(package_root.read(), {{'__file__': package_root.name}})",
             "from pathlib import Path",
             "from scripts.agents import codex_mesh",
             "from scripts.direct import workers",

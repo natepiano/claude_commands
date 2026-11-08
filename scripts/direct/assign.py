@@ -24,7 +24,6 @@ from pathlib import Path
 from types import FrameType
 from typing import Literal, NoReturn, cast, final, overload
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.astra import astra_roles
 from scripts.agents import worker_lifecycle
 from scripts.lib.process_failure import failure_detail

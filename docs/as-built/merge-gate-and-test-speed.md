@@ -4,6 +4,101 @@ Code reviews now use the unit's persistent `review` and `review2` workers
 through `assign.sh --role review`. Any pool maintenance paths described below
 remain only for the pending archive cleanup; they do not dispatch new reviews.
 
+## Cloud gate route
+
+Merge gates and targeted tests use one fresh Spot instance for each attempt after the user deploys the gate resources.
+The route returns the existing `GateRun` and exit behavior.
+The build queue enforces nine cloud slots and shows remote progress.
+
+The route selects targeted modules on natedev.
+It transfers a Git bundle with the exact commit, tree, `origin/main`, and current branch history.
+The guest verifies the tree and runs only the supplied paths from that checkout.
+The trial and route share `scripts/aws_target/gate_box.py`.
+The guest performs no type check and installs no basedpyright package.
+An explicit type request and the nightly checker remain local.
+
+The route tries all public zones at `m7a.8xlarge`, then all zones at `m7a.4xlarge`.
+Both sizes use one-time Spot with termination on interruption and shutdown.
+Termination deletes the root volume.
+A guest deadline and an independent expiry Lambda bound normal attempt lifetimes.
+The route confirms termination before it releases unused cost reservation.
+An uncertain reply retains the saved launch token, arguments, and reservation across restart.
+
+Local fallback requires AWS failure, an absent image or stack, a shared spending cap, or capacity refusal at both sizes.
+A remote failure remains red. A dead instance without a final result also remains red.
+The route validates source identity, attempt, modules, host, verdict, and final log delivery.
+It imports the explicit `gate_run` record once under the real remote host.
+Git's `cloud-gates/<attempt>` directory retains each request, bundle, launch, result, log, and import marker.
+
+The shared cost ledger includes Rust charges and all gate reservations.
+It checks the existing $20 daily cap, $400 monthly cap, and safety reserve under one cost lock.
+It splits reservations across accounting days and months.
+The defaults reserve `$0.8 × 20/60 + $0.02` for each attempt.
+The scaler refreshes combined Cost Explorer charges even when Rust offload is disabled.
+
+Sessions make no AWS calls.
+A user systemd service uses the scaler profile and removes inherited AWS key, profile, and config overrides.
+The user alone runs the administrator deployment command:
+
+```sh
+python3 scripts/aws_target/deploy.py up --workload merge-gates --approve-resources
+```
+
+The existing Rust foundation stack must exist first.
+The command adds the gate bucket, role, profile, security group, launch template, scaler policy, expiry Lambda, schedule, and log group.
+It preserves Rust parameters and refuses a change set that changes a Rust resource.
+It records a priced shared resource entry before creation.
+It saves the image, template version, public subnets, nixpkgs revision, and artifact role prefix locally.
+This phase prepares tools at boot. A prepared image belongs to plan phase 7.
+
+| Scaler grant | Scope |
+| --- | --- |
+| `ec2:RunInstances` | Deployed image, template, security group, public subnets, gate profile, configured types, and Spot market. |
+| `ec2:CreateTags` | Gate instances and volumes during launch only. |
+| `iam:PassRole` | Gate role, passed to EC2 only. |
+| `ec2:TerminateInstances` | This deployment's gate ownership and workload tags. |
+| `ec2:DescribeInstances` | Regional describe scope. |
+| `ce:GetCostAndUsage` | Combined cost query; AWS requires wildcard resource scope. |
+| `s3:PutObject` | Gate source and request prefixes. |
+| `s3:GetObject` | Gate artifact prefix. |
+
+The guest reads source and request objects.
+Its writes use only `artifacts/${aws:userid}/*`, which contains its role and instance identity.
+The expiry role terminates only gate-tagged instances and writes only its function logs.
+The gate bucket blocks public access, requires HTTPS, encrypts objects, and removes old artifacts.
+
+`config/cloud_gate.conf` supplies these values through `conf.py` at use:
+
+| Key | Default | Purpose |
+| --- | --- | --- |
+| `instance_types` | `m7a.8xlarge m7a.4xlarge` | Select 32 vCPU before 16 vCPU. |
+| `slots` | `9` | Supply the later queue limit. |
+| `lifetime_minutes` | `20` | Bound preparation, tests, and result delivery. |
+| `root_gib` | `40` | Hold the disposable system and checkout. |
+| `spot_max_usd_per_hour` | `0.8` | Bound the Spot price and cost reservation. |
+| `attempt_allowance_usd` | `0.02` | Reserve storage, IPv4, and transfer charges. |
+| `log_push_s` | `5` | Send progress logs. |
+| `result_poll_s` | `2` | Check remote results. |
+| `launch_reply_tries` | `2` | Recover an uncertain launch reply. |
+| `api_timeout_s` | `30` | Bound each scaler API command. |
+| `termination_timeout_s` | `120` | Bound termination confirmation. |
+| `module_time_limit_s` | `1800` | Bound each test module. |
+| `artifact_days` | `7` | Remove old S3 artifacts. |
+| `log_days` | `7` | Remove old Lambda logs. |
+| `expiry_schedule_minutes` | `1` | Check expired instances. |
+| `expiry_timeout_s` | `30` | Bound each expiry invocation. |
+| `expiry_memory_mib` | `128` | Size the expiry function. |
+| `shared_usd_per_month` | `1` | Price shared gate resources before creation. |
+| `credential_file` | `~/.config/aws-build/credentials` | Select the service's private scaler file. |
+| `packages` | See the configured list below. | Prepare the common trial and production tools. |
+
+The package list contains `git python3 cargo rustc rustup cargo-nextest uv curl openssh rsync gnupg ripgrep jq gcc pkg-config tmux taplo zsh bash gh sqlite chromium util-linux awscli2`.
+The existing `aws_target.conf` supplies the profile, region, placement, accounting settings, and shared limits.
+
+Fake AWS tests cover launch order, lost replies, restart recovery, expiry, termination, result validation, fallback, and concurrent cap reservations.
+They also cover exact bundle delivery, local targeted selection, service isolation, record import, deployment parameters, and IAM resource scopes.
+No test needs live AWS.
+
 ## Private account fixtures
 
 `staff_test_support.py` redirects fixture sessions away from real account folders.
@@ -262,7 +357,7 @@ The guest links `google-chrome` to Chromium before the system profile bind mount
 The cloud gate runs tests only, like natedev's `--tests-only` run.
 It supplies no `type_dirs` and prepares no full type environment.
 The nightly run does the full type check.
-The guest keeps Nix basedpyright for the two tests that run the real tool.
+The guest installs no basedpyright package. The two real-tool tests have left this branch.
 Root prepares the shell links and a temporary system profile bind mount with Python at `/run/current-system/sw/bin/python3`.
 Before the bind mount, `cp -a` copies the system profile links and preserves their targets in `/nix/store`.
 The guest runs as the unprivileged `gate-trial` user with its own home and runtime directory.
@@ -632,3 +727,30 @@ Lint repair ordering runs in `test_verify_lint_fixes.py` (successive fixes befor
 Tree watcher scope coverage remains in `scripts/direct/test_tree_watch.py`, with `tree_watch_test_support.py` owning one Git fixture seed per class, including the two nested Cargo workspace layouts, and private copies restored at the same paths per test. Key CLI calls run in-process; scope tests run the real watcher loop with an event-controlled sleep, completing explicit snapshot iterations instead of waiting through fixed intervals. All Git snapshots and file publication stay real, and the parent-exit test keeps a real watcher process. Negative checks require two completed observations and a live watcher, followed by the original positive-change proof; the original 2.5-second change and parent-exit bounds remain. Only non-speed setup and cleanup waits use the named 600-second hang guard in `scripts/lib/test_hang_guard.py`.
 
 Dailies input coverage remains in `scripts/production/test_dailies_input.py`, with `dailies_input_test_support.py` building the production document, Git checkout and origin, status, judgment, fake tools and environment once per class. Each test gets private files and Git metadata restored at the seed's original paths. Renderer, ETA-request, review-watch, phase-table and style-ledger commands run their real parsers and handlers in-process; their output, state changes, Git commands and SQLite ledger remain real. The two builder subprocess smoke calls remain. All test bodies and assertions are retained unchanged; this fixture has no fixed sleeps or polling intervals.
+
+## Cloud gate resource names
+
+The feature uses `scripts/aws_target/cloud_gate.py` and `config/cloud_gate.conf`.
+The machines use the name `cloud-claude-gate`.
+The instance `Name` tag and the resource `Workload` tags use `cloud-claude-gate`.
+The instance profile has no CloudFormation tag property.
+
+| Resource | Name |
+| --- | --- |
+| Bucket, role, profile, security group, launch template | `cloud-claude-gate-${DeploymentId}` |
+| Expiry role, expiry function, schedule | `cloud-claude-gate-${DeploymentId}-expiry` |
+| Log group | `/aws/lambda/cloud-claude-gate-${DeploymentId}-expiry` |
+
+The box sends logs every `log_push_s=5` seconds.
+The route reads module counters from each log download.
+It writes the existing queue progress format through `progress_profile.publish_counter`.
+
+The route admits with `CloudPlace("aws")` before it requests a box.
+The route uses its own pid as the run identity.
+The build queue releases the slot when the route ends.
+The route passes the reservation sidecar path to the scaler service.
+The service writes module progress and `CloudProgress` beside that path.
+The cloud state records the phase, vCPU count, failed module count, and update time.
+The phases are `requesting`, `setup`, `running`, and `uploading`.
+The route releases cloud admission before local fallback requests memory.
+The route requests no local memory for a cloud gate.

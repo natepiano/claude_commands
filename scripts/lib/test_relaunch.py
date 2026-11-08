@@ -139,6 +139,50 @@ class RelaunchTests(ShutdownTestCase):
             self.assertEqual(text.count(f"Worker {name}: idle"), 1)
         self.assertNotIn("Continue pass", text)
 
+    def test_director_note_keeps_the_saved_assignment_prompt_and_uses_one_receipt(self) -> None:
+        import shlex
+        from scripts.herdr.test_worker_panes import WorkerPaneTests
+        from scripts.herdr import worker_panes
+        from scripts.lib import atomic_file, unit_runs
+        from scripts.lib.resume_message import resume_message
+        from scripts.production import staff, worker, worker_admission
+
+        fixture = WorkerPaneTests("runTest")
+        fixture.setUp()
+        self.addCleanup(fixture.doCleanups)
+        row, source, dispatch = fixture.resume_fixture()
+        state_path = fixture.root / "run/progress_history_state.json"
+        state = cast(dict[str, object], json.loads(state_path.read_text()))
+        passes = cast(dict[str, dict[str, object]], state["pass"])
+        command = ("bash", "assign.sh", "--role", "impl", "--prompt", str(fixture.root / "saved prompt.md"))
+        passes[row.name]["launcher_command"] = list(command)
+        for status in ("unsubmitted", "submitted", "done", "completed"):
+            with self.subTest(status=status):
+                passes[row.name]["status"] = "completed" if status == "completed" else "active"
+                atomic_file.write_text_atomic(state_path, json.dumps(state))
+                entry = {"type": "user", "message": {"role": "user",
+                         "content": f"End your final reply with DONE {dispatch}."}}
+                text = "" if status == "unsubmitted" else json.dumps(entry) + "\n"
+                if status == "done":
+                    text += json.dumps({"type": "assistant", "message": {"role": "assistant", "content": "DONE " + dispatch}}) + "\n"
+                atomic_file.write_text_atomic(source, text)
+                with (patch.object(unit_runs, "held", return_value=[str(fixture.root / "run")]),
+                      patch.object(worker_panes, "dispatch_role", wraps=worker_panes.dispatch_role) as roles,
+                      patch.object(worker_admission, "transcript_entries", wraps=worker_admission.transcript_entries) as reads):
+                    note = resume_message("a shutdown", workers=worker.resume_workers(fixture.parent.id, staff.snapshot()))
+                if status == "unsubmitted":
+                    self.assertIn(shlex.join(command), note)
+                    self.assertNotIn("resume-prompt.md", note)
+                    self.assertNotIn("Continue pass", note)
+                elif status == "submitted":
+                    self.assertIn("Continue pass " + dispatch, note)
+                    self.assertNotIn("assign.sh", note)
+                else:
+                    self.assertNotIn(str(row.id), note)
+                    self.assertNotIn(dispatch, note)
+                self.assertEqual(reads.call_count, int(status != "completed"))
+                roles.assert_not_called()
+
     def test_resume_message_continues_only_the_recipients_own_pass(self) -> None:
         from scripts.lib.resume_message import AccountMove, BusyPass, resume_message
 

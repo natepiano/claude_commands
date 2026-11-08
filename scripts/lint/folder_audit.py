@@ -35,7 +35,7 @@ until then each line says "would remove". When config/rust_roots.txt cannot be r
 REMOVED_LOG in the state folder.
 
 The maker is the earliest-started session whose transcript (~/.claude*/projects/*/<session>.jsonl)
-holds a command that names the folder; a listing in a command's output does not count.
+holds a command that makes the folder. Read-only commands and message text do not count.
 `folder_audit.py [arm|disarm] [--send]` prints one line per loose folder and what happened to it;
 with --send, each maker session also gets one message that lists its folders.
 """
@@ -49,6 +49,7 @@ except FileNotFoundError:
 import argparse
 import fcntl
 import hashlib
+import importlib
 import json
 import os
 import re
@@ -61,7 +62,7 @@ from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import cast
+from typing import Protocol, cast
 
 from scripts.lint import sweep, tmp_sweep
 from scripts.message import session_send
@@ -76,19 +77,16 @@ KEPT_NAMES = SYSTEM_TEMP_NAMES | {
     *(root.name for root in unit_runs.run_roots()), copy_record.root().name,
     copy_record.copies_root().name, Path(tmp_sweep.SESSION_TEMP_ROOT).name, "repro",
 }
-KEPT_PREFIXES = SYSTEM_TEMP_PREFIXES
+KEPT_PREFIXES = (*SYSTEM_TEMP_PREFIXES, "codex-daemon-")
 GIT_TIME_FILES = ("HEAD", "index", os.path.join("logs", "HEAD"))
 UNIX_SOCKETS = "/proc/net/unix"
 STATE_ENV = "FOLDER_SWEEP_STATE_DIR"
 ARMED_NAME = "armed"
 REMOVED_LOG = "removed.jsonl"
-# A session counts as a maker only where one of its own commands names the folder. ripgrep returns
-# each whole JSON "command" string that names a loose folder (the path, then a boundary or the
-# string's end), and every folder in it is read from there. A listing in a tool result names every
-# folder it shows, so it does not count.
-COMMAND_START = r'"command":"(?:[^"\\]|\\.)*?'
-COMMAND_REST = r'(?:(?:[^A-Za-z0-9_.\-"\\]|\\.)(?:[^"\\]|\\.)*)?"'
-TRANSCRIPT_TIME = re.compile(rb'"timestamp":"([^"]+)"')
+# Ripgrep selects possible commands. The shared parser must prove each creation target.
+COMMAND_START = r'"command"\s*:\s*"(?:[^"\\]|\\.)*?'
+COMMAND_REST = r'(?:[^"\\]|\\.)*"'
+TRANSCRIPT_TIME = re.compile(rb'"timestamp"\s*:\s*"([^"]+)"')
 
 REMOVED = "removed"
 WOULD_REMOVE = "would remove"
@@ -524,39 +522,87 @@ def transcripts() -> list[Path]:
     return [path for folder in folders for path in folder.glob("*/*.jsonl")]
 
 
+class CreationTarget(Protocol):
+    """A resolved folder creation from the scratch guard."""
+
+    @property
+    def path(self) -> Path: ...
+
+
+class ScratchCommandParser(Protocol):
+    """The scratch guard's command walk and destination rules."""
+
+    def creation_targets(self, text: str, cwd: Path) -> Iterator[CreationTarget]: ...
+
+
+SCRATCH_COMMANDS = cast(ScratchCommandParser, cast(object, importlib.import_module(
+    "scripts.hooks.pre-tool-use-scratch-guard")))
+
+
+def transcript_commands(row: dict[str, object]) -> Iterator[str]:
+    """Read commands from this transcript row's own tool inputs."""
+    inputs = [row.get("input"), row.get("tool_input")]
+    message = row.get("message")
+    if isinstance(message, dict):
+        content = cast(dict[str, object], message).get("content")
+        if isinstance(content, list):
+            for block in cast(list[object], content):
+                if isinstance(block, dict):
+                    tool = cast(dict[str, object], block)
+                    if tool.get("type") == "tool_use":
+                        inputs.append(tool.get("input"))
+    for value in inputs:
+        if isinstance(value, dict):
+            command = cast(dict[str, object], value).get("command")
+            if isinstance(command, str):
+                yield command
+
+
 def makers(paths: list[Path], files: list[Path], *,
     lint_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
 ) -> dict[Path, str]:
-    """The earliest-started session whose own commands name each path, since a folder's maker named it
-    before any later session that only talked about it; a path no command names is left out.
-    One ripgrep pass reads every transcript: a Python scan of 22 GB took 4 h 24 min (2026-10-26). A
-    name must end at a path boundary, so ~/rust/hana is not named by ~/rust/hana_catalyst."""
+    """Find the earliest-started session whose own command makes each folder.
+
+    Ripgrep selects possible rows by folder name. The scratch guard's parser proves
+    each target against that row's cwd. A row without a cwd proves no target.
+    """
     if isinstance(lint_settings, UseConfiguredValue):
         lint_settings = conf.read("lint")
     if not paths or not files:
         return {}
-    names = {str(path) for path in paths}
-    alternatives = "|".join(re.escape(name) for name in sorted(names, key=len, reverse=True))
+    alternatives = "|".join(re.escape(name) for name in sorted({path.name for path in paths}, key=len, reverse=True))
     pattern = (COMMAND_START + "(?:" + alternatives + ")" + COMMAND_REST + "\n").encode()
-    in_command = re.compile(f"(?:{alternatives})(?![A-Za-z0-9_.-])")
-    earliest: dict[str, tuple[float, str]] = {}
+    earliest: dict[Path, tuple[float, str]] = {}
     started: dict[str, float] = {}
     files_per_call = lint_settings.whole("folder_rg_files_per_call")
     start_lines = lint_settings.whole("folder_start_lines")
     start_bytes = lint_settings.whole("folder_start_bytes")
     for start in range(0, len(files), files_per_call):
         chunk = [str(file) for file in files[start:start + files_per_call]]
-        result = subprocess.run(["rg", "--only-matching", "--with-filename", "--null", "--no-line-number",
+        result = subprocess.run(["rg", "--with-filename", "--null", "--no-line-number",
                                  "--no-messages", "--no-config", "--file", "-", "--", *chunk],
                                 input=pattern, capture_output=True, check=False)
         for line in result.stdout.decode(errors="replace").splitlines():
-            file, _, command = line.partition("\0")
-            for name in {found.group(0) for found in in_command.finditer(command)}:
+            file, _, raw = line.partition("\0")
+            try:
+                value = cast(object, json.loads(raw))
+            except ValueError:
+                continue
+            if not isinstance(value, dict):
+                continue
+            row = cast(dict[str, object], value)
+            cwd = row.get("cwd")
+            if not isinstance(cwd, str) or not Path(cwd).is_absolute():
+                continue
+            targets = [target.path for command in transcript_commands(row) for target in SCRATCH_COMMANDS.creation_targets(command, Path(cwd))]
+            for path in paths:
+                if path not in targets:
+                    continue
                 if file not in started:
                     started[file] = _started(Path(file), start_lines, start_bytes)
-                if started[file] < earliest.get(name, (float("inf"), ""))[0]:
-                    earliest[name] = (started[file], Path(file).stem)
-    return {path: earliest[str(path)][1] for path in paths if str(path) in earliest}
+                if started[file] < earliest.get(path, (float("inf"), ""))[0]:
+                    earliest[path] = (started[file], Path(file).stem)
+    return {path: earliest[path][1] for path in paths if path in earliest}
 
 
 def _started(path: Path, start_lines: int, start_bytes: int) -> float:

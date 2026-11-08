@@ -14,7 +14,6 @@ import select
 import socket
 import sqlite3
 import subprocess
-import sys
 import tempfile
 from threading import Event
 import time
@@ -35,7 +34,6 @@ if TYPE_CHECKING:
     from scripts.test_times.gate_record import GateRun, ModuleRun, TestTime
     from scripts.test_times.gate_record_test_support import gate_run, remove_run_measurements
 else:
-    # Import show first because it adds the build log folder to the import path.
     from scripts.test_times import gate_record, show
     from scripts.buildlog import parse, record, repository, store
     from scripts.buildlog.index import index_path_in
@@ -58,7 +56,6 @@ from pathlib import Path
 import runpy
 import socket
 import sys
-sys.path.insert(0, sys.argv[1])
 report = runpy.run_path(str(Path(sys.argv[1]) / 'scripts/test_times/show.py'))
 main = report['main']
 main.__globals__['TOOL_REPOSITORY'] = Path(sys.argv[2])
@@ -216,7 +213,7 @@ class TestTimesTests(unittest.TestCase):
         event, child_event = socket.socketpair()
         event.settimeout(TEST_HANG_GUARD_SECS)
         process = subprocess.Popen(
-            [sys.executable, "-c", REPORT_PROCESS, str(Path(__file__).resolve().parents[2]),
+            [str(Path(__file__).resolve().parents[1] / "lib/py"), "-c", REPORT_PROCESS, str(Path(__file__).resolve().parents[2]),
              str(self.repo), changed_table, str(child_event.fileno()),
              *(arguments or ("top", "--repo", str(self.repo)))],
             cwd=self.root, env=dict(os.environ), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -271,7 +268,6 @@ class TestTimesTests(unittest.TestCase):
         program = """
 import socket
 import sys
-sys.path.insert(0, sys.argv[1])
 from scripts.buildlog import index
 with socket.socket(fileno=int(sys.argv[2])) as event, index.update_lock():
     connection = index.open_for_update(index.index_path())
@@ -288,7 +284,7 @@ with socket.socket(fileno=int(sys.argv[2])) as event, index.update_lock():
         with event, child_event:
             event.settimeout(TEST_HANG_GUARD_SECS)
             writer = subprocess.Popen(
-                [sys.executable, "-c", program, str(Path(__file__).resolve().parents[2]),
+                [str(Path(__file__).resolve().parents[1] / "lib/py"), "-c", program, str(Path(__file__).resolve().parents[2]),
                  str(child_event.fileno())], env=dict(os.environ), pass_fds=(child_event.fileno(),),
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             )
@@ -329,7 +325,6 @@ with socket.socket(fileno=int(sys.argv[2])) as event, index.update_lock():
         program = """
 import socket
 import sys
-sys.path.insert(0, sys.argv[1])
 from scripts.buildlog import index
 with socket.socket(fileno=int(sys.argv[2])) as event, index.update_lock():
     connection = index.open_for_update(index.index_path())
@@ -345,7 +340,7 @@ with socket.socket(fileno=int(sys.argv[2])) as event, index.update_lock():
         with event, child_event:
             event.settimeout(TEST_HANG_GUARD_SECS)
             writer = subprocess.Popen(
-                [sys.executable, "-c", program, str(Path(__file__).resolve().parents[2]),
+                [str(Path(__file__).resolve().parents[1] / "lib/py"), "-c", program, str(Path(__file__).resolve().parents[2]),
                  str(child_event.fileno())], env=dict(os.environ), pass_fds=(child_event.fileno(),),
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             )

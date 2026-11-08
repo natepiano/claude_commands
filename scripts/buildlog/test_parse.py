@@ -15,7 +15,7 @@ import tempfile
 import unittest
 from contextlib import closing
 from pathlib import Path
-from typing import TYPE_CHECKING, cast, override
+from typing import cast, override
 from unittest import mock
 
 from scripts.buildlog import index
@@ -25,12 +25,8 @@ from scripts.buildlog import test_record as record_tests
 from scripts.buildlog.store import UNKNOWN_IDENTITY
 from scripts.buildlog.test_index import use_test_log
 
-if TYPE_CHECKING:
-    from ..lib import test_hang_guard
-    from ..lint.memory_test_support import config_environment, write_config_fixture, write_config_fault
-else:
-    from scripts.lib import test_hang_guard
-    from scripts.lint.memory_test_support import config_environment, write_config_fixture, write_config_fault
+from scripts.lib import test_hang_guard
+from scripts.lint.memory_test_support import config_environment, write_config_fixture, write_config_fault
 
 use_test_log()
 
@@ -318,8 +314,6 @@ import sys
 
 mode, script, arguments = sys.argv[1:]
 path = Path(script)
-sys.path.insert(0, str(path.parents[2]))
-sys.path.insert(0, str(path.parent))
 arguments = json.loads(arguments)
 if mode == "script":
     sys.argv = [script, *arguments]

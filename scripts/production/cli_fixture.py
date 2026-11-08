@@ -20,7 +20,6 @@ from typing import cast
 from unittest.mock import patch
 
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 
 def process_boundary[**P](test: Callable[P, None]) -> Callable[P, None]:

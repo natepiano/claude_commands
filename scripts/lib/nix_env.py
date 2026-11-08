@@ -24,11 +24,6 @@ if TYPE_CHECKING:
     from collections.abc import Mapping
     from scripts.lib.conf import ConfigRead
 
-if __name__ == "nix_env":
-    _ = sys.modules.setdefault("scripts.lib.nix_env", sys.modules[__name__])
-elif __name__ == "scripts.lib.nix_env":
-    _ = sys.modules.setdefault("nix_env", sys.modules[__name__])
-
 # Internal, one-session handoff from the healer to shutdown restart. These are
 # consumed before opening a pane and never exported to the resumed agent.
 HEAL_SESSION_ENV = "NIX_HEAL_PREPARED_SESSION"

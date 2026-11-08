@@ -42,7 +42,7 @@ from scripts.build_queue import admission_client as client, admission_protocol a
 from scripts.build_queue.admission_test_support import queue_decision, AdmissionFixture, InjectedCrash, only_admitted
 from scripts.build_queue.queue_fixture import write_memory_config as write_memory_config, fixture_queue_inputs, fixture_reservation, write_process, ci_step
 from scripts.lint import nextest_budget as budget
-from scripts.lint.build_shape import BuildShape, build_shape
+from scripts.lint.build_shape import BuildShape, CompiledCrates, build_shape
 from scripts.lint.memory_test_support import fake_memory_readings, gate_isolation_environment, write_config_fixture, write_config_fault, commit_config_fixture
 from scripts.buildlog import store
 from scripts.buildlog import record as buildlog_record
@@ -180,6 +180,15 @@ def write_history_rows(root: Path, rows: Iterable[dict[str, object]], *,
                                     store.utc_iso((datetime.fromisoformat(str(row["ended_at"])) - timedelta(seconds=1)).timestamp()),
                                     0, json.dumps(["cargo", row.get("step")]), call_id, crates))
             _ = output.write(json.dumps(row) + "\n")
+
+
+def assert_history_decoded_once[Result](test: unittest.TestCase, path: Path,
+                                        read: Callable[[], Result]) -> Result:
+    with patch.object(step_estimator, "anonymous_history_rows", wraps=step_estimator.anonymous_history_rows) as decode:
+        result = read()
+    test.assertEqual(decode.call_count, 1)
+    test.assertEqual(decode.call_args_list[0].args, (path,))
+    return result
 
 
 def assert_unfinished_history_ignored(test: unittest.TestCase, path: Path,
@@ -740,6 +749,36 @@ class FilteredPromiseTests(unittest.TestCase):
         self.enterContext(patch.dict(os.environ, fake_memory_readings(self.root)))
         (self.root / "admission").mkdir()
 
+    def test_filtered_estimate_decodes_the_history_once_for_all_compile_steps(self) -> None:
+        self.samples([3 * GIB], filters=("native_rate",))
+        self.samples([6 * GIB], step="check")
+        self.samples([8 * GIB], step="build")
+        estimate = assert_history_decoded_once(
+            self, self.root / "admission/anon_peaks.jsonl", self.promise)
+        self.assertEqual(estimate, gate.ExpectedPeak(3 * GIB, "measured", 1))
+
+    def test_shared_call_keeps_compile_results_and_nextest_selection_separate(self) -> None:
+        rows: list[dict[str, object]] = [{
+            "host": self.host, "repo": HANA.name, "repo_identity": HANA.key,
+            "step": step, "call_id": "shared", "anon_peak_bytes": peak,
+            "ended_at": store.utc_iso(HISTORY_AT.timestamp()),
+        } for step, peak in (("build", 8 * GIB), ("nextest", 3 * GIB))]
+        write_history_rows(self.root, rows, indexed=True)
+        arguments = ["cargo", "nextest", "run", "-E", "package(hana) & test(native_rate)"]
+        with closing(sqlite3.connect(file_marks.index_path_in(self.root))) as db, db:
+            _ = db.execute("UPDATE steps SET crates_compiled=0 WHERE step='build'")
+            _ = db.execute("UPDATE steps SET crates_compiled=7, argv=? WHERE step='nextest'",
+                           (json.dumps(arguments),))
+        history = gate.read_estimate_history(self.root, self.host, ("build", "nextest"), NOW)
+        grouped = gate.compiling_history(history)
+        self.assertEqual(grouped["build"], [])
+        self.assertEqual(len(grouped["nextest"]), 1)
+        item, evidence = grouped["nextest"][0]
+        self.assertEqual(evidence.compilation, CompiledCrates(7))
+        self.assertEqual(gate.history_selection(item, evidence),
+                         gate.HistorySelection("hana", "filtered", ("native_rate",)))
+        self.assertEqual(self.promise(), gate.ExpectedPeak(3 * GIB, "measured", 1))
+
     def test_package_check_keeps_legacy_measured_peaks_without_package_fields(self) -> None:
         arguments = ["cargo", "check", "-p", "hana"]
         rows: list[dict[str, object]] = [{
@@ -898,8 +937,7 @@ class FilteredPromiseTests(unittest.TestCase):
             _ = db.executemany("INSERT INTO steps VALUES (?, ?, ?, ?, ?, ?)", [
                 (self.host, "hana", "nextest", HISTORY_AT.isoformat(), 8 * GIB, json.dumps(arguments))
             ] * 5)
-        peak = gate.filtered_peak(HANA, "nextest", self.host, NOW, self.root,
-                                  None, ("native_rate",), "hana")
+        peak = self.promise()
         self.assertEqual(peak, gate.ExpectedPeak(int(8 * GIB * gate.ANON_SHARE), "buildlog", 5))
 
     def test_missing_call_and_step_matches_keep_peaks_until_classification(self) -> None:
@@ -940,8 +978,7 @@ class FilteredPromiseTests(unittest.TestCase):
         self.samples([3 * GIB], filters=("native_rate",))
         assert_unfinished_history_ignored(
             self, self.root / "admission/anon_peaks.jsonl",
-            lambda: gate.filtered_peak(HANA, "nextest", self.host, NOW, self.root,
-                                       None, ("native_rate",), "hana"))
+            self.promise)
 
     def test_filter_name_order_keeps_the_larger_exact_p90(self) -> None:
         self.samples([number * GIB for number in range(11, 21)], filters=("render", "native_rate"))
@@ -1297,6 +1334,43 @@ class FreshTestPromiseTests(unittest.TestCase):
         return gate.expected_peak(HANA, "nextest", self.host, NOW, self.root, scope=scope,
                                   package="hana", filters=filters, fresh=self.fresh(key=key, scope=scope), first_peak_bytes=admission_configuration_fixture().program_first_peaks["cargo"])
 
+    def test_fresh_and_compile_estimates_share_the_precise_window_edge(self) -> None:
+        now = NOW.replace(microsecond=123456)
+        cutoff = now - timedelta(days=gate.HISTORY_DAYS)
+        for crates in (0, 1):
+            self.samples([3 * GIB], package="edge-package", crates=crates,
+                         at=cutoff + timedelta(seconds=1))
+            self.samples([19 * GIB], package="edge-package", crates=crates,
+                         at=cutoff + timedelta(seconds=1))
+        path = self.root / "admission/anon_peaks.jsonl"
+        rows = list(gate.anonymous_history_rows(path))
+        for row in rows:
+            if row.get("package") == "edge-package":
+                delta = 44 if row["anon_peak_bytes"] == 3 * GIB else -44
+                row["ended_at"] = (cutoff + timedelta(microseconds=delta)).isoformat()
+        _ = path.write_text("")
+        write_history_rows(self.root, rows)
+        for fresh in (False, True):
+            with self.subTest(fresh=fresh):
+                estimate = gate.expected_peak(
+                    HANA, "nextest", self.host, now, self.root, scope="filtered",
+                    package="edge-package", filters=("native_rate",), fresh=fresh,
+                    first_peak_bytes=admission_configuration_fixture().program_first_peaks["cargo"])
+                self.assertEqual(estimate, gate.ExpectedPeak(3 * GIB, "measured", 1))
+
+    def test_fresh_estimate_decodes_the_history_once(self) -> None:
+        self.samples([2 * GIB])
+        self.previous_build()
+        estimate = assert_history_decoded_once(
+            self, self.root / "admission/anon_peaks.jsonl", self.promise)
+        self.assertEqual(estimate, gate.ExpectedPeak(2 * GIB, "measured", 1))
+
+    def test_fresh_compile_fallback_reuses_the_decoded_history(self) -> None:
+        self.previous_build()
+        estimate = assert_history_decoded_once(
+            self, self.root / "admission/anon_peaks.jsonl", self.promise)
+        self.assertEqual(estimate, gate.ExpectedPeak(10 * GIB, "measured", 10))
+
     def test_same_tree_native_rate_run_uses_zero_compile_anon_p90_joined_by_call(self) -> None:
         self.samples([number * GIB // 4 for number in range(1, 11)])
         self.samples([11 * GIB] * 10, crates=2)
@@ -1310,7 +1384,7 @@ class FreshTestPromiseTests(unittest.TestCase):
             self, self.root / "admission/anon_peaks.jsonl",
             lambda: gate.fresh_test_peak(HANA, "nextest", self.host, NOW, self.root, None,
                                          "filtered", ("native_rate",), "hana",
-                                         gate.ExpectedPeak(10 * GIB, "measured", 10)))
+                                         gate.read_estimate_history(self.root, self.host, ("nextest",), NOW)))
 
     def test_fresh_exact_filter_set_is_sorted_and_precedes_broader_package_history(self) -> None:
         self.samples([2 * GIB], filters=("render", "native_rate"))
@@ -2124,10 +2198,12 @@ class TestPhaseChargeTests(MemoryQueueFixture):
     def test_test_phase_reader_uses_the_shared_whole_row_boundary(self) -> None:
         path = self.phase_step()
         self.phase_samples([2 * GIB])
-        with patch.object(gate, "anonymous_history_rows", wraps=gate.anonymous_history_rows) as reader:
-            self.assertEqual(gate.test_phase_need_from_rows(gate.anonymous_history_rows(self.root / "admission/anon_peaks.jsonl"), gate.read_reservation(path), "test-host", NOW, 1.2),
-                             gate.TestPhaseNeed(2 * GIB, 1, 8, 8, "same_width", margin=1.2))
-        self.assertEqual(reader.call_args_list[0].args, (self.root / "admission/anon_peaks.jsonl",))
+        need = assert_history_decoded_once(
+            self, self.root / "admission/anon_peaks.jsonl",
+            lambda: gate.test_phase_need_from_rows(
+                step_estimator.anonymous_history_rows(self.root / "admission/anon_peaks.jsonl"),
+                gate.read_reservation(path), "test-host", NOW, 1.2))
+        self.assertEqual(need, gate.TestPhaseNeed(2 * GIB, 1, 8, 8, "same_width", margin=1.2))
         assert_unfinished_history_ignored(self, self.root / "admission/anon_peaks.jsonl",
             lambda: gate.test_phase_need_from_rows(gate.anonymous_history_rows(self.root / "admission/anon_peaks.jsonl"), gate.read_reservation(path), "test-host", NOW, 1.2))
 
@@ -2302,6 +2378,45 @@ class QueueLifetimeReaderTests(unittest.TestCase):
             assert isinstance(step.end, gate.ReservationEnded)
             self.assertIsInstance(step.end.end_kind, gate.StepEnd)
             self.assertEqual(step.end, step.intervals[-1].end)
+
+    def test_source_counts_separate_admissions_logical_waits_and_missing_evidence(self) -> None:
+        with AdmissionFixture() as fixture:
+            request = fixture.request(since=fixture.clock.now() - 5)
+            assert isinstance(request.profile, gate.StepProfile)
+            first = only_admitted(fixture.server.handle_request(request))
+            fixture.clock.advance(10)
+            _ = fixture.server.handle_request(wire.TokenWaitRequest("token-return", first.reservation))
+            expected = gate.QueueSourceCounts(
+                admissions={"measured": 1}, memory_waits=(5,), incomplete_memory_waits=0,
+                unsampled_intervals=1, open_intervals=0, completed_steps=0)
+            self.assertEqual(gate.count_queue_sources(gate.read_queue_lifetimes(fixture.state_dir)), expected)
+
+            fixture.clock.advance(20)
+            fixture.free(0)
+            fixture.hold_starts()
+            returned = replace(request, episode="after-token", token_back_at=fixture.clock.now(),
+                sidecar=str(fixture.scope(request.owner)),
+                profile=replace(request.profile, peak=gate.ExpectedPeak(request.profile.peak.bytes, "buildlog", 5)))
+            self.assertIsInstance(fixture.server.handle_request(returned)[0], wire.Wait)
+            fixture.clock.advance(7)
+            fixture.free(60 * GIB)
+            _ = fixture.server.run_pass()
+            second = only_admitted([fixture.server.ledger[returned.episode].reply])
+            expected = replace(expected, admissions={"measured": 1, "buildlog": 1},
+                memory_waits=(12,), open_intervals=1)
+            self.assertEqual(gate.count_queue_sources(gate.read_queue_lifetimes(fixture.state_dir)), expected)
+
+            fixture.scoped_peak(second, GIB)
+            fixture.clock.advance(2)
+            _ = fixture.server.handle_request(wire.ReleaseRequest("finished", second.reservation, 0))
+            expected = replace(expected, open_intervals=0, completed_steps=1)
+            self.assertEqual(gate.count_queue_sources(gate.read_queue_lifetimes(fixture.state_dir)), expected)
+
+            path = fixture.state_dir / "queue_times.jsonl"
+            events = [event for event in gate.anonymous_history_rows(path) if event.get("kind") != "token_gap"]
+            _ = path.write_text("".join(json.dumps(event) + "\n" for event in events))
+            expected = replace(expected, memory_waits=(), incomplete_memory_waits=1)
+            self.assertEqual(gate.count_queue_sources(gate.read_queue_lifetimes(fixture.state_dir)), expected)
 
     def test_cancellation_and_owner_exit_during_token_wait_leave_no_completed_step(self) -> None:
         for reason in ("cancelled", "owner_gone"):
@@ -3004,7 +3119,9 @@ class BuildFinalizerTests(BuildPromiseFixture):
             fixture.scoped_peak(grant, 16 * GIB)
             owner = fixture.fixture_owner(400, "next")
 
-            def delayed_generation(configuration: gate.MemoryConfig | None = None) -> gate.BuildHistoryGeneration:
+            def delayed_generation(
+                configuration: gate.MemoryConfig | client.ReadConfigurationAtUse = client.READ_CONFIGURATION_AT_USE,
+            ) -> gate.BuildHistoryGeneration:
                 self.assertIsInstance(configuration, gate.MemoryConfig)
                 fixture.clock.advance(10)
                 self.assertEqual(fixture.server.handle_request(wire.ReleaseRequest(
@@ -5158,10 +5275,27 @@ class QueueLeaveTests(unittest.TestCase):
             fcntl.flock(other, fcntl.LOCK_EX)
             result = self.run_step(None, free, self.nextest_step(ran_args, reservation))
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn(f"nextest: {shared} of {width} test threads, shared with the runs in flight", result.stdout)
+        self.assertRegex(result.stdout,
+            rf"(?m)^nextest: {shared} of {width} test threads; load \d+\.\d{{2}} on [1-9]\d* CPUs "
+            + r"\([^()\n]+\); shared with the runs in flight$")
         self.assertEqual(ran_args.read_text().split()[:4], ["nextest", "run", "--test-threads", str(shared)])
         self.assertEqual(json.loads(reservation.read_text())["test_threads"], shared)
         self.assertEqual(sorted(path.name for path in markers.iterdir()), ["lock", "other.run"])
+
+    def test_full_width_nextest_run_reports_threads_and_load_after_admission(self) -> None:
+        ran_args, reservation = self.root / "args", self.root / "reservation"
+        free = 'printf "MemAvailable: 67108864 kB\\n" > "$BUILDLOG_MEMINFO";'
+        step = ('nextest_logical_cores() { LINT_LOGICAL_CORES=12; }; '
+                + self.nextest_step(ran_args, reservation))
+        result = self.run_step(None, free, step)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.splitlines()[-1].split("|")[:2], ["0", "Granted"])
+        thread_lines = [line for line in result.stdout.splitlines() if line.startswith("nextest:")]
+        self.assertEqual(len(thread_lines), 1)
+        self.assertRegex(thread_lines[0],
+            r"\Anextest: 12 of 12 test threads; load \d+\.\d{2} on [1-9]\d* CPUs \([^()\n]+\)\Z")
+        self.assertEqual(ran_args.read_text().split()[:4], ["nextest", "run", "--test-threads", "12"])
+        self.assertEqual(json.loads(reservation.read_text())["test_threads"], 12)
 
 
 class QueueExplanationTests(MemoryQueueFixture):

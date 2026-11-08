@@ -84,6 +84,7 @@ class TimedResult(TimedResultBase):
         self.open_test: OpenTest | NoOpenTest = NoOpenTest()
         self.outcomes: dict[str, TestStatus] = {}
         self.fixtures: set[str] = set()
+        self.test_labels: dict[str, str] = {}
         self.cpu_times: dict[str, float] = {}
         self.test_cpu_started: float = 0.0
 
@@ -91,6 +92,7 @@ class TimedResult(TimedResultBase):
     def startTest(self, test: unittest.TestCase) -> None:
         self.test_cpu_started = cpu_seconds()
         self.open_test = OpenTest(test.id())
+        self.test_labels[test.id()] = test.id().removeprefix(type(test).__module__ + ".")
         super().startTest(test)
 
     @override
@@ -190,7 +192,7 @@ def test_times(result: TimedResult) -> list[TestTime]:
     for test_id, status, elapsed in timed_outcomes(result):
         fixture = test_id in result.fixtures
         row: TestMeasure = {
-            "test": test_id if fixture else test_id.partition(".")[2] or test_id,
+            "test": test_id if fixture else result.test_labels[test_id],
             "s": elapsed, "status": status,
             "kind": "fixture" if fixture else "test",
             "cpu_s": result.cpu_times.get(test_id, 0.0),
@@ -284,6 +286,15 @@ def fixture_measures(suite: unittest.TestSuite | unittest.TestCase
                 delattr(owner, name)
 
 
+def fixture_label(label: str) -> str:
+    operation, opening, owner = label.partition(" (")
+    if not opening:
+        return label
+    parts = owner.removesuffix(")").split(".")
+    count = 1 if operation.endswith("Module") else 2
+    return f"{operation} ({'.'.join(parts[-count:])})"
+
+
 def write_times(path: Path, result: TimedResult, wall_s: float,
                 fixtures: list[FixtureMeasure]) -> None:
     """Replace the output file without changing the test result on failure."""
@@ -296,6 +307,8 @@ def write_times(path: Path, result: TimedResult, wall_s: float,
             if row["test"] in result.fixtures:
                 cast(TestMeasure, row)["cpu_s"] = sum(
                     fixture["cpu_s"] for fixture in fixtures if fixture["test"] == row["test"])
+        for measure in [*tests, *fixtures]:
+            measure["test"] = fixture_label(measure["test"])
         times: dict[str, object] = {
             "wall_s": wall_s,
             "cpu_s": startup_cpu_s + own.ru_utime + own.ru_stime + children.ru_utime + children.ru_stime,
@@ -342,15 +355,23 @@ def main() -> None:
     if len(sys.argv) != 3:
         print("usage: module_run.py <start_dir> <pattern>", file=sys.stderr)
         sys.exit(2)
-    # Match the import path of python -m unittest from the current folder.
-    sys.path[0] = os.getcwd()
     start_dir, pattern = sys.argv[1:]
     output = os.environ.pop("TEST_TIMES_OUT", None)
     TimedRunner.destination = NoTimesOutput() if output is None else TimesOutput(Path(output))
     try:
-        _ = unittest.main(module=None,
-                          argv=["python -m unittest", "discover", "-s", start_dir, "-p", pattern],
-                          testRunner=TimedRunner)
+        names: list[str] = []
+        for path in sorted(Path(start_dir).resolve().glob(pattern)):
+            candidates: list[tuple[str, ...]] = []
+            for entry in sys.path:
+                base = Path(entry).resolve()
+                if path.is_relative_to(base):
+                    parts = path.relative_to(base).with_suffix("").parts
+                    if all(part.isidentifier() for part in parts):
+                        candidates.append(parts)
+            names.append(".".join(max(candidates, key=len, default=(path.stem,))))
+        suite = unittest.defaultTestLoader.loadTestsFromNames(names)
+        result = TimedRunner(warnings=None if cast(list[str], sys.warnoptions) else "default").run(suite)
+        sys.exit(1 if not result.wasSuccessful() else 5 if result.testsRun == 0 and not result.skipped else 0)
     except SystemExit:
         if "scripts.message.session_send_test_support" in sys.modules:
             from scripts.message import session_send_test_support

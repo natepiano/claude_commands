@@ -15,7 +15,7 @@ class VerifyStepRoutesTests(VerifyStepRoutesFixture):
         stub = original.replace('arguments = sys.argv[1:]', '''arguments = sys.argv[1:]
 if arguments[:1] == ["check"]:
     import sys
-    sys.path.insert(0, str(Path.home() / ".claude"))
+    with open(Path.home() / ".claude/scripts/lib/package_root.py") as package_root: exec(package_root.read(), {"__file__": package_root.name})
     from scripts.direct.test_verify_step_state import read_step_row
     record = read_step_row(os.environ["BUILDLOG_CALL_ID"])
     (Path(os.environ["PACKAGE_ROOT"]) / "compiling-state").write_text(record["state"])

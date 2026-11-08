@@ -4,20 +4,14 @@ from __future__ import annotations
 import json
 import math
 import os
-import sys
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal, NotRequired, TypedDict, cast
+from typing import Literal, NotRequired, TypedDict, cast
 from zoneinfo import ZoneInfo
 
-if TYPE_CHECKING:
-    from . import store
-    from ..lib import conf
-else:
-    from scripts.buildlog import store
-    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
-    from scripts.lib import conf
+from scripts.buildlog import store
+from scripts.lib import conf
 
 
 @dataclass(frozen=True)

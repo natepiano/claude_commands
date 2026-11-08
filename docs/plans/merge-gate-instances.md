@@ -194,7 +194,7 @@ Do not remove coverage or disable the memory scope to qualify Fargate.
 The remaining EC2-specific sections describe the fresh-Spot candidate, not a selected production method.
 Their production launch method waits for Steps A and B, then the concurrency trial.
 Shared requirements remain: exact tree, equal coverage, dedicated gate capacity, bounded cost, result integrity, and confirmed cleanup.
-The ready-image candidate contains NixOS, required store paths, Python, basedpyright, uv, Git, and shells.
+The ready-image candidate contains NixOS, required store paths, Python, uv, Git, and shells.
 It contains no job tree, host credential, session state, or Rust build output.
 A launch template stores settings; it does not contain installed tools.
 Containers require the same tool manifest with separately qualified host integration.
@@ -202,175 +202,100 @@ No candidate receives a production startup deadline from the estimates above.
 
 ## Launch, scale, and termination
 
-This section describes production with fresh Spot. Phase 1 uses the smaller cleanup arrangement below.
-Use one launch template for all gates.
-Use one ordinary `RunInstances` request per attempt, with one instance and an idempotency token.
-Use one-time Spot requests with termination on interruption.
-Set guest shutdown behavior to terminate.
-Set the root EBS volume to delete on termination.
-Create no retained home volume for a gate.
+The production route uses one fresh Spot instance for each merge gate or targeted test.
+`config/cloud_gate.conf` sets the order to `m7a.8xlarge`, then `m7a.4xlarge`.
+The route tries every deployed public zone at 32 vCPU before it tries 16 vCPU.
+It never requests On-Demand capacity.
+The build queue enforces nine cloud slots through `cloud_gate_slots` in `build_admission.conf`.
+The route adds no AWS work queue or autoscaling group.
 
-Twenty ready requests can issue twenty launches concurrently.
-This candidate has no autoscaling group or AWS work queue between requests and instances.
-The existing queue remains the only work queue.
-The twenty-instance limit is a proposed configuration value, not a new local admission rule.
-AWS refusal returns the affected request to natedev.
+Each attempt uses one `RunInstances` request and a saved idempotency token.
+An uncertain reply uses the same saved arguments and token after restart.
+Each launch uses the recorded launch-template version, image, subnet, security group, role, and expiry.
+The request uses one-time Spot, termination on interruption, termination on shutdown, and root deletion on termination.
+No home volume survives the attempt.
 
-The trial reads the regional Standard Spot quota before it creates resources.
-It subtracts the configured Rust box vCPUs to set the trial limit.
-`--vcpus N` overrides the limit and skips the quota read.
-One attempt at each size needs 120 vCPUs when all four attempts overlap.
-Three attempts at every size need 360 vCPUs if all twelve overlap.
-The existing sixteen-vCPU Rust box raises those regional Standard Spot totals to 136 and 376.
-An eighty-vCPU quota leaves 64 vCPUs for this trial when the Rust box runs.
-The automatic limit is 64 for that quota. The attempts then run in smaller groups.
-Twenty concurrent gates need `20 × winning vCPU count + 16` when the Rust box also runs.
-That is 336 vCPUs for sixteen-vCPU workers, or 1,296 for sixty-four-vCPU workers.
-Image construction can require additional capacity.
-AWS lists a default Standard Spot quota of five vCPUs.
-See [Spot quotas](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/using-spot-limits.html), accessed 2026-11-06.
-The current account quota is unknown. Regional quota does not guarantee capacity in zone 2c.
+The default lifetime is 20 minutes, including preparation and result delivery.
+The guest sets an absolute systemd shutdown deadline.
+One EventBridge schedule invokes an expiry Lambda each minute.
+The function terminates only expired instances with this deployment's gate tags.
+Normal completion requests termination and waits for confirmed termination.
+An uncertain launch or termination keeps its cost reservation.
+An AWS outage can delay termination and its final charge.
 
-Each launch record contains its absolute expiry time before the launch request.
-Set the absolute lifetime from measured gate time and its cost reservation.
-It includes startup, tests, upload, and termination delay.
-All lifetimes and intervals belong in configuration read through `conf.py`.
+| Event | Result |
+| --- | --- |
+| Complete result and final log | Validate the result and import its measurements. |
+| Guest death, deadline, or Spot interruption without a final result | Return red. |
+| Lost launch reply | Recover the saved request before any new launch. |
+| Natedev death | Recover the saved attempt; the guest and Lambda retain their deadlines. |
+| No capacity at either size | Use the existing local runner. |
 
-| Event | End action | Queue result |
-| --- | --- | --- |
-| Gate completes | Upload the final result, then shut down. Natedev also requests termination. | Use the complete result. |
-| Gate process dies | The worker service records failure and shuts down. | Red attempt. |
-| Natedev dies | The worker finishes or reaches its absolute expiry, then shuts down. | Recover the stored result, or mark the attempt red. |
-| Guest or worker hangs | An AWS expiry function terminates the expired instance. | Red attempt. |
-| Spot interrupts | Upload available evidence, then terminate. | Red interrupted attempt. |
-| Launch reply disappears | Retry the same idempotent request and reconcile its instance. | Pending until identified, then normal completion or expiry. |
-
-One EventBridge schedule invokes one small Lambda function each minute.
-The function terminates only expired instances tagged for merge gates.
-This is the independent cleanup owner when both natedev and the guest fail.
-The expiry never moves when a service restarts.
-The guest also has an absolute systemd deadline, rather than an inactivity timer.
-Normal completion does not wait for the expiry function.
-An AWS control-plane outage can delay termination; no design can promise zero charges during that outage.
-
-The Lambda function and schedule need separate production permission.
-Steps A and B install neither resource. They use guest shutdown deadlines and command cleanup.
+Nine 32-vCPU gates need 288 Standard Spot vCPUs before the Rust box or image work.
+The user must request any required quota increase.
+A quota does not guarantee free capacity in any zone.
 
 ## Exact tree delivery
 
-Use one private S3 bucket in Ohio for source bundles, request manifests, results, and logs.
-Use HTTPS and instance-role credentials. Use no SSH or Tailscale connection for gate execution.
-Use a public subnet with an automatically assigned public IPv4 address and no inbound rules.
-This avoids a NAT gateway and private endpoint services.
+The gate bucket holds source bundles, request manifests, results, and logs.
+Instances use HTTPS and temporary role credentials. They need no SSH or Tailscale connection.
+Each public subnet has an internet gateway route. The gate security group has no inbound rule.
 
-1. Create the merged commit on natedev.
-2. Export a Git bundle containing that commit and the history needed for its references.
-3. Upload the bundle under its content digest.
-4. Write an attempt manifest with the commit, tree, suites, type paths, image identity, and expiry.
-5. Launch the instance with the manifest location and attempt identity.
-6. Import the bundle into a real, private Git checkout on the instance.
-7. Run the tested checkout's runner and module launcher.
+1. Record the clean checkout's commit and tree on natedev.
+2. Select targeted modules on natedev with the existing affected-module rules.
+3. Export a Git bundle with HEAD, `origin/main`, and the current branch history.
+4. Upload the bundle under its content digest.
+5. Save the request with its selected paths, source identity, and absolute expiry.
+6. Launch the instance with that request and the recorded deployment settings.
+7. Clone the bundle and verify the exact tree before tests.
 
-Include the required `origin/main` and merge-branch references.
-Include a certified ancestor when affected selection uses one.
-Do not send a shallow archive without Git history.
-Do not copy local Git configuration, hooks, credential helpers, private refs, or untracked files.
-The checkout records the real origin URL without a credential.
-No private credential enters the image or source bundle.
-
-The module launcher must come from the tested tree.
-The current runner enforces this at `scripts/production/merge_gate.py:910`.
-The source copy contract requires independent Git metadata at `docs/as-built/gate-checkouts.md:43`.
-Git preserves the commit and tree identities across transfer.
-Natedev compares those identities with the returned result before it publishes anything.
-
-Estimate 5–15 seconds for a 100-MB bundle over the two transfers and checkout.
-Measure the real bundle size and transfer rate in the trial.
-Step A measures this allowance within running-to-gate-start time.
+The guest imports the bundle's `origin/main` reference and sets the public origin URL.
+The bundle contains no local Git configuration, hooks, credential helper, or untracked file.
+The guest runs the module launcher from the tested tree.
+The local route compares the returned attempt, commit, tree, module list, verdict, and host before completion.
 
 ## Test environment and equal meaning
 
-Use a non-root Linux user with a real passwd home, a user systemd manager, and cgroup v2.
-Give it an empty private home and the public configuration from the tested tree.
-Use the same pinned Nix packages as natedev for Python, basedpyright, and the remaining tools.
-Do not copy natedev's private home configuration.
+The trial and production route import one guest implementation from `scripts/aws_target/gate_box.py`.
+The guest uses the deployment host's locked nixpkgs revision and the configured public package list.
+It runs as the unprivileged `gate-trial` user with a private home and user systemd manager.
+Its temporary system profile exposes Python, Chromium, and the shell tools expected by existing fixtures.
+The guest links only the tested tree's public configuration into its home.
 
-| Requirement found in code | File and line | Instance treatment or local work |
-| --- | --- | --- |
-| User scopes and `builds.slice` | `scripts/build_queue/queue_place.py:105`, `:122`, `:290` | Provide the user manager and slice. Keep real scope accounting. Do not set `BUILDLOG_SCOPE=0` for the gate. |
-| Fixed gate memory reservation | `scripts/production/merge_gate.py:337` | The trial uses no admission service or memory reservation on the instance. |
-| Linux process memory and process groups | `scripts/production/merge_gate.py:484`, `:590`, `:1146` | Provide `/proc`, cgroup v2, and normal process permissions. Keep sampling and group cleanup. |
-| Writable tmpfs | `scripts/production/merge_gate.py:1013` | Provide writable `/dev/shm` with space for the gate's temporary files. |
-| Optional shared CPU device | `scripts/production/merge_gate.py:312` | Use the existing absent-device path. One instance has one gate, so it needs no shared `/dev/steve` pool. |
-| Pinned type packages and uv | `scripts/production/merge_gate.py:98`, `:526` | The nightly run needs the full type environment. The cloud tests-only run does not prepare it. Keep uv for tests. |
-| A real basedpyright executable | `scripts/production/test_merge_gate_suites_types.py:36` | Use the Nix basedpyright package for the two tests that run the real tool. |
-| Nix launch environment and trusted home paths | `scripts/lib/nix_env.py:76`; `scripts/lib/test_nix_env_launches.py:54` | Install Nix and the public trusted-root configuration. Existing tests supply their fake launch programs. |
-| bash, zsh, Git, jq, and core tools | `scripts/production/test_smoke_launch.py:35`; `scripts/statusline/test_statusline.py:30`; `scripts/hana_instances/test_hana_instances.py:445` | Install them. Missing zsh must not remove tests from the remote gate. |
-| Fixture homes and public target settings | `scripts/direct/verify_mac_offload_test_support.py:675`, `:722` | Keep fixture creation unchanged. Copy the complete public configuration tree. |
-| Fake Mac and network commands | `scripts/direct/verify_mac_offload_test_support.py:683`, `:690` | Run these tests remotely with their existing fakes. They need no real Mac. |
-| Fake herdr sessions | `scripts/herdr/test_herdr_sessions.py:59`, `:84` | Keep the fixture's herdr executable, process tree, and private XDG paths. No live daemon is required. |
-| Live herdr matcher and downloaded rules | `scripts/herdr/test_detection_rules.py:220` | Keep this complete module on natedev. Its installed rules are outside the transferred tree. |
-| Installed home-script override behavior | `scripts/build_hold/test_override_guard.py:439` | Keep this complete module on natedev. Its passwd-home script is part of the host behavior. |
-| Non-root and OOM score behavior | `scripts/build_hold/test_hold_shortcut.py:124`; `scripts/lint/test_invoke_scope.py:110` | Run without root and without an inherited elevated OOM score. Preserve the existing test conditions. |
-| User time zone | `scripts/lib/user_zone.py:16`, `:31`; `scripts/production/test_merge_gate_ledger.py:63` | Transfer the public zone setting. Record event times in UTC. Keep test-specific zone overrides. |
-| Private logs and tool tripwires | `scripts/production/merge_gate.py:657` | Preserve every per-module environment, fake-tool rule, memory tripwire, and private log directory. |
+The cloud gate runs tests only. It installs no basedpyright package and performs no type check.
+The two tests that required the real checker have left this branch.
+Nightly type checks remain local. An explicit `--type-dirs` request also runs its checker locally.
 
-The two local modules run from the same merged tree during every full gate.
-The remote module list excludes those modules explicitly.
-The final verdict combines the remote jobs, the local modules, and the full-tree type job.
-The local jobs keep their real host identities in reports.
-An affected gate includes the local modules when selection requires them.
-New modules still enter through the existing automatic discovery rule.
-
-The trial runs one full natedev baseline and the combined remote gates on the same tree.
-It compares module identities, test counts, skip identities, verdicts, and type output.
-A new skip cannot substitute for a previously executed test.
-Any additional test that requires natedev remains local until its environment has an equivalent fixture.
-This is the proof of equal coverage, not a claim that Linux hosts behave identically.
-No `scripts/production/full_test.py` exists in this checkout.
+Production sends `SelectedModules`, including a certified empty selection.
+The shared runner uses one job per CPU and the existing module launcher, timeouts, fake tools, and process cleanup.
+Failed production modules receive the existing isolated rerun.
+The trial retains its full-module comparison mode without reruns.
+New modules enter through automatic discovery.
+No module requires a permanent natedev exception in this route.
+The earlier guest proof covered all 18,630 tests at each trial size.
 
 ## Result and queue record
 
-The existing asynchronous record is `BumpGateRecord` in `scripts/production/merge_checkpoint.py:1256`.
-Its location uses Git's `checkpoint-completed/<merge-head>/bump-gate` path.
-See `scripts/production/merge_checkpoint.py:522` and `:1365`.
-Its current result is `pending`, `green`, or `red`.
-It also records the local PID, process start, tip, log, commands, and notice recipients.
-`bump_gate.py` completes this record after checkpoint commands return.
-See `scripts/production/bump_gate.py:45`.
+Natedev retains each attempt under the checkout's Git `cloud-gates/<attempt>` directory.
+The directory holds the bundle, request, deployment settings, launch arguments, instance identity, result, log, and import marker.
+`current.json` identifies the recoverable attempt for the same commit, tree, mode, and timeout.
+A completed retry uses a new identity and retains the previous evidence.
 
-Keep this record on natedev. Keep its existing result values and notice delivery.
-Add one execution field with distinct local and EC2 variants.
-The EC2 variant holds the attempt identity, instance identity, image identity, expiry, artifact path, and failed modules.
-Keep the local supervisor's PID and process start for existing liveness handling.
-Do not create another merge queue or replace the recorded commands.
-Ordinary synchronous gates return the combined `GateRun` through the same backend call.
+The guest pushes its log every five seconds by default.
+The final log must arrive before a result can complete the gate.
+The result contains final jobs, first failures, isolated reruns, timeouts, CPU use, memory peaks, and an explicit `gate_run` record.
+The route validates the attempt, commit, tree, modules, host, and verdict.
+Partial logs cannot complete a gate. A dead instance without a final result is red.
+A remote test failure remains red and never starts a local retry.
 
-The worker uploads module logs as jobs finish.
-It uploads one final result after process cleanup.
-That result includes every final module status, first failure, isolated rerun, killed reason, type output, and skip list.
-It also includes wall time, CPU seconds, memory peaks, source identity, and the gate buildlog record.
-The final object is the completion signal. Partial logs cannot complete a gate.
+The route imports the explicit buildlog record once by its identity under the real remote host.
+It uses `scripts/test_times/gate_record.py` for module measurements.
+It adds no gate host to the build-target registry or peer sync service.
+The synchronous caller receives the existing `GateRun` shape and exit behavior.
 
-The local supervisor accepts a pass only from the current attempt and exact tested tree.
-It requires the existing `GateRun.passed` meaning and successful required artifact delivery.
-It then combines the local module results and records green or red.
-Existing completion already rejects a superseded local runner at `scripts/production/merge_checkpoint.py:1351`.
-Extend that comparison to the EC2 attempt identity.
-A late result from an old attempt cannot overwrite a retry.
-
-A dead instance without a complete result is red, never green.
-After supervisor restart, reconcile the saved attempt before creating another instance.
-A retry gets a new attempt identity and preserves the failed attempt's evidence.
-The queue can start the same tree again.
-
-Reuse `scripts/test_times/gate_record.py:66` for the gate measurements.
-Import its `gate_run` record on natedev once by record identity.
-Keep the real remote host in the record, as written at `scripts/test_times/gate_record.py:216`.
-The current writer only warns when a record write fails.
-Remote completion must therefore return the record explicitly, rather than infer success from that warning path.
-Do not add short-lived hosts to the build-target registry or the regular peer sync service.
-These jobs are merge gates, not Rust offload attempts.
+The queue phase will add cloud execution details and progress to `BumpGateRecord` and its displays.
+This phase preserves that record and its existing notices.
+The queue still owns admission, slot enforcement, cancellation display, and later progress display.
 
 ## Reuse and the cache claim
 
@@ -406,22 +331,11 @@ Measure a cold full gate, a repeated full gate, and an affected gate to quantify
 
 ## Spot behavior
 
-Fresh EC2, Batch, and EKS gate candidates use Spot.
-The warm-pool comparison uses On-Demand capacity; production purchase mode waits for the trial.
-Short jobs reduce the amount of work lost per interruption, but they do not eliminate interruption risk.
-No measured interruption rate for this type and zone was supplied.
-
-AWS provides a best-effort two-minute interruption notice.
-See [interruption notices](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/spot-instance-termination-notices.html), accessed 2026-11-06.
-The worker stops launching modules, stops its owned process groups, and uploads available evidence.
-It reports an interrupted red attempt.
-The queue retries the exact tree or sends it to natedev.
-It does not resume a partial test pass or certify the interrupted tree.
-No persistent Spot request replaces the terminated instance automatically.
-
-At a hypothetical 5% interruption probability, full-cost retries multiply expected cost by `1 / 0.95`, or about 1.053.
-That is a sensitivity estimate, not a measured probability.
-Local fallback avoids repeated demand on an unavailable Spot pool.
+The route tries every configured zone at the preferred size before the smaller size.
+Both sizes use Spot. The route never requests On-Demand capacity.
+An interruption without a valid final result produces a red attempt.
+The saved log and cost evidence remain available for a later retry.
+Only capacity refusal at both sizes permits capacity fallback to natedev.
 
 ## Money and shared limits
 
@@ -486,133 +400,100 @@ No private state was read to invent that number.
 
 ### Ledger change
 
-The current ledger describes one instance observation stream.
-See `scripts/aws_target/ledger.py:33` and `:66`.
-It also permits only one unresolved compute request at `scripts/aws_target/ledger.py:669`.
-Appending twenty workers to that stream would misprice overlapping intervals.
-This code cannot account for the proposed fleet unchanged.
+The shared ledger keeps gate reservations separate from the Rust instance observation stream.
+One cost lock covers each admission decision and reservation.
+Both workloads use the existing $20 daily cap and $400 monthly cap from `aws_target.conf`.
+Gate reservations also constrain Rust admission.
 
-**aws-unit** adds per-attempt launch reservations and per-instance charged intervals to the existing cost authority.
-Keep these separate from the Rust box's observations and control state.
-Sum both workloads before the existing live-limit decision at `scripts/aws_target/ledger.py:797`.
-Take one cost lock across the decision and reservation, before each launch.
-Concurrent queue requests must not spend the same remaining dollars.
+Each gate reserves the configured maximum hourly Spot price through its absolute expiry, plus the configured attempt allowance.
+The defaults reserve `$0.8 × 20/60 + $0.02` before launch.
+Reservations split across accounting days and months.
+Confirmed termination or confirmed absence releases the unused portion.
+An uncertain launch or termination keeps charging until reconciliation proves its end.
+The existing safety reserve remains in every cap decision.
 
-Reserve the configured maximum Spot price through the absolute expiry, plus storage, transfer, and termination allowance.
-Release unused reservation only after confirmed termination or confirmed absence of resources.
-Retain an uncertain launch reservation across a lost API reply or controller restart.
-Split reservations across accounting days and months when a job crosses their boundary.
-The caps therefore constrain twenty launches as well as one launch.
-
-For twenty workers, reserve `20 × winning type's configured maximum hourly price × lifetime hours`, plus other charges.
-At a hypothetical $0.30/hour maximum, twenty one-hour compute reservations total $6 before other charges.
-That example does not price every trial size or select a winner.
-The user-run price stage records the configured maximum before routing starts.
-
-Use the existing cost-scope tag for both workloads and a separate workload tag for their reports.
-Tag instances, volumes, snapshots, and the shared resources.
-Reuse one UTC Cost Explorer query and its saved-reply recovery at `scripts/aws_target/ledger.py:743`.
-Apply each actual charge once across the combined estimate.
-Keep the configured query fee in the total.
-Do not query Cost Explorer from each worker.
-Refresh combined charges when either workload needs them, even when Rust offload is disabled.
-The gate switch must not enable Rust offload or start the Rust box.
-Accounting-day costs still use the configured accounting zone. Performance comparisons use the report's local day.
+Both workloads use the existing Cost Explorer scope tag and one combined charge query.
+The refresh uses the existing saved-reply recovery and query charge.
+It remains active for gates when Rust offload is disabled.
+Deployment records the shared gate resource price before it creates resources.
+The gate route never starts the Rust box or enables Rust offload.
 
 ## Access and permission questions
 
-Sessions send queue requests. They make no AWS calls.
-The queue daemon on natedev makes the required scoped machine calls.
-The user alone runs deployment administration through `deploy.py`.
-Reuse the existing scaler credential-file design and profile on natedev.
-Keep the credential in the existing private file with mode 0600.
-The service sets `AWS_SHARED_CREDENTIALS_FILE=~/.config/aws-build/credentials` and uses profile `build-scaler`.
-Read its location from service configuration. Never copy it to an instance or the repository.
+Sessions make no AWS call.
+The route starts a user systemd service with the scaler credential file and profile `build-scaler`.
+The service removes inherited AWS key, profile, and config overrides.
+The credential file stays on natedev. The guest receives only temporary instance-role credentials.
+The user alone runs `deploy.py` with administrator access.
 
-The current scaler policy permits start and stop on the Rust instance.
-It also permits describe calls and Cost Explorer reads.
-See `docs/plans/builds-aws/cloudformation.json:703`.
-It does not permit disposable instance launches.
-The following questions describe additional permissions for production with fresh Spot.
-They are not the permission list for Steps A and B.
-They are proposed grants, not permissions this design assumes already exist.
-
-| Permission question for the user | Scope and reason |
+| Added scaler grant | Scope |
 | --- | --- |
-| May the queue daemon receive `ec2:RunInstances`? | Restrict it to the gate image, launch-template settings, subnet, security group, instance profile, and approved type in zone 2c. |
-| May it receive `ec2:CreateTags` during `RunInstances` only? | Set gate ownership, cost scope, attempt, and absolute expiry on each instance and volume. |
-| May it receive `iam:PassRole` for the gate instance role only? | Attach the object-transfer role. Limit the recipient service to EC2. |
-| May it receive `ec2:TerminateInstances` for gate-tagged instances only? | End completed or cancelled gates. Exclude the Rust box. |
-| May it receive `s3:PutObject` within the gate bucket? | Publish source bundles and attempt manifests. |
-| May it receive `s3:GetObject` within the gate bucket? | Read results and logs. |
-| May the worker role receive `s3:GetObject`? | Read public source bundles and its assigned manifest. |
-| May the worker role receive `s3:PutObject`? | Write results only under its own instance's artifact prefix. |
-| May the expiry role receive `ec2:DescribeInstances`? | Find expired gate instances. The action requires regional describe scope. |
-| May the expiry role receive `ec2:TerminateInstances`? | Terminate only gate-tagged instances after their recorded expiry. |
-| May `deploy.py up` install the expiry function and its schedule? | Cleanup must remain available when natedev and the guest both fail. |
+| `ec2:RunInstances` | Deployed image, launch template, security group, public subnets, instance profile, configured types, and Spot market. |
+| `ec2:CreateTags` | Instances and volumes during `RunInstances`, with gate ownership and workload tags. |
+| `iam:PassRole` | The gate role only, passed to EC2 only. |
+| `ec2:TerminateInstances` | Instances with this deployment's gate ownership and workload tags. |
+| `ec2:DescribeInstances` | Regional describe scope, required by EC2. |
+| `ce:GetCostAndUsage` | The combined cost query; AWS requires wildcard resource scope. |
+| `s3:PutObject` | The gate bucket's `source/*` and `requests/*` prefixes. |
+| `s3:GetObject` | The gate bucket's `artifacts/*` prefix. |
 
-Reuse the scaler's existing `ec2:DescribeInstances` and `ce:GetCostAndUsage` grants.
-Pin the launch-template version and image in the deployed local manifest, so runtime needs no image-management grants.
-Use instance-role temporary credentials for object transfer.
-Workers receive no EC2 launch permission, Git credential, or scaler key.
-Use bucket lifecycle rules for log removal. Runtime needs no bucket administration or object deletion grant.
+Launch requests require attempt and expiry tags on instances and volumes.
+The route pins the deployed launch-template version.
+The guest role reads only source and request objects.
+It writes only `artifacts/${aws:userid}/*`, where an instance session uses `<role-id>:<instance-id>`.
+See [IAM policy variables](https://docs.aws.amazon.com/IAM/latest/UserGuide/reference_policies_variables.html).
+Workers receive no launch permission, scaler key, or Git credential.
 
-The trial reads the Standard Spot quota and reserves capacity for the configured Rust box.
-Can the quota support 120 trial vCPUs for one concurrent attempt at every size?
-Can its quota support `20 × winning vCPU count + 16` before fleet routing starts?
-Any required quota increase remains part of the user-run deployment path.
-No new notification, manual approval per gate, or resource check unrelated to this request is proposed.
+The expiry role can describe instances and terminate only this deployment's gate instances.
+It writes only its function's log streams.
+The bucket lifecycle removes old artifacts. Runtime receives no bucket administration or object deletion grant.
+Rust retains its existing resource policies and lifecycle settings.
 
 ## One-command setup and image updates
 
-Extend the existing staged `deploy.py up` command with a separate merge-gate workload.
-The current stage runner appears at `scripts/aws_target/deploy.py:916`.
-The **proposed** user command is:
+The user first deploys the existing Rust foundation stack with its configured inputs.
+The user then runs:
 
-`python3 scripts/aws_target/deploy.py up --workload merge-gates --approve-resources`
+```sh
+python3 scripts/aws_target/deploy.py up --workload merge-gates --approve-resources
+```
 
-This command uses the user's existing deployment inputs and administrator access.
-It creates or reconciles the image, bucket, worker role, launch template, expiry service, and scoped queue policy.
-It records priced inventory before the first charged resource.
-It installs queue integration after the small trial and the later concurrency trial.
-Rerunning it reconciles existing resources rather than creates another fleet.
-It requires no per-instance Tailscale login, SSH setup, console action, or package installation.
-An absent AWS account or unavailable administrator access remains outside a command's ability to create its own authority.
+This command uses the existing administrator credential path.
+It creates an UPDATE change set in that stack and preserves every Rust parameter.
+It rejects a change set that changes a Rust resource.
+It adds the gate bucket, guest role, instance profile, security group, launch template, scaler grants, expiry Lambda, schedule, and log group.
+It records the pinned image, template version, public subnets, nixpkgs revision, and artifact role prefix locally.
+It records the shared resource price before creation.
+A repeated command reconciles the same resources.
 
-Build the image from the selected Nix system and a public tool manifest.
-Include the gate's Python, basedpyright, uv, and shell tools in that manifest.
-A changed manifest causes `up` to build and qualify a new image.
-Publish a new template version after qualification. Let existing attempts finish on their recorded image.
-The queue sends work to natedev when no image matches the required tool manifest.
-The user reruns the same command after a tool change.
+This phase uses the configured NixOS base image and prepares tools at boot.
+The prepared image belongs to plan phase 7.
+That phase will cache only the package list and nixpkgs revision, independent of code changes.
+It will use the machine name `cloud-claude-gate`.
+No image build or queue display ships in this route phase.
 
-The Rust box already records its desired system with its saved image.
-See `scripts/aws_target/box.py:594`.
-Reuse that comparison pattern, not the box's image or Tailscale state.
-Keep a separate gate image record and image tags.
-Gate image updates must not delete the Rust image or its snapshots.
-Put gate settings in a proposed `config/merge_gate_instances.conf`, read through `conf.py`.
-Read the existing caps and placement from `config/aws_target.conf`; do not copy their values into another setting.
+`config/cloud_gate.conf` contains the new settings and their limits.
+`config/aws_target.conf` remains the source for placement, credentials profile, accounting settings, and shared caps.
 
 ## Fallback and separation from Rust
 
-AWS capacity refusal, missing quota, a reached cap, or an unavailable image sends the gate to natedev.
-Use the current local gate and its existing queue admission.
-Do not silently switch to on-demand, another zone, or a larger spending cap.
-A failed remote test remains a red result. Capacity fallback must not erase a reproducible test failure.
-Interrupted infrastructure attempts retain their red evidence before a retry.
+The local runner remains available for four conditions:
 
-The two workloads share deployment administration, scoped credentials, public configuration conventions, accounting limits, and cost reconciliation.
-They do not share instance identity, home volume, claims, slot state, image state, lifecycle service, or artifact directories.
-The Rust box keeps its persistent Spot request, retained home volume, and existing routing.
-The gate template uses one-time requests and disposable root volumes.
-The existing template sets persistent requests and shutdown-to-stop at `docs/plans/builds-aws/cloudformation.json:501` and `:515`.
-Do not change those settings for Rust.
+1. AWS is down.
+2. The image or deployed stack is absent.
+3. The shared daily or monthly cap prevents launch.
+4. Both configured sizes lack Spot capacity in every deployed zone.
 
-Gate termination does not call the Rust `teardown.py` path.
-That path removes the box's compute resources at `scripts/aws_target/teardown.py:290`.
-Gate cleanup names only the recorded gate instance and its disposable resources.
-No new gate host enters `config/build_targets.conf`.
+A remote test failure never permits local fallback.
+Access denial, invalid results, lost logs, and dead instances produce red results.
+An uncertain launch remains recoverable with its existing reservation.
+The route never increases a cap or requests On-Demand capacity.
+
+The workloads share deployment administration, scoped credentials, configuration, and accounting.
+They keep separate instance identities, volumes, lifecycle state, and artifact paths.
+The Rust box retains its persistent Spot request, retained home volume, and shutdown-to-stop behavior.
+Gate cleanup terminates only the recorded disposable gate instance.
+It never calls the Rust teardown path or registers a new build target.
 
 ## Phased build order
 
@@ -657,7 +538,7 @@ Start with one small run:
 The host reads the root `nixpkgs` input revision from `/etc/nixos/flake.lock` before it creates trial resources.
 The guest uses that revision for Python, SQLite, Chromium, and the other Nix packages.
 The guest links `google-chrome` to Chromium for headless chart tests.
-The guest uses Nix basedpyright for the two tests that run the real tool.
+The guest installs no basedpyright package. The two real-tool tests have left this branch.
 The cloud gate matches natedev's `--tests-only` run and prepares no full type environment.
 The tool shell also includes `taplo`, `zsh`, `bash`, `gh`, and Git.
 Root prepares `/bin/bash`, `/bin/zsh`, and Python at `/run/current-system/sw/bin/python3` through a temporary bind mount.
@@ -841,17 +722,16 @@ Keep EKS and Fargate outside implementation until their stated conditions change
 
 ### Phase 3: queue delivery and production cleanup
 
-Owners: **queue**, **sdlc devtools**, and **aws-unit**.
+The route phase supplies launch recovery, result import, shared reservations, and the independent expiry service.
+The queue phase remains separate.
 
-1. Add the backend call and the execution variant to the current queue record.
-2. Import module logs, gate measurements, and buildlog records.
-3. Install the production expiry service with separate permission.
-4. Extend reservations to concurrent attempts.
-5. Prove worker death, supervisor death, lost launch replies, interruption, and cap fallback.
-6. Enable remote queue requests within the measured concurrency.
+1. Add the cloud execution fields to the existing queue record.
+2. Enforce the configured nine cloud slots.
+3. Show module progress from the five-second log snapshots.
+4. Connect queue cancellation to the recorded attempt.
+5. Measure concurrency, capacity refusals, interruptions, and fallback use.
 
-Retain the selected size, method, measurements, and image identity in the deployment record.
-The user supplies any required quota authorization. The shared caps do not change.
+The user supplies any required quota increase. The shared spending caps stay unchanged.
 
 ### Phase 4: retain useful test reuse
 
@@ -863,3 +743,30 @@ Owner: **sdlc devtools**. **queue** carries the selected environment identity.
 4. Compare cold full, repeated full, and affected gates.
 
 This phase changes result reuse. Worker retention follows the selected method.
+
+## Cloud gate resource names
+
+The feature uses `scripts/aws_target/cloud_gate.py` and `config/cloud_gate.conf`.
+The machines use the name `cloud-claude-gate`.
+The instance `Name` tag and the resource `Workload` tags use `cloud-claude-gate`.
+The instance profile has no CloudFormation tag property.
+
+| Resource | Name |
+| --- | --- |
+| Bucket, role, profile, security group, launch template | `cloud-claude-gate-${DeploymentId}` |
+| Expiry role, expiry function, schedule | `cloud-claude-gate-${DeploymentId}-expiry` |
+| Log group | `/aws/lambda/cloud-claude-gate-${DeploymentId}-expiry` |
+
+The box sends logs every `log_push_s=5` seconds.
+The route reads module counters from each log download.
+It writes the existing queue progress format through `progress_profile.publish_counter`.
+
+The route admits with `CloudPlace("aws")` before it requests a box.
+The route uses its own pid as the run identity.
+The build queue releases the slot when the route ends.
+The route passes the reservation sidecar path to the scaler service.
+The service writes module progress and `CloudProgress` beside that path.
+The cloud state records the phase, vCPU count, failed module count, and update time.
+The phases are `requesting`, `setup`, `running`, and `uploading`.
+The route releases cloud admission before local fallback requests memory.
+The route requests no local memory for a cloud gate.

@@ -34,6 +34,12 @@ class BusyPass:
 
 
 @dataclass(frozen=True)
+class UnsubmittedAssignment:
+    dispatch_id: str
+    command: tuple[str, ...]
+
+
+@dataclass(frozen=True)
 class NoOwnPass:
     """The recipient has no active pass."""
 
@@ -41,7 +47,7 @@ class NoOwnPass:
 @dataclass(frozen=True)
 class PaneWorkerResume:
     staff_id: staff.StaffId
-    turn: BusyPass | IdleWorker
+    turn: BusyPass | UnsubmittedAssignment | IdleWorker
 
 
 class PausedSeat(TypedDict):
@@ -102,8 +108,14 @@ def resume_message(why: str, *, move: NoAccountMove | AccountMove = NO_ACCOUNT_M
         lines.append(opening.rstrip() + " First run `~/.claude/scripts/lib/py ~/.claude/scripts/message/send.py pending` "
                      + "for messages kept while you were down, then continue from there; if you were waiting on the user, keep waiting.")
     for pane in workers.panes:
-        turn = f"busy dispatch {pane.turn.dispatch_id}" if isinstance(pane.turn, BusyPass) else "idle"
-        lines.append(f"Worker {pane.staff_id}: {turn}. Continue with this worker's existing conversation.")
+        if isinstance(pane.turn, UnsubmittedAssignment):
+            lines.append(launcher_prompt(pane.staff_id, pane.turn.dispatch_id, pane.turn.command))
+        elif isinstance(pane.turn, BusyPass):
+            lines.append(f"Worker {pane.staff_id}: busy dispatch {pane.turn.dispatch_id}. "
+                         + "Send this step to the worker's existing conversation. "
+                         + f"Continue pass {pane.turn.dispatch_id} in this conversation. Keep the same pass id.")
+        else:
+            lines.append(f"Worker {pane.staff_id}: idle. Continue with this worker's existing conversation.")
     if workers.results:
         lines.append("Resume your workers; do not open new ones.")
         for result in workers.results:
@@ -116,7 +128,7 @@ def resume_message(why: str, *, move: NoAccountMove | AccountMove = NO_ACCOUNT_M
                     lines.append(f"{seat['seat']} ({seat['role']}, idle): paused on its thread; nothing to run now. "
                                  + f"Your next dispatch with --to {seat['seat']} resumes it.")
         lines.append("Each worker continues its own thread; after resuming, send later work with --to as usual.")
-    elif why:
+    elif why and not workers.panes:
         lines.append("Codex workers keep their existing threads. Use assign.sh --to <worker> to resume a paused worker.")
     text = ("\n" if workers.results or workers.panes else " ").join(lines)
     return script_prompt(text)
