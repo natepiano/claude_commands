@@ -12,7 +12,7 @@ from datetime import datetime, timezone
 from decimal import Decimal
 from calendar import monthrange
 import json
-from typing import cast
+from typing import TYPE_CHECKING, cast
 import time
 from pathlib import Path
 import sys

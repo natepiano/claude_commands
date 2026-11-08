@@ -26,7 +26,7 @@ from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
 from enum import Enum
 from pathlib import Path
-from typing import Literal, NotRequired, Protocol, TypedDict, cast
+from typing import TYPE_CHECKING, Literal, NotRequired, Protocol, TypedDict, cast
 
 from scripts.notify import reply_asks
 from scripts.notify import push_texts

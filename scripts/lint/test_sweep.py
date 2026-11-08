@@ -24,7 +24,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from threading import Event
-from typing import Literal, cast, override
+from typing import TYPE_CHECKING, Literal, cast, override
 from unittest import mock
 from zoneinfo import ZoneInfo
 

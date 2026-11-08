@@ -21,7 +21,6 @@ from pathlib import Path
 from typing import cast, override
 
 
-from scripts.production.fake_unit_host import labeled as labeled_host
 from scripts.lib.socket_test_support import short_socket_directory
 from scripts.production import broadcast
 from scripts.production import codex_winddown

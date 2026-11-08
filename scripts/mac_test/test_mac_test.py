@@ -21,7 +21,7 @@ import threading
 import unittest
 from pathlib import Path
 from types import ModuleType
-from typing import NotRequired, TypedDict, cast, final, override
+from typing import TYPE_CHECKING, NotRequired, TypedDict, cast, final, override
 
 from scripts.lib import process_start as process_identity
 

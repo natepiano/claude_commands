@@ -732,10 +732,10 @@ A good vault sync closes the question that its outage filed, through the public 
 
 All of `scripts/buildlog` and every outside importer of its modules use the repository's one import form. Behavior does not change.
 - A module or test module imports a sibling as `from scripts.buildlog import y` or `from scripts.buildlog.y import z`, and another script folder as `from scripts.lib.y import z`.
-- A library module or test module has no `sys.path` line. Seven modules that run by path keep one line before the first project import, `sys.path.insert(0, str(Path(__file__).resolve().parents[2]))`: `cli.py`, `record.py`, `mac_idle.py`, `step_context.py`, `health.py`, `port_lint.py`, `width_trial.py`.
+- No module in `scripts/buildlog` has a `sys.path` line. The seven modules that run by path (`cli.py`, `record.py`, `mac_idle.py`, `step_context.py`, `health.py`, `port_lint.py`, `width_trial.py`) start with the shared `scripts/lib/package_root.py` bootstrap that devtools 3z added (merge of builds f7e3cbce3).
 - A patch string names the root form: `mock.patch("scripts.buildlog.record.x")`. A code string that a test runs in a subprocess imports through the repo root.
 - Outside `scripts/notify`, no file imports a `scripts/notify` module by a bare name.
-- `_register_module_aliases`, `scripts/buildlog/__init__.py` and `test_store_identity.py` do not exist.
+- `_register_module_aliases` and `test_store_identity.py` do not exist. `scripts/buildlog/__init__.py` holds only a docstring; it adopts no bare module, and basedpyright needs it to resolve `scripts.buildlog` to this checkout.
 
 **Files:**
 - `scripts/buildlog/` — every module and test module, in the root form.

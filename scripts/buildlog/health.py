@@ -15,7 +15,6 @@ import fcntl
 import json
 import math
 import os
-import sys
 import tempfile
 import time
 from dataclasses import dataclass

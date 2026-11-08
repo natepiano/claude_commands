@@ -19,25 +19,21 @@ import time
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime
 from pathlib import Path
-from typing import Literal, cast
-
+from typing import TYPE_CHECKING, Literal, cast
 
 from scripts.buildlog import store
 
 SCRIPTS = Path(__file__).resolve().parents[1]
-from scripts.message import send_budget
-from scripts.message import session_send
 
-from scripts.lint import memory_admit
-from scripts.build_queue import admission_client, admission_protocol
-from scripts.direct import step_record
-from scripts.mac_test import mac_test
-from scripts.notify import push_texts
-from scripts.notify.push_catalog import mac_idle_reservation
-from scripts.buildlog import mac_idle_alert as mac_idle_alert
-from scripts.lib.process_failure import failure_detail
-from scripts.lib.user_zone import user_zone
-from scripts.message.unit_labels import unit_labels_for
+if TYPE_CHECKING:
+    from scripts.lint import memory_admit
+    from scripts.direct import step_record
+    from scripts.mac_test import mac_test
+    from scripts.buildlog import mac_idle_alert
+    from scripts.message.unit_labels import UnitLabels
+else:
+    from scripts.direct import step_record
+    from scripts.buildlog import mac_idle_alert
 
 SESSION_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]*")
 

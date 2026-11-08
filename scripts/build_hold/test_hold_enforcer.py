@@ -8,7 +8,6 @@ import os
 import signal
 import shutil
 import subprocess
-import sys
 import tempfile
 import unittest
 from collections.abc import Mapping

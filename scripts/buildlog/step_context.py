@@ -150,7 +150,8 @@ def _output_arguments(arguments: list[str]) -> list[tuple[str, ...]]:
 def step_output_roots(argv: list[str], cwd: str) -> CargoOutputRoots | CargoOutputUnavailable:
     """Use matching exported folders or read the step's Cargo metadata."""
     import json
-    from scripts.lib.cargo_output import CargoOutputRoots, read_cargo_output_roots
+    if not TYPE_CHECKING:
+        from scripts.lib.cargo_output import CargoOutputRoots, read_cargo_output_roots
 
     exported = os.environ.get("BUILDLOG_OUTPUT_ROOTS", "")
     if exported:
@@ -203,7 +204,8 @@ def _output_evidence(argv: list[str], cwd: str, environment: Mapping[str, str]) 
 
 def _parse_output_roots(value: str, evidence: str) -> CargoOutputRoots | CargoOutputUnavailable:
     """Accept exported folders only when the Cargo evidence matches."""
-    from scripts.lib.cargo_output import CargoOutputRoots, CargoOutputUnavailable
+    if not TYPE_CHECKING:
+        from scripts.lib.cargo_output import CargoOutputRoots, CargoOutputUnavailable
 
     parts = value.split("\t")
     if len(parts) != 4 or not evidence or parts[0] != evidence:
@@ -212,7 +214,8 @@ def _parse_output_roots(value: str, evidence: str) -> CargoOutputRoots | CargoOu
 
 
 def _output_roots(metadata: str) -> None:
-    from scripts.lib.cargo_output import CargoOutputRoots, cargo_metadata_output_roots
+    if not TYPE_CHECKING:
+        from scripts.lib.cargo_output import CargoOutputRoots, cargo_metadata_output_roots
 
     roots = cargo_metadata_output_roots(metadata)
     if isinstance(roots, CargoOutputRoots):

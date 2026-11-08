@@ -13,7 +13,7 @@ import sys
 import tempfile
 import threading
 import time
-from typing import Self, TypedDict, cast, override
+from typing import TYPE_CHECKING, Self, TypedDict, cast, override
 
 from scripts.lib import process_start as process_identity
 

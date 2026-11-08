@@ -28,7 +28,7 @@ from scripts.buildlog import mac_idle, mac_idle_alert, sample
 from scripts.mac_test import offload, mac_test
 from scripts.build_queue import admission_protocol as wire, admission_client
 from scripts.build_queue.admission_test_support import AdmissionFixture, caller_admission
-from scripts.buildlog.mac_idle_test_support import NotificationGuardedTestCase, NotificationTransportBlocked, private_sender_acceptance
+from scripts.buildlog.mac_idle_test_support import NotificationGuardedTestCase, NotificationTransportBlocked, PrivateSenderAcceptance, private_sender_acceptance
 from scripts.direct import step_record
 from scripts.lib import conf
 from scripts.lint.memory_test_support import write_config_fixture, fake_memory_readings

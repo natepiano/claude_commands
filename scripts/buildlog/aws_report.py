@@ -7,7 +7,7 @@ from datetime import UTC, datetime
 from decimal import Decimal
 import sqlite3
 from statistics import median
-from typing import cast
+from typing import TYPE_CHECKING, cast
 
 if TYPE_CHECKING:
     from scripts.aws_target.measurement import MeasurementUnavailable, number
