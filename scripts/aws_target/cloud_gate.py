@@ -256,7 +256,6 @@ class GateWorker:
                         {'Key': 'Workload', 'Value': 'cloud-claude-gate'}, {'Key': 'Name', 'Value': 'cloud-claude-gate'}, {'Key': 'GateAttempt', 'Value': ledger.text(request, 'attempt')},
                         {'Key': 'ExpiresAt', 'Value': str(request['expires'])},
                         {'Key': policy.cost_explorer_tag_key, 'Value': policy.cost_explorer_tag_value}]
-                import base64
                 arguments: dict[str, object] = {
                     'LaunchTemplate': {'LaunchTemplateId': deployment['template'], 'Version': deployment['version']},
                     'MinCount': 1, 'MaxCount': 1, 'ClientToken': ledger.text(request, 'attempt') + '-' + str(offset),
@@ -264,8 +263,8 @@ class GateWorker:
                     'NetworkInterfaces': [{'DeviceIndex': 0, 'SubnetId': subnet['id'],
                                            'Groups': [deployment['security_group']], 'AssociatePublicIpAddress': True}],
                     'TagSpecifications': [{'ResourceType': kind, 'Tags': tags} for kind in ('instance', 'volume')],
-                    'UserData': base64.b64encode(gate_box.user_data(links, ledger.text(deployment, 'revision'), lifetime,
-                              settings().number('log_push_s'), float(str(request['module_time_limit_s']))).encode()).decode()}
+                    'UserData': gate_box.user_data(links, ledger.text(deployment, 'revision'), lifetime,
+                              settings().number('log_push_s'), float(str(request['module_time_limit_s'])))}
                 launch = {'variant': offset, 'arguments': arguments}
                 save(path, launch)
             self.size_vcpus = int(ledger.text(arguments, 'InstanceType').split('.')[1].removesuffix('xlarge')) * 4
@@ -489,7 +488,8 @@ def run_cloud(repo: Path, *, mode: gate.SuiteMode, full: bool, module_time_limit
                    '--setenv=CONF_DIR=' + str(conf.path('aws_target').parent),
                    '--property=KillMode=control-group', '--property=UMask=0077',
                    '--property=UnsetEnvironment=AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN AWS_CONFIG_FILE AWS_PROFILE',
-                   '--working-directory=' + str(Path(__file__).resolve().parents[2]),
+                   # The installed tree launches the box; the checkout supplies only its source and tests.
+                   '--working-directory=' + str(Path.home() / '.claude'),
                    sys.executable, '-m', 'scripts.aws_target.cloud_gate', '--worker', str(folder), '--directory', str(directory),
                    '--sidecar', str(sidecar)]
         with cloud_reservation(repo, sidecar, mode) as reservation:

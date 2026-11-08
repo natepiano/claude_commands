@@ -13,7 +13,7 @@ import sys
 import tempfile
 import unittest
 from unittest import mock
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import cast, final
 from zoneinfo import ZoneInfo
 
@@ -22,13 +22,16 @@ from scripts.production import showrunners
 from scripts.production import production_doc
 from scripts.production.merge_checkpoint import check_parallel
 
-from scripts.lib import scratch
+from scripts.lib import main_publish, scratch
 
 from scripts.production.merge_checkpoint_test_support import MergeCheckpointFixture, REAL_MERGE_TESTS, STUB, configure_test_environment
 
 
 def setUpModule() -> None:
     configure_test_environment()
+    state = tempfile.TemporaryDirectory()
+    unittest.addModuleCleanup(state.cleanup)
+    unittest.enterModuleContext(mock.patch.dict(os.environ, {"ZONE_STATE": state.name}))
 
 
 class CheckpointTestFolderTests(unittest.TestCase):
@@ -517,7 +520,7 @@ class MacPromotionPathTests(unittest.TestCase):
         assert isinstance(promotion.mac, production_doc.MacCheckout)
         done = subprocess.CompletedProcess(["ssh"], 0, "rc=0\n", "")
         with mock.patch("scripts.production.merge_checkpoint.subprocess.run", return_value=done) as run:
-            merge_checkpoint.pull_mac_checkout(promotion.mac.path, Path("/home/natepiano/.claude"))
+            _ = merge_checkpoint.pull_mac_checkout(promotion.mac.path, Path("/home/natepiano/.claude"))
         argv = cast(list[str], run.call_args.args[0])
         self.assertEqual(argv[:2], ["ssh", "mac"])
         return argv[2]
@@ -530,6 +533,51 @@ class MacPromotionPathTests(unittest.TestCase):
     def test_absolute_mac_path_is_kept(self) -> None:
         remote = self.remote_command("/home/natepiano/.claude, mac /Users/someone/my repo")
         self.assertTrue(remote.startswith("cd '/Users/someone/my repo' && git pull"), remote)
+
+    def test_mac_pull_queues_only_connection_failures_and_preserves_zone_notices(self) -> None:
+        cases = (("offline", 255, "", "", main_publish.MacPullPending),
+                 ("remote failure", 0, "rc=1\n", "", merge_checkpoint.Stop),
+                 ("remote exit 255", 255, "rc=1\n", "", merge_checkpoint.Stop),
+                 ("pulled", 0, "rc=0\n", "", main_publish.MacPulled),
+                 ("pulled with zone", 0, "rc=0\n", "Zone changed", main_publish.MacPulled),
+                 ("offline with zone", 255, "", "Zone changed", main_publish.MacPullPending))
+        for label, code, output, text, expected in cases:
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as folder:
+                state = Path(folder)
+                ssh = state / "ssh"
+                _ = ssh.write_text(f"#!{sys.executable}\nimport sys\n"
+                                   + f"sys.stdout.write({output!r})\n"
+                                   + f"sys.stderr.write({'Mac asleep' if code == 255 else 'pull refused'!r})\n"
+                                   + f"sys.exit({code})\n")
+                ssh.chmod(0o755)
+                config = state / "merge_checkpoint.conf"
+                _ = config.write_text("# whole: 1..\nMAC_PULL_TRIES=2\n"
+                                      + "# range: 0..\nMAC_PULL_RETRY_SECONDS=0\n")
+                with mock.patch.dict(os.environ, {"ZONE_STATE": str(state / "zone"), "CONF_DIR": folder,
+                                                  "PATH": folder + os.pathsep + os.environ["PATH"]}):
+                    waiting = main_publish.PendingMacPull("zone", text, "2026-11-08", "earlier failure")
+                    if text or expected is not main_publish.MacPullPending:
+                        main_publish.queue(waiting)
+                    if expected is merge_checkpoint.Stop:
+                        with self.assertRaises(merge_checkpoint.Stop):
+                            _ = merge_checkpoint.pull_mac_checkout(PurePosixPath("~/.claude"), state)
+                        self.assertEqual(main_publish.read_queue(), waiting)
+                        continue
+                    outcome = merge_checkpoint.pull_mac_checkout(PurePosixPath("~/.claude"), state)
+                    self.assertIsInstance(outcome, expected)
+                    pending = main_publish.read_queue()
+                    if expected is main_publish.MacPullPending:
+                        self.assertIsInstance(pending, main_publish.PendingMacPull)
+                        assert isinstance(pending, main_publish.PendingMacPull)
+                        self.assertEqual(pending.text, text)
+                        self.assertIn("Mac asleep", pending.reason)
+                        self.assertEqual(len(list((state / "zone").iterdir())), 1)
+                        if text:
+                            self.assertEqual((pending.label, pending.since), (waiting.label, waiting.since))
+                    elif text:
+                        self.assertEqual(pending, waiting)
+                    else:
+                        self.assertIsInstance(pending, main_publish.NoPendingMacPull)
 
 
 if __name__ == "__main__":
