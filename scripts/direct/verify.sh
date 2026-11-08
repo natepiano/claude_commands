@@ -4078,7 +4078,7 @@ run_lint_sequence() {
                 exit "$mend_status"
             fi
             if grep -qiE 'rolled back|revert' "$MEND_LOG"; then
-                echo "verify.sh: cargo mend --fix rolled its rewrites back; the tree reproduces it — run /mend_fix" >&2
+                echo "verify.sh: cargo mend --fix rolled its rewrites back; stop and keep the tree for inspection" >&2
             else
                 echo "verify.sh: cargo mend --fix failed; see the output above" >&2
             fi
