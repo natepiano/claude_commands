@@ -1100,7 +1100,13 @@ def remove_marked(path: Path, delete: Callable[[Path], None], *,
         if isinstance(pending, copy_record.UnreadableRecord) and copy:
             raise ScratchError(pending.reason)
         if isinstance(pending, copy_record.NotRegistered) and (copy or isinstance(copy_record.read_record(path / copy_record.RECORD), copy_record.Registered)):
-            _ = update_record(path, removing, removal=True, scratch_settings=scratch_settings)
+            pending = update_record(path, removing, removal=True, scratch_settings=scratch_settings)
+        if isinstance(pending, copy_record.Registered):
+            trust_folder = pending.fields.get("claude_trust_folder")
+            if isinstance(trust_folder, str):
+                from scripts.accounts import accounts
+
+                accounts.set_claude_folder_trust(Path(trust_folder), trusted=False)
         remove_with_cargo_output(path, delete)
         removal_mark(path).unlink(missing_ok=True)
 

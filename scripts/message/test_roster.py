@@ -2155,6 +2155,44 @@ class RosterTests(unittest.TestCase):
         self.assertNotIn("herdr native:w1:p1", without_worker)
         self.assertIn("herdr native:w1:p3", without_worker)
 
+    def test_codex_pane_without_a_session_report_uses_its_process_identity(self) -> None:
+        world = PaneWorld()
+        row = fixture_member("agent", name="process-pane")
+        world.add(row, "w1:p5", family="codex")
+        responses = self._herdr_sessions()
+        responses["--session native agent list"]["stdout"] = json.dumps({"result": {"agents": [
+            {"pane_id": "w1:p5", "agent": "codex", "agent_status": "idle"},
+            {"pane_id": "w1:p6", "agent": "codex", "agent_status": "idle",
+             "agent_session": {"kind": "id", "value": "reported-thread"}},
+        ]}})
+        responses["--session native pane list"] = {"code": 0, "stdout": json.dumps({
+            "result": {"panes": list(world.locations.values())},
+        })}
+        process = world.result("pane", "process-info", "--pane", "w1:p5")
+        outcomes: list[CommandResponse] = [
+            {"code": 0, "stdout": json.dumps({"result": process})},
+            {"code": 1, "stdout": "", "stderr": "private process read failed"},
+        ]
+        for outcome in outcomes:
+            with self.subTest(outcome=outcome):
+                responses["--session native pane process-info --pane w1:p5"] = outcome
+                binary = self._herdr_fixture(responses)
+                with (mock.patch.object(herdr, "herdr_binary", return_value=binary),
+                      mock.patch.object(herdr, "native_process", side_effect=world.native_process)):
+                    found = roster.roster(os.environ, roster.ThisMachine())
+                pane, reported = [entry for entry in found.entries if entry.name.startswith("herdr native:")]
+                if outcome["code"] == 0:
+                    self.assertEqual(pane.thread, roster.CodexThread(str(row.current_session)))
+                    self.assertEqual(pane.reach, roster.Messageable(f"codex:{row.current_session}"))
+                else:
+                    self.assertIsInstance(pane.thread, roster.NoCodexThread)
+                    self.assertEqual(pane.reach, roster.CannotReceiveMessages("interactive Codex in a herdr pane"))
+                self.assertEqual(pane.pane, herdr.HerdrPlace("native", "w1:p5"))
+                self.assertEqual(reported.thread, roster.CodexThread("reported-thread"))
+                self.assertEqual(reported.reach, roster.Messageable("codex:reported-thread"))
+        commands = [cast(list[str], json.loads(line)) for line in (self.root / "herdr.jsonl").read_text().splitlines()]
+        self.assertNotIn(["--session", "native", "pane", "process-info", "--pane", "w1:p6"], commands)
+
     def test_a_herdr_failure_is_a_problem_and_keeps_the_other_roster_rows(self) -> None:
         binary = self._herdr_fixture({"default": {"code": 1, "stdout": json.dumps({
             "error": {"code": "closed", "message": "fixture herdr unavailable"}

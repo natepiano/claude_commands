@@ -35,6 +35,7 @@ from scripts.lib.script_envelope import script_prompt
 from scripts.lib.stop_injection_test_support import InjectedStop, stop_once, stop_in_child
 from scripts.lib.socket_test_support import ShortUnixSocket, short_socket_directory
 from scripts.message import send
+from scripts.message.roster import roster as read_roster
 from scripts.message import repeat_guard
 from scripts.message.relay_identity import relay_session_name
 from scripts.message.relay_test_support import write_relay_record
@@ -5537,22 +5538,31 @@ class PaneWorkerMessageTests(unittest.TestCase):
 
     def codex_agent(self) -> tuple[staff.StaffRow, roster.Roster]:
         """Add one private Codex agent and its pane route."""
-        from scripts.herdr.place import HerdrPlace
+        from scripts.herdr import herdr
 
         row = fixture_member("agent", name="pane-agent")
         self.fixture.world.add(row, "w2:p1", family="codex", workspace="w2", tab="w2:t1")
-        entry = roster.RosterEntry(
-            "natedev", "codex", "freestanding", "herdr reported:w2:p1", "idle",
-            roster.Messageable(f"codex:{row.current_session}"), str(self.fixture.root),
-            roster.NoShowrunner(), roster.NoDirector(), roster.NotAWorker(),
-            thread=roster.CodexThread(str(row.current_session)), pane=HerdrPlace("reported", "w2:p1"),
-        )
-        return row, roster.Roster([entry], [])
+        pane_result = self.fixture.world.result
+
+        def result(*arguments: str, deadline: float = math.inf) -> dict[str, object]:
+            if arguments[:2] == ("agent", "list"):
+                return {"agents": [{"pane_id": "w2:p1", "agent": "codex", "agent_status": "idle"}]}
+            return pane_result(*arguments, deadline=deadline)
+
+        with (mock.patch.object(herdr, "live_sessions", return_value=[{"name": "reported"}]),
+              mock.patch.object(herdr, "herdr_processes", return_value=[]),
+              mock.patch.object(self.fixture.world, "result", side_effect=result)):
+            found = read_roster(os.environ, roster.ThisMachine())
+        observed = roster.Roster([entry for entry in found.entries
+                                  if entry.pane == herdr.HerdrPlace("reported", "w2:p1")], found.problems)
+        return row, observed
 
     def test_codex_pane_agent_resolves_by_staff_and_thread_and_submits_once(self) -> None:
         from scripts.herdr import herdr
 
         row, observed = self.codex_agent()
+        self.assertEqual(observed.entries[0].thread, roster.CodexThread(str(row.current_session)))
+        self.assertEqual(observed.entries[0].reach, roster.Messageable(f"codex:{row.current_session}"))
         routes = [send.resolve_recipient(address, send.LocalOnly(), observed, membership=staff.snapshot())
                   for address in (row.name, f"codex:{row.current_session}")]
         self.assertIsInstance(routes[0], send.CodexPaneRecipient)
