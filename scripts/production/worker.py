@@ -341,6 +341,8 @@ def _dispatch_turn(parent: StaffId, started: worker_panes.OpenWorker, client: he
                    line: str, dispatch_id: str, *, run: Path) -> DispatchComplete | ExitCode:
     name = WorkerName.parse(started.row.name)
     current = started
+    if current.status == herdr.AgentStatus.BLOCKED:
+        return _blocked_question(client, current)
     receipt = dispatch_receipt(current.row, line, dispatch_id, run=run)
     if isinstance(receipt, DispatchEvidenceUnknown):
         print(f"anomaly: {name.value}: {receipt.reason}; no prompt sent", file=sys.stderr)
@@ -353,18 +355,20 @@ def _dispatch_turn(parent: StaffId, started: worker_panes.OpenWorker, client: he
             try:
                 settled = client.wait_turn_end(current.pane, int(seconds * 1000))
             except (herdr.HerdrFailure, subprocess.TimeoutExpired) as error:
-                return _delivery_failure(error)
+                return _delivery_failure(error, client, current)
             if isinstance(settled, herdr.ObservedAgentState):
                 current = replace(current, status=settled.status)
         receipt = dispatch_receipt(current.row, line, dispatch_id, run=run)
         if isinstance(receipt, DispatchNotSubmitted):
+            if current.status == herdr.AgentStatus.BLOCKED:
+                return _blocked_question(client, current)
             if current.status not in (herdr.AgentStatus.IDLE, herdr.AgentStatus.DONE):
                 print(f"{name.value}: agent is {current.status.value}", file=sys.stderr)
                 return ExitCode.BUSY
             try:
                 _agent_command(client, current, "prompt", line)
             except (herdr.HerdrFailure, subprocess.TimeoutExpired) as error:
-                return _delivery_failure(error)
+                return _delivery_failure(error, client, current)
     last_wait_was_quiet = False
     while True:
         record = staff.snapshot()
@@ -391,8 +395,8 @@ def _dispatch_turn(parent: StaffId, started: worker_panes.OpenWorker, client: he
         live_run = isinstance(receipt, DispatchWaitingForRuns) and receipt.has_live_run
         if current.status == herdr.AgentStatus.WORKING or live_run:
             last_wait_was_quiet = False
-        if current.status == herdr.AgentStatus.BLOCKED and not live_run:
-            return ExitCode.BLOCKED
+        if current.status == herdr.AgentStatus.BLOCKED:
+            return _blocked_question(client, current)
         if isinstance(receipt, (DispatchWaitingForRuns, DispatchAwaitingReply)):
             if last_wait_was_quiet:
                 if (isinstance(receipt, DispatchWaitingForRuns) and not receipt.has_live_run
@@ -410,12 +414,25 @@ def _dispatch_turn(parent: StaffId, started: worker_panes.OpenWorker, client: he
         try:
             _agent_command(client, current, "wait")
         except (herdr.HerdrFailure, subprocess.TimeoutExpired) as error:
-            return _delivery_failure(error)
+            return _delivery_failure(error, client, current)
 
-def _delivery_failure(error: herdr.HerdrFailure | subprocess.TimeoutExpired) -> ExitCode:
-    print(str(error), file=sys.stderr)
+
+def _blocked_question(client: herdr.Herdr, worker: worker_panes.OpenWorker) -> ExitCode:
+    print(f"question: {worker.row.name} pane {worker.pane}", file=sys.stderr)
+    try:
+        question = client.read(worker.pane, 40, joined=False, ansi=False)
+    except (herdr.HerdrFailure, OSError, subprocess.SubprocessError) as error:
+        print(f"anomaly: {worker.row.name}: {' '.join(str(error).splitlines())}", file=sys.stderr)
+    else:
+        print(question.rstrip("\n"), file=sys.stderr)
+    return ExitCode.BLOCKED
+
+
+def _delivery_failure(error: herdr.HerdrFailure | subprocess.TimeoutExpired,
+                      client: herdr.Herdr, worker: worker_panes.OpenWorker) -> ExitCode:
     if isinstance(error, herdr.AgentBlocked):
-        return ExitCode.BLOCKED
+        return _blocked_question(client, worker)
+    print(str(error), file=sys.stderr)
     if isinstance(error, subprocess.TimeoutExpired) or error.code in ("agent_prompt_stalled", "timeout"):
         return ExitCode.STALLED
     return ExitCode.UNCERTAIN
@@ -507,6 +524,20 @@ def assign(parent: StaffId, role: WorkerRole, prompt: Path, *, session_dir: Path
     return dispatch(parent, chosen, role, prompt, dispatch_id, session_dir=session_dir, slot=slot,
         phase=phase, kind=kind, lens=lens, launcher_command=launcher_command, reply=reply,
         fix_cause=fix_cause, fix_pass=fix_pass, activity=activity, early_ready=early_ready)
+
+
+def answer(parent: StaffId, name: WorkerName, text: str) -> ExitCode:
+    record = staff.snapshot()
+    row = worker_admission.find_worker(record, parent, name.value)
+    if row is None:
+        print(f"{name.value}: no worker staff row", file=sys.stderr)
+        return ExitCode.REFUSED
+    state = worker_panes.observe_worker(parent, row, record)
+    if not isinstance(state, worker_panes.OpenWorker):
+        return ExitCode.UNCERTAIN
+    client = _client()
+    client.prompt(state.pane, text, target=str(row.current_session))
+    return ExitCode.OK
 
 
 def end(parent: StaffId, name: WorkerName, *,
@@ -751,6 +782,7 @@ class Arguments(argparse.Namespace):
     role: str = ""
     name: str = ""
     prompt: str = ""
+    text: str = ""
     session_dir: str = ""
     slot: str = ""
     phase: str = ""
@@ -773,6 +805,9 @@ def main(arguments: list[str] | None = None) -> int:
         child = commands.add_parser(command)
         if command == "list":
             _ = child.add_argument("--json", action="store_true")
+    answering = commands.add_parser("answer")
+    _ = answering.add_argument("name")
+    _ = answering.add_argument("--text", required=True)
     ending = commands.add_parser("end")
     _ = ending.add_argument("name")
     _ = ending.add_argument("--session-dir", default="")
@@ -825,7 +860,9 @@ def main(arguments: list[str] | None = None) -> int:
             return int(bool(wrong))
         if args.command == "restore":
             return restore(owner.id)
-        if args.command == "end":
+        if args.command == "answer":
+            code = answer(owner.id, WorkerName.parse(args.name), args.text)
+        elif args.command == "end":
             code = end(owner.id, WorkerName.parse(args.name),
                 run=worker_panes.DispatchRun(Path(args.session_dir)) if args.session_dir else worker_panes.HolderRun.CURRENT)
         elif args.command == "add":

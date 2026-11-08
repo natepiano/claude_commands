@@ -13,6 +13,7 @@ import sys
 import time
 from collections.abc import Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 from contextlib import redirect_stderr, redirect_stdout
 from threading import Event
 from typing import Literal, TextIO, cast, final, override
@@ -45,6 +46,8 @@ class DispatchAgent:
         self.fixture = fixture
         self.submitted: list[tuple[str, str]] = []
         self.replies: list[str] = []
+        self.questions: dict[str, str | herdr.HerdrFailure] = {}
+        self.answers: list[tuple[str, str]] = []
         self.waited: list[str] = []
         self.finish_after = 0
         self.wait_count = 0
@@ -91,6 +94,27 @@ class DispatchAgent:
         self.append(pane, "assistant", response)
         self.fixture.world.locations[pane]["agent_status"] = "done"
         self.after_complete(pane)
+
+    def pane_commands(self, case: unittest.TestCase) -> None:
+        run = self.fixture.world.run
+
+        def command(*arguments: str, deadline: float = math.inf) -> str:
+            result = run(*arguments, deadline=deadline)
+            if arguments[:2] == ("pane", "read"):
+                question = self.questions.get(arguments[2], result)
+                if isinstance(question, herdr.HerdrFailure):
+                    raise question
+                return question
+            if arguments[:2] == ("agent", "prompt") and arguments[2] in self.questions:
+                pane, text = arguments[2:4]
+                del self.questions[pane]
+                self.answers.append((pane, text))
+                self.append(pane, "user", text)
+                self.error = ""
+                self.fixture.world.locations[pane]["agent_status"] = "working"
+            return result
+
+        _ = case.enterContext(patch.object(self.fixture.world, "run", side_effect=command))
 
     def consultations(self, case: unittest.TestCase) -> None:
         run = self.fixture.world.run
@@ -153,6 +177,8 @@ class DispatchAgent:
         else:
             raise AssertionError(args)
         if self.error:
+            if self.error == "agent_blocked":
+                self.fixture.world.locations[pane]["agent_status"] = "blocked"
             return subprocess.CompletedProcess(args, 1, json.dumps({"error": {"code": self.error, "message": self.error}}), "")
         return subprocess.CompletedProcess(args, 0, "{}", "")
 
@@ -218,6 +244,7 @@ class WorkerCommandTests(unittest.TestCase):
         atomic_file.write_text_atomic(config, config.read_text().replace("WORKER_TRANSPORT=mesh", "WORKER_TRANSPORT=herdr")
                                       + "# range: 1..600\nWORKER_SETTLE_SECONDS=30\n")
         self.agent = DispatchAgent(self.fixture)
+        self.agent.pane_commands(self)
         self.run_dir = self.fixture.root / "run"
         self.run_dir.mkdir(exist_ok=True)
         atomic_file.write_text_atomic(Path.home() / ".codex/sessions" / f"{self.fixture.parent.current_session}.jsonl",
@@ -971,9 +998,59 @@ class WorkerCommandTests(unittest.TestCase):
         self.assertEqual(len(self.agent.submitted), 1)
 
     def test_blocked_dispatch_returns_blocked(self) -> None:
+        opened = self.opened()
+        question = "Which output format must I use?\nJSON or Markdown?\n"
+        cases = (("before", question), ("after", question),
+                 ("unreadable", herdr.HerdrFailure("pane read failed\nterminal unavailable")))
+        for stage, visible in cases:
+            with self.subTest(stage=stage):
+                self.agent.questions[opened.pane] = visible
+                self.agent.error = "" if stage == "before" else "agent_blocked"
+                self.fixture.world.locations[opened.pane]["agent_status"] = "idle" if stage == "after" else "blocked"
+                with redirect_stderr(io.StringIO()) as errors:
+                    self.assertEqual(self.dispatch(), worker.ExitCode.BLOCKED)
+                expected = visible if isinstance(visible, str) else "anomaly: impl: pane read failed terminal unavailable\n"
+                self.assertEqual(errors.getvalue(), f"question: impl pane {opened.pane}\n" + expected)
+                self.assertEqual(len(self.agent.submitted), 0 if stage == "before" else 1)
+        self.assertIn(("pane", "read", opened.pane, "--source", "recent", "--lines", "40"), self.fixture.world.commands)
+
+    def test_answer_continues_a_blocked_dispatch_and_refuses_another_parents_worker(self) -> None:
+        opened = self.opened()
+        self.agent.questions[opened.pane] = "Which output format must I use?"
         self.agent.error = "agent_blocked"
-        self.assertEqual(self.dispatch(), worker.ExitCode.BLOCKED)
+        with redirect_stderr(io.StringIO()):
+            self.assertEqual(self.dispatch(), worker.ExitCode.BLOCKED)
+        active = progress_history.active_dispatch(opened.row.id, self.run_dir)
+        self.assertIsInstance(active, progress_history.ActiveDispatch)
+        answer_text = "Use JSON."
+        for index, reported in enumerate((True, False), start=1):
+            with self.subTest(reported=reported):
+                self.agent.questions[opened.pane] = "Which output format must I use?"
+                self.fixture.world.locations[opened.pane]["agent_status"] = "blocked"
+                if not reported:
+                    _ = self.fixture.world.locations[opened.pane].pop("agent_session", None)
+                    pid = self.fixture.world.foreground[opened.pane][0]
+                    process = self.fixture.world.processes[pid]
+                    self.fixture.world.processes[pid] = replace(process, identity=herdr.RolloutThread(opened.row.current_session))
+                self.assertEqual(self.command("answer", "impl", "--text", answer_text), (0, "done\n", ""))
+                self.assertEqual(len(self.agent.answers), index)
+                self.assertEqual(self.agent.answers[-1][0], opened.pane)
+                self.assertIn(answer_text, self.agent.answers[-1][1])
+                self.assertEqual(self.fixture.world.locations[opened.pane]["agent_status"], "working")
+        self.assertEqual(self.dispatch(), worker.ExitCode.OK)
         self.assertEqual(len(self.agent.submitted), 1)
+        self.assertEqual(self.agent.waited, [opened.pane])
+        self.assertIn(self.agent.final, self.reply.read_text())
+        assert isinstance(active, progress_history.ActiveDispatch)
+        self.assertIn("DONE " + active.instance_id, self.reply.read_text())
+        self.assertEqual(progress_history.active_dispatch(opened.row.id, self.run_dir), active)
+        other = fixture_member("unit", name="other-unit", parent=self.fixture.parent.parent)
+        foreign = fixture_member("worker", name="foreign", parent=other.id)
+        self.fixture.world.add(foreign, "w2:p7", workspace="w2", tab="w2:t2")
+        self.agent.questions["w2:p7"] = "Which output format must I use?"
+        self.assertEqual(self.command("answer", foreign.name, "--text", "Use Markdown."),
+                         (worker.ExitCode.REFUSED, "", "foreign: no worker staff row\n"))
+        self.assertEqual(len(self.agent.answers), 2)
 
     def test_working_worker_that_reaches_done_receives_one_prompt(self) -> None:
         opened = self.opened()

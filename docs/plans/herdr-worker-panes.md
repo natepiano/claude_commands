@@ -3201,7 +3201,7 @@ A pane holds a worker only while it works. After a director accepts a pass and s
 
 **Gotchas:** a test that expects a worker to reopen needs an active dispatch with a `launcher_command` (`progress_history.begin_dispatch`) and a patched `worker._resume_launcher`; without a live director session, `_resume_launcher` prints "director session is unavailable".
 
-### Phase 28 — A director answers a worker's question in its pane  · status: todo
+### Phase 28 — A director answers a worker's question in its pane  · status: done
 
 **Depends on:** Phase 27 and Phase 29 (they edit `scripts/production/worker.py`, `commands/unit/direct.md` and `docs/as-built/herdr-adoption.md`). It lands before Phase 19 (sdlc, 2026-11-07).
 
