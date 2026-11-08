@@ -1888,3 +1888,19 @@ The eight SSH result tests no longer depend on how long an admission pass takes.
 **Ruled out:**
 - A longer `running_pass_seconds`: the frozen clock removes the dependence without a slower interval.
 - Live failure deadlines under the frozen clock: only a broken admission service reaches them, and the test still fails.
+
+### Phase 92 — A merge gate's test files in tmpfs end with their module  · status: done
+**Depends on:** none
+
+#### As-built
+
+A find with no code change; the builds showrunner closed it so on 2026-11-08. At 11:19 UTC the builds slice held 27.48 GiB of shmem. The gate tmpfs is `/dev/shm` (30.2 GiB). In the same window the herdr gate's `test_verify_mac_memory_handoff.py` recorded a 27,000.8 MiB peak and `test_verify_mac_local_release.py` 9,383.4 MiB; their reruns stayed under 254 MiB. The sizes match, so the runaway verify module is the likely writer. The evidence went to builds for verify Phase 41r.
+
+**Files:** none.
+
+**Gotchas:**
+- The files stay only while the module runs. At herdr 7c5e53574, `finish_gate_job` kills the module's process group and removes its `TMPDIR` when the module ends, so `merge_gate.py` has no leak.
+- The gate clone was deleted, so no file list or file sizes remain. The match is by size and time only.
+
+**Ruled out:**
+- A gate cap on a module's `TMPDIR` size: it is a new check that needs the user's approval, and verify Phase 41r fixes the cause.
