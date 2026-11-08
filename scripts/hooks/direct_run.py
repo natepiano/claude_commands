@@ -13,18 +13,18 @@ marker's mtime -- see `_recently_active`.
 """
 
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import json
-import sys
 import time
 from pathlib import Path
-from typing import TYPE_CHECKING, cast
+from typing import cast
 
-if TYPE_CHECKING:
-    from ..lib import unit_runs
-else:
-    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
-    import unit_runs
+from scripts.lib import unit_runs
+from scripts.direct.worker_state import worker_status_paths
 
 # A test's own marker folder; unset, the marker is under either run-folder name.
 ACTIVE_OVERRIDE = unit_runs.environ("ACTIVE_DIR") or None
@@ -83,24 +83,19 @@ def _text(path: Path) -> str:
 
 def running_work(session_dir: Path) -> str | None:
     """Name work in flight, or return None when the unit is waiting."""
-    # A launch that names its phase writes its status in that phase's directory.
-    directories = [session_dir, *(path for path in session_dir.glob("phases/*") if path.is_dir())]
-    statuses = [path for directory in directories for path in directory.glob("*_status*")]
+    statuses = worker_status_paths(session_dir)
     if any(_text(path) in {"implementing", "running"} for path in statuses):
         return "an implementation or fix pass"
     if any(_text(path) == "reviewing" for path in statuses):
         return "a review pass"
-    state_text = _text(session_dir / "progress_history_state.json")
-    if state_text:
-        try:
-            state = cast("dict[str, object]", json.loads(state_text))
-        except json.JSONDecodeError:
-            return None
-        activity = state.get("activity")
-        if isinstance(activity, dict):
-            entry = cast("dict[str, object]", activity)
-            if entry.get("status") == "active":
-                label = entry.get("label")
-                return label if isinstance(label, str) and label else "an activity"
+    try:
+        state = cast("dict[str, object]", json.loads(_text(session_dir / "progress_history_state.json")))
+    except json.JSONDecodeError:
+        return None
+    activity = state.get("activity")
+    if isinstance(activity, dict):
+        entry = cast("dict[str, object]", activity)
+        if entry.get("status") == "active":
+            label = entry.get("label")
+            return label if isinstance(label, str) and label else "an activity"
     return None
-

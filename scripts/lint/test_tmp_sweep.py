@@ -1,14 +1,19 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
 """Tests for tmp_sweep.py on fabricated /tmp roots and a fabricated /proc. Times are two days ahead
 of the clock, so every file a test writes is old, ctime included, unless the test moves it."""
 
 from __future__ import annotations
 
+from scripts.shutdown import remote
+
 import io
 import fcntl
 import json
 import os
+import select
+import signal
 import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -16,16 +21,20 @@ from collections.abc import Generator, Iterator
 from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import cast, override
+from typing import TextIO, cast, override
 from unittest import mock
 
 from scripts.lint import tmp_sweep
+from scripts.copies.copies_test_support import copies_environment
 from scripts.lib import build_folders, copy_record, scratch, test_hang_guard
 from scripts.message import sessions
 from scripts.production import staff
-from scripts.production.staff_test_support import fixture_member, fixture_runtime_id, fixture_worker, isolated_staff_file
+from scripts.production.staff_test_support import StaffTestCase, fixture_member, fixture_runtime_id, fixture_worker, isolated_staff_file
 
-from scripts.lib import conf
+from scripts.lib import conf, unit_runs
+from scripts.herdr import worker_panes
+from scripts.lib.atomic_file import write_text_atomic
+from scripts.herdr import herdr
 from scripts.lib.cargo_output_test_support import fake_cargo_output_roots
 from scripts.lint.memory_test_support import config_environment, write_config_fixture
 
@@ -81,6 +90,7 @@ class TmpSweepCase(unittest.TestCase):
     @override
     def setUp(self) -> None:
         base = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
+        self.enterContext(mock.patch.dict(os.environ, {"HOME": str(base)}))
         _ = (base / "staff.json").write_text('{"schema": 2, "rows": []}')
         self.enterContext(isolated_staff_file(base / "staff.json", {"CODEX_HOME": str(base / "codex")}))
         self.tmp = base / "claude"
@@ -183,7 +193,7 @@ class CopyTests(TmpSweepCase):
         record.update(fields)
         _ = write(path / copy_record.RECORD, json.dumps(record))
         self.enterContext(mock.patch.dict(os.environ, {"SCRATCH_COPIES_ROOT": str(self.tmp / "copies")}))
-        self.now += 8 * DAY
+        self.now = self.now + 8 * DAY
         return path
 
     def test_copy_entries_are_individual_and_empty_pair_goes_after_last_copy(self) -> None:
@@ -195,7 +205,7 @@ class CopyTests(TmpSweepCase):
         self.assertTrue(live.parent.exists())
         self.assertIn(str(self.tmp / "copies"), result.kept[tmp_sweep.ROOT])
         _ = write(live / copy_record.RECORD, json.dumps({"task": "until:2000-01-01T0000Z"}))
-        self.now += 8 * DAY
+        self.now = self.now + 8 * DAY
         _ = self.sweep()
         self.assertFalse(live.parent.exists())
         self.assertTrue((self.tmp / "copies").is_dir())
@@ -259,7 +269,7 @@ class CopyTests(TmpSweepCase):
         _ = subprocess.run(["git", "-C", str(path), "init", "-q"], check=True, capture_output=True)
         scratch.exclude_copy_metadata(path)
         _ = write(path / "ordinary", "new owner's unsaved work")
-        self.now += 8 * DAY
+        self.now = self.now + 8 * DAY
         result = self.sweep()
         self.assertTrue((path / "ordinary").is_file())
         self.assertIn(str(path), result.kept[tmp_sweep.UNSAVED_WORK])
@@ -507,7 +517,7 @@ class OwnerEndTests(TmpSweepCase):
         self.assertTrue(folder.exists())
         self.assertIn(str(folder), result.kept[
             "no record proves its owner ended, and it changed in the last 7 days"])
-        self.now += 8 * DAY
+        self.now = self.now + 8 * DAY
         result = self.sweep()
         self.assertFalse(folder.exists())
         self.assertEqual(result.deleted[0].get("reason"),
@@ -531,7 +541,7 @@ class OwnerEndTests(TmpSweepCase):
         self.assertTrue(file.exists())
         self.assertTrue(link.is_symlink())
         self.assertFalse(temporary.exists())
-        self.now += 8 * DAY
+        self.now = self.now + 8 * DAY
         _ = self.sweep()
         self.assertFalse(file.exists())
         self.assertFalse(link.is_symlink())
@@ -908,7 +918,7 @@ class OwnerTests(TmpSweepCase):
         owner = fixture_member("showrunner", name="sweep")
         for run, session in ((live, LIVE_SESSION), (ended, ENDED_SESSION)):
             unit = fixture_member("unit", name=run.name, parent=owner.id, runtime_id=session)
-            _ = write(run / "progress_history_state.json", json.dumps({"unit": unit.name}))
+            _ = write(run / "progress_history_state.json", json.dumps({"owner_staff_id": unit.id}))
         unowned = write(self.unit / "unowned" / "board.log").parent
         result = self.sweep()
         self.assertTrue(live.is_dir())
@@ -937,7 +947,7 @@ class OwnerTests(TmpSweepCase):
             unit = fixture_member("unit", name=run.name, parent=owner.id, runtime_id=session)
             log = write(history / f"{run.name}.jsonl", json.dumps(
                 {"event_type": "run_started", "main_agent": {"session_id": session}}) + "\n")
-            _ = write(run / "progress_history_state.json", json.dumps({"unit": unit.name, "history_file": str(log)}))
+            _ = write(run / "progress_history_state.json", json.dumps({"owner_staff_id": unit.id, "history_file": str(log)}))
         result = self.sweep()
         self.assertTrue(runs[LIVE_SESSION].is_dir())
         self.assertFalse(runs[ENDED_SESSION].exists())
@@ -1294,6 +1304,63 @@ class HandCleanupTests(TmpSweepCase):
 
 
 class WorkerAndGitTests(TmpSweepCase):
+    def test_sweep_removes_a_killed_fresh_gate_but_keeps_unmarked_git_work(self) -> None:
+        source = self.tmp.parent / "fresh-source"
+        source.mkdir()
+        self.git(source, "init", "-q")
+        _ = write(source / "file", "saved\n")
+        self.git(source, "add", "file")
+        self.git(source, "commit", "-qm", "saved")
+        _ = write(source / "file", "working edit\n")
+        code = '''
+from pathlib import Path
+import signal
+import sys
+from scripts.copies import copies
+source = Path(sys.argv[1])
+with copies.standing("verify-unit", source, copies.WorktreeSource("HEAD", source)) as tree:
+    (tree / "untracked").write_text("test output\\n")
+    print(tree.parent, flush=True)
+    signal.pause()
+'''
+        environment = {**os.environ, **copies_environment(self.tmp.parent / "fresh-settings"),
+                       "SCRATCH_ROOT": str(self.tmp / "scratch"),
+                       "PYTHONPATH": str(Path(__file__).resolve().parents[2])}
+        for marked in (True, False):
+            with self.subTest(marked=marked), mock.patch.dict(os.environ, environment):
+                with subprocess.Popen([sys.executable, "-c", code, str(source)], env=environment,
+                                      stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) as child:
+                    try:
+                        assert child.stdout is not None
+                        output = cast(TextIO, child.stdout)
+                        ready, _, _ = select.select([output.fileno()], [], [], 30)
+                        self.assertTrue(ready, "The child must enter the fresh gate before the kill")
+                        line = output.readline().strip()
+                        self.assertTrue(line, "The child must report its fresh task folder")
+                        folder = Path(line)
+                        self.now = time.time() + 8 * DAY
+                        _ = self.sweep()
+                        self.assertTrue(folder.exists(), "The busy lock must protect an expired fresh gate")
+                    finally:
+                        child.kill()
+                        _, errors = child.communicate(timeout=30)
+                    self.assertEqual(child.returncode, -signal.SIGKILL, errors)
+                checkout = folder / "checkout"
+                self.assertEqual((checkout / "file").read_text(), "working edit\n")
+                self.assertEqual((checkout / "untracked").read_text(), "test output\n")
+                if not marked:
+                    record_path = folder / copy_record.RECORD
+                    fields = cast(dict[str, object], json.loads(record_path.read_text()))
+                    del fields["throwaway"]
+                    _ = record_path.write_text(json.dumps(fields))
+                result = self.sweep()
+                if marked:
+                    self.assertFalse(folder.exists())
+                    self.assertIn(str(folder), [entry["path"] for entry in result.deleted])
+                else:
+                    self.assertTrue(folder.exists())
+                    self.assertIn(str(folder), result.kept[tmp_sweep.UNSAVED_WORK])
+
     def git(self, repo: Path, *arguments: str) -> None:
         _ = subprocess.run(["git", "-C", str(repo), "-c", "user.name=test", "-c", "user.email=test@test",
                             *arguments], check=True, capture_output=True, timeout=test_hang_guard.TEST_HANG_GUARD_SECS,
@@ -1576,6 +1643,117 @@ class RunningSessionTests(unittest.TestCase):
         registry = sessions.RegistryRead((), (Path("/sessions/1.json"),))
         with mock.patch.object(sessions, "read_registry", return_value=registry):
             self.assertIsNone(tmp_sweep.running_session_ids())
+
+
+class PaneRunTests(TmpSweepCase):
+    now: float = 0.0
+
+    def test_invalid_run_pin_keeps_the_folder_and_reports_the_cause(self) -> None:
+        payload = write(self.unit / "bad-pin" / "payload")
+        pin = write(payload.parent / "worker_transport", "junk\n")
+        error = io.StringIO()
+        with redirect_stderr(error):
+            result = self.sweep()
+        self.assertTrue(payload.exists())
+        self.assertIn(str(payload.parent), result.kept[tmp_sweep.RunKeepReason.UNREADABLE_RECORD.value])
+        self.assertIn(str(pin), error.getvalue())
+        self.assertIn("invalid worker transport: junk", error.getvalue())
+
+    def test_live_director_keeps_mesh_run_without_an_extra_staff_read(self) -> None:
+        parent = fixture_member("unit", name="mesh-unit", parent=fixture_member("showrunner", name="runner").id,
+                                runtime_id=LIVE_SESSION)
+        payload = write(self.unit / "mesh-run" / "payload")
+        write_text_atomic(payload.parent / unit_runs.STATE_FILE, json.dumps({unit_runs.OWNER_FIELD: parent.id}))
+        write_text_atomic(payload.parent / "worker_transport", "mesh\n")
+        with mock.patch.object(staff, "snapshot", wraps=staff.snapshot) as snapshot, mock.patch.object(
+                staff, "local_snapshot", side_effect=AssertionError("extra local staff read")):
+            result = self.sweep()
+        self.assertTrue(payload.exists())
+        self.assertIn(str(payload.parent), result.kept[tmp_sweep.DIRECTOR_RUNS])
+        self.assertEqual(snapshot.call_count, 1)
+
+    def test_five_states_keep_only_open_or_unproved_runs(self) -> None:
+        parent = fixture_member("unit", name="pane-unit", parent=fixture_member("showrunner", name="pane-runner").id, worktree=staff.PresentWorktree(remote.local_machine(), self.tmp.parent))
+        worker = fixture_worker("reader", parent.id)
+        run = self.unit / "pane-run"
+        self.now = self.now + 8 * DAY
+        cases: tuple[tuple[worker_panes.WorkerPane, bool], ...] = (
+            (worker_panes.OpenWorker(worker, "p1", "t1", herdr.AgentStatus.IDLE), True),
+            (worker_panes.StoppedWorker(worker, "p1", "t1"), False),
+            (worker_panes.ClosedWorker(worker), False),
+            (worker_panes.ProcessUnknownWorker(worker, "p1", "t1", "process unreadable"), True),
+            (worker_panes.UncertainWorker(worker, "pane read incomplete"), True),
+        )
+        for state, keep in cases:
+            payload = write(run / "payload")
+            write_text_atomic(run / unit_runs.STATE_FILE, json.dumps({unit_runs.OWNER_FIELD: parent.id}))
+            write_text_atomic(run / "worker_transport", "herdr\n")
+            write_text_atomic(run / "mesh_roster.json", "not a mesh roster")
+            error = io.StringIO()
+            with self.subTest(state=state), mock.patch.object(unit_runs, "held", return_value=[str(run)]), mock.patch.object(
+                    worker_panes, "observe_parents", return_value={parent.id: [state]}), mock.patch.object(
+                    staff, "snapshot", wraps=staff.snapshot) as snapshot, redirect_stderr(error):
+                result = self.sweep()
+            self.assertEqual(payload.exists(), keep)
+            self.assertEqual(snapshot.call_count, 1)
+            if isinstance(state, (worker_panes.ProcessUnknownWorker, worker_panes.UncertainWorker)):
+                self.assertIn(state.reason, error.getvalue())
+                self.assertIn("reader", error.getvalue())
+                self.assertIn(str(run), result.kept[tmp_sweep.RunKeepReason.UNENDED_WORKER.value])
+
+    def test_pane_worker_thread_keeps_its_session_folder(self) -> None:
+        parent = fixture_member("unit", name="pane-unit", parent=fixture_member("showrunner", name="pane-runner").id, worktree=staff.PresentWorktree(remote.local_machine(), self.tmp.parent))
+        worker = fixture_worker("reader", parent.id)
+        run = self.unit / "pane-run"
+        write_text_atomic(run / "payload", "payload")
+        write_text_atomic(run / unit_runs.STATE_FILE, json.dumps({unit_runs.OWNER_FIELD: parent.id}))
+        write_text_atomic(run / "worker_transport", "herdr\n")
+        state = worker_panes.ProcessUnknownWorker(worker, "p1", "t1", "process unreadable")
+        with mock.patch.object(unit_runs, "held", return_value=[str(run)]), mock.patch.object(
+                worker_panes, "observe_parents", return_value={parent.id: [state]}):
+            use = tmp_sweep.pane_run_use()
+            observed = tmp_sweep.worker_use({str(run): tmp_sweep.RunKeepReason.UNENDED_WORKER}, use)
+        self.assertIn(worker.current_session, observed.threads)
+        self.assertEqual(observed.unreadable_records, ())
+
+    def test_missing_run_member_keeps_the_folder_and_names_the_reference(self) -> None:
+        payload = write(self.unit / "missing-member" / "payload")
+        missing = fixture_runtime_id("absent-sweep-parent")
+        write_text_atomic(payload.parent / unit_runs.STATE_FILE, json.dumps({unit_runs.OWNER_FIELD: missing}))
+        write_text_atomic(payload.parent / "worker_transport", "herdr\n")
+        error = io.StringIO()
+        with redirect_stderr(error):
+            result = self.sweep()
+        self.assertTrue(payload.exists())
+        self.assertIn(missing, error.getvalue())
+        self.assertIn(str(payload.parent), result.kept[tmp_sweep.RunKeepReason.UNREADABLE_RECORD.value])
+
+    def test_malformed_staff_keeps_the_folder_and_names_the_cause(self) -> None:
+        payload = write(self.unit / "bad-record" / "payload")
+        write_text_atomic(self.tmp.parent / "staff.json", "not json")
+        error = io.StringIO()
+        with redirect_stderr(error):
+            result = self.sweep()
+        self.assertTrue(payload.exists())
+        self.assertIn("staff", error.getvalue())
+        self.assertIn(str(payload.parent), result.kept[tmp_sweep.RunKeepReason.UNREADABLE_RECORD.value])
+
+
+class PaneSweepOwnerTests(StaffTestCase):
+    def test_unreachable_owner_keeps_the_run_and_names_the_cause(self) -> None:
+        root = self.root / "tmp"
+        run = root / "unit" / "run"
+        payload = write(run / "payload")
+        roots = tmp_sweep.default_roots(str(root), (str(root / "unit"),), (), (), (), (), ())
+        error = io.StringIO()
+        with self.machine("mac"), mock.patch.dict(os.environ, {"STAFF_TEST_SSH_FAIL": "1"}), mock.patch.object(
+                tmp_sweep, "running_session_ids", return_value=frozenset()), mock.patch.object(
+                tmp_sweep, "process_paths", return_value=tmp_sweep.ProcessUsesKnown([])), redirect_stderr(error):
+            entries = list(tmp_sweep.judge_entries(roots, time.time() + 8 * DAY, str(self.root / "proc")))
+        self.assertTrue(payload.exists())
+        self.assertIn("natedev not reached", error.getvalue())
+        self.assertTrue(any(isinstance(entry, tmp_sweep.KeptEntry) and entry.path == str(run)
+                            and entry.reason == tmp_sweep.RunKeepReason.UNREADABLE_RECORD.value for entry in entries))
 
 
 if __name__ == "__main__":

@@ -1,26 +1,22 @@
 """Retain the launch contract and remove retired identity at caller boundaries."""
 from __future__ import annotations
 
-import sys
 import unittest
-from pathlib import Path
 from unittest.mock import patch
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-import pane_launch
+from scripts.herdr import pane_launch
 from scripts.production import session_labels, staff
 from scripts.lib import legacy_identity
 from scripts.message import sessions
 from scripts.shutdown import pane_record
-import herdr
+from scripts.herdr import herdr
 
 
 class LaunchEnvironmentTests(unittest.TestCase):
-    def test_launch_retains_prefixed_environment_for_its_existing_contract(self) -> None:
+    def test_launch_does_not_retain_staff_environment(self) -> None:
         entry = pane_launch.launch("pane", "native", "/work", {"SHOWRUNNER_UNIT": "demo"}, ["claude"])
-        self.assertEqual(entry["environment"], {"SHOWRUNNER_UNIT": "demo"})
+        self.assertEqual(entry["environment"], {})
 
     def test_shutdown_launch_removes_retired_identity_before_the_locked_launch(self) -> None:
         entry = pane_record.launch("pane", "native", "/work", {"SHOWRUNNER_UNIT": "demo"}, ["claude"])
@@ -31,7 +27,7 @@ class LaunchEnvironmentTests(unittest.TestCase):
         expected = {"CODEX_THREAD_ID": "native", "PATH": "/bin"}
         self.assertEqual(legacy_identity.without_legacy_identity(environment), expected)
         self.assertEqual(environment["STAFF_ID"], "old")
-        labels = session_labels.StaffLabels(staff.StaffSnapshot((), production=False), {}, {})
+        labels = session_labels.StaffLabels(staff.StaffSnapshot((), production=False))
         entry = pane_launch.launch("pane", "native", "/work", {}, ["claude"])
         entry["environment"] = environment
         with (patch.object(legacy_identity, "without_legacy_identity", return_value=expected) as remove,

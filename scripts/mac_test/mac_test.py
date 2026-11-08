@@ -2,6 +2,10 @@
 """Coordinate build-step use of the Mac: one claim per repository, and the Mac block."""
 
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import argparse
 from collections.abc import Generator
@@ -20,39 +24,21 @@ import sys
 import tempfile
 import time
 import threading
-from typing import TYPE_CHECKING, Literal, NotRequired, TypeGuard, TypedDict, cast
+from typing import Literal, NotRequired, TypeGuard, TypedDict, cast
 from urllib.parse import quote
 
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lint"))
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "build_hold"))
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
-import override_guard
-import build_hold
-import offload
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
-import conf
-from user_zone import user_zone
+from scripts.build_hold import override_guard
+from scripts.build_hold import build_hold
+from scripts.mac_test import offload
+from scripts.lib import conf
+from scripts.lib.user_zone import user_zone
 
-if TYPE_CHECKING:
-    from ..message import session_send
-    from ..lib import process_start as process_identity
-    from ..build_targets import target_config
-    from ..build_targets.target_config import ConfigError
-else:
-    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-    from scripts.lib import process_start as process_identity
-    from scripts.message import session_send
-    import target_config
-    from target_config import ConfigError
-
-
-if TYPE_CHECKING:
-    from ..buildlog.mac_idle_alert import MacIdleConfig, MacIdleConfigError, idle_config
-else:
-    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-    from scripts.buildlog.mac_idle_alert import MacIdleConfig, MacIdleConfigError, idle_config
-
+from scripts.message import session_send
+from scripts.lib import process_start as process_identity
+from scripts.build_targets import target_config
+from scripts.build_targets.target_config import ConfigError
+from scripts.buildlog.mac_idle_alert import MacIdleConfigError, idle_config as idle_config
 
 MESSAGE_TIMEOUT_S = 30.0
 
@@ -377,7 +363,6 @@ NO_EXPIRED_BLOCK_LIFT_FAILURE = NoExpiredBlockLiftFailure()
 class MacTestConfig:
     """Mac claim, block and CI settings."""
 
-    idle: MacIdleConfig
     ci_repo: str
     ci_variable: str
     ci_workflow: str
@@ -461,6 +446,7 @@ class CliArguments(argparse.Namespace):
         self.repo_root: str = ""
         self.copy: bool = False
         self.target: str = ""
+        self.leased_slots: list[int] = []
         self.from_pid: int = 0
         self.package: str = ""
         self.verb: offload.MacVerb = "nextest"
@@ -501,20 +487,19 @@ def read_config(target: str = "") -> MacTestConfig:
     settings = config_path(target)
     config = conf.read(settings)
     values = config.values()
-    idle = idle_config(config)
+    platform = offload.configured_ssh_target(target).platform if target else "macos"
+    if platform == "macos":
+        _ = idle_config(config)
     if "ci_repo" not in values:
         ci_repo = config.text("ci_repo")
     else:
         ci_repo = values["ci_repo"]
-    if target:
-        configured = offload.configured_ssh_target(target)
-        if configured.platform == "linux" and ci_repo:
-            raise StateReadError(f"{settings}: ci_repo must be empty for a Linux target")
+    if platform == "linux" and ci_repo:
+        raise StateReadError(f"{settings}: ci_repo must be empty for a Linux target")
     ci_fields = {key: config.text(key) if ci_repo else values.get(key, "")
                  for key in ("ci_variable", "ci_workflow", "ci_job")}
 
     return MacTestConfig(
-        idle=idle,
         ci_repo=ci_repo,
         ci_variable=ci_fields["ci_variable"],
         ci_workflow=ci_fields["ci_workflow"],
@@ -879,7 +864,7 @@ def record_after_unlock() -> Generator[None, None, None]:
 
 
 def start_hold_recorder(event: MacBlockEvent) -> None:
-    command = [sys.executable, str(Path(__file__).resolve().parent.parent / "buildlog" / "record.py"),
+    command = [str(Path(__file__).resolve().parents[1] / "lib/py"), str(Path(__file__).resolve().parent.parent / "buildlog" / "record.py"),
                "hold-event", event.kind, event.target, timestamp(event.block.since), event.block.holder, event.block.reason,
                timestamp(event.at.astimezone(timezone.utc)), timestamp(event.block.expires)]
     try:
@@ -966,12 +951,9 @@ def slot_capacity(paths: StatePaths, scope: ClaimScope) -> int:
     if target_config.uses_legacy_mac_layout(paths.platform) or isinstance(scope, WholeMacScope):
         return 1
     values = conf.read(config_path(paths.target)).values()
-    value = values.get(f"slots.{scope.name}", values.get("slots", ""))
-    if not value and not scope.key:
-        return 1  # Preserve the legacy claim protocol for records without an origin.
-    if not value.isascii() or not value.isdecimal() or int(value) < 1:
-        raise ConfigError(f"slots.{scope.name}: expected a positive integer")
-    return int(value)
+    missing = (target_config.MissingSlotCapacity.REQUIRE_CONFIGURED if scope.key else
+               target_config.MissingSlotCapacity.SINGLE_SLOT)
+    return target_config.slot_capacity(values, scope.name, missing=missing)
 
 
 def affinity_path(paths: StatePaths, scope: RepositoryScope) -> Path:
@@ -1068,7 +1050,7 @@ def delivery_target(delivery: MessageDelivery) -> str:
     try:
         result = subprocess.run(
             [
-                sys.executable,
+                str(Path(__file__).resolve().parents[1] / "lib/py"),
                 str(sessions_script),
                 "socket",
                 f"session:{delivery.name}",
@@ -1572,7 +1554,7 @@ def start_watcher(paths: StatePaths) -> None:
         f"HOME={os.environ.get('HOME', '')}",
         f"PATH={os.environ.get('PATH', '')}",
         *environment,
-        sys.executable,
+        str(Path(__file__).resolve().parents[1] / "lib/py"),
         str(Path(__file__).resolve()),
         "watch",
         *(["--target", paths.target] if paths.registry_selected or paths.target != "mac" else []),
@@ -1608,7 +1590,7 @@ def start_claim_watcher(paths: StatePaths) -> None:
         "--unit", f"mac-test-claim-watch-{os.getpid()}", "--", "/usr/bin/env",
         f"HOME={os.environ.get('HOME', '')}",
         f"PATH={os.environ.get('PATH', '')}",
-        *environment, sys.executable, str(Path(__file__).resolve()), "watch-claim",
+        *environment, str(Path(__file__).resolve().parents[1] / "lib/py"), str(Path(__file__).resolve()), "watch-claim",
         *(["--target", paths.target] if paths.registry_selected or paths.target != "mac" else []),
     ]
     try:
@@ -1779,7 +1761,7 @@ def watch_claim(
         + f"(since {local_time(current['since'], include_zone=False)}) was released at {released_at}: "
         + f"nothing ran on the Mac for {config.claim_idle_minutes:g} minutes, so tests waiting for it can run. "
         + "Claim it again before your next Mac command: "
-        + "python3 ~/.claude/scripts/mac_test/mac_test.py claim --pid $$ "
+        + "~/.claude/scripts/lib/py ~/.claude/scripts/mac_test/mac_test.py claim --pid $$ "
         + f"--what {quoted_what} --worktree {quoted_worktree}{remote_argument} (see /build:mac)."
     )
     print(text, flush=True)
@@ -2073,7 +2055,8 @@ def claim_once(args: CliArguments, paths: StatePaths, scope: ClaimScope,
     for claim in overlapping:
         record = claim.record
         if ("remote_host" in record and record.get("cleanup_pending")
-                and record["pid"] == args.pid and not run_is_kept(record)):
+                and record["pid"] == args.pid and not run_is_kept(record)
+                and (not args.leased_slots or record.get("slot", 1) in args.leased_slots)):
             print(f"leftovers: {record['remote_host']}")
             if "slot" in record:
                 print(f"slot: {record['slot']}")
@@ -2082,12 +2065,15 @@ def claim_once(args: CliArguments, paths: StatePaths, scope: ClaimScope,
         try:
             capacity = slot_capacity(paths, scope)
             slots = preferred_slots(paths, scope, args.worktree, capacity)
+            if args.leased_slots:
+                slots = tuple(slot for slot in slots if slot in args.leased_slots)
         except (OSError, StateReadError, ConfigError) as error:
             print(f"state unreadable: {error}")
             return ClaimFinished(12)
         for claim in overlapping:
             if (claim.record["pid"] == args.pid and claim.record["worktree"] == args.worktree
                     and not run_is_kept(claim.record) and "slot" in claim.record
+                    and (not args.leased_slots or claim.record["slot"] in args.leased_slots)
                     and isinstance(block, NoMacBlock)):
                 print(f"claimed\nslot: {claim.record['slot']}")
                 return ClaimFinished(0)
@@ -2097,6 +2083,16 @@ def claim_once(args: CliArguments, paths: StatePaths, scope: ClaimScope,
                 scope = selected
                 overlapping = ()
                 break
+        else:
+            if args.leased_slots and slots:
+                selected_slot = next((claim.record["slot"] for claim in overlapping
+                                      if run_is_kept(claim.record) and "slot" in claim.record
+                                      and claim.record["slot"] in args.leased_slots), slots[0])
+                scope = RepositoryScope(scope.name, scope.key, selected_slot)
+                overlapping = tuple(claim for claim in claims if scopes_overlap(claim.scope, scope))
+    if (not target_config.uses_legacy_mac_layout(paths.platform) and isinstance(scope, RepositoryScope)
+            and args.leased_slots and scope.slot not in args.leased_slots):
+        return ClaimFinished(11)
     if isinstance(args.remote, str) or reserve_wait:
         for claim in overlapping:
             record = claim.record
@@ -2177,6 +2173,9 @@ def adopt_wait_claim(args: CliArguments, paths: StatePaths, scope: ClaimScope) -
     if len(owners) != 1 or not isinstance(args.remote, str):
         return ClaimFinished(12)
     claim = owners[0]
+    if (not target_config.uses_legacy_mac_layout(paths.platform) and isinstance(claim.scope, RepositoryScope)
+            and args.leased_slots and claim.scope.slot not in args.leased_slots):
+        return ClaimFinished(11)
     # A reservation grants capacity. A later block still prevents new work.
     # Retained remote work keeps its cleanup path.
     if "remote_host" not in claim.record:
@@ -2206,12 +2205,12 @@ def adopt_wait_claim(args: CliArguments, paths: StatePaths, scope: ClaimScope) -
     return ClaimFinished(0)
 
 
-def command_claim_wait(args: CliArguments, paths: StatePaths) -> int:
+def command_claim_wait(args: CliArguments, paths: StatePaths, *, kind: str = "") -> int:
     """Reserve a slot for a live local wait without starting remote work."""
     settings = Path(args.settings) if args.settings else config_path(args.target)
     config = offload.read_config(settings)
     if isinstance(offload.mac_step_eligibility(config, Path(args.repo_root), args.package,
-                                             args.verb, args.target), offload.IneligibleMacStep):
+                                             args.verb, args.target, kind=kind), offload.IneligibleMacStep):
         return 1
     args.worktree = args.repo_root
     args.what = f"{args.verb} {args.package or 'workspace'}"
@@ -2666,6 +2665,7 @@ def parser() -> argparse.ArgumentParser:
     _ = claim.add_argument("--remote", type=remote_host_argument, default=NO_REMOTE_JOB)
     _ = claim.add_argument("--copy", action="store_true")
 
+    _ = claim.add_argument("--leased-slot", dest="leased_slots", type=int, action="append", default=[])
     _ = claim.add_argument("--from-pid", type=int, default=0)
     wait_claim = commands.add_parser("claim-wait")
     _ = wait_claim.add_argument("--pid", type=int, required=True)
@@ -2755,43 +2755,45 @@ class StoppedInstanceEvidence:
     remote_host: str
 
 
-def release_host(paths: StatePaths, generation: str, state: str) -> str:
+def release_host(paths: StatePaths, generation: str) -> str:
     configured = offload.configured_ssh_target(paths.target)
-    if not target_config.is_aws_target(configured) or state not in RELEASE_STATES or not generation:
+    if not target_config.is_aws_target(configured) or not generation:
         raise StateReadError('instance evidence cannot release these claims')
     return offload.read_connection_settings(configured.settings).host
 
 
-def claim_matches_instance(claim: HeldClaim, host: str, generation: str) -> bool:
+def claim_matches_instance(claim: HeldClaim, host: str, generation: str, state: str) -> bool:
+    claim_generation = claim.record.get('instance_generation', '')
     return (claim.record.get('remote_host') == host
-            and claim.record.get('instance_generation') == generation)
+            and bool(claim_generation)
+            and (claim_generation != generation or state in RELEASE_STATES))
 
 
 def capture_release_evidence(paths: StatePaths, generation: str, state: str,
                              observed_at: float) -> StoppedInstanceEvidence:
-    """Capture claims bound to the observed instance and host."""
+    """Capture host claims whose generation ended before the observation."""
     with locked(paths.lock):
-        host = release_host(paths, generation, state)
+        host = release_host(paths, generation)
         claims = tuple(claim for claim in read_claims(paths)
-                       if claim_matches_instance(claim, host, generation)
+                       if claim_matches_instance(claim, host, generation, state)
                        and datetime.fromisoformat(claim.record['since']).timestamp() <= observed_at)
     return StoppedInstanceEvidence(paths.target, generation, state, observed_at, claims, host)
 
 
 def release_stopped_claims(paths: StatePaths, evidence: StoppedInstanceEvidence) -> int:
-    """Release only unchanged claims bound to the confirmed stopped instance."""
+    """Release unchanged claims after a stop or a generation change."""
     if evidence.target != paths.target:
         raise StateReadError('instance evidence does not match the target')
     released = 0
     with locked(paths.lock):
-        host = release_host(paths, evidence.generation, evidence.state)
+        host = release_host(paths, evidence.generation)
         if host != evidence.remote_host:
             raise StateReadError('instance host evidence does not match the target')
         current = {claim.path: claim for claim in read_claims(paths)}
         for claim in evidence.claims:
             if claim.path not in current or current[claim.path].record != claim.record:
                 continue
-            if not claim_matches_instance(claim, host, evidence.generation):
+            if not claim_matches_instance(claim, host, evidence.generation, evidence.state):
                 continue
             proof: dict[str, object] = {'target': evidence.target, 'generation': evidence.generation,
                      'remote_host': host, 'state': evidence.state, 'observed_at': evidence.observed_at,

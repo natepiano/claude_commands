@@ -1,22 +1,21 @@
 """Use private staff records and Git repositories for unit rename tests."""
 from __future__ import annotations
 
-import hashlib
+from scripts.shutdown import remote
+
 import json
 import os
 import shutil
 import shlex
 import sqlite3
 import subprocess
-import sys
 import tempfile
 from collections.abc import Callable, Generator, Iterable
 from contextlib import AbstractContextManager, closing, contextmanager
 from pathlib import Path
-from typing import TYPE_CHECKING, ClassVar, Literal, cast, override
+from typing import ClassVar, Literal, cast, override
 from unittest import mock
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from scripts.herdr import fake_herdr
 from scripts.lint.memory_test_support import config_environment
@@ -26,14 +25,11 @@ from scripts.production.staff_test_support import fixture_member, fixture_runtim
 from scripts.production import staff, unit_config, fake_unit_host
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
-import rename_unit
-import pane_record
-if TYPE_CHECKING:
-    from scripts.style import style_ledger
-else:
-    import style_ledger
+from scripts.production import rename
+from scripts.shutdown import pane_record
+from scripts.style import style_ledger
 
-SCRIPT = Path(__file__).with_name("rename_unit.py")
+SCRIPT = Path(__file__).with_name("rename.py")
 SLUG = "demo"
 
 
@@ -74,11 +70,11 @@ class UnitRenameFixture(StaffTestCase):
         _ = shutil.copytree(self.fixture_snapshot, self.fixture_root)
         self.addCleanup(shutil.rmtree, self.fixture_root)
         self.bind_fixture(self.fixture_root)
-        bind_staff_fixture(self, self.env, {SLUG: ("alpha-unit", "mul_add-unit")},
-                           locations={(SLUG, "alpha-unit"): self.rust / "claude-demo-alpha",
-                                      (SLUG, "mul_add-unit"): self.rust / "claude-demo-mul-add"},
-                           plans={(SLUG, "alpha-unit"): Path("docs/plans/alpha.md"),
-                                  (SLUG, "mul_add-unit"): Path("docs/plans/mul-add.md")})
+        bind_staff_fixture(self, self.env, {SLUG: ("alpha", "mul_add")},
+                           locations={(SLUG, "alpha"): self.rust / "claude-demo-alpha",
+                                      (SLUG, "mul_add"): self.rust / "claude-demo-mul-add"},
+                           plans={(SLUG, "alpha"): Path("docs/plans/alpha.md"),
+                                  (SLUG, "mul_add"): Path("docs/plans/mul-add.md")})
         _ = self.enterContext(mock.patch.object(pane_record, "RECORD_DIR", self.home / ".local/state/herdr-panes"))
         _ = self.enterContext(mock.patch.object(pane_record, "PROC", self.root / "proc"))
 
@@ -103,7 +99,6 @@ class UnitRenameFixture(StaffTestCase):
             "NOTIFIER_STATE_DIR": str(self.root / "state/notifier"),
             "NOTIFIER_SESSIONS_DIR": str(self.root / "state/sessions"),
             "SHOWRUNNER_STATE_DIR": str(self.state),
-            "STALL_WATCH_STATE_DIR": str(self.root / "state/stall-watch"),
             # No waits by default: a test that needs one sets it.
             "RENAME_UNIT_STOP_WAIT": "0", "RENAME_UNIT_LIVE_WAIT": "0",
             "DESIGN_ROLES_STATE": str(self.root / "state/astra/design-roles"),
@@ -137,8 +132,8 @@ class UnitRenameFixture(StaffTestCase):
         _ = self.git("remote", "add", "origin", str(self.origin))
         self.write(self.doc, self.production_doc())
         self.write(self.checkout / "docs/plans/alpha.md",
-                   "# alpha\n\n> **Production:** demo (alpha-unit)\n\nalpha-unit history stays in prose.\n")
-        self.write(self.checkout / "docs/plans/mul-add.md", "# mul_add\n\n> **Production:** demo (mul_add-unit)\n")
+                   "# alpha\n\n> **Production:** demo (alpha)\n\nalpha history stays in prose.\n")
+        self.write(self.checkout / "docs/plans/mul-add.md", "# mul_add\n\n> **Production:** demo (mul_add)\n")
         _ = self.git("add", ".")
         _ = self.git("commit", "-m", "fixture")
         _ = self.git("push", "-u", "origin", SLUG)
@@ -147,7 +142,7 @@ class UnitRenameFixture(StaffTestCase):
             _ = self.git("push", "origin", f"demo-{stem}")
         self.write(self.root / "state/notifier/showrunner-demo/conf",
                    "EVERY=15\nTARGET=session:test-showrunner\nCHECK="
-                   + shlex.join(["zsh", "/scripts/production_check.sh", str(self.doc)]) + "\n")
+                   + shlex.join(["zsh", "/scripts/production_check.sh", fixture_runtime_id(f"showrunner::{SLUG}")]) + "\n")
         # A merge-branch commit the unit has not taken yet: the rename merges it first.
         self.write(self.checkout / "NOTES.md", "after the unit branched\n")
         _ = self.git("add", "NOTES.md")
@@ -161,16 +156,15 @@ class UnitRenameFixture(StaffTestCase):
             f"- **Showrunner checkout:** `{self.checkout}`", "- **Log:** `production.log`",
             f"- **Proposals:** `{self.root / 'issues'}`", "",
             "## Hub files", "", "| File | Owner unit | Other units that touch it |", "| --- | --- | --- |",
-            "| `docs/alpha-unit.md` | alpha-unit | beta-unit (after alpha-unit Phase 2) |",
+            "| `docs/alpha-unit.md` | alpha | beta (after alpha Phase 2) |",
             "", "## Gates", "", "| Gate | Waiting | Waits on | Clears when |", "| --- | --- | --- | --- |",
-            "| alpha-unit gate | beta-unit | alpha-unit Phase 2 | alpha-unit merges |",
-            "| old gate | alpha-unit | beta-unit | cleared 10-01 when alpha-unit merged |",
-            "", "## Production rules", "", "History mentions alpha-unit and stays.", "",
+            "| alpha gate | beta | alpha Phase 2 | alpha merges |",
+            "| old gate | alpha | beta | cleared 10-01 when alpha merged |",
+            "", "## Production rules", "", "History mentions alpha and stays.", "",
         ])
 
     def seed_state(self) -> None:
         old = self.rust / "claude-demo-alpha"
-        self.write(self.stall_path("alpha-unit"), '{"stretch": 17}\n')
         run = self.root / "history/runs/run-1.jsonl"
         self.write(run, "\n".join(json.dumps(event) for event in (
             {"event_type": "run_started", "run_started_at": 1, "working_dir": str(old),
@@ -178,16 +172,16 @@ class UnitRenameFixture(StaffTestCase):
             {"event_type": "phase_started", "phase_instance_id": "p1", "phase_id": "1"},
             {"event_type": "phase_finished", "phase_instance_id": "p1", "phase_id": "1"})) + "\n")
         self.write(self.root / "sessions/s1/progress_history_state.json", json.dumps({
-            "history_file": str(run), "production": SLUG, "unit": "alpha-unit", "worktree": old.name, "branch": "demo-alpha",
+            "history_file": str(run), "production": SLUG, "unit": "alpha", "worktree": old.name, "branch": "demo-alpha",
             "plan_doc": f"{old}/docs/plans/alpha.md"}))
         for name, plan in (("mine", "docs/plans/alpha.md"), ("other-production", "docs/plans/elsewhere.md")):
             self.write(self.root / f"issues/{name}.md", "\n".join([
-                "---", "status: open", "tags: [proposal]", "unit: alpha-unit", f"plan: {plan}",
+                "---", "status: open", "tags: [proposal]", "unit: alpha", f"plan: {plan}",
                 "date_modified: 2026-10-01", "---", "", "A proposal.", ""]))
         for folder, production in (("demo-sr", "demo"), ("other-sr", "other")):
             self.write(self.root / f"vault/showrunners/{folder}/alpha-unit.md", "\n".join([
-                "---", "phase_table: true", f"production: {production}", "unit: alpha-unit", "---", "",
-                "# alpha-unit", ""]))
+                "---", "phase_table: true", f"production: {production}", "unit: alpha", "---", "",
+                "# alpha", ""]))
 
     def write(self, path: Path, content: str) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -199,13 +193,10 @@ class UnitRenameFixture(StaffTestCase):
         self.assertEqual(result.returncode, 0, (arguments, result.stdout, result.stderr))
         return result.stdout.strip()
 
-    def stall_path(self, unit: str) -> Path:
-        digest = hashlib.sha256(f"{SLUG}\0{unit}".encode()).hexdigest()
-        return self.root / "state/stall-watch" / f"{digest}.json"
 
     def rename(self, action: str, old: str = "alpha", new: str = "gamma", *,
                refuse: str = "") -> subprocess.CompletedProcess[str]:
-        arguments = [action, SLUG, old, new, "--scratch", str(self.root / "scratch")]
+        arguments = [action, f"{SLUG}/{old}", new]
         return self.invoke(arguments, refuse=refuse)
 
     def invoke(self, arguments: list[str], *, cwd: Path | None = None,
@@ -227,7 +218,7 @@ class UnitRenameFixture(StaffTestCase):
         # These values are normally bound at interpreter startup. Rebind them for
         # each invocation, including tests that change the shutdown stand-in.
         with mock.patch.object(subprocess, "run", run):
-            return invoke_cli(rename_unit, lambda: rename_unit.main(arguments), arguments,
+            return invoke_cli(rename, lambda: rename.main(arguments), arguments,
                               self.env, cwd or self.checkout, production_state=True)
 
     def assert_ok(self, result: subprocess.CompletedProcess[str]) -> None:
@@ -250,14 +241,14 @@ class UnitRenameFixture(StaffTestCase):
             "- **Log:**", f"- **Kind:** style\n- **Repository:** `{self.checkout}`\n- **Log:**"))
         parent = next(row for row in staff.snapshot().find(kind="showrunner") if row.name == SLUG)
         unit = fixture_member("unit", name="names", parent=parent.id,
-                           worktree=staff.PresentWorktree("natedev", worktree))
+                           worktree=staff.PresentWorktree(remote.local_machine(), worktree))
         _ = unit_config.write(worktree, unit_config.UnitConfig(
             unit_config.PlanFile(plan), unit_config.NoAppPort(), ()))
         for directory in (self.checkout, worktree):
-            self.write(directory / plan, "# Names\n\n> **Production:** demo (names-unit)\n"
-                       + "> **Standing:** style_plan.py\n\nnames-unit history stays.\n")
+            self.write(directory / plan, "# Names\n\n> **Production:** demo (names)\n"
+                       + "> **Standing:** style_plan.py\n\nnames history stays.\n")
         self.write(self.root / "issues/style.md", "---\nstatus: open\ntags: [proposal, style]\n"
-                   + "proposed_by: demo\nunit: names-unit\ndecision: approved\n"
+                   + "proposed_by: demo\nunit: names\ndecision: approved\n"
                    + "date_modified: 2026-10-01\n---\nA style proposal.\n")
         self.env["STYLE_LEDGER_STATE_DIR"] = str(self.root / "state/style")
         database = self.root / "state/style" / self.checkout.name / "ledger.sqlite"
@@ -269,8 +260,8 @@ class UnitRenameFixture(StaffTestCase):
                 "INSERT INTO tickets(id,unit,kind,family,rule,crate,files,sites,rules,rule_blobs,state,"
                 + "branch,checkpoint,created_at,updated_at) VALUES (?,?,'read','names','','.','[]','[]','[]','{}',?,"
                 + "'demo-names','','2026-10-01','2026-10-01')",
-                [("names-unit-1", "names-unit", "merged"), ("names-unit-2", "names-unit", "assigned"),
-                 ("names-unit-3", "names-unit", "queued")],
+                [("names-unit-1", "names", "merged"), ("names-unit-2", "names", "assigned"),
+                 ("names-unit-3", "names", "queued")],
             )
         return worktree, plan, database
 
@@ -295,7 +286,7 @@ class FolderRenameFixture(StaffTestCase):
         identity = staff.native_id(fixture_runtime_id(f"unit:{parent}:{self.old_name}"))
         return staff.StaffRow(identity, "unit", self.old_name, staff.ReportsTo(parent),
             current_session=staff.native_id(fixture_runtime_id("folder-current-after-clear")),
-            worktree=staff.PresentWorktree("natedev", self.source))
+            worktree=staff.PresentWorktree(remote.local_machine(), self.source))
 
     @override
     def setUp(self) -> None:
@@ -330,9 +321,9 @@ class FolderRenameFixture(StaffTestCase):
         _ = self.git("commit", "-m", "fixture")
         _ = self.git("worktree", "add", "-b", f"cargo-liner-{self.old_name}", str(self.source))
         owner = fixture_member("showrunner", name="folder-production",
-            doc=staff.LiveDoc("natedev", self.checkout / "production.md"))
+            doc=staff.LiveDoc(remote.local_machine(), self.checkout / "production.md"))
         row = fixture_member("unit", name=self.old_name, parent=owner.id,
-            worktree=staff.PresentWorktree("natedev", self.source))
+            worktree=staff.PresentWorktree(remote.local_machine(), self.source))
         _ = staff.update_current_session(row.current_session,
             staff.native_id(fixture_runtime_id("folder-current-after-clear")))
         _ = self.configuration.write_text((Path(__file__).resolve().parents[2] / "config/production.conf").read_text())
@@ -345,9 +336,9 @@ class FolderRenameFixture(StaffTestCase):
         return result.stdout.strip()
 
     def command(self, *, new: str = "") -> subprocess.CompletedProcess[str]:
-        from scripts.production import rename_unit as folder_rename
+        from scripts.production import rename as folder_rename
 
-        arguments = ["apply", "folder-production", self.old_name, new or self.new_name]
+        arguments = ["apply", f"folder-production/{self.old_name}", new or self.new_name]
         return invoke_cli(folder_rename, lambda: folder_rename.main(arguments), arguments,
                           dict(os.environ), self.checkout)
 
@@ -382,7 +373,6 @@ class FolderRenameFixture(StaffTestCase):
             path = self.home / ".codex/sessions/2026/11/04" / f"rollout-fixture-{self.owner.current_session}.jsonl"
         path.parent.mkdir(parents=True)
         _ = path.write_text("{}\n")
-
 
 
 class FolderSessionFixture:

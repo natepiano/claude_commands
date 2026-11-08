@@ -131,10 +131,17 @@ The [launch environment](nix-shell-launch.md) describes shared Nix setup and acc
 ## Moves, refusals, and workers
 
 Account moves use the shared stop and resume API.
+Each session attempt writes a request and one confirmed or failed outcome to `~/.local/state/accounts/moves.jsonl`.
+Each attempt has its own move ID and cause.
+A session already on the target writes nothing.
 The [shutdown design](shutdown-and-restart.md) owns process identity, pane reuse, prompt delivery, and recovery details.
 All selected stops finish before the batch resumes any session.
 Each session resumes its own conversation on the target account.
 A selected caller delegates the batch to a detached process before any signal.
+The notes timer delegates its moves through the same boundary before its part deadline can kill them.
+Requests use each session's observed process account, including members outside their selected group account.
+Blocked notices check the queue head and target again before delivery.
+Quota recipients use one session address for both names and IDs.
 Workers keep their threads when their Claude owner moves.
 
 A group move validates the destination before changing the selection or stopping members.
@@ -172,12 +179,32 @@ Without a queued workers move, provider refusal or unavailable included usage ca
 Credit policy determines whether an exhausted account can continue.
 Worker assignment fallback to Claude remains separate from the selected Codex account.
 Routing returns only when the selected Codex account can work and its refusal has resolved.
-The [worker design](long-lived-workers.md) owns thread interruption, continuation, held roles, and server retirement.
+Pane workers move through their dispatch lock, fresh pane evidence, `restart.stop_row`, and `worker_panes.start_or_resume`.
+They keep the same conversation and reuse a stopped pane.
+Only an open pass receives resume text through the shared target check.
+`config/shutdown.conf` sets the stop deadline from `STOP_GRACE_SECONDS`, `KILL_GRACE_SECONDS`, and `MOVE_STOP_MARGIN_SECONDS`.
+Mesh-pinned runs keep the [worker design](long-lived-workers.md) server release path until herdr-worker-panes Phase 19.
 The [quota guide](../quota_alerts.md) owns phone episodes, forecasts, routing notices, and delivery retries.
 
 Login renewal uses named success and failure results.
 The watcher rate-limits attempts and records their reason.
 A failed renewal remains visible; it does not convert a stale reading into a fresh reading.
+
+### Worker move results
+
+`accounts.py move workers <target>` stops same-family workers and leaves their restart pending.
+`assign.sh` cannot yet carry both the fixed staff ID and the destination account for this operation.
+The result names the target account: `stopped, resume pending on <account>: <reason>`.
+
+The preview uses the same family decision before it takes a row lock or stops a source.
+A same-family worker prints `<name> (<id>): would stop; restart on <target> stays pending`.
+A cross-family worker prints `<name> (<id>): not moved: cannot restart on <target> through assign.sh`.
+Unavailable family evidence also refuses the restart.
+The real refusal leaves the source running.
+
+Source release preserves each stop reason and gives the next action.
+The [family handoff](long-lived-workers.md#family-handoff-and-retry) defines its named results and server evidence.
+A session move's opening message selects only its [own worker children](shutdown-and-restart.md#worker-resume-results).
 
 ## Recovery and alert ownership
 

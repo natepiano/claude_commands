@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from scripts.shutdown import remote
+
 import contextlib
 import io
 import json
@@ -12,7 +14,7 @@ from unittest import mock
 from typing import cast
 
 from scripts.hooks import showrunner_footer
-from update_registration import QuestionStaff
+from scripts.production.update_registration import QuestionStaff
 from scripts.production import staff
 from scripts.production.staff_test_support import (
     fixture_member, fixture_runtime_id, isolated_source_readers, isolated_staff_file, source_environment,
@@ -21,6 +23,38 @@ from scripts.statusline import counts_row
 
 
 class QuestionLibraryTests(unittest.TestCase):
+    def test_invalid_timer_text_does_not_hide_a_valid_staff_timer(self) -> None:
+        with tempfile.TemporaryDirectory() as scratch:
+            root = Path(scratch)
+            with (isolated_staff_file(root / "staff.json", {}),
+                  mock.patch.dict(os.environ, {"NOTIFIER_STATE_DIR": str(root)})):
+                owner = fixture_member("showrunner", name="timer-owner")
+                invalid = root / "showrunner-invalid"
+                invalid.mkdir()
+                _ = (invalid / "conf").write_bytes(b"\xff")
+                valid = root / f"showrunner-{owner.id}"
+                valid.mkdir()
+                _ = (valid / "conf").write_text(f"TARGET=session:{owner.id}\n")
+                self.assertEqual(showrunner_footer.targeted_instances(owner.current_session), [valid])
+
+    def test_read_production_uses_one_staff_read_and_the_timer_folder_owner(self) -> None:
+        with tempfile.TemporaryDirectory() as scratch:
+            root = Path(scratch)
+            with (isolated_staff_file(root / "staff.json", {}),
+                  mock.patch.dict(os.environ, {"USER_ZONE": "UTC"})):
+                doc = root / "different-document-production.md"
+                _ = doc.write_text("> **Status: PRODUCTION — running.** Test\n")
+                owner = fixture_member("showrunner", name="hana", doc=staff.LiveDoc(remote.local_machine(), doc))
+                other = fixture_member("showrunner", name="another-owner")
+                instance = root / f"showrunner-{owner.id}"
+                instance.mkdir()
+                _ = (instance / "conf").write_text(f"TARGET=session:{other.id}\n")
+                with mock.patch.object(staff, "snapshot", wraps=staff.snapshot) as read_staff:
+                    production = showrunner_footer.read_production(instance)
+                self.assertEqual(production, showrunner_footer.Production(
+                    owner.name, doc, "UTC", showrunner_footer.NoDailiesSchedule.PAUSED_OR_UNSCHEDULED, owner))
+                read_staff.assert_called_once_with()
+
     def test_deferred_time_reports_missing_owner_and_keeps_a_known_owner(self) -> None:
         with tempfile.TemporaryDirectory() as scratch:
             root = Path(scratch)
@@ -61,13 +95,15 @@ class QuestionLibraryTests(unittest.TestCase):
                 document = root / "unowned-production.md"
                 _ = document.write_text("> **Status: PRODUCTION — running.** Test\n"
                                         + f"- **Efficiency ledger:** {ledger}\n")
-                instance = Path(environment["NOTIFIER_STATE_DIR"]) / "showrunner-unowned"
+                instance = Path(environment["NOTIFIER_STATE_DIR"]) / f"showrunner-{owner.id}"
                 instance.mkdir(parents=True)
                 _ = (instance / "conf").write_text(
-                    f"TARGET=session:{owner.current_session}\nCHECK=zsh /x/production_check.sh {document}\n")
+                    f"TARGET=session:{owner.current_session}\nCHECK=zsh /x/production_check.sh {owner.id}\n")
+                _ = staff.set_doc(owner.id, staff.LiveDoc(remote.local_machine(), document))
+                identities = QuestionStaff.for_record(staff.StaffSnapshot(()))
                 errors = io.StringIO()
                 with contextlib.redirect_stderr(errors):
-                    line, due, paths = counts_row.row(instance)
+                    line, due, paths = counts_row.row(instance, identities=identities)
                 self.assertEqual(line, "For you: 1 efficiency")
                 self.assertEqual(due, "")
                 self.assertIn(document, paths)
@@ -94,12 +130,14 @@ class QuestionLibraryTests(unittest.TestCase):
     def test_read_production_skips_wrapped_doc(self) -> None:
         with tempfile.TemporaryDirectory() as scratch:
             root = Path(scratch)
-            instance = root / "showrunner-demo"
-            instance.mkdir()
             doc = root / "production.md"
             _ = doc.write_text("> **Status: PRODUCTION — wrapped.** demo\n- **User zone:** America/Los_Angeles — demo\n")
-            _ = (instance / "conf").write_text(f"CHECK=zsh /x/production_check.sh {doc}\n")
-            self.assertIsNone(showrunner_footer.read_production(instance))
+            with isolated_staff_file(root / "staff.json", {}):
+                owner = fixture_member("showrunner", name="demo", doc=staff.WrappedDoc(remote.local_machine(), doc))
+                instance = root / f"showrunner-{owner.id}"
+                instance.mkdir()
+                _ = (instance / "conf").write_text(f"CHECK=zsh /x/production_check.sh {owner.id}\n")
+                self.assertIsNone(showrunner_footer.read_production(instance))
 
     def test_counts_and_deferred_time_share_one_question_staff_context(self) -> None:
         with tempfile.TemporaryDirectory() as scratch:
@@ -117,11 +155,11 @@ class QuestionLibraryTests(unittest.TestCase):
                     "> **Status: PRODUCTION — running.** demo\n"
                     + f"- **Proposals:** {folder}\n", encoding="utf-8")
                 owner = fixture_member("showrunner", name="renamed-owner",
-                                       doc=staff.LiveDoc("natedev", doc))
-                instance = Path(environment["NOTIFIER_STATE_DIR"]) / "showrunner-demo"
+                                       doc=staff.LiveDoc(remote.local_machine(), doc))
+                instance = Path(environment["NOTIFIER_STATE_DIR"]) / f"showrunner-{owner.id}"
                 instance.mkdir(parents=True)
                 _ = (instance / "conf").write_text(
-                    f"TARGET=session:{owner.current_session}\nCHECK=zsh /x/production_check.sh {doc}\n",
+                    f"TARGET=session:{owner.current_session}\nCHECK=zsh /x/production_check.sh {owner.id}\n",
                     encoding="utf-8")
                 for title, after in (("Choose the layout", ""), ("Choose the compiler", "2099-01-02T08:00")):
                     fields = {"since": "2000-01-01T08:00", "text": title,

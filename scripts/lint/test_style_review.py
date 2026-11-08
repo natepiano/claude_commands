@@ -223,7 +223,7 @@ class PreparationTests(unittest.TestCase):
         scripts = Path(style.__file__).resolve().parents[1]
         self.assertNotEqual(scripts.parent, self.repo)
         self.assertIn(f'zsh "{scripts}/rust_style/load-rust-style.sh"', assignment)
-        self.assertIn(f'python3 "{scripts}/hooks/banned_words_lib.py" --diff', assignment)
+        self.assertIn(f'"{scripts}/lib/py" "{scripts}/hooks/banned_words_lib.py" --diff', assignment)
         self.assertNotIn("~/.claude/scripts", assignment)
         self.assertNotIn("$scripts", assignment)
 

@@ -13,17 +13,16 @@ from pathlib import Path
 from typing import Literal, TypedDict, cast, final, override
 from unittest.mock import patch
 
-from test_support import ShutdownSendLeaf, ShutdownTestCase
-import remote_control
-import herdr
-import sessions
-import session_pane
+from scripts.shutdown.test_support import ShutdownSendLeaf, ShutdownTestCase
+from scripts.shutdown import remote_control
+from scripts.herdr import herdr
+from scripts.message import sessions
+from scripts.production import session_pane
 from scripts.whoami import quota_alert
-import remote
-import detached
-from push_texts import RenderedPush
-from herdr import HerdrPlace
-from herdr import AgentBlocked
+from scripts.shutdown import remote
+from scripts.lib import detached
+from scripts.notify.push_texts import RenderedPush
+from scripts.herdr.herdr import HerdrPlace, AgentBlocked
 
 
 def unchanged(_at: float) -> None:
@@ -129,11 +128,11 @@ class RemoteControlTests(ShutdownTestCase):
 
         with isolated_staff_file(self.root / "staff.json", {}):
             parent = showrunner_relationship("current")
-            row = fixture_member("unit", name="current-unit", parent=parent.id)
+            row = fixture_member("unit", name="current", parent=parent.id)
             for field in ("sessionId", "session_id"):
                 launch: dict[str, object] = {
                     field: row.current_session, "name": "Working tab",
-                    "environment": {"SHOWRUNNER_UNIT_ID": "old-unit", "SHOWRUNNER_UNIT": "old"},
+                    "environment": {"SHOWRUNNER_UNIT_ID": "old", "SHOWRUNNER_UNIT": "old"},
                 }
                 self.assertEqual(remote_control.remote_control_who(launch), "current unit")
                 self.assertEqual(remote_control.remote_control_who({"session": launch}), "current unit")
@@ -145,7 +144,7 @@ class RemoteControlTests(ShutdownTestCase):
         with isolated_staff_file(self.root / "staff.json", {}):
             launch: dict[str, object] = {
                 "session_id": "conversation", "name": "Working tab",
-                "environment": {"SHOWRUNNER_UNIT_ID": "old-unit", "SHOWRUNNER_UNIT": "old"},
+                "environment": {"SHOWRUNNER_UNIT_ID": "old", "SHOWRUNNER_UNIT": "old"},
             }
             self.assertEqual(remote_control.remote_control_who(launch), "Working tab")
 

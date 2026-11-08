@@ -53,6 +53,7 @@ export function snapshotPaths(snapshot: BoardSnapshot<BoardData>): RefreshPaths[
   return [
     ...snapshot.files.map((board, index): RefreshPaths => ({ kind: 'board', board, sources: snapshot.boards[index]?.sources ?? [] })),
     { kind: 'discovery', sources: snapshot.watch, loadedAt: snapshot.loadedAt },
+    ...(snapshot.boards.some(board => board.live) ? [{ kind: 'liveness' } as const] : []),
   ];
 }
 
@@ -81,6 +82,7 @@ export async function loadBoard(
   }
   watch({ kind: 'discovery', sources: response.watch, loadedAt });
   const boards: BoardData[] = [];
+  // The generator supplies staff-id paths from the staff record.
   for (const path of response.files) {
     ensureOpen();
     boards.push(JSON.parse(await calls.read(path)) as BoardData);

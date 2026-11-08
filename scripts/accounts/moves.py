@@ -47,9 +47,13 @@ RequestedFields = TypedDict("RequestedFields", {"from": HistoricalAccountLabel, 
                                               "window": Literal["weekly", "five_hour", "unknown"], "reset": NotRequired[str]})
 
 
+MoveCause = Literal["refusal", "credits off", "by hand", "auto"]
+
+
 class RequestedMove(MoveCommon, RequestedFields):
+    terminal: NotRequired[str]
     kind: Literal["requested"]
-    cause: NotRequired[Literal["refusal", "credits off", "by hand", "auto"]]
+    cause: NotRequired[MoveCause]
 
 
 class ConfirmedMove(MoveCommon):
@@ -285,6 +289,11 @@ def recorded_auto_entries() -> RecordedAutoEntries | UnreadableMoveJournal:
 def append_move(entry: MoveEntry) -> None:
     """Append a complete transition while holding the shared writer lock."""
     entry = _canonical_entry(entry)
+    if entry["kind"] == "requested":
+        source = entry["from"]
+        if isinstance(source, HomeAccountUnresolved):
+            entry = entry.copy()
+            entry["from"] = str(source.home)
     if any(entry.get(field) == "default" for field in ("from", "to", "label")):
         raise ValueError("name the account by number")
     path = store_file()

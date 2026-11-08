@@ -5,7 +5,6 @@ from __future__ import annotations
 import os
 import sqlite3
 import subprocess
-import sys
 import tempfile
 import unittest
 from collections.abc import Iterable, Iterator
@@ -130,7 +129,7 @@ def interrupted(*args):
 collect.save_measurement = interrupted
 collect.collect_file(db, 'natedev', sys.argv[2], Path(sys.argv[2]), 'codex', collect.RoleResolver(RoleLog({}, ()), set()))
 '''
-        result = subprocess.run([sys.executable, '-c', program, str(self.root / 'usage.db'), str(self.path)],
+        result = subprocess.run([str(Path(__file__).resolve().parents[2] / "scripts/lib/py"), '-c', program, str(self.root / 'usage.db'), str(self.path)],
                                 check=False, timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(result.returncode, 73)
         self.assertEqual(self.db.execute('SELECT COUNT(*) FROM cursors').fetchone()[0], 0)

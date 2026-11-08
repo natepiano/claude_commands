@@ -2,30 +2,26 @@
 from __future__ import annotations
 
 import fcntl
-import io
 import json
 import os
 import subprocess
-import sys
 import tempfile
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, cast, final, override
+from typing import cast, final, override
 from unittest import mock
 from zoneinfo import ZoneInfo
 
-import pins
-import upgrade_record
+
+from scripts.bevy_upgrade import pins
+from scripts.bevy_upgrade import upgrade_record
 from scripts.production.production_doc import Production, read_production
 from scripts.production import staff
 from scripts.production.staff_test_support import (
     fixture_member, fixture_runtime_id, isolated_staff_file,
 )
-if TYPE_CHECKING:
-    from ..lib import test_hang_guard
-else:
-    from scripts.lib import test_hang_guard
+from scripts.lib import test_hang_guard
 
 NOW = datetime(2026, 10, 12, 19, 8, 41, tzinfo=timezone.utc)
 LATER = datetime(2026, 10, 13, 1, 2, 3, tzinfo=timezone.utc)
@@ -42,7 +38,9 @@ class RecordTests(unittest.TestCase):
     @override
     def __init__(self, methodName: str = "runTest") -> None:
         super().__init__(methodName)
-        self.production = Production(Path(), "demo", "demo", Path(), Path(), ZoneInfo("UTC"))
+        self.production = Production(Path(), "demo", "demo", Path(), Path(), ZoneInfo("UTC"),
+                                     staff.StaffRow(staff.StaffId(""), "showrunner", "demo", staff.StaffRoot(),
+                                                    current_session=staff.StaffId("")))
         self.current_pins = pins.Pins((), frozenset(), ())
 
     @override
@@ -64,7 +62,6 @@ class RecordTests(unittest.TestCase):
             + "- **Log:** log.md\n- **User zone:** America/New_York\n",
             encoding="utf-8",
         )
-        self.production = read_production(doc)
         self.current_pins = pins.Pins(("0.19.1",), frozenset({"bevy_ecs"}),
                                       (dependent("alpha"), dependent("zeta")))
         _ = cast(object, self.enterContext(mock.patch.dict(
@@ -76,6 +73,7 @@ class RecordTests(unittest.TestCase):
         owner = fixture_member("showrunner", name="demo", doc=staff.LiveDoc("natedev", doc))
         self.owner = staff.update_current_session(owner.current_session,
             staff.native_id(fixture_runtime_id("bevy-current")))
+        self.production = read_production(self.owner.name)
 
     def begin(self) -> upgrade_record.Record:
         with upgrade_record.locked(self.owner.id):
@@ -102,218 +100,6 @@ class RecordTests(unittest.TestCase):
         self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns), before)
         self.assertEqual(sorted(item.name for item in path.parent.glob("*.json")), [path.name])
 
-    def legacy_watch(self) -> tuple[Path, Path]:
-        current = self.begin()
-        legacy = cast(dict[str, object], json.loads(json.dumps(current)))
-        _ = legacy.pop("staff_id")
-        legacy["slug"] = "demo"
-        source = self.root / "state/demo.json"
-        _ = source.write_text(json.dumps(legacy))
-        upgrade_record.record_path(self.owner.id).unlink()
-        job = self.root / "notifier/bevy-upgrade-demo"
-        job.mkdir(parents=True)
-        import shlex
-        words = ["python3", "bevy_upgrade.py", "--production", str(self.production.doc), "check", "--scheduled"]
-        _ = (job / "conf").write_text("FROM=bevy-upgrade-demo\nRUN=" + shlex.join(words) + "\n")
-        _ = (job / "state").write_text("NEXT_DUE=123\n")
-        return source, job
-
-    def test_watch_migration_recovers_job_after_clear_and_preserves_finished_rerun(self) -> None:
-        import migrate_bevy_watch
-
-        source, job = self.legacy_watch()
-        with mock.patch.dict(os.environ, {"NOTIFIER_STATE_DIR": str(self.root / "notifier")}):
-            self.assertEqual(migrate_bevy_watch.migrate(stop_after=1), 75)
-            self.assertTrue(job.exists())
-            _ = staff.update_current_session(self.owner.current_session,
-                                            staff.native_id(fixture_runtime_id("bevy-migration-clear")))
-            self.assertEqual(migrate_bevy_watch.migrate(), 0)
-            target = job.with_name(f"bevy-upgrade-{self.owner.id}")
-            conf = (target / "conf").read_text()
-            self.assertIn(f"--staff-id {self.owner.id}", conf)
-            self.assertNotIn("--production", conf)
-            self.assertEqual((target / "state").read_text(), "NEXT_DUE=123\n")
-            paths = [upgrade_record.record_path(self.owner.id), target / "conf", target / "state"]
-            before = {path: (path.read_bytes(), path.stat().st_mtime_ns) for path in paths}
-            self.assertEqual(migrate_bevy_watch.migrate(), 0)
-        self.assertEqual({path: (path.read_bytes(), path.stat().st_mtime_ns) for path in paths}, before)
-        self.assertFalse(source.exists())
-        self.assertFalse(job.exists())
-        self.assertEqual(len(staff.snapshot().rows), 1)
-
-    def rename_production_document(self) -> Path:
-        previous = self.production.doc
-        renamed = previous.with_name("renamed-demo-production.md")
-        _ = previous.rename(renamed)
-        _ = renamed.write_text(renamed.read_text() + "\n## Production Context\n- **Formerly:** `demo`\n")
-        _ = staff.rename(self.owner.id, "renamed-demo")
-        _ = staff.set_doc(self.owner.id, staff.LiveDoc("natedev", renamed))
-        return renamed
-
-    def test_watch_migration_resolves_former_document_for_record_archive_and_job(self) -> None:
-        import migrate_bevy_watch
-
-        source, job = self.legacy_watch()
-        archive = source.with_name("demo.0.20.closed.json")
-        closed = cast(dict[str, object], json.loads(source.read_text()))
-        closed["closed"] = LATER.isoformat()
-        _ = archive.write_text(json.dumps(closed))
-        _ = self.rename_production_document()
-        with mock.patch.dict(os.environ, {"NOTIFIER_STATE_DIR": str(job.parent)}):
-            self.assertEqual(migrate_bevy_watch.migrate(), 0)
-            self.assertFalse(source.exists())
-            self.assertFalse(archive.exists())
-            self.assertFalse(job.exists())
-            for name in (f"{self.owner.id}.json", f"{self.owner.id}.0.20.closed.json"):
-                fields = cast(dict[str, object], json.loads((source.parent / name).read_text()))
-                self.assertEqual(fields["staff_id"], self.owner.id)
-                self.assertNotIn("slug", fields)
-            target = job.with_name(f"bevy-upgrade-{self.owner.id}")
-            self.assertIn(f"--staff-id {self.owner.id}", (target / "conf").read_text())
-            self.assertNotIn("--production", (target / "conf").read_text())
-            self.assertEqual((target / "state").read_text(), "NEXT_DUE=123\n")
-            paths = [*source.parent.glob("*.json"), *target.iterdir()]
-            before = {path: (path.read_bytes(), path.stat().st_mtime_ns) for path in paths}
-            self.assertEqual(migrate_bevy_watch.migrate(), 0)
-            self.assertEqual({path: (path.read_bytes(), path.stat().st_mtime_ns) for path in paths}, before)
-
-    def test_finished_watch_migration_after_rename_needs_no_document_resolution(self) -> None:
-        import migrate_bevy_watch
-
-        current = self.begin()
-        archive = upgrade_record.record_path(self.owner.id).with_name(f"{self.owner.id}.0.20.closed.json")
-        closed = {**current, "closed": LATER.isoformat()}
-        _ = archive.write_text(json.dumps(closed))
-        _ = self.rename_production_document()
-        paths = [upgrade_record.record_path(self.owner.id), archive]
-        before = {path: (path.read_bytes(), path.stat().st_mtime_ns) for path in paths}
-        with (mock.patch.dict(os.environ, {"NOTIFIER_STATE_DIR": str(self.root / "notifier")}),
-              mock.patch.object(migrate_bevy_watch, "_owner", side_effect=staff.StaffRefused("old document")) as owner):
-            self.assertEqual(migrate_bevy_watch.migrate(), 0)
-            self.assertEqual(migrate_bevy_watch.migrate(), 0)
-        owner.assert_not_called()
-        self.assertEqual({path: (path.read_bytes(), path.stat().st_mtime_ns) for path in paths}, before)
-
-    def test_watch_migration_reports_ambiguous_former_document_and_continues(self) -> None:
-        import migrate_bevy_watch
-
-        source, job = self.legacy_watch()
-        renamed = self.rename_production_document()
-        other_doc = renamed.with_name("other-production.md")
-        _ = other_doc.write_text(renamed.read_text())
-        _ = fixture_member("showrunner", name="other", doc=staff.LiveDoc("natedev", other_doc))
-        unaffected_doc = renamed.with_name("unaffected-production.md")
-        _ = unaffected_doc.write_text("# Unaffected\n")
-        unaffected = fixture_member("showrunner", name="unaffected", doc=staff.LiveDoc("natedev", unaffected_doc))
-        fields = cast(dict[str, object], json.loads(source.read_text()))
-        fields["production"] = str(unaffected_doc)
-        fields["slug"] = "unaffected"
-        unaffected_source = source.with_name("unaffected.json")
-        _ = unaffected_source.write_text(json.dumps(fields))
-        paths = [source, job / "conf", job / "state"]
-        before = {path: (path.read_bytes(), path.stat().st_mtime_ns) for path in paths}
-        with (mock.patch.dict(os.environ, {"NOTIFIER_STATE_DIR": str(job.parent)}),
-              mock.patch("sys.stderr", new_callable=io.StringIO) as errors):
-            self.assertEqual(migrate_bevy_watch.migrate(), 1)
-        self.assertIn("anomaly:", errors.getvalue())
-        self.assertIn("ambiguous", errors.getvalue())
-        self.assertEqual({path: (path.read_bytes(), path.stat().st_mtime_ns) for path in paths}, before)
-        self.assertFalse(unaffected_source.exists())
-        self.assertTrue(upgrade_record.record_path(unaffected.id).exists())
-
-    def test_watch_migration_reconciles_job_created_by_status(self) -> None:
-        import bevy_upgrade
-        import migrate_bevy_watch
-        import upgrade_schedule
-
-        source, job = self.legacy_watch()
-        schedule = "ENABLED=0\nNEXT_DUE=123\nLAST_SENT=45\nLAST_RESTART=67\nLAST_TARGET=\nPAUSED=1\n"
-        _ = (job / "state").write_text(schedule)
-        _ = (job / "run.log").write_text("legacy check\n")
-        with (job / "conf").open("a") as stream:
-            _ = stream.write("EVERY=60\nTIMEOUT=45\n")
-        with mock.patch.dict(os.environ, {"NOTIFIER_STATE_DIR": str(job.parent)}):
-            self.assertEqual(migrate_bevy_watch.migrate(stop_after=1), 75)
-            with mock.patch("builtins.print"):
-                self.assertEqual(bevy_upgrade.main(["--production", str(self.production.doc), "status"]), 0)
-            target = job.with_name(upgrade_schedule.instance(self.owner.id))
-            self.assertTrue((target / "state").exists())
-            self.assertNotEqual((target / "state").read_text(), schedule)
-            _ = (target / "run.log").write_text("fixed check\n")
-            lock = (target / "lock").stat().st_ino
-            self.assertEqual(migrate_bevy_watch.migrate(), 0)
-            self.assertEqual((target / "state").read_text(), schedule)
-            self.assertEqual((target / "run.log").read_text(), "fixed check\nlegacy check\n")
-            self.assertEqual((target / "lock").stat().st_ino, lock)
-            self.assertIn("EVERY=60\nTIMEOUT=45\n", (target / "conf").read_text())
-            self.assertIn(f"--staff-id {self.owner.id}", (target / "conf").read_text())
-            self.assertFalse(source.exists())
-            self.assertFalse(job.exists())
-            paths = sorted(target.iterdir())
-            before = {path: (path.read_bytes(), path.stat().st_mtime_ns) for path in paths}
-            self.assertEqual(migrate_bevy_watch.migrate(), 0)
-            self.assertEqual({path: (path.read_bytes(), path.stat().st_mtime_ns) for path in paths}, before)
-
-    def test_watch_migration_finishes_cleanup_after_conf_delete(self) -> None:
-        import bevy_upgrade
-        import migrate_bevy_watch
-        import upgrade_schedule
-
-        _, job = self.legacy_watch()
-        remove_directory = Path.rmdir
-
-        def interrupt(path: Path) -> None:
-            if path == job:
-                raise OSError("interrupted after conf delete")
-            remove_directory(path)
-
-        with mock.patch.dict(os.environ, {"NOTIFIER_STATE_DIR": str(job.parent)}):
-            self.assertEqual(migrate_bevy_watch.migrate(stop_after=1), 75)
-            with mock.patch("builtins.print"):
-                self.assertEqual(bevy_upgrade.main(["--production", str(self.production.doc), "status"]), 0)
-            with mock.patch.object(Path, "rmdir", autospec=True, side_effect=interrupt):
-                self.assertEqual(migrate_bevy_watch.migrate(), 1)
-            self.assertTrue(job.is_dir())
-            self.assertEqual(list(job.iterdir()), [])
-            target = job.with_name(upgrade_schedule.instance(self.owner.id))
-            paths = sorted(target.iterdir())
-            before = {path: (path.read_bytes(), path.stat().st_mtime_ns) for path in paths}
-            self.assertEqual(migrate_bevy_watch.migrate(), 0)
-            self.assertFalse(job.exists())
-            self.assertEqual((target / "state").read_text(), "NEXT_DUE=123\n")
-            self.assertEqual(migrate_bevy_watch.migrate(), 0)
-            self.assertEqual({path: (path.read_bytes(), path.stat().st_mtime_ns) for path in paths}, before)
-
-    def test_watch_migration_refuses_job_destination_with_another_owner(self) -> None:
-        import migrate_bevy_watch
-        import upgrade_schedule
-
-        _, job = self.legacy_watch()
-        other = fixture_member("showrunner", name="other-owner")
-        with mock.patch.dict(os.environ, {"NOTIFIER_STATE_DIR": str(job.parent)}):
-            self.assertEqual(migrate_bevy_watch.migrate(stop_after=1), 75)
-            target = job.with_name(upgrade_schedule.instance(self.owner.id))
-            target.mkdir()
-            _ = (target / "conf").write_text(f"RUN={upgrade_schedule.command(other.id)}\n")
-            _ = (target / "state").write_text("NEXT_DUE=456\n")
-            paths = [job / "conf", job / "state", target / "conf", target / "state"]
-            before = {path: (path.read_bytes(), path.stat().st_mtime_ns) for path in paths}
-            self.assertEqual(migrate_bevy_watch.migrate(), 1)
-            self.assertEqual({path: (path.read_bytes(), path.stat().st_mtime_ns) for path in paths}, before)
-
-    def test_watch_migration_refuses_unavailable_owner_without_changing_files(self) -> None:
-        import migrate_bevy_watch
-
-        source, job = self.legacy_watch()
-        value = cast(dict[str, object], json.loads(source.read_text()))
-        value["production"] = str(self.root / "unowned-production.md")
-        _ = source.write_text(json.dumps(value))
-        paths = (source, job / "conf", job / "state")
-        before = {path: (path.read_bytes(), path.stat().st_mtime_ns) for path in paths}
-        with mock.patch.dict(os.environ, {"NOTIFIER_STATE_DIR": str(self.root / "notifier")}):
-            self.assertEqual(migrate_bevy_watch.migrate(), 1)
-        self.assertEqual({path: (path.read_bytes(), path.stat().st_mtime_ns) for path in paths}, before)
-
     def test_missing_record_loads_as_none(self) -> None:
         with upgrade_record.locked(self.owner.id):
             self.assertIsNone(upgrade_record.load(self.owner.id))
@@ -323,21 +109,21 @@ class RecordTests(unittest.TestCase):
         shutdown = directory.parent / "shutdown"
         script = (
             "import sys\nfrom pathlib import Path\n"
-            + "sys.path.insert(0, sys.argv[1])\nsys.path.insert(0, sys.argv[2])\n"
-            + "import shutdown_record\nimport upgrade_record\nimport upgrade_report\n"
+            + "from scripts.shutdown import shutdown_record\nfrom scripts.bevy_upgrade import upgrade_record, upgrade_report\n"
             + "assert Path(shutdown_record.__file__).resolve() == Path(sys.argv[2]) / 'shutdown_record.py'\n"
             + "assert Path(upgrade_record.__file__).resolve() == Path(sys.argv[1]) / 'upgrade_record.py'\n"
             + "assert Path(upgrade_report.__file__).resolve() == Path(sys.argv[1]) / 'upgrade_report.py'\n"
         )
-        result = subprocess.run([sys.executable, "-c", script, str(directory), str(shutdown)],
-                                env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
+        result = subprocess.run([str(directory.parent / "lib/py"), "-c", script, str(directory), str(shutdown)],
+                                env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1",
+                                     "PYTHONPATH": str(shutdown)},
                                 capture_output=True, text=True, timeout=test_hang_guard.TEST_HANG_GUARD_SECS, check=False)
         self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_start_builds_the_specified_record_without_default_answers(self) -> None:
         started = self.begin()
         self.assertEqual(started, {
-            "staff_id": self.owner.id, "production": str(self.production.doc), "checkout": str(self.production.checkout),
+            "staff_id": self.owner.id, "production": self.production.name, "checkout": str(self.production.checkout),
             "target": "0.20", "started": NOW.isoformat(), "closed": None,
             "bevy": ["0.19.1"], "pins_read": NOW.isoformat(),
             "target_bevy": {"status": "unread"}, "target_error": "", "checked": None, "announced": None,

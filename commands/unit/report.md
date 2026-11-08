@@ -26,11 +26,12 @@ Everything below is the contract.
 ---
 
 <ProgressReport>
-1. Check launcher state first. For Codex, `exit_code` alone marks terminal
-   completion; a returned `session_id` without it remains active. When no
-   dispatch, background verification or open activity remains active, process
-   completion; its result closes with the report from step 5. A closed pass
-   alone is not completion (step 5).
+1. Check launcher state first.
+   A pane dispatch completes only from its matching final `DONE <dispatch id>` reply.
+   A returned `session_id` without terminal completion remains active.
+   Process completion when no dispatch, background verification, or open activity remains active.
+   Its result closes with the report from step 5.
+   A closed pass alone is not completion (step 5).
 2. Read the current Work Order and verification list, the latest relevant
    heartbeat lines, `board.sh read "${SESSION_DIR}" --since <cursor>`,
    `git status --short`, and `git diff --stat` in `${WORKING_DIR}`. Keep the
@@ -55,19 +56,19 @@ Everything below is the contract.
    archived phase. That mistake reported a 68%-complete plan as 36%. To read the
    count directly, without an active phase and pass:
 
-   `python3 ~/.claude/scripts/direct/progress_history.py phase-count --plan-doc "<plan>" [--phase-percent N]`
+   `~/.claude/scripts/lib/py ~/.claude/scripts/direct/progress_history.py phase-count --plan-doc "<plan>" [--phase-percent N]`
 4. Apply <EarlyReviewArm/>: steps 2-3 are its evidence and this report is one of
    its trigger points. It runs **before** the recorder, so a reviewer it launches is
    already listed among this report's workers.
 5. Run:
 
-   `python3 ~/.claude/scripts/direct/progress_history.py calibrate --session-dir "${SESSION_DIR}" --candidate-percent "${PHASE_RAW_PERCENT}" --cap-stage "<stage>"`
+   `~/.claude/scripts/lib/py ~/.claude/scripts/direct/progress_history.py calibrate --session-dir "${SESSION_DIR}" --candidate-percent "${PHASE_RAW_PERCENT}" --cap-stage "<stage>"`
 
    Pass the same stage to both calls; `progress` refuses a calibration drawn
    for another. Use its phase suggestion when applicable; otherwise keep the raw value. Then
    run:
 
-   `python3 ~/.claude/scripts/direct/progress_history.py progress --session-dir "${SESSION_DIR}" --project-raw-percent "${PROJECT_RAW_PERCENT}" --project-percent "${PROJECT_RAW_PERCENT}" --phase-raw-percent "${PHASE_RAW_PERCENT}" --phase-percent "${PHASE_REPORTED_PERCENT}" --cap-stage "<stage>" --activity "<current activity>" [--phase-override-reason "<specific evidence>"] [--tables]`
+   `~/.claude/scripts/lib/py ~/.claude/scripts/direct/progress_history.py progress --session-dir "${SESSION_DIR}" --project-raw-percent "${PROJECT_RAW_PERCENT}" --project-percent "${PROJECT_RAW_PERCENT}" --phase-raw-percent "${PHASE_RAW_PERCENT}" --phase-percent "${PHASE_REPORTED_PERCENT}" --cap-stage "<stage>" --activity "<current activity>" [--phase-override-reason "<specific evidence>"] [--tables]`
 
    Pass `--tables` only for `/unit:report tables`. The call also rewrites this
    unit's phase note, which keeps the full phase list; write nothing there by
@@ -77,8 +78,9 @@ Everything below is the contract.
    **Between windows, report the last recorded values.** The recorder prints
    an `as of` line and `No pass or activity is open.` without opening a window
    or changing progress. A closed pass alone does not finish a dispatch: check
-   `phases/<id>/impl_status_<slot>`, board posts and launcher completion. Alive
-   means keep the run going; terminal means step 1. Never open an activity just
+   the dispatch's returned status path, board posts, and launcher completion.
+   Only an existing mesh pin uses `phases/<id>/impl_status_<slot>`.
+   Keep an active run running; terminal completion means step 1. Never open an activity just
    to render a report. An activity still open after the phase closes remains
    the stage; `No active phase to report` means no phase or activity is open.
 
@@ -96,6 +98,10 @@ Everything below is the contract.
    is armed, say the writer and reviewer are working at once.
 
    Use the recorder's worker lines for slot, role, state, model and effort.
+   Read pane states through the shared worker observation; do not scan processes or run files yourself.
+   Show open workers with their panes and status, stopped workers as stopped, and closed workers as closed.
+   Keep unknown process evidence and incomplete observations with their reasons.
+   Report an unreadable staff record as a problem; never substitute an empty worker list.
    `running` means working; `waiting` means held up; `idle` means its window
    closed while the round continues; `done` means its stretch ended. With
    `tables`, the round table adds timing and history for the last three stages;
@@ -109,11 +115,10 @@ Everything below is the contract.
    whether it is moving, waiting, or done. Build it from the worker's board lines
    since the last cursor plus the Work Order, and hold these rules:
 
-   - Track the opening phase of the current Codex thread, not the worker name. If
-     that phase is older, begin `Details` with `Opened in phase <id>;`; omit it
-     when the thread opened in the current phase. A replacement thread under
-     the same worker name starts fresh and holds only its own opening prompt, so
-     the dispatch that creates it is an opening prompt, not a follow-up.
+   - Track the opening phase of the current native conversation, not the worker name.
+     For an older conversation, begin `Details` with `Opened in phase <id>;`.
+     Omit this prefix for a conversation opened in the current phase.
+     A replacement conversation starts with its opening prompt.
    - Read the full board line, never the recorder's 72-character cut. A line
      ending in `…` has lost its information and must never reach the user.
    - Name work by what it changes for the phase — the Work Order item, the
@@ -188,7 +193,7 @@ Everything below is the contract.
 **Questions about work already finished** — how many fix passes there have been,
 how long a review took, what an earlier phase ran — are answered by
 
-`python3 ~/.claude/scripts/direct/progress_history.py timeline --session-dir "${SESSION_DIR}" [--phase <id>]`
+`~/.claude/scripts/lib/py ~/.claude/scripts/direct/progress_history.py timeline --session-dir "${SESSION_DIR}" [--phase <id>]`
 
 which renders one row per pass, with the agent that ran each, for one phase or
 the whole run. Read the answer from it rather than counting from memory or

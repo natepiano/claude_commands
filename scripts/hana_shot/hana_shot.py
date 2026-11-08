@@ -1,7 +1,11 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
 """Frame Hana's camera on a known view over BRP and save a timed screenshot."""
 
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 from functools import partial
 
@@ -15,7 +19,6 @@ from difflib import get_close_matches
 from enum import StrEnum
 from functools import cache
 import http.client
-import importlib.util
 import json
 import math
 import os
@@ -31,32 +34,11 @@ import sys
 import tempfile
 import time
 import tomllib
-from types import FrameType, ModuleType
-from typing import TYPE_CHECKING, IO, Literal, NamedTuple, NoReturn, NotRequired, TypedDict, cast, override
+from types import FrameType
+from typing import IO, Literal, NamedTuple, NoReturn, NotRequired, TypedDict, cast, override
 
-def _load_library(name: str) -> ModuleType:
-    """Load a shared library without changing the command's import path."""
-    path = Path(__file__).resolve().parents[1] / "lib" / f"{name}.py"
-    spec = importlib.util.spec_from_file_location(f"_hana_shot_{name}", path)
-    if spec is None or spec.loader is None:
-        raise ImportError(f"cannot load library at {path}")
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[spec.name] = module
-    spec.loader.exec_module(module)
-    return module
-
-
-if TYPE_CHECKING:
-    from scripts.lib import conf, process_group
-    from scripts.lib.conf import UseConfiguredValue
-else:
-    if __package__:
-        from scripts.lib import conf
-        from scripts.lib.conf import UseConfiguredValue
-    else:
-        conf = _load_library("conf")
-        UseConfiguredValue = conf.UseConfiguredValue
-    process_group = _load_library("process_group")
+from scripts.lib import conf, process_group
+from scripts.lib.conf import UseConfiguredValue
 
 PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 # Wakes the remote display and holds it until the run closes this shell's stdin; -t ends it if that never comes.
@@ -2223,16 +2205,12 @@ def launch(port: int, worktree: str | None, binary: str | None, purpose: str = "
         )
     owner = owner.strip()
     if not owner:
-        if not __package__:
-            sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
         from scripts.production import staff
         try:
             current = staff.runtime_id()
             if current:
                 record = staff.local_snapshot()
-                row = record.by_current_session(current)
-                if row is not None and row.kind == "worker":
-                    row = record.parent_of(row)
+                row = record.owner_of(current)
                 if row is not None:
                     owner = row.name
         except staff.StaffUnreadable:
@@ -2271,26 +2249,8 @@ def launch(port: int, worktree: str | None, binary: str | None, purpose: str = "
     _write_launch_state(state_path, state)
     start = time.monotonic()
     try:
-        recorder_path = Path(__file__).resolve().parents[1] / "buildlog" / "record.py"
-        recorder = sys.modules.get("record")
-        if recorder is None or getattr(recorder, "__file__", "") != str(recorder_path):
-            module_name = "_hana_shot_buildlog_record"
-            recorder = sys.modules.get(module_name)
-            if recorder is None:
-                spec = importlib.util.spec_from_file_location(
-                    module_name, recorder_path, submodule_search_locations=[str(recorder_path.parent)],
-                )
-                if spec is None or spec.loader is None:
-                    raise ImportError(f"cannot load launch recorder at {recorder_path}")
-                recorder = importlib.util.module_from_spec(spec)
-                sys.modules[module_name] = recorder
-                try:
-                    spec.loader.exec_module(recorder)
-                except BaseException:
-                    del sys.modules[module_name]
-                    raise
-        record_launch = cast(Callable[[Path, Path], bool], recorder.launch)
-        _ = record_launch(state_path, root)
+        from scripts.buildlog import record
+        _ = record.launch(state_path, root)
         wait_ready(Brp(port, settings=hana_shot_settings), process, log)
     except BaseException:
         shutdown(port, process, hana_shot_settings=hana_shot_settings)

@@ -23,10 +23,10 @@ with Path(os.environ["TEST_ROUTE_EVENTS"]).open("a") as output:
     output.write(json.dumps({"command": command, "args": sys.argv[2:], "call_id": os.environ.get("BUILDLOG_CALL_ID", "")}) + "\n")
 if command == "eligible":
     allowed = os.environ.get("TEST_MAC_ALLOWED", "1") == "1"
-    print("mac_allowed" if allowed else "natedev_only makes natedev artifacts")
-    print("natedev\teligible\t-\t-")
+    print("any_target" if allowed else "natedev_only makes natedev artifacts")
+    print("natedev\teligible\t-\t-\t-")
     if allowed:
-        print("mac\teligible\t-\t" + os.environ["MAC_TEST_CONFIG"])
+        print("mac\teligible\t-\t" + os.environ["MAC_TEST_CONFIG"] + "\tmacos")
 elif command in ("register-local", "check-local"):
     raise SystemExit(10 if any(holders.iterdir()) else 0)
 elif command == "wait-local":
@@ -43,7 +43,9 @@ import sys
 
 words = sys.argv[1:]
 call_id = words[words.index("--call-id") + 1]
-record = json.loads((Path(os.environ["VERIFY_STEPS_DIR"]) / (call_id + ".json")).read_text())
+sys.path.insert(0, str(Path.home() / ".claude"))
+from scripts.direct.test_verify_step_state import read_step_row
+record = read_step_row(call_id)
 with Path(os.environ["TEST_MAC_EVENTS"]).open("a") as output:
     output.write(json.dumps({"args": words, "record": record}) + "\n")
 Path(words[words.index("--result") + 1]).write_text("mac=passed\nseconds=0\n")
@@ -116,12 +118,18 @@ class VerifyStepRoutesFixture(unittest.TestCase):
 root = Path(os.environ["PACKAGE_ROOT"])
 finished = root / "mend-finished"
 if arguments[:1] == ["mend"]:
-    record = json.loads((Path(os.environ["VERIFY_STEPS_DIR"]) / (os.environ["BUILDLOG_CALL_ID"] + ".json")).read_text())
+    import sys
+    sys.path.insert(0, str(Path.home() / ".claude"))
+    from scripts.direct.test_verify_step_state import read_step_row
+    record = read_step_row(os.environ["BUILDLOG_CALL_ID"])
     (root / "mend-state").write_text(record["state"])
     finished.touch()
     raise SystemExit(int(os.environ["TEST_MEND_STATUS"]))
 if finished.exists() and not Path(os.environ["TEST_MAC_EVENTS"]).exists() and (arguments[:1] == ["metadata"] or arguments == ["+nightly", "fmt", "--version"]):
-    record = json.loads((Path(os.environ["VERIFY_STEPS_DIR"]) / (os.environ["BUILDLOG_CALL_ID"] + ".json")).read_text())
+    import sys
+    sys.path.insert(0, str(Path.home() / ".claude"))
+    from scripts.direct.test_verify_step_state import read_step_row
+    record = read_step_row(os.environ["BUILDLOG_CALL_ID"])
     (Path(os.environ["BUILD_HOLD_DIR"]) / "other").write_text("hold after mend")
     with (root / "between-steps").open("a") as output:
         output.write(json.dumps({"args": arguments, "state": record["state"]}) + "\\n")

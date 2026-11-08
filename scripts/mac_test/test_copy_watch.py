@@ -17,26 +17,16 @@ import time
 import unittest
 from unittest import mock
 from collections.abc import Callable
-from typing import TYPE_CHECKING, TypedDict, cast, final, override
+from typing import TypedDict, cast, final, override
 
-if TYPE_CHECKING:
-    from ..lib import process_start as process_identity
-else:
-    from scripts.lib import process_start as process_identity
+from scripts.lib import process_start as process_identity
 
 
-import copy_watch
-import offload
-if TYPE_CHECKING:
-    from ..direct import step_record
-    from ..lint.memory_test_support import config_environment, write_config_fixture
-    from ..lib import test_hang_guard
-    from ..lib.process_group import send_process_group
-else:
-    from scripts.direct import step_record
-    from scripts.lint.memory_test_support import config_environment, write_config_fixture
-    from scripts.lib import test_hang_guard
-    from scripts.lib.process_group import send_process_group
+from scripts.mac_test import copy_watch, offload
+from scripts.direct import step_record
+from scripts.lint.memory_test_support import config_environment, write_config_fixture
+from scripts.lib import test_hang_guard
+from scripts.lib.process_group import send_process_group
 
 
 SCRIPT = Path(__file__).with_name("copy_watch.py")
@@ -219,8 +209,8 @@ class StepProgressTests(unittest.TestCase):
                 "VERIFY_STEPS_DIR": str(root / "steps"), "VERIFY_PROC_ROOT": str(root / "proc"),
             }):
                 cases = (
-                    (step_record.SshAllowed(("aws",)), step_record.StepState.WAITING_HOLD, ""),
-                    (step_record.SshAllowed(("mac", "aws"), ("mac",)), step_record.StepState.ON_SSH, "aws"),
+                    (step_record.AnyTarget(("aws",)), step_record.StepState.WAITING_HOLD, ""),
+                    (step_record.AnyTarget(("mac", "aws"), ("mac",)), step_record.StepState.ON_SSH, "aws"),
                 )
                 for permission, state, selected in cases:
                     with self.subTest(state=state):

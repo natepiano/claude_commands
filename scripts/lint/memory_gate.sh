@@ -9,17 +9,14 @@ UNIT_ENV_SHIM="${BASH_SOURCE[0]%/*}/../lib/unit_env.sh"
 [[ ! -r "$UNIT_ENV_SHIM" ]] || source "$UNIT_ENV_SHIM"
 BUILD_TARGETS_SCRIPT="${BUILD_TARGETS_SCRIPT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../build_targets" && pwd)/build_targets.py}"
 BUILDLOG_MEM_ADMIT_SCRIPT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../build_queue" && pwd)/admission_client.py"
+BUILDLOG_MEM_PY="$(cd "$(dirname "${BASH_SOURCE[0]}")/../lib" && pwd)/py"
 
 # Each new wait uses its own identity. Rejoining callers restore it after sourcing.
 BUILDLOG_MEM_WAIT_SINCE="" BUILDLOG_MEM_WAIT_FIRST_FILE=""
 export -n BUILDLOG_MEM_WAIT_SINCE BUILDLOG_MEM_WAIT_FIRST_FILE
 
 buildlog_memory_python() {
-    if [[ -x "$HOME/.claude/scripts/lib/py" ]]; then
-        "$HOME/.claude/scripts/lib/py" "$@"
-    else
-        python3 "$@"
-    fi
+    "$BUILDLOG_MEM_PY" "$@"
 }
 
 # Status 0 when the holder directory is missing or readable with no entry.
@@ -121,7 +118,7 @@ build_hold_wait_local() {
         return 2
     fi
     output_pid=$!
-    python3 "$BUILD_TARGETS_SCRIPT" "${arguments[@]}" 2>&"$output_fd" &
+    buildlog_memory_python "$BUILD_TARGETS_SCRIPT" "${arguments[@]}" 2>&"$output_fd" &
     waiter_pid=$!
     exec {output_fd}>&-
     wait "$waiter_pid" || status=$?
@@ -145,7 +142,7 @@ build_hold_check_local() {
     if build_hold_nothing_held; then return 0; fi
     build_hold_call
     local status=0
-    python3 "$BUILD_TARGETS_SCRIPT" check-local --caller "${BUILDLOG_HOLD_CALLER:-verify}" || status=$?
+    buildlog_memory_python "$BUILD_TARGETS_SCRIPT" check-local --caller "${BUILDLOG_HOLD_CALLER:-verify}" || status=$?
     build_hold_check_result "$status" check-local
 }
 
@@ -157,8 +154,6 @@ buildlog_memory_refuse() {
 buildlog_memory_event() { :; }
 
 buildlog_wait_for_memory() {
-    local -
-    set -o pipefail
     BUILDLOG_MEM_WAIT_S=0 BUILDLOG_MEM_OUTCOME=MeminfoUnavailable BUILDLOG_MEM_RESERVATION=""
     if buildlog_target_admitted || [[ "${OSTYPE:-}" == darwin* && -z "${BUILDLOG_MEMINFO+x}" ]]; then
         BUILDLOG_MEM_OUTCOME=Granted
@@ -171,12 +166,15 @@ buildlog_wait_for_memory() {
     }
     BUILDLOG_MEM_WAIT_FROM="${BUILDLOG_MEM_WAIT_SINCE:-${EPOCHSECONDS:-$(date +%s)}}"
     (( $# > 0 )) || action=launch
-    LINT_QUEUE_LEAVE_HOOK="${LINT_QUEUE_LEAVE_HOOK:-}" \
-    BUILDLOG_MAC_IDLE_HOOK="${BUILDLOG_MAC_IDLE_HOOK:-}" \
-    buildlog_memory_python "$BUILDLOG_MEM_ADMIT_SCRIPT" "$action" --pid "$owner" \
-        --since "$BUILDLOG_MEM_WAIT_FROM" --sidecar "${BUILDLOG_PEAK:+$BUILDLOG_PEAK.cgroup}" \
-        --shell-state "$grant" --wait-events -- "$@" |
-        while IFS= read -r event; do buildlog_memory_event "$event"; done || status=$?
+    (
+        set -o pipefail
+        LINT_QUEUE_LEAVE_HOOK="${LINT_QUEUE_LEAVE_HOOK:-}" \
+        BUILDLOG_MAC_IDLE_HOOK="${BUILDLOG_MAC_IDLE_HOOK:-}" \
+        buildlog_memory_python "$BUILDLOG_MEM_ADMIT_SCRIPT" "$action" --pid "$owner" \
+            --since "$BUILDLOG_MEM_WAIT_FROM" --sidecar "${BUILDLOG_PEAK:+$BUILDLOG_PEAK.cgroup}" \
+            --shell-state "$grant" --wait-events -- "$@" |
+            while IFS= read -r event; do buildlog_memory_event "$event"; done
+    ) || status=$?
     source "$grant"
     if (( status == 75 )); then
         BUILDLOG_MEM_OUTCOME=LeftQueue

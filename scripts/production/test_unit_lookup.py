@@ -5,7 +5,6 @@ import json
 import os
 import socket
 import subprocess
-import sys
 import tempfile
 import unittest
 from dataclasses import replace
@@ -13,23 +12,21 @@ from pathlib import Path
 from typing import cast, override
 from unittest import mock
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from scripts.lib import unit_runs
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from scripts.lib.socket_test_support import short_socket_directory
-import fake_unit_host
+from scripts.production import fake_unit_host
 from scripts.production import showrunners
-import unit_lookup
-import herdr
-import sessions
-from fake_unit_host import HostedUnit, labeled
-from sessions import SessionRecord
-from unit_lookup import ClaudeNotRunning, ClaudeUnknown, LiveClaude, UnitState
+from scripts.production import unit_lookup
+from scripts.herdr import herdr
+from scripts.message import sessions
+from scripts.production.fake_unit_host import HostedUnit, labeled
+from scripts.message.sessions import SessionRecord
+from scripts.production.unit_lookup import ClaudeNotRunning, ClaudeUnknown, LiveClaude, UnitState
 from scripts.production import staff, session_staff, unit_config
 from scripts.shutdown import remote
 from scripts.production.staff_test_support import fixture_member, isolated_staff_file, unit_membership, showrunner_relationship, fixture_runtime_id, fixture_worker, recorded_showrunner, StaffTestCase
@@ -40,26 +37,33 @@ SCRIPT = Path(__file__).with_name("unit_lookup.py")
 
 
 class UnitReferenceTests(StaffTestCase):
+    def test_row_production_returns_the_recorded_parent_when_its_document_is_missing(self) -> None:
+        doc = self.source_root / "missing-production.md"
+        parent = fixture_member("showrunner", name="owner", doc=staff.LiveDoc(remote.local_machine(), doc))
+        unit = fixture_member("unit", name="member", parent=parent.id)
+        self.assertFalse(doc.exists())
+        self.assertEqual(unit_lookup.row_production(unit, staff.snapshot()),
+                         unit_lookup.UnitProduction(parent.name, str(doc)))
+
     def test_selected_identity_keeps_its_parent_after_a_session_and_name_change(self) -> None:
         fixture = self.row_production()
         row = staff.rename(fixture.unit.id, "renamed")
         record = staff.snapshot()
-        sources = unit_lookup.member_sources()
         before = self.staff_file.read_bytes()
         for reference in (session_staff.StoredReference(row.id),
                           session_staff.StoredReference(row.current_session),
                           session_staff.LiveSession(row.current_session)):
             with self.subTest(reference=reference):
                 self.assertEqual(unit_lookup.unit_row("wrong-name", record, reference=reference), row)
-                self.assertEqual(unit_lookup.unit_parent("wrong-name", reference, record=record, sources=sources),
-                                 unit_lookup.UnitProduction(fixture.slug, str(fixture.doc)))
+                self.assertEqual(unit_lookup.unit_parent("wrong-name", reference, record=record),
+                                 unit_lookup.UnitProduction(fixture.name, str(fixture.doc)))
         for reference in (session_staff.StoredReference(fixture_runtime_id("missing-reference")),
                           session_staff.LiveSession(fixture_runtime_id("missing-reference"))):
             with self.subTest(reference=reference):
                 with self.assertRaises(staff.StaffUnreadable):
                     _ = unit_lookup.unit_row(row.name, record, reference=reference)
                 with self.assertRaises(staff.StaffUnreadable):
-                    _ = unit_lookup.unit_parent(row.name, reference, record=record, sources=sources)
+                    _ = unit_lookup.unit_parent(row.name, reference, record=record)
         self.assertEqual(self.staff_file.read_bytes(), before)
 
 
@@ -72,21 +76,20 @@ class UnitLookupTests(unittest.TestCase):
         live = unit_membership("current", "live")
         retired = unit_membership("current", "retired")
         historical = unit_membership("wrapped", "historical")
-        _ = staff.set_worktree(retired.id, staff.RemovedWorktree("natedev", self.root / "retired"), expected=retired.worktree)
+        _ = staff.set_worktree(retired.id, staff.RemovedWorktree(remote.local_machine(), self.root / "retired"), expected=retired.worktree)
         assert isinstance(historical.parent, staff.ReportsTo)
-        _ = staff.set_doc(historical.parent.id, staff.WrappedDoc("natedev", self.root / "archive.md"))
+        _ = staff.set_doc(historical.parent.id, staff.WrappedDoc(remote.local_machine(), self.root / "archive.md"))
         record = staff.snapshot()
-        sources = unit_lookup.MemberSources({}, ())
-        self.assertEqual(unit_lookup.production_members(record, sources), {"current": (live,), "show": ()})
+        self.assertEqual(unit_lookup.production_members(record), {"current": (live,), "show": ()})
         self.assertIsNotNone(record.by_id(retired.id))
         self.assertEqual(unit_lookup.unit_row("retired", record, reference=session_staff.StoredReference(retired.id)).id, retired.id)
 
     def test_retired_session_labels_are_left_out_while_live_siblings_and_retained_identity_stay(self) -> None:
         retired = unit_membership("show", "retired")
         live = unit_membership("show", "live")
-        retired = staff.set_worktree(retired.id, staff.RemovedWorktree("natedev", self.root / "retired"), expected=retired.worktree)
+        retired = staff.set_worktree(retired.id, staff.RemovedWorktree(remote.local_machine(), self.root / "retired"), expected=retired.worktree)
         record = staff.snapshot()
-        sources = unit_lookup.MemberSources({}, ())
+        sources = unit_lookup.MemberSources(())
         for durable_id in (retired.id, ""):
             with self.subTest(durable_id=bool(durable_id)):
                 fake_unit_host.write(self.environment, [
@@ -111,13 +114,13 @@ class UnitLookupTests(unittest.TestCase):
         historical = unit_membership("wrapped", "historical")
         live = unit_membership("show", "live")
         assert isinstance(historical.parent, staff.ReportsTo)
-        _ = staff.set_doc(historical.parent.id, staff.WrappedDoc("natedev", self.root / "wrapped.md"))
+        _ = staff.set_doc(historical.parent.id, staff.WrappedDoc(remote.local_machine(), self.root / "wrapped.md"))
         fake_unit_host.write(self.environment, [
-            labeled("historical", "w1:p1", "historical", slug="wrapped", CODEX_THREAD_ID=historical.id),
+            labeled("historical", "w1:p1", "historical", production_name="wrapped", CODEX_THREAD_ID=historical.id),
             labeled("live", "w2:p1", "live", CODEX_THREAD_ID=live.id),
         ])
         found = unit_lookup.every_labeled_session(record=staff.snapshot())
-        self.assertEqual({slug: list(units) for slug, units in found.units.items()}, {"show": ["live"]})
+        self.assertEqual({production_name: list(units) for production_name, units in found.units.items()}, {"show": ["live"]})
 
     def test_active_session_labels_with_missing_or_invalid_parents_still_refuse(self) -> None:
         row = unit_membership("show", "active")
@@ -135,14 +138,14 @@ class UnitLookupTests(unittest.TestCase):
         for broken in (missing, parentless, invalid):
             with self.subTest(rows=broken.rows):
                 found = unit_lookup.group_labeled_sessions([pane], record=broken,
-                    sources=unit_lookup.MemberSources({}, ()))
+                    sources=unit_lookup.MemberSources(()))
                 self.assertEqual(found.units, {})
 
     def test_retained_unit_cleanup_lookup_keeps_a_live_director_after_active_membership_excludes_it(self) -> None:
         row = unit_membership("show", "retired")
         row = staff.update_current_session(row.current_session, staff.native_id(fixture_runtime_id("retained-after-clear")))
         self.assertNotEqual(row.id, row.current_session)
-        _ = staff.set_worktree(row.id, staff.RemovedWorktree("natedev", self.root / "removed"), expected=row.worktree)
+        _ = staff.set_worktree(row.id, staff.RemovedWorktree(remote.local_machine(), self.root / "removed"), expected=row.worktree)
         fake_unit_host.write(self.environment, [labeled("director", "w1:p1", "retired", CODEX_THREAD_ID=row.current_session)])
         self.claude("director", "w1:p1", session_id=row.current_session)
         record = staff.snapshot()
@@ -158,7 +161,7 @@ class UnitLookupTests(unittest.TestCase):
         row = unit_membership("show", "retired")
         row = staff.update_current_session(row.current_session, staff.native_id(fixture_runtime_id("retained-after-clear")))
         self.assertNotEqual(row.id, row.current_session)
-        _ = staff.set_worktree(row.id, staff.RemovedWorktree("natedev", self.root / "removed"), expected=row.worktree)
+        _ = staff.set_worktree(row.id, staff.RemovedWorktree(remote.local_machine(), self.root / "removed"), expected=row.worktree)
         fake_unit_host.write(self.environment, [labeled("director", "w1:p1", "retired", CODEX_THREAD_ID=row.current_session)])
         self.claude("director", "w1:p1", session_id=row.current_session)
         _ = (self.records / "broken.json").write_text("{")
@@ -172,14 +175,14 @@ class UnitLookupTests(unittest.TestCase):
     def test_removed_same_name_does_not_make_an_active_units_orphan_metadata_ambiguous(self) -> None:
         live = unit_membership("receiving", "alpha")
         old = unit_membership("former", "alpha")
-        _ = staff.set_worktree(old.id, staff.RemovedWorktree("natedev", self.root / "old"), expected=old.worktree)
+        _ = staff.set_worktree(old.id, staff.RemovedWorktree(remote.local_machine(), self.root / "old"), expected=old.worktree)
         worktree = Path("/live")
         cells = {"Unit": "alpha", "Plan": str(worktree / "plan.md"), "Worktree": "`/live`", "Branch": "alpha"}
-        _ = staff.set_worktree(live.id, staff.PresentWorktree("natedev", worktree), expected=live.worktree)
+        _ = staff.set_worktree(live.id, staff.PresentWorktree(remote.local_machine(), worktree), expected=live.worktree)
         doc = self.root / "receiving-production.md"
         write_text_atomic(doc, "# Receiving production\n")
         owner = showrunner_relationship("receiving")
-        _ = staff.set_doc(owner.id, staff.LiveDoc("natedev", doc))
+        _ = staff.set_doc(owner.id, staff.LiveDoc(remote.local_machine(), doc))
         facts = {"git:/live": ("value", "alpha"),
                  "file:/live/.unit.toml": ("value", 'plan = "plan.md"\nresponsibilities = []\n'),
                  "file:" + str(doc): ("value", doc.read_text())}
@@ -190,7 +193,7 @@ class UnitLookupTests(unittest.TestCase):
         config = unit_config.UnitConfig(unit_config.PlanFile(Path("plan.md")), unit_config.NoAppPort(), ())
         with (mock.patch.object(session_staff, "_read_facts", side_effect=read_facts),
               mock.patch.object(unit_config, "read", return_value=config)):
-            metadata = unit_lookup.unit_metadata(staff.snapshot(), unit_lookup.MemberSources({}, ()))
+            metadata = unit_lookup.unit_metadata(staff.snapshot())
         self.assertEqual(metadata.cells, {live.id: cells})
         self.assertEqual(metadata.problems, ())
 
@@ -282,10 +285,9 @@ class UnitLookupTests(unittest.TestCase):
     def test_lookup_and_source_import_orders_resolve_the_same_transferred_member(self) -> None:
         row = unit_membership("receiving", "alpha")
         program = """import importlib, sys
-sys.path.insert(0, sys.argv[1])
-for module in sys.argv[2:]:
-    importlib.import_module(module)
-import staff_sources, unit_lookup
+for module in sys.argv[1:]:
+    importlib.import_module("scripts.production." + module)
+from scripts.production import staff_sources, unit_lookup
 from scripts.production import staff
 record = staff.snapshot()
 found = staff_sources.member(staff_sources.UnitMember('old', 'alpha'), record)
@@ -302,7 +304,7 @@ print(observed.row.id)
 """
         for order in (("unit_lookup", "staff_sources"), ("staff_sources", "unit_lookup")):
             with self.subTest(order=order):
-                result = subprocess.run([sys.executable, "-c", program, str(SCRIPT.parent), *order],
+                result = subprocess.run([str(Path(__file__).resolve().parents[2] / "scripts/lib/py"), "-c", program, *order],
                                         env=self.environment, capture_output=True, text=True, check=False)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(result.stdout, row.id + "\n")
@@ -352,7 +354,7 @@ print(observed.row.id)
     def test_restarted_unit_without_process_marks_uses_its_repaired_pane_record(self) -> None:
         from scripts.shutdown import pane_record
         from scripts.production import session_staff
-        import session_pane
+        from scripts.production import session_pane
 
         owner = unit_membership("show", "alpha")
         fake_unit_host.write(self.environment, [HostedUnit("agents", "w4:p1", {})])
@@ -375,12 +377,12 @@ print(observed.row.id)
     def test_live_staffed_session_without_any_launch_agrees_across_readers_and_worker_queue(self) -> None:
         from scripts.production import session_staff
         from scripts.message import unit_labels
-        import session_pane
+        from scripts.production import session_pane
 
         doc = self.root / "production.md"
         _ = doc.write_text("# show\n")
         _ = recorded_showrunner("show", doc)
-        owner = unit_membership("show", "alpha-unit")
+        owner = unit_membership("show", "alpha")
         fake_unit_host.write(self.environment, [HostedUnit("agents", "w4:p1", {})])
         self.claude("alpha", "w4:p1", session_id=owner.id)
         registry = self.records / f"{os.getpid()}.json"
@@ -400,7 +402,7 @@ print(observed.row.id)
         _ = (run / "director").write_text(owner.id)
         worker = fixture_worker("fix", owner.id, runtime_id=fixture_runtime_id("worker-thread"), backend=staff.CodexBackend(self.root / "codex-home"))
         _ = (run / "mesh_roster.json").write_text(json.dumps({"fix": {"staff_id": worker.id, "status": "running"}}))
-        registered = [{"slug": "show", "session": "runner", "socket": "", "zone": "UTC", "doc": "/unused"}]
+        registered = [{"name": "show", "session": "runner", "socket": "", "zone": "UTC", "doc": "/unused"}]
         with (mock.patch.object(unit_labels, "newest_sessions", return_value=[session]),
               mock.patch.object(unit_labels, "registered_showrunners", return_value=registered),
               mock.patch.object(herdr, "herdr_processes", side_effect=AssertionError("queue must read files only"))):
@@ -422,7 +424,7 @@ print(observed.row.id)
             self.assertEqual(len(changes), 1)
             entry = pane_record.read("agents")["w4:p1"]
             self.assertEqual(entry["session_id"], owner.id)
-            self.assertEqual(entry["environment"], {"CLAUDE_CODE_SESSION_ID": owner.id})
+            self.assertEqual(entry["environment"], {})
             path = pane_record.record_path("agents")
             before = path.read_bytes(), path.stat().st_mtime_ns
             self.assertEqual(session_staff.repair_marks(), [])
@@ -436,7 +438,7 @@ print(observed.row.id)
         doc = self.root / "production.md"
         _ = doc.write_text("# show\n")
         _ = recorded_showrunner("show", doc)
-        owner = unit_membership("show", "alpha-unit")
+        owner = unit_membership("show", "alpha")
         _ = staff.set_worktree(owner.id, staff.PresentWorktree(remote.local_machine(), self.root), expected=owner.worktree)
         fake_unit_host.write(self.environment, [HostedUnit("agents", "w4:p1", {})])
         self.claude("organon", "w4:p1", session_id=owner.id)
@@ -454,7 +456,7 @@ print(observed.row.id)
         self.assertEqual(herdr.tab_order("show", ["show", "aaa-other", "organon"], [], {"organon"}), [0, 2, 1])
         grouped, _ = session_staff.session_staff_and_directors([session], self.environment)
         self.assertEqual(grouped.units["show"]["alpha"].identity, session_staff.LiveSession(owner.current_session))
-        registered = [{"slug": "show", "session": "runner", "socket": "", "zone": "UTC", "doc": "/unused"}]
+        registered = [{"name": "show", "session": "runner", "socket": "", "zone": "UTC", "doc": "/unused"}]
         with (mock.patch.object(unit_labels, "newest_sessions", return_value=[session]),
               mock.patch.object(unit_labels, "registered_showrunners", return_value=registered),
               mock.patch.object(herdr, "herdr_processes", side_effect=AssertionError("queue must read files only"))):
@@ -465,7 +467,7 @@ print(observed.row.id)
             changes = session_staff.repair_marks()
             self.assertEqual(len(changes), 1)
             entry = pane_record.read("agents")["w4:p1"]
-            self.assertEqual(entry["environment"], {"CLAUDE_CODE_SESSION_ID": owner.id})
+            self.assertEqual(entry["environment"], {})
             path = pane_record.record_path("agents")
             before = path.read_bytes(), path.stat().st_mtime_ns
             self.assertEqual(session_staff.repair_marks(), [])
@@ -475,11 +477,15 @@ print(observed.row.id)
         for name in ("trunk", "other", "first", "second", "third"):
             _ = unit_membership("new", name)
         doc = self.root / "new-production.md"
-        _ = doc.write_text("# Production\n\n## Production Context\n\n- **Formerly:** `old`\n")
-        instance = self.root / "notifier/showrunner-new"
+        _ = doc.write_text("# Production\n")
+        owner = recorded_showrunner("new", doc)
+        state = self.root / "showrunner-state"
+        _ = self.enterContext(mock.patch.object(showrunners, "SHOWRUNNER_STATE_DIR", state))
+        self.environment["SHOWRUNNER_STATE_DIR"] = str(state)
+        instance = self.root / f"notifier/showrunner-{showrunner_relationship('new').id}"
         instance.mkdir(parents=True)
         _ = (instance / "conf").write_text(
-            f"TARGET=session:{showrunner_relationship('new').id}\nCHECK=zsh /scripts/production_check.sh {doc}\n")
+            f"TARGET=session:{owner.id}\nCHECK=zsh /scripts/production_check.sh {owner.id}\n")
 
     def process(self, pid: int, parent: int, argv: list[str], **environment: str) -> None:
         fake_unit_host.process(self.environment, pid, parent, argv, environment, cwd=self.root)
@@ -487,7 +493,7 @@ print(observed.row.id)
     def herdr_session(self, name: str = "native", pane: str = "w1:p1", unit: str = "trunk") -> None:
         row = unit_membership("new" if (self.root / "new-production.md").exists() else "show", unit)
         fake_unit_host.write(self.environment, [labeled(name, pane, unit,
-            slug="new" if (self.root / "new-production.md").exists() else "show",
+            production_name="new" if (self.root / "new-production.md").exists() else "show",
             CODEX_THREAD_ID=row.current_session)])
         self.process(os.getpid(), 991001, ["claude"], HERDR_PANE_ID=pane,
                      CODEX_THREAD_ID=row.current_session)
@@ -520,13 +526,13 @@ print(observed.row.id)
 
     def run_script(self, *arguments: str) -> subprocess.CompletedProcess[str]:
         environment = self.environment
-        return subprocess.run([sys.executable, str(SCRIPT), *arguments], env=environment, capture_output=True,
+        return subprocess.run([str(SCRIPT.parents[1] / "lib/py"), str(SCRIPT), *arguments], env=environment, capture_output=True,
                               text=True, check=False)
 
 
     def test_a_unit_is_found_by_its_mark_whatever_its_session_is_called_now(self) -> None:
         self.hosts({"$1": labeled("renamed-since-launch", "w4:p1", "trunk"),
-                                     "$2": labeled("another-show", "w5:p1", "trunk", slug="other"),
+                                     "$2": labeled("another-show", "w5:p1", "trunk", production_name="other"),
                                      "$3": HostedUnit("unmarked", "w6:p1", {})})
         self.claude("renamed-since-launch", "w4:p1", session_id=unit_membership("show", "trunk").id)
         found = unit_lookup.labeled_sessions("show")
@@ -536,23 +542,23 @@ print(observed.row.id)
         assert isinstance(unit.claude, LiveClaude)
         self.assertEqual((unit.claude.name, unit.claude.session_id), ("renamed-since-launch", unit_membership("show", "trunk").id))
 
-    def test_old_labeled_sessions_are_found_under_both_production_names(self) -> None:
+    def test_session_names_do_not_change_the_production_name(self) -> None:
         self.renamed_production()
-        self.hosts({"$1": labeled("still-old", "w4:p1", "trunk", slug="old")})
+        self.hosts({"$1": labeled("still-old", "w4:p1", "trunk", production_name="new")})
         self.claude("still-old", "w4:p1")
         found = unit_lookup.every_labeled_session()
         self.assertEqual(list(found.units), ["new"])
-        for slug in ("old", "new"):
-            with self.subTest(slug=slug):
-                self.assertEqual(unit_lookup.labeled_sessions(slug)["trunk"].place, herdr.HerdrPlace("still-old", "w4:p1"))
-                pane = self.run_script("pane", slug, "trunk")
+        for production_name in ("new",):
+            with self.subTest(name=production_name):
+                self.assertEqual(unit_lookup.labeled_sessions(production_name)["trunk"].place, herdr.HerdrPlace("still-old", "w4:p1"))
+                pane = self.run_script("pane", production_name, "trunk")
                 self.assertEqual((pane.returncode, pane.stdout), (0, "herdr:still-old:w4:p1\n"), pane.stderr)
-                listed = self.run_script("list", slug)
+                listed = self.run_script("list", production_name)
                 self.assertEqual(listed.returncode, 0, listed.stderr)
                 self.assertEqual(listed.stdout.split("\t")[:6],
                                  ["trunk", "herdr:still-old:w4:p1", "still-old", "live", "still-old", unit_membership("new", "trunk").id])
 
-    def test_grouping_resolves_former_slugs_without_discovering_processes(self) -> None:
+    def test_grouping_uses_staff_names_without_discovering_processes(self) -> None:
         self.renamed_production()
         unit = unit_lookup.LabeledSession("trunk", LiveClaude("report", "report-id", "/fixture.sock", 123),
                                       herdr.HerdrPlace("old-pane", "w4:p1"), identity=session_staff.LiveSession(unit_membership("new", "trunk").current_session))
@@ -562,9 +568,9 @@ print(observed.row.id)
         scan.assert_not_called()
 
     def test_grouping_uses_the_current_row_name_after_a_rename(self) -> None:
-        row = unit_membership("show", "old-name-unit")
+        row = unit_membership("show", "old-name")
         row = staff.rename(row.id, "renamed")
-        pane = unit_lookup.LabeledSession("old-name-unit", ClaudeUnknown("unreadable record"),
+        pane = unit_lookup.LabeledSession("old-name", ClaudeUnknown("unreadable record"),
             herdr.HerdrPlace("agents", "w1:p1"), session_staff.ObservedProcess(991099, "claude"),
             session_staff.LiveSession(row.current_session))
         record = staff.snapshot()
@@ -582,9 +588,9 @@ print(observed.row.id)
     def test_native_sessions_do_not_read_timers_during_discovery(self) -> None:
         self.renamed_production()
         self.hosts({
-            "$1": labeled("first", "w4:p1", "first", slug="old"),
-            "$2": labeled("second", "w5:p1", "second", slug="old"),
-            "$3": labeled("third", "w6:p1", "third", slug="old"),
+            "$1": labeled("first", "w4:p1", "first", production_name="new"),
+            "$2": labeled("second", "w5:p1", "second", production_name="new"),
+            "$3": labeled("third", "w6:p1", "third", production_name="new"),
         })
         self.live_hosts("w4:p1", "w5:p1", "w6:p1")
         sources = unit_lookup.member_sources()
@@ -596,21 +602,24 @@ print(observed.row.id)
 
     def test_current_production_discovery_keeps_an_existing_timer_read_budget(self) -> None:
         self.renamed_production()
-        self.hosts({"$1": labeled("current", "w4:p1", "trunk", slug="new")})
+        self.hosts({"$1": labeled("current", "w4:p1", "trunk", production_name="new")})
         self.claude("current", "w4:p1")
-        with mock.patch.object(showrunners, "checked_doc", wraps=showrunners.checked_doc) as reads:
-            checked = showrunners.checked_doc(self.root / "notifier/showrunner-new")
-            self.assertIsInstance(checked, showrunners.CheckedDoc)
-            found = unit_lookup.every_labeled_session()
+        sources = unit_lookup.member_sources()
+        with mock.patch.object(showrunners, "_source", wraps=getattr(showrunners, "_source")) as reads:
+            source = showrunners.read_sources(self.root / "notifier",
+                unreadable=showrunners.UnreadableTimerPolicy.STRICT, record=staff.snapshot())[0]
+            self.assertIsInstance(source, showrunners.ShowrunnerSource)
+            found = unit_lookup.every_labeled_session(sources=sources)
             self.assertEqual(list(found.units["new"]), ["trunk"])
             self.assertEqual(reads.call_count, 1, "current marks must not reread already inventoried timers")
 
     def test_current_production_lookup_does_not_read_timer_docs(self) -> None:
         self.renamed_production()
-        self.hosts({"$1": labeled("current", "w4:p1", "trunk", slug="new")})
+        self.hosts({"$1": labeled("current", "w4:p1", "trunk", production_name="new")})
         self.claude("current", "w4:p1")
-        with mock.patch.object(showrunners, "checked_doc", wraps=showrunners.checked_doc) as reads:
-            found = unit_lookup.labeled_sessions("new")
+        sources = unit_lookup.member_sources()
+        with mock.patch.object(showrunners, "_source", wraps=getattr(showrunners, "_source")) as reads:
+            found = unit_lookup.labeled_sessions("new", sources=sources)
             self.assertEqual(found["trunk"].place, herdr.HerdrPlace("current", "w4:p1"))
             self.assertEqual(reads.call_count, 0)
 
@@ -621,9 +630,9 @@ print(observed.row.id)
         environment = self.root / "proc" / str(os.getpid()) / "environ"
         _ = environment.write_bytes(b"HERDR_PANE_ID=w1:p1")
         self.assertEqual(list(unit_lookup.every_labeled_session().units), ["new"])
-        for slug in ("old", "new"):
-            with self.subTest(slug=slug):
-                pane = self.run_script("pane", slug, "trunk")
+        for production_name in ("new",):
+            with self.subTest(name=production_name):
+                pane = self.run_script("pane", production_name, "trunk")
                 self.assertEqual((pane.returncode, pane.stdout), (0, "herdr:native:w1:p1\n"), pane.stderr)
 
 
@@ -874,10 +883,10 @@ print(observed.row.id)
         runs = self.root / "history/runs"
         runs.mkdir(parents=True, exist_ok=True)
         owner = showrunner_relationship("history")
-        row = staff.snapshot().unit_by_worktree("natedev", worktree.resolve())
+        row = staff.snapshot().unit_by_worktree(remote.local_machine(), worktree.resolve())
         if row is None:
             row = fixture_member("unit", name="history-" + name, parent=owner.id,
-                                 worktree=staff.PresentWorktree("natedev", worktree.resolve()))
+                                 worktree=staff.PresentWorktree(remote.local_machine(), worktree.resolve()))
         events = [{"event_type": "run_started", "main_agent": {"session_id": row.current_session}, "run_started_at": started},
                   *({"event_type": kind} for kind in later)]
         path = runs / f"{name}.jsonl"
@@ -908,7 +917,7 @@ print(observed.row.id)
         parent = staff.snapshot().parent_of(row)
         assert parent is not None
         _ = (folder / unit_runs.STATE_FILE).write_text(json.dumps({
-            "history_file": str(history), "production": parent.name, "unit": row.name}))
+            "history_file": str(history), "owner_staff_id": row.id}))
         first["main_agent"] = {"session_id": director}
         later = history.read_text().splitlines()[1:]
         _ = history.write_text("\n".join([json.dumps(first), *later]) + "\n")
@@ -918,10 +927,10 @@ print(observed.row.id)
         old = self.root / "old-folder"
         history = self.record("staff-run", old, 1.0, "run_finished")
         before = history.read_bytes(), history.stat().st_mtime_ns
-        row = staff.snapshot().unit_by_worktree("natedev", old)
+        row = staff.snapshot().unit_by_worktree(remote.local_machine(), old)
         assert row is not None
         destination = self.root / "staff-folder"
-        _ = staff.set_worktree(row.id, staff.PresentWorktree("natedev", destination), expected=row.worktree)
+        _ = staff.set_worktree(row.id, staff.PresentWorktree(remote.local_machine(), destination), expected=row.worktree)
         current = unit_lookup.read_run_states()
         self.assertIs(current.state(destination), UnitState.RUN_FINISHED)
         self.assertIs(current.state(old), UnitState.STANDING_BY)
@@ -954,7 +963,7 @@ print(observed.row.id)
         record = staff.snapshot()
         row = record.by_member_reference(director)
         assert row is not None
-        _ = staff.set_worktree(row.id, staff.PresentWorktree("natedev", self.root / "later"), expected=row.worktree)
+        _ = staff.set_worktree(row.id, staff.PresentWorktree(remote.local_machine(), self.root / "later"), expected=row.worktree)
         with mock.patch.object(staff, "snapshot", side_effect=AssertionError("another staff read")):
             found = unit_lookup.HeldRunLookup(record=record).unfinished_held_run(director)
         self.assertIsInstance(found, unit_lookup.HeldRun)

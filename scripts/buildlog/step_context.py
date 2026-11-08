@@ -1,6 +1,10 @@
 """Capture a step's tree key and target folder without loading the writer."""
 
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import os
 import sys
@@ -10,13 +14,9 @@ from pathlib import Path
 from typing import TYPE_CHECKING, cast
 
 if TYPE_CHECKING:
-    from ..lib.cargo_output import CargoOutputRoots, CargoOutputUnavailable, read_cargo_output_roots
+    from scripts.lib.cargo_output import CargoOutputRoots, CargoOutputUnavailable, cargo_metadata_output_roots, read_cargo_output_roots
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
-if __package__:
-    from . import parse
-else:
-    import parse
+from scripts.buildlog import parse
 
 
 @dataclass(frozen=True)
@@ -104,7 +104,7 @@ def resolve_target_folder(argv: list[str], cwd: str, environment: Mapping[str, s
     program, arguments, directory, effective = cargo_command_context(argv, cwd, environment)
     if not program or parse.step_name([*program, *arguments]) == "fmt":
         return NoTargetFolder()
-    from cargo_target_config import CargoConfigPolicy, cargo_folder_settings, cargo_home_folder, cargo_workspace_manifest
+    from scripts.lib.cargo_target_config import CargoConfigPolicy, cargo_folder_settings, cargo_home_folder, cargo_workspace_manifest
 
     try:
         settings = cargo_folder_settings(arguments, directory, effective, policy=CargoConfigPolicy.CURRENT_STRICT)
@@ -122,31 +122,51 @@ def resolve_target_folder(argv: list[str], cwd: str, environment: Mapping[str, s
         workspace = cargo_workspace_manifest(arguments, directory, cargo_home_folder(directory, effective))
         return CargoTargetFolder(workspace.resolve().parent / "target")
     except (OSError, ValueError) as error:
-        if __package__:
-            from . import store
-        else:
-            import store
+        from scripts.buildlog import store
 
         store.note_error(f"target folder: {error}")
         return UnresolvedTargetFolder()
 
 
-def step_output_roots(argv: list[str], cwd: str) -> CargoOutputRoots | CargoOutputUnavailable:
-    """Read output folders with the step command's Cargo inputs."""
-    import json
-    from cargo_target_config import cargo_path_argument
-    if not TYPE_CHECKING:
-        from scripts.lib.cargo_output import read_cargo_output_roots
+_OUTPUT_ENVIRONMENT = (
+    "CARGO_TARGET_DIR", "CARGO_BUILD_TARGET_DIR", "CARGO_BUILD_BUILD_DIR", "CARGO_HOME", "HOME", "RUSTUP_TOOLCHAIN",
+)
+_OUTPUT_ARGUMENTS = ("--manifest-path", "--config", "--target-dir")
+_OUTPUT_FILES = ("Cargo.toml", "rust-toolchain", "rust-toolchain.toml")
 
-    program, arguments, directory, environment = cargo_command_context(argv, cwd, os.environ)
-    options: list[str] = []
+
+def _output_arguments(arguments: list[str]) -> list[tuple[str, ...]]:
+    """Keep the selected Cargo flags and values as written."""
+    selected: list[tuple[str, ...]] = []
     words = iter(arguments)
     for word in words:
-        if word in ("--manifest-path", "--config"):
-            options.extend([word, next(words, "")])
-        elif word.startswith(("--manifest-path=", "--config=")):
-            options.append(word)
-    target = cargo_path_argument(arguments, "--target-dir")
+        if word in _OUTPUT_ARGUMENTS:
+            selected.append((word, next(words, "")))
+        elif word.startswith(tuple(flag + "=" for flag in _OUTPUT_ARGUMENTS)):
+            selected.append((word,))
+    return selected
+
+
+def step_output_roots(argv: list[str], cwd: str) -> CargoOutputRoots | CargoOutputUnavailable:
+    """Use matching exported folders or read the step's Cargo metadata."""
+    import json
+    if not TYPE_CHECKING:
+        from scripts.lib.cargo_output import CargoOutputRoots, read_cargo_output_roots
+
+    exported = os.environ.get("BUILDLOG_OUTPUT_ROOTS", "")
+    if exported:
+        roots = _parse_output_roots(exported, _output_evidence(argv, cwd, os.environ))
+        if isinstance(roots, CargoOutputRoots):
+            return roots
+    program, arguments, directory, environment = cargo_command_context(argv, cwd, os.environ)
+    options: list[str] = []
+    target = ""
+    for words in _output_arguments(arguments):
+        if words[0].split("=", 1)[0] == "--target-dir":
+            if not target:
+                target = words[1] if len(words) == 2 else words[0].split("=", 1)[1]
+        else:
+            options.extend(words)
     if target:
         absolute = str((Path(directory) / target).resolve())
         options.extend(["--config", "build.target-dir=" + json.dumps(absolute)])
@@ -154,11 +174,58 @@ def step_output_roots(argv: list[str], cwd: str) -> CargoOutputRoots | CargoOutp
                                    options=options, environment=environment)
 
 
+def _output_evidence(argv: list[str], cwd: str, environment: Mapping[str, str]) -> str:
+    """Fingerprint the Cargo inputs that select the workspace and output folders."""
+    import hashlib
+    import json
+    from scripts.lib.cargo_target_config import cargo_config_folders
+
+    program, arguments, directory, effective = cargo_command_context(argv, cwd, environment)
+    if not program:
+        return ""
+    selected = [word for words in _output_arguments(arguments) for word in words]
+    working = Path(directory).resolve()
+    files = {folder / name for folder in (working, *working.parents) for name in _OUTPUT_FILES}
+    files.update(folder / name for folder in cargo_config_folders(directory, effective)
+                 for name in ("config", "config.toml"))
+    contents: list[tuple[str, str, str]] = []
+    try:
+        for path in sorted(files):
+            try:
+                contents.append((str(path), "present", path.read_bytes().hex()))
+            except FileNotFoundError:
+                contents.append((str(path), "absent", ""))
+    except OSError:
+        return ""
+    inputs = (str(working), program[1:], selected,
+              [(name, effective.get(name)) for name in _OUTPUT_ENVIRONMENT], contents)
+    return hashlib.sha256(json.dumps(inputs, separators=(",", ":")).encode()).hexdigest()
+
+
+def _parse_output_roots(value: str, evidence: str) -> CargoOutputRoots | CargoOutputUnavailable:
+    """Accept exported folders only when the Cargo evidence matches."""
+    if not TYPE_CHECKING:
+        from scripts.lib.cargo_output import CargoOutputRoots, CargoOutputUnavailable
+
+    parts = value.split("\t")
+    if len(parts) != 4 or not evidence or parts[0] != evidence:
+        return CargoOutputUnavailable("output evidence does not match")
+    return CargoOutputRoots(*(Path(part).resolve() for part in parts[1:]))
+
+
+def _output_roots(metadata: str) -> None:
+    if not TYPE_CHECKING:
+        from scripts.lib.cargo_output import CargoOutputRoots, cargo_metadata_output_roots
+
+    roots = cargo_metadata_output_roots(metadata)
+    if isinstance(roots, CargoOutputRoots):
+        evidence = _output_evidence(["cargo", "metadata"], os.getcwd(), os.environ)
+        if evidence:
+            print("\t".join((evidence, str(roots.workspace_root), str(roots.target_directory), str(roots.build_directory))))
+
+
 def step_context(argv: list[str], metadata: str) -> None:
-    if __package__:
-        from . import treekey
-    else:
-        import treekey
+    from scripts.buildlog import treekey
 
     cwd = os.getcwd()
     print(treekey.tree_key(git_directory(argv, cwd)) or "")
@@ -176,8 +243,11 @@ def git_directory(argv: list[str], cwd: str) -> str:
 
 
 def main(argv: list[str]) -> int:
+    if argv == ["output-roots"]:
+        _output_roots(sys.stdin.read())
+        return 0
     if not argv or argv[0] != "step-context":
-        print("usage: step_context.py step-context ARGV...", file=sys.stderr)
+        print("usage: step_context.py {step-context ARGV...|output-roots}", file=sys.stderr)
         return 2
     step_context(argv[1:], sys.stdin.read())
     return 0

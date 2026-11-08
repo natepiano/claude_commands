@@ -15,7 +15,7 @@ from functools import cached_property, lru_cache
 from itertools import accumulate
 import re
 
-import style_footprint
+from scripts.style import style_footprint
 
 # The keywords that declare an item directly in a module, trait or impl body.
 ITEM_KEYWORDS = frozenset({"fn", "struct", "enum", "union", "trait", "type", "const", "static", "mod"})

@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """Check a small worktree patch, push main, and retain it for blind review."""
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import argparse
 import ast
@@ -24,11 +28,8 @@ import time
 from typing import Literal, TypedDict, cast
 from uuid import uuid4
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
-import process_group
+from scripts.lib import process_group
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 from scripts.copies import copies
 from scripts.lib import build_folders, conf
 from scripts.lib.atomic_file import write_text_atomic
@@ -99,9 +100,9 @@ class FileState:
 
 @dataclass
 class FastTrackArguments(argparse.Namespace):
-    """Typed CLI boundary; an empty production path is refused before a push."""
+    """Typed CLI boundary; an empty production name is refused before a push."""
     unit: str = ""
-    production: Path = Path()
+    production: str = ""
     why: str = ""
     pending: bool = False
     mark_reviewed: bool = False
@@ -472,7 +473,7 @@ def select_patch(repo: Path, paths: list[str]) -> Generator[SelectedPatch]:
         drop_recovery_refs(repo, prefix)
 
 
-def prepare_attempt(repo: Path, row: PushRecord, selection: SelectedPatch, base: str, production: Path, candidate_source: Path) -> Path:
+def prepare_attempt(repo: Path, row: PushRecord, selection: SelectedPatch, base: str, production: str, candidate_source: Path) -> Path:
     intent = PushIntent(record=row, worktree_head=selection.worktree_head, worktree_tree=selection.worktree_tree,
                         index_tree=selection.index_tree)
     identity = json.dumps([row["unit"], str(repo.resolve()), row["commit"]]).encode()
@@ -487,7 +488,7 @@ def prepare_attempt(repo: Path, row: PushRecord, selection: SelectedPatch, base:
             for name, target in (("head", selection.worktree_head), ("index", selection.index_tree),
                                  ("worktree", selection.worktree_tree)):
                 _ = git(repo, "update-ref", f"{prefix}/{name}", target)
-            attempt = PushAttempt(restore=intent, base=base, production=str(production.resolve()),
+            attempt = PushAttempt(restore=intent, base=base, production=production,
                                   publication="prepared", restored=False, restore_closed="", promoted=False)
             save_attempt(path, attempt)
         drop_recovery_refs(repo, selection.recovery_ref_prefix)
@@ -657,7 +658,7 @@ def reconcile(repo: Path, unit: str, *, finish: bool = False, paths: tuple[str, 
                     attempt["restored"] = True
                     save_attempt(path, attempt)
                 if not attempt["promoted"] or repeat:
-                    promote(Path(attempt["production"]), repo, row["commit"], unit)
+                    promote(attempt["production"], repo, row["commit"], unit)
                     attempt["promoted"] = True
                     save_attempt(path, attempt)
             except (PublishedFailure, Refused, OSError, ValueError) as error:
@@ -674,23 +675,23 @@ def reconcile(repo: Path, unit: str, *, finish: bool = False, paths: tuple[str, 
     return recovered
 
 
-def promote(production: Path, repo: Path, commit: str, unit: str) -> None:
+def promote(production: str, repo: Path, commit: str, unit: str) -> None:
     from scripts.production import merge_checkpoint, production_doc
 
     try:
-        promotion = production_doc.promotion_from_doc(production.read_text().splitlines())
+        promotion = production_doc.promotion_from_doc(production_doc.read_production(production).doc.read_text().splitlines())
         if isinstance(promotion, production_doc.PromoteTo) and not promotion.checkouts and isinstance(promotion.mac, production_doc.MacCheckout):
             # The pull helper needs a local main ref at the published commit.
-            with copies.standing(unit, repo, commit) as source:
+            with copies.standing(copies.source_owner(repo), repo, copies.CommittedSource(commit)) as source:
                 _ = git(source, "update-ref", "refs/heads/main", commit)
                 merge_checkpoint.promote_targets(promotion, "main", commit, source=source, label=f"fast-track {unit}")
         else:
             merge_checkpoint.promote_targets(promotion, "main", commit, source=repo, label=f"fast-track {unit}")
-    except (merge_checkpoint.Stop, copies.CopyError) as error:
+    except (merge_checkpoint.Stop, copies.CopyError, production_doc.Refusal) as error:
         raise PublishedFailure(str(error)) from error
 
 
-def push_patch(repo: Path, production: Path, unit: str, why: str, paths: list[str],
+def push_patch(repo: Path, production: str, unit: str, why: str, paths: list[str],
                selection: SelectedPatch, config: FastTrackLimits, settings_read: conf.ConfigRead) -> str:
     from scripts.production import merge_checkpoint
 
@@ -698,7 +699,7 @@ def push_patch(repo: Path, production: Path, unit: str, why: str, paths: list[st
     digest = hashlib.sha256(patch).hexdigest()
     with build_folders.temporary_build_folder(build_folders.UniqueBuildFolder(prefix=build_folders.FOLDER_PREFIXES["fast-track"])) as temporary:
         fetch_main(repo, settings_read)
-        with copies.standing(unit, repo, "origin/main") as copy:
+        with copies.standing(copies.source_owner(repo), repo, copies.CommittedSource("origin/main")) as copy:
             _ = git(copy, "remote", "set-url", "origin", git(repo, "remote", "get-url", "origin").strip())
             for key in ("user.name", "user.email"):
                 value = git(repo, "config", "--get", key).strip()
@@ -748,7 +749,7 @@ def push_patch(repo: Path, production: Path, unit: str, why: str, paths: list[st
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     _ = parser.add_argument("--unit", required=True)
-    _ = parser.add_argument("--production", type=Path, default=Path())
+    _ = parser.add_argument("--production", default="")
     _ = parser.add_argument("--why", default="")
     mode = parser.add_mutually_exclusive_group()
     _ = mode.add_argument("--pending", action="store_true")
@@ -770,9 +771,10 @@ def main(argv: list[str] | None = None) -> int:
         if args.close_restore:
             close_restore(repo, args.unit, args.close_restore)
             return 0
-        if args.production == Path() or not args.paths or not args.why.strip() or any(c in args.why for c in "\r\n"):
+        if not args.production or not args.paths or not args.why.strip() or any(c in args.why for c in "\r\n"):
             raise Refused("--production, a one-line --why, and file paths are required")
-        _ = args.production.read_text()
+        from scripts.production.production_doc import read_production
+        _ = read_production(args.production)
         settings_read = conf.read("fast_track")
         config = limits(settings_read)
         paths = selected_paths(repo, args.paths, config)

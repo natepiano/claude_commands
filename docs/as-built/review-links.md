@@ -13,11 +13,11 @@ Review links let a session on natedev or on the Mac show files to the user in a 
 | `/etc/nixos/modules/common/review-links.nix` | The shared job `nate.jobs.review-links` for both machines. |
 | `/etc/nixos/modules/linux/review-links.nix` | The natedev restart settings and the firewall line. |
 
-Run the tests from the repository root with `python3 -m unittest discover -s scripts/review_links -p 'test_*.py'`. They need Python 3.12 or later.
+Run the tests from the repository root with `~/.claude/scripts/lib/py -m unittest discover -s scripts/review_links -p 'test_*.py'`. They need Python 3.12 or later.
 
 The flow:
 
-1. The skill runs `~/.claude/scripts/lib/py ~/.claude/scripts/review_links/review_link.py <file>... [--new]` on the machine that has the files. `scripts/lib/py` finds Python 3.12 or later.
+1. The skill runs `~/.claude/scripts/lib/py ~/.claude/scripts/review_links/review_link.py <file>... [--new]` on the machine that has the files. `scripts/lib/py` finds Python 3.12 or later. Inline programs import from the shim’s repository root through `PYTHONPATH` and `-P`. File scripts keep their existing import path behavior.
 2. The publisher checks every input, gets the host, writes the snapshot under the index lock and prints one URL per file.
 3. The skill fetches each URL with `curl` on the same machine. It gives only the links that return `200`, as clickable Markdown links that show the file name.
 4. The browser on the Mac gets the file from the server on that machine, over the tailnet.
@@ -80,7 +80,7 @@ The lock file stays on disk. Closing it releases the lock, also on an error. If 
 Run this command without a row count or batch size:
 
 ```sh
-python3 scripts/review_links/change_page.py
+scripts/lib/py scripts/review_links/change_page.py
 ```
 
 The page finds list paths through `change_review.lists_directory()` and the existing filename prefix.
@@ -146,7 +146,7 @@ A missing document reference in the source list does not block a row with an ava
 An unrouted row retains verdict controls when its list's staff showrunner has an available document.
 In that case, its owner remains unrouted and receives no message.
 
-`merge_checkpoint`, `merge_gate`, and `change_review.py append` store each checkpoint unit's Producer id.
+`change_review.list_ready`, which `merge_checkpoint` and `merge_gate` call, stores each checkpoint unit's Producer id.
 `merge_gate` reads the staff record before the merge.
 `merge_checkpoint` reads the staff record before the push.
 An unreadable staff record stops either run before anything is pushed.
@@ -186,7 +186,7 @@ Next skips a change without saving an answer.
 The page keeps the current row if the user selects Next or another tab during the save.
 
 The record's `Kind` column remains the only source for the kind.
-Set it with `change_review.py set-kind --production DOC --row C27 --kind 'See in action'`.
+Set it with `change_review.py set-kind --production <showrunner name> --row C27 --kind 'See in action'`.
 Use **See in action** for a change to something the user runs or sees.
 Use **Read only** for other changes.
 Both kinds appear.
@@ -241,7 +241,7 @@ An open question survives page loads and server restarts.
 A failed HTTP save keeps the row waiting with its typed question and answer form.
 A direct link shows the open question without verdict buttons.
 
-The showrunner answers with `scripts/review_links/change_page.py answer-question --production <doc> --list <list> --row C<n> --question <id> --text "<answer>"`.
+The showrunner answers with `scripts/review_links/change_page.py answer-question --production <showrunner name> --list <list> --row C<n> --question <id> --text "<answer>"`.
 The command refuses a row without an open question.
 The command refuses an old or unknown question ID.
 The same ID and answer text change nothing and exit 0 on a rerun.
@@ -273,13 +273,13 @@ Path fields, command fields, and non-ASCII tokens also receive 4xx.
 
 Older selected-row links still work with their existing plain HTML forms and 303 responses.
 Their `.review-link-changes.json` manifest keeps its immutable row allowlist.
-The selected-row publisher still accepts `--production DOC [--list LIST] C27`.
+The selected-row publisher still accepts `--production <showrunner name> [--list LIST] C27`.
 It requires a valid kind, description, and proof for each selected row.
 The normal command uses the all-list page instead.
 
 The server accepts writes only when its bound address equals the current `tailscale ip -4` address.
 A different bind or a failed address lookup refuses the write.
-The server resolves each row's Production slug across the root production's complete hierarchy.
+The server resolves each row's Production staff name across the root production's complete hierarchy.
 A child page can therefore answer sibling rows on the shared root list.
 An unknown production is refused before the verdict saves.
 
@@ -370,7 +370,7 @@ Recovery preserves attempts that a live request owns.
 Recovery scans each review list once and finds each record through `change_routing.delivery_path`.
 It ignores the `page` field in legacy records.
 The browser and recovery use `StaffRouting.owner_and_production` for the same owner and production document.
-The `Production:` line names that document in live and recovered messages.
+The `Production:` line names the showrunner in live and recovered messages.
 It never delivers a verdict without a saved verdict in the review list.
 Legacy failed records decode as nothing to deliver; they produce no send or page controls.
 A legacy failed validation keeps validation ownership without a message attempt.
@@ -403,7 +403,7 @@ Older selected-row pages retain their server Next form for compatibility.
 The sender's repeat rules also apply when the server recovers a pending message.
 The review record remains the only verdict store.
 
-Restart the existing review-links service after deployment.
+Restart each running review-links service once when this code check reaches deployment.
 No NixOS or service configuration change is necessary.
 
 ### Server
@@ -417,6 +417,18 @@ The server reads the current settings when it needs them.
 - At start, the server runs `tailscale ip -4` (10 s timeout) and parses the output as IPv4. It creates the root if it is missing and runs the sweep. Then it binds a `ThreadingHTTPServer` to that address and port, and prints `review-links: serving <root> on <address>:<port>`. A failure at start, for example no address or a failed bind, prints one `review-links: <error>` line to stderr, and the server exits 1.
 - The server repeats the address check after `tailscale_check_seconds`, which starts at 60 seconds.
   The server uses the monotonic clock. A failed lookup prints `tailscale address gone (was <address>)`. A different address prints `tailscale address changed (was <old>, now <new>)`. In both cases the server exits 1, and the service manager starts it again on the current address. If Tailscale stops but still reports the same address, the server keeps running, because its socket stays bound to that address.
+- The server checks loaded module files under its own checkout after `code_check_seconds`, which starts at five seconds.
+  It uses a monotonic deadline and reads the interval only when the check is due.
+  It compares each file's modification time in nanoseconds and size.
+  A file modified at or after the process start counts as changed, even before its first stamp.
+  An older module loaded later joins the stamps at the next check without a restart.
+  A changed or unreadable file requires a restart.
+  The server checks live delivery attempts under the delivery lock.
+  It defers the restart while an attempt is live and keeps the old stamps for the next check.
+  When no attempt is live, an exception closes the server socket.
+  The server prints `review-links: code changed: <path>` and calls `os.execv(sys.executable, sys.orig_argv)`.
+  The new process keeps the pid, arguments and environment.
+  A failed process replacement or new start exits 1, and the service manager starts the service again.
 - The server percent-decodes the path and removes the query. A path with a `..` segment gets 404. The server resolves the path under the root and follows symlinks. The result must be a regular file under the root. Folders and targets outside the root get 404. Index names, the `.review-link-` prefix, and atomic temporary names get 404. The server never lists a folder.
 - A published `changes.html` with a private manifest is rendered from the review record. Every other regular file gets 200 with `Content-Type`, `Content-Length`, `Last-Modified` and `X-Content-Type-Options: nosniff`. The server never sends 304.
 - Content types: `.html` and `.htm`, in any case, go out as `text/html; charset=utf-8`. A type that Python's `mimetypes` lists under `image/` keeps that type. All other files, `.md`, `.txt`, `.json` and `.pdf` included, go out as `text/plain; charset=utf-8`.
@@ -440,7 +452,7 @@ That interval starts at one hour.
 
 ### Services
 
-Both machines import `/etc/nixos/modules/common/review-links.nix`. It defines the job `nate.jobs.review-links` with `keepAlive = true` and the script `exec python3 "$HOME/.claude/scripts/review_links/serve.py"`. The job runs the script from the `~/.claude` checkout, not from a Nix store copy, with the user's `PATH`, which has `python3` and `tailscale`. The backends `/etc/nixos/modules/linux/nate-backend.nix` (systemd) and `/etc/nixos/modules/darwin/nate-backend.nix` (launchd) turn the job into the service on each machine. The services set no `REVIEW_LINKS_ROOT` and no `REVIEW_LINKS_HOST`.
+Both machines import `/etc/nixos/modules/common/review-links.nix`. It defines the job `nate.jobs.review-links` with `keepAlive = true` and the script `exec "$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/review_links/serve.py"`. The job runs the script from the `~/.claude` checkout, not from a Nix store copy, with the user's `PATH`, which has `python3` and `tailscale`. The backends `/etc/nixos/modules/linux/nate-backend.nix` (systemd) and `/etc/nixos/modules/darwin/nate-backend.nix` (launchd) turn the job into the service on each machine. The services set no `REVIEW_LINKS_ROOT` and no `REVIEW_LINKS_HOST`.
 
 - natedev: the systemd user unit `review-links`. The backend sets `Type=simple`, `Restart=always` and `WantedBy=default.target`. `modules/linux/review-links.nix` adds `RestartSec=10s`, `StartLimitIntervalSec=0` and the firewall line `networking.firewall.interfaces.tailscale0.allowedTCPPorts = [ 8765 ];`. Logs go to the user journal.
 - Mac: the launchd user agent `org.nixos.review-links`. The backend makes `launchd.user.agents.review-links` with `KeepAlive = true` and `RunAtLoad = true`. It sets no `Label`, so the nix-darwin prefix `org.nixos` names the agent. There is no darwin-only module. The default launchd `ThrottleInterval` of 10 s is the restart gap. stdout and stderr go to `~/Library/Logs/nate-jobs/review-links.log`.
@@ -476,7 +488,9 @@ Both machines import `/etc/nixos/modules/common/review-links.nix`. It defines th
 - **Atomic per file, not per bundle.** During a refresh of several files, a reader can see one new file next to one old file.
 - **A bad index stops all publishing.** If `.index.json` is not valid JSON or is not a JSON object, every run exits 2 until someone repairs or removes the file.
 - **`REVIEW_LINKS_ROOT` in a session.** A session that sets it publishes to a folder that the service does not serve, and its links return 404. The `curl` check finds this.
-- **Code changes need a restart.** A running server keeps its imported code. Restart the service after changes to `serve.py`, `change_page.py`, `change_browser.py`, or `private_name` in `review_link.py`. Restart it after a change to the temporary-name shape in `atomic_file.py`. Other publisher changes take effect at the next publisher run. These changes need no rebuild.
+- **Code changes restart the server.** The next scheduled code check detects changes to loaded modules under the checkout and replaces the server process.
+  Other publisher changes take effect at the next publisher run.
+  These changes need no rebuild.
 - **Sweep and refresh at the same moment.** The sweep takes no lock. A refresh of the folder that the sweep deletes at that moment can fail, or can print a link that returns 404. The `curl` check finds this, and a second run gets a new ID.
 
 ## Why

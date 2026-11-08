@@ -6,7 +6,6 @@ import io
 from contextlib import redirect_stderr
 import math
 import os
-import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -15,11 +14,10 @@ from unittest import mock
 
 from scripts.production.staff_test_support import StaffTestCase, unit_membership
 from scripts.production.fake_unit_host import PaneShellFixture
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-import unit_move
-import herdr
-import unit_lookup
-from rename_state import RenameRefused
+from scripts.production import unit_move
+from scripts.herdr import herdr
+from scripts.production import unit_lookup
+from scripts.production.rename_state import RenameRefused
 
 
 @final
@@ -41,7 +39,7 @@ class UnitOperationPaneTests(unittest.TestCase):
         staff_fixture = StaffTestCase()
         staff_fixture.setUp()
         self.addCleanup(staff_fixture.doCleanups)
-        _ = unit_membership("demo", "alpha-unit")
+        _ = unit_membership("demo", "alpha")
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         self.worktree = self.root / 'worktree'
         self.worktree.mkdir()
@@ -54,7 +52,7 @@ class UnitOperationPaneTests(unittest.TestCase):
 
 
     def test_claude_execing_the_pane_shell_needs_no_close(self) -> None:
-        self.pane.found = unit_lookup.LabeledSession('alpha-unit',
+        self.pane.found = unit_lookup.LabeledSession('alpha',
             unit_lookup.LiveClaude('alpha', self.pane.native_id, 'socket', self.pane.shell), self.pane.place)
         self.assertIsNone(unit_move.unit_pane(self.pane.found, 'demo'))
         self.assertEqual(self.pane.close_calls(), [])
@@ -67,8 +65,8 @@ class UnitOperationPaneTests(unittest.TestCase):
         self.assertEqual(self.pane.close_calls(), [])
 
     def test_unknown_director_and_foreign_occupant_do_not_require_pane_proof(self) -> None:
-        self.pane.found = unit_lookup.LabeledSession('alpha-unit', unit_lookup.ClaudeUnknown('unreadable'), self.pane.place)
-        self.pane.add_occupant(991551, unit='beta-unit')
+        self.pane.found = unit_lookup.LabeledSession('alpha', unit_lookup.ClaudeUnknown('unreadable'), self.pane.place)
+        self.pane.add_occupant(991551, unit='beta')
         with mock.patch.object(herdr, 'herdr_processes', side_effect=AssertionError('no occupant scan')):
             pane = unit_move.unit_pane(self.pane.found, 'demo')
             with self.assertRaisesRegex(RenameRefused, 'other live work'):
@@ -77,7 +75,7 @@ class UnitOperationPaneTests(unittest.TestCase):
 
     def test_close_uses_saved_place_without_record_launch_or_generation_rechecks(self) -> None:
         pane = unit_move.unit_pane(self.pane.found, 'demo')
-        self.pane.found = unit_lookup.LabeledSession('alpha-unit',
+        self.pane.found = unit_lookup.LabeledSession('alpha',
             unit_lookup.LiveClaude('alpha', 'new-session', 'socket', self.pane.director), self.pane.place)
         with (mock.patch.object(herdr, 'process_action', side_effect=AssertionError('no process proof'))):
             unit_move.close_unit_pane(pane)

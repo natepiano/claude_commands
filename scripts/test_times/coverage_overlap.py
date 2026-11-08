@@ -1,10 +1,14 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
 """List tests whose executed lines are covered by tests that remain kept.
 
 Candidates can check different results. Review their assertions before removal.
 Collector times describe this run. Measure speed with the collector disabled.
 """
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 from collections.abc import Callable, Sequence
 from collections import defaultdict
@@ -20,7 +24,6 @@ from typing import TYPE_CHECKING, TypedDict, cast, override
 import tempfile
 import unittest
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from scripts.test_times.line_collector import (
     REPOSITORY, SHARED_TEST, SHARED_THREAD, ChildLaunch, ChildReport, ExecutedLine, LineCollector, read_child_reports,
@@ -325,7 +328,11 @@ def main(argv: list[str]) -> int:
         import_errors: list[str] = []
         for path in paths:
             previous_errors = len(loader.errors)
-            suite.addTests(loader.discover(str(path.parent), pattern=path.name))
+            module = ".".join(path.relative_to(REPOSITORY).with_suffix("").parts)
+            try:
+                suite.addTests(loader.loadTestsFromName(module))
+            except Exception as error:
+                import_errors.append(f"coverage overlap: {path.name} does not import: {type(error).__name__}: {error}")
             if len(loader.errors) > previous_errors:
                 reason = str(loader.errors[-1]).splitlines()[-1]
                 import_errors.append(f"coverage overlap: {path.name} does not import: {reason}")

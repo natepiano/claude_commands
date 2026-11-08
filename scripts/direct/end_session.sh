@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# end_session.sh — Mark this Claude session's unit run finished.
+# end_session.sh — Mark this director's unit run finished.
 #
 # Usage: end_session.sh
 #
@@ -14,6 +14,7 @@
 # Keeps workers and app-servers while their unit director is live. Otherwise,
 # pauses Codex workers and stops this run's servers after preserving queues.
 # Removes only Claude workers no longer held by a unit or live director.
+# Removes the unit's idle standing trees and workspaces.
 #
 # Deletes each run's scratch copies (remove_run_scratch.py): its verify.sh pass
 # records (verify_cache/), whose saved time is already in
@@ -33,22 +34,23 @@ UNIT_ENV_SHIM="${BASH_SOURCE[0]%/*}/../lib/unit_env.sh"
 # python3 goes through the repo shim, which picks an interpreter by VERSION
 # rather than by path: the python3 on PATH is Apple 3.9 on the Mac, and this
 # repo needs >= 3.12.
-PY="${HOME}/.claude/scripts/lib/py"
+PY="${BASH_SOURCE[0]%/*}/../lib/py"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 MESH="${SCRIPT_DIR}/../agents/codex_mesh.py"
 
-if [[ -z "${CLAUDE_CODE_SESSION_ID:-}" ]]; then
-  echo "No CLAUDE_CODE_SESSION_ID in the environment — nothing to clear."
+DIRECTOR_SESSION_ID="${CODEX_THREAD_ID:-${CLAUDE_CODE_SESSION_ID:-}}"
+if [[ -z "${DIRECTOR_SESSION_ID}" ]]; then
+  echo "No director session id in the environment; nothing to clear."
   exit 0
 fi
 
 # The marker is under unit/, or delegate/ for a run started before the rename.
 if [[ -n "${UNIT_ACTIVE_DIR:-}" ]]; then
-  MARKER="${UNIT_ACTIVE_DIR}/${CLAUDE_CODE_SESSION_ID}"
+  MARKER="${UNIT_ACTIVE_DIR}/${DIRECTOR_SESSION_ID}"
 else
-  MARKER="/tmp/claude/unit/active/${CLAUDE_CODE_SESSION_ID}"
-  if [[ ! -f "${MARKER}" && -f "/tmp/claude/delegate/active/${CLAUDE_CODE_SESSION_ID}" ]]; then
-    MARKER="/tmp/claude/delegate/active/${CLAUDE_CODE_SESSION_ID}"
+  MARKER="/tmp/claude/unit/active/${DIRECTOR_SESSION_ID}"
+  if [[ ! -f "${MARKER}" && -f "/tmp/claude/delegate/active/${DIRECTOR_SESSION_ID}" ]]; then
+    MARKER="/tmp/claude/delegate/active/${DIRECTOR_SESSION_ID}"
   fi
 fi
 
@@ -64,7 +66,7 @@ RUNS=()
 if [[ -n "${SESSION_DIR}" ]]; then
   RUNS+=("${SESSION_DIR}")
 fi
-HELD_ARGS=(held "${CLAUDE_CODE_SESSION_ID}")
+HELD_ARGS=(held "${DIRECTOR_SESSION_ID}")
 if [[ -n "${UNIT_RUN_ROOT:-}" ]]; then
   HELD_ARGS+=(--root "${UNIT_RUN_ROOT}")
 fi
@@ -95,6 +97,8 @@ if (( ${#RUNS[@]} > 0 )); then
   "$PY" "${SCRIPT_DIR}/remove_run_scratch.py" --tracked "${RUNS[@]}" || true
   # remove_run_scratch also ends tracked run scratch while keeping live commands' cwd.
 fi
+
+"$PY" "${SCRIPT_DIR}/../copies/copies.py" remove || true
 
 if [[ -f "${MARKER}" ]]; then
   rm -f "${MARKER}"

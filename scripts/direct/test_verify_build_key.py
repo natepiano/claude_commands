@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from scripts.build_queue.admission_test_support import AdmissionFixture, caller_admission
-
 import os
 import json
 import shlex
@@ -18,8 +16,6 @@ from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
 class VerifyBuildKeyTests(support.VerifyLintScopeFixture):
-    admission: AdmissionFixture = cast(AdmissionFixture, cast(object, None))
-
     @override
     def setUp(self) -> None:
         super().setUp()
@@ -35,7 +31,6 @@ class VerifyBuildKeyTests(support.VerifyLintScopeFixture):
         _ = self.git("add", "-f", ".gitignore", "Cargo.toml", "src/lib.rs")
         _ = self.git("commit", "-q", "-m", "fixture source")
         _ = self.enable_cache()
-        self.admission = caller_admission(self, self.root, self.environment)
 
     def git(self, *arguments: str) -> str:
         result = subprocess.run(
@@ -46,7 +41,7 @@ class VerifyBuildKeyTests(support.VerifyLintScopeFixture):
         return result.stdout.strip()
 
     def calculate_build_keys(self, *arguments: str, extra_environment: dict[str, str] | None = None,
-                        target: str = "") -> tuple[str, str, str]:
+                        target: str = "", command: str = "test") -> tuple[str, str, str]:
         """Run the shared production calculator without starting Cargo work."""
         metadata = cast(dict[str, object], json.loads(self.environment["TEST_METADATA"]))
         packages = cast(list[dict[str, object]], metadata["packages"])
@@ -57,7 +52,7 @@ class VerifyBuildKeyTests(support.VerifyLintScopeFixture):
         result = subprocess.run(
             [sys.executable, str(support.VERIFY.with_name("tree_watch.py")), "--key",
              "--package", "sample", str(support.VERIFY),
-             str(support.SCRIPTS / "lint/invoke.sh"), str(self.config), "--", "test", "sample", *arguments],
+             str(support.SCRIPTS / "lint/invoke.sh"), str(self.config), "--", command, "sample", *arguments],
             input=json.dumps(metadata), cwd=self.root,
             env={**self.environment, "TEST_METADATA": json.dumps(metadata), "VERIFY_COMPUTE_TEST_BUILD": "1",
                  "VERIFY_TEST_BUILD_INPUTS_FILE": str(output), **(extra_environment or {})},
@@ -99,6 +94,47 @@ class VerifyBuildKeyTests(support.VerifyLintScopeFixture):
                     "--filter", "native_rate", "--features", "a", extra_environment={name: value})
                 self.assertNotEqual(verdict, changed_verdict)
                 self.assertEqual(build, same_build)
+
+    def test_result_environment_changes_verdicts_without_rebuilding(self) -> None:
+        _ = self.environment.pop("NO_COLOR", None)
+        verdict, build, _ = self.calculate_build_keys()
+        for name in ("NO_COLOR", "CLICOLOR", "LC_ALL", "LC_COLLATE", "LC_CTYPE", "LC_MESSAGES",
+                     "LC_MONETARY", "LC_NUMERIC", "LC_TIME", "LC_ADDRESS", "LC_IDENTIFICATION",
+                     "LC_MEASUREMENT", "LC_NAME", "LC_PAPER", "LC_TELEPHONE", "HANA_TEST_MODE", "WGPU_BACKEND",
+                     "BEVY_TEST_MODE", "INSTA_UPDATE", "TRACE_MODE"):
+            with self.subTest(name=name):
+                changed, same_build, _ = self.calculate_build_keys(extra_environment={name: "fixture-value"})
+                self.assertNotEqual(verdict, changed)
+                self.assertEqual(build, same_build)
+        empty, same_build, _ = self.calculate_build_keys(extra_environment={"NO_COLOR": ""})
+        self.assertNotEqual(verdict, empty)
+        self.assertEqual(build, same_build)
+        forwarded, forwarded_build, _ = self.calculate_build_keys("--env", "SNAPSHOT", extra_environment={"SNAPSHOT": "one"})
+        changed, changed_build, _ = self.calculate_build_keys("--env", "SNAPSHOT", extra_environment={"SNAPSHOT": "two"})
+        self.assertNotEqual(forwarded, changed)
+        self.assertEqual(forwarded_build, changed_build)
+        self.assertEqual(build, forwarded_build)
+
+    def test_check_key_ignores_test_result_environment(self) -> None:
+        _ = self.environment.pop("NO_COLOR", None)
+        verdict, build, _ = self.calculate_build_keys(command="check")
+        unchanged, same_build, _ = self.calculate_build_keys(command="check", extra_environment={"NO_COLOR": "1"})
+        self.assertEqual(verdict, unchanged)
+        self.assertEqual(build, same_build)
+
+    def test_fixed_terminal_configuration_changes_only_the_verdict_key(self) -> None:
+        verdict, build, _ = self.calculate_build_keys()
+        unchanged, same_build, _ = self.calculate_build_keys(extra_environment={
+            "TERM": "other", "COLORTERM": "other", "TERM_PROGRAM": "other", "COLUMNS": "123", "LINES": "77",
+            "LC_TERMINAL": "other", "LC_TERMINAL_VERSION": "other",
+        })
+        self.assertEqual(verdict, unchanged)
+        self.assertEqual(build, same_build)
+        configuration = self.config.parent / "direct.conf"
+        _ = configuration.write_text(configuration.read_text().replace("TERM_PROGRAM=verify", "TERM_PROGRAM=fixture"))
+        changed, same_build, _ = self.calculate_build_keys()
+        self.assertNotEqual(verdict, changed)
+        self.assertEqual(build, same_build)
 
     def test_build_input_key_uses_metadata_target_and_package_source(self) -> None:
         _, build, target = self.calculate_build_keys("--filter", "native_rate")

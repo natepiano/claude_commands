@@ -2,23 +2,20 @@
 
 from __future__ import annotations
 
-from ledger_test_support import ticket_owner_id
+from scripts.style.ledger_test_support import ticket_owner_id
 
 import re
-import sys
 import unittest
-from pathlib import Path
 from typing import final
 from unittest import mock
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-import style_proposals
+from scripts.style import style_proposals
 
-import rules
-import style_ledger
+from scripts.style import rules
+from scripts.style import style_ledger
 
-from style_plan_test_support import StylePlanFixture
+from scripts.style.style_plan_test_support import StylePlanFixture
 
 
 @final
@@ -45,7 +42,7 @@ class StylePlanTests(StylePlanFixture):
         self.assertIn(f"waived 1 findings in {issue}: {source} site moved to {target} in synced commit {self.tip}\n", output)
         states = {finding.finding_id: finding.state for finding in ledger.proposal_findings(issue)}
         self.assertEqual(states, {moved.finding_id: style_ledger.Waived(), kept.finding_id: style_ledger.Filed(issue)})
-        ticket = ledger.ticket_open(ticket_owner_id("names-unit"))[0]
+        ticket = ledger.ticket_open(ticket_owner_id("names"))[0]
         self.assertEqual((ticket["kind"], ticket["files"], ticket["finding_ids"]), ("proposal", [source], [kept.finding_id]))
         self.assertTrue(any(selection.kind == "read" and target in selection.files for selection in self.candidates()))
 
@@ -87,7 +84,7 @@ class StylePlanTests(StylePlanFixture):
         self.assertEqual(self.ledger().proposal_tickets(), ())
         self.rejudge(finding, holds=True)
         _ = self.refill_decisions()
-        ticket = self.ledger().ticket_open(ticket_owner_id("names-unit"))[0]
+        ticket = self.ledger().ticket_open(ticket_owner_id("names"))[0]
         self.assertEqual((ticket["kind"], ticket["finding_ids"]), ("proposal", [finding.finding_id]))
 
     def test_an_approved_lower_rank_finding_at_a_changed_file_is_waived_when_the_judgment_of_that_file_does_not_hold_it(self) -> None:
@@ -101,7 +98,7 @@ class StylePlanTests(StylePlanFixture):
 
     def test_a_queued_proposal_for_a_lower_rank_finding_judged_at_an_older_file_is_dropped(self) -> None:
         issue, finding, _ = self.approved_then_changed()
-        self.ledger().ticket_add("9", ticket_owner_id("names-unit"), "proposal", "names", "crates/alpha", [finding.path],
+        self.ledger().ticket_add("9", ticket_owner_id("names"), "proposal", "names", "crates/alpha", [finding.path],
                                  [finding.rule], proposal=str(issue), finding_ids=(finding.finding_id,))
         output = self.refill_decisions()
         self.assertIn(f"dropped 9: {finding.finding_id} {finding.path} changed since it was judged", output)

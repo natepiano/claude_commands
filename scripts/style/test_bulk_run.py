@@ -1,16 +1,14 @@
 """Workspace bulk runs use temporary Git repos and a fake command runner; never build Rust."""
 from __future__ import annotations
 
-from ledger_test_support import ticket_owner_id
+from scripts.production.staff_test_support import foreign_hostname
 
 import json
 import os
 import signal
 import tempfile
 import sqlite3
-import socket
 import subprocess
-import sys
 import unittest
 from io import StringIO
 from unittest import mock
@@ -20,21 +18,26 @@ from contextlib import closing, nullcontext, redirect_stderr, redirect_stdout
 from dataclasses import replace
 from pathlib import Path
 from typing import TypedDict, cast, final, override
+from types import SimpleNamespace
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-import bulk_run as run
-import style_sync
-import bulk_rename as bulk
-import fake_fmt
-from style_child_test_support import StyleQueueFake, install_refusal_tools, unqueued_style_children
+from scripts.style import bulk_run as run
+from scripts.style import style_sync
+from scripts.style import bulk_rename as bulk
+from scripts.style import fake_fmt
+from scripts.style.style_child_test_support import StyleQueueFake, install_refusal_tools, unqueued_style_children
 from scripts.build_queue import queue_place
-import berth_board
-import rules
-from ledger_test_support import machine_rename_fixture, MACHINE_RENAME_AFTER
-import style_ledger as ledger_api
-from approved_renames import AppliedInCode, BindingRename, NoBindingScope, rename_declaration
-from test_bulk_rename import CargoProjectTests, ScriptedServer, word_edits, stop_after_edit, stop_process
+from scripts.style.style_plan_test_support import unit_staff_id
+from scripts.lib import berth_board
+from scripts.style import rules
+from scripts.style.ledger_test_support import machine_rename_fixture, MACHINE_RENAME_AFTER, ticket_owner_id
+from scripts.style import style_ledger as ledger_api
+from scripts.style.approved_renames import AppliedInCode, BindingRename, NoBindingScope, rename_declaration
+from scripts.style.test_bulk_rename import CargoProjectTests, ScriptedServer, word_edits, stop_after_edit, stop_process
+
+
+def setUpModule() -> None:
+    unittest.enterModuleContext(foreign_hostname())
 
 
 class FakeRunner:
@@ -68,14 +71,14 @@ class FakeRunner:
         if len(args) >= 3 and args[0] == "bash":
             self.test_checkout = repo
             self.test_tree = run.git(repo, "rev-parse", "HEAD^{tree}")
-            stage = args[2]
+            stage = "final --saved" if args[2:4] == ("final", "--saved") else args[2]
             if stage == self.mutate_stage:
                 _ = (repo / "unexpected.txt").write_text("untracked test output")
             if stage == "final" and self.red_tests:
                 return run.CommandResult(1, "FAIL [0.01s] bulk_sample::tests::broken\n")
             if stage == self.fail_stage:
                 return run.CommandResult(1, stderr=f"{stage} refused")
-            if stage == "final-pass" and (len(args) != 4 or self.other_tree_record or args[3] != self.test_tree):
+            if stage == "final --saved" and (len(args) != 6 or args[4] != "--tree" or self.other_tree_record or args[5] != self.test_tree):
                 return run.CommandResult(1, stderr="no matching tested-tree record")
         return run.CommandResult(0)
 
@@ -104,8 +107,8 @@ class WorkspaceRunTests(CargoProjectTests):
         self.assertIn("let old", (self.repo / "src/lib.rs").read_text())
         self.assertIn("let number", (self.repo / "beta/src/lib.rs").read_text())
         self.assertEqual(self.git("rev-list", "--count", f"{self.base}..HEAD"), "1")
-        self.assertEqual([args[2] for _, args in self.runner.calls if args[0] == "bash"],
-                         ["final", "lint", "final-pass"])
+        self.assertEqual([("final --saved" if args[2:4] == ("final", "--saved") else args[2]) for _, args in self.runner.calls if args[0] == "bash"],
+                         ["final", "lint", "final --saved"])
         released = ledger.named_held((findings[0].finding_id,))[0]
         self.assertIsInstance(released.build_ticket, ledger_api.NoBuildTicket)
         self.assertIsInstance(released.state, ledger_api.Filed)
@@ -369,13 +372,13 @@ class WorkspaceRunTests(CargoProjectTests):
                    base_tree: str, destination: str, authority: ledger_api.Ledger) -> int:
             return owned_run(repo, packages, run_id, rule, base_tree, destination, authority,
                              self.server, self.runner, self.available)
-        with mock.patch.object(socket, "gethostname", return_value="natedev"), mock.patch.object(
+        with mock.patch.object(run, "socket", SimpleNamespace(gethostname=lambda: "natedev")), mock.patch.object(
                 ledger_api, "open_ledger", return_value=nullcontext(ledger)), mock.patch.object(
                 run, "run_crates", side_effect=crates), redirect_stdout(StringIO()):
             return run.main(["--repo", str(self.repo), *arguments])
 
     def test_crate_cli_runs_lifecycle_and_resume_advances_second_crate_without_selection(self) -> None:
-        import crate_run
+        from scripts.style import crate_run
 
         ledger, definition, _ = self.setup_findings()
         self.addCleanup(ledger.close)
@@ -404,7 +407,7 @@ class WorkspaceRunTests(CargoProjectTests):
         self.assertEqual(self.git("status", "--porcelain"), "")
 
     def test_repeated_crate_cli_arguments_advance_serially_in_one_frozen_run(self) -> None:
-        import crate_run
+        from scripts.style import crate_run
 
         ledger, definition, _ = self.setup_findings()
         self.addCleanup(ledger.close)
@@ -425,7 +428,7 @@ class WorkspaceRunTests(CargoProjectTests):
         owned_run = run.run_rule
         def workspace(repo: Path, rule: str, base_tree: str, authority: ledger_api.Ledger) -> Path:
             return owned_run(repo, rule, base_tree, authority, self.server, self.runner, self.available)
-        with mock.patch.object(socket, "gethostname", return_value="natedev"), mock.patch.object(
+        with mock.patch.object(run, "socket", SimpleNamespace(gethostname=lambda: "natedev")), mock.patch.object(
                 ledger_api, "open_ledger", return_value=nullcontext(ledger)), mock.patch.object(
                 run, "run_rule", side_effect=workspace) as invoked, mock.patch.object(
                 run, "run_crates", side_effect=AssertionError("workspace does not enter crate lifecycle")), redirect_stdout(StringIO()):
@@ -434,8 +437,8 @@ class WorkspaceRunTests(CargoProjectTests):
             invoked.assert_called_once_with(self.repo, definition.rule_id, self.tree, ledger)
         self.assertEqual(self.git("rev-list", "--count", self.base + "..HEAD"), "1")
         self.assertFalse((ledger.database.parent / "crate_runs").exists())
-        self.assertEqual([args[2] for _, args in self.runner.calls if args[0] == "bash"],
-                         ["final", "lint", "final-pass"])
+        self.assertEqual([("final --saved" if args[2:4] == ("final", "--saved") else args[2]) for _, args in self.runner.calls if args[0] == "bash"],
+                         ["final", "lint", "final --saved"])
 
     def test_doc_parameter_and_derive_field_share_one_tested_rename_commit(self) -> None:
         source = '/// Add `old`.\nfn run(old: usize) -> usize { old + 1 }\n'
@@ -455,7 +458,7 @@ class WorkspaceRunTests(CargoProjectTests):
         self.assertIn('#[serde(rename = "old")] number:', (self.repo / 'beta/src/lib.rs').read_text())
         self.assertEqual((self.repo / 'README.md').read_text(), 'run takes `old`.\n')
         self.assertEqual(self.git('rev-list', '--count', f'{self.base}..HEAD'), '1')
-        self.assertEqual([args[2] for _, args in self.runner.calls if args[0] == 'bash'], ['final', 'lint', 'final-pass'])
+        self.assertEqual([("final --saved" if args[2:4] == ("final", "--saved") else args[2]) for _, args in self.runner.calls if args[0] == 'bash'], ['final', 'lint', 'final --saved'])
 
     def test_metadata_only_rule_edit_selects_approved_findings_but_body_edit_is_stale(self) -> None:
         ledger, definition, findings = self.setup_findings()
@@ -484,7 +487,7 @@ class WorkspaceRunTests(CargoProjectTests):
         findings: list[ledger_api.HeldFinding] = []
         for index, path in enumerate(paths):
             issue = self.root / ("decision.md" if shared_proposal else f"decision-{index}.md")
-            _ = issue.write_text('---\nunit: names-unit\nplan: /tmp/standing-names.md\nstatus: open\n---\nApproved rename\n')
+            _ = issue.write_text(f'---\nunit: {unit_staff_id("names")}\nplan: /tmp/standing-names.md\nstatus: open\n---\nApproved rename\n')
             finding = ledger.hold(definition.rule_id, path, 2, (self.repo / path).read_text().splitlines()[1],
                                   "rename", "old", "number", definition.blob, "1001")
             ledger.file_held(finding.finding_id, issue)
@@ -905,7 +908,7 @@ class WorkspaceRunTests(CargoProjectTests):
                               (self.repo / path).read_text().splitlines()[line - 1],
                               'rename', old, new, definition.blob, '14001')
         proposal = self.root / 'decision-extra.md'
-        _ = proposal.write_text('---\nunit: names-unit\nplan: /tmp/standing-names.md\nstatus: open\n---\nApproved extra rename\n')
+        _ = proposal.write_text(f'---\nunit: {unit_staff_id("names")}\nplan: /tmp/standing-names.md\nstatus: open\n---\nApproved extra rename\n')
         ledger.file_held(finding.finding_id, proposal)
         ledger.ticket_drop('14001')
         return finding
@@ -963,7 +966,7 @@ class WorkspaceRunTests(CargoProjectTests):
         self.assertEqual(child.read_text(), child_source)
         self.assertIn('let number', (self.repo / 'beta/src/lib.rs').read_text())
         self.assertEqual(self.git('rev-list', '--count', f'{self.base}..HEAD'), '1')
-        self.assertEqual([args[2] for _, args in self.runner.calls if args[0] == 'bash'], ['final', 'lint', 'final-pass'])
+        self.assertEqual([("final --saved" if args[2:4] == ("final", "--saved") else args[2]) for _, args in self.runner.calls if args[0] == 'bash'], ['final', 'lint', 'final --saved'])
         self.assertIsInstance(ledger.named_held((findings[0].finding_id,))[0].state, ledger_api.Filed)
 
     def test_held_field_reference_preserves_an_independent_local_rename_in_the_same_file(self) -> None:
@@ -989,7 +992,7 @@ class WorkspaceRunTests(CargoProjectTests):
         self.assertEqual(child.read_text(), child_source)
         self.assertEqual(checked, {'src/lib.rs': 2, 'src/child.rs': 1, 'beta/src/lib.rs': 2})
         self.assertEqual(self.git('rev-list', '--count', f'{self.base}..HEAD'), '1')
-        self.assertEqual([args[2] for _, args in self.runner.calls if args[0] == 'bash'], ['final', 'lint', 'final-pass'])
+        self.assertEqual([("final --saved" if args[2:4] == ("final", "--saved") else args[2]) for _, args in self.runner.calls if args[0] == 'bash'], ['final', 'lint', 'final --saved'])
         self.assertIsInstance(ledger.named_held((findings[0].finding_id,))[0].state, ledger_api.Filed)
         self.assertNotIn(extra.finding_id, cast(dict[str, str], report['refusals']))
 
@@ -1122,7 +1125,7 @@ class WorkspaceRunTests(CargoProjectTests):
         self.assertIn('const FIRST: usize = 42', (self.repo / 'beta/src/constants.rs').read_text())
         self.assertTrue(all(count == (2 if path.startswith('beta/') else 1) for path, count in checked.items()))
         self.assertEqual(self.git('rev-list', '--count', f'{self.base}..HEAD'), '1')
-        self.assertEqual([args[2] for _, args in self.runner.calls if args[0] == 'bash'], ['final', 'lint', 'final-pass'])
+        self.assertEqual([("final --saved" if args[2:4] == ("final", "--saved") else args[2]) for _, args in self.runner.calls if args[0] == 'bash'], ['final', 'lint', 'final --saved'])
 
     def test_values_hold_appearing_after_planning_still_aborts(self) -> None:
         ledger, definition, _ = self.setup_values()
@@ -1240,7 +1243,7 @@ class WorkspaceRunTests(CargoProjectTests):
         self.assertEqual((report['applied'], report['refused'], report['reverted']), (2, 1, 0))
         self.assertIn('no exact constant', str(report['refusals']))
         self.assertEqual(report['skip_counts'], {'decision not approved': 1})
-        self.assertEqual([args[2] for _, args in self.runner.calls if args[0] == 'bash'], ['final', 'lint', 'final-pass'])
+        self.assertEqual([("final --saved" if args[2:4] == ("final", "--saved") else args[2]) for _, args in self.runner.calls if args[0] == 'bash'], ['final', 'lint', 'final --saved'])
         self.assertEqual(self.git('rev-list', '--count', f'{self.base}..HEAD'), '1')
         self.assertIn('checkpointed', str(report['status']))
         for prefix in ('', 'beta/'):
@@ -1514,7 +1517,7 @@ class WorkspaceRunTests(CargoProjectTests):
         self.assertIn("--message-format=json", commands[2])
         verify = str(Path.home() / ".claude/scripts/direct/verify.sh")
         self.assertEqual(commands[3:], [("bash", verify, "final"), ("bash", verify, "lint"),
-                                       ("bash", verify, "final-pass", str(report["tested_tree"]))])
+                                       ("bash", verify, "final", "--saved", "--tree", str(report["tested_tree"]))])
         self.assertTrue(all(folder == self.runner.test_checkout for folder, args in self.runner.calls if args[0] == "bash"))
         self.assertNotEqual(self.runner.test_checkout, self.repo)
         self.assertTrue((self.runner.test_checkout / ".git").is_dir())
@@ -1593,7 +1596,7 @@ class WorkspaceRunTests(CargoProjectTests):
         self.assertIn("let number", (self.repo / "src/lib.rs").read_text())
         self.assertEqual(sum(args[1] == "check" for _, args in self.runner.calls), 2)
         self.assertEqual(sum(args[1] == "clippy" for _, args in self.runner.calls), 2)
-        self.assertEqual(sum(args[0] == "bash" and args[2] == "final" for _, args in self.runner.calls), 1)
+        self.assertEqual(sum(args[0] == "bash" and args[2] == "final" and args[2:4] != ("final", "--saved") for _, args in self.runner.calls), 1)
         self.assertEqual(len(cast(list[object], report["validation_loops"])), 2)
 
     def test_diagnostic_reader_reverts_the_edits_it_reads_transitively(self) -> None:
@@ -1664,7 +1667,7 @@ class WorkspaceRunTests(CargoProjectTests):
         for ticket in cast(list[str], report["tickets"]):
             self.assertTrue(all(row.reason == "tests failed: FAIL [0.01s] bulk_sample::tests::broken" for row in ledger.bulk_refusals(ticket)))
         self.assertTrue(all(isinstance(f.build_ticket, ledger_api.NoBuildTicket) for f in ledger.named_held(f.finding_id for f in findings)))
-        self.assertEqual(sum(args[0] == "bash" and args[2] == "final" for _, args in self.runner.calls), 1)
+        self.assertEqual(sum(args[0] == "bash" and args[2] == "final" and args[2:4] != ("final", "--saved") for _, args in self.runner.calls), 1)
         self.assertFalse(list((ledger.database.parent / "bulk_review").glob("*.tested.json")))
 
     def test_report_has_reason_family_crate_counts_stages_and_tested_tree_evidence(self) -> None:
@@ -1727,7 +1730,7 @@ class WorkspaceRunTests(CargoProjectTests):
         self.assertTrue(any(item.reason == reason for ticket in cast(list[str], report['tickets'])
                             for item in ledger.bulk_refusals(ticket)))
         self.assertEqual(self.git('rev-list', '--count', f'{self.base}..HEAD'), '1')
-        self.assertEqual([args[2] for _, args in self.runner.calls if args[0] == 'bash'], ['final', 'lint', 'final-pass'])
+        self.assertEqual([("final --saved" if args[2:4] == ("final", "--saved") else args[2]) for _, args in self.runner.calls if args[0] == 'bash'], ['final', 'lint', 'final --saved'])
         self.assertEqual(self.git("status", "--porcelain"), "")
 
     def test_formatter_failure_in_a_reference_restores_its_whole_rename_group(self) -> None:
@@ -2008,7 +2011,7 @@ class WorkspaceRunTests(CargoProjectTests):
         self.assertIn('let old', self.git('show', 'HEAD:src/lib.rs'))
         self.assertIn('let number', self.git('show', 'HEAD:beta/src/lib.rs'))
         self.assertIsInstance(ledger.named_held((findings[0].finding_id,))[0].state, ledger_api.Filed)
-        self.assertEqual(sum(args[0] == 'bash' and args[2] == 'final' for _, args in self.runner.calls), 1)
+        self.assertEqual(sum(args[0] == 'bash' and args[2] == 'final' and args[2:4] != ('final', '--saved') for _, args in self.runner.calls), 1)
 
     def test_read_only_proof_dependencies_do_not_join_the_edit_group(self) -> None:
         files = (bulk.FileRenames('src/lib.rs', '', '', (), (), proof_dependencies=frozenset({'src/other.rs'})),
@@ -2054,8 +2057,8 @@ class WorkspaceRunTests(CargoProjectTests):
                 self.runner.fail_stage = failed
                 times: dict[str, float] = {}
                 result = run.tested_tree_proof(self.repo, self.tree, self.runner, times)
-                stages = [args[2] for _, args in self.runner.calls]
-                self.assertEqual(stages, ["final", "lint", "final-pass"] if not failed else ["final", "lint"])
+                stages = [("final --saved" if args[2:4] == ("final", "--saved") else args[2]) for _, args in self.runner.calls]
+                self.assertEqual(stages, ["final", "lint", "final --saved"] if not failed else ["final", "lint"])
                 self.assertEqual(result.code, 0 if not failed else 1)
                 self.assertTrue(all(folder == self.repo and args[:2] == ("bash", str(Path.home() / ".claude/scripts/direct/verify.sh"))
                                     for folder, args in self.runner.calls))
@@ -2065,14 +2068,14 @@ class WorkspaceRunTests(CargoProjectTests):
 
     def assert_pass_record_refuses_batch(self, other_tree: bool) -> None:
         ledger, definition, findings = self.setup_findings()
-        self.runner.fail_stage = "" if other_tree else "final-pass"
+        self.runner.fail_stage = "" if other_tree else "final --saved"
         self.runner.other_tree_record = other_tree
         report = self.execute(ledger, definition)
         self.assertEqual((report["applied"], report["reverted"], report["commit"]), (0, 2, ""))
         self.assertEqual(self.git("rev-parse", "HEAD"), self.base)
         self.assertEqual(self.git("status", "--porcelain"), "")
         query = self.runner.calls[-1]
-        self.assertEqual(query[1][-2:], ("final-pass", str(report["tested_tree"])))
+        self.assertEqual(query[1][-4:], ("final", "--saved", "--tree", str(report["tested_tree"])))
         self.assertNotEqual(query[0], self.repo)
         self.assertFalse(tuple(ticket for ticket in ledger.proposal_tickets() if ticket["state"] not in ledger_api.FINAL_TICKET_STATES))
         self.assertTrue(all(isinstance(f.build_ticket, ledger_api.NoBuildTicket)
@@ -2085,14 +2088,14 @@ class WorkspaceRunTests(CargoProjectTests):
         self.assert_pass_record_refuses_batch(True)
 
     def test_tested_tree_proof_rejects_drift_after_each_command(self) -> None:
-        for stage in ("final", "lint", "final-pass"):
+        for stage in ("final", "lint", "final --saved"):
             with self.subTest(stage=stage):
                 self.runner = FakeRunner()
                 self.runner.mutate_stage = stage
                 with self.assertRaisesRegex(bulk.BulkRenameError, "clean checkout"):
                     _ = run.test_tree(self.repo, self.base, self.tree, self.runner, {})
                 self.assertTrue((self.runner.test_checkout / ".git").is_dir())
-                self.assertEqual(self.runner.calls[-1][1][2], stage)
+                self.assertEqual("final --saved" if self.runner.calls[-1][1][2:4] == ("final", "--saved") else self.runner.calls[-1][1][2], stage)
 
     def test_hidden_untracked_test_output_never_publishes_or_keeps_the_batch_commit(self) -> None:
         ledger, definition, findings = self.setup_findings()
@@ -2114,7 +2117,7 @@ class WorkspaceRunTests(CargoProjectTests):
         self.assertIn("clean checkout", str(report["status"]))
         self.assertEqual(self.git("rev-parse", "HEAD"), self.base)
         self.assertEqual(self.git("status", "--porcelain=v1", "--untracked-files=all"), "")
-        self.assertEqual([args[2] for _, args in self.runner.calls if args[0] == "bash"], ["final"])
+        self.assertEqual([("final --saved" if args[2:4] == ("final", "--saved") else args[2]) for _, args in self.runner.calls if args[0] == "bash"], ["final"])
         self.assertTrue((self.runner.test_checkout / ".git").is_dir())
         self.assertFalse(tuple(ticket for ticket in ledger.proposal_tickets()
                                if ticket["state"] not in ledger_api.FINAL_TICKET_STATES))
@@ -2375,7 +2378,7 @@ class StyleChildAdmissionTests(unittest.TestCase):
         self.assertTrue(all(place.closed for place in self.queue.places))
 
     def test_queue_refusal_stops_each_style_start_with_exit_two(self) -> None:
-        import style_plan
+        from scripts.style import style_plan
         config = self.repo / "lint.conf"
         starts: tuple[tuple[str, Callable[[], object]], ...] = (
             ("rust-analyzer", lambda: bulk.RustAnalyzer(self.repo)),
@@ -2400,7 +2403,7 @@ class StyleChildAdmissionTests(unittest.TestCase):
         self.assertEqual(self.queue.places, [])
 
     def test_plan_cargo_format_starts_at_the_shared_place(self) -> None:
-        import style_plan
+        from scripts.style import style_plan
         _ = (self.state / "cargo/stdout").write_text("Formatting src/lib.rs\n")
         result = style_plan.cargo_format(self.repo)
         self.assertEqual(result.visited, frozenset({self.repo / "src/lib.rs"}))

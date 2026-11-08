@@ -4,32 +4,22 @@ from __future__ import annotations
 import hashlib
 import importlib
 import json
-import re
 import string
-import sys
 from dataclasses import dataclass
 from pathlib import Path
 from collections.abc import Callable
-from typing import TYPE_CHECKING, Literal, NotRequired, TypedDict, cast
+from typing import Literal, NotRequired, TypedDict, cast
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-if TYPE_CHECKING:
-    from ..lib.conf import UseConfiguredValue
-    from ..message import session_send
-    from ..message.send_result import SEND_RETRY_EXIT as SEND_RETRY_EXIT
-else:
-    from scripts.lib.conf import UseConfiguredValue
-    from scripts.message import session_send
-    from scripts.message.send_result import SEND_RETRY_EXIT as SEND_RETRY_EXIT
+from scripts.lib.conf import UseConfiguredValue
+from scripts.message import session_send
+from scripts.message.send_result import SEND_RETRY_EXIT as SEND_RETRY_EXIT
 
-from user_action import (ActionRequired, NoActionRequired, UserAction, NotificationSession,
+from scripts.notify.user_action import (ActionRequired, NoActionRequired, UserAction, NotificationSession,
                          NoSessionLine, NO_SESSION_LINE, SessionLine, first_line)
 
 Need = Literal["note", "decision", "blocked"]
 REVIEWED_FILE = Path(__file__).with_name("push_texts_reviewed.json")
 TEMPLATE_REQUIRED = "phone pushes require --text-id: decision.choices for choices, alert.blocked for emergencies, or nate.adhoc for notes"
-# A unit id such as "types-unit": the whole value is one session name. The user knows it as "types".
-_UNIT_ID = re.compile(r"[A-Za-z0-9][\w-]*-unit")
 
 
 @dataclass(frozen=True)
@@ -60,8 +50,7 @@ class TemplateValues:
 
 
 def display_values(given: dict[str, str]) -> TemplateValues:
-    displayed = {key: shown_value(key, value) for key, value in given.items()}
-    return TemplateValues(displayed, dict(displayed))
+    return TemplateValues(dict(given), dict(given))
 
 
 @dataclass(frozen=True)
@@ -102,7 +91,7 @@ class RenderedPush:
 
 
 def catalog() -> tuple[PushText, ...]:
-    module = importlib.import_module("push_catalog")
+    module = importlib.import_module('scripts.notify.push_catalog')
     entries = cast(tuple[PushText, ...], module.ENTRIES)
     if len({entry.id for entry in entries}) != len(entries):
         raise ValueError("duplicate push text id")
@@ -114,10 +103,6 @@ def catalog() -> tuple[PushText, ...]:
     return entries
 
 
-def shown_value(key: str, value: str) -> str:
-    """A session name loses its "-unit" end: the {sender} and {session} values, and any value that is
-    a whole unit id. Free text keeps every word, "per-unit" included (reviewer, 2026-10-21)."""
-    return value.removesuffix("-unit") if key in ("sender", "session") or _UNIT_ID.fullmatch(value) else value
 
 
 @dataclass(frozen=True)
@@ -154,8 +139,7 @@ def decision_values(given: dict[str, str]) -> TemplateValues:
         raise ValueError("decision.choices: recommended_choice must name a listed choice")
     if "choice_labels" in given:
         raise ValueError("decision.choices: choice_labels is generated from choices")
-    displayed = {key: shown_value(key, value) if key in ("sender", "session") else value
-            for key, value in given.items()} | {"choice_labels": " or ".join(choice.label.lower() for choice in choices),
+    displayed = dict(given) | {"choice_labels": " or ".join(choice.label.lower() for choice in choices),
                     "choices": "\n".join(f"{choice.label}: {choice.effect}" for choice in choices)}
     return TemplateValues(displayed, dict(given))
 

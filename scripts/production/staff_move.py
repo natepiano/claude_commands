@@ -2,6 +2,10 @@
 """Move a unit's staff parent and its running herdr tab together."""
 
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import json
 import sys
@@ -11,7 +15,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from scripts.production import staff, staff_sources  # noqa: E402
-import herdr  # noqa: E402
+from scripts.herdr import herdr  # noqa: E402
 
 
 @dataclass(frozen=True)
@@ -42,11 +46,11 @@ def _place_tab(row: staff.StaffRow, record: staff.StaffSnapshot) -> bool:
     return herdr.Herdr(herdr.shared_session()).move_row_tabs(row.id, record=record)
 
 
-def move_unit(slug: str, unit: str, new_showrunner: str, *, identity: UnitIdentity = _LOCATE_UNIT) -> UnitMoveResult:
+def move_unit(production_name: str, unit: str, new_showrunner: str, *, identity: UnitIdentity = _LOCATE_UNIT) -> UnitMoveResult:
     """Change only membership, then reconcile the live tab with its parent's workspace."""
     with staff.operation():
         record = staff.snapshot()
-        selector = staff_sources.UnitMember(slug, unit)
+        selector = staff_sources.UnitMember(production_name, unit)
         parent_selector = staff_sources.ShowrunnerMember(new_showrunner)
         if isinstance(identity, PinnedUnit):
             pinned = record.by_id(identity.staff_id)
@@ -61,7 +65,7 @@ def move_unit(slug: str, unit: str, new_showrunner: str, *, identity: UnitIdenti
             # A completed parent change precedes the source updates in a transfer.
             found = staff_sources.member(staff_sources.UnitMember(new_showrunner, unit), record)
         if isinstance(found, staff_sources.NoSuchMember) or found.row.kind != "unit":
-            raise staff.StaffRefused(f"{slug}/{unit}: no matching unit staff row")
+            raise staff.StaffRefused(f"{production_name}/{unit}: no matching unit staff row")
         if isinstance(parent, staff_sources.NoSuchMember) or parent.row.kind != "showrunner":
             raise staff.StaffRefused(f"{new_showrunner}: no matching showrunner staff row")
         row = found.row if found.row.parent == staff.ReportsTo(parent.row.id) else staff.move(found.row.id, staff.ReportsTo(parent.row.id))
@@ -69,7 +73,7 @@ def move_unit(slug: str, unit: str, new_showrunner: str, *, identity: UnitIdenti
             current = staff.StaffSnapshot(tuple(row if member.id == row.id else member for member in record.rows))
             changed = _place_tab(row, current)
         except (OSError, ValueError, herdr.HerdrFailure) as error:
-            raise staff.StaffUnreadable(f"{slug}/{unit}: tab was not moved: {error}") from error
+            raise staff.StaffUnreadable(f"{production_name}/{unit}: tab was not moved: {error}") from error
         return UnitMoveResult(row, found.row.parent != row.parent or changed, parent.row.name)
 
 
@@ -86,7 +90,7 @@ def cli_move(target: str, new_showrunner: str, *, json_output: bool = False) -> 
     def apply() -> int:
         parts = target.split("/")
         if len(parts) != 2 or not all(parts) or not new_showrunner:
-            raise staff.StaffRefused("move needs <showrunner slug>/<unit> <new showrunner slug>")
+            raise staff.StaffRefused("move needs <showrunner production_name>/<unit> <new showrunner production_name>")
         return report(move_unit(parts[0], parts[1], new_showrunner), json_output=json_output)
 
     return staff.cli_result(apply)

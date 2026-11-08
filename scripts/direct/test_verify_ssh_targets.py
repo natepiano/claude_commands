@@ -6,7 +6,7 @@ import json
 from pathlib import Path
 from contextlib import redirect_stdout
 import io
-from typing import TYPE_CHECKING, override
+from typing import override
 import unittest
 from unittest import mock
 
@@ -15,10 +15,7 @@ from scripts.direct import verify_doc_test_support as doc_support
 from scripts.build_targets import test_ssh_eligibility as eligibility_support
 from scripts.lint.memory_test_support import write_config_fixture
 
-if TYPE_CHECKING:
-    from ..lib import process_start as process_identity
-else:
-    from scripts.lib import process_start as process_identity
+from scripts.lib import process_start as process_identity
 
 build_targets = eligibility_support.build_targets
 mac_test = eligibility_support.mac_test
@@ -216,10 +213,8 @@ import sys
 words = sys.argv[1:]
 settings = str(Path(os.environ["CONF_DIR"]) / "aws_target.conf")
 if words[0] == "eligible":
-    print("ssh_allowed")
-    print("aws\teligible\t-\t" + settings)
-elif words[0] == "platform":
-    print("linux")
+    print("any_target")
+    print("aws\teligible\t-\t" + settings + "\tlinux")
 elif words[0] == "reserve":
     Path(words[words.index("--reservation-file") + 1]).write_text("aws\t" + settings + "\n")
 elif words[0] in ("register-local", "check-local") and os.environ.get("TEST_PINNED_DOC") == "1":

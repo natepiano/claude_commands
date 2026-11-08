@@ -4,7 +4,7 @@ Usage: counts_row.py <notifier instance dir>
 
 statusline.sh runs this only when the cache is older than a file it was read from, or a deferred
 question has fallen due, so a render runs no Python while nothing changed. The cache is
-`<showrunner state>/counts/<slug>`:
+`<showrunner state>/counts/<staff id>`:
 
   line 1  the counts line, empty when nothing is counted;
   line 2  the epoch second the soonest deferred question falls due, empty when none is deferred;
@@ -14,21 +14,23 @@ question has fallen due, so a render runs no Python while nothing changed. The c
 The cache's time is when the reading began, so a file changed while it ran is newer than it.
 """
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import os
 import sys
 import time
 from pathlib import Path
 
-SCRIPTS = Path(__file__).resolve().parent.parent
-sys.path[:0] = [str(SCRIPTS / "hooks"), str(SCRIPTS / "production")]
-import showrunner_footer  # noqa: E402
+from scripts.hooks import showrunner_footer  # noqa: E402
 from scripts.production import staff
-from update_registration import QuestionStaff
+from scripts.production.update_registration import QuestionStaff
 
 
-def cache_path(slug: str) -> Path:
-    return showrunner_footer.state_root() / "counts" / slug
+def cache_path(name: str) -> Path:
+    return showrunner_footer.state_root() / "counts" / name
 
 
 def watched(path: Path) -> Path:
@@ -50,14 +52,16 @@ def row(instance: Path, *, identities: QuestionStaff | None = None) -> tuple[str
         sources.append(doc)
     if production is None:
         return "", "", sources
-    import footer_counts
-    from update_registration import QuestionStaff, RegistrationFailure
+    from scripts.production import footer_counts
+    from scripts.production.update_registration import QuestionStaff, RegistrationFailure
 
     identities = QuestionStaff.read() if identities is None else identities
     sources.extend(footer_counts.sources(production.doc, identities=identities))
     sources.extend(footer_counts.routing_sources(identities.record))
     try:
-        owner = identities.owner(production.doc)
+        owner = production.owner
+        if identities.record.by_id(owner.id) is None:
+            raise RegistrationFailure("questions", f"{production.doc}: no showrunner staff row")
     except (RegistrationFailure, staff.StaffRefused) as error:
         print(f"questions: unavailable — {error}", file=sys.stderr)
         line = footer_counts.counts_line(footer_counts.read_counts(production.doc, record=identities.record)) or ""

@@ -15,7 +15,6 @@ from urllib.parse import parse_qs, urlencode, urlsplit
 from scripts.lib import conf, urgency
 from scripts.production import change_review, change_routing, staff
 from scripts.production.change_routing import UnavailableProduction
-from scripts.production.proposals_folder import slug_of
 from scripts.review_links import change_page
 from scripts.review_links.change_page import ReviewBrowser as ReviewBrowser
 
@@ -111,7 +110,7 @@ def prepare(browser: ReviewBrowser, status: change_page.DeliveryStatus) -> Prepa
         current = (defaults.get(root.name) if root is not None else None) or routing.list_paths.get(tab) or defaults.get(tab, page.review_list)
         name = change_review.queue(current)
         if runner is not None and isinstance(runner.parent, staff.ReportsTo) and isinstance(page, change_page.AssignedReviewPage):
-            name += "-" + slug_of(page.production)
+            name += "-" + runner.name
         entries: list[urgency.Entry[dict[str, str]]] = []
         by_key: dict[str, WaitingChange] = {}
         for item in items:

@@ -12,7 +12,7 @@ from scripts.shutdown import pane_record
 class NativeLabelFilteringTests(StaffTestCase):
     def test_unavailable_process_record_still_removes_legacy_labels(self) -> None:
         legacy = {"STAFF_ID": "old-owner", "SHOWRUNNER_" + "UNIT": "old-parent",
-                  "SHOWRUNNER_" + "UNIT_ID": "old-unit", "CODEX_THREAD_ID": "native-id",
+                  "SHOWRUNNER_" + "UNIT_ID": "old", "CODEX_THREAD_ID": "native-id",
                   "CLAUDE_CONFIG_DIR": "/private/account"}
         before = legacy.copy()
         labels = pane_launch.RecordedLabels(pane_launch.StaffLabelsRead.UNAVAILABLE)
@@ -26,7 +26,7 @@ class NativeLabelFilteringTests(StaffTestCase):
         old["environment"] = {
             "STAFF_ID": fixture.unit.id,
             "SHOWRUNNER_" + "UNIT": "old-parent",
-            "SHOWRUNNER_" + "UNIT_ID": "old-unit",
+            "SHOWRUNNER_" + "UNIT_ID": "old",
             "CLAUDE_CODE_SESSION_ID": fixture.unit.current_session,
             "ENABLE_TOOL_SEARCH": "true",
         }
@@ -46,7 +46,7 @@ class NativeLabelFilteringTests(StaffTestCase):
         retained["environment"] = {
             "STAFF_ID": fixture.unit.id,
             "SHOWRUNNER_" + "UNIT": "old-parent",
-            "SHOWRUNNER_" + "UNIT_ID": "old-unit",
+            "SHOWRUNNER_" + "UNIT_ID": "old",
             "CLAUDE_CODE_SESSION_ID": fixture.unit.current_session,
             "ENABLE_TOOL_SEARCH": "true",
         }

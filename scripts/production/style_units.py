@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 """Read style ledgers and run records for the showrunner's ticket table."""
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import json
 import sqlite3
-import sys
 from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
@@ -13,15 +16,13 @@ from datetime import UTC, datetime, timedelta, tzinfo
 from pathlib import Path
 from typing import NamedTuple, cast
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "style"))
-
-import live_units
-import rules
-import style_ledger
-import display_cells
-from scripts.production import staff, session_staff, unit_lookup, unit_names
-from issues import Issue, frontmatter
-from proposal_issue import ApprovedDecision, decision_answer
+from scripts.production import live_units
+from scripts.style import rules
+from scripts.style import style_ledger
+from scripts.production import display_cells
+from scripts.production import staff, session_staff, unit_lookup
+from scripts.production.issues import Issue, frontmatter
+from scripts.production.proposal_issue import ApprovedDecision, decision_answer, proposal_unit
 from scripts.direct import plan_history
 from scripts.lib.user_zone import user_zone
 
@@ -100,14 +101,16 @@ def clock(value: str, zone: tzinfo) -> str:
     return at.astimezone(zone).strftime("%H:%M") if isinstance(at, datetime) else display_cells.NONE
 
 
-def decision_family(path: Path) -> DecisionFamily | DecisionFileMissing:
+def decision_family(path: Path, rule_families: Mapping[str, rules.Family]) -> DecisionFamily | DecisionFileMissing:
     if not path.is_file():
         return DecisionFileMissing()
     try:
         issue = Issue(path, frontmatter(path))
     except (OSError, UnicodeError):
         return DecisionFileMissing()
-    return DecisionFamily(rules.style_family(issue.value("unit")), isinstance(decision_answer(issue), ApprovedDecision))
+    family = (rules.style_family(proposal_unit(issue)) if issue.value("unit")
+              else rule_families.get(issue.value("style_rule_blob"), rules.NotStyleUnit()))
+    return DecisionFamily(family, isinstance(decision_answer(issue), ApprovedDecision))
 
 
 def columns(connection: sqlite3.Connection, table_name: str) -> set[str]:
@@ -149,6 +152,11 @@ def read_snapshot(database: Path, now: datetime, decision_folder: Path,
             }
         if not finding_columns:
             return snapshot
+        pinned = cast(list[tuple[str, bytes]], connection.execute("SELECT blob,text FROM rule_texts").fetchall())
+        rule_families: dict[str, rules.Family] = {
+            blob: family for blob, text in pinned
+            if isinstance(family := rules.pinned_family(text.decode(errors="replace")), str)
+        }
         built_at = "h.built_at" if "built_at" in finding_columns else "h.updated_at"
         if "built_at" not in finding_columns and ticket_columns and "build_ticket" in finding_columns:
             built_at = style_ledger.legacy_built_at_sql("h")
@@ -167,7 +175,7 @@ def read_snapshot(database: Path, now: datetime, decision_folder: Path,
                 snapshot.total_filed += finding.findings
             path = (decision_folder / Path(finding.proposal).expanduser()).resolve()
             if path not in decisions:
-                decisions[path] = decision_family(path)
+                decisions[path] = decision_family(path, rule_families)
             decision = decisions[path]
             if isinstance(decision, DecisionFamily):
                 family = decision.family
@@ -282,7 +290,7 @@ def table(units: list[live_units.LiveUnit], records: dict[str, object], *, doc: 
     zone = zone if zone is not None else user_zone()
     paths = ledger_paths
     resolver = session_staff.RowResolver(staff.snapshot())
-    holders = {unit_names.unit_id(row.name): row for row in unit_lookup.doc_units(doc, resolver.record)}
+    holders = {row.name: row for row in unit_lookup.doc_units(doc, resolver.record)}
     decisions: dict[Path, DecisionFamily | DecisionFileMissing] = {}
     snapshots: dict[Path, LedgerSnapshot] = {}
     with ThreadPoolExecutor(max_workers=1) as reads:
@@ -292,21 +300,21 @@ def table(units: list[live_units.LiveUnit], records: dict[str, object], *, doc: 
             if path not in snapshots:
                 snapshots[path] = read_snapshot(path, now, decision_folder, decisions)
         open_steps = steps.result()
-    lines = ["| Unit | Ticket | Step | ETA | Findings built | Last 24 h | Findings left |",
-             "| --- | --- | --- | --- | ---: | ---: | ---: |"]
+    lines = ["| Unit | Status | Ticket | Step | ETA | Findings built | Last 24 h | Findings left |",
+             "| --- | --- | --- | --- | --- | ---: | ---: | ---: |"]
     for unit in units:
         snapshot = snapshots[paths[unit.unit].resolve()] if unit.unit in paths else LedgerSnapshot()
         family = rules.style_family(unit.unit)
         counts = snapshot.counts.get(family, FamilyCounts()) if isinstance(family, str) else FamilyCounts()
         holder = holders.get(unit.unit)
         if holder is None:
-            print(f"anomaly: {unit.unit}: staff ticket ownership is unavailable under {doc}", file=sys.stderr)
+            session_staff.report_anomaly(f"{unit.unit}: staff ticket ownership is unavailable under {doc}")
         ticket = snapshot.tickets.get(str(holder.id), NoTicket()) if holder is not None else NoTicket()
         refill = snapshot.refills.get(unit.unit)
         idle = f"idle ({clock(refill.at, zone)})" if refill else "idle"
         idle_step = f"idle — {refill.outcome}" if refill else "idle"
         left = left_cell(counts.left, counts.filed, snapshot.splits.get(unit.unit, style_ledger.NoSplitRecorded()), now)
-        cells = (display_cells.session_cell(unit), ticket_cell(ticket) if isinstance(ticket, Ticket) else idle,
+        cells = (holder.name if holder is not None else unit.unit, unit.status, ticket_cell(ticket) if isinstance(ticket, Ticket) else idle,
                  format_step(open_steps[unit.unit], ticket, idle_step), eta_cell(records.get(unit.unit), zone),
                  f"{counts.built:,}", f"{counts.recent:,}", left)
         lines.append("| " + " | ".join(display_cells.escaped(cell) for cell in cells) + " |")

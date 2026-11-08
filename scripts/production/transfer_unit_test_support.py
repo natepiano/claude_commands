@@ -1,29 +1,26 @@
 """Use private staff records and Git repositories for unit transfer tests."""
 from __future__ import annotations
 
-import hashlib
 import json
 import os
 import shlex
 import shutil
 import subprocess
-import sys
 import tempfile
 from collections.abc import Callable
 from pathlib import Path
 from typing import ClassVar, cast, override
 from unittest import mock
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from scripts.herdr import fake_herdr
 from scripts.production import showrunners
 from scripts.production.cli_fixture import invoke_cli
 from scripts.production.rename_test_support import bind_staff_fixture
-from scripts.production.staff_test_support import StaffTestCase, unit_membership
+from scripts.production.staff_test_support import StaffTestCase, fixture_runtime_id, unit_membership
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
-import transfer_unit
+from scripts.production import transfer_unit
 
 SCRIPT = Path(__file__).with_name("transfer_unit.py")
 
@@ -63,17 +60,17 @@ class UnitTransferFixture(StaffTestCase):
         _ = shutil.copytree(self.snapshot, self.fixture_root)
         self.addCleanup(shutil.rmtree, self.fixture_root)
         self.bind_fixture(self.fixture_root)
-        bind_staff_fixture(self, self.env, {"demo": ("alpha-unit", "beta-unit"), "other": ("gamma-unit",)},
-                           locations={("demo", "alpha-unit"): self.unit,
-                                      ("demo", "beta-unit"): self.rust / "claude-demo-beta",
-                                      ("other", "gamma-unit"): self.root / "absent-gamma"})
-        row = unit_membership("demo", "alpha-unit")
+        bind_staff_fixture(self, self.env, {"demo": ("alpha", "beta"), "other": ("gamma",)},
+                           locations={("demo", "alpha"): self.unit,
+                                      ("demo", "beta"): self.rust / "claude-demo-beta",
+                                      ("other", "gamma"): self.root / "absent-gamma"})
+        row = unit_membership("demo", "alpha")
         self.pane("w1:p1", session_id="5ad615f2-4e04-5121-a102-9d6b2e2a6eb3", environment={
-            "SHOWRUNNER_UNIT": "demo", "SHOWRUNNER_UNIT_ID": "alpha-unit", "CLAUDE_CODE_SESSION_ID": row.id,
+            "SHOWRUNNER_UNIT": "demo", "SHOWRUNNER_UNIT_ID": "alpha", "CLAUDE_CODE_SESSION_ID": row.id,
         })
         self.write(self.root / "state/notifier/showrunner-other/conf",
                    "TARGET=session:cc9c5b71-6f71-5499-a4bb-e6ad5d02930d\nCHECK=" + shlex.join(["zsh", "/scripts/production_check.sh",
-                   str(self.receiving / "docs/plans/other-production.md")]) + "\n")
+                   fixture_runtime_id("showrunner::other")]) + "\n")
         for module, name, value in (
             (showrunners, "SEND", self.root / "fake_send.py"),
             (showrunners, "NOTIFIER_STATE_DIR", self.root / "state/notifier"),
@@ -99,7 +96,6 @@ class UnitTransferFixture(StaffTestCase):
             "NOTIFIER_STATE_DIR": str(self.root / "state/notifier"),
             "NOTIFIER_SESSIONS_DIR": str(self.root / "state/sessions"),
             "SHOWRUNNER_STATE_DIR": str(self.root / "state/showrunner"),
-            "STALL_WATCH_STATE_DIR": str(self.root / "state/stall-watch"),
             "RENAME_UNIT_STOP_WAIT": "0", "RENAME_UNIT_LIVE_WAIT": "0",
             "SHOWRUNNERS_CONFIG": str(config / "showrunners.json"),
             "SHOWRUNNERS_SEND": str(self.root / "fake_send.py"),
@@ -145,8 +141,7 @@ class UnitTransferFixture(StaffTestCase):
         self.write(self.giving / "docs/plans/demo-production.md", self.production_doc("demo", self.giving))
         self.write(self.giving / "docs/plans/other-production.md", self.production_doc("other", self.receiving))
         self.write(self.giving / "docs/plans/alpha.md",
-                   "# alpha\n\n> **Production: demo** — unit `alpha-unit`; production doc "
-                   + "`docs/plans/demo-production.md`\n\nalpha prose stays.\n")
+                   "# alpha\n\nalpha prose stays.\n")
         _ = self.git("add", ".")
         _ = self.git("commit", "-m", "fixture")
         _ = self.git("push", "-u", "origin", "demo")
@@ -158,12 +153,11 @@ class UnitTransferFixture(StaffTestCase):
         self.write(self.root / "state/notifier/showrunner-demo/conf",
                    "EVERY=15\nTARGET=session:8f83b18e-2d35-5935-a408-9f483d34afff\nCHECK="
                    + shlex.join(["zsh", "/scripts/production_check.sh",
-                                 str(self.giving / "docs/plans/demo-production.md")]) + "\n")
-        self.write(self.stall_path("demo", "alpha-unit"), '{"stretch": 17}\n')
+                                 fixture_runtime_id("showrunner::demo")]) + "\n")
 
-    def production_doc(self, slug: str, checkout: Path) -> str:
-        return "\n".join(["# Production — " + slug, "", "## Production Context", "",
-                          f"- **Merge branch:** `{slug}`", f"- **Showrunner checkout:** `{checkout}`",
+    def production_doc(self, production_name: str, checkout: Path) -> str:
+        return "\n".join(["# Production — " + production_name, "", "## Production Context", "",
+                          f"- **Merge branch:** `{production_name}`", f"- **Showrunner checkout:** `{checkout}`",
                           "- **Log:** `production.log`", "", "## Production rules", "", "Rules.", ""])
 
     def write(self, path: Path, content: str) -> None:
@@ -176,15 +170,12 @@ class UnitTransferFixture(StaffTestCase):
         self.assertEqual(result.returncode, 0, (arguments, result.stdout, result.stderr))
         return result.stdout.strip()
 
-    def stall_path(self, slug: str, unit: str) -> Path:
-        digest = hashlib.sha256(f"{slug}\0{unit}".encode()).hexdigest()
-        return self.root / "state/stall-watch" / f"{digest}.json"
 
     def assert_ok(self, result: subprocess.CompletedProcess[str]) -> None:
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
-    def transfer(self, verb: str, unit: str = "alpha-unit", to: Path | None = None) -> subprocess.CompletedProcess[str]:
-        arguments = [verb, "demo", unit, str(to or self.receiving / "docs/plans/other-production.md"),
+    def transfer(self, verb: str, unit: str = "alpha", to: str | None = None) -> subprocess.CompletedProcess[str]:
+        arguments = [verb, "demo", unit, to or "other",
                      "--scratch", str(self.root / "scratch")]
         return self.invoke(arguments)
 

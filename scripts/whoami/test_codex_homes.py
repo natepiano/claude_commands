@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import sys
 import asyncio
 import base64
 import json
@@ -17,7 +16,6 @@ from typing import cast, override
 from unittest.mock import AsyncMock, MagicMock, call, patch
 from zoneinfo import ZoneInfo
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.whoami.note_file import note_name
 from scripts.accounts import accounts, role_map
 from scripts.accounts.home_test_support import scratch_accounts_config
@@ -26,7 +24,7 @@ from scripts.production import showrunners
 from scripts.whoami import agent_accounts
 from scripts.whoami import note_file
 from scripts.whoami import usage_store
-import whoami
+from scripts.whoami import whoami
 from scripts.whoami.agent_accounts import (
     CheckedNamedClaudeAccount,
     ClaudeAccountsInUse,
@@ -180,7 +178,7 @@ class CodexHomesTests(unittest.TestCase):
         return Report("Codex", email=f"{home.name}@example.invalid", source=CodexHomeSource(home))
 
     def test_shared_user_zone_uses_production_or_the_users_zone_setting(self) -> None:
-        runner = showrunners.Showrunner(session="fixture", socket="", slug="fixture", zone="Asia/Tokyo", doc="")
+        runner = showrunners.Showrunner(session="fixture", socket="", name="fixture", zone="Asia/Tokyo", doc="")
         with patch.object(showrunners, "registered_showrunners", return_value=[runner]):
             self.assertEqual(agent_accounts.user_zone(), ZoneInfo("Asia/Tokyo"))
         with patch.dict(os.environ, {"USER_ZONE": "Europe/Paris"}):

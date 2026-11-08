@@ -8,7 +8,7 @@ argument-hint: "<unit> [--dry-run]"
 Run in the showrunner session. `<unit>` is the unit's id or stem.
 
 ```sh
-"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/production/resume_unit.py" <slug> <unit> [--dry-run]
+"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/production/resume_unit.py" <showrunner name> <unit> [--dry-run]
 ```
 
 Print the script output without changes.

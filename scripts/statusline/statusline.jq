@@ -140,15 +140,16 @@ def usage($config; $label; $window; $fmt):
        | select($id != "" and startswith($id + " ")) | .[($id | length) + 1:]
        | sub("^For you: "; "") | split(", ")[]] ) as $parts
    | ($ARGS.named.rebuild // "") as $rebuild
-   | (($parts | map(select(test("^[0-9]+ (question|change)s?$"))))
+   | ((if ($ARGS.named.adhoc // "") == "" then [] else [$ARGS.named.adhoc] end)
+      + ($parts | map(select(test("^[0-9]+ (question|change)s?$"))))
       + (if $rebuild == "" then [] else [$rebuild] end)
       + ($parts | map(select(test("^[0-9]+ (question|change)s?$") | not))))
    | if length == 0 then "" else "For you: " + join(", ") end
-      # The key is the plural word: counts.questions, counts.efficiency and so on.
-      | gsub("(?<count>[0-9]+)(?: (?<word>question|change|efficiency|proposal|project)(?<s>s?))?";
+      # Use the plural key with underscores: counts.adhoc_items; efficiency stays singular.
+      | gsub("(?<count>[0-9]+)(?: (?<word>adhoc item|question|change|efficiency|proposal|project)(?<s>s?))?";
              . as $part | "\u001b[1m\($part.count)\u001b[22m"
              | if $part.word == null then .
                else (. + " " + $part.word + $part.s)
-                 | color($colors; "counts." + $part.word + (if $part.word == "efficiency" then "" else "s" end))
+                 | color($colors; "counts." + ($part.word | gsub(" "; "_")) + (if $part.word == "efficiency" then "" else "s" end))
                end)) as $counts_row
 | [$first_line, $second_line, $counts_row] | map(select(. != "")) | join("\n")

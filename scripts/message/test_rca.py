@@ -9,7 +9,6 @@ import os
 import socket
 import signal
 import subprocess
-import sys
 import tempfile
 import unittest
 from threading import Thread
@@ -18,26 +17,22 @@ from contextlib import redirect_stderr, redirect_stdout
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from typing import IO, cast, override
 from unittest import mock
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "notify"))
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "production"))
 from scripts.lib.socket_test_support import short_socket_directory
 from scripts.message.process_test_support import OwnedTestProcesses
-import push_texts  # noqa: E402
-import rca  # noqa: E402
-import review  # noqa: E402
-import send  # noqa: E402
-import sessions  # noqa: E402
+from scripts.notify import push_texts  # noqa: E402
+from scripts.message import rca  # noqa: E402
+from scripts.notify import review  # noqa: E402
+from scripts.message import send  # noqa: E402
+from scripts.message import sessions  # noqa: E402
 from scripts.production import session_staff  # noqa: E402
 from scripts.production import showrunners, staff, fake_showrunner  # noqa: E402
 from scripts.production.staff_test_support import isolated_staff_file, recorded_showrunner, fixture_member  # noqa: E402
-from test_showrunners import stalled_session_reader  # noqa: E402
-import silence  # noqa: E402
-from user_action import NoActionRequired  # noqa: E402
+from scripts.production.test_showrunners import stalled_session_reader  # noqa: E402
+from scripts.notify import silence  # noqa: E402
+from scripts.notify.user_action import NoActionRequired  # noqa: E402
 
 OPENED = datetime(2026, 10, 23, 13, 30, tzinfo=timezone.utc)
 SHOWRUNNER = "uds:/tmp/cargo-liner-show.sock"
@@ -57,23 +52,19 @@ raise SystemExit(int(os.environ.get('RCA_TEST_EXIT', '0')))
 REAL_POPEN = subprocess.Popen
 REAL_SOCKET_FOR = showrunners.socket_for
 Stream = int | IO[str] | None
-HANDLER = rca.Report("handler-unit", "natedev", "prompt", ("cargo build -p cargo-handler",), "/tmp/t.jsonl",
+HANDLER = rca.Report("handler", "natedev", "prompt", ("cargo build -p cargo-handler",), "/tmp/t.jsonl",
                      "cargo-liner")
 # The handler case as stall_watch.py opens it: its alert's sender and key, and what waits on the session.
 ALERTED = HANDLER._replace(waits="The cargo-handler release waits for it", source="stall-watch",
-                           key="stall-watch:prompt:cargo-liner:handler-unit")
+                           key="stall-watch:prompt:cargo-liner:handler")
 CAUSE = "a helper ran a build command that needs your permission"
 FIX = "helpers use the build command that is always allowed"
 # The reviewer's refusal of a fixed text: what failed, a question, and its own rewrite.
-REWRITE = review.Draft("cargo-liner", "0", "cargo-liner: fixed why handler stopped", NoActionRequired(),
-                       "The handler session stopped when it asked you to allow a build.\n"
+REWRITE = review.Draft("cargo-liner", "0", "cargo-liner: fixed why handler hit a check", NoActionRequired(),
+                       "In the handler session, the session asked you to allow a build.\n"
                        + "Why: a helper ran a build that needs your permission.\nNow: helpers use the allowed build.", False)
 REFUSED = review.Failed(REWRITE, ["plain-words"], failures=(review.RuleFailure("plain-words", "verify.sh"),),
                         questions=("What does the fix change for the user?",))
-
-
-def same_slug(slug: str) -> str:
-    return slug
 
 
 def flags(argv: list[str]) -> dict[str, str]:
@@ -134,12 +125,11 @@ class RcaTests(unittest.TestCase):
         # No test runs the real push review (claude -p).
         self.verdict, self.reviewed = None, []
         _ = self.enterContext(mock.patch.object(review, "review", side_effect=self.review))
-        _ = self.enterContext(mock.patch.object(showrunners, "canonical_slug", side_effect=same_slug))
         timers = self.root / "notifiers"
         _ = self.enterContext(mock.patch.object(showrunners, "NOTIFIER_STATE_DIR", timers))
         document = self.root / "cargo-production.md"
         _ = document.write_text("# Cargo production\n")
-        owner = recorded_showrunner("cargo-owner", document)
+        owner = recorded_showrunner("cargo-liner", document)
         _ = fake_showrunner.write_timer(timers, "cargo-liner", owner.current_session, "UTC", document)
 
         def live_socket(target: str, *, deadline: float = math.inf) -> str | None:
@@ -210,12 +200,12 @@ class RcaTests(unittest.TestCase):
         case = self.case("261023-1")
         self.assertEqual((case["session"], case["production"], case["status"], case["commands"], case["alerts"],
                           case["reminded"], case["opened"]),
-                         ("handler-unit", "cargo-liner", "open", ["cargo build -p cargo-handler"], 1, False,
+                         ("handler", "cargo-liner", "open", ["cargo build -p cargo-handler"], 1, False,
                           OPENED.isoformat()))
         [owner] = self.sends()
         sent = flags(owner)
         self.assertEqual((sent["--to"], sent["--from"], sent["--key"]), (SHOWRUNNER, "rca", "rca-261023-1"))
-        for part in ("rca 261023-1: handler-unit on natedev stopped at a permission prompt.",
+        for part in ("rca 261023-1: handler on natedev stopped at a permission prompt.",
                      "Commands: cargo build -p cargo-handler", "Transcript: /tmp/t.jsonl",
                      f"1. Run `{rca.CALL} start 261023-1 --owner <unit you route the fix to>`.",
                      "2. Find where the command came from: a work order, a helper prompt, a skill or a script.",
@@ -269,9 +259,8 @@ pathlib.Path(os.environ['OWNER_TEST_RETURN']).write_text(json.dumps({
     'failure': failure, 'delivered': pathlib.Path(os.environ['OWNER_TEST_RECEIPT']).exists()}))
 # A separate service manager can end the test's caller group without signalling its own group.
 subprocess.run([sys.executable, '-c',
-    "import pathlib, signal, sys; "
-    "sys.path.insert(0, str(pathlib.Path.cwd() / 'scripts' / 'lib')); "
-    "import process_group; "
+    "import signal, sys; "
+    "from scripts.lib import process_group; "
     "process_group.send_process_group(int(sys.argv[1]), signal.SIGTERM)",
     str(os.getpgrp())], start_new_session=True, check=True)
 """
@@ -290,7 +279,7 @@ subprocess.run([sys.executable, '-c',
                     "OWNER_TEST_RETURN": str(returned), "OWNER_TEST_CASE_DIR": str(rca.STATE),
                     "OWNER_TEST_PIDS": str(descendants)}
                 self.owned.markers.append(descendants)
-                with REAL_POPEN([sys.executable, "-c", caller, mode], cwd=Path(__file__).resolve().parents[2],
+                with REAL_POPEN([str(Path(__file__).resolve().parents[2] / "scripts/lib/py"), "-c", caller, mode], cwd=Path(__file__).resolve().parents[2],
                                 env=self.owned.environment(environment), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                 text=True, start_new_session=True) as process:
                     self.owned.track(process, group=True)
@@ -308,10 +297,10 @@ subprocess.run([sys.executable, '-c',
                 self.assertEqual(receipt.read_text(), "delivered")
 
     def test_the_same_session_and_commands_join_the_case_until_it_is_fixed(self) -> None:
-        two = rca.Report("modules", "natedev", "auto_mode", ("implement.sh --to modules-impl",
+        two = rca.Report("modules", "natedev", "auto_mode", ("assign.sh --role implement --to modules-impl",
                                                              "review.sh  --to modules-test"), production="cargo-liner")
         self.assertEqual(rca.open_case(two, OPENED), "rca: opened 261023-1")
-        swapped = two._replace(commands=("review.sh --to modules-test", "implement.sh --to modules-impl"))
+        swapped = two._replace(commands=("review.sh --to modules-test", "assign.sh --role implement --to modules-impl"))
         self.assertEqual(rca.open_case(swapped, OPENED), "rca: joined 261023-1")
         self.assertEqual(self.case("261023-1")["alerts"], 2)
         self.assertEqual(len(self.sends()), 1)
@@ -323,13 +312,13 @@ subprocess.run([sys.executable, '-c',
         _ = rca.open_case(HANDLER._replace(production=""), OPENED)
         stopped_doc = self.root / "stopped-production.md"
         _ = stopped_doc.write_text("# Stopped production\n")
-        stopped = recorded_showrunner("stopped-owner", stopped_doc)
+        stopped = recorded_showrunner("stopped-production", stopped_doc)
         _ = fake_showrunner.write_timer(self.root / "notifiers", "stopped-production",
                                          stopped.current_session, "UTC", stopped_doc)
         _ = rca.open_case(HANDLER._replace(session="other", production="stopped-production"), OPENED)
         doc = self.root / "cargo-production.md"
         _ = doc.write_text("# Cargo production\n")
-        owner = recorded_showrunner("cargo-owner", doc)
+        owner = recorded_showrunner("cargo-liner", doc)
         member = fixture_member("unit", name="marked", parent=owner.id,
                                  worktree=staff.PresentWorktree("natedev", self.root / "marked"))
         self.live_session("marked", member.current_session)
@@ -342,8 +331,7 @@ subprocess.run([sys.executable, '-c',
         self.assertEqual(self.case("261023-3")["production"], "cargo-liner")
 
     def test_native_identity_uses_the_shared_member_resolver(self) -> None:
-        sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "production"))
-        import unit_lookup
+        from scripts.production import unit_lookup
         self.assertIs(session_staff.member_sources, unit_lookup.member_sources)
 
     def test_a_by_hand_open_takes_the_newest_transcript_of_the_session_it_names(self) -> None:
@@ -351,7 +339,7 @@ subprocess.run([sys.executable, '-c',
         newest = self.transcript("-home-handler", "sid-handler", 2000)
         self.live_session("handler", "sid-handler")
         with mock.patch.dict(os.environ, self.caller()):
-            code, out, _ = self.quiet(["open", "--session", "handler-unit", "--machine", "natedev", "--kind", "prompt",
+            code, out, _ = self.quiet(["open", "--session", "handler", "--machine", "natedev", "--kind", "prompt",
                                        "--command", "cargo build", "--production", "cargo-liner"])
         self.assertEqual((code, out), (0, "rca: opened 261023-1\n"))
         self.assertEqual(self.case("261023-1")["transcript"], str(newest))
@@ -359,10 +347,10 @@ subprocess.run([sys.executable, '-c',
 
     def test_an_unknown_session_gets_no_transcript_and_never_the_callers(self) -> None:
         with mock.patch.dict(os.environ, self.caller()):
-            _ = rca.open_case(HANDLER._replace(session="gone-unit", transcript=""), OPENED)
+            _ = rca.open_case(HANDLER._replace(session="gone", transcript=""), OPENED)
         self.assertEqual(self.case("261023-1")["transcript"], "")
         text = flags(self.sends()[0])["--text"]
-        self.assertIn("Commands: cargo build -p cargo-handler\nFind why it stopped", text)
+        self.assertIn("Commands: cargo build -p cargo-handler\nFind why this happened", text)
         self.assertNotIn("Transcript", text)
 
     def test_open_never_fails_its_caller(self) -> None:
@@ -387,23 +375,34 @@ subprocess.run([sys.executable, '-c',
                                  (("write phases/34h/state.json (34h phase record)",), "a file change"),
                                  (("Edit",), "a file change"), (("WebFetch",), "an action"),
                                  (("mcp__brp__brp_launch",), "an action"), (("cargo",), "a shell command"),
-                                 (("implement.sh --to modules-impl", "review.sh --to modules-test"), "2 shell commands"),
+                                 (("assign.sh --role implement --to modules-impl", "review.sh --to modules-test"), "2 shell commands"),
                                  (("write a.json", "edit b.py"), "2 file changes"),
                                  (("write a.json", "cargo build"), "2 actions"), ((), "an action"), ((" ",), "an action")):
             with self.subTest(commands=commands):
                 self.assertEqual(rca.action_of(commands), action)
 
+    def test_auto_mode_owner_message_and_story_describe_a_refused_command_without_a_session_stop(self) -> None:
+        case_id = rca.open_case(HANDLER._replace(kind="auto_mode", commands=("write progress.json",)), OPENED).split()[-1]
+        case = self.case(case_id)
+        delivered = flags(self.sends()[0])["--text"]
+        self.assertIn("handler on natedev had a command refused by auto mode.", delivered)
+        self.assertIn("Find why this happened and fix the source.", delivered)
+        for text in (delivered, rca.owner_message(case, reminder=True), *rca.story(case).values()):
+            with self.subTest(text=text):
+                self.assertNotIn("stopped", text)
+        self.assertEqual(rca.story(case)["stop"], "auto mode refused a file change")
+
     def test_start_sends_the_started_push_in_plain_words_with_the_case_key(self) -> None:
         stopped = OPENED - timedelta(minutes=2)
         for report, stop, waits in (
-                (ALERTED._replace(stopped=stopped.isoformat()), "it asked you to allow a shell command",
+                (ALERTED._replace(stopped=stopped.isoformat()), "the session asked you to allow a shell command",
                  " The cargo-handler release waits for it."),
                 (HANDLER._replace(kind="auto_mode", commands=("write a.json", "edit b.py")),
                  "auto mode refused 2 file changes", "")):
             with self.subTest(stop=stop):
                 self.log.unlink(missing_ok=True)
                 case_id = rca.open_case(report, OPENED).split()[-1]
-                code, out, _ = self.quiet(["start", case_id, "--owner", "builds-unit"])
+                code, out, _ = self.quiet(["start", case_id, "--owner", "builds"])
                 self.assertEqual((code, out), (0, "SENT: to the user\n"))
                 sent = flags(self.sends()[-1])
                 self.assertEqual((sent["--to"], sent["--text-id"], sent["--from"], sent["--key"]),
@@ -413,12 +412,12 @@ subprocess.run([sys.executable, '-c',
                 self.assertEqual(self.values(self.sends()[-1]), {"sender": "cargo-liner", "session": "handler",
                                                                   "time": time, "stop": stop, "waits_line": waits})
                 rendered = push_texts.render("permission.rca_started", **self.values(self.sends()[-1]))
-                self.assertEqual(rendered.title, "cargo-liner: finding why handler stopped")
-                self.assertEqual(rendered.body, f"The handler session stopped at {time} when {stop}.{waits} A session"
-                                 + " now finds the cause and fixes it, so it does not stop there again."
+                self.assertEqual(rendered.title, "cargo-liner: finding why handler hit a check")
+                self.assertEqual(rendered.body, f"At {time} in the handler session, {stop}.{waits} A session"
+                                 + " now finds the cause and fixes it, so this does not happen again."
                                  + " A second push comes when the fix is in.")
                 # The owner, who the user does not need, stays in the case.
-                self.assertEqual((self.case(case_id)["status"], self.case(case_id)["owner"]), ("started", "builds-unit"))
+                self.assertEqual((self.case(case_id)["status"], self.case(case_id)["owner"]), ("started", "builds"))
                 self.assertNotIn("builds", rendered.body)
 
     def test_fixed_closes_the_case_and_its_push_has_one_period_each(self) -> None:
@@ -432,9 +431,9 @@ subprocess.run([sys.executable, '-c',
         sent = flags(fixed_push)
         self.assertEqual((sent["--text-id"], sent["--from"], sent["--key"]), ("permission.rca_fixed", "messaging", "rca-261023-1"))
         rendered = push_texts.render("permission.rca_fixed", **self.values(fixed_push))
-        self.assertEqual(rendered.title, "messaging: fixed why handler stopped")
+        self.assertEqual(rendered.title, "messaging: fixed why handler hit a check")
         # The waits sentence is in the present tense: the fixed push leaves it out.
-        self.assertEqual(rendered.body, f"The handler session stopped at {silence.shown(OPENED)} when it asked you to"
+        self.assertEqual(rendered.body, f"At {silence.shown(OPENED)} in the handler session, the session asked you to"
                          + f" allow a shell command.\nWhy: {CAUSE}.\nNow: {FIX}.")
         # The push review read the whole fixed text once and approved it.
         self.assertEqual([(draft.title, draft.body) for draft in self.reviewed], [(rendered.title, rendered.body)])
@@ -452,7 +451,7 @@ subprocess.run([sys.executable, '-c',
         self.assertEqual((code, out), (0, "SENT: to the user\nSENT: to the user\n"))
         [_, retire, fixed_push] = self.sends()
         self.assertEqual(retire, ["retire", "--to", "user", "--from", "stall-watch",
-                                  "--key", "stall-watch:prompt:cargo-liner:handler-unit"])
+                                  "--key", "stall-watch:prompt:cargo-liner:handler"])
         self.assertEqual(flags(fixed_push)["--text-id"], "permission.rca_fixed")
 
     def test_the_first_refusal_of_the_fixed_text_sends_nothing_and_exits_1(self) -> None:
@@ -553,7 +552,7 @@ subprocess.run([sys.executable, '-c',
         with redirect_stdout(io.StringIO()):
             self.assertEqual(silence.release(*claimed, lambda _argv: 0, post, "silence off"), 0)
         self.assertEqual([(push["source"], push["key"], push["title"]) for push in delivered],
-                         [(sender, "rca-261023-1", "cargo-liner: fixed why handler stopped")])
+                         [(sender, "rca-261023-1", "cargo-liner: fixed why handler hit a check")])
         self.assertTrue(delivered[0]["message"].endswith(f"Now: {FIX}."))
 
     def test_a_failed_push_exits_1_and_keeps_the_new_status(self) -> None:
@@ -624,7 +623,9 @@ subprocess.run([sys.executable, '-c',
         with (rca.STATE / ".lock").open("a+") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
             began = monotonic()
-            with redirect_stderr(errors):
+            # The lock deadline must cover lock contention, without interpreter startup.
+            with (redirect_stderr(errors),
+                  mock.patch.object(rca, "send", return_value=(True, "SENT: fixture"))):
                 rca.remind(OPENED, deadline=began + 0.2)
             self.assertLess(monotonic() - began, 1.5)
         self.assertFalse(self.case("261023-1").get("owner_told", True))
@@ -674,7 +675,7 @@ subprocess.run([sys.executable, '-c',
         _ = self.quiet(["fixed", "261023-3", "--cause", "c", "--fix", "f", "--commit", "abc"])
         lines = self.quiet(["list"])[1].splitlines()
         self.assertEqual(lines, [
-            "261023-1  open  handler-unit on natedev  10-23 09:30 AST  alerts 1  cargo build -p cargo-handler",
+            "261023-1  open  handler on natedev  10-23 09:30 AST  alerts 1  cargo build -p cargo-handler",
             "261023-2  started owner builds  started on natedev  10-23 09:30 AST  alerts 1  cargo build -p cargo-handler"])
 
 

@@ -2,27 +2,25 @@
 
 from __future__ import annotations
 
-from ledger_test_support import ticket_owner_id
-
 import io
 import sqlite3
-import sys
 import unittest
 from contextlib import closing, redirect_stdout
 from pathlib import Path
 from typing import final
 from unittest import mock
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-import style_plan
-import style_proposals
+from scripts.style.ledger_test_support import ticket_owner_id
 
-import berth_board
-import rules
-import style_ledger
+from scripts.style import style_plan
+from scripts.style import style_proposals
 
-from style_plan_test_support import StylePlanFixture
+from scripts.lib import berth_board
+from scripts.style import rules
+from scripts.style import style_ledger
+
+from scripts.style.style_plan_test_support import StylePlanFixture, unit_staff_id
 from scripts.production import staff
 
 
@@ -55,7 +53,7 @@ class StylePlanTests(StylePlanFixture):
         self.assertEqual(self.run_next(), (3, outcome + "\n", ""))
         with closing(sqlite3.connect(self.ledger().database)) as connection:
             self.assertEqual(connection.execute(
-                "SELECT outcome FROM refill_results WHERE unit='names-unit'",
+                "SELECT outcome FROM refill_results WHERE unit='names'",
             ).fetchone(), (outcome,))
 
 
@@ -71,7 +69,7 @@ class StylePlanTests(StylePlanFixture):
             self.assertEqual(self.run_next(), (3, "waiting for sync\n", ""))
         self.assertEqual(self.sync_wait_rows(), [(str(next(row.id for row in staff.initial_snapshot().find(kind="unit") if row.name == "names")), "2026-01-02T03:04:05+00:00")])
         self.assertEqual(self.run_next(), (0, "phase written: 1\n", ""))
-        self.assertEqual(self.ledger().ticket_open(ticket_owner_id("names-unit"))[0]["crate"], "crates/alpha")
+        self.assertEqual(self.ledger().ticket_open(ticket_owner_id("names"))[0]["crate"], "crates/alpha")
         self.assertEqual(self.sync_wait_rows(), [])
 
     def test_names_skips_held_structure_and_preserves_unclassified_warning(self) -> None:
@@ -83,11 +81,11 @@ class StylePlanTests(StylePlanFixture):
             code, output, errors = self.run_next()
         self.assertEqual((code, errors), (3, "unclassified: 1 rules — pull nate_style\n"))
         self.assertIn("waiting for structure: crates/alpha, crates/beta\n", output)
-        self.assertEqual(self.ledger().ticket_open(ticket_owner_id("names-unit")), ())
+        self.assertEqual(self.ledger().ticket_open(ticket_owner_id("names")), ())
         # Releasing the product holds makes the original structure read eligible.
         self.assertEqual(self.run_next(), (0, "phase written: 1\n",
                                           "unclassified: 1 rules — pull nate_style\n"))
-        ticket, = self.ledger().ticket_open(ticket_owner_id("names-unit"))
+        ticket, = self.ledger().ticket_open(ticket_owner_id("names"))
         self.assertEqual((ticket["kind"], ticket["files"]), ("structure", list(self.sources[:2])))
         self.assertEqual(self.sync_wait_rows(), [])
 
@@ -114,9 +112,9 @@ class StylePlanTests(StylePlanFixture):
         self.assertEqual((code, errors), (3, ""))
         self.assertIn("waiting for structure: crates/beta\n", output)
         self.assertNotIn("crates/alpha", output)
-        self.assertEqual(self.ledger().ticket_open(ticket_owner_id("names-unit")), ())
+        self.assertEqual(self.ledger().ticket_open(ticket_owner_id("names")), ())
         self.assertEqual(self.run_next(), (0, "phase written: 1\n", ""))
-        ticket, = self.ledger().ticket_open(ticket_owner_id("names-unit"))
+        ticket, = self.ledger().ticket_open(ticket_owner_id("names"))
         self.assertEqual((ticket["kind"], ticket["crate"], ticket["files"]),
                          ("structure", "crates/beta", list(self.sources[2:])))
 
@@ -130,7 +128,7 @@ class StylePlanTests(StylePlanFixture):
         worktree = self.root / "modules"
         output = io.StringIO()
         with redirect_stdout(output):
-            code = style_plan.main(["next-phase", "--unit", "modules-unit", "--plan", str(plan), "--repo", str(worktree)])
+            code = style_plan.main(["next-phase", "--unit", "modules", "--plan", str(plan), "--repo", str(worktree)])
 
         self.assertEqual((code, output.getvalue()), (
             3, "no available work: modules no available work, types no family unit, values no family unit, names none approved\n"
@@ -153,8 +151,8 @@ class StylePlanTests(StylePlanFixture):
                 "",
             ))
         self.assertEqual(board.call_count, 1)
-        self.assertEqual(self.ledger().ticket_open(ticket_owner_id("names-unit"))[0]["kind"], "structure")
-        self.assertEqual(self.ledger().ticket_open(ticket_owner_id("names-unit"))[0]["files"], list(self.sources[2:]))
+        self.assertEqual(self.ledger().ticket_open(ticket_owner_id("names"))[0]["kind"], "structure")
+        self.assertEqual(self.ledger().ticket_open(ticket_owner_id("names"))[0]["files"], list(self.sources[2:]))
         self.assertEqual(self.sync_wait_rows(), [])
 
     def test_refill_rechecks_after_registering_a_wait_and_finds_the_just_merged_crate(self) -> None:
@@ -171,10 +169,10 @@ class StylePlanTests(StylePlanFixture):
             return self.board(*(self.sources if reads == 1 else self.sources[2:]))
 
         with mock.patch.object(berth_board, "read_board", side_effect=board_after_merge):
-            self.assertEqual(style_plan.next_phase("names-unit", self.plan, self.repo),
+            self.assertEqual(style_plan.next_phase("names", self.plan, self.repo),
                              style_plan.PhaseWritten("1"))
         self.assertEqual(reads, 2)
-        self.assertEqual(self.ledger().ticket_open(ticket_owner_id("names-unit"))[0]["crate"], "crates/alpha")
+        self.assertEqual(self.ledger().ticket_open(ticket_owner_id("names"))[0]["crate"], "crates/alpha")
         self.assertEqual(self.sync_wait_rows(), [])
 
     def test_refill_drops_a_busy_edit_ticket_once_and_reads_unheld_structure(self) -> None:
@@ -182,26 +180,26 @@ class StylePlanTests(StylePlanFixture):
         read = self.rule("read")
         self.sync()
         ledger = self.ledger()
-        ledger.ticket_add("1", ticket_owner_id("names-unit"), "read", "names", "crates/alpha",
+        ledger.ticket_add("1", ticket_owner_id("names"), "read", "names", "crates/alpha",
                           list(self.sources[:2]), [read])
         output = io.StringIO()
         with mock.patch.object(berth_board, "read_board", return_value=self.board(*self.sources[:2])) as board, redirect_stdout(output):
-            result = style_plan.next_phase("names-unit", self.plan, self.repo)
+            result = style_plan.next_phase("names", self.plan, self.repo)
         self.assertEqual(result, style_plan.PhaseWritten("2"))
         self.assertEqual(board.call_count, 1)
         self.assertEqual(output.getvalue().count("dropped 1: files busy\n"), 1)
-        self.assertEqual(ledger.ticket_open(ticket_owner_id("names-unit"))[0]["kind"], "structure")
-        self.assertEqual(ledger.ticket_open(ticket_owner_id("names-unit"))[0]["files"], list(self.sources[2:]))
+        self.assertEqual(ledger.ticket_open(ticket_owner_id("names"))[0]["kind"], "structure")
+        self.assertEqual(ledger.ticket_open(ticket_owner_id("names"))[0]["files"], list(self.sources[2:]))
         self.assertEqual(self.sync_wait_rows(), [])
-        self.assertEqual(ledger.queued_tickets(ticket_owner_id("names-unit")), ())
+        self.assertEqual(ledger.queued_tickets(ticket_owner_id("names")), ())
 
     def test_edited_files_of_a_read_ticket_reads_no_synced_tip(self) -> None:
         read = self.rule("read")
         ledger = self.ledger()
-        ledger.ticket_add("1", ticket_owner_id("names-unit"), "read", "names", "crates/alpha",
+        ledger.ticket_add("1", ticket_owner_id("names"), "read", "names", "crates/alpha",
                           list(self.sources[:2]), [read])
         edits = style_plan.EditedFiles(self.repo, ledger, style_plan.NoUnitBranch())
-        self.assertEqual(edits.of_ticket(ledger.queued_tickets(ticket_owner_id("names-unit"))[0]), self.sources[:2])
+        self.assertEqual(edits.of_ticket(ledger.queued_tickets(ticket_owner_id("names"))[0]), self.sources[:2])
         self.assertIsNone(edits.tip)
 
     def test_board_failure_after_registering_a_wait_preserves_it_for_a_later_wake(self) -> None:
@@ -209,10 +207,10 @@ class StylePlanTests(StylePlanFixture):
         self.sync()
         unavailable = berth_board.BoardUnavailable("second read failed")
         with mock.patch.object(berth_board, "read_board", side_effect=[self.board(*self.sources), unavailable]):
-            result = style_plan.next_phase("names-unit", self.plan, self.repo)
+            result = style_plan.next_phase("names", self.plan, self.repo)
         self.assertEqual(result, unavailable)
         self.assertEqual([row[0] for row in self.sync_wait_rows()], [str(next(row.id for row in staff.initial_snapshot().find(kind="unit") if row.name == "names"))])
-        self.assertEqual(self.ledger().ticket_open(ticket_owner_id("names-unit")), ())
+        self.assertEqual(self.ledger().ticket_open(ticket_owner_id("names")), ())
 
     def test_resuming_an_assigned_ticket_clears_a_persisted_sync_wait(self) -> None:
         _ = self.rule("read")
@@ -236,7 +234,7 @@ class StylePlanTests(StylePlanFixture):
             self.assertEqual(self.run_next()[0], 4)
         self.assertEqual(self.sync_wait_rows(), expected)
         self.assertEqual(self.run_next()[0], 0)
-        ticket = self.ledger().ticket_open(ticket_owner_id("names-unit"))[0]
+        ticket = self.ledger().ticket_open(ticket_owner_id("names"))[0]
         for rule in ticket["rules"]:
             for path in ticket["files"]:
                 self.record(rule, path, self.tip, ticket["id"])
@@ -289,7 +287,7 @@ class StylePlanTests(StylePlanFixture):
             with self.subTest(state=state):
                 _ = self.plan.write_text(current.replace("### Phase 2", finished + "### Phase 2"))
                 if state == "checkpointed":
-                    ticket = ledger.ticket_open(ticket_owner_id("names-unit"))[0]
+                    ticket = ledger.ticket_open(ticket_owner_id("names"))[0]
                     for rule in ticket["rules"]:
                         for path in ticket["files"]:
                             self.record(rule, path, self.tip, ticket["id"])
@@ -316,7 +314,7 @@ class StylePlanTests(StylePlanFixture):
         _ = self.plan.write_text(self.plan_header())
         _ = (self.rule_dir / "read.md").write_text("---\ntier: C\nfamily: names\ninput_scope: file\n---\nChanged instructions.\n")
         self.assertEqual(self.run_next(), (0, "phase written: 2\n", ""))
-        self.assertEqual([ticket["id"] for ticket in ledger.ticket_open(ticket_owner_id("names-unit"))], ["2"])
+        self.assertEqual([ticket["id"] for ticket in ledger.ticket_open(ticket_owner_id("names"))], ["2"])
         with closing(sqlite3.connect(ledger.database)) as connection:
             self.assertEqual(connection.execute("SELECT state FROM tickets WHERE id='1'").fetchone(),
                              ("dropped",))
@@ -334,13 +332,13 @@ class StylePlanTests(StylePlanFixture):
         rule = self.rule("read")
         self.sync()
         ledger = self.ledger()
-        ledger.ticket_add("1", ticket_owner_id("names-unit"), "read", "names", "crates/alpha", [self.sources[0]], [rule])
+        ledger.ticket_add("1", ticket_owner_id("names"), "read", "names", "crates/alpha", [self.sources[0]], [rule])
         with mock.patch.object(berth_board, "read_board", return_value=self.board(self.sources[0])):
             code, output, errors = self.run_next()
         self.assertEqual((code, errors), (0, ""))
         self.assertIn("dropped 1: files busy", output)
         self.assertIn("phase written: 2", output)
-        self.assertNotIn(self.sources[0], ledger.ticket_open(ticket_owner_id("names-unit"))[0]["files"])
+        self.assertNotIn(self.sources[0], ledger.ticket_open(ticket_owner_id("names"))[0]["files"])
         self.assertEqual(self.count_tickets(), 2)
 
     def test_checkpoint_waits_then_merged_phase_is_discarded_before_refill(self) -> None:
@@ -348,7 +346,7 @@ class StylePlanTests(StylePlanFixture):
         self.sync()
         self.assertEqual(self.run_next()[0], 0)
         ledger = self.ledger()
-        ticket = ledger.ticket_open(ticket_owner_id("names-unit"))[0]
+        ticket = ledger.ticket_open(ticket_owner_id("names"))[0]
         for rule in ticket["rules"]:
             for path in ticket["files"]:
                 self.record(rule, path, self.tip, ticket["id"])
@@ -377,7 +375,7 @@ class StylePlanTests(StylePlanFixture):
         _ = ledger.reconcile("main", "style/main")
         with mock.patch.object(berth_board, "read_board", return_value=self.board(*self.sources)):
             code, output, errors = self.run_next()
-        self.assertEqual((code, errors), (3, "style: names-unit: the unit worktree has a detached HEAD\n"))
+        self.assertEqual((code, errors), (3, "style: names: the unit worktree has a detached HEAD\n"))
         self.assertIn("discarded 1: dropped", output)
         self.assertNotIn("### Phase 1 — 1", self.plan.read_text())
 
@@ -393,7 +391,7 @@ class StylePlanTests(StylePlanFixture):
         _ = self.only_first_source_open()
         _ = self.unit_commit(self.sources[1], "pub fn unit() {}\n")
         self.assertEqual(self.run_next(), (0, "phase written: 1\n", ""))
-        self.assertEqual(self.ledger().ticket_open(ticket_owner_id("names-unit"))[0]["files"], [self.sources[0]])
+        self.assertEqual(self.ledger().ticket_open(ticket_owner_id("names"))[0]["files"], [self.sources[0]])
 
     def test_refill_builds_a_ticket_when_the_unit_base_is_behind_the_synced_tip(self) -> None:
         _ = self.only_first_source_open()
@@ -401,7 +399,7 @@ class StylePlanTests(StylePlanFixture):
         self.tip = self.commit()
         self.sync()
         self.assertEqual(self.run_next(), (0, "phase written: 1\n", ""))
-        self.assertEqual(self.ledger().ticket_open(ticket_owner_id("names-unit"))[0]["files"], [self.sources[0]])
+        self.assertEqual(self.ledger().ticket_open(ticket_owner_id("names"))[0]["files"], [self.sources[0]])
 
     def test_a_decision_builds_no_ticket_on_a_file_the_unit_base_changed_after_the_synced_tip(self) -> None:
         rule = self.only_first_source_open()
@@ -413,7 +411,7 @@ class StylePlanTests(StylePlanFixture):
         finding = ledger.hold(rule, self.sources[0], 1, "value", "rename", "old", "new", blob, "outside")
         ledger.file_held(finding.finding_id, issue)
         _ = issue.write_text('---\nstatus: open\nstage: backlog\ntags: [issue, proposal, style]\n'
-                             + f'unit: names-unit\nplan: "{self.plan} Phase 1"\nstyle_rule: {rule}\nstyle_crate: crates/alpha\nstyle_rule_blob: {blob}\n---\n')
+                             + f'unit: {unit_staff_id("names")}\nplan: "{self.plan} Phase 1"\nstyle_rule: {rule}\nstyle_crate: crates/alpha\nstyle_rule_blob: {blob}\n---\n')
         self.proposals_field(folder)
         unit_change = self.unit_commit(self.sources[0], "pub fn value() { unit(); }\n")
         with mock.patch.object(style_proposals, "proposal_command") as start:

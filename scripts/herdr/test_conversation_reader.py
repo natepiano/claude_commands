@@ -4,17 +4,14 @@ from __future__ import annotations
 import io
 import json
 import os
-import sys
 import time
 from contextlib import redirect_stderr
 from pathlib import Path
 from typing import cast, override
-from unittest.mock import patch
+from unittest.mock import call, patch
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-import herdr
+from scripts.herdr import herdr
 from scripts.agents import codex_mesh
 from scripts.lib import unit_runs
 from scripts.lib import operation_deadline
@@ -58,6 +55,17 @@ class ConversationReaderTests(StaffTestCase):
             _ = record.write_text(json.dumps({"type": "session_meta", "payload": {"id": self.identity}}) + "\n")
             (descriptors / "4").symlink_to(record)
 
+    def unreadable_process(self, pid: int) -> None:
+        self.codex(rollout=False, pid=pid)
+        arguments = herdr._process_arguments  # pyright: ignore[reportPrivateUsage]
+
+        def read_arguments(path: Path) -> list[str]:
+            if path.name == str(pid):
+                raise PermissionError("argv unreadable")
+            return arguments(path)
+
+        _ = self.enterContext(patch.object(herdr, "_process_arguments", side_effect=read_arguments))
+
     def test_current_identity_requires_current_evidence(self) -> None:
         for evidence in (herdr.RolloutThread(self.identity), herdr.EnvironmentThread(self.identity)):
             with self.subTest(evidence=evidence):
@@ -83,6 +91,43 @@ class ConversationReaderTests(StaffTestCase):
             f"{self.launched} is not proved live or stopped: 1 processes unknown, first: test-tab (Codex thread unknown)",
             shared_codex=True))
         self.assertEqual(herdr.native_process(998071, "codex").identity, herdr.LaunchArgument(self.launched))
+
+    def test_live_identity_does_not_name_an_unknown_process_elsewhere(self) -> None:
+        self.codex()
+        self.unreadable_process(998072)
+        with patch.object(herdr, "_process_display_name") as name:
+            self.assertEqual(herdr.read_conversation(self.identity, "codex"),
+                             herdr.LiveConversation("codex", (998071,)))
+        name.assert_not_called()
+
+    def test_missing_identity_keeps_the_unknown_process_reason(self) -> None:
+        self.codex()
+        self.unreadable_process(998072)
+        with patch.object(herdr, "_process_display_name", return_value="test-tab") as name:
+            observed = herdr.read_conversation("absent", "codex")
+        name.assert_called_once_with(998072)
+        self.assertEqual(observed, herdr.UnknownConversation(
+            "absent is not proved live or stopped: 1 processes unknown, first: test-tab (process argv unknown)",
+            shared_codex=True))
+
+    def test_shared_snapshot_names_unknown_processes_in_note_order(self) -> None:
+        self.codex(rollout=False, pid=998071)
+        self.unreadable_process(998072)
+        home = self.root / "account"
+        read = codex_daemon.DaemonRead(codex_daemon.CodexDaemon(home, home / "socket"),
+                                     codex_daemon.DaemonUnreadable("control socket unavailable"))
+
+        def display_name(pid: int) -> str:
+            return f"test-tab-{pid}"
+
+        with (patch.object(codex_daemon, "read_daemons", return_value=[read]),
+              patch.object(herdr, "_process_display_name", side_effect=display_name) as name):
+            snapshot = herdr.codex_conversations()
+        self.assertEqual(snapshot.unknown, (
+            "test-tab-998072 (process argv unknown)",
+            f"{home} (Codex daemon unknown: control socket unavailable)",
+            "test-tab-998071 (Codex thread unknown)"))
+        self.assertEqual(name.call_args_list, [call(998072), call(998071)])
 
     def test_daemon_clients_use_one_read_and_prove_every_loaded_thread(self) -> None:
         home = self.root / "account"
@@ -278,6 +323,20 @@ class ConversationReaderTests(StaffTestCase):
         (run / codex_mesh.SERVER_FILE).touch()
         with patch.object(codex_mesh, "loaded_threads", return_value={self.identity}) as loaded:
             self.assertEqual(herdr.read_conversation(self.identity, "codex"), herdr.LiveConversation("codex", ()))
+        loaded.assert_called_once()
+        self.assertEqual(loaded.call_args.args[0], run)
+        self.assertGreater(cast(float, loaded.call_args.args[1]), 0)
+
+    def test_idle_astra_app_server_proves_its_thread_live_without_an_unknown_pid(self) -> None:
+        run = unit_runs.ASTRA_RUN_ROOT / "test-review"
+        run.mkdir(parents=True)
+        _ = (run / codex_mesh.SERVER_FILE).write_text(json.dumps({"pid": 998071}))
+        self.codex(rollout=False, arguments=["codex", "app-server"],
+                   environment={"CODEX_HOME": str(self.root / "account")})
+        with patch.object(codex_mesh, "loaded_threads", return_value={self.identity}) as loaded:
+            snapshot = herdr.codex_conversations()
+        self.assertEqual(herdr.read_conversation(self.identity, "codex", codex=snapshot), herdr.LiveConversation("codex", ()))
+        self.assertEqual(snapshot.unknown, ())
         loaded.assert_called_once()
         self.assertEqual(loaded.call_args.args[0], run)
         self.assertGreater(cast(float, loaded.call_args.args[1]), 0)

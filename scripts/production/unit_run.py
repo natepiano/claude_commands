@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """Print the newest run id, machine and UTC start time for a production unit."""
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import argparse
 import json
@@ -132,7 +136,7 @@ def mac_run(root: str, worktree: str, *,
 
 def main(arguments: list[str]) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    _ = parser.add_argument("--production", type=Path, required=True)
+    _ = parser.add_argument("--production", required=True)
     _ = parser.add_argument("unit")
     _ = parser.add_argument("--root", default="")
     _ = parser.add_argument("--no-mac", action="store_true")
@@ -140,10 +144,9 @@ def main(arguments: list[str]) -> int:
     unit = cast(str, args.unit)
     try:
         record = staff.snapshot()
-        sources = unit_lookup.member_sources()
-        slug = unit_lookup.production_slug_for_document(cast(Path, args.production), record, sources)
-        worktree = str(unit_lookup.local_worktree(sources.member(
-            staff_sources.UnitMember(slug, unit), record)).path)
+        production_name = cast(str, args.production)
+        worktree = str(unit_lookup.local_worktree(staff_sources.member(
+            staff_sources.UnitMember(production_name, unit), record)).path)
     except (staff.StaffUnreadable, staff.StaffRefused) as error:
         print(f"unit_run: {error}", file=sys.stderr)
         return 1

@@ -18,31 +18,21 @@ import os
 import re
 import sqlite3
 import time
-import sys
 from collections.abc import Generator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path, PurePath
-from typing import TYPE_CHECKING, BinaryIO, TypedDict, cast
+from typing import BinaryIO, TypedDict, cast
 from urllib.parse import quote
 
-if __package__:
-    from . import store, parse
-else:
-    import store
-    import parse
+from scripts.buildlog import store, parse
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-if TYPE_CHECKING:
-    from ..lib import conf
-    from ..test_times.gate_record import TYPE_CHECK_JOB
-else:
-    from scripts.lib import conf
-    from scripts.test_times.gate_record import TYPE_CHECK_JOB
+from scripts.lib import conf
+from scripts.test_times.gate_record import TYPE_CHECK_JOB
 
-SCHEMA_VERSION = 33
+SCHEMA_VERSION = 34
 
 
 # These indexes support repeated queries over the current schema.
@@ -183,6 +173,7 @@ TEST_COLUMNS: list[Column] = [
 ]
 
 GATE_RUN_COLUMNS: list[Column] = [
+    ("step", "TEXT", "targeted-test or merge-gate; empty for old records"),
     ("id", "TEXT PRIMARY KEY", "gate run identity"),
     ("src", "TEXT", "source file"),
     ("host", "TEXT", "host"),
@@ -195,7 +186,7 @@ GATE_RUN_COLUMNS: list[Column] = [
     ("status", "INTEGER", "exit status"),
     ("max_jobs", "INTEGER", "maximum number of concurrent jobs"),
     ("peak_mib", "REAL", "peak memory in MiB"),
-    ("cap_mib", "REAL", "memory cap in MiB"),
+    ("cap_mib", "REAL", "runner memory governor in MiB"),
     ("checkout", "TEXT", "checkout path"),
     ("branch", "TEXT", "branch"),
     ("sha", "TEXT", "commit"),
@@ -262,7 +253,7 @@ CALL_COLUMNS: list[Column] = [
     ("caller", "TEXT", "verify for verify.sh (NULL before 2026-10-02), cargo-port for port-lint"),
     ("command", "TEXT", "'lint hana', 'test hana_diegetic', 'port-lint clippy', ..."),
     ("verb", "TEXT", "verify.sh: check, test, lint, fmt, example, example-test, final; port-lint: clippy, mend, sweep"),
-    ("package", "TEXT", "the package named"),
+    ("package", "TEXT", "the named package, or workspace"),
     (
         "outcome",
         "TEXT",
@@ -482,7 +473,7 @@ SSH_ATTEMPT_COLUMNS: list[Column] = [
 
 TABLES: dict[str, tuple[list[Column], str, str]] = {
     "gate_runs": (
-        GATE_RUN_COLUMNS, "", "one row per merge-gate test run (scripts/production/merge_gate.py)",
+        GATE_RUN_COLUMNS, "", "one row per targeted-test or merge-gate run",
     ),
     "gate_suites": (GATE_SUITE_COLUMNS, "PRIMARY KEY (run_id, suite)", "one row per gate suite"),
     "gate_modules": (
@@ -597,7 +588,47 @@ def index_path_in(root: Path) -> Path:
 
 
 def read_only_uri(root: Path) -> str:
-    return f"file:{quote(str(index_path_in(root)))}?mode=ro"
+    return read_only_path_uri(index_path_in(root))
+
+
+def read_only_path_uri(path: Path) -> str:
+    """Return a read-only SQLite URI for the selected index."""
+    return f"file:{quote(str(path))}?mode=ro"
+
+
+@dataclass(frozen=True)
+class NoCompleteGateIndex:
+    """No complete index has compatible gate tables."""
+
+
+def complete_gate_index_in(root: Path) -> Path | NoCompleteGateIndex:
+    """Prefer the current index, then the newest complete compatible index."""
+    expected = {statement.split()[2]: statement for statement in schema_statements()
+                if statement.startswith("CREATE TABLE ") and statement.split()[2] in GATE_TABLES}
+    current = index_path_in(root)
+    candidates: list[tuple[float, Path]] = []
+    read_wait = conf.read("buildlog").number("INDEX_READ_WAIT_SECONDS")
+    for path in root.glob(f"{INDEX_PREFIX}-*{INDEX_SUFFIX}"):
+        try:
+            connection = sqlite3.connect(read_only_path_uri(path), uri=True, timeout=read_wait)
+            try:
+                completed = cast(tuple[str] | None, connection.execute(
+                    "SELECT value FROM meta WHERE key = 'updated_at'"
+                ).fetchone())
+                tables = dict(cast(list[tuple[str, str]], connection.execute(
+                    "SELECT name, sql FROM sqlite_master WHERE type = 'table'"
+                ).fetchall()))
+                if completed is None or any(tables.get(name) != sql for name, sql in expected.items()):
+                    continue
+                completed_at = float(completed[0])
+                if path == current:
+                    return path
+                candidates.append((completed_at, path))
+            finally:
+                connection.close()
+        except (sqlite3.Error, ValueError):
+            continue
+    return max(candidates)[1] if candidates else NoCompleteGateIndex()
 
 
 @contextmanager
@@ -681,6 +712,8 @@ def open_for_update(path: Path) -> sqlite3.Connection:
     for statement in schema_statements():
         if statement.startswith("CREATE INDEX") and statement.split(" ON ", 1)[0].split()[-1] not in indexes:
             _ = connection.execute(statement)
+    spill_pages = conf.read("buildlog").whole("INDEX_SPILL_PAGES")
+    connection.execute(f"PRAGMA cache_spill = {spill_pages}").close()
     _ = connection.execute(f"PRAGMA busy_timeout = {BUSY_TIMEOUT_MS}")
     return connection
 
@@ -892,6 +925,7 @@ def add_gate_run(connection: sqlite3.Connection, record: dict[str, object], src:
         if key != TYPE_CHECK_JOB:
             module_keys.add(key)
     insert(connection, "gate_runs", pick({
+        "step": "",
         **record,
         "src": src,
         "modules_run": len(module_keys),
@@ -1132,6 +1166,20 @@ def update() -> int:
     return update_in(store.root())
 
 
+def has_numeric_update_time(connection: sqlite3.Connection) -> bool:
+    """Return whether the index has a numeric completion time."""
+    completed = cast(tuple[str | None] | None, connection.execute(
+        "SELECT value FROM meta WHERE key = 'updated_at'"
+    ).fetchone())
+    if completed is None:
+        return False
+    try:
+        _ = float(str(completed[0]))
+    except ValueError:
+        return False
+    return True
+
+
 def update_in(root: Path) -> int:
     """Update the index in the selected build log root."""
     root.mkdir(parents=True, exist_ok=True)
@@ -1165,6 +1213,9 @@ def update_in(root: Path) -> int:
                 forget(connection, gone)
             if touched_calls:
                 resolve_mac_repositories(connection, touched_calls)
+            if connection.total_changes or not has_numeric_update_time(connection):
+                _ = connection.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('updated_at', ?)",
+                                       (str(time.time()),))
             _ = connection.execute("COMMIT")
         except BaseException:
             if connection.in_transaction:

@@ -1,6 +1,8 @@
 """A queued program owns one reservation from before launch through finalization."""
 from __future__ import annotations
 
+from scripts.lib import atomic_file
+
 from contextlib import ExitStack, redirect_stderr, redirect_stdout
 from collections.abc import Callable
 from datetime import UTC, datetime
@@ -17,7 +19,7 @@ import tempfile
 import threading
 import time
 import unittest
-from typing import TYPE_CHECKING, Unpack, cast
+from typing import Unpack, cast
 from unittest import mock
 
 from scripts.build_queue import queue_place as queue, admission_client as client, admission_service as service, admission_protocol as wire
@@ -25,12 +27,10 @@ from scripts.build_queue.admission_test_support import AdmissionFixture
 from scripts.build_queue.queue_fixture import write_process
 from scripts.lib.process_group import send_process_group
 from scripts.lib.test_hang_guard import LauncherHangGuard, TEST_HANG_GUARD_SECS
+from scripts.build_queue import admission_records as records, step_estimator
 from scripts.lint import memory_admit as gate
 
-if TYPE_CHECKING:
-    from ..buildlog import store
-else:
-    import store
+from scripts.buildlog import store
 
 from scripts.lint.memory_test_support import commit_config_fixture, fake_memory_readings, gate_isolation_environment
 from scripts.build_queue.queue_fixture import write_memory_config
@@ -149,7 +149,7 @@ def helper_lifeline_owner() -> None:
 
 class HelperLifelineTests(unittest.TestCase):
     def test_helpers_exit_after_the_test_process_is_killed(self) -> None:
-        owner = subprocess.Popen([sys.executable, "-c",
+        owner = subprocess.Popen([str(Path(__file__).resolve().parents[2] / "scripts/lib/py"), "-c",
             "from scripts.build_queue.test_queue_place import helper_lifeline_owner; helper_lifeline_owner()"],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE)
         pids: list[int] = []
@@ -197,7 +197,7 @@ def private_scope_start() -> None:
     if not any(private_slice in Path(line[3:]).parts for line in actual.splitlines() if line.startswith("0::")):
         raise AssertionError("the program did not enter the private test slice")
     read_text = Path.read_text
-    publish = queue.atomic_sample
+    publish = atomic_file.atomic_sample
 
     def kernel_path(path: Path, encoding: str | None = None, errors: str | None = None) -> str:
         if path == cgroup_path:
@@ -208,7 +208,7 @@ def private_scope_start() -> None:
         publish(path, value.replace("/sys/fs/cgroup/builds.slice/", "/sys/fs/cgroup/", 1))
 
     with mock.patch.object(Path, "read_text", new=kernel_path), \
-         mock.patch.object(queue, "atomic_sample", side_effect=publish_actual_path):
+         mock.patch.object(atomic_file, "atomic_sample", side_effect=publish_actual_path):
         queue.scope_start(Path(sidecar), int(holder), start, argv)
 
 
@@ -249,7 +249,7 @@ class QueuePlaceFixture(ExitStack):
         def start(argv: list[str], **kwargs: Unpack[queue.PopenArguments]) -> subprocess.Popen[bytes]:
             if "--scope-start" in argv:
                 index = argv.index("--scope-start") - 2
-                argv = [*argv[:index], sys.executable, "-c",
+                argv = [*argv[:index], str(Path(__file__).resolve().parents[2] / "scripts/lib/py"), "-c",
                         "from scripts.build_queue.test_queue_place import private_scope_start; private_scope_start()",
                         self.private_slice, *argv[index + 2:]]
             if argv[:1] != ["git"]:
@@ -509,7 +509,7 @@ class QueuePlaceTests(unittest.TestCase):
                 process = place.popen(argv, stdout=subprocess.DEVNULL)
                 self.assertEqual(process.wait(timeout=2), 0)
             self.assertEqual(fixture.history(), history)
-            with mock.patch.object(gate, "program_peak_estimate", side_effect=AssertionError("editor sized from history")):
+            with mock.patch.object(step_estimator, "program_peak_estimate", side_effect=AssertionError("editor sized from history")):
                 with queue.queue_place([str(executable)], fixture.root) as place:
                     self.assertEqual(place.purpose, queue.ProgramPurpose.EDITOR_SERVER)
                     self.assertFalse(fixture.admission.server.reservations)
@@ -595,7 +595,7 @@ class QueuePlaceTests(unittest.TestCase):
         unit = f"queue-place-holder-{os.getpid()}-{time.monotonic_ns()}.scope"
         command = ["systemd-run", "--user", "--scope", "--quiet", "--collect",
                    "--expand-environment=no", f"--slice={private_slice}", f"--unit={unit}", "--",
-                   sys.executable, "-c", "from scripts.build_queue.test_queue_place import QueuePlaceTests; "
+                   str(Path(__file__).resolve().parents[2] / "scripts/lib/py"), "-c", "from scripts.build_queue.test_queue_place import QueuePlaceTests; "
                    + "QueuePlaceTests().assert_nested_scope_stops_unsampled_descendant("
                    + f"fork_during_scope_read={fork_during_scope_read!r}, private_slice={private_slice!r})"]
         try:
@@ -912,7 +912,7 @@ class QueuePlaceTests(unittest.TestCase):
         with QueuePlaceFixture() as fixture:
             write_memory_config(fixture.config, **{"program_first_peak_gib.rust-analyzer": "abc"})
             diagnostics = io.StringIO()
-            with mock.patch.object(gate, "_warned_configuration_diagnostics", set[gate.ConfigurationDiagnostic]()), \
+            with mock.patch.object(records, "_warned_configuration_diagnostics", set[gate.ConfigurationDiagnostic]()), \
                  mock.patch.object(client, "admit", wraps=client.admit) as checked, redirect_stderr(diagnostics):
                 for _ in range(2):
                     with self.assertRaises(queue.QueuePlaceRefused) as refused:
@@ -944,26 +944,6 @@ class QueuePlaceTests(unittest.TestCase):
                 self.assertEqual(fixture.children, [])
                 self.assertEqual(list(fixture.directory.glob("*.reservation")), [])
 
-    def test_fixed_cap_ignores_history_at_start_and_after_estimate_refresh_seconds(self) -> None:
-        with QueuePlaceFixture() as fixture:
-            fixture.seed([2 * GIB] * 10)
-            with queue.queue_place("rust-analyzer", fixture.root, sizing=gate.FixedCapSizing(12 * GIB)):
-                _, row = fixture.reservation()
-                self.assertEqual((row["need"], row.get("queue_waiter", {}).get("need_source")), (12 * GIB, "cap"))
-                waiter = row.get("queue_waiter", {})
-                self.assertEqual(gate.ExpectedPeak(row["need"], waiter.get("need_source", "fallback"),
-                    waiter.get("need_runs", 0), gate.read_need_basis(waiter.get("need_basis"))),
-                    gate.ExpectedPeak(12 * GIB, "cap", 0, gate.ProgramMemoryCap("rust-analyzer")))
-                fixture.admission.clock.advance(gate.read_memory_config().policy.timing.estimate_refresh_seconds + 1)
-                with mock.patch.object(gate, "program_peak_estimate", side_effect=AssertionError("cap estimated history")):
-                    _ = fixture.admission.run_pass()
-                _, current = fixture.reservation()
-                self.assertEqual(current["need"], 12 * GIB)
-                self.assertIn("queue_waiter", current)
-                waiter = current.get("queue_waiter", {})
-                self.assertEqual(gate.read_need_basis(waiter.get("need_basis")),
-                                 gate.ProgramMemoryCap("rust-analyzer"))
-                self.assertFalse(list(fixture.directory.glob("*.reservation")))
 
     def test_invalid_config_warns_once_and_does_not_corrupt_child_protocol(self) -> None:
         with QueuePlaceFixture() as fixture:

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Print every proposal still open for the user as one Markdown table.
 
-Usage: proposals_table.py [--production <production doc>] [--next]
+Usage: proposals_table.py [--production <production name>] [--next]
 
 Without `--production`, the doc is the one held by the update timer of the calling session
 (`CLAUDE_CODE_SESSION_ID`). Three sources, in this order:
@@ -19,6 +19,10 @@ score of its proposed stars, its prerequisite the first of its `depends_on`. The
 `--next` prints the one proposal /next shows and pins it until it leaves the waiting rows.
 """
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import json
 import math
@@ -35,18 +39,18 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.lib import conf
 from scripts.production import showrunners, staff
 from scripts.production.production_doc import Refusal
-from issues import Issue
-from proposal_issue import AwaitingApproval, InProgress, ProposalProgress, proposal_progress
-from proposals_folder import ledger, owners, proposal_issues, proposer, scope_docs
+from scripts.production.issues import Issue
+from scripts.production.proposal_issue import AwaitingApproval, InProgress, ProposalProgress, proposal_progress, staff_name
+from scripts.production.proposals_folder import ledger, owners, proposal_issues, proposer, scope_docs
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "direct"))
-import phase_table
+from scripts.direct import phase_table
 from scripts.direct import plan_history
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
-import unit_runs
-import urgency
-from user_zone import user_zone
+from scripts.lib import unit_runs
+from scripts.lib import urgency
+from scripts.lib.user_zone import user_zone
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "prioritize"))
 from scripts.prioritize import renumber
@@ -138,7 +142,7 @@ def issue_state(issue: Issue, progress: ProposalProgress) -> str:
         case AwaitingApproval():
             return REVIEW_STATE
         case InProgress():
-            unit = issue.value("unit")
+            unit = staff_name(issue.value("unit")) if issue.value("unit") else ""
             return f"{IN_PROGRESS_STATE} by {unit}" if unit else IN_PROGRESS_STATE
 
 
@@ -205,7 +209,7 @@ def issue_row(issue: Issue) -> IssueRow:
     progress = proposal_progress(issue)
     level = issue_urgency(issue) if isinstance(progress, AwaitingApproval) else urgency.Urgency()
     shown = urgency.cell(level)
-    row = Row(issue.value("proposed_by") or NONE, f"{issue.value('proposal_id')} {issue.path.stem}".lstrip(),
+    row = Row(staff_name(issue.value("proposed_by")) if issue.value("proposed_by") else NONE, f"{issue.value('proposal_id')} {issue.path.stem}".lstrip(),
               issue.value("date_created") or NONE,
               issue_state(issue, progress) + (f" · {shown}" if shown else ""))
     waits = isinstance(progress, AwaitingApproval)
@@ -335,7 +339,12 @@ def scope_issues(doc: Path, below: bool = False) -> list[Issue]:
 
 def improvement_ledgers(doc: Path, below: bool = False) -> list[Path]:
     """The Improvement queue ledger of the production, and with `below` of each one below it, once each."""
-    return list(dict.fromkeys(found for each in scope_docs(doc, below) if (found := ledger(each)) is not None))
+    paths: dict[Path, None] = {}
+    for each in scope_docs(doc, below):
+        found = ledger(each)
+        if found is not None:
+            paths[found] = None
+    return list(paths)
 
 
 def waiting_entries(doc: Path, below: bool = False) -> tuple[list[urgency.Entry[Row]], list[Row]]:
@@ -381,16 +390,18 @@ def next_proposal(doc: Path) -> str:
 def main(arguments: list[str]) -> int:
     one = "--next" in arguments
     match [argument for argument in arguments if argument != "--next"]:
-        case ["--production", doc_text]:
-            doc: Path | None = Path(doc_text)
+        case ["--production", name]:
+            row = showrunners.owner_for(name)
+            if isinstance(row.doc, staff.DocUnfilled): raise Refusal(f"{row.name}: no production document")
+            doc: Path | None = row.doc.path
         case []:
             doc = showrunners.production_of(os.environ.get("CLAUDE_CODE_SESSION_ID", ""))
             if doc is None:
-                print("proposals_table: this session is no production's showrunner; pass --production <doc>",
+                print("proposals_table: this session is no production's showrunner; pass --production <name>",
                       file=sys.stderr)
                 return 1
         case _:
-            print("usage: proposals_table.py [--production <production doc>] [--next]", file=sys.stderr)
+            print("usage: proposals_table.py [--production <production name>] [--next]", file=sys.stderr)
             return 2
     if one:
         print(next_proposal(doc.expanduser().resolve()))

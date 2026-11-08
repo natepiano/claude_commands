@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import os
 import shlex
+import shutil
 import signal
 import subprocess
 import sys
@@ -77,15 +78,28 @@ class VerifyTreeCancelTests(VerifyTreeCancelFixture):
                 self.assert_resources_released()
                 self.assert_no_cache_verdict()
 
+    def pause_state_move(self, *, after_first_natedev: bool = False) -> None:
+        move = self.root / "stubs/mv"
+        real_move = shutil.which("mv")
+        assert real_move is not None
+        move.unlink(missing_ok=True)
+        arm = (
+            'case "$(cat "$3" 2>/dev/null)" in *on_natedev*)\n'
+            + '    if [ -e "$TEST_CONTROL/publication-seen" ]; then\n'
+            + '        touch "$TEST_CONTROL/cleanup-armed"\n'
+            + '    else touch "$TEST_CONTROL/publication-seen"; fi;;\nesac\n'
+        ) if after_first_natedev else ""
+        self.write_shell_tool(move, arm +
+            'if [ -e "$TEST_CONTROL/cleanup-armed" ]; then\n'
+            + '    case "$*" in *.state*)\n'
+            + '        touch "$TEST_CONTROL/cleanup-started"\n'
+            + '        ' + shlex.quote(sys.executable) + ' "$TEST_WAIT_HELPER" "$TEST_CONTROL/cleanup-release";;\n'
+            + '    esac\n'
+            + 'fi\nexec ' + shlex.quote(real_move) + ' "$@"\n')
+
     def test_second_term_during_cleanup_removes_the_step_record(self) -> None:
-        python = self.control / "python"
-        self.write_shell_tool(python,
-            'if [ "${1##*/}" = step_record.py ] && [ "${2:-}" = state ] '
-            + '&& [ "${5:-}" = waiting_hold ] && [ -e "$TEST_CONTROL/cleanup-armed" ]; then\n'
-            + '    touch "$TEST_CONTROL/cleanup-started"\n'
-            + '    ' + shlex.quote(sys.executable) + ' "$TEST_WAIT_HELPER" "$TEST_CONTROL/cleanup-release"\n'
-            + 'fi\nexec ' + shlex.quote(sys.executable) + ' "$@"\n')
-        process = self.start_verify("lint", TEST_BLOCK_STAGE="mend", CLAUDE_PYTHON=str(python))
+        self.pause_state_move()
+        process = self.start_verify("lint", TEST_BLOCK_STAGE="mend")
         self.wait_for_running(self.control / "running", process)
         self.assert_resources_held()
         _ = (self.control / "cleanup-armed").touch()
@@ -98,6 +112,25 @@ class VerifyTreeCancelTests(VerifyTreeCancelFixture):
         self.assertEqual(process.returncode, 143, output + errors)
         self.wait_for_group_exit(process.pid, timeout=5)
         self.assert_resources_released()
+        self.assert_no_cache_verdict()
+
+    def test_term_during_state_publication_removes_the_record_state_and_temporary_file(self) -> None:
+        self.pause_state_move(after_first_natedev=True)
+        release = self.control / "cleanup-release"
+        self.addCleanup(release.touch)
+        process = self.start_verify("lint", TEST_BLOCK_STAGE="mend")
+        wait_until((self.control / "cleanup-started").exists, self.control, timeout=10,
+                   processes=(process,))
+        self.assertTrue(list((self.root / "verify-steps").glob(".step-*")))
+        process.send_signal(signal.SIGTERM)
+        _ = release.touch()
+        output, errors = process.communicate(timeout=10)
+        self.assertEqual(process.returncode, 143, output + errors)
+        self.wait_for_group_exit(process.pid, timeout=5)
+        records = self.root / "verify-steps"
+        self.assertEqual(list(records.glob("*.json")), [])
+        self.assertEqual(list(records.glob("*.state")), [])
+        self.assertEqual(list(records.glob(".step-*")), [])
         self.assert_no_cache_verdict()
 
     def test_lint_rewrites_finish_without_cancelling(self) -> None:

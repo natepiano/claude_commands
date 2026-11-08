@@ -39,6 +39,15 @@ def cargo_home_folder(cwd: str, environment: Mapping[str, str]) -> str:
     return os.path.realpath(os.path.join(cwd, cargo_home)) if cargo_home else ""
 
 
+def cargo_config_folders(cwd: str, environment: Mapping[str, str]) -> list[Path]:
+    """List Cargo home and the ancestor config folders in precedence order."""
+    cargo_home = cargo_home_folder(cwd, environment)
+    folders = [Path(cargo_home)] if cargo_home else []
+    directory = Path(cwd)
+    folders.extend(parent / ".cargo" for parent in reversed((directory, *directory.parents)))
+    return folders
+
+
 def cargo_folder_settings(argv: list[str], cwd: str, environment: Mapping[str, str], *,
                           policy: CargoConfigPolicy = CargoConfigPolicy.COMPATIBLE) -> dict[str, CargoFolderSetting]:
     """Apply Cargo precedence to folder settings under both policies.
@@ -48,6 +57,7 @@ def cargo_folder_settings(argv: list[str], cwd: str, environment: Mapping[str, s
     Strict mode reads current config files and raises for invalid or unreadable CLI config.
     """
     strict = policy is CargoConfigPolicy.CURRENT_STRICT
+    directory = Path(cwd)
     settings: dict[str, CargoFolderSetting] = {}
 
     def read_settings(contents: str, base: Path) -> None:
@@ -72,11 +82,7 @@ def cargo_folder_settings(argv: list[str], cwd: str, environment: Mapping[str, s
             if strict:
                 raise
 
-    cargo_home = cargo_home_folder(cwd, environment)
-    configs = [Path(cargo_home)] if cargo_home else []
-    directory = Path(cwd)
-    configs.extend(parent / ".cargo" for parent in reversed((directory, *directory.parents)))
-    for config in configs:
+    for config in cargo_config_folders(cwd, environment):
         legacy = config / "config"
         read_config(legacy if not strict and legacy.is_file() else config / "config.toml")
     for key, variable in (("target-dir", "CARGO_BUILD_TARGET_DIR"), ("build-dir", "CARGO_BUILD_BUILD_DIR")):

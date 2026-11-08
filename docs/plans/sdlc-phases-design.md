@@ -474,7 +474,7 @@ missing evidence as `None`, zero, or a success. It affects the director and
 doc checker. Build: 16–24 work hours; risk: another formatter becomes a second
 source of truth. It must keep no store and must link every fact to its owner.
 
-All duty checks refer to `origin/sdlc-roles:docs/plans/sdlc-roles-design.md`,
+All duty checks refer to `docs/plans/sdlc-roles-design.md`,
 Duty matrix D05, D10–D15, D17, and D27–D28. No candidate moves those duties.
 Any later proposal to give compose, acceptance, design, review, or checkpoint
 to another role belongs to roles-unit and goes through the showrunner.

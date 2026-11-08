@@ -6,14 +6,11 @@ from scripts.production.cli_fixture import process_boundary
 import json
 import unittest
 from datetime import datetime
-from pathlib import Path
 from typing import cast, final
 from unittest import mock
 from scripts.production import staff
 
-import sys
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-from cli_test_support import OWNER_ID, CURRENT_ID, CliFixture, ZONE, REGISTRY, upgrade_record, setUpModule as setUpModule
+from scripts.bevy_upgrade.cli_test_support import OWNER_ID, CURRENT_ID, CliFixture, ZONE, REGISTRY, upgrade_record, setUpModule as setUpModule
 
 
 @final
@@ -25,7 +22,7 @@ class CliTests(CliFixture):
         self.assert_table(result)
         current = self.read_record()
         self.assertEqual(current["staff_id"], OWNER_ID)
-        self.assertEqual(current["production"], str(self.doc))
+        self.assertEqual(current["production"], "demo")
         self.assertEqual(current["checkout"], str(self.checkout))
         self.assertEqual(current["target"], "0.20")
         self.assertEqual(current["bevy"], ["0.19.1"])
@@ -52,14 +49,14 @@ class CliTests(CliFixture):
         self.assertEqual(result.returncode, 2)
         self.assertEqual(result.stdout, "")
         self.assertEqual(result.stderr,
-                         "bevy_upgrade: this session runs no production; pass --production <doc>\n")
+                         "bevy_upgrade: this session runs no production; pass --production <name>\n")
 
 
     def test_registered_production_comes_from_the_staff_row(self) -> None:
         self.env["CLAUDE_CODE_SESSION_ID"] = CURRENT_ID
         result = self.run_cli("start", "0.20", explicit_production=False)
         self.assert_table(result)
-        self.assertEqual(self.read_record()["production"], str(self.doc))
+        self.assertEqual(self.read_record()["production"], "demo")
 
 
     def test_approve_decline_forget_and_note_end_in_a_table(self) -> None:

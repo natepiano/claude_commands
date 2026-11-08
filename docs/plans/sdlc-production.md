@@ -11,7 +11,7 @@
 - **Showrunner session:** sdlc
 - **Log:** `docs/plans/sdlc-log.md` — untracked: never added or committed (never `git add -A` or `-a`); one line per event
 - **Updates:** on demand (user, 2026-10-13: no timer unless asked); each update reports every unit in full
-- **Merge tests:** `env HERDR_BIN=/nonexistent/herdr python3 scripts/production/merge_gate.py --repo . --tests-only` and `basedpyright scripts/direct scripts/production` (pass is its `0 errors, 0 warnings` line), run in the showrunner checkout
+- **Merge tests:** `env HERDR_BIN=/nonexistent/herdr ~/.claude/scripts/lib/py ~/.claude/scripts/production/merge_gate.py --checkout . --tests-only` and `basedpyright scripts/direct scripts/production`, run in the showrunner checkout (basedpyright passes on its `0 errors, 0 warnings` line)
 - **Push:** git
 - **Promote:** ~/.claude, mac ~/.claude
 - **Capacity:** natedev has 32 cores and 60 GB of memory; four units. The work is mostly documents and Python scripts, so the load is low. Its seats share natedev's build slots with build-followups.
@@ -40,14 +40,6 @@ State is in `~/.local/state/astra/design-roles/` and `~/.local/state/astra/desig
 | `commands/showrunner/produce.md` | roles-unit | guild-process-unit (the designer and reviewer roles under a showrunner) |
 
 These three files are also hub files in build-followups. An edit to one of them goes through cargo-berth's normal flow, and the checkpoint notice names the build-followups owner.
-
-## Gates
-
-| Gate | Waiting | Waits on | Clears when |
-| --- | --- | --- | --- |
-| G1 | hierarchies-unit Phase 4 (measure.py reads wait records and merge receipts) | phases-unit Phase 6 (HI7 wait records and merge receipts; depends on its phase 3) | That checkpoint is on origin/sdlc and ~/.claude main, its notice names the record file and commit, and the file holds at least one wait record and one receipt from a real phase. |
-
-When a plan needs another unit's checkpoint, the gate goes here.
 
 ## Close-out
 

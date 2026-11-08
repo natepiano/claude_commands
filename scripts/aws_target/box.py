@@ -18,18 +18,54 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
-from scripts.aws_target import admin_secrets, ledger
+from scripts.aws_target import admin_secrets, ledger, routing_proof
 from scripts.aws_target.aws_target import AwsCli, AwsExecutor, AwsUnavailable, control_lock, execute_command
-from scripts.aws_target.config import deployment_outputs, deployment_record, read_deployment_settings
+from scripts.aws_target.config import deployment_outputs, deployment_record, read_deployment_settings, read_settings
 from scripts.build_targets import target_config
 from scripts.buildlog import store
-from scripts.lib import conf
+from scripts.lib import conf, copy_record, scratch
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.mac_test import linux_runner, offload, mac_test
 
 
+IMAGE_OWNER_TAG = 'aws-build-image'
+
+
+def running_claims(paths: mac_test.StatePaths) -> tuple[mac_test.HeldClaim, ...]:
+    """Read remote job claims whose owner process still runs without deleting claims."""
+    return tuple(claim for claim in mac_test.read_claims(paths)
+                 if 'remote_host' in claim.record and not mac_test.run_is_kept(claim.record))
+
+
+def close_routing(settings: Path) -> bool:
+    """Disable AWS routing while excluding new claims."""
+    path = target_config.ssh_target_state_directory('aws') / 'routing.json'
+    desired: dict[str, object] = {'enabled': False, 'settings': str(settings.resolve())}
+    paths = mac_test.state_paths('aws')
+    with mac_test.locked(paths.lock):
+        changed = not path.exists() or json_record(path.read_text()) != desired
+        if changed:
+            write_text_atomic(path, json.dumps(desired) + '\n')
+    return changed
+
+
 class BoxRefused(ValueError):
     """A live box check does not permit the next stage."""
+
+
+def saved_image(api: AwsCli, directory: Path) -> dict[str, object]:
+    """Read the saved image from EC2 without accepting a deleted image."""
+    path = directory / 'image.json'
+    if not path.exists():
+        return {}
+    record = json_record(path.read_text())
+    try:
+        reply = api.call('describe-images', '--image-ids', ledger.text(record, 'image_id'), '--owners', 'self')
+    except AwsUnavailable as error:
+        if 'NotFound' in str(error):
+            return {}
+        raise
+    return next(iter(ledger.rows(reply, 'Images')), dict[str, object]())
 
 
 def policy_source() -> dict[str, object]:
@@ -385,11 +421,11 @@ class BoxSetup:
         finally:
             _ = self.tailnet.call('DELETE', 'keys/' + key_id)
 
-    def _ssh(self, command: str) -> str:
+    def _ssh(self, command: str, *, user: str = 'natepiano') -> str:
         if isinstance(self.joined, UnjoinedBox):
             raise BoxRefused('the box has no SSM-confirmed Tailscale identity')
         connection = offload.read_connection_settings(self.settings)
-        return self._run(['ssh', *offload.ssh_options(connection), 'natepiano@' + self.joined.address, command])
+        return self._run(['ssh', *offload.ssh_options(connection), user + '@' + self.joined.address, command])
 
     def _desired_system(self) -> str:
         return self.desired_system
@@ -427,6 +463,9 @@ class BoxSetup:
             return False
 
     def configure(self) -> None:
+        if self.configuration_present():
+            return
+        self.quiet()
         desired = self._desired_system()
         source = Path(conf.read(self.settings).text('nixos_configuration_directory')).expanduser().resolve()
         built = self._run(['nix', 'build', '--no-link', '--print-out-paths', '--no-write-lock-file',
@@ -435,25 +474,32 @@ class BoxSetup:
             raise BoxRefused('the NixOS source changed during the build')
         _ = self.start()
         self._wait(self.join_present, 'box configuration requires the joined instance')
+        def bootstrapped() -> bool:
+            try:
+                _ = self._ssh('test -e /var/lib/aws-build/bootstrap-complete')
+                return True
+            except (BoxRefused, OSError, subprocess.SubprocessError):
+                return False
+        self._wait_setup(bootstrapped, 'the box bootstrap did not finish')
         values = conf.read(self.settings)
         timeout = values.whole('box_setup_timeout_s') + values.whole('box_check_attempts') * values.number('box_check_delay_s')
         idle_record = Path('/home/natepiano') / conf.read(self.settings).text('remote_state_directory') / 'idle.json'
         reset_idle = 'rm -f -- ' + shlex.quote(str(idle_record))
         # Hold the controller lock and use a bounded box timer during the copy and detached switch.
         with control_lock(self.directory):
-            _ = self._ssh(f'sudo systemd-run --unit=aws-build-setup-stop --on-active={timeout}s --collect ' +
+            _ = self._ssh(f'systemd-run --unit=aws-build-setup-stop --on-active={timeout}s --collect ' +
                           '/run/current-system/sw/bin/systemctl poweroff && ' +
-                          'sudo systemctl stop aws-build-remote.service && ' +
+                          'systemctl stop aws-build-remote.service && ' +
                           'if systemctl cat aws-build-first-boot-stop.timer >/dev/null 2>&1; then ' +
-                          'sudo systemctl stop aws-build-first-boot-stop.timer; fi')
+                          'systemctl stop aws-build-first-boot-stop.timer; fi', user='root')
             try:
                 self._copy([desired])
                 recovery = reset_idle + '; systemctl start aws-build-remote.service'
                 script = ('trap ' + shlex.quote(recovery) + ' EXIT; ' +
                           shlex.quote(desired + '/bin/switch-to-configuration') + ' switch')
                 try:
-                    _ = self._ssh('sudo systemd-run --unit=aws-build-switch --collect --no-block ' +
-                                  '/run/current-system/sw/bin/bash -c ' + shlex.quote(script))
+                    _ = self._ssh('systemd-run --unit=aws-build-switch --collect --no-block ' +
+                                  '/run/current-system/sw/bin/bash -c ' + shlex.quote(script), user='root')
                 except BoxRefused as error:
                     if 'exit 255' not in str(error):
                         raise
@@ -468,9 +514,9 @@ class BoxSetup:
             finally:
                 # A failed reconnect leaves the poweroff timer armed.
                 try:
-                    _ = self._ssh(reset_idle + ' && sudo systemctl start aws-build-remote.service && ' +
+                    _ = self._ssh(reset_idle + ' && systemctl start aws-build-remote.service && ' +
                                   'systemctl is-active --quiet aws-build-remote.service && ' +
-                                  'sudo systemctl stop aws-build-setup-stop.timer')
+                                  'systemctl stop aws-build-setup-stop.timer', user='root')
                 except (BoxRefused, OSError, subprocess.SubprocessError):
                     pass
 
@@ -480,12 +526,12 @@ class BoxSetup:
         # Nix uses the same bounded SSH connection as the other box commands.
         options = offload.ssh_options(offload.read_connection_settings(self.settings))
         _ = self._run(['env', 'NIX_SSHOPTS=' + shlex.join(options), 'nix', 'copy', '--substitute-on-destination',
-                      '--to', 'ssh://natepiano@' + self.joined.address, *paths])
+                      '--to', 'ssh://root@' + self.joined.address, *paths])
 
     def _versions(self, *, on_box: bool) -> dict[str, str]:
         versions: dict[str, str] = {}
-        for tool, command in (('rustc', ['rustc', '-V']), ('nextest', ['cargo', 'nextest', '--version']),
-                              ('mend', ['cargo', 'mend', '--version'])):
+        for tool, command in (('nextest', ['cargo-nextest', 'nextest', '--version']),
+                              ('mend', ['cargo-mend', 'mend', '--version'])):
             output = self._ssh(shlex.join(command)) if on_box else self._run(command)
             versions[tool] = linux_runner.normalize_tool_version(output)
             if not versions[tool]:
@@ -540,12 +586,129 @@ class BoxSetup:
             'instance_id': self._instance(), 'versions': expected}) + '\n')
 
 
+    def _wait_setup(self, check: Callable[[], bool], reason: str) -> None:
+        values = conf.read(self.settings)
+        deadline = self.monotonic() + values.whole('box_setup_timeout_s')
+        while True:
+            if check():
+                return
+            remaining = deadline - self.monotonic()
+            if remaining <= 0:
+                raise BoxRefused(reason)
+            _ = self.pause(min(values.number('box_check_delay_s'), remaining))
+
+    def image_present(self) -> bool:
+        if (self.directory / 'image-scrub.json').exists():
+            return False
+        path = self.directory / 'image.json'
+        if not path.exists() or json_record(path.read_text()).get('system') != self.desired_system:
+            return False
+        current = saved_image(self._api(), self.directory)
+        return current.get('State') == 'available' and not any(self._image_leftovers(current))
+
+    def _image_leftovers(self, current: dict[str, object]) -> tuple[list[str], list[str]]:
+        api = self._api()
+        filters = json.dumps([{'Name': 'tag:' + IMAGE_OWNER_TAG, 'Values': ['true']}])
+        images = api.call('describe-images', '--owners', 'self', '--filters', filters)
+        snapshots = api.call('describe-snapshots', '--owner-ids', 'self', '--filters', filters)
+        kept = {ledger.mapping(row.get('Ebs')).get('SnapshotId')
+                for row in ledger.rows(current, 'BlockDeviceMappings')}
+        return ([ledger.text(image, 'ImageId') for image in ledger.rows(images, 'Images')
+                 if image.get('ImageId') != current.get('ImageId')],
+                [ledger.text(snapshot, 'SnapshotId') for snapshot in ledger.rows(snapshots, 'Snapshots')
+                 if snapshot.get('SnapshotId') not in kept])
+
+    def _cleanup_images(self, current: dict[str, object]) -> None:
+        images, snapshots = self._image_leftovers(current)
+        api = self._api()
+        for image in images:
+            _ = api.call('deregister-image', '--image-id', image)
+        for snapshot in snapshots:
+            _ = api.call('delete-snapshot', '--snapshot-id', snapshot)
+
+    def _restore_image_items(self) -> None:
+        _ = self._ssm('set -eu; keep=/home/.aws-build-image-keep; ' +
+                      'if test -d "$keep"; then rm -rf -- "$keep"/*.partial; ' +
+                      'for item in /var/lib/tailscale /var/lib/aws-build/data-volume-id /var/lib/aws-build/bootstrap-complete; do ' +
+                      'name=${item##*/}; if test -e "$keep/$name"; then ' +
+                      'rm -rf -- "$item"; mv -- "$keep/$name" "$item"; fi; done; rmdir -- "$keep"; fi; ' +
+                      'sync; printf restored')
+
+    def image(self) -> None:
+        if self.image_present():
+            return
+        self.quiet()
+        marker = self.directory / 'image-scrub.json'
+        if marker.exists():
+            _ = self.start()
+            self._wait(self.ssm_online, 'image restore requires SSM')
+            with control_lock(self.directory):
+                self._restore_image_items()
+                marker.unlink()
+        path = self.directory / 'image.json'
+        record = json_record(path.read_text()) if path.exists() else {}
+        api = self._api()
+        current = saved_image(api, self.directory) if record.get('system') == self.desired_system else {}
+        if current.get('State') not in ('pending', 'available'):
+            _ = self.start()
+            self._wait(self.join_present, 'image creation requires the joined instance')
+            with control_lock(self.directory):
+                write_text_atomic(marker, json.dumps({'system': self.desired_system}) + '\n')
+                failed = False
+                try:
+                    _ = self._ssm('set -eu; keep=/home/.aws-build-image-keep; mkdir -p -m 0700 -- "$keep"; ' +
+                                  'for item in /var/lib/tailscale /var/lib/aws-build/data-volume-id /var/lib/aws-build/bootstrap-complete; do ' +
+                                  'if test -e "$item"; then name=${item##*/}; rm -rf -- "$keep/$name.partial"; ' +
+                                  'cp -a -- "$item" "$keep/$name.partial"; mv -- "$keep/$name.partial" "$keep/$name"; ' +
+                                  'rm -rf -- "$item"; fi; done; sync; printf prepared')
+                    spending = read_settings(self.settings)
+                    tags = [{'Key': spending.cost_explorer_tag_key, 'Value': spending.cost_explorer_tag_value},
+                            {'Key': IMAGE_OWNER_TAG, 'Value': 'true'}]
+                    reply = api.call('create-image', '--instance-id', self._instance(), '--no-reboot',
+                                     '--name', 'aws-build-image-' + Path(self.desired_system).name[:12] + '-' + str(int(time.time())),
+                                     '--block-device-mappings', json.dumps([{'DeviceName': '/dev/sdf', 'NoDevice': ''}]),
+                                     '--tag-specifications', json.dumps([
+                                         {'ResourceType': kind, 'Tags': tags} for kind in ('image', 'snapshot')]))
+                    record = {'image_id': ledger.text(reply, 'ImageId'), 'system': self.desired_system,
+                              **({'idle_stop_system': self.desired_system}
+                                 if record.get('idle_stop_system') == self.desired_system else {})}
+                    write_text_atomic(path, json.dumps(record, sort_keys=True) + '\n')
+                    def snapshotted() -> bool:
+                        image = saved_image(api, self.directory)
+                        self._image_failed(image)
+                        root = conf.read(self.settings).text('root_device_name')
+                        return any(row.get('DeviceName') == root and ledger.mapping(row.get('Ebs')).get('SnapshotId')
+                                   for row in ledger.rows(image, 'BlockDeviceMappings'))
+                    self._wait_setup(snapshotted, 'the image root snapshot did not appear')
+                except BaseException:
+                    failed = True
+                    raise
+                finally:
+                    try:
+                        self._restore_image_items()
+                        marker.unlink()
+                    except BaseException:
+                        if not failed:
+                            raise
+        def available() -> bool:
+            image = saved_image(api, self.directory)
+            self._image_failed(image)
+            return image.get('State') == 'available'
+        self._wait_setup(available, 'the image did not become available')
+        self._cleanup_images(saved_image(api, self.directory))
+
+    @staticmethod
+    def _image_failed(image: dict[str, object]) -> None:
+        if image.get('State') == 'failed':
+            raise BoxRefused('image failed: ' + str(ledger.mapping(image.get('StateReason')).get('Message', 'failed')))
+
+
     def _stage_record(self, stage: str) -> dict[str, object]:
         path = self.directory / 'up.json'
         return ledger.mapping(json_record(path.read_text()).get(stage, {})) if path.exists() else {}
 
     def _invalidate_from(self, stage: str) -> None:
-        stages = ('box-configuration', 'checks', 'idle-stop', 'activation', 'routing-proof')
+        stages = ('box-configuration', 'checks', 'image', 'idle-stop', 'activation', 'routing-proof')
         path = self.directory / 'up.json'
         record = json_record(path.read_text()) if path.exists() else {}
         invalid = stages[stages.index(stage):]
@@ -581,19 +744,20 @@ class BoxSetup:
         return ledger.mapping(record.get(stage, {})).get('status') in ('done', 'present')
 
     def idle_stop_present(self) -> bool:
-        return self._proof_present('idle-stop')
+        path = self.directory / 'image.json'
+        return (self._proof_present('idle-stop') or path.exists()
+                and json_record(path.read_text()).get('idle_stop_system') == self.desired_system)
 
     def idle_stop(self) -> None:
         if self.idle_stop_present():
             return
-        if mac_test.live_claims(mac_test.state_paths('aws')):
-            raise BoxRefused('idle stop requires no active AWS claims')
+        self.quiet()
         state = self._instance_state()
         def stable() -> bool:
             nonlocal state
-            if state in ('pending', 'stopping'):
+            if state in ('pending', 'stopping', 'shutting-down'):
                 state = self._instance_state()
-            return state not in ('pending', 'stopping')
+            return state not in ('pending', 'stopping', 'shutting-down')
         self._wait(stable, 'idle stop requires a stable instance state')
         started = state == 'stopped'
         try:
@@ -611,11 +775,16 @@ class BoxSetup:
             with control_lock(self.directory):
                 deadline = self.monotonic() + duration
                 while True:
-                    if mac_test.live_claims(mac_test.state_paths('aws')):
-                        raise BoxRefused('idle stop requires no active AWS claims')
+                    if running_claims(mac_test.state_paths('aws')):
+                        deadline = self.monotonic() + duration
                     state = self._instance_state()
                     if state == 'stopped':
                         self._save_proof('idle-stop')
+                        path = self.directory / 'image.json'
+                        if path.exists():
+                            record = json_record(path.read_text())
+                            record['idle_stop_system'] = self.desired_system
+                            write_text_atomic(path, json.dumps(record, sort_keys=True) + '\n')
                         return
                     remaining = deadline - self.monotonic()
                     if remaining <= 0:
@@ -630,6 +799,21 @@ class BoxSetup:
                 _ = self._api().call('stop-instances', '--instance-ids', self._instance())
                 self._wait(lambda: self._instance_state() == 'stopped', 'idle stop cleanup did not confirm EC2 stopped')
             raise
+
+    def close_routing(self) -> None:
+        if close_routing(self.settings):
+            print('routing: AWS takes no new work until up finishes')
+
+    def quiet(self) -> None:
+        self.close_routing()
+        paths = mac_test.state_paths('aws')
+        claims = running_claims(paths)
+        if claims:
+            print(f'routing: waiting for {len(claims)} AWS jobs to finish')
+        delay = conf.read(self.settings).number('box_check_delay_s')
+        while claims:
+            _ = self.pause(delay)
+            claims = running_claims(paths)
 
     def _routing_path(self) -> Path:
         return target_config.ssh_target_state_directory('aws') / 'routing.json'
@@ -670,22 +854,36 @@ class BoxSetup:
             return
         if not self.activation_present():
             raise BoxRefused('routing proof requires active routing')
-        directory = Path(__file__).resolve().parent / 'proof_crate'
-        package = 'aws-routing-proof'
+        package = routing_proof.PACKAGE
         before = {path: store.read_last_whole_row_end(path) for path in store.root().glob('*/[0-9][0-9][0-9][0-9]-[0-9][0-9].jsonl')}
         verify = Path(__file__).resolve().parents[1] / 'direct/verify.sh'
-        # The existing source override limits the copy to this nested workspace.
-        command = 'cd ' + shlex.quote(str(directory)) + ' && exec ' + shlex.join(
-            ['env', 'UNIT_DETACHED_RUN=1', 'DOC_REPO_TOP=' + str(directory),
-             str(verify), 'test', package, '--target', 'aws', '--no-cache'])
-        _ = self._run(['bash', '-c', command])
-        for path in store.root().glob('*/[0-9][0-9][0-9][0-9]-[0-9][0-9].jsonl'):
-            for row in store.locked_rows(path, before.get(path, 0)):
-                if (row.get('kind') == 'step' and row.get('target') == 'aws' and row.get('host') == 'aws-build'
-                        and row.get('package') == package and row.get('status') == 0 and row.get('pinned') is True):
-                    self._save_proof('routing-proof', record_id=row.get('id'), record_file=str(path))
-                    return
-        raise BoxRefused('routing proof has no new successful pinned AWS buildlog step')
+        task = 'gate:aws-routing-proof'
+        _ = scratch.end(task)
+        directory = scratch.new(task, 'routing-proof')
+        try:
+            _ = scratch.update_record(directory, lambda record: {
+                **(record.fields if isinstance(record, copy_record.Registered) else {}),
+                'generated_source': True})
+            git = ['git', '-C', str(directory), '-c', 'core.hooksPath=/dev/null',
+                   '-c', 'commit.gpgsign=false', '-c', 'user.name=AWS Routing Proof',
+                   '-c', 'user.email=aws-routing-proof@example.invalid']
+            _ = self._run([*git, 'init', '--initial-branch=main'])
+            scratch.exclude_copy_metadata(directory)
+            routing_proof.write_crate(directory)
+            _ = self._run([*git, 'add', '.'])
+            _ = self._run([*git, 'commit', '-m', 'Create the routing proof crate'])
+            command = 'cd ' + shlex.quote(str(directory)) + ' && exec ' + shlex.join(
+                ['env', 'UNIT_DETACHED_RUN=1', str(verify), 'test', package, '--target', 'aws', '--no-cache'])
+            _ = self._run(['bash', '-c', command])
+            for path in store.root().glob('*/[0-9][0-9][0-9][0-9]-[0-9][0-9].jsonl'):
+                for row in store.locked_rows(path, before.get(path, 0)):
+                    if (row.get('kind') == 'step' and row.get('target') == 'aws' and row.get('host') == 'aws-build'
+                            and row.get('package') == package and row.get('status') == 0 and row.get('pinned') is True):
+                        self._save_proof('routing-proof', record_id=row.get('id'), record_file=str(path))
+                        return
+            raise BoxRefused('routing proof has no new successful pinned AWS buildlog step')
+        finally:
+            _ = scratch.end(task)
 
 
 def re_store_path(value: str) -> bool:

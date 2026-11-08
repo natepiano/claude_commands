@@ -17,12 +17,12 @@ from pathlib import Path
 from typing import cast, override
 from unittest import mock
 
-import process_table
-import codex_daemon
-import roster
-import herdr
-import sessions
-import top_level
+from scripts.message import process_table
+from scripts.message import codex_daemon
+from scripts.message import roster
+from scripts.herdr import herdr
+from scripts.message import sessions
+from scripts.message import top_level
 from scripts.message.process_test_support import OwnedTestProcesses
 from scripts.message import unit_labels
 from scripts.production import staff
@@ -214,7 +214,7 @@ class TopLevelTests(unittest.TestCase):
                                      f"solo\tuds:{solo}", f"orphaned unit\tuds:{orphaned}"})
         self.assertEqual({session_id for _, session_id in recorded}, {"showrunner", "ordinary", "solo", "orphaned unit"})
 
-    def test_stale_tmux_names_do_not_override_roster_unit_identity(self) -> None:
+    def test_roster_unit_identity_overrides_tmux_labels(self) -> None:
         _ = self.add("renamed unit", tmux="old-name:@3.%7", role="unit director",
                      showrunner=roster.UnderShowrunner("production", "runner", "session:runner"))
         ordinary = self.add("ordinary", tmux="unit-looking-name:@1.%1")

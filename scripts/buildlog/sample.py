@@ -8,13 +8,11 @@ import subprocess
 from pathlib import Path
 from typing import Literal, NamedTuple, TypedDict
 
-import store
-import cgroup_capture
-import filesystem
-import sys
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
-from cargo_output import CargoOutputRoots, read_cargo_output_roots
-from cgroup_capture import (Unmeasured as Unmeasured, StallTotals as StallTotals,
+from scripts.buildlog import store
+from scripts.buildlog import cgroup_capture, filesystem
+from scripts.lib.boot_identity import parse_boot_id as parse_boot_id
+from scripts.lib.cargo_output import CargoOutputRoots, read_cargo_output_roots
+from scripts.buildlog.cgroup_capture import (Unmeasured as Unmeasured, StallTotals as StallTotals,
                             PartialStallTotals as PartialStallTotals, read_pressure as read_pressure,
                             parse_pressure as parse_pressure)
 
@@ -100,14 +98,6 @@ def parse_meminfo(text: str) -> MachineMemoryUse:
     return MachineMemoryUse(values["MemTotal"] - values["MemAvailable"], values["SwapTotal"] - values["SwapFree"])
 
 
-def parse_boot_id(text: str) -> str:
-    """Return the kernel boot ID, rejecting an empty value."""
-    boot_id = text.strip()
-    if not boot_id:
-        raise ValueError("empty boot ID")
-    return boot_id
-
-
 def anon_bytes(cgroup: Path) -> int | Unmeasured:
     """Read process memory from a slice, or mark an absent slice unmeasured."""
     reading = cgroup_capture.read_cgroup(cgroup)
@@ -180,7 +170,7 @@ def sample() -> SampleTaken:
     """Append the current machine counters to a separate monthly JSONL file."""
     if not all(path.exists() for path in (MEMINFO, PRESSURE, BOOT_ID)):
         raise SystemExit("buildlog sample is Linux only (requires /proc).")
-    from memory import read_zram
+    from scripts.buildlog.memory import read_zram
 
     at = time.time()
     host = store.host_name()

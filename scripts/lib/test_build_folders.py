@@ -2,14 +2,17 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+from collections.abc import Callable
 import os
 import json
+import shutil
 import signal
 from pathlib import Path
 import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from typing import cast, override
 from unittest import mock
@@ -50,6 +53,12 @@ assert not loaded, loaded
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(result.stdout, "")
         self.assertEqual(result.stderr, "")
+
+    def test_tmpfs_parent_uses_only_inherited_tmpfs_paths(self) -> None:
+        for value, expected in (("/dev/shm/outer/module", Path("/dev/shm/outer/module")),
+                                ("/dev/shm-other", Path("/dev/shm"))):
+            with self.subTest(value=value), mock.patch.dict(os.environ, {"TMPDIR": value}):
+                self.assertEqual(folders.tmpfs_temporary_parent(), expected)
 
     def test_inherited_parent_changes_between_allocations(self) -> None:
         first = folders.create_build_folder(folders.UniqueBuildFolder("merge-gate-"))
@@ -126,7 +135,7 @@ assert not loaded, loaded
     @unittest.skipUnless(Path("/dev/shm").is_dir() and os.access("/dev/shm", os.W_OK),
                          "the memory filesystem is unavailable")
     def test_explicit_parent_allocates_under_a_private_dev_shm_parent(self) -> None:
-        with tempfile.TemporaryDirectory(dir="/dev/shm") as temporary:
+        with tempfile.TemporaryDirectory(dir=folders.tmpfs_temporary_parent()) as temporary:
             parent = Path(temporary)
             with folders.temporary_build_folder(folders.UniqueBuildFolder(
                     "merge-gate-", folders.ExplicitBuildParent(parent))) as name:
@@ -152,6 +161,58 @@ assert not loaded, loaded
                         raise
                 self.assertNotEqual(path, self.root)
                 self.assertFalse(path.exists())
+
+    def test_cancellation_during_allocation_or_removal_keeps_no_folder(self) -> None:
+        def interrupted(number: int, frame: object) -> None:
+            del frame
+            raise KeyboardInterrupt(signal.Signals(number).name)
+
+        for stage in ("allocation", "removal"):
+            with self.subTest(stage=stage):
+                paths: list[Path] = []
+                allocate = folders.create_build_folder
+                remove = shutil.rmtree
+                cancel = threading.Event()
+                sent = threading.Event()
+                release = threading.Event()
+
+                def send_from_thread() -> None:
+                    if cancel.wait(10) and not release.is_set():
+                        signal.pthread_kill(threading.get_ident(), signal.SIGTERM)
+                        sent.set()
+                        _ = release.wait(10)
+
+                worker = threading.Thread(target=send_from_thread)
+                worker.start()
+
+                def allocate_then_cancel(request: folders.BuildFolderRequest | folders.BuildFolderSpec) -> Path:
+                    path = allocate(request)
+                    paths.append(path)
+                    if stage == "allocation":
+                        os.kill(os.getpid(), signal.SIGTERM)
+                    return path
+
+                def cancel_then_remove(path: str, *, dir_fd: int,
+                                       onexc: Callable[[Callable[..., object], str, BaseException], object]) -> None:
+                    if stage == "removal":
+                        cancel.set()
+                        self.assertTrue(sent.wait(10), "the worker did not send SIGTERM")
+                    remove(path, dir_fd=dir_fd, onexc=onexc)
+
+                previous = signal.signal(signal.SIGTERM, interrupted)
+                try:
+                    with (mock.patch.object(folders, "create_build_folder", side_effect=allocate_then_cancel),
+                          mock.patch.object(shutil, "rmtree", side_effect=cancel_then_remove),
+                          self.assertRaisesRegex(KeyboardInterrupt, "SIGTERM")):
+                        with folders.temporary_build_folder(folders.UniqueBuildFolder("gate-proof-")):
+                            pass
+                    self.assertEqual(len(paths), 1)
+                    self.assertFalse(paths[0].exists())
+                finally:
+                    release.set()
+                    cancel.set()
+                    worker.join(timeout=10)
+                    _ = signal.signal(signal.SIGTERM, previous)
 
     def test_authority_readers_follow_current_scratch_copy_and_unit_roots(self) -> None:
         for index in range(2):
@@ -409,6 +470,11 @@ assert not loaded, loaded
         _ = config.write_text(original.replace("prefixes.admit-test=admit-test-", "prefixes.admit-test=private-"))
         _ = config_environment(config.parent)
         self.assertEqual(folders.FOLDER_PREFIXES["admit-test"], "private-")
+
+    def test_repository_key_keeps_the_fixed_path_name(self) -> None:
+        self.assertEqual(folders.repository_key(Path("/fixture/hana")), "hana-e4417bba")
+        self.assertEqual(folders.repository_key_for("hana", "/fixture/hana"), "hana-e4417bba")
+        self.assertEqual(folders.repository_key_for("hana space%", "/fixture/hana"), "hana space%-e4417bba")
 
     def test_equal_repository_basenames_have_distinct_keys(self) -> None:
         first = self.root / "first" / "hana"

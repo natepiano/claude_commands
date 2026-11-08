@@ -22,9 +22,8 @@ The actions below remain for unit directors and showrunners.
 Each top-level showrunner keeps one list of changes waiting for the user's
 check, named for it: `~/rust/hanadocs/change-review/change-review - <showrunner>.md`,
 such as `change-review - natedev.md`. A child production's rows go to its
-root's list. Merges add a row for each
-`Change-Review:` line in a checkpoint. This skill adds the rest, shows the list
-when the user asks, and records verdicts. Unit directors and showrunners use it.
+root's list. `list_ready` adds checkpoint changes only after they reach `origin/main` and become live.
+This command adds other ready changes, shows the list, and records verdicts.
 
 Every action runs:
 
@@ -40,9 +39,8 @@ Every action finds the list from its production, written `<production>` below:
 
 - A showrunner passes nothing: the script finds the production from this
   session's update timer, as `/showrunner:proposals` does. A session with no
-  timer passes `--production <doc>`.
-- A unit director passes `--production <doc>`, with the doc its plan header's
-  `> **Production:**` line names.
+  timer passes `--production <showrunner name>`.
+- A unit director passes `--production <showrunner name>` from the parent showrunner row's `name`.
 
 The list is named for the production's top-level showrunner while it runs, and
 otherwise is the path the doc's **Change review** line names. `list-path`
@@ -62,6 +60,10 @@ half a second and can drop a row; the vault owner sets Excluded folders →
 `change-review`.
 
 ## add
+
+A row requires a change the user can check now, merged where they run it and live after rebuild, restart or deploy.
+Until then, add no row.
+`add --merged` refuses a hash that is not on `origin/main`.
 
 For a change the user should check that no checkpoint `Change-Review:` line
 carries: a showrunner's own change, a fix outside a run, or a change nobody
@@ -85,6 +87,35 @@ shows each unit's phase" --check "In a showrunner session on natedev, type
 check cell is `<how to try it> You see: <what you see>`. Pass `--merged` when a
 commit holds the change. It prints the new row's id, such as `C12`.
 
+## list-ready and live
+
+All merge callers use `list_ready` after the final promotion step succeeds, including the Mac pull.
+It fetches `origin main` and scans merge commits from 2026-11-06.
+It adds each uncovered checkpoint line, including after an interrupted call.
+A row covers the same change when its merge contains that checkpoint.
+A row without a known merge also covers that change.
+A later fix can add a new row with the same words.
+A failed fetch prints one error line and adds nothing.
+The `append` and `drift` actions are removed.
+
+```sh
+… list-ready --repo <checkout> --production <showrunner>
+```
+
+A checkpoint line can end with ` | after <step>` when it needs a rebuild, restart or deploy.
+The scan prints the merge, the step and the exact `live` command only for uncovered lines.
+The session that completes the step runs that command:
+
+```sh
+… live --merged <hash> --step <step> --repo <checkout> --production <showrunner>
+```
+
+`live` requires both `--merged` and `--step`.
+It adds only that merge's lines that wait for the named step, after the merge reaches `origin/main`.
+A step with no matching line gives an error.
+A repeated call adds nothing.
+A hash outside `origin/main` takes the same refusal as `add --merged`.
+
 ## edit
 
 To rewrite a row still to review, such as one that lacks where to try it or
@@ -102,12 +133,10 @@ The row keeps its id, its Merged cell and its place. It prints the new row.
 When the user asks to review changes, follow [Bare command](#bare-command).
 
 The page contains every waiting change, with staff-based showrunner tabs.
-Each row stores its producer's fixed staff id in the Producer cell.
-The reader follows that id to the unit's current staff showrunner.
-An empty cell belongs to the list's showrunner.
-A showrunner id belongs to that showrunner.
-Names come from the staff record at use.
-Renamed and retired units keep their ids.
+An open Production cell holds the unit's fixed staff id or the showrunner's fixed staff id.
+The reader follows a unit's current staff parent and displays current names.
+Reviewed rows keep the production name recorded at the verdict.
+Renames and transfers do not rewrite these cells.
 The `unrouted` tab shows an unknown id or a broken staff parent chain.
 Verdicts save without sending a message.
 This tab offers no question control, and the server refuses question submissions without saving.
@@ -217,7 +246,7 @@ Use the `verdict` command above for both. The row stays out of the user's count 
 3. Save the answer with this command:
 
 ```sh
-"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/review_links/change_page.py" answer-question --production <doc> --list <list> --row C<n> --question <id> --text "<answer>"
+"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/review_links/change_page.py" answer-question --production <showrunner name> --list <list> --row C<n> --question <id> --text "<answer>"
 ```
 
 The row returns to the user's count with the question and answer below the change.
@@ -234,10 +263,7 @@ counted among the open questions. It goes on this list, and the user asks for
 
 ### Producer ids
 
-The merge writer matches each checkpoint branch to a unit staff row and stores that row's id in Producer.
-A unit with no staff row leaves the cell empty and prints one named note.
+Producer retains the unit's fixed staff id for verdict delivery.
+Unknown units leave Producer empty and print one named note.
 For `add`, `--repo` selects the directory; the default is `.`.
-A unit worktree stores its id.
-A showrunner directory or an unowned directory leaves the cell empty.
-The page, status line, and `/next` use one staff routing rule.
-The owner's staff showrunner supplies the production document, even when the list's document reference is missing.
+A showrunner directory or an unowned directory records a production-owned change.

@@ -2,7 +2,6 @@
 
 > **Status: IMPLEMENTATION PLAN — phased, delegate-ready; long-running.** Own the phase process: measure how a `/unit:direct` phase runs from start to end and how design and documentation docs are made before a plan exists, find where time and tokens go, propose changes, then build and measure one approved change at a time.
 
-> **Production: sdlc** — unit `phases-unit`; production doc `docs/plans/sdlc-production.md`
 
 ## Source
 
@@ -50,7 +49,9 @@ For active process redesigns, as we are currently undergoing with promotions and
   - `scripts/lib/user_zone.py` — user-facing times
   - `~/.claude/docs/decision_criteria.md` — what reaches the user
 - **Test lanes:** `scripts/direct/` — `test_*.py` beside the script.
-- **Test:** `python3 -m unittest discover -s scripts/direct -p 'test_phase_process.py'`, from the worktree root. Gate: `env HERDR_BIN=/nonexistent/herdr python3 scripts/production/merge_gate.py --repo . --tests-only` from the worktree root (memory `shared-module-full-gate`).
+- **Test:** `python3 -m unittest discover -s scripts/direct -p 'test_phase_process.py'`, from the worktree root.
+  Targeted test: `env HERDR_BIN=/nonexistent/herdr python3 scripts/production/targeted_test.py --repo .` from the worktree root.
+  Memory: `shared-module-full-gate`.
 - **Lint:** `basedpyright scripts/direct scripts/production` passes when its output has the `0 errors, 0 warnings` line; the exit status says nothing.
 - **Invariants:**
   - Measuring reads every source read-only. It sends no message, push or alert, and starts no session (plan author: a measure must not add traffic).
@@ -250,7 +251,7 @@ For active process redesigns, as we are currently undergoing with promotions and
 
 **Gotchas:**
 - A launcher that never exits keeps its subscription to the worker thread and records the next compaction turn as work, so the worker reads busy and refuses follow-ups. End only the stale launcher pids.
-- Run a merge gate through `python3 ~/.claude/scripts/copies/copies.py run --owner <unit-or-production> --repo <source> --commit HEAD --merge origin/sdlc -- <gate command>`. For `--merge origin/<branch>`, `copies.py` first fetches the branch from the source's origin into the standing tree, then merges it; it does not update the source's refs.
+- Run a merge gate through `python3 ~/.claude/scripts/copies/copies.py run --repo <source> --commit HEAD --merge origin/sdlc -- <gate command>`. For `--merge origin/<branch>`, `copies.py` first fetches the branch from the source's origin into the standing tree, then merges it; it does not update the source's refs.
 
 **Ruled out:** the slot taken from a variable fixed at app-server start; the newest phase instance for an ambiguous checkpoint; checking a postmaster-forwarded reply against its log before the log exists (removed as containment).
 
@@ -541,8 +542,10 @@ The showrunner routed five rows of the rerun sweep (`docs/plans/sdlc-rerun-sweep
 #### As-built
 
 - `scripts/hooks/stop-direct-continue.py` measures context before any wake-source check. Below the handoff threshold, or when context cannot be measured, the stop passes.
-- At or above the threshold, the only wake source is a live entry in the payload's `background_tasks` (`pending_background_tasks`). With none, the hook blocks once, so the next request runs compaction. The `heartbeat.log` age is not a wake source: a finished worker writes the heartbeat too. `workers_working` no longer exists in `direct_run.py`.
-- The other early returns keep their meaning: a subagent, no session id, no active run, a declared user or supplier wait (`record_turn_wait`), and `stop_hook_active` (block once only).
+- At or above the threshold, a live entry in `background_tasks` (`pending_background_tasks`) permits the stop. With none, the hook repeats the wake until compaction reduces the context. A finished worker also writes `heartbeat.log`, so its age does not supply a wake. `workers_working` no longer exists in `direct_run.py`.
+- The other early returns permit subagents, missing session ids, missing active runs, and declared user or supplier waits (`record_turn_wait`).
+- The hook permits a stop when the final status matches `paused_status_pattern`.
+- Holding and blocked prefixes alone do not prevent the wake.
 
 **Files:**
 - `scripts/hooks/stop-direct-continue.py` — context first, then background tasks

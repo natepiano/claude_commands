@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """Retire a staff unit without deleting uncommitted or unmerged work."""
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import argparse
 import json
@@ -14,23 +18,22 @@ from datetime import datetime
 from pathlib import Path
 from typing import NamedTuple, cast
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-for folder in ("production", "lib", "message", "shutdown", "direct"):
-    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / folder))
 
 from scripts.production import staff, staff_sources, unit_config
+from scripts.copies import copies
 from scripts.shutdown.remote import local_machine
 from scripts.shutdown import stop_resume
 from scripts.message import sessions
 from scripts.lib import process_group, conf
+from scripts.herdr import worker_panes
 from scripts.lib.conf import UseConfiguredValue
 from scripts.agents import worker_lifecycle
-import berth_board
-import progress_history
-import unit_lookup
-import unit_move
-import unit_names
-import unit_runs
+from scripts.lib import berth_board
+from scripts.direct import progress_history
+from scripts.herdr import herdr
+from scripts.production import unit_lookup
+from scripts.production import unit_move
+from scripts.lib import unit_runs
 from scripts.production.production_doc import Production, Refusal, read_production
 
 SCRIPTS = Path(__file__).resolve().parent.parent
@@ -50,7 +53,6 @@ class Unit:
     name: str
     worktree: Path
     branch: str
-    retired: bool
     staff_member: staff.StaffRow
 
 
@@ -81,13 +83,13 @@ def failure(result: subprocess.CompletedProcess[str]) -> str:
     return (result.stderr or result.stdout).strip() or f"exit {result.returncode}"
 
 
-def production_of(slug: str, *, record: staff.StaffSnapshot) -> Production:
-    found = staff_sources.member(staff_sources.ShowrunnerMember(slug), record)
+def production_of(production_name: str, *, record: staff.StaffSnapshot) -> Production:
+    found = staff_sources.member(staff_sources.ShowrunnerMember(production_name), record)
     if isinstance(found, staff_sources.NoSuchMember) or isinstance(found.row.doc, staff.DocUnfilled):
-        raise ValueError(f"{slug}: no showrunner staff document")
+        raise ValueError(f"{production_name}: no showrunner staff document")
     if found.row.doc.machine != local_machine():
-        raise ValueError(f"{slug}: run retire on {found.row.doc.machine}")
-    return read_production(found.row.doc.path)
+        raise ValueError(f"{production_name}: run retire on {found.row.doc.machine}")
+    return read_production(found.row)
 
 
 def _git(unit: Unit, *arguments: str, settings: conf.ConfigRead) -> subprocess.CompletedProcess[str]:
@@ -311,7 +313,6 @@ def live_claims(claims: tuple[MacClaim, ...]) -> tuple[MacClaim, ...]:
     return tuple(claim for claim in claims if _alive(claim.pid) and proc_start(claim.pid) == claim.proc_start)
 
 
-
 class MeshRun(NamedTuple):
     run: Path
     pid: int
@@ -399,24 +400,23 @@ def _command_name(pid: int) -> str:
         return "?"
 
 
-def find_unit(slug: str, given: str, *,
+def find_unit(production_name: str, given: str, *,
               record: staff.StaffSnapshot | None = None,
               settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT) -> Unit:
     record = staff.snapshot() if record is None else record
-    production = production_of(slug, record=record)
+    production = production_of(production_name, record=record)
     member = record.by_id(staff.StaffId(given))
     if member is None or member.kind != "unit":
-        selected = staff_sources.member(staff_sources.UnitMember(production.slug, given), record)
+        selected = staff_sources.member(staff_sources.UnitMember(production.name, given), record)
         if isinstance(selected, staff_sources.NoSuchMember):
-            raise ValueError(f"{production.slug}/{given}: no matching staff member")
+            raise ValueError(f"{production.name}/{given}: no matching staff member")
         member = selected.row
     location = unit_lookup.local_worktree(staff_sources.MemberFound(member))
     branch = ""
     if location.path.is_dir():
         result = run(["git", "-C", str(location.path), "branch", "--show-current"], settings=settings)
         branch = result.stdout.strip()
-    return Unit(production, unit_names.unit_id(member.name), location.path, branch,
-                isinstance(location, staff.RemovedWorktree), member)
+    return Unit(production, member.name, location.path, branch, member)
 
 
 def last_session(unit: Unit) -> str:
@@ -455,12 +455,15 @@ def members(unit: Unit, record: staff.StaffSnapshot) -> list[staff.StaffRow]:
 
 
 def dry_run(unit: Unit, *, settings: conf.ConfigRead) -> int:
-    print(f"retire {unit.name} of {unit.production.slug}: dry run, nothing changes")
+    print(f"retire {unit.name} of {unit.production.name}: dry run, nothing changes")
     refused = refusals(unit, settings=settings)
     for reason in refused:
         print(f"refused: {reason}")
     for row in members(unit, staff.snapshot()):
         print(f"would stop: session {row.current_session}")
+    trees = copies.owned_trees(str(unit.staff_member.id))
+    for tree in (*trees.standing, *(entry[0] for entry in trees.workspaces)):
+        print(f"would remove: checkout {tree}")
     print(f"would remove: worktree {unit.worktree}")
     print(f"would delete: branch {unit.branch} here and on origin")
     return int(bool(refused))
@@ -496,7 +499,11 @@ def retire(unit: Unit, *, settings: conf.ConfigRead,
            record: staff.StaffSnapshot | None = None) -> int:
     record = staff.snapshot() if record is None else record
     row = unit.staff_member
-    if unit.retired and not unit.worktree.exists():
+    if isinstance(row.worktree, staff.RemovedWorktree) and not unit.worktree.exists():
+        try:
+            copies.remove_trees(str(row.id))
+        except copies.CopyError as error:
+            print(f"anomaly: {error}".replace("\n", " "))
         print("unchanged")
         return 0
     refused = refusals(unit, settings=settings)
@@ -512,15 +519,19 @@ def retire(unit: Unit, *, settings: conf.ConfigRead,
                                             row.current_session, unit_config.Branch(unit.branch)))
         _ = unit_config.write_parked(row.id, replace(config, retired=facts))
     owned = members(unit, record)
+    pane_run = worker_panes.worker_run(row)
+    pane_workers = worker_panes.observe(row.id, record) if unit_runs.worker_transport(pane_run) == "herdr" else []
+    pane_ids = {item.row.id for item in pane_workers}
+    _ = stop_resume.stop_unit_workers(row.id, record)
     for member in owned:
-        if isinstance(record.backends.get(member.id), staff.CodexBackend):
+        if member.id in pane_ids or isinstance(record.backends.get(member.id), staff.CodexBackend):
             continue
         try:
-            outcome = stop_resume.stop(member.current_session)
+            outcome = stop_resume.stop(member.current_session, deadline=worker_lifecycle.effective_deadline())
             if isinstance(outcome, stop_resume.StopFailed):
                 print(f"anomaly: {member.name}: {outcome.reason}")
-        except (OSError, ValueError) as error:
-            print(f"anomaly: {member.name}: {error}")
+        except (OSError, ValueError, herdr.HerdrFailure) as error:
+            print(f"anomaly: {member.name}: {' '.join(str(error).splitlines())}")
     for key in holds({member.current_session for member in owned}):
         result = run([sys.executable, str(BUILD_HOLD), "release", "--holder", key], settings=settings)
         if result.returncode:
@@ -542,6 +553,16 @@ def retire(unit: Unit, *, settings: conf.ConfigRead,
     if refused:
         print("\n".join(f"refused: {reason}" for reason in refused))
         return 1
+    remaining = worker_panes.observe(row.id, staff.snapshot()) if pane_workers else []
+    if any(isinstance(item, (worker_panes.OpenWorker, worker_panes.UncertainWorker)) for item in remaining):
+        return 1
+    try:
+        copies.remove_trees(str(row.id))
+    except copies.RemoteMirrorKept as error:
+        print(f"refused: {error}")
+        return 1
+    except copies.CopyError as error:
+        print(f"anomaly: {error}".replace("\n", " "))
     failed = remove(unit, settings=settings)
     if failed:
         print("\n".join(f"anomaly: {reason}" for reason in failed))
@@ -553,17 +574,17 @@ def retire(unit: Unit, *, settings: conf.ConfigRead,
 
 def _main(argv: list[str], *, settings: conf.ConfigRead) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    _ = parser.add_argument("slug")
+    _ = parser.add_argument("production_name")
     _ = parser.add_argument("unit")
     _ = parser.add_argument("--dry-run", action="store_true")
     options = parser.parse_args(argv)
     try:
         record = staff.snapshot()
-        unit = find_unit(cast(str, options.slug), cast(str, options.unit), record=record, settings=settings)
+        unit = find_unit(cast(str, options.production_name), cast(str, options.unit), record=record, settings=settings)
         if cast(bool, options.dry_run):
             return dry_run(unit, settings=settings)
         return retire(unit, settings=settings, record=record)
-    except (Refused, Refusal, ValueError, OSError, conf.Unusable, unit_config.ConfigRefused, subprocess.SubprocessError) as error:
+    except (Refused, Refusal, ValueError, OSError, copies.CopyError, conf.Unusable, unit_config.ConfigRefused, subprocess.SubprocessError) as error:
         print(f"retire: {error}")
         return 1
 

@@ -6,6 +6,66 @@ Every build on natedev, CI's and the sessions', is admitted so that it fits in m
 
 ## How it works
 
+The service measures each handled request's wall time and process CPU time.
+The measurements include configuration recovery for the logging threshold.
+`request_slow_seconds=0.25` sets the logging threshold in `config/build_admission.conf`.
+A request above that threshold logs its request kind, wall seconds, and CPU seconds to stderr.
+The service reads the threshold at use.
+An unusable threshold logs once through the existing configuration diagnostics.
+Requests and cleanup continue when this logging setting is unusable.
+
+### Cloud gates
+
+`AdmitRequest.place` defaults to `LocalPlace()`.
+This tree supplies the queue API and the cloud progress file.
+The aws route integration belongs to a separate tree.
+That route calls this API with `CloudPlace("aws")` for a `merge-gate` or `targeted-test` step.
+The route process owns the reservation.
+The service releases the cloud slot when that process ends.
+An explicit release also ends the reservation.
+A route that returns to natedev releases its cloud reservation before it requests local admission.
+
+Cloud reservations need zero local memory.
+They do not consume memory room, CI room, head protection, start spacing, or progress memory.
+Local waits and cloud waits have separate admission orders.
+Cloud gates wait in arrival order when all cloud slots are in use.
+The wait text includes the used slots and the slot limit.
+`cloud_gate_slots=9` sets the limit in `config/build_admission.conf`.
+The service reads the limit through its configuration check before each pass.
+The pass uses the checked values if the file changes during that pass.
+The next check handles an unusable cloud setting like other unusable settings.
+
+`cloud_progress.publish(sidecar, progress)` writes `<sidecar>.cloud.json` with the shared atomic writer.
+`CloudProgress(state, size_vcpus, failed_modules, updated_at)` stores the cloud state.
+`CloudState` names `requesting`, `setup`, `running`, and `uploading`.
+`cloud_progress.read(sidecar)` returns `CloudProgress` or `NoCloudProgress`.
+`NoCloudProgress.reason` distinguishes missing data from unreadable data.
+The API supplies `progress_profile.publish_counter` for the route to write module counts.
+The service removes the progress files when the reservation ends.
+
+The queue view and card show cloud rows under `Cloud`, with used slots and total slots.
+Each row shows the unit, step, state, module counts, vCPUs, and elapsed time.
+Missing progress and module counts have explicit display states.
+Waiting rows show their cloud slot wait.
+`cloud_gate_stale_pushes=3` sets the update age threshold in `config/build_admission.conf`.
+The queue reading carries the checked threshold to the display.
+The display reads the push interval from `conf.read("cloud_gate").number("log_push_s")`.
+An older update shows `no update for <age>`.
+`CloudPushIntervalUnavailable` names an unavailable push interval.
+The display omits the stale age when the push interval is unavailable.
+
+The wire envelope uses protocol version 2 and keeps the existing admission code version rule.
+The service accepts client versions 1 and 2.
+The service sends a version 1 refusal when it cannot determine the request version.
+Both client versions can decode that refusal.
+Version 1 view and mine replies carry plain `QueueRead` records without cloud rows.
+Version 2 replies can carry `CloudQueueRead` records.
+The shared codec encodes the new place field and its frozen dataclasses.
+Old requests default to local admission when they omit the place field.
+`CloudSlotWait` carries the used slots and slot limit in wait replies.
+`CloudQueueRead` extends the local queue reading with cloud rows and the slot limit.
+Local queue readings keep their existing wire form when no cloud row exists.
+
 Linux target steps set `BUILDLOG_CALLER=verify-linux`.
 `memory_gate.sh` grants these steps without a local admission socket or a natedev hold check.
 Target slots and the target build budget provide admission there.
@@ -64,7 +124,7 @@ Stable session folders retain their short paths and mode `0700`.
 The session hook defines the session temporary root.
 The admission fixture uses `short_socket_directory(prefix)` for its separate short socket parent.
 The service keeps `admission/state.json` and `admission/queue.json` outside temporary build folders.
-`memory_admit.is_fresh_test()` and the disk sweep read `tmp_sweep.state_dir()` at use.
+`step_estimator.is_fresh_test()` and the disk sweep read `tmp_sweep.state_dir()` at use.
 `tmp_sweep.TARGET_DELETES_NAME` defines the shared deletion record name.
 
 ### Machine side (`/etc/nixos`, natedev only)
@@ -114,12 +174,21 @@ After a restart, the service restores live run places and removes ended run plac
 
 `scripts/build_queue/admission_service.py` is the only live admitter. Its epoll loop owns the queue and reservations.
 `admission_protocol.py` defines every request and reply. `admission_client.py` handles connections, retries, wait output, and bounded queries.
-`memory_admit.py` owns the estimates, readers, pure admission rules, projection, and finalizer.
+`step_estimator.py` owns the estimates. `admission_records.py` owns the shared records, configuration, and wait phrases.
 
-Each admitted run keeps aside `max(0, accepted need − anonymous use)`, plus its held slots.
-Room equals host free memory minus the 3 GiB safety minus run keep-asides minus the CI keep-aside.
+The queue Step column and cards show the project before the step, such as `nateroids nextest`.
+A step without a project name shows only the step.
+An absolute repository path does not supply a project name.
+Matching and history retain the original step name.
+The queue omits a live unowned scope when its run has no reservation and keeps no memory.
+A run with a memory hold shows through that hold.
+The services block and the block for processes from ended builds remain visible.
+The card selector still finds an unowned run by its owner.
+The memory page keeps this memory in Other.
+`memory_admit.py` owns the readers, pure admission rules, projection, and finalizer.
+
+[Free memory, head protection, and step slots](#free-memory-head-protection-and-step-slots) defines the room, keep-asides, and cap.
 The first two minutes use the same calculation. A run never counts its use twice.
-The cap equals admitted anonymous use plus host free memory minus the safety.
 The display shows zero room for a shortfall. The cap explanation shows the shortfall.
 These readings never reduce a promise from history.
 
@@ -229,7 +298,7 @@ Queue views continue to use the service.
 ### Queue lifecycle and calibration
 
 The service records queue events in `admission/queue_times.jsonl` through `append_queue_time`.
-The same record holds Cargo steps and `merge-gate` steps.
+The same record holds Cargo, `targeted-test`, and `merge-gate` steps.
 The append function locks the file and removes incomplete rows before an append.
 At 8 MiB, it retains the newest events from the last 14 days in less than 6 MiB.
 
@@ -270,7 +339,8 @@ The comparative replay does not run. The capacity rule is not adopted.
 
 ### Estimates and keep-asides
 
-The client calls `step_estimate` before admission and after `EstimateExpired`.
+The client imports `step_estimator` inside `step_request`. It calls `step_estimate` before admission and after `EstimateExpired`.
+`system_clock.py` owns the shared `SystemClock`. Cleanup commands load no service or queue view.
 Before each new build estimate, it reads `build_history` from the service, then reads history.
 `StepProfile.build_history_generation` keeps that generation through reconnects and delayed replies.
 The service grants a build only when its estimate generation equals `ServiceState.build_history_generation`.
@@ -281,10 +351,40 @@ A publication retry also advances the generation. The service never prunes or re
 A refresh uses the open admission connection. An unregistered client uses a read-only `build_history` query.
 A pass retries a retained finalization intent even while its owner remains alive.
 It preserves the first `since` and episode across refreshes and reconnects.
+
+With `--wait-events`, the client emits `first`, then `holder <json>`.
+It emits another holder event only when the holder changes.
+The JSON identifies a session (`kind`, `session_id`, `session_name`), a unit (`kind`, `unit`), or no holder (`kind=none`).
+The pass records the holder in `AdmissionWaitSnapshot.holder`.
+An order hold names its protected waiter, including a continuation that requests extra memory.
+A room wait names the run with the largest recorded charge, including held slots.
+A held slot keeps the run's recorded unit after its reservation ends.
+The charge uses grouped anonymous use and the current keep-aside.
+Unavailable run use retains the full keep-aside charge.
+Unregistered CI jobs never become holders.
+Pressure, unreadable host readings, start spacing, and estimate refresh report no holder.
+The holder defaults to `NoHolder` when an older service omits the field.
+An older client ignores the added field and keeps its wait.
+At a service restart, the client reconnects with the same episode and arrival time.
+It prints `admission service restarted; waiting again` once when the connection closes.
+The existing unreachable limit still applies until a valid reply arrives.
+`QueueInputs` and the queue snapshot version remain unchanged.
+
 A fresh nextest estimate expires after one running-pass interval. Other history estimates expire after `estimate_refresh_seconds`.
-A cap-source waiter never expires. A `FixedCapSizing` program holds its cap without a history estimate or refresh.
-The merge gate asks for its own `--memory-cap-mib`, default 6144 MiB.
-Its `ProgramMemoryCap("merge-gate")` evidence produces `the merge gate's memory cap` in explanations.
+A program uses its history estimate and refreshes it under the normal estimate policy.
+The merge gate reads `program_first_peak_gib.merge-gate` at use; its first need is 4 GiB.
+Legacy gate peak records do not size that need. A matching anonymous progress profile supplies the first pass's look-ahead window.
+The gate removes its progress counter before reruns, which keep the full need.
+The merge-gate progress profile key includes `shape` (`tests` or `types`).
+Earlier profiles do not match, and nightly runs use separate profiles.
+It reads `merge_gate_governor_gib` when the gate starts; the initial value is 4 GiB.
+The governor bounds module starts when a CPU slot is free; with no job running, it always permits one job.
+Memory peaks do not kill jobs or fail the gate.
+The gate reports its first need as a fallback and explains any matching anonymous progress window.
+The queue model reads the step names once from `config/build_steps.conf`.
+Renderers use its `StepNames` value without file reads.
+Other sentences read the step names when they need the text.
+Queue tables and cards use the prose name, including `targeted test` for `targeted-test`.
 `step_promise` gives every admitted step a `LifetimePromise` until it ends.
 The run calculation uses the accepted need before tests start.
 For nextest, an observed test phase can select the frozen test-phase need instead.
@@ -417,14 +517,16 @@ CI RAM and unowned scopes reduce host free memory. They do not create a run prom
 The service reads that value once with the other policy values.
 `AdmissionPolicy.ci_memory_margin_bytes` stores its byte value.
 `MemoryRoom.ci_keep_aside` stores the separate `CIKeepAside(bytes)` evidence.
+`MemoryRoom.ci_use` stores readable CI use separately from admitted anonymous use.
 `MemoryRoom.kept` includes run keep-asides and this CI keep-aside once.
 Idle CI and unavailable CI readings add no CI keep-aside.
 CI RAM already reduces host free memory. The room calculation never subtracts it again.
 The service does not require `memory.max` for admission.
-The cap remains anonymous use plus free memory minus safety.
+[Free memory, head protection, and step slots](#free-memory-head-protection-and-step-slots) defines the cap.
 The cap text names the CI keep-aside within kept memory.
-The page shows CI RAM outside the cap and the CI keep-aside beside it, before the cap.
-Neither CI part increases the page's taken total for admitted runs.
+The page shows CI use and the CI keep-aside inside the cap.
+The page and the queue text show CI use under 0.1 GiB in MiB, so idle CI never reads 0.0 GiB.
+The page includes both CI amounts in its taken total. Room and admission do not change.
 `RunningServiceJob` and `IdleService` retain the CI job state.
 Anonymous scope counters use the same measure as the history peaks.
 Missing anonymous counters keep the full accepted need aside and make the cap unavailable.
@@ -482,10 +584,21 @@ The scoped wrapper requires a published sidecar and a live holder before program
 ### Startup, cut-over, and rollback
 
 The system socket starts the system service as the user. The service runs outside `builds.slice` with `OOMScoreAdjust=-900`.
-It clears the outage claim and sends `READY=1` after listener setup.
+It sends `READY=1` after listener setup.
+The main loop clears the outage claim once after `silence_seconds` of continuous operation.
+It uses the last usable configuration and retries a failed clear on a later loop.
+A shorter service start preserves the claim.
 Source changes stop the service after the settle interval. A missing source also counts as a change.
 A restored head override receives reconnect grace only after the listener is ready.
-`down-alert` waits two minutes, claims `build-admission`, and sends one outage push. A later start clears that claim.
+`down-alert` waits `silence_seconds` and claims `build-admission`.
+It sends the outage message to the `builds` session first.
+The message names the journal command and the restart command.
+If the result is not `sent`, it sends an `alert.blocked` phone push.
+The phone action is `sudo systemctl restart build-admission.socket build-admission.service` on natedev.
+The push clears when `admission_client.py view`, through `scripts/lib/py`, succeeds.
+The sender releases the claim only when both sends return `failed`, `refused`, or `retry`.
+Every other outcome preserves the delivered claim.
+The sender prints each send outcome header to the journal.
 
 The builds showrunner owns cut-over. Workers do not change live units or admission state.
 
@@ -659,11 +772,109 @@ The hourly task can retry the exchange.
 
 **Holder files.** One file per holder in `BUILD_HOLD_DIR` (default `~/.local/state/build-hold/`), one JSON line `{holder, since, for, release_eta, keep}`. `keep` holds PID/start-time pairs and defaults to empty for old files. Installed scripts refuse set directory variables or a changed `HOME`; unset the variable or use a shell with the user's home. The shell guard also refuses read-only `HOME`. The legacy free-text form reads, and an unreadable or malformed regular file stays a hold. Types include `HolderIdentity(key, name)`, `HoldState = NoHolders | ActiveHolders`, `Holder(name, since, purpose, release, key, keep)`, `ReleaseEta = KnownReleaseEta | UnknownReleaseEta`, and `ReleaseRequest = NoReleaseEta | ClockReleaseEta`. `write_hold` and `start_hold` take the resolved identity. Holder files supply state to status, dailies and Rust release checks. `natedev_holds(directory) -> NatedevHolds(in_force)` reads holder files once and never reads the cycle. Every present holder file is in force, even when the cycle has `released_at` or `release_started_at`. There is no releasing state. Only removal ends that holder's hold.
 
-**Hold enforcer.** A holder file always means a hold; cycle release fields grant nothing. `hold_enforcer.py run` checks once a second. It reads the cheap process table once, then environments for processes owned by this user and arguments and cwd for candidates, their ancestors and call-id processes. A process with `BUILDLOG_CALL_ID` uses `step_record.read`: live states `on_mac`, `waiting_hold`, `waiting_mac` and `local_noncompiling` continue; `on_natedev` children stop during a non-holder hold. The live record’s controller PID and start time always continue so verify can route the step again. A missing, stale or unreadable record grants no permission. Only processes without a call id use command-name rules. It matches both argv and executable basenames, including absolute Rust toolchain, cargo bin and Nix paths, under direnv, systemd-run or a Codex sandbox. Runs include building cargo verbs (the shared set in `hold_applies.py`), nextest, compilers, clippy-driver, cargo-tile-real, session-owned rust-analyzer, Python unittest/pytest or test_*.py files, basedpyright, and shells running test_*.sh. Mac coordination scripts, version probes, cargo lookup verbs and basedpyright-langserver pass. The sole holder’s runs, its `--keep <pid>` list and descendants (PID and start time checked), user terminal or desktop app runs without agent ancestors or session markers, shared sccache-server work, and the enforcer and its ancestors may continue. A run from before `since` has no special permission. Every other run gets the holder and reason on stderr, best effort, then SIGTERM root first through descendants and SIGKILL for survivors after two seconds, with start time checked before each signal. A route state change does not cancel a pending kill for an already stopped identity. New Mac children stay protected. A release, sole-holder ownership or explicit keep still cancels that kill. Each stopped root writes a permanent `hold_build` row through the shared audit writer: schema 21 adds `action=audit|stopped`, with old rows read as audit. The row also carries the stopped root’s `call_id` from `BUILDLOG_CALL_ID`, or an empty value, so verify can find a stop after the hold ends. Its owning session registers for one release notice. `verify.sh` and `merge_gate.py` without a call id are never signalled: both wait at their own hold gates. With a call id, the record decides; verify routes eligible steps to the Mac and waits for other steps. Their running natedev test and type-check children still stop and write stopped rows with PID and start time; the merge gate can read those rows and rerun the stopped modules after release. No run is paused: cargo must release `/dev/steve` slots and locks, and wall-clock limits keep running. `hold` starts the user unit `build-hold-enforcer` with absolute paths, keeps an active unit, or starts a detached process without systemd-run or a user bus. `BUILD_HOLD_ENFORCER_DIR` holds its singleton lock; no paused record or thaw exists. `run` exits when no holder file remains. `scan` is read only and prints allowed, kept, or would stop, with owner, reason and pass time; status and the hold-start audit print kept runs and `--keep <pid>` for runs that would stop. A read-only pass after release on 2026-10-28 took 0.585030 s over 1,736 processes; this is one measurement, not a pass-time limit. Other users’ processes, such as the CI runner, are outside its reach; runs shorter than one pass can finish first, so call guards refuse those starts.
+### Step state publication
 
-**Build call guard.** `settings.json` installs `scripts/hooks/pre-tool-use-build-hold-guard.sh` for Bash PreToolUse. The Bash front reads stdin once and starts no Python when the hold directory has no entry or the input has neither `cargo` nor `merge_gate`. An unreadable hold path also starts the decision reader. Otherwise it passes the same input to `pre-tool-use-build-hold-guard.py` and relays its output and status. The guard refuses raw building `cargo` verbs (including short forms and `+toolchain`) while a non-holder natedev hold applies; removal ends that holder’s hold. All `verify.sh` calls pass, with or without a step record: verify routes eligible steps to the Mac during the hold and waits for other steps. Non-building calls pass. The Python guard checks the command through `tool_call_text.py`, checks for a hold entry, then imports `scripts/build_hold/hold_applies.py` in the same process. The helper uses `target_state(local_target())`, `natedev_holds` and `caller_holds_only_own()`. The sole in-force holder may build. Other sessions see `natedev builds are held by <holder>. Keep working, writes included. Use verify.sh: eligible steps go to the Mac; other steps wait. Raw cargo and merge gates must wait for the hold to end.` Only in-force holders are named, with `holder_text`. The helper exits 0 with that refusal on stdout, 1 silently when builds may run, or 2 with a read error on stderr. The guard denies hold read errors and any other exception in its decision path with a one-line reason that names the failed read. Only an explicit allow decision permits a build; no wait is registered.
+`step_record.py write --report` writes the JSON record once for each verify call.
+It prints the clock offset in microseconds, the JSON path, and the sibling state path.
+`initialize_step_record` saves those values and the original JSON text.
+Bash uses `cmp` to compare the JSON bytes with the saved bytes before each state publication.
+A missing, damaged, or changed record refuses the step with exit 2.
+
+`publish_step_state` writes a state word and an optional target to `.step-<call id>.state-$RANDOM` beside the record.
+Bash replaces `<call id>.state` with `mv` in the same directory.
+It starts no Python process and performs no fsync for this temporary call state.
+The cleanup removes the JSON record, the state file, and this call’s `.step-<call id>.state-*` files, in that order.
+The `state` and `remove` Python CLI verbs no longer exist.
+
+`step_record.read` opens the state file before it reads the JSON record.
+It keeps that file open through the join, then closes it on every path before process validation.
+Without a state file, the reader keeps the original row.
+The open state file supplies the UTC update time from its modification time.
+An unknown state word returns `UnreadableRecord` through the existing validation path.
+`on_mac` selects `mac`, `on_natedev` selects `natedev`, and `on_ssh` selects its supplied target.
+Other state words clear the selected target.
+Readers continue to find records through `*.json` only.
+
+A tree-writing step publishes `writes_tree <state>` with an optional target for its whole lifetime.
+The reader applies `natedev_only` with the reason `step writes the tree`, then joins the state and target normally.
+The state remains visible so the hold enforcer can stop compiling steps in `on_natedev`.
+A bare `writes_tree` has no state word and returns `UnreadableRecord`.
+After the step, `run()` publishes `local_noncompiling` to restore the call's original decision.
+The token boundary and the per-step release remain unchanged.
+After a crash, readers ignore the record when its process identity is stale.
+
+**Hold enforcer.** A holder file always means a hold.
+Cycle release fields grant no permission.
+`hold_enforcer.py run` checks once each second.
+It reads the cheap process table once.
+It then reads environments for this user's processes.
+It reads arguments and working folders for candidates, their ancestors, and processes with call ids.
+
+A process with `BUILDLOG_CALL_ID` uses `step_record.read`.
+Live states `on_mac`, `waiting_hold`, `waiting_mac`, and `local_noncompiling` continue.
+Children in `on_natedev` stop during another holder's hold.
+The live record's controller PID and start time always continue, so verify can route the step again.
+A missing, stale, or unreadable record grants no permission.
+Only processes without a call id use command-name rules.
+
+The enforcer matches arguments and executable basenames.
+This includes absolute Rust toolchain, cargo bin, and Nix paths under direnv, systemd-run, or a Codex sandbox.
+Matches include building cargo verbs from the shared set in `hold_applies.py`, nextest, compilers, clippy-driver, cargo-tile-real, and session-owned rust-analyzer.
+They also include Python unittest, pytest, `test_*.py`, basedpyright, and shells that run `test_*.sh`.
+Mac coordination scripts, version probes, cargo lookup verbs, and basedpyright-langserver continue.
+
+The sole holder's runs continue.
+Its `--keep <pid>` list and descendants continue after PID and start-time checks.
+User terminal and desktop app runs continue without agent ancestors or session markers.
+Shared sccache-server work, the enforcer, and its ancestors continue.
+A run from before `since` has no special permission.
+
+Every other run receives the holder and reason on stderr when possible.
+The enforcer sends SIGTERM to the root first, then its descendants.
+After two seconds, it sends SIGKILL to survivors.
+It checks the start time before each signal.
+A route state change does not cancel a pending kill for an identity that the enforcer already stopped.
+New Mac children stay protected.
+A release, sole-holder ownership, or an explicit keep still cancels that kill.
+
+Each stopped root writes a permanent `hold_build` row through the shared audit writer.
+Schema 21 adds `action=audit|stopped`; readers treat old rows as audit rows.
+The row carries the root's `call_id` from `BUILDLOG_CALL_ID`, or an empty value.
+Verify can thus find a stop after the hold ends.
+The owning session registers for one release notice.
+The enforcer does not signal `verify.sh`, `targeted_test.py`, or `merge_gate.py` without a call id.
+Each waits at its own hold gate.
+With a call id, the record decides.
+Verify routes eligible steps to the Mac and waits for other steps.
+Their running natedev test and type-check children still stop.
+They write stopped rows with the PID and start time.
+The merge gate reads those rows and reruns the stopped modules after release.
+No run pauses: cargo must release `/dev/steve` slots and locks, and wall-clock limits continue.
+
+`hold` starts the user unit `build-hold-enforcer` with absolute paths, or keeps an active unit.
+Without systemd-run or a user bus, it starts a detached process.
+`BUILD_HOLD_ENFORCER_DIR` holds the singleton lock.
+No paused record or thaw exists.
+`run` exits when no holder file remains.
+`scan` reads state without changes and prints allowed, kept, or would stop, with the owner, reason, and pass time.
+Status and the hold-start audit print kept runs and `--keep <pid>` for runs that would stop.
+A read-only pass after release on 2026-10-28 took 0.585030 seconds over 1,736 processes.
+This measurement sets no pass-time limit.
+Other users' processes, such as the CI runner, are outside its reach.
+Runs shorter than one pass can finish first, so call guards refuse those starts.
+
+**Build call guard.** `settings.json` installs `scripts/hooks/pre-tool-use-build-hold-guard.sh` for Bash PreToolUse. 
+The Bash front reads stdin once.
+It starts no Python when the hold directory has no entry.
+It also starts no Python when the input has none of `cargo`, `merge_gate`, or `targeted_test`.
+ An unreadable hold path also starts the decision reader. Otherwise it passes the same input to `pre-tool-use-build-hold-guard.py` and relays its output and status. The guard refuses raw building `cargo` verbs (including short forms and `+toolchain`) while a non-holder natedev hold applies; removal ends that holder’s hold. All `verify.sh` calls pass, with or without a step record: verify routes eligible steps to the Mac during the hold and waits for other steps. Non-building calls pass. The Python guard checks the command through `tool_call_text.py`, checks for a hold entry, then imports `scripts/build_hold/hold_applies.py` in the same process. The helper uses `target_state(local_target())`, `natedev_holds` and `caller_holds_only_own()`. The sole in-force holder may build. Other sessions see `natedev builds are held by <holder>. Keep working, writes included. Use verify.sh: eligible steps go to the Mac; other steps wait. Raw cargo and merge gates must wait for the hold to end.` Only in-force holders are named, with `holder_text`. The helper exits 0 with that refusal on stdout, 1 silently when builds may run, or 2 with a read error on stderr. The guard denies hold read errors and any other exception in its decision path with a one-line reason that names the failed read. Only an explicit allow decision permits a build; no wait is registered.
 The cargo verbs include `mend` and `miri`; the guard does not match `verify.sh` step names or options.
-The guard also refuses `merge_gate.py` in every mode, called directly, through Python or through `lib/py`, with the same hold decision; its refusal says the gate waits for the hold to end and to run it after the release. Quoted mentions and written examples pass. Codex workers get the same Bash front and guard through `scripts/hooks/codex_hooks.py`; unit run markers let workers of the sole holder build.
+The guard also refuses `merge_gate.py` and `targeted_test.py` in every mode under the same hold decision.
+This applies to direct calls and calls through Python or `lib/py`.
+The refusal tells the caller to run after the hold ends.
+Quoted mentions and written examples pass.
+Codex workers use the same Bash front and guard through `scripts/hooks/codex_hooks.py`.
+Unit run markers let workers of the sole holder build.
 
 **CLI.**
 
@@ -732,6 +943,7 @@ After the file is gone, `notify_release` sends one notice to each recorded recip
 
 While `/` has less free than `sweep_free_floor_gib.<host>` in `config/lint.conf` (300 GiB on natedev), `hold_floor` removes build output from the cargo target directories under `sweep_floor_roots` that no build holds. It removes only the shortfall (`budget = total - (floor - scanned_free)`, with `scanned_free` read after the scan that measures the caches, so space another process frees during the scan is not taken again; at or above the floor after the scan it takes nothing), from idle targets in last-use order, oldest first, across all locations (`/tmp` targets have no special priority; `build-targets.md` → Build output retained by the sweep):
 
+- A target that goes away during a pass counts as done. The pass finishes with status 0. Its bytes do not count as removed.
 - **What a target is.** `is_cargo_target(directory)`: a directory holding `.rustc_info.json`, or cargo's `CACHEDIR.TAG` (matched on its line `# This file is a cache directory tag created by cargo.`) beside a build tree (`build_trees`). `target_dirs()` and `disk.py`'s `outside_directory_bytes()` both call it. Either marker alone misses targets: into a folder cargo creates, the tag and `debug/` appear at once and `.rustc_info.json` comes when the first build ends, or never; into a folder that already exists (mend's wrapper makes hana worktrees' first) cargo writes `.rustc_info.json` early and no tag.
 - **Targets in use.** A target whose cargo locks a build holds is busy, and so is one a live process uses (`process_uses`, 2026-10-15): its `/proc/<pid>/exe`, `cwd` or a `maps` file lies under the target, or it is a cargo-nextest run (`nextest` as its first argument, or argv[0] `cargo-nextest`) whose `--target-dir`, `CARGO_TARGET_DIR`, or else the directory beside a target that holds its cwd, names it. nextest's run phase holds no cargo lock and executes binaries from `deps/`; a floor sweep at test 2105 of 4072 left 1965 hana tests failing to exec. `hold_floor` prints `lint sweep: pid <pid> <how>; <target> left alone` and counts it with the held targets; `sweep_workspace` prints `… skipped` and sweeps nothing. A running app keeps its target too. An exe or mapped file that reads `(deleted)` is no use (2026-10-21): the sweep can neither take nor break it, so a stale process whose exe and mappings under a target are all deleted, with its `cwd` outside, leaves the target idle (a hung `cargo-berth resolve` had held 26 GiB of cargo-liner-berth's target for three days). One scan of `/proc` covers every target (0.21 s over 110 targets and about 600 readable processes); it runs only below the floor. Without `/proc` (the Mac) nothing counts as in use.
 - **Roots.** `sweep_floor_roots` is `~/rust`, `~/.local/state`, `~/.cache` and `/tmp`. `~/.cache` came in on 2026-10-21, after 421 GiB of idle targets under `~/.cache/trace-targets` had stayed unseen; it adds 0.4 s to the walk (21,000 folders). `~/.cache/sccache` holds no `.rustc_info.json` and no cargo tag, so it is never a target.
@@ -759,7 +971,47 @@ The audit and repository scan share `scratch.conf` `repo_skip`.
 The audit also keeps the configured `scratch.visible_root()`.
 `rust_roots.txt` remains a list file. All moved values retain their previous defaults.
 
-Agents made loose repo copies, repros and test trees in /tmp and ~/rust, and nothing removed them; sessions run for weeks, so a session end is no cleanup point (user, 2026-10-26/27). Each scratch folder now belongs to a task, and the task's end removes it. `scratch.py new [--task <task> | --until <when>] [--name <word>] [--visible]` makes one and prints its path; `adopt`, `hold`, `release`, `renew`, `end` and `list` do the rest. A task is `run:<run id>`, which `end_session.sh` ends; `phase:<unit>/<phase>`, which `merge_checkpoint.py` ends after it records the phase's code checkpoint; `gate:<id>`, which the gate's caller ends; `row:<showrunner>-C<n>`, which `change_review.py verdict` ends whichever way the verdict goes; or `until:<time>` (`--until YYYY-MM-DD [HH:MM]`), which the hourly tmp sweep ends when the time passes. Creation and hand-over accept a `phase:<unit>/<phase>` task only when the phase id is in that unit's recorded plan. A missing or unreadable plan refuses the new task and names the cause; use a real phase id, `gate:<id>` or `--until <when>`. Existing tasks with an invalid phase id can still update and end. With no task a folder lasts 24 h. The sweep keeps a task's folder while the task is open and removes any after 7 idle days. `scratch.py hold <path> --reason <why>` (or `change_review.py add --hold <path>`) keeps a folder where it is until its task ends, recorded in `~/.local/state/scratch/holds.json`; `end` removes it then, unless a repo in it holds work on no remote (uncommitted changes, a stash, commits on no remote), which stays with its hold marked ended. A folder is `/tmp/claude/scratch/<kind>-<name>-<word>-<6 chars>`; `--visible` (rows only) puts it at `~/rust/repro/<showrunner>-C<n>-<word>`, where cargo-port lists it. Each holds `.scratch.json` with its task, maker session and times. A git worktree goes through `git worktree remove`. A failed removal warns and never fails the merge or the verdict.
+Agents made loose repo copies, repros and test trees in /tmp and ~/rust, and nothing removed them.
+Sessions run for weeks, so a session end is no cleanup point (user, 2026-10-26/27).
+Each scratch folder belongs to a task. The task's end removes its folders.
+`scratch.py new [--task <task> | --until <when>] [--name <word>] [--visible]` makes a folder and prints its path.
+`scratch.py list` shows each folder's task and last change.
+The other commands are `adopt`, `hold`, `release`, `renew` and `end`.
+
+Tasks use these forms:
+
+- `run:<run id>` ends through `end_session.sh`.
+- `phase:<unit>/<phase>` ends through `merge_checkpoint.py` after the phase's code checkpoint.
+- `gate:<id>` ends through the gate's caller.
+- `row:<showrunner>-C<n>` ends through `change_review.py verdict` after either verdict.
+- `until:<YYYY-MM-DDTHHMMZ>/<id>` ends through the hourly temporary sweep when its time passes.
+
+`--until YYYY-MM-DD [HH:MM]` selects a deadline in the user's time zone.
+Each call creates a random task id from `scratch.conf` `suffix_length` characters.
+Folders with the same deadline have separate tasks.
+The folder name includes the deadline stamp but excludes the task id.
+With no task, each folder gets a separate deadline task that lasts 24 hours.
+The deadline reader also accepts old tasks without an id.
+`scratch.py end --task <task>` selects folders by their exact task.
+
+Creation and transfer accept a `phase:<unit>/<phase>` task only when the phase id appears in that unit's recorded plan.
+A missing or unreadable plan refuses the new task and names the cause.
+Use a recorded phase id, `gate:<id>` or `--until <when>`.
+Existing tasks with an invalid phase id can still update and end.
+The sweep keeps a task's folder while the task remains open.
+It removes folders after seven idle days, even when the task remains open.
+
+`scratch.py hold <path> --reason <why>` keeps a folder at its path until its task ends.
+`change_review.py add --hold <path>` also creates a hold.
+The hold record stays in `~/.local/state/scratch/holds.json`.
+`end` removes the held folder unless a repository in it has uncommitted changes, a stash or commits absent from all remotes.
+The folder stays with its hold marked ended.
+
+A folder uses `/tmp/claude/scratch/<kind>-<name>-<word>-<6 chars>`.
+`--visible` puts a row task's folder at `~/rust/repro/<showrunner>-C<n>-<word>`, where cargo-port lists it.
+Each folder holds `.scratch.json` with its task, maker session and times.
+A Git worktree uses `git worktree remove` for removal.
+A failed removal prints a warning and does not fail the merge or the verdict.
 
 The scratch guard, a `PreToolUse` hook on `Bash` for Claude Code (`settings.json`) and Codex (`codex_hooks.py`), refuses a command that makes a new folder directly in /tmp, `$TMPDIR`, /tmp/claude, ~/rust or ~/rust/scratch (and judges a Write or NotebookEdit file path where its matcher names them): mkdir, mktemp -d, git clone, git worktree add, cp -r/-R/-a, rsync, cargo new/init, and tar extraction into a root. Allowed there: the session scratchpads (`/tmp/claude-<uid>`), `/tmp/claude/unit`, `/tmp/claude/delegate`, `/tmp/claude/session` and both scratch roots; ~/worktrees is no root, and a `make_a_worktree` command is never judged. A heredoc body, a quoted argument and a comment are data. A path the hook cannot follow (a variable other than HOME or TMPDIR, a command substitution, a command inside `bash -c` or ssh) is allowed, and the hourly tmp sweep is the backstop. A `TMPDIR` inside a session scratchpad, a session temp root or a run folder is no root.
 Before its checks, the scratch guard uses the session-start path helper to restore only the input session id's missing temp folder with mode `0700`; an existing folder costs one `os.stat`, a missing or invalid id creates nothing, and a repair error allows the tool call to proceed to the checks.
@@ -783,9 +1035,37 @@ The daily folder audit (`scripts/lint/folder_audit.py --send`, a `nate.jobs` job
 
 ### `verify.sh` example guard
 
-`verify.sh build <pkg> [--bin <name> | --example <name>] [--release] [--features <list>]` builds what a smoke run or live shot launches: `BUILD_TARGETS_PY` reads the package's bins (or the one named bin or example, with its required features), `take_build_args` refuses a package with no binary and a target it lacks (exit 2), and `run cargo build --workspace --bin <name>…` builds under the workspace's feature set with the build hold, the cargo token, memory admission and a call record (verb `build`). `print_built_binaries` then prints `binary: <target_directory>/<debug|release>/[examples/]<name>` for each one. It has no pass record and no Mac offload. A helper's raw `cargo build` had needed the user's approval by hand on 2026-10-23; `/unit:direct` gives helpers this line.
+`verify.sh build [<pkg>] [--bin <name> | --example <name>] [--release] [--features <list>]` builds the selected binaries or example.
+`BUILD_TARGETS_PY` reads the package's binaries, or every member's binaries when no package is given.
+A named example supplies its required features.
+`take_build_args` refuses a missing target or a package without a binary with exit 2.
+The Cargo build keeps `--workspace` and the workspace's feature set.
+A named package owns feature names without a slash; without a package, feature names pass unchanged.
+The build uses the build hold, cargo token, memory admission, and a call record with verb `build`.
+`print_built_binaries` prints `binary: <target_directory>/<debug|release>/[examples/]<name>` for each target.
+The build saves no pass record and does not use Mac offload.
+Use this command for smoke and shot helpers.
 
-A gate run (`test <pkg>` with no `--filter` and no named target, `--features` allowed) and `final` read `cargo metadata --no-deps --format-version 1` once into `GATE_METADATA` and run `UNTESTED_EXAMPLES_PY` before the cache lookup and any build. An example target is an offender when a source line matches `^\s*#\[(cfg\(test\)|(\w+::)*test)\]`, whatever its `test` setting; a directory example (`examples/<dir>/main.rs`) is scanned through every `.rs` under its directory. An example that sets `test = true` is an offender too. A test offender prints `example <name> holds a test: <file>:<line> has <attribute>, and examples carry no tests.` and `move it into <package>'s src/ or tests/, or delete it.`; a `test = true` offender prints `example <name> sets test = true in <manifest>, and examples carry no tests.` and `remove test = true from its [[example]] entry.`. After all offenders, the call exits 2 with no cargo call besides `metadata`. `read_metadata` reuses `GATE_METADATA`. `verify.sh example-test` exits 2 with `verify.sh: example-test is removed: examples carry no tests (user, 2026-10-04).` before anything else.
+A gate run is `test [<pkg>]` without `--filter` or `--test`; `--features` is allowed.
+A test without a package uses the workspace figure for memory admission and estimates.
+Gate runs and `final` read `cargo metadata --no-deps --format-version 1` once into `GATE_METADATA`.
+They run `UNTESTED_EXAMPLES_PY` before the cache lookup and any build.
+An example is invalid when a source line matches `^\s*#\[(cfg\(test\)|(\w+::)*test)\]` or its manifest sets `test = true`.
+The scan reads every `.rs` file inside a directory example (`examples/<dir>/main.rs`).
+Each source violation prints a reason and a correction:
+
+- `example <name> holds a test: <file>:<line> has <attribute>, and examples carry no tests.`
+- `move it into <package>'s src/ or tests/, or delete it.`
+
+Each manifest violation prints:
+
+- `example <name> sets test = true in <manifest>, and examples carry no tests.`
+- `remove test = true from its [[example]] entry.`
+
+After all violations, the call exits 2 with no Cargo call except `metadata`.
+`read_metadata` reuses `GATE_METADATA`.
+`verify.sh example-test` exits 2 before any work.
+It prints `verify.sh: example-test is removed: examples carry no tests (user, 2026-10-04).`.
 
 ### Codex launcher capacity (`scripts/agents/codex_mesh.py`)
 
@@ -894,7 +1174,31 @@ A cleanup plan is written to a temporary file and linked into place only when no
 Python queue layouts, evidence tables and production dailies share `scripts/lib/terminal_cells.py::terminal_width`: combining marks occupy zero cells and wide characters two.
 
 **One decision pass.** `admission_pass(inputs, now, limits, policy)` returns decisions, blockers, proposals, the head cause, run keep-asides, and start spacing.
-The service commits proposals and stores the pass. Queries project that pass through `queue_read_from_pass`.
+The service commits proposals and stores the pass.
+It encodes View and Explain replies on the first request after each pass.
+It keeps those bytes until the next pass ends.
+Mine keeps the full reading and reuses the View encoding.
+The protocol encodes each reply tree once.
+A pending configuration still causes a pass before a query reply.
+One reader thread collects process, scope, pressure, and memory evidence.
+The reader publishes physical memory and sampler observations under a lock and wakes the service loop.
+Each reading contains the monotonic time when its read started.
+The loop applies the current peak hold and frozen test-phase need at each pass.
+The reader applies no reservation policy.
+The loop combines the latest reading with its current reservations and waiters.
+A reading can be one pass cadence old.
+The reader uses `waiting_pass_seconds` while steps wait and `running_pass_seconds` otherwise.
+A change from the running cadence to the waiting cadence wakes the reader.
+The service collects the first reading before it starts the serving loop.
+The reader starts when an unusable configuration becomes usable.
+An unknown owner requests an early reading.
+A deferred request uses only a reading that starts at or after the request arrives.
+An older reading leaves the request deferred.
+The reader sends exceptions to the loop and continues at the configured cadence.
+Direct test instances can supply a fixed reader.
+Persistence reuses each unchanged record's encoding.
+The state bytes, atomic writes, and lifecycle commit order stay the same.
+`query_timeout_seconds` stays 0.5.
 `QueueExplanation.decided_from` keeps the inputs for release calculations. Those calculations admit nothing and write nothing.
 `apply_queue_priority` supplies the priority order. The generic codec stores domain records for replies and service state.
 
@@ -956,7 +1260,7 @@ The nix-darwin job is a separate deployment step.
 `memory_room` calculates room from one captured admission pass.
 For each admitted run, kept bytes equal `max(0, selected need − anonymous use)` plus held slot bytes.
 Room equals free memory minus `safety_gib`, run keep-asides, and the CI keep-aside. The safety is 3 GiB.
-The cap equals our anonymous use plus free memory minus safety. It does not limit an estimate.
+The cap equals our anonymous use plus CI use plus free memory minus safety. It does not limit an estimate.
 The first two minutes use the same formula. Use and kept bytes never count the need twice.
 
 The first eligible run follows queue priority, first run arrival, and PID.
@@ -987,9 +1291,128 @@ Slots are not saved. Restart keeps active reservations and run order, but drops 
 `queue_evidence.room_text` supplies the captured cap calculation to the view, card, and memory report.
 The view shows zero room during a shortfall and records that shortfall in the cap explanation.
 The queue view and cards show captured process ids as `pid N` for each process row.
+Running rows show a `machine` column after `min` and before `pid`.
+The column uses `scripts.buildlog.store.host_name()`, the shared short host name.
+A narrow view omits the machine column before it reduces name space.
+Waiting rows have no machine value. Services lines do not change.
+The admission service admits each running step on its own machine. No per-row protocol field is added.
 `keep_aside_text` explains each admitted run's need, anonymous use, slot bytes, and kept bytes.
 `RoomCheck.basis` records `Fits`, `StartsAlone`, `WithinSlot`, `OverrideRoom`, or `DoesNotFit` in the admission walk.
 `admission_pass` records one `HeadCause` on `HeadAdmissionStatus`.
 `HeadExplanation` retains that cause for the view and release advice.
 The formatters read the captured cause and room without a second room calculation.
 No adaptive controller, fixed admission limit, order window, CI growth promise, or test-phase estimate worker remains.
+
+### Progress memory profiles
+
+Cargo build, check, clippy, mend, nextest, and merge gates record attributed anonymous use in five-percent phase bins.
+Each bin selects the Nth-highest run value from matching completed profiles.
+`progress_profile_rank=2` sets N in `config/build_admission.conf`.
+A bin with fewer than N measurements uses its lowest measured run value.
+Rank 1 selects the highest run value.
+The service validates the rank through its existing configuration check before each pass.
+It rebuilds merged profiles when the rank changes.
+The service applies each step's recorded headroom rule to the highest selected bin within its look-ahead window.
+`progress_lookahead_percent` is read at use; its initial value is 20.
+The window crosses Cargo phase boundaries, including repeated build phases.
+The merge gate window stops at the end of `suites:1`, even when history contains rerun phases.
+Reruns without a measured window retain the full need. Each step has its own history key.
+Missing counters, profiles, or anonymous readings retain the full need.
+Each saved record names its peak reading source with `ScopeReading` or `ProcessTreeReading`.
+`ScopeReading` stores the scope directory. `ProcessTreeReading` stores the process ids.
+At each new run peak, the service records the phase, bin, anonymous bytes, and source processes.
+Each `ProfileProcess` stores its pid, command arguments, and `RssAnon` bytes.
+Scope evidence includes all recorded scope members, including helpers outside the original process tree.
+The service reads process commands and `RssAnon` only for a new highest run value.
+Lower samples, equal samples, and lower bin peaks retain the previous process evidence.
+Active records retain this evidence across service restarts and completion.
+Old records remain readable with `ReadingSourceNotRecorded` and `PeakProcessesNotRecorded`.
+Unavailable process commands and anonymous readings have named states with their read errors.
+The nextest test phase keeps its frozen baseline and margin as the fallback. Its live test peak remains a floor.
+CI keeps its configured margin until registered CI steps supply counters and profiles.
+`lint/invoke.sh` enables Cargo progress in its capture log. It removes redraw frames from worker output.
+Cargo-tile enables progress for its own captures. The cargo wrapper does not enable progress for other pipes.
+
+
+### CI cargo admission
+
+The pinned client entry is `scripts/build_queue/ci_cargo_front.py`.
+The runner package exposes this entry as `bin/cargo` from the pinned source tree.
+The package wrapper passes `--front "$0"` before the cargo arguments.
+Its PATH entry precedes the cargo-tile shim, which precedes the real cargo.
+The front excludes that wrapper and removes its directory from the child's PATH.
+An explicit `--cargo <shim> -- <arguments>` entry also selects the next shim.
+Building calls hold one reservation until the child and its descendants end.
+Non-building calls execute the next cargo without admission.
+A direct call to a cargo executable outside this front bypasses admission.
+Calls inside the admitted child tree retain the same reservation.
+
+`ServiceEstimateRequest` carries the owner, repository, worktree, arguments, runner, and job.
+The service reads configuration and history with its own account.
+It uses `step_estimator.step_estimate` with a recorded repository location.
+The service refreshes the estimate on each acquisition retry.
+Build estimates use the current service history generation.
+CI uses `NoRun`, so it claims no run place or continuation slot.
+The configured `ci_label` expands `RUNNER_NAME` and `GITHUB_JOB`.
+The configuration reader validates the template before the service uses it.
+An invalid template uses a committed value through the normal configuration reader.
+Without a usable committed value, configuration resolution fails as for other invalid values.
+The queue records this label as the session name.
+
+`SO_PEERCRED` supplies the connecting account before replay lookup.
+Authorization also precedes caller version records and saved state changes.
+Runner request ids start with `uid:<account>:`.
+The service checks the owner's account and process start time.
+It also checks a caller-named run's account and process start time.
+Runner accounts cannot change priority or admit the head.
+Cleanup and width changes require a reservation from the same account.
+The account prefix also binds replay and pending priority access.
+Saved reservation and ledger records retain their existing shapes.
+The service wraps saved grants as `RunnerAdmitted` only when it sends them.
+
+The runner owns its child process tree; it creates no user-manager scope.
+The front adopts orphaned descendants before it starts cargo.
+The cargo child sets a parent death signal before exec.
+SIGKILL of the front also kills that cargo process.
+Cargo descendants do not inherit that signal and can survive a SIGKILL of the front.
+`QueuePlace` tracks descendants and terminates surviving descendants before release.
+The runner samples anonymous use in its process tree.
+The service also samples anonymous use during each admission pass.
+The service reads the runner's peak and wave files beside its sidecar.
+It copies the maximum into its own peak files before finalization.
+The service writes completed and failed peaks through the normal history path.
+The runner creates its sidecar and progress counter in a temporary directory.
+The directory mode is `0755`; the sidecar, counter, peak, and wave modes are `0644`.
+The runner account owns these files; the service reads them without group write access.
+The service completes release when sample deletion fails with `PermissionError`.
+The front removes its temporary directory after release.
+A front killed by SIGKILL leaves that directory for the existing sweep.
+The service reads the counter through the sidecar path in the reservation.
+The child alone receives `CARGO_TERM_PROGRESS_WHEN=always` and `CARGO_TERM_PROGRESS_WIDTH=80`.
+The shared progress reader and profile history apply the existing look-ahead rule.
+A missing counter or profile retains the full need.
+
+Acquisition uses named protocol timing without a local configuration read.
+The deadline covers closed connections and connections without replies.
+A valid reply renews the deadline.
+Cleanup uses the separate timing from the grant.
+
+CI memory keeps the mixed accounting rule during activation.
+Registered process trees count through their reservations.
+The CI slice reading subtracts their anonymous use.
+The CI keep-aside remains while any busy runner has no registered tree.
+The keep-aside applies once to a mix of registered and unregistered jobs.
+`ci_memory_margin_gib` remains in configuration until the approved activation step.
+
+NixOS activation remains natedev's work.
+The socket uses group `build-admission` and mode `0660`.
+The group includes natepiano and the hana runner accounts.
+Runner sandboxes need `BindPaths=/run/build-admission` when `/run` is hidden.
+`ADMISSION_SOCKET` is needed only for a nondefault socket path.
+The package must contain the pinned source tree and a Python interpreter.
+No client code is copied into `/etc/nixos`.
+The service must read runner `/proc` records and runner temporary counter files.
+Set `TMPDIR` to a shared runner-owned directory if `PrivateTmp` hides the default directory.
+For example, `/run/build-admission/ci/<uid>` uses mode `0755` and the runner's ownership.
+The fixed slice limits remain `MemoryMax=34G` and `MemorySwapMax=2G`.
+The service authorization and protocol must be live before runner socket access starts.

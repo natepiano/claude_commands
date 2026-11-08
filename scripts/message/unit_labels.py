@@ -2,22 +2,17 @@
 from __future__ import annotations
 
 import json
-import sys
 import time
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TypedDict, cast
 
-SCRIPTS = Path(__file__).resolve().parents[1]
-for directory in (SCRIPTS / "message", SCRIPTS / "production", SCRIPTS / "herdr", SCRIPTS / "lib", SCRIPTS.parent):
-    if str(directory) not in sys.path:
-        sys.path.insert(0, str(directory))
 from scripts.production import staff, showrunners
 from scripts.production import session_staff
-import unit_runs
-from sessions import SessionRecord, running_sessions
-from user_zone import user_zone_name
+from scripts.lib import unit_runs
+from scripts.message.sessions import SessionRecord, running_sessions
+from scripts.lib.user_zone import user_zone_name
 
 
 @dataclass(frozen=True)
@@ -100,7 +95,7 @@ class UnitLabels:
 def make_labels(name: str, showrunner: ShowrunnerRelationship,
                  director: DirectorRelationship) -> UnitLabels:
     production = " ".join(production_of(showrunner).split())
-    unit = short_unit(" ".join(unit_of(director).split()))
+    unit = " ".join(unit_of(director).split())
     return UnitLabels(" ".join(name.split()), production or "—", unit or "—")
 
 
@@ -112,11 +107,6 @@ def production_of(showrunner: ShowrunnerRelationship) -> str:
 
 def unit_of(director: DirectorRelationship) -> str:
     return director.unit if isinstance(director, (DirectsUnit, UnderDirector, UnitWithoutRunningDirector)) else ""
-
-
-def short_unit(unit: str) -> str:
-    """The shown unit name: the unit id without its "-unit" suffix."""
-    return unit.removesuffix("-unit")
 
 
 @dataclass(frozen=True)
@@ -256,11 +246,11 @@ def registered_showrunners(
             continue
         live = sessions_by_id.get(row.current_session)
         registered.append(showrunners.Showrunner(
-            slug=timer.slug if isinstance(timer, showrunners.Timer) else row.name,
+            name=row.name,
             session=live["name"] if live is not None else "",
             socket=live["messagingSocketPath"] if live is not None else "",
             doc=str(doc.path),
-            zone=timer.zone if isinstance(timer, showrunners.Timer) else user_zone_name()))
+            zone=timer.zone if isinstance(timer, showrunners.TimerRegistration) else user_zone_name()))
     return registered
 
 
@@ -284,7 +274,7 @@ def showrunner_ids(
 def every_labeled_session(record: staff.StaffSnapshot | None = None, *,
                       running: list[SessionRecord] | None = None) -> session_staff.LabeledProductions | OSError:
     """Every production's observed units, joined to one staff snapshot."""
-    import unit_lookup as process_units
+    from scripts.production import unit_lookup as process_units
 
     try:
         return process_units.every_labeled_session(record=record, running=running)
@@ -302,6 +292,8 @@ def production_places(
     places: dict[str, ProductionPlace] = {}
     resolver = resolver if resolver is not None else session_staff.RowResolver(record)
     by_id = {item["sessionId"]: item for item in records}
+    readable_parents: set[staff.StaffId] = set()
+    unreadable_parents: set[staff.StaffId] = set()
     for row in staff.active(record, "unit"):
         identity = row.current_session
         if identity in ledger_workers or not isinstance(row.parent, staff.ReportsTo):
@@ -316,16 +308,21 @@ def production_places(
         if not isinstance(doc, session_staff.ProductionDoc):
             diagnostics.document(row, doc)
             continue
-        try:
-            timer = showrunners.timer_for(parent, record)
-        except (OSError, ValueError) as error:
-            problem(diagnostics.problems, parent.name, error)
+        if parent.id in unreadable_parents:
             continue
-        slug = timer.slug if isinstance(timer, showrunners.Timer) else parent.name
+        if parent.id not in readable_parents:
+            try:
+                _ = showrunners.timer_for(parent, record)
+            except (OSError, ValueError) as error:
+                problem(diagnostics.problems, parent.name, error)
+                unreadable_parents.add(parent.id)
+                continue
+            readable_parents.add(parent.id)
+        name = parent.name
         owner = by_id.get(parent.current_session)
         relationship: UnderShowrunner | ProductionWithoutRunningShowrunner = (
-            UnderShowrunner(slug, owner["name"], f"session:{parent.current_session}")
-            if owner is not None else ProductionWithoutRunningShowrunner(slug))
+            UnderShowrunner(name, owner["name"], f"session:{parent.current_session}")
+            if owner is not None else ProductionWithoutRunningShowrunner(name))
         places[identity] = ProductionPlace(relationship, DirectsUnit(row.name))
     return places
 
@@ -357,7 +354,7 @@ def unit_labels_for(session_ids: Iterable[str], environment: Mapping[str, str]) 
             showrunner: ShowrunnerRelationship = NoShowrunner()
             director: DirectorRelationship = NoDirector()
             if session_id in runners:
-                showrunner = RunsProduction(runners[session_id]["slug"])
+                showrunner = RunsProduction(runners[session_id]["name"])
             elif session_id in places:
                 showrunner = places[session_id].showrunner
                 director = places[session_id].director
@@ -423,21 +420,21 @@ def live_runs(
     ]
 
 
-def stopped_run_place(run: Path) -> RunPlace:
+def stopped_run_place(run: Path, record: staff.StaffSnapshot) -> RunPlace:
     """Keep a worker's recorded unit without claiming that its director is live."""
     try:
         state = read_object(run / unit_runs.STATE_FILE)
     except (OSError, UnicodeError, ValueError):
         return RunPlace(NoDirector(), NoShowrunner(), "")
+    from scripts.direct import plan_history
+    if state.get(unit_runs.OWNER_FIELD):
+        state = plan_history.staff_directory(state, record)
     cwd = as_string(state.get("working_dir"))
-    production, unit = as_string(state.get("production")), as_string(state.get("unit"))
-    if production and unit:
-        return RunPlace(UnitWithoutRunningDirector(unit), ProductionWithoutRunningShowrunner(production), cwd)
     # Older runs may keep their identity only in the plan. Import the history
     # reader for that fallback, not for every lookup of recorded labels.
     from scripts.direct.progress_history import ProductionUnitIdentity, resolve_production_unit
 
-    identity = resolve_production_unit(state)
+    identity = resolve_production_unit(state, resolver=session_staff.RowResolver(record))
     if isinstance(identity, ProductionUnitIdentity):
         return RunPlace(UnitWithoutRunningDirector(identity.unit),
                          ProductionWithoutRunningShowrunner(identity.production), cwd)

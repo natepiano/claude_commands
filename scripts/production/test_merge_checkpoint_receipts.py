@@ -132,7 +132,7 @@ class MergeCheckpointTests(MergeCheckpointFixture):
         finished, = [row for row in rows if row["event_type"] == "wait_finished"]
         phase, = [row for row in rows if row["event_type"] == "phase_started" and row["phase_id"] == "2"]
         self.assertEqual((started["wait_kind"], started["phase_instance_id"], started["unit"], started["owner_session"]),
-                         ("WaitingForMergeGate", phase["phase_instance_id"], "alpha-unit", "unit-director"))
+                         ("WaitingForMergeGate", phase["phase_instance_id"], "alpha", "unit-director"))
         self.assertEqual(started["wait_id"], finished["wait_id"])
         self.assertEqual(cast(dict[str, object], finished["wait_end"])["state"], "Finished")
     def test_merge_after_phase_finish_records_the_checkpoint_instances_gate_wait(self) -> None:

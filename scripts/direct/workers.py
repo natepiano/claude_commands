@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """Worker allocation and run history. Staff holds worker ownership."""
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import argparse
 import json
@@ -26,9 +30,10 @@ if TYPE_CHECKING:
     from scripts.message.sessions import RegistryRead, SessionRecord
     from scripts.lib.names import JobKey
 
-from scripts.agents import worker_lifecycle
+from scripts.agents import mesh_run_process, worker_lifecycle
 from scripts.production import staff, worker_admission, session_staff
 from scripts.lib.atomic_file import write_text_atomic
+from scripts.lib import models_registry, unit_runs
 from scripts.usage import agents_log
 
 ROSTER = "mesh_roster.json"
@@ -56,6 +61,7 @@ class WorkerArguments(argparse.Namespace):
     command: str = ""
     session_dir: Path = Path()
     role: str = ""
+    working_dir: str = ""
     owner_pid: int = 0
     model: str = ""
     effort: str = ""
@@ -369,7 +375,7 @@ def _worker_from_record(name: str, run: Path, record: dict[str, object], members
     policy: dict[str, object] = {"kind": type(access).__name__}
     if isinstance(access, PhaseBoundDesigner):
         policy.update({"binding_generation": access.binding_generation, "launch_sandbox": access.launch_sandbox})
-    settings = codex_mesh.recorded_turn_settings(record)
+    settings = worker_lifecycle.recorded_turn_settings(record)
     return UnitWorker(name, _worker_task_role(record, membership, assignments), "codex", settings.model,
                       settings.effort, policy,
                       CodexThread(_text(session_staff.worker_session(record, membership)), _text(session_staff.worker_home(record, membership)) or
@@ -380,7 +386,7 @@ def _worker_from_record(name: str, run: Path, record: dict[str, object], members
 
 @contextmanager
 def ending_worker(run: Path, name: str) -> Generator[Callable[[], None], None, None]:
-    """Keep the ledger lock before membership during a permanent end."""
+    """Record the end under the ledger lock and retain the worker for permanent removal."""
     raw = worker_lifecycle.read_json_object(run / ROSTER)
     entry = _object(raw.get(name))
     location = _text(entry.get("unit_ledger"))
@@ -401,7 +407,6 @@ def ending_worker(run: Path, name: str) -> Generator[Callable[[], None], None, N
         def remember_end() -> None:
             identity = worker.staff_id
             store.record_end(ledger, identity, worker, run)
-            del ledger.workers[name]
             store.save(ledger)
         yield remember_end
 
@@ -429,7 +434,7 @@ def note_backend(run: Path, name: str, thread_id: str, home: Path) -> None:
                                                 old_thread_id=previous, thread_id=thread_id))
                 worker.access_policy = _object(record.get("access_policy")) or worker.access_policy
                 from scripts.agents import codex_mesh
-                settings = codex_mesh.recorded_turn_settings(record)
+                settings = worker_lifecycle.recorded_turn_settings(record)
                 worker.model, worker.effort = settings.model, settings.effort
                 worker.backend = CodexThread(thread_id, str(home.resolve()))
                 worker.ownership = HeldBy(str(run))
@@ -465,13 +470,13 @@ def _next_worker_name(ledger: UnitWorkers, roster: Mapping[str, object], role: s
     return name
 
 
-def resolve(run: Path, role: str, *, model: str = "", effort: str = "") -> str:
+def resolve(run: Path, role: str, *, model: str = "", effort: str = "", working_dir: Path | None = None) -> str:
     """Return an idle worker, carry one over, reopen one, or open the next name."""
-    return _resolve(run, role, os.getpid(), model=model, effort=effort)
+    return _resolve(run, role, os.getpid(), model=model, effort=effort, working_dir=working_dir)
 
 
 def _resolve(run: Path, role: str, owner_pid: int, *, model: str = "", effort: str = "",
-             new_name: str = "") -> str:
+             new_name: str = "", working_dir: Path | None = None) -> str:
     from scripts.agents import codex_mesh
     if role not in ROLES:
         raise WorkerUnavailable(f"unsupported worker role: {role}")
@@ -496,7 +501,7 @@ def _resolve(run: Path, role: str, owner_pid: int, *, model: str = "", effort: s
                         continue
                     if codex_mesh.worker_idle_reason(str(run), name, record, paused=paused, membership=membership):
                         continue
-                    permission = worker_admission.admit(name, run, role=role)
+                    permission = worker_admission.admit(name, run)
                     _ = worker_admission.publish(permission, _text(session_staff.worker_session(record, membership)))
                 elif record.get("status") in ("ended", "running", "starting"):
                     if codex_mesh.worker_idle_reason(str(run), name, record, membership=membership):
@@ -538,9 +543,11 @@ def _resolve(run: Path, role: str, owner_pid: int, *, model: str = "", effort: s
             if new_name in ledger.workers or new_name in roster:
                 raise WorkerUnavailable(f"{new_name}: worker name already exists")
             name = new_name
-        record = codex_mesh.open_unit_worker(str(run), name, role,
+        configuration = models_registry.launch_configuration(os.environ)
+        record = codex_mesh.open_unit_worker(str(run), name, role, configuration=configuration,
             model=model or (carried.model if carried is not None else ""),
-            effort=effort or (carried.effort if carried is not None else ""))
+            effort=effort or (carried.effort if carried is not None else ""),
+            cwd=str(working_dir) if working_dir is not None else "")
         if carried is not None:
             record.update({"turn_model": carried.model, "turn_effort": carried.effort})
             with _roster_locked(run) as (handle, current):
@@ -558,7 +565,7 @@ def _reviewer_destination(owner: staff.StaffRow) -> str:
     if owner.kind == "unit" and not isinstance(owner.worktree, staff.PresentWorktree):
         raise WorkerUnavailable("invalid worker state: missing working_dir")
     from scripts.production.production_doc import read_production
-    directory = str(read_production(owner.doc.path).checkout if owner.kind == "showrunner" and isinstance(owner.doc, staff.LiveDoc)
+    directory = str(read_production(owner).checkout if owner.kind == "showrunner" and isinstance(owner.doc, staff.LiveDoc)
                     else owner.worktree.path if isinstance(owner.worktree, staff.PresentWorktree) else Path.cwd())
     result = subprocess.run(
         ["bash", str(Path(__file__).with_name("worker_name.sh")),
@@ -584,10 +591,7 @@ def running_director_sessions(registry: RegistryRead) -> list[SessionRecord]:
     """Running director candidates, newest first, including sessions without sockets."""
     from scripts.message import sessions
 
-    return sorted(
-        (item.record for item in registry.entries if sessions.running_session(item.record)),
-        key=lambda session: session["updatedAt"], reverse=True,
-    )
+    return sessions.running_records(registry)
 
 
 def resolve_live_unit_director(
@@ -596,7 +600,7 @@ def resolve_live_unit_director(
     use_live_marks: bool = True,
 ) -> LiveUnitDirector | NoLiveUnitDirector:
     """Resolve the current director from worker membership or the unit staff row."""
-    from scripts.production import session_staff, unit_lookup
+    from scripts.production import unit_lookup
 
     dependencies(run / ROSTER)
     rosters = worker_lifecycle.read_json_object(run / ROSTER)
@@ -616,20 +620,20 @@ def resolve_live_unit_director(
             parents[parent.id] = parent
     dependencies(run / STATE)
     context = worker_lifecycle.read_json_object(run / STATE)
-    production, unit = context.get("production"), context.get("unit")
-    if not parents and isinstance(production, str) and isinstance(unit, str) and production and unit:
-        found = session_staff.unit_match(session_staff.ObservedUnit(unit), record)
-        if isinstance(found, session_staff.MemberFound):
-            parents[found.row.id] = found.row
+    if not parents:
+        owner = unit_runs.run_owner(context, record)
+        if isinstance(owner, staff.StaffRow) and owner.kind in ("unit", "showrunner"):
+            parents[owner.id] = owner
     if len(parents) != 1:
         return NoLiveUnitDirector()
     parent = next(iter(parents.values()))
     for session in running:
         if session["sessionId"] == parent.current_session:
             return LiveUnitDirector(session["sessionId"], session["pid"])
-    if use_live_marks and isinstance(production, str) and isinstance(unit, str) and production and unit:
+    production = record.parent_of(parent)
+    if use_live_marks and production is not None:
         try:
-            marked = unit_lookup.labeled_session(production, unit, record=record, sources=sources, running=running)
+            marked = unit_lookup.labeled_session(production.name, parent.name, record=record, sources=sources, running=running)
         except OSError:
             return NoLiveUnitDirector()
         if marked is not None and isinstance(marked.claude, unit_lookup.LiveClaude):
@@ -688,12 +692,11 @@ def _runs(ledger: UnitWorkers) -> tuple[Path, ...]:
 
 def live_detached_runs(run: Path) -> tuple[tuple[Path, dict[str, object]], ...]:
     """Recorded supervisors only; no process discovery by name."""
-    from scripts.agents import mesh_runs
     records: list[tuple[Path, dict[str, object]]] = []
     for path in sorted((run / "mesh_runs").glob("*.json")):
         record = worker_lifecycle.read_json_object(path)
         pid = record.get("pid")
-        if record.get("status") == "running" and isinstance(pid, int) and mesh_runs.supervises(pid, path):
+        if record.get("status") == "running" and isinstance(pid, int) and mesh_run_process.supervises(pid, path):
             records.append((path, record))
     return tuple(records)
 
@@ -724,7 +727,7 @@ def held_claude_sessions() -> set[str]:
 
 
 def end_unit(owner: staff.StaffRow) -> None:
-    from scripts.agents import codex_mesh, mesh_runs
+    from scripts.agents import codex_mesh
     # Run cleanup reads this ledger too; load only its binary lookup interface
     # here so neither module owns a static import cycle.
     with worker_lifecycle.operation_deadline(timeout=codex_mesh.THREAD_RELEASE_TIMEOUT_SECS):
@@ -756,8 +759,7 @@ def end_unit(owner: staff.StaffRow) -> None:
                                         print(f"cancelled pending message of {name}: {message}")
                                     _write_inbox(inbox, {})
                                 current = _object(_read_roster(run).get(name))
-                                if (isinstance(worker.backend, CodexThread) and current
-                                        and current.get("status") != "ended"):
+                                if isinstance(worker.backend, CodexThread) and current:
                                     result = codex_mesh.end_worker_locked(argparse.Namespace(session_dir=str(run), to=name))
                                     if result:
                                         raise WorkerUnavailable(f"cannot end worker {name} in {run}; retry retirement")
@@ -765,7 +767,7 @@ def end_unit(owner: staff.StaffRow) -> None:
                                     if detached.get("worker") != name:
                                         continue
                                     pid = detached["pid"]
-                                    if isinstance(pid, int) and mesh_runs.supervises(pid, path):
+                                    if isinstance(pid, int) and mesh_run_process.supervises(pid, path):
                                         try:
                                             os.kill(pid, signal.SIGTERM)
                                         except ProcessLookupError:
@@ -833,6 +835,7 @@ def main() -> int:
     command = commands.add_parser("resolve")
     _ = command.add_argument("--session-dir", type=Path, required=True)
     _ = command.add_argument("--role", choices=ROLES, required=True)
+    _ = command.add_argument("--working-dir", default="", help="working directory for a new worker")
     _ = command.add_argument("--owner-pid", type=int, default=0)
     _ = command.add_argument("--model", default="")
     _ = command.add_argument("--effort", default="")
@@ -848,7 +851,8 @@ def main() -> int:
             print(shown_name(run, args.name))
         else:
             print(_resolve(run, role, args.owner_pid or director_pid(run),
-                           model=args.model, effort=args.effort, new_name=args.name))
+                           model=args.model, effort=args.effort, new_name=args.name,
+                           working_dir=Path(args.working_dir) if args.working_dir else None))
         return 0
     except (WorkerUnavailable, OSError, ValueError) as error:
         print(f"workers: {error}", file=sys.stderr)

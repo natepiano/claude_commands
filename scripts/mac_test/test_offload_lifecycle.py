@@ -6,9 +6,9 @@ from typing import TYPE_CHECKING
 import select
 import signal
 import unittest
-from offload_test_support import OffloadCommandFixture
+from scripts.mac_test.offload_test_support import OffloadCommandFixture
 # The fixture loads offload's sibling script paths before the tree-key import.
-import treekey
+from scripts.buildlog import treekey
 if TYPE_CHECKING:
     from ..lib import test_hang_guard
 else:

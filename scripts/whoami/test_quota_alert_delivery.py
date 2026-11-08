@@ -11,20 +11,20 @@ import unittest
 from pathlib import Path
 from contextlib import redirect_stdout
 from datetime import timedelta
-from typing import cast
+from typing import cast, override
 from unittest import mock
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.lib.test_models_registry import write_registry
 from scripts.accounts.home_test_support import scratch_accounts_config
 from scripts.message import send_budget
+from scripts.shutdown import remote
 from scripts.whoami import quota_alert_test_support as support
-import quota_alert
-import review
-from push_texts import render
-import agent_notes
+from scripts.whoami import quota_alert
+from scripts.notify import review
+from scripts.notify.push_texts import render
+from scripts.whoami import agent_notes
 from scripts.whoami import note_file
-from user_action import ActionRequired
+from scripts.notify.user_action import ActionRequired
 from scripts.whoami.quota_alert_test_support import Notes, REAL_TELL_USER, REFUSAL_ACTION, REGISTRY as REGISTRY
 
 setUpModule = support.setUpModule
@@ -32,6 +32,11 @@ REAL_RELAY = quota_alert.relay
 
 
 class QuotaAlertTests(support.SeededQuotaReminderFixture):
+    @override
+    def setUp(self) -> None:
+        super().setUp()
+        _ = self.enterContext(mock.patch("socket.gethostname", return_value="worker.example"))
+
     def test_internal_switch_failure_details_do_not_leak_into_the_phone_push(self) -> None:
         note = self.note("codex1.md", "active", "0")
         push = quota_alert.refusal_push(note, quota_alert.NoCodexQuotaFallback(),
@@ -49,7 +54,7 @@ class QuotaAlertTests(support.SeededQuotaReminderFixture):
         for summary, text, ask in self.pushed:
             self.assertLess(len(summary), 45)
             self.assertLess(len("Action: " + ask.action + "\n" + text), 500)
-            self.assertTrue("natedev" in ask.action or "chatgpt.com/codex/settings/usage" in ask.action)
+            self.assertTrue(remote.local_machine() in ask.action or "chatgpt.com/codex/settings/usage" in ask.action)
             self.assertLessEqual(text.count("recommended"), 1)
 
     def test_every_user_push_states_its_action_as_send_py_requires(self) -> None:
@@ -65,7 +70,7 @@ class QuotaAlertTests(support.SeededQuotaReminderFixture):
             _ = sends.pop(title)
         self.assertEqual(sends, {
             "quota_alert: codex1 now uses paid credits": ("decision", ActionRequired(
-                "To stop it, set use_credits: off in ~/rust/hanadocs/agents/codex1.md on natedev")),
+                f"To stop it, set use_credits: off in ~/rust/hanadocs/agents/codex1.md on {remote.local_machine()}")),
             "Codex work stopped for lack of usage": ("decision", ActionRequired(REFUSAL_ACTION)),
         })
 
@@ -110,9 +115,7 @@ class QuotaAlertTests(support.SeededQuotaReminderFixture):
                 self.assertEqual(run.call_args.kwargs["timeout"], send_budget.seconds(limit - quota_alert.KILL_GRACE))
 
     def test_failed_codex_reminder_retries_phone_delivery_without_session_alerts(self) -> None:
-        config = quota_alert.load_config()
-        config["threshold_percent"] = 2
-        _ = quota_alert.CONFIG.write_text(json.dumps(config))
+        _ = quota_alert.CONFIG.write_text(quota_alert.CONFIG.read_text().replace("threshold_percent=1", "threshold_percent=2"))
         note = self.note("codex1.md", "active", "2")
         self.push_errors.append(quota_alert.PushFailed("fixture offline"))
         log = self.alert([note], self.now)

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from scripts.shutdown import remote
+
 import io
 import json
 import os
@@ -19,12 +21,12 @@ from contextlib import closing, contextmanager, redirect_stderr, redirect_stdout
 from datetime import datetime, timezone
 from typing import TypedDict, cast, override
 from unittest import mock
-import rules
-import style_ledger
-from approved_renames import AppliedCheck, TYPE_NAMED_PARAMETER_RULE
-import style_plan
-import style_rules
-import declarations
+from scripts.style import rules
+from scripts.style import style_ledger
+from scripts.style.approved_renames import AppliedCheck, TYPE_NAMED_PARAMETER_RULE
+from scripts.style import style_plan
+from scripts.style import style_rules
+from scripts.style import declarations
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.production import staff
 from scripts.production.staff_test_support import fixture_member, fixture_runtime_id, isolated_staff_file
@@ -42,7 +44,7 @@ STYLE_UNIT_NAMES = (
 
 def style_unit_id(name: str) -> str:
     """Return the native id supplied by the private style backend."""
-    return fixture_runtime_id("style-unit:" + name.removesuffix("-unit"))
+    return fixture_runtime_id("style:" + name)
 
 
 def ticket_owner_id(reference: str) -> str:
@@ -50,7 +52,7 @@ def ticket_owner_id(reference: str) -> str:
     record = staff.initial_snapshot()
     if record.by_id(staff.StaffId(reference)) is not None:
         return reference
-    rows = [row for row in record.find(kind="unit") if row.name == reference.removesuffix("-unit")]
+    rows = [row for row in record.find(kind="unit") if row.name == reference]
     if len(rows) == 1:
         return str(rows[0].id)
     return reference
@@ -65,11 +67,14 @@ def style_staff_fixture(root: Path, repo: Path) -> Generator[None]:
             staff.SeedMember(name, "unit", name, staff.NewSeedMember(), staff.SeedParent("owner"), style_unit_id(name))
             for name in STYLE_UNIT_NAMES
         ))
-        _ = staff.apply_seed(staff.SeedInput(tuple(members)))
+        record = staff.apply_seed(staff.SeedInput(tuple(members)))
+        for row in record.find(kind="unit", parent=owner.id):
+            _ = staff.set_worktree(row.id, staff.RemovedWorktree(remote.local_machine(), root / ("unused-" + row.name)),
+                                  expected=row.worktree)
         document = repo / ".git/style-production.md"
         document.parent.mkdir(exist_ok=True)
         _ = document.write_text("# Style production\n- **Kind:** style\n- **Branch point:** main\n")
-        _ = staff.set_doc(owner.id, staff.LiveDoc("natedev", document))
+        _ = staff.set_doc(owner.id, staff.LiveDoc(remote.local_machine(), document))
         yield
 
 
@@ -103,7 +108,7 @@ def machine_rename_fixture(ledger: style_ledger.Ledger, definition: rules.Rule, 
                           "rename", "item", "impl_item", definition.blob, "13001")
     ledger.record(definition.rule_id, "src/lib.rs", base, definition.blob, "held", ticket="13001",
                   input_scope=style_ledger.DeclaredInputScope.RULE)
-    _ = proposal.write_text("---\nunit: names-unit\nplan: /tmp/names.md\n---\nApproved rename\n")
+    _ = proposal.write_text("---\nunit: names\nplan: /tmp/names.md\n---\nApproved rename\n")
     ledger.file_held(finding.finding_id, proposal)
     ledger.ticket_drop("13001")
     _ = path.write_text(current)
@@ -267,7 +272,7 @@ class LedgerTestCase(unittest.TestCase):
 
     def cli_command(self, arguments: tuple[str, ...]) -> list[str]:
         prefix = 2 if arguments[0] in ("ticket", "handoff", "tip", "held", "unit") else 1
-        return [sys.executable, str(Path(style_ledger.__file__)), *arguments[:prefix],
+        return [str(Path(__file__).resolve().parents[1] / "lib/py"), str(Path(style_ledger.__file__)), *arguments[:prefix],
                 "--repo", str(self.repo), *arguments[prefix:]]
 
     def cli(self, *arguments: str, success: bool = True) -> subprocess.CompletedProcess[str]:
@@ -473,7 +478,7 @@ class LedgerTestCase(unittest.TestCase):
             ledger.record_person_applied({finding_id: style_ledger.ReadByPerson("reader")})
         self.assertEqual(self.built_time(ledger, finding_id), "2026-10-27T10:00:00+00:00")
 
-    def refill_result(self, database: Path, unit: str = "names-unit") -> tuple[str, str, str, int, int, int, int]:
+    def refill_result(self, database: Path, unit: str = "names") -> tuple[str, str, str, int, int, int, int]:
         with closing(sqlite3.connect(database)) as connection:
             return cast(tuple[str, str, str, int, int, int, int], connection.execute(
                 "SELECT at,outcome,split_at,ready,changed,structure,other FROM refill_results WHERE unit=?", (unit,),
@@ -998,7 +1003,7 @@ class LedgerTestCase(unittest.TestCase):
         rule = self.rule(f"structure-{ticket}", "tier: D\nfamily: modules\n")
         ledger = self.ledger()
         ledger.set_tip(self.initial_tip, "main")
-        ledger.ticket_add(ticket, ticket_owner_id("modules-unit"), "structure", "modules", "crates/alpha", [], [rule])
+        ledger.ticket_add(ticket, ticket_owner_id("modules"), "structure", "modules", "crates/alpha", [], [rule])
         ledger.ticket_assign(ticket, "main")
         self.record(rule, "crates/alpha", self.initial_tip, "waived", detail="accepted", ticket=ticket)
 

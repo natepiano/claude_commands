@@ -12,6 +12,7 @@ import tempfile
 from typing import override
 import unittest
 
+from scripts.lib.py_floor_test_support import seed_interpreter_cache
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 SHELL_READER = Path(__file__).with_name("conf.sh")
@@ -30,14 +31,18 @@ class ShellConfTests(unittest.TestCase):
         self.config.mkdir()
         programs = self.root / "bin"
         programs.mkdir()
+        (programs / "bash").symlink_to("/bin/bash")
         python = programs / "python3"
         _ = python.write_text(
             '#!/bin/bash\nprintf "python\\n" >> "$FORK_LOG"\n'
             + f"exec {shlex.quote(sys.executable)} \"$@\"\n",
         )
         python.chmod(0o755)
+        cache = self.root / "cache"
+        seed_interpreter_cache(cache, interpreter=python)
         self.env = {
             "PATH": str(programs), "HOME": str(self.root / "home"),
+            "XDG_CACHE_HOME": str(cache),
             "CONF_DIR": str(self.config), "HOSTNAME": socket.gethostname(),
             "FORK_LOG": str(self.root / "python.log"),
             "SUBSHELL_LOG": str(self.root / "subshell.log"),

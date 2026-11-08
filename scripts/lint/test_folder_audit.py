@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
 """Tests for folder_audit.py on a fabricated ~/rust, temp folder and transcript set. A test moves
 each folder's time back two days unless it wants the folder recent; a folder holds one file, since
 the tmp sweep owns empty temp folders."""
@@ -96,6 +96,7 @@ class FolderAuditTests(unittest.TestCase):
         _ = self.enterContext(unittest.mock.patch.object(os, "scandir", side_effect=recorded_scan))
         state = self.root / "state"
         self.enterContext(unittest.mock.patch.dict(os.environ, {"FOLDER_SWEEP_STATE_DIR": str(state),
+                                                                "HOME": str(self.root),
                                                                 "SCRATCH_HOLDS": str(state / "holds.json"),
                                                                 "SCRATCH_ROOT": str(self.root / "scratch"),
                                                                 "SCRATCH_VISIBLE_ROOT": str(self.root / "repro"),
@@ -331,7 +332,7 @@ class FolderAuditTests(unittest.TestCase):
         paths = [folder(self.temp / name, 10) for name in ("first", "second")]
         found = [(path, changed(path)) for path in paths]
         (self.root / "proc").mkdir()
-        with unittest.mock.patch("folder_audit.conf.ConfigRead.whole", side_effect=conf.read("lint").whole) as whole:
+        with unittest.mock.patch("scripts.lint.folder_audit.conf.ConfigRead.whole", side_effect=conf.read("lint").whole) as whole:
             outcomes = folder_audit.judge(found, time.time(), False, proc=str(self.root / "proc"),
                                           sockets=str(self.root / "unix"), mac=False)
         self.assertEqual(outcomes, {path: folder_audit.WOULD_REMOVE for path in paths})

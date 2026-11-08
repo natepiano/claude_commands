@@ -1,14 +1,22 @@
 #!/usr/bin/env python3
 """Save Astra assignments with explicit run and phase identity."""
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import argparse
 import json
 import sys
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal, cast
+
+if not __package__:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from scripts.lib.atomic_file import create_text_atomic
 
 AstraRole = Literal["astra-designer", "astra-reviewer"]
 
@@ -164,8 +172,11 @@ def main(arguments: list[str]) -> int:
         assignment = AstraWork("astra-designer", args.member, str(Path(args.document).expanduser().resolve()),
                                datetime.now(timezone.utc).isoformat(), str(reply), work)
         folder.mkdir(parents=True, exist_ok=True)
-        with destination.open("x", encoding="utf-8") as output:
-            _ = output.write(header_line(assignment) + "\n" + text)
+        if not create_text_atomic(destination, header_line(assignment) + "\n" + text):
+            saved = read_header(destination)
+            if (not isinstance(saved, AstraWork) or replace(saved, assigned_at_utc=assignment.assigned_at_utc) != assignment
+                    or destination.read_text(encoding="utf-8").partition("\n")[2] != text):
+                raise ValueError(f"brief already exists with different or incomplete content: {destination}")
         print(destination)
     except (OSError, UnicodeError, ValueError) as error:
         print(f"astra_work: {str(error).replace(chr(10), ' ')}", file=sys.stderr)

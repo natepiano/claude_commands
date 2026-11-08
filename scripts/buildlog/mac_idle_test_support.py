@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 import unittest
@@ -87,9 +88,11 @@ class NotificationGuardedTestCase(unittest.TestCase):
 
 if TYPE_CHECKING:
     from ..message import send, sessions
+    from ..lib import process_start
     from ..production import staff
 else:
     from scripts.message import send, sessions
+    from scripts.lib import process_start
     from scripts.production import staff
 
 
@@ -97,11 +100,16 @@ def no_checkpoint() -> None:
     pass
 
 
-@dataclass(frozen=True)
+@dataclass
 class PrivateSenderAcceptance:
     """Real sender state with only discovery and transport replaced by private fixtures."""
     state: Path
     accepted: Path
+    owner_start: str = "fixture-owner"
+
+    def end_owner(self) -> None:
+        """Replace the sender lifetime after a simulated process stop."""
+        self.owner_start += "-replacement"
 
     def count(self) -> int:
         return len(self.accepted.read_text().splitlines()) if self.accepted.exists() else 0
@@ -123,6 +131,13 @@ def private_sender_acceptance(state: Path, *, before_accept: Callable[[], None] 
     """No real phone, socket, subprocess or recipient registry is reachable through these fakes."""
     state.mkdir(parents=True, exist_ok=True)
     fixture = PrivateSenderAcceptance(state, state / "acceptances.jsonl")
+    owner_pid = os.getpid()
+    real_process_start = process_start.process_start
+
+    def sender_process_start(pid: int) -> process_start.ProcessStart:
+        if pid == owner_pid:
+            return process_start.Started(fixture.owner_start)
+        return real_process_start(pid)
 
     def transport(command: list[str], _stdin: str, _timeout: float) -> tuple[int, str, str]:
         before_accept()
@@ -136,6 +151,7 @@ def private_sender_acceptance(state: Path, *, before_accept: Callable[[], None] 
         return send.CodexWorkerRecipient(address, "fixture", str(state / "seat"))
 
     with mock.patch.object(staff, "snapshot", return_value=staff.StaffSnapshot(())), \
+         mock.patch.object(process_start, "process_start", side_effect=sender_process_start), \
          mock.patch.object(sessions, "running_sessions", return_value=[]), \
          mock.patch.object(send, "STATE", state), mock.patch.object(send, "wrong_template", return_value=None), mock.patch.object(send, "run", side_effect=transport), \
          mock.patch.object(send, "resolve_recipient", side_effect=discover):

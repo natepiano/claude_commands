@@ -8,6 +8,13 @@ from pathlib import Path
 from typing import Protocol
 
 
+from scripts.lib.suite_runners import starts_suite_runner
+
+
+def runs_suite_runner(command: tuple[str, ...]) -> bool:
+    return any(starts_suite_runner(command[index:]) for index in range(len(command)))
+
+
 class ProcessIdentity(Protocol):
     @property
     def parent(self) -> int: ...
@@ -122,51 +129,70 @@ class ScopeActivityReader:
 
     def run(self, pid: int) -> LiveBuildRun | NoLiveBuildRun:
         for ancestor in self.ancestors(pid):
-            known = self.runs.get(ancestor)
-            if known is not None and known.start_time == self.processes[ancestor].start:
-                return known
-            environment = self.environment(ancestor)
-            recorded = environment.get("BUILDLOG_RUN", "")
-            if recorded:
-                owner, separator, start = recorded.partition(":")
-                if separator and owner.isdecimal():
-                    identity = self.processes.get(int(owner))
-                    if identity is not None and identity.start == start:
-                        return LiveBuildRun(int(owner), start, self.started_at(int(owner)))
-                # An inherited run identity cannot name a different process lifetime.
-                return NoLiveBuildRun()
-            command = self.command(ancestor)
-            names = {Path(arg).name for arg in command}
-            if (names & {"verify.sh", "merge_gate.py"}
-                    or "mesh_runs.py" in names and "supervise" in command):
-                return LiveBuildRun(ancestor, self.processes[ancestor].start, self.started_at(ancestor))
+            run = self._run_at(ancestor, NoLiveBuildRun())
+            if isinstance(run, LiveBuildRun) or self.environment(ancestor).get("BUILDLOG_RUN"):
+                return run
         return NoLiveBuildRun()
+
+    def _run_at(self, pid: int, inherited: LiveBuildRun | NoLiveBuildRun) -> LiveBuildRun | NoLiveBuildRun:
+        known = self.runs.get(pid)
+        if known is not None and known.start_time == self.processes[pid].start:
+            return known
+        recorded = self.environment(pid).get("BUILDLOG_RUN", "")
+        if recorded:
+            owner, separator, start = recorded.partition(":")
+            if separator and owner.isdecimal():
+                identity = self.processes.get(int(owner))
+                if identity is not None and identity.start == start:
+                    return LiveBuildRun(int(owner), start, self.started_at(int(owner)))
+            # An inherited run identity cannot name a different process lifetime.
+            return NoLiveBuildRun()
+        command = self.command(pid)
+        names = {Path(arg).name for arg in command}
+        if ("verify.sh" in names or runs_suite_runner(command)
+                or "mesh_runs.py" in names and "supervise" in command):
+            return LiveBuildRun(pid, self.processes[pid].start, self.started_at(pid))
+        return inherited
 
     def scope(self, members: set[int], name: str = "") -> ScopeProcesses | EmptyBuildScope:
         members = members.intersection(self.processes)
         if not members:
             return EmptyBuildScope()
-        oldest = min(members, key=lambda pid: (self.started_at(pid), pid))
+        captured_members: list[ScopeProcess] = []
+        for pid in sorted(members, key=lambda pid: (self.started_at(pid), pid)):
+            command = self.command(pid)
+            captured_members.append(ScopeProcess(pid, Path(command[0]).name if command else "unknown program"))
+        oldest = captured_members[0].pid
         session, name, folder = "", "", ""
         fixture = False
         run: LiveBuildRun | NoLiveBuildRun = NoLiveBuildRun()
-        program = Path(self.command(oldest)[0]).name if self.command(oldest) else "unknown program"
+        program = captured_members[0].program
+        visited: set[int] = set()
+        ancestor_runs: dict[int, LiveBuildRun | NoLiveBuildRun] = {}
         for pid in sorted(members):
-            if not isinstance(run, LiveBuildRun):
-                run = self.run(pid)
-            for ancestor in self.ancestors(pid):
+            chain: list[int] = []
+            ancestor = pid
+            while ancestor in self.processes and ancestor not in visited:
+                visited.add(ancestor)
+                chain.append(ancestor)
                 env = self.environment(ancestor)
                 session = session or env.get("CODEX_THREAD_ID") or env.get("CLAUDE_CODE_SESSION_ID", "")
                 name = name or env.get("CLAUDE_SESSION_NAME", "")
                 command = self.command(ancestor)
                 fixture = fixture or bool(env.get("PYTEST_CURRENT_TEST")) or any(
                     arg in ("unittest", "pytest") or Path(arg).name.startswith("test_") for arg in command)
+                ancestor = self.processes[ancestor].parent
+            inherited = ancestor_runs.get(ancestor, NoLiveBuildRun())
+            for ancestor in reversed(chain):
+                inherited = self._run_at(ancestor, inherited)
+                ancestor_runs[ancestor] = inherited
+            if not isinstance(run, LiveBuildRun):
+                run = ancestor_runs[pid]
             if not folder:
                 try:
                     folder = str((self.proc / str(pid) / "cwd").readlink())
                 except OSError:
                     pass
-        return ScopeProcesses(len(members), session, name, folder, program,
+        return ScopeProcesses(len(captured_members), session, name, folder, program,
                               self.started_at(oldest), fixture, run,
-                              members=tuple(ScopeProcess(pid, Path(self.command(pid)[0]).name if self.command(pid) else "unknown program")
-                                            for pid in sorted(members, key=lambda pid: (self.started_at(pid), pid))))
+                              members=tuple(captured_members))

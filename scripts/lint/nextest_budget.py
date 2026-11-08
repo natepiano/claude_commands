@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
 """Share the machine's test threads among the local nextest runs in flight.
 
 Each run holds an flock on its own marker for as long as it runs. The lock

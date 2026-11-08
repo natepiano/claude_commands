@@ -63,7 +63,7 @@ for conf in "${NOTIFIER_STATE_DIR:-$HOME/.local/state/notifier}"/showrunner-*/co
           done
         } < "$cache"
       fi
-      [ -n "$fresh" ] || python3 -I "$statusline/counts_row.py" "$instance" >/dev/null 2>&1
+      [ -n "$fresh" ] || "$statusline/../lib/py" --isolated "$statusline/counts_row.py" "$instance" >/dev/null 2>&1
       row=
       { read -r row < "$cache"; } 2>/dev/null
       [ -z "$row" ] || counts="$counts${target#TARGET=session:} $row
@@ -73,7 +73,7 @@ for conf in "${NOTIFIER_STATE_DIR:-$HOME/.local/state/notifier}"/showrunner-*/co
 done
 
 # shellcheck disable=SC2154 # statusline is set by the command that sources this.
-STAFF_FILE="$staff" exec python3 -I "$statusline/assignment.py" -r --arg pwd "$PWD" --arg account "$account" \
+STAFF_FILE="$staff" exec "$statusline/../lib/py" --isolated "$statusline/assignment.py" -r --arg pwd "$PWD" --arg account "$account" \
   --arg legacy_home "$legacy_home" --rawfile home_config "$home_config" \
   --arg counts "$counts" --slurpfile labels "$labels" \
   --rawfile colors "$colors" -f "$statusline/statusline.jq"

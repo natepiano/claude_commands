@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from scripts.build_queue.admission_test_support import caller_admission
-from scripts.lib.py_floor_test_support import cache_file_name
+from scripts.lib.py_floor_test_support import seed_interpreter_cache
 
 from scripts.lint.memory_test_support import config_environment, write_config_fixture, write_pressure_reading
 
@@ -17,18 +17,12 @@ import tempfile
 from typing import ClassVar, TypedDict, cast, override
 import unittest
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.lib.shell_test_support import shell_functions
 
 
 VERIFY = Path(__file__).with_name("verify.sh")
 SCRIPTS = VERIFY.parent.parent
 TAPLO_RESULTS_FILE = "taplo-results.jsonl"
-
-
-def workspace_taplo_script(source: str) -> str:
-    """Extract the production formatter for fixtures that run part of verify."""
-    return "workspace_taplo() (" + source.split(
-        "workspace_taplo() (", 1,
-    )[1].split("\n)\n", 1)[0] + "\n)\n"
 
 
 class CargoInvocation(TypedDict):
@@ -239,14 +233,12 @@ class VerifyLintScopeFixture(unittest.TestCase):
         self.write_shell(bin_directory / "git", GIT_STUB)
         self.write_shell(bin_directory / "rustc", 'printf "rustc fixture\\n"\n')
         targets = self.root / "build-targets.py"
-        self.write_executable(targets, 'import sys\nif sys.argv[1] == "eligible": print("natedev_only test target\\nnatedev\\teligible\\t-\\t-")\n')
+        self.write_executable(targets, 'import sys\nif sys.argv[1] == "eligible": print("natedev_only test target\\nnatedev\\teligible\\t-\\t-\\t-")\n')
         for name in ("ssh", "rsync", "scp", "gh", "systemd-run"):
             self.write_shell(bin_directory / name, "exit 99\n")
         for directory in ("tmp", "state", "cache", "runtime", "target", "cargo-home", ".git", "cgroup"):
             (self.root / directory).mkdir()
-        interpreter_cache = self.root / "cache" / "claude" / cache_file_name()
-        interpreter_cache.parent.mkdir()
-        _ = interpreter_cache.write_text(sys.executable + "\n", encoding="utf-8")
+        seed_interpreter_cache(self.root / "cache")
         pressure = self.root / "memory-pressure"
         write_pressure_reading(pressure)
         meminfo = self.root / "meminfo"
@@ -389,11 +381,15 @@ raise SystemExit(128 + signal if signal else result.returncode)
 
     def invoke_workspace_taplo(self, *arguments: str) -> subprocess.CompletedProcess[str]:
         """Exercise the production formatter without simulating a remote build hold."""
-        formatter = workspace_taplo_script(VERIFY.read_text(encoding="utf-8"))
+        return self.invoke_taplo_at(self.root, *arguments)
+
+    def invoke_taplo_at(self, cwd: Path, *arguments: str) -> subprocess.CompletedProcess[str]:
+        """Call the real formatter from the selected directory with the fixture tools."""
+        formatter = shell_functions(VERIFY, "workspace_taplo")
         return subprocess.run(
             ["bash", "-c", 'set -euo pipefail\nrun() { "$@"; }\n' + formatter
              + 'workspace_taplo "$@"', "taplo-fixture", *arguments],
-            cwd=self.root, env={**self.environment, "WORKSPACE_ROOT": str(self.root)},
+            cwd=cwd, env={**self.environment, "WORKSPACE_ROOT": str(self.root)},
             capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS,
         )
 
@@ -411,7 +407,7 @@ raise SystemExit(128 + signal if signal else result.returncode)
         tools.mkdir()
         hash_tool = "sha256sum" if shutil.which("sha256sum") else "shasum"
         for name in (
-            "bash", "python3", "awk", "cat", "cut", "date", "dirname", "env", "grep",
+            "bash", "python3", "awk", "cat", "cmp", "cut", "date", "dirname", "env", "grep",
             "head", "mkdir", "mktemp", "mv", "ps", "rm", "sed", "sleep",
             "sort", "tail", "tee", "tr", "uname", "wc", hash_tool,
         ):
@@ -462,7 +458,7 @@ raise SystemExit(128 + signal if signal else result.returncode)
     def assert_fix_and_judgment_calls(self, *, fix_passes: int = 1) -> None:
         scope = ["--workspace", "--all-targets", "--all-features", "--keep-going"]
         self.assertEqual(self.calls("clippy"), [[*scope, "--", "-D", "warnings"]] + [
-            ["--fix", "--allow-dirty", "--allow-staged", "--allow-no-vcs",
+            ["--jobs", "8", "--fix", "--allow-dirty", "--allow-staged", "--allow-no-vcs",
              *scope, "--", "-D", "warnings"],
         ] * fix_passes + [[*scope, "--", "-D", "warnings"]])
 

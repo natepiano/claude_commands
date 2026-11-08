@@ -19,13 +19,13 @@ from types import FrameType
 from typing import TYPE_CHECKING, cast, override
 from unittest import mock
 
-import index
-import launches
-import record
-import report
-import store
-from test_index import Record, encode, point_root_at, step
-from test_launches import CLI, result_line
+from scripts.buildlog import index
+from scripts.buildlog import launches
+from scripts.buildlog import record
+from scripts.buildlog import report
+from scripts.buildlog import store
+from scripts.buildlog.test_index import Record, encode, point_root_at, step
+from scripts.buildlog.test_launches import CLI, result_line
 if TYPE_CHECKING:
     from ..lib import test_hang_guard
     from ..lint.memory_test_support import config_environment
@@ -278,7 +278,7 @@ class LaunchRecordingTests(unittest.TestCase):
 
     def test_importing_hana_shot_leaves_the_import_path_and_record_name_unchanged(self) -> None:
         result = subprocess.run(
-            [sys.executable, "-c", "\n".join((
+            [str(Path(__file__).resolve().parents[2] / "scripts/lib/py"), "-c", "\n".join((
                 "import json, sys",
                 "before = list(sys.path)",
                 "import scripts.hana_shot.hana_shot",

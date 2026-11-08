@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from scripts.shutdown import remote
+
 import importlib
 import json
 import os
@@ -226,11 +228,13 @@ class ProductionPathsTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         _ = document.write_text("# Production\n\n- **Repository:** `/repo/main`\n", encoding="utf-8")
         with isolated_staff_file(Path(directory.name) / "staff.json", {}):
-            owner = fixture_member("showrunner", name="sample", doc=staff.LiveDoc("natedev", document))
+            owner = fixture_member("showrunner", name="sample", doc=staff.LiveDoc(remote.local_machine(), document))
             _ = fixture_member("unit", name="a", parent=owner.id,
-                               worktree=staff.PresentWorktree("natedev", branch_worktree))
+                               worktree=staff.PresentWorktree(remote.local_machine(), branch_worktree))
+            self.assertEqual(tuple(outcomes.production_owners(document.parent, staff.snapshot())), (owner,))
+            self.assertEqual(tuple(outcomes.production_owners(document.parent / "other", staff.snapshot())), ())
             self.assertEqual(
-                outcomes.production_paths(document),
+                outcomes.production_paths(owner),
                 (Path("/repo/main"), branch_worktree),
             )
 
@@ -253,9 +257,9 @@ class ProductionPathsTests(unittest.TestCase):
         _ = self.enterContext(isolated_staff_file(Path(directory.name) / "staff.json", {}))
         owner = recorded_showrunner("fixture-owner", document)
         _ = fixture_member("unit", name="a", parent=owner.id,
-                           worktree=staff.PresentWorktree("natedev", worktree))
+                           worktree=staff.PresentWorktree(remote.local_machine(), worktree))
         self.assertEqual(
-            outcomes.production_paths(document),
+            outcomes.production_paths(owner),
             (repository, worktree),
         )
 
@@ -575,9 +579,9 @@ class OutcomeTests(OutcomeFixture):
             encoding="utf-8")
         owner = recorded_showrunner("second-owner", self.production_docs / "fixture-production.md")
         _ = fixture_member("unit", name="second", parent=owner.id,
-                           worktree=staff.PresentWorktree("natedev", second_repo))
+                           worktree=staff.PresentWorktree(remote.local_machine(), second_repo))
         _ = fixture_member("unit", name="first", parent=owner.id,
-                           worktree=staff.PresentWorktree("natedev", self.repository))
+                           worktree=staff.PresentWorktree(remote.local_machine(), self.repository))
         _ = self.collect()
         self.assertEqual({cast(str, row["commit_id"]) for row in self.rows("SELECT * FROM checkpoints")}, {first, side, second})
         _ = self.collect()
@@ -620,9 +624,9 @@ class OutcomeTests(OutcomeFixture):
         _ = (self.production_docs / "fixture-production.md").write_text(
             "# Production\n", encoding="utf-8")
         owner = fixture_member("showrunner", name="fixture",
-                               doc=staff.LiveDoc("natedev", self.production_docs / "fixture-production.md"))
+                               doc=staff.LiveDoc(remote.local_machine(), self.production_docs / "fixture-production.md"))
         _ = fixture_member("unit", name="retired", parent=owner.id,
-                           worktree=staff.RemovedWorktree("natedev", self.root / "removed-worktree"))
+                           worktree=staff.RemovedWorktree(remote.local_machine(), self.root / "removed-worktree"))
         output = self.collect()
         self.assert_family_state(output, "natedev", "checkpoints", "ready")
         self.assertEqual({cast(str, row["commit_id"]) for row in self.rows("SELECT * FROM checkpoints")}, {commit_id})
@@ -788,7 +792,8 @@ class MacOutcomeTests(OutcomeFixture):
         binary_directory = self.root / "bin"
         binary_directory.mkdir()
         ssh = binary_directory / "ssh"
-        _ = shutil.copyfile(COLLECT_FIXTURES / "mac/fake_ssh.py", ssh)
+        _ = ssh.write_text((COLLECT_FIXTURES / "mac/fake_ssh.py").read_text().replace(
+            "${HOME}/.claude/scripts/lib/py", str(Path(__file__).resolve().parents[1] / "lib/py")))
         ssh.chmod(0o700)
 
     def mac_collect(self, behavior: SshBehavior = "complete") -> MacRun:
@@ -1082,7 +1087,8 @@ from scripts.production.staff_test_support import StaffTestCase
 class BranchRepositoryLocationTests(StaffTestCase):
     def test_repository_discovery_uses_the_staff_worktree(self) -> None:
         fixture = self.separated_unit_folders()
-        self.assertEqual(outcomes.production_paths(fixture.doc), (fixture.doc.parents[1], fixture.worktree))
+        with patch.object(staff.StaffSnapshot, "by_doc", side_effect=AssertionError("repeated owner lookup")):
+            self.assertEqual(outcomes.production_paths(fixture.runner), (fixture.doc.parents[1], fixture.worktree))
 
 
 if __name__ == "__main__":

@@ -24,10 +24,22 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.direct import phase_reservation, plan_history  # noqa: E402
 from scripts.agents import worker_lifecycle
 from scripts.lib import atomic_file
+from scripts.production import staff
+from scripts.production.staff_test_support import fixture_member, fixture_unit_location, isolated_staff_file
 from scripts.lib.test_hang_guard import LauncherHangGuard, TEST_HANG_GUARD_SECS
 
 ACTIVE: dict[str, object] = {"kind": "active", "active_phase_reservation": {
     "reservation_id": "r1", "coordination_run_id": "c1", "phase": "34h", "phase_start_head": "a" * 40}}
+
+
+def record_unit(test: unittest.TestCase, run: Path, home: Path, phase: str) -> None:
+    """Record a private unit and its durable run owner."""
+    _ = test.enterContext(isolated_staff_file(run / "staff.json", {}))
+    _ = (run / "staff.json").write_text(json.dumps({"schema": 2, "rows": []}))
+    owner = fixture_member("showrunner", name="reservation")
+    row = fixture_unit_location(owner, "reservation", home)
+    _ = (run / plan_history.STATE_FILENAME).write_text(json.dumps({
+        "owner_staff_id": row.id, "phase": {"id": phase, "status": "active"}, "open_phases": []}))
 
 
 @final
@@ -44,6 +56,7 @@ class WorktreeAttributionTests(unittest.TestCase):
         self.first = root / "worktree-x"
         self.second = root / "worktree-y"
         self.first.mkdir()
+        record_unit(self, self.session, self.first, "1")
         for command in (
             ["init", "-q", "-b", "main"],
             ["-c", "user.name=Test", "-c", "user.email=test@example.invalid",
@@ -55,9 +68,11 @@ class WorktreeAttributionTests(unittest.TestCase):
 
     def phases(self, worktrees: dict[str, Path]) -> list[phase_reservation.OpenPhase]:
         records = [{"id": name, "instance_id": name, "status": "active"} for name in ("1", "2")]
-        _ = (self.session / plan_history.STATE_FILENAME).write_text(json.dumps({
+        state = cast(dict[str, object], json.loads((self.session / plan_history.STATE_FILENAME).read_text()))
+        state.update({
             "phase": records[-1], "open_phases": records[:-1],
-        }))
+        })
+        _ = (self.session / plan_history.STATE_FILENAME).write_text(json.dumps(state))
         for name in ("1", "2"):
             directory = phase_reservation.phase_directory(self.session, name)
             directory.mkdir(parents=True)
@@ -74,6 +89,15 @@ class WorktreeAttributionTests(unittest.TestCase):
                                            "--phase", phase, "--repo", str(root)])
         return code, errors.getvalue()
 
+    def test_missing_unit_row_names_the_owner(self) -> None:
+        _ = (self.session / plan_history.STATE_FILENAME).write_text(json.dumps({"owner_staff_id": "missing-owner"}))
+        directory = phase_reservation.phase_directory(self.session, "1")
+        errors = io.StringIO()
+        with contextlib.redirect_stderr(errors), self.assertRaisesRegex(phase_reservation.StateRefused,
+                                                                      "run owner is unavailable"):
+            _ = phase_reservation.phase_worktree(directory)
+        self.assertIn("run owner missing-owner: unit staff row is unavailable", errors.getvalue())
+
     def test_claim_records_the_first_commit_and_dirty_status(self) -> None:
         directory = phase_reservation.phase_directory(self.session, "1")
         _ = phase_reservation.enroll(directory, "1", "board_ready")
@@ -82,6 +106,7 @@ class WorktreeAttributionTests(unittest.TestCase):
         status = subprocess.run(["git", "-C", str(self.first), "status", "--short"], check=True,
                                 capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS).stdout
         self.assertEqual(self.claim("1", self.first), (0, ""))
+        self.assertFalse((directory / phase_reservation.WORKTREE_FILE).exists())
         self.assertTrue((directory / phase_reservation.BASELINE_FILE).is_file())
         self.assertEqual((directory / phase_reservation.BASELINE_FILE).read_text(), head + "\n")
         self.assertEqual((directory / phase_reservation.BASELINE_STATUS_FILE).read_text(), status)
@@ -248,7 +273,7 @@ class WorktreeAttributionTests(unittest.TestCase):
         _ = subprocess.run(["git", "-C", str(self.first), "worktree", "remove", str(self.second)],
                            check=True, capture_output=True, timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(self.claim("1", self.first), (0, ""))
-        self.assertEqual((directory / phase_reservation.WORKTREE_FILE).read_text(), str(self.first) + "\n")
+        self.assertFalse((directory / phase_reservation.WORKTREE_FILE).exists())
         self.assertEqual({name: (directory / name).read_bytes() for name in before}, before)
 
     def test_claim_retries_after_interruption_between_baseline_writes(self) -> None:
@@ -310,29 +335,23 @@ class WorktreeAttributionTests(unittest.TestCase):
                          "scripts/direct/verify.sh is in no single open phase's files list (open phases: 1, 2); "
                          + "add each path to exactly one phases/<phase>/files.")
 
-    def test_legacy_phase_still_matches_outside_the_known_phases_worktree(self) -> None:
-        phases = self.phases({"2": self.first})
-        overlap = phase_reservation.attribute(phases, ["scripts/direct/verify.sh"], self.first)
-        if isinstance(overlap, phase_reservation.NoOpenPhaseHere):
-            self.fail("known and legacy phases were filtered out")
-        self.assertEqual(overlap.by_phase, {})
-        self.assertEqual(overlap.refused, ["scripts/direct/verify.sh"])
-        elsewhere = phase_reservation.attribute(phases, ["scripts/direct/verify.sh"], self.second)
-        if isinstance(elsewhere, phase_reservation.NoOpenPhaseHere):
-            self.fail("legacy phase did not match another worktree")
-        self.assertEqual(elsewhere.refused, [])
-        self.assertEqual({phase.phase: scopes for phase, scopes in elsewhere.by_phase.items()},
-                         {"1": ["scripts/direct/verify.sh"]})
-
-    def test_a_second_claim_cannot_move_a_phase_to_another_live_worktree(self) -> None:
-        _ = self.phases({"1": self.first})
+    def test_attribution_follows_the_staff_folder_after_a_move(self) -> None:
+        _ = self.phases({"1": self.first, "2": self.second})
         directory = phase_reservation.phase_directory(self.session, "1")
-        before = {path.name: path.read_bytes() for path in directory.iterdir() if path.is_file()}
-        code, errors = self.claim("1", self.second)
-        self.assertNotEqual(code, 0)
-        self.assertIn(str(self.first), errors)
-        self.assertIn(str(self.second), errors)
-        self.assertEqual({path.name: path.read_bytes() for path in directory.iterdir() if path.is_file()}, before)
+        self.assertFalse((directory / phase_reservation.WORKTREE_FILE).exists())
+        override = phase_reservation.phase_directory(self.session, "2") / phase_reservation.WORKTREE_FILE
+        self.assertEqual(override.read_text(), str(self.second) + "\n")
+        row = next(row for row in staff.snapshot().rows if row.kind == "unit")
+        destination = self.first.with_name("moved")
+        _ = self.first.rename(destination)
+        _ = staff.set_worktree(row.id, staff.PresentWorktree("natedev", destination), expected=row.worktree)
+        phases = phase_reservation.open_phases(self.session)
+        result = phase_reservation.attribute(phases, ["scripts/direct/verify.sh"], destination)
+        self.assertIsInstance(result, phase_reservation.Attribution)
+        assert isinstance(result, phase_reservation.Attribution)
+        self.assertEqual(result.refused, [])
+        self.assertEqual([phase.phase for phase in result.by_phase], ["1"])
+        self.assertEqual(override.read_text(), str(self.second) + "\n")
 
     def test_claim_from_a_subfolder_keeps_the_root_after_the_subfolder_is_removed(self) -> None:
         start = self.first / "temporary-start"
@@ -357,6 +376,103 @@ class WorktreeAttributionTests(unittest.TestCase):
 
 
 @final
+class AcquisitionRecordingTests(unittest.TestCase):
+    repo: Path = Path()
+    session: Path = Path()
+    phases: list[phase_reservation.OpenPhase] = []
+
+    @override
+    def setUp(self) -> None:
+        root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
+        self.repo = root / "repo"
+        self.repo.mkdir()
+        _ = subprocess.run(["git", "-C", str(self.repo), "init", "-q"], check=True, capture_output=True,
+                           timeout=TEST_HANG_GUARD_SECS)
+        self.session = root / "session"
+        self.phases = []
+        for name in ("15", "16"):
+            directory = phase_reservation.phase_directory(self.session, name)
+            directory.mkdir(parents=True)
+            _ = phase_reservation.enroll(directory, name, "board_ready")
+            self.phases.append(phase_reservation.OpenPhase(
+                name, directory, phase_reservation.KnownPhaseWorktree(self.repo)))
+        ledger = self.repo / ".git" / phase_reservation.LEDGER_DIRECTORY
+        ledger.mkdir()
+        _ = (ledger / phase_reservation.SESSION_MAP_FILE).write_text(json.dumps({"identities": {
+            "director": {"reservation_id": "r1", "coordination_run_id": "c1"},
+        }}))
+
+    def test_concurrent_phases_record_the_directors_reservation_only_once(self) -> None:
+        acquisition = phase_reservation.Acquisition("r1", "c1", "a" * 40)
+        answer = phase_reservation.CheckAnswer(phase_reservation.CLEAR, "", acquisition,
+                                                phase_reservation.LEFT_UNMAPPED)
+        first_inside = Event()
+        release_first = Event()
+        second_observed = Event()
+        second_wrote = Event()
+        guard = LauncherHangGuard("concurrent reservation recording")
+        record = phase_reservation.record_active
+        acquire = worker_lifecycle.acquire_flock
+
+        def record_paused(directory: Path, owned: phase_reservation.Acquisition) -> bool:
+            if directory == self.phases[0].directory:
+                first_inside.set()
+                guard.event(release_first)
+            else:
+                second_wrote.set()
+                second_observed.set()
+            return record(directory, owned)
+
+        def contend(handle: int | worker_lifecycle.LockFileDescriptor, *, mode: int = fcntl.LOCK_EX,
+                    deadline: float = worker_lifecycle.NO_LOCK_DEADLINE) -> None:
+            if first_inside.is_set():
+                try:
+                    acquire(handle, mode=mode | fcntl.LOCK_NB, deadline=deadline)
+                    return
+                except BlockingIOError:
+                    second_observed.set()
+            acquire(handle, mode=mode, deadline=deadline)
+
+        with guard.protect(), mock.patch.object(phase_reservation, "record_active", record_paused), \
+                mock.patch.object(worker_lifecycle, "acquire_flock", contend), \
+                ThreadPoolExecutor(max_workers=2) as workers:
+            first = workers.submit(phase_reservation.record_own_acquisition, answer, self.repo,
+                                   self.phases, "director", self.phases[0])
+            try:
+                guard.event(first_inside)
+                second = workers.submit(phase_reservation.record_own_acquisition, answer, self.repo,
+                                        self.phases, "director", self.phases[1])
+                guard.event(second_observed)
+                self.assertFalse(second_wrote.is_set())
+                self.assertEqual(phase_reservation.read_state(self.phases[1].directory), {
+                    "kind": phase_reservation.AWAITING_FIRST_TOUCH, "phase": "16"})
+            finally:
+                release_first.set()
+            self.assertEqual(guard.result(first), acquisition)
+            self.assertIsNone(guard.result(second))
+        self.assertEqual(phase_reservation.read_state(self.phases[0].directory), {
+            "kind": phase_reservation.ACTIVE, "active_phase_reservation": {
+                "reservation_id": "r1", "coordination_run_id": "c1", "phase": "15",
+                "phase_start_head": "a" * 40}})
+        self.assertFalse(second_wrote.is_set())
+        self.assertEqual(phase_reservation.read_state(self.phases[1].directory), {
+            "kind": phase_reservation.AWAITING_FIRST_TOUCH, "phase": "16"})
+
+    def test_a_mapped_acquisition_records_without_a_lock(self) -> None:
+        acquisition = phase_reservation.Acquisition("r2", "c1", "a" * 40)
+        answer = phase_reservation.CheckAnswer(phase_reservation.CLEAR, "", acquisition)
+        with mock.patch.object(worker_lifecycle, "acquire_flock") as acquire:
+            result = phase_reservation.record_own_acquisition(
+                answer, self.repo, self.phases, "director", self.phases[0])
+        acquire.assert_not_called()
+        self.assertEqual(result, acquisition)
+        self.assertEqual(phase_reservation.read_state(self.phases[0].directory), {
+            "kind": phase_reservation.ACTIVE, "active_phase_reservation": {
+                "reservation_id": "r2", "coordination_run_id": "c1", "phase": "15",
+                "phase_start_head": "a" * 40}})
+
+
+@final
 class PhaseStateTests(unittest.TestCase):
     session: Path = Path()
 
@@ -365,6 +481,7 @@ class PhaseStateTests(unittest.TestCase):
         folder = tempfile.TemporaryDirectory()
         self.addCleanup(folder.cleanup)
         self.session = Path(folder.name)
+        record_unit(self, self.session, self.session, "34h")
 
     def phase_dir(self) -> Path:
         return phase_reservation.phase_directory(self.session, "34h")
@@ -428,7 +545,13 @@ class PhaseStateTests(unittest.TestCase):
     def test_a_finished_phase_reopens_with_its_kept_board_answer(self) -> None:
         _ = self.run_verb("enroll", "--board", "board_ready")
         self.assertEqual(self.run_verb("clear"), (0, ""))
+        path = self.session / plan_history.STATE_FILENAME
+        state = cast(dict[str, object], json.loads(path.read_text()))
+        state["phase"] = {"id": "34h", "status": "completed"}
+        _ = path.write_text(json.dumps(state))
         self.assertEqual(phase_reservation.open_phases(self.session), [])
+        state["phase"] = {"id": "34h", "status": "active"}
+        _ = path.write_text(json.dumps(state))
         self.assertEqual(phase_reservation.restore(self.phase_dir(), "34h"), "enrolled_awaiting_first_touch")
         self.assertEqual([phase.phase for phase in phase_reservation.open_phases(self.session)], ["34h"])
         # An open phase is left as it is, and a phase never enrolled has nothing to restore.
@@ -469,6 +592,7 @@ class PhaseRepairTests(unittest.TestCase):
         self.session = self.root / "unit session"
         self.directory = phase_reservation.phase_directory(self.session, "34h")
         self.directory.mkdir(parents=True)
+        record_unit(self, self.session, self.repo, "34h")
         _ = (self.directory / phase_reservation.BASELINE_FILE).write_text("a" * 40 + "\n")
         binary = self.root / "bin"
         binary.mkdir()
@@ -486,9 +610,11 @@ class PhaseRepairTests(unittest.TestCase):
 
     def recorder_phases(self, *phases: str) -> None:
         records = [{"id": phase, "status": "active"} for phase in phases]
-        _ = (self.session / plan_history.STATE_FILENAME).write_text(json.dumps({
+        state = cast(dict[str, object], json.loads((self.session / plan_history.STATE_FILENAME).read_text()))
+        state.update({
             "phase": records[-1] if records else {"id": "34h", "status": "completed"},
-            "open_phases": records[:-1]}))
+            "open_phases": records[:-1]})
+        _ = (self.session / plan_history.STATE_FILENAME).write_text(json.dumps(state))
 
     def test_a_checkpoint_released_phase_cannot_restore_a_live_mapping(self) -> None:
         _ = phase_reservation.enroll(self.directory, "34h", "board_ready")

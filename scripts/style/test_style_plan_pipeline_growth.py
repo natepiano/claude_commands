@@ -2,21 +2,18 @@
 
 from __future__ import annotations
 
-from ledger_test_support import ticket_owner_id
+from scripts.style.ledger_test_support import ticket_owner_id
 
 import sqlite3
-import sys
 import unittest
 from contextlib import closing
-from pathlib import Path
 from typing import final
 from unittest import mock
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-import style_ledger
+from scripts.style import style_ledger
 
-from style_plan_test_support import StylePlanFixture
+from scripts.style.style_plan_test_support import StylePlanFixture
 
 
 @final
@@ -29,7 +26,7 @@ class StylePlanTests(StylePlanFixture):
         ledger = self.ledger()
         findings = {finding.path: finding.finding_id for finding in ledger.proposal_findings(issue)}
         for number, path in enumerate(self.sources[:2], 1):
-            ledger.ticket_add(f"{number}", ticket_owner_id("names-unit"), "proposal", "names", "crates/alpha", [path], [rule],
+            ledger.ticket_add(f"{number}", ticket_owner_id("names"), "proposal", "names", "crates/alpha", [path], [rule],
                               proposal=str(issue), finding_ids=(findings[path],))
         ledger.ticket_assign("1", "demo-style-names")
         _ = ledger.ticket_base("1")
@@ -54,8 +51,8 @@ class StylePlanTests(StylePlanFixture):
         self.assertEqual((code, error), (5, ""), output)
         self.assertIn("overlap: " + self.sources[1], output)
         self.assertEqual(self.plan.read_bytes(), before)
-        self.assertEqual([ticket["id"] for ticket in ledger.ticket_open(ticket_owner_id("names-unit"))], ["1"])
-        self.assertEqual([ticket["id"] for ticket in ledger.queued_tickets(ticket_owner_id("names-unit"))], ["2"])
+        self.assertEqual([ticket["id"] for ticket in ledger.ticket_open(ticket_owner_id("names"))], ["1"])
+        self.assertEqual([ticket["id"] for ticket in ledger.queued_tickets(ticket_owner_id("names"))], ["2"])
 
     def test_pipeline_growth_widen_on_either_ticket_is_atomic(self) -> None:
         ledger, _, _ = self.waiting_proposal_pair()
@@ -63,7 +60,7 @@ class StylePlanTests(StylePlanFixture):
         for ticket, path in (("1", self.sources[1]), ("2", self.sources[0])):
             with self.subTest(ticket=ticket), self.assertRaisesRegex(style_ledger.LedgerError, "overlap: " + path):
                 self.widen_for_pipeline(ticket, path)
-            self.assertEqual(next(item for item in ledger.ticket_open(ticket_owner_id("names-unit")) if item["id"] == ticket)["widened"], ())
+            self.assertEqual(next(item for item in ledger.ticket_open(ticket_owner_id("names")) if item["id"] == ticket)["widened"], ())
         self.widen_for_pipeline("2", self.sources[2])
         self.assertEqual(self.run_next(), (0, "resume 2\n", ""))
 
@@ -86,7 +83,7 @@ class StylePlanTests(StylePlanFixture):
 
     def test_pipeline_growth_checkpoint_rechecks_actual_changes(self) -> None:
         ledger, rule, _ = self.waiting_ticket()
-        ledger.ticket_add("2", ticket_owner_id("names-unit"), "read", "names", "crates/alpha", [self.sources[1]], [rule])
+        ledger.ticket_add("2", ticket_owner_id("names"), "read", "names", "crates/alpha", [self.sources[1]], [rule])
         ledger.ticket_assign("2", "demo-style-names")
         _ = (self.unit / self.sources[0]).write_text("pub fn overlapping_work() {}\n")
         _ = self.git("add", self.sources[0], cwd=self.unit)
@@ -95,7 +92,7 @@ class StylePlanTests(StylePlanFixture):
         self.record(rule, self.sources[1], checkpoint, "2")
         with self.assertRaisesRegex(style_ledger.LedgerError, "overlap: " + self.sources[0]):
             ledger.ticket_checkpoint("2", checkpoint)
-        self.assertEqual(next(ticket for ticket in ledger.ticket_open(ticket_owner_id("names-unit"))
+        self.assertEqual(next(ticket for ticket in ledger.ticket_open(ticket_owner_id("names"))
                               if ticket["id"] == "2")["state"], "assigned")
 
     def test_pipeline_growth_new_reference_at_a_later_tip_is_rechecked(self) -> None:

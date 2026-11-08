@@ -16,13 +16,28 @@ import json
 import threading
 import time
 import select
-from collections.abc import Callable, Generator, Sequence
+from collections.abc import Callable, Generator, Mapping, Sequence
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol, TypeGuard, final, cast
 
 from scripts.lib.atomic_file import write_text_atomic
+
+
+@dataclass(frozen=True)
+class RecordedTurnSettings:
+    """The recorded model and effort for display."""
+    model: str
+    effort: str
+
+
+def recorded_turn_settings(record: Mapping[str, object]) -> RecordedTurnSettings:
+    """Use accepted-turn fields together, with the legacy pair as a fallback."""
+    model = record.get("turn_model")
+    prefix = "turn_" if isinstance(model, str) and model else ""
+    model, effort = record.get(prefix + "model"), record.get(prefix + "effort")
+    return RecordedTurnSettings(model if isinstance(model, str) else "", effort if isinstance(effort, str) else "")
 
 
 @dataclass(frozen=True, order=True)
@@ -386,6 +401,9 @@ class WorkerStateFile:
 def locked_state(path: Path, *, mode: int = fcntl.LOCK_EX,
                  deadline: float = NO_LOCK_DEADLINE) -> Generator[WorkerStateFile]:
     """Lock before opening data; replacement never changes the lock's inode."""
+    if mode == fcntl.LOCK_SH and not path.parent.exists():
+        yield WorkerStateFile(path)
+        return
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.with_name(path.name + ".lock").open("a", encoding="utf-8") as lock:
         acquire_flock(lock, mode=mode, deadline=deadline)

@@ -15,16 +15,15 @@ from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from scripts.lib.script_envelope import script_prompt
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from datetime import datetime, timezone
 from typing import TypedDict, cast, override
 from unittest.mock import patch
 
-import herdr
-import herdr_sessions
-import sessions
-from fake_herdr import CommandResponse
-from sessions import SessionRecord, UnreadableSessionRecord, read_session
+from scripts.herdr import herdr
+from scripts.herdr import herdr_sessions
+from scripts.message import sessions
+from scripts.herdr.fake_herdr import CommandResponse
+from scripts.message.sessions import SessionRecord, UnreadableSessionRecord, read_session
 from scripts.production import showrunners
 from scripts.accounts import accounts
 from scripts.accounts.home_test_support import scratch_accounts_config
@@ -164,14 +163,16 @@ class HerdrSessionsTests(unittest.TestCase):
         _ = (self.records / f"{pid}.json").write_text(json.dumps(record))
 
     def register_showrunner(self, pid: int) -> None:
-        instance = self.state / "showrunner-production"
-        instance.mkdir()
         doc = self.root / "production.md"
         _ = doc.write_text("fake production")
         record = read_session(self.records / f"{pid}.json")
         assert not isinstance(record, UnreadableSessionRecord)
+        owner = fixture_member("showrunner", name="fixture", doc=staff.LiveDoc("natedev", doc))
+        _ = self.enterContext(patch.object(showrunners, "_session_name", return_value=record["name"]))
+        instance = self.state / f"showrunner-{owner.id}"
+        instance.mkdir()
         _ = (instance / "conf").write_text(
-            f"TARGET=session:{record['sessionId']}\nCHECK=/fake/production_check.sh {doc}\n")
+            f"TARGET=session:{owner.id}\nCHECK=/fake/production_check.sh {owner.id}\n")
 
     def call(self, *arguments: str) -> tuple[int, str, str]:
         stdout, stderr = io.StringIO(), io.StringIO()
@@ -216,8 +217,8 @@ class HerdrSessionsTests(unittest.TestCase):
         self.server(100, "agents")
         self.server(900, "other")
         parent = showrunner_relationship("build-followups")
-        unit = fixture_member("unit", name="herdr-trial-unit", parent=parent.id)
-        marks = {('' + 'SHOWRUNNER_' + 'UNIT'): "build-followups", ('' + 'SHOWRUNNER_' + 'UNIT_ID'): "herdr-trial-unit", "CLAUDE_CODE_SESSION_ID": unit.id}
+        unit = fixture_member("unit", name="herdr-trial", parent=parent.id)
+        marks = {('' + 'SHOWRUNNER_' + 'UNIT'): "build-followups", ('' + 'SHOWRUNNER_' + 'UNIT_ID'): "herdr-trial", "CLAUDE_CODE_SESSION_ID": unit.id}
         self.claude(101, 100, "old-unit-name", pane="w1:p1", marks=marks)
         self.claude(102, 100, "new-unit-name", pane="w1:p1", updated=2, marks=marks)
         self.claude(103, 100, "dead-newest", pane="w1:p1", updated=3, live=False)
@@ -230,7 +231,7 @@ class HerdrSessionsTests(unittest.TestCase):
         _ = (self.records / "malformed.json").write_text("{broken")
         code, stdout, stderr = self.call("list")
         self.assertEqual((code, stderr), (0, ""))
-        self.assertEqual(stdout, "unit\tunit build-followups/herdr-trial-unit\tnew-unit-name\n"
+        self.assertEqual(stdout, "unit\tunit build-followups/herdr-trial\tnew-unit-name\n"
                          + "showrunner\tshowrunner\tdirector\nstandalone\tstandalone\tsolo\n"
                          + "w1:p4\tstandalone\t\n")
         self.assertEqual(self.commands(), [["--session", "default", "session", "list", "--json"],
@@ -288,9 +289,9 @@ class HerdrSessionsTests(unittest.TestCase):
             member = unit_membership("sdlc", name)
             self.claude(pid, 100, name, pane=pane, marks={"CLAUDE_CODE_SESSION_ID": member.id})
         self.claude(104, 100, "models", pane="w1:p4", marks={
-            "CLAUDE_CODE_SESSION_ID": pinned.id, ('' + 'SHOWRUNNER_' + 'UNIT'): "natedev", ('' + 'SHOWRUNNER_' + 'UNIT_ID'): "old-unit"})
+            "CLAUDE_CODE_SESSION_ID": pinned.id, ('' + 'SHOWRUNNER_' + 'UNIT'): "natedev", ('' + 'SHOWRUNNER_' + 'UNIT_ID'): "old"})
         self.process(105, 100, ["sleep", "600"], {"HERDR_PANE_ID": "w1:p5", ('' + 'SHOWRUNNER_' + 'UNIT'): "sdlc",
-                                                ('' + 'SHOWRUNNER_' + 'UNIT_ID'): "missing-unit"})
+                                                ('' + 'SHOWRUNNER_' + 'UNIT_ID'): "missing"})
         replies = cast(dict[str, CommandResponse], json.loads(self.responses.read_text()))
         panes = [{"pane_id": f"w1:p{index}", "label": name, "workspace_id": "w1"}
                  for index, name in enumerate(("herdr", "shutdown", "style", "former-name", "terminal"), 1)]
@@ -576,6 +577,7 @@ class StandaloneLaunchTests(unittest.TestCase):
             "NOTIFIER_SESSIONS_DIR": str(self.root / "sessions"),
         }, clear=True))
         _ = self.enterContext(fake_unit_host.private_process_registry())
+        _ = self.enterContext(patch.object(herdr.Herdr, "run_in_pane"))
         configuration = self.enterContext(scratch_accounts_config())
         _ = (configuration / "script_prompts.conf").write_text(
             (Path(__file__).resolve().parents[2] / "config/script_prompts.conf").read_text())
@@ -757,7 +759,7 @@ class StandaloneLaunchTests(unittest.TestCase):
             return herdr.NativeAgentProcess(herdr.RolloutThread("recorded-id"), "fixture-start", {})
         _ = self.enterContext(patch.object(herdr, "native_process", side_effect=native_process))
         self.responses["--session agents agent get w1:p1"] = CommandResponse(code=0, stdout=json.dumps({
-            "result": {"agent": {"agent_status": "idle", "interactive_ready": True}}}))
+            "result": {"agent": {"agent_status": "idle"}}}))
         self.responses["--session agents pane read w1:p1 --source visible --format ansi"] = CommandResponse(
             code=0, stdout="────────\n❯ \n────────")
         # This fixture turn is written by the fake command, after launch, not before it.

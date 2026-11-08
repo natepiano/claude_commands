@@ -2,6 +2,10 @@
 """Keep a terminal available while its Claude child stops and resumes."""
 
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import json
 import os
@@ -17,10 +21,13 @@ from typing import NotRequired, TypedDict, cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.herdr import herdr
-from scripts.production import session_staff
+from scripts.production import staff, worker
 from scripts.shutdown import pane_record
+from scripts.shutdown.launch_names import LaunchNames
 from scripts.lib.agent_program import resolve_program
-from scripts.lib.resume_message import resume_message
+from scripts.lib.models_registry import agent_environment
+from scripts.lib.resume_message import NO_WORKERS, resume_message
+from scripts.whoami.account import NAMED_ACCOUNT_VARIABLES
 
 HOLD_SECONDS = 300
 POLL_SECONDS = 0.5
@@ -39,10 +46,18 @@ def restored_launch(argv: list[str], environment: dict[str, str]) -> tuple[list[
     entry = pane_record.matching_launch(place, identity)
     if entry is None:
         return argv, environment
-    entry = session_staff.record_membership(entry)
-    restored = {**environment, **entry["environment"]}
+    restored = {**environment, **LaunchNames.read().environment(entry)}
+    restored.update({key: environment[key] for key in NAMED_ACCOUNT_VARIABLES if key in environment})
     if not parsed.has_prompt and environment.get("RELAUNCH_PROMPT_DELIVERY") != "pane":
-        argv = [*argv, resume_message("you were stopped and resumed")]
+        workers = NO_WORKERS
+        try:
+            record = staff.snapshot()
+            row = record.by_current_session(identity)
+            if row is not None:
+                workers = worker.resume_workers(row.id, record)
+        except (OSError, ValueError) as error:
+            print(f"{identity}: workers anomaly: {error}", file=sys.stderr)
+        argv = [*argv, resume_message("you were stopped and resumed", workers=workers)]
     return argv, restored
 
 
@@ -162,7 +177,7 @@ def run(argv: list[str]) -> int:
             _ = signal.signal(number, ignore)
         for number in (signal.SIGTERM, signal.SIGHUP):
             _ = signal.signal(number, forward)
-        child = subprocess.Popen(argv, env={**environment, "RELAUNCH_SUPERVISED": "1"})
+        child = subprocess.Popen(argv, env=agent_environment({**environment, "RELAUNCH_SUPERVISED": "1"}))
         code = child.wait()
     finally:
         for number, handler in previous.items():

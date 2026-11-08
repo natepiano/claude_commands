@@ -2,6 +2,10 @@
 """Report the pre-registered nextest-width switchback trial."""
 
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import argparse
 import hashlib
@@ -19,11 +23,11 @@ from typing import Literal, NamedTuple, TypedDict, cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lint"))
 
-import store
-import index as buildlog_index
-from memory_admit import expected_peak, git_identity, test_threads, read_memory_config
+from scripts.buildlog import store
+from scripts.buildlog import index as buildlog_index
+from scripts.lint.memory_admit import expected_peak, git_identity, test_threads, read_memory_config
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
-from user_zone import user_zone  # noqa: E402
+from scripts.lib.user_zone import user_zone  # noqa: E402
 
 BLOCK_S = 6000
 WASHOUT_S = 900

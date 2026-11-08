@@ -11,7 +11,6 @@ from __future__ import annotations
 import json
 import os
 import subprocess
-import sys
 import tempfile
 import unittest
 from contextlib import closing
@@ -19,12 +18,12 @@ from pathlib import Path
 from typing import TYPE_CHECKING, cast, override
 from unittest import mock
 
-import index
-import parse
-import repository
-import test_record as record_tests
-from store import UNKNOWN_IDENTITY
-from test_index import use_test_log
+from scripts.buildlog import index
+from scripts.buildlog import parse
+from scripts.buildlog import repository
+from scripts.buildlog import test_record as record_tests
+from scripts.buildlog.store import UNKNOWN_IDENTITY
+from scripts.buildlog.test_index import use_test_log
 
 if TYPE_CHECKING:
     from ..lib import test_hang_guard
@@ -343,7 +342,7 @@ assert len({id(module) for module in modules.values()}) == 1, list(modules)
                 arguments = ["step", "0", str(record_tests.START), str(record_tests.START + 1),
                              "0", str(handoff), "", *record_tests.NEXTEST]
                 result = subprocess.run(
-                    [sys.executable, "-c", source, mode, str(record_tests.SCRIPT), json.dumps(arguments)],
+                    [str(Path(__file__).resolve().parents[2] / "scripts/lib/py"), "-c", source, mode, str(record_tests.SCRIPT), json.dumps(arguments)],
                     cwd=self.fixture.repo, env=self.fixture.environment(), capture_output=True, text=True,
                     timeout=test_hang_guard.TEST_HANG_GUARD_SECS,
                 )

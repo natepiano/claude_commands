@@ -2,9 +2,8 @@
 
 from __future__ import annotations
 
-from ledger_test_support import ticket_owner_id
+from scripts.style.ledger_test_support import ticket_owner_id
 
-import sys
 import subprocess
 import unittest
 from dataclasses import replace
@@ -12,19 +11,18 @@ from pathlib import Path
 from typing import final
 from unittest import mock
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-import approved_renames
-import style_footprint
-import style_plan
-import style_proposals
+from scripts.style import approved_renames
+from scripts.style import style_footprint
+from scripts.style import style_plan
+from scripts.style import style_proposals
 
-import berth_board
-import rules
-import style_ledger
-from issues import Issue, frontmatter
+from scripts.lib import berth_board
+from scripts.style import rules
+from scripts.style import style_ledger
+from scripts.production.issues import Issue, frontmatter
 
-from style_plan_test_support import StylePlanFixture
+from scripts.style.style_plan_test_support import StylePlanFixture, unit_staff_id
 
 
 @final
@@ -91,7 +89,7 @@ class StylePlanTests(StylePlanFixture):
         second = self.approved_decision(rule, files[25:], "type", name="b-second")
         _ = self.refill_decisions()
         with self.ledger() as ledger:
-            ticket, = ledger.ticket_open(ticket_owner_id("names-unit"))
+            ticket, = ledger.ticket_open(ticket_owner_id("names"))
             self.assertEqual(ticket["files"], list(files[:25]))
             self.assertEqual(ticket["proposal"], str(first))
             self.assertEqual(ledger.ticket_proposals(ticket["id"]), (first,))
@@ -106,7 +104,7 @@ class StylePlanTests(StylePlanFixture):
         second = self.approved_decision(rule, files[:25], "type", name="b-second")
         _ = self.refill_decisions()
         with self.ledger() as ledger:
-            ticket, = ledger.ticket_open(ticket_owner_id("names-unit"))
+            ticket, = ledger.ticket_open(ticket_owner_id("names"))
             self.assertEqual(ticket["files"], list(files[:25]))
             self.assertEqual(ticket["proposal"], str(second))
             self.assertEqual(ledger.ticket_proposals(ticket["id"]), (second,))
@@ -126,7 +124,7 @@ class StylePlanTests(StylePlanFixture):
     def test_combined_ticket_closes_each_decision_with_the_same_build_credit(self) -> None:
         issues, ticket_id = self.combined_decision_ticket()
         with self.ledger() as ledger:
-            ticket, = ledger.ticket_open(ticket_owner_id("names-unit"))
+            ticket, = ledger.ticket_open(ticket_owner_id("names"))
             ledger.ticket_checkpoint(ticket_id, self.tip)
             _ = ledger.ticket_merge(ticket_id)
             for identity in ticket["finding_ids"]:
@@ -162,7 +160,7 @@ class StylePlanTests(StylePlanFixture):
         issue = self.approved_decision(rule, files, "rename")
         _ = self.refill_decisions()
         with self.ledger() as ledger:
-            ticket, = ledger.ticket_open(ticket_owner_id("names-unit"))
+            ticket, = ledger.ticket_open(ticket_owner_id("names"))
             self.assertEqual(ticket["files"], list(files[:25]))
             self.assertEqual(len(ticket["finding_ids"]), 25)
             self.assertEqual(sum(isinstance(f.build_ticket, style_ledger.NoBuildTicket)
@@ -176,7 +174,7 @@ class StylePlanTests(StylePlanFixture):
         second = self.approved_decision(secondary, (self.sources[0], self.sources[2]), "type", name="b-second")
         _ = self.refill_decisions()
         with self.ledger() as ledger:
-            ticket, = ledger.ticket_open(ticket_owner_id("names-unit"))
+            ticket, = ledger.ticket_open(ticket_owner_id("names"))
             self.assertEqual(ticket["files"], list(self.sources[:2]))
             self.assertEqual(ticket["rules"], [primary, secondary])
             self.assertEqual(set(ticket["finding_ids"]), {f.finding_id for issue in (first, second)
@@ -199,7 +197,7 @@ class StylePlanTests(StylePlanFixture):
         with mock.patch.object(berth_board, "read_board", return_value=self.board(files[1])):
             _ = self.refill_decisions()
         with self.ledger() as ledger:
-            ticket, = ledger.ticket_open(ticket_owner_id("names-unit"))
+            ticket, = ledger.ticket_open(ticket_owner_id("names"))
             self.assertEqual(ticket["files"], list(files[2:]))
             self.assertEqual(len(ticket["finding_ids"]), 8)
             self.assertNotIn(declined.finding_id, ticket["finding_ids"])
@@ -224,7 +222,7 @@ class StylePlanTests(StylePlanFixture):
         _ = self.refill_decisions()
         self.assertIn("**Workers:**\n1 writer; no tester.\n", self.plan.read_text())
         with self.ledger() as ledger:
-            ticket, = ledger.ticket_open(ticket_owner_id("names-unit"))
+            ticket, = ledger.ticket_open(ticket_owner_id("names"))
             for changed in (replace(finding, line=1, before="production", after="changed"),
                             replace(finding, line=1, before="production comment", after="changed comment"),
                             replace(finding, after="42); } } pub fn escaped() {} #[cfg(test)] mod more { fn check() { consume(43")):
@@ -257,7 +255,7 @@ class StylePlanTests(StylePlanFixture):
         self.assertEqual(runner.call_args_list, [mock.call(self.unit, stage, "alpha")
                                                for stage in ("check", "lint", "test")])
         with self.ledger() as ledger:
-            ticket, = ledger.ticket_open(ticket_owner_id("names-unit"))
+            ticket, = ledger.ticket_open(ticket_owner_id("names"))
             snapshot = style_footprint.worktree_commit(self.unit)
             self.assertEqual(ledger.ticket_changed_paths(ticket, snapshot), frozenset((own, pending)))
 
@@ -294,15 +292,14 @@ class StylePlanTests(StylePlanFixture):
         for path in files:
             finding = ledger.hold(rule, path, 1, "split", "restructure", "before", "after", blob, "outside")
             ledger.file_held(finding.finding_id, issue)
-        _ = issue.write_text("---\nstatus: open\ntags: [proposal, style]\nunit: names-unit\nplan: approved\n"
-                             + f"style_rule: {rule}\nstyle_crate: crates/alpha\nstyle_rule_blob: {blob}\n---\n")
+        _ = issue.write_text(f"---\nstatus: open\ntags: [proposal, style]\nunit: {unit_staff_id('names')}\nplan: approved\nstyle_rule: {rule}\nstyle_crate: crates/alpha\nstyle_rule_blob: {blob}\n---\n")
         self.proposals_field(folder)
         first_slice = style_plan.read_slices(self.repo, self.tip, files, style_plan.BatchLimits(6, 3000, 5))[0]
         with (mock.patch.object(berth_board, "read_board", return_value=self.board(*first_slice)),
               mock.patch.object(style_proposals, "proposal_command")):
             code, _, errors = self.run_next()
         self.assertEqual(code, 0, errors)
-        first_ticket = ledger.ticket_open(ticket_owner_id("names-unit"))[0]
+        first_ticket = ledger.ticket_open(ticket_owner_id("names"))[0]
         self.assertLessEqual(len(first_ticket["files"]), 6)
         self.assertFalse(set(first_ticket["files"]) & set(first_slice))
         ledger.ticket_drop(first_ticket["id"])
@@ -313,7 +310,7 @@ class StylePlanTests(StylePlanFixture):
             for _ in range(40):
                 code, _, errors = self.run_next()
                 self.assertEqual(code, 0, errors)
-                ticket = ledger.ticket_open(ticket_owner_id("names-unit"))[0]
+                ticket = ledger.ticket_open(ticket_owner_id("names"))[0]
                 self.assertEqual(ticket["kind"], "proposal")
                 self.assertLessEqual(len(ticket["files"]), 6)
                 self.assertFalse(built & set(ticket["files"]))

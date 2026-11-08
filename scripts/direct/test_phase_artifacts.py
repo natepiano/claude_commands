@@ -59,12 +59,6 @@ class PhaseArtifactTests(unittest.TestCase):
         _ = self.write("phases/4/project-review_status_adversary", "reviewing\n")
         self.assertEqual(direct_run.running_work(self.session), "a review pass")
 
-    def test_running_work_recognizes_the_simplify_status_writer(self) -> None:
-        from scripts.lib.atomic_file import write_text_atomic
-
-        write_text_atomic(self.session / "phases/4/review_status_simplify", "reviewing\n")
-        self.assertEqual(direct_run.running_work(self.session), "a review pass")
-
     def test_a_phase_implementing_counts_as_running_work(self) -> None:
         _ = self.write("phases/3/fix7_status", "running\n")
         self.assertEqual(direct_run.running_work(self.session), "an implementation or fix pass")

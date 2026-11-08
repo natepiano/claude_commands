@@ -1,7 +1,7 @@
 import { describe, expect, mock, test } from "claude-code/testing";
 import type { Engine, Mounted } from "claude-code/testing";
 import type { CommandRunInput, RenderSurface, TurnCompleteInput } from "claude-code";
-import { refreshIfChanged } from "../hooks/data";
+import { loadBoard, refreshIfChanged } from "../hooks/data";
 import { BOARD, CWD, DISCOVERY, drawnText, engineFiles, fixture, hostEngine, lifecycleHarness, NOW, REGISTRY, RUN, SESSION, time } from "./kit";
 
 const command = (args = ""): CommandRunInput => ({ command: "showrunner:unit_board", args,
@@ -21,6 +21,23 @@ async function press<Surface extends RenderSurface>(ui: Mounted<Surface, "Pane">
 }
 
 describe("unit board commands and lifetime", () => {
+  test("the reader keeps the staff-id path after a production rename", async () => {
+    const board = fixture();
+    const reads: string[] = [];
+    const calls = {
+      home: async () => "/test-home", registry: async () => REGISTRY, now: async () => NOW,
+      run: async () => ({ exitCode: 0, stdout: JSON.stringify({ files: [BOARD], watch: [REGISTRY] }),
+        stderr: "", isStdoutTruncated: false, isStderrTruncated: false }),
+      read: async (path: string) => { reads.push(path); return JSON.stringify(board); },
+    };
+    const before = await loadBoard(calls, SESSION, () => true, () => {});
+    board.production = "renamed";
+    const after = await loadBoard(calls, "cleared-session", () => true, () => {});
+    expect(after.files).toEqual(before.files);
+    expect(reads).toEqual([BOARD, BOARD]);
+    expect(after.boards[0]?.production).toBe("renamed");
+  });
+
   test("startup registers no commands", async ($, on) => {
     mock.env(on, { HOME: "/test-home", USER_ZONE: "UTC" });
     const registered: string[] = [];
@@ -596,12 +613,12 @@ describe("accounts pane clock", () => {
       const ui = await $.ui.mount({ plugin: "unit-board", requestId: "accounts", component: "Pane", surface,
         props: { ...props, title: "Accounts", bodyColumns: 120 } });
       const before = drawnText(await ui.drawn()).replace(/\s+/g, " ");
-      expect(before).toContain("account left role busy shell idle total resets credits enabled");
-      expect(before).toMatch(/● Fixture 60% workers 23:59 total 0 0 0\s*$/);
+      expect(before).toContain("account left role busy idle paused exited total resets credits enabled");
+      expect(before).toMatch(/● Fixture 60% workers 23:59 total 0 0 0 0 0\s*$/);
       await fake.clock.advance(10_000);
       const after = drawnText(await ui.drawn()).replace(/\s+/g, " ");
-      expect(after).toContain("account left role busy shell idle total resets credits enabled");
-      expect(after).toMatch(/● Fixture 60% workers Fri 23:59 total 0 0 0\s*$/);
+      expect(after).toContain("account left role busy idle paused exited total resets credits enabled");
+      expect(after).toMatch(/● Fixture 60% workers Fri 23:59 total 0 0 0 0 0\s*$/);
       expect(fake.snapshots.at(-1)?.now).toBe((midnight + 5_000) / 1000);
       expect(fake.processes.length).toBe(1);
       expect(fake.reads).toEqual([]);

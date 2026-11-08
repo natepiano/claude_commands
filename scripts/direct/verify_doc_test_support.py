@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from scripts.build_queue.admission_test_support import caller_admission
-from scripts.lib.py_floor_test_support import cache_file_name
+from scripts.lib.py_floor_test_support import seed_interpreter_cache
 
 from scripts.lint.memory_test_support import config_environment, write_config_fixture
 
@@ -134,7 +134,7 @@ class VerifyDocFixture(unittest.TestCase):
         self.executable(tools / "cargo", CARGO_STUB)
         self.executable(tools / "rustc", '#!/bin/sh\nprintf "rustc fixture\\n"\n')
         targets = tools / "build-targets.py"
-        self.executable(targets, 'import sys\nif sys.argv[1] == "eligible": print("natedev_only test target\\nnatedev\\teligible\\t-\\t-")\n')
+        self.executable(targets, 'import sys\nif sys.argv[1] == "eligible": print("natedev_only test target\\nnatedev\\teligible\\t-\\t-\\t-")\n')
         for name in ("ssh", "rsync", "scp", "gh", "systemd-run"):
             self.executable(tools / name, "#!/bin/sh\nexit 99\n")
         for name in ("tmp", "state", "cache", "runtime", "target", "session"):
@@ -185,9 +185,7 @@ class VerifyDocFixture(unittest.TestCase):
         })
         # These are doc-policy tests, not interpreter-discovery tests. Exercise
         # the real shim's cache hit instead of revalidating Python every call.
-        cache = self.root / "cache/claude" / cache_file_name()
-        cache.parent.mkdir()
-        _ = cache.write_text(sys.executable + "\n", encoding="utf-8")
+        seed_interpreter_cache(self.root / "cache")
         _ = self.environment.pop("CLAUDE_PYTHON", None)
         _ = self.git("init", "-q", "-b", "test")
         _ = self.git("add", "-A")
@@ -230,9 +228,9 @@ import os
 from pathlib import Path
 import sys
 if sys.argv[1] == "eligible":
-    print("mac_allowed")
-    print("natedev\\teligible\\t-\\t-")
-    print("mac\\teligible\\t-\\t" + os.environ["MAC_TEST_CONFIG"])
+    print("any_target")
+    print("natedev\\teligible\\t-\\t-\\t-")
+    print("mac\\teligible\\t-\\t" + os.environ["MAC_TEST_CONFIG"] + "\\tmacos")
 elif sys.argv[1] in ("register-local", "check-local"):
     raise SystemExit(10)
 ''')

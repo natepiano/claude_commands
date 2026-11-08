@@ -1,6 +1,10 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
 """Start a Bevy upgrade watch and record the user's crate-specific answers."""
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import argparse
 import json
@@ -9,18 +13,16 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from typing import TypedDict, cast
 
 from scripts.production.production_doc import Production, Refusal, read_production
-import pins
-from scripts.production import session_staff, staff
-from scripts.production.store_owner import document_id
-import upstream
-import upgrade_check
-import upgrade_record
-import upgrade_report
-import upgrade_schedule
+from scripts.bevy_upgrade import pins
+from scripts.production import staff
+from scripts.bevy_upgrade import upstream
+from scripts.bevy_upgrade import upgrade_check
+from scripts.bevy_upgrade import upgrade_record
+from scripts.bevy_upgrade import upgrade_report
+from scripts.bevy_upgrade import upgrade_schedule
 
 
 class UpgradeUpdate(TypedDict):
@@ -33,7 +35,7 @@ class UpgradeUpdate(TypedDict):
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="bevy_upgrade")
     owner = parser.add_mutually_exclusive_group()
-    _ = owner.add_argument("--production", type=Path)
+    _ = owner.add_argument("--production")
     _ = owner.add_argument("--staff-id")
     verbs = parser.add_subparsers(dest="verb")
     _ = verbs.add_parser("status")
@@ -62,21 +64,17 @@ def _production(args: argparse.Namespace, record: staff.StaffSnapshot) -> Produc
         row = record.by_id(staff.StaffId(identity))
         if row is None or row.kind != "showrunner":
             raise Refusal(f"{identity}: showrunner ownership evidence is unavailable")
-        document = session_staff.RowResolver(record).production_doc(row)
-        if not isinstance(document, session_staff.ProductionDoc):
-            raise Refusal(f"{identity}: the production document is unavailable")
-        return read_production(document.path)
-    doc = cast(Path | None, args.production)
-    if doc is None:
-        runtime = os.environ.get("CODEX_THREAD_ID") or os.environ.get("CLAUDE_CODE_SESSION_ID", "")
+    else:
+        name = cast(str | None, args.production)
+        if name is not None:
+            return read_production(name, record)
+        runtime = staff.caller_identity()
         row = record.by_current_session(runtime)
-        if row is not None and row.kind == "showrunner":
-            document = session_staff.RowResolver(record).production_doc(row)
-            if isinstance(document, session_staff.ProductionDoc):
-                doc = document.path
-    if doc is None:
-        raise Refusal("this session runs no production; pass --production <doc>")
-    return read_production(doc)
+        if row is None or row.kind != "showrunner":
+            raise Refusal("this session runs no production; pass --production <name>")
+    if isinstance(row.doc, staff.DocUnfilled):
+        raise Refusal(f"cannot read production doc: {row.name}: no production document")
+    return read_production(row)
 
 
 def _baseline(record: upgrade_record.Record) -> None:
@@ -155,7 +153,7 @@ def _run(args: argparse.Namespace, production: Production, now: datetime, identi
             current = upgrade_record.load(identity)
             if current is None:
                 if not scheduled:
-                    print(f"no Bevy upgrade is tracked for {production.slug}; start one with /showrunner:bevy_upgrade start <version>")
+                    print(f"no Bevy upgrade is tracked for {production.name}; start one with /showrunner:bevy_upgrade start <version>")
                 return 0
             if verb == "check" and current["closed"] is not None:
                 if scheduled:
@@ -236,7 +234,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         record = staff.snapshot()
         production = _production(args, record)
-        identity = document_id(production.doc, record=record)
+        identity = production.owner.id
         return _run(args, production, datetime.now(timezone.utc), identity)
     except (upgrade_record.RecordFailure, pins.PinsFailure, Refusal, staff.StaffRefused, staff.StaffUnreadable) as error:
         print(f"bevy_upgrade: {error}", file=sys.stderr)

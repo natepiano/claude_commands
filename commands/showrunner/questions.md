@@ -10,7 +10,7 @@ argument-hint: "[<production doc>]"
 3. Report an error in one line when the command fails.
 
 ```sh
-python3 ~/.claude/scripts/production/update_registration.py questions-table [--production <production doc>]
+~/.claude/scripts/lib/py ~/.claude/scripts/production/update_registration.py questions-table [--production <showrunner name>]
 ```
 
 Without `--production`, the command finds the production through the session's update timer.
@@ -26,7 +26,7 @@ With no open questions, the command prints `no open questions`. Use `/next quest
 For an existing JSON question list, run the store migration once:
 
 ```sh
-python3 ~/.claude/scripts/production/update_registration.py migrate-questions --production <production doc>
+~/.claude/scripts/lib/py ~/.claude/scripts/production/update_registration.py migrate-questions --production <showrunner name>
 ```
 
 Migration writes question records and removes questions from the JSON list under one lock. Reminders remain in JSON.

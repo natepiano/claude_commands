@@ -6,10 +6,8 @@ argument-hint: "<child> [parent] | detach <child> | tree"
 # Attach
 
 **Usage:** `/showrunner:attach <child> [parent]`, `/showrunner:attach detach <child>`,
-`/showrunner:attach tree`. A child and a parent are named by production slug
-(the production doc's file name without `-production.md`) or, for the caller's
-own production, left out. A former slug, from the doc's **Formerly** line
-after `/showrunner:rename`, names the same production.
+`/showrunner:attach tree`. Use each showrunner row's staff name for the child and parent.
+Omit the name for the caller's own production.
 
 Run `"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/production/showrunners.py" <verb> …`
 with the sandbox off, and print its output as it comes:
@@ -30,7 +28,7 @@ with the sandbox off, and print its output as it comes:
 - the child already reports to a showrunner: detach it first;
 - the parent already reports to the child, directly or through others;
 - a running child or parent has a session name that is not its production's
-  slug: rename the production first (`/showrunner:rename`).
+  staff name: rename the showrunner first (`/showrunner:rename`).
 
 A child showrunner is never a unit. It keeps its own production doc, update
 timer, merge branch and units, and its staff row is a showrunner row.

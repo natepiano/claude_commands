@@ -51,7 +51,7 @@ class VerifyHoldWaitTests(VerifyHoldWaitFixture):
         self.assertEqual(len(self.fixture.local_runs()), 1)
 
     def test_unheld_local_call_needs_no_release(self) -> None:
-        result = self.fixture.verify("test", "sample", "--local", "local admission test", "--filter", "smoke")
+        result = self.run_unblocked_step("test")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertNotIn("natedev is held", result.stdout + result.stderr)
         self.assertEqual(len(self.fixture.local_runs()), 1)
@@ -63,7 +63,7 @@ class VerifyHoldWaitTests(VerifyHoldWaitFixture):
         for arguments in (("check", "sample"), ("test", "sample", "--local", "local admission test", "--filter", "smoke")):
             with self.subTest(arguments=arguments):
                 starts.unlink(missing_ok=True)
-                result = self.fixture.verify(*arguments)
+                result = self.run_unblocked_step(arguments[0])
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 self.assertEqual(self.hold_commands(starts), [])
                 self.assertEqual(self.recorded_hold_wait(), 0)
@@ -112,7 +112,7 @@ class VerifyHoldWaitTests(VerifyHoldWaitFixture):
 
     def test_unreadable_hold_state_starts_no_local_step(self) -> None:
         _ = Path(self.fixture.environment["BUILD_HOLD_DIR"]).write_text("not a directory")
-        result = self.fixture.verify("test", "sample", "--local", "local admission test", "--filter", "smoke")
+        result = self.run_unblocked_step("test")
         self.assertEqual(result.returncode, 12, result.stdout + result.stderr)
         self.assertIn("hold state cannot be read", result.stdout + result.stderr)
         self.assertEqual(self.fixture.local_runs(), [])

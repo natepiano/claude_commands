@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from scripts.shutdown import remote
+
 import io
 from types import ModuleType
 import json
@@ -14,30 +16,24 @@ import unittest
 from contextlib import redirect_stdout
 from unittest import mock
 from pathlib import Path
-from typing import TYPE_CHECKING, ClassVar, TypedDict, cast, override
+from typing import ClassVar, TypedDict, cast, override
 
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-import update_registration
+from scripts.production import update_registration
 registration = update_registration
 from scripts.production import showrunners as showrunners
 from scripts.production import staff, unit_names
-import dailies_render as dailies_render
+from scripts.production import dailies_render as dailies_render
 from scripts.production.production_doc import read_production as read_production
 from scripts.production.cli_fixture import invoke_cli, production_paths
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.production.staff_test_support import (
-    fixture_member, fixture_showrunner_name, isolated_staff_file, recorded_showrunner, showrunner_launch, showrunner_relationship,
+    fixture_member, isolated_staff_file, recorded_showrunner, showrunner_launch, showrunner_relationship,
 )
 
-if TYPE_CHECKING:
-    from scripts.notify import review as review
-else:
-    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "notify"))
-    import review as review
+from scripts.notify import review as review
 
 SCRIPT = Path(__file__).with_name("update_registration.py")
 
@@ -67,6 +63,10 @@ if args[0] == "status":
     print("next_due=1791334500 (2026-10-06 17:55 PDT)")
 elif args[0] == "new":
     instance.touch()
+    timer = Path(os.environ["NOTIFIER_STATE_DIR"]) / args[1]
+    timer.mkdir(parents=True, exist_ok=True)
+    target = args[args.index("--to") + 1] if "--to" in args else ""
+    (timer / "conf").write_text(f"TARGET={target}\\n", encoding="utf-8")
     print("next_due=1791334500 (2026-10-06 17:55 PDT)")
 elif args[0] == "remove":
     instance.unlink(missing_ok=True)
@@ -87,6 +87,7 @@ class RegistrationFixture(unittest.TestCase):
     home: Path = Path()
     checkout: Path = Path()
     doc: Path = Path()
+    owner_id: staff.StaffId = staff.StaffId("")
     state: Path = Path()
     config: Path = Path()
     env: dict[str, str] = {}
@@ -120,6 +121,8 @@ class RegistrationFixture(unittest.TestCase):
         _ = shutil.copytree(self.fixture_snapshot, self.fixture_root)
         self.addCleanup(shutil.rmtree, self.fixture_root)
         self.bind_fixture(self.fixture_root)
+        self.owner_id = next(row.id for row in staff.snapshot().find(kind="showrunner")
+                             if isinstance(row.doc, (staff.LiveDoc, staff.WrappedDoc)) and row.doc.path == self.doc)
 
     def bind_fixture(self, root: Path) -> None:
         self.root = root
@@ -127,7 +130,7 @@ class RegistrationFixture(unittest.TestCase):
         self.checkout = self.root / "checkout"
         self.state = self.root / "state"
         self.config = self.root / "showrunners.json"
-        self.doc = self.checkout / "docs/plans/example-production.md"
+        self.doc = self.checkout / "docs/plans/registration-notes.md"
         bin_dir = self.root / "bin"
         self.env = {**os.environ, "HOME": str(self.home), "USER_ZONE": "America/Los_Angeles", "PATH": str(bin_dir) + os.pathsep + os.environ.get("PATH", ""),
                     "REGISTRATION_TEST_STATE": str(self.state), "SHOWRUNNER_STATE_DIR": str(self.state / "showrunner"),
@@ -153,7 +156,7 @@ class RegistrationFixture(unittest.TestCase):
         zsh = bin_dir / "zsh"
         _ = zsh.write_text("#!/bin/sh\nexec '" + sys.executable + "' \"$@\"\n", encoding="utf-8")
         zsh.chmod(0o755)
-        # Register refuses a session not named for its production's slug: both live sessions are named example.
+        # Register refuses a session not named for its production's name: both live sessions are named example.
         (self.state / "sessions").mkdir()
         for pid, session in ((os.getpid(), "current-session-id"), (os.getppid(), "resume-session-id")):
             _ = (self.state / "sessions" / f"{pid}.json").write_text(
@@ -170,13 +173,14 @@ class RegistrationFixture(unittest.TestCase):
         _ = self.doc.write_text("\n".join((
             "# Production — example", "", "## Production Context", "",
             "- **Merge branch:** `production`", f"- **Showrunner checkout:** `{self.checkout}`",
-            "- **Showrunner session:** first-showrunner", "- **Log:** `production.log`",
+            "- **Log:** `production.log`",
             "- **User zone:** America/Los_Angeles", "- **Updates:** every 15 minutes",
-            f"- **Proposals:** `{self.root / 'issues'}`", "", "## Gates", "",
+            f"- **Proposals:** `{self.root / 'issues'}`", "",
         )), encoding="utf-8")
-        runner = recorded_showrunner(fixture_showrunner_name("example", self.doc), self.doc)
+        runner = recorded_showrunner("example", self.doc)
+        self.owner_id = runner.id
         _ = fixture_member("unit", name="alpha", parent=runner.id,
-                           worktree=staff.PresentWorktree("natedev", alpha))
+                           worktree=staff.PresentWorktree(remote.local_machine(), alpha))
         _ = self.git("add", ".")
         _ = self.git("commit", "-m", "initial")
 
@@ -185,6 +189,10 @@ class RegistrationFixture(unittest.TestCase):
                                  capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(process.returncode, 0, process.stderr)
         return process.stdout.strip()
+
+    def fixture_owner_name(self) -> str:
+        return next(row.name for row in staff.snapshot().find(kind="showrunner")
+                    if row.id == self.owner_id)
 
     def run_command(self, *args: str, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
         environment = env or self.env
@@ -207,7 +215,7 @@ class RegistrationFixture(unittest.TestCase):
 
         with (mock.patch.object(subprocess, "run", run),
               mock.patch.object(showrunners, "SCRATCH_ROOT", Path(environment.get("SHOWRUNNER_SCRATCH_ROOT", "/tmp")))):
-            return invoke_cli(registration, registration.main, [*args, "--production", str(self.doc)],
+            return invoke_cli(registration, registration.main, [*args, "--production", self.fixture_owner_name()],
                               environment, self.checkout, production_state=True)
 
     def notifier_calls(self) -> list[list[str]]:
@@ -217,12 +225,13 @@ class RegistrationFixture(unittest.TestCase):
 
     def outstanding(self) -> Path:
         owner = next(row for row in staff.snapshot().find(kind="showrunner")
-                     if isinstance(row.doc, (staff.LiveDoc, staff.WrappedDoc)) and row.doc.path == self.doc)
+                     if row.id == self.owner_id)
         path = self.state / "showrunner/outstanding" / f"{owner.id}.json"
         path.parent.mkdir(parents=True, exist_ok=True)
         return path
 
     def build_command_copy(self, tree: Path) -> None:
+        _ = self.question_instance()
         _ = shutil.copytree(SCRIPT.parent.parent, tree / "scripts",
                             ignore=shutil.ignore_patterns("__pycache__"))
         hooks = tree / "scripts/hooks"
@@ -238,7 +247,7 @@ class RegistrationFixture(unittest.TestCase):
         return tree / "scripts/production/update_registration.py"
 
     def run_copy(self, script: Path, *args: str) -> subprocess.CompletedProcess[str]:
-        return subprocess.run([sys.executable, str(script), *args, "--production", str(self.doc)],
+        return subprocess.run([sys.executable, str(script), *args, "--production", self.fixture_owner_name()],
                               cwd=self.checkout, env=self.env, capture_output=True, text=True, check=False,
                               timeout=TEST_HANG_GUARD_SECS)
 
@@ -256,55 +265,53 @@ class RegistrationFixture(unittest.TestCase):
         with (mock.patch.dict(os.environ, self.env), production_paths(self.env),
               mock.patch.object(showrunners, "NOTIFIER_STATE_DIR", self.state / "notifier"),
               redirect_stdout(io.StringIO()) as output):
-            registration.questions(read_production(self.doc), state)
+            registration.questions(read_production("example"), state)
         return output.getvalue()
 
     def question_instance(self) -> Path:
-        instance = self.state / "notifier/showrunner-example"
+        instance = self.state / "notifier" / f"showrunner-{self.owner_id}"
         instance.mkdir(parents=True, exist_ok=True)
-        _ = (instance / "conf").write_text("TARGET=session:current-session-id\n")
+        _ = (instance / "conf").write_text(f"TARGET=session:{self.owner_id}\n")
         return instance
 
-    def timer(self, slug: str) -> None:
+    def timer(self, name: str) -> None:
         """A production with a complete update timer, so the tree counts it."""
-        instance = self.state / "notifier" / f"showrunner-{slug}"
-        instance.mkdir(parents=True)
-        document = self.document_for(slug)
-        row_id = self.fixture_staff_id(slug=slug)
+        _ = self.document_for(name)
+        row_id = self.fixture_staff_id(name=name)
         row = staff.by_id(row_id)
         assert row is not None
+        instance = self.state / "notifier" / f"showrunner-{row.id}"
+        instance.mkdir(parents=True)
         _ = (instance / "conf").write_text(
-            f"TARGET=session:{row.id}\nCHECK=zsh /x/production_check.sh {document}\n", encoding="utf-8")
+            f"TARGET=session:{row.id}\nCHECK=zsh /x/production_check.sh {row.id}\n", encoding="utf-8")
         showrunner_launch(row, row.id, self.env)
 
     def attach(self, child: str, parent: str) -> None:
-        _ = showrunner_relationship(fixture_showrunner_name(child, self.doc), fixture_showrunner_name(parent, self.doc))
+        _ = showrunner_relationship(child, parent)
 
-    def document_for(self, slug: str) -> Path:
-        if slug == "example":
+    def document_for(self, name: str) -> Path:
+        if name == "example":
             return self.doc
-        document = self.doc.with_name(f"{slug}-production.md")
+        document = self.doc.with_name(f"{name}-production.md")
         if not document.exists():
-            write_text_atomic(document, self.doc.read_text().replace("example", slug).replace(
-                "- **Showrunner session:** first-showrunner", f"- **Showrunner session:** {slug}"))
+            write_text_atomic(document, self.doc.read_text().replace("example", name))
         return document
 
-    def fixture_staff_id(self, reference: str = "", slug: str = "example") -> staff.StaffId:
+    def fixture_staff_id(self, reference: str = "", name: str = "example") -> staff.StaffId:
         record = staff.initial_snapshot()
         fixed = record.by_id(staff.StaffId(reference)) if reference else None
         if fixed is not None:
             return fixed.id
-        name = fixture_showrunner_name(slug, self.doc)
         matches = [row for row in record.find(kind="showrunner") if row.name == name]
         owner = matches[0] if matches else fixture_member("showrunner", name=name)
-        _ = staff.set_doc(owner.id, staff.LiveDoc("natedev", self.document_for(slug)))
+        _ = staff.set_doc(owner.id, staff.LiveDoc(remote.local_machine(), self.document_for(name)))
         if not reference or reference == "showrunner":
             return owner.id
         return fixture_member("unit", name=unit_names.name(reference), parent=owner.id,
-                              worktree=staff.PresentWorktree("natedev", self.root / unit_names.name(reference))).id
+                              worktree=staff.PresentWorktree(remote.local_machine(), self.root / unit_names.name(reference))).id
 
-    def write_open_for(self, slug: str, *items: dict[str, str]) -> None:
-        owner = self.fixture_staff_id(slug=slug)
+    def write_open_for(self, name: str, *items: dict[str, str]) -> None:
+        owner = self.fixture_staff_id(name=name)
         folder = self.root / "issues"
         for path in folder.glob("*.md"):
             if f"production_id: {owner}\n" in path.read_text():
@@ -314,7 +321,7 @@ class RegistrationFixture(unittest.TestCase):
             if "question" not in item:
                 reminders.append(item)
                 continue
-            fields = {**item, "asked_by": self.fixture_staff_id(item.get("asked_by", ""), slug=slug)}
+            fields = {**item, "asked_by": self.fixture_staff_id(item.get("asked_by", ""), name=name)}
             text = (f"---\nrecord_type: question\ntags: [question]\nstatus: open\nproduction_id: {owner}\n"
                     + f"asked_by: {fields['asked_by']}\nregistration: {json.dumps(fields)}\n---\n"
                     + f"# {fields['text']}\n\n{fields['question']}\n")
@@ -323,7 +330,7 @@ class RegistrationFixture(unittest.TestCase):
 
     def open_rows(self) -> list[dict[str, str]]:
         with mock.patch.dict(os.environ, self.env), production_paths(self.env):
-            rows = registration.open_entries(read_production(self.doc), registration.QuestionStaff.read())
+            rows = registration.open_entries(read_production("example"), registration.QuestionStaff.read())
             return cast(list[dict[str, str]], cast(object, rows))
 
     def read_items(self, path: Path | None = None) -> list[dailies_render.Outstanding]:
@@ -351,5 +358,5 @@ class RegistrationFixture(unittest.TestCase):
         with (mock.patch.dict(os.environ, self.env), production_paths(self.env),
               mock.patch.object(showrunners, "NOTIFIER_STATE_DIR", self.state / "notifier"),
               redirect_stdout(io.StringIO()) as output):
-            registration.ask(read_production(self.doc), text, question, unit, dailies_render.Ranking())
+            registration.ask(read_production("example"), text, question, unit, dailies_render.Ranking())
         return output.getvalue()

@@ -12,7 +12,7 @@ Run:
 bash ~/.claude/scripts/agents/default_models.sh $ARGUMENTS
 ```
 
-**Always run `default_models.sh` with `dangerouslyDisableSandbox: true`.** Edits atomically update shared `config/models.conf`, then commit only that file as `config(agents): …` and push to origin. The writer fetches and fast-forwards before editing; a rejected push replays the row change, up to three tries. Unrelated work stays in place. Status can also publish catalog additions. There is no local override file.
+**Always run `default_models.sh` with `dangerouslyDisableSandbox: true`.** Edits atomically update shared `config/models.conf`, then commit only that file as `config(models): …` and push to origin. The writer fetches and fast-forwards before editing; a rejected push replays the row change, up to three tries. Unrelated work stays in place. Status can also publish catalog additions. There is no local override file.
 
 Relay the script's stdout and stderr exactly, except status output — see below. If it exits non-zero, stop; do not invent a correction.
 
@@ -77,7 +77,7 @@ On success the edit prints a `# updated [<function>.<family>] <task> — live|do
 /default_models <function>.<subtask> <fast|flex|default|pace|inherit>
 ```
 
-`pace` lets `~/.claude/scripts/whoami/codex_pacer.py` choose fast or default at each launch, so the Codex quota reaches every weekly reset with 5% left; it shows as `pace(<current choice>)`. Any other tier takes it back. `python3 ~/.claude/scripts/whoami/codex_pacer.py status` explains the plan — relay it as-is when asked how pacing stands.
+`pace` lets `~/.claude/scripts/whoami/codex_pacer.py` choose fast or default at each launch, so the Codex quota reaches every weekly reset with 5% left; it shows as `pace(<current choice>)`. Any other tier takes it back. `~/.claude/scripts/lib/py ~/.claude/scripts/whoami/codex_pacer.py status` explains the plan — relay it as-is when asked how pacing stands.
 
 Writes `codex_service_tier` (or `codex_service_tier.<subtask>`, which beats it) in `[<function>.options]`, for every function with a codex set, one function, or one row. `inherit` deletes the key: a row then follows its function, a function `~/.codex/config.toml`. A wider level clears the row keys beneath it. Claude rows never take a tier — Claude fast mode bills extra usage — so a tier on a function running claude is stored dormant.
 

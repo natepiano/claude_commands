@@ -1,7 +1,8 @@
 # Unit rename
 
-`rename_unit.py plan|apply|verify <slug> <old> <new>` renames one staff unit.
+`rename.py plan|apply <old> <new>` renames one staff unit.
 The command reads the unit from its staff row.
+Use a staff id, `showrunner/name`, or a unique name; see `production-rename.md`.
 It keeps the staff id, current session, parent, and recorded role.
 A pending rename finishes before the command sets the displays.
 A same-name request sets the session, tab, and pane names to the staff name.
@@ -19,7 +20,7 @@ The move stops the live unit and its live workers.
 It moves the Git worktree and changes the branch while the sessions are stopped.
 It writes the staff location and resumes the same current sessions in their panes.
 A stopped session stays stopped.
-A restart failure prints `shutdown.py restart --only <staff-id>`.
+A restart failure prints `agents restart --only <staff-id>`.
 A retry reports stopped rows and keeps them stopped.
 The move limits come from `config/production.conf` at use.
 

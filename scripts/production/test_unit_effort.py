@@ -3,28 +3,26 @@ from __future__ import annotations
 
 from scripts.production.fake_unit_host import labeled as labeled_host
 
-from scripts.lib.test_models_registry import write_registry
+from scripts.lib.test_models_registry import RegistryReadProbe, write_registry
 
 import contextlib
 import io
 import json
 import os
-import sys
 import tempfile
 import unittest
 from pathlib import Path
 from typing import cast, override
 from unittest import mock
 
-import fake_unit_host
-import unit_effort
-import unit_lookup
-import herdr
-from fake_herdr import CommandResponse
-from fake_unit_host import HostedUnit
-from unit_effort import Ready, Skipped
+from scripts.production import fake_unit_host
+from scripts.production import unit_effort
+from scripts.production import unit_lookup
+from scripts.herdr import herdr
+from scripts.herdr.fake_herdr import CommandResponse
+from scripts.production.fake_unit_host import HostedUnit
+from scripts.production.unit_effort import Ready, Skipped
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.lib import models_registry  # noqa: E402
 from scripts.production.staff_test_support import StaffTestCase, isolated_staff_file, fixture_runtime_id, fixture_member
 
@@ -83,6 +81,7 @@ class UnitEffortTests(unittest.TestCase):
         synced = self.root / "catalog-sync-success"
         synced.touch()
         self.enterContext(mock.patch.dict(os.environ, {
+            "HOME": str(self.root),
             "HERDR_BIN": str(Path(__file__).parents[1] / "herdr/fake_herdr.py"),
             "HERDR_PROC": str(self.root / "proc"),
             "HERDR_PLATFORM": "linux",
@@ -96,9 +95,9 @@ class UnitEffortTests(unittest.TestCase):
         _ = self.enterContext(mock.patch.object(unit_lookup, "live_session", return_value=True))
         _ = self.enterContext(fake_unit_host.private_process_registry())
         units = [
-            labeled_host("review", "w1:p1", "review", slug="build-followups", screen=EMPTY),
-            labeled_host("widget", "w2:p1", "widget", slug="tool-based-ui", screen=screen("❯ my draft")),
-            labeled_host("trunk", "w3:p1", "trunk", slug="tool-based-ui", screen=screen("❯ \x1b[2mtry this\x1b[22m")),
+            labeled_host("review", "w1:p1", "review", production_name="build-followups", screen=EMPTY),
+            labeled_host("widget", "w2:p1", "widget", production_name="tool-based-ui", screen=screen("❯ my draft")),
+            labeled_host("trunk", "w3:p1", "trunk", production_name="tool-based-ui", screen=screen("❯ \x1b[2mtry this\x1b[22m")),
             HostedUnit("notes", "w4:p1", {}, EMPTY),
         ]
         identities = {unit.session: unit.marks["CODEX_THREAD_ID"] for unit in units
@@ -151,6 +150,20 @@ class UnitEffortTests(unittest.TestCase):
         ])
         self.assertEqual(self.sent(), [])
         self.assertEqual(self.director_row(), "director=opus:xhigh")
+
+    def test_each_effort_command_reads_one_base_and_its_children_share_it(self) -> None:
+        probe = RegistryReadProbe(self.root, self.registry)
+        for current, expected in (("opus:xhigh", "opus:high (now opus:xhigh)"),
+                                  ("sonnet:medium", "sonnet:high (now sonnet:medium)")):
+            with self.subTest(current=current):
+                _ = write_registry(self.registry, {"production.claude": {"director": current}})
+                probe.clear()
+                with probe.active(os.environ):
+                    code, output, errors = self.run_main("high", "--check")
+                self.assertEqual((code, errors), (0, ""))
+                self.assertIn("registry: production.director would be " + expected, output)
+                self.assertEqual(probe.total(), 1, probe.reads())
+        self.assertEqual(self.sent(), [])
 
     def test_every_productions_directors_get_effort_and_the_row_keeps_its_model(self) -> None:
         code, out, _ = self.run_main("high")

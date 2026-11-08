@@ -4,12 +4,16 @@
 Usage: astra_review.py [--run-directory <dir> --phase <id>] <document> [focus...]
 
 The review uses the workers account with read-only access and xhigh reasoning.
-A managed review publishes its worker before the app-server starts the turn.
+A managed review publishes its worker before it submits the prompt.
 The final message is saved under /tmp/claude/astra/ and printed.
 A failed review exits 1. A missing document or refused admission exits 2.
 """
 
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import os
 import subprocess
@@ -19,20 +23,18 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from scripts.astra import astra_roles  # noqa: E402
 from scripts.astra import astra_work, design_roles  # noqa: E402
+from scripts.lib import unit_runs
 from scripts.production import staff
+from scripts.lib.atomic_file import write_text_atomic
 
 MODEL = "gpt-6-astra"
 REASONING = "xhigh"
-# The reviewer's thread compacts above this many tokens.
-COMPACT_ABOVE_TOKENS = 200_000
 # Lines of Codex's own output a failure prints.
 ERROR_TAIL_LINES = 40
 SCRIPTS = Path(__file__).resolve().parents[1]
-# Tests point these at a stub and a temporary folder.
+# Tests use a stub accounts command.
 ACCOUNTS_COMMAND = os.environ.get("ASTRA_REVIEW_ACCOUNTS") or ""
-RUNS_ROOT = Path(os.environ.get("ASTRA_REVIEW_DIR") or "/tmp/claude/astra")
 
 
 def accounts_command() -> list[str]:
@@ -71,23 +73,9 @@ def workers_label() -> str | subprocess.CompletedProcess[str]:
     return label if found.returncode == 0 and label else found
 
 
-def codex_arguments(label: str, review: Path, working_dir: Path) -> list[str]:
-    return [*accounts_command(), "exec", label, "exec",
-            "-m", MODEL,
-            "-c", f'model_reasoning_effort="{REASONING}"',
-            "-c", f"model_auto_compact_token_limit={COMPACT_ABOVE_TOKENS}",
-            "-c", 'approval_policy="never"',
-            "--sandbox", "read-only",
-            "--skip-git-repo-check",
-            "--color", "never",
-            "-C", str(working_dir),
-            "-o", str(review),
-            "-"]
-
-
 def run_folder() -> Path:
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    folder = RUNS_ROOT / f"{stamp}-{os.getpid()}"
+    folder = unit_runs.ASTRA_RUN_ROOT / f"{stamp}-{os.getpid()}"
     folder.mkdir(parents=True, exist_ok=True)
     return folder
 
@@ -96,58 +84,29 @@ def tail(text: str) -> str:
     return "\n".join(text.strip().splitlines()[-ERROR_TAIL_LINES:])
 
 
-def _managed_review(review: Path, log: Path) -> int:
-    """Publish an idle worker before dispatch through the shared app-server path."""
-    from contextlib import redirect_stderr, redirect_stdout
-    from scripts.agents import codex_mesh
-
+def _managed_review(review: Path, log: Path, target: str) -> int:
+    """Run one managed review through assign.sh."""
     run = log.parent
-    name = f"astra-reviewer{os.getpid()}"
-    opened = False
-    held = ""
-    result = 1
-    with log.open("w", encoding="utf-8") as output, redirect_stdout(output), redirect_stderr(output):
-        try:
-            result = codex_mesh.main([
-                "prime", "--session-dir", str(run), "--name", name,
-                "--role", "astra-reviewer", "--instructions-file", str(run / "prompt.md"),
-                "--model", MODEL, "--effort", REASONING,
-                "--sandbox", "read-only",
-            ])
-            if result:
-                return result
-            opened = True
-            role = astra_roles.hold("reviewer", session_dir=run, worker=name)
-            held = role["staff_id"] if role is not None else ""
-            result = codex_mesh.main([
-                "follow", "--session-dir", str(run), "--to", name, "--role", "review",
-                "--message-file", str(run / "prompt.md"), "--summary-file", str(review),
-                "--log-file", str(run / "turn.log"), "--model", MODEL, "--effort", REASONING,
-                "--cwd", str(Path.cwd()), "--read-only",
-            ])
-        except (OSError, ValueError) as error:
-            print(f"astra_review: reviewer role unavailable: {error}", file=sys.stderr)
-            result = 1
-        finally:
-            if opened:
-                ended = codex_mesh.main(["end", "--session-dir", str(run), "--to", name])
-                if ended:
-                    result = 1
-                elif held:
-                    astra_roles.release(held)
-    return result
-
-
-def run_review(label: str, review: Path, prompt: str, log: Path) -> int:
-    """Use worker admission when the caller has a staff identity."""
-    manager = staff.runtime_id()
-    if manager:
-        _ = (log.parent / "prompt.md").write_text(prompt, encoding="utf-8")
-        return _managed_review(review, log)
     with log.open("w", encoding="utf-8") as output:
-        process = subprocess.run(codex_arguments(label, review, Path.cwd()), input=prompt,
-                                 stdout=output, stderr=subprocess.STDOUT, text=True, check=False)
-    return process.returncode
+        return subprocess.run([
+            "bash", str(SCRIPTS / "direct/assign.sh"), "--role", "review", "--operation", "astra-review",
+            "--target", target, "--policy", "astra-reviewer",
+            "--new-worker", f"astra-reviewer{os.getpid()}", "--session-dir", str(run), "--cwd", str(Path.cwd()),
+            "--prompt", str(run / "prompt.md"), "--summary", str(review), "--log", str(run / "turn.log"),
+            "--model", MODEL, "--effort", REASONING,
+        ], stdout=output, stderr=subprocess.STDOUT, text=True, check=False).returncode
+
+
+def run_review(review: Path, prompt: str, log: Path) -> int:
+    """Run each review through its explicit assign.sh target."""
+    manager = staff.runtime_id()
+    caller = staff.snapshot().by_current_session(manager) if manager else None
+    target = "consultation-pane"
+    if caller is not None and caller.kind in ("unit", "showrunner"):
+        write_text_atomic(log.parent / "worker_transport", unit_runs.parent_transport(caller.current_session) + "\n")
+        target = "staff-worker"
+    write_text_atomic(log.parent / "prompt.md", prompt)
+    return _managed_review(review, log, target)
 
 
 def held_review(design: design_roles.HeldDesign, focus: str, work: astra_work.PhaseWork | astra_work.StandaloneWork) -> int:
@@ -163,8 +122,7 @@ def held_review(design: design_roles.HeldDesign, focus: str, work: astra_work.Ph
             return 1
     folder = design_roles.design_directory(design.placement.design_id)
     request = folder / f"review-request-{os.getpid()}-{time.time_ns()}.txt"
-    with request.open("x", encoding="utf-8") as output:
-        _ = output.write(f"Review {design.document}.\nFocus: {focus}\n")
+    write_text_atomic(request, f"Review {design.document}.\nFocus: {focus}\n")
     try:
         reply = design_roles.resume(design.placement.design_id + "/reviewer", request)
         if not reply.is_file():
@@ -211,7 +169,7 @@ def main(arguments: list[str]) -> int:
     except (OSError, ValueError) as error:
         print(f"astra_review: held reviewer unavailable: {error}", file=sys.stderr)
         return 1
-    if held is not None:
+    if isinstance(held, design_roles.HeldDesign):
         return held_review(held, focus, work)
     label = workers_label()
     if not isinstance(label, str):
@@ -223,15 +181,17 @@ def main(arguments: list[str]) -> int:
     assignment = astra_work.AstraWork("astra-reviewer", str(folder), str(document),
                                      datetime.now(timezone.utc).isoformat(), str(review), work)
     prompt = astra_work.header_line(assignment) + "\n" + review_prompt(document, focus)
-    _ = (folder / "prompt.md").write_text(prompt, encoding="utf-8")
+    write_text_atomic(folder / "prompt.md", prompt)
     log = folder / "codex.log"
-    returncode = run_review(label, review, prompt, log)
+    returncode = run_review(review, prompt, log)
     written = review.read_text(encoding="utf-8").strip() if review.is_file() else ""
     if returncode != 0 or not written:
         why = f"exit {returncode}" if returncode != 0 else "no review was written"
         said = tail(log.read_text(encoding="utf-8"))
         print(f"astra_review: the {MODEL} review of {document} failed on workers account {label} ({why}).",
               f"Codex said:\n{said}", f"Log: {log}", sep="\n", file=sys.stderr)
+        if written:
+            print(f"Saved: {review}", file=sys.stderr)
         return 2 if returncode == 2 else 1
     print(f"# {MODEL} review of {document} (workers account {label})\n")
     print(written)

@@ -1,7 +1,11 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
 """Run one watcher process under a crash-safe, nonblocking runner lock."""
 
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import argparse
 import fcntl
@@ -12,7 +16,7 @@ from collections.abc import Sequence
 from pathlib import Path
 from typing import cast
 
-import writer_lock  # pyright: ignore[reportImplicitRelativeImport]
+from scripts.prioritize import writer_lock
 
 
 BUSY_EXIT = 75

@@ -8,12 +8,10 @@ from pathlib import Path
 from scripts.direct.verify_token_wait_test_support import VerifyTokenWaitFixture, VERIFY
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.production.staff_test_support import fixture_runtime_id
-from scripts.build_queue.admission_test_support import caller_admission
 
 
 class VerifyTokenHistoryTests(VerifyTokenWaitFixture):
     def test_waiting_for_peer_call_records_token_seconds(self) -> None:
-        admission = caller_admission(self, self.root, self.environment)
         board = self.root / "board"
         self.record_phase(board)
         waiting = self.root / "waiting-for-token"
@@ -53,8 +51,6 @@ exit 0
                 _ = (self.root / "release").touch()
                 first_output = first.communicate(timeout=TEST_HANG_GUARD_SECS)
                 self.assertEqual(first.returncode, 0, first_output)
-                with admission.loop_turn():
-                    admission.allow_next_start()
                 resume.touch()
                 second_output = second.communicate(timeout=TEST_HANG_GUARD_SECS)
                 self.assertEqual(first.returncode, 0, first_output)

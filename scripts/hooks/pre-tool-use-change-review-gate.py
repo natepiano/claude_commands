@@ -5,6 +5,10 @@ The shared command parser reads messages without executing shell text.
 The review module owns the merge rule.
 """
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import json
 import subprocess
@@ -12,7 +16,6 @@ import sys
 from pathlib import Path
 from typing import TypedDict
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.hooks import checkpoint_gate as commands
 
 

@@ -17,12 +17,11 @@ from collections.abc import Callable
 from typing import cast, override
 from unittest import mock
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "direct"))
-import phase_reservation  # noqa: E402
+from scripts.direct import phase_reservation  # noqa: E402
 from scripts.astra import design_roles  # noqa: E402
 from scripts.production import staff  # noqa: E402
 from scripts.production.staff_test_support import (  # noqa: E402
-    fixture_runtime_id, fixture_worker, isolated_staff_file, unit_membership,
+    fixture_runtime_id, fixture_worker, fixture_unit_location, isolated_staff_file, showrunner_relationship, unit_membership,
 )
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
@@ -65,6 +64,7 @@ class BerthHookTests(unittest.TestCase):
     bin_dir: Path = Path()
     environment: dict[str, str] = {}
     held_head: str = ""
+    owner_id: staff.StaffId = staff.StaffId(fixture_runtime_id("berth-unit"))
 
     @override
     def setUp(self) -> None:
@@ -100,6 +100,9 @@ class BerthHookTests(unittest.TestCase):
             "HERDR_BIN": "/nonexistent/herdr",
         }
         _ = self.enterContext(isolated_staff_file(self.root / "staff.json", self.environment))
+        owner = fixture_unit_location(showrunner_relationship("demo"), "design-unit", self.repo)
+        self.owner_id = owner.id
+        self.recorder_phases("15")
         _ = self.environment.pop("CARGO_BERTH_SESSION_ID", None)
         # A test run from inside a seat inherits its run; each test names the run it wants.
         _ = self.environment.pop("UNIT_RUN_DIR", None)
@@ -120,6 +123,7 @@ class BerthHookTests(unittest.TestCase):
     def open_second_phase(self) -> None:
         """Phase 16 opens beside 15; each lists its files."""
         _ = self.state({"kind": "enrolled_awaiting_first_touch", "phase": "16"}, phase="16")
+        self.recorder_phases("15", "16")
         _ = (phase_reservation.phase_directory(self.session_dir, "15") / phase_reservation.FILES_FILE).write_text(
             "src/lib.rs\n")
         _ = (phase_reservation.phase_directory(self.session_dir, "16") / phase_reservation.FILES_FILE).write_text(
@@ -165,9 +169,9 @@ class BerthHookTests(unittest.TestCase):
             design_roles._save(design)  # pyright: ignore[reportPrivateUsage]
         _ = (directory / "phases" / phase / "files").write_text("src/lib.rs\n")
         _ = (directory / "progress_history_state.json").write_text(json.dumps({
-            "run_id": directory.name, "history_file": str(self.root / (directory.name + ".jsonl")),
-            "open_phases": [{"id": phase, "instance_id": "instance-" + phase, "status": "open"}],
-            "phase": {"id": phase, "instance_id": "instance-" + phase, "status": "open"},
+            "run_id": directory.name, "owner_staff_id": parent.id, "history_file": str(self.root / (directory.name + ".jsonl")),
+            "open_phases": [],
+            "phase": {"id": phase, "instance_id": "instance-" + phase, "status": "active"},
         }))
 
     def held_hook(self, patch: str) -> str:
@@ -256,7 +260,7 @@ class BerthHookTests(unittest.TestCase):
         self.assertEqual((result.returncode, result.stdout), (0, ""), result.stderr)
         self.assertEqual(self.state()["kind"], "active")
 
-    def test_a_left_unmapped_reservation_stays_unrecorded_unless_the_map_names_it_for_one_open_phase(self) -> None:
+    def test_a_left_unmapped_reservation_needs_the_directors_mapping_not_a_single_open_phase(self) -> None:
         self.answer_left_unmapped()
         _ = (self.repo / "src" / "lib.rs").write_text("fn b() {}\n")
         for case in ("another reservation mapped", "a sibling phase open"):
@@ -269,8 +273,99 @@ class BerthHookTests(unittest.TestCase):
                     self.open_second_phase()
                 code, written = self.backstop()
                 self.assertEqual(code, 0)
-                self.assertIn("a sibling phase's reservation holds every changed path", written)
-                self.assertEqual(self.state(), AWAITING)
+                if case == "another reservation mapped":
+                    self.assertIn("a sibling phase's reservation holds every changed path", written)
+                    self.assertEqual(self.state(), AWAITING)
+                else:
+                    self.assertIn(f"Active, reservation {RESERVATION}", written)
+                    self.assertEqual(self.state()["active_phase_reservation"], {
+                        "reservation_id": RESERVATION, "coordination_run_id": RUN,
+                        "phase": "15", "phase_start_head": HEAD})
+                    self.assertEqual(self.state(phase="16"), {
+                        "kind": "enrolled_awaiting_first_touch", "phase": "16"})
+
+    def test_a_siblings_active_reservation_is_not_recorded_from_the_directors_mapping(self) -> None:
+        self.assert_sibling_reservation_stays_unrecorded(phase_reservation.ACTIVE)
+
+    def test_a_siblings_pending_release_is_not_recorded_from_the_directors_mapping(self) -> None:
+        self.assert_sibling_reservation_stays_unrecorded(phase_reservation.PENDING)
+
+    def test_a_siblings_mapped_reservation_is_not_recorded_from_the_directors_mapping(self) -> None:
+        self.assert_sibling_reservation_stays_unrecorded("mapped")
+
+    def test_the_directors_mapping_must_name_the_acquired_run(self) -> None:
+        self.answer_left_unmapped()
+        self.open_second_phase()
+        self.map_director_session()
+        path = self.repo / ".git" / phase_reservation.LEDGER_DIRECTORY / phase_reservation.SESSION_MAP_FILE
+        _ = path.write_text(json.dumps({"identities": {
+            DIRECTOR: {"reservation_id": RESERVATION, "coordination_run_id": "another-run"}}}))
+        _ = (self.repo / "src" / "lib.rs").write_text("fn b() {}\n")
+        code, written = self.backstop()
+        self.assertEqual(code, 0)
+        self.assertIn("still awaiting first touch", written)
+        self.assertEqual(self.state(), AWAITING)
+
+    def test_a_siblings_different_reservation_does_not_block_the_directors_reservation(self) -> None:
+        self.answer_left_unmapped()
+        self.open_second_phase()
+        self.map_director_session()
+        sibling = self.state({"kind": phase_reservation.ACTIVE, "active_phase_reservation": {
+            "reservation_id": EARLIER, "coordination_run_id": RUN,
+            "phase": "16", "phase_start_head": HEAD}}, phase="16")
+        _ = (self.repo / "src" / "lib.rs").write_text("fn b() {}\n")
+        code, written = self.backstop()
+        self.assertEqual(code, 0)
+        self.assertIn(f"Active, reservation {RESERVATION}", written)
+        self.assertEqual(self.state()["kind"], phase_reservation.ACTIVE)
+        self.assertEqual(self.state(phase="16"), sibling)
+
+    def assert_sibling_reservation_stays_unrecorded(self, holding: str) -> None:
+        self.answer_left_unmapped()
+        self.map_director_session()
+        self.open_second_phase()
+        if holding == "mapped":
+            path = self.repo / ".git" / phase_reservation.LEDGER_DIRECTORY / phase_reservation.SESSION_MAP_FILE
+            _ = path.write_text(json.dumps({"identities": {
+                DIRECTOR: {"reservation_id": RESERVATION, "coordination_run_id": RUN},
+                phase_reservation.phase_session_id(DIRECTOR, "16"): {
+                    "reservation_id": RESERVATION, "coordination_run_id": RUN}}}))
+        else:
+            field = "active_phase_reservation" if holding == phase_reservation.ACTIVE else phase_reservation.PENDING_FIELD
+            _ = self.state({"kind": holding, field: {
+                "reservation_id": RESERVATION, "coordination_run_id": RUN, "phase": "16",
+                "phase_start_head": HEAD, "checkpoint_commit": "b" * 40}}, phase="16")
+        sibling_before = self.state(phase="16")
+        _ = (self.repo / "src" / "lib.rs").write_text("fn b() {}\n")
+        code, written = self.backstop()
+        self.assertEqual(code, 0)
+        self.assertIn("a sibling phase's reservation holds every changed path", written)
+        self.assertEqual(self.state(), AWAITING)
+        self.assertEqual(self.state(phase="16"), sibling_before)
+
+    def test_the_hook_records_the_directors_reservation_when_the_sibling_holds_nothing(self) -> None:
+        self.answer_left_unmapped()
+        self.map_director_session()
+        self.open_second_phase()
+        result = self.hook(patch_text("*** Update File: src/lib.rs"))
+        self.assertEqual((result.returncode, result.stdout), (0, ""), result.stderr)
+        self.assertEqual(self.state()["active_phase_reservation"], {
+            "reservation_id": RESERVATION, "coordination_run_id": RUN,
+            "phase": "15", "phase_start_head": HEAD})
+        self.assertEqual(self.state(phase="16"), {"kind": "enrolled_awaiting_first_touch", "phase": "16"})
+
+    def test_claim_records_the_directors_reservation_when_the_sibling_holds_nothing(self) -> None:
+        self.answer_left_unmapped()
+        self.map_director_session()
+        self.open_second_phase()
+        output = io.StringIO()
+        with mock.patch.dict(os.environ, self.environment, clear=True), contextlib.redirect_stdout(output):
+            code = phase_reservation.main(["claim", "--session-dir", str(self.session_dir), "--phase", "15",
+                                           "--repo", str(self.repo)])
+        self.assertEqual(code, 0)
+        self.assertIn(f"Active, reservation {RESERVATION}", output.getvalue())
+        self.assertEqual(self.state()["kind"], phase_reservation.ACTIVE)
+        self.assertEqual(self.state(phase="16"), {"kind": "enrolled_awaiting_first_touch", "phase": "16"})
 
     def test_a_seat_first_touch_checks_its_paths_and_records_active(self) -> None:
         result = self.hook(patch_text("*** Add File: new.rs", "*** Update File: lib.rs"), cwd=self.repo / "src")
@@ -288,6 +383,8 @@ class BerthHookTests(unittest.TestCase):
         directory.mkdir(parents=True)
         _ = (directory / phase_reservation.STATE_FILE).write_text(json.dumps(
             {"kind": "enrolled_awaiting_first_touch", "phase": "7"}))
+        _ = (run / "progress_history_state.json").write_text(json.dumps({
+            "owner_staff_id": self.owner_id, "phase": {"id": "7", "status": "active"}}))
         return run
 
     def test_a_seat_of_a_side_run_checks_its_own_runs_phase_not_the_markers(self) -> None:
@@ -388,6 +485,7 @@ class BerthHookTests(unittest.TestCase):
     def recorder_phases(self, *phases: str) -> None:
         records = [{"id": phase, "status": "active"} for phase in phases]
         _ = (self.session_dir / "progress_history_state.json").write_text(json.dumps({
+            "owner_staff_id": self.owner_id,
             "phase": records[-1] if records else {"id": "15", "status": "completed"},
             "open_phases": records[:-1]}))
 
@@ -468,6 +566,8 @@ class BerthHookTests(unittest.TestCase):
 
     def test_an_unreadable_recorder_state_checks_the_held_phases_without_a_traceback(self) -> None:
         state = self.session_dir / "progress_history_state.json"
+        directory = phase_reservation.phase_directory(self.session_dir, "15")
+        _ = (directory / phase_reservation.WORKTREE_FILE).write_text(str(self.repo) + "\n")
         for content in ("not JSON", "[1]", "\udcff"):
             with self.subTest(content=content):
                 _ = state.write_bytes(content.encode("utf-8", "surrogateescape"))
@@ -670,7 +770,7 @@ class BerthHookTests(unittest.TestCase):
         self.assertEqual(sorted(path.name for path in phase.iterdir()),
                          [phase_reservation.STATE_FILE, phase_reservation.BASELINE_FILE,
                           phase_reservation.BASELINE_STATUS_FILE])
-        self.assertEqual(sorted(path.name for path in self.session_dir.iterdir()), [phase_reservation.PHASES_DIR])
+        self.assertEqual(sorted(path.name for path in self.session_dir.iterdir()), [phase_reservation.PHASES_DIR, "progress_history_state.json"])
 
     def backstop(self, phase: str = "15") -> tuple[int, str]:
         _ = (phase_reservation.phase_directory(self.session_dir, phase) / phase_reservation.BASELINE_FILE).write_text(

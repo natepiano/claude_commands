@@ -48,11 +48,15 @@ if declare -F lint_config_build_oom_score_adj >/dev/null; then
 else
     BUILD_OOM_SCORE_ADJ=500
 fi
+if declare -F lint_config_clippy_fix_jobs >/dev/null; then
+    lint_config_clippy_fix_jobs CLIPPY_FIX_JOBS
+else
+    CLIPPY_FIX_JOBS=8
+fi
 
-# natedev's machine-wide pool of build slots (/etc/nixos
-# modules/linux/jobserver.nix). The session environment names it, but a shell
-# started before the pool existed does not, so join it here too. The Mac has no
-# /dev/steve and skips this.
+# Builds use natedev's machine-wide pool (/etc/nixos/modules/linux/jobserver.nix).
+# Join the pool when the session does not name it. The Mac has no /dev/steve.
+# Clippy fixes use private jobs because they leave shared tokens unused.
 if [[ -z "${CARGO_MAKEFLAGS:-}" && -c /dev/steve && -r /dev/steve && -w /dev/steve ]]; then
     export CARGO_MAKEFLAGS="--jobserver-auth=fifo:/dev/steve"
 fi
@@ -305,6 +309,20 @@ buildlog_retry_unstarted_step() {
     BUILDLOG_RETRY_STEP=0
 }
 
+without_progress_frames() {
+    local line
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        line=${line%$'\r'}
+        printf '%s\n' "${line##*$'\r'}"
+    done
+}
+
+buildlog_exec_with_progress() {
+    CARGO_TERM_PROGRESS_WHEN=always \
+        CARGO_TERM_PROGRESS_WIDTH=${CARGO_TERM_PROGRESS_WIDTH:-${COLUMNS:-80}} \
+        buildlog_exec "$@"
+}
+
 run_step_attempt() {
     if [[ -n "${BUILDLOG_CHECK_FAILED_FILE:-}" && -f "$BUILDLOG_CHECK_FAILED_FILE" ]]; then
         build_check_stop 2 'a prior admission or hold check failed'
@@ -378,19 +396,25 @@ run_step_attempt() {
     if [[ -t 1 ]]; then
         tty=1
         set +e
-        buildlog_exec "$@" 9>&-
+        buildlog_exec_with_progress "$@" 9>&-
         status=$?
     else
         # $RANDOM too: a background sweep's run() shares this shell's $$.
         log="${TMPDIR:-/tmp}/lint_invoke.$$.$RANDOM.log"
+        if [[ -n "${BUILDLOG_PEAK:-}" ]]; then
+            ln -sf -- "$log" "$BUILDLOG_PEAK.progress.log"
+        fi
         # Keep output streaming for heartbeat_watch.sh and the watching worker.
         set +e
-        buildlog_exec "$@" 9>&- 2>&1 | tee "$log"
+        buildlog_exec_with_progress "$@" 9>&- 2>&1 | tee "$log" | without_progress_frames
         status=${PIPESTATUS[0]}
     fi
     set -e
     nextest_share_end
     buildlog_finish_memory "$status" "$sampler_pid"
+    if [[ -n "${BUILDLOG_PEAK:-}" ]]; then
+        rm -f -- "$BUILDLOG_PEAK.progress.log"
+    fi
     buildlog_retry_unstarted_step "$@" || {
         status=$?
         [[ -z "$log" ]] || rm -f "$log"
@@ -680,7 +704,7 @@ invoke_clippy() {
         return 0
     fi
     local -a cargo_args=() clippy_args=()
-    local seen_sep=0 arg
+    local seen_sep=0 fixing=0 arg
     for arg in "$@"; do
         if [[ "$arg" == "--" && $seen_sep -eq 0 ]]; then
             seen_sep=1
@@ -688,12 +712,19 @@ invoke_clippy() {
         fi
         if [[ $seen_sep -eq 0 ]]; then
             cargo_args+=("$arg")
+            [[ "$arg" != --fix ]] || fixing=1
         else
             clippy_args+=("$arg")
         fi
     done
-    run cargo clippy ${cargo_args[@]+"${cargo_args[@]}"} -- -D warnings \
-        ${clippy_args[@]+"${clippy_args[@]}"}
+    if [[ $fixing -eq 1 ]]; then
+        run env -u CARGO_MAKEFLAGS -u MAKEFLAGS -u MFLAGS \
+            cargo clippy --jobs "$CLIPPY_FIX_JOBS" ${cargo_args[@]+"${cargo_args[@]}"} -- -D warnings \
+            ${clippy_args[@]+"${clippy_args[@]}"}
+    else
+        run cargo clippy ${cargo_args[@]+"${cargo_args[@]}"} -- -D warnings \
+            ${clippy_args[@]+"${clippy_args[@]}"}
+    fi
 }
 
 # Use the same scope, lint arguments, gating, and run wrapper as judgment.

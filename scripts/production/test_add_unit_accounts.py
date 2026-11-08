@@ -6,24 +6,21 @@ import argparse
 import io
 import json
 import os
-import sys
 import unittest
 from contextlib import redirect_stderr
 from pathlib import Path
 from typing import final
 from unittest.mock import patch
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "shutdown"))
-import add_unit
-import autocompact
-import inventory
+from scripts.production import add_unit
+from scripts.production import autocompact
+from scripts.shutdown import inventory
 from scripts.accounts import accounts
 
 
-from add_unit_test_support import AddUnitTestCase, configure_test_zone
+from scripts.production.add_unit_test_support import AddUnitTestCase, configure_test_zone
 from scripts.production import staff
-from scripts.production.staff_test_support import fixture_showrunner_name, unit_membership
+from scripts.production.staff_test_support import unit_membership
 
 
 def setUpModule() -> None:
@@ -43,7 +40,7 @@ class AddUnitAccountsTests(AddUnitTestCase):
         prepared = accounts.PreparedAccount({"ACCOUNT_TEST_VARIABLE": "selected", "CLAUDE_CODE_OAUTH_TOKEN": "remove-me"},
                                              frozenset({"CLAUDE_CODE_OAUTH_TOKEN"}))
         with patch.dict(os.environ, self.env), patch.object(accounts, "prepared_account", return_value=prepared):
-            code = add_unit.main(["--production", str(self.doc), *flags])
+            code = add_unit.main(["--production", self.production_name, *flags])
         self.assertEqual(code, 0)
         self.assertEqual(self.pane_environment()["ACCOUNT_TEST_VARIABLE"], "selected")
         self.assertNotIn("CLAUDE_CODE_OAUTH_TOKEN", self.pane_environment())
@@ -57,7 +54,7 @@ class AddUnitAccountsTests(AddUnitTestCase):
         errors = io.StringIO()
         with (patch.dict(os.environ, self.env), redirect_stderr(errors),
               patch.object(accounts, "prepared_account", return_value=accounts.AccountRefused("account logged out")) as prepared):
-            code = add_unit.main(["--production", str(self.doc), "alpha", "--plan", "docs/plans/given.md",
+            code = add_unit.main(["--production", self.production_name, "alpha", "--plan", "docs/plans/given.md",
                                   "--resume", "62ccbd64-f22e-5647-b20e-7899aa39d766", "--cwd", str(prior), "--account", "claude3"])
         self.assertEqual(code, 2)
         self.assertIn("account logged out", errors.getvalue())
@@ -78,7 +75,7 @@ class AddUnitAccountsTests(AddUnitTestCase):
         prior = self.root / "prior-session"
         prior.mkdir()
         # The pane mark joins its unit only through the unit's staff row.
-        row = unit_membership(fixture_showrunner_name("build-followups", self.doc), "alpha-unit")
+        row = unit_membership("build-followups", "alpha")
         _ = staff.set_worktree(row.id, staff.PresentWorktree("natedev", self.root / "project-alpha"), expected=row.worktree)
         self.persist_herdr_unit("alpha", prior)
         transcript = Path(self.env["HOME"]) / ".claude/projects/project/62ccbd64-f22e-5647-b20e-7899aa39d766.jsonl"
@@ -87,7 +84,7 @@ class AddUnitAccountsTests(AddUnitTestCase):
             json.dumps({"type": "user", "message": {"model": "ignored"}}),
             json.dumps({"type": "assistant", "message": {"model": "<synthetic>"}}), "{partial"]))
         result = self.successful("alpha", "--plan", "docs/plans/given.md", "--resume", "62ccbd64-f22e-5647-b20e-7899aa39d766", "--cwd", str(prior))
-        self.assertIn("herdr session attach agents, workspace director, tab alpha", result.stdout)
+        self.assertIn("herdr session attach agents, workspace build-followups, tab alpha", result.stdout)
         self.assertEqual(self.pane_environment()["CLAUDE_CONFIG_DIR"], str(directory))
         self.assertEqual(self.agent_arguments()[:4], ["--model", "opus", "--effort", "high"])
         self.assertIn(["--session", "alpha", "server", "stop"], self.herdr_calls())
@@ -138,7 +135,7 @@ class AddUnitAccountsTests(AddUnitTestCase):
             patch.object(add_unit, "ensure_worktree", side_effect=change_role_after_worktree),
         ):
             result = add_unit.main([
-                "--production", str(self.doc), "alpha", "--plan", "docs/plans/given.md",
+                "--production", self.production_name, "alpha", "--plan", "docs/plans/given.md",
             ])
 
         self.assertEqual(result, 0)
@@ -197,7 +194,7 @@ class AddUnitAccountsTests(AddUnitTestCase):
         before = self.repository_state()
         result = self.set_unit_autocompact("200k")
         self.assertEqual(result.stdout.strip(),
-                         "trunk-unit: auto-compact 200k applies to session 3001165e-ca76-59c2-9490-878224585fad at its next restart")
+                         "trunk: auto-compact 200k applies to session 3001165e-ca76-59c2-9490-878224585fad at its next restart")
         with patch.dict(os.environ, self.env):
             self.assertEqual(autocompact.recorded("3001165e-ca76-59c2-9490-878224585fad"), "200k")
         self.assertEqual(self.repository_state(), before)
@@ -218,7 +215,7 @@ class AddUnitAccountsTests(AddUnitTestCase):
         before = self.repository_state()
         result = self.set_unit_autocompact("300k", "--check")
         self.assertEqual(result.stdout.strip(),
-                         "trunk-unit: auto-compact 300k would apply to session 3001165e-ca76-59c2-9490-878224585fad at its next restart")
+                         "trunk: auto-compact 300k would apply to session 3001165e-ca76-59c2-9490-878224585fad at its next restart")
         self.assertFalse((Path(self.env["HOME"]) / ".local/state/unit-launch").exists())
         self.assertEqual(self.repository_state(), before)
         self.assertEqual(self.herdr_calls(), [])
@@ -253,7 +250,7 @@ class AddUnitAccountsTests(AddUnitTestCase):
                                   "--resume", "62ccbd64-f22e-5647-b20e-7899aa39d766", "--cwd", str(prior))
         with (patch.dict(os.environ, self.env),
               patch.object(accounts, "prepared_account", wraps=accounts.prepared_account) as prepared):
-            code = add_unit.main(["--production", str(self.doc), "alpha", "--plan", "docs/plans/given.md",
+            code = add_unit.main(["--production", self.production_name, "alpha", "--plan", "docs/plans/given.md",
                 "--resume", "62ccbd64-f22e-5647-b20e-7899aa39d766", "--cwd", str(prior)])
         self.assertEqual(code, 0)
         prepared.assert_any_call("claude2", resume=True)
@@ -417,20 +414,21 @@ class AddUnitAccountsTests(AddUnitTestCase):
             f"add_unit: ERROR: [production.director] missing set section [production.claude] in {self.agent_config}."])
         self.assert_no_launch_change(document, head)
 
-    def test_names_without_table_rows_keep_suffix_across_productions(self) -> None:
+    def test_names_without_table_rows_keep_the_staff_name_across_productions(self) -> None:
         sample_doc = self.doc.with_name("sample-production.md")
         _ = sample_doc.write_text(self.production_doc(), encoding="utf-8")
-        for document, names in ((self.doc, ("designers", "reviewers", "showrunners", "units")),
-                                (sample_doc, ("reports", "designers-helper"))):
+        _ = self.staff.record_production("sample", sample_doc)
+        for production_name, names in ((self.production_name, ("designers", "reviewers", "showrunners", "units")),
+                                       ("sample", ("reports", "designers-helper"))):
             for name in names:
-                with self.subTest(production=document.name, name=name):
+                with self.subTest(production=production_name, name=name):
                     request = add_unit.launch_request(argparse.Namespace(
-                        production=str(document), name=name, plan="docs/plans/given.md", brief=None,
+                        production=production_name, name=name, plan="docs/plans/given.md", brief=None,
                         standby=False, permanent=False, port=None, timeout=90.0, check=False,
                         resume=None, cwd=None, restart_note=None, session_name=None, host_session=None,
                         probe=False,
                     ))
-                    self.assertEqual(request.unit, name + "-unit")
+                    self.assertEqual(request.unit, name)
 
 
 if __name__ == "__main__":

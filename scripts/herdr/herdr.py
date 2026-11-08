@@ -14,8 +14,13 @@ All caller-supplied timeouts are integer milliseconds.
 """
 
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import json
+import hashlib
 import ctypes
 import os
 import re
@@ -38,12 +43,8 @@ from pathlib import Path
 from collections.abc import Callable, Generator, Iterable, Mapping, Sequence, Set
 from typing import TYPE_CHECKING, Literal, NamedTuple, Never, NotRequired, TypedDict, TypeVar, cast, final, override
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "message"))
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-import pane_launch
+from scripts.herdr import pane_launch
 from scripts.agents import worker_lifecycle
 from scripts.lib import operation_deadline
 from scripts.lib.agent_scope import agents_slice, agent_scope_prefix
@@ -53,10 +54,10 @@ from scripts.lib.script_envelope import script_prompt
 from scripts.message import sessions as runtime_sessions
 from scripts.production import staff
 
-from process_failure import failure_detail
-import nix_env as nix_env
-from place import HerdrPlace as HerdrPlace
-from pane_launch import RecordedLabels, StaffLabelsRead
+from scripts.lib.process_failure import failure_detail
+from scripts.lib import nix_env as nix_env
+from scripts.herdr.place import HerdrPlace as HerdrPlace
+from scripts.herdr.pane_launch import RecordedLabels, StaffLabelsRead
 
 NATIVE_ID_MARKS = ("CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID")
 
@@ -77,6 +78,11 @@ class ReadStaffAtUse:
 
 
 @dataclass(frozen=True)
+class ScanAtUse:
+    """The layout operation reads current pane evidence."""
+
+
+@dataclass(frozen=True)
 class RestoreStaff:
     """The restore operation shares its staff record and session labels."""
 
@@ -85,6 +91,7 @@ class RestoreStaff:
 
 
 _READ_STAFF_AT_USE = ReadStaffAtUse()
+_SCAN_AT_USE = ScanAtUse()
 _RESTORE_STAFF: ContextVar[RestoreStaff | ReadStaffAtUse] = ContextVar(
     "restore_staff", default=_READ_STAFF_AT_USE)
 
@@ -141,6 +148,10 @@ class HerdrFailure(Exception):
     def __init__(self, message: str, code: str = "") -> None:
         super().__init__(message)
         self.code: str = code
+
+
+class NativeRegistryUnavailable(ValueError):
+    """The process has no native registry identity."""
 
 
 class HerdrMissing(HerdrFailure):
@@ -255,9 +266,6 @@ class UnspecifiedPromptTranscript:
     """The caller has not identified the conversation that must receive the prompt."""
 
 
-UNSPECIFIED_PROMPT_TRANSCRIPT = UnspecifiedPromptTranscript()
-
-
 @dataclass(frozen=True)
 class PromptScreenNotRead:
     """No visible screen has been read for this submission."""
@@ -275,6 +283,11 @@ class PromptInputReady:
 class PromptInputNotReady:
     reason: str
     screen: str | PromptScreenNotRead = PromptScreenNotRead()
+
+
+@dataclass(frozen=True)
+class PromptInputHoldsDraft:
+    screen: str
 
 
 @dataclass(frozen=True)
@@ -310,6 +323,11 @@ class PromptNotSubmitted:
 
 
 @dataclass(frozen=True)
+class AgentNotStarted(PromptNotSubmitted):
+    """The start command failed, and no agent runs in the pane."""
+
+
+@dataclass(frozen=True)
 class PromptSubmissionNotRequired:
     """The launch intentionally leaves the session without an opening prompt."""
 
@@ -326,6 +344,7 @@ class OpeningPrompt:
     text: str
     transcript: SessionTranscript | UnspecifiedPromptTranscript = UnspecifiedPromptTranscript()
     before_prompt: Callable[[SessionTranscript], object] = _no_staff_publication
+    cursor: TranscriptCursor | UnspecifiedPromptTranscript = UnspecifiedPromptTranscript()
 
 
 @dataclass(frozen=True)
@@ -353,6 +372,31 @@ class TranscriptCursor:
     sizes: dict[Path, int] = field(default_factory=dict)
     turns: dict[Path, list[tuple[datetime, dict[str, object]]]] = field(default_factory=dict)
     readability: TranscriptReadable | TranscriptUnreadable = field(default_factory=TranscriptReadable)
+
+    def skip_existing_turns(self) -> None:
+        """Skip complete rows before launch without parsing historical JSON."""
+        if not re.fullmatch(r"[A-Za-z0-9_-]+", self.transcript.session_id):
+            return
+        try:
+            paths = tuple((self.transcript.config_dir / "projects").glob(f"*/{self.transcript.session_id}.jsonl"))
+            for path in paths:
+                with path.open("rb") as stream:
+                    size = stream.seek(0, os.SEEK_END)
+                    position = size
+                    offset = 0
+                    while position:
+                        start = max(0, position - 4096)
+                        _ = stream.seek(start)
+                        chunk = stream.read(position - start)
+                        newline = chunk.rfind(b"\n")
+                        if newline >= 0:
+                            offset = start + newline + 1
+                            break
+                        position = start
+                    self.offsets[path] = offset
+                    self.sizes[path] = size
+        except OSError:
+            self.readability = TranscriptUnreadable()
 
     def read_turns(self) -> list[tuple[datetime, dict[str, object]]]:
         self.readability = TranscriptReadable()
@@ -534,7 +578,7 @@ def _composer_input(screen: str) -> ComposerInput | NoComposer:
 
 def prompt_recipient_process(session_id: str) -> PromptRecipientProcess | PromptRecipientUnavailable:
     """Identify the process receiving input, including before its socket opens."""
-    import sessions
+    from scripts.message import sessions
 
     try:
         identities = {PromptRecipientProcess(row["pid"], row.get("procStart", ""))
@@ -611,6 +655,10 @@ class AgentStatus(StrEnum):
     STOPPED = "stopped"
     DEAD = "dead"
     NONE = "none"
+
+    @property
+    def idle(self) -> bool:
+        return self in {AgentStatus.IDLE, AgentStatus.DONE}
 
     @classmethod
     def decode(cls, value: object) -> AgentStatus:
@@ -700,9 +748,30 @@ class NoPane:
 
 
 @dataclass(frozen=True)
+class PaneNotRead:
+    """The caller has not read the pane row."""
+
+
+PANE_NOT_READ = PaneNotRead()
+
+
+@dataclass(frozen=True)
 class SeveralPanes:
     label: str
     count: int
+
+
+@dataclass(frozen=True)
+class UnknownPane:
+    pane: str
+    tab: str
+    reason: str
+
+
+@dataclass(frozen=True)
+class RowPaneScan:
+    found: dict[staff.StaffId, list[dict[str, object]]]
+    unknown: list[UnknownPane]
 
 
 @dataclass(frozen=True)
@@ -795,6 +864,8 @@ class SessionListResult(TypedDict):
 class PaneIdentity(TypedDict):
     pane_id: str
     terminal_id: NotRequired[str]
+    tab_id: NotRequired[str]
+    focused: NotRequired[bool]
     label: NotRequired[str | None]
     workspace_id: str
     session_id: str | None
@@ -820,10 +891,23 @@ class PaneProcessInfoResult(TypedDict):
     process_info: PaneProcessInfo
 
 
+@dataclass(frozen=True)
+class ReportedAgentSession:
+    """The agent reports its current native session id."""
+
+    session_id: str
+
+
+@dataclass(frozen=True)
+class NoReportedAgentSession:
+    """The agent has no reported native session id."""
+
+
 class AgentOccupant(TypedDict):
     pane_id: str
     agent: NotRequired[str | None]
     agent_status: AgentStatus
+    agent_session: ReportedAgentSession | NoReportedAgentSession
 
 
 class AgentListResult(TypedDict):
@@ -915,9 +999,15 @@ def json_items(value: object, context: str) -> list[object]:
 
 
 def child_environment(environment: dict[str, str]) -> dict[str, str]:
-    """Keep launch proofs and retired identity hints out of child processes."""
+    """Remove launch proofs, retired identity hints, and NO_COLOR from child processes."""
     return {key: value for key, value in legacy_identity.without_legacy_identity(staff.child_environment(environment)).items()
-            if key not in (nix_env.HEAL_SESSION_ENV, nix_env.HEAL_DIRECTORY_ENV)}
+            if key not in (nix_env.HEAL_SESSION_ENV, nix_env.HEAL_DIRECTORY_ENV, "NO_COLOR")}
+
+
+def _pane_environment(environment: dict[str, str]) -> dict[str, str]:
+    """The pane's terminal owns TERM and COLORTERM."""
+    return {**{key: value for key, value in child_environment(environment).items()
+               if key not in ("TERM", "COLORTERM")}, "HERDR_AGENT_PANE": "1"}
 
 
 def unmarked_environment() -> dict[str, str]:
@@ -1121,8 +1211,9 @@ def merged_layout(saved: SavedLayout, live: list[_LiveSpace], now: float, *, exp
 def tab_order(space: str, titles: list[str], saved: list[SavedName], unit_director_titles: Set[str]) -> list[int]:
     """The indexes of `titles` in the order the workspace `space` shows them.
 
-    Saved tabs keep their saved order. For other tabs, the showrunner comes first, then unit
-    directors A-Z, then other tabs A-Z. The first tab stays first. `sort-tabs` ignores saved order.
+    Saved tabs keep their saved order. A new tab goes after the last placed tab with an equal
+    or lower rule: showrunner first, then unit directors A-Z, then other tabs A-Z.
+    The first tab stays first. `sort-tabs` ignores saved order.
     """
     showrunner_title = space
     if titles and not saved and space not in titles:
@@ -1136,7 +1227,8 @@ def tab_order(space: str, titles: list[str], saved: list[SavedName], unit_direct
     for index in sorted((index for index, title in enumerate(titles) if title not in places), key=lambda index: rule(titles[index])):
         # The first tab stays first: it is the showrunner's, also when its title is not the workspace's name.
         start = 0 if titles[index] == space or not order else 1
-        at = next((place for place in range(start, len(order)) if rule(titles[order[place]]) > rule(titles[index])), len(order))
+        at = next((place + 1 for place in range(len(order) - 1, start - 1, -1)
+                   if rule(titles[order[place]]) <= rule(titles[index])), start)
         order.insert(at, index)
     return order
 
@@ -1164,6 +1256,19 @@ class _LayoutLock:
     def __exit__(self, *_: object) -> None:
         if self.handle >= 0:
             os.close(self.handle)
+
+
+@dataclass(frozen=True)
+class SubmitUnproved:
+    """Submit without waiting for a turn state."""
+
+
+@dataclass(frozen=True)
+class SubmitStarts:
+    timeout_ms: int
+
+
+SUBMIT_UNPROVED = SubmitUnproved()
 
 
 class Herdr:
@@ -1198,7 +1303,7 @@ class Herdr:
         while True:
             try:
                 if check_target("", action="keys", place=HerdrPlace(self.session, pane), terminal=terminal,
-                                pane_info=_pane_row(self, pane), client=self):
+                                pane_info=self.pane_row(pane), client=self):
                     break
                 failure = HerdrFailure(f"{pane}: would send keys to an unproved target instead of the selected shell")
             except HerdrFailure as error:
@@ -1233,6 +1338,9 @@ class Herdr:
         return [json_object(item, f"herdr {kind}") for item in json_items(
             self.result(kind, "list", *arguments, **({"deadline": deadline} if deadline != math.inf else {})).get(f"{kind}s"), f"herdr {kind} list")]
 
+    def pane_row(self, pane: str) -> PaneIdentity | NoPane:
+        return next((row for row in self.panes() if row["pane_id"] == pane), NoPane(pane))
+
     def panes(self) -> list[PaneIdentity]:
         panes: list[PaneIdentity] = []
         for pane in self.listed("pane"):
@@ -1240,15 +1348,16 @@ class Herdr:
             if label is not None and not isinstance(label, str):
                 print(f"herdr {self.session}: pane label is unreadable; pane id used", file=sys.stderr)
                 label = None
-            agent_session = pane.get("agent_session")
-            session_id = cast(dict[str, object], agent_session).get("value") if isinstance(agent_session, dict) else None
-            if session_id is not None and not isinstance(session_id, str):
-                print(f"herdr {self.session}: pane session is unreadable", file=sys.stderr)
-                session_id = None
-            panes.append({"pane_id": json_text(pane.get("pane_id"), "herdr pane id"), "label": label,
-                          "terminal_id": json_text(pane.get("terminal_id", ""), "herdr terminal id"),
-                          "workspace_id": json_text(pane.get("workspace_id"), "herdr pane workspace id"),
-                          "session_id": session_id})
+            session_id = pane_session(pane) or None
+            entry: PaneIdentity = {"pane_id": json_text(pane.get("pane_id"), "herdr pane id"), "label": label,
+                                  "terminal_id": json_text(pane.get("terminal_id", ""), "herdr terminal id"),
+                                  "workspace_id": json_text(pane.get("workspace_id"), "herdr pane workspace id"),
+                                  "session_id": session_id}
+            if "tab_id" in pane:
+                entry["tab_id"] = json_text(pane["tab_id"], "herdr pane tab id")
+            if isinstance(focused := pane.get("focused"), bool):
+                entry["focused"] = focused
+            panes.append(entry)
         return panes
 
     def tab_sessions(self) -> list[TabSession]:
@@ -1293,7 +1402,7 @@ class Herdr:
     def open_tab(self, space: str, title: str, cwd: str, environment: dict[str, str]) -> str:
         """Open a named tab and pane in an existing or new workspace."""
         options = ["--label", title, "--cwd", cwd]
-        for key, value in {**child_environment(environment), "HERDR_AGENT_PANE": "1"}.items():
+        for key, value in _pane_environment(environment).items():
             options.extend(["--env", f"{key}={value}"])
         with _LayoutLock(self.session):
             saved = saved_layout(self.session)
@@ -1399,22 +1508,23 @@ class Herdr:
                 spaces.append(_LiveSpace(ident, label, titles))
         return spaces
 
-    def save_layout(self, *, record: staff.StaffSnapshot | ReadStaffAtUse = _READ_STAFF_AT_USE) -> None:
-        """`record_layout`, where a failure is a line on stderr: the tab is open, and only its saved place waits."""
+    def save_layout(self, *, record: staff.StaffSnapshot | ReadStaffAtUse = _READ_STAFF_AT_USE,
+                    scan: RowPaneScan | ScanAtUse = _SCAN_AT_USE) -> None:
+        """Save the layout and report a read or write failure on stderr."""
         try:
-            self.record_layout(record=record)
+            self.record_layout(record=record, scan=scan)
         except (HerdrFailure, OSError) as error:
             print(f"herdr {self.session}: layout not saved: {error}", file=sys.stderr)
 
-    def record_layout(self, *, record: staff.StaffSnapshot | ReadStaffAtUse = _READ_STAFF_AT_USE) -> None:
+    def record_layout(self, *, record: staff.StaffSnapshot | ReadStaffAtUse = _READ_STAFF_AT_USE,
+                      scan: RowPaneScan | ScanAtUse = _SCAN_AT_USE) -> None:
         """Save staff row ids in the native tab order."""
         record = _tab_staff() if isinstance(record, ReadStaffAtUse) else record
         spaces = self.listed("workspace")
         tabs = self.listed("tab")
-        panes = self.listed("pane")
-        found, known = self._row_panes(record, panes)
+        scan = self.scan_row_panes(record, self.listed("pane")) if isinstance(scan, ScanAtUse) else scan
         owners: dict[str, list[str]] = {}
-        for row_id, matches in found.items():
+        for row_id, matches in scan.found.items():
             for pane in matches:
                 tab = json_text(pane.get("tab_id"), "herdr pane tab id")
                 owners.setdefault(tab, []).append(row_id)
@@ -1429,10 +1539,10 @@ class Herdr:
                 live.append(_LiveSpace(workspace, label, identities))
         if live:
             saved = saved_layout(self.session)
-            if known:
+            if not scan.unknown:
                 for space in saved["workspaces"]:
                     space["tabs"] = [item for item in space["tabs"] if record.by_id(staff.StaffId(item["name"])) is not None]
-            _write_layout(self.session, merged_layout(saved, live, time.time(), expire=known))
+            _write_layout(self.session, merged_layout(saved, live, time.time(), expire=not scan.unknown))
 
     def pane_tab(self, pane: str) -> tuple[str, int, SavedName]:
         """Read the current workspace, tab position, and terminal for one pane."""
@@ -1454,7 +1564,7 @@ class Herdr:
             _ = _bind_row_tab(saved, workspace, row_id, target, max(0, index - 1))
             _write_layout(self.session, saved)
 
-    def saved_row_tab(self, row_id: str, title: str) -> NewTab | SplitPane | ExistingPane:
+    def saved_row_tab(self, row_id: str, title: str, fallback_workspace: str) -> NewTab | SplitPane | ExistingPane:
         """Find the saved row position and reuse only its terminal's shell."""
         saved = saved_layout(self.session)
         for space in saved["workspaces"]:
@@ -1477,7 +1587,7 @@ class Herdr:
                 if sibling is not None:
                     return SplitPane(json_text(sibling.get("pane_id"), "pane id"), "right", 0.5, title)
                 return NewTab(space["name"], title)
-        return NewTab(shared_session(), title)
+        return NewTab(fallback_workspace, title)
 
     def _retitle(self, row: dict[str, object], title: str, *, tab: bool) -> bool:
         changed = row.get("label") != title
@@ -1502,23 +1612,25 @@ class Herdr:
             self.save_layout()
             return True
 
-    def _row_panes(self, record: staff.StaffSnapshot,
-                   panes: list[dict[str, object]]) -> tuple[dict[str, list[dict[str, object]]], bool]:
+    def scan_row_panes(self, record: staff.StaffSnapshot,
+                       panes: list[dict[str, object]]) -> RowPaneScan:
         """Match native sessions and report incomplete process observations."""
-        found: dict[str, list[dict[str, object]]] = {}
-        known = True
+        found: dict[staff.StaffId, list[dict[str, object]]] = {}
+        unknown: list[UnknownPane] = []
         for pane in panes:
             try:
                 info = json_object(self.result("pane", "process-info", "--pane",
                     json_text(pane.get("pane_id"), "pane id")).get("process_info"), "native pane processes")
                 _ = _pane_process_ids(info, "native pane processes")
-                for identity in _pane_sessions(info):
+                for identity in _pane_sessions(info, pane):
                     if (row := record.by_current_session(identity)) is not None:
                         found.setdefault(row.id, []).append(pane)
             except (HerdrFailure, OSError, ValueError, subprocess.SubprocessError) as error:
-                known = False
-                print(f"herdr {self.session}: pane evidence is unknown: {error}; row placement retained", file=sys.stderr)
-        return found, known
+                unread = UnknownPane(str(pane.get("pane_id", "")), str(pane.get("tab_id", "")), str(error))
+                unknown.append(unread)
+                print(f"herdr {self.session}:{unread.pane} tab {unread.tab}: pane evidence is unknown: "
+                      + f"{' '.join(unread.reason.splitlines())}; row placement retained", file=sys.stderr)
+        return RowPaneScan(found, unknown)
 
     def retitle_row(self, row_id: str) -> bool:
         """Set each proved pane's title from its row."""
@@ -1526,9 +1638,16 @@ class Herdr:
         row = record.by_id(staff.StaffId(row_id))
         if row is None:
             raise HerdrFailure(f"no staff row {row_id!r}")
-        found, _ = self._row_panes(record, self.listed("pane"))
-        return any([self.retitle(json_text(pane.get("pane_id"), "pane id"), row.name, tab=row.kind != "worker")
-                    for pane in found.get(row.id, [])])
+        with _LayoutLock(self.session):
+            scan = self.scan_row_panes(record, self.listed("pane"))
+            matches = scan.found.get(row.id, [])
+            changed = any([self._retitle(pane, row.name, tab=row.kind != "worker") for pane in matches])
+            if changed:
+                if row.kind != "worker":
+                    for workspace in dict.fromkeys(json_text(pane.get("workspace_id"), "workspace id") for pane in matches):
+                        _ = self.order_tabs(workspace, saved_layout(self.session), record=record)
+                self.save_layout(record=record, scan=scan)
+            return changed
 
     def move_row_tabs(self, row_id: str, *, record: staff.StaffSnapshot | ReadStaffAtUse = _READ_STAFF_AT_USE) -> bool:
         """Move member tabs and saved bindings into the parent's workspace."""
@@ -1540,18 +1659,18 @@ class Herdr:
         with _LayoutLock(self.session):
             saved = saved_layout(self.session)
             panes = self.listed("pane")
-            found, known = self._row_panes(record, panes)
+            scan = self.scan_row_panes(record, panes)
             spaces = self.listed("workspace") if panes else []
             workspace = next((json_text(item.get("workspace_id"), "workspace id") for item in spaces
                               if item.get("label") == parent.name), "")
             focused_space = next((item.get("workspace_id") for item in spaces if item.get("focused") is True), "")
             focused = next((json_text(pane.get("pane_id"), "pane id") for pane in panes
                             if pane.get("focused") is True and pane.get("workspace_id") == focused_space), "")
-            changed, bound, placed = not known, False, False
+            changed, bound, placed = bool(scan.unknown), False, False
             visited: set[str] = set()
             try:
                 for member in (row, *record.find(parent=row.id)):
-                    matches = found.get(member.id, [])
+                    matches = scan.found.get(member.id, [])
                     for pane in matches:
                         tab = json_text(pane.get("tab_id"), "tab id")
                         if tab in visited:
@@ -1706,7 +1825,7 @@ class Herdr:
 
     def close_tab_confirmed(self, pane: str, *, target: str = "", terminal: str = "") -> bool:
         """Return true only after the selected pane and terminal are absent."""
-        row = _pane_row(self, pane)
+        row = self.pane_row(pane)
         if isinstance(row, NoPane):
             return self._pane_closed(pane, terminal)
         terminal = terminal or row.get("terminal_id", "")
@@ -1721,7 +1840,7 @@ class Herdr:
             return False
         return True
 
-    def close_retained_pane(self, pane: str, *, terminal: str = "") -> None:
+    def close_retained_pane(self, pane: str, *, terminal: str = "") -> bool:
         """Retire an outside caller's record only after confirmed terminal closure."""
         path = pane_launch.record_directory() / f"{self.session}.json"
         try:
@@ -1738,12 +1857,13 @@ class Herdr:
             terminal = observed
         target = original["session_id"] if original is not None else ""
         if not self.close_tab_confirmed(pane, target=target, terminal=terminal):
-            return
+            return False
         if original is not None:
             try:
                 pane_launch.retire_launch(path, original["pane_id"], original)
             except (OSError, ValueError) as error:
                 print(f"herdr {self.session}:{pane}: legacy record retained: {error}", file=sys.stderr)
+        return True
 
     def focus_tab_of(self, pane: str) -> None:
         """Show the tab holding `pane`, and its workspace, in the session's attached clients."""
@@ -1783,6 +1903,16 @@ class Herdr:
                 except HerdrFailure as error:
                     print(f"herdr {self.session}: workspace {candidate.workspace_id} retained: {error}", file=sys.stderr)
 
+    def codex_client_session(self, pane: str) -> str:
+        """Read the current thread from the staff row named by the client's tab."""
+        try:
+            reference = self.pane_tab(pane)[2]["name"]
+            record = staff.initial_snapshot()
+        except (OSError, ValueError, HerdrFailure):
+            return ""
+        owner = record.by_member_reference(reference) or record.by_path(reference)
+        return owner.current_session if owner is not None else ""
+
     def codex_launch(self, pane: str, arguments: Sequence[str] = ()) -> pane_launch.PaneLaunch:
         """Read one Codex launch from its exact foreground process."""
         info = json_object(self.result("pane", "process-info", "--pane", pane).get("process_info"),
@@ -1791,6 +1921,9 @@ class Herdr:
 
     def _codex_launch(self, pane: str, info: dict[str, object],
                       arguments: Sequence[str]) -> pane_launch.PaneLaunch:
+        row = self.pane_row(pane)
+        reported = pane_session(row) if not isinstance(row, NoPane) and codex_without_session(info) else ""
+        thread = "" if reported else self.codex_client_session(pane)
         matches: list[pane_launch.PaneLaunch] = []
         for value in json_items(info.get("foreground_processes"), "Codex launch processes"):
             process = json_object(value, "Codex launch process")
@@ -1800,13 +1933,17 @@ class Herdr:
             pid = process.get("pid")
             if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
                 raise ValueError("Codex launch has no process id")
-            observed = native_process(pid, "codex")
+            if thread:
+                session_id, started, environment = thread, _process_birth(pid), process_environment(pid)
+            else:
+                observed = native_process(pid, "codex", reported) if reported else native_process(pid, "codex")
+                session_id, started, environment = observed.identity.id, observed.started, observed.environment
             cwd = json_text(process.get("cwd"), "Codex launch cwd")
             if not Path(cwd).is_absolute():
                 raise ValueError("Codex launch working folder is unavailable")
-            entry = pane_launch.launch(pane, observed.identity.id, cwd, legacy_identity.without_legacy_identity(observed.environment),
+            entry = pane_launch.launch(pane, session_id, cwd, legacy_identity.without_legacy_identity(environment),
                                        ["codex", *arguments], kind="codex")
-            entry["pid"], entry["proc_start"] = pid, observed.started
+            entry["pid"], entry["proc_start"] = pid, started
             matches.append(entry)
         if len(matches) != 1:
             raise ValueError("Codex launch has no unique foreground process")
@@ -1848,7 +1985,7 @@ class Herdr:
             print(f"herdr {name}:{pane}: {error}; session retained", file=sys.stderr)
             if screen:
                 print(screen, file=sys.stderr)
-            return PromptNotSubmitted(str(error))
+            return AgentNotStarted(str(error))
         if kind == "codex":
             try:
                 entry = self.codex_launch(pane, agent_arguments)
@@ -1980,73 +2117,103 @@ class Herdr:
         activity = AgentProcessPresent(tuple(identities)) if agent_present else PaneAtShell() if foreground == shell else PaneRunning(tuple(commands))
         return PaneStartupObservation(PaneShell(shell), activity)
 
-    def native_session(self, pane: str, kind: str, timeout: float) -> str:
+    def native_session(self, pane: str, kind: str, timeout: float, *,
+                       pane_row: Mapping[str, object] | PaneNotRead = PANE_NOT_READ) -> str:
         """Prove the backend identity from the exact foreground process."""
         try:
-            return self.native_pane_process(pane, kind, timeout).current_identity
+            return self.native_pane_process(pane, kind, timeout, pane_row=pane_row).current_identity
         except ValueError as error:
             raise HerdrFailure(str(error)) from error
 
-    def native_pane_process(self, pane: str, kind: str, timeout: float) -> NativeAgentProcess:
+    def pane_codex_pid(self, pane: str) -> int:
+        """Return the sole foreground Codex PID, or zero for other foreground work."""
+        info = json_object(self.result("pane", "process-info", "--pane", pane).get("process_info"),
+                           "pane process info")
+        if not codex_without_session(info):
+            return 0
+        foreground = json_items(info.get("foreground_processes"), "native foreground processes")
+        pid = json_object(foreground[0], "native foreground process").get("pid")
+        if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+            raise HerdrFailure("native process pid is unavailable")
+        return pid
+
+    def native_pane_process(self, pane: str, kind: str, timeout: float, *,
+                            pane_row: Mapping[str, object] | PaneNotRead = PANE_NOT_READ) -> NativeAgentProcess:
         """Read the identity and launch environment from one proved foreground process."""
         result = run_program(self.argv("pane", "process-info", "--pane", pane), timeout=timeout)
         require_success(result, "native pane processes")
         payload = json_object(decode_object(result.stdout, "native pane processes").get("result"), "native pane result")
         info = json_object(payload.get("process_info"), "native pane process info")
-        return _native_pane_process(info, kind)
+        if isinstance(pane_row, PaneNotRead) and kind == "codex" and codex_without_session(info):
+            try:
+                row = self.pane_row(pane)
+                if not isinstance(row, NoPane):
+                    pane_row = row
+            except HerdrFailure:
+                pass
+        return pane_native_process(info, kind, {} if isinstance(pane_row, PaneNotRead) else pane_row)
+
+    def pane_agent_process(self, pane: str, terminal: str) -> AgentProcessIdentity:
+        """Read the foreground agent identity, then confirm its terminal."""
+        info = json_object(self.result("pane", "process-info", "--pane", pane).get("process_info"),
+                           "pane process info")
+        processes: list[AgentProcessIdentity] = []
+        reader = _startup_process_reader(PROGRAM_TIMEOUT_SECONDS)
+        for value in json_items(info.get("foreground_processes"), "foreground processes"):
+            process = json_object(value, "foreground process")
+            arguments = _foreground_arguments(process)
+            if any(_is_agent_process(arguments, kind) for kind in ("claude", "codex")):
+                pid = cast(int, process["pid"])
+                processes.append(reader.identity(pid))
+        if len(processes) != 1:
+            raise HerdrFailure(f"{pane}: expected one foreground agent process")
+        row = self.pane_row(pane)
+        if isinstance(row, NoPane) or row.get("terminal_id") != terminal:
+            raise HerdrFailure(f"{pane}: terminal changed before process selection", "wrong_target")
+        return processes[0]
 
     def readiness(self, pane: str) -> WorkerReadiness:
         agent = json_object(self.result("agent", "get", pane).get("agent"), "herdr agent get")
         status = AgentStatus.decode(agent.get("agent_status"))
-        ready = agent.get("interactive_ready")
+        ready = agent.get("interactive_ready", True)
         if not isinstance(ready, bool):
             print(f"herdr {self.session}:{pane}: readiness is unknown", file=sys.stderr)
             ready = False
         return {"agent_status": status, "interactive_ready": ready}
 
-    @staticmethod
-    def _remote_control_turn(row: dict[str, object]) -> bool:
-        """Identify a system turn that confirms Remote Control."""
-        return row.get("type") == "system" and (
-            row.get("subtype") == "bridge_status" or "/remote-control is active" in _turn_text(row))
-
-    def prompt_input_state(self, pane: str, transcript: SessionTranscript | UnspecifiedPromptTranscript,
-                           launched_at: datetime, *,
-                           cursor: TranscriptCursor | UnspecifiedPromptTranscript = UNSPECIFIED_PROMPT_TRANSCRIPT,
-                           ) -> PromptInputReady | PromptInputNotReady:
+    def prompt_input_state(self, pane: str) -> PromptInputReady | PromptInputHoldsDraft | PromptInputNotReady:
         ready, idle = False, False
         try:
             observation = self.readiness(pane)
-            idle = observation["agent_status"] == AgentStatus.IDLE
-            ready = observation["agent_status"] in {AgentStatus.WORKING, AgentStatus.IDLE} and observation["interactive_ready"]
+            status = observation["agent_status"]
+            idle = status.idle
+            ready = observation["interactive_ready"] and (status == AgentStatus.WORKING or idle)
         except (OSError, subprocess.SubprocessError, HerdrFailure):
             pass
-        if not ready and isinstance(transcript, SessionTranscript):
-            reader = cursor if isinstance(cursor, TranscriptCursor) else TranscriptCursor(transcript, launched_at)
-            ready = any(self._remote_control_turn(row) for _, row in reader.read_turns())
         if not ready:
             return PromptInputNotReady("destination session is still loading")
         raw = self.run("pane", "read", pane, "--source", "visible", "--format", "ansi")
         screen = _prompt_screen(raw)
         composer = _composer_input(raw)
-        if isinstance(composer, ComposerInput) and not composer.text.strip():
+        if isinstance(composer, ComposerInput):
+            if composer.text.strip():
+                return PromptInputHoldsDraft(screen)
             return PromptInputReady(screen, idle)
         return PromptInputNotReady("destination has no empty composer", screen)
 
-    def wait_for_prompt_input(self, pane: str, transcript: SessionTranscript | UnspecifiedPromptTranscript, launched_at: datetime,
-                              timeout_ms: int, *,
-                              cursor: TranscriptCursor | UnspecifiedPromptTranscript = UNSPECIFIED_PROMPT_TRANSCRIPT,
-                              ) -> PromptInputReady | PromptInputTimedOut:
-        if isinstance(cursor, UnspecifiedPromptTranscript) and isinstance(transcript, SessionTranscript):
-            cursor = TranscriptCursor(transcript, launched_at)
+    def wait_for_prompt_input(self, pane: str, timeout_ms: int) -> PromptInputReady | PromptInputTimedOut:
         deadline = time.monotonic() + operation_deadline.remaining(timeout_ms / 1000)
         screen: str | PromptScreenNotRead = PromptScreenNotRead()
+        draft_stashed = False
         while time.monotonic() < deadline:
-            state = self.prompt_input_state(pane, transcript, launched_at, cursor=cursor)
+            state = self.prompt_input_state(pane)
             if isinstance(state.screen, str):
                 screen = state.screen
             if isinstance(state, PromptInputReady):
                 return state
+            if isinstance(state, PromptInputHoldsDraft) and not draft_stashed:
+                self._send_keys(pane, "ctrl+s")
+                draft_stashed = True
             remaining = deadline - time.monotonic()
             if remaining > 0:
                 time.sleep(min(0.1, remaining))
@@ -2079,10 +2246,11 @@ class Herdr:
                               timeout_ms: int) -> PromptSubmitOutcome:
         if timeout_ms <= 0 or not opening.text.strip():
             return PromptNotSubmitted("opening prompt deadline elapsed or text is empty")
-        opening = OpeningPrompt(script_prompt(opening.text), opening.transcript, opening.before_prompt)
+        opening = OpeningPrompt(script_prompt(opening.text), opening.transcript, opening.before_prompt, opening.cursor)
         deadline = time.monotonic() + operation_deadline.remaining(timeout_ms / 1000)
-        cursor = (TranscriptCursor(opening.transcript, launched_at)
-                  if isinstance(opening.transcript, SessionTranscript) else UnspecifiedPromptTranscript())
+        cursor = opening.cursor
+        if not isinstance(cursor, TranscriptCursor) and isinstance(opening.transcript, SessionTranscript):
+            cursor = TranscriptCursor(opening.transcript, launched_at)
         screen: str | PromptScreenNotRead = PromptScreenNotRead()
         typings, enters, rejections = 0, 0, 0
         recipient: PromptRecipientProcess | PromptRecipientUnavailable = PromptRecipientUnavailable("transcript identity not supplied")
@@ -2110,9 +2278,11 @@ class Herdr:
             return failure(reason)
 
         try:
-            ready = self.wait_for_prompt_input(pane, opening.transcript, launched_at, timeout_ms, cursor=cursor)
+            ready = self.wait_for_prompt_input(pane, timeout_ms)
             screen = ready.screen
             if isinstance(ready, PromptInputTimedOut):
+                if isinstance(cursor, TranscriptCursor):
+                    _ = cursor.read_turns()
                 if isinstance(cursor, TranscriptCursor) and isinstance(cursor.readability, TranscriptUnreadable):
                     return deadline_failure()
                 return failure("destination never became ready for input")
@@ -2140,8 +2310,8 @@ class Herdr:
                     if time.monotonic() >= deadline:
                         return deadline_failure()
                     if isinstance(cursor.readability, TranscriptReadable):
-                        ready = self.wait_for_prompt_input(pane, opening.transcript, launched_at,
-                            max(0, int((deadline - time.monotonic()) * 1000)), cursor=cursor)
+                        ready = self.wait_for_prompt_input(pane,
+                            max(0, int((deadline - time.monotonic()) * 1000)))
                         if isinstance(ready.screen, str):
                             screen = ready.screen
                         if isinstance(ready, PromptInputTimedOut):
@@ -2157,7 +2327,7 @@ class Herdr:
                     if not check_target(cursor.transcript.session_id, action="keys",
                                         place=HerdrPlace(self.session, pane), text=current,
                                         recipient=recipient if typings > 1 else _TARGET_RECIPIENT_UNKNOWN,
-                                        pane_info=_pane_row(self, pane), client=self):
+                                        pane_info=self.pane_row(pane), client=self):
                         return failure("prompt target is unknown; session retained")
                     proof = cursor.submitted_prompt(current)
                     if isinstance(proof, PromptSubmitted):
@@ -2207,7 +2377,7 @@ class Herdr:
                             return failure("no user turn after three Enter retries")
                         if not check_target(cursor.transcript.session_id, action="keys",
                                             place=HerdrPlace(self.session, pane), text=current, recipient=recipient,
-                                            pane_info=_pane_row(self, pane), client=self):
+                                            pane_info=self.pane_row(pane), client=self):
                             return failure("prompt target is unknown; session retained")
                         # A turn can land during the screen/process reads too.
                         proof = cursor.submitted_prompt(current)
@@ -2223,16 +2393,16 @@ class Herdr:
                         continue
                     if composer.text.strip():
                         return failure("destination input contains other text")
-                    # Working can mean queued input, even with an empty box. Only
-                    # an idle recipient after a quiet settle window may be re-typed.
+                    # Working can mean queued input, even with an empty composer.
+                    # Retype only when the recipient is idle after the settle time.
                     observation = self.readiness(pane)
-                    if (observation["agent_status"] != AgentStatus.IDLE
+                    if (not observation["agent_status"].idle
                             or time.monotonic() - last_input < PROMPT_SETTLE_SECONDS):
                         continue
                     if typings == 3:
                         return failure("no user turn after three typings")
-                    ready = self.wait_for_prompt_input(pane, opening.transcript, launched_at,
-                        max(0, int((deadline - time.monotonic()) * 1000)), cursor=cursor)
+                    ready = self.wait_for_prompt_input(pane,
+                        max(0, int((deadline - time.monotonic()) * 1000)))
                     if isinstance(ready.screen, str):
                         screen = ready.screen
                     if isinstance(ready, PromptInputTimedOut):
@@ -2246,28 +2416,40 @@ class Herdr:
         except (OSError, subprocess.SubprocessError, HerdrFailure) as error:
             return failure(str(error))
 
-    def prompt(self, pane: str, text: str, *, target: str) -> None:
+    def prompt(self, pane: str, text: str, *, target: str,
+               proof: SubmitUnproved | SubmitStarts = SUBMIT_UNPROVED) -> None:
         """Send input only to the selected session."""
         if not target:
             raise HerdrFailure(f"{pane}: would send keys without a named target session")
-        row = _pane_row(self, pane)
+        row = self.pane_row(pane)
         if not check_target(target, action="keys", place=HerdrPlace(self.session, pane), text=text,
                             pane_info=row, client=self):
             raise HerdrFailure(f"{pane}: would send keys to an unproved target instead of session {target}")
+        self._prompt(pane, text, proof=proof)
+
+    def prompt_terminal(self, pane: str, terminal: str, text: str) -> None:
+        """Send input to the selected pane terminal."""
+        row = self.pane_row(pane)
+        if isinstance(row, NoPane) or row.get("terminal_id") != terminal:
+            raise HerdrFailure(f"{pane}: terminal changed before prompt")
         self._prompt(pane, text)
 
-    def _prompt(self, pane: str, text: str) -> None:
-        import script_prompts
+    def _prompt(self, pane: str, text: str, *,
+                proof: SubmitUnproved | SubmitStarts = SUBMIT_UNPROVED) -> None:
+        from scripts.lib import script_prompts
 
         text = script_prompt(text)
         if text.lstrip().startswith("/"):
             script_prompts.record(pane, text)
-        _ = self.run("agent", "prompt", pane, text)
+        arguments = ["agent", "prompt", pane, text]
+        if isinstance(proof, SubmitStarts):
+            arguments += ["--wait", "--until", "working", "--until", "blocked", "--timeout", str(proof.timeout_ms)]
+        _ = self.run(*arguments)
 
-    def wait_until(self, pane: str, state: str, timeout_ms: int) -> ObservedAgentState | WaitTimedOut:
+    def wait_turn_end(self, pane: str, timeout_ms: int) -> ObservedAgentState | WaitTimedOut:
         _timeout(timeout_ms)
         try:
-            result = run_program(self.argv("agent", "wait", pane, "--until", state,
+            result = run_program(self.argv("agent", "wait", pane, "--until", "done", "--until", "idle",
                                            "--timeout", str(timeout_ms)), timeout=timeout_ms / 1000 + 10)
         except subprocess.TimeoutExpired:
             return WaitTimedOut()
@@ -2294,7 +2476,7 @@ class Herdr:
     def send_keys(self, pane: str, *keys: str, target: str) -> None:
         if not target:
             raise HerdrFailure(f"{pane}: would send keys without a named target session")
-        row = _pane_row(self, pane)
+        row = self.pane_row(pane)
         if not check_target(target, action="keys", place=HerdrPlace(self.session, pane),
                             pane_info=row, client=self):
             raise HerdrFailure(f"{pane}: would send keys to an unproved target instead of session {target}")
@@ -2306,7 +2488,7 @@ class Herdr:
     def close_pane(self, pane: str, *, target: str) -> bool:
         """Close only the pane that runs the selected session, or its empty shell."""
         if not check_target(target, action="close", place=HerdrPlace(self.session, pane),
-                            pane_info=_pane_row(self, pane), client=self):
+                            pane_info=self.pane_row(pane), client=self):
             return False
         return self._close_pane(pane)
 
@@ -2325,17 +2507,19 @@ class Herdr:
             kind = agent.get("agent")
             if kind is not None and not isinstance(kind, str):
                 raise HerdrFailure("herdr agent kind: expected text or null")
+            session: ReportedAgentSession | NoReportedAgentSession = NoReportedAgentSession()
+            if "agent_session" in agent:
+                report = json_object(agent["agent_session"], "herdr agent session")
+                if json_text(report.get("kind"), "herdr agent session kind") == "id":
+                    session = ReportedAgentSession(json_text(report.get("value"), "herdr agent session id"))
             agents.append({
                 "pane_id": json_text(agent.get("pane_id"), "herdr agent pane id"),
                 "agent": kind,
                 "agent_status": AgentStatus.decode(agent.get("agent_status")),
+                "agent_session": session,
             })
         return agents
 
-
-
-def _pane_row(client: Herdr, pane: str) -> PaneIdentity | NoPane:
-    return next((row for row in client.panes() if row["pane_id"] == pane), NoPane(pane))
 
 
 def _pane_process_ids(info: dict[str, object], context: str) -> tuple[int, int]:
@@ -2345,9 +2529,28 @@ def _pane_process_ids(info: dict[str, object], context: str) -> tuple[int, int]:
     return cast(tuple[int, int], values)
 
 
-def _native_pane_process(info: dict[str, object], kind: str) -> NativeAgentProcess:
+def pane_session(row: Mapping[str, object]) -> str:
+    """Read the native session recorded in a pane's metadata."""
+    report = row.get("agent_session")
+    session = cast(dict[str, object], report).get("value") if isinstance(report, dict) else row.get("session_id")
+    if session is not None and not isinstance(session, str):
+        print("herdr: pane session is unreadable", file=sys.stderr)
+    return session if isinstance(session, str) else ""
+
+
+def codex_without_session(info: dict[str, object]) -> bool:
+    """Identify one foreground Codex that can supply a session report."""
+    foreground = json_items(info.get("foreground_processes"), "native foreground processes")
+    return len(foreground) == 1 and is_codex_process(
+        _foreground_arguments(json_object(foreground[0], "native foreground process")))
+
+
+def pane_native_process(info: dict[str, object], kind: str,
+                         pane: Mapping[str, object]) -> NativeAgentProcess:
+    foreground = json_items(info.get("foreground_processes"), "native foreground processes")
+    reported = pane_session(pane) if kind == "codex" and codex_without_session(info) else ""
     processes: list[NativeAgentProcess] = []
-    for value in json_items(info.get("foreground_processes"), "native foreground processes"):
+    for value in foreground:
         process = json_object(value, "native foreground process")
         arguments = _foreground_arguments(process)
         if not _is_agent_process(arguments, kind):
@@ -2356,16 +2559,19 @@ def _native_pane_process(info: dict[str, object], kind: str) -> NativeAgentProce
         if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
             raise HerdrFailure("native process pid is unavailable")
         try:
-            observed = native_process(pid, kind)
+            observed = native_process(pid, kind, reported) if reported else native_process(pid, kind)
         except (OSError, ValueError) as error:
             raise HerdrFailure(str(error)) from error
+        if (kind == "codex" and codex_without_session(info) and "pane_id" in pane
+                and not reported and isinstance(observed.identity, LaunchArgument)):
+            observed = NativeAgentProcess(UnreportedResume(observed.identity.id), observed.started, observed.environment)
         processes.append(observed)
     if len(processes) != 1:
         raise HerdrFailure("native registry identity is unavailable or ambiguous")
     return processes[0]
 
 
-def _pane_sessions(info: dict[str, object]) -> set[str]:
+def _pane_sessions(info: dict[str, object], pane: Mapping[str, object]) -> set[str]:
     kinds: set[str] = set()
     for value in json_items(info.get("foreground_processes"), "foreground processes"):
         process = json_object(value, "foreground process")
@@ -2373,7 +2579,7 @@ def _pane_sessions(info: dict[str, object]) -> set[str]:
         if not arguments and Path(str(process.get("name", ""))).name in ("claude", "codex"):
             raise HerdrFailure("agent argv is unavailable")
         kinds.update(kind for kind in ("claude", "codex") if _is_agent_process(arguments, kind))
-    return {_native_pane_process(info, kind).current_identity for kind in kinds}
+    return {pane_native_process(info, kind, pane).current_identity for kind in kinds}
 
 
 _TARGET_PLACE_UNKNOWN = NotInHerdr()
@@ -2419,7 +2625,7 @@ def check_target(target: str | AgentProcessIdentity, *, action: Literal["signal"
         return False
     client = Herdr(place.session) if isinstance(client, NotInHerdr) else client
     try:
-        row = _pane_row(client, place.pane) if pane_info is _TARGET_PANE_UNKNOWN else pane_info
+        row = client.pane_row(place.pane) if pane_info is _TARGET_PANE_UNKNOWN else pane_info
         if isinstance(row, NoPane):
             print(f"herdr {name}: pane {place.pane} is absent", file=sys.stderr)
             return False
@@ -2446,7 +2652,7 @@ def check_target(target: str | AgentProcessIdentity, *, action: Literal["signal"
             return action != "keys" or not target
         if not target:
             raise HerdrFailure(f"would {verb} a pane with other live work instead of the selected shell", "wrong_target")
-        observed = _pane_sessions(info)
+        observed = _pane_sessions(info, row)
         if not observed:
             print(f"herdr {name}: native session is unknown; target retained", file=sys.stderr)
             return False
@@ -2748,7 +2954,7 @@ def _server_start_failure(name: str) -> HerdrFailure:
 
 
 def _start_darwin_server(client: Herdr, timeout_ms: int, *, session_kind: SecuritySession) -> ServerCreated | ServerAdopted:
-    from detached import DiscardOutput, ExplicitEnvironment, DetachedChildExited, DetachedStartFailure, start_detached
+    from scripts.lib.detached import DiscardOutput, ExplicitEnvironment, DetachedChildExited, DetachedStartFailure, start_detached
 
     deadline = time.monotonic() + operation_deadline.remaining(min(10.0, timeout_ms / 1000))
     try:
@@ -2891,6 +3097,15 @@ def shared_session(*, dependencies: Callable[[Path], None] | None = None) -> str
     return name
 
 
+def row_workspace(row: staff.StaffRow | staff.StaffRoot, record: staff.StaffSnapshot, name: str) -> str:
+    """Use the showrunner workspace, then the supplied name, then the shared session."""
+    while isinstance(row, staff.StaffRow):
+        if row.kind == "showrunner":
+            return row.name
+        row = record.parent_of(row) or staff.STAFF_ROOT
+    return name or shared_session()
+
+
 def attach_hint(space: str, tab: str) -> str:
     """Where the user finds one Claude session: its tab in a workspace of the shared session."""
     return f"herdr session attach {shared_session()}, workspace {space}, tab {tab}"
@@ -2903,7 +3118,7 @@ def open_tab(name: str, space: str, title: str, cwd: str, environment: dict[str,
 def rename_saved_tab(session: str, workspace: str, old_titles: Set[str], title: str) -> None:
     """Replace an outside caller's old saved titles with the staff row id."""
     record = _tab_staff()
-    row = record.by_path(f"{workspace}/{title}") or record.by_path(f"{workspace}/{title}-unit")
+    row = record.by_path(f"{workspace}/{title}")
     if row is None:
         print(f"herdr {session}: staff row for {workspace}/{title} is unknown; layout retained", file=sys.stderr)
         return
@@ -2961,7 +3176,7 @@ def close_agent(session: str, pane: str) -> None:
     client = Herdr(session)
     path = pane_launch.record_directory() / f"{session}.json"
     if pane in pane_launch.read_valid_entries(path):
-        client.close_retained_pane(pane)
+        _ = client.close_retained_pane(pane)
         return
     rows = client.listed("pane")
     selected = next((row for row in rows if row.get("pane_id") == pane), None)
@@ -3092,10 +3307,24 @@ class LaunchArgument:
 
 
 @dataclass(frozen=True)
+class PaneSessionReport:
+    """One foreground Codex process owns the reported pane session."""
+
+    id: str
+
+
+@dataclass(frozen=True)
+class UnreportedResume:
+    """A resumed Codex with no report yet is named by its resume argument."""
+
+    id: str
+
+
+@dataclass(frozen=True)
 class NativeAgentProcess:
     """Conversation evidence from one process with a stable start time."""
 
-    identity: RolloutThread | EnvironmentThread | LaunchArgument
+    identity: RolloutThread | EnvironmentThread | LaunchArgument | PaneSessionReport | UnreportedResume
     started: str
     environment: dict[str, str]
 
@@ -3123,7 +3352,10 @@ def _open_codex_rollouts(pid: int) -> dict[Path, str]:
         return {path: str(path) for path in darwin_open_files(pid) if path.name.startswith("rollout-")}
     files: dict[Path, str] = {}
     for descriptor in (_proc_root() / str(pid) / "fd").iterdir():
-        target = os.readlink(descriptor)
+        try:
+            target = os.readlink(descriptor)
+        except FileNotFoundError:
+            continue
         if Path(target.removesuffix(" (deleted)")).name.startswith("rollout-"):
             files[descriptor] = target
     return files
@@ -3132,31 +3364,45 @@ def _open_codex_rollouts(pid: int) -> dict[Path, str]:
 def codex_rollout_threads(pid: int) -> set[str]:
     """Read every thread from stable open rollouts of one process."""
     started = _process_birth(pid)
-    files = _open_codex_rollouts(pid)
-    identities: set[str] = set()
-    for path in files:
-        before = path.stat()
-        with path.open(encoding="utf-8") as stream:
-            value = cast(object, json.loads(stream.readline()))
-        after = path.stat()
-        if (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns) != (
-                after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns):
-            raise ValueError(f"pid {pid}: current Codex rollout changed")
-        if not isinstance(value, dict):
-            raise ValueError(f"pid {pid}: current Codex rollout is unreadable")
-        meta = cast(dict[str, object], value)
-        payload = meta.get("payload")
-        if meta.get("type") != "session_meta" or not isinstance(payload, dict):
-            raise ValueError(f"pid {pid}: current Codex rollout has no session metadata")
-        identity = cast(dict[str, object], payload).get("id")
-        if not isinstance(identity, str):
-            raise ValueError(f"pid {pid}: current Codex rollout has no identity")
+    deadline = time.monotonic() + operation_deadline.remaining(PROGRAM_TIMEOUT_SECONDS)
+    while True:
+        files = _open_codex_rollouts(pid)
+        identities: set[str] = set()
         try:
-            identities.add(staff.native_id(identity))
-        except staff.StaffRefused as error:
-            raise ValueError(f"pid {pid}: current Codex rollout identity is invalid") from error
-    if _open_codex_rollouts(pid) != files or _process_birth(pid) != started:
-        raise ValueError(f"pid {pid}: current Codex rollout or process changed")
+            for path in files:
+                before = path.stat()
+                with path.open(encoding="utf-8") as stream:
+                    value = cast(object, json.loads(stream.readline()))
+                after = path.stat()
+                if (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns) != (
+                        after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns):
+                    raise ValueError(f"pid {pid}: current Codex rollout changed")
+                if not isinstance(value, dict):
+                    raise ValueError(f"pid {pid}: current Codex rollout is unreadable")
+                meta = cast(dict[str, object], value)
+                payload = meta.get("payload")
+                if meta.get("type") != "session_meta" or not isinstance(payload, dict):
+                    raise ValueError(f"pid {pid}: current Codex rollout has no session metadata")
+                identity = cast(dict[str, object], payload).get("id")
+                if not isinstance(identity, str):
+                    raise ValueError(f"pid {pid}: current Codex rollout has no identity")
+                try:
+                    identities.add(staff.native_id(identity))
+                except staff.StaffRefused as error:
+                    raise ValueError(f"pid {pid}: current Codex rollout identity is invalid") from error
+        except FileNotFoundError:
+            if _process_birth(pid) != started:
+                raise ValueError(f"pid {pid}: current Codex rollout or process changed")
+            if time.monotonic() >= deadline:
+                raise
+            continue
+        current = _open_codex_rollouts(pid)
+        if _process_birth(pid) != started:
+            raise ValueError(f"pid {pid}: current Codex rollout or process changed")
+        if current == files:
+            break
+        if not current.items() < files.items() or time.monotonic() >= deadline:
+            raise ValueError(f"pid {pid}: current Codex rollout or process changed")
     if not files:
         raise NoOpenCodexRollout(f"pid {pid}: current Codex rollout is unavailable")
     return identities
@@ -3170,7 +3416,19 @@ def codex_rollout_thread(pid: int) -> str:
     return next(iter(identities))
 
 
-def _codex_resume_thread(pid: int) -> str:
+def codex_transcript(pid: int) -> Path:
+    """Find the open transcript of one proved Codex process."""
+    started = _process_birth(pid)
+    files = _open_codex_rollouts(pid)
+    identity = codex_rollout_thread(pid)
+    paths = {Path(target) for target in files.values() if target.endswith(f"-{identity}.jsonl")}
+    if _process_birth(pid) != started or _open_codex_rollouts(pid) != files or len(paths) != 1:
+        raise ValueError(f"pid {pid}: current Codex transcript is unavailable or ambiguous")
+    return next(iter(paths))
+
+
+def codex_resume_thread(pid: int) -> str:
+    """Read the Codex thread from its resume arguments."""
     if _platform() == "darwin":
         process = next((process for process in _darwin_processes() if process.pid == pid), None)
         if process is None or isinstance(process.arguments, UnreadableProcessArguments):
@@ -3197,7 +3455,7 @@ def _codex_resume_thread(pid: int) -> str:
     raise ValueError(f"pid {pid}: Codex launch identity is unavailable")
 
 
-def native_process(pid: int, kind: str) -> NativeAgentProcess:
+def native_process(pid: int, kind: str, reported: str = "") -> NativeAgentProcess:
     """Bind the current identity and account to one unchanged process."""
     started = _process_birth(pid)
     environment = process_environment(pid)
@@ -3205,14 +3463,21 @@ def native_process(pid: int, kind: str) -> NativeAgentProcess:
         try:
             identity = RolloutThread(codex_rollout_thread(pid))
         except NoOpenCodexRollout:
-            identity = LaunchArgument(_codex_resume_thread(pid))
+            try:
+                resume = codex_resume_thread(pid)
+            except ValueError:
+                if not reported:
+                    raise
+                identity = PaneSessionReport(reported)
+            else:
+                identity = PaneSessionReport(reported) if reported == resume else LaunchArgument(resume)
     elif kind == "claude":
         try:
             current = staff.runtime_id(pid)
         except staff.StaffRefused as error:
             raise ValueError(f"pid {pid}: native registry identity is invalid") from error
         if not current:
-            raise ValueError(f"pid {pid}: native registry identity is unavailable")
+            raise NativeRegistryUnavailable(f"pid {pid}: native registry identity is unavailable")
         identity = EnvironmentThread(current)
     else:
         raise ValueError(f"pid {pid}: unknown agent kind {kind}")
@@ -3296,19 +3561,19 @@ class CodexConversations:
     unknown: tuple[str, ...]
 
 
-def codex_conversations() -> CodexConversations:
+def codex_conversations(*, wanted: str = "") -> CodexConversations:
     from scripts.lib import unit_runs
     from scripts.message import codex_daemon
 
     # A static import would close the cycle codex_mesh -> session_staff -> herdr -> codex_mesh.
     loaded_threads = cast(Callable[[Path, float], set[str]], import_module("scripts.agents.codex_mesh").loaded_threads)
     candidates: list[tuple[int, list[str]]] = []
-    unknown: list[str] = []
+    unknown: list[tuple[int, str] | str] = []
     try:
         if _platform() == "darwin":
             for process in _darwin_processes(complete=True):
                 if isinstance(process.arguments, UnreadableProcessArguments):
-                    unknown.append(f"{_process_display_name(process.pid)} (Codex argv unknown)")
+                    unknown.append((process.pid, "Codex argv unknown"))
                 else:
                     candidates.append((process.pid, list(process.arguments.argv)))
         else:
@@ -3320,9 +3585,9 @@ def codex_conversations() -> CodexConversations:
                         candidates.append((int(path.name), _process_arguments(path)))
                 except FileNotFoundError:
                     if path.exists():
-                        unknown.append(f"{_process_display_name(int(path.name))} (process argv unknown)")
+                        unknown.append((int(path.name), "process argv unknown"))
                 except OSError:
-                    unknown.append(f"{_process_display_name(int(path.name))} (process argv unknown)")
+                    unknown.append((int(path.name), "process argv unknown"))
     except (HerdrFailure, OSError, ValueError) as error:
         unknown.append(f"Codex process list unknown: {error}")
     live: dict[str, tuple[int, ...]] = {}
@@ -3334,8 +3599,16 @@ def codex_conversations() -> CodexConversations:
             for session in observed:
                 _ = live.setdefault(session.thread_id, ())
     runs: set[Path] = set()
-    for root in unit_runs.run_roots(os.environ.get("ROSTER_RUN_ROOT")):
+    for root in (*unit_runs.run_roots(os.environ.get("ROSTER_RUN_ROOT")), unit_runs.ASTRA_RUN_ROOT):
         runs.update(path.parent for path in root.glob(f"*/{unit_runs.SERVER_FILE}"))
+    server_pids: set[int] = set()
+    for run in runs:
+        try:
+            pid = worker_lifecycle.read_json_object(run / unit_runs.SERVER_FILE).get("pid")
+            if isinstance(pid, int):
+                server_pids.add(pid)
+        except (OSError, ValueError):
+            pass
     for pid, arguments in candidates:
         if not is_codex_process(arguments) or codex_managed_daemon(arguments):
             continue
@@ -3346,7 +3619,7 @@ def codex_conversations() -> CodexConversations:
                 runs.add(Path(run))
             observed = native_process(pid, "codex")
             if isinstance(observed.identity, LaunchArgument):
-                unknown.append(f"{_process_display_name(pid)} (Codex thread unknown)")
+                unknown.append((pid, "Codex thread unknown"))
             else:
                 identity = observed.current_identity
                 live[identity] = (*live.get(identity, ()), pid)
@@ -3365,7 +3638,7 @@ def codex_conversations() -> CodexConversations:
                 pass
             if environment is not None:
                 if "app-server" in arguments:
-                    if environment.get("UNIT_RUN_DIR"):
+                    if environment.get("UNIT_RUN_DIR") or pid in server_pids:
                         # The run read below resolves a server with no open rollout.
                         continue
                 elif no_rollout and "--no-daemon" not in arguments:
@@ -3373,7 +3646,7 @@ def codex_conversations() -> CodexConversations:
                     if home in daemon_reads:
                         # A failed daemon read already has one note for its account.
                         continue
-            unknown.append(f"{_process_display_name(pid)} (Codex thread unknown)")
+            unknown.append((pid, "Codex thread unknown"))
     deadline = time.monotonic() + operation_deadline.remaining(PROGRAM_TIMEOUT_SECONDS)
     for run in sorted(runs):
         try:
@@ -3381,7 +3654,11 @@ def codex_conversations() -> CodexConversations:
                 _ = live.setdefault(identity, ())
         except (OSError, ValueError) as error:
             unknown.append(f"{run.name} (Codex hosted threads unknown: {error})")
-    return CodexConversations(live, tuple(unknown))
+    if wanted in live:
+        return CodexConversations(live, ())
+    return CodexConversations(live, tuple(
+        entry if isinstance(entry, str) else f"{_process_display_name(entry[0])} ({entry[1]})"
+        for entry in unknown))
 
 
 def read_conversation(identity: str, kind: str = "", *,
@@ -3401,7 +3678,7 @@ def read_conversation(identity: str, kind: str = "", *,
         except (HerdrFailure, OSError, ValueError) as error:
             unknown.append(f"{identity} (Claude session unknown: {error})")
     if kind != "claude":
-        codex = codex_conversations() if codex is None else codex
+        codex = codex_conversations(wanted=identity) if codex is None else codex
         if identity in codex.live:
             return LiveConversation("codex", codex.live[identity])
         shared_codex = not unknown and bool(codex.unknown)
@@ -4088,17 +4365,17 @@ def _pane_shell_pids(session: str) -> list[int]:
     return list(_live_pane_reader.get()(session).shells())
 
 
-def pane_scopes(groups: list[tuple[str, Path]]) -> list[tuple[str, Path]]:
+def pane_scopes(groups: list[tuple[str, Path]], slice_name: str) -> list[tuple[str, Path]]:
     """Return the populated pane scopes in the configured agent slice."""
-    slice_name = agents_slice()
     return [(hierarchy, scope) for hierarchy, path in groups
             for scope in (path, *path.parents) if scope.parent.name == slice_name]
 
 
-def _add_scope_owners(owners: dict[tuple[str, Path], set[str]], pids: Sequence[int], sessions: dict[int, str]) -> None:
+def _add_scope_owners(owners: dict[tuple[str, Path], set[str]], pids: Sequence[int],
+                      sessions: dict[int, str], slice_name: str) -> None:
     """Record the session of each matched process in its pane scope."""
     for pid in pids:
-        for scope in pane_scopes(_systemd_cgroups(_proc_root() / str(pid))):
+        for scope in pane_scopes(_systemd_cgroups(_proc_root() / str(pid)), slice_name):
             owners.setdefault(scope, set()).add(sessions[pid])
 
 
@@ -4106,6 +4383,7 @@ def _process_sessions(candidates: list[Path], servers: dict[int, str]) -> dict[i
     """Associate descendants and handoff survivors with socket-owned sessions."""
     if not servers:
         return {}
+    read_slice = cache(agents_slice)
     unit_groups: dict[tuple[str, Path], str] = {}
     shared_groups: dict[tuple[str, Path], set[str]] = {}
     for pid, session in servers.items():
@@ -4161,14 +4439,14 @@ def _process_sessions(candidates: list[Path], servers: dict[int, str]) -> dict[i
                         break
                 if pid in sessions:
                     break
-            if pid not in sessions and (scopes := pane_scopes(groups)):
+            if pid not in sessions and (scopes := pane_scopes(groups, read_slice())):
                 loose[pid] = scopes
         # A pane scope holds one pane's processes, as the unit's cgroup held
         # them before. Only a scope that no matched process explains needs the
         # unit servers' pane shells.
         owners: dict[tuple[str, Path], set[str]] = {}
         if loose:
-            _add_scope_owners(owners, [pid for pid in sessions if pid not in servers], sessions)
+            _add_scope_owners(owners, [pid for pid in sessions if pid not in servers], sessions, read_slice())
             if any(not any(scope in owners for scope in scopes) for scopes in loose.values()):
                 shared_sessions.update(unit_groups.values())
         walked = set(sessions)
@@ -4185,7 +4463,7 @@ def _process_sessions(candidates: list[Path], servers: dict[int, str]) -> dict[i
                     sessions[pid] = owner
                     descendants.extend((child, owner) for child in children.get(pid, []))
         if loose:
-            _add_scope_owners(owners, [pid for pid in sessions if pid not in walked], sessions)
+            _add_scope_owners(owners, [pid for pid in sessions if pid not in walked], sessions, read_slice())
             for pid, scopes in loose.items():
                 found = {session for scope in scopes for session in owners.get(scope, set())}
                 # A scope with two owners holds a server started inside a pane; it names neither.
@@ -4535,7 +4813,9 @@ def _agent_name(name: str) -> str:
     mapped = re.sub(r"[^a-z0-9_-]", "-", name.lower())
     if not mapped or not "a" <= mapped[0] <= "z":
         mapped = "a-" + mapped
-    return mapped[:32]
+    if len(mapped) <= 32:
+        return mapped
+    return mapped[:23] + "-" + hashlib.sha256(mapped.encode()).hexdigest()[:8]
 
 
 @dataclass(frozen=True)
@@ -4634,10 +4914,15 @@ def prepare_session_environment(session_id: str, cwd: str, environment: dict[str
     return prepare_agent_environment(cwd, environment, unset_variables)
 
 
+class AgentNameSource(Enum):
+    MEMBER_REFERENCE = "member_reference"
+
+
 def launch_prepared_agent(name: str, destination: NewTab | SplitPane | ExistingPane, prepared: PreparedAgentEnvironment,
                           kind: str, agent_arguments: list[str], opening: OpeningPrompt | NoOpeningPrompt,
-                          timeout_ms: int, *, agent: str, reported_unknown: str = "") -> AgentLaunched:
-    """Launch an already proved environment without another potentially slow load."""
+                          timeout_ms: int, *, agent: str, reported_unknown: str = "",
+                          agent_name: str | AgentNameSource = AgentNameSource.MEMBER_REFERENCE) -> AgentLaunched:
+    """Launch the prepared environment. Use agent for staff lookup and agent_name for the server name."""
     _check_agent_arguments(kind, agent_arguments)
     session_id = next((agent_arguments[index + 1] for index, argument in enumerate(agent_arguments[:-1])
                        if argument in {"--resume", "--session-id", "resume"}), "")
@@ -4663,7 +4948,7 @@ def launch_prepared_agent(name: str, destination: NewTab | SplitPane | ExistingP
         options = ["pane", "split", destination.of_pane, "--direction",
                    destination.direction if destination.direction in {"right", "down"} else "right",
                    "--ratio", str(min(0.99, max(0.01, destination.ratio))), "--cwd", str(prepared.directory), "--no-focus"]
-        for key, value in {**child_environment(prepared.env), "HERDR_AGENT_PANE": "1"}.items():
+        for key, value in _pane_environment(prepared.env).items():
             options.extend(["--env", f"{key}={value}"])
         result = client.result(*options)
         pane = json_text(json_object(result.get("pane"), "herdr split pane").get("pane_id"), "herdr split pane id")
@@ -4675,33 +4960,41 @@ def launch_prepared_agent(name: str, destination: NewTab | SplitPane | ExistingP
     try:
         if isinstance(destination, SplitPane):
             client.label_pane(pane, destination.label)
+        script = f"unalias {kind} 2>/dev/null; "
         if isinstance(destination, ExistingPane):
-            # Change the existing shell, so the canonical agent inherits the proved environment.
-            environment = {**child_environment(prepared.env), "HERDR_AGENT_PANE": "1"}
+            # Set the environment in the existing shell before the agent starts.
+            environment = _pane_environment(prepared.env)
             exports = shlex.join([f"{key}={value}" for key, value in environment.items()
                                   if not key.startswith("HERDR_") or key == "HERDR_AGENT_PANE"])
-            removals = prepared.unset_environment | {
+            removals = (prepared.unset_environment | {
                 "STAFF_ID", "CLAUDE_CONFIG_DIR", "CODEX_HOME",
                 "CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID", "CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY",
-            }
-            script = (f"unalias {kind} 2>/dev/null; "
-                      "for legacy_label in $(env); do case $legacy_label in SHOWRUNNER_*=*) "
+            }) - {"TERM", "COLORTERM"}
+            script += ("for legacy_label in $(env); do case $legacy_label in SHOWRUNNER_*=*) "
                       'unset "${legacy_label%%=*}";; esac; done; '
                       f"cd -- {shlex.quote(str(prepared.directory))} && "
                       f"unset {shlex.join(sorted(key for key in removals if not key.startswith('HERDR_') and re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*', key)))} && export {exports}")
-            client.run_in_pane(pane, ["eval", script], terminal=destination.terminal)
-        outcome = start_agent(name, pane, kind, agent_arguments, opening, timeout_ms, agent=agent)
+        client.run_in_pane(pane, ["eval", script],
+                           terminal=destination.terminal if isinstance(destination, ExistingPane) else "")
+        server_name = agent_name if isinstance(agent_name, str) else agent
+        outcome = start_agent(name, pane, kind, agent_arguments, opening, timeout_ms, agent=server_name)
     except AgentExited:
         if isinstance(destination, NewTab):
             close_agent(name, pane)
         elif isinstance(destination, SplitPane):
-            client.close_retained_pane(pane)
+            _ = client.close_retained_pane(pane)
         raise
     except (HerdrFailure, OSError, subprocess.SubprocessError) as error:
         if isinstance(error, HerdrFailure) and error.code == "wrong_target":
             raise
         print(f"herdr {name}:{pane}: start incomplete: {error}; pane retained", file=sys.stderr)
         return AgentLaunched(pane, PromptNotSubmitted(str(error)))
+    if isinstance(outcome, AgentNotStarted) and not isinstance(destination, ExistingPane):
+        if isinstance(destination, NewTab):
+            close_agent(name, pane)
+        else:
+            _ = client.close_retained_pane(pane)
+        print(f"herdr {name}:{pane}: agent start failed: {outcome.reason}; pane closed", file=sys.stderr)
     return AgentLaunched(pane, outcome)
 
 

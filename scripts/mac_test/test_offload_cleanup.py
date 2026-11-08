@@ -13,10 +13,9 @@ import io
 from pathlib import Path
 from typing import TYPE_CHECKING, cast, override
 from unittest import mock
-import offload
-import mac_test
-from offload_test_commands import ACTIVITY_SELECTOR_STUB, write_shell
-from offload_test_support import HANA, HANA_COMMAND_PATTERN, SelectorEvent
+from scripts.mac_test import offload, mac_test
+from scripts.mac_test.offload_test_commands import ACTIVITY_SELECTOR_STUB, write_shell
+from scripts.mac_test.offload_test_support import HANA, HANA_COMMAND_PATTERN, SelectorEvent
 if TYPE_CHECKING:
     from ..lib import test_hang_guard
 else:
@@ -104,7 +103,7 @@ exit "$CLEANUP_TEST_STATUS"
         disk_status: int = 0,
         free_floor_gib: float = 100,
     ) -> subprocess.CompletedProcess[str]:
-        request = offload.OffloadRequest(self.root, "hana", "cleanup-call", offload.NO_RESULT_FILE, words)
+        request = offload.OffloadRequest(self.root, "hana", "cleanup-call", offload.NO_RESULT_FILE, words, owner="verify", holder_session="fixture-session")
         config = offload.OffloadConfig(
             enabled=True, connection=offload.SshConnectionSettings("unused-host", 6, 10), probe_timeout_s=1,
             unreachable_backoff_s=300, free_floor_gib=free_floor_gib,

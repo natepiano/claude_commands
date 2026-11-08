@@ -58,4 +58,3 @@ class UnitStatusTests(UnitStatusFixture):
         self.assertIn("CLAUDE STATE UNKNOWN", outputs[0].splitlines())
         self.assertNotIn("CLAUDE NOT RUNNING", outputs[0])
         self.assertIsNone(calls)
-

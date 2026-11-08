@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from scripts.shutdown import remote
+
 import os
 import subprocess
 import sys
@@ -9,15 +11,15 @@ import tempfile
 import unittest
 from pathlib import Path
 from typing import override
-from scripts.production import staff
+from scripts.production import staff, staff_test_support
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.production.staff_test_support import isolated_staff_file, recorded_showrunner, unit_membership
 
 SCRIPT = Path(__file__).with_name("prune_phase_notes.py")
 
 
-def note(unit: str, production: str = "example") -> str:
-    return f"---\nphase_table: true\nproduction: {production}\nunit: {unit}\n---\n\n# {unit}\n"
+def note(unit: staff.StaffRow) -> str:
+    return f"---\nphase_table: true\nunit: {unit.id}\n---\n\n# {unit.name}\n"
 
 
 class PrunePhaseNotesTests(unittest.TestCase):
@@ -37,11 +39,12 @@ class PrunePhaseNotesTests(unittest.TestCase):
                     "SHOWRUNNER_STATE_DIR": str(self.root / "showrunner"),
                     "HERDR_BIN": "/nonexistent/herdr"}
         _ = self.enterContext(isolated_staff_file(self.root / "staff.json", self.env))
+        write_text_atomic(self.root / "staff.json", '{"schema":2,"rows":[]}\n')
 
-    def production(self, slug: str) -> Path:
-        """A production with one live unit, alpha-unit, and its update timer."""
-        checkout = self.root / slug
-        alpha = self.root / f"{slug}-alpha"
+    def production(self, name: str) -> Path:
+        """A production with one live unit, alpha, and its update timer."""
+        checkout = self.root / name
+        alpha = self.root / f"{name}-alpha"
         alpha.mkdir(parents=True)
         _ = subprocess.run(["git", "-C", str(alpha), "init", "--quiet", "-b", "alpha"],
                            capture_output=True, check=True)
@@ -49,30 +52,33 @@ class PrunePhaseNotesTests(unittest.TestCase):
                             "-c", "user.email=fixture@example.invalid", "commit", "--quiet",
                             "--allow-empty", "-m", "fixture"], capture_output=True, check=True)
         write_text_atomic(alpha / ".unit.toml", 'plan = "docs/alpha.md"\nresponsibilities = []\n')
-        doc = checkout / f"docs/{slug}-production.md"
+        doc = checkout / f"docs/{name}-production.md"
         doc.parent.mkdir(parents=True)
         _ = doc.write_text("\n".join((
-            f"# Production — {slug}", "", "## Production Context", "",
+            f"# Production — {name}", "", "## Production Context", "",
             "- **Merge branch:** `production`", f"- **Showrunner checkout:** `{checkout}`",
             "- **Log:** `production.log`", "",
         )), encoding="utf-8")
-        self.timer(slug, doc)
-        unit = unit_membership(slug, "alpha-unit")
-        _ = staff.set_worktree(unit.id, staff.PresentWorktree("natedev", alpha), expected=unit.worktree)
+        self.timer(name, doc)
+        unit = unit_membership(name, "alpha")
+        _ = staff.set_worktree(unit.id, staff.PresentWorktree(remote.local_machine(), alpha), expected=unit.worktree)
+        retired = unit_membership(name, "beta")
+        _ = staff.set_worktree(retired.id, staff.RemovedWorktree(remote.local_machine(), self.root / f"{name}-beta"),
+                               expected=retired.worktree)
         return doc
 
-    def timer(self, slug: str, doc: Path) -> None:
-        _ = recorded_showrunner(slug, doc)
-        instance = self.notifier / f"showrunner-{slug}"
+    def timer(self, name: str, doc: Path) -> None:
+        owner = recorded_showrunner(name, doc)
+        instance = self.notifier / f"showrunner-{owner.id}"
         instance.mkdir()
         _ = (instance / "conf").write_text(
-            f"TARGET=session:x\nCHECK=zsh /home/x/.claude/scripts/production/production_check.sh {doc}\n",
+            f"TARGET=session:x\nCHECK=zsh /home/x/.claude/scripts/production/production_check.sh {owner.id}\n",
             encoding="utf-8")
 
     def planted(self, unit: str, production: str = "example") -> Path:
         path = self.vault / "natedev" / f"{unit}.md"
         path.parent.mkdir(parents=True, exist_ok=True)
-        _ = path.write_text(note(unit, production), encoding="utf-8")
+        _ = path.write_text(note(unit_membership(production, unit)), encoding="utf-8")
         return path
 
     def run_script(self) -> subprocess.CompletedProcess[str]:
@@ -81,25 +87,25 @@ class PrunePhaseNotesTests(unittest.TestCase):
 
     def test_a_retired_units_note_is_archived_and_a_live_ones_stays(self) -> None:
         _ = self.production("example")
-        live = self.planted("alpha-unit")
-        retired = self.planted("beta-unit")
+        live = self.planted("alpha")
+        retired = self.planted("beta")
         # Another production's note for the same unit name is that production's to prune.
         other = self.vault / "elsewhere" / "beta-unit.md"
         other.parent.mkdir(parents=True)
-        _ = other.write_text(note("beta-unit", "other"), encoding="utf-8")
+        _ = other.write_text(note(unit_membership("other", "beta")), encoding="utf-8")
 
         result = self.run_script()
 
         self.assertEqual((result.returncode, result.stdout, result.stderr), (0, "", ""))
         self.assertTrue(live.exists())
         self.assertFalse(retired.exists())
-        self.assertTrue((self.root / "vault/archive/natedev/example/beta-unit.md").exists())
+        self.assertTrue((self.root / "vault/archive/natedev/example/beta.md").exists())
         self.assertTrue(other.exists())
 
     def test_a_production_that_fails_is_reported_and_the_next_is_still_pruned(self) -> None:
         self.timer("aaa-broken", self.root / "missing/aaa-broken-production.md")
         _ = self.production("example")
-        retired = self.planted("beta-unit")
+        retired = self.planted("beta")
 
         result = self.run_script()
 
@@ -108,19 +114,20 @@ class PrunePhaseNotesTests(unittest.TestCase):
         self.assertNotIn("example", result.stderr)
         self.assertFalse(retired.exists())
 
-    def test_a_timer_with_no_production_check_is_reported(self) -> None:
-        instance = self.notifier / "showrunner-odd"
+    def test_a_timer_owner_with_no_document_is_reported(self) -> None:
+        owner = staff_test_support.fixture_member("showrunner", name="odd")
+        instance = self.notifier / f"showrunner-{owner.id}"
         instance.mkdir()
         _ = (instance / "conf").write_text("TARGET=session:x\n", encoding="utf-8")
 
         result = self.run_script()
 
         self.assertEqual(result.returncode, 1)
-        self.assertEqual(result.stderr, "phase notes not pruned for odd: CHECK is missing\n")
+        self.assertEqual(result.stderr, "phase notes not pruned for odd: timer owner has no local staff document\n")
 
     def test_nothing_to_prune_prints_nothing(self) -> None:
         _ = self.production("example")
-        live = self.planted("alpha-unit")
+        live = self.planted("alpha")
         # Only update timers name productions: other notifier jobs are not read.
         (self.notifier / "stall-watch").mkdir()
 

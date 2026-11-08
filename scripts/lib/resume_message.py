@@ -1,145 +1,185 @@
 """Build resume messages and commands for existing worker threads."""
 from __future__ import annotations
 
-import json
 import shlex
-from datetime import datetime, timezone
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, cast
+from typing import NamedTuple, TypedDict
 
+from scripts.direct import assign_gate, phase_reservation, progress_history
 from scripts.lib.script_envelope import script_prompt
-from scripts.usage import agents_log
-
-if TYPE_CHECKING:
-    from scripts.shutdown.inventory import PausedSeat
-
-SCRIPTS = Path(__file__).resolve().parents[1]
+from scripts.production import staff
 
 
 @dataclass(frozen=True)
-class ResumeWorkers:
-    """Existing worker threads and their work directory, for the opening message."""
-    seats: Sequence[PausedSeat]
-    cwd: str
+class NoAccountMove:
+    """Keep the current account."""
 
 
-NO_WORKERS = ResumeWorkers((), "")
+@dataclass(frozen=True)
+class AccountMove:
+    source: str
+    destination: str
 
 
-def resume_message(why: str, *, moved_from: str | None = None, moved_to: str | None = None,
-                   workers: ResumeWorkers = NO_WORKERS, context: str = "") -> str:
+@dataclass(frozen=True)
+class IdleWorker:
+    """The worker has no active dispatch."""
+
+
+@dataclass(frozen=True)
+class BusyPass:
+    dispatch_id: str
+
+
+@dataclass(frozen=True)
+class NoOwnPass:
+    """The recipient has no active pass."""
+
+
+@dataclass(frozen=True)
+class PaneWorkerResume:
+    staff_id: staff.StaffId
+    turn: BusyPass | IdleWorker
+
+
+class PausedSeat(TypedDict):
+    """A worker reference and the launcher that continues its task."""
+
+    run_dir: str
+    seat: str
+    role: str
+    staff_id: str
+    turn_live: bool
+    launcher_command: list[str]
+
+
+class Resumable(NamedTuple):
+    seat: PausedSeat
+
+
+class Idle(NamedTuple):
+    seat: PausedSeat
+
+
+class Unavailable(NamedTuple):
+    staff_id: str
+    name: str
+    reason: str
+
+
+WorkerResume = Resumable | Idle | Unavailable
+
+
+class ResumeWorkers(NamedTuple):
+    results: Sequence[WorkerResume] = ()
+    cwd: str = ""
+    panes: Sequence[PaneWorkerResume] = ()
+
+
+NO_ACCOUNT_MOVE = NoAccountMove()
+NO_WORKERS = ResumeWorkers()
+NO_OWN_PASS = NoOwnPass()
+
+
+def launcher_prompt(worker: staff.StaffId, dispatch_id: str, command: Sequence[str]) -> str:
+    """Build launcher instructions; the prompt client adds the script envelope."""
+    return (f"Resume worker {worker}, dispatch {dispatch_id}. "
+            + f"Run this saved command from your session shell: {shlex.join(command)}")
+
+
+def resume_message(why: str, *, move: NoAccountMove | AccountMove = NO_ACCOUNT_MOVE,
+                   workers: ResumeWorkers = NO_WORKERS, context: str = "",
+                   own_pass: BusyPass | NoOwnPass = NO_OWN_PASS) -> str:
+    moved = f" You were moved from {move.source} to {move.destination}." if isinstance(move, AccountMove) else ""
+    if isinstance(own_pass, BusyPass):
+        opening = context or f"You were stopped and resumed because {why}.{moved}"
+        return script_prompt(f"{opening}\nContinue pass {own_pass.dispatch_id} in this conversation. Keep the same pass id.")
     lines: list[str] = []
     if why or context:
-        move = f" You were moved from {moved_from} to {moved_to}." if moved_to else ""
-        opening = context or f"You were stopped and resumed because {why}.{move} Continue where you stopped."
+        opening = context or f"You were stopped and resumed because {why}.{moved} Continue where you stopped."
         lines.append(opening.rstrip() + " First run `~/.claude/scripts/lib/py ~/.claude/scripts/message/send.py pending` "
                      + "for messages kept while you were down, then continue from there; if you were waiting on the user, keep waiting.")
-    if workers.seats:
-        lines.append("Resume your Codex workers; do not open new ones.")
-        for seat in workers.seats:
-            if seat["turn_live"]:
-                lines.append(f"{seat['seat']} ({seat['role']}, was working): {resume_worker_command(seat, workers.cwd)}")
-            else:
-                lines.append(f"{seat['seat']} ({seat['role']}, idle): paused on its thread; nothing to run now. "
-                             + f"Your next dispatch with --to {seat['seat']} resumes it.")
-        lines.append("Each command resumes the worker's existing thread.")
+    for pane in workers.panes:
+        turn = f"busy dispatch {pane.turn.dispatch_id}" if isinstance(pane.turn, BusyPass) else "idle"
+        lines.append(f"Worker {pane.staff_id}: {turn}. Continue with this worker's existing conversation.")
+    if workers.results:
+        lines.append("Resume your workers; do not open new ones.")
+        for result in workers.results:
+            match result:
+                case Unavailable(staff_id, name, reason):
+                    lines.append(f"anomaly: {name} ({staff_id}): {reason}")
+                case Resumable(seat):
+                    lines.append(f"{seat['seat']} ({seat['role']}, was working): {resume_worker_command(seat, workers.cwd)}")
+                case Idle(seat):
+                    lines.append(f"{seat['seat']} ({seat['role']}, idle): paused on its thread; nothing to run now. "
+                                 + f"Your next dispatch with --to {seat['seat']} resumes it.")
         lines.append("Each worker continues its own thread; after resuming, send later work with --to as usual.")
     elif why:
-        lines.append("Codex workers keep their existing threads. Use implement.sh --to <worker> or "
-                     + "codex_mesh.py resume for a paused worker; do not open a replacement thread.")
-    text = ("\n" if workers.seats else " ").join(lines)
+        lines.append("Codex workers keep their existing threads. Use assign.sh --to <worker> to resume a paused worker.")
+    text = ("\n" if workers.results or workers.panes else " ").join(lines)
     return script_prompt(text)
 
 
-def _resume_phase_id(seat: PausedSeat) -> str:
-    """Use the phase recorded for this worker; a slot can belong to another worker."""
-    try:
-        raw = cast(object, json.loads((Path(seat["run_dir"]) / "progress_history_state.json").read_text(encoding="utf-8")))
-    except (OSError, ValueError):
-        return ""
-    if not isinstance(raw, dict):
-        return ""
-    passes = cast(dict[str, object], raw).get("pass")
-    if not isinstance(passes, dict):
-        return ""
-    recorded_passes = cast(dict[str, object], passes)
-    # Older state holds one pass directly; newer state holds a pass per slot.
-    candidates = [recorded_passes] if "instance_id" in recorded_passes else recorded_passes.values()
-    phase_ids: set[str] = set()
-    for candidate in candidates:
-        if not isinstance(candidate, dict):
-            continue
-        record = cast(dict[str, object], candidate)
-        if record.get("worker_name") != seat["seat"]:
-            continue
-        phase = record.get("phase")
-        if not isinstance(phase, dict):
-            return ""
-        phase_id = cast(dict[str, object], phase).get("id")
-        if not isinstance(phase_id, str) or not phase_id.strip():
-            return ""
-        phase_ids.add(phase_id)
-    return next(iter(phase_ids)) if len(phase_ids) == 1 else ""
-
-
 def resume_worker_command(seat: PausedSeat, cwd: str) -> str:
-    """Build a complete launcher invocation that continues this worker's thread."""
-    from scripts.direct.worker_state import worker_slot
-    from scripts.production import session_staff
-
-    launcher = "review.sh" if seat["role"] == "review" else "implement.sh"
+    """Build an assignment command for the worker's existing thread."""
     prompt = str(Path(seat["run_dir"]) / f"{seat['seat']}.resume-prompt.md")
     if seat["turn_live"] and seat["launcher_command"]:
         try:
             return _resume_task(seat, cwd, prompt)
         except ValueError:
             pass
-    # Find the saved slot through staff_id, including identities from named fix workers.
-    recorded_slot = worker_slot(Path(seat["run_dir"]), seat["seat"]) or ""
-    team_role = recorded_slot or seat["role"]
-    phase_id = _resume_phase_id(seat)
-    # The launchers are not executable files: `bash` runs them as pasted.
-    start = ["bash", str(SCRIPTS / "direct" / launcher), "--to", seat["seat"]]
-    if phase_id:
-        start.extend(("--phase", phase_id))
-    if launcher == "review.sh":
-        assignment = agents_log.role_at(agents_log.assignments(agents_log.state_dir() / "agents.jsonl"),
-                                       session_staff.worker_session(seat), datetime.now(timezone.utc))
-        if isinstance(assignment, agents_log.Assignment) and assignment.role == "review" and assignment.lens:
-            start.extend(("--lens", assignment.lens))
-    kind = team_role if team_role in {"impl", "test", "fix"} else "impl"
-    if seat["role"] == "fix":
-        kind = "fix"
-    if launcher == "implement.sh" and kind == "fix":
-        start.extend(("--fix-cause", "resume after a move"))
-    start.extend((seat["run_dir"], cwd, prompt))
-    if launcher == "review.sh":
-        return shlex.join([*start, "review", "resume after a move", "resuming after a move"])
-    return shlex.join([*start, kind, "resume after a move", kind, "resuming after a move", "0", team_role])
+    options = {"--role": seat["role"]}
+    dispatch = progress_history.last_dispatch(staff.StaffId(seat["staff_id"]))
+    if isinstance(dispatch, progress_history.RecordedDispatch):
+        options["--role"] = dispatch.role
+        options.update({option: value for option, value in (
+            ("--phase", dispatch.phase_id), ("--lens", dispatch.lens), ("--paths", dispatch.paths))
+                        if isinstance(value, str)})
+    return _assignment_command(seat, cwd, prompt, list(options.items()))
 
 
+def _assignment_command(seat: PausedSeat, cwd: str, prompt: str, options: list[tuple[str, str]]) -> str:
+    """Supply the current folder, prompt, and authorized phase paths."""
+    values = dict(options)
+    role = values["--role"]
+    if role == "fix" and "--fix-cause" not in values:
+        options.append(("--fix-cause", "resume after a move"))
+    if role != "review" and "--paths" not in values and (phase := values.get("--phase")):
+        options.append(("--paths", str(phase_reservation.phase_directory(Path(seat["run_dir"]), phase)
+                                     / phase_reservation.FILES_FILE)))
+    refreshed = {"--to": seat["seat"], "--session-dir": seat["run_dir"], "--cwd": cwd, "--prompt": prompt}
+    return assign_gate.assign_command(
+        seat["run_dir"], seat["seat"], role,
+        [*refreshed.items(), *((option, value) for option, value in options if option not in refreshed)])
 
 def _resume_task(seat: PausedSeat, cwd: str, prompt: str) -> str:
-    """Keep task options and arguments with the current folder and resume prompt."""
+    """Convert a saved launcher command into an assignment command."""
     command = seat["launcher_command"]
-    index = next((i for i, value in enumerate(command) if Path(value).name in {"implement.sh", "review.sh"}), -1)
+    index = next((i for i, value in enumerate(command) if Path(value).name in assign_gate.WORKER_LAUNCHERS), -1)
     if index < 0:
         raise ValueError("the saved command has no worker launcher")
-    review = Path(command[index]).name == "review.sh"
-    supported = {"--phase", "--lens"} if review else {"--phase", "--fix-cause"}
+    launcher = Path(command[index]).name
     position = index + 1
-    options: list[str] = []
+    options: list[tuple[str, str]] = []
     while position < len(command) and command[position].startswith("--"):
         if position + 1 >= len(command):
             raise ValueError("the saved command has an incomplete option")
         option, value = command[position:position + 2]
-        if option in supported:
-            options.extend((option, value))
+        if launcher in assign_gate.ASSIGN_LAUNCHERS or option not in {"--pool", "--lease", "--slot", "--mesh-label"}:
+            options.append((option, value))
         position += 2
-    arguments = command[position:]
-    if len(arguments) < (3 if review else 9):
-        raise ValueError("the saved command has incomplete task arguments")
-    arguments[:3] = [seat["run_dir"], cwd, prompt]
-    return shlex.join([*command[:index + 1], *options, "--to", seat["seat"], *arguments])
+    if launcher not in assign_gate.ASSIGN_LAUNCHERS:
+        arguments = command[position:]
+        if len(arguments) < 3:
+            raise ValueError("the saved command has incomplete task arguments")
+        options.append(("--role", "review"))
+        if len(arguments) > 6:
+            options.append(("--pass", str(max(1, int(arguments[6])))))
+            for offset, option in ((7, "--lens"), (8, "--early-ready")):
+                if len(arguments) > offset and arguments[offset] and option not in dict(options):
+                    options.append((option, arguments[offset]))
+    if "--role" not in dict(options):
+        raise ValueError("the saved assignment has no role")
+    return _assignment_command(seat, cwd, prompt, options)

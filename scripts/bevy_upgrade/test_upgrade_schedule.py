@@ -6,7 +6,6 @@ import io
 import json
 import os
 import shlex
-import sys
 import tempfile
 import unittest
 from datetime import datetime, timezone
@@ -14,10 +13,9 @@ from pathlib import Path
 from typing import cast, final, override
 from unittest import mock
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-import upgrade_record
-import upgrade_schedule
+from scripts.bevy_upgrade import upgrade_record
+from scripts.bevy_upgrade import upgrade_schedule
 from scripts.production import staff
 from scripts.production.staff_test_support import fixture_member, fixture_runtime_id, isolated_staff_file
 
@@ -151,7 +149,7 @@ class ScheduleTests(unittest.TestCase):
     def test_retirement_os_error_reports_failure_without_raising(self) -> None:
         stderr = io.StringIO()
         with contextlib.nullcontext(), \
-                mock.patch("upgrade_schedule.subprocess.run", side_effect=OSError("sender unavailable")) as runner, \
+                mock.patch("scripts.bevy_upgrade.upgrade_schedule.subprocess.run", side_effect=OSError("sender unavailable")) as runner, \
                 contextlib.redirect_stderr(stderr):
             upgrade_schedule.retire_message(self.owner_id)
         scripts = Path(__file__).resolve().parents[1]

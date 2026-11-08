@@ -61,11 +61,11 @@ This command does not change code and does not commit.
 
 <ArchiveOnly>
 **Shrinking touches `done` phases and nothing else.** Not the title, not the
-status line, not the `As-built disposition`, `Production` or `Issues` lines,
+status line, not the `As-built disposition` or `Issues` lines,
 not `## Delegation Context`
 (including `Project started`, which `/unit:direct`'s recorder treats as
 authoritative),
-not `## Gates` or any other doc-level section, and above all not a single byte of
+not any doc-level section, and above all not a single byte of
 any `todo` phase. The live zone is the dispatch contract `/unit:direct` reads;
 this command has no opinion about it.
 

@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import io
 import json
-import sys
 import tempfile
 import unittest
 from collections.abc import Generator
@@ -18,8 +17,7 @@ from scripts.accounts import accounts, next_moves, refusal_watch, refusals, role
 from scripts.lib.conf import UseConfiguredValue
 from scripts.lib import conf
 from scripts.whoami import run_out, usage_store
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "whoami"))
-import quota_alert
+from scripts.whoami import quota_alert
 
 NOW = datetime(2026, 10, 17, tzinfo=timezone.utc)
 

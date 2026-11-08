@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from datetime import datetime, timezone
 import json
 import os
@@ -16,37 +16,21 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal, NotRequired, TypedDict, cast, override
+from typing import Literal, NotRequired, TypedDict, cast, override
 
-if TYPE_CHECKING:
-    from ..lib import process_start as process_identity
-else:
-    from scripts.lib import process_start as process_identity
+from scripts.lib import process_start as process_identity
+from scripts.copies.copies_test_support import copies_environment
 
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lint"))
-if TYPE_CHECKING:
-    from ..lint.memory_test_support import write_config_fixture, config_environment
-else:
-    from memory_test_support import write_config_fixture, config_environment
+from scripts.lint.memory_test_support import write_config_fixture, config_environment
 
-import offload
-import conf
-import mac_test
-import treekey
-from offload_test_commands import COMMAND_STUB, write_shell
-if TYPE_CHECKING:
-    from ..lib import test_hang_guard
-    from ..lib.process_group import send_process_group
-else:
-    from scripts.lib import test_hang_guard
-    from scripts.lib.process_group import send_process_group
-
-if TYPE_CHECKING:
-    from ..production.cli_fixture import invoke_cli
-else:
-    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "production"))
-    from cli_fixture import invoke_cli
+from scripts.mac_test import offload, mac_test
+from scripts.lib import conf
+from scripts.buildlog import treekey
+from scripts.mac_test.offload_test_commands import COMMAND_STUB, write_shell
+from scripts.lib import test_hang_guard
+from scripts.lib.process_group import send_process_group
+from scripts.production.cli_fixture import invoke_cli
 
 SCRIPT = Path(__file__).with_name("offload.py")
 
@@ -93,6 +77,19 @@ class CommandEvent(TypedDict):
     copy_claim: NotRequired[bool]
     what: NotRequired[str]
     claim: NotRequired[RemoteClaimRecord]
+
+
+def mirror_use_payload(case: unittest.TestCase, argv: Sequence[str]) -> list[str]:
+    words = shlex.split(argv[-1])
+    if "mirror-use" not in words:
+        return list(argv)
+    boundary = words.index("--")
+    case.assertEqual(words[boundary + 1:boundary + 3], ["sh", "-c"])
+    case.assertEqual(len(words[boundary + 3:]), 1)
+    case.assertIn("--owner", words[:boundary])
+    case.assertIn("--repository", words[:boundary])
+    case.assertIn("--session", words[:boundary])
+    return [*argv[:-1], words[boundary + 3]]
 
 
 class SelectorEvent(TypedDict):
@@ -296,6 +293,7 @@ class OffloadCommandFixture(unittest.TestCase):
         self.environment = {
             **os.environ,
             **config_environment(self.root),
+            **copies_environment(self.root),
             "HOME": str(self.root / "home"),
             "PATH": f"{self.bin_directory}{os.pathsep}{os.environ['PATH']}",
             "MAC_TEST_STATE_DIR": str(self.state_directory),
@@ -356,7 +354,7 @@ class OffloadCommandFixture(unittest.TestCase):
     ) -> subprocess.CompletedProcess[str]:
         self.result_path.unlink(missing_ok=True)
         arguments = [
-            sys.executable,
+            str(SCRIPT.resolve().parents[1] / "lib/py"),
             str(SCRIPT),
             "run",
             "--repo-root",
@@ -398,8 +396,7 @@ class OffloadCommandFixture(unittest.TestCase):
         program = r'''
 import subprocess
 import sys
-sys.path.insert(0, sys.argv.pop(1))
-import offload
+from scripts.mac_test import offload
 
 clock = [100.0]
 offload.time.monotonic = lambda: clock[0]
@@ -438,7 +435,7 @@ subprocess.run = run
 raise SystemExit(offload.main())
 '''
         return subprocess.run(
-            [sys.executable, "-c", program, str(SCRIPT.parent), "run",
+            [str(SCRIPT.resolve().parents[1] / "lib/py"), "-c", program, "run",
              "--repo-root", str(self.repository), "--package", "hana",
              "--call-id", "call-17", "--result", str(self.result_path), "--"],
             cwd=self.root, env=self.environment, stdout=subprocess.PIPE,
@@ -458,7 +455,7 @@ raise SystemExit(offload.main())
     ) -> subprocess.Popen[str]:
         self.result_path.unlink(missing_ok=True)
         arguments = [
-            sys.executable,
+            str(SCRIPT.resolve().parents[1] / "lib/py"),
             str(script),
             "run",
             "--repo-root",
@@ -499,6 +496,7 @@ raise SystemExit(offload.main())
         _ = shutil.copyfile(SCRIPT, runner)
         _ = shutil.copyfile(SCRIPT.with_name("cargo_manifest.py"), runner_directory / "cargo_manifest.py")
         self.write_executable(runner_directory / "mac_test.py", CLAIM_STUB)
+        (scripts_directory / "lib").symlink_to(SCRIPT.parent.parent / "lib", target_is_directory=True)
         (scripts_directory / "lint").symlink_to(
             SCRIPT.parent.parent / "lint", target_is_directory=True
         )
@@ -510,7 +508,7 @@ raise SystemExit(offload.main())
 
     def state_command(self, *arguments: str) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
-            [sys.executable, str(STATE_SCRIPT), *arguments],
+            [str(SCRIPT.resolve().parents[1] / "lib/py"), str(STATE_SCRIPT), *arguments],
             cwd=self.root,
             env=self.environment,
             capture_output=True,
@@ -526,6 +524,8 @@ raise SystemExit(offload.main())
         events = [cast(CommandEvent, json.loads(line))
                   for line in path.read_text(encoding="utf-8").splitlines()]
         for event in events:
+            if event["command"] == "ssh" and "copies.py mirror-use " in event["args"][-1]:
+                event["args"] = mirror_use_payload(self, event["args"])
             if "claim" in event:
                 event["copy_claim"] = event["claim"].get("copy", False)
                 event["what"] = event["claim"]["what"]

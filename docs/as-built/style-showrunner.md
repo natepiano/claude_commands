@@ -2,7 +2,7 @@
 
 ## What it is
 
-A style production is a standing child production named `<repo>-style`. A repo's main showrunner starts it with `/showrunner:add_style`. It has four family units (`<style slug>-names-unit`, `<style slug>-values-unit`, `<style slug>-types-unit`, `<style slug>-modules-unit`). They sweep the repo against every style rule in `~/rust/nate_style` and the repo's local rule folders. A per-repo sqlite ledger records which (rule, file or crate) cells are covered at the synced branch-point tip. Units apply mechanical fixes. They hold every other change as a finding, and the style showrunner files findings as style decisions. The style showrunner merges unit work into a style merge branch and hands each style-branch tip back to the parent, which merges it into the branch point. The style production replaced the old fix pipeline (`scripts/fix/`, `/fix`, `/style_eval`, `/style_fix_review`, `/style_usage`, `/nightly_weights`), which is deleted. The runtime procedure the style showrunner follows is `docs/style_production.md`. That doc takes precedence over `commands/showrunner/produce.md` for a `**Kind:** style` production.
+A style production is a standing child production named `<repo>-style`. A repo's main showrunner starts it with `/showrunner:add_style`. It has four family units (`<style showrunner name>-names`, `<style showrunner name>-values`, `<style showrunner name>-types`, `<style showrunner name>-modules`). They sweep the repo against every style rule in `~/rust/nate_style` and the repo's local rule folders. A per-repo sqlite ledger records which (rule, file or crate) cells are covered at the synced branch-point tip. Units apply mechanical fixes. They hold every other change as a finding, and the style showrunner files findings as style decisions. The style showrunner merges unit work into a style merge branch and hands each style-branch tip back to the parent, which merges it into the branch point. The style production replaced the old fix pipeline (`scripts/fix/`, `/fix`, `/style_eval`, `/style_fix_review`, `/style_usage`, `/nightly_weights`), which is deleted. The runtime procedure the style showrunner follows is `docs/style_production.md`. That doc takes precedence over `commands/showrunner/produce.md` for a `**Kind:** style` production.
 
 ## How it works
 
@@ -25,7 +25,7 @@ A style production is a standing child production named `<repo>-style`. A repo's
 | `scripts/style/bulk_rename.py` | Bulk binding renames for one proposal ticket (`--ticket T --repo R`): rust-analyzer rename over LSP, the binding proof per file, verify per crate (split per file on failure), refusals released to ordinary tickets (`Ledger.bulk_release`, `bulk_refusals` table, migration 24), a 60-finding stratified review sample; commits nothing |
 | `scripts/style/declarations.py` | Rust item reading for the declaration step |
 | `scripts/style/unit_plans.py` | Standing unit plans: `delegation_context`, pilot scope (`PilotScope`, `parse_pilot_scope`, `crate_in_scope`), `family_plan_texts`, `family_pilot_scopes`; read by refill and filing |
-| `scripts/style/unit_files.py` | Live-unit file lookup (`unit_worktrees`, `unit_file_holders`, `changed_files`, `file_text`); breaks the `style_plan`/`style_proposals` import cycle |
+| `scripts/style/unit_files.py` | Live file lookup (`unit_worktrees`, `unit_file_holders`, `changed_files`, `file_text`); breaks the `style_plan`/`style_proposals` import cycle |
 | `scripts/style/coverage_report.py` | The style report CLI |
 | `scripts/style/order_waste.py` | Read-only measure of wasted work by rule pair (`--ledger <sqlite> --repo <git repo> [--json]`): stale findings and reworked hunks, each pair against `rule_order_analysis.md`'s order (`ANALYSIS_LAYERS`, `ANALYSIS_EDGES`); see **Fix sequencing** in `docs/style_production.md` |
 | `scripts/style/fake_fmt.py` | The fake cargo and rustfmt that every test reaching the gate puts first on PATH |
@@ -36,7 +36,7 @@ A style production is a standing child production named `<repo>-style`. A repo's
 | `scripts/production/proposals_table.py`, `footer_counts.py` | Proposal states and the footer count |
 | `scripts/production/dailies_input.py`, `dailies_render.py` | The style line in the parent's dailies |
 | `scripts/production/production_lifecycle.py` | Wrap detaches style children |
-| `commands/unit/direct.md` `<StandingPlanRefill>`, `commands/unit/checkpoint.md` | Unit director side of refill and checkpoint |
+| `docs/direct/standing_plan_refill.md` `<StandingPlanRefill>`, `commands/unit/checkpoint.md` | Unit director side of refill and checkpoint |
 | `commands/showrunner/add_style.md`, `style_report.md`, `proposal.md` | Showrunner commands |
 | `docs/style_production.md` | Runtime procedure (Tiers, Families, Ticket queue, Ledger, Sync, Merging back, Yielding, Big changes, Lifetime, Report) |
 
@@ -55,7 +55,7 @@ Import direction: `declarations → approved_renames → style_footprint`. `styl
 - `Rule.reach: RepoReach | MemberReach(member, crate_dir)`. A `docs/<member>/style` rule reaches the workspace member whose directory name or package name is `<member>`, else `RuleValidationError`.
 - `workspace_members(manifests) -> tuple[WorkspaceMember(directory, package_name), ...]`, deepest first: explicit members plus in-tree path dependencies, recursively, minus `exclude`. The loader and the ledger share it.
 - `rules.py list [--repo] [--json]` prints `rule_id` first and shows unclassified rules. Exit 2 on a validation error. `STYLE_HISTORY_NATE_STYLE_DIR` points the loader at another rule folder.
-- `approval: always` loads as `Rule.approval = AlwaysApproved(family)`; absent is `UserApproves()`. Any other value raises `approval must be always`, and a rule with no family raises `approval always requires a family`. `DecisionWriter.rule_approval` gives a new decision with no inherited approval the approval fields (`unit` and `plan` from the live family row of the standing production's Units table, `family_units`; `showrunner` and `approved_in` the style slug; `approved_by: rule <rule id>`), passed to `create` as initial fields, so it starts `stage: active` and never reads `AwaitingApproval`. At each `file`, `approve_by_rule` gives every open `UnansweredDecision` whose rule id (any blob) is always approved the same fields through `proposal_issue.approve`, the function the approve verb uses. A decision key holds one rule, so no decision mixes an always approved rule with another.
+- `approval: always` loads as `Rule.approval = AlwaysApproved(family)`; absent is `UserApproves()`. Any other value raises `approval must be always`, and a rule with no family raises `approval always requires a family`. `DecisionWriter.rule_approval` gives a new decision with no inherited approval the approval fields (`unit` and `plan` from the live family row of the standing production's Units table, `family_units`; `showrunner` and `approved_in` the style showrunner name; `approved_by: rule <rule id>`), passed to `create` as initial fields, so it starts `stage: active` and never reads `AwaitingApproval`. At each `file`, `approve_by_rule` gives every open `UnansweredDecision` whose rule id (any blob) is always approved the same fields through `proposal_issue.approve`, the function the approve verb uses. A decision key holds one rule, so no decision mixes an always approved rule with another.
 - `style_rules.parse_frontmatter` returns `tier`, `family`, `input_scope`, `mechanism`, `mode`, `approval` as one-element lists, quotes stripped. `read_pre_filter` reads only an unindented top-level `pre_filter:`.
 
 ### Coverage ledger
@@ -169,15 +169,16 @@ Verdicts: `clean | fixed | exception | held | waived | removed`. A `removed` row
 
 ### Bootstrap: `add_style.py` and the production format
 
-- `add_style.py --production <parent doc> --model <m> --effort <e> [--pilot <unit>[=<crate>,...]]... [--check]`, run by the repo's main showrunner (`commands/showrunner/add_style.md`).
-- `_request` derives everything from the parent doc: main checkout through `--git-common-dir` on `**Repository:**`; slug `<repo>-style`; branch point = parent merge branch; style merge branch `style/<branch point with / as ->`; checkout `<repo parent>/<repo>-style`; doc `docs/<repo>-style-production.md`. A missing `**Proposals:**` refuses.
-- `standing_style_production(repo_dir) -> StandingStyleProduction | NoStyleProduction` (frozen; `checkout`, `doc`, `slug`, `branch_point`) is the one shared lookup. `style_plan.style_document`, `style_sync.notify` and `add_style` use it. A new caller that resolves from a repo folder must use it.
-- **Existing production** = doc present and slug in `showrunners.timer_slugs()`. `_attach` detaches from any old parent, attaches under the caller, rewrites `**Parent production:**` and `**Proposals:**`, then runs `style_sync.py resume`. A doc on another branch point raises `StyleBranchPointTaken` (exit 2) with no write. A doc with no timer is an interrupted bootstrap and reruns the create path, which also rewrites the two fields.
+- `add_style.py --production <showrunner name> --model <m> --effort <e> [--pilot <unit>[=<crate>,...]]... [--check]`, run by the repo's main showrunner (`commands/showrunner/add_style.md`).
+- `_request` derives everything from the parent doc: main checkout through `--git-common-dir` on `**Repository:**`; showrunner name `<repo>-style`; branch point = parent merge branch; style merge branch `style/<branch point with / as ->`; checkout `<repo parent>/<repo>-style`; doc `docs/<repo>-style-production.md`. A missing `**Proposals:**` refuses.
+- `standing_style_production(repo_dir) -> StandingStyleProduction | NoStyleProduction` (frozen; `checkout`, `doc`, `name`, `branch_point`) is the one shared lookup. `style_plan.style_document`, `style_sync.notify` and `add_style` use it. A new caller that resolves from a repo folder must use it.
+- **Existing production** = doc present and staff name in `showrunners.timer_names()`. `_attach` detaches from any old parent, attaches under the caller, rewrites `**Parent production:**` and `**Proposals:**`, then runs `style_sync.py resume`. A doc on another branch point raises `StyleBranchPointTaken` (exit 2) with no write. A doc with no timer is an interrupted bootstrap and reruns the create path, which also rewrites the two fields.
 - Production docs and standing plans use `atomic_file.write_text_atomic` for each whole-file write. A stopped first write leaves no partial file that bootstrap could mistake for a completed file.
-- **Create path** (each step idempotent): branch from the branch-point tip and worktree; production doc with Units table `Unit | Plan | Worktree | Branch | Port | Owns` (Unit `<slug>-<family>-unit`, Worktree `<repo parent>/<slug>-<family>`, Branch `<slug>-<family>`, Port `—`, Owns `none — takes what the board leaves free`); four standing plans `docs/style-production/units/<slug>-<family>-unit.md` with a `**Family:**` snapshot of rule ids and tiers and an empty `## Phases`; `.git/info/exclude` entries for `/docs/style-production/`, the doc and the log; `set_tip(<stored synced tip, else the style branch commit>, style_branch)`; then `add_showrunner.py`. Launcher exit 1 or 3 prints `_open_session_guidance` and returns that code. A live herdr session named `<slug>` with no timer is refused before any write.
-- `--pilot` (create path only; else exit 2 `--pilot applies only while creating <slug>`) lists only the named units in the Units table; all four plans are still written. `=<crates>` writes `- **Pilot scope:** <packages>` into that unit's showrunner-copy plan. `--pilot` accepts a family, an old `<family>-unit` id or a full `<slug>-<family>-unit` id. `--check` prints seven steps with full ids and acts on nothing.
+- **Create path:** Each step is idempotent. The command creates the branch and worktree from the branch-point tip. It writes a production document without a Units table. It writes four plans at `docs/style-production/units/<showrunner name>-<family>-unit.md`. Each plan records rule ids and tiers in `**Family:**` and has an empty `## Phases`. The command excludes `/docs/style-production/`, the document, and the log through `.git/info/exclude`. It calls `set_tip` with the stored synced tip, or the style branch commit. It then runs `add_showrunner.py`. Launcher exit 1 or 3 prints `_open_session_guidance` and returns that code. A live herdr session with the showrunner name and no timer prevents writes.
+- **Pilot:** `--pilot` applies only during creation. Otherwise, the command exits 2 with `--pilot applies only while creating <showrunner name>`. It records selected and already launched units in `**Pilot units:**`. All four plans remain. `=<crates>` writes `- **Pilot scope:** <packages>` into the selected unit's showrunner-copy plan. `--pilot` accepts a family or a full `<showrunner name>-<family>` staff name. `--check` prints seven steps with full ids and changes nothing.
+
 - Format fields (`docs/production_format.md`): `**Kind:** style` (absent = product production), `**Branch point:**`, `**Parent production:**`; `**Proposals:**` required for style. Plan header (`docs/direct_plan_format.md`): `> **Standing:** style_plan.py`. A standing plan never closes and is git-excluded.
-- `add_unit._is_excluded_standing_plan` accepts a plan absent on the merge branch when the showrunner copy is git-ignored and carries `> **Production:` and `> **Standing:**`. `ensure_worktree` copies it into the unit worktree only when the unit copy is missing. After first launch, the unit copy is the only one that counts.
+- `add_unit._is_excluded_standing_plan` accepts a plan absent on the merge branch when the showrunner copy is git-ignored and carries `> **Standing:**`. `ensure_worktree` copies it into the unit worktree only when the unit copy is missing. After first launch, the unit copy is the only one that counts.
 
 ### Ticket selection, busy files and the berth board
 
@@ -270,38 +271,124 @@ Findings left counts filed findings whose decision is approved. When all filed f
 
 Schema 25 also adds `held_findings.built_at`. For old built findings it uses the merged build ticket's `updated_at`, or the finding's `updated_at` when there is no merged build ticket. `style_ledger.legacy_built_at_sql(finding)` returns this rule as SQL, for migration 25 and for the Units report on a ledger before schema 25. The report opens the ledger read-only and does not migrate it. It reads `built_at` when the column exists, also when later writes changed `updated_at`. Without the column it uses `legacy_built_at_sql("h")`, but a ledger without the `tickets` table or the `build_ticket` column uses the finding's `updated_at`, because that SQL fails there. Its last-24-hours count also supplies the totals line's ETA. Each build transition sets an empty `built_at` once: proposal ticket merge, declaration follow, `held built` and `mark_built_at_merge`. Later writes keep that time. Returning a built finding to filed, waiving it or withdrawing it as a duplicate clears the time.
 
-**Unit side** (`commands/unit/direct.md` `<StandingPlanRefill>`, `commands/unit/checkpoint.md`): refill runs `style_plan.py next-phase --unit <unit> --plan <unit worktree>/<Plan cell> --repo <unit worktree>` at startup, after compaction or restart, and at each `<NextPhase/>`. It first resumes checkpoint step 7 for any reservation record in `checkpoint_committed_awaiting_release_confirmation`. Exit 3, 4, 5 report once and end the turn blocked (`waiting on the showrunner: sync | board | ticket <id> merge`). A sync message, any showrunner message (board), or `ticket <id> merged; refill.` wakes it. Exit 6: `git fetch origin <style branch> && git merge --ff-only origin/<style branch>`, then refill; a refused or empty fast-forward goes to the showrunner. A standing plan never runs FinalGate, RunAsBuilt, final PeriodicCI, CICleanup, RunSummary or shrink.
+**Unit side** (`docs/direct/standing_plan_refill.md` `<StandingPlanRefill>`, `commands/unit/checkpoint.md`): refill uses this command:
+
+`style_plan.py next-phase --unit <unit> --plan <unit worktree>/<Plan cell> --repo <unit worktree>`
+
+It runs at startup, after compaction or restart, and at each `<NextPhase/>`.
+It first resumes checkpoint step 7 for any reservation record in `checkpoint_committed_awaiting_release_confirmation`.
+Exits 3, 4 and 5 report once and end the turn blocked.
+The message is `waiting on the showrunner: sync | board | ticket <id> merge`.
+A sync message or `ticket <id> merged; refill.` resumes a sync wait.
+A sync message or any showrunner message resumes a board wait.
+The message `ticket <id> merged; refill.` resumes a ticket wait.
+Exit 6 runs `git fetch origin <style branch> && git merge --ff-only origin/<style branch>`, then runs refill.
+A refused or empty fast-forward goes to the showrunner.
+A standing plan never runs FinalGate, RunAsBuilt, final PeriodicCI, CICleanup, RunSummary or shrink.
+
 - Units sync at phase start with that `--ff-only` merge (the `docs/production_format.md` item 5 exception).
 - Checkpoint: gate exit 0 stages only code paths from `git status --porcelain` (rename pairs together), commits once, records `phase_reservation.py committed --ticket <id>` (the pending record names the ticket and the worktree, and step 7 releases nothing), then `ticket checkpoint --session-dir <run> --phase <id>`, which stores the run folder and phase on the ticket in the same write as its state (migration 22: `reservation_session_dir`, `reservation_phase`); a repeat at the same commit stores them when the first checkpoint named none, and refuses a different pair. `ticket merge`, and every `reconcile` for each merged ticket that still names a record, then run `Ledger.release_held_reservation`, which calls `phase_reservation.py release-held --merged <style branch tip>`: it releases an `active` reservation from the recorded worktree when its HEAD is the checkpoint, confirms `outstanding` or `released_after_checkpoint` on the board when its `protected_tip` is the checkpoint, or descends from it and is in the style branch tip (a unit that merged style/main after its checkpoint releases at that merge), and clears the record. Exit 0 also clears the ticket's two columns, so a later merge or reconcile makes no berth call. An earlier confirmed release is not made again, a record not held for the ticket prints `no reservation held`, and a moved worktree or an unconfirmed release keeps it held and keeps the columns (`ticket merge` exits 2 with `rerun ticket merge`; `reconcile` prints the line and retries on its next run). A ticket checkpoint without the two flags merges as before. The plan, `docs/style-production/` and pinned rules never appear in `git add`. Exit 1 keeps the reservation and returns to repair; exit 2 keeps the reservation and reruns the gate, and stops when the same error comes back.
 - No-change ticket (no tracked diff): no commit; `git merge-base --is-ancestor HEAD refs/heads/<style branch>` (else report, ticket stays assigned); the committed-awaiting-release record with that `HEAD` and `--ticket <id>`; `ticket checkpoint --commit HEAD --session-dir <run> --phase <id>`; `ticket merge`, which releases the reservation and clears the record; report `From <unit>: ticket <id> closed with no code change; <n> held.`; refill at once.
-- Sync waits: refill writes a `sync_waits` row before its last check; `ticket merge` runs `style_sync.py wake-waiters`, which sends `From the showrunner of <slug>: ticket <id> merged; refill.` to each waiting unit director found through `message/roster.py --json` and clears only a delivered wait (`acknowledge_sync_wait` keys on the wait token). A queued wake keeps its wait: the next merge wakes the director at its current roster address.
+- Sync waits: refill writes a `sync_waits` row before its last check; `ticket merge` runs `style_sync.py wake-waiters`, which sends `From the showrunner of <showrunner name>: ticket <id> merged; refill.` to each waiting unit director found through `message/roster.py --json` and clears only a delivered wait (`acknowledge_sync_wait` keys on the wait token). A queued wake keeps its wait: the next merge wakes the director at its current roster address.
 
-**Sync trigger.** `merge_checkpoint.notify_style` and `merge_gate.notify_style` (two copies; 30 s subprocess timeout; one-line failure) call `style_sync.py notify --repo-dir <checkout> --branch <b> --tip <sha>` after each successful push, including hand-off merges. It is silent with no style production on `b`; else `send.py --timeout 10` of `From <caller>: branch point <b> moved to <sha7>; sync.` keyed `style-sync:<slug>`, bounded at 35 s. A failure prints one line and exits 0.
+**Sync trigger.** `merge_checkpoint.notify_style` and `merge_gate.notify_style` (two copies; 30 s subprocess timeout; one-line failure) call `style_sync.py notify --repo-dir <checkout> --branch <b> --tip <sha>` after each successful push, including hand-off merges. It is silent with no style production on `b`; else `send.py --timeout 10` of `From <caller>: branch point <b> moved to <sha7>; sync.` keyed `style-sync:<showrunner name>`, bounded at 35 s. A failure prints one line and exits 0.
 
-**Sync steps** (style showrunner; skipped when `tip seen` prints `seen`; `style_sync.py own-handoff --repo R --tip T --style-branch B` exits 0 when T's tree is B's tree, after `set-tip` and `tip done` with reason `own hand-off`, so only the tree-neutral merge and the wake remain, and exits 1 otherwise): merge the tip into the style branch and gate; `style_sync.py lint --repo R --checkout C --tip T` (`verify.sh lint --workspace --no-cache --check` in a standing checkout; one `lint-record` per tool; exit 0 clean, 1 diagnostics or a failed tool (continue), 2 error (stop), 128 + signal for SIGTERM or SIGHUP (stop); every exit it can catch stops verify.sh's process group, releases the standing checkout and deletes its temporary supervision metadata; each `style-sync-lint-*` dir holds `owner.json` (owner pid and the repo's git dir) and `verifier.pgid`, which verify.sh's own process writes before it starts verify.sh, and only while the owner runs; the sweep never follows a link; the owner record is deleted last and kept when metadata cleanup fails, and each run first removes stale metadata (and any legacy registration) whose owner and verify.sh group are both gone, so the dir stays while a killed run's verify.sh still runs); `set-tip --style-branch`, then `status` (report a nonzero unclassified count to the parent with "pull nate_style"); tell unit directors to merge at their next pause and wake sync waiters; `tip done`. The listed-site refresh runs on every read regardless.
+**Sync steps.** Skip these steps when `tip seen` prints `seen`.
+`style_sync.py own-handoff --repo R --tip T --style-branch B` checks whether T and B have the same tree.
+When they match, it runs `set-tip` and `tip done` with reason `own hand-off`, then exits 0.
+Only the merge with an unchanged tree and the wake remain.
+Otherwise it exits 1, and the style showrunner uses this sequence:
+
+1. Merge the tip into the style branch and run its gate.
+2. Run `style_sync.py lint --repo R --checkout C --tip T`.
+3. Run `set-tip --style-branch`.
+4. Run `status`.
+5. Report a nonzero unclassified count to the parent with `pull nate_style`.
+6. Tell unit directors to merge at their next pause.
+7. Wake sync waiters.
+8. Run `tip done`.
+
+The lint command runs `verify.sh lint --no-cache --check` in a standing checkout.
+It writes one `lint-record` per tool.
+Its status controls the sequence:
+
+- Exit 0 means clean.
+- Exit 1 means diagnostics or a failed tool; continue.
+- Exit 2 means an error; stop.
+- Exit 128 plus the signal means SIGTERM or SIGHUP; stop.
+
+Every exit it can catch stops the `verify.sh` process group and releases the standing checkout.
+It also deletes temporary supervision metadata.
+Each `style-sync-lint-*` folder holds `owner.json` with the owner PID and the repository's Git directory.
+It also holds `verifier.pgid`, written before `verify.sh` starts, and only while the owner runs.
+The sweep never follows a link.
+It deletes the owner record last and keeps it if metadata cleanup fails.
+Each run first removes stale metadata and legacy registration only when the owner and verifier group are both gone.
+Thus the folder stays while a killed run's `verify.sh` still runs.
+The refresh of listed sites runs on every read.
 
 **Warm sync target.** Lint uses `copies.standing` at the requested commit and
 holds the checkout's `.claude-busy` lock through verification and cleanup. Each
 checkout owns a real `target/`; the configured second checkout owns a separate
 cache. Supervision metadata is removed after lint; the checkout and target stay.
 The floor sweep may reclaim idle marked targets, so a later run can build cold.
-No `CARGO_TARGET_DIR` is set. A wrap leaves the standing checkouts in place;
-`copies.py remove --owner <style-production> --repo <repo>` removes idle ones.
-See `gate-checkouts.md` for configured paths, pool limits and lock rules.
+No `CARGO_TARGET_DIR` is set. A wrap leaves the standing checkouts in place.
+See `gate-checkouts.md` for removal, configured paths, pool limits and lock rules.
 
 ### Child hand-off merge
 
-- Style showrunner, after each unit checkpoint merge: `merge_checkpoint.py --production <style doc> <unit> <phase> <hash> --started …` with one `--also <path>` per entry of the ticket's `files` (Owns parses as `('none',)`); `ticket merge`; then `style_sync.py send-handoff --repo R --slug S --checkpoint <style branch tip>` (`handoff add`, notice `From the showrunner of <slug>: hand-off <hash>` to `showrunners.py parent S`, `handoff send`). `handoff_notice` returns `HandoffDelivery` (`sent` | `queued`): send.py exit 1 with stdout `QUEUED:` is queued, because send.py delivers it later. Both outcomes record `handoff send` (resume reroutes a row sent elsewhere), and a queued one prints `hand-off <c7>: queued for <parent>`. Every other non-zero exit, a refusal or a timeout keeps the row and exits 1. A root prints `root: merge <c7> with --root-self`.
-- `style_sync.py resume --repo --slug --branch-point --style-branch` runs first at startup and on reattach: `reconcile` lines, then oldest first: `pending` → notice and `send`; `sent` to the current parent → notice again; `sent` elsewhere → notice and `reroute`. A failed send prints one line and leaves the row (exit 1).
-- Parent: correctness-review the diff against the branch point, then `merge_checkpoint.py --from-child <child> --checkpoint <hash> --production <parent doc> --started <time> [--root-self]`. It reads no Units table. Refusals: child not attached (`parent_of(child) == parent`; `--root-self` needs no parent), hash not on the child's merge branch, not descended from the last merged hand-off, staged changes in the parent tree, or a unit-only flag (`--regime` other than after, `--holds`, `--merge-defects`, `--excluded`, `--scratch`). Fixed metadata: phase `style hand-off`, no review trial.
-- Run: `checkpoint_tests` (`merge_<c7>_test.log`), merge `Merge <child> hand-off (<hash7>) into <branch point>`, push, `notify_style`, promote (label `<child> style hand-off`). Then `record_handoff_merge` runs `style_ledger.py handoff merged --repo <child checkout> --checkpoint <hash> --merge-commit <merge>` (30 s timeout; a failure prints `hand-off ledger: <detail>`, and the style showrunner then runs `handoff merged` by hand), and `acknowledge_handoff` sends `From the showrunner of <parent slug>: hand-off <hash7> merged as <merge7>.` (a failure prints `hand-off acknowledgment: <error>`). A root prints `root: run style_ledger.py reconcile to mark <h7> merged` and does neither.
+1. Merge each unit checkpoint with `merge_checkpoint.py --production <style showrunner name> <unit> <phase> <hash> --started …`.
+2. Run `ticket merge`.
+3. Run `style_sync.py send-handoff --repo R --production <style showrunner name> --checkpoint <style branch tip>`.
+
+`send-handoff` records `handoff add` and sends `From the showrunner of <showrunner name>: hand-off <hash>` to the parent.
+It then records `handoff send`.
+`handoff_notice` returns `HandoffDelivery` with `sent` or `queued`.
+A send.py exit 1 with stdout `QUEUED:` means queued delivery.
+Both outcomes record the send.
+Resume reroutes a row sent to another parent.
+A queued notice prints `hand-off <c7>: queued for <parent>`.
+Other failures preserve the row and exit 1.
+A root prints `root: merge <c7> with --root-self`.
+
+`style_sync.py resume --repo --production <style showrunner name> --branch-point --style-branch` runs at startup and after reattachment.
+It reconciles rows, then processes the oldest row first.
+A pending row receives a notice and a send record.
+A row sent to the current parent receives another notice.
+A row sent elsewhere receives a notice and a reroute record.
+A failed send prints one line, preserves the row, and exits 1.
+
+The parent reviews correctness against the branch point.
+It runs `merge_checkpoint.py --from-child <child> --checkpoint <hash> --production <showrunner name> --started <time> [--root-self]`.
+The command reads no Units table.
+The child must report to the parent, except with `--root-self`.
+The hash must occur on the child's merge branch. Git ancestry identifies a hand-off that already merged.
+Staged parent changes prevent the merge.
+Unit-only flags also prevent the merge: non-default `--regime`, `--holds`, `--merge-defects`, `--excluded`, and `--scratch`.
+The phase is `style hand-off`, without a review trial.
+
+1. Run `checkpoint_tests` with log `merge_<c7>_test.log`.
+2. Merge with subject `Merge <child> hand-off (<hash7>) into <branch point>`.
+3. Push the merge.
+4. Run `notify_style`.
+5. Promote with label `<child> style hand-off`.
+6. Record `style_ledger.py handoff merged --repo <child checkout> --checkpoint <hash> --merge-commit <merge>`.
+7. Send `From the showrunner of <parent showrunner name>: hand-off <hash7> merged as <merge7>.`.
+
+The ledger command has a 30-second timeout.
+A ledger failure prints `hand-off ledger: <detail>`.
+The style showrunner then runs `handoff merged` manually.
+An acknowledgment failure prints `hand-off acknowledgment: <error>`.
+A root prints `root: run style_ledger.py reconcile to mark <h7> merged`.
+It skips both the ledger command and the acknowledgment.
+
 - Delivery state is computed from git each run, never stored: `NotMerged | MergedNotPushed(merge_head) | MergedAndPushed(merge_head)`. A marker in Git’s `checkpoint-tests-pending/<checkpoint>` is written before merging and removed only after tests pass, so an interrupted merge reruns its tests before pushing. A pushed hand-off retries configured promotion until `checkpoint-completed/<merge>/handoff-promotion` records success; this receipt is written only after all promotion destinations finish. The completion log is restored without duplicating its entry. A retry pushes an unpushed merge before any acknowledgment; an already merged hand-off prints `hand-off <hash7> already merged as <merge7>` and acknowledges again (exit 0). `undo_failed_push` aborts a half merge and resets only when origin is unchanged.
-- History: `merge_branch_history` also matches `^Merge (.+?) hand-off \(([0-9a-f]+)\)` into `ChildHandoffEntry(child, short, merge_branch, merge_hash)`. `entries: tuple[MergeEntry | ChildHandoffEntry, ...]`. Unit readers (`last_for_unit`, `code_merge_count`, CI points, lifecycle, dailies) guard with `isinstance(entry, MergeEntry)`; `last_handoff_for_child` and `last_merge()` read hand-offs.
+- Git ancestry identifies a merged hand-off. The receipt stores its merge commit. Unit checkpoint records supply CI counts.
 - Wrap: `production_lifecycle.wrap` detaches running style children (`refuse_running_children -> RunningStyleChildren`, `detach_style_children`) only after promotion, unit retirement and notifier removal, and tells each `<parent> wrapped, so you are a root now: run style_sync.py resume and merge your own hand-offs (docs/style_production.md, Merging back).` Any other running child holds the wrap. `retire_reservations` reads `read_board`, prints `retire skipped: board unavailable (<reason>)` on `BoardUnavailable`, and releases nothing for an unconfigured repo.
 
 ### Style report and dailies line
 
-- `coverage_report.py --repo R [--rule <id or unique stem> | --crate <dir or package>]` (`/showrunner:style_report [rule|crate]` runs it for each style production at or below the caller). Header from `summary_of(repo rows)`: `<slug> — synced <branch point> <tip> at HH:MM <zone>, <n> files (+<d> since yesterday)`; `Rules done: <d> of <t> (<n> by lint) · cells current <p>% · open · stale · awaiting merge · held`; the unclassified line; `Waiting to merge back: ...`; table `| Rule | Tier | Current | Stale | Open | Awaiting merge | Held | Done |` (classified tier A-D only; `#uncovered` folded in; stem, or full id when two rules share a stem); `Since last report: ...`. `rule_counts(WholeRepository())` runs once, plus `rule_counts(CrateCoverage(crate))` under `--crate`. `--rule` adds open tickets; `--crate` adds the oldest open ticket.
+- `coverage_report.py --repo R [--rule <id or unique stem> | --crate <dir or package>]` (`/showrunner:style_report [rule|crate]` runs it for each style production at or below the caller). Header from `summary_of(repo rows)`: `<showrunner name> — synced <branch point> <tip> at HH:MM <zone>, <n> files (+<d> since yesterday)`; `Rules done: <d> of <t> (<n> by lint) · cells current <p>% · open · stale · awaiting merge · held`; the unclassified line; `Waiting to merge back: ...`; table `| Rule | Tier | Current | Stale | Open | Awaiting merge | Held | Done |` (classified tier A-D only; `#uncovered` folded in; stem, or full id when two rules share a stem); `Since last report: ...`. `rule_counts(WholeRepository())` runs once, plus `rule_counts(CrateCoverage(crate))` under `--crate`. `--rule` adds open tickets; `--crate` adds the oldest open ticket.
 - Snapshot `ReportSnapshot(rules, proposals, files_by_day)` is written atomically to `ledger.database.parent / "last_report.json"`; `previous_report -> FirstReport | PreviousReport`.
 - Dailies: `dailies_input` saves a `style` key only for a `**Kind:** style` doc (raw `summary --json`, or `{"unavailable": "<reason>"}`). `ChildReport.style: StyleSummary | NoStyleSummary | StyleSummaryUnavailable`; unknown keys are refused. `child_row` puts `<child>  rules done 21/51 · cells 62% · stale 1,402 · proposals 3 · synced 14:05` in `Row.lines_below`, plus ` · unclassified <n> — pull nate_style` and ` · hand-off waiting <h>h` when the oldest pending hand-off is more than 4 h old. `cells` is `math.floor(pct)`. `ChildReport.cadence: ReportsEvery(minutes) | ReportsOnDemand`.
 
@@ -316,13 +403,13 @@ See `gate-checkouts.md` for configured paths, pool limits and lock rules.
 - `DeclineActor = WaiveByPerson | WaiveByLedger`. `decline_findings(finding_ids, words, actor)` refuses any other actor with `decline requires a person or the ledger` before any write. A decline over a unit's waive replaces that actor with the decline actor. `decline` and `apply_answer` in `style_proposals.py` pass `WaiveByPerson("user")`; the refill waive in `style_plan.py` for a gone file or a moved site passes `WaiveByLedger()`.
 - `held replace --id F --after TEXT [--person NAME]` (`Ledger.replace_held`) corrects a waived finding. It sets the new after text and keeps the id and judging ticket, sets the finding to unfiled, clears its proposal, build ticket and person reading, and sets a newest `waived` cell judgment back to `held` (`_restore_held_findings`, which `unwaive_held` also uses). It prints the id. It replaces only a unit's waive: it refuses a finding that is not waived, a ledger waive (`cannot replace a ledger waive`) and a person's waive. An unrecorded waive needs `--person`, and the ledger records that name in `unwaived_by`, as unwaive does. Plain `held add` keeps an existing waive, because it returns the existing row of the same change unchanged.
 
-**Approval and progress** (`proposal_issue.py`): `proposal_progress(issue) -> AwaitingApproval | InProgress`. Approved, or unanswered at `stage: active`, is `InProgress`; all else (open declined included) is `AwaitingApproval`. `approve`, `create` with inherited approval, and `reopen` of an approved decision write `stage: active` (`IN_PROGRESS_STAGE`). The footer counts `AwaitingApproval` only; `proposals_table` shows `waiting for your review` rows first, then `in progress by <unit>`. `move-approved <folder> [--dry-run]` moves approved `backlog` proposals to `active` by hand (exit 2 on a refused file). `approve --by user|showrunner` writes `approved_by` and `approved_in`, the production slug of the calling showrunner (`calling_showrunner`: `showrunners.production_of` on `CLAUDE_CODE_SESSION_ID`; exit 2 outside a showrunner). `approver(issue)` is `showrunner` only when `approved_by` says so, so an approval from before the field is the user's. Under the lock, `--by showrunner` over an approved issue whose approver is the user leaves `approved_by` and `approved_in` as they are; `--by user` over a showrunner approval sets them, so it prints `set approved_by`, not `unchanged`. `create` inherits both fields (`INHERITED_FIELDS`). `unapprove <issue> [--dry-run]` undoes a showrunner approval: under the lock it refuses (exit 2) an issue that is not open, has no `proposal` tag, is not `ApprovedDecision` (declined included), whose approver is the user, or whose `approved_in` is not the calling showrunner; else it sets `APPROVAL_FIELDS` (`showrunner`, `unit`, `plan`, `approved_by`, `approved_in`) to `""` and `stage: backlog`, so it reads `AwaitingApproval`. A dry run makes the same checks and writes nothing. Every write holds `_issue_lock`, rereads under it and writes only on a byte change. `_issue_lock` takes its lock file from the fixed folder `~/.local/state/proposal-issue/locks` (from `Path.home()`) and creates the folder on use. It reads no environment variable (`XDG_RUNTIME_DIR`, `TMPDIR`), so every run on the machine shares one lock per issue.
+**Approval and progress** (`proposal_issue.py`): `proposal_progress(issue) -> AwaitingApproval | InProgress`. Approved, or unanswered at `stage: active`, is `InProgress`; all else (open declined included) is `AwaitingApproval`. `approve`, `create` with inherited approval, and `reopen` of an approved decision write `stage: active` (`IN_PROGRESS_STAGE`). The footer counts `AwaitingApproval` only; `proposals_table` shows `waiting for your review` rows first, then `in progress by <unit>`. `move-approved <folder> [--dry-run]` moves approved `backlog` proposals to `active` by hand (exit 2 on a refused file). `approve --by user|showrunner` writes `approved_by` and `approved_in`, the showrunner staff name of the calling showrunner (`calling_showrunner`: `showrunners.production_of` on `CLAUDE_CODE_SESSION_ID`; exit 2 outside a showrunner). `approver(issue)` is `showrunner` only when `approved_by` says so, so an approval from before the field is the user's. Under the lock, `--by showrunner` over an approved issue whose approver is the user leaves `approved_by` and `approved_in` as they are; `--by user` over a showrunner approval sets them, so it prints `set approved_by`, not `unchanged`. `create` inherits both fields (`INHERITED_FIELDS`). `unapprove <issue> [--dry-run]` undoes a showrunner approval: under the lock it refuses (exit 2) an issue that is not open, has no `proposal` tag, is not `ApprovedDecision` (declined included), whose approver is the user, or whose `approved_in` is not the calling showrunner; else it sets `APPROVAL_FIELDS` (`showrunner`, `unit`, `plan`, `approved_by`, `approved_in`) to `""` and `stage: backlog`, so it reads `AwaitingApproval`. A dry run makes the same checks and writes nothing. Every write holds `_issue_lock`, rereads under it and writes only on a byte change. `_issue_lock` takes its lock file from the fixed folder `~/.local/state/proposal-issue/locks` (from `Path.home()`) and creates the folder on use. It reads no environment variable (`XDG_RUNTIME_DIR`, `TMPDIR`), so every run on the machine shares one lock per issue.
 
 **`style_proposals.py` verbs** (most take `--repo <style checkout>`; dry runs print the same lines and write nothing):
 
 | Verb | Does |
 | --- | --- |
-| `file --proposals <dir> --parent <slug>` | runs the declaration step, then withdrawal, then batches unfiled findings into decisions; crash recovery marks findings an existing decision lists; exit 1 on a skipped decision |
+| `file --proposals <dir> --parent <showrunner name>` | runs the declaration step, then withdrawal, then batches unfiled findings into decisions; crash recovery marks findings an existing decision lists; exit 1 on a skipped decision |
 | `follow --proposals [--dry-run]` | the declaration step alone; exit 1 on a left finding or skipped decision |
 | `withdraw --proposals [--dry-run]` | the withdrawal step alone |
 | `complete` | closes approved decisions whose findings are all built or waived (also with no merged ticket); renumbers |
@@ -385,7 +472,7 @@ All follow writes run in one `BEGIN IMMEDIATE` transaction. The write refuses wh
 
 - basedpyright reports 0 errors and 0 warnings on every touched script folder; no file-level ignores; no `Any`. Every module has `from __future__ import annotations`; discarded results are `_ = …`; tests use `@final`/`@override`; sum types are small frozen dataclass variants. Scripts run through `~/.claude/scripts/lib/py`.
 - State lives under `~/.local/state/`. User-facing times go through `scripts/lib/user_zone.py`.
-- Scripts message sessions only through `scripts/message/send.py`, and find a showrunner by `showrunners.py address <slug>`.
+- Scripts message sessions only through `scripts/message/send.py`, and find a showrunner by `showrunners.py address <showrunner name>`.
 - Rules stay in `~/rust/nate_style`; the procedure stays in `docs/style_production.md`. Standing plans never go under `docs/style/` or `docs/*/style/`, since `load_rules` reads every `.md` there.
 - The family rank lives only in `rules.FAMILY_RANKS`; code compares ranks through `rules.ranked_above` and never names two families in order. A lower-rank finding judged at an older file is never filed or built where a family above it has a unit.
 - Style units own no files. They take what the board, live units' branches and dirty worktrees leave free. Product work always wins.
@@ -398,7 +485,7 @@ All follow writes run in one `BEGIN IMMEDIATE` transaction. The write refuses wh
   A unit rename changes no ticket or sync wait.
   `board_json.py` joins ticket owners through staff and reads phase records through `phase_table.build_run`.
 
-- A style unit id already starts with `<style slug>-`. Code that builds a worktree, branch or herdr host name from a unit stem goes through `unit_names.branch` (or `worktree`), which returns the stem unchanged when it starts with `<slug>-`; else the prefix doubles. `add_unit.host_session_name` uses this rule. Shutdown restart uses the staff name.
+- A style unit id already starts with `<style showrunner name>-`. Code that builds a worktree, branch or herdr host name from a unit stem goes through `unit_names.branch` (or `worktree`), which returns the stem unchanged when it starts with `<showrunner name>-`; else the prefix doubles. `add_unit.host_session_name` uses this rule. Shutdown restart uses the staff name.
 - Every ledger row and `--rule` uses `Rule.rule_id`. Map a unit to its branch through the Units row, never by name derivation.
 - Every `set-tip` caller that expects awaiting-merge cells passes `--style-branch`. `reconcile` never moves the synced tip.
 - Read committed trees only through git objects (`ls-tree`, `cat-file --batch`), never `git archive`.
@@ -410,7 +497,7 @@ All follow writes run in one `BEGIN IMMEDIATE` transaction. The write refuses wh
 - A unit director builds each prompt only from its own Work Order, plan and conversation, never from another unit's prompt files under `/tmp/claude/unit/*` (`docs/delegate/compose_work_order.md` **Fallback**). A missing build fact goes to the showrunner.
 - Plan and pin writes use `atomic_write`.
 - The style showrunner's unit-checkpoint merge keeps the unit tip an ancestor, so the unit's next `--ff-only` merge succeeds. Standing units never make `--no-ff` merges.
-- Every reader of merge history handles `ChildHandoffEntry`.
+- Hand-off readers use git ancestry and the recorded checkpoint.
 - No acknowledgment of a hand-off precedes a successful push.
 - `proposal_issue.create` keeps both `_decision_path_state` checks, before and inside the folder lock.
 - Every state reader compares a judgment with a tip through `_judgment_inputs_match`. A judgment with reads compares only by `_read_fingerprint`.
@@ -454,9 +541,9 @@ All follow writes run in one `BEGIN IMMEDIATE` transaction. The write refuses wh
 - A `checkpointed` ticket blocks the unit's next `assign` until `ticket merge`.
 - `git add` on a path under the shared exclude exits 1 without `-f`; stage from `git status --porcelain`.
 - `add_unit` copies a standing plan only when the unit copy is missing; later showrunner-copy edits never reach a launched unit.
-- Every style Units row's Owns parses as `('none',)`, so a unit checkpoint merge needs one `--also` per ticket file.
+- Unit checkpoints do not filter code paths by responsibilities. The ticket gate and cargo-berth manage ticket files and reservations.
 - A root's own hand-off stays `pending`; `reconcile` after each `--root-self` merge marks it merged by ancestry.
-- Former child slugs go through `showrunners.canonical_slug` before the doc lookup.
+- The child showrunner staff row gives its current name and document path.
 - The footprint filter is lexical and fails closed: a private rename with a test module's `use super::*`, an unrelated edit on a macro line, or an attribute on an unknown item goes to review. It reads committed revisions only; `--worktree` exists for that reason.
 - The tokenizer keeps a string literal as one token, so the `{_name}` capture regex runs over literal tokens. When `token_spans` is empty, the original change is kept and the answer stays review.
 - Pilot scope lines name workspace packages, not member folders; `status` groups by member folder.
@@ -492,7 +579,7 @@ All follow writes run in one `BEGIN IMMEDIATE` transaction. The write refuses wh
 - **Lint in check mode:** a check never touches the tree, so no rewrite-and-rollback is needed.
 - **`--ff-only` for standing units:** a `--no-ff` merge breaks no-change ticket ancestry. No-change tickets make no empty commits, which would carry empty merges into the branch point.
 - **Delivery state from git, not stored:** a single local ancestry check would acknowledge an unpushed merge after a failed push.
-- **A hand-off is not a unit phase:** it is the child's work landing, so it counts toward no unit CI point. Style files go in as `--also`, so no scope code changes.
+- **A hand-off is not a unit phase:** it is the child's work landing, so it counts toward no unit CI point. The hand-off does not use a responsibility filter.
 - **`style_plan.py gate` serves both gates:** one place reads `SelectedByCoverage.base` and the proposal rules.
 - **Per-file structure cells and per-file blocking:** a crate-wide structure cell held every other family off a whole crate; per-file cells let values and names work start as soon as a file's own structure check is done.
 - **Two blind judges on names read tickets, and a when-to-split step on structure tickets:** one judge, or no split question, missed the 95% recall bar in the pilot.

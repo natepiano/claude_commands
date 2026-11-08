@@ -7,11 +7,11 @@ import runpy
 import shutil
 from collections.abc import Sequence
 from types import ModuleType
-import dailies_input
-import fake_unit_host
-import fake_herdr
-import dailies_render
-from cli_fixture import ImmutableGitSeed, invoke_cli, production_paths
+from scripts.production import dailies_input
+from scripts.production import fake_unit_host
+from scripts.herdr import fake_herdr
+from scripts.production import dailies_render
+from scripts.production.cli_fixture import ImmutableGitSeed, invoke_cli, production_paths
 import os
 import subprocess
 import sys
@@ -21,25 +21,26 @@ from pathlib import Path
 from typing import ClassVar, IO, cast, override
 from unittest import mock
 
-from dailies_input import (Activity, Block, ClaudeNotRunning, Decision, FormWaiting, Running, SessionGone,
+from scripts.production.dailies_input import (Activity, Block, ClaudeNotRunning, Decision, FormWaiting, Running, SessionGone,
                            StillWaiting, TicksFailing, UnitRow, status_blocks)
-from unit_lookup import UnitState
+from scripts.production.unit_lookup import UnitState
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.production import staff, unit_names
 from scripts.production.staff_test_support import (
-    fixture_showrunner_name, isolated_staff_file, recorded_showrunner, recorded_unit, showrunner_launch, showrunner_relationship,
+    isolated_staff_file, recorded_showrunner, recorded_unit, showrunner_launch, showrunner_relationship,
     unit_membership,
 )
 
 
 SCRIPT = Path(__file__).with_name("dailies_input.py")
+SHIM = SCRIPT.parents[1] / "lib/py"
 RENDERER = SCRIPT.with_name("dailies_render.py")
 CI_POINTS = SCRIPT.with_name("ci_points.py")
 WAITING = SCRIPT.with_name("waiting.py")
 STAMP = "at 10:00 PDT / 17:00 UTC"
 AT = "2026-10-06T17:00"
-ALPHA = "alpha-unit"
-BETA = "beta-unit"
+ALPHA = "alpha"
+BETA = "beta"
 NOTIFIER = '''#!__PYTHON__
 import json
 import os
@@ -80,7 +81,7 @@ import sys
 if sys.argv[1:2] != ["watch"]:
     raise SystemExit(99)
 request = subprocess.run([
-    sys.executable,
+    "__SHIM__",
     os.environ["DAILIES_RACE_WAITING"],
     "eta-request",
     os.environ["DAILIES_RACE_UNIT"],
@@ -210,7 +211,7 @@ class DailiesInputFixture(unittest.TestCase):
         self.origin = self.root / "origin.git"
         self.checkout = self.root / "merge"
         self.seed.copy_to(self.checkout, self.origin)
-        self.doc = self.root / "example-production.md"
+        self.doc = self.root / "report-notes.md"
         self.status = self.root / "status.txt"
         self.judgment = self.root / "judgment.json"
         self.state = self.root / "state"
@@ -254,7 +255,7 @@ class DailiesInputFixture(unittest.TestCase):
         _ = self.enterContext(isolated_staff_file(self.root / "staff/staff.json", self.env))
         (self.root / "sessions").mkdir()
         self.production_doc()
-        _ = showrunner_relationship(fixture_showrunner_name("example", self.doc))
+        _ = showrunner_relationship("example")
         self.status_lines(f"== {ALPHA}", "● Checking panel labels", "ETA 23:40")
         self.judgment_file()
 
@@ -276,8 +277,9 @@ class DailiesInputFixture(unittest.TestCase):
                 self.assertIsNotNone(env, "herdr must supply its sanitized child environment")
                 return invoke_cli(fake_herdr, lambda: fake_herdr.main(list(argv[1:])),
                                   list(argv[1:]), environment, directory)
-            script = Path(argv[1] if argv[0] == sys.executable and len(argv) > 1 else argv[0])
-            arguments = list(argv[2:] if argv[0] == sys.executable else argv[1:])
+            python = argv[0] in (sys.executable, str(SHIM))
+            script = Path(argv[1] if python else argv[0])
+            arguments = list(argv[2:] if python else argv[1:])
             if script == RENDERER:
                 return invoke_cli(dailies_render, lambda: dailies_render.main(arguments),
                                   arguments, environment, directory, production_state=True)
@@ -295,8 +297,7 @@ class DailiesInputFixture(unittest.TestCase):
                 module.__file__ = str(script)
 
                 def main() -> int:
-                    with mock.patch.object(sys, "path", [str(script.parent), *sys.path]):
-                        _ = runpy.run_path(str(script), run_name="__main__")
+                    _ = runpy.run_path(str(script), run_name="__main__")
                     return 0
 
                 return invoke_cli(module, main, arguments, environment, directory)
@@ -321,15 +322,14 @@ class DailiesInputFixture(unittest.TestCase):
             "# Production — example", "", "## Production Context", "",
             "- **Merge branch:** `production`",
             f"- **Showrunner checkout:** `{self.checkout}`",
-            "- **Showrunner session:** test-showrunner",
             "- **Log:** `production.log`",
             "- **User zone:** America/Los_Angeles",
-            "- **Updates:** every 15 minutes", "", "## Gates", "",
+            "- **Updates:** every 15 minutes", "",
         ]
         _ = self.doc.write_text("\n".join(rows), encoding="utf-8")
         self.timer("example")
         for unit, name in ((ALPHA, "alpha"), (BETA, "beta")) if beta else ((ALPHA, "alpha"),):
-            _ = recorded_unit(fixture_showrunner_name("example", self.doc), unit, self.root / name, self.doc,
+            _ = recorded_unit("example", unit, self.root / name, self.doc,
                               plan=f"docs/{name}.md")
 
     def status_lines(self, *lines: str) -> None:
@@ -337,7 +337,7 @@ class DailiesInputFixture(unittest.TestCase):
 
     def unit_id(self, name: str = ALPHA) -> staff.StaffId:
         if name not in self.unit_ids:
-            self.unit_ids[name] = unit_membership(fixture_showrunner_name("example", self.doc), name).id
+            self.unit_ids[name] = unit_membership("example", name).id
         return self.unit_ids[name]
 
     def judgment_file(self, *, beta: bool = False, alpha: dict[str, object] | None = None) -> None:
@@ -371,13 +371,13 @@ class DailiesInputFixture(unittest.TestCase):
             ("--render-state", str(self.root / "render-state.json"))
             if include_render_state and "--render-state" not in extra else ()
         )
-        arguments = ["--production", str(self.doc),
+        arguments = ["--production", "example",
              "--status", str(self.status), "--judgment", str(self.judgment),
              "--state-dir", str(self.state), "--out", str(self.output),
              "--holders", str(self.holders), "--notifier", str(self.notifier),
              "--at", AT, *state_args, *extra]
         if subprocess_cli:
-            return subprocess.run([sys.executable, str(SCRIPT), *arguments], cwd=self.checkout,
+            return subprocess.run([str(SHIM), str(SCRIPT), *arguments], cwd=self.checkout,
                                   env=self.env, capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
         return invoke_cli(dailies_input, dailies_input.main, arguments, self.env, self.checkout, production_state=True)
 
@@ -477,18 +477,18 @@ class DailiesInputFixture(unittest.TestCase):
                 if events.exists() else [])
 
     def run_merge_watch(self) -> subprocess.CompletedProcess[str]:
-        return subprocess.run([sys.executable, str(CI_POINTS), "watch", "--production", str(self.doc),
+        return subprocess.run([str(SHIM), str(CI_POINTS), "watch", "--production", "example",
                                "--state-dir", str(self.state)], cwd=self.checkout, env=self.env,
                               capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
 
     def run_eta_request(self, phase: str = "Phase 2 of 3: panel labels stay clear") -> subprocess.CompletedProcess[str]:
-        return subprocess.run([sys.executable, str(WAITING), "eta-request", ALPHA,
-                               "--phase", phase, "--production", str(self.doc),
+        return subprocess.run([str(SHIM), str(WAITING), "eta-request", ALPHA,
+                               "--phase", phase, "--production", "example",
                                "--state-dir", str(self.state)], cwd=self.checkout, env=self.env,
                               capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
 
     def rename_unit(self, name: str) -> None:
-        row = unit_membership(fixture_showrunner_name("example", self.doc), ALPHA)
+        row = unit_membership("example", ALPHA)
         _ = staff.rename(row.id, unit_names.name(name))
         for path in (self.status, self.judgment):
             _ = path.write_text(path.read_text(encoding="utf-8").replace(ALPHA, name), encoding="utf-8")
@@ -531,38 +531,37 @@ class DailiesInputFixture(unittest.TestCase):
         self.assertEqual([item for item in topics if item["title"] == "Bevy upgrade"], [
             {"title": "Bevy upgrade", "update": update, "eta": "no ETA stated yet", "needs_user": False}])
 
-    def timer(self, slug: str) -> None:
+    def timer(self, name: str) -> None:
         """A production with a complete update timer, so the tree counts it."""
-        instance = self.root / "notifier-state" / f"showrunner-{slug}"
-        instance.mkdir(parents=True, exist_ok=True)
-        document = self.doc if slug == "example" else self.root / f"{slug}-production.md"
+        document = self.doc if name == "example" else self.root / f"{name}-production.md"
         if not document.exists():
-            _ = document.write_text(f"# Production — {slug}\n", encoding="utf-8")
-        row = recorded_showrunner(fixture_showrunner_name(slug, self.doc), document)
+            _ = document.write_text(f"# Production — {name}\n", encoding="utf-8")
+        row = recorded_showrunner(name, document)
+        instance = self.root / "notifier-state" / f"showrunner-{row.id}"
+        instance.mkdir(parents=True, exist_ok=True)
         _ = (instance / "conf").write_text(
-            f"TARGET=session:{row.current_session}\nCHECK=zsh /x/production_check.sh {document}\n", encoding="utf-8")
+            f"TARGET=session:{row.current_session}\nCHECK=zsh /x/production_check.sh {row.id}\n", encoding="utf-8")
         showrunner_launch(row, row.current_session, self.env)
 
     def attach(self, child: str, parent: str) -> None:
-        for slug in (child, parent):
-            if not (self.root / "notifier-state" / f"showrunner-{slug}").exists():
-                self.timer(slug)
-        _ = showrunner_relationship(fixture_showrunner_name(child, self.doc), fixture_showrunner_name(parent, self.doc))
+        for name in (child, parent):
+            self.timer(name)
+        _ = showrunner_relationship(child, parent)
 
-    def saved_report(self, slug: str) -> Path:
-        return self.showrunner_state / self.production_id(slug) / "dailies_last.json"
+    def saved_report(self, name: str) -> Path:
+        return self.showrunner_state / self.production_id(name) / "dailies_last.json"
 
-    def write_saved_report(self, slug: str, **changed: object) -> None:
+    def write_saved_report(self, name: str, **changed: object) -> None:
         fields: dict[str, object] = {
             "written": "2026-10-06T16:50", "zone": "America/Los_Angeles", "interval": 15, "units": 3, "held": 1,
             "rows": [{"name": "fps", "started": "2026-10-06T15:10", "eta": "2026-10-06T19:20",
                       "earliest": "2026-10-06T19:20", "latest": "2026-10-06T19:20"}, {"name": "docs"}],
             **changed}
-        self.saved_report(slug).parent.mkdir(parents=True, exist_ok=True)
-        _ = self.saved_report(slug).write_text(json.dumps(fields), encoding="utf-8")
+        self.saved_report(name).parent.mkdir(parents=True, exist_ok=True)
+        _ = self.saved_report(name).write_text(json.dumps(fields), encoding="utf-8")
 
-    def write_open_for(self, slug: str, content: str) -> None:
-        path = self.showrunner_state / "outstanding" / f"{self.production_id(slug)}.json"
+    def write_open_for(self, name: str, content: str) -> None:
+        path = self.showrunner_state / "outstanding" / f"{self.production_id(name)}.json"
         path.parent.mkdir(parents=True, exist_ok=True)
         _ = path.write_text(content, encoding="utf-8")
 
@@ -571,7 +570,7 @@ class DailiesInputFixture(unittest.TestCase):
 
     def style_ledger_cli(self, *arguments: str) -> subprocess.CompletedProcess[str]:
         ledger = SCRIPT.parent.parent / "style/style_ledger.py"
-        result = subprocess.run([sys.executable, str(ledger), *arguments, "--repo", str(self.checkout)],
+        result = subprocess.run([str(SHIM), str(ledger), *arguments, "--repo", str(self.checkout)],
                                 env=self.env, capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         return result
@@ -595,7 +594,7 @@ class DailiesInputFixture(unittest.TestCase):
         _ = self.doc.write_text(content.replace("## Production Context", "## Production Context\n\n- **Kind:** style"),
                                 encoding="utf-8")
 
-    def production_id(self, slug: str) -> staff.StaffId:
-        document = self.doc if slug == "example" else self.root / f"{slug}-production.md"
+    def production_id(self, name: str) -> staff.StaffId:
+        document = self.doc if name == "example" else self.root / f"{name}-production.md"
         return next(row.id for row in staff.snapshot().find(kind="showrunner")
                     if isinstance(row.doc, staff.LiveDoc) and row.doc.path == document)

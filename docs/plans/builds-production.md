@@ -11,7 +11,7 @@
 - **Showrunner session:** builds
 - **Log:** `docs/plans/builds-log.md` — untracked: never added or committed (never `git add -A` or `-a`); one line per event
 - **Updates:** on demand (user, 2026-10-13: no timer unless asked); each update reports every unit in full
-- **Merge tests:** `env HERDR_BIN=/nonexistent/herdr python3 scripts/production/merge_gate.py --repo . --tests-only` and `basedpyright scripts/buildlog scripts/build_hold scripts/build_queue scripts/build_targets scripts/mac_test scripts/lint scripts/direct` (pass is its `0 errors, 0 warnings` line), run in the showrunner checkout
+- **Merge tests:** `env HERDR_BIN=/nonexistent/herdr python3 ~/.claude/scripts/production/merge_gate.py --checkout . --tests-only` (run in the showrunner checkout; the installed gate code and config admit the run, and the module tests come from the merged tree; the full type check runs nightly, user 2026-11-05)
 - **Push:** git
 - **Promote:** ~/.claude, mac ~/.claude
 - **Capacity:** natedev has 32 cores and 60 GB of memory; three units. The work is Python and shell scripts and docs. The tests run under the merge gate's memory cap. Its workers share natedev's build slots with natedev and sdlc.
@@ -51,13 +51,6 @@ Scope of each unit:
 
 `commands/showrunner/produce.md`, `settings.json` (hook entries) and `pyrightconfig.json` are hub files in natedev. An edit to one of them goes through cargo-berth's normal flow, and the checkpoint notice names the natedev owner.
 
-## Gates
-
-| Gate | Waiting | Waits on | Clears when |
-| --- | --- | --- | --- |
-
-None yet. When a plan needs another unit's checkpoint, the gate goes here.
-
 ## Close-out
 
 - Each unit's as-built doc is in `docs/as-built/`, and the docs it replaces are deleted or amended.
@@ -68,7 +61,7 @@ None yet. When a plan needs another unit's checkpoint, the gate goes here.
 
 - **A child of natedev** (the user, 2026-10-29). builds reports to natedev in the showrunner tree: `~/.claude/scripts/lib/py ~/.claude/scripts/production/showrunners.py parent builds` prints natedev. The promotion attaches it. If it does not, attach it with `/showrunner:attach`. natedev never merges `builds`; each merged phase goes to main, as below.
 - **Launch order** (natedev, 2026-10-29). builds-unit commits this doc on `natedev-builds`, ends its `/unit:direct` run, and natedev merges the doc. Then natedev runs `/showrunner:promote_showrunner builds-unit docs/plans/builds-production.md`. The builds showrunner then creates `builds` from `origin/natedev-builds`, switches its checkout to it and pushes it. Then it starts resources-unit and report-unit with `/showrunner:add_unit <name> --brief "<goal>"`, which writes each stub plan at the path in its `.unit.toml`. Then it asks natedev to transfer verify-unit.
-- **Not builds work** (the user, 2026-10-29). Production rename and worker identity belong to natedev's shutdown-unit. A finding there goes to the natedev showrunner, not to a builds unit.
+- **Not builds work** (the user, 2026-10-29). Production rename and worker identity belong to the shutdown unit under sdlc. A finding there goes to the sdlc showrunner, not to a builds unit.
 - **Build speed is a top priority** (the user, 2026-10-07: understanding builds deeply and speeding them up ranks among the most important work).
 - **Owners in natedev** (2026-10-21, after the sdlc showrunner sent back a checkpoint whose notice named only its own hub owners). A checkpoint that changes a file a natedev unit owns (the unit's `.unit.toml` and the Hub files section) names each owner in its notice: `also touches <paths> (owner <unit>), tested against <owner origin tip>, clean`, after `git merge-tree --write-tree HEAD origin/<owner branch>`. Also trial-merge against `origin/natedev`.
 - **No CI on this repo** (natedev, 2026-10-04, for `~/.claude`). `~/.claude` has no workflows, so the Merge tests replace `verify.sh test`, and <CIPoint/>, the smoke launch, the Mac run and `validate_and_push.sh` do not apply.

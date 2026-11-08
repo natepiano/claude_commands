@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """Choose admission from command arguments and manage the program scope."""
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 from collections.abc import Callable, Generator, Mapping, Sequence
 from contextlib import contextmanager, redirect_stdout
@@ -14,18 +18,12 @@ import subprocess
 import sys
 import threading
 import time
-from typing import TYPE_CHECKING, BinaryIO, TypedDict, Unpack
+from typing import BinaryIO, TypedDict, Unpack
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from scripts.lib import build_folders
+from scripts.lib import build_folders, atomic_file, conf
 from scripts.lint import memory_admit
 from scripts.build_queue import admission_client, admission_protocol as wire
 import uuid
-
-if TYPE_CHECKING:
-    from scripts.lib import conf
-else:
-    import conf
 
 
 @dataclass(frozen=True)
@@ -40,6 +38,7 @@ class ProgramPurpose(Enum):
     BATCH = auto()
     PROBE = auto()
     EDITOR_SERVER = auto()
+    RUNNER = auto()
 
 
 def program_purpose(argv: Sequence[str], *, batch: bool = False) -> ProgramPurpose:
@@ -84,24 +83,6 @@ def defer_cleanup_signals() -> Generator[None]:
         _ = signal.pthread_sigmask(signal.SIG_SETMASK, previous)
 
 
-@contextmanager
-def defer_start_signals() -> Generator[None]:
-    """Record cancellation until the newly started child has an owner."""
-    pending: list[int] = []
-
-    def record(number: int, _frame: object) -> None:
-        pending.append(number)
-
-    previous = {number: signal.signal(number, record) for number in (signal.SIGTERM, signal.SIGINT)}
-    try:
-        yield
-    finally:
-        for number, handler in previous.items():
-            _ = signal.signal(number, handler)
-    if pending:
-        signal.raise_signal(pending[0])
-
-
 def in_builds_slice() -> bool:
     try:
         return "/builds.slice/" in Path("/proc/self/cgroup").read_text()
@@ -136,15 +117,6 @@ def probe_scope_prefix() -> list[str]:
     return prefix
 
 
-def atomic_sample(path: Path, value: str) -> None:
-    temporary = path.with_name(path.name + ".tmp")
-    try:
-        _ = temporary.write_text(value)
-        os.replace(temporary, path)
-    finally:
-        temporary.unlink(missing_ok=True)
-
-
 def wait_reasons(result: memory_admit.AdmissionWaitSnapshot) -> tuple[str, ...]:
     return admission_client.wait_reasons(result)
 
@@ -159,6 +131,7 @@ class PopenArguments(TypedDict, total=False):
     close_fds: bool
     pass_fds: Sequence[int]
     start_new_session: bool
+    preexec_fn: Callable[[], None]
 
 
 @dataclass(frozen=True)
@@ -167,8 +140,14 @@ class ProgramNotStarted:
 
 
 @dataclass
+class NoDescendantAdoption:
+    pass
+
+
+@dataclass
 class ProgramTree:
     group: int
+    adopter: wire.Owner | NoDescendantAdoption = field(default_factory=NoDescendantAdoption)
     observed: dict[int, str] = field(default_factory=dict[int, str])
     lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
@@ -176,7 +155,10 @@ class ProgramTree:
         """Retain observed descendants after a session change or reparenting."""
         with self.lock:
             processes = memory_admit.process_table(Path("/proc"))
-            members = memory_admit.process_tree(self.observed, processes)
+            roots = dict(self.observed)
+            if isinstance(self.adopter, wire.Owner):
+                roots[self.adopter.pid] = self.adopter.start_time
+            members = memory_admit.process_tree(roots, processes)
             members.update(scope_members)
             for pid in processes:
                 try:
@@ -184,6 +166,8 @@ class ProgramTree:
                         members.add(pid)
                 except ProcessLookupError:
                     continue
+            if isinstance(self.adopter, wire.Owner):
+                members.discard(self.adopter.pid)
             live = {pid: processes[pid].start for pid in members if pid in processes}
             self.observed = live
             return live
@@ -209,7 +193,7 @@ def scope_start(sidecar: Path, holder_pid: int, holder_start: str, argv: Sequenc
     for line in Path("/proc/self/cgroup").read_text().splitlines():
         if line.startswith("0::") and "/builds.slice/" in line:
             scope = Path("/sys/fs/cgroup") / line[3:].lstrip("/")
-            atomic_sample(sidecar, str(scope) + "\n")
+            atomic_file.atomic_sample(sidecar, str(scope) + "\n")
             if memory_admit.process_start_time(holder_pid) != holder_start:
                 raise QueuePlaceRefused("the queue place holder exited during scope publication")
             os.execvp(argv[0], list(argv))
@@ -258,22 +242,28 @@ class QueuePlace:
     status: int = 1
     program: ProgramNotStarted | StartedProgram = field(default_factory=ProgramNotStarted, init=False)
     on_started: Callable[[], None] = no_hold_wait
-    configuration: memory_admit.MemoryConfig = field(kw_only=True, repr=False)
+    configuration: memory_admit.MemoryConfig | wire.RunnerExecutionTiming = field(kw_only=True, repr=False)
     purpose: ProgramPurpose = field(default=ProgramPurpose.BATCH, kw_only=True)
     arguments: tuple[str, ...] = field(default=(), kw_only=True)
     _samples: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
+
+    def publish_sample(self, suffix: str, value: str) -> None:
+        path = self.path.with_suffix(suffix)
+        atomic_file.atomic_sample(path, value)
+        if self.purpose == ProgramPurpose.RUNNER:
+            path.chmod(0o644)
 
     def observe(self, peak_bytes: int, current_bytes: int) -> None:
         """Publish the existing peak and near-peak evidence in bytes."""
         with self._samples:
             now = datetime.now(UTC).timestamp()
             if peak_bytes > self.peak_bytes:
-                atomic_sample(self.path.with_suffix(".max"), f"{peak_bytes}\n")
+                self.publish_sample(".max", f"{peak_bytes}\n")
                 self.peak_bytes = peak_bytes
-                atomic_sample(self.path.with_suffix(".wave"), f"{peak_bytes} {int(now)}\n")
+                self.publish_sample(".wave", f"{peak_bytes} {int(now)}\n")
                 self.wave_at = now
             elif self.peak_bytes and current_bytes >= self.peak_bytes / 2 and now - self.wave_at >= self.configuration.peak_wave_seconds:
-                atomic_sample(self.path.with_suffix(".wave"), f"{self.peak_bytes} {int(now)}\n")
+                self.publish_sample(".wave", f"{self.peak_bytes} {int(now)}\n")
                 self.wave_at = now
 
     def popen(self, argv: Sequence[str], **popen_arguments: Unpack[PopenArguments]) -> subprocess.Popen[bytes]:
@@ -285,7 +275,7 @@ class QueuePlace:
             raise QueuePlaceRefused("a queued program must start in its own process group")
         popen_arguments["start_new_session"] = True
         prefix: list[str] = []
-        if self.purpose != ProgramPurpose.PROBE and os.environ.get("BUILDLOG_SCOPE") != "0":
+        if self.purpose not in (ProgramPurpose.PROBE, ProgramPurpose.RUNNER) and os.environ.get("BUILDLOG_SCOPE") != "0":
             with redirect_stdout(sys.stderr):
                 prefix = probe_scope_prefix()
             if not prefix:
@@ -295,15 +285,17 @@ class QueuePlace:
         holder_start = memory_admit.process_start_time(holder_pid)
         if holder_start is None:
             raise QueuePlaceRefused("the queue place holder has no live process identity")
-        command = ([*prefix, sys.executable, str(Path(__file__).resolve()), "--scope-start", str(self.sidecar),
+        command = ([*prefix, str(Path(__file__).resolve().parents[1] / "lib/py"), str(Path(__file__).resolve()), "--scope-start", str(self.sidecar),
                     str(holder_pid), holder_start, *argv]
                    if prefix else list(argv))
-        with defer_start_signals():
+        with build_folders.defer_signals():
             process = subprocess.Popen(command, **popen_arguments)
             stopped = threading.Event()
             tracking: ScopedProgram | ProgramTree = ScopedProgram()
             if not prefix:
                 tracking = ProgramTree(process.pid)
+                if self.purpose == ProgramPurpose.RUNNER:
+                    tracking.adopter = wire.Owner(holder_pid, holder_start)
                 start = memory_admit.process_start_time(process.pid)
                 if start is not None:
                     tracking.observed[process.pid] = start
@@ -337,7 +329,11 @@ class QueuePlace:
                         matching = {pid for pid, start in members.items()
                                     if pid in processes and processes[pid].start == start}
                     reading = memory_admit.process_memory(matching, proc)
-                    self.observe(reading.bytes, reading.bytes)
+                    if self.purpose == ProgramPurpose.RUNNER:
+                        if isinstance(reading.anonymous, memory_admit.AnonymousRunUse):
+                            self.observe(reading.anonymous.bytes, reading.anonymous.bytes)
+                    else:
+                        self.observe(reading.bytes, reading.bytes)
             except (OSError, ValueError, StopIteration):
                 pass  # A process or scope can disappear between sampling reads.
             if stopped.wait(self.configuration.program_sample_seconds):
@@ -384,7 +380,7 @@ def _stop_holder(number: int, _frame: object) -> None:
 
 @contextmanager
 def queue_place(program: str | Sequence[str], repo: Path, *, batch: bool = False,
-                sizing: memory_admit.FixedCapSizing | memory_admit.HistoryPeakSizing | ConfiguredFirstPeak = CONFIGURED_FIRST_PEAK,
+                sizing: memory_admit.HistoryPeakSizing | ConfiguredFirstPeak = CONFIGURED_FIRST_PEAK,
                 before_check: Callable[[], None] = no_hold_wait) -> Generator[QueuePlace]:
     """Use full commands for purpose selection; retain named batch reservations."""
     # A name requests a batch place. A complete command permits purpose selection.
@@ -444,7 +440,7 @@ def queue_place(program: str | Sequence[str], repo: Path, *, batch: bool = False
                 with defer_cleanup_signals():
                     place.finish(failed=failed)
                     if isinstance(grant, wire.Admitted):
-                        _ = admission_client.release(grant.reservation, place.status, place.configuration)
+                        _ = admission_client.release(grant.reservation, place.status, grant.cleanup_timing)
         finally:
             with defer_cleanup_signals():
                 for number, handler in handlers.items():

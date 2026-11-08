@@ -4,7 +4,7 @@
 Agents holding the SendMessage tool call it directly; scripts call this. The rules
 every message follows are /message (~/.claude/commands/message.md).
 
-  send.py --to NAME|uds:<path>|session:<id>|worker:<run>/<worker>|codex:<thread>
+  send.py --to NAME|uds:<path>|session:<id>|worker:<unit>/<worker>|codex:<thread>
           [--from NAME] [--summary TEXT] [--key KEY [--repeat-minutes N]]
           [--here | --machine HOST] [--codex --session-dir DIR] [--timeout SECONDS]
           (--text TEXT | --file PATH | stdin)
@@ -19,6 +19,9 @@ every message follows are /message (~/.claude/commands/message.md).
                           also stop the emergency push sent with KEY (see below)
   send.py clear-check     retire each live emergency push whose --clears-when check passes
 
+Pane workers use worker:<unit>/<worker>.
+Workers in mesh-pinned runs use worker:<run id>/<worker>.
+
 Delivery. A Claude recipient is tried through the postmaster outbox first when
 its heartbeat is fresh. Every path without confirmed delivery falls back to a
 headless `claude -p` relay whose one job is a SendMessage call. It runs sonnet in auto mode (haiku cannot run in auto mode),
@@ -27,9 +30,13 @@ removed, so it never passes for the session that ran this. Its relay
 name is separate from the sender, who is named in the message. Delivery is read from the
 SendMessage tool result in the relay's stream, never from what the model says;
 the last stream per recipient stays in STATE/relay/<to>.jsonl.
-`worker:` addresses queue through codex_mesh.py; `codex:` addresses queue through
-the shared Codex daemon. One staff snapshot selects each staff recipient.
-Unit names accept the optional `-unit` suffix. Ambiguous staff names stop delivery.
+Staff `worker:` paths deliver through observed panes or their holders.
+Mesh `worker:` addresses keep their existing queues.
+Staff worker addresses use the run's pinned transport.
+Other `codex:` addresses use a reported herdr pane or the shared Codex daemon.
+An absent staff recipient keeps its queue without selecting a session family.
+One staff snapshot selects each staff recipient.
+Unit names use the staff names. Ambiguous staff names stop delivery.
 A staff recipient uses its current_session, including for an explicit address.
 A non-staff name uses a unique live roster session, locally before the peer.
 A name without a staff row or live session is refused without a relay or queue.
@@ -109,6 +116,10 @@ Usage errors, an unreadable --file and an empty message exit 2. STATE is $XDG_ST
 """
 
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import argparse
 import fcntl
@@ -123,7 +134,7 @@ import socket
 import subprocess
 import sys
 import time
-from collections.abc import Generator
+from collections.abc import Generator, Mapping
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timedelta, timezone
@@ -131,38 +142,36 @@ from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, NamedTuple, NoReturn, NotRequired, TypedDict, cast
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "notify"))
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
-import process_group
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from scripts.herdr.place import HerdrPlace
+from scripts.lib import process_group
 from scripts.production import staff, unit_names
-from scripts.lib import conf
+from scripts.lib import conf, models_registry, process_start, unit_runs
+from scripts.lib.atomic_file import write_text_atomic as write_atomic
 from scripts.notify import decision_priority
-from scripts.message import send_budget
+from scripts.message import morty_identity, send_budget
 from scripts.message.send_result import (
     Outcome as Outcome, EXIT as EXIT, OUTCOME_HEADERS as OUTCOME_HEADERS,
     OutcomeHeader as OutcomeHeader, NoOutcomeHeader as NoOutcomeHeader, parse_outcome as parse_outcome,
     ConfirmedSendOutcome as ConfirmedSendOutcome, UnconfirmedSendOutcome as UnconfirmedSendOutcome,
     send_outcome as send_outcome,
 )
-import sessions  # noqa: E402
-from relay_identity import SavedRelaySender, read_relay_sender, relay_session_name
-import postmaster  # noqa: E402
-import codex_daemon  # noqa: E402
+from scripts.message import sessions  # noqa: E402
+from scripts.message.relay_identity import SavedRelaySender, read_relay_sender, relay_session_name
+from scripts.message import postmaster  # noqa: E402
+from scripts.message import codex_daemon  # noqa: E402
 if TYPE_CHECKING:
-    import roster
-    from ..accounts import accounts
-    from ..whoami.account import named_account_environment
-import push_texts  # noqa: E402
-import push_reference
-import rca  # noqa: E402
-import repeat_guard  # noqa: E402
-import review  # noqa: E402
-import silence  # noqa: E402
-from user_zone import user_zone  # noqa: E402
-from probe_session import PROBE_ENV  # noqa: E402
-from user_action import (FIX, REFUSED_BEFORE_SENDING, ActionRefused, ActionRequired, ActionUnstated,
+    from scripts.message import roster
+    from scripts.accounts import accounts
+    from scripts.whoami.account import named_account_environment
+from scripts.notify import push_texts  # noqa: E402
+from scripts.notify import push_reference
+from scripts.message import rca  # noqa: E402
+from scripts.message import repeat_guard  # noqa: E402
+from scripts.notify import review  # noqa: E402
+from scripts.notify import silence  # noqa: E402
+from scripts.lib.user_zone import user_zone  # noqa: E402
+from scripts.lib.probe_session import PROBE_ENV  # noqa: E402
+from scripts.notify.user_action import (FIX, REFUSED_BEFORE_SENDING, ActionRefused, ActionRequired, ActionUnstated,
                          UserAction, NoActionRequired, action_conflicts, first_line, named_places, parse_user_action,
                          SessionLine, split_session, session_prefix, typed_texts)  # noqa: E402
 
@@ -207,15 +216,18 @@ NEEDS_GO_HELD = ("not sent: this push asks the user to type a go. Send it with t
 SESSION_TEMPLATES = {
     "decision.choices": "a decision with structured choices and a recommendation; see review.py show decision.choices.",
     "review_watch.acknowledge": "a reminder to acknowledge a review report; see review.py show review_watch.acknowledge.",
-    AUTO_MODE_TEXT: "auto mode refused a command and the session waits for the user. " + AUTO_MODE_CALL,
+    AUTO_MODE_TEXT: ("auto mode refused a command; the session continues its other work. "
+                     + "Send auto_mode.refused only when the refused step holds work and the user has no step for it yet. "
+                     + "If the user already has one, send nothing. "
+                     + "With other work to run, go on with it and leave out --need blocked. " + AUTO_MODE_CALL),
     PAID_CREDITS_TEXT: ("an account now spends paid credits; a script with no Claude session names itself with --from. "
                         + PAID_CREDITS_CALL),
     PAID_CREDITS_QUEUED_TEXT: ("an account now spends paid credits and the user queued a workers move; workers wait for"
                                + " the move, never go to Claude. " + PAID_CREDITS_QUEUED_CALL),
     NEEDS_GO_TEXT: "a session is stopped until the user types a go in its pane. " + NEEDS_GO_CALL,
-    rca.STARTED_TEXT: ("a unit starts to fix why a session stopped for a permission. Sent by rca.py start;"
+    rca.STARTED_TEXT: ("a unit starts to fix the cause of a permission stop or refusal. Sent by rca.py start;"
                        + " sessions run rca.py, not this: " + rca.CALL + " start <id> --owner <unit>"),
-    rca.FIXED_TEXT: ("the fix merged and the session does not stop for that permission again. Sent by rca.py fixed;"
+    rca.FIXED_TEXT: ("the fix merged; that permission does not stop or refuse the session again. Sent by rca.py fixed;"
                      + " sessions run rca.py, not this: " + rca.CALL
                      + ' fixed <id> --cause "<cause>" --fix "<fix>" --commit <sha>'),
     rca.REWRITTEN_TEXT: ("the push review's rewrite of a fixed text it refused twice. Sent by rca.py fixed;"
@@ -224,17 +236,16 @@ SESSION_TEMPLATES = {
 }
 AUTO_MODE_REPORT = re.compile(r"\bauto[\s-]mode\b", re.IGNORECASE)
 AUTO_MODE_REFUSAL = re.compile(r"\b(refused|denied|stopped)\b", re.IGNORECASE)
-# The rca.py pushes tell of a session that stopped, and a cause can say auto mode refused a command.
+# The rca.py pushes describe permission stops or refusals. A cause can name an auto-mode refusal.
 RCA_TEXTS = frozenset({rca.STARTED_TEXT, rca.FIXED_TEXT, rca.REWRITTEN_TEXT})
 AUTO_MODE_HELD = ("not sent: this push reports an auto-mode refusal. Send it with the auto_mode.refused template: "
                   + AUTO_MODE_CALL)
 PERMISSION_MODE = "auto"
 # Exec preserves this PID: Claude's cc-socks/<pid>.sock belongs to the recorded process.
 # Publish before Claude starts, so even an immediate reply can resolve its sender.
-RELAY_EXEC = f"""import os, sys
+RELAY_EXEC = """import os, sys
 from pathlib import Path
-sys.path.insert(0, {str(Path(__file__).resolve().parent)!r})
-from relay_identity import publish_relay_identity
+from scripts.message.relay_identity import publish_relay_identity
 publish_relay_identity(os.getpid(), sys.argv[2], Path(sys.argv[1]))
 os.execvpe(sys.argv[3], sys.argv[3:], os.environ)
 """
@@ -338,6 +349,9 @@ QueuedMessage = KeyedMessage | UnkeyedMessage
 class PendingDelivery(TypedDict):
     started: str
     limit_seconds: float
+    owner_pid: NotRequired[int]
+    owner_start: NotRequired[str]
+    clearing: NotRequired[Emergency]
 
 
 class KeyState(TypedDict):
@@ -345,6 +359,7 @@ class KeyState(TypedDict):
     last: dict[str, str]
     pending: NotRequired[dict[str, str | PendingDelivery]]
     acknowledged: NotRequired[str]
+    clearing: NotRequired[Emergency]
 
 
 KeyStates = dict[str, KeyState]
@@ -397,7 +412,7 @@ def new_queue_order() -> QueueOrder:
             for queue in (STATE / "queue").glob("*.jsonl"):
                 try:
                     entries = read_queue(queue)
-                except UnicodeError:
+                except (OSError, UnicodeError):
                     continue
                 previous = max(previous, max((entry.get("send_order", 0) for entry in entries), default=0))
         order = QueueOrder(previous + 1)
@@ -539,6 +554,10 @@ class Result(NamedTuple):
     receiver: str = ""
 
 
+class PaneTextDelivered(Result):
+    """The observed worker pane accepted the text input."""
+
+
 @dataclass(frozen=True)
 class NoClaudeRoute:
     pass
@@ -594,7 +613,26 @@ class CodexSessionRecipient:
     daemon: codex_daemon.CodexDaemon
 
 
-SessionRecipient = ClaudeRecipient | CodexWorkerRecipient | CodexSessionRecipient
+@dataclass(frozen=True)
+class CodexPaneRecipient:
+    address: str
+    place: HerdrPlace
+    thread_id: str
+
+
+@dataclass(frozen=True)
+class QueuedStaffRecipient:
+    address: str
+    name: str
+    session_id: str
+
+
+@dataclass(frozen=True)
+class PaneWorkerRecipient:
+    row: staff.StaffRow
+
+
+SessionRecipient = ClaudeRecipient | CodexWorkerRecipient | CodexSessionRecipient | CodexPaneRecipient
 
 
 @dataclass(frozen=True)
@@ -633,7 +671,7 @@ class TransportQueueOwner:
 TRANSPORT_QUEUE_OWNER = TransportQueueOwner()
 
 
-DeliveryRoute = SessionRecipient | UserDelivery | RemoteDelivery | RecipientLookupFailed
+DeliveryRoute = SessionRecipient | QueuedStaffRecipient | PaneWorkerRecipient | UserDelivery | RemoteDelivery | RecipientLookupFailed
 
 
 @dataclass(frozen=True)
@@ -771,12 +809,6 @@ def as_str(value: object) -> str:
     return value if isinstance(value, str) else ""
 
 
-def write_atomic(path: Path, text: str) -> None:
-    tmp = path.with_name(f".{path.name}.tmp")
-    _ = tmp.write_text(text, encoding="utf-8")
-    os.replace(tmp, path)
-
-
 @contextmanager
 def locked() -> Generator[None]:
     STATE.mkdir(parents=True, exist_ok=True)
@@ -850,7 +882,7 @@ def _queued_message(value: object) -> QueuedMessage | None:
 def read_queue(path: Path) -> list[QueuedMessage]:
     try:
         lines = path.read_text(encoding="utf-8").splitlines()
-    except OSError:
+    except FileNotFoundError:
         return []
     messages = (_queued_message(loads(line)) for line in lines)
     return [message for message in messages if message is not None]
@@ -915,7 +947,7 @@ def enqueue(message: Message, reason: str, at: datetime, *,
                     continue
                 try:
                     queues.append((previous, read_queue(previous)))
-                except UnicodeError:
+                except (OSError, UnicodeError):
                     continue
         if message.key is not None and any(
             _matches_queued_key(old, message.key, recipient, own_path=previous == path)
@@ -962,7 +994,7 @@ def remove_queued_key(to: str, key: str, *,
         for path in candidates:
             try:
                 entries = read_queue(path)
-            except UnicodeError:
+            except (OSError, UnicodeError):
                 if path in paths:
                     raise
                 continue
@@ -1064,8 +1096,13 @@ def write_emergencies(records: list[Emergency]) -> None:
 def record_emergency(record: Emergency) -> None:
     """Keep a sent emergency push for clear-check; it replaces an older record with its sender and key."""
     with locked():
-        kept = [old for old in read_emergencies() if (old["sender"], old["key"]) != (record["sender"], record["key"])]
-        write_emergencies([*kept, record])
+        _record_emergency_locked(record)
+
+
+def _record_emergency_locked(record: Emergency) -> None:
+    """Replace one clearing record while the caller holds the state lock."""
+    kept = [old for old in read_emergencies() if (old["sender"], old["key"]) != (record["sender"], record["key"])]
+    write_emergencies([*kept, record])
 
 
 def check_exit(command: str, timeout: float) -> int | None:
@@ -1259,10 +1296,41 @@ def pending_deliveries(state: KeyState) -> dict[str, PendingDelivery]:
             for recipient, mark in state.get("pending", {}).items()}
 
 
+def _owner_released(record: Mapping[str, object]) -> bool:
+    """Reclaim only a gone process or a confirmed replacement."""
+    pid = record.get("owner_pid")
+    if not isinstance(pid, int) or isinstance(pid, bool):
+        return False
+    observed = process_start.process_start(pid)
+    if isinstance(observed, (process_start.Gone, process_start.Zombie)):
+        return True
+    saved = record.get("owner_start")
+    return isinstance(observed, process_start.Started) and isinstance(saved, str) and bool(saved) and observed.start != saved
+
+
+
+def _owns_attempt(record: PendingDelivery) -> bool:
+    """Only the original live process can complete its owned attempt."""
+    if "owner_pid" not in record:
+        return True
+    if record["owner_pid"] != os.getpid():
+        return False
+    observed = process_start.process_start(os.getpid())
+    return isinstance(observed, process_start.Started) and observed.start == record.get("owner_start")
+
+
+def _finish_clearing(state: KeyState) -> None:
+    """Project a clearing record while the caller holds the key lock."""
+    if "clearing" not in state:
+        return
+    _record_emergency_locked(state["clearing"])
+    del state["clearing"]
+
+
 def claim(message: Message, recipient: StableRecipient, repeat: timedelta | None, at: datetime, *,
           delivery_limit: float,
           legacy_aliases: tuple[str, ...] = (), live: bool = False,
-          clears_when: str = "", posted_on: str = "") -> ClaimGranted | RepeatAccepted | RepeatPending:
+          clears_when: str = "", posted_on: str = "", emergency: bool = False) -> ClaimGranted | RepeatAccepted | RepeatPending:
     """Check acceptance before recording an attempt under the stable recipient.
 
     The lock prevents overlapping sends with one key from both sending.
@@ -1273,9 +1341,19 @@ def claim(message: Message, recipient: StableRecipient, repeat: timedelta | None
         return ClaimGranted()
     with key_states() as states:
         state: KeyState = states.get(message.key, {"last": {}})
+        _finish_clearing(state)
         if "acknowledged" in state:
             return RepeatAccepted(acknowledged_skip_reason(message.key, state["acknowledged"]))
         pending = pending_deliveries(state)
+        for alias in (recipient.value, *legacy_aliases):
+            attempt = pending.get(alias)
+            if attempt is None or "owner_pid" not in attempt or attempt["started"] != state["last"].get(alias):
+                continue
+            if not _owner_released(attempt):
+                return RepeatPending(f"key {message.key!r}: an earlier send to {recipient.value} is pending; not yet accepted")
+            del state["last"][alias]
+            if "pending" in state:
+                _ = state["pending"].pop(alias, None)
         # An abandoned delivery must not block a window with no end.
         timestamps = [state["last"][alias] for alias in (recipient.value, *legacy_aliases)
                       if alias in state["last"]
@@ -1297,19 +1375,29 @@ def claim(message: Message, recipient: StableRecipient, repeat: timedelta | None
                 return RepeatAccepted(still_live(message.key, message.sender, datetime.fromisoformat(last), repeat))
             minutes = repeat.total_seconds() / 60
             return RepeatAccepted(f"key {message.key!r} last sent to {recipient.value} at {last}, inside its {minutes:g}-minute window")
+        attempt = PendingDelivery(started=at.isoformat(), limit_seconds=delivery_limit)
+        if emergency:
+            owner = process_start.process_start(os.getpid())
+            if not isinstance(owner, process_start.Started):
+                return RepeatPending("emergency owner lifetime is unknown; not yet accepted")
+            attempt.update(owner_pid=os.getpid(), owner_start=owner.start)
         if clears_when:
-            clear_record = Emergency(key=message.key, sender=message.sender, check=clears_when, machine=posted_on,
-                                     sent=at.isoformat(), expires=(at + emergency_lifetime()).isoformat())
-            # Persist recovery before the claim: a crash can leave an extra check, never an orphan claim.
-            kept = [old for old in read_emergencies() if old["key"] != clear_record["key"]]
-            write_emergencies([*kept, clear_record])
+            clearing = Emergency(key=message.key, sender=message.sender, check=clears_when, machine=posted_on,
+                                 sent=at.isoformat(), expires=(at + emergency_lifetime()).isoformat())
+            if message.key.startswith("github.keys_cold:"):
+                # A warm-check command also clears an interrupted cold-key claim.
+                _record_emergency_locked(clearing)
+            elif emergency:
+                attempt["clearing"] = clearing
+            else:
+                _record_emergency_locked(clearing)
         state["last"][recipient.value] = at.isoformat()
-        state.setdefault("pending", {})[recipient.value] = PendingDelivery(started=at.isoformat(), limit_seconds=delivery_limit)
+        state.setdefault("pending", {})[recipient.value] = attempt
         states[message.key] = state
     return ClaimGranted()
 
 
-def accept_sent(key: str, to: str, at: datetime) -> None:
+def accept_sent(key: str, to: str, at: datetime, *, delivered: bool = True) -> None:
     """Confirm only the claim owned by this accepted attempt."""
     with key_states() as states:
         state = states.get(key)
@@ -1319,9 +1407,17 @@ def accept_sent(key: str, to: str, at: datetime) -> None:
         owned = pending_deliveries(state).get(to)
         if owned is None or owned["started"] != at.isoformat():
             return
+        if not _owns_attempt(owned):
+            return
+        if delivered and "clearing" in owned:
+            state["clearing"] = owned["clearing"]
         del pending[to]
         if not pending:
             del state["pending"]
+    with key_states() as states:
+        state = states.get(key)
+        if state is not None:
+            _finish_clearing(state)
 
 
 def user_emergency_key(sender: str, title: str) -> str:
@@ -1333,7 +1429,7 @@ def user_emergency_key(sender: str, title: str) -> str:
 def emergency_lifetime() -> timedelta:
     """How long Pushover repeats an emergency push that the user does not acknowledge."""
     # Imported here: only an emergency send reads it, and pushover's imports cost about 20 ms.
-    from pushover import EXPIRE_S
+    from scripts.notify.pushover import EXPIRE_S
     return timedelta(seconds=EXPIRE_S)
 
 
@@ -1355,8 +1451,10 @@ def forget_sent(key: str, to: str, at: datetime | None = None) -> None:
         state = states.get(key)
         if state is None or to not in state["last"] or (at is not None and state["last"][to] != at.isoformat()):
             return
-        del state["last"][to]
         owned = pending_deliveries(state).get(to)
+        if at is not None and owned is not None and not _owns_attempt(owned):
+            return
+        del state["last"][to]
         if "pending" in state and (at is None or (owned is not None and owned["started"] == at.isoformat())):
             _ = state["pending"].pop(to, None)
             if not state["pending"]:
@@ -1559,12 +1657,12 @@ def recover_socket_queues(records: list[sessions.SessionRecord], at: datetime) -
                               f"Stuck message from {entry['time']}:\n" + entry["text"], identity,
                               entry.get("shown_sender", entry["from"]),
                               stamp=read_sender_stamp(entry.get("sender_native_id", "unavailable")))
-            if not saved:
-                _rewrite_queue(path, remaining)
-                saved = True
             started = now()
             append_record(STATE / "socket-recovery-attempts.jsonl",
                           SocketRecoveryAttempt(key=identity, time=started.isoformat()), durable=True)
+            if not saved:
+                _rewrite_queue(path, remaining)
+                saved = True
             result = relay_socket(message, delivery_timeout(), records, metadata, membership=membership)
             log(message, result, started)
             if result.outcome != "sent":
@@ -1582,30 +1680,53 @@ def recover_socket_queues(records: list[sessions.SessionRecord], at: datetime) -
     return code, lines
 
 
-def pending(to: str | None) -> str:
+@dataclass(frozen=True)
+class CodexQueueOwner:
+    thread_id: str
+
+
+@dataclass(frozen=True)
+class CodexHookContext:
+    event: Literal["SessionStart", "PostToolUse"]
+
+
+class PendingTextFormat(Enum):
+    TEXT = "text"
+
+
+def pending(to: str | CodexQueueOwner | None, *, emit: bool = False,
+            output: PendingTextFormat | CodexHookContext = PendingTextFormat.TEXT) -> str:
     """Print and clear queued messages for the selected session.
 
     Current staff owners also receive their messages from queues for previous sessions.
     Names from previous sessions remain eligible when no other live session uses them.
     """
-    records = sessions.live_sessions()
-    if to is None:
-        own = os.environ.get("CLAUDE_CODE_SESSION_ID", "")
-        session = next((record for record in records if own and record["sessionId"] == own), None)
-        if session is None:
-            raise ValueError("pending without a name runs inside a live Claude session")
+    if isinstance(to, str) and to.startswith("codex:"):
+        to = CodexQueueOwner(to.removeprefix("codex:"))
+    if isinstance(to, CodexQueueOwner):
+        own = to.thread_id
+        keys = [f"session-{own}", f"session:{own}", f"codex:{own}", own]
     else:
-        session = sessions.addressed(to, records)
-    keys = [] if to is None else [to]
-    if session is not None:
-        taken = {record["name"] for record in records if record["sessionId"] != session["sessionId"]}
-        keys = [session_key(session), session["name"], f"uds:{session['messagingSocketPath']}",
-                *(name for name in session["formerNames"] if name not in taken), *keys]
+        records = sessions.live_sessions()
+        if to is None:
+            own = os.environ.get("CLAUDE_CODE_SESSION_ID", "")
+            session = next((record for record in records if own and record["sessionId"] == own), None)
+            if session is None:
+                raise ValueError("pending without a name runs inside a live Claude session")
+        else:
+            session = sessions.addressed(to, records)
+        keys = [] if to is None else [to]
+        own = session["sessionId"] if session is not None else ""
+        if session is not None:
+            taken = {record["name"] for record in records if record["sessionId"] != session["sessionId"]}
+            keys = [session_key(session), session["name"], f"uds:{session['messagingSocketPath']}",
+                    *(name for name in session["formerNames"] if name not in taken), *keys]
     paths = list(dict.fromkeys(queue_path(key) for key in keys if key))
     stable_values = set(keys)
-    if session is not None:
+    if own:
         try:
-            member = staff.snapshot().by_current_session(session["sessionId"])
+            membership = staff.local_snapshot() if isinstance(to, CodexQueueOwner) else staff.snapshot()
+            member = membership.by_current_session(own)
         except staff.StaffUnreadable:
             member = None
         if member is not None:
@@ -1619,7 +1740,7 @@ def pending(to: str | None) -> str:
             kept: list[QueuedMessage] = []
             try:
                 queued = read_queue(path)
-            except UnicodeError:
+            except (OSError, UnicodeError):
                 if path in paths:
                     raise
                 continue
@@ -1632,8 +1753,6 @@ def pending(to: str | None) -> str:
             if selected or path in paths:
                 entries.extend(selected)
                 rewrites.append((path, kept))
-        for path, kept in rewrites:
-            _rewrite_queue(path, kept)
         entries.sort(key=lambda entry: entry["time"])
         newest: dict[tuple[str, str], QueuedMessage] = {}
         unkeyed_or_legacy: list[QueuedMessage] = []
@@ -1649,11 +1768,18 @@ def pending(to: str | None) -> str:
             else:
                 unkeyed_or_legacy.append(entry)
         entries = sorted([*unkeyed_or_legacy, *newest.values()], key=lambda entry: entry["time"])
-    return "\n\n".join(stamped_text(
-        f"Queued message {index} of {len(entries)}, from {entry['from']} at {entry['time']}:"
-        + shown_sender_line(entry["from"], entry.get("shown_sender", entry["from"])),
-        "\n" + entry["text"].rstrip(), read_sender_stamp(entry.get("sender_native_id", "unavailable")))
-        for index, entry in enumerate(entries, 1))
+        text = "\n\n".join(stamped_text(
+            f"Queued message {index} of {len(entries)}, from {entry['from']} at {entry['time']}:"
+            + shown_sender_line(entry["from"], entry.get("shown_sender", entry["from"])),
+            "\n" + entry["text"].rstrip(), read_sender_stamp(entry.get("sender_native_id", "unavailable")))
+            for index, entry in enumerate(entries, 1))
+        if emit and text:
+            rendered = (json.dumps({"hookSpecificOutput": {"hookEventName": output.event, "additionalContext": text}})
+                        if isinstance(output, CodexHookContext) else text)
+            print(rendered, flush=True)
+        for path, kept in rewrites:
+            _rewrite_queue(path, kept)
+        return text
 
 
 # ---------------------------------------------------------------------------
@@ -1703,7 +1829,7 @@ def _print_roster_problems(
 
 
 def _messageable_recipient(entry: roster.RosterEntry) -> SessionRecipient:
-    import roster
+    from scripts.message import roster
 
     if not isinstance(entry.reach, roster.Messageable):
         raise AssertionError("a messageable recipient needs an address")
@@ -1713,6 +1839,8 @@ def _messageable_recipient(entry: roster.RosterEntry) -> SessionRecipient:
             usage_error(f"{address} is not assigned to a Codex worker")
         return CodexWorkerRecipient(address, entry.name, entry.assignment.session_dir)
     if address.startswith("codex:"):
+        if isinstance(entry.pane, HerdrPlace):
+            return CodexPaneRecipient(address, entry.pane, address.removeprefix("codex:"))
         if not isinstance(entry.daemon, codex_daemon.CodexDaemon):
             usage_error(f"{address} has no owning Codex daemon")
         return CodexSessionRecipient(
@@ -1725,13 +1853,13 @@ def _messageable_recipient(entry: roster.RosterEntry) -> SessionRecipient:
 
 
 def _cannot_receive_message(entry: roster.RosterEntry) -> NoReturn:
-    import roster
+    from scripts.message import roster
 
     usage_error(roster.cannot_receive_message_text(entry))
 
 
 def _ambiguous_name(name: str, entries: list[roster.RosterEntry]) -> NoReturn:
-    import roster
+    from scripts.message import roster
 
     lines = [f"{name} matches {len(entries)} sessions:"]
     for entry in entries:
@@ -1751,7 +1879,7 @@ def resolve_staff_recipient(
     observed: tuple[roster.RosterEntry, ...] | list[roster.RosterEntry] = (),
 ) -> staff.StaffRow | NoStaffRecipient | RecipientLookupFailed:
     """Select one staff identity before any transport lookup."""
-    import roster
+    from scripts.message import roster
 
     reference = target
     if target.startswith("worker:"):
@@ -1761,6 +1889,20 @@ def resolve_staff_recipient(
                     reference = entry.thread.thread_id
                 elif isinstance(entry.session, roster.ClaudeSession):
                     reference = entry.session.session_id
+        if reference == target:
+            path = target.removeprefix("worker:")
+            if len(path.split("/")) == 2:
+                sender = roster.sender_identity(os.environ)
+                identity = (sender.thread_id if isinstance(sender, roster.CodexThread)
+                            else sender.session_id if isinstance(sender, roster.ClaudeSession) else "")
+                ancestor = membership.by_current_session(identity)
+                while ancestor is not None and ancestor.kind != "showrunner":
+                    ancestor = membership.parent_of(ancestor)
+                if ancestor is not None and path.split("/", 1)[0] != ancestor.name:
+                    path = f"{ancestor.name}/{path}"
+            member = membership.by_path(path)
+            if member is not None and member.kind == "worker":
+                return member
     if target.startswith("uds:"):
         record = next((record for record in records
                        if f"uds:{record['messagingSocketPath']}" == target), None)
@@ -1809,7 +1951,7 @@ def resolve_staff_recipient(
 
 
 def _staff_transport_matches(member: staff.StaffRow, entries: list[roster.RosterEntry]) -> list[roster.RosterEntry]:
-    import roster
+    from scripts.message import roster
 
     return [entry for entry in entries if (
         isinstance(entry.session, roster.ClaudeSession) and entry.session.session_id == member.current_session
@@ -1820,7 +1962,7 @@ def _staff_transport_matches(member: staff.StaffRow, entries: list[roster.Roster
 
 
 def _sender_label_matches(to: str, entries: list[roster.RosterEntry]) -> list[roster.RosterEntry]:
-    import roster
+    from scripts.message import roster
 
     if to.startswith(("session:", "worker:", "codex:")):
         return [entry for entry in entries
@@ -1831,7 +1973,7 @@ def _sender_label_matches(to: str, entries: list[roster.RosterEntry]) -> list[ro
 def _matched_recipient(
     to: str, matches: list[roster.RosterEntry], destination: LocalOnly | NamedMachine,
 ) -> SessionRecipient | RemoteDelivery:
-    import roster
+    from scripts.message import roster
 
     if len(matches) > 1:
         _ambiguous_name(to, matches)
@@ -1848,7 +1990,7 @@ def matching_recipients(
     membership: staff.StaffSnapshot | None = None,
 ) -> RecipientMatches | LocalRosterIncomplete | RecipientSearchFailed:
     """Find rows without delivering or exiting; ask the peer only after a local miss."""
-    import roster
+    from scripts.message import roster
 
     membership = staff.snapshot() if membership is None else membership
     member = resolve_staff_recipient(to, membership, observed=observed.entries)
@@ -1887,16 +2029,31 @@ def resolve_recipient(
     membership: staff.StaffSnapshot | None = None, records: list[sessions.SessionRecord] | None = None,
 ) -> DeliveryRoute:
     """Resolve locally first; a remote row supplies the address sent to its machine."""
+    from scripts.message import roster
+
     membership = staff.snapshot() if membership is None else membership
     problems = observed.diagnostics
 
     def lookup() -> DeliveryRoute:
         nonlocal problems
-        if to.startswith("uds:"):
-            return socket_recipient(to, sessions.live_sessions() if records is None else records, {}, membership=membership)
-        member = resolve_staff_recipient(to, membership, observed=observed.entries)
+        socket_records = (sessions.live_sessions() if records is None else records) if to.startswith("uds:") else []
+        member = resolve_staff_recipient(to, membership, observed=observed.entries, records=socket_records)
         if isinstance(member, RecipientLookupFailed):
             usage_error(member.reason)
+        if (not isinstance(scope, NamedMachine)
+                and isinstance(member, staff.StaffRow) and member.kind == "worker"):
+            from scripts.herdr import worker_panes
+
+            holder = membership.parent_of(member)
+            if holder is not None and (isinstance(holder.worktree, staff.WorktreeUnfilled)
+                                       or holder.worktree.machine == roster.remote.local_machine()):
+                run = worker_panes.worker_run(holder, record=membership)
+                if unit_runs.worker_transport(run) == "herdr":
+                    return PaneWorkerRecipient(member)
+                if to.startswith("worker:") and not _sender_label_matches(to, observed.entries):
+                    return CodexWorkerRecipient(to, member.name, str(run))
+        if to.startswith("uds:"):
+            return socket_recipient(to, socket_records, {}, membership=membership)
         if isinstance(member, staff.StaffRow):
             for anomaly in observed.row_anomalies:
                 if anomaly.row.id == member.id:
@@ -1930,7 +2087,10 @@ def resolve_recipient(
             return RecipientLookupFailed(
                 f"no live Codex daemon has thread {to.removeprefix('codex:')} loaded; checked {checked}")
         if isinstance(member, staff.StaffRow):
-            return ClaudeRecipient(f"session:{member.current_session}")
+            address = f"session:{member.current_session}"
+            if sessions.addressed(address, records or []) is not None:
+                return ClaudeRecipient(address)
+            return QueuedStaffRecipient(address, member.name, str(member.current_session))
         if to.startswith("session:"):
             return ClaudeRecipient(to)
         usage_error(f"no staff row or live session for {to!r}")
@@ -2064,7 +2224,6 @@ def relay(message: Message, timeout: float) -> Result:
     # An inherited CLAUDE_* variable makes the relay pass for the caller's session:
     # CLAUDE_CODE_MESSAGING_SOCKET, for one, is that session's inbox.
     env = {name: value for name, value in os.environ.items() if not name.startswith("CLAUDE")}
-    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
     if not TYPE_CHECKING:
         from scripts.accounts import accounts
         from scripts.whoami.account import named_account_environment
@@ -2085,7 +2244,7 @@ def relay(message: Message, timeout: float) -> Result:
             return Result("queued", f"gpg-agent is cold on {machine()}: run github-warmup there")
         env["CLAUDE_CODE_OAUTH_TOKEN"] = token.stdout.strip()
     command = [sys.executable, "-c", RELAY_EXEC, str(STATE / "relay_senders"), message.sender, *command]
-    code, out, err = run(command, relay_prompt(message), timeout, env, Path.home())
+    code, out, err = run(command, relay_prompt(message), timeout, models_registry.agent_environment(env), Path.home())
     raw = STATE / "relay" / f"{file_name(message.to)}.jsonl"
     raw.parent.mkdir(parents=True, exist_ok=True)
     write_atomic(raw, out + err)
@@ -2253,20 +2412,20 @@ def template_fix_notice(record: dict[str, object]) -> None:
                 return
             if stamp.exists():
                 return
-            _ = stamp.write_text(text_id, encoding="utf-8")
-        recipient = "natedev"
-        try:
-            for line in review.NOTIFY_CONFIG.read_text(encoding="utf-8").splitlines():
-                name, separator, value = line.partition("#")[0].partition("=")
-                if separator and name.strip() == "TEMPLATE_FIX_SESSION" and value.strip():
-                    recipient = value.strip()
-        except OSError:
-            pass
-        text = "Fix registry push " + text_id + " today: it was sent despite failed review.\n" + json.dumps(record, ensure_ascii=False)
-        command = [sys.executable, str(Path(__file__).resolve()), "template-fix-deliver", text_id, recipient, text]
-        # Delivery and its error record run in the detached child.
-        _ = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                             stderr=subprocess.DEVNULL, start_new_session=True)
+            recipient = "natedev"
+            try:
+                for line in review.NOTIFY_CONFIG.read_text(encoding="utf-8").splitlines():
+                    name, separator, value = line.partition("#")[0].partition("=")
+                    if separator and name.strip() == "TEMPLATE_FIX_SESSION" and value.strip():
+                        recipient = value.strip()
+            except OSError:
+                pass
+            text = "Fix registry push " + text_id + " today: it was sent despite failed review.\n" + json.dumps(record, ensure_ascii=False)
+            command = [str(Path(__file__).resolve().parents[1] / "lib/py"), str(Path(__file__).resolve()), "template-fix-deliver", text_id, recipient, text]
+            # Delivery and its error record run in the detached child.
+            _ = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                 stderr=subprocess.DEVNULL, start_new_session=True)
+            write_atomic(stamp, text_id)
     except OSError as error:
         print(f"send.py: template fix notice failed for {text_id}: {error}", file=sys.stderr)
         log_template_fix_error(text_id, str(error))
@@ -2501,8 +2660,7 @@ def reports_auto_mode_refusal(text: str) -> bool:
 
 
 def refusal_report(options: Options) -> rca.Report:
-    """The facts of an auto_mode.refused push: rca.py opens a case for the stopped session with them,
-    with the waits sentence the alert showed and the alert's sender and key."""
+    """Open a case for the session with refused commands, the waits sentence, and the alert's sender and key."""
     values = {key: item for key, _, item in (value.partition("=") for value in options.values)}
     return rca.Report(values["session"], values["machine"], "auto_mode", options.commands,
                       waits=values["waits_line"].strip().removesuffix("."), source=options.sender or "",
@@ -2539,8 +2697,9 @@ def parse(argv: list[str]) -> Options:
     parser = argparse.ArgumentParser(prog="send.py",
                                      description=(
                                          "Send one message to a roster name, uds:<path>, "
-                                         "session:<id>, worker:<run id>/<worker name>, "
-                                         "codex:<thread id>, or user."
+                                         "session:<id>, codex:<thread id>, or user. "
+                                         "Use worker:<unit>/<worker> for a pane worker. "
+                                         "Use worker:<run id>/<worker name> for a run pinned to mesh."
                                      ),
                                      formatter_class=argparse.RawDescriptionHelpFormatter,
                                      epilog="Also: send.py ack KEY | reopen KEY | pending [NAME]\n\n"
@@ -2551,7 +2710,9 @@ def parse(argv: list[str]) -> Options:
         required=True,
         help=(
             "a roster name, uds:<path>, session:<id>, "
-            "worker:<run id>/<worker name>, codex:<thread id>, or user"
+            "codex:<thread id>, or user. "
+            "Use worker:<unit>/<worker> for a pane worker. "
+            "Use worker:<run id>/<worker name> for a run pinned to mesh."
         ),
     )
     _ = parser.add_argument("--text-id", default="", help="registered script push")
@@ -2618,7 +2779,7 @@ def parse(argv: list[str]) -> Options:
     if text_id:
         if to != USER:
             parser.error("--text-id goes with --to user")
-        import push_texts
+        from scripts.notify import push_texts
         values: dict[str, str] = {}
         for value in raw_values:
             key, separator, item = value.partition("=")
@@ -2768,7 +2929,7 @@ def body_text(options: Options) -> str:
 
 def sender_shown_name(sender: str, stamp: SenderStamp, observed: roster.Roster) -> str:
     """Resolve the display from the native id without changing reply addresses."""
-    import roster
+    from scripts.message import roster
 
     if isinstance(stamp, UnavailableSender):
         return sender
@@ -2780,7 +2941,7 @@ def sender_shown_name(sender: str, stamp: SenderStamp, observed: roster.Roster) 
 
 def sender_stamp() -> SenderStamp:
     """Read the native sender identity independently of the display name."""
-    import roster
+    from scripts.message import roster
 
     identity = roster.sender_identity(os.environ)
     if isinstance(identity, roster.ClaudeSession):
@@ -2815,19 +2976,7 @@ def read_sender_stamp(value: object) -> SenderStamp:
 def morty_stamp(stamp: SenderStamp) -> bool:
     if isinstance(stamp, UnavailableSender):
         return False
-    config = conf.read("send")
-    # A recovered configuration value cannot grant authority after a missing live key.
-    if not isinstance(config.origin("MORTY_NATIVE_ID", str), conf.UsableLiveValue):
-        return False
-    try:
-        expected = config.text("MORTY_NATIVE_ID")
-        kind, _, identity = expected.partition(":")
-        if kind not in ("session", "codex"):
-            return False
-        _ = staff.native_id(identity)
-    except (conf.Unusable, staff.StaffRefused):
-        return False
-    return expected == sender_native_id(stamp)
+    return morty_identity.matches(sender_native_id(stamp))
 
 
 def sender_stamp_lines(stamp: SenderStamp) -> str:
@@ -2866,18 +3015,64 @@ def delivered_text(message: Message, entry_id: str) -> str:
 
 
 def send(options: Options) -> Result:
+    try:
+        membership = (staff.snapshot() if options.to != USER and isinstance(options.selection, RosterLookup)
+                      else staff.StaffSnapshot(()))
+    except staff.StaffUnreadable as error:
+        usage_error(f"staff lookup for {options.to!r}: {error}")
     if not isinstance(options.recipient_identity, LogicalRecipientIdentity):
-        return _send(options)
+        return _send(options, membership=membership)
     identity = Message(options.recipient_identity.name, options.sender or default_sender(),
                        options.summary or "", "", options.key)
     with delivery_turn(identity) as acquired:
         if not acquired:
             return Result("retry", f"key {options.key!r} has a delivery in progress; retry")
-        return _send(options)
+        return _send(options, membership=membership)
 
 
-def _send(options: Options) -> Result:
-    import roster
+def _prompt_pane(place: HerdrPlace, text: str, *, target: str, timeout: float) -> None:
+    """Submit text and require the selected pane to start a turn."""
+    from scripts.herdr import herdr
+
+    herdr.Herdr(place.session).prompt(
+        place.pane, text, target=target, proof=herdr.SubmitStarts(int(timeout * 1000)))
+
+
+def deliver_worker_text(worker: staff.StaffRow, membership: staff.StaffSnapshot, text: str, *,
+                        sender: str, timeout: float, reason: str = "") -> Result:
+    """Deliver to a proved pane or retain the message through its holder."""
+    from scripts.herdr import worker_panes
+    from scripts.herdr import herdr
+
+    holder = membership.parent_of(worker)
+    if holder is None:
+        return Result("failed", f"{worker.name}: worker holder is unavailable")
+    if not reason:
+        state = next((item for item in worker_panes.observe(holder.id, membership) if item.row.id == worker.id), None)
+        if isinstance(state, worker_panes.OpenWorker) and state.status != herdr.AgentStatus.BLOCKED:
+            try:
+                _prompt_pane(HerdrPlace(herdr.shared_session(), state.pane), text,
+                             target=str(worker.current_session), timeout=timeout)
+                return PaneTextDelivered("sent", f"worker {worker.name} at {state.pane}")
+            except (herdr.HerdrFailure, OSError) as error:
+                reason = str(error)
+        elif state is None:
+            reason = "worker observation is unavailable"
+        elif isinstance(state, (worker_panes.ProcessUnknownWorker, worker_panes.UncertainWorker)):
+            reason = state.reason
+        elif isinstance(state, worker_panes.OpenWorker):
+            reason = "worker is blocked"
+        elif isinstance(state, worker_panes.StoppedWorker):
+            reason = "worker is stopped"
+        else:
+            reason = "worker pane is closed"
+    options = parse(["--here", "--to", f"session:{holder.current_session}", "--from", sender,
+                     "--timeout", str(timeout), "--text", f"Worker {worker.name}: {one_line(reason)}\n{text}"])
+    return _send(options, membership=membership)
+
+
+def _send(options: Options, *, membership: staff.StaffSnapshot) -> Result:
+    from scripts.message import roster
 
     if options.to == USER and not options.text_id:
         return Result("refused", push_texts.TEMPLATE_REQUIRED)
@@ -2890,18 +3085,17 @@ def _send(options: Options) -> Result:
         usage_error("the message is empty")
     first = next(iter(text.strip().splitlines()), options.summary or "")
     summary = options.summary or (first if len(first) <= 60 else first[:59] + "…")
-    try:
-        membership = (staff.snapshot() if options.to != USER and isinstance(options.selection, RosterLookup)
-                      else staff.StaffSnapshot(()))
-    except staff.StaffUnreadable as error:
-        usage_error(f"staff lookup for {options.to!r}: {error}")
     # A forwarded display is authoritative; only recipient lookup may read the receiver's roster.
     needs_recipient_roster = (isinstance(options.selection, RosterLookup) and options.to != USER
                               and not options.to.startswith("uds:") and not isinstance(options.scope, NamedMachine))
     needs_sender_roster = options.to != USER and isinstance(options.shown_sender, SenderNotResolved)
-    running = (sessions.running_sessions() if needs_recipient_roster or needs_sender_roster
-               or (options.to != USER and isinstance(options.selection, RosterLookup)) else [])
-    observed = (roster.roster(os.environ, roster.ThisMachine(), membership=membership, records=running) if needs_recipient_roster or needs_sender_roster
+    reads_registry = (needs_recipient_roster or needs_sender_roster
+                      or (options.to != USER and isinstance(options.selection, RosterLookup)))
+    registry = sessions.read_registry() if reads_registry else sessions.RegistryRead((), ())
+    running = sessions.running_records(registry)
+    if reads_registry:
+        membership = replace(membership, running_sessions=frozenset(record["sessionId"] for record in running))
+    observed = (roster.roster(os.environ, roster.ThisMachine(), membership=membership, registry=registry) if needs_recipient_roster or needs_sender_roster
                 else roster.Roster([], []))
     records = [record for record in running if sessions.messaging_socket_exists(record)]
     if isinstance(options.selection, MeshWorker):
@@ -2914,7 +3108,7 @@ def _send(options: Options) -> Result:
                  else UserDelivery())
     else:
         route = resolve_recipient(options.to, options.scope, observed, membership=membership, records=records)
-    destination = route.address if isinstance(route, SessionRecipient | RemoteDelivery) else options.to
+    destination = route.address if isinstance(route, SessionRecipient | QueuedStaffRecipient | RemoteDelivery) else options.to
     member = resolve_staff_recipient(options.to, membership, records=records, observed=observed.entries)
     if isinstance(member, RecipientLookupFailed):
         usage_error(member.reason)
@@ -2951,13 +3145,14 @@ def _send(options: Options) -> Result:
     held = None if refused else wrong_template(options, "\n".join((summary, text, action_text)))
     cold_check = options.clears_when if options.text_id == "github.keys_cold" else ""
     identity = replace(message, to=stable.value)
-    if isinstance(options.recipient_identity, LogicalRecipientIdentity):
+    if isinstance(options.recipient_identity, LogicalRecipientIdentity) and not emergency:
         skip = None if refused or held is not None else confirmed_skip(identity, window, started, live=live)
         claim_result = RepeatAccepted(skip) if skip is not None else ClaimGranted()
     else:
         claim_result = ClaimGranted() if refused or held is not None else claim(
-            message, stable, window, started, delivery_limit=options.timeout,
-            legacy_aliases=legacy_aliases, live=live, clears_when=cold_check,
+            message, stable, window, started, delivery_limit=send_budget.seconds(options.timeout) if emergency else options.timeout,
+            legacy_aliases=legacy_aliases, live=live, clears_when=options.clears_when if emergency else cold_check,
+            emergency=emergency,
             posted_on=options.scope.host if isinstance(options.scope, NamedMachine) else machine())
     log_route: Route = NO_CLAUDE_ROUTE
     guarded = repeat_guard.Decision()
@@ -2999,6 +3194,21 @@ def _send(options: Options) -> Result:
         result = codex(transport, route.session_dir, options.timeout)
     elif isinstance(route, CodexSessionRecipient):
         result = codex_session(message, route, options.timeout)
+    elif isinstance(route, CodexPaneRecipient):
+        from scripts.herdr import herdr
+
+        try:
+            _prompt_pane(route.place, agent_text(message), target=route.thread_id, timeout=options.timeout)
+            result = Result("sent", f"{route.address} at {route.place.session}:{route.place.pane}")
+        except (herdr.HerdrFailure, OSError) as error:
+            result = Result("failed", str(error))
+    elif isinstance(route, QueuedStaffRecipient):
+        result = Result("queued", f"no live Claude or Codex session answers to {route.name} ({route.session_id}),"
+                        + " so it is kept for it")
+        enqueue(message, result.detail, started, recipient=stable, order=order)
+    elif isinstance(route, PaneWorkerRecipient):
+        result = deliver_worker_text(route.row, membership, agent_text(message),
+                                     sender=message.sender, timeout=options.timeout)
     else:
         claude_started = time.monotonic()
         def relay_and_queue(relay_message: Message, timeout: float) -> Result:
@@ -3047,22 +3257,20 @@ def _send(options: Options) -> Result:
         _ = remove_queued_key(message.to, message.key, recipient=stable, order=order)
         if options.to != message.to:
             _ = remove_queued_key(options.to, message.key, recipient=stable, order=order)
-    if isinstance(options.recipient_identity, LogicalRecipientIdentity):
+    if isinstance(options.recipient_identity, LogicalRecipientIdentity) and not emergency:
         if (not refused and held is None and isinstance(claim_result, ClaimGranted)
                 and result.outcome in {"sent", "queued", "kept", "replaced", "skipped"}):
             record_acceptance(identity, started)
     else:
-        # A failed send can retry. A queue or kept push owns its copy until delivery.
+        # An undelivered emergency releases its claim for a later attempt.
+        # Other queued or kept messages retain their claims until delivery.
         if (key is not None and not refused and held is None and isinstance(claim_result, ClaimGranted)
-                and result.outcome in {"failed", "refused", "held", "pending"}):
+                and ((emergency and result.outcome != "sent")
+                     or result.outcome in {"failed", "refused", "held", "pending"})):
             forget_sent(key, stable.value, started)
         elif (key is not None and not refused and held is None and isinstance(claim_result, ClaimGranted)
               and result.outcome in {"sent", "queued", "kept", "replaced", "skipped"}):
-            accept_sent(key, stable.value, started)
-    if emergency and options.clears_when and key is not None and not cold_check and result.outcome == "sent":
-        posted_on = options.scope.host if isinstance(options.scope, NamedMachine) else machine()
-        record_emergency(Emergency(key=key, sender=sender, check=options.clears_when, machine=posted_on,
-                                   sent=started.isoformat(), expires=(started + emergency_lifetime()).isoformat()))
+            accept_sent(key, stable.value, started, delivered=result.outcome == "sent")
     if message.to == USER and (result.outcome == "failed" or (result.outcome == "held" and isinstance(result.failure, FailedPush))):
         result = user_failure(message, options.action, result, options.need, options.text_id)
     if not options.no_accounting:
@@ -3181,11 +3389,9 @@ def main(argv: list[str]) -> int:
             print(reopen(key))
         case ["pending", *named] if len(named) <= 1:
             try:
-                text = pending(named[0] if named else None)
+                _ = pending(named[0] if named else None, emit=True)
             except ValueError as error:
                 usage_error(str(error))
-            if text:
-                print(text)
         case ["ack" | "reopen" | "pending" | "clear-check" | "drain-sockets", *_]:
             usage_error(f"usage: send.py {argv[0]}" + {"pending": " [NAME]", "clear-check": "",
                          "drain-sockets": ""}.get(argv[0], " KEY"))

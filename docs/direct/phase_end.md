@@ -11,8 +11,8 @@ Pointing files: `commands/unit/direct.md`, `commands/unit/checkpoint.md`,
 `commands/plan/phase_review.md`.
 
 <PhaseEnd>
-Standing plans (`**Standing:** style_plan.py`) run <StandingPlanRefill/> at the
-next boundary instead of closing, even with no todo phase. Skip step 7 (shrink,
+Standing plans (`**Standing:** style_plan.py`) run <StandingPlanRefill/> at the next boundary, even with no todo phase.
+Read `docs/direct/standing_plan_refill.md` for that rule. Skip step 7 (shrink,
 shrink commit and notice); never stage, commit or shrink the excluded plan or
 pinned rule files. A no-change ticket follows <CheckpointCommit/> step 6's
 ancestry-checked HEAD path with no code commit, push or merge request, then
@@ -35,6 +35,13 @@ Run these steps in order for each completed loop or verbose phase:
    Include every `held_for_decision` item as `Held simplify: <id> — <files> — <proposed change>; ledger <path>`.
    Outside a production, report
    `Checkpoint <short hash> — phase N: <title>.`.
+   Start the daily simplify run as a background shell after the code ready notice:
+
+   ```sh
+   bash ~/.claude/scripts/direct/assign.sh --role simplify --session-dir "${SESSION_DIR}" --cwd "${WORKING_DIR}"
+   ```
+
+   The next phase does not wait for this run.
 3. **Plan review.** Run <RunPhaseReview/> before the next phase's Work Order is
    used. A defect found in the committed phase becomes a follow-up phase
    inserted next under `/plan:to_phased_plan` → <PhaseNumbering/> and runs next.
@@ -44,10 +51,9 @@ Run these steps in order for each completed loop or verbose phase:
    open: its `finish-phase` in step 5 waits until this review has finished,
    also beside a running phase.
 4. **Add-on check.** Run <ConsiderNextItems/>.
-5. **Worker cleanup and completion.** Run the worker half of <PhaseCleanup/>:
-   `remove_workers.py`, helpers, launchers, and apps. Run it before the next
-   launch. Per <LongLivedWorkers/>, Codex turns finish but their threads remain
-   open until `end_session.sh`; Claude workers keep their existing cleanup.
+5. **Worker cleanup and completion.** Run the worker half of <PhaseCleanup/> before the next launch.
+   Retain pane workers and their native conversations under <LongLivedWorkers/>.
+   Apply the compatibility cleanup only when the existing run's pin is `mesh`.
    Then run <RecordPhaseCompletion/>, including `finish-phase` and deletion of the
    inactive reservation state file before the next phase writes its own.
 6. **Next launch.** In loop mode or an active auto window with a next phase,
@@ -64,7 +70,7 @@ Run these steps in order for each completed loop or verbose phase:
    turn holding on them. <DispatchContract/> allows this synchronous work after
    launch besides the main review.
 
-When no todo phase remains, run step 7, then <NextPhase/> for <FinalGate/>.
+When no todo phase remains, run step 7, then <NextPhase/> for <FinalGate/> in `docs/direct/final_gate_commit.md`.
 When a <PeriodicCI/> point is due (outside a production), run step 7 before
 step 6, so CI runs on a clean tree; then the CI point, then step 6.
 When a todo phase remains but verbose mode is outside an auto window, run step

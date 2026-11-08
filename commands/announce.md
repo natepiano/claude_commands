@@ -9,7 +9,7 @@ Treat `$ARGUMENTS` as the user's message. Send it without changes. Show the comm
 
 ## Delivery
 
-`python3 ~/.claude/scripts/production/broadcast.py --from <your session name> --all "From the user (via <your session name>, <HH:MM zone>): <message>"`
+`~/.claude/scripts/lib/py ~/.claude/scripts/production/broadcast.py --from <your session name> --all "From the user (via <your session name>, <HH:MM zone>): <message>"`
 
 It reaches every showrunner, unit director, Claude or Codex worker, and freestanding agent on both machines. Each is told everyone has it, so nobody passes it on.
 

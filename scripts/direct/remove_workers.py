@@ -6,6 +6,10 @@ The command keeps transcripts and never removes the caller.
 """
 
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import argparse
 import json
@@ -14,15 +18,19 @@ import shutil
 import subprocess
 import sys
 import time
+from collections.abc import Generator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import TypedDict, cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.agents import worker_lifecycle
-from scripts.production import staff, worker_admission
+from scripts.production import session_staff, staff, worker_admission
 from scripts.lib import unit_runs
 
 CLAUDE_TIMEOUT_SECS = 30
+OWN_RUN_FINISHED = "its run finished this phase"
+DIRECTOR_NOT_LIVE = "unit director is not live"
 
 
 
@@ -69,27 +77,68 @@ def list_sessions(claude: str) -> list[AgentRow] | None:
 
 
 
+def run_workers(run: Path, record: staff.StaffSnapshot) -> set[staff.StaffId]:
+    """Select the run's workers from its roster and dispatch records."""
+    roster = worker_admission.resolve_roster(run, session_staff.read_worker_roster(run / "mesh_roster.json"))
+    launches = [worker_lifecycle.read_json_object(path) for path in run.glob("impl_worker_*.json")]
+    members = {staff.StaffId(str(cast(dict[str, object], entry).get("staff_id", "")))
+               for entry in [*roster.values(), *launches] if isinstance(entry, dict)}
+    state = worker_lifecycle.read_json_object(run / unit_runs.STATE_FILE)
+    passes = state.get("pass", {})
+    fields = cast(dict[str, object], passes) if isinstance(passes, dict) else {}
+    entries = [fields] if "instance_id" in fields else [cast(dict[str, object], item)
+        for item in fields.values() if isinstance(item, dict)]
+    names = {entry.get("worker_name") or entry.get("team_slot") for entry in entries}
+    if names:
+        parent = worker_admission.parent(record, run=run, roster=roster)
+        members.update(row.id for row in record.find(kind="worker", parent=parent.id) if row.name in names)
+    return members
+
+
+@contextmanager
+def _run_owner_read(run: Path) -> Generator[None]:
+    try:
+        yield
+    except (ValueError, staff.StaffUnreadable) as error:
+        print(f"anomaly: {run}: {error}", file=sys.stderr)
+
+
 def removal_targets(own_runs: set[Path], rows: list[AgentRow], *,
                     roots: tuple[Path, ...] | None = None) -> dict[str, str]:
     record = staff.local_snapshot()
-    owners = {worker_admission.parent(record, run=run).id for run in own_runs}
+    owners: set[staff.StaffId] = set()
+    for run in own_runs:
+        with _run_owner_read(run):
+            owners.add(worker_admission.parent(record, run=run).id)
     protected: set[staff.StaffId] = set()
     for run in unit_runs.live_run_folders(time.time(), roots):
-        try:
+        with _run_owner_read(run):
             protected.add(worker_admission.parent(record, run=run).id)
-        except ValueError as error:
-            print(f"anomaly: {run}: {error}", file=sys.stderr)
+    selected: set[staff.StaffId] = set()
+    for run in own_runs:
+        with _run_owner_read(run):
+            selected.update(run_workers(run, record))
+    pane_workers: set[staff.StaffId] = set()
+    for root in unit_runs.run_roots() if roots is None else roots:
+        for pin in root.glob("*/worker_transport"):
+            if unit_runs.worker_transport(pin.parent) == "herdr":
+                with _run_owner_read(pin.parent):
+                    pane_workers.update(run_workers(pin.parent, record))
     listed = {row.get("sessionId", "") for row in rows}
     targets: dict[str, str] = {}
+    reason = OWN_RUN_FINISHED if own_runs else DIRECTOR_NOT_LIVE
     for member in record.find(kind="worker"):
         if not isinstance(record.backends.get(member.id), staff.ClaudeBackend):
             continue
         parent = record.parent_of(member)
         if parent is None or (parent.id not in owners and (parent.current_session in listed or parent.id in protected)):
             continue
-        if parent.id in owners or not own_runs:
+        if (parent.id in owners and member.id in selected) or not own_runs:
+            if member.id in pane_workers:
+                print(f"anomaly: {member.name}: pane worker retained; use worker.py end from its parent", file=sys.stderr)
+                continue
             agent = next((row for row in rows if row.get("sessionId") == member.current_session), None)
-            targets[agent.get("id", member.current_session) if agent is not None else member.current_session] = "unit director is not live"
+            targets[agent.get("id", member.current_session) if agent is not None else member.current_session] = reason
     return targets
 
 
@@ -110,6 +159,27 @@ def main() -> int:
     args = parser.parse_args()
     session_dirs = cast("list[str]", args.session_dir)
     own_runs = {Path(session_dir).resolve() for session_dir in session_dirs if session_dir}
+
+    pane_runs = {run for run in own_runs if unit_runs.worker_transport(run) == "herdr"}
+    pane_code = 0
+    if pane_runs:
+        record = staff.local_snapshot()
+        parents = {worker_admission.parent(record, run=run).id for run in pane_runs}
+        caller = record.by_current_session(staff.runtime_id())
+        if caller is None or caller.kind not in ("unit", "showrunner") or parents != {caller.id}:
+            print("remove_workers: the selected run does not belong to the native caller; nothing removed.", file=sys.stderr)
+            return 2
+        selected = {identity for run in pane_runs for identity in run_workers(run, record)}
+        for member in record.find(kind="worker"):
+            if member.parent != staff.ReportsTo(caller.id) or member.id not in selected:
+                continue
+            result = subprocess.run([sys.executable, str(Path(__file__).resolve().parents[1] / "production/worker.py"),
+                                     "end", member.name], check=False)
+            if result.returncode:
+                pane_code = result.returncode
+        own_runs.difference_update(pane_runs)
+        if not own_runs:
+            return pane_code
 
     claude = claude_bin()
     rows = list_sessions(claude)
@@ -170,7 +240,7 @@ def main() -> int:
 
     if removed == 0 and failed == 0:
         print("remove_workers: no workers to remove.")
-    return 1 if failed else 0
+    return 1 if failed else pane_code
 
 
 if __name__ == "__main__":

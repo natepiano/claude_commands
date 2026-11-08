@@ -12,7 +12,7 @@ The user approved these spending and capacity values on 2026-11-03, all in `conf
 4. `start_min_waiting=2`, `start_after_wait_s=120` and `idle_stop_minutes=15`: the box starts when 2 steps wait 120 s, and stops after 15 idle minutes.
 5. `slots=2`, `slots.hana=4`, `slots.cargo-liner=4` and `build_budget_gib=32`: the slots per repository and the build space.
 
-The user approved `notification_email_file=~/.config/aws-build/notification-email` on 2026-11-03. aws-unit wrote that private file on natedev (mode 0600) from the address the user gave.
+The user approved `notification_email_file=~/.config/aws-build/notification-email` on 2026-11-03. aws wrote that private file on natedev (mode 0600) from the address the user gave.
 The user approved `deployment_price_file=~/.config/aws-build/deployment-price` on 2026-11-03. `deploy.py price` writes the Spot price and its read time there (mode 0600), outside the repository.
 
 The target is live. The user approved go-live on 2026-11-03. The stacks exist in `us-east-2`, and the box is instance `i-0216cf933a26bd1ea`. `offload=on`, and `targets=mac,natedev,aws` lists AWS after natedev. [The runbook](../plans/builds-aws-runbook.md) gives the steps. The source design is [builds-aws-design.md](../plans/builds-aws-design.md). Its Phase 4 (lint with write-back) is not built.
@@ -23,7 +23,7 @@ The target is live. The user approved go-live on 2026-11-03. The stacks exist in
 
 - `mac_test.state_paths(target)` is the one map from a target to its state folder. The Mac keeps `~/.local/state/mac-test`. Every other target uses `~/.local/state/build-targets/<target>/` for claims, locks, block and unreachable backoff.
 - `mac_test.configured_ssh_target(target)` checks every target, the Mac too, against `config/build_targets.conf`. It refuses an unknown or non-ssh name before any state write. `build_hold.py` accepts `target <name>` and `--target <name>`.
-- `offload.repository_identity` returns `KnownRepository(name, key)`. `name` is the source folder name. `key` comes from `repository.repository_key`: the normalized origin URL, else `git-root:<root commit>`, else empty when the repository has no commits. `path_key` encodes it for paths. `target_config.uses_legacy_mac_layout(platform)` is true only for `macos`. The Mac keeps one mirror per source folder name. Linux targets use `~/.local/state/build-target/mirror/<path_key>/<slot>`, with one warm build folder per slot.
+- `offload.repository_identity` returns `KnownRepository(name, key)`. `name` is the source folder name. `repository.repository_key` supplies the normalized origin URL, or `git-root:<root commit>` when no origin exists. The key is empty when the repository has no commits. `path_key` encodes the identity for local claim and affinity files. The Mac keeps `mirror_name`, the source folder name. Linux mirrors use the build queue rule in `config/build_folders.conf`: `~/.local/state/build-target/mirror/<repository>/<target>-s<slot>`. `build_folders.repository_name` joins the policy name and the identity hash. `names.repository_key_length` sets the hash length, which is eight characters. Worktrees and gate copies with the same policy name and identity share one mirror per target and slot. Different identities with the same policy name have separate mirrors.
 - A claim carries a slot. `mac_test.py` allocates it under the target lock from `slots.<repo>`, then `slots`, and prefers the free slot that last ran the same worktree. Affinity grants no ownership. Claim records hold `repo_name`, `repo_key`, `slot` and `cleanup_pending`. Status 13 means cleanup must come before execution.
 - `buildlog sync` pulls from every configured SSH peer. Each peer gives back only its own host folders. `sync.hosts.<target>` in `config/build_targets.conf` is the one host-to-target map. Step records carry `target` (index schema 27). The `ssh_attempts` table (schema 28) keeps target, repository identity, queue time, departure time, slot, outcome and evidence.
 
@@ -81,6 +81,12 @@ An interruption marker reports the instance generation.
 - `aws_target.py tick|start|stop|serve` runs `Controller` under `control_lock`. `AwsCli` is the one AWS CLI adapter. `controller.json` holds the state (`off`, `refused`, `stopped`, `starting`, `running`, `draining`, `stopping`), `generation`, `permitted_generation`, the drain deadline and the capacity backoff.
 - `tick` starts the box for one live pinned waiting step or enough eligible rows in `admission/queue.json`.
   Both paths require guard permission and an ended backoff. Unpinned steps keep their queue thresholds. A drain keeps its deadline (`drain_max_minutes`). The tick also runs `refresh_charges`.
+- Natedev compares the tree's tool versions with `box-tools.json` before it claims a Linux target slot, so a version decline never reaches the box and does not reset the idle timer.
+  The comparison uses only the keys in the saved `versions` map. A missing or unreadable file leaves the probe and runner checks in control. It does not read the saved `instance_id`.
+  A mismatch writes its time to `version-decline-<repository name>` in the target's local state directory. A later attempt without a mismatch removes that file before the claim.
+- `tick` does not count queued or pinned work of a repository for `version_decline_hold_s=3600` after its decline. The controller only reads the file and runs no tool.
+  A job reaches the comparison only after the box is up. So a repository with other tool versions still gets one paid start each hold, about 15 idle minutes.
+  A corrected repository can wait until the hold ends for its own start. It still runs when the box is up for other work.
 - `remote.py` publishes an `AdmissionEnvelope` (target, purpose, generation, decision time, expiry) only after a confirmed guard write. The runner checks it before and after shell preparation. Other Linux targets use `IndependentLinuxExecution` and need no AWS permission.
 - On the box, `RemoteAgent` stops the instance after `idle_stop_minutes` idle and polls IMDSv2 every `interruption_poll_s`. An interrupted slot prints `aws_interrupted=<generation>` once, after `mac_exit` and `mac_cleanup`, and exits with the child status. Offload reads it as `InterruptedTargetRun` and records `ON_NATEDEV` before local work.
 - The controller also stops a running instance after `idle_stop_minutes` without published permission when no target claim remains.
@@ -90,7 +96,17 @@ An interruption marker reports the instance generation.
   The remote service and Linux runner need this config during import.
 - A version refusal names the target, each mismatched tool, both versions, and the file set by `version_pin_file`.
   The verify output and the step attempt record keep this reason.
-- `release_stopped_claims` releases only claims bound to the stopped host and generation, and writes `release-evidence/`.
+- The box has `rustup`, `rustc`, `cargo` and `rustdoc` as rustup proxies. The Nix compiler builds only cargo-mend and cargo-tile. It does not select a job's compiler.
+  The Linux runner keeps the caller PATH after the development shell PATH, then runs `shellHook`.
+  Each job installs its toolchain in the mirror, before the parity checks and the work, in the job's process group.
+  rustup's order selects the toolchain, the same as on natedev: `RUSTUP_TOOLCHAIN`, then the tree's toolchain file. With neither, a plain `x.y.z` version from natedev becomes `RUSTUP_TOOLCHAIN`. Other forms leave it unset, and parity declines the job.
+  The runner passes the step's selected `RUSTUP_TOOLCHAIN` to the disk measurement and cleanup. A toolchain file still applies when that variable is unset.
+  One `flock` per toolchain protects the install. The lock name is `RUSTUP_TOOLCHAIN`, or the file's channel, or the SHA-256 of a file with no channel. A second job waits on the lock and downloads nothing.
+  An install failure declines the attempt with its error text, and the job goes to normal routing.
+  Toolchains stay in `~/.rustup` on `/home`, not in the image. A new volume downloads each version once, about 1.6 GB and 20 s.
+  The probe measures the checkout filesystem and runs no cargo or rustc. It reads nextest and mend through `cargo-nextest` and `cargo-mend`. The runner compares rustc after it enters the mirror.
+- `release_stopped_claims` releases host claims after a confirmed stop or a generation change, and writes `release-evidence/`.
+  A generation change releases only claims with a nonempty older generation and a start time at or before the observation.
 
 ### Status and report
 
@@ -99,7 +115,8 @@ An interruption marker reports the instance generation.
 
 ### Deployment: `deploy.py`, `docs/plans/builds-aws/`
 
-- `deploy.py up --approve-resources` runs price, bootstrap, stacks, scaler-key, Tailscale policy, box join, box configuration, checks, idle stop, activation, and routing proof.
+- `deploy.py up --approve-resources` runs twelve stages.
+  They run in this order: price, bootstrap, stacks, scaler-key, Tailscale policy, box join, box configuration, checks, image, idle stop, activation, and routing proof.
   Each stage checks live state and records its last result and times in `up.json`.
   A retry continues from incomplete stages. The price stage always refreshes the public price.
   The stacks stage preserves the guard, ledger, and retained-volume checks.
@@ -132,7 +149,7 @@ Device names in `config/aws-build-tailscale.json` must equal a machine name (fir
 1. `tailscale-policy` reads `config/aws-build-tailscale.json` and the live policy.
    It resolves the natedev and Mac addresses from local Tailscale status.
    The network rule permits only these addresses on port 22.
-   The SSH rule permits `autogroup:member` as `natepiano`; the network rule still limits access to these devices.
+   The SSH rule permits `autogroup:member` as `natepiano` and `root`; the network rule still limits access to these devices.
    It changes only `tag:build-aws` owners and destination rules.
    It prints each proposed change and uses the policy ETag to prevent concurrent overwrites.
    It refuses mixed destination rules and broad outbound access that requires an unrelated policy change.
@@ -140,24 +157,61 @@ Device names in `config/aws-build-tailscale.json` must equal a machine name (fir
 2. `box-join` checks SSM and the instance's Tailscale identity.
    `box-join` writes the box host keys from Tailscale to `~/.ssh/known_hosts` for the host name and address; box setup refusals show the last stderr line.
    It starts a stopped instance through the existing guarded setup path.
+   If AWS reports `InsufficientInstanceCapacity`, `up` waits `capacity_backoff_s` between start attempts until AWS accepts the start or the user interrupts.
    It creates a single-use, pre-approved key and revokes it after the join attempt.
    SSM disables terminal echo before the helper sends the key through stdin.
    The command reads the key from stdin and writes no key file.
 3. `box-configuration` reads the clean `main` checkout named by `nixos_configuration_directory`.
    It compares `/run/current-system` with the `aws-build` output.
    It builds the output locally and copies the closure with destination substitutes.
+   It waits for `/var/lib/aws-build/bootstrap-complete` before changing the box.
+   It copies the closure and runs the box configuration commands as `root` without `sudo`.
    It holds the controller lock and stops the remote idle service during the copy.
    A bounded poweroff timer protects a failed reconnect.
    A transient systemd unit runs the switch independently of SSH.
    The helper resets the old idle timestamp before it restarts the remote service.
    It waits for the expected system and an active `aws-build-remote` service.
 4. `checks` confirms SSM, the EBS serial under `/home`, ext4, and the remote service.
-   It compares `rustc -V`, `cargo nextest --version`, and `cargo mend --version` in the plain environment on both hosts.
+   It compares `cargo-nextest nextest --version` and `cargo-mend mend --version` in the plain environment on both hosts.
+   It does not compare rustc: each job uses its tree's toolchain.
    Non-interactive SSH uses the box tools from `environment.systemPackages` in `/etc/nixos/hosts/aws-build.nix`.
    The stage reads no other source repository and copies no shell inputs.
    It uses `normalize_tool_version` for both results.
    `box-tools.json` records the instance ID and normalized tool versions.
    Each build still checks the tools inside its own repository shell.
+
+5. `image` saves an image of the configured system before the idle stop proof.
+   It checks the saved system path and the image state before creating an image.
+
+### Box image cache
+
+`image.json` records the image ID, system path, and completed idle stop system proof.
+The image holds the root filesystem and the Nix store.
+The helper excludes the `/dev/sdf` data volume from the image.
+It moves the Tailscale identity and both bootstrap markers to `/home` while the root snapshot starts.
+It restores these items after EC2 reports the root snapshot ID, including after a failed request.
+`image-scrub.json` records the need to restore these items before the scrub starts.
+A rerun restores the items through SSM before it resumes image creation or cleanup.
+The helper deletes the marker only after a successful restore.
+The helper copies each item to a `.partial` path before it renames the complete copy and removes the original.
+The restore removes partial copies before it restores complete copies.
+The moved files leave no live path in the image, but their deleted blocks can stay in the snapshot.
+The image is private and encrypted, and is never shared.
+`down` deletes the Tailscale node, which ends that key.
+The helper holds the controller lock during this operation and stops no service.
+A changed desired system refreshes the image.
+The helper tags both the image and its snapshots with `aws-build-image=true` beside the cost tag.
+The helper waits for the image to become available and removes other images with that ownership tag.
+It lists snapshots with that ownership tag separately and deletes each snapshot outside the current image mappings.
+The stage stays incomplete while either list holds an item to delete.
+A rerun without a restore marker resumes a pending or available image and repeats cleanup without changing the box.
+Only one image remains.
+A 32 GiB root snapshot costs at most $1.60 per month at $0.05 per GB-month.
+`down` keeps the image and its system proof.
+The next `up` selects the available image for a new instance.
+The unchanged bootstrap prepares the new data volume and installs the remote scripts.
+Every stage still runs in the same order.
+A completed idle stop proof also covers a new instance with the same desired system.
 
 `admin_secret_file` names `~/.config/aws-build/admin.gpg` outside the repository, with mode `0600`.
 The encrypted JSON holds `aws_access_key_id`, `aws_secret_access_key`, `tailscale_client_id`, and `tailscale_client_secret`.
@@ -170,7 +224,7 @@ Enter retains a stored value during replacement.
 `price`, `apply`, `setup-start`, and `up` decrypt at the first administrator request.
 `prepare` decrypts only when it must reconcile existing AWS resources.
 `bootstrap` needs no administrator credentials.
-`up` shares one decryption across all eleven stages.
+`up` shares one decryption across all twelve stages.
 The price stage refresh and the live checks require credentials even when every stage reports `present`.
 The policy check uses the same decrypted OAuth client for its token request.
 AWS subprocesses receive the administrator key through their environment without an administrator profile argument.
@@ -228,28 +282,41 @@ The controller activation and routing proof remain separate plan stages.
 
 ### Activation and proof
 
+Configuration, image creation, and the idle stop proof close AWS routing before they change the box.
+Each stage waits without a time limit for AWS jobs that still run.
+Kept claims do not delay the wait.
+A stage with a valid proof leaves routing unchanged.
+Activation opens routing after the idle stop proof.
+An interrupted `up` leaves routing closed until the next `up` reaches activation.
+Jobs use natedev and the Mac while AWS routing stays closed.
+
 1. `idle-stop` observes EC2 until the box stops within `idle_stop_minutes` plus `idle_stop_margin_s`.
    Without a saved proof, the stage waits for pending or stopping instances to reach a stable state.
    It starts a stopped instance through the existing spending checks and waits for health.
    It holds the controller lock so the controller cannot satisfy the proof.
-   Active AWS claims prevent the proof.
+   A job that starts before routing closes resets the proof deadline to the full duration.
    A deadline failure requests an EC2 stop, confirms the stop, and refuses the stage.
 2. `activation` writes `routing.json` under `~/.local/state/build-targets/aws`.
    This record enables routing for the configured AWS settings file.
    The controller and the sender read the same record before the legacy `offload` value.
    The stage enables and starts `aws-target.service` with `systemctl --user`.
    It requires the reviewed AWS registry rows and edits no tracked file.
-3. `routing-proof` runs `verify.sh test aws-routing-proof --target aws --no-cache` in `scripts/aws_target/proof_crate`.
+3. `routing-proof` runs `verify.sh test aws-routing-proof --target aws --no-cache` in a scratch Git repository.
+   The folder uses task `gate:aws-routing-proof`.
+   The next `up` removes a folder left by a dead run.
+   `scripts/aws_target/routing_proof.py` supplies the crate files.
    The crate has its own workspace, no Rust dependencies, and one test that runs the compiler.
    The runner requires `flake.nix` and `flake.lock`, so the crate supplies a small locked shell.
    The `default` shell retains the host tools on PATH.
-   The stage uses the existing `DOC_REPO_TOP` source override to copy only the crate.
+   Git identifies the temporary folder as the source root.
+   The stage deletes the folder after the command ends.
    The crate needs no other source repository.
    The normal queue retains admission, spending, and version checks.
    The stage requires a new successful pinned buildlog step with `target=aws` and `host=aws-build`.
 
 Both proofs record the current instance ID and completion time in `up.json`.
-A replacement instance invalidates both proofs.
+A replacement instance invalidates the routing proof.
+The idle stop proof remains valid when `image.json` records the same desired system.
 A later run skips completed proofs without another idle wait or test.
 A stopped instance retains its completed setup evidence for the same instance ID.
 The price stage still refreshes the public price.
@@ -260,7 +327,7 @@ The price stage still refreshes the public price.
 `deploy.py down --approve-destroy` removes the target in this order.
 
 1. Write disabled `routing.json` and disable `aws-target.service` with `systemctl --user`.
-2. Refuse while an AWS claim remains live.
+2. Refuse while an AWS job still runs. Kept claims do not delay removal.
 3. Save public resource identities in `down.json` before removing any resource.
 4. Delete the tagged `aws-build` Tailscale device and keep the policy rules.
 5. Delete every scaler access key and remove only its credential profile.
@@ -351,7 +418,7 @@ Before CREATE, the helper checks identity-<deployment_id> for a previous reserva
 It verifies the saved DeploymentId and the StackId account before it saves the StackId.
 It resumes the change-set waiter without a second CREATE request.
 
-Existing stack updates preserve the previous Bootstrap when an InstanceId exists. Bootstrap applies only at first boot.
+Existing stack updates preserve the previous Bootstrap and AmiId when an InstanceId exists. These values apply only when the stack creates an instance.
 The box-configuration stage changes a live box.
 
 The helper inspects an UPDATE change set before execution. It refuses protected resource removals and replacements, including conditional replacements.

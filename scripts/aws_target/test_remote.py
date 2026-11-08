@@ -1,20 +1,11 @@
 """Remote permission, interruption, and stop evidence protect AWS work."""
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
-
-if TYPE_CHECKING:
-    from ..lib import process_start as process_identity
-else:
-    from scripts.lib import process_start as process_identity
-
-
 from collections.abc import Callable, Sequence
 from contextlib import nullcontext, redirect_stdout
 import io
 import json
 import os
-import sys
 import time
 from pathlib import Path
 import signal
@@ -23,11 +14,9 @@ from typing import cast, override
 import unittest
 from unittest import mock
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "mac_test"))
-
 from scripts.aws_target import config as settings_config, ledger, remote
 from scripts.aws_target.control_test_support import ControlFixture
-from scripts.lib import conf
+from scripts.lib import conf, process_start as process_identity
 from scripts.mac_test import linux_runner, mac_test
 
 
@@ -213,7 +202,7 @@ class RemoteAgentTests(ControlFixture):
         self.assertEqual(self.stops, [self.clock.now] * 3)
         self.assertEqual(self.signals, [])
 
-    def test_active_groups_read_each_process_once_for_multiple_retained_markers(self) -> None:
+    def test_active_groups_read_old_and_new_mirrors_with_each_process_read_once(self) -> None:
         proc = self.root / "proc"
         process = proc / "808"
         process.mkdir(parents=True)
@@ -221,8 +210,9 @@ class RemoteAgentTests(ControlFixture):
         _ = (process / "stat").write_text("808 (cargo check) " + " ".join(fields))
         environment = process / "environ"
         _ = environment.write_bytes(b"BUILD_TARGET_RUN_TOKEN=first-run\0")
-        for slot, token in ((1, "first-run"), (2, "second-run")):
-            mirror = self.root / f".local/state/build-target/mirror/repository/{slot}"
+        for slot, token, relative in ((1, "first-run", "repository/1"),
+                                      (2, "second-run", "repository-key/aws-s2")):
+            mirror = self.root / ".local/state/build-target/mirror" / relative
             mirror.mkdir(parents=True)
             _ = (mirror / ".linux-run.json").write_text(json.dumps({
                 "pid": 320 + slot, "start_time": 123, "process_group": 320 + slot,
@@ -582,13 +572,12 @@ class ClaimReleaseTests(ControlFixture):
             _ = mac_test.release_stopped_claims(other, evidence)
         self.assertEqual(unrelated.read_bytes(), before)
 
-    def test_stop_evidence_preserves_claims_for_another_host_or_instance_generation(self) -> None:
-        for mismatch in ("host", "generation", "legacy"):
+    def test_stop_evidence_preserves_claims_for_another_host_or_without_a_generation(self) -> None:
+        for mismatch in ("host", "legacy"):
             with self.subTest(mismatch=mismatch):
                 path = self.claim(self.paths)
                 row = cast(dict[str, object], json.loads(path.read_text()))
                 row["remote_host"] = "previous-host" if mismatch == "host" else "aws-build"
-                row["instance_generation"] = "previous-generation" if mismatch == "generation" else "generation-one"
                 if mismatch == "legacy":
                     del row["instance_generation"]
                 _ = path.write_text(json.dumps(row))

@@ -9,6 +9,7 @@ from contextlib import redirect_stderr
 import json
 import os
 import runpy
+import select
 import shutil
 import signal
 import socket
@@ -25,30 +26,27 @@ from pathlib import Path
 from typing import cast, override
 from zoneinfo import ZoneInfo
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.lib import unit_runs
 from scripts.lib.test_models_registry import write_registry
 from scripts.lib.process_group import send_process_group
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "herdr"))
 
 from scripts.lib.socket_test_support import short_socket_directory
 from scripts.production import showrunners, staff
 from scripts.shutdown.remote import local_machine
 from scripts.production.staff_test_support import isolated_staff_file, showrunner_relationship, unit_membership, fixture_member, fixture_runtime_id
-import fake_unit_host
-from fake_unit_host import HostedUnit
-import fake_herdr
-import herdr
-import stall_watch
-from session_pane import HerdrFailure, read_place, agent_status
-import context_usage
-import rca
-from cli_fixture import invoke_cli
-from test_showrunners import stalled_session_reader
-import unit_lookup
+from scripts.production import fake_unit_host
+from scripts.production.fake_unit_host import HostedUnit
+from scripts.herdr import fake_herdr
+from scripts.herdr import herdr
+from scripts.production import stall_watch
+from scripts.production.session_pane import HerdrFailure, read_place, agent_status
+from scripts.hooks import context_usage
+from scripts.message import rca
+from scripts.production.cli_fixture import invoke_cli
+from scripts.production.test_showrunners import stalled_session_reader
+from scripts.production import unit_lookup
 
 
 SCRIPT = Path(__file__).with_name("stall_watch.py")
@@ -75,7 +73,7 @@ DELETE_CALL = {"command": f"rm -f {SAVED}/b1e4yc8b9.txt",
 
 DELETE_REQUEST = "delete its saved tool output b1e4yc8b9.txt, which is outside its allowed folders"
 # unit-one's prompt alert key in the showrunner production, and the retire that cancels its repeats.
-PROMPT_KEY = "stall-watch:prompt:showrunner:unit-one"
+PROMPT_KEY = "stall-watch:prompt:" + fixture_runtime_id("stall-unit:unit-one")
 RETIRE = {"command": "retire", "to": "user", "from": "stall-watch", "key": PROMPT_KEY}
 
 
@@ -112,6 +110,7 @@ class StallWatchTests(unittest.TestCase):
     def __init__(self, methodName: str = "runTest") -> None:
         super().__init__(methodName)
         self.root: Path = Path()
+        self.watches: dict[str, stall_watch.WatchedUnit] = {}
         self.bin: Path = Path()
         self.notifier: Path = Path()
         self.sessions: Path = Path()
@@ -181,7 +180,7 @@ raise SystemExit(1)
         self.fail_file = self.root / "fail-targets.json"
         _ = self.fail_file.write_text("[]")
         _ = (self.root / "stall_watch.conf").write_text("prompt_grace_seconds=0\n")
-        self.config = self.root / "showrunners.json"
+        self.config = self.root / "showrunners.conf"
         self.configure({"showrunner": ["unit-one"]})
         self.addCleanup(self.close_processes)
         executable(self.bin / "ps", "#!/bin/sh\ncat \"$STALL_TEST_PS_FILE\"\n")
@@ -262,18 +261,100 @@ with open(os.environ['STALL_TEST_RCA_LOG'], 'a') as log:
         _ = path.write_text("".join(f"{key}={value}\n" for key, value in values.items()))
         return path
 
+    def test_prompt_alert_seconds_reads_changed_config(self) -> None:
+        path = self.root / "production.conf"
+        self.environment["CONF_DIR"] = str(self.root)
+        self.panes["unit-one"].update(pane=EDIT_PROMPT, agent_status="blocked")
+        _ = path.write_text("# range: 0..\nPROMPT_ALERT_SECONDS=120\n")
+        self.assertEqual(self.tick(START).returncode, 0)
+        self.assertEqual(self.tick(START + 60).returncode, 0)
+        self.assertEqual(self.sent(), [])
+        _ = path.write_text("# range: 0..\nPROMPT_ALERT_SECONDS=30\n")
+        self.assertEqual(self.tick(START + 61).returncode, 0)
+        self.assertTrue(any(item.get("to") == "user" for item in self.sent()))
+
+    def test_migration_retries_interrupted_alert_and_preserves_cancellation(self) -> None:
+        row = unit_membership("showrunner", "unit-one")
+        self.state.mkdir()
+        digest = hashlib.sha256(b"showrunner\0unit-one").hexdigest()
+        stretch = self.state / f"{digest}.json"
+        _ = stretch.write_text('{"since": 17}\n')
+        source = self.state / f"{digest}.prompt.json"
+        old_key = "stall-watch:prompt:showrunner:unit-one"
+        prompt = stall_watch.PromptWait(session_id=unit_session("unit-one"), created=START,
+            key=old_key, since=START - 90, alerted=True, tool="tool", retiring=False)
+        stall_watch.save_prompt(source, prompt)
+        with (mock.patch.multiple(stall_watch, STATE_DIR=self.state),
+              mock.patch.object(subprocess, "run") as send):
+            send.side_effect = [subprocess.CompletedProcess([], 0), OSError("interrupted")]
+            with self.assertRaisesRegex(OSError, "interrupted"):
+                _ = stall_watch.migrate_staff_ids()
+            target = self.state / f"{row.id}.prompt.json"
+            self.assertFalse(source.exists())
+            self.assertEqual(stall_watch.saved_prompt(target), prompt)
+            send.reset_mock(side_effect=True)
+            self.assertEqual(stall_watch.migrate_staff_ids(), 0)
+            self.assertEqual(send.call_count, 2)
+            commands = [cast(list[str], call.args[0]) for call in send.call_args_list]
+            self.assertIn(old_key, commands[0])
+            self.assertIn(PROMPT_KEY, commands[1])
+            expected = {**prompt, "key": PROMPT_KEY}
+            self.assertEqual(stall_watch.saved_prompt(target), expected)
+            before = {path: (path.read_bytes(), path.stat().st_mtime_ns) for path in self.state.iterdir()}
+            send.reset_mock()
+            self.assertEqual(stall_watch.migrate_staff_ids(), 0)
+            send.assert_not_called()
+            self.assertEqual({path: (path.read_bytes(), path.stat().st_mtime_ns)
+                              for path in self.state.iterdir()}, before)
+            self.assertEqual((self.state / f"{row.id}.json").read_text(), '{"since": 17}\n')
+            watch = stall_watch.watched_staff_unit("showrunner", "unit-one", row)
+            self.assertIsNotNone(stall_watch.end_prompt(watch))
+            retire = stall_watch.end_prompt(watch)
+            assert retire is not None
+            self.assertIn(PROMPT_KEY, retire.command)
+
+    def test_migration_lists_an_unmatched_file(self) -> None:
+        self.state.mkdir()
+        orphan = self.state / "unknown.json"
+        _ = orphan.write_text("{}\n")
+        errors = io.StringIO()
+        with mock.patch.object(stall_watch, "STATE_DIR", self.state), redirect_stderr(errors):
+            self.assertEqual(stall_watch.migrate_staff_ids(), 1)
+        self.assertIn(str(orphan), errors.getvalue())
+        self.assertEqual(orphan.read_text(), "{}\n")
+
+    def test_store_keys_survive_a_rename_and_transfer(self) -> None:
+        row = unit_membership("showrunner", "unit-one")
+        parent = showrunner_relationship("receiver")
+        with mock.patch.object(stall_watch, "STATE_DIR", self.state):
+            watch = stall_watch.watched_staff_unit("showrunner", "unit-one", row)
+            before = (watch.stretch_path, watch.prompt_path, PROMPT_KEY)
+            _ = staff.rename(row.id, "renamed")
+            moved = staff.move(row.id, staff.ReportsTo(parent.id))
+            watch = stall_watch.watched_staff_unit("receiver", "renamed", moved)
+            self.assertEqual((watch.stretch_path, watch.prompt_path, watch.prompt_key), before)
+
     def configure(self, runners: dict[str, list[str]], *, stall_minutes: int = 5) -> None:
-        """Give each showrunner an update timer, a production doc and staff rows for its units. The slug is its name."""
-        _ = self.config.write_text(json.dumps({
-            "threshold_percent": 1, "repeat_minutes": 30, "stall_minutes": stall_minutes,
-            "faults_to": "natedev", "always": ["natedev"],
-        }))
+        """Give each showrunner an update timer, a production doc and staff rows for its units. Use the staff name."""
+        _ = self.config.write_text((f"""# range: 0..
+threshold_percent=1
+# range: 0..
+repeat_minutes=30
+# range: 0..
+stall_minutes={stall_minutes}
+faults_to=natedev
+always=natedev
+"""))
         for session, units in runners.items():
             parent = showrunner_relationship(session)
             live_units = [unit for unit in units if unit not in self.retired]
-            intended = {fixture_member("unit", name=unit, parent=parent.id,
-                                       runtime_id=unit_session(unit), worktree=staff.PresentWorktree(
-                                           local_machine(), self.root / "worktrees" / unit)).id for unit in live_units}
+            rows = [fixture_member("unit", name=unit, parent=parent.id,
+                                   runtime_id=unit_session(unit), worktree=staff.PresentWorktree(
+                                       local_machine(), self.root / "worktrees" / unit)) for unit in live_units]
+            intended = {row.id for row in rows}
+            with mock.patch.object(stall_watch, "STATE_DIR", self.state):
+                self.watches.update((unit, stall_watch.watched_staff_unit(session, unit, row))
+                                    for unit, row in zip(live_units, rows))
             for row in staff.snapshot().find(kind="unit", parent=parent.id):
                 if row.id not in intended:
                     _ = staff.set_worktree(row.id, staff.RemovedWorktree(
@@ -306,16 +387,16 @@ with open(os.environ['STALL_TEST_RCA_LOG'], 'a') as log:
         _ = (self.sessions / f"{pid}.json").write_text(json.dumps(record))
         return path
 
-    def production(self, slug: str, units: tuple[str, ...], *, target: str = "",
-                   doc: Path | None = None) -> None:
-        target = target or "session:" + showrunner_relationship(slug).id
-        directory = self.notifier / f"showrunner-{slug}"
+    def production(self, production_name: str, units: tuple[str, ...], *, doc: Path) -> None:
+        owner = showrunner_relationship(production_name)
+        owner = staff.set_doc(owner.id, staff.LiveDoc(local_machine(), doc))
+        directory = self.notifier / f"showrunner-{owner.id}"
         directory.mkdir(exist_ok=True)
         prompt = directory / "prompt"
         _ = prompt.write_text("Run `zsh ~/.claude/scripts/production/unit_status.sh /tmp/status "
                               + f"America/Los_Angeles {' '.join(units)} | cut -c1-400`.\n")
-        check = f"CHECK=zsh /scripts/production/production_check.sh {doc}\n" if doc is not None else ""
-        _ = (directory / "conf").write_text(f"TARGET={target}\nPROMPT_FILE={prompt}\n{check}")
+        check = f"CHECK=zsh /scripts/production/production_check.sh {owner.id}\n"
+        _ = (directory / "conf").write_text(f"TARGET=session:{owner.id}\nPROMPT_FILE={prompt}\n{check}")
 
     def unit(self, name: str) -> tuple[int, Path]:
         child = subprocess.Popen(["sleep", str(TEST_HANG_GUARD_SECS)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -323,7 +404,7 @@ with open(os.environ['STALL_TEST_RCA_LOG'], 'a') as log:
         pane_pid = 10_000 + len(self.panes)
         self.process_rows += [f"{pane_pid} 1 herdr pane", f"{child.pid} {pane_pid} claude --remote-control other-name"]
         pane_id = len(self.panes) + 1
-        self.panes[name] = {"pane": PANE, "id": pane_id, "pid": child.pid, "slug": "showrunner", "label": f"label-of-{name}"}
+        self.panes[name] = {"pane": PANE, "id": pane_id, "pid": child.pid, "name": "showrunner", "label": f"label-of-{name}"}
         socket_path = self.record_session(child.pid, unit_session(name), "different-remote-name")
         # The lookup reads the record itself: it needs the pane the session runs in, and a real socket.
         held = socket.socket(socket.AF_UNIX)
@@ -393,7 +474,7 @@ with open(os.environ['STALL_TEST_RCA_LOG'], 'a') as log:
             if owner is not None and isinstance(owner.parent, staff.ReportsTo):
                 parent = membership.by_id(owner.parent.id)
                 assert parent is not None
-                run_state.update(production=parent.name, unit=f"{owner.name}-unit")
+                run_state[unit_runs.OWNER_FIELD] = owner.id
             _ = (folder / unit_runs.STATE_FILE).write_text(json.dumps(run_state))
         environment = {**self.environment, "STALL_WATCH_NOW_EPOCH": str(at),
                        "STALL_TEST_SEND_TOGETHER": str(together)}
@@ -401,7 +482,7 @@ with open(os.environ['STALL_TEST_RCA_LOG'], 'a') as log:
             wrapper = ("import runpy,sys; from pathlib import Path; from scripts.lib import unit_runs; "
                        + "unit_runs.RUN_ROOT=Path(sys.argv[1]); unit_runs.FORMER_RUN_ROOT=Path(sys.argv[2]); "
                        + "runpy.run_path(sys.argv[3],run_name='__main__')")
-            return subprocess.run([sys.executable, "-c", wrapper, str(self.root / "held"),
+            return subprocess.run([str(Path(__file__).resolve().parents[2] / "scripts/lib/py"), "-c", wrapper, str(self.root / "held"),
                                    str(self.root / "former-held"), str(SCRIPT)], env=environment,
                                   capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
         # Keep herdr.run_program, its sanitized environment, and every parser.
@@ -438,7 +519,7 @@ with open(os.environ['STALL_TEST_RCA_LOG'], 'a') as log:
     def stop_unit(self) -> Path:
         """Stop the fixture's unit through the real cancellation boundary; return its isolated launch file."""
         from scripts.shutdown import stop_resume
-        import pane_record
+        from scripts.shutdown import pane_record
         with (mock.patch.object(pane_record, "RECORD_DIR", self.root / "launches"),
               mock.patch("scripts.production.stall_watch.STATE_DIR", self.state),
               mock.patch.object(stop_resume, "_stop", return_value=stop_resume.NotRunning("204f532d-a97a-59e7-a6a7-caf86af3f5ee"))):
@@ -465,7 +546,7 @@ with open(os.environ['STALL_TEST_RCA_LOG'], 'a') as log:
         return cast(dict[str, str], cast(object, next(item["values"] for item in reversed(self.sent())
                                                      if "values" in item)))
 
-    def tell_prompt_owner(self, at: int) -> None:
+    def tell_prompt_owner(self, at: float) -> None:
         before = len(self.prompt_notices())
         self.assertEqual(self.tick(at).returncode, 0)
         notices = self.prompt_notices()
@@ -520,7 +601,7 @@ with open(os.environ['STALL_TEST_RCA_LOG'], 'a') as log:
         self.assertEqual(self.sent(), [])
         self.assertIn("inspected showrunner/unit-one: running", result.stdout)
         saved = cast(dict[str, object], json.loads(
-            (self.state / stall_watch.stretch_path("showrunner", "unit-one").name).read_text()))
+            self.watches["unit-one"].stretch_path.read_text()))
         self.assertEqual(saved["since"], START + 600)
         _ = self.process_rows.pop()
         self.assertEqual(self.tick(START + 601).returncode, 0)
@@ -533,7 +614,7 @@ with open(os.environ['STALL_TEST_RCA_LOG'], 'a') as log:
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertNotIn("inspected showrunner/unit-one:", result.stdout)
         self.assertEqual(self.sent(), [])
-        self.assertFalse((self.state / stall_watch.stretch_path("showrunner", "unit-one").name).exists())
+        self.assertFalse(self.watches["unit-one"].stretch_path.exists())
 
     def test_replacement_director_uses_the_recorded_director_of_the_held_run(self) -> None:
         _ = self.moved_director_run()
@@ -562,7 +643,7 @@ with open(os.environ['STALL_TEST_RCA_LOG'], 'a') as log:
         _ = self.unit("unit-two")
         self.configure({"showrunner": ["unit-one", "unit-two"]})
         self.assertEqual(self.tick(START).returncode, 0)
-        path = self.state / stall_watch.stretch_path("showrunner", "unit-one").name
+        path = self.watches["unit-one"].stretch_path
         saved = path.read_bytes()
         scan = unit_runs.held_by_session
         damaged = self.root / "history/runs/unit-one.jsonl"
@@ -583,7 +664,9 @@ with open(os.environ['STALL_TEST_RCA_LOG'], 'a') as log:
         self.assertIn("run unknown", lines[0])
         self.assertIn("inspected showrunner/unit-two: idle bump requested", result.stdout)
         self.assertEqual(len(self.sent()), 2)
-        self.assertTrue(all("unit-two" in item["key"] for item in self.sent()))
+        self.assertEqual({item["key"] for item in self.sent()},
+                         {f"stall-watch:{unit_session('unit-two')}:{START}:bump",
+                          f"stall-watch:{unit_session('unit-two')}:{START}:tell"})
 
     def test_one_director_read_per_folder_serves_multiple_units(self) -> None:
         _ = self.unit("unit-two")
@@ -673,40 +756,50 @@ with open(os.environ['STALL_TEST_RCA_LOG'], 'a') as log:
         self.assertEqual(self.sent(), [])
 
     def test_one_tick_reads_run_records_once_across_productions_and_units(self) -> None:
-        import stall_watch
+        from scripts.production import stall_watch
         from scripts.production import showrunners
-        import unit_lookup as lookup
+        from scripts.production import unit_lookup as lookup
         runners: list[showrunners.Showrunner] = []
         marked: dict[str, dict[str, lookup.LabeledSession]] = {}
-        for slug in ("first", "second"):
-            doc = self.root / f"{slug}-production.md"
-            _ = doc.write_text(f"# Production\n- **Production slug:** {slug}\n")
-            runners.append(showrunners.Showrunner(session=slug, socket="/fixture.sock",
-                            slug=slug, zone="UTC", doc=str(doc)))
-            marked[slug] = {}
+        for production_name in ("first", "second"):
+            doc = self.root / f"{production_name}-production.md"
+            _ = doc.write_text(f"# Production\n- **Production name:** {production_name}\n")
+            runners.append(showrunners.Showrunner(session=production_name, socket="/fixture.sock",
+                            name=production_name, zone="UTC", doc=str(doc)))
+            marked[production_name] = {}
             for name in ("alpha", "beta"):
-                row = unit_membership(slug, name)
-                marked[slug][name] = lookup.LabeledSession(name, lookup.ClaudeNotRunning(), lookup.Place("fixture", name),
+                row = unit_membership(production_name, name)
+                marked[production_name][name] = lookup.LabeledSession(name, lookup.ClaudeNotRunning(), lookup.Place("fixture", name),
                                                      identity=lookup.LiveSession(row.current_session))
 
-        def labeled_sessions(slug: str, *, record: staff.StaffSnapshot) -> dict[str, lookup.LabeledSession]:
-            del record
-            return marked[slug]
         with (mock.patch.dict(os.environ, self.environment),
               mock.patch.object(stall_watch, "processes", return_value=[]),
               mock.patch.object(stall_watch, "STATE_DIR", self.state),
               mock.patch.object(showrunners, "load_settings", return_value={}),
               mock.patch.object(showrunners, "registered_showrunners", return_value=showrunners.ShowrunnerDiscovery(runners)),
-              mock.patch.object(lookup, "labeled_sessions", side_effect=labeled_sessions),
+              mock.patch.object(lookup, "every_labeled_session", return_value=lookup.LabeledProductions(marked)) as scans,
               mock.patch.object(unit_runs, "held_by_session", wraps=unit_runs.held_by_session) as reads,
               mock.patch.object(stall_watch, "forget", return_value=None) as forget,
               mock.patch.object(stall_watch, "send_all") as send):
             _ = stall_watch.tick(START)
+            scans.assert_called_once_with(record=mock.ANY)
             reads.assert_called_once_with()
             self.assertEqual(forget.call_count, 4)
             send.assert_called_once_with(
                 [], START, deadline=mock.ANY,
                 limits=stall_watch.sender_limits(stall_watch.watch_config(packaged_only=True)))
+
+    def test_a_failed_session_scan_ends_the_tick_and_the_next_tick_scans_again(self) -> None:
+        with (mock.patch.object(unit_lookup, "every_labeled_session", side_effect=OSError("fixture scan failed")) as scans,
+              mock.patch.object(showrunners, "registered_showrunners") as discovery):
+            first = self.tick(START)
+            second = self.tick(START + 60)
+        self.assertEqual(scans.call_count, 2)
+        discovery.assert_not_called()
+        for result in (first, second):
+            self.assertIn("fixture scan failed", result.stderr)
+            self.assertNotIn("inspected ", result.stdout)
+        self.assertEqual(self.sent(), [])
 
     def test_a_stalled_discovery_keeps_prompt_work_and_returns_by_the_pass_deadline(self) -> None:
         self.panes["unit-one"]["agent_status"] = "blocked"
@@ -732,12 +825,11 @@ with open(os.environ['STALL_TEST_RCA_LOG'], 'a') as log:
     def test_failed_production_discovery_still_alerts_the_healthy_production(self) -> None:
         self.assertEqual(self.tick(START).returncode, 0)
         self.configure({"aaa-stalled": [], "showrunner": ["unit-one"]})
-        self.production("aaa-stalled", (), target="session:stalled-id",
-                        doc=self.root / "aaa-stalled-production.md")
+        stalled = showrunner_relationship("aaa-stalled")
         original = showrunners.socket_for
 
         def lookup(target: str, *, deadline: float) -> str | None:
-            if target == "session:stalled-id":
+            if target == f"session:{stalled.current_session}":
                 raise TimeoutError("fixture lookup timed out; retained")
             return original(target, deadline=deadline)
 
@@ -852,7 +944,7 @@ with open(os.environ['STALL_TEST_RCA_LOG'], 'a') as log:
                         result = self.tick(START + 300 + pass_number)
                     self.assertEqual(result.returncode, 0, result.stderr)
                     self.assertLessEqual(clock[0], 100.0)
-                    slow = self.state / (hashlib.sha256(b"showrunner\0unit-one").hexdigest() + ".json")
+                    slow = self.state / (unit_session("unit-one") + ".json")
                     self.assertEqual(slow.read_bytes(), saved[slow])
                     if pass_number == 0:
                         self.assertEqual(reads, ["w1:p1"])
@@ -1139,9 +1231,8 @@ with open(os.environ['STALL_TEST_RCA_LOG'], 'a') as log:
         self.assertEqual(len(self.prompt_notices()), 2)
 
     def test_stop_retires_a_transferred_units_current_production_key(self) -> None:
-        import pane_record
+        from scripts.shutdown import pane_record
         from scripts.shutdown import pane_record as staff_launches
-        import herdr
 
         self.configure({"showrunner": ["unit-one"], "receiver": []})
         row = unit_membership("showrunner", "unit-one")
@@ -1159,9 +1250,9 @@ with open(os.environ['STALL_TEST_RCA_LOG'], 'a') as log:
                 ["claude", "-n", "unit-one"])
             pane_record.write("agents", launch)
             self.state.mkdir()
-            path = stall_watch.prompt_path("receiver", "unit-one")
+            path = stall_watch.watched_staff_unit("receiver", "unit-one", row).prompt_path
             stall_watch.save_prompt(path, stall_watch.PromptWait(
-                session_id="204f532d-a97a-59e7-a6a7-caf86af3f5ee", created=START, key="stall-watch:prompt:receiver:unit-one",
+                session_id="204f532d-a97a-59e7-a6a7-caf86af3f5ee", created=START, key=PROMPT_KEY,
                 since=START, alerted=True, tool="tool", retiring=False))
             stall_watch.retire_session_prompt("204f532d-a97a-59e7-a6a7-caf86af3f5ee")
             self.assertTrue(path.exists())
@@ -1171,7 +1262,7 @@ with open(os.environ['STALL_TEST_RCA_LOG'], 'a') as log:
             stall_watch.send_all(pending.deliveries, START)
             stall_watch.finish_cancellations(pending.requests)
             self.assertFalse(path.exists())
-        self.assertEqual(self.sent(), [{**RETIRE, "key": "stall-watch:prompt:receiver:unit-one"}])
+        self.assertEqual(self.sent(), [{**RETIRE, "key": PROMPT_KEY}])
 
     def test_a_resume_during_a_running_tick_retires_the_observation_then_observes_the_new_prompt(self) -> None:
         self.environment["CLAUDE_CODE_SESSION_ID"] = ""
@@ -1447,7 +1538,7 @@ with open(os.environ['STALL_TEST_RCA_LOG'], 'a') as log:
         self.assertEqual(len(self.prompt_notices()), 1)
 
     def test_the_request_is_read_from_the_prompt_at_the_bottom_of_the_pane(self) -> None:
-        import stall_watch
+        from scripts.production import stall_watch
         self.assertEqual(stall_watch.prompt_request(EDIT_PROMPT), "edit panes.py")
         self.assertEqual(stall_watch.prompt_request(BASH_PROMPT),
                          "run a shell command to read lines 5 to the end of a saved output")
@@ -1457,7 +1548,7 @@ with open(os.environ['STALL_TEST_RCA_LOG'], 'a') as log:
         self.assertEqual(stall_watch.prompt_request("— holding: waiting\n"), "go on with its work")
 
     def test_the_request_skips_the_auto_deny_banner(self) -> None:
-        import stall_watch
+        from scripts.production import stall_watch
         self.assertEqual(stall_watch.prompt_request(AUTO_DENY_PROMPT),
                          "run a shell command to read lines 5 to the end of a saved output")
         self.assertTrue(stall_watch.auto_denied(AUTO_DENY_PROMPT))
@@ -1466,7 +1557,7 @@ with open(os.environ['STALL_TEST_RCA_LOG'], 'a') as log:
         self.assertFalse(stall_watch.auto_denied(quoted))
 
     def test_the_request_comes_from_the_pending_tool_call_in_the_transcript(self) -> None:
-        import stall_watch
+        from scripts.production import stall_watch
         call = stall_watch.PendingTool("toolu_1", "Bash", dict(DELETE_CALL), START)
         # A Bash call reads as its command with each path shown by its file name, never as its description,
         # also when the screen shows a description or the outside warning.
@@ -1479,7 +1570,7 @@ with open(os.environ['STALL_TEST_RCA_LOG'], 'a') as log:
         self.assertEqual(stall_watch.prompt_request(EDIT_PROMPT, other), "edit panes.py")
 
     def test_a_wrapped_prompt_with_the_outside_warning_reads_as_a_whole_sentence(self) -> None:
-        import stall_watch
+        from scripts.production import stall_watch
         self.assertEqual(stall_watch.prompt_request(OUTSIDE_PROMPT),
                          DELETE_REQUEST)
         # Without the warning, the wrapped description is the request, joined into one sentence.
@@ -1518,9 +1609,7 @@ with open(os.environ['STALL_TEST_RCA_LOG'], 'a') as log:
         self.assertEqual(len(self.prompt_notices()), 2)
 
     def prompt_state(self) -> Path:
-        import stall_watch
-        with mock.patch.object(stall_watch, "STATE_DIR", self.state):
-            return stall_watch.prompt_path("showrunner", "unit-one")
+        return self.watches["unit-one"].prompt_path
 
     def alerted_at_a_prompt(self) -> None:
         """A zero-grace fixture tells the owner and alerts at the same threshold."""
@@ -1594,7 +1683,7 @@ with open(os.environ['STALL_TEST_RCA_LOG'], 'a') as log:
         # which `rca.py fixed` retires it by.
         self.assertEqual((case["stopped"], case["alert_source"], case["alert_key"], case["waits"]),
                          (datetime.fromtimestamp(START - 60, ZoneInfo("UTC")).isoformat(), "stall-watch",
-                          "stall-watch:prompt:showrunner:unit-one", ""))
+                          PROMPT_KEY, ""))
         owner = self.owner_messages()
         self.assertEqual([(item["to"], item["from"], item["key"]) for item in owner],
                          [(f"uds:{self.root / '54c9fdb8-6dfc-55dd-8242-a523c2e9f81f.sock'}", "rca", "rca-261006-1")])
@@ -1685,10 +1774,10 @@ with open(os.environ['STALL_TEST_RCA_LOG'], 'a') as log:
             self.panes["unit-one"]["agent_status"] = "blocked"
             self.panes["unit-one"]["pane"] = BASH_PROMPT
             _ = self.tick(START + 180)
-            _ = self.tick(START + 180 + stall_watch.PROMPT_ALERT_SECONDS - 1)
+            _ = self.tick(START + 180 + stall_watch.prompt_alert_seconds() - 1)
             self.assertEqual(self.prompt_followups()[1:], [RETIRE])
-            self.tell_prompt_owner(START + 180 + stall_watch.PROMPT_ALERT_SECONDS)
-            retry = self.tick(START + 180 + stall_watch.PROMPT_ALERT_SECONDS)
+            self.tell_prompt_owner(START + 180 + stall_watch.prompt_alert_seconds())
+            retry = self.tick(START + 180 + stall_watch.prompt_alert_seconds())
         self.assertIn("rca: no case opened: OSError: case disk unavailable", retry.stderr)
         self.assertEqual([item["key"] for item in self.prompt_followups()], [PROMPT_KEY, PROMPT_KEY, PROMPT_KEY])
         self.assertEqual(self.prompt_followups()[1], RETIRE)
@@ -1712,8 +1801,8 @@ with open(os.environ['STALL_TEST_RCA_LOG'], 'a') as log:
         self.assertEqual(len(self.prompt_notices()), 2)
 
     def test_a_helpers_pending_bash_call_names_its_command_cut_to_90_characters(self) -> None:
-        import stall_watch
-        import push_texts
+        from scripts.production import stall_watch
+        from scripts.notify import push_texts
         helpers = self.projects / "project" / "204f532d-a97a-59e7-a6a7-caf86af3f5ee" / "subagents"
         helpers.mkdir(parents=True)
         _ = (self.projects / "project" / "204f532d-a97a-59e7-a6a7-caf86af3f5ee.jsonl").write_text(
@@ -1767,14 +1856,14 @@ with open(os.environ['STALL_TEST_RCA_LOG'], 'a') as log:
         _ = transcript.write_text("".join(json.dumps(entry) + "\n" for entry in entries))
         os.utime(transcript, (START - 3600, START - 3600))
 
-    def test_near_compaction_waits_bump_except_holds_naming_outside_parties(self) -> None:
+    def test_only_blocked_turns_bump_near_compaction_and_other_waits_reset_the_stretch(self) -> None:
         self.configure({"showrunner": ["unit-one"]}, stall_minutes=10)
         blocked = "— blocked: my context is full; it compacts on the next turn"
         window = 283_800
         trigger = context_usage.trigger_tokens(window)
         threshold = context_usage.handoff_threshold(window)
         self.assertEqual(trigger, 250_800)
-        # The shared boundary, the real accounts reading, the trigger and over it; every waiting kind.
+        # Blocked turns wake at the threshold, the accounts reading, the trigger and above the trigger.
         for status, tokens in [(blocked, tokens) for tokens in (threshold, 245_621, trigger, trigger + 1)] + [
                 (f"— {kind}: waiting", threshold) for kind in ("done", "gate", "decision")] + [
                 ("— holding: until 18:00", threshold),
@@ -1784,17 +1873,17 @@ with open(os.environ['STALL_TEST_RCA_LOG'], 'a') as log:
                 self.panes["unit-one"]["pane"] = pane
                 self.write_context_usage(tokens, window=window)
                 self.state.mkdir(exist_ok=True)
-                path = self.state / stall_watch.stretch_path("showrunner", "unit-one").name
+                path = self.watches["unit-one"].stretch_path
                 stretch = stall_watch.Stretch(pane_hash=hashlib.sha256(pane.strip().encode()).hexdigest(), since=START - 601,
                     bump_sent=False, tell_sent=False, reported_status="")
                 _ = path.write_text(json.dumps(stretch))
                 self.assertEqual(self.tick(START).returncode, 0)
-                holding = "your" in status
-                self.assertEqual(len(self.sent()), 0 if holding else 2)
+                wakes = status == blocked
+                self.assertEqual(len(self.sent()), 2 if wakes else 0)
                 self.assertEqual(self.tick(START + 600).returncode, 0)
                 sent = self.sent()
-                self.assertEqual(len(sent), 0 if holding else 2)
-                if holding:
+                self.assertEqual(len(sent), 2 if wakes else 0)
+                if not wakes:
                     self.assertEqual(sent, [])
                 else:
                     tell, = [item for item in sent if item["key"].endswith(":tell")]
@@ -1805,10 +1894,10 @@ with open(os.environ['STALL_TEST_RCA_LOG'], 'a') as log:
                     self.assertIn("54c9fdb8-6dfc-55dd-8242-a523c2e9f81f.sock", tell["to"])
                     self.assertIn(f"Last status: {status}", tell["text"])
                 saved = cast(stall_watch.Stretch, json.loads(path.read_text()))
-                self.assertEqual(saved["since"], START - 601)
-                self.assertEqual(saved["reported_status"], status)
-                self.assertEqual(saved["bump_sent"], not holding)
-                self.assertEqual(saved["tell_sent"], not holding)
+                self.assertEqual(saved["since"], START - 601 if wakes else START + 600)
+                self.assertEqual(saved["reported_status"], status if wakes else "")
+                self.assertEqual(saved["bump_sent"], wakes)
+                self.assertEqual(saved["tell_sent"], wakes)
                 self.send_log.unlink(missing_ok=True)
                 path.unlink()
 
@@ -1913,7 +2002,7 @@ with open(os.environ['STALL_TEST_RCA_LOG'], 'a') as log:
                 self.send_log.unlink(missing_ok=True)
                 # The recording ps fixture models the unit's worker launcher, then its termination.
                 director_pid = self.children[0].pid
-                self.process_rows.append(f"{director_pid + 1} {director_pid} implement.sh running")
+                self.process_rows.append(f"{director_pid + 1} {director_pid} bash scripts/agents/agent_bg.sh running")
                 for at in (START, START + 300):
                     result = self.tick(at)
                     self.assertEqual(result.returncode, 0, result.stderr)
@@ -1933,12 +2022,12 @@ with open(os.environ['STALL_TEST_RCA_LOG'], 'a') as log:
                 self.assertIn(f"Last status: {status}", tell["text"])
 
     def test_malformed_owner_captures_preserve_other_units_and_pending_deliveries(self) -> None:
-        self.configure({"showrunner": ["unit-one", "bad-unit", "following-unit"]})
-        _ = self.unit("bad-unit")
-        _ = self.unit("following-unit")
-        for name in ("unit-one", "following-unit"):
+        self.configure({"showrunner": ["unit-one", "bad", "following"]})
+        _ = self.unit("bad")
+        _ = self.unit("following")
+        for name in ("unit-one", "following"):
             self.panes[name]["pane"] = PANE
-        self.panes["bad-unit"]["pane"] = "holding: waiting on the showrunner\n"
+        self.panes["bad"]["pane"] = "holding: waiting on the showrunner\n"
         for pattern in (r"\bwaiting\b(?P<owner>never)?", r"\bwaiting\b(?P<owner>)", r"\bwaiting\b"):
             with self.subTest(pattern=pattern):
                 _ = self.watch_settings(prompt_grace_seconds="0", external_wait_pattern=pattern)
@@ -1949,12 +2038,13 @@ with open(os.environ['STALL_TEST_RCA_LOG'], 'a') as log:
                 for at in (START, START + 300):
                     result = self.tick(at)
                     self.assertEqual(result.returncode, 0, result.stderr)
-                    self.assertIn("bad-unit: no bump: invalid status rule", result.stderr)
+                    self.assertIn("bad: no bump: invalid status rule", result.stderr)
                     self.assertIn("external_wait_pattern must capture a nonempty owner", result.stderr)
                 sent = self.sent()
                 self.assertEqual(len(sent), 4)
                 self.assertEqual({item["to"] for item in sent if item["key"].endswith(":bump")},
-                                 {f"uds:{self.root / '204f532d-a97a-59e7-a6a7-caf86af3f5ee.sock'}", f"uds:{self.root / '21fe8b33-87b0-5239-90de-7fe05cc304e1.sock'}"})
+                                 {f"uds:{self.root / (unit_session(name) + '.sock')}"
+                                  for name in ("unit-one", "following")})
                 self.assertEqual(len([item for item in sent if item["key"].endswith(":tell")]), 2)
 
     def test_a_waiting_unit_below_compaction_stays_quiet_and_resets_its_stretch(self) -> None:
@@ -1964,7 +2054,7 @@ with open(os.environ['STALL_TEST_RCA_LOG'], 'a') as log:
         window = 283_800
         self.write_context_usage(context_usage.handoff_threshold(window) - 1, window=window)
         self.state.mkdir(exist_ok=True)
-        path = self.state / stall_watch.stretch_path("showrunner", "unit-one").name
+        path = self.watches["unit-one"].stretch_path
         stretch = stall_watch.Stretch(pane_hash=hashlib.sha256(pane.strip().encode()).hexdigest(), since=START - 601,
                                       bump_sent=False, tell_sent=False, reported_status="")
         _ = path.write_text(json.dumps(stretch))
@@ -2138,7 +2228,7 @@ with open(os.environ['STALL_TEST_RCA_LOG'], 'a') as log:
                     if at >= START + 300:
                         self.assertIn("inspected showrunner/unit-one: holding", result.stdout)
                         self.assertEqual(self.sent(), [])
-                        path = self.state / stall_watch.stretch_path("showrunner", "unit-one").name
+                        path = self.watches["unit-one"].stretch_path
                         self.assertFalse(stall_watch.saved_stretch(path)["tell_sent"])
                         self.assertFalse(stall_watch.saved_stretch(path)["bump_sent"])
 
@@ -2283,7 +2373,7 @@ with open(os.environ['STALL_TEST_RCA_LOG'], 'a') as log:
                     self.assertIn("nothing running; bumped", tell["text"])
 
     def test_a_sentence_period_ends_the_units_own_shown_label(self) -> None:
-        self.panes["unit-one"].update(session="agents", label="metrics-unit", pane="holding: metrics-unit.\n")
+        self.panes["unit-one"].update(session="agents", label="metrics", pane="holding: metrics.\n")
         for at in (START, START + 300, START + 600):
             result = self.tick(at)
             self.assertEqual(result.returncode, 0, result.stderr)
@@ -2315,7 +2405,7 @@ with open(os.environ['STALL_TEST_RCA_LOG'], 'a') as log:
         for at in (START, START + 300, START + 600):
             result = self.tick(at)
             self.assertEqual(result.returncode, 0, result.stderr)
-        path = self.state / stall_watch.stretch_path("showrunner", "unit-one").name
+        path = self.watches["unit-one"].stretch_path
         held = stall_watch.saved_stretch(path)
         self.assertEqual(self.sent(), [])
         self.assertFalse(held["tell_sent"])
@@ -2432,7 +2522,7 @@ with open(os.environ['STALL_TEST_RCA_LOG'], 'a') as log:
         self.assertEqual(len(self.sent()), 4)
 
     def test_running_shell_or_worker_launcher_prevents_a_bump(self) -> None:
-        for command in ("bash", "implement.sh"):
+        for command in ("bash", "bash scripts/agents/agent_bg.sh"):
             with self.subTest(command=command):
                 self.state.mkdir(exist_ok=True)
                 for path in self.state.glob("*.json"):
@@ -2465,10 +2555,7 @@ with open(os.environ['STALL_TEST_RCA_LOG'], 'a') as log:
                 self.assertEqual(len(self.sent()), bumps)
                 _ = self.process_rows.pop()
 
-    def test_detached_work_with_a_former_production_mark_prevents_a_bump(self) -> None:
-        doc = self.root / "showrunner-production.md"
-        _ = doc.write_text("## Production Context\n\n- **Formerly:** `old-showrunner`\n\n" + doc.read_text())
-        self.panes["unit-one"]["slug"] = "old-showrunner"
+    def test_detached_work_with_a_native_session_prevents_a_bump(self) -> None:
         worker = subprocess.Popen(MARKED_SLEEPER, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                                   env={**self.environment, "CODEX_THREAD_ID": "", "CLAUDE_CODE_SESSION_ID": unit_session("unit-one")})
         self.children.append(worker)
@@ -2482,12 +2569,10 @@ with open(os.environ['STALL_TEST_RCA_LOG'], 'a') as log:
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual({item["key"].rsplit(":", 1)[-1] for item in self.sent()}, {"bump", "tell"})
 
-    def test_detached_processes_share_one_slug_resolution_per_work_check(self) -> None:
-        import stall_watch
+    def test_detached_processes_use_native_sessions_without_production_name_resolution(self) -> None:
+        from scripts.production import stall_watch
         from scripts.production import showrunners
 
-        doc = self.root / "showrunner-production.md"
-        _ = doc.write_text("## Production Context\n\n- **Formerly:** `old-showrunner`\n\n" + doc.read_text())
         rows = [stall_watch.Process(10, 1, "claude"), stall_watch.Process(20, 1, "build"),
                 stall_watch.Process(21, 1, "build")]
         with (mock.patch.object(showrunners, "NOTIFIER_STATE_DIR", self.notifier),
@@ -2551,7 +2636,7 @@ with open(os.environ['STALL_TEST_RCA_LOG'], 'a') as log:
     def test_defunct_worker_process_does_not_count_as_running_work(self) -> None:
         _ = self.tick(START)
         claude_pid = self.children[0].pid
-        self.process_rows.append(f"999999 {claude_pid} implement.sh <defunct>")
+        self.process_rows.append(f"999999 {claude_pid} bash scripts/agents/agent_bg.sh <defunct>")
         _ = self.tick(START + 300)
         self.assertEqual(len(self.sent()), 2)
 
@@ -2573,7 +2658,9 @@ with open(os.environ['STALL_TEST_RCA_LOG'], 'a') as log:
         self.assertEqual(len(self.sent()), 2)
         _ = self.tick(START + 600)
         self.assertEqual(len(self.sent()), 4)
-        self.assertTrue(any("unit-two" in item["key"] for item in self.sent()))
+        self.assertEqual({item["key"] for item in self.sent()[2:]},
+                         {f"stall-watch:{unit_session('unit-two')}:{START + 300}:bump",
+                          f"stall-watch:{unit_session('unit-two')}:{START + 300}:tell"})
         self.configure({"showrunner": ["unit-one"]})
         self.panes["unit-two"]["pane"] = "— gate: changed\n"
         _ = self.tick(START + 901)
@@ -2585,8 +2672,7 @@ with open(os.environ['STALL_TEST_RCA_LOG'], 'a') as log:
         self.assertEqual(self.tick(START).returncode, 0)
         self.assertEqual(self.tick(START + 600).returncode, 0)
         self.assertEqual(self.sent(), [])
-        import stall_watch
-        self.assertFalse((self.state / stall_watch.stretch_path("showrunner", "unit-one").name).exists())
+        self.assertFalse(self.watches["unit-one"].stretch_path.exists())
         self.states["unit-one"] = "running"
         self.assertEqual(self.tick(START + 601).returncode, 0)
         self.assertEqual(self.sent(), [])
@@ -2596,15 +2682,13 @@ with open(os.environ['STALL_TEST_RCA_LOG'], 'a') as log:
                          {"bump", "tell"})
 
     def test_finished_registry_unit_has_no_notice_or_stretch(self) -> None:
-        import stall_watch
         self.configure_registered({"showrunner": [("unit-one", "run-finished")]})
         self.assertEqual(self.tick(START).returncode, 0)
         self.assertEqual(self.tick(START + 600).returncode, 0)
         self.assertEqual(self.sent(), [])
-        self.assertFalse((self.state / stall_watch.stretch_path("showrunner", "unit-one").name).exists())
+        self.assertFalse(self.watches["unit-one"].stretch_path.exists())
 
     def test_a_retired_unit_is_skipped(self) -> None:
-        import stall_watch
         self.retired.add("unit-one")
         self.configure({"showrunner": ["unit-one"]})
         first = self.tick(START)
@@ -2612,26 +2696,25 @@ with open(os.environ['STALL_TEST_RCA_LOG'], 'a') as log:
         self.assertEqual(first.returncode, 0, first.stderr)
         self.assertEqual(second.returncode, 0, second.stderr)
         self.assertEqual(self.sent(), [])
-        self.assertFalse((self.state / stall_watch.stretch_path("showrunner", "unit-one").name).exists())
+        self.assertFalse(self.watches["unit-one"].stretch_path.exists())
 
     def test_a_unit_named_review_unit_is_bumped(self) -> None:
-        self.configure_registered({"showrunner": [("review-unit", "running")]})
-        _ = self.unit("review-unit")
+        self.configure_registered({"showrunner": [("review", "running")]})
+        _ = self.unit("review")
 
         self.assertEqual(self.tick(START).returncode, 0)
         self.assertEqual(self.tick(START + 600).returncode, 0)
         sent = self.sent()
         self.assertEqual({item["key"].rsplit(":", 1)[-1] for item in sent}, {"bump", "tell"})
-        self.assertTrue(all(item["key"].startswith("stall-watch:review-unit:") for item in sent), sent)
+        self.assertTrue(all(item["key"].startswith(f"stall-watch:{unit_session('review')}:") for item in sent), sent)
 
     def test_finished_units_are_skipped_while_a_running_unit_is_bumped(self) -> None:
-        import stall_watch
         self.configure_registered({"showrunner": [
-            ("build-report-unit", "run-finished"),
-            ("hook-unit", "running"),
-            ("notifier-unit", "run-finished"),
+            ("build-report", "run-finished"),
+            ("hook", "running"),
+            ("notifier", "run-finished"),
         ]})
-        for name in ("build-report-unit", "hook-unit", "notifier-unit"):
+        for name in ("build-report", "hook", "notifier"):
             _ = self.unit(name)
 
         self.assertEqual(self.tick(START).returncode, 0)
@@ -2639,9 +2722,9 @@ with open(os.environ['STALL_TEST_RCA_LOG'], 'a') as log:
         sent = self.sent()
         self.assertEqual(len(sent), 2)
         self.assertEqual({item["key"].rsplit(":", 1)[-1] for item in sent}, {"bump", "tell"})
-        self.assertTrue(all(item["key"].startswith("stall-watch:hook-unit:") for item in sent))
-        for name in ("build-report-unit", "notifier-unit"):
-            self.assertFalse((self.state / stall_watch.stretch_path("showrunner", name).name).exists())
+        self.assertTrue(all(item["key"].startswith(f"stall-watch:{unit_session('hook')}:") for item in sent))
+        for name in ("build-report", "notifier"):
+            self.assertFalse(self.watches[name].stretch_path.exists())
 
     def test_a_marked_session_of_a_unit_the_doc_does_not_list_is_not_watched(self) -> None:
         _ = self.panes.pop("unit-one")
@@ -2723,7 +2806,7 @@ with open(os.environ['STALL_TEST_RCA_LOG'], 'a') as log:
                 pending = [stall_watch.Delivery(old, "retire", [sys.executable,
                     str(self.bin / "send.py"), "retire", "--key", "old-alert"]),
                     stall_watch.Delivery(relay, "bump", [sys.executable, str(self.bin / "send.py"),
-                        "--key", "pending-relay", "--to", "fake-unit", "--text", "pending"])]
+                        "--key", "pending-relay", "--to", "fake", "--text", "pending"])]
                 # The pending retire is independent of process liveness; inspection is not.
                 with (mock.patch.object(stall_watch, "tick", side_effect=bounded_tick),
                       mock.patch.object(stall_watch, "reconcile_prompts", return_value=pending)):
@@ -2807,6 +2890,15 @@ with open(os.environ['STALL_TEST_RCA_LOG'], 'a') as log:
             self.assertEqual(state.read_text(), "saved retire state\n")
             self.assertTrue(pid_file.exists(), "the relay must start its pipe-holding descendant")
             pid = int(pid_file.read_text())
+            try:
+                descriptor = os.pidfd_open(pid)
+            except ProcessLookupError:
+                pass
+            else:
+                try:
+                    _ = select.select([descriptor], [], [], max(0, deadline - time.monotonic()))
+                finally:
+                    os.close(descriptor)
             # A zombie is dead, awaiting the machine's init reaper, and cannot hold pipes.
             status = subprocess.run(["ps", "-p", str(pid), "-o", "stat="],
                 capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
@@ -2840,7 +2932,7 @@ with open(os.environ['STALL_TEST_RCA_LOG'], 'a') as log:
                     pending = [stall_watch.Delivery(retiring, "retire", [sys.executable,
                         str(self.bin / "send.py"), "retire", "--key", "old-alert"]),
                         stall_watch.Delivery(relay, "bump", [sys.executable, str(self.bin / "send.py"),
-                            "--key", "pending-relay", "--to", "fake-unit", "--text", "pending"])]
+                            "--key", "pending-relay", "--to", "fake", "--text", "pending"])]
                     original = stall_watch.tick
                     began = time.monotonic()
                     deadline = began + 5

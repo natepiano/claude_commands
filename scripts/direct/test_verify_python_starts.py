@@ -4,6 +4,9 @@ from __future__ import annotations
 
 from collections import Counter
 import json
+import os
+from pathlib import Path
+import tempfile
 import shutil
 import subprocess
 import sys
@@ -38,7 +41,8 @@ class VerifyPythonStartsTests(VerifyLintCacheFixture):
         # The builds signal-status guard removes one stopped-step query.
         self.assertEqual(counts["tree_watch.py"], 11, rows)
         self.assertEqual(counts["memory_kill.py"], 1, rows)
-        self.assertEqual(len(rows), 59, counts)
+        self.assertEqual(counts["step_context.py"], 1, rows)
+        self.assertEqual(len(rows), 24, counts)
 
     def test_lint_code_key_tracks_inputs_and_clears_unreadable_keys_with_both_hash_tools(self) -> None:
         home = self.root / "key-home"
@@ -105,6 +109,42 @@ class VerifyPythonStartsTests(VerifyLintCacheFixture):
                 environment["LINT_CONFIG_FILE"] = str(self.config)
 
 
+class VerifyOutputRootsTests(unittest.TestCase):
+    def test_metadata_reuse_keeps_the_export_after_a_config_change(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            workspace = Path(temporary).resolve()
+            _ = (workspace / "Cargo.toml").write_text('[workspace]\nmembers = []\n')
+            metadata = json.dumps({"workspace_root": str(workspace), "target_directory": str(workspace / "target")})
+            harness = workspace / "metadata.sh"
+            _ = harness.write_text(
+                'set -euo pipefail\n'
+                + shell_function(VERIFY.read_text(), "set_gate_metadata") + "\n"
+                + shell_function(VERIFY.read_text(), "load_metadata") + "\n"
+                + "cargo() { [[ ${CARGO_FAIL:-0} == 0 ]] || return 1; cat metadata.json; }\n"
+                + 'set_gate_metadata\nprintf "%s\\n" "$BUILDLOG_OUTPUT_ROOTS"\n'
+                + 'mkdir .cargo\nprintf \'[build]\\nbuild-dir = "changed-build"\\n\' > .cargo/config.toml\n'
+                + 'METADATA_READY=0; CMD=doc; ARGS=(); load_metadata\n'
+                + 'printf "reused:%s\\n" "$BUILDLOG_OUTPUT_ROOTS"\n'
+                + 'export BUILDLOG_OUTPUT_ROOTS=stale; CARGO_FAIL=1\n'
+                + 'set_gate_metadata || true\n'
+                + 'printf "failed:%s:%s\\n" "$GATE_METADATA" "$BUILDLOG_OUTPUT_ROOTS"\n')
+            _ = (workspace / "metadata.json").write_text(metadata)
+            environment = {name: value for name, value in os.environ.items()
+                           if not name.startswith(("CARGO_", "BUILDLOG_"))}
+            environment.update({"PY": sys.executable, "VERIFY_START_DIR": str(VERIFY.parent),
+                                "VERIFY_METADATA_SCRIPT": str(VERIFY.with_name("verify_metadata.py"))})
+            result = subprocess.run(["bash", str(harness)], cwd=workspace, env=environment,
+                                    capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            exported, reused, failed = result.stdout.splitlines()
+            evidence, root, target, build = exported.split("\t")
+            self.assertRegex(evidence, r"\A[0-9a-f]{64}\Z")
+            self.assertEqual((root, target, build), (str(workspace), str(workspace / "target"),
+                                                   str(workspace / "target")))
+            self.assertEqual(reused, "reused:" + exported)
+            self.assertEqual(failed, "failed::")
+
+
 class PairedTreeKeyTests(TreeWatchFixture):
     @override
     def setUp(self) -> None:
@@ -157,7 +197,7 @@ printf '%s\\n' "$VERDICT_KEY" "$VERDICT_TREE_KEY"
         self.assert_pair("lint", "sample")
         _ = (self.root / "sample/src/new.rs").write_text("// new source\n")
         self.environment["RUSTFLAGS"] = "-C opt-level=1"
-        self.assert_pair("lint", "--workspace", "--check")
+        self.assert_pair("lint", "", "--check")
         _ = (self.root / "session/lint.conf").write_text("# changed config\n")
         self.assert_pair("lint", "sample")
 

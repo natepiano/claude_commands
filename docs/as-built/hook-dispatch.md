@@ -43,11 +43,13 @@ dispatcher overhead, so every hook keeps its full budget.
 `settings.json`: a dispatched hook file must no longer appear as an entry of
 its own.
 
-`stop-direct-continue.py` has a separate Stop entry with `asyncRewake: true` and a 10 s timeout.
+`stop-direct-continue.py` has a separate Stop entry with `asyncRewake: true` and a 60 s timeout.
 It runs after the turn ends.
-Exit 2 sends its stderr reason to the agent in a system-reminder and starts a new request for compaction.
+Exit 2 sends its stderr reason to the agent in a system-reminder.
 The user sees only "Continuing the unit run".
-The next Stop payload sets `stop_hook_active`, so the hook wakes once only.
+The hook wakes above the threshold only when the final line differs from the last wake.
+The hook permits a stop when the final status matches `paused_status_pattern`.
+Holding and blocked prefixes alone do not prevent the wake.
 The existing guards and declared wait records stay the same.
 
 These hooks stay outside the dispatcher, as their own entries:

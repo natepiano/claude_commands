@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Keep dated copies of a production's LOG, so a LOG emptied by mistake loses at most one update interval.
 
-Usage: log_backup.py <production doc>
+Usage: log_backup.py <production name or staff id>
 
 `production_check.sh` runs this for a running production, and the notifier runs that check once per
 scheduled update tick, so every production is covered with no setup of its own. Copies go to
@@ -12,6 +12,10 @@ An empty or missing LOG is not copied, so an emptied LOG never pushes out a good
 since the newest copy is not copied again, so the copies kept span KEEP changes.
 """
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import os
 import sys
@@ -19,7 +23,6 @@ from datetime import datetime
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from scripts.production.store_owner import document_id
 from scripts.production import staff
 from scripts.lib.atomic_file import write_bytes_atomic
 from scripts.production.production_doc import Refusal, read_production  # noqa: E402
@@ -55,11 +58,11 @@ def backup(log: Path, directory: Path, now: datetime) -> Path | None:
 
 def main(arguments: list[str]) -> int:
     if len(arguments) != 1:
-        print("usage: log_backup.py <production doc>", file=sys.stderr)
+        print("usage: log_backup.py <production name or staff id>", file=sys.stderr)
         return 2
     try:
-        production = read_production(Path(arguments[0]))
-        target = backup(production.log, STATE_DIR / document_id(production.doc) / BACKUPS, datetime.now(production.zone))
+        production = read_production(arguments[0])
+        target = backup(production.log, STATE_DIR / production.owner.id / BACKUPS, datetime.now(production.zone))
     except (Refusal, OSError, staff.StaffRefused, staff.StaffUnreadable) as error:
         print(f"log_backup: {error}", file=sys.stderr)
         return 1

@@ -1,12 +1,16 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
 """Tell a unit's showrunner when its agents spend their usage waiting, or a Codex worker stops compacting.
 
 The collector runs this script after each good pass. By hand:
-`python3 scripts/usage/waste_watch.py [--db PATH] [--production-docs DIR] [--dry-run] [--now ISO]`.
+`~/.claude/scripts/lib/py scripts/usage/waste_watch.py [--db PATH] [--production-docs DIR] [--dry-run] [--now ISO]`.
 Only the default store sends; a run over any other store prints what it would send.
 """
 
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import argparse
 import json
@@ -22,15 +26,14 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import cast
 
-if __package__ in (None, ""):
-    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from scripts.usage import collect, outcomes, usage_report, weights
 from scripts.usage.agents_log import state_dir
 from scripts.usage.usage_report import UnitWorktree
-from scripts.production import session_staff, staff
+from scripts.production import session_staff, showrunners, staff
 from scripts.shutdown import remote
 from scripts.message import send_budget, session_send
+from scripts.lib.codex_models_cache import ModelsCacheUnreadable, read_models_cache
 
 
 WINDOW = timedelta(hours=2)
@@ -40,9 +43,8 @@ WAIT_SHARE_LIMIT = 0.10
 # share; at 10% the waste at the minimum is at least 100K weighted tokens, about five requests, more
 # than the showrunner turn the alert costs.
 MINIMUM_WEIGHTED = 1_000_000
-# Codex compacts workers at 200,000 tokens (codex_mesh.py AUTO_COMPACT_TOKENS), so five requests in
-# a row above 250,000 mean compaction is not happening.
-CONTEXT_LIMIT = 250_000
+# Codex uses each model's compaction limit. Five consecutive requests above that limit trigger an alert.
+# The usage ledger cannot distinguish mesh threads with launch overrides from pane threads.
 CONTEXT_RUN = 5
 WORKER_ROLES = frozenset({"impl", "test", "fix", "review", "worker"})
 ALERT_INTERVAL = timedelta(hours=6)
@@ -68,7 +70,8 @@ class Thread:
 
 @dataclass(frozen=True)
 class ContextRun:
-    longest: int
+    model_limits: dict[str, int]
+    requests: int
     peak: int
 
 
@@ -80,18 +83,48 @@ class ThreadUsage:
     weighted: float
     wait_weighted: float
     wait_actions: dict[str, int]
-    context_run: ContextRun | None
+    context_runs: tuple[ContextRun, ...]
 
     def codex_worker(self) -> bool:
         return self.thread.family == "codex" and (self.role is None or self.role in WORKER_ROLES)
 
     def context_flagged(self) -> bool:
-        return self.context_run is not None and self.codex_worker()
+        return bool(self.context_runs) and self.codex_worker()
 
 
 def row_thread(row: sqlite3.Row) -> Thread:
     return Thread(cast(str, row["machine"]), cast(str, row["family"]), cast(str, row["parent_id"]),
                   cast(str, row["agent_id"]))
+
+
+def model_context_limits() -> dict[str, int]:
+    """Read compaction limits from the Codex models cache. Omit models with unreadable values."""
+    home = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex")
+    try:
+        snapshot = read_models_cache(home / "models_cache.json", retry_delays=())
+    except ModelsCacheUnreadable:
+        return {}
+    limits: dict[str, int] = {}
+    for model in cast(list[object], snapshot["models"]):
+        if not isinstance(model, dict):
+            continue
+        entry = cast(dict[str, object], model)
+        slug = entry.get("slug")
+        window = entry.get("context_window")
+        if window is None:
+            window = entry.get("max_context_window")
+        configured = entry.get("auto_compact_token_limit")
+        if not isinstance(slug, str) or type(window) is not int:
+            continue
+        # Codex 0.166.0: protocol/src/openai_models.rs, ModelInfo::auto_compact_token_limit.
+        # The 95% effective input window does not change this 90% compaction threshold.
+        limit = window * 9 // 10
+        if configured is not None:
+            if type(configured) is not int:
+                continue
+            limit = min(limit, configured)
+        limits[slug] = limit
+    return limits
 
 
 def thread_usage(db: sqlite3.Connection, start: datetime, end: datetime) -> list[ThreadUsage]:
@@ -100,7 +133,7 @@ def thread_usage(db: sqlite3.Connection, start: datetime, end: datetime) -> list
     prefix = f"""
         WITH weight_entries AS ({relation.entries}),
         window_turns AS MATERIALIZED (
-            SELECT t.machine, t.family, t.parent_id, t.agent_id, t.at, t.turn_key, t.role, t.activity,
+            SELECT t.machine, t.family, t.parent_id, t.agent_id, t.at, t.turn_key, t.role, t.activity, t.model,
                    t.wait_action, t.input + t.cache_read AS context, {usage_report.weighted_sql('t')} AS weighted
             FROM turns t LEFT JOIN weight_entries w ON w.weight_entry = {relation.active_entry}
             WHERE t.at >= ? AND t.at < ?)
@@ -125,34 +158,37 @@ def thread_usage(db: sqlite3.Connection, start: datetime, end: datetime) -> list
     """, bounds)):
         thread = row_thread(row)
         actions.setdefault(thread, {})[cast(str, row["wait_action"])] = cast(int, row["requests"])
-    runs: dict[Thread, ContextRun] = {}
-    # Gaps and islands: requests above the limit that are consecutive share one position difference.
+    runs: dict[Thread, list[ContextRun]] = {}
+    # Number all requests first. Unknown models and requests below the limit interrupt a run.
     for row in cast(Iterable[sqlite3.Row], db.execute(prefix + f"""
-        , numbered AS (SELECT *, row_number() OVER (PARTITION BY machine, family, parent_id, agent_id
+        , context_limits AS (SELECT key AS model, value AS context_limit FROM json_each(?)),
+        numbered AS (SELECT *, row_number() OVER (PARTITION BY machine, family, parent_id, agent_id
                                                     ORDER BY at, turn_key) AS position
                        FROM window_turns WHERE family = 'codex'),
         above AS (SELECT *, position - row_number() OVER (PARTITION BY machine, family, parent_id, agent_id
                                                           ORDER BY at, turn_key) AS island
-                  FROM numbered WHERE context > {CONTEXT_LIMIT})
-        SELECT machine, family, parent_id, agent_id, max(requests) AS longest, max(peak) AS peak FROM (
-            SELECT machine, family, parent_id, agent_id, count(*) AS requests, max(context) AS peak
-            FROM above GROUP BY machine, family, parent_id, agent_id, island HAVING count(*) >= {CONTEXT_RUN})
-        GROUP BY machine, family, parent_id, agent_id
-    """, bounds)):
+                  FROM numbered JOIN context_limits USING (model) WHERE context > context_limit)
+        SELECT machine, family, parent_id, agent_id, json_group_object(model, context_limit) AS model_limits,
+               count(*) AS requests, max(context) AS peak
+        FROM above GROUP BY machine, family, parent_id, agent_id, island
+        HAVING count(*) >= {CONTEXT_RUN}
+        ORDER BY machine, family, parent_id, agent_id, island
+    """, (*bounds, json.dumps(model_context_limits())))):
         thread = row_thread(row)
-        runs[thread] = ContextRun(cast(int, row["longest"]), cast(int, row["peak"]))
+        limits = cast(dict[str, int], json.loads(cast(str, row["model_limits"])))
+        runs.setdefault(thread, []).append(ContextRun(limits, cast(int, row["requests"]), cast(int, row["peak"])))
     found: list[ThreadUsage] = []
     for row in totals:
         thread = row_thread(row)
         found.append(ThreadUsage(thread, cast(str | None, row["folder"]), cast(str | None, row["role"]),
                                  cast(float, row["weighted"]), cast(float, row["wait_weighted"]),
-                                 actions.get(thread, {}), runs.get(thread)))
+                                 actions.get(thread, {}), tuple(runs.get(thread, ()))))
     return found
 
 
 @dataclass(frozen=True)
 class Showrunner:
-    slug: str
+    name: str
     # `uds:<socket>`, or empty while the showrunner is not running.
     address: str
     units: tuple[UnitWorktree, ...]
@@ -183,8 +219,9 @@ def registered_showrunners(*, resolver: session_staff.RowResolver | None = None)
         runners = unit_labels.registered_showrunners(diagnostics, membership=record, resolver=resolver)
         for warning in diagnostics.warnings:
             print(f"warning: {warning}", file=sys.stderr)
-        found = tuple(Showrunner(runner["slug"], f"uds:{runner['socket']}" if runner["socket"] else "",
-                                usage_report.document_units(Path(runner["doc"]), resolver=resolver))
+        found = tuple(Showrunner(runner["name"], f"uds:{runner['socket']}" if runner["socket"] else "",
+                                usage_report.document_units(
+                                    showrunners.owner_for(runner["name"], record=record), resolver=resolver))
                       for runner in runners)
         if problems:
             return ShowrunnerLookupFailed("; ".join(problems))
@@ -260,16 +297,18 @@ def alert_text(usage: UnitUsage, start: datetime) -> str:
             lines.append(f"Most common waiting action: {action} ({requests} requests).")
     else:
         lines.append(f"Message from {SENDER}: {usage.unit} has {len(flagged)} Codex worker "
-                     + f"thread{'s' if len(flagged) != 1 else ''} whose context stayed above "
-                     + f"{thousands(CONTEXT_LIMIT)} tokens for {CONTEXT_RUN} or more requests in a row "
-                     + "in the last 2 hours")
+                     + f"thread{'s' if len(flagged) != 1 else ''} above the model compaction limit.")
     if flagged:
-        lines.append(f"Context above {thousands(CONTEXT_LIMIT)} tokens, so compaction is not happening:")
+        lines.append(f"Context exceeded the model compaction limit for {CONTEXT_RUN} or more consecutive requests "
+                     + "in the last 2 hours:")
         for thread in flagged:
-            run = cast(ContextRun, thread.context_run)
-            lines.append(f"- {thread.role or 'unassigned'} {thread.thread.label()}: {run.longest} requests "
-                         + f"in a row, peak {thousands(run.peak)} tokens")
-    lines.append("See more: python3 ~/.claude/scripts/usage/usage_report.py wait_share --by unit,role "
+            for run in thread.context_runs:
+                limits = ", ".join(f"{model}: {thousands(limit)} tokens"
+                                   for model, limit in sorted(run.model_limits.items()))
+                lines.append(f"- {thread.role or 'unassigned'} {thread.thread.label()}: limits {limits}; "
+                             + f"{run.requests} consecutive requests; "
+                             + f"peak {thousands(run.peak)} tokens.")
+    lines.append("See more: ~/.claude/scripts/lib/py ~/.claude/scripts/usage/usage_report.py wait_share --by unit,role "
                  + f"--since {since}")
     return "\n".join(lines)
 
@@ -374,7 +413,7 @@ def watch(db: Path, production_docs: Path, *, now: datetime | None = None, dry_r
         elif runner is None:
             reason = f"no registered showrunner lists unit {usage.unit}"
         elif not runner.address:
-            reason = f"showrunner {runner.slug} is not running"
+            reason = f"showrunner {runner.name} is not running"
         else:
             reason = ""
         if printing:
@@ -386,7 +425,7 @@ def watch(db: Path, production_docs: Path, *, now: datetime | None = None, dry_r
         else:
             sent = send(runner.address, text)
             if isinstance(sent, NotSent):
-                print(f"waste_watch: could not tell {runner.slug}: {sent.reason}; alert for the journal:\n{text}")
+                print(f"waste_watch: could not tell {runner.name}: {sent.reason}; alert for the journal:\n{text}")
                 continue
         alerts[usage.unit] = moment.isoformat()
         changed = True

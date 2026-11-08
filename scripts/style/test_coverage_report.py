@@ -2,13 +2,12 @@
 
 from __future__ import annotations
 
-from ledger_test_support import ticket_owner_id
+from scripts.style.ledger_test_support import ticket_owner_id
 
 import json
 import os
 import sqlite3
 import subprocess
-import sys
 import tempfile
 import unittest
 from contextlib import closing
@@ -18,11 +17,11 @@ from typing import TypedDict, cast, final, override
 from unittest import mock
 from zoneinfo import ZoneInfo
 
-import coverage_report
-import rules
-import style_ledger
-import style_rules
-from scripts.production.staff_test_support import isolated_staff_file, recorded_showrunner, unit_membership
+from scripts.style import coverage_report
+from scripts.style import rules
+from scripts.style import style_ledger
+from scripts.style import style_rules
+from scripts.production.staff_test_support import fixture_member, isolated_staff_file, recorded_showrunner, unit_membership
 
 
 @dataclass(frozen=True)
@@ -97,6 +96,8 @@ class CoverageReportTests(unittest.TestCase):
         for source in self.sources:
             self.write(source, "pub fn value() -> u32 { 1 }\n")
         self.tip = self.commit("Create report workspace")
+        _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
+        _ = fixture_member("showrunner", name="report")
 
     def git(self, *arguments: str) -> str:
         return subprocess.run(
@@ -131,7 +132,7 @@ class CoverageReportTests(unittest.TestCase):
 
     def report(self, *arguments: str, success: bool = True) -> subprocess.CompletedProcess[str]:
         result = subprocess.run(
-            [sys.executable, str(Path(__file__).with_name("coverage_report.py")),
+            [str(Path(__file__).resolve().parents[1] / "lib/py"), str(Path(__file__).with_name("coverage_report.py")),
              "--repo", str(self.repo), *arguments],
             check=False, capture_output=True, text=True,
         )
@@ -160,7 +161,7 @@ class CoverageReportTests(unittest.TestCase):
                                "value", "count", definition.blob, "40001").finding_id
 
     def staff_units(self, *units: str) -> None:
-        doc = self.root / "sample-style/docs/sample-style-production.md"
+        doc = self.repo / ".git/tool-based-ui-production.md"
         doc.parent.mkdir(parents=True, exist_ok=True)
         _ = doc.write_text("# Style production\n- **Kind:** style\n- **Branch point:** main\n")
         _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
@@ -173,19 +174,19 @@ class CoverageReportTests(unittest.TestCase):
         self.sync()
         with style_ledger.open_ledger(self.repo) as ledger:
             self.assertEqual(set(coverage_report.production(ledger, self.tip).units), {
-                "sample-style-names-unit", "sample-style-types-unit",
-                "sample-style-values-unit", "sample-style-modules-unit",
+                "sample-style-names", "sample-style-types",
+                "sample-style-values", "sample-style-modules",
             })
-            self.staff_units("names-unit", "sample-style-types-unit", "feature-unit")
+            self.staff_units("names", "sample-style-types", "feature")
             self.assertEqual(coverage_report.production(ledger, self.tip).units,
-                             ("names-unit", "sample-style-types-unit"))
+                             ("names", "sample-style-types"))
 
     def test_report_finds_a_moved_ticket_by_the_declared_full_unit_id(self) -> None:
         rule = self.rule("read")
         self.sync()
-        self.staff_units("names-unit")
+        self.staff_units("names")
         with style_ledger.open_ledger(self.repo) as ledger:
-            ledger.ticket_add("1", ticket_owner_id("names-unit"), "read", "names", "crates/alpha",
+            ledger.ticket_add("1", ticket_owner_id("names"), "read", "names", "crates/alpha",
                               list(self.sources[:2]), [rule])
             ledger.ticket_assign("1", "main")
             from scripts.production import staff
@@ -198,9 +199,9 @@ class CoverageReportTests(unittest.TestCase):
     def test_report_shows_each_widened_path_of_an_open_ticket_under_its_line(self) -> None:
         rule = self.rule("read")
         self.sync()
-        self.staff_units("names-unit")
+        self.staff_units("names")
         with style_ledger.open_ledger(self.repo) as ledger:
-            ledger.ticket_add("1", ticket_owner_id("names-unit"), "read", "names", "crates/alpha",
+            ledger.ticket_add("1", ticket_owner_id("names"), "read", "names", "crates/alpha",
                               list(self.sources[:2]), [rule])
             ledger.ticket_assign("1", "main")
             database = ledger.database
@@ -421,7 +422,7 @@ class CoverageReportTests(unittest.TestCase):
         selected = self.rule("selected")
         other = self.rule("other")
         self.sync()
-        units = ("names-unit", "sample-style-names-unit", "other-style-names-unit", "types-unit")
+        units = ("names", "sample-style-names", "other-style-names", "types")
         self.staff_units(*units)
         with style_ledger.open_ledger(self.repo) as ledger:
             for number, rule in enumerate((selected, selected, selected, other), start=1):
@@ -445,13 +446,13 @@ class CoverageReportTests(unittest.TestCase):
     def test_crate_filter_limits_cells_and_prints_the_oldest_open_ticket(self) -> None:
         read = self.rule("read")
         self.sync()
-        self.staff_units("names-unit", "sample-style-names-unit", "types-unit")
+        self.staff_units("names", "sample-style-names", "types")
         for path in self.sources[:2]:
             self.record(read, path)
         with style_ledger.open_ledger(self.repo) as ledger:
-            for identity, unit, crate in (("1", "names-unit", "alpha"), ("2", "sample-style-names-unit", "alpha"), ("2001", "types-unit", "beta")):
+            for identity, unit, crate in (("1", "names", "alpha"), ("2", "sample-style-names", "alpha"), ("2001", "types", "beta")):
                 with mock.patch.object(style_ledger, "_now", return_value=(
-                    "2026-10-01T12:00:00+00:00" if unit == "names-unit" else "2026-10-02T12:00:00+00:00"
+                    "2026-10-01T12:00:00+00:00" if unit == "names" else "2026-10-02T12:00:00+00:00"
                 )):
                     ledger.ticket_add(identity, ticket_owner_id(unit), "read", "names", "crates/" + crate,
                                       [f"crates/{crate}/src/lib.rs"], [read])

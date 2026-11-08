@@ -11,11 +11,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import TypedDict, cast
 
-from compare import CLASSES, ComparisonReport, DirectorComparison, DifferenceEstimate, TurnClassStatistics
-from phases import PhaseComparison, PhaseReport, PhaseRow
-from turns import RECORDED_ZONE
+from scripts.model_study.compare import CLASSES, ComparisonReport, DirectorComparison, DifferenceEstimate, TurnClassStatistics
+from scripts.model_study.phases import PhaseComparison, PhaseReport, PhaseRow
+from scripts.model_study.turns import RECORDED_ZONE
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
-from user_zone import user_zone  # noqa: E402
+from scripts.lib.user_zone import user_zone  # noqa: E402
 
 # The deadline was set as a Pacific wall time. It is shown in the user's zone.
 SAMPLE_DEADLINE_PDT = datetime(2026, 10, 7, 10, 30, tzinfo=RECORDED_ZONE)
@@ -467,7 +467,7 @@ def message(comparison: ComparisonReport, phases: PhaseReport, extracted: Extrac
     dropped = sum(sum(session["dropped"].values()) for session in extracted["sessions"])
     since = [since_pooled_line(history)] if not isinstance(history, NotRecorded) else []
     measures = measure_lines(comparison)
-    lines = [f"From model-study-unit: {kind} director model study — {verdict(comparison, phases)}.",
+    lines = [f"From model-study: {kind} director model study — {verdict(comparison, phases)}.",
              *measures, *since,
              "Verdict:", *verdict_lines(comparison, phases), "Per-director comparison:"]
     table = director_table(comparison, phases)

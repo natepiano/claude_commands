@@ -2,19 +2,21 @@
 
 from __future__ import annotations
 
+from scripts.shutdown import remote
+
 import json
 import os
 import shutil
 import socket
 import subprocess
 import sys
-import tempfile
 import unittest
 from collections.abc import Generator
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import cast
+from scripts.lib.socket_test_support import short_socket_directory
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.production import staff
 from scripts.production.staff_test_support import fixture_member, fixture_runtime_id, fixture_worker, isolated_staff_file, recorded_unit
@@ -56,7 +58,7 @@ class DirectorWaitFixture:
 
 @contextmanager
 def director_wait_fixture() -> Generator[DirectorWaitFixture]:
-    with tempfile.TemporaryDirectory(dir="/tmp/claude") as temporary, ExitStack() as resources:
+    with short_socket_directory("turn-wait-") as temporary, ExitStack() as resources:
         root = Path(temporary)
         run = root / "run"
         run.mkdir()
@@ -85,11 +87,11 @@ def director_wait_fixture() -> Generator[DirectorWaitFixture]:
         document = root / "wait-production.md"
         _ = document.write_text("Fixture production\n")
         _ = (notifier / "conf").write_text(
-            f"TARGET=session:{SHOWRUNNER_SESSION}\nCHECK=zsh /scripts/production_check.sh {document}\n")
+            f"TARGET=session:{SHOWRUNNER_SESSION}\nCHECK=zsh /scripts/production_check.sh expected-showrunner\n")
         staff_environment: dict[str, str] = {}
         resources.enter_context(isolated_staff_file(root / "staff.json", staff_environment))
         _ = fixture_member("showrunner", name="expected-showrunner",
-                           runtime_id=SHOWRUNNER_SESSION, doc=staff.LiveDoc("natedev", document))
+                           runtime_id=SHOWRUNNER_SESSION, doc=staff.LiveDoc(remote.local_machine(), document))
         _ = recorded_unit("expected-showrunner", "fixture-unit", root, document, plan="plan.md")
         sessions = root / "sessions"
         sessions.mkdir()
@@ -105,8 +107,7 @@ def director_wait_fixture() -> Generator[DirectorWaitFixture]:
         _ = session_lookup.write_text("\n".join((
             "import runpy, sys",
             "from pathlib import Path",
-            f"sys.path.insert(0, {str(HOOKS.parents[1])!r})",
-            f"sys.path.insert(0, {str(HOOKS)!r})",
+            f"with open({str(HOOKS.parent / 'lib/package_root.py')!r}) as package_root: exec(package_root.read(), {{'__file__': package_root.name}})",
             "from scripts.message import sessions",
             "from unittest.mock import patch",
             "read_sessions = sessions.live_sessions",
@@ -155,7 +156,7 @@ class DirectorTurnWaitHookTests(unittest.TestCase):
 
     def test_supplier_wait_only_finishes_on_its_current_address(self) -> None:
         for final_line, sender, address in (
-            ("blocked: waiting on the showrunner to merge", "showrunner:wait-production", "/fixture/showrunner/socket"),
+            ("blocked: waiting on the showrunner to merge", "showrunner:expected-showrunner", "/fixture/showrunner/socket"),
             ("blocked: waiting on claude-build-followups-other", "claude-build-followups-other", "socket-1"),
             ("blocked: waiting on session:peer-1", "session:peer-1", "socket-1"),
         ):

@@ -47,22 +47,20 @@ else:
         records.mkdir()
         path = records / "call.json"
         _ = path.write_text(json.dumps(dict(v=1, call_id="call", pid=42, proc_start="123", repo=str(root),
-            kind="test", package=None, runs_on={"kind": "mac_allowed"}, state="waiting_hold", updated="now")))
+            kind="test", package=None, eligible_targets=["mac", "natedev"], runs_on={"kind": "any_target", "mac_targets": ["mac"]}, state="waiting_hold", updated="now")))
         return path
 
     def test_each_record_verb_avoids_heavy_imports_in_a_fresh_process(self) -> None:
-        for verb in ("write", "state", "remove", "stopped"):
+        for verb in ("write", "stopped"):
             with self.subTest(verb=verb), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
                 path = self.fixture(root)
                 arguments = [verb, "--call-id", "call"]
                 if verb == "write":
                     path.unlink()
-                    arguments += ["--pid", "42", "--kind", "lint", "--runs-on", "ssh_allowed",
+                    arguments += ["--pid", "42", "--kind", "lint", "--runs-on", "any_target",
                                   "--eligible-targets", "studio,natedev", "--mac-targets", "studio",
                                   "--pinned-target", "studio", "--state", "waiting_ssh"]
-                elif verb == "state":
-                    arguments += ["on_mac"]
                 elif verb == "stopped":
                     log = root / "logs" / socket.gethostname().split(".")[0]
                     log.mkdir(parents=True)
@@ -75,33 +73,13 @@ else:
                     row = cast(dict[str, object], json.loads(path.read_text()))
                     self.assertEqual(row["eligible_targets"], ["studio", "natedev"])
                     self.assertEqual(row["pinned_target"], "studio")
-                elif verb == "state":
-                    self.assertEqual(json.loads(path.read_text())["state"], "on_mac")
-                elif verb == "remove":
-                    self.assertFalse(path.exists())
                 else:
                     self.assertEqual((root / "consumed").read_text(), "event\n")
                     repeated = self.invoke(root, arguments)
                     self.assertEqual(repeated.returncode, 1, repeated.stderr)
 
-    def test_stale_or_unreadable_owner_refuses_state_without_record_changes(self) -> None:
-        for content in ("missing", "42 (verify) S " + "0 " * 18 + "456 0\n", "broken"):
-            with self.subTest(content=content), tempfile.TemporaryDirectory() as directory:
-                root = Path(directory)
-                path = self.fixture(root)
-                before = path.read_bytes()
-                stat = root / "proc/42/stat"
-                if content == "missing":
-                    stat.unlink()
-                else:
-                    _ = stat.write_text(content)
-                result = self.invoke(root, ["state", "--call-id", "call", "on_mac"])
-                self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
-                self.assertIn("step refused", result.stderr)
-                self.assertEqual(path.read_bytes(), before)
-
     def test_bad_syntax_and_help_reach_argparse_before_any_record_change(self) -> None:
-        for verb in ("write", "state", "remove", "stopped"):
+        for verb in ("write", "stopped"):
             for extra, status in ((["--unknown"], 2), (["--help"], 0)):
                 with self.subTest(verb=verb, extra=extra), tempfile.TemporaryDirectory() as directory:
                     root = Path(directory)
@@ -120,7 +98,7 @@ else:
                 path = self.fixture(root)
                 before = path.read_bytes()
                 arguments = ["write", "--call-id", "call", "--pid", "42", "--kind", "lint",
-                             "--runs-on", "mac_allowed", "--state", "waiting_hold", flag, value]
+                             "--runs-on", "any_target", "--state", "waiting_hold", flag, value]
                 result = self.invoke(root, arguments)
                 self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
                 self.assertIn("step refused", result.stderr)

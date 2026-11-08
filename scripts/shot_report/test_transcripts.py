@@ -5,7 +5,6 @@ from __future__ import annotations
 import json
 import pickle
 import subprocess
-import sys
 import tempfile
 import unittest
 from dataclasses import asdict, replace
@@ -1166,7 +1165,7 @@ class TranscriptTest(unittest.TestCase):
             state_dir = Path(directory)
             result = subprocess.run(
                 [
-                    sys.executable, str(Path(__file__).parent / "shot_report.py"), "scan",
+                    str(Path(__file__).resolve().parents[1] / "lib/py"), str(Path(__file__).parent / "shot_report.py"), "scan",
                     "--state-dir", str(state_dir),
                     "--claude-root", str(CLASSIFY / "claude" / "projects"),
                     "--codex-root", str(CLASSIFY / "codex" / "sessions"),

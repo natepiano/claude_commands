@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
 """Keep a cargo project's target directory under a size budget.
 
 invoke.sh's run() starts `lint sweep` in the background after every build
@@ -152,6 +152,10 @@ test binaries. A running app counts too, so its target waits for it to exit.
 """
 
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import fcntl
 import hashlib
@@ -178,47 +182,42 @@ from functools import cache, cached_property
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, TypeGuard, cast, overload, override
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.message import send_budget, send_result
 from scripts.message.session_send import session_send_argv
 from scripts.lib import file_lock
 from scripts.lib.file_lock import PROC_LOCKS as PROC_LOCKS
-import conf
-from cargo_target_config import (
+from scripts.lib import conf
+from scripts.lib.cargo_target_config import (
     CargoFolderSetting,
     cargo_folder_settings,
     cargo_home_folder,
     cargo_workspace_manifest,
 )
-from process_failure import failure_detail
-from user_zone import user_zone  # noqa: E402
+from scripts.lib.process_failure import failure_detail
+from scripts.lib.user_zone import user_zone  # noqa: E402
 if TYPE_CHECKING:
-    from . import tmp_sweep
-    from ..copies import copies
-    from ..lib import scratch
-    from ..lib.atomic_file import write_text_atomic
-    from ..buildlog import index as build_index, record, store
-    from ..notify.push_texts import RenderedPush
-    from ..notify import review
+    from scripts.lint import tmp_sweep
+    from scripts.copies import copies
+    from scripts.lib import scratch
+    from scripts.lib.atomic_file import write_text_atomic
+    from scripts.buildlog import index as build_index, record, store
+    from scripts.notify.push_texts import RenderedPush
+    from scripts.notify import review
 else:
-    sys.path.insert(0, str(Path(__file__).resolve().parent))
-    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
     from scripts.copies import copies
     from scripts.lint import tmp_sweep
-    import scratch
-    from atomic_file import write_text_atomic
-    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "buildlog"))
-    import record
-    import store
-    import index as build_index
+    from scripts.lib import scratch
+    from scripts.lib.atomic_file import write_text_atomic
+    from scripts.buildlog import record
+    from scripts.buildlog import store
+    from scripts.buildlog import index as build_index
 
 from scripts.lib.conf import UseConfiguredValue
 from scripts.lib import copy_record
 from scripts.lib.cargo_output import CargoOutputRoots, CargoOutputUnavailable, read_cargo_output_roots
 from scripts.mac_test import floor_claims
 from scripts.mac_test.mirror_root import MacMirrorRoot
-from build_shape import AbsoluteRecordedRoot, RecordedOutputRoots, recorded_output_roots
+from scripts.lint.build_shape import AbsoluteRecordedRoot, RecordedOutputRoots, recorded_output_roots
 
 GIB = 1 << 30
 MIB = 1 << 20
@@ -354,9 +353,12 @@ FLOOR_FILESYSTEM: ContextVar[FilesystemFloor | UseConfiguredValue] = ContextVar(
 
 
 def on_floor_filesystem(path: str) -> bool:
-    """Keep paths on the current floor filesystem."""
+    """Keep paths on the current floor filesystem. A missing target is on no filesystem."""
     filesystem = FLOOR_FILESYSTEM.get()
-    return not isinstance(filesystem, FilesystemFloor) or output_device(path) == filesystem.device
+    try:
+        return not isinstance(filesystem, FilesystemFloor) or output_device(path) == filesystem.device
+    except FileNotFoundError:
+        return False
 
 
 def cargo_output_cache_path() -> Path:
@@ -1244,13 +1246,8 @@ def holder_sessions(pids: Sequence[int]) -> dict[int, str]:
     """The live Claude session each pid runs under: the nearest ancestor a session record names."""
     if not pids:
         return {}
-    if TYPE_CHECKING:
-        from ..message import process_table
-        from ..message.sessions import live_sessions
-    else:
-        sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "message"))
-        import process_table
-        from sessions import live_sessions
+    from scripts.message import process_table
+    from scripts.message.sessions import live_sessions
     try:
         table = process_table.snapshot()
     except (OSError, subprocess.CalledProcessError):
@@ -1939,6 +1936,14 @@ def recoverable_trim(target: str, cause: Literal["budget take", "floor take"], s
             TRIM_TAKES.reset(token)
 
 
+def stamp_newer(root: str, moment: float) -> bool:
+    """Return whether the use stamp is newer than moment. A missing stamp returns False."""
+    try:
+        return os.stat(os.path.join(root, USE_STAMP)).st_mtime > moment
+    except FileNotFoundError:
+        return False
+
+
 def recover_pending_trims(locked_targets: Sequence[str] = (), *,
     lint_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
 ) -> None:
@@ -1970,8 +1975,7 @@ def recover_pending_trims(locked_targets: Sequence[str] = (), *,
                                 break
                         if not acquired:
                             continue
-                        if any(os.path.exists(os.path.join(root, USE_STAMP))
-                               and os.stat(os.path.join(root, USE_STAMP)).st_mtime > take.at for root in roots):
+                        if any(stamp_newer(root, take.at) for root in roots):
                             continue
                     trees = [tree for root in roots for tree in _build_trees(root, tree_depth, lint_settings=lint_settings)]
                     trees = output_lock_trees(roots, trees, [entry.path for entry in take.pending])
@@ -3136,11 +3140,7 @@ def send_floor_alert(message: str, channels: FloorAlertChannels, *,
     scripts = Path(__file__).resolve().parents[1]
     command: list[str] = []
     if channels is FloorAlertChannels.NATEDEV_AND_PHONE:
-        if TYPE_CHECKING:
-            from ..notify.push_texts import RenderedPush, user_send_argv
-        else:
-            sys.path.insert(0, str(scripts / "notify"))
-            from push_texts import RenderedPush, user_send_argv
+        from scripts.notify.push_texts import RenderedPush, user_send_argv
 
         if not isinstance(phone, RenderedPush):
             raise ValueError("phone channel requires a rendered disk alert")
@@ -3153,7 +3153,7 @@ def send_floor_alert(message: str, channels: FloorAlertChannels, *,
     if not command:
         return FloorAlertDelivery(natedev, FloorChannelOutcome.NOT_ATTEMPTED)
     if not TYPE_CHECKING:
-        import review
+        from scripts.notify import review
     try:
         result = subprocess.run(command, input=None, text=True, capture_output=True,
                                 timeout=send_budget.user_seconds(review.user_send_seconds()))
@@ -3167,13 +3167,8 @@ def send_floor_alert(message: str, channels: FloorAlertChannels, *,
     return FloorAlertDelivery(natedev, FloorChannelOutcome.FAILED)
 
 
-if TYPE_CHECKING:
-    from ..build_hold import build_hold
-    from ..message import sessions
-else:
-    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "build_hold"))
-    import build_hold
-    import sessions
+from scripts.build_hold import build_hold
+from scripts.message import sessions
 
 
 @dataclass(frozen=True)
@@ -3295,6 +3290,7 @@ class MacFloor:
     roots: tuple[str, ...]
     claims: floor_claims.LockedClaims
     mirror: Path
+    leased_mirrors: frozenset[Path] = frozenset()
 
     def allows(self, target: str) -> bool:
         path = Path(target)
@@ -3316,7 +3312,9 @@ class MacFloor:
         result: dict[str, TargetUse | LockHeld] = {}
         paths = tmp_sweep.lsof_paths(tuple(str(Path(root).expanduser().resolve()) for root in self.roots))
         for root in targets:
-            if not self.allows(root) or self.claims.holds(root, self.mirror) or isinstance(paths, tmp_sweep.ProcessUsesUnavailable):
+            if (not self.allows(root) or self.claims.holds(root, self.mirror)
+                    or any(Path(root).resolve().is_relative_to(mirror.resolve()) for mirror in self.leased_mirrors)
+                    or isinstance(paths, tmp_sweep.ProcessUsesUnavailable)):
                 result[root] = LockHeld("Mac claim or process use is busy or unreadable")
             else:
                 for path, pid, how in paths.paths:
@@ -3443,7 +3441,10 @@ def filesystem_floors(floor: int, targets: Sequence[str], *, lint_settings: conf
         path = os.path.realpath(os.path.expanduser(path))
         if not os.path.isdir(path):
             continue
-        device = output_device(path)
+        try:
+            device = output_device(path)
+        except FileNotFoundError:
+            continue
         _ = devices.setdefault(device, [])
         _ = probes.setdefault(device, path)
         if path in targets:
@@ -3612,6 +3613,7 @@ def _hold_floor_pass(floor: int, dry_run: bool, *,
     outcome = FloorOutcome(tmp_sweep.SkippedSweepAssessment())
     protected: tuple[tuple[str, int], ...] = ()
     detail = ""
+    mirror_leases = ExitStack()
     try:
         if isinstance(planned_at, UseConfiguredValue):
             planned_at = time.time()
@@ -3671,6 +3673,11 @@ def _hold_floor_pass(floor: int, dry_run: bool, *,
         hold_targets = (build_hold_targets(targets, known_trees, lint_settings=lint_settings)
                         if isinstance(policy, NatedevFloor) else {})
         uses: dict[str, TargetUse | LockHeld] = dict(policy.uses(targets) if isinstance(policy, MacFloor) else process_uses(owners))
+        if isinstance(policy, NatedevFloor):
+            busy_mirrors = mirror_leases.enter_context(copies.target_mirror_leases(targets))
+            for root in targets:
+                if any(Path(root).resolve().is_relative_to(mirror) for mirror in busy_mirrors):
+                    uses[root] = LockHeld("remote mirror lease is busy")
         for root in tuple(hold_targets):
             for paired in paired_roots(root):
                 if paired in targets:
@@ -3750,9 +3757,7 @@ def _hold_floor_pass(floor: int, dry_run: bool, *,
             ci_seen: set[InodeKey] = set()
             ci_bytes = sum(directory_blocks(os.path.expanduser(path), ci_seen)
                            for path in lint_settings.words("sweep_ci_targets")
-                           if (not isinstance(filesystem, FilesystemFloor)
-                               or (output_device(os.path.expanduser(path)) == filesystem.device
-                                   if os.path.isdir(os.path.expanduser(path)) else filesystem.root_device)))
+                           if on_floor_filesystem(os.path.expanduser(path)))
             unchanged_caches = held_bytes + ci_bytes
             before_caches = total + unchanged_caches
         # The growth check compares this pair with the previous record. The scan takes minutes, so
@@ -3803,7 +3808,12 @@ def _hold_floor_pass(floor: int, dry_run: bool, *,
             after_caches = sum(scan.blocks[key] for key in unchanged) + unchanged_caches
             after_caches += sum(directory_blocks(path, unchanged, excluded_targets)
                                 for path in idle if path in scan.changed_targets and on_floor_filesystem(path))
-            removed = max(0, before_caches - after_caches)
+            # This pass did not remove these blocks.
+            externally_removed_keys = {key for root in idle if root not in taken and not os.path.lexists(root)
+                                      for key in scan.target_links.get(root, {})
+                                      if key not in unchanged
+                                      and (not isinstance(filesystem, FilesystemFloor) or key[0] == filesystem.device)}
+            removed = max(0, before_caches - after_caches - sum(scan.blocks[key] for key in externally_removed_keys))
             try:
                 with locked_floor_record(record_path) as previous:
                     base = floor_record_or_new(previous, after_free)
@@ -3876,8 +3886,11 @@ def _hold_floor_pass(floor: int, dry_run: bool, *,
             if not dry_run and isinstance(policy, NatedevFloor):
                 notify_floor_problem(replace(outcome, protected=protected), lint_settings=lint_settings, detail=detail)
         finally:
-            if guard is not None:
-                os.close(guard)
+            try:
+                if guard is not None:
+                    os.close(guard)
+            finally:
+                mirror_leases.close()
 
 
 def size_bytes(raw: str, unit: int) -> int | None:
@@ -4317,9 +4330,10 @@ def main(argv: list[str]) -> int:
                 mac_floor, mac_roots = mac_floor_settings(mac_settings, mirror_root=mirror_root)
                 lint_settings = conf.read("lint")
                 timeout = mac_settings.number("probe_timeout_s")
-            with floor_claims.locked_claims(timeout) as claims:
-                return hold_floor(mac_floor, dry_run, lint_settings=lint_settings,
-                                  policy=MacFloor(mac_roots, claims, mirror_root.local_path()))
+            with copies.mirror_sweep_leases(mirror_root.local_path()) as protected:
+                with floor_claims.locked_claims(timeout) as claims:
+                    return hold_floor(mac_floor, dry_run, lint_settings=lint_settings,
+                                      policy=MacFloor(mac_roots, claims, mirror_root.local_path(), protected))
         except conf.Unusable as error:
             print(f"lint sweep: {error}", file=sys.stderr)
             return 2

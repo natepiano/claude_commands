@@ -1,6 +1,10 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
 """Find local Claude quota refusals and start safe, account-grouped moves."""
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import argparse
 import fcntl
@@ -24,16 +28,14 @@ from typing import TYPE_CHECKING, Literal, NotRequired, Protocol, TypedDict, cas
 from uuid import uuid4
 
 ROOT = Path(__file__).resolve().parents[2]
-sys.path.insert(0, str(ROOT))
-sys.path.insert(0, str(ROOT / "scripts" / "shutdown"))
-sys.path.insert(0, str(ROOT / "scripts" / "whoami"))
 from scripts.lib import conf
+from scripts.agents import codex_mesh
 from scripts.accounts import accounts, moves, next_moves, refusals, role_map
 from scripts.whoami import account
 from scripts.whoami import agent_accounts
 from scripts.whoami.note_file import canonical_label
 from scripts.whoami import usage_store
-from quota_alert import (RefusedAt, _refusal_window, blocked_next_move_line, blocked_next_move_reason_key, notify_blocked_next_move,  # pyright: ignore[reportPrivateUsage]
+from scripts.whoami.quota_alert import (RefusedAt, _refusal_window, blocked_next_move_line, blocked_next_move_reason_key, notify_blocked_next_move,  # pyright: ignore[reportPrivateUsage]
                          BlockedHeadReason as BlockedHeadReason, NoTargetReading as NoTargetReading,
                          TargetReadingUnavailable as TargetReadingUnavailable,
                          TargetLoginRenewalFailed as TargetLoginRenewalFailed,
@@ -46,9 +48,12 @@ if TYPE_CHECKING:
     from scripts.herdr import herdr
     from scripts.message import sessions
 else:
-    inventory_module = import_module("inventory")
-    sessions = import_module("sessions")
-    herdr = import_module("herdr")
+    inventory_module = import_module("scripts.shutdown.inventory")
+    sessions = import_module('scripts.message.sessions')
+    herdr = import_module("scripts.herdr.herdr")
+
+
+CLAUDE_LIMIT_PHRASES = ("hit your session limit", "hit your weekly limit")
 
 
 @dataclass(frozen=True)
@@ -374,7 +379,7 @@ class LockedNextMoveEdit:
             if state != original:
                 _save_state(state)
             if discarded:
-                import quota_alert
+                from scripts.whoami import quota_alert
                 with quota_alert.state_file() as quota_state:
                     for entry_id in discarded:
                         _ = quota_state.get("workers_move_notices", {}).pop(entry_id, None)
@@ -396,6 +401,7 @@ class TranscriptEntry(TypedDict, total=False):
     timestamp: str
     message: object
     quotaLimits: object
+    payload: object
 
 
 @dataclass(frozen=True)
@@ -429,35 +435,74 @@ def _newest_exchange(path: Path, chunk_bytes: int) -> NewestExchange | NoExchang
                         entry = cast(dict[str, object], value)
                         if entry.get("type") in ("user", "assistant"):
                             return NewestExchange(cast(TranscriptEntry, cast(object, entry)))
+                        payload = entry.get("payload")
+                        if isinstance(payload, dict):
+                            message = cast(dict[str, object], payload)
+                            if (entry.get("type") == "event_msg" and message.get("type") in (
+                                    "user_message", "agent_message", "error") or
+                                    entry.get("type") == "response_item" and message.get("type") == "message"
+                                    and message.get("role") in ("user", "assistant")):
+                                return NewestExchange(cast(TranscriptEntry, cast(object, entry)))
     except OSError:
         pass
     return NoExchange()
 
 
-def transcript_refusal(session_id: str, *, config_dir: Path | None = None, account_config: conf.ConfigRead | accounts.ReadCurrentAccountSettings = accounts.CURRENT_ACCOUNT_SETTINGS) -> TranscriptRefusal | NoSessionRefusal:
+def transcript_refusal(session_id: str, *, config_dir: Path | None = None, screen_text: str = "", account_config: conf.ConfigRead | accounts.ReadCurrentAccountSettings = accounts.CURRENT_ACCOUNT_SETTINGS) -> TranscriptRefusal | NoSessionRefusal:
+    """Read transcript evidence first. Use supplied pane text only without transcript evidence."""
     account_config = accounts.read_account_settings(account_config)
     root = config_dir if config_dir is not None else Path.home() / ".claude"
     try:
         paths = list((root / "projects").glob("*/" + session_id + ".jsonl"))
-    except OSError:
-        return NoSessionRefusal()
-    return _transcript_refusal(paths, account_config.whole("transcript_chunk_bytes"))
-
-
-def _transcript_refusal(paths: list[Path], chunk_bytes: int) -> TranscriptRefusal | NoSessionRefusal:
-    try:
         if not paths:
-            return NoSessionRefusal()
-        transcript = max(paths, key=lambda path: path.stat().st_mtime)
+            homes = [config_dir] if config_dir is not None else agent_accounts.codex_homes(agent_accounts.codex_home())
+            paths = [path for home in homes for folder in ("sessions", "archived_sessions")
+                     for path in (home / folder).rglob(f"*{session_id}.jsonl")]
     except OSError:
-        return NoSessionRefusal()
-    latest = _newest_exchange(transcript, chunk_bytes)
+        paths = []
+    return _transcript_refusal(paths, account_config.whole("transcript_chunk_bytes"), screen_text=screen_text)
+
+
+def _transcript_refusal(paths: list[Path], chunk_bytes: int, *, screen_text: str = "") -> TranscriptRefusal | NoSessionRefusal:
+    try:
+        latest = _newest_exchange(max(paths, key=lambda path: path.stat().st_mtime), chunk_bytes) if paths else NoExchange()
+    except OSError:
+        latest = NoExchange()
+    quota: object = None
+    codex_error = isinstance(latest, NoExchange) or latest.entry.get("type") == "event_msg"
     if isinstance(latest, NoExchange):
-        return NoSessionRefusal()
-    entry = latest.entry
-    if entry.get("type") != "assistant" or entry.get("isApiErrorMessage") is not True or entry.get("error") != "rate_limit":
-        return NoSessionRefusal()
-    entry_id, timestamp = entry.get("uuid"), entry.get("timestamp")
+        text = screen_text
+        timestamp = datetime.now(timezone.utc).isoformat()
+        entry_id = hashlib.sha256(text.encode()).hexdigest()
+    else:
+        entry = latest.entry
+        timestamp = entry.get("timestamp")
+        if codex_error:
+            payload_value = entry.get("payload")
+            if not isinstance(payload_value, dict):
+                return NoSessionRefusal()
+            payload = cast(dict[str, object], payload_value)
+            if payload.get("type") != "error":
+                return NoSessionRefusal()
+            text = str(payload.get("message", ""))
+            entry_id = entry.get("uuid") or hashlib.sha256((str(timestamp or "") + text).encode()).hexdigest()
+        else:
+            if entry.get("type") != "assistant" or entry.get("isApiErrorMessage") is not True or entry.get("error") != "rate_limit":
+                return NoSessionRefusal()
+            entry_id = entry.get("uuid")
+            message = entry.get("message")
+            content = cast(dict[str, object], message).get("content") if isinstance(message, dict) else ""
+            if isinstance(content, str):
+                text = content
+            elif isinstance(content, list):
+                text = "\n".join(str(cast(dict[str, object], block).get("text", ""))
+                                 for block in cast(list[object], content) if isinstance(block, dict))
+            else:
+                text = ""
+            quota = entry.get("quotaLimits")
+    if codex_error and codex_mesh.QUOTA_REFUSAL not in text.casefold():
+        if not isinstance(latest, NoExchange) or not any(phrase in text.casefold() for phrase in CLAUDE_LIMIT_PHRASES):
+            return NoSessionRefusal()
     if not isinstance(entry_id, str) or not entry_id or not isinstance(timestamp, str):
         return NoSessionRefusal()
     try:
@@ -466,21 +511,12 @@ def _transcript_refusal(paths: list[Path], chunk_bytes: int) -> TranscriptRefusa
         return NoSessionRefusal()
     if at.tzinfo is None:
         return NoSessionRefusal()
-    message = entry.get("message")
-    content = cast(dict[str, object], message).get("content") if isinstance(message, dict) else ""
-    if isinstance(content, str):
-        text = content
-    elif isinstance(content, list):
-        text = "\n".join(str(cast(dict[str, object], block).get("text", ""))
-                         for block in cast(list[object], content) if isinstance(block, dict))
-    else:
-        text = ""
     folded = text.casefold()
     window: refusals.KnownWindow | refusals.UnknownWindow = (
-        refusals.KnownWindow("weekly") if "weekly limit" in folded else
-        refusals.KnownWindow("five_hour") if "hit your session limit" in folded else refusals.UnknownWindow())
+        refusals.KnownWindow("weekly") if "weekly limit" in folded or codex_error and "weekly" in folded else
+        refusals.KnownWindow("five_hour") if CLAUDE_LIMIT_PHRASES[0] in folded or codex_error and (
+            "5-hour" in folded or "five-hour" in folded) else refusals.UnknownWindow())
     reset: refusals.KnownReset | refusals.NoResetKnown = refusals.NoResetKnown()
-    quota = entry.get("quotaLimits")
     if isinstance(quota, dict):
         limits = cast(dict[str, object], quota)
         rate_type = limits.get("rateLimitType")
@@ -630,7 +666,7 @@ def live_owners(*, only: frozenset[str] = NO_SESSION_FILTER) -> list[inventory_m
 
 
 def _notify_no_room(text: str, now: datetime) -> bool:
-    import quota_alert
+    from scripts.whoami import quota_alert
     config = quota_alert.load_config()
     return quota_alert.deliver_notice([quota_alert.Job("", recipient, text, "refusal")
         for recipient in quota_alert.recipients(config)], now.isoformat())
@@ -654,8 +690,11 @@ def _record_blocked_head(state: WatchState, rule: AutoMoveRule, reason: BlockedH
         fingerprint = "|".join(candidate.to + blocked_next_move_reason_key(cause) for candidate, cause in blocked) if other_targets else blocked_next_move_reason_key(reason)
         if notices.get(rule.entry_id) != fingerprint:
             _ = notices.pop(rule.entry_id, None)
-            if (_notify_no_room(line, now) if other_targets else _notify_blocked_head(rule, reason, now)):
-                notices[rule.entry_id] = fingerprint
+            head = next((entry for entry in next_moves.read_next_moves() if entry.group == rule.group), None)
+            if (isinstance(head, next_moves.ClaudeGroupMove) and head.id == rule.entry_id and head.to == rule.to
+                    and head.fallback_targets == rule.fallback_targets):
+                if (_notify_no_room(line, now) if other_targets else _notify_blocked_head(rule, reason, now)):
+                    notices[rule.entry_id] = fingerprint
     return line
 
 
@@ -675,7 +714,7 @@ def _set_transition(state: WatchState, session_id: str, entry_id: str, transitio
 
 def _continue_session(session_id: str, entry_id: str) -> ContinuationDelivered | ContinuationNotDelivered:
     # Shutdown imports this watcher for its hold and cancellation; resolve its delivery boundary at use.
-    messenger = cast(LiveSessionMessenger, cast(object, import_module("restart_support")))
+    messenger = cast(LiveSessionMessenger, cast(object, import_module("scripts.shutdown.restart_support")))
     try:
         delivery = messenger.send_message(f"session:{session_id}", "Quota wait ended", "Continue where you stopped.",
             key=f"quota-continue-{session_id}-{entry_id}")
@@ -980,7 +1019,7 @@ def _run(now: datetime, dry_run: bool, proof_group: frozenset[str] = NO_SESSION_
                         if not accounts.session_on_account(session, chosen.label))
         else:
             ids = tuple(session["session_id"] for session, _, _ in group)
-        outcomes = accounts.move_sessions(ids, chosen.label, why=why) if ids else ()
+        outcomes = accounts.move_sessions(ids, chosen.label, why=why, cause="refusal") if ids else ()
         by_id = {session["session_id"]: refusal for session, refusal, _ in group}
         for outcome in outcomes:
             lines.append(accounts.move_result_line(outcome))
@@ -1051,7 +1090,8 @@ def _run(now: datetime, dry_run: bool, proof_group: frozenset[str] = NO_SESSION_
                         why = f"complete {group_name} move to {target}"
                         if isinstance(transition.origin, accounts.AutoOrigin):
                             why = transition.why.text if isinstance(transition.why, accounts.RecordedTransitionReason) else ""
-                        outcomes = accounts.move_sessions(tuple(session.session_id for session in members), target, why=why)
+                        outcomes = accounts.move_sessions(tuple(session.session_id for session in members), target, why=why,
+                            cause=accounts.move_origin_fields(transition.origin)["cause"])
                         lines.extend(accounts.move_result_line(outcome) for outcome in outcomes)
     if not dry_run and state != original_state:
         _save_state(state)
@@ -1216,7 +1256,7 @@ def _run_auto_moves_locked(now: datetime, *, dry_run: bool = False,
         _save_state(state)
         ids = tuple(member.session_id for member in members[rule.group]
                     if not accounts.session_on_account(member, rule.to))
-        outcomes = accounts.move_sessions(ids, rule.to, why=why) if ids else ()
+        outcomes = accounts.move_sessions(ids, rule.to, why=why, cause="auto") if ids else ()
         lines.extend(accounts.move_result_line(outcome) for outcome in outcomes)
     if not dry_run and state != original:
         _save_state(state)

@@ -2,24 +2,21 @@
 
 from __future__ import annotations
 
-from ledger_test_support import ticket_owner_id
+from scripts.style.ledger_test_support import ticket_owner_id
 
 import sqlite3
-import sys
 import unittest
 from contextlib import closing
-from pathlib import Path
 from typing import final
 from unittest import mock
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-import style_proposals
+from scripts.style import style_proposals
 
-import berth_board
-import style_ledger
+from scripts.lib import berth_board
+from scripts.style import style_ledger
 
-from style_plan_test_support import StylePlanFixture
+from scripts.style.style_plan_test_support import StylePlanFixture
 
 
 @final
@@ -36,7 +33,7 @@ class StylePlanTests(StylePlanFixture):
             code, output, errors = self.run_next()
         self.assertEqual(code, 0, errors)
         self.assertEqual(output.count(f"waiting {issue}: {files[0]} busy\nwaiting {issue}: {files[1]} busy\n"), 1)
-        self.assertEqual(self.ledger().ticket_open(ticket_owner_id("names-unit"))[0]["files"], [files[2]])
+        self.assertEqual(self.ledger().ticket_open(ticket_owner_id("names"))[0]["files"], [files[2]])
 
     def test_decision_refill_names_its_busy_file_and_builds_its_free_file(self) -> None:
         rule = self.rule("read")
@@ -51,7 +48,7 @@ class StylePlanTests(StylePlanFixture):
         self.assertEqual(code, 0, errors)
         self.assertEqual(output.count(f"waiting {issue}: {files[1]} busy\n"), 1)
         self.assertNotIn(files[0], output)
-        self.assertEqual(self.ledger().ticket_open(ticket_owner_id("names-unit"))[0]["files"], [files[0]])
+        self.assertEqual(self.ledger().ticket_open(ticket_owner_id("names"))[0]["files"], [files[0]])
 
     def test_decision_refill_holds_a_file_rename_whose_reference_file_is_busy_and_builds_the_next(self) -> None:
         rule = self.rule("read")
@@ -65,7 +62,7 @@ class StylePlanTests(StylePlanFixture):
         self.assertEqual(code, 0, errors)
         self.assertEqual(output.count(f"waiting {issue}: {probe.path} edits crates/alpha/src/render.rs, busy (1 finding)\n"), 1)
         self.assertNotIn(f"waiting {issue}: crates/alpha/src/probe.rs busy", output)
-        ticket = self.ledger().ticket_open(ticket_owner_id("names-unit"))[0]
+        ticket = self.ledger().ticket_open(ticket_owner_id("names"))[0]
         self.assertEqual((ticket["files"], ticket["finding_ids"]), (["crates/alpha/src/gauge.rs"], [gauge.finding_id]))
 
     def test_decision_refill_builds_a_file_rename_whose_busy_file_names_no_renamed_module(self) -> None:
@@ -77,7 +74,7 @@ class StylePlanTests(StylePlanFixture):
             code, output, errors = self.run_next()
         self.assertEqual(code, 0, errors)
         self.assertNotIn("waiting", output)
-        ticket = self.ledger().ticket_open(ticket_owner_id("names-unit"))[0]
+        ticket = self.ledger().ticket_open(ticket_owner_id("names"))[0]
         self.assertEqual((ticket["files"], ticket["finding_ids"]),
                          (["crates/alpha/src/probe.rs"], [self.ledger().proposal_findings(issue)[0].finding_id]))
 
@@ -102,7 +99,7 @@ class StylePlanTests(StylePlanFixture):
             _, output, _ = self.run_next()
         self.assertIn(f"waiting {issue}: {finding.path} edits docs/notes.md, busy (1 finding)\n", output)
         # The decision has no free finding, so refill plans coverage work instead.
-        self.assertEqual(self.ledger().ticket_open(ticket_owner_id("names-unit"))[0]["kind"], "read")
+        self.assertEqual(self.ledger().ticket_open(ticket_owner_id("names"))[0]["kind"], "read")
         self.assertIsInstance(self.ledger().proposal_findings(issue)[0].build_ticket, style_ledger.NoBuildTicket)
 
     def test_refill_drops_a_queued_file_rename_ticket_whose_reference_file_is_busy(self) -> None:
@@ -110,14 +107,14 @@ class StylePlanTests(StylePlanFixture):
         issue = self.file_rename_decision(rule, (("crates/alpha/src/probe.rs", "Rename probe.rs to frame_log.rs"),))
         ledger = self.ledger()
         finding = ledger.proposal_findings(issue)[0]
-        ledger.ticket_add("1", ticket_owner_id("names-unit"), "proposal", "names", "crates/alpha", [finding.path], [rule],
+        ledger.ticket_add("1", ticket_owner_id("names"), "proposal", "names", "crates/alpha", [finding.path], [rule],
                           proposal=str(issue), finding_ids=(finding.finding_id,))
         with (mock.patch.object(berth_board, "read_board", return_value=self.board("crates/alpha/src/render.rs")),
               mock.patch.object(style_proposals, "proposal_command")):
             _, output, _ = self.run_next()
         self.assertIn("dropped 1: files busy\n", output)
         self.assertIn(f"waiting {issue}: {finding.path} edits crates/alpha/src/render.rs, busy (1 finding)\n", output)
-        self.assertEqual(ledger.ticket_open(ticket_owner_id("names-unit"))[0]["kind"], "read")
+        self.assertEqual(ledger.ticket_open(ticket_owner_id("names"))[0]["kind"], "read")
         self.assertIsInstance(ledger.proposal_findings(issue)[0].build_ticket, style_ledger.NoBuildTicket)
 
     def test_decision_refill_holds_a_file_rename_whose_busy_file_names_it_only_at_the_unit_base(self) -> None:
@@ -166,7 +163,7 @@ class StylePlanTests(StylePlanFixture):
                                           ((lib, 'mod gauge;\n#[cfg_attr(test, path = "probe.rs")]\nmod probe;\nmod render;\n'),))
         ledger = self.ledger()
         finding = ledger.proposal_findings(issue)[0]
-        ledger.ticket_add("1", ticket_owner_id("names-unit"), "proposal", "names", "crates/alpha", [finding.path], [self.rule("read")],
+        ledger.ticket_add("1", ticket_owner_id("names"), "proposal", "names", "crates/alpha", [finding.path], [self.rule("read")],
                           proposal=str(issue), finding_ids=(finding.finding_id,))
         output = self.refill_with_busy()
         self.assertIn(f"dropped 1: {lib} has a path attribute the rename gate cannot read\n", output)
@@ -183,7 +180,7 @@ class StylePlanTests(StylePlanFixture):
                                                     "#[cfg(test)]\nmod startup_tests;\n", "type")
         output = self.refill_with_busy("crates/alpha/src/terminal.rs")
         self.assertNotIn(f"waiting {issue}", output)
-        ticket = self.ledger().ticket_open(ticket_owner_id("names-unit"))[0]
+        ticket = self.ledger().ticket_open(ticket_owner_id("names"))[0]
         self.assertEqual((ticket["files"], ticket["finding_ids"]), (["crates/alpha/src/terminal/startup_tests.rs"], [finding]))
 
     def test_decision_gate_names_the_cause_for_a_ticket_made_before_decisions(self) -> None:

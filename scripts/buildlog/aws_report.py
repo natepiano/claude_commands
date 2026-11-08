@@ -15,9 +15,9 @@ if TYPE_CHECKING:
     from ..mac_test import offload
 else:
     from scripts.aws_target.measurement import MeasurementUnavailable, number
-    import record
-    import store
-    import offload
+    from scripts.buildlog import record
+    from scripts.buildlog import store
+    from scripts.mac_test import offload
 
 
 @dataclass(frozen=True)

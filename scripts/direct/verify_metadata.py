@@ -42,41 +42,54 @@ def require_package(meta: CargoMetadata, name: str) -> CargoPackage:
 
 
 def example_features(meta: CargoMetadata, package_name: str, example_name: str) -> str:
-    for package in meta["packages"]:
-        if package["name"] != package_name:
-            continue
+    packages = [require_package(meta, package_name)] if package_name else [
+        package for package in meta["packages"] if package["id"] in meta["workspace_members"]]
+    for package in packages:
         for target in package["targets"]:
             if target["name"] == example_name and "example" in target["kind"]:
-                return ",".join(target.get("required-features", []))
-        print(
-            "verify.sh: example " + example_name + " not found in package " + package_name,
-            file=sys.stderr,
-        )
-        sys.exit(2)
-    print("verify.sh: package " + package_name + " not found in workspace", file=sys.stderr)
-    sys.exit(2)
+                features = target.get("required-features", [])
+                return ",".join(features if package_name else [
+                    feature if "/" in feature else package["name"] + "/" + feature for feature in features])
+    print("verify.sh: example " + example_name + " not found in " + ("package " + package_name if package_name else "workspace"), file=sys.stderr)
+    raise SystemExit(2)
 
 
 def build_targets(meta: CargoMetadata, package_name: str, kind: str, name: str) -> str:
-    package = require_package(meta, package_name)
+    packages = [require_package(meta, package_name)] if package_name else [
+        package for package in meta["packages"] if package["id"] in meta["workspace_members"]]
     lines: list[str] = []
-    wanted = [target for target in package["targets"] if (kind or "bin") in target["kind"] and name in ("", target["name"])]
+    wanted = [(package, target) for package in packages for target in package["targets"] if (kind or "bin") in target["kind"] and name in ("", target["name"])]
     if not wanted:
         what = f"{kind} {name}" if name else "binary"
         advice = "" if name else "; name an example with --example <name>"
-        print(f"verify.sh: package {package_name} has no {what}{advice}", file=sys.stderr)
+        selection = "package " + package_name if package_name else "workspace"
+        print(f"verify.sh: {selection} has no {what}{advice}", file=sys.stderr)
         sys.exit(2)
-    for target in wanted:
+    for package, target in wanted:
         lines.append("select --" + (kind or "bin"))
         lines.append("select " + target["name"])
         if kind == "example" and target.get("required-features"):
-            lines.append("features " + ",".join(target["required-features"]))
+            lines.append("features " + ",".join(target["required-features"] if package_name else [
+                feature if "/" in feature else package["name"] + "/" + feature for feature in target["required-features"]]))
         lines.append(("binary examples/" if kind == "example" else "binary ") + target["name"])
     lines.append("target " + meta["target_directory"])
     return "\n".join(lines)
 
 
+def package_has_library(package: CargoPackage) -> bool:
+    return any(target["kind"][0] in {"lib", "rlib", "dylib", "cdylib", "staticlib", "proc-macro"}
+               for target in package["targets"])
+
+
+def check_targets(meta: CargoMetadata) -> str:
+    selection = ["--lib"] if any(package_has_library(package) for package in meta["packages"]) else []
+    return "\n".join([*selection, "--bins"])
+
+
 def test_targets(meta: CargoMetadata, package_name: str, feature_flags: str) -> str:
+    if not package_name:
+        packages = [package for package in meta["packages"] if package["id"] in meta["workspace_members"]]
+        return "\n".join((["--lib"] if any(package_has_library(package) for package in packages) else []) + ["--bins", "--tests"])
     package = require_package(meta, package_name)
     features = package["features"]
     enabled: set[str] = set()
@@ -95,7 +108,7 @@ def test_targets(meta: CargoMetadata, package_name: str, feature_flags: str) -> 
         if other["name"] != package_name
         for target in other["targets"]
     }
-    has_lib = any(target["kind"][0] in {"lib", "rlib", "dylib", "cdylib", "staticlib", "proc-macro"} for target in package["targets"])
+    has_lib = package_has_library(package)
     selection = ["--lib"] if has_lib else []
     for target in package["targets"]:
         kind = target["kind"][0]
@@ -167,6 +180,8 @@ def answer(meta: CargoMetadata, request: str) -> str:
         return example_features(meta, arguments[0], arguments[1])
     if name == "test-targets" and len(arguments) == 2:
         return test_targets(meta, arguments[0], arguments[1])
+    if name == "check-targets" and not arguments:
+        return check_targets(meta)
     if name == "build-targets" and len(arguments) == 3:
         return build_targets(meta, arguments[0], arguments[1], arguments[2])
     if name == "untested-examples" and len(arguments) == 1:

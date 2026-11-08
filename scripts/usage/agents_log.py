@@ -1,7 +1,11 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
 """Record role assignments that would otherwise disappear when a run ends."""
 
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import argparse
 import fcntl
@@ -22,6 +26,7 @@ Role = Literal["showrunner", "director", "impl", "test", "fix", "review", "worke
 Lens = Literal["adversary", "contract", "craft", "ux", "rerun", "simplify"]
 ROLES: tuple[Role, ...] = ("showrunner", "director", "impl", "test", "fix", "review", "worker", "interactive", "subagent")
 LENSES = cast(tuple[Lens, ...], get_args(Lens))
+PHASE_REVIEW_LENSES = tuple(lens for lens in LENSES if lens != "simplify")
 
 
 @dataclass(frozen=True)
@@ -237,7 +242,6 @@ def _recover_directors(live: Path, recovered: list[tuple[str, Assignment]]) -> N
 
 def backfill(archive: Path, *live: Path) -> int:
     """Recover assignments from the archive and each live run root."""
-    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
     from scripts.production import staff
 
     recovered: list[tuple[str, Assignment]] = []
@@ -323,7 +327,6 @@ def main(argv: list[str] | None = None) -> int:
         elif command == "register":
             _ = register_default(cast(str, args.id), cast(Role, args.role), datetime.now(timezone.utc))
         elif command == "backfill":
-            sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
             from scripts.lib import unit_runs
 
             archive = cast(Path | None, args.archive) or unit_runs.run_archive()

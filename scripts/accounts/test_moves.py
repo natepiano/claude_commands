@@ -6,6 +6,7 @@ import fcntl
 import io
 import json
 import os
+import sys
 import tempfile
 import unittest
 from concurrent.futures import ThreadPoolExecutor
@@ -17,6 +18,7 @@ from unittest.mock import patch
 
 from scripts.accounts.home_test_support import scratch_account_home
 from scripts.accounts import accounts, moves, role_map, worker_names
+from scripts.lib import unit_runs
 from scripts.production import session_staff, staff
 from scripts.production.staff_test_support import (
     StaffTestCase, fixture_member, fixture_worker, fixture_runtime_id,
@@ -678,6 +680,10 @@ class WorkerGroupPendingTests(StaffTestCase):
     @override
     def setUp(self) -> None:
         super().setUp()
+        _ = self.enterContext(patch.object(unit_runs, "worker_transport", return_value="mesh"))
+        _ = self.enterContext(patch.object(unit_runs, "RUN_ROOT", self.root / "runs"))
+        _ = self.enterContext(patch.object(unit_runs, "FORMER_RUN_ROOT", self.root / "former-runs"))
+        _ = cast(object, self.enterContext(patch.dict(os.environ, {"UNIT_RUN_DIR": "", "PLAN_DELEGATE_BOARD_DIR": ""})))
         home = Path(os.environ["HOME"])
         home.mkdir(parents=True, exist_ok=True)
         _ = self.enterContext(scratch_account_home(home, {}, clear=False))
@@ -687,6 +693,16 @@ class WorkerGroupPendingTests(StaffTestCase):
         create_claude_account("claude1", "claude@example.invalid")
         notes = note_file.notes_dir()
         _ = (notes / note_file.note_name("codex1")).write_text("---\nlogin: codex@example.invalid\n---\n")
+        binary = self.root / "bin"
+        binary.mkdir(exist_ok=True)
+        codex = binary / "codex"
+        _ = codex.write_text("#!" + sys.executable + "\n" +
+            "import json, sys\nfor line in sys.stdin:\n"
+            + "    request = json.loads(line)\n"
+            + "    if 'id' in request:\n"
+            + "        print(json.dumps({'id': request['id'], 'result': {}}), flush=True)\n")
+        codex.chmod(0o700)
+        _ = cast(object, self.enterContext(patch.dict(os.environ, {"PATH": str(binary) + os.pathsep + os.environ.get("PATH", "")})))
         self.assertEqual(accounts.setup("codex1"), [])
         write_codex_auth(home / ".codex1", "codex@example.invalid")
         report = agent_accounts.Report("Codex", email="codex@example.invalid",
@@ -697,12 +713,13 @@ class WorkerGroupPendingTests(StaffTestCase):
         _ = self.enterContext(patch.object(stop_resume, "stop", side_effect=self.stop_worker))
         _ = self.enterContext(patch.object(accounts, "SCRIPTS", self.root / "no-launchers"))
 
-    def stop_worker(self, reference: str) -> stop_resume.Stopped | stop_resume.StopFailed:
+    def stop_worker(self, reference: str, kind: str = "") -> stop_resume.Stopped | stop_resume.StopFailed:
         self.stop_requests.append(reference)
         if reference == self.failed_worker:
             return stop_resume.StopFailed(reference, "source process could not stop")
         row = staff.by_id(staff.StaffId(reference))
         assert row is not None
+        self.assertIn(kind, ("", staff.snapshot().backends[row.id].family))
         return stop_resume.Stopped(row.current_session, 987654)
 
     def worker(self, name: str, family: Literal["claude", "codex"]) -> tuple[staff.StaffRow, Path]:

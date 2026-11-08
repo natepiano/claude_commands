@@ -1,5 +1,9 @@
 """Read the session's assignment from its staff row."""
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import json
 import os
@@ -8,9 +12,8 @@ import sys
 from pathlib import Path
 from typing import cast
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.production import staff
-from scripts.statusline import rebuild_row
+from scripts.statusline import adhoc_items, rebuild_row
 
 
 def assignment(record: staff.StaffSnapshot, session_id: str) -> tuple[str, str]:
@@ -47,7 +50,8 @@ def main() -> None:
         record = staff_record(Path(os.environ["STAFF_FILE"]).read_text(encoding="utf-8"))
     except OSError:
         record = staff.StaffSnapshot(())
-    label, role = assignment(record, str(payload.get("session_id", "")))
+    session_id = str(payload.get("session_id", ""))
+    label, role = assignment(record, session_id)
     rebuild_config = Path(__file__).resolve().parents[2] / "config/statusline.conf"
     rebuild = rebuild_row.read(rebuild_config)
     if rebuild.refresh_due:
@@ -61,6 +65,7 @@ def main() -> None:
             pass
     os.execvp("jq", ["jq", "-n", "--argjson", "payload", json.dumps(payload),
                      "--arg", "assignment", label, "--arg", "role", role,
+                     "--arg", "adhoc", adhoc_items.row(session_id),
                      "--arg", "rebuild", rebuild.row(), *sys.argv[1:]])
 
 

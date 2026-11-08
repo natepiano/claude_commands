@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Find and fix why a session stopped for a permission, so the same command never stops it again.
+"""Find and fix the cause of a permission stop or refusal.
 
   rca.py open --session S --machine M --kind prompt|auto_mode [--command C ...] [--transcript P]
               [--production SLUG]
@@ -12,14 +12,13 @@ A permission alert to the user opens a case: stall_watch.py opens one after its 
 after an auto_mode.refused push. A new case sends its owner one message with the steps. An open or started
 case for the same session and the same commands counts one more alert instead. The owner is the showrunner
 of the session's production (--production, else the production mark the session's processes carry), or the
-natedev session when there is none or it is not running. The case's transcript is the stopped session's:
+natedev session when there is none or it is not running. The case's transcript belongs to the affected session:
 --transcript, else the newest transcript of the live session on this machine that --session names, else none.
 
-A case keeps what its pushes tell the user: when the session stopped, the commands (whose first words give
-the kind of action: a file change, a shell command), the alert's waits sentence, and the alert's sender and
-key. `start` and `fixed` each send the user one push, permission.rca_started and permission.rca_fixed, with
+A case keeps the permission event time, the commands, the alert's waits sentence, and the alert's sender and key.
+The commands' first words give the kind of action: a file change or a shell command. `start` and `fixed` each send the user one push, permission.rca_started and permission.rca_fixed, with
 the key rca-<id>: while silence is on, the fixed push replaces the started one. Only the started push repeats
-the waits sentence, as nothing waits once the stop is fixed. Neither names the owner, a file, a command or a
+the waits sentence, as the fixed push describes the completed fix. Neither names the owner, a file, a command or a
 commit; the commit stays in the case and the owner log.
 
 `fixed` runs the cold-read push review (review.py) on the whole fixed text first, as cause and fix are free
@@ -39,6 +38,10 @@ Each case is one JSON file in STATE, which is $XDG_STATE_HOME/message/rca or ~/.
 `open` never fails its caller: the alert already went out, so an error prints to stderr and it exits 0.
 """
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import argparse
 import fcntl
@@ -56,21 +59,16 @@ from enum import Enum
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from typing import Literal, NamedTuple, NotRequired, TypedDict, cast
 
 from scripts.lib import conf
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "production"))
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "notify"))
-import push_texts  # noqa: E402
-import review  # noqa: E402
-import sessions  # noqa: E402
+from scripts.notify import push_texts  # noqa: E402
+from scripts.notify import review  # noqa: E402
+from scripts.message import sessions  # noqa: E402
 from scripts.production import showrunners  # noqa: E402
-import silence  # noqa: E402
-from user_zone import user_zone  # noqa: E402
+from scripts.notify import silence  # noqa: E402
+from scripts.lib.user_zone import user_zone  # noqa: E402
 from scripts.production import staff  # noqa: E402
 
 STATE = Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local" / "state") / "message" / "rca"
@@ -122,7 +120,7 @@ class Case(TypedDict):
     reminded: bool
     owner_told: NotRequired[bool]
     alerts: int
-    # When the session stopped (UTC ISO time); a case from before 2026-10-23 reads its opened time.
+    # Permission stop or refusal time (UTC ISO time). An older case uses its opened time.
     stopped: str
     # The alert's sentence of what waits on the session, or "".
     waits: str
@@ -227,8 +225,8 @@ def production_of(report: Report) -> str:
         row = record.parent_of(row)
     if row is None:
         return ""
-    timer = showrunners.timer_for(row, record)
-    return timer.slug if isinstance(timer, showrunners.Timer) else row.name
+
+    return row.name
 
 
 def owner_address(production: str, *, deadline: float = math.inf) -> str:
@@ -238,9 +236,9 @@ def owner_address(production: str, *, deadline: float = math.inf) -> str:
     try:
         record = staff.snapshot()
         for row in staff.active(record, "showrunner"):
-            timer = showrunners.timer_for(row, record)
-            slug = timer.slug if isinstance(timer, showrunners.Timer) else row.name
-            if slug == production:
+
+            name = row.name
+            if name == production:
                 socket = showrunners.socket_for(f"session:{row.current_session}", deadline=deadline)
                 return f"uds:{socket}" if socket else NATEDEV
         return NATEDEV
@@ -270,25 +268,25 @@ def action_of(commands: list[str] | tuple[str, ...]) -> str:
 
 
 def waits_line(waits: str) -> str:
-    """The sentence of what waits on the stopped session, after the sentence of the stop; "" for none."""
+    """The sentence about work that waits after a permission stop or refusal; "" for none."""
     return f" {waits}." if waits else ""
 
 
 def story(case: Case) -> dict[str, str]:
-    """The values both pushes start with: the session, when it stopped, and why it stopped."""
+    """The session, time, and permission stop or refusal for both pushes."""
     action = action_of(case["commands"])
     return {"session": case["session"], "time": silence.shown(datetime.fromisoformat(case["stopped"])),
-            "stop": f"auto mode refused {action}" if case["kind"] == "auto_mode" else f"it asked you to allow {action}"}
+            "stop": f"auto mode refused {action}" if case["kind"] == "auto_mode" else f"the session asked you to allow {action}"}
 
 
 def owner_message(case: Case, *, reminder: bool = False) -> str:
-    stop = "stopped at a permission prompt" if case["kind"] == "prompt" else "was stopped by auto mode"
+    stop = "stopped at a permission prompt" if case["kind"] == "prompt" else "had a command refused by auto mode"
     first = (f"rca {case['id']} is still open after 30 minutes. " if reminder else f"rca {case['id']}: ")
     transcript = ["Transcript: " + case["transcript"]] if case["transcript"] else []
     lines = [first + f"{case['session']} on {case['machine']} {stop}.",
              "Commands: " + ("; ".join(case["commands"]) or "none recorded"),
              *transcript,
-             f"Find why it stopped and fix the source. Run the rca.py commands on {case['machine']}:",
+             f"Find why this happened and fix the source. Run the rca.py commands on {case['machine']}:",
              f"1. Run `{CALL} start {case['id']} --owner <unit you route the fix to>`.",
              "2. Find where the command came from: a work order, a helper prompt, a skill or a script.",
              "3. Route the fix to the unit that owns that source, so the command never needs a prompt "

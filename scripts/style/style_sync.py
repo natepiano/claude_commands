@@ -1,7 +1,11 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
 """Notify standing style productions and record workspace lint coverage."""
 
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import argparse
 import json
@@ -16,24 +20,21 @@ from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.lib import build_folders
 from types import FrameType, MappingProxyType
 from typing import Literal, cast
 
 SCRIPTS = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(SCRIPTS / "production"))
-sys.path.insert(0, str(SCRIPTS / "lib"))
-import process_group
+from scripts.lib import process_group
 
-from add_style import NoStyleProduction, standing_style_production
+from scripts.style.add_style import NoStyleProduction, standing_style_production
 from scripts.production.production_doc import Refusal
 from scripts.copies import copies
 from scripts.message import send_result, send_budget, session_send
-from scripts.production import showrunners, unit_names
-import style_ledger
-from process_failure import failure_detail
-import scratch
+from scripts.production import showrunners
+from scripts.style import style_ledger
+from scripts.lib.process_failure import failure_detail
+from scripts.lib import scratch
 
 PYTHON = SCRIPTS / "lib/py"
 SEND_SECONDS = 10
@@ -73,16 +74,15 @@ def notify(repo_dir: Path, branch: str, tip: str) -> None:
         branch = branch.removeprefix("refs/heads/")
         if isinstance(standing, NoStyleProduction) or standing.branch_point != branch:
             return
-        address = subprocess.run([str(PYTHON), str(SHOWRUNNERS), "address", standing.slug],
+        address = subprocess.run([str(PYTHON), str(SHOWRUNNERS), "address", standing.name],
                                  capture_output=True, text=True, check=False, timeout=10)
         if address.returncode or not address.stdout.strip():
-            raise Refusal(address.stderr.strip() or f"no address for {standing.slug}")
-        caller_doc = showrunners.production_of(os.environ.get("CLAUDE_CODE_SESSION_ID", ""))
-        caller = showrunners.production_slug(str(caller_doc)) if caller_doc else "style_sync"
+            raise Refusal(address.stderr.strip() or f"no address for {standing.name}")
+        caller = showrunners.own_name() or "style_sync"
         sent = subprocess.run([
             str(PYTHON), str(session_send.SEND_SCRIPT), "--to", address.stdout.strip(), "--from", caller,
             "--text", f"From {caller}: branch point {branch} moved to {tip[:7]}; sync.",
-            "--key", f"style-sync:{standing.slug}",
+            "--key", f"style-sync:{standing.name}",
             "--timeout", str(SEND_SECONDS),
         ], capture_output=True, text=True, check=False, timeout=send_budget.seconds(SEND_SECONDS))
         outcome = send_result.send_outcome(sent.returncode, sent.stdout)
@@ -261,7 +261,7 @@ def unblock_held_signals() -> None:
 
 def verifier_command(directory: Path, owner: int) -> list[str]:
     return ["sh", "-c", VERIFIER_WRAPPER, "sh", str(directory / VERIFIER_FILE), str(owner),
-            "bash", str(VERIFY), "lint", "--workspace", "--check", "--no-cache"]
+            "bash", str(VERIFY), "lint", "--check", "--no-cache"]
 
 
 def verify_lint(directory: Path) -> tuple[int, str]:
@@ -350,11 +350,13 @@ def sweep_stale_lint_dirs() -> None:
 
 def gate_owner(repo: Path) -> str:
     """Use the registered style production, or the calling production."""
+    from scripts.production import staff, unit_lookup
+
     standing = standing_style_production(repo)
     if not isinstance(standing, NoStyleProduction):
-        return standing.slug
-    owner = showrunners.own_slug()
-    return owner or copies.fallback_owner("style")
+        return str(unit_lookup.doc_owner(standing.doc, staff.local_snapshot()).id)
+    row = staff.local_snapshot().owner_of(staff.caller_identity())
+    return str(row.id) if row is not None else copies.fallback_owner("style")
 
 
 def lint(repo: Path, checkout: Path, tip: str) -> int:
@@ -365,7 +367,7 @@ def lint(repo: Path, checkout: Path, tip: str) -> int:
         raise Refusal("--repo and --checkout must belong to the same repository")
     sweep_stale_lint_dirs()
     # Signals stay held outside the work, so the dir never exists without its record and its cleanup path.
-    with stop_signals_raise(), copies.standing(gate_owner(repo), checkout, tip) as snapshot, signal_mask(signal.SIG_BLOCK):
+    with stop_signals_raise(), copies.standing(gate_owner(repo), checkout, copies.CommittedSource(tip)) as snapshot, signal_mask(signal.SIG_BLOCK):
         directory = build_folders.create_build_folder(build_folders.UniqueBuildFolder(
             lint_prefix(), build_folders.ExplicitBuildParent(lint_temp_parent())))
         try:
@@ -406,9 +408,9 @@ def lint(repo: Path, checkout: Path, tip: str) -> int:
             _ = remove_lint_dir(Path(common_dir), directory)
 
 
-def runner_value(action: str, slug: str) -> str:
+def runner_value(action: str, name: str) -> str:
     result = subprocess.run(
-        [str(PYTHON), str(SHOWRUNNERS), action, slug],
+        [str(PYTHON), str(SHOWRUNNERS), action, name],
         capture_output=True, text=True, check=False, timeout=10,
     )
     if result.returncode:
@@ -416,13 +418,13 @@ def runner_value(action: str, slug: str) -> str:
     return result.stdout.strip()
 
 
-def handoff_notice(slug: str, parent: str, checkpoint: str) -> HandoffDelivery:
+def handoff_notice(name: str, parent: str, checkpoint: str) -> HandoffDelivery:
     address = runner_value("address", parent)
     if not address:
         raise Refusal(f"no address for {parent}")
     result = subprocess.run([
-        str(PYTHON), str(session_send.SEND_SCRIPT), "--to", address, "--from", slug,
-        "--text", f"From the showrunner of {slug}: hand-off {checkpoint}",
+        str(PYTHON), str(session_send.SEND_SCRIPT), "--to", address, "--from", name,
+        "--text", f"From the showrunner of {name}: hand-off {checkpoint}",
         "--timeout", str(SEND_SECONDS),
     ], capture_output=True, text=True, check=False, timeout=send_budget.seconds(SEND_SECONDS))
     outcome = send_result.send_outcome(result.returncode, result.stdout)
@@ -440,7 +442,7 @@ class WaitingUnitDirector:
     address: str
 
 
-def _waiting_directors(slug: str) -> tuple[WaitingUnitDirector, ...]:
+def _waiting_directors(name: str) -> tuple[WaitingUnitDirector, ...]:
     try:
         result = subprocess.run(
             [str(PYTHON), str(ROSTER), "--json"],
@@ -459,7 +461,7 @@ def _waiting_directors(slug: str) -> tuple[WaitingUnitDirector, ...]:
             if not isinstance(entry, dict):
                 raise Refusal("invalid entry")
             fields = cast(dict[str, object], entry)
-            if fields.get("role") != "unit director" or fields.get("production") != slug:
+            if fields.get("role") != "unit director" or fields.get("production") != name:
                 continue
             unit, address = fields.get("unit"), fields.get("address")
             if not isinstance(unit, str) or not isinstance(address, str):
@@ -486,22 +488,22 @@ def wake_waiters(repo: Path, ticket_id: str) -> None:
         if isinstance(standing, NoStyleProduction):
             return
         try:
-            directors = _waiting_directors(standing.slug)
+            directors = _waiting_directors(standing.name)
         except Refusal as error:
             for wait in waits:
                 print(f"style_ledger: wake {wait.unit}: {error}")
             return
         for wait in waits:
             try:
-                unit = unit_names.unit_id(ledger.unit_name(wait.unit))
+                unit = ledger.unit_name(wait.unit)
                 addresses = [director.address for director in directors if director.unit == unit]
                 if not addresses:
                     raise Refusal("no live director")
                 if len(addresses) != 1:
                     raise Refusal(f"{len(addresses)} directors")
                 result = subprocess.run([
-                    str(PYTHON), str(session_send.SEND_SCRIPT), "--to", addresses[0], "--from", standing.slug,
-                    "--text", f"From the showrunner of {standing.slug}: ticket {ticket_id} merged; refill.",
+                    str(PYTHON), str(session_send.SEND_SCRIPT), "--to", addresses[0], "--from", standing.name,
+                    "--text", f"From the showrunner of {standing.name}: ticket {ticket_id} merged; refill.",
                     "--timeout", str(SEND_SECONDS),
                 ], capture_output=True, text=True, check=False, timeout=send_budget.seconds(SEND_SECONDS))
                 if result.returncode:
@@ -512,7 +514,7 @@ def wake_waiters(repo: Path, ticket_id: str) -> None:
             ledger.acknowledge_sync_wait(wait)
 
 
-def replay_handoffs(ledger: style_ledger.Ledger, slug: str, parent: str) -> int:
+def replay_handoffs(ledger: style_ledger.Ledger, name: str, parent: str) -> int:
     failed = False
     for row in ledger.pending_handoffs():
         checkpoint = row["checkpoint"]
@@ -520,7 +522,7 @@ def replay_handoffs(ledger: style_ledger.Ledger, slug: str, parent: str) -> int:
             print(f"root: merge {checkpoint[:7]} with --root-self")
             continue
         try:
-            delivery = handoff_notice(slug, parent, checkpoint)
+            delivery = handoff_notice(name, parent, checkpoint)
         except (Refusal, OSError, ValueError, subprocess.TimeoutExpired) as error:
             print("style_sync: hand-off: " + " ".join(str(error).splitlines()))
             failed = True
@@ -534,23 +536,23 @@ def replay_handoffs(ledger: style_ledger.Ledger, slug: str, parent: str) -> int:
     return int(failed)
 
 
-def resume(repo: Path, slug: str, branch_point: str, style_branch: str) -> int:
+def resume(repo: Path, name: str, branch_point: str, style_branch: str) -> int:
     with style_ledger.open_ledger(repo) as ledger:
         for change in ledger.reconcile(branch_point, style_branch):
             print(change, flush=True)
-        return replay_handoffs(ledger, slug, runner_value("parent", slug))
+        return replay_handoffs(ledger, name, runner_value("parent", name))
 
 
-def send_handoff(repo: Path, slug: str, checkpoint: str) -> int:
+def send_handoff(repo: Path, name: str, checkpoint: str) -> int:
     with style_ledger.open_ledger(repo) as ledger:
         checkpoint = git(repo, "rev-parse", "--verify", f"{checkpoint}^{{commit}}")
         ledger.handoff_add(checkpoint)
-        parent = runner_value("parent", slug)
+        parent = runner_value("parent", name)
         if not parent:
             print(f"root: merge {checkpoint[:7]} with --root-self")
             return 0
         try:
-            delivery = handoff_notice(slug, parent, checkpoint)
+            delivery = handoff_notice(name, parent, checkpoint)
         except (Refusal, OSError, ValueError, subprocess.TimeoutExpired) as error:
             print("style_sync: hand-off: " + " ".join(str(error).splitlines()))
             return 1
@@ -587,7 +589,7 @@ def main(argv: list[str] | None = None) -> int:
     _ = wake.add_argument("--ticket", required=True)
     for command in (replay, handoff):
         _ = command.add_argument("--repo", type=Path, required=True)
-        _ = command.add_argument("--slug", required=True)
+        _ = command.add_argument("--production", required=True)
     _ = replay.add_argument("--branch-point", required=True)
     _ = replay.add_argument("--style-branch", required=True)
     _ = handoff.add_argument("--checkpoint", required=True)
@@ -602,10 +604,10 @@ def main(argv: list[str] | None = None) -> int:
             wake_waiters(cast(Path, args.repo), cast(str, args.ticket))
             return 0
         if cast(str, args.command) == "resume":
-            return resume(cast(Path, args.repo), cast(str, args.slug),
+            return resume(cast(Path, args.repo), cast(str, args.production),
                           cast(str, args.branch_point), cast(str, args.style_branch))
         if cast(str, args.command) == "send-handoff":
-            return send_handoff(cast(Path, args.repo), cast(str, args.slug), cast(str, args.checkpoint))
+            return send_handoff(cast(Path, args.repo), cast(str, args.production), cast(str, args.checkpoint))
         return lint(cast(Path, args.repo), cast(Path, args.checkout), cast(str, args.tip))
     except LintStopped as stopped:
         print(f"style_sync: {stopped}", file=sys.stderr)

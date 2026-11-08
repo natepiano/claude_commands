@@ -17,6 +17,10 @@ Environment readers retain only the names below.
 """
 
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import argparse
 import json
@@ -31,18 +35,12 @@ from typing import TYPE_CHECKING, Literal, cast
 if TYPE_CHECKING:
     from scripts.production import staff
 
-SCRIPTS = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(SCRIPTS / "herdr"))
-sys.path.insert(0, str(SCRIPTS / "lib"))
-sys.path.insert(0, str(SCRIPTS / "whoami"))
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-import herdr  # noqa: E402
-import pane_launch
+from scripts.herdr import herdr, pane_launch  # noqa: E402
 from scripts.lib import legacy_identity
-import sessions
-from pane_launch import PaneLaunch as PaneLaunch
-from pane_launch import (
+from scripts.message import sessions
+from scripts.herdr.pane_launch import PaneLaunch as PaneLaunch
+from scripts.herdr.pane_launch import (
     CLAUDE_VALUE_FLAGS as CLAUDE_VALUE_FLAGS,
     KEPT_NAMES as KEPT_NAMES,
     MODEL_FLAGS as MODEL_FLAGS,
@@ -350,19 +348,6 @@ def _conversation_of(config_dir: str, pid: int) -> str:
     return session_id if isinstance(session_id, str) else ""
 
 
-def codex_client_session(client: herdr.Herdr, pane_id: str) -> str:
-    """Read the current thread from the staff row named by the client's tab."""
-    from scripts.production import staff
-
-    try:
-        reference = client.pane_tab(pane_id)[2]["name"]
-        record = staff.initial_snapshot()
-    except (OSError, ValueError, herdr.HerdrFailure):
-        return ""
-    owner = record.by_member_reference(reference) or record.by_path(reference)
-    return owner.current_session if owner is not None else ""
-
-
 def seed(session: str, *, select: Callable[[herdr.PaneIdentity], bool] | None = None) -> int:
     """Record Claude and Codex panes; name each pane whose conversation cannot be read."""
     client = herdr.Herdr(session)
@@ -391,7 +376,7 @@ def seed(session: str, *, select: Callable[[herdr.PaneIdentity], bool] | None = 
             print(f"{pane_id}: cannot read the environment of {pid}: {error}")
             continue
         config_dir = environment.get("CLAUDE_CONFIG_DIR") or str(Path.home() / ".claude")
-        session_id = (codex_client_session(client, pane_id) if kind == "codex"
+        session_id = (client.codex_client_session(pane_id) if kind == "codex"
                       else _conversation_of(config_dir, pid))
         if not session_id:
             print(f"{pane_id}: no conversation id for {pid}")

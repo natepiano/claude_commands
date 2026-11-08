@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from ledger_test_support import ticket_owner_id
+from scripts.style.ledger_test_support import ticket_owner_id
 
 import unittest
 import fcntl
@@ -20,19 +20,19 @@ from contextlib import closing, redirect_stdout
 from datetime import datetime, timezone
 from typing import IO, cast, final
 from unittest import mock
-import rules
-import style_ledger
-from approved_renames import AppliedInCode
+from scripts.style import rules
+from scripts.style import style_ledger
+from scripts.style.approved_renames import AppliedInCode
 
 
-from ledger_test_support import (remove_generation_schema, LedgerTestCase, LedgerStatus, PARENT_FILE, style_unit_id)
+from scripts.style.ledger_test_support import (remove_generation_schema, LedgerTestCase, LedgerStatus, PARENT_FILE, style_unit_id)
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
 @final
 class StyleLedgerRecordsTests(LedgerTestCase):
     def test_path_attributes_classify_meta_roles_and_nested_cfg_attr_payloads(self) -> None:
-        from style_ledger import _path_attributes  # pyright: ignore[reportPrivateUsage]
+        from scripts.style.style_ledger import _path_attributes  # pyright: ignore[reportPrivateUsage]
         data = ('#[cfg(path = "predicate.rs")] fn f() {} '
                 '#[cfg_attr(path = "predicate.rs", allow(dead_code))] fn g() {} '
                 '#[custom(path = "argument.rs")] fn h() {} '
@@ -443,28 +443,28 @@ class StyleLedgerRecordsTests(LedgerTestCase):
         with (mock.patch.object(rules, "load_rules", side_effect=AssertionError("record_refill loads no catalog")),
               mock.patch.object(style_ledger, "open_ledger", side_effect=AssertionError("record_refill runs no migration"))):
             with mock.patch.object(style_ledger, "_now", return_value=first):
-                style_ledger.record_refill(self.repo, "names-unit", "phase written")
+                style_ledger.record_refill(self.repo, "names", "phase written")
             self.assertEqual(self.refill_result(ledger.database), (first, "phase written", "", 0, 0, 0, 0))
             with closing(sqlite3.connect(ledger.database)) as connection, connection:
                 _ = connection.execute("UPDATE refill_results SET split_at=?,ready=1,changed=2,structure=3,other=4", (first,))
             with mock.patch.object(style_ledger, "_now", return_value=later):
-                style_ledger.record_refill(self.repo, "names-unit", "repair first")
-                style_ledger.record_refill(self.repo, "types-unit", "board unavailable")
+                style_ledger.record_refill(self.repo, "names", "repair first")
+                style_ledger.record_refill(self.repo, "types", "board unavailable")
             self.assertEqual(self.refill_result(ledger.database), (later, "repair first", first, 1, 2, 3, 4))
-            self.assertEqual(self.refill_result(ledger.database, "types-unit"), (later, "board unavailable", "", 0, 0, 0, 0))
+            self.assertEqual(self.refill_result(ledger.database, "types"), (later, "board unavailable", "", 0, 0, 0, 0))
         with closing(sqlite3.connect(ledger.database)) as connection:
             self.assertEqual(connection.execute("SELECT COUNT(*) FROM refill_results").fetchone(), (2,))
 
     def test_record_refill_does_nothing_without_a_database_or_table(self) -> None:
         database = style_ledger.ledger_location(self.repo).database
-        style_ledger.record_refill(self.repo, "names-unit", "repair first")
+        style_ledger.record_refill(self.repo, "names", "repair first")
         self.assertFalse(database.exists())
         database.parent.mkdir(parents=True)
         with closing(sqlite3.connect(database)) as connection, connection:
             _ = connection.execute("CREATE TABLE existing(value TEXT)")
             _ = connection.execute("INSERT INTO existing VALUES ('kept')")
         before = database.read_bytes()
-        style_ledger.record_refill(self.repo, "names-unit", "no work")
+        style_ledger.record_refill(self.repo, "names", "no work")
         self.assertEqual(database.read_bytes(), before)
         with closing(sqlite3.connect(database)) as connection:
             self.assertEqual(connection.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall(), [("existing",)])
@@ -475,7 +475,7 @@ class StyleLedgerRecordsTests(LedgerTestCase):
         split = style_ledger.RecordedSplit(7, 6, 5, 4, measured_at)
         with (mock.patch.object(rules, "load_rules", side_effect=AssertionError("no catalog write")),
               mock.patch.object(style_ledger, "open_ledger", side_effect=AssertionError("no migration"))):
-            style_ledger.record_split(self.repo, "names-unit", split)
+            style_ledger.record_split(self.repo, "names", split)
         self.assertEqual(self.refill_result(ledger.database), ("", "", measured_at, 7, 6, 5, 4))
 
     def test_the_split_blob_cache_reads_each_tree_once_and_keeps_versions_distinct(self) -> None:
@@ -542,7 +542,7 @@ class StyleLedgerRecordsTests(LedgerTestCase):
     def test_split_write_uses_a_small_busy_timeout_on_a_locked_ledger(self) -> None:
         ledger = self.ledger()
         previous = style_ledger.RecordedSplit(9, 8, 7, 6, "2026-10-27T12:00:00+00:00")
-        style_ledger.record_split(self.repo, "names-unit", previous)
+        style_ledger.record_split(self.repo, "names", previous)
         before = self.refill_result(ledger.database)
         with closing(sqlite3.connect(ledger.database)) as writer:
             _ = writer.execute("BEGIN IMMEDIATE")
@@ -556,7 +556,7 @@ class StyleLedgerRecordsTests(LedgerTestCase):
 
             with (mock.patch.object(sqlite3, "connect", side_effect=observe_connect),
                   self.assertRaisesRegex(sqlite3.OperationalError, "database is locked")):
-                style_ledger.record_split(self.repo, "names-unit",
+                style_ledger.record_split(self.repo, "names",
                                           style_ledger.RecordedSplit(1, 2, 3, 4, "2026-10-28T12:00:00+00:00"),
                                           busy_timeout_seconds=0.05)
             writer.rollback()
@@ -568,12 +568,12 @@ class StyleLedgerRecordsTests(LedgerTestCase):
         first_at = "2026-10-27T12:00:00+00:00"
         later_at = "2026-10-28T10:00:00+00:00"
         with mock.patch.object(style_ledger, "_now", return_value=first_at):
-            style_ledger.record_refill(self.repo, "names-unit", "phase written")
-        style_ledger.record_split(self.repo, "names-unit", style_ledger.RecordedSplit(1, 2, 3, 4, first_at))
-        style_ledger.record_split(self.repo, "names-unit", style_ledger.RecordedSplit(0, 0, 0, 0, later_at))
+            style_ledger.record_refill(self.repo, "names", "phase written")
+        style_ledger.record_split(self.repo, "names", style_ledger.RecordedSplit(1, 2, 3, 4, first_at))
+        style_ledger.record_split(self.repo, "names", style_ledger.RecordedSplit(0, 0, 0, 0, later_at))
         self.assertEqual(self.refill_result(ledger.database), (first_at, "phase written", later_at, 0, 0, 0, 0))
         with mock.patch.object(style_ledger, "_now", return_value=later_at):
-            style_ledger.record_refill(self.repo, "names-unit", "waiting for sync")
+            style_ledger.record_refill(self.repo, "names", "waiting for sync")
         self.assertEqual(self.refill_result(ledger.database), (later_at, "waiting for sync", later_at, 0, 0, 0, 0))
 
     def test_withdraw_duplicates_is_idempotent_refuses_an_open_ticket_and_the_held_list_names_the_duplicate(self) -> None:

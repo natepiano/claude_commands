@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import re
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -48,10 +49,9 @@ PHASE_REFERENCE_PATTERN = re.compile(
     + r"\d+[a-z]?(?!\w|[-:./]\w))*)",
 )
 UNIT_PHASE_PREFIX = re.compile(
-    r"(?<![\w-])(?P<quote>`|'|\"|\*\*)?(?P<unit>[\w-]+-unit)"
+    r"(?:^|[;,&][ \t]*|\b(?i:and)[ \t]+)(?P<quote>`|'|\"|\*\*)?(?P<unit>(?!(?i:and)(?![\w-]))[\w-]+)"
     + r"(?:['’]s)?(?(quote)(?P=quote))(?:['’]s)?[ \t]+$"
 )
-BLOCKED_BY_PATTERN = re.compile(r"^\*\*Blocked by:\*\*[ \t]*(?P<gate>G\d+)", re.MULTILINE)
 
 
 class PlanPhase(TypedDict):
@@ -62,8 +62,6 @@ class PlanPhase(TypedDict):
     done: bool
     # The phases its `**Depends on:**` line names; None when the line is absent.
     depends_on: list[str] | None
-    # The gate its `**Blocked by:**` line names; empty when none.
-    blocked_by: str
 
 
 class EtaBand(NamedTuple):
@@ -143,21 +141,19 @@ def plan_phase_details(plan_path: Path, *, resolver: session_staff.RowResolver |
                 # A unit name qualifies only the phase span that follows it.
                 qualifier = UNIT_PHASE_PREFIX.search(dependency_text[: reference.start()])
                 if qualifier is not None and (
-                    isinstance(member, session_staff.NoSuchMember) or qualifier.group("unit").removesuffix("-unit") != member.row.name
+                    isinstance(member, session_staff.NoSuchMember) or qualifier.group("unit") != member.row.name
                 ):
                     continue
                 phase_ids = reference.group("single") or reference.group("list")
                 for dependency in phase_ids.replace(",", " ").replace("&", " ").split():
                     if dependency.lower() != "and" and dependency not in depends_on:
                         depends_on.append(dependency)
-        blocked_match = BLOCKED_BY_PATTERN.search(body)
         phases.append(
             PlanPhase(
                 id=identifier,
                 title=title,
                 done=done,
                 depends_on=depends_on,
-                blocked_by="" if blocked_match is None else blocked_match.group("gate"),
             )
         )
     return phases, duplicates
@@ -193,13 +189,10 @@ def _text(value: object) -> str:
 
 def staff_directory(fields: dict[str, object], record: staff.StaffSnapshot) -> dict[str, object]:
     """Resolve the director's current folder without changing its stored record."""
-    raw_identity = fields.get("main_agent")
-    identity = cast(dict[str, object], raw_identity) if isinstance(raw_identity, dict) else {}
-    session_id = _text(identity.get("session_id")) or _text(fields.get("owner_session"))
-    row = record.by_member_reference(session_id) if session_id else None
-    if row is not None and row.kind == "worker":
-        row = record.parent_of(row)
-    if row is None or row.kind != "unit":
+    if fields.get(unit_runs.OWNER_FIELD) and fields.get("status") and fields["status"] != "active":
+        return fields
+    row = unit_runs.run_owner(fields, record)
+    if isinstance(row, unit_runs.RunOwnerUnrecorded):
         return fields
     previous = _text(fields.get("working_dir"))
     for key in ("plan_doc", "project_plan_doc"):
@@ -211,6 +204,14 @@ def staff_directory(fields: dict[str, object], record: staff.StaffSnapshot) -> d
             del fields[key]
     if not isinstance(row.worktree, staff.WorktreeUnfilled):
         fields.update(working_dir=str(row.worktree.path), worktree=row.worktree.path.name)
+        if fields.get(unit_runs.OWNER_FIELD) and not fields.get("event_type"):
+            branch = subprocess.run(["git", "-C", str(row.worktree.path), "branch", "--show-current"],
+                                    capture_output=True, text=True, check=False)
+            fields["branch"] = branch.stdout.strip()
+            if branch.returncode == 0 and not fields["branch"]:
+                commit = subprocess.run(["git", "-C", str(row.worktree.path), "rev-parse", "--short", "HEAD"],
+                                        capture_output=True, text=True, check=False)
+                fields["branch"] = f"detached@{commit.stdout.strip() or 'unknown'}"
     return fields
 
 

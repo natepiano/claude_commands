@@ -36,25 +36,35 @@ def exclusive(path: Path, *, wait: bool = True) -> Generator[LockResult]:
             fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
 
 
-def lock_holder(lock: str, locks: str = PROC_LOCKS, *, reads: int = PROC_LOCKS_READS) -> int | None:
-    """Read the flock holder pid. Return None when the holder is not available.
+def device_key(path: str | Path) -> str:
+    """Identify the device and inode used by the kernel lock table."""
+    status = os.stat(path)
+    return f"{os.major(status.st_dev):02x}:{os.minor(status.st_dev):02x}:{status.st_ino}"
 
-    Read again because the kernel can omit a line when another lock ends.
-    """
+
+def held_flock_keys(locks: str = PROC_LOCKS) -> dict[str, int]:
+    """Read the kernel table once and map held flock keys to process ids."""
+    with open(locks, encoding="ascii", errors="replace") as handle:
+        lines = handle.read().splitlines()
+    held: dict[str, int] = {}
+    for line in lines:
+        fields = line.split()
+        if len(fields) > 5 and fields[1] == "FLOCK" and fields[4].isdigit():
+            _ = held.setdefault(fields[5], int(fields[4]))
+    return held
+
+
+def lock_holder(lock: str, locks: str = PROC_LOCKS, *, reads: int = PROC_LOCKS_READS) -> int | None:
+    """Read the flock holder pid; repeat when the kernel omits a holder line."""
     try:
-        stat = os.stat(lock)
+        device = device_key(lock)
     except OSError:
         return None
-    # A holder line has the pid and device. A waiter line contains "->".
-    device = f"{os.major(stat.st_dev):02x}:{os.minor(stat.st_dev):02x}:{stat.st_ino}"
     for _ in range(reads):
         try:
-            with open(locks, encoding="ascii", errors="replace") as handle:
-                lines = handle.read().splitlines()
+            held = held_flock_keys(locks)
         except OSError:
             return None
-        for line in lines:
-            fields = line.split()
-            if len(fields) > 5 and fields[1] == "FLOCK" and fields[5] == device and fields[4].isdigit():
-                return int(fields[4])
+        if device in held:
+            return held[device]
     return None

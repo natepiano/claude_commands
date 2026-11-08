@@ -2,7 +2,6 @@
 
 # Frozen copies: one helper makes every build copy
 
-> **Production: builds** — unit `verify-unit`; production doc `docs/plans/builds-production.md`
 > **Status:** approved by the user 2026-10-29 (via builds). Phase 1 done: measured 2026-10-30 02:00-02:41 EDT under verify-unit's build hold; the builds showrunner set the target mode to seed on 2026-10-30 (Decision, Verdict). Unit-director survey of the path format closed 23:00 EDT; its answers are in Survey changes.
 
 One helper, `scripts/copies/copies.py` (verify-unit), makes every frozen copy we build in: gate, review, merge and land copies on natedev, and the Mac test mirrors. It names each copy `/tmp/claude/copies/<showrunner>-<unit>/<phase>-<purpose>`, gives it its own git, fills its target by the measured best option, and registers it with the cleanup that already exists.
@@ -119,7 +118,8 @@ Survey of every unit director, sent 14:05 EDT 2026-10-29 to 45 units, closed 23:
 - The helper never writes into the source worktree (`review.sh` fails on a worktree change) [models].
 
 **Target.**
-- Mode `none` when the source has no `Cargo.toml`: no seed, no shared build-dir, no cargo lock. `merge_gate.py --checkout <copy>` then runs in the copy [roles, hierarchies, fix-rounds, screenshot, report, style-unit, models, phases].
+- Mode `none` when the source has no `Cargo.toml`: no seed, no shared build-dir, no cargo lock.
+  `targeted_test.py --checkout <copy>` then runs in the copy [roles, hierarchies, fix-rounds, screenshot, report, style-unit, models, phases].
 - A seed comes only from a target built with the same `Cargo.lock` and toolchain [hana-migration]. The newest landed gate copy of the repository is the first seed choice [merge-gate].
 - A before/after pair gets the same fill from the same base build [fastest].
 
@@ -174,7 +174,8 @@ Busy day: in-scope clones run about 78 a week (12 gate/merge + 31 phase + 22 oth
 - **Layout:** `scripts/copies/` (new), `scripts/mac_test/`, `scripts/production/mac_run.sh`.
 - **Key files:** `scripts/lib/scratch.py` (lifetime, resources-unit); `scripts/message/roster.py` (names, report-unit); `scripts/build_hold/build_hold.py:291` (owning session); `scripts/lint/sweep.py:187` (`LOCK_NAMES`, reuse for the seed lock); `scripts/mac_test/offload.py`.
 - **Test lanes:** `scripts/copies/test_copies.py`; `scripts/mac_test/test_offload*.py`.
-- **Build / Test:** `HERDR_BIN=/nonexistent/herdr python3 ~/.claude/scripts/production/merge_gate.py --checkout <tree> --tests-only` on a tree merged with origin/builds; `basedpyright` on changed files and every caller module.
+- **Build / Test:** `HERDR_BIN=/nonexistent/herdr python3 ~/.claude/scripts/production/targeted_test.py --checkout <tree>` on a tree merged with origin/builds.
+  Run `basedpyright` on changed files and every caller module.
 - **Invariants:** a copy has its own git dir, never a copied `.git` pointer (memory `gate-copy-needs-own-git`); a copy's `origin` is the source's origin URL, not the source path (`docs/plans/sdlc-phases.md:252`); one name source (roster); no copy outside `/tmp/claude/copies` once a caller moves.
 
 ## Phases

@@ -8,12 +8,12 @@ import os
 from contextlib import redirect_stderr
 from pathlib import Path
 import subprocess
-import sys
 import tempfile
 from typing import TYPE_CHECKING, cast
 import unittest
 from unittest import mock
 from scripts.production import staff
+from scripts.shutdown import remote
 
 if TYPE_CHECKING:
     from scripts.message.sessions import SessionRecord
@@ -62,7 +62,7 @@ class FileOnlyLabelTests(unittest.TestCase):
 
     def test_failed_discovery_keeps_healthy_rows_and_reports_each_problem_once(self) -> None:
         from scripts.message import unit_labels
-        from scripts.production import fake_showrunner, session_staff, showrunners
+        from scripts.production import session_staff, showrunners
         from scripts.production.staff_test_support import fixture_runtime_id
         from scripts.shutdown import remote
 
@@ -72,23 +72,26 @@ class FileOnlyLabelTests(unittest.TestCase):
             _ = doc.write_text("# Healthy production\n")
             identity = staff.StaffId(fixture_runtime_id("healthy-owner"))
             healthy_owner = staff.StaffRow(identity, "showrunner", "healthy-owner", staff.StaffRoot(),
-                                           current_session=identity, doc=staff.LiveDoc("natedev", doc))
+                                           current_session=identity, doc=staff.LiveDoc(remote.local_machine(), doc))
             missing_id = staff.StaffId(fixture_runtime_id("missing-owner"))
             missing = staff.StaffRow(missing_id, "showrunner", "missing-owner", staff.StaffRoot(),
                                      current_session=missing_id,
-                                     doc=staff.LiveDoc("natedev", root / "missing-production.md"))
-            _ = fake_showrunner.write_timer(root, "healthy-alias", identity, "UTC", doc)
+                                     doc=staff.LiveDoc(remote.local_machine(), root / "missing-production.md"))
+            timer_path = root / f"showrunner-{identity}"
+            timer_path.mkdir()
+            _ = (timer_path / "conf").write_text(
+                f"TARGET=session:{identity}\nCHECK=zsh /scripts/production_check.sh {identity}\n")
             record: SessionRecord = {
                 "pid": 123, "sessionId": identity, "name": "healthy", "messagingSocketPath": "",
                 "updatedAt": 1, "tmux": "", "formerNames": [],
             }
-            healthy = showrunners.Showrunner(session="healthy", socket="", slug="healthy-alias",
+            healthy = showrunners.Showrunner(session="healthy", socket="", name="healthy-owner",
                                              zone="UTC", doc=str(doc))
             resolver = session_staff.RowResolver(staff.StaffSnapshot((healthy_owner, missing)))
             problems: list[str] = []
             with (mock.patch.object(showrunners, "NOTIFIER_STATE_DIR", root),
                   mock.patch.dict(os.environ, {"USER_ZONE": "UTC"}),
-                  mock.patch.object(remote, "local_machine", return_value="natedev")):
+                  mock.patch.object(remote, "local_machine", return_value=remote.local_machine())):
                 rows = unit_labels.registered_showrunners(unit_labels.StaffDiagnostics(problems),
                                                          known_sessions={identity: record}, resolver=resolver)
             self.assertEqual(rows, [healthy])
@@ -110,27 +113,27 @@ class FileOnlyLabelTests(unittest.TestCase):
                 _ = document.write_text("# Production\n")
                 owner_id = staff.StaffId(fixture_runtime_id(name + "-owner"))
                 rows.append(staff.StaffRow(owner_id, "showrunner", name + "-owner", staff.StaffRoot(),
-                                          current_session=owner_id, doc=staff.LiveDoc("natedev", document)))
+                                          current_session=owner_id, doc=staff.LiveDoc(remote.local_machine(), document)))
                 unit_id = staff.StaffId(fixture_runtime_id(name + "-unit"))
                 rows.append(staff.StaffRow(unit_id, "unit", name, staff.ReportsTo(owner_id), current_session=unit_id,
-                                          worktree=staff.PresentWorktree("natedev", root / name)))
+                                          worktree=staff.PresentWorktree(remote.local_machine(), root / name)))
             snapshot = staff.StaffSnapshot(tuple(rows))
 
-            def timer(row: staff.StaffRow, record: staff.StaffSnapshot) -> showrunners.Timer:
+            def timer(row: staff.StaffRow, record: staff.StaffSnapshot) -> showrunners.TimerRegistration:
                 del record
                 if row.name == "broken-owner":
                     raise OSError("fixture timer cannot be read")
-                return showrunners.Timer("healthy-alias", f"session:{row.current_session}", root / "healthy.md", "UTC")
+                return showrunners.TimerRegistration("healthy-alias", f"session:{row.current_session}", "UTC")
 
             with (mock.patch.object(showrunners, "timer_for", side_effect=timer),
-                  mock.patch.object(remote, "local_machine", return_value="natedev")):
+                  mock.patch.object(remote, "local_machine", return_value=remote.local_machine())):
                 for reader in ("registrations", "places"):
                     with self.subTest(reader=reader):
                         problems: list[str] = []
                         resolver = session_staff.RowResolver(snapshot)
                         if reader == "registrations":
                             registered = unit_labels.registered_showrunners(unit_labels.StaffDiagnostics(problems), known_sessions={}, resolver=resolver)
-                            self.assertEqual([row["slug"] for row in registered], ["healthy-alias"])
+                            self.assertEqual([row["name"] for row in registered], ["healthy-owner"])
                         else:
                             places = unit_labels.production_places([], set(), unit_labels.StaffDiagnostics(problems), record=snapshot, resolver=resolver)
                             self.assertEqual(set(places), {rows[3].current_session})
@@ -139,9 +142,33 @@ class FileOnlyLabelTests(unittest.TestCase):
                         self.assertIn("broken-owner", problems[0])
                         self.assertIn("fixture timer cannot be read", problems[0])
 
+    def test_production_places_reads_each_parent_timer_once(self) -> None:
+        from scripts.message import unit_labels
+        from scripts.production import showrunners
+        from scripts.production.staff_test_support import fixture_member, isolated_staff_file
+
+        with tempfile.TemporaryDirectory() as directory, isolated_staff_file(Path(directory) / "staff.json", {}):
+            doc = Path(directory) / "production.md"
+            _ = doc.write_text("# Production\n")
+            parents = [fixture_member("showrunner", name=name, doc=staff.LiveDoc(remote.local_machine(), doc))
+                       for name in ("healthy", "broken")]
+            for parent in parents:
+                for number in range(3):
+                    _ = fixture_member("unit", name=f"{parent.name}-{number}", parent=parent.id)
+            record = staff.snapshot()
+            problems: list[str] = []
+            with mock.patch.object(showrunners, "timer_for", side_effect=[showrunners.NoTimer("fixture"),
+                                                                       OSError("fixture timer failed")]) as timers:
+                places = unit_labels.production_places([], set(), unit_labels.StaffDiagnostics(problems), record=record)
+            self.assertEqual(timers.call_args_list, [mock.call(parent, record) for parent in parents])
+            self.assertEqual({place.director for place in places.values()},
+                             {unit_labels.DirectsUnit(f"healthy-{number}") for number in range(3)})
+            self.assertEqual(len(problems), 1)
+            self.assertIn("fixture timer failed", problems[0])
+
     def test_unreadable_timer_file_does_not_remove_another_showrunners_rows(self) -> None:
         from scripts.message import unit_labels
-        from scripts.production import fake_showrunner, session_staff, showrunners
+        from scripts.production import session_staff, showrunners
         from scripts.production.staff_test_support import fixture_runtime_id
         from scripts.shutdown import remote
 
@@ -154,25 +181,28 @@ class FileOnlyLabelTests(unittest.TestCase):
                 _ = document.write_text("# Production\n")
                 owner_id = staff.StaffId(fixture_runtime_id(name + "-owner"))
                 rows.append(staff.StaffRow(owner_id, "showrunner", name + "-owner", staff.StaffRoot(),
-                                          current_session=owner_id, doc=staff.LiveDoc("natedev", document)))
+                                          current_session=owner_id, doc=staff.LiveDoc(remote.local_machine(), document)))
                 unit_id = staff.StaffId(fixture_runtime_id(name + "-unit"))
                 rows.append(staff.StaffRow(unit_id, "unit", name, staff.ReportsTo(owner_id), current_session=unit_id,
-                                          worktree=staff.PresentWorktree("natedev", root / name)))
-                _ = fake_showrunner.write_timer(timers, name + "-alias", owner_id, "UTC", document)
-            unreadable = timers / "showrunner-broken-alias/conf"
+                                          worktree=staff.PresentWorktree(remote.local_machine(), root / name)))
+                timer_path = timers / f"showrunner-{owner_id}"
+                timer_path.mkdir(parents=True)
+                _ = (timer_path / "conf").write_text(
+                    f"TARGET=session:{owner_id}\nCHECK=zsh /scripts/production_check.sh {owner_id}\n")
+            unreadable = timers / f"showrunner-{rows[0].id}" / "conf"
             unreadable.unlink()
             unreadable.mkdir()
             snapshot = staff.StaffSnapshot(tuple(rows))
             with (mock.patch.object(showrunners, "NOTIFIER_STATE_DIR", timers),
                   mock.patch.dict(os.environ, {"USER_ZONE": "UTC"}),
-                  mock.patch.object(remote, "local_machine", return_value="natedev")):
+                  mock.patch.object(remote, "local_machine", return_value=remote.local_machine())):
                 for reader in ("registrations", "places"):
                     with self.subTest(reader=reader):
                         problems: list[str] = []
                         resolver = session_staff.RowResolver(snapshot)
                         if reader == "registrations":
                             registered = unit_labels.registered_showrunners(unit_labels.StaffDiagnostics(problems), known_sessions={}, resolver=resolver)
-                            self.assertIn("healthy-alias", [row["slug"] for row in registered])
+                            self.assertIn("healthy-owner", [row["name"] for row in registered])
                         else:
                             places = unit_labels.production_places([], set(), unit_labels.StaffDiagnostics(problems), record=snapshot, resolver=resolver)
                             self.assertIn(rows[3].current_session, places)
@@ -194,17 +224,17 @@ class FileOnlyLabelTests(unittest.TestCase):
                 document = root / f"{name}.md"
                 _ = document.write_text("# Production\n")
                 owner_id = staff.StaffId(fixture_runtime_id(name + "-owner"))
-                document_state = (staff.WrappedDoc("natedev", document) if name == "wrapped"
-                                  else staff.LiveDoc("natedev", document))
+                document_state = (staff.WrappedDoc(remote.local_machine(), document) if name == "wrapped"
+                                  else staff.LiveDoc(remote.local_machine(), document))
                 rows.append(staff.StaffRow(owner_id, "showrunner", name, staff.StaffRoot(),
                                           current_session=owner_id, doc=document_state))
                 unit_id = staff.StaffId(fixture_runtime_id(name + "-unit"))
                 rows.append(staff.StaffRow(unit_id, "unit", name + "-child", staff.ReportsTo(owner_id), current_session=unit_id,
-                                          worktree=staff.PresentWorktree("natedev", root / name)))
+                                          worktree=staff.PresentWorktree(remote.local_machine(), root / name)))
             snapshot = staff.StaffSnapshot(tuple(rows))
             problems: list[str] = []
             with (mock.patch.object(showrunners, "timer_for", return_value=showrunners.NoTimer("private fixture")),
-                  mock.patch.object(remote, "local_machine", return_value="natedev")):
+                  mock.patch.object(remote, "local_machine", return_value=remote.local_machine())):
                 places = unit_labels.production_places([], set(), unit_labels.StaffDiagnostics(problems), record=snapshot,
                                                        resolver=session_staff.RowResolver(snapshot))
             self.assertEqual(set(places), {rows[3].current_session})
@@ -223,24 +253,25 @@ import sys
 from unittest import mock
 from scripts.message import unit_labels
 from scripts.production import staff
+from scripts.shutdown import remote
 from scripts.production import session_staff
 
 record = json.loads(sys.stdin.read())
 with (mock.patch.object(unit_labels, "newest_sessions", return_value=[record]),
       mock.patch.object(staff, "snapshot", return_value=staff.StaffSnapshot(())),
-      mock.patch.object(session_staff, "member_sources", return_value=session_staff.MemberSources({}, ()))):
+      mock.patch.object(session_staff, "member_sources", return_value=session_staff.MemberSources(()))):
     labels = unit_labels.unit_labels_for([record["sessionId"]], {
         "HERDR_PROC": sys.argv[1], "NOTIFIER_STATE_DIR": sys.argv[1],
         "NOTIFIER_SESSIONS_DIR": sys.argv[1],
     })
 print(json.dumps({
     "labels": {key: dataclasses.asdict(value) for key, value in labels.items()},
-    "herdr_modules": [name for name in sys.modules if name.rsplit(".", 1)[-1] == "herdr"],
+    "herdr_modules": [name for name in sys.modules if name in {"herdr", "scripts.herdr.herdr"}],
 }))
 """
         with tempfile.TemporaryDirectory() as directory:
             result = subprocess.run(
-                [sys.executable, "-c", program, directory], input=json.dumps(record),
+                [str(Path(__file__).resolve().parents[2] / "scripts/lib/py"), "-c", program, directory], input=json.dumps(record),
                 cwd=Path(__file__).resolve().parents[2], capture_output=True, text=True,
                 check=False, timeout=10,
             )

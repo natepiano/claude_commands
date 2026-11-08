@@ -1,11 +1,9 @@
 """A waiting shell keeps its queue place through client failures."""
 from __future__ import annotations
 
-from contextlib import redirect_stderr
 from collections.abc import Callable
 from dataclasses import replace
 from datetime import datetime
-import io
 import json
 import os
 from pathlib import Path
@@ -16,9 +14,9 @@ from typing import TypedDict, cast, override
 import unittest
 from unittest import mock
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from scripts.build_queue import admission_client as client, admission_protocol as wire
+from scripts.build_queue import snapshot_codec as codec, step_estimator
 from scripts.build_queue.admission_test_support import AdmissionFixture, FakeClock
 from scripts.lint import memory_admit as gate
 
@@ -58,7 +56,7 @@ def wait_client_main() -> int:
             cast(gate.NeedSource, "future-source") if action == "unknown" else "measured", 5)
         return gate.StepEstimate(gate.StepProfile("fixture", "nextest", "tree", peak,
             estimated_at=clock.now()), gate.ReusableEstimate())
-    with mock.patch.object(client, "CLOCK", clock), mock.patch.object(gate, "step_estimate", side_effect=estimate):
+    with mock.patch.object(client, "CLOCK", clock), mock.patch.object(step_estimator, "step_estimate", side_effect=estimate):
         with mock.patch.object(sys, "argv", ["admission_client.py", *sys.argv[2:]]):
             return client.main()
 
@@ -95,7 +93,7 @@ class AdmissionClientWaitTests(unittest.TestCase):
                 observations = [cast(CheckerCall, json.loads(line)) for line in calls.read_text().splitlines()]
                 observations[-1]["rows"] = {str(waiting.row["pid"]): waiting.row.copy()
                     for waiting in self.admission.server.waiters.values()}
-                _ = calls.write_text("".join(json.dumps(gate.snapshot_value(row)) + "\n" for row in observations))
+                _ = calls.write_text("".join(json.dumps(codec.snapshot_value(row)) + "\n" for row in observations))
             if isinstance(reply, wire.Admitted):
                 self.grants.append(reply)
                 self.grant_charges.append(tuple((record.reservation_id, record.need)
@@ -109,36 +107,20 @@ class AdmissionClientWaitTests(unittest.TestCase):
     def run_wait(self, actions: str, *, launch: bool = False) -> subprocess.CompletedProcess[str]:
         command = ('set -e; source "$1"; buildlog_memory_python() { '
             + 'if [[ "$1" == "$BUILDLOG_MEM_ADMIT_SCRIPT" ]]; then '
-            + 'shift; python3 "$TEST_WAIT_CLIENT" --wait-client "$@"; else python3 "$@"; fi; }; '
+            + 'shift; "$TEST_PY" "$TEST_WAIT_CLIENT" --wait-client "$@"; else "$TEST_PY" "$@"; fi; }; '
             + 'shift; if (( $# == 0 )); then '
             + 'trap \'printf "wait elapsed: %s\\n" "$BUILDLOG_MEM_WAIT_S" >&2\' EXIT; fi; '
             + 'buildlog_wait_for_memory "$@"; printf "%s\\n" "$BUILDLOG_MEM_OUTCOME"')
         return subprocess.run(["bash", "-c", command, "test",
             str(Path(__file__).parents[1] / "lint/memory_gate.sh"), *([] if launch else ["/bin/true"])],
             env={**self.environment, "TEST_CHECKER_ACTIONS": actions,
-                 "TEST_WAIT_CLIENT": str(Path(__file__).resolve())},
+                 "TEST_WAIT_CLIENT": str(Path(__file__).resolve()),
+                 "TEST_PY": str(Path(__file__).resolve().parents[1] / "lib/py")},
             cwd=self.root, text=True, capture_output=True, check=False, timeout=30)
 
     def calls(self) -> list[CheckerCall]:
         return [cast(CheckerCall, json.loads(line))
             for line in (self.root / "calls.jsonl").read_text().splitlines()]
-
-    def test_cap_wait_line_names_the_program_cap_without_a_history_fallback(self) -> None:
-        for program, words in (("merge-gate", "the merge gate's memory cap"),
-                               ("rust-analyzer", "rust-analyzer's memory cap")):
-            with self.subTest(program=program):
-                request = replace(self.admission.request(), profile=gate.ProgramProfile(
-                    program, "repo", "tree", gate.FixedCapSizing(6 * gate.GIB)))
-                with self.admission.loop_turn():
-                    reply = self.admission.server.handle_request(request)[0]
-                assert isinstance(reply, wire.Wait)
-                output = io.StringIO()
-                with redirect_stderr(output):
-                    client.WaitOutput()(reply)
-                self.assertIn(words, output.getvalue())
-                self.assertIn("6.0 GiB", output.getvalue())
-                self.assertNotIn("no history", output.getvalue())
-                self.assertNotIn("fallback", output.getvalue())
 
     def test_unknown_source_and_failed_poll_preserve_the_real_waiting_row(self) -> None:
         result = self.run_wait("unknown,fail,hold,admit")

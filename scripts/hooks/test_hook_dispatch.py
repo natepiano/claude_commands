@@ -7,7 +7,6 @@ import os
 import shlex
 import shutil
 import subprocess
-import sys
 import tempfile
 import textwrap
 import unittest
@@ -172,7 +171,7 @@ class IsolatedHookTests(unittest.TestCase):
         })
 
     def run_python(self, arguments: list[str], payload: dict[str, object]) -> subprocess.CompletedProcess[str]:
-        return subprocess.run([sys.executable, *arguments], input=json.dumps(payload),
+        return subprocess.run([str(Path(__file__).resolve().parents[2] / "scripts/lib/py"), *arguments], input=json.dumps(payload),
                               text=True, capture_output=True, check=False, timeout=TEST_HANG_GUARD_SECS,
                               env=self.environment, cwd=self.root)
 
@@ -367,7 +366,7 @@ class FakeHookTests(IsolatedHookTests):
     def run_fakes(self, event: str, hooks: Sequence[FakeHook], tool: str = "Bash") -> EventOutcome:
         rows = self.fake_files(hooks)
         driver = (
-            f"import sys\nsys.path.insert(0, {str(ROOT)!r})\n"
+            "import sys\n"
             + "from scripts.hooks import hook_dispatch as dispatch\n"
             + f"dispatch.EVENTS[{event!r}] = tuple(dispatch.HookSpec(filename, matcher or None, timeout) "
             + f"for filename, matcher, timeout in {rows!r})\n"
@@ -516,7 +515,7 @@ class FakeHookTests(IsolatedHookTests):
 class SettingsRegistrationTests(IsolatedHookTests):
     def test_push_delivery_hook_runs_only_for_push_notifications(self) -> None:
         driver = (
-            f"import sys, json\nsys.path.insert(0, {str(ROOT)!r})\n"
+            "import sys, json\n"
             + "from scripts.hooks import hook_dispatch as dispatch\n"
             + "calls = []\n"
             + "from pathlib import Path\n"
@@ -539,7 +538,7 @@ class SettingsRegistrationTests(IsolatedHookTests):
 
     def test_dispatcher_outer_timeouts_cover_all_hooks_and_overhead(self) -> None:
         driver = (
-            f"import sys, json, re\nsys.path.insert(0, {str(ROOT)!r})\n"
+            "import sys, json, re\n"
             + "from scripts.hooks import hook_dispatch as dispatch\n"
             + "tools = ('Bash', 'Write', 'Edit', 'MultiEdit', 'NotebookEdit', 'PushNotification', '')\n"
             + "print(json.dumps({event: max(sum(spec.timeout for spec in table "
@@ -569,7 +568,7 @@ class SettingsRegistrationTests(IsolatedHookTests):
 
     def test_dispatch_tables_equal_legacy_files_matchers_and_timeouts(self) -> None:
         driver = (
-            f"import sys, json\nsys.path.insert(0, {str(ROOT)!r})\n"
+            "import sys, json\n"
             + "from scripts.hooks import hook_dispatch as dispatch\n"
             + "tables = {'pre_tool_use': dispatch.PRE_TOOL_USE, 'post_tool_use': dispatch.POST_TOOL_USE, "
             + "'stop': dispatch.STOP}\n"
@@ -634,7 +633,7 @@ class DispatcherRepairTests(IsolatedHookTests):
             _ = path.write_text(hook.source + "\n", encoding="utf-8")
             rows.append((str(path), hook.timeout))
         driver = (
-            f"import sys\nsys.path.insert(0, {str(ROOT)!r})\n"
+            "import sys\n"
             + "from scripts.hooks import hook_dispatch as dispatch\n"
             + f"dispatch.EVENTS[{event!r}] = tuple(dispatch.HookSpec(filename, None, timeout) "
             + f"for filename, timeout in {rows!r})\n"
@@ -767,7 +766,7 @@ class CopyGuardDispatchTests(IsolatedHookTests):
         _ = later.write_text(f"from pathlib import Path\nPath({str(marker)!r}).touch()\n"
                              + "import sys\nprint('later refusal', file=sys.stderr)\nraise SystemExit(2)\n")
         driver = (
-            f"import sys\nsys.path.insert(0, {str(ROOT)!r})\n"
+            "import sys\n"
             + "from scripts.hooks import hook_dispatch as dispatch\n"
             + "original = dispatch._execute\n"
             + "def execute(path):\n"
@@ -786,7 +785,7 @@ class CopyGuardDispatchTests(IsolatedHookTests):
         completion = self.root / "timed-body-completed"
         later = self.root / "later-hook-ran"
         driver = (
-            f"import sys, time\nsys.path.insert(0, {str(ROOT)!r})\n"
+            "import sys, time\n"
             + "from pathlib import Path\n"
             + "from scripts.hooks import hook_dispatch as dispatch\n"
             + "from scripts.copies import copy_guard\n"
@@ -855,7 +854,7 @@ class CopyGuardDispatchTests(IsolatedHookTests):
 
     def test_service_command_and_other_events_pass_without_guard_refusal(self) -> None:
         for event, command in (
-            ("pre_tool_use", "python3 ~/.claude/scripts/copies/copies.py run --owner verify-unit --repo . --commit HEAD -- true"),
+            ("pre_tool_use", "python3 ~/.claude/scripts/copies/copies.py run --repo . --commit HEAD -- true"),
             ("post_tool_use", "git clone source destination"),
         ):
             with self.subTest(event=event):

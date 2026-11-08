@@ -4,7 +4,7 @@ from __future__ import annotations
 from scripts.build_queue.admission_test_support import caller_admission
 
 from scripts.lint import memory_admit as gate
-from scripts.lib.py_floor_test_support import cache_file_name
+from scripts.lib.py_floor_test_support import seed_interpreter_cache
 
 from scripts.lint.memory_test_support import config_environment, write_pressure_reading
 
@@ -15,9 +15,9 @@ import os
 import signal
 import shlex
 import shutil
-import sys
 import select
 import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -26,10 +26,11 @@ from typing import ClassVar, cast, override
 from scripts.lib.process_group import send_process_group
 from scripts.direct.wait_for_test_state import wait_until
 from scripts.direct.recorder_fixture import invoke_recorder, record_wait_workers
+from scripts.lib.atomic_file import write_text_atomic
 from scripts.production.staff_test_support import fixture_runtime_id
-from scripts.direct.local_release_wait import LocalReleaseEvents, local_release_waiter
 from scripts.direct.verify_mac_offload_test_support import RUSTC_STUB, stub_build_tool_path
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.lib.shell_test_support import shell_functions
 
 
 VERIFY = Path(__file__).with_name("verify.sh")
@@ -83,6 +84,8 @@ class VerifyTokenWaitFixture(unittest.TestCase):
         _ = caller_admission(self, self.root, self.environment)
 
     def build_fixture(self) -> None:
+        _ = (self.root / "build_targets.conf").write_text(
+            "targets=natedev\nkind.natedev=local\nplatform.natedev=linux\n")
         home = self.root / "home"
         home.mkdir()
         (home / ".claude").symlink_to(VERIFY.parent.parent.parent, target_is_directory=True)
@@ -159,7 +162,7 @@ esac
         reader = self.root / "lint-config.sh"
         _ = reader.write_text('lint_config_enabled() { [ "$1" != sweep ]; }\n'
                               + 'lint_config_skip_notice() { :; }\n')
-        for name in ("tmp", "runtime", "state", "cache", "session", "target", "cgroup"):
+        for name in ("tmp", "runtime", "state", "cache", "session", "target", "cgroup", "unit"):
             (self.root / name).mkdir()
         _ = (self.root / "Cargo.toml").write_text(
             '[package]\nname = "sample"\nversion = "0.1.0"\nedition = "2021"\n'
@@ -174,9 +177,7 @@ esac
         write_pressure_reading(pressure)
         # Interpreter selection is independent of token ownership. Seed the
         # shim's normal cache once rather than rediscovering Python per test.
-        interpreter = self.root / "cache" / "claude" / cache_file_name()
-        interpreter.parent.mkdir()
-        _ = interpreter.write_text(sys.executable + "\n")
+        seed_interpreter_cache(self.root / "cache")
         memory_event = self.root / "memory-event.py"
         _ = memory_event.write_text(
             "import os, sys\nfrom pathlib import Path\n"
@@ -217,10 +218,6 @@ esac
             "BUILDLOG_DIR": str(self.root / "buildlog"),
             "BUILDLOG_BUILDS_CGROUP": str(self.root / "cgroup"),
             "BUILDLOG_MEMINFO": str(meminfo),
-            # Two 12 GiB fallback promises fit this 48 GiB fixture. The host's
-            # 21 GiB budget would add an unrelated 120-second ramp wait before
-            # the test can observe the token handoff.
-            "BUILDLOG_BUILD_BUDGET_GIB": "48",
             "BUILDLOG_MEMORY_PRESSURE": str(pressure),
             "BUILDLOG_CI_CGROUP": str(self.root / "cgroup"),
             "BUILDLOG_ZRAM": str(self.root / "zram"),
@@ -229,6 +226,9 @@ esac
             "BUILD_HOLD_DIR": str(self.root / "build-hold"),
             "BUILD_HOLD_RELEASE_DIR": str(self.root / "hold-release"),
             "UNIT_ACTIVE_DIR": str(self.root / "active"),
+            "ROSTER_RUN_ROOT": str(self.root / "unit"),
+            "UNIT_RUN_ROOT": str(self.root / "unit"),
+            "SCRATCH_ROOT": str(self.root / "scratch"),
             "BUILDLOG_CALL_ID": "", "BUILDLOG_CALLER": "",
             "BUILD_TARGETS_SCRIPT": str(VERIFY.parent.parent / "build_targets" / "build_targets.py"),
             "BUILDLOG_HOLD_WAIT_FILE": "", "BUILDLOG_HOLD_ADMISSION_FILE": "",
@@ -329,6 +329,7 @@ esac
     def record_phase(self, session: Path) -> None:
         record_wait_workers(self.root, session, self.environment,
                             {f"fixture-{slot}": f"thread-{slot}" for slot in ("impl", "first", "second")})
+        write_text_atomic(session / "worker_transport", "mesh\n")
         self.environment.update({"UNIT_HISTORY_DIR": str(self.root / "history"),
                                  "UNIT_PHASE_ID": "6", "UNIT_SYNC_WRITES": "0",
                                  "UNIT_PASS_OWNER": "launcher", "CODEX_THREAD_ID": fixture_runtime_id("thread-impl"),
@@ -403,17 +404,8 @@ esac
         return process
 
     def wait_for_output(self, path: Path, text: str, process: subprocess.Popen[bytes]) -> None:
-        deadline = time.monotonic() + TEST_HANG_GUARD_SECS
-        with local_release_waiter(path.parent, path.parent) as events:
-            events.arm()
-            if isinstance(events, LocalReleaseEvents):
-                # Include MODIFY: the child keeps this log open while blocked.
-                _ = events.add_watch(events.descriptor, os.fsencode(path.parent), 0x00000FCA)
-            while text not in path.read_text(errors="replace") and process.poll() is None:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    break
-                events.wait(remaining if isinstance(events, LocalReleaseEvents) else min(0.01, remaining))
+        wait_until(lambda: text in path.read_text(errors="replace") or process.poll() is not None,
+                   path.parent, processes=(process,), watch_writes=True)
         self.assertIn(text, path.read_text(errors="replace"))
 
     def build_stub(self, targets: list[dict[str, object]]) -> dict[str, str]:
@@ -458,7 +450,7 @@ from scripts.direct.wait_for_test_state import wait_until
 root = Path(os.environ["TEST_HOLD_ROOT"])
 if sys.argv[1] == "eligible":
     print("natedev_only test target")
-    print("natedev\teligible\t-\t-")
+    print("natedev\teligible\t-\t-\t-")
 if sys.argv[1] == "wait-local":
     calls = root / "wait-local-calls"
     count = len(calls.read_text().splitlines()) if calls.exists() else 0
@@ -481,6 +473,39 @@ if sys.argv[1] == "wait-local":
                                        stderr=subprocess.STDOUT, start_new_session=True)
         self.started_groups.add(process.pid)
         self.wait_for_running(self.root / "hold-waiting", process)
+        return process
+
+    def start_owned_step(self, environment: dict[str, str]) -> subprocess.Popen[str]:
+        """Run the real command guard and renewer with a real board lease."""
+        source = VERIFY.read_text()
+        start = source.index("STEP_OWNER_PY='\n")
+        end = source.index("\nrelease_token() {", start)
+        script = self.root / "owned-step.sh"
+        _ = script.write_text('set -eo pipefail\nsource "$1"\n'
+            + source[start:end] + shell_functions(VERIFY, "release_token") + '''
+BOARD_HELPER=$TEST_BOARD_HELPER BOARD_DIR=$UNIT_RUN_DIR BOARD_SLOT=$UNIT_TEAM_ROLE
+STEP_RECORD_SCRIPT=$TEST_STEP_RECORD_SCRIPT
+PY=$TEST_REAL_PYTHON
+source "${STEP_RECORD_SCRIPT%/*}/../lib/conf.sh"
+TOKEN_HOLD_S=$(conf_value direct VERIFY_TOKEN_HOLD_SECONDS)
+TOKEN_RENEW_S=$(conf_value direct VERIFY_TOKEN_RENEW_SECONDS)
+TOKEN_HELD=0 TOKEN_WAIT_FILE=""
+HOLD_WAIT_DIR=$TEST_HOLD_DIRECTORY
+mkdir -p "$HOLD_WAIT_DIR"
+trap 'status=$?; release_token || true; exit "$status"' EXIT
+bash "$BOARD_HELPER" acquire "$BOARD_DIR" "$BOARD_SLOT" cargo --pid $$ --hold "$TOKEN_HOLD_S"
+TOKEN_HELD=1
+status=0
+buildlog_exec cargo check > "$HOLD_WAIT_DIR/command-output" 2>&1 || status=$?
+cat -- "$HOLD_WAIT_DIR/command-output"
+exit "$status"
+''')
+        process = subprocess.Popen(["bash", str(script), str(VERIFY.parent.parent / "lint/invoke.sh")],
+            cwd=self.root, env={**environment, "TEST_BOARD_HELPER": str(BOARD),
+                "TEST_STEP_RECORD_SCRIPT": str(VERIFY.with_name("step_record.py")),
+                "TEST_REAL_PYTHON": sys.executable, "TEST_HOLD_DIRECTORY": str(self.root / "owned-step-hold")},
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True)
+        self.started_groups.add(process.pid)
         return process
 
     def start_check(self, environment: dict[str, str]) -> subprocess.Popen[str]:

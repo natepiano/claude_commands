@@ -1,7 +1,9 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
 """Tests for the phase table built from worker state and durable events."""
 
 from __future__ import annotations
+
+from scripts.shutdown import remote
 
 import io
 import json
@@ -11,7 +13,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
-from contextlib import redirect_stderr
+from contextlib import chdir, redirect_stderr
 from datetime import datetime
 from pathlib import Path
 from typing import cast, override
@@ -22,10 +24,9 @@ from scripts.direct import phase_table
 from scripts.message import sessions
 from scripts.direct.recorder_fixture import invoke_recorder
 from scripts.lib.socket_test_support import short_socket_directory
-from scripts.production import fake_showrunner, fake_unit_host, showrunners, staff
-from scripts.production.production_doc import read_production
+from scripts.production import fake_showrunner, fake_unit_host, session_staff, showrunners, staff
 from scripts.production.staff_test_support import (
-    isolated_staff_file, production_membership, showrunner_relationship, recorded_showrunner, recorded_unit,
+    isolated_staff_file, production_membership, showrunner_relationship, recorded_showrunner, recorded_unit, unit_membership,
 )
 
 
@@ -85,6 +86,24 @@ class PhaseTableTests(unittest.TestCase):
     def write_plan(self, text: str) -> None:
         _ = self.plan.write_text(text, encoding="utf-8")
 
+    def test_owner_only_run_uses_the_moved_staff_folder_from_an_unrelated_folder(self) -> None:
+        self.write_plan(plan_text("# Plan", "### Phase 1 — Current work · status: todo"))
+        row = recorded_unit("show", "table", self.working_dir,
+                            self.working_dir / "docs/production.md", plan="docs/plan.md")
+        state = self.session_dir / "progress_history_state.json"
+        _ = state.write_text(json.dumps({"owner_staff_id": row.id, "status": "active", "plan_doc": "docs/plan.md"}))
+        before = state.read_bytes()
+        destination = self.root / "moved"
+        _ = self.working_dir.rename(destination)
+        _ = staff.set_worktree(row.id, staff.PresentWorktree("natedev", destination), expected=row.worktree)
+        with chdir(self.root):
+            record = self.build(1_200)
+        self.assertEqual(record.plan, destination / "docs/plan.md")
+        self.assertEqual([phase.title for phase in record.phases], ["Current work"])
+        self.assertEqual(state.read_bytes(), before)
+        with self.assertRaisesRegex(phase_table.NoState, "owner"):
+            _ = phase_table.build(self.session_dir, resolver=session_staff.RowResolver(staff.StaffSnapshot(())))
+
     def write_state(self, phase: dict[str, object] | None) -> None:
         state = {
             "working_dir": str(self.working_dir),
@@ -97,6 +116,13 @@ class PhaseTableTests(unittest.TestCase):
             json.dumps(state),
             encoding="utf-8",
         )
+
+    def test_run_without_a_folder_reports_unreadable_staff_as_no_state(self) -> None:
+        _ = (self.session_dir / "progress_history_state.json").write_text(
+            json.dumps({"plan_doc": "docs/plan.md"}))
+        _ = (self.root / "staff.json").write_text("[]")
+        with self.assertRaisesRegex(phase_table.NoState, "no available owner folder.*staff record must be an object"):
+            _ = phase_table.build(self.session_dir)
 
     def write_run(
         self,
@@ -154,8 +180,8 @@ class PhaseTableTests(unittest.TestCase):
             **fake_unit_host.environment(self.root),
         }
 
-    def write_production(self, unit: str = "table-unit") -> Path:
-        path = self.working_dir / "docs" / "show-production.md"
+    def write_production(self, unit: str = "table") -> Path:
+        path = self.working_dir / "docs" / "different-document.md"
         _ = path.write_text(
             plan_text(
                 "# Production — show",
@@ -177,7 +203,7 @@ class PhaseTableTests(unittest.TestCase):
         *rows: tuple[str, str, Path],
         checkout: Path | None = None,
     ) -> Path:
-        path = self.working_dir / "docs" / "show-production.md"
+        path = self.working_dir / "docs" / "different-document.md"
         checkout_path = checkout or self.working_dir
         _ = path.write_text(
             plan_text(
@@ -196,7 +222,7 @@ class PhaseTableTests(unittest.TestCase):
         for unit, plan, worktree in rows:
             row = recorded_unit("show", unit, worktree, path, plan=plan.split()[0])
             if plan.startswith("retired"):
-                _ = staff.set_worktree(row.id, staff.RemovedWorktree("natedev", worktree), expected=row.worktree)
+                _ = staff.set_worktree(row.id, staff.RemovedWorktree(remote.local_machine(), worktree), expected=row.worktree)
         return path
 
     def make_live_worktree(self, name: str) -> Path:
@@ -277,9 +303,11 @@ class PhaseTableTests(unittest.TestCase):
             env=self.environment(),
         )
 
-    def production_file_line(self, production: str = "show") -> str:
-        doc = (self.working_dir / "docs" / f"{production}-production.md").resolve()
-        return f'production_file: "{doc.as_uri()}"'
+    def unit_id(self, production: str = "show", unit: str = "table") -> str:
+        row = unit_membership(production, unit)
+        if isinstance(row.worktree, staff.WorktreeUnfilled):
+            row = staff.set_worktree(row.id, staff.RemovedWorktree(remote.local_machine(), self.root / row.id), expected=row.worktree)
+        return row.id
 
     def write_phase_note(
         self,
@@ -295,8 +323,7 @@ class PhaseTableTests(unittest.TestCase):
                 (
                     "---",
                     "phase_table: true",
-                    f"production: {production}",
-                    f"unit: {unit}",
+                    f"unit: {self.unit_id(production, unit)}",
                     "---",
                     "",
                 )
@@ -309,28 +336,13 @@ class PhaseTableTests(unittest.TestCase):
         self, folder: str, name: str, production: str, unit: str
     ) -> Path:
         path = self.write_phase_note(folder, name, production, unit)
-        _ = path.write_text(
-            path.read_text(encoding="utf-8").replace(
-                f"production: {production}", self.production_file_line(production)
-            ) + f"# {name}\n\nSaved phase table.\n",
-            encoding="utf-8",
-        )
+        _ = path.write_text(path.read_text(encoding="utf-8") + f"# {name}\n\nSaved phase table.\n", encoding="utf-8")
         return path
-
-    def record_former_production(self, production: Path) -> None:
-        _ = production.write_text(
-            production.read_text(encoding="utf-8").replace(
-                "## Production Context\n",
-                "## Production Context\n\n- **Formerly:** `old-name`\n",
-                1,
-            ),
-            encoding="utf-8",
-        )
 
     def write_showrunner(self, name: str = "showrunner") -> None:
         self.showrunner_record_number += 1
         session_id = showrunner_relationship("show").id
-        production = self.working_dir / "docs" / "show-production.md"
+        production = self.working_dir / "docs" / "different-document.md"
         _ = fake_showrunner.write_timer(
             self.notifier_dir,
             "show",
@@ -348,7 +360,7 @@ class PhaseTableTests(unittest.TestCase):
     def write_stopped_showrunner(self) -> None:
         self.showrunner_record_number += 1
         (self.sessions_dir / f"{os.getpid()}.json").unlink(missing_ok=True)
-        production = self.working_dir / "docs" / "show-production.md"
+        production = self.working_dir / "docs" / "different-document.md"
         _ = fake_showrunner.write_timer(
             self.notifier_dir,
             "show",
@@ -362,7 +374,6 @@ class PhaseTableTests(unittest.TestCase):
             plan_text(
                 "# Delivery plan",
                 "",
-                "> **Production: show** — unit `table-unit`; production doc `docs/show-production.md`",
                 "",
                 "### Phase 1 — Current delivery  · status: todo",
             )
@@ -388,7 +399,7 @@ class PhaseTableTests(unittest.TestCase):
         unit = next(row for row in staff.snapshot().find(kind="unit", parent=owner.id)
                     if row.name == "table")
         fake_unit_host.write(self.environment(), [fake_unit_host.HostedUnit(
-            "table-host", "w1:p1", {"SHOWRUNNER_UNIT": "show", "SHOWRUNNER_UNIT_ID": "table-unit"})])
+            "table-host", "w1:p1", {"SHOWRUNNER_UNIT": "show", "SHOWRUNNER_UNIT_ID": "table"})])
         if not live_name:
             return
         if not self.live_unit_pid:
@@ -839,7 +850,7 @@ class PhaseTableTests(unittest.TestCase):
         self.assert_epoch(later.times.start, 1_300)
         self.assert_epoch(later.times.finish, 1_600)
 
-    def eta_chain_fixture(self, *, gate: str = "", production: bool = True) -> None:
+    def eta_chain_fixture(self) -> None:
         """Ten-minute recorded work, a two-minute gap, then the Phase 5 promises."""
         lines = [
             "### Phase 4 — Finished delivery  · status: done",
@@ -849,25 +860,12 @@ class PhaseTableTests(unittest.TestCase):
             "### Phase 6 — Next delivery  · status: todo",
             "",
         ]
-        if gate:
-            lines += ["**Blocked by:** G2", ""]
         lines += ["### Phase 7 — Last delivery  · status: todo"]
-        if production:
-            production_doc = self.write_production("unit-a")
-            _ = production_doc.write_text(
-                production_doc.read_text(encoding="utf-8")
-                + plan_text(
-                    "", "## Gates", "",
-                    "| Gate | Waiting | Waits on | Clears when |",
-                    "| --- | --- | --- | --- |",
-                    f"| G2 | this unit phase 6 | renderer phase 9 | {gate} |",
-                ),
-                encoding="utf-8",
-            )
-            lines.insert(
-                0,
-                "> **Production: show** — unit `unit-a`; production doc `docs/show-production.md`",
-            )
+        _ = self.write_production("unit-a")
+        lines.insert(
+            0,
+            "> **Production: show** — unit `unit-a`; production doc `docs/different-document.md`",
+        )
         self.write_plan(plan_text(*lines))
         _ = self.write_run(
             "current", self.chain_time(16, 0),
@@ -921,80 +919,6 @@ class PhaseTableTests(unittest.TestCase):
         assert isinstance(record.plan_finish, phase_table.PredictedFinish)
         self.assert_epoch(record.plan_finish.at, self.chain_time(18, 59))
 
-    def test_timed_gate_delays_the_chain_and_names_the_release_time(self) -> None:
-        self.eta_chain_fixture(gate="release 2026-10-16 19:00; fallback 2026-10-16 20:00")
-
-        record = self.build(self.chain_time(18, 0))
-        gated = record.phases[2]
-        assert isinstance(gated, phase_table.TodoPhase)
-        assert isinstance(gated.times, phase_table.PredictedPhaseTiming)
-        self.assert_epoch(gated.times.start, self.chain_time(19, 0))
-        self.assert_epoch(gated.times.finish, self.chain_time(19, 10))
-        assert isinstance(record.plan_finish, phase_table.PredictedFinish)
-        self.assert_epoch(record.plan_finish.at, self.chain_time(19, 22))
-        rendered = phase_table.render(record, ZoneInfo("UTC"))
-        gated_row = next(line for line in rendered.splitlines() if line.startswith("| 6 |"))
-        self.assertIn("gated until Fri 16 Oct 19:00", gated_row)
-
-    def test_untimed_gate_removes_times_from_itself_and_every_later_phase(self) -> None:
-        self.eta_chain_fixture(gate="renderer checkpoint and review")
-
-        record = self.build(self.chain_time(18, 0))
-        rendered = phase_table.render(record, ZoneInfo("UTC"))
-
-        for phase in ("6", "7"):
-            row = next(line for line in rendered.splitlines() if line.startswith(f"| {phase} |"))
-            cells = [cell.strip() for cell in row.strip("|").split("|")]
-            self.assertEqual(cells[2:], ["gated by G2: renderer phase 9", "—", "—"])
-
-    def test_timed_gate_uses_the_productions_local_zone(self) -> None:
-        self.eta_chain_fixture(gate="release 2026-10-16 19:00")
-        production = self.working_dir / "docs" / "show-production.md"
-        _ = production.write_text(
-            production.read_text(encoding="utf-8").replace(
-                "**User zone:** UTC", "**User zone:** America/New_York",
-            ),
-            encoding="utf-8",
-        )
-
-        with patch.dict(os.environ, {"USER_ZONE": "America/New_York"}):
-            record = self.build(self.chain_time(18, 0))
-
-        gated = record.phases[2]
-        assert isinstance(gated, phase_table.TodoPhase)
-        assert isinstance(gated.times, phase_table.PredictedPhaseTiming)
-        self.assert_epoch(gated.times.start, self.chain_time(23, 0))
-        rendered = phase_table.render(record, ZoneInfo("America/New_York"))
-        row = next(line for line in rendered.splitlines() if line.startswith("| 6 |"))
-        self.assertIn("gated until Fri 16 Oct 19:00", row)
-
-    def test_gate_release_before_the_chain_does_not_pull_a_phase_earlier(self) -> None:
-        self.eta_chain_fixture(gate="expected 2026-10-16 17:00")
-
-        record = self.build(self.chain_time(18, 0))
-        next_phase = record.phases[2]
-        assert isinstance(next_phase, phase_table.TodoPhase)
-        assert isinstance(next_phase.times, phase_table.PredictedPhaseTiming)
-        self.assert_epoch(next_phase.times.start, self.chain_time(18, 32))
-
-    def test_cleared_gate_does_not_delay_predictions(self) -> None:
-        self.eta_chain_fixture(gate="cleared 2026-10-16 19:00 — merged")
-
-        record = self.build(self.chain_time(18, 0))
-        next_phase = record.phases[2]
-        assert isinstance(next_phase, phase_table.TodoPhase)
-        assert isinstance(next_phase.times, phase_table.PredictedPhaseTiming)
-        self.assert_epoch(next_phase.times.start, self.chain_time(18, 32))
-        self.assertNotIn("gated", phase_table.render(record, ZoneInfo("UTC")))
-
-    def test_blocked_by_is_ignored_without_a_production_document(self) -> None:
-        self.eta_chain_fixture(gate="renderer checkpoint", production=False)
-
-        record = self.build(self.chain_time(18, 0))
-        next_phase = record.phases[2]
-        assert isinstance(next_phase, phase_table.TodoPhase)
-        assert isinstance(next_phase.times, phase_table.PredictedPhaseTiming)
-        self.assert_epoch(next_phase.times.start, self.chain_time(18, 32))
 
     def test_phase_history_counts_moves_fixes_and_findings_across_attempts(self) -> None:
         self.write_plan(plan_text(
@@ -2124,9 +2048,8 @@ class PhaseTableTests(unittest.TestCase):
             "**Depends on:** Phase 2",
             "### Phase 5 — Docs  · status: todo",
             "**Depends on:** Phase 1",
-            "### Phase 6 — Gated  · status: todo",
-            "**Blocked by:** G2 — trunk phase 3 merged",
-            "**Depends on:** none",
+            "### Phase 6 — Later delivery  · status: todo",
+            "**Depends on:** Phase 2",
         )
 
         check = self.build(1_100).parallel
@@ -2141,7 +2064,7 @@ class PhaseTableTests(unittest.TestCase):
             "### Phase 3 — Notice  · status: todo",
             "**Depends on:** Phase 1",
             "### Phase 4 — Resources  · status: todo",
-            "**Depends on:** Phase 1 (resources-unit waits until 2026-10-29 00:00)",
+            "**Depends on:** Phase 1 (resources waits until 2026-10-29 00:00)",
         )
 
         result = subprocess.run(
@@ -2191,8 +2114,7 @@ class PhaseTableTests(unittest.TestCase):
             "### Phase 4 — Report  · status: todo",
             "**Depends on:** Phase 2, Phase 5",
             "### Phase 5 — Docs  · status: todo",
-            "**Blocked by:** G1 — trunk phase 2 merged",
-            "**Depends on:** none",
+            "**Depends on:** Phase 2",
         )
 
         line = phase_table.parallel_line(self.build(1_100).parallel)
@@ -2428,7 +2350,7 @@ class PhaseTableTests(unittest.TestCase):
 
     def test_render_keeps_a_stated_basis_inside_its_table_cell(self) -> None:
         zone = ZoneInfo("America/Los_Angeles")
-        basis = "lint | full tests\nthen the live check"
+        basis = "lint | targeted tests\nthen the live check"
 
         def epoch(hour: int, minute: int) -> int:
             return int(datetime(2026, 10, 8, hour, minute, tzinfo=zone).timestamp())
@@ -2463,7 +2385,7 @@ class PhaseTableTests(unittest.TestCase):
             )
 
         self.assertIn(
-            "| ETA from | stated 09:50: lint \\| full tests then the live check |",
+            "| ETA from | stated 09:50: lint \\| targeted tests then the live check |",
             rendered,
         )
         current_json = cast("dict[str, object]", parsed["current"])
@@ -2920,9 +2842,7 @@ class PhaseTableTests(unittest.TestCase):
                 (
                     "---",
                     "phase_table: true",
-                    "showrunner: showrunner",
-                    self.production_file_line(),
-                    "unit: table-unit",
+                    f"unit: {self.unit_id()}",
                     'now: "Phase 1 of 1 — Current delivery"',
                     "---",
                     "",
@@ -2957,7 +2877,6 @@ class PhaseTableTests(unittest.TestCase):
             plan_text(
                 "# Delivery plan",
                 "",
-                "> **Production: show** — unit `table-unit`; production doc `docs/show-production.md`",
                 "",
                 "### Phase 1 — Prior delivery  · status: done",
                 "",
@@ -2980,54 +2899,9 @@ class PhaseTableTests(unittest.TestCase):
 
         self.assertEqual((result.returncode, result.stdout, result.stderr), (0, "", ""))
         lines = (self.vault_root / "showrunner" / "table.md").read_text(encoding="utf-8").splitlines()
-        self.assertEqual(lines[5], 'now: "No phase running — 1 of 2 done"')
+        self.assertEqual(lines[3], 'now: "No phase running — 1 of 2 done"')
         heading = next(line for line in lines if line.startswith("**"))
-        self.assertEqual(json.loads(lines[5].removeprefix("now: ")), heading[2:-2])
-
-    def test_refresh_keeps_bases_filter_group_and_link_properties_in_frontmatter(self) -> None:
-        self.write_production_plan()
-        self.mark_unit("table")
-        for arguments in (
-            ("remote", "add", "origin", "git@github.com:someone/tools.git"),
-            ("symbolic-ref", "HEAD", "refs/heads/main"),
-        ):
-            _ = subprocess.run(
-                ["git", "-C", str(self.working_dir), *arguments],
-                check=True,
-                capture_output=True,
-            )
-        production = self.working_dir / "docs" / "show-production.md"
-        original = production.read_text(encoding="utf-8")
-        cases = (
-            ("github", self.working_dir, "https://github.com/someone/tools/blob/main/docs/show-production.md"),
-            ("vault", self.vault_root.parent, "[[docs/show-production]]"),
-        )
-        for label, checkout, link in cases:
-            with self.subTest(link=label):
-                _ = production.write_text(
-                    original.replace(
-                        "## Production Context\n",
-                        f"## Production Context\n\n- **Promote:** {checkout}\n",
-                    ),
-                    encoding="utf-8",
-                )
-
-                result = self.run_refresh()
-
-                self.assertEqual((result.returncode, result.stderr), (0, ""))
-                note = self.vault_root / "showrunner" / "table.md"
-                self.assertEqual(
-                    note.read_text(encoding="utf-8").splitlines()[:7],
-                    [
-                        "---",
-                        "phase_table: true",
-                        "showrunner: showrunner",
-                        f"production_file: {json.dumps(link)}",
-                        "unit: table-unit",
-                        'now: "Phase 1 of 1 — Current delivery"',
-                        "---",
-                    ],
-                )
+        self.assertEqual(json.loads(lines[3].removeprefix("now: ")), heading[2:-2])
 
     def test_refresh_keeps_note_bytes_and_mtime_when_only_time_and_progress_change(self) -> None:
         self.write_production_plan()
@@ -3111,7 +2985,6 @@ class PhaseTableTests(unittest.TestCase):
             plan_text(
                 "# Delivery plan",
                 "",
-                "> **Production: show** — unit `table-unit`; production doc `docs/show-production.md`",
                 "",
                 "### Phase 1 — Prior delivery  · status: done",
                 "",
@@ -3129,7 +3002,7 @@ class PhaseTableTests(unittest.TestCase):
 
         self.assertEqual((result.returncode, result.stdout, result.stderr), (0, "", ""))
         lines = (self.vault_root / "showrunner" / "table.md").read_text(encoding="utf-8").splitlines()
-        self.assertEqual(lines[5], 'now: "Phase 14 — Placement disk · not in this plan"')
+        self.assertEqual(lines[3], 'now: "Phase 14 — Placement disk · not in this plan"')
         self.assertIn("**Phase 14 — Placement disk · not in this plan**", lines)
 
     def test_refresh_escapes_title_in_now_and_replaces_owned_note(self) -> None:
@@ -3139,7 +3012,6 @@ class PhaseTableTests(unittest.TestCase):
             plan_text(
                 "# Delivery plan",
                 "",
-                "> **Production: show** — unit `table-unit`; production doc `docs/show-production.md`",
                 "",
                 f"### Phase 1 — {title}  · status: todo",
             )
@@ -3154,7 +3026,7 @@ class PhaseTableTests(unittest.TestCase):
         note = self.vault_root / "showrunner" / "table.md"
         text = note.read_text(encoding="utf-8")
         self.assertEqual(
-            text.splitlines()[5],
+            text.splitlines()[3],
             'now: "Phase 1 of 1 — Delivery: \\"quoted\\" \\\\ path"',
         )
         self.assertIn(f"**Phase 1 of 1 — {title}**\n", text)
@@ -3165,27 +3037,25 @@ class PhaseTableTests(unittest.TestCase):
         self.assertEqual((second.returncode, second.stdout, second.stderr), (0, "", ""))
         refreshed = note.read_text(encoding="utf-8")
         self.assertNotIn("old copy", refreshed)
-        self.assertEqual(refreshed.splitlines()[4], text.splitlines()[4])
+        self.assertEqual(refreshed.splitlines()[2], text.splitlines()[2])
         self.assertIn(f"**Phase 1 of 1 — {title}**\n", refreshed)
         self.assertNotIn("| Updated |", refreshed)
 
     def test_refresh_replaces_three_key_note_with_current_heading(self) -> None:
         self.write_production_plan()
         self.mark_unit("table")
-        note = self.write_phase_note("showrunner", "table", "show", "table-unit")
+        note = self.write_phase_note("showrunner", "table", "show", "table")
         self.assertNotIn("now:", note.read_text(encoding="utf-8"))
 
         result = self.run_refresh()
 
         self.assertEqual((result.returncode, result.stdout, result.stderr), (0, "", ""))
         self.assertEqual(
-            note.read_text(encoding="utf-8").splitlines()[:7],
+            note.read_text(encoding="utf-8").splitlines()[:5],
             [
                 "---",
                 "phase_table: true",
-                "showrunner: showrunner",
-                self.production_file_line(),
-                "unit: table-unit",
+                f"unit: {self.unit_id()}",
                 'now: "Phase 1 of 1 — Current delivery"',
                 "---",
             ],
@@ -3199,7 +3069,7 @@ class PhaseTableTests(unittest.TestCase):
 
         self.assertEqual(result.returncode, 0)
         self.assertTrue(
-            (self.vault_root / "showrunner" / "table-unit.md").is_file()
+            (self.vault_root / "showrunner" / "table.md").is_file()
         )
 
     def test_renamed_live_session_moves_its_note(self) -> None:
@@ -3268,51 +3138,6 @@ class PhaseTableTests(unittest.TestCase):
         self.assertEqual(result.returncode, 1)
         self.assertEqual(target.read_text(encoding="utf-8"), other)
 
-    def test_refresh_reclaims_a_note_owned_by_a_former_production_slug(self) -> None:
-        self.write_production_plan()
-        self.record_former_production(self.working_dir / "docs" / "show-production.md")
-        self.mark_unit("table")
-        target = self.write_linked_phase_note(
-            "showrunner", "table", "old-name", "table-unit"
-        )
-
-        result = self.run_refresh()
-
-        self.assertEqual((result.returncode, result.stderr), (0, ""))
-        text = target.read_text(encoding="utf-8")
-        self.assertIn(self.production_file_line(), text)
-        self.assertNotIn("old-name-production.md", text)
-        self.assertIn("Current delivery", text)
-
-    def test_refresh_keeps_former_slug_ownership_within_its_context_and_unit(self) -> None:
-        self.write_production_plan()
-        self.mark_unit("table")
-        production = self.working_dir / "docs" / "show-production.md"
-        original_doc = production.read_text(encoding="utf-8")
-        cases = (
-            ("outside context", "old-name", "table-unit", False),
-            ("unrelated production", "unrelated", "table-unit", True),
-            ("different unit", "old-name", "other-unit", True),
-        )
-        for label, slug, unit, in_context in cases:
-            with self.subTest(case=label):
-                _ = production.write_text(original_doc, encoding="utf-8")
-                if in_context:
-                    self.record_former_production(production)
-                else:
-                    with production.open("a", encoding="utf-8") as handle:
-                        _ = handle.write("\n## History\n\n- **Formerly:** `old-name`\n")
-                target = self.write_linked_phase_note("showrunner", "table", slug, unit)
-                before = target.read_bytes()
-
-                result = self.run_refresh()
-
-                self.assertEqual(result.returncode, 1)
-                self.assertEqual(
-                    result.stderr,
-                    f"phase note target is not owned by show/table-unit: {target}\n",
-                )
-                self.assertEqual(target.read_bytes(), before)
 
     def test_refresh_refuses_file_that_appears_during_publication(self) -> None:
         self.write_production_plan()
@@ -3392,7 +3217,7 @@ class PhaseTableTests(unittest.TestCase):
         self.assertTrue(target.is_file())
         text = target.read_text(encoding="utf-8")
         self.assertNotIn("| Updated |", text)
-        self.assertIn("\nshowrunner: last-known-showrunner\n", text)
+        self.assertNotIn("showrunner:", text)
         self.assertEqual(
             [path.relative_to(self.vault_root) for path in self.vault_root.rglob("*.md")],
             [Path("last-known-showrunner/after.md")],
@@ -3493,7 +3318,7 @@ class PhaseTableTests(unittest.TestCase):
 
     def test_invalid_production_document_is_one_line_refusal(self) -> None:
         self.write_production_plan()
-        production = self.working_dir / "docs" / "show-production.md"
+        production = self.working_dir / "docs" / "different-document.md"
         _ = production.write_text("# Incomplete production\n", encoding="utf-8")
 
         result = self.run_refresh()
@@ -3594,38 +3419,50 @@ class PhaseTableTests(unittest.TestCase):
         self.assertEqual(unreadable_show.returncode, 1)
         self.assertIn(str(missing_plan), unreadable_show.stderr)
 
-    def test_owned_notes_finds_former_slug_notes_only_for_the_same_unit(self) -> None:
-        production = self.write_units_production()
-        self.record_former_production(production)
-        former = self.write_linked_phase_note("runner", "former", "old-name", "table-unit")
-        current = self.write_linked_phase_note("runner", "current", "show", "table-unit")
-        other_unit = self.write_linked_phase_note("runner", "other-unit", "old-name", "other-unit")
-        unrelated = self.write_linked_phase_note("runner", "unrelated", "unrelated", "table-unit")
-        before = {path: path.read_bytes() for path in (former, current, other_unit, unrelated)}
-
+    def test_note_follows_staff_rename_and_transfer_without_rewrite(self) -> None:
+        self.write_production_plan()
+        path = self.write_phase_note("runner", "table", "show", "table")
+        before = path.read_bytes()
+        unit = unit_membership("show", "table")
+        other = showrunner_relationship("other")
+        _ = staff.rename(unit.id, "renamed")
+        _ = staff.move(unit.id, staff.ReportsTo(other.id))
         with patch.dict(os.environ, self.environment()):
-            identity = phase_table.production_identity(read_production(production))
-            found = phase_table.owned_notes(identity, "table-unit")
-            legacy_lookup = phase_table.owned_notes("show", "table-unit")
+            self.assertEqual(phase_table.owned_notes("show", "renamed"), [])
+            self.assertEqual(phase_table.owned_notes("other", "renamed"), [path])
+        self.assertEqual(path.read_bytes(), before)
 
-        self.assertEqual(found, sorted((former, current)))
-        self.assertEqual(legacy_lookup, [current])
-        for path, content in before.items():
-            self.assertEqual(path.read_bytes(), content)
+
+    def test_owned_notes_reuses_the_staff_record_after_the_file_disappears(self) -> None:
+        notes = [self.write_phase_note("runner", f"table-{index:02}", "show", "table")
+                 for index in range(35)]
+        _ = self.write_phase_note("runner", "foreign", "other", "other")
+        snapshot = staff.snapshot
+        staff_file = Path(os.environ["STAFF_FILE"])
+        saved = staff_file.read_bytes()
+        self.addCleanup(staff_file.write_bytes, saved)
+
+        def read_and_remove_staff() -> staff.StaffSnapshot:
+            record = snapshot()
+            staff_file.unlink()
+            return record
+
+        with patch.dict(os.environ, self.environment()), patch.object(staff, "snapshot", read_and_remove_staff):
+            self.assertEqual(phase_table.owned_notes("show", "table"), notes)
 
     def test_archive_moves_owned_notes_with_bytes_and_modes_unchanged(
         self,
     ) -> None:
         production = self.write_units_production()
-        first = self.write_phase_note("runner-one", "alpha", "show", "alpha-unit")
-        second = self.write_phase_note("runner-two", "beta", "show", "beta-unit")
+        first = self.write_phase_note("runner-one", "alpha", "show", "alpha")
+        second = self.write_phase_note("runner-two", "beta", "show", "beta")
         first_bytes = (
-            b"---\nphase_table: true\nproduction: show\nunit: alpha-unit\n---\n"
-            b"# Alpha\n\nFirst table.\n"
+            f"---\nphase_table: true\nunit: {self.unit_id(unit='alpha')}\n---\n".encode()
+            + b"# Alpha\n\nFirst table.\n"
         )
         second_bytes = (
-            b"---\nphase_table: true\nproduction: show\nunit: beta-unit\n---\n"
-            b"# Beta\n\nSecond table.\n"
+            f"---\nphase_table: true\nunit: {self.unit_id(unit='beta')}\n---\n".encode()
+            + b"# Beta\n\nSecond table.\n"
         )
         _ = first.write_bytes(first_bytes)
         _ = second.write_bytes(second_bytes)
@@ -3652,21 +3489,6 @@ class PhaseTableTests(unittest.TestCase):
         self.assertFalse(first.parent.exists())
         self.assertFalse(second.parent.exists())
 
-    def test_archive_owns_notes_from_a_former_production_slug(self) -> None:
-        production = self.write_units_production()
-        self.record_former_production(production)
-        source = self.write_linked_phase_note("old-runner", "table", "old-name", "table-unit")
-        before = source.read_bytes()
-        unrelated = self.write_linked_phase_note("old-runner", "other", "unrelated", "table-unit")
-        unrelated_before = unrelated.read_bytes()
-
-        result = self.run_archive(production)
-
-        target = self.vault_root.parent / "archive" / "old-runner" / "show" / "table.md"
-        self.assertEqual((result.returncode, result.stdout, result.stderr), (0, f"{target}\n", ""))
-        self.assertFalse(source.exists())
-        self.assertEqual(target.read_bytes(), before)
-        self.assertEqual(unrelated.read_bytes(), unrelated_before)
 
     def test_archive_leaves_notes_it_does_not_own_untouched(self) -> None:
         production = self.write_units_production()
@@ -3676,7 +3498,7 @@ class PhaseTableTests(unittest.TestCase):
         _ = handwritten.write_text("kept by a person\n", encoding="utf-8")
         missing_production = folder / "missing-production.md"
         _ = missing_production.write_text(
-            "---\nphase_table: true\nunit: table-unit\n---\nkept\n",
+            "---\nphase_table: true\nunit: table\n---\nkept\n",
             encoding="utf-8",
         )
         missing_unit = folder / "missing-unit.md"
@@ -3685,7 +3507,7 @@ class PhaseTableTests(unittest.TestCase):
             encoding="utf-8",
         )
         other = self.write_phase_note(
-            "showrunner", "other", "other", "table-unit"
+            "showrunner", "other", "other", "table"
         )
         before = {
             path: path.read_bytes()
@@ -3701,7 +3523,7 @@ class PhaseTableTests(unittest.TestCase):
 
     def test_archive_keeps_existing_target_and_adds_numeric_suffix(self) -> None:
         production = self.write_units_production()
-        source = self.write_phase_note("showrunner", "table", "show", "table-unit")
+        source = self.write_phase_note("showrunner", "table", "show", "table")
         source_bytes = source.read_bytes() + b"source\n"
         _ = source.write_bytes(source_bytes)
         target = (
@@ -3739,11 +3561,11 @@ class PhaseTableTests(unittest.TestCase):
     ) -> None:
         self.write_production_plan(register_showrunner=False)
         self.mark_unit("table")
-        source = self.write_phase_note("showrunner", "table", "show", "table-unit")
+        source = self.write_phase_note("showrunner", "table", "show", "table")
         source_bytes = source.read_bytes()
 
         archive_result = self.run_archive(
-            self.working_dir / "docs" / "show-production.md"
+            self.working_dir / "docs" / "different-document.md"
         )
 
         archived = (
@@ -3775,7 +3597,7 @@ class PhaseTableTests(unittest.TestCase):
             plan_text(
                 "# Delivery plan",
                 "",
-                "> **Production: other** — unit `table-unit`; production doc `docs/other-production.md`",
+                "> **Production: other** — unit `table`; production doc `docs/other-production.md`",
                 "",
                 "### Phase 1 — Current delivery  · status: todo",
             )
@@ -3786,7 +3608,7 @@ class PhaseTableTests(unittest.TestCase):
         recipient = recorded_showrunner("other", other_production)
         _ = staff.move(unit.id, staff.ReportsTo(recipient.id))
         fake_unit_host.write(self.environment(), [fake_unit_host.HostedUnit(
-            "table-host", "w1:p1", {"SHOWRUNNER_UNIT": "other", "SHOWRUNNER_UNIT_ID": "table-unit"})])
+            "table-host", "w1:p1", {"SHOWRUNNER_UNIT": "other", "SHOWRUNNER_UNIT_ID": "table"})])
         live_record = cast(dict[str, object], json.loads(
             (self.sessions_dir / f"record-{self.live_record_number}.json").read_text(encoding="utf-8")
         ))
@@ -3814,13 +3636,13 @@ class PhaseTableTests(unittest.TestCase):
             (0, "", ""),
         )
         refreshed_text = refreshed.read_text(encoding="utf-8")
-        self.assertIn(f"{self.production_file_line('other')}\n", refreshed_text)
-        self.assertIn("unit: table-unit\n", refreshed_text)
+        self.assertNotIn("production_file:", refreshed_text)
+        self.assertIn(f"unit: {self.unit_id('other')}\n", refreshed_text)
         self.assertEqual(archived.read_bytes(), source_bytes)
 
     def test_prune_leaves_archived_notes_in_place(self) -> None:
         production = self.write_units_production()
-        _ = self.write_phase_note("showrunner", "retired", "show", "retired-unit")
+        _ = self.write_phase_note("showrunner", "retired", "show", "retired")
         archive_result = self.run_archive(production)
         self.assertEqual(archive_result.returncode, 0)
         archived = (
@@ -3852,7 +3674,7 @@ class PhaseTableTests(unittest.TestCase):
         refresh_result = self.run_refresh()
         source = self.vault_root / "showrunner" / "x.md"
         archive_result = self.run_archive(
-            self.working_dir / "docs" / "show-production.md"
+            self.working_dir / "docs" / "different-document.md"
         )
         archived = vault / "archive" / "showrunner" / "show" / "x.md"
 
@@ -3978,16 +3800,15 @@ class PhaseTableTests(unittest.TestCase):
             ).is_file()
         )
 
-    def test_prune_archives_a_former_slugs_note_when_its_unit_is_gone(self) -> None:
-        live_worktree = self.make_live_worktree("former-slug-live")
+    def test_prune_archives_a_journal_named_note_when_its_unit_is_gone(self) -> None:
+        live_worktree = self.make_live_worktree("journal-live")
         _ = (live_worktree / "plan.md").write_text(
             plan_text("### Phase 1 — Live  · status: todo"), encoding="utf-8"
         )
         production = self.write_units_production(("live-unit", "plan.md", live_worktree))
-        self.record_former_production(production)
-        live = self.write_linked_phase_note("old-runner", "live", "old-name", "live-unit")
-        gone = self.write_linked_phase_note("old-runner", "gone", "old-name", "gone-unit")
-        unrelated = self.write_linked_phase_note("old-runner", "other", "unrelated", "gone-unit")
+        live = self.write_linked_phase_note("old-runner", "live", "show", "live-unit")
+        gone = self.write_linked_phase_note("old-runner", "gone", "show", "gone")
+        unrelated = self.write_linked_phase_note("old-runner", "other", "unrelated", "gone")
         before = {path: path.read_bytes() for path in (live, gone, unrelated)}
 
         result = self.run_prune(production)
@@ -4032,103 +3853,6 @@ class PhaseTableTests(unittest.TestCase):
 
         self.assertEqual(result.returncode, 0)
         self.assertIn("--session-dir", result.stdout)
-
-
-class ProductionFileLinkTests(unittest.TestCase):
-    """The `production_file` link names the doc's main-branch copy."""
-
-    temporary: tempfile.TemporaryDirectory[str]  # pyright: ignore[reportUninitializedInstanceVariable]
-    root: Path  # pyright: ignore[reportUninitializedInstanceVariable]
-    vault: Path  # pyright: ignore[reportUninitializedInstanceVariable]
-
-    @override
-    def setUp(self) -> None:
-        self.temporary = tempfile.TemporaryDirectory()
-        self.addCleanup(self.temporary.cleanup)
-        self.root = Path(self.temporary.name).resolve()
-        self.vault = self.root / "vault"
-        self.vault.mkdir()
-
-    def make_checkout(self, path: Path, remote: str) -> None:
-        path.mkdir(parents=True)
-        for arguments in (
-            ("init", "--quiet", "--initial-branch=main"),
-            ("remote", "add", "origin", remote),
-        ):
-            _ = subprocess.run(["git", "-C", str(path), *arguments], check=True)
-
-    def write_doc(self, checkout: Path, relative: str, promote: str) -> Path:
-        doc = checkout / relative
-        doc.parent.mkdir(parents=True, exist_ok=True)
-        _ = doc.write_text(f"# Production\n\n- **Promote:** {promote}\n", encoding="utf-8")
-        return doc
-
-    def test_doc_promoted_into_the_vault_is_a_wiki_link(self) -> None:
-        trunk = self.root / "trunk"
-        self.make_checkout(trunk, "git@github.com:someone/vault.git")
-        doc = self.write_doc(trunk, "productions/notes-production.md", str(self.vault))
-
-        link = phase_table._production_file_link(doc, self.vault)  # pyright: ignore[reportPrivateUsage]
-
-        self.assertEqual(link, "[[productions/notes-production]]")
-
-    def test_doc_promoted_outside_the_vault_is_its_github_page(self) -> None:
-        main = self.root / "main"
-        self.make_checkout(main, "git@github.com:someone/tools.git")
-        _ = subprocess.run(
-            ["git", "-C", str(main), "symbolic-ref", "HEAD", "refs/heads/trunk-line"],
-            check=True,
-        )
-        trunk = self.root / "trunk"
-        self.make_checkout(trunk, "git@github.com:someone/tools.git")
-        doc = self.write_doc(trunk, "docs/plans/tools-production.md", f"{main}, mac ~/tools")
-
-        link = phase_table._production_file_link(doc, self.vault)  # pyright: ignore[reportPrivateUsage]
-
-        self.assertEqual(
-            link,
-            "https://github.com/someone/tools/blob/trunk-line/docs/plans/tools-production.md",
-        )
-
-    def test_doc_off_github_is_a_file_uri_of_the_main_copy(self) -> None:
-        main = self.root / "main"
-        self.make_checkout(main, str(self.root / "bare.git"))
-        trunk = self.root / "trunk"
-        self.make_checkout(trunk, str(self.root / "bare.git"))
-        doc = self.write_doc(trunk, "docs/tools-production.md", str(main))
-
-        link = phase_table._production_file_link(doc, self.vault)  # pyright: ignore[reportPrivateUsage]
-
-        self.assertEqual(link, (main / "docs" / "tools-production.md").as_uri())
-
-    def test_slug_is_read_from_each_link_form(self) -> None:
-        cases = {
-            '"[[productions/notes-production]]"': "notes",
-            '"https://github.com/someone/tools/blob/main/docs/tools-production.md"': "tools",
-            '"file:///home/someone/docs/tools-production.md"': "tools",
-            '"[[productions/notes]]"': "",
-            "": "",
-        }
-        for link, slug in cases.items():
-            with self.subTest(link=link):
-                self.assertEqual(
-                    phase_table._production_slug_from_link(link),  # pyright: ignore[reportPrivateUsage]
-                    slug,
-                )
-
-    def test_note_with_only_production_file_is_owned(self) -> None:
-        note = self.root / "note.md"
-        _ = note.write_text(
-            "---\nphase_table: true\nshowrunner: natedev\n"
-            + 'production_file: "[[productions/notes-production]]"\n'
-            + "unit: alpha-unit\n---\n",
-            encoding="utf-8",
-        )
-
-        self.assertEqual(
-            phase_table._note_ownership(note),  # pyright: ignore[reportPrivateUsage]
-            phase_table.NoteOwnership(production="notes", unit="alpha-unit"),
-        )
 
 
 if __name__ == "__main__":

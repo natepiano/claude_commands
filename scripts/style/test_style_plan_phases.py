@@ -2,25 +2,23 @@
 
 from __future__ import annotations
 
-from ledger_test_support import ticket_owner_id
+from scripts.style.ledger_test_support import ticket_owner_id
 
 import subprocess
-import sys
 import unittest
 from pathlib import Path
 from typing import final
 from unittest import mock
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-import style_plan
-import unit_plans
+from scripts.style import style_plan
+from scripts.style import unit_plans
 
-import mechanical_classes
-import rules
-import style_ledger
+from scripts.style import mechanical_classes
+from scripts.style import rules
+from scripts.style import style_ledger
 
-from style_plan_test_support import StylePlanFixture
+from scripts.style.style_plan_test_support import StylePlanFixture
 
 
 @final
@@ -119,7 +117,7 @@ class StylePlanTests(StylePlanFixture):
         _ = self.rule("read", "tier: C\nfamily: names\ninput_scope: crate\n")
         self.sync()
         self.assertEqual(self.run_next(), (0, "phase written: 1\n", ""))
-        ticket_id = self.ledger().ticket_open(ticket_owner_id("names-unit"))[0]["id"]
+        ticket_id = self.ledger().ticket_open(ticket_owner_id("names"))[0]["id"]
         self.assertIn(
             f"Record every judged cell with `style_ledger.py record --ticket {ticket_id}`; "
             + "the ledger takes its pinned rule blob.\n"
@@ -142,7 +140,7 @@ class StylePlanTests(StylePlanFixture):
         self.sync()
         self.assertTrue(any(rule in ticket.rules and path in ticket.files for ticket in self.candidates()))
         result = subprocess.run(
-            [sys.executable, str(Path(style_ledger.__file__)), "record", "--repo", str(self.repo),
+            [str(Path(__file__).resolve().parents[1] / "lib/py"), str(Path(style_ledger.__file__)), "record", "--repo", str(self.repo),
              "--rule", rule, "--path", path, "--commit", self.tip, "--rule-blob",
              next(item.blob for item in rules.load_rules(self.repo) if item.rule_id == rule),
              "--verdict", "clean", "--ticket", "outside", "--worker", "test", "--input-scope", "rule",
@@ -192,8 +190,8 @@ class StylePlanTests(StylePlanFixture):
         for number, count in enumerate((2, 13), 1):
             with self.subTest(files=count):
                 ticket_id = f"{number}"
-                ledger.ticket_add(ticket_id, ticket_owner_id("names-unit"), "read", "names", "crates/alpha", files[:count], [rule])
-                ticket = ledger.queued_tickets(ticket_owner_id("names-unit"))[-1]
+                ledger.ticket_add(ticket_id, ticket_owner_id("names"), "read", "names", "crates/alpha", files[:count], [rule])
+                ticket = ledger.queued_tickets(ticket_owner_id("names"))[-1]
                 ledger.ticket_assign(ticket_id, "demo-style-names")
                 style_plan.write_phase(ledger, ticket, self.plan, self.plan_header())
                 ledger.ticket_drop(ticket_id)
@@ -219,7 +217,7 @@ class StylePlanTests(StylePlanFixture):
         ledger = self.ledger()
         for number, (family, rule) in enumerate((("names", plain), ("names", plain + "#uncovered"), ("types", types)), 1):
             with self.subTest(rule=rule):
-                unit = family + "-unit"
+                unit = family
                 ticket_id = str(number)
                 ledger.ticket_add(ticket_id, ticket_owner_id(unit), "read", family, "crates/alpha", list(self.sources[:2]), [rule])
                 ticket = ledger.queued_tickets(ticket_owner_id(unit))[-1]
@@ -243,9 +241,9 @@ class StylePlanTests(StylePlanFixture):
         rule = self.rule("structure", "tier: D\nfamily: modules\n")
         self.sync()
         ledger = self.ledger()
-        ledger.ticket_add("1", ticket_owner_id("names-unit"), "structure", "names", "crates/alpha",
+        ledger.ticket_add("1", ticket_owner_id("names"), "structure", "names", "crates/alpha",
                           list(self.sources[:2]), [rule], cells=tuple((rule, path) for path in self.sources[:2]))
-        ticket = ledger.queued_tickets(ticket_owner_id("names-unit"))[0]
+        ticket = ledger.queued_tickets(ticket_owner_id("names"))[0]
         ledger.ticket_assign("1", "demo-style-names")
         style_plan.write_phase(ledger, ticket, self.plan, self.plan_header())
         text = self.plan.read_text()
@@ -260,9 +258,9 @@ class StylePlanTests(StylePlanFixture):
         rule = self.rule("structure", "tier: D\nfamily: modules\n")
         self.sync()
         ledger = self.ledger()
-        ledger.ticket_add("3001", ticket_owner_id("modules-unit"), "structure", "modules", "crates/alpha",
+        ledger.ticket_add("3001", ticket_owner_id("modules"), "structure", "modules", "crates/alpha",
                           list(self.sources[:2]), [rule], cells=tuple((rule, path) for path in self.sources[:2]))
-        ticket = ledger.queued_tickets(ticket_owner_id("modules-unit"))[0]
+        ticket = ledger.queued_tickets(ticket_owner_id("modules"))[0]
         text = style_plan.phase_text(ticket, ledger.pinned_rule_texts(ticket["id"]), self.plan,
                                      unit_plans.delegation_context(self.plan.read_text()))
         self.assertNotIn("A site that breaks more than one rule above", text)
@@ -275,10 +273,10 @@ class StylePlanTests(StylePlanFixture):
         split = self.rule("when-to-split-a-module", "tier: D\nfamily: modules\n")
         self.sync()
         ledger = self.ledger()
-        ledger.ticket_add("3001", ticket_owner_id("modules-unit"), "structure", "modules", "crates/alpha",
+        ledger.ticket_add("3001", ticket_owner_id("modules"), "structure", "modules", "crates/alpha",
                           list(self.sources[:2]), [structure, split],
                           cells=tuple((rule, path) for rule in (structure, split) for path in self.sources[:2]))
-        ticket = ledger.queued_tickets(ticket_owner_id("modules-unit"))[0]
+        ticket = ledger.queued_tickets(ticket_owner_id("modules"))[0]
         texts = ledger.pinned_rule_texts(ticket["id"])
         context = unit_plans.delegation_context(self.plan.read_text())
         baseline = style_plan.phase_text(ticket, tuple(pin for pin in texts if pin.rule_id != split),
@@ -313,7 +311,7 @@ class StylePlanTests(StylePlanFixture):
         rule = self.rule("structure", "tier: D\nfamily: modules\n")
         self.sync()
         plan = self.modules_unit()
-        self.assertEqual(style_plan.next_phase("modules-unit", plan, self.repo), style_plan.PhaseWritten("1"))
+        self.assertEqual(style_plan.next_phase("modules", plan, self.repo), style_plan.PhaseWritten("1"))
         text = plan.read_text()
         self.assertEqual(text.split("**Files:**\n", 1)[1].split("\n**Workers:**", 1)[0],
                          "\n".join(f"- `{path}`" for path in self.sources[:2]) + "\n")
@@ -330,13 +328,13 @@ class StylePlanTests(StylePlanFixture):
                          + "Record each file's verdict for every rule above as soon as that file has been judged against it, "
                          + "with `record --path <file>`; the gate refuses this ticket while any file lacks one.")
         self.assertNotIn("window", text)
-        self.assertEqual(self.ledger().ticket_open(ticket_owner_id("modules-unit"))[0]["rules"], [rule])
+        self.assertEqual(self.ledger().ticket_open(ticket_owner_id("modules"))[0]["rules"], [rule])
 
     def test_written_names_phase_explains_conversions_pass_through_to_the_call_parameter(self) -> None:
         rule = self.rule("name-bindings-to-match-parameters")
         self.sync()
         self.assertEqual(self.run_next(), (0, "phase written: 1\n", ""))
-        self.assertEqual(self.ledger().ticket_open(ticket_owner_id("names-unit"))[0]["rules"], [rule])
+        self.assertEqual(self.ledger().ticket_open(ticket_owner_id("names"))[0]["rules"], [rule])
         self.assertIn(
             "uncovered read.\n"
             + "A conversion between the binding and the call passes through: `map_or`, `From::from`, `.into()`, "
@@ -368,7 +366,7 @@ class StylePlanTests(StylePlanFixture):
                          + "  kind: regex\n  pattern: absent\n  surface: partial\n  uncovered: Read every binding.\n")
         self.sync()
         self.assertEqual(self.run_next(), (0, "phase written: 1\n", ""))
-        self.assertEqual(self.ledger().ticket_open(ticket_owner_id("names-unit"))[0]["rules"], [rule + "#uncovered"])
+        self.assertEqual(self.ledger().ticket_open(ticket_owner_id("names"))[0]["rules"], [rule + "#uncovered"])
         self.assertIn(
             "uncovered read.\n"
             + "A conversion between the binding and the call passes through: `map_or`, `From::from`, `.into()`, "
@@ -502,7 +500,7 @@ class StylePlanTests(StylePlanFixture):
             _ = self.git("merge", "--ff-only", "main", cwd=checkout)
         self.sync()
         self.assertEqual(self.run_next(), (0, "phase written: 1\n", ""))
-        ticket = self.ledger().ticket_open(ticket_owner_id("names-unit"))[0]
+        ticket = self.ledger().ticket_open(ticket_owner_id("names"))[0]
         self.assertEqual((ticket["crate"], ticket["files"]), (".", ["root.rs"]))
         self.assertIn("- `root.rs` — lines 1-1\n", self.plan.read_text())
         self.assertNotIn("binary-only", self.plan.read_text())
@@ -531,9 +529,9 @@ class StylePlanTests(StylePlanFixture):
         rule = self.rule("structure", "tier: D\nfamily: modules\ncandidates:\n  kind: regex\n  pattern: value\n  surface: partial\n  uncovered: Read the crate layout.\n")
         self.sync()
         plan = self.modules_unit()
-        result = style_plan.next_phase("modules-unit", plan, self.repo)
+        result = style_plan.next_phase("modules", plan, self.repo)
         self.assertIsInstance(result, style_plan.PhaseWritten)
-        ticket = self.ledger().ticket_open(ticket_owner_id("modules-unit"))[0]
+        ticket = self.ledger().ticket_open(ticket_owner_id("modules"))[0]
         self.assertEqual(ticket["rules"], [rule])
         self.assertEqual({site["path"] for site in ticket["sites"]}, set(self.sources[:2]))
         text = plan.read_text()
@@ -559,7 +557,7 @@ class StylePlanTests(StylePlanFixture):
         self.sync()
         plan = self.modules_unit()
         with mock.patch.object(mechanical_classes, "classes", return_value=mechanical_classes.load(listed, catalog)):
-            self.assertIsInstance(style_plan.next_phase("modules-unit", plan, self.repo), style_plan.PhaseWritten)
+            self.assertIsInstance(style_plan.next_phase("modules", plan, self.repo), style_plan.PhaseWritten)
         text = plan.read_text()
         self.assertIn("- `pure-move` (", text)
         self.assertIn("- `third-class` (`third-rule`): A third change takes out one word.", text)
@@ -570,7 +568,7 @@ class StylePlanTests(StylePlanFixture):
         listed = self.rule("listed", "tier: B\nfamily: names\npre_filter: value\n")
         self.sync()
         plan = self.modules_unit()
-        self.assertIsInstance(style_plan.next_phase("modules-unit", plan, self.repo), style_plan.PhaseWritten)
+        self.assertIsInstance(style_plan.next_phase("modules", plan, self.repo), style_plan.PhaseWritten)
         text = plan.read_text()
         instructions = (
             "Judge file by file", "sibling files in the same module", "direct callers",
@@ -583,7 +581,7 @@ class StylePlanTests(StylePlanFixture):
         self.assertIn("Read only these pinned rule texts.", text)
         self.assertIn("#uncovered rule is the parent rule's uncovered read.", text)
         ledger = self.ledger()
-        self.assertEqual(ledger.ticket_open(ticket_owner_id("modules-unit"))[0]["rules"], [structure])
+        self.assertEqual(ledger.ticket_open(ticket_owner_id("modules"))[0]["rules"], [structure])
         issue = self.root / "approved.md"
         blob = next(rule.blob for rule in rules.load_rules(self.repo) if rule.rule_id == read)
         finding = ledger.hold(read, self.sources[0], 1, "value", "type", "u32", "u64", blob, "outside")
@@ -593,11 +591,11 @@ class StylePlanTests(StylePlanFixture):
             with self.subTest(kind=kind):
                 rule = listed if kind == "listed" else read
                 ticket_id = ledger.next_ticket_id()
-                ledger.ticket_add(ticket_id, ticket_owner_id("names-unit"), kind, "names", "crates/alpha", [self.sources[0]],
+                ledger.ticket_add(ticket_id, ticket_owner_id("names"), kind, "names", "crates/alpha", [self.sources[0]],
                                   [rule], rule=rule if kind == "listed" else "",
                                   proposal=str(issue) if kind == "proposal" else "",
                                   finding_ids=(finding.finding_id,) if kind == "proposal" else ())
-                ticket = ledger.queued_tickets(ticket_owner_id("names-unit"))[-1]
+                ticket = ledger.queued_tickets(ticket_owner_id("names"))[-1]
                 phase = style_plan.phase_text(ticket, ledger.pinned_rule_texts(ticket_id), self.plan,
                                               unit_plans.delegation_context(self.plan.read_text()),
                                               file_windows={self.sources[0]: (style_plan.ReadWindow(1, 1),)})
@@ -612,9 +610,9 @@ class StylePlanTests(StylePlanFixture):
                                 "Read only these pinned rule texts. For a structure ticket, judge each rule's "
                                 + "listed sites and its uncovered surface together; read the uncovered instructions in the pinned text.")
         _ = plan.write_text(legacy)
-        self.assertEqual(style_plan.next_phase("modules-unit", plan, self.repo), style_plan.Resumed("1"))
+        self.assertEqual(style_plan.next_phase("modules", plan, self.repo), style_plan.Resumed("1"))
         self.assertEqual(plan.read_text(), text)
-        self.assertEqual(len(ledger.ticket_open(ticket_owner_id("modules-unit"))), 1)
+        self.assertEqual(len(ledger.ticket_open(ticket_owner_id("modules"))), 1)
 
     def test_listed_packing_keeps_whole_files_and_selects_remaining_file_after_judgment(self) -> None:
         for path, count in zip(self.sources, (100, 100, 151, 0), strict=True):

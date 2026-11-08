@@ -68,12 +68,6 @@
 | `scripts/production/showrunners.py` | stalls-unit | enh-showrunner-unit (after stalls-unit Phase 6 merges) |
 | `scripts/production/stall_watch.py` | stalls-unit | enh-showrunner-unit (after stalls-unit Phase 6 merges) |
 
-## Gates
-
-| Gate | Waiting | Waits on | Clears when |
-| --- | --- | --- | --- |
-| G1 | enh-showrunner-unit Phase 4 | stalls-unit Phase 6 | cleared 16:00 PDT 2026-10-06: 966b814 merged, enh-showrunner told |
-
 ## Close-out
 
 - followups-unit Phase 1 on main: mark `~/.local/state/nightly-review/ledger.md` line 15 accepted with the main sha — done (0bbccc0).

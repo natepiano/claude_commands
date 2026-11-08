@@ -48,6 +48,10 @@ the run's durable event stream when `progress_history.py` has started a run.
 """
 
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import argparse
 import fcntl
@@ -66,7 +70,7 @@ from typing import TypedDict, cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.lib import conf, unit_runs  # noqa: E402
-from scripts.history.rounds import phase_rounds  # noqa: E402
+from scripts.history.rounds import pass_ledger_round, phase_rounds, refunded_batches  # noqa: E402
 from scripts.usage.agents_log import LENSES as REVIEW_LENSES  # noqa: E402
 
 # What history written before the rename records for a finding a worker caught.
@@ -89,12 +93,11 @@ LATER_ROUND_GATING = ("blocker",)
 LEGACY_BOTH_LENS = "both"
 
 STATE_OPEN = "open"
-# Dispatching a repair proves an attempt was launched, never that it landed, so
-# these are two states rather than one. A repair that dies -- killed, crashed,
-# or abandoned mid-edit -- leaves its findings `repair_in_flight`, and both the
-# gate and the closure verdict refuse that state. Collapsing them would let a
-# dead repair present its findings to the next review already labelled fixed,
-# which is a request to confirm work nobody did.
+# Dispatch reserves an attempt before launch. It never proves that the repair landed.
+# These are two states rather than one. A killed, crashed, or abandoned repair
+# leaves its findings `repair_in_flight`. The gate and the closure verdict refuse
+# that state. One shared state would present a dead repair's findings as fixed.
+# The next reviewer would then confirm work that nobody completed.
 STATE_IN_FLIGHT = "repair_in_flight"
 STATE_PENDING = "fixed_pending_review"
 STATE_ACCEPTED = "accepted"
@@ -188,10 +191,8 @@ def _state_path(session_dir: Path) -> Path:
 def _parked_path(session_dir: Path, instance_id: str) -> Path:
     """Where a phase's ledger waits while another open phase is current.
 
-    Phases can be open together, and the current one owns `findings_state.json`
-    (implement.sh reads it there). The ledger it displaces is kept here rather
-    than discarded, so the older phase finds its findings when it is current
-    again.
+    The current phase owns `findings_state.json`, which assign_claude.py reads.
+    Keep the previous ledger here until its phase becomes current again.
     """
     return session_dir / f"findings_state-{instance_id}.json"
 
@@ -207,9 +208,8 @@ def _ledger_instance(path: Path) -> str:
 def _write_state(session_dir: Path, state: dict[str, object]) -> None:
     """Write a phase's ledger where its readers look for it.
 
-    The newest open phase owns `findings_state.json`. An older open phase named
-    with `--phase` writes its parked file instead, so its repair never displaces
-    the newest phase's ledger from the file implement.sh checks.
+    The newest open phase owns `findings_state.json`, which assign_claude.py checks.
+    An older open phase named with `--phase` writes its parked file.
     """
     session_dir.mkdir(parents=True, exist_ok=True)
     live = _state_path(session_dir)
@@ -363,8 +363,18 @@ def _read_state(
     session_dir: Path, now: float, phase: str = "", *, closed_phase_ok: bool = False,
 ) -> dict[str, object]:
     """Load the phase's ledger: the live file, a parked one, or a fresh one."""
-    path = _state_path(session_dir)
     instance_id, phase_id = _phase_identity(session_dir, phase, closed_phase_ok=closed_phase_ok)
+    return read_phase_ledger(session_dir, instance_id, phase_id, now)
+
+
+def read_phase_ledger(
+    session_dir: Path, instance_id: str, phase_id: str, now: float,
+) -> dict[str, object]:
+    """Read the selected instance's ledger without changing the current phase."""
+    path = _state_path(session_dir)
+    parked = _parked_path(session_dir, instance_id)
+    if not path.exists() and instance_id and parked.exists():
+        path = parked
     if not path.exists():
         return _fresh_state(instance_id, phase_id, now)
     try:
@@ -374,7 +384,6 @@ def _read_state(
     if state is None:
         raise SystemExit(f"Invalid findings state: {path}")
     if instance_id and _string(state.get("phase_instance_id")) != instance_id:
-        parked = _parked_path(session_dir, instance_id)
         if parked.exists():
             try:
                 kept = _json_object(parked.read_text(encoding="utf-8"))
@@ -402,20 +411,20 @@ def _finding(state: dict[str, object], finding_id: str) -> dict[str, object]:
 
 
 def _rounds(state: dict[str, object]) -> list[dict[str, object]]:
-    """Every round ever dispatched, abandoned ones included.
+    """Every batch ever dispatched, including abandoned batches.
 
-    This is the audit trail and the source of round numbers, which stay
-    monotonic so no two entries in the event stream share one.
+    This is the audit trail and the source of dispatch numbers. The numbers
+    stay monotonic, so no two entries in the event stream share one.
     """
     return _object_list(state.get("rounds"))
 
 
 def _live_rounds(state: dict[str, object]) -> list[dict[str, object]]:
-    """The rounds that actually ran, which are the ones convergence counts.
+    """The batches whose attempts remain charged, which convergence counts.
 
-    An abandoned round consumed no repair: its worker died before finishing, so
-    charging it against the repair budget or reading it as a stalled round would
-    stop a phase for work that never happened.
+    A refunded batch consumed no repair. Its worker died before it made edits.
+    Charging it against the repair budget would stop a phase for work that
+    never happened. Reading it as a stalled round would have the same effect.
     """
     return [entry for entry in _rounds(state) if not entry.get("abandoned")]
 
@@ -430,18 +439,18 @@ def _history_root() -> Path:
 
 
 def _repair_round(state: dict[str, object], session_dir: Path) -> int:
-    """The next repair interval, using the same join as `history.py rounds`."""
+    """The next repair round, counting each started ledger batch once."""
     path = _history_root() / "runs" / f"{session_dir.name}.jsonl"
     try:
         lines = path.read_text(encoding="utf-8").splitlines()
     except FileNotFoundError:
-        return len(_rounds(state)) + 1
+        return 1
     except OSError as error:
         raise SystemExit(f"Unable to read repair history {path}: {error}") from error
     instance = _string(state.get("phase_instance_id"))
     events = [event for line in lines if (event := _json_object(line)) is not None
               and _string(event.get("phase_instance_id")) == instance]
-    return len(phase_rounds(events)) + 1
+    return len({number for repair in phase_rounds(events) for number in repair["ledger_rounds"]}) + 1
 
 
 def _astra_due(entry: dict[str, object], repair_round: int, settings_read: conf.ConfigRead) -> bool:
@@ -473,11 +482,16 @@ class PhasePass(TypedDict):
     who ran it. `slot` is the worker: a stable worker identity for the length of
     one launcher, not the role that worker is performing, which changes during a
     phase and lives on the coordination board.
+
+    `ledger_round` identifies relaunches of one batch. `repair_refunded` records
+    an explicit refund without a later landing. Both use the history reader's rules.
     """
 
     kind: str
     slot: str
     status: str
+    ledger_round: int
+    repair_refunded: bool
 
 
 def _event_slot(event: dict[str, object]) -> str:
@@ -509,15 +523,10 @@ def _phase_passes(session_dir: Path, instance_id: str) -> list[PhasePass]:
         return []
     opened_at: dict[str, int] = {}
     passes: dict[str, PhasePass] = {}
-    for order, line in enumerate(lines):
-        line = line.strip()
-        if not line:
-            continue
-        event = _json_object(line)
-        if event is None:
-            continue
-        if _string(event.get("phase_instance_id")) != instance_id:
-            continue
+    events = [event for line in lines if (event := _json_object(line)) is not None
+              and _string(event.get("phase_instance_id")) == instance_id]
+    refunded = refunded_batches(events)
+    for order, event in enumerate(events):
         event_type = _string(event.get("event_type"))
         if event_type not in ("pass_started", "pass_finished"):
             continue
@@ -528,36 +537,38 @@ def _phase_passes(session_dir: Path, instance_id: str) -> list[PhasePass]:
         slot = _event_slot(event)
         status = _string(event.get("status")) if event_type == "pass_finished" else ""
         existing = passes.get(pass_id)
+        ledger_round = existing["ledger_round"] if existing and event_type == "pass_finished" else pass_ledger_round(event)
         _ = opened_at.setdefault(pass_id, order)
         passes[pass_id] = PhasePass(
             kind=kind or (existing["kind"] if existing else ""),
             slot=slot or (existing["slot"] if existing else ""),
             status=status,
+            ledger_round=ledger_round,
+            repair_refunded=ledger_round > 0 and ledger_round in refunded,
         )
     return [passes[pass_id] for pass_id in sorted(passes, key=lambda key: opened_at[key])]
 
 
 def _passes_by_slot(passes: list[PhasePass]) -> dict[str, list[PhasePass]]:
-    """The phase's passes split into one sequence per worker, order preserved.
+    """Group the phase's passes by worker and exclude refunded repairs.
 
-    Passes with no worker land in one bucket together, which is every pass the
-    back corpus recorded and every pass of a phase run by a single launcher --
-    the sequence those see is the flat one, exactly as before workers existed.
+    Preserve the recorded order. Passes without a worker share one sequence.
+    This preserves the sequence for legacy records and phases with one launcher.
     """
     by_slot: dict[str, list[PhasePass]] = {}
     for entry in passes:
+        if entry["kind"] == "fix" and entry["repair_refunded"]:
+            continue
         by_slot.setdefault(entry["slot"], []).append(entry)
     return by_slot
 
 
 def _consecutive_same_kind(passes: list[PhasePass]) -> tuple[str, int]:
-    """The longest run of one kind ending at some worker's most recent pass.
+    """Count the longest sequence of one kind ending at a worker's latest pass.
 
-    Counted within a worker, never across workers. A phase team runs its launchers
-    at once, so two impl passes in the event stream are one round with two
-    workers; what this limit guards against is one worker being handed the same
-    kind of work over and over while the phase fails to advance, and only that
-    worker's own sequence shows it.
+    Count each worker separately. Concurrent workers do not extend each other's
+    sequence. Fix relaunches of one ledger batch add only one repair to the count.
+    Other passes retain the existing count, including legacy fix passes.
     """
     longest_kind = ""
     longest_run = 0
@@ -566,9 +577,15 @@ def _consecutive_same_kind(passes: list[PhasePass]) -> tuple[str, int]:
         worker_passes = by_slot[slot]
         kind = worker_passes[-1]["kind"]
         run = 0
+        ledger_rounds: set[int] = set()
         for entry in reversed(worker_passes):
             if entry["kind"] != kind:
                 break
+            # Relaunches of one batch spend one fix round for this advisory.
+            if kind == "fix" and entry["ledger_round"] > 0:
+                if entry["ledger_round"] in ledger_rounds:
+                    continue
+                ledger_rounds.add(entry["ledger_round"])
             run += 1
         if run > longest_run:
             longest_kind, longest_run = kind, run
@@ -591,7 +608,7 @@ def _review_cancellations(passes: list[PhasePass]) -> int:
 
 def _repair_budget(state: dict[str, object], settings_read: conf.ConfigRead) -> int:
     """How many fix rounds this phase's original finding count justifies."""
-    rounds = _rounds(state)
+    rounds = _live_rounds(state)
     if not rounds:
         return 0
     initial = _integer(rounds[0].get("gating_open_before"), 0)
@@ -718,9 +735,8 @@ def _advisory_reason(
             f"{len(rounds)} fix rounds have run for {initial} original findings, "
             f"past the {budget}-round repair budget, with {gating_open} still open"
         )
-    # The backstop counts every dispatch, abandoned ones included: a loop that
-    # keeps launching repairs that keep dying is exactly the runaway it guards.
-    if len(_rounds(state)) >= settings_read.whole("RUNAWAY_ROUNDS"):
+    # Refunded batches spend no repair round, including this advisory threshold.
+    if len(rounds) >= settings_read.whole("RUNAWAY_ROUNDS"):
         return f"the runaway backstop of {settings_read.whole("RUNAWAY_ROUNDS")} fix rounds was reached"
     return ""
 
@@ -1080,8 +1096,8 @@ def _dispatch(args: argparse.Namespace) -> None:
     round_number = len(_rounds(state)) + 1
     for finding_id in sorted(covered):
         entry = _finding(state, finding_id)
-        # In flight, not fixed: launching a repair is all that has happened.
-        # `landed` promotes these to review once a worker exits cleanly.
+        # In flight, not fixed: dispatch reserves an attempt before launch.
+        # `landed` promotes these findings to review after the worker exits cleanly.
         entry["state"] = STATE_IN_FLIGHT
         entry["fix_attempts"] = _integer(entry.get("fix_attempts")) + 1
         entry["last_dispatch_round"] = round_number
@@ -1126,101 +1142,45 @@ def _in_flight_round(state: dict[str, object]) -> dict[str, object] | None:
     return None
 
 
-def _landed(args: argparse.Namespace) -> None:
-    """Promote an in-flight round to review after its worker exited cleanly.
-
-    `implement.sh` calls this, not the unit director, for the same reason the
-    launcher owns its own pass records: the launcher is the only party that
-    watches the worker exit. A unit director can be killed, compacted, or simply
-    distracted between the repair finishing and the ledger hearing about it, and
-    every one of those gaps used to resolve as "fixed".
-
-    A session with no round in flight is the ordinary case for an implementation
-    dispatch, so it succeeds quietly rather than failing the launcher.
-    """
-    session_dir = _session_dir(args)
-    now = _now_epoch()
+def _resolve_round(args: argparse.Namespace) -> None:
+    """Resolve the repair round in flight."""
+    session_dir, now = _session_dir(args), _now_epoch()
     state = _read_state(session_dir, now, _arg_string(args, "phase"))
     round_entry = _in_flight_round(state)
+    landed = _arg_string(args, "resolution") == "landed"
     in_flight = _in_flight_ids(state)
     if round_entry is None or not in_flight:
+        if not landed:
+            raise SystemExit("No repair round is in flight, so there is nothing to abandon")
         print("no repair round in flight")
         return
-    for finding_id in in_flight:
-        entry = _finding(state, finding_id)
-        entry["state"] = STATE_PENDING
-        entry["landed_at"] = now
-    round_entry["outcome"] = "landed"
-    round_entry["landed_at"] = now
-    _write_state(session_dir, state)
-    _append_event(
-        session_dir,
-        state,
-        {
-            "event_type": "finding_batch_landed",
-            "timestamp": _iso_time(now),
-            "timestamp_epoch": now,
-            "round": _integer(round_entry.get("round")),
-            "landed": in_flight,
-        },
-    )
-    print(f"round {_integer(round_entry.get('round'))} landed: {', '.join(in_flight)}")
-
-
-def _abandon(args: argparse.Namespace) -> None:
-    """Return an in-flight round's findings to open because its repair died.
-
-    This is what a killed, crashed, or errored repair actually leaves: the
-    findings are open again, unreviewed, and the reason is appended to the event
-    stream. It never edits history, and it never accepts anything.
-
-    Without `--edits-landed` the round is refunded -- the attempt is uncounted
-    and the round stops counting toward the repair budget -- because a worker
-    that died before writing anything consumed no repair. Pass `--edits-landed`
-    when partial edits are in the tree: that work was real, the next reviewer has
-    to read it, and the attempt stands.
-    """
-    session_dir = _session_dir(args)
-    now = _now_epoch()
-    state = _read_state(session_dir, now, _arg_string(args, "phase"))
-    round_entry = _in_flight_round(state)
-    in_flight = _in_flight_ids(state)
-    if round_entry is None or not in_flight:
-        raise SystemExit("No repair round is in flight, so there is nothing to abandon")
     reason = _arg_string(args, "reason").strip()
-    if not reason:
+    if not landed and not reason:
         raise SystemExit("--reason is required: name how the repair ended")
     edits_landed = bool(getattr(args, "edits_landed", False))
     for finding_id in in_flight:
         entry = _finding(state, finding_id)
-        entry["state"] = STATE_OPEN
-        if not edits_landed:
+        entry["state"] = STATE_PENDING if landed else STATE_OPEN
+        if landed:
+            entry["landed_at"] = now
+        elif not edits_landed:
             entry["fix_attempts"] = max(0, _integer(entry.get("fix_attempts")) - 1)
-    round_entry["outcome"] = "abandoned"
-    round_entry["abandoned_at"] = now
-    round_entry["abandoned_reason"] = reason
-    round_entry["edits_landed"] = edits_landed
-    if not edits_landed:
-        round_entry["abandoned"] = True
+    outcome = "landed" if landed else "abandoned"
+    round_entry.update(outcome=outcome, **{f"{outcome}_at": now})
+    details: dict[str, object] = {"landed": in_flight}
+    if not landed:
+        round_entry.update(abandoned_reason=reason, edits_landed=edits_landed)
+        if not edits_landed:
+            round_entry["abandoned"] = True
+        details = {"reopened": in_flight, "reason": reason, "edits_landed": edits_landed}
     _write_state(session_dir, state)
-    _append_event(
-        session_dir,
-        state,
-        {
-            "event_type": "finding_batch_abandoned",
-            "timestamp": _iso_time(now),
-            "timestamp_epoch": now,
-            "round": _integer(round_entry.get("round")),
-            "reopened": in_flight,
-            "reason": reason,
-            "edits_landed": edits_landed,
-        },
-    )
+    _append_event(session_dir, state, {
+        "event_type": f"finding_batch_{outcome}", "timestamp": _iso_time(now), "timestamp_epoch": now,
+        "round": _integer(round_entry.get("round")), **details,
+    })
     refund = "attempt stands" if edits_landed else "attempt refunded"
-    print(
-        f"round {_integer(round_entry.get('round'))} abandoned ({refund}): "
-        + ", ".join(in_flight)
-    )
+    label = "landed" if landed else f"abandoned ({refund})"
+    print(f"round {_integer(round_entry.get('round'))} {label}: {', '.join(in_flight)}")
 
 
 def _record_decision_event(session_dir: Path, state: dict[str, object], entry: dict[str, object]) -> None:
@@ -1411,25 +1371,15 @@ def _build_parser() -> argparse.ArgumentParser:
         _ = command.add_argument("--session-dir", required=True)
         _ = command.add_argument("--phase", default="", help=PHASE_HELP)
 
-    landed = subparsers.add_parser(
-        "landed", help="promote an in-flight round to review after a clean worker exit"
-    )
-    _ = landed.add_argument("--session-dir", required=True)
-    _ = landed.add_argument("--phase", default="", help=PHASE_HELP)
-    landed.set_defaults(handler=_landed)
+    for verb in ("landed", "abandon"):
+        resolution = subparsers.add_parser(verb, help="resolve a repair round after its worker exits")
+        _ = resolution.add_argument("--session-dir", required=True)
+        _ = resolution.add_argument("--phase", default="", help=PHASE_HELP)
+        resolution.set_defaults(handler=_resolve_round, resolution=verb, reason="", edits_landed=False)
+        if verb == "abandon":
+            _ = resolution.add_argument("--reason", required=True)
+            _ = resolution.add_argument("--edits-landed", action="store_true", help="keep the repair attempt")
 
-    abandon = subparsers.add_parser(
-        "abandon", help="return an in-flight round to open because its repair died"
-    )
-    _ = abandon.add_argument("--session-dir", required=True)
-    _ = abandon.add_argument("--phase", default="", help=PHASE_HELP)
-    _ = abandon.add_argument("--reason", required=True)
-    _ = abandon.add_argument(
-        "--edits-landed",
-        action="store_true",
-        help="partial edits are in the tree, so the attempt stands rather than being refunded",
-    )
-    abandon.set_defaults(handler=_abandon)
 
     status = subparsers.add_parser("status", help="print the whole ledger")
     _ = status.add_argument("--session-dir", required=True)

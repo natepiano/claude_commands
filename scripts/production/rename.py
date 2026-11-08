@@ -1,9 +1,16 @@
 #!/usr/bin/env python3
-"""Rename a showrunner row and repair its session, tab, and workspace names."""
+"""Rename a unit or showrunner and repair its current session and displays."""
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import argparse
 import hashlib
+import json
+import os
+import subprocess
 import sys
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -13,9 +20,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from scripts.herdr import herdr
-from scripts.production import staff, unit_move
+from scripts.production import staff, unit_move, unit_names
 from scripts.production.rename_state import RenameRefused, production_journal, read_json, write_json
 from scripts.shutdown import remote
+from scripts.agents import worker_lifecycle
+from scripts.lib.atomic_file import write_text_atomic
+from scripts.message import sessions
 
 
 @dataclass(frozen=True)
@@ -53,29 +63,27 @@ class RenamePlan:
     move: KeepDocBranch | DocBranchMove
 
 
-@dataclass(frozen=True)
-class Showrunner:
-    row: staff.StaffRow
-
-
-@dataclass(frozen=True)
-class MissingStaffReference:
-    pass
-
-
-@dataclass(frozen=True)
-class OtherStaffKind:
-    row: staff.StaffRow
-
-
-def _member(reference: str, record: staff.StaffSnapshot) -> Showrunner | MissingStaffReference | OtherStaffKind:
-    row = record.by_member_reference(reference) or record.by_path(reference)
-    if row is not None:
-        return Showrunner(row) if row.kind == "showrunner" else OtherStaffKind(row)
-    matches = [row for row in record.find(kind="showrunner") if row.name == reference]
-    if len(matches) > 1:
-        raise staff.StaffRefused(f"{reference}: several showrunner rows match; use the staff id")
-    return Showrunner(matches[0]) if matches else MissingStaffReference()
+def _member(old: str, new: str, record: staff.StaffSnapshot) -> staff.StaffRow:
+    references = (old, f"{old.rpartition('/')[0]}/{new}" if "/" in old else new)
+    for reference in references:
+        row = record.by_member_reference(reference)
+        if row is None and "/" in reference:
+            row = record.by_path(reference) or record.by_path(reference.removesuffix("-unit"))
+        if row is not None:
+            return row
+    rows = [row for row in record.rows if row.kind in {"showrunner", "unit"}]
+    caller = record.by_current_session(os.environ.get("CLAUDE_CODE_SESSION_ID", ""))
+    local = ([row for row in rows if row.id == caller.id or row.parent == staff.ReportsTo(caller.id)]
+             if caller is not None and caller.kind == "showrunner" else [])
+    for scope in (local, rows):
+        for reference in references:
+            matches = [row for row in scope if row.name == reference or
+                       row.kind == "unit" and row.name == reference.removesuffix("-unit")]
+            if len(matches) > 1:
+                raise staff.StaffRefused(f"{old}: several rows match; use showrunner/name or the staff id")
+            if matches:
+                return matches[0]
+    raise staff.StaffRefused(f"{old}: no showrunner or unit staff row")
 
 
 def _saved_move(fields: dict[str, object]) -> DocBranchMove:
@@ -106,14 +114,15 @@ def plan(old: str, new: str, *, to_doc: str = "", to_branch: str = "") -> Rename
     if bool(to_doc) != bool(to_branch):
         raise RenameRefused("--to-doc and --to-branch are required together")
     record = staff.snapshot()
-    target = _member(old, record)
-    if isinstance(target, MissingStaffReference):
-        target = _member(new, record)
-    if isinstance(target, OtherStaffKind):
-        raise staff.StaffRefused(f"{old}: the staff row is a {target.row.kind}, not a showrunner")
-    if isinstance(target, MissingStaffReference):
-        raise staff.StaffRefused(f"{old}: no showrunner staff row")
-    row = target.row
+    row = _member(old, new, record)
+    if row.kind != "showrunner" and (row.kind != "unit" or to_doc):
+        raise staff.StaffRefused(f"{old}: the staff row is a {row.kind}, not a showrunner")
+    if row.kind == "unit":
+        name = unit_names.name(new)
+        if (row.name != name and not isinstance(row.worktree, staff.WorktreeUnfilled)
+                and row.worktree.machine != remote.local_machine()):
+            raise ValueError(f"{old}: run rename on {row.worktree.machine}")
+        return RenamePlan(row, name, KeepDocBranch())
     staff.validate_name(row.kind, new)
     if any(other.id != row.id and other.name == new
            for other in record.find(kind="showrunner")):
@@ -229,11 +238,49 @@ def _move_branch(move: DocBranchMove) -> bool:
     return True
 
 
-def _set_displays(row: staff.StaffRow) -> bool:
-    """Use the shared repair for the row's current session and displays."""
-    from scripts.production.rename_unit import repair_displays
-
-    return repair_displays(row)
+def repair_displays(row: staff.StaffRow) -> bool:
+    """Repair the current session name and its pane, tab, and workspace labels."""
+    changed = False
+    for session in sessions.running_sessions():
+        if session["sessionId"] != row.current_session or session["name"] == row.name:
+            continue
+        path = sessions.sessions_dir() / f"{session['pid']}.json"
+        raw = cast(dict[str, object], json.loads(path.read_text(encoding="utf-8")))
+        current = sessions.parse_session(raw)
+        if (isinstance(current, sessions.UnreadableSessionRecord)
+                or current["sessionId"] != row.current_session or current["pid"] != session["pid"]
+                or current.get("procStart") != session.get("procStart") or not sessions.running_session(current)):
+            raise ValueError(f"{row.name}: the session changed during rename")
+        if current["name"] == row.name:
+            continue
+        raw["name"] = row.name
+        raw["formerNames"] = list(dict.fromkeys([*current["formerNames"], current["name"]]))
+        write_text_atomic(path, json.dumps(raw, indent=2) + "\n")
+        changed = True
+    client = herdr.Herdr(herdr.shared_session())
+    spaces: set[str] = set()
+    for pane in client.panes():
+        native_sessions: set[str] = set()
+        for kind in ("claude", "codex"):
+            try:
+                native_sessions.add(client.native_session(pane["pane_id"], kind, herdr.PROGRAM_TIMEOUT_SECONDS))
+            except (OSError, ValueError, herdr.HerdrFailure, subprocess.SubprocessError):
+                continue
+        if native_sessions != {row.current_session}:
+            if pane.get("session_id") == row.current_session:
+                print(f"anomaly: pane {pane['pane_id']} does not run session {row.current_session}", file=sys.stderr)
+                changed = True
+            continue
+        changed = client.retitle(pane["pane_id"], row.name) or changed
+        spaces.add(pane["workspace_id"])
+    if row.kind == "showrunner" and spaces:
+        for space in client.listed("workspace"):
+            if space.get("workspace_id") in spaces and space.get("label") != row.name:
+                _ = client.run("workspace", "rename", str(space["workspace_id"]), row.name)
+                changed = True
+        if changed:
+            client.save_layout()
+    return changed
 
 
 def _describe(request: RenamePlan) -> list[str]:
@@ -248,8 +295,10 @@ def _describe(request: RenamePlan) -> list[str]:
 
 def apply(old: str, new: str, *, to_doc: str = "", to_branch: str = "") -> RenamePlan:
     """Rename the row first; report other failures and continue with display repair."""
+    request = plan(old, new, to_doc=to_doc, to_branch=to_branch)
+    if request.member.kind == "unit":
+        return _apply_unit(request)
     with staff.operation():
-        request = plan(old, new, to_doc=to_doc, to_branch=to_branch)
         move = request.move
         journal = production_journal(request.member.id)
         if isinstance(move, DocBranchMove) and not journal.exists():
@@ -273,10 +322,59 @@ def apply(old: str, new: str, *, to_doc: str = "", to_branch: str = "") -> Renam
                 print(f"anomaly: document_move: {error}", file=sys.stderr)
                 changed = True
         try:
-            changed = _set_displays(row) or changed
+            changed = repair_displays(row) or changed
         except (OSError, ValueError, staff.StaffRefused, staff.StaffNotFound, herdr.HerdrFailure) as error:
             print(f"anomaly: set_displays: {error}", file=sys.stderr)
             changed = True
+        print("done" if changed else "unchanged")
+        return request
+
+
+def _apply_unit(request: RenamePlan) -> RenamePlan:
+    with staff.row_operation(str(request.member.id)):
+        if (row := staff.by_id(request.member.id)) is None:
+            raise ValueError(f"{request.member.id}: no unit staff row")
+        changed = row.name != request.name
+        pending = unit_move.pending_move(row.id)
+        if isinstance(pending, unit_move.FolderMove) and changed:
+            if not unit_move.move_folder(row.id, pending.destination, branch=pending.branch):
+                print("unchanged")
+                return request
+            if (row := staff.by_id(request.member.id)) is None:
+                raise ValueError(f"{request.member.id}: no unit staff row")
+            pending = unit_move.pending_move(row.id)
+        movement = pending
+        if isinstance(pending, unit_move.PendingRename) and pending.name != request.name:
+            raise ValueError(f"{row.name}: finish the pending rename to {pending.name}")
+        if isinstance(pending, unit_move.NoPendingMove) and changed:
+            if isinstance(row.worktree, staff.WorktreeUnfilled):
+                print(f"anomaly: {request.name}: the staff worktree is unfilled", file=sys.stderr)
+            else:
+                if row.worktree.machine != remote.local_machine():
+                    raise ValueError(f"{row.name}: run rename on {row.worktree.machine}")
+                folder = row.worktree.path.expanduser().resolve()
+                target = unit_names.swap_stem(folder.name, row.name, request.name)
+                destination = folder.with_name(target) if target is not None else folder
+                checkout = folder if folder.exists() else destination
+                branch = unit_move.git(checkout, "branch", "--show-current") if checkout.exists() else ""
+                renamed_branch = unit_names.swap_stem(branch, row.name, request.name)
+                if target is None:
+                    print(f"anomaly: folder {folder} does not end with -{row.name}", file=sys.stderr)
+                if renamed_branch is None:
+                    print(f"anomaly: branch {branch} does not end with -{row.name}", file=sys.stderr)
+                target_branch = renamed_branch if renamed_branch is not None else unit_move.KeepBranch.CURRENT
+                if target is not None or renamed_branch is not None:
+                    movement = unit_move.PendingRename(destination, target_branch, request.name)
+                    unit_move.prepare_move(row, destination, target_branch, request.name)
+        if changed:
+            row = staff.rename(row.id, request.name)
+        try:
+            changed = repair_displays(row) or changed
+        except (OSError, ValueError, herdr.HerdrFailure) as error:
+            print(f"anomaly: display: {error}", file=sys.stderr)
+            changed = True
+        if isinstance(movement, (unit_move.FolderMove, unit_move.PendingRename)):
+            changed = unit_move.move_folder(row.id, movement.destination, branch=movement.branch) or changed
         print("done" if changed else "unchanged")
         return request
 
@@ -303,7 +401,13 @@ def _main(argv: list[str]) -> int:
                 print(line)
         else:
             _ = apply(old, new, **options)
-    except (ValueError, OSError, UnicodeError) as error:
+    except worker_lifecycle.OperationDeadlineExpired as error:
+        print(f"rename: anomaly: {error}", file=sys.stderr)
+        return 0
+    except subprocess.TimeoutExpired as error:
+        print(f"rename: error: {str(error).splitlines()[0]}", file=sys.stderr)
+        return 1
+    except (ValueError, OSError, UnicodeError, RenameRefused, herdr.HerdrFailure) as error:
         print(f"rename: {error}", file=sys.stderr)
         return 1
     return 0

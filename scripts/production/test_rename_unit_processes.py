@@ -1,21 +1,22 @@
 """Check process ownership without the deleted rename shutdown step."""
 from __future__ import annotations
 
+from scripts.production.staff_test_support import foreign_hostname
+
 import json
 import os
-import sys
 import tempfile
+import unittest
 from pathlib import Path
-from typing import TYPE_CHECKING, NamedTuple, cast, final, override
+from typing import NamedTuple, cast, final, override
 from unittest import mock
 from scripts.production import staff, worker_admission
 from scripts.production.staff_test_support import fixture_worker
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-import retire_unit
-import unit_lookup
-import unit_move
+from scripts.production import retire_unit
+from scripts.production import unit_lookup
+from scripts.production import unit_move
 from scripts.production import staff_sources
 from scripts.production.staff_test_support import (
     StaffTestCase, fixture_unit_location, recorded_showrunner,
@@ -23,13 +24,14 @@ from scripts.production.staff_test_support import (
 from scripts.lib.conf import UseConfiguredValue
 from scripts.lib import conf
 from scripts.lint.memory_test_support import config_environment
-if TYPE_CHECKING:
-    from scripts.shutdown.unit_staff_test_support import PARENTS, isolated_parents
-else:
-    from unit_staff_test_support import PARENTS, isolated_parents
+from scripts.shutdown.unit_staff_test_support import PARENTS, isolated_parents
 
 SLUG = "demo"
 WATCHER = 'while kill -0 "$1"; do sleep "$5"; "$4" "$0" idle-stop --session-dir "$3" --pid "$1" --port "$2"; done'
+
+
+def setUpModule() -> None:
+    unittest.enterModuleContext(foreign_hostname())
 
 
 class FakeProcess(NamedTuple):
@@ -51,7 +53,7 @@ class RunProcessTests(StaffTestCase):
     def setUp(self) -> None:
         super().setUp()
         _ = self.enterContext(isolated_parents())
-        PARENTS["alpha-unit"] = staff_sources.UnitProduction(SLUG, "/fixture/demo-production.md")
+        PARENTS["alpha"] = staff_sources.UnitProduction(SLUG, "/fixture/demo-production.md")
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         self.enterContext(mock.patch.dict(os.environ, config_environment(self.root / "config")))
         self.unit_folder = self.root / "claude-demo-alpha"
@@ -81,8 +83,8 @@ class RunProcessTests(StaffTestCase):
             "UNIT_WORKERS_STATE": str(self.root / "unit-workers")}))
         _ = self.enterContext(mock.patch.object(unit_move, "processes_inside", self.inside))
         _ = self.enterContext(mock.patch.object(retire_unit, "command_line", self.arguments))
-        from scripts.agents import mesh_runs
-        _ = self.enterContext(mock.patch.object(mesh_runs, "_process_args", self.arguments))
+        from scripts.agents import mesh_run_process
+        _ = self.enterContext(mock.patch.object(mesh_run_process, "process_args", self.arguments))
         _ = self.enterContext(mock.patch.object(os, "getsid", self.session))
         _ = self.enterContext(mock.patch.object(os, "kill", self.kill))
         _ = self.enterContext(mock.patch.object(unit_lookup, "labeled_session", return_value=None))
@@ -95,7 +97,7 @@ class RunProcessTests(StaffTestCase):
         (folder / retire_unit.DETACHED_RUNS).mkdir(parents=True)
         parent = recorded_showrunner("demo", self.root / "demo-production.md")
         member = fixture_unit_location(parent, worktree.name, worktree)
-        _ = (folder / "progress_history_state.json").write_text(json.dumps({"production": parent.name, "unit": member.name}))
+        _ = (folder / "progress_history_state.json").write_text(json.dumps({"owner_staff_id": member.id}))
         return folder
 
     def run_record(self, folder: Path, label: str, pid: int) -> Path:
@@ -113,7 +115,7 @@ class RunProcessTests(StaffTestCase):
         return ["sh", "-c", WATCHER, str(retire_unit.MESH.resolve()), "900", "51101", str(folder.resolve()),
                 "python3", "300"]
 
-    def no_units(self, _slug: str) -> dict[str, object]:
+    def no_units(self, _production_name: str) -> dict[str, object]:
         return {}
 
     def inside(self, worktree: Path) -> list[int]:

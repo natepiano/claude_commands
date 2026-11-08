@@ -1,9 +1,8 @@
 # natedev shutdown-unit phases
 
-> **Production:** `docs/plans/natedev-production.md`
-> **Unit:** shutdown-unit · branch `natedev-shutdown` · as-built `docs/as-built/shutdown-and-restart.md`
+> **Unit:** agents (was shutdown-unit), under sdlc · branch `sdlc-agents` · as-built `docs/as-built/shutdown-and-restart.md`
 
-Earlier phases of this unit are recorded in the as-built and in the branch history. This plan holds Phase 4 and Phase 5, the follow-up Phase 4 routed.
+Earlier phases of this unit are recorded in the as-built and in the branch history. This plan holds Phases 4 to 16.
 
 ## Phase 4: herdr's shutdown items and the pane-shell stop — done
 
@@ -59,3 +58,56 @@ The user's rule: "1 yes 2 yes 3 yes - plus a resume message". There is one way f
 - `rename_unit.py` stops with Phase 6 stop, moves with herdr's move, and resumes with Phase 6 resume; the record rewrite and the `shutdown.py restart --only` relaunch go.
 - `rename.py` uses the same stop, move and resume. herdr-unit deletes the `transfer_unit.py` journal at its own checkpoint (sdlc, 2026-10-30); this phase touches `transfer_unit.py` only if a stop or resume call is left in it.
 - The as-built docs that describe the old machinery are corrected: `shutdown-and-restart.md`, `unit-rename.md`, `unit-transfer.md`, `production-rename.md` and `long-lived-workers.md`.
+
+## One agents command (user decision 2026-11-07, via sdlc)
+
+The user's rule: one name, `agents`. One skill, `/agents`, and one program, `agents`. Everyone uses only these. The commands are status, pause, exit, resume, retire, restart, rename and move. `agents` with no arguments prints the same short usage as `agents help`.
+
+Each phase deletes the skill and the code it replaces when it lands. `staff.py` stays as the code that stores the staff record; no person or skill runs it. herdr-unit is the partner for worker rename and pane files. The accounts unit is the partner for move. Phases 10 and 15 run side by side. Phase 11 follows Phase 10, because it adds commands to the program Phase 10 makes. Phases 13 and 14 wait on Phase 12, because the three write the same staff rows. Phase 16 runs beside Phase 11. Phase 12 starts when a writer is free.
+
+### Phase 10: the agents program and the /agents skill — done
+
+- `agents` and `agents help` print one short usage.
+- `agents status`, `agents restart` and `agents resume NAME`. Resume of a paused unit sends it a message to continue. Resume of an exited unit starts it again on the current role account, the same as `resume <unit>` at the shell, which stays as the short form.
+- Deletes `/shutdown` and the shutdown.py command surface that `agents` replaces.
+
+### Phase 11: pause and exit
+
+- `agents pause NAME`: stop now by default. Workers stop at once, and the unit holds at its prompt. The pause record holds the time, the caller and why. The board shows `paused`.
+- `agents exit NAME`: the same stop rule. The director and its workers quit, the herdr tab stays at the shell prompt, and the staff row stays. The board shows `exited`.
+- "finish the current step" on either command lets workers finish their current task first, then hold or exit.
+- Deletes the `staff.py` pause and resume commands and the pause and resume text in `/showrunner:units`.
+- No draft keep: a move does not save or type back unsent composer text (user 2026-11-07, via sdlc: "this is overkill").
+
+### Phase 12: retire, and resume of a retired unit
+
+- `agents retire NAME` removes the unit from active staff. Its row stays only as a retired record. The board does not show it.
+- `agents resume NAME` of a retired unit refuses and names `--retired`. The showrunner asks the user yes or no before it runs `--retired`.
+- Replaces `retire_unit.py` and `resume_unit.py`. Deletes `/showrunner:retire_unit` and `/showrunner:resume_unit`.
+
+### Phase 13: rename
+
+- `agents rename OLD NEW` for units, showrunners and workers. Workers are in herdr panes, so herdr-unit gives the pane rename.
+- Replaces `rename.py`. Deletes `/showrunner:rename` and `/unit:rename`.
+
+### Phase 14: move
+
+- `agents move SESSION_OR_GROUP ACCOUNT`, with natedev's accounts unit. `accounts.py` keeps the account board and the queued moves (`accounts.py next`).
+- Replaces `showrunner_move.py`. Deletes `/showrunner:move`.
+
+### Phase 15: the launch record takes the role account — done
+
+- A staff member takes its account from the current role account at launch. A session with no staff row opens on its family default: the workers account for Codex, the units account for Claude.
+- Copies of staff data leave `pane_launch.PaneLaunch`. Pane data stays there.
+- Also touches `scripts/herdr/pane_launch.py`; sdlc confirmed 2026-11-07 that it is free.
+
+### Phase 15b: worker list gives work, account and home — done
+
+- `worker.py list --json` gives `work`, `account` and `home` for each pane worker, computed at read time. A worker with no backend entry reports `AccountUnavailable`.
+- `member_account.resume_account` is the one account rule for resume, restart and the worker list.
+
+### Phase 16: a launch trusts its folder; the draft stash goes
+
+- A launch by our tools writes Claude trust for the target folder in the target account before it starts. It reuses the `copy_claude_trust` write, in one place. No user step (user rule 2026-11-07: a move or start needs no user work).
+- When trust cannot be written, the launch prints one anomaly line and stops cleanly.
+- Deletes the herdr 23 draft stash in `herdr.py` and its three tests (change row C1211). The user does not want the feature.

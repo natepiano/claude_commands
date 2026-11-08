@@ -16,32 +16,31 @@ from collections.abc import Callable, Generator, Sequence, Mapping
 from contextlib import AbstractContextManager, ExitStack, contextmanager
 from types import SimpleNamespace
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from scripts.direct import workers
 from scripts.production import staff, unit_config, fake_unit_host
 from scripts.production.staff_test_support import fixture_member, fixture_runtime_id, StaffTestCase, isolated_source_readers
 from scripts.lib.atomic_file import write_text_atomic
-import fake_herdr
-import herdr
+from scripts.herdr import fake_herdr
+from scripts.herdr import herdr
 from scripts.shutdown import pane_record, remote
 from scripts.direct import progress_history
 from scripts.message import sessions
-import sessions as stop_sessions
+from scripts.message import sessions as stop_sessions
 from scripts.direct.recorder_state import STATE_FILENAME
-import merge_checkpoint
-from scripts.production.production_doc import Production, read_production
-import rename
+from scripts.production import merge_checkpoint
+from scripts.production.production_doc import Production, production_field, read_production
+from scripts.production import rename
 from scripts.production import showrunners
-import stall_watch
-import tidy_wrapped
-import unit_move
-import unit_names
-import unit_lookup
+from scripts.production import tidy_wrapped
+from scripts.production import unit_move
+from scripts.production import unit_names
+from scripts.production import unit_lookup
 from scripts.production.cli_fixture import invoke_cli, process_boundary_for_case
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 SCRIPT = Path(__file__).with_name("rename.py")
+READ_HERDR_PANES = herdr.Herdr.panes
 
 
 class RenameDisplays:
@@ -96,6 +95,7 @@ class RenameDisplays:
         from scripts.herdr import herdr
 
         with (mock.patch.dict(os.environ, {"HERDR_BIN": "/nonexistent/herdr"}),
+              mock.patch.object(herdr.Herdr, "panes", READ_HERDR_PANES),
               mock.patch.object(herdr.Herdr, "listed", side_effect=self.listed),
               mock.patch.object(herdr.Herdr, "run", side_effect=self.run),
               mock.patch.object(herdr.Herdr, "result", side_effect=self.result),
@@ -142,6 +142,9 @@ class FolderMoveBackend:
             _ = record.write_text(json.dumps({"type": "session_meta", "payload": {"id": self.fixture.owner.current_session}}) + "\n")
             descriptor.symlink_to(record)
 
+    def pane_row(self, pane: str) -> herdr.PaneIdentity | herdr.NoPane:
+        return next((row for row in self.panes() if row["pane_id"] == pane), herdr.NoPane(pane))
+
     def panes(self) -> list[herdr.PaneIdentity]:
         return [
             {"pane_id": "w1:p1", "terminal_id": "kept-terminal", "workspace_id": "w1",
@@ -151,7 +154,8 @@ class FolderMoveBackend:
         ]
 
     def agents(self) -> list[herdr.AgentOccupant]:
-        return ([{"pane_id": "w1:p1", "agent": self.kind, "agent_status": herdr.AgentStatus.RUNNING}]
+        return ([{"pane_id": "w1:p1", "agent": self.kind, "agent_status": herdr.AgentStatus.RUNNING,
+                  "agent_session": herdr.NoReportedAgentSession()}]
                 if self.live else [])
 
     def observed_processes(self, **_options: object) -> list[herdr.HerdrProcess]:
@@ -173,7 +177,8 @@ class FolderMoveBackend:
                                  "foreground_process_group_id": self.pid if self.live else self.shell_pid,
                                  "foreground_processes": foreground}}
 
-    def saved_row_tab(self, row_id: str, title: str) -> herdr.ExistingPane:
+    def saved_row_tab(self, row_id: str, title: str, fallback_workspace: str) -> herdr.ExistingPane:
+        _ = fallback_workspace
         self.fixture.assertEqual((row_id, title), (str(self.fixture.owner.id), self.fixture.owner.name))
         return herdr.ExistingPane("w1:p1", "kept-terminal")
 
@@ -253,9 +258,7 @@ class FolderMoveFixture(StaffTestCase):
             "GIT_CONFIG_NOSYSTEM": "1",
         })))
         _ = self.enterContext(mock.patch.object(pane_record, "RECORD_DIR", self.records))
-        _ = self.enterContext(mock.patch("pane_record.RECORD_DIR", self.records))
         _ = self.enterContext(mock.patch.object(progress_history, "SESSION_ROOTS", (self.run_dir.parent,)))
-        _ = self.enterContext(mock.patch("progress_history.SESSION_ROOTS", (self.run_dir.parent,)))
         _ = self.folder_git(self.checkout, "init", "-b", "kept-branch")
         _ = self.folder_git(self.checkout, "config", "user.name", "Folder Move Test")
         _ = self.folder_git(self.checkout, "config", "user.email", "move@example.invalid")
@@ -265,7 +268,7 @@ class FolderMoveFixture(StaffTestCase):
         _ = self.folder_git(self.checkout, "worktree", "add", "-b", "unit-branch", str(self.old_folder))
         parent = fixture_member("showrunner", name="production")
         fixed = fixture_member("unit", name="kept-name", parent=parent.id,
-                               worktree=staff.PresentWorktree("natedev", self.old_folder))
+                               worktree=staff.PresentWorktree(remote.local_machine(), self.old_folder))
         self.owner = staff.update_current_session(fixed.current_session,
             staff.native_id(fixture_runtime_id("folder-move-current")))
         launch = pane_record.launch("w1:p1", self.owner.id, str(self.old_folder),
@@ -396,7 +399,6 @@ def run_rename(arguments: list[str], environment: dict[str, str], cwd: Path,
                            "SHOWRUNNER_STATE_DIR": Path(environment["SHOWRUNNER_STATE_DIR"])}),
             (tidy_wrapped, {"STATE_DIR": Path(environment["SHOWRUNNER_STATE_DIR"]),
                             "NOTIFIER_STATE_DIR": Path(environment["NOTIFIER_STATE_DIR"])}),
-            (stall_watch, {"STATE_DIR": Path(environment["STALL_WATCH_STATE_DIR"])}),
         ):
             for name, value in fields.items():
                 _ = scope.enter_context(mock.patch.object(module, name, value))
@@ -447,7 +449,6 @@ def bind_staff_fixture(case: StaffTestCase, environment: dict[str, str], members
     roots = tuple(Path(root) for root in environment.get(
         "PROGRESS_SESSION_ROOTS", environment.get("UNIT_RUN_ROOT", str(case.root / "runs"))).split(":"))
     _ = case.enterContext(mock.patch.object(progress_history, "SESSION_ROOTS", roots))
-    _ = case.enterContext(mock.patch("progress_history.SESSION_ROOTS", roots))
     for name, attribute, reader in (
         ("scripts.production.showrunners", "socket_for", FIXTURE_SOCKET_FOR),
         ("unit_lookup", "labeled_sessions", FIXTURE_LABELED_SESSIONS),
@@ -461,33 +462,30 @@ def bind_staff_fixture(case: StaffTestCase, environment: dict[str, str], members
         with mock.patch.object(tidy_wrapped, "STATE_DIR", state), unit_move.production_lock():
             pass
     productions: dict[str, Production] = {}
-    for source in showrunners.read_sources(unreadable=showrunners.UnreadableTimerPolicy.RAISE):
-        if source.timer.slug in members:
-            production = read_production(source.timer.doc)
-            productions[source.timer.slug] = production
-            with merge_checkpoint.merge_lock(production.checkout, source.timer.slug):
-                pass
-    for slug in members.keys() - productions.keys():
-        candidates = [production for path in sorted(case.root.rglob(f"{slug}-production.md"))
-                      if (production := read_production(path)).doc.is_relative_to(production.checkout)]
-        case.assertEqual(len(candidates), 1, f"{slug}: expected one production document in its checkout")
-        production = candidates[0]
-        productions[slug] = production
-        with merge_checkpoint.merge_lock(production.checkout, slug):
+    for production_name in members:
+        candidates = [path for path in sorted(case.root.rglob(f"{production_name}-production.md"))
+                      if path.is_relative_to(Path(production_field(
+                          path.read_text().splitlines(), "Showrunner checkout")).expanduser().resolve())]
+        case.assertEqual(len(candidates), 1, f"{production_name}: expected one production document")
+        _ = fixture_member("showrunner", name=production_name,
+                           doc=staff.LiveDoc(remote.local_machine(), candidates[0]))
+        production = read_production(production_name)
+        productions[production_name] = production
+        with merge_checkpoint.merge_lock(production.checkout, production_name):
             pass
     with staff.operation():
-        for slug, units in members.items():
-            production = productions[slug]
-            row = fixture_member("showrunner", name=slug,
+        for production_name, units in members.items():
+            production = productions[production_name]
+            row = fixture_member("showrunner", name=production_name,
                                  doc=staff.LiveDoc(remote.local_machine(), production.doc))
             for unit in units:
                 name = unit_names.name(unit)
-                tree = locations[(slug, unit)]
+                tree = locations[(production_name, unit)]
                 _ = fixture_member("unit", name=name, parent=row.id,
                                    worktree=staff.PresentWorktree(remote.local_machine(), tree))
                 if not tree.is_dir():
                     continue
-                plan = plans.get((slug, unit))
+                plan = plans.get((production_name, unit))
                 mode = unit_config.StandbyPlan() if plan is None else unit_config.PlanFile(plan)
                 _ = unit_config.write(tree, unit_config.UnitConfig(mode, unit_config.NoAppPort(), ()))
 
@@ -503,7 +501,6 @@ class ProductionRenameFixture(StaffTestCase):
         self.new_doc: Path = Path()
         self.notifier: Path = Path()
         self.state: Path = Path()
-        self.stall: Path = Path()
         self.worktrees: Path = Path()
         self.env: dict[str, str] = {}
         self.old_tip: str = ""
@@ -541,7 +538,7 @@ class ProductionRenameFixture(StaffTestCase):
         self.env.update(STAFF_FILE=str(self.staff_file), STAFF_TEST_OWNER_FILE=str(self.staff_file))
         _ = self.enterContext(cast(AbstractContextManager[object], mock.patch.dict(os.environ, self.env)))
         _ = self.enterContext(isolated_source_readers())
-        _ = fixture_member("showrunner", name=OLD, doc=staff.LiveDoc("natedev", self.doc))
+        _ = fixture_member("showrunner", name=OLD, doc=staff.LiveDoc(remote.local_machine(), self.doc))
         with staff.operation(), unit_move.production_lock():
             pass
 
@@ -554,7 +551,6 @@ class ProductionRenameFixture(StaffTestCase):
         self.new_doc = self.doc.with_name("new-production.md")
         self.notifier = self.root / "state/notifier"
         self.state = self.root / "state/showrunner"
-        self.stall = self.root / "state/stall-watch"
         self.worktrees = self.home / "worktrees"
         self.env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
         self.env.update({
@@ -569,7 +565,6 @@ class ProductionRenameFixture(StaffTestCase):
             "NOTIFIER_STATE_DIR": str(self.notifier),
             "NOTIFIER_SESSIONS_DIR": str(self.root / "state/sessions"),
             "SHOWRUNNER_STATE_DIR": str(self.state),
-            "STALL_WATCH_STATE_DIR": str(self.stall),
             "SHOWRUNNERS_CONFIG": str(self.home / ".claude/showrunners.json"),
             "UNIT_ACTIVE_DIR": str(self.root / "active"),
             "UNIT_HISTORY_DIR": str(self.root / "history"),
@@ -585,7 +580,7 @@ class ProductionRenameFixture(StaffTestCase):
         })
 
     def build_fixture(self) -> None:
-        for path in (self.home, self.checkout, self.notifier, self.stall, self.worktrees):
+        for path in (self.home, self.checkout, self.notifier, self.worktrees):
             path.mkdir(parents=True)
         config = self.home / ".claude"
         config.mkdir()
@@ -614,7 +609,7 @@ class ProductionRenameFixture(StaffTestCase):
         self.old_tip = self.git("rev-parse", "HEAD")
         self.write(self.notifier / "showrunner-old/conf",
                    "EVERY=15\nTARGET=session:test-showrunner\nCHECK="
-                   + shlex.join(["zsh", "/scripts/production_check.sh", str(self.doc)])
+                   + shlex.join(["zsh", "/scripts/production_check.sh", fixture_runtime_id(f"showrunner::{OLD}")])
                    + "\nPROMPT_FILE=unchanged-prompt\n")
         self.write(self.notifier / "showrunner-old/prompt", "Historical prompt mentions old.\n")
 

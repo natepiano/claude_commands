@@ -1,6 +1,10 @@
-#!/usr/bin/env python3
-"""Publish all change reviews, or retain an older selected-row link with --production DOC C27."""
+#!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
+"""Publish all change reviews, or retain an older selected-row link with --production NAME C27."""
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import argparse
 import html
@@ -18,9 +22,9 @@ from pathlib import Path
 from typing import Literal, TypedDict, cast
 from urllib.parse import parse_qs, urlsplit
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.production import change_review as change_review
-from scripts.production import unrouted_alert, change_routing, delivery_state, next_item, showrunners, showrunner_tree, staff
+from scripts.production import unit_lookup
+from scripts.production import unrouted_alert, change_routing, delivery_state, next_item, showrunners, staff
 from scripts.production.delivery_state import (
     AnsweredQuestion as AnsweredQuestion, DeliveryIntent as DeliveryIntent, DeliverySlots as DeliverySlots,
     NoDelivery as NoDelivery, NoQuestion as NoQuestion, OpenQuestion as OpenQuestion,
@@ -28,7 +32,6 @@ from scripts.production.delivery_state import (
 )
 from scripts.lib import atomic_file, conf, file_lock, urgency
 from scripts.production.production_doc import Refusal as Refusal, production_field
-from scripts.production.proposals_folder import owner_docs, slug_of
 from scripts.feature_log import feature_log
 from scripts.review_links import review_link
 
@@ -559,15 +562,17 @@ def showrunner(page: ReviewPage) -> str:
 
 def row_production(page: ReviewPage, row: dict[str, str]) -> Path:
     """Resolve the row's Production cell for the existing feature-log closeout rule."""
-    root = showrunner_tree.root_of(slug_of(page.production))
-    docs = {**showrunners.timer_docs(), slug_of(page.production): page.production}
-    docs.update({slug_of(doc): doc for doc in change_routing.list_documents(change_review.read(page.review_list))})
-    if root not in docs:
-        raise AnswerRefused(f"root production {root} has no production document")
+    record = staff.snapshot()
+    if not row.get("Verdict"):
+        assignment = change_routing.StaffRouting(record, {}).owner_and_production(page.review_list, row)
+        if isinstance(assignment.production, Path):
+            return assignment.production
+        raise AnswerRefused(assignment.production.reason)
+    root = change_review.showrunner_of(page.production, record=record)
     owner = row.get(change_review.PRODUCTION) or root
-    for doc in dict.fromkeys([*owner_docs(docs[root]), *docs.values()]):
-        if slug_of(doc) == owner:
-            return doc
+    found = showrunners.owner_for(owner, record)
+    if isinstance(found.doc, (staff.LiveDoc, staff.WrappedDoc)):
+        return found.doc.path
     raise AnswerRefused(f"unknown production {owner} for {row['#']}")
 
 
@@ -599,7 +604,7 @@ def close_feature_log(page: ReviewPage, doc: Path, row_id: str, verdict: str) ->
     lines = doc.read_text(encoding="utf-8").splitlines()
     repo = Path(production_field(lines, "Showrunner checkout")).expanduser()
     script = str(Path(feature_log.__file__))
-    project = subprocess.run([sys.executable, script, "project-of", str(repo)],
+    project = subprocess.run([str(Path(__file__).resolve().parents[1] / "lib/py"), script, "project-of", str(repo)],
                              capture_output=True, text=True, check=True).stdout.strip()
     if project not in projects:
         return
@@ -607,12 +612,12 @@ def close_feature_log(page: ReviewPage, doc: Path, row_id: str, verdict: str) ->
     arguments = ["--review", review, "--if-proposed"]
     if command == "drop":
         arguments.append(f"--verdict={verdict}")
-    result = subprocess.run([sys.executable, script, command, *arguments],
+    result = subprocess.run([str(Path(__file__).resolve().parents[1] / "lib/py"), script, command, *arguments],
                             capture_output=True, text=True, check=False)
     # The writer names the required operation when a proposal replaces an old note.
     if command == "add" and result.returncode and (
             f"proposal {review} uses supersede; run supersede --review {review}" in result.stderr):
-        result = subprocess.run([sys.executable, script, "supersede", *arguments],
+        result = subprocess.run([str(Path(__file__).resolve().parents[1] / "lib/py"), script, "supersede", *arguments],
                                 capture_output=True, text=True, check=False)
     if result.returncode:
         raise RuntimeError((result.stderr or result.stdout).strip() or "feature-log operation failed")
@@ -695,8 +700,8 @@ def submit(page: ReviewPage, body: str, status: DeliveryStatus, *,
     recipients = verdict_recipients(owner, verdict)
     closeout_before_save(page, doc, row_id, verdict)
     attempt = status.begin(page, row_id, "verdict", recipients=recipients) if recipients else ""
-    result = subprocess.run([sys.executable, str(Path(change_review.__file__)), "verdict",
-                             "--production", str(page.production), "--list", str(page.review_list),
+    result = subprocess.run([str(Path(__file__).resolve().parents[1] / "lib/py"), str(Path(change_review.__file__)), "verdict",
+                             "--production", unit_lookup.doc_owner(page.production, staff.snapshot()).name, "--list", str(page.review_list),
                              "--row", row_id, f"--verdict={verdict}"], capture_output=True, text=True, check=False)
     if result.returncode:
         status.clear(page, row_id, "verdict")
@@ -708,7 +713,7 @@ def submit(page: ReviewPage, body: str, status: DeliveryStatus, *,
 
 def review_message(page: ReviewPage, row: dict[str, str], headline: str, *details: str) -> str:
     return "\n".join((f"Change review {row['#']}: {headline}", f"List: {page.review_list}",
-                      f"Production: {page.production}", f"Change: {row['Change']}", *details))
+                      f"Production: {unit_lookup.doc_owner(page.production, staff.snapshot()).name}", f"Change: {row['Change']}", *details))
 
 
 def verdict_recipients(owner: change_routing.ChangeOwner, verdict: str) -> tuple[staff.StaffId, ...]:
@@ -864,13 +869,13 @@ def publish_browser(initial: str = "") -> str:
 def main(arguments: list[str]) -> int:
     if arguments and arguments[0] == "answer-question":
         parser = argparse.ArgumentParser(description="Answer an open question about a change.")
-        _ = parser.add_argument("--production", required=True, type=Path)
+        _ = parser.add_argument("--production", required=True)
         _ = parser.add_argument("--list", required=True, type=Path)
         _ = parser.add_argument("--row", required=True)
         _ = parser.add_argument("--question", required=True)
         _ = parser.add_argument("--text", required=True)
         args = parser.parse_args(arguments[1:])
-        page = ReviewPage(cast(Path, args.list).expanduser(), cast(Path, args.production).expanduser(),
+        page = ReviewPage(cast(Path, args.list).expanduser(), change_review.production_doc(cast(str, args.production)),
                           (cast(str, args.row),), "")
         try:
             changed = DeliveryStatus(review_link.review_root()).answer_question(
@@ -882,11 +887,11 @@ def main(arguments: list[str]) -> int:
         return 0
     parser = argparse.ArgumentParser(description=__doc__)
     _ = parser.add_argument("rows", nargs="*")
-    _ = parser.add_argument("--production", type=Path)
+    _ = parser.add_argument("--production")
     _ = parser.add_argument("--list", type=Path)
     args = parser.parse_args(arguments)
     rows = cast(list[str], args.rows)
-    production = cast(Path | None, args.production)
+    production = cast(str | None, args.production)
     review_list = cast(Path | None, args.list)
     try:
         if not rows:
@@ -894,9 +899,9 @@ def main(arguments: list[str]) -> int:
             return 0
         if production is None:
             raise ValueError("pass --production for an older selected-row link")
-        production = production.expanduser()
-        path = review_list.expanduser() if review_list else change_review.production_list(str(production))
-        print(publish(production, path, rows))
+        doc = change_review.production_doc(production)
+        path = review_list.expanduser() if review_list else change_review.production_list(production)
+        print(publish(doc, path, rows))
     except (OSError, ValueError, change_review.ChangeReviewError, subprocess.SubprocessError, Refusal) as error:
         print(f"change page: {error}", file=sys.stderr)
         return 1

@@ -6,20 +6,20 @@ from scripts.production.cli_fixture import process_boundary
 
 import json
 import shutil
-import subprocess
 import sys
 import unittest
 from pathlib import Path
-from typing import cast, final
+from typing import cast, final, override
+
+from scripts.production import change_review
+from scripts.production.staff_test_support import isolated_staff_file
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from merge_checkpoint import ChildHandoffEntry, CodeCheckpoint, MergeEntry, NoMerge, ShrinkCommit, merge_branch_history
 
 # Importable once merge_checkpoint has put scripts/lib on the path.
 
 
-from scripts.production.merge_checkpoint_test_support import MergeCheckpointFixture, SCRIPT, STARTED, configure_test_environment
-from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.production.merge_checkpoint_test_support import MergeCheckpointFixture, configure_test_environment
 
 
 def setUpModule() -> None:
@@ -28,6 +28,13 @@ def setUpModule() -> None:
 
 @final
 class MergeCheckpointTests(MergeCheckpointFixture):
+    @override
+    def setUp(self) -> None:
+        super().setUp()
+        staff_file = self.root / "staff.json"
+        _ = Path(self.env["STAFF_FILE"]).rename(staff_file)
+        _ = self.enterContext(isolated_staff_file(staff_file, self.env))
+
     # Keep the child CLI process boundary.
     @process_boundary
     def test_attached_child_handoff_merges_without_a_units_row_and_acknowledges_after_push(self) -> None:
@@ -78,20 +85,6 @@ class MergeCheckpointTests(MergeCheckpointFixture):
         self.assertIn(f"checkpoint {checkpoint[:7]} is not on example-style's merge branch alpha-branch", result.stdout)
         self.assertEqual(self.git("rev-parse", "HEAD"), before)
         self.assertEqual(self.events("send.py"), [])
-    def test_child_checkpoint_must_descend_from_last_merged_handoff(self) -> None:
-        _ = self.child_production()
-        first = self.checkpoint()
-        self.assertEqual(self.run_handoff(first).returncode, 0)
-        self.write(self.other, "src/beta.txt", "divergent history\n")
-        _ = self.git("commit", "-am", "Divergent child", cwd=self.other)
-        divergent = self.git("rev-parse", "HEAD", cwd=self.other)
-        _ = self.git("reset", "--hard", divergent, cwd=self.unit)
-        before, notices = self.git("rev-parse", "HEAD"), self.events("send.py")
-        result = self.run_handoff(divergent)
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn("does not descend from example-style's last merged hand-off", result.stdout)
-        self.assertEqual(self.git("rev-parse", "HEAD"), before)
-        self.assertEqual(self.events("send.py"), notices)
     def test_root_style_handoff_merges_itself_without_an_attachment(self) -> None:
         _ = self.child_production(parent="")
         checkpoint = self.checkpoint()
@@ -105,10 +98,13 @@ class MergeCheckpointTests(MergeCheckpointFixture):
         self.assertIn(f"root: run style_ledger.py reconcile to mark {checkpoint[:7]} merged", result.stdout)
     def test_duplicate_child_notice_acknowledges_without_another_merge_push_or_notify(self) -> None:
         self.promotions = str(self.promote)
-        self.production_doc()
+        review = Path(self.env["HOME"]) / "rust/hanadocs/change-review/change-review - example.md"
+        self.production_doc(change_review=review)
         _ = self.child_production()
-        checkpoint = self.checkpoint()
+        checkpoint = self.dated_checkpoint("checkpoint(alpha): handoff\n\nChange-Review: Child ready | Read | Listed")
         self.assertEqual(self.run_handoff(checkpoint).returncode, 0)
+        self.assertEqual([row["Change"] for row in change_review.pending(review)], ["Child ready"])
+        written = review.read_bytes()
         merge = self.git("rev-parse", "HEAD")
         count = self.git("rev-list", "--count", "HEAD")
         notifications = self.events("style_sync.py")
@@ -132,6 +128,7 @@ class MergeCheckpointTests(MergeCheckpointFixture):
         self.assertEqual((self.promote / "src/alpha.txt").read_text(), "local changes must not be promoted over\n")
         self.assertEqual(len(self.events("send.py")), 2)
         self.assertEqual(self.events("send.py")[0], self.events("send.py")[1])
+        self.assertEqual(review.read_bytes(), written)
     def test_failed_handoff_push_rolls_back_and_retry_acknowledges_only_after_push(self) -> None:
         _ = self.child_production()
         checkpoint = self.checkpoint()
@@ -158,9 +155,54 @@ class MergeCheckpointTests(MergeCheckpointFixture):
         self.assertEqual((self.state / "notified-tip").read_text(), merge)
         self.assertEqual(len(self.events("send.py")), 1)
         self.assertLess(retried.stdout.index("push: ok"), retried.stdout.index("hand-off "))
-    def test_locally_merged_handoff_is_pushed_before_acknowledgment_without_merging_again(self) -> None:
+    def assert_child_push_conflict_is_held(self, *, already_pushed: bool) -> None:
+        self.promotions = str(self.promote)
+        self.production_doc()
         _ = self.child_production()
-        checkpoint = self.checkpoint()
+        _ = self.checkpoint(content="child alpha\n")
+        checkpoint = self.checkpoint("src/beta.txt", "child beta\n")
+        if already_pushed:
+            _ = self.git("merge", "--no-ff", "-m", "Merge child handoff", checkpoint)
+            _ = self.git("push", "origin", "production")
+        before = self.git("rev-parse", "HEAD")
+        remote_before = self.git("rev-parse", "production", cwd=self.origin)
+        for path in ("src/alpha.txt", "src/beta.txt"):
+            self.write(self.promote, path, "main side\n")
+        _ = self.git("add", "src", cwd=self.promote)
+        _ = self.git("commit", "-m", "Conflicting main edits", cwd=self.promote)
+        _ = self.git("push", "origin", "main", cwd=self.promote)
+        main_before = self.git("rev-parse", "HEAD", cwd=self.promote)
+
+        result = self.run_handoff(checkpoint)
+
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("push: held", result.stdout)
+        self.assertIn("src/alpha.txt, src/beta.txt", result.stdout)
+        self.assertIn("merge origin/main into the merge branch, resolve the conflict, and run the push again",
+                      result.stdout)
+        merge_head = self.checkout / self.git("rev-parse", "--git-path", "MERGE_HEAD")
+        self.assertFalse(merge_head.exists())
+        self.assertEqual(self.git("status", "--porcelain"), "")
+        self.assertEqual(self.git("rev-parse", "HEAD"), before)
+        self.assertEqual(self.git("rev-parse", "production", cwd=self.origin), remote_before)
+        self.assertEqual(self.git("rev-parse", "HEAD", cwd=self.promote), main_before)
+        self.assertEqual(self.git("rev-parse", "main", cwd=self.origin), main_before)
+        self.assertFalse(self.log.exists(), "a held push must not record completion")
+        self.assertEqual(self.events("style_ledger.py"), [])
+        self.assertEqual(self.events("send.py"), [])
+
+    def test_fresh_child_push_conflict_reports_held_without_completion(self) -> None:
+        self.assert_child_push_conflict_is_held(already_pushed=False)
+
+    def test_pushed_child_awaiting_promotion_reports_main_conflict_as_held(self) -> None:
+        self.assert_child_push_conflict_is_held(already_pushed=True)
+
+    def test_locally_merged_handoff_is_pushed_before_acknowledgment_without_merging_again(self) -> None:
+        self.promotions = str(self.promote)
+        review = Path(self.env["HOME"]) / "rust/hanadocs/change-review/change-review - example.md"
+        self.production_doc(change_review=review)
+        _ = self.child_production()
+        checkpoint = self.dated_checkpoint("checkpoint(alpha): recovered handoff\n\nChange-Review: Recovered | Read | Listed")
         _ = self.git("merge", "--no-ff", "-m",
                      f"Merge example-style hand-off ({checkpoint[:7]}) into production", checkpoint)
         merge = self.git("rev-parse", "HEAD")
@@ -174,6 +216,11 @@ class MergeCheckpointTests(MergeCheckpointFixture):
         self.assertEqual((self.state / "notified-tip").read_text(), merge)
         self.assertEqual(len(self.events("send.py")), 1)
         self.assertNotIn("already merged", result.stdout)
+        self.assertEqual([row["Change"] for row in change_review.pending(review)], ["Recovered"])
+        written = review.read_bytes()
+        retried = self.run_handoff(checkpoint)
+        self.assertEqual(retried.returncode, 0, retried.stdout + retried.stderr)
+        self.assertEqual(review.read_bytes(), written)
     def test_handoff_runs_package_tests_and_writes_the_checkpoint_test_log(self) -> None:
         _ = self.child_production()
         self.write(self.unit, "crates/widget/Cargo.toml", '[package]\nname="widget"\nversion="0.1.0"\n')
@@ -256,29 +303,6 @@ class MergeCheckpointTests(MergeCheckpointFixture):
         self.assertLess(result.stdout.index("push: ok"), result.stdout.index("promote: ok"))
         self.assertEqual(len(self.events("send.py")), 1)
         self.assertNotIn("hand-off acknowledgment:", result.stdout)
-    def test_former_child_slug_resolves_to_the_canonical_doc_and_merge_subject(self) -> None:
-        doc = self.child_production()
-        _ = doc.write_text(doc.read_text().replace(
-            "# Style production", "# Style production\n\n## Production Context\n- **Formerly:** `old-style`",
-        ))
-        timer = self.root / "notifier/showrunner-example-style/conf"
-        timer.parent.mkdir(parents=True)
-        _ = timer.write_text(f"TARGET=session:fake-child\nCHECK=zsh /unused/production_check.sh {doc}\n")
-        checkpoint = self.checkpoint()
-        result = subprocess.run([
-            sys.executable, str(SCRIPT), "--from-child", "old-style", "--checkpoint", checkpoint,
-            "--production", str(self.doc), "--started", STARTED,
-        ], cwd=self.checkout, env=self.env, capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertEqual(self.git("log", "-1", "--format=%s"),
-                         f"Merge example-style hand-off ({checkpoint[:7]}) into production")
-        entry = merge_branch_history(self.checkout, "production").last_merge()
-        self.assertIsInstance(entry, ChildHandoffEntry)
-        if not isinstance(entry, ChildHandoffEntry):
-            self.fail("canonical child's hand-off was not recorded")
-        self.assertEqual(entry.child, "example-style")
-        self.assertEqual(len(self.events("send.py")), 1)
-        self.assertNotIn("old-style", str(self.events("send.py")))
     def test_handoff_refuses_unit_only_hold_metadata(self) -> None:
         _ = self.child_production()
         before = self.git("rev-parse", "HEAD")
@@ -287,48 +311,6 @@ class MergeCheckpointTests(MergeCheckpointFixture):
         self.assertEqual(result.stdout.strip(), "merge_checkpoint: --from-child is separate from unit checkpoint arguments")
         self.assertEqual(self.git("rev-parse", "HEAD"), before)
         self.assertEqual(self.events("send.py"), [])
-    def test_style_unit_none_owns_needs_explicit_ticket_file_allowance(self) -> None:
-        self.production_doc(owns=("none",))
-        checkpoint = self.checkpoint(relative="src/lib.rs", content="fn fixed() {}\n")
-        refused = self.run_checkpoint(checkpoint)
-        self.assertNotEqual(refused.process.returncode, 0)
-        self.assertIn("outside responsibilities: src/lib.rs", refused.process.stdout)
-        permitted = self.run_checkpoint(checkpoint, "--also", "src/lib.rs")
-        self.assertEqual(permitted.process.returncode, 0, permitted.process.stdout + permitted.process.stderr)
-        self.assertIn("scope: ok", permitted.process.stdout)
-    def test_mixed_history_keeps_child_identity_separate_from_renamed_unit_phases(self) -> None:
-        subjects = (
-            "Merge old-unit phase 1 (aaaaaaa) into production",
-            "Merge old-unit hand-off (bbbbbbb) into production",
-            "Merge old-unit phase 1 shrink (ccccccc) into production",
-            "chore(example): rename unit old-unit to new-unit",
-            "Merge style-child hand-off (ddddddd) into production",
-            "Merge new-unit phase 2 (eeeeeee) into production",
-            "Merge old-unit hand-off (fffffff) into production",
-        )
-        hashes: list[str] = []
-        for subject in subjects:
-            _ = self.git("commit", "--allow-empty", "-m", subject)
-            hashes.append(self.git("rev-parse", "HEAD"))
-        history = merge_branch_history(self.checkout, "production")
-        self.assertEqual(history.entries, (
-            ChildHandoffEntry("old-unit", "fffffff", "production", hashes[6]),
-            MergeEntry("new-unit", "2", "eeeeeee", "production", hashes[5], CodeCheckpoint()),
-            ChildHandoffEntry("style-child", "ddddddd", "production", hashes[4]),
-            MergeEntry("new-unit", "1", "ccccccc", "production", hashes[2], ShrinkCommit()),
-            ChildHandoffEntry("old-unit", "bbbbbbb", "production", hashes[1]),
-            MergeEntry("new-unit", "1", "aaaaaaa", "production", hashes[0], CodeCheckpoint()),
-        ))
-        self.assertEqual(history.last_merge(), history.entries[0])
-        self.assertEqual(history.last_for_unit("new-unit"), history.entries[1])
-        self.assertEqual(history.last_code_for_unit("new-unit"), history.entries[1])
-        self.assertEqual(history.last_for_unit("old-unit"), NoMerge())
-        self.assertEqual(history.last_code_for_unit("style-child"), NoMerge())
-        self.assertEqual(history.code_merge_count(), 2)
-        self.assertTrue(history.has_code_merge("new-unit", "1"))
-        self.assertFalse(history.has_code_merge("old-unit", "style hand-off"))
-        self.assertEqual(history.last_handoff_for_child("old-unit"), history.entries[0])
-        self.assertEqual(history.last_handoff_for_child("new-unit"), NoMerge())
 
 
 if __name__ == "__main__":

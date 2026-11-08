@@ -20,7 +20,7 @@ director states an ETA ──► progress_history.py eta ──► eta_stated ev
                          phase_table.build_plan(plan) ◄───────┘  (chain, gates, PhaseHistory)
                                   │                        │
             progress_history.py progress           board_json.py --session <id>
-            (short report / --tables)              writes <slug>.json, prints {files, watch}
+            (short report / --tables)              writes <staff-id>.json, prints {files, watch}
                                                            │
                                        mod: /showrunner:unit_board ── reads JSON, stats sources while open
                                        mod: /showrunner:accounts ── runs accounts.py status --json --stored
@@ -55,18 +55,23 @@ progress_history.py eta --session-dir <dir> --time <t> --basis <basis>
 ### The board generator
 
 ```
-~/.claude/scripts/lib/py ~/.claude/scripts/direct/board_json.py (--session <id> | --production <slug>)
+~/.claude/scripts/lib/py ~/.claude/scripts/direct/board_json.py (--session <id> | --production <showrunner name>)
 ```
 
-[`board_json.py`](../../scripts/direct/board_json.py) resolves productions, writes each one's board atomically (temp file in the same directory, then `os.replace`) to `${UNIT_BOARD_DIR:-${XDG_STATE_HOME:-~/.local/state}/unit-board}/<slug>.json`, and prints one line `{"files": [...], "watch": [...]}`. Nothing resolved exits 0 with `"files": []`. An unreadable staff file also gives no boards and prints one line on stderr with the cause.
+[`board_json.py`](../../scripts/direct/board_json.py) reads the staff file to resolve each production. It writes each board atomically to `${UNIT_BOARD_DIR:-${XDG_STATE_HOME:-~/.local/state}/unit-board}/<showrunner-staff-id>.json`. It prints one line: `{"files": [...], "watch": [...]}`. The plugin reads these returned paths directly. A rename, transfer, or session replacement preserves the cache path. An unresolved production returns `"files": []` and exits 0. An unreadable staff file also prints its cause to stderr.
 
-- Resolve: read one staff snapshot and use it for every board’s unit rows. Join the session to its newest pane launch’s `STAFF_ID`, then follow its staff parents to the first showrunner. Unit and worker sessions see that showrunner’s production and every showrunner production below it, nearest level first. `--production <slug>` selects the same subtree by its mapped staff row and takes precedence if both selectors are supplied. The shared `MemberSources.showrunner_members` mapping joins each showrunner row to its production; `showrunners.registered_showrunners()` supplies the doc and zone. Unmapped productions are left out. A session with no staff row or no showrunner above it gives no files.
-- `watch` holds the notifier registry dir (`NOTIFIER_STATE_DIR`, default `~/.local/state/notifier`), so an open pane notices a production started later. It also holds `SHOWRUNNER_STATE_DIR` and `SHOWRUNNER_STATE_DIR/<slug>` for every registered slug: `showrunners.attach` and `detach` write or remove `<child>/parent`, which moves that dir's mtime. Existing paths only; registration creates `<slug>/` before the update timer, so the dir exists before any attach.
-- The JSON contract is [`mods/unit-board/types/board.d.ts`](../../mods/unit-board/types/board.d.ts), field for field, and [`test_board_json.py`](../../scripts/direct/test_board_json.py) checks every output key against it. Top level: `production`, `as_of`, `zone`, `utc_offset_minutes`, `units`, `sources`. Every time is `BoardTime {at: epoch s, text}` in the production's zone, `text` `HH:MM` today, else `ddd DD Mon HH:MM`.
-- `BoardUnit`: `key` (Unit cell less `-unit`), `plan`, `state` (`running` | `run-finished` | `standing-by`, from the unit's own newest run via `unit_run.local_run`), `phase` (tagged by `kind`: `plan {id, of, title}`, or `ticket {id, title, merged}` when the plan holds a `> **Standing:**` line; one read-only ledger read gives `merged`, the unit's `merged` tickets, and `id`, its newest `assigned` or `checkpointed` ticket (the current phase is then the open `phase_table.build_run` row whose phase or leading title word is that id, so a ticket that a unit rename moved still shows under its old prefix), else the title's leading `<unit>-<n>`, else the phase id; `title` drops that leading id) or null, `phases` (`BoardPhase`: `status` `done|open|todo|gated`, `took`, `fix_done`, `fix_running`, `findings {blocker, minor, nit}`, `eta {first, trail, finished, delta_minutes}`, todo `start`/`finish`, `gate` `none|timed|untimed`; a non-`none` gate makes the status `gated`), `finish` (`predicted`/`finished` with `at`, `after_gate` with `gate`/`waits_on`, or `unknown`), `stage`, `eta` (`BoardEta {at, first, trail, moved, delta_minutes, schedule_end, fix_done, fix_running}`) or null, `summary` (newest `progress_reported` text), `steps` (`[state, what, started, took_seconds]` for the open instance's passes and activities), `workers` (`slot`, `role`, `state`, `model`, `doing`).
+- `board_json.resolve` reads one staff snapshot for all boards. It finds the session with `record.by_current_session`, then follows staff parents to the first showrunner. Unit and worker sessions see that production and its descendant productions, nearest level first. `--production <showrunner name>` selects the same subtree by staff name and takes precedence over `--session`. The resolver reads document paths from showrunner staff rows and zones through `showrunners.timer_for`. It excludes showrunners without timer registrations. A session without a staff row or a showrunner ancestor produces no files.
+- `watch` holds the notifier registry dir (`NOTIFIER_STATE_DIR`, default `~/.local/state/notifier`), so an open pane notices a production started later. It also holds `SHOWRUNNER_STATE_DIR` and `SHOWRUNNER_STATE_DIR/<staff id>` for every registered showrunner: `showrunners.attach` and `detach` write or remove `<child>/parent`, which moves that dir's mtime. Existing paths only; registration creates `<showrunner name>/` before the update timer, so the dir exists before any attach.
+- The JSON contract is [`mods/unit-board/types/board.d.ts`](../../mods/unit-board/types/board.d.ts).
+  [`test_board_json.py`](../../scripts/direct/test_board_json.py) checks every output key against it.
+  The top level holds `production`, `as_of`, `zone`, `utc_offset_minutes`, `units`, `sources`, and `live`.
+  `live` is true when a worker is `working` or `waiting on run`.
+  Every time uses `BoardTime {at: epoch s, text}` in the production's zone.
+  The text uses `HH:MM` today and `ddd DD Mon HH:MM` on other days.
+- `BoardUnit`: `key` (the staff name), `plan`, `state` (`running` | `run-finished` | `standing-by`, from the unit's own newest run via `unit_run.local_run`), `phase` (tagged by `kind`: `plan {id, of, title}`, or `ticket {id, title, merged}` when the plan holds a `> **Standing:**` line; one read-only ledger read gives `merged`, the unit's `merged` tickets, and `id`, its newest `assigned` or `checkpointed` ticket (the current phase is then the open `phase_table.build_run` row whose phase or leading title word is that id, so a ticket that a unit rename moved still shows under its old prefix), else the title's leading `<unit>-<n>`, else the phase id; `title` drops that leading id) or null, `phases` (`BoardPhase`: `status` `done|open|todo|gated`, `took`, `fix_done`, `fix_running`, `findings {blocker, minor, nit}`, `eta {first, trail, finished, delta_minutes}`, todo `start`/`finish`, `gate` `none|timed|untimed`; a non-`none` gate makes the status `gated`), `finish` (`predicted`/`finished` with `at`, `after_gate` with `gate`/`waits_on`, or `unknown`), `stage`, `eta` (`BoardEta {at, first, trail, moved, delta_minutes, schedule_end, fix_done, fix_running}`) or null, `summary` (newest `progress_reported` text), `steps` (`[state, what, started, took_seconds]` for the open instance's passes and activities), `workers` (`slot`, `role`, `state`, `model`, `doing`).
 - `stage`, in order:
   - the open pass as `Build`/`Tests`/`Review`/`Repair round <n>`;
-  - a `finding_batch_dispatched` not yet landed in the open phase instance, as `Repair round <dispatched batches>`;
+  - An unlanded `finding_batch_dispatched` in the open phase appears as `Repair round <dispatched batches>`. This label shows dispatch records for audit. Repair counts require started fix passes. Relaunches of one ledger batch add no round. Refunded batches add no round unless they later land.
   - the open activity label (`display_cells.open_step`);
   - `Phase <id> running` while a phase is open (`Ticket <id> running` on a standing plan);
   - otherwise `Run done`, `Waiting on G<k>` or `Standing by`.
@@ -75,12 +80,47 @@ progress_history.py eta --session-dir <dir> --time <t> --basis <basis>
 - `state` comes from `unit_run.local_run`, which reads each run file only up to its `run_started` line (every run file holds one, on line 1) and skips lines without `"run_started"` before parsing.
 - The record is built from the found run's own plan (`project_plan_doc`, else `plan_doc` resolved against the worktree), falling back to the Plan cell's plan.
   - It is `build_plan` on that plan; when that has no phases, `build_run(plan, events)` from the run's events.
-  - A run on another plan than its production row (tool-based-ui `demo`) shows its real phase.
+  - A run on another plan than its production row (hana `demo`) shows its real phase.
   - `plan` is the Plan cell, and is empty when that file no longer exists.
-- `workers` come from the run's session dir: `mesh_roster.json` (role, status; `done` shows as `idle`, `ended` stays), `impl_worker_<slot>.json` (slot, family/model) and the slot's newest `board.log` line as `doing`.
+- `workers` combines the run roster, slot metadata, and each slot's newest board activity.
+  `recorded_turn_settings` supplies the accepted model and effort.
+  `done` displays as `idle`; `ended` stays unchanged.
+  The reader displays raw role and family values when the records contain them.
+  Missing values display as empty fields.
+  The [worker design](long-lived-workers.md#roster-fields) defines the current records without copied role or family fields.
   - Slots drop the worktree's mesh prefix.
   - Roster entries that become one slot merge into the entry its `impl_worker_<slot>.json` names, else the last in roster order. Roster `revision` values are per-entry counters, never compared.
   - `doing` is less a leading `launcher: ` and a trailing `; summary at …` or `; findings in …`, stripped and cut to 80 characters.
+- Pane workers also use [`worker_runs.py`](../../scripts/direct/worker_runs.py) to read detached runs from their run folder.
+  It matches each worker by staff id and selects its newest run by `started_at`.
+  A working pane has state `working`.
+  An idle pane with a live run has state `waiting on run`.
+  A successful process snapshot confirms `run gone` when a running record has no process.
+  A failed snapshot keeps `waiting on run` and `live: true` so the next tick retries.
+  That run shows `first_reading` growth and saves no new reading.
+  A finished run with delivery starting `queued` has state `result queued` until that worker starts another pass.
+  Both `queued for ...` and `queued: ...` deliveries use this state.
+  Other workers keep their pane state.
+  Only these three run states carry `run {label, started_at, growth, last_line}`.
+  `growth` has kind `first_reading`, `measured`, or `finished`.
+  Measured growth holds `cpu_percent` and `log_bytes_per_minute`.
+  Finished growth holds `exit_code`.
+  The reader takes at most one `ps -A -o pid=,ppid=,time=` snapshot for all shown runs.
+  It takes no snapshot when no shown run has status `running`.
+  CPU seconds include the run process and all its descendants.
+  On Linux, each tree member includes its own CPU and the CPU of children it reaped, from `/proc/<pid>/stat`.
+  Stat reads cover only the running run's tree; an unavailable stat file uses that pid's `ps` CPU time.
+  On systems without `/proc`, including macOS, CPU totals use `ps` and can miss children that exit between snapshots.
+  The last line comes from at most 4096 log bytes and contains no ANSI escape sequences.
+- `run_readings.json` sits beside the board files, outside the watched run folders.
+  Each running reading holds `run_id`, `at`, `cpu_seconds`, and `log_bytes`.
+  The next reading measures CPU percent of one core and log bytes per minute.
+  The writer merges readings under the exclusive `run_readings.lock` beside the readings file.
+  The lock stays in place when atomic publication replaces the readings file.
+  A build preserves readings from other boards.
+  It removes only readings for runs it saw as finished and readings older than ten minutes.
+  An idle build never deletes another board's fresh readings.
+  A build with no readings creates no readings file.
 - `eta.at`/`first`/`trail` are stated promises only; `schedule_end` is the chain's end and never a trail entry.
 - `sources` lists existing paths only: each unit's run `.jsonl`, `mesh_roster.json`, `board.log`, every `impl_worker_<slot>.json`, the plan doc, every `plan_runs` `.jsonl`, a standing unit's style ledger, the production doc, plus each session dir, the run roots and the history `runs/` dir (or the history root while `runs/` is missing), so a run that starts later moves a watched mtime.
 
@@ -159,13 +199,14 @@ refreshIfChanged<T>(files: RefreshFiles, paths: readonly RefreshPaths[],
 type RefreshPaths =
   | { kind: 'board'; board: string; sources: string[] }       // sources vs the board file's mtime
   | { kind: 'discovery'; sources: string[]; loadedAt: number } // sources vs the load time
-  | { kind: 'liveness' } // refresh local counts each tick
+  | { kind: 'liveness' } // refresh live counts and worker runs each tick
 ```
 
 A source newer than its reference, or a failed stat, triggers one generator run.
 `isOpen` guards each stat, generator call, and state write.
 The production board refreshes every ten seconds and on `turn.complete`.
-An unchanged production board tick advances its display clock without a process.
+An unchanged production board with `live: false` advances its display clock without a process.
+When any board has `live: true`, `snapshotPaths` adds `liveness` and each tick rebuilds the board.
 The accounts pane uses a separate ten-second timer and a busy guard.
 It ignores `turn.complete`.
 `loadAccounts` watches saved usage, groups, worker selection, and the role-map cache.
@@ -198,7 +239,13 @@ The build queue reads process memory every ten seconds while open.
   - ETA with overdue, gate and finish, then the ruler;
   - the trail as `HH:MM said HH:MM → …`, then the strip;
   - `This phase` steps, each label fitted to one row with two spaces before its time;
-  - one row per worker, with slot, role and state padded to the widest entry;
+  - Each worker row pads its slot, role, and state to the widest entry.
+    A run row then shows the label, age, CPU percent, log growth, and last log line.
+    The pane truncates the row at its width.
+    The first reading shows `cpu …` and `log …`.
+    A finished run shows its exit code.
+    `working` and `waiting on run` use `suggestion`; `run gone` uses `error`; `result queued` uses `warning`.
+    A row without a run keeps its existing fields.
   - the phase record, newest first.
 
   It keeps within `bodyRows`:
@@ -207,7 +254,7 @@ The build queue reads process memory every ten seconds while open.
   - Older steps fold into `+N earlier steps`.
   - An empty record reads `no phases recorded`. A block with nothing in it is not drawn.
 - Accounts: `AccountsView(elements, columns, status, zone, now)` uses the pane's width.
-  The columns are the access mark, `account`, `left`, `role`, `busy`, `shell`, `idle`, `total`, `resets`, `credits`, and `enabled`.
+  The columns are the access mark, `account`, `left`, `role`, `busy`, `idle`, `paused`, `exited`, `total`, `resets`, `credits`, and `enabled`.
   The table omits the `read` and `in use` columns.
   Account labels are bold, and numbers align to the right.
   Each role has a separate row with its own counts.
@@ -217,7 +264,9 @@ The build queue reads process memory every ten seconds while open.
   The view reads these counts directly; `role_counts_by_machine` keeps the separate machine records.
   A role with no reported members has zero counts; `spare` has no count.
   A totals row sums the known activity counts.
-  Codex shell counts remain unknown; they do not become zero.
+  Units and showrunners without live sessions count as exited on their selected role account.
+  Workers count only while live; their paused and exited counts stay zero.
+  Paused stays zero until agents status supplies that state.
   The access mark uses `read_ok`: success for a recent usable reading, and error otherwise.
   Low allowance uses error below 10 percent and warning below 25 percent.
   Tables use the widest cell or header, with two spaces between columns.
@@ -301,7 +350,8 @@ The ETA shown is the latest promise because a passed promise advanced to now wou
 The mod draws and Python computes. The chain, gates and history live in `phase_table`, which is stdlib Python under `unittest` and basedpyright; a generator that writes one JSON file keeps a single source of predictions, a typed contract tested on both sides, and a view layer with no logic to drift. `state` comes from the unit's own newest run, and `local_run` reads each file only to its `run_started` line so the board opens inside the process limit. Other production watchers share one `unit_lookup.read_run_states()` snapshot per tick, reading each file's first line and each worktree's newest record's last JSON object; `run_state` is the wrapper for a single lookup. `build_run` keeps a unit's record on the board after its plan turns into an as-built doc and loses its phase headings.
 
 Panes open on demand, so a closed pane runs no view refresh.
-The production board uses file changes to trigger its generator.
+The production board uses file changes to trigger its generator when `live` is false.
+When `live` is true, the existing 10 s tick uses the `liveness` refresh path to rebuild the board.
 Discovery paths detect a new production or input.
 The accounts pane also refreshes local liveness each tick when its generator reports session inputs.
 The build queue refreshes process memory each tick.

@@ -1,16 +1,17 @@
-# herdr restore (as built)
+# Herdr restore
 
-Goal (user, 2026-10-19): after a crash or a reboot, `herdr session attach agents` shows every
-workspace, tab and pane as before, each Claude conversation resumed by its id on its own account.
+`herdr session attach agents` restores the saved workspaces, tabs, and panes.
+The saved launch selects each conversation and account.
 
-## Pane launch record (checkpoint 1)
+## Pane launch record
 
 - `scripts/shutdown/pane_record.py` keeps one file per herdr session,
   `~/.local/state/herdr-panes/<session>.json` (`HERDR_PANE_RECORD_DIR` in tests), keyed by
   `HERDR_PANE_ID`.
 - Each entry holds the pane's Claude launch: the account folder (`CLAUDE_CONFIG_DIR`), the cwd,
   the `-n` name, the `--model` value, whether `--remote-control` was given, the conversation id
-  at that start, and the `SHOWRUNNER_*`, `ENABLE_TOOL_SEARCH` and probe marks. No credential
+  at that start (the fixed staff id for a staff member), and the `ENABLE_TOOL_SEARCH` and probe
+  marks. It saves no staff labels: a launch computes them from staff. No credential
   enters it: a resume rebuilds the account variables from the account folder.
 - `scripts/hooks/session-start-pane-record.py` writes the entry at SessionStart
   (startup, resume, clear, compact) from its own Claude process: the environment it inherits, and
@@ -28,7 +29,9 @@ The settings.json entry, one more SessionStart item:
 {"matcher": "startup|resume|clear|compact", "hooks": [{"type": "command", "command": "\"$HOME/.claude/scripts/lib/py\" \"$HOME/.claude/scripts/hooks/session-start-pane-record.py\""}]}
 ```
 
-## Pane restore (checkpoint 2)
+The [launch-name policy](shutdown-and-restart.md#launch-names) supplies current names without copied staff marks.
+
+## Pane restore
 
 - Each entry also holds `flags_read` (false when the hook found no Claude argv) and `ended`. `scripts/hooks/session-end-pane-record.py` sets `ended` at
   SessionEnd for any reason but `other`: `/exit` and logout mark it, a signal at a reboot or a
@@ -38,27 +41,26 @@ The settings.json entry, one more SessionStart item:
   conversation id from `<config>/sessions/<pid>.json`. It needs no
   `report-agent-session`: a restore takes the id from the entry and checks herdr's
   `agent_session` only when the pane has one.
-- `scripts/shutdown/pane_restore.py [--session NAME] [--dry-run]` (the shared session by
-  default) first waits for the server (`herdr.start_server`, which adopts it). For each pane with
-  an entry, it resumes the conversation unless a reason below holds, and prints the reason:
-  - herdr's `agent_session` names another conversation;
-  - the entry is `ended` (closed by hand);
-  - the conversation already runs (`sessions.live_sessions` or `running_sessions`);
-  - `flags_read` is false (entries written before the field are read as true off the Mac);
-  - the account has no transcript of the conversation;
-  - the pane runs a program.
-- A resume opens a tab with `herdr.open_tab` in the pane's workspace, with the pane's label and
-  cwd, and the entry's marks plus `named_account_environment(config_dir)`. It then runs
-  `start_agent` with `--resume <id>`, `-n`, `--remote-control`, `--model` from the entry, and
-  `--settings '{"disableAgentView": true}'`, with no opening prompt. Then it closes the restored
-  tab by its pane id: ordering the tabs keeps pane ids. A failed start closes the new tab and
-  keeps the restored one. Any failure makes the exit status 1.
-- `herdr.keeps_restored_layout(session)` is true for `shared_session()` only when herdr's
-  config sets `[session] resume_agents_on_restore = false`. Else herdr resumes each pane itself
-  on the server's account, so `_clear_restored_workspaces` clears the layout, as for every other
-  session.
-- `shutdown.py restart --all` stops and starts the local live Claude staff rows.
-- `shutdown.py restart` starts the missing rows from the saved row ID list.
+- `scripts/shutdown/pane_restore.py [--session NAME] [--dry-run]` first starts or adopts the shared server.
+  It resumes staff rows through `restart.start_row`.
+  It resumes saved panes without staff rows through `herdr.launch_agent`.
+  A pane without a saved entry or a staff row stays open.
+- Restore keeps live conversations. Unknown conversation evidence prints one anomaly line and permits a guarded launch.
+  Saved entries remain eligible after an intentional stop or when `flags_read` is false.
+  The shared launch path checks the selected terminal before it sends keys.
+- Restore reuses a retained shell when its terminal and folder match.
+  A replacement uses the saved account and the current staff identity, name, and folder.
+  A saved pane without a staff row uses its saved identity, account, and folder.
+  Both routes send no opening prompt.
+  They preserve the saved model, Remote Control setting, and `disableAgentView`.
+  The launch-name reader supplies the current display name.
+- A replacement closes its source only after resume publication proves the new conversation.
+  A source pane that gains another conversation or program stays open and prints an anomaly.
+  A failed start preserves the pane. A failed restore returns exit status 1.
+- Herdr keeps the restored layout. Unless its config sets `[session] resume_agents_on_restore = false`,
+  herdr also resumes each pane itself on the server's account, and without the pane's `--env`.
+- `agents restart --all` stops and starts the local live Claude and Codex staff rows.
+- `agents restart` starts the missing rows from the saved row ID list.
 - Staff supplies the current session and worktree. Herdr saves tab order by staff row ID.
 - Restart sends no work prompt and does not restore unrelated panes.
 - A restore takes focus only when that launch created a window
@@ -73,8 +75,8 @@ The settings.json entry, one more SessionStart item:
   Herdr can replay saved pane commands when its configuration allows agent restore.
   Claude commands wrapped by `lib/relaunch.py` recover the matching conversation's
   session labels and resume note. This is separate from `agents restart`.
-- `pane_restore.py` remains an explicit command for eligible saved panes. Run it
-  when needed; no service invokes it automatically.
+- `pane_restore.py` is an explicit command for staff rows and saved panes without staff rows.
+  No service invokes it automatically.
 
 Settings entry for the user, one more SessionEnd item:
 
@@ -89,7 +91,28 @@ Settings entry for the user, one more SessionEnd item:
   dropped as it is read. The Mac hides the environment of a system binary such as `/bin/zsh`,
   never of Claude.
 
-## Still to come
+## Codex panes
+
+- A Codex pane launch passes `--no-daemon`. A daemon-attached Codex reports no `agent_session`.
+- A fresh Codex worker gets one short first turn, `WORKER_FIRST_TURN_TEXT`, with the limit
+  `WORKER_FIRST_TURN_SECONDS` (`config/direct.conf`). `worker_panes.start_or_resume` then publishes
+  the staff row from the pane's `agent_session`.
+- A known identity launches with `resume <id>` and gets no first turn.
+- `herdr.pane_native_process` is the one reader of pane membership. For one foreground `codex`:
+  - an open rollout proves the pane;
+  - an `agent_session` equal to the row's `current_session` proves the pane;
+  - a `resume` argument proves the pane when the report is empty (`UnreportedResume`: a resumed
+    Codex reports nothing before its first prompt) or equals the argument;
+  - a report that names another session proves nothing, and so does a pane row that cannot be read.
+- `PANE_AGENT_START_SECONDS` is the one launch deadline, for a worker and for a side pane.
+- `herdr.child_environment` removes `NO_COLOR`. With it, Claude draws no SGR, and `_composer_input`
+  reads the faint placeholder as typed text.
+- The pane's terminal owns `TERM` and `COLORTERM`. `herdr._pane_environment` removes them at a new
+  tab, a split and an existing-pane launch. A Codex tool shell holds `TERM=dumb`. With it, `/etc/zshrc`
+  turns off the line editor, so zsh keeps the raw tty that a stopped Codex leaves, and the Enter
+  from `pane run` never ends a line.
+
+## Restore services
 
 - Automatic boot restore is not installed on either machine.
 - Layout saving and detection-rule refresh run in `herdr-upkeep`.

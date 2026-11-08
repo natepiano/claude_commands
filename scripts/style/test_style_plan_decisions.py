@@ -2,28 +2,26 @@
 
 from __future__ import annotations
 
-from ledger_test_support import ticket_owner_id
+from scripts.style.ledger_test_support import ticket_owner_id
 
 import os
 import shutil
 import sqlite3
 import subprocess
-import sys
 import unittest
 from contextlib import closing
 from pathlib import Path
 from typing import final
 from unittest import mock
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-import style_plan
-import style_proposals
+from scripts.style import style_plan
+from scripts.style import style_proposals
 
-import rules
-import style_ledger
+from scripts.style import rules
+from scripts.style import style_ledger
 
-from style_plan_test_support import StylePlanFixture
+from scripts.style.style_plan_test_support import StylePlanFixture
 
 
 @final
@@ -31,7 +29,7 @@ class StylePlanTests(StylePlanFixture):
     def test_fix_worker_applies_after_as_the_whole_before_span_replacement(self) -> None:
         ticket_id = self.approved_reference_ticket()
         with self.ledger() as ledger:
-            ticket, = ledger.queued_tickets(ticket_owner_id("names-unit"))
+            ticket, = ledger.queued_tickets(ticket_owner_id("names"))
             text = style_plan.phase_text(ticket, ledger.pinned_rule_texts(ticket_id), self.plan, self.plan_header())
         authorization = text.split("Read the issue for its sites and before/after changes.", 1)[1]
         authorization = authorization.split("Hold every other non-mechanical finding.", 1)[0]
@@ -78,7 +76,7 @@ class StylePlanTests(StylePlanFixture):
         showrunner = self.style / "docs/style-production/units/names-unit.md"
         before = showrunner.read_bytes()
         self.assertEqual(self.run_next(), (0, "phase written: 1\n", ""))
-        ticket = self.ledger().ticket_open(ticket_owner_id("names-unit"))[0]
+        ticket = self.ledger().ticket_open(ticket_owner_id("names"))[0]
         self.assertEqual(ticket["branch"], "refs/heads/demo-style-names")
         self.assertEqual(ticket["rules"], [rule])
         pinned = self.ledger().pinned_rule_texts(ticket["id"])[0]
@@ -112,11 +110,11 @@ class StylePlanTests(StylePlanFixture):
                 if boundary == "added":
                     with mock.patch.object(style_ledger.Ledger, "ticket_assign", side_effect=RuntimeError("interruption")):
                         with self.assertRaisesRegex(RuntimeError, "interruption"):
-                            _ = style_plan.next_phase("names-unit", self.plan, self.repo)
+                            _ = style_plan.next_phase("names", self.plan, self.repo)
                 elif boundary == "assigned":
                     with mock.patch.object(style_plan, "write_phase", side_effect=RuntimeError("interruption")):
                         with self.assertRaisesRegex(RuntimeError, "interruption"):
-                            _ = style_plan.next_phase("names-unit", self.plan, self.repo)
+                            _ = style_plan.next_phase("names", self.plan, self.repo)
                 else:
                     real_write = style_plan.atomic_write
                     def fail_plan(path: Path, data: bytes) -> None:
@@ -125,12 +123,12 @@ class StylePlanTests(StylePlanFixture):
                         return real_write(path, data)
                     with mock.patch.object(style_plan, "atomic_write", fail_plan):
                         with self.assertRaisesRegex(RuntimeError, "interruption"):
-                            _ = style_plan.next_phase("names-unit", self.plan, self.repo)
+                            _ = style_plan.next_phase("names", self.plan, self.repo)
                     self.assertTrue(pinned_dir.exists())
                 self.assertEqual(self.run_next()[0], 0)
                 self.assertEqual(self.plan.read_bytes(), uninterrupted)
                 self.assertEqual(self.count_tickets(), 1)
-                self.assertEqual(self.ledger().ticket_open(ticket_owner_id("names-unit"))[0]["branch"], "refs/heads/demo-style-names")
+                self.assertEqual(self.ledger().ticket_open(ticket_owner_id("names"))[0]["branch"], "refs/heads/demo-style-names")
 
     def test_resume_restores_a_truncated_pin_without_changing_the_phase(self) -> None:
         _ = self.rule("read")
@@ -230,7 +228,7 @@ class StylePlanTests(StylePlanFixture):
         ledger.file_held(freed.finding_id, origin.issue)
         ledger.ticket_drop(ticket)
         replacement = ledger.next_ticket_id()
-        ledger.ticket_add(replacement, ticket_owner_id("names-unit"), "proposal", "names", "crates/alpha", [self.sources[0], self.sources[3]],
+        ledger.ticket_add(replacement, ticket_owner_id("names"), "proposal", "names", "crates/alpha", [self.sources[0], self.sources[3]],
                           [rule], proposal=str(origin.issue), finding_ids=(kept, freed.finding_id))
         ledger.ticket_assign(replacement, "main")
         self.write(self.sources[3], "enum Shape { Round }\n")
@@ -252,7 +250,7 @@ class StylePlanTests(StylePlanFixture):
         second = ledger.hold(rule, self.sources[0], 1, "another value", "restructure", "42", "LIMIT", blob, "outside")
         ledger.file_held(second.finding_id, issue)
         _ = self.refill_decisions()
-        ticket, = ledger.ticket_open(ticket_owner_id("names-unit"))
+        ticket, = ledger.ticket_open(ticket_owner_id("names"))
         self.assertEqual(ticket["files"], list(self.sources[:2]))
         self.assertEqual(set(ticket["finding_ids"]), {f.finding_id for f in ledger.proposal_findings(issue)})
 
@@ -268,15 +266,15 @@ class StylePlanTests(StylePlanFixture):
         ledger = self.ledger()
         self.commit_files({site: "fn sibling() {}\n" + source})
         _ = self.refill_decisions()
-        ticket, = ledger.ticket_open(ticket_owner_id("names-unit"))
+        ticket, = ledger.ticket_open(ticket_owner_id("names"))
         self.assertEqual((ticket["kind"], ticket["finding_ids"]), ("proposal", [finding.finding_id]))
         self.assertEqual(ledger.named_held([finding.finding_id])[0].line, 3)
         ledger.ticket_drop(ticket["id"])
-        ledger.ticket_add("99", ticket_owner_id("names-unit"), "proposal", "names", "crates/alpha", [site], [rule],
+        ledger.ticket_add("99", ticket_owner_id("names"), "proposal", "names", "crates/alpha", [site], [rule],
                           proposal=str(issue), finding_ids=(finding.finding_id,))
         self.commit_files({site: "fn another() {}\nfn sibling() {}\n" + source})
         _ = self.refill_decisions()
-        ticket, = ledger.ticket_open(ticket_owner_id("names-unit"))
+        ticket, = ledger.ticket_open(ticket_owner_id("names"))
         self.assertEqual(ticket["id"], "99")
         self.assertEqual(ledger.named_held([finding.finding_id])[0].line, 4)
 
@@ -305,20 +303,20 @@ class StylePlanTests(StylePlanFixture):
                                               kind="rename", before="old", after="fresh")
         _ = self.refill_decisions()
         ledger = self.ledger()
-        ticket, = ledger.ticket_open(ticket_owner_id("names-unit"))
+        ticket, = ledger.ticket_open(ticket_owner_id("names"))
         self.assertEqual((ticket["kind"], ticket["finding_ids"]), ("proposal", [findings[1].finding_id]))
         ledger.ticket_drop(ticket["id"])
-        ledger.ticket_add("99", ticket_owner_id("names-unit"), "proposal", "names", "crates/alpha", [self.sources[0]], [rule],
+        ledger.ticket_add("99", ticket_owner_id("names"), "proposal", "names", "crates/alpha", [self.sources[0]], [rule],
                           proposal=str(issue), finding_ids=(findings[1].finding_id,))
         _ = self.refill_decisions()
-        self.assertEqual(ledger.ticket_open(ticket_owner_id("names-unit"))[0]["id"], "99")
+        self.assertEqual(ledger.ticket_open(ticket_owner_id("names"))[0]["id"], "99")
         # The exemption never lifts the separate changed-since-judgment gate.
         ledger.ticket_drop("99")
         self.commit_files({self.sources[0]: source + "fn unrelated() {}\n"})
         with mock.patch.object(style_proposals, "proposal_command"):
             _, output, _ = self.run_next()
         self.assertIn(f"waiting {issue}: {self.sources[0]} changed since it was judged; source follow could not refresh the decision (2 findings)", output)
-        self.assertFalse(any(t["kind"] == "proposal" for t in ledger.ticket_open(ticket_owner_id("names-unit"))))
+        self.assertFalse(any(t["kind"] == "proposal" for t in ledger.ticket_open(ticket_owner_id("names"))))
 
     def test_decision_refill_skips_a_rule_that_left_the_catalog_and_coverage_goes_on(self) -> None:
         gone = self.rule("gone-decision")
@@ -331,7 +329,7 @@ class StylePlanTests(StylePlanFixture):
         self.assertEqual(code, 0, errors)
         self.assertEqual(output.count(f"waiting {issue}: rule {gone} not in the catalog\n"), 1)
         start.assert_not_called()
-        self.assertEqual(self.ledger().ticket_open(ticket_owner_id("names-unit"))[0]["kind"], "read")
+        self.assertEqual(self.ledger().ticket_open(ticket_owner_id("names"))[0]["kind"], "read")
 
     def test_decision_refill_waives_a_finding_whose_file_is_gone_so_the_decision_can_close(self) -> None:
         rule = self.rule("read")
@@ -352,7 +350,7 @@ class StylePlanTests(StylePlanFixture):
             self.assertEqual(connection.execute("SELECT waive_provenance,waived_by FROM held_findings WHERE finding_id=?",
                                                 (gone.finding_id,)).fetchone(), ("ledger", "ledger"))
         self.assertEqual(ledger.named_held((gone.finding_id,))[0].waive_actor, style_ledger.WaiveByLedger())
-        ticket = ledger.ticket_open(ticket_owner_id("names-unit"))[0]
+        ticket = ledger.ticket_open(ticket_owner_id("names"))[0]
         self.assertEqual((ticket["kind"], ticket["files"]), ("proposal", [self.sources[0]]))
         ledger.ticket_checkpoint(ticket["id"], self.tip)
         _ = ledger.ticket_merge(ticket["id"])

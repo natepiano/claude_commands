@@ -51,7 +51,7 @@ class AgentsLogTests(unittest.TestCase):
 
     def cli(self, *arguments: str) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
-            [sys.executable, str(SCRIPT), *arguments],
+            [str(Path(__file__).resolve().parents[1] / "lib/py"), str(SCRIPT), *arguments],
             cwd=REPOSITORY,
             env=os.environ.copy(),
             capture_output=True,
@@ -329,7 +329,7 @@ print(json.dumps(register_default('shared-session', 'interactive', datetime.now(
         try:
             for _worker in range(6):
                 processes.append(subprocess.Popen(
-                    [sys.executable, "-c", script],
+                    [str(Path(__file__).resolve().parents[2] / "scripts/lib/py"), "-c", script],
                     cwd=REPOSITORY, env=os.environ.copy(),
                     stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
                 ))
@@ -516,7 +516,7 @@ for index in range(20):
         try:
             for worker in range(4):
                 processes.append(subprocess.Popen(
-                    [sys.executable, "-c", script, str(worker)],
+                    [str(Path(__file__).resolve().parents[2] / "scripts/lib/py"), "-c", script, str(worker)],
                     cwd=REPOSITORY, env=os.environ.copy(),
                     stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                     text=True,

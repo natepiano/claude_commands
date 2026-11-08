@@ -17,7 +17,6 @@ from types import ModuleType
 from typing import cast, override
 from unittest.mock import patch
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.lib.test_models_registry import write_registry
 from scripts.accounts.home_test_support import scratch_accounts_config
 
@@ -39,10 +38,10 @@ class ProfileNotesPassTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
-        Path("/tmp/claude").mkdir(exist_ok=True)
-        directory = tempfile.TemporaryDirectory(prefix="profile-fixture-", dir="/tmp/claude")
+        directory = tempfile.TemporaryDirectory(prefix="profile-fixture-")
         self.addCleanup(directory.cleanup)
         self.root = Path(directory.name)
+        _ = self.enterContext(patch.object(profile, "SCRATCH_ROOT", self.root))
         self.home = self.root / "home"
         self.home.mkdir()
         self.notes = self.home / "notes"
@@ -67,7 +66,7 @@ class ProfileNotesPassTests(unittest.TestCase):
             "NOTIFIER_SESSIONS_DIR": str(self.home / "sessions"),
             "ROSTER_CODEX_SOCKET": str(self.home / "daemon.sock"),
             "ROSTER_RUN_ROOT": str(self.home / "runs"),
-            "SHOWRUNNERS_CONFIG": str(self.home / "showrunners.json"),
+            "SHOWRUNNERS_CONFIG": str(self.home / "showrunners.conf"),
             "USER_ZONE": "UTC", "PYTHONDONTWRITEBYTECODE": "1",
         }, clear=True))
         _ = self.enterContext(scratch_accounts_config())
@@ -80,7 +79,7 @@ class ProfileNotesPassTests(unittest.TestCase):
                 target = self.home / "fixed" / entry.owner.__name__ / entry.attribute
                 _ = self.enterContext(patch.object(entry.owner, entry.attribute, target))
         paths = (
-            (self.pass_.quota, "CONFIG", self.home / "showrunners.json"),
+            (self.pass_.quota, "CONFIG", self.home / "showrunners.conf"),
             (self.pass_.five, "PROTOCOL", self.home / "quota_alerts.md"),
             (self.pass_.pacer, "SESSIONS", self.home / ".codex/sessions"),
             (self.pass_.pacer, "MODELS_CONF", self.home / "models.conf"),
@@ -94,10 +93,15 @@ class ProfileNotesPassTests(unittest.TestCase):
         for attribute in ("CONFIG", "NOTIFIER_STATE_DIR", "SHOWRUNNER_STATE_DIR"):
             _ = self.enterContext(patch.object(self.pass_.showrunners, attribute, self.home / attribute))
         _ = self.enterContext(patch.object(import_module("scripts.message.process_table"), "PS", [str(self.bin / "ps")]))
-        _ = (self.home / "showrunners.json").write_text(json.dumps({
-            "threshold_percent": 2, "repeat_minutes": 30, "stall_minutes": 5,
-            "faults_to": "fixture", "always": [],
-        }))
+        _ = (self.home / "showrunners.conf").write_text(("""# range: 0..
+threshold_percent=2
+# range: 0..
+repeat_minutes=30
+# range: 0..
+stall_minutes=5
+faults_to=fixture
+always=
+"""))
 
     @property
     def pass_(self) -> profile.NotesPass:
@@ -145,9 +149,9 @@ class ProfileNotesPassTests(unittest.TestCase):
             functions = cast(dict[tuple[str, int, str], object], getattr(pstats.Stats(str(stats)), "stats"))
             self.assertTrue(any(Path(file).name == "unit_watchdog.py" and name == "run"
                                 for file, _, name in functions))
-            self.assertEqual(measured.calls["agent_notes.write_note"], 1)
-            self.assertEqual(measured.calls["agent_notes.write_sessions_seen"], 1)
-            self.assertEqual(measured.calls["codex_pacer.write_atomic"], 3)
+            self.assertEqual(measured.calls["scripts.whoami.agent_notes.write_note"], 1)
+            self.assertEqual(measured.calls["scripts.whoami.agent_notes.write_sessions_seen"], 1)
+            self.assertEqual(measured.calls["scripts.whoami.codex_pacer.write_atomic"], 3)
             self.assertEqual(measured.calls[timer_save_name], 0)
             self.assertGreater(measured.calls["scripts.accounts.refusal_watch._watch_lock"], 0)
             self.assertTrue(measured.children)
@@ -169,7 +173,7 @@ class ProfileNotesPassTests(unittest.TestCase):
         self.assertIn("below /tmp/claude/", error.getvalue())
         self.assertFalse((self.root / "unused.prof").exists())
         with self.assertRaises(ValueError):
-            _ = profile.private_scratch(Path("/tmp/claude"))
+            _ = profile.private_scratch(profile.SCRATCH_ROOT)
 
     def test_recovery_results_are_read_from_scratch_with_their_saved_job(self) -> None:
         state = profile.state_path(self.pass_.watchdog, "_state_file", True)
@@ -193,7 +197,7 @@ class ProfileNotesPassTests(unittest.TestCase):
         self.assertEqual(snapshot(self.home), before)
 
     def test_scratch_symlink_cannot_escape_the_private_root(self) -> None:
-        with tempfile.TemporaryDirectory(dir="/tmp") as outside:
+        with tempfile.TemporaryDirectory() as outside:
             link = self.root / "escape"
             link.symlink_to(outside, target_is_directory=True)
             with self.assertRaises(ValueError):
@@ -250,7 +254,7 @@ class ProfileNotesPassTests(unittest.TestCase):
                         _ = profile.checked_child(policy, command, supplied)
 
     def test_private_scratch_accepts_a_resolved_symlink_root(self) -> None:
-        with tempfile.TemporaryDirectory(dir="/tmp") as directory:
+        with tempfile.TemporaryDirectory() as directory:
             target = Path(directory) / "claude"
             target.mkdir()
             link = self.root / "tmp-link"

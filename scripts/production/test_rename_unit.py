@@ -20,6 +20,46 @@ from scripts.production.rename_unit_test_support import FolderRenameFixture, Fol
 
 @final
 class UnitRenameTests(UnitRenameFixture):
+    def test_bare_unit_name_renames_the_unit_folder_and_branch(self) -> None:
+        row = next(row for row in staff.find(kind="unit") if row.name == "alpha")
+        with RenameDisplays(row).installed():
+            self.assert_ok(self.invoke(["apply", "alpha", "gamma"]))
+        renamed = staff.by_id(row.id)
+        assert renamed is not None
+        self.assertEqual(renamed.name, "gamma")
+        self.assertEqual(renamed.worktree, staff.PresentWorktree("natedev", self.rust / "claude-demo-gamma"))
+        self.assertEqual(self.git("branch", "--show-current", cwd=self.rust / "claude-demo-gamma"), "demo-gamma")
+
+    def test_bare_unit_rename_rerun_keeps_the_callers_unit_and_leaves_the_foreign_unit_unchanged(self) -> None:
+        parent = next(row for row in staff.find(kind="showrunner") if row.name == "demo")
+        own = next(row for row in staff.find(kind="unit") if row.name == "alpha")
+        foreign_parent = fixture_member("showrunner", name="foreign")
+        foreign = fixture_member("unit", name="alpha", parent=foreign_parent.id)
+        self.env["CLAUDE_CODE_SESSION_ID"] = parent.current_session
+        with RenameDisplays(own).installed():
+            self.assert_ok(self.invoke(["apply", "alpha", "gamma"]))
+            before = final_files(self.root)
+            rerun = self.invoke(["apply", "alpha", "gamma"])
+            self.assert_ok(rerun)
+            self.assertEqual(rerun.stdout.strip(), "unchanged")
+            self.assertEqual(final_files(self.root), before)
+        renamed = staff.by_id(own.id)
+        assert renamed is not None
+        self.assertEqual(renamed.name, "gamma")
+        self.assertEqual(staff.by_id(foreign.id), foreign)
+
+    def test_bare_unit_name_with_two_matches_outside_the_caller_requires_a_path(self) -> None:
+        caller = next(row for row in staff.find(kind="showrunner") if row.name == "demo")
+        for name in ("first", "second"):
+            parent = fixture_member("showrunner", name=name)
+            _ = fixture_member("unit", name="duplicate", parent=parent.id)
+        self.env["CLAUDE_CODE_SESSION_ID"] = caller.current_session
+        before = final_files(self.root)
+        result = self.invoke(["apply", "duplicate", "renamed"])
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("duplicate: several rows match; use showrunner/name or the staff id", result.stderr)
+        self.assertEqual(final_files(self.root), before)
+
     def test_same_name_repairs_displays_with_an_unfilled_worktree(self) -> None:
         parent = next(row for row in staff.find(kind="showrunner") if row.name == "demo")
         row = fixture_member("unit", name="unfilled", parent=parent.id)
@@ -177,7 +217,6 @@ class UnitRenameTests(UnitRenameFixture):
         self.assertEqual(self.git("rev-parse", "HEAD", cwd=new), tip)
         self.assertEqual((new / "draft.md").read_text(), "a new file\n")
 
-
     def test_a_mid_phase_rename_keeps_the_commits_and_the_uncommitted_work(self) -> None:
         source = self.rust / "claude-demo-alpha"
         self.write(source / "work.md", "phase work\n")
@@ -272,16 +311,18 @@ class FolderRenameTests(FolderRenameFixture):
                         self.assertEqual(displays.commands, commands)
 
     def test_f017_same_name_with_unit_suffix_changes_nothing(self) -> None:
-        from scripts.production import rename_unit, unit_move
+        from scripts.production import rename, unit_move
 
         displays = RenameDisplays(self.owner)
         displays.pane = displays.tab = self.owner.name
         labels = displays.pane, displays.tab, displays.workspace
         before = file_versions(self.root)
-        arguments = ["apply", "folder-production", "port-unit", "port"]
+        parent = staff.snapshot().parent_of(self.owner)
+        assert parent is not None
+        arguments = ["apply", f"{parent.name}/port-unit", "port"]
         with (FolderSessionFixture(self.owner, live=False).installed(), displays.installed(),
               mock.patch.object(unit_move, "move_folder", wraps=unit_move.move_folder) as move):
-            result = invoke_cli(rename_unit, lambda: rename_unit.main(arguments), arguments,
+            result = invoke_cli(rename, lambda: rename.main(arguments), arguments,
                                 dict(os.environ), self.checkout)
         self.assertEqual((result.returncode, result.stdout, result.stderr), (0, "unchanged\n", ""))
         move.assert_not_called()
@@ -345,10 +386,10 @@ class FolderRenameTests(FolderRenameFixture):
         self.assertEqual((self.destination / "kept.txt").read_text(), "Keep this work.\n")
 
     def test_same_name_writes_nothing_and_moves_nothing(self) -> None:
-        from scripts.production import rename_unit, unit_move
+        from scripts.production import rename, unit_move
 
         before = file_versions(self.root)
-        with (mock.patch.object(rename_unit, "repair_displays", return_value=False),
+        with (mock.patch.object(rename, "repair_displays", return_value=False),
               mock.patch.object(unit_move, "move_folder") as move):
             result = self.command(new="port")
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -359,10 +400,10 @@ class FolderRenameTests(FolderRenameFixture):
 
     def test_new_name_preserves_the_folder_parent_and_branch_prefix(self) -> None:
         from dataclasses import replace
-        from scripts.production import rename_unit
+        from scripts.production import rename
 
         with (FolderSessionFixture(self.owner, live=False).installed(),
-              mock.patch.object(rename_unit, "repair_displays", return_value=False)):
+              mock.patch.object(rename, "repair_displays", return_value=False)):
             result = self.command()
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertFalse(self.source.exists())
@@ -375,7 +416,7 @@ class FolderRenameTests(FolderRenameFixture):
 
     def test_unmatched_folder_stays_and_reports_one_anomaly_while_branch_moves(self) -> None:
         from dataclasses import replace
-        from scripts.production import rename_unit
+        from scripts.production import rename
 
         original = self.source
         self.source = original.with_name("unmatched")
@@ -383,7 +424,7 @@ class FolderRenameTests(FolderRenameFixture):
         _ = staff.set_worktree(self.owner.id, staff.PresentWorktree("natedev", self.source),
                               expected=staff.PresentWorktree("natedev", original))
         with (FolderSessionFixture(self.owner, live=False).installed(),
-              mock.patch.object(rename_unit, "repair_displays", return_value=False)):
+              mock.patch.object(rename, "repair_displays", return_value=False)):
             result = self.command()
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(len(result.stderr.splitlines()), 1, result.stderr)

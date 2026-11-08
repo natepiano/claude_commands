@@ -1,10 +1,14 @@
 """Keep repository checkout creation in copies.py and the named original/mirror paths."""
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import ast
+from collections import deque
 from collections.abc import Iterator, Mapping
-from dataclasses import dataclass
-import importlib
+from dataclasses import dataclass, field
 import io
 import json
 import os
@@ -17,24 +21,24 @@ from typing import Protocol, cast, override
 
 
 # Reuse the existing scratch policy behind this combined front.
-HOOKS = Path(__file__).resolve().parents[1] / "hooks"
-sys.path.insert(0, str(HOOKS))
-sys.path.insert(0, str(HOOKS.parents[1]))
 
 from scripts.copies import shell_syntax as syntax
+from scripts.lib.file_module import load_file_module
 
 
 class ShellCommands(Protocol):
     def main(self) -> None: ...
 
 
-SHELL = cast(ShellCommands, cast(object, importlib.import_module("pre-tool-use-scratch-guard")))
+SHELL = cast(ShellCommands, cast(object, load_file_module(
+    "scratch_guard", Path(__file__).resolve().parents[1] / "hooks/pre-tool-use-scratch-guard.py")))
 # Fixture repositories are disposable test inputs, never operational gate checkouts.
 TEST_INPUT_REASON = "Tests and fixture/support modules construct isolated disposable repository inputs."
 REFUSAL = (
     "Repository trees must be made by copies.py run. "
-    + "Example: python3 ~/.claude/scripts/copies/copies.py run --owner verify-unit "
-    + "--repo ~/.claude --commit HEAD -- python3 -m unittest discover"
+    + "Example: python3 ~/.claude/scripts/copies/copies.py run "
+    + "--repo ~/.claude --commit HEAD -- python3 -m unittest discover. "
+    + "A lasting phase tree: bash ~/.claude/scripts/worktree/make_worktree.sh <path> <branch>, from the source repository."
 )
 GIT_VALUE_OPTIONS = frozenset({"-C", "-c", "--git-dir", "--work-tree", "--namespace", "--config-env", "--super-prefix", "--attr-source"})
 COPY_VALUE_OPTIONS = frozenset({"-t", "--target-directory", "-e", "--rsh", "--exclude", "--include",
@@ -43,6 +47,7 @@ ASSIGNMENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=.*", re.DOTALL)
 REPO_NAME = re.compile(r"(?:^|[_.])(?:repo|repository|checkout|worktree|clone)(?:$|[_.])")
 RUNNERS = frozenset({"run", "Popen", "check_call", "check_output", "call", "system", "command"})
 TREE_COMMAND = re.compile(r"\bgit\b.*\b(?:clone|worktree\s+add)\b|\b(?:cp|rsync)\b.*-[a-zA-Z]*[arR]")
+GIT_MODULES = frozenset({"bulk_run", "scripts.style.bulk_run", "copies", "scripts.copies.copies"})
 
 
 @dataclass(frozen=True)
@@ -618,19 +623,36 @@ class ArgumentVector:
 
 
 @dataclass(frozen=True)
+class ModuleBinding:
+    """A module binding retains its full import path through aliases."""
+    name: str
+
+
+@dataclass(frozen=True)
+class KnownGitFunction:
+    """The Git function from a module with the known forwarding signature."""
+
+
+@dataclass(frozen=True)
+class FunctionBinding:
+    """A name refers to this function, including through an assignment alias."""
+    function: DeferredFunction
+
+
+@dataclass(frozen=True)
 class PossibleValues:
-    values: tuple[ScalarValue | ArgumentVector, ...]
+    values: tuple[ScalarValue | ArgumentVector | ModuleBinding | KnownGitFunction | FunctionBinding, ...]
 
 
-PythonValue = ScalarValue | ArgumentVector | PossibleValues
+PythonValue = ScalarValue | ArgumentVector | ModuleBinding | KnownGitFunction | FunctionBinding | PossibleValues
 
 
-def _possibilities(value: PythonValue) -> tuple[ScalarValue | ArgumentVector, ...]:
+def _possibilities(value: PythonValue) -> tuple[ScalarValue | ArgumentVector | ModuleBinding | KnownGitFunction | FunctionBinding, ...]:
     return value.values if isinstance(value, PossibleValues) else (value,)
 
 
 def _union(values: list[PythonValue]) -> PythonValue:
-    alternatives: list[ScalarValue | ArgumentVector] = []
+    alternatives: list[ScalarValue | ArgumentVector | ModuleBinding | KnownGitFunction | FunctionBinding] = []
     for value in values:
         for alternative in _possibilities(value):
             if alternative not in alternatives:
@@ -643,18 +665,31 @@ def _join_bindings(target: dict[str, PythonValue], branches: list[dict[str, Pyth
         target[key] = _union([branch.get(key, ScalarValue(UnknownArgument(key))) for branch in branches])
 
 
+def _import_value(name: str) -> ModuleBinding | KnownGitFunction | ScalarValue:
+    module, _, member = name.rpartition(".")
+    if member == "git" and module in GIT_MODULES:
+        return KnownGitFunction()
+    if any(module == name or module.startswith(name + ".") for module in GIT_MODULES):
+        return ModuleBinding(name)
+    return ScalarValue(UnknownArgument(name))
+
+
 def _python_value(node: ast.AST, bindings: Mapping[str, PythonValue]) -> PythonValue:
     if isinstance(node, ast.Constant) and isinstance(node.value, str):
         return ScalarValue(KnownArgument(node.value))
     if isinstance(node, ast.Name):
         return bindings.get(node.id, ScalarValue(UnknownArgument(node.id)))
+    if isinstance(node, ast.Attribute):
+        return _union([_import_value(value.name + "." + node.attr) if isinstance(value, ModuleBinding)
+                       else ScalarValue(UnknownArgument(ast.unparse(node)))
+                       for value in _possibilities(_python_value(node.value, bindings))])
     if isinstance(node, (ast.List, ast.Tuple)):
         arguments: list[Argument] = []
         for element in node.elts:
             if isinstance(element, ast.Starred):
                 value = _python_value(element.value, bindings)
                 choices = tuple(tuple(part.arguments) if isinstance(part, ArgumentVector)
-                                else (part.argument,) if isinstance(part.argument, ForwardedArguments)
+                                else (part.argument,) if isinstance(part, ScalarValue) and isinstance(part.argument, ForwardedArguments)
                                 else (UnknownArguments(ast.unparse(element.value)),) for part in _possibilities(value))
                 arguments.extend(choices[0] if len(choices) == 1 else (ArgumentChoices(choices),))
             else:
@@ -686,7 +721,8 @@ def _python_value(node: ast.AST, bindings: Mapping[str, PythonValue]) -> PythonV
 def _argv(value: PythonValue) -> list[Argument]:
     if isinstance(value, PossibleValues):
         return [ArgumentChoices(tuple(tuple(_argv(part)) for part in value.values))]
-    return list(value.arguments) if isinstance(value, ArgumentVector) else [value.argument]
+    return (list(value.arguments) if isinstance(value, ArgumentVector) else [value.argument]
+            if isinstance(value, ScalarValue) else [UnknownArgument("imported object")])
 
 
 @dataclass(frozen=True)
@@ -721,12 +757,64 @@ def _git_forwarder(node: ast.FunctionDef | ast.AsyncFunctionDef) -> GitForwarder
     return None
 
 
+def _local_names(node: ast.FunctionDef | ast.AsyncFunctionDef) -> set[str]:
+    """Collect names that shadow enclosing bindings throughout a function."""
+    names: set[str] = set()
+    declarations: set[str] = set()
+    for part in _scope_nodes(node):
+        if isinstance(part, (ast.Global, ast.Nonlocal)):
+            declarations.update(part.names)
+        elif isinstance(part, ast.Name) and isinstance(part.ctx, (ast.Store, ast.Del)):
+            names.add(part.id)
+        elif part is not node and isinstance(part, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            names.add(part.name)
+        elif isinstance(part, ast.alias):
+            names.add(part.asname or part.name.split(".")[0])
+        elif isinstance(part, ast.ExceptHandler) and part.name is not None:
+            names.add(part.name)
+    names.difference_update(declarations)
+    names.update(parameter.arg for parameter in (*node.args.posonlyargs, *node.args.args, *node.args.kwonlyargs))
+    if node.args.vararg is not None:
+        names.add(node.args.vararg.arg)
+    if node.args.kwarg is not None:
+        names.add(node.args.kwarg.arg)
+    return names
+
+
+@dataclass(frozen=True)
+class LexicalScopeSnapshot:
+    """The bindings for one lexical scope at a call or after its body."""
+    scope: ast.AST
+    bindings: dict[str, PythonValue]
+    helpers: dict[str, GitForwarder]
+
+
+@dataclass(frozen=True)
+class FunctionExecution:
+    """The enclosing scopes that can reach a function execution."""
+    enclosing_scopes: tuple[LexicalScopeSnapshot, ...]
+
+
+@dataclass(frozen=True, eq=False)
+class DeferredFunction:
+    """A function keeps its lexical scope and the bindings at its calls."""
+    definition: ast.FunctionDef | ast.AsyncFunctionDef
+    enclosing_scope: ast.AST
+    executions: list[FunctionExecution] = field(default_factory=list)
+
+
 class PythonPolicy:
     def __init__(self, path: Path, *, static: bool = True) -> None:
         self.static: bool = static
         self.path: Path = path
         self.found: list[TreeCreation] = []
-        self.git_modules: set[str] = set()
+        self.module_bindings: dict[str, PythonValue] = {}
+        self.module_helpers: dict[str, GitForwarder] = {}
+        self.deferred_functions: dict[ast.FunctionDef | ast.AsyncFunctionDef, DeferredFunction] = {}
+        self.unscanned_executions: deque[tuple[DeferredFunction, FunctionExecution]] = deque()
+        self.final_executions: deque[tuple[DeferredFunction, FunctionExecution]] = deque()
+        self.scopes: tuple[LexicalScopeSnapshot, ...] = ()
+        self.scope_functions: list[DeferredFunction] = []
         # Verified public signature: copies.git(repo, *arguments) forwards
         # ["git", "-C", str(repo), *arguments]. Local definitions override it.
         self.standard_git: GitForwarder = GitForwarder(("repo",), "arguments", cast(ast.List,
@@ -742,11 +830,9 @@ class PythonPolicy:
             if isinstance(outcome, ForbiddenOperation):
                 return ForbiddenOperation("copytree of repository")
             return outcome
-        qualified_git = (isinstance(node.func, ast.Attribute) and name == "git"
-                         and isinstance(node.func.value, ast.Name) and node.func.value.id in self.git_modules
-                         and node.func.value.id not in bindings)
-        if isinstance(node.func, ast.Name) and name in helpers or qualified_git:
-            signature = self.standard_git if qualified_git else helpers[name]
+        imported_git = any(isinstance(value, KnownGitFunction) for value in _possibilities(_python_value(node.func, bindings)))
+        if isinstance(node.func, ast.Name) and name in helpers or imported_git:
+            signature = self.standard_git if imported_git else helpers[name]
             values = dict(bindings)
             for index, parameter in enumerate(signature.parameters):
                 value = next((keyword.value for keyword in node.keywords if keyword.arg == parameter), None)
@@ -776,6 +862,9 @@ class PythonPolicy:
 
     def expression(self, node: ast.AST, bindings: dict[str, PythonValue], helpers: dict[str, GitForwarder]) -> None:
         if isinstance(node, ast.Call):
+            for value in _possibilities(_python_value(node.func, bindings)):
+                if isinstance(value, FunctionBinding):
+                    self.enqueue(value.function, self.execution(value.function))
             outcome = self.call(node, bindings, helpers)
             if not isinstance(outcome, NoForbiddenOperation):
                 self.found.append(TreeCreation(self.path, node.lineno, _description(outcome)))
@@ -783,37 +872,61 @@ class PythonPolicy:
             if not isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
                 self.expression(child, bindings, helpers)
 
-    def statements(self, statements: list[ast.stmt], bindings: dict[str, PythonValue], helpers: dict[str, GitForwarder]) -> None:
+    def execution(self, pending: DeferredFunction) -> FunctionExecution:
+        scopes: list[LexicalScopeSnapshot] = []
+        for scope in self.scopes:
+            scopes.append(LexicalScopeSnapshot(scope.scope, dict(scope.bindings), dict(scope.helpers)))
+            if scope.scope is pending.enclosing_scope:
+                break
+        return FunctionExecution(tuple(scopes))
+
+    def enqueue(self, pending: DeferredFunction, execution: FunctionExecution) -> None:
+        if execution not in pending.executions:
+            pending.executions.append(execution)
+            self.unscanned_executions.append((pending, execution))
+
+    def body(self, statements: list[ast.stmt], scope: ast.AST, bindings: dict[str, PythonValue],
+             helpers: dict[str, GitForwarder]) -> None:
+        enclosing_scopes = self.scopes
+        enclosing_functions = self.scope_functions
+        self.scopes = (*enclosing_scopes, LexicalScopeSnapshot(scope, bindings, helpers))
+        self.scope_functions = []
+        self.statements(statements, bindings, helpers)
+        for pending in self.scope_functions:
+            self.final_executions.append((pending, self.execution(pending)))
+        self.scopes = enclosing_scopes
+        self.scope_functions = enclosing_functions
+
+    def statements(self, statements: list[ast.stmt], bindings: dict[str, PythonValue],
+                   helpers: dict[str, GitForwarder]) -> None:
+        scopes = self.scopes
+        self.scopes = (*scopes[:-1], LexicalScopeSnapshot(scopes[-1].scope, bindings, helpers))
         for statement in statements:
             if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 signature = _git_forwarder(statement)
+                if statement not in self.deferred_functions:
+                    self.deferred_functions[statement] = DeferredFunction(statement, self.scopes[-1].scope)
+                pending = self.deferred_functions[statement]
+                bindings[statement.name] = FunctionBinding(pending)
                 _ = helpers.pop(statement.name, None)
                 if signature is not None:
                     helpers[statement.name] = signature
-                local = dict(bindings)
-                # Python locals shadow enclosing values even before assignment.
-                for part in _scope_nodes(statement):
-                    if isinstance(part, ast.Name) and isinstance(part.ctx, ast.Store):
-                        local[part.id] = ScalarValue(UnknownArgument(part.id))
-                    elif part is not statement and isinstance(part, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-                        local[part.name] = ScalarValue(UnknownArgument(part.name))
-                    elif isinstance(part, ast.alias):
-                        alias = part.asname or part.name.split(".")[0]
-                        local[alias] = ScalarValue(UnknownArgument(alias))
-                    elif isinstance(part, ast.ExceptHandler) and part.name is not None:
-                        local[part.name] = ScalarValue(UnknownArgument(part.name))
-                for parameter in (*statement.args.posonlyargs, *statement.args.args, *statement.args.kwonlyargs):
-                    local[parameter.arg] = ScalarValue(UnknownArgument(parameter.arg))
-                if statement.args.kwarg is not None:
-                    local[statement.args.kwarg.arg] = ScalarValue(UnknownArgument(statement.args.kwarg.arg))
-                if statement.args.vararg is not None:
-                    local[statement.args.vararg.arg] = ArgumentVector((ForwardedArguments(statement.args.vararg.arg),))
-                for parameter in (*statement.args.posonlyargs, *statement.args.args, *statement.args.kwonlyargs):
-                    if parameter.annotation is not None and any(isinstance(part, ast.Name) and part.id in {"list", "tuple", "Sequence", "Iterable"} for part in ast.walk(parameter.annotation)):
-                        local[parameter.arg] = ArgumentVector((ForwardedArguments(parameter.arg),))
-                self.statements(statement.body, local, dict(helpers))
+                if pending not in self.scope_functions:
+                    self.scope_functions.append(pending)
             elif isinstance(statement, ast.ClassDef):
-                self.statements(statement.body, dict(bindings), dict(helpers))
+                bindings[statement.name] = ScalarValue(UnknownArgument(statement.name))
+                _ = helpers.pop(statement.name, None)
+                self.body(statement.body, statement, dict(bindings), dict(helpers))
+            elif isinstance(statement, (ast.Import, ast.ImportFrom)):
+                for alias in statement.names:
+                    if isinstance(statement, ast.Import):
+                        name = alias.asname or alias.name.split(".")[0]
+                        imported = alias.name if alias.asname else name
+                    else:
+                        name = alias.asname or alias.name
+                        imported = (statement.module + "." if statement.module else "") + alias.name
+                    bindings[name] = _import_value(imported)
+                    _ = helpers.pop(name, None)
             elif isinstance(statement, (ast.Assign, ast.AnnAssign)):
                 value = statement.value
                 if value is not None:
@@ -864,17 +977,48 @@ class PythonPolicy:
                     self.statements(statement.finalbody, bindings, helpers)
             else:
                 self.expression(statement, bindings, helpers)
+        self.scopes = scopes
+
+    def function(self, pending: DeferredFunction, execution: FunctionExecution) -> None:
+        statement = pending.definition
+        module = execution.enclosing_scopes[0]
+        self.scopes = execution.enclosing_scopes
+        local = dict(self.scopes[-1].bindings)
+        local_helpers = dict(self.scopes[-1].helpers)
+        for part in _scope_nodes(statement):
+            if isinstance(part, ast.Global):
+                for name in part.names:
+                    local[name] = module.bindings.get(name, ScalarValue(UnknownArgument(name)))
+                    _ = local_helpers.pop(name, None)
+                    if name in module.helpers:
+                        local_helpers[name] = module.helpers[name]
+        for name in _local_names(statement):
+            local[name] = ScalarValue(UnknownArgument(name))
+            _ = local_helpers.pop(name, None)
+        if statement.args.vararg is not None:
+            local[statement.args.vararg.arg] = ArgumentVector((ForwardedArguments(statement.args.vararg.arg),))
+        for parameter in (*statement.args.posonlyargs, *statement.args.args, *statement.args.kwonlyargs):
+            if parameter.annotation is not None and any(isinstance(part, ast.Name) and part.id in {"list", "tuple", "Sequence", "Iterable"} for part in ast.walk(parameter.annotation)):
+                local[parameter.arg] = ArgumentVector((ForwardedArguments(parameter.arg),))
+        self.body(statement.body, statement, local, local_helpers)
 
     def scan(self, tree: ast.Module) -> list[TreeCreation]:
-        self.git_modules = {
-            alias.asname or alias.name for statement in tree.body if isinstance(statement, ast.Import)
-            for alias in statement.names if alias.name in {"bulk_run", "scripts.style.bulk_run"}
-        }
-        self.git_modules.update(
-            alias.asname or alias.name for statement in tree.body if isinstance(statement, ast.ImportFrom)
-            and statement.module == "scripts.copies" for alias in statement.names if alias.name == "copies")
-        self.statements(tree.body, {}, {"git": self.standard_git})
-        return self.found
+        self.module_bindings = {}
+        self.module_helpers = {"git": self.standard_git}
+        self.scopes = ()
+        self.body(tree.body, tree, self.module_bindings, self.module_helpers)
+        # Calls copy snapshots without argument values or callee assignments.
+        # Stable function identities and finite lexical nesting make the queue finite.
+        while self.final_executions or self.unscanned_executions:
+            while self.final_executions:
+                pending, execution = self.final_executions.popleft()
+                module = LexicalScopeSnapshot(execution.enclosing_scopes[0].scope,
+                                              dict(self.module_bindings), dict(self.module_helpers))
+                self.enqueue(pending, FunctionExecution((module, *execution.enclosing_scopes[1:])))
+            if self.unscanned_executions:
+                pending, execution = self.unscanned_executions.popleft()
+                self.function(pending, execution)
+        return list(dict.fromkeys(self.found))
 
 
 def markdown_commands(text: str) -> list[tuple[int, str]]:

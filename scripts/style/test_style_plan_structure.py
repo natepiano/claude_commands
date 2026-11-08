@@ -2,26 +2,23 @@
 
 from __future__ import annotations
 
-from ledger_test_support import ticket_owner_id
+from scripts.style.ledger_test_support import ticket_owner_id
 
 import io
-import sys
 import unittest
 from contextlib import redirect_stdout
-from pathlib import Path
 from typing import final
 from unittest import mock
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-import style_plan
-import unit_plans
+from scripts.style import style_plan
+from scripts.style import unit_plans
 
-import berth_board
-import rules
-import style_ledger
+from scripts.lib import berth_board
+from scripts.style import rules
+from scripts.style import style_ledger
 
-from style_plan_test_support import StylePlanFixture
+from scripts.style.style_plan_test_support import StylePlanFixture
 from scripts.production.staff_test_support import fixture_unit_location, recorded_showrunner
 
 
@@ -42,7 +39,7 @@ class StylePlanTests(StylePlanFixture):
         with mock.patch.object(berth_board, "read_board", return_value=self.board(self.sources[0])):
             with redirect_stdout(preview):
                 self.assertEqual(style_plan.main(["queue", "--repo", str(self.repo)]), 0)
-        self.assertTrue(preview.getvalue().startswith("modules-unit: structure"))
+        self.assertTrue(preview.getvalue().startswith("modules: structure"))
         self.assertNotIn(self.sources[0], preview.getvalue())
         self.assertIn(self.sources[1], preview.getvalue())
         ledger = self.ledger()
@@ -55,7 +52,7 @@ class StylePlanTests(StylePlanFixture):
         output = io.StringIO()
         with redirect_stdout(output):
             self.assertEqual(style_plan.main(["queue", "--repo", str(self.repo)]), 0)
-        self.assertIn("names-unit: read", output.getvalue())
+        self.assertIn("names: read", output.getvalue())
 
     def test_names_read_refill_takes_only_files_without_pending_structure_cells(self) -> None:
         structure = self.rule("structure", "tier: D\nfamily: modules\ninput_scope: file\n")
@@ -65,7 +62,7 @@ class StylePlanTests(StylePlanFixture):
         _ = self.plan.write_text(self.plan_header().replace("## Phases", "**Pilot scope:** alpha\n\n## Phases"))
 
         self.assertEqual(self.run_next(), (0, "phase written: 1\n", ""))
-        ticket = self.ledger().ticket_open(ticket_owner_id("names-unit"))[0]
+        ticket = self.ledger().ticket_open(ticket_owner_id("names"))[0]
         self.assertEqual((ticket["kind"], ticket["rules"], ticket["files"]),
                          ("read", [read], [self.sources[1]]))
         self.assertIn(f"- `{self.sources[1]}` — lines 1-1\n", self.plan.read_text())
@@ -79,7 +76,7 @@ class StylePlanTests(StylePlanFixture):
         _ = self.plan.write_text(self.plan_header().replace("## Phases", "**Pilot scope:** alpha\n\n## Phases"))
 
         self.assertEqual(self.run_next(), (0, "phase written: 1\n", ""))
-        ticket = self.ledger().ticket_open(ticket_owner_id("names-unit"))[0]
+        ticket = self.ledger().ticket_open(ticket_owner_id("names"))[0]
         self.assertEqual((ticket["kind"], ticket["rules"], ticket["files"]),
                          ("listed", [listed], [self.sources[1]]))
         self.assertEqual([(site["path"], site["line"]) for site in ticket["sites"]], [(self.sources[1], 1)])
@@ -95,7 +92,7 @@ class StylePlanTests(StylePlanFixture):
         self.assertLessEqual({(manifest, "crates/alpha"), (structure, self.sources[1])}, pending)
 
         self.assertEqual(self.run_next(), (0, "phase written: 1\n", ""))
-        ticket = self.ledger().ticket_open(ticket_owner_id("names-unit"))[0]
+        ticket = self.ledger().ticket_open(ticket_owner_id("names"))[0]
         self.assertEqual((ticket["kind"], ticket["rules"], ticket["files"]), ("read", [read], [self.sources[0]]))
 
     def test_names_reads_blocking_structure_when_its_only_unblocked_file_is_busy(self) -> None:
@@ -108,7 +105,7 @@ class StylePlanTests(StylePlanFixture):
 
         with mock.patch.object(berth_board, "read_board", return_value=self.board(self.sources[0])):
             self.assertEqual(self.run_next(), (0, "phase written: 1\n", ""))
-        ticket, = self.ledger().ticket_open(ticket_owner_id("names-unit"))
+        ticket, = self.ledger().ticket_open(ticket_owner_id("names"))
         self.assertEqual((ticket["kind"], ticket["files"]),
                          ("structure", ["crates/alpha/Cargo.toml", self.sources[1]]))
 
@@ -132,7 +129,7 @@ class StylePlanTests(StylePlanFixture):
         self.record(read, self.sources[1], self.tip)
         _ = self.plan.write_text(self.plan_header().replace("## Phases", "**Pilot scope:** alpha\n\n## Phases"))
         self.assertEqual(self.run_next(), (0, "phase written: 1\n", ""))
-        ticket, = self.ledger().ticket_open(ticket_owner_id("names-unit"))
+        ticket, = self.ledger().ticket_open(ticket_owner_id("names"))
         self.assertEqual((ticket["kind"], ticket["family"], ticket["files"]),
                          ("structure", "modules", [self.sources[0]]))
         self.assertEqual(self.sync_wait_rows(), [])
@@ -146,7 +143,7 @@ class StylePlanTests(StylePlanFixture):
 
         with mock.patch.object(berth_board, "read_board", return_value=self.board(self.sources[1])):
             self.assertEqual(self.run_next(), (0, "phase written: 1\n", ""))
-        ticket, = self.ledger().ticket_open(ticket_owner_id("names-unit"))
+        ticket, = self.ledger().ticket_open(ticket_owner_id("names"))
         self.assertEqual((ticket["kind"], ticket["files"]), ("structure", [self.sources[0]]))
 
     def test_modules_still_selects_only_pending_structure_files_when_names_can_refill(self) -> None:
@@ -233,7 +230,7 @@ class StylePlanTests(StylePlanFixture):
         _ = self.plan.write_text(self.plan_header().replace("## Phases", "**Pilot scope:** alpha\n\n## Phases"))
         template = self.style / "docs/style-production/units/names-unit.md"
         _ = template.write_text(self.plan_header().replace("## Phases", "**Pilot scope:** beta\n\n## Phases"))
-        _ = fixture_unit_location(recorded_showrunner("sample-style", self.doc), "product-unit", self.root / "product")
+        _ = fixture_unit_location(recorded_showrunner("sample-style", self.doc), "product", self.root / "product")
         _ = self.modules_unit()
 
         self.assertEqual(unit_plans.family_pilot_scopes(self.doc, self.repo), {
@@ -254,15 +251,15 @@ class StylePlanTests(StylePlanFixture):
         plan = self.modules_unit()
         preview = io.StringIO()
         with redirect_stdout(preview):
-            self.assertEqual(style_plan.main(["queue", "--repo", str(self.repo), "--unit", "modules-unit"]), 0)
-        self.assertTrue(preview.getvalue().startswith("modules-unit: structure crates/alpha "), preview.getvalue())
+            self.assertEqual(style_plan.main(["queue", "--repo", str(self.repo), "--unit", "modules"]), 0)
+        self.assertTrue(preview.getvalue().startswith("modules: structure crates/alpha "), preview.getvalue())
 
         output = io.StringIO()
         with redirect_stdout(output):
-            code = style_plan.main(["next-phase", "--unit", "modules-unit", "--plan", str(plan), "--repo", str(self.root / "modules")])
+            code = style_plan.main(["next-phase", "--unit", "modules", "--plan", str(plan), "--repo", str(self.root / "modules")])
 
         self.assertEqual((code, output.getvalue()), (0, "phase written: 1\n"))
-        ticket = self.ledger().ticket_open(ticket_owner_id("modules-unit"))[0]
+        ticket = self.ledger().ticket_open(ticket_owner_id("modules"))[0]
         self.assertEqual((ticket["kind"], ticket["crate"], ticket["files"]),
                          ("structure", "crates/alpha", list(self.sources[:2])))
 

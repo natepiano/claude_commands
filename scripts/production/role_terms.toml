@@ -82,11 +82,6 @@ reason = "Filename placeholder for the account-move marker."
 
 [[terms.kept_contexts]]
 path = "docs/as-built/shutdown-and-restart.md"
-text = "`codex_mesh.py reopen --session-dir <D> --to <seat>`"
-reason = "Command placeholder for the existing transport argument."
-
-[[terms.kept_contexts]]
-path = "docs/as-built/shutdown-and-restart.md"
 text = "`reopened <seat>; send its next turn with --to <seat>`"
 reason = "Recorded command output with transport placeholders."
 
@@ -104,11 +99,6 @@ reason = "Resume command output placeholder."
 path = "docs/as-built/shutdown-and-restart.md"
 text = "`<seat> (<role>, idle): paused on its thread; nothing to run now. Your next dispatch with --to <seat> resumes it.`"
 reason = "Idle resume output placeholders; preserve the transport argument."
-
-[[terms.kept_contexts]]
-path = "docs/as-built/shutdown-and-restart.md"
-text = "- Resume workers, natedev, 2026-10-16, about 21:30 EDT, on the installed `build-followups` merge `ba27d7b9`. A probe `rwprobe` (`accounts.py exec --probe`, claude2) in tmux, before herdr replaced it, held one real Codex seat, `tmp-rwseat`, in a scratch run dir under `/tmp/claude/delegate/` mapped to the probe through `active/<probe session id>`. `accounts.py move <probe id> claude3 --no-alert` finished at 21:31: the seat read `paused` (`paused_from` `done`, `paused_turn` false) on thread `01a14775-e8c5-7cd2-9d63-176e065faa06`, the probe was back on claude3, and the message log held the `resume-workers-<probe id>` message. Its `implement.sh --to tmp-rwseat` command replied `resumed` on the same thread. The run found that the message went only to unit sessions; it now goes to any session with recorded seats. The complete-command form of each seat line landed after this run and is held by `test_restart.py`. `reopen` was seen on real seats: units had returned six ended seats to `paused`."
-reason = "Dated 2026-10-16 probe history; preserve its wording and worker identity."
 
 [[terms.kept_contexts]]
 path = "docs/as-built/message-clarity.md"
@@ -273,13 +263,13 @@ other_names = ["Pending decision block"]
 [[terms]]
 name = "finding"
 kind = "record"
-defined_in = "commands/unit/direct.md#<FindingsLedger/>"
+defined_in = "docs/direct/repair_rounds.md#<FindingsLedger/>"
 other_names = ["issue"]
 
 [[terms]]
 name = "reservation"
 kind = "record"
-defined_in = "commands/unit/direct.md#<PhaseReservationContract/>"
+defined_in = "docs/direct/phase_reservation.md#<PhaseReservationContract/>"
 other_names = ["phase reservation", "delegated phase reservation"]
 
 [[terms]]

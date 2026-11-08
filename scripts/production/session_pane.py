@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """Read or send input to a production unit or live Claude session in herdr."""
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import math
 import sys
@@ -9,14 +13,14 @@ from pathlib import Path
 SCRIPTS = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(SCRIPTS / "herdr"))
 sys.path.insert(0, str(SCRIPTS / "message"))
-import herdr  # noqa: E402
-from herdr import AgentBlocked, Herdr  # noqa: E402
-from herdr import HerdrFailure as HerdrFailure  # noqa: E402
-from sessions import SessionRecord, UnreadableSessionRecord, live_session, read_session  # noqa: E402
-from unit_lookup import LiveSession, LiveClaude, Place, labeled_session, sessions_dir  # noqa: E402
+from scripts.herdr import herdr  # noqa: E402
+from scripts.herdr.herdr import AgentBlocked, Herdr  # noqa: E402
+from scripts.herdr.herdr import HerdrFailure as HerdrFailure  # noqa: E402
+from scripts.message.sessions import SessionRecord, UnreadableSessionRecord, live_session, read_session  # noqa: E402
+from scripts.production.unit_lookup import LiveSession, LiveClaude, Place, labeled_session, sessions_dir  # noqa: E402
 from scripts.lib.script_envelope import script_prompt  # noqa: E402
 
-USAGE = ("usage: session_pane.py <read|type|keys|where> <unit <slug> <unit>|session <id>> "
+USAGE = ("usage: session_pane.py <read|type|keys|where> <unit <production_name> <unit>|session <id>> "
          "[--lines N --joined --ansi | <text> | <key>...]")
 
 
@@ -82,12 +86,12 @@ def main(arguments: list[str]) -> int:
             raise ValueError(USAGE)
         verb, kind = arguments[:2]
         if kind == "unit" and len(arguments) >= 4:
-            slug, name = arguments[2:4]
-            target, rest = f"unit {slug} {name}", arguments[4:]
+            production_name, name = arguments[2:4]
+            target, rest = f"unit {production_name} {name}", arguments[4:]
         elif kind == "session":
             name = arguments[2]
             target, rest = f"session {name}", arguments[3:]
-            slug = ""
+            production_name = ""
         else:
             raise ValueError(USAGE)
         lines, joined, ansi = 60, False, False
@@ -108,7 +112,7 @@ def main(arguments: list[str]) -> int:
               or verb == "where" and rest):
             raise ValueError(USAGE)
         if kind == "unit":
-            unit = labeled_session(slug, name)
+            unit = labeled_session(production_name, name)
             if unit is None:
                 raise NoSuchTarget(target)
             place = unit.place

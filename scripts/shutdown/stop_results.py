@@ -12,6 +12,8 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import TYPE_CHECKING
 
+from scripts.whoami import note_file
+
 if TYPE_CHECKING:
     from scripts.production.staff import StaffRow, ClaudeBackend, CodexBackend, BackendUnavailable
 
@@ -19,6 +21,14 @@ if TYPE_CHECKING:
 def shutdown_state_root() -> Path:
     """Return the machine-local folder for shutdown records."""
     return Path(os.environ.get("SHUTDOWN_STATE_DIR", str(Path.home() / ".local/state/shutdown")))
+
+
+@dataclass(frozen=True)
+class SessionWithoutStaffRow:
+    """The session has no row in the staff record."""
+
+
+SESSION_WITHOUT_STAFF_ROW = SessionWithoutStaffRow()
 
 
 @dataclass(frozen=True)
@@ -38,9 +48,19 @@ class StopFailed:
     reason: str
 
 
+@dataclass(frozen=True)
+class StopUnproved(StopFailed):
+    """The read cannot prove absence or identify one process to signal."""
+
+
 class ClaudeStartState(StrEnum):
     STARTED = "started"
     ALREADY_RUNNING = "already running"
+
+
+@dataclass(frozen=True)
+class UnknownProcessId:
+    """The resume result has no proved process id."""
 
 
 @dataclass(frozen=True)
@@ -51,6 +71,7 @@ class ClaudeUp:
     elapsed_seconds: float = field(default=0.0, compare=False)
     trust_copied_from: str = field(default="", compare=False)
     start_state: ClaudeStartState = field(default=ClaudeStartState.STARTED, compare=False)
+    pid: int | UnknownProcessId = field(default_factory=UnknownProcessId, compare=False)
 
 
 @dataclass(frozen=True)
@@ -82,9 +103,11 @@ MoveResult = ResumeResult | MoveHandedOff | StopFailed | ResumePending
 
 
 def claude_up_line(result: ClaudeUp) -> str:
+    label = note_file.parse_account_label(result.account)
+    agent = f"{label.tool.capitalize()} " if isinstance(label, note_file.NumberedAccountLabel) else ""
     if result.start_state is ClaudeStartState.ALREADY_RUNNING:
-        return f"{result.session_id}: unchanged; Claude runs on {result.account} in {result.pane_id}"
-    return (f"{result.session_id}: Claude is up on {result.account} in {result.pane_id} "
+        return f"{result.session_id}: unchanged; {agent}runs on {result.account} in {result.pane_id}"
+    return (f"{result.session_id}: {agent + 'is ' if agent else ''}up on {result.account} in {result.pane_id} "
             + f"({result.elapsed_seconds:.1f} s)"
             + (f"; copied folder trust from {result.trust_copied_from}" if result.trust_copied_from else ""))
 

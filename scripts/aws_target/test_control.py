@@ -13,7 +13,6 @@ from typing import cast, override
 import unittest
 from unittest import mock
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "mac_test"))
 
 from scripts.aws_target import aws_target, config as settings_config, ledger, remote
 from scripts.aws_target.control_test_support import ControlFixture
@@ -73,7 +72,7 @@ class ControlTests(ControlFixture):
             offload.KnownRepository("hana", "https://example.invalid/team/hana"))
         pid = os.getpid()
         step_record.write(step_record.StepRecord("pinned", pid, step_record.process_start(pid), self.root,
-            kind, "hana", step_record.SshAllowed((target,)), step_record.StepState.WAITING_SSH,
+            kind, step_record.NamedPackage("hana"), step_record.AnyTarget((target,)), step_record.StepState.WAITING_SSH,
             "2026-01-15T12:00:00Z", selection=step_record.Pinned(target)))
 
     def test_one_new_pinned_step_starts_capacity_without_local_queue_demand(self) -> None:
@@ -82,6 +81,70 @@ class ControlTests(ControlFixture):
         self.assertEqual(self.aws.count("start-instances"), 1)
         decision = ledger.CostLedger(self.state).read_snapshot().decision
         self.assertEqual(decision["status"], "allowed")
+
+    def test_pinned_final_starts_capacity_for_check_and_test(self) -> None:
+        self.pinned_step(kind="final")
+        self.assertEqual(self.controller().tick().state, "starting")
+        self.assertEqual(self.aws.count("start-instances"), 1)
+
+    def test_pinned_final_requires_both_remote_kinds(self) -> None:
+        self.pinned_step(kind="final")
+        for kinds in ("check", "test"):
+            with self.subTest(kinds=kinds):
+                self.replace("kinds", kinds)
+                self.assertEqual(self.controller().tick().state, "stopped")
+                self.assertEqual(self.aws.count("start-instances"), 0)
+
+    def test_unpinned_build_waiters_do_not_start_capacity_with_default_kinds(self) -> None:
+        self.snapshot(self.waiter(101, step="build"), self.waiter(102, step="build"))
+        self.assertEqual(self.controller().tick().state, "stopped")
+        self.assertEqual(self.aws.count("start-instances"), 0)
+
+    def test_queue_repository_hold_controls_whether_a_stopped_box_starts(self) -> None:
+        self.replace("start_after_wait_s", "1")
+        self.snapshot(self.waiter(101, age=2), self.waiter(102, age=2))
+        self.check_decline_demand()
+
+    def test_pinned_repository_hold_controls_whether_a_stopped_box_starts(self) -> None:
+        self.pinned_step()
+        self.check_decline_demand()
+
+    def test_queue_subdirectory_uses_the_repository_hold(self) -> None:
+        folder = self.root / "src/subdirectory"
+        folder.mkdir(parents=True)
+        first, second = self.waiter(101), self.waiter(102)
+        first["folder"] = second["folder"] = str(folder)
+        self.snapshot(first, second)
+        self.check_decline_demand()
+
+    def test_pinned_poll_updates_keep_the_repository_hold(self) -> None:
+        self.pinned_step()
+        row = cast(dict[str, object], json.loads(step_record.record_path("pinned").read_text()))
+        step_record.write_fields("pinned", {**row, "updated": "2026-01-15T12:00:01Z"})
+        self.check_decline_demand()
+
+    def check_decline_demand(self) -> None:
+        self.replace("version_decline_hold_s", "60")
+        controller = self.controller()
+        path = offload.linux_version_decline_path("aws", "hana")
+        other = offload.linux_version_decline_path("aws", "other")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with (
+            mock.patch.object(subprocess, "run", side_effect=AssertionError("No subprocess expected")),
+            mock.patch.object(subprocess, "Popen", side_effect=AssertionError("No subprocess expected")),
+            mock.patch.object(offload, "expected_linux_parity", side_effect=AssertionError("No tool comparison expected")),
+        ):
+            for content, starts in ((str(self.clock.now - 10), False), (str(self.clock.now - 59), False),
+                                    (str(self.clock.now - 60), True), (None, True), ("unreadable", True)):
+                with self.subTest(content=content):
+                    self.aws.state = "stopped"
+                    self.aws.calls.clear()
+                    path.unlink(missing_ok=True)
+                    _ = other.write_text(str(self.clock.now))
+                    if content is not None:
+                        _ = path.write_text(content)
+                    self.assertEqual(controller.tick().state, "starting" if starts else "stopped")
+                    self.assertEqual(self.aws.count("start-instances"), int(starts))
 
     def test_pinned_step_cannot_start_capacity_when_either_spending_cap_refuses(self) -> None:
         self.pinned_step()
@@ -92,13 +155,14 @@ class ControlTests(ControlFixture):
                 self.assertEqual(self.aws.count("start-instances"), 0)
                 self.replace(key, "20" if key == "daily_limit_usd" else "400")
 
-    def test_foreign_completed_and_local_only_pins_do_not_start_aws(self) -> None:
+    def test_foreign_completed_and_disallowed_pins_do_not_start_aws(self) -> None:
+        self.replace("kinds", "test,check,doc")
         self.pinned_step("spare")
         self.assertEqual(self.controller().tick().state, "stopped")
         self.pinned_step(kind="build")
         self.assertEqual(self.controller().tick().state, "stopped")
         self.pinned_step()
-        step_record.state("pinned", step_record.StepState.ON_SSH, "aws")
+        _ = step_record.record_path("pinned").with_suffix(".state").write_text("on_ssh aws\n")
         self.assertEqual(self.controller().tick().state, "stopped")
         self.assertEqual(self.aws.count("start-instances"), 0)
 
@@ -330,7 +394,7 @@ with mock.patch.object(linux_runner, "slot_run", return_value=nullcontext()), \
     assert linux_runner.probe_shell(mirror, values, "hana") == 0
     assert linux_runner.run(mirror, values, "hana", "check", (), "call", "tree") == 0
 """
-        result = subprocess.run([sys.executable, "-I", "-c", script,
+        result = subprocess.run([str(Path(__file__).resolve().parents[2] / "scripts/lib/py"), "-I", "-c", script,
             str(Path(__file__).resolve().parents[2]), str(self.root)],
             cwd=self.root, capture_output=True, text=True, timeout=10, check=False)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -413,7 +477,8 @@ with mock.patch.object(linux_runner, "slot_run", return_value=nullcontext()), \
         _ = self.controller().tick()
         self.assertEqual(self.aws.count("start-instances"), 0)
 
-    def test_local_only_kinds_unknown_repositories_and_token_waiters_do_not_supply_demand(self) -> None:
+    def test_disallowed_kinds_unknown_repositories_and_token_waiters_do_not_supply_demand(self) -> None:
+        self.replace("kinds", "test,check,doc")
         token = self.waiter(104)
         token["token_left_at"] = self.clock.now - 300
         self.snapshot(self.waiter(101, step="build"), self.waiter(102, step="lint"),
@@ -599,6 +664,38 @@ with mock.patch.object(linux_runner, "slot_run", return_value=nullcontext()), \
         self.assertEqual((proof["target"], proof["state"]), ("aws", "stopping"))
         self.assertEqual(proof["generation"], "i-fixture:" + self.aws.generation)
         self.assertEqual(proof["observed_at"], self.clock.now)
+
+    def test_running_new_generation_releases_only_ended_host_claims_with_proof(self) -> None:
+        self.aws.state = "running"
+        paths = mac_test.state_paths("aws")
+        old = self.claim(paths, generation="previous-generation", at=self.clock.now)
+        current = self.claim(paths, slot=2, generation="i-fixture:" + self.aws.generation)
+        later = self.claim(paths, slot=3, generation="previous-generation", at=self.clock.now + 1)
+        legacy = self.claim(paths, slot=4)
+        foreign = self.claim(paths, slot=5, generation="previous-generation")
+        row = cast(dict[str, object], json.loads(legacy.read_text()))
+        del row['instance_generation']
+        _ = legacy.write_text(json.dumps(row))
+        row = cast(dict[str, object], json.loads(foreign.read_text()))
+        row['remote_host'] = 'other-host'
+        _ = foreign.write_text(json.dumps(row))
+        before = {path: path.read_bytes() for path in (current, later, legacy, foreign)}
+
+        self.assertEqual(self.controller().tick().state, "running")
+
+        self.assertFalse(old.exists())
+        for path, contents in before.items():
+            self.assertEqual(path.read_bytes(), contents)
+        proofs = list((paths.directory / "release-evidence").iterdir())
+        self.assertEqual([path.name for path in proofs], [old.name])
+        proof = cast(dict[str, object], json.loads(proofs[0].read_text()))
+        self.assertEqual(proof['state'], 'running')
+        self.assertEqual(proof['generation'], 'i-fixture:' + self.aws.generation)
+        self.assertEqual(proof['observed_at'], self.clock.now)
+        self.assertEqual(proof['remote_host'], 'aws-build')
+        claim = cast(dict[str, object], proof['claim'])
+        self.assertEqual(claim['instance_generation'], 'previous-generation')
+        self.assertEqual(self.aws.count('stop-instances'), 0)
 
     def test_a_running_restart_without_queue_demand_never_requests_another_start(self) -> None:
         self.snapshot()

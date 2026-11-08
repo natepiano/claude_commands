@@ -26,11 +26,11 @@ from functools import cache
 from typing import cast
 from pathlib import Path, PurePosixPath
 
-import finding_sites
-import style_footprint
-from candidate_generators import snake_case
-from declarations import ITEM_KEYWORDS, type_path
-from git_process import run_git
+from scripts.style import finding_sites
+from scripts.style import style_footprint
+from scripts.style.candidate_generators import snake_case
+from scripts.style.declarations import ITEM_KEYWORDS, type_path
+from scripts.lib.git_blob import git_blob_id
 
 # The keywords that declare an item with a name that other names can sit under.
 PARENT_KEYWORDS = frozenset({"enum", "struct", "union", "trait", "mod"})
@@ -636,7 +636,7 @@ class NoMachineRenameRule:
 
 @cache
 def _type_named_parameter_rule_blob() -> str:
-    return run_git(("git", "hash-object", "--stdin"), input=TYPE_NAMED_PARAMETER_RULE.encode()).stdout.decode().strip()
+    return git_blob_id(TYPE_NAMED_PARAMETER_RULE.encode())
 
 
 def machine_rename_rule(rule_blob: str) -> TypeNamedParameterRule | NoMachineRenameRule:

@@ -11,10 +11,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, TypedDict, cast
 
-from pins import Pin, Pins
+from scripts.bevy_upgrade.pins import Pin, Pins
 from scripts.lib.atomic_file import write_text_atomic
-from scripts.production.store_owner import document_id
-from upstream import Item, TargetPrerelease, TargetReleased, TargetUnpublished
+from scripts.bevy_upgrade.upstream import Item, TargetPrerelease, TargetReleased, TargetUnpublished
 
 if TYPE_CHECKING:
     from scripts.production.production_doc import Production
@@ -287,7 +286,7 @@ def start(production: Production, target: str, pins: Pins, now: datetime, *, sta
     """Begin or refresh a watch; the caller holds locked through start and save."""
     if re.fullmatch(r"\d+\.\d+", target) is None:
         raise RecordFailure("target must be major.minor, such as 0.20")
-    identity = staff_id or document_id(production.doc)
+    identity = staff_id or production.owner.id
     current = load(identity)
     if current is not None and current["closed"] is None:
         if current["target"] != target:
@@ -300,7 +299,7 @@ def start(production: Production, target: str, pins: Pins, now: datetime, *, sta
             _ = path.replace(archive)
         except OSError as error:
             raise RecordFailure(f"{path}: {error}") from error
-    return apply_pins(Record(staff_id=identity, production=str(production.doc),
+    return apply_pins(Record(staff_id=identity, production=production.name,
                              checkout=str(production.checkout), target=target, started=_utc(now),
                              closed=None, bevy=[], pins_read=_utc(now), dependencies={},
                              target_bevy=TargetUnread(status="unread"), target_error="", checked=None,

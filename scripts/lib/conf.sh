@@ -5,8 +5,8 @@ else
     _CONF_SOURCE="${BASH_SOURCE[0]}"
 fi
 case "$_CONF_SOURCE" in
-    */*) _CONF_READER="${_CONF_SOURCE%/*}/conf.py" ;;
-    *) _CONF_READER="./conf.py" ;;
+    */*) _CONF_LIB="${_CONF_SOURCE%/*}" ;;
+    *) _CONF_LIB="." ;;
 esac
 unset _CONF_SOURCE
 if [[ -r /proc/sys/kernel/hostname ]]; then
@@ -81,6 +81,6 @@ conf_value() {
         fi
     fi
     if [[ "$valid" == 1 ]]; then printf '%s\n' "$value"
-    else python3 "$_CONF_READER" get "$file" "$key"
+    else "$_CONF_LIB/py" "$_CONF_LIB/conf.py" get "$file" "$key"
     fi
 }

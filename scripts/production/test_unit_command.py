@@ -13,7 +13,7 @@ from unittest import mock
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.production import staff, unit_config, unit_command
 from scripts.shutdown import remote
-import herdr
+from scripts.herdr import herdr
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.production.staff_test_support import CHECKOUT, StaffTestCase, fixture_runtime_id
 
@@ -87,7 +87,7 @@ class UnitCommandTests(StaffTestCase):
             doc=staff.LiveDoc("natedev", self.root / "production.md"),
             current_session=staff.StaffId(fixture_runtime_id("command-root-current")))
         unit = staff.StaffRow(
-            staff.StaffId(fixture_runtime_id("command-unit")), "unit", "panes", staff.ReportsTo(runner.id),
+            staff.StaffId(fixture_runtime_id("command")), "unit", "panes", staff.ReportsTo(runner.id),
             worktree=staff.PresentWorktree("natedev", self.folder),
             current_session=staff.StaffId(fixture_runtime_id("command-unit-current")))
         worker = staff.StaffRow(

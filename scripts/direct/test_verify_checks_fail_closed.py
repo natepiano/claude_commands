@@ -32,15 +32,19 @@ if command == os.environ.get("TEST_BROKEN_CHECK"):
     if mode == "invalid":
         print("not a target table")
         raise SystemExit(0)
+    if mode == "tabbed-settings":
+        print("any_target")
+        print("mac\\teligible\\t-\\t/tmp/mac\\tsettings.conf\\tmacos")
+        raise SystemExit(0)
     if mode == "held":
         raise SystemExit(10)
     if mode == "error":
         raise SystemExit(12)
 if command == "eligible":
-    print("mac_allowed" if os.environ.get("TEST_ELIGIBLE_MAC") else "natedev_only test target")
-    print("natedev\\teligible\\t-\\t-")
+    print("any_target" if os.environ.get("TEST_ELIGIBLE_MAC") else "natedev_only test target")
+    print("natedev\\teligible\\t-\\t-\\t-")
     if os.environ.get("TEST_ELIGIBLE_MAC"):
-        print("mac\\teligible\\t-\\t" + os.environ["MAC_TEST_CONFIG"])
+        print("mac\\teligible\\t-\\t" + os.environ["MAC_TEST_CONFIG"] + "\\tmacos")
 if command == "wait-local" and os.environ.get("TEST_REMOVE_CHECK") == "1":
     Path(__file__).unlink()
 raise SystemExit(0)
@@ -210,6 +214,17 @@ class VerifyChecksFailClosedTests(unittest.TestCase):
                 self.fixture.environment.update({"TEST_BROKEN_CHECK": "register-local",
                                                  "TEST_CHECK_FAILURE": failure})
                 self.assert_refused(self.fixture.verify("test", "sample", "--filter", "smoke", "--no-cache"))
+
+    def test_settings_path_with_a_tab_refuses_before_the_step(self) -> None:
+        self.fixture.environment.update({
+            "TEST_BROKEN_CHECK": "eligible", "TEST_CHECK_FAILURE": "tabbed-settings",
+        })
+        result = self.fixture.verify("test", "sample", "--filter", "smoke", "--no-cache")
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn("target eligibility check returned invalid targets; step refused", result.stderr)
+        self.assertEqual(self.fixture.runner_events(), [])
+        self.assertEqual([event for event in self.fixture.cargo_events()
+                          if event["args"][:1] != ["metadata"]], [])
 
     def test_routing_hold_error_refuses_before_a_passing_mac_runner(self) -> None:
         self.fixture.environment.update({

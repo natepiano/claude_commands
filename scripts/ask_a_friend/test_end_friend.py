@@ -3,18 +3,97 @@ from __future__ import annotations
 
 import argparse
 import io
+import json
 import os
-from contextlib import redirect_stderr, redirect_stdout
+import select
+import subprocess
+import sys
+from contextlib import AbstractContextManager, redirect_stderr, redirect_stdout
+from pathlib import Path
 from typing import cast
 from unittest.mock import patch
 
-from scripts.agents import codex_mesh
+from scripts.agents import codex_mesh, test_codex_mesh
 from scripts.production import staff, worker_fill
 from scripts.production.staff_test_support import StaffTestCase, fixture_worker
 from scripts.shutdown import stop_resume
 
 
 class EndFriendTests(StaffTestCase):
+    def test_ending_a_codex_consultation_retires_the_friends_staff_row(self) -> None:
+        _, unit, _ = self.tree()
+        worker = fixture_worker("friend", unit.id, backend=staff.CodexBackend(self.root / "codex"))
+        run = self.root / "consultation"
+        run.mkdir()
+        _ = (run / "consult_agent").write_text("launched\n")
+        _ = (run / "friend_name").write_text(worker.name)
+        _ = (run / "status").write_text("running\n")
+        _ = (run / codex_mesh.ROSTER_FILE).write_text(json.dumps({
+            worker.name: {"staff_id": worker.id, "status": "done"},
+        }))
+        with (patch.dict(os.environ, {"CODEX_THREAD_ID": unit.current_session}),
+              redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as errors):
+            code = worker_fill.main(["end-friend", "--run", str(run)])
+        self.assertEqual(code, 0, output.getvalue() + errors.getvalue())
+        self.assertIsNone(staff.local_snapshot().by_id(worker.id))
+        self.assertEqual((run / "status").read_text(), "ended\n")
+
+    def test_a_staff_retirement_refusal_still_stops_the_consultation_server(self) -> None:
+        _, unit, _ = self.tree()
+        worker = fixture_worker("friend-refused", unit.id, backend=staff.CodexBackend(self.root / "codex"))
+        notes = self.root / "account-notes"
+        Path.home().mkdir(parents=True, exist_ok=True)
+        test_codex_mesh.select_fixture_workers(Path.home(), notes=notes)
+        _ = self.enterContext(cast(AbstractContextManager[object],
+                                   patch.dict(os.environ, {"AGENT_NOTES_DIR": str(notes)})))
+        run = self.root / "refused-consultation"
+        run.mkdir()
+        _ = (run / "consult_agent").write_text("launched\n")
+        _ = (run / "friend_name").write_text(worker.name)
+        _ = (run / "status").write_text("running\n")
+        _ = (run / codex_mesh.ROSTER_FILE).write_text(json.dumps({
+            worker.name: {"staff_id": worker.id, "status": "done"},
+        }))
+        driver = self.root / "consultation_server.py"
+        _ = driver.write_text("\n".join((
+            "import signal",
+            "from scripts.agents import test_codex_mesh",
+            "def respond(request):",
+            "    method = request.get('method')",
+            "    result = {}",
+            "    if method == 'thread/queue/list': result = {'data': [], 'nextCursor': None}",
+            f"    if method == 'thread/read': result = {{'thread': {{'id': {worker.current_session!r}, 'status': {{'type': 'idle'}}, 'turns': []}}}}",
+            "    return [{'id': request['id'], 'result': result}] if 'id' in request else None",
+            "server = test_codex_mesh.StubAppServer(respond)",
+            "print(server.port, flush=True)",
+            "signal.pause()",
+        )) + "\n")
+        server = subprocess.Popen([sys.executable, str(driver)], stdout=subprocess.PIPE,
+                                  stderr=subprocess.PIPE, text=True,
+                                  env={**os.environ, "PYTHONPATH": str(Path(__file__).resolve().parents[2])})
+
+        def stop_server() -> None:
+            if server.poll() is None:
+                server.kill()
+            _ = server.communicate(timeout=10)
+
+        self.addCleanup(stop_server)
+        assert server.stdout is not None
+        self.assertTrue(select.select([server.stdout], [], [], 10)[0], "the fixture server did not start")
+        port = int(cast(str, server.stdout.readline()))
+        _ = (run / codex_mesh.SERVER_FILE).write_text(json.dumps({"pid": server.pid, "port": port}))
+        with (patch.dict(os.environ, {"CODEX_THREAD_ID": unit.current_session}),
+              patch.object(staff, "retire", side_effect=staff.StaffRefused("fixture retirement refused")),
+              patch.object(codex_mesh, "_list_server_processes", return_value=
+                           f"{server.pid} 0 codex app-server --listen ws://127.0.0.1:{port}"),
+              redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as errors):
+            code = worker_fill.main(["end-friend", "--run", str(run)])
+        self.assertEqual(code, 1, output.getvalue() + errors.getvalue())
+        self.assertEqual(errors.getvalue(), f"codex_mesh: {worker.name}: fixture retirement refused\n")
+        self.assertIsNotNone(server.poll(), "the consultation server survived the retirement refusal")
+        self.assertIsNotNone(staff.local_snapshot().by_id(worker.id))
+        self.assertEqual((run / "status").read_text(), "running\n")
+
     def test_status_changes_only_after_confirmed_absence_or_successful_stop(self) -> None:
         _, unit, _ = self.tree()
         for case in ("absent", "unreadable", "claude-stop-failed", "codex-stop-failed", "claude-stopped", "codex-stopped"):

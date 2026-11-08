@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from scripts.production.unit_status_test_support import UnitStatusFixture, setUpModule as setUpModule
-from dailies_input import ClaudeNotRunning, Decision, SessionGone, StillWaiting
+from scripts.production.dailies_input import ClaudeNotRunning, Decision, SessionGone, StillWaiting
 
 
 class UnitStatusTests(UnitStatusFixture):
@@ -47,8 +47,8 @@ class UnitStatusTests(UnitStatusFixture):
         outputs, _, _ = self.run_statuses(None, "ok", 0, panes=({},), units=("hook", "hookworm"),
                                           missing_units=("hook",), stopped_units=("hookworm",))
         # A unit without a marked session prints its staff unit id.
-        gone = self.status_block(outputs[0], "hook-unit", ("hook-unit", "hookworm"))
-        live = self.status_block(outputs[0], "hookworm", ("hook-unit", "hookworm"))
+        gone = self.status_block(outputs[0], "hook", ("hook", "hookworm"))
+        live = self.status_block(outputs[0], "hookworm", ("hook", "hookworm"))
         self.assertIsInstance(gone.state, SessionGone, outputs[0])
         self.assertIsInstance(live.state, ClaudeNotRunning, outputs[0])
 

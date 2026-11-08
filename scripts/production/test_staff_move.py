@@ -11,7 +11,7 @@ from unittest import mock
 
 from scripts.production import staff, staff_move, staff_sources
 from scripts.production.staff_test_support import StaffTestCase, fixture_member
-import herdr
+from scripts.herdr import herdr
 
 
 class StaffMoveTests(StaffTestCase):
@@ -32,21 +32,21 @@ class StaffMoveTests(StaffTestCase):
         self.members["unit"] = fixture_member("unit", name="panes", parent=staff.ReportsTo(self.members["source"].id))
         self.members["worker"] = fixture_member("worker", name="impl1", parent=staff.ReportsTo(self.members["unit"].id))
         self.pane("w1:p1", session_id=self.members["unit"].current_session, environment={
-            "CLAUDE_CODE_SESSION_ID": self.members["unit"].current_session, ('' + 'SHOWRUNNER_' + 'UNIT'): "sdlc", ('' + 'SHOWRUNNER_' + 'UNIT_ID'): "models-unit",
+            "CLAUDE_CODE_SESSION_ID": self.members["unit"].current_session, ('' + 'SHOWRUNNER_' + 'UNIT'): "sdlc", ('' + 'SHOWRUNNER_' + 'UNIT_ID'): "models",
         })
         _ = self.place
 
     def test_old_launch_labels_cannot_select_a_renamed_unit(self) -> None:
         before = self.staff_file.read_bytes()
         with self.assertRaisesRegex(staff.StaffRefused, "no matching unit staff row"):
-            _ = staff_move.move_unit("sdlc", "models-unit", "target")
+            _ = staff_move.move_unit("tools", "models", "new-tools")
         self.assertEqual(self.staff_file.read_bytes(), before)
         self.place.assert_not_called()
 
     def test_move_changes_only_parent_and_moves_running_pane_to_parent_workspace(self) -> None:
         before = staff.snapshot()
         with mock.patch.object(staff, "snapshot", wraps=staff.snapshot) as snapshot:
-            result = staff_move.move_unit("sdlc", "panes-unit", "target")
+            result = staff_move.move_unit("tools", "panes", "new-tools")
         snapshot.assert_called_once_with()
         self.assertEqual(result.row, replace(self.members["unit"], parent=staff.ReportsTo(self.members["destination"].id)))
         self.assertTrue(result.changed)
@@ -63,7 +63,7 @@ class StaffMoveTests(StaffTestCase):
                 before, modified = self.staff_file.read_bytes(), self.staff_file.stat().st_mtime_ns
                 with (redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as errors,
                       mock.patch.object(staff, "move", wraps=staff.move) as move):
-                    code = staff.main(["move", "sdlc/panes-unit", "target"])
+                    code = staff.main(["move", "tools/panes", "new-tools"])
                 self.assertEqual(code, 0, errors.getvalue())
                 self.assertEqual(output.getvalue(), ("unchanged" if repeated else "done") + ": panes under new-tools\n")
                 self.assertEqual(errors.getvalue(), "")
@@ -85,9 +85,9 @@ class StaffMoveTests(StaffTestCase):
             return True
         self.place.side_effect = place
         with self.assertRaisesRegex(staff.StaffUnreadable, "tab was not moved"):
-            _ = staff_move.move_unit("sdlc", "panes-unit", "target")
+            _ = staff_move.move_unit("tools", "panes", "new-tools")
         before = self.staff_file.read_bytes()
-        result = staff_move.move_unit("sdlc", "panes-unit", "target")
+        result = staff_move.move_unit("tools", "panes", "new-tools")
         self.assertTrue(result.changed)
         self.assertEqual(parents, [staff.ReportsTo(self.members["destination"].id)] * 2)
         self.assertEqual(self.staff_file.read_bytes(), before)
@@ -105,13 +105,13 @@ class StaffMoveTests(StaffTestCase):
                 identity = staff_move.PinnedUnit(self.members["unit"].id, self.members["destination"].id) if pinned else staff_move.LocateUnit()
                 self.place.reset_mock()
                 self.place.return_value = True
-                first = staff_move.move_unit("sdlc", "models-unit", "target", identity=identity)
+                first = staff_move.move_unit("tools", "models", "new-tools", identity=identity)
                 _ = (self.source_root / "sdlc-production.md").write_text("# Fixture production\n- **Showrunner session:** `tools`\n")
                 if pinned:
                     (self.source_root / "target-production.md").unlink()
                 before = self.staff_file.read_bytes()
                 self.place.return_value = False
-                repeated = staff_move.move_unit("sdlc", "models-unit", "target", identity=identity)
+                repeated = staff_move.move_unit("tools", "models", "new-tools", identity=identity)
                 self.assertEqual(repeated.row, first.row)
                 self.assertEqual(repeated.row.id, self.members["unit"].id)
                 self.assertEqual(self.staff_file.read_bytes(), before)
@@ -119,19 +119,20 @@ class StaffMoveTests(StaffTestCase):
                 self.assertEqual(self.place.call_args_list, [mock.call(self.members["unit"].id, record=mock.ANY)] * 2)
 
     def test_mac_moves_owner_row_and_local_tab_without_a_local_staff_copy(self) -> None:
-        for key, slug in (("source", "sdlc"), ("destination", "target")):
+        for key, production_name in (("source", "sdlc"), ("destination", "target")):
             self.members[key] = staff.set_doc(self.members[key].id, staff.LiveDoc(
-                "mac", self.root / "mac-sources" / f"{slug}-production.md"))
+                "mac", self.root / "mac-sources" / f"{production_name}-production.md"))
         with self.machine("mac"):
             _ = self.production("sdlc", workspace="tools")
             _ = self.production("target", workspace="new-tools")
             self.pane("w1:p1", session_id=self.members["unit"].current_session, environment={
-                "CLAUDE_CODE_SESSION_ID": self.members["unit"].current_session, ('' + 'SHOWRUNNER_' + 'UNIT'): "sdlc", ('' + 'SHOWRUNNER_' + 'UNIT_ID'): "models-unit",
+                "CLAUDE_CODE_SESSION_ID": self.members["unit"].current_session, ('' + 'SHOWRUNNER_' + 'UNIT'): "sdlc", ('' + 'SHOWRUNNER_' + 'UNIT_ID'): "models",
             })
-            result = staff_move.move_unit("sdlc", "panes-unit", "target")
+            before = len(self.ssh_commands())
+            result = staff_move.move_unit("tools", "panes", "new-tools")
             self.assertEqual(result.row, replace(self.members["unit"], parent=staff.ReportsTo(self.members["destination"].id)))
             self.assertFalse(self.mac_file.exists())
-        self.assertEqual(self.ssh_commands(), [
+        self.assertEqual(self.ssh_commands()[before:], [
             ["show", "--snapshot", "--json"], ["move", self.members["unit"].id, f"--parent={self.members["destination"].id}", "--json"],
         ])
         self.assertEqual(staff.by_id(self.members["unit"].id), result.row)
@@ -146,15 +147,15 @@ class StaffMoveTests(StaffTestCase):
                   for parent in (missing, self.members["unit"].id, self.members["worker"].id))]:
             with self.subTest(unit=unit, parent=parent):
                 with self.assertRaisesRegex(staff.StaffRefused, reason):
-                    _ = staff_move.move_unit("sdlc", "models-unit", "target", identity=staff_move.PinnedUnit(unit, parent))
+                    _ = staff_move.move_unit("tools", "models", "new-tools", identity=staff_move.PinnedUnit(unit, parent))
                 self.assertEqual(staff.by_id(replacement.id), replacement)
                 self.assertEqual(self.staff_file.read_bytes(), before)
         self.place.assert_not_called()
 
     def test_missing_member_refuses_before_any_staff_or_tab_change(self) -> None:
         before = self.staff_file.read_bytes()
-        for target, destination, cause in (("sdlc/missing", "target", "sdlc/missing"),
-                                            ("sdlc/panes-unit", "missing", "missing")):
+        for target, destination, cause in (("tools/missing", "new-tools", "tools/missing"),
+                                            ("tools/panes", "missing", "missing")):
             with self.subTest(target=target, destination=destination):
                 completed = self.cli("move", target, destination, code=2)
                 self.assertIn(cause, completed.stderr)
@@ -170,7 +171,7 @@ class StaffMoveTests(StaffTestCase):
                     staff_sources.MemberFound(unit), staff_sources.MemberFound(parent),
                 ]):
                     with self.assertRaises(staff.StaffRefused):
-                        _ = staff_move.move_unit("sdlc", "models-unit", "target")
+                        _ = staff_move.move_unit("tools", "models", "new-tools")
                 self.assertEqual(self.staff_file.read_bytes(), before)
         self.place.assert_not_called()
 
@@ -178,7 +179,7 @@ class StaffMoveTests(StaffTestCase):
         _ = fixture_member("unit", name=self.members["unit"].name, parent=staff.ReportsTo(self.members["destination"].id))
         before = self.staff_file.read_bytes()
         with self.assertRaises(staff.StaffRefused):
-            _ = staff_move.move_unit("sdlc", "models-unit", "target")
+            _ = staff_move.move_unit("tools", "models", "new-tools")
         self.assertEqual(self.staff_file.read_bytes(), before)
         self.place.assert_not_called()
 

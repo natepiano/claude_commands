@@ -2,22 +2,19 @@
 
 from __future__ import annotations
 
-from ledger_test_support import ticket_owner_id
+from scripts.style.ledger_test_support import ticket_owner_id
 
 import sqlite3
-import sys
 import unittest
 from contextlib import closing
-from pathlib import Path
 from typing import final
 from unittest import mock
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-import style_plan
-import style_ledger
+from scripts.style import style_plan
+from scripts.style import style_ledger
 
-from style_plan_test_support import StylePlanFixture
+from scripts.style.style_plan_test_support import StylePlanFixture
 
 
 @final
@@ -25,23 +22,23 @@ class StylePlanTests(StylePlanFixture):
     def test_checkpoint_refill_disjoint_work_starts_at_the_waiting_checkpoint(self) -> None:
         ledger, _, checkpoint = self.waiting_ticket()
         self.assertEqual(self.run_next(), (0, "phase written: 2\n", ""))
-        opened = ledger.ticket_open(ticket_owner_id("names-unit"))
+        opened = ledger.ticket_open(ticket_owner_id("names"))
         self.assertEqual(len(opened), 2)
         successor = next(ticket for ticket in opened if ticket["state"] == "assigned")
         self.assertEqual(successor["base"], checkpoint)
         self.assertNotIn(self.sources[0], successor["files"])
         self.assertIn("2", self.plan.read_text())
         self.assertEqual(self.run_next(), (0, "resume 2\n", ""))
-        self.assertEqual(len(ledger.ticket_open(ticket_owner_id("names-unit"))), 2)
+        self.assertEqual(len(ledger.ticket_open(ticket_owner_id("names"))), 2)
 
     def test_checkpoint_refill_overlap_waits_names_files_and_keeps_the_queue(self) -> None:
         ledger, rule, checkpoint = self.waiting_ticket()
-        ledger.ticket_add("2", ticket_owner_id("names-unit"), "read", "names", "crates/alpha", [self.sources[0]], [rule])
+        ledger.ticket_add("2", ticket_owner_id("names"), "read", "names", "crates/alpha", [self.sources[0]], [rule])
         before = self.plan.read_bytes()
         self.assertEqual(self.run_next(), (
             5, f"waiting for merge: 1 checkpointed at {checkpoint[:7]}; overlap: {self.sources[0]}\n", ""))
         self.assertEqual(self.plan.read_bytes(), before)
-        self.assertEqual([ticket["id"] for ticket in ledger.queued_tickets(ticket_owner_id("names-unit"))], ["2"])
+        self.assertEqual([ticket["id"] for ticket in ledger.queued_tickets(ticket_owner_id("names"))], ["2"])
 
     def test_checkpoint_refill_unknown_footprint_keeps_the_wait(self) -> None:
         ledger, _, _ = self.waiting_ticket()
@@ -50,7 +47,7 @@ class StylePlanTests(StylePlanFixture):
             code, output, error = self.run_next()
         self.assertEqual((code, error), (5, ""))
         self.assertIn("footprint unknown: unreadable", output)
-        self.assertEqual(len(ledger.ticket_open(ticket_owner_id("names-unit"))), 1)
+        self.assertEqual(len(ledger.ticket_open(ticket_owner_id("names"))), 1)
         self.assertEqual(self.plan.read_bytes(), before)
 
     def test_checkpoint_refill_unreadable_checkpoint_or_moved_branch_waits(self) -> None:
@@ -64,7 +61,7 @@ class StylePlanTests(StylePlanFixture):
                 self.assertIn("footprint unknown:", output)
         with closing(sqlite3.connect(ledger.database)) as connection, connection:
             _ = connection.execute("UPDATE tickets SET checkpoint=? WHERE id='1'", (checkpoint,))
-        self.assertEqual(len(ledger.ticket_open(ticket_owner_id("names-unit"))), 1)
+        self.assertEqual(len(ledger.ticket_open(ticket_owner_id("names"))), 1)
 
     def test_checkpoint_refill_waiting_rename_protects_reference_and_new_paths(self) -> None:
         rule = self.rule("read")
@@ -73,7 +70,7 @@ class StylePlanTests(StylePlanFixture):
         issue = self.file_rename_decision(rule, ((old, "Rename probe.rs to frame_log.rs"),))
         ledger = self.ledger()
         finding = ledger.proposal_findings(issue)[0]
-        ledger.ticket_add("1", ticket_owner_id("names-unit"), "proposal", "names", "crates/alpha", [old], [rule],
+        ledger.ticket_add("1", ticket_owner_id("names"), "proposal", "names", "crates/alpha", [old], [rule],
                           proposal=str(issue), finding_ids=(finding.finding_id,))
         ledger.ticket_assign("1", "demo-style-names")
         _ = ledger.ticket_base("1")
@@ -88,17 +85,17 @@ class StylePlanTests(StylePlanFixture):
         for number, path in enumerate((reference, new), 2):
             with self.subTest(path=path):
                 ticket = f"{number}"
-                ledger.ticket_add(ticket, ticket_owner_id("names-unit"), "read", "names", "crates/alpha", [path], [rule])
+                ledger.ticket_add(ticket, ticket_owner_id("names"), "read", "names", "crates/alpha", [path], [rule])
                 code, output, error = self.run_next()
                 self.assertEqual((code, error), (5, ""))
                 self.assertIn("overlap: " + path, output)
-                self.assertEqual(len(ledger.ticket_open(ticket_owner_id("names-unit"))), 1)
+                self.assertEqual(len(ledger.ticket_open(ticket_owner_id("names"))), 1)
                 ledger.ticket_drop(ticket)
 
     def test_checkpoint_refill_stops_after_the_successor_checkpoints(self) -> None:
         ledger, rule, _ = self.waiting_ticket()
         self.assertEqual(self.run_next()[0], 0)
-        successor = next(ticket for ticket in ledger.ticket_open(ticket_owner_id("names-unit")) if ticket["state"] == "assigned")
+        successor = next(ticket for ticket in ledger.ticket_open(ticket_owner_id("names")) if ticket["state"] == "assigned")
         checkpoint = self.git("rev-parse", "HEAD", cwd=self.unit)
         for path in successor["files"]:
             self.record(rule, path, checkpoint, successor["id"])
@@ -114,7 +111,7 @@ class StylePlanTests(StylePlanFixture):
             code, output, error = self.run_next()
         self.assertEqual((code, error), (5, ""))
         self.assertIn("footprint unknown: selected unreadable", output)
-        self.assertEqual(len(ledger.ticket_open(ticket_owner_id("names-unit"))), 1)
+        self.assertEqual(len(ledger.ticket_open(ticket_owner_id("names"))), 1)
 
     def test_checkpoint_refill_build_inputs_and_rename_paths_block_symmetrically(self) -> None:
         work = style_plan.WaitingCheckpoint("1", self.tip, frozenset({self.sources[0]}),

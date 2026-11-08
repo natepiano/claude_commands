@@ -4,8 +4,12 @@ from __future__ import annotations
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
 import re
-from typing import Literal, NotRequired, TypedDict
+from typing import TYPE_CHECKING, Literal, NotRequired, TypedDict
 from scripts.lib.terminal_cells import terminal_width
+
+if TYPE_CHECKING:
+    from scripts.build_queue.admission_records import RunningStep, WaitingStep
+    from scripts.lib.build_steps import StepNames
 
 Tone = Literal["default", "success", "error", "warning", "inactive", "suggestion"]
 
@@ -16,7 +20,6 @@ class Span:
     tone: Tone = "default"
     bold: bool = False
     background: Tone = "default"
-    until: float | None = None
 
 
 Line = tuple[Span, ...]
@@ -27,7 +30,6 @@ class JsonSpan(TypedDict):
     tone: NotRequired[Tone]
     bold: NotRequired[bool]
     background: NotRequired[Tone]
-    until: NotRequired[float]
 
 
 class QueueLines(TypedDict):
@@ -38,6 +40,16 @@ class QueueLines(TypedDict):
 
 def field(text: str) -> str:
     return " ".join(text.split())
+
+
+def step_text(step: WaitingStep | RunningStep, names: StepNames) -> str:
+    """Show the project with the step's shown name when the project is known."""
+    return field(f"{step.project} {names.shown(step.step)}")
+
+
+def step_prose(step: WaitingStep | RunningStep, names: StepNames) -> str:
+    """Show the project with the step's sentence name when the project is known."""
+    return field(f"{step.project} {names.prose(step.step)}")
 
 
 def age(since: float, now: float) -> int:
@@ -61,7 +73,7 @@ def clip(line: Line, columns: int) -> Line:
         for char in span.text:
             size = terminal_width(char)
             if size > left:
-                return (*result, replace(span, text=text + "…", until=None))
+                return (*result, replace(span, text=text + "…"))
             text += char
             left -= size
         result.append(replace(span, text=text))
@@ -74,7 +86,7 @@ def merge_spans(line: Line) -> Line:
         if not span.text:
             continue
         if (parts and parts[-1].tone == span.tone and parts[-1].bold == span.bold
-                and parts[-1].background == span.background and parts[-1].until == span.until):
+                and parts[-1].background == span.background):
             previous = parts[-1]
             parts[-1] = replace(span, text=previous.text + span.text)
         else:
@@ -179,8 +191,6 @@ def json_form(lines: Sequence[Line], columns: int, as_of: float) -> QueueLines:
                 part["bold"] = span.bold
             if span.background != defaults.background:
                 part["background"] = span.background
-            if span.until is not None:
-                part["until"] = span.until
             row.append(part)
         result.append(row)
     return {"columns": columns, "as_of": as_of, "lines": result}

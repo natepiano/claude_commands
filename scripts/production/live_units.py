@@ -1,22 +1,24 @@
 #!/usr/bin/env python3
 """List a showrunner's recorded units, each with its session now."""
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import sys
-from pathlib import Path
+from collections.abc import Callable
 from typing import NamedTuple
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-
-from scripts.production import showrunners, staff, unit_names
-from scripts.shutdown import remote
-import unit_lookup
+from scripts.production import session_staff, showrunners, staff
+from scripts.production import unit_lookup
 
 
 class LiveUnit(NamedTuple):
     unit: str
     # None when no observed herdr session has the unit identity.
     session: unit_lookup.LabeledSession | None
+    status: str = "active"
 
     @property
     def name(self) -> str:
@@ -25,42 +27,51 @@ class LiveUnit(NamedTuple):
         return claude.name if isinstance(claude, unit_lookup.LiveClaude) else ""
 
 
-def _production_slug(doc: Path, record: staff.StaffSnapshot,
-                     sources: unit_lookup.MemberSources) -> str:
-    owner = record.by_doc(remote.local_machine(), doc)
-    slugs = [slug for slug, row in sources.showrunner_members(record).items() if row == owner]
-    return (slugs[0] if len(slugs) == 1 else owner.name if owner is not None
-            else showrunners.production_slug(str(doc)))
+class UnitListing(NamedTuple):
+    units: list[LiveUnit]
+    anomalies: tuple[str, ...]
 
 
-def units_of_doc(doc: Path) -> list[LiveUnit]:
-    """List recorded unit children with their current panes."""
+def read_units(production_name: str, *,
+               check: Callable[[int, str], session_staff.ReportProcessIdentity] | None = None) -> UnitListing:
+    """Return staff units and every anomaly from this observation."""
     record = staff.snapshot()
     sources = unit_lookup.member_sources()
-    slug = _production_slug(doc, record, sources)
-    metadata = unit_lookup.unit_metadata(record, sources, slug=slug)
+    metadata = unit_lookup.unit_metadata(record, name=production_name)
     for problem in metadata.problems:
         print(f"live_units: {problem.name}: unavailable: {problem.reason}", file=sys.stderr)
-    return _joined(slug, unit_lookup.every_labeled_session(record=record, sources=sources))
+    with session_staff.anomalies(check) as lines:
+        every = unit_lookup.every_labeled_session(record=record, sources=sources)
+    units = _with_status(_joined(production_name, every), session_staff.production_members(record).get(production_name, ()))
+    return UnitListing(units, tuple(lines))
 
 
-def units_in(doc: Path, every: unit_lookup.LabeledProductions) -> list[LiveUnit]:
-    """Join a production through its recorded document and the caller's pane snapshot."""
-    record = staff.snapshot()
-    sources = unit_lookup.member_sources()
-    return _joined(_production_slug(doc, record, sources), every)
+def units_of(production_name: str) -> list[LiveUnit]:
+    """List recorded unit children with their current panes."""
+    listing = read_units(production_name)
+    for line in listing.anomalies:
+        print(line, file=sys.stderr)
+    return listing.units
 
 
-def _joined(slug: str, every: unit_lookup.LabeledProductions) -> list[LiveUnit]:
-    """Units in staff row order, each with its pane."""
-    marked = every.status_units(slug)
-    return [LiveUnit(unit if unit in marked else unit_names.unit_id(unit), marked.get(unit))
-            for unit in every.members.get(slug, ())]
+def _with_status(units: list[LiveUnit], rows: tuple[staff.StaffRow, ...]) -> list[LiveUnit]:
+    statuses = {row.name: "paused" if isinstance(row.paused, staff.Paused) else "active" for row in rows}
+    return [unit._replace(status=statuses.get(unit.unit, "active")) for unit in units]
 
 
-def units_of(runner: showrunners.Showrunner) -> list[LiveUnit]:
-    """The showrunner's units. A showrunner whose update timer names no doc has none to list."""
-    return units_of_doc(Path(runner["doc"])) if runner["doc"] else []
+def units_in(production_name: str, every: unit_lookup.LabeledProductions) -> list[LiveUnit]:
+    """Join the named production to the caller's session snapshot."""
+    units = _joined(production_name, every)
+    if not units:
+        return units
+    return _with_status(units, session_staff.production_members(staff.snapshot()).get(production_name, ()))
+
+
+def _joined(production_name: str, every: unit_lookup.LabeledProductions) -> list[LiveUnit]:
+    """Return units in staff row order, each with its pane."""
+    marked = every.status_units(production_name)
+    return [LiveUnit(unit, marked.get(unit))
+            for unit in every.members.get(production_name, ())]
 
 
 def live_unit_names(runner: showrunners.Showrunner) -> list[str]:
@@ -69,9 +80,9 @@ def live_unit_names(runner: showrunners.Showrunner) -> list[str]:
     A herdr that cannot say which sessions exist leaves the list empty and says why.
     """
     try:
-        return [unit.name for unit in units_of(runner) if unit.name]
+        return [unit.name for unit in units_of(runner["name"]) if unit.name]
     except OSError as error:
-        print(f"live_units: the units of {runner['slug']} could not be listed: {error}", file=sys.stderr)
+        print(f"live_units: the units of {runner['name']} could not be listed: {error}", file=sys.stderr)
         return []
 
 
@@ -82,13 +93,13 @@ def main(arguments: list[str]) -> int:
         arguments = arguments[1:]
     try:
         match arguments:
-            case ["--production", doc]:
-                units = units_of_doc(Path(doc))
-            # An update prompt written before a production was named by its doc names the showrunner.
+            case ["--production", name]:
+                record = staff.snapshot()
+                units = units_in(name, unit_lookup.every_labeled_session(record=record))
             case [showrunner] if not showrunner.startswith("-"):
-                units = units_of(showrunners.named(showrunner))
+                units = units_of(showrunners.named(showrunner)["name"])
             case _:
-                print("usage: live_units.py --production <production doc>", file=sys.stderr)
+                print("usage: live_units.py --production <staff name>", file=sys.stderr)
                 return 2
     except (OSError, ValueError) as error:
         print(error, file=sys.stderr)

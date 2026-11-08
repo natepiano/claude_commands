@@ -4,11 +4,10 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from scripts.whoami.note_file import note_name
 
-from scripts.production import staff_sources, staff
+from scripts.production import staff_sources, staff, staff_test_support
 from scripts.message import sessions as status_sessions
 import io
 import fcntl
@@ -37,7 +36,7 @@ from scripts.whoami import run_out
 from scripts.whoami import account
 from scripts.whoami import agent_accounts
 from scripts.whoami import usage_store
-import quota_alert
+from scripts.whoami import quota_alert
 
 local_staff_snapshot = staff.local_snapshot
 
@@ -49,12 +48,12 @@ if TYPE_CHECKING:
     from scripts.shutdown import inventory, shutdown_record, restart_support, pane_record
     from scripts.message import sessions
 else:
-    from unit_staff_test_support import isolated_parents, unit_host
-    inventory = import_module("inventory")
-    shutdown_record = import_module("shutdown_record")
-    restart_support = import_module("restart_support")
-    sessions = import_module("sessions")
-    pane_record = import_module("pane_record")
+    from scripts.shutdown.unit_staff_test_support import isolated_parents, unit_host
+    inventory = import_module("scripts.shutdown.inventory")
+    shutdown_record = import_module("scripts.shutdown.shutdown_record")
+    restart_support = import_module("scripts.shutdown.restart_support")
+    sessions = import_module('scripts.message.sessions')
+    pane_record = import_module("scripts.shutdown.pane_record")
 
 
 def setUpModule() -> None:
@@ -207,7 +206,7 @@ class RefusalWatchTests(unittest.TestCase):
             if identity is None or login is not None and identity.login != login:
                 continue
             production = (owner["production"] if owner["kind"] == "showrunner" else
-                          staff_sources.unit_parent(owner["host"]["unit"]).slug if owner["host"]["kind"] == "unit" else "")
+                          staff_sources.unit_parent(owner["host"]["unit"]).name if owner["host"]["kind"] == "unit" else "")
             doc = (owner["doc"] if owner["kind"] == "showrunner" else
                    staff_sources.unit_parent(owner["host"]["unit"]).doc if owner["host"]["kind"] == "unit" else "")
             result.append(inventory.ListedSession(owner["session_id"], owner["pid"], owner["proc_start"],
@@ -1056,7 +1055,7 @@ class RefusalWatchTests(unittest.TestCase):
         if TYPE_CHECKING:
             from scripts.herdr import herdr
         else:
-            herdr = import_module("herdr")
+            herdr = import_module("scripts.herdr.herdr")
 
         _ = self.groups()
         _ = self.owner("new-unit", host="unit")
@@ -1080,7 +1079,7 @@ class RefusalWatchTests(unittest.TestCase):
         if TYPE_CHECKING:
             from scripts.herdr import herdr
         else:
-            herdr = import_module("herdr")
+            herdr = import_module("scripts.herdr.herdr")
 
         _ = self.groups(units="claude3")
         processes: list[herdr.HerdrProcess] = []
@@ -1105,7 +1104,7 @@ class RefusalWatchTests(unittest.TestCase):
         if TYPE_CHECKING:
             from scripts.herdr import herdr
         else:
-            herdr = import_module("herdr")
+            herdr = import_module("scripts.herdr.herdr")
 
         _ = self.groups(units="claude1")
         _ = self.owner("unit", host="unit")
@@ -1129,7 +1128,7 @@ class RefusalWatchTests(unittest.TestCase):
         if TYPE_CHECKING:
             from scripts.herdr import herdr
         else:
-            herdr = import_module("herdr")
+            herdr = import_module("scripts.herdr.herdr")
         _ = self.groups(units="claude1")
         _ = self.owner("unit", host="unit")
         def observed() -> list[sessions.SessionRecord]:
@@ -1153,7 +1152,7 @@ class RefusalWatchTests(unittest.TestCase):
         if TYPE_CHECKING:
             from scripts.herdr import herdr
         else:
-            herdr = import_module("herdr")
+            herdr = import_module("scripts.herdr.herdr")
 
         path = self.groups()
         owner = self.owner("new-unit", host="unit")
@@ -1304,6 +1303,24 @@ class RefusalWatchTests(unittest.TestCase):
         self.assertEqual(self.head_deliveries, [])
         self.assertEqual(self.snapshot(), before)
         self.assertEqual(self.moves.calls, [])
+
+    def test_blocked_notice_rechecks_the_current_head_before_delivery(self) -> None:
+        entry = self.low_rule(target="claude3")
+        rule = refusal_watch.AutoMoveRule(entry.id, "units", entry.to, refusal_watch.LeftAtMost(1))
+        reason = refusal_watch.TargetAtOrBelowThreshold(0, 1)
+        for current in ((), (self.low_rule("replacement", target="claude2"),),
+                        (self.low_rule(entry.id, target="claude2"),)):
+            with (self.subTest(current=current),
+                  patch.object(next_moves, "read_next_moves", return_value=current),
+                  patch.object(refusal_watch, "_notify_blocked_head") as notify):
+                state = refusal_watch._load_state()  # pyright: ignore[reportPrivateUsage]
+                _ = refusal_watch._record_blocked_head(state, rule, reason, NOW, False)  # pyright: ignore[reportPrivateUsage]
+                notify.assert_not_called()
+        with (patch.object(next_moves, "read_next_moves", return_value=(entry,)),
+              patch.object(refusal_watch, "_notify_blocked_head", return_value=True) as notify):
+            state = refusal_watch._load_state()  # pyright: ignore[reportPrivateUsage]
+            _ = refusal_watch._record_blocked_head(state, rule, reason, NOW, False)  # pyright: ignore[reportPrivateUsage]
+            notify.assert_called_once_with(rule, reason, NOW)
 
     def test_removing_a_blocked_entry_clears_its_notice_deduplication(self) -> None:
         _ = self.groups()
@@ -2226,9 +2243,9 @@ class RefusalWatchTests(unittest.TestCase):
         _ = self.owner("unit", host="unit")
         _ = self.transcript("unit")
         original = accounts.move_sessions
-        def requested(ids: tuple[str, ...], target: str, *, why: str) -> tuple[accounts.SessionMoveOutcome, ...]:
+        def requested(ids: tuple[str, ...], target: str, *, why: str, cause: moves.MoveCause) -> tuple[accounts.SessionMoveOutcome, ...]:
             self.assertEqual(stored_group_labels(path)["units"], target)
-            return original(ids, target, why=why)
+            return original(ids, target, why=why, cause=cause)
         with patch.object(accounts, "move_sessions", side_effect=requested):
             _ = self.cli()
         history = [cast(dict[str, object], json.loads(line)) for line in accounts.roles_history_file().read_text().splitlines()]
@@ -2237,9 +2254,12 @@ class RefusalWatchTests(unittest.TestCase):
         self.assertIn("refused", str(history[0]["why"]))
 
     def test_manual_showrunner_group_command_needs_only_destination(self) -> None:
+        _ = self.enterContext(staff_test_support.isolated_staff_file(self.home / "staff.json", {}))
+        first = staff_test_support.fixture_member("showrunner", name="runner-one")
+        second = staff_test_support.fixture_member("showrunner", name="runner-two")
         path = self.groups(showrunners="claude1")
-        _ = self.owner("runner-one", host="herdr")
-        _ = self.owner("runner-two", host="herdr")
+        _ = self.owner(first.current_session, host="herdr")
+        _ = self.owner(second.current_session, host="herdr")
         _ = self.owner("unit", host="unit")
         output, error = io.StringIO(), io.StringIO()
         with redirect_stdout(output), redirect_stderr(error):
@@ -2247,7 +2267,7 @@ class RefusalWatchTests(unittest.TestCase):
         self.assertEqual((code, error.getvalue()), (0, ""))
         self.assertEqual(stored_group_labels(path), {"units": "claude1", "showrunners": "claude3"})
         self.assertEqual(len(self.moves.calls), 2)
-        self.assertEqual({command.session_id for command in self.moves.calls}, {"runner-one", "runner-two"})
+        self.assertEqual({command.session_id for command in self.moves.calls}, {first.current_session, second.current_session})
 
     def test_refusal_of_one_unit_moves_every_live_unit_and_leaves_showrunners(self) -> None:
         path = self.groups()
@@ -2383,8 +2403,8 @@ class RefusalWatchTests(unittest.TestCase):
         rows = [line for line in output.splitlines() if line.startswith("|")][2:]
         self.assertTrue(rows)
         roles = [row.split("|")[3].strip() for row in rows]
-        self.assertIn("units 1 (busy 0, shell 0, idle 1)", roles)
-        self.assertIn("showrunners 1 (busy 0, shell 0, idle 1)", roles)
+        self.assertIn("units 1 (busy 0, idle 1, paused 0, exited 0)", roles)
+        self.assertIn("showrunners 1 (busy 0, idle 1, paused 0, exited 0)", roles)
         self.assertFalse(any("✓" in role for role in roles))
         self.assertEqual(self.snapshot(), before)
 
@@ -2537,6 +2557,123 @@ class RefusalWatchTests(unittest.TestCase):
         if isinstance(found, refusal_watch.TranscriptRefusal):
             self.assertEqual(found.entry_id, "refusal-one")
             self.assertEqual(found.window, refusals.KnownWindow("weekly"))
+            self.assertEqual(found.refused_at.at, REFUSAL_AT)
+
+    def test_codex_refusal_keeps_its_time_and_window_after_bookkeeping(self) -> None:
+        for folder, window in (("sessions", "weekly"), ("archived_sessions", "5-hour")):
+            with self.subTest(folder=folder):
+                home = self.home / ".codex2"
+                path = home / folder / "2026/11/05/rollout-refused-thread.jsonl"
+                path.parent.mkdir(parents=True)
+                text = f"You've hit your usage limit. {window} limit reached."
+                _ = path.write_text("\n".join(json.dumps(entry) for entry in [
+                    {"type": "session_meta", "payload": {"id": "refused-thread"}},
+                    {"type": "event_msg", "timestamp": REFUSAL_AT.isoformat(),
+                     "payload": {"type": "error", "message": text}},
+                    {"type": "event_msg", "payload": {"type": "token_count"}},
+                    {"type": "event_msg", "payload": {"type": "task_complete"}},
+                ]) + "\n")
+                found = refusal_watch.transcript_refusal("refused-thread", config_dir=home)
+                self.assertIsInstance(found, refusal_watch.TranscriptRefusal)
+                if isinstance(found, refusal_watch.TranscriptRefusal):
+                    self.assertEqual(found.text, text)
+                    self.assertEqual(found.refused_at.at, REFUSAL_AT)
+                    self.assertEqual(found.window, refusals.KnownWindow("weekly" if window == "weekly" else "five_hour"))
+                    self.assertEqual(refusal_watch.transcript_refusal("refused-thread", config_dir=home), found)
+                path.unlink()
+
+    def test_codex_and_pane_limits_require_the_provider_usage_marker(self) -> None:
+        home = self.home / ".codex"
+        path = home / "sessions/rollout-limit-text.jsonl"
+        path.parent.mkdir(parents=True)
+        for text in ("You've hit your session limit.", "You've hit your weekly limit."):
+            with self.subTest(text=text):
+                _ = path.write_text(json.dumps({"type": "event_msg", "timestamp": REFUSAL_AT.isoformat(),
+                    "payload": {"type": "error", "message": text}}) + "\n")
+                self.assertIsInstance(refusal_watch.transcript_refusal("limit-text", config_dir=home),
+                                      refusal_watch.NoSessionRefusal)
+                self.assertIsInstance(refusal_watch.transcript_refusal("no-transcript", config_dir=home, screen_text=text),
+                                      refusal_watch.TranscriptRefusal)
+
+    def test_claude_pane_limits_keep_the_window_until_a_transcript_exchange_exists(self) -> None:
+        path = self.home / ".claude/projects/fixture/claude-screen.jsonl"
+        path.parent.mkdir(parents=True)
+        for text, window in (("You've hit your session limit.", refusals.KnownWindow("five_hour")),
+                             ("You've hit your weekly limit.", refusals.KnownWindow("weekly"))):
+            with self.subTest(text=text):
+                _ = path.write_text('{"type":"system"}\n')
+                found = refusal_watch.transcript_refusal("claude-screen", screen_text=text)
+                self.assertIsInstance(found, refusal_watch.TranscriptRefusal)
+                if isinstance(found, refusal_watch.TranscriptRefusal):
+                    self.assertEqual(found.text, text)
+                    self.assertEqual(found.window, window)
+                _ = path.write_text('{"type":"user","message":{"content":"continue"}}\n')
+                self.assertIsInstance(refusal_watch.transcript_refusal("claude-screen", screen_text=text),
+                                      refusal_watch.NoSessionRefusal)
+
+    def test_codex_new_exchange_clears_refusal_and_overrides_stale_pane_text(self) -> None:
+        home = self.home / ".codex"
+        path = home / "sessions/rollout-continued-thread.jsonl"
+        path.parent.mkdir(parents=True)
+        refusal = {"type": "event_msg", "timestamp": REFUSAL_AT.isoformat(),
+                   "payload": {"type": "error", "message": "You've hit your usage limit."}}
+        for exchange in (
+            {"type": "event_msg", "payload": {"type": "user_message", "message": "continue"}},
+            {"type": "event_msg", "payload": {"type": "agent_message", "message": "I checked the usage limit."}},
+            {"type": "response_item", "payload": {"type": "message", "role": "assistant",
+                "content": [{"type": "output_text", "text": "You've hit your usage limit is the old error."}]}},
+            {"type": "event_msg", "payload": {"type": "error", "message": "Connection failed."}},
+        ):
+            with self.subTest(exchange=exchange):
+                _ = path.write_text(json.dumps(refusal) + "\n" + json.dumps(exchange) + "\n")
+                found = refusal_watch.transcript_refusal("continued-thread", config_dir=home,
+                                                       screen_text="You've hit your weekly limit.")
+                self.assertIsInstance(found, refusal_watch.NoSessionRefusal)
+
+    def test_pane_text_supplies_refusal_only_without_readable_transcript_evidence(self) -> None:
+        text = "You've hit your usage limit. 5-hour limit reached."
+        path = self.home / ".claude/projects/fixture/pane-refusal.jsonl"
+        path.parent.mkdir(parents=True)
+        for state in ("missing", "unreadable", "bookkeeping"):
+            with self.subTest(state=state):
+                if state == "unreadable":
+                    path.mkdir()
+                elif state == "bookkeeping":
+                    path.rmdir()
+                    _ = path.write_text('{"type":"system"}\n')
+                found = refusal_watch.transcript_refusal("pane-refusal", screen_text=text)
+                self.assertIsInstance(found, refusal_watch.TranscriptRefusal)
+                if isinstance(found, refusal_watch.TranscriptRefusal):
+                    self.assertEqual(found.text, text)
+                    self.assertEqual(found.window, refusals.KnownWindow("five_hour"))
+                    repeated = refusal_watch.transcript_refusal("pane-refusal", screen_text=text)
+                    self.assertIsInstance(repeated, refusal_watch.TranscriptRefusal)
+                    if isinstance(repeated, refusal_watch.TranscriptRefusal):
+                        self.assertEqual(found.entry_id, repeated.entry_id)
+        _ = path.write_text('{"type":"user","message":{"content":"continue"}}\n')
+        self.assertIsInstance(refusal_watch.transcript_refusal("pane-refusal", screen_text=text),
+                              refusal_watch.NoSessionRefusal)
+
+    def test_claude_transcript_refusal_takes_priority_over_pane_text(self) -> None:
+        _ = self.transcript("transcript-first")
+        found = refusal_watch.transcript_refusal("transcript-first", screen_text="You've hit your session limit.")
+        self.assertIsInstance(found, refusal_watch.TranscriptRefusal)
+        if isinstance(found, refusal_watch.TranscriptRefusal):
+            self.assertEqual(found.entry_id, "refusal-one")
+            self.assertEqual(found.window, refusals.KnownWindow("weekly"))
+            self.assertEqual(found.refused_at.at, REFUSAL_AT)
+
+    def test_codex_refusal_is_found_in_the_configured_account_home(self) -> None:
+        home = self.home / "codex-account"
+        path = home / "sessions/rollout-account-thread.jsonl"
+        path.parent.mkdir(parents=True)
+        _ = path.write_text(json.dumps({"type": "event_msg", "timestamp": REFUSAL_AT.isoformat(),
+            "payload": {"type": "error", "message": "You've hit your usage limit."}}) + "\n")
+        with patch.dict(os.environ, {"CODEX_HOME": str(home)}):
+            found = refusal_watch.transcript_refusal("account-thread")
+        self.assertIsInstance(found, refusal_watch.TranscriptRefusal)
+        if isinstance(found, refusal_watch.TranscriptRefusal):
+            self.assertEqual(found.window, refusals.UnknownWindow())
             self.assertEqual(found.refused_at.at, REFUSAL_AT)
 
     def test_new_user_exchange_clears_refusal_until_another_refusal_arrives(self) -> None:
@@ -3240,18 +3377,50 @@ class RefusalWatchTests(unittest.TestCase):
         self.assertEqual(self.snapshot(), before)
         self.assertEqual(self.moves.calls, [])
 
-    def test_showrunner_batch_uses_the_same_move_sessions_path_as_watcher(self) -> None:
-        _ = self.owner("first", host="herdr")
-        _ = self.owner("second", host="herdr")
+    def test_refusal_move_passes_its_cause_to_the_session_batch(self) -> None:
+        _ = self.owner("refused")
+        _ = self.transcript("refused")
+        with patch.object(accounts, "move_sessions", wraps=accounts.move_sessions) as move:
+            _ = self.cli()
+        move.assert_called_once()
+        self.assertEqual(move.call_args.kwargs["cause"], "refusal")
+
+    def test_auto_move_passes_its_cause_to_the_session_batch(self) -> None:
+        _ = self.groups()
         _ = self.owner("unit", host="unit")
-        requested = (stop_resume.ClaudeUp("first", "w1:p1", "claude3"),
-                     stop_resume.ClaudeUp("second", "w1:p2", "claude3"))
+        self.next_entries(self.low_rule())
+        self.reading(SOURCE_LOGIN, 1)
+        with patch.object(accounts, "move_sessions", wraps=accounts.move_sessions) as move:
+            _ = self.cli()
+        move.assert_called_once()
+        self.assertEqual(move.call_args.kwargs["cause"], "auto")
+
+    def test_auto_move_keeps_each_members_live_source_and_the_selected_destination(self) -> None:
+        _ = self.groups(units="claude1")
+        owner = self.owner("off-group-unit", host="unit", label="claude3")
+        self.next_entries(self.low_rule())
+        self.reading(SOURCE_LOGIN, 1)
+        _ = self.cli()
+        self.assertEqual(len(self.moves.calls), 1)
+        self.assertEqual((self.moves.calls[0].session_id, self.moves.calls[0].target),
+                         (owner["session_id"], "claude2"))
+        self.assertEqual(self.moves.sources, [{owner["session_id"]: "claude3"}])
+
+    def test_showrunner_batch_uses_the_same_move_sessions_path_as_watcher(self) -> None:
+        _ = self.enterContext(staff_test_support.isolated_staff_file(self.home / "staff.json", {}))
+        first = staff_test_support.fixture_member("showrunner", name="first")
+        second = staff_test_support.fixture_member("showrunner", name="second")
+        _ = self.owner(first.current_session, host="herdr")
+        _ = self.owner(second.current_session, host="herdr")
+        _ = self.owner("unit", host="unit")
+        requested = (stop_resume.ClaudeUp(first.current_session, "w1:p1", "claude3"),
+                     stop_resume.ClaudeUp(second.current_session, "w1:p2", "claude3"))
         with patch.object(accounts, "move_sessions", return_value=requested) as move:
             result = accounts.move_group("showrunners", "claude3", why="weekly refusal")
         self.assertIsInstance(result, accounts.GroupMoveStarted)
         transition = accounts.group_transition("showrunners")
         assert isinstance(transition, accounts.GroupTransition)
-        move.assert_called_once_with(("first", "second"), "claude3", why="weekly refusal", account_config=ANY)
+        move.assert_called_once_with((first.current_session, second.current_session), "claude3", why="weekly refusal", account_config=ANY)
 
     def test_named_window_without_known_reset_moves(self) -> None:
         _ = self.owner("refused")

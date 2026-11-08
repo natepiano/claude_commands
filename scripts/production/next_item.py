@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """The one item /next shows from the four lists the user works through, and moving an item to the end.
 
-    next_item.py show [--production DOC] [--kind change|proposal|efficiency|question] [--order urgent|oldest|newest] [--all-below]
-    next_item.py move-to-end --kind change|proposal|efficiency|question [--production DOC] [--all-below]
+    next_item.py show [--production NAME] [--kind change|proposal|efficiency|question] [--order urgent|oldest|newest] [--all-below]
+    next_item.py move-to-end --kind change|proposal|efficiency|question [--production NAME] [--all-below]
 
 `show` prints the item's kind on the first line, then the item as its list prints it, and pins it
 (urgency.py). With a kind it takes that list's first item; with none, the first across the four
@@ -23,6 +23,10 @@ docs; a production with none has no efficiency items. A list that cannot be read
 one line on stderr.
 """
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import argparse
 import sys
@@ -32,24 +36,24 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, NamedTuple, TypeVar, cast
 
-import change_review
-import proposals_folder
-import proposals_table
-from footer_counts import efficiency_ledger
+from scripts.production import change_review
+from scripts.production import proposals_folder
+from scripts.production import proposals_table
+from scripts.production.footer_counts import efficiency_ledger
 from scripts.production.store_owner import document_id
 from scripts.production import staff
 from scripts.production.production_doc import Refusal, read_production
-from update_registration import QuestionStaff, RegistrationFailure, open_lists, question_queue
+from scripts.production.update_registration import QuestionStaff, RegistrationFailure, open_lists, question_queue
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
-import urgency  # noqa: E402
-from user_zone import user_zone  # noqa: E402
+from scripts.lib import urgency  # noqa: E402
+from scripts.lib.user_zone import user_zone  # noqa: E402
 
 if TYPE_CHECKING:
     from ..nightly_review import candidates
 else:
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "nightly_review"))
-    import candidates
+    from scripts.nightly_review import candidates
 
 CHANGE = "change"
 PROPOSAL = "proposal"
@@ -118,10 +122,12 @@ def read_queue(kind: str, production: Path | None, below: bool = False, *,
                 waiting, _ = proposals_table.waiting_entries(doc, below)
                 return Queue(urgency.scope_queue(proposals_table.queue(doc, record=record), below), _as_text(waiting, proposals_table.proposal_text))
             case "question":
-                found = read_production(_doc(production))
+                doc = _doc(production)
                 identities = QuestionStaff.read() if record is None else QuestionStaff.for_record(record)
+                owner = identities.owner(doc)
+                found = read_production(owner)
                 due = open_lists(found, below, identities=identities).due
-                return Queue(question_queue(found, below, identities=identities), _as_text(due, lambda entry: entry.item.line()))
+                return Queue(question_queue(found, below), _as_text(due, lambda entry: entry.item.line()))
             case _:
                 return efficiency_queue(_doc(production), below)
     except (change_review.ChangeReviewError, RegistrationFailure, Refusal, OSError, ValueError) as error:
@@ -178,12 +184,13 @@ def main(arguments: list[str]) -> int:
     moved = actions.add_parser("move-to-end")
     _ = moved.add_argument("--kind", choices=KINDS, required=True)
     for action in (shown, moved):
-        _ = action.add_argument("--production", type=Path)
+        _ = action.add_argument("--production", default="")
         _ = action.add_argument(f"--{urgency.ALL_BELOW}", action="store_true", dest="below")
     args = parser.parse_args(arguments)
-    production = cast(Path | None, args.production)
+    production_name = cast(str, args.production)
     below = cast(bool, args.below)
     try:
+        production = change_review.production_doc(production_name) if production_name else None
         if cast(str, args.action) == "show":
             print(show(cast(str, args.kind), cast(str, args.order), production, below))
         else:

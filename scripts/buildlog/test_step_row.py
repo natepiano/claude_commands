@@ -3,26 +3,27 @@
 from __future__ import annotations
 
 import contextlib
-from functools import cached_property
+from functools import cached_property, partial
 import io
 import json
 import os
+import shlex
 from pathlib import Path
 import subprocess
 import sys
 import tempfile
 import unittest
 from unittest import mock
-from typing import TYPE_CHECKING, cast, override
+from typing import cast, override
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-import record
-import repository
-import step_context
-import treekey
-import store
-from test_index import use_test_log
-from test_record import START, NEXTEST
+from scripts.buildlog import record
+from scripts.buildlog import repository
+from scripts.buildlog import step_context
+from scripts.buildlog import treekey
+from scripts.buildlog import store
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.buildlog.test_index import use_test_log
+from scripts.buildlog.test_record import START, NEXTEST
 
 use_test_log()
 
@@ -38,12 +39,8 @@ PHASE_GRANT = json.dumps({
     "test_phase_charge_use": {"kind": "NoTestPhaseChargeUse"},
 })
 
-if TYPE_CHECKING:
-    from ..lib.cargo_output import CargoOutputRoots
-    from ..lib.cargo_output_test_support import fake_cargo_output_roots
-else:
-    from scripts.lib.cargo_output import CargoOutputRoots
-    from scripts.lib.cargo_output_test_support import fake_cargo_output_roots
+from scripts.lib.cargo_output import CargoOutputRoots
+from scripts.lib.cargo_output_test_support import fake_cargo_output_roots
 
 
 class RecorderCompatibilityTests(unittest.TestCase):
@@ -72,36 +69,36 @@ class RecorderCompatibilityTests(unittest.TestCase):
 
     def test_scp_remote_identity_does_not_load_url_parsing(self) -> None:
         source = (
-            "import sys; sys.path.insert(0, sys.argv[1]); import repository; "
+            "import sys; from scripts.buildlog import repository; "
             "assert repository.remote_identity('git@EXAMPLE.com:owner/project.git', '/fixture') "
             "== 'https://example.com/owner/project'; assert 'urllib.parse' not in sys.modules; "
             "assert 'record' not in sys.modules; assert 'scripts.buildlog.record' not in sys.modules"
         )
-        result = subprocess.run([sys.executable, "-c", source, str(Path(__file__).parent)],
+        result = subprocess.run([str(Path(__file__).resolve().parents[1] / "lib/py"), "-c", source],
                                 capture_output=True, text=True, env={
                                     key: value for key, value in os.environ.items() if key != "PYTHONPATH"})
         self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_plain_phase_context_does_not_load_admission(self) -> None:
         source = (
-            "import sys; sys.path.insert(0, sys.argv[1]); import record; "
-            "value = record.test_phase_context(sys.argv[2], ['cargo', 'nextest', 'run', '-j4']); "
+            "import sys; from scripts.buildlog import record; "
+            "value = record.test_phase_context(sys.argv[1], ['cargo', 'nextest', 'run', '-j4']); "
             "assert value['test_threads'] == 4; assert value['call_id'] == 'phase-call'; "
             "assert 'memory_admit' not in sys.modules; assert 'scripts.lint.memory_admit' not in sys.modules"
         )
-        result = subprocess.run([sys.executable, "-c", source, str(Path(__file__).parent), PHASE_GRANT],
+        result = subprocess.run([str(Path(__file__).resolve().parents[1] / "lib/py"), "-c", source, PHASE_GRANT],
                                 capture_output=True, text=True, env={
                                     key: value for key, value in os.environ.items() if key != "PYTHONPATH"})
         self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_row_ids_do_not_load_random_or_temporary_file_modules(self) -> None:
         source = (
-            "import sys; sys.path.insert(0, sys.argv[1]); import record; "
+            "import sys; from scripts.buildlog import record; "
             "value = record.new_id('fixture', 0); assert value.startswith('fixture-19700101T000000-'); "
             "assert len(value.rsplit('-', 1)[1]) == 6; "
             "assert 'secrets' not in sys.modules; assert 'tempfile' not in sys.modules"
         )
-        result = subprocess.run([sys.executable, "-c", source, str(Path(__file__).parent)],
+        result = subprocess.run([str(Path(__file__).resolve().parents[1] / "lib/py"), "-c", source],
                                 capture_output=True, text=True, env={
                                     key: value for key, value in os.environ.items() if key != "PYTHONPATH"})
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -116,18 +113,18 @@ class RecorderCompatibilityTests(unittest.TestCase):
 
     def test_empty_metadata_does_not_load_json_or_store(self) -> None:
         source = (
-            "import sys; sys.path.insert(0, sys.argv[1]); import step_context; "
-            "assert 'json' not in sys.modules; assert 'store' not in sys.modules; "
+            "import sys; from scripts.buildlog import step_context; "
+            "assert 'json' not in sys.modules; assert 'scripts.buildlog.store' not in sys.modules; "
             "step_context.metadata_target_folder('  ', [], '/fixture'); "
-            "assert 'json' not in sys.modules; assert 'store' not in sys.modules"
+            "assert 'json' not in sys.modules; assert 'scripts.buildlog.store' not in sys.modules"
         )
-        result = subprocess.run([sys.executable, "-c", source, str(Path(__file__).parent)],
+        result = subprocess.run([str(Path(__file__).resolve().parents[1] / "lib/py"), "-c", source],
                                 capture_output=True, text=True, env={
                                     key: value for key, value in os.environ.items() if key != "PYTHONPATH"})
         self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_invalid_target_configuration_records_the_error(self) -> None:
-        import cargo_target_config
+        from scripts.lib import cargo_target_config
 
         with (
             mock.patch.object(cargo_target_config, "cargo_folder_settings", side_effect=ValueError("invalid")),
@@ -142,13 +139,13 @@ class RecorderCompatibilityTests(unittest.TestCase):
             peak = Path(temporary) / "peak"
             _ = peak.write_text("123456\nsome avg10=0.00 total=1250000\n")
             source = (
-                "import sys; sys.path.insert(0, sys.argv[1]); from scripts.buildlog import record; "
-                "memory = record.peak_and_stall(sys.argv[2]); "
+                "import sys; from scripts.buildlog import record; "
+                "memory = record.peak_and_stall(sys.argv[1]); "
                 "assert memory.peak_bytes == 123456; assert memory.stall_some_s == 1.25; "
                 "assert memory.stall_full_s is record.cgroup_capture.Unmeasured.VALUE"
             )
             result = subprocess.run(
-                [sys.executable, "-c", source, str(Path(__file__).resolve().parents[2]), str(peak)],
+                [str(Path(__file__).resolve().parents[2] / "scripts/lib/py"), "-c", source, str(peak)],
                 cwd=temporary, capture_output=True, text=True,
                 env={key: value for key, value in os.environ.items() if key != "PYTHONPATH"},
             )
@@ -415,7 +412,7 @@ class RecorderCompatibilityTests(unittest.TestCase):
         self.assertEqual(output.getvalue(), "tree\n/fixture/target\n")
 
 
-class StepOutputFolderTests(unittest.TestCase):
+class StepOutputFolderFixture(unittest.TestCase):
     @cached_property
     def temporary(self) -> Path:
         return Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
@@ -441,6 +438,40 @@ class StepOutputFolderTests(unittest.TestCase):
             '[package]\nname = "output-fixture"\nversion = "0.1.0"\nedition = "2024"\n')
         _ = (source / "lib.rs").write_text("pub fn fixture() {}\n")
         self.outside.mkdir()
+        environment = {key: value for key, value in os.environ.items()
+                       if not key.startswith(("CARGO_", "BUILDLOG_"))}
+        environment.update({"CARGO_HOME": str(self.temporary / "cargo-home"),
+                            "BUILDLOG_DIR": str(self.log_root), "BUILDLOG_TARGET": "natedev"})
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, environment, clear=True)))
+        _ = cast(object, self.enterContext(mock.patch.object(record, "output", return_value=None)))
+        _ = cast(object, self.enterContext(mock.patch.object(repository, "output", return_value=None)))
+        _ = cast(object, self.enterContext(mock.patch.object(treekey, "tree_key", return_value=None)))
+
+    def write_step(self, argv: list[str], target: Path, *, cwd: Path) -> dict[str, object]:
+        captured = step_context.target_folder_text(step_context.resolve_target_folder(argv, str(cwd), os.environ))
+        self.assertEqual(captured, str(target))
+        os.environ["BUILDLOG_TARGET_FOLDER"] = captured
+        return self.publish_step(argv, cwd=cwd)
+
+    def publish_step(self, argv: list[str], *, cwd: Path) -> dict[str, object]:
+        with contextlib.chdir(cwd):
+            record.step(["0", str(int(START)), str(int(START) + 2), "1", "", "", *argv])
+        rows = [cast(dict[str, object], json.loads(line))
+                for path in self.log_root.glob("*/*.jsonl") for line in path.read_text().splitlines()]
+        self.assertEqual(len(rows), 1)
+        return rows[0]
+
+    def assert_output_pair(self, row: dict[str, object], target: Path, build: Path) -> None:
+        self.assertEqual(row["target_dir"], str(target))
+        self.assertEqual(row["target_directory"], row["target_dir"])
+        self.assertEqual(row["build_directory"], str(build))
+        self.assertFalse((self.log_root / store.ERRORS_NAME).exists())
+
+
+class StepOutputFolderTests(StepOutputFolderFixture):
+    @override
+    def setUp(self) -> None:
+        super().setUp()
         # Phase 19 confirmed these answers with cargo metadata --format-version 1 --no-deps.
         # Each row supplies that command's options, cwd, and CARGO_TARGET_DIR.
         cases: list[tuple[list[str], Path, str | None, Path, Path]] = [
@@ -495,35 +526,7 @@ class StepOutputFolderTests(unittest.TestCase):
             "",
         ]))
         cargo.chmod(0o755)
-        environment = {key: value for key, value in os.environ.items()
-                       if not key.startswith(("CARGO_", "BUILDLOG_"))}
-        environment.update({"CARGO_HOME": str(self.temporary / "cargo-home"),
-                            "BUILDLOG_DIR": str(self.log_root), "BUILDLOG_TARGET": "natedev",
-                            "PATH": str(binaries) + os.pathsep + environment.get("PATH", "")})
-        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, environment, clear=True)))
-        _ = cast(object, self.enterContext(mock.patch.object(record, "output", return_value=None)))
-        _ = cast(object, self.enterContext(mock.patch.object(repository, "output", return_value=None)))
-        _ = cast(object, self.enterContext(mock.patch.object(treekey, "tree_key", return_value=None)))
-
-    def write_step(self, argv: list[str], target: Path, *, cwd: Path) -> dict[str, object]:
-        captured = step_context.target_folder_text(step_context.resolve_target_folder(argv, str(cwd), os.environ))
-        self.assertEqual(captured, str(target))
-        os.environ["BUILDLOG_TARGET_FOLDER"] = captured
-        return self.publish_step(argv, cwd=cwd)
-
-    def publish_step(self, argv: list[str], *, cwd: Path) -> dict[str, object]:
-        with contextlib.chdir(cwd):
-            record.step(["0", str(int(START)), str(int(START) + 2), "1", "", "", *argv])
-        rows = [cast(dict[str, object], json.loads(line))
-                for path in self.log_root.glob("*/*.jsonl") for line in path.read_text().splitlines()]
-        self.assertEqual(len(rows), 1)
-        return rows[0]
-
-    def assert_output_pair(self, row: dict[str, object], target: Path, build: Path) -> None:
-        self.assertEqual(row["target_dir"], str(target))
-        self.assertEqual(row["target_directory"], row["target_dir"])
-        self.assertEqual(row["build_directory"], str(build))
-        self.assertFalse((self.log_root / store.ERRORS_NAME).exists())
+        os.environ["PATH"] = str(binaries) + os.pathsep + os.environ.get("PATH", "")
 
     def test_relative_target_argument_overrides_config(self) -> None:
         target = self.workspace / "relative-output"
@@ -687,3 +690,143 @@ TEE_BASELINE: dict[str, object] = {
     "tests_retried": 0,
     "tests": [],
 }
+
+
+class VerifyOutputEvidenceTests(StepOutputFolderFixture):
+    @override
+    def setUp(self) -> None:
+        super().setUp()
+        tools = self.temporary / "tools"
+        tools.mkdir()
+        launcher = tools / "cargo"
+        _ = launcher.write_text(
+            "#!/bin/sh\n"
+            + f"printf '%s\\n' \"$*\" >> '{self.temporary / 'cargo-calls'}'\n"
+            + f"exec cat {shlex.quote(str(self.temporary / 'metadata.json'))}\n")
+        launcher.chmod(0o755)
+        self.set_metadata_roots(self.workspace, self.workspace / "target", self.workspace / "target")
+        os.environ["PATH"] = str(tools) + os.pathsep + os.environ.get("PATH", "")
+        _ = cast(object, self.enterContext(mock.patch.object(
+            subprocess, "run", side_effect=partial(subprocess.run, timeout=TEST_HANG_GUARD_SECS))))
+
+    def set_metadata_roots(self, workspace: Path, target: Path, build: Path) -> None:
+        _ = (self.temporary / "metadata.json").write_text(json.dumps({
+            "workspace_root": str(workspace), "target_directory": str(target), "build_directory": str(build),
+        }))
+
+    def capture_export(self) -> str:
+        metadata = subprocess.run(["cargo", "metadata", "--no-deps", "--format-version", "1"],
+                                  cwd=self.workspace, capture_output=True, text=True, check=True,
+                                  timeout=TEST_HANG_GUARD_SECS).stdout
+        environment = dict(os.environ)
+        _ = environment.pop("PYTHONPATH", None)
+        result = subprocess.run([str(Path(__file__).resolve().parents[1] / "lib/py"), str(Path(step_context.__file__)), "output-roots"],
+                                input=metadata, cwd=self.workspace, env=environment, capture_output=True, text=True, check=True,
+                                timeout=TEST_HANG_GUARD_SECS)
+        self.assertEqual(len(result.stdout.rstrip("\n").split("\t")), 4, result.stdout + result.stderr)
+        return result.stdout.strip()
+
+    def assert_recorded_roots(self, exported: str, argv: list[str], *, reuse: bool = False,
+                              cwd: Path | None = None) -> None:
+        directory = cwd or self.workspace
+        with mock.patch.dict(os.environ, {"BUILDLOG_OUTPUT_ROOTS": ""}):
+            expected = step_context.step_output_roots(argv, str(directory))
+        self.assertIsInstance(expected, CargoOutputRoots)
+        assert isinstance(expected, CargoOutputRoots)
+        answer = cast(dict[str, str], json.loads((self.temporary / "metadata.json").read_text()))
+        self.assertEqual((str(expected.workspace_root), str(expected.target_directory), str(expected.build_directory)),
+                         (answer["workspace_root"], answer["target_directory"], answer["build_directory"]))
+        os.environ["BUILDLOG_OUTPUT_ROOTS"] = exported
+        _ = (self.temporary / "cargo-calls").write_text("")
+        self.assertEqual(step_context.step_output_roots(argv, str(directory)), expected)
+        calls = (self.temporary / "cargo-calls").read_text().splitlines()
+        self.assertEqual(sum("metadata" in line.split() for line in calls), 0 if reuse else 1, calls)
+        os.environ["BUILDLOG_TARGET_FOLDER"] = str(expected.target_directory)
+        _ = (self.temporary / "cargo-calls").write_text("")
+        row = self.publish_step(argv, cwd=directory)
+        self.assertEqual(row["target_directory"], str(expected.target_directory))
+        self.assert_output_pair(row, expected.target_directory, expected.build_directory)
+        calls = (self.temporary / "cargo-calls").read_text().splitlines()
+        self.assertEqual(sum("metadata" in line.split() for line in calls), 0 if reuse else 1, calls)
+
+    def test_plain_step_reuses_the_metadata_output_folders(self) -> None:
+        self.assert_recorded_roots(self.capture_export(), ["cargo", "check"], reuse=True)
+
+    def test_target_environment_wrapper_reads_its_own_output_folders(self) -> None:
+        exported = self.capture_export()
+        target = self.workspace / "wrapped-target"
+        self.set_metadata_roots(self.workspace, target, target)
+        self.assert_recorded_roots(exported, ["env", "CARGO_TARGET_DIR=wrapped-target", "cargo", "check"])
+
+    def test_build_environment_wrapper_reads_its_own_output_folders(self) -> None:
+        exported = self.capture_export()
+        self.set_metadata_roots(self.workspace, self.workspace / "target", self.workspace / "wrapped-build")
+        self.assert_recorded_roots(exported, ["env", "CARGO_BUILD_BUILD_DIR=wrapped-build", "cargo", "check"])
+
+    def test_external_manifest_reads_the_other_workspace_output_folders(self) -> None:
+        other = self.temporary / "other"
+        other.mkdir()
+        _ = (other / "Cargo.toml").write_text('[workspace]\nmembers = []\n')
+        exported = self.capture_export()
+        self.set_metadata_roots(other, other / "target", other / "target")
+        self.assert_recorded_roots(exported, ["cargo", "check", "--manifest-path", str(other / "Cargo.toml")])
+
+    def test_inline_config_reads_its_selected_output_folders(self) -> None:
+        exported = self.capture_export()
+        target = self.workspace / "inline-target"
+        self.set_metadata_roots(self.workspace, target, target)
+        self.assert_recorded_roots(exported, ["cargo", "check", "--config", 'build.target-dir="inline-target"'])
+
+    def test_target_argument_reads_its_selected_output_folders(self) -> None:
+        exported = self.capture_export()
+        target = self.workspace / "argument-target"
+        self.set_metadata_roots(self.workspace, target, target)
+        self.assert_recorded_roots(exported, ["cargo", "check", "--target-dir=argument-target"])
+
+    def test_changed_config_reads_the_new_output_folders(self) -> None:
+        exported = self.capture_export()
+        config = self.workspace / ".cargo/config.toml"
+        config.parent.mkdir()
+        _ = config.write_text('[build]\ntarget-dir = "changed-target"\n')
+        target = self.workspace / "changed-target"
+        self.set_metadata_roots(self.workspace, target, target)
+        self.assert_recorded_roots(exported, ["cargo", "check"])
+
+    def test_legacy_config_change_reads_the_new_output_folders(self) -> None:
+        exported = self.capture_export()
+        config = self.workspace / ".cargo/config"
+        config.parent.mkdir()
+        _ = config.write_text('[build]\ntarget-dir = "legacy-target"\n')
+        target = self.workspace / "legacy-target"
+        self.set_metadata_roots(self.workspace, target, target)
+        self.assert_recorded_roots(exported, ["cargo", "check"])
+
+    def test_changed_manifest_rejects_the_prior_metadata_evidence(self) -> None:
+        exported = self.capture_export()
+        _ = (self.workspace / "Cargo.toml").write_text('[workspace]\nmembers = []\nresolver = "3"\n')
+        self.assert_recorded_roots(exported, ["cargo", "check"])
+
+    def test_other_working_folder_reads_its_own_output_folders(self) -> None:
+        member = self.workspace / "other-cwd"
+        member.mkdir()
+        self.assert_recorded_roots(self.capture_export(), ["cargo", "check"], cwd=member)
+
+    def test_cargo_home_config_change_reads_the_new_output_folders(self) -> None:
+        exported = self.capture_export()
+        home = Path(os.environ["CARGO_HOME"])
+        home.mkdir(exist_ok=True)
+        _ = (home / "config.toml").write_text('[build]\ntarget-dir = "home-target"\n')
+        target = home.parent / "home-target"
+        self.set_metadata_roots(self.workspace, target, target)
+        self.assert_recorded_roots(exported, ["cargo", "check"])
+
+    def test_toolchain_file_change_rejects_prior_metadata_evidence(self) -> None:
+        exported = self.capture_export()
+        _ = (self.workspace / "rust-toolchain.toml").write_text('[toolchain]\nchannel = "stable"\n')
+        self.assert_recorded_roots(exported, ["cargo", "check"])
+
+    def test_invalid_metadata_clears_the_export(self) -> None:
+        result = subprocess.run([str(Path(__file__).resolve().parents[1] / "lib/py"), str(Path(step_context.__file__)), "output-roots"],
+                                input="{}", cwd=self.workspace, capture_output=True, text=True, check=True,
+                                timeout=TEST_HANG_GUARD_SECS)
+        self.assertEqual(result.stdout, "")

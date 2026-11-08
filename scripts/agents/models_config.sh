@@ -19,7 +19,6 @@ if [ -n "${ZSH_VERSION:-}" ]; then
     return 1 2>/dev/null || exit 1
 fi
 
-MODELS_CONFIG_FILE="${MODELS_CONFIG_FILE:-$HOME/.claude/config/models.conf}"
 MODELS_CONFIG_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CODEX_CONFIG_FILE="${CODEX_CONFIG_FILE:-$HOME/.codex/config.toml}"
 CODEX_MODELS_CACHE_FILE="${CODEX_MODELS_CACHE_FILE:-$HOME/.codex/models_cache.json}"
@@ -39,50 +38,57 @@ except (OSError, ValueError) as error:
 PY
 }
 
-# One shared registry for every reader and writer.
+# The parser supplies the exact editor text and normalized lookup values.
 models_registry_text() {
     if [[ "${MODELS_REGISTRY_BASE+x}" == x ]]; then
-        printf '%s\n' "$MODELS_REGISTRY_BASE"
+        printf '%s' "$MODELS_REGISTRY_BASE"
     else
-        cat "$MODELS_CONFIG_FILE"
+        _models_registry_read models_registry_text
     fi
 }
 
-# Validation and transformation see the same snapshot. Storage alone reads the
-# latest file and replays the intended row delta onto concurrent changes.
+models_launch_configuration() {
+    _models_registry_parse --launch || return 1
+    export MODELS_LAUNCH_CONFIGURATION MODELS_CONFIG_FILE
+}
+
 models_registry_edit() {
-    _models_table_valid=0
-    local MODELS_REGISTRY_BASE
-    unset MODELS_REGISTRY_BASE
-    MODELS_REGISTRY_BASE="$(models_registry_text)" || return 1
-    _models_registry_read "$@"
+    if [[ "${_models_edit_active:-0}" == 1 ]]; then
+        "$@"
+        return $?
+    fi
+    local _models_edit_active=1
+    _models_registry_scope --edit "$@"
+}
+
+_models_registry_scope() {
+    local mode="$1"
+    shift
+    local _models_table_file MODELS_LAUNCH_CONFIGURATION MODELS_REGISTRY_BASE MODELS_CONFIG_FILE="${MODELS_CONFIG_FILE:-}"
+    local -a _models_table_sections=() _models_table_keys=() _models_table_values=()
+    _models_registry_parse "$mode" || return 1
+    "$@"
 }
 
 # All editors use the same atomic row replay and publication path. The caller's
 # local snapshot identifies its changes without reverting a concurrent editor.
 models_registry_store() {
-    _models_table_valid=0
-    local registry="$1" description="${2:-update registry}" result=0
+    local registry="$1" description="${2:-update registry}" result=0 assignments
     local extra=()
     [[ "${3:-}" != additive-catalog ]] || extra+=(--additive-catalog)
-    "$MODELS_CONFIG_DIR/../lib/py" "$MODELS_CONFIG_DIR/../lib/models_registry.py" store \
+    assignments="$("$MODELS_CONFIG_DIR/../lib/py" "$MODELS_CONFIG_DIR/../lib/models_registry.py" store \
         --registry "$MODELS_CONFIG_FILE" --after "$registry" \
-        --before <(printf '%s\n' "$MODELS_REGISTRY_BASE") --description "$description" \
-        "${extra[@]}" || result=$?
+        --before <(printf '%s' "$MODELS_REGISTRY_BASE") --description "$description" \
+        "${extra[@]}")" || result=$?
     rm -f "$registry"
-    return "$result"
+    [[ "$result" == 0 ]] || return "$result"
+    eval "$assignments"
+    _models_table_file="$MODELS_CONFIG_FILE"
 }
 
-# Keep the materialized registry current between periodic launchd runs.
-if [[ "${MODELS_CONFIG_TIER_ONLY:-}" != 1 && -f "$MODELS_CONFIG_FILE" \
-    && -x "$MODELS_CONFIG_DIR/sync_codex_catalog.sh" \
-    && ( ! -f "$CODEX_CATALOG_SYNC_STATE_FILE" \
-        || "$CODEX_CONFIG_FILE" -nt "$CODEX_CATALOG_SYNC_STATE_FILE" \
-        || "$CODEX_MODELS_CACHE_FILE" -nt "$CODEX_CATALOG_SYNC_STATE_FILE" ) ]]; then
-    if ! "$MODELS_CONFIG_DIR/sync_codex_catalog.sh" >/dev/null; then
-        echo "WARNING: Codex catalog sync failed; using $MODELS_CONFIG_FILE as-is." >&2
-    fi
-fi
+models_agent_environment() {
+    unset MODELS_LAUNCH_CONFIGURATION MODELS_REGISTRY_EDIT_BASE STAFF_OPERATION_FD
+}
 
 # With an output variable, trim in this shell. Without one, keep the printed API.
 models_config_trim() {
@@ -96,33 +102,27 @@ models_config_trim() {
     fi
 }
 
-# A table belongs to one reader call. Bash's dynamic scope lets nested readers
-# and command substitutions share it, without caching across separate calls.
-# File and snapshot identity also protect readers inside an edit callback.
+# Nested readers share their caller's operation table.
 _models_registry_read() {
-    if [[ "${_models_table_valid:-0}" == 1 \
-        && "${_models_table_file:-}" == "$MODELS_CONFIG_FILE" \
-        && "${_models_table_base_set:-}" == "${MODELS_REGISTRY_BASE+x}" \
-        && "${_models_table_base:-}" == "${MODELS_REGISTRY_BASE:-}" ]]; then
+    if [[ -n "${_models_table_file:-}" && "$_models_table_file" == "${MODELS_CONFIG_FILE:-}" ]]; then
         "$@"
         return $?
     fi
-    local _models_table_valid=1 _models_table_file="$MODELS_CONFIG_FILE"
-    local _models_table_base_set="${MODELS_REGISTRY_BASE+x}"
-    local _models_table_base="${MODELS_REGISTRY_BASE:-}"
-    local -a _models_table_sections=() _models_table_rows=()
-    _models_registry_parse || return $?
-    "$@"
+    _models_registry_scope --launch "$@"
 }
 
-# Empty rows mark section headers, including sections that have no values.
-# Other rows keep their order and their original key spelling.
 _models_registry_parse() {
-    local assignments
-    [[ -f "$MODELS_CONFIG_FILE" ]] || return 0
-    assignments="$(models_registry_text | "$MODELS_CONFIG_DIR/../lib/py" \
-        "$MODELS_CONFIG_DIR/../lib/models_registry.py" shell)" || return 1
+    local assignments argument
+    local -a registry=()
+    if [[ -n "${MODELS_CONFIG_FILE:-}" ]]; then
+        registry=(--registry "$MODELS_CONFIG_FILE")
+        for argument in "$@"; do
+            case "$argument" in --registry|--registry=*) registry=(); break ;; esac
+        done
+    fi
+    assignments="$("$MODELS_CONFIG_DIR/../lib/py" "$MODELS_CONFIG_DIR/../lib/models_registry.py" shell "${registry[@]}" "$@")" || return 1
     eval "$assignments"
+    _models_table_file="$MODELS_CONFIG_FILE"
 }
 
 _models_config_has_section() {
@@ -133,7 +133,7 @@ _models_table_has_section() {
     local want_section="$1" index
     for index in "${!_models_table_sections[@]}"; do
         if [[ "${_models_table_sections[index]}" == "$want_section" \
-            && -z "${_models_table_rows[index]}" ]]; then
+            && -z "${_models_table_keys[index]}" ]]; then
             return 0
         fi
     done
@@ -148,8 +148,8 @@ _models_table_section_values() {
     local want_section="$1" index
     for index in "${!_models_table_sections[@]}"; do
         [[ "${_models_table_sections[index]}" == "$want_section" ]] || continue
-        [[ -n "${_models_table_rows[index]}" ]] || continue
-        printf '%s\n' "${_models_table_rows[index]}"
+        [[ -n "${_models_table_keys[index]}" ]] || continue
+        printf '%s=%s\n' "${_models_table_keys[index]}" "${_models_table_values[index]}"
     done
     return 0
 }
@@ -176,12 +176,11 @@ _models_registry_get() {
 }
 
 _models_table_get() {
-    local section="$1" key="$2" index line
+    local section="$1" key="$2" index
     for index in "${!_models_table_sections[@]}"; do
         [[ "${_models_table_sections[index]}" == "$section" ]] || continue
-        line="${_models_table_rows[index]}"
-        [[ -n "$line" && "${line%%=*}" == "$key" ]] || continue
-        models_config_trim "${line#*=}"
+        [[ "${_models_table_keys[index]}" == "$key" ]] || continue
+        printf '%s' "${_models_table_values[index]}"
         return 0
     done
     return 0
@@ -192,11 +191,10 @@ _models_registry_has_key() {
 }
 
 _models_table_has_key() {
-    local section="$1" key="$2" index line
+    local section="$1" key="$2" index
     for index in "${!_models_table_sections[@]}"; do
         [[ "${_models_table_sections[index]}" == "$section" ]] || continue
-        line="${_models_table_rows[index]}"
-        [[ -n "$line" && "${line%%=*}" == "$key" ]] && return 0
+        [[ "${_models_table_keys[index]}" == "$key" ]] && return 0
     done
     return 1
 }
@@ -439,6 +437,14 @@ agents_resolve() {
     _models_registry_read _agents_resolve_from_table "$@"
 }
 
+agents_resolve_claude_launcher() {
+    agents_resolve "$1" || return $?
+    if [[ "$AGENT_FAMILY" != claude ]]; then
+        printf '%s: Codex workers must use assign.sh.\n' "$2" >&2
+        return 2
+    fi
+}
+
 _agents_resolve_from_table() {
     local task="$1" function subtask family pair section configured allowed_families
 
@@ -582,10 +588,6 @@ agents_turn_service_tier() {
 
 _agents_turn_service_tier_from_table() {
     local task="${1:-delegate}"
-    if [[ ! -r "$MODELS_CONFIG_FILE" ]]; then
-        echo "ERROR: cannot read agent registry: $MODELS_CONFIG_FILE" >&2
-        return 1
-    fi
     [[ "$task" == *.* ]] || task="$task."
     _agents_resolve_service_tier "$task" codex || return
     printf '%s' "${AGENT_SERVICE_TIER:-default}"

@@ -4,7 +4,7 @@
 Usage: dailies_render.py [<input.json>] [--chart default|ascii] [--state <state.json>] [--log <log.md>] [--at <YYYY-MM-DDTHH:MM[±HH:MM]>]
        dailies_render.py --footer --zone <IANA zone> [--next-run <HH:MM[+N]>]
                          [--nothing-needed] [--at <YYYY-MM-DDTHH:MM[±HH:MM]>]
-                         [--below <outstanding.json>]... [--reports-to <root slug>] [--doc <production doc>]
+                         [--below <outstanding.json>]... [--reports-to <root name>] [--doc <production doc>]
 Both forms take [--outstanding <outstanding.json>].
 
 The input gives each subject's fields; this script owns the layout, so no line
@@ -42,11 +42,11 @@ production's own plumbing words (PLUMBING).
          missing file is an empty list.
 --below  With --footer, once per production below a root showrunner: that
          production's list. Its due items count with --outstanding. A list
-         that cannot be read adds the bullet `<slug>: needs-user list
-         unreadable`, where the slug is the file's name, and never fails the
+         that cannot be read adds the bullet `<name>: needs-user list
+         unreadable`, where the name is the file's name, and never fails the
          footer.
 --reports-to  With --footer, for a showrunner under a root: adds the bullet
-         `reports to <root slug>`.
+         `reports to <root name>`.
 --doc    With --footer, the production doc: the line after the header counts
          its changes, efficiency and proposals (footer_counts.py). A
          report reads the doc from its input's `doc`.
@@ -54,6 +54,10 @@ production's own plumbing words (PLUMBING).
 The input format is in ~/.claude/commands/showrunner/dailies.md.
 """
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import argparse
 import json
@@ -67,20 +71,15 @@ from pathlib import Path
 from typing import NamedTuple, cast
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "build_hold"))
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "mac_test"))
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "whoami"))
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from atomic_file import write_text_atomic
+from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.terminal_cells import terminal_width
 from scripts.whoami import run_out
 from scripts.whoami import note_file
 from scripts.whoami.run_out import READINGS_LOG, Reading
-from build_hold import ActiveHolders, HoldCycle, HoldState, KnownReleaseEta, NoHolders, Holder, ReleaseEntry, ReleaseRecordReadError, holder_directory, read_cycle, read_holders, release_record_error_line
-from mac_test import ActiveMacBlock, NoMacBlock, PendingMacBlock, ci_may_still_be_on, read_block, state_paths
-from update_registration import (
+from scripts.build_hold.build_hold import ActiveHolders, HoldCycle, HoldState, KnownReleaseEta, NoHolders, Holder, ReleaseEntry, ReleaseRecordReadError, holder_directory, read_cycle, read_holders, release_record_error_line
+from scripts.mac_test.mac_test import ActiveMacBlock, NoMacBlock, PendingMacBlock, ci_may_still_be_on, read_block, state_paths
+from scripts.production.update_registration import (
     DueNow as DueNow,
     DeferredUntil as DeferredUntil,
     Ranking as Ranking,
@@ -931,7 +930,7 @@ def check_plumbing(line: str, name: str) -> None:
 
 def read_outstanding(path: Path | None) -> list[Outstanding]:
     """Read reminders and questions from their owning stores, oldest first."""
-    from update_registration import read_open_fields
+    from scripts.production.update_registration import read_open_fields
 
     return parse_outstanding_entries(read_open_fields(path), path or Path("questions"))
 
@@ -1027,7 +1026,7 @@ def parse_unit(value: object, where: str, length: str) -> Unit:
         raise InputError(f"{where}.held: required; the reason the phase's checkpoint is not merged, or null when no checkpoint waits")
     unit = text(fields, "unit", where)
     name = optional_text(fields, "name", where) or unit
-    label = optional_text(fields, "label", where) or name.removesuffix("-unit")
+    label = optional_text(fields, "label", where) or name
     if len(label) > LABEL_LIMIT:
         raise InputError(f"{where}.label: {label!r} is longer than {LABEL_LIMIT}; give a short label")
     phase = text(fields, "phase", where)
@@ -1580,7 +1579,7 @@ def footer(
         items.append(mac_block_line(mac_block, zone))
     items.extend(line.removeprefix("- ") for line in agent_lines if line and line != "### Agents")
     # By name, so the lists keep one order however the tree was walked.
-    items.extend(f"{slug}: {UNREADABLE_LIST}" for slug in sorted(unreadable))
+    items.extend(f"{name}: {UNREADABLE_LIST}" for name in sorted(unreadable))
     if root:
         items.append(f"reports to {root}")
     # An item the user deferred stays hidden until its `after` time, in the report's zone.
@@ -1596,7 +1595,7 @@ def footer(
 
 def doc_counts(doc: Path | None) -> str | None:
     """The counts line for a production doc; the status line carries the question count."""
-    import footer_counts
+    from scripts.production import footer_counts
 
     return None if doc is None else footer_counts.counts_line(footer_counts.read_counts(doc))
 
@@ -1825,7 +1824,7 @@ def render(report: Report, previous: dict[str, LastUnitReport], resolved: dict[s
               or any(child.open for child in report.children))
     lines.extend(footer(now, zone, zone_name, report.next_run, report.build_hold, report.mac_block, outstanding,
                         nothing_needed=not needed, agent_lines=agent_section(now, zone, at=at),
-                        unreadable=[slug for child in report.children for slug in child.unreadable],
+                        unreadable=[name for child in report.children for name in child.unreadable],
                         root=report.reports_to, counts=doc_counts(report.doc)))
     return lines
 
@@ -1879,7 +1878,7 @@ def local_now(zone: str, where: str, at: str | None) -> tuple[datetime, str]:
 
 def footer_main(zone: str, next_run: str | None, at: str | None, outstanding_path: Path | None, *,
                 nothing_needed: bool, below: Sequence[Path] = (), root: str = "", doc: Path | None = None) -> int:
-    from update_registration import QuestionStaff, read_open_fields
+    from scripts.production.update_registration import QuestionStaff, read_open_fields
 
     unreadable: list[str] = []
     try:
@@ -1960,7 +1959,7 @@ def main(arguments: list[str]) -> int:
         resolved = resolve_eta_moments(report, previous, now)
         check_changes(report, previous, resolved)
         check_idle(report, now)
-        from update_registration import read_open_fields
+        from scripts.production.update_registration import read_open_fields
 
         outstanding = parse_outstanding_entries(
             read_open_fields(outstanding_path, document=report.doc),
