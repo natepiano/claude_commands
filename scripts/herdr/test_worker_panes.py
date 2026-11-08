@@ -481,7 +481,7 @@ class WorkerPaneTests(StaffTestCase):
         assert isinstance(second, worker_panes.OpenWorker)
         self.assertEqual(self.world.agent_names, ["unit-impl", "second-unit-impl"])
         self.assertEqual([first.row.name, second.row.name], ["impl", "impl"])
-        self.assertEqual([self.world.locations[result.pane]["label"] for result in (first, second)], ["impl", "impl"])
+        self.assertEqual([self.world.locations[result.pane]["label"] for result in (first, second)], ["unit-impl", "second-unit-impl"])
         self.assertEqual([first.row.parent, second.row.parent],
                          [staff.ReportsTo(self.parent.id), staff.ReportsTo(parent.id)])
 
@@ -1151,7 +1151,7 @@ class WorkerPaneTests(StaffTestCase):
         assert isinstance(opened, worker_panes.OpenWorker)
         self.assertEqual(opened.row, row)
         self.assertEqual(self.staff_state(), before)
-        self.assertEqual(self.world.launches, [herdr.SplitPane("w1:p0", "right", 0.667, "reviewer")])
+        self.assertEqual(self.world.launches, [herdr.SplitPane("w1:p0", "right", 0.667, "unit-reviewer")])
         self.assertEqual(self.prompts(), [])
         self.assertEqual(self.world.requests[0][1][:3], ["resume", row.current_session, "--no-daemon"])
 
@@ -1243,11 +1243,11 @@ class WorkerPaneTests(StaffTestCase):
         first = self.start("first")
         self.assertIsInstance(first, worker_panes.OpenWorker)
         assert isinstance(first, worker_panes.OpenWorker)
-        self.assertEqual(self.world.launches[0], herdr.SplitPane("w1:p0", "right", 0.25, "first"))
+        self.assertEqual(self.world.launches[0], herdr.SplitPane("w1:p0", "right", 0.25, "unit-first"))
         write_text_atomic(config, config.read_text().replace("WORKER_SPLIT_RATIO=0.25", "WORKER_SPLIT_RATIO=0.75"))
         second = self.start("second")
         self.assertIsInstance(second, worker_panes.OpenWorker)
-        self.assertEqual(self.world.launches[1], herdr.SplitPane(first.pane, "down", 0.75, "second"))
+        self.assertEqual(self.world.launches[1], herdr.SplitPane(first.pane, "down", 0.75, "unit-second"))
 
     def test_start_rerun_after_agent_exit_resumes_current_session_in_the_same_terminal(self) -> None:
         row = self.worker(family="codex")
@@ -1448,7 +1448,7 @@ class WorkerPaneTests(StaffTestCase):
                                                           "# range: 0.05..0.95\nWORKER_SPLIT_RATIO=0.95"))
         result = self.start()
         self.assertIsInstance(result, worker_panes.OpenWorker)
-        self.assertEqual(self.world.launches, [herdr.SplitPane("w1:p0", "right", 0.95, "impl2")])
+        self.assertEqual(self.world.launches, [herdr.SplitPane("w1:p0", "right", 0.95, "unit-impl2")])
 
     def test_invalid_live_ratio_uses_the_committed_ratio_and_prints_a_warning(self) -> None:
         for arguments in (("init", "-q"), ("add", "conf/direct.conf"),
@@ -1460,7 +1460,7 @@ class WorkerPaneTests(StaffTestCase):
         with redirect_stderr(io.StringIO()) as errors:
             result = self.start()
         self.assertIsInstance(result, worker_panes.OpenWorker)
-        self.assertEqual(self.world.launches, [herdr.SplitPane("w1:p0", "right", 0.667, "impl2")])
+        self.assertEqual(self.world.launches, [herdr.SplitPane("w1:p0", "right", 0.667, "unit-impl2")])
         self.assertIn("warning:", errors.getvalue())
 
     def test_invalid_registry_settings_are_reported_before_backend_creation(self) -> None:
@@ -1662,10 +1662,10 @@ class WorkerPaneTests(StaffTestCase):
         self.assertIsInstance(worker_panes.close(self.parent.id, staff.WorkerName.parse("a")), worker_panes.Closed)
         resumed = self.start("a")
         assert isinstance(resumed, worker_panes.OpenWorker)
-        self.assertEqual(self.world.launches[-1], herdr.SplitPane(second.pane, "down", 0.667, "a"))
+        self.assertEqual(self.world.launches[-1], herdr.SplitPane(second.pane, "down", 0.667, "unit-a"))
         third = self.start("c")
         self.assertIsInstance(third, worker_panes.OpenWorker)
-        self.assertEqual(self.world.launches[-1], herdr.SplitPane(resumed.pane, "down", 0.667, "c"))
+        self.assertEqual(self.world.launches[-1], herdr.SplitPane(resumed.pane, "down", 0.667, "unit-c"))
         self.assertEqual(self.world.closed, [(first.pane, first.terminal)])
 
     def test_layout_balances_each_split_in_a_nested_worker_column(self) -> None:

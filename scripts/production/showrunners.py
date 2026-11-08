@@ -517,7 +517,7 @@ def name_refusal(production_name: str, name: str) -> str:
     if not name:
         return f"the showrunner of {production_name} has no session name; name the session {production_name}"
     return (f"production {production_name} has showrunner {name}, and a production's name must be its showrunner's name; "
-            + f"rename the production first: `/showrunner:rename plan {production_name} {name}`")
+            + f"rename the production first: `/agents rename {production_name} {name}`")
 
 
 @dataclass(frozen=True)
