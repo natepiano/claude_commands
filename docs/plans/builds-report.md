@@ -528,7 +528,7 @@ The user, 2026-11-04, change review C948 (`buildlog costs`), through builds: the
 **Ruled out:** a per-kill `cached_property` (under 1 ms per report).
 
 ### Phase 26 — buildlog costs is gone and buildlog charts opens the shared build page  · status: todo
-**Depends on:** Phase 15; queue-unit's Phase 10m (the build page and its feed in the repo, drawing Phase 15's `page_data`)
+**Depends on:** Phase 15; queue-unit's Phase 10m (the build page and its feed in the repo, drawing Phase 15's `page_data`); a command that returns the shared page's tailnet link. Queue 10m (on builds at 72a6a3f4d) added `memory_feed.py` and `memory_live.html` but no such command; its name and owner wait on the user's answer (builds showrunner, 2026-11-08).
 
 From the builds showrunner (not the user), 2026-11-05: after queue 10m, delete `buildlog costs`, and `buildlog charts` prints the shared page's tailnet link, with a non-zero exit and a reason when there is no link. The user's C948 ruling (2026-11-04, through builds): the ranking lives on the one build page; hours show in the user's zone, with no seconds, UTC or microseconds; the Definitions block moves into the as-built doc.
 
@@ -539,7 +539,7 @@ From the builds showrunner (not the user), 2026-11-05: after queue 10m, delete `
 **Spec:**
 - Remove the `costs` command from `scripts/buildlog/cli.py` (usage line 7 and the branch at line 271) and `costs.main`, `costs.render_costs`, `costs.phase_line`, `FOOTER`, `OUTPUT_LINE_LIMIT` and `MAX_RANKED_ROWS` when no other caller remains (LSP `findReferences`). Keep `read_costs`, `aggregate_costs`, `collect_costs` and the types: `charts` reads them.
 - Move the `FOOTER` definitions into `docs/as-built/buildlog-memory-stalls.md` as plain sentences, in Simplified Technical English.
-- `charts.main` keeps its arguments (`--days 7|30`, `--no-open`). It stops writing `latest.html` and stops calling `present_page`'s publish path. It asks queue 10m's page command for the page's tailnet link (10m names it; read its as-built before the Work Order is used) and prints it, or opens it when a local display exists and `--no-open` is absent. With no link, it prints `buildlog charts: <reason>` to stderr and exits 1.
+- `charts.main` keeps its arguments (`--days 7|30`, `--no-open`). It stops writing `latest.html` and stops calling `present_page`'s publish path. It asks the shared page's link command for the page's tailnet link (named in **Depends on**) and prints it, or opens it when a local display exists and `--no-open` is absent. With no link, it prints `buildlog charts: <reason>` to stderr and exits 1.
 - Delete `render_html`, `publish`, `PAGE` and `chart_data` when no caller remains.
 - A test that calls `chart_data` and also proves a calculation keeps that proof. Change it to read the typed `ChartSet`, for example `test_exact_edges_assign_steps_phases_ci_and_moments_to_the_later_bucket` in `test_charts.py`. Delete only assertions about removed output.
 - Replace each `buildlog costs` instruction in the three as-built docs below with `buildlog charts`.
@@ -788,37 +788,68 @@ Measurement only; no code changed. Two full rebuilds ran on private copies of th
 - A value change to `INDEX_SPILL_PAGES` needs the user's approval first (builds showrunner, 2026-11-08).
 
 ### Phase 36 — A full rebuild of the build log index uses about a third of the memory · status: done
-**Depends on:** Phase 35
 
-From the builds showrunner (not the user), 2026-11-08: "Add-on ruling: current. Make it Phase 36 and start now. The config already intends a spill at 65536 pages, so this fixes a wrong result, and memory is natedev's scarcest resource. The value stays 65536. In the as-built, state the reader cost during a spilled update in one line. Measure one rebuild with spill on at a quiet load, if one comes, so the wall time is clean."
+#### As-built
+
+`INDEX_SPILL_PAGES` takes effect: an index update spills at 65,536 changed pages.
+- `scripts/buildlog/index.py` `open_for_update` runs `PRAGMA cache_spill = {INDEX_SPILL_PAGES}` and then `PRAGMA cache_spill = ON`. SQLite reads N as a boolean through 8 bits, so 65536 alone turns spill off; `ON` sets the flag and keeps the threshold.
+- `test_update_enables_the_configured_spill_threshold` checks that the writer reports the configured threshold.
+- One full rebuild (443 files, 276,466 records, load 47.2 to 68.9): peak RSS 1,378,896 KiB, 154.33 s wall, 98.01 CPU s, first spill at 9.975 s.
+
+**Files:**
+- `scripts/buildlog/index.py` — `open_for_update` enables spill.
+- `scripts/buildlog/test_index.py` — the spill threshold test.
+- `config/buildlog.conf` — `INDEX_SPILL_PAGES` basis comment; the value stays 65536.
+- `docs/as-built/buildlog-memory-stalls.md` — "Full rebuilds and spill, 2026-11-08": the measurements and the reader cost.
+
+**Gotchas:**
+- In rollback-journal mode a spill takes an exclusive lock. Direct readers that skip `index.update()` wait 30 s and fail (`database is locked`): `buildlog costs`, `buildlog moments` and charts. `complete_gate_index_in` raises `NoCompleteGateIndex` after 1 s; the step estimator falls back after 5 s.
+- A value change to `INDEX_SPILL_PAGES` needs the user's approval first (builds showrunner, 2026-11-08).
+
+### Phase 37 — Readers get their answer during a full rebuild of the build log index · status: todo
+**Depends on:** Phase 36
+
+From the builds showrunner (not the user), 2026-11-08: "I hold Phase 36 (419d9d038) and do not merge it alone. Reason: with spill on, a full rebuild makes costs and moments fail after 30 s, and charts show no index. That is a fault the user sees. Before this change, readers waited about 10 s. Requirement: a full rebuild keeps the low memory, and readers do not wait or fail during it. 1. Pick the mechanism yourself. Two options: rebuild into a side file and rename it over the index at the end, or WAL mode, if spill in WAL mode takes no exclusive lock. Measure the result before you choose. 2. Do it as Phase 37, or amend it into Phase 36. That choice is yours. 3. Send me the hash. I will chain 36 and the fix together. 4. In the measured run, show that a reader started during the rebuild returns its answer."
 
 #### Work Order
 
-**Goal:** `INDEX_SPILL_PAGES` takes effect: an index update spills at 65536 changed pages, so a full rebuild no longer holds every dirty page in memory (Phase 35: 3.75 GiB with spill off, 1.34 GiB with spill on).
+**Goal:** A full rebuild of the build log index keeps Phase 36's low memory (about 1.35 GiB peak), and a direct reader started during the rebuild returns its answer at once, with no lock wait and no error.
+
+**Mechanism: WAL mode.** In rollback-journal mode, a spill takes an exclusive lock on the database file, so every reader waits until the commit (Phase 36: `read_only()` failed after 30.214 s). In WAL mode, a spill writes changed pages to the `-wal` file and takes no exclusive lock; readers read the last committed snapshot. The side file was ruled out: the index file name is the schema digest (`index_path_in`), so a full rebuild happens when the current-schema file does not exist yet. With a side file, a reader during the rebuild finds no current file and fails at once.
 
 **Spec:**
-- `scripts/buildlog/index.py` `open_for_update`: after `PRAGMA cache_spill = {spill_pages}`, run `PRAGMA cache_spill = ON`. SQLite sets the spill flag from N read as a boolean through 8 bits (65536 gives off); `ON` sets the flag and keeps the size. One short comment states that SQLite fact.
-- A test in `scripts/buildlog/test_index.py`: a connection from `open_for_update` on a private root reports `PRAGMA cache_spill` equal to `INDEX_SPILL_PAGES` read from `config/buildlog.conf`. The test fails on the current code (it reads 0).
-- Measure one full rebuild with the new code, as in Phase 35: a private disk root with a copy of the live JSONL, no index file, `BUILDLOG_DIR` set, `/run/current-system/sw/bin/time -v`, through `mesh_runs.py start`. Record peak RSS, wall and CPU seconds, the first spill time, and the one-minute load at start and end. Start it when the one-minute load is 50 or less, comparable to Phase 35's spill-off run (48.4). If the load is above 50 at that point, run it anyway and report the load; do not wait in a loop.
-- During that rebuild, after the first spill, time one direct read through `index.read_only()` (no CLI, no update) and one `complete_gate_index_in` call on the same root. Record the wall time, the result or the error text.
-- `config/buildlog.conf`: rewrite the `INDEX_SPILL_PAGES` basis comment for spill in effect: the threshold, the measured full-rebuild peak RSS and wall time. The value stays 65536.
-- `docs/as-built/buildlog-memory-stalls.md`, "Calibration and gotchas": update the Phase 35 entry so it says spill is in effect; add the new figures, and one line on the reader cost during a spilled update.
+- `scripts/buildlog/index.py` `open_for_update`: set `PRAGMA journal_mode = WAL` on the writer connection before the schema check's `BEGIN IMMEDIATE` and before the spill settings; read back the result and raise if it is not `wal`. Put one short comment on why: spill in WAL mode takes no exclusive lock, so readers do not wait. An existing index in `delete` mode converts at its next update.
+- Keep `PRAGMA cache_spill = {INDEX_SPILL_PAGES}` and `PRAGMA cache_spill = ON` as they are.
+- Readers stay as they are (`read_only`, `read_only_path_uri`, `complete_gate_index_in`, the step estimator's `file_marks.read_only_uri` connections). Check that a `mode=ro` reader opens a WAL index both while the writer holds it open (`-wal` and `-shm` exist) and after the writer closed (no `-wal`). If a `mode=ro` reader fails in either case, stop and report; do not change the reader URI without a new Work Order.
+- `remove_index` and `cleanup_unused_indexes` already handle the `-wal` and `-shm` sidecars (`INDEX_SIDECAR_SUFFIXES`); keep them.
+- A test in `scripts/buildlog/test_index.py`: on a private root, open the writer with `open_for_update`, set a small spill threshold on that connection (for example `PRAGMA cache_size = 10` and `PRAGMA cache_spill = 10` then `ON`), `record the `-wal` size after the schema setup, `BEGIN IMMEDIATE`, insert enough rows to spill (assert the `-wal` file grew during the uncommitted transaction), then open `index.read_only()` with a short timeout and run a count query. It returns the committed count with no error. The test fails on the Phase 36 code (`database is locked`). Close the writer with `ROLLBACK`.
+- A test that `open_for_update` leaves `PRAGMA journal_mode` equal to `wal`.
+- Measure one full rebuild, as in Phase 36: a private disk root with a copy of the live JSONL, no index file, `BUILDLOG_DIR` set, `/run/current-system/sw/bin/time -v`, through `mesh_runs.py start`. Record peak RSS, wall and CPU seconds, the first spill time (the `-wal` file grows), the largest `-wal` size, the size of the index and any `-wal` after the run, and the one-minute load at start and end. Start when the one-minute load is 50 or less; if it is above 50, run anyway and report the load; do not wait in a loop.
+- During that rebuild, after the first spill, start these readers on the same root and record each wall time and its result or error text:
+  1. one direct read through `index.read_only()` with a count query;
+  2. one `complete_gate_index_in` call;
+  3. `buildlog costs` and `buildlog moments` as subprocesses with `BUILDLOG_DIR` set.
+  Each returns its answer (the last committed snapshot) in under 2 s with exit 0.
+- What a reader receives: the last committed snapshot. During the first rebuild of a new schema, that snapshot is the empty schema, so a reader returns an empty answer at once; before Phase 36 a direct reader also read that empty snapshot. Selecting an older completed index is not in this phase's scope. Record the row count each reader saw.
+- `config/buildlog.conf`: update the `INDEX_SPILL_PAGES` basis comment with the WAL figures. The value stays 65536.
+- `docs/as-built/buildlog-memory-stalls.md`, "Calibration and gotchas", the "Full rebuilds and spill" entry: state that the index uses WAL mode and why, add the Phase 37 figures, and replace the reader-cost line with the measured reader results. Name the disk cost: the `-wal` file grows to about the size of the rebuilt index during a full rebuild.
 - Delete the private root after the run.
 
 **Files:**
 - `scripts/buildlog/index.py` — `open_for_update`.
-- `scripts/buildlog/test_index.py` — the spill test.
+- `scripts/buildlog/test_index.py` — the reader-during-spill test and the journal mode test.
 - `config/buildlog.conf` — the basis comment.
 - `docs/as-built/buildlog-memory-stalls.md` — the calibration entry.
 
-**Workers:** 1 writer — `rowcpu` writes the code, the test, the measurement and both docs.
+**Workers:** 1 writer — `rowcpu` writes the code, the tests, the measurement and both docs.
 
-**State:** none. The private root is deleted after the run.
+**State:** the index file's journal mode changes to WAL; `-wal` and `-shm` sidecars exist while a connection is open. `remove_index` removes them.
 
-**Constraints from prior phases:** Phase 35: SQLite 3.51.2; 4096-byte pages; `cache_size=-2000`; rollback journal. CLI readers (`buildlog query`, `test_times show`) wait on the update file lock for the whole rebuild, with spill on or off. A value change to `INDEX_SPILL_PAGES` needs the user's approval first (builds showrunner, 2026-11-08). Never write the live build log, the live index or the live progress history.
+**Constraints from prior phases:** Phase 35: SQLite 3.51.2; 4096-byte pages; `cache_size=-2000`. Phase 36: `PRAGMA cache_spill = N` alone sets the flag from N through 8 bits; the `ON` line keeps spill on. CLI readers that call `index.update()` first (`buildlog query`, `test_times show`) wait on the update file lock for the whole rebuild; that wait is not in this phase's scope. A value change to `INDEX_SPILL_PAGES` needs the user's approval first (builds showrunner, 2026-11-08). Never write the live build log, the live index or the live progress history.
 
 **Acceptance gate:**
-- The new test passes, and fails with the `ON` line removed.
+- The reader-during-spill test passes, and fails on the Phase 36 code.
 - `python3 -m unittest discover -s scripts/buildlog -p 'test_index.py'` and `test_gate_index.py` pass.
 - `basedpyright scripts/buildlog/index.py scripts/buildlog/test_index.py` reports 0 errors, 0 warnings, 0 notes.
-- The summary gives the rebuild figures, the load, and the direct reader results; the conf comment and the as-built entry state the same figures.
+- The measured rebuild's peak RSS is within 10% of Phase 36's 1,378,896 KiB, and every reader in the list returns exit 0 or a result in under 2 s.
+- The summary gives the rebuild figures, the load, the `-wal` sizes and each reader result; the conf comment and the as-built entry state the same figures.
