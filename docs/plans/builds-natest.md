@@ -1869,3 +1869,43 @@ The six `LedgerTestCase` modules use 28% less CPU, with all tests kept. Same-loa
 
 **Gotchas:**
 - Path rewrites use `relative_to(template_repo.parent)` on the decoded JSON, never a text replace: a non-ASCII `TMPDIR` is escaped in the JSON text.
+
+### Phase 91 — The SSH result tests pass under load, whatever time an admission pass takes  · status: done
+**Depends on:** none
+
+#### Work Order
+
+**Source:** verify-unit and the showrunner, 2026-11-08. `direct/test_verify_ssh_targets_results.py` fails about 1 run in 4 on builds b7226bfa8 (3 of 10 runs on base 5f2d765c3). A red gate can come from it. The showrunner put this phase ahead of Phase 89.
+
+**Goal:** the SSH result tests pass 20 of 20 runs under load, and no result depends on wall time.
+
+**Spec:**
+1. Find the cause first. The failing cases are other-generation loss, Linux loss, probe interruption, and interruption with local state. Each fails with extra SSH attempts.
+2. verify-unit's trace (Linux loss, seconds from eligible start): E 0-1.121; R 1.764-2.903; L 4.444-5.065; R 8.520-9.503; L 11.427-12.424; R 14.180-14.967; L 17.771-19.543. Each later reserve follows a release wait, and the admission retry starts another SSH attempt.
+3. The fixture (`verify_ssh_targets_test_support.py`, `setUp`) and `config/build_admission.conf` both set `waiting_pass_seconds=1`. Under load, a pass takes longer than 1 s. The admission service reads the interval in `build_queue/admission_service.py` (`_read` and the pass that sets `next_pass`).
+4. Decide whether a real verify step can make the same extra SSH attempt under load. If it can, the defect is in production code that this unit does not own. Then stop. Write the evidence (trace, code path, file and line) in your summary, and change no production file.
+5. If only the fixture is at fault, make the result tests independent of wall time. Use a fake clock, or an explicit pass or poll count, through an existing test hook. Use a longer interval only for the result tests, and only when no clean hook exists. Give the reason in your summary.
+6. Keep every test and every assertion. Keep the exact attempt counts. Add no test and no production check.
+7. Do not raise the module's CPU. Measure CPU s, processes, execs and wall s before and after with `python3 scripts/test_times/module_cost.py`.
+8. Prove the fix with 20 runs of the result module under load, as one detached run. Run 10 runs of the base tree interleaved under the same load, for comparison.
+
+**Files:**
+- `scripts/direct/verify_ssh_targets_test_support.py`
+- `scripts/direct/test_verify_ssh_targets_results.py`
+
+**Workers:** 1 writer; one test file and its fixture do not split
+- `impl` — `test_verify_ssh_targets_results.py`, hub: `verify_ssh_targets_test_support.py`
+
+**Constraints from prior phases:**
+- Phase 5 split the SSH target tests into five modules over one fixture and set the 1 s interval. The fixture comment says the interval also bounds admission socket reads.
+- Six modules import the fixture: `test_verify_ssh_targets.py`, `test_verify_ssh_targets_results.py`, `test_verify_ssh_targets_retained.py`, `test_verify_ssh_targets_retry.py`, `test_verify_ssh_targets_routing.py` and `test_verify_routing_rule.py`.
+- Test rules 1 and 2 (the user, 2026-11-07): a fix adds rows to existing tests; a rare-case test stays only where its defect matters.
+- Tests never read or write live state: `~/.claude` main, `~/.local/state/merge-gate`, `/tmp/claude`.
+
+**Acceptance gate:**
+- 20 of 20 result-module runs pass under load. The base comparison shows its failure rate under the same load.
+- No assertion is removed or weakened. The attempt counts stay exact.
+- CPU s, processes, execs and wall s before and after, from `module_cost.py`.
+- Every importer of the fixture passes.
+- the targeted test green on the phase commit merged with `origin/builds`
+- `basedpyright` on the changed files prints `0 errors, 0 warnings, 0 notes`
