@@ -251,6 +251,23 @@ Each host with a counted pair gets one line, `<host>: CPU some X%, full Y%; IO s
 
 ## Calibration and gotchas
 
+- **Full rebuilds and spill, 2026-11-08.** SQLite 3.51.2 reads the spill boolean through 8 bits.
+  `PRAGMA cache_spill = 65536` disables spill because `65536 & 255 = 0`.
+  Both trials used 4096-byte pages, `cache_size=-2000`, rollback journal mode `delete`, and separate private disk roots.
+  Run 1 copied 443 JSONL files with 1,247,655,070 bytes and indexed 276,226 records.
+  It took 132.73 s wall and 102.02 s CPU, with peak RSS 3,846,340 KiB (3,756.2 MiB).
+  Its `cache_spill` getter returned 0; it held every dirty page until commit.
+  Its six late readers waited 9.404–10.919 s during commit, not during a spill.
+  Run 2 copied 443 JSONL files with 1,247,920,323 bytes and indexed 276,363 records.
+  A trial wrapper applied `PRAGMA cache_spill = ON` after `open_for_update` and confirmed `cache_spill=65536` on the writer connection.
+  It took 252.73 s wall and 109.89 s CPU, with peak RSS 1,372,548 KiB (1,340.4 MiB).
+  The database first grew past its 307,200-byte schema at 11.523 s, when the first spill occurred.
+  Query/report pairs started near that spill and at 50% and 90% of run 1's final index size.
+  Their wall times were 241.254/245.754 s, 166.623/174.815 s, and 43.593/46.620 s.
+  All twelve readers exited 0 and read the new index; neither private root had an older index.
+  These CLI calls waited on the update file lock; they did not measure the 30-second direct SQL timeout.
+  Machine load and the copied records differed, so these runs do not isolate the effect on wall time.
+  `INDEX_SPILL_PAGES` remains 65536; only the trial wrapper enabled spill.
 - **The 5-minute gap rule.** `MAX_SAMPLE_GAP_S = 300`, five 60 s intervals. A counter rise across a longer gap cannot be placed on a day, so it is dropped. That happens when the timer stopped or the machine was off. A `boot_id` change also makes the interval unknown; a new counter cannot reveal its start time.
 - **Temp-folder steps are in the stall table.** They appear as `scratch (temp folders)` (`SCRATCH_LABEL`), and they count in every step's "at once". `SCRATCH` matches a cwd under `/tmp/`, `/var/folders/` or `/private/var/folders/`.
 - **Linux only.** `buildlog sample` without any of its three `/proc` files prints one line and exits 1. That includes a Linux kernel without PSI. A malformed `/proc/pressure/memory` raises and writes no row, and the next minute tries again. Step stalls need the systemd scope as well: a user manager, `systemd-run`, and `BUILDLOG_SCOPE` not set to `0`. That means natedev only, the same as `peak_mem_bytes`.
