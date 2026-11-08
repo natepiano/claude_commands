@@ -64,7 +64,6 @@ class CodexHook:
 
     @property
     def timeout(self) -> int:
-        """Whole seconds: Codex refuses the whole hooks file when a timeout is not an integer."""
         if self.name == "scratch-guard":
             from scripts.copies.copy_guard import hook_timeout
             return math.ceil(hook_timeout())
@@ -162,20 +161,17 @@ def _command_binary() -> str:
     return os.path.abspath(found) if found else os.path.join(_home(), ".local", "bin", "codex")
 
 
-def _matching_group(group: object, hook: CodexHook) -> bool:
+def _managed_handlers(group: object, hook: CodexHook) -> list[dict[str, object]]:
     if not isinstance(group, dict):
-        return False
+        return []
     fields = cast(dict[str, object], group)
     if fields.get("matcher") != hook.matcher or not isinstance(fields.get("hooks"), list):
-        return False
+        return []
     handlers = cast(list[object], fields["hooks"])
-    return any(
-        isinstance(handler, dict)
+    return [cast(dict[str, object], handler) for handler in handlers if isinstance(handler, dict)
         and cast(dict[str, object], handler).get("type") == "command"
         and cast(dict[str, object], handler).get("command") == hook.command
-        and cast(dict[str, object], handler).get("timeout") == hook.timeout
-        for handler in handlers
-    )
+    ]
 
 
 def _is_retired_handler(handler: object) -> bool:
@@ -185,8 +181,16 @@ def _is_retired_handler(handler: object) -> bool:
     return entry.get("type") == "command" and entry.get("command") == RETIRED_COMMAND
 
 
-def _remove_retired_handlers(hooks: dict[str, object], path: str) -> bool:
+class HandlerRepairs(NamedTuple):
+    """File changes and retired removals that can move trust keys."""
+
+    changed: bool
+    retired_removed: bool
+
+
+def _repair_handlers(hooks: dict[str, object], path: str) -> HandlerRepairs:
     changed = False
+    retired_removed = False
     needs_manual_removal = False
     for groups in hooks.values():
         if not isinstance(groups, list):
@@ -200,11 +204,17 @@ def _remove_retired_handlers(hooks: dict[str, object], path: str) -> bool:
                 continue
             entries = cast(list[object], handlers)
             kept = [handler for handler in entries if not _is_retired_handler(handler)]
-            changed |= len(kept) != len(entries)
+            removed = len(kept) != len(entries)
+            retired_removed |= removed
+            changed |= removed
             for handler in kept:
                 if not isinstance(handler, dict):
                     continue
                 entry = cast(dict[str, object], handler)
+                timeout = entry.get("timeout")
+                if isinstance(timeout, float) and math.isfinite(timeout):
+                    entry["timeout"] = math.ceil(timeout)
+                    changed = True
                 command = entry.get("command")
                 if entry.get("type") == "command" and isinstance(command, str) and "post-tool-use-mul-add.py" in command:
                     needs_manual_removal = True
@@ -212,7 +222,7 @@ def _remove_retired_handlers(hooks: dict[str, object], path: str) -> bool:
             fields["hooks"] = kept
     if needs_manual_removal:
         print(f"{path}: remove the remaining retired script handler by hand", file=sys.stderr)
-    return changed
+    return HandlerRepairs(changed, retired_removed)
 
 
 def _install_file(path: str, binary: str, codex_home: str) -> list[HandlerTrustIdentity]:
@@ -226,20 +236,21 @@ def _install_file(path: str, binary: str, codex_home: str) -> list[HandlerTrustI
     else:
         document = {"hooks": {}}
     hooks = _object(document.get("hooks"), f"{path} hooks")
-    removed = _remove_retired_handlers(hooks, path)
-    changed = removed
+    repairs = _repair_handlers(hooks, path)
+    changed = repairs.changed
     for hook in HOOKS:
         groups_value = hooks.setdefault(hook.event, [])
         if not isinstance(groups_value, list):
             raise HookError(f"{path}: invalid {hook.event} groups")
         groups = cast(list[object], groups_value)
-        if not any(_matching_group(group, hook) for group in groups):
+        managed = [handler for group in groups for handler in _managed_handlers(group, hook)]
+        if not any(handler.get("timeout") == hook.timeout for handler in managed):
             groups.append({"matcher": hook.matcher, "hooks": [hook.handler()]})
             changed = True
     if not changed:
         return []
     previously_trusted: list[HandlerTrustIdentity] = []
-    if removed:
+    if repairs.retired_removed:
         server = AppServer(binary, codex_home)
         try:
             _initialize(server)
@@ -340,7 +351,7 @@ class AppServer:
                 continue
             if "error" in response:
                 error = _object(response["error"], "RPC error")
-                raise HookError(str(error.get("message", error)))
+                raise HookError(f"{method}: {error.get('message', error)}")
             return _object(response.get("result"), f"{method} result")
 
 
@@ -359,7 +370,13 @@ def _listed_hook_entries(server: AppServer, path: str) -> list[dict[str, object]
         raise HookError("invalid hooks/list data")
     entries: list[dict[str, object]] = []
     for workspace in cast(list[object], data):
-        hooks = _object(workspace, "hooks/list workspace").get("hooks")
+        fields = _object(workspace, "hooks/list workspace")
+        for kind in ("warnings", "errors"):
+            messages = fields.get(kind)
+            if isinstance(messages, list):
+                for message in cast(list[object], messages):
+                    print(f"codex hooks: hooks/list {kind}: {message}", file=sys.stderr)
+        hooks = fields.get("hooks")
         if not isinstance(hooks, list):
             raise HookError("invalid hooks/list hooks")
         for candidate in cast(list[object], hooks):
@@ -416,18 +433,18 @@ def _restore_moved_trust(
     return True
 
 
+def _listed_fields(hook: CodexHook) -> dict[str, object]:
+    return {"command": hook.command, "eventName": hook.listed_event(), "matcher": hook.matcher,
+            "handlerType": "command", "timeoutSec": hook.timeout}
+
+
 def _select_hooks(entries: list[dict[str, object]]) -> dict[CodexHook, LocatedHook | MissingHook]:
     selected: dict[CodexHook, LocatedHook | MissingHook] = {hook: MissingHook(hook) for hook in HOOKS}
+    definitions = {hook: _listed_fields(hook) for hook in HOOKS}
     for entry in entries:
-        hook = next((hook for hook in HOOKS
-                     if entry.get("command") == hook.command
-                     and entry.get("eventName") == hook.listed_event()
-                     and entry.get("matcher") == hook.matcher), None)
-        if (
-            hook is None
-            or entry.get("handlerType") != "command"
-            or entry.get("timeoutSec") != hook.timeout
-        ):
+        hook = next((hook for hook, fields in definitions.items()
+                     if all(entry.get(field) == value for field, value in fields.items())), None)
+        if hook is None:
             continue
         key = entry.get("key")
         current_hash = entry.get("currentHash")
@@ -451,6 +468,19 @@ def _status(entry: LocatedHook | MissingHook) -> str:
     return "disabled" if not entry.enabled else entry.trust_status
 
 
+def _failure(entry: LocatedHook | MissingHook, listed: list[dict[str, object]]) -> str:
+    if isinstance(entry, LocatedHook):
+        return f"{entry.hook.name}: trustStatus={entry.trust_status!r}, enabled={entry.enabled!r}"
+    expected = _listed_fields(entry.hook)
+    candidates = [value for value in listed if value.get("command") == entry.hook.command]
+    if not candidates:
+        return f"{entry.hook.name}: hooks/list has no command {entry.hook.command!r}"
+    closest = max(candidates, key=lambda value: sum(value.get(field) == wanted for field, wanted in expected.items()))
+    differences = [f"{field}: expected {wanted!r}, got {closest.get(field)!r}"
+                   for field, wanted in expected.items() if closest.get(field) != wanted]
+    return f"{entry.hook.name}: hooks/list " + "; ".join(differences)
+
+
 def _run(action: str) -> int:
     codex_home = _codex_home()
     binary = _command_binary()
@@ -468,7 +498,8 @@ def _run(action: str) -> int:
                 entry = entries[hook]
                 if isinstance(entry, LocatedHook) and entry.trust_status in {"untrusted", "modified"}:
                     _trust_handlers(server, {entry.key: {"trusted_hash": entry.current_hash}})
-                    entries = _select_hooks(_listed_hook_entries(server, path))
+                    listed = _listed_hook_entries(server, path)
+                    entries = _select_hooks(listed)
     finally:
         server.close()
     success = all(isinstance(entry, LocatedHook) and entry.trust_status == "trusted" and entry.enabled
@@ -479,6 +510,8 @@ def _run(action: str) -> int:
             print(f"{hook.name} codex hook: trusted {entry.key}")
         else:
             print(f"{hook.name} codex hook: {_status(entry)}")
+        if not isinstance(entry, LocatedHook) or entry.trust_status != "trusted" or not entry.enabled:
+            print(f"codex hooks: {action}: {_failure(entry, listed)}", file=sys.stderr)
     return 0 if success else 1
 
 
@@ -489,7 +522,7 @@ def main() -> int:
     try:
         return _run(sys.argv[1])
     except (HookError, OSError) as error:
-        print(f"codex hooks: {error}", file=sys.stderr)
+        print(f"codex hooks: {sys.argv[1]}: {error}", file=sys.stderr)
         return 1
 
 

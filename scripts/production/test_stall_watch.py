@@ -1932,6 +1932,7 @@ always=natedev
                         self.assertFalse(stretch["tell_sent"])
 
     def test_latest_transcript_wait_on_natedev_overrides_a_stale_pane(self) -> None:
+        _ = showrunner_relationship("natedev")
         self.panes["unit-one"]["pane"] = "— holding: waiting on the second blind code reviewer\n"
         transcript = self.projects / "project/204f532d-a97a-59e7-a6a7-caf86af3f5ee.jsonl"
         waiting = "— holding: no job: waiting on natedev for the next assignment"
@@ -2233,10 +2234,12 @@ always=natedev
                         self.assertFalse(stall_watch.saved_stretch(path)["bump_sent"])
 
     def test_own_work_order_and_own_names_do_not_hold_the_unit(self) -> None:
+        self.configure({"showrunner": ["unit-one"], "sdlc": ["style"]})
         for status in ("— holding: … until the Codex worker work order goes out",
                        "holding: waiting on unit-one",
                        "holding: waiting on label-of-unit-one",
-                       "holding: waiting on different-remote-name"):
+                       "holding: waiting on different-remote-name",
+                       "— holding: waiting on the style review"):
             with self.subTest(status=status):
                 self.send_log.unlink(missing_ok=True)
                 self.state.mkdir(exist_ok=True)
@@ -2255,19 +2258,31 @@ always=natedev
 
     def test_holding_names_a_peer_or_showrunner_anywhere_in_the_line(self) -> None:
         self.configure({"showrunner": ["unit-one", "typesafe"]})
-        for party in ("typesafe", "showrunner"):
-            with self.subTest(party=party):
+        _ = showrunner_relationship("sdlc")
+        row = unit_membership("showrunner", "unit-one")
+        peer_row = unit_membership("showrunner", "typesafe")
+        cases = (
+            ("showrunner", "holding: typesafe must provide the next result", "holding"),
+            ("showrunner", "holding: showrunner must provide the next result", "holding"),
+            ("natedev", "— holding: waiting on sdlc's message that the result is ready", "waiting"),
+        )
+        for production, status, decision in cases:
+            with self.subTest(production=production, status=status):
+                owner = showrunner_relationship(production)
+                _ = staff.move(row.id, staff.ReportsTo(owner.id))
+                _ = staff.move(peer_row.id, staff.ReportsTo(owner.id))
+                self.configure({production: ["unit-one", "typesafe"]})
+                _ = self.record_session(os.getpid(), owner.current_session, production)
                 self.send_log.unlink(missing_ok=True)
                 self.state.mkdir(exist_ok=True)
                 for path in self.state.glob("*.json"):
                     path.unlink()
-                status = f"holding: {party} must provide the next result"
                 self.panes["unit-one"]["pane"] = status + "\n"
                 for at in (START, START + 300, START + 600):
                     result = self.tick(at)
                     self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(self.sent(), [])
-                self.assertIn("inspected showrunner/unit-one: holding", result.stdout)
+                self.assertIn(f"inspected {production}/unit-one: {decision}", result.stdout)
 
     def test_own_shown_label_in_a_shared_session_does_not_hold_the_unit(self) -> None:
         self.panes["unit-one"].update(session="agents", label="build-unit",
