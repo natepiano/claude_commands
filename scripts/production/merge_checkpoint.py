@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
 """Merge, test, push, promote, and record one production checkpoint.
 
 A unit checkpoint commit without its Change-Review line is held before the merge. After the push,
@@ -46,6 +46,7 @@ from scripts.lib.atomic_file import write_text_atomic  # noqa: E402
 from scripts.message import sessions  # noqa: E402
 from scripts.lib.process_failure import failure_detail  # noqa: E402
 from scripts.lib import conf  # noqa: E402
+from scripts.message import session_send  # noqa: E402
 
 # /zone queues a change for the Mac while it is offline; a promotion's Mac pull sends it.
 ZONE_SCRIPT = Path(__file__).resolve().parents[1] / "lib/zone.py"
@@ -115,6 +116,7 @@ class Unit(NamedTuple):
     plan: Path
     worktree: Path
     branch: str
+    staff_id: staff.StaffId
 
 
 class UnitUnavailable(NamedTuple):
@@ -237,7 +239,7 @@ def unit_from_row(row: staff.StaffRow, resolver: session_staff.RowResolver) -> U
         return UnitUnavailable(name, config.reason)
     plan = (config.plan.path if isinstance(config.plan, unit_config.PlanFile)
             else Path("standby" if isinstance(config.plan, unit_config.StandbyPlan) else "permanent"))
-    return Unit(name, plan, location.path, branch.name)
+    return Unit(name, plan, location.path, branch.name, row.id)
 
 
 def parse_merge_tests(lines: list[str], checkout: Path) -> tuple[tuple[str, ...], ...]:
@@ -404,9 +406,9 @@ def ancestry(request: MergeRequest) -> bool:
                    "push your branch to origin and resend the checkpoint")
     already = git(checkout, "merge-base", "--is-ancestor", request.commit,
                   request.production.merge_branch).returncode == 0
-    if not isinstance(request.kind, CodeCheckpoint) and not any(
-            entry.unit == request.unit.name and entry.phase == request.phase
-            for entry in merged_checkpoints(request.production, record=request.staff_record)):
+    if not isinstance(request.kind, CodeCheckpoint) and good(git(
+            checkout, "rev-list", "--no-merges",
+            f"{request.production.merge_branch}..{request.commit}^"), "ancestry"):
         raise Stop("ancestry", "held", f"phase {request.phase} code checkpoint has not merged",
                    "wait for the phase code checkpoint to merge, then resend the shrink")
     report("ancestry", "ok", f"checkpoint exists and is on {origin_branch}" +
@@ -435,7 +437,8 @@ def checkpoint_step_record(checkout: Path, merge_head: str, step: str) -> Path:
 
 
 def record_publication_changes(production: ProductionDocument, *, report_unchanged: bool = True,
-                               record: staff.StaffSnapshot | None = None) -> None:
+                               record: staff.StaffSnapshot | None = None,
+                               known_producer: change_review.KnownMergeProducer | change_review.UnknownProducer = change_review.UNKNOWN_PRODUCER) -> None:
     """Scan published merges after every promotion step succeeds."""
     doc = change_review.list_path(production.doc, record=record)
     if doc is None:
@@ -443,7 +446,8 @@ def record_publication_changes(production: ProductionDocument, *, report_unchang
             report("change review", "ok", "the production doc has no Change review line; no rows written")
         return
     try:
-        rows = change_review.list_ready(production.checkout, production.doc, production.merge_branch, record=record)
+        rows = change_review.list_ready(production.checkout, production.doc, production.merge_branch, record=record,
+                                        known_producer=known_producer)
     except (change_review.ChangeReviewError, OSError) as error:
         report("change review", "failed", f"{doc} not written: {error}; retry after the repair")
         return
@@ -644,7 +648,7 @@ def test_steps(production: ProductionDocument, paths: tuple[str, ...],
     verify_command = [verify] if os.access(verify, os.X_OK) else ["bash", verify]
     steps = [CheckpointTestStep(f"package {package.name}", [*verify_command, "test", package.name], package.folder)
              for package in sorted(packages)]
-    steps.extend(CheckpointTestStep(f"example {package}/{name}", [*verify_command, "example", package, name], checkout)
+    steps.extend(CheckpointTestStep(f"example {package}/{name}", [*verify_command, "example", package, "--name", name], checkout)
                  for package, name in sorted(examples))
     steps.extend(CheckpointTestStep(f"merge test {index}", list(command), checkout)
                  for index, command in enumerate(merge_tests, 1))
@@ -1131,6 +1135,8 @@ class BumpGateRecord(TypedDict):
     tip: str
     checkpoint: str
     production_doc: str
+    owner_id: str
+    unit_id: str
     name: str
     merge_branch: str
     checkout: str
@@ -1194,7 +1200,7 @@ def send_result(path: Path, record: BumpGateRecord) -> None:
         red = current["result"] == "red"
         text = (f"Bump gate {'red' if red else 'green'}: {current['unit']}; tip {current['tip']}; "
                 + f"{current['detail']}; log {current['log']}")
-        script = tool("send.py", Path(__file__).resolve().parents[1] / "message/send.py", "MERGE_CHECKPOINT_SEND")
+        script = tool("send.py", session_send.SEND_SCRIPT, "MERGE_CHECKPOINT_SEND")
         recipients: tuple[Literal["unit", "showrunner"], ...] = ("unit", "showrunner") if red else ("showrunner",)
         delivered = current.get("delivered_to", [])
         current["delivered_to"] = delivered
@@ -1203,12 +1209,12 @@ def send_result(path: Path, record: BumpGateRecord) -> None:
                 continue
             for attempt in (1, 2):
                 try:
-                    unit_address, showrunner_address = bump_gate_addresses(current["name"], current["unit"])
-                    address = unit_address if recipient == "unit" else showrunner_address
-                    if not address:
-                        raise ValueError(f"no current {recipient} address for {current['name']}/{current['unit']}")
+                    members = staff.snapshot().rows_by_id
+                    owner = members[staff.StaffId(current["owner_id"])]
+                    target = members[staff.StaffId(current["unit_id"])] if recipient == "unit" else owner
+                    address = f"session:{target.current_session}"
                     result = subprocess.run(
-                        [PYTHON, script, "--to", address, "--from", current["name"], "--text", text],
+                        [sys.executable, script, "--to", address, "--from", owner.name, "--text", text],
                         capture_output=True, text=True, check=False,
                     )
                     if result.returncode:
@@ -1216,7 +1222,7 @@ def send_result(path: Path, record: BumpGateRecord) -> None:
                     delivered.append(recipient)
                     save_record(path, current)
                     break
-                except (OSError, ValueError) as error:
+                except (OSError, ValueError, KeyError) as error:
                     print(f"bump gate send {recipient} attempt {attempt} failed: {error}", flush=True)
 
 
@@ -1238,9 +1244,13 @@ def start_gate(request: MergeRequest, paths: tuple[str, ...], merge_head: str, t
     resume_delivery = False
     launch_failure = ""
     log = path.with_name("bump-gate.log")
+    members = request.staff_record if request.staff_record is not None else staff.snapshot()
+    unit = next(row for row in members.find(kind="unit", parent=request.production.owner.id)
+                if row.name == request.unit.name)
     record: BumpGateRecord = {
         "tip": tip, "checkpoint": request.commit,
         "production_doc": str(request.production.doc), "name": request.production.name,
+        "owner_id": str(request.production.owner.id), "unit_id": str(unit.id),
         "merge_branch": request.production.merge_branch, "checkout": str(request.production.checkout),
         "production_log": str(request.production.log.relative_to(request.production.checkout)),
         "zone": str(request.production.zone), "unit": request.unit.name,
@@ -1304,25 +1314,6 @@ def deliver_gate_result(request: MergeRequest, merge_head: str, tip: str) -> Non
         send_result(path, record)
 
 
-def bump_gate_addresses(name: str, unit: str) -> tuple[str, str]:
-    """Resolve recipients through the production's current unit and showrunner lookup."""
-    from scripts.production import showrunners
-
-    unit_address = ""
-    showrunner_address = ""
-    try:
-        found = unit_lookup.labeled_session(name, unit)
-        if found is not None and isinstance(found.claude, unit_lookup.LiveClaude):
-            unit_address = f"session:{found.claude.session_id}"
-    except OSError as error:
-        report("bump gate notice", "failed", str(error))
-    try:
-        showrunner_address = showrunners.current_address(name)
-    except (OSError, ValueError) as error:
-        report("bump gate notice", "failed", str(error))
-    return unit_address, showrunner_address
-
-
 def run(request: MergeRequest) -> int:
     try:
         if request.staff_record is None:
@@ -1359,7 +1350,8 @@ def run(request: MergeRequest) -> int:
             paths = changed_paths(request, f"{merge_head}^1")
         if isinstance(pushed, NotYetPushed) and change_review.list_path(request.production.doc, record=request.staff_record) is not None:
             try:
-                _ = change_review.publication_changes(commits, request.production.doc, record=request.staff_record)
+                _ = change_review.publication_changes(commits, request.production.doc, record=request.staff_record,
+                                                       known_producer=request.unit.staff_id)
             except (change_review.ChangeReviewError, OSError) as error:
                 undo_unpushed_merge(request.production, merge_head)
                 raise Stop("change review", "failed", f"{error}: the staff record is read before the push",
@@ -1413,7 +1405,8 @@ def run(request: MergeRequest) -> int:
                 record_pushed_merges(request.production, merge_head, request.commit, tip, phase_id=request.phase,
                                      issue=str(request.unit.plan))
                 notify_published_style(request.production, merge_head, tip)
-        record_publication_changes(request.production, record=request.staff_record)
+        record_publication_changes(request.production, record=request.staff_record,
+                                   known_producer=change_review.KnownMergeProducer(merge_head, request.unit.staff_id))
         promotion_done.parent.mkdir(parents=True, exist_ok=True)
         promotion_done.touch()
         record(request, merge_head, tests_green)
@@ -1544,7 +1537,7 @@ def record_handoff_merge(request: ChildHandoffRequest, merge_head: str) -> None:
 
 
 def acknowledge_handoff(request: ChildHandoffRequest, merge_head: str) -> None:
-    script = tool("send.py", Path(__file__).resolve().parents[1] / "message/send.py", "MERGE_CHECKPOINT_SEND")
+    script = tool("send.py", session_send.SEND_SCRIPT, "MERGE_CHECKPOINT_SEND")
     try:
         address = child_runner("address", request.child.name)
         if not address:

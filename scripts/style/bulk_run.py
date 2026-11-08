@@ -794,13 +794,8 @@ def plan_constants(repo: Path, ledger: ledger_api.Ledger, base: str, selected: S
             findings.append(current)
     # Target discovery shares the frozen manifest/path reader with source ownership.
     # No export is needed; snapshots never consult untracked files or write sources.
-    entries = git(repo, "ls-tree", "-rz", base).split("\0")
-    blobs: dict[str, str] = {}
-    for entry in filter(None, entries):
-        header, path = entry.split("\t", 1)
-        mode, kind, blob = header.split()
-        if kind == "blob" and mode in {"100644", "100755"}:
-            blobs[path] = blob
+    blobs = {path: entry.object for path, entry in ledger_api.tree_entries(repo, base).items()
+             if entry.kind == "blob" and entry.mode in ledger_api.REGULAR_FILE_MODES}
     contents = {path: data for path, data in ledger_api.blob_contents(repo, blobs)}
     members = rules.workspace_members({path: data.decode() for path, data in contents.items()
                                       if Path(path).name == "Cargo.toml"})
@@ -1016,12 +1011,12 @@ def tested_tree_proof(checkout: Path, tree: str, runner: Runner, times: dict[str
     """Test and lint the exact clean tree, then require its machine-wide final pass record.
 
     Keep all evidence checks here. A zero command exit alone never authorizes publication.
-    The query fails closed until builds' final-pass integration is available.
+    The query fails closed until the saved final pass integration is available.
     """
     require_test_tree(checkout, tree)
     verify = str(Path.home() / ".claude/scripts/direct/verify.sh")
     for stage, arguments in (("verify_final", ("final",)), ("verify_lint", ("lint",)),
-                             ("final_pass", ("final-pass", tree))):
+                             ("final_pass", ("final", "--saved", "--tree", tree))):
         started = time.monotonic()
         try:
             result = runner(checkout, ("bash", verify, *arguments))

@@ -5,6 +5,9 @@ from __future__ import annotations
 import ctypes
 import errno
 import os
+from pathlib import Path
+import tempfile
+import threading
 import time
 import unittest
 from unittest import mock
@@ -13,7 +16,9 @@ from scripts.direct.verify_hold_wait_test_support import (
     VerifyHoldWaitFixture,
     grant_call,
     read_cycle_file,
+    release_registered_call,
 )
+from scripts.direct.wait_for_test_state import wait_until
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
@@ -80,6 +85,89 @@ class VerifyHoldWaitTests(VerifyHoldWaitFixture):
              self.assertRaises(OSError) as failed:
             _ = local_release_wait.local_release_waiter(self.fixture.root, self.fixture.root)
         self.assertEqual(failed.exception.errno, errno.EMFILE)
+
+    def test_fixture_releases_a_call_when_a_scanned_directory_disappears(self) -> None:
+        from scripts.lib import inotify
+
+        self.hold()
+        vanished = self.fixture.root / "watch-race" / "nested" / "vanished"
+        vanished.mkdir(parents=True)
+        removed = threading.Event()
+        add_watch = inotify.add_watch
+
+        def remove_before_watch(descriptor: int, path: Path, mask: int) -> int:
+            if path == vanished:
+                vanished.rmdir()
+                removed.set()
+            return add_watch(descriptor, path, mask)
+
+        with mock.patch.object(inotify, "add_watch", side_effect=remove_before_watch), \
+             release_registered_call(self.cycle_file):
+            result = self.fixture.verify("test", "sample", "--local", "directory removal", "--filter", "smoke")
+        self.assertTrue(removed.is_set(), "The directory must disappear before the watch.")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(len(self.fixture.local_runs()), 1)
+
+
+class ReleaseDeadlineTests(unittest.TestCase):
+    def test_wait_returns_by_its_deadline_when_irrelevant_events_never_stop(self) -> None:
+        from scripts.direct.local_release_wait import LocalReleaseEvents
+
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            with LocalReleaseEvents(directory, directory) as waiter:
+                waiter.arm()
+                noise = directory / ".noise"
+                noise.touch()
+                batch = os.read(waiter.descriptor, 65536)
+                _ = noise.write_text("noise")
+                duration = 0.05
+                deadline = time.monotonic() + duration
+                limit = deadline + 5
+
+                def continuous_events(descriptor: int, size: int) -> bytes:
+                    del descriptor, size
+                    if time.monotonic() >= limit:
+                        raise AssertionError("The wait must return while events continue.")
+                    return batch
+
+                with mock.patch.object(os, "read", side_effect=continuous_events):
+                    waiter.wait(duration)
+                finished = time.monotonic()
+                self.assertGreaterEqual(finished, deadline)
+                self.assertLess(finished, limit)
+
+
+class OpenLogWaitTests(unittest.TestCase):
+    def test_shared_wait_reads_a_line_before_the_writer_closes(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            log = directory / "output.log"
+            log.touch()
+            write = threading.Event()
+            close = threading.Event()
+
+            def writer() -> None:
+                with log.open("a") as stream:
+                    if write.wait(TEST_HANG_GUARD_SECS):
+                        _ = stream.write("ready\n")
+                        stream.flush()
+                        _ = close.wait(TEST_HANG_GUARD_SECS)
+
+            def ready() -> bool:
+                found = "ready\n" in log.read_text()
+                write.set()
+                return found
+
+            worker = threading.Thread(target=writer)
+            worker.start()
+            try:
+                wait_until(ready, directory, watch_writes=True)
+                self.assertIn("ready\n", log.read_text())
+                self.assertTrue(worker.is_alive(), "The writer must keep the log open.")
+            finally:
+                close.set()
+                worker.join(TEST_HANG_GUARD_SECS)
 
 
 if __name__ == "__main__":

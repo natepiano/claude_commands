@@ -18,11 +18,10 @@ from pathlib import Path
 from typing import ClassVar, cast, override
 from unittest import mock
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from scripts.message import session_send
 from scripts.lib.test_models_registry import ExactRows, registry_text, write_registry
 from scripts.whoami.account_test_support import create_claude_account
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from scripts.whoami import quota_alert
 from scripts.notify.push_texts import RenderedPush
@@ -38,9 +37,7 @@ from scripts.whoami.note_file import read_note
 from scripts.accounts import accounts, moves, next_moves, role_map
 from scripts.production import showrunners
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "message"))
 from scripts.message import send
-# send puts scripts/notify on the path.
 from scripts.notify.user_action import ActionRequired, UserAction, parse_user_action
 
 Notes = list[quota_alert.AgentNote]
@@ -191,7 +188,7 @@ always=natedev
             _ = deliver()
         sends: dict[str, tuple[str, UserAction]] = {}
         for command in commands:
-            self.assertEqual(command[:2], [sys.executable, str(quota_alert.SEND)])
+            self.assertEqual(command[:2], [sys.executable, str(session_send.SEND_SCRIPT)])
             with redirect_stderr(io.StringIO()) as refusal:
                 try:
                     options = send.parse(command[2:])

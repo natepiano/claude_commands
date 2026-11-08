@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from scripts.production.staff_test_support import foreign_hostname
+
 import unittest
 
 import json
@@ -11,17 +13,33 @@ from pathlib import Path
 import subprocess
 import sys
 from types import SimpleNamespace
-from typing import final
+from typing import final, override
 from contextlib import redirect_stdout
 from unittest import mock
-from scripts.production import change_review, merge_gate
+from scripts.production import change_review, merge_gate, staff
+from scripts.production.staff_test_support import isolated_staff_file
+from scripts.shutdown import remote
 from scripts.production.gate_modules import GateRefused
 from scripts.production.merge_gate_test_support import MergeGateFixture, wait_for_file
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
+def setUpModule() -> None:
+    unittest.enterModuleContext(foreign_hostname())
+
+
 @final
 class MergeGatePromotionTests(MergeGateFixture):
+    @override
+    def review_list(self) -> tuple[Path, Path]:
+        review, doc = super().review_list()
+        with isolated_staff_file(Path(self.environment["STAFF_FILE"]), self.environment):
+            record = staff.snapshot()
+            owner = record.by_doc("natedev", doc)
+            assert owner is not None
+            _ = staff.set_doc(owner.id, staff.LiveDoc(remote.local_machine(), doc))
+        return review, doc
+
     def test_failed_main_push_leaves_rows_unlisted_until_promote_only_succeeds(self) -> None:
         review, _ = self.review_list()
         before = review.read_bytes()

@@ -76,6 +76,19 @@ Codex review prompts also include section 3's command block.
 6. `## Work Specification`: include the following instructions verbatim.
    "Do not weaken, delete or turn off an existing assertion or test to make a test pass. If one must change, post blocked with the test, the old assertion, the new assertion and why."
    For tests, prohibit constant comparisons, implementation copies, library tests, configured mock tests, existence checks, and duplicate behavior tests.
+   Implementation, fix and test prompts carry these two test rules verbatim:
+
+   1. For a fix, add a table row to the existing test of the same behavior.
+      Add a new test only when no test covers the behavior.
+   2. Write or keep a rare-case test only when its defect meets at least one condition below.
+      Rare cases include an edge case, a refusal, malformed input, and a failure path.
+
+      - The user sees a wrong result.
+      - The defect damages saved state, such as a file, Git, a ledger, staff, or a config.
+      - The defect loses work, such as a commit, an edit, a message, or a worker result.
+
+      Keep every main-path test.
+
    For tests, include this instruction verbatim: "Never commit a test project to the repo. A test makes the project it needs in a tempdir at run time (Rust tempfile::TempDir, Python tempfile.TemporaryDirectory), which removes it after."
    Include these repair rules:
    - Remove dead code and unused bindings. Do not suppress warnings or prefix unused names with `_`.
@@ -109,7 +122,7 @@ Codex review prompts also include section 3's command block.
     3. While editing, use `verify.sh check`. Lint runs once, at the phase gate.
     ```
 
-    Run the phase and merge gates in full. Require each worker's listed tests before its checkpoint.
+    Run `targeted_test.py` for a unit. Run `merge_gate.py` for a merge. Require each worker's listed tests before its checkpoint.
 </WritePromptContract>
 
 <PhaseTeam>
@@ -151,6 +164,7 @@ Use <PhaseCleanup/> for removal.
 `test` opens against the **specification, not the implementation**. The Work
 Order defines the behavior, so tests can be written before any of it exists;
 a tester that waits for `impl` has converted a parallel team back into a queue.
+Apply the two test rules in <WritePromptContract/> item 6.
 In each edit round, `test` also runs the existing tests of the callers of the
 changed code, so a caller red shows before the full gate.
 

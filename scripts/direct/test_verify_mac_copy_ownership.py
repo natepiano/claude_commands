@@ -7,16 +7,17 @@ from typing import final
 from scripts.direct.verify_mac_offload_test_support import VerifyMacOffloadFixture, VERIFY as VERIFY
 import os
 import signal
-from scripts.direct.verify_mac_offload_test_support import processes_carrying, invoke_mac_claim
+from scripts.direct.verify_mac_offload_test_support import processes_carrying, invoke_mac_claim, wait_for_marker_exit
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.build_queue.admission_test_support import caller_admission
+from scripts.direct.wait_for_test_state import wait_for_pid
 
 
 @final
 class VerifyMacCopyOwnershipTests(VerifyMacOffloadFixture):
     def test_a_stopped_call_leaves_no_step_or_copy_running(self) -> None:
         process, copy = self.start_copy_call(copy={"TEST_COPY_WAIT": "1"})
-        cargo = int((self.runner_state / "cargo-compiling").read_text())
+        cargo = wait_for_pid(self.runner_state / "cargo-compiling", processes=(process,))
         # The step runs in its own process group, so a kill of verify's group alone misses it.
         self.assertNotEqual(os.getpgid(cargo), process.pid)
         self.assertTrue({cargo, copy} <= processes_carrying(self.child_marker()))
@@ -25,7 +26,9 @@ class VerifyMacCopyOwnershipTests(VerifyMacOffloadFixture):
         holds = list((self.root / "tmp").glob(f"verify-hold.{process.pid}.*"))
         self.assertEqual(len(holds), 1, list((self.root / "tmp").iterdir()))
         self.assertEqual(len(list(holds[0].glob(f"verify-copy.{process.pid}.*"))), 1)
-        self.stop_verify(process)
+        process.send_signal(signal.SIGTERM)
+        _ = process.communicate(timeout=TEST_HANG_GUARD_SECS)
+        _ = wait_for_marker_exit(self.child_marker(), TEST_HANG_GUARD_SECS)
         self.assertEqual(processes_carrying(self.child_marker()), set())
 
     def test_natedev_finishing_first_stops_the_copy_and_its_result_stands(self) -> None:

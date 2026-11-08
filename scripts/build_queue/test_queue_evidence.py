@@ -20,7 +20,7 @@ from pathlib import Path
 import tempfile
 import time
 import unittest
-from typing import TYPE_CHECKING, TypedDict, Unpack, cast, override
+from typing import TypedDict, Unpack, cast, override
 from unittest import mock
 
 from scripts.build_queue import queue_evidence, head_facts, build_queue, queue_card, queue_view
@@ -29,13 +29,11 @@ from scripts.build_queue.queue_fixture import write_process, write_scope, fixtur
 from scripts.build_queue.queue_fixture import bump_line, queue_time_line, token_gap_line, write_bumps, write_token_gaps
 from scripts.lint import memory_admit as gate
 
-if TYPE_CHECKING:
-    from scripts.buildlog import store
-else:
-    from scripts.buildlog import store
+from scripts.buildlog import store
 
 from scripts.build_queue.queue_fixture import write_memory_config
 from scripts.lint.memory_test_support import commit_config_fixture
+from scripts.lib.build_steps import read_step_names
 from scripts.lib.user_zone import user_zone
 from scripts.message import roster, unit_labels
 
@@ -303,10 +301,26 @@ class QueueEvidenceTests(unittest.TestCase):
         reading = gate.queue_read()
         running = replace(reading.explanation.running[0], admitted_at=gate.AdmissionTimeNotRecorded())
         explanation = replace(reading.explanation, running=(running, *reading.explanation.running[1:]))
-        text = queue_evidence.running_text(running, explanation, {}, user_zone())
+        text = queue_evidence.running_text(running, explanation, {}, user_zone(), names=read_step_names())
         self.assertIn("admission time unknown", text)
         self.assertIn("need 10.8 GiB; anonymous use 0.8 GiB; held slot 0.0 GiB; kept aside 10.0 GiB", text)
         self.assertNotIn("admitted 00:00", text)
+
+    def test_running_and_release_sentences_use_step_prose(self) -> None:
+        reading = gate.queue_read()
+        names = read_step_names()
+        for step, prose in (("targeted-test", "targeted test"), ("merge-gate", "merge gate")):
+            with self.subTest(step=step):
+                running = replace(reading.explanation.running[0],
+                                  step=replace(reading.explanation.running[0].step, step=step))
+                explanation = replace(reading.explanation, running=(running, *reading.explanation.running[1:]))
+                text = queue_evidence.running_text(running, explanation, {}, user_zone(), names=names)
+                self.assertIn(f" {prose}: admitted ", text)
+                self.assertNotIn(step, text)
+                release = gate.HeadStartsAt(NOW + 30, (0,), 0, 0, 0)
+                text = queue_evidence.release_text(release, explanation, {}, user_zone(), names=names)
+                self.assertIn(f" {prose} end ", text)
+                self.assertNotIn(step, text)
 
     def test_optional_load_failure_preserves_evidence_and_release_advice(self) -> None:
         load = self.proc / "loadavg"
@@ -395,7 +409,7 @@ class QueueEvidenceTests(unittest.TestCase):
         _ = self.running(800, "only-holder", "clippy", 1, 1, 3600)
         output = self.output()
         final = self.line(output, "Frees when:")
-        self.assertIn("stale-only-holder clippy end", final)
+        self.assertIn("stale-only-holder hana clippy end", final)
         self.assertNotIn("insufficient", final)
         self.assertNotIn("still leaves", final)
         result = gate.head_after_steps_end(gate.explain_queue(), (0,))
@@ -457,7 +471,7 @@ class QueueEvidenceTests(unittest.TestCase):
         _ = self.running(800, "large-peak", "clippy", 10, 0.1, 3600, peak=10)
         _ = self.running(801, "useful-release", "clippy", 9, 9, 3600)
         final = self.line(self.output(), "Frees when:")
-        self.assertIn("stale-useful-release clippy end", final)
+        self.assertIn("stale-useful-release hana clippy end", final)
         self.assertNotIn("large-peak", final)
         self.assertIn("keep-aside drops 0.0 GiB; free memory rises 9.0 GiB", final)
 
@@ -485,7 +499,7 @@ class QueueEvidenceTests(unittest.TestCase):
         for pid, name, charge in ((800, "larger", 8), (801, "first-small", 6), (802, "second-small", 6)):
             _ = self.running(pid, name, "clippy", charge, charge, 3600)
         final = self.line(self.output(), "Frees when:")
-        self.assertIn("stale-larger clippy + stale-first-small clippy end", final)
+        self.assertIn("stale-larger hana clippy + stale-first-small hana clippy end", final)
         self.assertNotIn("second-small", final)
 
     def test_equal_size_releases_choose_the_least_charge_even_later_in_the_table(self) -> None:
@@ -494,7 +508,7 @@ class QueueEvidenceTests(unittest.TestCase):
                                   (802, "small-a", 6), (803, "small-b", 6)):
             _ = self.running(pid, name, "clippy", charge, charge, 3600)
         final = self.line(self.output(), "Frees when:")
-        self.assertIn("stale-small-a clippy + stale-small-b clippy end", final)
+        self.assertIn("stale-small-a hana clippy + stale-small-b hana clippy end", final)
         self.assertNotIn("largest", final)
         self.assertNotIn("medium", final)
         self.assertIn("keep-aside drops 0.0 GiB; free memory rises 12.0 GiB", final)
@@ -568,7 +582,7 @@ class QueueEvidenceTests(unittest.TestCase):
         )
         for name, step, admitted, need, used, kept in expected:
             row, = [line for line in rows if f"{name}-session," in line]
-            self.assertIn(f"hana / {name} / {name}-session, {step}: admitted {admitted}", row)
+            self.assertIn(f"hana / {name} / {name}-session, hana {step}: admitted {admitted}", row)
             self.assertIn(f"need {need} GiB; anonymous use {used} GiB; held slot 0.0 GiB; kept aside {kept} GiB", row)
         compiler, = [line for line in rows if "sccache.service" in line]
         self.assertIn("sccache.service: idle; 0.4 GiB RAM; 0.0 GiB swapped", compiler)

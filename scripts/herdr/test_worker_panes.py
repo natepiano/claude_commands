@@ -6,6 +6,7 @@ import json
 import fcntl
 import math
 import os
+import shutil
 import sys
 import time
 import subprocess
@@ -38,7 +39,8 @@ class PaneWorld(herdr.Herdr):
     """A private pane server supplies process facts to the real shared scan."""
 
     def __init__(self) -> None:
-        super().__init__("agents")
+        with patch.dict(os.environ, {"HERDR_BIN": "/nonexistent/herdr"}):
+            super().__init__("agents")
         self.process_directory = TemporaryDirectory(prefix="pane-world-proc-")
         self.process_cleanup = finalize(self, self.process_directory.cleanup)
         self.locations: dict[str, dict[str, object]] = {}
@@ -52,6 +54,7 @@ class PaneWorld(herdr.Herdr):
         self.launches: list[herdr.ExistingPane | herdr.SplitPane] = []
         self.launch_directories: list[Path] = []
         self.launch_timeouts: list[int] = []
+        self.agent_names: list[str] = []
         self.stops: list[str] = []
         self.signals: list[tuple[int, int]] = []
         self.stop_deadlines: list[float] = []
@@ -69,13 +72,12 @@ class PaneWorld(herdr.Herdr):
         self.report_reads_at_wait: list[int] = []
         self.disappear_after_launch = False
 
-    def setup(self, test: StaffTestCase, *, compact_above_tokens: int = 43000) -> None:
+    def setup(self, test: StaffTestCase) -> None:
         """Install shared accounts, configuration, and process facts."""
         config = test.root / "conf"
         config.mkdir()
         write_text_atomic(config / "direct.conf", "WORKER_TRANSPORT=mesh\n# range: 0.1..0.9\nWORKER_SPLIT_RATIO=0.667\n"
-                          + f"# whole: 1..\nUNIT_COMPACT_ABOVE_TOKENS={compact_above_tokens}\n"
-                          + "# whole: 1..\nASTRA_REVIEW_COMPACT_ABOVE_TOKENS=200000\n"
+                          + "# whole: 1..\nUNIT_COMPACT_ABOVE_TOKENS=43000\n"
                           + "WORKER_FIRST_TURN_TEXT=Reply with ready. Do not use tools.\n"
                           + "# range: 1..600\nWORKER_FIRST_TURN_SECONDS=120\n"
                           + "# range: 1..600\nPANE_AGENT_START_SECONDS=90\n")
@@ -230,10 +232,13 @@ class PaneWorld(herdr.Herdr):
     def launch(self, name: str, destination: herdr.NewTab | herdr.SplitPane | herdr.ExistingPane,
                prepared: herdr.PreparedAgentEnvironment, kind: str, agent_arguments: list[str],
                opening: herdr.OpeningPrompt | herdr.NoOpeningPrompt, timeout_ms: int, *, agent: str,
-               reported_unknown: str = "") -> herdr.AgentLaunched:
+               reported_unknown: str = "",
+               agent_name: str | herdr.AgentNameSource = herdr.AgentNameSource.MEMBER_REFERENCE) -> herdr.AgentLaunched:
         del name, opening, reported_unknown
         if isinstance(destination, herdr.NewTab):
             raise AssertionError("a worker must not create a tab")
+        server_name = agent_name if isinstance(agent_name, str) else agent
+        self.agent_names.append(server_name)
         self.launches.append(destination)
         self.launch_directories.append(prepared.directory)
         self.launch_timeouts.append(timeout_ms)
@@ -254,7 +259,7 @@ class PaneWorld(herdr.Herdr):
             self.interrupt = ""
             raise OSError("interrupted after split")
         identity = next((agent_arguments[index + 1] for index, argument in enumerate(agent_arguments[:-1])
-                         if argument in ("--resume", "resume", "--session-id")), fixture_runtime_id("backend-" + agent))
+                         if argument in ("--resume", "resume", "--session-id")), fixture_runtime_id("backend-" + server_name))
         self.activate(identity, pane, cast(Literal["claude", "codex"], kind))
         pid, family, _ = self.foreground[pane]
         self.processes[pid].environment.update(prepared.env)
@@ -386,6 +391,11 @@ class WorkerPaneTests(StaffTestCase):
     world: PaneWorld = PaneWorld()
     parent_id: staff.StaffId = staff.StaffId("")
 
+    def test_fake_pane_server_does_not_need_herdr_on_path(self) -> None:
+        with patch.dict(os.environ, {"HERDR_BIN": ""}), patch.object(shutil, "which", return_value=None):
+            world = PaneWorld()
+        self.assertEqual(world.binary, "/nonexistent/herdr")
+
     @property
     def parent(self) -> staff.StaffRow:
         row = staff.by_id(self.parent_id)
@@ -457,6 +467,24 @@ class WorkerPaneTests(StaffTestCase):
               *, account: worker_panes.ConfiguredWorkerAccount | worker_panes.DestinationWorkerAccount = worker_panes.ConfiguredWorkerAccount.CURRENT) -> worker_panes.WorkerStart:
         return worker_panes.start_or_resume(self.parent.id, staff.WorkerName.parse(name), role, account=account)
 
+    def test_each_parent_uses_its_name_for_the_server_agent_and_keeps_the_worker_name(self) -> None:
+        first = self.start("impl")
+        self.assertIsInstance(first, worker_panes.OpenWorker)
+        second_root = self.root / "second-unit"
+        second_root.mkdir()
+        parent = fixture_member("unit", name="second-unit", parent=self.parent.parent,
+                                worktree=staff.PresentWorktree("natedev", second_root))
+        self.world.add(parent, "w2:p0", workspace="w2", tab="w2:t2")
+        second = worker_panes.start_or_resume(parent.id, staff.WorkerName.parse("impl"), "impl")
+        self.assertIsInstance(second, worker_panes.OpenWorker)
+        assert isinstance(first, worker_panes.OpenWorker)
+        assert isinstance(second, worker_panes.OpenWorker)
+        self.assertEqual(self.world.agent_names, ["unit-impl", "second-unit-impl"])
+        self.assertEqual([first.row.name, second.row.name], ["impl", "impl"])
+        self.assertEqual([self.world.locations[result.pane]["label"] for result in (first, second)], ["impl", "impl"])
+        self.assertEqual([first.row.parent, second.row.parent],
+                         [staff.ReportsTo(self.parent.id), staff.ReportsTo(parent.id)])
+
     def command(self, *arguments: str) -> tuple[int, str, str]:
         with redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as errors:
             code = worker_panes.main(list(arguments))
@@ -516,6 +544,32 @@ class WorkerPaneTests(StaffTestCase):
         self.record_command("finish-pass", "--status", status, at=at + 1)
         self.reply_to_dispatch(row, dispatch)
         return dispatch
+
+    def test_close_uses_the_newest_pass_when_an_older_short_slot_is_last(self) -> None:
+        for index, (older_start, newest_start) in enumerate(((10, 20), (None, -1), ("later", -1)), start=1):
+            with self.subTest(older_start=older_start):
+                row = self.worker(f"claude-queue-test-{index}")
+                pane = f"w1:p{index}"
+                self.world.add(row, pane)
+                self.completed_dispatch(row, "impl")
+                run = self.root / "run"
+                path = run / "progress_history_state.json"
+                state = cast(dict[str, object], json.loads(path.read_text()))
+                passes = cast(dict[str, dict[str, object]], state["pass"])
+                newest = passes[row.name]
+                newest["started_at"] = newest_start
+                older: dict[str, object] = {"instance_id": "older-dispatch", "worker_name": row.name,
+                    "team_slot": "test", "kind": "impl", "status": "completed"}
+                if older_start is not None:
+                    older["started_at"] = older_start
+                passes["test"] = older
+                write_text_atomic(path, json.dumps(state))
+                self.assertEqual(worker_panes.worker_pass(row, run), newest)
+                closed = worker_panes.close(self.parent.id, staff.WorkerName.parse(row.name))
+                self.assertIsInstance(closed, worker_panes.Closed)
+                self.assertIn(row.current_session, self.world.stops)
+                self.assertIn((pane, "terminal-" + pane), self.world.closed)
+                self.assertNotIn(pane, self.world.locations)
 
     def test_a_worker_can_close_after_its_completed_pass_crosses_a_phase_boundary(self) -> None:
         opened = self.start()
@@ -886,13 +940,12 @@ class WorkerPaneTests(StaffTestCase):
             self.assertEqual(len(self.world.launches), 2)
             self.assertEqual(self.world.stops, [str(row.current_session)])
 
-    def test_codex_launch_and_resume_use_the_configured_compaction_limit(self) -> None:
+    def test_codex_launch_and_resume_keep_the_native_compaction_limit(self) -> None:
         first = self.start("reviewer", "review")
         self.assertIsInstance(first, worker_panes.OpenWorker)
         assert isinstance(first, worker_panes.OpenWorker)
         arguments = self.world.requests[-1][1]
-        self.assertIn(["-c", "model_auto_compact_token_limit=43000"],
-                      [arguments[index:index + 2] for index in range(len(arguments) - 1)])
+        self.assertFalse(any("model_auto_compact_token_limit" in argument for argument in arguments))
         self.assertIn(["-c", "notice.hide_rate_limit_model_nudge=true"],
                       [arguments[index:index + 2] for index in range(len(arguments) - 1)])
         config = self.root / "conf/direct.conf"
@@ -905,8 +958,7 @@ class WorkerPaneTests(StaffTestCase):
         self.assertEqual((resumed.row, resumed.pane, resumed.terminal), (first.row, first.pane, first.terminal))
         arguments = self.world.requests[-1][1]
         self.assertEqual(arguments[:2], ["resume", str(first.row.current_session)])
-        self.assertIn(["-c", "model_auto_compact_token_limit=67000"],
-                      [arguments[index:index + 2] for index in range(len(arguments) - 1)])
+        self.assertFalse(any("model_auto_compact_token_limit" in argument for argument in arguments))
         self.assertIn(["-c", "notice.hide_rate_limit_model_nudge=true"],
                       [arguments[index:index + 2] for index in range(len(arguments) - 1)])
         self.assertEqual(len(self.world.launches), 2)
@@ -942,29 +994,26 @@ class WorkerPaneTests(StaffTestCase):
         self.assertEqual(family, "claude")
         self.assertFalse(any("model_auto_compact_token_limit" in argument for argument in arguments))
 
-    def test_unusable_codex_compaction_limit_refuses_before_launch(self) -> None:
+    def test_codex_launch_ignores_the_between_turn_compaction_limit(self) -> None:
         config = self.root / "conf/direct.conf"
         original = config.read_text()
-        before = self.staff_state()
-        for value in ("", "invalid", "0", "-1", "1.5"):
+        for index, value in enumerate(("", "invalid", "0", "-1", "1.5")):
             with self.subTest(value=value):
                 write_text_atomic(config, original.replace("UNIT_COMPACT_ABOVE_TOKENS=43000",
                                                            "UNIT_COMPACT_ABOVE_TOKENS=" + value))
-                result = self.start()
-                self.assertIsInstance(result, worker_panes.StartRefused)
-                assert isinstance(result, worker_panes.StartRefused)
-                self.assertEqual(result.reason, worker_panes.StartRefusal.INVALID_ROLE_CONFIGURATION)
-                self.assertIn("UNIT_COMPACT_ABOVE_TOKENS", result.detail)
-                self.assertEqual(self.world.launches, [])
-                self.assertEqual(self.staff_state(), before)
+                result = self.start(f"compact-{index}")
+                self.assertIsInstance(result, worker_panes.OpenWorker)
+                family, arguments, _ = self.world.requests[-1]
+                self.assertEqual(family, "codex")
+                self.assertFalse(any("model_auto_compact_token_limit" in argument for argument in arguments))
+                self.assertEqual(len(self.world.launches), index + 1)
 
     def test_same_role_keeps_a_worker_without_the_compaction_option(self) -> None:
         result = self.start()
         assert isinstance(result, worker_panes.OpenWorker)
         self.dispatch(result.row, "impl")
-        pid, family, arguments = self.world.foreground[result.pane]
-        index = arguments.index("model_auto_compact_token_limit=43000")
-        self.world.foreground[result.pane] = pid, family, arguments[:index - 1] + arguments[index + 1:]
+        arguments = self.world.requests[-1][1]
+        self.assertFalse(any("model_auto_compact_token_limit" in argument for argument in arguments))
         self.assertEqual(self.start(), result)
         self.assertEqual((len(self.world.launches), self.world.stops), (1, []))
 
@@ -972,16 +1021,15 @@ class WorkerPaneTests(StaffTestCase):
         result = self.start()
         assert isinstance(result, worker_panes.OpenWorker)
         self.completed_dispatch(result.row, "impl")
-        pid, family, arguments = self.world.foreground[result.pane]
-        index = arguments.index("model_auto_compact_token_limit=43000")
-        self.world.foreground[result.pane] = pid, family, arguments[:index - 1] + arguments[index + 1:]
-        changed = self.start(role="test")
+        arguments = self.world.requests[-1][1]
+        self.assertFalse(any("model_auto_compact_token_limit" in argument for argument in arguments))
+        changed = self.start(role="review")
         self.assertIsInstance(changed, worker_panes.OpenWorker)
         assert isinstance(changed, worker_panes.OpenWorker)
         self.assertEqual((changed.row, changed.pane, changed.terminal), (result.row, result.pane, result.terminal))
         arguments = self.world.requests[-1][1]
-        self.assertIn(["-c", "model_auto_compact_token_limit=43000"],
-                      [arguments[index:index + 2] for index in range(len(arguments) - 1)])
+        self.assertFalse(any("model_auto_compact_token_limit" in argument for argument in arguments))
+        self.assertEqual(arguments[arguments.index("--sandbox") + 1], "read-only")
         self.assertEqual(self.world.stops, [str(result.row.current_session)])
         self.assertEqual(len(self.world.launches), 2)
 

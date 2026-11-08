@@ -24,9 +24,7 @@ import sys
 import time
 from pathlib import Path
 
-SCRIPTS = Path(__file__).resolve().parent.parent
-sys.path[:0] = [str(SCRIPTS / "hooks"), str(SCRIPTS / "production")]
-import showrunner_footer  # noqa: E402
+from scripts.hooks import showrunner_footer  # noqa: E402
 from scripts.production import staff
 from scripts.production.update_registration import QuestionStaff
 
@@ -54,7 +52,7 @@ def row(instance: Path, *, identities: QuestionStaff | None = None) -> tuple[str
         sources.append(doc)
     if production is None:
         return "", "", sources
-    import footer_counts
+    from scripts.production import footer_counts
     from scripts.production.update_registration import QuestionStaff, RegistrationFailure
 
     identities = QuestionStaff.read() if identities is None else identities

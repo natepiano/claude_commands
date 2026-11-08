@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
 """Claude gets one phone reminder when a low account lacks an account-move entry.
 
 Codex refusal reruns reach only the stopped command's director; other notices are logged.
@@ -35,6 +35,7 @@ from scripts.lib import process_group
 
 from scripts.lib.process_failure import failure_detail
 from scripts.message import send_result, send_budget, session_send
+from scripts.shutdown import remote
 from scripts.whoami import note_file
 
 from scripts.lib import conf, models_registry  # noqa: E402
@@ -250,7 +251,6 @@ from scripts.production.showrunners import (
 
 Config = ShowrunnerSettings
 STATE = Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local" / "state") / "quota_alert.json"
-SEND = session_send.SEND_SCRIPT
 SESSIONS = Path.home() / ".claude" / "sessions"
 PROTOCOL = Path.home() / ".claude" / "docs" / "quota_alerts.md"
 AGENTS = Path(__file__).resolve().parent.parent / "agents" / "models_config.sh"
@@ -1771,7 +1771,7 @@ def _paid_credits_notice(label: str, report: Report,
     except ValueError:
         credits_left = "unlimited" if report.credit_balance == "unlimited" else "unknown"
     return ZeroEpisodeNotice(id="quota.paid_credits", values={
-        "sender": "quota_alert", "account": label, "machine": os.uname().nodename, "credits": credits_left,
+        "sender": "quota_alert", "account": label, "machine": remote.local_machine(), "credits": credits_left,
         "refill": reset_display(refusals.KnownReset(reset)),
         "next_reset": reset_display(refusals.KnownReset(next_reset)),
     })

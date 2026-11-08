@@ -28,7 +28,8 @@ from scripts.build_hold import build_hold
 from scripts.direct.recorder_fixture import invoke_recorder, record_wait_workers
 from scripts.production.staff_test_support import fixture_runtime_id
 from scripts.direct.verify_mac_offload_test_support import VerifyMacOffloadFixture, CallRecord, CARGO_STUB, wait_for_marker_exit
-from scripts.direct.local_release_wait import LocalReleaseEvents, local_release_waiter
+from scripts.direct.local_release_wait import RELEASE_CHANGES, LocalReleaseEvents, local_release_waiter
+from scripts.lib import inotify
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.shell_test_support import shell_functions
@@ -101,7 +102,7 @@ def release_registered_call(path: Path) -> Generator[None, None, None]:
 
     def release() -> None:
         try:
-            with local_release_waiter(root, root) as events:
+            with local_release_waiter(root, root, RELEASE_CHANGES | inotify.IN_MODIFY) as events:
                 deadline = time.monotonic() + TEST_HANG_GUARD_SECS
                 while True:
                     # Watch all existing descendants before checking; watching
@@ -110,7 +111,10 @@ def release_registered_call(path: Path) -> Generator[None, None, None]:
                     if isinstance(events, LocalReleaseEvents):
                         for directory in root.rglob("*"):
                             if directory.is_dir() and not directory.is_symlink():
-                                _ = events.add_watch(events.descriptor, os.fsencode(directory), 0x00000FCA)
+                                try:
+                                    _ = inotify.add_watch(events.descriptor, directory, events.mask)
+                                except FileNotFoundError:
+                                    continue
                     if stop.is_set():
                         return
                     if path.exists() and any(root.glob("**/verify-hold.*/waiter")):
@@ -176,9 +180,13 @@ class VerifyHoldTools(VerifyMacOffloadFixture):
             if entry.name != "py":
                 (library / entry.name).symlink_to(entry, target_is_directory=entry.is_dir())
         builder.write_executable(library / "py", '#!/bin/sh\nexec "${CLAUDE_PYTHON:-$TEST_REAL_PYTHON}" "$@"\n')
+        (builder.root / "unit").mkdir()
         cls.fixture_environment = {
             **builder.environment,
             "IN_NIX_SHELL": "pure",
+            "ROSTER_RUN_ROOT": str(builder.root / "unit"),
+            "UNIT_RUN_ROOT": str(builder.root / "unit"),
+            "SCRATCH_ROOT": str(builder.root / "scratch"),
         }
         _ = shutil.copytree(cls.fixture_root, cls.fixture_seed, symlinks=True)
         shutil.rmtree(cls.fixture_root)
@@ -374,7 +382,7 @@ exit "$status"
         output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
         return process.returncode, self.wait_output.pop(process.pid, "") + output + self.wait_diagnostics.pop(process.pid, "") + errors
 
-    def set_hold_routing(self, runs_on: Literal["natedev_only", "mac_allowed"]) -> None:
+    def set_hold_routing(self, runs_on: Literal["natedev_only", "any_target"]) -> None:
         targets = self.fixture.root / "hold-targets.py"
         _ = targets.write_text(f'''import os
 import runpy
@@ -384,7 +392,7 @@ import tempfile
 if sys.argv[1] == "eligible":
     print({runs_on!r} + (" fixture local wait" if {runs_on!r} == "natedev_only" else ""))
     print("natedev\\teligible\\t-\\t-\\t-")
-    if {runs_on!r} == "mac_allowed":
+    if {runs_on!r} == "any_target":
         print("mac\\teligible\\t-\\t" + os.environ["MAC_TEST_CONFIG"] + "\\tmacos")
 else:
     sys.path.insert(0, {str(TARGETS.parent)!r})

@@ -17,7 +17,7 @@ from scripts.model_study.stats import bootstrap_diff, percentile, request_cost
 from scripts.model_study.turns import Turn, load_roster, session_ids
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
-from unit_runs import history_root  # noqa: E402
+from scripts.lib.unit_runs import history_root  # noqa: E402
 
 DEFAULT_RUNS = history_root() / "runs"
 DEFAULT_ROSTER = Path(__file__).with_name("roster.json")

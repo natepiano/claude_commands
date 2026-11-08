@@ -8,16 +8,13 @@ from pathlib import Path
 from decimal import Decimal
 import subprocess
 import time
-from typing import TYPE_CHECKING, Callable, TypedDict, cast, override
+from typing import Callable, TypedDict, cast, override
 
 from scripts.build_queue.admission_test_support import AdmissionFixture, caller_admission
 from scripts.direct.verify_mac_offload_test_support import VerifyMacOffloadFixture, GIT_STUB
 from scripts.lint.memory_test_support import fake_memory_readings, write_config_fixture
 
-if TYPE_CHECKING:
-    from ..aws_target import ledger
-else:
-    from scripts.aws_target import ledger
+from scripts.aws_target import ledger
 
 
 REPOSITORY = Path(__file__).resolve().parents[2]
@@ -64,7 +61,7 @@ from scripts.lib.atomic_file import write_text_atomic
 
 root = Path(os.environ["TEST_RUNNER_STATE"])
 leave = admission_client._leave_queue
-sequence = 0
+sequence = len(tuple(root.glob("memory-hook-[0-9]*")))
 
 def attempts():
     events = root / "ssh-events.jsonl"
@@ -82,8 +79,9 @@ def observe():
     clock = os.environ.get("TEST_ROUTING_CLOCK", "")
     event = {"left": left, "clock": Path(clock).read_text() if clock else "", "attempts": attempts()}
     write_text_atomic(root / ("memory-hook-" + str(sequence)), json.dumps(event))
-    with (root / "memory-hook-ack").open() as acknowledgment:
-        assert acknowledgment.read() == "continue", "the test did not acknowledge the hook"
+    if not (root / "memory-hook-settled").exists():
+        with (root / "memory-hook-ack").open() as acknowledgment:
+            assert acknowledgment.read(len("continue")) == "continue", "the test did not acknowledge the hook"
     return left
 
 with mock.patch.object(admission_client, "_leave_queue", side_effect=observe):
@@ -161,12 +159,12 @@ def capture(arguments, deadline=offload.NO_COMMAND_TIME_LIMIT):
     if mode == "probe-refusal":
         (root / (request.target + ".marker")).touch()
         return offload.CommandOutput(75, "linux_startup=unresolved\n", "")
-    wire = "free_gib=1000\nhost=aws-build\nrustc=rustc fixture\nnextest=nextest fixture\n"
+    wire = "free_gib=1000\nhost=aws-build\nnextest=nextest fixture\n"
     wire += "mend=mend fixture\nscripts_commit=fixture-commit\nrc=0\n"
     if mode == "disk":
         wire = wire.replace("free_gib=1000", "free_gib=0")
     if mode == "version-mismatch":
-        wire = wire.replace("rustc=rustc fixture", "rustc=rustc other")
+        wire = wire.replace("nextest=nextest fixture", "nextest=nextest other")
     if mode == "after-probe":
         wire += "mac_cleanup=unconfirmed\n"
         (root / (request.target + ".marker")).touch()
@@ -317,6 +315,8 @@ source() {
     def setUp(self) -> None:
         super().setUp()
         self.admission = caller_admission(self, self.root, self.environment)
+        # The interval also bounds admission socket reads. Keep room for scheduling delay at high load.
+        self.admission.configure(waiting_pass_seconds=1, running_pass_seconds=0.25)
 
     def configure(self, order: str) -> None:
         _ = (self.root / "build_targets.conf").write_text(
@@ -354,8 +354,6 @@ source() {
         _ = self.hold_memory()
         self.memory_events_enabled = True
         self.memory_hook_observer = observe
-        # The hook interval exceeds real hook time. Reply timing does not release memory.
-        self.admission.configure(waiting_pass_seconds=1, running_pass_seconds=5)
         observer = self.root / "observe-memory-hook.py"
         self.write_executable(observer, OBSERVE_MEMORY_HOOK)
         library = self.home / ".claude/scripts/lib"
@@ -377,26 +375,33 @@ source() {
     def verify(self, *arguments: str, extra: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
         if not self.memory_events_enabled:
             return super().verify(*arguments, extra=extra)
-        process = self.start_verify(*arguments, extra=extra)
+        acknowledgment = os.open(self.runner_state / "memory-hook-ack", os.O_RDWR)
         try:
-            sequence = 0
-            while True:
-                sequence += 1
-                event_path = self.runner_state / f"memory-hook-{sequence}"
-                self.wait_for_path(event_path, (process,))
-                event = cast(CompletedMemoryHook, json.loads(event_path.read_text()))
-                release = self.memory_hook_observer(event)
-                if release and not event["left"]:
-                    _ = Path(self.environment["BUILDLOG_MEMINFO"]).write_text("MemAvailable: 268435456 kB\n")
-                with (self.runner_state / "memory-hook-ack").open("w") as acknowledgment:
-                    _ = acknowledgment.write("continue")
-                if release or event["left"]:
-                    break
-            output, errors = process.communicate()
-            return subprocess.CompletedProcess(process.args, process.wait(), output, errors)
-        except BaseException:
-            self.stop_verify(process)
-            raise
+            process = self.start_verify(*arguments, extra=extra)
+            try:
+                sequence = 0
+                while True:
+                    sequence += 1
+                    event_path = self.runner_state / f"memory-hook-{sequence}"
+                    self.wait_for_path(event_path, (process,))
+                    event = cast(CompletedMemoryHook, json.loads(event_path.read_text()))
+                    release = self.memory_hook_observer(event)
+                    if release and not event["left"]:
+                        _ = Path(self.environment["BUILDLOG_MEMINFO"]).write_text("MemAvailable: 268435456 kB\n")
+                    settled = release or event["left"]
+                    if settled:
+                        # Admission can wait after memory is free. Its later hooks do not wait for this test.
+                        (self.runner_state / "memory-hook-settled").touch()
+                    _ = os.write(acknowledgment, b"continue")
+                    if settled:
+                        break
+                output, errors = process.communicate()
+                return subprocess.CompletedProcess(process.args, process.wait(), output, errors)
+            except BaseException:
+                self.stop_verify(process)
+                raise
+        finally:
+            os.close(acknowledgment)
 
     def target_state(self, target: str) -> Path:
         return self.home / ".local/state/build-targets" / target

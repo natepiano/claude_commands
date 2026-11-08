@@ -13,7 +13,11 @@ Codex code review uses the unit's read-only `review` workers.
 The [daily simplify run](simplify-lens.md) uses a fresh Claude review.
 Writers keep their writing roles.
 Each follow compacts when the recorded context exceeds the configured limit.
-Phase cleanup ends turns and keeps threads. Unit pause, move, and end use staff membership and the worker ledger. Usage reports compare checkpointed phases through the usage store.
+After accepting a pass, the director closes its pane unless another fix round or phase dispatch starts immediately.
+The close retains the staff row and thread. The next assign resumes that thread in a new pane.
+A busy worker or live detached run prevents closure until that work ends.
+Unit pause, move, and end use staff membership and the worker ledger.
+Usage reports compare checkpointed phases through the usage store.
 
 ## Unit code reviewers
 
@@ -326,7 +330,9 @@ The rules live in `commands/unit/direct.md` `<LongLivedWorkers/>`, `docs/direct/
 A busy recipient gets only its `own_pass` continuation.
 An idle worker row receives no prompt.
 A director can receive the list of busy and idle worker children.
-Restore retains launcher recovery and shares dispatch reads across pane workers.
+Restore reopens only workers with active dispatches and retains launcher recovery.
+It shares dispatch reads across pane workers. Idle workers stay closed until their next assign.
+Account moves must preserve closed idle workers.
 
 ### Cleanup
 
@@ -412,9 +418,11 @@ See [unit rename](unit-rename.md) for explicit worktree moves.
 | `scripts/usage/weights.py` | Dated per-model weights the report applies |
 | `scripts/usage/rollouts.py` | `is_edit`, used by the collector |
 | `scripts/whoami/agent_notes.py` | `credits` on Codex readings |
-| `config/direct.conf` | `UNIT_COMPACT_ABOVE_TOKENS=100000`. A Codex pane worker takes the same value as `model_auto_compact_token_limit` at launch. |
-| `commands/unit/direct.md` | `<LongLivedWorkers/>`, referenced from `<LaunchImplementation/>`, `<FixDispatch/>`, `<PhaseCleanup/>` and `<CompactionContract/>`; early review worker (`EARLY_REVIEW_SLOT`) |
-| `docs/direct/launch_implementation.md` | `codex_mesh.py list`, then `--to` for every slot with an open worker |
+| `config/direct.conf` | `UNIT_COMPACT_ABOVE_TOKENS=100000`. `assign.py` compacts an idle mesh worker above it before new work. A pane worker has no in-turn compaction option. Codex keeps its own full-window limit. |
+| `commands/unit/direct.md` | Defines `<LongLivedWorkers/>`, with references from `<PhaseCleanup/>` and `<CompactionContract/>`. |
+| `docs/direct/repair_rounds.md` | References `<LongLivedWorkers/>` from `<FixDispatch/>`. |
+| `docs/direct/early_review.md` | Defines `<EarlyReviewArm/>` and uses the early review worker (`EARLY_REVIEW_SLOT`). |
+| `docs/direct/launch_implementation.md` | References `<LongLivedWorkers/>` from `<LaunchImplementation/>`; uses `codex_mesh.py list`, then `--to` for every slot with an open worker. |
 | `docs/direct/dual_review.md`, `docs/direct/run_phase_review.md`, `commands/plan/phase_review.md` | Review worker selection and `--to`/`--slot` calls |
 | `docs/direct/write_prompt_contract.md` | `<RoleReassignment/>`; Three Gods and Type Design in every prompt |
 

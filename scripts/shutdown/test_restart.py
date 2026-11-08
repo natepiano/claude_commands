@@ -1,6 +1,8 @@
 """Restart staff rows without a session journal."""
 from __future__ import annotations
 
+from scripts.shutdown import remote
+
 import io
 import math
 import json
@@ -72,7 +74,7 @@ class CodexSnapshotTests(RestartTestCase):
         self.proc.mkdir()
         self.rows = tuple(
             staff.StaffRow(staff.StaffId(f"row-{index}"), "agent", identity, staff.STAFF_ROOT,
-                current_session=staff.StaffId(identity), worktree=staff.PresentWorktree("natedev", self.root))
+                current_session=staff.StaffId(identity), worktree=staff.PresentWorktree(remote.local_machine(), self.root))
             for index, identity in enumerate(("claude-a", "codex-a", "claude-b", "codex-b")))
         self.claude = {"claude-a", "claude-b", "claude-orphan"}
         self.codex = {998081: "codex-a", 998082: "codex-b", 998083: "codex-orphan"}
@@ -312,7 +314,7 @@ class RecordedResumeTests(RestartTestCase):
     def resumed_arguments(self, entry: pane_record.PaneLaunch) -> list[str]:
         row = staff.StaffRow(staff.StaffId("row"), "agent", "current-name", staff.StaffRoot(),
                             current_session=staff.StaffId("current-id"),
-                            worktree=staff.PresentWorktree("natedev", self.folder))
+                            worktree=staff.PresentWorktree(remote.local_machine(), self.folder))
         with (patch.object(pane_record, "launch_for_session", return_value=entry),
               patch.object(restart, "named_account_environment", return_value={"CLAUDE_CONFIG_DIR": "/account"}),
               patch.object(herdr, "read_conversation", return_value=herdr.StoppedConversation()),
@@ -393,9 +395,10 @@ class RestartTests(RestartTestCase):
                                                      "XDG_STATE_HOME": str(self.root), "HOME": str(self.root),
                                                      "CODEX_HOME": str(self.root / ".codex"),
                                                      "CLAUDE_CONFIG_DIR": str(config)})))
+        _ = self.enterContext(patch.object(herdr.Herdr, "run_in_pane"))
         self.rows = tuple(staff.StaffRow(staff.StaffId(f"row-{n}"), "unit", f"unit-{n}", staff.StaffRoot(),
             current_session=staff.StaffId(f"conversation-{n}"),
-            worktree=staff.PresentWorktree("natedev", self.root)) for n in range(3))
+            worktree=staff.PresentWorktree(remote.local_machine(), self.root)) for n in range(3))
         self.running = {str(row.current_session) for row in self.rows}
         self.launches = []
         self.stops = []
@@ -784,22 +787,45 @@ class RestartTests(RestartTestCase):
             reason = str(result) if isinstance(result, herdr.UnreadableTrustFile) else f"Claude has not trusted {self.root}"
             self.assertEqual(output.getvalue(), f"test: trust anomaly: {reason}\n")
 
-    def test_saved_codex_record_restores_its_home_without_claude_trust(self) -> None:
+    def test_saved_codex_record_uses_workers_home_without_claude_trust(self) -> None:
         row = self.rows[0]
         home = self.root / ".codex2"
+        workers = self.root / ".codex1"
         entry = pane_record.launch("w1:p0", str(row.current_session), str(self.root),
             {"CLAUDE_CONFIG_DIR": str(home)}, ["codex"], kind="codex")
         entry["config_dir"] = str(home)
         pane_record.write("agents", entry)
-        with (patch.object(herdr, "read_conversation", return_value=herdr.StoppedConversation()),
+        with (patch.object(accounts, "role_account", return_value=accounts.CodexWorkersAccount("codex1", workers)) as role,
+              patch.object(herdr, "read_conversation", return_value=herdr.StoppedConversation()),
               patch.object(stop_resume, "heal_account_trust") as trust,
               patch.object(herdr, "launch_prepared_agent", return_value=herdr.AgentLaunched(
                   "w1:p0", herdr.PromptSubmissionNotRequired())),
               patch.object(herdr, "prepare_session_environment", return_value=herdr.PreparedAgentEnvironment(
-                  self.root, {"CODEX_HOME": str(home)})) as prepare):
+                  self.root, {"CODEX_HOME": str(workers)})) as prepare):
             _ = restart.start_row(row, staff.StaffSnapshot(self.rows), herdr.Herdr("agents"))
         trust.assert_not_called()
-        self.assertEqual(prepare.call_args.args[2]["CODEX_HOME"], str(home))
+        role.assert_called_once_with("workers")
+        self.assertEqual(prepare.call_args.args[2]["CODEX_HOME"], str(workers))
+
+    def test_saved_codex_restart_uses_explicit_account(self) -> None:
+        row = self.rows[0]
+        home = self.root / ".codex2"
+        target = self.root / ".codex3"
+        entry = pane_record.launch("w1:p0", str(row.current_session), str(self.root),
+            {"CLAUDE_CONFIG_DIR": str(home)}, ["codex"], kind="codex")
+        entry["config_dir"] = str(home)
+        pane_record.write("agents", entry)
+        with (patch.object(accounts, "role_account") as role,
+              patch.object(herdr, "read_conversation", return_value=herdr.StoppedConversation()),
+              patch.object(stop_resume, "heal_account_trust") as trust,
+              patch.object(herdr, "launch_prepared_agent", return_value=herdr.AgentLaunched(
+                  "w1:p0", herdr.PromptSubmissionNotRequired())),
+              patch.object(herdr, "prepare_session_environment", return_value=herdr.PreparedAgentEnvironment(
+                  self.root, {"CODEX_HOME": str(target)})) as prepare):
+            _ = restart.start_row(row, staff.StaffSnapshot(self.rows), herdr.Herdr("agents"), target_account="codex3")
+        role.assert_not_called()
+        trust.assert_not_called()
+        self.assertEqual(prepare.call_args.args[2]["CODEX_HOME"], str(target))
 
     def test_dry_run_names_a_morty_agent_with_an_unproved_native_identity(self) -> None:
         row = replace(self.rows[0], kind="agent", name="morty", worktree=staff.WORKTREE_UNFILLED)
@@ -823,7 +849,7 @@ class RestartTests(RestartTestCase):
             replace(self.rows[1], kind="worker", name="codex-worker", parent=staff.ReportsTo(self.rows[0].id),
                     worktree=staff.WORKTREE_UNFILLED),
             replace(self.rows[2], kind="agent", name="morty", parent=staff.StaffRoot(),
-                    worktree=staff.WORKTREE_UNFILLED, doc=staff.LiveDoc("natedev", self.root / "morty.md")))
+                    worktree=staff.WORKTREE_UNFILLED, doc=staff.LiveDoc(remote.local_machine(), self.root / "morty.md")))
         layout: herdr.SavedLayout = {"at": 1, "workspaces": [{"name": "saved", "seen": 1,
             "tabs": [{"name": "old", "seen": 1, "row_id": str(self.rows[1].id)}]}]}
         shutdown_record.save([str(self.rows[2].id)])
@@ -850,9 +876,9 @@ class RestartTests(RestartTestCase):
                 unused.assert_not_called()
             self.assertEqual(shutdown_record.record_path().read_bytes(), before)
             self.assertEqual((self.stops, self.launches), ([], []))
-            self.assertEqual(shutdown_record.row_folder(self.rows[2], staff.StaffSnapshot(self.rows)), ("natedev", self.root))
-            self.assertEqual(shutdown_record.row_folder(replace(self.rows[2], worktree=staff.PresentWorktree("natedev", self.root / "own")),
-                staff.StaffSnapshot(self.rows)), ("natedev", self.root / "own"))
+            self.assertEqual(shutdown_record.row_folder(self.rows[2], staff.StaffSnapshot(self.rows)), (remote.local_machine(), self.root))
+            self.assertEqual(shutdown_record.row_folder(replace(self.rows[2], worktree=staff.PresentWorktree(remote.local_machine(), self.root / "own")),
+                staff.StaffSnapshot(self.rows)), (remote.local_machine(), self.root / "own"))
 
     def test_codex_dry_run_uses_the_newest_pane_record_and_reports_rows_without_a_tab(self) -> None:
         self.rows = (replace(self.rows[0], kind="agent", name="morty"), *self.rows[1:])
@@ -1016,7 +1042,7 @@ class RestartTests(RestartTestCase):
         folder = self.root / "renamed-folder"
         folder.mkdir()
         self.rows = (replace(self.rows[0], name="renamed",
-            worktree=staff.PresentWorktree("natedev", folder)), *self.rows[1:])
+            worktree=staff.PresentWorktree(remote.local_machine(), folder)), *self.rows[1:])
         record = staff.StaffSnapshot(self.rows)
         self.running.clear()
         prepared = herdr.PreparedAgentEnvironment(folder, {})
@@ -1165,7 +1191,7 @@ class RestartTests(RestartTestCase):
         saved = json.dumps(session)
         for folder in (self.root / "before", self.root / "after"):
             record = staff.StaffSnapshot((replace(self.rows[0],
-                worktree=staff.PresentWorktree("natedev", folder)),))
+                worktree=staff.PresentWorktree(remote.local_machine(), folder)),))
             with patch.object(staff, "snapshot", return_value=record):
                 parsed = inventory.parse_session(session, "fixture")
             self.assertEqual(parsed["cwd"], str(folder))
@@ -1174,7 +1200,7 @@ class RestartTests(RestartTestCase):
     def test_restart_skips_an_unknown_unit_folder_and_starts_the_other_rows(self) -> None:
         parent = staff.StaffRow(staff.StaffId("parent"), "showrunner", "parent", staff.StaffRoot(),
                                current_session=staff.StaffId("parent-session"),
-                               doc=staff.LiveDoc("natedev", self.root / "production.md"))
+                               doc=staff.LiveDoc(remote.local_machine(), self.root / "production.md"))
         self.rows = (replace(self.rows[0], parent=staff.ReportsTo(parent.id), worktree=staff.WORKTREE_UNFILLED), *self.rows[1:])
         record = staff.StaffSnapshot((*self.rows, parent))
         self.running.clear()
@@ -1445,9 +1471,11 @@ class RestartTests(RestartTestCase):
 
 class RetainedSplitRestartTests(RestartTestCase):
     def test_interrupted_restart_keeps_every_original_pane_and_terminal(self) -> None:
+        from scripts.direct import progress_history
         from scripts.herdr.test_worker_panes import PaneWorld
-        from scripts.production.staff_test_support import StaffTestCase, fixture_member, fixture_worker
         from scripts.lib.test_models_registry import registry_text
+        from scripts.production import worker
+        from scripts.production.staff_test_support import StaffTestCase, fixture_member, fixture_worker
 
         fixture = StaffTestCase()
         fixture.setUp()
@@ -1475,10 +1503,19 @@ class RetainedSplitRestartTests(RestartTestCase):
             "model": "", "remote_control": False, "environment": {}, "flags_read": True,
             "written_at": "2026-11-06T00:00:00+00:00"}
         pane_record.write("agents", entry)
-        write_text_atomic(root / "run/progress_history_state.json", json.dumps({"main_agent": {"session_id": str(holder.current_session)}, "pass": {
-            row.name: {"instance_id": "dispatch-" + row.name, "worker_name": row.name,
-                       "team_slot": row.name, "kind": "impl", "status": "completed"} for row in children}}))
-        write_text_atomic(root / "run/worker_transport", "herdr\n")
+        run = root / "run"
+        write_text_atomic(run / "progress_history_state.json", json.dumps({
+            "main_agent": {"session_id": str(holder.current_session)},
+            "phase": {"id": "earlier", "title": "Earlier", "instance_id": "earlier-phase",
+                      "started_at": 1, "status": "active"},
+            "pass": {}, "history_file": str(run / "history.jsonl")}))
+        write_text_atomic(run / "worker_transport", "herdr\n")
+        prompt = run / "prompt.md"
+        write_text_atomic(prompt, "Preserve the source behavior.\n")
+        for row in children:
+            _ = progress_history.begin_dispatch(run, slot=row.name, phase="earlier", role="impl",
+                worker_name=row.name, worker_id=row.id, launcher_command=["bash", "assign.sh", "impl", str(prompt)],
+                prompt=prompt, kind="impl", lens="")
         shutdown_record.save([str(row.id) for row in (holder, *children)])
         world.interrupt = "agent"
 
@@ -1511,6 +1548,7 @@ class RetainedSplitRestartTests(RestartTestCase):
               patch.object(accounts, "role_account", side_effect=role_account),
               patch.object(accounts, "account_dir", return_value=Path(os.environ["CLAUDE_CONFIG_DIR"])),
               patch.object(restart.stop_resume, "heal_account_trust"),
+              patch.object(worker, "_resume_launcher", return_value=worker.ExitCode.OK),
               redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()) as errors):
             self.assertEqual(restart.restart(), 0)
             self.assertEqual(len(shutdown_record.read()), 3)

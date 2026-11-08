@@ -28,6 +28,7 @@ from scripts.build_queue.queue_fixture import (
 )
 from scripts.build_queue.queue_lines import QueueLines, Span, json_form, plain
 from scripts.lib.terminal_cells import terminal_width
+from scripts.lib.build_steps import read_step_names
 from scripts.buildlog import store
 from scripts.buildlog.mac_idle_test_support import NotificationGuardedTestCase, write_idle_alert
 from scripts.lint import memory_admit
@@ -182,7 +183,7 @@ class QueueTests(NotificationGuardedTestCase):
         write_bumps(NOW, [bump_line(NOW - 1)])
         facts = head_facts.read_head_facts(head_reading(since=NOW - 600, now=NOW))
         assert isinstance(facts, head_facts.HeadFacts)
-        text = head_facts.bump_text(facts, ZoneInfo("UTC"), short=True)
+        text = head_facts.bump_text(facts, ZoneInfo("UTC"), short=True, names=read_step_names())
         self.assertIn("1 bump since it joined, most: bumped check (1)", text)
         self.assertNotIn("1 bumps", text)
 

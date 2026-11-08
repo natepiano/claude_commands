@@ -17,7 +17,6 @@ from typing import Literal, TypedDict, cast
 from uuid import uuid4
 from zoneinfo import ZoneInfo
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.whoami.agent_accounts import KnownCodexAccount
 from scripts.whoami.agent_accounts import Report, observe_workers_home
 from scripts.whoami import account
@@ -25,8 +24,6 @@ from scripts.whoami.quota_alert import (PROTOCOL, load_config, recipients, relay
                          CodexAlertPassReadings, ReadCurrentCodexReadings, READ_CURRENT_CODEX_READINGS,
                          codex_alert_pass, selected_codex_report, codex_swap_line)
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "message"))
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "notify"))
 from scripts.message import escalate  # noqa: E402
 # Percent of the five-hour window left at which the alert list is told.
 THRESHOLD = 20

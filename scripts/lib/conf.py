@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
 """Read live configuration, complete missing default values, and recover invalid values from Git."""
 from __future__ import annotations
 
@@ -206,6 +206,13 @@ def read(file: str | Path) -> ConfigRead:
         return ConfigRead(file, source, _UnreadableFile(str(error), isinstance(error, FileNotFoundError)),
                           "CONF_DIR" not in os.environ)
     return ConfigRead(file, source, settings, "CONF_DIR" not in os.environ)
+
+
+def read_or_repository(stem: str) -> ConfigRead:
+    """Use the repository file when the fixture has no copy."""
+    if "CONF_DIR" in os.environ and not path(stem).exists():
+        return read(_repository_path(stem))
+    return read(stem)
 
 
 def directory() -> Path:

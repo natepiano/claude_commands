@@ -1,6 +1,8 @@
 """Seeded unit-status shell fixtures with static fake-host responses."""
 from __future__ import annotations
 
+from scripts.shutdown import remote
+
 from scripts.production.fake_unit_host import labeled as labeled_host
 
 from contextlib import contextmanager
@@ -185,7 +187,7 @@ class UnitStatusFixture(unittest.TestCase):
                                        timeout=TEST_HANG_GUARD_SECS)
                 if unit not in retired_units:
                     member = unit_membership("example", unit)
-                    _ = staff.set_worktree(member.id, staff.PresentWorktree("natedev", worktree), expected=member.worktree)
+                    _ = staff.set_worktree(member.id, staff.PresentWorktree(remote.local_machine(), worktree), expected=member.worktree)
                     write_text_atomic(worktree / ".unit.toml", 'plan = "docs/plan.md"\nresponsibilities = []\n')
                 if unit in missing_units:
                     continue
@@ -197,7 +199,7 @@ class UnitStatusFixture(unittest.TestCase):
                     if unit in retired_units:
                         owner = showrunner_relationship("example")
                         member = fixture_member("unit", name=unit, parent=owner.id,
-                                                worktree=staff.RemovedWorktree("natedev", worktree))
+                                                worktree=staff.RemovedWorktree(remote.local_machine(), worktree))
                     else:
                         member = unit_membership("example", unit)
                     session_id = member.id
@@ -212,7 +214,7 @@ class UnitStatusFixture(unittest.TestCase):
             production_doc = root / "example-production.md"
             _ = production_doc.write_text("# Production\n", encoding="utf-8")
             owner = showrunner_relationship("example")
-            _ = staff.set_doc(owner.id, staff.LiveDoc("natedev", production_doc))
+            _ = staff.set_doc(owner.id, staff.LiveDoc(remote.local_machine(), production_doc))
             zsh = shutil.which("zsh")
             if zsh is None:
                 raise RuntimeError("zsh is required for unit status tests")

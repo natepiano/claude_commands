@@ -2,7 +2,7 @@
 
 `add_unit.py --resume <id> --autocompact <tokens>` records it (for a unit that already has a staff row it
 only records, launching nothing); every later `add_unit.py --resume <id>`,
-which /shutdown restarts, account moves and renames all run, passes `--autocompact <tokens>` to Claude.
+which agents restarts, account moves and renames all run, passes `--autocompact <tokens>` to Claude.
 `--autocompact auto` removes the record, so the session falls back to the saved setting.
 """
 from __future__ import annotations

@@ -255,16 +255,11 @@ def worker_lock(parent: StaffId, name: WorkerName, *, blocking: bool = False) ->
             hold.active = False
 
 
-class ClaudeCompaction(Enum):
-    NATIVE = "Claude controls compaction"
-
-
 @dataclass(frozen=True)
 class LaunchPolicy:
     settings: models_registry.LaunchSettings
     sandbox: str
     permission: str
-    compact_above_tokens: int | ClaudeCompaction
 
 
 @dataclass(frozen=True)
@@ -448,9 +443,13 @@ def _passes(run: Path) -> list[dict[str, object]]:
 
 
 def worker_pass(row: staff.StaffRow, run: Path) -> dict[str, object]:
+    def started_at(item: dict[str, object]) -> float:
+        value = item.get("started_at")
+        return value if isinstance(value, (int, float)) else float("-inf")
+
     no_pass: dict[str, object] = {}
-    return next((item for item in reversed(_passes(run)) if item.get("worker_name") == row.name
-                 or item.get("team_slot") == row.name), no_pass)
+    return max((item for item in reversed(_passes(run)) if item.get("worker_name") == row.name
+                or item.get("team_slot") == row.name), key=started_at, default=no_pass)
 
 
 def dispatch_role(row: staff.StaffRow) -> WorkerRole | WorkerRoleUnavailable:
@@ -553,8 +552,7 @@ def astra_review_policy(model: str, effort: str) -> LaunchPolicy:
     from scripts.agents.codex_mesh import READ_ONLY_SANDBOX
 
     settings = models_registry.LaunchSettings("codex", model, effort, "")
-    return LaunchPolicy(settings, READ_ONLY_SANDBOX, "plan",
-                        conf.read("direct").whole("ASTRA_REVIEW_COMPACT_ABOVE_TOKENS"))
+    return LaunchPolicy(settings, READ_ONLY_SANDBOX, "plan")
 
 
 def worker_policy(settings: models_registry.LaunchSettings) -> LaunchPolicy:
@@ -568,9 +566,7 @@ def _launch_policy(settings: models_registry.LaunchSettings, sandbox: str) -> La
     from scripts.agents.codex_mesh import READ_ONLY_SANDBOX
 
     permission = "plan" if sandbox == READ_ONLY_SANDBOX else "bypassPermissions"
-    compact_above_tokens = (conf.read("direct").whole("UNIT_COMPACT_ABOVE_TOKENS")
-                            if settings.kind == "codex" else ClaudeCompaction.NATIVE)
-    return LaunchPolicy(settings, sandbox, permission, compact_above_tokens)
+    return LaunchPolicy(settings, sandbox, permission)
 
 
 def _policy_arguments(policy: LaunchPolicy) -> list[str]:
@@ -578,7 +574,6 @@ def _policy_arguments(policy: LaunchPolicy) -> list[str]:
     if settings.kind == "codex":
         arguments = ["--model", settings.model, "--sandbox", policy.sandbox, "--ask-for-approval", "never",
                       "-c", f'model_reasoning_effort="{settings.effort}"',
-                      "-c", f"model_auto_compact_token_limit={policy.compact_above_tokens}",
                       "-c", "notice.hide_rate_limit_model_nudge=true"]
         if settings.service_tier:
             arguments += ["-c", f'service_tier="{settings.service_tier}"']
@@ -862,7 +857,7 @@ def _start_locked(owner: staff.StaffRow, name: WorkerName, role: WorkerRole, pol
     try:
         launched = herdr.launch_prepared_agent(client.session, destination, prepared, policy.settings.kind,
             launch_arguments(policy, str(row.current_session) if row else "", directory), herdr.NoOpeningPrompt(),
-            int(start_seconds * 1000), agent=name.value)
+            int(start_seconds * 1000), agent=name.value, agent_name=f"{owner.name}-{name.value}")
     except (herdr.HerdrFailure, OSError, ValueError, subprocess.SubprocessError) as error:
         return _uncertain(row or owner, f"agent launch is incomplete; pane retained: {error}")
     try:

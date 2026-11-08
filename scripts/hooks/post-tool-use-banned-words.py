@@ -15,13 +15,17 @@ counters are updated by the hook itself.
 The hook has no matcher, so it runs after every tool call. A read-only tool
 exits on its name, before the banned-word machinery is imported.
 """
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import json
 import sys
 from typing import TYPE_CHECKING, cast
 
 if TYPE_CHECKING:
-    from tool_call_text import HookPayload
+    from scripts.hooks.tool_call_text import HookPayload
 
 # Tools that only read — they never author content this turn. Their output is
 # just file/search content the agent is inspecting, so scanning it only produces
@@ -44,8 +48,7 @@ def main() -> None:
     # this hook's start-up time.
     from pathlib import Path
 
-    sys.path.insert(0, str(Path(__file__).parent))
-    from banned_words_lib import (
+    from scripts.hooks.banned_words_lib import (
         COUNTER_STATE,
         STYLE_GUIDE,
         bump_counters,
@@ -55,7 +58,7 @@ def main() -> None:
         hooks_enabled,
         is_guide_reproduction,
     )
-    from tool_call_text import ToolInput, scan_text
+    from scripts.hooks.tool_call_text import ToolInput, scan_text
 
     if not hooks_enabled():
         sys.exit(0)

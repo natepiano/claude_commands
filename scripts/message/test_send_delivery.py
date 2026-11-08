@@ -4,21 +4,14 @@ from __future__ import annotations
 import os
 import select
 import signal
-import sys
 import tempfile
 from contextlib import contextmanager
 from pathlib import Path
 from collections.abc import Callable, Generator
-from typing import TYPE_CHECKING
 from unittest import mock
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-if TYPE_CHECKING:
-    from . import send
-    from ..buildlog.mac_idle_test_support import NotificationGuardedTestCase, private_sender_acceptance
-else:
-    from scripts.message import send
-    from scripts.buildlog.mac_idle_test_support import NotificationGuardedTestCase, private_sender_acceptance
+from scripts.message import send
+from scripts.buildlog.mac_idle_test_support import NotificationGuardedTestCase, private_sender_acceptance
 
 
 @contextmanager

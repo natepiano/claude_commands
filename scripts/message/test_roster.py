@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+from scripts.production.staff_test_support import foreign_hostname
+
 from scripts.lib import names
 from scripts.lib.test_names import fixture_names
 
@@ -70,6 +72,10 @@ ENTRY_FIELDS = {
 WORKER_SESSION_ID = "12345678-1234-5678-9abc-def012345678"
 NO_SHOWRUNNER = roster.NoShowrunner()
 NO_DIRECTOR = roster.NoDirector()
+
+
+def setUpModule() -> None:
+    unittest.enterModuleContext(foreign_hostname())
 
 
 class RosterTests(unittest.TestCase):
@@ -632,7 +638,7 @@ class RosterTests(unittest.TestCase):
         _ = env_file.write_bytes(env_file.read_bytes() + f"\0CODEX_THREAD_ID={row.id}".encode())
         doc = self.root / "receiving-production.md"
         _ = doc.write_text("# Receiving\n")
-        _ = staff.set_doc(receiving.id, staff.LiveDoc("natedev", doc))
+        _ = staff.set_doc(receiving.id, staff.LiveDoc(roster.remote.local_machine(), doc))
         timer = self.notifier / "showrunner-receiving"
         timer.mkdir()
         _ = (timer / "conf").write_text(f"TARGET=session:522e6367-86e1-5829-ada8-2c71b5c28c97\nCHECK=zsh /scripts/production_check.sh {receiving.id}\n")
@@ -700,7 +706,7 @@ class RosterTests(unittest.TestCase):
 
     def test_renamed_production_has_the_same_full_and_fast_labels(self) -> None:
         owner = showrunner_relationship("alpha")
-        owner = staff.set_doc(owner.id, staff.LiveDoc("natedev", self.production_doc))
+        owner = staff.set_doc(owner.id, staff.LiveDoc(roster.remote.local_machine(), self.production_doc))
         showrunner_launch(owner, "acd50bad-5afa-5d3d-b155-3766b7d113e0", self.environment)
         _ = staff.rename(owner.id, "builds")
         full = roster.unit_labels(self._entries().values())
@@ -1323,7 +1329,7 @@ class RosterTests(unittest.TestCase):
         local = staff.local_snapshot()
         membership = staff.StaffSnapshot((*local.rows, staff.StaffRow(staff.StaffId('peer-session'), 'showrunner',
             'natedev', staff.StaffRoot(), current_session=staff.StaffId('peer-session'),
-            doc=staff.LiveDoc('natedev', doc))))
+            doc=staff.LiveDoc(roster.remote.local_machine(), doc))))
         with mock.patch.object(staff, 'snapshot', return_value=membership), \
                 mock.patch.object(send, 'STATE', self.root / 'send-state'), \
                 mock.patch.object(send, 'remote', return_value=send.Result('sent', 'fixture peer')) as deliver, \
@@ -2110,7 +2116,8 @@ class RosterTests(unittest.TestCase):
         responses["--session native agent list"]["stdout"] = json.dumps({"ok": True, "result": {"agents": [
             {"pane_id": "w1:p1", "agent": "codex", "agent_status": "working"},
             {"pane_id": "w1:p2", "agent": "claude", "agent_status": "idle"},
-            {"pane_id": "w1:p3", "agent": "codex", "agent_status": "idle"},
+            {"pane_id": "w1:p3", "agent": "codex", "agent_status": "idle",
+             "agent_session": {"kind": "id", "value": "private-pane-thread"}},
             {"pane_id": "w1:p4", "agent_status": "idle"},
         ]}})
         self._herdr_process(991000, 0, ["herdr", "--session", "native", "server"])
@@ -2135,6 +2142,11 @@ class RosterTests(unittest.TestCase):
                          (roster.NoShowrunner(), roster.NoDirector(), roster.NotAWorker()))
         self.assertEqual(pane.account, roster.AccountLabel("codex1"))
         self.assertIsInstance(entries["herdr native:w1:p3"].account, roster.AccountUnread)
+        reported = entries["herdr native:w1:p3"]
+        self.assertEqual(reported.thread, roster.CodexThread("private-pane-thread"))
+        self.assertEqual(reported.reach, roster.Messageable("codex:private-pane-thread"))
+        self.assertEqual(reported.pane, herdr.HerdrPlace("native", "w1:p3"))
+        self.assertIsInstance(reported.daemon, roster.NotDaemonSession)
         self.assertIn(mock.call(991001), read_home.call_args_list)
         self.assertNotIn(mock.call(991002), read_home.call_args_list)
         self.assertNotIn(mock.call(991003), read_home.call_args_list)
@@ -2161,17 +2173,27 @@ class RosterTests(unittest.TestCase):
         sessions_response = {"sessions": [herdr.SessionEntry(name=name, running=True, default=False,
                             session_dir="/fixture", socket_path="/fixture/socket") for name in ("broken", "native")]}
         responses["--session default session list --json"]["stdout"] = json.dumps(sessions_response)
-        responses["--session broken agent list"] = {"code": 1, "stdout": "", "stderr": "fixture broken"}
+        failures: list[CommandResponse] = [{"code": 1, "stdout": "", "stderr": "fixture broken"}]
+        malformed_agents: list[dict[str, object]] = [
+            {"agent": "codex", "agent_status": "idle"},
+            {"pane_id": "w1:p1", "agent": "codex"},
+            {"pane_id": "w1:p1", "agent": "codex", "agent_status": "idle", "agent_session": []},
+        ]
+        for agent in malformed_agents:
+            failures.append({"code": 0, "stdout": json.dumps({"result": {"agents": [agent]}})})
         responses["--session native agent list"]["stdout"] = json.dumps({"ok": True, "result": {"agents": [
             {"pane_id": "w1:p1", "agent": "codex", "agent_status": "idle"}
         ]}})
-        binary = self._herdr_fixture(responses)
-        with mock.patch.object(herdr, "herdr_binary", return_value=binary), \
-                mock.patch.object(codex_daemon, "loaded_sessions", return_value=[]):
-            found = roster.roster(os.environ, roster.ThisMachine())
-        self.assertEqual([entry.name for entry in found.entries if entry.name.startswith("herdr ")], ["herdr native:w1:p1"])
-        self.assertEqual(len(found.problems), 1)
-        self.assertIn("herdr session broken", found.problems[0])
+        for failure in failures:
+            with self.subTest(failure=failure):
+                responses["--session broken agent list"] = failure
+                binary = self._herdr_fixture(responses)
+                with mock.patch.object(herdr, "herdr_binary", return_value=binary), \
+                        mock.patch.object(codex_daemon, "loaded_sessions", return_value=[]):
+                    found = roster.roster(os.environ, roster.ThisMachine())
+                self.assertEqual([entry.name for entry in found.entries if entry.name.startswith("herdr ")], ["herdr native:w1:p1"])
+                self.assertEqual(len(found.problems), 1)
+                self.assertIn("herdr session broken", found.problems[0])
 
 
     def test_unreadable_herdr_fallback_places_director_but_never_ledger_worker_by_cwd(self) -> None:
@@ -2502,6 +2524,8 @@ class RosterTests(unittest.TestCase):
             replace(base, kind="codex", session=roster.NoClaudeSession(), thread=roster.CodexThread("daemon"),
                     reach=roster.Messageable("codex:daemon"),
                     daemon=codex_daemon.CodexDaemon(Path("/remote/.codex2"), Path("/remote/.codex2/socket"))),
+            replace(base, kind="codex", session=roster.NoClaudeSession(), thread=roster.CodexThread("pane-thread"),
+                    reach=roster.Messageable("codex:pane-thread"), pane=herdr.HerdrPlace("private", "w1:p2")),
             replace(base, kind="codex", role="worker", session=roster.NoClaudeSession(),
                     reach=roster.CannotReceiveMessages("between turns; no unit director is running"),
                     assignment=roster.WorkerAssignment("test", "/remote/no-thread")),
@@ -2884,7 +2908,7 @@ class UnitLabelsTests(unittest.TestCase):
         assert isinstance(unit.parent, staff.ReportsTo)
         worker = fixture_worker("types-review", unit.id)
         doc = root / "production.md"
-        _ = staff.set_doc(unit.parent.id, staff.LiveDoc("natedev", doc))
+        _ = staff.set_doc(unit.parent.id, staff.LiveDoc(roster.remote.local_machine(), doc))
         _ = doc.write_text("# cargo-liner\n")
         records: list[sessions.SessionRecord] = [
             {"pid": pid, "sessionId": sid, "name": name, "messagingSocketPath": f"/fixture/{sid}.sock",
