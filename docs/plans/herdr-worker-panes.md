@@ -3460,20 +3460,25 @@ The user (2026-11-07, through sdlc [4fdbe4b7]): "yes i definitely want this - ke
 
 **Gotchas:** `pane_restore` (typed account of the holder's own family), `stop_resume.resume` (account label) and `unit_move` all call `start_row`; a change to `start_row` needs `test_restart`, `test_pane_restore` and `test_stop_resume`.
 
-### Phase 28a — A new Claude worker gets its first prompt  · status: todo
+### Phase 28a — A new Claude worker gets its first prompt  · status: done
 
 **Depends on:** Phase 28 (the question path) and Phase 42 (it runs after 42: cargo-liner waits on 42).
 
 Found by Phase 28's director proof, 2026-11-08 (test run `/home/natepiano/scratch/herdrcheck/answer-1794138524`). Both defects were there before Phase 28.
 
-1. Live evidence (Phase 42 repair, 2026-11-08): a Codex worker does block. impl6 asked a question with Codex's question tool (pane shows `? 1 question`, `shift+← to answer`); herdr reported `blocked`, and the launcher gave exit 4 with the `question:` line. `worker.py answer` then failed: `herdr agent prompt: agent_blocked: agent w16:p63 is blocked and requires interactive input`. The director answered by hand: `herdr pane send-keys <pane> shift+left`, `herdr pane send-text <pane> "<answer>"`, then `send-keys <pane> enter` twice (the first enter did not submit). Make `answer` use that path for a blocked Codex pane, and the Claude equivalent for `AskUserQuestion`. Approval prompts stay off (`--ask-for-approval never`). `Herdr.send_keys` gives `check_target` no expected text, so it can reject the Enter after the answer is in the question box, and herdr.py has no guarded `send_text`. Add one answer operation in `scripts/herdr/herdr.py` that keeps the target check and checks that the typed answer is in the box before Enter; `scripts/herdr/herdr.py` and its tests are in this phase's files.
+1. Live evidence (Phase 42 repair, 2026-11-08): a Codex worker does block. impl6 asked a question with Codex's question tool (pane shows `? 1 question`, `shift+← to answer`); herdr reported `blocked`, and the launcher gave exit 4 with the `question:` line. `worker.py answer` then failed: `herdr agent prompt: agent_blocked: agent w16:p63 is blocked and requires interactive input`. The director answered by hand: `herdr pane send-keys <pane> shift+left`, `herdr pane send-text <pane> "<answer>"`, then `send-keys <pane> enter` twice (the first enter did not submit). Make `answer` use that path for a blocked Codex pane, and the Claude equivalent for `AskUserQuestion`. Approval prompts stay off (`--ask-for-approval never`). `Herdr.send_keys` gives `check_target` no expected text, so it can reject the Enter after the answer is in the question box, and herdr.py has no guarded `send_text`. Add one answer operation in `scripts/herdr/herdr.py` that keeps the target check and passes `check_target` the expected box text before each key; `scripts/herdr/herdr.py` and its tests are in this phase's files.
 2. A new Claude worker gets no first prompt. `worker_admission.transcript_source` raises "no source transcript found" for a Claude conversation that has no transcript yet, so `dispatch_receipt` returns evidence unknown and the launcher exits 8 with "no prompt sent". A new Codex conversation writes its rollout file at start, so Codex is not affected. Also check why the new Claude pane started in the director's worktree and not in `--cwd`.
 3. `worker_panes.py close` and `worker.py end` refuse a worker whose last pass is `interrupted` ("launcher has not recorded a completed pass"), so the proof pane `answerproof` (w16:p6A) stays open.
 4. `worker_panes.py close` reads a short shell prompt-hook process (direnv, with its bash child) in a stopped worker's pane as other work and refuses (cargo-liner [7ac1dfcc], 2026-11-08, pane p17). The process ended seconds later. A retry closes the pane.
 
 Cause of the cwd question (phase start, 2026-11-08): `worker_panes._start_locked` opens every worker pane, Codex and Claude, in the holder's worktree (`owner.worktree.path`), and a Codex resume passes the same directory with `--cd`. `assign.sh --cwd` reaches only the prompt. The proof passed a scratch `--cwd`, so the pane and `--cwd` differed. This is the same for both families and is not a Claude defect; a unit dispatches with `--cwd` set to its own worktree. No change.
 
-Defect 4: sdlc [1d1e7440] chose answer C (2026-11-08): when close sees another process in a stopped worker's pane, it reads the pane once more after about 1 s and refuses only if that process is still there. C adds a wait and a second read. The user's rule says the user approves each added check, so it is filed as a user question. It enters this phase as a repair item when the user approves it.
+Defect 4: sdlc [1d1e7440] chose answer C (2026-11-08): when close sees another process in a stopped worker's pane, it reads the pane once more after about 1 s and refuses only if that process is still there. C adds a wait and a second read. The user's rule says the user approves each added check, so it is filed as a user question. It enters a follow-up phase when the user approves it.
+
+Director proof, 2026-11-08 (test run `/home/natepiano/scratch/herdrcheck/answer28a-1794150217`, branch scripts):
+- Codex: impl6 asked "May I edit outside.txt" with its question tool; the launcher gave exit 4 and `question: impl6 pane w16:p6W`. `worker.py answer impl6 --text "Yes"` exited 0, and the pane showed the answer under the question. The rerun of the saved launcher exited 0 with `DONE a776d152-…`, the same dispatch, and the worker wrote `outside.txt`.
+- Claude: the new-worker first prompt now reaches the pane (item 4): answerproof read the prompt and replied with its DONE line. A Claude worker session has no `AskUserQuestion` tool (the worker said so and a tool search found none), so a Claude worker never stops on a question. Item 3 needs no Claude key sequence; a Claude worker keeps `prompt`.
+- Claude: the launcher and its rerun both gave exit 3, although the transcript ends with the DONE line. Cause: the Claude transcript now holds `api-request-blob` records whose `message.role` is `user` and whose text holds the whole request, the dispatch reminder included. `worker_admission.transcript_entry` reads them as user turns, so `transcript_receipt` stops reading the reply. This was there before this phase (28a did not change `transcript_entry`). It moves to Phase 28d with the Claude pass-completes proof and the `answerproof` close (its newest pass is not complete, so close refuses).
 
 #### Work Order
 
@@ -3507,7 +3512,29 @@ Defect 4: sdlc [1d1e7440] chose answer C (2026-11-08): when close sees another p
 - `docs/as-built/herdr-adoption.md` "Worker questions" names the key path for a blocked Codex worker.
 - basedpyright on the changed Python files reads `0 errors, 0 warnings, 0 notes`.
 - The full gate passes.
-- Director proof after the gate, for both families, in test runs under `/home/natepiano/scratch/herdrcheck/`: a Codex worker and a Claude worker, each asked to edit a file outside its paths, stop on the question; the director answers through `worker.py answer`, reruns the saved launcher, and the same pass completes with no second dispatch. A Claude worker needs a private `MODELS_CONFIG_FILE` with `direct=claude`. Close the proof pane `answerproof` (w16:p6A) with `worker_panes.py close` after item 5 lands.
+- Director proof after the gate, for both families, in test runs under `/home/natepiano/scratch/herdrcheck/`: a Codex worker and a Claude worker, each asked to edit a file outside its paths, stop on the question; the director answers through `worker.py answer`, reruns the saved launcher, and the same pass completes with no second dispatch. A Claude worker needs a private `MODELS_CONFIG_FILE` with `direct=claude`. Close the proof pane `answerproof` (w16:p6A) with `worker_panes.py close` after item 5 lands. (Proof result above: Codex passed; the Claude part moved to Phase 28d.)
+
+### Phase 28b — A worker's pane closes when its agent ends  · status: todo
+
+**Depends on:** Phase 28a (both edit `worker_panes.can_close` and close). sdlc [e19b58aa], 2026-11-08.
+
+Phase 27's rule is "only working workers hold a pane". Today only a manual close after an accepted pass releases a pane. devtools [26af13ea]: when a worker's agent ends without an accepted pass (a move, a quota stop or shutdown: `zsh: terminated ... accounts.py exec workers`), the row reads `StoppedWorker` and the pane stays at the shell. `ClosedWorker` rows also leave panes at the shell (devtools review, review2; w16:p27, p28). A row `fix` reads "dispatch role is unavailable"; the herdr proof row `answerproof` reads the same.
+
+Goal: when a worker's agent ends and nothing is sent to it, its pane closes; the row and thread stay for resume. Restore and moves already reopen only busy workers. Work Order: written at phase start.
+
+### Phase 28c — A new Codex worker proves only its own conversation  · status: todo
+
+**Depends on:** Phase 28a. Waits on the user's answer to the open question on old conversation files. sdlc [c0771f21], 2026-11-08.
+
+Cause (proved from the run records, 2026-11-08): a fresh Codex launch proves its thread inside `herdr.launch_rollout_proof`, where the only identity source is the new process's open `rollout-*` descriptors. queue cause28 (pid 195008) published herdr's `review` thread from 11-06, and handler review2 (pid 383931) published the agents `restore` thread from 11-05. Neither foreign rollout got a write then; each process now holds only its own rollout, made 4-6 s after the process started. So at the proof read the process had another thread's rollout open and its own not yet. Why Codex opens the old file is not proved.
+
+Fix when the user approves: in `launch_rollout_proof`, accept only a rollout whose file name time is at or after the process start. One test row. Work Order: written at phase start.
+
+### Phase 28d — A Claude worker's DONE reply is read  · status: todo
+
+**Depends on:** Phase 28a. Found by the 28a director proof.
+
+`worker_admission.transcript_entry` reads Claude `api-request-blob` records (`message.role` `user`, text holding the whole request) as user turns, so `transcript_receipt` stops reading the reply after one, and a Claude pass gives exit 3 with its DONE line in the transcript. Fix: read only Claude records whose top-level `type` is `user` or `assistant`. Acceptance adds the Claude part of the 28a proof (the pass completes with no second dispatch) and closes `answerproof` (w16:p6A) with `worker_panes.py close`. Work Order: written at phase start.
 
 ## Reference
 
