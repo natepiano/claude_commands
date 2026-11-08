@@ -1695,38 +1695,19 @@ Merge 82e4ed73a puts builds 7ab78b74e into this branch with phases 35 to 83. Its
 ### Phase 84 — The lint cache version and step state tests use half their CPU  · status: done
 **Depends on:** Phase 67
 
-#### Work Order
+#### As-built
 
-**Source:** the Phase 79 architect review add-on, settled "current, after 67 and 68" by the showrunner on 2026-11-07. They are the next free rows of `show.py top` after Phases 67 and 68.
+The lint cache version and step state tests use 66% less CPU, with all 13 tests kept. Same-time pairs on `/dev/shm`: 50.9 to 17.1 CPU s. `test_verify_lint_cache_versions.py` 22.6 to 9.7, `test_verify_step_state.py` 28.3 to 7.4.
 
-**Goal:** `direct/test_verify_lint_cache_versions.py` (58.4 CPU s median per gate, 7 tests) and `direct/test_verify_step_state.py` (53.0 CPU s, 6 tests) use half their CPU, or a measured floor shows why they cannot, with every checked behavior kept.
-
-**Spec:**
-1. Follow the Speed method. Measure CPU with `module_cost.py --tests 10 --commands 10` first: a process count does not rank CPU.
-2. Move each case that only needs a function's decision onto a direct call through `shell_functions`. Keep the real `verify.sh` starts that prove what no direct call can.
-3. A cut in `verify.sh` goes to verify with its measured gain. Add no guard, refusal or check (user rule, 2026-11-05).
-4. Read the importers of a shared fixture before you change it. Every importer stays green.
+- `test_verify_lint_cache_versions.py` checks the Mend, Rustfmt, Clippy and Taplo version keys by direct calls to the cache helper, with fresh version files per call. Two real `verify.sh` runs stay: startup with pass publication, and empty-version handling through startup.
+- `test_verify_step_state.py` shares one recorded lint sequence per class. The tree-step test calls the production `run_lint_sequence`, `fmt_cargo` and `invoke_mend` with the real `run`.
 
 **Files:**
-- `scripts/direct/test_verify_lint_cache_versions.py`
-- `scripts/direct/test_verify_step_state.py`
+- `scripts/direct/test_verify_lint_cache_versions.py` — version-key tests by direct call, plus two real runs.
+- `scripts/direct/test_verify_step_state.py` — step-state tests on one recorded sequence per class.
 
-**Workers:** 2 writers; each file has its own fixture
-- `impl` — `test_verify_lint_cache_versions.py`, role impl
-- `test` — `test_verify_step_state.py`, opens as impl
-
-**Constraints from prior phases:**
-- Phase 61: `test_verify_lint_cache_versions.py` already holds the harness form for lint functions. Do not apply a cut it already has.
-- Phase 67: the lint judgment cases call `run_lint_judgment`, `run_lint_held_sequence` and `run_lint_sequence` through `shell_functions`. Reuse that form.
-- Phase 76: a fixture that starts `verify.sh` sets `ROSTER_RUN_ROOT`, `UNIT_RUN_ROOT` and `SCRATCH_ROOT` inside its test root.
-- Tests never read or write live state: `~/.claude` main, `~/.local/state/merge-gate`, `/tmp/claude`.
-
-**Acceptance gate:**
-- The behavior map has a row for each assertion. For each moved check, breaking the function fails the new test, shown on a tempdir copy.
-- CPU s, processes, execs and wall s before and after, from `module_cost.py` and same-load pairs, in the checkpoint notice.
-- Each changed file and every importer of a changed fixture pass.
-- the targeted test green on the phase commit merged with `origin/builds`
-- `basedpyright` on the changed files prints `0 errors, 0 warnings, 0 notes`
+**Gotchas:**
+- A direct-call test goes through the production function that holds the checked branch. A test that calls a lower helper passes while that protection is bypassed; only a mutation of the branch shows it.
 
 ### Phase 85 — The style ledger ticket and finding tests use half their CPU  · status: done
 **Depends on:** none
