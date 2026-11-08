@@ -1404,39 +1404,17 @@ SIGINT at its default did not prove the cause of any failure in Spec step 5. `ev
 ### Phase 67 — The lint judgment and parser cases move onto verify's new functions  · status: done
 **Depends on:** Phase 61
 
-#### Work Order
+#### As-built
 
-**Source:** Phase 61 writers, 2026-11-06. `test_verify_lint_judgment.py` keeps 28 real starts, because `verify.sh:3704-3756` has no function boundary. The 38 parser cases of `test_verify_mac_only.py` also need a complete script setup. Verify takes both moves.
-
-**Goal:** `test_verify_lint_judgment.py` (123.5 CPU s) and `test_verify_mac_only.py` (107.4 CPU s after Phase 61) use half their CPU of Phase 61's base, or a measured floor shows why they cannot, with every checked behavior kept.
-
-**Spec:**
-1. Merge builds with verify's hash. Do not merge verify's branch.
-2. Follow the Speed method. Measure CPU with `module_cost.py --commands 10` first: a process count does not rank CPU.
-3. Move the judgment and parser cases onto direct calls of the two new functions. Keep the real starts that prove what no direct call can.
-4. A further cut in `verify.sh` goes to verify. Add no guard, refusal or check (user rule, 2026-11-05).
-5. Read the importers of a shared Mac fixture before you change it, and take the owner's word for any file another unit holds.
+- `test_verify_lint_judgment.py` calls `run_lint_judgment`, `run_lint_held_sequence` and `run_lint_sequence` through `shell_functions`. It keeps a real `verify.sh` start only for a path that no direct call proves. Same-load CPU: 68.3 → 19.1 s.
+- `test_verify_mac_only.py` checks its parser cases through `parse_routing_arguments`. `test_policy_refusals_start_nothing` keeps one real `verify test sample --env SHOTS` run: exit 2, the `--env and --fetch need --mac` line, and no runner, cargo or call-record event. Same-load CPU: 101.5 → 96.5 s.
 
 **Files:**
-- `scripts/direct/test_verify_lint_judgment.py`
-- `scripts/direct/test_verify_mac_only.py`
+- `scripts/direct/test_verify_lint_judgment.py` — lint judgment cases; direct calls plus the real starts only a real run proves.
+- `scripts/direct/test_verify_mac_only.py` — Mac-only policy and parser cases; one real refusal run.
 
-**Workers:** 2 writers; each file has its own fixture
-- `test` — `test_verify_lint_judgment.py`, opens as impl
-- `impl` — `test_verify_mac_only.py`, role impl
-
-**Constraints from prior phases:**
-- Phase 61: `test_verify_lint_cache_versions.py` holds the harness form for lint functions. `test_verify_mac_only.py`'s `mac_result()` holds the form for result functions.
-- Verify's functions: `run_lint_judgment`, `run_lint_held_sequence` and `run_lint_sequence` (7ea9b08ef), and `parse_routing_arguments` (0c855e894). Call them through `shell_functions`. The parser's arguments and globals are in `scripts/direct/test_verify_argument_parser.py`. After verify's 41g, new tests use the new forms: `final --saved`, `lint` with no package, `example --name` and `test --test`.
-- Phase 76: a fixture that starts `verify.sh` sets `ROSTER_RUN_ROOT`, `UNIT_RUN_ROOT` and `SCRATCH_ROOT` inside its test root, or `verify.sh:1272` reads the live `/tmp/claude/unit` through `progress_history.last_dispatch`, `unit_runs.held` and `_supplier_address`. `verify_lint_scope_test_support.py:276` and `verify_mac_offload_test_support.py:752` do not set all three. Set them in the owned test files; a shared support change needs its own owner.
-- Tests never read or write live state: `~/.claude` main, `~/.local/state/merge-gate`, `/tmp/claude`.
-
-**Acceptance gate:**
-- The behavior map has a row for each assertion. For each moved check, breaking the function fails the new test, shown on a tempdir copy.
-- CPU s, processes, execs and wall s before and after, from `module_cost.py` and same-load pairs, in the checkpoint notice.
-- The changed files pass. When `VerifyLintJudgmentFixture` or its constants change, these also pass: `test_verify_lint_cache.py`, `test_verify_lint_cache_fix_limit.py`, `test_verify_lint_fix_failures.py`, `test_verify_lint_fix_limit.py`, `test_verify_lint_fixes.py` and `test_verify_token_renew.py`.
-- the targeted test green on the phase commit merged with `origin/builds`, after both writers finish and the reviews converge
-- `basedpyright` on the changed files prints `0 errors, 0 warnings, 0 notes`
+**Gotchas:**
+- `test_verify_mac_only.py` stays at its floor until `verify.sh` makes one `build_targets.py` call per start that returns one JSON (verify owns this work). Count the file at this floor until then.
 
 ### Phase 68 — The assign launcher tests use half their CPU  · status: todo
 **Depends on:** Phase 54
