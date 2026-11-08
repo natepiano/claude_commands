@@ -15,7 +15,7 @@ import sys
 import time
 import unittest
 from collections.abc import Generator, Iterator
-from contextlib import contextmanager, redirect_stderr
+from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from pathlib import Path
 from typing import cast, override
 
@@ -26,6 +26,7 @@ from scripts.lib.socket_test_support import short_socket_directory
 from scripts.lint import tmp_sweep, folder_audit, sweep
 from scripts.lib import build_folders, cargo_output, conf, copy_record, scratch
 from scripts.lint.memory_test_support import config_environment, write_config_fixture
+from scripts.message import session_send
 
 DAY = 86_400
 
@@ -822,22 +823,60 @@ class FolderAuditTests(unittest.TestCase):
                                 check=True).stdout
         self.assertNotIn(str(worktree), listed)
 
-    def test_the_earliest_started_session_that_names_a_folder_is_its_maker(self) -> None:
+    def test_the_earliest_session_whose_command_makes_a_folder_is_its_maker(self) -> None:
         stray = folder(self.rust / "stray")
         other = folder(self.rust / "other")
         prefix = folder(self.rust / "stra")
+        project = folder(self.rust / "project")
         maker = self.root / "p" / "aaaa.jsonl"
         talker = self.root / "p" / "bbbb.jsonl"
         untimed = self.root / "p" / "cccc.jsonl"
         maker.parent.mkdir()
-        _ = maker.write_text(f'{{"timestamp":"2026-10-20T10:00:00.000Z","input":{{"command":"mkdir -p {stray} && echo \\"x\\""}}}}\n')
-        _ = talker.write_text(f'{{"timestamp":"2026-10-25T10:00:00.000Z","input":{{"command":"ls {stray} {other}/a"}}}}\n')
-        _ = untimed.write_text(f'{{"toolUseResult":{{"stdout":"{other}"}},"input":{{"command":"cd {other}"}}}}\n')
+        _ = maker.write_text(json.dumps({"timestamp": "2026-10-20T10:00:00.000Z", "cwd": str(self.rust),
+            "input": {"command": 'mkdir -p stray && echo "x"'}}) + "\n")
+        _ = talker.write_text(json.dumps({"timestamp": "2026-10-01T10:00:00.000Z", "cwd": str(self.root),
+            "input": {"command": f"ls {stray} {other}/a; cd {other}; du {stray}; rg pattern {other}"}}) + "\n")
+        later = self.root / "p" / "eeee.jsonl"
+        _ = later.write_text(json.dumps({"timestamp": "2026-10-25T10:00:00.000Z", "cwd": str(self.rust),
+            "input": {"command": "mkdir -p stray"}}) + "\n")
+        _ = untimed.write_text(json.dumps({"cwd": str(self.rust), "toolUseResult": {"stdout": str(other)},
+            "input": {"command": f"cd {other}"}}) + "\n")
         lister = self.root / "p" / "dddd.jsonl"
-        _ = lister.write_text(f'{{"timestamp":"2026-10-01T10:00:00.000Z","toolUseResult":{{"stdout":"{stray}"}}}}\n')
+        _ = lister.write_text(json.dumps({"timestamp": "2026-09-01T10:00:00.000Z", "cwd": str(self.rust),
+            "toolUseResult": {"stdout": str(stray)}}) + "\n")
+        child_maker = self.root / "p" / "ffff.jsonl"
+        _ = child_maker.write_text(json.dumps({"timestamp": "2026-09-15T10:00:00.000Z", "cwd": str(self.rust),
+            "input": {"command": f"mkdir -p {stray}/notes {other}/notes"}}) + "\n")
+        clone_maker = self.root / "p" / "gggg.jsonl"
+        _ = clone_maker.write_text(json.dumps({"timestamp": "2026-10-20T10:00:00.000Z", "cwd": str(self.rust),
+            "input": {"command": "git clone https://example.invalid/project.git"}}) + "\n")
         os.utime(untimed, (time.time(), time.time()))
-        named = folder_audit.makers([stray, other, prefix, self.rust / "unnamed"], [maker, talker, untimed, lister])
-        self.assertEqual(named, {stray: "aaaa", other: "bbbb"})
+        named = folder_audit.makers([stray, other, prefix, project, self.rust / "unnamed"],
+                                    [later, talker, child_maker, clone_maker, untimed, lister, maker])
+        self.assertEqual(named, {stray: "aaaa", project: "gggg"})
+
+    def test_a_folder_without_a_creation_command_prints_unknown_and_gets_no_message(self) -> None:
+        stray = folder(self.temp / "unproven")
+        transcript = self.root / "observer.jsonl"
+        _ = transcript.write_text(json.dumps({"timestamp": "2026-10-01T10:00:00.000Z", "cwd": str(self.temp),
+            "input": {"command": f"ls {stray}; cd {stray}; du {stray}; rg pattern {stray}"}}) + "\n")
+        proc = self.root / "proc"
+        proc.mkdir()
+        loose = folder_audit.audit(self.rust, [self.temp], frozenset(), time.time(), files=[transcript],
+            proc=str(proc), sockets=str(self.root / "unix"), clone_roots=[])
+        self.assertEqual([(entry.path, entry.maker) for entry in loose], [(stray, "")])
+        output = io.StringIO()
+        with (unittest.mock.patch.object(folder_audit, "audit", return_value=loose),
+              unittest.mock.patch.object(session_send, "send_argv") as send,
+              redirect_stdout(output)):
+            self.assertEqual(folder_audit.main(["--send"]), 0)
+        self.assertIn(f"loose: {stray} (2.0 d idle) maker unknown:", output.getvalue())
+        send.assert_not_called()
+
+    def test_the_codex_daemon_folder_is_not_loose(self) -> None:
+        _ = folder(self.temp / "codex-daemon-1000")
+        ordinary = folder(self.temp / "ordinary")
+        self.assertEqual(folder_audit.candidates(self.rust, [self.temp], frozenset()), [ordinary])
 
     def test_the_message_lists_each_folder_and_names_scratch(self) -> None:
         loose = [folder_audit.Loose(Path("/home/u/rust/a"), 0.0, "s"),

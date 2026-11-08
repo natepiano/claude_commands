@@ -36,6 +36,7 @@ import shlex
 import sys
 from collections import deque
 from collections.abc import Iterator
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol, TypedDict, cast, override
 
@@ -408,9 +409,17 @@ def nested_build_copy(path: Path) -> bool:
         SESSION_SCRATCHPAD.fullmatch(part) for part in path.parts[:-1])
 
 
-def loose_folders(text: str, cwd: Path) -> list[Path]:
-    """Every new loose folder the command makes, following `cd` between its commands."""
-    found: list[Path] = []
+@dataclass(frozen=True)
+class CreationTarget:
+    """A resolved creation path and its repository-copy rule."""
+
+    path: Path
+    repository_copy: bool
+
+
+def creation_targets(text: str, cwd: Path) -> Iterator[CreationTarget]:
+    """Resolve creation targets while following environment words and working folders."""
+    found: list[CreationTarget] = []
     for words in commands(text):
         while words and ENVIRONMENT_WORD.fullmatch(words[0]):
             words = words[1:]
@@ -418,18 +427,27 @@ def loose_folders(text: str, cwd: Path) -> list[Path]:
             continue
         verb = Path(words[0]).name
         if verb.startswith("make_a_worktree"):
-            return []
+            return
         if verb == "cd":
             moved = expanded(words[1], cwd) if len(words) > 1 else real("~")
             if moved is None:
-                return found
+                break
             cwd = moved
             continue
         copying = repository_copy(words, cwd)
         for path in targets(words, cwd):
-            top = (path if copying and nested_build_copy(path) else loose_folder(path)) if path is not None else None
-            if top is not None and top not in found:
-                found.append(top)
+            if path is not None:
+                found.append(CreationTarget(path, copying))
+    yield from found
+
+
+def loose_folders(text: str, cwd: Path) -> list[Path]:
+    """Every new loose folder the command makes, following `cd` between its commands."""
+    found: list[Path] = []
+    for target in creation_targets(text, cwd):
+        top = target.path if target.repository_copy and nested_build_copy(target.path) else loose_folder(target.path)
+        if top is not None and top not in found:
+            found.append(top)
     return found
 
 

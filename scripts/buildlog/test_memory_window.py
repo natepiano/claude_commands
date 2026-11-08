@@ -768,11 +768,9 @@ class BuildOutputProgramTests(unittest.TestCase):
         target = cargo_output(self.base / "unrecorded-output")
         self.assertTrue(memory.build_output_program(str(target / "debug/deps/test")))
 
-    def test_cargo_cache_tag_with_a_build_tree_identifies_a_build_program(self) -> None:
-        target = self.base / "tagged-output"
-        (target / "debug/.fingerprint").mkdir(parents=True)
-        scratch.mark_cargo_cache(target)
-        self.assertTrue(memory.build_output_program(str(target / "debug/deps/test")))
+    def test_cargo_target_folder_is_not_a_build_program(self) -> None:
+        target = cargo_output(self.base / "output")
+        self.assertFalse(memory.build_output_program(str(target)))
 
     def test_cache_tag_without_a_build_tree_is_not_a_build_program(self) -> None:
         registry = self.base / "registry"
