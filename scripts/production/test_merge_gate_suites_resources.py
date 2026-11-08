@@ -1,6 +1,8 @@
 """Merge gate suites contracts."""
 
 from __future__ import annotations
+from scripts.build_queue import admission_records
+
 from scripts.build_queue import queue_place, admission_protocol as wire
 
 import unittest
@@ -52,7 +54,6 @@ class CpuUsageTest(unittest.TestCase):
 if __name__ == "__main__":
     Path(sys.argv[2]).write_text(str(spin_cpu(float(sys.argv[1]))))
 '''
-from scripts.lint import memory_admit
 from scripts.lib import copy_record, scratch
 from scripts.message.process_test_support import OwnedTestProcesses
 
@@ -330,7 +331,7 @@ class MergeGateResourcesTests(GateSuitesFixture):
                 with self.assertRaises(BlockingIOError):
                     fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
 
-        def observed(result: memory_admit.AdmissionWaitSnapshot) -> None:
+        def observed(result: admission_records.AdmissionWaitSnapshot) -> None:
             nonlocal admitted
             admitted = result.decision.state == "admit"
             if result.decision.state == "hold":

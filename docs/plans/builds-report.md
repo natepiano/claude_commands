@@ -833,7 +833,7 @@ The build log index uses WAL mode, so a spilled update takes no exclusive lock a
 **Ruled out:**
 - A change to `INDEX_SPILL_PAGES`: a value change needs the user's approval (builds showrunner, 2026-11-08).
 
-### Phase 38 — Each moved admission name has one import path · status: todo
+### Phase 38 — Each moved admission name has one import path · status: done
 **Depends on:** queue-unit's Phase 10o and resources 0dfe65382 (both on this branch); nothing in this plan. This phase was queue-unit's Phase 21 (builds-queue.md).
 
 From the builds showrunner (not the user), 2026-11-08: "queue has too much work. You get three of its phases … Phase 21: each moved admission name has one import path. … Order 21 freely." The design call is the builds showrunner's, 2026-11-06: "The owner of a move switches every caller, and the old path goes."

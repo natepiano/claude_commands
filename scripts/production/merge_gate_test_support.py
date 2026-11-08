@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from scripts.build_queue import admission_records
+
 from scripts.shutdown import remote
 
 from collections.abc import Callable, Generator, Sequence
@@ -426,7 +428,7 @@ class MergeGateFixture(unittest.TestCase):
         return [cast(dict[str, object], json.loads(line)) for line in path.read_text().splitlines()] if path.exists() else []
 
     def occupy_memory_queue(self) -> wire.Admitted:
-        request = self.admission.request(need=21 * memory_admit.GIB, step="build")
+        request = self.admission.request(need=21 * admission_records.GIB, step="build")
         with self.admission.loop_turn():
             return only_admitted(self.admission.server.handle_request(request))
 
@@ -437,7 +439,7 @@ class MergeGateFixture(unittest.TestCase):
             self.assertEqual(list(self.admission_directory.glob("*." + suffix)), [], suffix)
 
     @contextlib.contextmanager
-    def observing_admission(self, observe: Callable[[memory_admit.AdmissionWaitSnapshot], None]) -> Generator[None]:
+    def observing_admission(self, observe: Callable[[admission_records.AdmissionWaitSnapshot], None]) -> Generator[None]:
         server = self.admission.server
         previous = server.reply_filter
 
@@ -449,17 +451,17 @@ class MergeGateFixture(unittest.TestCase):
                 waiter = record.queue_waiter
                 inputs = server.last_inputs
                 result = server.last_result
-                self.assertIsInstance(inputs, memory_admit.QueueInputs)
+                self.assertIsInstance(inputs, admission_records.QueueInputs)
                 self.assertIsInstance(result, memory_admit.PassResult)
-                assert isinstance(inputs, memory_admit.QueueInputs)
+                assert isinstance(inputs, admission_records.QueueInputs)
                 assert isinstance(result, memory_admit.PassResult)
-                outcome = next(row for row in result.rows if row.owner == memory_admit.waiter_owner(waiter))
-                peak = memory_admit.ExpectedPeak(reply.need, reply.source, waiter.get("need_runs", 0),
+                outcome = next(row for row in result.rows if row.owner == admission_records.waiter_owner(waiter))
+                peak = admission_records.ExpectedPeak(reply.need, reply.source, waiter.get("need_runs", 0),
                     memory_admit.read_need_basis(waiter.get("need_basis")))
-                available = inputs.host.available if isinstance(inputs.host, memory_admit.HostMemory) else 0
+                available = inputs.host.available if isinstance(inputs.host, admission_records.HostMemory) else 0
                 policy = server.last_policy
-                assert isinstance(policy, memory_admit.AdmissionPolicy)
-                observe(memory_admit.AdmissionWaitSnapshot(outcome.decision, peak, tuple(inputs.running),
+                assert isinstance(policy, admission_records.AdmissionPolicy)
+                observe(admission_records.AdmissionWaitSnapshot(outcome.decision, peak, tuple(inputs.running),
                     available, record.repo, record.step, policy, server.last_diagnostics))
             return previous(reply)
 

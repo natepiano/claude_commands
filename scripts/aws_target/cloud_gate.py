@@ -31,7 +31,7 @@ from scripts.build_targets import target_config
 from scripts.buildlog import store
 from scripts.lib import conf
 from scripts.lib.atomic_file import write_text_atomic
-from scripts.lint import memory_admit
+from scripts.build_queue import admission_records
 from scripts.production import affected_modules
 from scripts.production.gate_modules import GateRefused, discover_test_modules
 from scripts.production import merge_gate as gate
@@ -119,12 +119,12 @@ class CloudReservation:
 def cloud_reservation(repo: Path, sidecar: Path, mode: gate.SuiteMode) -> Generator[CloudReservation]:
     """Keep the route's cloud slot until its result or fallback returns."""
     pid = os.getpid()
-    start = memory_admit.process_start_time(pid)
+    start = admission_records.process_start_time(pid)
     if start is None:
         raise GateRefused('The cloud route has no live process identity')
     owner, episode, since = wire.Owner(pid, start), uuid4().hex, time.time()
-    profile = memory_admit.ProgramProfile(mode.value, str(Path(__file__).resolve().parents[2]), str(repo.resolve()),
-        memory_admit.HistoryPeakSizing(0, memory_admit.FirstProgramPeak(0), 0.0))
+    profile = admission_records.ProgramProfile(mode.value, str(Path(__file__).resolve().parents[2]), str(repo.resolve()),
+        admission_records.HistoryPeakSizing(0, admission_records.FirstProgramPeak(0), 0.0))
     def refresh() -> wire.AdmitRequest:
         request = admission_client.step_request([mode.value], str(repo), owner, since, str(sidecar), episode,
             profile, run=wire.RunIdentity(pid, start))
