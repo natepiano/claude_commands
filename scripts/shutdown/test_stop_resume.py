@@ -2229,9 +2229,12 @@ class StopResumeTests(unittest.TestCase):
 
     def test_move_waits_for_exit_when_term_removes_the_registry_before_cleanup_finishes(self) -> None:
         identity = self.entry["session_id"]
-        for exits, error in ((True, ValueError("pid 123: native registry identity is unavailable")),
+        staff_id = staff.StaffId(identity)
+        row = staff.StaffRow(staff_id, "unit", "alpha", staff.StaffRoot(), current_session=staff_id)
+        _ = self.enterContext(patch.object(staff, "initial_snapshot", return_value=staff.StaffSnapshot((row,))))
+        for exits, error in ((True, herdr.NativeRegistryUnavailable("pid 123: native registry identity is unavailable")),
                              (True, PermissionError("process read denied during exit")),
-                             (False, ValueError("pid 123: native registry identity is unavailable"))):
+                             (False, herdr.NativeRegistryUnavailable("pid 123: native registry identity is unavailable"))):
             with self.subTest(exits=exits, error=error):
                 self.clock.elapsed = 0
                 self.launched.clear()
@@ -2259,7 +2262,10 @@ class StopResumeTests(unittest.TestCase):
                 with patch.object(herdr, "native_process", side_effect=native), redirect_stderr(io.StringIO()) as output:
                     result = stop_resume.move("alpha", "claude4", why="limit")
                 self.kill.assert_called_once_with(123, signal.SIGTERM)
-                self.assertIn("stop identity anomaly after SIGTERM:", output.getvalue())
+                if isinstance(error, herdr.NativeRegistryUnavailable):
+                    self.assertEqual(output.getvalue(), "")
+                else:
+                    self.assertIn("stop identity anomaly after SIGTERM:", output.getvalue())
                 if exits:
                     self.assertEqual(result, stop_resume.ClaudeUp(identity, "w1:p2", "claude4"))
                     self.start.assert_called_once()
@@ -2471,6 +2477,33 @@ class StopResumeTests(unittest.TestCase):
         self.assertEqual(errors.getvalue().splitlines(), [
             f"{self.entry['session_id']}: prompt identity anomaly: registry unavailable"])
         self.detach.assert_called()
+
+    def test_resume_prepares_the_transcript_cursor_before_launch(self) -> None:
+        path = Path(self.entry["config_dir"]) / "projects" / "fixture" / f"{self.entry['session_id']}.jsonl"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        _ = path.write_text('{"type":"assistant","message":{"content":"old context"}}\n')
+        before = path.stat().st_size
+
+        def start(*_command: str) -> str:
+            with path.open("a") as stream:
+                _ = stream.write(json.dumps({
+                    "type": "user",
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "message": {"role": "user", "content": "launch-time work"},
+                }) + "\n")
+            return ""
+
+        self.start.side_effect = start
+        identity = staff.StaffId(self.entry["session_id"])
+        row = staff.StaffRow(identity, "unit", "alpha", staff.StaffRoot(), current_session=identity)
+        with patch.object(staff, "initial_snapshot", return_value=staff.StaffSnapshot((row,))):
+            result = stop_resume.resume("alpha", why="maintenance")
+        self.assertIsInstance(result, stop_resume.ClaudeUp)
+        self.assertEqual(len(self.client.prompts), 1)
+        cursor = self.client.prompts[0][1].cursor
+        assert isinstance(cursor, herdr.TranscriptCursor)
+        self.assertEqual(cursor.offsets[path], before)
+        self.assertEqual(len(cursor.read_turns()), 1)
 
     def test_resume_identity_mismatch_dispatches_no_work_without_retry(self) -> None:
         proof = "019b3a40-4250-7000-8000-000000000199"

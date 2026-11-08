@@ -118,6 +118,13 @@ Short tab titles can repeat across workspaces.
 
 ### Claude trust before every launch
 
+`copies.py clone` checks source trust through `herdr.claude_trust` in every Claude account home.
+Trust in any home authorizes the clone in every existing account file.
+The clone record stores its resolved `claude_trust_folder` before the locked accounts writer grants trust.
+Removal deletes that folder's complete project entry after the external removal mark exists.
+It preserves other project entries and settings and skips missing account files.
+Malformed or unreadable account files produce an anomaly while the other homes continue.
+
 Every Claude launch writes trust before starting Claude. The target account does not need an existing trust entry.
 
 - `trust_claude_launch(folder, config_dir)` calls the shared `_write_claude_trust` writer.

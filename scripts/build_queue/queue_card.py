@@ -5,10 +5,11 @@ from collections.abc import Sequence
 
 from scripts.buildlog import store
 from scripts.build_queue import head_facts, queue_evidence, queue_lines
+from scripts.build_queue import admission_protocol as wire
 from scripts.build_queue.queue_lines import Line, Span, age, wrap
 from scripts.build_queue.scope_activity import NotServiceSlice
 from scripts.build_queue.queue_view import (QueueModel, behind_place, eligible_head_position, check_line, check_lines, clock, estimate_minutes,
-    has_move_priority, is_moved, name_spans, name_text, pressure_check, shown_waiters, reason_phrase, running_matches_selector, start_text, step_checks, same_waiter, HostLoad)
+    cloud_lines, cloud_matches, cloud_rows, has_move_priority, is_moved, name_spans, name_text, pressure_check, shown_waiters, reason_phrase, running_matches_selector, start_text, step_checks, same_waiter, HostLoad)
 from scripts.lint import memory_admit as gate
 
 
@@ -209,7 +210,8 @@ def page_running_steps(model: QueueModel) -> list[gate.ExplainedRunningStep]:
 
 
 def render_card(model: QueueModel, matches: Sequence[int], columns: int,
-                selected_running: Sequence[gate.ExplainedRunningStep] = ()) -> list[Line]:
+                selected_running: Sequence[gate.ExplainedRunningStep] = (),
+                selected_cloud: tuple[wire.CloudRow, ...] = ()) -> list[Line]:
     head = model.reading.explanation.head
     head_card = isinstance(head, gate.HeadExplanation) and any(
         same_waiter(model.reading.view.waiting[position - 1], head.waiter) for position in matches)
@@ -217,6 +219,9 @@ def render_card(model: QueueModel, matches: Sequence[int], columns: int,
     if lines:
         lines.append(())
     lines.extend(_recorded_evidence(model, head_card, columns, selected_running))
+    cloud = cloud_lines(model, columns, selected_cloud) if selected_cloud else []
+    if cloud:
+        lines.extend([(), *cloud])
     return lines
 
 
@@ -224,6 +229,9 @@ def render_selection(model: QueueModel, selector: str, columns: int) -> list[Lin
     matches = select_waiters(model, selector)
     running_matches = [running for running in page_running_steps(model)
         if running_matches_selector(running.step, selector, model.labels)]
-    if not matches and not running_matches:
+    cloud = tuple(row for row in cloud_rows(model) if cloud_matches(row, selector, model.cloud_labels))
+    if cloud and not matches and not running_matches:
+        return cloud_lines(model, columns, cloud)
+    if not matches and not running_matches and not cloud:
         return wrap((Span(f"No waiting or running step matches {selector}."),), columns)
-    return render_card(model, matches, columns, running_matches)
+    return render_card(model, matches, columns, running_matches, cloud)

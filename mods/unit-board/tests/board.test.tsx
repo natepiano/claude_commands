@@ -735,6 +735,67 @@ describe("unit detail layout", () => {
       expect(rows).toEqual(["1         fix    idle    short activity", "adversary review running long activity"]);
     });
 
+    test(`${surface}: a detached run shows its age, growth, last line, and state color`, async ($, on) => {
+      const data = noPhase();
+      data.units[0]!.workers = [{ slot: "test", role: "test", state: "waiting on run", model: "",
+        doing: "old activity", run: { label: "Python checks", started_at: NOW / 1000 - 720,
+          growth: { kind: "measured", cpu_percent: 87, log_bytes_per_minute: 3100 },
+          last_line: "42 tests passed" } }];
+      const ui = await render($, on, surface, data, true);
+      const tree = await ui.drawn();
+      const row = normalized(lines(tree)).find(row => row.startsWith("test"))!;
+      expect(row).toContain("waiting on run Python checks 12m");
+      expect(row).toContain("cpu 87%");
+      expect(row).toContain("log +3.1 KB/min");
+      expect(row).toContain("42 tests passed");
+      expect(textInColor(tree, "suggestion")).toContain("waiting on run");
+    });
+
+    test(`${surface}: first readings and finished results retain their distinct run facts`, async ($, on) => {
+      const data = noPhase();
+      data.units[0]!.workers = [
+        { slot: "first", role: "test", state: "waiting on run", model: "", doing: "",
+          run: { label: "New checks", started_at: NOW / 1000 - 3840,
+            growth: { kind: "first_reading" }, last_line: "starting" } },
+        { slot: "gone", role: "test", state: "run gone", model: "", doing: "",
+          run: { label: "Lost checks", started_at: NOW / 1000 - 720,
+            growth: { kind: "first_reading" }, last_line: "last progress" } },
+        { slot: "queued", role: "test", state: "result queued", model: "", doing: "",
+          run: { label: "Failed checks", started_at: NOW / 1000 - 720,
+            growth: { kind: "finished", exit_code: 1 }, last_line: "one failure" } },
+        { slot: "passed", role: "test", state: "result queued", model: "", doing: "",
+          run: { label: "Passed checks", started_at: NOW / 1000 - 720,
+            growth: { kind: "finished", exit_code: 0 }, last_line: "all passed" } },
+        { slot: "working", role: "impl", state: "working", model: "", doing: "editing" },
+      ];
+      const ui = await render($, on, surface, data, true);
+      const tree = await ui.drawn();
+      const rows = normalized(lines(tree));
+      const first = rows.find(row => row.startsWith("first"))!;
+      expect(first).toContain("1h04m");
+      expect(first).toContain("cpu …");
+      expect(first).toContain("log …");
+      expect(first).not.toContain("cpu 0%");
+      expect(rows.find(row => row.startsWith("queued"))).toContain("exit 1");
+      expect(rows.find(row => row.startsWith("passed"))).toContain("exit 0");
+      expect(textInColor(tree, "error")).toContain("run gone");
+      expect(textInColor(tree, "warning")).toContain("result queued");
+      expect(textInColor(tree, "suggestion")).toContain("working");
+    });
+
+    test(`${surface}: a long run log stays inside the pane width`, async ($, on) => {
+      const data = noPhase();
+      data.units[0]!.workers = [{ slot: "test", role: "test", state: "waiting on run", model: "", doing: "",
+        run: { label: "checks", started_at: NOW / 1000 - 720,
+          growth: { kind: "measured", cpu_percent: 87, log_bytes_per_minute: 3100 },
+          last_line: "progress " + "界".repeat(100) + " END OF LONG LOG" } }];
+      const ui = await render($, on, surface, data, true, 170);
+      const row = lines(await ui.drawn()).find(row => row.trimStart().startsWith("test"))!;
+      expect(row).toContain("progress");
+      expect(row).not.toContain("END OF LONG LOG");
+      expect(cellWidth(row)).toBeLessThanOrEqual(170);
+    });
+
     test(`${surface}: an empty phase history has an explicit readable record line`, async ($, on) => {
       const data = noPhase();
       data.units[0]!.state = "run-finished";
@@ -841,4 +902,27 @@ describe("unit detail layout", () => {
       expect(lines(tree).join("\n")).not.toContain("plan.md");
     });
   }
+});
+
+
+describe("live worker board refresh", () => {
+  test("live boards refresh every ten seconds and stop when no worker is live", async ($, on) => {
+    const fake = engineFiles(on);
+    const data = { ...fixture(), live: true };
+    fake.replace(data);
+    await $.command.run({ command: "showrunner:unit_board", args: "",
+      origin: { kind: "composer" }, presentation: { isFullscreen: false, columns: 170 } });
+    fake.clear();
+    await fake.clock.advance(10_000);
+    expect(fake.processes).toHaveLength(1);
+    fake.clear();
+    const finished = { ...data, live: false };
+    fake.replace(finished);
+    await fake.clock.advance(10_000);
+    expect(fake.processes).toHaveLength(1);
+    fake.clear();
+    await fake.clock.advance(20_000);
+    expect(fake.processes).toEqual([]);
+    expect(fake.reads).toEqual([]);
+  });
 });

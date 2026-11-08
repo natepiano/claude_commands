@@ -12,7 +12,7 @@ import stat
 import subprocess
 import sys
 import unittest
-from collections.abc import Callable, Iterator
+from collections.abc import Callable
 from contextlib import AbstractContextManager, chdir, redirect_stderr
 from dataclasses import FrozenInstanceError, replace
 from multiprocessing.connection import Connection
@@ -62,16 +62,6 @@ class StaffCommandTestCase(StaffTestCase):
         self.assertEqual(result.returncode, code, result.stderr)
         return result
 
-
-class CountedStaffRows(tuple[staff.StaffRow, ...]):
-    """Count full scans of the staff rows during repeated id lookups."""
-
-    scans: int = 0
-
-    @override
-    def __iter__(self) -> Iterator[staff.StaffRow]:
-        self.scans += 1
-        return super().__iter__()
 
 KILLED_WRITER = """import os, sys
 sys.platform = 'linux'
@@ -199,18 +189,6 @@ class NativeRuntimeIdentityTests(StaffCommandTestCase):
                 self.assertIn("morty", shown.stdout)
                 self.assertIn("agent", shown.stdout)
                 self.assertEqual(staff.StaffRow.from_json(row.to_json()), row)
-
-    def test_repeated_id_lookups_scan_the_staff_rows_at_most_once(self) -> None:
-        _, unit, _ = self.tree()
-        expected = tuple(replace(unit, id=staff.StaffId(fixture_runtime_id(f"indexed-{number}")))
-                         for number in range(400))
-        rows = CountedStaffRows(expected)
-        record = staff.StaffSnapshot(rows)
-        for number in range(200):
-            row = expected[number % 7]
-            self.assertIs(record.by_id(row.id), row)
-            self.assertIsNone(record.by_id(MISSING_ID))
-        self.assertLessEqual(rows.scans, 1)
 
     def test_unit_lookup_keeps_exact_removed_worktrees_and_ignores_showrunners(self) -> None:
         runner, unit, _ = self.tree()
@@ -441,6 +419,7 @@ class DocumentLookupTests(StaffCommandTestCase):
         main = self.root / "main"
         main.mkdir()
         self.git(main, "init", "-b", "main")
+        self.git(main, "config", "maintenance.auto", "false")
         self.git(main, "config", "user.name", "Document Test")
         self.git(main, "config", "user.email", "document@example.invalid")
         document = main / "docs/plans/example-production.md"

@@ -1437,6 +1437,7 @@ class WorkerCommandTests(unittest.TestCase):
             run = runs / name
             run.mkdir(parents=True)
             atomic_file.write_text_atomic(run / unit_runs.STATE_FILE, '{}')
+            atomic_file.write_text_atomic(run / "fixture-impl_status", "running\n")
         with patch.object(unit_runs, "held_by_session", wraps=unit_runs.held_by_session) as scans:
             code, output, errors = self.command("list", "--json")
         self.assertEqual(code, 0, errors)

@@ -14,7 +14,7 @@ from typing import ClassVar, TypedDict, cast, override
 from unittest.mock import patch
 
 from scripts.agents import codex_mesh, test_codex_mesh as mesh_fixture
-from scripts.direct import assign
+from scripts.direct import assign, workers
 from scripts.direct.recorder_fixture import communicate_launcher, invoke_recorder
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.git_test_support import commit_repository
@@ -66,8 +66,41 @@ class LauncherScript:
 
 
 AssignmentExecution = InProcessAssignment | LauncherScript
-# Worker admission requires the actual assignment process.
+# Process cases keep the actual assignment launcher.
 DEFAULT_ASSIGNMENT_EXECUTION = LauncherScript(ASSIGN)
+
+
+def invoke_assignment(arguments: list[str], environment: dict[str, str]) -> subprocess.CompletedProcess[str]:
+    """Call the real coordinator and its synchronous Python commands."""
+    real_call = assign.call
+
+    def call(command: list[str], env: dict[str, str], *, capture: bool = False,
+             check: bool = True) -> subprocess.CompletedProcess[str]:
+        if command[1] == assign.PROGRESS:
+            result = invoke_recorder(command[2:], env, ROOT)
+        elif command[1] == str(assign.SCRIPTS / "workers.py"):
+            result = invoke_cli(workers, workers.main, command[2:], env, ROOT)
+        elif command[1] == assign.MESH:
+            result = invoke_cli(codex_mesh, codex_mesh.main, command[2:], env, ROOT)
+        else:
+            return real_call(command, env, capture=capture, check=check)
+        if not capture:
+            print(result.stdout, end="")
+            print(result.stderr, end="", file=sys.stderr)
+        if check and result.returncode:
+            if capture:
+                print(result.stderr or result.stdout, file=sys.stderr, end="")
+            raise SystemExit(2)
+        return result
+
+    def follow(dispatch: assign.Dispatch, command: list[str], shown: str, log: Path) -> int:
+        del shown, log
+        return call(command, dispatch.env, check=False).returncode
+
+    # Process tests cover the ancestor check and the child lifecycle.
+    with (patch.object(assign, "require_live_director"),
+          patch.object(assign, "call", call), patch.object(assign.Dispatch, "follow", follow)):
+        return invoke_cli(assign, assign.main, arguments, environment, ROOT)
 
 
 def read_object(path: Path) -> dict[str, object]:
@@ -196,7 +229,7 @@ class AssignLauncherFixture(mesh_fixture.MeshCommandFixture):
             arguments.extend(["--paths", str(self.paths)])
         arguments.extend(options)
         if isinstance(execution, InProcessAssignment):
-            return invoke_cli(assign, assign.main, arguments, os.environ.copy(), ROOT)
+            return invoke_assignment(arguments, os.environ.copy())
         return self.run_launcher(["bash", str(execution.path), *arguments])
 
     def run_launcher(self, arguments: list[str], *, family: str = "codex",
@@ -289,6 +322,19 @@ class FirstDispatchArtifact:
     mode: int
 
 
+def snapshot_files(root: Path) -> dict[Path, bytes]:
+    """Read regular files before a dispatch."""
+    return {path.relative_to(root): path.read_bytes() for path in root.rglob("*")
+            if path.is_file() and not path.is_symlink()}
+
+
+def changed_files(root: Path, before: dict[Path, bytes]) -> tuple[FirstDispatchArtifact, ...]:
+    """Keep files that the dispatch changed."""
+    return tuple(FirstDispatchArtifact(relative, content, (root / relative).stat().st_mode)
+                 for relative, content in snapshot_files(root).items()
+                 if before.get(relative) != content)
+
+
 class FirstDispatchObservations(TypedDict):
     requests: list[dict[str, object]]
     turn_starts: int
@@ -328,13 +374,9 @@ class FirstDispatchFixture(AssignLauncherFixture):
         root = self.session_dir.parent
         key = (role, *options)
         if key not in self.first_dispatches:
-            before = {path.relative_to(root): path.read_bytes() for path in root.rglob("*")
-                      if path.is_file() and not path.is_symlink()}
+            before = snapshot_files(root)
             _ = self.successful(role, *options)
-            artifacts = tuple(FirstDispatchArtifact(path.relative_to(root), path.read_bytes(), path.stat().st_mode)
-                              for path in root.rglob("*")
-                              if path.is_file() and not path.is_symlink()
-                              and before.get(path.relative_to(root)) != path.read_bytes())
+            artifacts = changed_files(root, before)
             observations: FirstDispatchObservations = {
                 "requests": self.server.requests, "turn_starts": self.turn_starts,
                 "turn_inputs": self.turn_inputs, "started_turns": self.started_turns,

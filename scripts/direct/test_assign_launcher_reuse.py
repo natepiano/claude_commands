@@ -40,7 +40,7 @@ class AssignReuseTests(launcher_fixture.FirstDispatchFixture):
         })))
 
     def test_a_dead_launcher_and_server_recover_the_same_thread_for_named_dispatch(self) -> None:
-        _ = self.successful()
+        self.first_assignment()
         name, original = next(iter(self.assignment_records().items()))
         original.update({"status": "running", "launcher_pid": 99999999, "turn_id": "lost-turn"})
         self.write_pool_roster({name: original})
@@ -62,7 +62,7 @@ class AssignReuseTests(launcher_fixture.FirstDispatchFixture):
         self.assertEqual(self.turn_starts, 2)
 
     def test_an_ended_worker_dispatches_again_on_its_recorded_thread(self) -> None:
-        _ = self.successful()
+        self.first_assignment()
         name, original = next(iter(self.assignment_records().items()))
         code, output, errors = self.run_mesh(["end", "--to", name])
         self.assertEqual(code, 0, output + errors)
@@ -76,7 +76,7 @@ class AssignReuseTests(launcher_fixture.FirstDispatchFixture):
         self.assertEqual(self.turn_starts, 2)
 
     def assert_reopened_dispatch_keeps_a_thread_when_resume_fails(self, status: str) -> None:
-        _ = self.successful()
+        self.first_assignment()
         name, original = next(iter(self.assignment_records().items()))
         original.update({"status": status, "launcher_pid": 99999999})
         self.write_pool_roster({name: original})
@@ -108,7 +108,7 @@ class AssignReuseTests(launcher_fixture.FirstDispatchFixture):
     def test_named_dispatch_reuses_a_thread_and_advances_the_manifest_number(self) -> None:
         self.first_assignment()
         name, original = next(iter(self.assignment_records().items()))
-        _ = self.successful("test", "--to", name)
+        _ = self.successful("test", "--to", name, execution=launcher_fixture.InProcessAssignment())
         self.assertEqual(self.assignment_records()[name]["thread_id"], original["thread_id"])
         self.assertEqual(len(self.methods("thread/start")), 1)
         self.assertEqual(self.turn_starts, 2)
@@ -122,7 +122,7 @@ class AssignReuseTests(launcher_fixture.FirstDispatchFixture):
         for options, expected in ((["--model", "gpt-other-sol:high"], ("gpt-other-sol", "high")),
                                   (["--effort", "max"], ("gpt-kept-sol", "max"))):
             with self.subTest(options=options):
-                _ = self.successful("implement", "--to", name, *options)
+                _ = self.successful("implement", "--to", name, *options, execution=launcher_fixture.InProcessAssignment())
                 turn = cast(dict[str, object], self.methods("turn/start")[-1]["params"])
                 self.assertEqual((turn["model"], turn["effort"]), expected)
                 record = self.assignment_records()[name]
@@ -138,14 +138,14 @@ class AssignReuseTests(launcher_fixture.FirstDispatchFixture):
         name = next(iter(roster))
         roster[name].update({"turn_model": "gpt-other-sol", "turn_effort": "max"})
         self.write_pool_roster(dict[str, object](roster))
-        _ = self.successful("implement", "--to", name)
+        _ = self.successful("implement", "--to", name, execution=launcher_fixture.InProcessAssignment())
         turn = cast("dict[str, object]", self.methods("turn/start")[-1]["params"])
         self.assertEqual((turn["model"], turn["effort"]), ("gpt-kept-sol", "high"))
 
     def test_a_model_override_reuses_an_idle_worker_and_updates_only_its_turn_display(self) -> None:
         self.first_assignment()
         name, before = next(iter(self.assignment_records().items()))
-        _ = self.successful("implement", "--model", "gpt-other-sol:high")
+        _ = self.successful("implement", "--model", "gpt-other-sol:high", execution=launcher_fixture.InProcessAssignment())
         roster = self.assignment_records()
         self.assertEqual(set(roster), {name})
         self.assertEqual(roster[name]["thread_id"], before["thread_id"])
@@ -161,7 +161,7 @@ class AssignReuseTests(launcher_fixture.FirstDispatchFixture):
         identity = read_object(identity_path)
         identity["model"] = "gpt-other-sol"
         _ = identity_path.write_text(json.dumps(identity))
-        _ = self.successful("implement", "--to", name)
+        _ = self.successful("implement", "--to", name, execution=launcher_fixture.InProcessAssignment())
         turn = cast(dict[str, object], self.methods("turn/start")[-1]["params"])
         self.assertEqual(turn["model"], "gpt-kept-sol")
         self.assertEqual(read_object(identity_path)["model"], "gpt-other-sol")
@@ -174,12 +174,12 @@ class AssignReuseTests(launcher_fixture.FirstDispatchFixture):
         _ = record.pop("model", None)
         self.write_pool_roster({name: record})
         _ = write_registry(self.registry, {"direct.codex": {"impl": "gpt-other-sol:high"}}, update=True)
-        _ = self.successful("implement", "--to", name)
+        _ = self.successful("implement", "--to", name, execution=launcher_fixture.InProcessAssignment())
         turn = cast(dict[str, object], self.methods("turn/start")[-1]["params"])
         self.assertEqual(turn["model"], "gpt-other-sol")
         self.assertEqual(self.assignment_records()[name]["thread_id"], original_thread)
         self.assertEqual(len(self.methods("thread/start")), 1)
-        _ = self.successful("implement", "--to", name, "--model", "gpt-kept-sol")
+        _ = self.successful("implement", "--to", name, "--model", "gpt-kept-sol", execution=launcher_fixture.InProcessAssignment())
         turn = cast(dict[str, object], self.methods("turn/start")[-1]["params"])
         self.assertEqual(turn["model"], "gpt-kept-sol")
         self.assertEqual(self.turn_starts, 3)
@@ -190,7 +190,7 @@ class AssignReuseTests(launcher_fixture.FirstDispatchFixture):
         record["context_tokens"] = 200_000
         self.write_pool_roster({name: record})
         self.context_sizes = [200_000]
-        _ = self.successful("implement", "--to", name)
+        _ = self.successful("implement", "--to", name, execution=launcher_fixture.InProcessAssignment())
         methods = [request.get("method") for request in self.server.requests]
         self.assertEqual(methods.count("thread/compact/start"), 1, methods)
         self.assertLess(methods.index("thread/compact/start"),
@@ -207,10 +207,10 @@ class AssignReuseTests(launcher_fixture.FirstDispatchFixture):
             record["context_tokens"] = 200_000
             self.write_pool_roster({name: record})
             self.context_sizes = [200_000, 200_000]
-            _ = self.successful("implement", "--to", name)
+            _ = self.successful("implement", "--to", name, execution=launcher_fixture.InProcessAssignment())
             self.assertEqual(len(self.methods("thread/compact/start")), 0)
             _ = write_config_fixture(config, "UNIT_COMPACT_ABOVE_TOKENS=100000 # compact before the next turn\n")
-            _ = self.successful("implement", "--to", name)
+            _ = self.successful("implement", "--to", name, execution=launcher_fixture.InProcessAssignment())
         self.assertEqual(len(self.methods("thread/compact/start")), 1)
         self.assertEqual(self.assignment_records()[name]["thread_id"], thread)
         self.assertEqual(len(self.methods("thread/start")), 1)
