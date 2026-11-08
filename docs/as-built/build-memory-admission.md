@@ -1298,12 +1298,28 @@ No adaptive controller, fixed admission limit, order window, CI growth promise, 
 ### Progress memory profiles
 
 Cargo build, check, clippy, mend, nextest, and merge gates record attributed anonymous use in five-percent phase bins.
-The service applies each step's recorded headroom rule to the highest profile sample within its look-ahead window.
+Each bin selects the Nth-highest run value from matching completed profiles.
+`progress_profile_rank=2` sets N in `config/build_admission.conf`.
+A bin with fewer than N measurements uses its lowest measured run value.
+Rank 1 selects the highest run value.
+The service validates the rank through its existing configuration check before each pass.
+It rebuilds merged profiles when the rank changes.
+The service applies each step's recorded headroom rule to the highest selected bin within its look-ahead window.
 `progress_lookahead_percent` is read at use; its initial value is 20.
 The window crosses Cargo phase boundaries, including repeated build phases.
 The merge gate window stops at the end of `suites:1`, even when history contains rerun phases.
 Reruns without a measured window retain the full need. Each step has its own history key.
 Missing counters, profiles, or anonymous readings retain the full need.
+Each saved record names its peak reading source with `ScopeReading` or `ProcessTreeReading`.
+`ScopeReading` stores the scope directory. `ProcessTreeReading` stores the process ids.
+At each new run peak, the service records the phase, bin, anonymous bytes, and source processes.
+Each `ProfileProcess` stores its pid, command arguments, and `RssAnon` bytes.
+Scope evidence includes all recorded scope members, including helpers outside the original process tree.
+The service reads process commands and `RssAnon` only for a new highest run value.
+Lower samples, equal samples, and lower bin peaks retain the previous process evidence.
+Active records retain this evidence across service restarts and completion.
+Old records remain readable with `ReadingSourceNotRecorded` and `PeakProcessesNotRecorded`.
+Unavailable process commands and anonymous readings have named states with their read errors.
 The nextest test phase keeps its frozen baseline and margin as the fallback. Its live test peak remains a floor.
 CI keeps its configured margin until registered CI steps supply counters and profiles.
 `lint/invoke.sh` enables Cargo progress in its capture log. It removes redraw frames from worker output.

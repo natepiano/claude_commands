@@ -1288,7 +1288,7 @@ class AdmissionServer:
             return self.system_reader.latest.lifetimes.get(record.episode, gate.LiveOwnerProcess())
         return self.proc.lifetime(reservation_row(record), self._live(record.owner))
 
-    def _inputs(self, config: gate.MemoryConfig) -> gate.QueueInputs:
+    def _inputs(self, config: gate.MemoryConfig, profile_rank: int) -> gate.QueueInputs:
         now = self.clock.now()
         plan = self._reading_plan(config)
         if isinstance(self.system_reader, NoSystemReader):
@@ -1355,7 +1355,7 @@ class AdmissionServer:
                         if isinstance(step.run, LiveBuildRun) and (step.run.pid, step.run.start_time) not in represented)
         if between:
             inputs = replace(inputs, running=(*inputs.running, *between))
-        return self._progress_inputs(self._inputs_with_current_slots(inputs), dict(evidence.processes), config.policy)
+        return self._progress_inputs(self._inputs_with_current_slots(inputs), dict(evidence.processes), config.policy, profile_rank)
 
     def _unowned_memory(self, evidence: SystemEvidence, rows: list[gate.Reservation]
                         ) -> tuple[gate.UnownedSliceMemory, ...]:
@@ -1421,12 +1421,12 @@ class AdmissionServer:
                 pass
 
     def _progress_inputs(self, inputs: gate.QueueInputs, processes: dict[int, gate.ProcessIdentity],
-                         policy: gate.AdmissionPolicy) -> gate.QueueInputs:
+                         policy: gate.AdmissionPolicy, profile_rank: int) -> gate.QueueInputs:
         """Capture counters and profile samples on the service loop thread."""
         attributed = iter(gate.attributed_step_uses(inputs))
         running: list[gate.RunningStep] = []
         cutoff = inputs.now - gate.HISTORY_DAYS * 86400
-        self.progress_history.prune(cutoff)
+        self.progress_history.prune(cutoff, rank=profile_rank)
         for step in inputs.running:
             if not gate.running_has_reservation(step):
                 running.append(step)
@@ -1447,11 +1447,25 @@ class AdmissionServer:
                 pids = gate.process_tree({row["pid"]: row["start_time"]}, processes)
                 counter = self.progress_captures.counter({pid: processes[pid].start for pid in pids}, self.boot_id)
             key = gate.reservation_profile_key(row, self.host)
-            profile = self.progress_history.matching(key, cutoff)
+            profile = self.progress_history.matching(key, cutoff, rank=profile_rank)
             adjusted = gate.progress_memory(row, memory, use, counter, profile, policy)
             running.append(replace(step, measured=adjusted))
             if use.owns_source and isinstance(use.use, gate.AnonymousRunUse) and "reservation_id" in row:
-                self.progress_history.observe(row["reservation_id"], key, counter, use.use.bytes, inputs.now)
+                source = memory.anonymous_source
+                if isinstance(source, gate.ScopeSource):
+                    reading_source: progress.ReadingSource = progress.ScopeReading(source.directory)
+                    pids = tuple(sorted(source.members))
+                elif isinstance(source, gate.ProcessSource):
+                    pids = tuple(item.pid for item in source.processes)
+                    reading_source = progress.ProcessTreeReading(pids)
+                else:
+                    pids = ()
+                    reading_source = progress.ReadingSourceNotRecorded("reading source unavailable")
+                self.progress_history.observe(row["reservation_id"], key, counter, use.use.bytes, inputs.now,
+                    reading_source=reading_source,
+                    read_processes=lambda pids=pids, source=reading_source:
+                        progress.PeakProcessesNotRecorded("reading source unavailable")
+                        if isinstance(source, progress.ReadingSourceNotRecorded) else progress.read_processes(pids, self.proc.path))
         self.progress_captures.end_pass()
         return replace(inputs, running=tuple(running))
 
@@ -1551,7 +1565,7 @@ class AdmissionServer:
                                      self.clock.monotonic() + config.source_check_seconds)
         policy = config.policy
         self.last_diagnostics = config.diagnostics
-        inputs = self._inputs(config)
+        inputs = self._inputs(config, self.configuration.progress_profile_rank)
         preserve_override = self._override_pending_reconnect()
         if preserve_override:
             inputs = replace(inputs, override=gate.NoHeadAdmissionOverride())

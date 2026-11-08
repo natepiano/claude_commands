@@ -686,6 +686,7 @@ class UsableAdmissionConfiguration:
     config: MemoryConfig
     cloud_gate_slots: int
     cloud_gate_stale_pushes: int
+    progress_profile_rank: int
 
 
 @dataclass(frozen=True)
@@ -700,10 +701,11 @@ def read_admission_configuration() -> UsableAdmissionConfiguration | UnusableAdm
             settings = conf.read("build_admission")
             cloud_gate_slots = settings.whole("cloud_gate_slots")
             cloud_gate_stale_pushes = settings.whole("cloud_gate_stale_pushes")
+            progress_profile_rank = settings.whole("progress_profile_rank")
         config = read_memory_config(report=False)
         return UsableAdmissionConfiguration(replace(config,
             diagnostics=(*config.diagnostics, *configuration_diagnostics(messages))),
-            cloud_gate_slots, cloud_gate_stale_pushes)
+            cloud_gate_slots, cloud_gate_stale_pushes, progress_profile_rank)
     except conf.Unusable as error:
         return UnusableAdmissionConfiguration(str(error))
 

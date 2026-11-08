@@ -663,7 +663,7 @@ Phase 18c makes the staff row id the copy owner, under its `RoleOwner` boundary 
 
 **Acceptance gate:** build_queue suites pass; basedpyright 0/0/0; `nixos-rebuild build` passes on the branch.
 
-### Phase 28 — A reservation matches the memory a run really uses  · status: todo
+### Phase 28 — A reservation matches the memory a run really uses  · status: done
 
 1. **The ask.** The user, 2026-11-07 17:30: "this is completely busted - we've been running with about 1.2GiB reserved for merge gates for the last few days - this is completely unacceptable", and of a hana build "reserving 15.6GiB and using 0.2GiB - it is ridiculous".
 2. **Facts found.** The need for a run with progress is the highest anonymous use any recorded run of the same key had in the next 20% of progress, over 14 days (`progress_profile.merge_profiles`, `HISTORY_DAYS`). Two full merge gates today recorded 17.3 GiB (builds, 16:28) and 16.0 GiB (herdr, 16:58) in one 5% bin. Their own gate samplers saw at most 2.8 GiB for the whole job tree. The other 263 gate runs have a median of 0.9 GiB in those bins. The director moved the two records to `$SD/evidence/bad-gate-profiles-20261107/` (17:33). Hana `build:1` profiles show 10 to 15 GiB at the end of a build.

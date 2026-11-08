@@ -1138,6 +1138,63 @@ class OutageClaimTests(unittest.TestCase):
 
 
 class ProgressProfileServiceTests(unittest.TestCase):
+    def test_configured_rank_sets_the_remaining_memory_need(self) -> None:
+        with AdmissionFixture() as fixture, fixture.loop_turn():
+            write_memory_config(fixture.root / "build_admission.conf", progress_profile_rank="2")
+            owner = fixture.proc.spawn(used=GIB)
+            sidecar = fixture.scope(owner, current=GIB, anonymous=GIB)
+            request = replace(fixture.request(owner=owner, step="build", need=10 * GIB), sidecar=str(sidecar))
+            grant = only_admitted(fixture.server.handle_request(request))
+            row = service.reservation_row(fixture.server.reservations[request.episode])
+            key = gate.reservation_profile_key(row, fixture.server.host)
+            for index, need in enumerate((9 * GIB, 3 * GIB, 6 * GIB)):
+                for done in range(0, 100, 5):
+                    fixture.server.progress_history.observe(f"previous-{index}", key,
+                        progress.ProgressCounter("build:1", done, 100), need, fixture.clock.now())
+                fixture.server.progress_history.finish(f"previous-{index}", fixture.clock.now(), fixture.clock.now() - 1)
+            progress.publish_counter(sidecar, progress.ProgressCounter("build:1", 50, 100))
+            _ = fixture.run_pass()
+            reply, = fixture.server.handle_request(wire.ViewRequest())
+            assert isinstance(reply, wire.ViewReply)
+            room = reply.reading.explanation.room
+            assert isinstance(room, records.MemoryRoom)
+            hold, = room.runs
+            self.assertEqual(hold.memory.need, 6 * GIB)
+            self.assertEqual(hold.bytes, 5 * GIB)
+            fixture.release(grant)
+
+    def test_saved_highest_bin_names_the_scope_processes_and_reading_source(self) -> None:
+        with AdmissionFixture() as fixture, fixture.loop_turn():
+            owner = fixture.proc.spawn(used=GIB // 4)
+            helper = fixture.proc.spawn(used=11 * GIB // 4)
+            helper_proc = fixture.proc.path / str(helper.pid)
+            _ = (helper_proc / "cmdline").write_bytes(b"rustc-outlier\0--private-fixture\0")
+            _ = (helper_proc / "comm").write_text("rustc-outlier\n")
+            sidecar = fixture.scope(owner, members=(owner.pid, helper.pid), current=4 * GIB, anonymous=3 * GIB)
+            scope = Path(sidecar.read_text().strip())
+            request = replace(fixture.request(owner=owner, step="merge-gate", need=4 * GIB), sidecar=str(sidecar))
+            grant = only_admitted(fixture.server.handle_request(request))
+            progress.publish_counter(sidecar, progress.ProgressCounter("suites:1", 20, 100))
+            _ = fixture.run_pass()
+            _ = (scope / "cgroup.procs").write_text(f"{owner.pid}\n")
+            _ = (scope / "memory.stat").write_text(f"anon {GIB}\ninactive_file 0\n")
+            progress.publish_counter(sidecar, progress.ProgressCounter("suites:1", 80, 100))
+            _ = fixture.run_pass()
+            fixture.release(grant)
+            path, = fixture.server.progress_history.root.glob("*/*.json")
+            record = progress.read_profile_record(path)
+            assert isinstance(record, progress.RecordedProfile)
+            self.assertEqual(record.profile.phases[0].bins[4], 3 * GIB)
+            self.assertEqual(record.profile.phases[0].bins[16], GIB)
+            self.assertEqual(record.reading_source, progress.ScopeReading(scope))
+            peak = record.peak_processes
+            assert isinstance(peak, progress.PeakProcesses)
+            self.assertEqual((peak.phase, peak.bin, peak.anonymous_bytes), ("suites:1", 4, 3 * GIB))
+            self.assertEqual({process.pid for process in peak.processes}, {owner.pid, helper.pid})
+            helper_sample, = (process for process in peak.processes if process.pid == helper.pid)
+            self.assertEqual(helper_sample.command, ("rustc-outlier", "--private-fixture"))
+            self.assertEqual(helper_sample.rss_anon, 11 * GIB // 4)
+
     def test_a_version_four_snapshot_is_rejected_until_a_new_pass_publishes_current_evidence(self) -> None:
         with AdmissionFixture() as fixture, fixture.loop_turn():
             _ = fixture.run_pass()
