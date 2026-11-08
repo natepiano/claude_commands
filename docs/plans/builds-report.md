@@ -769,3 +769,20 @@ A failed merge gate attempt keeps the end of its output in the build log, for lo
 
 **Ruled out:**
 - Prune code for the logs: the build log prunes neither records nor logs (builds showrunner, 2026-11-06).
+
+### Phase 35 — One full rebuild of the build log index has a measured memory cost  · status: done
+
+#### As-built
+
+Measurement only; no code changed. Two full rebuilds ran on private copies of the live JSONL (443 files, 1.16 GiB, about 276,000 records; a 3.0 GB index with 4096-byte pages).
+- SQLite 3.51.2 reads `PRAGMA cache_spill = N` as a boolean through 8 bits. `INDEX_SPILL_PAGES=65536` gives 0, so `open_for_update` turns spill off. 65535 stays on; `PRAGMA cache_spill = ON` after the size keeps 65536 in effect.
+- Spill off (as shipped): peak RSS 3.75 GiB, 132.7 s wall, 102 CPU s. Six readers waited 9.4–10.9 s at commit and read the new index.
+- Spill on (trial wrapper only): peak RSS 1.34 GiB, 252.7 s wall, 110 CPU s, under a higher load. The first spill came at 11.5 s. Readers started near the first spill, the middle and the end waited until commit (43.6–245.8 s) and read the new index.
+
+**Files:**
+- `config/buildlog.conf` — the `INDEX_SPILL_PAGES` basis gives both runs; the value stays 65536.
+- `docs/as-built/buildlog-memory-stalls.md` — "Calibration and gotchas": the full-rebuild entry.
+
+**Gotchas:**
+- CLI readers (`buildlog query`, `test_times show`) wait on the update file lock for the whole rebuild, with spill on or off; neither run measured the 30 s direct SQL timeout.
+- A value change to `INDEX_SPILL_PAGES` needs the user's approval first (builds showrunner, 2026-11-08).
