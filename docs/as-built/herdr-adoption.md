@@ -333,7 +333,7 @@ The resume message builder retains the launcher prompt path for restored workers
 - A non-empty `TMUX_PANE` means the process is never a herdr place.
 - Native session ids select staff rows for launch and restore names.
   The Stop hook keeps member titles consistent with their rows.
-  A unit name mismatch prints `/showrunner:rename_unit` and never changes staff.
+  A unit name mismatch prints `/agents rename` and never changes staff.
 - Every unit restarts through `add_unit.py --host-session <name>`, which is restart's only restore flag for units.
 - Callers refuse a server whose inherited environment holds a must-be-unset variable (`CLAUDE_CODE_OAUTH_TOKEN`, the named-account variables for a legacy home, or `PreparedAccount.remove`).
 - Every pane carries `HERDR_AGENT_PANE=1`. The shell's `claude` alias depends on it.

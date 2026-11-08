@@ -1,6 +1,6 @@
 ---
-description: Show, pause, exit, retire, resume, stop, or restart sessions.
-argument-hint: 'retire NAME | pause NAME --why TEXT | exit NAME --why TEXT | help | status [ACCOUNT] [--json] [--here] | resume NAME [--retired] [--why TEXT] [--to ACCOUNT] | restart [ACCOUNT] [--all] [--dry-run] [--only ID[,ID...]] [--here] | stop SESSION [--dry-run] | stop --all [--dry-run]'
+description: Show, pause, exit, retire, rename, resume, stop, or restart sessions.
+argument-hint: 'rename OLD NEW [--to-doc PATH] [--to-branch NAME] | retire NAME | pause NAME --why TEXT | exit NAME --why TEXT | help | status [ACCOUNT] [--json] [--here] | resume NAME [--retired] [--why TEXT] [--to ACCOUNT] | restart [ACCOUNT] [--all] [--dry-run] [--only ID[,ID...]] [--here] | stop SESSION [--dry-run] | stop --all [--dry-run]'
 ---
 
 Use the `agents` program.
@@ -13,6 +13,7 @@ Use the `agents` program.
 - Use `agents pause --production SHOWRUNNER [--except UNIT ...] --why TEXT` to select a production.
 - Use `agents resume --production SHOWRUNNER` to resume its units.
 - `agents resume NAME [--retired] [--why TEXT] [--to ACCOUNT]`: resume a name, staff id, session id, or exact Codex thread name.
+- `agents rename OLD NEW [--to-doc PATH] [--to-branch NAME]`: rename a unit, showrunner, or worker.
 - `agents retire NAME`: remove the unit worktree and branch. Keep its retired staff row and conversations.
 - `agents resume NAME --retired`: restore a retired unit and its retained workers.
 - Before running `--retired`, ask the user yes or no. Run it only after yes.
@@ -37,6 +38,18 @@ A closed tab uses the existing restore path.
 An empty current pane can resume its own saved session.
 Resume restores retained workers with their native conversations.
 The short form `resume NAME [--retired] [--why TEXT] [--to ACCOUNT]` stays available from any directory.
+
+Use a staff id, a staff path, or a unique name for rename.
+A bare name first selects the calling showrunner or unit and its direct children.
+A unit rename changes matching folder and branch suffixes.
+A unit or showrunner rename updates its worker agent names and pane labels to `<new>-<worker>`.
+Use `--to-branch NAME` for an explicit unit branch.
+Keep OLD and NEW equal to change only that branch.
+A showrunner document move requires both `--to-doc PATH` and `--to-branch NAME`.
+A worker rename changes proved pane titles and keeps shared tab and workspace names.
+Repeat an interrupted rename to complete its saved move.
+Show each anomaly and the final output.
+See `docs/as-built/production-rename.md` and `docs/as-built/unit-rename.md`.
 
 Before a power-off, run `agents stop --all`.
 After login, run `agents restart`.
