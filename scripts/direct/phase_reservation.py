@@ -8,7 +8,7 @@ the phase's `delegated_phase_reservation_state.json` before dispatch, and the fi
 a clear `cargo-berth check` acquires turns it `Active`. Each phase checks as its own berth
 session, `<director session id>.phase-<phase>`, so a phase opened beside another holds its own
 reservation; a path a sibling phase already holds answers `left_unmapped` with the sibling's
-reservation, which is never recorded here (`commands/unit/direct.md` →
+reservation, which is never recorded here (`docs/direct/phase_reservation.md` →
 <PhaseReservationContract/>). A `left_unmapped` reservation belongs to this phase when the map names it and its run for the director's bare session id.
 No other open phase may hold it through an `Active` state, a pending release, or its berth session map.
 Codex workers edit through `apply_patch`, so the Codex
@@ -61,14 +61,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import NamedTuple, cast, overload
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib import unit_runs
 from scripts.production import staff
 from scripts.agents import worker_lifecycle
 
-if not __package__:
-    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.direct import recorder_state  # noqa: E402
 
 PHASES_DIR = "phases"

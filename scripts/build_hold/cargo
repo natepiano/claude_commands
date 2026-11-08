@@ -56,7 +56,8 @@ shopt -s nullglob dotglob
 hold_entries=("$hold_dir"/*)
 if (( ${#hold_entries[@]} )); then
     wrapper_path=$(readlink -f -- "${BASH_SOURCE[0]}")
-    if hold_message=$(python3 "${wrapper_path%/*}/hold_applies.py" 2>&1); then
+    wrapper_dir=${wrapper_path%/*}
+    if hold_message=$("$wrapper_dir/../lib/py" "$wrapper_dir/hold_applies.py" 2>&1); then
         printf '%s\n' "$hold_message" >&2
         exit 1
     else

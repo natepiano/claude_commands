@@ -7,7 +7,8 @@ import io
 import json
 import os
 from pathlib import Path
-from typing import TYPE_CHECKING
+import subprocess
+import sys
 from unittest import mock
 
 from scripts.build_targets import test_ssh_eligibility as eligibility_support
@@ -18,16 +19,47 @@ from scripts.direct.verify_ssh_targets_test_support import VerifySshTargetsFixtu
 from scripts.lint.memory_test_support import write_config_fixture
 from scripts.lib.process_start_test_support import process_reader
 
-if TYPE_CHECKING:
-    from ..lib import process_start as process_identity
-else:
-    from scripts.lib import process_start as process_identity
+from scripts.lib import process_start as process_identity
 
 
 mac_test = eligibility_support.mac_test
 
 
 class VerifySshRetainedTests(VerifySshTargetsFixture):
+    def test_verify_exit_before_first_memory_hook_fails(self) -> None:
+        self.release_memory_after_hook()
+        with subprocess.Popen(["true"], text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE) as process, \
+             mock.patch.object(self, "start_verify", return_value=process), \
+             self.assertRaisesRegex(self.failureException, "verify exited"):
+            _ = self.verify("test", "sample", "--no-cache")
+
+    def test_verify_drains_output_after_memory_hook_settles(self) -> None:
+        self.release_memory_after_hook()
+        command = '''
+printf '%s\\n' '{"left": false, "clock": "", "attempts": 0}' > memory-hook-1
+head -c 8 memory-hook-ack > /dev/null
+exec "$1" -c 'import sys; sys.stdout.write("x" * (128 * 1024))'
+'''
+        with subprocess.Popen(["sh", "-c", command, "memory-hook-output", sys.executable],
+                              cwd=self.runner_state, text=True,
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE) as process, \
+             mock.patch.object(self, "start_verify", return_value=process):
+            result = self.verify("test", "sample", "--no-cache")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "x" * (128 * 1024))
+
+    def test_verify_returns_when_settled_hook_skips_acknowledgment(self) -> None:
+        self.release_memory_after_hook()
+        command = '''
+printf '%s\\n' '{"left": true, "clock": "", "attempts": 0}' > memory-hook-1
+exit 0
+'''
+        with subprocess.Popen(["sh", "-c", command], cwd=self.runner_state, text=True,
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE) as process, \
+             mock.patch.object(self, "start_verify", return_value=process):
+            result = self.verify("test", "sample", "--no-cache")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
     def retain_slots(self, capacity: int = 2) -> list[Path]:
         _ = write_config_fixture(self.root / "aws_target.conf",
                                  (self.root / "aws_target.conf").read_text()

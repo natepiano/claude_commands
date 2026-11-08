@@ -19,6 +19,7 @@ from scripts.copies.copies_test_support import copies_environment
 from scripts.direct.wait_for_test_state import wait_until
 from scripts.lint.memory_test_support import config_environment, write_config_fixture
 from scripts.lib.process_group import send_process_group
+from scripts.lib.py_floor_test_support import seed_interpreter_cache
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.production.cli_fixture import ImmutableGitSeed
 
@@ -222,9 +223,11 @@ class MacRunTests(unittest.TestCase):
             SITE_CUSTOMIZE, encoding="utf-8"
         )
         # The runner's session must not own the fixture's Mac block.
+        seed_interpreter_cache(self.root / "cache")
         self.environment = {
             **{name: value for name, value in os.environ.items() if name not in SESSION_SELECTORS},
             "HOME": str(self.home),
+            "XDG_CACHE_HOME": str(self.root / "cache"),
             "__ETC_ZSHENV_SOURCED": "1",
             "PATH": f"{self.bin_directory}{os.pathsep}{os.environ['PATH']}",
             "PYTHONPATH": str(startup),
@@ -237,6 +240,8 @@ class MacRunTests(unittest.TestCase):
             "HANA_TEST_PURPOSE": "Mac launch coordination",
             "TMPDIR": str(self.temp_directory),
         }
+
+        _ = self.environment.pop("CLAUDE_PYTHON", None)
 
     def write_executable(self, path: Path, source: str) -> None:
         _ = path.write_text("#!/usr/bin/env zsh\n" + source, encoding="utf-8")

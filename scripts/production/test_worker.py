@@ -20,6 +20,7 @@ import unittest
 from unittest.mock import patch
 
 from scripts.agents import codex_mesh, mesh_runs
+from scripts.accounts import accounts
 from scripts.herdr import test_worker_panes as pane_fixtures
 from scripts.herdr import worker_panes
 from scripts.direct import assign, progress_history
@@ -253,6 +254,29 @@ class WorkerCommandTests(unittest.TestCase):
         with redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as errors:
             code = worker.main(list(args))
         return code, output.getvalue(), errors.getvalue()
+
+    def test_restore_starts_only_the_worker_with_an_active_dispatch(self) -> None:
+        idle = self.opened("review", "review")
+        _ = self.fixture.world.stop(idle.row, self.fixture.world)
+        self.assertIsInstance(worker_panes.close(self.fixture.parent.id, staff.WorkerName.parse(idle.row.name)),
+                              worker_panes.Closed)
+        busy = self.opened()
+        dispatch_id = progress_history.begin_dispatch(self.run_dir, slot="impl", phase="8", role="impl",
+            worker_name=busy.row.name, worker_id=busy.row.id, launcher_command=["assign.sh", "--to", "impl"],
+            prompt=self.prompt, kind="impl", lens="")
+        _ = self.fixture.world.stop(busy.row, self.fixture.world)
+        before = self.fixture.staff_state(), len(self.fixture.world.launches)
+        with patch.object(worker, "_resume_launcher", return_value=worker.ExitCode.OK) as resume:
+            self.assertEqual(self.command("restore"), (0, "done\n", ""))
+        resume.assert_called_once_with(busy.row,
+            progress_history.ActiveDispatch(dispatch_id, ("assign.sh", "--to", "impl")))
+        self.assertEqual(self.fixture.staff_state(), before[0])
+        self.assertEqual(len(self.fixture.world.launches), before[1] + 1)
+        states = {state.row.id: state for state in worker_panes.observe(self.fixture.parent.id, staff.snapshot())}
+        self.assertIsInstance(states[busy.row.id], worker_panes.OpenWorker)
+        self.assertIsInstance(states[idle.row.id], worker_panes.ClosedWorker)
+        self.assertEqual(states[busy.row.id].row.current_session, busy.row.current_session)
+        self.assertEqual(states[idle.row.id].row.current_session, idle.row.current_session)
 
     def test_restore_rerun_after_agent_resume(self) -> None:
         opened = self.opened()
@@ -1249,11 +1273,13 @@ class WorkerCommandTests(unittest.TestCase):
         private_root.mkdir()
         self.run_dir = self.run_dir.rename(private_root / "held-run")
         _ = self.fixture.world.stop(row, self.fixture.world)
+        before = len(self.fixture.world.launches)
         with patch.dict(os.environ, {"ROSTER_RUN_ROOT": str(private_root)}):
             code, output, errors = self.command("restore")
-        self.assertEqual((code, output, errors), (0, "done\n", ""))
+        self.assertEqual((code, output, errors), (0, "unchanged\n", ""))
         self.assertEqual(staff.snapshot().by_id(row.id), row)
-        self.assertIn(row.current_session, self.fixture.world.requests[-1][1])
+        self.assertEqual(len(self.fixture.world.launches), before)
+        self.assertNotIn(self.agent.submitted[-1][0], self.fixture.world.foreground)
 
     def test_herdr_list_shares_history_and_staff_reads_across_workers(self) -> None:
         expected: dict[str, str] = {}
@@ -1338,6 +1364,51 @@ class WorkerCommandTests(unittest.TestCase):
         self.assertEqual(listing[0]["state"], "OpenWorker")
         self.assertEqual(listing[0]["activity"], "done")
 
+    def test_list_open_busy_worker_reports_work_account_and_home(self) -> None:
+        row = self.fixture.worker("astra-designer", family="codex")
+        self.fixture.world.add(row, "w1:p1", family="codex")
+        self.fixture.world.locations["w1:p1"]["agent_status"] = "working"
+        self.fixture.dispatch(row, "astra-designer")
+        home = self.fixture.root / "selected-codex"
+        with patch.object(accounts, "role_account", return_value=accounts.CodexWorkersAccount("codex2", home)) as selected:
+            code, output, errors = self.command("list", "--json")
+        self.assertEqual(code, 0, errors)
+        listing = cast(list[dict[str, object]], json.loads(output))
+        self.assertEqual(len(listing), 1)
+        self.assertEqual(listing[0]["state"], "OpenWorker")
+        self.assertEqual(listing[0]["role"], "astra-designer")
+        self.assertEqual({key: listing[0].get(key) for key in ("work", "account", "home")},
+                         {"work": "busy", "account": "codex2", "home": str(home)})
+        selected.assert_called_once_with("workers")
+
+    def test_list_closed_worker_reports_work_account_and_home(self) -> None:
+        row = self.fixture.worker("astra-reviewer", family="claude")
+        self.fixture.dispatch(row, "astra-reviewer", completed=True)
+        home = self.fixture.root / "selected-claude"
+        with patch.object(accounts, "role_account", return_value=accounts.NamedAccount("claude2", home)) as selected:
+            code, output, errors = self.command("list", "--json")
+        self.assertEqual(code, 0, errors)
+        listing = cast(list[dict[str, object]], json.loads(output))
+        self.assertEqual(len(listing), 1)
+        self.assertEqual(listing[0]["state"], "ClosedWorker")
+        self.assertEqual(listing[0]["role"], "astra-reviewer")
+        self.assertEqual({key: listing[0].get(key) for key in ("work", "account", "home")},
+                         {"work": "idle", "account": "claude2", "home": str(home)})
+        selected.assert_called_once_with("unit")
+
+    def test_list_worker_without_backend_reports_account_unavailable(self) -> None:
+        row = self.fixture.worker("missing-backend", family="codex")
+        self.fixture.dispatch(row, "impl", completed=True)
+        (Path(os.environ["CODEX_HOME"]) / "sessions" / f"{row.current_session}.jsonl").unlink()
+        self.assertNotIn(row.id, staff.snapshot().backends)
+        code, output, errors = self.command("list", "--json")
+        self.assertEqual(code, 0, errors)
+        listing = cast(list[dict[str, object]], json.loads(output))
+        self.assertEqual(len(listing), 1)
+        self.assertEqual(listing[0]["account"],
+                         {"state": "AccountUnavailable", "reason": "worker backend is unavailable"})
+        self.assertNotIn("home", listing[0])
+
     def test_list_scans_runs_once_and_prints_each_run_anomaly_once(self) -> None:
         unit_runs.report_anomaly.cache_clear()
         self.addCleanup(unit_runs.report_anomaly.cache_clear)
@@ -1349,6 +1420,7 @@ class WorkerCommandTests(unittest.TestCase):
             run = runs / name
             run.mkdir(parents=True)
             atomic_file.write_text_atomic(run / unit_runs.STATE_FILE, '{}')
+            atomic_file.write_text_atomic(run / "fixture-impl_status", "running\n")
         with patch.object(unit_runs, "held_by_session", wraps=unit_runs.held_by_session) as scans:
             code, output, errors = self.command("list", "--json")
         self.assertEqual(code, 0, errors)
@@ -1363,12 +1435,13 @@ class WorkerCommandTests(unittest.TestCase):
         opened = self.opened()
         self.fixture.dispatch(opened.row, "impl", completed=True)
         _ = self.fixture.world.stop(opened.row, self.fixture.world)
-        self.assertEqual(worker.restore(self.fixture.parent.id), worker.ExitCode.OK)
         before = self.fixture.staff_state(), len(self.fixture.world.launches), self.fixture.world.locations.copy()
+        self.assertEqual(self.command("restore"), (0, "unchanged\n", ""))
         code, output, errors = self.command("restore")
         self.assertEqual((code, output, errors), (0, "unchanged\n", ""))
         self.assertEqual((self.fixture.staff_state(), len(self.fixture.world.launches), self.fixture.world.locations.copy()), before)
-        self.assertEqual(self.fixture.world.native_session(opened.pane, self.fixture.world.foreground[opened.pane][1], 1), opened.row.current_session)
+        self.assertEqual(staff.snapshot().by_id(opened.row.id), opened.row)
+        self.assertNotIn(opened.pane, self.fixture.world.foreground)
 
     def test_restore_reports_the_unavailable_role_and_continues_other_workers(self) -> None:
         missing = self.opened("impl")
@@ -1376,11 +1449,10 @@ class WorkerCommandTests(unittest.TestCase):
         _ = self.fixture.world.stop(missing.row, self.fixture.world)
         _ = self.fixture.world.stop(retained.row, self.fixture.world)
         self.fixture.dispatch(retained.row, "review", completed=True)
-        with redirect_stderr(io.StringIO()) as errors:
-            code = worker.restore(self.fixture.parent.id)
-        self.assertEqual(code, worker.ExitCode.REFUSED)
-        self.assertIn("dispatch role unavailable", errors.getvalue())
-        self.assertIn(retained.pane, self.fixture.world.foreground)
+        before = self.fixture.staff_state(), len(self.fixture.world.launches)
+        self.assertEqual(self.command("restore"), (0, "unchanged\n", ""))
+        self.assertEqual((self.fixture.staff_state(), len(self.fixture.world.launches)), before)
+        self.assertNotIn(retained.pane, self.fixture.world.foreground)
         self.assertNotIn(missing.pane, self.fixture.world.foreground)
 
     def test_end_keeps_a_busy_worker_and_reports_the_blocker(self) -> None:

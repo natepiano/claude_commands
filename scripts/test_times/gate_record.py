@@ -63,6 +63,9 @@ class SuiteRun(TypedDict):
 
 
 class GateRun(TypedDict):
+    step: str
+    dirty_paths: list[str]
+    dirty_path_count: int
     started_at: str
     ended_at: str
     wall_s: float

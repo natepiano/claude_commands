@@ -5,7 +5,6 @@ import json
 import os
 import shlex
 import subprocess
-import sys
 import unittest
 from dataclasses import replace
 from pathlib import Path
@@ -18,7 +17,6 @@ from unittest.mock import patch
 
 from scripts.lib.socket_test_support import short_socket_directory
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "message"))
 from scripts.message.codex_test_support import FakeDaemon, loaded_session_daemon, write_codex_account
 from scripts.message.relay_identity import relay_session_name
 from scripts.message.relay_test_support import write_relay_session

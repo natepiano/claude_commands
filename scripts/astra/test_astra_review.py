@@ -14,7 +14,6 @@ from pathlib import Path
 from typing import cast, final, override
 from unittest.mock import patch
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.agents import test_codex_mesh as mesh_fixture  # noqa: E402
 from scripts.astra import astra_review  # noqa: E402
 from scripts.astra import astra_roles, astra_work, design_roles  # noqa: E402
@@ -28,7 +27,7 @@ from scripts.direct import assign
 from scripts.astra.design_role_test_support import write_mesh_server_record  # noqa: E402
 from scripts.lib.signal_test_support import install_signal_pid_guard  # noqa: E402
 from scripts.lib.server_test_support import owned_server_record  # noqa: E402
-from scripts.lib import conf, unit_runs
+from scripts.lib import unit_runs
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.test_models_registry import write_registry
 
@@ -226,8 +225,7 @@ class AstraReviewTests(StaffTestCase):
             self.assertEqual(argv[argv.index(flag) + 1], value)
         settings = [argv[index + 1] for index, word in enumerate(argv) if word == "-c"]
         self.assertIn('model_reasoning_effort="xhigh"', settings)
-        compact = conf.read("direct").whole("ASTRA_REVIEW_COMPACT_ABOVE_TOKENS")
-        self.assertIn(f"model_auto_compact_token_limit={compact}", settings)
+        self.assertFalse(any("model_auto_compact_token_limit" in argument for argument in argv))
         self.assertEqual(argv[argv.index("--ask-for-approval") + 1], "never")
         self.assertEqual(environment["CODEX_HOME"], str(self.root / "codex"))
         self.assertNotIn("STAFF_ID", environment)

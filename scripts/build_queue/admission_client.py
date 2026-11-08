@@ -31,7 +31,7 @@ from scripts.message.session_send import session_send_argv
 from scripts.lib.user_zone import user_zone
 from scripts.build_queue import admission_records as records
 
-from scripts.lib import conf
+from scripts.lib import build_steps, conf
 from scripts.buildlog import store
 
 BUILDS_SESSION = "builds"
@@ -149,7 +149,7 @@ def build_history_generation(configuration: records.MemoryConfig | ReadConfigura
     return records.BuildHistoryGeneration(reply.generation)
 
 
-def view() -> records.QueueRead:
+def view() -> records.QueueRead | wire.CloudQueueRead:
     reply = _query(wire.ViewRequest())
     if not isinstance(reply, wire.ViewReply):
         raise wire.AdmissionUnavailable("invalid view answer")
@@ -165,7 +165,7 @@ def explain() -> records.QueueExplanation:
     return reply.explanation
 
 
-def mine(session_id: str) -> records.QueueRead:
+def mine(session_id: str) -> records.QueueRead | wire.CloudQueueRead:
     reply = _query(wire.MineRequest(session_id))
     if not isinstance(reply, wire.MineReply):
         raise wire.AdmissionUnavailable("invalid step answer")
@@ -184,6 +184,8 @@ def _refreshed(first: wire.AdmitRequest | wire.LaunchRequest,
         _ESTIMATE_CONNECTION.reset(token)
     # A refresh changes estimates only, never the step's identity or place.
     if isinstance(first, wire.AdmitRequest) and isinstance(updated, wire.AdmitRequest):
+        if isinstance(first.place, wire.CloudPlace):
+            return first
         return replace(first, profile=updated.profile, fresh_test=updated.fresh_test)
     if isinstance(first, wire.LaunchRequest) and isinstance(updated, wire.LaunchRequest):
         return replace(first, profile=updated.profile)
@@ -585,6 +587,17 @@ class WaitOutput:
     def __call__(self, reply: wire.Wait) -> None:
         now = CLOCK.monotonic()
         first = not self.held
+        if isinstance(reply.reason, wire.CloudSlotWait):
+            reasons = (reply.text,)
+            if first:
+                self.held = True
+                self.on_event("first")
+                self.on_event('holder {"kind":"none"}')
+            if first or reasons != self.last_reasons or now >= self.next_notice:
+                print(reply.text, file=sys.stderr)
+                self.last_reasons = reasons
+                self.next_notice = now + self.reply_seconds()
+            return
         reasons = wait_reasons(reply.snapshot)
         changed = (reasons != self.last_reasons or reply.snapshot.peak.bytes != self.last_need
                    or reply.position != self.last_position)
@@ -625,7 +638,7 @@ class WaitOutput:
         if snapshot.head_need:
             text += f"; head {snapshot.head_label} needs {snapshot.head_need / records.GIB:.1f} GiB"
         summary = ", ".join(("" if item.project else Path(item.folder).name + " ")
-            + f"{queue_lines.step_text(item)} in {item.folder}" for item in snapshot.running)
+            + f"{queue_lines.step_text(item, build_steps.RECORDED_STEP_NAMES)} in {item.folder}" for item in snapshot.running)
         reason_text = (records.head_wait_text(snapshot.head_reason, user_zone())
             if isinstance(snapshot.head_reason, records.HeadAdmissionStatus) else
             records.pressure_text(decision.pressure) if isinstance(decision.pressure, records.MemoryPressure) else "")

@@ -20,12 +20,14 @@ import sys
 from typing import cast, final
 
 from scripts.agents import codex_mesh, mesh_runs
+from scripts.accounts import accounts
 from scripts.direct import board_json, progress_history
 from scripts.herdr import worker_panes
 from scripts.lib import atomic_file, conf, unit_runs
 from scripts.lib.resume_message import BusyPass, IdleWorker, NoOwnPass, NO_OWN_PASS, PaneWorkerResume, ResumeWorkers, launcher_prompt
 from scripts.lib.script_envelope import script_prompt
 from scripts.production import session_staff, staff, worker_admission
+from scripts.shutdown import member_account
 
 from scripts.herdr import herdr
 
@@ -595,6 +597,16 @@ def restore(parent: StaffId) -> ExitCode:
                 outcome = ExitCode.UNCERTAIN
                 continue
             try:
+                if holder is None:
+                    continue
+                run = worker_panes.worker_run(holder)
+                active = progress_history.active_dispatch(state.row.id, run)
+                if isinstance(active, progress_history.ActiveDispatchUnavailable):
+                    print(f"anomaly: {state.row.name}: {active.reason}", file=sys.stderr)
+                    outcome = ExitCode.UNCERTAIN
+                    continue
+                if not isinstance(active, progress_history.ActiveDispatch):
+                    continue
                 if not isinstance(state, worker_panes.OpenWorker):
                     role = worker_panes.dispatch_role(state.row)
                     result = worker_panes.start_or_resume(parent, WorkerName.parse(state.row.name), role)
@@ -603,16 +615,9 @@ def restore(parent: StaffId) -> ExitCode:
                         outcome = code
                         continue
                     changed = True
-                if holder is not None:
-                    run = worker_panes.worker_run(holder)
-                    active = progress_history.active_dispatch(state.row.id, run)
-                    if isinstance(active, progress_history.ActiveDispatchUnavailable):
-                        print(f"anomaly: {state.row.name}: {active.reason}", file=sys.stderr)
-                        outcome = ExitCode.UNCERTAIN
-                    elif isinstance(active, progress_history.ActiveDispatch):
-                        code = _resume_launcher(state.row, active)
-                        if code != ExitCode.OK:
-                            outcome = code
+                code = _resume_launcher(state.row, active)
+                if code != ExitCode.OK:
+                    outcome = code
             except (herdr.HerdrFailure, OSError, ValueError) as error:
                 print(f"anomaly: {state.row.name}: {' '.join(str(error).splitlines())}", file=sys.stderr)
                 outcome = ExitCode.UNCERTAIN
@@ -638,7 +643,15 @@ def list_workers(parent: StaffId, record: staff.StaffSnapshot) -> list[dict[str,
         for state in observed.states:
             role = worker_panes.dispatch_role(state.row)
             fields: dict[str, object] = {"name": state.row.name, "id": str(state.row.id),
-                "current_session": str(state.row.current_session), "state": type(state).__name__}
+                "current_session": str(state.row.current_session), "state": type(state).__name__,
+                "work": worker_panes.worker_state(state)}
+            backend = record.backends.get(state.row.id, staff.BACKEND_UNAVAILABLE)
+            if isinstance(backend, (staff.CodexBackend, staff.ClaudeBackend)):
+                account = member_account.resume_account("codex" if isinstance(backend, staff.CodexBackend) else "claude", state.row)
+                home = account.home if isinstance(account, accounts.CodexWorkersAccount) else account.dir
+                fields.update(account=account.label, home=str(home.absolute()))
+            else:
+                fields["account"] = {"state": "AccountUnavailable", "reason": "worker backend is unavailable"}
             fields["role"] = role if isinstance(role, str) else {"state": "WorkerRoleUnavailable", "reason": role.reason}
             if isinstance(state, worker_panes.OpenWorker):
                 fields["activity"] = state.status.value

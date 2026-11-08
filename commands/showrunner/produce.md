@@ -146,9 +146,8 @@ State:
   User, 2026-10-09: "showrunners manage showrunners - ad hoc depth"; and
   2026-10-12: "have them available for direct interaction from me but also
   have a natural home under an L1".
-  - **A child showrunner is never a unit.** Never type
-    into its pane or its units' panes. One merge exception: a same-repository
-    child with `**Kind:** style` sends
+  - **A child showrunner's branch** is merged only by hand-off. A
+    same-repository child with `**Kind:** style` sends
     `From the showrunner of <style showrunner name>: hand-off <hash>`. Correctness-review
     its diff against the branch point as for a unit checkpoint, then run
     `merge_checkpoint.py --from-child <style showrunner name> --checkpoint <hash> --production <showrunner name> --started <time>`.
@@ -1134,7 +1133,7 @@ Worker stops retain their panes at the shell and keep their conversations for re
 Move sessions with `accounts.py move SESSION_OR_GROUP claudeN --why "reason"`.
 Worker account moves resume each conversation in its existing pane on the target account.
 Unknown evidence leaves that worker unchanged and prints its reason; other proved moves continue.
-See `commands/shutdown.md` and `docs/accounts.md`.
+See `commands/agents.md` and `docs/accounts.md`.
 </StopResume>
 
 ---
