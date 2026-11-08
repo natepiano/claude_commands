@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import shlex
 import subprocess
+import sys
 import tempfile
 from types import SimpleNamespace
 from typing import Self, cast
@@ -50,8 +51,8 @@ class GateBoxTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertNotIn('base64 -d', script)
         self.assertNotIn(gate_box.GUEST, script)
-        self.assertIn('aws s3 cp s3://fixture/requests/attempt.guest.py /var/lib/gate-trial/guest.py', script)
-        self.assertIn('aws s3 cp s3://fixture/requests/attempt.json /var/lib/gate-trial/request.json', script)
+        self.assertIn('aws s3 cp s3://fixture/requests/attempt.guest.py "$box_dir/guest.py"', script)
+        self.assertIn('aws s3 cp s3://fixture/requests/attempt.json "$box_dir/request.json"', script)
         session = shlex.split(script[script.index('nix --extra-experimental-features'):])[-1]
         self.assertLess(session.index('aws s3 cp s3://fixture/requests'), session.index('exec python3'))
 
@@ -78,12 +79,137 @@ class GateBoxTests(unittest.TestCase):
             _ = aws.write_text('#!/bin/sh\ncase "$3" in *.guest.py) cp "$FIXTURE/source.py" "$4" ;;'
                                + ' *.json) cp "$FIXTURE/manifest.json" "$4" ;; *) exit 1 ;; esac\n')
             aws.chmod(0o700)
-            result = subprocess.run(['sh', '-ec', downloads.replace('/var/lib/gate-trial', str(root))],
-                env={**os.environ, 'PATH': str(root) + os.pathsep + os.environ['PATH'], 'FIXTURE': str(root)},
+            result = subprocess.run(['sh', '-ec', downloads],
+                env={**os.environ, 'PATH': str(root) + os.pathsep + os.environ['PATH'], 'FIXTURE': str(root), 'box_dir': str(root)},
                 text=True, capture_output=True, timeout=TEST_HANG_GUARD_SECS, check=False)
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual((root / 'guest.py').read_text(), gate_box.GUEST)
             self.assertEqual(json.loads((root / 'request.json').read_text()), {'modules': modules})
+
+    def test_production_boot_stages_and_errors_with_local_stubs(self) -> None:
+        stages = ['boot', 'aws ready', 'tools ready', 'source ready', 'tests start']
+        for failure in ('', 'boot', 'aws ready', 'tools shell', 'tools ready', 'source ready', 'tests start'):
+            with self.subTest(failure=failure), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                tools, box, repo = root / 'bin', root / 'box', root / 'repo'
+                tools.mkdir()
+                (root / 'home').mkdir()
+                for name in ('scripts', 'scripts/production', 'scripts/aws_target', 'config'):
+                    folder = repo / name
+                    folder.mkdir(parents=True, exist_ok=True)
+                    if name != 'config':
+                        _ = (folder / '__init__.py').write_text('')
+                _ = (repo / 'scripts/production/merge_gate.py').write_text(
+                    'from contextlib import nullcontext\nfrom types import SimpleNamespace\nimport os\n'
+                    + 'WholeMachine = lambda times: times\nSelectedModules = tuple\nSuiteMode = str\n'
+                    + 'rollback_signals = nullcontext\n'
+                    + 'def run_suites(*args, **kwargs):\n'
+                    + '    if os.environ["FAIL_STAGE"] == "tests start": raise RuntimeError("fixture tests start failure")\n'
+                    + '    return SimpleNamespace(passed=True, jobs=(), seconds=1, peak_memory_mib=0)\n')
+                _ = (repo / 'scripts/aws_target/gate_box.py').write_text(
+                    'def encode_run(run): return {"passed": run.passed}\n'
+                    + 'def completion_record(*args): return {"kind": "gate_run"}\n')
+                _ = (root / 'source.py').write_text(gate_box.GUEST)
+                _ = (root / 'request.json').write_text(json.dumps({
+                    'clone_url': 'https://example.invalid/repo.git', 'origin_main': 'b' * 40, 'modules': []}))
+                stub = '#!' + sys.executable + '\n' + r'''import json, os, pathlib, shutil, subprocess, sys
+root = pathlib.Path(os.environ['FIXTURE'])
+name, args = pathlib.Path(sys.argv[0]).name, sys.argv[1:]
+def event(value):
+    with (root / 'trace').open('a') as output: output.write(value + '\n')
+def fail(stage):
+    marker = root / 'failed'
+    if os.environ['FAIL_STAGE'] == stage and not marker.exists():
+        marker.touch()
+        sys.exit(7)
+event(name)
+if name == 'nix':
+    command = args[args.index('--command') + 1:]
+    if command[0] == 'sh':
+        assert args[args.index('shell') + 1:args.index('--command')] == ['github:NixOS/nixpkgs/' + 'f' * 40 + '#awscli2']
+        fail('aws ready')
+        print(root / 'bin/aws')
+    else:
+        if command[0] != 'aws':
+            event('tools shell')
+            fail('tools shell')
+        sys.exit(subprocess.call(command))
+elif name == 'curl':
+    if 'http://169.254.169.254/latest/api/token' in args:
+        fail('boot')
+        print('fixture-token')
+    else:
+        assert 'X-aws-ec2-metadata-token: fixture-token' in args
+        pathlib.Path(args[args.index('-o') + 1]).write_text('i-fixture\n')
+elif name == 'aws':
+    assert os.environ['AWS_DEFAULT_REGION'] == 'us-west-2'
+    assert args[:2] == ['s3', 'cp']
+    source, destination = args[2:4]
+    if source.startswith('s3://'):
+        fail('tools ready')
+        shutil.copyfile(root / ('source.py' if source.endswith('.guest.py') else 'request.json'), destination)
+    else:
+        body = sys.stdin.read() if source == '-' else pathlib.Path(source).read_text()
+        event('upload result' if destination.endswith('/result.json') else 'upload log')
+        with (root / 'uploads').open('a') as output:
+            output.write(json.dumps({'destination': destination, 'body': body}) + '\n')
+elif name == 'runuser':
+    command = args[args.index('--') + 1:]
+    command = ['HOME=' + str(root / 'home') if word.startswith('HOME=') else word for word in command]
+    sys.exit(subprocess.call(command))
+elif name == 'id':
+    if not (root / 'user').exists(): sys.exit(1)
+    print('1000')
+elif name == 'useradd':
+    (root / 'user').touch()
+elif name == 'git' and args[0] == 'clone':
+    fail('source ready')
+    shutil.copytree(root / 'repo', args[-1])
+elif name == 'git' and 'rev-parse' in args:
+    print('c' * 40)
+elif name in ('systemd-run', 'loginctl', 'mount', 'chown', 'ln', 'cp', 'shutdown', 'git'):
+    pass
+else:
+    print('fixture-version')
+'''
+                for name in ('nix', 'aws', 'runuser', 'systemd-run', 'loginctl', 'useradd', 'mount', 'curl',
+                             'id', 'git', 'chown', 'ln', 'cp', 'shutdown', 'cargo', 'rustc', 'rustdoc', 'rustup',
+                             'cargo-nextest', 'uv', 'sqlite3'):
+                    command = tools / name
+                    _ = command.write_text(stub)
+                    command.chmod(0o700)
+                (tools / 'python3').symlink_to(sys.executable)
+                links = {'production': 'true', 'expires': '1800000000', 'step': 'size', 'region': 'us-west-2',
+                         'attempt': 'attempt', 'commit': 'a' * 40, 'tree': 'c' * 40, 'mode': 'merge-gate',
+                         'origin': 'https://example.invalid/repo.git', 'guest': 's3://fixture/requests/attempt.guest.py',
+                         'request': 's3://fixture/requests/attempt.json',
+                         'log': 's3://fixture/artifacts/role:__INSTANCE_ID__/attempt/gate.log',
+                         'result': 's3://fixture/artifacts/role:__INSTANCE_ID__/attempt/result.json'}
+                script = gate_box.user_data(links, 'f' * 40, 20, 5, 1800)
+                self.assertLess(script.index('push_logs &'), script.rindex('nix --extra-experimental-features'))
+                self.assertIn('aws s3 cp "${box_dir:-/var/lib/gate-trial}/boot-error.json"', script)
+                reply = subprocess.run(['bash', '-c', script], text=True, capture_output=True, check=False,
+                    timeout=TEST_HANG_GUARD_SECS, cwd=root, env={**os.environ, 'FIXTURE': str(root),
+                    'GATE_BOX_DIR': str(box), 'FAIL_STAGE': failure, 'PATH': str(tools) + os.pathsep + os.environ['PATH']})
+                log = (box / 'boot.log').read_text()
+                uploads = [ledger.mapping(cast(object, json.loads(line))) for line in (root / 'uploads').read_text().splitlines()]
+                results = [ledger.mapping(cast(object, json.loads(ledger.text(row, 'body'))))
+                           for row in uploads if ledger.text(row, 'destination').endswith('/result.json')]
+                self.assertTrue(results, log + reply.stderr)
+                self.assertEqual(results[-1]['verdict'], 'error' if failure else 'pass', log)
+                self.assertEqual((box / 'instance-id').read_text().strip(), 'i-fixture')
+                if failure:
+                    self.assertIn('error', results[-1])
+                self.assertTrue(all('__INSTANCE_ID__' not in ledger.text(row, 'destination') for row in uploads))
+                if not failure:
+                    self.assertEqual(reply.returncode, 0, log + reply.stderr)
+                    lines = [line for line in log.splitlines() if ' stage=' in line]
+                    self.assertEqual([line.split(' stage=', 1)[1] for line in lines], stages)
+                    for line in lines:
+                        self.assertRegex(line, r'^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ stage=')
+                    trace = (root / 'trace').read_text().splitlines()
+                    self.assertLess(trace.index('upload log'), trace.index('tools shell'))
+                    print('Production boot stages: ' + ' -> '.join(stages))
 
     def test_result_round_trip_preserves_reruns_and_test_failures(self) -> None:
         first = gate.GateJobResult('fixture', 'test_one.py', 1, 2, 'failed', cpu_seconds=1, peak_mib=3)
