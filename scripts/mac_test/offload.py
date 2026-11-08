@@ -35,11 +35,10 @@ from scripts.mac_test import cargo_manifest
 from scripts.build_hold import override_guard
 from scripts.copies import copies
 from scripts.direct import result_environment
-from scripts.lint import sweep
 from scripts.lib import conf
 from scripts.buildlog import treekey
 from scripts.mac_test.mirror_root import MacMirrorRoot
-from scripts.buildlog import record, repository, store
+from scripts.buildlog import repository, store
 from scripts.build_targets import target_config
 from scripts.lib import build_folders
 
@@ -933,6 +932,8 @@ def parse_cleanup(value: str) -> CleanupOutcome:
 
 
 def report_cleanup(cleanup: CleanupOutcome, target: str, *, path: str, free_floor_gib: float) -> None:
+    from scripts.lint import sweep
+
     label = target or "Mac"
     if isinstance(cleanup, CleanupDone):
         size = sweep.gib(cleanup.size.kib * 1024) if isinstance(cleanup.size, MeasuredCleanupSize) else "size not measured"
@@ -995,6 +996,8 @@ def read_config(path: Path | DefaultMacSettings = DEFAULT_MAC_SETTINGS) -> Offlo
 
 
 def repository_identity(repo_root: Path) -> RepositoryIdentity:
+    from scripts.lint import sweep
+
     name = sweep.repo_name(str(repo_root))
     common = sweep.git_common_dir(str(repo_root))
     if name is None or common is None:
@@ -2491,6 +2494,8 @@ def restore_ignored_interrupt_default(arguments: CliArguments) -> None:
 def persist_attempt(request: OffloadRequest, result: MacOffloadResult,
                     evidence: AttemptEvidence, started: float) -> None:
     """Append each attempt independently of the final verify call target."""
+    from scripts.buildlog import record
+
     if not request.target:
         return
     repository = repository_identity(request.repo_root)
