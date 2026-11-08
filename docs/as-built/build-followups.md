@@ -2,7 +2,18 @@
 
 ## What it is
 
-Agents' test builds linked far more than the tests they ran, and the daily build report did not show what builds cost the machine. `verify.sh test <pkg>` builds only the named package's test programs (4 in hana, against 78 for `--lib --bins --tests` across the workspace) and runs the same tests. The build report (`buildlog report [day]`) shows that cost four ways: a Rebuilds section of where compile time goes, by how many crates each step compiled (cold builds, cascades, edited-crate rebuilds), with nextest's compile time against its test run; a temporary table of daily test-build time against fixed baselines; builds under temp folders (agent scratch clones, worker session folders) as one `scratch (temp folders)` caller in every kind's table and summary; and a Disk table of where natedev's root filesystem goes: `~/rust`, `/tmp`, the two CI runners, everything else, and free space against the sweep's floor. The buildlog test suite writes only to a temporary log and never walks the real disks, so nothing it does reaches the real log or shows up as a temp-folder build.
+`verify.sh test [<pkg>]` builds and runs the selected test programs.
+Without a package, it selects every workspace member.
+A named package selects only its test programs: 4 in hana, against 78 across the workspace.
+The daily build report (`buildlog report [day]`) shows four costs:
+
+1. The Rebuilds section groups compile time by crate count and compares nextest compile time with test time.
+2. A temporary table compares daily test build time with fixed baselines.
+3. The `scratch (temp folders)` row groups builds in temporary folders across callers.
+4. The Disk table shows space for `~/rust`, `/tmp`, two CI runners, other files, and free space against the sweep's floor.
+
+The buildlog tests write to a temporary log and do not scan real disks.
+They do not add records to the real build log.
 
 ## How it works
 
@@ -81,7 +92,20 @@ Missing matching history puts a step that compiled 1–49 crates in `first build
 
 `take_test_targets` pipes `cargo metadata --no-deps` into `TEST_TARGETS_PY` with the package and its `--features` list. The script expands the enabled features (`default` plus the `<pkg>/`-qualified names from `--features`, transitively). It emits `--lib` when the package has any lib kind (proc-macro included), then `--bin <name>` for each bin and `--test`/`--bench <name>` for each target with `test` enabled. It never selects an example; the example scan refuses an example that holds a test or sets `test = true` (see [rustdoc-once-and-final-targets.md](rustdoc-once-and-final-targets.md)). If one target needs a feature that is off, or shares its kind and name with a target in another member, the whole selection becomes `--bins --tests` (plus `--lib` when there is one); an empty selection becomes `--bins --tests` too.
 
-The arm runs `cargo nextest --no-fail-fast --workspace <selection> -E <filter>` with the feature flags. The filter is `package(<pkg>)`, or `package(<pkg>) & test(a)` for one `--filter`, or `package(<pkg>) & (test(a) | test(b) …)` for several. `test <pkg> <integration_test>` keeps its own `--test <name>` build and never calls the selector.
+The arm runs `cargo nextest --no-fail-fast --workspace <selection> -E <filter>` with the feature flags.
+For a named package, the filter is `package(<pkg>)`.
+One `--filter` adds `& test(a)`; several add `& (test(a) | test(b) …)`.
+Without a package, these filters apply across the workspace.
+`test [<pkg>] --test <integration_test>` selects the named integration target and does not call the target selector.
+
+### Call package names
+
+`scripts/buildlog/record.py` reads the package from the parsed verify command.
+It records `workspace` when no package is given, including `check --features foo`.
+`final <package>` records the named package and saves no gate pass.
+`WorkspacePackages` and `NamedPackage` in `step_record.py` separate package selection from display words.
+The Cargo and cache selectors do not use the display word `workspace`.
+The index, report, Mac outcome reader, and step estimator read the recorded package.
 
 ### Test builds table
 
@@ -188,10 +212,10 @@ Measured by the buildlog disk job at 12:14 EDT: allocated blocks, each hard-link
 - Rows, `other` and free add up to less than the disk: ext4's reserved blocks are in neither used (`f_blocks - f_bfree`) nor free (`f_bavail`), about 93 GiB on natedev (`stat -f /`, 2026-10-04).
 - `read_snapshot` casts the JSON to `DiskSnapshot` without checking its shape. A change to the snapshot's keys must still render the old `disk.json`, or the report raises `KeyError` until the job's next write.
 - The heading's host is `store.host_name()` (short); the floor key's host is `socket.gethostname()` (full), as the sweep reads it.
-- To try a disk change by hand without replacing the live snapshot: `BUILDLOG_DIR=$(mktemp -d) python3 scripts/buildlog/cli.py disk`, then `report` with the same `BUILDLOG_DIR`, and compare used and free with `df -B1 /`.
-- In a worktree, `./scripts/buildlog/buildlog` execs the live `~/.claude` CLI; render the worktree's report with `python3 scripts/buildlog/cli.py report <day>`.
-- `test_report.py` has no `sys.path` setup. It runs from the repo root.
-- `disk.py` imports `scripts.lint.sweep` from the repo root and changes no `sys.path`.
+- To try a disk change by hand without replacing the live snapshot: `BUILDLOG_DIR=$(mktemp -d) scripts/lib/py scripts/buildlog/cli.py disk`, then `report` with the same `BUILDLOG_DIR`, and compare used and free with `df -B1 /`.
+- In a worktree, `./scripts/buildlog/buildlog` execs the live `~/.claude` CLI; render the worktree's report with `scripts/lib/py scripts/buildlog/cli.py report <day>`.
+- `test_report.py` has no `sys.path` setup and runs only under `~/.claude/scripts/lib/py -m unittest discover -s scripts/buildlog -p 'test_*.py'`.
+- `disk.py` imports `scripts.lint.sweep` by package name and changes no `sys.path`.
 - `basedpyright scripts/buildlog` exits 0 when clean. Its summary reads `0 errors, 0 warnings, 0 notes`.
 
 ## Why

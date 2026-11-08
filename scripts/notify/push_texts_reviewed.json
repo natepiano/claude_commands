@@ -223,6 +223,91 @@
       "time": "2026-10-27T11:40:34.667654-04:00"
     }
   },
+  "nightly.not_run": {
+    "cold_credentials": {
+      "objections": [
+        {
+          "quote": "run github-warmup",
+          "rule": "reader-starts-cold"
+        },
+        {
+          "quote": "Why: GitHub credentials are cold.",
+          "rule": "what-happened-why-what-you-do"
+        }
+      ],
+      "reviewer": "user-spec: User 2026-11-06 via sdlc and natedev: 'i want a pushover sent when the nightly type check is done and whether it passed or not ... i may remvoe this in the future but for now i want to see that it ran'. Wording by messaging-unit; the user has not read these texts; reviewer: opus",
+      "sha256": "2061c49a150d75ef62b00b77ee7e06dbe7886c64e48e8d3c5146217e5bfc053d",
+      "time": "2026-11-06T10:46:38.779135-05:00"
+    },
+    "fetch_failed": {
+      "objections": [
+        {
+          "quote": "The next nightly run tries again.",
+          "rule": "push-only-what-the-user-must-do"
+        }
+      ],
+      "reviewer": "user-spec: User 2026-11-06 via sdlc and natedev: 'i want a pushover sent when the nightly type check is done and whether it passed or not ... i may remvoe this in the future but for now i want to see that it ran'. Wording by messaging-unit; the user has not read these texts; reviewer: opus",
+      "sha256": "2061c49a150d75ef62b00b77ee7e06dbe7886c64e48e8d3c5146217e5bfc053d",
+      "time": "2026-11-06T10:46:25.461944-05:00"
+    }
+  },
+  "nightly.result": {
+    "did_not_finish": {
+      "objections": [
+        {
+          "quote": "The nightly check of main finished at 03:53 EST.",
+          "rule": "push-only-what-the-user-must-do"
+        }
+      ],
+      "reviewer": "user-spec: User 2026-11-06 via sdlc and natedev: 'i want a pushover sent when the nightly type check is done and whether it passed or not ... i may remvoe this in the future but for now i want to see that it ran'. Wording by messaging-unit; the user has not read these texts; reviewer: opus",
+      "sha256": "9354706854e28a29248db222dc0163aafde6b40158a114491ad14b51b509a396",
+      "time": "2026-11-06T10:40:44.705692-05:00"
+    },
+    "many_failed": {
+      "objections": [
+        {
+          "quote": "Full tests: failed in direct/test_assign.py, direct/test_board.py, message/test_send.py, notify/test_review.py, production/test_staff.py, shutdown/test_restart.py, settings/test_settings.py, whoami/test_usage.py and 12 more.",
+          "rule": "push-only-what-the-user-must-do"
+        }
+      ],
+      "reviewer": "user-spec: User 2026-11-06 via sdlc and natedev: 'i want a pushover sent when the nightly type check is done and whether it passed or not ... i may remvoe this in the future but for now i want to see that it ran'. Wording by messaging-unit; the user has not read these texts; reviewer: opus",
+      "sha256": "9354706854e28a29248db222dc0163aafde6b40158a114491ad14b51b509a396",
+      "time": "2026-11-06T10:40:37.448223-05:00"
+    },
+    "passed": {
+      "objections": [
+        {
+          "quote": "The nightly check of main finished at 03:53 EST.",
+          "rule": "push-only-what-the-user-must-do"
+        }
+      ],
+      "reviewer": "user-spec: User 2026-11-06 via sdlc and natedev: 'i want a pushover sent when the nightly type check is done and whether it passed or not ... i may remvoe this in the future but for now i want to see that it ran'. Wording by messaging-unit; the user has not read these texts; reviewer: opus",
+      "sha256": "9354706854e28a29248db222dc0163aafde6b40158a114491ad14b51b509a396",
+      "time": "2026-11-06T10:40:18.061908-05:00"
+    },
+    "tests_failed": {
+      "objections": [
+        {
+          "quote": "Full tests: failed in direct/test_simplify_lens.py, production/test_staff.py.",
+          "rule": "push-only-what-the-user-must-do"
+        }
+      ],
+      "reviewer": "user-spec: User 2026-11-06 via sdlc and natedev: 'i want a pushover sent when the nightly type check is done and whether it passed or not ... i may remvoe this in the future but for now i want to see that it ran'. Wording by messaging-unit; the user has not read these texts; reviewer: opus",
+      "sha256": "9354706854e28a29248db222dc0163aafde6b40158a114491ad14b51b509a396",
+      "time": "2026-11-06T10:40:24.309443-05:00"
+    },
+    "types_failed": {
+      "objections": [
+        {
+          "quote": "The nightly check of main finished at 03:53 EST.\nType check: failed with 3 errors, 1 warning, 0 notes.\nFull tests: passed.",
+          "rule": "push-only-what-the-user-must-do"
+        }
+      ],
+      "reviewer": "user-spec: User 2026-11-06 via sdlc and natedev: 'i want a pushover sent when the nightly type check is done and whether it passed or not ... i may remvoe this in the future but for now i want to see that it ran'. Wording by messaging-unit; the user has not read these texts; reviewer: opus",
+      "sha256": "9354706854e28a29248db222dc0163aafde6b40158a114491ad14b51b509a396",
+      "time": "2026-11-06T10:40:29.948005-05:00"
+    }
+  },
   "nix_heal.failed": {
     "refused": {
       "reviewer": "opus",
@@ -902,32 +987,32 @@
   "shutdown.restart_failed": {
     "one_long_name": {
       "reviewer": "opus",
-      "sha256": "da53582edd216e5d1e0758383368fd76a554d8bd088e6b11ab8e05efa00a3188",
-      "time": "2026-11-01T22:39:12.544136-05:00"
+      "sha256": "bf6001b8b3d7ba5f04633c8f7bb271495bece4ca7715b24d0b115a27d5c0db24",
+      "time": "2026-11-07T12:59:46.071567-05:00"
     },
     "typical": {
       "reviewer": "opus",
-      "sha256": "da53582edd216e5d1e0758383368fd76a554d8bd088e6b11ab8e05efa00a3188",
-      "time": "2026-11-01T22:39:06.696247-05:00"
+      "sha256": "bf6001b8b3d7ba5f04633c8f7bb271495bece4ca7715b24d0b115a27d5c0db24",
+      "time": "2026-11-07T12:59:38.245148-05:00"
     }
   },
   "shutdown.restart_incomplete": {
     "long_account": {
       "reviewer": "opus",
-      "sha256": "f5e0e31c30d4008c005131d88f87330e7b85b24a28214e26a81c6dc89cfdfc46",
-      "time": "2026-10-14T17:15:31.310232-04:00"
+      "sha256": "ada7c3fe1a713afffff6864d57d1a225c87f399b9477d555bbf57ee3c70a67d4",
+      "time": "2026-11-07T13:00:09.523293-05:00"
     },
     "typical": {
       "reviewer": "opus",
-      "sha256": "f5e0e31c30d4008c005131d88f87330e7b85b24a28214e26a81c6dc89cfdfc46",
-      "time": "2026-10-14T17:15:20.109165-04:00"
+      "sha256": "ada7c3fe1a713afffff6864d57d1a225c87f399b9477d555bbf57ee3c70a67d4",
+      "time": "2026-11-07T13:00:02.062164-05:00"
     }
   },
   "shutdown.restart_untrusted": {
     "typical": {
       "reviewer": "opus",
-      "sha256": "f57b6487a5078fa11193be0ca11dfc0b3c14d83684cc0d4d77e22cec98a3a7a6",
-      "time": "2026-11-01T23:38:17.230240-05:00"
+      "sha256": "ac22944a6753615e074a27bffe4dbba0c64c654aebf4f560a00a2ad57e560c95",
+      "time": "2026-11-07T12:59:55.219819-05:00"
     }
   },
   "shutdown.restart_untrusted_unlisted": {

@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import subprocess
+import tempfile
 import unittest
+from pathlib import Path
 from typing import override
 
 from scripts.direct.verify_lint_cache_test_support import VerifyLintCacheFixture
@@ -12,10 +15,56 @@ from scripts.direct.verify_lint_diagnostics_test_support import (
     CLIPPY_DENY_WARNINGS,
     RUSTC_DENY_ATTRIBUTE,
 )
-from scripts.direct.verify_lint_scope_test_support import CARGO_STUB, SCRIPTS
+from scripts.direct.verify_lint_scope_test_support import CARGO_STUB, SCRIPTS, VERIFY
+from scripts.lib.shell_test_support import shell_functions
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
 LINT_FINDING = CLIPPY_DENY_WARNINGS
+
+
+class FirstJudgmentRepairTests(unittest.TestCase):
+    def repair_decision(
+        self, status: int, diagnostic: str, *, hold_lint: int = 0, killed: int = 0,
+    ) -> subprocess.CompletedProcess[str]:
+        with tempfile.TemporaryDirectory() as directory:
+            log = Path(directory) / "clippy.log"
+            _ = log.write_text(diagnostic, encoding="utf-8")
+            script = "set -eu\n" + shell_functions(VERIFY, "first_judgment_permits_repair")
+            script += '\nHOLD_LINT=$3\nRUN_LAST_ATTEMPT_KILLED=$4\nfirst_judgment_permits_repair "$1" "$2"\n'
+            return subprocess.run(
+                ["bash", "-c", script, "judgment", str(status), str(log), str(hold_lint), str(killed)],
+                capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS,
+            )
+
+    def test_nonlint_status_never_permits_repair(self) -> None:
+        for status in (1, 2, 3, 10, 75, 76, 77, 125, 130, 137, 143):
+            with self.subTest(status=status):
+                result = self.repair_decision(status, LINT_FINDING)
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+
+    def test_lint_finding_permits_repair(self) -> None:
+        result = self.repair_decision(101, LINT_FINDING)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_compile_error_permits_repair(self) -> None:
+        result = self.repair_decision(101, "error[E0308]: mismatched types\n")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_lint_hold_prevents_repair(self) -> None:
+        result = self.repair_decision(101, LINT_FINDING, hold_lint=1)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+
+    def test_killed_attempt_prevents_repair(self) -> None:
+        result = self.repair_decision(101, LINT_FINDING, killed=1)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+
+    def test_signal_report_prevents_repair(self) -> None:
+        result = self.repair_decision(
+            101, LINT_FINDING + "process didn't exit successfully: `rustc` (signal: 9, SIGKILL: kill)\n",
+        )
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+
 
 # Intercept only an explicitly requested first judgment. The ordinary fixture
 # still implements repairs, formatting, subsequent judgments and tool failures.
@@ -51,7 +100,7 @@ class VerifyLintJudgmentFixture(VerifyLintCacheFixture):
     def assert_fix_and_judgment_calls(self, *, fix_passes: int = 1) -> None:
         scope = ["--workspace", "--all-targets", "--all-features", "--keep-going"]
         judgment = [*scope, "--", "-D", "warnings"]
-        fix = ["--fix", "--allow-dirty", "--allow-staged", "--allow-no-vcs", *judgment]
+        fix = ["--jobs", "8", "--fix", "--allow-dirty", "--allow-staged", "--allow-no-vcs", *judgment]
         self.assertEqual(self.calls("clippy"), [judgment, *([fix] * fix_passes), judgment])
 
     def override_runner_killed_flag(self, flag: int) -> None:
@@ -143,8 +192,9 @@ Caused by:
                          [["fmt", "-p", "sample"]])
 
     def test_first_judgment_nonlint_status_never_repairs(self) -> None:
-        # Even lint-shaped output cannot turn admission or kill codes into findings.
-        for status in (1, 2, 3, 10, 75, 76, 77, 125, 130, 137, 143):
+        # Lint-shaped output never turns a failed first judgment into a repair.
+        # Status 1 takes the plain failure path; 143 also takes the hold-stop checks in run_step.
+        for status in (1, 143):
             with self.subTest(status=status):
                 self.environment["TEST_CLIPPY_FIRST_STATUS"] = str(status)
                 result = self.invoke_verify("lint", "sample", cwd=self.root)

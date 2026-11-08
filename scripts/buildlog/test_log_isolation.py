@@ -31,10 +31,16 @@ class TestLogIsolationTests(unittest.TestCase):
             module = " ".join(arguments)
             with self.subTest(module=module), tempfile.TemporaryDirectory() as temporary:
                 home = Path(temporary)
+                tools = home / "bin"
+                tools.mkdir()
+                herdr = tools / "herdr"
+                _ = herdr.write_text(f"#!{sys.executable}\nraise SystemExit('unexpected fixture herdr command')\n")
+                herdr.chmod(0o755)
                 environment = {key: value for key, value in os.environ.items()
                                if key not in ("BUILDLOG_DIR", "STAFF_OPERATION_FD", "PYTHONUNBUFFERED",
                                               "REFUSAL_WATCH_INVENTORY")}
-                environment.update(HOME=str(home), HERDR_BIN="/nonexistent/herdr")
+                environment.update(HOME=str(home), HERDR_BIN=str(herdr),
+                                   PATH=str(tools) + os.pathsep + os.environ.get("PATH", os.defpath))
                 result = subprocess.run(
                     [sys.executable, "-m", "unittest", *arguments],
                     cwd=REPOSITORY, env=environment, text=True, capture_output=True,

@@ -9,8 +9,7 @@ from pathlib import Path
 from typing import Literal, NamedTuple, TypedDict
 
 from scripts.buildlog import store
-from scripts.buildlog import cgroup_capture
-from scripts.buildlog import filesystem
+from scripts.buildlog import cgroup_capture, filesystem
 from scripts.lib.boot_identity import parse_boot_id as parse_boot_id
 from scripts.lib.cargo_output import CargoOutputRoots, read_cargo_output_roots
 from scripts.buildlog.cgroup_capture import (Unmeasured as Unmeasured, StallTotals as StallTotals,

@@ -101,18 +101,16 @@ class PublishedWorker:
 def parent(record: staff.StaffSnapshot, sources: session_staff.MemberSources | None = None, *,
            staff_id: str = "", production: str = "", unit: str = "",
            run: Path | None = None, roster: Mapping[str, object] | None = None) -> staff.StaffRow:
-    """Resolve the recorded run owner or run unit before the roster and caller."""
+    """Resolve the recorded run owner before the roster and caller."""
     if run is not None:
         try:
             state = worker_lifecycle.read_json_object(run / unit_runs.STATE_FILE)
         except (OSError, ValueError) as error:
-            print(f"anomaly: {error}".replace("\n", " "), file=sys.stderr)
+            unit_runs.report_anomaly(f"anomaly: {error}".replace("\n", " "))
             state = {}
         owner = unit_runs.run_owner(state, record)
         if isinstance(owner, staff.StaffRow) and owner.kind in ("unit", "showrunner"):
             return owner
-        production = value if isinstance(value := state.get("production"), str) else ""
-        unit = value if isinstance(value := state.get("unit"), str) else ""
     if unit:
         found = session_staff.unit_match(session_staff.ObservedUnit(unit), record)
         if isinstance(found, session_staff.MemberFound):
@@ -131,16 +129,18 @@ def parent(record: staff.StaffSnapshot, sources: session_staff.MemberSources | N
             owner = record.parent_of(child) if child is not None else None
             if owner is not None:
                 return owner
-    row = record.by_current_session(staff_id) if staff_id else None
-    if row is not None and row.kind == "worker":
-        row = record.parent_of(row)
+    row = record.owner_of(staff_id) if staff_id else None
     if row is not None and row.kind in ("unit", "showrunner"):
         return row
-    sources = sources if sources is not None else session_staff.member_sources()
-    found = sources.member(session_staff.ShowrunnerMember(production), record)
-    if isinstance(found, session_staff.NoSuchMember):
+    if production:
+        sources = sources if sources is not None else session_staff.member_sources()
+        found = sources.member(session_staff.ShowrunnerMember(production), record)
+        if isinstance(found, session_staff.MemberFound):
+            return found.row
+    if unit or production:
         raise ValueError(f"no unit staff row for {unit}" if unit else f"no showrunner staff row for {production}")
-    return found.row
+    raise ValueError(f"this run has no owner because {unit_runs.STATE_FILE} and mesh_roster.json name no unit, production or staff row"
+                     if run is not None else "the caller has no staff row and names no unit or production")
 
 
 def find_worker(record: staff.StaffSnapshot, owner: staff.StaffId, name: str) -> staff.StaffRow | None:
@@ -166,19 +166,16 @@ def resolve_roster(run: Path, entries: dict[str, object]) -> dict[str, object]:
     return entries
 
 
-def admit(name: str, run: Path, *, role: str, production: str = "", unit: str = "", reference: str = "") -> WorkerStartAllowed:
+def admit(name: str, run: Path, *, reference: str = "") -> WorkerStartAllowed:
     """Refuse before starting a backend or taking lifecycle, inbox or roster locks."""
     try:
-        del role
         record = staff.snapshot()
         if reference:
             existing = record.by_id(staff.StaffId(reference))
             if existing is None or existing.kind != "worker" or not isinstance(existing.parent, staff.ReportsTo):
                 raise AdmissionRefused(f"{reference}: no worker staff row")
             return WorkerStartAllowed(existing.name, existing.parent.id, run, ExistingWorkerSlot(existing))
-        explicit = bool(production or unit)
-        owner = parent(record, staff_id="" if explicit else staff.runtime_id(),
-                       production=production, unit=unit, run=None if explicit else run)
+        owner = parent(record, staff_id=staff.runtime_id(), run=run)
         _ = staff.WorkerName.parse(name)
         if isinstance(owner.worktree, staff.RemovedWorktree):
             print(f"staff: {name}: parent {owner.id} is retired; admission continues", file=sys.stderr)
@@ -312,16 +309,25 @@ def assignment_id(prompt: Path) -> str:
     return hashlib.sha256(str(prompt.resolve()).encode() + str(prompt.stat().st_mtime_ns).encode() + prompt.read_bytes()).hexdigest()
 
 
-def dispatch_record(allowed: WorkerStartAllowed, *, report_anomaly: bool = True) -> DispatchRecord:
-    entry = session_staff.read_worker_roster(allowed.run / "mesh_roster.json").get(allowed.name)
+def dispatch_record(run: Path, name: str, *, report_anomaly: bool = True) -> DispatchRecord:
+    entry = session_staff.read_worker_roster(run / "mesh_roster.json").get(name)
     fields = cast(dict[str, object], entry) if isinstance(entry, dict) else {}
     try:
         return DispatchRecord(str(fields.get("assignment_id", "")),
                               SwitchState(fields.get("dispatch_state", SwitchState.NO_RECORD)))
     except ValueError:
         if report_anomaly:
-            print(f"anomaly: {allowed.name}: unknown dispatch_state {fields.get('dispatch_state')!r}; using NO_RECORD", file=sys.stderr)
+            print(f"anomaly: {name}: unknown dispatch_state {fields.get('dispatch_state')!r}; using NO_RECORD", file=sys.stderr)
         return DispatchRecord(str(fields.get("assignment_id", "")), SwitchState.NO_RECORD)
+
+
+def dispatch_pending(run: Path, name: str, prompt: Path) -> bool:
+    try:
+        record = dispatch_record(run, name)
+    except (OSError, worker_lifecycle.WorkerStateUnreadable) as error:
+        print(f"anomaly: {name}: {error}".replace("\n", " "), file=sys.stderr)
+        return False
+    return record.assignment_id == assignment_id(prompt) and record.state is not SwitchState.ASSIGNMENT_ACCEPTED
 
 
 def record_dispatch(allowed: WorkerStartAllowed, request: str, state: SwitchState, *, expected_request: str = "") -> None:
@@ -383,7 +389,7 @@ def switch_worker(allowed: WorkerStartAllowed, family: str, *,
             raise AdmissionRefused(f"{allowed.slot.row.id}: source staff row is missing")
         backend = staff.backend(row) if row is not None else staff.BACKEND_UNAVAILABLE
         same = not isinstance(backend, staff.BackendUnavailable) and backend.family == family
-        prior = dispatch_record(allowed)
+        prior = dispatch_record(allowed.run, allowed.name)
         request = request or (hashlib.sha256(f"{allowed.slot.row.id}:{family}".encode()).hexdigest()
                               if isinstance(allowed.slot, ExistingWorkerSlot) else "")
         retry = bool(request and prior.assignment_id == request)

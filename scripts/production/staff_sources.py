@@ -2,6 +2,10 @@
 """Resolve staff membership and observe native worker identities."""
 
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 from contextlib import redirect_stderr
 import io
@@ -15,11 +19,6 @@ import sys
 from pathlib import Path
 from typing import cast
 
-# These source modules still use sibling imports; keep their existing module identity.
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 from scripts.production import showrunners  # noqa: E402
 from scripts.production.production_doc import ProductionDocument  # noqa: E402
 from scripts.production import staff, unit_config, session_staff  # noqa: E402
@@ -29,13 +28,13 @@ from scripts.shutdown import remote  # noqa: E402
 
 
 # Matchers live in unit_lookup, so lower readers use the same join without an import cycle.
-from unit_lookup import (  # noqa: E402
+from scripts.production.unit_lookup import (  # noqa: E402
     ShowrunnerMember as ShowrunnerMember, UnitMember as UnitMember, ObservedUnit as ObservedUnit,
     MemberSelector as MemberSelector, MemberFound as MemberFound, NoSuchMember as NoSuchMember,
     UnitProduction as UnitProduction, MemberSources as _MemberSources,
     member_sources as _member_sources,
 )
-import unit_lookup  # noqa: E402
+from scripts.production import unit_lookup  # noqa: E402
 
 
 def member(selector: MemberSelector, record: staff.StaffSnapshot) -> MemberFound | NoSuchMember:
@@ -110,14 +109,10 @@ def _observation_session(value: ClaudeSession | CodexThread) -> str:
     return value.session_id if isinstance(value, ClaudeSession) else value.thread_id
 
 
-def _problem(path: Path | str, error: object) -> None:
-    message = f"staff sources: {path}: {error}"
-    print(message.replace("\n", " ").replace("\r", " "), file=sys.stderr)
-
-
-def is_non_staff_note(message: str) -> bool:
-    """Identify a diagnostic that excludes an agent from staff."""
-    return message.endswith("; not staff")
+def _problem(path: Path | str, error: object, *, pid: int = 0) -> None:
+    message = f"staff sources: {path}: {error}".replace("\n", " ").replace("\r", " ")
+    if not session_staff.collect_anomaly(f"pid {pid} (codex): {message}" if pid else message, pid=pid):
+        print(message, file=sys.stderr)
 
 
 def codex_thread_host(arguments: list[str]) -> bool:
@@ -139,7 +134,7 @@ def codex_thread_host(arguments: list[str]) -> bool:
 
 
 def pane_holds_staff_member(record: staff.StaffSnapshot, sources: _MemberSources, pane: str) -> bool:
-    """Join the pane's retained identity or unit labels to the supplied staff snapshot."""
+    """Join a pane's retained launch to the supplied staff snapshot."""
     for launch in sources.launches:
         if launch.get("pane_id") != pane or launch.get("ended"):
             continue
@@ -148,17 +143,74 @@ def pane_holds_staff_member(record: staff.StaffSnapshot, sources: _MemberSources
     return False
 
 
-def codex_non_staff_reason(record: staff.StaffSnapshot, sources: _MemberSources,
-                           environment: Mapping[str, str]) -> str:
-    """Exclude a process without a thread only when its pane has no staff owner."""
-    if environment.get("CODEX_THREAD_ID", ""):
-        return ""
-    pane = environment.get("HERDR_PANE_ID", "")
-    if not pane:
-        return "not in a herdr pane; not staff"
-    if not pane_holds_staff_member(record, sources, pane):
-        return "pane holds no staff member; not staff"
-    return ""
+class CodexProcessThreads:
+    """Read a thread from its process or terminal metadata."""
+
+    def __init__(self) -> None:
+        self.panes: dict[tuple[str, str], dict[str, object]] = {}
+        self.foreground_pids: dict[tuple[str, str], int] = {}
+        self.threads: dict[Path, dict[str, str]] = {}
+
+    def thread(self, pid: int, environment: Mapping[str, str]) -> str:
+        from scripts.herdr import herdr
+        from scripts.message import codex_daemon
+
+        try:
+            return herdr.codex_rollout_thread(pid)
+        except herdr.NoOpenCodexRollout:
+            pass
+        except (OSError, ValueError, herdr.HerdrFailure):
+            return ""
+        if identity := environment.get("CODEX_THREAD_ID", ""):
+            return identity
+        try:
+            try:
+                return herdr.codex_resume_thread(pid)
+            except (OSError, ValueError):
+                pass
+            place = herdr.herdr_place_of(pid)
+            if isinstance(place, herdr.NotInHerdr):
+                return ""
+            key = (place.session, place.pane)
+            client = herdr.Herdr(place.session)
+            if key not in self.foreground_pids:
+                self.foreground_pids[key] = client.pane_codex_pid(place.pane)
+            if self.foreground_pids[key] != pid:
+                return ""
+            if key not in self.panes:
+                self.panes[key] = herdr.json_object(client.result("pane", "get", place.pane).get("pane"),
+                                                  "Codex pane")
+            pane = self.panes[key]
+            if identity := herdr.pane_session(pane):
+                return identity
+            title = pane.get("terminal_title_stripped")
+            if not isinstance(title, str):
+                return ""
+            name = title.partition(" | ")[0]
+            home = Path(environment.get("CODEX_HOME", str(Path.home() / ".codex"))).expanduser()
+            if home not in self.threads:
+                observed = codex_daemon.loaded_sessions(home / "app-server-control/app-server-control.sock")
+                self.threads[home] = {}
+                if not isinstance(observed, codex_daemon.DaemonUnreadable):
+                    for entry in observed:
+                        # A repeated name cannot identify one terminal's thread.
+                        if entry.name in self.threads[home]:
+                            self.threads[home][entry.name] = ""
+                        else:
+                            self.threads[home][entry.name] = entry.thread_id
+            return self.threads[home].get(name, "")
+        except (OSError, ValueError, herdr.HerdrFailure):
+            return ""
+
+
+    def check(self, pid: int, identity: str) -> session_staff.ReportProcessIdentity:
+        from scripts.herdr import herdr
+
+        try:
+            native = identity or (self.thread(pid, herdr.process_environment(pid)) if pid else "")
+        except (OSError, ValueError, herdr.HerdrFailure):
+            native = identity
+        return session_staff.ReportProcessIdentity(native, session_staff.morty_thread(native))
 
 
 @dataclass(frozen=True)
@@ -226,16 +278,23 @@ class _WorkerSources:
         self.native_running: dict[str, dict[str, str]] = {
             identity: {"claude": identity} for identity in self.running}
         from scripts.message import process_table
-        import herdr
+        from scripts.herdr import herdr
         try:
-            for process in process_table.snapshot().values():
+            processes = process_table.snapshot()
+        except (OSError, ValueError, subprocess.SubprocessError) as error:
+            self.codex_scan_incomplete = True
+            _problem("Codex processes", error)
+            processes = {}
+        threads = CodexProcessThreads()
+        for process in processes.values():
+            try:
                 try:
                     arguments = shlex.split(process.arguments)
                 except ValueError as error:
                     if not herdr.is_codex_process(process.arguments.split()):
                         continue
                     self.codex_scan_incomplete = True
-                    _problem(f"Codex process scan: pid {process.pid}", error)
+                    _problem(f"Codex process scan: pid {process.pid}", error, pid=process.pid)
                     continue
                 if not herdr.is_codex_process(arguments) or codex_thread_host(arguments):
                     continue
@@ -245,16 +304,19 @@ class _WorkerSources:
                     if process.pid in process_table.snapshot():
                         raise
                     continue
-                if native := environment.get("CODEX_THREAD_ID", ""):
-                    self.native_running[native] = {"codex": native}
-                elif reason := codex_non_staff_reason(record, sources, environment):
-                    _problem(f"Codex process {process.pid}", reason)
-                else:
+                native = threads.thread(process.pid, environment)
+                if session_staff.report_process(process.pid, native).is_morty:
+                    continue
+                if native:
+                    if record.by_current_session(native) is not None:
+                        self.native_running[native] = {"codex": native}
+                elif (pane := environment.get("HERDR_PANE_ID", "")) and pane_holds_staff_member(record, sources, pane):
                     self.codex_scan_incomplete = True
-                    _problem(f"Codex process {process.pid}", "native thread identity is unavailable")
-        except (OSError, ValueError, subprocess.SubprocessError) as error:
-            self.codex_scan_incomplete = True
-            _problem("Codex processes", error)
+                    _problem(f"Codex process {process.pid} in pane {pane}",
+                             "cannot read its thread; staff status may be incomplete", pid=process.pid)
+            except (OSError, ValueError, subprocess.SubprocessError) as error:
+                self.codex_scan_incomplete = True
+                _problem(f"Codex process {process.pid}", error, pid=process.pid)
         for row in record.rows:
             identity = self.native_running.get(row.current_session)
             if identity is not None:
@@ -296,6 +358,12 @@ def observe_workers(record: staff.StaffSnapshot, sources: _MemberSources, *,
         _ = errors.write("Claude session registry is incomplete\n")
     diagnostics = tuple(errors.getvalue().splitlines())
     return WorkerEvidence(observed, scan.identities, diagnostics)
+
+
+def production_units(slug: str) -> tuple[staff.StaffRow, ...]:
+    """Read unit membership for the staff pause and resume commands."""
+    record = staff.snapshot()
+    return session_staff.production_members(record).get(slug, ())
 
 
 def _live_member(row: staff.StaffRow, role: LiveRole, identity: Mapping[str, str]) -> dict[str, object]:

@@ -5,23 +5,74 @@ Use it to find each place to change in a staff migration. The spec is `docs/plan
 
 The check in `scripts/production/test_staff_accessors.py` fails when this table omits an accessor. Before a migration, run the check and add each file it names.
 
-Updated from the combined branch on 2026-11-05. The table excludes Python test modules.
+The table excludes Python test modules.
 `staff.py` owns reads and writes.
 On natedev, each Python accessor reads `staff.json` in its own process.
 On the Mac, `staff.py` asks natedev over SSH.
 
-Write functions of `staff.py`: ensure, ensure_worker, move, rename, retire, retire_pending, set_doc, set_worktree, update_current_session.
+## Staff identity and backends
+
+`StaffRow` holds `id`, `kind`, `name`, `parent`, `current_session`, `worktree`, `doc`, `paused`, and `unknown_fields`.
+The fixed `id` identifies a member across session changes.
+`parent` is `ReportsTo(id)` or `StaffRoot`.
+`current_session` holds the native Claude session ID or Codex thread ID.
+
+`StaffSnapshot` derives backend evidence from session records, transcripts, and live processes.
+`ClaudeBackend.family` is `claude`.
+`CodexBackend.family` is `codex`; its `codex_home` names the serving account.
+`BackendUnavailable` names unavailable backend evidence.
+A live Claude session can supply backend evidence before its transcript exists.
+A caller that already read the session registry sets `StaffSnapshot.running_sessions`, and `backends` then reads no registry.
+
+`StaffRow.paused` is `Paused(since, by, why)` or `Active()`.
+JSON stores `paused: {since, by, why}` only for a paused row.
+`pause(reference, why)` records the time in the user zone and the caller's staff name.
+`resume(reference)` removes the field.
+The commands accept a unit or `--production <showrunner name>`.
+Production pause accepts repeated `--except <unit>` options with a unit's staff name, its `-unit` form, or its staff id.
+An unmatched `--except` value refuses the whole command before any write.
+The refusal names the value and the production. A unit of another production does not match.
+Both commands are safe to repeat. They stop no process.
+Rename, move, retire and restore retain the pause field.
+
+Rows, locations, and pause records keep fields that the reader does not know in `unknown_fields`.
+Writes preserve these fields unchanged. Row changes also preserve them.
+The owner keeps an existing location's unknown fields when its path or state changes, including retirement and restore.
+Changes from the Mac use the same owner setters.
+A new pause record starts with no unknown fields because it replaces the old record.
+Staff storage uses schema 2.
+A change that old code cannot read safely requires a new schema number.
+`staff_sources.live` emits observations with schema 3.
+`WorkerObservation.identity` is `ClaudeSession`, `CodexThread`, or `BackendUnavailable`.
+
+Run records identify workers through fixed staff references.
+The [worker lifecycle](long-lived-workers.md#roster-fields) defines their stored fields.
+Its [admission boundary](long-lived-workers.md#staff-identity-and-admission) publishes the current runtime.
+
+`set_worktree` compares an expected `PresentWorktree`, `RemovedWorktree`, or `WorktreeUnfilled` under the staff lock.
+The comparison includes the machine and path when present.
+A row lock protects one member during a worker change.
+`staff.child_environment` removes inherited row-lock proofs and the staff ID before an agent starts.
+It also removes the [operation configuration](agent-registry.md#agent-environment-boundary).
+Staff lock and remote waits read `OPERATION_LOCK_SECONDS` and `REMOTE_SECONDS` from `config/staff.conf` at use.
+Each wait uses the smaller configured limit or remaining operation deadline.
+
+## Accessor table
+
+The write functions are `ensure`, `ensure_worker`, `move`, `rename`, `retire`, and `retire_pending`.
+They also include `set_doc`, `set_worktree`, `update_current_session`, `pause`, and `resume`.
 
 | File | Access | `staff` calls |
 |---|---|---|
 | `commands/showrunner/promote_unit.md` | read | staff.py get (shell) |
+| `commands/showrunner/units.md` | write | staff.py pause, resume (shell) |
 | `docs/associate-producer/operations.md` | read | staff.json (shell) |
+| `docs/as-built/showrunner-automation.md` | write | staff.py pause, resume (shell) |
 | `docs/production_format.md` | read | staff.py get (shell) |
 | `scripts/accounts/accounts.py` | read | local_snapshot |
 | `scripts/accounts/pane_moves.py` | read | local_snapshot, WorkerName.parse |
 | `scripts/accounts/refusal_watch.py` | read | initial_snapshot |
 | `scripts/accounts/unit_watchdog.py` | read | active, initial_snapshot, snapshot |
-| `scripts/agents/agent_bg.sh` | read | runtime_id |
 | `scripts/agents/codex_mesh.py` | read | native_id, runtime_id, snapshot |
 | `scripts/agents/mesh_runs.py` | read | local_snapshot |
 | `scripts/agents/test_agent_exec.sh` | read | staff.json (shell) |
@@ -34,11 +85,15 @@ Write functions of `staff.py`: ensure, ensure_worker, move, rename, retire, reti
 | `scripts/bevy_upgrade/upgrade_schedule.py` | read | snapshot |
 | `scripts/build_targets/working_set.py` | read | local_snapshot |
 | `scripts/buildlog/mac_idle_test_support.py` | read | snapshot |
+| `scripts/copies/copies.py` | read | local_snapshot, caller_identity; current owner names by row id |
+| `scripts/build_queue/build_queue.py` | read | caller_identity |
+| `scripts/build_queue/admission_records.py` | read | caller_identity |
 | `scripts/direct/assign.py` | read | runtime_id |
+| `scripts/direct/assign_claude.py` | read | local_snapshot |
+| `scripts/direct/assign_claude_test_support.py` | read | staff.json path |
 | `scripts/direct/assign_launcher_test_support.py` | write | by_id, local_snapshot, rename, set_worktree |
 | `scripts/direct/board_json.py` | read | active, snapshot |
-| `scripts/direct/implement.sh` | read | local_snapshot |
-| `scripts/direct/implement_launcher_test_support.py` | read | staff.json path |
+| `scripts/direct/claude_worker.py` | read | runtime_id |
 | `scripts/direct/phase_reservation.py` | read | snapshot, WorktreeUnfilled |
 | `scripts/direct/phase_table.py` | read | active, snapshot |
 | `scripts/direct/plan_history.py` | read | snapshot |
@@ -47,6 +102,7 @@ Write functions of `staff.py`: ensure, ensure_worker, move, rename, retire, reti
 | `scripts/direct/remove_workers.py` | write | local_snapshot, retire |
 | `scripts/direct/review.sh` | read | local_snapshot, StaffRow |
 | `scripts/direct/review_launcher_test_support.py` | write | local_snapshot, native_id, update_current_session |
+| `scripts/direct/verify.sh` | read | snapshot, by_id, StaffId, StaffRow |
 | `scripts/direct/workers.py` | read | initial_snapshot |
 | `scripts/hana_shot/hana_shot.py` | read | local_snapshot, runtime_id |
 | `scripts/herdr/herdr.py` | read | active, initial_snapshot, native_id, runtime_id |
@@ -62,16 +118,18 @@ Write functions of `staff.py`: ensure, ensure_worker, move, rename, retire, reti
 | `scripts/hooks/session-start-pane-record.py` | read | runtime_id |
 | `scripts/hooks/showrunner_footer.py` | read | snapshot |
 | `scripts/hooks/staff_session_identity.py` | write | initial_snapshot, native_id, runtime_id, update_current_session |
+| `scripts/lib/relaunch.py` | read | snapshot, by_current_session |
 | `scripts/lib/resume_message.py` | read | StaffId |
 | `scripts/lib/scratch.py` | read | by_current_session, runtime_id, snapshot |
 | `scripts/lib/unit_runs.py` | read | local_snapshot, record_path |
 | `scripts/lint/tmp_sweep.py` | read | local_snapshot |
 | `scripts/maintenance/agent_notes_job.py` | read | snapshot |
 | `scripts/message/escalate.py` | read | active, snapshot |
+| `scripts/message/morty_identity.py` | read | native_id |
 | `scripts/message/rca.py` | read | active, snapshot |
 | `scripts/message/recipient_test_support.py` | read | staff.json path |
 | `scripts/message/roster.py` | read | initial_snapshot, runtime_id |
-| `scripts/message/send.py` | read | native_id, snapshot |
+| `scripts/message/send.py` | read | snapshot |
 | `scripts/message/sessions.py` | read | current_session_target |
 | `scripts/message/unit_labels.py` | read | active, snapshot |
 | `scripts/nightly_review/nightly_review.py` | read | active, snapshot |
@@ -93,10 +151,14 @@ Write functions of `staff.py`: ensure, ensure_worker, move, rename, retire, reti
 | `scripts/production/log_backup.py` | read | none (StaffRefused, StaffUnreadable exceptions) |
 | `scripts/production/merge_checkpoint.py` | read | snapshot |
 | `scripts/production/merge_checkpoint_test_support.py` | write | native_id, update_current_session |
-| `scripts/production/merge_gate.py` | read | staff.json path |
-| `scripts/production/merge_gate_test_support.py` | read | LiveDoc |
+| `scripts/production/bump_gate.py` | read | read_production.owner.id |
+| `scripts/production/ci_points.py` | read | Production.owner.id |
+| `scripts/production/fast_track.py` | read | copies.source_owner |
+| `scripts/production/waiting.py` | read | Production.owner.id |
+| `scripts/production/merge_gate.py` | read | snapshot, initial_snapshot, doc_owner |
+| `scripts/production/merge_gate_test_support.py` | write | LiveDoc; fixture_member calls ensure |
 | `scripts/production/next_item.py` | read | snapshot |
-| `scripts/production/production_doc.py` | read | StaffSnapshot, LiveDoc, WrappedDoc |
+| `scripts/production/production_doc.py` | read | StaffRow, StaffSnapshot, LiveDoc, WrappedDoc |
 | `scripts/production/production_lifecycle.py` | write | defer_retire, operation, retire_pending, set_doc, set_worktree, snapshot |
 | `scripts/production/production_lifecycle_test_support.py` | read | find, pane, register_production, session_transcript |
 | `scripts/production/promote_showrunner.py` | read | cli_result, find, native_id, operation, promote_unit, runtime_id, snapshot |
@@ -104,10 +166,9 @@ Write functions of `staff.py`: ensure, ensure_worker, move, rename, retire, reti
 | `scripts/production/proposals_folder.py` | read | initial_snapshot |
 | `scripts/production/proposals_table.py` | read | none (StaffSnapshot type) |
 | `scripts/production/prune_phase_notes.py` | read | snapshot |
-| `scripts/production/rename.py` | write | by_id, cli_result, operation, rename, set_doc, snapshot |
+| `scripts/production/rename.py` | write | by_id, cli_result, operation, rename, row_operation, set_doc, snapshot |
 | `scripts/production/rename_state.py` | read | snapshot |
 | `scripts/production/rename_test_support.py` | write | find, native_id, operation, set_worktree, update_current_session |
-| `scripts/production/rename_unit.py` | write | by_id, cli_result, operation, rename, set_worktree, snapshot |
 | `scripts/production/rename_unit_test_support.py` | read | snapshot |
 | `scripts/production/resume_unit.py` | read | cli_result, initial_snapshot, operation, restore_unit |
 | `scripts/production/retire_unit.py` | write | cli_result, operation, operation_fds, set_worktree, snapshot |
@@ -164,20 +225,21 @@ Write functions of `staff.py`: ensure, ensure_worker, move, rename, retire, reti
 | `scripts/style/style_plan.py` | read | snapshot |
 | `scripts/style/style_plan_test_support.py` | read | staff.json path |
 | `scripts/style/style_proposals.py` | read | snapshot |
+| `scripts/style/style_sync.py` | read | local_snapshot, caller_identity, doc_owner |
 | `scripts/style/unit_files.py` | read | snapshot |
 | `scripts/usage/agents_log.py` | read | local_snapshot, record_path |
 | `scripts/usage/outcomes.py` | read | snapshot |
 | `scripts/usage/usage_report.py` | read | snapshot |
 | `scripts/usage/waste_watch.py` | read | snapshot |
-| `~/rust/cargo-liner-handler/crates/cargo-handler/src/census/command_inputs.rs` | read | staff.json (Rust, direct) |
+| `~/rust/cargo-liner-handler/crates/cargo-handler/src/census/hierarchy.rs` | read | StaffFileReader reads staff.json (Rust, direct) |
 
-155 accessors: 30 write, 124 read, 1 owner.
+165 accessors: 32 write, 132 read, 1 owner.
 
 ## Approved copies
 
 | Copy | Writer | Reader | Approved |
 |---|---|---|---|
-| `~/.local/state/staff/staff.json` on the Mac, read-only | `staff.py` on natedev, after each write (atomic rename) | cargo-handler on the Mac (`census/command_inputs.rs`) | the user, 2026-11-04 |
+| `~/.local/state/staff/staff.json` on the Mac, read-only | `staff.py` on natedev, after each write (atomic rename) | cargo-handler on the Mac (`census/hierarchy.rs`) | the user, 2026-11-04 |
 
 No other copy of the staff facts is allowed without the user's approval. Remake this list before any staff migration.
 

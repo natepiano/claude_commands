@@ -45,7 +45,7 @@ printf 'free_gib=%s\\nhost=test-mac\\nrc=0\\n' "$(cat '{available}')"
             record = step_record.read(paths[0].stem)
         if not isinstance(record, step_record.StepRecord):
             self.fail(f"Expected a live step record, got {record!r}")
-        self.assertEqual(record.runs_on, step_record.NatedevOnly("disk"))
+        self.assertEqual(record.runs_on, step_record.AnyTarget(("mac", "natedev"), ("mac",)))
         self.assertEqual(len(list((self.root / "mac-idle/calls").glob("*.json"))), 1)
         self.assertEqual(len(self.runner_events()), 1)
         _ = available.write_text("1000\n")
@@ -89,7 +89,8 @@ class StepRetryPermissionTests(unittest.TestCase):
         )
         for rows in cases:
             for ordered in (rows, tuple(reversed(rows))):
-                table = "\n".join(f"{name}\texcluded\t{reason}\t/{name}.conf" for name, reason in ordered)
+                table = "\n".join(f"{name}\texcluded\t{reason}\t/{name}.conf\t{'macos' if name == 'mac' else 'linux'}"
+                                  for name, reason in ordered)
                 for local_only, kind, writes_tree in (("0", "test", "0"), ("1", "test", "0"),
                                                       ("0", "build", "0"), ("0", "final", "0"),
                                                       ("0", "lint", "1"), ("0", "test", "1")):

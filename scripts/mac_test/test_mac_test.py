@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
 """Exercise Mac test commands and their real process coordination boundaries."""
 
 from __future__ import annotations
@@ -28,17 +28,18 @@ from scripts.lib import process_start as process_identity
 from unittest import mock
 from zoneinfo import ZoneInfo
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lint"))
 from scripts.lint.memory_test_support import write_config_fixture, commit_config_fixture, config_environment
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 from scripts.mac_test import mac_test
 from scripts.lib import conf
 from scripts.lib import test_hang_guard
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "production"))
-from scripts.production.cli_fixture import invoke_cli
-from scripts.buildlog.mac_idle_test_support import NotificationGuardedTestCase
+if TYPE_CHECKING:
+    from scripts.buildlog.mac_idle_test_support import NotificationGuardedTestCase
+    from scripts.production.cli_fixture import invoke_cli
+else:
+    from scripts.production.cli_fixture import invoke_cli
+    from scripts.buildlog.mac_idle_test_support import NotificationGuardedTestCase
 
 
 SCRIPT = Path(__file__).with_name("mac_test.py")
@@ -485,7 +486,7 @@ class MacTestCommandTests(NotificationGuardedTestCase):
             script = self.bin_directory / command[0]
             stub_arguments = command[1:]
             for name in ("sessions.py", "send.py"):
-                if command[:2] == [sys.executable, str(self.stub_directory / name)]:
+                if command[:2] == [str(SCRIPT.resolve().parents[1] / "lib/py"), str(self.stub_directory / name)]:
                     # Tests of blocked/timed-out delivery keep the actual child.
                     if name == "send.py" and any((self.stub_directory / flag).exists()
                                                 for flag in ("send-hold", "send-delay")):
@@ -705,6 +706,23 @@ class MacTestCommandTests(NotificationGuardedTestCase):
         )
         return cast(str, values["variable"])
 
+    def test_aws_block_uses_mac_idle_policy_without_target_idle_keys(self) -> None:
+        settings = self.root / "aws_target.conf"
+        values = conf.read(settings).values()
+        self.assertTrue(all(key not in values for key in (
+            "alert_seconds", "push_seconds", "stale_seconds", "repeat_minutes", "send_timeout_s",
+        )))
+        result = self.command("block", "--target", "aws", "--holder", "alice", "--for", "rendering")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        block = cast(dict[str, object], json.loads(
+            (self.root / ".local/state/build-targets/aws/block.json").read_text(),
+        ))
+        self.assertEqual(block["state"], "active")
+        self.assertEqual(block["holder"], "alice")
+        self.assertEqual(block["for"], "rendering")
+        self.assertEqual(block["ci"], "not_configured")
+        self.assertEqual(self.gh_calls(""), 0)
+
     def test_status_without_block_reports_all_switch_results(self) -> None:
         on = self.command("status", subprocess_cli=True)
         self.assert_command(on, 0, "free\nno block\nCI's Mac switch: on\n")
@@ -824,7 +842,7 @@ class MacTestCommandTests(NotificationGuardedTestCase):
         arguments = calls[0]
         self.assertEqual(arguments[:5], ["--user", "--collect", "--quiet", "--no-block", "--unit"])
         self.assertTrue(arguments[5].startswith("mac-test-claim-watch-"))
-        self.assertEqual(arguments[-3:], [sys.executable, str(SCRIPT.resolve()), "watch-claim"])
+        self.assertEqual(arguments[-3:], [str(SCRIPT.resolve().parents[1] / "lib/py"), str(SCRIPT.resolve()), "watch-claim"])
         self.assertIn(f"MAC_TEST_STATE_DIR={self.state_directory}", arguments)
         self.assertIn(f"MAC_TEST_CONFIG={self.config_path}", arguments)
 
@@ -3017,7 +3035,7 @@ class ClaimWatchTests(NotificationGuardedTestCase):
         text = (
             'Your Mac claim "alpha tests" (since 08:00) was released at 08:30: nothing ran on the Mac for 15 minutes, '
             + "so tests waiting for it can run. Claim it again before your next Mac command: "
-            + "python3 ~/.claude/scripts/mac_test/mac_test.py claim --pid $$ --what 'alpha tests' "
+            + "~/.claude/scripts/lib/py ~/.claude/scripts/mac_test/mac_test.py claim --pid $$ --what 'alpha tests' "
             + f"--worktree '{self.root}' --remote 'claim-mac' (see /build:mac)."
         )
         self.assertEqual(send.call_args.args[4], text)
@@ -3039,7 +3057,7 @@ class ClaimWatchTests(NotificationGuardedTestCase):
         self.assertEqual(send.call_args.args[4], (
             'Your Mac claim "alpha tests" (since 08:00) was released at 08:30: nothing ran on the Mac for 15 minutes, '
             + "so tests waiting for it can run. Claim it again before your next Mac command: "
-            + f"python3 ~/.claude/scripts/mac_test/mac_test.py claim --pid $$ --what 'alpha tests' --worktree '{self.root}' "
+            + f"~/.claude/scripts/lib/py ~/.claude/scripts/mac_test/mac_test.py claim --pid $$ --what 'alpha tests' --worktree '{self.root}' "
             + "(see /build:mac)."
         ))
 
@@ -3053,7 +3071,7 @@ class ClaimWatchTests(NotificationGuardedTestCase):
         self.assertEqual(send.call_args.args[4], (
             'Your Mac claim "alpha\'s tests" (since 08:00) was released at 08:30: nothing ran on the Mac for 15 minutes, '
             + "so tests waiting for it can run. Claim it again before your next Mac command: "
-            + "python3 ~/.claude/scripts/mac_test/mac_test.py claim --pid $$ "
+            + "~/.claude/scripts/lib/py ~/.claude/scripts/mac_test/mac_test.py claim --pid $$ "
             + "--what 'alpha'\"'\"'s tests' --worktree '/work/alpha'\"'\"'s tree' --remote 'host'\"'\"'s name' "
             + "(see /build:mac)."
         ))
@@ -3202,20 +3220,36 @@ class ClaimWatchTests(NotificationGuardedTestCase):
 
     def test_idle_alert_config_uses_shipped_values_and_rejects_invalid_overrides(self) -> None:
         path = self.root / "mac_test.conf"
-        shipped = mac_test.read_config().idle
+        _ = mac_test.read_config()
+        shipped = mac_test.idle_config(conf.read(path))
         committed = path.read_text()
         _ = write_config_fixture(path, "alert_seconds=7\npush_seconds=11\nstale_seconds=13\n"
                                  + "repeat_minutes=17\nsend_timeout_s=19\n")
-        configured = mac_test.read_config().idle
+        _ = mac_test.read_config()
+        configured = mac_test.idle_config(conf.read(path))
         self.assertEqual((configured.alert_seconds, configured.push_seconds, configured.stale_seconds,
                           configured.repeat_minutes, configured.send_timeout_s), (7, 11, 13, 17, 19))
         _ = write_config_fixture(path, "alert_seconds=nan\npush_seconds=0\nstale_seconds=-1\n"
                                  + "repeat_minutes=bad\nsend_timeout_s=inf\n")
         with mock.patch.object(conf, "_committed_files", return_value=(committed,)), conf.diagnostics(report=False):
-            self.assertEqual(mac_test.read_config().idle, shipped)
+            _ = mac_test.read_config()
+            self.assertEqual(mac_test.idle_config(conf.read(path)), shipped)
         with mock.patch.object(conf, "_committed_files", return_value=iter(())), \
              self.assertRaises(conf.Unusable):
             _ = mac_test.read_config()
+
+    def test_default_and_named_macos_targets_require_idle_settings(self) -> None:
+        path = self.root / "mac_test.conf"
+        for target in ("", "mac"):
+            with self.subTest(target=target):
+                _ = write_config_fixture(path)
+                self.assertEqual(mac_test.read_config(target).host, conf.read(path).text("host"))
+                _ = path.write_text("\n".join(
+                    line for line in path.read_text().splitlines() if not line.startswith("alert_seconds=")
+                ) + "\n")
+                with mock.patch.object(conf, "_committed_files", return_value=iter(())), \
+                     conf.diagnostics(report=False), self.assertRaisesRegex(conf.Unusable, "alert_seconds"):
+                    _ = mac_test.read_config(target)
 
     def test_claim_idle_settings_read_configured_values(self) -> None:
         path = self.root / "mac_test.conf"

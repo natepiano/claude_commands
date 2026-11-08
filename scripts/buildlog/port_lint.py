@@ -34,6 +34,10 @@ changes the exit status.
 """
 
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import gzip
 import json
@@ -48,14 +52,13 @@ from datetime import datetime
 from pathlib import Path
 from typing import TypedDict, cast
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-
 from scripts.buildlog import index
 from scripts.buildlog import record
 from scripts.buildlog import store
 from scripts.buildlog import treekey
 
-from scripts.lib.user_zone import user_zone
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
+from scripts.lib.user_zone import user_zone  # noqa: E402
 
 DEFERRED = 75
 USAGE = 2

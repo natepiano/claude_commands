@@ -20,3 +20,9 @@ at `~/.claude/scripts/production/transfer_unit.py`:
 3. Run `verify` to complete the transfer after a failed tab move.
 4. Send the receiving showrunner the unit name, worktree and branch.
 5. Tell the user that the unit now reports to the receiving showrunner.
+
+The workers keep their parent unit, native conversations, and pane labels.
+An interrupted tab rebuild can leave panes in the source workspace and lose the split ratio.
+The anomaly names the tab and panes; inspect those panes.
+A retry does not rebuild the split.
+A Git timeout prints one `transfer_unit: error:` line and exits 1 without a traceback.

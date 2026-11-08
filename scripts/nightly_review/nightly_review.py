@@ -16,6 +16,10 @@ Nothing offers the proposals: the ledger's queue grows until the user asks for /
 """
 
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import json
 import subprocess
@@ -27,10 +31,6 @@ from typing import TYPE_CHECKING, NotRequired, TypedDict, cast
 
 # The account reader and the production scripts sit one directory over.
 SCRIPTS = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(SCRIPTS.parent))
-sys.path.insert(0, str(SCRIPTS / "whoami"))
-sys.path.insert(0, str(SCRIPTS / "shutdown"))
-sys.path.insert(0, str(SCRIPTS / "production"))
 from scripts.lib.process_failure import failure_detail
 from scripts.whoami import account  # noqa: E402
 
@@ -204,7 +204,6 @@ def live_message_counts(path: Path, since: datetime) -> LiveMessageCounts:
 
 
 def messages(since: datetime) -> list[str]:
-    sys.path.insert(0, str(SCRIPTS / "notify"))
     from scripts.notify import review
 
     counts = live_message_counts(review.state_path() / "review.jsonl", since)

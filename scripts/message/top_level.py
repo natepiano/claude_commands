@@ -6,6 +6,10 @@ under a showrunner. Session records provide the socket that SendMessage needs.
 """
 
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import os
 import subprocess
@@ -13,9 +17,8 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.message import roster
-import sessions
+from scripts.message import sessions
 
 USAGE = "usage: top_level.py"
 

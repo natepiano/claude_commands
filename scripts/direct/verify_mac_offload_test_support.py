@@ -6,6 +6,7 @@ from scripts.build_queue.admission_test_support import caller_admission
 from scripts.build_queue import admission_protocol as wire
 from scripts.lib.py_floor_test_support import seed_interpreter_cache
 
+from scripts.copies.copies_test_support import copies_environment
 from scripts.lint.memory_test_support import config_environment, write_config_fixture, write_pressure_reading
 
 import json
@@ -30,9 +31,11 @@ from typing import ClassVar, TypedDict, cast, override
 from unittest import mock
 
 from scripts.build_hold import build_hold
-from scripts.direct.local_release_wait import LocalReleaseEvents, local_release_waiter
+from scripts.direct.local_release_wait import RELEASE_CHANGES, LocalReleaseEvents, local_release_waiter
+from scripts.lib import inotify
 from scripts.production.cli_fixture import invoke_cli
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.lib.shell_test_support import shell_functions
 
 
 VERIFY = Path(__file__).with_name("verify.sh")
@@ -821,6 +824,7 @@ class VerifyMacOffloadFixture(unittest.TestCase):
             "TEST_REAL_RECORD": str(VERIFY.parent.parent / "buildlog" / "record.py"),
         }
 
+        self.environment["COPIES_CONFIG"] = copies_environment(self.root)["COPIES_CONFIG"]
         seed_interpreter_cache(self.root / "cache")
         _ = self.environment.pop("CLAUDE_PYTHON", None)
 
@@ -831,6 +835,103 @@ class VerifyMacOffloadFixture(unittest.TestCase):
         _ = path.write_text(source if source.startswith("#!") else f"#!{sys.executable}\n" + source,
                             encoding="utf-8")
         path.chmod(0o755)
+
+    def call_mac_functions(self, body: str, *, extra: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+        """Call the real result and retry functions with private tools and records."""
+        direct = self.root / "direct-functions"
+        direct.mkdir(exist_ok=True)
+        library = self.root / "lib"
+        if not library.is_symlink():
+            library.symlink_to(VERIFY.parent.parent / "lib", target_is_directory=True)
+        functions = shell_functions(VERIFY,
+            "try_mac_test", "forward_mac_runner_signal", "target_for_settings", "target_platform",
+            "release_token", "stop_token_renewer",
+            "step_state", "publish_step_state", "tree_key", "set_verdict_keys", "after_tree_change",
+            "start_tree_watch", "finish_tree_watch", "stop_tree_watch", "cancel_tree_run",
+            "record_mac_pass", "cache_record", "user_clock", "finish_mac_pass", "note_event",
+            "collect_hold_wait", "collect_routing_wait", "phase_wait_finish", "phase_wait_finish_all",
+            "finish_hold_wait", "release_wait_claim", "step_can_retry", "register_mac_wait",
+            "remember_mac_retry", "mac_retry_hook", "ssh_retry_hook", "remote_step_kind", "ssh_reserve_hook",
+            "try_reserved_target", "check_mac_only_result", "mac_only_refuse",
+            "route_test", "check_routing_hold")
+        functions += shell_functions(VERIFY.parent.parent / "lint/memory_gate.sh",
+                                     "build_hold_nothing_held", "build_hold_check_result",
+                                     "build_check_stop", "build_check_record_failure")
+        script = direct / "verify.sh"
+        setup = r'''
+set -euo pipefail
+PY=$TEST_REAL_PYTHON
+CMD=test PKG=sample ARGS=(sample) NEXTEST_ARGS=(-p sample --no-tests=warn)
+FILTER_RUN=${TEST_DIRECT_FILTER:-0}
+if [[ "$FILTER_RUN" == 1 ]]; then ARGS+=(--filter alpha); NEXTEST_ARGS+=(--filter-expr 'test(alpha)'); fi
+GATE_METADATA=$TEST_METADATA
+TREE_WATCH_SCRIPT=$TEST_REAL_DIRECT/tree_watch.py
+BUILD_FOLDERS_SCRIPT=$TEST_REAL_DIRECT/../lib/build_folders.py
+BUILDLOG_RECORD=$HOME/.claude/scripts/buildlog/record.py
+BUILDLOG_CALL_ID=direct-$$
+export BUILDLOG_CALL_ID BUILDLOG_CALLER=verify
+HOLD_WAIT_DIR=$TEST_RUNNER_STATE/hold
+mkdir -p "$HOLD_WAIT_DIR"
+BUILDLOG_HOLD_WAIT_FILE=$HOLD_WAIT_DIR/seconds
+ROUTING_WAIT_STARTED="" PHASE_WAIT_SESSION=""
+CACHE_DIR=$UNIT_RUN_DIR/verify_cache
+MAC_RUNNER=$VERIFY_MAC_RUNNER MAC_TEST_SCRIPT=$VERIFY_MAC_TEST_SCRIPT
+MAC_IDLE_SCRIPT=$TEST_REAL_DIRECT/../buildlog/mac_idle.py
+MAC_IDLE_MARKER="" BUILDLOG_MAC_IDLE_HOOK=""
+MAC_LEAVE_SETTINGS=$MAC_TEST_CONFIG MAC_LEAVE_REASON=""
+MAC_RETRY_AFTER=0 MAC_RETRY_NOTICE_SHOWN=0
+SSH_RETIRED_SETTINGS=() SSH_RETRY_SETTINGS=() SSH_RETRY_DEADLINES=()
+SSH_RETRY_AFTER_SETTINGS="" SSH_RESERVE_RECOVERY=""
+SSH_RETRYABLE_REASON='^(busy|blocked|disk|backoff|unreachable|state|copy|mac_busy)$'
+MAC_VERB=nextest MAC_SOURCE_ROOT="" MAC_VERB_ARGS=() MAC_FINISH_CALL=1 MAC_PASSED=0
+MAC_ENV_NAMES=() VERIFY_MAC_ENVIRONMENT=() MAC_FETCH_GIVEN=0
+MAC_RESULT_FILE="" MAC_LOG_FILE="" MAC_RUNNER_PID="" MAC_ONLY=0 LOCAL_ONLY=0
+PINNED_TARGET="" STEP_FORCE_MAC=0
+STEP_RECORD_ACTIVE=0 STEP_WRITES_TREE=0 STEP_RUNS_ON=any_target
+STEP_TARGET_TABLE=$(printf 'mac\teligible\t-\t%s\tmacos' "$MAC_TEST_CONFIG")
+TREE_WATCH_PID="" TREE_WATCH_DIR="" RUN_STEP_PID="" RUN_LOG=""
+VERDICT_KEY="" VERDICT_TREE_KEY="" CALL_NOTED=0
+BUILDLOG_MAC="" BUILDLOG_MAC_REASON="" BUILDLOG_MAC_HOLDER="" BUILDLOG_MAC_S=""
+BUILDLOG_MAC_COPY="" BUILDLOG_MAC_COPY_S="" BUILDLOG_MAC_COPY_COUNT="" BUILDLOG_MAC_COPY_NATEDEV_S=""
+DOC_REPO_TOP=$PACKAGE_ROOT
+BOARD_HELPER=$TEST_REAL_DIRECT/board.sh BOARD_DIR=$UNIT_RUN_DIR BOARD_SLOT=direct
+TOKEN_HELD=0 TOKEN_RENEWER_PID=""
+VERIFY_MONOTONIC_OFFSET_US=0
+trap 'finish_tree_watch; finish_hold_wait; release_token' EXIT
+'''
+        _ = script.write_text(functions + setup + '\neval "$1"\n', encoding="utf-8")
+        return subprocess.run(["bash", str(script), body], cwd=self.root,
+                              env={**self.environment, "TEST_REAL_DIRECT": str(VERIFY.parent),
+                                   "TEST_TOKEN_RECORD": str(self.board / "locks/cargo.d/holder_pid"),
+                                   **(extra or {})},
+                              capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS)
+
+    def check_routing_idle_hook(self) -> None:
+        """Consume a real retry hook before and after the idle marker."""
+        self.set_mac_answer("lost", "", 75)
+        result = self.call_mac_functions(r'''
+unset EPOCHREALTIME
+EPOCHREALTIME=100.000000
+try_reserved_target
+wc -l < "$TEST_RUNNER_STATE/runner-events.jsonl" > "$TEST_RUNNER_STATE/first-attempt-count"
+hook=$(mac_retry_hook "$MAC_TEST_CONFIG" "$MAC_RETRY_AFTER" reserve)
+if eval "$hook"; then exit 98; fi
+printf '%s\n' "$MAC_IDLE_MARKER" > "$TEST_RUNNER_STATE/idle-marker"
+find "$MAC_IDLE_STATE_DIR/calls" -name '*.json' > "$TEST_RUNNER_STATE/idle-calls"
+printf 'passed\n\n0\n' > "$TEST_RUNNER_STATE/runner-answer"
+printf 'retry_delayed\n' > "$MAC_IDLE_MARKER"
+if eval "$hook"; then try_reserved_target; fi
+exit 99
+''', extra={"TEST_FREE_NOW_FREE": "1"})
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(int((self.runner_state / "first-attempt-count").read_text()), 1)
+        self.assertEqual(len((self.runner_state / "idle-calls").read_text().splitlines()), 1)
+        self.assertEqual(len(self.runner_events()), 2)
+        self.assertEqual(self.local_runs(), [])
+        self.assertEqual(self.last_call()["mac"], "passed_full")
+        marker = Path((self.runner_state / "idle-marker").read_text().strip())
+        self.assertFalse(marker.exists())
+        self.assertEqual(list((self.board / "token_waiters").glob("*")), [])
 
     def verify(
         self, *arguments: str, extra: dict[str, str] | None = None
@@ -1063,13 +1164,8 @@ class VerifyMacOffloadFixture(unittest.TestCase):
                     descriptors.append(os.pidfd_open(process.pid))
                 except ProcessLookupError:
                     pass
-            with local_release_waiter(directory or self.root, self.root / "tmp") as events:
-                if isinstance(events, LocalReleaseEvents):
-                    add_watch = events.add_watch
-                    def watch_modifications(fd: int, path: bytes, mask: int) -> int:
-                        return add_watch(fd, path, mask | 0x2)
-
-                    events.add_watch = watch_modifications
+            with local_release_waiter(directory or self.root, self.root / "tmp",
+                                      RELEASE_CHANGES | inotify.IN_MODIFY) as events:
                 while True:
                     events.arm()
                     if condition():
@@ -1208,9 +1304,7 @@ trap hold_after_routing DEBUG
         _ = self.control_routing_clock()
         self.environment["MAC_IDLE_STATE_DIR"] = str(self.root / "idle-watch")
         self.environment["TEST_FREE_NOW_FREE"] = "1"
-        if wait_kind == "routing":
-            _ = self.routing_fixture()
-        elif wait_kind == "memory":
+        if wait_kind == "memory":
             _ = self.hold_memory()
         else:
             board = VERIFY.with_name("board.sh")

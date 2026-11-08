@@ -14,7 +14,6 @@ import time
 from typing import TextIO, cast, override
 from unittest.mock import Mock, call, patch
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.lib import conf, nix_env
 from scripts.lib.nix_env_test_support import NixFixture
 from scripts.nix_env import heal

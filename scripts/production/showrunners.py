@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """Read local showrunner timers, resolve their addresses and send production notices."""
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import argparse
 import json
@@ -34,7 +38,7 @@ PARENT_FILE = "parent"
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
 from scripts.lib.user_zone import user_zone_name  # noqa: E402
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "message"))
-from sessions import SessionRecord, messaging_socket_exists  # noqa: E402
+from scripts.message.sessions import SessionRecord, messaging_socket_exists  # noqa: E402
 from scripts.lib.session_paths import sessions_directory as sessions_directory
 from scripts.production import staff  # noqa: E402
 from scripts.shutdown import remote  # noqa: E402
@@ -399,19 +403,40 @@ def copy_session_state(staff_id: str, scratch: Path) -> list[str]:
     return copied
 
 
-def timer_scratch(staff_id: str, record: staff.StaffSnapshot | None = None) -> Path | None:
+@dataclass(frozen=True)
+class TimerConfigurationUnreadable:
+    reason: str
+
+
+@dataclass(frozen=True)
+class TimerTargetUnresolved:
+    target: str
+
+
+@dataclass(frozen=True)
+class TimerScratchAbsent:
+    session_id: str
+
+
+@dataclass(frozen=True)
+class TimerScratchFound:
+    path: Path
+
+
+def timer_scratch(staff_id: str, record: staff.StaffSnapshot | None = None
+                  ) -> TimerConfigurationUnreadable | TimerTargetUnresolved | TimerScratchAbsent | TimerScratchFound:
     """Find the scratchpad for the session that receives the production update timer."""
     record = record if record is not None else staff.snapshot()
     try:
         target = _fields(NOTIFIER_STATE_DIR / f"showrunner-{staff_id}" / "conf").get("TARGET", "")
-    except (OSError, UnicodeError):
-        return None
+    except (OSError, UnicodeError) as error:
+        return TimerConfigurationUnreadable(" ".join(str(error).splitlines()))
     owner = record.by_id(staff.StaffId(target.removeprefix("session:")))
     session_id = owner.current_session if owner is not None else ""
     if not session_id or session_id == target:
-        return None
-    return next((path for path in sorted(SCRATCH_ROOT.glob(f"claude-*/*/{session_id}/scratchpad"))
-                 if path.is_dir()), None)
+        return TimerTargetUnresolved(target)
+    return next((TimerScratchFound(path) for path in sorted(SCRATCH_ROOT.glob(f"claude-*/*/{session_id}/scratchpad"))
+                 if path.is_dir()), TimerScratchAbsent(session_id))
 
 
 def adopt_session_state(staff_id: str, record: staff.StaffSnapshot | None = None) -> list[str]:
@@ -420,7 +445,9 @@ def adopt_session_state(staff_id: str, record: staff.StaffSnapshot | None = None
     if all((target / name).exists() for name in SESSION_STATE):
         return []
     scratch = timer_scratch(staff_id, record)
-    return copy_session_state(staff_id, scratch) if scratch is not None else []
+    if isinstance(scratch, TimerConfigurationUnreadable):
+        print(f"showrunners: timer configuration unreadable: {scratch.reason}", file=sys.stderr)
+    return copy_session_state(staff_id, scratch.path) if isinstance(scratch, TimerScratchFound) else []
 
 
 def current_name(production_name: str) -> str:

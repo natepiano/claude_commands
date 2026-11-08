@@ -6,11 +6,8 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal, cast, final, override
-if TYPE_CHECKING:
-    from ..lib import test_hang_guard
-else:
-    from scripts.lib import test_hang_guard
+from typing import Literal, cast, final, override
+from scripts.lib import test_hang_guard
 
 
 CountMode = Literal["single", "multiple", "verify"]

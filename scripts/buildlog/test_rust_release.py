@@ -103,6 +103,7 @@ class RustReleaseTests(unittest.TestCase):
                           ("config", "user.email", "trial@example.invalid")):
             _ = subprocess.run(["git", "-C", str(source), *arguments], check=True, capture_output=True)
         _ = (source / ".gitignore").write_text("/target/\n/mend-target/\n/mend-root/\n")
+        _ = (source / "Cargo.toml").write_text("[workspace]\n")
         _ = subprocess.run(["git", "-C", str(source), "add", "."], check=True, capture_output=True)
         _ = subprocess.run(["git", "-C", str(source), "commit", "-qm", "trial source"], check=True, capture_output=True)
         _ = self.enterContext(mock.patch.object(rust_release, "HANA", source))

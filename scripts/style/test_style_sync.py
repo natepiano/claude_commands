@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from ledger_test_support import ticket_owner_id
-
 import errno
 import fcntl
 import io
@@ -22,22 +20,20 @@ from collections.abc import Callable
 from contextlib import closing, redirect_stderr, redirect_stdout, suppress
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 from typing import TypedDict, cast, final, override
 from unittest import mock
 
-import style_sync
-from add_style import NoStyleProduction
+from scripts.style import style_sync
+from scripts.style.add_style import NoStyleProduction
 from scripts.copies import copies
-import scratch
-import style_ledger
-import style_rules
+from scripts.lib import scratch
+from scripts.style import style_ledger
+from scripts.style import style_rules
 from scripts.lib import build_folders
 from scripts.lib.process_group import send_process_group
 from scripts.production import showrunners, staff
 from scripts.production.staff_test_support import recorded_showrunner
-from ledger_test_support import style_staff_fixture, style_unit_id
+from scripts.style.ledger_test_support import style_staff_fixture, style_unit_id, ticket_owner_id
 from scripts.message import send_budget, session_send
 from scripts.direct import test_verify_lint_scope as verify_fixture
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
@@ -71,10 +67,9 @@ CLEAN_LINT = ''.join(f"style-lint: {tool} start\nstyle-lint: {tool} passed\n"
                      for tool in ("mend", "rustfmt", "clippy"))
 
 # Runs the lint in its own process, so a signal takes the real path through style_sync.
-LINT_DRIVER = f'''import sys
+LINT_DRIVER = '''import sys
 from pathlib import Path
-sys.path.insert(0, {str(Path(style_sync.__file__).resolve().parent)!r})
-import style_sync
+from scripts.style import style_sync
 style_sync.VERIFY = Path(sys.argv[1])
 style_sync.LINT_TEMP_PARENT = Path(sys.argv[2])
 style_sync.CHILD_STOP_SECONDS = 0.5
@@ -506,7 +501,7 @@ class StyleSyncTests(unittest.TestCase):
 
     def test_found_production_sends_the_keyed_sync_message_to_its_current_address(self) -> None:
         self.production()
-        with mock.patch("style_sync.subprocess.run", wraps=subprocess.run) as calls:
+        with mock.patch("scripts.style.style_sync.subprocess.run", wraps=subprocess.run) as calls:
             self.assertEqual(self.notice(), (0, ""))
         call = cast(RecordedCall, json.loads((self.root / "sent.json").read_text()))
         arguments = call["arguments"]
@@ -572,7 +567,7 @@ class StyleSyncTests(unittest.TestCase):
         fixture = verify_fixture.VerifyLintScopeTests()
         self.addCleanup(fixture.doCleanups)
         fixture.setUp()
-        result = fixture.verify("lint", "--workspace", "--no-cache")
+        result = fixture.verify("lint", "--no-cache")
         self.assertEqual(fixture.calls("+nightly"), [
             ["fmt", "--version"], ["fmt", "--all"],
         ])
@@ -602,7 +597,7 @@ if arguments[:2] == ["+nightly", "fmt"] and "--version" not in arguments:
         source = fixture.root / "src/lib.rs"
         _ = source.write_text("pub fn value()->u8{1}\n")
         before = source.read_bytes()
-        result = fixture.invoke_verify("lint", "--workspace", "--check", "--no-cache", cwd=fixture.root)
+        result = fixture.invoke_verify("lint", "--check", "--no-cache", cwd=fixture.root)
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
         self.assertEqual(source.read_bytes(), before)
         self.assertEqual(fixture.calls("mend"), [["--all-targets", "--workspace", "--fail-on-warn"]])
@@ -620,7 +615,7 @@ if arguments[:2] == ["+nightly", "fmt"] and "--version" not in arguments:
     def test_lint_runs_workspace_gate_on_requested_tip_and_records_each_tool(self) -> None:
         verify = self.root / "verify.sh"
         _ = verify.write_text(
-            '#!/bin/bash\n[[ "$*" == "lint --workspace --check --no-cache" ]] || exit 2\n'
+            '#!/bin/bash\n[[ "$*" == "lint --check --no-cache" ]] || exit 2\n'
             + f'git rev-parse HEAD > "{self.root / "checked-tip"}"\n'
             + "cat <<'OUTPUT'\n" + RECORDED_LINT + "OUTPUT\n",
         )
@@ -767,7 +762,7 @@ if arguments[:2] == ["+nightly", "fmt"] and "--version" not in arguments:
 
     def test_lint_takes_second_checkout_when_first_is_busy(self) -> None:
         observed = self.root / "checked-directory"
-        with copies.standing("sample-style", self.repo, self.tip) as first:
+        with copies.standing("sample-style", self.repo, copies.CommittedSource(self.tip)) as first:
             probe = """import fcntl
 from pathlib import Path
 with Path('.claude-busy').open('r+') as lock:
@@ -779,7 +774,7 @@ with Path('.claude-busy').open('r+') as lock:
         raise SystemExit('lint released its checkout while verifying')
 """
             code, output = self.run_lint(
-                f"pwd -P > {observed}\n{shlex.quote(sys.executable)} -c {shlex.quote(probe)} || exit $?\n")
+                f"pwd -P > {observed}\n{shlex.quote(str(Path(__file__).resolve().parents[1] / "lib/py"))} -c {shlex.quote(probe)} || exit $?\n")
             self.assertEqual(code, 0, output)
             second = Path(observed.read_text().strip())
             self.assertNotEqual(first, second)
@@ -788,7 +783,7 @@ with Path('.claude-busy').open('r+') as lock:
             with (second / ".claude-busy").open("r+") as lock:
                 fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
                 fcntl.flock(lock, fcntl.LOCK_UN)
-        with copies.standing("sample-style", self.repo, self.tip) as reused:
+        with copies.standing("sample-style", self.repo, copies.CommittedSource(self.tip)) as reused:
             self.assertEqual(reused, first)
         self.assertEqual(list(self.lint_temp.iterdir()), [])
 
@@ -820,7 +815,7 @@ with Path('.claude-busy').open('r+') as lock:
                 _ = verify.write_text(f"#!/bin/bash\n{trap}sleep 300 &\n"
                                       + f'echo "$$ $!" > {pids}.part && mv {pids}.part {pids}\nwait\n')
                 process = subprocess.Popen(
-                    [sys.executable, str(driver), str(verify), str(self.lint_temp),
+                    [str(Path(style_sync.__file__).resolve().parents[1] / "lib" / "py"), str(driver), str(verify), str(self.lint_temp),
                      "lint", "--repo", str(self.repo), "--checkout", str(self.repo), "--tip", self.tip],
                     stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
                 )
@@ -992,7 +987,7 @@ with Path('.claude-busy').open('r+') as lock:
         verifier = self.root / "verifier"
         verify = self.clean_verify(f'sleep 300 &\necho "$$" > {verifier}.part && mv {verifier}.part {verifier}\nwait\n')
         process = subprocess.Popen(
-            [sys.executable, str(driver), str(verify), str(self.lint_temp),
+            [str(Path(style_sync.__file__).resolve().parents[1] / "lib" / "py"), str(driver), str(verify), str(self.lint_temp),
              "lint", "--repo", str(self.repo), "--checkout", str(self.repo), "--tip", self.tip],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
@@ -1056,7 +1051,7 @@ with Path('.claude-busy').open('r+') as lock:
         probe = ("import signal; from pathlib import Path; "
                  "blocked = signal.pthread_sigmask(signal.SIG_BLOCK, set()); "
                  f"Path({str(mask)!r}).write_text(str(sum(1 << (s - 1) for s in blocked)))")
-        code, output = self.run_lint(shlex.join([sys.executable, "-c", probe]) + "\n")
+        code, output = self.run_lint(shlex.join([str(Path(__file__).resolve().parents[1] / "lib/py"), "-c", probe]) + "\n")
         self.assertEqual(code, 0, output)
         held = sum(1 << (signum - 1) for signum in style_sync.HELD_SIGNALS)
         self.assertEqual(int(mask.read_text()) & held, 0)
@@ -1127,7 +1122,7 @@ with Path('.claude-busy').open('r+') as lock:
                     self.assertEqual(connection.execute("SELECT branch_point FROM reconciliation").fetchone(), ("main",))
             self.assertTrue(options.get("capture_output"))
             return cast(object, mock.DEFAULT)
-        with mock.patch("style_sync.subprocess.run", wraps=real_run, side_effect=observe_send), redirect_stdout(output):
+        with mock.patch("scripts.style.style_sync.subprocess.run", wraps=real_run, side_effect=observe_send), redirect_stdout(output):
             code = style_sync.main(["resume", "--repo", str(self.repo), "--production", "sample-style",
                                     "--branch-point", "main", "--style-branch", "style/main"])
         self.assertEqual(code, 0)

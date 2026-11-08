@@ -20,9 +20,7 @@ from scripts.aws_target.measurement_test_support import DAY, MIDNIGHT, NOW, Meas
 from scripts.aws_target.ledger_test_support import instant
 from scripts.aws_target.control_test_support import AwsReplies
 
-from scripts.buildlog import aws_report
-from scripts.buildlog import index
-from scripts.buildlog import report
+from scripts.buildlog import aws_report, index, report
 
 
 class MeasurementTests(MeasurementFixture):

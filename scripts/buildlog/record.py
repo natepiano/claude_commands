@@ -48,6 +48,10 @@ exit status is 0. Records are JSON lines (store.py); index.py reads them.
 """
 
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import fcntl
 import json
@@ -60,8 +64,6 @@ from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, NamedTuple, NotRequired, TypedDict, cast
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from scripts.lib.test_phase import (
     CallRecord,
@@ -78,15 +80,14 @@ from scripts.lib.test_phase import (
     UnreadableTestPhaseRecord as UnreadableTestPhaseRecord,
 )
 
-from scripts.buildlog import cgroup_capture
-from scripts.buildlog import store
-from scripts.buildlog import step_context
+from scripts.buildlog import cgroup_capture, store, step_context
 from scripts.buildlog.repository import (
     GIT_TIMEOUT_S as GIT_TIMEOUT_S,
     output as output,
     remote_identity as remote_identity,
     repository_key as repository_key,
 )
+
 
 from scripts.lib.cargo_output import CargoOutputRoots, CargoOutputUnavailable
 if TYPE_CHECKING:
@@ -1108,14 +1109,18 @@ def write_call(started: float, fields: dict[str, object], record_id: str | None 
 
 
 def call(args: list[str]) -> None:
+    from scripts.direct.step_record import NamedPackage, WorkspacePackages
+
     outcome, status, cached, wait, wall, build, saved, elapsed, verb = args[:9]
     words = args[9:]
+    package_name = os.environ.get("BUILDLOG_PACKAGE", words[0] if words and not words[0].startswith("-") else "")
+    selection = NamedPackage(package_name) if package_name else WorkspacePackages()
     fields: dict[str, object] = {
         "tool": "verify.sh",
         "caller": os.environ.get("BUILDLOG_CALLER") or "verify",
         "command": " ".join([verb, *words]),
         "verb": verb,
-        "package": words[0] if words and verb != "final" else None,
+        "package": selection.name if isinstance(selection, NamedPackage) else "workspace",
         "outcome": outcome,
         "status": optional_int(status),
         "cached": cached == "1",

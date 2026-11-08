@@ -23,6 +23,10 @@ natedev holds the state: on the Mac every subcommand, and pushover.py's check, r
 ssh. NOTIFY_STATE_DIR, when set, names this host's state directory and keeps everything here.
 """
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import argparse
 import fcntl
@@ -41,9 +45,6 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import NotRequired, Protocol, TypedDict, cast
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from scripts.lib.user_zone import user_zone, zone_label  # noqa: E402
 from scripts.notify import push_reference
@@ -304,7 +305,7 @@ class PushChannel(Protocol):
 
 def post_kept(push: KeptPush) -> int:
     """pushover.py posts it; imported here, as pushover.py imports this module."""
-    return cast(PushChannel, cast(object, importlib.import_module("scripts.notify.pushover"))).post_kept(push)
+    return cast(PushChannel, cast(object, importlib.import_module('scripts.notify.pushover'))).post_kept(push)
 
 
 class AutomaticSilenceEvents(Protocol):
@@ -313,7 +314,7 @@ class AutomaticSilenceEvents(Protocol):
 
 def automatic_event(event: str, cause: str, record: SilenceRecord, *, next_state: str = "off") -> None:
     """Record an automatic transition while the caller holds the silence lock."""
-    channel = cast(AutomaticSilenceEvents, cast(object, importlib.import_module("scripts.notify.auto_silence")))
+    channel = cast(AutomaticSilenceEvents, cast(object, importlib.import_module('scripts.notify.auto_silence')))
     channel.record_command_event(event, cause, record, next_state)
 
 

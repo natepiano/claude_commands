@@ -12,7 +12,7 @@
 
 **Source:** builds (showrunner), 2026-10-30, from the Phase 1 trace: "mac_idle.py costs 122 ms per step, and it is your file, so put it in your next-items list."
 
-**Today:** each `verify.sh` step starts `mac_idle.py`, which costs about 122 ms of CPU (Phase 1 trace, real lint run).
+**Today:** `verify.sh` starts `mac_idle.py` for Mac retry registration, exclusion and cleanup. `register_mac_wait` (`verify.sh:2068`) limits registration to Mac routes on Linux. The Phase 1 lint trace measured about 122 ms of CPU.
 
 **Needed:** measure its imports and work with `VERIFY_PY_TRACE` and `python -X importtime`, then remove the start or its slow imports where the step does not need them, with every output unchanged. Done when the same trace shows the cost removed or named per cause.
 
@@ -29,29 +29,77 @@
 
 **Order:** after Phases 24 and 27. Track this producer repair separately from the completed Phase 20 work. `mac_test.py` (near lines 1525 and 2491) already requests END events; find why they do not reach the recorded history, and add no second emission path.
 
-## Copy guard: refuse tree-making git calls through every import form
+## Check mend against the active rustc before lint
 
-**Source:** phase 18 review 6, finding F037 (blocker), routed under the round-3 landing rule. Astra review: `/tmp/claude/astra/20261103T220532Z-2445924/review.md` item 7.
+**Source:** builds (showrunner), 2026-11-04.
 
-**Today:** `scripts/copies/copy_guard.py` finds `bulk_run.git(...)` and `copies.git(...)` calls only for some import forms. These forms give no finding:
-1. `import scripts.style.bulk_run`, then `scripts.style.bulk_run.git(repo, "clone", "a", "b")`.
-2. `from scripts.style import bulk_run as run`, then `run.git(...)`.
-3. An import inside a function.
+**Needed:** before lint runs mend, check that cargo-mend loads against the active rustc (`cargo mend --version` exits 0). On a failure, print one line with the cause (rustc changed since mend was installed) and the repair (`imend` in a cargo-liner worktree), then stop that lint step. Add no pin and no Nix change: natedev and the Mac keep cargo-mend in `~/.cargo/bin` by design (nixos `shell.nix:25-28`).
 
-**Needed:** the guard refuses a tree-making git call through each form above, through alias reimports, and through `global` and `nonlocal` bindings. The local-shadowing rule from phase 18 stays.
+## Report Phase 28 metadata items
 
-**Acceptance:** one regression test per binding form, each fails on the old guard; valid shadowed-name cases stay clean; the copies and guard suites pass.
+**Source:** builds (showrunner), 2026-11-05. Report Phase 28 (`eb4210b92`) is on this branch.
 
-**Due:** Phase 35 item 3. Remove this item after its binding-form and valid-shadowing tests pass.
+**Needed:**
+1. `verify.sh` reads the metadata before the first export (`verify.sh:2717-2732`), through `set_gate_metadata` and `load_metadata`.
+2. `BUILDLOG_OUTPUT_ROOTS` comes from a `verify_metadata.py` request, in place of the `step_context.py output-roots` call at `verify.sh:725`.
+3. `verify.sh test` reads Cargo's folders once. `tree_watch.py:245` takes them from the `BUILDLOG_OUTPUT_ROOTS` export when its evidence matches, else from `read_cargo_output_roots`.
+4. Keep `test_metadata_reuse_keeps_the_export_after_a_config_change` and the output-folder tests. Put the before and after time per test run in the notice.
 
-## Name copies.py source and merge policies with semantic types
+## FixtureHang in test_verify_ssh_targets_retry.py
 
-**Source:** phase 20, 23 and 24 architect review, finding 11, routed out of phase 18 under the round-3 landing rule.
+**Source:** builds (showrunner), 2026-11-05.
 
-**Today:** `copies.standing` (`scripts/copies/copies.py`) takes `apply_uncommitted=None` and `merge=None`. These values are a source policy and an integration policy, not missing input. Phase 35 adds a third source, the staged tree.
+**Today:** natest's survey saw the module raise FixtureHang once (659 s, load 55).
 
-**Needed:** Phase 35 item 7 introduces `CommittedSource`, `WorktreeSource`, `StagedSource`, `NoMerge` and `MergeRevision`. Convert the CLI flags at the boundary, and change callers and tests before queue-unit takes ownership.
+**Needed:** find the cause. If it is the same as the retry-clock hang (`988b6690b`, `3c86b5424`), fix it the same way. Send builds the cause when known.
 
-**Due:** Phase 35 item 7. Remove this item when that item lands.
+## One busy-mirror loop in sweep.py
 
-**Acceptance:** copies, copy guard and style suites pass; basedpyright 0/0/0; no bare `None` policy argument remains in the copies API.
+**Source:** Phase 35 review, sent to next items by builds 2026-11-05.
+
+**Owner:** whoever holds `scripts/lint/sweep.py` when the builds file freeze lifts. Queue-unit owns the `sweep.py` callers of the floor interfaces once Phase 35 is on GitHub builds.
+
+**Needed:** `lint/sweep.py` (near lines 3298, 3321 and 3678-3682) has one busy-mirror `LockHeld` loop in `_hold_floor_pass`. Rename `leased_mirrors` to `busy_mirrors`. Then close its route from the Phase 35 ledger (F031).
+
+## Mirror scans after the sweep.py file freeze
+
+**Source:** Phase 35b review, findings F028 and F029.
+
+**Order:** the first checkpoint after `scripts/lint/sweep.py` leaves the file freeze, together with F031 above.
+
+**Owner:** verify-unit, with queue-unit for the copies and floor interfaces.
+
+**Today:** `copies.py` imports the process scanners from `scripts/lint/tmp_sweep.py`. The Mac floor sweep runs `lsof -F pfn` twice (`copies.scan_mirror_processes`, `sweep.MacFloor.uses`), about 0.23 s more per low-disk sweep.
+
+**Needed:**
+1. Move `ProcessUsesKnown`, `ProcessUsesUnavailable`, `process_paths`, `lsof_paths` and `parse_lsof` from `lint/tmp_sweep.py` to `scripts/lib`, and change every caller together. Keep no re-export.
+2. Share one Mac `lsof` scan between mirror protection and the approved floor roots. Keep the current rule in `mirror_lease_set`: all candidate leases before the one scan.
+3. Keep unavailable-scan protection, unreadable-process protection, path matching and cancellation behavior. Keep the existing scan and floor tests.
+4. Put the measured scan count and time before and after in the notice. Close the routes F028 and F029 from the Phase 35b ledger.
+
+## Each verify run starts fewer helper processes
+
+**Source:** Phase 41's profile. The builds showrunner placed it after Phase 41a, 2026-11-06.
+
+**Today:** one `verify.sh` run of a plain package, with the test fixture's fake tools, starts about 300 processes and costs about 8 CPU s. The `strace` count is 38 git, 37 bash, 35 python3, 32 `py`, 19 rm, 12 dirname, 12 mv. The Python starts are 7 `-c`, 7 `tree_watch.py`, 4 `build_folders.py`, 3 `build_targets.py`, 2 `step_record.py`, 2 `mac_idle.py`, 2 `admission_client.py`, and one each of 7 others.
+
+**Needed:**
+1. Measure the baseline first, on one real plain-package run: processes by command name, CPU s and wall s. Name the method. The count above comes from fake tools, so it is not this baseline.
+2. Remove the starts that the measure shows give no needed answer, largest first. Keep each behavior and its tests.
+3. Measure the same run with the same method. Put before and after in the notice.
+4. Cut the cold imports of `build_targets.py` `eligible`, `reserve` and `release-wait`, with no behavior change. natest 4ed0a1d2 measured 128.4 of 249.6 CPU s in four SSH test files, 270 starts, upper bound of the cut 99.9 CPU s. Tables: `/tmp/claude/unit/2113de4f-9913-485a-9a51-61558bfd81db/phases/66/slots/impl4/measure/`. Builds placed this here, 2026-11-06.
+5. Get queue-unit's review of the admission import split before the Work Order. `build_hold.py` stays frozen unless builds says otherwise. Send natest the hash. natest measures with same-load pairs.
+6. Move three parts of `verify.sh` to functions that the SSH target tests can call. natest 608af02f measured 146.1 CPU s in the four `test_verify_ssh_targets` files. Breakdown: Phase 66 as-built in `docs/plans/builds-natest.md`, on builds-natest at 6f496170f. Builds placed this here, 2026-11-06.
+   - An eligibility consumer from `initialize_step_record`. It accepts real eligibility output and starts no heavy target command.
+   - A result consumer from `try_mac_test`. It accepts the actual result, status and output, and gives the next step decision of `route_test`. This one decides the most: a stop after a busy result and the queue-age handoff have no narrow function now.
+   - The reservation and retry orchestration around `command_reserve`, claim recovery and target selection. It keeps the real admission result and queue sequence.
+
+## A stopped verify call waits for every process of its step
+
+**Source:** natest-unit, 2026-11-06, forced evidence on 5f56b92c4. Builds placed it here, 2026-11-07.
+
+**Today:** `verify.sh` signals the step's process group, then waits only for `RUN_STEP_PID`. The cargo token releases and `verify.sh` exits while a step member (rustc, cargo) can still run. Evidence: `/tmp/claude/unit/2113de4f-9913-485a-9a51-61558bfd81db/phases/73/profile/impl3/cargo-survivor-evidence.jsonl`, a forced SIGSTOP case only.
+
+**Needed:**
+1. Measure a live stopped call. Record whether a step member outlives the token release.
+2. Only if one does: wait for the whole step process group before the token releases, with a test that fails on the old code.

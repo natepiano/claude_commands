@@ -13,10 +13,9 @@ import tempfile
 import unittest
 from typing import override
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.lib import test_hang_guard
+from scripts.lib.py_floor_test_support import seed_interpreter_cache
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 from scripts.build_hold.override_guard import require_checkout
 
 require_checkout(Path(__file__))
@@ -87,6 +86,9 @@ class CargoWrapperTest(unittest.TestCase):
         self.wrapper = self.root / "scripts" / "cargo"
         self.wrapper.parent.mkdir()
         _ = shutil.copy2(SCRIPTS / "cargo", self.wrapper)
+        library = self.root / "lib"
+        library.mkdir()
+        _ = shutil.copy2(SCRIPTS.parent / "lib" / "py", library / "py")
         self.installer = self.wrapper.with_name("install_cargo_wrapper.sh")
         _ = shutil.copy2(SCRIPTS / self.installer.name, self.installer)
         _ = self.wrapper.with_name("hold_applies.py").write_text(HOLD_STUB)
@@ -112,6 +114,7 @@ class CargoWrapperTest(unittest.TestCase):
         assert bash is not None and readlink is not None
         (self.tools / "bash").symlink_to(bash)
         (self.tools / "readlink").symlink_to(readlink)
+        seed_interpreter_cache(self.root / "cache", self.tools / "python3")
         self.cgroup = self.root / "cgroup"
         _ = self.cgroup.write_text("0::/user.slice/app-agents.slice/session.scope\n")
         bus = self.enterContext(socket.socket(socket.AF_UNIX))
@@ -125,6 +128,7 @@ class CargoWrapperTest(unittest.TestCase):
             "PATH": os.pathsep.join(map(str, (self.front, self.real_bin, self.tools))),
             "OSTYPE": "linux-gnu",
             "XDG_RUNTIME_DIR": str(self.runtime),
+            "XDG_CACHE_HOME": str(self.root / "cache"),
             "BUILD_HOLD_DIR": str(self.hold),
             "BUILD_HOLD_RELEASE_DIR": str(self.root / "release"),
             "CARGO_WRAPPER_CGROUP_FILE": str(self.cgroup),

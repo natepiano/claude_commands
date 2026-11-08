@@ -112,7 +112,7 @@ class GateIndexTests(unittest.TestCase):
         self.assertEqual(index.update(), 1)
         common: Record = {"src": source, "host": "fixture-host", "started_at": STARTED}
         expected_run: Record = {
-            **{key: value for key, value in run.items() if key not in {"suites", "modules"}},
+            **{key: value for key, value in run.items() if key not in {"suites", "modules", "dirty_paths", "dirty_path_count"}},
             **common, "id": "gate-one", "aborted": 1, "dirty": 1,
             "modules_run": 3, "tests_run": 111,
         }
@@ -145,10 +145,12 @@ class GateIndexTests(unittest.TestCase):
         path = self.root / source
         entry = next(store.locked_rows(path))
         remove_run_measurements(entry)
+        del entry["step"]
         _ = path.write_bytes(encode(entry))
         original = path.read_bytes()
         self.assertEqual(index.update(), 1)
         self.assertEqual(rows("SELECT slow_test_s, tests_run, modules_run FROM gate_runs"), [(None, None, 3)])
+        self.assertEqual(rows("SELECT step FROM gate_runs"), [("",)])
         self.assertEqual(rows("SELECT tests_run FROM gate_modules WHERE suite = ? AND attempt = ?"
                               + " AND module = ?", "scripts", 2, "test_shared.py"), [(7,)])
         self.assertEqual(path.read_bytes(), original)

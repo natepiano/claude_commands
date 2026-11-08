@@ -48,7 +48,7 @@ The stages pass data through files in the state directory, so each command can r
 ### Phase table
 
 - `phases(state_dir, runs_dir, roster, registry_dir) -> PhaseReport` writes `phases.json` (`{phases, comparisons, drops}`). It reads `<history root>/runs/*.jsonl` (`unit_runs.history_root()`); `run_started.main_agent.session_id` picks the director (ids from `session_states`, then roster, then registry). Each completed phase (`phase_started` paired with a `phase_finished` of status `completed`) takes every request of that director with `started <= at < ended`, unfiltered; `phase_arm` names it `opus`, `sonnet` or `mixed` from the requests' models.
-- `PhaseRow` carries `requests`, `director_seconds`, `cost_usd`, `output_tokens`, `repair_rounds` (the highest `round` of the phase's `finding_batch_dispatched` events), `phase_elapsed_seconds`, the recorded size `work_order_words`, and per-1,000-word rates `requests_per_1000_words`, `seconds_per_1000_words`, `cost_per_1000_words`. A size is null when unrecorded or invalid; a recorded 0 stays 0; rates are null for a null or 0 size.
+- `PhaseRow` carries `requests`, `director_seconds`, `cost_usd`, `output_tokens`, `repair_rounds`, `phase_elapsed_seconds`, and the recorded size `work_order_words`. It also carries the rates `requests_per_1000_words`, `seconds_per_1000_words`, and `cost_per_1000_words`. Its legacy `repair_rounds` field stores the highest dispatch number. This audit measure includes dispatches without a started worker. Use `history.py rounds` for repair counts. It groups started fix passes by ledger batch. Relaunches add no round. Refunded batches add no round unless they later land. A size is null when unrecorded or invalid. A recorded zero stays zero. Rates are null for a null or zero size.
 - `comparisons` has one entry per roster director with `switched_by_pdt` set, then `Pooled switched`. Four metrics (the three rates and `repair_rounds`) each map to Sonnet minus Opus medians. With 8 or more phases per arm the interval comes from `bootstrap_diff` and the label is `fewer`, `more` or `no measurable difference`; otherwise `too few phases (n=<a> against <b>)` with null value and bounds. Rate metrics skip rows with null rates, so their n is smaller than the `repair_rounds` n.
 - `drops` is `{stopped, errored, empty}`: finish status `stopped`; any status other than `completed` or `stopped`; completed phases with no request of the director.
 
@@ -64,7 +64,7 @@ The stages pass data through files in the state directory, so each command can r
 
 ### Commands
 
-`python3 scripts/model_study/model_study.py <subcommand>`. Path flags default as follows: `--state-dir` is `MODEL_STUDY_STATE`, else `~/.local/state/model-study`; `--projects-dir` `~/.claude/projects`; `--registry-dir` `~/.claude/sessions`; `--runs-dir` `<history root>/runs`; `--roster` `scripts/model_study/roster.json`. `--now <ISO time>` (a naive time reads as PDT) replaces the wall clock everywhere: `extracted`, the history `at`, the report title, the deadline test.
+`scripts/lib/py scripts/model_study/model_study.py <subcommand>`. Path flags default as follows: `--state-dir` is `MODEL_STUDY_STATE`, else `~/.local/state/model-study`; `--projects-dir` `~/.claude/projects`; `--registry-dir` `~/.claude/sessions`; `--runs-dir` `<history root>/runs`; `--roster` `scripts/model_study/roster.json`. `--now <ISO time>` (a naive time reads as PDT) replaces the wall clock everywhere: `extracted`, the history `at`, the report title, the deadline test.
 
 | Subcommand | Flags | Does |
 | --- | --- | --- |
@@ -122,9 +122,9 @@ State directory files: `turns.jsonl`, `compactions.jsonl`, `extract.json`, `comp
 
 ## How to re-run
 
-- `python3 scripts/model_study/model_study.py results` extracts the live transcripts, compares, joins the phase table, adds a history line, and replaces `docs/as-built/director-model-study-results.md` and `.json` plus `~/.local/state/model-study/report.md`. Add `--message` for the short message, `--no-extract` to reuse extracted rows, `--now 2026-10-07T10:30` to pin the clock, `--no-history` to skip the history line.
-- `python3 scripts/model_study/model_study.py report --interim` writes only `report.md` and a history line; `ready` prints the gate state and exits 0 or 3.
-- `python3 -m unittest discover -s scripts/model_study -p 'test_*.py'` from the repository root runs the tests (`test_turns`, `test_stats`, `test_compare`, `test_phases`, `test_report`, `test_rerun`); it prints a pass count and touches no real transcript or state.
+- `scripts/lib/py scripts/model_study/model_study.py results` extracts the live transcripts, compares, joins the phase table, adds a history line, and replaces `docs/as-built/director-model-study-results.md` and `.json` plus `~/.local/state/model-study/report.md`. Add `--message` for the short message, `--no-extract` to reuse extracted rows, `--now 2026-10-07T10:30` to pin the clock, `--no-history` to skip the history line.
+- `scripts/lib/py scripts/model_study/model_study.py report --interim` writes only `report.md` and a history line; `ready` prints the gate state and exits 0 or 3.
+- `~/.claude/scripts/lib/py -m unittest discover -s scripts/model_study -p 'test_*.py'` from the repository root runs the tests (`test_turns`, `test_stats`, `test_compare`, `test_phases`, `test_report`, `test_rerun`); it prints a pass count and touches no real transcript or state.
 - `basedpyright scripts/model_study` type-checks the tool; read its closing counts, not its exit status.
 
 ## Result at the time of writing

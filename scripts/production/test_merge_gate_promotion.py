@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from scripts.production.staff_test_support import foreign_hostname
+
 import unittest
 
 import json
@@ -11,17 +13,72 @@ from pathlib import Path
 import subprocess
 import sys
 from types import SimpleNamespace
-from typing import final
+from typing import final, override
 from contextlib import redirect_stdout
 from unittest import mock
-from scripts.production import merge_gate
+from scripts.production import change_review, merge_gate, staff
+from scripts.production.staff_test_support import isolated_staff_file
+from scripts.shutdown import remote
 from scripts.production.gate_modules import GateRefused
 from scripts.production.merge_gate_test_support import MergeGateFixture, wait_for_file
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
+def setUpModule() -> None:
+    unittest.enterModuleContext(foreign_hostname())
+
+
 @final
 class MergeGatePromotionTests(MergeGateFixture):
+    @override
+    def review_list(self) -> tuple[Path, Path]:
+        review, doc = super().review_list()
+        with isolated_staff_file(Path(self.environment["STAFF_FILE"]), self.environment):
+            record = staff.snapshot()
+            owner = record.by_doc("natedev", doc)
+            assert owner is not None
+            _ = staff.set_doc(owner.id, staff.LiveDoc(remote.local_machine(), doc))
+        return review, doc
+
+    def test_failed_main_push_leaves_rows_unlisted_until_promote_only_succeeds(self) -> None:
+        review, _ = self.review_list()
+        before = review.read_bytes()
+        checkpoint = self.checkpoint_commit("checkpoint(fixture): ready\n\nChange-Review: Published | Read | Ready")
+        hook = self.origin / "hooks/pre-receive"
+        self.write(hook, '#!/bin/sh\nwhile read old new ref; do\n'
+                   + ' if [ "$ref" = refs/heads/main ]; then exit 1; fi\ndone\n')
+        hook.chmod(0o755)
+        failed = self.run_gate("--promote", "--production", "fixture-showrunner", checkpoint=checkpoint)
+        self.assertNotEqual(failed.returncode, 0, failed.stdout + failed.stderr)
+        self.assertEqual(review.read_bytes(), before)
+        self.assertEqual(self.git(self.origin, "rev-parse", "main"), self.base)
+        published = self.git(self.origin, "rev-parse", "integration")
+        hook.unlink()
+        retried = self.run_promote_only("--production", "fixture-showrunner")
+        self.assertEqual(retried.returncode, 0, retried.stdout + retried.stderr)
+        self.assertEqual(self.git(self.origin, "rev-parse", "main"), published)
+        self.assertEqual([row["Change"] for row in change_review.pending(review)], ["old", "Published"])
+        self.assertEqual(change_review.pending(review)[-1]["Merged"].split(" · ")[1], published[:8])
+        written = review.read_bytes()
+        self.assertEqual(self.run_promote_only("--production", "fixture-showrunner").returncode, 0)
+        self.assertEqual(review.read_bytes(), written)
+
+    def test_failed_mac_pull_leaves_rows_unlisted_until_the_next_good_promotion(self) -> None:
+        review, _ = self.review_list()
+        before = review.read_bytes()
+        checkpoint = self.checkpoint_commit("checkpoint(fixture): live\n\nChange-Review: Installed | Read | Live")
+        self.write(self.state / "mac-answer", "ff_rc=1\nfixture-head\n")
+        failed = self.run_gate("--promote", "--production", "fixture-showrunner", checkpoint=checkpoint)
+        self.assertNotEqual(failed.returncode, 0, failed.stdout + failed.stderr)
+        self.assertEqual(review.read_bytes(), before)
+        published = self.git(self.origin, "rev-parse", "integration")
+        self.assertEqual(self.git(self.origin, "rev-parse", "main"), published)
+        self.write(self.state / "mac-answer", "ff_rc=0\nfixture-head\n")
+        retried = self.run_promote_only("--production", "fixture-showrunner")
+        self.assertEqual(retried.returncode, 0, retried.stdout + retried.stderr)
+        self.assertEqual([row["Change"] for row in change_review.pending(review)], ["old", "Installed"])
+        self.assertEqual(change_review.pending(review)[-1]["Merged"].split(" · ")[1], published[:8])
+
     def test_remote_tracked_check_runs_without_repository_modules(self) -> None:
         self.write(self.unit / "subject.txt", "promoted contents\n")
         self.checkpoint = self.commit(self.unit, "update subject")

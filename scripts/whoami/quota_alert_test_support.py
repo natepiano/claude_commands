@@ -18,29 +18,25 @@ from pathlib import Path
 from typing import ClassVar, cast, override
 from unittest import mock
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.lib.test_models_registry import ExactRows, registry_text, write_registry
 from scripts.whoami.account_test_support import create_claude_account
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-import quota_alert
+from scripts.whoami import quota_alert
 from scripts.notify.push_texts import RenderedPush
 from scripts.whoami import agent_accounts
 from scripts.whoami.agent_accounts import ClaudeAccountsInUse, CodexHomeSource, Quota, Report
-import agent_notes
+from scripts.whoami import agent_notes
 from scripts.whoami import session_table
 from scripts.whoami import note_file
 from scripts.whoami import account
 from scripts.whoami import usage_store
-from agent_notes import local_reset
+from scripts.whoami.agent_notes import local_reset
 from scripts.whoami.note_file import read_note
 from scripts.accounts import accounts, moves, next_moves, role_map
 from scripts.production import showrunners
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "message"))
-import send
-# send puts scripts/notify on the path.
+from scripts.message import send
 from scripts.notify.user_action import ActionRequired, UserAction, parse_user_action
 
 Notes = list[quota_alert.AgentNote]

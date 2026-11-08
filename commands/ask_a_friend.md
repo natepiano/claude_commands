@@ -9,9 +9,11 @@ description: Consult an agent of the same family.
 Consult a peer about a design or debugging question. Keep the friend available for follow-up questions and optional implementation.
 Evaluate the answer before you present it to the user. Continue until you have a clear answer or a clear disagreement.
 
-The friend uses the caller's family. `side_pane.py` reads `ask_a_friend.consultation` through the model registry.
+The friend uses the caller's family. `assign.sh` reads `ask_a_friend.consultation` through the model registry.
 `[assignments] ask_a_friend=caller` selects the family. `/default_models ask_a_friend` shows both family settings.
 The friend occupies a pane beside the caller. It has no staff row.
+The friend launches with the worker policy, so it can change files.
+The instruction in step 2 holds it back until the user asks for an implementation.
 
 ## State
 
@@ -45,12 +47,12 @@ Append the question to `HISTORY_FILE` under `## Round 1 — question`.
 Run the same command for both families:
 
 ```sh
-~/.claude/scripts/lib/py ~/.claude/scripts/herdr/side_pane.py open "${FRIEND}" --question-file "${SESSION_DIR}/question.md" --cwd "${WORKING_DIR}"
+bash ~/.claude/scripts/direct/assign.sh --role implement --target consultation-pane --policy friend --new-worker "${FRIEND}" --prompt "${SESSION_DIR}/question.md" --cwd "${WORKING_DIR}"
 ```
 
-A repeated open reuses the friend's pane. It creates no second pane.
+A repeated launch reuses the friend's pane. It creates no second pane.
 Exit 0 means complete. Exit 2 means a structural refusal. Exit 8 means unknown evidence or incomplete startup.
-After an exit 8 from `open`, rerun `open`, then deliver the question with `send`.
+After exit 8, repeat **LaunchFriend**. Then use **SendToFriend** to deliver the question.
 Read any failure output and report its cause. Use **EndFriend** when the consultation ends.
 
 ### 4. AwaitReply

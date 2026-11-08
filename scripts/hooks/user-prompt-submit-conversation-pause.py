@@ -2,6 +2,10 @@
 """Pause a session's automatic updates when a conversation begins, and record the user's activity."""
 
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import hashlib
 import json
@@ -29,8 +33,7 @@ class PromptPayload(TypedDict, total=False):
 
 def _record_typed_prompt() -> None:
     try:
-        sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "message"))
-        import escalate
+        from scripts.message import escalate
 
         escalate.typed()
     except HookBudgetSpent:
@@ -50,7 +53,7 @@ def _record_activity(session_id: str, source: str, prompt: str) -> None:
     The call runs detached, so neither natedev's push nor the Mac's ssh slows the prompt.
     """
     try:
-        import conversation_pause
+        from scripts.hooks import conversation_pause
 
         if not conversation_pause.is_showrunner_or_unit_director(session_id):
             return
@@ -86,7 +89,7 @@ def main() -> None:
     _ = signal.signal(signal.SIGALRM, budget_spent)
     _ = signal.alarm(budget)
     try:
-        import conversation_pause
+        from scripts.hooks import conversation_pause
 
         source = conversation_pause.prompt_source(
             prompt,
@@ -96,14 +99,13 @@ def main() -> None:
         # Classify before matching the declared wait. A timer or unrelated
         # message does not supply the answer. Read the marker directly so long
         # waits survive active_run's liveness timeout.
-        from direct_run import marker_path
+        from scripts.hooks.direct_run import marker_path
 
         try:
             run_text = marker_path(session_id).read_text(encoding="utf-8").strip()
         except FileNotFoundError:
             run_text = ""
         if run_text:
-            sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
             from scripts.direct.progress_history import finish_turn_wait
 
             finish_turn_wait(Path(run_text), session_id, source=source.name, prompt=prompt)

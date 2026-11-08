@@ -11,6 +11,8 @@ from pathlib import Path
 from typing import cast, override
 from unittest import mock
 
+# Support both the package-qualified unittest command and directory discovery.
+
 from scripts.buildlog import index
 from scripts.buildlog.test_index import Record, call, encode, point_root_at, rows, step
 

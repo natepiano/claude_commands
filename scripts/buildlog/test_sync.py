@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
 """Sync pauses and Mac command status stay within a temporary state root."""
 
 from __future__ import annotations
@@ -19,15 +19,13 @@ from pathlib import Path
 from typing import cast, override
 from unittest import mock
 
-from scripts.buildlog import ci
-from scripts.buildlog import cli
+from scripts.buildlog import ci, cli
 from scripts.buildlog import index
 from scripts.buildlog import health
 from scripts.buildlog import record
 from scripts.buildlog import rust_release
 from scripts.buildlog import store
-from scripts.buildlog import sync
-from scripts.buildlog import vault_pull
+from scripts.buildlog import sync, vault_pull
 from scripts.buildlog.test_index import point_root_at
 from scripts.lib import test_hang_guard
 from scripts.lint.memory_test_support import config_environment
@@ -47,6 +45,7 @@ class SyncTests(unittest.TestCase):
     def setUp(self) -> None:
         temporary = self.enterContext(tempfile.TemporaryDirectory())
         self.root = Path(temporary) / "buildlog"
+        _ = self.enterContext(mock.patch.object(store, "host_name", side_effect=lambda: record.local_step_identity().hosts[0]))
         point_root_at(self, self.root)
         self.enterContext(mock.patch.dict(os.environ, {
             **config_environment(Path(temporary)),

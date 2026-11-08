@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
 """Crash-safe single-writer lock shared by Hanadocs prioritization tools."""
 
 from __future__ import annotations

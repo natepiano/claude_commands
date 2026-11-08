@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from scripts.shutdown import remote
+
 import io
 import json
 import os
@@ -19,12 +21,12 @@ from contextlib import closing, contextmanager, redirect_stderr, redirect_stdout
 from datetime import datetime, timezone
 from typing import TypedDict, cast, override
 from unittest import mock
-import rules
-import style_ledger
-from approved_renames import AppliedCheck, TYPE_NAMED_PARAMETER_RULE
-import style_plan
-import style_rules
-import declarations
+from scripts.style import rules
+from scripts.style import style_ledger
+from scripts.style.approved_renames import AppliedCheck, TYPE_NAMED_PARAMETER_RULE
+from scripts.style import style_plan
+from scripts.style import style_rules
+from scripts.style import declarations
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.production import staff
 from scripts.production.staff_test_support import fixture_member, fixture_runtime_id, isolated_staff_file
@@ -67,12 +69,12 @@ def style_staff_fixture(root: Path, repo: Path) -> Generator[None]:
         ))
         record = staff.apply_seed(staff.SeedInput(tuple(members)))
         for row in record.find(kind="unit", parent=owner.id):
-            _ = staff.set_worktree(row.id, staff.RemovedWorktree("natedev", root / ("unused-" + row.name)),
+            _ = staff.set_worktree(row.id, staff.RemovedWorktree(remote.local_machine(), root / ("unused-" + row.name)),
                                   expected=row.worktree)
         document = repo / ".git/style-production.md"
         document.parent.mkdir(exist_ok=True)
         _ = document.write_text("# Style production\n- **Kind:** style\n- **Branch point:** main\n")
-        _ = staff.set_doc(owner.id, staff.LiveDoc("natedev", document))
+        _ = staff.set_doc(owner.id, staff.LiveDoc(remote.local_machine(), document))
         yield
 
 
@@ -270,7 +272,7 @@ class LedgerTestCase(unittest.TestCase):
 
     def cli_command(self, arguments: tuple[str, ...]) -> list[str]:
         prefix = 2 if arguments[0] in ("ticket", "handoff", "tip", "held", "unit") else 1
-        return [sys.executable, str(Path(style_ledger.__file__)), *arguments[:prefix],
+        return [str(Path(__file__).resolve().parents[1] / "lib/py"), str(Path(style_ledger.__file__)), *arguments[:prefix],
                 "--repo", str(self.repo), *arguments[prefix:]]
 
     def cli(self, *arguments: str, success: bool = True) -> subprocess.CompletedProcess[str]:

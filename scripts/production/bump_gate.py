@@ -1,23 +1,25 @@
 #!/usr/bin/env python3
 """Gate a bumped checkpoint in a standing checkout of its pushed tip."""
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import argparse
 import os
-import sys
 from pathlib import Path
 from typing import cast
 from zoneinfo import ZoneInfo
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.copies import copies
 
-from merge_checkpoint import (
+from scripts.production.merge_checkpoint import (
     Stop, complete_gate, read_record, record_lock,
     run_checkpoint_test_steps, save_record,
 )
 from scripts.production.production_doc import ProductionDocument
-import sessions
+from scripts.message import sessions
 
 
 def run_gate(path: Path) -> int:
@@ -37,7 +39,7 @@ def run_gate(path: Path) -> int:
         record["proc_start"] = proc_start
         save_record(path, record)
     try:
-        with copies.standing(record["name"], Path(record["checkout"]), record["tip"]) as clone:
+        with copies.standing(record["owner_id"], Path(record["checkout"]), copies.CommittedSource(record["tip"])) as clone:
             production = ProductionDocument(Path(record["production_doc"]), record["name"], record["merge_branch"],
                                     clone, Path(record["checkout"]) / record["production_log"], ZoneInfo(record["zone"]))
             os.environ["BUILDLOG_UNIT"] = record["unit"]

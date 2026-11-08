@@ -2,6 +2,10 @@
 """Prove Linux execution over Tailscale SSH in a managed scratch home."""
 
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import json
 import os
@@ -14,14 +18,14 @@ from typing import TYPE_CHECKING
 import uuid
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'lib'))
-import linux_runner
-import conf
+from scripts.mac_test import linux_runner
+from scripts.lib import conf
 
 if TYPE_CHECKING:
     from ..lint import memory_admit
 else:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'lint'))
-    import memory_admit
+    from scripts.lint import memory_admit
 
 
 REMOTE_PROOF = r"""

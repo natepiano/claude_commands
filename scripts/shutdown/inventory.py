@@ -2,7 +2,10 @@
 """Inventory the live Claude work belonging to one account on this machine."""
 
 from __future__ import annotations
-
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import json
 import os
@@ -16,31 +19,23 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal, TypedDict, cast
 
-SCRIPTS = Path(__file__).resolve().parents[1]
-# Sibling imports need this folder. Append it so a caller's own modules
-# (buildlog's record) keep precedence over shutdown's.
-if str(SCRIPTS / "shutdown") not in sys.path:
-    sys.path.append(str(SCRIPTS / "shutdown"))
-for dependency in ("whoami", "message", "production", "herdr", "direct", "lib", "hooks"):
-    sys.path.insert(0, str(SCRIPTS / dependency))
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-
 from scripts.direct.assign_gate import WORKER_LAUNCHERS
 from scripts.whoami import account
 from scripts.shutdown import remote
-from probe_session import PROBE_ENV
-import unit_runs
-import herdr
-import sessions
-from sessions import process_start as _process_start
+from scripts.lib.probe_session import PROBE_ENV
+from scripts.lib import unit_runs
+from scripts.herdr import herdr
+from scripts.message import sessions
+from scripts.message.sessions import process_start as _process_start
 from scripts.production import showrunners, staff, session_staff
 from scripts.usage import agents_log
-import unit_lookup
+from scripts.direct.worker_state import ROSTER_LIVE, worker_status_path
+from scripts.lib.resume_message import PausedSeat, Resumable, Idle, Unavailable, WorkerResume
+from scripts.production import unit_lookup
 from scripts.whoami.account import Account, label_for
 
 
-from session_types import (
+from scripts.shutdown.session_types import (
     InvalidInventory as InvalidInventory,
     parse_session as parse_session,
     wire_object as _wire_object,
@@ -768,16 +763,11 @@ def _model(session_id: str, config_dir: Path) -> LastModel:
 
 def _launcher_command(pid: int) -> list[str]:
     """Read the nearest live launcher ancestor and preserve argument boundaries."""
-    try:
-        darwin = {process.pid: process for process in herdr._darwin_processes()} if sys.platform == "darwin" else {}  # pyright: ignore[reportPrivateUsage]
-    except (OSError, herdr.HerdrFailure):
-        return []
     visited: set[int] = set()
-    while pid > 1 and pid not in visited and len(visited) < 64:
-        visited.add(pid)
-        if not _pid_alive(pid):
-            return []
-        try:
+    try:
+        darwin = {process.pid: process for process in herdr._darwin_processes()} if sys.platform == "darwin" and pid > 1 else {}  # pyright: ignore[reportPrivateUsage]
+        while pid > 1 and pid not in visited and len(visited) < 64 and _pid_alive(pid):
+            visited.add(pid)
             if sys.platform == "linux":
                 process = Path(os.environ.get("HERDR_PROC", "/proc")) / str(pid)
                 argv = [os.fsdecode(part) for part in process.joinpath("cmdline").read_bytes().split(b"\0") if part]
@@ -789,75 +779,44 @@ def _launcher_command(pid: int) -> list[str]:
                     return []
                 parent = process.parent
                 argv = list(process.arguments.argv)
-        except (OSError, ValueError, IndexError, UnicodeError, subprocess.SubprocessError):
-            return []
-        if any(Path(arg).name in WORKER_LAUNCHERS for arg in argv):
-            return argv
-        pid = parent
+            if any(Path(arg).name in WORKER_LAUNCHERS for arg in argv):
+                return argv
+            pid = parent
+    except (OSError, ValueError, IndexError, subprocess.SubprocessError, herdr.HerdrFailure):
+        return []
     return []
 
 
-def _left_since_offered(directory: Path, roster: dict[str, dict[str, object]]) -> bool:
-    """An earlier stop paused every worker, and the director has written no board line since.
-
-    Each stop writes `<seat>.resume-prompt.md`, so the oldest one is the earliest offer
-    the restart made. A board older than that offer means the director took none back.
-    """
-    if not roster or any(entry.get("status") != "paused" for entry in roster.values()):
-        return False
+def worker_resumes(parent: staff.StaffRow, membership: staff.StaffSnapshot) -> list[WorkerResume]:
+    """Return one resume result for each direct worker child, across both families."""
+    children = membership.find(kind="worker", parent=parent.id)
+    if not children:
+        return []
     try:
-        board = (directory / "board.log").stat().st_mtime
-        offered = min((directory / f"{name}.resume-prompt.md").stat().st_mtime for name in roster)
-    except OSError:
-        return False
-    return board < offered
-
-
-
-
-class PausedSeat(TypedDict):
-    """A worker reference and the launcher that continues its task."""
-
-    run_dir: str
-    seat: str
-    role: str
-    staff_id: str
-    turn_live: bool
-    launcher_command: list[str]
-
-
-def codex_seats(run_directories: list[Path]) -> list[PausedSeat]:
-    seats: list[PausedSeat] = []
-    if not run_directories:
-        return seats
-    try:
-        membership = staff.local_snapshot()
-    except staff.StaffUnreadable as error:
-        print(f"inventory: worker membership: {error}", file=sys.stderr)
-        return seats
-    tasks = agents_log.assignments(agents_log.state_dir() / "agents.jsonl")
-    for directory in run_directories:
-        run_dir = str(directory)
-        roster = {
-            name: cast(dict[str, object], raw)
-            for name, raw in sorted(_json_object(Path(run_dir) / "mesh_roster.json").items())
-            if isinstance(raw, dict) and cast(dict[str, object], raw).get("status") != "ended"
-        }
-        # A run whose director left it is not one to resume: its marker outlived the work.
-        if _left_since_offered(directory, roster):
-            continue
-        for name, entry in roster.items():
-            reference = entry.get("staff_id", "")
-            task = agents_log.role_at(tasks, session_staff.worker_session(entry, membership), datetime.now(timezone.utc))
+        tasks = agents_log.assignments(agents_log.state_dir() / "agents.jsonl")
+        moment = datetime.now(timezone.utc)
+        runs = session_staff.worker_run_entries(membership, children)
+    except (OSError, ValueError) as error:
+        return [Unavailable(child.id, child.name, str(error).replace("\n", " ")) for child in children]
+    results: list[WorkerResume] = []
+    for child in children:
+        try:
+            found = next(reversed(runs.get(child.id, ())), None)
+            if found is None:
+                raise ValueError("worker roster entry is unavailable in its recorded runs")
+            directory, entry = found
+            task = agents_log.role_at(tasks, child.current_session, moment)
+            if not isinstance(task, agents_log.Assignment):
+                raise ValueError("last assignment is unavailable" + (f": {'; '.join(tasks.problems)}" if tasks.problems else ""))
+            status = worker_status_path(directory, str(entry["slot"])).read_text().strip() if "slot" in entry else entry.get("status")
+            live = status == "implementing" if "slot" in entry else status in ROSTER_LIVE or entry.get("paused_turn") is True
             launcher = entry.get("launcher_pid", 0)
-            turn_live = entry.get("status") in {"running", "starting"} or entry.get("paused_turn") is True
-            seat = PausedSeat(run_dir=run_dir, seat=name,
-                              role=task.role if isinstance(task, agents_log.Assignment) else "",
-                              staff_id=reference if isinstance(reference, str) else "",
-                              turn_live=turn_live,
+            seat = PausedSeat(run_dir=str(directory), seat=child.name, role=task.role, staff_id=child.id, turn_live=live,
                               launcher_command=_launcher_command(launcher) if isinstance(launcher, int) else [])
-            seats.append(seat)
-    return seats
+            results.append(Resumable(seat) if live else Idle(seat))
+        except (OSError, ValueError) as error:
+            results.append(Unavailable(child.id, child.name, str(error).replace("\n", " ")))
+    return results
 
 
 def _codex_servers(run_directories: list[Path]) -> list[CodexServer]:
@@ -872,11 +831,10 @@ def _codex_servers(run_directories: list[Path]) -> list[CodexServer]:
             if not isinstance(raw_entry, dict):
                 continue
             entry = cast(dict[str, object], raw_entry)
-            status = entry.get("status")
             launcher = _positive_int(entry.get("launcher_pid"))
             # Saved status alone does not prove a launcher is still doing work.
             launcher_is_live = launcher is not None and _pid_alive(launcher)
-            if status in {"running", "starting"} and launcher_is_live:
+            if entry.get("status") in ROSTER_LIVE and launcher_is_live:
                 busy.append(name)
         servers.append({"run_dir": str(directory), "pid": pid, "busy_workers": busy})
     return servers
@@ -1040,58 +998,3 @@ def _session_details(record: SessionFile, entry: ListedSession, *, directories: 
     folder = session["cwd"]
     session["checkout"] = _checkout(folder) if isinstance(folder, str) else NotACheckout(kind="not a checkout")
     return session
-
-
-class MatchingSession(TypedDict):
-    kind: Literal["matching session"]
-    session: Session
-    workers: list[Session]
-
-
-class SessionAbsent(TypedDict):
-    kind: Literal["session absent"]
-
-
-class SessionIdentityLost(TypedDict):
-    kind: Literal["session identity lost"]
-
-
-class SessionAccountUnreadable(TypedDict):
-    kind: Literal["session account unreadable"]
-
-
-FreshSession = (
-    MatchingSession | SessionAbsent | SessionIdentityLost | SessionAccountUnreadable
-)
-
-
-def fresh_session(stored: Session, report: Inventory) -> FreshSession:
-    session_id = stored["session_id"]
-    occurrences = [item for item in report["sessions"] if item["session_id"] == session_id]
-    if any(item["pid"] != stored["pid"] or item["proc_start"] != stored["proc_start"]
-           for item in occurrences):
-        return {"kind": "session identity lost"}
-    current = next(iter(occurrences), None)
-    if current is not None:
-        return {
-            "kind": "matching session", "session": current,
-            "workers": [
-                item for item in report["sessions"]
-                if item["kind"] == "worker"
-                and item["owner"]["kind"] == "director"
-                and item["owner"]["session_id"] == session_id
-            ],
-        }
-    reason = next(
-        (
-            item["reason"]
-            for item in report["unattributed"]
-            if item["pid"] == stored["pid"]
-        ),
-        "",
-    )
-    if reason == "process start mismatch":
-        return {"kind": "session identity lost"}
-    if reason == "account unreadable":
-        return {"kind": "session account unreadable"}
-    return {"kind": "session absent"}

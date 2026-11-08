@@ -5,10 +5,10 @@ from __future__ import annotations
 import unittest
 from typing import final, override
 
-import finding_sites
-import style_ledger
-import test_style_ledger_sites
-from ledger_test_support import PARENT_FILE
+from scripts.style import finding_sites
+from scripts.style import style_ledger
+from scripts.style import test_style_ledger_sites
+from scripts.style.ledger_test_support import PARENT_FILE
 
 
 @final

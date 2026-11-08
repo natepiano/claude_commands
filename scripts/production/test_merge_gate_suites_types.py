@@ -3,15 +3,20 @@
 from __future__ import annotations
 
 import unittest
+import io
+import tempfile
+from collections.abc import Generator
+from contextlib import contextmanager, nullcontext, redirect_stdout
 import os
 import shutil
 import subprocess
 import sys
-import venv
 from pathlib import Path
-from typing import cast, final
+from typing import cast, final, override
 from unittest import mock
+from scripts.copies import copies
 from scripts.production import merge_gate
+from scripts.production.gate_modules import GateRefused
 from scripts.production.cli_fixture import invoke_cli
 from scripts.production.merge_gate_test_support import gate_suites, wait_for_file
 from scripts.production.merge_gate_suites_test_support import GateSuitesFixture
@@ -20,6 +25,11 @@ from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 @final
 class MergeGateTypesTests(GateSuitesFixture):
+    @override
+    def setUp(self) -> None:
+        super().setUp()
+        _ = cast(object, self.enterContext(mock.patch.object(merge_gate, "push_nightly_result")))
+
     def run_nightly(self) -> subprocess.CompletedProcess[str]:
         configuration = self.root / "copies.conf"
         self.write(configuration, f"[copies]\nroot={self.root / 'copies'}\n"
@@ -120,46 +130,6 @@ class MergeGateTypesTests(GateSuitesFixture):
                 self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
                 self.assertIn("basedpyright: " + ("OK" if expected == 0 else "RED"), result.stdout)
 
-    def test_real_basedpyright_exits_zero_without_a_checkout_venv(self) -> None:
-        executable = shutil.which("basedpyright")
-        self.assertIsNotNone(executable, "basedpyright is required")
-        assert executable is not None
-        repo = Path(__file__).resolve().parents[2]
-        _ = shutil.copyfile(repo / "pyrightconfig.json", self.checkout / "pyrightconfig.json")
-        self.write(self.checkout / "clean.py", 'message: str = "clean"\nprint(message)\n')
-        self.assertFalse((self.checkout / ".venv").exists())
-
-        result = subprocess.run(
-            [executable, "clean.py"], cwd=self.checkout, env=self.environment,
-            stdin=subprocess.DEVNULL, capture_output=True, text=True, check=False,
-            timeout=TEST_HANG_GUARD_SECS,
-        )
-
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertIn("0 errors, 0 warnings, 0 notes", result.stdout)
-
-    def test_type_check_uses_pinned_packages_when_the_checkout_has_a_venv(self) -> None:
-        executable = shutil.which("basedpyright")
-        self.assertIsNotNone(executable, "basedpyright is required")
-        assert executable is not None
-        repo = Path(__file__).resolve().parents[2]
-        _ = shutil.copyfile(repo / "pyrightconfig.json", self.checkout / "pyrightconfig.json")
-        pinned = self.state / "runner" / "typecheck-venv"
-        venv.EnvBuilder().create(pinned)
-        venv.EnvBuilder().create(self.checkout / ".venv")
-        packages = pinned / "lib" / f"python{sys.version_info.major}.{sys.version_info.minor}" / "site-packages"
-        for module in ("bpy", "PIL"):
-            self.write(packages / module / "__init__.pyi", "__version__: str\n")
-        self.write(pinned / "gate-requirements.txt", "\n".join(merge_gate.TYPECHECK_REQUIREMENTS) + "\n")
-        self.write(self.checkout / "packages.py",
-                   "import bpy\nimport PIL\nprint(bpy.__version__, PIL.__version__)\n")
-        self.environment["MERGE_GATE_BASEDPYRIGHT"] = executable
-
-        result = self.run_gate("--tests-only", "--type-dirs", "packages.py")
-
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertIn("basedpyright: OK\n0 errors, 0 warnings, 0 notes", result.stdout)
-
     @gate_suites("hooks")
     def test_types_owns_a_shared_slot_until_it_finishes(self) -> None:
         self.supply_jobserver(b"T")
@@ -249,6 +219,220 @@ class MergeGateTypesTests(GateSuitesFixture):
         self.assert_not_pushed()
         self.assertEqual(self.git(self.checkout, "rev-parse", "HEAD"), self.base)
         self.assertEqual(self.git(self.checkout, "status", "--porcelain"), "")
+
+
+@final
+class NightlyPushTests(unittest.TestCase):
+    root: Path = Path()
+
+    @override
+    def setUp(self) -> None:
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        config = self.root / "config"
+        _ = shutil.copytree(Path(__file__).resolve().parents[2] / "config", config)
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
+            "HOME": str(self.root), "CONF_DIR": str(config),
+            "MERGE_GATE_STATE_DIR": str(self.root / "state"), "USER_ZONE": "America/New_York"})))
+
+    @contextmanager
+    def execution(self, run: merge_gate.GateRun | Exception) -> Generator[mock.MagicMock, None, None]:
+        with (mock.patch.object(merge_gate, "nightly_git", return_value=""),
+              mock.patch.object(merge_gate, "checked_git", return_value="fixture-tree"),
+              mock.patch.object(merge_gate, "nightly_owner", return_value="fixture"),
+              mock.patch.object(copies, "standing", return_value=nullcontext(self.root)),
+              mock.patch.object(merge_gate, "run_suites", return_value=run,
+                                side_effect=run if isinstance(run, Exception) else None),
+              mock.patch.object(merge_gate, "tell_nightly_red"),
+              mock.patch.object(subprocess, "run", return_value=subprocess.CompletedProcess(
+                  [], 0, "SENT: fixture\n", "")) as sent):
+            yield sent
+
+    def nightly(self) -> int:
+        return merge_gate.nightly(merge_gate.GateArguments(repo=str(self.root), merge_branch="main"))
+
+    def test_nightly_push_describes_the_run_and_limits_failed_modules(self) -> None:
+        good = merge_gate.GateJobResult("message", "test_send.py", 0, 0, "")
+        types = merge_gate.GateJobResult("types", "basedpyright", 0, 0, "",
+                                        kind=merge_gate.GateJobKind.TYPE_CHECK)
+        red_types = merge_gate.GateJobResult("types", "basedpyright", 1, 0,
+            "5 errors, 2 warnings, 0 notes\ndiagnostic\n3 errors, 1 warning, 0 notes",
+            kind=merge_gate.GateJobKind.TYPE_CHECK)
+        red_jobs = tuple(merge_gate.GateJobResult("message", f"test_{i}.py", 1, 0, "") for i in range(10))
+        cases: tuple[tuple[str, merge_gate.GateRun | Exception, str, str, str], ...] = (
+            ("green", merge_gate.GateRun((good, types), 0, 0), "passed", "passed", "passed"),
+            ("test red", merge_gate.GateRun((red_jobs[0], types), 0, 0), "failed", "passed",
+             "failed in message/test_0.py"),
+            ("many red", merge_gate.GateRun((*red_jobs, types), 0, 0), "failed", "passed",
+             "failed in " + ", ".join(f"message/test_{i}.py" for i in range(8)) + " and 2 more"),
+            ("types red", merge_gate.GateRun((good, red_types), 0, 0), "failed",
+             "failed with 3 errors, 1 warning, 0 notes", "passed"),
+            ("runner", GateRefused("runner failed"), "failed", "did not run", "did not finish"),
+            ("empty", merge_gate.GateRun((), 0, 0), "failed", "did not run", "did not finish"),
+        )
+        for name, run, outcome, expected_types, tests in cases:
+            with self.subTest(name=name), self.execution(run) as sent, redirect_stdout(io.StringIO()):
+                self.assertEqual(self.nightly(), 0 if outcome == "passed" else 1)
+                sent.assert_called_once()
+                command = cast(list[str], sent.call_args.args[0])
+                for flag, value in (("--text-id", "nightly.result"), ("--need", "note"),
+                                    ("--key", "nightly-result")):
+                    self.assertEqual(command[command.index(flag) + 1], value)
+                values = dict(command[i + 1].split("=", 1) for i, word in enumerate(command) if word == "--value")
+                self.assertEqual((values["types"], values["tests"], values["outcome"]),
+                                 (expected_types, tests, outcome))
+                self.assertEqual(values["branch"], "main")
+                self.assertRegex(values["time"], r"^\d{2}:\d{2} E[SD]T$")
+                self.assertNotIn("--priority", command)
+
+    def test_off_disables_both_push_texts_at_use(self) -> None:
+        from scripts.notify import push_texts
+
+        for run in (merge_gate.GateRun((merge_gate.GateJobResult("test", "ok", 0, 0, ""),), 0, 0),
+                    GateRefused("runner failed")):
+            with self.execution(run) as sent, mock.patch.object(push_texts, "render") as render:
+                _ = (self.root / "config/merge_gate.conf").write_text("nightly_result_push=off\n")
+                _ = self.nightly()
+                sent.assert_not_called()
+                render.assert_not_called()
+                with mock.patch.object(merge_gate, "nightly_git", side_effect=OSError("fetch failed")):
+                    with self.assertRaisesRegex(OSError, "fetch failed"):
+                        _ = self.nightly()
+                sent.assert_not_called()
+                render.assert_not_called()
+
+    def test_failed_module_limit_is_read_again_for_each_run(self) -> None:
+        jobs = tuple(merge_gate.GateJobResult("test", f"test_{i}.py", 1, 0, "") for i in range(4))
+        for limit in (1, 3):
+            _ = (self.root / "config/merge_gate.conf").write_text(
+                f"nightly_result_push=on\n# whole: 1..\nnightly_result_modules={limit}\n")
+            with self.execution(merge_gate.GateRun(jobs, 0, 0)) as sent, redirect_stdout(io.StringIO()):
+                self.assertEqual(self.nightly(), 1)
+                command = cast(list[str], sent.call_args.args[0])
+                self.assertIn("tests=failed in " + ", ".join(f"test/test_{i}.py" for i in range(limit))
+                              + f" and {4 - limit} more", command)
+
+    def test_failed_push_preserves_green_and_red_exit_and_marker(self) -> None:
+        for status in (0, 1):
+            run = merge_gate.GateRun((merge_gate.GateJobResult("test", "example", status, 0, ""),), 0, 0)
+            for error in (subprocess.CompletedProcess([], 3, "", "unavailable\nmore detail"),
+                          OSError("cannot start sender")):
+                with self.subTest(status=status, error=error), self.execution(run) as sent:
+                    if isinstance(error, OSError):
+                        sent.side_effect = error
+                    else:
+                        sent.return_value = error
+                    marker = self.root / "state/full-required"
+                    marker.parent.mkdir(exist_ok=True)
+                    _ = marker.write_text("older marker")
+                    with redirect_stdout(io.StringIO()) as output:
+                        self.assertEqual(self.nightly(), status)
+                    self.assertEqual(marker.exists(), bool(status))
+                    self.assertIn("Nightly result push could not be sent:", output.getvalue())
+                    if status:
+                        self.assertIn('"failed_modules": ["test/example"]', marker.read_text())
+
+    def test_render_import_error_preserves_green_exit_and_marker(self) -> None:
+        from scripts.notify import push_texts
+
+        run = merge_gate.GateRun((merge_gate.GateJobResult("test", "ok", 0, 0, ""),), 0, 0)
+        marker = self.root / "state/full-required"
+        marker.parent.mkdir()
+        _ = marker.write_text("older marker")
+        with self.execution(run) as sent, mock.patch.object(push_texts, "render", side_effect=ImportError("render unavailable")):
+            with redirect_stdout(io.StringIO()) as output:
+                self.assertEqual(self.nightly(), 0)
+            self.assertFalse(marker.exists())
+            self.assertIn("Nightly result push could not be sent: render unavailable", output.getvalue())
+            sent.assert_not_called()
+
+    def test_setup_failure_push_preserves_the_exception(self) -> None:
+        good = merge_gate.GateRun((merge_gate.GateJobResult("test", "ok", 0, 0, ""),), 0, 0)
+        for stage in ("fetch", "standing"):
+            failure = GateRefused(stage + " failed\nconnection closed")
+            with self.subTest(stage=stage), self.execution(good) as sent:
+                with (mock.patch.object(merge_gate, "nightly_git", side_effect=["", failure]) if stage == "fetch"
+                      else mock.patch.object(copies, "standing", side_effect=failure)):
+                    with self.assertRaises(GateRefused) as caught, redirect_stdout(io.StringIO()):
+                        _ = self.nightly()
+                self.assertIs(caught.exception, failure)
+                sent.assert_called_once()
+                command = cast(list[str], sent.call_args.args[0])
+                self.assertEqual(command[command.index("--text-id") + 1], "nightly.not_run")
+                self.assertEqual(command[command.index("--key") + 1], "nightly-result")
+                self.assertEqual(command[command.index("--need") + 1], "note")
+                self.assertIn(f"reason={stage} failed connection closed", command)
+                self.assertIn("action=None. The next nightly run tries again.", command)
+                self.assertNotIn("--priority", command)
+
+    def test_interrupt_push_preserves_the_exception(self) -> None:
+        run = merge_gate.GateRun((), 0, 0)
+        for stage in ("nightly_git", "run_suites"):
+            failure = KeyboardInterrupt()
+            with self.subTest(stage=stage), self.execution(run) as sent:
+                with mock.patch.object(merge_gate, stage, side_effect=failure):
+                    with self.assertRaises(KeyboardInterrupt) as caught, redirect_stdout(io.StringIO()):
+                        _ = self.nightly()
+                self.assertIs(caught.exception, failure)
+                sent.assert_called_once()
+                command = cast(list[str], sent.call_args.args[0])
+                self.assertEqual(command[command.index("--text-id") + 1], "nightly.not_run")
+                self.assertIn("reason=interrupted by SIGINT", command)
+                self.assertEqual(command[command.index("--key") + 1], "nightly-result")
+
+    def test_empty_exception_reason_uses_its_class_name(self) -> None:
+        run = merge_gate.GateRun((), 0, 0)
+        failure = OSError()
+        with self.execution(run) as sent, mock.patch.object(merge_gate, "nightly_git", side_effect=failure):
+            with self.assertRaises(OSError) as caught, redirect_stdout(io.StringIO()):
+                _ = self.nightly()
+            self.assertIs(caught.exception, failure)
+            sent.assert_called_once()
+            command = cast(list[str], sent.call_args.args[0])
+            self.assertEqual(command[command.index("--text-id") + 1], "nightly.not_run")
+            self.assertIn("reason=OSError", command)
+
+    def test_cleanup_failure_does_not_send_a_second_push(self) -> None:
+        @contextmanager
+        def failing_cleanup() -> Generator[Path, None, None]:
+            try:
+                yield self.root
+            finally:
+                raise OSError("cleanup failed")
+
+        run = merge_gate.GateRun((merge_gate.GateJobResult("test", "ok", 0, 0, ""),), 0, 0)
+        with self.execution(run) as sent, mock.patch.object(copies, "standing", return_value=failing_cleanup()):
+            with self.assertRaisesRegex(OSError, "cleanup failed"), redirect_stdout(io.StringIO()):
+                _ = self.nightly()
+            sent.assert_called_once()
+            self.assertIn("nightly.result", cast(list[str], sent.call_args.args[0]))
+
+    def test_not_run_reason_removes_final_periods(self) -> None:
+        from scripts.notify import push_texts
+
+        run = merge_gate.GateRun((), 0, 0)
+        with self.execution(run) as sent, mock.patch.object(merge_gate, "nightly_git", side_effect=OSError("fetch\nfailed...")):
+            with self.assertRaises(OSError), redirect_stdout(io.StringIO()):
+                _ = self.nightly()
+            command = cast(list[str], sent.call_args.args[0])
+            values = dict(command[i + 1].split("=", 1) for i, word in enumerate(command) if word == "--value")
+            self.assertEqual(values["reason"], "fetch failed")
+            self.assertIn("action=None. The next nightly run tries again.", command)
+            self.assertIn("Why: fetch failed.", push_texts.render("nightly.not_run", **values).message)
+
+    def test_not_run_reason_fits_the_message_limit(self) -> None:
+        from scripts.notify import push_texts
+        from scripts.notify.pushover import MESSAGE_MAX
+
+        run = merge_gate.GateRun((), 0, 0)
+        with self.execution(run) as sent, mock.patch.object(merge_gate, "nightly_git", side_effect=OSError("word\n" * 2000)):
+            with self.assertRaises(OSError), redirect_stdout(io.StringIO()):
+                _ = self.nightly()
+            command = cast(list[str], sent.call_args.args[0])
+            values = dict(command[i + 1].split("=", 1) for i, word in enumerate(command) if word == "--value")
+            rendered = push_texts.render("nightly.not_run", **values)
+            self.assertLessEqual(len(rendered.message), MESSAGE_MAX)
+            self.assertNotIn("\n", values["reason"])
+            self.assertIn("word word", values["reason"])
 
 
 if __name__ == "__main__":

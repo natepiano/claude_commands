@@ -1,6 +1,10 @@
 """Capture a step's tree key and target folder without loading the writer."""
 
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import os
 import sys
@@ -10,9 +14,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, cast
 
 if TYPE_CHECKING:
-    from scripts.lib.cargo_output import CargoOutputRoots, CargoOutputUnavailable
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+    from scripts.lib.cargo_output import CargoOutputRoots, CargoOutputUnavailable, cargo_metadata_output_roots, read_cargo_output_roots
 
 from scripts.buildlog import parse
 

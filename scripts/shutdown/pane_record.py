@@ -17,6 +17,10 @@ Environment readers retain only the names below.
 """
 
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import argparse
 import json
@@ -31,18 +35,12 @@ from typing import TYPE_CHECKING, Literal, cast
 if TYPE_CHECKING:
     from scripts.production import staff
 
-SCRIPTS = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(SCRIPTS / "herdr"))
-sys.path.insert(0, str(SCRIPTS / "lib"))
-sys.path.insert(0, str(SCRIPTS / "whoami"))
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-import herdr  # noqa: E402
-import pane_launch
+from scripts.herdr import herdr, pane_launch  # noqa: E402
 from scripts.lib import legacy_identity
-import sessions
-from pane_launch import PaneLaunch as PaneLaunch
-from pane_launch import (
+from scripts.message import sessions
+from scripts.herdr.pane_launch import PaneLaunch as PaneLaunch
+from scripts.herdr.pane_launch import (
     CLAUDE_VALUE_FLAGS as CLAUDE_VALUE_FLAGS,
     KEPT_NAMES as KEPT_NAMES,
     MODEL_FLAGS as MODEL_FLAGS,

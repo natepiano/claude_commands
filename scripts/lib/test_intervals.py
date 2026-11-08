@@ -1,10 +1,7 @@
 """Test merged time spans and their combined duration."""
 
-from pathlib import Path
-import sys
 import unittest
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.lib.intervals import merged_spans, union_seconds
 
 

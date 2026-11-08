@@ -28,8 +28,11 @@ from scripts.build_hold import build_hold
 from scripts.direct.recorder_fixture import invoke_recorder, record_wait_workers
 from scripts.production.staff_test_support import fixture_runtime_id
 from scripts.direct.verify_mac_offload_test_support import VerifyMacOffloadFixture, CallRecord, CARGO_STUB, wait_for_marker_exit
-from scripts.direct.local_release_wait import LocalReleaseEvents, local_release_waiter
+from scripts.direct.local_release_wait import RELEASE_CHANGES, LocalReleaseEvents, local_release_waiter
+from scripts.lib import inotify
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.lib.atomic_file import write_text_atomic
+from scripts.lib.shell_test_support import shell_functions
 
 
 VERIFY = Path(__file__).with_name("verify.sh")
@@ -99,7 +102,7 @@ def release_registered_call(path: Path) -> Generator[None, None, None]:
 
     def release() -> None:
         try:
-            with local_release_waiter(root, root) as events:
+            with local_release_waiter(root, root, RELEASE_CHANGES | inotify.IN_MODIFY) as events:
                 deadline = time.monotonic() + TEST_HANG_GUARD_SECS
                 while True:
                     # Watch all existing descendants before checking; watching
@@ -108,7 +111,10 @@ def release_registered_call(path: Path) -> Generator[None, None, None]:
                     if isinstance(events, LocalReleaseEvents):
                         for directory in root.rglob("*"):
                             if directory.is_dir() and not directory.is_symlink():
-                                _ = events.add_watch(events.descriptor, os.fsencode(directory), 0x00000FCA)
+                                try:
+                                    _ = inotify.add_watch(events.descriptor, directory, events.mask)
+                                except FileNotFoundError:
+                                    continue
                     if stop.is_set():
                         return
                     if path.exists() and any(root.glob("**/verify-hold.*/waiter")):
@@ -174,9 +180,13 @@ class VerifyHoldTools(VerifyMacOffloadFixture):
             if entry.name != "py":
                 (library / entry.name).symlink_to(entry, target_is_directory=entry.is_dir())
         builder.write_executable(library / "py", '#!/bin/sh\nexec "${CLAUDE_PYTHON:-$TEST_REAL_PYTHON}" "$@"\n')
+        (builder.root / "unit").mkdir()
         cls.fixture_environment = {
             **builder.environment,
             "IN_NIX_SHELL": "pure",
+            "ROSTER_RUN_ROOT": str(builder.root / "unit"),
+            "UNIT_RUN_ROOT": str(builder.root / "unit"),
+            "SCRATCH_ROOT": str(builder.root / "scratch"),
         }
         _ = shutil.copytree(cls.fixture_root, cls.fixture_seed, symlinks=True)
         shutil.rmtree(cls.fixture_root)
@@ -247,6 +257,37 @@ class VerifyHoldWaitFixture(unittest.TestCase):
             "BUILDLOG_HOLD_WAIT_FILE": "",
             "BUILDLOG_HOLD_WAITER_FILE": "",
         })
+
+    def run_unblocked_step(self, command: str) -> subprocess.CompletedProcess[str]:
+        """Call the real hold checks, command launcher, and call recorder."""
+        script = self.fixture.root / "unblocked-step.sh"
+        _ = script.write_text('set -eo pipefail\nsource "$1"\n'
+            + 'eval "$(declare -f build_hold_wait_local | sed \'1s/build_hold_wait_local/build_hold_wait_local_only/\')"\n'
+            + shell_functions(VERIFY, "publish_step_state", "step_state", "phase_wait_start", "phase_wait_finish",
+                              "build_hold_wait_local", "collect_routing_wait", "collect_hold_wait", "note_event")
+            + '''
+PY=$CLAUDE_PYTHON
+CMD=$2 ARGS=(sample) CALL_NOTED=0 CACHE_DIR=""
+STEP_RECORD_ACTIVE=0 PHASE_WAIT_SESSION="" ROUTING_WAIT_STARTED=""
+TOKEN_HELD=0 TEST_BUILD_INPUTS_READY=0
+HOLD_WAIT_DIR=$TEST_HOLD_DIRECTORY
+mkdir -p "$HOLD_WAIT_DIR"
+export BUILDLOG_CALL_ID="direct-hold-$$" BUILDLOG_CALLER=verify BUILDLOG_SYNC=1
+export BUILDLOG_HOLD_WAIT_FILE="$HOLD_WAIT_DIR/seconds" BUILDLOG_HOLD_WAIT_S=0
+BUILDLOG_MAC="" BUILDLOG_MAC_HOLDER="" BUILDLOG_MAC_REASON="" BUILDLOG_MAC_S=""
+BUILDLOG_MAC_COPY="" BUILDLOG_MAC_COPY_S="" BUILDLOG_MAC_COPY_COUNT="" BUILDLOG_MAC_COPY_NATEDEV_S=""
+status=0
+if [[ "$CMD" == check ]]; then
+    run_once cargo check || status=$?
+else
+    run_once cargo nextest run || status=$?
+fi
+note_event ran 0 0 0 0 "$status"
+exit "$status"
+''')
+        return subprocess.run(["bash", str(script), str(INVOKE), command], cwd=self.fixture.root,
+            env={**self.fixture.environment, "TEST_HOLD_DIRECTORY": str(self.fixture.root / "direct-hold")},
+            capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS)
 
     def hold(self, key: str = "hana") -> None:
         holders = Path(self.fixture.environment["BUILD_HOLD_DIR"])
@@ -341,7 +382,7 @@ class VerifyHoldWaitFixture(unittest.TestCase):
         output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
         return process.returncode, self.wait_output.pop(process.pid, "") + output + self.wait_diagnostics.pop(process.pid, "") + errors
 
-    def set_hold_routing(self, runs_on: Literal["natedev_only", "mac_allowed"]) -> None:
+    def set_hold_routing(self, runs_on: Literal["natedev_only", "any_target"]) -> None:
         targets = self.fixture.root / "hold-targets.py"
         _ = targets.write_text(f'''import os
 import runpy
@@ -350,9 +391,9 @@ import tempfile
 
 if sys.argv[1] == "eligible":
     print({runs_on!r} + (" fixture local wait" if {runs_on!r} == "natedev_only" else ""))
-    print("natedev\\teligible\\t-\\t-")
-    if {runs_on!r} == "mac_allowed":
-        print("mac\\teligible\\t-\\t" + os.environ["MAC_TEST_CONFIG"])
+    print("natedev\\teligible\\t-\\t-\\t-")
+    if {runs_on!r} == "any_target":
+        print("mac\\teligible\\t-\\t" + os.environ["MAC_TEST_CONFIG"] + "\\tmacos")
 else:
     sys.path.insert(0, {str(TARGETS.parent)!r})
     runpy.run_path({str(TARGETS)!r}, run_name="__main__")
@@ -362,6 +403,7 @@ else:
     def record_phase(self) -> Path:
         session = self.fixture.root / "unit-run"
         record_wait_workers(self.fixture.root, session, self.fixture.environment, {"fixture-impl": "thread-impl"})
+        write_text_atomic(session / "worker_transport", "mesh\n")
         self.fixture.environment.update({"UNIT_RUN_DIR": str(session), "UNIT_PHASE_ID": "closed-server-phase",
                                          "UNIT_TEAM_ROLE": "impl", "CODEX_THREAD_ID": fixture_runtime_id("thread-impl"),
                                          "UNIT_PASS_OWNER": "launcher",

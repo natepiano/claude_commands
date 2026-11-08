@@ -10,7 +10,6 @@ import re
 import signal
 import socket
 import subprocess
-import sys
 import tempfile
 import time
 import unittest
@@ -22,14 +21,13 @@ from typing import TypedDict, cast, override
 from unittest import mock
 from zoneinfo import ZoneInfo
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from scripts.build_hold import build_hold
 from scripts.build_hold import hold_enforcer
-import unit_runs
-from sessions import SessionRecord
+from scripts.lib import unit_runs
+from scripts.message.sessions import SessionRecord
 
-from build_hold_test_support import (
+from scripts.build_hold.build_hold_test_support import (
     IsolatedBuildHoldTest as IsolatedBuildHoldTest,
     HoldEventRecord, SCRIPT, invoke_hold, recorded_hold_events, write_holder,
 )
@@ -489,7 +487,7 @@ class TargetCommandTests(PrivateReleaseBroadcastTest):
         def command(argv: list[str], **options: object) -> subprocess.CompletedProcess[str]:
             if argv[:1] == ["git"]:
                 return run(argv, capture_output=True, text=True, check=False, timeout=test_hang_guard.TEST_HANG_GUARD_SECS)
-            self.assertEqual(argv[:2], [sys.executable, str(expected_script)])
+            self.assertEqual(argv[:2], [str(SCRIPT.resolve().parents[1] / "lib/py"), str(expected_script)])
             self.assertTrue(options.get("capture_output"))
             self.assertTrue(options.get("text"))
             calls.append(argv[2:])
@@ -2325,7 +2323,7 @@ class BuildAuditTests(IsolatedBuildHoldTest):
                     "VERIFY_PROC_ROOT": str(self.proc), "VERIFY_STEPS_DIR": str(self.scratch / "steps"),
                 }):
                     step_record.write(step_record.StepRecord(
-                        "kept-step", 90, "900", self.scratch, "test", None,
+                        "kept-step", 90, "900", self.scratch, "test", step_record.WorkspacePackages(),
                         step_record.NatedevOnly("fixture"), step_record.StepState.ON_NATEDEV,
                         "2026-10-28T12:00:00+00:00",
                     ))

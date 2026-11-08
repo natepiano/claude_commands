@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
-from contextlib import redirect_stderr, redirect_stdout
+from contextlib import chdir, redirect_stderr, redirect_stdout
 import io
 import json
 import os
@@ -11,33 +11,20 @@ import re
 import shutil
 import subprocess
 import sys
-from typing import TYPE_CHECKING, cast, override
-from unittest.mock import Mock, patch
+from typing import cast, override
+from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
 ROOT = Path(__file__).resolve().parents[2]
-for dependency in ("lib", "herdr", "production", "message", "shutdown", "notify", "whoami", "direct"):
-    sys.path.insert(0, str(ROOT / "scripts" / dependency))
-sys.path.insert(0, str(ROOT))
-if TYPE_CHECKING:
-    from scripts.herdr import herdr, herdr_sessions, pane_launch
-    from scripts.production import add_unit, add_showrunner
-    from scripts.shutdown import pane_restore, pane_record
-    from scripts.notify import review
-    from scripts.notify.user_action import NoActionRequired
-else:
-    import herdr
-    import add_unit
-    import add_showrunner
-    import pane_restore
-    import pane_record
-    import herdr_sessions
-    import pane_launch
-    from scripts.notify import review
-    from scripts.notify.user_action import NoActionRequired
+from scripts.herdr import herdr, herdr_sessions
+from scripts.production import add_unit, add_showrunner
+from scripts.notify import review
+from scripts.notify.user_action import NoActionRequired
 from scripts.direct.assign_launcher_test_support import backend_fixture_command
+from scripts.direct import test_claude_worker
 from scripts.accounts import accounts
 from scripts.lib import nix_env
+from scripts.lib.test_models_registry import write_registry
 from scripts.production import staff
 from scripts.production.production_doc import Production
 from scripts.production.staff_test_support import isolated_staff_file, unit_membership
@@ -47,12 +34,31 @@ from scripts.whoami import account
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
+class AgentExecEnvironmentTests(NixFixture):
+    def test_exec_removes_operation_configuration_after_the_worktree_environment_load(self) -> None:
+        _ = self.envrc(self.work)
+        restored = {"KEEP": "loaded", "IN_NIX_SHELL": "impure",
+                    "MODELS_LAUNCH_CONFIGURATION": "stale launch", "MODELS_REGISTRY_EDIT_BASE": "stale editor"}
+        with (chdir(self.work), patch.dict(os.environ, {"DIRENV_DIFF": json.dumps(restored)}),
+              patch.object(os, "execvpe", side_effect=SystemExit(0)) as execute):
+            with self.assertRaises(SystemExit):
+                _ = nix_env.main(["exec", sys.executable, "--version"])
+        execute.assert_called_once()
+        self.assertEqual(execute.call_args.args[:2], (sys.executable, [sys.executable, "--version"]))
+        environment = cast(dict[str, str], execute.call_args.args[2])
+        self.assertEqual(environment["KEEP"], "loaded")
+        self.assertEqual(environment["NIX_ENV_ENVRC"], str(self.work / ".envrc"))
+        self.assertNotIn("MODELS_LAUNCH_CONFIGURATION", environment)
+        self.assertNotIn("MODELS_REGISTRY_EDIT_BASE", environment)
+
+
 class HerdrLaunchTests(NixFixture):
     @override
     def setUp(self) -> None:
         super().setUp()
         _ = self.enterContext(patch.object(herdr, "shared_session", return_value="fixture-server"))
         _ = self.enterContext(patch.object(herdr, "start_server"))
+        _ = self.enterContext(patch.object(herdr.Herdr, "run_in_pane"))
         _ = self.enterContext(patch.object(os, "execvp", side_effect=AssertionError("unexpected fixture attach")))
         _ = self.enterContext(patch.object(account, "named_account_environment", return_value={"CLAUDE_CONFIG_DIR": str(self.home / ".claude3")}))
 
@@ -205,20 +211,6 @@ class HerdrLaunchTests(NixFixture):
             self.assertEqual(Path(cast(str | Path, ensure.call_args.args[0])), self.work)
             self.assertEqual(cast(dict[str, str], opened.call_args.args[4])["NIX_LDFLAGS"], "-Lloaded")
 
-    def test_pane_restore_refusal_preserves_the_old_pane(self) -> None:
-        client = Mock()
-        client.configure_mock(**{"pane_activity.return_value": herdr.PaneAtShell(),
-                                 "close_tab_confirmed.return_value": False})
-        entry = pane_record.launch("pane", "sid", str(self.work), {"CLAUDE_CONFIG_DIR": str(self.home / ".claude3")},
-                                   ["claude", "-n", "worker"])
-        invoke = cast(Callable[..., object], getattr(pane_restore, "_resume"))
-        with (patch.object(pane_restore, "named_account_environment", return_value={}),
-              patch.object(pane_launch, "resume_attempt",
-                           side_effect=herdr.HerdrFailure("fixture publication is unavailable")),
-              self.assertRaisesRegex(herdr.HerdrFailure, "fixture publication is unavailable")):
-            _ = self.continued(lambda: invoke("host", client, herdr.TabSession("pane", "worker", "space", "sid"), entry))
-        cast(Mock, client.close_tab_of).assert_not_called()
-
     def test_herdr_sessions_refusal_prints_one_line_and_opens_nothing(self) -> None:
         reason = "nix_env: fixture: missing shell"
         output = io.StringIO()
@@ -252,21 +244,21 @@ class ShellLaunchTests(NixFixture):
         self.scripts = self.home / ".claude/scripts"
         _ = shutil.copytree(ROOT / "scripts/lib", self.scripts / "lib", dirs_exist_ok=True,
                             ignore=shutil.ignore_patterns("__pycache__", "test_*"))
-        for relative in ("agents/agent_exec.sh", "agents/agent_bg.sh", "agents/worker_lifecycle.py", "cli_agent/cli_agent.sh", "berth_fix/launch.sh", "make_a_worktree/direnv_allow.sh"):
+        for relative in ("agents/agent_exec.sh", "agents/worker_lifecycle.py", "cli_agent/cli_agent.sh", "berth_fix/launch.sh", "make_a_worktree/direnv_allow.sh"):
             destination = self.scripts / relative
             destination.parent.mkdir(parents=True, exist_ok=True)
-            if relative in ("agents/agent_bg.sh", "agents/agent_exec.sh"):
+            if relative == "agents/agent_exec.sh":
                 destination.symlink_to(ROOT / "scripts" / relative)
             else:
                 _ = shutil.copyfile(ROOT / "scripts" / relative, destination)
         (self.scripts / "direct").symlink_to(ROOT / "scripts/direct", target_is_directory=True)
-        py = self.scripts / "lib/py"
-        _ = py.write_text('#!/bin/sh\nexec ' + sys.executable + ' "$@"\n')
-        py.chmod(0o755)
         _ = (self.scripts / "agents/claude_account.sh").write_text('claude_launch_environment() { return 0; }\n')
-        _ = (self.scripts / "agents/models_config.sh").write_text('''agents_resolve() { AGENT_FAMILY=claude; }
-agents_claude_args() { echo '--model fixture'; }
-''')
+        _ = (self.scripts / "agents/models_config.sh").write_text(
+            (ROOT / "scripts/agents/models_config.sh").read_text()
+            + "\nagents_resolve() { AGENT_FAMILY=claude; }\n"
+            + "agents_claude_args() { echo '--model fixture'; }\n")
+        registry = write_registry(self.root / "models.conf")
+        self.env.update(MODELS_CONFIG_FILE=str(registry), MODELS_CONFIG_PUBLISH="0", MODELS_CONFIG_TIER_ONLY="1")
         self.started = self.root / "started.jsonl"
         self.script(self.bin / "claude", '''import json, os, sys
 from pathlib import Path
@@ -282,7 +274,10 @@ print('{"type":"result","result":"fixture completed"}')
 
     def run_script(self, relative: str, args: list[str], directory: Path) -> subprocess.CompletedProcess[str]:
         command, environment = ["bash", str(self.scripts / relative), *args], self.env
-        if relative in ("agents/agent_bg.sh", "agents/agent_exec.sh"):
+        if relative == "direct/claude_worker.py":
+            run, name, cwd, prompt, summary, log = args
+            command = test_claude_worker.worker_command(name, Path(run), Path(cwd), Path(prompt), Path(summary), Path(log))
+        if relative == "agents/agent_exec.sh":
             command, environment = backend_fixture_command(self.root / "assign-parent", command, environment)
         return subprocess.run(command, cwd=directory, env=environment, capture_output=True, text=True,
                               timeout=TEST_HANG_GUARD_SECS, check=False)
@@ -314,13 +309,15 @@ print('{"type":"result","result":"fixture completed"}')
     def test_cli_agent(self) -> None:
         self.launch_contract("cli_agent/cli_agent.sh", [], self.work)
 
-    def test_agent_bg(self) -> None:
+    def test_claude_worker(self) -> None:
+        _ = (self.home / ".claude.json").write_text(json.dumps({
+            "oauthAccount": {"emailAddress": "fixture@example.invalid"}}))
         (self.scripts / "production").symlink_to(ROOT / "scripts/production", target_is_directory=True)
+        self.env["CLAUDE_CONFIG_DIR"] = ""
         with isolated_staff_file(self.root / "staff.json", self.env):
             owner = unit_membership("child", "unit")
             self.env["CODEX_THREAD_ID"] = owner.id
-            self.env["AGENT_BG_ROLE"] = "impl"
-            self.launch_contract("agents/agent_bg.sh", ["--run", str(self.root / "run"), "fixture", str(self.work), str(self.root / "prompt"),
+            self.launch_contract("direct/claude_worker.py", [str(self.root / "run"), "fixture", str(self.work), str(self.root / "prompt"),
                 str(self.root / "result"), str(self.root / "launch.log")], self.work)
         rows = [cast(dict[str, object], json.loads(line)) for line in self.started.read_text().splitlines()]
         arguments = cast(list[str], rows[0]["args"])

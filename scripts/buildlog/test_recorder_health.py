@@ -15,8 +15,7 @@ from pathlib import Path
 from typing import cast, override
 from unittest import mock
 
-from scripts.buildlog import health
-from scripts.buildlog import launches
+from scripts.buildlog import health, launches
 from scripts.buildlog import record
 from scripts.buildlog import report
 from scripts.buildlog import store

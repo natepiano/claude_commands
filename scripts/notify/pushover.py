@@ -34,6 +34,10 @@ usage, or keys missing; 4 an existing claim is busy, 5 replaced, 6 not sent afte
 """
 
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import hashlib
 import json
@@ -48,8 +52,6 @@ from datetime import datetime
 from pathlib import Path
 from typing import NotRequired, TypedDict, cast
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-
 from scripts.notify import review
 from scripts.notify import push_texts
 from scripts.notify import push_reference
@@ -59,9 +61,8 @@ from scripts.notify.user_action import (FIX, REFUSED_BEFORE_SENDING, ActionAllow
                          ActionUnstated, UserAction, first_line, parse_user_action, refused_at,
                          NotificationSession, NO_SESSION_LINE, split_session, session_prefix)
 
-API_HOST = "api.pushover.net"
-API_URL = f"https://{API_HOST}/1/messages.json"
-CANCEL_URL = f"https://{API_HOST}/1/receipts/cancel_by_tag/{{tag}}.json"
+API_URL = "https://api.pushover.net/1/messages.json"
+CANCEL_URL = "https://api.pushover.net/1/receipts/cancel_by_tag/{tag}.json"
 KEYS_FILE = Path.home() / ".config" / "pushover" / "env"
 LOG_FILE = Path.home() / ".local" / "state" / "notify" / "pushover.jsonl"
 PRIORITIES = ("0", "1", "2")

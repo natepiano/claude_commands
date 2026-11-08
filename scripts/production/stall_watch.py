@@ -7,6 +7,10 @@ Retire the alert when the prompt ends. Staff ids identify files and alert keys.
 """
 
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import fcntl
 import hashlib
@@ -28,9 +32,6 @@ from typing import TYPE_CHECKING, NamedTuple, NotRequired, TypedDict, cast
 from zoneinfo import ZoneInfo
 from uuid import uuid4
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "shutdown"))
 
 from scripts.lib import conf as tunables
 from scripts.lib.atomic_file import write_text_atomic
@@ -38,18 +39,15 @@ from scripts.lib.process_failure import failure_detail
 from scripts.lib.process_group import send_process_group
 
 from scripts.production import showrunners, staff, session_staff
-import unit_lookup
-from session_pane import HerdrFailure, agent_status, read_place
+from scripts.production import unit_lookup
+from scripts.production.session_pane import HerdrFailure, agent_status, read_place
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "notify"))
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "message"))
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "hooks"))
-import context_usage  # noqa: E402
+from scripts.hooks import context_usage  # noqa: E402
 from scripts.notify import push_texts  # noqa: E402
-import rca  # noqa: E402
-import sessions  # noqa: E402
+from scripts.message import rca  # noqa: E402
+from scripts.message import sessions  # noqa: E402
 
-import herdr  # noqa: E402  session_pane puts scripts/herdr on the path
+from scripts.herdr import herdr  # noqa: E402
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Generator, Iterable, Iterator
@@ -68,7 +66,7 @@ TURN_END = re.compile(rf"^\s*(?:[●⏺]\s+)?(?P<status>(?:— )?(?P<kind>{'|'.j
 # not in the production's zone.
 HOLD_TIME = re.compile(r"\b(?:(?:(?P<year>\d{4})-)?(?P<month>\d{2})-(?P<day>\d{2})[ T])?"
                        + r"(?P<hour>\d{1,2}):(?P<minute>\d{2})\b(?:\s+(?P<utc>UTC|GMT)\b)?")
-WORK = {"zsh", "bash", "sh", "implement.sh", "review.sh", "verify.sh"}
+WORK = {"zsh", "bash", "sh", "review.sh", "verify.sh"}
 BLOCKED = herdr.AgentStatus.BLOCKED
 PROMPT_TEXT_ID = "stall_watch.permission_prompt"
 # The prompt alert's sender, which its retire names too.

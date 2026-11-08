@@ -24,6 +24,14 @@ def shutdown_state_root() -> Path:
 
 
 @dataclass(frozen=True)
+class NoRoleAccount:
+    """The recipient has no staff role that selects a Claude account."""
+
+
+NO_ROLE_ACCOUNT = NoRoleAccount()
+
+
+@dataclass(frozen=True)
 class Stopped:
     session_id: str
     pid: int
@@ -40,9 +48,19 @@ class StopFailed:
     reason: str
 
 
+@dataclass(frozen=True)
+class StopUnproved(StopFailed):
+    """The read cannot prove absence or identify one process to signal."""
+
+
 class ClaudeStartState(StrEnum):
     STARTED = "started"
     ALREADY_RUNNING = "already running"
+
+
+@dataclass(frozen=True)
+class UnknownProcessId:
+    """The resume result has no proved process id."""
 
 
 @dataclass(frozen=True)
@@ -53,6 +71,7 @@ class ClaudeUp:
     elapsed_seconds: float = field(default=0.0, compare=False)
     trust_copied_from: str = field(default="", compare=False)
     start_state: ClaudeStartState = field(default=ClaudeStartState.STARTED, compare=False)
+    pid: int | UnknownProcessId = field(default_factory=UnknownProcessId, compare=False)
 
 
 @dataclass(frozen=True)
@@ -85,10 +104,10 @@ MoveResult = ResumeResult | MoveHandedOff | StopFailed | ResumePending
 
 def claude_up_line(result: ClaudeUp) -> str:
     label = note_file.parse_account_label(result.account)
-    agent = "Codex" if isinstance(label, note_file.NumberedAccountLabel) and label.tool == "codex" else "Claude"
+    agent = f"{label.tool.capitalize()} " if isinstance(label, note_file.NumberedAccountLabel) else ""
     if result.start_state is ClaudeStartState.ALREADY_RUNNING:
-        return f"{result.session_id}: unchanged; {agent} runs on {result.account} in {result.pane_id}"
-    return (f"{result.session_id}: {agent} is up on {result.account} in {result.pane_id} "
+        return f"{result.session_id}: unchanged; {agent}runs on {result.account} in {result.pane_id}"
+    return (f"{result.session_id}: {agent + 'is ' if agent else ''}up on {result.account} in {result.pane_id} "
             + f"({result.elapsed_seconds:.1f} s)"
             + (f"; copied folder trust from {result.trust_copied_from}" if result.trust_copied_from else ""))
 

@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
 """Tests for fixture parsing and one isolated machine memory sample."""
 
 from __future__ import annotations
@@ -8,14 +8,12 @@ import os
 import re
 import socket
 import subprocess
-import sys
 import tempfile
 import unittest
 from datetime import datetime
 from pathlib import Path
 from typing import cast, override
 from unittest.mock import patch
-
 
 from scripts.buildlog import cli
 from scripts.buildlog import index
@@ -102,7 +100,7 @@ class SampleTests(unittest.TestCase):
             "assert 'scripts.lint.sweep' not in sys.modules, 'filesystem reading imported sweep'"
         )
         result = subprocess.run(
-            ["python3", "-c", command],
+            [str(CLI.parents[1] / "lib/py"), "-c", command],
             cwd=CLI.parents[2],
             env={**os.environ, "BUILDLOG_DIR": str(self.root), "BUILDLOG_TARGET_FILESYSTEM": str(self.root)},
             capture_output=True,
@@ -413,7 +411,7 @@ class SampleTests(unittest.TestCase):
             "sample.MEMINFO = Path(sys.argv[1]); sys.exit(cli.main(['sample']))"
         )
         result = subprocess.run(
-            [sys.executable, "-c", command, str(missing)],
+            [str(CLI.parents[1] / "lib/py"), "-c", command, str(missing)],
             env={**os.environ, "BUILDLOG_DIR": str(self.root)},
             capture_output=True,
             text=True,
@@ -468,8 +466,7 @@ class SampleTests(unittest.TestCase):
             "sys.exit(cli.main(['sample']))"
         )
         result = subprocess.run(
-            [str(Path(__file__).resolve().parents[2] / "scripts/lib/py"), "-c", command, str(proc)],
-            cwd=Path(__file__).resolve().parents[2],
+            [str(CLI.parents[1] / "lib/py"), "-c", command, str(proc)],
             env=environment,
             capture_output=True,
             text=True,

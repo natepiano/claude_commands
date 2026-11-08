@@ -4,19 +4,19 @@ The hook never stops the turn.
 """
 
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import json
 import os
 import sys
 from collections.abc import Mapping
-from pathlib import Path
 from typing import TypedDict, cast
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "herdr"))
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "message"))
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-import herdr  # noqa: E402
-import sessions  # noqa: E402
+from scripts.herdr import herdr  # noqa: E402
+from scripts.message import sessions  # noqa: E402
 from scripts.production import staff
 from scripts.shutdown import pane_record
 
@@ -79,7 +79,7 @@ def sync(payload: StopPayload, environment: Mapping[str, str]) -> bool:
     row = record.by_current_session(session_id)
     if row is not None:
         if row.kind == "unit" and name and name != row.name:
-            print(f"herdr title: {name!r} differs from unit {row.name!r}; use /showrunner:rename_unit.", file=sys.stderr)
+            print(f"herdr title: {name!r} differs from unit {row.name!r}; use /showrunner:rename.", file=sys.stderr)
         client = herdr.Herdr(shared)
         return client.retitle(pane, row.name, tab=row.kind != "worker")
     if _clear_handoff_pending(session_id, shared, pane, record):

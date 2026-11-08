@@ -6,27 +6,32 @@ import json
 import fcntl
 import math
 import os
+import shutil
+import sys
+import time
 import subprocess
 from copy import deepcopy
+from collections.abc import Generator, Mapping
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import redirect_stderr, redirect_stdout
+from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from typing import Literal, cast, final, override
 from unittest.mock import patch
+from weakref import finalize
 
 from scripts.production import staff, worker_admission
 from scripts.shutdown import restart
 from scripts.production.staff_test_support import StaffTestCase, fixture_member, fixture_runtime_id, fixture_session, fixture_worker
 from scripts.lib.atomic_file import write_text_atomic
-from scripts.lib import unit_runs
+from scripts.lib import process_start, unit_runs
+from scripts.message import sessions
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib.test_models_registry import write_registry
 from scripts.accounts import accounts
 from scripts.whoami import agent_accounts
-from scripts.herdr import worker_panes
-
-import herdr
-import pane_launch
+from scripts.herdr import herdr, pane_launch, worker_panes
+from scripts.direct import progress_history
 
 
 @final
@@ -34,17 +39,25 @@ class PaneWorld(herdr.Herdr):
     """A private pane server supplies process facts to the real shared scan."""
 
     def __init__(self) -> None:
-        super().__init__("agents")
+        with patch.dict(os.environ, {"HERDR_BIN": "/nonexistent/herdr"}):
+            super().__init__("agents")
+        self.process_directory = TemporaryDirectory(prefix="pane-world-proc-")
+        self.process_cleanup = finalize(self, self.process_directory.cleanup)
         self.locations: dict[str, dict[str, object]] = {}
         self.processes: dict[int, herdr.NativeAgentProcess] = {}
         self.foreground: dict[str, tuple[int, str, list[str]]] = {}
         self.shells: dict[str, int] = {}
         self.unknown: dict[str, str] = {}
         self.commands: list[tuple[str, ...]] = []
+        self.reads: list[tuple[str, ...]] = []
         self.process_reads: list[str] = []
         self.launches: list[herdr.ExistingPane | herdr.SplitPane] = []
+        self.launch_directories: list[Path] = []
         self.launch_timeouts: list[int] = []
+        self.agent_names: list[str] = []
         self.stops: list[str] = []
+        self.signals: list[tuple[int, int]] = []
+        self.stop_deadlines: list[float] = []
         self.closed: list[tuple[str, str]] = []
         self.requests: list[tuple[str, list[str], dict[str, str]]] = []
         self.outcome: herdr.PromptSubmissionNotRequired | herdr.PromptNotSubmitted = herdr.PromptSubmissionNotRequired()
@@ -52,9 +65,40 @@ class PaneWorld(herdr.Herdr):
         self.layouts: dict[str, dict[str, object]] = {}
         self.layout_changes: list[tuple[str, float]] = []
         self.unreadable = False
+        self.unreadable_environment: set[int] = set()
         self.first_turn_timeout = False
+        self.turn_end_status = herdr.AgentStatus.DONE
         self.report_reads_before_publish = 0
+        self.report_reads_at_wait: list[int] = []
         self.disappear_after_launch = False
+
+    def setup(self, test: StaffTestCase) -> None:
+        """Install shared accounts, configuration, and process facts."""
+        config = test.root / "conf"
+        config.mkdir()
+        write_text_atomic(config / "direct.conf", "WORKER_TRANSPORT=mesh\n# range: 0.1..0.9\nWORKER_SPLIT_RATIO=0.667\n"
+                          + "# whole: 1..\nUNIT_COMPACT_ABOVE_TOKENS=43000\n"
+                          + "WORKER_FIRST_TURN_TEXT=Reply with ready. Do not use tools.\n"
+                          + "# range: 1..600\nWORKER_FIRST_TURN_SECONDS=120\n"
+                          + "# range: 1..600\nPANE_AGENT_START_SECONDS=90\n")
+        write_text_atomic(config / "shutdown.conf", "# whole: 1..300\nSTOP_GRACE_SECONDS=2\n")
+        registry = write_registry(config / "models.conf")
+        _ = cast(object, test.enterContext(patch.dict(os.environ, {
+            "XDG_STATE_HOME": str(test.root / "state"), "CONF_DIR": str(config),
+            "MODELS_CONFIG_FILE": str(registry), "MODELS_CONFIG_PUBLISH": "0",
+            "HERDR_PROC": str(test.root / "proc"), "HERDR_PLATFORM": "linux",
+            "HERDR_PANE_RECORD_DIR": str(test.root / "pane-records"),
+            "CLAUDE_CONFIG_DIR": str(test.root / "claude"), "CODEX_HOME": str(test.root / "codex"),
+            "AGENTS_CALLER_FAMILY": "", "HERDR_BIN": "/nonexistent/herdr", "TMPDIR": str(test.root),
+            "UNIT_RUN_DIR": str(test.root / "run"), "ROSTER_RUN_ROOT": str(test.root),
+        })))
+        _ = test.enterContext(patch.object(herdr, "herdr_binary", return_value="/nonexistent/herdr"))
+        _ = test.enterContext(patch.object(herdr, "Herdr", return_value=self))
+        _ = test.enterContext(patch.object(herdr, "native_process", side_effect=self.native_process))
+        _ = test.enterContext(patch.object(herdr, "_startup_processes", side_effect=self.descendants))
+        _ = test.enterContext(patch.object(sessions, "process_start", side_effect=self.process_start))
+        _ = test.enterContext(patch.object(accounts, "role_account", return_value=accounts.CodexWorkersAccount("codex1", test.root / "codex")))
+        _ = test.enterContext(patch.object(accounts, "account_for_unscoped_launch", return_value=accounts.LegacyHomeLaunch()))
 
     def add(self, row: staff.StaffRow, pane: str, *, live: bool = True,
             family: Literal["claude", "codex"] = "claude", terminal: str = "",
@@ -116,8 +160,33 @@ class PaneWorld(herdr.Herdr):
     def activate(self, identity: str, pane: str, family: Literal["claude", "codex"]) -> None:
         pid = 998600 + len(self.processes)
         native = herdr.EnvironmentThread(identity) if family == "claude" else herdr.RolloutThread(identity)
-        self.processes[pid] = herdr.NativeAgentProcess(native, "fixture-generation", {})
+        environment = {"UNIT_RUN_DIR": run} if (run := os.environ.get("UNIT_RUN_DIR")) else {}
+        self.processes[pid] = herdr.NativeAgentProcess(native, "fixture-generation", environment)
         self.foreground[pane] = pid, family, [family, "--resume" if family == "claude" else "resume", identity]
+
+    @property
+    def process_root(self) -> Path:
+        """Use the configured process directory or this fixture's private directory."""
+        return Path(os.environ.get("HERDR_PROC", self.process_directory.name))
+
+    def process_start(self, pid: int) -> str | None:
+        """Read the process generation from the private stat file."""
+        if pid in self.processes:
+            with patch.dict(os.environ, {"VERIFY_PROC_ROOT": str(self.process_root)}):
+                observed = process_start.process_start(pid)
+        else:
+            observed = process_start.process_start(pid)
+        return observed.start if isinstance(observed, process_start.Started) else None
+
+    def signal(self, pid: int, number: int) -> None:
+        """Stop only an agent that belongs to this fixture."""
+        if pid not in self.processes:
+            raise AssertionError(f"signal target is outside the fixture: {pid}")
+        self.signals.append((pid, number))
+        for pane, (agent_pid, _, _) in tuple(self.foreground.items()):
+            if pid == agent_pid:
+                self.stops.append(self.processes[pid].identity.id)
+                del self.foreground[pane]
 
     def native_process(self, pid: int, kind: str, reported: str = "") -> herdr.NativeAgentProcess:
         if self.foreground and kind not in ("claude", "codex"):
@@ -143,9 +212,14 @@ class PaneWorld(herdr.Herdr):
         return herdr.PaneRunning((process[1],))
 
     @override
-    def native_pane_process(self, pane: str, kind: str, timeout: float) -> herdr.NativeAgentProcess:
-        del timeout
-        if self.report_reads_before_publish and self.locations[pane].get("agent_status") == "done":
+    def native_pane_process(self, pane: str, kind: str, timeout: float, *,
+                            pane_row: Mapping[str, object] | herdr.PaneNotRead = herdr.PANE_NOT_READ) -> herdr.NativeAgentProcess:
+        del timeout, pane_row
+        if pane in self.foreground and self.foreground[pane][0] in self.unreadable_environment:
+            raise herdr.HerdrFailure("process environment is unreadable")
+        if self.report_reads_before_publish and any(
+                command[:3] == ("agent", "prompt", pane) for command in self.commands):
+            self.locations[pane]["agent_status"] = self.turn_end_status.value
             self.report_reads_before_publish -= 1
             if self.report_reads_before_publish == 0:
                 process = self.processes[self.foreground[pane][0]]
@@ -158,11 +232,15 @@ class PaneWorld(herdr.Herdr):
     def launch(self, name: str, destination: herdr.NewTab | herdr.SplitPane | herdr.ExistingPane,
                prepared: herdr.PreparedAgentEnvironment, kind: str, agent_arguments: list[str],
                opening: herdr.OpeningPrompt | herdr.NoOpeningPrompt, timeout_ms: int, *, agent: str,
-               reported_unknown: str = "") -> herdr.AgentLaunched:
+               reported_unknown: str = "",
+               agent_name: str | herdr.AgentNameSource = herdr.AgentNameSource.MEMBER_REFERENCE) -> herdr.AgentLaunched:
         del name, opening, reported_unknown
         if isinstance(destination, herdr.NewTab):
             raise AssertionError("a worker must not create a tab")
+        server_name = agent_name if isinstance(agent_name, str) else agent
+        self.agent_names.append(server_name)
         self.launches.append(destination)
+        self.launch_directories.append(prepared.directory)
         self.launch_timeouts.append(timeout_ms)
         self.requests.append((kind, agent_arguments.copy(), prepared.env.copy()))
         if isinstance(destination, herdr.SplitPane):
@@ -181,15 +259,31 @@ class PaneWorld(herdr.Herdr):
             self.interrupt = ""
             raise OSError("interrupted after split")
         identity = next((agent_arguments[index + 1] for index, argument in enumerate(agent_arguments[:-1])
-                         if argument in ("--resume", "resume", "--session-id")), fixture_runtime_id("backend-" + agent))
+                         if argument in ("--resume", "resume", "--session-id")), fixture_runtime_id("backend-" + server_name))
         self.activate(identity, pane, cast(Literal["claude", "codex"], kind))
         pid, family, _ = self.foreground[pane]
+        self.processes[pid].environment.update(prepared.env)
+        process_root = self.process_root / str(pid)
+        process_root.mkdir(parents=True, exist_ok=True)
+        write_text_atomic(process_root / "stat", f"{pid} (fixture) S " + "0 " * 18 + "1\n")
         self.foreground[pane] = pid, family, [kind, *agent_arguments]
         if kind == "codex" and "resume" not in agent_arguments:
             process = self.processes[pid]
             self.processes[pid] = herdr.NativeAgentProcess(herdr.LaunchArgument(process.identity.id), process.started, process.environment)
         fixture_session(identity, staff.ClaudeBackend() if kind == "claude" else
                         staff.CodexBackend(Path(prepared.env["CODEX_HOME"])))
+        if kind == "codex":
+            source = Path(prepared.env["CODEX_HOME"]) / "sessions" / f"{identity}.jsonl"
+            if not source.read_text():
+                write_text_atomic(source, json.dumps({"type": "session_meta", "payload": {"id": identity}}) + "\n")
+            rollout = source.with_name(f"rollout-fixture-{identity}.jsonl")
+            rollout.unlink(missing_ok=True)
+            rollout.symlink_to(source)
+            descriptors = process_root / "fd"
+            descriptors.mkdir(exist_ok=True)
+            descriptor = descriptors / "3"
+            descriptor.unlink(missing_ok=True)
+            descriptor.symlink_to(rollout)
         if self.interrupt == "agent":
             self.interrupt = ""
             raise OSError("interrupted after agent start")
@@ -197,9 +291,10 @@ class PaneWorld(herdr.Herdr):
             del self.locations[pane]
         return herdr.AgentLaunched(pane, self.outcome)
 
-    def stop(self, row: staff.StaffRow, client: herdr.Herdr) -> bool:
+    def stop(self, row: staff.StaffRow, client: herdr.Herdr, *, deadline: float = math.inf) -> bool:
         if client is not self:
             raise AssertionError("stop uses another client")
+        self.stop_deadlines.append(deadline)
         self.stops.append(str(row.current_session))
         for pane, (pid, _, _) in tuple(self.foreground.items()):
             if self.processes[pid].current_identity == row.current_session:
@@ -228,6 +323,7 @@ class PaneWorld(herdr.Herdr):
 
     @override
     def result(self, *arguments: str, deadline: float = math.inf) -> dict[str, object]:
+        self.reads.append(arguments)
         del deadline
         if arguments[:2] == ("pane", "list"):
             if self.unreadable:
@@ -273,17 +369,32 @@ class PaneWorld(herdr.Herdr):
         return ""
 
     @override
-    def wait_until(self, pane: str, state: str, timeout_ms: int) -> herdr.ObservedAgentState | herdr.WaitTimedOut:
-        self.commands.append(("agent", "wait", pane, "--until", state, "--timeout", str(timeout_ms)))
-        if self.first_turn_timeout:
-            return herdr.WaitTimedOut()
-        self.locations[pane]["agent_status"] = "done"
-        return herdr.ObservedAgentState(herdr.AgentStatus.DONE)
+    def wait_turn_end(self, pane: str, timeout_ms: int) -> herdr.ObservedAgentState | herdr.WaitTimedOut:
+        def wait(arguments: list[str], timeout: float) -> subprocess.CompletedProcess[str]:
+            del timeout
+            command = tuple(arguments[3:])
+            self.commands.append(command)
+            self.report_reads_at_wait.append(self.report_reads_before_publish)
+            states = {command[index + 1] for index, argument in enumerate(command[:-1]) if argument == "--until"}
+            if self.first_turn_timeout or self.turn_end_status.value not in states:
+                return subprocess.CompletedProcess(arguments, 1,
+                    json.dumps({"error": {"code": "timeout", "message": "deadline"}}), "")
+            self.locations[pane]["agent_status"] = self.turn_end_status.value
+            return subprocess.CompletedProcess(arguments, 0,
+                json.dumps({"result": {"agent": {"agent_status": self.turn_end_status.value}}}), "")
+
+        with patch.object(herdr, "run_program", side_effect=wait):
+            return super().wait_turn_end(pane, timeout_ms)
 
 
 class WorkerPaneTests(StaffTestCase):
     world: PaneWorld = PaneWorld()
     parent_id: staff.StaffId = staff.StaffId("")
+
+    def test_fake_pane_server_does_not_need_herdr_on_path(self) -> None:
+        with patch.dict(os.environ, {"HERDR_BIN": ""}), patch.object(shutil, "which", return_value=None):
+            world = PaneWorld()
+        self.assertEqual(world.binary, "/nonexistent/herdr")
 
     @property
     def parent(self) -> staff.StaffRow:
@@ -297,30 +408,13 @@ class WorkerPaneTests(StaffTestCase):
         showrunner = fixture_member("showrunner", name="showrunner")
         self.parent_id = fixture_member("unit", name="unit", parent=showrunner.id,
                                         worktree=staff.PresentWorktree("natedev", self.root)).id
-        config = self.root / "conf"
-        config.mkdir()
-        write_text_atomic(config / "direct.conf", "WORKER_TRANSPORT=mesh\n# range: 0.1..0.9\nWORKER_SPLIT_RATIO=0.667\n"
-                          + "WORKER_FIRST_TURN_TEXT=Reply with ready. Do not use tools.\n"
-                          + "# range: 1..600\nWORKER_FIRST_TURN_SECONDS=120\n"
-                          + "# range: 1..600\nPANE_AGENT_START_SECONDS=90\n")
-        registry = write_registry(config / "models.conf")
-        _ = cast(object, self.enterContext(patch.dict(os.environ, {
-            "XDG_STATE_HOME": str(self.root / "state"), "CONF_DIR": str(config),
-            "MODELS_CONFIG_FILE": str(registry), "MODELS_CONFIG_PUBLISH": "0",
-            "HERDR_BIN": "/nonexistent/herdr", "TMPDIR": str(self.root),
-            "UNIT_RUN_DIR": str(self.root / "run"),
-        })))
         self.world = PaneWorld()
+        self.world.setup(self)
         self.world.add(self.parent, "w1:p0")
-        _ = self.enterContext(patch.object(herdr, "Herdr", return_value=self.world))
         _ = self.enterContext(patch.object(unit_runs, "RUN_ROOT", self.root / "unit-runs"))
         _ = self.enterContext(patch.object(unit_runs, "FORMER_RUN_ROOT", self.root / "former-runs"))
-        _ = self.enterContext(patch.object(herdr, "native_process", side_effect=self.world.native_process))
-        _ = self.enterContext(patch.object(herdr, "_startup_processes", side_effect=self.world.descendants))
         _ = self.enterContext(patch.object(herdr, "launch_prepared_agent", side_effect=self.world.launch))
         _ = self.enterContext(patch.object(restart, "stop_row", side_effect=self.world.stop))
-        _ = self.enterContext(patch.object(accounts, "role_account", return_value=accounts.CodexWorkersAccount("codex1", self.root / "codex")))
-        _ = self.enterContext(patch.object(accounts, "account_for_unscoped_launch", return_value=accounts.LegacyHomeLaunch()))
 
     def worker(self, name: str = "impl2", *, family: Literal["claude", "codex"] = "claude") -> staff.StaffRow:
         backend = staff.ClaudeBackend() if family == "claude" else staff.CodexBackend(self.root / "codex")
@@ -373,6 +467,24 @@ class WorkerPaneTests(StaffTestCase):
               *, account: worker_panes.ConfiguredWorkerAccount | worker_panes.DestinationWorkerAccount = worker_panes.ConfiguredWorkerAccount.CURRENT) -> worker_panes.WorkerStart:
         return worker_panes.start_or_resume(self.parent.id, staff.WorkerName.parse(name), role, account=account)
 
+    def test_each_parent_uses_its_name_for_the_server_agent_and_keeps_the_worker_name(self) -> None:
+        first = self.start("impl")
+        self.assertIsInstance(first, worker_panes.OpenWorker)
+        second_root = self.root / "second-unit"
+        second_root.mkdir()
+        parent = fixture_member("unit", name="second-unit", parent=self.parent.parent,
+                                worktree=staff.PresentWorktree("natedev", second_root))
+        self.world.add(parent, "w2:p0", workspace="w2", tab="w2:t2")
+        second = worker_panes.start_or_resume(parent.id, staff.WorkerName.parse("impl"), "impl")
+        self.assertIsInstance(second, worker_panes.OpenWorker)
+        assert isinstance(first, worker_panes.OpenWorker)
+        assert isinstance(second, worker_panes.OpenWorker)
+        self.assertEqual(self.world.agent_names, ["unit-impl", "second-unit-impl"])
+        self.assertEqual([first.row.name, second.row.name], ["impl", "impl"])
+        self.assertEqual([self.world.locations[result.pane]["label"] for result in (first, second)], ["impl", "impl"])
+        self.assertEqual([first.row.parent, second.row.parent],
+                         [staff.ReportsTo(self.parent.id), staff.ReportsTo(parent.id)])
+
     def command(self, *arguments: str) -> tuple[int, str, str]:
         with redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as errors:
             code = worker_panes.main(list(arguments))
@@ -381,20 +493,138 @@ class WorkerPaneTests(StaffTestCase):
     def dispatch(self, row: staff.StaffRow, role: staff.WorkerRole, *, completed: bool = False) -> None:
         run = self.root / "run"
         run.mkdir(exist_ok=True)
-        write_text_atomic(run / "progress_history_state.json", json.dumps({"pass": {
+        write_text_atomic(run / "progress_history_state.json", json.dumps({"owner_staff_id": str(self.parent.id), "pass": {
             row.name: {"instance_id": "dispatch-" + row.name, "worker_name": row.name,
                        "team_slot": row.name, "kind": role, "status": "completed" if completed else "active"}}}))
+        write_text_atomic(run / "worker_transport", "herdr\n")
 
     def completed_dispatch(self, row: staff.StaffRow, role: staff.WorkerRole) -> None:
         self.dispatch(row, role, completed=True)
+        self.reply_to_dispatch(row, "dispatch-" + row.name)
+
+    def reply_to_dispatch(self, row: staff.StaffRow, dispatch_id: str) -> None:
         backend = staff.backend(row)
         assert isinstance(backend, (staff.CodexBackend, staff.ClaudeBackend))
         source = worker_admission.transcript_source(row, backend)
-        message = "The task is complete.\nDONE dispatch-" + row.name
+        message = "The task is complete.\nDONE " + dispatch_id
         entry = ({"type": "event_msg", "payload": {"type": "agent_message", "message": message}}
                  if isinstance(backend, staff.CodexBackend) else
                  {"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": message}]}})
         write_text_atomic(source, json.dumps(entry) + "\n")
+
+    def record_command(self, *arguments: str, at: int) -> None:
+        with (patch.dict(os.environ, {"UNIT_PASS_OWNER": "launcher", "UNIT_TEAM_ROLE": "impl",
+                  "UNIT_NOW_EPOCH": str(at), "CODEX_THREAD_ID": self.parent.current_session,
+                  "UNIT_HISTORY_DIR": str(self.root / "history"), "UNIT_SYNC_WRITES": "0"}),
+              patch.object(sys, "argv", ["progress_history.py", *arguments, "--session-dir", os.environ["UNIT_RUN_DIR"]]),
+              redirect_stdout(io.StringIO())):
+            progress_history.main()
+
+    def run_state(self) -> Path:
+        run = Path(os.environ["UNIT_RUN_DIR"])
+        state = run / "progress_history_state.json"
+        if not state.exists():
+            run.mkdir(exist_ok=True)
+            write_text_atomic(run / "worker_transport", "herdr\n")
+            write_text_atomic(state, json.dumps({"owner_staff_id": self.parent.id, "working_dir": str(self.root),
+                "phase": {"id": "earlier", "title": "Earlier", "instance_id": "earlier-phase", "started_at": 1,
+                          "status": "active"}, "pass": {}, "events": [],
+                "history_file": str(run / "history.jsonl"),
+                "main_agent": {"session_id": self.parent.current_session, "family": "claude",
+                               "model": "fixture", "effort": "high"}}))
+        return run
+
+    def recorded_dispatch(self, row: staff.StaffRow, status: Literal["completed", "error"], *, at: int) -> str:
+        run = self.run_state()
+        prompt = run / "prompt.md"
+        write_text_atomic(prompt, "Preserve the source behavior.\n")
+        with patch.dict(os.environ, {"UNIT_NOW_EPOCH": str(at), "CODEX_THREAD_ID": self.parent.current_session}):
+            dispatch = progress_history.begin_dispatch(run, slot="impl", phase="earlier", role="impl",
+                worker_name=row.name, worker_id=row.id, launcher_command=[], prompt=prompt, kind="impl", lens="")
+        self.record_command("finish-pass", "--status", status, at=at + 1)
+        self.reply_to_dispatch(row, dispatch)
+        return dispatch
+
+    def test_close_uses_the_newest_pass_when_an_older_short_slot_is_last(self) -> None:
+        for index, (older_start, newest_start) in enumerate(((10, 20), (None, -1), ("later", -1)), start=1):
+            with self.subTest(older_start=older_start):
+                row = self.worker(f"claude-queue-test-{index}")
+                pane = f"w1:p{index}"
+                self.world.add(row, pane)
+                self.completed_dispatch(row, "impl")
+                run = self.root / "run"
+                path = run / "progress_history_state.json"
+                state = cast(dict[str, object], json.loads(path.read_text()))
+                passes = cast(dict[str, dict[str, object]], state["pass"])
+                newest = passes[row.name]
+                newest["started_at"] = newest_start
+                older: dict[str, object] = {"instance_id": "older-dispatch", "worker_name": row.name,
+                    "team_slot": "test", "kind": "impl", "status": "completed"}
+                if older_start is not None:
+                    older["started_at"] = older_start
+                passes["test"] = older
+                write_text_atomic(path, json.dumps(state))
+                self.assertEqual(worker_panes.worker_pass(row, run), newest)
+                closed = worker_panes.close(self.parent.id, staff.WorkerName.parse(row.name))
+                self.assertIsInstance(closed, worker_panes.Closed)
+                self.assertIn(row.current_session, self.world.stops)
+                self.assertIn((pane, "terminal-" + pane), self.world.closed)
+                self.assertNotIn(pane, self.world.locations)
+
+    def test_a_worker_can_close_after_its_completed_pass_crosses_a_phase_boundary(self) -> None:
+        opened = self.start()
+        assert isinstance(opened, worker_panes.OpenWorker)
+        dispatch = self.recorded_dispatch(opened.row, "completed", at=10)
+        self.reply_to_dispatch(opened.row, worker_panes.stage_two_completion_id(dispatch))
+        self.record_command("finish-phase", "--status", "completed", at=12)
+        self.record_command("start-phase", "--phase-id", "later", "--phase-title", "Later", at=13)
+        self.assertEqual(worker_panes.worker_pass(opened.row, self.root / "run"), {})
+        closed = worker_panes.close(self.parent.id, staff.WorkerName.parse(opened.row.name))
+        self.assertIsInstance(closed, worker_panes.Closed)
+        self.assertEqual(self.world.stops, [opened.row.current_session])
+        self.assertEqual(self.world.closed, [(opened.pane, opened.terminal)])
+        self.assertEqual(set(self.world.locations), {"w1:p0"})
+
+    def test_a_newer_error_pass_keeps_a_worker_with_an_older_completed_pass(self) -> None:
+        opened = self.start()
+        assert isinstance(opened, worker_panes.OpenWorker)
+        completed = self.recorded_dispatch(opened.row, "completed", at=10)
+        failed = self.recorded_dispatch(opened.row, "error", at=20)
+        self.assertNotEqual(failed, completed)
+        self.reply_to_dispatch(opened.row, completed)
+        self.record_command("finish-phase", "--status", "completed", at=22)
+        self.record_command("start-phase", "--phase-id", "later", "--phase-title", "Later", at=23)
+        self.assertEqual(worker_panes.worker_pass(opened.row, self.root / "run"), {})
+        closed = worker_panes.close(self.parent.id, staff.WorkerName.parse(opened.row.name))
+        self.assertEqual(closed, worker_panes.Kept("launcher has not recorded a completed pass"))
+        self.assertEqual(self.world.stops, [])
+        self.assertEqual(self.world.closed, [])
+
+    def test_a_completed_pass_in_an_explicit_run_outside_the_run_roots_allows_closure(self) -> None:
+        row = self.worker()
+        self.world.add(row, "w1:p1")
+        self.completed_dispatch(row, "impl")
+        directory = self.root / "private" / "explicit-run"
+        directory.parent.mkdir()
+        directory = (self.root / "run").rename(directory)
+        observed = self.observation(row)
+        assert isinstance(observed, worker_panes.OpenWorker)
+        result = worker_panes.can_close(observed, run=worker_panes.DispatchRun(directory))
+        self.assertIsInstance(result, worker_panes.CloseAllowed)
+        self.assertEqual(self.world.stops, [])
+        self.assertEqual(self.world.closed, [])
+
+    def test_a_showrunner_workers_completed_pass_allows_closure(self) -> None:
+        self.parent_id = fixture_member("showrunner", name="close-owner").id
+        self.world.add(self.parent, "w1:p0")
+        row = self.worker("showrunner-worker")
+        self.world.add(row, "w1:p1")
+        self.completed_dispatch(row, "impl")
+        observed = self.observation(row)
+        assert isinstance(observed, worker_panes.OpenWorker)
+        self.assertIsInstance(worker_panes.can_close(observed), worker_panes.CloseAllowed)
+        self.assertEqual(self.world.stops, [])
+        self.assertEqual(self.world.closed, [])
 
     def prompts(self) -> list[tuple[str, ...]]:
         return [command for command in self.world.commands if command[:2] == ("agent", "prompt")]
@@ -460,6 +690,81 @@ class WorkerPaneTests(StaffTestCase):
         self.assertEqual(self.world.stops, [opened.row.current_session])
         self.assertEqual(self.world.closed, [])
         self.assertEqual(self.world.requests[-1][1][self.world.requests[-1][1].index("--sandbox") + 1], "read-only")
+
+    def test_policy_change_passes_the_configured_monotonic_deadline_to_stop(self) -> None:
+        opened = self.start()
+        assert isinstance(opened, worker_panes.OpenWorker)
+        self.completed_dispatch(opened.row, "impl")
+        config = self.root / "conf/direct.conf"
+        write_text_atomic(config, config.read_text().replace("PANE_AGENT_START_SECONDS=90", "PANE_AGENT_START_SECONDS=37"))
+        before = time.monotonic()
+        changed = self.start(role="review")
+        after = time.monotonic()
+        self.assertIsInstance(changed, worker_panes.OpenWorker)
+        self.assertEqual(self.world.stops, [opened.row.current_session])
+        self.assertGreaterEqual(self.world.stop_deadlines[-1], before + 37)
+        self.assertLessEqual(self.world.stop_deadlines[-1], after + 37)
+
+    def test_close_passes_the_configured_monotonic_deadline_to_stop(self) -> None:
+        opened = self.start()
+        assert isinstance(opened, worker_panes.OpenWorker)
+        self.completed_dispatch(opened.row, "impl")
+        config = self.root / "conf/direct.conf"
+        write_text_atomic(config, config.read_text().replace("PANE_AGENT_START_SECONDS=90", "PANE_AGENT_START_SECONDS=29"))
+        before = time.monotonic()
+        closed = worker_panes.close(self.parent.id, staff.WorkerName.parse(opened.row.name))
+        after = time.monotonic()
+        self.assertIsInstance(closed, worker_panes.Closed)
+        self.assertEqual(self.world.stops, [opened.row.current_session])
+        self.assertGreaterEqual(self.world.stop_deadlines[-1], before + 29)
+        self.assertLessEqual(self.world.stop_deadlines[-1], after + 29)
+
+    def test_close_keeps_the_worker_when_its_stop_budget_is_unusable(self) -> None:
+        opened = self.start()
+        assert isinstance(opened, worker_panes.OpenWorker)
+        self.completed_dispatch(opened.row, "impl")
+        config = self.root / "conf/direct.conf"
+        write_text_atomic(config, config.read_text().replace("PANE_AGENT_START_SECONDS=90", "PANE_AGENT_START_SECONDS=invalid"))
+        with redirect_stderr(io.StringIO()):
+            result = worker_panes.close(self.parent.id, staff.WorkerName.parse(opened.row.name))
+        self.assertIsInstance(result, worker_panes.Kept)
+        assert isinstance(result, worker_panes.Kept)
+        self.assertIn("PANE_AGENT_START_SECONDS", result.blocker)
+        self.assertEqual(self.world.stops, [])
+        self.assertEqual(self.world.closed, [])
+
+    def test_close_starts_its_stop_budget_after_both_locks_are_acquired(self) -> None:
+        opened = self.start()
+        assert isinstance(opened, worker_panes.OpenWorker)
+        self.completed_dispatch(opened.row, "impl")
+        monotonic = time.monotonic
+        bind = worker_panes.WorkerLockHold.bind
+        row_operation = staff.row_operation
+        elapsed = 0.0
+
+        def bind_after_delay(hold: worker_panes.WorkerLockHold, row: staff.StaffRow) -> None:
+            nonlocal elapsed
+            bind(hold, row)
+            elapsed += 120
+
+        @contextmanager
+        def row_after_delay(reference: str) -> Generator[None]:
+            nonlocal elapsed
+            with row_operation(reference):
+                elapsed += 180
+                yield
+
+        before = monotonic()
+        with patch.object(worker_panes.WorkerLockHold, "bind", bind_after_delay), \
+                patch.object(staff, "row_operation", row_after_delay), \
+                patch.object(time, "monotonic", side_effect=lambda: monotonic() + elapsed):
+            closed = worker_panes.close(self.parent.id, staff.WorkerName.parse(opened.row.name))
+        after = monotonic()
+        self.assertIsInstance(closed, worker_panes.Closed)
+        self.assertEqual(elapsed, 300)
+        self.assertEqual(self.world.stops, [opened.row.current_session])
+        self.assertGreaterEqual(self.world.stop_deadlines[-1], before + elapsed + 90)
+        self.assertLessEqual(self.world.stop_deadlines[-1], after + elapsed + 90)
 
     def test_close_permission_leaves_the_pane_open_until_close_completes(self) -> None:
         row = self.worker()
@@ -557,6 +862,177 @@ class WorkerPaneTests(StaffTestCase):
         self.assertEqual(len(self.world.launches), 1)
         self.assertEqual(self.world.stops, [])
 
+    def test_unreadable_launch_environment_without_a_current_dispatch_is_uncertain(self) -> None:
+        first = self.start()
+        assert isinstance(first, worker_panes.OpenWorker)
+        self.world.unreadable_environment.add(self.world.foreground[first.pane][0])
+        before = self.staff_state()
+        commands = self.world.commands.copy()
+        with patch.object(staff, "runtime_id", return_value=self.parent.current_session):
+            code, output, diagnostic = self.command("start-or-resume", first.row.name, "--role", "impl")
+        self.assertEqual(code, worker_panes.ExitCode.UNCERTAIN)
+        self.assertEqual(output, "")
+        self.assertEqual(len(diagnostic.splitlines()), 1)
+        self.assertIn("launch environment is unproved", diagnostic)
+        self.assertEqual(self.staff_state(), before)
+        self.assertEqual(self.world.commands, commands)
+        self.assertEqual(len(self.world.launches), 1)
+        self.assertEqual(self.world.stops, [])
+        self.assertEqual(self.world.closed, [])
+
+    def test_current_dispatch_reuses_a_worker_with_an_unreadable_launch_environment(self) -> None:
+        first = self.start()
+        assert isinstance(first, worker_panes.OpenWorker)
+        self.dispatch(first.row, "impl")
+        self.world.unreadable_environment.add(self.world.foreground[first.pane][0])
+        before = self.staff_state()
+        repeated = self.start()
+        self.assertEqual(repeated, first)
+        self.assertEqual(self.staff_state(), before)
+        self.assertEqual(len(self.world.launches), 1)
+        self.assertEqual(self.world.stops, [])
+        self.assertEqual(self.world.closed, [])
+
+    def test_policy_change_restarts_in_place_with_an_unreadable_launch_environment(self) -> None:
+        first = self.start()
+        assert isinstance(first, worker_panes.OpenWorker)
+        _ = self.recorded_dispatch(first.row, "completed", at=10)
+        self.record_command("finish-phase", "--status", "completed", at=12)
+        self.record_command("start-phase", "--phase-id", "later", "--phase-title", "Later", at=13)
+        self.world.unreadable_environment.add(self.world.foreground[first.pane][0])
+        changed = self.start(role="review")
+        self.assertIsInstance(changed, worker_panes.OpenWorker)
+        assert isinstance(changed, worker_panes.OpenWorker)
+        self.assertEqual((changed.row, changed.pane, changed.terminal), (first.row, first.pane, first.terminal))
+        self.assertEqual(self.world.launches[-1], herdr.ExistingPane(first.pane, first.terminal))
+        self.assertEqual(len(self.world.launches), 2)
+        self.assertEqual(self.world.stops, [str(first.row.current_session)])
+        self.assertEqual(self.world.closed, [])
+        arguments = self.world.requests[-1][1]
+        self.assertEqual(arguments[:2], ["resume", str(first.row.current_session)])
+        self.assertEqual(arguments[arguments.index("--sandbox") + 1], "read-only")
+
+    def test_run_handoff_resumes_in_place_with_the_current_run_environment_once(self) -> None:
+        row = self.worker("retained", family="codex")
+        self.world.add(row, "w1:p1", live=False, family="codex")
+        first = self.start(row.name)
+        self.assertIsInstance(first, worker_panes.OpenWorker)
+        assert isinstance(first, worker_panes.OpenWorker)
+        self.assertNotEqual(row.id, row.current_session)
+        run_a = Path(os.environ["UNIT_RUN_DIR"])
+        self.assertEqual(self.world.requests[-1][2]["UNIT_RUN_DIR"], str(run_a))
+        _ = self.recorded_dispatch(row, "completed", at=10)
+        run_b = self.root / "next-run"
+        with patch.dict(os.environ, {"UNIT_RUN_DIR": str(run_b)}):
+            _ = self.run_state()
+            unit_runs.activate(run_b, self.parent.current_session)
+            resumed = self.start(row.name)
+            self.assertEqual(resumed, first)
+            self.assertEqual(self.world.launches, [
+                herdr.ExistingPane(first.pane, first.terminal),
+                herdr.ExistingPane(first.pane, first.terminal)])
+            self.assertEqual(self.world.stops, [str(row.current_session)])
+            self.assertEqual(self.world.closed, [])
+            self.assertEqual(self.world.requests[-1][1][:2], ["resume", str(row.current_session)])
+            self.assertEqual(self.world.requests[-1][2]["UNIT_RUN_DIR"], str(run_b))
+            repeated = self.start(row.name)
+            self.assertEqual(repeated, first)
+            self.assertEqual(len(self.world.launches), 2)
+            self.assertEqual(self.world.stops, [str(row.current_session)])
+
+    def test_codex_launch_and_resume_keep_the_native_compaction_limit(self) -> None:
+        first = self.start("reviewer", "review")
+        self.assertIsInstance(first, worker_panes.OpenWorker)
+        assert isinstance(first, worker_panes.OpenWorker)
+        arguments = self.world.requests[-1][1]
+        self.assertFalse(any("model_auto_compact_token_limit" in argument for argument in arguments))
+        self.assertIn(["-c", "notice.hide_rate_limit_model_nudge=true"],
+                      [arguments[index:index + 2] for index in range(len(arguments) - 1)])
+        config = self.root / "conf/direct.conf"
+        write_text_atomic(config, config.read_text().replace("UNIT_COMPACT_ABOVE_TOKENS=43000",
+                                                             "UNIT_COMPACT_ABOVE_TOKENS=67000"))
+        del self.world.foreground[first.pane]
+        resumed = self.start("reviewer", "review")
+        self.assertIsInstance(resumed, worker_panes.OpenWorker)
+        assert isinstance(resumed, worker_panes.OpenWorker)
+        self.assertEqual((resumed.row, resumed.pane, resumed.terminal), (first.row, first.pane, first.terminal))
+        arguments = self.world.requests[-1][1]
+        self.assertEqual(arguments[:2], ["resume", str(first.row.current_session)])
+        self.assertFalse(any("model_auto_compact_token_limit" in argument for argument in arguments))
+        self.assertIn(["-c", "notice.hide_rate_limit_model_nudge=true"],
+                      [arguments[index:index + 2] for index in range(len(arguments) - 1)])
+        self.assertEqual(len(self.world.launches), 2)
+
+    def test_resume_uses_the_pane_folder_only_for_codex(self) -> None:
+        for family in ("codex", "claude"):
+            with self.subTest(family=family):
+                _ = write_registry(self.root / "conf/models.conf", {"assignments": {"direct": family}})
+                first = self.start("folder-" + family)
+                self.assertIsInstance(first, worker_panes.OpenWorker)
+                assert isinstance(first, worker_panes.OpenWorker)
+                self.assertNotIn("--cd", self.world.requests[-1][1])
+                del self.world.foreground[first.pane]
+                resumed = self.start(first.row.name)
+                self.assertIsInstance(resumed, worker_panes.OpenWorker)
+                assert isinstance(resumed, worker_panes.OpenWorker)
+                self.assertEqual((resumed.row, resumed.pane, resumed.terminal), (first.row, first.pane, first.terminal))
+                arguments = self.world.requests[-1][1]
+                if family == "codex":
+                    self.assertEqual(arguments[:2], ["resume", str(first.row.current_session)])
+                    self.assertEqual(arguments[arguments.index("--cd") + 1], str(self.root))
+                else:
+                    self.assertEqual(arguments[:2], ["--resume", str(first.row.current_session)])
+                    self.assertNotIn("--cd", arguments)
+
+    def test_claude_launch_ignores_the_codex_compaction_limit(self) -> None:
+        _ = write_registry(self.root / "conf/models.conf", {"assignments": {"direct": "claude"}})
+        config = self.root / "conf/direct.conf"
+        write_text_atomic(config, config.read_text().replace("UNIT_COMPACT_ABOVE_TOKENS=43000",
+                                                             "UNIT_COMPACT_ABOVE_TOKENS=invalid"))
+        self.assertIsInstance(self.start(), worker_panes.OpenWorker)
+        family, arguments, _ = self.world.requests[-1]
+        self.assertEqual(family, "claude")
+        self.assertFalse(any("model_auto_compact_token_limit" in argument for argument in arguments))
+
+    def test_codex_launch_ignores_the_between_turn_compaction_limit(self) -> None:
+        config = self.root / "conf/direct.conf"
+        original = config.read_text()
+        for index, value in enumerate(("", "invalid", "0", "-1", "1.5")):
+            with self.subTest(value=value):
+                write_text_atomic(config, original.replace("UNIT_COMPACT_ABOVE_TOKENS=43000",
+                                                           "UNIT_COMPACT_ABOVE_TOKENS=" + value))
+                result = self.start(f"compact-{index}")
+                self.assertIsInstance(result, worker_panes.OpenWorker)
+                family, arguments, _ = self.world.requests[-1]
+                self.assertEqual(family, "codex")
+                self.assertFalse(any("model_auto_compact_token_limit" in argument for argument in arguments))
+                self.assertEqual(len(self.world.launches), index + 1)
+
+    def test_same_role_keeps_a_worker_without_the_compaction_option(self) -> None:
+        result = self.start()
+        assert isinstance(result, worker_panes.OpenWorker)
+        self.dispatch(result.row, "impl")
+        arguments = self.world.requests[-1][1]
+        self.assertFalse(any("model_auto_compact_token_limit" in argument for argument in arguments))
+        self.assertEqual(self.start(), result)
+        self.assertEqual((len(self.world.launches), self.world.stops), (1, []))
+
+    def test_role_change_resumes_a_worker_without_the_compaction_option(self) -> None:
+        result = self.start()
+        assert isinstance(result, worker_panes.OpenWorker)
+        self.completed_dispatch(result.row, "impl")
+        arguments = self.world.requests[-1][1]
+        self.assertFalse(any("model_auto_compact_token_limit" in argument for argument in arguments))
+        changed = self.start(role="review")
+        self.assertIsInstance(changed, worker_panes.OpenWorker)
+        assert isinstance(changed, worker_panes.OpenWorker)
+        self.assertEqual((changed.row, changed.pane, changed.terminal), (result.row, result.pane, result.terminal))
+        arguments = self.world.requests[-1][1]
+        self.assertFalse(any("model_auto_compact_token_limit" in argument for argument in arguments))
+        self.assertEqual(arguments[arguments.index("--sandbox") + 1], "read-only")
+        self.assertEqual(self.world.stops, [str(result.row.current_session)])
+        self.assertEqual(len(self.world.launches), 2)
+
     def test_fresh_codex_publishes_the_first_turn_report_and_sends_no_second_turn(self) -> None:
         first = self.start("reviewer", "review")
         self.assertIsInstance(first, worker_panes.OpenWorker)
@@ -612,12 +1088,31 @@ class WorkerPaneTests(StaffTestCase):
         path = self.root / "conf/direct.conf"
         write_text_atomic(path, path.read_text().replace("Reply with ready. Do not use tools.", "Reply with configured-ready.")
                           .replace("WORKER_FIRST_TURN_SECONDS=120", "WORKER_FIRST_TURN_SECONDS=45"))
-        result = self.start("reviewer", "review")
+        with patch.object(time, "monotonic", return_value=100.0):
+            result = self.start("reviewer", "review")
         self.assertIsInstance(result, worker_panes.OpenWorker)
         prompt = self.prompts()[0]
         self.assertIn("Reply with configured-ready.", prompt[-1])
         wait = next(command for command in self.world.commands if command[:2] == ("agent", "wait"))
-        self.assertEqual(wait[-4:], ("--until", "done", "--timeout", "45000"))
+        self.assertEqual(wait[-6:], ("--until", "done", "--until", "idle", "--timeout", "45000"))
+
+    def test_first_turn_that_ends_at_idle_returns_the_session(self) -> None:
+        self.world.turn_end_status = herdr.AgentStatus.IDLE
+        result = self.start("reviewer", "review")
+        self.assertIsInstance(result, worker_panes.OpenWorker)
+        assert isinstance(result, worker_panes.OpenWorker)
+        self.assertEqual(result.status, herdr.AgentStatus.IDLE)
+        self.assertEqual(result.row.current_session,
+                         cast(dict[str, str], self.world.locations[result.pane]["agent_session"])["value"])
+
+    def test_first_turn_wait_starts_after_the_session_report_is_available(self) -> None:
+        self.world.report_reads_before_publish = 2
+        result = self.start("reviewer", "review")
+        self.assertIsInstance(result, worker_panes.OpenWorker)
+        assert isinstance(result, worker_panes.OpenWorker)
+        self.assertEqual(result.row.current_session,
+                         cast(dict[str, str], self.world.locations[result.pane]["agent_session"])["value"])
+        self.assertEqual(self.world.report_reads_at_wait, [0])
 
     def test_configured_launch_timeout_applies_to_fresh_start_and_resume(self) -> None:
         path = self.root / "conf/direct.conf"
@@ -936,9 +1431,11 @@ class WorkerPaneTests(StaffTestCase):
         self.assertEqual(len(staff.snapshot().find(kind="worker", parent=self.parent.id)), 1)
 
     def test_unusable_configuration_opens_no_split(self) -> None:
+        config = self.root / "conf/direct.conf"
+        original = config.read_text()
         for value in ("0.01", "0.99", "invalid"):
             with self.subTest(value=value):
-                write_text_atomic(self.root / "conf/direct.conf", f"# range: 0.1..0.9\nWORKER_SPLIT_RATIO={value}\n")
+                write_text_atomic(config, original.replace("WORKER_SPLIT_RATIO=0.667", "WORKER_SPLIT_RATIO=" + value))
                 result = self.start()
                 self.assertIsInstance(result, worker_panes.StartRefused)
                 assert isinstance(result, worker_panes.StartRefused)
@@ -1111,11 +1608,16 @@ class WorkerPaneTests(StaffTestCase):
                 self.world.locations = {"w1:p0": self.world.locations["w1:p0"]}
                 self.world.foreground = {"w1:p0": self.world.foreground["w1:p0"]}
 
+    def saved_mesh_run(self) -> Path:
+        run = self.root / "run"
+        run.mkdir()
+        write_text_atomic(run / "worker_transport", "mesh\n")
+        return run
+
     def test_a_dispatch_lock_keeps_a_stopped_pane_open(self) -> None:
         row = self.worker()
         self.world.add(row, "w1:p1", live=False)
-        run = self.root / "run"
-        run.mkdir()
+        run = self.saved_mesh_run()
         with (run / "dispatch.lock").open("w") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             result = worker_panes.close(self.parent.id, staff.WorkerName.parse(row.name))
@@ -1127,7 +1629,7 @@ class WorkerPaneTests(StaffTestCase):
     def test_stopped_worker_close_honors_the_phase_dispatch_lock(self) -> None:
         row = self.worker()
         self.world.add(row, "w1:p1", live=False)
-        phase = self.root / "run/phases/7"
+        phase = self.saved_mesh_run() / "phases/7"
         phase.mkdir(parents=True)
         with (phase / "dispatch.lock").open("w") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)

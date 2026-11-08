@@ -7,7 +7,7 @@ LABEL="com.natemccoy.hanadocs-prioritize"
 # by VERSION rather than by path. These scripts used to pin "$PY" --
 # Apple 3.9 on the Mac, nonexistent on NixOS. The pin was never load-bearing:
 # the tests in tests/ import typing.override and cannot run under 3.9 at all.
-PY="$HOME/.claude/scripts/lib/py"
+PY="${BASH_SOURCE[0]%/*}/../lib/py"
 INSTALLED_PLIST="$HOME/Library/LaunchAgents/com.natemccoy.hanadocs-prioritize.plist"
 SOURCE_PLIST="$HOME/.claude/scripts/prioritize/com.natemccoy.hanadocs-prioritize.plist"
 STATE_DIR="/tmp/hanadocs-prioritize"

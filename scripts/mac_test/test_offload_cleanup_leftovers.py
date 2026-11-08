@@ -10,9 +10,9 @@ from typing import cast
 import unittest
 from unittest import mock
 from scripts.mac_test import offload
-from offload_test_commands import SELECTOR_STUB, write_shell
-from offload_test_support import HANA_COMMAND_PATTERN, SelectorEvent
-from offload_cleanup_test_support import SeededCleanupFixture
+from scripts.mac_test.offload_test_commands import SELECTOR_STUB, write_shell
+from scripts.mac_test.offload_test_support import HANA_COMMAND_PATTERN, SelectorEvent
+from scripts.mac_test.offload_cleanup_test_support import SeededCleanupFixture
 
 
 class OffloadCommandTests(SeededCleanupFixture):

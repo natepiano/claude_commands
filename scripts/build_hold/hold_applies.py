@@ -2,13 +2,15 @@
 """Report whether natedev's hold refuses the calling session's build."""
 
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "build_targets"))
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-
 from scripts.build_targets import build_targets
 from scripts.build_hold import build_hold
 from scripts.build_targets.targets import Held, StateUnreadable, target_state

@@ -42,9 +42,10 @@ The `craft` lens remains off since 2026-10-04 (user: review trial ended).
 The `contract` reviewer also owns the phase style review under
 <ReviewPromptContract/>.
 
-The Codex lenses use the unit's own read-only reviewer. Dispatch with
-`assign.sh --role review`; it resumes `review`, or `review2` when `review` is
-busy. Keep both threads across phases and plans. Writers keep their own roles.
+The Codex lenses use the unit's read-only workers.
+Dispatch with `assign.sh --role review` under <LongLivedWorkers/>.
+The worker command selects a free reviewer and retains its native conversation across phases.
+Writers keep their assigned roles.
 
 The worker is the address and the lens is the judgment. Pass the lens to
 `assign.sh`; its returned handle names the selected worker and summary. Each
@@ -77,20 +78,21 @@ command is git -C <worktree> rev-parse HEAD; if it is not <head>, report error.
 Re-read the tree; trust nothing from memory about its state.
 ```
 
-In a run's own-worker review, the opening also gives the concrete
-`board.sh role ... review` command for the worker's first tool call. The reviewer
-narrates each change of activity as a short output line so the wrapper
-heartbeat remains live, and never polls, sleeps or narrates a wait. It receives no
-heartbeat path and never receives `${IMPL_SUMMARY}`. The reviewer runs read-only.
+For `herdr`, the reviewer posts no board lines and runs no suites.
+The director or a writer handles required board posts and suites.
+For an existing `mesh` pin, give the concrete `board.sh role ... review` command as the reviewer's first tool call.
+The reviewer reports each activity change as a short output line.
+It never polls, sleeps, or reports a wait.
+Give it no heartbeat path or `${IMPL_SUMMARY}`.
+The reviewer runs read-only.
 
-Do not repeat the implementer's listed verification. Apart from the assigned
-<StyleReview/>, a reviewer may run one specific omitted check only when a
-plausible regression lies outside the listed gate, and must name that command;
-a Codex reviewer runs it
-with `verify.sh` per the `## Builds and tests` section of
-<WritePromptContract/> item 3, which every Codex review prompt carries verbatim. Broad reviews apply
-<TypeDesignContract/>; closure reviews apply <ClosureReview/>, including any
-style assignment still owed under this contract.
+Do not repeat the implementer's listed verification.
+For `herdr`, name an omitted check for the director or a writer when a plausible regression requires it.
+For an existing `mesh` pin, a reviewer may run one omitted check for a plausible regression outside the listed gate.
+It names the command and uses `verify.sh` under <WritePromptContract/> item 3.
+Every Codex review prompt carries that item's `## Builds and tests` section verbatim.
+Broad reviews apply <TypeDesignContract/>.
+Closure reviews apply <ClosureReview/>, including any owed style assignment.
 
 Every review prompt carries the Three Gods sentence and the Type Design
 Contract under <WritePromptContract/>. Its standing-instructions line names
@@ -249,11 +251,15 @@ final diff only.
    `${REVIEW_PASS}`. Pass 1 is the phase's broad review and runs the selected
    lenses of <TeamReview/> over <BroadReviewPrompt/>; later passes are one
    reviewer over one repair, per <ClosureReview/>.
+   For `herdr`, Stage 2 uses `worker.py` with dispatch id `<dispatch id>-2`.
+   The launcher reads the transcript before input and requires `DONE <dispatch id>-2` to complete review.
+   Review Stage 2 reports through its status and summary files.
+   Only an existing mesh pin selects the retained mesh Stage 2 route.
 2. Apply <ReviewDiffContract/>. Before the broad review, save the complete phase
    diff to a file and run this read-only check in every repository, including Rust:
 
    ```sh
-   python3 ~/.claude/scripts/direct/rerun_lens.py arm --diff <diff>
+   ~/.claude/scripts/lib/py ~/.claude/scripts/direct/rerun_lens.py arm --diff <diff>
    ```
 
    `<diff>` is that saved diff, including new phase files, made with whole-file
@@ -283,9 +289,12 @@ final diff only.
      --prompt "${PHASE_DIR}/review_prompt_${REVIEW_PASS}_<lens>.md"
    ```
 
+   For `herdr`, name `--to review2` for a second lens that runs at the same time.
+   The worker command refuses automatic selection when all suitable workers are busy.
+   Give each additional concurrent lens a distinct available review name with `--to`.
    A closure review omits `--lens` and uses `review_prompt_${REVIEW_PASS}.md`.
-   Keep each dispatch handle. The allocator resumes `review`, then `review2`
-   when the first is busy. Read the summary path each dispatch returns.
+   Keep each dispatch handle and apply <LongLivedWorkers/> for selection and reuse.
+   Read the summary path each dispatch returns.
 4. While they run, perform the main review. Pass 1 reads changed code in risk
    order: Work Order paths, public API/traits/registration/plugin wiring, then
    remaining hunks. Verify spec, extras, codebase fit, <TypeDesignContract/>, and

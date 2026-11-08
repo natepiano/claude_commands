@@ -12,14 +12,14 @@ from unittest.mock import patch
 
 from scripts.direct.progress_history import DispatchDetailNotRecorded, RecordedDispatch
 from scripts.lib import resume_message
-from scripts.shutdown.inventory import PausedSeat
+from scripts.lib.resume_message import PausedSeat
 
 from scripts.lib.code_kind import is_test_code
 
 
 ROOT = Path(__file__).resolve().parents[2]
-LAUNCHERS = {"scripts/direct/assign.sh", "scripts/direct/assign.py"}
-GATED_HOPS = {"scripts/direct/implement.sh", "scripts/direct/review.sh"}
+LAUNCHERS = {"scripts/direct/assign.sh", "scripts/direct/assign.py", "scripts/direct/assign_claude.py"}
+GATED_HOPS = {"scripts/direct/review.sh"}
 MESH_STARTS = {"start", "follow", "reopen", "fork", "adopt", "prime", "resume-account-move"}
 NO_REFERENCES: frozenset[str] = frozenset()
 
@@ -27,11 +27,9 @@ NO_REFERENCES: frozenset[str] = frozenset()
 def starts_worker(words: list[str]) -> bool:
     for index, word in enumerate(words):
         name = Path(word).name
-        if name in {"implement.sh", "review.sh"}:
+        if name == "review.sh":
             return True
         if name == "codex_mesh.py" and index + 1 < len(words) and words[index + 1] in MESH_STARTS:
-            return True
-        if name == "agent_bg.sh" and (index + 1 == len(words) or words[index + 1] not in {"stop", "status", "--stop", "--status"}):
             return True
     return False
 
@@ -148,10 +146,10 @@ class OneLaunchPathTests(unittest.TestCase):
                         f'MESH = ROOT / "scripts/agents/codex_mesh.py"\ncommand = [python, str(MESH), "{verb}"]\n')
                     _ = (root / "caller.sh").write_text(f'MESH="${{DIR}}/codex_mesh.py"\n"$PY" "$MESH" {verb}\n')
                     self.assertEqual(forbidden_launches(root), ["caller.py:2", "caller.sh:2"])
-            for launcher in ("implement.sh", "review.sh", "agent_bg.sh"):
+            for launcher in ("review.sh",):
                 with self.subTest(launcher=launcher):
                     _ = (root / "caller.py").write_text(f'command = ["bash", str(ROOT / "{launcher}")]\n')
-                    _ = (root / "caller.sh").write_text(f'AGENT_BG_ROLE=impl bash "${{DIR}}/{launcher}" --to worker\n')
+                    _ = (root / "caller.sh").write_text(f'bash "${{DIR}}/{launcher}" --to worker\n')
                     self.assertEqual(forbidden_launches(root), ["caller.py:1", "caller.sh:1"])
 
     def test_scan_catches_in_process_worker_launches_and_keeps_nonlaunch_verbs_open(self) -> None:
@@ -186,8 +184,7 @@ class OneLaunchPathTests(unittest.TestCase):
         gate = '"/repo/scripts/lib/py" "/repo/scripts/direct/assign_gate.py"\n'
         for relative in (*sorted(GATED_HOPS), "other.sh"):
             for start in ('"$PY" "/repo/scripts/agents/codex_mesh.py" start\n',
-                          'AGENT_BG_ROLE=impl bash "/repo/scripts/agents/agent_bg.sh" worker\n',
-                          'AGENT_BG_ROLE=impl bash "/repo/scripts/agents/agent_bg.sh" --attach worker\n'):
+                          'bash "/repo/scripts/direct/review.sh" worker\n'):
                 with self.subTest(path=relative, start=start), tempfile.TemporaryDirectory() as directory:
                     root = Path(directory)
                     path = root / relative
@@ -204,14 +201,6 @@ class OneLaunchPathTests(unittest.TestCase):
                     _ = path.write_text('echo "assign_gate.py"\n' + start)
                     self.assertEqual(forbidden_launches(root), [f"{relative}:2"])
 
-    def test_claude_stop_and_status_do_not_start_workers(self) -> None:
-        for verb in ("stop", "status", "--stop", "--status"):
-            with self.subTest(verb=verb), tempfile.TemporaryDirectory() as directory:
-                root = Path(directory)
-                _ = (root / "caller.py").write_text(f'command = ["bash", "scripts/agents/agent_bg.sh", "{verb}", "worker"]\n')
-                _ = (root / "caller.sh").write_text(f'BG="scripts/agents/agent_bg.sh"\nbash "$BG" {verb} worker\n')
-                self.assertEqual(forbidden_launches(root), [])
-
     def test_scan_excludes_tests_launcher_and_nonlaunch_commands(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -219,9 +208,9 @@ class OneLaunchPathTests(unittest.TestCase):
                              "scripts/launch_test_support.py", "scripts/recorder_fixture.py"):
                 path = root / relative
                 path.parent.mkdir(parents=True, exist_ok=True)
-                _ = path.write_text('command = ["implement.sh"]\n')
+                _ = path.write_text('command = ["review.sh"]\n')
             _ = (root / "inspect.py").write_text(
-                '# codex_mesh.py start\ntext = "implement.sh --to worker"\n' +
+                '# codex_mesh.py start\ntext = "review.sh worker"\n' +
                 'command = ["codex_mesh.py", "end"]\n')
             _ = (root / "inspect.sh").write_text(
                 '# codex_mesh.py follow\necho "codex_mesh.py start"\n"$PY" codex_mesh.py send --to worker\n')
@@ -231,15 +220,18 @@ class OneLaunchPathTests(unittest.TestCase):
 class ResumeAssignmentTests(unittest.TestCase):
     def test_saved_shell_commands_resume_through_assign_with_their_role_and_phase(self) -> None:
         for launcher, role, arguments in (
-            ("implement.sh", "impl", ["impl", "the task", "impl", "writing", "0", "impl"]),
-            ("implement.sh", "fix", ["fix", "the repair", "fix", "repairing", "1", "impl"]),
+            ("assign.sh", "impl", ["--role", "implement", "--prompt", "/old/prompt"]),
+            ("assign.sh", "fix", ["--role", "fix", "--prompt", "/old/prompt", "--fix-cause", "resume after a move"]),
             ("review.sh", "review", ["review", "the review", "reviewing", "3"]),
         ):
             with self.subTest(launcher=launcher, role=role):
                 command = ["bash", str(ROOT / "scripts/direct" / launcher), "--phase", "3t"]
                 if role == "review":
                     command.extend(("--lens", "contract"))
-                command.extend(("/old/run", "/old/tree", "/old/prompt", *arguments))
+                if launcher == "assign.sh":
+                    command.extend(("--session-dir", "/old/run", "--cwd", "/old/tree", *arguments))
+                else:
+                    command.extend(("/old/run", "/old/tree", "/old/prompt", *arguments))
                 seat = PausedSeat(run_dir="/run", seat="worker", role=role, staff_id="worker-id",
                                   turn_live=True, launcher_command=command)
                 rebuilt = shlex.split(resume_message.resume_worker_command(seat, "/current/tree"))

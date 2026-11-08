@@ -13,12 +13,8 @@ import re
 import sqlite3
 from typing import Callable, Literal, cast
 
-import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "buildlog"))
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lint"))
 
 from scripts.lib.cargo_output import CargoOutputRoots, CargoOutputUnavailable
 from scripts.build_queue.admission_records import (

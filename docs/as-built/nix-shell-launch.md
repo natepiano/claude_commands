@@ -44,6 +44,8 @@ Older clones without `source_commit` and folders outside the configured copy loc
 Importing it does not reach scratch or herdr.
 The helper imports it only when it checks a copy.
 
+A direct child of the scratch root without `.envrc` passes Linux source trust when its readable registered record has `generated_source: true`.
+
 This rule checks only `.envrc`. Files it loads, including `flake.nix`, are not
 checked and may differ from the source commit.
 
@@ -77,10 +79,10 @@ resolver before calling `exec`.
 | `production/add_showrunner.py` | Child showrunners use `launch_agent`. |
 | `shutdown/restart.py` | Record-driven restarts prepare the saved cwd and account environment before `restore_server`, then use `launch_prepared_agent`. Refusal retains the record. |
 | `shutdown/stop_resume.py` | Shared resume runs the account exec command in the session's pane. The exec path prepares the launch shell. |
-| `shutdown/pane_restore.py` | Saved Claude panes use `launch_agent` before replacing their old tab. |
+| `shutdown/pane_restore.py` | Staff rows use `restart.start_row`. Saved panes without staff rows use `launch_agent`. Both routes preserve live conversations and retained accounts. |
 | `herdr/herdr_sessions.py` | Standalone starts and resumes use `launch_agent`. |
 | `berth_fix/launch.sh` | Proves the worktree before opening a window; both window and current-terminal starts use `nix_env.py exec`. Worktree approval failure is fatal. |
-| `agents/agent_bg.sh` | Proves the cwd while making worker settings, passes the loaded env through settings for the long-lived background daemon, and starts the CLI through `exec`. |
+| `direct/claude_worker.py` | Calls `nix_env.ensure` once in the assign process. The settings and the Claude start use the same loaded environment. |
 | `agents/agent_exec.sh` | Claude print runs use `exec` after changing to their requested directory. |
 | `agents/codex_mesh.py` | The shared Codex app-server calls `ensure(worktree, environment)` and starts Codex directly with the loaded env. Protected account, run, temporary-directory and held-role values come from the caller. `Refused` logs the helper's line, remembers the failed shell, and falls back to the caller env so other workers keep their shared server. The recorded pid is the server's pid. |
 | `accounts/accounts.py` | Normal `exec` launches call `launch_shell_environment(cwd)`. It calls `ensure`, restores the caller's HOME, and refuses an unusable shell. `codex update` bypasses account launch. |
@@ -138,6 +140,12 @@ that status until no more guards are found. Nested functions and classes are
 excluded from each body's scan, and methods and other-module attribute calls
 do not establish module guards. Shell scripts must reference the helper.
 No file is exempt.
+
+## Agent operation environment
+
+`nix_env.py exec` filters its final environment immediately before `os.execvpe`.
+The [model registry boundary](agent-registry.md#agent-environment-boundary) defines which operation values the filter removes.
+Helpers retain these values until the agent starts.
 
 ## Existing sessions
 

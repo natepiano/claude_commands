@@ -23,33 +23,30 @@ other machine: ssh roster.py --here --snapshot ──►├─► Roster(entries
 
 ### Record sources
 
-The roster joins records that each name one part of the picture. A session's role comes from these records, never from its name; the one value read from a name is a Claude worker's slot role, the suffix of its worker ledger worker name.
+The roster joins staff, run records, process evidence, and assignment logs.
+Staff supplies each worker's current session and parent.
+The assignment log supplies its task role and lens.
+The [worker design](long-lived-workers.md#roster-fields) defines stored run fields.
 
 | Source | Where | Gives |
-
 |---|---|---|
-
-| Showrunner registrations | notifier timers under `~/.local/state/notifier/showrunner-*` (`NOTIFIER_STATE_DIR`), via `showrunners.registered_showrunners()` | session name, socket, showrunner staff name, production doc |
-
+| Showrunner registrations | notifier timers under `~/.local/state/notifier/showrunner-*` (`NOTIFIER_STATE_DIR`), via `showrunners.registered_showrunners()` | session name, socket, production slug, production doc |
 | Unit staff rows | `staff.json`, via `unit_lookup.doc_units` with a present worktree | unit id and worktree per row (fallback only) |
-
 | Run markers | `/tmp/claude/unit/active/<director session id>`, and the same under `/tmp/claude/delegate/` for a run started before the folder rename (`ROSTER_RUN_ROOT` replaces both) | first line: the run's session directory |
-
 | Run heartbeats | `<run>/heartbeat.log` | a run is live if written within `unit_runs.LIVE_HEARTBEAT_SECS` (600 s) |
-
-| Workers ledgers | `<run>/workers`, one `<background id>\t<worker name>` per `agent_bg.sh` launch | Claude workers |
-
-| Mesh roster | `<run>/mesh_roster.json`, `<run>/mesh_server.json` | Codex workers: `thread_id`, `status`, `role`, `lens`, `launcher_pid`, `cwd`; server `pid` |
-
-| Held role store | `~/.local/state/astra/design-roles/<design id>/design.json` and its `mesh/mesh_roster.json` (`design_roles.state_root()`, `DESIGN_ROLES_STATE`) | held Astra designers and reviewers: holder, lifecycle, thread, mesh entry |
-
+| Staff worker rows | `staff.json`, through `staff.local_snapshot()`: rows of kind `worker` under the run's director whose backend reads `ClaudeBackend`. A running registry record counts as Claude evidence when no transcript exists yet | Claude workers |
+| Mesh roster | `<run>/mesh_roster.json`, `<run>/mesh_server.json` | Fixed `staff_id`, turn status, launcher PID, server PID, and run details |
+| Held role store | `~/.local/state/astra/design-roles/<design id>/design.json` and its `mesh/mesh_roster.json` | Held Astra role lifecycle and staff reference |
 | Review state | `<run>/<worker>_status[_<lens>]`, `<run>/<worker>_pid[_<lens>]` | running blind reviewers |
-
 | Codex account daemons | each account home from `agent_accounts.codex_homes`, at `<home>/app-server-control/app-server-control.sock` (`ROSTER_CODEX_SOCKET` replaces the list for tests) | loaded threads: id, name, cwd, status, owning daemon |
-
 | Process table | `ps -eo pid=,ppid=,comm=,args=` (`PROCESS_TABLE_PS`) | Codex agent processes, reviewer descendants, worker `--cwd` |
 
 The mesh roster format belongs to `scripts/agents/codex_mesh.py` (see `docs/as-built/long-lived-workers.md`); the roster reads it and never writes it.
+
+`codex_mesh.py end` keeps the staff row and its thread id.
+`assign.sh --to` reopens an ended worker or a worker whose launcher died, using the recorded thread.
+A follow-up after reopen refuses a replacement thread if the recorded thread cannot resume.
+The unit ledger keeps ended workers until permanent removal retires their staff rows.
 
 ### How each row's role is derived
 
@@ -59,8 +56,20 @@ Claude rows come from `sessions.running_sessions()`, one per `sessionId` (newest
 
 Codex rows:
 
-- **worker** — each mesh entry of a live run whose status is not `ended` and whose server pid or `launcher_pid` is alive. Slot role from the record's `role`: `review (<lens>)` for a `review` role with a lens, `no role` when absent, `role unknown` when unrecognized. Status reads `done` → `idle`, `waiting_capacity` → `waiting for capacity`, `capacity_exhausted` → `out of capacity`, others as stored. cwd from the record, else the agent process's `--cwd`, else the director's cwd. Director and showrunner links come from the run; a heartbeat-only run gives `NoDirector` / `NoShowrunner`.
-- **held Astra role** (`_durable_roles`) — each open held role in the held role store (`docs/as-built/long-lived-workers.md#lasting-roles`), skipping a role not opened or ended and a thread fenced by an adoption (`transferring_role`, `role_redirect`, `design_roles.transfer_route`). Role `astra-designer` or `astra-reviewer`, name the instance name, status the mesh entry's, else the lifecycle name; cwd the design's checkout. A unit holder gives `UnderDirector`; a showrunner holder gives `UnderShowrunner` and `NoDirector`. Its account reads `AccountUnread("serving home not read")`.
+- **Worker.** A live run's mesh entry supplies status and process evidence.
+  The entry's `staff_id` resolves the current thread and parent through one staff snapshot.
+  A worker whose backend is Claude appears only as a Claude row.
+  The assignment log supplies the task role and review lens.
+  Status `done` displays `idle`; capacity states retain their named display text.
+  The process supplies the working directory when available; the director's directory is the fallback.
+  Staff parents supply the director and showrunner relationships.
+- **Held Astra role.** `_durable_roles` lists opened roles that have not ended.
+  Staff supplies the current thread and the role's parent.
+  The role store supplies the design repository, instance name, and lifecycle.
+  A missing backend prints an anomaly and skips that role.
+  The row uses `astra-designer` or `astra-reviewer` and cannot receive direct messages.
+  The holder adds pending messages through `design_roles.py`.
+  The [held-role design](long-lived-workers.md#lasting-roles) defines its authority.
 - **blind reviewer** — `<worker>_status[_<lens>]` reads `reviewing` with a live `<worker>_pid[_<lens>]`. Kind is `codex` for a `codex exec` descendant of that pid, else `claude` for a `claude` descendant, else `codex`. Named `<lens> reviewer` or `blind reviewer`, slot role `review (<lens>)` or `review`.
 - **freestanding** — each daemon thread that is not a worker's or held role's thread (such a thread is listed once, as the worker or held role).
 
@@ -74,7 +83,7 @@ Codex rows:
   - Blind reviewer: `CannotReceiveMessages("blind reviewer")`.
   - Held Astra role: `CannotReceiveMessages("held role; its holder adds pending messages to an authorized assignment")`.
 - `ShowrunnerRelationship = RunsProduction | UnderShowrunner | ProductionWithoutRunningShowrunner | NoShowrunner`; `DirectorRelationship = DirectsUnit | UnderDirector | NoDirector`; `Assignment = WorkerAssignment | NotAWorker`.
-- `thread: CodexThread | NoCodexThread` (mesh record or daemon thread); `session: ClaudeSession | NoClaudeSession` (the Claude identity, kept even without a socket).
+- `thread: CodexThread | NoCodexThread` (staff current session or daemon thread); `session: ClaudeSession | NoClaudeSession` (the Claude identity, kept even without a socket).
 - Link addresses, text nesting, sort and `--of` use `_session_address(entry)` on `session`, so a socketless unit director still owns its workers.
 - `Roster(entries, problems, warnings)`; `RosterScope = ThisMachine | AllMachines`; `roster(environment, scope) -> Roster` (scope required). Unreadable durable-role records are warnings: they preserve the readable rows and do not make recipient discovery incomplete. Other source failures remain problems. `diagnostics` combines problems and labelled warnings for display.
 - `SenderIdentity = CodexThread | ClaudeSession | NoSession` from `sender_identity(environment)`: `CODEX_THREAD_ID` first, then `CLAUDE_CODE_SESSION_ID`. `is_sender(entry, identity)` matches a Codex row's `thread` or any row's `session`; `NoSession` matches nothing.
@@ -89,8 +98,12 @@ Codex rows:
   A stopped showrunner keeps its staff name. `—` marks a missing part.
 - `unit_labels(entries) -> dict[str, UnitLabels]` keys a full roster's entries by Claude session id and Codex thread id. `/build:queue` uses it (`docs/as-built/build-memory-admission.md`, "Queue API").
 - `unit_labels_for(session_ids, environment) -> dict[str, UnitLabels]` is the fast path for known Claude session ids. It reads the session records, the showrunner registry through `showrunners.registered_showrunners(known_sessions=...)`, and session labels through `session_staff.session_staff_and_directors(records, environment)`, which reads only each record's `/proc/<pid>/environ` (`HERDR_PROC` replaces `/proc`). It never reads the process table, Codex meshes or accounts. A session whose `CLAUDE_CODE_SESSION_ID` names another known session resolves under that director and takes its production and unit. Unknown ids are left out, and any error returns `{}`. `/build:status` uses it (`docs/as-built/build-targets.md`).
-- Both paths use `session_staff.group_labeled_sessions`. Native runtime ids select staff rows. Duplicate live or unknown processes produce a fault.
-- Sessions with a given name such as `organon` still join their staff unit through cwd equal to its present local `worktree.path`. `pane_launch.RecordedLabels` and the host-unavailable fallback in `unit_labels.production_places` use `StaffLabels.environment`, the same identity → timer target → exact folder → normalized name order as the status line. A folder is never inferred from the session name or a production Units table.
+- Both paths use `session_staff.group_labeled_sessions`.
+  Duplicate live or unknown processes produce a fault.
+- Native runtime IDs select staff rows for session labels.
+  `pane_launch.RecordedLabels` and `StaffLabels.environment` remove retired copied identity values.
+  A folder or session name does not select a staff row.
+  The [staff identity contract](staff-accessors.md#staff-identity-and-backends) defines this join.
 - `UnitLabels.folder_name() -> str` names the copies folder `/tmp/claude/copies/<showrunner>-<unit>/<phase>-<purpose>`: showrunner `hana`, unit `lfo` gives `hana-lfo`. A unit name equal to the showrunner name, or one that starts with the showrunner name and `-`, is the folder name alone (`cargo-liner-style` + `cargo-liner-style-types` gives `cargo-liner-style-types`). The prefix rule needs the hyphen: `hana` + `hanami` gives `hana-hanami`. A `—` part is left out with its hyphen (`builds`, `lfo`); with both parts `—` the session name is the folder name. A caller looks up labels with `unit_labels_for([<session id from build_hold.owning_session()>], environment)`, so a Codex worker resolves to its unit director. No caller uses `folder_name` yet.
 - Imports: `roster.py` imports `scripts.shutdown.remote` by package and does not put `scripts/shutdown` on `sys.path`; `account`, `agent_accounts` and `note_file` load lazily, so a label-only caller does not load account discovery. `scripts/shutdown/inventory.py` appends its own folder after existing `sys.path` entries for its sibling imports.
 
@@ -228,7 +241,7 @@ The unit director runs this on natedev, from main, since the session loads `~/.c
 From the repo root, define `pm_rows` once; it selects today's local Claude rows using the user's zone, without computing the trial's results here:
 
 ```sh
-pm_rows() { python3 -c 'import datetime,json,os,sys; from pathlib import Path; sys.path.insert(0,"scripts/lib"); from user_zone import user_zone; z=user_zone(); today=datetime.datetime.now(z).date(); p=Path(os.environ.get("XDG_STATE_HOME",str(Path.home()/".local/state")))/"message/log.jsonl"; rows=(json.loads(s) for s in p.read_text().splitlines() if s.strip()) if p.exists() else []; [print(json.dumps(r)) for r in rows if "via" in r and datetime.datetime.fromisoformat(r["time"]).astimezone(z).date()==today]'; }
+pm_rows() { ~/.claude/scripts/lib/py -c 'import datetime,json,os; from pathlib import Path; from scripts.lib.user_zone import user_zone; z=user_zone(); today=datetime.datetime.now(z).date(); p=Path(os.environ.get("XDG_STATE_HOME",str(Path.home()/".local/state")))/"message/log.jsonl"; rows=(json.loads(s) for s in p.read_text().splitlines() if s.strip()) if p.exists() else []; [print(json.dumps(r)) for r in rows if "via" in r and datetime.datetime.fromisoformat(r["time"]).astimezone(z).date()==today]'; }
 ```
 
 Each following line reads those rows without changing state. The delivery-share denominator includes `queue` rows as messages not delivered by the mod; the relay count includes only `via: relay`. Compare the daily relay count to the baseline of about 600 and the elapsed-time median to the relay baseline of 4.5 s; use the trial start timestamp to select the two-day interval for the final comparison.
@@ -452,7 +465,8 @@ Release recalculates the priority of a kept decision.
 
 **Roster records**
 
-- A Claude worker ledger id is `agent_bg.sh`'s background id, a prefix of the `sessionId`.
+- A Claude worker ledger id is the background id that `scripts/direct/claude_worker.py` reads from the start banner.
+  The id is a prefix of the `sessionId`.
 
 - Session records are one file per pid, indexed by `(sessionId, pid)`; the newest `updatedAt` wins. A pid-to-name map therefore cannot hold a stale name.
 

@@ -14,7 +14,7 @@ import urllib.request
 from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, BinaryIO, Literal, TypedDict, cast
+from typing import BinaryIO, Literal, TypedDict, cast
 
 from scripts.buildlog import store
 from scripts.message import send_budget
@@ -24,10 +24,7 @@ from scripts.build_hold import override_guard
 from scripts.copies import copies
 from scripts.lib import cargo_output, scratch
 from scripts.notify import review
-from scripts.notify.push_texts import render, user_send_argv
-
-if TYPE_CHECKING:
-    from scripts.notify.push_texts import RenderedPush
+from scripts.notify.push_texts import RenderedPush
 
 CHANNEL_URL = "https://static.rust-lang.org/dist/channel-rust-stable.toml"
 HANA = Path.home() / "rust/hana"
@@ -175,6 +172,8 @@ def cargo_building() -> bool:
 
 
 def send_release_text(push: RenderedPush) -> bool:
+    from scripts.notify.push_texts import user_send_argv
+
     command = user_send_argv(push)
     result = subprocess.run(command, capture_output=True, text=True,
                             timeout=send_budget.user_seconds(review.user_send_seconds()), stdin=subprocess.DEVNULL)
@@ -366,7 +365,7 @@ def trial_release(version: str, run_command: RunCommand, held: Callable[[], bool
         step = "checkout"
         if held():
             raise TrialDeferred("build hold active")
-        with copies.standing("toolchain-trial", HANA, revision.stdout.strip()) as checkout:
+        with copies.standing("toolchain-trial", HANA, copies.CommittedSource(revision.stdout.strip())) as checkout:
             _ = scratch.save_cargo_outputs(checkout)
             clippy_env = env | {
                 "CARGO_INCREMENTAL": "0", "CARGO_TARGET_DIR": str(checkout / "target"),
@@ -409,6 +408,8 @@ def trial_text(trial: TrialOutcome) -> str:
 
 
 def release_push(version: str, pin: str, trial: TrialOutcome) -> RenderedPush:
+    from scripts.notify.push_texts import render
+
     if trial["status"] != "finished":
         raise ValueError("incomplete compiler trials are log notes, not user pushes")
     if trial["errors"]:

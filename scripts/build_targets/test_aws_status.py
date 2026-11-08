@@ -7,9 +7,8 @@ import io
 import json
 from pathlib import Path
 import subprocess
-import sys
 import time
-from typing import TYPE_CHECKING, cast, override
+from typing import cast, override
 
 from scripts.lib import process_start as process_identity
 from scripts.lib.process_start_test_support import process_reader
@@ -18,20 +17,12 @@ from unittest import mock
 import unittest
 
 from scripts.build_targets import build_targets
-from scripts.mac_test import mac_test
-from scripts.mac_test import offload
+from scripts.mac_test import mac_test, offload
 
-if TYPE_CHECKING:
-    from scripts.aws_target import aws_target, ledger, config as aws_config
-    from scripts.aws_target.control_test_support import AwsReplies
-    from scripts.aws_target.measurement_test_support import MeasurementFixture, NOW, REPOSITORY, private_history, read_only_evidence
-    from scripts.message import roster
-else:
-    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-    from scripts.aws_target import aws_target, ledger, config as aws_config
-    from scripts.aws_target.control_test_support import AwsReplies
-    from scripts.aws_target.measurement_test_support import MeasurementFixture, NOW, REPOSITORY, private_history, read_only_evidence
-    from scripts.message import roster
+from scripts.aws_target import aws_target, ledger, config as aws_config
+from scripts.aws_target.control_test_support import AwsReplies
+from scripts.aws_target.measurement_test_support import MeasurementFixture, NOW, REPOSITORY, private_history, read_only_evidence
+from scripts.message import roster
 
 
 class AwsStatusTests(MeasurementFixture):

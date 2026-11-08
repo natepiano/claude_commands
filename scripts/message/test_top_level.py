@@ -17,12 +17,12 @@ from pathlib import Path
 from typing import cast, override
 from unittest import mock
 
-import process_table
-import codex_daemon
+from scripts.message import process_table
+from scripts.message import codex_daemon
 from scripts.message import roster
-import herdr
-import sessions
-import top_level
+from scripts.herdr import herdr
+from scripts.message import sessions
+from scripts.message import top_level
 from scripts.message.process_test_support import OwnedTestProcesses
 from scripts.message import unit_labels
 from scripts.production import staff

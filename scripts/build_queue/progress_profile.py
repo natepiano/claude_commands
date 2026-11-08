@@ -67,6 +67,7 @@ class WindowPeak:
 
 
 BINS = 20
+GATE_FIRST_PASS = "suites:1"
 FRAME_SPLIT = re.compile(r"[\r\n]")
 PHASE_END = re.compile(r"\bFinished\b|\bSummary\b|Blocking waiting for")
 CARGO_COUNTER = re.compile(r"\b(?:Building|Checking|Compiling)\s+\[[^\]]*\]\s*(\d+)\s*/\s*(\d+)")
@@ -123,7 +124,7 @@ def parse_progress(text: str) -> ProgressCounter | NoCounter:
 
 def window_peak(profile: ProgressProfile | NoMatchingProfile, counter: ProgressCounter | NoCounter,
                 lookahead_percent: float) -> WindowPeak | NoMatchingProfile:
-    """Cross phase boundaries and refuse windows with unmeasured bins."""
+    """Cross cargo phases, stop after the gate first pass, and require measured bins."""
     if isinstance(profile, NoMatchingProfile):
         return profile
     if isinstance(counter, NoCounter):
@@ -145,7 +146,7 @@ def window_peak(profile: ProgressProfile | NoMatchingProfile, counter: ProgressC
                 return NoMatchingProfile("unmeasured progress window")
             peak = max(peak, value)
         remaining -= end - at
-        if remaining <= 0:
+        if remaining <= 0 or phase.phase == GATE_FIRST_PASS:
             break
         at = 0
     return WindowPeak(peak, lookahead_percent)
@@ -245,6 +246,10 @@ def progress_path(sidecar: Path, suffix: str) -> Path:
 
 def publish_counter(sidecar: Path, counter: ProgressCounter) -> None:
     atomic_sample(progress_path(sidecar, "json"), json.dumps(snapshot_value(counter), separators=(",", ":")))
+
+
+def clear_counter(sidecar: Path) -> None:
+    progress_path(sidecar, "json").unlink(missing_ok=True)
 
 
 def read_counter(sidecar: Path) -> ProgressCounter | NoCounter:

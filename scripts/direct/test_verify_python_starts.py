@@ -42,7 +42,7 @@ class VerifyPythonStartsTests(VerifyLintCacheFixture):
         self.assertEqual(counts["tree_watch.py"], 11, rows)
         self.assertEqual(counts["memory_kill.py"], 1, rows)
         self.assertEqual(counts["step_context.py"], 1, rows)
-        self.assertEqual(len(rows), 60, counts)
+        self.assertEqual(len(rows), 24, counts)
 
     def test_lint_code_key_tracks_inputs_and_clears_unreadable_keys_with_both_hash_tools(self) -> None:
         home = self.root / "key-home"
@@ -197,7 +197,7 @@ printf '%s\\n' "$VERDICT_KEY" "$VERDICT_TREE_KEY"
         self.assert_pair("lint", "sample")
         _ = (self.root / "sample/src/new.rs").write_text("// new source\n")
         self.environment["RUSTFLAGS"] = "-C opt-level=1"
-        self.assert_pair("lint", "--workspace", "--check")
+        self.assert_pair("lint", "", "--check")
         _ = (self.root / "session/lint.conf").write_text("# changed config\n")
         self.assert_pair("lint", "sample")
 

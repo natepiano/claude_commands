@@ -13,17 +13,16 @@ from pathlib import Path
 from typing import Literal, TypedDict, cast, final, override
 from unittest.mock import patch
 
-from test_support import ShutdownSendLeaf, ShutdownTestCase
-import remote_control
-import herdr
-import sessions
-import session_pane
+from scripts.shutdown.test_support import ShutdownSendLeaf, ShutdownTestCase
+from scripts.shutdown import remote_control
+from scripts.herdr import herdr
+from scripts.message import sessions
+from scripts.production import session_pane
 from scripts.whoami import quota_alert
-import remote
-import detached
+from scripts.shutdown import remote
+from scripts.lib import detached
 from scripts.notify.push_texts import RenderedPush
-from herdr import HerdrPlace
-from herdr import AgentBlocked
+from scripts.herdr.herdr import HerdrPlace, AgentBlocked
 
 
 def unchanged(_at: float) -> None:

@@ -36,13 +36,13 @@ raise SystemExit(0 if os.environ["TEST_MAC_STATE"] == "free" else 1)
                             calls.unlink(missing_ok=True)
                             reservations = root / "reservations"
                             reservations.unlink(missing_ok=True)
-                            script = 'set -euo pipefail\n' + shell_functions(VERIFY, "mac_retry_hook", "target_for_settings", "step_can_retry", "ssh_reserve_hook", "ssh_retry_hook", "sync_token_state", "acquire_token")
+                            script = 'set -euo pipefail\n' + shell_functions(VERIFY, "mac_retry_hook", "target_for_settings", "target_platform", "step_can_retry", "remote_step_kind", "ssh_reserve_hook", "ssh_retry_hook", "sync_token_state", "acquire_token")
                             script += r'''
 TOKEN_USED=1 TOKEN_HELD=0 TOKEN_WAITER_FILE="" TOKEN_FIRST_WAIT_DONE=0
 TOKEN_SUPERSEDED=0 TOKEN_WAIT_NOTE_MIN=1 TOKEN_CLOCK_NOW=0
-BOARD_DIR=unused STEP_RUNS_ON=mac_allowed STEP_FORCE_MAC=0 LOCAL_ONLY=0
+BOARD_DIR=unused STEP_RUNS_ON=any_target STEP_FORCE_MAC=0 LOCAL_ONLY=0
 PKG=sample HOLD_WAIT_DIR=$DOC_REPO_TOP
-STEP_TARGET_TABLE=$'mac\teligible\t-\tfixture-settings'
+STEP_TARGET_TABLE=$'mac\teligible\t-\tfixture-settings\tmacos'
 SSH_RETRYABLE_REASON=busy SSH_RETRY_AFTER_SETTINGS=""
 SSH_RETIRED_SETTINGS=() SSH_RETRY_SETTINGS=() SSH_RETRY_DEADLINES=()
 MAC_LEAVE_SETTINGS=fixture-settings MAC_RETRY_AFTER=0 LINT_LEFT_QUEUE_STATUS=75

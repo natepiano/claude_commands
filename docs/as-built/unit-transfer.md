@@ -52,9 +52,9 @@ paths. Resume and verify find the giving doc through its staff row and read the
 receiving doc from its staff row, just as a fresh apply does. Both checkouts come from
 those docs. Old journals' stored locations are ignored, so a checkout move does not strand an
 open transfer; the receiving doc must still name the journal's receiving production.
-Each step except stop, relaunch and verify runs under both merge locks, taken in staff name order,
-and runs the preflight again first. Stop is `rename_unit.stop_unit` through the shared
-`rename_unit.StopTarget` protocol: a transfer keeps the id, so the old and new ids are the same.
+Each step except stop, relaunch and verify runs under both merge locks, taken in staff name order.
+Each step repeats the preflight. The transfer uses `staff.move` to change the parent.
+It calls `staff_move.move_unit` for the folder and branch move.
 
 The doc commits use `git commit --only` on the doc, and an earlier run's commit is adopted by its
 subject. If a run stops between a row write and its commit, the journaled step accepts only

@@ -43,6 +43,10 @@ held for the worker's next dispatch, so it is never lost.
 """
 
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import argparse
 import contextlib
@@ -325,6 +329,23 @@ def live_twin(runs: Path, worker: str, command: list[str], tree_key: str) -> Run
     return None
 
 
+def worker_runs(runs: Path, worker: str, *, since: float = 0) -> list[RunRecord]:
+    """Read this worker's runs that started during the selected dispatch."""
+    found: list[RunRecord] = []
+    for path in sorted(runs.glob("*.json")):
+        raw = codex_mesh._read_json_object(path)  # pyright: ignore[reportPrivateUsage]
+        if raw.get("worker") == worker and codex_mesh._as_float(raw.get("started_at"), 0) >= since:  # pyright: ignore[reportPrivateUsage]
+            found.append(cast(RunRecord, cast(object, raw)))
+    return found
+
+
+def delivered_worker_results(runs: Path, worker: str, *, since: float) -> set[str]:
+    """Name finished results sent directly to this worker's pane."""
+    return {record["run_id"] for record in worker_runs(runs, worker, since=since)
+            if record["status"] == "finished" and record.get("delivery", "").startswith(
+                (f"sent: worker {worker} at ", "already delivered: "))}
+
+
 def live_runs(runs: Path, worker: str) -> list[RunRecord]:
     """Return this worker's running records whose supervisors still own them."""
     found: list[RunRecord] = []
@@ -398,7 +419,7 @@ def command_start(args: argparse.Namespace) -> int:
         _write_record(record_path, record)
         with log_path.open("ab") as log:
             supervisor = subprocess.Popen(
-                [sys.executable, str(Path(__file__).resolve()), "supervise", str(record_path)],
+                [str(Path(__file__).resolve().parents[1] / "lib/py"), str(Path(__file__).resolve()), "supervise", str(record_path)],
                 stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
                 start_new_session=True, cwd=cwd,
             )

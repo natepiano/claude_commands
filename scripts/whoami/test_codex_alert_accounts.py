@@ -16,13 +16,11 @@ from pathlib import Path
 from typing import Literal, cast, override
 from unittest.mock import patch
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.lib.test_models_registry import registry_text, write_registry
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from scripts.whoami import note_file
-import quota_alert
+from scripts.whoami import quota_alert
 from scripts.whoami import agent_accounts
 from scripts.whoami.agent_accounts import CodexHomeSource, Quota, Report
 from scripts.accounts import accounts, moves, next_moves, refusals, role_map
@@ -34,7 +32,7 @@ from scripts.shutdown import stop_resume
 from scripts.whoami import usage_store
 from scripts.notify.push_texts import RenderedPush, catalog, render_entry
 from scripts.notify.user_action import ActionRequired
-from test_quota_alert import REGISTRY
+from scripts.whoami.test_quota_alert import REGISTRY
 
 CURRENT_READING_AGE = timedelta()
 

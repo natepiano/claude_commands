@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import sys
 import json
 import unittest
 from datetime import datetime, timedelta, timezone
@@ -10,12 +9,11 @@ from pathlib import Path
 from typing import cast
 from unittest import mock
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.whoami import quota_alert_test_support as support
-import quota_alert
+from scripts.whoami import quota_alert
 from scripts.whoami import agent_accounts
 from scripts.whoami.agent_accounts import ClaudeAccountsInUse, Quota, Report
-import agent_notes
+from scripts.whoami import agent_notes
 from scripts.whoami import session_table
 from scripts.whoami import note_file
 from scripts.whoami import account
@@ -200,7 +198,7 @@ class QuotaAlertTests(support.SeededQuotaReminderFixture):
 
     def test_collected_readings_remind_the_unfit_group_account_but_not_ungrouped_external_sessions(self) -> None:
         from scripts.message import sessions
-        import five_hour
+        from scripts.whoami import five_hour
         self.configure_claude_roles()
         _ = accounts.set_group_account("units", "claude3", why="fixture units", now=self.now)
         unfit = accounts.account_dir("claude3")

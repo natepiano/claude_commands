@@ -54,6 +54,10 @@ production's own plumbing words (PLUMBING).
 The input format is in ~/.claude/commands/showrunner/dailies.md.
 """
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import argparse
 import json
@@ -67,20 +71,15 @@ from pathlib import Path
 from typing import NamedTuple, cast
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "build_hold"))
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "mac_test"))
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "whoami"))
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from atomic_file import write_text_atomic
+from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.terminal_cells import terminal_width
 from scripts.whoami import run_out
 from scripts.whoami import note_file
 from scripts.whoami.run_out import READINGS_LOG, Reading
 from scripts.build_hold.build_hold import ActiveHolders, HoldCycle, HoldState, KnownReleaseEta, NoHolders, Holder, ReleaseEntry, ReleaseRecordReadError, holder_directory, read_cycle, read_holders, release_record_error_line
 from scripts.mac_test.mac_test import ActiveMacBlock, NoMacBlock, PendingMacBlock, ci_may_still_be_on, read_block, state_paths
-from update_registration import (
+from scripts.production.update_registration import (
     DueNow as DueNow,
     DeferredUntil as DeferredUntil,
     Ranking as Ranking,
@@ -931,7 +930,7 @@ def check_plumbing(line: str, name: str) -> None:
 
 def read_outstanding(path: Path | None) -> list[Outstanding]:
     """Read reminders and questions from their owning stores, oldest first."""
-    from update_registration import read_open_fields
+    from scripts.production.update_registration import read_open_fields
 
     return parse_outstanding_entries(read_open_fields(path), path or Path("questions"))
 
@@ -1596,7 +1595,7 @@ def footer(
 
 def doc_counts(doc: Path | None) -> str | None:
     """The counts line for a production doc; the status line carries the question count."""
-    import footer_counts
+    from scripts.production import footer_counts
 
     return None if doc is None else footer_counts.counts_line(footer_counts.read_counts(doc))
 
@@ -1879,7 +1878,7 @@ def local_now(zone: str, where: str, at: str | None) -> tuple[datetime, str]:
 
 def footer_main(zone: str, next_run: str | None, at: str | None, outstanding_path: Path | None, *,
                 nothing_needed: bool, below: Sequence[Path] = (), root: str = "", doc: Path | None = None) -> int:
-    from update_registration import QuestionStaff, read_open_fields
+    from scripts.production.update_registration import QuestionStaff, read_open_fields
 
     unreadable: list[str] = []
     try:
@@ -1960,7 +1959,7 @@ def main(arguments: list[str]) -> int:
         resolved = resolve_eta_moments(report, previous, now)
         check_changes(report, previous, resolved)
         check_idle(report, now)
-        from update_registration import read_open_fields
+        from scripts.production.update_registration import read_open_fields
 
         outstanding = parse_outstanding_entries(
             read_open_fields(outstanding_path, document=report.doc),

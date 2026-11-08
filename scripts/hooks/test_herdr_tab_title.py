@@ -5,7 +5,6 @@ from __future__ import annotations
 import io
 import json
 import math
-import sys
 import tempfile
 import unittest
 from contextlib import redirect_stderr
@@ -13,19 +12,16 @@ from pathlib import Path
 from typing import override
 from unittest.mock import patch
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "herdr"))
 from scripts.lib import names
 from scripts.lib.test_names import fixture_names
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.production import staff
 from scripts.production.staff_test_support import fixture_member, fixture_runtime_id, fixture_worker, isolated_staff_file
 from scripts.shutdown import pane_record
-import herdr  # noqa: E402
-import sessions  # noqa: E402
-import herdr_tab_title  # noqa: E402
-from herdr_tab_title import StopPayload  # noqa: E402
+from scripts.herdr import herdr  # noqa: E402
+from scripts.message import sessions  # noqa: E402
+from scripts.hooks import herdr_tab_title  # noqa: E402
+from scripts.hooks.herdr_tab_title import StopPayload  # noqa: E402
 
 REAL_RETITLE = herdr.Herdr.retitle
 REAL_PANES = herdr.Herdr.panes
@@ -100,7 +96,7 @@ class HerdrTabTitleTests(unittest.TestCase):
             self.assertTrue(herdr_tab_title.sync({"session_id": unit.current_session}, environment))
         self.assertEqual(reads.call_count, 1)
         self.assertEqual(self.retitled, [("w3:p7", "render")])
-        self.assertIn("/showrunner:rename_unit", errors.getvalue())
+        self.assertIn("/showrunner:rename", errors.getvalue())
         self.assertIn("typed-name", errors.getvalue())
         self.assertIn("render", errors.getvalue())
         self.assertEqual(len(errors.getvalue().splitlines()), 1)
@@ -128,7 +124,7 @@ class HerdrTabTitleTests(unittest.TestCase):
             self.assertTrue(herdr_tab_title.sync({"session_id": runner.current_session},
                 {"HERDR_PANE_ID": "w3:p7", "HERDR_SESSION": "agents", "SHOWRUNNER_" + "UNIT_ID": "wrong-unit"}))
         self.assertEqual(self.retitled, [("w3:p7", runner.name)])
-        self.assertNotIn("/showrunner:rename_unit", errors.getvalue())
+        self.assertNotIn("/showrunner:rename", errors.getvalue())
         self.assertEqual(herdr_tab_title.current_name(runner.current_session), "typed-production")
         self.assertEqual((self.staff_file.read_bytes(), self.staff_file.stat().st_mtime_ns), before)
 
@@ -213,7 +209,7 @@ class HerdrTabTitleTests(unittest.TestCase):
         self.assertEqual(reads.call_count, 1)
         self.assertIn("no staff row", errors.getvalue())
         self.assertIn(pending, errors.getvalue())
-        self.assertNotIn("/showrunner:rename_unit", errors.getvalue())
+        self.assertNotIn("/showrunner:rename", errors.getvalue())
         self.assertEqual(self.retitled, [("w3:p7", "typed-name")])
         self.assertEqual((self.staff_file.read_bytes(), self.staff_file.stat().st_mtime_ns), before)
         self.assertEqual((retained.read_bytes(), retained.stat().st_mtime_ns), retained_before)
@@ -222,7 +218,7 @@ class HerdrTabTitleTests(unittest.TestCase):
         with redirect_stderr(io.StringIO()) as errors:
             self.assertTrue(herdr_tab_title.sync({"session_id": pending}, environment))
         self.assertEqual(self.retitled[-1], ("w3:p7", unit.name))
-        self.assertIn("/showrunner:rename_unit", errors.getvalue())
+        self.assertIn("/showrunner:rename", errors.getvalue())
         self.assertEqual((self.staff_file.read_bytes(), self.staff_file.stat().st_mtime_ns), completed)
         self.assertEqual((retained.read_bytes(), retained.stat().st_mtime_ns), retained_before)
 

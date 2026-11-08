@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """Build the mechanical dailies input around the showrunner's judgment JSON."""
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import argparse
 import json
@@ -12,30 +16,27 @@ from datetime import datetime, timedelta, timezone, tzinfo
 from pathlib import Path
 from typing import NamedTuple, cast
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.process_failure import failure_detail
 from zoneinfo import ZoneInfo
 
 from scripts.production import showrunners
-import showrunner_tree
-import unit_lookup
+from scripts.production import showrunner_tree
+from scripts.production import unit_lookup
 from scripts.production import staff, unit_names
 from scripts.production.production_doc import Production, Refusal, production_field, read_production
-from ci_points import PointFailure, WatchFirstAlert, WatchRepeat, review_watch
-from dailies_counts import CountsFailure, production_counts
+from scripts.production.ci_points import PointFailure, WatchFirstAlert, WatchRepeat, review_watch
+from scripts.production.dailies_counts import CountsFailure, production_counts
 from scripts.production.store_owner import showrunner_id
-from dailies_render import (LENGTHS, InputError, ReportsEvery, ReportsOnDemand, StateRefused, StyleSummary,
+from scripts.production.dailies_render import (LENGTHS, InputError, ReportsEvery, ReportsOnDemand, StateRefused, StyleSummary,
                             as_list, as_map, check_render_state, due, last_report,
                             local_now, parse_child_report, parse_range_end, parse_report, parse_time,
                             parse_style_summary)
-from merge_checkpoint import git, merged_checkpoints
-from update_registration import (QuestionStaff, read_open_items, RegistrationFailure, UpdatesOnDemand, adopt_moved_state, outstanding_file,
+from scripts.production.merge_checkpoint import git, merged_checkpoints
+from scripts.production.update_registration import (QuestionStaff, read_open_items, RegistrationFailure, UpdatesOnDemand, adopt_moved_state, outstanding_file,
                                  update_schedule)
-from waiting import EtaNotYetRequested, EtaRequested, eta_requested, update_state
+from scripts.production.waiting import EtaNotYetRequested, EtaRequested, eta_requested, update_state
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "build_hold"))
 from scripts.build_hold.build_hold import ActiveHolders, read_holders
 from scripts.build_hold import override_guard
 
@@ -273,7 +274,7 @@ def bevy_upgrade_watch(production: Production) -> BevyUpgradeWatch:
     script = os.environ.get("DAILIES_BEVY_UPGRADE", str(
         Path(__file__).resolve().parent.parent / "bevy_upgrade/bevy_upgrade.py"))
     try:
-        result = subprocess.run([sys.executable, script, "--production", production.name,
+        result = subprocess.run([str(Path(__file__).resolve().parents[1] / "lib/py"), script, "--production", production.name,
                                  "line", "--json"], capture_output=True, text=True, timeout=30, check=False)
     except subprocess.TimeoutExpired as error:
         stderr = error.stderr.decode("utf-8", errors="replace") if isinstance(error.stderr, bytes) else error.stderr
@@ -575,7 +576,8 @@ def phase_table_path() -> Path:
 
 
 def phase_tables(production_doc: Path, zone: ZoneInfo) -> PhaseTablesState:
-    result = command(phase_table_path(), "show", "--production-doc", str(production_doc), "--json")
+    result = command(Path(__file__).resolve().parents[1] / "lib/py", str(phase_table_path()),
+                     "show", "--production-doc", str(production_doc), "--json")
     if result.returncode:
         return PhaseTablesUnavailable(failure_detail(result))
     try:
@@ -751,7 +753,7 @@ def record_eta_value(
 
 
 def command(path: Path, *args: str) -> subprocess.CompletedProcess[str]:
-    argv = [str(path), *args] if os.access(path, os.X_OK) else [sys.executable, str(path), *args]
+    argv = [str(path), *args] if os.access(path, os.X_OK) else [str(Path(__file__).resolve().parents[1] / "lib/py"), str(path), *args]
     return subprocess.run(argv, capture_output=True, text=True, check=False)
 
 
@@ -814,7 +816,8 @@ def style_summary(production: Production) -> JsonMap:
     """Validate the ledger's summary while keeping every JSON field for the parent."""
     script = Path(__file__).resolve().parent.parent / "style/style_ledger.py"
     try:
-        result = command(script, "summary", "--repo", str(production.checkout), "--json")
+        result = command(Path(__file__).resolve().parents[1] / "lib/py", str(script),
+                         "summary", "--repo", str(production.checkout), "--json")
         if result.returncode:
             reason = f"summary: {failure_detail(result, lines=1)}"
             return {"unavailable": reason.replace("\n", "; ")}

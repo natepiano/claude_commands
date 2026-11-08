@@ -21,7 +21,7 @@ from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 if TYPE_CHECKING:
     from ..hooks import showrunner_footer
 else:
-    import showrunner_footer
+    from scripts.hooks import showrunner_footer
 
 
 # Script completion deadlines only bound hangs; startup can be slow under load.

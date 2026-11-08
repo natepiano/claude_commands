@@ -74,7 +74,7 @@ class RecorderCompatibilityTests(unittest.TestCase):
             "== 'https://example.com/owner/project'; assert 'urllib.parse' not in sys.modules; "
             "assert 'scripts.buildlog.record' not in sys.modules"
         )
-        result = subprocess.run([sys.executable, "-c", source],
+        result = subprocess.run([str(Path(__file__).resolve().parents[1] / "lib/py"), "-c", source],
                                 capture_output=True, text=True, env={
                                     key: value for key, value in os.environ.items() if key != "PYTHONPATH"})
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -86,7 +86,7 @@ class RecorderCompatibilityTests(unittest.TestCase):
             "assert value['test_threads'] == 4; assert value['call_id'] == 'phase-call'; "
             "assert 'memory_admit' not in sys.modules; assert 'scripts.lint.memory_admit' not in sys.modules"
         )
-        result = subprocess.run([sys.executable, "-c", source, PHASE_GRANT],
+        result = subprocess.run([str(Path(__file__).resolve().parents[1] / "lib/py"), "-c", source, PHASE_GRANT],
                                 capture_output=True, text=True, env={
                                     key: value for key, value in os.environ.items() if key != "PYTHONPATH"})
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -98,7 +98,7 @@ class RecorderCompatibilityTests(unittest.TestCase):
             "assert len(value.rsplit('-', 1)[1]) == 6; "
             "assert 'secrets' not in sys.modules; assert 'tempfile' not in sys.modules"
         )
-        result = subprocess.run([sys.executable, "-c", source],
+        result = subprocess.run([str(Path(__file__).resolve().parents[1] / "lib/py"), "-c", source],
                                 capture_output=True, text=True, env={
                                     key: value for key, value in os.environ.items() if key != "PYTHONPATH"})
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -118,7 +118,7 @@ class RecorderCompatibilityTests(unittest.TestCase):
             "step_context.metadata_target_folder('  ', [], '/fixture'); "
             "assert 'json' not in sys.modules; assert 'scripts.buildlog.store' not in sys.modules"
         )
-        result = subprocess.run([sys.executable, "-c", source],
+        result = subprocess.run([str(Path(__file__).resolve().parents[1] / "lib/py"), "-c", source],
                                 capture_output=True, text=True, env={
                                     key: value for key, value in os.environ.items() if key != "PYTHONPATH"})
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -146,7 +146,7 @@ class RecorderCompatibilityTests(unittest.TestCase):
             )
             result = subprocess.run(
                 [str(Path(__file__).resolve().parents[2] / "scripts/lib/py"), "-c", source, str(peak)],
-                cwd=Path(__file__).resolve().parents[2], capture_output=True, text=True,
+                cwd=temporary, capture_output=True, text=True,
                 env={key: value for key, value in os.environ.items() if key != "PYTHONPATH"},
             )
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -720,7 +720,7 @@ class VerifyOutputEvidenceTests(StepOutputFolderFixture):
                                   timeout=TEST_HANG_GUARD_SECS).stdout
         environment = dict(os.environ)
         _ = environment.pop("PYTHONPATH", None)
-        result = subprocess.run([sys.executable, str(Path(step_context.__file__)), "output-roots"],
+        result = subprocess.run([str(Path(__file__).resolve().parents[1] / "lib/py"), str(Path(step_context.__file__)), "output-roots"],
                                 input=metadata, cwd=self.workspace, env=environment, capture_output=True, text=True, check=True,
                                 timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(len(result.stdout.rstrip("\n").split("\t")), 4, result.stdout + result.stderr)
@@ -826,7 +826,7 @@ class VerifyOutputEvidenceTests(StepOutputFolderFixture):
         self.assert_recorded_roots(exported, ["cargo", "check"])
 
     def test_invalid_metadata_clears_the_export(self) -> None:
-        result = subprocess.run([sys.executable, str(Path(step_context.__file__)), "output-roots"],
+        result = subprocess.run([str(Path(__file__).resolve().parents[1] / "lib/py"), str(Path(step_context.__file__)), "output-roots"],
                                 input="{}", cwd=self.workspace, capture_output=True, text=True, check=True,
                                 timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(result.stdout, "")

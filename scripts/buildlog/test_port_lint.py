@@ -7,7 +7,6 @@ import gzip
 import json
 import os
 import subprocess
-import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -221,7 +220,7 @@ class CommandTests(unittest.TestCase):
 
     def port_lint(self, *args: str) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
-            [sys.executable, str(SCRIPT), *args],
+            [str(SCRIPT.resolve().parents[1] / "lib/py"), str(SCRIPT), *args],
             cwd=self.repo,
             env=self.environment(),
             capture_output=True,

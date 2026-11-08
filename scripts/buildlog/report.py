@@ -18,19 +18,13 @@ from decimal import Decimal
 import time
 from typing import Literal, NamedTuple, cast
 
-from scripts.buildlog import ci
-from scripts.buildlog import holds
+from scripts.buildlog import ci, holds
 from scripts.buildlog import index
-from scripts.buildlog import disk
-from scripts.buildlog import health
-from scripts.buildlog import memory
-from scripts.buildlog import moments
+from scripts.buildlog import disk, health, memory, moments
 from scripts.buildlog.moments import COLD_BUILD_MIN_CRATES
 from scripts.buildlog import store
 from scripts.buildlog import record
-from scripts.buildlog import sync
-from scripts.buildlog import rust_release
-from scripts.buildlog import aws_report
+from scripts.buildlog import sync, rust_release, aws_report
 from scripts.mac_test import mac_test
 from scripts.buildlog.mac_outcome import (
     DECLINE_REASONS,
@@ -57,7 +51,7 @@ from scripts.buildlog.mac_outcome import (
 )
 
 from scripts.lib import conf
-from scripts.lib.user_zone import user_zone
+from scripts.lib.user_zone import user_zone  # noqa: E402
 from scripts.aws_target import measurement
 from scripts.build_targets.target_config import SshTarget, is_aws_target, read_targets
 

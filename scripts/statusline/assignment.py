@@ -1,5 +1,9 @@
 """Read the session's assignment from its staff row."""
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import json
 import os
@@ -8,7 +12,6 @@ import sys
 from pathlib import Path
 from typing import cast
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.production import staff
 from scripts.statusline import adhoc_items, rebuild_row
 

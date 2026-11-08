@@ -6,7 +6,6 @@ from __future__ import annotations
 import json
 import os
 import subprocess
-import sys
 import tempfile
 import unittest
 from unittest import mock
@@ -49,7 +48,7 @@ class MemoryRecordTests(unittest.TestCase):
 
     def run_script(self, script: Path, *args: str, extra: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
-            [sys.executable, str(script), *args],
+            [str(HERE.parent / "lib/py"), str(script), *args],
             cwd=self.base,
             env=self.env(**(extra or {})),
             capture_output=True,
@@ -93,7 +92,7 @@ class MemoryRecordTests(unittest.TestCase):
                        BUILDLOG_ZRAM=str(self.base / "absent-zram"))
         def take_sample() -> None:
             result = subprocess.run(
-                [sys.executable, "-c", command, str(proc)],
+                [str(HERE.parent / "lib/py"), "-c", command, str(proc)],
                 env=env, capture_output=True, text=True, check=False, timeout=test_hang_guard.TEST_HANG_GUARD_SECS,
             )
             self.assertEqual(result.returncode, 0, result.stderr)

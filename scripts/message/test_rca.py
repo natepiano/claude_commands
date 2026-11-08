@@ -9,7 +9,6 @@ import os
 import socket
 import signal
 import subprocess
-import sys
 import tempfile
 import unittest
 from threading import Thread
@@ -18,24 +17,20 @@ from contextlib import redirect_stderr, redirect_stdout
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from typing import IO, cast, override
 from unittest import mock
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "notify"))
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "production"))
 from scripts.lib.socket_test_support import short_socket_directory
 from scripts.message.process_test_support import OwnedTestProcesses
 from scripts.notify import push_texts  # noqa: E402
-import rca  # noqa: E402
+from scripts.message import rca  # noqa: E402
 from scripts.notify import review  # noqa: E402
-import send  # noqa: E402
-import sessions  # noqa: E402
+from scripts.message import send  # noqa: E402
+from scripts.message import sessions  # noqa: E402
 from scripts.production import session_staff  # noqa: E402
 from scripts.production import showrunners, staff, fake_showrunner  # noqa: E402
 from scripts.production.staff_test_support import isolated_staff_file, recorded_showrunner, fixture_member  # noqa: E402
-from test_showrunners import stalled_session_reader  # noqa: E402
+from scripts.production.test_showrunners import stalled_session_reader  # noqa: E402
 from scripts.notify import silence  # noqa: E402
 from scripts.notify.user_action import NoActionRequired  # noqa: E402
 
@@ -264,9 +259,8 @@ pathlib.Path(os.environ['OWNER_TEST_RETURN']).write_text(json.dumps({
     'failure': failure, 'delivered': pathlib.Path(os.environ['OWNER_TEST_RECEIPT']).exists()}))
 # A separate service manager can end the test's caller group without signalling its own group.
 subprocess.run([sys.executable, '-c',
-    "import pathlib, signal, sys; "
-    "sys.path.insert(0, str(pathlib.Path.cwd() / 'scripts' / 'lib')); "
-    "import process_group; "
+    "import signal, sys; "
+    "from scripts.lib import process_group; "
     "process_group.send_process_group(int(sys.argv[1]), signal.SIGTERM)",
     str(os.getpgrp())], start_new_session=True, check=True)
 """
@@ -303,10 +297,10 @@ subprocess.run([sys.executable, '-c',
                 self.assertEqual(receipt.read_text(), "delivered")
 
     def test_the_same_session_and_commands_join_the_case_until_it_is_fixed(self) -> None:
-        two = rca.Report("modules", "natedev", "auto_mode", ("implement.sh --to modules-impl",
+        two = rca.Report("modules", "natedev", "auto_mode", ("assign.sh --role implement --to modules-impl",
                                                              "review.sh  --to modules-test"), production="cargo-liner")
         self.assertEqual(rca.open_case(two, OPENED), "rca: opened 261023-1")
-        swapped = two._replace(commands=("review.sh --to modules-test", "implement.sh --to modules-impl"))
+        swapped = two._replace(commands=("review.sh --to modules-test", "assign.sh --role implement --to modules-impl"))
         self.assertEqual(rca.open_case(swapped, OPENED), "rca: joined 261023-1")
         self.assertEqual(self.case("261023-1")["alerts"], 2)
         self.assertEqual(len(self.sends()), 1)
@@ -337,8 +331,7 @@ subprocess.run([sys.executable, '-c',
         self.assertEqual(self.case("261023-3")["production"], "cargo-liner")
 
     def test_native_identity_uses_the_shared_member_resolver(self) -> None:
-        sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "production"))
-        import unit_lookup
+        from scripts.production import unit_lookup
         self.assertIs(session_staff.member_sources, unit_lookup.member_sources)
 
     def test_a_by_hand_open_takes_the_newest_transcript_of_the_session_it_names(self) -> None:
@@ -382,7 +375,7 @@ subprocess.run([sys.executable, '-c',
                                  (("write phases/34h/state.json (34h phase record)",), "a file change"),
                                  (("Edit",), "a file change"), (("WebFetch",), "an action"),
                                  (("mcp__brp__brp_launch",), "an action"), (("cargo",), "a shell command"),
-                                 (("implement.sh --to modules-impl", "review.sh --to modules-test"), "2 shell commands"),
+                                 (("assign.sh --role implement --to modules-impl", "review.sh --to modules-test"), "2 shell commands"),
                                  (("write a.json", "edit b.py"), "2 file changes"),
                                  (("write a.json", "cargo build"), "2 actions"), ((), "an action"), ((" ",), "an action")):
             with self.subTest(commands=commands):
@@ -630,7 +623,9 @@ subprocess.run([sys.executable, '-c',
         with (rca.STATE / ".lock").open("a+") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
             began = monotonic()
-            with redirect_stderr(errors):
+            # The lock deadline must cover lock contention, without interpreter startup.
+            with (redirect_stderr(errors),
+                  mock.patch.object(rca, "send", return_value=(True, "SENT: fixture"))):
                 rca.remind(OPENED, deadline=began + 0.2)
             self.assertLess(monotonic() - began, 1.5)
         self.assertFalse(self.case("261023-1").get("owner_told", True))

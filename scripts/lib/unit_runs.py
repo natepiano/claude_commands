@@ -13,21 +13,29 @@ A test points a reader at its own folder with an override, which replaces both n
 Staff supplies each run's current owner. Run records keep task history.
 """
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import argparse
 import fcntl
-import json
 import os
 import sys
 import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from enum import Enum
+from functools import cache
 from pathlib import Path
 from importlib import import_module
 from typing import TYPE_CHECKING, Literal, NamedTuple, cast
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+if __name__ == "unit_runs":
+    _ = sys.modules.setdefault("scripts.lib.unit_runs", sys.modules[__name__])
+elif __name__ == "scripts.lib.unit_runs":
+    _ = sys.modules.setdefault("unit_runs", sys.modules[__name__])
+
 if TYPE_CHECKING:
     from scripts.production import staff
 
@@ -35,6 +43,7 @@ RUN_TEMP_NAME = "tmp"
 # SCRATCH_ROOT also selects the parent folder for temporary unit runs.
 RUN_ROOT = Path(os.environ.get("SCRATCH_ROOT") or "/tmp/claude/scratch").parent / "unit"
 FORMER_RUN_ROOT = RUN_ROOT.parent / "delegate"
+ASTRA_RUN_ROOT = Path(os.environ.get("ASTRA_REVIEW_DIR") or "/tmp/claude/astra")
 # Notifier instances a unit run once had; conversation_pause names them "status reports".
 INSTANCE_PREFIXES = ("unit-", "delegate-")
 # A run's shared liveness log, beaten every 60 s per worker while one runs.
@@ -81,9 +90,7 @@ def run_owner(fields: Mapping[str, object], record: staff.StaffSnapshot) -> staf
     identity = fields.get("main_agent")
     agent = cast(dict[str, object], identity) if isinstance(identity, dict) else {}
     reference = agent.get("session_id") or fields.get("owner_session") or fields.get("director_session")
-    row = record.by_member_reference(reference) if isinstance(reference, str) and reference else None
-    if row is not None and row.kind == "worker":
-        row = record.parent_of(row)
+    row = record.owner_of(reference) if isinstance(reference, str) and reference else None
     return row if row is not None and row.kind == "unit" else RunOwnerUnrecorded("run has no unit staff owner")
 
 
@@ -121,6 +128,9 @@ def worker_transport(run: Path) -> Literal["mesh", "herdr"]:
         except FileNotFoundError:
             selected = conf.read("direct").text("WORKER_TRANSPORT")
             selected = _transport(selected, run)
+            if selected == "mesh":
+                print("unit_runs: new runs require herdr; refusing a new mesh pin", file=sys.stderr)
+                raise SystemExit(2)
             write_text_atomic(pin, selected + "\n")
         return _transport(selected, pin)
 
@@ -210,12 +220,14 @@ def marker_must_stay(path: Path) -> bool:
     The marker name is the session id; its age and target's existence say nothing
     about the owning process. Reuse the registry's process-identity check.
     """
-    if TYPE_CHECKING:
-        from ..message import sessions
-    else:
-        sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "message"))
-        import sessions
+    from scripts.message import sessions
     return not isinstance(sessions.session_liveness(path.name), sessions.SessionNotLive)
+
+
+@cache
+def report_anomaly(message: str) -> None:
+    """Print each run anomaly once per process."""
+    print(message, file=sys.stderr)
 
 
 def director(run: Path, *, dependencies: Callable[[Path], None] | None = None,
@@ -230,26 +242,31 @@ def director(run: Path, *, dependencies: Callable[[Path], None] | None = None,
         find_parent = cast(Callable[..., staff.StaffRow], import_module("scripts.production.worker_admission").parent)
         return find_parent(staff.local_snapshot() if isinstance(record, RunStaffAtUse) else record, run=run).current_session
     except (OSError, ValueError) as error:
-        print(f"anomaly: {run}: {error}", file=sys.stderr)
+        report_anomaly(f"anomaly: {run}: {error}")
         return ""
+
+
+def run_folders(root_override: str | Path | None = None) -> list[Path]:
+    """List unique run folders in root and name order, without marker folders."""
+    folders: dict[Path, Path] = {}
+    for root in run_roots(root_override):
+        try:
+            candidates = sorted(root.iterdir())
+        except OSError:
+            continue
+        for folder in candidates:
+            if folder != root / "active" and folder.is_dir():
+                _ = folders.setdefault(folder.resolve(), folder)
+    return list(folders.values())
 
 
 def held_by_session(root_override: str | Path | None = None, *,
                     record: staff.StaffSnapshot | RunStaffAtUse = RunStaffAtUse.LOCAL) -> dict[str, list[str]]:
-    """Read each folder's director once, in root order and then name order."""
+    """Read each run's director once, in root and name order."""
     found: dict[str, list[str]] = {}
-    seen: set[Path] = set()
-    for root in run_roots(root_override):
-        try:
-            folders = sorted(root.iterdir())
-        except OSError:
-            continue
-        for folder in folders:
-            resolved = folder.resolve()
-            if (folder.is_dir() and resolved not in seen
-                    and any((folder / name).is_file() for name in (STATE_FILE, "mesh_roster.json"))):
-                seen.add(resolved)
-                found.setdefault(director(folder, record=record), []).append(str(folder))
+    for folder in run_folders(root_override):
+        if any((folder / name).is_file() for name in (STATE_FILE, "mesh_roster.json")):
+            found.setdefault(director(folder, record=record), []).append(str(folder))
     return found
 
 
@@ -284,58 +301,6 @@ def held(session_id: str, root_override: str | Path | None = None,
             seen.add(resolved)
             runs.append(folder)
     return runs
-
-
-def _json_object(text: str) -> dict[str, object]:
-    try:
-        raw = cast(object, json.loads(text))
-    except ValueError:
-        return {}
-    return cast(dict[str, object], raw) if isinstance(raw, dict) else {}
-
-
-def migrate_owners(root: Path, *, dry_run: bool = False) -> int:
-    """Replace active run names with proved staff ids; keep history files unchanged."""
-    from scripts.lib import atomic_file
-    from scripts.production import staff
-
-    unavailable = False
-    for path in sorted(root.glob(f"*/{STATE_FILE}")):
-        try:
-            with (path.parent / ".progress_history.lock").open("a+") as lock:
-                fcntl.flock(lock, fcntl.LOCK_EX)
-                fields = _json_object(path.read_text(encoding="utf-8"))
-                if not fields:
-                    raise ValueError(f"{path}: run state is unreadable")
-                if fields.get("status") != "active":
-                    continue
-                record = staff.snapshot()
-                owner = run_owner(fields, record)
-                if isinstance(owner, RunOwnerUnrecorded):
-                    production, unit = fields.get("production"), fields.get("unit")
-                    parents = {row.id for row in record.find(kind="showrunner") if row.name == production}
-                    matches = [row for row in record.find(kind="unit") if isinstance(row.parent, staff.ReportsTo) and row.parent.id in parents
-                               and isinstance(unit, str) and row.name == unit]
-                    if len(matches) != 1:
-                        raise staff.StaffUnreadable(f"{path}: run owner is unavailable")
-                    owner = matches[0]
-                changed = dict(fields)
-                changed[OWNER_FIELD] = owner.id
-                folder = fields.get("working_dir")
-                for key in ("plan_doc", "project_plan_doc"):
-                    value = fields.get(key)
-                    if isinstance(folder, str) and isinstance(value, str) and value.startswith(folder + "/"):
-                        changed[key] = str(Path(value).relative_to(folder))
-                for key in ("production", "unit", "working_dir", "worktree", "branch"):
-                    _ = changed.pop(key, None)
-                if changed != fields:
-                    if not dry_run:
-                        atomic_file.write_text_atomic(path, json.dumps(changed, indent=2, sort_keys=True) + "\n")
-                    print(f"{'would migrate' if dry_run else 'migrated'} {path}: {owner.id}")
-        except (OSError, ValueError) as error:
-            unavailable = True
-            print(f"run owner unavailable: {error}", file=sys.stderr)
-    return int(unavailable)
 
 
 class FormerOwner(NamedTuple):
@@ -435,12 +400,6 @@ def main(argv: list[str]) -> int:
             print(f"unit_runs: {error}", file=sys.stderr)
             return 2
         return 0
-    if argv and argv[0] == "migrate-owners":
-        parser = argparse.ArgumentParser(description="Migrate active run owners to staff ids.")
-        _ = parser.add_argument("--root", type=Path, required=True)
-        _ = parser.add_argument("--dry-run", action="store_true")
-        args = parser.parse_args(argv[1:])
-        return migrate_owners(cast(Path, args.root), dry_run=cast(bool, args.dry_run))
     if len(argv) == 3 and argv[0] == "activate":
         try:
             activate(Path(argv[1]), argv[2])
@@ -459,11 +418,7 @@ def main(argv: list[str]) -> int:
         print("usage: unit_runs.py removal-check | history-root | move-history | activate <run folder> <session id> | held <session id> | worker-transport <run folder>",
               file=sys.stderr)
         return 2
-    if TYPE_CHECKING:
-        from ..message.sessions import running_sessions
-    else:
-        sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "message"))
-        from sessions import running_sessions
+    from scripts.message.sessions import running_sessions
 
     return removal_check({record["sessionId"]: record["name"] for record in running_sessions()})
 

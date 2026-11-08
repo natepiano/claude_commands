@@ -20,15 +20,81 @@ import os
 import hashlib
 from unittest.mock import patch
 import subprocess
+import shutil
 import sys
 import tempfile
 from typing import override
 from scripts.direct import wait_for_test_state
 from scripts.direct.wait_for_test_state import wait_until
+from scripts.lib.test_models_registry import RegistryReadProbe, write_registry
 
 
 class ReviewLauncherPassTests(support.ReviewLauncherFixture):
 
+    def test_review_reads_one_registry_snapshot_across_its_child_processes(self) -> None:
+        session = self.start_implementation("registry-snapshot")
+        self.finish_implementation(session)
+        environment = self.environment()
+        probe = RegistryReadProbe(self.root, Path(environment["MODELS_CONFIG_FILE"]))
+        result = subprocess.run(self.review_command(session, "contract", ""),
+                                env=probe.environment(environment), capture_output=True, text=True,
+                                timeout=TEST_HANG_GUARD_SECS)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(len(probe.reads()), 1, probe.reads())
+
+    def test_review_helper_keeps_the_launch_generation_after_a_registry_edit(self) -> None:
+        session = self.start_implementation("review-helper-generation")
+        self.finish_implementation(session)
+        environment = self.environment()
+        registry = Path(environment["MODELS_CONFIG_FILE"])
+        _ = write_registry(registry, {"assignments": {"direct": "claude"},
+            "direct.claude": {"review": "opus:high"},
+            "claude.agents": {"opus": "high", "sonnet": "low"}})
+        _ = (self.root / ".claude.json").write_text('{"oauthAccount":{"emailAddress":"review@example.invalid"}}')
+        backend = self.root / "bin/claude"
+        backend.parent.mkdir(exist_ok=True)
+        _ = backend.write_text("#!" + sys.executable + '''
+import json, os, sys
+from pathlib import Path
+Path(os.environ["REVIEW_AGENT"]).write_text(json.dumps({"arguments": sys.argv[1:], "environment": dict(os.environ)}))
+print(json.dumps({"type": "result", "result": "No findings."}))
+''')
+        backend.chmod(0o755)
+        scripts = Path(__file__).resolve().parents[1]
+        helper = self.root / "scripts/agents/agent_exec.sh"
+        agent_exec = helper.with_name("agent_exec_real.sh")
+        _ = shutil.copy2(scripts / "agents/agent_exec.sh", agent_exec)
+        for name in ("claude_account.sh", "claude_result.py"):
+            _ = shutil.copy2(scripts / "agents" / name, helper.with_name(name))
+        _ = shutil.copy2(scripts / "lib/nix_env.py", self.root / "scripts/lib/nix_env.py")
+        _ = helper.write_text('''#!/usr/bin/env bash
+set -euo pipefail
+python3 - <<'EDIT'
+import os
+from pathlib import Path
+path = Path(os.environ["MODELS_CONFIG_FILE"])
+path.write_text(os.environ["NEXT_REVIEW_REGISTRY"])
+EDIT
+exec bash "''' + str(agent_exec) + '''" "$@"
+''')
+        recorded = self.root / "review-agent.json"
+        environment.update(PATH=str(backend.parent) + os.pathsep + environment["PATH"], REVIEW_AGENT=str(recorded),
+            CLAUDE_CONFIG_DIR="",
+            CODEX_CATALOG_SYNC_STATE_FILE=str(registry),
+            NEXT_REVIEW_REGISTRY=registry.read_text().replace("review=opus:high", "review=sonnet:low"))
+        probe = RegistryReadProbe(self.root, registry)
+        result = subprocess.run(self.review_command(session, "contract", ""), env=probe.environment(environment),
+            capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        launched = cast(dict[str, object], json.loads(recorded.read_text()))
+        arguments = cast(list[str], launched["arguments"])
+        self.assertEqual(arguments[arguments.index("--model") + 1], "opus")
+        self.assertEqual(arguments[arguments.index("--effort") + 1], "high")
+        self.assertNotIn("MODELS_LAUNCH_CONFIGURATION", cast(dict[str, str], launched["environment"]))
+        self.assertNotIn("MODELS_REGISTRY_EDIT_BASE", cast(dict[str, str], launched["environment"]))
+        self.assertIn("review=sonnet:low", registry.read_text())
+        self.assertEqual(len(probe.reads()), 1, probe.reads())
+        self.assertIn("agent=opus", (session / "review_agent_contract").read_text())
 
     @override
     def environment(self) -> dict[str, str]:
@@ -264,6 +330,18 @@ class ReviewLauncherPassTests(support.ReviewLauncherFixture):
         )
 
 
+    def test_a_refused_launch_check_removes_a_stale_review_slot(self) -> None:
+        session = self.start_implementation("stale-review-slot")
+        self.finish_implementation(session)
+        phase = session / "phases/99"
+        phase.mkdir(parents=True)
+        slot = phase / "review_slot_contract"
+        _ = slot.write_text("review2\n", encoding="utf-8")
+        result = self.checked_review(session, "--phase", "99", lens="contract")
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("unable to check the review launch", result.stderr)
+        self.assertFalse(slot.exists())
+
     def test_codex_reviewers_must_use_assign(self) -> None:
         session = self.start_implementation("codex-refused")
         self.finish_implementation(session)
@@ -329,7 +407,7 @@ class FixtureReadinessTests(unittest.TestCase):
                         return False  # Exit races the wait, after registration.
                     return child.poll() is not None
 
-                def polling_waiter(_a: Path, _b: Path) -> IntervalReleasePolling:
+                def polling_waiter(_a: Path, _b: Path, _mask: int) -> IntervalReleasePolling:
                     return IntervalReleasePolling()
 
                 with ExitStack() as patches:

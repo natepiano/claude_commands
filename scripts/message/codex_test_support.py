@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, cast, final
 
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
-import codex_daemon
+from scripts.message import codex_daemon
 if TYPE_CHECKING:
     from scripts.message import roster
 

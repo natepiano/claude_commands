@@ -18,6 +18,7 @@ from typing import cast
 
 from scripts.buildlog import store
 from scripts.lib.cargo_target_config import cargo_path_argument
+
 from scripts.lib.test_phase import TEST_STEPS as TEST_STEPS
 
 

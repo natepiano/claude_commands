@@ -15,6 +15,30 @@ def mac_idle_reservation(holder: str, detail: str) -> str:
 
 
 ENTRIES = (
+    PushText("nightly.result", "nightly", "note", "Nightly check {outcome}", NoActionNeeded(),
+        "The nightly check of {branch} finished at {time}.\nType check: {types}.\nFull tests: {tests}.",
+        (PushExample("passed", {"branch": "main", "time": "03:53 EST", "outcome": "passed",
+                               "types": "passed", "tests": "passed"}),
+         PushExample("tests_failed", {"branch": "main", "time": "03:53 EST", "outcome": "failed",
+             "types": "passed", "tests": "failed in direct/test_simplify_lens.py, production/test_staff.py"}),
+         PushExample("types_failed", {"branch": "main", "time": "03:53 EST", "outcome": "failed",
+             "types": "failed with 3 errors, 1 warning, 0 notes", "tests": "passed"}),
+         PushExample("many_failed", {"branch": "main", "time": "03:53 EST", "outcome": "failed",
+             "types": "passed", "tests": "failed in direct/test_assign.py, direct/test_board.py, "
+             + "message/test_send.py, notify/test_review.py, production/test_staff.py, "
+             + "shutdown/test_restart.py, settings/test_settings.py, whoami/test_usage.py and 12 more"}),
+         PushExample("did_not_finish", {"branch": "main", "time": "03:53 EST", "outcome": "failed",
+                                       "types": "did not run", "tests": "did not finish"})),
+        purpose="The nightly check finished. It says which parts passed."),
+    PushText("nightly.not_run", "nightly", "note", "Nightly check did not run", ActionTemplate("{action}"),
+        "The nightly check of {branch} did not run at {time}.\nWhy: {reason}.",
+        (PushExample("fetch_failed", {"branch": "main", "time": "03:53 EST",
+             "reason": "git fetch of main failed: ssh connection timed out",
+             "action": "None. The next nightly run tries again."}),
+         PushExample("cold_credentials", {"branch": "main", "time": "03:53 EST",
+             "reason": "GitHub credentials are cold",
+             "action": "In a terminal on natedev, run github-warmup"})),
+        purpose="The nightly check did not run. It says why."),
     PushText("decision.choices", "{sender}", "decision", "{title}",
         ActionTemplate("On {machine}, reply in the {session} terminal: {choice_labels}."),
         "Situation: {situation}\n\nChoices:\n{choices}\n\n"
@@ -81,7 +105,7 @@ ENTRIES = (
         purpose="A session waits for you to answer its permission prompt.",
         session=SessionTemplate("{unit}")),
     PushText("shutdown.restart_failed", "shutdown", "decision", "Claude coding work remains stopped",
-        ActionTemplate('In the Claude session named natedev on the natedev computer, run /shutdown restart {account}.'),
+        ActionTemplate('In the Claude session named natedev on the natedev computer, run /agents restart {account}.'),
         "After your restart request, {stopped} on Claude account {account} did not restart on {machine}. "
         + "Coding work stays stopped until the restart succeeds.\n\n"
         + "The restart gave this error: {cause}.\n\n"
@@ -94,7 +118,7 @@ ENTRIES = (
         purpose="One restart problem sends one push with the failed session count."),
     PushText("shutdown.restart_untrusted", "shutdown", "decision", "Stopped Claude work needs folder trust",
         ActionTemplate("In a terminal on {machine}, run ~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py trust. "
-                       + "Then run /shutdown restart {account} in the natedev session."),
+                       + "Then run /agents restart {account} in the natedev session."),
         "After your restart request, {stopped} on Claude account {account} could not start on {machine}. Coding work stays stopped. "
         + "The first command trusts the configured folders. The second retries stopped sessions.",
         (PushExample("typical", {"stopped": "3 sessions", "machine": "natedev", "account": "claude2"}),),
@@ -117,7 +141,7 @@ ENTRIES = (
              "machine": "Mac", "source": "claude2", "target": "claude4"})),
         purpose="A session stopped for an account move did not start on its new account."),
     PushText("shutdown.restart_incomplete", "shutdown", "decision", "Claude restart could not be confirmed",
-        ActionTemplate('In the Claude session named natedev on the natedev computer, run /shutdown restart {account}.'),
+        ActionTemplate('In the Claude session named natedev on the natedev computer, run /agents restart {account}.'),
         "The restart of Claude account {account} could not be confirmed on {machine}. "
         + "Its stopped sessions may still be unable to work. Retrying asks any sessions that are still stopped to start again.",
         (PushExample("typical", {"account": 'claude2', "machine": "Mac"}),

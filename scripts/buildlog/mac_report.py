@@ -24,7 +24,7 @@ from scripts.buildlog.mac_outcome import (
     UsableShare, is_mac_candidate, is_mac_step, offload_record, share_of_records,
 )
 
-from scripts.lib.user_zone import user_zone
+from scripts.lib.user_zone import user_zone  # noqa: E402
 
 LOCAL_MAC_UNAVAILABLE_PATTERNS = (
     r"\bmac\b.*\b(?:unavailable|busy|blocked|unreachable|offline|not available|not reachable)\b",

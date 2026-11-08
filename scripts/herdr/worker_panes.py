@@ -1,5 +1,9 @@
 """Start, observe, and close staff workers through proved native panes."""
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import argparse
 import fcntl
@@ -11,19 +15,14 @@ import subprocess
 import sys
 import time
 from threading import Event
-from collections.abc import Callable, Generator, Sequence
+from collections.abc import Callable, Generator, Mapping, Sequence
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from enum import Enum, IntEnum
 from importlib import import_module
-from typing import cast, final
+from typing import Literal, cast, final
 
-if not __package__:
-    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-
-import herdr
-import pane_launch
+from scripts.herdr import herdr, pane_launch
 from scripts.lib import conf, models_registry, nix_env, unit_runs
 from scripts.production import staff, worker_admission
 from scripts.agents import worker_lifecycle
@@ -32,6 +31,44 @@ from scripts.direct import recorder_state
 StaffId = staff.StaffId
 WorkerName = staff.WorkerName
 WorkerRole = staff.WorkerRole
+
+
+@dataclass(frozen=True)
+class StaffWorker:
+    parent: StaffId
+    name: WorkerName
+    role: WorkerRole
+
+
+@dataclass(frozen=True)
+class ReplyToCaller:
+    """Send the answer to the caller with the message command."""
+
+
+@dataclass(frozen=True)
+class TranscriptReply:
+    """Read the answer from the consultation transcript."""
+
+
+REPLY_TO_CALLER = ReplyToCaller()
+
+
+@dataclass(frozen=True)
+class ConsultationPane:
+    label: str
+    cwd: Path
+    question: str = ""
+    delivery: ReplyToCaller | TranscriptReply = REPLY_TO_CALLER
+
+
+@dataclass(frozen=True)
+class DurableDesignRole:
+    parent: StaffId
+    name: WorkerName
+    role: WorkerRole
+
+
+PaneTarget = StaffWorker | ConsultationPane | DurableDesignRole
 
 
 @dataclass(frozen=True)
@@ -263,9 +300,9 @@ def agent_inventory(client: herdr.Herdr) -> list[herdr.AgentOccupant]:
     return client.agents()
 
 
-def _stop_row(row: staff.StaffRow, client: herdr.Herdr) -> bool:
-    stop = cast(Callable[[staff.StaffRow, herdr.Herdr], bool], import_module("scripts.shutdown.restart").stop_row)
-    return stop(row, client)
+def _stop_row(row: staff.StaffRow, client: herdr.Herdr, *, deadline: float) -> bool:
+    stop = cast(Callable[..., bool], import_module("scripts.shutdown.restart").stop_row)
+    return stop(row, client, deadline=deadline)
 
 
 def _read_panes(record: staff.StaffSnapshot, client: herdr.Herdr) -> PaneRead | PaneReadUnavailable:
@@ -361,8 +398,34 @@ def observe_parents(parents: Sequence[staff.StaffRow], record: staff.StaffSnapsh
     return {parent.id: _parent_evidence(parent.id, record, client, read).states for parent in parents}
 
 
-def worker_run(parent: staff.StaffRow) -> Path:
-    runs = unit_runs.held(str(parent.current_session))
+def worker_state(observed: WorkerPane) -> Literal["idle", "busy", "unknown"]:
+    """Use one activity rule for staff workers and held roles."""
+    if isinstance(observed, OpenWorker):
+        return "idle" if observed.status in (herdr.AgentStatus.IDLE, herdr.AgentStatus.DONE) else "unknown" if observed.status == herdr.AgentStatus.UNKNOWN else "busy"
+    if isinstance(observed, (StoppedWorker, ClosedWorker)):
+        return "idle"
+    return "unknown"
+
+
+def labelled_pane(panes: Sequence[Mapping[str, object]], tab: str, label: str, *,
+                  exclude: str = "") -> Mapping[str, object] | herdr.NoPane:
+    """Prove one labelled pane and its unique terminal in the requested tab."""
+    matches = [pane for pane in panes if pane.get("pane_id") != exclude
+               and pane.get("tab_id") == tab and pane.get("label") == label]
+    if not matches:
+        return herdr.NoPane(label)
+    if len(matches) != 1:
+        raise ValueError(f"{label}: duplicate labelled panes")
+    pane = matches[0]
+    terminal = pane.get("terminal_id")
+    if not terminal or sum(item.get("terminal_id") == terminal for item in panes) != 1:
+        raise ValueError(f"{label}: terminal identity is missing or duplicated")
+    return pane
+
+
+def worker_run(parent: staff.StaffRow, *,
+               record: staff.StaffSnapshot | unit_runs.RunStaffAtUse = unit_runs.RunStaffAtUse.LOCAL) -> Path:
+    runs = unit_runs.held(str(parent.current_session), os.environ.get("ROSTER_RUN_ROOT"), record=record)
     if runs:
         return Path(runs[0])
     return Path(unit_runs.environ("RUN_DIR")) if unit_runs.environ("RUN_DIR") else unit_runs.state_dir() / "staff" / "workers" / parent.id
@@ -380,18 +443,23 @@ def _passes(run: Path) -> list[dict[str, object]]:
 
 
 def worker_pass(row: staff.StaffRow, run: Path) -> dict[str, object]:
+    def started_at(item: dict[str, object]) -> float:
+        value = item.get("started_at")
+        return value if isinstance(value, (int, float)) else float("-inf")
+
     no_pass: dict[str, object] = {}
-    return next((item for item in reversed(_passes(run)) if item.get("worker_name") == row.name
-                 or item.get("team_slot") == row.name), no_pass)
+    return max((item for item in reversed(_passes(run)) if item.get("worker_name") == row.name
+                or item.get("team_slot") == row.name), key=started_at, default=no_pass)
 
 
 def dispatch_role(row: staff.StaffRow) -> WorkerRole | WorkerRoleUnavailable:
-    """Read the worker's recorded role through the current shared pass reader."""
-    parent = staff.snapshot().parent_of(row)
-    if parent is None:
-        return WorkerRoleUnavailable("worker parent is unavailable")
-    role = worker_pass(row, worker_run(parent)).get("kind")
-    return role if isinstance(role, str) and role in staff.WORKER_ROLES else WorkerRoleUnavailable("dispatch role is unavailable")
+    """Read the worker's role from its newest open or finished dispatch."""
+    from scripts.direct import progress_history
+
+    dispatch = progress_history.last_dispatch(row.id)
+    if isinstance(dispatch, progress_history.RecordedDispatch) and dispatch.role in staff.WORKER_ROLES:
+        return dispatch.role
+    return WorkerRoleUnavailable("dispatch role is unavailable")
 
 
 def _idle_checks(row: staff.StaffRow, run: Path,
@@ -428,6 +496,8 @@ def stage_two_completion_id(dispatch_id: str) -> str:
 def can_close(worker: OpenWorker | StoppedWorker, *,
               run: DispatchRun | HolderRun = HolderRun.CURRENT,
               lock: WorkerLockHold | WorkerLockAtUse = WorkerLockAtUse.ACQUIRE) -> CloseAllowed | Kept:
+    from scripts.direct import progress_history
+
     record = staff.snapshot()
     parent = record.parent_of(worker.row)
     if parent is None:
@@ -439,7 +509,13 @@ def can_close(worker: OpenWorker | StoppedWorker, *,
     if worker.status not in (herdr.AgentStatus.IDLE, herdr.AgentStatus.DONE):
         return Kept(f"agent state is {worker.status.value}")
     passed = worker_pass(worker.row, directory)
-    if passed.get("status") != "completed":
+    if passed:
+        status, dispatch = passed.get("status"), passed.get("instance_id")
+    else:
+        latest = progress_history.last_dispatch(worker.row.id)
+        status, dispatch = ((latest.status, latest.instance_id)
+                            if isinstance(latest, progress_history.RecordedDispatch) else ("", ""))
+    if status != "completed":
         return Kept("launcher has not recorded a completed pass")
     try:
         backend = staff.backend(worker.row)
@@ -450,7 +526,6 @@ def can_close(worker: OpenWorker | StoppedWorker, *,
         if any(isinstance(entry, worker_admission.TornTranscriptRecord) for entry in entries):
             return Kept("worker transcript has incomplete records")
         messages = [entry for entry in entries if isinstance(entry, str) and entry]
-        dispatch = passed.get("dispatch_id", passed.get("instance_id"))
         if (not isinstance(dispatch, str) or not dispatch or not messages
                 or not messages[-1].startswith("assistant:\n")
                 or messages[-1].rstrip().splitlines()[-1] not in
@@ -469,6 +544,27 @@ def launch_policy(role: WorkerRole) -> LaunchPolicy:
     sandbox = READ_ONLY_SANDBOX if role in ("review", "astra-reviewer") else WORKER_SANDBOX
     if role == "astra-designer":
         sandbox = design_roles.DESIGNER_SANDBOX
+    return _launch_policy(settings, sandbox)
+
+
+def astra_review_policy(model: str, effort: str) -> LaunchPolicy:
+    """Use the supplied review settings with fixed read-only Codex access."""
+    from scripts.agents.codex_mesh import READ_ONLY_SANDBOX
+
+    settings = models_registry.LaunchSettings("codex", model, effort, "")
+    return LaunchPolicy(settings, READ_ONLY_SANDBOX, "plan")
+
+
+def worker_policy(settings: models_registry.LaunchSettings) -> LaunchPolicy:
+    """Use the worker's file permissions with the supplied model settings."""
+    from scripts.agents.codex_mesh import WORKER_SANDBOX
+
+    return _launch_policy(settings, WORKER_SANDBOX)
+
+
+def _launch_policy(settings: models_registry.LaunchSettings, sandbox: str) -> LaunchPolicy:
+    from scripts.agents.codex_mesh import READ_ONLY_SANDBOX
+
     permission = "plan" if sandbox == READ_ONLY_SANDBOX else "bypassPermissions"
     return LaunchPolicy(settings, sandbox, permission)
 
@@ -477,7 +573,8 @@ def _policy_arguments(policy: LaunchPolicy) -> list[str]:
     settings = policy.settings
     if settings.kind == "codex":
         arguments = ["--model", settings.model, "--sandbox", policy.sandbox, "--ask-for-approval", "never",
-                      "-c", f'model_reasoning_effort="{settings.effort}"']
+                      "-c", f'model_reasoning_effort="{settings.effort}"',
+                      "-c", "notice.hide_rate_limit_model_nudge=true"]
         if settings.service_tier:
             arguments += ["-c", f'service_tier="{settings.service_tier}"']
         return arguments
@@ -487,9 +584,11 @@ def _policy_arguments(policy: LaunchPolicy) -> list[str]:
     return arguments
 
 
-def launch_arguments(policy: LaunchPolicy, identity: str) -> list[str]:
+def launch_arguments(policy: LaunchPolicy, identity: str, directory: Path | str) -> list[str]:
     if policy.settings.kind == "codex":
         launch = (["resume", identity] if identity else []) + ["--no-daemon"]
+        if identity:
+            launch += ["--cd", str(directory)]
     else:
         launch = ["--resume", identity] if identity else []
     return launch + _policy_arguments(policy)
@@ -551,14 +650,15 @@ def _destination(parent: staff.StaffRow, name: str, evidence: PaneEvidence,
         return _uncertain(parent, "parent pane is unavailable or duplicated")
     parent_pane = parents[0]
     tab = _text(parent_pane, "tab_id")
-    labelled = [pane for pane in evidence.panes if pane.get("label") == name and _text(pane, "tab_id") == tab]
-    if labelled:
-        if len(labelled) != 1 or not _text(labelled[0], "terminal_id"):
-            return _uncertain(parent, "recovery terminal is unavailable or duplicated")
-        pane = labelled[0]
-        if not isinstance(client.pane_activity(_text(pane, "pane_id")), herdr.PaneAtShell):
+    try:
+        pane = labelled_pane(evidence.panes, tab, name)
+    except ValueError as error:
+        return _uncertain(parent, str(error))
+    if not isinstance(pane, herdr.NoPane):
+        identity, terminal = str(pane["pane_id"]), str(pane["terminal_id"])
+        if not isinstance(client.pane_activity(identity), herdr.PaneAtShell):
             return StartRefused(StartRefusal.PANE_NOT_AT_SHELL, "labelled recovery pane is live")
-        return herdr.ExistingPane(_text(pane, "pane_id"), _text(pane, "terminal_id"))
+        return herdr.ExistingPane(identity, terminal)
     ratio = conf.read("direct").number("WORKER_SPLIT_RATIO")
     workers = {item.pane for item in evidence.states if isinstance(item, (OpenWorker, StoppedWorker))
                and any(_text(pane, "pane_id") == item.pane and _text(pane, "tab_id") == tab for pane in evidence.panes)}
@@ -581,7 +681,8 @@ def _destination(parent: staff.StaffRow, name: str, evidence: PaneEvidence,
 
 def start_or_resume(parent: StaffId, name: WorkerName, role: WorkerRole | WorkerRoleUnavailable, *,
                     account: ConfiguredWorkerAccount | DestinationWorkerAccount = ConfiguredWorkerAccount.CURRENT,
-                    lock: WorkerLockHold | WorkerLockAtUse = WorkerLockAtUse.ACQUIRE) -> WorkerStart:
+                    lock: WorkerLockHold | WorkerLockAtUse = WorkerLockAtUse.ACQUIRE,
+                    policy: LaunchPolicy | None = None) -> WorkerStart:
     if isinstance(role, WorkerRoleUnavailable):
         return StartRefused(StartRefusal.ROLE_UNAVAILABLE, role.reason)
     if role not in staff.WORKER_ROLES:
@@ -595,7 +696,7 @@ def start_or_resume(parent: StaffId, name: WorkerName, role: WorkerRole | Worker
     allowed = worker_admission.WorkerStartAllowed(name.value, parent, run,
         worker_admission.ExistingWorkerSlot(existing) if existing is not None else worker_admission.NewWorkerSlot())
     try:
-        policy = launch_policy(role)
+        policy = policy if policy is not None else launch_policy(role)
     except (OSError, ValueError, subprocess.SubprocessError) as error:
         return StartRefused(StartRefusal.INVALID_ROLE_CONFIGURATION, str(error))
     try:
@@ -612,36 +713,46 @@ def start_or_resume(parent: StaffId, name: WorkerName, role: WorkerRole | Worker
 
 
 def first_turn_session(client: herdr.Herdr, pane: str, terminal: str) -> str:
-    """Finish the first Codex turn before reading its session report."""
+    """Read the session report, then wait for the first Codex turn to end."""
     settings = conf.read("direct")
     text = settings.text("WORKER_FIRST_TURN_TEXT")
     seconds = settings.number("WORKER_FIRST_TURN_SECONDS")
     deadline = time.monotonic() + seconds
     client.prompt_terminal(pane, terminal, text)
-    if isinstance(client.wait_until(pane, "done", int(seconds * 1000)), herdr.WaitTimedOut):
-        raise herdr.HerdrFailure("first turn timed out; pane retained")
     failure = "first turn timed out"
     while time.monotonic() < deadline:
         try:
-            return client.native_session(pane, "codex", herdr.PROGRAM_TIMEOUT_SECONDS)
+            session = client.native_session(pane, "codex", herdr.PROGRAM_TIMEOUT_SECONDS)
         except (herdr.HerdrFailure, OSError, ValueError, subprocess.SubprocessError) as error:
             failure = str(error)
-        _ = Event().wait(max(0, min(0.1, deadline - time.monotonic())))
+            _ = Event().wait(max(0, min(0.1, deadline - time.monotonic())))
+            continue
+        remaining_ms = int(max(0, deadline - time.monotonic()) * 1000)
+        if isinstance(client.wait_turn_end(pane, remaining_ms), herdr.WaitTimedOut):
+            raise herdr.HerdrFailure("first turn timed out; pane retained")
+        return session
     raise herdr.HerdrFailure(f"{failure}; pane retained")
 
 
-def _codex_start_session(client: herdr.Herdr, pane: str) -> str:
-    row = client.pane_row(pane)
+def _codex_start_session(client: herdr.Herdr, pane: str, *,
+                         pane_row: Mapping[str, object] | herdr.PaneNotRead = herdr.PANE_NOT_READ) -> str:
+    row = client.pane_row(pane) if isinstance(pane_row, herdr.PaneNotRead) else pane_row
     if isinstance(row, herdr.NoPane):
         raise herdr.HerdrFailure("Codex pane is missing; pane retained")
     if row.get("session_id"):
-        return client.native_session(pane, "codex", herdr.PROGRAM_TIMEOUT_SECONDS)
-    return first_turn_session(client, pane, row.get("terminal_id", ""))
+        return client.native_session(pane, "codex", herdr.PROGRAM_TIMEOUT_SECONDS, pane_row=row)
+    return first_turn_session(client, pane, str(row.get("terminal_id", "")))
 
 
 def _start_locked(owner: staff.StaffRow, name: WorkerName, role: WorkerRole, policy: LaunchPolicy,
                   account: ConfiguredWorkerAccount | DestinationWorkerAccount,
                   allowed: worker_admission.WorkerStartAllowed, lock: WorkerLockHold) -> WorkerStart:
+    started = time.monotonic()
+    try:
+        start_seconds = conf.read("direct").number("PANE_AGENT_START_SECONDS")
+    except conf.Unusable as error:
+        return StartRefused(StartRefusal.INVALID_ROLE_CONFIGURATION, str(error))
+    deadline = started + start_seconds
     client = _client()
     record = staff.snapshot()
     evidence = _evidence(owner.id, record, client)
@@ -654,10 +765,12 @@ def _start_locked(owner: staff.StaffRow, name: WorkerName, role: WorkerRole, pol
     if current is None:
         parents = evidence.scan.found.get(owner.id, [])
         tab = _text(parents[0], "tab_id") if len(parents) == 1 else ""
-        retained = [pane for pane in evidence.panes if tab and _text(pane, "tab_id") == tab
-                    and pane.get("label") == name.value]
-        if len(retained) == 1:
-            pane = retained[0]
+        try:
+            pane = labelled_pane(evidence.panes, tab, name.value) if tab else herdr.NoPane(name.value)
+        except ValueError as error:
+            return _uncertain(owner, str(error))
+        if not isinstance(pane, herdr.NoPane):
+            pane = dict(pane)
             identity = _text(pane, "pane_id")
             unknown = next((item for item in evidence.scan.unknown if item.pane == identity), None)
             claimed = [key for key, found in evidence.scan.found.items() if pane in found]
@@ -674,8 +787,8 @@ def _start_locked(owner: staff.StaffRow, name: WorkerName, role: WorkerRole, pol
                 return ProcessUnknownWorker(owner, identity, _text(pane, "terminal_id"), str(error))
             if not isinstance(activity, herdr.PaneAtShell):
                 try:
-                    native = (_codex_start_session(client, identity) if policy.settings.kind == "codex" else
-                              client.native_session(identity, policy.settings.kind, herdr.PROGRAM_TIMEOUT_SECONDS))
+                    native = (_codex_start_session(client, identity, pane_row=pane) if policy.settings.kind == "codex" else
+                              client.native_session(identity, policy.settings.kind, herdr.PROGRAM_TIMEOUT_SECONDS, pane_row=pane))
                     row = worker_admission.publish(allowed, native).row
                     lock.bind(row)
                 except (worker_admission.AdmissionRefused, herdr.HerdrFailure, OSError, ValueError, subprocess.SubprocessError) as error:
@@ -693,16 +806,20 @@ def _start_locked(owner: staff.StaffRow, name: WorkerName, role: WorkerRole, pol
         matches = _live_policy(current, policy, client, same_role=passed.get("kind") == role)
         if isinstance(matches, UncertainWorker):
             return matches
-        if matches:
+        same_run = True
+        if owner.kind == "unit" and matches and not passed:
+            try:
+                pane_row = next(pane for pane in evidence.panes if pane.get("pane_id") == current.pane)
+                launched = client.native_pane_process(current.pane, policy.settings.kind, herdr.PROGRAM_TIMEOUT_SECONDS, pane_row=pane_row)
+            except (herdr.HerdrFailure, OSError, ValueError, subprocess.SubprocessError) as error:
+                return _uncertain(current.row, f"running launch environment is unproved: {error}")
+            same_run = launched.environment.get("UNIT_RUN_DIR") == str(allowed.run)
+        if matches and same_run:
             _layout(owner.id, evidence)
             return current
         closable = can_close(current, lock=lock)
         if isinstance(closable, Kept):
             return StartRefused(StartRefusal.BUSY_ROLE_CHANGE, closable.blocker)
-    try:
-        start_seconds = conf.read("direct").number("PANE_AGENT_START_SECONDS")
-    except conf.Unusable as error:
-        return StartRefused(StartRefusal.INVALID_ROLE_CONFIGURATION, str(error))
     environment = launch_environment(policy, account, row is not None)
     if isinstance(environment, StartRefused):
         return environment
@@ -717,7 +834,7 @@ def _start_locked(owner: staff.StaffRow, name: WorkerName, role: WorkerRole, pol
     if isinstance(prepared, nix_env.Refused):
         return StartRefused(StartRefusal.INVALID_ROLE_CONFIGURATION, str(prepared))
     if isinstance(current, OpenWorker):
-        if not _stop_row(current.row, client):
+        if not _stop_row(current.row, client, deadline=deadline):
             return _uncertain(current.row, "agent stop is incomplete; pane retained")
         current = StoppedWorker(current.row, current.pane, current.terminal)
     if isinstance(current, StoppedWorker):
@@ -739,8 +856,8 @@ def _start_locked(owner: staff.StaffRow, name: WorkerName, role: WorkerRole, pol
             return StartRefused(StartRefusal.PANE_NOT_AT_SHELL, "recovery pane has foreground work")
     try:
         launched = herdr.launch_prepared_agent(client.session, destination, prepared, policy.settings.kind,
-            launch_arguments(policy, str(row.current_session) if row else ""), herdr.NoOpeningPrompt(),
-            int(start_seconds * 1000), agent=name.value)
+            launch_arguments(policy, str(row.current_session) if row else "", directory), herdr.NoOpeningPrompt(),
+            int(start_seconds * 1000), agent=name.value, agent_name=f"{owner.name}-{name.value}")
     except (herdr.HerdrFailure, OSError, ValueError, subprocess.SubprocessError) as error:
         return _uncertain(row or owner, f"agent launch is incomplete; pane retained: {error}")
     try:
@@ -807,8 +924,13 @@ def close(parent: StaffId, name: WorkerName, *,
                         else Kept("worker parent is unavailable"))
             if isinstance(closable, Kept):
                 return closable
-            if isinstance(observed, OpenWorker) and not _stop_row(observed.row, client):
-                return _uncertain(row, "agent stop is incomplete; pane retained")
+            if isinstance(observed, OpenWorker):
+                try:
+                    seconds = conf.read("direct").number("PANE_AGENT_START_SECONDS")
+                except conf.Unusable as error:
+                    return Kept(str(error))
+                if not _stop_row(observed.row, client, deadline=time.monotonic() + seconds):
+                    return _uncertain(row, "agent stop is incomplete; pane retained")
             panes = client.panes()
             matches = [pane for pane in panes if pane.get("terminal_id") == observed.terminal]
             if len(matches) != 1 or matches[0]["pane_id"] != observed.pane:

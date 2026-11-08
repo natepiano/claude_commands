@@ -9,6 +9,10 @@ Action counters include zeroes. Read-only children run normally; only their firs
 two command words appear in the report. Pass messages and child output stay private.
 """
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import argparse
 import builtins
@@ -35,7 +39,6 @@ from types import MappingProxyType, ModuleType
 from typing import Literal, cast, override
 from unittest.mock import patch
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 
 class DiscardedTextWrite(io.StringIO):
@@ -132,14 +135,12 @@ class NotesPass:
 
 
 def load_pass() -> NotesPass:
-    # Keep the timer modules on their existing sibling import names.
-    sys.path.insert(0, str(Path(__file__).resolve().parent))
-    notes = import_module("agent_notes")
+    notes = import_module('scripts.whoami.agent_notes')
     watch = import_module("scripts.accounts.refusal_watch")
     watchdog = import_module("scripts.accounts.unit_watchdog")
     return NotesPass(notes, import_module("scripts.accounts.accounts"), watch, watchdog,
-        import_module("quota_alert"), import_module("codex_pacer"), import_module("scripts.whoami.usage_store"),
-        import_module("five_hour"), import_module("scripts.accounts.role_map"),
+        import_module('scripts.whoami.quota_alert'), import_module('scripts.whoami.codex_pacer'), import_module("scripts.whoami.usage_store"),
+        import_module("scripts.whoami.five_hour"), import_module("scripts.accounts.role_map"),
         import_module("scripts.accounts.moves"), import_module("scripts.accounts.next_moves"),
         import_module("scripts.accounts.refusals"), import_module("scripts.production.showrunners"),
         import_module("scripts.whoami.run_out"), import_module("scripts.accounts.outage_alerts"))
@@ -176,8 +177,8 @@ def patch_list(pass_: NotesPass) -> tuple[PassCallPatch, ...]:
         PassCallPatch(pass_.five, "relay", "sends or queues a five-hour message", "profile: message suppressed"),
         PassCallPatch(q, "tell_user", "sends a phone push", result(q, "PushFailed", "profile: push suppressed")),
         PassCallPatch(pass_.five, "cancel_outgoing_notices", "retires queued warnings and removes markers"),
-        PassCallPatch(import_module("escalate"), "close", "removes an escalation and retires its push", False),
-        PassCallPatch(import_module("escalate"), "reconcile_codex_holds", "cancels outgoing account escalation holds"),
+        PassCallPatch(import_module('scripts.message.escalate'), "close", "removes an escalation and retires its push", False),
+        PassCallPatch(import_module('scripts.message.escalate'), "reconcile_codex_holds", "cancels outgoing account escalation holds"),
         PassCallPatch(pass_.roles, "_atomic_write", "updates the remote role-map read cache"),
         PassCallPatch(pass_.roles, "write_role_map", "changes account roles locally or remotely"),
         PassCallPatch(pass_.moves, "append_move", "appends the move journal"),

@@ -26,7 +26,7 @@ from scripts.buildlog import record
 from scripts.buildlog import store
 
 from pathlib import Path
-from scripts.lib.user_zone import user_zone
+from scripts.lib.user_zone import user_zone  # noqa: E402
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.build_targets.target_config import SshTarget, read_targets
 from scripts.lib import conf

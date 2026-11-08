@@ -13,8 +13,8 @@ from io import StringIO
 from pathlib import Path
 from typing import NotRequired, TypedDict, cast
 
-from model_study import extract
-from turns import read_session
+from scripts.model_study.model_study import extract
+from scripts.model_study.turns import read_session
 
 
 class CacheCreation(TypedDict, total=False):

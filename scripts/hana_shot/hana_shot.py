@@ -1,7 +1,11 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
 """Frame Hana's camera on a known view over BRP and save a timed screenshot."""
 
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 from functools import partial
 
@@ -15,7 +19,6 @@ from difflib import get_close_matches
 from enum import StrEnum
 from functools import cache
 import http.client
-import importlib.util
 import json
 import math
 import os
@@ -31,32 +34,11 @@ import sys
 import tempfile
 import time
 import tomllib
-from types import FrameType, ModuleType
-from typing import TYPE_CHECKING, IO, Literal, NamedTuple, NoReturn, NotRequired, TypedDict, cast, override
+from types import FrameType
+from typing import IO, Literal, NamedTuple, NoReturn, NotRequired, TypedDict, cast, override
 
-def _load_library(name: str) -> ModuleType:
-    """Load a shared library without changing the command's import path."""
-    path = Path(__file__).resolve().parents[1] / "lib" / f"{name}.py"
-    spec = importlib.util.spec_from_file_location(f"_hana_shot_{name}", path)
-    if spec is None or spec.loader is None:
-        raise ImportError(f"cannot load library at {path}")
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[spec.name] = module
-    spec.loader.exec_module(module)
-    return module
-
-
-if TYPE_CHECKING:
-    from scripts.lib import conf, process_group
-    from scripts.lib.conf import UseConfiguredValue
-else:
-    if __package__:
-        from scripts.lib import conf
-        from scripts.lib.conf import UseConfiguredValue
-    else:
-        conf = _load_library("conf")
-        UseConfiguredValue = conf.UseConfiguredValue
-    process_group = _load_library("process_group")
+from scripts.lib import conf, process_group
+from scripts.lib.conf import UseConfiguredValue
 
 PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 # Wakes the remote display and holds it until the run closes this shell's stdin; -t ends it if that never comes.
@@ -2228,9 +2210,7 @@ def launch(port: int, worktree: str | None, binary: str | None, purpose: str = "
             current = staff.runtime_id()
             if current:
                 record = staff.local_snapshot()
-                row = record.by_current_session(current)
-                if row is not None and row.kind == "worker":
-                    row = record.parent_of(row)
+                row = record.owner_of(current)
                 if row is not None:
                     owner = row.name
         except staff.StaffUnreadable:
@@ -2269,9 +2249,8 @@ def launch(port: int, worktree: str | None, binary: str | None, purpose: str = "
     _write_launch_state(state_path, state)
     start = time.monotonic()
     try:
-        from scripts.buildlog import record as buildlog_record
-
-        _ = buildlog_record.launch(state_path, root)
+        from scripts.buildlog import record
+        _ = record.launch(state_path, root)
         wait_ready(Brp(port, settings=hana_shot_settings), process, log)
     except BaseException:
         shutdown(port, process, hana_shot_settings=hana_shot_settings)
@@ -3116,5 +3095,4 @@ def main(argv: list[str]) -> int:
 
 
 if __name__ == "__main__":
-    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
     sys.exit(main(sys.argv[1:]))

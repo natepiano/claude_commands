@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
 """Scratch folders that belong to a task, and go when the task ends.
 
 Agents made loose folders in /tmp and ~/rust (repo copies, repros, test trees) and nothing removed
@@ -21,9 +21,11 @@ A task, and what ends it:
   * `gate:<id>`: the gate's caller, with `scratch.py end`, when the gate ends;
   * `landed:<unit>/<branch>`: the branch is in its recorded land target and all work is saved;
   * `row:<showrunner>-C<n>`: change_review.py verdict;
-  * `until:<YYYY-MM-DDTHHMMZ>`: the hourly tmp sweep, once the time passes. `--until` takes
-    `YYYY-MM-DD` or `YYYY-MM-DD HH:MM` in the user's zone. With no task, a folder gets
-    `until:` for scratch.conf default_life_seconds from now.
+  * `until:<YYYY-MM-DDTHHMMZ>/<id>`: the hourly temporary sweep ends the task when its time passes.
+    `--until` takes `YYYY-MM-DD` or `YYYY-MM-DD HH:MM` in the user's zone.
+    Each call makes a random id with scratch.conf suffix_length characters.
+    With no task, a folder gets a separate deadline task for scratch.conf default_life_seconds from now.
+    Old deadline tasks without an id remain valid.
 
 A folder lives in ROOT as `<task>-<word>-<suffix>`; scratch.conf suffix_length sets the suffix length.
 `--visible` (rows only) puts it in VISIBLE_ROOT
@@ -49,6 +51,10 @@ stay; an unreadable record, phase state or land target needs repair. Shared .cla
 keep a copy while work runs or waits. Removal holds an exclusive lock through deletion.
 """
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import argparse
 import fcntl
@@ -70,7 +76,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import TypedDict, cast
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.lib import cargo_output, conf, copy_record  # noqa: E402
 from scripts.lib.conf import UseConfiguredValue
 
@@ -169,14 +174,15 @@ def exclude_copy_metadata(path: Path) -> None:
 
 def register_copy(path: Path, *, task: str, owner_unit: str, source_path: str, source_commit: str,
                   copy_commit: str, target_mode: str, seed_source: str, borrows_from: str,
-                  land_target: str = "", run_dir: str = "", phase_id: str = "", crate_run: str = "") -> None:
+                  land_target: str = "", run_dir: str = "", phase_id: str = "", crate_run: str = "",
+                  repository_identity: str = "") -> None:
     scratch_settings = conf.read("scratch")
     if copy_record.copy_folder(path) != path.resolve() or path.is_symlink() or not path.is_dir():
         raise ScratchError(f"{path}: a copy must be a folder at {copy_record.copies_root()}/<pair>/<copy>")
     def registered(record: copy_record.Registered | copy_record.NotRegistered | copy_record.UnreadableRecord) -> dict[str, object]:
         fields: dict[str, object] = dict(owner_unit=owner_unit, source_path=source_path,
             source_commit=source_commit, copy_commit=copy_commit, target_mode=target_mode, seed_source=seed_source,
-            borrows_from=borrows_from,
+            borrows_from=borrows_from, repository_identity=repository_identity,
             maker=maker(), created=time.time(), renewed=time.time())
         if isinstance(record, copy_record.Registered):
             fields["created"] = record.fields.get("created", fields["created"])
@@ -479,8 +485,21 @@ def visible_root(*, scratch_settings: conf.ConfigRead | UseConfiguredValue = Use
     return Path(os.environ.get(VISIBLE_ROOT_ENV) or scratch_settings.text("visible_root")).expanduser()
 
 
-def until_task(moment: float) -> str:
-    return "until:" + datetime.fromtimestamp(moment, timezone.utc).strftime(UNTIL_FORMAT)
+def random_suffix(scratch_settings: conf.ConfigRead) -> str:
+    return "".join(secrets.choice(SUFFIX_CHARACTERS) for _ in range(scratch_settings.whole("suffix_length")))
+
+
+def until_task(moment: float, *,
+    scratch_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
+) -> str:
+    if isinstance(scratch_settings, UseConfiguredValue):
+        scratch_settings = conf.read("scratch")
+    stamp = datetime.fromtimestamp(moment, timezone.utc).strftime(UNTIL_FORMAT)
+    return f"until:{stamp}/{random_suffix(scratch_settings)}"
+
+
+def until_stamp(name: str) -> str:
+    return name.partition("/")[0]
 
 
 def parsed_until(text: str) -> str:
@@ -502,7 +521,7 @@ def task_end(task: str, now: float | None = None) -> Live | Ended | Unknown:
     if match["kind"] != "until":
         return Live(f"task {task} has not ended")
     try:
-        at = datetime.strptime(match["name"], UNTIL_FORMAT).replace(tzinfo=timezone.utc).timestamp()
+        at = datetime.strptime(until_stamp(match["name"]), UNTIL_FORMAT).replace(tzinfo=timezone.utc).timestamp()
     except ValueError:
         return Unknown(f"invalid task deadline: {task}")
     return Ended(f"deadline {task} passed", at) if at <= (time.time() if now is None else now) else Live(f"task {task} has not ended")
@@ -520,7 +539,7 @@ def checked_task(task: str, visible: bool) -> re.Match[str]:
     if match["kind"] == "row" and not ROW_NAME.fullmatch(match["name"]):
         raise ScratchError(f"{task!r}: a row task is row:<showrunner>-C<n>")
     if match["kind"] == "until" and isinstance(task_end(task), Unknown):
-        raise ScratchError(f"{task!r}: an until task is until:YYYY-MM-DDTHHMMZ; use --until")
+        raise ScratchError(f"{task!r}: an until task is until:YYYY-MM-DDTHHMMZ/<id>; use --until")
     if visible and match["kind"] != "row":
         raise ScratchError("--visible is for a change review row's repro only")
     return match
@@ -586,8 +605,9 @@ def target(task: str, word: str, visible: bool, *,
         if os.path.lexists(path):
             raise ScratchError(f"{path} exists")
         return path
-    suffix = "".join(secrets.choice(SUFFIX_CHARACTERS) for _ in range(scratch_settings.whole("suffix_length")))
-    slug = f"{match['kind']}-{match['name'].replace('/', '-')}"
+    suffix = random_suffix(scratch_settings)
+    name = until_stamp(match["name"]) if match["kind"] == "until" else match["name"]
+    slug = f"{match['kind']}-{name.replace('/', '-')}"
     return build_folder_path(BuildFolderSpec(kind="scratch", parent=copy_record.root(), suffix_length=scratch_settings.whole("suffix_length"),
                                             purpose="-".join(part for part in (slug, word) if part), suffix=suffix))
 
@@ -607,18 +627,20 @@ def task_or_default(task: str, now: float, *,
 ) -> str:
     if isinstance(scratch_settings, UseConfiguredValue):
         scratch_settings = conf.read("scratch")
-    return task or until_task(now + scratch_settings.whole("default_life_seconds"))
+    return task or until_task(now + scratch_settings.whole("default_life_seconds"), scratch_settings=scratch_settings)
 
 
 def write_record(path: Path, task: str, now: float, *,
+    throwaway: bool = False,
     scratch_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
 ) -> None:
     _ = update_record(path, lambda record: fields_for_task(
         {**(record.fields if isinstance(record, copy_record.Registered) else {}),
-         "maker": maker(), "created": now, "renewed": now}, task), scratch_settings=scratch_settings)
+         "maker": maker(), "created": now, "renewed": now, "throwaway": throwaway}, task), scratch_settings=scratch_settings)
 
 
 def new(task: str = "", word: str = "", visible: bool = False, now: float | None = None, *,
+    throwaway: bool = False,
     scratch_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
 ) -> Path:
     if isinstance(scratch_settings, UseConfiguredValue):
@@ -628,7 +650,7 @@ def new(task: str = "", word: str = "", visible: bool = False, now: float | None
     path = target(task, word, visible, scratch_settings=scratch_settings)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.mkdir()
-    write_record(path, task, moment, scratch_settings=scratch_settings)
+    write_record(path, task, moment, throwaway=throwaway, scratch_settings=scratch_settings)
     return path
 
 
@@ -724,6 +746,12 @@ def task_of(path: Path, *,
 ) -> copy_record.Registered | copy_record.NotRegistered | copy_record.UnreadableRecord:
     record = copy_record.read_record(path / copy_record.RECORD)
     return pending_removal(path, scratch_settings=scratch_settings) if isinstance(record, copy_record.NotRegistered) else record
+
+
+def is_throwaway(path: Path) -> bool:
+    """Identify a folder that code creates without edits from a person."""
+    record = task_of(path)
+    return isinstance(record, copy_record.Registered) and record.fields.get("throwaway") is True
 
 
 def pending_copy_paths(base: Path) -> Iterator[Path]:
@@ -893,7 +921,11 @@ def folders(*, scratch_settings: conf.ConfigRead | UseConfiguredValue = UseConfi
     for path in candidates:
         record = task_of(path, scratch_settings=scratch_settings) if not path.is_symlink() else copy_record.NotRegistered()
         if isinstance(record, copy_record.Registered):
-            found.append(Folder(path, record.task, folder_record(path).stat().st_mtime))
+            try:
+                modified = folder_record(path).stat().st_mtime
+            except FileNotFoundError:
+                continue
+            found.append(Folder(path, record.task, modified))
     return found
 
 

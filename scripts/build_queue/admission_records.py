@@ -14,9 +14,6 @@ from zoneinfo import ZoneInfo
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "buildlog"))
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lint"))
 
 from scripts.build_queue import progress_profile as progress
 from scripts.build_queue.scope_activity import (EmptyBuildScope, IdleService, LiveBuildRun, NoLiveBuildRun,
@@ -793,6 +790,7 @@ class WaitingStep:
     need: int
     reason: WaitReason
     unit: str = ""
+    project: str = ""
     run: LiveBuildRun | NoLiveBuildRun = field(default=NoLiveBuildRun(), kw_only=True)
 
 
@@ -808,6 +806,7 @@ class RunningStep:
     run: LiveBuildRun | NoLiveBuildRun = NoLiveBuildRun()
     started_at: float = 0.0
     unit: str = ""
+    project: str = ""
 
 
 @dataclass(frozen=True)
@@ -1241,7 +1240,9 @@ BUILDLOG_UNIT = "BUILDLOG_UNIT"
 
 
 def waiter_identity(step: str, worktree: str) -> WaiterIdentity:
-    session = os.environ.get("CODEX_THREAD_ID") or os.environ.get("CLAUDE_CODE_SESSION_ID", "")
+    from scripts.production import staff
+
+    session = staff.caller_identity()
     identity: WaiterIdentity = {"session_id": session, "session_name": os.environ.get("CLAUDE_SESSION_NAME", ""),
                                 "step": step, "folder": os.getcwd() if worktree else ""}
     if unit := os.environ.get(BUILDLOG_UNIT):

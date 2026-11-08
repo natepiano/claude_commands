@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """Review phone drafts; keep one owner for delivery of a held push."""
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import argparse
 import fcntl
@@ -24,18 +28,18 @@ from enum import Enum
 from pathlib import Path
 from typing import Literal, NotRequired, Protocol, TypedDict, cast
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-
 from scripts.notify import reply_asks
 from scripts.notify import push_texts
 from scripts.notify import push_reference
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
 from scripts.lib.user_zone import user_zone, user_zone_name, zone_label  # noqa: E402
 from scripts.lib import nix_env
 
 from scripts.notify.user_action import (ActionRequired, NoActionRequired, UserAction, action_conflicts, first_line, parse_user_action,
                          NotificationSession, NO_SESSION_LINE, SessionLine, split_session)
+
+if TYPE_CHECKING:
+    from scripts.accounts import accounts
 
 ROOT = Path(__file__).resolve().parents[2]
 STATE_DIR = Path.home() / ".local/state/notify"
@@ -656,7 +660,8 @@ def validate(value: object, draft: Draft, revision: bool,
 
 def reviewer_environment() -> tuple[dict[str, str], str]:
     # Import the shared account modules from this checkout, not the writer's login.
-    from scripts.accounts import accounts
+    if not TYPE_CHECKING:
+        from scripts.accounts import accounts
     environment = dict(os.environ)
     for key in ("CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY", "CLAUDE_CONFIG_DIR"):
         _ = environment.pop(key, None)
@@ -758,7 +763,9 @@ def _review(draft: Draft, revision: bool, runner: ProcessRunner,
         loaded = nix_env.ensure(Path.cwd(), environment)
         if isinstance(loaded, nix_env.Refused):
             return Unreviewed(loaded.reason, details())
-        environment = loaded.env
+        from scripts.lib.models_registry import agent_environment
+
+        environment = agent_environment(loaded.env)
         result = runner(command, timeout=remaining(), env=environment)
         if result.returncode != 0:
             return Unreviewed(f"reviewer exit {result.returncode}", details())
@@ -1174,7 +1181,7 @@ class PushChannel(Protocol):
 
 
 def push_channel() -> PushChannel:
-    return cast(PushChannel, cast(object, importlib.import_module("scripts.notify.pushover")))
+    return cast(PushChannel, cast(object, importlib.import_module('scripts.notify.pushover')))
 
 
 def expiry_post(url: str, data: bytes) -> tuple[int, bytes]:
@@ -1463,6 +1470,7 @@ def text_approvals(value: object) -> dict[str, dict[str, TextApproval]]:
 
 def texts(ids: list[str], approve: bool = False, *, runner: ProcessRunner = run_process,
           authority: TextApprovalAuthority = REVIEWER_APPROVAL_REQUIRED) -> int:
+    from scripts.notify import push_texts
     if isinstance(authority, UserSpecifiedText) and (not approve or not authority.source.strip()):
         raise ValueError("a user spec requires --approve and a nonempty source")
     entries = push_texts.catalog()
@@ -1508,11 +1516,13 @@ def texts(ids: list[str], approve: bool = False, *, runner: ProcessRunner = run_
 
 
 def list_texts() -> int:
+    from scripts.notify import push_texts
     print(push_texts.listing(push_texts.catalog()))
     return 0
 
 
 def show_text(text_id: str) -> int:
+    from scripts.notify import push_texts
     entries = push_texts.catalog()
     for entry in entries:
         if entry.id == text_id:

@@ -5,7 +5,10 @@ from __future__ import annotations
 from pathlib import Path
 import subprocess
 
-from scripts.buildlog import store
+if __package__:
+    from . import store
+else:
+    from scripts.buildlog import store
 
 GIT_TIMEOUT_S = 5
 

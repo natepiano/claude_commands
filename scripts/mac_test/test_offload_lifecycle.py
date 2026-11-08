@@ -6,6 +6,7 @@ import select
 import signal
 import unittest
 from scripts.mac_test.offload_test_support import OffloadCommandFixture
+# The fixture loads offload's sibling script paths before the tree-key import.
 from scripts.buildlog import treekey
 from scripts.lib import test_hang_guard
 

@@ -2,10 +2,8 @@
 from __future__ import annotations
 
 from pathlib import Path
-import sys
 from typing import override
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.lib.rerun_test_support import ScriptRepositoryTestCase
 
 
@@ -15,16 +13,13 @@ class RustGenerationRerunTests(ScriptRepositoryTestCase):
         super().setUp()
         _ = self.write(self.home / "rust/rust-template/cargo-generate.toml", "[template]\n")
         _ = self.write(self.home / ".claude/templates/settings_local.json", "{}\n")
-        shim = self.write(self.home / ".claude/scripts/lib/py", f'#!/bin/sh\nexec "{sys.executable}" "$@"\n')
-        shim.chmod(0o755)
         self.environment["TEST_REMOTE"] = str(self.remote)
-        self.environment["TEST_SCRIPTS_ROOT"] = str(Path(__file__).resolve().parents[2])
         self.environment["TEST_CARGO_CALLS"] = str(self.root / "cargo-calls")
+        self.environment["PYTHONPATH"] = str(Path(__file__).resolve().parents[2])
         for command in ("cargo-generate", "cargo-mend", "taplo"):
             _ = self.stub(command, "pass\n")
         _ = self.stub("cargo", '''import os, sys
 from pathlib import Path
-sys.path.insert(0, os.environ["TEST_SCRIPTS_ROOT"])
 from scripts.lib.rerun_test_support import initialize_repository
 args = sys.argv[1:]
 with Path(os.environ["TEST_CARGO_CALLS"]).open("a") as handle:

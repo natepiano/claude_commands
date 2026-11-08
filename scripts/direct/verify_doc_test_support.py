@@ -134,7 +134,7 @@ class VerifyDocFixture(unittest.TestCase):
         self.executable(tools / "cargo", CARGO_STUB)
         self.executable(tools / "rustc", '#!/bin/sh\nprintf "rustc fixture\\n"\n')
         targets = tools / "build-targets.py"
-        self.executable(targets, 'import sys\nif sys.argv[1] == "eligible": print("natedev_only test target\\nnatedev\\teligible\\t-\\t-")\n')
+        self.executable(targets, 'import sys\nif sys.argv[1] == "eligible": print("natedev_only test target\\nnatedev\\teligible\\t-\\t-\\t-")\n')
         for name in ("ssh", "rsync", "scp", "gh", "systemd-run"):
             self.executable(tools / name, "#!/bin/sh\nexit 99\n")
         for name in ("tmp", "state", "cache", "runtime", "target", "session"):
@@ -228,9 +228,9 @@ import os
 from pathlib import Path
 import sys
 if sys.argv[1] == "eligible":
-    print("mac_allowed")
-    print("natedev\\teligible\\t-\\t-")
-    print("mac\\teligible\\t-\\t" + os.environ["MAC_TEST_CONFIG"])
+    print("any_target")
+    print("natedev\\teligible\\t-\\t-\\t-")
+    print("mac\\teligible\\t-\\t" + os.environ["MAC_TEST_CONFIG"] + "\\tmacos")
 elif sys.argv[1] in ("register-local", "check-local"):
     raise SystemExit(10)
 ''')

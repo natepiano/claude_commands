@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
 """Tests for index.py: incremental reads of the JSON lines, rebuilds, views, and `buildlog query`."""
 
 from __future__ import annotations
@@ -215,7 +215,7 @@ class LogIsolationTests(unittest.TestCase):
         for name in COORDINATION_VARIABLES:
             _ = environment.pop(name, None)
         result = subprocess.run(
-            [sys.executable, "-c",
+            [str(CLI.parents[1] / "lib/py"), "-c",
              "import os; from scripts.buildlog import test_index; print({key: os.environ[key] "
              + "for key in test_index.COORDINATION_VARIABLES if key in os.environ})"],
             cwd=Path(__file__).resolve().parents[2], env=environment, capture_output=True, text=True,
@@ -231,7 +231,7 @@ class LogIsolationTests(unittest.TestCase):
         def import_module(module: Path) -> subprocess.CompletedProcess[str]:
             return subprocess.run(
                 [
-                    sys.executable,
+                    str(CLI.parents[1] / "lib/py"),
                     "-c",
                     "import importlib, sys; from scripts.buildlog import store; "
                     + "importlib.import_module(sys.argv[1]); print(store.root())",
@@ -277,6 +277,61 @@ class IndexTests(unittest.TestCase):
         self.host_file = self.root / "natedev" / "2026-10.jsonl"
         self.host_file.parent.mkdir(parents=True)
 
+    def test_complete_update_time_rolls_back_with_a_failed_update(self) -> None:
+        self.write(self.host_file, step("retained"))
+        with mock.patch.object(time, "time", return_value=100.0):
+            _ = index.update()
+        self.write(self.host_file, step("retained"), step("new"))
+        with mock.patch.object(time, "time", side_effect=[150.0, RuntimeError("clock failed")]):
+            with self.assertRaisesRegex(RuntimeError, "clock failed"):
+                _ = index.update()
+        self.assertEqual(self.rows("SELECT value FROM meta WHERE key='updated_at'"), [("100.0",)])
+        self.assertEqual(self.ids(), ["retained"])
+        with mock.patch.object(time, "time", return_value=200.0):
+            _ = index.update()
+        self.assertEqual(self.rows("SELECT value FROM meta WHERE key='updated_at'"), [("200.0",)])
+        self.assertEqual(self.ids(), ["new", "retained"])
+
+    def test_reader_keeps_complete_rows_during_an_uncommitted_refresh(self) -> None:
+        self.write(self.host_file, step("retained"))
+        _ = index.update()
+        with closing(index.open_for_update(index.index_path())) as writer:
+            writer.execute("BEGIN IMMEDIATE").close()
+            writer.execute("DELETE FROM steps").close()
+            with closing(index.read_only()) as reader:
+                reader.execute("PRAGMA busy_timeout=0").close()
+                self.assertEqual(reader.execute("SELECT id FROM steps").fetchall(), [("retained",)])
+            writer.execute("ROLLBACK").close()
+
+    def test_report_uses_the_newest_complete_compatible_index_until_the_current_one_finishes(self) -> None:
+        self.write(self.host_file, step("retained"))
+        with mock.patch.object(time, "time", return_value=100.0):
+            _ = index.update()
+        original = index.index_path()
+        alternate = {"fixture_rows": ([("src", "TEXT", "source")], "", "fixture")}
+        with mock.patch.dict(index.TABLES, alternate):
+            self.assertEqual(index.complete_gate_index_in(self.root), original)
+            with mock.patch.object(time, "time", return_value=200.0):
+                _ = index.update()
+            newest = index.index_path()
+        with mock.patch.object(index, "COST_INDEXES", (*index.COST_INDEXES, FIXTURE_INDEX_SQL)):
+            self.assertEqual(index.complete_gate_index_in(self.root), newest)
+            index.open_for_update(index.index_path()).close()
+            self.assertEqual(index.complete_gate_index_in(self.root), newest)
+        self.assertEqual(index.complete_gate_index_in(self.root), original)
+
+    def test_report_ignores_an_alternate_index_with_an_invalid_completion_time(self) -> None:
+        self.write(self.host_file, step("retained"))
+        _ = index.update()
+        valid = index.index_path()
+        with mock.patch.object(index, "COST_INDEXES", (*index.COST_INDEXES, FIXTURE_INDEX_SQL)):
+            _ = index.update()
+            with closing(sqlite3.connect(index.index_path())) as writer, writer:
+                writer.execute("UPDATE meta SET value='invalid' WHERE key='updated_at'").close()
+        alternate = {"fixture_rows": ([("src", "TEXT", "source")], "", "fixture")}
+        with mock.patch.dict(index.TABLES, alternate):
+            self.assertEqual(index.complete_gate_index_in(self.root), valid)
+
     def test_schema_files_keep_independent_rows_and_offsets(self) -> None:
         _ = configure_cleanup(self, self.root)
         self.write(self.host_file, step("retained"))
@@ -284,7 +339,8 @@ class IndexTests(unittest.TestCase):
         original_path = index.index_path()
         with closing(sqlite3.connect(original_path)) as connection, connection:
             _ = connection.execute("UPDATE steps SET duration_s=123 WHERE id='retained'")
-        original_bytes = original_path.read_bytes()
+        with closing(sqlite3.connect(original_path)) as connection:
+            original_rows = [line for line in connection.iterdump() if "updated_at" not in line]
         alternate = {"fixture_rows": ([("src", "TEXT", "source"), ("value", "TEXT", "fixture value")], "", "fixture")}
         with mock.patch.dict(index.TABLES, alternate):
             alternate_path = index.index_path()
@@ -294,7 +350,8 @@ class IndexTests(unittest.TestCase):
             self.assertEqual(index.update(), 0)
         self.assertEqual(index.index_path(), original_path)
         self.assertEqual(index.update(), 0)
-        self.assertEqual(original_path.read_bytes(), original_bytes)
+        with closing(sqlite3.connect(original_path)) as connection:
+            self.assertEqual([line for line in connection.iterdump() if "updated_at" not in line], original_rows)
         self.assertEqual(self.rows("SELECT duration_s FROM steps"), [(123,)])
         self.assertTrue(alternate_path.is_file())
 

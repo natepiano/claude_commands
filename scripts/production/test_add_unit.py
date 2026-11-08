@@ -13,7 +13,6 @@ import os
 import shlex
 import shutil
 import subprocess
-import sys
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from datetime import datetime, tzinfo
@@ -22,17 +21,15 @@ from typing import cast, final
 from unittest.mock import call, patch
 from zoneinfo import ZoneInfo
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "shutdown"))
-import add_unit
-import unit_lookup
-import sessions
-from herdr import HerdrPlace
-import herdr
+from scripts.production import add_unit
+from scripts.production import unit_lookup
+from scripts.message import sessions
+from scripts.herdr.herdr import HerdrPlace
+from scripts.herdr import herdr
 from scripts.herdr.fake_herdr import CommandResponse
 
 
-from add_unit_test_support import AddUnitTestCase, configure_test_zone, SCRIPT, SHARED, RemoteControlDeadlineClock
+from scripts.production.add_unit_test_support import AddUnitTestCase, configure_test_zone, SCRIPT, SHARED, RemoteControlDeadlineClock
 
 
 LAUNCHED_AT = datetime(2026, 10, 6, 12, tzinfo=ZoneInfo("America/Los_Angeles"))
@@ -40,6 +37,14 @@ LAUNCHED_AT = datetime(2026, 10, 6, 12, tzinfo=ZoneInfo("America/Los_Angeles"))
 
 def setUpModule() -> None:
     configure_test_zone()
+
+    def start_command(client: herdr.Herdr, argv: list[str], kind: str, pane: str,
+                      timeout: float) -> subprocess.CompletedProcess[str]:
+        del client, kind, pane
+        return herdr.run_program(argv, timeout)
+
+    # Use the existing fake transport. Herdr tests cover the waiting CLI process.
+    _ = unittest.enterModuleContext(patch.object(herdr.Herdr, "start_command", start_command))
 
 
 from scripts.production import staff, unit_config
@@ -141,16 +146,15 @@ class AddUnitLaunchTests(AddUnitTestCase):
         script = self.root / "clocked_add_unit.py"
         _ = script.write_text(
             "import sys\nfrom datetime import datetime\nfrom unittest.mock import patch\n"
-            + f"sys.path.insert(0, {str(Path(add_unit.__file__).parent)!r})\n"
-            + "import add_unit\n"
+            + "from scripts.production import add_unit\n"
             + f"at = datetime.fromisoformat({LAUNCHED_AT.isoformat()!r})\n"
             + "with patch.object(add_unit, 'datetime', wraps=datetime) as clock:\n"
             + "    clock.now.side_effect = lambda zone: at.astimezone(zone)\n"
             + "    raise SystemExit(add_unit.main(sys.argv[1:]))\n", encoding="utf-8")
-        _ = self.enterContext(patch("add_unit_test_support.SCRIPT", script))
+        _ = self.enterContext(patch("scripts.production.add_unit_test_support.SCRIPT", script))
 
     def test_real_brief_admission_can_switch_to_its_approved_plan(self) -> None:
-        _ = self.successful("alpha", "--brief", "Write a full plan.", subprocess_cli=True)
+        _ = self.successful("alpha", "--brief", "Write a full plan.")
         worktree = self.root / "project-alpha"
         before = unit_config.read(worktree)
         assert isinstance(before, unit_config.UnitConfig)
@@ -162,7 +166,7 @@ class AddUnitLaunchTests(AddUnitTestCase):
         for pid in (101, 102):
             shutil.rmtree(self.root / "proc" / str(pid))
         before_calls = len(self.herdr_calls())
-        _ = self.successful("alpha", "--plan", "docs/plans/given.md", subprocess_cli=True)
+        _ = self.successful("alpha", "--plan", "docs/plans/given.md")
         self.assertEqual(unit_config.read(worktree), unit_config.UnitConfig(
             unit_config.PlanFile(Path("docs/plans/given.md")), before.port, before.responsibilities))
         prompts = [row[-1] for row in self.herdr_calls()[before_calls:] if row[2:4] == ["agent", "prompt"]]

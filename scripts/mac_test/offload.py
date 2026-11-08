@@ -1,14 +1,19 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
 """Run one read-only Cargo judgment on an idle Mac mirror when it is available."""
 
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import argparse
 from collections.abc import Callable, Generator, Sequence
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, replace
 from importlib import import_module
 import fcntl
+import json
 import math
 import os
 from pathlib import Path
@@ -26,29 +31,23 @@ from typing import Literal, NewType, TextIO, TypedDict, cast, final
 from urllib.parse import quote
 
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lint"))
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "build_hold"))
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-
 from scripts.mac_test import cargo_manifest
-from scripts.build_hold import override_guard
+from scripts.build_hold import build_hold, override_guard
+from scripts.copies import copies
+from scripts.direct import result_environment
 from scripts.lint import sweep
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
 from scripts.lib import conf
 from scripts.buildlog import treekey
 from scripts.mac_test.mirror_root import MacMirrorRoot
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "build_targets"))
-from scripts.buildlog import record
-from scripts.buildlog import repository
-from scripts.buildlog import store
+from scripts.buildlog import record, repository, store
 from scripts.build_targets import target_config
+from scripts.lib import build_folders
 
 
 # Version the mirrored repository's development shell exports on the Mac.
 MACOSX_DEPLOYMENT_TARGET = "14.0"
 
-MacVerb = Literal["nextest", "check", "clippy", "mend-check", "doc"]
+MacVerb = Literal["nextest", "check", "clippy", "mend-check", "doc", "build"]
 
 
 def step_kind(verb: str) -> str:
@@ -65,6 +64,7 @@ NonBusyMacDeclineReason = Literal[
     "state",
     "unreachable",
     "mac_busy",
+    "target does not permit this command",
     "disk",
     "copy",
 ]
@@ -194,6 +194,7 @@ class PassedOnMac:
 
     seconds: float
     fetch: FetchResult = FetchNotRun()
+    build_target_directory: str = ""
 
 
 @dataclass(frozen=True)
@@ -278,6 +279,7 @@ def holder_value(holder: MacHolder) -> str:
 @dataclass(frozen=True)
 class PassedOnTarget:
     seconds: float
+    build_target_directory: str = ""
 
 
 @dataclass(frozen=True)
@@ -424,6 +426,8 @@ class OffloadRequest:
     call_id: str
     result: ResultDestination
     nextest_words: tuple[str, ...]
+    owner: str
+    holder_session: str
     last_decline: LastMacDecline = NO_PRIOR_MAC_DECLINE
     copy: bool = False
     verb: MacVerb = "nextest"
@@ -433,6 +437,8 @@ class OffloadRequest:
     admission: UnclaimedMacRun | MacClaimFromWait = UnclaimedMacRun()
     environment: tuple[tuple[str, str], ...] = ()
     fetch: FetchFolder | NoFetch = NO_FETCH
+    repository_scope: copies.RepositoryScope = copies.ALL_REPOSITORIES
+    kind: str = ""
 
     @property
     def source_root(self) -> Path:
@@ -608,6 +614,7 @@ class ReportedMacStatus:
 
     status: int
     cleanup: CleanupOutcome = CleanupUnconfirmed()
+    build_target_directory: str = ""
 
 
 @dataclass(frozen=True)
@@ -702,6 +709,7 @@ class CliArguments(argparse.Namespace):
         self.copy: bool = False
         self.nextest_words: list[str] = []
         self.verb: MacVerb = "nextest"
+        self.kind: str = ""
         self.claim_owner_pid: int = 0
         self.environment: list[str] = []
         self.fetch: str | None = None
@@ -825,9 +833,13 @@ class ProcessController:
         cleanup: CleanupOutcome = CleanupUnconfirmed()
         held_status_line = ""
         mismatch = ""
+        build_target_directory = ""
         try:
             for line in output:
                 marker = line.rstrip("\r\n")
+                if marker.startswith("build_target_directory="):
+                    build_target_directory = marker.removeprefix("build_target_directory=")
+                    continue
                 if re.match(r"[A-Za-z0-9_-]+ version mismatch: ", marker):
                     mismatch = marker
                     print(line, end="", flush=True)
@@ -874,7 +886,7 @@ class ProcessController:
         if mismatch and not isinstance(status, (ReportedMacStatus, InterruptedTargetStatus)):
             return ToolVersionMismatch(mismatch)
         if isinstance(status, ReportedMacStatus):
-            return ReportedMacStatus(status.status, cleanup)
+            return ReportedMacStatus(status.status, cleanup, build_target_directory)
         if isinstance(status, (UnresolvedSlotStartup, InterruptedTargetStatus)):
             return status
         return MissingMacStatus(f"runner exited with status {exit_status} without a final status")
@@ -1049,6 +1061,8 @@ def write_result(
                        + f"unresolved_count={count}\nevidence_at={evidence.evidence_at}\n")
         if isinstance(result, InterruptedTargetRun):
             details += f'interruption_generation={result.generation}\n'
+        if isinstance(result, (PassedOnMac, PassedOnTarget)) and result.build_target_directory:
+            details += f'build_target_directory={result.build_target_directory}\n'
         _ = destination.path.write_text(
             f"{prefix}\nreason={reason}\nseconds={result.seconds:.6f}\n" + holder_line + details
             + (f"fetch={fetch_word(fetched)}\n" if isinstance(fetch, FetchFolder) else ""),
@@ -1129,18 +1143,18 @@ def remote_mirror(repository: KnownRepository, target: str = "mac", slot: int = 
         return f"{mac_mirror_root().relative}/{repository.legacy_mirror_name}"
     if slot < 1:
         raise ValueError("slot must be positive")
-    return f"{linux_mirror_root()}/{repository.path_key}/{slot}"
+    name = build_folders.repository_key_for(repository.policy_name, repository.key or repository.name)
+    return str(build_folders.build_folder_path(build_folders.BuildFolderSpec(
+        kind="mirror", parent=linux_mirror_root(), repository=name, owner=target, slot=slot, suffix_length=0)))
 
 
 def probe_script(repository: KnownRepository, target: str = "mac", slot: int = 1) -> str:
     if not target_config.uses_legacy_mac_layout(configured_ssh_target(target or "mac").platform):
         from scripts.mac_test import linux_runner
         return linux_runner.probe_script(remote_mirror(repository, target, slot))
-    mirror = shlex.quote(remote_mirror(repository, target, slot))
     return "\n".join(
         (
-            f'mkdir -p "$HOME"/{mirror} || exit 1',
-            f'printf "mac-test mirror\\n" > "$HOME"/{mirror}/.mac-test-mirror || exit 1',
+            copies.mirror_probe_setup(remote_mirror(repository, target, slot)),
             "free_gib=$(df -g \"$HOME\" | awk 'NR == 2 {print $4}')",
             "printf 'free_gib=%s\\nhost=%s\\nrc=0\\n' "
             + '"$free_gib" "$(hostname -s)"',
@@ -1166,13 +1180,13 @@ def parse_probe(output: str) -> ProbeResult:
     return ProbeSnapshot(free_gib, hostname)
 
 
-def claim_arguments(request: OffloadRequest, config: OffloadConfig) -> list[str]:
+def claim_arguments(request: OffloadRequest, config: OffloadConfig, leased_slots: tuple[int, ...] = ()) -> list[str]:
     copy_words = ["--copy"] if request.copy else []
     selection = ["--target", request.target] if request.target else []
     handoff = (["--from-pid", str(request.admission.owner_pid)]
                if isinstance(request.admission, MacClaimFromWait) else [])
     return [
-        sys.executable,
+        str(Path(__file__).resolve().parents[1] / "lib/py"),
         str(Path(__file__).with_name("mac_test.py")),
         "claim",
         "--pid",
@@ -1186,13 +1200,14 @@ def claim_arguments(request: OffloadRequest, config: OffloadConfig) -> list[str]
         *copy_words,
         *selection,
         *handoff,
+        *[word for slot in leased_slots for word in ("--leased-slot", str(slot))],
     ]
 
 
 def release_claim(controller: ProcessController, target: str = "") -> None:
     _ = controller.capture(
         [
-            sys.executable,
+            str(Path(__file__).resolve().parents[1] / "lib/py"),
             str(Path(__file__).with_name("mac_test.py")),
             "release",
             "--pid",
@@ -1245,7 +1260,7 @@ def trusted_linux_source(root: Path) -> bool:
         if nix_env.trusted_envrc(envrc):
             return True
         return isinstance(nix_env.ensure(root), nix_env.Loaded)
-    return nix_env.trusted_root(root) or nix_env.registered_worktree(root)
+    return nix_env.trusted_root(root) or nix_env.registered_worktree(root) or nix_env.generated_source(root)
 
 
 class PublicToolParity(TypedDict):
@@ -1278,6 +1293,44 @@ def expected_linux_parity(controller: ProcessController, config: OffloadConfig) 
         expected[key] = normalize_tool_version(value)
     return {"rustc": expected["rustc"], "nextest": expected["nextest"],
             "mend": expected["mend"], "scripts_commit": expected["scripts_commit"]}
+
+
+def recorded_linux_version_mismatch(controller: ProcessController, config: OffloadConfig,
+                                    target: str) -> str:
+    """Compare the tree with the tools recorded by deployment without contacting the box."""
+    from scripts.mac_test import linux_runner
+    try:
+        raw = cast(object, json.loads((target_config.ssh_target_state_directory(target) / "box-tools.json").read_text()))
+        if not isinstance(raw, dict):
+            return ""
+        versions = cast(dict[str, object], raw).get("versions")
+        if not isinstance(versions, dict):
+            return ""
+        entries = cast(dict[str, object], versions)
+        if any(not isinstance(value, str) for value in entries.values()):
+            return ""
+        actual = {key: linux_runner.normalize_tool_version(cast(str, value)) for key, value in entries.items()}
+        expected = expected_linux_parity(controller, config)
+        if isinstance(expected, UnavailableToolParity):
+            return ""
+        selected = {key: linux_runner.normalize_tool_version(value) for key, value in (
+            ("rustc", expected["rustc"]), ("nextest", expected["nextest"]), ("mend", expected["mend"])) if key in actual}
+        return linux_runner.version_mismatch(target, actual, selected, config.values.get("version_pin_file", ""))
+    except (OSError, ValueError, UnicodeError):
+        return ""
+
+
+def linux_version_decline_path(target: str, repository_name: str) -> Path:
+    """Use one decline record for each repository name."""
+    return state_directory(target) / f"version-decline-{repository_name}"
+
+
+def linux_version_declined_recently(target: str, repository_name: str, hold_s: float, now: float) -> bool:
+    """Read whether this repository has a decline within the hold duration."""
+    try:
+        return 0 <= now - float(linux_version_decline_path(target, repository_name).read_text()) < hold_s
+    except (OSError, ValueError, UnicodeError):
+        return False
 
 
 def copy_tracked_scripts(controller: ProcessController, config: OffloadConfig) -> bool:
@@ -1371,11 +1424,11 @@ def probe_mac(
                 return probe
             expected = expected_linux_parity(controller, config)
             values = dict(line.split("=", 1) for line in result.stdout.splitlines() if "=" in line)
-            if not isinstance(expected, UnavailableToolParity) and all(values.get(key) == value for key, value in expected.items()):
+            if not isinstance(expected, UnavailableToolParity) and all(values.get(key) == expected[key] for key in ("nextest", "mend", "scripts_commit")):
                 return probe
             from scripts.mac_test import linux_runner
             detail = (linux_runner.version_mismatch(target, values,
-                      {"rustc": expected["rustc"], "nextest": expected["nextest"], "mend": expected["mend"]},
+                      {"nextest": expected["nextest"], "mend": expected["mend"]},
                       config.values.get("version_pin_file", ""))
                       if not isinstance(expected, UnavailableToolParity) else "")
             if detail:
@@ -1505,34 +1558,19 @@ def copy_tree(
     ignored = () if isinstance(request.source, StagedDocSnapshot) else ignored_paths(controller, request.repo_root)
     if isinstance(ignored, IgnoredPathListingFailed):
         return False
-    mirror = remote_mirror(repository, request.target, request.slot)
-    receiver = []
-    if not target_config.uses_legacy_mac_layout(configured_ssh_target(request.target or "mac").platform):
-        # The first copy needs the repository and slot directories before rsync starts.
-        receiver = [f"--rsync-path=mkdir -p -- {shlex.quote(mirror)} && exec rsync"]
+    mirror = request_mirror(config, request, repository)
     try:
         with tempfile.NamedTemporaryFile(
             "w", encoding="utf-8", prefix="mac-test-exclude-", delete=False
         ) as exclude_file:
             exclude_path = Path(exclude_file.name)
             try:
-                _ = exclude_file.write("/.git\n/target/\n/.mac-test-mirror\n")
+                _ = exclude_file.write("/.git\n/target/\n")
                 for path in ignored:
                     _ = exclude_file.write(f"/{escape_rsync_filter_path(path)}\n")
                 exclude_file.flush()
-                result = controller.capture_copy(
-                    [
-                        "rsync",
-                        "-rlpc",
-                        "--delete",
-                        *receiver,
-                        f"--exclude-from={exclude_path}",
-                        "-e",
-                        shlex.join(["ssh", *ssh_options(config.connection)]),
-                        f"{request.source_root}/",
-                        f"{config.host}:{shlex.quote(mirror)}/",
-                    ]
-                )
+                result = controller.capture_copy(copies.remote_rsync(
+                    request.source_root, mirror, exclude_path, ssh_options(config.connection)))
                 return isinstance(result, CommandOutput) and result.status == 0
             finally:
                 exclude_path.unlink(missing_ok=True)
@@ -1582,14 +1620,17 @@ def remote_test_command(
     repository: KnownRepository,
     sent_tree_key: TreeKey = UNAVAILABLE_TREE_KEY,
 ) -> str:
+    clear_environment = (result_environment.read_policy().clear_remote_environment()
+                         if request.verb == "nextest" and request.environment else "")
     if not target_config.uses_legacy_mac_layout(configured_ssh_target(request.target or "mac").platform):
         from scripts.mac_test import linux_runner
         words = request.nextest_words
         return linux_runner.command_script(
-            remote_mirror(repository, request.target, request.slot), runner_values(config, request.target),
+            remote_mirror(repository, request.target, request.slot),
+            {**runner_values(config, request.target), "step_kind": request.kind or verb_kind(request.verb)},
             repository.policy_name, request.verb, words, request.call_id,
             sent_tree_key.value if isinstance(sent_tree_key, KnownTreeKey) else "",
-            repository.key,
+            repository.key, request.environment, clear_environment,
         )
     budget = config.values.get(
         f"mac_budget_gib.{repository.name}", config.default_target_budget_gib
@@ -1622,9 +1663,10 @@ def remote_test_command(
     forced_config = "LINT_CONFIG_FORCE=1 " if request.verb == "doc" else ""
     remove_folder = f"rm -rf -- {shlex.quote(request.fetch.value)} && " if isinstance(request.fetch, FetchFolder) else ""
     environment = "".join(f"{name}={shlex.quote(value)} " for name, value in request.environment)
+    clear_environment = clear_environment + " && " if clear_environment else ""
     return (
         f"cd {shlex.quote(remote_mirror(repository, request.target, request.slot))} && "
-        f"{remove_folder}{environment}"
+        f"{remove_folder}{clear_environment}{environment}"
         'PATH="$HOME/.cargo/bin:$PATH" '
         "BUILDLOG_CALLER=verify-mac "
         f"BUILDLOG_PINNED_TARGET={shlex.quote(os.environ.get('BUILDLOG_PINNED_TARGET', ''))} "
@@ -1892,11 +1934,12 @@ def check_taken_over_claim(
 
 
 def claim_for_run(
-    controller: ProcessController, config: OffloadConfig, request: OffloadRequest, repository: KnownRepository
+    controller: ProcessController, config: OffloadConfig, request: OffloadRequest, repository: KnownRepository,
+    leased_slots: tuple[int, ...] = (),
 ) -> MacClaimAnswer:
     attempt = LocalClaimAttempt()
     try:
-        controller.complete_claim(claim_arguments(request, config), attempt)
+        controller.complete_claim(claim_arguments(request, config, leased_slots), attempt)
         if isinstance(attempt.interruption, OffloadInterrupted):
             raise attempt.interruption
         return attempt.answer
@@ -2002,11 +2045,13 @@ def claimed_run(
         if linux:
             running = f"running on {request.target} (Linux, host {probe.hostname})"
         print(f"mac_test: {running}; tree copied in {copy_seconds:.1f} s", flush=True)
+        copies.register_remote(request_mirror(config, request, repository))
         release_allowed = False
         remote_status = controller.stream_mac_run(
             [
                 *ssh_prefix(config),
-                remote_test_command(config, request, repository, copied.tree_key),
+                copies.remote_use_command(request_mirror(config, request, repository),
+                                          remote_test_command(config, request, repository, copied.tree_key)),
             ]
         )
         if isinstance(remote_status, InterruptedTargetStatus) and (not generation or remote_status.generation != generation):
@@ -2040,7 +2085,7 @@ def claimed_run(
         if linux and remote_status.status == 75:
             return declined("state", started)
         if remote_status.status == 0:
-            return PassedOnMac(seconds, fetched)
+            return PassedOnMac(seconds, fetched, remote_status.build_target_directory)
         if remote_status.status == 4 and request.verb == "nextest":
             return NoTestMatchedOnMac(seconds, fetched)
         return FailedOnMac(remote_status.status, seconds, fetched)
@@ -2124,11 +2169,21 @@ def workspace_has_linux_only(repo_root: Path, excluded: set[str]) -> bool:
 
 
 def linux_kind_permitted(values: dict[str, str], kind: str) -> bool:
-    return kind in ('test', 'check', 'doc') and kind in comma_values(values.get('kinds', ''))
+    return all(step in ('test', 'check', 'doc', 'lint', 'example', 'build')
+               and step in comma_values(values.get('kinds', '')) for step in remote_step_kinds(kind))
+
+
+def remote_step_kinds(kind: str) -> tuple[str, ...]:
+    """Return the kinds that a command must run on its pinned target."""
+    return ('check', 'test') if kind == 'final' else (kind,)
+
+
+def verb_kind(verb: MacVerb) -> str:
+    return "test" if verb == "nextest" else "lint" if verb in ("clippy", "mend-check") else verb
 
 
 def mac_step_eligibility(config: OffloadConfig, repo_root: Path, package: str,
-                         verb: MacVerb, target: str = "") -> KnownRepository | IneligibleMacStep:
+                         verb: MacVerb, target: str = "", *, kind: str = "") -> KnownRepository | IneligibleMacStep:
     """Share repository, package/workspace and backoff rules with eligible --kind."""
     if not config.enabled:
         return IneligibleMacStep("off")
@@ -2136,9 +2191,8 @@ def mac_step_eligibility(config: OffloadConfig, repo_root: Path, package: str,
     if isinstance(repository, UnknownRepository):
         return IneligibleMacStep("repo")
     if target and not target_config.uses_legacy_mac_layout(configured_ssh_target(target).platform):
-        kind = "test" if verb == "nextest" else verb
-        if not linux_kind_permitted(config.values, kind):
-            return IneligibleMacStep("repo")
+        if not linux_kind_permitted(config.values, kind or verb_kind(verb)):
+            return IneligibleMacStep("target does not permit this command")
         if isinstance(read_backoff(time.time(), target), ActiveBackoff):
             return IneligibleMacStep("backoff")
         return repository
@@ -2146,7 +2200,7 @@ def mac_step_eligibility(config: OffloadConfig, repo_root: Path, package: str,
     if key not in config.values:
         return IneligibleMacStep("repo")
     excluded = comma_values(config.values[key])
-    if verb == "nextest":
+    if verb == "nextest" and package:
         if package in excluded:
             return IneligibleMacStep("linux_only")
     else:
@@ -2166,13 +2220,21 @@ def run_offload(
     request: OffloadRequest,
     started: float,
 ) -> MacOffloadResult:
-    eligibility = mac_step_eligibility(config, request.repo_root, request.package, request.verb, request.target)
+    eligibility = mac_step_eligibility(config, request.repo_root, request.package, request.verb, request.target, kind=request.kind)
     if isinstance(eligibility, IneligibleMacStep):
         return declined(eligibility.reason, started)
     repository = eligibility
     linux = not target_config.uses_legacy_mac_layout(configured_ssh_target(request.target or "mac").platform)
     if linux and not trusted_linux_source(request.repo_root):
         return declined("repo", started)
+    if linux:
+        detail = recorded_linux_version_mismatch(controller, config, request.target)
+        decline_path = linux_version_decline_path(request.target, repository.name)
+        if detail:
+            decline_path.parent.mkdir(parents=True, exist_ok=True)
+            _ = decline_path.write_text(str(time.time()))
+            return DeclinedMacRun("state", elapsed_seconds(started), detail)
+        decline_path.unlink(missing_ok=True)
     if not linux and isinstance(request.source, StagedDocSnapshot):
         try:
             if workspace_has_linux_only(request.source.root, comma_values(config.values[f"linux_only.{repository.name}"])):
@@ -2180,7 +2242,38 @@ def run_offload(
         except (OSError, UnicodeError, ValueError):
             return declined("repo", started)
 
-    claim = claim_for_run(controller, config, request, repository)
+    try:
+        with ExitStack() as admission_leases:
+            slots = (target_config.slot_capacity(config.values, repository.name,
+                     missing=target_config.MissingSlotCapacity.SINGLE_SLOT) if linux else 1)
+            leases: dict[int, ExitStack] = {}
+            for slot in range(1, slots + 1):
+                lease = ExitStack()
+                try:
+                    lease.enter_context(copies.remote_lease(request_mirror(config, replace(request, slot=slot), repository)))
+                except copies.BusyRemoteMirror:
+                    continue
+                leases[slot] = admission_leases.enter_context(lease)
+            return leased_offload(controller, config, request, repository, started, linux, leases)
+    except copies.CopyError as error:
+        return DeclinedMacRun("copy", elapsed_seconds(started), str(error))
+
+
+def request_mirror(config: OffloadConfig, request: OffloadRequest, repository: KnownRepository) -> copies.RemoteMirror:
+    scope = request.repository_scope
+    if isinstance(scope, copies.AllRepositories):
+        scope = copies.SelectedRepository(repository.name)
+    return copies.RemoteMirror(request.owner, scope, config.host,
+                               remote_mirror(repository, request.target, request.slot),
+                               request.holder_session)
+
+
+def leased_offload(controller: ProcessController, config: OffloadConfig, request: OffloadRequest,
+                   repository: KnownRepository, started: float, linux: bool,
+                   leases: dict[int, ExitStack]) -> MacOffloadResult:
+    if not leases:
+        return BusyMacDecline(LostRunLeftovers(), elapsed_seconds(started))
+    claim = claim_for_run(controller, config, request, repository, tuple(leases))
     # A transferred reservation can be adopted only once.
     request = replace(request, admission=UnclaimedMacRun())
     if isinstance(claim, (TakenOverMacClaim, TakeoverHostUnreadable)):
@@ -2194,7 +2287,7 @@ def run_offload(
         if isinstance(checked, LeftoversRemain):
             return BusyMacDecline(LostRunLeftovers(), elapsed_seconds(started))
         release_claim(controller, request.target)
-        claim = claim_for_run(controller, config, request, repository)
+        claim = claim_for_run(controller, config, request, repository, tuple(leases))
         if isinstance(claim, (TakenOverMacClaim, TakeoverHostUnreadable)):
             return BusyMacDecline(LostRunLeftovers(), elapsed_seconds(started))
     if isinstance(claim, MacClaimNotConfirmed):
@@ -2206,9 +2299,16 @@ def run_offload(
         if claim.reason == "busy":
             return BusyMacDecline(claim_holder(claim.stdout), elapsed_seconds(started))
         return declined(claim.reason, started)
-    result = claimed_run(controller, config, replace(request, slot=claim.slot), repository, started)
+    if claim.slot not in leases:
+        release_claim(controller, request.target)
+        return BusyMacDecline(LostRunLeftovers(), elapsed_seconds(started))
+    for slot, lease in leases.items():
+        if slot != claim.slot:
+            lease.close()
+    selected = replace(request, slot=claim.slot)
+    result = claimed_run(controller, config, selected, repository, started)
     if linux and isinstance(result, PassedOnMac):
-        return PassedOnTarget(result.seconds)
+        return PassedOnTarget(result.seconds, result.build_target_directory)
     if linux and isinstance(result, FailedOnMac):
         return FailedOnTarget(result.status, result.seconds)
     return result
@@ -2248,7 +2348,8 @@ def parser() -> argparse.ArgumentParser:
     _ = run.add_argument("--repo-root", required=True)
     _ = run.add_argument("--source-root", default="")
     _ = run.add_argument("--package", default="")
-    _ = run.add_argument("--verb", choices=("nextest", "check", "clippy", "mend-check", "doc"), default="nextest")
+    _ = run.add_argument("--verb", choices=("nextest", "check", "clippy", "mend-check", "doc", "build"), default="nextest")
+    _ = run.add_argument("--kind", default="")
     _ = run.add_argument("--call-id", required=True)
     _ = run.add_argument("--settings", default="")
     _ = run.add_argument("--target", default="")
@@ -2263,6 +2364,14 @@ def parser() -> argparse.ArgumentParser:
     return root
 
 
+def holder_session() -> str:
+    """Use the unit owner session before the shell session."""
+    owner = build_hold.owning_session()
+    if isinstance(owner, build_hold.OwningSession):
+        return owner.session_id
+    return os.environ.get("CODEX_THREAD_ID") or f"pid-{os.getpid()}"
+
+
 def request_from_arguments(arguments: CliArguments) -> OffloadRequest:
     words = arguments.nextest_words
     if words[:1] == ["--"]:
@@ -2275,6 +2384,8 @@ def request_from_arguments(arguments: CliArguments) -> OffloadRequest:
     return OffloadRequest(
         repo_root=Path(arguments.repo_root).resolve(),
         source=StagedDocSnapshot(Path(arguments.source_root).resolve()) if arguments.source_root else RepositoryWorkingTree(),
+        owner=copies.source_owner(Path(arguments.repo_root)),
+        holder_session=holder_session(),
         package=arguments.package,
         call_id=arguments.call_id,
         result=result_destination(arguments.result),
@@ -2282,6 +2393,7 @@ def request_from_arguments(arguments: CliArguments) -> OffloadRequest:
         last_decline=last_decline,
         copy=arguments.copy,
         verb=arguments.verb,
+        kind=arguments.kind,
         target=arguments.target,
         environment=tuple((name, os.environ[name]) for name in arguments.environment),
         fetch=FetchFolder(arguments.fetch.removesuffix("/")) if arguments.fetch is not None else NO_FETCH,
@@ -2332,8 +2444,10 @@ def main() -> int:
     override_guard.refuse_overrides(Path(__file__), "mac_test/offload.py")
     cli = parser()
     arguments = cli.parse_args(namespace=CliArguments())
-    if (arguments.environment or arguments.fetch is not None) and (arguments.verb != "nextest" or arguments.copy):
-        cli.error("--env and --fetch apply only to non-copy nextest runs")
+    if arguments.environment and arguments.verb != "nextest":
+        cli.error("--env applies only to nextest runs")
+    if arguments.fetch is not None and (arguments.verb != "nextest" or arguments.copy):
+        cli.error("--fetch applies only to non-copy nextest runs")
     for name in arguments.environment:
         if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name) is None:
             cli.error(f"--env {name}: not a variable name")

@@ -1,7 +1,6 @@
 """Claude session warnings, Codex log markers and legacy notice cleanup."""
 from __future__ import annotations
 
-import sys
 import io
 from contextlib import redirect_stdout
 import tempfile
@@ -16,22 +15,21 @@ from pathlib import Path
 from typing import cast, override
 from unittest.mock import patch
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from scripts.whoami import agent_accounts
 from scripts.whoami import note_file
 from scripts.whoami.agent_accounts import KnownCodexAccount, UnknownCodexAccount
-import five_hour
+from scripts.whoami import five_hour
 from scripts.whoami.agent_accounts import CodexHomeSource, CodexRateLimits, Quota, Report
 from scripts.accounts import accounts, role_map
 from scripts.production.staff_test_support import isolated_staff_file, recorded_showrunner
 
-import escalate  # five_hour puts scripts/message on the path
-import quota_alert
+from scripts.message import escalate  # five_hour puts scripts/message on the path
+from scripts.whoami import quota_alert
 from scripts.notify import push_texts
-import send
-import sessions
-from quota_alert import Config, Showrunner
+from scripts.message import send
+from scripts.message import sessions
+from scripts.whoami.quota_alert import Config, Showrunner
 from scripts.notify.user_action import NoActionRequired
 
 NOW = datetime(2026, 10, 15, 18, 20, tzinfo=timezone.utc)

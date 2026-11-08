@@ -5,9 +5,9 @@ from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
 from typing import NamedTuple
 
-import upstream
-from pins import Pins
-from upgrade_record import BranchRead, BranchUnread, CratesIoRead, CratesIoUnlisted, Entry, Record, on_target, target_fit
+from scripts.bevy_upgrade import upstream
+from scripts.bevy_upgrade.pins import Pins
+from scripts.bevy_upgrade.upgrade_record import BranchRead, BranchUnread, CratesIoRead, CratesIoUnlisted, Entry, Record, on_target, target_fit
 
 Clock = Callable[[], datetime]
 CHECK_BUDGET = timedelta(seconds=180)

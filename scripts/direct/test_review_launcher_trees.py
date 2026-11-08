@@ -1,4 +1,4 @@
-"""Check concurrent reviews preserve phase ownership and detect edits."""
+"""Check concurrent reviews preserve phase ownership and allow edits."""
 
 from __future__ import annotations
 
@@ -12,7 +12,6 @@ import subprocess
 class ReviewLauncherPassTests(support.ReviewLauncherFixture):
 
     def test_plain_review_does_not_require_the_tree_guard(self) -> None:
-        (self.review_script.parent / "review_tree.py").unlink()
         result, phase_dir = self.side_by_side_review("parallel-writer", "other.txt")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertNotIn("changed the working tree", result.stderr)

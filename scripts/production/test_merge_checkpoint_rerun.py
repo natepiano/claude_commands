@@ -2,21 +2,21 @@
 from __future__ import annotations
 
 import argparse
+import json
 from collections.abc import Callable
 from contextlib import AbstractContextManager
 from pathlib import Path
 import shutil
 import subprocess
-import sys
 from types import ModuleType
-from typing import final
+from typing import cast, final
 import unittest
 from unittest.mock import patch
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-import merge_checkpoint
-import change_review
-from scripts.production import staff
+from scripts.production import merge_checkpoint
+from scripts.production import change_review
+from scripts.production import staff, unit_lookup
+from scripts.production.staff_test_support import isolated_staff_file
 from scripts.production.merge_checkpoint_test_support import MergeCheckpointFixture, configure_test_environment
 
 
@@ -32,6 +32,7 @@ def setUpModule() -> None:
 class CheckpointRerunTests(MergeCheckpointFixture):
     def review_checkpoint(self, *changes: str, unit: str = "alpha") -> tuple[Path, str]:
         review = Path(self.env["HOME"]) / "rust/hanadocs/change-review/change-review - example.md"
+        self.promotions = str(self.promote)
         self.production_doc(change_review=review)
         return review, self.dated_checkpoint(f"checkpoint({unit}): change\n\n" + "\n".join(
             f"Change-Review: {change}" for change in changes))
@@ -57,7 +58,7 @@ class CheckpointRerunTests(MergeCheckpointFixture):
         _ = shutil.copytree(self.root, snapshot)
         self.addCleanup(shutil.rmtree, snapshot)
         # Merge commits must be identical in the uninterrupted and resumed cases.
-        self.env["GIT_COMMITTER_DATE"] = "2026-10-29T12:00:00-04:00"
+        self.env["GIT_COMMITTER_DATE"] = "2026-11-06T12:00:00-05:00"
         self.env["GIT_AUTHOR_DATE"] = self.env["GIT_COMMITTER_DATE"]
         return snapshot
 
@@ -106,18 +107,18 @@ class CheckpointRerunTests(MergeCheckpointFixture):
         self.assert_review_recovered("tests")
 
     def test_review_rows_recover_after_push_before_recording(self) -> None:
-        self.assert_review_recovered("record_changes")
+        self.assert_review_recovered("record_publication_changes")
 
     def test_review_rows_written_before_receipt_are_not_duplicated(self) -> None:
         review, checkpoint = self.review_checkpoint("A change | Open it | Result")
         original = Path.touch
 
         def touch(path: Path, mode: int = 0o666, exist_ok: bool = True) -> None:
-            if path.name == "change-review":
+            if path.name == "promotion":
                 raise Killed
             original(path, mode=mode, exist_ok=exist_ok)
 
-        # The write completes but the command dies before recording completion.
+        # The list write completes before the promotion receipt records completion.
         with patch.object(Path, "touch", touch), self.assertRaises(Killed):
             _ = self.run_checkpoint(checkpoint)
         expected = review.read_bytes()
@@ -177,17 +178,27 @@ class CheckpointRerunTests(MergeCheckpointFixture):
         self.assertIn("the production doc has no Change review line; no rows written", result.stdout)
         self.assertEqual(self.git("rev-parse", "production", cwd=self.origin), self.git("rev-parse", "HEAD"))
 
-    def test_a_successful_publication_notes_an_unregistered_unit_once(self) -> None:
-        review, checkpoint = self.review_checkpoint("First change | Open first | First result", "Second change | Open second | Second result", unit="unregistered")
-        result = self.run_checkpoint(checkpoint).process
+    def test_a_merge_keeps_its_units_producer_after_the_staff_row_goes(self) -> None:
+        review, checkpoint = self.review_checkpoint("First change | Open first | First result",
+                                                    "Second change | Open second | Second result")
+        with isolated_staff_file(Path(self.env["STAFF_FILE"]), self.env):
+            unit_staff_id = unit_lookup.unit_row("alpha", staff.snapshot()).id
+
+        def unregister(staff_file: Path) -> None:
+            document = cast(dict[str, list[dict[str, object]]], json.loads(staff_file.read_text(encoding="utf-8")))
+            document["rows"] = [row for row in document["rows"] if row["name"] != "alpha"]
+            _ = staff_file.write_text(json.dumps(document), encoding="utf-8")
+
+        with self.after_input(unregister):
+            result = self.run_checkpoint(checkpoint).process
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         notes = [line for line in result.stdout.splitlines() if line.startswith("change review: no staff row for unit")]
-        self.assertEqual(notes, ["change review: no staff row for unit unregistered; Producer stays empty"])
-        self.assertEqual([row["Producer"] for row in change_review.pending(review)], ["", ""])
+        self.assertEqual(notes, [])
+        self.assertEqual([row["Producer"] for row in change_review.pending(review)], [unit_staff_id, unit_staff_id])
 
     def test_an_already_pushed_merge_keeps_the_row_failure_report_for_an_unreadable_staff_record(self) -> None:
         review, checkpoint = self.review_checkpoint("A change | Open it | Result")
-        with patch.object(merge_checkpoint, "record_changes", side_effect=Killed), self.assertRaises(Killed):
+        with patch.object(merge_checkpoint, "record_publication_changes", side_effect=Killed), self.assertRaises(Killed):
             _ = self.run_checkpoint(checkpoint)
         merge = self.git("rev-parse", "HEAD")
         self.assertEqual(self.git("rev-parse", "production", cwd=self.origin), merge)
@@ -195,7 +206,7 @@ class CheckpointRerunTests(MergeCheckpointFixture):
             result = self.run_checkpoint(checkpoint).process
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("change review: failed", result.stdout)
-        self.assertIn("add its rows by hand", result.stdout)
+        self.assertIn("retry after the repair", result.stdout)
         self.assertEqual(self.git("rev-parse", "HEAD"), merge)
         self.assertEqual(self.git("rev-parse", "production", cwd=self.origin), merge)
         self.assertFalse(review.exists())

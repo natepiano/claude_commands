@@ -9,10 +9,15 @@ import sqlite3
 from statistics import median
 from typing import cast
 
-from scripts.aws_target.measurement import MeasurementUnavailable, number
-from scripts.buildlog import record
-from scripts.buildlog import store
-from scripts.mac_test import offload
+if TYPE_CHECKING:
+    from scripts.aws_target.measurement import MeasurementUnavailable, number
+    from scripts.buildlog import record, store
+    from scripts.mac_test import offload
+else:
+    from scripts.aws_target.measurement import MeasurementUnavailable, number
+    from scripts.buildlog import record
+    from scripts.buildlog import store
+    from scripts.mac_test import offload
 
 
 @dataclass(frozen=True)

@@ -9,7 +9,7 @@ from unittest import mock
 
 from scripts.message import send
 from scripts.production import staff, staff_move, unit_config
-import stall_watch
+from scripts.production import stall_watch
 from scripts.production.staff_test_support import unit_membership
 from scripts.production.transfer_unit_test_support import UnitTransferFixture
 

@@ -35,10 +35,8 @@ if TYPE_CHECKING:
     from scripts.build_hold import build_hold
     from scripts.lint.memory_test_support import config_environment, write_config_fixture
 else:
-    from scripts.build_targets import build_targets
-    from scripts.build_targets import targets
-    from scripts.mac_test import mac_test
-    from scripts.mac_test import offload
+    from scripts.build_targets import build_targets, targets
+    from scripts.mac_test import mac_test, offload
     from scripts.build_hold import build_hold
     from scripts.aws_target import ledger
     from scripts.aws_target.ledger_test_support import (
@@ -157,12 +155,27 @@ class SshEligibilityTests(unittest.TestCase):
         self.reachable = False
         with redirect_stdout(output):
             self.assertEqual(build_targets.command_pinned_eligible(args, targets.ANY_ELIGIBLE_TARGET), 0)
-        self.assertIn("aws\texcluded\tstarting\t", output.getvalue())
+        self.assertIn(f"aws\texcluded\tstarting\t{self.root / 'aws_target.conf'}\tlinux\n", output.getvalue())
         self.assertEqual(self.commands, [])
         _ = (paths.directory / "controller.json").write_text('{"state":"running"}')
         with redirect_stderr(io.StringIO()), redirect_stdout(io.StringIO()):
             self.assertEqual(build_targets.command_pinned_eligible(args, targets.ANY_ELIGIBLE_TARGET), 2)
         self.assertTrue(self.commands)
+
+    def test_pinned_final_requires_check_and_test_before_waiting_for_aws(self) -> None:
+        paths = mac_test.state_paths("aws")
+        paths.directory.mkdir(parents=True, exist_ok=True)
+        _ = (paths.directory / "controller.json").write_text('{"state":"stopped"}')
+        args = build_targets.CliArguments()
+        args.target, args.kind, args.repo_root, args.package = "aws", "final", str(self.root), "linux-part"
+        settings = self.root / "aws_target.conf"
+        original = settings.read_text()
+        for kinds, expected in (("check", 2), ("test", 2), ("test,check", 0)):
+            with self.subTest(kinds=kinds):
+                _ = settings.write_text(original.replace("kinds=test,check,doc", "kinds=" + kinds))
+                with redirect_stderr(io.StringIO()), redirect_stdout(io.StringIO()):
+                    self.assertEqual(build_targets.command_pinned_eligible(args, targets.ANY_ELIGIBLE_TARGET), expected)
+        self.assertEqual(self.commands, [])
 
     def test_pinned_stopped_aws_still_refuses_a_spending_limit(self) -> None:
         paths = mac_test.state_paths("aws")
@@ -468,7 +481,7 @@ class SshEligibilityTests(unittest.TestCase):
                 numeric_settings(settings, {key: "3"})
                 with redirect_stderr(io.StringIO()) as errors:
                     self.assertEqual(self.aws()[1:3], ["excluded", "spending_limit"])
-                    self.assertEqual(self.decision(), "ssh_allowed")
+                    self.assertEqual(self.decision(), "any_target")
                     self.assertEqual(self.reserve(), 1)
                 self.assertIn("spending refused", errors.getvalue())
                 self.assertEqual(self.commands, [])
@@ -508,7 +521,7 @@ class SshEligibilityTests(unittest.TestCase):
         with redirect_stderr(io.StringIO()):
             self.assertEqual(self.aws()[1:3], ["excluded", "spending_unavailable"])
             self.assertEqual(self.reserve(), 1)
-            self.assertEqual(self.decision(), "ssh_allowed")
+            self.assertEqual(self.decision(), "any_target")
         self.assertEqual(self.commands, [])
         self.assertEqual(mac_test.read_claims(mac_test.state_paths("aws")), ())
         self.assertEqual(book.path.read_bytes(), b"{unfinished ledger")
@@ -539,25 +552,25 @@ class SshEligibilityTests(unittest.TestCase):
 
     def test_linux_backoff_keeps_the_memory_leave_route(self) -> None:
         offload.write_backoff(10**12, "aws")
-        self.assertEqual(self.decision(), "ssh_allowed")
+        self.assertEqual(self.decision(), "any_target")
         self.assertEqual(self.commands, [])
 
     def test_unreachable_linux_target_keeps_the_memory_leave_route(self) -> None:
         self.reachable = False
-        self.assertEqual(self.decision(), "ssh_allowed")
+        self.assertEqual(self.decision(), "any_target")
         self.assertTrue(self.commands)
 
     def test_disk_refusal_keeps_the_memory_leave_route(self) -> None:
         with mock.patch.object(mac_test, "free_now", return_value="disk"):
-            self.assertEqual(self.decision(), "natedev_only disk")
+            self.assertEqual(self.decision(), "any_target")
         self.assertEqual(self.commands, [])
 
     def test_capacity_exclusions_keep_the_memory_leave_route_available(self) -> None:
         self.occupy(71)
         self.occupy(72)
-        self.assertEqual(self.decision(), "ssh_allowed")
+        self.assertEqual(self.decision(), "any_target")
         with mock.patch.object(mac_test, "free_now", return_value="blocked"):
-            self.assertEqual(self.decision(), "ssh_allowed")
+            self.assertEqual(self.decision(), "any_target")
         self.assertEqual(self.commands, [])
 
     def test_linux_only_work_keeps_linux_capacity_without_a_mac(self) -> None:
@@ -565,6 +578,7 @@ class SshEligibilityTests(unittest.TestCase):
         self.assertEqual([row[0] for row in rows], ["mac", "natedev", "aws"])
         self.assertEqual(rows[0][1:3], ["excluded", "linux_only"])
         self.assertEqual(rows[2][1:3], ["eligible", "-"])
+        self.assertEqual([row[4] for row in rows], ["macos", "-", "linux"])
         self.assertTrue(self.commands)
 
     def test_linux_test_check_and_doc_need_no_mac_repository_setting(self) -> None:

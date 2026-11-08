@@ -19,9 +19,7 @@ from enum import StrEnum
 from zoneinfo import ZoneInfo
 
 from scripts.lib import conf
-from scripts.buildlog import costs
-from scripts.buildlog import index
-from scripts.buildlog import moments
+from scripts.buildlog import costs, index, moments
 from scripts.lib.user_zone import user_zone
 from scripts.buildlog.costs import CostUnavailable as CostUnavailable
 

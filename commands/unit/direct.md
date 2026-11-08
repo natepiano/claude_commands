@@ -27,16 +27,21 @@ review, gate and report. Every prompt sent to a worker carries them inline per
 - `single` and `verbose` are mutually exclusive.
 
 <HeldAstraRoles>
-For LongLivedWorkers and LaunchImplementation, the director briefs and accepts;
-Astra authors the assigned design. Use one `design_roles.py` designer and at most one
-reviewer per design, with models resolved from `design_roles` in `models.conf`. Open
-once; resume the same instance across rounds, phases and runs. `design_roles.py` saves
-each headed prompt and reply; do not also use `astra_work.py brief` for that role.
-For a designer outside `design_roles.py`, include `config/design_roles/designer.md` in its brief
-and save it with `astra_work.py brief --run-directory <SESSION_DIR> --phase <id>
---member <mesh name> --document <path> --round <N> --text-file <brief>`.
-Save its reply as `<SESSION_DIR>/design/phase<id>/round<N>_reply.md` without
-overwrite. Pass both `--run-directory` and `--phase` to phase `astra_review.py` calls.
+The director gives the brief and accepts the design. Astra writes the assigned design.
+Use one `design_roles.py` designer and at most one reviewer per design.
+`models.conf` selects the role's model and effort.
+Held roles use `worker.py` with explicit `astra-designer` or `astra-reviewer` roles.
+Keep the worker's row, native conversation, and pane across rounds, phases, and runs.
+An ad hoc Astra review outside the staff hierarchy uses a consultation pane through `assign.sh`.
+Ask-a-friend opens a consultation pane through `assign.sh` beside its caller.
+The consultation creates no staff row.
+`side_pane.py send|close` uses the same terminal for later questions and closure.
+`design_roles.py` saves each headed prompt and reply. Do not also use `astra_work.py brief` for that role.
+For another designer, include `config/design_roles/designer.md` in its brief.
+Save the brief with `astra_work.py brief --run-directory <SESSION_DIR> --phase <id>
+--member <worker name> --document <path> --round <N> --text-file <brief>`.
+Save its reply as `<SESSION_DIR>/design/phase<id>/round<N>_reply.md` without overwrite.
+Pass both `--run-directory` and `--phase` to `astra_review.py` calls for a phase.
 
 For DelegatedPhaseReservationContract, prepare exact phase files, baseline and
 reservation before dispatch. Bind the designer to those output paths with explicit
@@ -49,17 +54,16 @@ For DualReview and FixDispatch, keep the same reviewer and writer. Save findings
 responses and short rulings that cite files; update the Work Order for a scope
 change. Busy or unavailable review is not a pass and permits no replacement.
 
-For PhaseCleanup, FinalGate and RunSummary, finish turns, release the reservation,
-then unbind the design. Keep role threads, pending messages and evidence until
-explicit end. Run cleanup must not stop durable meshes. Account moves and holder
-restarts recover the same threads through the role lifecycle; never raw pause or
-silently replace a lost thread. Adoption uses its recorded transfer and destination.
-The existing checkpoint, visual check and gate order still applies.
-For rollback, set `[roles] new_open=false` in `config/design_roles.conf`. Finish active
-turns and release servers through the holder lifecycle. Keep placements, fences,
-pending input, prompts, replies and unfinished reservations. Keep adopted ownership
-at its destination unless a reverse transfer proves no destination writer. Restore
-old command text only when it preserves these fences; never replace a thread.
+For PhaseCleanup, FinalGate and RunSummary, finish turns, release the reservation, then unbind the design.
+Keep conversations, pending messages and evidence until explicit end.
+Account moves and holder restarts resume the same conversations through the role lifecycle.
+Never replace a lost conversation silently. Adoption uses its recorded transfer and destination.
+Keep the existing checkpoint, visual check and gate order.
+For rollback, set `[roles] new_open=false` in `config/design_roles.conf`.
+Finish active turns through the holder lifecycle.
+Keep placements, fences, pending input, prompts, replies and unfinished reservations.
+Keep adopted ownership at its destination unless a reverse transfer proves no destination writer.
+Restore old command text only when it preserves these fences.
 </HeldAstraRoles>
 
 At startup or restart, a header `**Standing:** style_plan.py` runs
@@ -92,8 +96,8 @@ State:
   its `files` list, its prompts, and every file its launchers write: each
   launch names the phase with `--phase`, so status, summaries, findings and
   logs never collide with a phase running beside it. Run-wide files
-  (`board.log`, `heartbeat.log`, `mesh_server.json`, `mesh_roster.json`, the
-  findings ledger and recorder state) stay in `${SESSION_DIR}`.
+  (`board.log`, `heartbeat.log`, the findings ledger and recorder state) stay in `${SESSION_DIR}`.
+  An existing mesh-pinned run also keeps `mesh_server.json` and `mesh_roster.json` there.
 - `PHASE_RESERVATION_STATE`: the tagged state persisted at
   `${PHASE_DIR}/delegated_phase_reservation_state.json`; see
   <PhaseReservationContract/>.
@@ -142,33 +146,79 @@ the director neither prepares style inputs nor pastes a style assignment.
 <LongLivedWorkers>
 Read the run's transport through `unit_runs.worker_transport(run)` once.
 Use the pinned transport for <WorkerRuns/>, <WorkerLaunchFailure/>, <FixDispatch/>, and <PhaseCleanup/>.
-The default remains `mesh`. A mesh-pinned run finishes on the mesh.
+The configuration selects a new run's transport. Never change an existing run's pin.
+Apply mesh instructions only when that existing pin is `mesh`.
 
 For `herdr`, dispatch through `assign.sh --role implement|test|fix|review --prompt <path> --cwd <worktree>`.
 The launcher calls `worker.py assign` with the explicit role.
-Use `worker.py list` to inspect workers and `worker.py restore` to resume retained workers.
+Use `worker.py list` to inspect workers and `worker.py restore` to resume workers with active dispatches.
+The list uses `worker_panes.observe` for open, stopped, closed, unknown, and incomplete states.
+An unknown pane outside this parent's tabs does not make its absent workers uncertain.
+An unknown pane in a parent's tab, or an unreadable parent pane, can leave absence unproved.
 Use `worker.py end <name>` only for permanent removal.
+After accepting a pass, close its pane unless a fix round or next-phase dispatch starts immediately.
+Use `~/.claude/scripts/lib/py ~/.claude/scripts/herdr/worker_panes.py close <name>`.
+The close keeps the thread and staff row; the next assign resumes that thread.
+If a busy worker or live detached run prevents closure, keep the pane. Close it after that work ends.
 The worker command selects idle workers and reuses stopped workers.
+Use the short name from `worker.py list` with `--to` when selecting a retained pane worker.
 Keep every busy or unknown worker unchanged.
 The transcript records prompt submission and the matching `DONE <dispatch id>` reply.
 Only exit 0 completes a pass.
+Exit 2 means refused.
 Exit 3 means no DONE reply. Exit 4 means blocked. Exit 5 means stalled.
 Exit 6 means busy. Exit 7 means retained. Exit 8 means uncertain.
-Inspect the named pane before another dispatch after an incomplete result.
+After an incomplete pass, inspect the named pane and rerun the saved launcher command before another role's dispatch.
+A rerun never types a prompt that the transcript records. It reads the transcript and waits for the worker.
+So when a turn ended with no DONE line, a rerun alone returns exit 3 (`NO_DONE`) again. Recover in this order:
+1. Tell the worker to write its complete result and to end with `DONE <dispatch id>` alone on the last line.
+   Use `send.py --from <holder> --to worker:<holder>/<worker> --text "<request>"`. The launcher's prompt line in the pane holds the id.
+2. Read the worker's reply in the pane. Check the result and the DONE line.
+3. Rerun the saved launcher command with its original arguments. The command is the worker's `launcher_command` in `<run>/progress_history_state.json`.
+A worker that waits on a friend's reply also ends its turn with no DONE, so the launcher exits 3.
+When the pane shows the worker's DONE line, rerun the saved launcher command. Do not send a message.
+After all repair workers complete successfully, run `findings.py landed` if the launcher does not run it.
+Use `--session-dir "${SESSION_DIR}" --phase "<phase id>"`.
+Read-only pane reviewers post no board lines and run no suites.
+The director or a writer handles required board posts and suites.
+A pane worker has no in-turn compaction option.
+Codex keeps its own full-window limit.
 Do not use mesh claims, mesh roster entries, or phase dispatch locks for this transport.
 
-For `mesh`, keep each worker's thread through the existing unit ledger.
+Shutdown leaves proved stopped workers at the shell and retains their rows and conversations.
+Restore resumes only conversations with active dispatches through `worker.py restore`. Idle workers stay closed until their next assign.
+Restore reads the role and active pass from the recorder, then reuses the saved launcher command.
+It reads the transcript before input and never submits the same dispatch twice.
+Account moves resume only workers with active dispatches; each move closes an idle worker's pane.
+An idle worker's next assign opens its conversation on the current role account.
+A stopped worker with an active dispatch keeps its pane and terminal.
+An unknown worker supplies no stopped proof. Inspect its named pane.
+Unrelated proved moves can continue.
+A completed restore or move rerun prints one `unchanged` line and exits 0 without a restart notice.
+An interrupted split rebuild can leave panes in the source workspace and lose the split ratio.
+Inspect the tab and panes named by the anomaly line. A retry does not rebuild that split.
+
+For an existing `mesh` pin, keep each worker's thread through the existing unit ledger.
 Use `docs/as-built/long-lived-workers.md` for pause, move, end, and compaction.
 A failed compaction keeps the thread available for its own compaction.
 Never create another reviewer while its retained thread exists.
+At the next phase start, the director of a run with a `mesh` pin must follow these steps:
+
+1. Finish the current pass, or record the unfinished work in the plan.
+2. Keep the run's history, saved launcher arguments, and durable design bindings.
+3. Run `progress_history.py finish-run --status stopped`, then `end_session.sh`.
+4. Confirm with one `ps` read that no process of that run remains.
+   This includes `mesh_runs.py supervise`, `codex_mesh.py`, and `codex app-server`.
+   `end_session.sh` continues past a cleanup failure. Its exit does not prove that these processes stopped.
+5. Start a new run with `prepare_session.sh`. It pins herdr. Continue at the same plan phase.
 
 Every review prompt names `config/review/code.md` under <ReviewPromptContract/>.
 Other prompts carry the Three Gods and Type Design Contract under <WritePromptContract/>.
 </LongLivedWorkers>
 
 <CoreContract>
-- Never modify unrelated files. The unit director may make a worktree, and its
-  branch, for its own workers. The unit's staff row keeps its one home worktree;
+- Never modify unrelated files. The unit director may make a worktree, and its branch, for its own workers, with `scripts/worktree/make_worktree.sh`.
+  The unit's staff row keeps its one home worktree;
   where a worker works stays in its run record, not in staff. The director
   removes each worktree it made when that work ends. In the home worktree, the
   only branch the run may create is the remote branch <PushCheckpoint/> pushes;
@@ -308,19 +358,17 @@ Applies to every implementation, test, fix, and review launcher.
    line, never its handle. A task message resumes the workflow.
 5. Codex: apply <CodexDispatchWait/>. Never end the turn while the launcher is
    active; its terminal result drives the next workflow step.
-6. A new-worker or follow-up launcher killed at its time limit leaves its Codex
+6. For `herdr`, recover an incomplete pass under <LongLivedWorkers/> before another role's dispatch.
+   For an existing `mesh` pin, a launcher killed at its time limit leaves its Codex
    worker running with no one watching. Arm a Monitor on
    `${SESSION_DIR}/board.log` until that worker
    posts its own `done`, not a `launcher:` line. Once it has, and its last lint
-   and test passed after its last edit, leave its thread open under
+   and test passed after its last edit, retain its native conversation under
    <LongLivedWorkers/> and record the outcome the launcher would have; for a
    repair, that is <FixDispatch/>'s third outcome.
 </DispatchContract>
 
 <WorkerRuns>
-For `herdr`, keep the pane and native session during detached work.
-Use the detached-run result without sending another dispatch prompt.
-The following mesh attachment and delivery rules apply only to `mesh`.
 A Codex worker runs only commands that finish within one call and never makes
 an empty `write_stdin` poll. A longer command, a `verify.sh` run or any other
 started with `mesh_runs.py start`, detaches and pushes its own result to the
@@ -330,10 +378,18 @@ Records are in `${SESSION_DIR}/mesh_runs/`, each log beside its record.
 `start` checks for a live twin before it applies `config/mesh_runs.conf` `LIVE_RUN_LIMIT` to that worker.
 At the limit, exit 4 starts nothing and names the live runs on stderr.
 Wait for a run's result as the next message, or put more files in one run.
-Exit 3 means the caller is not a mesh worker; only that exit permits attached execution.
-A message from a worker's run saying no
-launcher is attached carries the result to you: dispatch that worker
-(`assign.sh --role implement --to <full worker name>`) when it should act on it.
+Exit 3 means the caller has no registered worker route; only that exit permits attached execution.
+
+For `herdr`, keep the pane and native session during detached work.
+Results use the worker's native identity and observed pane.
+Delivery reads the transcript and does not repeat a recorded result.
+After a stop, a rerun can type a detached result twice without loss; add no check for the duplicate.
+Stopped, blocked, closed, or uncertain workers' results go to their holder with the reason.
+Unknown process evidence produces one anomaly line and permits no pane input.
+Use the result without sending another dispatch prompt.
+
+For an existing `mesh` pin, a result can report that no launcher is attached.
+Dispatch that worker through `assign.sh --role implement --to <full worker name>` when it must act on the result.
 
 When a decision makes a running or queued test, lint or build run useless,
 cancel it in the same turn to free its memory and its place in the queue.
@@ -357,10 +413,20 @@ only to complete a report.
 </WorkerRuns>
 
 <WorkerLaunchFailure>
+`assign.py` ends a failed launch's run when no pass completed, no other worker exists, and the director holds only that run.
+Each recorder slot counts as one worker, even when its pass records no worker name.
+For Claude, this slot must record a new `pass_started` event during the launch.
+The launcher keeps the phase reservation and the launch exit code.
+After this end, omit `--session-dir` to start a new run on retry.
+An explicit `--session-dir` retains the existing retry behavior for that folder.
+For herdr, this end applies only to exit 2. Exits 3 through 8 retain the run.
+
 For `herdr`, inspect `worker.py list` and the named pane.
 Keep incomplete, unpublished, busy, and unknown workers unchanged.
-Resume the same pass through its saved launcher command.
-The following mesh recovery rules apply only to `mesh`.
+A failed fresh start prints `publication failed: ...` and retains its pane without a saved pass.
+Rerun the original launcher command; it publishes once from that pane.
+For a published worker, resume the same pass through its saved launcher command.
+The following recovery rules apply only when the existing run's pin is `mesh`.
 A dispatch that dies in seconds never reached the provider, and a provider
 message it prints is a message some earlier call received. Workers launched
 together that fail within seconds of each other carrying **byte-identical text,
@@ -429,7 +495,7 @@ Codex only; no timer process:
 
 <BackgroundVerificationContract>
 Run every `verify.sh` call as one plain command,
-`bash ~/.claude/scripts/direct/verify.sh --session-dir "${SESSION_DIR}" <verb> …`,
+`bash ~/.claude/scripts/direct/verify.sh --session-dir "${SESSION_DIR}" <command> [<package>] [flags]`,
 with no env prefix, redirect or trailing command: the settings allow rule
 matches only that shape, and the task notification already carries its exit
 code. For `verify.sh final`, launch under <ToolingContract/> so `verify.sh`
@@ -499,19 +565,37 @@ implementation, fix, or review prompt. It also defines <PhaseTeam/>,
 </WritePromptContract>
 
 <VerificationContract>
-Rust workers run only exact prompt lines using
-`~/.claude/scripts/direct/verify.sh`:
+Rust workers run only exact prompt lines with this form:
+`bash ~/.claude/scripts/direct/verify.sh <command> [<package>] [flags]`.
+Omit the package for the whole workspace. Give at most one positional word after the command.
 
 | Intent | Command |
 | --- | --- |
-| compile feedback | `bash ~/.claude/scripts/direct/verify.sh check <package> [--keep-going]` |
-| package tests | `bash ~/.claude/scripts/direct/verify.sh test <package>` |
-| one integration target alone | `bash ~/.claude/scripts/direct/verify.sh test <package> <test>` |
-| only the tests whose name contains `<name>`, while iterating | `bash ~/.claude/scripts/direct/verify.sh test <package> --filter <name> [--filter <name> …]` |
-| a test that cannot pass on macOS, run on natedev (before CI either machine answers a test, merge gates included; user, 2026-10-16) | `bash ~/.claude/scripts/direct/verify.sh test <package> --local "<why it cannot pass on macOS>"`; never to keep tests off the Mac: a reason that names a reservation is refused, and a Mac hold (`/build:hold hold <why> target mac`) does that |
-| phase lint checks under <PhaseChecks/> | `bash ~/.claude/scripts/direct/verify.sh lint <package>` |
-| changed example | `bash ~/.claude/scripts/direct/verify.sh example <package> <name>` |
-| final workspace gate | `bash ~/.claude/scripts/direct/verify.sh final` |
+| compile feedback | `bash ~/.claude/scripts/direct/verify.sh check [<package>] [--keep-going]` |
+| package or workspace tests | `bash ~/.claude/scripts/direct/verify.sh test [<package>]` |
+| one integration target alone | `bash ~/.claude/scripts/direct/verify.sh test [<package>] --test <test>` |
+| only the tests whose name contains `<name>`, while iterating | `bash ~/.claude/scripts/direct/verify.sh test [<package>] --filter <name> [--filter <name> …]` |
+| a test that cannot pass on macOS | `bash ~/.claude/scripts/direct/verify.sh test [<package>] --local "<why it cannot pass on macOS>"` |
+| phase lint checks under <PhaseChecks/> | `bash ~/.claude/scripts/direct/verify.sh lint [<package>] [--check]` |
+| staged workspace rustdoc | `bash ~/.claude/scripts/direct/verify.sh doc [<package>]` |
+| example checks | `bash ~/.claude/scripts/direct/verify.sh example [<package>] [--name <name>]` |
+| build a binary or example | `bash ~/.claude/scripts/direct/verify.sh build [<package>] [--bin <name> \| --example <name>]` |
+| final gate | `bash ~/.claude/scripts/direct/verify.sh final [<package>]` |
+| read a saved workspace gate pass | `bash ~/.claude/scripts/direct/verify.sh final --saved [--tree <tree>]` |
+
+`check` and `build` keep Cargo's workspace selection, also with a named package.
+A named package owns feature names without a slash. Without a package, feature
+names pass unchanged. `doc` checks the whole staged workspace with the same
+feature rule. Its pass record stays the same.
+
+Without `--name`, `example` checks all examples in the selected package or workspace.
+With `--name` and no package, the example's member supplies its required features.
+`final` checks the whole workspace. A named package limits its nextest run and
+prevents a saved pass. `--tree` requires `--saved`.
+
+Use `--local` only for a test that cannot pass on macOS. A reservation reason
+is refused. Use `/build:hold hold <why> target mac` for a Mac hold.
+Before CI, either machine can answer a test, including merge gates.
 
 Rules:
 
@@ -583,7 +667,7 @@ recording the result.
 </VerificationNarration>
 
 <FindingsLedger>
-Use `python3 ~/.claude/scripts/direct/findings.py <command> --session-dir
+Use `~/.claude/scripts/lib/py ~/.claude/scripts/direct/findings.py <command> --session-dir
 "${SESSION_DIR}" --phase "<phase id>"` after <Synthesize/> confirms an issue,
 including a reviewer's style finding. Each open phase has
 its own ledger, and `--phase` names which one: with two phases open, a call
@@ -631,17 +715,22 @@ beside the repair being dispatched — then continue. Never stop, ask permission
 re-open a decision the user has already made about this run, or edit
 `~/.claude/config/direct.conf` mid-run to change what gets said.
 
-**Dispatching a repair fixes nothing.** `dispatch` leaves its batch
-`repair_in_flight`, and `gate` and `verdict` both refuse a finding still in
-flight, so a repair that never finished cannot reach a reviewer pre-labelled as
-fixed and be confirmed on that label alone. `assign.sh` resolves that state
-itself: `landed` when its worker exits cleanly, `abandon --edits-landed` when
-the worker errors. The unit director owns it only when the launcher is gone — the
-user stopped it, the process was killed, the session was interrupted. Then run
-`abandon --reason "<how it ended>"` before any other workflow step, and say in
-one line what died and that the findings are open again. Pass `--edits-landed`
-only when repair edits are actually in the tree; without it the attempt is
-refunded, because a repair that never ran must not spend the budget that decides
+**The gate reads only the ledger.** `converged` means that no gating finding is
+open. It does not mean that the tests pass: a test result reaches the gate only
+through a finding. Before each `gate` after a repair, read the worker's summary
+and open a blocker for each failing test or lint line that no finding covers.
+A later round gates blockers only, so a red with no finding reads as `converged`.
+Count one repair round per ledger batch with a started fix pass. Relaunches of that batch add no round.
+A refunded batch adds no round unless it later lands.
+
+`dispatch` leaves its batch `repair_in_flight`.
+`gate` and `verdict` refuse a finding that remains in flight.
+For `herdr`, apply the completion and recovery rules in <LongLivedWorkers/>.
+For an existing `mesh` pin, `assign.sh` runs `landed` after a clean exit or `abandon --edits-landed` after an error.
+When that mesh launcher is gone, run `abandon --reason "<how it ended>"` before the next workflow step.
+Report the interruption and the reopened findings in one line.
+Pass `--edits-landed` only when repair edits exist in the tree.
+Without that flag, the ledger refunds the attempt, which preserves the budget that decides
 when this phase stops.
 </FindingsLedger>
 
@@ -987,9 +1076,11 @@ Do not dispatch until this contract reaches one of its four persisted states.
    protects the paths but writes no state, so a first touch of your own leaves
    the state for the checkpoint backstop (<CheckpointCommit/> step 5). That
    edit checks under your bare session id, and cargo-berth maps its reservation
-   there, so the phase's own check later answers `left_unmapped` with it. With
-   one open phase, the hook and the backstop record that reservation as the
-   phase's `Active`. With two
+   there, so the phase's own check later answers `left_unmapped` with it.
+   The hook and the backstop record it as `Active` when the bare session maps that reservation and run.
+   No other open phase may hold it.
+   A sibling holds it through an `Active` state, a pending release, or its berth session map.
+   With two
    phases holding reservations, your own edit is refused as ambiguous until you
    name its phase: `cargo-berth check <path> --reservation <that phase's
    reservation id> --json` acquires the path for it, and the edit then clears. A blocked check refuses the edit and
@@ -1110,7 +1201,7 @@ At an eligible point, in that same turn:
 6. Before the recorder call in <ProgressReport/> step 5, put the reviewer in
    the round table:
 
-   `python3 ~/.claude/scripts/direct/progress_history.py arm-review --session-dir "${SESSION_DIR}" --worker "<review worker name>" --phase-id "<phase id>" --activity "<what this reviewer is checking>" --called-task direct.review [--lens adversary]`
+   `~/.claude/scripts/lib/py ~/.claude/scripts/direct/progress_history.py arm-review --session-dir "${SESSION_DIR}" --worker "<review worker name>" --phase-id "<phase id>" --activity "<what this reviewer is checking>" --called-task direct.review [--lens adversary]`
 
    Pass the same lens and phase the launch carries, and no lens where the
    launch carries none: the marker names the status and pid files it will watch for, and a
@@ -1138,7 +1229,7 @@ always may — early launch is opportunistic, never required.
 Every path that ends an early launch before its real pass starts also drops the
 row it was given:
 
-`python3 ~/.claude/scripts/direct/progress_history.py disarm-review --session-dir "${SESSION_DIR}" --reason "<canceled|reviewer error|void verdict>"`
+`~/.claude/scripts/lib/py ~/.claude/scripts/direct/progress_history.py disarm-review --session-dir "${SESSION_DIR}" --reason "<canceled|reviewer error|void verdict>"`
 
 Run it alongside clearing `${REVIEW_DISPATCH_HANDLE}`, `${EARLY_REVIEW_SLOT}`,
 and `EARLY_REVIEW`. The
@@ -1235,23 +1326,22 @@ without `none:` records P5 exposure (the user, 2026-10-28).
 
 For `herdr`, dispatch repairs through `assign.sh --role fix --prompt <path> --cwd <worktree> --fix-cause "<defect>"`.
 The worker command selects the worker and keeps its native session.
-For `mesh`, dispatch every open worker with `assign.sh --role implement --to <full-worker-name>` before the
-usual positional arguments; the prompt file is the follow-up message. Omit
-`--to` only for a new worker allowed by <LongLivedWorkers/>. Messages without the
-launcher are for questions only.
+For an existing `mesh` pin, use `assign.sh --role fix --to <full-worker-name>` with the repair prompt and phase options.
+Omit `--to` only for a new worker allowed by <LongLivedWorkers/>.
+Use messages only for questions; the launcher sends the assignment prompt.
 
-Count repair rounds as `history.py rounds` numbers its repair intervals, not as ledger batches. From repair round 4 onward, do not dispatch a missing target, rule interpretation or acceptance case in this phase unless evidence establishes a phase-caused regression, broken working behavior or test/gate failure. A broad original permission to fix pilot defects does not override this check. A later explicit user or showrunner ruling may keep named work; cite it. Route every other missing criterion to a follow-up Work Order in the owning unit, with its target decision, implementation, tests and acceptance evidence. Do not dispatch a batch until every finding is either retained with evidence or assigned to that follow-up. Split mixed batches; keep their eligible defects here. Never mark an unmet pilot acceptance bar passed because its work was routed.
+Use `history.py rounds` for repair counts. Relaunches of one ledger batch count as one repair round. From repair round 4 onward, do not dispatch a missing target, rule interpretation or acceptance case in this phase unless evidence establishes a phase-caused regression, broken working behavior or test/gate failure. A broad original permission to fix pilot defects does not override this check. A later explicit user or showrunner ruling may keep named work; cite it. Route every other missing criterion to a follow-up Work Order in the owning unit, with its target decision, implementation, tests and acceptance evidence. Do not dispatch a batch until every finding is either retained with evidence or assigned to that follow-up. Split mixed batches; keep their eligible defects here. Never mark an unmet pilot acceptance bar passed because its work was routed.
 
 Work Orders state the acceptance observation, unit or comparison, and named real-path test or live check for changed behavior. Reuse established targets. Resolve choices through the showrunner before dependent work; do not invent a number to fill the form. A later changed goal updates the order explicitly. (the user, 2026-10-28)
 
-Count repair rounds as `history.py rounds` numbers its repair intervals, not as ledger batches. Before any round 4-or-later dispatch on a repeated finding, require evidence that it is a phase-caused regression, broken working behavior or test/gate failure. Earlier attempts and an open verdict alone are not that evidence. Broad original permission for pilot fixes does not override landing. Cite any later explicit user/showrunner ruling that keeps the named work. Route a repeated finding outside these categories to its owning unit's follow-up Work Order before another repair starts. Keep the finding open and link its checks, previous attempts, due checkpoint and final acceptance result. Split mixed batches and retain all eligible work. If eligibility is unknown, diagnose it rather than silently route or count it as a certain saving.
+Use `history.py rounds` for repair counts. Relaunches of one ledger batch count as one repair round. Before any round 4-or-later dispatch on a repeated finding, require evidence that it is a phase-caused regression, broken working behavior or test/gate failure. Earlier attempts and an open verdict alone are not that evidence. Broad original permission for pilot fixes does not override landing. Cite any later explicit user/showrunner ruling that keeps the named work. Route a repeated finding outside these categories to its owning unit's follow-up Work Order before another repair starts. Keep the finding open and link its checks, previous attempts, due checkpoint and final acceptance result. Split mixed batches and retain all eligible work. If eligibility is unknown, diagnose it rather than silently route or count it as a certain saving.
 
 For retained work after two completed failed fixes, record the failure, approaches tried, cause diagnosis and next distinguishing test before another approach. Interrupted workers and account moves remain continuations, not completed rejected patches. (the user, 2026-10-28)
 
 At each fix limit, try something different. When a phase reaches repair round 4 with a finding still open, or a kept finding has failed two fixes, the director writes a short note: the finding, the tries so far and why each failed. It runs `/astra_review` on the note. Astra's approach goes into the next try, or into the follow-up Work Order when the finding moves out (the user, 2026-10-28).
 
 Before forming the batch, use the gate's `repair_round`, which counts
-`history.py rounds` repair intervals, for the round-4 checks; keep `round` for
+`history.py rounds` repair groups, for the round-4 checks; keep `round` for
 `${FIX_ROUND}` and ledger dispatches. P2 is a 30-exposed-phase trial from
 round 4; P3 is a 30-phase trial. For every `astra_review_due` id, write the note
 and run `/astra_review --run-directory "${SESSION_DIR}" --phase <id> <note>`.
@@ -1276,16 +1366,16 @@ before launching, then:
 
 ```sh
 UNIT_RESOLVES_ROUND=1 bash ~/.claude/scripts/direct/assign.sh --role fix \
-  --to "<full-worker-name>" --phase "<phase id>" --session-dir "${SESSION_DIR}" \
+  --to "<worker name from LongLivedWorkers>" --phase "<phase id>" --session-dir "${SESSION_DIR}" \
   --cwd "${WORKING_DIR}" --prompt "${SESSION_DIR}/fix_prompt_${FIX_ROUND}.md" \
   --paths "${SESSION_DIR}/fix_paths_${FIX_ROUND}.txt" \
   --fix-cause "<failed gate or defect>" --pass "${FIX_ROUND}" &
 ```
 
-**`UNIT_RESOLVES_ROUND=1` is what lets the launcher resolve the round**:
-only the launcher watches the worker exit, so only it can say a repair landed.
-Each further worker runs the same call with `UNIT_RESOLVES_ROUND=0`, its
-own prompt and its slot; the round is done only once every worker has exited.
+For an existing `mesh` pin, `UNIT_RESOLVES_ROUND=1` makes the launcher resolve the round.
+For `herdr`, apply the completion and recovery rules in <LongLivedWorkers/>.
+Each further worker uses `UNIT_RESOLVES_ROUND=0`, its own prompt, and its slot.
+The round ends only after every worker completes.
 
 Apply <DispatchContract/>; set `EARLY_REVIEW=none` and clear
 `${EARLY_REVIEW_SLOT}` at dispatch, and close the
@@ -1325,15 +1415,15 @@ does not. A closure review costs a stage of the phase, so it is spent on a
 question, never on a path. Use the unit's own reviewer under <TeamReview/> and dispatch with
 `assign.sh --role review --prompt <closure prompt> --cwd <worktree>`.
 
-On completion, `implemented` continues as above; `error` applies
-<WorkerLaunchFailure/>, and then, if the error survives it,
-<RetainPhaseReservation/>, reports the fix log, records an error
-outcome, clears the session marker, and stops. Both outcomes resolve the round
-in the ledger through the launcher. Any third outcome — a new-worker or follow-up dispatch stopped,
-killed, or gone without `impl_status` reaching either — is the unit director's to
-resolve with `findings.py abandon` per <FindingsLedger/>, then apply
-<RetainPhaseReservation/> before reviewing, re-dispatching, or
-reporting anything about the round.
+On completion, read the dispatch's status and summary paths.
+A successful dispatch continues as above. An error applies <WorkerLaunchFailure/>.
+If the error remains, apply <RetainPhaseReservation/> and report the fix log.
+Record the error, clear the session marker, and stop.
+The launcher records either outcome in the ledger.
+For an existing `mesh` pin, if a dispatch ends without a terminal status, resolve its round with `findings.py abandon` under <FindingsLedger/>.
+For `herdr`, apply the recovery in <LongLivedWorkers/> first, because the pane worker can still finish the round.
+Run `abandon` only when that recovery cannot finish it.
+Then apply <RetainPhaseReservation/> before review, another dispatch, or a report about the round.
 </FixDispatch>
 
 <Synthesize>
@@ -1396,7 +1486,7 @@ A launch that needs a built binary — a smoke or shot helper's, or a launcher
 that takes a path — builds it with this one line, then starts the
 `binary: <path>` it prints:
 
-`bash ~/.claude/scripts/direct/verify.sh --session-dir "${SESSION_DIR}" build <package> [--bin <name> | --example <name>]`
+`bash ~/.claude/scripts/direct/verify.sh --session-dir "${SESSION_DIR}" build [<package>] [--bin <name> | --example <name>]`
 
 It waits for a build hold, takes the cargo token and memory admission, and
 records the build, and its allow rule needs no approval. You and every helper
@@ -1532,21 +1622,21 @@ plan-doc edit acquires that phase's reservation in an enrolled repository.
 </ShrinkCommit>
 
 <PhaseCleanup>
-For `herdr`, retain worker rows and panes for the next phase.
-Use `worker.py end <name>` only when permanent removal is required.
-The following Claude and mesh cleanup rules apply only to `mesh`.
-In `single`, run both halves under <ExecutionSteps/> step 9.
-At <PhaseEnd/>'s worker cleanup point, run
-`python3 ~/.claude/scripts/direct/remove_workers.py --session-dir "${SESSION_DIR}"`.
+For `herdr`, apply <LongLivedWorkers/> to close idle panes and retain worker rows for the next phase.
+
+For an existing `mesh` pin, run this command at <PhaseEnd/>'s worker cleanup point:
+`~/.claude/scripts/lib/py ~/.claude/scripts/direct/remove_workers.py --session-dir "${SESSION_DIR}"`.
 It removes the completed phase's Claude workers and any worker a dead run left
 alive; a failure is one line in the report, never a stop. Under
 <LongLivedWorkers/>, do not end this run's Codex workers: their turns finish, their
-threads stay open, and `end_session.sh` ends them with the run. TaskStop each
-Claude Agent helper, end finished launchers, and shut down every Hana or
-example app this phase launched. Never touch what another session started.
+threads stay open, and `end_session.sh` ends them with the run.
+
+For both transports, stop each Claude Agent helper and end finished launchers.
+Shut down every Hana or example app this phase launched. Never touch what another session started.
 Mid-phase, stop each helper once its result is read and each app once no step
 uses it.
 
+In `single`, run both cleanup halves under <ExecutionSteps/> step 9.
 At <PhaseEnd/>'s review-prose cleanup point, run
 `bash ~/.claude/scripts/direct/clear_phase_review.sh "${SESSION_DIR}" <phase-id>`.
 It removes only the completed phase's review prose; structured progress

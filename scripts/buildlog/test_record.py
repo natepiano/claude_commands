@@ -30,8 +30,7 @@ from scripts.lib.shell_test_support import shell_function, shell_functions
 from scripts.buildlog import record as recorder
 from scripts.buildlog import step_context
 from scripts.buildlog import index
-from scripts.buildlog import report
-from scripts.buildlog import sample
+from scripts.buildlog import report, sample
 from scripts.buildlog import store
 from scripts.buildlog.cgroup_test_support import CPU, IO_LINES, save_scope_counters, write_cgroup
 
@@ -169,7 +168,7 @@ class RecordTests(unittest.TestCase):
         self, *args: str, cwd: Path | None = None, extra: dict[str, str] | None = None, input: str = ""
     ) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
-            [sys.executable, str(CONTEXT_SCRIPT if args[0] == "step-context" else SCRIPT), *args],
+            [str(SCRIPT.resolve().parents[1] / "lib/py"), str(CONTEXT_SCRIPT if args[0] == "step-context" else SCRIPT), *args],
             cwd=cwd or self.repo,
             input=input,
             env=self.environment(**(extra or {})),
@@ -275,7 +274,7 @@ class RecordTests(unittest.TestCase):
         for entry_point in (["-m", "scripts.buildlog.step_context"], [str(CONTEXT_SCRIPT.resolve())]):
             with self.subTest(entry_point=entry_point):
                 result = subprocess.run(
-                    [sys.executable, "-B", *entry_point, "step-context", "cargo", "check"],
+                    [str(repository / "scripts/lib/py"), "-B", *entry_point, "step-context", "cargo", "check"],
                     cwd=workspace, env=environment, input="", capture_output=True, text=True,
                     check=False, timeout=test_hang_guard.TEST_HANG_GUARD_SECS,
                 )
@@ -1332,7 +1331,7 @@ printf '%s\n' "$BUILDLOG_TARGET_FOLDER"
         final = self.record("call", "interrupted", "", "0", "0", "12", "", "0", "12", "final")
         self.assertEqual(final.returncode, 0, final.stderr)
         record = self.records()[-1]
-        self.assertEqual((record["verb"], record["package"], record["status"], record["build_s"]), ("final", None, None, None))
+        self.assertEqual((record["verb"], record["package"], record["status"], record["build_s"]), ("final", "workspace", None, None))
         self.assertIs(record["cached"], False)
         self.assertNotEqual(record["id"], CALL_ID)
 

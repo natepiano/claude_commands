@@ -15,15 +15,13 @@ from typing import cast, override
 from unittest import mock
 
 
-import sys
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.production import staff, staff_sources, session_staff
 from scripts.production.staff_test_support import StaffTestCase, unit_membership
 from scripts.shutdown import pane_record, remote
-import herdr
+from scripts.herdr import herdr
 from scripts.production import showrunners
 from scripts.production.session_staff import MemberSources
 
@@ -172,6 +170,9 @@ class StaffSourcesTests(StaffTestCase):
     @override
     def setUp(self) -> None:
         super().setUp()
+        # Synthetic processes have no open rollout unless the test supplies one.
+        _ = self.enterContext(mock.patch.object(herdr, "codex_rollout_thread",
+                                                side_effect=herdr.NoOpenCodexRollout("no open rollout")))
         # Keep the host's scratch policy, with a private root for this fixture.
         _ = self.enterContext(mock.patch.object(showrunners, "SCRATCH_ROOT", self.root / "scratch-checkout"))
 
@@ -321,6 +322,136 @@ class StaffSourcesTests(StaffTestCase):
         self.assertEqual(errors.getvalue().splitlines(), [
             "staff sources: Codex process scan: pid 42401: No closing quotation"])
 
+    def test_codex_scan_continues_after_a_process_environment_disappears(self) -> None:
+        from scripts.message import process_table
+
+        doc = self.fill_production("environment-demo")
+        owner = staff.by_path("environment-demo")
+        assert owner is not None
+        _ = staff.set_doc(owner.id, staff.LiveDoc("natedev", doc))
+        table = {pid: process_table.Process(pid, 1, "codex", "codex") for pid in (42401, 42402)}
+        with (mock.patch.object(process_table, "snapshot", return_value=table),
+              mock.patch.object(herdr, "process_environment", side_effect=[
+                  FileNotFoundError("process disappeared"), {"CODEX_THREAD_ID": owner.current_session}]),
+              redirect_stderr(io.StringIO()) as errors):
+            document = staff_sources.live()
+        members = cast(list[dict[str, object]], document["members"])
+        found = next(member for member in members if member["id"] == owner.id)
+        self.assertEqual(found["identity"], {"codex": owner.current_session})
+        self.assertFalse(document["complete"])
+        self.assertEqual(errors.getvalue().splitlines(), [
+            "staff sources: Codex process 42401: process disappeared"])
+
+    def test_codex_worker_without_a_launch_record_is_staff(self) -> None:
+        from scripts.message import codex_daemon, process_table
+
+        owner = unit_membership("show", "unit")
+        worker = fixture_worker("impl", owner.id, backend=staff.CodexBackend(self.root / "codex"))
+        process = self.root / "proc/42401"
+        process.mkdir(parents=True)
+        for source in ("environment", "resume", "terminal", "pane"):
+            with self.subTest(source=source):
+                arguments = (["codex", "resume", worker.current_session] if source == "resume"
+                             else ["codex", "--no-daemon"])
+                _ = (process / "cmdline").write_bytes("\0".join(arguments).encode() + b"\0")
+                table = {42401: process_table.Process(42401, 1, "codex", " ".join(arguments))}
+                environment = {"HERDR_PANE_ID": "test:pane"}
+                if source == "environment":
+                    environment["CODEX_THREAD_ID"] = worker.current_session
+                pane: dict[str, object] = {"terminal_title_stripped": "impl | idle"}
+                if source == "pane":
+                    pane["agent_session"] = {"value": worker.current_session}
+                    pane["terminal_title_stripped"] = "Reply ready | herdr"
+                with (mock.patch.dict(os.environ, {"HERDR_PROC": str(process.parent), "HERDR_PLATFORM": "linux"}),
+                      mock.patch.object(process_table, "snapshot", return_value=table),
+                      mock.patch.object(herdr, "process_environment", return_value=environment),
+                      mock.patch.object(herdr, "herdr_place_of", return_value=herdr.HerdrPlace("agents", "test:pane")),
+                      mock.patch.object(herdr.Herdr, "result", return_value={
+                          "pane": pane, "process_info": {"foreground_processes": [{"pid": 42401, "argv": arguments}]}}),
+                      mock.patch.object(codex_daemon, "loaded_sessions", return_value=[
+                          codex_daemon.DaemonSession(worker.current_session, "impl", str(self.root), "idle")])):
+                    evidence = staff_sources.observe_workers(staff.snapshot(), MemberSources(()), current_only=True)
+                self.assertEqual(evidence.diagnostics, ())
+                self.assertEqual(evidence.identities[worker.id], {"codex": worker.current_session})
+                self.assertEqual([entry.row for entry in evidence.workers], [worker])
+
+    def test_only_the_panes_foreground_codex_can_use_its_metadata(self) -> None:
+        from scripts.message import process_table
+
+        owner = unit_membership("show", "unit")
+        worker = fixture_worker("impl", owner.id, backend=staff.CodexBackend(self.root / "codex"))
+        table = {42401: process_table.Process(42401, 1, "codex", "codex task")}
+        payload: dict[str, object] = {
+            "pane": {"agent_session": {"value": worker.current_session}},
+            "process_info": {"foreground_processes": [{"pid": 42402, "argv": ["codex", "--no-daemon"]}]},
+        }
+        with (mock.patch.object(herdr, "codex_resume_thread", side_effect=ValueError("no resume argument")),
+              mock.patch.object(herdr, "herdr_place_of", return_value=herdr.HerdrPlace("agents", "test:pane")),
+              mock.patch.object(herdr.Herdr, "result", return_value=payload) as reads,
+              mock.patch.object(herdr, "process_environment", return_value={}),
+              mock.patch.object(process_table, "snapshot", return_value=table),
+              mock.patch.object(session_staff, "member_sources", return_value=MemberSources(()))):
+            reader = staff_sources.CodexProcessThreads()
+            self.assertEqual(reader.thread(42401, {}), "")
+            self.assertEqual(reader.check(42403, "").native_id, "")
+            self.assertEqual(reader.thread(42402, {}), worker.current_session)
+            self.assertEqual(reads.call_args_list, [
+                mock.call("pane", "process-info", "--pane", "test:pane"),
+                mock.call("pane", "get", "test:pane"),
+            ])
+            staff_sources.require_worker_stopped(staff.snapshot(), worker.id)
+
+    def test_current_rollout_overrides_resume_and_does_not_block_the_old_thread(self) -> None:
+        from scripts.message import process_table
+
+        owner = unit_membership("show", "unit")
+        old = fixture_worker("old", owner.id, backend=staff.CodexBackend(self.root / "codex"))
+        current = fixture_worker("current", owner.id, backend=staff.CodexBackend(self.root / "codex"))
+        table = {42401: process_table.Process(42401, 1, "codex", f"codex resume {old.current_session}")}
+        record = staff.snapshot()
+        with (mock.patch.object(herdr, "codex_rollout_thread", return_value=current.current_session),
+              mock.patch.object(herdr, "codex_resume_thread", return_value=old.current_session) as resume,
+              mock.patch.object(herdr, "process_environment", return_value={"CODEX_THREAD_ID": old.current_session}),
+              mock.patch.object(process_table, "snapshot", return_value=table),
+              mock.patch.object(session_staff, "member_sources", return_value=MemberSources(()))):
+            reader = staff_sources.CodexProcessThreads()
+            self.assertEqual(reader.thread(42401, {"CODEX_THREAD_ID": old.current_session}), current.current_session)
+            staff_sources.require_worker_stopped(record, old.id)
+            with self.assertRaises(staff.StaffRefused):
+                staff_sources.require_worker_stopped(record, current.id)
+        resume.assert_not_called()
+
+    def test_unreadable_open_rollout_never_uses_a_lower_identity_source(self) -> None:
+        for failure in (PermissionError("rollout denied"), ValueError("rollout ambiguous"),
+                        herdr.HerdrFailure("rollout read failed")):
+            with (self.subTest(failure=type(failure).__name__),
+                  mock.patch.object(herdr, "codex_rollout_thread", side_effect=failure),
+                  mock.patch.object(herdr, "codex_resume_thread") as resume,
+                  mock.patch.object(herdr, "herdr_place_of") as place):
+                self.assertEqual(staff_sources.CodexProcessThreads().thread(42401, {"CODEX_THREAD_ID": "old"}), "")
+            resume.assert_not_called()
+            place.assert_not_called()
+
+    def test_resumed_codex_session_without_a_staff_row_is_quiet(self) -> None:
+        from scripts.message import process_table
+
+        owner = unit_membership("show", "unit")
+        worker = fixture_worker("impl", owner.id, backend=staff.CodexBackend(self.root / "codex"))
+        thread = fixture_runtime_id("freestanding-codex")
+        table = {42401: process_table.Process(42401, 1, "codex", f"codex resume {thread}")}
+        process = self.root / "proc/42401"
+        process.mkdir(parents=True)
+        _ = (process / "cmdline").write_bytes(f"codex\0resume\0{thread}\0".encode())
+        record = staff.snapshot()
+        with (mock.patch.dict(os.environ, {"HERDR_PROC": str(process.parent), "HERDR_PLATFORM": "linux"}),
+              mock.patch.object(process_table, "snapshot", return_value=table),
+              mock.patch.object(herdr, "process_environment", return_value={"HERDR_PANE_ID": "test:pane"}),
+              redirect_stderr(io.StringIO()) as errors):
+            evidence = staff_sources.observe_workers(record, MemberSources(()), current_only=True)
+        self.assertEqual(errors.getvalue(), "")
+        self.assertEqual(evidence.diagnostics, ())
+        self.assertNotIn(worker.id, evidence.identities)
+        self.assertEqual(evidence.workers, ())
 
     def test_missing_codex_thread_reports_one_codex_problem(self) -> None:
         from scripts.message import process_table
@@ -334,9 +465,12 @@ class StaffSourcesTests(StaffTestCase):
         record = staff.snapshot()
         sources = MemberSources((launch,))
         with (mock.patch.object(process_table, "snapshot", return_value=table),
-              mock.patch.object(herdr, "process_environment", return_value={"HERDR_PANE_ID": "test:pane"})):
+              mock.patch.object(herdr, "process_environment", return_value={"HERDR_PANE_ID": "test:pane"}),
+              mock.patch.object(staff_sources.CodexProcessThreads, "thread", return_value="") as recover):
             evidence = staff_sources.observe_workers(record, sources)
-        expected = "staff sources: Codex process 42401: native thread identity is unavailable"
+        recover.assert_called_once_with(42401, {"HERDR_PANE_ID": "test:pane"})
+        expected = ("staff sources: Codex process 42401 in pane test:pane: "
+                    "cannot read its thread; staff status may be incomplete")
         self.assertEqual(evidence.diagnostics, (expected,))
         self.assertNotIn("Claude", "\n".join(evidence.diagnostics))
 
@@ -363,10 +497,10 @@ class StaffSourcesTests(StaffTestCase):
         with (mock.patch.object(process_table, "snapshot", side_effect=[table, table]),
               mock.patch.object(herdr, "process_environment", side_effect=PermissionError("permission denied"))):
             evidence = staff_sources.observe_workers(staff.StaffSnapshot(()), MemberSources(()))
-        self.assertIn("staff sources: Codex processes: permission denied", evidence.diagnostics)
+        self.assertIn("staff sources: Codex process 42401: permission denied", evidence.diagnostics)
 
 
-    def test_codex_without_a_thread_in_an_unowned_pane_reports_a_diagnostic_without_refusal(self) -> None:
+    def test_codex_without_a_thread_in_an_unowned_pane_is_not_staff(self) -> None:
         from scripts.message import process_table
 
         _ = self.fill_production("other-pane-demo", "models")
@@ -380,8 +514,8 @@ class StaffSourcesTests(StaffTestCase):
                   mock.patch.object(process_table, "snapshot", return_value=table),
                   mock.patch.object(herdr, "process_environment", return_value={"HERDR_PANE_ID": "test:pane"})):
                 evidence = staff_sources.observe_workers(staff.snapshot(), MemberSources(launches))
-            self.assertEqual(evidence.diagnostics, (
-                "staff sources: Codex process 42401: pane holds no staff member; not staff",))
+            self.assertEqual(evidence.diagnostics, ())
+            self.assertEqual(evidence.identities, {})
 
 
     def test_missing_codex_thread_in_a_pane_with_staff_unit_labels_keeps_the_scan_incomplete(self) -> None:
@@ -397,7 +531,7 @@ class StaffSourcesTests(StaffTestCase):
               mock.patch.object(herdr, "process_environment", return_value={"HERDR_PANE_ID": "test:pane"})):
             evidence = staff_sources.observe_workers(staff.snapshot(), MemberSources((launch,)))
         self.assertEqual(evidence.diagnostics, (
-            "staff sources: Codex process 42401: native thread identity is unavailable",))
+            "staff sources: Codex process 42401 in pane test:pane: cannot read its thread; staff status may be incomplete",))
 
 
     def test_unparsable_claude_settings_do_not_make_the_codex_scan_incomplete(self) -> None:
@@ -421,15 +555,15 @@ class StaffSourcesTests(StaffTestCase):
         self.assertEqual(errors.getvalue(), "")
 
 
-    def test_codex_without_a_thread_or_pane_reports_a_diagnostic_without_refusal(self) -> None:
+    def test_codex_without_a_thread_or_pane_is_not_staff(self) -> None:
         from scripts.message import process_table
 
         table = {42401: process_table.Process(42401, 1, "codex", "/local/bin/codex resume")}
         with (mock.patch.object(process_table, "snapshot", return_value=table),
               mock.patch.object(herdr, "process_environment", return_value={})):
             evidence = staff_sources.observe_workers(staff.StaffSnapshot(()), MemberSources(()))
-        self.assertEqual(evidence.diagnostics, (
-            "staff sources: Codex process 42401: not in a herdr pane; not staff",))
+        self.assertEqual(evidence.diagnostics, ())
+        self.assertEqual(evidence.workers, ())
 
 
     def test_unparsable_node_codex_arguments_keep_the_scan_incomplete(self) -> None:
@@ -585,7 +719,7 @@ class StaffSourcesTests(StaffTestCase):
                         self.assertEqual(grouped.units.get("sdlc", {}), {"models": marked})
 
     def test_current_session_parent_and_showrunner_follow_the_retained_launch_after_rename(self) -> None:
-        import unit_lookup
+        from scripts.production import unit_lookup
         from scripts.production import session_staff
 
         parent, unit, _ = self.tree()
@@ -924,4 +1058,4 @@ class StaffWorkerIdentityTests(StaffTestCase):
         self.assertIsNone(staff.by_id(worker.id))
         self.assertEqual(staff.snapshot().rows, tuple(sorted((runner, owner), key=lambda row: row.id)))
         self.assertEqual(errors.getvalue().splitlines(), [
-            "anomaly: staff sources: Codex process 42401: native thread identity is unavailable"])
+            "anomaly: staff sources: Codex process 42401 in pane test:pane: cannot read its thread; staff status may be incomplete"])

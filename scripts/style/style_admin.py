@@ -1,7 +1,11 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
 """Deterministic style guideline admin operations."""
 
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import argparse
 import json
@@ -11,7 +15,7 @@ import tempfile
 from pathlib import Path
 from typing import cast
 
-from style_rules import HISTORY_DIR, NATE_STYLE_DIR, HistoryRow
+from scripts.style.style_rules import HISTORY_DIR, NATE_STYLE_DIR, HistoryRow
 
 RUST_STYLE_DIR = NATE_STYLE_DIR / "rust"
 

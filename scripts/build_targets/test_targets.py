@@ -7,7 +7,6 @@ from __future__ import annotations
 import io
 import json
 import os
-import sys
 import tempfile
 import unittest
 from dataclasses import FrozenInstanceError, is_dataclass
@@ -17,8 +16,6 @@ from pathlib import Path
 from typing import Literal, TypedDict, cast, override
 from unittest import mock
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lint"))
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.lint.memory_test_support import config_environment, write_config_fixture
 
 from scripts.build_targets import targets

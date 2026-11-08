@@ -1,19 +1,22 @@
-# Showrunner rename
+# Unit and showrunner rename
 
-`scripts/production/rename.py` changes a showrunner's staff name and repairs its current session, tab, and workspace names.
+`scripts/production/rename.py plan|apply <old> <new>` renames a unit or showrunner.
 `plan <old> <new>` reads the request without writing.
 `apply <old> <new>` calls `staff.rename` before the display repair.
-The shared `rename_unit.repair_displays` selects the row's current native session.
+The shared `rename.repair_displays` selects the row's current native session.
 It keeps panes that run another session.
 
-The command accepts a fixed staff id or a current staff name.
+The command accepts a staff id, `showrunner/name`, or a bare name.
+A bare name first selects the calling showrunner or its own units.
+If none matches, the command searches all showrunner and unit rows.
+Several matches require a staff id or `showrunner/name`.
 A same-name request repairs differing names.
 It prints `unchanged` only when the row and all available names agree.
 An unavailable display produces one anomaly line and a successful exit.
 
 ## Optional document and branch move
 
-Pass both `--to-doc <path>` and `--to-branch <name>` for this further step.
+Only showrunners accept the paired `--to-doc <path>` and `--to-branch <name>` options.
 The target document must remain inside the current Git checkout.
 The command reads the checkout and current branch from Git.
 It reads the document path from staff.
@@ -39,7 +42,8 @@ The command creates no commit and makes no push.
 
 Timers and stores keep their staff ids during a rename.
 The command edits no document fields, plan headers, prose, marks, or history.
-Unit folder moves use `rename_unit.py --move-worktree`.
+Unit renames change matching folder and branch suffixes; see `unit-rename.md`.
+Folder-only moves use `unit_move.py move-folder --unit <staff id> --to <path>`.
 
 `test_rename*.py` uses private staff records, temporary files, and a fake herdr.
 The tests cover row rename, display repair, optional moves, and recovery after an interruption.

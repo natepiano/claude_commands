@@ -5,13 +5,11 @@ import hashlib
 import importlib
 import json
 import string
-import sys
 from dataclasses import dataclass
 from pathlib import Path
 from collections.abc import Callable
 from typing import Literal, NotRequired, TypedDict, cast
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.lib.conf import UseConfiguredValue
 from scripts.message import session_send
 from scripts.message.send_result import SEND_RETRY_EXIT as SEND_RETRY_EXIT
@@ -93,7 +91,7 @@ class RenderedPush:
 
 
 def catalog() -> tuple[PushText, ...]:
-    module = importlib.import_module("scripts.notify.push_catalog")
+    module = importlib.import_module('scripts.notify.push_catalog')
     entries = cast(tuple[PushText, ...], module.ENTRIES)
     if len({entry.id for entry in entries}) != len(entries):
         raise ValueError("duplicate push text id")

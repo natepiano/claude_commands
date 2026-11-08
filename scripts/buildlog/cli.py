@@ -28,6 +28,10 @@ Records live in ~/.local/state/buildlog (BUILDLOG_DIR moves it); see store.py.
 """
 
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import json
 import os
@@ -39,7 +43,6 @@ from datetime import date
 from pathlib import Path
 from typing import cast
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 # Covers shot_report.py's 330 s Mac SSH timeout plus a measured 120-175 s cold local scan and report under load, with room inside the 3,600 s job interval.
 SCREENSHOT_HOURLY_TIMEOUT_SECONDS = 900
@@ -220,7 +223,7 @@ def moments_report(args: list[str]) -> int:
 def screenshot_hourly() -> int:
     command = Path(__file__).resolve().parents[1] / "shot_report" / "shot_report.py"
     return subprocess.run(
-        [sys.executable, str(command), "hourly"],
+        [str(Path(__file__).resolve().parents[1] / "lib/py"), str(command), "hourly"],
         check=False,
         timeout=SCREENSHOT_HOURLY_TIMEOUT_SECONDS,
     ).returncode

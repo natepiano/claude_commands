@@ -6,6 +6,7 @@
     "plugins",
     "jobs"
   ],
+  "extraPaths": ["."],
   "executionEnvironments": [
     {
       "root": "scripts/astra",
@@ -41,15 +42,9 @@
       ]
     },
     {
-      "root": "scripts/feature_log",
-      "extraPaths": [
-        "scripts/feature_log",
-        "scripts/lib"
-      ]
-    },
-    {
       "root": "scripts/model_study",
       "extraPaths": [
+        ".",
         "scripts/model_study",
         "scripts/lib"
       ]
@@ -115,13 +110,21 @@
     {
       "root": "scripts/banned_word_analysis",
       "extraPaths": [
+        ".",
         "scripts/banned_word_analysis",
         "scripts/hooks"
       ]
     },
     {
       "root": "scripts/buildlog",
-      "extraPaths": ["."]
+      "extraPaths": [
+        ".",
+        "scripts/buildlog",
+        "scripts/build_hold",
+        "scripts/lib",
+        "scripts/build_targets",
+        "scripts/mac_test"
+      ]
     },
     {
       "root": "scripts/mac_test",
@@ -129,7 +132,6 @@
         ".",
         "scripts/mac_test",
         "scripts/build_hold",
-        "scripts/lint",
         "scripts/lib"
       ]
     },
@@ -140,16 +142,7 @@
         "scripts/build_targets",
         "scripts/build_hold",
         "scripts/mac_test",
-        "scripts/lint",
         "scripts/message",
-        "scripts/lib"
-      ]
-    },
-    {
-      "root": "scripts/lint",
-      "extraPaths": [
-        ".",
-        "scripts/lint",
         "scripts/lib"
       ]
     },
@@ -167,7 +160,6 @@
         ".",
         "scripts/production",
         "scripts/style",
-        "scripts/bevy_upgrade",
         "scripts/build_hold",
         "scripts/direct",
         "scripts/hooks",
@@ -186,7 +178,6 @@
         ".",
         "scripts/build_hold",
         "scripts/build_targets",
-        "scripts/lint",
         "scripts/message",
         "scripts/notify",
         "scripts/lib"
@@ -207,21 +198,6 @@
       ]
     },
     {
-      "root": "scripts/bevy_upgrade",
-      "extraPaths": [
-        ".",
-        "scripts/bevy_upgrade",
-        "scripts/production"
-      ]
-    },
-    {
-      "root": "scripts/bevy_migration_plan",
-      "extraPaths": [
-        "scripts/bevy_migration_plan",
-        "scripts/bevy_upgrade"
-      ]
-    },
-    {
       "root": "scripts/statusline",
       "extraPaths": [
         ".",
@@ -233,10 +209,6 @@
         "scripts/production",
         "scripts/lib"
       ]
-    },
-    {
-      "root": "scripts/issue_score",
-      "extraPaths": [".", "scripts/issue_score"]
     },
     {
       "root": "."

@@ -9,6 +9,7 @@ import io
 import json
 import os
 import shlex
+import socket
 import subprocess
 import time
 from pathlib import Path
@@ -18,6 +19,13 @@ from unittest import mock
 
 from scripts.accounts import outage_alerts
 from scripts.message import send_result
+from scripts.message import roster
+from scripts.message.session_send import session_send_argv
+from scripts.message.session_send_test_support import forbid_real_sender
+from scripts.message.codex_test_support import FakeDaemon, receive_frame, reply, write_codex_account
+from scripts.lib.socket_test_support import short_socket_directory
+from scripts.production import staff
+from scripts.production.staff_test_support import fixture_member, fixture_worker, fixture_runtime_id, isolated_staff_file
 from scripts.lint import memory_admit as gate
 from typing import cast
 from scripts.lib import conf
@@ -28,14 +36,101 @@ from scripts.build_queue.admission_test_support import (
     AdmissionFixture, Exchange, GIB, ScriptedTransport, ScriptSocket, TimedChunk, only_admitted, reply_bytes,
 )
 from scripts.build_queue.queue_fixture import QueueFixture, write_memory_config
-from scripts.lint.memory_test_support import commit_config_fixture
+from scripts.lint.memory_test_support import commit_config_fixture, config_environment
 
 WAIT = wait_reply(gate.NeedsMemory(), 1, "head", "free memory")
 EXPIRED = wait_reply(gate.EstimateExpired(1), 1, "head", "estimate expired")
 GRANTED = admitted_reply("stem", GIB, "new-source", "stem.max", "stem.wave")
 
 
+def setUpModule() -> None:
+    forbid_real_sender()
+
+
 class ClientTests(unittest.TestCase):
+    def test_import_does_not_load_memory_admission(self) -> None:
+        result = subprocess.run([sys.executable, "-c",
+            "import sys\nfrom scripts.build_queue import admission_client\nprint('\\n'.join(sys.modules))"],
+            cwd=Path(__file__).resolve().parents[2], capture_output=True, text=True, check=True)
+        self.assertNotIn("scripts.lint.memory_admit", result.stdout.splitlines())
+
+    def test_outage_message_reaches_builds_without_herdr_on_path(self) -> None:
+        with short_socket_directory() as directory:
+            root = Path(directory)
+            binaries = root / "bin"
+            binaries.mkdir()
+            for name in ("ps", "ssh"):
+                executable = binaries / name
+                _ = executable.write_text("#!/bin/sh\nexit 0\n")
+                executable.chmod(0o755)
+            home = root / "home"
+            daemon_home = home / ".codex"
+            notes = root / "notes"
+            write_codex_account(daemon_home, notes, "codex1")
+            address = daemon_home / "app-server-control/control.sock"
+            address.parent.mkdir()
+            sessions = root / "sessions"
+            sessions.mkdir()
+            identity = fixture_runtime_id("outage-builds")
+            environment = {"HOME": str(home), "PATH": str(binaries), "CLAUDE_PYTHON": sys.executable,
+                "AGENT_NOTES_DIR": str(notes), "ROSTER_CODEX_SOCKET": str(address),
+                "NOTIFIER_SESSIONS_DIR": str(sessions), "NOTIFIER_STATE_DIR": str(root / "notifier"),
+                "ROSTER_RUN_ROOT": str(root / "runs"), "HERDR_PROC": str(root / "proc"),
+                "DESIGN_ROLES_STATE": str(root / "roles"), "XDG_STATE_HOME": str(root / "state"),
+                **config_environment(root / "config")}
+            direct_config = root / "config/direct.conf"
+            _ = direct_config.write_text(direct_config.read_text().replace("WORKER_TRANSPORT=mesh", "WORKER_TRANSPORT=herdr"))
+            received: list[dict[str, object]] = []
+
+            def receive(connection: socket.socket) -> None:
+                initialize = receive_frame(connection)
+                self.assertEqual(initialize["method"], "initialize")
+                reply(connection, initialize, {})
+                self.assertEqual(receive_frame(connection)["method"], "initialized")
+                while True:
+                    try:
+                        request = receive_frame(connection)
+                    except EOFError:
+                        return
+                    if request["method"] == "thread/loaded/list":
+                        reply(connection, request, {"data": [identity]})
+                    elif request["method"] == "thread/read":
+                        reply(connection, request, {"thread": {"id": identity, "name": "builds",
+                            "cwd": str(root), "status": {"type": "idle"}}})
+                    elif request["method"] == "thread/queue/add":
+                        received.append(cast(dict[str, object], request["params"]))
+                        reply(connection, request, {"queuedSubmission": {"id": "outage"}})
+                    else:
+                        self.fail(f"unexpected daemon method: {request['method']}")
+
+            with mock.patch.dict(os.environ, environment, clear=True), \
+                 isolated_staff_file(root / "staff.json", environment):
+                document = root / "production.md"
+                _ = document.write_text("# Builds fixture\n")
+                runner = fixture_member("showrunner", name="builds", runtime_id=identity,
+                    doc=staff.LiveDoc(roster.remote.local_machine(), document),
+                    backend=staff.CodexBackend(daemon_home))
+                parent = fixture_member("unit", name="pane-parent", parent=runner.id,
+                    worktree=staff.PresentWorktree(roster.remote.local_machine(), root))
+                _ = fixture_worker("reader", parent.id)
+                command = session_send_argv(client.BUILDS_SESSION, sender="build-admission",
+                    lint_settings=conf.read("lint"))
+                child_environment = dict(os.environ)
+                _ = child_environment.pop("TEST_SENDER_GUARD", None)
+                _ = child_environment.pop("HERDR_BIN", None)
+                child_environment["PYTHONPATH"] = str(Path(__file__).resolve().parents[2])
+                message = "The build queue service has not answered. Builds wait."
+                with FakeDaemon(address, receive, repeat=True):
+                    result = subprocess.run(command, input=message, text=True, capture_output=True,
+                        env=child_environment, timeout=30, check=False)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            outcome = send_result.send_outcome(result.returncode, result.stdout)
+            self.assertIsInstance(outcome, send_result.ConfirmedSendOutcome)
+            assert isinstance(outcome, send_result.ConfirmedSendOutcome)
+            self.assertEqual(outcome.header.outcome, "sent")
+            self.assertEqual([(item["threadId"], item["input"]) for item in received],
+                [(identity, [{"type": "text", "text": message + "\nSender native id: unavailable"}])])
+
     def test_runner_width_change_uses_its_account_and_changes_its_reservation(self) -> None:
         with AdmissionFixture() as fixture:
             uid = os.getuid() + 10000
@@ -828,7 +923,7 @@ class ClientTests(unittest.TestCase):
                     values = [command[index + 1] for index, part in enumerate(command) if part == "--value"]
                     self.assertEqual(values, [
                         "action=On natedev, run: sudo systemctl restart build-admission.socket build-admission.service",
-                        "body=No session is live to handle it. Builds wait until the service answers.",
+                        "body=The builds session did not take the message. Builds wait until the service answers.",
                         "sender=build-admission", "title=Build queue service is down"])
                     scripts = Path(client.__file__).resolve().parents[1]
                     self.assertEqual(shlex.split(command[command.index("--clears-when") + 1]),

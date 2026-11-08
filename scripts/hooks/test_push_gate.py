@@ -1,14 +1,12 @@
 """A fallback approval survives interruption and is consumed on delivery."""
 from __future__ import annotations
 
-import importlib.util
 import fcntl
 import io
 import json
 import os
 import tempfile
 import time
-import sys
 import subprocess
 import shlex
 import unittest
@@ -17,8 +15,8 @@ from pathlib import Path
 from collections.abc import Callable
 from typing import TYPE_CHECKING, NotRequired, Protocol, TypedDict, cast, override
 from unittest import mock
+from scripts.lib.file_module import load_file_module
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "notify"))
 if TYPE_CHECKING:
     from scripts.notify import review, pushover
     from scripts.notify.push_test_support import registered_send
@@ -29,7 +27,8 @@ else:
     from scripts.notify.push_test_support import registered_send
     from scripts.notify.user_action import ActionRequired
 
-spec = importlib.util.spec_from_file_location("push_gate", Path(__file__).with_name("pre-tool-use-push-gate.py"))
+module = load_file_module("push_gate", Path(__file__).with_name("pre-tool-use-push-gate.py"))
+spec = module.__spec__
 assert spec is not None and spec.loader is not None
 class PushGate(Protocol):
     DENIAL: str
@@ -40,11 +39,10 @@ class PushGate(Protocol):
     def main(self, *, clock: Callable[[], float], sleep: Callable[[float], None]) -> None: ...
 
 
-module = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(module)
 push_gate = cast(PushGate, cast(object, module))
 
-delivered_spec = importlib.util.spec_from_file_location("push_delivered", Path(__file__).with_name("post-tool-use-push-delivered.py"))
+delivered_module = load_file_module("push_delivered", Path(__file__).with_name("post-tool-use-push-delivered.py"))
+delivered_spec = delivered_module.__spec__
 assert delivered_spec is not None and delivered_spec.loader is not None
 
 
@@ -52,8 +50,6 @@ class PushDelivered(Protocol):
     def main(self) -> None: ...
 
 
-delivered_module = importlib.util.module_from_spec(delivered_spec)
-delivered_spec.loader.exec_module(delivered_module)
 push_delivered = cast(PushDelivered, cast(object, delivered_module))
 
 

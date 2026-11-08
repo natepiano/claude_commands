@@ -403,6 +403,155 @@ class FindingsLedgerTests(FindingsLedgerFixture):
         self.assertEqual(findings[0]["fix_attempts"], 1)
         self.assertEqual(self.status()["rounds_completed"], 1)
 
+    def test_two_refused_launches_and_one_landed_repair_count_one_round(self) -> None:
+        self.history_file = self.root / "history" / "runs" / f"{self.session_dir.name}.jsonl"
+        self.write_progress_state("instance-a")
+        _ = self.open_finding("blocker", "retry fails")
+        _ = self.run_command("dispatch", "--covers", "F001")
+        for launch in (1, 2):
+            self.record_repair_pass(launch=launch, status="error", seconds=3)
+        self.record_repair_pass(launch=3)
+        _ = self.run_command("landed")
+        _ = self.run_command("verdict", "--id", "F001", "--state", "still_open")
+        payload = self.gate()
+        self.assertEqual(payload["repair_round"], 2)
+        self.assertEqual(payload["round"], 2)
+        self.assertEqual(self.finding_rows()[0]["fix_attempts"], 1)
+        self.assertEqual(payload["astra_review_due"], [])
+        self.assertIsNone(payload["advisory"])
+        self.assertEqual(payload["consecutive_same_kind"], {"kind": "fix", "count": 1})
+
+    def test_refunded_launch_starts_spend_no_round_or_attempt(self) -> None:
+        self.write_config("MAX_CONSECUTIVE_SAME_KIND_PASSES=2\n")
+        self.history_file = self.root / "history" / "runs" / f"{self.session_dir.name}.jsonl"
+        self.write_progress_state("instance-a")
+        _ = self.open_finding("blocker", "retry fails")
+        for number in (1, 2):
+            _ = self.run_command("dispatch", "--covers", "F001", at=1_000 + number * 100)
+            self.record_repair_pass(status="error", seconds=3)
+            _ = self.run_command("abandon", "--reason", "assign_gate refused the launch", at=1_090 + number * 100)
+            payload = self.gate()
+            self.assertEqual(payload["repair_round"], 1)
+            self.assertEqual(payload["repair_budget"], 0)
+            self.assertEqual(self.finding_rows()[0]["fix_attempts"], 0)
+            self.assertEqual(payload["astra_review_due"], [])
+            self.assertIsNone(payload["advisory"])
+            self.assertIsNone(payload["consecutive_same_kind"])
+
+    def test_mixed_launch_metadata_counts_one_ledger_batch(self) -> None:
+        self.history_file = self.root / "history" / "runs" / f"{self.session_dir.name}.jsonl"
+        self.write_progress_state("instance-a")
+        _ = self.open_finding("blocker", "retry fails")
+        self.close_round(["F001"], verdict="still_open")
+        records = self.events()
+        for record in records:
+            if record["event_type"] in {"pass_started", "pass_finished"}:
+                _ = record.pop("launch_check", None)
+        _ = self.history_file.write_text("".join(json.dumps(record) + "\n" for record in records), encoding="utf-8")
+        self.record_repair_pass(launch=2)
+        self.assertEqual(self.gate()["repair_round"], 2)
+        self.assertEqual(self.run_command("dispatch", "--covers", "F001"), "round 2 covering F001")
+        dispatched = [event for event in self.events() if event["event_type"] == "finding_batch_dispatched"][-1]
+        self.assertEqual(dispatched["repair_round"], 2)
+
+    def test_overlap_with_a_refunded_batch_counts_only_the_landed_batch(self) -> None:
+        self.history_file = self.root / "history" / "runs" / f"{self.session_dir.name}.jsonl"
+        self.write_progress_state("instance-a")
+        _ = self.open_finding("blocker", "retry fails")
+        _ = self.run_command("dispatch", "--covers", "F001")
+        self.record_repair_pass(status="error")
+        _ = self.run_command("abandon", "--reason", "the launcher failed")
+        self.close_round(["F001"], verdict="still_open")
+        records = self.events()
+        for record in records:
+            if record["event_type"] in {"pass_started", "pass_finished"}:
+                launch = cast(dict[str, object], record.pop("launch_check"))
+                cause = cast(dict[str, object], launch["fix_cause"])
+                record["fix_pass"] = cause["round"]
+        gate: dict[str, object] = {
+            "event_type": "pass_started", "phase_instance_id": "instance-a",
+            "pass_instance_id": "overlapping-gate", "pass_kind": "fix", "fix_pass": 99,
+            "pass_activity": "run the merge gate", "pass_started_at": 1_110, "timestamp_epoch": 1_110,
+        }
+        records.extend([gate, {**gate, "event_type": "pass_finished", "status": "completed",
+                               "timestamp_epoch": 1_240, "pass_elapsed_seconds": 130}])
+        _ = self.history_file.write_text("".join(json.dumps(record) + "\n" for record in records), encoding="utf-8")
+        self.assertEqual(self.gate(at=1_500)["repair_round"], 2)
+
+    def test_started_batches_without_dispatch_events_count_repair_rounds(self) -> None:
+        self.history_file = self.root / "history" / "runs" / f"{self.session_dir.name}.jsonl"
+        self.write_progress_state("instance-a")
+        for number in range(1, 4):
+            _ = self.open_finding("blocker", f"defect {number}")
+            self.close_round([f"F{number:03d}"])
+            retained = [event for event in self.events() if event["event_type"] != "finding_batch_dispatched"]
+            _ = self.history_file.write_text("".join(json.dumps(event) + "\n" for event in retained), encoding="utf-8")
+        self.assertEqual(self.status()["rounds_completed"], 3)
+        self.assertEqual(self.gate()["repair_round"], 4)
+
+    def test_gate_fix_and_unledgered_relaunch_add_no_repair_round(self) -> None:
+        self.history_file = self.root / "history" / "runs" / f"{self.session_dir.name}.jsonl"
+        self.write_progress_state("instance-a")
+        _ = self.open_finding("blocker", "retry fails")
+        self.close_round(["F001"], verdict="still_open")
+        with self.history_file.open("a", encoding="utf-8") as stream:
+            for number, activity in ((2, "run the merge gate"), (3, "relaunch the repair after a launcher fault")):
+                started = 1_200 + number * 20
+                event: dict[str, object] = {
+                    "event_type": "pass_started", "phase_instance_id": "instance-a",
+                    "pass_instance_id": f"unledgered-{number}", "pass_kind": "fix",
+                    "fix_pass": number, "pass_activity": activity,
+                    "pass_started_at": started, "timestamp_epoch": started,
+                }
+                _ = stream.write(json.dumps(event) + "\n")
+                _ = stream.write(json.dumps({
+                    **event, "event_type": "pass_finished", "status": "completed",
+                    "timestamp_epoch": started + 10, "pass_elapsed_seconds": 10,
+                }) + "\n")
+        payload = self.gate(at=1_500)
+        self.assertEqual(payload["repair_round"], 2)
+        self.assertEqual(payload["astra_review_due"], [])
+        self.assertEqual(self.run_command("dispatch", "--covers", "F001", at=1_500), "round 2 covering F001")
+        dispatched = [event for event in self.events() if event["event_type"] == "finding_batch_dispatched"][-1]
+        self.assertEqual(dispatched["repair_round"], 2)
+        self.assertEqual(dispatched["round"], 2)
+
+    def test_distinct_ledger_batches_still_reach_the_consecutive_fix_advisory(self) -> None:
+        self.write_progress_state("instance-a")
+        self.write_pass_events("instance-a", [("fix", "repair", "completed")] * 3)
+        path = self.root / "history" / "runs" / f"{self.session_dir.name}.jsonl"
+        records = [cast(dict[str, object], json.loads(line)) for line in path.read_text().splitlines()]
+        for number in range(3):
+            for record in records[number * 2:number * 2 + 2]:
+                record["launch_check"] = {"fix_cause": {"round": number + 1}}
+        _ = path.write_text("".join(json.dumps(record) + "\n" for record in records))
+        _ = self.open_finding("blocker", "retry fails")
+        payload = self.gate()
+        self.assertEqual(payload["consecutive_same_kind"], {"kind": "fix", "count": 3})
+        self.assertEqual(payload["advisory"], "3 consecutive fix passes ran without the phase advancing")
+
+    def test_refunded_dispatches_do_not_reach_the_runaway_advisory(self) -> None:
+        self.write_config("RUNAWAY_ROUNDS=2\n")
+        _ = self.open_finding("blocker", "retry fails")
+        for _ in range(2):
+            _ = self.run_command("dispatch", "--covers", "F001")
+            _ = self.run_command("abandon", "--reason", "assign_gate refused the launch")
+        payload = self.gate()
+        self.assertEqual(payload["repair_round"], 1)
+        self.assertEqual(payload["repair_budget"], 0)
+        self.assertIsNone(payload["advisory"])
+
+    def test_repair_budget_uses_the_first_batch_that_was_not_refunded(self) -> None:
+        for _ in range(8):
+            _ = self.open_finding("blocker", "initial report")
+        covers = [f"F{index:03d}" for index in range(1, 9)]
+        _ = self.run_command("dispatch", "--covers", ",".join(covers))
+        _ = self.run_command("abandon", "--reason", "assign_gate refused the launch")
+        for finding_id in covers[1:]:
+            _ = self.route_finding(finding_id)
+        self.close_round(["F001"], verdict="still_open")
+        self.assertEqual(self.gate()["repair_budget"], 3)
+
     def test_an_abandoned_round_does_not_narrow_the_gate_to_blockers(self) -> None:
         """The first round is the only one that gates minors; a dead round keeps it."""
         _ = self.open_finding("blocker", "null deref")
@@ -814,20 +963,20 @@ class FindingsLedgerTests(FindingsLedgerFixture):
         self.assertNotEqual(partial.returncode, 0)
         self.assertIn("F002", partial.stderr)
 
-    def test_no_history_uses_the_ledger_round_and_respects_configured_routing_limit(self) -> None:
+    def test_no_history_does_not_count_a_ledger_dispatch_for_routing(self) -> None:
         self.write_config("ROUTING_FROM_ROUND=2\n")
         _ = self.open_finding("blocker", "first")
         self.close_round(["F001"])
+        (self.root / "history" / "runs" / f"{self.session_dir.name}.jsonl").unlink()
         _ = self.open_finding("blocker", "second")
         payload = self.gate()
-        self.assertEqual((payload["round"], payload["repair_round"]), (2, 2))
-        self.assertEqual(payload["astra_review_due"], ["F002"])
-        _ = self.record_astra("F002")
-        missing = self.run_failing_command("dispatch", "--covers", "F002")
-        self.assertNotEqual(missing.returncode, 0)
-        self.assertIn("--keep", missing.stderr)
+        self.assertEqual((payload["round"], payload["repair_round"]), (2, 1))
+        self.assertEqual(payload["astra_review_due"], [])
+        dispatched = self.run_failing_command("dispatch", "--covers", "F002")
+        self.assertEqual(dispatched.returncode, 0, dispatched.stderr)
 
     def test_astra_is_due_at_each_new_failed_attempt_and_clears_with_a_record(self) -> None:
+        self.history_file = self.root / "history" / "runs" / f"{self.session_dir.name}.jsonl"
         self.write_progress_state("instance-a")
         _ = self.open_finding("blocker", "retry never closes")
         self.assertEqual(self.gate()["astra_review_due"], [])
@@ -928,6 +1077,7 @@ class FindingsLedgerTests(FindingsLedgerFixture):
         self.assertEqual(dispatched["accepted_checks"], "none: no accepted caller")
 
     def test_trial_exposures_keep_the_basis_decision_and_repair_round(self) -> None:
+        self.history_file = self.root / "history" / "runs" / f"{self.session_dir.name}.jsonl"
         self.write_progress_state("instance-a")
         for proposal, basis, decision in (
             ("P2", "Work Order changes retry lifecycle", ""),
@@ -944,7 +1094,7 @@ class FindingsLedgerTests(FindingsLedgerFixture):
         ])
         _ = self.open_finding("blocker", "retry")
         self.close_round(["F001"], verdict="still_open")
-        self.write_repair_intervals(3)
+        self.write_repair_intervals(2)
         _ = self.gate()
         p3 = [row for row in self.events() if row["event_type"] == "trial_exposure" and row["proposal"] == "P3"]
         self.assertTrue(p3)

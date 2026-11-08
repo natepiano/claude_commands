@@ -2,6 +2,10 @@
 """Show the recorded state of each configured build target."""
 
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import argparse
 from collections.abc import Callable, Mapping
@@ -20,12 +24,11 @@ import subprocess
 import sys
 import time
 from types import FrameType
-from typing import TYPE_CHECKING, Literal, Protocol, TypedDict, cast, final
+from typing import Literal, Protocol, TypedDict, cast, final
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "build_hold"))
 from scripts.build_hold import override_guard
 from scripts.build_targets import target_config
+from scripts.message import roster
 
 
 class CliArguments(argparse.Namespace):
@@ -47,6 +50,8 @@ class CliArguments(argparse.Namespace):
         self.reservation_file: str = ""
         self.target: str = ""
         self.recover_only: bool = False
+        self.mac_only: bool = False
+        self.remote_kinds_file: str = ""
 
 
 def positive_pid(value: str) -> int:
@@ -59,8 +64,6 @@ def positive_pid(value: str) -> int:
 def parser() -> argparse.ArgumentParser:
     root = argparse.ArgumentParser(description=__doc__)
     commands = root.add_subparsers(dest="command", required=True)
-    platform = commands.add_parser("platform")
-    _ = platform.add_argument("--target", required=True)
     reserve = commands.add_parser("reserve")
     _ = reserve.add_argument("--repo-root", required=True)
     _ = reserve.add_argument("--package", default="")
@@ -79,6 +82,8 @@ def parser() -> argparse.ArgumentParser:
     _ = eligible.add_argument("--kind", choices=("check", "lint", "doc", "test", "build", "example", "final"), default="")
     _ = eligible.add_argument("--local", dest="local_reason", default="")
     _ = eligible.add_argument("--target", default="")
+    _ = eligible.add_argument("--mac", dest="mac_only", action="store_true")
+    _ = eligible.add_argument("--remote-kinds-file", default="")
     register = commands.add_parser("register-local")
     _ = register.add_argument("--call-id", required=True)
     _ = register.add_argument("--pid", type=positive_pid, required=True)
@@ -93,18 +98,6 @@ def parser() -> argparse.ArgumentParser:
     _ = interrupt.add_argument("--call-id", required=True)
     _ = interrupt.add_argument("--signal", dest="signal_name", choices=("INT", "TERM"), default="TERM")
     return root
-
-
-def command_platform(target: str) -> int:
-    print(target_config.configured_ssh_target(target).platform)
-    return 0
-
-
-# A platform query needs configuration before any coordination imports.
-if __name__ == "__main__" and sys.argv[1:2] == ["platform"]:
-    override_guard.refuse_overrides(Path(__file__), "build_targets/build_targets.py")
-    platform_arguments = parser().parse_args(namespace=CliArguments())
-    raise SystemExit(command_platform(platform_arguments.target))
 
 
 from scripts.build_targets.targets import (
@@ -134,8 +127,7 @@ from scripts.build_targets.targets import (
     target_state,
     target_eligibility,
 )
-from scripts.mac_test import offload
-from scripts.mac_test import mac_test
+from scripts.mac_test import mac_test, offload
 from scripts.lib import conf
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.build_hold import build_hold
@@ -144,10 +136,6 @@ from scripts.lib import process_start as process_identity
 from scripts.direct.step_record import Pinned, ROUTED, TargetSelection
 from scripts.buildlog import mac_idle_alert
 from scripts.aws_target import config as aws_config, ledger as cost_ledger, measurement
-
-if TYPE_CHECKING:
-    from scripts.message import roster
-
 
 
 class ActiveWaitProcess(TypedDict):
@@ -250,7 +238,6 @@ def format_aws_status(row: AwsStatusRow) -> str:
 
 
 def command_status(probe: bool = False) -> int:
-    from scripts.message import roster
 
     try:
         targets = read_targets()
@@ -301,14 +288,15 @@ def print_eligible_target(result: EligibleTarget | ExcludedTarget) -> None:
     disposition = "eligible" if isinstance(result, EligibleTarget) else "excluded"
     reason = "-" if isinstance(result, EligibleTarget) else display_field(result.reason)
     settings = str(target.settings) if isinstance(target, SshTarget) else "-"
-    print(f"{target.name}\t{disposition}\t{reason}\t{settings}")
+    platform = target.platform if isinstance(target, SshTarget) else "-"
+    print(f"{target.name}\t{disposition}\t{reason}\t{settings}\t{platform}")
 
 
 StepKind = Literal["check", "lint", "doc", "test", "build", "example", "final"]
 
 
 @dataclass(frozen=True)
-class MacAllowed:
+class AnyTarget:
     pass
 
 
@@ -317,30 +305,46 @@ class NatedevOnly:
     reason: str
 
 
-def target_can_retry(result: EligibleTarget | ExcludedTarget) -> bool:
-    """Keep temporary refusals available for a later reservation."""
-    return (isinstance(result, EligibleTarget)
-            or result.reason in {"busy", "blocked", "disk", "backoff", "unreachable", "state", "copy", "mac_busy",
-                                 "spending_limit", "spending_unavailable"}
-            or result.reason.startswith("state unreadable: "))
+def step_routing_rule(kind: StepKind, routing: Routing = ANY_ELIGIBLE_TARGET,
+                      selection: TargetSelection = ROUTED, *, writes_tree: bool = False
+                      ) -> AnyTarget | NatedevOnly:
+    """Choose the run location for each step before target admission."""
+    if writes_tree:
+        return NatedevOnly("step writes the tree")
+    if isinstance(routing, LocalRequired):
+        return NatedevOnly(routing.reason)
+    if isinstance(selection, Pinned):
+        return AnyTarget()
+    if kind == "build":
+        return NatedevOnly("makes natedev artifacts")
+    if kind == "final":
+        return NatedevOnly("full gate runs on natedev")
+    return AnyTarget()
+
+
+def remote_verb(kind: StepKind) -> offload.MacVerb:
+    step = offload.remote_step_kinds(kind)[0]
+    return cast(offload.MacVerb, "nextest" if step == "test" else "clippy" if step in ("lint", "example") else step)
 
 
 def mac_target_eligibility(target: LocalTarget | SshTarget, repo_root: Path,
                            package: str, kind: StepKind, routing: Routing
                            ) -> EligibleTarget | ExcludedTarget:
-    if kind in ("build", "example"):
-        return ExcludedTarget(target, "makes natedev artifacts")
-    if kind == "final":
-        return ExcludedTarget(target, "full gate runs on natedev")
     if isinstance(routing, LocalRequired):
         return ExcludedTarget(target, routing.reason)
-    verb: offload.MacVerb = "nextest" if kind == "test" else "clippy" if kind == "lint" else kind
     try:
         config = offload.read_config(target.settings) if isinstance(target, SshTarget) else offload.read_config()
         name = target.name if isinstance(target, SshTarget) else "mac"
-        eligibility = offload.mac_step_eligibility(config, repo_root, package, verb, name)
+        steps = offload.remote_step_kinds(kind)
+        eligibility = offload.mac_step_eligibility(config, repo_root, package,
+            remote_verb(cast(StepKind, steps[0])), name, kind=steps[0])
         if isinstance(eligibility, offload.IneligibleMacStep):
             return ExcludedTarget(target, eligibility.reason)
+        for step in steps[1:]:
+            policy = offload.mac_step_eligibility(config, repo_root, package,
+                remote_verb(cast(StepKind, step)), name, kind=step)
+            if isinstance(policy, offload.IneligibleMacStep):
+                return ExcludedTarget(target, policy.reason)
         controller = offload.ProcessController()
         probe = offload.probe_mac(controller, config, eligibility, name)
         if isinstance(probe, offload.UnresolvedSlotStartup):
@@ -370,15 +374,14 @@ def ssh_target_eligibility(target: SshTarget, repo_root: Path, package: str,
         return mac_target_eligibility(target, repo_root, package, kind, routing)
     if isinstance(routing, LocalRequired):
         return ExcludedTarget(target, routing.reason)
-    if kind not in ("test", "check", "doc"):
-        return ExcludedTarget(target, "local kind")
     config = ssh_target_config(target)
     if isinstance(config, ExcludedTarget):
         return config
-    verb: offload.MacVerb = "nextest" if kind == "test" else kind
-    policy = offload.mac_step_eligibility(config, repo_root, package, verb, target.name)
-    if isinstance(policy, offload.IneligibleMacStep):
-        return ExcludedTarget(target, policy.reason)
+    for step in offload.remote_step_kinds(kind):
+        policy = offload.mac_step_eligibility(config, repo_root, package,
+            remote_verb(cast(StepKind, step)), target.name, kind=step)
+        if isinstance(policy, offload.IneligibleMacStep):
+            return ExcludedTarget(target, policy.reason)
     paths = mac_test.state_paths(target.name)
     if isinstance(selection, Pinned) and target_config.is_aws_target(target):
         control = mac_test.read_json_object(paths.directory / "controller.json") or {}
@@ -424,15 +427,18 @@ def ssh_target_config(target: SshTarget) -> offload.OffloadConfig | ExcludedTarg
 def command_pinned_eligible(args: CliArguments, routing: Routing) -> int:
     """Use normal eligibility, but wait for stopped AWS capacity before its reachability check."""
     try:
+        if args.target == "natedev":
+            local = local_target()
+            print("natedev_only pinned to natedev")
+            print_eligible_target(EligibleTarget(local))
+            return 0
         target = target_config.configured_ssh_target(args.target)
-        if args.kind not in ("test", "check", "doc"):
-            raise ValueError("--target supports test, check, and doc only")
         kind = cast(StepKind, args.kind)
         result = ssh_target_eligibility(target, Path(args.repo_root), args.package, kind, routing,
                                         selection=Pinned(target.name))
         if isinstance(result, ExcludedTarget) and result.reason not in ("busy", "blocked", "starting"):
             raise ValueError(f"target {target.name} refused: {result.reason}")
-        print("ssh_allowed")
+        print("any_target")
         print_eligible_target(result)
         return 0
     except (ConfigError, OSError, UnicodeError, ValueError) as error:
@@ -517,10 +523,9 @@ def command_reserve(args: CliArguments) -> int:
                     if (not args.target or name == args.target) and owns_wait_claim(paths, args.repo_root, args.pid):
                         return 0
         destination.unlink(missing_ok=True)
-    if args.kind not in ("test", "check", "doc", "lint"):
+    if args.kind not in ("test", "check", "doc", "lint", "example", "build", "final"):
         return 1
-    verb: offload.MacVerb = ("nextest" if args.kind == "test" else "clippy" if args.kind == "lint"
-                            else cast(offload.MacVerb, args.kind))
+    verb = remote_verb(args.kind)
     busy_mac = False
     for target in read_targets():
         if not isinstance(target, SshTarget) or (args.target and target.name != args.target):
@@ -530,7 +535,7 @@ def command_reserve(args: CliArguments) -> int:
             if config.reason != "off":
                 cleanup_refused_claims(target, args)
             continue
-        policy = offload.mac_step_eligibility(config, Path(args.repo_root), args.package, verb, target.name)
+        policy = offload.mac_step_eligibility(config, Path(args.repo_root), args.package, verb, target.name, kind=args.kind)
         if isinstance(policy, offload.IneligibleMacStep):
             continue
         paths = mac_test.state_paths(target.name)
@@ -554,7 +559,7 @@ def command_reserve(args: CliArguments) -> int:
         claim.pid, claim.target, claim.repo_root = args.pid, target.name, args.repo_root
         claim.settings, claim.package, claim.verb = str(target.settings), args.package, verb
         with redirect_stdout(io.StringIO()):
-            status = mac_test.command_claim_wait(claim, paths)
+            status = mac_test.command_claim_wait(claim, paths, kind=args.kind)
         if status not in (0, 13):
             if status == 11 and target.platform == "macos":
                 busy_mac = True
@@ -587,40 +592,21 @@ def command_release_wait(pid: int) -> int:
     return 0
 
 
-def command_kind_eligible(repo_root: Path, package: str, kind: StepKind, routing: Routing) -> int:
+def command_kind_eligible(repo_root: Path, package: str, kind: StepKind, routing: Routing,
+                          *, mac_only: bool = False) -> int:
+    decision = step_routing_rule(kind, routing, Pinned("mac") if mac_only else ROUTED)
     try:
         eligibility = tuple(
-            ssh_target_eligibility(target, repo_root, package, kind, routing)
+            ExcludedTarget(target, decision.reason) if isinstance(target, SshTarget) and isinstance(decision, NatedevOnly)
+            else ssh_target_eligibility(target, repo_root, package, kind, routing)
             if isinstance(target, SshTarget) else EligibleTarget(target)
             for target in read_targets()
+            if not mac_only or isinstance(target, SshTarget) and target.platform == "macos"
         )
     except (ConfigError, OSError, UnicodeError, ValueError) as error:
         print(f"natedev_only state unreadable: {display_field(str(error))}")
         return 0
-    decision: MacAllowed | NatedevOnly = NatedevOnly("no Mac target configured")
-    if kind in ("build", "example"):
-        decision = NatedevOnly("makes natedev artifacts")
-    elif kind == "final":
-        decision = NatedevOnly("full gate runs on natedev")
-    elif isinstance(routing, LocalRequired):
-        decision = NatedevOnly(routing.reason)
-    retry_allowed = kind in ("test", "check", "lint", "doc") and not isinstance(routing, LocalRequired)
-    remote_results = tuple(result for result in eligibility if isinstance(result.target, SshTarget))
-    disk_declined = any(isinstance(result, ExcludedTarget) and result.reason == "disk" for result in remote_results)
-    linux_allowed = False
-    if retry_allowed:
-        if disk_declined:
-            # Keep disk evidence independent of target order and retry permission.
-            decision = NatedevOnly("disk")
-        elif any(target_can_retry(result) for result in remote_results):
-            decision = MacAllowed()
-            linux_allowed = any(isinstance(result.target, SshTarget) and result.target.platform == "linux"
-                                and target_can_retry(result) for result in remote_results)
-        else:
-            reasons = sorted(result.reason for result in remote_results if isinstance(result, ExcludedTarget))
-            if reasons:
-                decision = NatedevOnly(reasons[0])
-    print("ssh_allowed" if linux_allowed else "mac_allowed" if isinstance(decision, MacAllowed)
+    print("any_target" if isinstance(decision, AnyTarget)
           else f"natedev_only {display_field(decision.reason)}")
     for result in eligibility:
         print_eligible_target(result)
@@ -889,18 +875,20 @@ def command_check_local(caller: str = "") -> int:
 def main() -> int:
     override_guard.refuse_overrides(Path(__file__), "build_targets/build_targets.py")
     args = parser().parse_args(namespace=CliArguments())
-    if args.command == "platform":
-        return command_platform(args.target)
     if args.command == "reserve":
         return command_reserve(args)
     if args.command == "release-wait":
         return command_release_wait(args.pid)
     if args.command == "eligible":
+        if args.remote_kinds_file:
+            write_text_atomic(Path(args.remote_kinds_file), "".join(
+                f"{remote_verb(cast(StepKind, step))}\t{step}\n"
+                for step in offload.remote_step_kinds(args.kind)))
         routing = LocalRequired(args.local_reason) if args.local_reason else ANY_ELIGIBLE_TARGET
         if args.target:
             return command_pinned_eligible(args, routing)
         if args.kind:
-            return command_kind_eligible(Path(args.repo_root).resolve(), args.package, cast(StepKind, args.kind), routing)
+            return command_kind_eligible(Path(args.repo_root).resolve(), args.package, cast(StepKind, args.kind), routing, mac_only=args.mac_only)
         return command_eligible(Path(args.repo_root).resolve(), args.package, routing)
     if args.command == "register-local":
         return command_register_local(args.call_id, pid=args.pid)

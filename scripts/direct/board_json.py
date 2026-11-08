@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """Write a production's board snapshot from its durable records."""
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import argparse
 import json
@@ -18,12 +22,8 @@ from pathlib import Path
 from typing import cast
 from zoneinfo import ZoneInfo
 
-REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
-if not __package__:
-    sys.path.insert(0, str(REPOSITORY_ROOT))
-sys.path.insert(0, str(REPOSITORY_ROOT / "scripts" / "production"))
 
-import display_cells
+from scripts.production import display_cells
 
 from scripts.agents import worker_lifecycle
 from scripts.direct import phase_table, plan_history
@@ -44,10 +44,12 @@ def fields(value: object) -> dict[str, object]:
     return cast(dict[str, object], value) if isinstance(value, dict) else {}
 
 
-def read_object(path: Path) -> dict[str, object]:
+def read_object(path: Path, *, required: bool = False) -> dict[str, object]:
     try:
         return fields(cast(object, json.loads(path.read_text(encoding="utf-8"))))
     except (OSError, UnicodeError, ValueError):
+        if required:
+            raise
         return {}
 
 
@@ -207,7 +209,10 @@ def workers(session: Path, sources: set[Path], mesh_prefix: str = "", *,
     except (staff.StaffUnreadable, OSError, ValueError) as error:
         print(f"board_json: {session}: {error}", file=sys.stderr)
         return [{"slot": "?", "role": "", "state": "incomplete", "model": "", "effort": "", "doing": str(error)}]
-    roster = read_object(session / "mesh_roster.json")
+    try:
+        roster = read_object(session / "mesh_roster.json", required=mesh_pinned)
+    except (OSError, ValueError) as error:
+        return [{"name": "", "slot": "?", "role": "", "state": "incomplete", "model": "", "effort": "", "doing": str(error)}]
     sources.update((session, session / "mesh_roster.json", session / "board.log"))
     metadata = list(session.glob("impl_worker_*.json"))
     sources.update(metadata)
@@ -260,7 +265,9 @@ def workers(session: Path, sources: set[Path], mesh_prefix: str = "", *,
         settings = worker_lifecycle.recorded_turn_settings(entry)
         model_label = f"{settings.model}:{settings.effort}" if settings.model and settings.effort else settings.model
         state = {"done": "idle"}.get(status, status)
-        result.append({"slot": slot, "role": text(entry.get("role")), "state": state,
+        task = text(entry.get("task"))
+        role = text(entry.get("role")) or (task.removeprefix("direct.") if task.startswith("direct.") else "")
+        result.append({"name": name, "slot": slot, "role": role, "state": state,
                        "model": "/".join(part for part in (text(meta.get("family")), model_label) if part),
                        "effort": settings.effort,
                        "doing": newest.get(slot, "")})

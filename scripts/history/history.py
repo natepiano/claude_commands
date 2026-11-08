@@ -18,6 +18,10 @@ provenance counts a terminal reader gets on stderr.
 """
 
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import argparse
 import csv
@@ -35,7 +39,6 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Protocol, TypedDict, cast
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.lib.intervals import union_seconds  # noqa: E402
 from scripts.lib.user_zone import user_zone  # noqa: E402
 
@@ -447,8 +450,8 @@ def _normalize(
         label=label,
         task=task,
         agent=agent,
-        # Empty on every pre-2026-08-31 pass and on any recorder outside
-        # implement.sh, so it groups as "-" rather than claiming a slot.
+        # Passes before 2026-08-31 have no slot.
+        # A recorder outside assign.py can omit the slot; history groups it as "-".
         # The one-day-old "team_role" spelling is not read: every event
         # written under it carried an empty value, so nothing is lost.
         slot=_string(event.get("team_slot")),

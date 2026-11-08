@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
 """Delete idle agent scratch under /tmp once an hour.
 
 Agents leave shots, traces, gate copies and scratch builds in /tmp/claude and in
@@ -79,6 +79,10 @@ folders it also covers.
 """
 
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 
 import json
@@ -99,7 +103,6 @@ from pathlib import Path
 from typing import Protocol, TypedDict, cast
 from urllib.parse import unquote, urlparse
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.lib import build_folders, conf, copy_record, scratch, unit_runs
 from scripts.lib.conf import UseConfiguredValue  # noqa: E402
 from scripts.lib.user_zone import user_zone  # noqa: E402
@@ -492,6 +495,7 @@ def running_session_ids() -> frozenset[str] | None:
 class ProcessUsesKnown:
     """A completed scan of process paths, including a scan with no matches."""
     paths: list[tuple[str, int, str]]
+    unreadable_cwd_pids: tuple[int, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -500,18 +504,23 @@ class ProcessUsesUnavailable:
 
 
 def process_paths(proc: str, prefix: str | tuple[str, ...]) -> ProcessUsesKnown | ProcessUsesUnavailable:
-    """Each path under prefix that a process works in, holds open or maps, with its pid and how;
-    unavailable when proc does not exist. A process that ends mid-scan, or one this user cannot read, is
-    passed over: another user's process does not work in an agent's scratch."""
+    """Read matching process paths and report processes with unreadable working directories.
+
+    Ignore processes that end during the scan.
+    """
     if not os.path.isdir(proc):
         return ProcessUsesUnavailable()
     found: list[tuple[str, int, str]] = []
+    unreadable: list[int] = []
     for entry in listing(proc):
         if not entry.name.isdigit():
             continue
         pid = int(entry.name)
         try:
             cwd = os.readlink(os.path.join(entry.path, "cwd"))
+        except PermissionError:
+            unreadable.append(pid)
+            continue
         except OSError:
             continue
         if cwd.startswith(prefix):
@@ -532,7 +541,7 @@ def process_paths(proc: str, prefix: str | tuple[str, ...]) -> ProcessUsesKnown 
                         found.append((parts[5].removesuffix(DELETED_SUFFIX), pid, "maps a file in it"))
         except OSError:
             continue
-    return ProcessUsesKnown(found)
+    return ProcessUsesKnown(found, tuple(unreadable))
 
 
 def lsof_paths(prefix: str | tuple[str, ...]) -> ProcessUsesKnown | ProcessUsesUnavailable:
@@ -543,7 +552,8 @@ def lsof_paths(prefix: str | tuple[str, ...]) -> ProcessUsesKnown | ProcessUsesU
     except (OSError, subprocess.TimeoutExpired):
         return ProcessUsesUnavailable()
     # lsof exits 1 when it cannot read some process; the lines it printed still hold.
-    return ProcessUsesKnown(parse_lsof(completed.stdout, prefix)) if completed.stdout else ProcessUsesUnavailable()
+    return (ProcessUsesKnown(parse_lsof(completed.stdout, prefix))
+            if completed.returncode in (0, 1) and completed.stdout else ProcessUsesUnavailable())
 
 
 def parse_lsof(text: str, prefix: str | tuple[str, ...]) -> list[tuple[str, int, str]]:
@@ -1096,7 +1106,7 @@ def judge_entries(roots: Roots, now: float, proc: str, *,
                 yield KeptEntry(entry.path, SMALL_IN_LIVE_SESSION)
                 continue
             pending = root in roots.copies and isinstance(scratch.pending_removal(Path(entry.path), scratch_settings=scratch_settings), copy_record.Registered)
-            git = GitWork.SAVED if pending else git_work(Path(entry.path))
+            git = GitWork.SAVED if pending or scratch.is_throwaway(Path(entry.path)) else git_work(Path(entry.path))
             if git is not GitWork.SAVED:
                 yield KeptEntry(entry.path, git.value)
                 continue
@@ -1119,7 +1129,7 @@ def remove_entry(entry: RemovableEntry, result: Sweep, dry_run: bool, *,
                 result.keep(entry.path, state.why if isinstance(state, scratch.Live) else state.reason)
                 return False
             pending = isinstance(scratch.pending_removal(Path(entry.path), scratch_settings=scratch_settings), copy_record.Registered)
-            git = GitWork.SAVED if pending else git_work(Path(entry.path))
+            git = GitWork.SAVED if pending or scratch.is_throwaway(Path(entry.path)) else git_work(Path(entry.path))
             if git is not GitWork.SAVED:
                 result.keep(entry.path, git.value)
                 return False

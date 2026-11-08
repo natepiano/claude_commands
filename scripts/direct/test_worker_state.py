@@ -4,18 +4,134 @@ from __future__ import annotations
 import io
 import json
 import os
+import subprocess
+import sys
 import tempfile
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import redirect_stderr
 from pathlib import Path
+from typing import cast
 from unittest.mock import patch
 
-from scripts.direct import assign, workers
-from scripts.direct.worker_state import worker_claim_lock, worker_record_path, worker_slot
+from scripts.direct import assign, worker_state, workers
+from scripts.direct.worker_state import worker_claim_lock, worker_record_path, worker_slot, worker_status_path
+from scripts.lib import process_start
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+
+
+class WorkerClaimTests(unittest.TestCase):
+    def write_claim(self, run: Path, pid: int, started: str) -> Path:
+        path = run / "impl_claim_impl.json"
+        _ = path.write_text(json.dumps({"pid": pid, "started": started, "worker": "impl"}))
+        return path
+
+    def test_an_absent_file_has_no_worker_claim(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            claim = Path(directory) / "claim.json"
+            self.assertIsInstance(worker_state.read_worker_claim(claim), worker_state.NoWorkerClaim)
+
+    def test_malformed_json_has_no_worker_claim(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            claim = Path(directory) / "claim.json"
+            _ = claim.write_text("{bad json")
+            self.assertIsInstance(worker_state.read_worker_claim(claim), worker_state.NoWorkerClaim)
+
+    def test_an_empty_record_has_no_worker_claim(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            claim = Path(directory) / "claim.json"
+            _ = claim.write_text("{}")
+            self.assertIsInstance(worker_state.read_worker_claim(claim), worker_state.NoWorkerClaim)
+
+    def test_a_live_pid_without_a_start_has_an_ended_claim(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            claim = Path(directory) / "claim.json"
+            _ = claim.write_text(json.dumps({"pid": os.getpid(), "worker": "impl"}))
+            self.assertIsInstance(worker_state.read_worker_claim(claim), worker_state.EndedWorkerClaim)
+
+    def test_publication_records_the_launcher_start_and_worker(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            claim = Path(directory) / "claim.json"
+            started = process_start.process_start(os.getpid())
+            assert isinstance(started, process_start.Started)
+            worker_state.publish_worker_claim(claim, "impl")
+            record = cast(dict[str, object], json.loads(claim.read_text()))
+            self.assertEqual(record, {"pid": os.getpid(), "started": started.start, "worker": "impl"})
+
+    def test_publication_reports_an_unreadable_start_and_records_the_launcher_and_worker(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            run = Path(directory)
+            proc = run / "proc" / str(os.getpid())
+            (proc / "stat").mkdir(parents=True)
+            claim = run / "claim.json"
+            errors = io.StringIO()
+            with patch.dict(os.environ, {"VERIFY_PROC_ROOT": str(proc.parent)}), patch.object(sys, "platform", "linux"), redirect_stderr(errors):
+                worker_state.publish_worker_claim(claim, "impl")
+            record = cast(dict[str, object], json.loads(claim.read_text()))
+            self.assertEqual(record, {"pid": os.getpid(), "worker": "impl"})
+            diagnostic, = errors.getvalue().splitlines()
+            self.assertTrue(diagnostic.startswith("anomaly: "), diagnostic)
+
+    def test_the_same_process_start_keeps_the_claim_held(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            started = process_start.process_start(os.getpid())
+            assert isinstance(started, process_start.Started)
+            claim = self.write_claim(Path(directory), os.getpid(), started.start)
+            self.assertEqual(worker_state.read_worker_claim(claim), worker_state.HeldWorkerClaim(os.getpid()))
+
+    def test_another_process_start_ends_the_claim_despite_a_live_pid(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            started = process_start.process_start(os.getpid())
+            assert isinstance(started, process_start.Started)
+            claim = self.write_claim(Path(directory), os.getpid(), started.start + "-previous")
+            self.assertIsInstance(worker_state.read_worker_claim(claim), worker_state.EndedWorkerClaim)
+
+    def test_a_gone_process_ends_the_claim(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            with subprocess.Popen([sys.executable, "-c", "pass"]) as child:
+                _ = child.wait(timeout=TEST_HANG_GUARD_SECS)
+            claim = self.write_claim(Path(directory), child.pid, "ended-launcher-start")
+            self.assertIsInstance(worker_state.read_worker_claim(claim), worker_state.EndedWorkerClaim)
+
+    def test_a_zombie_process_ends_the_claim_even_with_the_same_start(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            run = Path(directory)
+            proc = run / "proc" / str(os.getpid())
+            proc.mkdir(parents=True)
+            _ = (proc / "stat").write_text(f"{os.getpid()} (launcher) Z " + "0 " * 18 + "123 0\n")
+            claim = self.write_claim(run, os.getpid(), "123")
+            with patch.dict(os.environ, {"VERIFY_PROC_ROOT": str(proc.parent)}), patch.object(sys, "platform", "linux"):
+                self.assertIsInstance(worker_state.read_worker_claim(claim), worker_state.EndedWorkerClaim)
+
+    def test_an_unreadable_process_start_keeps_the_claim_held(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            run = Path(directory)
+            proc = run / "proc" / str(os.getpid())
+            (proc / "stat").mkdir(parents=True)
+            claim = self.write_claim(run, os.getpid(), "unreadable-launcher-start")
+            with patch.dict(os.environ, {"VERIFY_PROC_ROOT": str(proc.parent)}), patch.object(sys, "platform", "linux"):
+                self.assertEqual(worker_state.read_worker_claim(claim), worker_state.HeldWorkerClaim(os.getpid()))
 
 
 class WorkerStateTests(unittest.TestCase):
+    def test_temporary_status_copies_do_not_replace_the_current_phase_status(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            run = Path(directory)
+            phase = run / "phases" / "build"
+            copied = run / "tmp" / "fixture" / "phases" / "build"
+            phase.mkdir(parents=True)
+            copied.mkdir(parents=True)
+            original = phase / "impl_status_impl"
+            _ = original.write_text("implementing\n")
+            _ = (run / "impl_status_impl").write_text("implemented\n")
+            temporary = copied / "impl_status_impl"
+            _ = temporary.write_text("implemented\n")
+            os.utime(run / "impl_status_impl", (1, 1))
+            os.utime(original, (2, 2))
+            os.utime(temporary, (3, 3))
+            self.assertEqual(worker_status_path(run, "impl").read_text(), "implementing\n")
+            self.assertEqual(worker_status_path(run, "impl"), original)
+
     def test_an_existing_repair_identity_keeps_its_file_and_a_new_impl_gets_a_distinct_file(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             run = Path(directory)
@@ -89,8 +205,12 @@ class WorkerStateTests(unittest.TestCase):
                                        [self.dispatch(run, name) for name in ("fix7", "fix7b")]))
             self.assertEqual({claim.slot for claim in claims}, {"fix7", "fix7b"})
             self.assertEqual(len({claim.identity_path for claim in claims}), 2)
+            started = process_start.process_start(os.getpid())
+            assert isinstance(started, process_start.Started)
             for claim in claims:
-                self.assertEqual(json.loads((run / f"impl_claim_{claim.slot}.json").read_text())["pid"], os.getpid())
+                record = cast(dict[str, object], json.loads((run / f"impl_claim_{claim.slot}.json").read_text()))
+                self.assertEqual(record["pid"], os.getpid())
+                self.assertEqual(record["started"], started.start)
 
     def test_refused_same_name_preserves_phase_status_and_summary(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

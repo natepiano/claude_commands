@@ -20,12 +20,8 @@ from zoneinfo import ZoneInfo
 from urllib.parse import unquote, urlsplit
 
 
-from scripts.buildlog import charts
 from scripts.lib import conf
-from scripts.buildlog import costs
-from scripts.buildlog import index
-from scripts.buildlog import moments
-from scripts.buildlog import record
+from scripts.buildlog import charts, costs, index, moments, record
 from scripts.buildlog import test_moments as fixtures
 from scripts.buildlog.test_holds import hold_event
 from scripts.buildlog.test_index import Record, call, ci_job, ci_run

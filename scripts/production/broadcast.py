@@ -9,6 +9,10 @@ left out by session or Codex thread identity. Every message names its groups so
 recipients know it was sent directly.
 """
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import os
 import shlex
@@ -23,7 +27,6 @@ from typing import Literal, NamedTuple, cast
 
 MESSAGE = Path(__file__).resolve().parent.parent / "message"
 sys.path.insert(0, str(MESSAGE))
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.message import roster  # noqa: E402
 from scripts.lib import names as display_names  # noqa: E402
 from scripts.message import session_send

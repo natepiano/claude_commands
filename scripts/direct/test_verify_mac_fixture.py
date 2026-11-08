@@ -120,15 +120,14 @@ class VerifyMacFixtureTests(VerifyMacOffloadFixture):
         tree = self.root / "record-tree/scripts"
         (tree / "build_hold").mkdir(parents=True)
         (tree / "buildlog").mkdir()
+        (tree / "lib").symlink_to(VERIFY.parent.parent / "lib", target_is_directory=True)
         release, completed = self.root / "recorder-release", self.root / "recorder-completed"
         self.write_executable(tree / "buildlog/record.py", f'''
 from pathlib import Path
 from scripts.direct.wait_for_test_state import wait_for_file
 wait_for_file(Path({str(release)!r}))
 Path({str(completed)!r}).touch()
-'''.replace("from scripts.direct.wait_for_test_state import wait_for_file",
-            "import sys\nsys.path.insert(0, " + repr(str(VERIFY.resolve().parents[2])) + ")\n"
-            + "from scripts.direct.wait_for_test_state import wait_for_file"))
+''')
         outside_release = threading.Event()
         outside = threading.Thread(target=outside_release.wait, name="hold-event-recorder", daemon=True)
         outside.start()
@@ -166,6 +165,7 @@ Path({str(completed)!r}).touch()
         tree = self.root / "blocked-record-tree/scripts"
         (tree / "build_hold").mkdir(parents=True)
         (tree / "buildlog").mkdir()
+        (tree / "lib").symlink_to(VERIFY.parent.parent / "lib", target_is_directory=True)
         ready = self.root / "blocked-recorders"
         ready.mkdir()
         self.write_executable(tree / "buildlog/record.py", f'''

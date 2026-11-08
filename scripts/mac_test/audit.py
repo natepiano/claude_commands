@@ -2,6 +2,10 @@
 """Report operating-system conditions in a Rust workspace."""
 
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import argparse
 from bisect import bisect_right
@@ -15,13 +19,11 @@ from typing import Literal, cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lint"))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "build_hold"))
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.build_hold import override_guard
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
 from scripts.lib import conf
 
-from scripts.mac_test import cargo_manifest
-from scripts.mac_test import offload
+from scripts.mac_test import cargo_manifest, offload
 
 
 ListingStatus = Literal["yes", "no", "unknown"]

@@ -2,6 +2,10 @@
 """Resolve the Claude or Codex login behind a config directory or process."""
 
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import argparse
 import ctypes
@@ -16,8 +20,6 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Literal, NamedTuple, TypedDict, cast
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 from scripts.whoami.agent_accounts import claude_config_dir, claude_config_value, claude_on_disk, codex_email_on_disk, codex_home  # noqa: E402
 from scripts.whoami import note_file  # noqa: E402
 

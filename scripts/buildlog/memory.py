@@ -15,11 +15,9 @@ from enum import Enum
 from pathlib import Path
 from typing import Literal, TypedDict, cast
 
-from scripts.buildlog import index
-from scripts.buildlog import cgroup_capture
+from scripts.buildlog import index, cgroup_capture, store
 from scripts.buildlog.cgroup_capture import SliceAbsent as SliceAbsent, SlicePresent as SlicePresent, SliceCollection as SliceCollection
-from scripts.buildlog import store
-from scripts.lib.user_zone import user_zone
+from scripts.lib.user_zone import user_zone  # noqa: E402
 
 from scripts.build_queue import queue_snapshot
 from scripts.build_queue.queue_evidence import room_text

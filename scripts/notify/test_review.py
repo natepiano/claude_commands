@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from scripts.shutdown import remote
+
 import hashlib
 import io
 import json
@@ -16,12 +18,10 @@ from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal, TypedDict, cast, final, override
+from typing import Literal, TypedDict, cast, final, override
 from unittest import mock
 from zoneinfo import ZoneInfo
 
-import sys
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.notify import pushover
 from scripts.notify import review
 from scripts.notify import reply_asks
@@ -32,22 +32,13 @@ from scripts.notify.user_action import ActionRequired, NoActionRequired, Session
 
 REAL_REVIEW = review.review
 
-if TYPE_CHECKING:
-    from ..accounts import accounts
-    from ..production import staff
-    from ..production.update_registration_test_support import RegistrationFixture
-    from ..production.cli_fixture import production_paths
-    from ..production.staff_test_support import (
-        fixture_member, isolated_staff_file, isolated_source_readers, source_environment,
-    )
-else:
-    from scripts.accounts import accounts
-    from scripts.production import staff
-    from scripts.production.update_registration_test_support import RegistrationFixture
-    from scripts.production.cli_fixture import production_paths
-    from scripts.production.staff_test_support import (
-        fixture_member, isolated_staff_file, isolated_source_readers, source_environment,
-    )
+from scripts.accounts import accounts
+from scripts.production import staff
+from scripts.production.update_registration_test_support import RegistrationFixture
+from scripts.production.cli_fixture import production_paths
+from scripts.production.staff_test_support import (
+    fixture_member, isolated_staff_file, isolated_source_readers, source_environment,
+)
 
 
 class VerdictJSON(TypedDict):
@@ -182,7 +173,7 @@ class LocalReviewTests(unittest.TestCase):
         folder.mkdir(parents=True, exist_ok=True)
         document = self.root / f"{name}-production.md"
         _ = document.write_text(f"# Production — {name}\n\n- **Proposals:** `{folder}`\n")
-        owner = fixture_member("showrunner", name=name, doc=staff.LiveDoc("natedev", document))
+        owner = fixture_member("showrunner", name=name, doc=staff.LiveDoc(remote.local_machine(), document))
         record = folder / "question-fixture.md"
         fields = {**fields, "asked_by": owner.id}
         _ = record.write_text(f"---\nrecord_type: question\ntags: [question]\nstatus: open\n"

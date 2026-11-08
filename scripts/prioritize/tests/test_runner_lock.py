@@ -9,9 +9,8 @@ from typing import final
 
 
 PRIORITIZE_DIR = Path(__file__).parents[1]
-sys.path.insert(0, str(PRIORITIZE_DIR))
-import runner_lock  # pyright: ignore[reportImplicitRelativeImport]
-import writer_lock  # pyright: ignore[reportImplicitRelativeImport]
+from scripts.prioritize import runner_lock
+from scripts.prioritize import writer_lock
 
 
 @final
@@ -31,7 +30,7 @@ class RunnerLockTests(unittest.TestCase):
             path = Path(directory) / "runner.lock"
             completed = subprocess.run(
                 [
-                    sys.executable,
+                    str(PRIORITIZE_DIR.parent / "lib/py"),
                     str(PRIORITIZE_DIR / "runner_lock.py"),
                     "run",
                     str(path),
