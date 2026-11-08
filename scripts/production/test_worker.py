@@ -19,7 +19,7 @@ from typing import Literal, TextIO, cast, final, override
 import unittest
 from unittest.mock import patch
 
-from scripts.agents import codex_mesh, mesh_runs
+from scripts.agents import mesh_runs, worker_lifecycle
 from scripts.accounts import accounts
 from scripts.herdr import test_worker_panes as pane_fixtures
 from scripts.herdr import worker_panes
@@ -651,17 +651,17 @@ class WorkerCommandTests(unittest.TestCase):
         opened = self.opened()
         if closed:
             atomic_file.write_text_atomic(self.reply, "The previous report.\n")
-        directory = self.run_dir / codex_mesh.DETACHED_RUNS_DIR
+        directory = self.run_dir / worker_lifecycle.DETACHED_RUNS_DIR
         directory.mkdir()
         path = directory / "verification.json"
         guard = LauncherHangGuard("pane dispatch with a detached result")
         waiting = Event()
-        watch_class = codex_mesh.LinuxFileChanges if sys.platform.startswith("linux") else codex_mesh.KqueueFileChanges
+        watch_class = worker_lifecycle.LinuxFileChanges if sys.platform.startswith("linux") else worker_lifecycle.KqueueFileChanges
 
-        def watch_paths(paths: set[Path]) -> codex_mesh.LinuxFileChanges | codex_mesh.KqueueFileChanges:
+        def watch_paths(paths: set[Path]) -> worker_lifecycle.LinuxFileChanges | worker_lifecycle.KqueueFileChanges:
             watch = watch_class(paths)
             wait = watch.wait
-            def wait_for_change(connection: socket.socket, deadline: float) -> codex_mesh.FileWaitResult:
+            def wait_for_change(connection: socket.socket, deadline: float) -> worker_lifecycle.FileWaitResult:
                 waiting.set()
                 return wait(connection, deadline)
             _ = self.enterContext(patch.object(watch, "wait", side_effect=wait_for_change))
@@ -678,7 +678,7 @@ class WorkerCommandTests(unittest.TestCase):
                 atomic_file.write_text_atomic(path, json.dumps(record))
             self.agent.during_prompt = start_run
             self.agent.without_done = not initial_done
-            with patch.object(codex_mesh, watch_class.__name__, side_effect=watch_paths), \
+            with patch.object(worker_lifecycle, watch_class.__name__, side_effect=watch_paths), \
                     ThreadPoolExecutor(max_workers=1) as pool:
                 result = pool.submit(self.dispatch)
                 try:
@@ -733,8 +733,8 @@ class WorkerCommandTests(unittest.TestCase):
         pane, line = self.agent.submitted[-1]
         previous = self.reply.read_text()
         self.agent.append(pane, "user", "Detached run: private-check\nRun finished: private verification")
-        watch_class = codex_mesh.LinuxFileChanges if sys.platform.startswith("linux") else codex_mesh.KqueueFileChanges
-        with patch.object(watch_class, "wait", return_value=codex_mesh.WaitDeadlineExpired.EXPIRED) as wait:
+        watch_class = worker_lifecycle.LinuxFileChanges if sys.platform.startswith("linux") else worker_lifecycle.KqueueFileChanges
+        with patch.object(watch_class, "wait", return_value=worker_lifecycle.WaitDeadlineExpired.EXPIRED) as wait:
             self.assertEqual(self.dispatch(), worker.ExitCode.NO_DONE)
         wait.assert_called_once()
         self.assertEqual(self.agent.submitted, [(pane, line)])
@@ -759,15 +759,15 @@ class WorkerCommandTests(unittest.TestCase):
                 states.append(observed.status)
             return observed
 
-        def next_turn(connection: socket.socket, deadline: float) -> codex_mesh.FileWaitResult:
+        def next_turn(connection: socket.socket, deadline: float) -> worker_lifecycle.FileWaitResult:
             del connection, deadline
             if len(states) == 1:
                 self.fixture.world.locations[pane]["agent_status"] = "working"
-                return codex_mesh.WaitDeadlineExpired.EXPIRED
+                return worker_lifecycle.WaitDeadlineExpired.EXPIRED
             self.agent.complete(pane)
-            return codex_mesh.StateFilesChanged(frozenset({source}))
+            return worker_lifecycle.StateFilesChanged(frozenset({source}))
 
-        watch_class = codex_mesh.LinuxFileChanges if sys.platform.startswith("linux") else codex_mesh.KqueueFileChanges
+        watch_class = worker_lifecycle.LinuxFileChanges if sys.platform.startswith("linux") else worker_lifecycle.KqueueFileChanges
         with patch.object(worker_panes, "observe_worker", side_effect=observe_status), \
                 patch.object(watch_class, "wait", side_effect=next_turn) as wait:
             self.assertEqual(self.dispatch(), worker.ExitCode.OK)
@@ -788,16 +788,16 @@ class WorkerCommandTests(unittest.TestCase):
         source = worker_admission.transcript_source(row, backend)
         waits: list[float] = []
 
-        def change_then_quiet(connection: socket.socket, deadline: float) -> codex_mesh.FileWaitResult:
+        def change_then_quiet(connection: socket.socket, deadline: float) -> worker_lifecycle.FileWaitResult:
             del connection
             waits.append(deadline)
             if len(waits) == 1:
                 self.agent.append(pane, "user", "Detached run: second-check\nRun finished: second verification")
-                return codex_mesh.StateFilesChanged(frozenset({source}))
+                return worker_lifecycle.StateFilesChanged(frozenset({source}))
             self.assertEqual(len(waits), 2, "a quiet wait must end the dispatch")
-            return codex_mesh.WaitDeadlineExpired.EXPIRED
+            return worker_lifecycle.WaitDeadlineExpired.EXPIRED
 
-        watch_class = codex_mesh.LinuxFileChanges if sys.platform.startswith("linux") else codex_mesh.KqueueFileChanges
+        watch_class = worker_lifecycle.LinuxFileChanges if sys.platform.startswith("linux") else worker_lifecycle.KqueueFileChanges
         with patch.object(watch_class, "wait", side_effect=change_then_quiet):
             self.assertEqual(self.dispatch(), worker.ExitCode.NO_DONE)
         self.assertEqual(len(waits), 2)
@@ -812,7 +812,7 @@ class WorkerCommandTests(unittest.TestCase):
         row = self.agent.row(pane)
         path, record = self.detached_record(row, "private-check")
         record["delivery"] = f"sent: worker {row.name} at {pane}"
-        watch_class = codex_mesh.LinuxFileChanges if sys.platform.startswith("linux") else codex_mesh.KqueueFileChanges
+        watch_class = worker_lifecycle.LinuxFileChanges if sys.platform.startswith("linux") else worker_lifecycle.KqueueFileChanges
         with subprocess.Popen([sys.executable, "-c", "import sys; sys.stdin.read()",
                                "mesh_runs.py", "supervise", str(path)], stdin=subprocess.PIPE, text=True) as supervisor:
             for live in (False, True):
@@ -822,16 +822,16 @@ class WorkerCommandTests(unittest.TestCase):
                     atomic_file.write_text_atomic(path, json.dumps(record))
                     waits = 0
 
-                    def finish_run(connection: socket.socket, deadline: float) -> codex_mesh.FileWaitResult:
+                    def finish_run(connection: socket.socket, deadline: float) -> worker_lifecycle.FileWaitResult:
                         nonlocal waits
                         del connection, deadline
                         waits += 1
                         if live and waits == 2:
                             record["status"] = "finished"
                             atomic_file.write_text_atomic(path, json.dumps(record))
-                            return codex_mesh.StateFilesChanged(frozenset({path}))
+                            return worker_lifecycle.StateFilesChanged(frozenset({path}))
                         self.assertLessEqual(waits, 3 if live else 1, "a quiet ended turn must return")
-                        return codex_mesh.WaitDeadlineExpired.EXPIRED
+                        return worker_lifecycle.WaitDeadlineExpired.EXPIRED
 
                     with (redirect_stderr(io.StringIO()) as errors,
                           patch.object(watch_class, "wait", side_effect=finish_run)):
@@ -858,9 +858,9 @@ class WorkerCommandTests(unittest.TestCase):
         path, record = self.detached_record(row, "private-check")
         record["delivery"] = f"sent: worker {row.name} at {pane}"
         atomic_file.write_text_atomic(path, json.dumps(record))
-        watch_class = codex_mesh.LinuxFileChanges if sys.platform.startswith("linux") else codex_mesh.KqueueFileChanges
+        watch_class = worker_lifecycle.LinuxFileChanges if sys.platform.startswith("linux") else worker_lifecycle.KqueueFileChanges
         with (redirect_stderr(io.StringIO()) as errors,
-              patch.object(watch_class, "wait", return_value=codex_mesh.WaitDeadlineExpired.EXPIRED) as wait):
+              patch.object(watch_class, "wait", return_value=worker_lifecycle.WaitDeadlineExpired.EXPIRED) as wait):
             self.assertEqual(self.dispatch(), worker.ExitCode.NO_DONE)
         wait.assert_called_once()
         self.assertEqual(errors.getvalue(), "")
@@ -882,7 +882,7 @@ class WorkerCommandTests(unittest.TestCase):
             self.agent.append(pane, "assistant", final)
             return observed
 
-        watch_class = codex_mesh.LinuxFileChanges if sys.platform.startswith("linux") else codex_mesh.KqueueFileChanges
+        watch_class = worker_lifecycle.LinuxFileChanges if sys.platform.startswith("linux") else worker_lifecycle.KqueueFileChanges
         with patch.object(worker_panes, "observe_worker", side_effect=observe_then_reply), \
                 patch.object(watch_class, "wait", side_effect=AssertionError("a complete reply must not wait")):
             self.assertEqual(self.dispatch(), worker.ExitCode.OK)
@@ -891,7 +891,7 @@ class WorkerCommandTests(unittest.TestCase):
         self.assertEqual(self.agent.waited, [])
 
     def detached_record(self, row: staff.StaffRow, run_id: str) -> tuple[Path, mesh_runs.RunRecord]:
-        directory = self.run_dir / codex_mesh.DETACHED_RUNS_DIR
+        directory = self.run_dir / worker_lifecycle.DETACHED_RUNS_DIR
         directory.mkdir(exist_ok=True)
         record: mesh_runs.RunRecord = {"run_id": run_id, "status": "finished", "worker": row.name,
             "staff_id": row.id, "session_dir": str(self.run_dir), "label": "private verification", "command": [],
@@ -1287,54 +1287,6 @@ class WorkerCommandTests(unittest.TestCase):
                                                "--status", "completed"]):
                     progress_history.main()
 
-    def mesh_run(self) -> tuple[staff.StaffRow, staff.StaffRow]:
-        running = self.fixture.worker("team-impl")
-        done = self.fixture.worker("team-review")
-        atomic_file.write_text_atomic(self.run_dir / "worker_transport", "mesh\n")
-        atomic_file.write_text_atomic(self.run_dir / "mesh_roster.json", json.dumps({
-            running.name: {"slot": "impl", "role": "fix", "status": "running"},
-            done.name: {"slot": "review", "role": "review", "status": "done"},
-            "team-unrecorded": {"slot": "test", "role": "test", "status": "done"},
-        }))
-        atomic_file.write_text_atomic(self.run_dir / "board.log",
-            "2026-11-06T00:00:00Z [team-impl] status: repairing the reader\n")
-        return running, done
-
-    def test_mesh_pinned_list_reads_roster_states_and_staff_identity_without_herdr(self) -> None:
-        running, done = self.mesh_run()
-        before = self.fixture.staff_state(), (self.run_dir / "worker_transport").read_bytes()
-        with patch.object(herdr, "Herdr", side_effect=AssertionError("mesh list must not read panes")):
-            code, output, errors = self.command("list")
-            self.assertEqual(code, 0, errors)
-            self.assertIn(f"1 {running.name} fix running repairing the reader", output)
-            self.assertIn(f"2 {done.name} review idle", output)
-            code, output, errors = self.command("list", "--json")
-        self.assertEqual(code, 0, errors)
-        rows = cast(list[dict[str, object]], json.loads(output))
-        self.assertEqual(rows[0], {"name": running.name, "role": "fix", "state": "running",
-            "activity": "repairing the reader", "id": running.id, "current_session": running.current_session})
-        self.assertEqual(rows[1]["current_session"], done.current_session)
-        self.assertNotIn("id", rows[2])
-        self.assertNotIn("current_session", rows[2])
-        self.assertEqual((self.fixture.staff_state(), (self.run_dir / "worker_transport").read_bytes()), before)
-
-    def test_mesh_check_reports_only_incomplete_roster_evidence(self) -> None:
-        _ = self.mesh_run()
-        with patch.object(herdr, "Herdr", side_effect=AssertionError("mesh check must not read panes")):
-            self.assertEqual(self.command("check"), (0, "", ""))
-            (self.run_dir / "mesh_roster.json").unlink()
-            code, output, errors = self.command("check")
-        self.assertEqual(code, 1, errors)
-        self.assertIn("?:", output)
-        self.assertIn("mesh_roster.json", output)
-
-    def test_mesh_restore_keeps_rows_and_opens_no_pane(self) -> None:
-        _ = self.mesh_run()
-        before = self.fixture.staff_state(), self.fixture.world.locations.copy(), self.fixture.world.launches.copy()
-        with patch.object(herdr, "Herdr", side_effect=AssertionError("mesh restore must not read panes")):
-            self.assertEqual(self.command("restore"), (0, "unchanged\n", ""))
-        self.assertEqual((self.fixture.staff_state(), self.fixture.world.locations, self.fixture.world.launches), before)
-
     def test_dispatch_role_survives_a_new_phase_with_an_empty_pass_map(self) -> None:
         self.assertEqual(self.dispatch(role="review"), worker.ExitCode.OK)
         row = self.agent.row(self.agent.submitted[-1][0])
@@ -1521,7 +1473,7 @@ class WorkerCommandTests(unittest.TestCase):
         listing = cast(list[dict[str, object]], json.loads(output))
         self.assertEqual({item["name"] for item in listing}, {row.name for row in rows})
         self.assertEqual(errors.splitlines(), [
-            f"anomaly: {runs / name}: this run has no owner because {unit_runs.STATE_FILE} and mesh_roster.json name no unit, production or staff row"
+            f"anomaly: {runs / name}: this run has no owner because {unit_runs.STATE_FILE} names no staff row"
             for name in ("ownerless-a", "ownerless-b")])
 
     def test_restore_retains_the_same_native_session_and_reruns_unchanged(self) -> None:

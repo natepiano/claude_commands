@@ -1,6 +1,6 @@
 # Long-lived workers and held Astra roles
 
-## Phase 30, round 1
+## Phase 30, rounds 1 and 2a
 
 Live consumers read staff membership and backend evidence.
 `StaffSnapshot.backends` derives backend evidence from each current native session.
@@ -10,10 +10,11 @@ They show stopped, closed, unknown and incomplete states without reading a mesh 
 `inventory.worker_resumes` keeps Claude child commands in `ClaudeChildResume`.
 `refusal_watch.py` owns `QUOTA_REFUSAL`.
 
-Round 2 removes the held launcher, shutdown and sandbox dependencies.
+Round 2a removes mesh selection from the worker command, stop, restart and pane restore.
+The pane owner holds the sandbox constants.
+Round 2b removes the held assignment launcher dependencies.
 It deletes `codex_mesh.py`, the worker ledger and the remaining allocation and adoption helpers.
-It removes `PausedSeat`, `unit_runs.worker_transport`, `parent_transport`, run pins and the transport config keys.
-It moves sandbox constants into `worker_panes.py`.
+It removes `unit_runs.worker_transport`, `parent_transport`, run pins and the transport config keys.
 It renames `mesh_runs.py`, `mesh_run_process.py`, their config and the detached record folder.
 The current detached commands keep their existing names until that round.
 Completed run folders keep their roster files.
@@ -32,7 +33,7 @@ The launcher records dispatch identity in `last_dispatch_<slot>.json`.
 `worker_admission.parent` reads the run owner from the state file.
 It does not recover ownership from a mesh roster.
 The held launcher still uses allocation and publication helpers in this round.
-Round 2 removes those helpers after the other units release their files.
+Round 2b removes those helpers after the other units release their files.
 
 ## Displays and messages
 
@@ -55,6 +56,8 @@ Run cleanup preserves worker threads.
 Shutdown keeps saved Claude child launcher commands in `ClaudeChildResume`.
 Pane worker resume messages keep the fixed staff id and dispatch id.
 Account move messages preserve the move source, destination and task context.
+Native source release requires a confirmed stop or absence.
+Unknown source evidence preserves the source and prevents the family switch.
 
 The sweep uses staff ownership and pane states to retain live run folders.
 Stopped or closed workers can supply end evidence.
@@ -64,16 +67,16 @@ Detached command records retain their own process and working directory checks.
 ## Held interfaces
 
 `assign.py` still imports mesh launch helpers in this round.
-`production/worker.py` and shutdown stop and restart code await their owning units.
-`workers.py` keeps the ledger methods that those launchers call.
+`production/worker.py`, shutdown and pane restore use staff membership and native evidence.
+`workers.py` keeps the ledger methods that the held assignment launcher calls.
 `worker_adoption.py` keeps the adoption helpers that `codex_mesh.py` calls.
 `session_staff` keeps roster publication for those launchers.
 These interfaces do not provide live display state.
 
-Watchers and watcher events move to `worker_lifecycle.py`.
+`worker_lifecycle.py` owns watchers and watcher events.
 `finished_run_status` has the same owner.
-`loaded_threads` moves to `herdr.py`.
-Shared launcher fixtures move to `codex_mesh_test_support.py` without changing their names.
+`herdr.py` owns `loaded_threads`.
+`codex_mesh_test_support.py` owns the shared launcher fixtures with their existing names.
 
 ## Pane closure and restore
 
@@ -98,7 +101,7 @@ That row has no `home` field.
 
 ## Assignment settings and command files
 
-`UNIT_COMPACT_ABOVE_TOKENS` controls idle mesh compaction until round 2 removes that path.
+`UNIT_COMPACT_ABOVE_TOKENS` controls idle mesh compaction until round 2b removes that path.
 Pane workers have no option for compaction during a turn.
 Codex keeps its own full-window limit.
 `commands/unit/direct.md` defines `<LongLivedWorkers/>`.

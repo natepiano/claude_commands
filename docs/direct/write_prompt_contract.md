@@ -15,8 +15,18 @@ Codex review prompts also include section 3's command block.
    Use opening wording for a replacement conversation.
 2. Boundaries: prohibit commits, branches, and unrelated edits.
    State both file sets under <TeamFilePartition/>. Block changes to a peer's files.
+   Require the summary in the final reply, because the launcher saves that reply as the summary.
+   Include files, reasons, deviations, doubts, unverified checks, and edits outside the file set.
+   Implementation, fix and test prompts carry verbatim:
+   "Do not open the `rust_style` skill or run `load-rust-style.sh`; the reviewer worker owns the phase style review."
+   Review prompts use
+   <ReviewPromptContract/>'s style assignment instead.
 3. Narration: require this command when a herdr pane worker's activity changes:
    `bash ~/.claude/scripts/direct/board.sh post <slot> status "<activity>"`.
+   For a read-only pane reviewer, require short output lines instead of board posts.
+   Assign its required suites to the director or a writer.
+   Use short present-tense text. Do not read the heartbeat file or post unchanged activity.
+   Include this command block verbatim after section 2 in every Codex prompt:
 
    ```
    ## Builds and tests
@@ -47,12 +57,17 @@ Codex review prompts also include section 3's command block.
    Claude workers use `run_in_background: true` and end the turn until the result arrives.
    Before a role change, require this command from herdr pane writers:
    `bash ~/.claude/scripts/direct/board.sh role <slot> <impl|fix|test|review> "<why>"`.
+   The director records a pane reviewer's role change.
+   Use the prompt's slot. Check that different prompts name different slots.
+   Omit the run folder from pane worker board commands. They read `UNIT_RUN_DIR`.
 4. `## Team`: copy the Workers assignment and file ownership, including one owner for each hub file.
    Copy the <CoordinationBoard/> commands. State that `verify.sh` may pause for a peer.
    Prohibit cargo token requests, acquisition, and discussion under <BuildTokenContract/>.
    Send questions by message. Record decisions on the board. State each source when passing information.
    Label the user's words only when the unit director relays them.
    Include each worker address and its concrete contact command under <PhaseMesh/>.
+   If a member has no message route, require it to read the board.
+   For repairs, list the file set, other workers' files as read-only, and the token prohibition under <FixDispatch/>.
 5. `## Project Context`: include the current context. Omit plan **Style** metadata.
 6. `## Work Specification`: include the following instructions verbatim.
    "Do not weaken, delete or turn off an existing assertion or test to make a test pass. If one must change, post blocked with the test, the old assertion, the new assertion and why."

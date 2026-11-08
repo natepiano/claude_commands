@@ -44,7 +44,7 @@ The [worker design](long-lived-workers.md#staff-membership-and-dispatch) defines
 The roster reads staff membership and pane evidence.
 
 The worker command preserves staff identity when it closes a worker.
-The held assignment launcher retains its thread and allocation helpers until round 2.
+The held assignment launcher retains its thread and allocation helpers until round 2b.
 The roster uses the staff row's current native session.
 
 ### How each row's role is derived
@@ -72,6 +72,10 @@ Codex rows:
   The [held-role design](long-lived-workers.md#held-interfaces) defines its authority.
 - **blind reviewer** — `<worker>_status[_<lens>]` reads `reviewing` with a live `<worker>_pid[_<lens>]`. Kind is `codex` for a `codex exec` descendant of that pid, else `claude` for a `claude` descendant, else `codex`. Named `<lens> reviewer` or `blind reviewer`, slot role `review (<lens>)` or `review`.
 - **freestanding** — each daemon thread that is not a worker's or held role's thread (such a thread is listed once, as the worker or held role).
+  A native Codex pane uses its reported session when available.
+  Without a report, `native_pane_process(...).current_identity` supplies its thread.
+  An unreadable process keeps the pane visible without a messaging address.
+  A reported session needs no process identity read.
 
 ### Domain types (`roster.py`)
 

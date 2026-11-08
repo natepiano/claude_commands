@@ -19,7 +19,7 @@ from dataclasses import asdict, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from collections.abc import Callable, Generator, Mapping
+from collections.abc import Generator, Mapping
 from contextlib import ExitStack, contextmanager, redirect_stdout
 from contextvars import ContextVar
 from io import StringIO
@@ -179,7 +179,7 @@ def _record_launches(selected: list[str]) -> None:
         print(f"stop: launch note anomaly: {error}", file=sys.stderr)
 
 
-def release_source(row: StaffRow, runs: Callable[[], tuple[Path, ...]], backend: ClaudeBackend | CodexBackend | BackendUnavailable) -> SourceRelease:
+def release_source(row: StaffRow, backend: ClaudeBackend | CodexBackend | BackendUnavailable) -> SourceRelease:
     """Resolve native stop evidence before creating the destination."""
     from scripts.production import staff
 
@@ -187,13 +187,6 @@ def release_source(row: StaffRow, runs: Callable[[], tuple[Path, ...]], backend:
     result = stop(row.id, kind)
     if isinstance(result, SessionNotFound):
         return SourceUnresolved(f"{row.id}: lifecycle could not resolve the staff reference; check the staff row and retry")
-    if isinstance(result, StopUnproved):
-        herdr.conversation_note(herdr.UnknownConversation(result.reason))
-    if isinstance(result, (NotRunning, StopUnproved)) and isinstance(backend, staff.CodexBackend):
-        stop_mesh = cast(Callable[[staff.StaffRow, tuple[Path, ...]], SourceRelease],
-                         import_module("scripts.agents.codex_mesh").stop_worker_for_switch)
-        released = stop_mesh(row, runs())
-        return released if isinstance(released, SourceReleased) else replace(released, reason=f"{released.reason}; inspect the source session and retry")
     if isinstance(result, StopFailed):
         return SourceReleaseUnknown(f"{result.reason}; inspect the source session and retry")
     return SourceReleased()
@@ -220,10 +213,7 @@ def _stop_recorded(session: str, kind: str = "") -> StopResult:
     except (OSError, ValueError):
         record = staff.StaffSnapshot(())
     row = record.by_member_reference(session)
-    from scripts.lib import unit_runs
-    parent = record.parent_of(row) if row is not None else None
-    pane_worker = row is not None and row.kind == "worker" and (parent is None or
-        unit_runs.worker_transport(worker_panes.worker_run(parent)) == "herdr")
+    pane_worker = row is not None and row.kind == "worker"
     before = next((item for item in worker_panes.observe(row.parent.id, record) if item.row.id == row.id), None
                   ) if pane_worker and row is not None and isinstance(row.parent, staff.ReportsTo) else None
     if isinstance(before, (worker_panes.ProcessUnknownWorker, worker_panes.UncertainWorker)):
@@ -373,11 +363,9 @@ def stop_unit_workers(unit: StaffId, record: StaffSnapshot) -> list[str]:
     """Stop the selected workers concurrently and retain every staff row."""
     from scripts.agents import worker_lifecycle
     from scripts.herdr import worker_panes
-    from scripts.lib import unit_runs
     from scripts.shutdown import restart
 
-    holder = record.by_id(unit)
-    if not record.find(kind="worker", parent=unit) or holder is not None and unit_runs.worker_transport(worker_panes.worker_run(holder)) == "mesh":
+    if not record.find(kind="worker", parent=unit):
         return []
     try:
         deadline = worker_lifecycle.effective_deadline()

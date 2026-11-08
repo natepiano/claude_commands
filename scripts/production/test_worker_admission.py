@@ -189,14 +189,14 @@ class WorkerAdmissionTests(StaffTestCase):
 
 class FamilyHandoffTests(StaffTestCase):
     def source(self, family: Literal["claude", "codex"], *, turns: int = 1,
-               malformed: bool = False) -> tuple[worker_admission.WorkerStartAllowed, Path,
+               malformed: bool = False, worker_name: str = "switch") -> tuple[worker_admission.WorkerStartAllowed, Path,
                                                 tuple[list[str], list[str], list[str]]]:
         _, unit, _ = self.tree()
         tree = self.root / "worktree"
         tree.mkdir(exist_ok=True)
         _ = staff.set_worktree(unit.id, staff.PresentWorktree("natedev", tree), expected=unit.worktree)
         backend = staff.ClaudeBackend() if family == "claude" else staff.CodexBackend(self.root / "codex")
-        row = fixture_worker("switch-" + family, unit.id, backend=backend)
+        row = fixture_worker(worker_name + "-" + family, unit.id, backend=backend)
         path, evidence = transcript_fixture(row, backend, turns=turns, malformed=malformed)
         run = self.root / ("run-" + family)
         run.mkdir(exist_ok=True)
@@ -206,19 +206,22 @@ class FamilyHandoffTests(StaffTestCase):
 
 
 
-    def test_source_run_discovery_only_follows_an_idle_codex_source(self) -> None:
-        cases: tuple[tuple[Literal["claude", "codex"], bool], ...] = (("claude", False), ("codex", True))
+    def test_family_switch_uses_native_release_without_run_discovery(self) -> None:
+        cases: tuple[tuple[Literal["claude", "codex"], bool], ...] = (
+            ("claude", False), ("claude", True), ("codex", False), ("codex", True))
         for family, stopped in cases:
-            allowed, _, _ = self.source(family)
+            allowed, _, _ = self.source(family, worker_name=f"native-{stopped}")
             assert isinstance(allowed.slot, worker_admission.ExistingWorkerSlot)
             row = allowed.slot.row
             result = stop_resume.Stopped(row.current_session, 123) if stopped else stop_resume.NotRunning(row.current_session)
-            identity = fixture_runtime_id("lazy-" + family)
+            identity = fixture_runtime_id(f"native-{family}-{stopped}")
             fixture_session(identity, staff.ClaudeBackend() if family == "codex" else staff.CodexBackend(self.root / "destination"))
             with (mock.patch.object(stop_resume, "stop", return_value=result),
                   mock.patch.object(session_staff, "worker_run_index", side_effect=AssertionError("unnecessary run discovery"))):
-                _ = worker_admission.switch_worker(allowed, "claude" if family == "codex" else "codex",
+                published = worker_admission.switch_worker(allowed, "claude" if family == "codex" else "codex",
                     start=lambda handoff: identity, dispatch=lambda published: worker_admission.SwitchState.ASSIGNMENT_ACCEPTED, cleanup=lambda identity: None)
+            self.assertEqual(published.row.id, row.id)
+            self.assertEqual(published.row.current_session, identity)
 
     def test_sibling_slots_can_launch_together_and_equal_slots_refuse_contention(self) -> None:
         _, unit, _ = self.tree()

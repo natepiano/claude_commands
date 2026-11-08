@@ -275,8 +275,7 @@ QUEUE_GRACE_SECS = 3.0
 # every five seconds off the authority; detached runs still use sixty seconds.
 REMOTE_ROLE_CHECK_SECS = 5.0
 # The SandboxMode strings a thread starts with: workers write, standing reviewers only read.
-WORKER_SANDBOX = "danger-full-access"
-READ_ONLY_SANDBOX = "read-only"
+from scripts.herdr.worker_panes import WORKER_SANDBOX as WORKER_SANDBOX, READ_ONLY_SANDBOX as READ_ONLY_SANDBOX
 SANDBOX_MODES = (WORKER_SANDBOX, READ_ONLY_SANDBOX)
 # Production gives a server five seconds to stop; disposable child processes need no long grace.
 REAP_WAIT_SECS = 5.0

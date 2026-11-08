@@ -407,7 +407,7 @@ def switch_worker(allowed: WorkerStartAllowed, family: str, *,
             if row is not None and not same:
                 handoff = extract_transcript(row, allowed.run, backend)
                 release_source = cast(ReleaseSource, import_module("scripts.shutdown.stop_resume").release_source)
-                released = release_source(row, lambda: (allowed.run, *session_staff.worker_run_index(record).get(allowed.lock_reference, ())), backend)
+                released = release_source(row, backend)
                 if not isinstance(released, SourceReleased):
                     raise AdmissionRefused(released.reason)
                 retry = True

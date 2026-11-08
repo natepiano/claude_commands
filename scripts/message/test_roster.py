@@ -1299,7 +1299,7 @@ class RosterTests(unittest.TestCase):
         design_id = "00000000-0000-4000-8000-000000000099"
         unit = unit_membership("sdlc", "roles")
         runner = showrunner_relationship("sdlc")
-        mesh = str(design_roles.mesh_directory(design_id))
+        directory = str(design_roles.design_directory(design_id))
         for parent, prefix in ((unit, "sdlc · roles"), (runner, "sdlc")):
             designer = fixture_worker("design-address", parent.id)
             reviewer = fixture_worker("review-address", parent.id)
@@ -1312,11 +1312,11 @@ class RosterTests(unittest.TestCase):
             for held_role, name, job in (("designer", "design-address", "designer"),
                                          ("reviewer", "review-address", "design reviewer")):
                 with self.subTest(parent=parent, role=held_role):
-                    shown = roster.mesh_shown_name(mesh, name, {"held_design_id": design_id, "held_role": held_role})
+                    shown = roster.mesh_shown_name(directory, name, {"held_design_id": design_id, "held_role": held_role})
                     self.assertEqual(shown.render(), f"{prefix} · {job}")
                     self.assertEqual(shown.address, name)
         _ = (design_roles.design_directory(design_id) / "design.json").write_text("broken JSON")
-        self.assertEqual(roster.mesh_shown_name(mesh, "review-address", {
+        self.assertEqual(roster.mesh_shown_name(directory, "review-address", {
             "held_design_id": design_id, "held_role": "reviewer"}).render(), "review-address")
 
     def test_docless_row_keeps_repeated_mesh_title_reads_silent(self) -> None:
@@ -1936,7 +1936,7 @@ class RosterTests(unittest.TestCase):
         self.assertIn("herdr native:w1:p3", without_worker)
 
     def test_codex_pane_without_a_session_report_uses_its_process_identity(self) -> None:
-        world = PaneWorld()
+        world = self.pane_world
         row = fixture_member("agent", name="process-pane")
         world.add(row, "w1:p5", family="codex")
         responses = self._herdr_sessions()

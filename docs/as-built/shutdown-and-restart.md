@@ -24,6 +24,14 @@ It takes no watcher lock and sends no message.
 Stall-watch retires the saved prompt keys on its next pass, even after launch deletion.
 A cancellation error prints a separate warning and does not change the stop result.
 Workers keep their threads.
+Staff membership selects worker children for stop and restart.
+These operations do not read a transport pin.
+
+`release_source(row, backend)` uses the current native conversation evidence.
+A confirmed exit or `NotRunning` gives `SourceReleased`.
+An unresolved staff reference gives `SourceUnresolved`.
+Unknown process evidence or an unproved stop gives `SourceReleaseUnknown`.
+A family switch preserves its source when release remains unproved.
 
 `agents resume NAME [--why TEXT] [--to ACCOUNT]` works from any directory.
 The short form is `resume NAME`, through `scripts/shutdown/resume`.
@@ -128,17 +136,25 @@ Each child has one result:
 The reader selects staff members under the moved parent.
 It reads each member's backend and current native session.
 A Claude child uses its `impl_worker_<slot>.json` record and the matching status file.
-The held stop and restart code retains `PausedSeat` until round 2.
 The status reader searches the run root and `phases/*`; it does not search `tmp/**`.
 A readable status other than `implementing`, including `capacity_exhausted`, gives `Idle`.
 An unavailable child does not hide another child's result.
 
 `session_staff.worker_run_entries(snapshot, rows)` returns real `(run, entry)` pairs.
 `worker_run_index(snapshot)` also includes owner-marker runs without a worker record.
-Source release uses those marker runs to find loaded threads.
+Source release uses native process evidence and does not scan those runs.
 Both readers share one scan and report unreadable evidence as anomalies.
 `unit_runs.run_folders` preserves root and name order, removes duplicate resolved paths, and skips each root's `active` marker folder.
 An unreadable root does not prevent reads of other roots.
+
+Pane worker resumes use `PaneWorkerResume` with a fixed staff id and an active dispatch id.
+The director receives `Worker <staff id>: busy dispatch <dispatch id>` for each active direct child.
+An idle child receives no new assignment.
+The message names idle children separately.
+It keeps the account move source and destination.
+It supplies no saved mesh launcher command.
+Restart and pane restore select each worker's current staff parent directly.
+Closed idle workers stay closed until their next assignment.
 
 ## Launch names
 

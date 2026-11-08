@@ -44,17 +44,6 @@ class PaneWorkerResume:
     turn: BusyPass | IdleWorker
 
 
-class PausedSeat(TypedDict):
-    """A worker reference and the launcher that continues its task."""
-
-    run_dir: str
-    seat: str
-    role: str
-    staff_id: str
-    turn_live: bool
-    launcher_command: list[str]
-
-
 class ClaudeChildResume(TypedDict):
     """A Claude child keeps its launcher command and assignment."""
 
@@ -127,8 +116,6 @@ def resume_message(why: str, *, move: NoAccountMove | AccountMove = NO_ACCOUNT_M
                     lines.append(f"{seat['seat']} ({seat['role']}, idle): paused on its thread; nothing to run now. "
                                  + f"Your next dispatch with --to {seat['seat']} resumes it.")
         lines.append("Each worker continues its own thread; after resuming, send later work with --to as usual.")
-    elif why:
-        lines.append("Codex workers keep their existing threads. Use assign.sh --to <worker> to resume a paused worker.")
     text = ("\n" if workers.results or workers.panes else " ").join(lines)
     return script_prompt(text)
 

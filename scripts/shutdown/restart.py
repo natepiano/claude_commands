@@ -24,7 +24,7 @@ from scripts.herdr import herdr
 from scripts.message import sessions, codex_daemon
 from scripts.production import staff, session_staff
 from scripts.accounts import accounts
-from scripts.lib import conf, nix_env, operation_deadline, unit_runs
+from scripts.lib import conf, nix_env, operation_deadline
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.shutdown import member_account, shutdown_record, pane_record
 from scripts.shutdown.stop_results import StopResult, Stopped, NotRunning, StopFailed
@@ -63,7 +63,6 @@ class WorkerPanes(Protocol):
     StoppedWorker: type[WorkerRow]
     ClosedWorker: type[WorkerRow]
     def observe(self, parent: staff.StaffId, record: staff.StaffSnapshot) -> list[WorkerRow]: ...
-    def worker_run(self, parent: staff.StaffRow) -> Path: ...
 
 
 class WorkerRestore(Protocol):
@@ -165,15 +164,11 @@ def session_launch(identity: str, name: str) -> tuple[Literal["claude", "codex"]
     raise OSError(f"no transcript for {identity}")
 
 
-def pane_workers(row: staff.StaffRow) -> bool:
-    return unit_runs.worker_transport(worker_panes.worker_run(row)) != "mesh"
-
-
 def _restore_workers(row: staff.StaffRow, record: staff.StaffSnapshot) -> None:
     worker = cast(WorkerRestore, cast(object, import_module("scripts.production.worker")))
     if row.kind in ("unit", "showrunner") and any(
             child.kind == "worker" and child.parent == staff.ReportsTo(row.id) for child in record.rows
-            ) and pane_workers(row) and worker.restore(row.id) != 0:
+            ) and worker.restore(row.id) != 0:
         raise OSError("worker restore is incomplete")
 
 
@@ -378,7 +373,7 @@ def live_rows(record: staff.StaffSnapshot, client: herdr.Herdr, *, save_tabs: bo
             print(f"{' '.join(candidates[identity].splitlines())}: restart anomaly: unassigned live session", file=sys.stderr)
     workers: dict[staff.StaffId, WorkerRow] = {}
     for holder in record.rows:
-        if holder.kind in ("unit", "showrunner") and any(child.parent == staff.ReportsTo(holder.id) for child in record.rows) and pane_workers(holder):
+        if holder.kind in ("unit", "showrunner") and any(child.parent == staff.ReportsTo(holder.id) for child in record.rows):
             workers.update((state.row.id, state) for state in worker_panes.observe(holder.id, record))
     active_workers = [state.row for state in workers.values()
                       if not isinstance(state, (worker_panes.ClosedWorker, worker_panes.StoppedWorker))]
@@ -388,6 +383,8 @@ def live_rows(record: staff.StaffSnapshot, client: herdr.Herdr, *, save_tabs: bo
     selected = live_members(candidates_rows, record, resolver=resolver, codex=codex, account=account)
     if isinstance(account, AllRestartAccounts):
         selected.extend(active_workers)
+    positions = {row.id: index for index, row in enumerate(record.rows)}
+    selected.sort(key=lambda row: positions[row.id])
     if save_tabs:
         try:
             client.save_layout()
@@ -474,7 +471,7 @@ def restart(*, stop_all: bool = False, dry_run: bool = False, only: tuple[str, .
     for row in selected:
         parent = record.parent_of(row) if row.kind == "worker" else None
         holder = (parent if worker_scope is WorkerRestartScope.FOLLOW_OWNER
-                  and parent is not None and parent.id in selected_ids and pane_workers(parent) else row)
+                  and parent is not None and parent.id in selected_ids else row)
         holders[holder.id] = holder
         members_by_holder.setdefault(holder.id, []).append(str(row.id))
     callers = {os.environ.get("CLAUDE_CODE_SESSION_ID"), os.environ.get("CODEX_THREAD_ID")} - {None, ""}

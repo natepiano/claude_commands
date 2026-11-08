@@ -32,6 +32,9 @@ StaffId = staff.StaffId
 WorkerName = staff.WorkerName
 WorkerRole = staff.WorkerRole
 
+WORKER_SANDBOX = "danger-full-access"
+READ_ONLY_SANDBOX = "read-only"
+
 
 @dataclass(frozen=True)
 class StaffWorker:
@@ -253,6 +256,10 @@ def worker_lock(parent: StaffId, name: WorkerName, *, blocking: bool = False) ->
             yield hold
         finally:
             hold.active = False
+
+
+class UseRolePolicy(Enum):
+    CURRENT = "resolve the role policy"
 
 
 @dataclass(frozen=True)
@@ -514,14 +521,6 @@ def _idle_checks(row: staff.StaffRow, run: Path,
                 fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError:
                 return Kept("dispatch lock is held")
-    legacy = (*run.glob("dispatch.lock"), *(run / "phases").glob("*/dispatch.lock"))
-    if legacy and unit_runs.worker_transport(run) == "mesh":
-        for path in legacy:
-            with path.open("r") as handle:
-                try:
-                    fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                except BlockingIOError:
-                    return Kept("dispatch lock is held")
     if worker_pass(row, run).get("status") in ("active", "refused"):
         return Kept("launcher has not recorded a completed pass")
     live_runs = cast(Callable[[Path, str], Sequence[object]], import_module("scripts.agents.mesh_runs").live_runs)
@@ -579,7 +578,6 @@ def can_close(worker: OpenWorker | StoppedWorker, *,
 
 
 def launch_policy(role: WorkerRole) -> LaunchPolicy:
-    from scripts.agents.codex_mesh import READ_ONLY_SANDBOX, WORKER_SANDBOX
     from scripts.astra import design_roles
     section, key = ("design_roles", role.removeprefix("astra-")) if role.startswith("astra-") else ("direct", role)
     settings = models_registry.launch_settings(section, key)
@@ -591,22 +589,16 @@ def launch_policy(role: WorkerRole) -> LaunchPolicy:
 
 def astra_review_policy(model: str, effort: str) -> LaunchPolicy:
     """Use the supplied review settings with fixed read-only Codex access."""
-    from scripts.agents.codex_mesh import READ_ONLY_SANDBOX
-
     settings = models_registry.LaunchSettings("codex", model, effort, "")
     return LaunchPolicy(settings, READ_ONLY_SANDBOX, "plan")
 
 
 def worker_policy(settings: models_registry.LaunchSettings) -> LaunchPolicy:
     """Use the worker's file permissions with the supplied model settings."""
-    from scripts.agents.codex_mesh import WORKER_SANDBOX
-
     return _launch_policy(settings, WORKER_SANDBOX)
 
 
 def _launch_policy(settings: models_registry.LaunchSettings, sandbox: str) -> LaunchPolicy:
-    from scripts.agents.codex_mesh import READ_ONLY_SANDBOX
-
     permission = "plan" if sandbox == READ_ONLY_SANDBOX else "bypassPermissions"
     return LaunchPolicy(settings, sandbox, permission)
 
@@ -726,7 +718,7 @@ def _destination(parent: staff.StaffRow, name: str, evidence: PaneEvidence,
 def start_or_resume(parent: StaffId, name: WorkerName, role: WorkerRole | WorkerRoleUnavailable, *,
                     account: ConfiguredWorkerAccount | DestinationWorkerAccount = ConfiguredWorkerAccount.CURRENT,
                     lock: WorkerLockHold | WorkerLockAtUse = WorkerLockAtUse.ACQUIRE,
-                    policy: LaunchPolicy | None = None) -> WorkerStart:
+                    policy: UseRolePolicy | LaunchPolicy = UseRolePolicy.CURRENT) -> WorkerStart:
     if isinstance(role, WorkerRoleUnavailable):
         return StartRefused(StartRefusal.ROLE_UNAVAILABLE, role.reason)
     if role not in staff.WORKER_ROLES:
@@ -740,7 +732,7 @@ def start_or_resume(parent: StaffId, name: WorkerName, role: WorkerRole | Worker
     allowed = worker_admission.WorkerStartAllowed(name.value, parent, run,
         worker_admission.ExistingWorkerSlot(existing) if existing is not None else worker_admission.NewWorkerSlot())
     try:
-        policy = policy if policy is not None else launch_policy(role)
+        policy = launch_policy(role) if isinstance(policy, UseRolePolicy) else policy
     except (OSError, ValueError, subprocess.SubprocessError) as error:
         return StartRefused(StartRefusal.INVALID_ROLE_CONFIGURATION, str(error))
     try:

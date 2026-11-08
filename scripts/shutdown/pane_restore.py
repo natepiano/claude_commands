@@ -79,7 +79,7 @@ def restore(session: str, *, dry_run: bool) -> int:
             saved_panes.append(pane)
             continue
         parent = record.parent_of(row) if row.kind == "worker" else None
-        holder = parent if parent is not None and restart.pane_workers(parent) else row
+        holder = parent if parent is not None else row
         selected[holder.id] = holder
         if saved is not None and holder.id == row.id:
             home = Path(saved["config_dir"])

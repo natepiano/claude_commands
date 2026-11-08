@@ -834,12 +834,11 @@ class WorkerPaneTests(StaffTestCase):
         self.assertEqual(worker_panes.dispatch_role(row), "astra-reviewer")
         self.assertEqual(staff.snapshot().by_id(row.id), row)
 
-    def test_herdr_pinned_close_ignores_a_mesh_phase_lock(self) -> None:
+    def test_close_ignores_a_phase_dispatch_lock(self) -> None:
         row = self.worker()
         self.world.add(row, "w1:p1", live=False)
         run = self.root / "run"
         run.mkdir()
-        write_text_atomic(run / "worker_transport", "herdr\n")
         phase = run / "phases/8"
         phase.mkdir(parents=True)
         with (phase / "dispatch.lock").open("w") as lock:
@@ -1217,7 +1216,7 @@ class WorkerPaneTests(StaffTestCase):
 
     def test_all_explicit_roles_reach_their_registry_settings(self) -> None:
         for role in staff.WORKER_ROLES:
-            with self.subTest(role=role):
+            with self.subTest(role=role), patch.dict(sys.modules, {"scripts.agents.codex_mesh": None}):
                 result = self.start("worker-" + role, role)
                 self.assertIsInstance(result, worker_panes.OpenWorker)
                 _, arguments, environment = self.world.requests[-1]
@@ -1607,38 +1606,6 @@ class WorkerPaneTests(StaffTestCase):
                 self.assertEqual(self.world.closed, [])
                 self.world.locations = {"w1:p0": self.world.locations["w1:p0"]}
                 self.world.foreground = {"w1:p0": self.world.foreground["w1:p0"]}
-
-    def saved_mesh_run(self) -> Path:
-        run = self.root / "run"
-        run.mkdir()
-        write_text_atomic(run / "worker_transport", "mesh\n")
-        return run
-
-    def test_a_dispatch_lock_keeps_a_stopped_pane_open(self) -> None:
-        row = self.worker()
-        self.world.add(row, "w1:p1", live=False)
-        run = self.saved_mesh_run()
-        with (run / "dispatch.lock").open("w") as lock:
-            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            result = worker_panes.close(self.parent.id, staff.WorkerName.parse(row.name))
-        self.assertIsInstance(result, worker_panes.Kept)
-        assert isinstance(result, worker_panes.Kept)
-        self.assertIn("lock", result.blocker)
-        self.assertEqual(self.world.closed, [])
-
-    def test_stopped_worker_close_honors_the_phase_dispatch_lock(self) -> None:
-        row = self.worker()
-        self.world.add(row, "w1:p1", live=False)
-        phase = self.saved_mesh_run() / "phases/7"
-        phase.mkdir(parents=True)
-        with (phase / "dispatch.lock").open("w") as lock:
-            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            result = worker_panes.close(self.parent.id, staff.WorkerName.parse(row.name))
-        self.assertIsInstance(result, worker_panes.Kept)
-        assert isinstance(result, worker_panes.Kept)
-        self.assertEqual(result.blocker, "dispatch lock is held")
-        self.assertEqual(self.world.closed, [])
-        self.assertEqual(set(self.world.locations), {"w1:p0", "w1:p1"})
 
     def test_stale_session_mark_does_not_prevent_proved_shell_recovery(self) -> None:
         row = self.worker()

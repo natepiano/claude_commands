@@ -17,7 +17,7 @@ from dataclasses import replace
 from unittest.mock import call, patch
 
 from scripts.shutdown import inventory
-from scripts.herdr import herdr, pane_launch
+from scripts.herdr import herdr, pane_launch, worker_panes
 from scripts.message import sessions
 from scripts.shutdown import restart, shutdown
 from scripts.shutdown.unit_staff_test_support import unit_host
@@ -185,7 +185,7 @@ def common_session(session_id: str, name: str | None = None, *, cwd: str | None 
         "name": name or session_id, "cwd": cwd or f"/tmp/{session_id}",
         "status": "idle", "updated_at": 0, "probe": False,
         "model": model or inventory.NoReplyYet(kind="no reply yet"),
-        "checkout": checkout(), "run_dirs": list(run_dirs or []), "codex_servers": [], "timers": [],
+        "checkout": checkout(), "run_dirs": list(run_dirs or []), "timers": [],
     }
 
 
@@ -612,7 +612,6 @@ class RestartTests(RestartTestCase):
             with (self.subTest(selected=selected.id),
                   patch.object(staff, "initial_snapshot", return_value=record),
                   patch.object(restart, "live_rows", return_value=list(record.rows)),
-                  patch.object(unit_runs, "worker_transport", return_value="herdr"),
                   patch.object(restart.stop_resume, "stop_unit_workers") as stop_workers,
                   patch.object(restart, "stop_row") as stop,
                   patch.object(restart, "start_row", return_value="w1:p1") as start,
@@ -627,8 +626,7 @@ class RestartTests(RestartTestCase):
         child = replace(self.rows[1], kind="worker", parent=staff.ReportsTo(owner.id))
         self.rows = (owner, child, self.rows[2])
         self.running.remove(str(child.current_session))
-        with (patch.object(unit_runs, "worker_transport", return_value="herdr"),
-              redirect_stdout(io.StringIO())):
+        with redirect_stdout(io.StringIO()):
             self.assertEqual(restart.start_row(child, staff.StaffSnapshot(self.rows), herdr.Herdr("agents")), "w1:p1")
         self.assertEqual([name for name, _pane in self.launches], [child.name])
         self.assertIn(str(owner.current_session), self.running)
@@ -655,16 +653,13 @@ class RestartTests(RestartTestCase):
         self.assertEqual(len(errors.getvalue().splitlines()), 1)
 
     def test_account_filters_partition_an_owner_and_its_workers_by_their_own_accounts(self) -> None:
-        from scripts.herdr import worker_panes
-
         self.account_processes()
         owner = self.rows[0]
         children = tuple(replace(row, kind="worker", parent=staff.ReportsTo(owner.id)) for row in self.rows[1:])
         record = staff.StaffSnapshot((owner, *children))
         states = [worker_panes.OpenWorker(row, f"w1:p{index}", f"terminal-{index}", herdr.AgentStatus.IDLE)
                   for index, row in enumerate(children, 1)]
-        with (patch.object(unit_runs, "worker_transport", return_value="herdr"),
-              patch.object(worker_panes, "observe", return_value=states)):
+        with patch.object(worker_panes, "observe", return_value=states):
             for label, expected in (("claude3", [owner]), ("claude2", list(children))):
                 with self.subTest(account=label):
                     self.assertEqual(restart.live_rows(record, herdr.Herdr("agents"),
@@ -1091,7 +1086,8 @@ class RestartTests(RestartTestCase):
         for identity, label, unavailable in ((str(self.rows[0].current_session), "live", False), (None, "live", False),
                                            (str(self.rows[0].current_session), None, False), (None, "live", True)):
             with (patch.object(staff, "initial_snapshot", return_value=staff.StaffSnapshot(self.rows)),
-                  patch.object(restart, "pane_workers", return_value=False),
+                  patch.object(restart.worker_panes, "observe", return_value=[
+                      worker_panes.OpenWorker(self.rows[1], "worker-pane", "worker-terminal", herdr.AgentStatus.IDLE)]),
                   patch.object(herdr.Herdr, "panes", return_value=[{**self.panes()[0], "session_id": identity}],
                                side_effect=herdr.HerdrFailure("socket unavailable") if unavailable else None),
                   patch.object(herdr, "saved_layout", return_value=layout),
@@ -1655,7 +1651,6 @@ class RestartTests(RestartTestCase):
         self.running.clear()
         shutdown_record.save([str(holder.id), str(child.id)])
         with (patch.object(staff, "initial_snapshot", return_value=record),
-              patch.object(unit_runs, "worker_transport", return_value="herdr"),
               patch.object(worker, "restore", side_effect=[worker.ExitCode.UNCERTAIN, worker.ExitCode.OK]) as restore):
             self.assertEqual(restart.restart(), 0)
             self.assertEqual(shutdown_record.read(), [str(holder.id), str(child.id)])
@@ -1681,7 +1676,6 @@ class RestartTests(RestartTestCase):
 
         shutdown_record.save([str(row.id) for row in record.rows])
         with (patch.object(staff, "initial_snapshot", return_value=record),
-              patch.object(unit_runs, "worker_transport", return_value="herdr"),
               patch.object(worker, "restore", side_effect=restore)):
             self.assertEqual(restart.restart(), 0)
             self.assertEqual(len(shutdown_record.read()), 3)
@@ -1693,10 +1687,7 @@ class RestartTests(RestartTestCase):
 
         child = children[0]
         self.running.add(str(child.current_session))
-        from scripts.herdr import worker_panes
-
         with (patch.object(staff, "initial_snapshot", return_value=record),
-              patch.object(unit_runs, "worker_transport", return_value="herdr"),
               patch.object(worker_panes, "observe") as observe):
             self.assertTrue(restart.stop_row(child, herdr.Herdr("fixture")))
         observe.assert_not_called()
@@ -1742,7 +1733,6 @@ class RetainedSplitRestartTests(RestartTestCase):
             "phase": {"id": "earlier", "title": "Earlier", "instance_id": "earlier-phase",
                       "started_at": 1, "status": "active"},
             "pass": {}, "history_file": str(run / "history.jsonl")}))
-        write_text_atomic(run / "worker_transport", "herdr\n")
         prompt = run / "prompt.md"
         write_text_atomic(prompt, "Preserve the source behavior.\n")
         for row in children:

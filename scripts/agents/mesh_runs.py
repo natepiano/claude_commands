@@ -32,7 +32,6 @@ from pathlib import Path
 from types import FrameType
 from typing import Literal, NotRequired, TypedDict, cast
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.agents import mesh_run_process, worker_lifecycle
 from scripts.buildlog import treekey
 from scripts.lib import conf, unit_runs

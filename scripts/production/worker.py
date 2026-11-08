@@ -19,14 +19,14 @@ import subprocess
 import sys
 from typing import cast, final
 
-from scripts.agents import codex_mesh, mesh_runs
+from scripts.agents import mesh_runs, worker_lifecycle
 from scripts.accounts import accounts
-from scripts.direct import board_json, progress_history
+from scripts.direct import progress_history
 from scripts.herdr import worker_panes
 from scripts.lib import atomic_file, conf, unit_runs
 from scripts.lib.resume_message import BusyPass, IdleWorker, NoOwnPass, NO_OWN_PASS, PaneWorkerResume, ResumeWorkers, launcher_prompt
 from scripts.lib.script_envelope import script_prompt
-from scripts.production import session_staff, staff, worker_admission
+from scripts.production import staff, worker_admission
 from scripts.shutdown import member_account
 
 from scripts.herdr import herdr
@@ -178,7 +178,7 @@ def dispatch_receipt(row: staff.StaffRow, line: str, dispatch_id: str, *, run: P
     passed = worker_panes.worker_pass(row, run)
     started = passed.get("started_at", 0)
     since = float(started) if isinstance(started, (int, float)) else 0
-    directory = run / codex_mesh.DETACHED_RUNS_DIR
+    directory = run / worker_lifecycle.DETACHED_RUNS_DIR
     pending = mesh_runs.delivered_worker_results(directory, row.name, since=since) - received
     live = mesh_runs.live_runs(directory, row.name)
     pending.update(record["run_id"] for record in live)
@@ -240,7 +240,7 @@ def dispatch(parent: StaffId, name: WorkerName, role: WorkerRole, prompt: Path, 
              session_dir: Path, slot: str, phase: str, kind: str, launcher_command: list[str],
              lens: str = "", reply: Path | ReplyBesidePrompt = REPLY_BESIDE_PROMPT, fix_cause: str = "",
              fix_pass: int = 0, activity: str = "", early_ready: Path | SingleStageReview = SINGLE_STAGE_REVIEW,
-             policy: worker_panes.LaunchPolicy | None = None,
+             policy: worker_panes.UseRolePolicy | worker_panes.LaunchPolicy = worker_panes.UseRolePolicy.CURRENT,
              started: worker_panes.OpenWorker | StartAtDispatch = START_AT_DISPATCH) -> ExitCode:
     """Hold one worker through startup, pass recording, submission, and completion."""
     prompt = prompt.resolve()
@@ -290,7 +290,7 @@ def dispatch(parent: StaffId, name: WorkerName, role: WorkerRole, prompt: Path, 
 
 
 def _wait_for_ready(ready: Path) -> None:
-    watch = codex_mesh.LinuxFileChanges({ready}) if sys.platform.startswith("linux") else codex_mesh.KqueueFileChanges({ready})
+    watch = worker_lifecycle.LinuxFileChanges({ready}) if sys.platform.startswith("linux") else worker_lifecycle.KqueueFileChanges({ready})
     try:
         wake, cancel = socket.socketpair()
         with wake, cancel:
@@ -304,16 +304,16 @@ def _wait_for_dispatch(row: staff.StaffRow, line: str, dispatch_id: str, run: Pa
     backend = staff.backend(row)
     if isinstance(backend, staff.BackendUnavailable):
         return False
-    directory = run / codex_mesh.DETACHED_RUNS_DIR
+    directory = run / worker_lifecycle.DETACHED_RUNS_DIR
     paths = {worker_admission.transcript_source(row, backend), *directory.glob("*.json")}
-    watch = codex_mesh.LinuxFileChanges(paths) if sys.platform.startswith("linux") else codex_mesh.KqueueFileChanges(paths)
+    watch = worker_lifecycle.LinuxFileChanges(paths) if sys.platform.startswith("linux") else worker_lifecycle.KqueueFileChanges(paths)
     try:
         wake, cancel = socket.socketpair()
         with wake, cancel:
             if isinstance(dispatch_receipt(row, line, dispatch_id, run=run),
                           (DispatchWaitingForRuns, DispatchAwaitingReply)):
                 return isinstance(watch.wait(wake, time.monotonic() + herdr.PROGRAM_TIMEOUT_SECONDS),
-                                  codex_mesh.StateFilesChanged)
+                                  worker_lifecycle.StateFilesChanged)
             return True
     finally:
         watch.close()
@@ -544,29 +544,21 @@ def own_pass(row: staff.StaffRow, record: staff.StaffSnapshot) -> BusyPass | NoO
 
 
 def resume_workers(parent: StaffId, record: staff.StaffSnapshot) -> ResumeWorkers:
-    """Supply pane dispatch ids and retained mesh seats to the shared builder."""
-    from scripts.shutdown.inventory import worker_resumes
+    """Supply pane dispatch ids to the shared builder."""
 
     holder = record.by_id(parent)
     if holder is None:
         return ResumeWorkers()
-    runs = [Path(run) for run in unit_runs.held(str(holder.current_session),
-        os.environ.get("ROSTER_RUN_ROOT"), record=record)]
-    mesh = [run for run in runs if unit_runs.worker_transport(run) == "mesh"]
     panes: list[PaneWorkerResume] = []
     run = worker_panes.worker_run(holder)
-    for row in record.find(kind="worker", parent=parent) if not mesh else ():
+    for row in record.find(kind="worker", parent=parent):
         active = progress_history.active_dispatch(row.id, run)
         if isinstance(active, progress_history.ActiveDispatchUnavailable):
             print(f"anomaly: {row.name}: {active.reason}", file=sys.stderr)
             continue
         panes.append(PaneWorkerResume(row.id, BusyPass(active.instance_id)
             if isinstance(active, progress_history.ActiveDispatch) else IdleWorker()))
-    return ResumeWorkers(worker_resumes(holder, record) if mesh else [], str(session_staff.worker_directory(record, parent)) if mesh else "", panes)
-
-@dataclass(frozen=True)
-class MeshWorkerRows:
-    rows: list[dict[str, object]]
+    return ResumeWorkers([], panes=panes)
 
 
 @dataclass(frozen=True)
@@ -575,11 +567,8 @@ class PaneWorkerStates:
     runs: list[Path]
 
 
-def _read_workers(parent: staff.StaffRow, record: staff.StaffSnapshot) -> MeshWorkerRows | PaneWorkerStates:
+def _read_workers(parent: staff.StaffRow, record: staff.StaffSnapshot) -> PaneWorkerStates:
     runs = unit_runs.held(str(parent.current_session), os.environ.get("ROSTER_RUN_ROOT"), record=record)
-    if runs and unit_runs.parent_transport(str(parent.current_session),
-            scanned={str(parent.current_session): runs}, record=record) == "mesh":
-        return MeshWorkerRows(board_json.workers(Path(runs[0]), set(), record=record))
     return PaneWorkerStates(worker_panes.observe(parent.id, record), [Path(run) for run in runs])
 
 
@@ -589,9 +578,6 @@ def restore(parent: StaffId) -> ExitCode:
     changed = False
     outcome = ExitCode.OK
     observed = _read_workers(next(row for row in record.rows if row.id == parent), record)
-    if isinstance(observed, MeshWorkerRows):
-        print("unchanged")
-        return ExitCode.OK
     with progress_history.dispatch_reads(record, observed.runs):
         for state in observed.states:
             if isinstance(state, (worker_panes.ProcessUnknownWorker, worker_panes.UncertainWorker)):
@@ -630,16 +616,6 @@ def restore(parent: StaffId) -> ExitCode:
 def list_workers(parent: StaffId, record: staff.StaffSnapshot) -> list[dict[str, object]]:
     listing: list[dict[str, object]] = []
     observed = _read_workers(next(row for row in record.rows if row.id == parent), record)
-    if isinstance(observed, MeshWorkerRows):
-        members = {row.name: row for row in record.find(kind="worker", parent=parent)}
-        for row in observed.rows:
-            fields = {key: row.get(key, "") for key in ("name", "role", "state")}
-            fields["activity"] = row.get("doing", "")
-            member = members.get(str(fields["name"]))
-            if member is not None:
-                fields.update(id=str(member.id), current_session=str(member.current_session))
-            listing.append(fields)
-        return listing
     with progress_history.dispatch_reads(record, observed.runs):
         for state in observed.states:
             role = worker_panes.dispatch_role(state.row)
@@ -735,11 +711,6 @@ def main(arguments: list[str] | None = None) -> int:
             return ExitCode.OK
         if args.command == "check":
             observed = _read_workers(owner, record)
-            if isinstance(observed, MeshWorkerRows):
-                incomplete = [row for row in observed.rows if row.get("state") == "incomplete"]
-                for row in incomplete:
-                    print(f"{row.get('slot') or row.get('name')}: {row.get('doing', '')}")
-                return int(bool(incomplete))
             with progress_history.dispatch_reads(record, observed.runs):
                 wrong = [state for state in observed.states
                          if not isinstance(state, (worker_panes.OpenWorker, worker_panes.StoppedWorker, worker_panes.ClosedWorker))
