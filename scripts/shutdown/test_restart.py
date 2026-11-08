@@ -23,6 +23,8 @@ from scripts.shutdown import restart, shutdown
 from scripts.shutdown.unit_staff_test_support import unit_host
 from scripts.production import fake_unit_host, session_staff, staff
 from scripts.accounts import accounts
+from scripts.whoami import agent_accounts, note_file
+from scripts.whoami.account import Account, UnknownAccountName
 from scripts.message import codex_daemon
 from scripts.shutdown import shutdown_record, stop_resume, pane_record
 from scripts.lib import unit_runs
@@ -395,6 +397,7 @@ class RestartTests(RestartTestCase):
                                                      "XDG_STATE_HOME": str(self.root), "HOME": str(self.root),
                                                      "CODEX_HOME": str(self.root / ".codex"),
                                                      "CLAUDE_CONFIG_DIR": str(config)})))
+        _ = self.enterContext(patch.object(herdr.Herdr, "run_in_pane"))
         self.rows = tuple(staff.StaffRow(staff.StaffId(f"row-{n}"), "unit", f"unit-{n}", staff.StaffRoot(),
             current_session=staff.StaffId(f"conversation-{n}"),
             worktree=staff.PresentWorktree(remote.local_machine(), self.root)) for n in range(3))
@@ -488,6 +491,215 @@ class RestartTests(RestartTestCase):
         self.launches.append((agent, destination))
         self.running.add(str(row.current_session))
         return herdr.AgentLaunched(f"w1:p{self.rows.index(row)}", herdr.PromptSubmissionNotRequired())
+
+    def account_processes(self) -> None:
+        def observe(identity: str, _kind: str = "", *,
+                    codex: herdr.CodexConversations | None = None) -> herdr.LiveConversation:
+            _ = codex
+            index = next(index for index, row in enumerate(self.rows) if row.current_session == identity)
+            return herdr.LiveConversation("claude", (990100 + index,))
+
+        _ = self.enterContext(patch.object(herdr, "read_conversation", side_effect=observe))
+        def environment(pid: int) -> dict[str, str]:
+            return {"CLAUDE_CONFIG_DIR": str(self.root / (".claude3" if pid == 990100 else ".claude2"))}
+
+        _ = self.enterContext(patch.object(herdr, "process_environment", side_effect=environment))
+        _ = self.enterContext(patch.object(shutdown, "named_claude_account",
+            return_value=Account("claude", "test@example.invalid", "claude3")))
+
+    def test_restart_account_all_dry_run_lists_only_matching_live_rows(self) -> None:
+        self.account_processes()
+        shutdown_record.update(started=[], pending=[str(self.rows[2].id)])
+        with redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(shutdown.main(["restart", "claude3", "--all", "--dry-run"]), 0)
+        self.assertIn(self.rows[0].name + ":", output.getvalue())
+        self.assertNotIn(self.rows[1].name + ":", output.getvalue())
+        self.assertNotIn(self.rows[2].name + ":", output.getvalue())
+        self.assertEqual(self.stops, [])
+
+    def test_restart_account_all_stops_and_starts_only_matching_rows_on_that_account(self) -> None:
+        self.account_processes()
+        with (patch.object(restart, "stop_row") as stop,
+              patch.object(restart, "start_row", return_value="w1:p0") as start,
+              patch.object(staff, "row_operation"),
+              redirect_stdout(io.StringIO())):
+            self.assertEqual(shutdown.main(["restart", "claude3", "--all"]), 0)
+        self.assertEqual([item.args[0] for item in stop.call_args_list], [self.rows[0]])
+        self.assertEqual([item.args[0] for item in start.call_args_list], [self.rows[0]])
+        self.assertEqual(start.call_args.kwargs["target_account"],
+                         accounts.NamedAccount("claude3", self.root / ".claude3"))
+
+    def test_restart_codex_account_filters_live_process_homes(self) -> None:
+        def observe(identity: str, _kind: str = "", *,
+                    codex: herdr.CodexConversations | None = None) -> herdr.LiveConversation:
+            _ = codex
+            index = next(index for index, row in enumerate(self.rows) if row.current_session == identity)
+            return herdr.LiveConversation("codex", (990100 + index,))
+
+        def environment(pid: int) -> dict[str, str]:
+            return {"CODEX_HOME": str(self.root / (".codex1" if pid == 990100 else ".codex2"))}
+
+        with (patch.object(herdr, "read_conversation", side_effect=observe),
+              patch.object(herdr, "process_environment", side_effect=environment),
+              patch.object(agent_accounts, "codex_account_home",
+                  return_value=agent_accounts.CodexSetupHome("codex1", self.root / ".codex1")),
+              patch.object(note_file, "read_note",
+                  return_value=note_file.Note(self.root / "codex1.md", "codex", "", 0, 0, "codex1")),
+              redirect_stdout(io.StringIO()) as output):
+            self.assertEqual(shutdown.main(["restart", "codex1", "--all", "--dry-run"]), 0)
+        self.assertIn(self.rows[0].name + ":", output.getvalue())
+        self.assertNotIn(self.rows[1].name + ":", output.getvalue())
+        self.assertNotIn(self.rows[2].name + ":", output.getvalue())
+
+    def test_restart_account_without_all_filters_saved_session_accounts(self) -> None:
+        self.account_processes()
+        self.running.clear()
+        shutdown_record.update(started=[], pending=[str(row.id) for row in self.rows])
+
+        def saved(identity: str, name: str) -> tuple[Literal["claude"], dict[str, str], list[str]]:
+            return "claude", {"CLAUDE_CONFIG_DIR": str(self.root / (
+                ".claude3" if identity == self.rows[0].current_session else ".claude2"))}, [
+                    "--resume", identity, "--name", name]
+
+        with (patch.object(restart, "session_launch", side_effect=saved),
+              redirect_stdout(io.StringIO()) as output):
+            self.assertEqual(shutdown.main(["restart", "claude3", "--dry-run"]), 0)
+        self.assertIn(self.rows[0].name + ":", output.getvalue())
+        self.assertNotIn(self.rows[1].name + ":", output.getvalue())
+        self.assertNotIn(self.rows[2].name + ":", output.getvalue())
+        self.assertEqual(shutdown_record.read(), [str(row.id) for row in self.rows])
+
+    def test_restart_all_only_dry_run_lists_only_the_requested_live_row(self) -> None:
+        self.account_processes()
+        for account, requested in (([], self.rows[0]), (["claude3"], self.rows[1])):
+            with self.subTest(account=account), redirect_stdout(io.StringIO()) as output:
+                self.assertEqual(shutdown.main(["restart", *account, "--all", "--only",
+                    str(requested.id), "--dry-run"]), 0)
+                self.assertEqual([line.split(":", 1)[0] for line in output.getvalue().splitlines()],
+                                 [self.rows[0].name] if not account else [])
+
+    def test_restart_all_only_stops_and_starts_only_the_requested_live_row(self) -> None:
+        with (patch.object(restart, "live_rows", return_value=list(self.rows)),
+              patch.object(restart, "stop_row") as stop,
+              patch.object(restart, "start_row", return_value="w1:p0") as start,
+              patch.object(staff, "row_operation")):
+            self.assertEqual(restart.restart(stop_all=True, only=(str(self.rows[0].id),)), 0)
+        self.assertEqual([item.args[0] for item in stop.call_args_list], [self.rows[0]])
+        self.assertEqual([item.args[0] for item in start.call_args_list], [self.rows[0]])
+
+    def test_restart_selected_caller_detaches_before_any_stop(self) -> None:
+        for variable in ("CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID"):
+            with (self.subTest(variable=variable),
+                  patch.dict(os.environ, {variable: str(self.rows[0].current_session)}),
+                  patch.object(restart, "live_rows", return_value=list(self.rows)),
+                  patch.object(stop_resume, "detach", create=True, return_value=self.root / "restart.log") as detach,
+                  patch.object(restart, "stop_row") as stop,
+                  patch.object(restart, "start_row") as start,
+                  patch.object(staff, "row_operation"),
+                  redirect_stdout(io.StringIO()) as output):
+                self.assertEqual(restart.restart(stop_all=True, only=(str(self.rows[0].id),)), 0)
+                detach.assert_called_once()
+                stop.assert_not_called()
+                start.assert_not_called()
+                self.assertIn(str(self.root / "restart.log"), output.getvalue())
+                self.assertEqual(len(output.getvalue().splitlines()), 1)
+
+    def test_restart_only_keeps_worker_and_owner_operations_within_selected_rows(self) -> None:
+        owner = self.rows[0]
+        children = tuple(replace(row, kind="worker", parent=staff.ReportsTo(owner.id)) for row in self.rows[1:])
+        record = staff.StaffSnapshot((owner, *children))
+        for selected in (owner, children[0]):
+            with (self.subTest(selected=selected.id),
+                  patch.object(staff, "initial_snapshot", return_value=record),
+                  patch.object(restart, "live_rows", return_value=list(record.rows)),
+                  patch.object(unit_runs, "worker_transport", return_value="herdr"),
+                  patch.object(restart.stop_resume, "stop_unit_workers") as stop_workers,
+                  patch.object(restart, "stop_row") as stop,
+                  patch.object(restart, "start_row", return_value="w1:p1") as start,
+                  patch.object(staff, "row_operation")):
+                self.assertEqual(restart.restart(stop_all=True, only=(str(selected.id),)), 0)
+                self.assertEqual([item.args[0] for item in stop.call_args_list], [selected])
+                self.assertEqual([item.args[0] for item in start.call_args_list], [selected])
+                stop_workers.assert_not_called()
+
+    def test_start_row_resumes_one_worker_without_starting_its_owner(self) -> None:
+        owner = self.rows[0]
+        child = replace(self.rows[1], kind="worker", parent=staff.ReportsTo(owner.id))
+        self.rows = (owner, child, self.rows[2])
+        self.running.remove(str(child.current_session))
+        with (patch.object(unit_runs, "worker_transport", return_value="herdr"),
+              redirect_stdout(io.StringIO())):
+            self.assertEqual(restart.start_row(child, staff.StaffSnapshot(self.rows), herdr.Herdr("agents")), "w1:p1")
+        self.assertEqual([name for name, _pane in self.launches], [child.name])
+        self.assertIn(str(owner.current_session), self.running)
+
+    def test_account_filter_selects_a_hosted_codex_thread_by_its_daemon_home(self) -> None:
+        row = self.rows[0]
+        home = self.root / ".codex1"
+        observed = codex_daemon.DaemonRead(codex_daemon.CodexDaemon(home, home / "control.sock"), [
+            codex_daemon.DaemonSession(str(row.current_session), row.name, str(self.root), "idle")])
+        with (patch.object(herdr, "read_conversation", return_value=herdr.LiveConversation("codex", ())),
+              patch.object(codex_daemon, "read_daemons", return_value=[observed])):
+            self.assertEqual(restart.live_members([row], staff.StaffSnapshot(self.rows),
+                codex=herdr.CodexConversations({str(row.current_session): ()}, ()),
+                account=accounts.CodexWorkersAccount("codex1", home)), [row])
+
+    def test_restart_rejects_a_codex_label_without_an_account_note(self) -> None:
+        with (patch.object(note_file, "read_note", return_value=note_file.NotAccountNote(self.root / "missing.md")),
+              patch.object(agent_accounts, "codex_account_home",
+                  return_value=agent_accounts.CodexSetupHome("codex987654321", self.root / ".codex987654321")),
+              patch.object(restart, "restart") as run,
+              redirect_stderr(io.StringIO()) as errors):
+            self.assertEqual(shutdown.main(["restart", "codex987654321", "--all"]), 2)
+        run.assert_not_called()
+        self.assertEqual(len(errors.getvalue().splitlines()), 1)
+
+    def test_account_filters_partition_an_owner_and_its_workers_by_their_own_accounts(self) -> None:
+        from scripts.herdr import worker_panes
+
+        self.account_processes()
+        owner = self.rows[0]
+        children = tuple(replace(row, kind="worker", parent=staff.ReportsTo(owner.id)) for row in self.rows[1:])
+        record = staff.StaffSnapshot((owner, *children))
+        states = [worker_panes.OpenWorker(row, f"w1:p{index}", f"terminal-{index}", herdr.AgentStatus.IDLE)
+                  for index, row in enumerate(children, 1)]
+        with (patch.object(unit_runs, "worker_transport", return_value="herdr"),
+              patch.object(worker_panes, "observe", return_value=states)):
+            for label, expected in (("claude3", [owner]), ("claude2", list(children))):
+                with self.subTest(account=label):
+                    self.assertEqual(restart.live_rows(record, herdr.Herdr("agents"),
+                        account=accounts.NamedAccount(label, self.root / ("." + label))), expected)
+
+    def test_restart_names_unclassified_claude_and_codex_workers_once_without_acting(self) -> None:
+        row = replace(self.rows[0], kind="worker")
+        for kind in ("claude", "codex"):
+            account = (accounts.NamedAccount("claude3", self.root / ".claude3") if kind == "claude" else
+                       accounts.CodexWorkersAccount("codex1", self.root / ".codex1"))
+            for dry_run in (False, True):
+                with (self.subTest(kind=kind, dry_run=dry_run),
+                      patch.object(staff, "initial_snapshot", return_value=staff.StaffSnapshot((row,))),
+                      patch.object(sessions, "running_sessions", return_value=[]),
+                      patch.object(herdr, "read_conversation",
+                          return_value=herdr.LiveConversation(kind, ())),
+                      patch.object(restart, "stop_row") as stop,
+                      patch.object(restart, "start_row") as start,
+                      redirect_stdout(io.StringIO()) as output):
+                    self.assertEqual(restart.restart(stop_all=True, dry_run=dry_run, account=account), 0)
+                    self.assertEqual(output.getvalue().splitlines(),
+                                     [f"{row.name}: left alone; account unknown"])
+                    stop.assert_not_called()
+                    start.assert_not_called()
+
+    def test_restart_unknown_account_returns_two_before_any_stop(self) -> None:
+        with (patch.object(shutdown, "named_claude_account",
+                  side_effect=UnknownAccountName("unknown account: missing")),
+              patch.object(restart, "stop_row") as stop,
+              patch.object(restart, "start_row") as start,
+              redirect_stderr(io.StringIO()) as errors):
+            self.assertEqual(shutdown.main(["restart", "missing", "--all"]), 2)
+        stop.assert_not_called()
+        start.assert_not_called()
+        self.assertEqual(len(errors.getvalue().splitlines()), 1)
 
     def test_restart_uses_each_reader_outcome_for_both_runtimes(self) -> None:
         self.running.clear()
@@ -759,6 +971,29 @@ class RestartTests(RestartTestCase):
             self.assertEqual(restart.start_row(row, staff.StaffSnapshot(self.rows), herdr.Herdr("agents")), "w1:p0")
         self.assertEqual(prepare.call_args.args[2]["CLAUDE_CONFIG_DIR"], str(target))
 
+    def test_start_row_without_a_role_uses_units_unless_the_target_is_explicit(self) -> None:
+        self.running.clear()
+        row = replace(self.rows[0], kind="agent")
+        source, target = self.root / ".claude3", self.root / ".claude2"
+        entry = pane_record.launch("w1:p0", str(row.current_session), str(self.root),
+            {"CLAUDE_CONFIG_DIR": str(source)}, ["claude", "--resume", str(row.current_session)])
+        for requested, expected in (("", target), ("claude3", source)):
+            with (self.subTest(target=requested),
+                  patch.object(pane_record, "publication_for_session",
+                      return_value=pane_launch.LaunchPublication(self.root / "agents.json", entry)),
+                  patch.object(accounts, "role_account", return_value=accounts.NamedAccount("claude2", target)) as role,
+                  patch.object(herdr, "prepare_session_environment",
+                      return_value=herdr.PreparedAgentEnvironment(self.root, {})) as prepare,
+                  patch.object(herdr, "launch_prepared_agent", return_value=herdr.AgentLaunched(
+                      "w1:p0", herdr.PromptSubmissionNotRequired()))):
+                self.assertEqual(restart.start_row(row, staff.StaffSnapshot((row,)), herdr.Herdr("agents"),
+                                                  target_account=requested), "w1:p0")
+                self.assertEqual(prepare.call_args.args[2]["CLAUDE_CONFIG_DIR"], str(expected))
+                if requested:
+                    role.assert_not_called()
+                else:
+                    role.assert_called_once_with("unit")
+
     def test_account_trust_with_the_same_account_keeps_the_file(self) -> None:
         target = self.root / ".claude2"
         before = (target / ".claude.json").read_text()
@@ -929,19 +1164,18 @@ class RestartTests(RestartTestCase):
                         self.assertEqual(restart.restart(stop_all=stop_all, only=(reference,)), 0)
                     self.assertEqual(path.read_bytes() if path.exists() else None, before)
                     start.assert_not_called()
-                    expected = self.rows if stop_all else self.rows[:1]
                     self.assertEqual(errors.getvalue().splitlines(),
-                        (["another-pending-row: restart anomaly: in the restart record, no fixed staff id"]
-                         if stop_all and saved else []) +
-                        [f"{row.name}: restart anomaly: row is locked" for row in expected])
+                        [f"{self.rows[0].name}: restart anomaly: row is locked"])
 
     def test_restart_record_delta_keeps_another_runs_failed_row(self) -> None:
         self.running.clear()
         other = "another-failed-row"
 
         def start(_row: staff.StaffRow, _record: staff.StaffSnapshot, _client: herdr.Herdr, *,
-                  present: bool, resolver: session_staff.RowResolver) -> None:
-            _ = present, resolver
+                  present: bool, resolver: session_staff.RowResolver,
+                  target_account: str | accounts.AccountSelection,
+                  worker_scope: restart.WorkerRestartScope) -> None:
+            _ = present, resolver, target_account, worker_scope
             shutdown_record.update(started=[], pending=[other])
 
         shutdown_record.save([str(self.rows[0].id), str(self.rows[1].id)])

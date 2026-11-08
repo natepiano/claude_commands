@@ -329,7 +329,22 @@ class SharedCPUSlot:
 @dataclass
 class SharedCPUPool:
     descriptor: int
+    blocking: int
     owned: list[SharedCPUSlot] = field(default_factory=list)
+
+    def acquire(self) -> SharedCPUSlot:
+        """Wait in the pool's reader queue while no module runs."""
+        started = time.monotonic()
+        print("waits for a CPU slot", flush=True)
+        try:
+            token = os.read(self.blocking, 1)
+            if not token:
+                raise GateRefused("shared CPU pool returned no byte")
+            slot = SharedCPUSlot(self.descriptor, token)
+            self.owned.append(slot)
+            return slot
+        finally:
+            print(f"CPU slot wait ended after {time.monotonic() - started:.3f} s", flush=True)
 
     def try_acquire(self) -> SharedCPUSlot | WaitingForCPU:
         with defer_cleanup_signals():
@@ -357,19 +372,23 @@ def shared_cpu_pool() -> Generator[SharedCPUPool | NoSharedCPU]:
         return
     except OSError as error:
         raise GateRefused(f"shared CPU pool {path}: {error}") from error
-    pool = SharedCPUPool(descriptor)
     try:
         mode = os.fstat(descriptor).st_mode
         if not (stat.S_ISFIFO(mode) or stat.S_ISCHR(mode)):
             raise GateRefused(f"shared CPU pool is not a FIFO or character device: {path}")
-        yield pool
+        blocking = os.open(path, os.O_RDWR | os.O_CLOEXEC)
+        pool = SharedCPUPool(descriptor, blocking)
+        try:
+            yield pool
+        finally:
+            with defer_cleanup_signals():
+                try:
+                    for slot in pool.owned:
+                        slot.release()
+                finally:
+                    os.close(blocking)
     finally:
-        with defer_cleanup_signals():
-            try:
-                for slot in pool.owned:
-                    slot.release()
-            finally:
-                os.close(descriptor)
+        os.close(descriptor)
 
 
 def merge_gate_governor_gib() -> float:
@@ -1145,9 +1164,18 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
                         if not running:
                             hold.wait_until_free()
                         break
-                    slot = cpu_pool.try_acquire() if isinstance(cpu_pool, SharedCPUPool) else cpu_pool
-                    if isinstance(slot, WaitingForCPU):
-                        break
+                    if isinstance(cpu_pool, SharedCPUPool):
+                        slot = cpu_pool.try_acquire()
+                        if isinstance(slot, WaitingForCPU):
+                            if running:
+                                break
+                            slot = cpu_pool.acquire()
+                            if hold is not None and not hold.admits():
+                                slot.release()
+                                hold.wait_until_free()
+                                break
+                    else:
+                        slot = cpu_pool
                     request = pending.popleft()
                     suite, path = request.suite, request.path
                     root = build_folders.create_build_folder(build_folders.UniqueBuildFolder(
