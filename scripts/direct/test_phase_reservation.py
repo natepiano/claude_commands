@@ -589,12 +589,20 @@ REPAIR_BERTH = r'''#!__PYTHON__
 import json, os, sys
 with open(os.environ["REPAIR_BERTH_LOG"], "a") as log:
     log.write(json.dumps(sys.argv[1:]) + "\n")
+if sys.argv[1] == "check":
+    print(json.dumps({"status": "clear", "payload": {"data": {"acquisition": {
+        "reservation_id": "r2", "coordination_run_id": "c2",
+        "phase_start_head": os.environ["REPAIR_CLAIM_HEAD"]}}}}))
+    sys.exit(0)
 assert sys.argv[1:3] == ["board", "--reservation"]
 statuses = json.load(open(os.environ["REPAIR_BOARD"]))
 print(json.dumps({"payload": {"data": {"lifecycle": {"status": statuses.get(sys.argv[3], "released")}}}}))
 '''
 REPAIR_BOARD_POST = r'''#!__PYTHON__
 import json, os, sys
+if os.environ.get("REPAIR_POST_FAIL") == "1":
+    print("fixture board unavailable", file=sys.stderr)
+    sys.exit(1)
 with open(os.environ["REPAIR_POST_LOG"], "a") as log:
     log.write(json.dumps(sys.argv[1:]) + "\n")
 '''
@@ -681,7 +689,10 @@ class PhaseRepairTests(unittest.TestCase):
             for session, reservation in sessions.items()}}))
 
     def repair(self, *arguments: str) -> subprocess.CompletedProcess[str]:
-        return subprocess.run([sys.executable, phase_reservation.__file__, "repair", "--session-dir",
+        return self.run_verb("repair", *arguments)
+
+    def run_verb(self, verb: str, *arguments: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run([sys.executable, phase_reservation.__file__, verb, "--session-dir",
                                str(self.session), "--phase", "34h", "--repo", str(self.repo), *arguments],
                               env=self.environment, capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
 
@@ -723,6 +734,122 @@ class PhaseRepairTests(unittest.TestCase):
 
     def test_no_mapping_prints_reopen_commands_without_writing(self) -> None:
         self.assert_reopen_refusal(self.repair())
+
+    def test_a_checkpoint_released_active_record_can_claim_a_new_reservation(self) -> None:
+        _ = subprocess.run(["git", "-C", str(self.repo), "-c", "user.name=Test",
+                            "-c", "user.email=test@example.invalid", "commit", "-q", "--allow-empty", "-m", "base"],
+                           check=True, capture_output=True, timeout=TEST_HANG_GUARD_SECS)
+        head = phase_reservation.commit_id(self.repo, "HEAD")
+        self.environment["REPAIR_CLAIM_HEAD"] = head
+        _ = (self.directory / phase_reservation.BASELINE_FILE).write_text(head + "\n")
+        _ = (self.directory / phase_reservation.BASELINE_STATUS_FILE).write_text("?? existing.txt\n")
+        _ = (self.directory / phase_reservation.FILES_FILE).write_text("changed.txt\n")
+        for status in ("released_after_checkpoint", "outstanding"):
+            for mapping, post_failure in (({}, False), ({DIRECTOR_SESSION + ".phase-34h": "r1"}, False), ({}, True)):
+                with self.subTest(status=status, mapping=mapping, post_failure=post_failure):
+                    for path in (self.directory / phase_reservation.STATE_FILE,
+                                 self.directory / phase_reservation.REPAIRS_FILE,
+                                 self.root / "posts.log", self.root / "berth.log"):
+                        path.unlink(missing_ok=True)
+                    _ = phase_reservation.enroll(self.directory, "34h", "board_ready")
+                    self.assertTrue(phase_reservation.record_active(
+                        self.directory, phase_reservation.Acquisition("r1", "c1", head)))
+                    self.map_sessions(mapping)
+                    self.board({"r1": status})
+                    kept = {name: (self.directory / name).read_bytes() for name in (
+                        phase_reservation.BOARD_RESULT_FILE, phase_reservation.BASELINE_FILE,
+                        phase_reservation.BASELINE_STATUS_FILE, phase_reservation.FILES_FILE)}
+                    if post_failure:
+                        original = (self.directory / phase_reservation.STATE_FILE).read_bytes()
+                        self.environment["REPAIR_POST_FAIL"] = "1"
+                        try:
+                            failed = self.repair()
+                        finally:
+                            del self.environment["REPAIR_POST_FAIL"]
+                        self.assertEqual(failed.returncode, 1, failed.stdout + failed.stderr)
+                        self.assertEqual((self.directory / phase_reservation.STATE_FILE).read_bytes(), original)
+                        self.assertEqual(failed.stdout, "")
+                        self.assertEqual(len(failed.stderr.splitlines()), 1)
+                        self.assertIn("board post failed", failed.stderr)
+                        self.assertIn("record unchanged", failed.stderr)
+                        self.assertEqual(len((self.directory / phase_reservation.REPAIRS_FILE).read_text().splitlines()), 1)
+                        retried = self.repair()
+                        self.assertEqual(retried.returncode, 0, retried.stdout + retried.stderr)
+                        self.assertEqual(self.state(), {"kind": "enrolled_awaiting_first_touch", "phase": "34h"})
+                        self.assertEqual(shlex.split(retried.stdout.splitlines()[-1]), [
+                            "python3", str(Path(phase_reservation.__file__).resolve()), "claim", "--session-dir",
+                            str(self.session), "--phase", "34h", "--repo", str(self.repo)])
+                        retry_lines = (self.directory / phase_reservation.REPAIRS_FILE).read_text().splitlines()
+                        self.assertEqual(len(retry_lines), 2)
+                        for line in retry_lines:
+                            self.assertIn("reservation_id=r1", line)
+                            self.assertIn("board_status=" + status, line)
+                        retry_posts = (self.root / "posts.log").read_text().splitlines()
+                        self.assertEqual([cast(list[str], json.loads(post)) for post in retry_posts], [[
+                            str(Path(phase_reservation.__file__).with_name("board.sh")), "post", str(self.session),
+                            "director", "status", retry_lines[-1]]])
+                        self.assertEqual({name: (self.directory / name).read_bytes() for name in kept}, kept)
+                        continue
+                    result = self.repair()
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                    self.assertEqual(self.state(), {"kind": "enrolled_awaiting_first_touch", "phase": "34h"})
+                    self.assertEqual({name: (self.directory / name).read_bytes() for name in kept}, kept)
+                    self.assertFalse((self.directory / phase_reservation.RELEASED_FILE).exists())
+                    command = shlex.split(result.stdout.splitlines()[-1])
+                    self.assertEqual(command, ["python3", str(Path(phase_reservation.__file__).resolve()), "claim",
+                                               "--session-dir", str(self.session), "--phase", "34h",
+                                               "--repo", str(self.repo)])
+                    lines = (self.directory / phase_reservation.REPAIRS_FILE).read_text().splitlines()
+                    self.assertEqual(len(lines), 1)
+                    self.assertIsNotNone(datetime.fromisoformat(lines[0].split()[0]).tzinfo)
+                    self.assertIn("phase=34h", lines[0])
+                    self.assertIn("reservation_id=r1", lines[0])
+                    self.assertIn("board_status=" + status, lines[0])
+                    posts = (self.root / "posts.log").read_text().splitlines()
+                    self.assertEqual([cast(list[str], json.loads(post)) for post in posts],
+                                     [[str(Path(phase_reservation.__file__).with_name("board.sh")),
+                                       "post", str(self.session), "director", "status", lines[0]]])
+                    claim = self.run_verb("claim")
+                    self.assertEqual(claim.returncode, 0, claim.stdout + claim.stderr)
+                    self.assertEqual(self.state(), {"kind": "active", "active_phase_reservation": {
+                        "reservation_id": "r2", "coordination_run_id": "c2", "phase": "34h",
+                        "phase_start_head": head}})
+                    calls = [cast(list[str], json.loads(line))
+                             for line in (self.root / "berth.log").read_text().splitlines()]
+                    self.assertEqual([call for call in calls if call[0] == "check"],
+                                     [["check", "changed.txt", "--json"]])
+                    self.assertEqual({name: (self.directory / name).read_bytes() for name in kept}, kept)
+                    self.assertEqual((self.directory / phase_reservation.REPAIRS_FILE).read_text().splitlines(), lines)
+                    self.assertEqual((self.root / "posts.log").read_text().splitlines(), posts)
+
+    def test_an_active_record_without_checkpoint_release_proof_keeps_its_files(self) -> None:
+        for case in ("release_marker", "unreadable_board", "released", "unknown", "finished_phase", "unreadable_mapping"):
+            with self.subTest(case=case):
+                self.recorder_phases("34h")
+                self.map_sessions({})
+                _ = (self.directory / phase_reservation.STATE_FILE).write_text(json.dumps(ACTIVE, indent=2) + "\n")
+                _ = (self.directory / phase_reservation.BOARD_RESULT_FILE).write_text("board_ready\n")
+                marker = self.directory / phase_reservation.RELEASED_FILE
+                marker.unlink(missing_ok=True)
+                self.board({"r1": "released_after_checkpoint"})
+                if case == "release_marker":
+                    _ = marker.write_text("b" * 40 + "\n")
+                elif case == "unreadable_board":
+                    _ = (self.root / "board.json").write_text("not JSON")
+                elif case == "finished_phase":
+                    self.recorder_phases()
+                elif case == "unreadable_mapping":
+                    self.map_sessions({DIRECTOR_SESSION + ".phase-34h": "r2"})
+                    self.board({"r1": "released_after_checkpoint", "r2": ""})
+                else:
+                    self.board({"r1": case})
+                before = {path.name: path.read_bytes() for path in self.directory.iterdir()}
+                result = self.repair()
+                self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                self.assertEqual({path.name: path.read_bytes() for path in self.directory.iterdir()}, before)
+                self.assertNotIn(" enroll ", result.stderr)
+                self.assertNotIn(" claim ", result.stderr)
+                self.assertFalse((self.root / "posts.log").exists())
 
     def test_a_released_mapping_prints_reopen_commands_without_writing(self) -> None:
         self.map_sessions({DIRECTOR_SESSION + ".phase-34h": "r1"})
@@ -790,9 +917,13 @@ class PhaseRepairTests(unittest.TestCase):
         phase_reservation.committed(self.directory, "b" * 40)
         original = (self.directory / phase_reservation.STATE_FILE).read_bytes()
         self.map_sessions({DIRECTOR_SESSION + ".phase-34h": "r1"})
-        self.assertEqual(self.repair().returncode, 2)
-        self.assertEqual((self.directory / phase_reservation.STATE_FILE).read_bytes(), original)
-        self.assertFalse((self.directory / phase_reservation.REPAIRS_FILE).exists())
+        for status in ("active", "outstanding", "released_after_checkpoint"):
+            with self.subTest(status=status):
+                self.board({"r1": status})
+                self.assertEqual(self.repair().returncode, 2)
+                self.assertEqual((self.directory / phase_reservation.STATE_FILE).read_bytes(), original)
+                self.assertFalse((self.directory / phase_reservation.REPAIRS_FILE).exists())
+                self.assertFalse((self.root / "posts.log").exists())
 
     def test_repair_does_not_accept_caller_supplied_reservation_or_run_ids(self) -> None:
         self.map_sessions({DIRECTOR_SESSION + ".phase-34h": "r1"})
