@@ -29,7 +29,7 @@ CODEX_PACER_TIER_FILE="${CODEX_PACER_TIER_FILE:-$HOME/.local/state/codex-pacer/t
 agents_workers_home() {
     "$MODELS_CONFIG_DIR/../lib/py" - "$MODELS_CONFIG_DIR/../.." <<'PY'
 import sys
-sys.path.insert(0, sys.argv[1])
+with open(sys.argv[1] + "/scripts/lib/package_root.py") as package_root: exec(package_root.read(), {"__file__": package_root.name})
 from scripts.whoami.agent_accounts import workers_home
 try:
     print(workers_home())

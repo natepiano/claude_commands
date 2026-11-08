@@ -19,7 +19,8 @@ CONCURRENCY_POLL = '''            deadline = time.monotonic() + TEST_HANG_GUARD_
                 if time.monotonic() >= deadline:
                     self.fail("runner never released the module")
                 time.sleep(0.01)'''
-CONCURRENCY_EVENT = '''            sys.path.insert(0, os.environ["MERGE_GATE_TEST_REPO"])
+CONCURRENCY_EVENT = '''            with open(Path(os.environ["MERGE_GATE_TEST_REPO"]) / "scripts/lib/package_root.py") as package_root:
+                exec(package_root.read(), {"__file__": package_root.name})
             from scripts.direct.wait_for_test_state import wait_until
             wait_until((state / (str(os.getpgrp()) + ".released")).exists,
                        state, timeout=TEST_HANG_GUARD_SECS)'''
@@ -32,7 +33,8 @@ OVERLAP_POLL = '''            deadline = time.monotonic() + TEST_HANG_GUARD_SECS
                 if time.monotonic() >= deadline:
                     self.fail("module processes never overlapped")
                 time.sleep(0.01)'''
-OVERLAP_EVENT = '''            sys.path.insert(0, os.environ["MERGE_GATE_TEST_REPO"])
+OVERLAP_EVENT = '''            with open(Path(os.environ["MERGE_GATE_TEST_REPO"]) / "scripts/lib/package_root.py") as package_root:
+                exec(package_root.read(), {"__file__": package_root.name})
             from scripts.direct.wait_for_test_state import wait_until
             def both_started():
                 with (state / "modules.jsonl").open() as source:

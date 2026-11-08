@@ -49,9 +49,11 @@ class CompletedMemoryHook(TypedDict):
 
 ADMISSION_BEFORE_RETRY = r'''
 import os
+from pathlib import Path
 import sys
 
-sys.path.insert(0, os.environ["TEST_SOURCE_REPO"])
+with open(Path(os.environ["TEST_SOURCE_REPO"]) / "scripts/lib/package_root.py") as package_root:
+    exec(package_root.read(), {"__file__": package_root.name})
 from scripts.build_queue import admission_client
 from scripts.build_queue.system_clock import SystemClock
 
@@ -76,7 +78,7 @@ import sys
 from unittest import mock
 
 source = Path(os.environ["TEST_SOURCE_REPO"])
-sys.path.insert(0, str(source))
+with open(source / "scripts/lib/package_root.py") as package_root: exec(package_root.read(), {"__file__": package_root.name})
 from scripts.build_queue import admission_client
 from scripts.lib.atomic_file import write_text_atomic
 
@@ -117,17 +119,13 @@ import os
 from pathlib import Path
 import subprocess
 import shlex
-import sys
 import time
 from contextlib import nullcontext, redirect_stdout
 from unittest import mock
 
 source = Path(os.environ["TEST_SOURCE_REPO"])
-sys.path.insert(0, str(source))
-for name in ("mac_test", "build_targets", "build_hold", "lint", "lib"):
-    sys.path.insert(0, str(source / "scripts" / name))
-from scripts.mac_test import offload
-from scripts.mac_test import mac_test
+with open(source / "scripts/lib/package_root.py") as package_root: exec(package_root.read(), {"__file__": package_root.name})
+from scripts.mac_test import offload, mac_test
 
 args = offload.parser().parse_args(namespace=offload.CliArguments())
 request = offload.request_from_arguments(args)
@@ -214,7 +212,7 @@ def stream(arguments):
         generation = "fixture-generation" if mode == "interrupted" else "old-generation"
         wire, status = "aws_interrupted=" + generation + "\n", 255
     elif mode == "runner-sigterm":
-        import linux_runner
+        from scripts.mac_test import linux_runner
         from scripts.aws_target.runner_test_support import interrupt_runner, seed_runner_permission
 
         now = int(time.time())
@@ -447,7 +445,6 @@ source() {
 
 
 RUN_BUILD_TARGETS = r'''
-sys.path.insert(0, str(source / "scripts/build_targets"))
 status = 0
 try:
     runpy.run_path(str(source / "scripts/build_targets/build_targets.py"), run_name="__main__")

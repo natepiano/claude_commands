@@ -7,9 +7,9 @@ import os
 import io
 import time
 import subprocess
-import sys
 from contextlib import closing, redirect_stderr
 from datetime import timedelta
+from pathlib import Path
 from typing import cast, override
 from unittest import mock
 
@@ -176,8 +176,8 @@ class CostTests(unittest.TestCase):
                    + "connection=index.read_only(); "
                    + "history=holds.read_hold_history(connection,current,datetime.now(UTC)); "
                    + "connection.close(); assert len(history.intervals) == 1; "
-                   + "assert not any(name in sys.modules for name in ('scripts.buildlog.record','scripts.build_targets.targets','scripts.build_hold.build_hold','scripts.mac_test.mac_test'))")
-        result = subprocess.run([sys.executable, "-c", command], env=dict(os.environ),
+                   + "assert not any(name in sys.modules for name in ('scripts.buildlog.record', 'scripts.build_targets.targets', 'scripts.build_hold.build_hold', 'scripts.mac_test.mac_test'))")
+        result = subprocess.run([str(Path(__file__).resolve().parents[2] / "scripts/lib/py"), "-c", command], env=dict(os.environ),
                                 capture_output=True, text=True, check=False, timeout=10)
         self.assertEqual(result.returncode, 0, result.stderr)
 
@@ -300,8 +300,8 @@ class CostTests(unittest.TestCase):
 
     def test_cli_help_does_not_import_collectors_or_the_report(self) -> None:
         command = ("import sys; from scripts.buildlog import cli; cli.main(['help']); "
-                   + "assert not any(name in sys.modules for name in ('scripts.buildlog.record','scripts.buildlog.report','scripts.buildlog.costs','scripts.buildlog.launches'))")
-        result = subprocess.run([sys.executable, "-c", command], env=dict(os.environ),
+                   + "assert not any(name in sys.modules for name in ('scripts.buildlog.record', 'scripts.buildlog.report', 'scripts.buildlog.costs', 'scripts.buildlog.launches'))")
+        result = subprocess.run([str(Path(__file__).resolve().parents[2] / "scripts/lib/py"), "-c", command], env=dict(os.environ),
                                 capture_output=True, text=True, check=False, timeout=10)
         self.assertEqual(result.returncode, 0, result.stderr)
 

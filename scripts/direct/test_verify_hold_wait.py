@@ -21,12 +21,12 @@ from scripts.direct.verify_hold_wait_test_support import (
 
 class VerifyHoldWaitTests(VerifyHoldWaitFixture):
     def test_step_failure_with_hold_refusal_text_stays_a_failure(self) -> None:
-        repo_root = Path(__file__).resolve().parents[2]
+        package_root = Path(__file__).resolve().parents[1] / "lib/package_root.py"
         failing_step = f'''if arguments[:2] == ["nextest", "run"]:
     failed = Path(os.environ["TEST_RUNNER_STATE"]) / "failed-once"
     if not failed.exists():
         failed.touch()
-        sys.path.insert(0, {str(repo_root)!r})
+        with open({str(package_root)!r}) as package_root: exec(package_root.read(), {{"__file__": package_root.name}})
         from scripts.build_hold import build_hold
         from datetime import datetime
         build_hold.start_hold(

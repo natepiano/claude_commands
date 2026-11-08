@@ -12,11 +12,8 @@ except FileNotFoundError:
 
 import argparse
 import sys
-from pathlib import Path
 from typing import Literal, cast
 
-ROOT = Path(__file__).resolve().parents[2]
-sys.path.insert(0, str(ROOT))
 from scripts.accounts import accounts  # noqa: E402
 from scripts.whoami import note_file  # noqa: E402
 

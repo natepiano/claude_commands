@@ -120,9 +120,12 @@ start; read that record.
    `no run record`:
 
    ```python
-   import json, os, pathlib, sys
-   sys.path.insert(0, str(pathlib.Path.home() / ".claude/scripts/lib"))
-   from unit_runs import history_root
+   import json, os, pathlib
+   try:
+       with open(pathlib.Path.home() / ".claude/scripts/lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+   except FileNotFoundError:
+       pass
+   from scripts.lib.unit_runs import history_root
    sid = os.environ.get("CLAUDE_CODE_SESSION_ID", "")
    markers = [pathlib.Path(f"/tmp/claude/{name}/active/{sid}") for name in ("unit", "delegate")]
    marker = next((path for path in markers if path.is_file()), markers[0])

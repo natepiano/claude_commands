@@ -1801,6 +1801,6 @@ def main(arguments: list[str]) -> int:
 
 
 if __name__ == "__main__":
-    # The enforcer must use this CLI's domain types, not a second module instance.
+    # The enforcer and this CLI must use the same domain types.
     _ = sys.modules.setdefault("scripts.build_hold.build_hold", sys.modules[__name__])
     sys.exit(main(sys.argv[1:]))

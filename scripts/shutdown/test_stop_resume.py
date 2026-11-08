@@ -2547,7 +2547,7 @@ class StopResumeTests(unittest.TestCase):
                     self.assertNotIn("Worker ", self.client.prompts[0][1].text)
                 else:
                     self.assertEqual(self.client.prompts, [])
-                run.assert_called_once_with(parent)
+                run.assert_called_once_with(row, record=record)
                 read.assert_called_once_with(row.id, self.root)
 
     def test_named_resume_keeps_the_saved_assignment_when_the_worker_never_received_it(self) -> None:

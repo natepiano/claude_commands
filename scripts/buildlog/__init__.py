@@ -1,1 +1,1 @@
-"""Build log package."""
+"""Store and read the build log."""

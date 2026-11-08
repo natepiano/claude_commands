@@ -8,6 +8,7 @@ from pathlib import Path
 from uuid import uuid4
 
 from scripts.accounts import accounts, moves, refusal_watch
+from scripts.agents.worker_lifecycle import WorkerStateUnreadable
 from scripts.accounts.accounts import SessionMoveOutcome
 from scripts.herdr import herdr, worker_panes
 from scripts.direct import progress_history
@@ -169,7 +170,10 @@ def _move_locked(move: WorkerMove, hold: worker_panes.WorkerLockHold) -> Session
 
 def run_for_worker(row: staff.StaffRow, record: staff.StaffSnapshot) -> Path:
     parent = record.parent_of(row)
-    return worker_panes.worker_run(parent) if parent is not None else Path()
+    try:
+        return worker_panes.worker_run(row, record=record) if parent is not None else Path()
+    except WorkerStateUnreadable as error:
+        raise ValueError(f"anomaly: {error}") from error
 
 
 def move_worker(row: staff.StaffRow, record: staff.StaffSnapshot, target: str, why: str, run: Path) -> SessionMoveOutcome:
