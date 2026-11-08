@@ -20,6 +20,7 @@ except FileNotFoundError:
 
 import argparse
 import fcntl
+import json
 import os
 import sys
 import time
@@ -272,9 +273,10 @@ def _has_resumable_workers(run: Path, *, record: staff.StaffSnapshot | RunStaffA
 
     def read_record(path: Path) -> dict[str, object]:
         try:
-            return _json_object(path.read_text())
-        except (OSError, UnicodeError):
+            raw = cast(object, json.loads(path.read_text()))
+        except (OSError, UnicodeError, ValueError):
             return {}
+        return cast(dict[str, object], raw) if isinstance(raw, dict) else {}
 
     state = read_record(run / STATE_FILE)
     if state.get("status") == "ended":
