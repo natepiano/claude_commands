@@ -81,6 +81,7 @@ class FakeAws:
         self.observed_states: list[str] = []
         self.delete_dependencies: int = 0
         self.signal_number: int = 0
+        self.handler_thread: int = threading.get_ident()
         self.signal_handled: Callable[[], None] | None = None
         self.missing_log: bool = False
         self.query_timeout: bool = False
@@ -104,7 +105,7 @@ class FakeAws:
             with self.lock:
                 number, self.signal_number = self.signal_number, 0
             if number:
-                os.kill(os.getpid(), number)
+                signal.pthread_kill(self.handler_thread, number)
                 if self.signal_handled is not None:
                     self.signal_handled()
         if 'get-object' in args and self.before_result is not None:
@@ -500,6 +501,7 @@ class GateTrialTests(unittest.TestCase):
         self.assertLess(command.spent + command.s3_cost, 0.45)
 
     def test_signal_cancels_parallel_waits_and_prints_final_report(self) -> None:
+        main_thread = threading.get_ident()
         for number in trial.TRIAL_SIGNALS:
             with self.subTest(number=number):
                 self.fake = FakeAws(self.clock)
@@ -507,7 +509,8 @@ class GateTrialTests(unittest.TestCase):
                 def result(key: str) -> None:
                     _ = barrier.wait()
                     if key.startswith('8-'):
-                        os.kill(os.getpid(), number)
+                        # Wake the Python handler's thread instead of an unrelated helper thread.
+                        signal.pthread_kill(main_thread, number)
                     command = self.command
                     assert command is not None
                     with command.changed:

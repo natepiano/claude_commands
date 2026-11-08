@@ -29,7 +29,7 @@ class GateBoxTests(unittest.TestCase):
         self.assertNotIn('basedpyright', gate_box.GUEST)
         self.assertIn('merge_gate.SelectedModules', gate_box.GUEST)
         self.assertIn("'HEAD^{tree}'", gate_box.GUEST)
-        self.assertIn("'+refs/remotes/origin/*:refs/remotes/origin/*'", gate_box.GUEST)
+        self.assertIn("'update-ref', 'refs/remotes/origin/main', gate_request['origin_main']", gate_box.GUEST)
 
     def test_production_boot_has_absolute_expiry_and_no_type_package(self) -> None:
         links = {'production': 'true', 'expires': '1800000000', 'step': 'size',

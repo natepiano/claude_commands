@@ -42,7 +42,12 @@ The route returns the existing `GateRun` and exit behavior.
 The build queue enforces nine cloud slots and shows remote progress.
 
 The route selects targeted modules on natedev.
-It transfers a Git bundle with the exact commit, tree, `origin/main`, and current branch history.
+The box clones the public HTTPS URL from `clone_url` in `cloud_gate.conf`.
+The route bundles only commits outside natedev's `origin/main`.
+It bundles HEAD and the current branch ref with `--not refs/remotes/origin/main`.
+It uploads no bundle when HEAD is already on `origin/main`.
+The request records the exact tested commit, tree, and natedev `origin/main` hash.
+The box fetches the optional bundle and sets `origin/main` to the recorded hash.
 The guest verifies the tree and runs only the supplied paths from that checkout.
 The trial and route share `scripts/aws_target/gate_box.py`.
 The boot script downloads the guest program before Python starts.
@@ -58,13 +63,14 @@ Both sizes use one-time Spot with termination on interruption and shutdown.
 Termination deletes the root volume.
 A guest deadline and an independent expiry Lambda bound normal attempt lifetimes.
 The route confirms termination before it releases unused cost reservation.
-A launch timeout retains the saved launch token, arguments, and reservation across restart.
+A launch timeout permits local fallback and releases the cost reservation when no instance identity is known.
 
-Every AWS launch refusal permits local fallback.
+Every cloud setup or infrastructure failure permits local fallback.
+This includes upload errors, timeouts, missing results, invalid results, and instance failures.
 Capacity refusals first exhaust the configured sizes and zones.
-Other fallback causes include AWS failure, an absent image or stack, and a shared spending cap.
 The route releases the cost reservation and cloud slot before local admission.
-A remote failure remains red. A dead instance without a final result also remains red.
+Only a real remote test failure remains red.
+A dead instance without a final test result permits local fallback.
 The route validates source identity, attempt, modules, host, verdict, and final log delivery.
 It imports the explicit `gate_run` record once under the real remote host.
 Git's `cloud-gates/<attempt>` directory retains each request, bundle, launch, result, log, and import marker.
