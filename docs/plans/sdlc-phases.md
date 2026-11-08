@@ -508,3 +508,38 @@ For active process redesigns, as we are currently undergoing with promotions and
 - Deleting a folder by its original path is never safe while a publisher knows that path; only a rename under the lock makes a late publisher fail.
 - A shared writer that creates a missing parent reopens the late-publication race; publishers into a hold folder pass `create_parent=False`.
 - `codex_mesh.py` `_mesh_phase_wait` still appends its event before its marker, so a killed codex_mesh can leave an open wait with no file; models-unit owns its move to `publish_wait`.
+
+### Phase 21 — repair frees a phase record whose reservation a sibling's checkpoint released  · status: done
+
+**Depends on:** none
+
+#### Work Order
+
+**Goal:** a phase whose record says `Active`, while berth's board shows that reservation released at a checkpoint the phase did not make, is brought back to `enrolled_awaiting_first_touch` by `phase_reservation.py repair`, so `claim` takes a new reservation.
+
+**Source:** sdlc showrunner 2026-11-08, from cargo-liner's report `~/.claude/state/berth-fix/inbox/20261108T152729Z-cargo-liner/report.md` (tile Phases 31 and 43i). The cargo-berth side (one checkpoint release frees sibling reservations of its `reservation_shares` group) goes to tile, not to this unit.
+
+**Spec:**
+- Today `repair` on such a record prints "enroll, then claim" and exits 2. `enroll` refuses an `Active` record (`HOLDS_RESERVATION`), and `claim` accepts only `enrolled_awaiting_first_touch`, so no command frees the phase.
+- In `_repair_command` (`scripts/direct/phase_reservation.py`): when the record is `Active`, the phase is recorder-open, the phase has no release marker (`RELEASED_FILE`) and no pending release, and berth's live board shows the recorded reservation in `CHECKPOINT_RELEASED`, and no live mapped reservation restores `Active`, then write `{"kind": enrolled_awaiting_first_touch, "phase": <phase>}` for the phase. Do not touch the kept board answer or the baselines.
+- Log the change in the phase's repairs file and post it to the board, in the same form as the current `Active` restore (`REPAIRS_FILE`, `_post_repair`). The line names the released reservation and its board status.
+- Print the `claim` command for the phase, and exit 0 when the board post succeeded. The claim itself stays the director's next step.
+- A board that cannot be read, or that shows the recorded reservation in any other status, keeps today's behaviour.
+- Correct the refusal text that names `enroll` for an `Active` record, so no printed command is one that refuses.
+- Update `docs/direct/phase_reservation.md` (the "Lost open phase record" row and the `repair` paragraph) to say what repair does for this case.
+- Add no guard, refusal or check that this Work Order does not ask for.
+
+**Files:**
+- `scripts/direct/phase_reservation.py` — `_repair_command` and `_repair_refused`
+- `scripts/direct/test_phase_reservation.py` — the regression tests
+- `docs/direct/phase_reservation.md` — repair behaviour
+
+**Workers:** `1 writer + 1 tester` — the writer changes `phase_reservation.py` and the doc; the tester writes the tests in `test_phase_reservation.py` against a fake `cargo-berth` on `PATH`, the way the file's current repair tests do.
+
+**State:** the phase's reservation state file, its repairs log and one board line.
+
+**Tests:**
+- An `Active` record whose reservation the board shows `released_after_checkpoint` (and one with `outstanding`), with no release marker, becomes `enrolled_awaiting_first_touch`; the repairs log and the board each get one line; the printed command is `claim`; a following `claim` with a clear check writes `Active` with the new reservation.
+- The same record with a release marker, a pending release, an unreadable board or an `active` board status is unchanged.
+
+**Acceptance gate:** `python3 -m unittest scripts.direct.test_phase_reservation` passes; basedpyright on the two Python files prints `0 errors, 0 warnings`; the targeted test from the Delegation Context is green.
