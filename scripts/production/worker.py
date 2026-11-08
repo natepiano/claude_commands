@@ -7,7 +7,7 @@ except FileNotFoundError:
     pass
 
 import argparse
-from collections.abc import Generator
+from collections.abc import Generator, Iterable
 from contextlib import ExitStack, closing, redirect_stderr
 from dataclasses import dataclass, replace
 import heapq
@@ -114,7 +114,8 @@ class DispatchPrompt:
     dispatch_id: str
 
 
-def transcript_receipt(source: Path, line: str | DispatchPrompt, completion: DoneReply | FinalReply) -> TranscriptReceipt:
+def transcript_receipt(entries: Iterable[str | worker_admission.TornTranscriptRecord],
+                       line: str | DispatchPrompt, completion: DoneReply | FinalReply) -> TranscriptReceipt:
     """Read prompt acceptance and its reply through the shared transcript parser."""
     submitted = False
     responding = False
@@ -122,7 +123,7 @@ def transcript_receipt(source: Path, line: str | DispatchPrompt, completion: Don
     received: set[str] = set()
     reply: DispatchSubmitted | DispatchComplete | DispatchAwaitingReply = DispatchSubmitted()
     try:
-        for entry in worker_admission.transcript_entries(source, set()):
+        for entry in entries:
             if isinstance(entry, worker_admission.TornTranscriptRecord):
                 incomplete = True
                 continue
@@ -167,7 +168,7 @@ def transcript_receipt(source: Path, line: str | DispatchPrompt, completion: Don
 def consultation_reply(client: herdr.Herdr, pane: str, source: Path, question: str) -> str:
     """Require acceptance before the turn end and its final reply."""
     deadline = time.monotonic() + herdr.PROGRAM_TIMEOUT_SECONDS
-    receipt = transcript_receipt(source, question, FinalReply()).receipt
+    receipt = transcript_receipt(worker_admission.transcript_entries(source, set()), question, FinalReply()).receipt
     while True:
         accepted = isinstance(receipt, (DispatchSubmitted, DispatchComplete))
         if not accepted and time.monotonic() >= deadline:
@@ -177,7 +178,7 @@ def consultation_reply(client: herdr.Herdr, pane: str, source: Path, question: s
             remaining = deadline - time.monotonic()
             if remaining > 0:
                 time.sleep(min(0.1, remaining))
-        receipt = transcript_receipt(source, question, FinalReply()).receipt
+        receipt = transcript_receipt(worker_admission.transcript_entries(source, set()), question, FinalReply()).receipt
         if isinstance(receipt, DispatchEvidenceUnknown):
             raise ValueError(receipt.reason)
         if accepted and isinstance(ended, herdr.ObservedAgentState):
@@ -191,7 +192,7 @@ def dispatch_receipt(row: staff.StaffRow, line: str, dispatch_id: str, *, run: P
     backend = staff.backend(row)
     if isinstance(backend, staff.BackendUnavailable):
         return DispatchEvidenceUnknown("worker transcript backend is unavailable")
-    transcript = transcript_receipt(worker_admission.transcript_source(row, backend), line, DoneReply(dispatch_id))
+    transcript = transcript_receipt(worker_admission.conversation_entries(row, backend, set()), line, DoneReply(dispatch_id))
     reply = transcript.receipt
     if isinstance(reply, (DispatchNotSubmitted, DispatchEvidenceUnknown)):
         return reply
@@ -539,7 +540,11 @@ def answer(parent: StaffId, name: WorkerName, text: str) -> ExitCode:
     if not isinstance(state, worker_panes.OpenWorker):
         return ExitCode.UNCERTAIN
     client = _client()
-    client.prompt(state.pane, text, target=str(row.current_session))
+    backend = record.backends.get(row.id, staff.BACKEND_UNAVAILABLE)
+    if state.status is herdr.AgentStatus.BLOCKED and isinstance(backend, staff.CodexBackend):
+        client.answer_question(state.pane, text, target=str(row.current_session))
+    else:
+        client.prompt(state.pane, text, target=str(row.current_session))
     return ExitCode.OK
 
 
@@ -568,7 +573,7 @@ def resume_receipt(row: staff.StaffRow, dispatch: progress_history.ActiveDispatc
     backend = staff.backend(row)
     if isinstance(backend, staff.BackendUnavailable):
         return DispatchEvidenceUnknown("worker transcript backend is unavailable")
-    return transcript_receipt(worker_admission.transcript_source(row, backend),
+    return transcript_receipt(worker_admission.conversation_entries(row, backend, set()),
         DispatchPrompt(dispatch.instance_id), DoneReply(dispatch.instance_id)).receipt
 
 
