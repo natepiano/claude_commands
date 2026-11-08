@@ -412,6 +412,94 @@ class WorkerCommandTests(unittest.TestCase):
         self.assertNotIn(opened.pane, self.fixture.world.foreground)
         self.assertEqual(len(self.agent.submitted), 1)
 
+    def test_named_assign_depends_on_its_own_pane_and_keeps_sibling_list_states(self) -> None:
+        opened = self.opened("impl4")
+        closed = [self.fixture.worker(name) for name in ("impl3", "fix1", "rev10a", "rev10c", "fix2", "port6", "ft7", "cr7")]
+        for pane, reason in (("w1:p9", "agent argv is unavailable"), ("w2:p9", "pane_not_found"),
+                             ("w2:p8", "current Codex rollout changed")):
+            foreign = fixture_member("agent", name="foreign-" + pane.replace(":", "-"))
+            self.fixture.world.add(foreign, pane, workspace=pane.split(":")[0],
+                                   tab="w1:t1" if pane.startswith("w1:") else "w2:t2")
+            self.fixture.world.unknown[pane] = reason
+        self.fixture.world.process_reads.clear()
+        self.fixture.world.reads.clear()
+        self.agent.finish_after = 1
+        with redirect_stderr(io.StringIO()) as errors:
+            code = worker.assign(self.fixture.parent.id, "impl", self.prompt, session_dir=self.run_dir,
+                slot="impl4", phase="8", kind="impl", name="impl4", launcher_command=["assign.sh"], reply=self.reply)
+        self.assertEqual(code, worker.ExitCode.OK, errors.getvalue())
+        self.assertEqual(len(self.agent.submitted), 1)
+        self.assertIn(self.agent.final, self.reply.read_text())
+        self.assertEqual(set(self.fixture.world.process_reads), set(self.fixture.world.locations))
+        self.assertIn(("agent", "list"), self.fixture.world.reads)
+        self.assertIn("agent argv is unavailable", errors.getvalue())
+        for row in closed:
+            self.assertNotIn(f"anomaly: {row.name}:", errors.getvalue())
+        self.fixture.world.unknown[opened.pane] = "selected pane evidence is unavailable"
+        for label in ("impl4", "unit-impl4"):
+            with self.subTest(label=label), redirect_stderr(io.StringIO()) as errors:
+                self.fixture.world.locations[opened.pane]["label"] = label
+                code = worker.assign(self.fixture.parent.id, "impl", self.prompt, session_dir=self.run_dir,
+                    slot="impl4", phase="8", kind="impl", name="impl4", launcher_command=["assign.sh"], reply=self.reply)
+            self.assertEqual(code, worker.ExitCode.UNCERTAIN)
+            self.assertIn("selected pane evidence is unavailable", errors.getvalue())
+            self.assertEqual(len(self.agent.submitted), 1)
+        del self.fixture.world.unknown[opened.pane]
+        code, output, errors_text = self.command("list", "--json")
+        self.assertEqual(code, worker.ExitCode.OK, errors_text)
+        listing = {str(row["name"]): row for row in cast(list[dict[str, object]], json.loads(output))}
+        self.assertEqual(listing[opened.row.name]["state"], "OpenWorker")
+        for row in closed:
+            self.assertEqual(listing[row.name]["state"], "UncertainWorker")
+        self.fixture.world.remove_leaf(opened.pane)
+        del self.fixture.world.locations[opened.pane]
+        del self.fixture.world.foreground[opened.pane]
+        other = fixture_member("unit", name="other-unit", parent=self.fixture.parent.parent)
+        foreign = fixture_member("worker", name="impl4", parent=other.id)
+        self.fixture.world.add(foreign, "w2:p7", workspace="w2", tab="w2:t2")
+        launches = len(self.fixture.world.launches)
+        with redirect_stderr(io.StringIO()) as errors:
+            code = worker.assign(self.fixture.parent.id, "impl", self.prompt, session_dir=self.run_dir,
+                slot="impl4", phase="8", kind="impl", name="impl4", launcher_command=["assign.sh"], reply=self.reply)
+        self.assertEqual(code, worker.ExitCode.OK, errors.getvalue())
+        self.assertEqual(len(self.fixture.world.launches), launches + 1)
+        self.assertEqual(self.agent.row("w2:p7"), foreign)
+
+    def test_named_assign_resumes_while_its_codex_rollout_opens(self) -> None:
+        row = self.fixture.worker("impl", family="codex")
+        self.fixture.world.add(row, "w1:p1", live=False)
+        native_process = self.fixture.world.native_process
+        stat = Path.stat
+        metadata_reads = 0
+        published: list[str] = []
+
+        def read_metadata(path: Path, *, follow_symlinks: bool = True) -> os.stat_result:
+            nonlocal metadata_reads
+            value = stat(path, follow_symlinks=follow_symlinks)
+            if path.name == "3" and path.parent.name == "fd":
+                metadata_reads += 1
+                if metadata_reads == 2:
+                    (path.parent / "4").symlink_to(os.readlink(path))
+                    published.append(str(row.current_session))
+            return value
+
+        def read_process(pid: int, kind: str, reported: str = "") -> herdr.NativeAgentProcess:
+            observed = native_process(pid, kind, reported)
+            if kind == "codex":
+                identity = herdr.codex_rollout_thread(pid)
+                return herdr.NativeAgentProcess(herdr.RolloutThread(identity), observed.started, observed.environment)
+            return observed
+
+        with (patch.object(herdr, "native_process", side_effect=read_process),
+              patch.object(Path, "stat", read_metadata), redirect_stderr(io.StringIO()) as errors):
+            code = worker.assign(self.fixture.parent.id, "impl", self.prompt, session_dir=self.run_dir,
+                slot="impl", phase="8", kind="impl", name="impl", launcher_command=["assign.sh"], reply=self.reply)
+        self.assertEqual(code, worker.ExitCode.OK, errors.getvalue())
+        self.assertEqual(published, [str(row.current_session)])
+        self.assertEqual(len(self.agent.submitted), 1)
+        self.assertIn(self.agent.final, self.reply.read_text())
+        self.assertEqual(staff.by_id(row.id), row)
+
     def test_unknown_evidence_during_dispatch_prints_one_scan_diagnostic(self) -> None:
         opened = self.opened()
         def lose_process_evidence() -> None:
@@ -662,11 +750,13 @@ class WorkerCommandTests(unittest.TestCase):
         assert isinstance(backend, (staff.ClaudeBackend, staff.CodexBackend))
         source = worker_admission.transcript_source(row, backend)
         states: list[herdr.AgentStatus] = []
-        observe = worker_panes.observe
+        observe = worker_panes.observe_worker
 
-        def observe_status(parent: staff.StaffId, record: staff.StaffSnapshot) -> list[worker_panes.WorkerPane]:
-            observed = observe(parent, record)
-            states.extend(item.status for item in observed if isinstance(item, worker_panes.OpenWorker))
+        def observe_status(parent: staff.StaffId, selected: staff.StaffRow,
+                           record: staff.StaffSnapshot) -> worker_panes.WorkerPane | worker_panes.WorkerNotObserved:
+            observed = observe(parent, selected, record)
+            if isinstance(observed, worker_panes.OpenWorker):
+                states.append(observed.status)
             return observed
 
         def next_turn(connection: socket.socket, deadline: float) -> codex_mesh.FileWaitResult:
@@ -678,7 +768,7 @@ class WorkerCommandTests(unittest.TestCase):
             return codex_mesh.StateFilesChanged(frozenset({source}))
 
         watch_class = codex_mesh.LinuxFileChanges if sys.platform.startswith("linux") else codex_mesh.KqueueFileChanges
-        with patch.object(worker_panes, "observe", side_effect=observe_status), \
+        with patch.object(worker_panes, "observe_worker", side_effect=observe_status), \
                 patch.object(watch_class, "wait", side_effect=next_turn) as wait:
             self.assertEqual(self.dispatch(), worker.ExitCode.OK)
         self.assertEqual(states, [herdr.AgentStatus.DONE, herdr.AgentStatus.WORKING, herdr.AgentStatus.DONE])
@@ -784,15 +874,16 @@ class WorkerCommandTests(unittest.TestCase):
         dispatch_id = line.split("DONE ")[-1].split(".")[0]
         self.agent.append(pane, "user", "Detached run: private-check\nRun finished: private verification")
         final = "The result is verified.\nDONE " + dispatch_id
-        observe = worker_panes.observe
+        observe = worker_panes.observe_worker
 
-        def observe_then_reply(parent: staff.StaffId, record: staff.StaffSnapshot) -> list[worker_panes.WorkerPane]:
-            states = observe(parent, record)
+        def observe_then_reply(parent: staff.StaffId, selected: staff.StaffRow,
+                               record: staff.StaffSnapshot) -> worker_panes.WorkerPane | worker_panes.WorkerNotObserved:
+            observed = observe(parent, selected, record)
             self.agent.append(pane, "assistant", final)
-            return states
+            return observed
 
         watch_class = codex_mesh.LinuxFileChanges if sys.platform.startswith("linux") else codex_mesh.KqueueFileChanges
-        with patch.object(worker_panes, "observe", side_effect=observe_then_reply), \
+        with patch.object(worker_panes, "observe_worker", side_effect=observe_then_reply), \
                 patch.object(watch_class, "wait", side_effect=AssertionError("a complete reply must not wait")):
             self.assertEqual(self.dispatch(), worker.ExitCode.OK)
         self.assertEqual(self.reply.read_text().strip(), final)
@@ -1022,8 +1113,10 @@ class WorkerCommandTests(unittest.TestCase):
         self.assertEqual(chosen, staff.WorkerName.parse("impl"))
         self.fixture.world.locations[first.pane]["agent_status"] = "working"
         _ = self.fixture.world.stop(second.row, self.fixture.world)
+        self.fixture.world.reads.clear()
         chosen = worker.select_worker(self.fixture.parent.id, "impl", staff.snapshot())
         self.assertEqual(chosen, staff.WorkerName.parse("impl2"))
+        self.assertEqual(self.fixture.world.reads.count(("pane", "list")), 1)
         launches = len(self.fixture.world.launches)
         self.assertEqual(self.dispatch("impl2"), worker.ExitCode.OK)
         self.assertEqual(len(self.fixture.world.launches), launches + 1)
