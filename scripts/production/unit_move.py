@@ -639,9 +639,11 @@ def _move_folder(unit: staff.StaffId, destination: Path, *, branch: str | KeepBr
                                         _ = client.close_retained_pane(pane, terminal=terminal)
                             except (OSError, ValueError, herdr.HerdrFailure, subprocess.SubprocessError) as error:
                                 restart_notice(latest, error)
-                        if not _wait_folder_rows(observe, live - reported, running=True):
+                        # Worker restore proves active starts and leaves idle workers closed.
+                        expected = {member.id for member in members if member.kind != "worker"} & (live - reported)
+                        if not _wait_folder_rows(observe, expected, running=True):
                             for member in members:
-                                if member.id in live - observed_live:
+                                if member.id in expected - observed_live:
                                     restart_notice(member, "restart is incomplete")
                 except (OSError, ValueError, herdr.HerdrFailure, subprocess.SubprocessError) as error:
                     for member in members:
