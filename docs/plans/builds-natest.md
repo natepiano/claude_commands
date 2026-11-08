@@ -1401,47 +1401,23 @@ SIGINT at its default did not prove the cause of any failure in Spec step 5. `ev
 - The `route()` form of Phase 61: 52% fewer process starts and no CPU gain, with command-line paths lost.
 - The `offload_result` fixture: 41.64 to 14.39 CPU s in the results file, but it calls each target itself and precomputes each attempt. A stop after a busy result and a lost `BUILDLOG_MEM_WAIT_SINCE` pass unseen. The two tests that could stay save about 8 CPU s, against a 90-line fixture that patches global state beside the admission thread.
 
-### Phase 67 — The lint judgment and parser cases move onto verify's new functions  · status: todo
+### Phase 67 — The lint judgment and parser cases move onto verify's new functions  · status: done
 **Depends on:** Phase 61
-**Blocked by:** verify's hash for its two function moves: the inline main lint sequence and the test argument parser.
 
-#### Work Order
+#### As-built
 
-**Source:** Phase 61 writers, 2026-11-06. `test_verify_lint_judgment.py` keeps 28 real starts, because `verify.sh:3704-3756` has no function boundary. The 38 parser cases of `test_verify_mac_only.py` also need a complete script setup. Verify takes both moves.
-
-**Goal:** `test_verify_lint_judgment.py` (123.5 CPU s) and `test_verify_mac_only.py` (107.4 CPU s after Phase 61) use half their CPU of Phase 61's base, or a measured floor shows why they cannot, with every checked behavior kept.
-
-**Spec:**
-1. Merge builds with verify's hash. Do not merge verify's branch.
-2. Follow the Speed method. Measure CPU with `module_cost.py --commands 10` first: a process count does not rank CPU.
-3. Move the judgment and parser cases onto direct calls of the two new functions. Keep the real starts that prove what no direct call can.
-4. A further cut in `verify.sh` goes to verify. Add no guard, refusal or check (user rule, 2026-11-05).
-5. Read the importers of a shared Mac fixture before you change it, and take the owner's word for any file another unit holds.
+- `test_verify_lint_judgment.py` calls `run_lint_judgment`, `run_lint_held_sequence` and `run_lint_sequence` through `shell_functions`. It keeps a real `verify.sh` start only for a path that no direct call proves. Same-load CPU: 68.3 → 19.1 s.
+- `test_verify_mac_only.py` checks its parser cases through `parse_routing_arguments`. `test_policy_refusals_start_nothing` keeps one real `verify test sample --env SHOTS` run: exit 2, the `--env and --fetch need --mac` line, and no runner, cargo or call-record event. Same-load CPU: 101.5 → 96.5 s.
 
 **Files:**
-- `scripts/direct/test_verify_lint_judgment.py`
-- `scripts/direct/test_verify_mac_only.py`
+- `scripts/direct/test_verify_lint_judgment.py` — lint judgment cases; direct calls plus the real starts only a real run proves.
+- `scripts/direct/test_verify_mac_only.py` — Mac-only policy and parser cases; one real refusal run.
 
-**Workers:** 2 writers; each file has its own fixture
-- `test` — `test_verify_lint_judgment.py`, opens as impl
-- `impl` — `test_verify_mac_only.py`, role impl
-
-**Constraints from prior phases:**
-- Phase 61: `test_verify_lint_cache_versions.py` holds the harness form for lint functions. `test_verify_mac_only.py`'s `mac_result()` holds the form for result functions.
-- Verify's functions: `run_lint_judgment`, `run_lint_held_sequence` and `run_lint_sequence` (7ea9b08ef), and `parse_routing_arguments` (0c855e894). Call them through `shell_functions`. The parser's arguments and globals are in `scripts/direct/test_verify_argument_parser.py`. After verify's 41g, new tests use the new forms: `final --saved`, `lint` with no package, `example --name` and `test --test`.
-- Phase 76: a fixture that starts `verify.sh` sets `ROSTER_RUN_ROOT`, `UNIT_RUN_ROOT` and `SCRATCH_ROOT` inside its test root, or `verify.sh:1272` reads the live `/tmp/claude/unit` through `progress_history.last_dispatch`, `unit_runs.held` and `_supplier_address`. `verify_lint_scope_test_support.py:276` and `verify_mac_offload_test_support.py:752` do not set all three. Set them in the owned test files; a shared support change needs its own owner.
-- Tests never read or write live state: `~/.claude` main, `~/.local/state/merge-gate`, `/tmp/claude`.
-
-**Acceptance gate:**
-- The behavior map has a row for each assertion. For each moved check, breaking the function fails the new test, shown on a tempdir copy.
-- CPU s, processes, execs and wall s before and after, from `module_cost.py` and same-load pairs, in the checkpoint notice.
-- The changed files pass. When `VerifyLintJudgmentFixture` or its constants change, these also pass: `test_verify_lint_cache.py`, `test_verify_lint_cache_fix_limit.py`, `test_verify_lint_fix_failures.py`, `test_verify_lint_fix_limit.py`, `test_verify_lint_fixes.py` and `test_verify_token_renew.py`.
-- the targeted test green on the phase commit merged with `origin/builds`, after both writers finish and the reviews converge
-- `basedpyright` on the changed files prints `0 errors, 0 warnings, 0 notes`
+**Gotchas:**
+- `test_verify_mac_only.py` stays at its floor until `verify.sh` makes one `build_targets.py` call per start that returns one JSON (verify owns this work). Count the file at this floor until then.
 
 ### Phase 68 — The assign launcher tests use half their CPU  · status: todo
 **Depends on:** Phase 54
-**Blocked by:** devtools' `assign.py` coordinator change on builds. The showrunner sends the word.
 
 #### Work Order
 
@@ -1735,3 +1711,159 @@ Merge 82e4ed73a puts builds 7ab78b74e into this branch with phases 35 to 83. Its
 
 **Files:**
 - `scripts/production/test_merge_gate_suites_types.py` — merge gate type-check tests with stubs only
+
+### Phase 84 — The lint cache version and step state tests use half their CPU  · status: todo
+**Depends on:** Phase 67
+
+#### Work Order
+
+**Source:** the Phase 79 architect review add-on, settled "current, after 67 and 68" by the showrunner on 2026-11-07. They are the next free rows of `show.py top` after Phases 67 and 68.
+
+**Goal:** `direct/test_verify_lint_cache_versions.py` (58.4 CPU s median per gate, 7 tests) and `direct/test_verify_step_state.py` (53.0 CPU s, 6 tests) use half their CPU, or a measured floor shows why they cannot, with every checked behavior kept.
+
+**Spec:**
+1. Follow the Speed method. Measure CPU with `module_cost.py --tests 10 --commands 10` first: a process count does not rank CPU.
+2. Move each case that only needs a function's decision onto a direct call through `shell_functions`. Keep the real `verify.sh` starts that prove what no direct call can.
+3. A cut in `verify.sh` goes to verify with its measured gain. Add no guard, refusal or check (user rule, 2026-11-05).
+4. Read the importers of a shared fixture before you change it. Every importer stays green.
+
+**Files:**
+- `scripts/direct/test_verify_lint_cache_versions.py`
+- `scripts/direct/test_verify_step_state.py`
+
+**Workers:** 2 writers; each file has its own fixture
+- `impl` — `test_verify_lint_cache_versions.py`, role impl
+- `test` — `test_verify_step_state.py`, opens as impl
+
+**Constraints from prior phases:**
+- Phase 61: `test_verify_lint_cache_versions.py` already holds the harness form for lint functions. Do not apply a cut it already has.
+- Phase 67: the lint judgment cases call `run_lint_judgment`, `run_lint_held_sequence` and `run_lint_sequence` through `shell_functions`. Reuse that form.
+- Phase 76: a fixture that starts `verify.sh` sets `ROSTER_RUN_ROOT`, `UNIT_RUN_ROOT` and `SCRATCH_ROOT` inside its test root.
+- Tests never read or write live state: `~/.claude` main, `~/.local/state/merge-gate`, `/tmp/claude`.
+
+**Acceptance gate:**
+- The behavior map has a row for each assertion. For each moved check, breaking the function fails the new test, shown on a tempdir copy.
+- CPU s, processes, execs and wall s before and after, from `module_cost.py` and same-load pairs, in the checkpoint notice.
+- Each changed file and every importer of a changed fixture pass.
+- the targeted test green on the phase commit merged with `origin/builds`
+- `basedpyright` on the changed files prints `0 errors, 0 warnings, 0 notes`
+
+### Phase 85 — The style ledger ticket and finding tests use half their CPU  · status: todo
+**Depends on:** none
+
+#### Work Order
+
+**Source:** the Phase 79 architect review add-on, settled "current, after 67 and 68" by the showrunner on 2026-11-07.
+
+**Goal:** `style/test_style_ledger_tickets.py` (44.9 CPU s per gate on 2026-11-07, 195 tests) and `style/test_style_ledger_findings.py` (43.8 CPU s, 139 tests) use half their CPU, or a measured floor shows why they cannot, with every checked behavior kept.
+
+**Spec:**
+1. Follow the Speed method. Measure CPU with `module_cost.py --tests 10 --commands 10` first. Both modules spend their time in tests, not in imports: about 0.3 s for each test.
+2. Find what each test pays for: the `LedgerTestCase` setup, a Git repository, or a process start. Share an expensive seed per class and copy it for each test where the test changes it.
+3. These modules have many tests. Run the trivial-test sweep from the Speed method: tests with the same setup and the same assertion target, then `coverage_overlap.py`.
+4. Add no guard, refusal or check (user rule, 2026-11-05).
+
+**Files:**
+- `scripts/style/test_style_ledger_tickets.py`
+- `scripts/style/test_style_ledger_findings.py`
+
+**Workers:** 2 writers; each module is its own file set
+- `impl` — `test_style_ledger_tickets.py`, role impl
+- `test` — `test_style_ledger_findings.py`, opens as impl
+
+**Constraints from prior phases:**
+- `scripts/style/ledger_test_support.py` and `scripts/production/staff_test_support.py` are not natest's to edit (standing rule). A gain that needs a change there goes to the director as an architecture proposal with its measured gain.
+- Phase 81: a fixture that commits in a tempdir repository sets `maintenance.auto false` before its first commit.
+- Tests never read or write live state: `~/.claude` main, `~/.local/state/merge-gate`, `/tmp/claude`.
+
+**Acceptance gate:**
+- The behavior map has a row for each assertion. Each removed test names its covering test or its reason.
+- CPU s, processes, execs and wall s before and after, from `module_cost.py` and same-load pairs, in the checkpoint notice.
+- Each changed file passes.
+- the targeted test green on the phase commit merged with `origin/builds`
+- `basedpyright` on the changed files prints `0 errors, 0 warnings, 0 notes`
+
+### Phase 86 — We know which tests to remove, merge or move to streamline the suite  · status: todo
+**Depends on:** none
+
+#### Work Order
+
+**Source:** the user, 2026-11-07: "18,800 seems excessive for the amount of actual code we have", then "yes i want you to evalutae how we can streamline our testing". The gate runs 733 modules and 18,777 test methods. The test code is about 1.5 times the size of the production code.
+
+**Goal:** a ranked report says which tests to remove, merge or move, with the test count and the CPU each action saves. The suite changes in later phases, not in this one.
+
+**Spec:**
+1. Change no test and no production file. Write only the report files below.
+2. For each module in your folders, read the tests and sort each one that can go into one class:
+   - **Retired:** it tests code that is gone or retiring (for example `agents/codex_mesh.py`).
+   - **Trivial:** it asserts a constant, the standard library, a configured mock, or only that a thing exists (Invariants).
+   - **Repeat:** another test in the same module checks the same result from the same setup.
+   - **Cross-module repeat:** another module checks the same behavior through another entry point. Name the test that stays.
+   - **Table:** several tests have the same body and differ only in input. They become one table test with `subTest`, which keeps every case and pays the setup once.
+   - **Wording:** it pins message text and no behavior. List these separately; the user decides on them.
+3. Use `python3 scripts/test_times/coverage_overlap.py scripts/<folder> <file>` only for modules with 100 or more tests or 20 or more CPU s per gate. Run it as one detached run per folder, one at a time: natedev is shared.
+4. Read CPU per gate with `python3 scripts/test_times/show.py top --limit 800` and test times with `show.py module <folder>/<file>`.
+5. For each candidate, name the test that keeps the behavior, or the reason no test needs to keep it. A test with no covering test and a real behavior stays.
+6. Rank the actions by CPU s saved per gate, then by tests removed. For each folder, give the test count before and after, and the owner unit from the production doc.
+7. Name the patterns that make the suite grow (for example one test per error message, one test per config key), and one rule for each that stops the growth. A rule is a proposal for the user, not a new check.
+
+**Files:**
+- `docs/plans/builds-natest-streamline-a.md` — the report for `production`, `direct`, `agents`, `lint`, `message`, `hooks`, `lib`
+- `docs/plans/builds-natest-streamline-b.md` — the report for every other folder under `scripts/`
+
+**Workers:** 2 writers; split by folder
+- `eval1` — `docs/plans/builds-natest-streamline-a.md`, role impl
+- `eval2` — `docs/plans/builds-natest-streamline-b.md`, role impl
+
+**Constraints from prior phases:**
+- Phase 13: five modules whose time is in process starts held no repeat. Spend the reading on modules with many tests.
+- Phases 67, 68, 84 and 85 hold their modules. Report candidates in them, and mark them as held.
+- Tests never read or write live state: `~/.claude` main, `~/.local/state/merge-gate`, `/tmp/claude`.
+
+**Acceptance gate:**
+- Each report covers every module in its folders, with a count by class.
+- Each candidate names its covering test or its reason.
+- The director checks ten candidates from each report against the code.
+
+### Phase 87 — The three costliest production modules keep only the rare-case tests that matter  · status: done
+**Depends on:** none
+
+#### Work Order
+
+**Source:** the user, 2026-11-07: "do rules 1 and 2", on the Phase 86 findings. Rule 1: a fix adds a case to the existing test of its behavior, not a new test. Rule 2: keep a rare-case test only where its defect would matter. This phase is the first cleanup under rule 2. It measures the yield before the cleanup runs module by module across the suite.
+
+**Goal:** `production/test_add_unit.py` (64 tests, 60.9 CPU s per gate on 2026-11-07), `production/test_staff.py` (129 tests, 56.8 CPU s) and `production/test_fast_track.py` (57 tests, 52.5 CPU s) keep only the rare-case tests that rule 2 keeps. The checkpoint notice gives the test count and the CPU s before and after.
+
+**Spec:**
+1. Measure each module first: `python3 scripts/test_times/module_cost.py --tree . --tests 10 --commands 10 production/<file>`.
+2. Sort each test. A **main-path** test checks the normal use of a behavior. A **rare-case** test checks an edge case, a refusal, a malformed input or a failure path.
+3. Keep every main-path test. Keep a rare-case test only when its defect would do one of these:
+   - show the user a wrong result: a screen, report, notice, message or command output that the user reads;
+   - damage saved state: a file, Git history, a ledger, the staff record or a config;
+   - lose work: a commit, an edit, a message or a worker result.
+4. For each other rare-case test, merge its case as a row into the main-path test of the same behavior when the setup is the same (rule 1). Otherwise remove it.
+5. Write the list in your final reply: test name, the case it checked, the rule 2 result, and "kept", "merged into <test>" or "removed".
+6. Change no production file. Do not edit `scripts/production/staff_test_support.py`.
+7. Add no guard, refusal or check (user rule, 2026-11-05).
+
+**Files:**
+- `scripts/production/test_add_unit.py`
+- `scripts/production/test_staff.py`
+- `scripts/production/test_fast_track.py`
+
+**Workers:** 2 writers; split by module
+- `impl` — `test_add_unit.py` and `test_fast_track.py`, role impl
+- `test` — `test_staff.py`, opens as impl
+
+**Constraints from prior phases:**
+- Phase 86: the reports `builds-natest-streamline-a.md` and `-b.md` found no copies. The suite grows by one new test for each case that a review finds.
+- `scripts/production/staff_test_support.py` is not natest's to edit (standing rule).
+- Phase 81: a fixture that commits in a tempdir repository sets `maintenance.auto false` before its first commit.
+- Tests never read or write live state: `~/.claude` main, `~/.local/state/merge-gate`, `/tmp/claude`.
+
+**Acceptance gate:**
+- The list names every removed or merged test, its case and its rule 2 result.
+- The test count and CPU s, processes and wall s before and after, from `module_cost.py` and same-load pairs, in the checkpoint notice.
+- Each changed file passes.
+- the targeted test green on the phase commit merged with `origin/builds`
+- `basedpyright` on the changed files prints `0 errors, 0 warnings, 0 notes`
