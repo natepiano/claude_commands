@@ -42,59 +42,35 @@
 
 **Files:**
 - `scripts/hooks/codex_hooks.py` — `CodexHook.timeout` returns whole seconds.
-- `scripts/hooks/test_codex_hooks.py` — the installed hooks file carries an `int` timeout for each handler.
+- `scripts/hooks/test_codex_hooks.py` — `install` repairs managed and unmanaged float timeouts.
+
+The same fix also landed from natedev-messaging (`Codex hook install writes integer timeouts`); the merge keeps that version, so this phase adds no change of its own.
 
 **Binds later work:** the herdr `SessionStart` hook reports a new Codex pane's thread at the first prompt, not at process start.
 
-**Gotchas:** `install` compares timeouts with `==`, and `10.0 == 10` in Python, so `install` does not rewrite an old file. An old `hooks.json` needs a one-time edit of `10.0` to `10`, then `install` in each Codex home, then `check`. natedev and the Mac were migrated on 2026-11-08.
+**Gotchas:** `install` rewrites a float timeout in an old `hooks.json` and trusts the changed handler again. natedev and the Mac were migrated by hand on 2026-11-08.
 
 ### Phase 3 — A Codex worker launch proves its thread without reading its rollout file  · status: done
 
-**Depends on:** Phase 2. panes Phase 28f runs after it.
+#### As-built
 
-#### Work Order
+Inside `herdr.launch_rollout_proof()` (`RolloutProofPhase.LAUNCH`), `herdr.native_process` for `codex` reads no rollout file. `_codex_launch_identity(pid, reported)` decides the thread:
+- With a `resume <id>` argument, a matching pane report gives `PaneSessionReport`; no report or another report gives `LaunchArgument(<id>)`, which `pane_native_process` turns into `UnreportedResume` when unreported.
+- With no `resume` argument, the pane report gives `PaneSessionReport(reported)`; no report raises `Codex launch identity is unavailable`.
 
-**Goal:** A Codex worker launch publishes the right thread on the first try, for a new and a resumed worker, and a dispatch that typed its prompt never says it did not.
+Under `RolloutProofPhase.STABLE` the rollout read stays, and `NoOpenCodexRollout` falls back to `_codex_launch_identity`.
 
-**Spec:**
-Faults (sdlc, 2026-11-08):
-1. A resumed worker fails assign with exit 8, `pid N: current Codex rollout changed` (agents fix3, 150 MB rollout, pid 2973548; fix4, 86 MB). A large rollout keeps it failing on retry. `codex_rollout_threads` stats the open rollout, reads its first line and stats it again. A resumed Codex appends to that same file, so the size changes between the two stats.
-2. A new worker fails with `Codex launch identity is unavailable`. Phase 2 found the main cause: Codex could not parse the hooks file, so the herdr `SessionStart` hook never reported the pane's thread. fix5 (pid 3736521) then published `01a1b950…`, a 13 h old thread of another worker, although the process held only its own rollout open.
-3. agents fix3's second resume exited 8 and printed `…; no prompt sent`, but the pane got the prompt and worked on it. `worker.py` `_dispatch_turn` prints `no prompt sent` for `DispatchEvidenceUnknown` also in its wait loop, after `_agent_command(…, "prompt", …)` typed the prompt. A retry then sends the job twice.
-
-Proved timing (models, 2026-11-08 12:30 EST, scratch pane, `~/.codex2`): herdr records the pane's `agent_session` about 2 s after the first prompt goes in, not at process start. The value equals the thread in the new rollout file name. `worker_panes.first_turn_session` already types a first turn and waits for that report.
-
-Design (panes 28c handoff, accepted by sdlc [1a39967b]):
-1. Inside `herdr.launch_rollout_proof()`, `herdr.native_process` for `codex` reads no rollout file.
-   - With a `resume <id>` argument: the thread is that argument. A matching pane report gives `PaneSessionReport`; no report gives `LaunchArgument`, which `pane_native_process` already turns into `UnreportedResume`. A report that names another thread keeps today's result, `LaunchArgument`.
-   - With no `resume` argument: the thread is the pane report, `PaneSessionReport(reported)`. With no report, raise `Codex launch identity is unavailable`, as today.
-2. Outside the launch proof (`RolloutProofPhase.STABLE`), the rollout read stays in this phase. Phase 5 removes it.
-3. In `worker.py` `_dispatch_turn`, every failure line printed after the prompt was typed says the prompt was delivered and names the pane, for example `anomaly: <worker>: <reason>; prompt delivered to pane <pane>`. Lines printed before typing keep `no prompt sent`. Exit codes do not change.
-
-Add no other check (user, 2026-11-05 and 2026-11-07).
-
-Test rows:
-- `scripts/herdr/test_herdr.py`, in the existing `native_process` launch tests:
-  1. A new launch with a foreign rollout open publishes the pane's reported thread.
-  2. A new launch with no rollout open publishes the pane's reported thread.
-  3. A resume publishes its argument thread.
-  4. A resume whose only open rollout is its own older file, growing while it is read, proves.
-- `scripts/production/test_worker.py`, in the existing dispatch tests:
-  5. A transcript failure after the prompt is typed reports the prompt as delivered.
+In `worker.py` `_dispatch_turn`, a `DispatchEvidenceUnknown` in the wait loop after the prompt is typed prints `anomaly: <worker>: <reason>; prompt delivered to pane <pane>`. The same failure before typing prints `no prompt sent`. Exit codes do not change.
 
 **Files:**
-- `scripts/herdr/herdr.py` — `native_process` under `RolloutProofPhase.LAUNCH`.
-- `scripts/herdr/test_herdr.py` — rows 1–4.
-- `scripts/production/worker.py` — `_dispatch_turn` failure lines after typing.
-- `scripts/production/test_worker.py` — row 5.
+- `scripts/herdr/herdr.py` — `_codex_launch_identity` and `native_process`.
+- `scripts/herdr/test_herdr.py` — `native_process` rows: stable, new launch with a foreign rollout, new launch with no rollout, resume, resume with a growing rollout.
+- `scripts/production/worker.py` — the wait-loop failure line.
+- `scripts/production/test_worker.py` — a transcript failure before and after delivery.
 
-**Workers:** 2 writers.
-- `impl`: `scripts/herdr/herdr.py`, `scripts/herdr/test_herdr.py` (rows 1–4).
-- `test`, as a writer: `scripts/production/worker.py`, `scripts/production/test_worker.py` (row 5).
+**Binds later work:** the `RolloutProofPhase.STABLE` read in `herdr.native_process` is the last rollout read on the launch path.
 
-**State:** none.
-
-**Acceptance gate:** `scripts.herdr.test_herdr`, `scripts.herdr.test_worker_panes`, `scripts.production.test_worker` and `scripts.production.test_worker_admission` pass; basedpyright is clean on the changed files; the merge gate passes.
+**Gotchas:** the herdr `SessionStart` hook reports a new Codex pane's thread about 2 s after the first prompt, not at process start. A resumed Codex appends to its own rollout file, so a stat, read and second stat of that file fails as "current Codex rollout changed".
 
 ### Phase 4 — A restored Codex worker resumes with its full launch policy  · status: todo
 
