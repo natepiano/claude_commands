@@ -32,7 +32,7 @@ State:
   Keep this id after a rename or a new current session.
 - `UNITS` — the production's staff rows with a present worktree. A retired row has a `RemovedWorktree`.
 - `ZONE` — the user's zone setting, which
-  `python3 ~/.claude/scripts/lib/user_zone.py` prints. It is one setting for
+  `~/.claude/scripts/lib/py ~/.claude/scripts/lib/user_zone.py` prints. It is one setting for
   every production; a doc's own **User zone** line is not read.
 - `CHECKOUT` — this session's checkout, which must be on `MERGE_BRANCH`.
 - `SCRATCH` — this session's scratchpad directory, for files that only this session needs.
@@ -73,11 +73,11 @@ State:
 
 <Throughout>
 - **Time.** Before writing any time, run
-  `python3 ~/.claude/scripts/production/update_registration.py time <ISO or HH:MM>
+  `~/.claude/scripts/lib/py ~/.claude/scripts/production/update_registration.py time <ISO or HH:MM>
   --production <showrunner name>`. For the current time, pass `"$(date -Iseconds)"`.
   Use its `HH:MM <zone>` output. Give every time in `ZONE` only, never UTC
   (user, 2026-10-02).
-- **Log.** Run `python3 ~/.claude/scripts/production/update_registration.py
+- **Log.** Run `~/.claude/scripts/lib/py ~/.claude/scripts/production/update_registration.py
   log "<event>" --production <showrunner name>` for each event. Add
   `--state SHOWRUNNER_STATE` once that file exists. The command writes
   the event line and each tenth `### STATE` block, including unit phase, last
@@ -297,7 +297,7 @@ State:
   When the user asks for the next question, show only the current item
   (`/next question`).
   List the questions in full only when the user asks what they are: run
-  `python3 ~/.claude/scripts/production/update_registration.py open
+  `~/.claude/scripts/lib/py ~/.claude/scripts/production/update_registration.py open
   --production <showrunner name>` and show its list in the order of `/next`, each item led
   by the production that owns it. A dailies report still lists what needs the user in full, because
   it is a report the user asked for. User, 2026-10-12, replacing the
@@ -309,7 +309,7 @@ State:
 - **Helpers.** Stop each named helper agent once its report is read.
 - **An auto-mode denial** is never retried or worked around. Tell the user what
   was denied and let them add a permission rule.
-- **Unmeasured ETAs.** When a unit has no measured phase ETA, run `python3
+- **Unmeasured ETAs.** When a unit has no measured phase ETA, run `~/.claude/scripts/lib/py
   ~/.claude/scripts/production/waiting.py eta-request <unit> --phase <phase>
   --production <showrunner name> --state-dir DAILIES_STATE_DIR` in that turn.
   Send its `request /unit:eta:` line to the unit director with `From the
@@ -323,7 +323,7 @@ State:
   2026-10-18: "i want footers gone for good").
 - **Open-questions list.** When the user-facing open list changes, set
   `open_for_user` in `SHOWRUNNER_STATE` to the complete new list, starting
-  from `OUTSTANDING`'s current items (`[]` clears it), and run `python3
+  from `OUTSTANDING`'s current items (`[]` clears it), and run `~/.claude/scripts/lib/py
   ~/.claude/scripts/production/update_registration.py questions --production
   <showrunner name> --state SHOWRUNNER_STATE`. It stores the list in
   `OUTSTANDING` and reviews each new question; paste each `reviewed question:`
@@ -386,7 +386,7 @@ screenshot and visual acceptance duties remain.
 ---
 
 <LoadProduction>
-Run `python3 ~/.claude/scripts/production/production_lifecycle.py load
+Run `~/.claude/scripts/lib/py ~/.claude/scripts/production/production_lifecycle.py load
 --production <showrunner name> --scratch <SCRATCH>`, adding `--resume` on resume.
 The command checks the checkout and copies state from `<SCRATCH>` when `STATE_DIR` lacks it.
 It reads the last `### STATE` block of `LOG` and each unit's run records.
@@ -408,7 +408,7 @@ When the production doc's **Production rules** say CI does not apply, pass
 
 <OpenMergeBranch>
 For a planned production, run
-`python3 ~/.claude/scripts/production/production_lifecycle.py open
+`~/.claude/scripts/lib/py ~/.claude/scripts/production/production_lifecycle.py open
 --production <showrunner name>`. The command creates and pushes the merge
 branch, records the running doc, finds the plans from staff rows and
 `.unit.toml`, and initializes `LOG`. Rerun it
@@ -454,7 +454,7 @@ the doc says `wrapped`. Each production has its own instance and log.
 
 At the start and on every resume, run:
 
-`python3 ~/.claude/scripts/production/update_registration.py register
+`~/.claude/scripts/lib/py ~/.claude/scripts/production/update_registration.py register
 --production <showrunner name>`
 
 This session's name is written nowhere: the update timer is addressed to its
@@ -687,9 +687,9 @@ message.
    reached. A rerun of the same hash resumes promotion.
 
 6. **After the push.** Run <CrossUnitChange/> when public items were renamed or removed or files
-   restructured. Run `python3 ~/.claude/scripts/production/ci_points.py due
+   restructured. Run `~/.claude/scripts/lib/py ~/.claude/scripts/production/ci_points.py due
    --production <showrunner name> --state-dir DAILIES_STATE_DIR` after each code
-   merge; when it says due, run <CIPoint/>. Run `python3
+   merge; when it says due, run <CIPoint/>. Run `~/.claude/scripts/lib/py
    ~/.claude/scripts/production/ci_points.py watch --production <showrunner name>
    --state-dir DAILIES_STATE_DIR` after each code checkpoint. Give the user its
    table on the first alert. A shrink adds no review-ledger row or CI count. While the
@@ -805,10 +805,10 @@ Merge nothing during validation. Before the push, check for an older queued or
 running CI run on `MERGE_BRANCH`; add `--cancel-prior` when this push supersedes
 it and no CI point is watching its result or diagnosing a red run. With
 `dangerouslyDisableSandbox: true`, run
-`python3 ~/.claude/scripts/production/ci_points.py ci start --production
+`~/.claude/scripts/lib/py ~/.claude/scripts/production/ci_points.py ci start --production
 <showrunner name> --state-dir DAILIES_STATE_DIR [--cancel-prior]` in the background.
 It validates, pushes, and records the CI run. When validation passes, start
-<PromoteMain/>'s smoke launch before the next merge. Then run `python3
+<PromoteMain/>'s smoke launch before the next merge. Then run `~/.claude/scripts/lib/py
 ~/.claude/scripts/production/ci_points.py ci collect --production
 <showrunner name> --state-dir DAILIES_STATE_DIR` in the background. Its last line is
 `--ci-green <tip>` only after the current tip's required jobs pass. When its
@@ -855,7 +855,7 @@ Promote the exact sha pushed by <CIPoint/> after these checks:
    is blocked passes. Add `macOS skipped (runner offline)` or `macOS skipped
    (Mac blocked)` to the log line. A macOS job that ran and failed blocks. User
    rule 2026-10-02.
-4. Run `python3 ~/.claude/scripts/production/production_lifecycle.py
+4. Run `~/.claude/scripts/lib/py ~/.claude/scripts/production/production_lifecycle.py
    promote-main --production <showrunner name> --ci-green <sha>
    --smoke-passed <sha>`. The command checks that main is not dirty, pushes
    and promotes the doc's **Promote:** destinations. A held main is a topic in
@@ -893,7 +893,7 @@ Use `cargo-berth sequence` for merge order.
    - **Preference:** "to avoid conflicts", "to build on their version". Never a
      block; tell the unit director to continue.
 
-   Before accepting a code block, run `python3 ~/.claude/scripts/production/waiting.py scratch-test
+   Before accepting a code block, run `~/.claude/scripts/lib/py ~/.claude/scripts/production/waiting.py scratch-test
    <waiting unit> --tests "<command>" --production <showrunner name>
    --state-dir DAILIES_STATE_DIR`. It tests a detached scratch checkout with
    `MERGE_BRANCH`, without the other unit's unmerged work. Green means it is
@@ -961,7 +961,7 @@ Use `cargo-berth sequence` for merge order.
    - `- HH:MM <zone>: block: <waiting unit> on <unit> (<code | files>: <what>), clears ~HH:MM`
    - `- HH:MM <zone>: block cleared: <waiting unit> on <unit>`
 
-   At each tick, run `python3 ~/.claude/scripts/production/waiting.py waits
+   At each tick, run `~/.claude/scripts/lib/py ~/.claude/scripts/production/waiting.py waits
    --production <showrunner name>` for berth overlaps, open waits and their ages.
    At 30 minutes past a wait's clear time, or one hour open without movement, act
    under rules 2 and 3 in that turn, an update tick included, and log the call.
@@ -1058,7 +1058,7 @@ checks that wait on the user's travel.
 A phase that runs past 8 hours is talked over with the user (user,
 2026-10-04). It never blocks the unit.
 
-At each tick, run `python3 ~/.claude/scripts/production/waiting.py agenda
+At each tick, run `~/.claude/scripts/lib/py ~/.claude/scripts/production/waiting.py agenda
 --production <showrunner name> --state-dir DAILIES_STATE_DIR`. Its new items are
 deduplicated per unit and phase; supply the cause, options and your pick.
 
@@ -1104,7 +1104,7 @@ land a phase sooner. Each design check covers every view of the change at once
 
 <CrossUnitChange>
 1. **Renamed or removed public items.** Search every other unit for uses of
-   the old name with `python3 ~/.claude/scripts/production/waiting.py search
+   the old name with `~/.claude/scripts/lib/py ~/.claude/scripts/production/waiting.py search
    <old name> <new name> --production <showrunner name>`. It lists branch and
    worktree sites with paths and lines.
 
@@ -1134,7 +1134,7 @@ Worker stops retain their panes at the shell and keep their conversations for re
 Move sessions with `accounts.py move SESSION_OR_GROUP claudeN --why "reason"`.
 Worker account moves resume each conversation in its existing pane on the target account.
 Unknown evidence leaves that worker unchanged and prints its reason; other proved moves continue.
-See `commands/shutdown.md` and `docs/accounts.md`.
+See `commands/agents.md` and `docs/accounts.md`.
 </StopResume>
 
 ---
@@ -1158,7 +1158,7 @@ condition: wrap neither waits on it nor retires its worktree or branch.
    - any other item that cannot be undone gets the user's OK first;
    - back up user data before migrating it.
    Finish each item before passing its exact text as `--close-out-done "<item>"`.
-3. Run `python3 ~/.claude/scripts/production/production_lifecycle.py wrap
+3. Run `~/.claude/scripts/lib/py ~/.claude/scripts/production/production_lifecycle.py wrap
    --production <showrunner name> --ci-green <sha> --smoke-passed <sha>
    --close-out-done "<item>"` (repeat the last flag for every item), or pass
    `--no-ci` when CI does not apply. The command holds on an unfinished close-out item,

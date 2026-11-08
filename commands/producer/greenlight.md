@@ -50,7 +50,7 @@ reading the Markdown yourself:
 
 ```sh
 set -o pipefail
-PYTHONPATH="$HOME/.claude/scripts" python3 -m berth.work_order \
+~/.claude/scripts/lib/py -m scripts.berth.work_order \
   --repository-root "${REPO}" resolve --document "<plan>" --phase <N> \
   | jq -r '.work_order.files[].path'
 ```

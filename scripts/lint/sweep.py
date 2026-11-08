@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
 """Keep a cargo project's target directory under a size budget.
 
 invoke.sh's run() starts `lint sweep` in the background after every build
@@ -152,6 +152,10 @@ test binaries. A running app counts too, so its target waits for it to exit.
 """
 
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import fcntl
 import hashlib
@@ -179,43 +183,39 @@ from functools import cache, cached_property
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, TypeGuard, cast, overload, override
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.message import send_budget, send_result, session_send
 from scripts.message.session_send import session_send_argv
 from scripts.lib import file_lock
 from scripts.lib.file_lock import PROC_LOCKS as PROC_LOCKS
-import conf
-from cargo_target_config import (
+from scripts.lib import conf
+from scripts.lib.cargo_target_config import (
     CargoFolderSetting,
     cargo_folder_settings,
     cargo_home_folder,
     cargo_workspace_manifest,
 )
-from process_failure import failure_detail
-from user_zone import user_zone  # noqa: E402
+from scripts.lib.process_failure import failure_detail
+from scripts.lib.user_zone import user_zone  # noqa: E402
 if TYPE_CHECKING:
-    from . import tmp_sweep
-    from ..copies import copies
-    from ..lib import scratch
-    from ..lib.atomic_file import write_text_atomic
-    from ..buildlog import index as build_index, record, store
-    from ..buildlog.step_outputs import (AbsoluteRecordedRoot, KnownStepStart, RecordedStepOutput, RecordedStepOutputs,
-                                        TargetFolderOverride, recorded_output_roots)
-    from ..notify.push_texts import RenderedPush
-    from ..notify import review
+    from scripts.lint import tmp_sweep
+    from scripts.copies import copies
+    from scripts.lib import scratch
+    from scripts.lib.atomic_file import write_text_atomic
+    from scripts.buildlog import index as build_index, record, store
+    from scripts.buildlog.step_outputs import (AbsoluteRecordedRoot, KnownStepStart, RecordedStepOutput, RecordedStepOutputs,
+                                              TargetFolderOverride, recorded_output_roots)
+    from scripts.notify.push_texts import RenderedPush
+    from scripts.notify import review
 else:
-    sys.path.insert(0, str(Path(__file__).resolve().parent))
     from scripts.copies import copies
     from scripts.lint import tmp_sweep
-    import scratch
-    from atomic_file import write_text_atomic
-    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "buildlog"))
-    import index as build_index
-    import record
-    import store
-    from step_outputs import (AbsoluteRecordedRoot, KnownStepStart, RecordedStepOutput, RecordedStepOutputs,
-                              TargetFolderOverride, recorded_output_roots)
+    from scripts.lib import scratch
+    from scripts.lib.atomic_file import write_text_atomic
+    from scripts.buildlog import record
+    from scripts.buildlog import store
+    from scripts.buildlog import index as build_index
+    from scripts.buildlog.step_outputs import (AbsoluteRecordedRoot, KnownStepStart, RecordedStepOutput, RecordedStepOutputs,
+                                              TargetFolderOverride, recorded_output_roots)
 
 from scripts.lib.conf import UseConfiguredValue
 from scripts.lib import copy_record
@@ -1350,12 +1350,8 @@ def holder_sessions(pids: Sequence[int]) -> dict[int, str]:
     """The live Claude session each pid runs under: the nearest ancestor a session record names."""
     if not pids:
         return {}
-    if TYPE_CHECKING:
-        from ..message import process_table
-        from ..message.sessions import live_sessions
-    else:
-        import process_table
-        from sessions import live_sessions
+    from scripts.message import process_table
+    from scripts.message.sessions import live_sessions
     try:
         table = process_table.snapshot()
     except (OSError, subprocess.CalledProcessError):
@@ -3255,7 +3251,6 @@ def folder_choices(measurement: DiskMeasurement, protected: Sequence[tuple[str, 
 @cache
 def prepare_push_texts() -> None:
     """Add the notification module path once per process."""
-    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "notify"))
 
 
 def folder_recommendation(choices: FolderChoices, shortfall: int) -> str:
@@ -3301,10 +3296,10 @@ def folder_choice_lines(choices: FolderChoices, shortfall: int, *, path_limit: i
 def disk_floor_push(free: int, floor: int, choices: FolderChoices) -> RenderedPush:
     """Render free space, the alert line, and one folder recommendation."""
     if TYPE_CHECKING:
-        from ..notify.push_texts import render
+        from scripts.notify.push_texts import render
     else:
         prepare_push_texts()
-        from push_texts import render
+        from scripts.notify.push_texts import render
     folder_action = ("In the natedev Claude session, reply measure or delete nothing."
                      if isinstance(choices, UnavailableFolderChoices)
                      else "In the natedev Claude session, say which folders to delete.")
@@ -3375,10 +3370,10 @@ def send_holder_message(session: str, message: str, *,
 def disk_floor_channels() -> FloorAlertChannels:
     """Keep phone delivery disabled until the user records a current approval."""
     if TYPE_CHECKING:
-        from ..notify.push_texts import approval_date
+        from scripts.notify.push_texts import approval_date
     else:
         prepare_push_texts()
-        from push_texts import approval_date
+        from scripts.notify.push_texts import approval_date
     return (FloorAlertChannels.NATEDEV_AND_PHONE if approval_date("sweep.disk_floor")
             else FloorAlertChannels.NATEDEV)
 
@@ -3391,11 +3386,11 @@ def send_phone_push(phone: RenderedPush, *,
     if isinstance(lint_settings, UseConfiguredValue):
         lint_settings = conf.read("lint")
     if TYPE_CHECKING:
-        from ..notify.push_texts import user_send_argv
+        from scripts.notify.push_texts import user_send_argv
     else:
         prepare_push_texts()
-        from push_texts import user_send_argv
-        import review
+        from scripts.notify.push_texts import user_send_argv
+        from scripts.notify import review
     command = user_send_argv(phone)
     command[1] = str(session_send.SEND_SCRIPT)
     command.extend(crossing_send_argv(repeat))
@@ -3416,12 +3411,7 @@ def send_floor_alert(message: str, *,
     return send_holder_message("natedev", message, repeat=repeat, lint_settings=lint_settings)
 
 
-if TYPE_CHECKING:
-    from ..message import sessions
-else:
-    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "build_hold"))
-    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "message"))
-    import sessions
+from scripts.message import sessions
 
 
 @dataclass(frozen=True)
@@ -3435,10 +3425,7 @@ def build_hold_targets(targets: Sequence[str], known_trees: dict[str, list[str]]
     lint_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
 ) -> dict[str, BuildHoldTarget]:
     """Protect session workspaces and recently written build trees without reading build output."""
-    if TYPE_CHECKING:
-        from ..build_hold import build_hold
-    else:
-        import build_hold
+    from scripts.build_hold import build_hold
     if isinstance(lint_settings, UseConfiguredValue):
         lint_settings = conf.read("lint")
     state = build_hold.read_holders(build_hold.holder_directory())

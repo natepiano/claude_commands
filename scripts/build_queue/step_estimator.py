@@ -13,13 +13,8 @@ import re
 import sqlite3
 from typing import Callable, Literal, cast
 
-import sys
 from pathlib import Path
-from typing import TYPE_CHECKING
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "buildlog"))
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lint"))
 
 from scripts.lib.cargo_output import CargoOutputRoots, CargoOutputUnavailable
 from scripts.build_queue.admission_records import (
@@ -54,21 +49,11 @@ from scripts.build_queue.admission_records import (
     test_threads,
 )
 
-if TYPE_CHECKING:
-    from scripts.lint.build_shape import (BuildShape, NoBuildShape, CompileCountUnknown, NoCratesCompiled,
-        StepEvidence, build_shape, index_step_evidence, recorded_build_shape, step_index)
-    from scripts.lib.test_phase import TEST_STEPS
-    from scripts.buildlog import parse, record, repository, store
-    from scripts.buildlog import index as file_marks
-else:
-    from build_shape import (BuildShape, NoBuildShape, CompileCountUnknown, NoCratesCompiled,
-        StepEvidence, build_shape, index_step_evidence, recorded_build_shape, step_index)
-    from test_phase import TEST_STEPS
-    import parse
-    import record
-    import repository
-    import store
-    import index as file_marks
+from scripts.lint.build_shape import (BuildShape, NoBuildShape, CompileCountUnknown, NoCratesCompiled,
+    StepEvidence, build_shape, index_step_evidence, recorded_build_shape, step_index)
+from scripts.lib.test_phase import TEST_STEPS
+from scripts.buildlog import parse, record, repository, store
+from scripts.buildlog import index as file_marks
 
 # 111 natedev filtered single-test runs with no recompilation in the 14 days
 # to 2026-10-29 had anon p90 0.671 GiB and p95 0.784 GiB.

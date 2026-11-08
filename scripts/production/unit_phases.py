@@ -7,25 +7,29 @@ Without `--production`, the caller's staff row names the production.
 The phase and task come from the unit's run records.
 """
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import json
 import sys
+import subprocess
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import cast
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-
-import live_units
-from scripts.production import showrunners, staff, unit_lookup
+from scripts.production import live_units
+from scripts.production import session_staff, showrunners, staff, staff_sources, unit_lookup
 from scripts.production.production_doc import Refusal, production_field, read_production
 from scripts.shutdown import remote
+from scripts.lib import conf
+from scripts.lib.process_failure import failure_detail
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "direct"))
-import phase_table
+from scripts.direct import phase_table
 from scripts.direct import plan_history
 
-import display_cells
+from scripts.production import display_cells
 
 # A task longer than this is cut, so one verification command cannot widen the whole table.
 TASK_WIDTH = 80
@@ -70,10 +74,10 @@ def task_cell(record: object) -> str:
 
 
 def table(units: list[live_units.LiveUnit], records: dict[str, object]) -> str:
-    lines = ["| Unit | Phase | Task |", "| --- | --- | --- |"]
+    lines = ["| Unit | Status | Phase | Task |", "| --- | --- | --- | --- |"]
     for unit in units:
         record = records.get(unit.unit)
-        cells = (display_cells.session_cell(unit), phase_cell(record), task_cell(record))
+        cells = (unit.unit, unit.status, phase_cell(record), task_cell(record))
         lines.append("| " + " | ".join(display_cells.escaped(cell) for cell in cells) + " |")
     return "\n".join(lines)
 
@@ -87,7 +91,7 @@ def is_style_production(doc: Path) -> bool:
 
 def style_ledger_paths(doc: Path, units: list[live_units.LiveUnit]) -> dict[str, Path]:
     """Resolve ledgers from the staff rows, even when phase records fail."""
-    import style_ledger
+    from scripts.style import style_ledger
 
     try:
         rows = {row.name: row for row in unit_lookup.doc_units(doc, staff.snapshot())}
@@ -107,6 +111,22 @@ def style_ledger_paths(doc: Path, units: list[live_units.LiveUnit]) -> dict[str,
     return paths
 
 
+def send_anomalies(lines: tuple[str, ...]) -> None:
+    """Send one notice; a delivery failure does not change the table result."""
+    if not lines:
+        return
+    try:
+        target = conf.read("production").text("UNIT_ANOMALIES_TO")
+        done = subprocess.run([sys.executable, str(showrunners.SEND), "--to", target,
+                               "--from", "unit_phases.py", "--text", "\n".join(lines)],
+                              capture_output=True, text=True, check=False)
+        if done.returncode:
+            detail = " ".join(failure_detail(done).splitlines())
+            print(f"anomaly: could not send unit anomalies to {target}: {detail}")
+    except (OSError, conf.Unusable) as error:
+        print(f"anomaly: could not send unit anomalies: {' '.join(str(error).splitlines())}")
+
+
 def main(arguments: list[str]) -> int:
     match arguments:
         case ["--production", name]:
@@ -120,27 +140,32 @@ def main(arguments: list[str]) -> int:
         case _:
             print("usage: unit_phases.py [--production <staff name>]", file=sys.stderr)
             return 2
-    try:
-        doc = read_production(name).doc
-        style = is_style_production(doc)
-        with ThreadPoolExecutor(max_workers=2) as reads:
-            sessions = reads.submit(live_units.units_of, name)
-            if style:
-                import style_units
-            records = cast(dict[str, object], json.loads(phase_table.show_production(doc)))
-            units = sessions.result()
-        paths = style_ledger_paths(doc, units) if style and units else {}
-    except (OSError, ValueError, Refusal) as error:
-        print(f"unit_phases: {error}", file=sys.stderr)
-        return 1
-    if not units:
-        print("no live units")
-        return 0
-    if style:
-        import style_units
-        print(style_units.table(units, records, doc=doc, ledger_paths=paths))
-    else:
-        print(table(units, records))
+    with session_staff.anomalies() as rendering_lines:
+        try:
+            doc = read_production(name).doc
+            style = is_style_production(doc)
+            with ThreadPoolExecutor(max_workers=2) as reads:
+                sessions = reads.submit(live_units.read_units, name,
+                                        check=staff_sources.CodexProcessThreads().check)
+                records = cast(dict[str, object], json.loads(phase_table.show_production(doc)))
+                listing = sessions.result()
+                units = listing.units
+            paths = style_ledger_paths(doc, units) if style and units else {}
+            if not units:
+                output = "no live units"
+            elif style:
+                from scripts.production import style_units
+                output = style_units.table(units, records, doc=doc, ledger_paths=paths)
+            else:
+                output = table(units, records)
+        except (OSError, ValueError, Refusal) as error:
+            print(f"unit_phases: {error}", file=sys.stderr)
+            return 1
+    print(output)
+    lines = tuple(dict.fromkeys((*listing.anomalies, *rendering_lines)))
+    for line in lines:
+        print(line)
+    send_anomalies(lines)
     return 0
 
 

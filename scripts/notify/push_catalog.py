@@ -1,6 +1,6 @@
 """Script phone texts and named cases reviewed before delivery."""
-from gpu_xid import XID_MEANINGS
-from push_texts import ActionTemplate, NoActionNeeded, PushExample, PushText, SessionTemplate, decision_values
+from scripts.notify.gpu_xid import XID_MEANINGS
+from scripts.notify.push_texts import ActionTemplate, NoActionNeeded, PushExample, PushText, SessionTemplate, decision_values
 
 # Codex usage destination: https://learn.chatgpt.com/docs/pricing (read 2026-10-14).
 # Real quota case: notify/review.jsonl, 2026-10-13T22:30:22.569264-04:00.
@@ -115,7 +115,7 @@ ENTRIES = (
         purpose="A session waits for you to answer its permission prompt.",
         session=SessionTemplate("{unit}")),
     PushText("shutdown.restart_failed", "shutdown", "decision", "Claude coding work remains stopped",
-        ActionTemplate('In the Claude session named natedev on the natedev computer, run /shutdown restart {account}.'),
+        ActionTemplate('In the Claude session named natedev on the natedev computer, run /agents restart {account}.'),
         "After your restart request, {stopped} on Claude account {account} did not restart on {machine}. "
         + "Coding work stays stopped until the restart succeeds.\n\n"
         + "The restart gave this error: {cause}.\n\n"
@@ -128,7 +128,7 @@ ENTRIES = (
         purpose="One restart problem sends one push with the failed session count."),
     PushText("shutdown.restart_untrusted", "shutdown", "decision", "Stopped Claude work needs folder trust",
         ActionTemplate("In a terminal on {machine}, run ~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py trust. "
-                       + "Then run /shutdown restart {account} in the natedev session."),
+                       + "Then run /agents restart {account} in the natedev session."),
         "After your restart request, {stopped} on Claude account {account} could not start on {machine}. Coding work stays stopped. "
         + "The first command trusts the configured folders. The second retries stopped sessions.",
         (PushExample("typical", {"stopped": "3 sessions", "machine": "natedev", "account": "claude2"}),),
@@ -151,7 +151,7 @@ ENTRIES = (
              "machine": "Mac", "source": "claude2", "target": "claude4"})),
         purpose="A session stopped for an account move did not start on its new account."),
     PushText("shutdown.restart_incomplete", "shutdown", "decision", "Claude restart could not be confirmed",
-        ActionTemplate('In the Claude session named natedev on the natedev computer, run /shutdown restart {account}.'),
+        ActionTemplate('In the Claude session named natedev on the natedev computer, run /agents restart {account}.'),
         "The restart of Claude account {account} could not be confirmed on {machine}. "
         + "Its stopped sessions may still be unable to work. Retrying asks any sessions that are still stopped to start again.",
         (PushExample("typical", {"account": 'claude2', "machine": "Mac"}),

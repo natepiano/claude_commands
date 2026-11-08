@@ -1,6 +1,10 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
 """Save the shared layout and refresh detection rules on a runtime schedule."""
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import argparse
 import fcntl
@@ -13,7 +17,6 @@ import tomllib
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
-sys.path.insert(0, str(ROOT))
 from scripts.lib import process_group
 from scripts.maintenance.settings import schedule, table
 
@@ -45,7 +48,7 @@ def run_job() -> int:
             print("herdr-upkeep: not due; exit 0")
             return 0
         started = time.monotonic()
-        with subprocess.Popen([sys.executable, str(Path(__file__).resolve()), "--work"],
+        with subprocess.Popen([str(ROOT / "scripts/lib/py"), str(Path(__file__).resolve()), "--work"],
                               cwd=ROOT, start_new_session=True) as child:
             try:
                 code = child.wait(timeout=cadence.timeout_seconds)

@@ -1,10 +1,14 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
 """Apply one approved names or values rule; test its clean workspace tree once on natedev.
 
 Each original decision keeps a normal proposal ticket. All tickets share one checkpoint.
 This command never sends messages or changes approvals.
 """
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import argparse
 import hashlib
@@ -23,22 +27,21 @@ from enum import Enum
 from pathlib import Path
 from typing import Protocol, cast, override
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.copies import copies
-import style_sync
+from scripts.style import style_sync
 
-import bulk_constants as constants
-import bulk_rename as bulk
-import approved_renames
-import coverage_report
-import rules
-import style_ledger as ledger_api
-import style_proposals
-import style_footprint as rust
-from approved_renames import (BindingRename, NoBindingScope, NoMachineRenameRule, machine_rename_rule,
+from scripts.style import bulk_constants as constants
+from scripts.style import bulk_rename as bulk
+from scripts.style import approved_renames
+from scripts.style import coverage_report
+from scripts.style import rules
+from scripts.style import style_ledger as ledger_api
+from scripts.style import style_proposals
+from scripts.style import style_footprint as rust
+from scripts.style.approved_renames import (BindingRename, NoBindingScope, NoMachineRenameRule, machine_rename_rule,
                               refactor_rename, rename_declaration, type_named_parameter)
-from issues import Issue, frontmatter
-from proposal_issue import ApprovedDecision, UnansweredDecision, decision_answer
+from scripts.production.issues import Issue, frontmatter
+from scripts.production.proposal_issue import ApprovedDecision, UnansweredDecision, decision_answer
 
 
 @dataclass(frozen=True)
@@ -791,13 +794,8 @@ def plan_constants(repo: Path, ledger: ledger_api.Ledger, base: str, selected: S
             findings.append(current)
     # Target discovery shares the frozen manifest/path reader with source ownership.
     # No export is needed; snapshots never consult untracked files or write sources.
-    entries = git(repo, "ls-tree", "-rz", base).split("\0")
-    blobs: dict[str, str] = {}
-    for entry in filter(None, entries):
-        header, path = entry.split("\t", 1)
-        mode, kind, blob = header.split()
-        if kind == "blob" and mode in {"100644", "100755"}:
-            blobs[path] = blob
+    blobs = {path: entry.object for path, entry in ledger_api.tree_entries(repo, base).items()
+             if entry.kind == "blob" and entry.mode in ledger_api.REGULAR_FILE_MODES}
     contents = {path: data for path, data in ledger_api.blob_contents(repo, blobs)}
     members = rules.workspace_members({path: data.decode() for path, data in contents.items()
                                       if Path(path).name == "Cargo.toml"})
@@ -1013,12 +1011,12 @@ def tested_tree_proof(checkout: Path, tree: str, runner: Runner, times: dict[str
     """Test and lint the exact clean tree, then require its machine-wide final pass record.
 
     Keep all evidence checks here. A zero command exit alone never authorizes publication.
-    The query fails closed until builds' final-pass integration is available.
+    The query fails closed until the saved final pass integration is available.
     """
     require_test_tree(checkout, tree)
     verify = str(Path.home() / ".claude/scripts/direct/verify.sh")
     for stage, arguments in (("verify_final", ("final",)), ("verify_lint", ("lint",)),
-                             ("final_pass", ("final-pass", tree))):
+                             ("final_pass", ("final", "--saved", "--tree", tree))):
         started = time.monotonic()
         try:
             result = runner(checkout, ("bash", verify, *arguments))
@@ -1349,7 +1347,7 @@ def run_crates(repo: Path, packages: Sequence[str], run_id: str, rule: str, base
                runner: Runner = run_command,
                available: Callable[[Path, str], None] = bulk.check_available) -> int:
     """Enter the lifecycle through a deferred typed command; crate_run depends on this API."""
-    handler = cast(CrateCommand, getattr(importlib.import_module("crate_run"), "run_crates"))
+    handler = cast(CrateCommand, getattr(importlib.import_module("scripts.style.crate_run"), "run_crates"))
     return handler(repo, packages, run_id, rule, base_tree, destination, ledger, server, runner, available)
 
 
@@ -1391,7 +1389,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.dry_run:
             location = ledger_api.ledger_location(args.repo)
             with ledger_api.Ledger(location.repo, location.database, access=ledger_api.LedgerAccess.READ_ONLY) as ledger:
-                handler = cast(DryRunCommand, getattr(importlib.import_module("crate_run"), "dry_run_crates"))
+                handler = cast(DryRunCommand, getattr(importlib.import_module("scripts.style.crate_run"), "dry_run_crates"))
                 print(json.dumps(handler(args.repo, args.crate, args.rule, args.base_tree, ledger), indent=2))
                 return 0
         if socket.gethostname().split(".")[0] != "natedev":
@@ -1411,5 +1409,5 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 if __name__ == "__main__":
     # crate_run imports this module: keep one class identity when entered as a script.
-    import bulk_run
+    from scripts.style import bulk_run
     raise SystemExit(bulk_run.main())

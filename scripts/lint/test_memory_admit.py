@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
 """Memory admission with only temporary history, cgroups, and ledgers."""
 
 from __future__ import annotations
@@ -26,36 +26,29 @@ from dataclasses import replace
 from functools import cached_property
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import TYPE_CHECKING, BinaryIO, Literal, cast, override
+from typing import BinaryIO, Literal, cast, override
 from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from scripts.lint import memory_admit as gate, tmp_sweep
 from scripts.lib.cargo_output import CargoOutputRoots, CargoOutputUnavailable
 from scripts.lib.cargo_output_test_support import fake_cargo_output_roots
-import conf
+from scripts.lib.build_steps import read_step_names
+from scripts.lib import conf
 from scripts.build_queue.scope_activity import IdleService, RunningServiceJob, LiveBuildRun, NoLiveBuildRun
 from scripts.build_queue import progress_profile as progress
 from scripts.build_queue import admission_client as client, admission_protocol as wire, admission_service as service, queue_view, queue_evidence
 from scripts.build_queue.admission_test_support import queue_decision, AdmissionFixture, InjectedCrash, only_admitted
 from scripts.build_queue.queue_fixture import write_memory_config as write_memory_config, fixture_queue_inputs, fixture_reservation, write_process, ci_step
-import nextest_budget as budget
-from build_shape import BuildShape, CompiledCrates, build_shape
-from memory_test_support import fake_memory_readings, gate_isolation_environment, write_config_fixture, write_config_fault, commit_config_fixture
-if TYPE_CHECKING:
-    from ..buildlog import store
-    from ..buildlog import record as buildlog_record
-    from ..buildlog import index as file_marks
-    from ..lib import test_hang_guard
-    from ..message.roster import UnitLabels
-else:
-    import store
-    import record as buildlog_record
-    import index as file_marks
-    from scripts.lib import test_hang_guard
-    from scripts.message.roster import UnitLabels
+from scripts.lint import nextest_budget as budget
+from scripts.lint.build_shape import BuildShape, CompiledCrates, build_shape
+from scripts.lint.memory_test_support import fake_memory_readings, gate_isolation_environment, write_config_fixture, write_config_fault, commit_config_fixture
+from scripts.buildlog import store
+from scripts.buildlog import record as buildlog_record
+from scripts.buildlog import index as file_marks
+from scripts.lib import test_hang_guard
+from scripts.message.roster import UnitLabels
 
 READY_FOR_ADMISSION = gate.ReadyForAdmission()
 
@@ -1478,7 +1471,7 @@ class FreshTestPromiseTests(unittest.TestCase):
                     "BUILDLOG_TREE_START": "same-source", "BUILDLOG_TEST_BUILD_KEY": "current-key"}), \
                     patch.object(buildlog_record, "git_directory", return_value=str(self.worktree)), \
                     patch.object(buildlog_record, "git_facts", return_value={"worktree": str(self.worktree)}), \
-                    patch("treekey.tree_key", return_value=ending_source), \
+                    patch("scripts.buildlog.treekey.tree_key", return_value=ending_source), \
                     patch.object(buildlog_record, "rustc_version", return_value="rustc fixture"), \
                     patch.object(store, "host_name", return_value=self.host), \
                     patch.object(store, "host_file", return_value=path):
@@ -2072,7 +2065,7 @@ class TestPhaseChargeTests(MemoryQueueFixture):
                 self.assertEqual(running.promise, hold.memory.need)
                 assert isinstance(running.step.measured, gate.MeasuredMemory)
                 self.assertIsInstance(running.step.measured.peak_history, gate.TestPhaseStarted)
-                text = queue_evidence.running_text(running, reading.explanation, {}, ZoneInfo("UTC"))
+                text = queue_evidence.running_text(running, reading.explanation, {}, ZoneInfo("UTC"), names=read_step_names())
                 self.assertIn(f"tests started: need {expected:.1f} GiB", text)
                 self.assertIn(f"test peak {peak / GIB:.1f} GiB, history 3.0 GiB x 1.2", text)
                 self.assertIn(queue_evidence.keep_aside_text(hold), text)
@@ -2227,7 +2220,7 @@ class TestPhaseChargeTests(MemoryQueueFixture):
                 self.assertEqual(gate.read_test_phase_need(record), gate.NoTestPhaseNeed("not_recorded"))
 
     def test_charge_wire_types_have_one_shared_owner(self) -> None:
-        import test_phase
+        from scripts.lib import test_phase
 
         pairs = (
             (gate.TestPhaseChargeUse, test_phase.TestPhaseChargeUse),
@@ -2240,7 +2233,7 @@ class TestPhaseChargeTests(MemoryQueueFixture):
                 self.assertIs(exported, shared)
 
     def test_shared_charge_check_rejects_invalid_fields(self) -> None:
-        import test_phase
+        from scripts.lib import test_phase
 
         evidence: dict[str, object] = {
             "bytes": 8192, "selected_at": 123, "reservation_id": "own",
@@ -2259,7 +2252,7 @@ class TestPhaseChargeTests(MemoryQueueFixture):
                 _ = test_phase.parse_test_phase_charge_use({**evidence, **change})
 
     def test_saved_charge_keeps_admission_need_validation(self) -> None:
-        import test_phase
+        from scripts.lib import test_phase
 
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "reservation.json"
@@ -5113,7 +5106,7 @@ class QueueLeaveTests(unittest.TestCase):
         (scripts / "lib").mkdir(parents=True)
         (scripts / "buildlog").mkdir()
         py = scripts / "lib/py"
-        _ = py.write_text('#!/bin/sh\nexec python3 "$@"\n')
+        _ = py.write_text((Path(__file__).resolve().parents[1] / "lib/py").read_text())
         py.chmod(0o755)
         _ = (scripts / "buildlog/record.py").write_text(
             f"import sys\nwith open({str(self.recorded)!r}, 'a') as log:\n    log.write(sys.argv[1] + '\\n')\n")
@@ -5136,6 +5129,7 @@ class QueueLeaveTests(unittest.TestCase):
             + "width = row['test_threads']\nassert isinstance(width, RequestedTestWidth)\n"
             + "print(json.dumps({'test_threads': width.threads}))\n")
         self.environment["TEST_CAPTURE_WIDTH"] = str(capture)
+        self.environment["TEST_PY"] = str(Path(__file__).resolve().parents[1] / "lib/py")
         self.environment["PYTHONPATH"] = str(Path(__file__).resolve().parents[2])
 
 
@@ -5162,8 +5156,8 @@ class QueueLeaveTests(unittest.TestCase):
         self.admission.server.reply_filter = advance_memory
         command = ('source "$1"; buildlog_memory_python() { '
                    + 'if [[ "$1" == "$BUILDLOG_MEM_ADMIT_SCRIPT" ]]; then shift; '
-                   + 'python3 -c \'import sys; from scripts.lint.test_memory_admit import queue_leave_client_main; '
-                   + 'sys.exit(queue_leave_client_main(sys.argv[1:]))\' "$@"; else python3 "$@"; fi; }; '
+                   + '"$TEST_PY" -c \'import sys; from scripts.lint.test_memory_admit import queue_leave_client_main; '
+                   + 'sys.exit(queue_leave_client_main(sys.argv[1:]))\' "$@"; else "$TEST_PY" "$@"; fi; }; '
                    + f'status=0; {step} || status=$?; '
                    + 'printf "%s|%s|%s\\n" "$status" "$BUILDLOG_MEM_OUTCOME" "${BUILDLOG_START:-}"')
         result = subprocess.run(["bash", "-c", command, "test", str(INVOKE), str(self.ran)],
@@ -5231,7 +5225,7 @@ class QueueLeaveTests(unittest.TestCase):
 
     def nextest_step(self, ran_args: Path, reservation: Path) -> str:
         return ('LINT_TEST_WIDTH=logical; cargo() { [[ "$*" == "nextest --version" ]] && return 0; '
-                + f'printf "%s\\n" "$*" > "{ran_args}"; python3 "$TEST_CAPTURE_WIDTH" > "{reservation}"; }}; '
+                + f'printf "%s\\n" "$*" > "{ran_args}"; "$TEST_PY" "$TEST_CAPTURE_WIDTH" > "{reservation}"; }}; '
                 + 'run_nextest --workspace')
 
     def test_a_run_waiting_for_memory_claims_its_share_only_once_admitted(self) -> None:

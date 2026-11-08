@@ -10,8 +10,6 @@ from scripts.production import staff
 def staff_child_command(script: Path, rows: list[staff.StaffRow], *arguments: str) -> list[str]:
     """Keep fake runtime identities separate from the live staff record."""
     source = """import json, runpy, sys
-from pathlib import Path
-sys.path.insert(0, sys.argv.pop(1))
 from scripts.production import staff
 values = json.loads(sys.argv.pop(1))
 rows = tuple(staff.StaffRow(staff.StaffId(row['id']), row['kind'], row['name'],
@@ -23,5 +21,5 @@ staff.local_snapshot = staff.snapshot
 sys.argv = sys.argv[1:]
 runpy.run_path(sys.argv[0], run_name='__main__')
 """
-    return ["/bin/bash", str(Path(__file__).resolve().parents[2] / "scripts/lib/py"), "-c", source, str(Path(__file__).resolve().parents[2]),
+    return ["/bin/bash", str(Path(__file__).resolve().parents[1] / "lib/py"), "-c", source,
             json.dumps([row.to_json() for row in rows]), str(script), *arguments]

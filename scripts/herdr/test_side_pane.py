@@ -7,21 +7,17 @@ import os
 import signal
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
-from typing import Literal, cast, override
+from typing import Literal, override
 from unittest.mock import patch
 
-from scripts.herdr import side_pane, worker_panes
+from scripts.herdr import herdr, pane_launch, side_pane, worker_panes
 from scripts.herdr.test_worker_panes import PaneWorld
 from scripts.lib import conf
 from scripts.lib.atomic_file import write_text_atomic
-from scripts.lib.test_models_registry import write_registry
 from scripts.production import staff
 from scripts.production.staff_test_support import StaffTestCase, fixture_member, fixture_runtime_id
-from scripts.accounts import accounts
-from scripts.shutdown import stop_resume
-
-import herdr
-import pane_launch
+from scripts.direct import assign
+from scripts.production.test_worker import PaneCommandRouter
 
 
 class SidePaneTests(StaffTestCase):
@@ -32,39 +28,25 @@ class SidePaneTests(StaffTestCase):
     signals: list[tuple[int, int]] = []
     launch_limits: list[int] = []
 
+    def __init__(self, methodName: str = "runTest") -> None:
+        super().__init__(methodName)
+        self.router: PaneCommandRouter = PaneCommandRouter()
+
     @override
     def setUp(self) -> None:
         super().setUp()
         _ = self.write_document({"schema": 2, "rows": []})
-        _ = self.enterContext(patch.object(herdr, "herdr_binary", return_value="/nonexistent/herdr"))
         self.world = PaneWorld()
         self.openings = []
-        self.signals = []
+        self.signals = self.world.signals
         self.launch_limits = []
         self.launch_interrupt = ""
         self.caller_id = fixture_runtime_id("ad-hoc-caller")
-        config = self.root / "conf"
-        config.mkdir()
-        write_text_atomic(config / "direct.conf", "# range: 0.1..0.9\nWORKER_SPLIT_RATIO=0.667\n"
-                          + "# range: 1..600\nPANE_AGENT_START_SECONDS=90\n"
-                          + "# whole: 1..\nUNIT_COMPACT_ABOVE_TOKENS=53000\n")
-        registry = write_registry(config / "models.conf")
-        _ = cast(object, self.enterContext(patch.dict(os.environ, {
-            "XDG_STATE_HOME": str(self.root / "state"), "CONF_DIR": str(config),
-            "MODELS_CONFIG_FILE": str(registry), "MODELS_CONFIG_PUBLISH": "0",
-            "HERDR_PANE_RECORD_DIR": str(self.root / "pane-records"),
-            "CLAUDE_CONFIG_DIR": str(self.root / "claude"),
-            "CODEX_HOME": str(self.root / "codex"),
-            "HERDR_PROC": str(self.root / "proc"), "AGENTS_CALLER_FAMILY": "",
-        })))
-        _ = self.enterContext(patch.object(herdr, "Herdr", return_value=self.world))
+        self.world.setup(self, compact_above_tokens=53000)
+        self.router.setup(self, self.root)
         _ = self.enterContext(patch.object(staff, "runtime_id", side_effect=lambda: self.caller_id))
-        _ = self.enterContext(patch.object(herdr, "native_process", side_effect=self.world.native_process))
-        _ = self.enterContext(patch.object(herdr, "_startup_processes", side_effect=self.world.descendants))
         _ = self.enterContext(patch.object(herdr, "launch_prepared_agent", side_effect=self.launch))
-        _ = self.enterContext(patch.object(os, "kill", side_effect=self.signal))
-        _ = self.enterContext(patch.object(accounts, "role_account", return_value=accounts.CodexWorkersAccount("fixture", self.root / "codex")))
-        _ = self.enterContext(patch.object(accounts, "account_for_unscoped_launch", return_value=accounts.LegacyHomeLaunch()))
+        _ = self.enterContext(patch.object(os, "kill", side_effect=self.world.signal))
         self.caller("claude")
 
     def caller(self, family: Literal["claude", "codex"], *, member: bool = False) -> None:
@@ -92,21 +74,10 @@ class SidePaneTests(StaffTestCase):
         self.launch_limits.append(timeout_ms)
         result = self.world.launch(name, destination, prepared, kind, agent_arguments, opening, timeout_ms,
                                    agent=agent, reported_unknown=reported_unknown)
-        pid = self.world.foreground[result.pane][0]
-        process = self.root / "proc" / str(pid)
-        process.mkdir(parents=True, exist_ok=True)
-        write_text_atomic(process / "stat", f"{pid} (fixture) S " + "0 " * 18 + "1\n")
         if self.launch_interrupt == "agent":
             self.launch_interrupt = ""
             raise OSError("lost launch acknowledgement")
         return result
-
-    def signal(self, pid: int, number: int) -> None:
-        self.signals.append((pid, number))
-        for pane, (agent_pid, _, _) in tuple(self.world.foreground.items()):
-            if pid == agent_pid:
-                self.world.stops.append(self.world.processes[pid].identity.id)
-                del self.world.foreground[pane]
 
     def command(self, *arguments: str) -> tuple[int, str, str]:
         with redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as errors:
@@ -114,7 +85,7 @@ class SidePaneTests(StaffTestCase):
         return code, output.getvalue(), errors.getvalue()
 
     def start(self, label: str = "friend") -> side_pane.OpenSidePane:
-        result = side_pane.open(label, cwd=self.root)
+        result = side_pane.open(label, assign.pane_policy("friend"), cwd=self.root)
         self.assertIsInstance(result, side_pane.OpenSidePane)
         assert isinstance(result, side_pane.OpenSidePane)
         return result
@@ -139,7 +110,7 @@ class SidePaneTests(StaffTestCase):
         for family in ("claude", "codex"):
             with self.subTest(family=family):
                 self.caller(family)
-                opened = side_pane.open("worker-policy-" + family, cwd=self.root)
+                opened = side_pane.open("worker-policy-" + family, assign.pane_policy("friend"), cwd=self.root)
                 self.assertIsInstance(opened, side_pane.OpenSidePane)
                 self.assertEqual(self.world.requests[-1][0], family)
                 arguments = self.world.requests[-1][1]
@@ -207,12 +178,16 @@ class SidePaneTests(StaffTestCase):
                 self.assertEqual(question.read_text(), "Review this design.")
                 self.assertEqual(self.command("close", label)[0], 0)
         self.assertEqual(staff.snapshot().rows, before)
+        self.assertEqual(self.router.worker_commands, [])
+        for command in self.router.commands:
+            self.assertEqual(command[command.index("--target") + 1], "consultation-pane")
+            self.assertEqual(command[command.index("--policy") + 1], "friend")
         self.assertIn("w1:p0", self.world.locations)
 
     def test_open_sends_the_whole_question_after_start_without_reading_the_composer(self) -> None:
         question = "Review the design.\nExplain the result."
         with patch.object(self.world, "composer", side_effect=AssertionError("composer must not be read")):
-            result = side_pane.open("friend", question=question, cwd=self.root)
+            result = side_pane.open("friend", assign.pane_policy("friend"), question=question, cwd=self.root)
         self.assertIsInstance(result, side_pane.OpenSidePane)
         assert isinstance(result, side_pane.OpenSidePane)
         self.assertIsInstance(self.openings[-1], herdr.NoOpeningPrompt)
@@ -240,9 +215,9 @@ class SidePaneTests(StaffTestCase):
         self.assertEqual(self.world.closed, [])
 
     def test_repeated_open_with_a_question_sends_nothing(self) -> None:
-        first = side_pane.open("friend", question="First question.", cwd=self.root)
+        first = side_pane.open("friend", assign.pane_policy("friend"), question="First question.", cwd=self.root)
         commands = self.world.commands.copy()
-        second = side_pane.open("friend", question="Second question.", cwd=self.root)
+        second = side_pane.open("friend", assign.pane_policy("friend"), question="Second question.", cwd=self.root)
         self.assertEqual(second, first)
         self.assertEqual(self.world.commands, commands)
         self.assertEqual(len(self.world.launches), 1)
@@ -340,7 +315,7 @@ class SidePaneTests(StaffTestCase):
 
     def test_close_retains_a_terminal_that_moves_after_the_stop(self) -> None:
         result = self.start()
-        send_signal = self.signal
+        send_signal = self.world.signal
 
         def move(pid: int, number: int) -> None:
             send_signal(pid, number)
@@ -362,9 +337,30 @@ class SidePaneTests(StaffTestCase):
         self.assertIn("Use the same terminal.", self.world.commands[-1][3])
         self.assertEqual(self.world.stops, [])
 
+    def test_friend_prompt_refuses_a_terminal_that_changes_before_submission(self) -> None:
+        result = self.start()
+        message = self.root / "message.md"
+        write_text_atomic(message, "Review the second question.")
+        submit = self.world.prompt_terminal
+        before = self.world.commands.copy()
+
+        def changed_terminal(pane: str, terminal: str, text: str) -> None:
+            self.world.locations[pane]["terminal_id"] = "replacement-terminal"
+            submit(pane, terminal, text)
+
+        with patch.object(self.world, "prompt_terminal", side_effect=changed_terminal):
+            code, output, errors = self.command("send", "friend", "--message-file", str(message))
+        self.assertEqual(code, worker_panes.ExitCode.UNCERTAIN)
+        self.assertEqual(output, "")
+        self.assertEqual(len(errors.splitlines()), 1, errors)
+        self.assertIn("terminal", errors)
+        self.assertEqual(self.world.commands, before)
+        self.assertIn(result.pane, self.world.locations)
+        self.assertEqual(self.world.closed, [])
+
     def test_close_rerun_after_agent_stop_keeps_the_same_terminal(self) -> None:
         result = self.start()
-        send_signal = self.signal
+        send_signal = self.world.signal
 
         pid = self.world.foreground[result.pane][0]
 
@@ -381,7 +377,7 @@ class SidePaneTests(StaffTestCase):
 
     def test_a_busy_terminal_after_the_stop_keeps_its_pane(self) -> None:
         result = self.start()
-        send_signal = self.signal
+        send_signal = self.world.signal
 
         pid = self.world.foreground[result.pane][0]
 
@@ -389,7 +385,8 @@ class SidePaneTests(StaffTestCase):
             send_signal(agent_pid, number)
             self.world.activate(fixture_runtime_id("other-work"), result.pane, "claude")
 
-        with patch.object(os, "kill", side_effect=busy), patch.object(stop_resume, "STOP_GRACE_SECONDS", 0):
+        write_text_atomic(self.root / "conf/shutdown.conf", "# range: 0..300\nSTOP_GRACE_SECONDS=0\n")
+        with patch.object(os, "kill", side_effect=busy):
             code, _, errors = self.command("close", "friend")
         self.assertEqual(code, 8)
         self.assertIn("agent has not ended", errors)
@@ -444,6 +441,10 @@ class SidePaneTests(StaffTestCase):
             return run(*arguments, deadline=deadline)
 
         with patch.object(self.world, "run", side_effect=fail_close):
+            closed = side_pane.close("friend")
+            self.assertIsInstance(closed, side_pane.SidePaneCloseUnavailable)
+            assert isinstance(closed, side_pane.SidePaneCloseUnavailable)
+            self.assertIn("close", closed.reason)
             self.assertEqual(self.command("close", "friend")[0], 8)
         self.assertEqual(pane_launch.read_valid_entries(path)[result.pane], entry)
         self.assertIn(result.pane, self.world.locations)
@@ -485,8 +486,8 @@ class SidePaneTests(StaffTestCase):
         def retained(agent_pid: int, number: int) -> None:
             self.signals.append((agent_pid, number))
 
-        with patch.object(os, "kill", side_effect=retained), patch.object(
-                stop_resume, "STOP_GRACE_SECONDS", 0):
+        write_text_atomic(self.root / "conf/shutdown.conf", "# range: 0..300\nSTOP_GRACE_SECONDS=0\n")
+        with patch.object(os, "kill", side_effect=retained):
             code, _, errors = self.command("close", "friend")
         self.assertEqual(code, 8)
         self.assertIn("agent has not ended", errors)

@@ -1,6 +1,7 @@
 """Build resume messages and commands for existing worker threads."""
 from __future__ import annotations
 
+import shlex
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -13,7 +14,7 @@ from scripts.production import staff
 
 @dataclass(frozen=True)
 class NoAccountMove:
-    """The resume does not change accounts."""
+    """Keep the current account."""
 
 
 @dataclass(frozen=True)
@@ -23,13 +24,18 @@ class AccountMove:
 
 
 @dataclass(frozen=True)
+class IdleWorker:
+    """The worker has no active dispatch."""
+
+
+@dataclass(frozen=True)
 class BusyPass:
     dispatch_id: str
 
 
 @dataclass(frozen=True)
-class IdleWorker:
-    """The worker has no open pass to continue."""
+class NoOwnPass:
+    """The recipient has no active pass."""
 
 
 @dataclass(frozen=True)
@@ -72,26 +78,32 @@ class ResumeWorkers(NamedTuple):
     panes: Sequence[PaneWorkerResume] = ()
 
 
-NO_WORKERS = ResumeWorkers((), "")
 NO_ACCOUNT_MOVE = NoAccountMove()
+NO_WORKERS = ResumeWorkers()
+NO_OWN_PASS = NoOwnPass()
+
+
+def launcher_prompt(worker: staff.StaffId, dispatch_id: str, command: Sequence[str]) -> str:
+    """Build launcher instructions; the prompt client adds the script envelope."""
+    return (f"Resume worker {worker}, dispatch {dispatch_id}. "
+            + f"Run this saved command from your session shell: {shlex.join(command)}")
 
 
 def resume_message(why: str, *, move: NoAccountMove | AccountMove = NO_ACCOUNT_MOVE,
-                   workers: ResumeWorkers = NO_WORKERS, context: str = "") -> str:
+                   workers: ResumeWorkers = NO_WORKERS, context: str = "",
+                   own_pass: BusyPass | NoOwnPass = NO_OWN_PASS) -> str:
+    moved = f" You were moved from {move.source} to {move.destination}." if isinstance(move, AccountMove) else ""
+    if isinstance(own_pass, BusyPass):
+        opening = context or f"You were stopped and resumed because {why}.{moved}"
+        return script_prompt(f"{opening}\nContinue pass {own_pass.dispatch_id} in this conversation. Keep the same pass id.")
     lines: list[str] = []
-    move_text = f" You were moved from {move.source} to {move.destination}." if isinstance(move, AccountMove) else ""
-    if workers.panes:
-        busy = [worker.turn for worker in workers.panes if isinstance(worker.turn, BusyPass)]
-        if not busy:
-            return ""
-        lines.append(context or f"You were stopped and resumed because {why}.{move_text}")
-        for turn in busy:
-            lines.append(f"Continue pass {turn.dispatch_id} in this conversation. Keep the same pass id.")
-        return script_prompt("\n".join(lines))
     if why or context:
-        opening = context or f"You were stopped and resumed because {why}.{move_text} Continue where you stopped."
+        opening = context or f"You were stopped and resumed because {why}.{moved} Continue where you stopped."
         lines.append(opening.rstrip() + " First run `~/.claude/scripts/lib/py ~/.claude/scripts/message/send.py pending` "
                      + "for messages kept while you were down, then continue from there; if you were waiting on the user, keep waiting.")
+    for pane in workers.panes:
+        turn = f"busy dispatch {pane.turn.dispatch_id}" if isinstance(pane.turn, BusyPass) else "idle"
+        lines.append(f"Worker {pane.staff_id}: {turn}. Continue with this worker's existing conversation.")
     if workers.results:
         lines.append("Resume your workers; do not open new ones.")
         for result in workers.results:
@@ -106,7 +118,7 @@ def resume_message(why: str, *, move: NoAccountMove | AccountMove = NO_ACCOUNT_M
         lines.append("Each worker continues its own thread; after resuming, send later work with --to as usual.")
     elif why:
         lines.append("Codex workers keep their existing threads. Use assign.sh --to <worker> to resume a paused worker.")
-    text = ("\n" if workers.results else " ").join(lines)
+    text = ("\n" if workers.results or workers.panes else " ").join(lines)
     return script_prompt(text)
 
 
@@ -159,12 +171,11 @@ def _resume_task(seat: PausedSeat, cwd: str, prompt: str) -> str:
             options.append((option, value))
         position += 2
     if launcher not in assign_gate.ASSIGN_LAUNCHERS:
-        review = launcher == "review.sh"
         arguments = command[position:]
-        if len(arguments) < (3 if review else 9):
+        if len(arguments) < 3:
             raise ValueError("the saved command has incomplete task arguments")
-        options.append(("--role", "review" if review else arguments[5]))
-        if review and len(arguments) > 6:
+        options.append(("--role", "review"))
+        if len(arguments) > 6:
             options.append(("--pass", str(max(1, int(arguments[6])))))
             for offset, option in ((7, "--lens"), (8, "--early-ready")):
                 if len(arguments) > offset and arguments[offset] and option not in dict(options):

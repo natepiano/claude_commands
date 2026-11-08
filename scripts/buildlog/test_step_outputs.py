@@ -2,32 +2,22 @@
 
 from __future__ import annotations
 
-import sys
 import tempfile
 import unittest
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, final, override
+from typing import final, override
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-from test_index import use_test_log
+from scripts.buildlog.test_index import use_test_log
 
 use_test_log()
 
-if TYPE_CHECKING:
-    from .step_outputs import (
-        AbsoluteRecordedRoot, KnownStepStart, RecordedRoot, RecordedStepOutputs, RecordedRootsUnavailable,
-        RecordedStepOutput, RelativeRecordedRoot, StepStart, TargetFolderOverride, UnknownRecordedRoot, UnknownStepStart,
-        recorded_output_roots,
-    )
-    from .step_outputs_test_support import create_step_index, record_root_attempt
-else:
-    from scripts.buildlog.step_outputs import (
-        AbsoluteRecordedRoot, KnownStepStart, RecordedRoot, RecordedStepOutputs, RecordedRootsUnavailable,
-        RecordedStepOutput, RelativeRecordedRoot, StepStart, TargetFolderOverride, UnknownRecordedRoot, UnknownStepStart,
-        recorded_output_roots,
-    )
-    from scripts.buildlog.step_outputs_test_support import create_step_index, record_root_attempt
+from scripts.buildlog.step_outputs import (
+    AbsoluteRecordedRoot, KnownStepStart, RecordedRoot, RecordedStepOutputs, RecordedRootsUnavailable,
+    RecordedStepOutput, RelativeRecordedRoot, StepStart, TargetFolderOverride, UnknownRecordedRoot, UnknownStepStart,
+    recorded_output_roots,
+)
+from scripts.buildlog.step_outputs_test_support import create_step_index, record_root_attempt
 
 
 UNKNOWN_ROOT = UnknownRecordedRoot()

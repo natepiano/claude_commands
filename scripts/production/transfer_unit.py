@@ -1,16 +1,17 @@
 #!/usr/bin/env python3
 """Change a unit's staff parent."""
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import argparse
 from dataclasses import dataclass
-from pathlib import Path
 import subprocess
 import sys
 from typing import cast
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from scripts.production import showrunners, staff, staff_move, staff_sources
 from scripts.production.production_doc import Production, Refusal, read_production

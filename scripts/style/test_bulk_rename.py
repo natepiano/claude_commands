@@ -4,7 +4,7 @@ Real LSP and compiler tests use BULK_RENAME_REAL_TOOLS=1; the merge gate never s
 """
 from __future__ import annotations
 
-from ledger_test_support import ticket_owner_id
+from scripts.style.ledger_test_support import ticket_owner_id
 
 import json
 import os
@@ -22,18 +22,18 @@ from pathlib import Path
 from typing import cast, override
 from unittest import mock
 
-import bulk_rename as bulk
-from style_child_test_support import StyleQueueFake, unqueued_style_children
-import approved_renames
-from approved_renames import OuterBindingBlocked, OuterBindingUnproved
-import berth_board
-import rules
-import style_ledger
-from ledger_test_support import remove_generation_schema, style_staff_fixture
-import style_rules
+from scripts.style import bulk_rename as bulk
+from scripts.style.style_child_test_support import StyleQueueFake, unqueued_style_children
+from scripts.style import approved_renames
+from scripts.style.approved_renames import OuterBindingBlocked, OuterBindingUnproved
+from scripts.lib import berth_board
+from scripts.style import rules
+from scripts.style import style_ledger
+from scripts.style.ledger_test_support import remove_generation_schema, style_staff_fixture
+from scripts.style import style_rules
 from scripts.direct.test_verify_untested_examples import rust_tool_path, workspace_metadata
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
-from approved_renames import AppliedInCode, BindingRename, NoBindingScope, binding_rename_check, binding_scope, rename_declaration
+from scripts.style.approved_renames import AppliedInCode, BindingRename, NoBindingScope, binding_rename_check, binding_scope, rename_declaration
 
 
 class ScriptedServer:
@@ -178,7 +178,7 @@ class CargoProjectTests(unittest.TestCase):
 
 class RenameTests(CargoProjectTests):
     def test_bulk_rename_uses_current_parameters_instead_of_anchor_blockers(self) -> None:
-        from test_approved_renames import PARAMETER_CHANGES
+        from scripts.style.test_approved_renames import PARAMETER_CHANGES
         for label, source, current, blocked in PARAMETER_CHANGES:
             with self.subTest(parameter=label):
                 server = ScriptedServer(lambda text, offset, new: word_edits(text, "g", new))
@@ -201,7 +201,7 @@ class RenameTests(CargoProjectTests):
                     self.assertEqual(result.edited, current.replace("|g| g", "|checkout_info| checkout_info"))
 
     def test_unread_local_body_never_reaches_analyzer_after_a_signature_change(self) -> None:
-        from test_approved_renames import UNREAD_LOCAL_BODIES
+        from scripts.style.test_approved_renames import UNREAD_LOCAL_BODIES
         for label, source in UNREAD_LOCAL_BODIES:
             with self.subTest(body=label):
                 current = source.replace("label()", "label(extra: usize)")
@@ -217,7 +217,7 @@ class RenameTests(CargoProjectTests):
                 self.assertIn("containing item body unread", refusal.reason)
 
     def test_proved_item_with_unread_body_reaches_the_bulk_rename_proof(self) -> None:
-        from test_approved_renames import UNREAD_ITEM_BODIES
+        from scripts.style.test_approved_renames import UNREAD_ITEM_BODIES
         for label, source in UNREAD_ITEM_BODIES:
             with self.subTest(body=label):
                 server = ScriptedServer(lambda text, offset, new: word_edits(text, "g", new))
@@ -228,7 +228,7 @@ class RenameTests(CargoProjectTests):
                 self.assertEqual(result.edited, source.replace("fn g(", "fn checkout_info("))
 
     def test_generic_parameters_refuse_before_any_bulk_rename_request(self) -> None:
-        from test_approved_renames import GENERIC_PARAMETER_BINDINGS
+        from scripts.style.test_approved_renames import GENERIC_PARAMETER_BINDINGS
         self.assert_local_declarations_refuse_before_bulk_rename(GENERIC_PARAMETER_BINDINGS)
 
     def assert_local_declarations_refuse_before_bulk_rename(self, forms: tuple[tuple[str, str], ...]) -> None:
@@ -243,11 +243,11 @@ class RenameTests(CargoProjectTests):
                 self.assertIsInstance(refusal, bulk.BlockedRename)
 
     def test_field_expression_bindings_refuse_before_any_bulk_rename_request(self) -> None:
-        from test_approved_renames import FIELD_EXPRESSION_BINDINGS
+        from scripts.style.test_approved_renames import FIELD_EXPRESSION_BINDINGS
         self.assert_local_declarations_refuse_before_bulk_rename(FIELD_EXPRESSION_BINDINGS)
 
     def test_bulk_anchor_matrix_never_requests_a_rename_without_current_identity(self) -> None:
-        from test_approved_renames import IDENTICAL_BINDING_ITEMS
+        from scripts.style.test_approved_renames import IDENTICAL_BINDING_ITEMS
         original = IDENTICAL_BINDING_ITEMS
         for probe in ("missing_anchor", "later_base", "removed", "raw_pair"):
             with self.subTest(probe=probe):
@@ -266,7 +266,7 @@ class RenameTests(CargoProjectTests):
                 self.assertIsInstance(result.refusals[0], bulk.BlockedRename)
 
     def test_bulk_admission_never_substitutes_an_identical_sibling_for_a_renamed_target(self) -> None:
-        from test_approved_renames import IDENTICAL_BINDING_ITEMS
+        from scripts.style.test_approved_renames import IDENTICAL_BINDING_ITEMS
         original = IDENTICAL_BINDING_ITEMS
         current = original.replace("first()", "first(checkout_info: usize)").replace("|g| g", "|checkout_info| checkout_info", 1)
         finding = self.finding(original, "g", "checkout_info", 2)
@@ -280,7 +280,7 @@ class RenameTests(CargoProjectTests):
         assert isinstance(refusal, bulk.BlockedRename)
         self.assertIsInstance(refusal.blocker, OuterBindingUnproved)
         # The unblocked format-capture path retains the existing analyzer proof.
-        from test_approved_renames import CAPTURE_BINDING_ITEM
+        from scripts.style.test_approved_renames import CAPTURE_BINDING_ITEM
         def capture_edits(text: str, _offset: int, new: str) -> tuple[bulk.SourceEdit, ...]:
             begin = text.index("{g}") + 1
             return (*word_edits(text, "g", new), bulk.SourceEdit(begin, begin + 1, new))
@@ -294,7 +294,7 @@ class RenameTests(CargoProjectTests):
         self.assertIn('println!("{checkout_info}")', capture.edited)
 
     def test_bulk_admission_refuses_duplicate_recorded_item_paths(self) -> None:
-        from test_approved_renames import DUPLICATE_BINDING_ITEM_PATH
+        from scripts.style.test_approved_renames import DUPLICATE_BINDING_ITEM_PATH
         source = DUPLICATE_BINDING_ITEM_PATH
         server = ScriptedServer(lambda text, offset, new: word_edits(text, "g", new))
         result = self.rename(source, (self.finding(source, "g", "checkout_info", 2),), server)
@@ -305,7 +305,7 @@ class RenameTests(CargoProjectTests):
         self.assertIn("item path is not unique", refusal.reason)
 
     def test_inner_attributes_in_every_enclosing_scope_refuse_before_analyzer_rename(self) -> None:
-        from test_approved_renames import INHERITED_INNER_ATTRIBUTES
+        from scripts.style.test_approved_renames import INHERITED_INNER_ATTRIBUTES
         # The bulk entry point reads the source after a later outer parameter arrives too.
         self.assert_outer_block_before_analyzer("fn label(checkout_info: usize) {\nmap(|g| g + 1)\n}\n")
         for label, source in INHERITED_INNER_ATTRIBUTES:
@@ -322,7 +322,7 @@ class RenameTests(CargoProjectTests):
                 self.assertIn("unresolved attribute macro 'inject'", refusal.reason)
 
     def test_item_presence_refusals_never_request_an_analyzer_rename(self) -> None:
-        from test_approved_renames import PRESENCE_REFUSALS
+        from scripts.style.test_approved_renames import PRESENCE_REFUSALS
         for label, source, line, expected in PRESENCE_REFUSALS:
             with self.subTest(form=label):
                 server = ScriptedServer(lambda text, offset, new: word_edits(text, "g", new))
@@ -1766,7 +1766,7 @@ pub fn run(parameter: usize) -> usize {
         self.assertIn("is exported by provider", result.refusals[0].reason)
 
     def test_real_refactor_hidden_clash_is_reverted_by_workspace_check(self) -> None:
-        import bulk_run
+        from scripts.style import bulk_run
         source = ('#![allow(dead_code, unused_imports, unexpected_cfgs)]\nmod provider { pub fn unused() {} }\n'
                   'use provider::*;\ninclude!("generated.rs");\nfn f() { let old = 1; let _ = old; }\n')
         _ = (self.repo / "src/lib.rs").write_text(source)

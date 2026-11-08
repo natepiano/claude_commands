@@ -2,16 +2,18 @@
 """Block one stop when the assistant defers work because of context."""
 
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import json
 import re
 import sys
 from bisect import bisect_left, bisect_right
 from dataclasses import dataclass
-from pathlib import Path
 from typing import TypedDict, cast
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.lib import conf
 
 REASON = "Compaction runs by itself mid-work; do the work now."

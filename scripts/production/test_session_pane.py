@@ -23,14 +23,14 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "herdr"))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "message"))
 
 from scripts.lib.socket_test_support import short_socket_directory
-import session_pane
-import herdr
-import sessions
-import unit_lookup
-from herdr import AgentBlocked, HerdrPlace, HerdrRefusal, SessionListResult
-from fake_herdr import CommandResponse
-import fake_unit_host
-from sessions import SessionRecord
+from scripts.production import session_pane
+from scripts.herdr import herdr
+from scripts.message import sessions
+from scripts.production import unit_lookup
+from scripts.herdr.herdr import AgentBlocked, HerdrPlace, HerdrRefusal, SessionListResult
+from scripts.herdr.fake_herdr import CommandResponse
+from scripts.production import fake_unit_host
+from scripts.message.sessions import SessionRecord
 from scripts.production.staff_test_support import fixture_runtime_id, isolated_staff_file, unit_membership
 from scripts.production.cli_fixture import invoke_cli
 from scripts.message import sessions as runtime_sessions
@@ -58,7 +58,7 @@ class SessionPaneTests(unittest.TestCase):
             yield submit
 
     def test_source_record_failure_prevents_pane_input(self) -> None:
-        import script_prompts
+        from scripts.lib import script_prompts
 
         with (mock.patch.object(script_prompts, "record", side_effect=OSError("record failed")),
               self.prompt_submission() as submit):
@@ -202,7 +202,7 @@ class SessionPaneTests(unittest.TestCase):
         reply = subprocess.CompletedProcess(["fixture"], 0,
             '{"result":{"agents":[{"pane_id":"w1:p1","agent":"claude","agent_status":"blocked"}]}}', "")
         with (mock.patch.object(time, "monotonic", return_value=100.0),
-              mock.patch("herdr.run_program", return_value=reply) as program):
+              mock.patch("scripts.herdr.herdr.run_program", return_value=reply) as program):
             for deadline, expected in ((100.5, 0.5), (float("inf"), 10.0)):
                 with self.subTest(deadline=deadline):
                     self.assertEqual(session_pane.read_place(place, deadline=deadline), reply.stdout)

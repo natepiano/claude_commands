@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from scripts.shutdown import remote
+
 import io
 import json
 import os
@@ -157,7 +159,7 @@ class WasteWatchTests(unittest.TestCase):
             "- impl codex rker-one: 14% of 1,050,000 weighted",
             "- impl codex rker-two: 100% of 51,000 weighted",
             "Most common waiting action: sleep (2 requests).",
-            "See more: python3 ~/.claude/scripts/usage/usage_report.py wait_share --by unit,role "
+            "See more: ~/.claude/scripts/lib/py ~/.claude/scripts/usage/usage_report.py wait_share --by unit,role "
             + "--since 2026-10-16T10:00:00+00:00",
         ])
         self.assertEqual(self.alert_times(), {"alpha": NOW.isoformat()})
@@ -233,7 +235,7 @@ class WasteWatchTests(unittest.TestCase):
         _ = doc.write_text("# Loose production\n")
         owner = recorded_showrunner("loose-owner", doc)
         _ = fixture_member("unit", name="loose", parent=owner.id,
-                           worktree=staff.PresentWorktree("natedev", Path("/invented/loose")))
+                           worktree=staff.PresentWorktree(remote.local_machine(), Path("/invented/loose")))
         self.request("loose", 0, 900_000, folder="/invented/loose")
         self.wait("loose", 1, 500_000, folder="/invented/loose")
         output = self.run_watch()
@@ -284,7 +286,7 @@ class WasteWatchTests(unittest.TestCase):
             + "250,000 tokens for 5 or more requests in a row in the last 2 hours",
             "Context above 250,000 tokens, so compaction is not happening:",
             "- impl codex k-worker: 5 requests in a row, peak 300,000 tokens",
-            "See more: python3 ~/.claude/scripts/usage/usage_report.py wait_share --by unit,role "
+            "See more: ~/.claude/scripts/lib/py ~/.claude/scripts/usage/usage_report.py wait_share --by unit,role "
             + "--since 2026-10-16T10:00:00+00:00",
         ])
 

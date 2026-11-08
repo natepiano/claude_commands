@@ -16,17 +16,17 @@ import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-import issues
-import proposals_folder
-import proposals_table
+from scripts.production import issues
+from scripts.production import proposals_folder
+from scripts.production import proposals_table
 from scripts.production import showrunners, staff
 from scripts.production.staff_test_support import StaffTestCase, production_membership, recorded_showrunner, fixture_member
-import showrunner_tree
-from proposals_table import ADD_ON_STATE, IN_PROGRESS_STATE, REVIEW_STATE, Row
+from scripts.production import showrunner_tree
+from scripts.production.proposals_table import ADD_ON_STATE, IN_PROGRESS_STATE, REVIEW_STATE, Row
 from scripts.lib import conf
 
 # Importable once proposals_table has put scripts/direct on the path.
-import phase_table
+from scripts.direct import phase_table
 from scripts.direct import plan_history
 
 

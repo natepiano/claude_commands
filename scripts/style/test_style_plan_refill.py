@@ -2,12 +2,11 @@
 
 from __future__ import annotations
 
-from ledger_test_support import ticket_owner_id
+from scripts.style.ledger_test_support import ticket_owner_id
 
 import io
 import os
 import sqlite3
-import sys
 import traceback
 import unittest
 from contextlib import closing, redirect_stdout
@@ -15,19 +14,18 @@ from pathlib import Path
 from typing import final
 from unittest import mock
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-import style_plan
-import rules
-import style_proposals
+from scripts.style import style_plan
+from scripts.style import rules
+from scripts.style import style_proposals
 
-import berth_board
-import coverage_report
-import style_ledger
+from scripts.lib import berth_board
+from scripts.style import coverage_report
+from scripts.style import style_ledger
 
 from scripts.production import staff
 
-from style_plan_test_support import StylePlanFixture
+from scripts.style.style_plan_test_support import StylePlanFixture
 
 
 @final

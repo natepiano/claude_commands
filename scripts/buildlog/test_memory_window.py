@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
 """Snapshot and instant-window CLI contracts against fixtures, never host state."""
 
 from __future__ import annotations
@@ -8,34 +8,23 @@ from __future__ import annotations
 import contextlib
 import json
 import os
-import socket
 import subprocess
-import sys
 import tempfile
 import unittest
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import TYPE_CHECKING, cast, override
+from typing import cast, override
 from unittest.mock import patch
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lint"))
-if TYPE_CHECKING:
-    from ..lint.memory_test_support import config_environment
-else:
-    from memory_test_support import config_environment
+from scripts.lint.memory_test_support import config_environment
 
-import index
-import memory
-import scratch
-import sweep
-from cgroup_test_support import CPU, GIB, IO_LINES, ZRAM_READING, slice_reading, write_cgroup, write_zram
-import store
-from test_index import Record, call, encode, point_root_at, sample, step
-if TYPE_CHECKING:
-    from ..lib import test_hang_guard
-else:
-    from scripts.lib import test_hang_guard
+from scripts.buildlog import index, memory, store
+from scripts.lib import scratch
+from scripts.lint import sweep
+from scripts.buildlog.cgroup_test_support import CPU, GIB, IO_LINES, ZRAM_READING, slice_reading, write_cgroup, write_zram
+from scripts.buildlog.test_index import Record, call, encode, point_root_at, sample, step
+from scripts.lib import test_hang_guard
+from scripts.buildlog import record
 
 CLI = Path(__file__).with_name("cli.py")
 START = "2026-10-04T23:30-07:00"
@@ -43,6 +32,20 @@ END = "2026-10-05T00:30-07:00"
 START_UTC = "2026-10-05T06:30:00.000Z"
 END_UTC = "2026-10-05T07:30:00.000Z"
 
+
+
+def configured_local_host() -> str:
+    """Read the local record host from the fixture's target configuration."""
+    return record.local_step_identity().hosts[0]
+
+
+def configured_host_cli(script: Path, *arguments: str) -> list[str]:
+    """Use the configured record host in the child process."""
+    return [str(Path(__file__).resolve().parents[1] / "lib/py"), "-c",
+            "import runpy, sys; "
+            + "script = sys.argv.pop(1); sys.argv[0] = script; "
+            + "from scripts.buildlog import record, store; store.host_name = lambda: record.local_step_identity().hosts[0]; "
+            + "runpy.run_path(script, run_name='__main__')", str(script), *arguments]
 
 def write_lint_config(root: Path, adjustment: int | str, *, include_adjustment: bool = True) -> Path:
     path = root / "lint.conf"
@@ -117,6 +120,7 @@ class MemoryWindowTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         self.base = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
+        _ = self.enterContext(patch.object(store, "host_name", side_effect=configured_local_host))
         self.enterContext(patch.dict(os.environ, config_environment(self.base)))
         self.root = self.base / "buildlog"
         self.fake_bin = self.base / "bin"
@@ -161,7 +165,7 @@ class MemoryWindowTests(unittest.TestCase):
 
     def cli(self, *args: str) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
-            [sys.executable, str(CLI), *args],
+            configured_host_cli(CLI, *args),
             cwd=self.base,
             env=self.env(),
             capture_output=True,
@@ -280,7 +284,7 @@ class MemoryWindowTests(unittest.TestCase):
         self.assertEqual(len(lines), 1)
         recorded = cast(Record, json.loads(lines[0]))
         self.assertEqual(recorded["kind"], "memory_snapshot")
-        self.assertEqual(recorded["host"], socket.gethostname().split(".")[0])
+        self.assertEqual(recorded["host"], configured_local_host())
         self.assertTrue(str(recorded["at"]).endswith("Z"))
         slices = cast(dict[str, Record], recorded["slices"])
         self.assertEqual({key: slices["builds"][key] for key in (
@@ -573,7 +577,7 @@ class MemoryWindowTests(unittest.TestCase):
         self.assertIn("kernel OOM kills: 0", empty.stdout)
 
     def test_missing_journal_command_is_unavailable(self) -> None:
-        with patch("memory.subprocess.run", side_effect=FileNotFoundError):
+        with patch("scripts.buildlog.memory.subprocess.run", side_effect=FileNotFoundError):
             result = memory.journal_messages([], datetime.fromisoformat(START), datetime.fromisoformat(END))
         self.assertIs(result, memory.JournalUnavailable.VALUE)
 

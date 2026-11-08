@@ -9,17 +9,11 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from enum import Enum, auto
 from pathlib import Path
-from typing import TYPE_CHECKING, cast
+from typing import cast
 
-if __package__:
-    from . import store
-else:
-    import store
+from scripts.buildlog import store
 
-if TYPE_CHECKING:
-    from ..lib.cargo_target_config import cargo_config_values, cargo_path_argument
-else:
-    from scripts.lib.cargo_target_config import cargo_config_values, cargo_path_argument
+from scripts.lib.cargo_target_config import cargo_config_values, cargo_path_argument
 
 
 @dataclass(frozen=True)

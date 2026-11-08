@@ -1,21 +1,24 @@
 #!/usr/bin/env python3
 """List a showrunner's recorded units, each with its session now."""
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import sys
-from pathlib import Path
+from collections.abc import Callable
 from typing import NamedTuple
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-
-from scripts.production import showrunners, staff
-import unit_lookup
+from scripts.production import session_staff, showrunners, staff
+from scripts.production import unit_lookup
 
 
 class LiveUnit(NamedTuple):
     unit: str
     # None when no observed herdr session has the unit identity.
     session: unit_lookup.LabeledSession | None
+    status: str = "active"
 
     @property
     def name(self) -> str:
@@ -24,18 +27,48 @@ class LiveUnit(NamedTuple):
         return claude.name if isinstance(claude, unit_lookup.LiveClaude) else ""
 
 
-def units_of(production_name: str) -> list[LiveUnit]:
-    """List recorded unit children with their current panes."""
+class UnitListing(NamedTuple):
+    units: list[LiveUnit]
+    anomalies: tuple[str, ...]
+
+
+def read_units(production_name: str, *,
+               check: Callable[[int, str], session_staff.ReportProcessIdentity] | None = None) -> UnitListing:
+    """Return staff units and every anomaly from this observation."""
     record = staff.snapshot()
     sources = unit_lookup.member_sources()
     metadata = unit_lookup.unit_metadata(record, name=production_name)
     for problem in metadata.problems:
         print(f"live_units: {problem.name}: unavailable: {problem.reason}", file=sys.stderr)
-    return units_in(production_name, unit_lookup.every_labeled_session(record=record, sources=sources))
+    with session_staff.anomalies(check) as lines:
+        every = unit_lookup.every_labeled_session(record=record, sources=sources)
+    units = _with_status(_joined(production_name, every), session_staff.production_members(record).get(production_name, ()))
+    return UnitListing(units, tuple(lines))
+
+
+def units_of(production_name: str) -> list[LiveUnit]:
+    """List recorded unit children with their current panes."""
+    listing = read_units(production_name)
+    for line in listing.anomalies:
+        print(line, file=sys.stderr)
+    return listing.units
+
+
+def _with_status(units: list[LiveUnit], rows: tuple[staff.StaffRow, ...]) -> list[LiveUnit]:
+    statuses = {row.name: "paused" if isinstance(row.paused, staff.Paused) else "active" for row in rows}
+    return [unit._replace(status=statuses.get(unit.unit, "active")) for unit in units]
 
 
 def units_in(production_name: str, every: unit_lookup.LabeledProductions) -> list[LiveUnit]:
     """Join the named production to the caller's session snapshot."""
+    units = _joined(production_name, every)
+    if not units:
+        return units
+    return _with_status(units, session_staff.production_members(staff.snapshot()).get(production_name, ()))
+
+
+def _joined(production_name: str, every: unit_lookup.LabeledProductions) -> list[LiveUnit]:
+    """Return units in staff row order, each with its pane."""
     marked = every.status_units(production_name)
     return [LiveUnit(unit, marked.get(unit))
             for unit in every.members.get(production_name, ())]

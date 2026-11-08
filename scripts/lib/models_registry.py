@@ -1,5 +1,9 @@
 """Read, atomically edit and publish the shared model registry."""
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import argparse
 import fcntl
@@ -109,8 +113,9 @@ def _sync_catalog(path: Path) -> None:
 
 
 def agent_environment(environment: Mapping[str, str]) -> dict[str, str]:
-    """Remove configuration state before an agent or server starts."""
-    return {key: value for key, value in environment.items() if key not in OPERATION_ENVIRONMENT}
+    """Remove operation state before an agent or server starts."""
+    return {key: value for key, value in environment.items()
+            if key not in (*OPERATION_ENVIRONMENT, "STAFF_OPERATION_FD")}
 
 
 def _decoded(encoded: str) -> tuple[Path, str]:

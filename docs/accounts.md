@@ -304,11 +304,14 @@ Commands accept numbered accounts and launch groups; `default` refuses.
 
 ### Memory on a named account
 
-A session on `~/.claudeN` starts with two variables: `CLAUDE_CONFIG_DIR=~/.claudeN` and `CLAUDE_CODE_REMOTE_MEMORY_DIR=~/.claude`. The aliases, unit launches and `/shutdown restart` all set both.
+A session on `~/.claudeN` starts with two variables: `CLAUDE_CONFIG_DIR=~/.claudeN` and `CLAUDE_CODE_REMOTE_MEMORY_DIR=~/.claude`.
+The aliases, unit launches, and `/agents restart` set both variables.
 
 The second one is why memory writes do not ask. Claude Code saves a memory file without asking only when no link sits in the file's path, and `~/.claudeN/projects` is a link to `~/.claude/projects`. With the variable, the session uses `~/.claude/projects/<project>/memory/` itself, the folder every account shares.
 
-- A session started with `CLAUDE_CONFIG_DIR` alone asks on each memory write ("… which is a sensitive file"). No allow rule clears it: that check runs before allow rules. Restart the session through an alias or `/shutdown restart`.
+- A session with `CLAUDE_CONFIG_DIR` alone requests permission for each memory write ("… which is a sensitive file").
+  This check runs before allow rules.
+  Restart the session through an alias or `/agents restart`.
 - A session started before this change keeps asking until it is restarted.
 - The variable is not in Claude Code's public documentation. After a Claude Code update that brings the prompt back, check it first: in a scratch folder run `claude3 -p --permission-mode default` and ask it to write one `.md` file into the memory folder its prompt names.
 - Memory that a custom subagent keeps in its `local` scope is stored under `~/.claude/projects/<project>/agent-memory-local/` in these sessions, not in the project's `.claude/`.
@@ -585,6 +588,13 @@ A failed move keeps the entry queued and delays later entries.
 The watcher tells showrunners once when the failure reason changes.
 Automatic moves record cause `auto` and reason `auto: <id>` in the group history and the moves log.
 Each session attempt has its own `move_id`, with a request and one confirmed or failed outcome.
+The request uses the session process account as its source.
+Saved launch settings cannot replace the requested destination account.
+The notes timer delegates moves to a detached batch before it stops any session.
+The batch records each outcome when its resume and existing stay observation finish.
+A failed resume uses the existing move failure report to tell the showrunners.
+Blocked notices use the current queue head and target at delivery.
+Each notice addresses a session once, even when its name and ID both select it.
 
 A workers move to Claude needs a known source weekly reset and holds its work routing on Claude until that reset, even if Codex has room earlier. Status detail shows it under `Codex work routing:` with cause `auto`. While any workers entry is queued, default, provider-refusal and credits-off moves wait. With no workers entry, weekly zero first moves workers to included Codex usage when it is available. With credits on and no included room, workers stay and spend their paid credits. With credits off, or after a refusal, workers use the Codex account with room whose weekly reset is soonest, else Claude.
 

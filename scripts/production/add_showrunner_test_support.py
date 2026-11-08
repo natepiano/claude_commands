@@ -2,6 +2,8 @@
 message sender: nothing real starts and nothing real is sent."""
 from __future__ import annotations
 
+from scripts.shutdown import remote
+
 import json
 import os
 import shutil
@@ -16,7 +18,6 @@ from types import ModuleType, SimpleNamespace
 from typing import ClassVar, cast, override
 from unittest.mock import patch
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.production.cli_fixture import invoke_cli
 from scripts.accounts import accounts
 from scripts.whoami.account_test_support import write_claude_account
@@ -252,7 +253,7 @@ class AddShowrunnerFixture(unittest.TestCase):
 
     def timer(self, production_name: str, session: str) -> None:
         _ = fixture_member("showrunner", name=production_name, runtime_id=session,
-                           doc=staff.LiveDoc("natedev", self.doc(production_name)))
+                           doc=staff.LiveDoc(remote.local_machine(), self.doc(production_name)))
         self.timer_conf(production_name).parent.mkdir(parents=True, exist_ok=True)
         _ = self.timer_conf(production_name).write_text(self.timer_text(production_name, session), encoding="utf-8")
 
@@ -307,7 +308,7 @@ class AddShowrunnerFixture(unittest.TestCase):
         if "--resume" in extra and "--cwd" in extra and owner is None:
             owner = fixture_member("showrunner", name=production_name,
                                    runtime_id=extra[extra.index("--resume") + 1],
-                                   doc=staff.LiveDoc("natedev", doc))
+                                   doc=staff.LiveDoc(remote.local_machine(), doc))
         if owner is not None:
             _ = self.env.setdefault("FAKE_CLAUDE_SESSION_ID", owner.current_session)
         self.prepare_herdr(production_name)
@@ -392,7 +393,7 @@ class AddShowrunnerFixture(unittest.TestCase):
         }
         write_process(self.env, 998040, 1, ["zsh"], {"HERDR_SESSION": SHARED, "HERDR_PANE_ID": "w1:p1"})
         responses[f"--session {SHARED} agent get w1:p1"] = CommandResponse(code=0, stdout=json.dumps({
-            "result": {"agent": {"agent_status": "idle", "interactive_ready": True}}}))
+            "result": {"agent": {"agent_status": "idle"}}}))
         responses[f"--session {SHARED} pane read w1:p1 --source visible --format ansi"] = CommandResponse(
             code=0, stdout="────────\n❯ \n────────")
         for suffix in ("", " resume"):

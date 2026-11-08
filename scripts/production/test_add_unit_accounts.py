@@ -6,22 +6,19 @@ import argparse
 import io
 import json
 import os
-import sys
 import unittest
 from contextlib import redirect_stderr
 from pathlib import Path
 from typing import final
 from unittest.mock import patch
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "shutdown"))
-import add_unit
-import autocompact
-import inventory
+from scripts.production import add_unit
+from scripts.production import autocompact
+from scripts.shutdown import inventory
 from scripts.accounts import accounts
 
 
-from add_unit_test_support import AddUnitTestCase, configure_test_zone
+from scripts.production.add_unit_test_support import AddUnitTestCase, configure_test_zone
 from scripts.production import staff
 from scripts.production.staff_test_support import unit_membership
 

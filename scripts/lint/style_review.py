@@ -1,6 +1,10 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
 """Prepare immutable style inputs and capture a read-only reviewer's result."""
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import argparse
 import json
@@ -13,7 +17,6 @@ from pathlib import Path
 from string import Template
 from typing import Literal, cast, final
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.lib import build_folders
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.agents import worker_lifecycle

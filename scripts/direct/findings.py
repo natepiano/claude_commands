@@ -48,6 +48,10 @@ the run's durable event stream when `progress_history.py` has started a run.
 """
 
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import argparse
 import fcntl
@@ -187,10 +191,8 @@ def _state_path(session_dir: Path) -> Path:
 def _parked_path(session_dir: Path, instance_id: str) -> Path:
     """Where a phase's ledger waits while another open phase is current.
 
-    Phases can be open together, and the current one owns `findings_state.json`
-    (implement.sh reads it there). The ledger it displaces is kept here rather
-    than discarded, so the older phase finds its findings when it is current
-    again.
+    The current phase owns `findings_state.json`, which assign_claude.py reads.
+    Keep the previous ledger here until its phase becomes current again.
     """
     return session_dir / f"findings_state-{instance_id}.json"
 
@@ -206,9 +208,8 @@ def _ledger_instance(path: Path) -> str:
 def _write_state(session_dir: Path, state: dict[str, object]) -> None:
     """Write a phase's ledger where its readers look for it.
 
-    The newest open phase owns `findings_state.json`. An older open phase named
-    with `--phase` writes its parked file instead, so its repair never displaces
-    the newest phase's ledger from the file implement.sh checks.
+    The newest open phase owns `findings_state.json`, which assign_claude.py checks.
+    An older open phase named with `--phase` writes its parked file.
     """
     session_dir.mkdir(parents=True, exist_ok=True)
     live = _state_path(session_dir)
@@ -362,8 +363,18 @@ def _read_state(
     session_dir: Path, now: float, phase: str = "", *, closed_phase_ok: bool = False,
 ) -> dict[str, object]:
     """Load the phase's ledger: the live file, a parked one, or a fresh one."""
-    path = _state_path(session_dir)
     instance_id, phase_id = _phase_identity(session_dir, phase, closed_phase_ok=closed_phase_ok)
+    return read_phase_ledger(session_dir, instance_id, phase_id, now)
+
+
+def read_phase_ledger(
+    session_dir: Path, instance_id: str, phase_id: str, now: float,
+) -> dict[str, object]:
+    """Read the selected instance's ledger without changing the current phase."""
+    path = _state_path(session_dir)
+    parked = _parked_path(session_dir, instance_id)
+    if not path.exists() and instance_id and parked.exists():
+        path = parked
     if not path.exists():
         return _fresh_state(instance_id, phase_id, now)
     try:
@@ -373,7 +384,6 @@ def _read_state(
     if state is None:
         raise SystemExit(f"Invalid findings state: {path}")
     if instance_id and _string(state.get("phase_instance_id")) != instance_id:
-        parked = _parked_path(session_dir, instance_id)
         if parked.exists():
             try:
                 kept = _json_object(parked.read_text(encoding="utf-8"))
@@ -429,7 +439,7 @@ def _history_root() -> Path:
 
 
 def _repair_round(state: dict[str, object], session_dir: Path) -> int:
-    """The next repair round, using the same groups as `history.py rounds`."""
+    """The next repair round, counting each started ledger batch once."""
     path = _history_root() / "runs" / f"{session_dir.name}.jsonl"
     try:
         lines = path.read_text(encoding="utf-8").splitlines()
@@ -440,7 +450,7 @@ def _repair_round(state: dict[str, object], session_dir: Path) -> int:
     instance = _string(state.get("phase_instance_id"))
     events = [event for line in lines if (event := _json_object(line)) is not None
               and _string(event.get("phase_instance_id")) == instance]
-    return len(phase_rounds(events)) + 1
+    return len({number for repair in phase_rounds(events) for number in repair["ledger_rounds"]}) + 1
 
 
 def _astra_due(entry: dict[str, object], repair_round: int, settings_read: conf.ConfigRead) -> bool:

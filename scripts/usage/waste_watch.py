@@ -1,12 +1,16 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
 """Tell a unit's showrunner when its agents spend their usage waiting, or a Codex worker stops compacting.
 
 The collector runs this script after each good pass. By hand:
-`python3 scripts/usage/waste_watch.py [--db PATH] [--production-docs DIR] [--dry-run] [--now ISO]`.
+`~/.claude/scripts/lib/py scripts/usage/waste_watch.py [--db PATH] [--production-docs DIR] [--dry-run] [--now ISO]`.
 Only the default store sends; a run over any other store prints what it would send.
 """
 
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import argparse
 import json
@@ -22,8 +26,6 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import cast
 
-if __package__ in (None, ""):
-    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from scripts.usage import collect, outcomes, usage_report, weights
 from scripts.usage.agents_log import state_dir
@@ -270,7 +272,7 @@ def alert_text(usage: UnitUsage, start: datetime) -> str:
             run = cast(ContextRun, thread.context_run)
             lines.append(f"- {thread.role or 'unassigned'} {thread.thread.label()}: {run.longest} requests "
                          + f"in a row, peak {thousands(run.peak)} tokens")
-    lines.append("See more: python3 ~/.claude/scripts/usage/usage_report.py wait_share --by unit,role "
+    lines.append("See more: ~/.claude/scripts/lib/py ~/.claude/scripts/usage/usage_report.py wait_share --by unit,role "
                  + f"--since {since}")
     return "\n".join(lines)
 

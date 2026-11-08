@@ -7,12 +7,8 @@ import sqlite3
 from collections.abc import Sequence
 from contextlib import closing
 from pathlib import Path
-from typing import TYPE_CHECKING
 
-if TYPE_CHECKING:
-    from . import index
-else:
-    from scripts.buildlog import index
+from scripts.buildlog import index
 
 
 def create_step_index(path: Path) -> None:

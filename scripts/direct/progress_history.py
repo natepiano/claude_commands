@@ -2,6 +2,10 @@
 """Durable unit progress events, headers, and calibration statistics."""
 
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import argparse
 import fcntl
@@ -29,7 +33,7 @@ from typing import Literal, NoReturn, TypedDict, cast
 if not __package__:
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.agents import worker_lifecycle  # noqa: E402
-from scripts.direct import phase_reservation, plan_history, recorder_state  # noqa: E402
+from scripts.direct import findings, phase_reservation, plan_history, recorder_state  # noqa: E402
 from scripts.direct.recorder_state import OPEN_PHASES_KEY as OPEN_PHASES_KEY  # noqa: E402
 from scripts.direct.tag_inventory import contract_table_paths  # noqa: E402
 from scripts.lib import models_registry, unit_runs
@@ -302,7 +306,7 @@ PASS_OWNER_ENV = "UNIT_PASS_OWNER"
 PASS_OWNER_TOKEN = "launcher"
 
 PASS_OWNERSHIP_RULE = (
-    "Pass lifecycle belongs to the launchers. assign.sh and the implement.sh or "
+    "Pass lifecycle belongs to the launchers. assign.py and the "
     "review.sh it runs record pass_started and pass_finished. findings.py gate "
     "counts these passes for convergence. Manual pass records can falsely stop "
     "a run. Launch the work through assign.sh. Exception: if the unit director "
@@ -429,9 +433,6 @@ def _set_unit(args: argparse.Namespace) -> None:
 def _set_owner(state: dict[str, object], production: str, unit: str) -> None:
     """Resolve the command's names once and store the fixed unit id."""
     if state.get(unit_runs.OWNER_FIELD):
-        return
-    if state.get("production") and state.get("unit"):
-        state.update(production=production, unit=unit)
         return
     record = staff.initial_snapshot()
     parents = {row.id for row in record.find(kind="showrunner")
@@ -984,27 +985,17 @@ def _ensure_project_timing(
     return state
 
 
-# The worker this launcher occupies in its phase team, exported by implement.sh
-# before it calls start-pass. A phase runs two launchers against one state
-# file and each records its own pass, so this is the key their windows are kept
-# apart under -- without it a team phase and a solo phase produce identical rows.
-#
-# The variable says role and its value is a worker: `impl` and `test` name the
-# two chairs, not the work done in them. Both workers can be implementing at one moment and reviewing at another; the role a worker holds
-# right now lives on the coordination board, which records it as a `handoff` and
-# never writes it here. Reading the value as a role is the mistake this comment
-# exists to stop -- the variable is the half with the wrong name, and it stays
-# that way because implement.sh exports it.
+# assign.py exports the worker slot before it records a pass.
+# Each launcher records its pass under that slot.
+# The slot stays fixed when the worker's role changes on the board.
 TEAM_SLOT_ENV = "UNIT_TEAM_ROLE"
 
 
 def _team_slot() -> str:
-    """The recording member's worker, empty when nothing named one.
+    """Return the recording worker's slot.
 
-    Empty is a worker like any other rather than a missing value: passes predating
-    the field, and every recorder that does not run through implement.sh --
-    review.sh included -- record under it, and must stay distinguishable from a
-    launcher that really is sitting in `impl`.
+    Earlier passes and recorders that omit a slot use the empty slot.
+    Keep them separate from a launcher that records the `impl` slot.
     """
     return os.environ.get(TEAM_SLOT_ENV) or os.environ.get("PLAN_DELEGATE_TEAM_ROLE", "")
 
@@ -1052,6 +1043,50 @@ def _open_passes(state: dict[str, object]) -> dict[str, dict[str, object]]:
         for slot, record in _pass_slots(state).items()
         if _string(record.get("status")) in ("active", "refused")
     }
+
+
+@dataclass(frozen=True)
+class ActiveDispatch:
+    instance_id: str
+    launcher_command: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class NoActiveDispatch:
+    """The worker has no active pass."""
+
+
+@dataclass(frozen=True)
+class ActiveDispatchUnavailable:
+    reason: str
+
+
+def active_dispatch(worker_id: staff.StaffId, run: Path) -> ActiveDispatch | NoActiveDispatch | ActiveDispatchUnavailable:
+    """Read the active pass through the worker's fixed staff id."""
+    try:
+        row = staff.snapshot().by_id(worker_id)
+        if row is None:
+            return ActiveDispatchUnavailable(f"worker {worker_id}: staff row is unavailable")
+        state = worker_lifecycle.read_json_object(_state_path(run))
+        roster = session_staff.read_worker_roster(run / "mesh_roster.json")
+        names = {row.name, *(name for name, entry in roster.items()
+                           if (_object_dict(entry) or {}).get("staff_id") == worker_id)}
+        matches = [item for slot, item in _open_passes(state).items()
+                   if item.get("worker_name", slot) in names]
+        if not matches:
+            return NoActiveDispatch()
+        if len(matches) != 1:
+            return ActiveDispatchUnavailable(f"worker {worker_id}: multiple active passes")
+        instance = _string(matches[0].get("instance_id"))
+        command = matches[0].get("launcher_command")
+        if not instance or not isinstance(command, list) or not command or any(
+                not isinstance(part, str) for part in cast(list[object], command)):
+            return ActiveDispatchUnavailable(f"worker {worker_id}: active pass identity or launcher command is unavailable")
+        return ActiveDispatch(instance, tuple(cast(list[str], command)))
+    except FileNotFoundError:
+        return NoActiveDispatch()
+    except (OSError, ValueError, worker_lifecycle.WorkerStateUnreadable) as error:
+        return ActiveDispatchUnavailable(f"worker {worker_id}: {error}")
 
 
 class DispatchDetailNotRecorded(Enum):
@@ -1635,7 +1670,8 @@ def _start_phase(args: argparse.Namespace) -> None:
     state["percent_started_at"] = None
     state["pending_calibration"] = None
     event = _event(state, "phase_started", started_at)
-    source = _phase_source_identity(state)
+    production, unit = _phase_plan_names(state)
+    source = PhaseSourceIdentity(production, unit, _phase_repository(_string(state.get("working_dir"))))
     event.update(production=_phase_metadata_fields(source.production),
                  unit=_phase_metadata_fields(source.unit),
                  repository=_phase_metadata_fields(source.repository))
@@ -2694,8 +2730,7 @@ RIGHT_ALIGNED_SUMMARY_COLUMNS = frozenset({"%", "Elapsed", "ETA", "ETA low", "ET
 # board caps a post far higher than a terminal line can hold, and a wrapped
 # narration costs the reader the three-line scan the note exists to give.
 BOARD_NOTE_CHARS = 72
-# What implement.sh puts in front of the `done` and `blocked` it posts on the
-# worker's exit, so the note can tell the launcher's line from the worker's own.
+# assign.py prefixes its final `done` and `blocked` board lines with this text.
 LAUNCHER_PREFIX = "launcher:"
 # What a worker's own narration says when it is alive but not working: held up on
 # a peer's edit, on a token, on a gate. Nothing in the pass record separates that
@@ -3216,11 +3251,9 @@ def _board_role_changes(session_dir: Path) -> list[RoleChange]:
 
 
 def _launcher_authored(kind: str, message: str) -> bool:
-    """Whether a board line came from implement.sh rather than from the worker.
+    """Identify board lines that assign.py records.
 
-    The launcher writes two kinds of line: `register`, which is always its, and
-    a `done` or `blocked` on exit, which it prefixes `launcher:` so the note can
-    tell it from a `done` the worker posted itself.
+    The launcher records `register` lines and prefixes its final lines with `launcher:`.
     """
     return kind == "register" or message.startswith(LAUNCHER_PREFIX)
 
@@ -5313,10 +5346,7 @@ class ProductionNotRecorded:
 
 
 def resolve_production_unit(state: Mapping[str, object], *, resolver: session_staff.RowResolver | None = None) -> ProductionUnitIdentity | ProductionNotRecorded:
-    """Keep recorded history; resolve missing ownership from the current row."""
-    production, unit = _string(state.get("production")), _string(state.get("unit"))
-    if production and unit and not state.get(unit_runs.OWNER_FIELD):
-        return ProductionUnitIdentity(production, unit)
+    """Read the production and unit names from the current staff row."""
     try:
         resolver = resolver if resolver is not None else session_staff.RowResolver(staff.snapshot())
         record = resolver.record
@@ -5345,8 +5375,7 @@ def resolve_production_unit(state: Mapping[str, object], *, resolver: session_st
         parent = record.parent_of(row)
         if parent is None:
             return ProductionNotRecorded(f"{row.name}: the staff parent is unavailable")
-        return (ProductionUnitIdentity(parent.name, row.name) if state.get(unit_runs.OWNER_FIELD)
-                else ProductionUnitIdentity(production or parent.name, unit or row.name))
+        return ProductionUnitIdentity(parent.name, row.name)
     except (OSError, ValueError) as error:
         return ProductionNotRecorded(str(error))
 
@@ -6386,24 +6415,13 @@ def _finish_run(args: argparse.Namespace) -> None:
 
 
 def _finding_lenses(event: dict[str, object]) -> set[str]:
-    """The lenses a `finding_opened` event names, with `both` read as its pair."""
+    """Read a finding's lenses, with `both` read as its pair."""
     lens = _string(event.get("lens"))
     if lens == LEGACY_BOTH_LENS:
         return set(LEGACY_BOTH_LENSES)
     return {part.strip() for part in lens.split(",") if part.strip()}
 
 
-@dataclass(frozen=True)
-class NoRecordedCodeReview:
-    """No finished code review records this phase's raised count."""
-
-
-@dataclass(frozen=True)
-class RecordedCodeFindings:
-    count: int
-
-
-CodeReviewEvidence = NoRecordedCodeReview | RecordedCodeFindings
 SEPARATE_TRIAL_LENSES = ("ux",)
 
 
@@ -6433,44 +6451,13 @@ def write_review_turn(session_dir: Path, metadata: Mapping[str, object], *,
         return
 
 
-def _phase_review_records(session_dir: Path, instance_id: str) -> Iterable[dict[str, object]]:
-    """Read the durable review records for one phase instance."""
-    root = plan_history.history_root() / "review_turns" / session_dir.name
-    for path in sorted(root.glob("*.json")):
-        try:
-            record = _object_dict(cast(object, json.loads(path.read_text(encoding="utf-8"))))
-        except (OSError, ValueError):
-            continue
-        if record is not None and _string(record.get("phase_instance_id")) == instance_id:
-            yield record
-
-
-def _is_code_review(record: dict[str, object]) -> bool:
-    return (
-        _string(record.get("kind")) not in SEPARATE_TRIAL_LENSES
-        and _string(record.get("lens")) not in SEPARATE_TRIAL_LENSES
-    )
-
-
-def _raised_findings(records: Iterable[dict[str, object]]) -> CodeReviewEvidence:
-    """Count findings from completed reviews."""
-    evidence: CodeReviewEvidence = NoRecordedCodeReview()
-    for record in records:
-        if _string(record.get("status")) != "reviewed":
-            continue
-        count = evidence.count if isinstance(evidence, RecordedCodeFindings) else 0
-        evidence = RecordedCodeFindings(count + _integer(record.get("raised")))
-    return evidence
-
-
 def _review_trial(args: argparse.Namespace) -> None:
     """Print the phase's findings and review minutes for the checkpoint notice.
 
     A named phase selects its open instance or its latest completed instance.
     An unnamed command selects the current phase, including a completed phase.
-    Only events and review records for that instance count.
-    Completed reviews supply the code count.
-    Without completed reviews, the count uses the findings that the director opened.
+    Only the selected instance contributes to the line.
+    Its ledger supplies the findings and dispatched rounds, including routed and closed findings.
     Review-worker minutes count finished review passes and UX review activities.
     UX check minutes count `UX review` activities.
     UX repair minutes count fix passes whose dispatched batch includes a UX finding.
@@ -6501,27 +6488,26 @@ def _review_trial(args: argparse.Namespace) -> None:
             f"No phase recorded in {_state_path(session_dir)}: review-trial reports "
             + "the phase start-phase opened, and this run has not opened one"
         )
-    ux_findings = 0
-    code_findings = 0
+    ledger = findings.read_phase_ledger(session_dir, instance_id, phase_id, plan_history.now_epoch())
+    ux_finding_ids: set[str] = set()
+    code_finding_ids: set[str] = set()
+    for finding_id, value in (_object_dict(ledger.get("findings")) or {}).items():
+        entry = _object_dict(value)
+        if entry is None:
+            continue
+        lenses = _finding_lenses(entry)
+        if "ux" in lenses:
+            ux_finding_ids.add(finding_id)
+        if not lenses or lenses.difference(SEPARATE_TRIAL_LENSES):
+            code_finding_ids.add(finding_id)
     review_seconds = 0
     ux_check_seconds = 0
-    ux_finding_ids: set[str] = set()
-    dispatched: list[dict[str, object]] = []
     fix_passes: list[dict[str, object]] = []
     for event in _run_events(state):
         if _string(event.get("phase_instance_id")) != instance_id:
             continue
         event_type = _string(event.get("event_type"))
-        if event_type == "finding_opened":
-            lenses = _finding_lenses(event)
-            if "ux" in lenses:
-                ux_findings += 1
-                ux_finding_ids.add(_string(event.get("finding_id")))
-            if not lenses or lenses.difference(SEPARATE_TRIAL_LENSES):
-                code_findings += 1
-        elif event_type == "finding_batch_dispatched":
-            dispatched.append(event)
-        elif event_type == "pass_finished" and _string(event.get("pass_kind")) == "review":
+        if event_type == "pass_finished" and _string(event.get("pass_kind")) == "review":
             review_seconds += _integer(event.get("pass_elapsed_seconds"))
         elif event_type == "pass_finished" and _string(event.get("pass_kind")) == "fix":
             fix_passes.append(event)
@@ -6534,22 +6520,21 @@ def _review_trial(args: argparse.Namespace) -> None:
             ux_check_seconds += elapsed
     # A fix pass carries the round the ledger dispatched (`fix_pass`), and the
     # dispatch names the findings that round covers.
+    rounds = ledger.get("rounds")
+    dispatched = cast(list[object], rounds) if isinstance(rounds, list) else []
     ux_rounds = {
         _integer(event.get("round"))
-        for event in dispatched
-        if ux_finding_ids.intersection(_string_list(event.get("covered")))
+        for value in dispatched
+        if (event := _object_dict(value)) is not None
+        and ux_finding_ids.intersection(_string_list(event.get("covered")))
     }
     ux_repair_seconds = sum(
         _integer(event.get("pass_elapsed_seconds"))
         for event in fix_passes
         if _integer(event.get("fix_pass")) in ux_rounds
     )
-    records = list(_phase_review_records(session_dir, instance_id))
-    raised = _raised_findings(filter(_is_code_review, records))
-    if isinstance(raised, RecordedCodeFindings):
-        code_findings = raised.count
     print(
-        f"review trial: ux {ux_findings} findings, code {code_findings} findings, "
+        f"review trial: ux {len(ux_finding_ids)} findings, code {len(code_finding_ids)} findings, "
         + f"review-worker minutes {(review_seconds + 30) // 60}, "
         + f"ux check minutes {(ux_check_seconds + 30) // 60}, "
         + f"ux repair minutes {(ux_repair_seconds + 30) // 60}"
@@ -6743,9 +6728,8 @@ def _build_parser() -> argparse.ArgumentParser:
         help="close this slot's open pass when the unit director killed its "
         + "launcher (--status canceled only)",
     )
-    # Accepted and ignored: implement.sh and review.sh launchers started before
-    # 2026-10-15 18:00 EDT still pass it, since bash keeps the script it began
-    # with. Remove after 2026-10-22.
+    # Earlier shell launchers passed this option before 2026-10-15 18:00 EDT.
+    # Accept and ignore it for those recorded commands.
     _ = finish_pass.add_argument(
         "--agent-awake-seconds",
         default=argparse.SUPPRESS,

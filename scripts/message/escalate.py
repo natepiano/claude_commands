@@ -15,6 +15,10 @@ through `push_texts.user_send_argv()` with its registered template. Holding a KE
 may hold on every check and `close` once the news stops being true.
 """
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import fcntl
 import json
@@ -30,26 +34,18 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, NamedTuple, NotRequired, TypedDict, cast
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "notify"))
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "whoami"))
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "production"))
 from scripts.lib.process_failure import failure_detail
 from scripts.production.showrunners import load_settings
 from scripts.production import staff
 from scripts.message import send_budget, session_send
-import push_texts
-import push_reference
-if TYPE_CHECKING:
-    from ..whoami.agent_accounts import (KnownCodexAccount, UnknownCodexAccount, StoredCodexAccount,
-                                        codex_account, workers_home)
-else:
-    from scripts.whoami.agent_accounts import (KnownCodexAccount, UnknownCodexAccount, StoredCodexAccount,
-                                codex_account, workers_home)
-from user_action import ActionRequired, NoActionRequired, UserAction
+from scripts.notify import push_texts
+from scripts.notify import push_reference
+from scripts.whoami.agent_accounts import (KnownCodexAccount, UnknownCodexAccount, StoredCodexAccount,
+                                    codex_account, workers_home)
+from scripts.notify.user_action import ActionRequired, NoActionRequired, UserAction
 
 if TYPE_CHECKING:
-    from send import Need
+    from scripts.message.send import Need
 
 STATE = Path(os.environ.get("ESCALATE_STATE_DIR")
              or Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local" / "state") / "escalate")
@@ -506,7 +502,7 @@ def reconcile_codex_holds(home: Path, login: str) -> None:
 
 def deliver(held: HeldMessage, key: str) -> str:
     """Send one held message to the user; the empty string when sent, else send.py's own line."""
-    import review
+    from scripts.notify import review
 
     if not isinstance(held, RegisteredHold):
         return "template revision required"

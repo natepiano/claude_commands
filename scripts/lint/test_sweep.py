@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
 """Tests for sweep.py on a fabricated target directory: which unhashed files
 go with a build unit, which are orphans, and which stay."""
 
@@ -28,50 +28,43 @@ from typing import TYPE_CHECKING, Literal, cast, override
 from unittest import mock
 from zoneinfo import ZoneInfo
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-import sweep
-import cargo_target_config
+from scripts.lint import sweep, tmp_sweep
+from scripts.lib import cargo_target_config
 from scripts.lib import file_lock
 from scripts.message import session_send
 from scripts.message.session_send_test_support import forbid_real_sender
-import conf
+from scripts.lib import conf
 from scripts.lib.cargo_output import CargoOutputRoots
 from scripts.lib.cargo_output_test_support import fake_cargo_output_roots
 from scripts.mac_test import floor_claims
-from test_memory_admit import HISTORY_APPEND_STOPS, stop_history_append
-from memory_test_support import config_environment, write_config_fixture
+from scripts.lint.test_memory_admit import HISTORY_APPEND_STOPS, stop_history_append
+from scripts.lint.memory_test_support import config_environment, write_config_fixture
 from scripts.buildlog.step_outputs_test_support import create_step_index, record_root_attempt
 from scripts.buildlog import index as build_index
+from scripts.lib import test_hang_guard
 if TYPE_CHECKING:
-    from ..lib import test_hang_guard
-else:
-    from scripts.lib import test_hang_guard
-if TYPE_CHECKING:
-    from ..copies import copies
-    from ..production.cli_fixture import ImmutableGitSeed
-    from ..build_hold import build_hold
-    from ..buildlog import record, store
-    from ..lib import scratch
-    from ..message import process_table, sessions
-    from ..notify import review
-    from ..notify.push_texts import catalog, render, render_entry
-    from ..notify.user_action import ActionRequired
+    from scripts.copies import copies
+    from scripts.production.cli_fixture import ImmutableGitSeed
+    from scripts.build_hold import build_hold
+    from scripts.buildlog import record, store
+    from scripts.lib import scratch
+    from scripts.message import process_table, sessions
+    from scripts.notify import review
+    from scripts.notify.push_texts import catalog, render, render_entry
+    from scripts.notify.user_action import ActionRequired
 else:
     from scripts.copies import copies
     from scripts.production.cli_fixture import ImmutableGitSeed
-    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "build_hold"))
-    import build_hold
-    import record
-    import store
-    import scratch
-    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "message"))
-    import process_table
-    import sessions
-    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "notify"))
-    import review
-    from push_texts import catalog, render, render_entry
-    from user_action import ActionRequired
+    from scripts.build_hold import build_hold
+    from scripts.buildlog import record
+    from scripts.lib import scratch
+    from scripts.buildlog import store
+    from scripts.message import process_table
+    from scripts.message import sessions
+    from scripts.notify import review
+    from scripts.notify.push_texts import catalog, render, render_entry
+    from scripts.notify.user_action import ActionRequired
 
 GIB = 1 << 30
 SIZE = 64 * 1024
@@ -181,7 +174,7 @@ def fresh_import_modules(base: Path, directory: str, module: str) -> list[str]:
                    "BUILD_HOLD_DIR": str(base / "holders"),
                    "BUILD_HOLD_RELEASE_DIR": str(base / "release"),
                    "BUILDLOG_DIR": str(base / "buildlog"),
-                   sweep.tmp_sweep.STATE_ENV: str(base / "state"),
+                   tmp_sweep.STATE_ENV: str(base / "state"),
                    "NOTIFIER_SESSIONS_DIR": str(base / "sessions"),
                    "PYTHONPATH": os.pathsep.join((str(root / "scripts" / directory), str(root)))}
     for name in ("PYTHONUNBUFFERED", "REFUSAL_WATCH_INVENTORY", "STAFF_OPERATION_FD"):
@@ -286,7 +279,7 @@ class SweepCase(unittest.TestCase):
         state = Path(self.enterContext(tempfile.TemporaryDirectory()))
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
             **config_environment(state / "config"),
-            sweep.tmp_sweep.STATE_ENV: str(state / "sweep"),
+            tmp_sweep.STATE_ENV: str(state / "sweep"),
             "BUILDLOG_DIR": str(state / "buildlog"),
         })))
 
@@ -333,7 +326,7 @@ class GroupTests(SweepCase):
         targets = [self.target(), self.target()]
         trees = [str(target.tree) for target in targets]
         scan = sweep.Scan()
-        with mock.patch("sweep.conf.ConfigRead.whole", side_effect=conf.read("lint").whole) as whole:
+        with mock.patch("scripts.lint.sweep.conf.ConfigRead.whole", side_effect=conf.read("lint").whole) as whole:
             owners = sweep.group_roots(trees, scan)
         self.assertTrue(all(str(target.app_dep_info) in owners for target in targets))
         self.assertGreater(len(scan.groups), 2)
@@ -471,7 +464,7 @@ class SweepTests(SweepCase):
         without_window = cast(Callable[[list[str], list[str], int, str, bool], int], sweep.sweep)
         workspace_without_window = cast(Callable[[str | None, str, bool], int], sweep.sweep_workspace)
         before = {path: path.read_bytes() for path in target.root.rglob("*") if path.is_file()}
-        with mock.patch("sweep.conf.ConfigRead.number", side_effect=AssertionError("No implicit configuration read expected")):
+        with mock.patch("scripts.lint.sweep.conf.ConfigRead.number", side_effect=AssertionError("No implicit configuration read expected")):
             with self.assertRaisesRegex(TypeError, "recent_minutes"):
                 _ = without_window(roots, trees, 0, "test", False)
             with self.assertRaisesRegex(TypeError, "recent_minutes"):
@@ -621,6 +614,11 @@ class SweepTests(SweepCase):
 
 
 class RebuildTests(SweepCase):
+    @override
+    def setUp(self) -> None:
+        super().setUp()
+        _ = self.enterContext(mock.patch.object(store, "host_name", side_effect=lambda: record.local_step_identity().hosts[0]))
+
     def test_rebuild_report_fails_when_an_enumerated_month_disappears(self) -> None:
         path = Path(os.environ["BUILDLOG_DIR"]) / "natedev" / "2026-10.jsonl"
         path.parent.mkdir(parents=True)
@@ -723,7 +721,7 @@ class RebuildTests(SweepCase):
         _ = path.write_text("".join(json.dumps(record) + "\n" for record in self.records))
         before = {item.relative_to(root): (item.read_bytes(), item.stat().st_mtime_ns)
                   for item in root.rglob("*") if item.is_file()}
-        state = Path(os.environ[sweep.tmp_sweep.STATE_ENV])
+        state = Path(os.environ[tmp_sweep.STATE_ENV])
         state_before = {item.relative_to(state): (item.read_bytes(), item.stat().st_mtime_ns)
                         for item in state.rglob("*") if item.is_file()}
         output = io.StringIO()
@@ -2834,7 +2832,7 @@ class FloorTests(SweepCase):
     def test_floor_keeps_a_standing_target_only_while_its_checkout_is_busy(self) -> None:
         base = self.base()
         seed = ImmutableGitSeed.create(base, "main", "Sweep tests", "sweep@example.invalid",
-                                       {"source.txt": "style source\n"})
+                                       {"Cargo.toml": "[workspace]\n", "source.txt": "style source\n"})
         with mock.patch.dict(os.environ, {"HOME": str(base), scratch.HOLDS_ENV: str(base / "holds.json")}):
             with copies.standing("style-unit", seed.checkout, copies.CommittedSource("HEAD")) as checkout:
                 target = checkout / "target"
@@ -2858,7 +2856,7 @@ class FloorTests(SweepCase):
     def test_floor_finds_and_reclaims_an_idle_retained_standing_target(self) -> None:
         base = self.base()
         seed = ImmutableGitSeed.create(base, "main", "Sweep tests", "sweep@example.invalid",
-                                       {"source.txt": "style source\n"})
+                                       {"Cargo.toml": "[workspace]\n", "source.txt": "style source\n"})
         with mock.patch.dict(os.environ, {"HOME": str(base), scratch.HOLDS_ENV: str(base / "holds.json")}):
             with copies.standing("style-unit", seed.checkout, copies.CommittedSource("HEAD")) as checkout:
                 target = checkout / "target"
@@ -2881,7 +2879,7 @@ class FloorTests(SweepCase):
         _ = config.write_text("\n".join(f"root={pool}" if line.startswith("root=") else line
                                            for line in configured.splitlines()))
         seed = ImmutableGitSeed.create(base, "main", "Sweep tests", "sweep@example.invalid",
-                                       {"source.txt": "standing source\n"})
+                                       {"Cargo.toml": "[workspace]\n", "source.txt": "standing source\n"})
         discover = sweep.target_dirs
 
         def configured_targets(roots: Sequence[str], *, lint_settings: conf.ConfigRead,
@@ -3497,7 +3495,7 @@ class FloorTests(SweepCase):
         _ = config.write_text("\n".join(f"root={base / 'gates'}" if line.startswith("root=") else line
                                            for line in configured.splitlines()) + "\n")
         self.enterContext(mock.patch.dict(os.environ, {
-            sweep.tmp_sweep.STATE_ENV: str(base),
+            tmp_sweep.STATE_ENV: str(base),
             "BUILDLOG_DIR": str(base / "buildlog"),
             "BUILD_HOLD_DIR": str(base / "build-hold"),
             "COPIES_CONFIG": str(config),
@@ -3557,7 +3555,7 @@ class FloorTests(SweepCase):
         _ = write_config_fixture(conf.path("lint"),
                                  f"sweep_floor_roots={base}\n")
         with (self.free_space(free, scanned),
-              mock.patch.object(sweep.tmp_sweep, "state_dir", return_value=base), redirect_stdout(output)):
+              mock.patch.object(tmp_sweep, "state_dir", return_value=base), redirect_stdout(output)):
             status = sweep.hold_floor(floor, dry_run)
         return status, output.getvalue()
 
@@ -3830,7 +3828,7 @@ class FloorTests(SweepCase):
     def finalize_crossing(self, free_gib: int, *, protected: tuple[tuple[str, int], ...] = (), removed: int = 0) -> None:
         with mock.patch.object(sweep, "free_bytes", return_value=free_gib * GIB):
             sweep.notify_floor_problem(sweep.FloorOutcome(
-                sweep.tmp_sweep.CompletedSweepAssessment(0), after=free_gib * GIB, protected=protected, removed=removed),
+                tmp_sweep.CompletedSweepAssessment(0), after=free_gib * GIB, protected=protected, removed=removed),
                 lint_settings=conf.read("lint"))
 
     def test_crossing_sends_both_channels_once_and_rearms_only_above_the_line(self) -> None:
@@ -3935,7 +3933,7 @@ with mock.patch.object(sweep, "free_bytes", return_value=130 * sweep.GIB), mock.
                       sweep.TemporarySweepFailureScope())
             with mock.patch.object(sweep, "free_bytes", return_value=200 * GIB):
                 for scope in scopes:
-                    sweep.notify_floor_problem(sweep.tmp_sweep.CompletedSweepAssessment(1),
+                    sweep.notify_floor_problem(tmp_sweep.CompletedSweepAssessment(1),
                                                detail="private failure", scope=scope, lint_settings=conf.read("lint"))
             self.assertEqual([attempt.recipient for attempt in delivery.attempts], ["natedev"] * 3)
             self.assertTrue(all("private failure" in attempt.text for attempt in delivery.attempts))
@@ -3944,7 +3942,7 @@ with mock.patch.object(sweep, "free_bytes", return_value=130 * sweep.GIB), mock.
         with self.crossing_delivery({}) as delivery:
             with mock.patch.object(sweep, "free_bytes", return_value=140 * GIB):
                 for status in (1, 1):
-                    sweep.notify_floor_problem(sweep.tmp_sweep.CompletedSweepAssessment(status),
+                    sweep.notify_floor_problem(tmp_sweep.CompletedSweepAssessment(status),
                                                detail="private failed pass", lint_settings=conf.read("lint"))
             self.assertEqual([attempt.recipient for attempt in delivery.attempts], ["natedev"])
             self.assertIn("private failed pass", delivery.attempts[0].text)
@@ -4189,7 +4187,7 @@ with mock.patch.object(sweep, "free_bytes", return_value=130 * sweep.GIB), mock.
             replies["natedev"] = [3, 0]
             with mock.patch.object(sweep, "free_bytes", return_value=140 * GIB):
                 for expected in (sweep.FailurePending, sweep.FailureReported):
-                    sweep.notify_floor_problem(sweep.tmp_sweep.CompletedSweepAssessment(1),
+                    sweep.notify_floor_problem(tmp_sweep.CompletedSweepAssessment(1),
                         detail="new failed pass", lint_settings=conf.read("lint"))
                     attempt = delivery.attempts[-1]
                     self.assertEqual(attempt.key, "")
@@ -4367,7 +4365,7 @@ with mock.patch.object(sweep, "free_bytes", return_value=130 * sweep.GIB), mock.
         base = self.base()
         now = time.time()
         with (mock.patch.object(sweep, "hold_floor", return_value=0),
-              mock.patch.object(sweep.tmp_sweep, "run", return_value=2) as assess,
+              mock.patch.object(tmp_sweep, "run", return_value=2) as assess,
               mock.patch.object(sweep, "send_floor_alert", return_value=DELIVERED_NATEDEV_ALERT) as send,
               mock.patch.object(time, "time", return_value=now) as clock,
               redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO())):
@@ -4375,17 +4373,17 @@ with mock.patch.object(sweep, "free_bytes", return_value=130 * sweep.GIB), mock.
             self.assertEqual(send.call_count, 1)
             self.assertEqual(sweep.main([sweep.FLOOR_ONLY_FLAG]), 0)
             self.assertEqual(assess.call_count, 1)
-            clock.return_value = now + sweep.tmp_sweep.RUN_INTERVAL_SECONDS
+            clock.return_value = now + tmp_sweep.RUN_INTERVAL_SECONDS
             self.assertEqual(sweep.main([sweep.FLOOR_ONLY_FLAG]), 2)
             self.assertEqual(send.call_count, 1)
             assess.return_value = 0
-            clock.return_value += sweep.tmp_sweep.RUN_INTERVAL_SECONDS
+            clock.return_value += tmp_sweep.RUN_INTERVAL_SECONDS
             self.assertEqual(sweep.main([sweep.FLOOR_ONLY_FLAG]), 0)
             assess.return_value = 2
-            clock.return_value += sweep.tmp_sweep.RUN_INTERVAL_SECONDS
+            clock.return_value += tmp_sweep.RUN_INTERVAL_SECONDS
             self.assertEqual(sweep.main([sweep.FLOOR_ONLY_FLAG]), 2)
         self.assertEqual(send.call_count, 2)
-        self.assertTrue((base / sweep.tmp_sweep.STAMP_NAME).is_file())
+        self.assertTrue((base / tmp_sweep.STAMP_NAME).is_file())
         self.assertTrue(all("status 2" in cast(str, call.args[0]) for call in send.call_args_list))
         cast(mock.Mock, sweep.send_phone_push).assert_not_called()
         self.assertTrue(all("phone" not in call.kwargs for call in send.call_args_list))
@@ -4407,7 +4405,7 @@ with mock.patch.object(sweep, "free_bytes", return_value=130 * sweep.GIB), mock.
         with self.crossing_delivery({}) as delivery:
             with mock.patch.object(sweep, "free_bytes", return_value=130 * GIB):
                 for older_reading in (140, 200, 130):
-                    sweep.notify_floor_problem(sweep.FloorOutcome(sweep.tmp_sweep.CompletedSweepAssessment(0), 0, older_reading * GIB, older_reading * GIB, 0),
+                    sweep.notify_floor_problem(sweep.FloorOutcome(tmp_sweep.CompletedSweepAssessment(0), 0, older_reading * GIB, older_reading * GIB, 0),
                                                lint_settings=conf.read("lint"))
             send = cast(mock.Mock, sweep.send_floor_alert)
             self.assertEqual(send.call_count, 1)
@@ -4507,13 +4505,13 @@ with mock.patch.object(sweep, "free_bytes", return_value=130 * sweep.GIB), mock.
         token = sweep.FLOOR_FILESYSTEM.set(sweep.FilesystemFloor(2, str(base), 300 * GIB, (), False))
         try:
             with mock.patch.object(sweep, "send_floor_alert", return_value=DELIVERED_NATEDEV_ALERT) as send:
-                sweep.notify_floor_problem(sweep.FloorOutcome(sweep.tmp_sweep.CompletedSweepAssessment(1), 0, 100 * GIB, 100 * GIB, 0),
+                sweep.notify_floor_problem(sweep.FloorOutcome(tmp_sweep.CompletedSweepAssessment(1), 0, 100 * GIB, 100 * GIB, 0),
                                            lint_settings=conf.read("lint"))
             self.assertEqual(send.call_count, 1)
             other = self.saved_record()
             self.assertIsInstance(other.phone_crossing, sweep.AbovePhoneFloor)
             with mock.patch.object(sweep, "send_floor_alert") as recovered_send:
-                sweep.notify_floor_problem(sweep.FloorOutcome(sweep.tmp_sweep.CompletedSweepAssessment(0), 0, 100 * GIB, 100 * GIB, 0),
+                sweep.notify_floor_problem(sweep.FloorOutcome(tmp_sweep.CompletedSweepAssessment(0), 0, 100 * GIB, 100 * GIB, 0),
                                            lint_settings=conf.read("lint"))
             recovered_send.assert_not_called()
             recovered = self.saved_record()
@@ -4529,7 +4527,7 @@ with mock.patch.object(sweep, "free_bytes", return_value=130 * sweep.GIB), mock.
               mock.patch.object(sweep, "write_floor_record", side_effect=OSError(errno.ENOSPC, "fixture full")),
               mock.patch.object(sweep, "send_floor_alert", return_value=DELIVERED_NATEDEV_ALERT) as send,
               redirect_stderr(io.StringIO())):
-            sweep.notify_floor_problem(sweep.FloorOutcome(sweep.tmp_sweep.CompletedSweepAssessment(0), 0, 140 * GIB, 140 * GIB, 0),
+            sweep.notify_floor_problem(sweep.FloorOutcome(tmp_sweep.CompletedSweepAssessment(0), 0, 140 * GIB, 140 * GIB, 0),
                                        lint_settings=conf.read("lint"))
         self.assertEqual(send.call_count, 1)
         cast(mock.Mock, sweep.send_phone_push).assert_not_called()
@@ -4541,7 +4539,7 @@ with mock.patch.object(sweep, "free_bytes", return_value=130 * sweep.GIB), mock.
         with (mock.patch.object(sweep, "locked_floor_record", side_effect=OSError(errno.ENOSPC, "fixture full")),
               mock.patch.object(sweep, "send_floor_alert", return_value=DELIVERED_NATEDEV_ALERT) as send,
               redirect_stderr(io.StringIO())):
-            sweep.notify_floor_problem(sweep.FloorOutcome(sweep.tmp_sweep.CompletedSweepAssessment(1), 0, 200 * GIB, 200 * GIB, 0),
+            sweep.notify_floor_problem(sweep.FloorOutcome(tmp_sweep.CompletedSweepAssessment(1), 0, 200 * GIB, 200 * GIB, 0),
                                        lint_settings=conf.read("lint"), scope=sweep.FloorFailureScope.DISCOVERY)
         self.assertEqual(send.call_count, 1)
 
@@ -4549,10 +4547,10 @@ with mock.patch.object(sweep, "free_bytes", return_value=130 * sweep.GIB), mock.
         _ = self.base()
         with (mock.patch.object(sweep, "free_bytes", return_value=200 * GIB),
               mock.patch.object(sweep, "send_floor_alert", return_value=DELIVERED_NATEDEV_ALERT) as send):
-            for outcome in (sweep.tmp_sweep.CompletedSweepAssessment(1), sweep.tmp_sweep.CompletedSweepAssessment(1),
-                            sweep.tmp_sweep.SkippedSweepAssessment(),
-                            sweep.tmp_sweep.CompletedSweepAssessment(1), sweep.tmp_sweep.CompletedSweepAssessment(0),
-                            sweep.tmp_sweep.CompletedSweepAssessment(1)):
+            for outcome in (tmp_sweep.CompletedSweepAssessment(1), tmp_sweep.CompletedSweepAssessment(1),
+                            tmp_sweep.SkippedSweepAssessment(),
+                            tmp_sweep.CompletedSweepAssessment(1), tmp_sweep.CompletedSweepAssessment(0),
+                            tmp_sweep.CompletedSweepAssessment(1)):
                 sweep.notify_floor_problem(outcome, lint_settings=conf.read("lint"))
         self.assertEqual(send.call_count, 2)
 
@@ -4560,13 +4558,13 @@ with mock.patch.object(sweep, "free_bytes", return_value=130 * sweep.GIB), mock.
         _ = self.base()
         with (mock.patch.object(sweep, "free_bytes", return_value=320 * GIB),
               mock.patch.object(sweep, "send_floor_alert", side_effect=[FAILED_NATEDEV_ALERT, DELIVERED_NATEDEV_ALERT]) as send):
-            sweep.notify_floor_problem(sweep.tmp_sweep.CompletedSweepAssessment(1), lint_settings=conf.read("lint"),
+            sweep.notify_floor_problem(tmp_sweep.CompletedSweepAssessment(1), lint_settings=conf.read("lint"),
                                        detail="private failure detail")
             pending = self.saved_record()
             self.assertIsInstance(pending.failure, sweep.FailurePending)
             assert isinstance(pending.failure, sweep.FailurePending)
             self.assertEqual(pending.failure.event.detail, "private failure detail")
-            sweep.notify_floor_problem(sweep.tmp_sweep.CompletedSweepAssessment(0), lint_settings=conf.read("lint"))
+            sweep.notify_floor_problem(tmp_sweep.CompletedSweepAssessment(0), lint_settings=conf.read("lint"))
         self.assertEqual(send.call_count, 1)
         cast(mock.Mock, sweep.send_phone_push).assert_not_called()
         self.assertNotIn("phone", send.call_args.kwargs)
@@ -4577,11 +4575,11 @@ with mock.patch.object(sweep, "free_bytes", return_value=130 * sweep.GIB), mock.
         _ = self.base()
         with (mock.patch.object(sweep, "free_bytes", return_value=200 * GIB),
               mock.patch.object(sweep, "send_floor_alert", side_effect=[FAILED_NATEDEV_ALERT, DELIVERED_NATEDEV_ALERT]) as send):
-            sweep.notify_floor_problem(sweep.FloorOutcome(sweep.tmp_sweep.CompletedSweepAssessment(1), 0, 200 * GIB, 200 * GIB, 0),
+            sweep.notify_floor_problem(sweep.FloorOutcome(tmp_sweep.CompletedSweepAssessment(1), 0, 200 * GIB, 200 * GIB, 0),
                                        lint_settings=conf.read("lint"), detail="private exception detail")
             pending = self.saved_record()
             self.assertIsInstance(pending.failure, sweep.FailurePending)
-            sweep.notify_floor_problem(sweep.FloorOutcome(sweep.tmp_sweep.CompletedSweepAssessment(1), 0, 200 * GIB, 200 * GIB, 0),
+            sweep.notify_floor_problem(sweep.FloorOutcome(tmp_sweep.CompletedSweepAssessment(1), 0, 200 * GIB, 200 * GIB, 0),
                                        lint_settings=conf.read("lint"), detail="later failure detail")
         self.assertEqual(send.call_count, 2)
         for call in send.call_args_list:
@@ -4598,7 +4596,7 @@ with mock.patch.object(sweep, "free_bytes", return_value=130 * sweep.GIB), mock.
         with (mock.patch.object(sweep, "free_bytes", return_value=140 * GIB),
               mock.patch.object(sweep, "send_floor_alert", return_value=DELIVERED_NATEDEV_ALERT) as send):
             for status in (1, 1):
-                sweep.notify_floor_problem(sweep.FloorOutcome(sweep.tmp_sweep.CompletedSweepAssessment(status), 0, 140 * GIB, 140 * GIB, 0),
+                sweep.notify_floor_problem(sweep.FloorOutcome(tmp_sweep.CompletedSweepAssessment(status), 0, 140 * GIB, 140 * GIB, 0),
                                            lint_settings=conf.read("lint"), detail="private exception detail")
         self.assertEqual(send.call_count, 1)
         cast(mock.Mock, sweep.send_phone_push).assert_not_called()
@@ -4824,11 +4822,11 @@ raise SystemExit(int(os.environ[variable]))
         _ = write_config_fixture(conf.path("lint"), "sweep_phone_floor_gib=150\n")
         folder = sweep.OutsideCacheDirectory(str(base / "measured"), 26 * GIB, 0, sweep.NoLargestGrowingChild())
         measurement = sweep.AvailableDiskMeasurement(datetime.now(UTC), sweep.NoEarlierDiskMeasurement(), [folder], 0)
-        with (mock.patch("push_texts.approval_date", return_value=""),
+        with (mock.patch("scripts.notify.push_texts.approval_date", return_value=""),
               mock.patch.object(sweep, "free_bytes", return_value=140 * GIB),
               mock.patch.object(sweep, "read_disk_measurement", return_value=measurement),
               mock.patch.object(sweep, "send_floor_alert", return_value=DELIVERED_NATEDEV_ALERT) as send):
-            sweep.notify_floor_problem(sweep.FloorOutcome(sweep.tmp_sweep.CompletedSweepAssessment(0), 0, 140 * GIB, 140 * GIB, 0),
+            sweep.notify_floor_problem(sweep.FloorOutcome(tmp_sweep.CompletedSweepAssessment(0), 0, 140 * GIB, 140 * GIB, 0),
                                        lint_settings=conf.read("lint"))
         self.assertEqual(send.call_count, 1)
         cast(mock.Mock, sweep.send_phone_push).assert_not_called()
@@ -6065,7 +6063,7 @@ if sys.argv[sys.argv.index("--to") + 1] == "user":
         base = self.base()
         for name in ("first state", "second state"):
             state = base / name
-            with mock.patch.dict(os.environ, {sweep.tmp_sweep.STATE_ENV: str(state)}), \
+            with mock.patch.dict(os.environ, {tmp_sweep.STATE_ENV: str(state)}), \
                  mock.patch.object(sweep, "recover_pending_trims"), \
                  mock.patch.object(sweep, "free_bytes", return_value=0), \
                  mock.patch.object(sweep, "try_lock", return_value=None) as acquire, \
@@ -6073,7 +6071,7 @@ if sys.argv[sys.argv.index("--to") + 1] == "user":
                 self.assertEqual(sweep.hold_floor(GIB, False), 0)
                 acquire.assert_called_once_with(str(state / "floor.lock"))
                 self.assertEqual(sweep.floor_record_path(), state / "floor.json")
-                self.assertEqual(sweep.target_deletes_path(), state / sweep.tmp_sweep.TARGET_DELETES_NAME)
+                self.assertEqual(sweep.target_deletes_path(), state / tmp_sweep.TARGET_DELETES_NAME)
                 self.assertTrue(state.is_dir())
 
     def test_own_deletes_do_not_hold_a_target_but_a_later_build_write_does(self) -> None:
@@ -6355,8 +6353,8 @@ if sys.argv[sys.argv.index("--to") + 1] == "user":
         with (mock.patch.dict(os.environ, {"CONF_DIR": str(config.parent)}),
               mock.patch.object(socket, "gethostname", return_value="testhost"),
               mock.patch.object(sweep, "sweep_workspace") as workspace,
-              mock.patch.object(sweep.tmp_sweep, "run_if_due",
-                                return_value=sweep.tmp_sweep.SkippedSweepAssessment()) as scratch,
+              mock.patch.object(tmp_sweep, "run_if_due",
+                                return_value=tmp_sweep.SkippedSweepAssessment()) as scratch,
               mock.patch.object(sweep, "hold_floor", return_value=0) as floor):
             for setting, minutes in (("", 60.0), ("recent_minutes=180\n", 180.0)):
                 with self.subTest(minutes=minutes):
@@ -6414,7 +6412,7 @@ class MacFloorTests(SweepCase):
     def mac_hold(self, policy: sweep.MacFloor, shortfall: int, *, dry_run: bool = False) -> str:
         output = io.StringIO()
         with (mock.patch.object(sweep, "free_bytes", return_value=GIB - shortfall),
-              mock.patch.object(sweep.tmp_sweep, "lsof_paths", return_value=sweep.tmp_sweep.ProcessUsesKnown([])),
+              mock.patch.object(tmp_sweep, "lsof_paths", return_value=tmp_sweep.ProcessUsesKnown([])),
               redirect_stdout(output)):
             self.assertEqual(sweep.hold_floor(GIB, dry_run, policy=policy), 0)
         return output.getvalue()
@@ -6527,7 +6525,7 @@ class MacFloorTests(SweepCase):
         claims = floor_claims.LockedClaims(frozenset())
         with (mock.patch.object(floor_claims, "locked_claims", return_value=nullcontext(claims)),
               mock.patch.object(sweep, "hold_floor", return_value=0) as take,
-              mock.patch.object(sweep.tmp_sweep, "run_if_due") as tmp):
+              mock.patch.object(tmp_sweep, "run_if_due") as tmp):
             self.assertEqual(sweep.main(["--floor-only", "--host", "mac", "--dry-run"]), 0)
         self.assertEqual(take.call_args.args, (101 * GIB, True))
         self.assertIsInstance(cast(object, take.call_args.kwargs["policy"]), sweep.MacFloor)
@@ -6537,7 +6535,7 @@ class MacFloorTests(SweepCase):
         base = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
         tree, payload = cargo_target(base, "idle", APP, time.time() - DAY)
         _ = (tree.parent / sweep.USE_STAMP).write_text("")
-        with mock.patch.object(sweep.tmp_sweep, "lsof_paths", return_value=sweep.tmp_sweep.ProcessUsesUnavailable()):
+        with mock.patch.object(tmp_sweep, "lsof_paths", return_value=tmp_sweep.ProcessUsesUnavailable()):
             self.assertIn(str(tree.parent), self.policy(base).uses([str(tree.parent)]))
         self.assertTrue(payload.exists())
 
@@ -6609,7 +6607,7 @@ class HolderSessionTests(unittest.TestCase):
             300: process_table.Process(300, 100, "cargo", "cargo build"),
         }
         with (mock.patch.dict(os.environ, {"BUILD_HOLD_DIR": str(holders),
-                                          sweep.tmp_sweep.STATE_ENV: str(base / "state")}),
+                                          tmp_sweep.STATE_ENV: str(base / "state")}),
               mock.patch.object(build_hold, "live_sessions", return_value=[]),
               mock.patch.object(sessions, "live_sessions", return_value=[record]),
               mock.patch.object(process_table, "snapshot", return_value=table),
@@ -6647,7 +6645,7 @@ class BudgetTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         state = self.enterContext(tempfile.TemporaryDirectory())
-        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {sweep.tmp_sweep.STATE_ENV: state})))
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {tmp_sweep.STATE_ENV: state})))
 
     def config(self) -> str:
         path = Path(self.enterContext(tempfile.TemporaryDirectory())) / "lint.conf"
@@ -6715,8 +6713,8 @@ class BudgetTests(unittest.TestCase):
                        "BUILD_HOLD_RELEASE_DIR": str(base / "release"),
                        "BUILDLOG_DIR": str(base / "buildlog"),
                        "NOTIFIER_SESSIONS_DIR": str(base / "sessions"),
-                       "PYTHONPATH": str(Path(__file__).resolve().parent)}
-        result = subprocess.run([sys.executable, "-c", "import sweep"], cwd=base, env=environment,
+                       "PYTHONPATH": str(Path(__file__).resolve().parents[2])}
+        result = subprocess.run([sys.executable, "-c", "from scripts.lint import sweep"], cwd=base, env=environment,
                                 capture_output=True, text=True, check=False, timeout=test_hang_guard.TEST_HANG_GUARD_SECS)
         self.assertEqual(result.returncode, 0, result.stderr)
 

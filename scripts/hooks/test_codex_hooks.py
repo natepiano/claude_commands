@@ -17,7 +17,7 @@ from unittest import mock
 
 from scripts.copies.test_copy_guard import argv_policy_cases, repair_policy_cases, shell_policy_cases, unresolved_policy_cases
 
-import codex_hooks
+from scripts.hooks import codex_hooks
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
@@ -175,7 +175,7 @@ class CodexHookInstallerTests(unittest.TestCase):
     def run_bash_policy(self, command: str | list[str]) -> subprocess.CompletedProcess[str]:
         hook = next(hook for hook in codex_hooks.HOOKS if hook.name == "scratch-guard")
         script = shlex.split(hook.command)[-1].replace("$HOME/.claude", str(INSTALLER.resolve().parents[2]))
-        return subprocess.run([sys.executable, script], input=json.dumps({
+        return subprocess.run([str(INSTALLER.parents[1] / "lib/py"), script], input=json.dumps({
             "tool_name": "Bash", "tool_input": {"command": command}, "cwd": "/"}),
             env={**self.environment, "PATH": os.environ["PATH"]}, text=True,
             capture_output=True, timeout=TEST_HANG_GUARD_SECS, check=False)
@@ -184,7 +184,7 @@ class CodexHookInstallerTests(unittest.TestCase):
         hook = next(hook for hook in codex_hooks.HOOKS if hook.name == "scratch-guard")
         self.assertEqual((hook.event, hook.matcher), ("PreToolUse", "Bash"))
         for command, expected in (("git clone source destination", 2),
-                                  ("copies.py run --owner verify-unit --repo . --commit HEAD -- true", 0)):
+                                  ("copies.py run --repo . --commit HEAD -- true", 0)):
             with self.subTest(command=command):
                 result = self.run_bash_policy(command)
                 self.assertEqual(result.returncode, expected, result.stderr)

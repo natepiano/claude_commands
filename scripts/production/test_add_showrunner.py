@@ -21,16 +21,13 @@ from typing import cast, override
 from unittest.mock import patch
 
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-
 from scripts.accounts import accounts
 from scripts.production import add_showrunner
 from scripts.production.production_doc import ProductionDocument, read_new_production, read_production
 from scripts.production import showrunners
-import showrunner_tree
+from scripts.production import showrunner_tree
 from scripts.whoami import usage_store
 from scripts.whoami.account_test_support import stored_room
-import herdr as runtime
 from scripts.herdr import herdr
 from scripts.herdr.fake_herdr import CommandResponse
 
@@ -55,8 +52,8 @@ class NativeClaudeShowrunnerTests(StaffTestCase):
         _ = staff.update_current_session(owner.current_session, current)
         _ = staff.rename(owner.id, "row-name")
         _ = fixture_member("showrunner", name="demo", runtime_id=fixture_runtime_id("decoy-showrunner"))
-        with (patch.object(runtime, "start_server"), patch.object(runtime, "launch_agent", return_value=
-              runtime.AgentLaunched("w1:p1", runtime.PromptSubmitted(datetime.now(timezone.utc)))) as launch):
+        with (patch.object(herdr, "start_server"), patch.object(herdr, "launch_agent", return_value=
+              herdr.AgentLaunched("w1:p1", herdr.PromptSubmitted(datetime.now(timezone.utc)))) as launch):
             _ = add_showrunner.launch(read_production("row-name"), "fixture", "high", current,
                                       self.root, accounts.NamedAccount("claude1", self.root))
         arguments = cast(list[str], launch.call_args.kwargs["agent_arguments"])
@@ -74,10 +71,10 @@ class NativeClaudeShowrunnerTests(StaffTestCase):
         self.assertIsNone(staff.initial_snapshot().by_path("demo"))
         identity = fixture_runtime_id("fresh-Claude-showrunner")
         backend = ClaudeBackendFixture(identity, self.root / "claude-account")
-        with (patch.object(runtime, "start_server"), patch.object(runtime, "launch_agent", side_effect=backend.launch)):
+        with (patch.object(herdr, "start_server"), patch.object(herdr, "launch_agent", side_effect=backend.launch)):
             outcome = add_showrunner.launch(child, "fixture", "high", None, self.root,
                 accounts.NamedAccount("claude1", backend.configuration))
-        self.assertIsInstance(outcome, runtime.PromptSubmitted)
+        self.assertIsInstance(outcome, herdr.PromptSubmitted)
         row = backend.before_opening.by_id(staff.StaffId(identity))
         assert row is not None
         self.assertEqual((row.id, row.name, row.parent), (identity, "demo", staff.StaffRoot()))
@@ -244,7 +241,7 @@ class AddShowrunnerTests(AddShowrunnerFixture):
                 with self.assertRaisesRegex(RuntimeError, "stopped before timer"):
                     _ = self.run_command("kid")
         else:
-            with patch.object(runtime.Herdr, "submit_opening_prompt", return_value=runtime.PromptNotSubmitted("pane busy")):
+            with patch.object(herdr.Herdr, "submit_opening_prompt", return_value=herdr.PromptNotSubmitted("pane busy")):
                 first = self.run_command("kid")
             self.assertEqual(first.returncode, add_showrunner.SESSION_NOT_READY, first.stderr)
         starts = sum(row[2:4] == ["agent", "start"] for row in self.herdr_calls())
@@ -257,7 +254,7 @@ class AddShowrunnerTests(AddShowrunnerFixture):
             return True
 
         with (patch.object(sessions, "session_liveness", return_value=sessions.LiveSessionProcess(12345)),
-              patch.object(runtime, "herdr_place_of", return_value=runtime.HerdrPlace("agents", "w1:p1")),
+              patch.object(herdr, "herdr_place_of", return_value=herdr.HerdrPlace("agents", "w1:p1")),
               patch.object(add_showrunner, "showrunner_appeared", side_effect=register)):
             recovered = self.run_command("kid")
         self.assertEqual(recovered.returncode, 0, recovered.stdout + recovered.stderr)
@@ -311,10 +308,10 @@ class AddShowrunnerTests(AddShowrunnerFixture):
         self.assertEqual(len(starts), 1)
         self.assertNotIn("--session-id", starts[0])
         self.assertEqual([row for row in self.herdr_calls() if row[2:4] == ["agent", "prompt"]], [])
-        submit = runtime.Herdr.submit_opening_prompt
+        submit = herdr.Herdr.submit_opening_prompt
 
-        def published_before_work(client: runtime.Herdr, pane: str, opening: runtime.OpeningPrompt,
-                                  launched_at: datetime, timeout_ms: int) -> runtime.PromptSubmitted | runtime.PromptNotSubmitted:
+        def published_before_work(client: herdr.Herdr, pane: str, opening: herdr.OpeningPrompt,
+                                  launched_at: datetime, timeout_ms: int) -> herdr.PromptSubmitted | herdr.PromptNotSubmitted:
             row = staff.by_id(staff.native_id(native))
             parent = staff.by_path("top")
             assert row is not None and parent is not None
@@ -322,8 +319,8 @@ class AddShowrunnerTests(AddShowrunnerFixture):
                              (native, "showrunner", "kid", staff.LiveDoc("natedev", self.doc("kid"))))
             return submit(client, pane, opening, launched_at, timeout_ms)
 
-        with (patch.object(runtime.Herdr, "submit_opening_prompt", new=published_before_work),
-              patch.object(runtime, "herdr_place_of", return_value=runtime.HerdrPlace("agents", "w1:p1"))):
+        with (patch.object(herdr.Herdr, "submit_opening_prompt", new=published_before_work),
+              patch.object(herdr, "herdr_place_of", return_value=herdr.HerdrPlace("agents", "w1:p1"))):
             recovered = self.run_command("kid")
         self.assertEqual(recovered.returncode, 0, recovered.stdout + recovered.stderr)
         self.assertEqual(sum(row[2:4] == ["agent", "start"] for row in self.herdr_calls()), 1)
@@ -356,8 +353,8 @@ class AddShowrunnerTests(AddShowrunnerFixture):
         other_native = fixture_runtime_id("another-showrunner-backend")
         with (patch.object(completion_receipt, "read_launch_receipt",
                            wraps=completion_receipt.read_launch_receipt) as read,
-              patch.object(runtime, "herdr_place_of", return_value=runtime.HerdrPlace("agents", "w1:p1")),
-              patch.object(runtime.Herdr, "native_session", return_value=other_native)):
+              patch.object(herdr, "herdr_place_of", return_value=herdr.HerdrPlace("agents", "w1:p1")),
+              patch.object(herdr.Herdr, "native_session", return_value=other_native)):
             retry = self.run_command("kid")
         self.assertEqual(retry.returncode, 2, retry.stdout + retry.stderr)
         self.assertIn(f"pending backend {native} differs from {other_native}", retry.stderr)
@@ -386,7 +383,7 @@ class AddShowrunnerTests(AddShowrunnerFixture):
         self.assertEqual(child.parent, staff.ReportsTo(parent.id))
         data, edge = self.staff.staff_file.read_bytes(), self.parent_of("kid")
         calls = sum(row[2:4] == ["agent", "start"] for row in self.herdr_calls())
-        with patch.object(runtime, "herdr_place_of", return_value=runtime.HerdrPlace("agents", "w1:p1")):
+        with patch.object(herdr, "herdr_place_of", return_value=herdr.HerdrPlace("agents", "w1:p1")):
             again = self.run_command("kid")
         self.assertEqual(again.returncode, 0, again.stdout + again.stderr)
         self.assertIn("already started", again.stdout)
@@ -490,19 +487,19 @@ class AddShowrunnerTests(AddShowrunnerFixture):
                 "foreground_processes": [{"pid": pid, "name": "claude", "argv": ["claude"]}]}}}), "")
 
         with (patch.dict(os.environ, self.env),
-              patch.object(runtime, "run_program", side_effect=native_process),
-              patch.object(runtime, "shared_session", return_value="agents"),
-              patch.object(runtime, "start_server"),
-              patch.object(runtime, "open_tab", return_value="destination:p1") as tab,
-              patch.object(runtime, "time", SimpleNamespace(monotonic=lambda: elapsed, sleep=advance)),
-              patch.object(runtime.Herdr, "panes", return_value=[{"pane_id": "destination:p1", "terminal_id": "destination-terminal", "workspace_id": "destination", "label": "kid"}]),
-              patch.object(runtime.Herdr, "start_command", side_effect=started),
-              patch.object(runtime.Herdr, "readiness", return_value={"agent_status": "idle", "interactive_ready": True}) as readiness,
-              patch.object(runtime.Herdr, "_prompt", autospec=True, side_effect=typed) as prompt,
-              patch.object(runtime.Herdr, "run", side_effect=visible),
-              patch.object(runtime.Herdr, "_send_keys", autospec=True, side_effect=enter) as keys):
+              patch.object(herdr, "run_program", side_effect=native_process),
+              patch.object(herdr, "shared_session", return_value="agents"),
+              patch.object(herdr, "start_server"),
+              patch.object(herdr, "open_tab", return_value="destination:p1") as tab,
+              patch.object(herdr, "time", SimpleNamespace(monotonic=lambda: elapsed, sleep=advance)),
+              patch.object(herdr.Herdr, "panes", return_value=[{"pane_id": "destination:p1", "terminal_id": "destination-terminal", "workspace_id": "destination", "label": "kid"}]),
+              patch.object(herdr.Herdr, "start_command", side_effect=started),
+              patch.object(herdr.Herdr, "readiness", return_value={"agent_status": herdr.AgentStatus.IDLE, "interactive_ready": True}) as readiness,
+              patch.object(herdr.Herdr, "_prompt", autospec=True, side_effect=typed) as prompt,
+              patch.object(herdr.Herdr, "run", side_effect=visible),
+              patch.object(herdr.Herdr, "_send_keys", autospec=True, side_effect=enter) as keys):
             outcome = add_showrunner.launch(child, "opus", "high", native, self.root, selected)
-        self.assertIsInstance(outcome, runtime.PromptSubmitted)
+        self.assertIsInstance(outcome, herdr.PromptSubmitted)
         self.assertEqual(prompt.call_count, 1)
         self.assertEqual(keys.call_count, 1)
         readiness.assert_called_once_with("destination:p1")
@@ -511,13 +508,13 @@ class AddShowrunnerTests(AddShowrunnerFixture):
 
     def test_unsubmitted_showrunner_is_named_and_never_attached_even_if_live(self) -> None:
         _ = self.doc("kid")
-        for outcome in (runtime.PromptNotSubmitted("fixture lost input"), runtime.PromptSubmissionNotRequired()):
+        for outcome in (herdr.PromptNotSubmitted("fixture lost input"), herdr.PromptSubmissionNotRequired()):
             with (self.subTest(outcome=outcome), patch.dict(os.environ, self.env, clear=True),
                   patch.object(showrunners, "own_name", return_value="top"),
                   patch.object(add_showrunner, "checked"),
-                  patch.object(runtime, "shared_session", return_value="agents"),
-                  patch.object(runtime, "start_server"), patch.object(runtime, "open_tab", return_value="destination:p1"),
-                  patch.object(runtime, "start_agent", return_value=outcome) as start,
+                  patch.object(herdr, "shared_session", return_value="agents"),
+                  patch.object(herdr, "start_server"), patch.object(herdr, "open_tab", return_value="destination:p1"),
+                  patch.object(herdr, "start_agent", return_value=outcome) as start,
                   patch.object(sessions, "session_liveness", return_value=sessions.SessionNotLive()),
                   patch.object(add_showrunner, "showrunner_appeared", return_value=True) as appeared,
                   redirect_stderr(io.StringIO()) as error):
@@ -525,8 +522,8 @@ class AddShowrunnerTests(AddShowrunnerFixture):
             self.assertEqual(code, add_showrunner.SESSION_NOT_READY)
             self.assertIn("kid: opening prompt not submitted", error.getvalue())
             appeared.assert_not_called()
-            opening = cast(runtime.OpeningPrompt, start.call_args.args[4])
-            assert isinstance(opening.transcript, runtime.SessionTranscript)
+            opening = cast(herdr.OpeningPrompt, start.call_args.args[4])
+            assert isinstance(opening.transcript, herdr.SessionTranscript)
             self.assertEqual(opening.transcript.config_dir, Path(self.env["HOME"]) / ".claude2")
             arguments = cast(list[str], start.call_args.args[3])
             self.assertEqual(opening.transcript.session_id, "")
@@ -864,8 +861,8 @@ class AddShowrunnerTests(AddShowrunnerFixture):
 
     def test_showrunner_poll_default_remains_two_seconds(self) -> None:
         environment = {key: value for key, value in self.env.items() if key != "ADD_SHOWRUNNER_POLL_S"}
-        program = f"import sys; sys.path.insert(0, {str(SCRIPT.parent)!r}); import add_showrunner; print(add_showrunner.POLL_S)"
-        result = subprocess.run([sys.executable, "-c", program], env=environment,
+        program = "from scripts.production import add_showrunner; print(add_showrunner.POLL_S)"
+        result = subprocess.run([str(SCRIPT.parents[1] / "lib/py"), "-c", program], env=environment,
                                 capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual((result.returncode, result.stdout), (0, "2.0\n"), result.stderr)
 

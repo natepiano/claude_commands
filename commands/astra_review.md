@@ -29,13 +29,15 @@ changes no file.
    The launcher uses the review run's transport pin.
    If worker end fails, its staff row remains visible in `worker.py list`.
    The exec hold ends with the launcher process.
-   A review outside the staff hierarchy keeps its one-turn `codex exec` path.
+   A review outside the staff hierarchy uses `assign.sh --target consultation-pane --operation astra-review`.
+   Its consultation pane uses Codex `gpt-6-astra` at `xhigh` with read-only access and approval `never`.
+   The launcher reads the review from the transcript, then closes the pane.
    - **Claude:** run it with `run_in_background: true`, tell the caller in one
      line that the astra review is running, then end the turn or do other work.
      The task notification is the wait. Never poll it, sleep or read its output
      before then. A review at xhigh can take many minutes.
    - **Pane or mesh worker:** start it with
-     `python3 ~/.claude/scripts/agents/mesh_runs.py start --label "astra review" -- <the command>`
+     `~/.claude/scripts/lib/py ~/.claude/scripts/agents/mesh_runs.py start --label "astra review" -- <the command>`
      End your turn; the result arrives as your next message.
      This detached-run command serves pane runs and existing mesh-pinned runs.
      Exit 3 means the caller is not a worker; run attached in one call only for that exit.

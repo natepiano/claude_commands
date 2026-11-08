@@ -11,34 +11,57 @@ import sys
 import tempfile
 import unittest
 from types import ModuleType
-from contextlib import closing, redirect_stderr, redirect_stdout
+from contextlib import closing, contextmanager, redirect_stderr, redirect_stdout
 from pathlib import Path
 from typing import ClassVar, cast, override
+from collections.abc import Generator
 from unittest import mock
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from ledger_test_support import ticket_owner_id
+from scripts.style.ledger_test_support import ticket_owner_id
 
-import approved_renames
-import style_footprint
-import style_plan
-import style_proposals
-import proposal_issue
+from scripts.style import approved_renames
+from scripts.style import style_footprint
+from scripts.style import style_plan
+from scripts.style import style_proposals
+from scripts.production import proposal_issue
 
-import berth_board
-import fake_fmt
-from style_child_test_support import style_cli_command, unqueued_style_children
-import mechanical_classes
-import rules
-import style_ledger
-import style_rules
+from scripts.lib import berth_board
+from scripts.style import fake_fmt
+from scripts.style.style_child_test_support import style_cli_command, unqueued_style_children
+from scripts.style import mechanical_classes
+from scripts.style import rules
+from scripts.style import style_ledger
+from scripts.style import style_rules
 from scripts.production import staff, unit_config
 from scripts.production.cli_fixture import invoke_cli, process_boundary_for_case
 from scripts.production.staff_test_support import fixture_member, fixture_runtime_id, fixture_unit_location, isolated_staff_file, recorded_showrunner
 
 
 REAL_RUN = subprocess.run
+CLASS_RULES = (
+    "module-structure",
+    "types-live-with-their-behavior",
+    "split-by-type-ownership",
+    "test-module-allow-boilerplate",
+    "prefer-type-named-fields-and-bindings",
+)
+
+
+@contextmanager
+def private_class_catalog(root: Path) -> Generator[None]:
+    """Provide a fixed catalog independent of the mechanical class list."""
+    catalog = root / "class-catalog"
+    (catalog / "rust").mkdir(parents=True, exist_ok=True)
+    for name in CLASS_RULES:
+        _ = (catalog / "rust" / f"{name}.md").write_text(f"---\ntier: E\n---\n# {name}\n")
+    mechanical_classes.classes.cache_clear()
+    try:
+        with (mock.patch.object(style_rules, "NATE_STYLE_DIR", catalog),
+              mock.patch.dict(os.environ, {"STYLE_HISTORY_NATE_STYLE_DIR": str(catalog)})):
+            yield
+    finally:
+        mechanical_classes.classes.cache_clear()
 
 
 def unit_staff_id(name: str) -> str:
@@ -114,7 +137,8 @@ class StylePlanFixture(unittest.TestCase):
 
     def configure_fixture(self) -> None:
         _ = self.enterContext(unqueued_style_children())
-        listed = mechanical_classes.classes()
+        with private_class_catalog(self.fixture_root.parent):
+            listed = mechanical_classes.classes()
         _ = self.enterContext(mock.patch.object(mechanical_classes, "classes", return_value=listed))
         self.root = self.fixture_root
         self.pending_judge_tickets = frozenset()
@@ -157,7 +181,7 @@ class StylePlanFixture(unittest.TestCase):
         directory = Path.cwd() if cwd is None else Path(cwd)
         module = None
         arguments = command[2:]
-        if command[0] == sys.executable and len(command) > 1:
+        if command[0] == str(Path(__file__).resolve().parents[1] / "lib/py") and len(command) > 1:
             module = next((item for item in (style_plan, style_ledger, style_footprint, proposal_issue)
                            if Path(command[1]) == Path(item.__file__ or "")), None)
         if module is style_plan and process_boundary_for_case(self):
@@ -241,7 +265,7 @@ class StylePlanFixture(unittest.TestCase):
         return "\n".join([
             "# Standing names",
             "> **Standing:** style_plan.py", "", "## Delegation Context", "",
-            "- **Project:** sample", "- **Test:** verify.sh test <package>", "", "## Phases", "",
+            "- **Project:** sample", "- **Test:** verify.sh test [<package>]", "", "## Phases", "",
         ])
 
     def board(self, *blocked: str) -> berth_board.Board:

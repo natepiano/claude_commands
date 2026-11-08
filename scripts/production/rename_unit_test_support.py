@@ -1,21 +1,21 @@
 """Use private staff records and Git repositories for unit rename tests."""
 from __future__ import annotations
 
+from scripts.shutdown import remote
+
 import json
 import os
 import shutil
 import shlex
 import sqlite3
 import subprocess
-import sys
 import tempfile
 from collections.abc import Callable, Generator, Iterable
 from contextlib import AbstractContextManager, closing, contextmanager
 from pathlib import Path
-from typing import TYPE_CHECKING, ClassVar, Literal, cast, override
+from typing import ClassVar, Literal, cast, override
 from unittest import mock
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from scripts.herdr import fake_herdr
 from scripts.lint.memory_test_support import config_environment
@@ -25,14 +25,11 @@ from scripts.production.staff_test_support import fixture_member, fixture_runtim
 from scripts.production import staff, unit_config, fake_unit_host
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
-import rename_unit
-import pane_record
-if TYPE_CHECKING:
-    from scripts.style import style_ledger
-else:
-    import style_ledger
+from scripts.production import rename
+from scripts.shutdown import pane_record
+from scripts.style import style_ledger
 
-SCRIPT = Path(__file__).with_name("rename_unit.py")
+SCRIPT = Path(__file__).with_name("rename.py")
 SLUG = "demo"
 
 
@@ -199,7 +196,7 @@ class UnitRenameFixture(StaffTestCase):
 
     def rename(self, action: str, old: str = "alpha", new: str = "gamma", *,
                refuse: str = "") -> subprocess.CompletedProcess[str]:
-        arguments = [action, SLUG, old, new, "--scratch", str(self.root / "scratch")]
+        arguments = [action, f"{SLUG}/{old}", new]
         return self.invoke(arguments, refuse=refuse)
 
     def invoke(self, arguments: list[str], *, cwd: Path | None = None,
@@ -221,7 +218,7 @@ class UnitRenameFixture(StaffTestCase):
         # These values are normally bound at interpreter startup. Rebind them for
         # each invocation, including tests that change the shutdown stand-in.
         with mock.patch.object(subprocess, "run", run):
-            return invoke_cli(rename_unit, lambda: rename_unit.main(arguments), arguments,
+            return invoke_cli(rename, lambda: rename.main(arguments), arguments,
                               self.env, cwd or self.checkout, production_state=True)
 
     def assert_ok(self, result: subprocess.CompletedProcess[str]) -> None:
@@ -244,7 +241,7 @@ class UnitRenameFixture(StaffTestCase):
             "- **Log:**", f"- **Kind:** style\n- **Repository:** `{self.checkout}`\n- **Log:**"))
         parent = next(row for row in staff.snapshot().find(kind="showrunner") if row.name == SLUG)
         unit = fixture_member("unit", name="names", parent=parent.id,
-                           worktree=staff.PresentWorktree("natedev", worktree))
+                           worktree=staff.PresentWorktree(remote.local_machine(), worktree))
         _ = unit_config.write(worktree, unit_config.UnitConfig(
             unit_config.PlanFile(plan), unit_config.NoAppPort(), ()))
         for directory in (self.checkout, worktree):
@@ -289,7 +286,7 @@ class FolderRenameFixture(StaffTestCase):
         identity = staff.native_id(fixture_runtime_id(f"unit:{parent}:{self.old_name}"))
         return staff.StaffRow(identity, "unit", self.old_name, staff.ReportsTo(parent),
             current_session=staff.native_id(fixture_runtime_id("folder-current-after-clear")),
-            worktree=staff.PresentWorktree("natedev", self.source))
+            worktree=staff.PresentWorktree(remote.local_machine(), self.source))
 
     @override
     def setUp(self) -> None:
@@ -324,9 +321,9 @@ class FolderRenameFixture(StaffTestCase):
         _ = self.git("commit", "-m", "fixture")
         _ = self.git("worktree", "add", "-b", f"cargo-liner-{self.old_name}", str(self.source))
         owner = fixture_member("showrunner", name="folder-production",
-            doc=staff.LiveDoc("natedev", self.checkout / "production.md"))
+            doc=staff.LiveDoc(remote.local_machine(), self.checkout / "production.md"))
         row = fixture_member("unit", name=self.old_name, parent=owner.id,
-            worktree=staff.PresentWorktree("natedev", self.source))
+            worktree=staff.PresentWorktree(remote.local_machine(), self.source))
         _ = staff.update_current_session(row.current_session,
             staff.native_id(fixture_runtime_id("folder-current-after-clear")))
         _ = self.configuration.write_text((Path(__file__).resolve().parents[2] / "config/production.conf").read_text())
@@ -339,9 +336,9 @@ class FolderRenameFixture(StaffTestCase):
         return result.stdout.strip()
 
     def command(self, *, new: str = "") -> subprocess.CompletedProcess[str]:
-        from scripts.production import rename_unit as folder_rename
+        from scripts.production import rename as folder_rename
 
-        arguments = ["apply", "folder-production", self.old_name, new or self.new_name]
+        arguments = ["apply", f"folder-production/{self.old_name}", new or self.new_name]
         return invoke_cli(folder_rename, lambda: folder_rename.main(arguments), arguments,
                           dict(os.environ), self.checkout)
 
@@ -376,7 +373,6 @@ class FolderRenameFixture(StaffTestCase):
             path = self.home / ".codex/sessions/2026/11/04" / f"rollout-fixture-{self.owner.current_session}.jsonl"
         path.parent.mkdir(parents=True)
         _ = path.write_text("{}\n")
-
 
 
 class FolderSessionFixture:

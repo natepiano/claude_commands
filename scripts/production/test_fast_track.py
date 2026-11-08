@@ -1055,6 +1055,30 @@ signal.pause()
         self.assertEqual(self.git("write-tree", cwd=self.unit), index)
         self.assertEqual((self.unit / "scripts/sample/item.py").read_bytes(), content)
 
+    def test_fast_track_without_a_build_cache_records_the_push_and_removes_its_copy(self) -> None:
+        _ = self.git("rm", "Cargo.toml")
+        _ = self.git("commit", "-m", "repository without a build cache")
+        _ = self.git("push", "origin", "HEAD:main", "HEAD:production")
+        _ = self.git("reset", "--hard", "production", cwd=self.unit)
+        _ = self.git("merge", "--ff-only", "production", cwd=self.promote)
+        self.change_module()
+
+        result = self.fast_track()
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        tip = self.git("rev-parse", "refs/heads/main", cwd=self.origin)
+        row, = self.records()
+        self.assertEqual((row["unit"], row["commit"], row["review"]), ("alpha", tip, "pending"))
+        tests = self.observations("test")
+        self.assertEqual({row["module"] for row in tests}, {"test_item", "test_item_extra"})
+        for observed in tests:
+            checkout = Path(str(observed["cwd"]))
+            self.assertNotIn(checkout, (self.unit, self.checkout, self.promote))
+            self.assertTrue(observed["private_git"], observed)
+            self.assertFalse(checkout.exists())
+        self.assertEqual((self.unit / "scripts/sample/item.py").read_text(), MODULE)
+        self.assertEqual(self.git("rev-parse", "HEAD", cwd=self.promote), tip)
+
     def test_one_command_shares_its_settings_through_fetch_and_recovery(self) -> None:
         self.change_module()
         with patch.object(conf, "read", wraps=conf.read) as reads:
@@ -1154,7 +1178,7 @@ signal.pause()
                       "scripts/production/staff_sources.py", "scripts/production/add_unit.py",
                       "scripts/production/add_showrunner.py", "scripts/production/retire_unit.py",
                       "scripts/production/promote_showrunner.py", "scripts/production/transfer_unit.py",
-                      "scripts/accounts/moves.py", "scripts/production/rename_unit.py",
+                      "scripts/accounts/moves.py", "scripts/production/rename.py",
                       "scripts/shutdown/shutdown.py", "scripts/production/merge_gate.py",
                       "scripts/production/merge_checkpoint.py", "scripts/direct/verify.sh",
                       "scripts/production/build_hold.py", "scripts/production/fast_track.py",

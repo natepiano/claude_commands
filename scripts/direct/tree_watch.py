@@ -9,6 +9,10 @@ or the parent exits (3). Cargo metadata is supplied once on stdin.
 """
 
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import hashlib
 import json
@@ -21,8 +25,8 @@ import sys
 import time
 from typing import NotRequired, TypedDict, cast
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.lib.cargo_output import CargoOutputRoots, read_cargo_output_roots
+from scripts.lib.git_blob import git_blob_id
 
 
 class Dependency(TypedDict, total=False):
@@ -102,7 +106,7 @@ def blob(path: bytes) -> bytes:
         mode = b"100755" if os.access(path, os.X_OK) else b"100644"
     else:
         return b""
-    return mode + b" blob " + hashlib.sha1(b"blob %d\0" % len(data) + data).hexdigest().encode()
+    return mode + b" blob " + git_blob_id(data).encode()
 
 
 class TreeInputs:
@@ -113,6 +117,14 @@ class TreeInputs:
         self.tree_content_key: str = ""
         self.files: list[str] = args[:split]
         self.words: list[str] = args[split + 1:]
+        self.forwarded_result_environment: dict[str, str] = {}
+        descriptor = os.environ.get("VERIFY_RESULT_ENVIRONMENT_FD", "")
+        if self.words[:1] == ["test"] and descriptor:
+            with os.fdopen(int(descriptor), "rb", closefd=False) as source:
+                for entry in source.read().split(b"\0"):
+                    if entry:
+                        name, _, value = entry.partition(b"=")
+                        self.forwarded_result_environment[os.fsdecode(name)] = os.fsdecode(value)
         self.package: str = self.files[1] if self.files[:1] == ["--package"] else ""
         if self.package:
             self.files = self.files[2:]
@@ -224,11 +236,15 @@ class TreeInputs:
         build_key = key.copy()
         words = iter(self.words)
         for word in words:
-            if word == "--filter":
+            if word == "--filter" or (word == "--env" and self.words[:1] == ["test"]):
                 _ = next(words, None)
             else:
                 build_key.update(b"\0" + word.encode())
-        for word in self.words:
+        words = iter(self.words)
+        for word in words:
+            if word == "--env" and self.words[:1] == ["test"]:
+                _ = next(words, None)
+                continue
             key.update(b"\0" + word.encode())
             tree_content.update(b"\0" + word.encode())
         for name, value in sorted(os.environ.items()):
@@ -237,6 +253,24 @@ class TreeInputs:
                 tree_content.update(("\0" + name + "=" + value).encode())
                 if not name.startswith("NEXTEST_") or name == "NEXTEST_CARGO_PROFILE":
                     build_key.update(("\0" + name + "=" + value).encode())
+        if self.words[:1] == ["test"]:
+            from scripts.direct.result_environment import read_policy
+
+            policy = read_policy()
+            environment = {name: value for name, value in os.environ.items() if policy.selects(name)}
+            words = iter(self.words)
+            for word in words:
+                if word == "--env":
+                    name = next(words, "")
+                    if name in self.forwarded_result_environment:
+                        environment[name] = self.forwarded_result_environment[name]
+                    elif name in os.environ:
+                        environment[name] = os.environ[name]
+            environment.update(policy.fixed)
+            for name, value in sorted(environment.items()):
+                encoded = ("\0" + name + "=" + value).encode()
+                key.update(encoded)
+                tree_content.update(encoded)
         if self.package and os.environ.get("VERIFY_COMPUTE_TEST_BUILD") == "1":
             # Cargo resolves config, environment and workspace target paths.
             # An unknown destination proves no fresh build.

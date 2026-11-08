@@ -43,7 +43,7 @@ Q1 stop-and-rerun finishes · Q2 live check, not stored status · Q3 failure kee
 | Tool and lasting state | Q1 | Q2 | Q3 | Q4 | Q5 | Rank | Phase |
 |---|---|---|---|---|---|---|---|
 | `direct/workers.py` roster | no: seek, truncate, dump in place, `:558-563` | sweep row `:1604` (stored `ended`) | no: a stop after truncate loses every worker's record | ok | ok | unsafe | 1 |
-| `agents/codex_mesh.py` roster, inbox | no: 17 in-place `truncate()` sites | sweep rows | no (sweep `:1443`, `:2006`) | ok | sweep `:8169` prime claim | unsafe; retires in herdr-worker-panes Phase 18 | 1 only |
+| `agents/codex_mesh.py` roster, inbox | no: 17 in-place `truncate()` sites | sweep rows | no (sweep `:1443`, `:2006`) | ok | sweep `:8169` prime claim | unsafe; retires in herdr-worker-panes Phase 19 | 1 only |
 | `message/send.py` `--key` claim (*new*) | no: `claim()` records the key before delivery (`256a7214` `:967-987`), with no owner | ok | ok since 969f229b: a failed, refused or held keyed send gives back its claim; a queued or kept send keeps it (`256a7214` `:2245-2248`) | ok | no clear for a non-emergency claim but `reopen` | at risk | 6 |
 | 7 "notified" marks saved before the send (sweep rows: `five_hour.py:92`, `codex_winddown.py:233`, `main_sync.py:122`, `send.py:1389`, `stall_watch.py:679`, `settle.py:1568` (obsolete: code deleted), `dailies_input.py:1095`) | no, where still open | ok | — | — | no expiry | at risk; some fixed per site | 6 (`settle.py`: obsolete: code deleted) |
 | `production/transfer_unit.py` journal (*new* fault) | at risk: `_commit_only` (`:248-254`) adopts an earlier commit only when it is HEAD; after another merge-branch commit the rerun runs `git commit --only` on clean paths, which fails with nothing to commit, so the rerun stops (prove with a test) | ok: stop and relaunch read live state | ok | ok | ok | at risk | 7 (obsolete: code deleted) |
@@ -67,7 +67,7 @@ Q1 stop-and-rerun finishes · Q2 live check, not stored status · Q3 failure kee
 - **Lifecycle steps.** Six doc-commit sites with three adoption rules; the three step runners are in deleted code (obsolete).
 - **Worktree removal.** Eight removal paths; `lib/scratch.py` already documents the safe form (`git worktree remove --force`).
 
-**Not in this plan.** Open rows with one site and no shared cause go to their owners through the sweep: class E `scratch.py:202` (adopt), `codex_hooks.py:237`, `build_hold.py:1173` (release), `buildlog/record.py:497`, `send.py:1213`; class F `role_map.py:587`, `refusal_watch.py:949`, `design_roles.py:927`, `:1009`, `:1438`, `merge_gate.py:1145`, `:1057` (push after merge). codex_mesh fixes beyond the file writer: the mesh retires in herdr-worker-panes Phase 18 (the user's request to retire it), so only one-line writer moves go there.
+**Not in this plan.** Open rows with one site and no shared cause go to their owners through the sweep: class E `scratch.py:202` (adopt), `codex_hooks.py:237`, `build_hold.py:1173` (release), `buildlog/record.py:497`, `send.py:1213`; class F `role_map.py:587`, `refusal_watch.py:949`, `design_roles.py:927`, `:1009`, `:1438`, `merge_gate.py:1145`, `:1057` (push after merge). codex_mesh fixes beyond the file writer: the mesh retires in herdr-worker-panes Phase 19 (the user's request to retire it), so only one-line writer moves go there.
 
 ## Delegation Context
 
@@ -79,7 +79,9 @@ Q1 stop-and-rerun finishes · Q2 live check, not stored status · Q3 failure kee
   - `scripts/lib/rerun_test_support.py` — the one rerun test harness: disposable HOME and repo, one-shot `git` and command stops (`fail_git`, `stop_command`)
   - `scripts/lib/scratch.py` — scratch folders and the safe worktree removal
   - `docs/plans/sdlc-rerun-sweep.md` — the per-site rows and their owners
-- **Test:** each module's own suite, `python3 -m unittest discover -s scripts/<folder> -p '<test file>'`, from the worktree root. Gate: `env HERDR_BIN=/nonexistent/herdr python3 scripts/production/merge_gate.py --repo . --tests-only --full`, from the worktree root, after `build_hold.py status` shows no natedev hold that is not ours.
+- **Test:** each module's own suite, `python3 -m unittest discover -s scripts/<folder> -p '<test file>'`, from the worktree root.
+  Targeted test: `env HERDR_BIN=/nonexistent/herdr python3 scripts/production/targeted_test.py --repo . --full`.
+  Run it from the worktree root after `build_hold.py status` shows no natedev hold that is not ours.
 - **Lint:** `basedpyright <changed Python files and every caller module>` passes when its output has the `0 errors, 0 warnings, 0 notes` line; the exit status says nothing.
 - **Invariants:**
   - One place for each thing (user, 2026-10-30). A phase moves every copy of its cause onto the shared place, deletes the copy, and adds a check that refuses a new one. Where the check cannot see a copy (shell writers, Python in a string, a caller's own notice mark), the phase says so and names the sites. No forwarding wrapper that only calls the shared place.

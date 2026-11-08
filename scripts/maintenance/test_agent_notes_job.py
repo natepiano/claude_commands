@@ -34,6 +34,27 @@ class JobTests(unittest.TestCase):
         self.enterContext(patch.dict(os.environ, {
             "XDG_STATE_HOME": str(self.root), "AGENT_NOTES_JOB_CONFIG": str(self.config)}))
 
+    def test_refusal_part_hands_moves_to_the_detached_batch_before_stopping(self) -> None:
+        from scripts.accounts import refusal_watch, moves
+        from scripts.shutdown import stop_resume
+
+        def refusal_pass(**_options: object) -> list[str]:
+            results = stop_resume.move_sessions(["member"], "claude5", why="auto: head", cause="auto",
+                                               source_accounts={"member": "claude4"})
+            self.assertEqual(results, [stop_resume.MoveHandedOff("member")])
+            return []
+
+        with (patch.dict(os.environ, {"HOME": str(self.root)}),
+              patch.object(refusal_watch, "run", side_effect=refusal_pass),
+              patch.object(stop_resume, "_detach") as detach,
+              patch.object(stop_resume, "_stop") as stop,
+              patch.object(moves, "append_move") as append):
+            self.assertEqual(job._perform(Part.REFUSALS), 0)  # pyright: ignore[reportPrivateUsage]
+        stop.assert_not_called()
+        append.assert_not_called()
+        detach.assert_called_once_with(["batch", "--target", "claude5", "--why", "auto: head", "--cause", "auto",
+            "--warn-seconds", "0", "--source-account", "member=claude4", "--", "member"], "move")
+
     def test_successful_parts_are_saved_and_a_rerun_retries_only_the_failure(self) -> None:
         def part(name: Part, _cadence: Schedule, _deadline: float) -> job.PartResult:
             return job.PartResult(name, job.Outcome.FAILED if name is Part.PACER else job.Outcome.SUCCESS,

@@ -257,14 +257,24 @@ class FindingsLedgerFixture(unittest.TestCase):
         return note
 
     def write_repair_intervals(self, count: int, *, instance: str = "instance-a") -> None:
-        """Unledgered fixes use distinct intervals even when fix_pass restarts at one."""
+        """Ledger batches use distinct intervals even when fix_pass restarts at one."""
         path = self.root / "history" / "runs" / f"{self.session_dir.name}.jsonl"
         path.parent.mkdir(parents=True, exist_ok=True)
+        history = [cast(dict[str, object], json.loads(line)) for line in path.read_text().splitlines()] if path.exists() else []
+        previous = max((cast(int, event["round"]) for event in history
+                        if event.get("event_type") == "finding_batch_dispatched"
+                        and event.get("phase_instance_id") == instance), default=0)
         records: list[dict[str, object]] = []
         for index in range(count):
+            number = previous + index + 1
+            records.append({
+                "event_type": "finding_batch_dispatched", "phase_instance_id": instance,
+                "round": number, "covered": ["F001"], "timestamp_epoch": 90 + index * 20,
+            })
             start: dict[str, object] = {
                 "event_type": "pass_started", "phase_instance_id": instance,
-                "pass_instance_id": f"repair-{instance}-{index}", "pass_kind": "fix",
+                "pass_instance_id": f"repair-{instance}-{number}", "pass_kind": "fix",
+                "launch_check": {"fix_cause": {"round": number}},
                 "fix_pass": 1, "pass_started_at": 100 + index * 20,
                 "timestamp_epoch": 100 + index * 20, "pass_activity": "repair failing tests",
             }

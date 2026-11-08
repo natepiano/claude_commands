@@ -34,7 +34,7 @@ class AssignGateTests(unittest.TestCase):
                     self.assertEqual(result.stdout, '')
 
     def test_direct_shell_launchers_refuse_before_argument_validation(self) -> None:
-        for script in ('direct/implement.sh', 'direct/review.sh', 'agents/agent_bg.sh',
+        for script in ('direct/review.sh',
                        'agents/agent_exec.sh'):
             with self.subTest(script=script):
                 result = subprocess.run(['bash', str(ROOT / 'scripts' / script)],
@@ -53,9 +53,8 @@ class AssignGateTests(unittest.TestCase):
         with patch.object(subprocess, 'run', return_value=result):
             self.assertTrue(assign_gate.called_by_assign())
 
-    def test_worker_fill_and_exec_hops_reach_the_assign_parent(self) -> None:
-        for launcher, interpreter in ((ROOT / 'scripts/agents/agent_exec.sh', 'bash'),
-                                      (ROOT / 'scripts/production/worker_fill.py', 'python3')):
+    def test_exec_hop_reaches_the_assign_parent(self) -> None:
+        for launcher, interpreter in ((ROOT / 'scripts/agents/agent_exec.sh', 'bash'),):
             with self.subTest(launcher=launcher):
                 replies = [subprocess.CompletedProcess([], 0, f'2 {interpreter} {launcher}\n', ''),
                            subprocess.CompletedProcess([], 0, f'1 python3 {assign_gate.ASSIGN}\n', '')]

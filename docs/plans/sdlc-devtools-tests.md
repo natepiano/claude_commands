@@ -2,7 +2,6 @@
 
 > **Status: IMPLEMENTATION PLAN — phased, delegate-ready.** Make the `~/.claude` repo tests run in every gate, faster, and with less CPU. Phase 1 fixes the gate's test list. Phases 4-6 come from the measured inventory of full gate 3 (2026-10-30).
 
-
 ## Source
 
 The user, through the sdlc showrunner, 2026-10-30: "it can also be where we look at making repo tests go faster and take less cpu". Phase 1: herdr through natedev and the showrunner, 2026-10-30. natedev agreed the `merge_gate.py` edit ("take it"; no open natedev branch touches it).
@@ -18,7 +17,8 @@ Known input for the inventory: `scripts/agents/test_codex_mesh.py` was killed at
   - `scripts/production/merge_gate.py` — the merge gate: finds test modules, runs them under a memory cap, keeps the passed-tree ledger (`PassedTreeLedger`)
   - `scripts/production/merge_gate_test_support.py`, `scripts/production/test_merge_gate*.py` — its fixture and tests
   - `docs/as-built/merge-gate-and-test-speed.md` — the gate's as-built
-- **Test:** `python3 -m unittest discover -s scripts/production -p 'test_merge_gate*.py'`, from the worktree root. Gate: `env HERDR_BIN=/nonexistent/herdr python3 scripts/production/merge_gate.py --repo . --tests-only --full`, from the worktree root.
+- **Test:** `python3 -m unittest discover -s scripts/production -p 'test_merge_gate*.py'`, from the worktree root.
+  Targeted test: `env HERDR_BIN=/nonexistent/herdr python3 scripts/production/targeted_test.py --repo . --full`, from the worktree root.
 - **Lint:** `basedpyright <changed Python files>` passes when its output has the `0 errors, 0 warnings, 0 notes` line; the exit status says nothing.
 - **Invariants:**
   - Tests use fixtures; they never read live state (`~/.claude` main, `/tmp/claude`, `~/.cargo/bin`).
@@ -559,7 +559,7 @@ Every tool takes a unit's location from its staff row. A stale or absent Units W
 **Gotchas:**
 - A test that reaches a unit-location reader writes the staff rows it needs. No reader treats a missing staff file as an empty record.
 - `resume_unit` imports the bare `unit_lookup` module and `add_unit` imports the package copy. A test patches each copy that its callee uses.
-- The phase test list does not cover every reader caller. The gate for a reader change is `merge_gate.py --tests-only --full`.
+- The phase test list does not cover every reader caller. The gate for a reader change is `full_test.py --checkout <tree> --full`.
 
 **Ruled out:** a fallback reader for a missing staff file; a walk up from a missing Plan folder to a parent checkout.
 
@@ -908,7 +908,53 @@ Source: sdlc 2026-11-04 11:5x (save gate time). A unit gates a tree that already
 
 **Acceptance gate:** the merge_gate and `test_merge_checkpoint*` modules pass; basedpyright `0 errors, 0 warnings, 0 notes`. Branch `sdlc-devtools-passed` off origin/sdlc 5e8bc5a52.
 
-### Phase 7u — The production name is the showrunner's staff name  · status: todo
+### Phase 7s — review.sh keeps no tree check  · status: done (d32150dfb)
+
+Source: sdlc [e0265011], 2026-11-05. The tree check failed a review for the third time with no reviewer write (2026-10-12, 10-15, 11-05: the director's own plan write ran during the review). User rule 2026-11-05: a fix for a broken guard deletes the guard.
+
+**Depends on:** none. It lands as its own hash from the sdlc tip.
+
+#### Work Order
+
+**Goal:** `review.sh` makes no before and after tree fingerprint and reports no "changed the working tree" error.
+
+**Spec:**
+1. Delete the baseline and changes calls in `review.sh`, their variables, their error and board posts, and the status branch that the error sets.
+2. Delete `review_tree.py` and `test_review_tree.py`.
+3. Delete the tests that pin only the tree check. Keep every other test in those files.
+4. Delete the tree check text in `docs/as-built/long-lived-workers.md`.
+5. Add nothing in its place.
+
+**Files:** `scripts/direct/review.sh`, `scripts/direct/review_tree.py`, `scripts/direct/test_review_tree.py`, `scripts/direct/test_review_launcher_trees.py`, `scripts/direct/review_launcher_test_support.py`, `scripts/direct/test_simplify_lens.py`, `docs/as-built/long-lived-workers.md`.
+
+**Workers:** `1 writer`.
+
+**Acceptance gate:** no file names `review_tree` or "changed the working tree"; the direct review suites pass; the full gate passes; source net negative.
+
+### Phase 7t — Withdraw an open question whose cause is gone  · status: done (bb5854152)
+
+Source: sdlc [e93bf7b3], 2026-11-05, for natedev. First user: report-unit's hanadocs sync question. It lands as its own hash on top of 4fa36df93.
+
+**Depends on:** none.
+
+#### Work Order
+
+**Goal:** `update_registration.py withdraw --item <text>` removes one open item, records it in the question history as withdrawn, and prints no relay line.
+
+**Spec:**
+1. Move the open-item removal in `answer` into one function. `answer` and `withdraw` both call it. Do not copy it.
+2. `withdraw` matches one open item by its exact text, in the same lists that `answer` reads.
+3. `withdraw` writes the item to `<slug>.history.jsonl` with a `withdrawn` time. It writes nothing to `<slug>.answered.jsonl`.
+4. `withdraw` prints no `relay:` line.
+5. Add no other guard or check.
+
+**Files:** `scripts/production/update_registration.py`, `scripts/production/test_update_registration_answers.py`, `commands/showrunner/produce.md`, `docs/as-built/showrunner-automation.md`, `docs/as-built/message-clarity.md`.
+
+**Workers:** `1 writer`.
+
+**Acceptance gate:** a withdraw test removes the item, writes the history record, writes no answered record, and prints no relay line; the answer tests pass unchanged; the production suite passes.
+
+### Phase 7u — The production name is the showrunner's staff name  · status: done (829824277)
 
 **Source:** the user, through the sdlc showrunner, 2026-11-05 [fe103398]: "the name of the showrunner is the name of the productino wherever production is used we should just use the showrunner's name. the units alrady know what is there place int he staff so the prodution header line doesn't nee to exist nor does the name of the production doc because that also comes from the staff record."
 
@@ -941,37 +987,160 @@ Source: sdlc 2026-11-04 11:5x (save gate time). A unit gates a tree that already
 3. With a fixture whose doc is `tool-based-ui-production.md` and whose row name is `hana`, `merge_checkpoint.py`, `add_unit.py` and `update_registration.py` take `--production hana`, and their output and files say `hana`.
 4. Every suite of the changed folders passes on the clone, then the full merge gate passes. Source net negative.
 
-### Phase 3x — Small stores keyed by staff id  · status: todo
+### Phase 7v — The simplify review starts as a child of assign  · status: done
 
-Source: herdr-unit plan Phase 3x, given to devtools-unit by sdlc 2026-11-02. Reduced by the Phase 3t architect review (2026-11-05): the store migrations already shipped (`change_review.py:1118`, `phase_table.py:1939`, `board_json.py:462`), with tests for interruption, reruns and ownership changes, and proposal readers already resolve staff ids. Store 3 (saved tab titles) is dropped (user, 2026-11-01). Store 6 (`stall_watch.py`) belongs to messaging-unit. herdr-unit's 3y owns the rename files and removes each store's rewriter there.
+**Depends on:** none
 
-**Depends on:** 3t, 3u, 3v (records stage of the rename track).
+**Source:** the sdlc showrunner, 2026-11-05 [2edc2aea]: `assign.sh --role review --lens simplify` fails with "Start workers through assign.sh from the director session." Fix it as a fast hash on top of main, apart from 7u.
 
 #### Work Order
 
-**Goal:** no reader of the change review cell, the phase note `unit:`, the board cache or the proposal `unit:` field uses a unit or production name; the deployed stores hold staff ids on both machines.
+**Goal:** `execute_simplify` starts `review.sh` as a child, as every other assign path does. No launch gate changes. The fixture stops replacing the start path, so a test now covers the real one.
 
 **Spec:**
-1. **Remaining consumers.** For each store, search `grep -rn '<store path or key>' scripts commands ~/.codex/skills/generated-from-claude` and switch each reader that still takes a name to the staff id from the row. Keep `change_routing.owner` current-parent routing (`change_routing.py:157-182`) and reviewed change-review rows byte for byte.
-2. **Unit-board reader.** The unit-board plugin reads `~/.local/state/unit-board/<showrunner staff id>.json`. That file belongs to the unit-board owner: send the change to it and name it in the checkpoint notice.
-3. **Shared-folder regression.** One test holds proposal and question records in one proposals folder. It checks proposal ownership and the `/showrunner:questions` table after a rename and after a transfer. Question records keep their contents, timestamps, `production_id` and `asked_by` byte for byte.
-4. **Deployment evidence.** Phase 3t deleted `migrate_proposals.py`; sdlc ran it from `c6e9f5555` on 2026-11-05. Its output on natedev and the Mac, and a live read of each store, are the migration proof. This phase runs no migration.
-5. Delete more than you add. Add no guards.
+1. `execute_simplify` runs `review.sh` with `subprocess.run` and returns its exit code. Delete `ReviewExec`, the `exec_review` parameter and the `os.execvpe` default.
+2. `test_simplify_lens.py` stops passing a review runner to `main`.
 
 **Files:**
-- `scripts/production/change_review.py`, `scripts/production/change_routing.py`, `scripts/direct/phase_table.py`, `scripts/direct/board_json.py`, `scripts/production/proposal_issue.py`, `commands/change_review.md` — remaining readers; every other reader the search finds joins them.
-- `scripts/production/test_change_review.py`, `scripts/production/test_change_routing.py`, `scripts/direct/test_phase_table.py`, `scripts/direct/test_board_json.py`, `scripts/production/test_proposal_issue.py`, `scripts/production/test_update_registration_questions.py` — their tests and the shared-folder regression.
-- `scripts/production/rename.py`, `scripts/production/rename_unit.py`, `scripts/production/rename_outside.py`, `scripts/production/transfer_unit.py` — read only (herdr-unit 3y).
+- `scripts/direct/assign.py`
+- `scripts/direct/test_simplify_lens.py`
 
-**Workers:** `1 writer + 1 tester`
-- `impl` — the non-test files.
-- `test` — the tests and the shared-folder regression.
+**Workers:** `1 writer`.
 
-**State:** none; the store migrations already ran.
+**Acceptance gate:** `scripts/direct/test_simplify_lens.py` passes through the real `assign.py` start path, and fails with the refusal when the old `os.execvpe` call returns.
 
-**Constraints from prior phases:** keep the Phase 3s resolver. Phase 4p resolves relative question folders through `update_registration.question_folder`. Unreadable ownership is not confirmed absence. Staff rows hold canonical unit names from `unit_names.name`. Add no store registry, identity alias or live-rekey journal. Read-only consumers report the bad row and keep the other rows.
+### Phase 7w — Tests read the live notifier folder  · status: done
 
-**Acceptance gate:** the search in item 1 finds no reader that takes a name, or the notice names each match and its owner. A real `/change_review` shows a moved unit's open row under its new production. The shared-folder regression passes. basedpyright `0 errors, 0 warnings, 0 notes` on changed files and their callers. Each changed module's suite passes. The full gate passes.
+**Depends on:** none
+
+**Source:** the merge gate on 2026-11-05, after the live notifier timer folders moved to `showrunner-<staff id>`. Main's suites read those live folders and go red.
+
+#### Work Order
+
+**Goal:** No test reads the live `~/.local/state/notifier` folder. A test run gives the same result before and after a live state migration.
+
+**Spec:**
+1. Each test that reaches `showrunners.registered_showrunners` uses a private notifier folder. Prefer one change in shared test support. Keep the assertions.
+2. Add no guard or check.
+
+**Files:**
+- `scripts/` test files and test support only.
+
+**Workers:** `1 writer`.
+
+**Acceptance gate:** `shutdown.test_stop_resume`, `production.test_session_pane`, `production.test_roles_audit` and `direct.test_progress_history` pass on main with the live folders in place, and the full merge gate is green.
+
+### Phase 7x — The merge scope check goes  · status: done
+
+**Depends on:** none
+
+The user said go on 2026-11-05, through sdlc [9ce110ba]. User decisions: 2026-10-31 "Owns is deleted"; 2026-11-01 "cargo-berth is what maintains ownership of who goes when - this was gold plating i never asked for". Change review C1107 returned for this.
+
+1. `merge_checkpoint.py`: delete the empty-responsibilities refusal, the outside-responsibilities step, `allowed`, `hub_paths`, `Unit.owns` and `--also`. Keep the staged-paths stop and the shrink and as-built path rules.
+2. Delete `owns_fill.py` and its test.
+3. `add_unit.py`: delete `owned_responsibilities`, the refusal for a unit with no owned paths.
+4. `unit_config.py`: delete `responsibilities_from_owns` and `BOARD_FREE`. `unit_lookup.py`: delete the `Owns` cell. The `responsibilities` field stays, because `nightly_review.py` and `add_unit.launch_profile` read short duty names from it.
+5. A one-off program outside the repo removes path entries and `board-free` from each `.unit.toml` at deploy, once on each machine. Then it is deleted.
+
+**Acceptance gate:** a checkpoint that changes any path merges with no scope hold; `git grep -E 'owns_fill|responsibilities_from_owns|BOARD_FREE|outside responsibilities|hub_paths'` finds nothing in scripts, commands or docs/as-built; suites of the production and style folders pass; source net negative.
+
+### Phase 7y — A refused launch is not a repair round  · status: done (bfa635d64)
+
+**Depends on:** none
+
+Source: builds resources-unit, through sdlc [dcad96ef]. The ledger counted two launches that `assign_gate` refused as repair rounds, so Phase 57 reached repair round 4 with one landed repair.
+
+1. `scripts/history/rounds.py`: a round comes from fix passes only. A recorded dispatch with no started pass counts for nothing.
+2. `scripts/direct/findings.py`: a refused launch spends no fix attempt and no repair budget.
+
+**Acceptance gate:** events with two refused launches and one landed repair give `repair_round` 2, no Astra review due and no advisory; `history.test_rounds`, `direct.test_findings`, `direct.test_progress_history` pass.
+
+### Phase 7z — An installed script imports from its own install  · status: done
+
+**Depends on:** none
+
+Source: sdlc [22612d13] and [6dab7317]. A stdin or `-c` Python script puts the working directory first on `sys.path`. So `from scripts.lib import ...` in a shell heredoc reads the reviewed tree. In a cargo-liner worktree the import fails. In a `~/.claude` tree behind main it reads old code.
+
+1. `scripts/lib/py`: put the shim's own root on `PYTHONPATH` and start a stdin, `-c` or `-m` script with `-P`, so the working directory never enters `sys.path`.
+2. Every heredoc or `-c` Python script that imports `scripts.` starts through `scripts/lib/py`.
+
+**Acceptance gate:** one heredoc from a folder with its own `scripts/`, and one from a tree whose `scripts/lib` is behind the install, both import the install's module. The suites of the changed folders pass.
+
+### Phase 8a — One lookup for the production owner  · status: done (0ed0dc329)
+
+**Depends on:** Phase 7u
+
+#### As-built
+
+- **One owner lookup.** `read_production` keeps the found row on `Production.owner`; callers read it. `ProductionDocument` is a document with no owner, and `ProductionDocument.for_owner` binds one. `unit_lookup.doc_owner` is the one doc-to-owner function. `showrunner_footer.read_production` looks up the row once.
+- **`sources` removed.** `staff_sources.member(selector, record)` replaces `member_sources()` at each caller. `MemberSources.productions`, `store_owner.showrunner_id(sources=)` and the `sources` parameter of `production_members` and `unit_lookup.unit_metadata` are gone.
+- **Dead code removed.** `source_allowed`, `_fill_machine`, `BoundMigrationSources`, `migration_peer_identities`, `migration_sources`, `showrunners.read_bound_source`, `production_name_for_document`, `fixture_showrunner_name`, `ProductionNames.showrunner` and the `ShowrunnerSource` fallback in `production_lifecycle`.
+- **Fewer reads.** `production_check.sh` and timers pass a staff id, with no extra Python start. `live_units` takes the production name. `phase_note_ownership` takes a `record`. `stall_watch` calls `every_labeled_session` once per tick. `unit_labels` runs `timer_for` once per parent. `scope_list` and `footer_counts` share one record.
+- **Parent lookup.** `record.parent_of` is the one parent lookup. `row_production` and `progress_history.resolve_production_unit` call it and read no document.
+- `add_unit.py:1279` keeps `ensure_staff_showrunner(production)`, because that call also records a moved document.
+- `worker.py` passes `worker_id` to `begin_dispatch`. The old `CHECK=... production_check.sh {doc}` fixture shape and the old slug text are gone.
+
+**Acceptance gate:** main merge gate green on 2578d686d (which holds the phase); hash 0ed0dc329 adds the stack and sdlc c7754c2d6, with suites and types green.
+
+### Phase 8bb — Merge checkpoint tests read the live registries  · status: done (829824277)
+
+Source: builds queue-unit, through sdlc [a84d0d7a]. `scripts/production/test_merge_checkpoint*.py` (10 files) read the live showrunner and session registries.
+
+1. `scripts/production/staff_test_support.py`: `isolated_staff_file` gives private registry paths, in one place.
+2. The 10 suites use it. No copy of the fixture.
+
+**Acceptance gate:** a run with a throwaway audit hook that is not committed finds no read of a live registry; `production.test_merge_checkpoint*` pass, plus each suite that uses the helper.
+
+### Phase 8c — The merge gate removes its own temp folder  · status: done (829824277)
+
+Source: sdlc [eca4284e]. Ended merge gates leave `/dev/shm/merge-gate-*` folders; natest counts 75 folders and 234 MiB of RAM. The gate removes its own folder when it ends, also on failure and on a kill signal, with no separate sweep.
+
+**Depends on:** none
+
+**Acceptance gate:** a gate that fails and a gate that gets SIGTERM, SIGHUP or SIGINT each leave no folder, in a test that runs the real gate process; `production` suites pass, then the full merge gate.
+
+### Phase 8d — Git and the unit's records answer what merged  · status: done (829824277)
+
+Source: the user through sdlc [3e19fcc0]: "yes delete the title-reading code and let git and the unit's own records answer".
+
+1. Delete `merge_checkpoint.merge_branch_history`, its parse of merge commit subjects and its rename handling. Switch every caller.
+2. Git answers whether work merged: a hash already merged is an ancestor of the merge branch.
+3. The unit's phase records answer when a phase started.
+4. Delete the "follows the last merged checkpoint" check. No new check.
+5. Delete the `-unit` suffix, by the user's approval through sdlc [25a7d0d1]: delete `unit_names.unit_id`, switch its callers to the staff name, and delete the suffix handling in `unit_names.name`, `promote_showrunner`, `sessions.py`, `push_texts` and `user_action`.
+
+**Depends on:** Phase 7u
+
+**Acceptance gate:** `git grep merge_branch_history` finds nothing, and no code outside tests reads a unit or phase from a merge commit subject; a fixture whose merge subjects carry no unit name gives the same answers; suites of changed folders pass, then the full merge gate; source net negative.
+
+### Phase 8e — Importing staff costs less  · status: done (455aa383e)
+
+Source: sdlc [209c11a3]. Importing `scripts.production.staff` takes 38.9 ms of a 92.6 ms status line refresh. Cut the cost inside `staff.py`. Do not add a second light reader: that is a copy.
+
+**Depends on:** Phase 8a
+
+**As built:** `staff.py` defers each import that only some paths use into its functions; `_Arguments` stays with the command line. The same-load median fell from 29.4 ms to 18.9 ms. The remainder is `dataclasses` with `inspect` and the module's own code. No command or behavior changed.
+
+### Phase 3x — Small stores keyed by staff id  · status: done (735747766)
+
+Source: herdr-unit plan Phase 3x, given to devtools-unit by sdlc 2026-11-02. Reduced by the Phase 3t architect review (2026-11-05): the store migration code already shipped (`change_review.py:1118`, `phase_table.py:1939`, `board_json.py:462`), with tests for interruption, reruns and ownership changes, and proposal readers already resolve staff ids. Store 3 (saved tab titles) is dropped (user, 2026-11-01). Store 6 (`stall_watch.py`) belongs to messaging-unit. herdr-unit's 3y owns the rename files and removes each store's rewriter there.
+
+**Depends on:** 3t, 3u, 3v (records stage of the rename track).
+
+**As built:** the change review cell, the phase note `unit:`, the board cache and the proposal `unit:` field hold staff ids, and `change_routing` routes an open row from its staff id. `change_review.py migrate-owners` moved 222 rows on natedev. The Mac run waits on the user's Mac step. After its final read shows staff ids in all open rows, delete the `by_id` condition and `migrate_owners`.
+
+The read-only acceptance checks also retain these requirements:
+
+1. Name each excluded reader and its owning phase in the checkpoint notice.
+2. Include the dispatch readers in that search: `bump_gate`, `dailies_input`, `live_units`, `showrunners`, `staff_sources`, `unit_lookup`, `unit_table`, and `worker_admission`.
+3. Use different timer and row documents to prove that each changed reader takes the row's document.
+4. Keep `test_checkpoint_uses_the_plan_worktree_when_the_director_runs_elsewhere`, lookup tests, requested-checkpoint tests, and partial-report tests.
+5. Distinguish `ProposalsUnavailable` and `LedgerUnavailable` from confirmed absence.
+6. Verify the director and branch folders with `targeted_test.py` and `add_unit.py --check`.
+7. Verify `resume_unit.py sdlc guild-process-unit --dry-run`.
+
+The search may retain read-only `session_labels.py`, `production_units.WRAPPED` imports, and Units scope reads owned by Phase 4b.
+Only reads change.
 
 ### Phase 3t — Production tools read the row and `.unit.toml`  · status: done
 
@@ -1025,10 +1194,10 @@ Codex workers start only through `assign.sh`, and that path does what the old Co
 ### Phase 3z — One import rule  · status: todo
 
 **Approved** (user via sdlc [93de1898] 2026-11-05: "duplication removal is something i approve of. there is no quiet time - figure out how to sequence it correctly and do it"). No guard test (sdlc [e00ba3f9]; Spec item 6 dropped). Land it in small hashes, each net negative, which sdlc merges at once:
-1. Shared step: the `scripts/lib/py` shim sets the package root, and every managed entry (Spec item 4, outside callers on both machines included) runs through it. Old `sys.path` lines stay until their folder converts. Commit the rewrite script here.
-2. One hash per folder group (the 8 groups below). Each converts that group's imports and deletes its `sys.path` lines. Run the script on the newest sdlc tip just before each hash.
-3. Group order: before each hash, check the open unit branches (all productions on `~/.claude`) for changes in the group's folders. Convert untouched groups first. Convert a group a unit is changing right after that unit's merge lands. Measured at 3y's end (live worktree branches, 2 days): `remaining` 0 branches, `accounts` 2, `style` 2, `production` 4, `sessions` 5, `workers` 8, `build` 12.
-4. Last step: delete the rewrite script when no `sys.path` line is left.
+1. Shared hash, landed (`2304da03d`): the `scripts/lib/py` shim sets the package root, every managed entry runs through it, the rewrite script is committed, and `style`, `usage`, `prioritize`, `lint` and `settings` are converted. Old `sys.path` lines stay until their folder converts. The gate starts each test run through the checked tree's shim and drops the caller's `PYTHONPATH` (sdlc [4547aef2]).
+2. One hash per folder group that remains. Each converts that group's imports and deletes its `sys.path` lines. The `accounts` hash landed (`8d112025c`, with the `package_imports.py` repair in `faa97d24e`). `whoami` waits for `builds-report`, which changes 8 of its files. Run the script on the newest sdlc tip just before each hash. Files with a `sys.path` change on 2026-11-06: `production` 80, `direct` 39, `hooks` 36, `whoami` 23, `lib` 23, `buildlog` 21, `shutdown` 12, `message` 12, `agents` 10, `mac_test` 10, `astra` 8, `accounts` 6, `herdr` 6, `build_hold` 6, every other folder 5 or fewer.
+3. Group order: before each hash, check the open unit branches (all productions on `~/.claude`) for changes in the group's folders. Convert untouched groups first. Convert a group a unit is changing right after that unit's merge lands.
+4. Last step: convert `scripts/lib` and the other shared files (`hook_dispatch`, `merge_gate`, `fast_track`, `module_run`), because every folder imports `scripts/lib`. Then delete the import conversion from the rewrite script and its tests, when no `sys.path` line is left outside `scripts/lib/package_root.py`. Keep the `bootstrap` command and its tests.
 
 **Depends on:** Phase 3y
 
@@ -1036,17 +1205,17 @@ Source: sdlc [c27b7d82] 2026-11-05 (the item); plan by a read-only worker at `a7
 
 #### Work Order
 
-**Goal:** every repository import is package-qualified, one place sets the package root, and no file changes `sys.path`.
+**Goal:** every repository import is package-qualified, one place sets the package root, and no file changes `sys.path` except `scripts/lib/package_root.py`, which each entry file loads (phase 8n).
 
 **Spec:**
 1. **Imports.** Every repository import is `from scripts.<folder> import module` or `from scripts.<folder>.<module> import name`. Convert bare imports (2,276 in 499 files), relative imports (338), import names built in strings, and mock patch targets. At `a74569610`: 758 `sys.path` calls in Python (409 per folder, 322 to the package root, 27 dynamic), 21 in shell, 124 inside Python strings and generated fixtures.
-2. **One package root.** The `scripts/lib/py` shim sets the root, before both its cached and uncached exits. For a script path it uses that script's checkout; for `-m`, `-c` and stdin it uses the shim's checkout. It keeps the caller's working directory, the `CLAUDE_PYTHON` override, the interpreter cache and the version floor. Today both exits (`py:42` cached, `py:74` resolved) exec with no package root. The two statusline `-I` calls (`statusline.sh:66`, `:76`) use one central isolated form that keeps isolation. Keep the startup hooks that `test_simplify_lens.py:75` and `merge_gate.py:714` use.
-3. **No path changes.** No file inserts, appends, assigns or slices `sys.path` (`counts_row.py` slices, `hook_dispatch.py` replaces). `module_run.py` and `fast_track.py` load tests by package name, with no folder paths.
-4. **Entries through the shim.** Every managed entry runs through the shim: hook commands in `settings.json`, transient systemd commands (`accounts/unit_watchdog.py:219` runs `-m`, `build_hold/hold_enforcer.py:449`, `build_queue/queue_place.py:309`, `agents/mesh_runs.py:398`), shell lines that call `python3` (`statusline/statusline.sh:66`), `sys.executable` calls by path, `-m` and `-c` (`production/merge_gate.py:722`), shebang scripts (`agents/codex_mesh.py:1`), and command documents and their generated skill copies (`commands/producer/to_production.md:127` runs bare `berth.work_order`). `herdr.py:2722` starts a native server through `Herdr.argv`; it stays a non-Python command. Two entries keep a foreign interpreter: `banned_word_analysis/banned-word-gradient.py` (`uv`, for Pillow) and the Blender script in `commands/blender/bake_textures.md:12` (`bpy`). Their launch line sets `PYTHONPATH` to the checkout; the file has no `sys.path` line (`banned-word-gradient.py:36` goes).
-5. **Rewrite script, committed.** One script converts plain imports, patch targets and inserts in a tree with one command. Each unit converts its own branch with it at its next merge. Run it on the newest sdlc tip just before each hash. The last hash deletes it, when no `sys.path` line is left.
+2. **One package root.** The `scripts/lib/py` shim sets the root, before both its cached and uncached exits. For a script path it uses that script's checkout; for `-m`, `-c` and stdin it uses the shim's checkout. It keeps the caller's working directory, the `CLAUDE_PYTHON` override, the interpreter cache and the version floor. Shipped: `scripts/lib/py:49` exports the root before both exits, and the status line starts through `--isolated`. Keep their tests. Keep the startup hooks that `test_simplify_lens.py:75` and `merge_gate.py:714` use.
+3. **No path changes.** No file inserts, appends, assigns or slices `sys.path` (`counts_row.py` slices, `hook_dispatch.py` replaces). The one exception is `scripts/lib/package_root.py`, which each entry file loads by path so that bare `python3 <path>` works (phase 8n). `module_run.py` and `fast_track.py` load tests by package name, with no folder paths.
+4. **Entries.** Since phase 8n, `scripts/lib/package_root.py` puts the checkout root at `sys.path[1]`, before `PYTHONPATH` entries, so a bare `python3 <path>` loads its own checkout. No entry or caller changes to the shim form (sdlc [432682a3] 2026-11-07). The shim entries that shipped stay, with their tests: every managed entry, the transient systemd commands (`accounts/unit_watchdog.py`, `build_hold/hold_enforcer.py`, `build_queue/queue_place.py`, `agents/mesh_runs.py`) and `statusline/statusline.sh`. Two entries keep a foreign interpreter: `banned_word_analysis/banned-word-gradient.py` (`uv`, for Pillow) and the Blender script in `commands/blender/bake_textures.md:12` (`bpy`). Their launch line sets `PYTHONPATH` to the checkout; the file has no `sys.path` line (`banned-word-gradient.py:36` goes).
+5. **Rewrite script, committed.** One script converts plain imports, patch targets and inserts in a tree with one command. Each unit converts its own branch with it at its next merge. Run it on the newest sdlc tip just before each hash. The last hash deletes its import conversion, when no `sys.path` line is left outside `scripts/lib/package_root.py`. It keeps `add_bootstrap`, `_bootstrap_tree`, the `bootstrap <checkout>` command and their tests, because they add the phase 8n block to each new entry file.
 6. **Guard.** Dropped (sdlc [e00ba3f9]): no guard test.
-7. **Outside callers.** Inventory saved commands outside this repository on natedev and the Mac (timers, staff rows, notifier configs, other units' state) that call a script by path without the shim. Convert them in the shared step.
-8. Delete more than you add, in each hash: source lines (tests and `*_test_support.py` excluded) deleted exceed those added, by `git diff --numstat <hash base> -- 'scripts/**/*.py' 'scripts/**/*.sh' ':!scripts/**/test_*' ':!scripts/**/*_test_support.py'`. The phase estimate is about 1,240 added and 1,685 deleted.
+7. **Outside callers.** Dropped (sdlc [432682a3]): saved commands outside this repository keep their bare form, which works since phase 8n.
+8. Delete more than you add, in each hash: source lines (tests and `*_test_support.py` excluded) deleted exceed those added, by `git diff --numstat <hash base> -- 'scripts/**/*.py' 'scripts/**/*.sh' ':!scripts/**/test_*' ':!scripts/**/*_test_support.py'`. The phase estimate is about 1,240 added and 1,685 deleted. The accounts hash counts `scripts/lint/package_imports.py` outside this check, because the last step deletes its import conversion (sdlc [a5c1b326] 2026-11-07). Its new checks stay in the converter, as refusals; a new check in a test, hook, gate or merge step needs the user's approval.
 9. **One module object.** A bare and a package import of one file are two module objects, so a patch on one misses the other. A group hash also converts, in other folders, each import and patch target tied to an import it converts (`shutdown/stop_resume.py:457` imports bare `unit_runs`; `accounts/test_unit_watchdog.py:408` patches `unit_runs.held`). The rewrite script finds these pairs; the hash notice names the outside files. Keep the existing dual-module fixture support until its last consumer converts.
 
 **Files:**
@@ -1054,62 +1223,261 @@ Source: sdlc [c27b7d82] 2026-11-05 (the item); plan by a read-only worker at `a7
 - `settings.json`, `pyrightconfig.json` — hook commands and the type checker root.
 - `commands/` — command documents that start Python (item 4).
 
-**Workers:** `8 writers`, disjoint sets; folder writers exclude the shared files.
-- `shared` — `scripts/lib/**` (the shim), `scripts/lint/**`, `scripts/settings/**`, `scripts/hooks/*hook_dispatch*`, `scripts/production/*merge_gate*`, `scripts/production/fast_track.py`, `scripts/test_times/*module_run*`, `settings.json`, `pyrightconfig.json`, `commands/`, the rewrite script; starts first with the script. Until the shared hash lands it also owns the entry builders in item 4 (`unit_watchdog.py`, `hold_enforcer.py`, `queue_place.py`, `mesh_runs.py`, `statusline.sh`, `banned-word-gradient.py`); then they return to their folder writers.
-- `build` — `buildlog`, `build_hold`, `build_queue`, `build_targets`, `mac_test`, `aws_target`, `berth`, `berth_fix`.
-- `production` — `production`.
-- `workers` — `direct`, `agents`, `astra`, `ask_a_friend`, `cli_agent`, `model_study`, `history`.
-- `sessions` — `message`, `shutdown`, `herdr`, `hierarchies`, `notify`, `statusline`.
-- `accounts` — `accounts`, `whoami`.
-- `style` — `style`, `hooks`, `banned_word_analysis`, `rust_style`, `nightly_review`.
-- `remaining` — every other folder (`usage`, `prioritize`, `test_times`, `maintenance` and the rest).
+**Workers:** `1 writer + 1 tester` per folder hash.
+- `impl` — owns the converter and every source or fixture edit in that hash's complete conversion set.
+- `test` — verifies the hash through the existing module tests, type checks and the full gate.
+`package_imports.py` converts callers across the tree and writes them before it prints the outside files, so two writers in one tree cannot find their sets at the same time. The folder groups, in Spec order: the shared files last (`scripts/lib/**`, `hook_dispatch`, `merge_gate`, `fast_track`, `module_run`, `settings.json`, `pyrightconfig.json`, `commands/`, the rewrite script); `buildlog`, `build_hold`, `build_queue`, `build_targets`, `mac_test`, `aws_target`, `berth`, `berth_fix`; `production`; `direct`, `agents`, `astra`, `ask_a_friend`, `cli_agent`, `model_study`, `history`; `message`, `shutdown`, `herdr`, `hierarchies`, `notify`, `statusline`; `accounts`, `whoami`; `hooks`, `nightly_review`; every other folder that keeps a `sys.path` change.
+Merging the newest sdlc into this branch is one round of `1 writer + 1 tester`: `impl` owns the merge, the shim and `package_imports.py`; `test` owns their tests. After the conflicts are settled, `impl` runs `python3 scripts/lint/package_imports.py bootstrap <checkout>` and owns each block it adds. `test` keeps `scripts/lib/test_package_root.py` and the bootstrap tests in `scripts/lint/test_package_imports.py`.
 
-**State:** saved outside commands on both machines change to the shim form, once.
-
-**Constraints from prior phases:** Phase 3t: run test modules alone or in small groups; one process over many modules leaks state and shows false reds. Tests run as `~/.claude/scripts/lib/py -m unittest scripts.<folder>.<test module>` with the checkout as the root. Phase 3y: `codex_mesh.main` gates seven verbs; tests that call it in process patch `scripts.direct.assign_gate.called_by_assign` (`test_role_map.py:731`); keep that target. `recorded_turn_settings` stays in `scripts/agents/worker_lifecycle.py:35`; an import from `codex_mesh` brings back the `progress_history` cycle. Keep the `last_dispatch` tests (`test_progress_history.py:8121`, `:8191`, `:8203`, `:8217`).
+**Constraints from prior phases:** Phase 3t: run test modules alone or in small groups; one process over many modules leaks state and shows false reds. Tests run as `~/.claude/scripts/lib/py -m unittest scripts.<folder>.<test module>` with the checkout as the root. Phase 3y: `codex_mesh.main` gates seven verbs; tests that call it in process patch `scripts.direct.assign_gate.called_by_assign` (`test_role_map.py:731`); keep that target. `recorded_turn_settings` stays in `scripts/agents/worker_lifecycle.py:35`; an import from `codex_mesh` brings back the `progress_history` cycle. Keep the `last_dispatch` tests (`test_progress_history.py:8121`, `:8191`, `:8203`, `:8217`). Phases 7u, 8a and 8d: `Production.slug` is gone; `ProductionDocument` and `ProductionDocument.for_owner` exist, and `Production.owner` holds the found row; identities are staff names with no `-unit` suffix; `production_members` and `unit_lookup.unit_metadata` take no `sources`; `record.parent_of` reads no document. Conflict settling restores none of the removed APIs. Phase 8e: `staff.py` defers its imports into functions so the status line imports it faster. The conversion keeps each import at its deferred place. Phase 8n: each entry file loads `scripts/lib/package_root.py` through a 4-line `try` block after its docstring and `from __future__` imports. `python3 scripts/lint/package_imports.py <checkout> scripts/<group>` converts a group and adds a missing block over all of `scripts/`; `python3 scripts/lint/package_imports.py bootstrap <checkout>` repairs a tree. There is no `convert` verb. Phase 8i: `assign_claude.py` has no `__main__` and runs in the assign process. Phase 4a: `owner_staff_id` is the one owner field of a run, and `timer_scratch` returns named results; conflict settling restores no name field.
 
 **Acceptance gate:**
-1. No `sys.path` change and no bare or relative repository import remain (a grep at the checkpoint).
+1. No `sys.path` change and no bare or relative repository import remain (a grep at the checkpoint). Three forms stay: `scripts/lib/package_root.py` with the 4-line block in each entry file (phase 8n), the isolated form in `scripts/lib/py`, and the inputs in `test_package_imports.py:29-32` until the last step deletes the import conversion and those inputs.
 2. Hooks run from `/`, `/tmp`, a checkout and a folder whose name has a space.
-3. A conflicting inherited `PYTHONPATH` still loads the selected checkout, copied launcher fixtures included.
+3. A conflicting inherited `PYTHONPATH` still loads the selected checkout, copied launcher fixtures included. Four runs of one entry load the selected checkout: bare `python3 <path>` and the shim, each with an empty and with a conflicting `PYTHONPATH`.
 4. Systemd commands run with a bare manager environment.
 5. `store.py` and `workers.py` each load under one `sys.modules` name; modules that are also libraries run by path and by `-m`.
 6. The shim resolves cold and cached on natedev and the Mac.
 7. Each hash: the numstat check in item 8 shows a net delete, basedpyright `0 errors, 0 warnings, 0 notes`, and the full gate passes.
 8. Each hash notice lists each open unit branch, all productions on `~/.claude`, that conflicts with that hash, from `git merge-tree`.
 
-### Phase 4a — Run owner and showrunner timers keyed by staff id  · status: todo
+### Phase 4a — Run owner and showrunner timers keyed by staff id  · status: done
 
-Source: herdr-unit plan Phase 4a, given to devtools-unit by sdlc 2026-11-02. Starts after herdr-unit's 3u and 3z. Reduced by the Phase 3t architect review (2026-11-05): most of both stores already shipped.
+#### As-built
 
-**Depends on:** 3t (the doc from the row), 3z. Records stage of the rename track.
+`owner_staff_id` is the one owner field of a run. `_set_owner`, `resolve_production_unit` and the start path of `_start_phase` read only the staff row, and they accept no names. A saved event keeps its names as history. `phase_table.build` with no `working_dir` takes the folder from the staff row, and it reports a staff read error in the table result. It does not use `Path.cwd()`. `unit_runs.migrate_owners` does not exist.
 
-#### Work Order
-
-**Goal:** the two largest name-keyed stores hold the staff id with no reader left on the old key: the run owner in progress history and the update timer folders.
-
-**Spec:**
-1. **Run owner.** Already shipped: `progress_history.py:435` records the fixed owner, and `unit_runs.py:237` moves active run ownership and keeps history. Remaining: each reader that `grep -rln progress_history_state scripts` finds reads the staff id. The unit folder comes only from the staff row (`unit_lookup.py:93`, `progress_history.py:437`; workers through `session_staff.py:144`). A separate phase checkout comes from `phase_reservation.py claim --repo`. No rule routes by an absolute Plan path or keeps a worker folder copy. Finished runs keep their recorded paths as history; worker threads stay.
-2. **Showrunner timers.** Already shipped: `update_registration.py:625-631` writes `showrunner-<staff id>` folders and staff-id `CHECK` lines, and `showrunners.py:146` reads timers by staff id. Remaining: every reader that a search of `scripts`, `commands` and the Codex mirror finds for the timer folder (`produce.md`'s `UPDATES` included) uses the staff-id folder. The two question readers already switched: `showrunner_footer.py:93,116` reads the document through staff ownership, and `tidy_wrapped.py:123` checks both timer folders (`test_tidy_wrapped.py:306,320`).
-3. **Deployment evidence.** Phase 3t deleted `migrate_showrunner_timers.py`; sdlc ran that migration from `c6e9f5555` on 2026-11-05. Its output on natedev and the Mac is the migration proof; this phase runs no migration.
+`showrunners.timer_scratch` returns `TimerConfigurationUnreadable`, `TimerTargetUnresolved`, `TimerScratchAbsent` or `TimerScratchFound`. `adopt_session_state` prints the unreadable case and keeps going. Every reader of the timer folder uses `showrunner-<staff id>`.
 
 **Files:**
-- `scripts/direct/progress_history.py`, `scripts/production/update_registration.py`, `scripts/production/production_check.sh`, `scripts/production/showrunners.py`, `scripts/statusline/statusline.sh`, `scripts/production/rename.py` — the remaining readers; every other reader that a search for the two paths finds joins them.
-- `scripts/direct/test_progress_history.py`, `scripts/production/test_update_registration.py`, `scripts/production/test_showrunners.py`, `scripts/statusline/test_statusline.py`, `scripts/production/test_rename.py` — their tests.
-- `scripts/production/update_registration_test_support.py` — fixtures.
-- `scripts/lib/unit_runs.py`, `scripts/lib/test_unit_runs.py` — the active run record (Phase 3h review).
-- `scripts/message/notifier.sh`, `scripts/message/test_notifier.py` — read only; the messaging unit owns them. A change there goes to that unit, and the checkpoint notice names it.
+- `scripts/direct/progress_history.py`, `scripts/direct/phase_table.py`, `scripts/lib/unit_runs.py` — the run readers.
+- `scripts/production/showrunners.py`, `scripts/production/update_registration.py`, `scripts/production/production_check.sh`, `scripts/production/rename.py`, `scripts/statusline/statusline.sh` — the timer readers.
+- `scripts/direct/test_progress_history.py`, `scripts/direct/test_phase_table.py`, `scripts/production/test_showrunners.py` — one test per result; fixtures store `owner_staff_id`.
 
-**Workers:** `1 writer + 1 tester`
-- `impl` — the non-test files above, not the messaging files; hub: `scripts/production/showrunners.py` (`registered_showrunners`, the timer reader every caller uses).
-- `test` — the tests and fixtures.
+**Binds later work:** a test fixture for a run stores `owner_staff_id` with the staff row's id, and no name fields.
 
-**State:** none; the timer and run-owner migrations already ran.
+**Gotchas:** `run_owner` accepts only `unit` rows, so no run has a showrunner owner, and `parent`'s `showrunner` kind check after `run_owner` is unreachable. Active runs from before the owner code convert once at landing, on natedev and the Mac, by a program outside the repository.
 
-**Constraints from prior phases:** Phase 3t reads the document from the showrunner row. Staff records the director folder; each worker's run record holds its location. Phase 4p resolves relative question folders from the staff owner's document through `update_registration.question_folder`. Unreadable ownership is not confirmed absence. Keep the linked-checkout, ambiguous-owner, and shared-question tests. Staff rows hold canonical unit names from `unit_names.name`. A requested checkpoint refuses with the unit and folder; unrelated rows do not block it (`merge_checkpoint.py:277-306`). Read-only consumers report the bad row and keep the other rows. Keep `test_unit_lookup.py`, the requested-checkpoint regressions in `test_merge_checkpoint.py`, and the partial-report regressions. Run-folder paths stay the same across `/clear`. Keep the native-session and socket resolution that shipped. Add no store registry, identity alias or live-rekey journal. Phase 3y: `progress_history.last_dispatch(staff_id)` takes no run, searches every run of the staff parent, and returns `RecordedDispatch`, `NoDispatchRecorded` or `DispatchDetailNotRecorded.UNRECORDED`; keep all three.
+**Ruled out:** a reader of the old name fields in main code.
 
-**Acceptance gate:**
-1. Tests show the folder each command runs in: the staff folder and an explicit phase checkout; finished history and worker threads stay (this replaces the Plan-routing test at `test_merge_checkpoint.py:74`).
-2. After the reader switch, cleanup still refuses while the production has a timer, the footer reminder and question counts stay the same, and a deferred question still expires on time.
-3. Every running showrunner's timer fires once on the landed tree; dailies and the status line show it. sdlc's migration output is cited in the notice.
-4. Keep the lookup, requested-checkpoint, and partial-report tests. basedpyright `0 errors, 0 warnings, 0 notes`. The full gate passes.
+### Phase 8f — A run whose only worker dies at launch ends itself  · status: done
+
+#### As-built
+
+A launch that fails with no other work in its run ends the run through its normal end path. `scripts/direct/assign.py` `end_failed_launch(run, slot, env)` runs after a nonzero launch and returns without an action when any of these hold: a recorded pass completed; a pass names another slot; the mesh roster, an `impl_worker_*.json` staff row or a herdr staff row names another worker; or `unit_runs.held` names a run other than this one.
+
+The action is `progress_history.py finish-run --status error`, then `end_session.sh`, each through `call` with `check=False`. A failed child prints one line and the launch keeps its exit code. An exception in the check prints one line and changes nothing. A signal to the launcher raises `SystemExit` and never reaches the check. A herdr launch reaches it only for `worker.py assign` exit 2, the no-worker-started exit. The phase reservation stays.
+
+The run marker uses the Codex id first: `prepare_session.sh` and `end_session.sh` both read `CODEX_THREAD_ID`, then `CLAUDE_CODE_SESSION_ID`. A launch with no `--session-dir` after the end starts a new run through `prepare_run`.
+
+**Files:**
+- `scripts/direct/assign.py` — `end_failed_launch`, `recorded_passes`, and the three calls.
+- `scripts/direct/end_session.sh`, `scripts/direct/prepare_session.sh` — the Codex-first director id.
+- `scripts/direct/test_assign_launcher.py` — the real-path tests for each condition.
+- `scripts/agents/test_codex_mesh.py` — its run-end fixture removes `CODEX_THREAD_ID`.
+- `docs/direct/launch_implementation.md`, `commands/unit/direct.md`, `docs/as-built/long-lived-workers.md` — the end path and the retry forms.
+
+**Gotchas:** a fixture that sets `CODEX_THREAD_ID` beside a different `CLAUDE_CODE_SESSION_ID` makes `end_session.sh` read the Codex marker.
+
+**Ruled out:** a new refusal at the next launch; the end is the whole repair. Other open-marker cases belong to hierarchies.
+
+### Phase 8g — The review links service restarts when its code changes  · status: done
+
+#### As-built
+
+A running review links server replaces itself when a module it loaded changes. `ReviewLinksServer.service_actions` in `scripts/review_links/serve.py` runs `loaded_module_stamps()` every `code_check_seconds` (`config/review_links.conf`, default 5). The function reads `st_mtime_ns` and `st_size` of each `sys.modules` file under the server's checkout. A file with no stamp (`ModuleStampUnavailable.UNREADABLE`), a file modified at or after process start (`STARTED_NS`) and a changed stamp each raise `CodeChanged`. `main` prints `review-links: code changed: <path>`, closes the socket through its `with` block and runs `os.execv(sys.executable, sys.orig_argv)`. The pid and the environment stay. A failed start of the new code exits 1, and the service manager starts it again.
+
+While a verdict delivery request is live, the check returns and keeps its recorded stamps, so the next check restarts.
+
+`change_review.py add --merged <hash>` refuses a hash that is not an ancestor of `origin/main`: one line, exit 1, no row. The `migrate-owners` action is gone. `commands/change_review.md` and `docs/production_format.md` item 17 state the rule: a row is added only when the user can check it now, merged to where the user runs it and live.
+
+**Files:**
+- `scripts/review_links/serve.py`, `config/review_links.conf`, `docs/as-built/review-links.md` — the code check.
+- `scripts/review_links/test_serve.py` — a real child process, the same pid, new code, HTTP after the restart.
+- `scripts/production/change_review.py`, `commands/change_review.md`, `docs/production_format.md` — the refusal, the deletion and the rule.
+- `scripts/production/test_change_review.py` — `MergedAddTests` on a real bare origin.
+
+**Gotchas:** a test fixture must set old modification times, because a file written after process start counts as changed.
+
+**Ruled out:** a merge-time restart command; the server finds each change itself.
+
+### Phase 8h — A change reaches the list only when it is on main and live  · status: done
+
+#### As-built
+
+A row reaches a change list only when its change is on `origin/main` and live. `change_review.list_ready(repo, production, merge_branch, *, review_list=None, record=None, selection=_READINESS_SCAN)` is the one path. It fetches `origin main`; a failed fetch prints one line and adds nothing. It reads the merges on the merge branch since `READY_FROM`, takes their lines through `publication_changes`, and adds a row for each line of a merge that is an ancestor of `origin/main`. Rows carry the merge's short hash. `add`, `live`, `merge_checkpoint.record_publication_changes` and `merge_gate.record_changes` all call it; the two merge paths run it after the last promotion step. The `append` and `drift` actions and `_ChangeNotOnMain` are gone.
+
+A `Change-Review:` line takes an optional fourth field, `after <step>`. `Visible` holds `ReadyNow` or `AfterStep(step)`. A scan skips an `AfterStep` line and prints one line with the exact command: `change_review.py live --merged <hash> --step <step> --repo <checkout> --production <showrunner>`, with script paths from the tools' own checkout. `live` selects `CompletedStep(merged, step)`, releases only that merge's lines for that step, and raises `ChangeReviewError` when no line waits on that step.
+
+`_covered(rows, change, repo)` runs under the list lock: a row with the same Change text covers a line unless the row has a known Merged hash that does not hold `change.checkpoint`. So a repeated scan adds nothing and a returned change gets a new row for its later commit. A child production with no list uses the merging production's list and keeps its own credit. `append_rows` prints `change review: no staff row for unit <name>; Producer stays empty` once per unit after a row write. A failed write in `merge_checkpoint` reports `<doc> not written: <error>; retry after the repair`.
+
+**Files:**
+- `scripts/production/change_review.py` — `list_ready`, `_covered`, `live`, `ReadyNow`, `AfterStep`, `CompletedStep`, `ReadinessScan`, `PublicationChange`.
+- `scripts/production/merge_checkpoint.py`, `scripts/production/merge_gate.py` — the callers after promotion.
+- `scripts/production/test_change_review.py`, `test_change_routing.py`, `test_merge_checkpoint_handoff.py`, `test_merge_checkpoint_promotion.py`, `test_merge_checkpoint_rerun.py`, `test_merge_checkpoint_validation.py`, `test_merge_gate.py`, `test_merge_gate_promotion.py`, `merge_gate_test_support.py` — the real-path tests on bare origins.
+- `commands/change_review.md`, `commands/unit/checkpoint.md`, `docs/production_format.md`, `docs/as-built/showrunner-automation.md`, `docs/as-built/merge-gate-and-test-speed.md`, `docs/as-built/review-links.md` — the rule, the fourth field and who runs `live`.
+
+**Gotchas:** `publication_changes` prints nothing, so a read has no side effect. A merge from before `READY_FROM` never adds a row.
+
+**Ruled out:** a store or waiting section for held lines; Git holds them in `Change-Review:` lines.
+
+### Phase 8i — A Claude worker starts only through assign  · status: done
+
+#### As-built
+
+`scripts/direct/implement.sh` does not exist. `assign.py` `execute_claude` calls `assign_claude.run(ClaudeLaunch)` in the same process, so `assign.sh` is the one start path for a Claude worker. `assign_claude.py` has no `__main__` and no argument parser. `ClaudeLaunch` is a frozen dataclass; its `worker` field holds `NewClaudeWorker` or `ClaudeFollowUp`.
+
+The order stays: admit, `worker_state.py`, switch check, claim, `phase_reservation.py claim`, status, pass start, heartbeat, board, `TMPDIR`, worker start, worker wait, heartbeat watch, finish. File names and contents of `impl_status_<slot>`, `impl_summary_<slot>.txt`, `impl_agent_<slot>.log` and `impl_agent_<slot>`, board lines, heartbeat lines and recorder events stay the same. The claim holds `os.getpid()`. `run` releases the claim in `finally`, and a TERM, INT or HUP raises `SystemExit` through `_interrupted`, so the finish records run on a signal. The launch uses the family, model and effort from `resolve_model`, with no second resolve. `--launcher-command` holds the `assign.sh` command of the launch, so a replay runs assign.
+
+`assign_gate.py` holds no `implement.sh` entry, and `agent_bg.sh` accepts assign as its direct parent. `stall_watch.py` `WORK` holds no `implement.sh`, and a Claude worker under assign still counts as work.
+
+**Files:**
+- `scripts/direct/assign_claude.py` — the moved launch.
+- `scripts/direct/assign.py`, `scripts/direct/assign_gate.py`, `scripts/production/stall_watch.py`, `scripts/agents/models_config.sh` — the callers and the gates.
+- `scripts/direct/test_assign_claude*.py`, `scripts/direct/assign_claude*_test_support.py` — the real-path tests through `bash scripts/direct/assign.sh` with a fixture Claude binary.
+- `docs/as-built/agent-registry.md`, `docs/as-built/long-lived-workers.md`, `docs/as-built/staff-accessors.md`, `docs/as-built/unit-progress-history.md`, `docs/as-built/usage-ledger.md`, `docs/as-built/merge-gate-and-test-speed.md`, `docs/as-built/build-followups-fn-length-hook.md` — the assign form.
+
+**Binds later work:** the launcher Python starts count from `agent_bg.sh`, `claude_account.sh` and `heartbeat_watch.sh`; `worker_record` is now in process. `_claim` trusts any live PID in `impl_claim_<slot>.json`.
+
+**Gotchas:** `git grep implement.sh` also prints `scripts/notify/` (the approved phone sample; a changed sample voids the user's approval), `docs/direct_footprint_review.md` (a dated review), `settings.json` and a negative assertion in `scripts/lib/test_relaunch.py`. A `claude --bg` start in a scratch copy reports an untrusted workspace, so a live check uses `--cwd` on the home worktree.
+
+**Ruled out:** a compatibility shim for saved `implement.sh` commands; 0 of 20 records held one.
+
+### Phase 8j — A worker claim belongs to the process that made it  · status: done
+
+#### As-built
+
+`impl_claim_<slot>.json` holds `pid`, `started` and `worker`. `worker_state.publish_worker_claim` is the one writer, for `assign_claude._claim` and `assign.claim_worker`: it writes atomically, and with an unreadable own start it omits `started` and prints an anomaly line. `worker_state.read_worker_claim` is the one reader. It returns `HeldWorkerClaim(pid)` for the same start or an unreadable one, `EndedWorkerClaim` for a positive `pid` that is gone, a zombie, another start or has no recorded start, and `NoWorkerClaim` for an absent or malformed file or a record with no positive `pid`. A reused process id therefore no longer blocks a launch. `_release` and the interrupted path of `assign.py` compare only `pid` with `os.getpid()`.
+
+`remove_workers.removal_targets` gives `OWN_RUN_FINISHED` (`its run finished this phase`) to a worker of an own run and `DIRECTOR_NOT_LIVE` (`unit director is not live`) only to a sweep with no own run.
+
+**Files:**
+- `scripts/direct/worker_state.py`, `scripts/direct/assign.py`, `scripts/direct/assign_claude.py` — the claim.
+- `scripts/direct/remove_workers.py` — the removal reason.
+- `scripts/direct/test_worker_state.py`, `scripts/direct/test_assign_claude_claims.py`, `scripts/direct/test_assign_claude_claim_follow.py`, `scripts/direct/test_assign_launcher_review.py`, `scripts/direct/test_remove_workers.py` — one test per result; real-path tests through `assign.sh`.
+
+**Binds later work:** a fixture that writes a live claim adds `started` from `process_start`.
+
+**Gotchas:** a claim from a launcher that runs across the landing has no `started` and reads as ended. `assign.claim_worker` then refuses at `launcher_pid`. `assign_claude._claim` refuses at its idle check, except in two short moments, when a second launch can double-launch one Claude worker. A malformed claim on the Codex path counts as no claim.
+
+**Ruled out:** an old-shape reader or a conversion for the claim. A fix of `launcher_pid`: its refusal is in the detached-run server, and that code retires.
+
+### Phase 8k — A Claude worker launch runs in one Python process  · status: done
+
+#### As-built
+
+`scripts/direct/claude_worker.py` holds each step of a Claude worker launch and has no `__main__`. `assign_claude._run` calls `open_worker(turn)` or `follow_up(turn, native_id)`, then `wait_for_turn(turn, delivered)`, all in the assign process. `ClaudeTurn` holds the inputs of one turn. A launch returns `Delivered(native_id, turns_before, launch_environment)`, `Unchanged` or `NotDelivered(code)`; `TurnsNotCounted` is the turn count of a new session. `scripts/agents/agent_bg.sh`, `worker_fill.py coordinate-claude`, `assign_gate.PYTHON_HOPS` and `AGENT_BG_WORKERS` do not exist.
+
+`worker_admission.switch_worker` keeps its `start` and `dispatch` callbacks. The account step calls `accounts.account_for_unscoped_launch`. One `nix_env.ensure` serves the settings and the start. The id comes only from the `backgrounded` line of the banner, and `_registered` waits `CLAUDE_WORKER_REGISTER_WAIT_SECS` for the full id. `agents_log.append` runs before delivery, and delivery is one child: `send.py --to session:<id> --from launcher --file <prompt>`, with `CLAUDE_WORKER_SEND_SCRIPT` as its test override. `wait_for_turn` parses `claude agents --json` and `claude logs` in process each `CLAUDE_WORKER_POLL_SECS`, which `UNIT_WORKER_POLL_SECS` overrides.
+
+`assign_claude._run` runs `_record` in `finally` around the launch, before `heartbeat_watch.sh`, and writes nothing when no session is published. A signal after the banner stops the unpublished session with `claude stop`. Exit codes: 127 no binary, 2 refused or not delivered, 1 no banner, gone with no summary or any other launch error, 143, 130 and 129 on a signal. An unreadable log gives the fallback summary. A transcript record with no message object does not count as a turn.
+
+**Files:**
+- `scripts/direct/claude_worker.py`, `scripts/direct/assign_claude.py`, `scripts/direct/assign_gate.py`, `scripts/production/worker_fill.py`, `config/direct.conf` — the launch.
+- `scripts/direct/test_claude_worker.py`, `scripts/direct/test_assign_claude.py` — moved launcher behaviors and regression tests; other launcher tests use `fixtures/background.sh` or `assign.sh` with the fixture Claude binary.
+
+**Binds later work:** the recorder and resolver children of `assign_claude._run` are the remaining launcher Python, with `send.py` (180 ms) and the `heartbeat_watch.sh` digest (24 ms each minute).
+
+**Gotchas:** a `claude --bg` start in a scratch copy reports an untrusted workspace, so a live check uses `--cwd` on the home worktree with the baseline commit fetched there.
+
+**Ruled out:** an in-process `send.py`: delivery has its own exit paths and an import still pays most of its cost. A port of `heartbeat_watch.sh`: `review.sh` and `assign.py` share it.
+### Phase 8l — A worker whose launcher and server died recovers on its own thread  · status: done
+
+#### As-built
+
+A Codex worker whose launcher and app-server died recovers on its recorded thread through one more `assign.sh --to` dispatch.
+
+- `assign.py` `claim_worker` calls `codex_mesh.py reopen` for an `ended` worker, and for a worker in `ROSTER_LIVE` or `WAITING_CAPACITY` whose launcher is not attached (`codex_mesh.worker_launcher_attached`).
+- `command_reopen` accepts `WAITING_CAPACITY` and sets `dead_launcher_recovery` on the paused entry. A follow-up with that mark refuses a replacement thread when `thread/resume` fails.
+- `codex_mesh.command_end` keeps the staff row and thread id; a second `end` on an ended worker retries the cleanup. `workers.ending_worker` records the end and keeps the worker in the unit ledger.
+- Each caller that removes a worker for good retires the row itself: unit retirement (`workers.end_unit`), `remove_workers.py`, `worker.py end`, `worker_fill.end_friend` (after `command_end` returns 0; on `staff.StaffRefused` it stops the server, then returns 1) and `assign.py` `execute_astra_review` (end, release the role, then retire through `session_staff.worker_row`).
+- The account move tries each recorded server, the recorded port first, and uses the one that has the thread loaded. When `_server_availability` cannot prove that no server holds the thread, it refuses.
+
+**Files:**
+- `scripts/direct/assign.py` — reopen on a dead launcher; the Astra reviewer retire.
+- `scripts/agents/codex_mesh.py` — end keeps the row; the recovery mark; the account move server choice.
+- `scripts/direct/workers.py` — the unit ledger keeps ended workers.
+- `scripts/production/worker_fill.py` — the end-friend retire.
+- `docs/as-built/long-lived-workers.md`, `docs/as-built/session-roster.md` — end, reopen and retire rules.
+- `scripts/direct/test_assign_launcher_reuse.py`, `scripts/agents/test_codex_mesh.py`, `scripts/ask_a_friend/test_end_friend.py`, `scripts/direct/test_workers.py`, `scripts/astra/test_astra_review.py` — the tests.
+
+**Binds later work:** `codex_mesh.py end` never retires a staff row; a new caller that ends a worker for good retires it after `end` exits 0.
+
+**Gotchas:** find permanent-removal callers by their `end` calls, not by `staff.retire` calls. Look up a worker's row by its staff id (`session_staff.worker_row`); a lookup by session id can match an unrelated row when the session is empty.
+
+**Ruled out:** a second recovery mark beside `dead_launcher_recovery`.
+
+### Phase 8m — The end-session test does not read the live session  · status: done
+
+#### As-built
+
+`direct.test_end_session` gives the same result whatever session identity its caller has. `EndSessionTests.environment` removes `CODEX_THREAD_ID` and every `PLAN_DELEGATE_*` name from the environment it gives `end_session.sh`, and keeps its own `CLAUDE_CODE_SESSION_ID`. The in-process test patches `os.environ` with `clear=True` to that same environment.
+
+**Files:**
+- `scripts/direct/test_end_session.py` — the fixture.
+
+**Gotchas:** `unit_runs.environ` and `unit_env.sh` read every `PLAN_DELEGATE_*` suffix, so a fixture that removes only the known names leaks the rest.
+
+### Phase 8n — Entry scripts run under bare python3  · status: done
+
+#### As-built
+
+Every entry script under `scripts/` runs under bare `python3 <path>` from any working directory, with no change to a doc or a caller.
+
+- `scripts/lib/package_root.py` puts the checkout root (the folder above `scripts/`, from its own resolved `__file__`) on `sys.path` directly after the entry script's folder. It adds nothing when an entry already resolves to that root. It imports only the standard library and defines no public names.
+- Each entry file with a `scripts.` import (a statement, `__import__` or `importlib.import_module`) and a `__main__` block or shebang loads it after its docstring and `from __future__` imports, with one `../` for each folder level below `scripts/`:
+
+  ```python
+  try:
+      with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+  except FileNotFoundError:
+      pass
+  ```
+
+  A copy outside the checkout finds no file and runs with the root from `PYTHONPATH`. The block costs under 2 ms for each start.
+- `scripts/lint/package_imports.py`: `add_bootstrap(file: Path) -> bool` adds the block, replaces an older one-line form, keeps CRLF and skips `test_*` and `*_test_support.py`. `_bootstrap_tree(root) -> int` runs it over `scripts/**/*.py`; `convert` and the `bootstrap <checkout>` command both call it.
+
+**Files:**
+- `scripts/lib/package_root.py` — the bootstrap.
+- `scripts/lint/package_imports.py` — the block function, the tree helper and the `bootstrap` command.
+- `scripts/lib/test_package_root.py` — bare, relative-path (`runpy.run_path` under `-I`) and copied-entry runs.
+- `scripts/lint/test_package_imports.py` — block insertion, old-form replacement, dynamic imports and convert reruns.
+
+**Binds later work:** `scripts/lib/package_root.py` is the one allowed `sys.path` change; the 4-line block holds no `sys.path` text. `package_imports.py bootstrap <checkout>` adds a missing block over a tree and stays when the import conversion is deleted.
+
+**Gotchas:** `__file__.rpartition("/")[0]` is empty for a `__file__` with no folder part and gives `/../lib/...`; the block uses `rfind`. A `runpy` or `pathlib` form costs about 15 ms for each start; `open` + `exec` costs under 1 ms.
+
+**Ruled out:** hand-written blocks after the converter goes — they drift.
+
+### Phase 8o — Screen recording finds a window with no client list  · status: done
+
+#### As-built
+
+`find_window` in `screen_record.py` reads `xprop -root _NET_CLIENT_LIST`. When the property is missing or the list is empty, it reads `xwininfo -root -tree` and takes each window id and title from `TREE_WINDOW`. The fallback keeps the 10 s lookup limit, the poll, the one-match rule, the stop before ffmpeg on two or more matches, and the list of titles seen on no match. Tree titles are read as printed, with literal quotes and backslashes. `xwininfo` is required only on the fallback path: a missing binary gives `screen_record: missing on PATH: xwininfo`.
+
+**Files:**
+- `scripts/screen_record/screen_record.py` — window lookup with the tree fallback.
+- `scripts/screen_record/test_screen_record.py` — fake `xprop` and `xwininfo`; tests for a missing and an empty client list, two matches, literal quotes, literal backslashes and a missing `xwininfo`.
+
+**Gotchas:** `xwininfo` prints a title with no escapes, so `TREE_WINDOW` reads to the last `": (` on the line. natedev has `xwininfo` only in the nix store, not on PATH.
+
+**Ruled out:** unescaping tree titles — `xwininfo` does not escape them.
+
+### Phase 8p — An edited change row still covers its change  · status: done
+
+#### As-built
+
+A change review row whose Change text was edited still covers its own change, and no other change.
+
+- `append_rows(..., on_hold=None, merge_changes: Sequence[PublicationChange] = ())` in `scripts/production/change_review.py`. With `merge_changes`, `_merge_covered` decides coverage per review list and per merge. A text match (`_covered`) runs first and reserves its row. Then each unused row whose Merged hash is this merge's hash covers one uncovered change: `ReadyNow` changes first, in commit order, then `AfterStep` changes only when every uncovered `AfterStep` change waits on one step.
+- `list_ready` passes every routed change of the merge as `merge_changes`, also for `live --step`, and writes rows only for the selected step's changes.
+- Callers that pass no `merge_changes` (`add`, `merge_checkpoint`, `merge_gate`) keep the text match only.
+- A merge with two changes and one row keeps the second change uncovered. No check, refusal or column was added.
+
+**Files:**
+- `scripts/production/change_review.py` — `append_rows`, `_merge_covered`, `list_ready`.
+- `scripts/production/test_change_review.py` — `ReadyListTests` for an edited row on a rescan, text match before pairing, one row for a two-change merge, a ready row beside a held change, a row of another merge, and two held steps released out of order.
+
+**Gotchas:** a row does not record its step. With two held steps uncovered, an edited row covers nothing by its hash, and the scan adds a duplicate row rather than hide a change.
+
+**Ruled out:** pairing every `AfterStep` change in commit order — with two steps released out of order, an edited row covers the wrong step and hides the other change.

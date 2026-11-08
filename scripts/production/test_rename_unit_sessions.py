@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import unittest
+from collections.abc import Mapping
 from dataclasses import replace
 from unittest import mock
 
@@ -19,7 +20,9 @@ class UnitRenameSessionsTests(UnitRenameFixture):
             {"pane_id": "w1:p2", "workspace_id": "w1", "terminal_id": "t2",
              "label": "other", "session_id": "unrelated-session"},
         ]
-        def native_process(pane: str, kind: str, _timeout: float) -> herdr.NativeAgentProcess:
+        def native_process(pane: str, kind: str, timeout: float, *,
+                           pane_row: Mapping[str, object] | herdr.PaneNotRead = herdr.PANE_NOT_READ) -> herdr.NativeAgentProcess:
+            del timeout, pane_row
             session = row.current_session if pane == "w1:p1" else "unrelated-session"
             identity = herdr.RolloutThread(session) if kind == "codex" else herdr.EnvironmentThread(session)
             return herdr.NativeAgentProcess(identity, "fixture-generation", {})

@@ -2,6 +2,10 @@
 """Keep Mac claim admission locked while the floor sweep removes idle output."""
 
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 from collections.abc import Callable, Generator, Mapping, Sequence
 from contextlib import AbstractContextManager, contextmanager
@@ -137,7 +141,7 @@ def locked_claims(timeout: float) -> Generator[LockedClaims]:
         1,
     )
     commands = (
-        [sys.executable, str(Path(__file__).resolve()), "--serve"],
+        [str(Path(__file__).resolve().parents[1] / "lib/py"), str(Path(__file__).resolve()), "--serve"],
         ["ssh", "-o", "BatchMode=yes", "-o", f"ConnectTimeout={max(1, int(timeout))}",
          "-o", "ServerAliveInterval=5", "-o", "ServerAliveCountMax=1", "natedev",
          "~/.claude/scripts/lib/py -c " + shlex.quote(remote_source)],
@@ -190,9 +194,7 @@ def locked_claims(timeout: float) -> Generator[LockedClaims]:
 
 def serve() -> int:
     """Use the claim writer's lock and decoder without deleting stale records."""
-    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-    sys.path.insert(0, str(Path(__file__).resolve().parent))
-    mac_test = cast(ClaimReader, cast(object, import_module("mac_test")))
+    mac_test = cast(ClaimReader, cast(object, import_module('scripts.mac_test.mac_test')))
 
     paths = mac_test.state_paths()
     with mac_test.locked(paths.lock):

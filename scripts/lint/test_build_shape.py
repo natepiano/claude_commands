@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import final, override
 from unittest.mock import patch
 
-from build_shape import (CompileCountUnknown, CompiledCrates, NoBuildShape, NoCratesCompiled,
+from scripts.lint.build_shape import (CompileCountUnknown, CompiledCrates, NoBuildShape, NoCratesCompiled,
                          StepEvidence, build_shape, index_step_evidence, step_index)
 
 from scripts.buildlog.step_outputs_test_support import create_step_index
@@ -134,7 +134,7 @@ class IndexStepEvidenceTests(unittest.TestCase):
                 connection.set_trace_callback(queries.append)
                 yield connection, columns
 
-        with patch("build_shape.step_index", side_effect=traced_index):
+        with patch("scripts.lint.build_shape.step_index", side_effect=traced_index):
             self.assertEqual(self.evidence("selected"), {
                 ("selected", "build"): StepEvidence(build_shape(["cargo", "build"]), CompiledCrates(3)),
             })

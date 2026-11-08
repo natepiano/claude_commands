@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
 """Print a cheap stable signature for files that should wake backlog ranking."""
 
 from __future__ import annotations

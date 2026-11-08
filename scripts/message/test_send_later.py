@@ -7,7 +7,7 @@ import unittest
 from collections.abc import Sequence
 from unittest import mock
 
-import send_later
+from scripts.message import send_later
 from scripts.message import session_send
 
 SEND_ARGS = ["--to", "user", "--value", "description=it is ready"]

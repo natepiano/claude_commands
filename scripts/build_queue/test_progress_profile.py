@@ -152,6 +152,24 @@ class ProgressWindowTests(unittest.TestCase):
 
 
 class ProfileHistoryTests(unittest.TestCase):
+    def test_gate_tail_window_stops_before_sparse_rerun_history(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            history = progress.ProfileHistory(Path(temporary))
+            for episode, rerun in (("first-pass", False), ("old-rerun", True)):
+                for index in range(20):
+                    history.observe(episode, "gate", progress.ProgressCounter("suites:1", index * 5, 100),
+                        (20 - index) * GIB // 100, 100)
+                if rerun:
+                    history.observe(episode, "gate", progress.ProgressCounter("suites:2", 0, 100), 9 * GIB, 100)
+                history.finish(episode, 101, 90)
+            profile = progress.ProfileHistory(Path(temporary)).matching("gate", 90)
+            for done, expected in ((86, 3 * GIB // 100), (99, GIB // 100)):
+                with self.subTest(done=done):
+                    window = progress.window_peak(profile, progress.ProgressCounter("suites:1", done, 100), 20)
+                    self.assertEqual(window, progress.WindowPeak(expected, 20))
+            self.assertIsInstance(progress.window_peak(profile,
+                progress.ProgressCounter("suites:2", 0, 100), 20), progress.NoMatchingProfile)
+
     def test_merged_partial_runs_keep_build_before_test_and_preserve_the_cross_phase_peak(self) -> None:
         build = progress.PhaseProfile("build:1", (GIB,) * 20)
         tests = progress.PhaseProfile("test:1", (9 * GIB,) * 20)

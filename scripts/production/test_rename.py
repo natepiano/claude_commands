@@ -135,7 +135,7 @@ class ProductionRenameTests(support.ProductionRenameFixture):
     def production_row(self) -> staff.StaffRow:
         return next(row for row in staff.find(kind="showrunner") if row.name == OLD)
 
-    def test_rename_finds_the_workspace_member_and_keeps_its_id(self) -> None:
+    def test_bare_showrunner_name_renames_the_showrunner_and_keeps_its_id(self) -> None:
         row = self.production_row()
         row = staff.rename(row.id, "tools")
         self.assert_success(self.run_command("apply", "tools", NEW))

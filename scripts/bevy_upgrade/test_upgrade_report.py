@@ -8,9 +8,9 @@ from pathlib import Path
 from typing import final, override
 from zoneinfo import ZoneInfo
 
-import pins
-import upgrade_record
-import upgrade_report
+from scripts.bevy_upgrade import pins
+from scripts.bevy_upgrade import upgrade_record
+from scripts.bevy_upgrade import upgrade_report
 
 NOW = datetime(2026, 10, 12, 19, 8, 41, tzinfo=timezone.utc)
 REVISION = "1234567890abcdef1234567890abcdef12345678"

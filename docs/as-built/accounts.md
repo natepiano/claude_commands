@@ -138,6 +138,10 @@ The [shutdown design](shutdown-and-restart.md) owns process identity, pane reuse
 All selected stops finish before the batch resumes any session.
 Each session resumes its own conversation on the target account.
 A selected caller delegates the batch to a detached process before any signal.
+The notes timer delegates its moves through the same boundary before its part deadline can kill them.
+Requests use each session's observed process account, including members outside their selected group account.
+Blocked notices check the queue head and target again before delivery.
+Quota recipients use one session address for both names and IDs.
 Workers keep their threads when their Claude owner moves.
 
 A group move validates the destination before changing the selection or stopping members.
@@ -179,7 +183,7 @@ Pane workers move through their dispatch lock, fresh pane evidence, `restart.sto
 They keep the same conversation and reuse a stopped pane.
 Only an open pass receives resume text through the shared target check.
 `config/shutdown.conf` sets the stop deadline from `STOP_GRACE_SECONDS`, `KILL_GRACE_SECONDS`, and `MOVE_STOP_MARGIN_SECONDS`.
-Mesh-pinned runs keep the [worker design](long-lived-workers.md) server release path until Phase 18.
+Mesh-pinned runs keep the [worker design](long-lived-workers.md) server release path until herdr-worker-panes Phase 19.
 The [quota guide](../quota_alerts.md) owns phone episodes, forecasts, routing notices, and delivery retries.
 
 Login renewal uses named success and failure results.

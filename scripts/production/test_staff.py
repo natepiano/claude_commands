@@ -13,7 +13,7 @@ import subprocess
 import sys
 import unittest
 from collections.abc import Callable, Iterator
-from contextlib import chdir, redirect_stderr
+from contextlib import AbstractContextManager, chdir, redirect_stderr
 from dataclasses import FrozenInstanceError, replace
 from multiprocessing.connection import Connection
 from multiprocessing.process import BaseProcess
@@ -23,12 +23,35 @@ from typing import cast, override
 from unittest import mock
 
 from scripts.production import staff
+from scripts.production.cli_fixture import invoke_cli
+from scripts.lib import unit_runs
 from scripts.message import sessions
 from scripts.production.staff_test_support import CHECKOUT, STAFF_SCRIPT, StaffTestCase, isolated_staff_file
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
 MISSING_ID = staff.StaffId("s00000000000")
+
+
+class StaffCommandTestCase(StaffTestCase):
+    """Run local CLI logic with the real parser, handlers, and private state."""
+
+    @override
+    def setUp(self) -> None:
+        super().setUp()
+        _ = self.enterContext(cast(AbstractContextManager[object], mock.patch.dict(os.environ, {
+            "ROSTER_RUN_ROOT": str(self.root / "unit"),
+            "UNIT_RUN_ROOT": str(self.root / "unit"),
+            "SCRATCH_ROOT": str(self.root / "scratch"),
+        })))
+        _ = self.enterContext(mock.patch.object(unit_runs, "RUN_ROOT", self.root / "unit"))
+
+    @override
+    def cli(self, *arguments: str, code: int = 0) -> subprocess.CompletedProcess[str]:
+        result = invoke_cli(staff, lambda: staff.main(list(arguments)), list(arguments),
+                            dict(os.environ), CHECKOUT)
+        self.assertEqual(result.returncode, code, result.stderr)
+        return result
 
 
 class CountedStaffRows(tuple[staff.StaffRow, ...]):
@@ -67,7 +90,7 @@ def concurrent_ensure(
             result.send((False, repr(error)))
 
 
-class NativeRuntimeIdentityTests(StaffTestCase):
+class NativeRuntimeIdentityTests(StaffCommandTestCase):
     def test_running_claude_registry_identifies_a_worker_before_its_first_transcript(self) -> None:
         runner = fixture_member("showrunner", name="sdlc")
         unit = fixture_member("unit", name="models", parent=runner.id)
@@ -91,7 +114,6 @@ class NativeRuntimeIdentityTests(StaffTestCase):
         self.assertEqual(environment["MODELS_REGISTRY_EDIT_BASE"], "editor-generation")
 
     def test_worker_rename_cli_keeps_identity_for_each_backend_and_holder(self) -> None:
-        from scripts.production.cli_fixture import invoke_cli
         from scripts.production.rename_test_support import RenameDisplays
 
         runner, unit, _ = self.tree()
@@ -337,7 +359,7 @@ class NativeRuntimeIdentityTests(StaffTestCase):
         self.assertEqual(staff.by_id(worker.id), worker)
 
 
-class RecordedWorkerRoleTests(StaffTestCase):
+class RecordedWorkerRoleTests(StaffCommandTestCase):
 
     def test_rows_share_one_publication_for_admission_replacement_and_retirement(self) -> None:
         for action in ("admit", "replace", "retire"):
@@ -400,7 +422,7 @@ class RecordedWorkerRoleTests(StaffTestCase):
 
 
 
-class DocumentLookupTests(StaffTestCase):
+class DocumentLookupTests(StaffCommandTestCase):
     def git(self, checkout: Path, *arguments: str) -> None:
         result = subprocess.run(["git", *arguments], cwd=checkout, capture_output=True,
                                 text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
@@ -528,7 +550,182 @@ class DocumentLookupTests(StaffTestCase):
         self.assertIsNone(record.by_doc("natedev", unit / "docs/other-production.md"))
 
 
-class StaffTests(StaffTestCase):
+class StaffTests(StaffCommandTestCase):
+    def test_owner_lookup_returns_the_unit_for_a_worker_reference(self) -> None:
+        showrunner, unit, worker = self.tree()
+        record = staff.local_snapshot()
+        for reference in (worker.id, worker.current_session, unit.id, unit.current_session):
+            with self.subTest(reference=reference):
+                self.assertEqual(record.owner_of(reference), unit)
+        self.assertEqual(record.owner_of(showrunner.id), showrunner)
+        self.assertIsNone(record.owner_of("absent"))
+
+    def test_caller_identity_uses_codex_before_claude_and_allows_no_identity(self) -> None:
+        with mock.patch.dict(os.environ, {"CODEX_THREAD_ID": "codex", "CLAUDE_CODE_SESSION_ID": "claude"}):
+            self.assertEqual(staff.caller_identity(), "codex")
+            del os.environ["CODEX_THREAD_ID"]
+            self.assertEqual(staff.caller_identity(), "claude")
+            del os.environ["CLAUDE_CODE_SESSION_ID"]
+            self.assertEqual(staff.caller_identity(), "")
+
+    def test_pause_and_resume_one_unit_preserve_membership_and_allow_reruns(self) -> None:
+        from scripts.production.fake_showrunner import write_session
+
+        owner, unit, worker = self.tree()
+        before = unit.to_json()
+        caller = fixture_member("showrunner", name="fixture-director")
+        listener = write_session(sessions.sessions_dir(), "registry-name", caller.current_session)
+        self.addCleanup(listener.close)
+        self.enterContext(mock.patch.dict(os.environ, {"CODEX_THREAD_ID": ""}))
+        for attempt in range(2):
+            with self.subTest(attempt=attempt):
+                result = self.script(STAFF_SCRIPT, "pause", f"{owner.name}/{unit.name}", "--why", "review the change")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                current = staff.by_id(unit.id)
+                assert current is not None
+                paused = cast(dict[str, object], current.to_json()["paused"])
+                self.assertIsInstance(paused, dict)
+                self.assertEqual(paused["why"], "review the change")
+                self.assertTrue(paused["since"])
+                self.assertEqual(paused["by"], "fixture-director")
+                self.assertEqual({key: value for key, value in current.to_json().items() if key != "paused"}, before)
+                self.assertEqual(staff.by_id(worker.id), worker)
+        for attempt in range(2):
+            with self.subTest(resume=attempt):
+                result = self.cli("resume", f"{owner.name}/{unit.name}")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(staff.by_id(unit.id), unit)
+
+    def test_pause_records_the_codex_callers_staff_name(self) -> None:
+        owner, unit, worker = self.tree()
+        caller = fixture_worker("codex-director", owner.id, backend=staff.CodexBackend(self.root / "codex"))
+        with mock.patch.dict(os.environ, {"CODEX_THREAD_ID": caller.current_session}):
+            result = self.cli("pause", f"{owner.name}/{unit.name}", "--why", "review the change")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        current = staff.by_id(unit.id)
+        assert current is not None
+        self.assertEqual(cast(dict[str, object], current.to_json()["paused"])["by"], caller.name)
+        self.assertEqual(staff.by_id(worker.id), worker)
+
+    def test_production_pause_and_resume_change_only_its_units(self) -> None:
+        owner, first, worker = self.tree()
+        second = fixture_member("unit", name="registry", parent=owner.id)
+        other_owner = fixture_member("showrunner", name="hana")
+        other = fixture_member("unit", name="other", parent=other_owner.id)
+        _ = self.cli("pause", "--production", owner.name, "--why", "review the production")
+        for original in (first, second):
+            current = staff.by_id(original.id)
+            assert current is not None
+            self.assertEqual(cast(dict[str, object], current.to_json()["paused"])["why"], "review the production")
+        self.assertEqual(staff.by_id(other.id), other)
+        self.assertEqual(staff.by_id(worker.id), worker)
+        _ = self.cli("resume", "--production", owner.name)
+        self.assertEqual(staff.by_id(first.id), first)
+        self.assertEqual(staff.by_id(second.id), second)
+
+    def test_production_pause_except_keeps_each_named_unit_active(self) -> None:
+        owner, selected, worker = self.tree()
+        first = fixture_member("unit", name="registry", parent=owner.id)
+        second = fixture_member("unit", name="builds", parent=owner.id)
+        _ = self.cli("pause", "--production", owner.name, "--except", first.name, "--except", second.name,
+                 "--why", "review the selected unit")
+        current = staff.by_id(selected.id)
+        assert current is not None
+        self.assertEqual(cast(dict[str, object], current.to_json()["paused"])["why"], "review the selected unit")
+        for original in (first, second, worker):
+            self.assertEqual(staff.by_id(original.id), original)
+        _ = self.cli("resume", "--production", owner.name)
+        self.assertEqual(staff.by_id(selected.id), selected)
+
+    def test_production_pause_except_accepts_the_unit_suffix(self) -> None:
+        owner, selected, worker = self.tree()
+        excluded = fixture_member("unit", name="fastest", parent=owner.id)
+        result = self.cli("pause", "--production", owner.name, "--except", "fastest-unit",
+                          "--why", "review the selected unit")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(staff.by_id(excluded.id), excluded)
+        self.assertEqual(staff.by_id(worker.id), worker)
+        current = staff.by_id(selected.id)
+        assert current is not None
+        self.assertIsInstance(current.paused, staff.Paused)
+        self.assertEqual(cast(staff.Paused, current.paused).why, "review the selected unit")
+
+    def test_production_pause_except_accepts_the_unit_id(self) -> None:
+        owner, selected, worker = self.tree()
+        excluded = fixture_member("unit", name="fastest", parent=owner.id)
+        result = self.cli("pause", "--production", owner.name, "--except", str(excluded.id),
+                          "--why", "review the selected unit")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(staff.by_id(excluded.id), excluded)
+        self.assertEqual(staff.by_id(worker.id), worker)
+        current = staff.by_id(selected.id)
+        assert current is not None
+        self.assertIsInstance(current.paused, staff.Paused)
+        self.assertEqual(cast(staff.Paused, current.paused).why, "review the selected unit")
+
+    def test_production_pause_except_prefers_the_exact_staff_name(self) -> None:
+        owner, selected, worker = self.tree()
+        alias = fixture_member("unit", name="a", parent=owner.id)
+        exact = fixture_member("unit", name="a-unit", parent=owner.id)
+        result = self.cli("pause", "--production", owner.name, "--except", exact.name,
+                          "--why", "review the selected units")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(staff.by_id(exact.id), exact)
+        self.assertEqual(staff.by_id(worker.id), worker)
+        for original in (selected, alias):
+            current = staff.by_id(original.id)
+            assert current is not None
+            self.assertIsInstance(current.paused, staff.Paused)
+
+    def test_production_pause_except_accepts_a_staff_name_with_spaces(self) -> None:
+        owner, selected, worker = self.tree()
+        excluded = fixture_member("unit", name="phase 9", parent=owner.id)
+        result = self.cli("pause", "--production", owner.name, "--except", excluded.name,
+                          "--why", "review the selected unit")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(staff.by_id(excluded.id), excluded)
+        self.assertEqual(staff.by_id(worker.id), worker)
+        current = staff.by_id(selected.id)
+        assert current is not None
+        self.assertIsInstance(current.paused, staff.Paused)
+
+    def test_production_pause_refuses_an_unmatched_exclusion_without_a_write(self) -> None:
+        owner = self.tree()[0]
+        excluded = fixture_member("unit", name="kept", parent=owner.id)
+        before = self.staff_state()
+        result = self.cli("pause", "--production", owner.name, "--except", excluded.name,
+                          "--except", "unknown-unit", "--why", "review the selected units", code=2)
+        self.assertIn("StaffRefused", result.stderr)
+        self.assertIn("unknown-unit", result.stderr)
+        self.assertIn(owner.name, result.stderr)
+        self.assertEqual(self.staff_state(), before)
+
+    def test_production_pause_refuses_another_productions_unit_without_a_write(self) -> None:
+        owner = self.tree()[0]
+        other = fixture_member("showrunner", name="other")
+        foreign = fixture_member("unit", name="foreign", parent=other.id)
+        before = self.staff_state()
+        for reference in (foreign.name, str(foreign.id)):
+            with self.subTest(reference=reference):
+                result = self.cli("pause", "--production", owner.name, "--except", reference,
+                                  "--why", "review the selected units", code=2)
+                self.assertIn("StaffRefused", result.stderr)
+                self.assertIn(reference, result.stderr)
+                self.assertIn(owner.name, result.stderr)
+                self.assertEqual(self.staff_state(), before)
+
+    def test_rename_and_move_preserve_the_pause_record(self) -> None:
+        owner, unit, worker = self.tree()
+        destination = fixture_member("showrunner", name="hana")
+        _ = self.cli("pause", f"{owner.name}/{unit.name}", "--why", "review before moving")
+        paused = staff.by_id(unit.id)
+        assert paused is not None
+        changed = staff.rename(unit.id, "registry")
+        self.assertEqual(changed.to_json()["paused"], paused.to_json()["paused"])
+        moved = staff.move(changed.id, staff.ReportsTo(destination.id))
+        self.assertEqual(moved.to_json()["paused"], paused.to_json()["paused"])
+        self.assertEqual(staff.by_id(worker.id), worker)
+
     def test_staff_fixture_keeps_registry_paths_under_its_private_folder(self) -> None:
         from scripts.lib.session_paths import sessions_directory
         from scripts.production import showrunners
@@ -953,6 +1150,95 @@ class StaffTests(StaffTestCase):
         rows = cast(list[dict[str, object]], document["rows"])
         self.assertEqual({row["id"] for row in rows}, {runner.id, unit.id, worker.id})
         self.assertTrue(all("worktree" not in row and "doc" not in row for row in rows))
+
+    def test_staff_writes_keep_unknown_row_location_and_pause_fields(self) -> None:
+        runner, unit, worker = self.tree()
+        for row, other, key, state in ((unit, runner, "worktree", "present"),
+                                       (unit, runner, "worktree", "removed"),
+                                       (runner, unit, "doc", "live"),
+                                       (runner, unit, "doc", "wrapped")):
+            with self.subTest(key=key, state=state), redirect_stderr(io.StringIO()) as errors:
+                value = {**row.to_json(), "future_row": {"items": [False, None, 3]},
+                         key: {"machine": "natedev", "path": str(self.root / state), "state": state,
+                               "future_location": ["retained", {"revision": 2}]},
+                         "paused": {"since": "2026-11-06T16:54:00-05:00", "by": "owner", "why": "review",
+                                    "future_pause": {"enabled": True}}}
+                _ = self.write_document({"schema": 2, "rows": [value, other.to_json(), worker.to_json()]})
+                current = staff.snapshot().by_id(row.id)
+                assert current is not None
+                self.assertEqual(current.unknown_fields, {"future_row": value["future_row"]})
+                location = current.worktree if key == "worktree" else current.doc
+                assert isinstance(location, (staff.PresentWorktree, staff.RemovedWorktree, staff.LiveDoc, staff.WrappedDoc))
+                self.assertEqual(location.unknown_fields, {"future_location": ["retained", {"revision": 2}]})
+                assert isinstance(current.paused, staff.Paused)
+                self.assertEqual(current.paused.unknown_fields, {"future_pause": {"enabled": True}})
+                _ = staff.rename(other.id, "other-" + state)
+                stored = cast(list[dict[str, object]], json.loads(self.staff_file.read_text())["rows"])
+                self.assertEqual(next(item for item in stored if item["id"] == row.id), value)
+                changed = staff.rename(row.id, "changed-" + state)
+                expected = {**value, "name": changed.name}
+                stored = cast(list[dict[str, object]], json.loads(self.staff_file.read_text())["rows"])
+                self.assertEqual(next(item for item in stored if item["id"] == row.id), expected)
+                self.assertEqual(errors.getvalue(), "")
+
+    def test_owner_location_changes_keep_unknown_fields(self) -> None:
+        runner, unit = self.tree()[:2]
+        kept = {"future_location": {"items": [False, None, 3]}}
+        for action in ("set_worktree", "set_doc", "restore", "retire_unit", "retire_showrunner"):
+            with self.subTest(action=action):
+                worktree = (staff.RemovedWorktree("natedev", self.root / "unit")
+                            if action in ("restore", "retire_showrunner") else
+                            staff.PresentWorktree("natedev", self.root / "unit"))
+                doc = staff.LiveDoc("natedev", self.root / "doc.md")
+                unit_value = replace(unit, worktree=worktree).to_json()
+                runner_value = replace(runner, doc=doc).to_json()
+                unit_value["worktree"] = {**cast(dict[str, object], unit_value["worktree"]), **kept}
+                runner_value["doc"] = {**cast(dict[str, object], runner_value["doc"]), **kept}
+                _ = self.write_document({"schema": 2, "rows": [runner_value, unit_value]})
+                target, key, path, state = unit, "worktree", worktree.path, "present"
+                if action == "set_worktree":
+                    path = self.root / "new-unit"
+                    _ = staff.set_worktree(unit.id, staff.PresentWorktree("natedev", path), expected=worktree)
+                elif action == "set_doc":
+                    target, key, path, state = runner, "doc", self.root / "new-doc.md", "live"
+                    _ = staff.set_doc(runner.id, staff.LiveDoc("natedev", path))
+                elif action == "restore":
+                    _ = staff.restore_unit(unit.id, staff.PresentWorktree("natedev", path))
+                else:
+                    if action == "retire_showrunner":
+                        target, key, path, state = runner, "doc", doc.path, "wrapped"
+                    else:
+                        state = "removed"
+                    staff.defer_retire((target.id,))
+                    self.assertEqual(staff.retire_pending(), ())
+                stored = cast(list[dict[str, object]], json.loads(self.staff_file.read_text())["rows"])
+                location = next(item for item in stored if item["id"] == target.id)[key]
+                self.assertEqual(location, {"machine": "natedev", "path": str(path), "state": state, **kept})
+
+    def test_staff_read_requires_known_row_location_and_pause_fields(self) -> None:
+        runner, unit, worker = self.tree()
+        for key in ("kind", "id", "name", "parent"):
+            with self.subTest(row_field=key):
+                value = unit.to_json()
+                del value[key]
+                _ = self.write_document({"schema": 2, "rows": [runner.to_json(), value, worker.to_json()]})
+                with self.assertRaisesRegex(staff.StaffUnreadable, "staff row must contain id, kind, name and parent"):
+                    _ = staff.snapshot()
+        for key, required in (("worktree", {"machine": "natedev", "path": str(self.root), "state": "present"}),
+                              ("paused", {"since": "today", "by": "owner", "why": "review"})):
+            for missing in required:
+                with self.subTest(record=key, missing=missing):
+                    value = {**unit.to_json(), key: {name: item for name, item in required.items() if name != missing}}
+                    _ = self.write_document({"schema": 2, "rows": [runner.to_json(), value, worker.to_json()]})
+                    with self.assertRaises(staff.StaffUnreadable):
+                        _ = staff.snapshot()
+        for key in ("since", "by", "why"):
+            with self.subTest(pause_string=key):
+                pause: dict[str, object] = {"since": "today", "by": "owner", "why": "review", key: False}
+                _ = self.write_document({"schema": 2, "rows": [runner.to_json(),
+                    {**unit.to_json(), "paused": pause}, worker.to_json()]})
+                with self.assertRaisesRegex(staff.StaffUnreadable, "paused must contain since, by and why as strings"):
+                    _ = staff.snapshot()
 
     def test_partial_fill_survives_an_ordinary_staff_write(self) -> None:
         runner, unit, _ = self.tree()
@@ -1620,8 +1906,8 @@ class StaffTests(StaffTestCase):
 
     def test_mac_reads_and_writes_use_owner_via_fake_ssh_without_a_local_copy(self) -> None:
         showrunner, unit, worker = self.tree()
-        owner_show = self.cli("show", "--json")
-        owner_display = self.cli("show").stdout
+        owner_show = self.script(STAFF_SCRIPT, "show", "--json")
+        owner_display = self.script(STAFF_SCRIPT, "show").stdout
         reads: tuple[Callable[[], object], ...] = (
             lambda: staff.by_id(worker.id),
             lambda: staff.by_path("sdlc/models/impl1"),
@@ -1640,7 +1926,7 @@ class StaffTests(StaffTestCase):
             for read, expected in zip(reads, owner_results):
                 with self.subTest(read=read):
                     self.assertEqual(read(), expected)
-            self.assertEqual(self.cli("show").stdout, owner_display)
+            self.assertEqual(self.script(STAFF_SCRIPT, "show").stdout, owner_display)
             created = staff.ensure_worker(staff.native_id(fixture_runtime_id("mac-native-worker")),
                                           "test1", unit.id)
             moved_name = staff.rename(unit.id, "registry")

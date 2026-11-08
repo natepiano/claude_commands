@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
 """An interrupted recorder keeps its original step until publication finishes."""
 
 from __future__ import annotations
@@ -10,33 +10,29 @@ import os
 import re
 import shutil
 import subprocess
-import sys
 import time
 import unittest
 from collections.abc import Callable, Generator
 from contextlib import ExitStack, chdir, closing, contextmanager
 from enum import Enum
 from pathlib import Path
-from typing import TYPE_CHECKING, cast, override
+from typing import cast, override
 from unittest import mock
 
-import index
-import health
-import launches
-import record
-import report
-import store
-from mac_natedev_test_support import mac_natedev_environment
-from cgroup_test_support import CPU, save_scope_counters, write_cgroup
-import test_launch_recording as launch_tests
-import test_record as record_tests
-from test_index import point_root_at, step as indexed_step
-from test_launches import CLI
+from scripts.buildlog import index
+from scripts.buildlog import health, launches
+from scripts.buildlog import record
+from scripts.buildlog import report
+from scripts.buildlog import store
+from scripts.buildlog.mac_natedev_test_support import mac_natedev_environment
+from scripts.buildlog.cgroup_test_support import CPU, save_scope_counters, write_cgroup
+from scripts.buildlog import test_launch_recording as launch_tests
+from scripts.buildlog import test_record as record_tests
+from scripts.buildlog.test_index import point_root_at, step as indexed_step
+from scripts.buildlog.test_launches import CLI
+from scripts.buildlog.test_memory_window import configured_host_cli, configured_local_host
 
-if TYPE_CHECKING:
-    from ..direct.test_verify_untested_examples import FIXED_RUSTC
-else:
-    from scripts.direct.test_verify_untested_examples import FIXED_RUSTC
+from scripts.direct.test_verify_untested_examples import FIXED_RUSTC
 
 
 class RecorderStopped(BaseException):
@@ -88,6 +84,7 @@ class RecordRerunTests(unittest.TestCase):
         self.fixture = record_tests.RecordTests()
         self.addCleanup(self.fixture.doCleanups)
         self.fixture.setUp()
+        _ = self.enterContext(mock.patch.object(store, "host_name", side_effect=configured_local_host))
         environment = self.fixture.environment(
             **mac_natedev_environment(self.fixture.base / "config"),
             BUILDLOG_TRANSCRIPTS=str(self.fixture.base / "transcripts"),
@@ -138,7 +135,7 @@ class RecordRerunTests(unittest.TestCase):
             TZ="UTC",
         )
         result = subprocess.run(
-            [sys.executable, str(CLI), *arguments], cwd=self.fixture.base,
+            configured_host_cli(CLI, *arguments), cwd=self.fixture.base,
             env=environment, capture_output=True, text=True, check=False, timeout=60,
         )
         self.assertEqual(result.returncode, 0, result.stderr)

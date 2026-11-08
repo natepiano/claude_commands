@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
-import sys
+from scripts.shutdown import remote
+
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from scripts.lib.test_models_registry import write_registry
 
@@ -33,25 +33,23 @@ from types import ModuleType
 from collections.abc import Callable, Iterator
 from unittest.mock import patch
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "shutdown"))
-import add_unit
+from scripts.production import add_unit
 from scripts.production import staff, unit_config
-from cli_fixture import ImmutableGitSeed, invoke_cli
-import conversation_pause
-import unit_lookup
-import sessions
-import inventory
-import restart
-from herdr import HerdrPlace
+from scripts.production.cli_fixture import ImmutableGitSeed, invoke_cli
+from scripts.hooks import conversation_pause
+from scripts.production import unit_lookup
+from scripts.message import sessions
+from scripts.shutdown import inventory
+from scripts.shutdown import restart
+from scripts.herdr.herdr import HerdrPlace
 from scripts.production.production_doc import Refusal, read_production
 from scripts.accounts import accounts
 from scripts.whoami.note_file import NumberedAccountLabel, note_name, parse_account_label
-import herdr
+from scripts.herdr import herdr
 from scripts.herdr.fake_herdr import CommandResponse
 from scripts.production.fake_unit_host import confirm_tab_close, process as write_process, private_process_registry
 from scripts.whoami.account_test_support import stored_room
-from test_support import registry_confirmation, ShutdownTestCase
+from scripts.shutdown.test_support import registry_confirmation, ShutdownTestCase
 
 
 # Script completion deadlines only bound hangs; startup can be slow under load.
@@ -341,7 +339,6 @@ class AddUnitTestCase(ShutdownTestCase):
         source = source.replace("raise SystemExit(main(sys.argv[1:]))", "raise SystemExit(submitting_main(sys.argv[1:]))")
         hook = r'''def submitting_main(argv):
     if argv[2:4] == ["pane", "process-info"] and "FAKE_SHELL_PID" in os.environ:
-        sys.path.insert(0, os.environ["FIXTURE_CHECKOUT"])
         from scripts.production.add_unit_test_support import fixture_foreground
         from scripts.lib.atomic_file import write_text_atomic
         path = Path(os.environ["FAKE_HERDR_RESPONSES"])
@@ -353,7 +350,6 @@ class AddUnitTestCase(ShutdownTestCase):
         shell = Path(os.environ["HERDR_PROC"]) / os.environ["FAKE_SHELL_PID"]
         (shell / "environ").write_text("HERDR_SESSION=" + argv[1] + "\0HERDR_PANE_ID=w1:p1")
     if result == 0 and argv[2:4] == ["agent", "start"]:
-        sys.path.insert(0, os.environ["FIXTURE_CHECKOUT"])
         from scripts.production.add_unit_test_support import fixture_agent_started
         fixture_agent_started(argv)
     if result == 0 and argv[2:4] == ["agent", "prompt"]:
@@ -372,7 +368,6 @@ class AddUnitTestCase(ShutdownTestCase):
     return result
 
 '''
-        hook = hook.replace('os.environ["FIXTURE_CHECKOUT"]', repr(str(SCRIPT.resolve().parents[2])))
         source = source.replace('if __name__ == "__main__":', hook + 'if __name__ == "__main__":')
         _ = fake_path.write_text(source)
         fake_path.chmod(0o755)
@@ -451,7 +446,7 @@ class AddUnitTestCase(ShutdownTestCase):
         self.persist_herdr_unit(session, self.root)
         environment = self.root / "proc/202/environ"
         _ = environment.write_text(environment.read_text() + f"\0CLAUDE_CONFIG_DIR={directory}")
-        import pane_record
+        from scripts.shutdown import pane_record
         with patch.object(pane_record, "RECORD_DIR", Path(self.env["HERDR_PANE_RECORD_DIR"])):
             pane_record.write(session, pane_record.launch("w1:p1", "62ccbd64-f22e-5647-b20e-7899aa39d766", str(self.root),
                 {"CLAUDE_CONFIG_DIR": str(directory)},
@@ -504,7 +499,7 @@ class AddUnitTestCase(ShutdownTestCase):
             "default": CommandResponse(code=0, stdout=json.dumps({"result": {
                 "root_pane": {"pane_id": "w1:p1"}, "tab": {"tab_id": "w1:t1"}, "tabs": []}})),
         }
-        responses["agent get"] = CommandResponse(code=0, stdout=json.dumps({"result": {"agent": {"agent_status": "idle", "interactive_ready": True}}}))
+        responses["agent get"] = CommandResponse(code=0, stdout=json.dumps({"result": {"agent": {"agent_status": "idle"}}}))
         # An already launched fixture advertises its session on subsequent CLI calls.
         sessions = [herdr.SessionEntry(name=path.name.removeprefix("herdr-live-"), running=True,
                     default=False, session_dir="/fixture", socket_path="/fixture/socket")
@@ -512,7 +507,6 @@ class AddUnitTestCase(ShutdownTestCase):
         responses["--session default session list --json"] = CommandResponse(
             code=0, stdout=json.dumps(herdr.SessionListResult(sessions=sessions)))
         if isinstance(request, add_unit.UnitLaunch):
-            self.env["FIXTURE_CHECKOUT"] = str(SCRIPT.parents[2])
             self.env["FAKE_CLAUDE_PID"] = str(FAKE_CLAUDE_PID)
             registry = Path(self.env["NOTIFIER_SESSIONS_DIR"]) / f"{FAKE_CLAUDE_PID}.json"
             if registry.exists():
@@ -525,7 +519,7 @@ class AddUnitTestCase(ShutdownTestCase):
                 else fixture_runtime_id("unit:" + parent + ":" + request.identity.session))
             name = SHARED
             title = request.identity.session
-            responses[f"--session {name} agent get w1:p1"] = CommandResponse(code=0, stdout=json.dumps({"result": {"agent": {"agent_status": "idle", "interactive_ready": True}}}))
+            responses[f"--session {name} agent get w1:p1"] = CommandResponse(code=0, stdout=json.dumps({"result": {"agent": {"agent_status": "idle"}}}))
             responses[f"--session {name} status server"] = [
                 CommandResponse(code=0, stdout="status: stopped\n"),
                 CommandResponse(code=0, stdout="status: running\n")]
@@ -695,7 +689,7 @@ class AddUnitTestCase(ShutdownTestCase):
             identity = self.env.get("FAKE_RESTORED_SESSION_ID", "62ccbd64-f22e-5647-b20e-7899aa39d766")
             if row.current_session != identity:
                 row = staff.update_current_session(row.current_session, staff.native_id(identity))
-            row = staff.set_worktree(row.id, staff.PresentWorktree("natedev", worktree), expected=row.worktree)
+            row = staff.set_worktree(row.id, staff.PresentWorktree(remote.local_machine(), worktree), expected=row.worktree)
             config_plan = (unit_config.StandbyPlan() if plan == "standby"
                            else unit_config.PlanFile(Path(plan)))
             _ = unit_config.write(worktree, unit_config.UnitConfig(config_plan, unit_config.NoAppPort(), ()))
@@ -734,7 +728,7 @@ class AddUnitTestCase(ShutdownTestCase):
             _ = self.git("worktree", "add", "-b", request.branch, str(request.worktree), "build-followups")
         with patch.dict(os.environ, self.env):
             row = unit_membership(self.production_name, request.unit_id)
-            _ = staff.set_worktree(row.id, staff.PresentWorktree("natedev", request.worktree), expected=row.worktree)
+            _ = staff.set_worktree(row.id, staff.PresentWorktree(remote.local_machine(), request.worktree), expected=row.worktree)
             _ = unit_config.write(request.worktree, unit_config.UnitConfig(
                 unit_config.PlanFile(Path("docs/plans/given.md")), unit_config.NoAppPort(), ()))
         git_run = subprocess.run
@@ -841,7 +835,7 @@ class AddUnitTestCase(ShutdownTestCase):
     def persist_herdr_unit(self, name: str, cwd: Path) -> None:
         row = unit_membership(self.production_name, "alpha")
         row = staff.update_current_session(row.current_session, staff.native_id("62ccbd64-f22e-5647-b20e-7899aa39d766"))
-        row = staff.set_worktree(row.id, staff.PresentWorktree("natedev", self.root / "project-alpha"), expected=row.worktree)
+        row = staff.set_worktree(row.id, staff.PresentWorktree(remote.local_machine(), self.root / "project-alpha"), expected=row.worktree)
         stopped = add_unit.LabeledSessionFound(unit_lookup.LabeledSession(
             "alpha", unit_lookup.ClaudeNotRunning(), HerdrPlace(name, "w2:p1"),
             identity=unit_lookup.LiveSession(row.current_session)))

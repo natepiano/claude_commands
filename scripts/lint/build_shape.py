@@ -14,14 +14,9 @@ from contextlib import closing, contextmanager
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, cast
-import sys
+from typing import cast
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
-if TYPE_CHECKING:
-    from scripts.lib.test_phase import TEST_STEPS as TEST_STEPS
-else:
-    from test_phase import TEST_STEPS as TEST_STEPS
+from scripts.lib.test_phase import TEST_STEPS as TEST_STEPS
 
 
 @dataclass(frozen=True)

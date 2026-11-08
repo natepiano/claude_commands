@@ -12,8 +12,8 @@ from pathlib import Path
 from typing import override
 from unittest import mock
 
-import dailies_counts
-from dailies_counts import CountsFailure, production_counts
+from scripts.production import dailies_counts
+from scripts.production.dailies_counts import CountsFailure, production_counts
 from scripts.production import session_staff
 
 LEDGER_RULE = r"— (proposed|deferred)$"
