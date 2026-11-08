@@ -32,7 +32,7 @@ from scripts.buildlog import store, parse
 from scripts.lib import conf
 from scripts.test_times.gate_record import TYPE_CHECK_JOB
 
-SCHEMA_VERSION = 35
+SCHEMA_VERSION = 36
 
 
 # These indexes support repeated queries over the current schema.
@@ -219,6 +219,7 @@ GATE_MODULE_COLUMNS: list[Column] = [
     ("attempt", "INTEGER", "execution number from 1; includes hold restarts and reruns"),
     ("restart", "TEXT", "hold when a build hold stopped the attempt; empty otherwise"),
     ("times_missing", "TEXT", "reason test times are missing; empty when present"),
+    ("log", "TEXT", "gzipped output of a failed attempt; empty otherwise"),
     ("wall_s", "REAL", "wall time of the module"),
     ("cpu_s", "REAL", "user and system CPU seconds"),
     ("peak_mib", "REAL", "peak memory in MiB"),

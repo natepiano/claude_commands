@@ -742,7 +742,7 @@ All of `scripts/buildlog` and every outside importer of its modules use the repo
 - A path module for `scripts/buildlog`: the repo already has one way, and a per-folder module is a second way.
 - Moving `sessions` and `unit_runs` in this phase: other files import them bare in large numbers.
 
-### Phase 34 — A failed merge gate module keeps its failure text  · status: todo
+### Phase 34 — A failed merge gate module keeps its failure text  · status: done
 **Depends on:** none
 
 From the builds showrunner (not the user), 2026-11-06: "a new item for you, next after your current phase. A failed gate must keep its failure text, so a unit can read it after the gate ends. Today finish_gate_job at merge_gate.py:697 deletes the temporary log, and the record keeps only the test name. natest could read no past failure for its flake work. Keep only the failing modules' output (bounded size, a config key for the limit), next to the gate record, and prune it with the record."
@@ -750,6 +750,8 @@ From the builds showrunner (not the user), 2026-11-06: "a new item for you, next
 Decided by the director: the text goes through the build log's one kept-log path, `record.keep_log`, under `<host>/logs/<YYYY-MM>/`. The build log prunes neither records nor logs, so no prune code exists to join; the text lasts as long as the record.
 
 From the builds showrunner (not the user), 2026-11-06: "Phase 34 design accepted. No prune code; the per-file limit bounds the growth."
+
+From the builds showrunner (not the user), 2026-11-08: "go. Fix gate_box.py, cloud_gate.py and their tests in Phase 34 yourself. aws has no unlanded change in scripts/aws_target/, so there is no overlap. I tell aws. Name the files in your checkpoint notice."
 
 #### Work Order
 
