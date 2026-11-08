@@ -6,7 +6,7 @@ from __future__ import annotations
 import json
 import io
 import ctypes
-from contextlib import contextmanager, redirect_stderr, redirect_stdout
+from contextlib import contextmanager, nullcontext, redirect_stderr, redirect_stdout
 from collections.abc import Callable, Generator
 from datetime import datetime, timedelta, timezone
 import os
@@ -3257,6 +3257,40 @@ class HerdrTests(unittest.TestCase):
             self.configure(["-a", "-p", str(pid), "-d", "cwd", "-Fn"], f"p{pid}\nfcwd\nn/work\n")
         self.assertCountEqual([row.pid for row in herdr.herdr_processes()], [71, 72])
         self.assertEqual(herdr.herdr_place_of(72), herdr.HerdrPlace("writing", "w1:p1"))
+
+    def test_report_batches_shell_pids_for_several_panes(self) -> None:
+        panes = [{"pane_id": f"w1:p{n}", "workspace_id": "w1"} for n in range(3)]
+        self.configure_herdr(["pane", "list"], json.dumps({"result": {"panes": panes}}))
+        for n in range(3):
+            self.configure_herdr(["pane", "process-info", "--pane", f"w1:p{n}"],
+                json.dumps({"result": {"process_info": {"shell_pid": 998070 + n}}}))
+        def server(*_arguments: object) -> object:
+            replies = io.StringIO()
+            def send(data: bytes) -> None:
+                request = cast(dict[str, object], json.loads(data.splitlines()[0]))
+                params = cast(dict[str, object], request["params"])
+                pane = str(params["pane_id"])
+                _ = replies.write(json.dumps({"id": pane, "result": {"process_info": {
+                    "shell_pid": 998070 + int(pane[-1])}}}) + "\n")
+                _ = replies.seek(0)
+            return nullcontext(SimpleNamespace(connect=Mock(), sendall=send, settimeout=Mock(),
+                                                makefile=Mock(return_value=replies)))
+
+        with patch("socket.socket", side_effect=server) as connection:
+            with herdr.observation_snapshot(), herdr.pane_snapshot():
+                self.assertEqual(herdr._pane_shell_pids("fixture"), list(range(998070, 998073)))  # pyright: ignore[reportPrivateUsage]
+                self.assertEqual(herdr._pane_shell_pids("fixture"), list(range(998070, 998073)))  # pyright: ignore[reportPrivateUsage]
+            self.assertEqual(self.commands(), [["--session", "fixture", "pane", "list"]])
+            self.assertEqual(connection.call_count, len(panes))
+
+    def test_report_lists_copy_changed_rows_without_deep_copies(self) -> None:
+        self.configure_herdr(["pane", "list"], json.dumps({"result": {"panes": [
+            {"pane_id": "w1:p1", "workspace_id": "w1", "label": "original"}]}}))
+        with (herdr.observation_snapshot(),
+              patch.object(herdr, "deepcopy", side_effect=AssertionError("unneeded deep copy"), create=True)):
+            first = self.herdr.listed("pane")
+            first[0]["label"] = "changed"
+            self.assertEqual(self.herdr.listed("pane")[0]["label"], "original")
 
     def test_binary_missing_and_override(self) -> None:
         self.assertEqual(herdr.herdr_binary(), str(self.fake))

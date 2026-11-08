@@ -33,6 +33,7 @@ import math
 import sys
 import time
 from contextlib import contextmanager
+from concurrent.futures import ThreadPoolExecutor
 from contextvars import ContextVar
 from functools import cache, cached_property
 from importlib import import_module
@@ -1228,6 +1229,30 @@ class SubmitStarts:
 SUBMIT_UNPROVED = SubmitUnproved()
 
 
+@dataclass
+class PaneObservations:
+    """Share read-only pane evidence until the report scope closes."""
+    replies: dict[tuple[str, tuple[str, ...]], dict[str, object]] = field(default_factory=dict)
+    process_batches: set[str] = field(default_factory=set)
+
+
+_pane_observations: ContextVar[PaneObservations | None] = ContextVar("pane_observations", default=None)
+
+
+@contextmanager
+def observation_snapshot() -> Generator[None]:
+    """Read each pane, process, and layout once for a status pass."""
+    if _pane_observations.get() is not None:
+        yield
+        return
+    token = _pane_observations.set(PaneObservations())
+    try:
+        with process_snapshot():
+            yield
+    finally:
+        _pane_observations.reset(token)
+
+
 class Herdr:
     def __init__(self, session: str) -> None:
         self.binary: str = herdr_binary()
@@ -1274,9 +1299,36 @@ class Herdr:
         _ = self.run("pane", "run", pane, shlex.join(command))
 
     def result(self, *arguments: str, deadline: float = math.inf) -> dict[str, object]:
+        observed = _pane_observations.get()
+        key = (self.session, arguments)
+        shared = observed is not None and arguments[:2] in (
+            ("pane", "list"), ("tab", "list"), ("workspace", "list"),
+            ("agent", "list"), ("pane", "process-info"))
+        if observed is not None and arguments[:2] == ("pane", "process-info"):
+            self._process_info_batch(observed)
+        if shared and observed is not None and key in observed.replies:
+            return observed.replies[key]
         output = self.run(*arguments) if deadline == math.inf else self.run(*arguments, deadline=deadline)
-        reply = decode_object(output, "herdr response")
-        return json_object(reply.get("result"), "herdr result")
+        reply = json_object(decode_object(output, "herdr response").get("result"), "herdr result")
+        if shared and observed is not None:
+            observed.replies[key] = reply
+        return reply
+
+    def _process_info_batch(self, observed: PaneObservations) -> None:
+        """Read all pane processes in one report batch without CLI subprocesses."""
+        if self.session in observed.process_batches:
+            return
+        observed.process_batches.add(self.session)
+        panes = [json_text(pane.get("pane_id"), "pane id") for pane in self.listed("pane")]
+        def read(pane: str) -> tuple[str, dict[str, object]]:
+            try:
+                return pane, self.socket_request("pane.process_info", pane_id=pane)
+            except (OSError, HerdrFailure):
+                return pane, {}
+        with ThreadPoolExecutor(max_workers=16) as pool:
+            for pane, reply in pool.map(read, panes):
+                if reply:
+                    observed.replies[self.session, ("pane", "process-info", "--pane", pane)] = reply
 
     def socket_request(self, method: str, **params: object) -> dict[str, object]:
         """Send one request to this session's socket."""
@@ -1292,7 +1344,7 @@ class Herdr:
         return json_object(response.get("result"), f"herdr {method} result")
 
     def listed(self, kind: str, *arguments: str, deadline: float = math.inf) -> list[dict[str, object]]:
-        return [json_object(item, f"herdr {kind}") for item in json_items(
+        return [json_object(item, f"herdr {kind}").copy() for item in json_items(
             self.result(kind, "list", *arguments, **({"deadline": deadline} if deadline != math.inf else {})).get(f"{kind}s"), f"herdr {kind} list")]
 
     def pane_row(self, pane: str) -> PaneIdentity | NoPane:
@@ -4885,10 +4937,15 @@ class AgentNameSource(Enum):
     MEMBER_REFERENCE = "member_reference"
 
 
+class CodexLaunchRead(Enum):
+    CURRENT = "read Codex at launch"
+
+
 def launch_prepared_agent(name: str, destination: NewTab | SplitPane | ExistingPane, prepared: PreparedAgentEnvironment,
                           kind: str, agent_arguments: list[str], opening: OpeningPrompt | NoOpeningPrompt,
                           timeout_ms: int, *, agent: str, reported_unknown: str = "",
-                          agent_name: str | AgentNameSource = AgentNameSource.MEMBER_REFERENCE) -> AgentLaunched:
+                          agent_name: str | AgentNameSource = AgentNameSource.MEMBER_REFERENCE,
+                          codex: CodexConversations | CodexLaunchRead = CodexLaunchRead.CURRENT) -> AgentLaunched:
     """Launch the prepared environment. Use agent for staff lookup and agent_name for the server name."""
     _check_agent_arguments(kind, agent_arguments)
     if kind == "claude":
@@ -4905,7 +4962,9 @@ def launch_prepared_agent(name: str, destination: NewTab | SplitPane | ExistingP
         owner = membership.by_member_reference(session_id or agent) or membership.by_path(agent)
         if owner is not None:
             session_id = owner.current_session
-        observed = read_conversation(session_id, kind) if session_id else StoppedConversation()
+        observed = (read_conversation(session_id, kind,
+                    **({"codex": codex} if isinstance(codex, CodexConversations) else {}))
+                    if session_id else StoppedConversation())
     except (HerdrFailure, OSError, ValueError) as error:
         print(f"herdr {session_id}: live session evidence is unknown: {error}", file=sys.stderr)
     else:

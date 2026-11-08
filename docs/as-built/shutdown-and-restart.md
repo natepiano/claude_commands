@@ -167,6 +167,21 @@ The [pane restore](herdr-restore.md) uses this same naming policy.
 
 ## Restart
 
+A status pass shares one Codex snapshot, one worker-run search, and one pane observation.
+It reads pane processes through a direct socket batch and reuses the results during that pass.
+The server accepts one request per socket. The batch reads those sockets in parallel.
+Read-only layout results share their data. Listed rows use shallow copies for caller edits.
+The launch helper uses the same Codex snapshot.
+Confirmed stops remove the selected rows' old Codex liveness entries.
+An unconfirmed stop checks only its target's current identity and process generation before a launch.
+A live target stays running. An unreadable target stays on the restart list.
+A missing rollout file or changed generation alone does not prove exit.
+Restart launches after a failed stop only when it proves absence or a different process running another conversation.
+The run index passes through every stop helper and through worker restore.
+Action checks still prove the target process before a signal.
+Independent rows stop and start in parallel.
+Each restore line starts with the staff name, including worker restore results.
+
 Before a power-off, run `agents stop --all`.
 After login, run `agents restart`.
 
