@@ -1097,51 +1097,23 @@ Checkpoint `1f9e9c484` on `verify-not-mac-wait`, merged to builds as `a62793f07`
 
 **Depends on:** Phase 41p.
 
-#### Work Order
+#### As-built
 
-**Source:** builds showrunner, 2026-11-08, from queue's import trace of the Phase 41p tree: `/tmp/claude/unit/2ac94b9b-8a9d-4a9b-b908-b4f87dd4d5d0/phases/31/notes/trace.md` (table "Imports above 10 ms cumulative", `measurements.json` beside it). The trace uses a fixture with one local Linux target and no SSH target.
-
-**Goal:** `eligible`, `reserve` and `release-wait` load `mac_test`, `offload` and their heavy children only when an SSH target needs them. No behavior changes. Upper bound of the cut per start: `eligible` 222 ms, `reserve` 230 ms, `release-wait` 300 ms.
-
-**Spec:**
-
-1. Measure first, on a tree that holds queue Phase 31. The director merges builds after Phase 31 lands there. Measure CPU s per start of `eligible`, `reserve` and `release-wait`. Use a local-only fixture and an SSH-target fixture. Use interleaved before and after pairs under the same load, as in Phase 41p's repair. Name the method.
-2. `build_targets.py`: `reserve` and `release-wait` import `mac_test` (`command_reserve` at line 680, `command_release_wait` at line 751) but call none of its functions when no SSH target passes the filter (about 300 ms). Import it only after an SSH target passes. `command_reserve` reads a saved reservation with `mac_test` before its target loop (line 693); keep that path working.
-3. `build_targets.py` `command_eligibility` (line 1075) imports `offload` for every `eligible` call (about 222 ms). Load it only where a call uses it: the `--probe-marks-file` and `--remote-kinds-file` flags (lines 1078 and 1089), and Mac or SSH targets in `target_eligibility` (`targets.py:265` reads `offload.repository_identity`, `targets.py:274` applies Mac policy). A bare `eligible` with only a local Linux target loads no `offload`. `reserve` calls `offload.remote_step_kinds()`; keep that import unless the call can wait until an SSH target passes.
-4. `scripts/mac_test/offload.py:38` and `scripts/mac_test/mac_test.py:35` import `scripts.lint.sweep` at module top (126-156 ms). Its users are `offload.repository_identity()` (three repository helpers), `offload.report_cleanup()` (`sweep.gib`, line 938) and `mac_test.free_now()` (`sweep.repo_name`, line 2322). Import `sweep` inside each of those functions.
-5. `scripts/mac_test/mac_test.py:32` imports `build_hold` at module top (32-63 ms). No measured command calls a hold function. Import it inside the functions that use it. (`offload.py` already imports `build_hold` only inside `holder_session()`; its line 35 imports `override_guard`, which stays.)
-6. `scripts/mac_test/offload.py:42` imports `scripts.buildlog.record` at module top (16-21 ms). Import it inside the functions that record an attempt.
-7. queue's trace shows two modules in the `mac_test` chain: `scripts.production.showrunners` (34 ms) and `scripts.astra.design_roles` (52 ms). `showrunners` loads `message.sessions` and `production.staff`. `design_roles` loads `production.session_staff`. On the Phase 41p tree, `mac_test.py` imports neither one directly. There, `showrunners` loads through `sweep` → `tmp_sweep` → `session_staff` → `unit_config` → `production_doc`. On the merged tree, use `python3 -X importtime` to find the import that pulls in each one. Look in `mac_test.py` and `offload.py`. Move that import to its users if no `build_targets.py` command needs it. Report the chain in the final reply.
-8. Do not edit `scripts/lint/sweep.py`, `scripts/lint/tmp_sweep.py` or `scripts/build_hold/build_hold.py`. queue Phase 31 changes them. Report other import facts in the final reply.
-9. Keep each command line, output, exit status and side effect the same.
+- `build_targets.py` imports `mac_test` and `offload` only inside the SSH target loops of `reserve` and `release-wait`, the saved-reservation branch, and the `eligible` output-file flag branches.
+- `target_eligibility` (`targets.py`) returns every target as eligible when all are Linux. Otherwise `mac_policy_eligibility` imports `offload` and applies the Mac policy checks.
+- `mac_test.py` imports `build_hold` under `TYPE_CHECKING` and inside `read_claim_block`, `block_duration`, `block_belongs_to` and `bind_instance_generation`; `sweep` inside `free_now`. `offload.py` imports `sweep` inside its users and `buildlog.record` inside its attempt recorder.
+- Median CPU per start, five interleaved pairs on the merged tree: local-only `eligible` 0.26 → 0.10 s, `reserve` 0.29 → 0.09 s, `release-wait` 0.30 → 0.09 s. SSH-target `eligible` 0.29 → 0.29 s, `reserve` 0.32 → 0.30 s, `release-wait` 0.30 → 0.22 s.
+- queue Phase 31 already broke the `offload → sweep → tmp_sweep → session_staff → unit_config → production_doc → showrunners` chain. No measured command loads `showrunners`, `design_roles` or `admission_service`.
 
 **Files:**
-- `scripts/build_targets/build_targets.py`
-- `scripts/build_targets/targets.py`
-- `scripts/mac_test/offload.py`
-- `scripts/mac_test/mac_test.py`
-- `scripts/build_targets/test_build_targets.py`
+- `scripts/build_targets/build_targets.py` — SSH imports inside their branches.
+- `scripts/build_targets/targets.py` — `mac_policy_eligibility`.
+- `scripts/mac_test/mac_test.py`, `scripts/mac_test/offload.py` — function-level imports of hold, sweep and attempt-record modules.
+- `scripts/build_targets/test_build_targets.py` — `test_local_commands_omit_ssh_modules`: four fresh-process cases (bare eligible, kind eligible, release-wait, filtered reserve).
 
-**Workers:** 1 writer: impl41n.
-
-**Constraints from prior phases:**
-- queue Phase 31 alone saves no CPU, because `mac_test` and `offload` still load the same modules. Its saving shows only after this phase. The before measure includes queue Phase 31, so the before-to-after difference is this phase's own saving.
-- Phase 41p's rule holds: modules that Python has loaded before the module body runs (`os`, `sys`, `io`, `time`, `contextlib`, `collections.abc`, `importlib`, `types`, `typing`) stay at module top. Defer only imports with a measured cost.
-- `offload.OffloadRequest.repository_scope` reads `copies.ALL_REPOSITORIES` at import (`offload.py:440`). Keep the `copies` import.
-- `ssh_target_eligibility` reads `free_now` once and passes it to `mac_target_eligibility`. A `"bad"` answer on a new step's first read starts one detached `recover-probe`. Keep both.
-- natest owns the `test_verify*` files. This phase changes none of them.
-- Add no guard, refusal or check that this Spec does not ask for.
-- Tests use a temporary state folder.
-
-**Acceptance gate:**
-- Per subcommand and fixture (local-only, SSH target): CPU s per start, before and after, in interleaved pairs, with the load beside each pair. Each local-only CPU goes down, or the reply says why it cannot.
-- Fresh-process import checks prove three cases. Put them in the existing `test_clean_target_import_omits_admission_service_and_loads_mac_test_once` test, or in a new test beside it.
-  - A bare local-only `eligible` loads neither `mac_test` nor `offload`.
-  - `release-wait` with no SSH reservation loads no `mac_test`.
-  - `reserve` with every SSH target excluded by its filter loads no `mac_test`.
-- No output, exit status or side effect changes: the Phase 41p modules plus `test_offload.py`, `test_offload_cleanup.py`, `test_mac_test.py`, `test_target_state.py` and `test_failed_probe_mark.py` (its version-decline checks) pass.
-- basedpyright 0/0/0 on the changed Python files.
-- The director runs the targeted test (`targeted_test.py`) before the checkpoint.
+**Gotchas:**
+- SSH `eligible` still needs the repository policy and sweep helpers, so its CPU does not change.
+- Phase 41p's removal of the `sys.path` inserts broke `linux_runner.trim_build_folder`, whose child imported bare `sweep` and `conf`. devtools Phase 3z fixed it on builds (the child runs `scripts/lib/py` with package imports). A `sys.path` insert can hide a bare import elsewhere; run the `mac_test` modules after an import change.
 
 ### Phase 41r — Stop two verify test modules from growing without limit  · status: done
 
