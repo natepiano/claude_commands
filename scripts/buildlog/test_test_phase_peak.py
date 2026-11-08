@@ -64,7 +64,7 @@ def sample_timeline(root: Path, repository: Path, *, marked: bool = True) -> Sam
     for index, anon in enumerate((9000, 500, 1700, 800)):
         tick = ticks / str(index)
         tick.mkdir()
-        _ = (tick / "memory.stat").write_text(f"anon {anon}\nfile 900000\n")
+        _ = (tick / "memory.stat").write_text(f"anon {anon}\nshmem 0\nfile 900000\n")
         pids = "101\n" if not marked or index == 0 else ("201\n" if index == 1 else "201\n202\n")
         _ = (tick / "cgroup.procs").write_text(pids)
     return SampleTimeline(files, proc, ticks)

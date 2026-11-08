@@ -1885,3 +1885,33 @@ Every nextest run that lint starts prints one line after admission: `nextest: <g
 - earlyoom stopped hana `b2f5eb9641`'s gate nextest at 11:19:14, 11:19:28 and 11:19:51 UTC on 2026-11-08, with about 1.2 GiB available and no free swap. hana's nextest stayed inside its claim (8.6 GiB anonymous peak against 12.1 GiB).
 - A herdr merge gate that ran at the same time had a 4 GiB claim and a 26.4 GiB anonymous peak. Its first attempts of `test_verify_mac_memory_handoff.py` (27.0 GiB) and `test_verify_mac_local_release.py` (9.4 GiB) ran away; their retries passed at about 250 MiB. The builds slice also held up to 27 GiB of shmem that no reservation counts.
 - Routed by builds: the runaway modules to verify; the fixed 4 GiB merge-gate claim (`scripts/build_queue/step_estimator.py:244`) and the shmem question to queue; the merge_gate governor that lets one oversized module run alone (`scripts/production/merge_gate.py:291`) to sdlc.
+
+### Phase 84 — Admission counts tmpfs memory in the builds slice  · status: done
+**Depends on:** none. Merge `origin/builds` first.
+
+**Approved:** builds showrunner, 2026-11-08 ("Phase 84: admission counts tmpfs memory ... Add the slice's memory.stat shmem to the used memory that admission reads, with a test row that fails without it.").
+
+#### Work Order
+
+**Goal:** memory admission counts the builds slice's shared memory (tmpfs, `memory.stat` `shmem`) as used memory, so it holds work back when tmpfs files fill the slice.
+
+**Measured (Phase 83 report, 2026-11-08):** at 11:19 UTC the builds slice held up to 27.5 GiB of shmem next to 15.4 GiB of anonymous memory, with a 44 GiB limit. earlyoom then killed hana's gate nextest. The slice reader `slice_working_set()` in `scripts/lint/memory_admit.py` reads `anon` from `memory.stat` as the run use, and no reservation accounts for shmem.
+
+**Spec:**
+1. Find each place where admission reads the slice's used memory from `anon` only. Add the slice's `memory.stat` `shmem` to that used memory. Do not count shmem twice where a reading (for example `memory.current` less `inactive_file`) already holds it.
+2. A missing or unreadable `shmem` field gives the same unavailable result that a missing `anon` field gives now.
+3. Add a row to the existing slice-reader test that fails without the change: a slice with large shmem and small anon reads as the sum.
+4. Update the as-built doc for the changed reading.
+
+**Files:**
+- `scripts/lint/memory_admit.py` — the slice reading.
+- `scripts/lint/test_memory_admit.py` — the test row.
+- `docs/as-built/build-memory-admission.md` — the changed reading.
+
+**Workers:** `1 writer + 1 tester`
+- `impl` owns `scripts/lint/memory_admit.py` and the as-built doc, and runs the final suites.
+- `test` owns `scripts/lint/test_memory_admit.py`.
+
+**Acceptance gate:**
+- The new test row fails without the change and passes with it.
+- `scripts/lint/test_memory_admit.py` passes. Basedpyright reports `0 errors, 0 warnings, 0 notes` for every changed Python file.
