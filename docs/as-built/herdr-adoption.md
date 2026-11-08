@@ -118,6 +118,13 @@ Short tab titles can repeat across workspaces.
 
 ### Claude trust before every launch
 
+`copies.py clone` checks source trust through `herdr.claude_trust` in every Claude account home.
+Trust in any home authorizes the clone in every existing account file.
+The clone record stores its resolved `claude_trust_folder` before the locked accounts writer grants trust.
+Removal clears only that folder's trust bit after the external removal mark exists.
+It preserves all other project settings and skips missing account files.
+Malformed or unreadable account files produce an anomaly while the other homes continue.
+
 A Claude session started in a folder the account has not trusted stops at the trust prompt. A launcher that sends it a prompt then waits on a session that never answers. Every launcher checks trust first and refuses with the one command the user runs, before it writes or launches anything.
 
 - `herdr.claude_trust(folder, claude_json) -> Trusted | Untrusted | UnreadableTrustFile` is the one check. A folder is trusted when `projects[k].hasTrustDialogAccepted is True` in the account's `.claude.json` for a key `k` in: the folder itself, its `git rev-parse --show-toplevel` (`repository_root`), and its main checkout (`repository_trust_key`, the parent of `--git-common-dir`). Both git helpers share `_repository_key`, which strips inherited `GIT_*` variables and runs git with `GIT_CONFIG_GLOBAL=/dev/null` and `GIT_CONFIG_NOSYSTEM=1`.
@@ -127,7 +134,7 @@ A Claude session started in a folder the account has not trusted stops at the tr
 - Callers. Each refuses with `<unit | child showrunner name | session>: Claude is not trusted in <folder> on <account label>. Run: <trust_command>`, or `<prefix>: <UnreadableTrustFile text>`:
   - `add_unit.preflight(request, selected)` exits 2 before any stub, table row or worktree is written. A worktree that does not exist yet is checked by its main checkout's key, and its trust command runs in the main checkout.
   - `add_showrunner.checked`, and through it `promote_showrunner.py`. `ADD_SHOWRUNNER_CLAUDE_JSON` sets the account file in tests.
-  - `herdr_sessions.py start` and `resume`. An untrusted folder prints one paste line, the trust command `&&` the same invocation rebuilt by `_launch_rerun` (with `--cwd` resolved, claude arguments kept after `--`, and paths with spaces quoted), and exits 1. Nothing writes `hasTrustDialogAccepted`.
+  - `herdr_sessions.py start` and `resume`. An untrusted folder prints one paste line, the trust command `&&` the same invocation rebuilt by `_launch_rerun` (with `--cwd` resolved, claude arguments kept after `--`, and paths with spaces quoted), and exits 1. The launch check does not write `hasTrustDialogAccepted`.
   - `restart._herdr_launch`, on the trust file in the launch environment's `CLAUDE_CONFIG_DIR`, before any server starts.
   - The nightly review launches through `add_unit.py --permanent` on the units account, so `preflight` covers it.
 - Launchers use the configured group account. Each check reads `<CLAUDE_CONFIG_DIR>/.claude.json` in that numbered folder. `~/.claude.json` stays the seed and MCP baseline.

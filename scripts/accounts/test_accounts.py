@@ -2615,6 +2615,63 @@ with path.with_name(path.name + ".lock").open("a") as lock:
             "/elsewhere": {"hasTrustDialogAccepted": False, "other": [1]},
         })
 
+    def test_without_trusted_folders_preserves_settings_and_removes_empty_entries(self) -> None:
+        source: dict[str, object] = {"keep": [1, 2], "projects": {
+            "/settings": {"hasTrustDialogAccepted": True, "keep": ["setting"]},
+            "/empty": {"hasTrustDialogAccepted": False},
+            "/other": {"hasTrustDialogAccepted": True, "keep": "other"},
+        }}
+        before = json.dumps(source)
+        result = accounts.without_trusted_folders(source, ("/settings", "/empty", "/missing"))
+        self.assertEqual(result, {"keep": [1, 2], "projects": {
+            "/settings": {"keep": ["setting"]},
+            "/other": {"hasTrustDialogAccepted": True, "keep": "other"},
+        }})
+        self.assertEqual(json.dumps(source), before)
+        self.assertIs(accounts.without_trusted_folders(result, ("/settings", "/empty")), result)
+        self.assertIs(accounts.without_trusted_folders(source, ()), source)
+        absent: dict[str, object] = {"keep": "no projects"}
+        self.assertIs(accounts.without_trusted_folders(absent, ("/missing",)), absent)
+
+    def test_folder_trust_reports_a_failed_home_and_continues_on_set_and_clear(self) -> None:
+        paths = self.write_trust_fixture()
+        folder = self.home / "clone"
+        read = Path.read_bytes
+
+        def unreadable(path: Path) -> bytes:
+            if path == paths[1]:
+                raise PermissionError("fixture unreadable")
+            return read(path)
+
+        for trusted in (True, False):
+            with self.subTest(trusted=trusted):
+                errors = io.StringIO()
+                output = io.StringIO()
+                with (patch.object(Path, "read_bytes", new=unreadable),
+                      redirect_stderr(errors), redirect_stdout(output)):
+                    accounts.set_claude_folder_trust(folder, trusted=trusted)
+                self.assertEqual(output.getvalue(), "")
+                self.assertEqual(len(errors.getvalue().splitlines()), 1)
+                self.assertTrue(errors.getvalue().startswith("accounts: anomaly:"))
+                for path in (paths[0], paths[2]):
+                    projects = cast(dict[str, object], accounts.read_json_object(path)["projects"])
+                    self.assertEqual(str(folder.resolve()) in projects, trusted)
+                    self.assertEqual(path.stat().st_mode & 0o777, 0o640)
+
+    def test_folder_trust_skips_missing_files_without_output_or_file_creation(self) -> None:
+        paths = self.write_trust_fixture()
+        for path in paths:
+            path.unlink()
+        errors = io.StringIO()
+        output = io.StringIO()
+        with redirect_stderr(errors), redirect_stdout(output):
+            self.assertFalse(accounts.source_has_claude_trust(self.home / "source"))
+            accounts.set_claude_folder_trust(self.home / "clone", trusted=True)
+            accounts.set_claude_folder_trust(self.home / "clone", trusted=False)
+        self.assertEqual((errors.getvalue(), output.getvalue()), ("", ""))
+        self.assertTrue(all(not path.exists() for path in paths))
+        self.assertTrue(all(not path.with_name(path.name + ".lock").exists() for path in paths))
+
     def test_new_account_seed_uses_trusted_folders_from_configuration_at_use(self) -> None:
         write_account_settings(self.trust_config, folders=("~/configured root",))
         _ = (self.home / ".claude.json").write_text('{"hasCompletedOnboarding": true}')

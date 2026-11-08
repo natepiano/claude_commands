@@ -894,6 +894,33 @@ def with_trusted_folders(source: dict[str, object], folders: tuple[str, ...]) ->
     return {**source, "projects": projects}
 
 
+def without_trusted_folders(source: dict[str, object], folders: tuple[str, ...]) -> dict[str, object]:
+    """Remove only the selected projects' trust bits. Preserve all other settings."""
+    if not folders:
+        return source
+    raw_projects = source.get("projects", {})
+    if not isinstance(raw_projects, dict):
+        raise ValueError("projects must be an object")
+    projects = dict(cast(dict[str, object], raw_projects))
+    changed = False
+    for folder in folders:
+        if folder not in projects:
+            continue
+        raw_project = projects[folder]
+        if not isinstance(raw_project, dict):
+            raise ValueError("configured trust project must be an object")
+        project = cast(dict[str, object], raw_project)
+        if "hasTrustDialogAccepted" not in project:
+            continue
+        remaining = {key: value for key, value in project.items() if key != "hasTrustDialogAccepted"}
+        if remaining:
+            projects[folder] = remaining
+        else:
+            del projects[folder]
+        changed = True
+    return {**source, "projects": projects} if changed else source
+
+
 @contextmanager
 def _account_home_lock(home: Path) -> Generator[None]:
     """Serialize account-file publication with setup's directory flock."""
@@ -930,13 +957,14 @@ def claude_config_lock(path: Path) -> Generator[None]:
         yield
 
 
-def _trust_file(home: Path, path: Path, configuration: TrustConfiguration) -> bool:
+def _change_trust_file(home: Path, path: Path,
+                       change: Callable[[dict[str, object]], dict[str, object]]) -> bool:
     with _account_home_lock(home), claude_config_lock(path):
         while True:
             before_mode = stat.S_IMODE(path.stat().st_mode)
             before = path.read_bytes()
             original = read_json_object(io.StringIO(before.decode("utf-8")))
-            updated = with_trusted_folders(original, configuration.folders)
+            updated = change(original)
             if updated == original:
                 return False
             published = json.dumps(updated, indent=2, ensure_ascii=False) + "\n"
@@ -950,19 +978,76 @@ def _trust_file(home: Path, path: Path, configuration: TrustConfiguration) -> bo
                 # Preserve changes from writers that do not use the lock.
 
 
+def _trust_file(home: Path, path: Path, configuration: TrustConfiguration) -> bool:
+    return _change_trust_file(home, path, lambda source: with_trusted_folders(source, configuration.folders))
+
+
+@dataclass(frozen=True)
+class AccountTrustFile:
+    """The trust file and account home used for locked publication."""
+
+    label: str
+    home: Path
+    path: Path
+
+
+def _account_trust_files() -> list[AccountTrustFile]:
+    homes = [NamedAccount("~/.claude", main_config_dir()), *_existing_named_accounts()]
+    return [AccountTrustFile(home.label, home.dir,
+                            accounts_home() / ".claude.json" if home.dir == main_config_dir()
+                            else home.dir / ".claude.json") for home in homes]
+
+
+def source_has_claude_trust(source: Path) -> bool:
+    """Return whether any account trusts the source through the shared Claude trust check."""
+    from scripts.herdr import herdr
+
+    try:
+        files = _account_trust_files()
+    except (OSError, ValueError) as error:
+        print(f"accounts: anomaly: cannot list trust files ({type(error).__name__})", file=sys.stderr)
+        return False
+    for account_file in files:
+        try:
+            if isinstance(herdr.claude_trust(source, account_file.path), herdr.Trusted):
+                return True
+        except FileNotFoundError:
+            continue
+        except (OSError, ValueError) as error:
+            print(f"accounts: anomaly: {account_file.path}: cannot check trust ({type(error).__name__})", file=sys.stderr)
+    return False
+
+
+def set_claude_folder_trust(folder: Path, *, trusted: bool) -> None:
+    """Set or clear folder trust in every existing account file. Report each failed home independently."""
+    try:
+        key = str(folder.resolve())
+        files = _account_trust_files()
+    except (OSError, ValueError) as error:
+        print(f"accounts: anomaly: cannot prepare folder trust ({type(error).__name__})", file=sys.stderr)
+        return
+    change = with_trusted_folders if trusted else without_trusted_folders
+    for account_file in files:
+        try:
+            _ = account_file.path.stat()
+            _ = _change_trust_file(account_file.home, account_file.path, lambda source: change(source, (key,)))
+        except FileNotFoundError:
+            continue
+        except (OSError, ValueError) as error:
+            print(f"accounts: anomaly: {account_file.path}: cannot change trust ({type(error).__name__})", file=sys.stderr)
+
+
 def trust_accounts() -> int:
     """Apply configured trust to each home independently without inspecting identity."""
     configuration = trust_configuration()
-    homes = [NamedAccount("~/.claude", main_config_dir()), *_existing_named_accounts()]
     failures = False
-    for home in homes:
-        path = accounts_home() / ".claude.json" if home.dir == main_config_dir() else home.dir / ".claude.json"
+    for account_file in _account_trust_files():
         try:
-            changed = _trust_file(home.dir, path, configuration)
+            changed = _trust_file(account_file.home, account_file.path, configuration)
             state = "updated" if changed else "unchanged"
-            print(f"{home.label}: trust {state}")
+            print(f"{account_file.label}: trust {state}")
         except (OSError, ValueError) as error:
-            print(f"{home.label}: trust failed: {error}", file=sys.stderr)
+            print(f"{account_file.label}: trust failed: {error}", file=sys.stderr)
             failures = True
     return int(failures)
 

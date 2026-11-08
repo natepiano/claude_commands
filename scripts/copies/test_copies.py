@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 from collections.abc import Mapping
-from contextlib import ExitStack, redirect_stderr, redirect_stdout
+from contextlib import ExitStack, nullcontext, redirect_stderr, redirect_stdout
 import io
 import json
 import os
@@ -20,7 +20,10 @@ from typing import TextIO, cast, override
 from unittest import mock
 
 from scripts.copies import copies
+from scripts.accounts import accounts
 from scripts.lib import copy_record, scratch
+from scripts.lint import folder_audit, tmp_sweep
+from scripts.mac_test import floor_claims
 from scripts.lib.cargo_output_test_support import fake_cargo_output_roots
 from scripts.message import sessions
 from scripts.production.cli_fixture import ImmutableGitSeed, invoke_cli
@@ -343,6 +346,203 @@ class StandingTests(unittest.TestCase):
         self.assertEqual(scratch.end("gate:camera"), [checkout.parent])
         self.assertFalse(checkout.parent.exists())
         self.assertEqual((self.source / "tracked.txt").read_text(), "source HEAD\n")
+
+    def clone_trust_files(self, trusted_homes: tuple[int, ...] = (0, 1, 2)) -> tuple[Path, ...]:
+        home = Path.home()
+        (home / ".claude").mkdir(exist_ok=True)
+        paths = [home / ".claude.json"]
+        for number in (1, 2):
+            account = home / f".claude{number}"
+            account.mkdir(exist_ok=True)
+            paths.append(account / ".claude.json")
+        for index, path in enumerate(paths):
+            _ = path.write_text(json.dumps({"keep": [1, 2], "projects": {
+                str(self.source.resolve()): {"hasTrustDialogAccepted": index in trusted_homes, "keep": "source"},
+                "/other": {"hasTrustDialogAccepted": False, "keep": [index, {"nested": True}]},
+            }}))
+            path.chmod(0o640)
+        return tuple(paths)
+
+    def trust_projects(self, path: Path) -> dict[str, dict[str, object]]:
+        return cast(dict[str, dict[str, object]], accounts.read_json_object(path)["projects"])
+
+    def assert_clone_trust(self, checkout: Path, paths: tuple[Path, ...]) -> None:
+        key = str(checkout.resolve())
+        record = scratch.task_of(checkout.parent)
+        assert isinstance(record, copy_record.Registered)
+        self.assertEqual(record.fields["claude_trust_folder"], key)
+        for path in paths:
+            self.assertEqual(self.trust_projects(path)[key], {"hasTrustDialogAccepted": True})
+
+    def test_clone_inherits_trust_in_every_home_and_preserves_other_values(self) -> None:
+        paths = self.clone_trust_files()
+        before = {path: accounts.read_json_object(path) for path in paths}
+        checkout = copies.clone(self.source, "gate:trusted")
+        self.assert_clone_trust(checkout, paths)
+        for path in paths:
+            after = accounts.read_json_object(path)
+            projects = self.trust_projects(path)
+            del projects[str(checkout.resolve())]
+            self.assertEqual(projects, before[path]["projects"])
+            self.assertEqual(after["keep"], before[path]["keep"])
+            self.assertEqual(path.stat().st_mode & 0o777, 0o640)
+
+    def test_clone_trusted_in_only_one_home_gains_trust_in_every_home(self) -> None:
+        for index in range(3):
+            with self.subTest(home=index):
+                paths = self.clone_trust_files((index,))
+                checkout = copies.clone(self.source, f"gate:trusted-{index}")
+                self.assert_clone_trust(checkout, paths)
+
+    def test_clone_of_an_untrusted_source_changes_no_account_file(self) -> None:
+        paths = self.clone_trust_files(())
+        before = {path: path.read_bytes() for path in paths}
+        checkout = copies.clone(self.source, "gate:untrusted")
+        record = scratch.task_of(checkout.parent)
+        assert isinstance(record, copy_record.Registered)
+        self.assertNotIn("claude_trust_folder", record.fields)
+        self.assertEqual({path: path.read_bytes() for path in paths}, before)
+
+    def test_clone_uses_the_main_checkout_trust_for_a_linked_source(self) -> None:
+        paths = self.clone_trust_files((2,))
+        linked = self.base / "linked-source"
+        _ = self.git(self.source, "worktree", "add", "--detach", str(linked), "HEAD")
+        checkout = copies.clone(linked, "gate:linked-trust")
+        self.assert_clone_trust(checkout, paths)
+
+    def test_clone_skips_a_home_without_a_trust_file(self) -> None:
+        paths = self.clone_trust_files((0,))
+        paths[2].unlink()
+        errors = io.StringIO()
+        with redirect_stderr(errors):
+            checkout = copies.clone(self.source, "gate:missing-trust")
+        self.assert_clone_trust(checkout, paths[:2])
+        self.assertFalse(paths[2].exists())
+        self.assertEqual(list(paths[2].parent.iterdir()), [])
+        self.assertEqual(errors.getvalue(), "")
+
+    def test_clone_reports_one_bad_home_and_updates_other_homes(self) -> None:
+        paths = self.clone_trust_files((1,))
+        _ = paths[0].write_text("{bad JSON")
+        errors = io.StringIO()
+        with redirect_stderr(errors):
+            checkout = copies.clone(self.source, "gate:bad-trust")
+        self.assert_clone_trust(checkout, paths[1:])
+        self.assertEqual(paths[0].read_text(), "{bad JSON")
+        self.assertEqual(len(errors.getvalue().splitlines()), 1)
+        self.assertTrue(errors.getvalue().startswith("accounts: anomaly:"))
+
+    def add_clone_project_settings(self, checkout: Path, paths: tuple[Path, ...]) -> None:
+        for path in paths:
+            document = accounts.read_json_object(path)
+            projects = cast(dict[str, dict[str, object]], document["projects"])
+            projects[str(checkout.resolve())]["keep"] = ["clone setting"]
+            _ = path.write_text(json.dumps(document))
+
+    def assert_clone_trust_removed(self, checkout: Path, paths: tuple[Path, ...]) -> None:
+        for path in paths:
+            projects = self.trust_projects(path)
+            self.assertEqual(projects[str(checkout.resolve())], {"keep": ["clone setting"]})
+            self.assertIn("/other", projects)
+            self.assertIn(str(self.source.resolve()), projects)
+
+    def test_copies_removal_clears_clone_trust_before_deleting_the_folder(self) -> None:
+        paths = self.clone_trust_files()
+        checkout = copies.clone(self.source, "gate:remove-trust")
+        self.add_clone_project_settings(checkout, paths)
+        copies.mark_mirror(checkout, "clone-owner", "hana", "fixture")
+        remove = scratch.remove
+
+        def delete(folder: Path) -> None:
+            self.assertTrue(scratch.removal_mark(folder).exists())
+            self.assert_clone_trust_removed(checkout, paths)
+            remove(folder)
+
+        processes = copies.MirrorProcessScan(tmp_sweep.ProcessUsesKnown([]), frozenset())
+        with (mock.patch.object(copies, "scan_mirror_processes", return_value=processes),
+              mock.patch.object(copies, "mirror_metadata_locks",
+                                return_value=nullcontext(floor_claims.LockedClaims(frozenset()))),
+              mock.patch.object(scratch, "remove", side_effect=delete)):
+            result = self.cli("mirror-remove", "--path", str(checkout), "--owner", "clone-owner",
+                              "--repository", "hana", "--session", "fixture")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(checkout.parent.exists())
+        self.assert_clone_trust_removed(checkout, paths)
+
+    def test_temporary_sweep_clears_clone_trust(self) -> None:
+        paths = self.clone_trust_files()
+        checkout = copies.clone(self.source, "gate:sweep-trust")
+        self.add_clone_project_settings(checkout, paths)
+        entry = tmp_sweep.RemovableEntry(str(checkout.parent), str(checkout.parent.parent), time.time(), 1)
+        self.assertTrue(tmp_sweep.remove_entry(entry, tmp_sweep.Sweep(), False))
+        self.assertFalse(checkout.parent.exists())
+        self.assert_clone_trust_removed(checkout, paths)
+
+    def test_folder_audit_clears_clone_trust(self) -> None:
+        paths = self.clone_trust_files()
+        checkout = copies.clone(self.source, "gate:audit-trust")
+        self.add_clone_project_settings(checkout, paths)
+        self.assertEqual(folder_audit.remove(checkout.parent, time.time(), time.time()), folder_audit.REMOVED)
+        self.assertFalse(checkout.parent.exists())
+        self.assert_clone_trust_removed(checkout, paths)
+
+    def test_task_end_clears_clone_trust(self) -> None:
+        paths = self.clone_trust_files()
+        checkout = copies.clone(self.source, "gate:end-trust")
+        self.add_clone_project_settings(checkout, paths)
+        self.assertEqual(scratch.end("gate:end-trust"), [checkout.parent])
+        self.assert_clone_trust_removed(checkout, paths)
+
+    def test_removal_retries_with_only_the_external_mark_and_changes_no_account_file(self) -> None:
+        paths = self.clone_trust_files()
+        checkout = copies.clone(self.source, "gate:retry-trust")
+        self.add_clone_project_settings(checkout, paths)
+
+        def stopped(folder: Path) -> None:
+            (folder / copy_record.RECORD).unlink()
+            raise OSError("stopped removal")
+
+        with self.assertRaisesRegex(OSError, "stopped removal"):
+            scratch.remove_marked(checkout.parent, stopped)
+        self.assertTrue(scratch.removal_mark(checkout.parent).exists())
+        self.assert_clone_trust_removed(checkout, paths)
+        before = {path: (path.read_bytes(), path.stat().st_ino, path.stat().st_mtime_ns) for path in paths}
+        scratch.remove_marked(checkout.parent, scratch.remove)
+        self.assertFalse(checkout.parent.exists())
+        self.assertFalse(scratch.removal_mark(checkout.parent).exists())
+        self.assertEqual({path: (path.read_bytes(), path.stat().st_ino, path.stat().st_mtime_ns) for path in paths}, before)
+
+    def test_clone_records_the_trust_key_before_writing_account_files(self) -> None:
+        paths = self.clone_trust_files()
+        before = {path: path.read_bytes() for path in paths}
+        with mock.patch.object(accounts, "set_claude_folder_trust", side_effect=KeyboardInterrupt):
+            with self.assertRaises(KeyboardInterrupt):
+                _ = copies.clone(self.source, "gate:stop-before-trust")
+        folder = next(folder.path for folder in scratch.folders() if folder.task == "gate:stop-before-trust")
+        record = scratch.task_of(folder)
+        assert isinstance(record, copy_record.Registered)
+        self.assertEqual(record.fields["claude_trust_folder"], str((folder / "checkout").resolve()))
+        self.assertEqual(scratch.end("gate:stop-before-trust"), [folder])
+        self.assertEqual({path: path.read_bytes() for path in paths}, before)
+
+    def test_removal_without_a_recorded_trust_key_keeps_account_trust(self) -> None:
+        paths = self.clone_trust_files(())
+        checkout = copies.clone(self.source, "gate:no-trust-field")
+        accounts.set_claude_folder_trust(checkout, trusted=True)
+        before = {path: path.read_bytes() for path in paths}
+        self.assertEqual(scratch.end("gate:no-trust-field"), [checkout.parent])
+        self.assertEqual({path: path.read_bytes() for path in paths}, before)
+
+    def test_clone_trust_key_survives_task_transfer_and_renewal(self) -> None:
+        paths = self.clone_trust_files()
+        checkout = copies.clone(self.source, "gate:original")
+        scratch.hand_over(checkout.parent, "next-unit", "gate:transferred")
+        scratch.renew(checkout.parent)
+        self.assert_clone_trust(checkout, paths)
+        record = scratch.task_of(checkout.parent)
+        assert isinstance(record, copy_record.Registered)
+        fields = scratch.fields_for_task(record.fields, "gate:another")
+        self.assertEqual(fields["claude_trust_folder"], str(checkout.resolve()))
 
     def shared_source_commit(self) -> tuple[Path, str]:
         source = self.base / "shared-source"
