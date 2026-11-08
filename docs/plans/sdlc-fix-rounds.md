@@ -417,3 +417,12 @@ From the user, through natest and the sdlc showrunner, 2026-11-07 (the user's wo
 Places: the FixDispatch regression-test sentence ("writes, for each testable finding, the regression test that would have caught it"), the test rules line in `write_prompt_contract.md`, and the test worker prompt. Each rule has one place; the other places point to it. This phase is doc-only.
 
 As built: both rules are in `docs/direct/write_prompt_contract.md` item 6, which implementation, fix and test prompts carry verbatim. FixDispatch, the main-read closure check and `<ClosureReview/>` ask for coverage under item 6, not one new regression test for each finding. The test worker paragraph points to item 6.
+
+### Phase 10f — A checkpoint named for its plan without "-plan" gets its Producer  · status: done
+**Depends on:** Phase 10d
+
+From hana's showrunner, through sdlc, 2026-11-07. `change_review.py list-ready` printed `no staff row for unit info-panels; Producer stays empty` for demo's rows. demo's plan is `docs/hana/info-panels-plan.md`, its branch is `tool-based-ui-demo-36`, and it commits `checkpoint(info-panels): …`. The checkpoint aliases hold the plan stem (`info-panels-plan`), not the stem without `-plan`. Hana's main uses both forms for one plan: `info-panels-plan` and `info-panels`, `widget-enhancements-plan` and `widget-enhancements`.
+
+Fix: the checkpoint aliases of a unit also hold its plan stem without a trailing `-plan`. Add no new check.
+
+As built: `_branches_from_units` adds `plan.removesuffix("-plan")` right after the plan stem, so `checkpoint(info-panels)` resolves to demo.

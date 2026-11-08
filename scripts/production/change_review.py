@@ -993,7 +993,8 @@ def _branches_from_units(pairs: Iterable[tuple[Path, staff.StaffRow]],
             config = unit_config.ConfigMissing(str(error))
         plan = (config.plan.path.stem if isinstance(config, unit_config.UnitConfig)
                 and isinstance(config.plan, unit_config.PlanFile) else "")
-        aliases.append((source, (plan, source.name, worktree.name if isinstance(worktree, Path) else "")))
+        aliases.append((source, (plan, plan.removesuffix("-plan"), source.name,
+                                 worktree.name if isinstance(worktree, Path) else "")))
     for source, names in aliases:
         for name in names:
             if name:

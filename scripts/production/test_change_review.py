@@ -298,7 +298,7 @@ class ProducerWriterTests(ProducerFixture):
     def test_publication_keeps_the_scoped_alias_when_another_production_has_it(self) -> None:
         other = self.unrelated_unit(plan="old-plan.md")
         _ = self.git("checkout", "-b", "checkpoints")
-        for name in ("external-branch", "old-plan"):
+        for name in ("external-branch", "old-plan", "old"):
             _ = self.git("commit", "--allow-empty", "-m",
                          f"checkpoint({name}): change\n\nChange-Review: {name} | Read | Proof")
         _ = self.git("checkout", "main")
@@ -308,10 +308,11 @@ class ProducerWriterTests(ProducerFixture):
                                 unit_lookup.doc_owner(self.doc, staff.snapshot()))
         merge_checkpoint.record_publication_changes(production)
         rows = change_review.pending(self.listing)
-        self.assertEqual([row["Producer"] for row in rows], [other.id, self.unit.id])
+        self.assertEqual([row["Producer"] for row in rows], [other.id, self.unit.id, self.unit.id])
         assert isinstance(other.parent, staff.ReportsTo)
         assert isinstance(self.unit.parent, staff.ReportsTo)
-        self.assertEqual([row["Production"] for row in rows], [other.parent.id, self.unit.parent.id])
+        self.assertEqual([row["Production"] for row in rows],
+                         [other.parent.id, self.unit.parent.id, self.unit.parent.id])
 
     def test_a_checkpoint_with_an_unmatched_branch_pattern_keeps_the_row_values_aligned(self) -> None:
         _ = self.git("checkout", "-b", "old-branch")
