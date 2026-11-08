@@ -1727,49 +1727,23 @@ The style ledger ticket and finding tests use 49% less CPU, with all tests kept.
 - The per-test cost is in `LedgerTestCase.setUp`, which six modules share. Phase 90 moves the seed there and removes the two module copies.
 - A text replace of paths misses a JSON-escaped path. Phase 90 decodes the JSON to rewrite them.
 
-### Phase 86 — We know which tests to remove, merge or move to streamline the suite  · status: todo
-**Depends on:** none
+### Phase 86 — We know which tests to remove, merge or move to streamline the suite  · status: done
 
-#### Work Order
+#### As-built
 
-**Source:** the user, 2026-11-07: "18,800 seems excessive for the amount of actual code we have", then "yes i want you to evalutae how we can streamline our testing". The gate runs 733 modules and 18,777 test methods. The test code is about 1.5 times the size of the production code.
-
-**Goal:** a ranked report says which tests to remove, merge or move, with the test count and the CPU each action saves. The suite changes in later phases, not in this one.
-
-**Spec:**
-1. Change no test and no production file. Write only the report files below.
-2. For each module in your folders, read the tests and sort each one that can go into one class:
-   - **Retired:** it tests code that is gone or retiring (for example `agents/codex_mesh.py`).
-   - **Trivial:** it asserts a constant, the standard library, a configured mock, or only that a thing exists (Invariants).
-   - **Repeat:** another test in the same module checks the same result from the same setup.
-   - **Cross-module repeat:** another module checks the same behavior through another entry point. Name the test that stays.
-   - **Table:** several tests have the same body and differ only in input. They become one table test with `subTest`, which keeps every case and pays the setup once.
-   - **Wording:** it pins message text and no behavior. List these separately; the user decides on them.
-3. Use `python3 scripts/test_times/coverage_overlap.py scripts/<folder> <file>` only for modules with 100 or more tests or 20 or more CPU s per gate. Run it as one detached run per folder, one at a time: natedev is shared.
-4. Read CPU per gate with `python3 scripts/test_times/show.py top --limit 800` and test times with `show.py module <folder>/<file>`.
-5. For each candidate, name the test that keeps the behavior, or the reason no test needs to keep it. A test with no covering test and a real behavior stays.
-6. Rank the actions by CPU s saved per gate, then by tests removed. For each folder, give the test count before and after, and the owner unit from the production doc.
-7. Name the patterns that make the suite grow (for example one test per error message, one test per config key), and one rule for each that stops the growth. A rule is a proposal for the user, not a new check.
+- Two reports sort every test module under `scripts/` into Retired, Trivial, Repeat, Cross-module repeat, Table and Wording candidates. They change no test.
+- Report A covers `production`, `direct`, `agents`, `lint`, `message`, `hooks` and `lib`: 433 modules and 8,320 test methods. It has no safe deletion, 309 Table candidates in 127 groups, 3 Wording candidates and 736 conditional Retired candidates (`agents/test_codex_mesh.py`).
+- Report B covers every other folder: 300 modules and 10,453 test methods. Its Table merges remove an estimated 307 methods and keep every input case.
+- Both reports credit CPU savings only to the codex_mesh retirement. Every Table merge credits 0 CPU s per gate.
+- Each report ends with growth patterns and one proposed rule for each. The user approved rules 1 and 2 on 2026-11-07.
 
 **Files:**
-- `docs/plans/builds-natest-streamline-a.md` — the report for `production`, `direct`, `agents`, `lint`, `message`, `hooks`, `lib`
-- `docs/plans/builds-natest-streamline-b.md` — the report for every other folder under `scripts/`
+- `docs/plans/builds-natest-streamline-a.md` — report A
+- `docs/plans/builds-natest-streamline-b.md` — report B
 
-**Workers:** 2 writers; split by folder
-- `eval1` — `docs/plans/builds-natest-streamline-a.md`, role impl
-- `eval2` — `docs/plans/builds-natest-streamline-b.md`, role impl
+**Gotchas:** a Table candidate is not proof of one body shape. A sample of ten groups found 9 of 10 in report A and 5 of 10 in report B with one shape. Check each group body before a merge.
 
-**Constraints from prior phases:**
-- Phase 13: five modules whose time is in process starts held no repeat. Spend the reading on modules with many tests.
-- Phase 89 holds `direct/test_assign_launcher.py` and `direct/assign_launcher_test_support.py`. Phase 88 holds `production/test_fast_track.py`, `production/test_staff.py`, `production/test_add_unit.py` and `production/staff_test_support.py`. Report candidates in them, and mark them as held.
-- Phase 90: the six `LedgerTestCase` modules now seed staff once per class (109.0 to 78.3 CPU s). They are no longer held; report their remaining candidates.
-- Phase 87 removed rare-case tests from `production/test_fast_track.py` and `production/test_staff.py`. Reconcile each candidate in those modules against that removal.
-- Tests never read or write live state: `~/.claude` main, `~/.local/state/merge-gate`, `/tmp/claude`.
-
-**Acceptance gate:**
-- Each report covers every module in its folders, with a count by class.
-- Each candidate names its covering test or its reason.
-- The director checks ten candidates from each report against the code.
+**Ruled out:** a Table-merge cleanup phase, because the merges save no CPU.
 
 ### Phase 87 — The three costliest production modules keep only the rare-case tests that matter  · status: done
 **Depends on:** none
