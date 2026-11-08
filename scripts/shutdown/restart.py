@@ -16,6 +16,7 @@ from collections.abc import Iterable
 from contextlib import redirect_stderr, redirect_stdout
 from concurrent.futures import ThreadPoolExecutor
 from contextvars import copy_context
+from threading import Event
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
@@ -626,17 +627,24 @@ def restart(*, stop_all: bool = False, dry_run: bool = False, only: tuple[str, .
     selected_sessions = {str(row.current_session) for row in selected} if stop_all else set[str]()
     pre_stop_codex = observed.codex
     unconfirmed: set[staff.StaffId] = set()
-    def stop_holder(holder: staff.StaffRow) -> bool:
-        with staff.row_operation(str(holder.id)):
-            shutdown_record.update(started=[], pending=members_by_holder[holder.id])
-            if worker_scope is WorkerRestartScope.FOLLOW_OWNER and holder.kind in ("unit", "showrunner"):
-                _ = stop_resume.stop_unit_workers(holder.id, record, codex=observed.codex, runs=observed.runs)
-            return stop_row(holder, client, codex=observed.codex, runs=observed.runs)
+    def stop_holder(holder: staff.StaffRow, previous: Event, recorded: Event) -> bool:
+        _ = previous.wait()
+        try:
+            with staff.row_operation(str(holder.id)):
+                shutdown_record.update(started=[], pending=members_by_holder[holder.id])
+                recorded.set()
+                if worker_scope is WorkerRestartScope.FOLLOW_OWNER and holder.kind in ("unit", "showrunner"):
+                    _ = stop_resume.stop_unit_workers(holder.id, record, codex=observed.codex, runs=observed.runs)
+                return stop_row(holder, client, codex=observed.codex, runs=observed.runs)
+        finally:
+            recorded.set()
 
     if stop_all and holders:
+        recorded = [Event() for _ in range(len(holders) + 1)]
+        recorded[0].set()
         with ThreadPoolExecutor(max_workers=min(16, len(holders))) as pool:
-            futures = [(holder, pool.submit(copy_context().run, stop_holder, holder))
-                       for holder in tuple(holders.values())]
+            futures = [(holder, pool.submit(copy_context().run, stop_holder, holder, recorded[index], recorded[index + 1]))
+                       for index, holder in enumerate(tuple(holders.values()))]
             for holder, future in futures:
                 try:
                     if not future.result():
