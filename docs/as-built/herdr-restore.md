@@ -10,7 +10,8 @@ The saved launch selects each conversation and account.
   `HERDR_PANE_ID`.
 - Each entry holds the pane's Claude launch: the account folder (`CLAUDE_CONFIG_DIR`), the cwd,
   the `-n` name, the `--model` value, whether `--remote-control` was given, the conversation id
-  at that start, and the `SHOWRUNNER_*`, `ENABLE_TOOL_SEARCH` and probe marks. No credential
+  at that start (the fixed staff id for a staff member), and the `ENABLE_TOOL_SEARCH` and probe
+  marks. It saves no staff labels: a launch computes them from staff. No credential
   enters it: a resume rebuilds the account variables from the account folder.
 - `scripts/hooks/session-start-pane-record.py` writes the entry at SessionStart
   (startup, resume, clear, compact) from its own Claude process: the environment it inherits, and
