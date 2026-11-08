@@ -46,7 +46,6 @@ from scripts.lib import test_hang_guard
 if TYPE_CHECKING:
     from scripts.copies import copies
     from scripts.production.cli_fixture import ImmutableGitSeed
-    from scripts.build_hold import build_hold
     from scripts.buildlog import record, store
     from scripts.lib import scratch
     from scripts.message import process_table, sessions
@@ -56,7 +55,6 @@ if TYPE_CHECKING:
 else:
     from scripts.copies import copies
     from scripts.production.cli_fixture import ImmutableGitSeed
-    from scripts.build_hold import build_hold
     from scripts.buildlog import record
     from scripts.lib import scratch
     from scripts.buildlog import store
@@ -3374,7 +3372,6 @@ class FloorTests(SweepCase):
         }))
         create_step_index(build_index.index_path())
         _ = self.enterContext(mock.patch.object(sweep, "output_device", return_value=base.stat().st_dev))
-        _ = self.enterContext(mock.patch.object(build_hold, "live_sessions", return_value=[]))
         _ = self.enterContext(mock.patch.object(sessions, "live_sessions", return_value=[]))
         _ = self.enterContext(mock.patch.object(sweep, "process_uses", return_value={}))
         _ = write_config_fixture(conf.path("lint"),
@@ -6049,14 +6046,17 @@ class BudgetTests(unittest.TestCase):
             self.assertEqual(sweep.main([]), 0)
         reads.assert_called_once_with("lint")
 
-    def test_sweep_imports_in_a_fresh_interpreter(self) -> None:
+    def test_sweep_import_omits_unused_modules(self) -> None:
         base = Path(self.enterContext(tempfile.TemporaryDirectory()))
         environment = {**os.environ, "BUILD_HOLD_DIR": str(base / "holders"),
                        "BUILD_HOLD_RELEASE_DIR": str(base / "release"),
                        "BUILDLOG_DIR": str(base / "buildlog"),
                        "NOTIFIER_SESSIONS_DIR": str(base / "sessions"),
                        "PYTHONPATH": str(Path(__file__).resolve().parents[2])}
-        result = subprocess.run([sys.executable, "-c", "from scripts.lint import sweep"], cwd=base, env=environment,
+        omitted = ("scripts.lint.tmp_sweep", "scripts.buildlog.record", "scripts.buildlog.index")
+        command = ("import sys; from scripts.lint import sweep; "
+                   + f"assert not set({omitted!r}).intersection(sys.modules)")
+        result = subprocess.run([sys.executable, "-c", command], cwd=base, env=environment,
                                 capture_output=True, text=True, check=False, timeout=test_hang_guard.TEST_HANG_GUARD_SECS)
         self.assertEqual(result.returncode, 0, result.stderr)
 

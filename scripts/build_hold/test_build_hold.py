@@ -39,12 +39,13 @@ from scripts.lib import test_hang_guard
 
 
 class ImportTests(unittest.TestCase):
-    def test_clean_import_omits_admission_service(self) -> None:
+    def test_clean_import_omits_unused_modules(self) -> None:
+        omitted = ("scripts.build_queue.admission_service", "scripts.message.sessions")
         with tempfile.TemporaryDirectory() as directory:
             environment = {**os.environ, "HOME": directory, "BUILDLOG_DIR": directory}
             result = subprocess.run(
                 [sys.executable, "-c", "import sys; from scripts.build_hold import build_hold; "
-                 + "assert 'scripts.build_queue.admission_service' not in sys.modules"],
+                 + f"assert not set({omitted!r}).intersection(sys.modules)"],
                 cwd=Path(__file__).resolve().parents[2], env=environment,
                 capture_output=True, text=True, timeout=test_hang_guard.TEST_HANG_GUARD_SECS, check=False,
             )

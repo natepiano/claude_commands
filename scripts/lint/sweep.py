@@ -200,17 +200,14 @@ if TYPE_CHECKING:
     from scripts.copies import copies
     from scripts.lib import scratch
     from scripts.lib.atomic_file import write_text_atomic
-    from scripts.buildlog import index as build_index, record, store
+    from scripts.buildlog import record, store
     from scripts.notify.push_texts import RenderedPush
     from scripts.notify import review
 else:
     from scripts.copies import copies
-    from scripts.lint import tmp_sweep
     from scripts.lib import scratch
     from scripts.lib.atomic_file import write_text_atomic
-    from scripts.buildlog import record
     from scripts.buildlog import store
-    from scripts.buildlog import index as build_index
 
 from scripts.lib.conf import UseConfiguredValue
 from scripts.lib import copy_record
@@ -362,6 +359,8 @@ def on_floor_filesystem(path: str) -> bool:
 
 
 def cargo_output_cache_path() -> Path:
+    from scripts.lint import tmp_sweep
+
     return tmp_sweep.state_dir() / "cargo-output-roots.json"
 
 
@@ -424,6 +423,8 @@ def save_cargo_output_roots(index: CargoOutputIndex) -> None:
 def discover_cargo_outputs(roots: Sequence[str], *,
                            lint_settings: conf.ConfigRead) -> tuple[list[str], CargoOutputIndex]:
     """Map recorded step pairs first, then saved pairs. Protect every other target."""
+    from scripts.buildlog import index as build_index
+
     known_trees: dict[str, list[str]] = {}
     discovered = target_dirs(roots, lint_settings=lint_settings, known_trees=known_trees)
     recorded = recorded_output_roots(build_index.index_path(), store.host_name())
@@ -2680,6 +2681,8 @@ def floor_bytes(values: dict[str, str], host: str) -> tuple[int | None, str | No
 
 
 def floor_record_path() -> Path:
+    from scripts.lint import tmp_sweep
+
     filesystem = FLOOR_FILESYSTEM.get()
     stem = filesystem.record_stem if isinstance(filesystem, FilesystemFloor) else "floor"
     return tmp_sweep.state_dir() / f"{stem}.json"
@@ -2690,6 +2693,8 @@ def _finite_number(value: object) -> TypeGuard[int | float]:
 
 
 def target_deletes_path() -> Path:
+    from scripts.lint import tmp_sweep
+
     return tmp_sweep.state_dir() / tmp_sweep.TARGET_DELETES_NAME
 
 
@@ -3309,6 +3314,8 @@ class MacFloor:
         return False
 
     def uses(self, targets: Sequence[str]) -> dict[str, TargetUse | LockHeld]:
+        from scripts.lint import tmp_sweep
+
         result: dict[str, TargetUse | LockHeld] = {}
         paths = tmp_sweep.lsof_paths(tuple(str(Path(root).expanduser().resolve()) for root in self.roots))
         for root in targets:
@@ -3466,6 +3473,8 @@ def _hold_floor(floor: int, dry_run: bool, *,
     lint_settings: conf.ConfigRead, policy: MacFloor | NatedevFloor,
     roots: Sequence[str] = (), lock: str = "",
 ) -> FloorOutcome:
+    from scripts.lint import tmp_sweep
+
     if isinstance(policy, MacFloor):
         return _hold_floor_pass(floor, dry_run, lint_settings=lint_settings, policy=policy, roots=roots, lock=lock)
     planned_at = time.time()
@@ -3522,6 +3531,8 @@ def _hold_floor(floor: int, dry_run: bool, *,
 def notify_floor_problem(outcome: FloorOutcome | tmp_sweep.SweepAssessment, *, lint_settings: conf.ConfigRead, detail: str = "",
                          scope: SweepFailureScope = FloorFailureScope.FILESYSTEM) -> None:
     """Finalize delivery and state before an acquired floor lock closes."""
+    from scripts.lint import tmp_sweep
+
     assessment = outcome.assessment if isinstance(outcome, FloorOutcome) else outcome
     if isinstance(assessment, tmp_sweep.SkippedSweepAssessment):
         return
@@ -3609,6 +3620,9 @@ def _hold_floor_pass(floor: int, dry_run: bool, *,
     planned_at: float | UseConfiguredValue = UseConfiguredValue.CURRENT,
 ) -> FloorOutcome:
     """Below the floor, take the shortfall from the least used idle targets."""
+    from scripts.lint import tmp_sweep
+    from scripts.buildlog import record
+
     guard: int | None = None
     outcome = FloorOutcome(tmp_sweep.SkippedSweepAssessment())
     protected: tuple[tuple[str, int], ...] = ()
@@ -4065,6 +4079,8 @@ def parse_sweep_removals(rows: Iterable[dict[str, object]]) -> list[SweepRemoval
 def record_sweep_removal(target: str, cause: Literal["budget take", "floor take"],
                          bytes_freed: int, extent: Literal["whole", "partial"], at: float) -> bool:
     """One build-log row per target take, including when stdout is discarded."""
+    from scripts.buildlog import record
+
     try:
         record.sweep_trim(os.path.abspath(target), bytes_freed, extent, cause, at)
     except OSError as error:
@@ -4294,6 +4310,8 @@ def rebuilds_main(argv: list[str]) -> int:
 
 
 def main(argv: list[str]) -> int:
+    from scripts.lint import tmp_sweep
+
     if argv and argv[0] == "rebuilds":
         return rebuilds_main(argv[1:])
     dry_run = False
@@ -4363,6 +4381,8 @@ def main(argv: list[str]) -> int:
 def report_assessment(run: Callable[[], tmp_sweep.SweepAssessment], scope: SweepFailureScope,
                       dry_run: bool, lint_settings: conf.ConfigRead) -> int:
     """Assess one scope and report its failure episode."""
+    from scripts.lint import tmp_sweep
+
     detail = ""
     try:
         assessment = run()
@@ -4403,6 +4423,8 @@ def _sweep_workspace(roots: list[str], budget_config: conf.ConfigRead, dry_run: 
                     recent_minutes: float, *,
                     lint_settings: conf.ConfigRead) -> tmp_sweep.SweepAssessment:
     """Sweep the resolved output roots to their budget."""
+    from scripts.lint import tmp_sweep
+
     if not roots:
         print("lint sweep: no target directory to sweep")
         return tmp_sweep.SkippedSweepAssessment()
