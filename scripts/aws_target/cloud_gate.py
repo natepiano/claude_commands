@@ -235,17 +235,22 @@ class GateWorker:
                 arguments = ledger.mapping(launch['arguments'])
             else:
                 lifetime = max(1, (ledger.instant(request, 'expires') - int(self.clock()) + 59) // 60)
-                prefix = ledger.text(deployment, 'artifact_prefix') + '__INSTANCE_ID__/' + ledger.text(request, 'attempt')
+                prefix = 'artifacts/' + ledger.text(request, 'attempt')
                 links = {key: ledger.text(request, key) for key in ('attempt', 'commit', 'tree', 'mode', 'origin')}
-                bucket = 's3://' + ledger.text(deployment, 'bucket')
+                credentials = self.api.call('export-credentials', '--format', 'process', service='configure')
+                signing = gate_box.SigningKey(ledger.text(credentials, 'AccessKeyId'), ledger.text(credentials, 'SecretAccessKey'),
+                    ledger.text(credentials, 'SessionToken') if 'SessionToken' in credentials else '')
+                at = int(self.clock())
+                def url(method: str, key: str) -> str:
+                    return gate_box.presign(method, ledger.text(deployment, 'bucket') + '.s3.' + self.api.region + '.amazonaws.com',
+                        key, self.api.region, signing, datetime.fromtimestamp(at, UTC), max(1, ledger.instant(request, 'expires') - at))
                 links.update(production='true', step='size', expires=str(request['expires']),
-                             region=self.api.region,
-                             guest=bucket + '/requests/' + ledger.text(request, 'attempt') + '.guest.py',
-                             request=bucket + '/requests/' + ledger.text(request, 'attempt') + '.json',
-                             log='s3://' + ledger.text(deployment, 'bucket') + '/' + prefix + '/gate.log',
-                             result='s3://' + ledger.text(deployment, 'bucket') + '/' + prefix + '/result.json')
+                             guest=url('GET', 'requests/' + ledger.text(request, 'attempt') + '.guest.py'),
+                             request=url('GET', 'requests/' + ledger.text(request, 'attempt') + '.json'),
+                             log=url('PUT', prefix + '/gate.log'), result=url('PUT', prefix + '/result.json'),
+                             boot_error=url('PUT', prefix + '/boot-error.json'))
                 if request['source_key']:
-                    links['source'] = bucket + '/' + ledger.text(request, 'source_key')
+                    links['source'] = url('GET', ledger.text(request, 'source_key'))
                 policy = read_settings(self.settings_path)
                 tags = [{'Key': 'GateDeployment', 'Value': ledger.text(deployment, 'deployment_id')},
                         {'Key': 'Workload', 'Value': 'cloud-claude-gate'}, {'Key': 'Name', 'Value': 'cloud-claude-gate'}, {'Key': 'GateAttempt', 'Value': ledger.text(request, 'attempt')},
@@ -335,7 +340,7 @@ class GateWorker:
             if isinstance(launched, LocalFallback):
                 return {'status': 'fallback', 'reason': launched.reason}
             instance = launched
-            prefix = ledger.text(deployment, 'artifact_prefix') + instance + '/' + attempt
+            prefix = 'artifacts/' + attempt
             try:
                 arguments = ledger.mapping(read(folder / 'launch.json')['arguments'])
                 self.size_vcpus = int(ledger.text(arguments, 'InstanceType').split('.')[1].removesuffix('xlarge')) * 4
@@ -344,6 +349,8 @@ class GateWorker:
                     bucket = ledger.text(deployment, 'bucket')
                     if self.download(bucket, prefix + '/gate.log', folder / 'gate.log'):
                         self.publish_log(folder)
+                    if self.download(bucket, prefix + '/boot-error.json', folder / 'boot-error.json'):
+                        raise ValueError(ledger.text(read(folder / 'boot-error.json'), 'error'))
                     if self.download(bucket, prefix + '/result.json', folder / 'remote-result.json'):
                         if not self.download(bucket, prefix + '/gate.log', folder / 'gate.log'):
                             raise ValueError('The final log is absent')

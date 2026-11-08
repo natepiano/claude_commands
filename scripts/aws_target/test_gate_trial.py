@@ -5,7 +5,7 @@ from collections.abc import Callable, Sequence
 from contextlib import redirect_stdout
 from datetime import UTC, datetime
 from decimal import Decimal
-from io import BytesIO, StringIO
+from io import StringIO
 import json
 import os
 import pathlib
@@ -21,7 +21,6 @@ from typing import cast, final, override
 import unittest
 from unittest import mock
 from urllib.parse import parse_qs, urlsplit
-from urllib.request import Request
 
 from scripts.aws_target import admin_secrets, deploy, gate_trial as trial, ledger
 from scripts.aws_target.aws_target import AwsCli, AwsUnavailable
@@ -398,8 +397,8 @@ class GateTrialTests(unittest.TestCase):
                 prices = trial.Prices(**command.attempts[0].prices)
                 lifetime = 30 * 60
                 uploads = lifetime // 15 * boots
-                self.assertEqual(command.puts, 2 + 2 * boots + uploads)
-                expected = (prices.lifetime(lifetime, 32) * boots + prices.put * (5 + uploads)
+                self.assertEqual(command.puts, 2 + 3 * boots + uploads)
+                expected = (prices.lifetime(lifetime, 32) * boots + prices.put * (5 + boots + uploads)
                             + prices.get * (lifetime * 2 / command.option('poll_pause_s') + 100))
                 self.assertAlmostEqual(command.projection(prices, step), expected)
                 self.assertIn('while sleep 15; do', self.fake.payloads[-1])
@@ -1167,8 +1166,10 @@ class GuestTests(unittest.TestCase):
             guest = trial.GUEST.replace("'/proc/meminfo'", repr(str(root / 'meminfo'))).replace("'/var/lib/gate-trial'", repr(str(root)))
             wrapper = root / 'guest-test.py'
             _ = wrapper.write_text('from unittest import mock\nimport subprocess\n'
-                + 'with (mock.patch("urllib.request.urlopen", side_effect=OSError("publish failed")),\n'
-                + '      mock.patch("subprocess.run", return_value=subprocess.CompletedProcess([], 0, "version", ""))):\n'
+                + 'def command(args, **kwargs):\n'
+                + '    if args[0] == "curl": raise OSError("publish failed")\n'
+                + '    return subprocess.CompletedProcess([], 0, "version", "")\n'
+                + 'with mock.patch("subprocess.run", side_effect=command):\n'
                 + f'    exec({guest!r}, {{}})\n')
             script = ('set -e\n' + trial.boot_trap(links).replace('/var/lib/gate-trial', str(root))
                       + shlex.join([sys.executable, str(wrapper)]) + '\n')
@@ -1215,14 +1216,16 @@ class GuestTests(unittest.TestCase):
             modules = [('fixture', suite / 'test_stuck.py'), ('fixture', suite / 'test_broken.py')]
             uploads: dict[str, bytes] = {}
             timings = {'fixture/test_stuck.py': 20.0, 'fixture/test_broken.py': 1.0}
-            def http(request: str | Request, *, timeout: float) -> BytesIO:
-                self.assertIn(timeout, (30, 60))
-                if isinstance(request, Request):
-                    uploads[request.full_url] = cast(bytes, request.data)
-                    return BytesIO()
-                if request == links['module_seconds']:
-                    return BytesIO(json.dumps(timings).encode())
-                return BytesIO(b'fixture bundle')
+            def transport(arguments: Sequence[str], **options: object) -> subprocess.CompletedProcess[str]:
+                if arguments[0] == 'curl':
+                    self.assertIn(arguments[arguments.index('--max-time') + 1], ('30', '60'))
+                    url = next(word for word in arguments if word.startswith('https://'))
+                    if '-o' in arguments:
+                        content = json.dumps(timings).encode() if url == links['module_seconds'] else b'fixture bundle'
+                        _ = Path(arguments[arguments.index('-o') + 1]).write_bytes(content)
+                    else:
+                        uploads[url] = cast(bytes, options['input'])
+                return subprocess.CompletedProcess(arguments, 0, 'version', '')
             code = trial.GUEST.replace("'/proc/meminfo'", repr(str(root / 'meminfo'))).replace("'/var/lib/gate-trial'", repr(str(root)))
             code = code.replace("'/proc/stat'", repr(str(root / 'stat')))
             _ = (root / 'stat').write_text('cpu 100 0 100 10000 1000 0 0 0 9999 9999\n')
@@ -1238,8 +1241,7 @@ class GuestTests(unittest.TestCase):
             with (mock.patch.dict(os.environ, {'MERGE_GATE_BASEDPYRIGHT': str(types), 'MERGE_GATE_PYTHON': sys.executable}),
                   mock.patch.object(sys, 'path', list(sys.path)),
                   mock.patch.object(Path, 'home', return_value=root),
-                  mock.patch('urllib.request.urlopen', side_effect=http),
-                  mock.patch('subprocess.run', return_value=subprocess.CompletedProcess(['fixture'], 0, 'version', '')),
+                  mock.patch('subprocess.run', side_effect=transport),
                   mock.patch('os.cpu_count', return_value=2),
                   mock.patch.object(merge_gate, 'run_suites', side_effect=run_suites),
                   mock.patch.object(merge_gate, 'module_runner', return_value=runner),
@@ -1305,14 +1307,15 @@ class GuestTests(unittest.TestCase):
                      'ready-cold': 'https://fixture.invalid/cold', 'ready-warm': 'https://fixture.invalid/warm'}
             _ = (root / 'links.json').write_text(json.dumps(links))
             uploads: dict[str, dict[str, object]] = {}
-            def http(request: Request, *, timeout: float) -> BytesIO:
-                self.assertEqual(timeout, 30)
-                if request.full_url != links['log']:
-                    uploads[request.full_url] = ledger.mapping(cast(object, json.loads(cast(bytes, request.data))))
-                return BytesIO()
+            def transport(arguments: Sequence[str], **options: object) -> subprocess.CompletedProcess[str]:
+                if arguments[0] == 'curl':
+                    self.assertEqual(arguments[arguments.index('--max-time') + 1], '30')
+                    url = arguments[-1]
+                    if url != links['log']:
+                        uploads[url] = ledger.mapping(cast(object, json.loads(cast(bytes, options['input']))))
+                return subprocess.CompletedProcess(arguments, 0, 'version', '')
             code = trial.GUEST.replace("'/proc/meminfo'", repr(str(root / 'meminfo'))).replace("'/var/lib/gate-trial'", repr(str(root)))
-            with (mock.patch('urllib.request.urlopen', side_effect=http),
-                  mock.patch('subprocess.run', return_value=subprocess.CompletedProcess(['fixture'], 0, 'version', '')),
+            with (mock.patch('subprocess.run', side_effect=transport),
                   mock.patch('subprocess.Popen', side_effect=AssertionError('admission during start trial')),
                   mock.patch.object(merge_gate, 'run_suites', side_effect=AssertionError('gate during start trial')),
                   mock.patch.object(merge_gate, 'typecheck_python', side_effect=AssertionError('types during start trial'))):
