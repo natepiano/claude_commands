@@ -1104,39 +1104,6 @@
             "Value": "cloud-claude-gate"
           }
         ],
-        "Policies": [
-          {
-            "PolicyName": "GateObjects",
-            "PolicyDocument": {
-              "Version": "2012-10-17",
-              "Statement": [
-                {
-                  "Effect": "Allow",
-                  "Action": [
-                    "s3:GetObject"
-                  ],
-                  "Resource": [
-                    {
-                      "Fn::Sub": "${GateBucket.Arn}/source/*"
-                    },
-                    {
-                      "Fn::Sub": "${GateBucket.Arn}/requests/*"
-                    }
-                  ]
-                },
-                {
-                  "Effect": "Allow",
-                  "Action": [
-                    "s3:PutObject"
-                  ],
-                  "Resource": {
-                    "Fn::Sub": "${GateBucket.Arn}/artifacts/${!aws:userid}/*"
-                  }
-                }
-              ]
-            }
-          }
-        ],
         "RoleName": {
           "Fn::Sub": "cloud-claude-gate-${DeploymentId}"
         }
@@ -1479,6 +1446,9 @@
                 },
                 {
                   "Fn::Sub": "${GateBucket.Arn}/requests/*"
+                },
+                {
+                  "Fn::Sub": "${GateBucket.Arn}/artifacts/*"
                 }
               ]
             },
@@ -1487,9 +1457,17 @@
               "Action": [
                 "s3:GetObject"
               ],
-              "Resource": {
-                "Fn::Sub": "${GateBucket.Arn}/artifacts/*"
-              }
+              "Resource": [
+                {
+                  "Fn::Sub": "${GateBucket.Arn}/artifacts/*"
+                },
+                {
+                  "Fn::Sub": "${GateBucket.Arn}/source/*"
+                },
+                {
+                  "Fn::Sub": "${GateBucket.Arn}/requests/*"
+                }
+              ]
             },
             {
               "Effect": "Allow",

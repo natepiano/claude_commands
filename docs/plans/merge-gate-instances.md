@@ -244,9 +244,8 @@ The gate bucket holds source bundles, guest programs, request manifests, results
 The boot script downloads the guest program before Python starts.
 Production also downloads the request that contains the module list.
 User data carries neither the program nor the module paths.
-Production downloads through S3 inside the tools shell, where `aws` is available.
-The trial downloads its program and source bundle through signed HTTPS links.
-Instances use HTTPS and temporary role credentials. They need no SSH or Tailscale connection.
+Production and trial use curl with signed HTTPS links for every box transfer.
+Instances use HTTPS links signed on natedev. They need no SSH or Tailscale connection.
 Each public subnet has an internet gateway route. The gate security group has no inbound rule.
 
 1. Record the clean checkout's commit and tree on natedev.
@@ -438,7 +437,7 @@ The gate route never starts the Rust box or enables Rust offload.
 Sessions make no AWS call.
 The route starts a user systemd service with the scaler credential file and profile `build-scaler`.
 The service removes inherited AWS key, profile, and config overrides.
-The credential file stays on natedev. The guest receives only temporary instance-role credentials.
+The credential file stays on natedev. The guest receives only signed object URLs.
 The user alone runs `deploy.py` with administrator access.
 
 | Added scaler grant | Scope |
@@ -449,14 +448,13 @@ The user alone runs `deploy.py` with administrator access.
 | `ec2:TerminateInstances` | Instances with this deployment's gate ownership and workload tags. |
 | `ec2:DescribeInstances` | Regional describe scope, required by EC2. |
 | `ce:GetCostAndUsage` | The combined cost query; AWS requires wildcard resource scope. |
-| `s3:PutObject` | The gate bucket's `source/*` and `requests/*` prefixes. |
-| `s3:GetObject` | The gate bucket's `artifacts/*` prefix. |
+| `s3:PutObject` | The gate bucket's `source/*`, `requests/*`, and `artifacts/*` prefixes. |
+| `s3:GetObject` | The gate bucket's `artifacts/*`, `source/*`, and `requests/*` prefixes. |
 
 Launch requests require attempt and expiry tags on instances and volumes.
 The route pins the deployed launch-template version.
-The guest role reads only source and request objects.
-It writes only `artifacts/${aws:userid}/*`, where an instance session uses `<role-id>:<instance-id>`.
-See [IAM policy variables](https://docs.aws.amazon.com/IAM/latest/UserGuide/reference_policies_variables.html).
+The guest role and profile remain attached to the launch template but have no S3 grants.
+The scaler signs log, result, and boot-error PUT links under `artifacts/<attempt>/`.
 Workers receive no launch permission, scaler key, or Git credential.
 
 The expiry role can describe instances and terminate only this deployment's gate instances.

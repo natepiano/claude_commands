@@ -11,7 +11,7 @@ import subprocess
 import sys
 import tempfile
 from types import SimpleNamespace
-from typing import Self, cast
+from typing import Self, cast, override
 import unittest
 from unittest import mock
 
@@ -24,6 +24,13 @@ ROOT = Path(__file__).resolve().parents[2]
 
 
 class GateBoxTests(unittest.TestCase):
+    @override
+    def setUp(self) -> None:
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        for name in ('cloud_gate.conf', 'test_times.conf'):
+            _ = (root / name).write_bytes((ROOT / 'config' / name).read_bytes())
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {'CONF_DIR': str(root)})))
+
     def test_trial_and_route_share_one_guest(self) -> None:
         self.assertIs(gate_trial.GUEST, gate_box.GUEST)
         _ = compile(gate_box.GUEST, '<gate guest>', 'exec')
@@ -34,15 +41,16 @@ class GateBoxTests(unittest.TestCase):
 
     def test_production_boot_has_absolute_expiry_and_no_type_package(self) -> None:
         links = {'production': 'true', 'expires': '1800000000', 'step': 'size',
-                 'guest': 's3://fixture/requests/attempt.guest.py', 'request': 's3://fixture/requests/attempt.json',
-                 'result': 's3://fixture/artifacts/role:__INSTANCE_ID__/attempt/result.json',
-                 'log': 's3://fixture/artifacts/role:__INSTANCE_ID__/attempt/gate.log'}
+                 'guest': 'https://fixture.invalid/requests/attempt.guest.py', 'request': 'https://fixture.invalid/requests/attempt.json',
+                 'result': 'https://fixture.invalid/artifacts/attempt/result.json',
+                 'log': 'https://fixture.invalid/artifacts/attempt/gate.log'}
         script = gate_box.user_data(links, 'fixture-revision', 20, 5, 1800)
         self.assertIn('--on-calendar=@1800000000', script)
         self.assertIn('shutdown -h now', script)
         self.assertIn('while sleep 5;', script)
-        self.assertIn('aws s3 cp', script)
-        self.assertIn('instance-id', script)
+        self.assertNotIn('aws s3 cp', script)
+        self.assertNotIn('instance-id', script)
+        self.assertNotIn('#awscli2', script)
         self.assertNotIn('#basedpyright', script)
         self.assertIn('#chromium', script)
         self.assertLessEqual(len(script.encode()), 16384)
@@ -51,34 +59,34 @@ class GateBoxTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertNotIn('base64 -d', script)
         self.assertNotIn(gate_box.GUEST, script)
-        self.assertIn('aws s3 cp s3://fixture/requests/attempt.guest.py "$box_dir/guest.py"', script)
-        self.assertIn('aws s3 cp s3://fixture/requests/attempt.json "$box_dir/request.json"', script)
+        self.assertIn('curl --fail --silent --show-error --max-time 60 https://fixture.invalid/requests/attempt.guest.py -o "$box_dir/guest.py"', script)
+        self.assertIn('curl --fail --silent --show-error --max-time 60 https://fixture.invalid/requests/attempt.json -o "$box_dir/request.json"', script)
         session = shlex.split(script[script.index('nix --extra-experimental-features'):])[-1]
-        self.assertLess(session.index('aws s3 cp s3://fixture/requests'), session.index('exec python3'))
+        self.assertLess(session.index('curl --fail'), session.index('exec python3'))
 
     def test_full_gate_downloads_program_and_request_without_inlining_modules(self) -> None:
         modules = [f'scripts/fixture/test_module_{index:04d}.py' for index in range(740)]
         links = {'production': 'true', 'expires': '1800000000', 'step': 'size',
                  'attempt': 'a' * 32, 'commit': 'b' * 40, 'tree': 'c' * 40, 'mode': 'merge-gate',
-                 'origin': 'https://example.invalid/team/project.git', 'source': 's3://fixture/source/' + 'd' * 64 + '.bundle',
-                 'guest': 's3://fixture/requests/attempt.guest.py', 'request': 's3://fixture/requests/attempt.json',
-                 'log': 's3://fixture/artifacts/role:__INSTANCE_ID__/attempt/gate.log',
-                 'result': 's3://fixture/artifacts/role:__INSTANCE_ID__/attempt/result.json'}
+                 'origin': 'https://example.invalid/team/project.git', 'source': 'https://fixture.invalid/source/' + 'd' * 64 + '.bundle',
+                 'guest': 'https://fixture.invalid/requests/attempt.guest.py', 'request': 'https://fixture.invalid/requests/attempt.json',
+                 'log': 'https://fixture.invalid/artifacts/attempt/gate.log',
+                 'result': 'https://fixture.invalid/artifacts/attempt/result.json'}
         script = gate_box.user_data(links, 'f' * 40, 20, 5, 1800)
         self.assertLess(len(base64.b64encode(script.encode())), 25600)
         self.assertNotIn('test_module_', script)
         self.assertNotIn('"modules"', script)
         self.assertNotIn(base64.b64encode(gate_box.GUEST.encode()).decode(), script)
         session = shlex.split(script[script.index('nix --extra-experimental-features'):])[-1]
-        downloads = session[session.index('aws s3 cp s3://fixture/requests'):session.index('ln -sf')]
+        downloads = session[session.index('curl --fail'):session.index('ln -sf')]
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             _ = (root / 'source.py').write_text(gate_box.GUEST)
             _ = (root / 'manifest.json').write_text(json.dumps({'modules': modules}))
-            aws = root / 'aws'
-            _ = aws.write_text('#!/bin/sh\ncase "$3" in *.guest.py) cp "$FIXTURE/source.py" "$4" ;;'
-                               + ' *.json) cp "$FIXTURE/manifest.json" "$4" ;; *) exit 1 ;; esac\n')
-            aws.chmod(0o700)
+            curl = root / 'curl'
+            _ = curl.write_text('#!/bin/sh\ncase "$6" in *.guest.py) cp "$FIXTURE/source.py" "$8" ;;'
+                                + ' *.json) cp "$FIXTURE/manifest.json" "$8" ;; *) exit 1 ;; esac\n')
+            curl.chmod(0o700)
             result = subprocess.run(['sh', '-ec', downloads],
                 env={**os.environ, 'PATH': str(root) + os.pathsep + os.environ['PATH'], 'FIXTURE': str(root), 'box_dir': str(root)},
                 text=True, capture_output=True, timeout=TEST_HANG_GUARD_SECS, check=False)
@@ -87,8 +95,8 @@ class GateBoxTests(unittest.TestCase):
             self.assertEqual(json.loads((root / 'request.json').read_text()), {'modules': modules})
 
     def test_production_boot_stages_and_errors_with_local_stubs(self) -> None:
-        stages = ['boot', 'aws ready', 'tools ready', 'source ready', 'tests start']
-        for failure in ('', 'boot', 'aws ready', 'tools shell', 'tools ready', 'source ready', 'tests start'):
+        stages = ['boot', 'tools ready', 'source ready', 'tests start']
+        for failure in ('', 'nix', 'tools shell', 'tools ready', 'source ready', 'tests start'):
             with self.subTest(failure=failure), tempfile.TemporaryDirectory() as temporary:
                 root = Path(temporary)
                 tools, box, repo = root / 'bin', root / 'box', root / 'repo'
@@ -125,32 +133,19 @@ def fail(stage):
 event(name)
 if name == 'nix':
     command = args[args.index('--command') + 1:]
-    if command[0] == 'sh':
-        assert args[args.index('shell') + 1:args.index('--command')] == ['github:NixOS/nixpkgs/' + 'f' * 40 + '#awscli2']
-        fail('aws ready')
-        print(root / 'bin/aws')
-    else:
-        if command[0] != 'aws':
-            event('tools shell')
-            fail('tools shell')
-        sys.exit(subprocess.call(command))
+    event('tools shell')
+    if os.environ['FAIL_STAGE'] == 'nix': sys.exit(7)
+    fail('tools shell')
+    sys.exit(subprocess.call(command))
 elif name == 'curl':
-    if 'http://169.254.169.254/latest/api/token' in args:
-        fail('boot')
-        print('fixture-token')
-    else:
-        assert 'X-aws-ec2-metadata-token: fixture-token' in args
-        pathlib.Path(args[args.index('-o') + 1]).write_text('i-fixture\n')
-elif name == 'aws':
-    assert os.environ['AWS_DEFAULT_REGION'] == 'us-west-2'
-    assert args[:2] == ['s3', 'cp']
-    source, destination = args[2:4]
-    if source.startswith('s3://'):
+    destination = next(word for word in args if word.startswith('https://'))
+    if '-o' in args:
         fail('tools ready')
-        shutil.copyfile(root / ('source.py' if source.endswith('.guest.py') else 'request.json'), destination)
+        shutil.copyfile(root / ('source.py' if destination.endswith('.guest.py') else 'request.json'), args[args.index('-o') + 1])
     else:
-        body = sys.stdin.read() if source == '-' else pathlib.Path(source).read_text()
-        event('upload result' if destination.endswith('/result.json') else 'upload log')
+        source = args[args.index('--data-binary') + 1]
+        body = sys.stdin.read() if source == '@-' else pathlib.Path(source[1:]).read_text()
+        event('upload result' if destination.endswith(('result.json', 'boot-error.json')) else 'upload log')
         with (root / 'uploads').open('a') as output:
             output.write(json.dumps({'destination': destination, 'body': body}) + '\n')
 elif name == 'runuser':
@@ -172,7 +167,7 @@ elif name in ('systemd-run', 'loginctl', 'mount', 'chown', 'ln', 'cp', 'shutdown
 else:
     print('fixture-version')
 '''
-                for name in ('nix', 'aws', 'runuser', 'systemd-run', 'loginctl', 'useradd', 'mount', 'curl',
+                for name in ('nix', 'runuser', 'systemd-run', 'loginctl', 'useradd', 'mount', 'curl',
                              'id', 'git', 'chown', 'ln', 'cp', 'shutdown', 'cargo', 'rustc', 'rustdoc', 'rustup',
                              'cargo-nextest', 'uv', 'sqlite3'):
                     command = tools / name
@@ -181,26 +176,29 @@ else:
                 (tools / 'python3').symlink_to(sys.executable)
                 links = {'production': 'true', 'expires': '1800000000', 'step': 'size', 'region': 'us-west-2',
                          'attempt': 'attempt', 'commit': 'a' * 40, 'tree': 'c' * 40, 'mode': 'merge-gate',
-                         'origin': 'https://example.invalid/repo.git', 'guest': 's3://fixture/requests/attempt.guest.py',
-                         'request': 's3://fixture/requests/attempt.json',
-                         'log': 's3://fixture/artifacts/role:__INSTANCE_ID__/attempt/gate.log',
-                         'result': 's3://fixture/artifacts/role:__INSTANCE_ID__/attempt/result.json'}
+                         'origin': 'https://example.invalid/repo.git', 'guest': 'https://fixture.invalid/requests/attempt.guest.py',
+                         'request': 'https://fixture.invalid/requests/attempt.json',
+                         'log': 'https://fixture.invalid/artifacts/attempt/gate.log',
+                         'result': 'https://fixture.invalid/artifacts/attempt/result.json',
+                         'boot_error': 'https://fixture.invalid/artifacts/attempt/boot-error.json'}
                 script = gate_box.user_data(links, 'f' * 40, 20, 5, 1800)
                 self.assertLess(script.index('push_logs &'), script.rindex('nix --extra-experimental-features'))
-                self.assertIn('aws s3 cp "${box_dir:-/var/lib/gate-trial}/boot-error.json"', script)
+                self.assertNotIn('#awscli2', script)
+                self.assertNotIn('instance-id', script)
                 reply = subprocess.run(['bash', '-c', script], text=True, capture_output=True, check=False,
                     timeout=TEST_HANG_GUARD_SECS, cwd=root, env={**os.environ, 'FIXTURE': str(root),
                     'GATE_BOX_DIR': str(box), 'FAIL_STAGE': failure, 'PATH': str(tools) + os.pathsep + os.environ['PATH']})
                 log = (box / 'boot.log').read_text()
                 uploads = [ledger.mapping(cast(object, json.loads(line))) for line in (root / 'uploads').read_text().splitlines()]
                 results = [ledger.mapping(cast(object, json.loads(ledger.text(row, 'body'))))
-                           for row in uploads if ledger.text(row, 'destination').endswith('/result.json')]
+                           for row in uploads if ledger.text(row, 'destination').endswith(('/result.json', '/boot-error.json'))]
                 self.assertTrue(results, log + reply.stderr)
                 self.assertEqual(results[-1]['verdict'], 'error' if failure else 'pass', log)
-                self.assertEqual((box / 'instance-id').read_text().strip(), 'i-fixture')
                 if failure:
                     self.assertIn('error', results[-1])
-                self.assertTrue(all('__INSTANCE_ID__' not in ledger.text(row, 'destination') for row in uploads))
+                if failure == 'nix':
+                    self.assertIn('stage=boot', ledger.text(uploads[0], 'body'))
+                    self.assertEqual(ledger.text(uploads[-1], 'destination'), links['boot_error'])
                 if not failure:
                     self.assertEqual(reply.returncode, 0, log + reply.stderr)
                     lines = [line for line in log.splitlines() if ' stage=' in line]
@@ -306,13 +304,15 @@ class GateResourcesTests(unittest.TestCase):
         self.assertEqual(ledger.mapping(condition['StringEquals'])['ec2:InstanceType'], {'Ref': 'GateInstanceTypes'})
         self.assertEqual(ledger.mapping(condition['StringEquals'])['ec2:InstanceMarketType'], 'spot')
         self.assertIn('ec2:InstanceProfile', ledger.mapping(condition['ArnEquals']))
+        self.assertIn({'Fn::Sub': '${GateBucket.Arn}/artifacts/*'},
+                      ledger.rows(by_action[str(['s3:PutObject'])], 'Resource'))
+        self.assertEqual(ledger.rows(by_action[str(['s3:GetObject'])], 'Resource'), (
+            {'Fn::Sub': '${GateBucket.Arn}/artifacts/*'}, {'Fn::Sub': '${GateBucket.Arn}/source/*'},
+            {'Fn::Sub': '${GateBucket.Arn}/requests/*'}))
 
-    def test_guest_can_write_only_its_credential_prefix(self) -> None:
+    def test_guest_role_has_no_object_permissions(self) -> None:
         role = ledger.mapping(ledger.mapping(self.resources()['GateRole'])['Properties'])
-        policy = ledger.mapping(ledger.rows(role, 'Policies')[0]['PolicyDocument'])
-        writes = [row for row in ledger.rows(policy, 'Statement') if row['Action'] == ['s3:PutObject']]
-        self.assertEqual(writes, [{'Effect': 'Allow', 'Action': ['s3:PutObject'],
-            'Resource': {'Fn::Sub': '${GateBucket.Arn}/artifacts/${!aws:userid}/*'}}])
+        self.assertNotIn('Policies', role)
         self.assertEqual(ledger.mapping(self.template()['Outputs'])['GateRoleId'],
                          {'Condition': 'Gates', 'Value': {'Fn::GetAtt': ['GateRole', 'RoleId']}})
 
