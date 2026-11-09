@@ -708,6 +708,9 @@ It preserves the caller's working directory, interpreter cache, version floor, a
 The cloud guest bootstrap supplies its own root after a fresh clone.
 The Pillow analysis and Blender entries retain their foreign interpreters and explicit `PYTHONPATH`.
 
+`update_registration.state_block` imports `merged_checkpoints` in its body.
+This keeps `scripts.production.merge_checkpoint` and `scripts.production.merge_gate` out of each `scripts.statusline.counts_row` start, which costs 0.1 to 0.2 s of CPU when they load.
+
 **Interpreter-cache seeding.** `scripts/lib/py` caches the resolved interpreter path in `$XDG_CACHE_HOME/claude/python3-<major>.<minor>`. The key uses the version floor from `lib/py`, currently `python3-3.12`. Worker fixtures set `XDG_CACHE_HOME` for each temporary HOME. They write `sys.executable` into that cache file. They unset `CLAUDE_PYTHON`, which bypasses the cache. This avoids Python resolution for roughly 19 helper launches per `verify.sh`, `review.sh`, or `assign.sh` run.
 
 **Stub app-server shutdown** (`scripts/agents/codex_test_support.py`). The accept loop blocks in `select` on the listener and on a socketpair that `close()` writes to, so closing the server wakes it at once.
