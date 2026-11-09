@@ -63,6 +63,7 @@ class MergeGateTestTimesTests(MergeGateFixture):
         self.environment["CONF_DIR"] = str(config)
         _ = write_config_fixture(config / "build_admission.conf")
         _ = write_config_fixture(config / "build_folders.conf")
+        _ = write_config_fixture(config / "merge_gate.conf")
         _ = write_config_fixture(config / "lint.conf")
         _ = write_config_fixture(config / "test_times.conf", "SLOW_TEST_S=1.0")
 

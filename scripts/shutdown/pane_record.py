@@ -135,6 +135,7 @@ def resume_arguments(entry: PaneLaunch) -> list[str]:
         arguments = ["resume", entry["session_id"]]
         if entry["model"]:
             arguments.extend(("--model", entry["model"]))
+        arguments.extend(entry.get("codex_policy", []))
         return arguments
     arguments = ["--resume", entry["session_id"]]
     if entry["name"]:
