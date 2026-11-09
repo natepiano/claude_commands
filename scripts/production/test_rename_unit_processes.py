@@ -7,6 +7,7 @@ import json
 import os
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from typing import NamedTuple, cast, final, override
 from unittest import mock
@@ -14,7 +15,7 @@ from scripts.production import staff, worker_admission
 from scripts.production.staff_test_support import fixture_worker
 
 
-from scripts.shutdown import shutdown
+from scripts.shutdown import remote, shutdown
 from scripts.production import unit_lookup
 from scripts.production import unit_move
 from scripts.production import staff_sources
@@ -125,14 +126,24 @@ class RunProcessTests(StaffTestCase):
             del self.processes[pid]
 
     def test_run_ownership_passes_one_settings_read_to_process_arguments(self) -> None:
-        with (mock.patch.object(conf, "read", wraps=conf.read) as reads,
-              mock.patch.object(shutdown, "retirement_command_line", wraps=self.arguments) as arguments):
-            found = shutdown.retirement_run_processes(self.unit_folder, [101, 102])
-        self.assertEqual(set(found), {101, 102})
-        reads.assert_called_once_with("production")
-        settings = [cast(object, call.kwargs["settings"]) for call in arguments.call_args_list]
-        self.assertTrue(settings)
-        self.assertTrue(all(value is settings[0] for value in settings))
+        record = staff.snapshot()
+        row = record.by_worktree(remote.local_machine(), self.unit_folder)
+        assert row is not None and isinstance(row.worktree, staff.PresentWorktree)
+        for machine, hostname in ((row.worktree.machine, remote.local_machine()), ("mac", "Nates-MacBook-Pro.local")):
+            with self.subTest(machine=machine, hostname=hostname):
+                owner = replace(row, worktree=staff.PresentWorktree(machine, row.worktree.path))
+                supplied = staff.StaffSnapshot(tuple(owner if member.id == owner.id else member for member in record.rows))
+                with (mock.patch.object(conf, "read", wraps=conf.read) as reads,
+                      mock.patch.object(shutdown, "retirement_command_line", wraps=self.arguments) as arguments,
+                      mock.patch.object(shutdown, "local_machine", return_value=hostname),
+                      mock.patch.object(staff, "snapshot", side_effect=AssertionError("local staff is unavailable")),
+                      mock.patch.object(staff, "local_snapshot", side_effect=AssertionError("local staff is unavailable"))):
+                    found = shutdown.retirement_run_processes(owner, [101, 102], record=supplied)
+                self.assertEqual(set(found), {101, 102})
+                reads.assert_called_once_with("production")
+                settings = [cast(object, call.kwargs["settings"]) for call in arguments.call_args_list]
+                self.assertTrue(settings)
+                self.assertTrue(all(value is settings[0] for value in settings))
 
 
 

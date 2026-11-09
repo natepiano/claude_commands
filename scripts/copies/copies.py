@@ -1603,7 +1603,7 @@ def remote_rsync(source: Path, mirror: RemoteMirror, excludes: Path, options: li
     receiver = remote_copies_command("mirror-receive", mirror, "--", "rsync")
     # Keep the existing command order while metadata removal keeps the record last.
     exclusions = floor_claims.MIRROR_METADATA[1:] + floor_claims.MIRROR_METADATA[:1]
-    return ["rsync", "-rlpc", "--delete", f"--rsync-path={receiver}",
+    return ["rsync", "-rlptc", "--compress", "--delete", f"--rsync-path={receiver}",
             *(f"--exclude=/{name}" for name in exclusions),
             f"--exclude-from={excludes}", "-e", shlex.join(["ssh", *options]),
             f"{source}/", f"{mirror.host}:{shlex.quote(mirror.path)}/"]
