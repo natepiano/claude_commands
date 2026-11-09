@@ -714,7 +714,7 @@ def memory_room(host: HostMemory | ReadingUnavailable, runs: Sequence[RunMemory]
                 policy: AdmissionPolicy, *,
                 ci_keep_aside: CIKeepAside = NO_CI_KEEP_ASIDE,
                 ci_use: int = 0) -> MemoryRoom | ReadingUnavailable:
-    """Calculate room once from anonymous use and accepted promises."""
+    """Calculate room once from swap-backed use and accepted promises."""
     if isinstance(host, ReadingUnavailable):
         return host
     safety = policy.safety_bytes
@@ -1012,7 +1012,7 @@ def scope_members(directory: Path) -> set[int]:
 
 
 def process_memory(source: set[int] | PopulatedStepScope, proc: Path = PROC) -> MeasuredMemory:
-    """Read anonymous use from the scope or processes; retain resident bytes and swap."""
+    """Read swap-backed use from the scope or processes; retain resident bytes and swap."""
     if isinstance(source, PopulatedStepScope):
         reading = slice_working_set(source.directory)
         try:
@@ -1022,7 +1022,7 @@ def process_memory(source: set[int] | PopulatedStepScope, proc: Path = PROC) -> 
                            anonymous_source=ScopeSource(source.directory, frozenset()))
         return replace(reading, anonymous_source=ScopeSource(source.directory, members))
     used, swapped = 0, 0
-    anonymous: list[ProcessAnonymousUse] = []
+    process_uses: list[ProcessAnonymousUse] = []
     for child in sorted(source):
         path = proc / str(child) / "status"
         try:
@@ -1030,11 +1030,11 @@ def process_memory(source: set[int] | PopulatedStepScope, proc: Path = PROC) -> 
         except OSError as error:
             use = (AnonymousRunUse(0) if error.errno in (errno.ENOENT, errno.ESRCH) else
                    RunUseUnavailable(f"{path}: {error.strerror or error}"))
-            anonymous.append(ProcessAnonymousUse(child, use))
+            process_uses.append(ProcessAnonymousUse(child, use))
             continue
         rss_present = False
-        anon_seen = False
-        anonymous_fields: dict[str, int] = {}
+        swap_backed_seen: set[str] = set()
+        swap_backed_fields: dict[str, int] = {}
         for line in contents:
             parts = line.split()
             if not parts:
@@ -1050,21 +1050,21 @@ def process_memory(source: set[int] | PopulatedStepScope, proc: Path = PROC) -> 
                         used += size
                 except (ValueError, IndexError):
                     pass
-            elif parts[0] == "RssAnon:" and not anon_seen:
-                anon_seen = True
-                anonymous_fields = kib_fields(parts)
+            elif parts[0] in ("RssAnon:", "RssShmem:") and parts[0] not in swap_backed_seen:
+                swap_backed_seen.add(parts[0])
+                swap_backed_fields.update(kib_fields(parts))
         if not rss_present:
             use = AnonymousRunUse(0)
-        elif "RssAnon" in anonymous_fields:
-            use = AnonymousRunUse(anonymous_fields["RssAnon"])
+        elif "RssAnon" in swap_backed_fields and "RssShmem" in swap_backed_fields:
+            use = AnonymousRunUse(swap_backed_fields["RssAnon"] + swap_backed_fields["RssShmem"])
         else:
-            use = RunUseUnavailable(f"{path}: RssAnon missing or invalid")
-        anonymous.append(ProcessAnonymousUse(child, use))
-    return MeasuredMemory(used, swap_bytes=swapped, anonymous=sum_anonymous_use(item.use for item in anonymous),
-                          anonymous_source=ProcessSource(tuple(anonymous)))
+            use = RunUseUnavailable(f"{path}: swap-backed memory unavailable (RssAnon or RssShmem missing or invalid)")
+        process_uses.append(ProcessAnonymousUse(child, use))
+    return MeasuredMemory(used, swap_bytes=swapped, anonymous=sum_swap_backed_use(item.use for item in process_uses),
+                          anonymous_source=ProcessSource(tuple(process_uses)))
 
 
-def sum_anonymous_use(readings: Iterable[AnonymousRunUse | RunUseUnavailable]) -> AnonymousRunUse | RunUseUnavailable:
+def sum_swap_backed_use(readings: Iterable[AnonymousRunUse | RunUseUnavailable]) -> AnonymousRunUse | RunUseUnavailable:
     total = 0
     for use in readings:
         if isinstance(use, RunUseUnavailable):
@@ -1862,7 +1862,7 @@ def attributed_step_uses(inputs: QueueInputs) -> tuple[tuple[Reservation, Runnin
                     use = AnonymousRunUse(0)
                     owns_source = False
                 elif isinstance(use, AnonymousRunUse):
-                    nested = sum_anonymous_use(scope_holders[child][2].anonymous
+                    nested = sum_swap_backed_use(scope_holders[child][2].anonymous
                                                for child in children.get(source.directory, ()))
                     use = (AnonymousRunUse(max(0, use.bytes - nested.bytes))
                            if isinstance(nested, AnonymousRunUse) else nested)
@@ -1870,7 +1870,7 @@ def attributed_step_uses(inputs: QueueInputs) -> tuple[tuple[Reservation, Runnin
                 assigned = tuple(item for item in source.processes
                                  if item.pid in unclaimed and process_holders[item.pid][2] == index)
                 owns_source = bool(assigned)
-                use = sum_anonymous_use(item.use for item in assigned)
+                use = sum_swap_backed_use(item.use for item in assigned)
                 unclaimed.difference_update(item.pid for item in assigned)
         attributed.append((row, step, AttributedStepUse(use, owns_source)))
     return tuple(attributed)
@@ -1888,7 +1888,7 @@ def run_memories(inputs: QueueInputs) -> tuple[RunMemory, ...]:
         if previous is None:
             groups[owner] = RunMemory(owner, need, use, run=run)
         else:
-            combined = sum_anonymous_use((previous.use, use))
+            combined = sum_swap_backed_use((previous.use, use))
             groups[owner] = replace(previous, need=previous.need + need, use=combined)
     for slot in inputs.slots:
         if not slot_in_force(slot, inputs.now):
@@ -1917,11 +1917,11 @@ def progress_memory(row: Reservation, reading: MeasuredMemory, attributed: Attri
                     counter: progress.ProgressCounter | progress.NoCounter,
                     profile: progress.ProgressProfile | progress.NoMatchingProfile,
                     policy: AdmissionPolicy) -> ProgressAdjustedMemory:
-    """Use a profile only with a current attributed anonymous reading."""
+    """Use a profile only with a current attributed swap-backed reading."""
     full_need = reservation_need(row, reading)
     window = (progress.window_peak(profile, counter, policy.progress_lookahead_percent)
               if isinstance(attributed.use, AnonymousRunUse) else
-              progress.NoMatchingProfile("anonymous use unavailable"))
+              progress.NoMatchingProfile("swap-backed use unavailable"))
     need = full_need
     if isinstance(window, progress.WindowPeak):
         basis = read_need_basis(row.get("queue_waiter", {}).get("need_basis"))
@@ -2636,7 +2636,7 @@ def ci_slice_cgroup(name: str) -> Path | ReadingUnavailable:
         return ReadingUnavailable(f"{name}: cannot read ControlGroup: {error}")
 
 def slice_working_set(directory: Path) -> MeasuredMemory:
-    """Measure resident memory without inactive file cache and record swap separately."""
+    """Read the working set, anonymous plus shared memory, and swap separately."""
     current = directory / "memory.current"
     check_memory_reading(current)
     amount = int(current.read_text())
@@ -2653,12 +2653,19 @@ def slice_working_set(directory: Path) -> MeasuredMemory:
     swapped = int(swap.read_text()) if swap.exists() else 0
     try:
         anon = int(fields["anon"])
-        if anon < 0:
-            raise ValueError("negative anon")
-        use: AnonymousRunUse | RunUseUnavailable = AnonymousRunUse(anon)
+        shmem = int(fields["shmem"])
+        if anon < 0 or shmem < 0:
+            raise ValueError("negative anon or shmem")
+        use: AnonymousRunUse | RunUseUnavailable = AnonymousRunUse(anon + shmem)
     except (KeyError, ValueError):
-        use = RunUseUnavailable(f"{stat}: anonymous memory unavailable")
+        use = RunUseUnavailable(f"{stat}: swap-backed memory unavailable")
     return MeasuredMemory(max(0, amount - inactive_file), swap_bytes=swapped, anonymous=use)
+
+
+def owned_scope_roots(scopes: Iterable[Path], parent: Path) -> set[Path]:
+    """Select owned scopes inside a slice without counting nested scopes twice."""
+    inside = {scope for scope in scopes if scope == parent or parent in scope.parents}
+    return {scope for scope in inside if inside.isdisjoint(scope.parents)}
 
 
 def unowned_slice_memory(rows: list[Reservation], processes: dict[int, ProcessIdentity], proc: Path,
@@ -2698,11 +2705,17 @@ def unowned_slice_memory(rows: list[Reservation], processes: dict[int, ProcessId
             amount = working_set.bytes
             swapped = working_set.swap_bytes
             members = scope_members(child)
-            duplicate = process_memory(members & tree_pids, proc)
+            scoped = [process_memory(PopulatedStepScope(scope), proc)
+                      for scope in owned_scope_roots(owned, child)] if required else []
+            scoped_pids = {pid for memory in scoped if isinstance(memory.anonymous_source, ScopeSource)
+                           for pid in memory.anonymous_source.members}
+            duplicate = process_memory((members & tree_pids) - scoped_pids, proc)
             duplicate_use = (duplicate.anonymous.bytes if required
                 and isinstance(duplicate.anonymous, AnonymousRunUse) else duplicate.bytes)
+            duplicate_use += sum(memory.anonymous.bytes for memory in scoped
+                                 if isinstance(memory.anonymous, AnonymousRunUse))
             amount = max(0, amount - duplicate_use)
-            swapped = max(0, swapped - duplicate.swap_bytes)
+            swapped = max(0, swapped - duplicate.swap_bytes - sum(memory.swap_bytes for memory in scoped))
             promise: MemoryPromise = NoPromise()
             activity = activity_reader.scope(members, child.name)
             row_pid: int | PidNotRecorded = (activity.members[0].pid
@@ -2719,7 +2732,7 @@ def unowned_slice_memory(rows: list[Reservation], processes: dict[int, ProcessId
                     row_pid = oldest
                     if workers:
                         unregistered = [pid for pid in workers
-                            if not process_tree({pid: processes[pid].start}, processes).intersection(tree_pids)]
+                            if not process_tree({pid: processes[pid].start}, processes).intersection(tree_pids | scoped_pids)]
                         if unregistered:
                             first = min(unregistered, key=lambda pid: (int(processes[pid].start), pid))
                             job_state = RunningServiceJob(activity_reader.started_at(first))

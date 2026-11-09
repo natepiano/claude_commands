@@ -325,12 +325,12 @@ sleep() {
     printf "%s:%s\\n" "$(cat "$maximum_path")" "$(cat "$near_peak_path")"
     index=$((index + 1))
     (( index < ${#times[@]} )) || exit 0
-    printf "anon %s\\n" "${values[index]}" > "$scope_path/memory.stat"
+    printf "anon %s\\nshmem 0\\n" "${values[index]}" > "$scope_path/memory.stat"
 }
 maximum_path=$2
 near_peak_path=${2%.max}.wave
 scope_path=$3
-printf "anon %s\\n" "${values[index]}" > "$scope_path/memory.stat"
+printf "anon %s\\nshmem 0\\n" "${values[index]}" > "$scope_path/memory.stat"
 buildlog_sample_anon "$1" "$2" "$$"
 '''
             with near_peak.open() as old_snapshot:
@@ -367,13 +367,13 @@ sleep() {
     printf '%s\n' "$(cat "$maximum_path")"
     index=$((index + 1))
     (( index < ${#values[@]} )) || exit 0
-    printf 'anon %s\n' "${values[index]}" > "$scope_path/memory.stat"
+    printf 'anon %s\nshmem 0\n' "${values[index]}" > "$scope_path/memory.stat"
 }
 maximum_path=$2
 scope_path=$3
 fail_first_peak=$4
 if [[ "$fail_first_peak" == 0 ]]; then values=(100 200 0); fi
-printf 'anon 100\n' > "$scope_path/memory.stat"
+printf 'anon 100\nshmem 0\n' > "$scope_path/memory.stat"
 buildlog_sample_anon "$1" "$2" "$$"
 '''
                 result = subprocess.run(["bash", "-c", program, "sampler-test", str(sidecar),
