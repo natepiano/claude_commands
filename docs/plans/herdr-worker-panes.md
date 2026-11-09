@@ -3490,41 +3490,26 @@ Live proof (2026-11-09 05:10-05:14 EST, one new Codex worker, two passes with a 
 
 ### Phase 34c — Worker-pane anomalies from the builds report  · status: done
 
-**Depends on:** Phase 34b (same hook and close code). sdlc [c2b76faf], 2026-11-09, from the builds showrunner's report.
+#### As-built
 
-1. **A turn end with no DONE sends no message.** A `recorder` worker ended its turn without the DONE reply. No turn-hook message reached the director; the director read the result from the transcript. A turn end with no DONE must send the director one message.
-2. **A worker close exits 8 with the pane still open.** The `worker_panes.py` close of `recorder` exited 8: `worker stop has no fresh shell or closed-pane proof` (`scripts/shutdown/stop_resume.py:239`). The pane is still open.
-3. **A review DONE sends no turn-hook message.** sdlc [7b64ed16], from models Phase 1. Reviewers `models-review2` (adversary) and `models-review3` (contract) printed DONE in their panes at 04:44 to 04:45 EST. No turn-hook message reached the models director. Their status files still read `running`, and the style state reads `Error`. Check the `review.sh` pass path through `turn_end`. The models director read the results from the panes.
-4. **The completion hook's staff lookup fails.** sdlc [3e629889]. A models worker finished its turn, and the hook did not wake the models director. The hook run log reads `staff worktree is unavailable` (`session_staff.py:259` or `unit_lookup.py:272`). Models worktree: `/home/natepiano/worktrees/models`. Find why the lookup fails for this worker, and fix it at the cause.
+A worker turn whose reply ends with `DONE <dispatch id>` completes its pass when the transcript reply is missing or older. `turn_end.handle` applies this rule only on `TURN_END`, only after the transcript shows the matching dispatch prompt, and never while `DispatchWaitingForRuns.has_live_run` holds. The receipt becomes `worker.DispatchComplete(event.reply, anomalies)`. `worker_panes.can_close` accepts a `completed` pass whose saved `HookCompletion` outcome is `done`. Likely cause (hana fastest Phase 54, models reviewers, sdlc ruling (a)): the hook read the transcript before the DONE record was visible.
 
-Evidence (sdlc [335976f2]): `/tmp/claude/unit/ed9c66cd-d74e-480c-9cca-766bc9f0702c/phases/42/`. `recorder_status` reads `running` after the 04:06 turn end, `recorder_reply_turn.txt` is 1 byte, and `recorder_agent.log` holds the launch. The 1-byte turn reply is the Phase 34b item 3 shape; check item 1 against the 34b fix first. Ask the builds showrunner for the close exit-8 output.
+Each ignored exit of `turn_end.handle` goes through `_ignored(event, reason, worker_name)`. It appends one JSON line (time, reason, event kind, thread id, worker name) to `~/.local/state/herdr/turn-end-ignored.jsonl` (`herdr.layout_path(herdr.shared_session()).parent`). It changes no outcome and sends no notice.
 
-#### Work Order
+A failed worker stop (`stop_resume._worker_stopped` → `StopFailed`) names the pane and each foreground program from `client.pane_activity` (`PaneRunning.commands`), or says the pane is at its shell.
 
-**Goal:** Every worker turn end reaches its director once, and a worker close removes the pane or names why.
-
-**Spec:**
-
-1. Item 1: replay the `recorder` evidence against the Phase 34b hook. If a no-DONE turn end still sends nothing, find the cause and fix it, so the director gets one `no DONE` notice.
-2. Item 2: find why the close of `recorder` exited 8 at `stop_resume.py:239` with the pane open. Fix the cause where it lives, so a close of a stopped worker removes its pane. Ask the director for the builds exit-8 output if the evidence folder does not show it.
-3. Item 3: follow a `review.sh` pass from the reviewer's DONE through `turn_end.handle`. Find where it stops, and fix it, so the review status reads `done` and the director gets one notice.
-4. Item 4: find why the staff lookup reads `staff worktree is unavailable` for the models worker (`session_staff.py:259`, `unit_lookup.py:271`). Fix it at the cause, so the hook wakes the director.
-5. Update `docs/as-built/long-lived-workers.md` and `docs/as-built/herdr-adoption.md` where they state the changed behavior.
-6. Add no check, refusal, validation, retry or wait that this list does not name.
+A no-DONE turn with no pending work sends one `no DONE` notice with the last reply (the Phase 34b path). Named adversary and contract reviews record `done`, save the style result and send one notice through the same hook.
 
 **Files:**
+- `scripts/herdr/turn_end.py` — `_ignored`, hook-reply completion in `handle`.
+- `scripts/herdr/worker_panes.py` — `can_close` hook completion.
+- `scripts/shutdown/stop_resume.py` — `StopFailed` pane and program text.
+- Tests: `scripts/herdr/test_turn_end.py` (native payload rows for Claude and Codex, missing and older reply; other-dispatch row records its reason; recorder no-DONE row), `scripts/direct/test_assign_launcher_review.py` (named review rows), `scripts/shutdown/test_stop_resume.py` (`PaneRunning` row).
+- Docs: `docs/as-built/long-lived-workers.md`, `docs/as-built/herdr-adoption.md`.
 
-- `scripts/herdr/turn_end.py`, `scripts/herdr/test_turn_end.py` — no-DONE notice, review pass path.
-- `scripts/herdr/worker_panes.py`, `scripts/herdr/test_worker_panes.py` — the close.
-- `scripts/shutdown/stop_resume.py`, `scripts/shutdown/test_stop_resume.py` — the close proof, only if the cause is there.
-- `scripts/direct/review.sh`, `scripts/direct/assign.py`, `scripts/direct/test_assign_launcher_review.py` — the review pass path.
-- `scripts/production/session_staff.py`, `scripts/production/test_session_staff.py`, `scripts/production/unit_lookup.py`, `scripts/production/test_unit_lookup.py` — the staff lookup.
-- `scripts/production/worker.py`, `scripts/production/test_worker.py` — receipt, only if the cause is there.
-- `docs/as-built/long-lived-workers.md`, `docs/as-built/herdr-adoption.md` — the changed behavior.
+**Gotchas:** until this code is on main, the live hook runs main's code: no hook-reply completion. The exit-8 close cause is not found; the next case names its foreground programs. The "staff worktree is unavailable" warnings name workers of a retired unit and are true.
 
-**Workers:** `1 writer` — `hook34`, which holds the Phase 34, 34a and 34b design.
-
-**State:** none new.
+**Ruled out:** returning a removed retained worktree from `session_staff.worker_directory` (its resume command then refuses a missing `--cwd`); a wait or second pane read in the close (needs the user's approval).
 
 ### Phase 42 — A renamed unit keeps its workers  · status: done
 
