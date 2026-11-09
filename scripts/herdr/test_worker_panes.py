@@ -1208,6 +1208,7 @@ class WorkerPaneTests(StaffTestCase):
         self.assertIsInstance(first, worker_panes.OpenWorker)
         assert isinstance(first, worker_panes.OpenWorker)
         arguments = self.world.requests[-1][1]
+        self.assertFalse(any(argument.startswith("notify=") for argument in arguments))
         self.assertFalse(any("model_auto_compact_token_limit" in argument for argument in arguments))
         self.assertIn(["-c", "notice.hide_rate_limit_model_nudge=true"],
                       [arguments[index:index + 2] for index in range(len(arguments) - 1)])
@@ -1225,10 +1226,7 @@ class WorkerPaneTests(StaffTestCase):
         self.assertFalse(any("model_auto_compact_token_limit" in argument for argument in arguments))
         self.assertIn(["-c", "notice.hide_rate_limit_model_nudge=true"],
                       [arguments[index:index + 2] for index in range(len(arguments) - 1)])
-        hook = next(argument.removeprefix("notify=") for argument in arguments if argument.startswith("notify="))
-        command = cast(list[str], json.loads(hook))
-        self.assertEqual(Path(command[1]).resolve(), Path(__file__).with_name("turn_end.py").resolve())
-        self.assertEqual(Path(command[0]).resolve(), Path(__file__).resolve().parents[1] / "lib/py")
+        self.assertFalse(any(argument.startswith("notify=") for argument in arguments))
         self.assertEqual(len(self.world.launches), 2)
 
     def test_resume_uses_the_pane_folder_only_for_codex(self) -> None:
@@ -1299,9 +1297,11 @@ class WorkerPaneTests(StaffTestCase):
                 self.assertEqual((len(self.world.launches), self.world.stops), (before[0] + 1, before[1]))
                 self.completed_dispatch(result.row, "impl")
                 actual = self.world.foreground[result.pane][2]
-                index = (next(i for i, argument in enumerate(actual) if argument.startswith("notify=")) - 1
-                         if family == "codex" else actual.index("--settings"))
-                del actual[index:index + 2]
+                if family == "codex":
+                    actual[actual.index("--sandbox") + 1] = "read-only"
+                else:
+                    index = actual.index("--settings")
+                    del actual[index:index + 2]
                 resumed = self.start(name)
                 self.assertIsInstance(resumed, worker_panes.OpenWorker)
                 assert isinstance(resumed, worker_panes.OpenWorker)
