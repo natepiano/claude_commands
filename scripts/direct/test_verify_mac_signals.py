@@ -34,7 +34,7 @@ class VerifyMacSignalsTests(VerifyMacOffloadFixture):
                     (self.runner_state / "runner-signal").read_text(
                         encoding="utf-8"
                     ),
-                    str(signal_number),
+                    str(signal.SIGTERM if signal_number == signal.SIGINT else signal_number),
                 )
                 self.assertEqual(self.local_runs(), [])
                 runners = self.runner_events()
