@@ -2009,3 +2009,77 @@ Every nextest run that lint starts prints one line after admission: `nextest: <g
 - Tailscale control can list the Mac as online for minutes after it sleeps; an ssh timeout with `online=yes` is the sign.
 
 **Ruled out:** a kernel panic and restart (uptime 21 days); memory pressure as the cause (the pmset log names clamshell sleep for each drop); a nextest concurrency change.
+
+### Phase 91 — The floor alert sends once for each crossing of the line  · status: done
+**Depends on:** none. Merge `origin/builds` first.
+
+**Approved:** builds showrunner, 2026-11-09 ("top priority, a Mac disk defect from natedev. Fix it at the source as a phase."). Order change, builds, 2026-11-09: "Fix the repeat first and send that checkpoint alone: one alert for each crossing of the line, with a margin before it alerts again. Put the margin in config as a new key."
+
+#### Work Order
+
+**Goal:** the floor alert sends one alert for each crossing of the alert line, and does not repeat while free space stays near the line.
+
+**Measured (natedev, 2026-11-09):** the Mac floor alert came 4 times in about 30 minutes, at 149.7 to 150.0 GiB, with no real fall. Today a reading above the alert line (`sweep_phone_floor_gib=150`) rearms the crossing, so a reading that moves around the line sends an alert on each dip.
+
+**Spec:**
+1. After an alert, the crossing rearms only when free space rises above the alert line plus a margin. Equality does not rearm. Natedev and the Mac use this one rule.
+2. The margin is a new key `sweep_phone_rearm_gib=5` in `config/lint.conf`, beside `sweep_phone_floor_gib` (builds 11-09: a new key needs no user go).
+3. Change the existing Mac expectation in `test_phone_floor_crossing_sends_once_until_free_space_rises`: 200,140,130,151,140 gives one alert. Add a row: 200,140,160,140 gives two alerts.
+4. Update `docs/as-built/build-memory-admission.md` for the rearm rule and the key.
+
+**Constraints:**
+- Run no cleanup on the Mac, and no gc command of any kind.
+- The alert text `sweep.disk_floor` keeps its approved words.
+
+**Files:**
+- `scripts/lint/sweep.py` — the crossing rule.
+- `config/lint.conf` — the margin key.
+- `scripts/lint/test_sweep.py` — the rows.
+- `docs/as-built/build-memory-admission.md` — the changed rule.
+
+**Workers:** `1 writer + 1 tester`
+- `impl` owns the source files, the config and the as-built doc, and runs the final suites.
+- `test` owns the test file.
+
+**Acceptance gate:**
+- The new row fails before the fix and passes after it.
+- The changed test modules pass. Basedpyright reports `0 errors, 0 warnings, 0 notes` for every changed Python file.
+
+### Phase 92 — The Mac floor sweep trims the mirror targets, and its alert names folder sizes  · status: todo
+**Depends on:** Phase 91 (same file, `scripts/lint/sweep.py`). Merge `origin/builds` first.
+
+**Approved:** builds showrunner, 2026-11-09 (the Mac disk defect, items 1 and 2; order change: after the repeat fix).
+
+#### Work Order
+
+**Goal:** fix two defects in the Mac floor path at their source.
+
+**Measured (natedev, 2026-11-09):** the Mac had 150 GiB free. Each alert said "The cleanup run freed nothing. Folder sizes are unknown." `~/.local/state/mac-test/mirror` held 220 GiB of build output: `hana/target` 156 GiB and `cargo-liner/target` 64 GiB. `config/mac_test.conf` names the mirror root in `sweep_floor_roots`. Phase 91 reads: later floor passes found the mirror targets and removed 0.7 and 1.1 GiB, with one or two targets busy. A claimed mirror that is missing makes `LockedClaims.holds` protect an unrecorded marked target.
+
+**Spec:**
+1. **The floor sweep trims the mirror targets.** Find why the floor pass keeps `hana/target` and `cargo-liner/target`. Write the cause with its evidence in `phases/92/cause.md` in the run folder (Phase 91 notes are in `phases/91/cause.md`). Fix the proven cause, so the sweep removes mirror build output, least recently used first, down to the floor. A target that a live build holds stays. Fix the `LockedClaims.holds` defect.
+2. **The alert names folder sizes on the Mac.** Today the Mac alert reads "Folder sizes are unknown." because the folder choices come only from the natedev disk measurement. Make the Mac alert name its largest folders under its floor roots, with their sizes, from a measurement on the Mac.
+3. Add one table row to the existing test of each behavior. Each row fails before its fix and passes after it.
+4. Update `docs/as-built/build-memory-admission.md` for the changed rules.
+5. Start from the saved patches in `phases/92/` in the run folder when they exist.
+
+**Constraints:**
+- Run no cleanup on the Mac, and no gc command of any kind. natedev asks the user whether to clear the two mirror targets now.
+- Read the Mac only with read-only commands. Change no Mac file, setting or claim.
+- Tests make their projects in a tempdir and never touch the real `/tmp`, `~/rust` or Mac home.
+- The alert text `sweep.disk_floor` keeps its approved words. If a fix needs a changed catalog text, post blocked.
+
+**Files:**
+- `scripts/lint/sweep.py` — the floor scan and the folder choices.
+- `scripts/mac_test/floor_claims.py` — the floor claims.
+- `scripts/lint/test_sweep.py`, `scripts/mac_test/test_floor_sweep.py` — the table rows.
+- `docs/as-built/build-memory-admission.md` — the changed rules.
+
+**Workers:** `1 writer + 1 tester`
+- `impl` owns `cause.md`, the source files and the as-built doc, and runs the final suites.
+- `test` owns the test files.
+
+**Acceptance gate:**
+- `cause.md` names the proven cause of the kept targets with its evidence.
+- Each new row fails before its fix and passes after it.
+- The changed test modules pass. Basedpyright reports `0 errors, 0 warnings, 0 notes` for every changed Python file.
