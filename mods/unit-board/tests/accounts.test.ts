@@ -5,7 +5,7 @@ import { register } from '../hooks/register';
 import { accountDisplay } from '../hooks/accounts';
 import { cellWidth } from '../hooks/geometry';
 import type { StoredAccountsStatus } from '../types/accounts';
-import { BOARD, CWD, DISCOVERY, drawnText, element, elements, fixture, hostEngine, NOW, REGISTRY, rowLines, RUN, styledText } from './kit';
+import { CWD, drawnText, element, elements, hostEngine, NOW, rowLines, styledText } from './kit';
 
 const HOME = '/test-home';
 const USAGE = `${HOME}/.local/state/agent-notes/usage.json`;
@@ -231,9 +231,8 @@ function accountsHost(on: On, missing: readonly string[] = [], environment: Reco
   });
   const directories = new Set([HOME, `${HOME}/.local`, `${HOME}/.local/state`,
     `${HOME}/.local/state/agent-notes`, `${HOME}/.local/state/accounts`, `${HOME}/.claude`,
-    `${HOME}/.claude/config`, DISCOVERY, REGISTRY]);
-  const mtimes = new Map<string, number>([...directories, ...INPUTS, BOARD, RUN].map(path => [path, NOW - 1000]));
-  mtimes.set(BOARD, NOW);
+    `${HOME}/.claude/config`]);
+  const mtimes = new Map<string, number>([...directories, ...INPUTS].map(path => [path, NOW - 1000]));
   for (const path of missing) mtimes.delete(path);
   let data = statusFixture();
   let failure = '';
@@ -272,8 +271,7 @@ function accountsHost(on: On, missing: readonly string[] = [], environment: Reco
     if (e.path === zonePath) {
       return { value: zoneConfig };
     }
-    if (e.path !== BOARD) throw new Error('The accounts pane must consume process JSON only');
-    return { value: JSON.stringify(fixture()) };
+    throw new Error('The accounts pane must consume process JSON only');
   });
   on('fs.write', (_$, e) => { fs.push(e.path); throw new Error('Unexpected fixture write'); });
   on('process.run', async (_$, e) => {
@@ -289,15 +287,13 @@ function accountsHost(on: On, missing: readonly string[] = [], environment: Reco
       return { value: { exitCode: 0, stdout: JSON.stringify(data), stderr: '',
         isStdoutTruncated: false, isStderrTruncated: false } };
     }
-    mtimes.set(BOARD, clock.now());
-    return { value: { exitCode: 0, stdout: JSON.stringify({ files: [BOARD], watch: [REGISTRY] }),
-      stderr: '', isStdoutTruncated: false, isStderrTruncated: false } };
+    throw new Error('Unexpected process from the accounts pane');
   });
   on('session.send', (_$, e) => { escaped.push(e.text); throw new Error('Unexpected message from accounts pane'); });
   return { ...host, clock, fs, mtimes, processes, escaped, stateWrites,
     accountStateKind: () => accountStateKind,
     accountRuns: () => processes.filter(isAccounts),
-    boardRuns: () => processes.filter(argv => !isAccounts(argv)),
+    otherRuns: () => processes.filter(argv => !isAccounts(argv)),
     replace: (next: StoredAccountsStatus) => { data = next; },
     failNext: () => { failure = `Stored status failed for ${address('fixture')}.`; },
     clear: () => { fs.length = 0; processes.length = 0; stateWrites.length = 0; },
@@ -824,7 +820,7 @@ describe('accounts pane', () => {
     await fake.clock.advance(10_000);
     expect(fake.accountRuns()).toEqual([ARGV]);
     expect(normalized(accountLines(await ui.drawn(), 'Low'))).toContain('unit directors 1 2 0 1 4');
-    expect(fake.boardRuns()).toEqual([]);
+    expect(fake.otherRuns()).toEqual([]);
     fake.clear();
     await fake.clock.advance(10_000);
     expect(fake.accountRuns()).toEqual([ARGV]);
@@ -850,7 +846,7 @@ describe('accounts pane', () => {
     await fake.clock.advance(10_000);
     expect([...fake.mtimes.entries()]).toEqual(unchanged);
     expect(fake.accountRuns()).toEqual([ARGV]);
-    expect(fake.boardRuns()).toEqual([]);
+    expect(fake.otherRuns()).toEqual([]);
     expect(normalized(accountLines(await ui.drawn(), 'Low'))).toContain('unit directors 1 1 0 0 2');
     expect(fake.escaped).toEqual([]);
     expect(fake.forbidden).toEqual([]);
@@ -881,7 +877,7 @@ describe('accounts pane', () => {
     expect(fake.accountRuns()).toEqual([ARGV]);
     expect(fake.accountStateKind()).toBe('accounts');
     expect(normalized(accountLines(await ui.drawn(), 'Low'))).toContain('unit directors 1 1 0 0 2');
-    expect(fake.boardRuns()).toEqual([]);
+    expect(fake.otherRuns()).toEqual([]);
     expect(fake.escaped).toEqual([]);
     expect(fake.forbidden).toEqual([]);
   });
@@ -1004,10 +1000,9 @@ describe('accounts pane', () => {
     expect(fake.closed).toEqual(['accounts']);
   });
 
-  test('closing during startup zone lookup cannot restart accounts while the board keeps refreshing', async ($, on) => {
+  test('closing during startup zone lookup cannot restart accounts', async ($, on) => {
     const fake = accountsHost(on, [], {});
     await $.session.start(start);
-    await $.command.run(command('showrunner:unit_board'));
     await $.command.run(command());
     const pending = fake.pauseZone();
     const restarting = $.session.start(start);
@@ -1022,10 +1017,6 @@ describe('accounts pane', () => {
     expect(fake.accountRuns()).toEqual([]);
     expect(fake.fs.some(path => INPUTS.includes(path))).toBe(false);
     expect(fake.fs.includes(`${HOME}/.claude/config/user_zone.conf`)).toBe(false);
-    fake.change(RUN);
-    await fake.clock.advance(10_000);
-    expect(fake.boardRuns().length).toBe(1);
-    expect(fake.fs.includes(RUN)).toBe(true);
     expect(fake.accountRuns()).toEqual([]);
   });
 
@@ -1144,22 +1135,18 @@ describe('accounts pane', () => {
     expect(fake.processes).toEqual([]);
   });
 
-  for (const close of ['showrunner:accounts', 'showrunner:unit_board']) {
-    test(`closing ${close} preserves the other pane refresh loop`, async ($, on) => {
+  for (const close of ['showrunner:accounts', 'build:queue']) {
+    test(`closing ${close} preserves the accounts lifecycle`, async ($, on) => {
       const fake = accountsHost(on);
       await $.session.start(start);
-      await $.command.run(command('showrunner:unit_board'));
       await $.command.run(command());
       await $.command.run(command(close, 'close'));
       fake.clear();
       fake.change(USAGE);
-      fake.change(RUN);
       await fake.clock.advance(10_000);
       expect(fake.accountRuns().length).toBe(close === 'showrunner:accounts' ? 0 : 1);
-      expect(fake.boardRuns().length).toBe(close === 'showrunner:unit_board' ? 0 : 1);
       expect(fake.fs.includes(USAGE)).toBe(close !== 'showrunner:accounts');
-      expect(fake.fs.includes(RUN)).toBe(close !== 'showrunner:unit_board');
-      await $.command.run(command(close === 'showrunner:accounts' ? 'showrunner:unit_board' : 'showrunner:accounts', 'close'));
+      await $.command.run(command(close === 'showrunner:accounts' ? 'build:queue' : 'showrunner:accounts', 'close'));
       fake.clear();
       await fake.clock.advance(60_000);
       expect(fake.fs).toEqual([]);
@@ -1204,11 +1191,10 @@ describe('accounts pane', () => {
   });
 
   for (const refresh of [false, true]) {
-    test(`closing during pending ${refresh ? 'refresh' : 'open'} leaves no state and keeps the board live`, async ($, on) => {
+    test(`closing during pending ${refresh ? 'refresh' : 'open'} leaves no state or background work`, async ($, on) => {
       const fake = accountsHost(on);
       await $.session.start(start);
-      await $.command.run(command('showrunner:unit_board'));
-      if (refresh) await $.command.run(command());
+        if (refresh) await $.command.run(command());
       const pending = fake.pause();
       let opening: Promise<unknown> = Promise.resolve();
       if (refresh) { fake.change(USAGE); opening = fake.clock.advance(10_000); }
@@ -1222,10 +1208,9 @@ describe('accounts pane', () => {
       expect(fake.accountStateKind()).toBe('closed');
       expect(fake.stateWrites.length).toBe(0);
       expect(fake.fs).toEqual([]);
-      fake.change(RUN);
       await fake.clock.advance(10_000);
       expect(fake.accountRuns()).toEqual([]);
-      expect(fake.boardRuns().length).toBe(1);
+      expect(fake.otherRuns()).toEqual([]);
     });
   }
 });
