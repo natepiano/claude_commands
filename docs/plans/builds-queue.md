@@ -704,6 +704,17 @@ After Phase 30, `build_targets.py` eligible, reserve and release-wait still use 
 
 The user approved aws-unit's design on 2026-11-08. Builds moved it to report, which starts after Phase 36 lands, because both edit memory_feed.py and memory_live.html.
 
+### Phase 37 — Build folders delete themselves when their process ends  · status: done
+
+1. **The rule (user via builds, 2026-11-09).** Our processes clean up after themselves, as `tempfile.TemporaryDirectory` does. Source: `/tmp/claude/leftover_sources_2026-11-09.md`, section "builds", item 2; detail in `/tmp/claude/leftover_sources_2026-11-09_detail.txt` lines 321-400.
+2. **Python callers.** Each bare `build_folders.create_build_folder(...)` caller whose folder only its own process uses moves to `with build_folders.temporary_build_folder(...) as path:`. Known callers: `scripts/production/merge_gate.py:1236`, `scripts/lint/style_review.py:183`, `scripts/style/style_sync.py:371`. Find every other caller with `rg -n 'create_build_folder|build_folders\.py.*(unique|stable)'`.
+3. **verify.sh folders.** `scripts/direct/verify.sh` makes three private folders with the `unique` CLI: verify-tree, verify-copy and verify-hold. The existing EXIT and signal traps remove each one on every handled exit, so `verify.sh` keeps them. A trial that ran verify under `build_folders.py run` changed its process ID and signal path and failed 22 test modules, so it was removed. Decision: director, builds agreed 2026-11-09.
+4. **Folders that must outlive their process stay.** Example: `scripts/hooks/session-start-temp-root.py:56` (session TMPDIR), `scripts/direct/prepare_session.sh:31` (unit session folder), `scripts/lint/invoke.sh:19` (`stable --path "$TMPDIR"`), `verify.sh:1281`. Each such call gets a one-line comment that says why the folder outlives its process.
+5. **Not in this phase.** Add no check, scan or audit. Add no signal handler (TMPDIR is cleared at reboot). `copies.py` belongs to verify; `memory_page_proof.mjs` belongs to report. If the `unique` CLI has no caller left, remove it; otherwise keep it.
+6. **Proof.** Rows in existing tests: a caller's folder is gone after the caller returns and after it raises. For verify.sh, the existing verify tests still pass, and the three folders are gone after a verify run ends.
+
+**Workers:** 1 writer and tester. **Gate:** targeted test, basedpyright 0/0/0, adversary review.
+
 ### Phase 36 — Swap by group adds up to the swap bar  · status: done
 
 1. **The ask (user via builds, 2026-11-08).** The bar said 23.8 of 38.2 GiB swap used; the groups summed to about 0.3 GiB. Add a Total row so the rows add up to the bar, show the real owner of the gap, and give the three "between steps" rows labels that tell them apart.

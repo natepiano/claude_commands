@@ -1278,6 +1278,7 @@ if [[ "${1:-}" == "--session-dir" ]]; then
     shift 2
     # Test temp folders land in the run folder and end with it (tmp_sweep.py judges each entry).
     SESSION_TMPDIR="$("$PY" "$BUILD_FOLDERS_SCRIPT" run-temp-path "$UNIT_SESSION_DIR")"
+    # Other worker commands use the session TMPDIR after this verify process exits.
     if [[ -d "$SESSION_TMPDIR" ]] || "$PY" "$BUILD_FOLDERS_SCRIPT" stable --run-temp "$UNIT_SESSION_DIR" >/dev/null 2>&1; then
         export TMPDIR="$SESSION_TMPDIR"
     fi

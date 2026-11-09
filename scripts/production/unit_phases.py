@@ -421,9 +421,11 @@ def table(units: list[live_units.LiveUnit], records: dict[str, object], *,
         except (OSError, ValueError) as error:
             print(f"unit_phases: workers: {error}", file=sys.stderr)
             pane_rows = {}
-    lines = [f"| Unit | Status | Progress | Phase | ETA | {worker_heading()} | Non-Phase Work | Queued |",
-             "| --- | --- | --- | --- | --- | --- | --- | --- |"]
-    for unit in units:
+    machines = display_cells.machine_column([unit.machine for unit in units])
+    headers = ("Unit", "Status", *(("Machine",) if machines else ()), "Progress", "Phase", "ETA",
+               worker_heading(), "Non-Phase Work", "Queued")
+    lines = ["| " + " | ".join(headers) + " |", "| " + " | ".join(("---",) * len(headers)) + " |"]
+    for index, unit in enumerate(units):
         record = records.get(unit.unit)
         progress_record = record
         member = unit.member
@@ -447,7 +449,8 @@ def table(units: list[live_units.LiveUnit], records: dict[str, object], *,
                 rows = worker_runs.observe_pane_rows(session_directory(run), pane_rows.get(member.id, []),
                                                      snapshot, member.id, read_run(run.path), runs_reader)
                 workers = workers_cell(rows, now=now)
-        cells = (unit.unit, unit.status, progress_cell(progress_record), phase_cell(record, read_run=read_run),
+        cells = (unit.unit, unit.status, *((machines[index],) if machines else ()),
+                 progress_cell(progress_record), phase_cell(record, read_run=read_run),
                  eta_cell(progress_record, now=now, zone=zone), workers, other, queued)
         lines.append("| " + " | ".join(display_cells.escaped(cell) for cell in cells) + " |")
     return "\n".join(lines)

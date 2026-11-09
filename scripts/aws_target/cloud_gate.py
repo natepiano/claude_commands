@@ -10,7 +10,6 @@ from collections.abc import Callable, Generator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
-from decimal import Decimal
 from hashlib import sha256
 import json
 import os
@@ -27,7 +26,7 @@ from typing import Literal, cast, final
 from uuid import uuid4
 
 from scripts.aws_target import gate_box, ledger
-from scripts.aws_target.aws_target import AwsCli, AwsUnavailable, control_lock
+from scripts.aws_target.aws_target import AwsCli, AwsUnavailable, control_lock, fetch_account_charges
 from scripts.aws_target.config import money, read_settings
 from scripts.build_queue import admission_client, admission_protocol as wire, cloud_progress, progress_profile
 from scripts.build_queue.queue_place import defer_cleanup_signals
@@ -168,21 +167,11 @@ class GateWorker:
         cloud_progress.publish(self.sidecar, log_cloud_progress(text, self.size_vcpus, self.clock()))
 
     def charges(self) -> None:
-        def fetch(start: int, end: int) -> Decimal:
+        now = int(self.clock())
+        def fetch(start: int, end: int) -> tuple[ledger.ChargeRead, ...]:
             policy = read_settings(self.settings_path)
-            period = ','.join((f'Start={datetime.fromtimestamp(start, UTC):%Y-%m-%d}',
-                               f'End={datetime.fromtimestamp(end, UTC):%Y-%m-%d}'))
-            reply = self.api.call('get-cost-and-usage', '--time-period', period, '--granularity', 'DAILY',
-                                  '--metrics', 'UnblendedCost', '--filter', json.dumps({'Tags': {
-                                      'Key': policy.cost_explorer_tag_key, 'Values': [policy.cost_explorer_tag_value]}}), service='ce')
-            total = Decimal(0)
-            for row in ledger.rows(reply, 'ResultsByTime'):
-                cost = ledger.mapping(ledger.mapping(row['Total'])['UnblendedCost'])
-                if cost.get('Unit') != 'USD':
-                    raise ValueError('Cost Explorer did not return USD')
-                total += money(ledger.text(cost, 'Amount'))
-            return total
-        _ = self.book.refresh_charges(self.settings_path, int(self.clock()), fetch, gate_workload=True)
+            return fetch_account_charges(self.api, start, end, now, policy.cost_explorer_read_usd)
+        _ = self.book.refresh_charges(self.settings_path, now, fetch, gate_workload=True)
 
     def upload(self, bucket: str, key: str, path: Path) -> None:
         _ = self.api.call('put-object', '--bucket', bucket, '--key', key, '--body', str(path), service='s3api')

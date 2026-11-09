@@ -632,7 +632,10 @@ Saved progress state uses the fixed staff reference instead of a copied session 
   - **Phase productions:** `| Unit | Status | Progress | Phase | ETA | Workers | Non-Phase Work | Queued |`.
     Status uses the [shared session classifier](accounts.md#status-counts-and-notes).
     A live Claude or Codex pane supplies live evidence.
-    An active unit on another machine shows `on <machine>`.
+    Both tables add a **Machine** column after **Status** only when a row runs on another machine.
+    The home machine is the `kind.<machine>=local` entry in `config/build_targets.conf`.
+    `worker.py list` places the optional machine field after the account field, and takes the machine from the parent's worktree.
+    `worker.py list --json` keeps its existing fields.
     Phase shows `phase <n> of <m> — <task>`.
     The task uses the newest plan run's open step, then the phase title.
     Other phase states include `between phases`, `not started`, `plan done`, `no phases`, and `no plan`.

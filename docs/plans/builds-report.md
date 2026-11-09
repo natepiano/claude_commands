@@ -206,7 +206,9 @@ Method (side A and side B 1 already ran this way; keep it):
 4. Run each verify.sh call with `--local`, `--no-cache` and the measurement reason, on natedev only.
 5. Record wall, build, test, wait and load per run. Exclude an interrupted run.
 6. Each incremental run alternates adding and removing one comment in `crates/hana/src/environment/constants.rs`, a leaf module of the hana binary. Both sides use the same edit sequence; side B starts from the original file.
-7. The completed runs, the clone path and the run receipts are in `report-unit-dylib-ab.md` at the worktree root. Read it first and run only the missing runs.
+7. The completed runs are in `report-unit-dylib-ab.md` at the worktree root. Read it first and run only the missing runs.
+8. The missing runs are side B incremental tests 2 and 3. The B2 run `20261103T221339-813897-4c39` ended with exit 143 while it waited for memory, so it is not a sample. Its record and log are in `/tmp/claude/unit/b090f8f1-cf8e-4d44-8e52-b223d94de9cc/mesh_runs/`. Check that record again before you select the runs.
+9. The clone at `/tmp/claude/unit/b090f8f1-cf8e-4d44-8e52-b223d94de9cc/dylib_ab/hana` no longer exists (checked 2026-11-09). `target-a` and `target-b` remain beside it. Make a new clone at the same commit in that folder. If the target folders are gone, the side B runs need a new cold build first.
 
 Completion gate: add one row to `docs/plans/builds-report-rounds.md` with the hana commit, the settings of each side, the measured times, the limits and the conclusion. Mark it as a controlled A/B result, not a phase-time measurement over ten hana phases. Record the `record.py` commit of each run: Phase 16 cut its CPU per step. If runs used different versions, say so; do not repeat completed runs for that reason.
 
@@ -907,29 +909,15 @@ The build log index uses WAL mode, so a spilled update takes no exclusive lock a
 - The kernel stamps file times from a coarse clock that can be one tick behind `time.time()`. A test that compares a file time with `time.time()` fails now and then; a cloud gate saw a 0.16 ms miss.
 
 ### Phase 43 — The build page proof removes the folders it makes · status: done
-**Depends on:** none.
 
-From the builds showrunner (not the user), 2026-11-09, for the user rule of 2026-11-09 "our processes clean up after themselves, as tempdir does" (report `/tmp/claude/leftover_sources_2026-11-09.md`, section builds, item 2).
+#### As-built
 
-#### Work Order
-
-**Goal:** `memory_page_proof.mjs` removes each temporary folder it makes when the proof ends, on pass and on failure.
-
-**Spec:**
-- Line 13: with no `argv[2]`, the proof makes `memory-page-proof-*` with `mkdtemp`. Remove it with `rm(..., {recursive:true, force:true})` in a `finally` that covers all work after the `mkdtemp`. A folder given as `argv[2]` belongs to the caller and stays.
-- Line 90: the `memory-proof-chrome-*` profile. Today the `finally` at line 597 removes it only after the `try` at line 98 starts. Make the removal cover every exit after its `mkdtemp`.
-- The success line names `output` only when the caller gave a folder; a removed folder is not named.
-- No check, scan or signal handler.
+- `memory_page_proof.mjs` removes its `memory-page-proof-*` output folder and its `memory-proof-chrome-*` profile when the proof ends, on pass and on failure.
+- A folder given as `argv[2]` belongs to the caller and stays. The success line names `output` only for that folder.
+- The script has no folder scan and no signal handler.
 
 **Files:**
-- `scripts/build_queue/memory_page_proof.mjs`
+- `scripts/build_queue/memory_page_proof.mjs` — the build page proof.
 
-**Workers:** `1 writer`
-- writer — `memory_page_proof.mjs`; runs the proof.
-
-**State:** none.
-
-**Acceptance gate:**
-- The proof passes with no argument, and no `memory-page-proof-*` or `memory-proof-chrome-*` folder from that run remains in `$TMPDIR`.
-- The proof passes with a folder argument; that folder and its `proof.json` stay.
-- A proof that fails (for example `CHROME=/nonexistent`) leaves no folder of its own.
+**Gotchas:**
+- Chrome refuses a long temporary socket path. Run the proof under a short `$TMPDIR` when the default path is long.
