@@ -248,6 +248,21 @@ class RemoteCopiesTests(unittest.TestCase):
         self.assertIn("--repository " + self.source.name, receiver)
         self.assertIn("--session holder-session", receiver)
         self.assertIn("--delete", command)
+        self.assertIn("--compress", command)
+        self.assertIn("-rlptc", command)
+        exclude = self.root / "excludes"
+        _ = exclude.write_text("/target/\n")
+        output = self.root / "receiver"
+        for body in ("before", "edited"):
+            with self.subTest(body=body):
+                source = self.source / "same-size.txt"
+                _ = source.write_text(body)
+                os.utime(source, (1_000_000_000, 1_000_000_000))
+                answer = subprocess.run([*command[:-1], f"{output}/"],
+                    capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
+                self.assertEqual(answer.returncode, 0, answer.stdout + answer.stderr)
+                self.assertEqual((output / "same-size.txt").read_text(), body)
+                self.assertEqual((output / "same-size.txt").stat().st_mtime_ns, source.stat().st_mtime_ns)
 
     def test_owner_removal_keeps_another_owner_and_repository(self) -> None:
         mine, other, elsewhere = self.remote(), self.remote("beta", "mirror/beta"), self.remote("alpha", "mirror/else")
