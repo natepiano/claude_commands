@@ -493,6 +493,11 @@ if [[ "${VERIFY_QUERY_ARGS[0]:-}" == final && " ${VERIFY_QUERY_ARGS[*]} " == *" 
     export CLAUDE_PYTHON="${CLAUDE_PYTHON:-python3}"
     exec "$PY" "$VERIFY_START_DIR/final_pass.py" query "$VERIFY_START_DIR/verify.sh" "$SAVED_TREE"
 fi
+VERIFY_REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+if [[ ! -f "$VERIFY_REPO_ROOT/Cargo.toml" ]]; then
+    printf 'verify.sh: %s has no Cargo.toml; verify.sh checks Cargo repositories only\n' "$VERIFY_REPO_ROOT" >&2
+    exit 2
+fi
 # Create the inherited temporary parent before environment commands use it.
 VERIFY_INVOKE_DIR="${BASH_SOURCE[0]%/*}"
 [[ "$VERIFY_INVOKE_DIR" != "${BASH_SOURCE[0]}" ]] || VERIFY_INVOKE_DIR=.
@@ -1284,24 +1289,24 @@ case "$CMD" in
     *) usage; exit 2 ;;
 esac
 
-# A Codex mesh worker's command dies with its turn, and a worker that waits on
-# one spends a model call per wait. So a worker's call detaches: mesh_runs.py
+# A native worker's command dies with its turn, and a worker that waits on
+# one spends a model call per wait. So a worker's call detaches: detached_runs.py
 # runs this same call under a supervisor outside the worker's process group,
 # returns at once, and sends the result to the worker as its next message.
-# Exit 3 means the caller is not a mesh worker; this call then runs attached.
+# Exit 3 means the caller is not a registered worker; this call then runs attached.
 # Exit 4 refuses the run at its live-run limit; never run that command attached.
 # The detached run sets UNIT_DETACHED_RUN, so it does not detach again.
-MESH_RUNS_SCRIPT="${VERIFY_MESH_RUNS_SCRIPT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../agents" && pwd)/mesh_runs.py}"
+DETACHED_RUNS_SCRIPT="${VERIFY_DETACHED_RUNS_SCRIPT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../agents" && pwd)/detached_runs.py}"
 if [[ -z "${UNIT_DETACHED_RUN:-}" && -n "${CODEX_THREAD_ID:-}" ]]; then
     VERIFY_SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
     DETACH_STATUS=0
-    "$PY" "$MESH_RUNS_SCRIPT" start --label "verify.sh ${VERIFY_ORIGINAL_ARGS[*]-}" -- \
+    "$PY" "$DETACHED_RUNS_SCRIPT" start --label "verify.sh ${VERIFY_ORIGINAL_ARGS[*]-}" -- \
         bash "$VERIFY_SELF" ${VERIFY_ORIGINAL_ARGS[@]+"${VERIFY_ORIGINAL_ARGS[@]}"} || DETACH_STATUS=$?
     case "$DETACH_STATUS" in
         0) exit 0 ;;
         3) ;;
         4) exit 4 ;;
-        *) echo "verify.sh: mesh_runs.py could not detach this run (exit $DETACH_STATUS); running attached" >&2 ;;
+        *) echo "verify.sh: detached_runs.py could not detach this run (exit $DETACH_STATUS); running attached" >&2 ;;
     esac
 fi
 
@@ -1426,18 +1431,13 @@ if kind == "token":
     if payload == "director":
         owner = unit_runs.director(board)
     elif payload and payload != "unknown":
-        roster = fields(read(board / "mesh_roster.json"))
-        matches = [entry for name, entry in roster.items() if isinstance(entry, dict)
-                   and name == payload]
+        matches = []
         if not matches:
             for path in board.glob("impl_worker_*.json"):
                 worker = fields(read(path))
                 if (text(worker.get("slot")) == payload
                         or path.stem == "impl_worker_" + payload):
                     matches.append(worker)
-        if not matches:
-            matches = [entry for entry in roster.values() if isinstance(entry, dict)
-                       and entry.get("slot") == payload]
         state = fields(read(board / "progress_history_state.json"))
         if matches:
             reference = text(matches[0].get("staff_id")) if len(matches) == 1 else ""

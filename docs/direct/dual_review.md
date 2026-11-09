@@ -48,8 +48,11 @@ The worker command selects a free reviewer and retains its native conversation a
 Writers keep their assigned roles.
 
 The worker is the address and the lens is the judgment. Pass the lens to
-`assign.sh`; its returned handle names the selected worker and summary. Each
-lens has its own artifact paths.
+`assign.sh`. Exit 0 means submitted, with the pass still active.
+Each lens has its own artifact paths.
+After the main review, end the director turn.
+Each turn hook sends the director a result and reply path.
+Read that reply when the message resumes the director.
 
 The adversary's brief is to break the change, not to check it. It reports the
 concrete failing case it built, or reports plainly that it could not build one:
@@ -80,7 +83,6 @@ Re-read the tree; trust nothing from memory about its state.
 
 For `herdr`, the reviewer posts no board lines and runs no suites.
 The director or a writer handles required board posts and suites.
-For an existing `mesh` pin, give the concrete `board.sh role ... review` command as the reviewer's first tool call.
 The reviewer reports each activity change as a short output line.
 It never polls, sleeps, or reports a wait.
 Give it no heartbeat path or `${IMPL_SUMMARY}`.
@@ -88,7 +90,6 @@ The reviewer runs read-only.
 
 Do not repeat the implementer's listed verification.
 For `herdr`, name an omitted check for the director or a writer when a plausible regression requires it.
-For an existing `mesh` pin, a reviewer may run one omitted check for a plausible regression outside the listed gate.
 It names the command and uses `verify.sh` under <WritePromptContract/> item 3.
 Every Codex review prompt carries that item's `## Builds and tests` section verbatim.
 Broad reviews apply <TypeDesignContract/>.
@@ -254,7 +255,6 @@ final diff only.
    For `herdr`, Stage 2 uses `worker.py` with dispatch id `<dispatch id>-2`.
    The launcher reads the transcript before input and requires `DONE <dispatch id>-2` to complete review.
    Review Stage 2 reports through its status and summary files.
-   Only an existing mesh pin selects the retained mesh Stage 2 route.
 2. Apply <ReviewDiffContract/>. Before the broad review, save the complete phase
    diff to a file and run this read-only check in every repository, including Rust:
 

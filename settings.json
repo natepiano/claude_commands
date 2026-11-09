@@ -240,6 +240,16 @@
     "nightly_review": "user-invocable-only"
   },
   "hooks": {
+    "PostCompact": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$HOME/.claude/scripts/lib/py\" \"$HOME/.claude/scripts/hooks/compaction-marker-clear.py\""
+          }
+        ]
+      }
+    ],
     "PostToolUse": [
       {
         "matcher": "Bash",
@@ -256,6 +266,16 @@
             "type": "command",
             "command": "\"$HOME/.claude/scripts/lib/py\" \"$HOME/.claude/scripts/hooks/hook_dispatch.py\" post_tool_use",
             "timeout": 2430
+          }
+        ]
+      }
+    ],
+    "PreCompact": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$HOME/.claude/scripts/lib/py\" \"$HOME/.claude/scripts/hooks/pre-compact-marker.py\" --family claude"
           }
         ]
       }
@@ -388,7 +408,7 @@
           {
             "type": "command",
             "command": "\"$HOME/.claude/scripts/lib/py\" \"$HOME/.claude/scripts/hooks/hook_dispatch.py\" stop",
-            "timeout": 1840
+            "timeout": 1850
           },
           {
             "type": "command",

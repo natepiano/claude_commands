@@ -245,7 +245,11 @@ On failure, it undoes the merge and prints the failed suites' output.
 
 `discover_test_modules` finds every `scripts/**/test_*.py` file outside `__pycache__`, in path order. The first folder under `scripts/` is its suite; a test file directly under `scripts/` is refused. `test_module_name` keeps the path within the suite in timing keys, results and log lines. Retries keep the original job path, so a nested failure reruns the same file. Job kind is independent of suite name: a test suite named `types` still runs unittests, and the type check has its own job kind. Discovery tests check real regression paths and nested retries.
 
-**Launcher follow tests.** `test_implement_launcher_follow.py` reuses the existing completed-worker fixture: one real initial launch per class, copied to private files at the same paths for each test. Follow-up, repair, identity migration and refusal checks still run the real Bash launcher and recorder processes. Initial-launch results and all follow-up assertions are preserved.
+**Claude launcher tests.** `test_assign_claude*.py` run the real `assign.sh` path with a private Claude binary.
+The fixtures restore private run, claim, staff, transcript, and configuration files.
+`test_claude_worker.py` covers the coordinator's launch, delivery, completion, and cancellation behavior.
+The cancellation case permits a closed gate socket after SIGTERM.
+The completion case retains its strict socket send.
 
 **One test hang guard.** Tests import `TEST_HANG_GUARD_SECS` and `LauncherHangGuard` directly from `scripts.lib.test_hang_guard`. The shared limit is 600 seconds. `scripts/lib/test_one_hang_guard.py` parses every Python file under `scripts/` and refuses local assignments or imports through other modules. Each refusal gives its path and line. Fixture script text is data and can receive the shared value through a placeholder. Expected events use the shared guard; negative observation windows, product timeout settings and elapsed-time assertions keep their behavior.
 
@@ -324,7 +328,7 @@ Without exact reuse, a targeted test selects affected modules as described below
 `--full` bypasses reuse.
 A red nightly marker bypasses reuse only in a merge gate.
 
-Recursive discovery changes the ledger key once, so the first gate after this change runs all modules. A later added or removed test folder changes the suite set and also forces a full run. The newly covered modules add about 120 module-seconds (measured 2026-10-30).
+An added or removed test folder changes the ledger suite set and prevents reuse of a pass with another suite set.
 
 **Affected modules for targeted tests** (`scripts/production/affected_modules.py`).
 The base is the newest full record on this host with the complete suite set and a commit that is an ancestor of `HEAD`.
@@ -471,6 +475,7 @@ The admission, scheduling caches, and rerun rules below apply to `SharedMachine`
 - **CPU records.** `module_cpu_seconds.json` maps each module path to the last completed attempt's CPU seconds.
   The type-check job uses the `types/basedpyright` key.
   The runner reads user and system CPU time with `os.wait4` when it reaps each leader.
+  Signal deferral protects the reap and its stored status and CPU value.
   This includes children that the leader waited for.
   Children killed during cleanup after their leader exits do not contribute to this reading.
   At run end, the runner writes the records atomically and retains entries for jobs that did not run.
@@ -509,7 +514,9 @@ The admission, scheduling caches, and rerun rules below apply to `SharedMachine`
   A failed send prints one line and does not change the gate result.
   The gate record retains the key `cap_mib` for the governor value in MiB.
 - **Running job limit.** A module starts only when memory admits it and fewer than `max(1, (os.cpu_count() or 2) // 2)` jobs run: half the cores, with a minimum of one. The basedpyright job counts as one. `run_suites` accepts `max_running_jobs` for tests; there is no environment variable or command-line flag. The `Gate tests:` line names the limit once. On 2026-10-28, starting nearly all modules at once raised one-minute load from 71.6 to 339.7 and made every module 3–5 times slower.
-- **Cleanup.** When a job's leader exits, the runner SIGKILLs the job's whole process group, which catches leaked children. On any exit it kills and reaps every running group before the tmpfs dir is removed. It never kills a process outside its own groups.
+- **Cleanup.** When a job's leader exits, the runner kills its process group to stop leaked children.
+  Every exit kills and reaps running groups before removing the temporary root.
+  `build_folders.temporary_build_folder` removes the private root after success, failure, TERM, HUP, or INT. It never kills a process outside its own groups.
 - **Report.** Each suite shows `OK` or `RED` and its wall time.
   Failed modules show their exit codes and full output; basedpyright shows its verdict and output.
   A module reports `Slow module:` when it exceeds its recent median by both `SLOW_MODULE_FACTOR` (3) and `SLOW_MODULE_FLOOR_S` (60 seconds).
@@ -534,13 +541,36 @@ The median type check took 164 seconds and reached 4.07 GiB.
 Type checks used 3.4% of gate CPU time.
 The daily rule removes these jobs from default gates.
 
-**`--promote`** runs after the merge-branch push:
-- It waits up to 60 s for the existing `build-hold-release/release.lock` to be free, checking every 0.2 s; a missing directory or lock file permits promotion without creating state, and a lock held for the whole wait refuses promotion.
-- It requires the `--main-repo` checkout on `main` with HEAD equal to `origin/main`, and `origin/main` an ancestor of `origin/<merge branch>`. Before any promotion operation, it refuses tracked work tree or index changes from HEAD and names every file. A private index checks file contents without the live index's `assume-unchanged` or `skip-worktree` flags. The live index and edits stay unchanged; untracked files do not count.
-- Before the local fast-forward, promotion records the exact source commit and base in a separate push recovery record; after a stop or failed push, it pushes that recorded local commit only when origin/main is its ancestor and the source branch still contains it, never on tree equality alone.
-- It re-checks the settings blob on `origin/<merge branch>`, waits for the last hold, then checks tracked edits again before the fast-forward and push.
-- It runs the Mac fast-forward over `ssh -o ConnectTimeout=10` with a 25 s limit. The Mac uses the same tracked edit check before fetch and again before merge; a refusal names each file in the result and keeps its edits. The remote command prints `ff_rc=<status>` and exits 0, so the gate parses `ff_rc=` and needs exactly `["0"]`. Any Mac failure reports `main promoted to <hash>; Mac fast-forward failed: ...; the claude-sync job on the Mac retries within 15 minutes`.
-- **Self-heal (2026-10-27).** `scripts/lib/main_sync.py` is the retry. The nixos job `claude-sync` (`modules/common/claude-sync.nix`) runs it every 15 minutes on both machines with `--notify natedev`. It fetches origin main and fast-forwards `~/.claude` only when the checkout is on main, has no tracked-file changes, has no merge, rebase or cherry-pick in progress, and origin/main holds HEAD. It never resets, stashes or makes a merge commit; untracked files do not count. States: `current`, `advanced`, and the blocked `unreadable`, `not-main`, `in-progress`, `fetch-failed`, `diverged`, `dirty`, `ff-failed` (exit 1). Each run appends a line to `~/.local/state/main-sync/sync.jsonl` (`MAIN_SYNC_STATE_DIR`); `blocked.txt` holds the blocked state, so each new cause sends one message and a sync clears it. Cause: from 2026-10-26 20:10 the Mac missed 12 promotions because the showrunner promoted with plain git and the Mac step never ran.
+**`--promote`** runs after the merge-branch push.
+
+1. Wait for `build-hold-release/release.lock` within the configured release wait.
+2. Verify that the promotion checkout uses main and has an eligible recorded tip.
+3. Verify the settings blob and ancestry of `origin/<merge branch>`.
+4. Check edited paths against the target through `promotion_edit_conflict(repo, target)`.
+5. Record the exact source commit and base for push recovery.
+6. Fast-forward local main and push it.
+7. Fast-forward the Mac through SSH and inspect its printed `ff_rc=` result.
+
+`promotion_edit_conflict` refuses only edited paths that the promotion also changes.
+A private index exposes edits hidden by `assume-unchanged` or `skip-worktree`.
+The live index and edits stay unchanged; untracked files do not count.
+Local, Mac, and checkpoint promotion use this function.
+A retry can push its recorded local commit when origin/main remains its ancestor and the source still contains it.
+Tree equality alone does not authorize that push.
+The Mac command has a 25-second limit and must print exactly one successful `ff_rc=0` result.
+A failed Mac advance names the published local commit and leaves retry to main synchronization.
+
+- **Main synchronization.** `scripts/lib/main_sync.py` fetches main and fast-forwards an eligible checkout.
+  The `claude-sync` job runs every 15 minutes on both machines.
+  It refuses another branch, an active Git operation, divergence, or tracked edits before an advance.
+  It never resets, stashes, or creates a merge commit.
+  Each run appends `MAIN_SYNC_STATE_DIR/sync.jsonl`, default `~/.local/state/main-sync/`.
+  No blocked-state marker exists.
+  Each blocked run with `--notify` calls `send.py`.
+  The key is `main-sync-<host>-<state>`.
+  `send.conf` supplies `main_sync_repeat_minutes` for delivery suppression.
+  A failed fetch advises `github-warmup` only when the credential check fails, is absent, or exceeds five seconds.
+  Warm credentials instead produce a likely GitHub incident message.
 
 Tests use independent scratch repositories.
 The modules in `scripts/production/` cover these subjects:
@@ -553,13 +583,54 @@ The modules in `scripts/production/` cover these subjects:
 6. `test_merge_gate_holds.py`: holds and interruptions.
  `merge_gate_test_support.py` caches one repository seed per class and fixture folder set, then restores a private copy at its original path for each test. Cases declare the folders needed for their contract. The fixture writes test modules in those folders; it does not replace discovery or copy the checkout's suite names. CLI calls run in-process except where signals, child ownership or the executable entry point are under test. The gate discovers all parts through `test_*.py`; the affected-module graph follows their shared-helper imports.
 
-Checkpoint integration tests are split into `test_merge_checkpoint.py` (input and scope), `test_merge_checkpoint_receipts.py` (receipts and wait attribution), `test_merge_checkpoint_validation.py` (validation and notifications), `test_merge_checkpoint_promotion.py` (promotion and retries), `test_merge_checkpoint_history.py` (shrink, as-built and history), `test_merge_checkpoint_handoff.py` (child handoffs), and `test_merge_checkpoint_ledger.py` (handoff ledger recovery). `merge_checkpoint_test_support.py` builds one Git seed per class and copies it back to the original paths for each case, including each provenance matrix cell. Synchronous checkpoint, recorder and fake-tool calls run through their real entry points in-process; Git, executable Git stand-ins, and existing unit and child-handoff CLI cases retain real subprocesses. Every original test body and assertion is retained.
+Checkpoint integration modules separate inputs, receipts, validation, promotion, history, child handoffs, and handoff ledger recovery.
+`merge_checkpoint_test_support.py` restores a private Git seed at the same paths for each case.
+Ordinary CLI cases use the real parser and handlers in-process.
+Git, executable stand-ins, and selected unit and child-handoff cases retain real subprocesses.
 
 Findings-ledger tests remain in `scripts/direct/test_findings.py`, with `findings_test_support.py` restoring one private fixture seed at the same path for each case. Commands execute the real CLI in-process with a fresh module namespace, so every invocation rereads configuration and all ledger, event, parser and locking code stays active. Stable-ID persistence across invocations and unusable-configuration cases retain real Python subprocesses. All original test bodies and assertions are retained.
 
 Conversation-pause hook behavior tests live in `scripts/hooks/test_conversation_pause.py`; `test_conversation_pause_processes.py` covers alarm budgets, executable exits and concurrent lock/delivery. Both use `conversation_pause_test_support.py` restoring a private fixture seed at the same path for each case. Synchronous behavior cases execute the real hook and CLI entry points and their current Python stand-ins in-process, with isolated input, output, environment, import-time fixture paths and signal handlers. Alarm-budget, concurrent lock/delivery and executable-error cases retain real processes; detached activity calls remain detached. Fixture release and activity waits use file events and a 600-second hang guard in `scripts/lib/test_hang_guard.py`. All original assertions are retained.
 
 Style-planner tests use `style_plan_test_support.py` and split by subject into `test_style_plan.py` (rank, scope and concurrency), `test_style_plan_phases.py` (written instructions), `test_style_plan_gate.py` (gate and formatting contracts), `test_style_plan_selection.py` (held judgments), `test_style_plan_ancestry.py` (judgment tips and synchronization), `test_style_plan_structure.py` (structure priority), `test_style_plan_refill.py` (unsynced product changes), `test_style_plan_recovery.py` (waits and interrupted phases), `test_style_plan_decisions.py` (decision tickets), `test_style_plan_batches.py` (large restructure batches), `test_style_plan_type_batches.py` (type read limits), `test_style_plan_declarations.py` (declaration following), `test_style_plan_decision_completion.py` (decision completion and recovery), `test_style_plan_sites.py` (moved sites), `test_style_plan_split.py` (split accounting and command orchestration), `test_style_plan_ownership.py` (busy rename references), `test_style_plan_module_owners.py` (busy module declarations), `test_style_plan_renames.py` (item reference edits), `test_style_plan_file_renames.py` (file moves and declarations), `test_style_plan_borrowing.py` (cross-family selection and projected findings), `test_style_plan_checkpoint_refill.py` (disjoint work behind a checkpoint), and `test_style_plan_pipeline_growth.py` (atomic footprint growth and rechecks). Each class builds a complete Git/worktree fixture once and restores a private copy at the same paths for each test. Synchronous CLI and formatter fixtures run their actual code in-process; a gate case retains the executable boundary. Concurrent refill tests release on observed lock contention, with committed-ticket and disjoint-file assertions.
+
+### Small fixes on main
+
+`commands/unit/fast_track.md` defines the fast-track exception for small fixes.
+`fast_track.py --unit <unit> --production <showrunner name> --why "<one line>" <paths>...` selects changes against HEAD.
+New files can be selected.
+`copies.standing` supplies an isolated checkout of `origin/main`.
+The command applies the patch with `git apply --3way`.
+It runs direct test modules for changed Python files, imports each changed module, and checks the basedpyright footer.
+The check uses `merge_gate.test_module_environment` and its tripwires.
+An empty helper module can pass discovery; a failed package import cannot.
+The fast check uses no full merge gate or queue admission.
+`config/fast_track.conf` supplies the size, file, time, push-attempt, and refused-path limits.
+Imports of refused repository modules also refuse the fix, including indirect imports.
+
+A successful check creates a `fast-track(<unit>): <why>` commit with `Fast-Track: <unit>`.
+`main_push_lock` protects its fast-forward push.
+A moved main causes another application and check within `max_push_attempts`.
+The command then promotes through the production's configured targets and restores the selected source changes.
+A refusal before publication exits 2.
+A failure after publication exits 1 and retains the published commit.
+A completed retry prints `already on main at <commit>` and creates no new commit.
+
+Each attempt keeps a `PushAttempt` JSON record and recovery refs under `refs/fast-track/{selections,attempts}/`.
+The refs protect the original trees from garbage collection.
+Automatic restore requires overlapping requested paths.
+It validates every original path before restoring any path and preserves later index and worktree edits.
+An unrelated pending attempt produces a warning.
+`--close-restore <attempt>` permanently closes automatic restore, retains the JSON record, and removes the recovery refs.
+HEAD ancestry containing the pushed commit also closes restore.
+`records.jsonl` under `FAST_TRACK_STATE_DIR`, default `~/.local/state/fast-track/`, records publication and pending review.
+`--pending --unit <unit>` prints pending review diffs.
+Broad reviews include these diffs and record their review pass.
+Later merge gates and the nightly run test published fixes through their normal paths.
+
+`fetch_main` retries only Git failures containing `cannot lock ref`.
+It uses `fetch_lock_attempts` and `fetch_lock_wait_seconds` from the command's configuration read.
+Temporary checkouts use their own fetches and refs.
 
 ### Test-speed infrastructure
 
@@ -570,7 +641,8 @@ Style-planner tests use `style_plan_test_support.py` and split by subject into `
   - `SystemExit` becomes the return code; a string code is printed to stderr.
   - With `production_state=True` it first imports `dailies_render` and `showrunners` in the caller's environment, then patches their import-time paths under the fixture HOME: `CHART_CONF`, `AGENTS_DIR`, `READINGS_LOG`; `CONFIG`, `NOTIFIER_STATE_DIR`, `SESSIONS_DIR`, `SHOWRUNNER_STATE_DIR`, `SESSIONS`, `SEND`.
 - `ImmutableGitSeed.create(root, branch, author, email, files)` builds one checkout plus a bare origin per test class, with `GIT_CONFIG_GLOBAL=/dev/null`. `copy_to(checkout, origin)` copies both trees and repoints the remote, so each case has private refs, config, index and origin without re-running git setup.
-- Converted test modules keep one `subprocess_cli=True` case per script, covering parsing, exit status and the launch contract. `mac_test/test_offload.py` imports `cli_fixture` through a `sys.path` insertion.
+- Converted modules retain a `subprocess_cli=True` case for parsing, exit status, and executable behavior.
+  `scripts.mac_test.test_offload` imports `scripts.production.cli_fixture` by package name.
 
 **Session host fakes.** Production, message and shutdown tests reach herdr only through `scripts/herdr/fake_herdr.py` (`HERDR_BIN`) and `scripts/production/fake_unit_host.py`, which publishes panes with session labels, pane reads and a fake `/proc` (see [herdr-adoption.md](herdr-adoption.md), Test doubles). Most production suites use them, `test_waiting.py` and `test_dailies_input.py` among them. The `ci_points` fake `gh` is a shell + jq stub (`GH_STUB` in `test_ci_points.py`).
 
@@ -593,30 +665,52 @@ Quota reminders run in `scripts/whoami/test_quota_alert.py` and nine subject mod
 
 **`scripts/direct/local_release_wait.py`**
 - `local_release_waiter(holders, release) -> LocalReleaseEvents | IntervalReleasePolling`. `LocalReleaseEvents` watches the directories and their existing parents through inotify via ctypes, re-arms replaced directories, and treats queue overflow as a change. `IntervalReleasePolling` sleeps the caller's interval; it is used where libc has no inotify (macOS) or the call returns ENOSYS/ENOTSUP.
-- `wait_for_local_release(seconds, call_id)` arms the watch, then reads target state and returns when no hold is in force or the deadline is reached. `verify.sh` calls it as a script (`VERIFY_LOCAL_RELEASE_WAIT_SCRIPT` overrides the path). `build_targets.py` imports it as `scripts.direct.local_release_wait`, with the repo root on `sys.path`.
+- `wait_for_local_release(seconds, call_id)` arms the watch before reading target state.
+  It returns when the hold ends or the deadline is reached.
+  `verify.sh` calls its script; `VERIFY_LOCAL_RELEASE_WAIT_SCRIPT` overrides the path.
+  `build_targets.py` imports `scripts.direct.local_release_wait`.
 
 **`scripts/direct/wait_for_test_state.py`**
 - `wait_until(ready, directory, timeout=TEST_HANG_GUARD_SECS, *, processes=())` arms directory events, checks `ready()`, then blocks in `select` on the inotify fd plus a pidfd per child process. An exited child's pidfd stays readable, so each one is observed once and closed. Without inotify or pidfd it polls every 0.01 s. It raises `TimeoutError` at the hang guard.
 - `wait_for_file(path)` is a wrapper, also callable from the command line.
 
-**Python import root.** The gate starts each test run through the checked tree's `scripts/lib/py`.
-The gate removes the caller's `PYTHONPATH` from each child environment.
-The shim sets the checked tree's root in `PYTHONPATH`.
-Tests and their Python children can import packages from that tree.
-The gate refuses a tree without the shim.
-`MERGE_GATE_PYTHON` still selects the test interpreter.
+### Private runtime fixtures
 
-The shim resolves its repository root with shell operations.
-For stdin, `-c`, and `-m`, it puts that root first in `PYTHONPATH` and passes `-P` first.
-Outside the gate, it preserves inherited Python paths after that root.
-Options such as `-B` and `-u` can precede the program mode.
-File scripts keep their folder first in the import path.
-The shim resolves relative paths and parent segments without another process or a directory change.
-`test_py_shim.py` tests local package collisions, old modules, cached interpreters, module mode, and file scripts.
+`staff_test_support.isolated_staff_file` supplies private staff, notifier, showrunner, session, and pane paths.
+It patches loaded modules and passes the same paths to fixture children.
+Checkpoint tests use this shared helper instead of live registries.
+`fixture_unit_location` publishes the staff location required by a test.
+Configuration fixtures supply `CONF_DIR` and the real key limit comments.
+Git-recovery tests use their own committed repositories.
+`test_end_session` removes inherited `CODEX_THREAD_ID` and every `PLAN_DELEGATE_*` value before it supplies its test identity.
+The shared hang guard protects expected events without shortening production waits.
+
+### Python package imports
+
+Repository imports use `scripts.<folder>` package names, including mock patch targets.
+`scripts/lib/package_root.py` places the checkout root directly after the entry script folder without a duplicate.
+Entry scripts load that helper after their docstring and future imports.
+Bare `python3 <path>` therefore imports the entry's own checkout from any caller folder.
+A copied entry without the helper can use an existing `PYTHONPATH`.
+`package_imports.py bootstrap <checkout>` adds the four-line block to new entry scripts.
+It preserves CRLF and skips test and test-support modules.
+The command provides no import converter.
+
+The gate starts test modules through the checked tree's `scripts/lib/py`.
+It removes the caller's `PYTHONPATH` before the shim sets the checked tree's package root.
+The gate refuses a tree without that shim.
+`MERGE_GATE_PYTHON` selects the test interpreter.
+For script paths, the shim selects the script's checkout.
+For stdin, `-c`, and `-m`, it selects its own checkout and passes `-P` before other Python arguments.
+Outside the gate, it retains inherited Python paths after that root.
+It preserves the caller's working directory, interpreter cache, version floor, and `CLAUDE_PYTHON` override.
+`module_run.py` and `fast_track.py` load tests by package name.
+The cloud guest bootstrap supplies its own root after a fresh clone.
+The Pillow analysis and Blender entries retain their foreign interpreters and explicit `PYTHONPATH`.
 
 **Interpreter-cache seeding.** `scripts/lib/py` caches the resolved interpreter path in `$XDG_CACHE_HOME/claude/python3-<major>.<minor>`. The key uses the version floor from `lib/py`, currently `python3-3.12`. Worker fixtures set `XDG_CACHE_HOME` for each temporary HOME. They write `sys.executable` into that cache file. They unset `CLAUDE_PYTHON`, which bypasses the cache. This avoids Python resolution for roughly 19 helper launches per `verify.sh`, `review.sh`, or `assign.sh` run.
 
-**Stub app-server shutdown** (`scripts/agents/test_codex_mesh.py`). The accept loop blocks in `select` on the listener and on a socketpair that `close()` writes to, so closing the server wakes it at once.
+**Stub app-server shutdown** (`scripts/agents/codex_test_support.py`). The accept loop blocks in `select` on the listener and on a socketpair that `close()` writes to, so closing the server wakes it at once.
 
 ### Wait and sync overrides
 
@@ -629,7 +723,6 @@ The shim resolves relative paths and parent segments without another process or 
 | `--durability {full,off}` (`LedgerDurability.DURABLE`/`DISPOSABLE`) | `scripts/usage/collect.py` | `full` → `PRAGMA synchronous=FULL` | `off`; default pinned by an SQL trace |
 | `ADD_SHOWRUNNER_POLL_S` | `scripts/production/add_showrunner.py` (`POLL_S`, read at import) | `2.0` | `0.01`; default test imports with it unset |
 | `leftover_timeout_s` (`OffloadConfig`, settings file) | `scripts/mac_test/offload.py` | `10` s | small or large per case; invalid values fall back to 10 |
-| `RESIDENT_POLL_SECS`, `REAP_WAIT_SECS`, `REAP_POLL_SECS` | `scripts/agents/codex_mesh.py` | `1.0`, `5.0`, `0.2` | patched as module attributes |
 | `UNIT_ACTIVE_DIR` | `end_session.sh`, `unit_status.sh`, `hooks/direct_run.py`, `build_hold.py`, `promote_showrunner.py`; `prepare_session.sh` writes the fixed directory | `/tmp/claude/delegate/active` | a temp dir |
 | `UNIT_RUN_ROOT` | `end_session.sh` (passed to `unit_runs.py held --root`) | both run roots, `/tmp/claude/unit` then `/tmp/claude/delegate` | a temp dir |
 | `MERGE_GATE_STATE_DIR`, `MERGE_GATE_PYTHON`, `MERGE_GATE_BASEDPYRIGHT`, `MERGE_GATE_UV` | `merge_gate.py` | `~/.local/state/merge-gate`, `sys.executable`, `basedpyright`, `uv` | scratch dir and stubs |
@@ -669,7 +762,7 @@ The status line reads assignments from staff rows instead of these environment n
 
 - **Signals.** A test that signals a child restores `SIG_DFL` before exec and waits for a ready marker written after the child installs its handlers (for example `runner-signals-ready`).
 
-- **Fixture cleanup.** A fixture that times out reaps its process group and owned threads (`communicate_launcher`) before restoring the mesh stub or HOME.
+- **Fixture cleanup.** A fixture that times out reaps its process group and owned threads (`communicate_launcher`) before restoring the app-server fixture or HOME.
 
 - **In-process cases are synchronous only.** `invoke_cli` suits scripts that do not mutate containers held in module globals. Cache-holding functions (`_config_digest`) are cleared around each case.
 
@@ -728,7 +821,8 @@ Example verification runs in `test_verify_untested_examples.py` (clean package) 
 
 - **Bindings, not containers.** `invoke_cli` restores module bindings, not mutable containers in module globals.
 
-- **Shell override defaults** are pinned by unset-default tests in `test_review_launcher_delivery.py`, `test_implement_launcher_probes.py`, `test_implement_launcher_follow_probes.py` and `test_verify_token_wait.py`; each pops all four shell overrides.
+- **Shell override defaults.** Launcher and token tests remove test overrides when they check configured defaults.
+  Claude launch checks use the current `test_assign_claude*.py` fixtures.
 
 - **Mac ssh status.** The Mac ssh command always exits 0; read `ff_rc=`.
 
@@ -758,11 +852,9 @@ Registration tests use `update_registration_test_support.py` and split into `tes
 
 The Bevy upgrade CLI tests (`scripts/bevy_upgrade/test_cli.py`) build one synthetic checkout, lockfile, upstream fixture and tool seed per class, then restore private copies at the same path for each test. Behavioral cases run the real parser and handlers with isolated process state and network rejection. The current Python tool fixtures run in-process, preserving their record reads, lock probes, event ordering and failures; the start case retains a real CLI interpreter and both tool wrappers. Save/fetch tracing still checks the real record lock and single-save behavior. No sleeps, polling or scheduler budgets are involved.
 
-The unit-transfer tests (`scripts/production/test_transfer_unit.py`) use `transfer_unit_test_support.py` to build one bare origin, two production checkouts, a linked unit worktree and isolated state per class, then restore private copies at the same absolute paths per test. Behavioral calls run the real transfer parser and handlers and fake herdr CLI in-process with process state and import-time paths restored; Git, the shutdown stub, worker conflicts and a CLI launch test use real processes. The paused writer's detached command remains live through transfer and finishes through its input pipe. The former-mark holder now signals readiness and waits for pipe closure instead of sleeping; the one 600-second hang guard in `scripts/lib/test_hang_guard.py` only guards hangs. Original assertions remain, including work-in-progress preservation, journal resumption after checkout moves, worker identity and live-holder refusals.
-
-Launcher claim tests restore a private completed-worker snapshot at its original paths through `implement_launcher_claims_test_support.py`. The snapshot comes from the real Bash launcher once per class; each case and nested recovery scenario receives independent claims, roster, durable identity and history. `test_implement_launcher_claims.py` keeps recovery and refusal coverage, while `test_implement_launcher_probes.py` and `test_implement_launcher_follow_probes.py` separately pin all thirty default one-second probes for new and followed workers. The probe stand-in records requested sleeps immediately; file events hold and release the real mesh child. Real Bash claim locking, launcher liveness, PID ownership, pass records and subprocess exit status remain exercised. The shared launcher fixture and its existing consumers retain their original behavior.
-
-Claude launcher integration tests restore independent fixtures at the same absolute paths through `implement_launcher_claude_test_support.py`. `test_implement_launcher_claude.py`, `test_implement_launcher_claude_accounts.py` and `test_implement_launcher_claude_effort.py` cover repair identity, account cutover and registry effort; `test_implement_launcher_claude_panes.py` covers byte-preserving summaries and pane cleanup; `test_implement_launcher_claude_follow.py` covers transcript completion, unreadable listings and delivery failures. The real Bash launcher, account selection, recorder and worker-state tools remain subprocesses. The fake Claude CLI serves repeated listing/log replies with shell builtins and cat; its original Python background-launch implementation still records arguments, environment and UUID identity. Fake busy-to-idle and unreadable-to-readable transitions publish events consumed at the copied agent wrapper’s poll boundary, eliminating delays for state already ready. The shared launcher fixture retains its existing behavior.
+The unit-transfer tests use `transfer_unit_test_support.py` with private staff, Git, configuration, and terminal fixtures.
+They check parent changes, retained worktrees, unchanged configuration bytes, tab reconciliation, and repeated transfers.
+The tests also retain staff-keyed stall files across the transfer.
 
 Lint cache checks run by subject in `test_verify_lint_cache.py` (fixed and formatted trees), `test_verify_lint_cache_fix_limit.py` (a passing judgment at the repair limit), and `test_verify_lint_cache_mend.py` (mend rewrites). `verify_lint_cache_test_support.py` reuses the committed lint-scope fixture, including its one seed per class and private copies at the same paths. It enables pass records through `UNIT_RUN_DIR` with no team role, so cache checks do not also open a director Cargo token or progress window. The real Bash verification, cache keys, invocation policy and existing fake tools still run as processes. Every original assertion remains; waits use the one 600-second hang guard in `scripts/lib/test_hang_guard.py`.
 

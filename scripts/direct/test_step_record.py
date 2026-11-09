@@ -10,12 +10,12 @@ import tempfile
 import socket
 import subprocess
 import sys
-import time
 from typing import cast
 import unittest
 from unittest.mock import patch
 
 from scripts.direct import step_record as steps
+from scripts.direct.step_selection import Pinned
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
@@ -28,24 +28,29 @@ class StepRecordTests(unittest.TestCase):
                          "--pid", str(os.getpid()), "--repo", directory, "--kind", "test",
                          "--runs-on", "any_target", "--eligible-targets", "mac,aws", "--mac-targets", "mac",
                          "--pinned-target", "mac", "--package", "sample", "--state", "waiting_hold"]
-            before = (time.time_ns() - time.monotonic_ns()) // 1000
-            result = subprocess.run([*arguments, "--report"], env=environment,
-                                    capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS)
-            after = (time.time_ns() - time.monotonic_ns()) // 1000
+            fixed_clocks = """
+import runpy
+import sys
+from unittest.mock import patch
+sys.argv = sys.argv[1:]
+with patch("time.time_ns", return_value=1_700_000_000_123_456_789), \
+     patch("time.monotonic_ns", return_value=123_456_000):
+    runpy.run_path(sys.argv[0], run_name="__main__")
+"""
+            result = subprocess.run([arguments[0], "-c", fixed_clocks, *arguments[1:], "--report"],
+                                    env=environment, capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS)
             self.assertEqual(result.returncode, 0, result.stderr)
             offset_text, record_text, state_text = result.stdout.splitlines()
             offset = int(offset_text)
             self.assertEqual(Path(record_text), root / "clock.json")
             self.assertEqual(Path(state_text), root / "clock.state")
-            # Separate clock reads can cross a microsecond boundary.
-            self.assertLessEqual(min(before, after) - 1, offset)
-            self.assertLessEqual(offset, max(before, after) + 1)
+            self.assertEqual(offset, 1_700_000_000_000_000)
             with patch.dict(os.environ, environment):
                 record = steps.read("clock")
             self.assertIsInstance(record, steps.StepRecord)
             assert isinstance(record, steps.StepRecord)
             self.assertEqual(record.runs_on, steps.AnyTarget(("mac", "aws"), ("mac",)))
-            self.assertEqual(record.selection, steps.Pinned("mac"))
+            self.assertEqual(record.selection, Pinned("mac"))
             self.assertEqual((record.kind, record.package), ("test", steps.NamedPackage("sample")))
             self.assertTrue((root / "clock.json").is_file())
 
@@ -54,7 +59,7 @@ class StepRecordTests(unittest.TestCase):
         record = steps.StepRecord("joined", pid, steps.process_start(pid), root, "test", steps.NamedPackage("sample"),
                                   steps.AnyTarget(("mac", "aws"), ("mac",)),
                                   steps.StepState.WAITING_HOLD, "2026-01-01T00:00:00+00:00",
-                                  selection=steps.Pinned("mac"))
+                                  selection=Pinned("mac"))
         steps.write(record)
         return record
 
@@ -107,7 +112,7 @@ class StepRecordTests(unittest.TestCase):
             self.assertIsInstance(joined, steps.StepRecord)
             assert isinstance(joined, steps.StepRecord)
             self.assertEqual(joined.runs_on, steps.NatedevOnly("step writes the tree"))
-            self.assertEqual(joined.selection, steps.Pinned("natedev"))
+            self.assertEqual(joined.selection, Pinned("natedev"))
             self.assertEqual(joined.state, steps.StepState.LOCAL_NONCOMPILING)
             self.assertEqual(joined.selected_target, "")
             with self.subTest(state="on_natedev"):

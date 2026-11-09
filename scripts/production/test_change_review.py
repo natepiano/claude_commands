@@ -373,6 +373,21 @@ class ProducerWriterTests(ProducerFixture):
         notes = [line for line in output.getvalue().splitlines() if line.startswith("change review: no staff row")]
         self.assertEqual(notes, [])
 
+        with self.subTest(subject="queue(7): queued change"):
+            _ = self.git("checkout", "-b", "queue-unit")
+            _ = self.git("commit", "--allow-empty", "-m",
+                         "queue(7): queued change\n\nChange-Review: Queued change | Read | Queue result")
+            _ = self.git("checkout", "main")
+            _ = self.git("merge", "--no-ff", "queue-unit", "-m", "Merge queue-unit into main")
+            _ = self.git("push", "origin", "main")
+            queued_merge = self.git("rev-parse", "HEAD")
+            merge_checkpoint.record_publication_changes(
+                production, known_producer=change_review.KnownMergeProducer(queued_merge, self.unit.id))
+            row = change_review.pending(self.listing)[-1]
+            self.assertEqual(row["Change"], "Queued change")
+            self.assertEqual(row["Producer"], self.unit.id)
+            self.assertEqual(row["Production"], production.owner.id)
+
     def test_an_unregistered_unit_writes_an_empty_producer_and_one_named_note(self) -> None:
         _ = self.merge()
         production = Production(self.doc, "top", "main", self.repo, self.root / "log", ZoneInfo("UTC"), unit_lookup.doc_owner(self.doc, staff.snapshot()))
@@ -425,7 +440,8 @@ class ParseTest(unittest.TestCase):
     def test_only_a_checkpoint_that_changes_more_than_markdown_needs_a_line(self) -> None:
         self.assertTrue(change_review.needs_trailer("checkpoint(x): y", ("src/a.rs",)))
         self.assertFalse(change_review.needs_trailer("checkpoint(x): y", ("docs/a.md", "b.md")))
-        for subject in ("ci(x): fix", "as-built(x): docs", "merge(x): origin", "production(x): row", "fix the vault"):
+        for subject in ("ci(x): fix", "as-built(x): docs", "merge(x): origin", "production(x): row", "fix the vault",
+                        "queue(7): queued change"):
             self.assertFalse(change_review.needs_trailer(subject, ("src/a.rs",)), subject)
 
     def test_a_missing_or_malformed_line_is_named(self) -> None:
@@ -2100,6 +2116,13 @@ class RepositoryTest(unittest.TestCase):
         self.assertEqual([commit.subject for commit in commits], ["checkpoint(u): grid"])
         self.assertEqual(change_review.missing(commits), [])
         self.assertEqual(change_review.visible(commits), [GRID])
+
+        with self.subTest(subject="queue(7): grid"):
+            queued = self.commit("a.py", f"queue(7): grid\n\n{SEE}")
+            commits = change_review.unit_commits(self.repo, queued, checkpoint, "merge")
+            self.assertEqual([commit.subject for commit in commits], ["queue(7): grid"])
+            self.assertEqual(change_review.missing(commits), [])
+            self.assertEqual(change_review.visible(commits), [GRID])
 
     def test_a_merge_reads_its_parents_with_one_git_command_and_refuses_unknown_commits(self) -> None:
         checkpoint = self.commit("a.py", f"checkpoint(u): grid\n\n{SEE}")

@@ -7,10 +7,6 @@
   ],
   "rules": [
     {
-      "path": "scripts/agents/codex_mesh.py",
-      "owner": "models-unit"
-    },
-    {
       "path": "scripts/buildlog/mac_idle.py",
       "owner": "verify-unit"
     },

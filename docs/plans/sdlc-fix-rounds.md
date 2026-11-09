@@ -200,40 +200,21 @@ For active process redesigns, as we are currently undergoing with promotions and
 
 **Gotchas:** A Python 3.10 interpreter cannot run `findings.py` or `progress_history.py`; `lib/py` skips it. A cache file under the old `python3-3.10` key is not read.
 
-### Phase 7 — Did the changes cut rounds and keep the work  · status: todo
-**Depends on:** Phase 5, Phase 6 (it redefines the `history.py rounds` medians and shares)
-**Blocked by:** for each adopted proposal, 30 completed, non-mixed exposed phases that started after the time Phase 5 records, zero-repair phases included, with exposure as that proposal's **Measure** defines it.
+### Phase 7 — Did the changes cut rounds and keep the work  · status: done
 
-#### Work Order
+#### As-built
 
-**Goal:** `docs/plans/sdlc-fix-rounds-study.md` ends with a before-and-after table per adopted change, a verdict on each, and any revert sent to the user as a question.
+- `docs/plans/sdlc-fix-rounds-study.md` opens with `Changes took effect: 56b8f93be… on main, 2026-10-28T21:26:05-04:00`, the first `~/.claude` main update that contains the Phase 5 checkpoint (C1, from the main reflog).
+- `## Effect` holds the boundary, the window selection, the exposure table, the P4 launch audit, the review rows, the routed-work closure and the questions. Every number names C1 or C2. C2 is a read-only Python command in `### Reproduce C2`; it reads run records through a fixed upper bound (2026-11-09T03:32:17+00:00) and prints a digest of its input.
+- Verdicts: P1, P2, P4 and P5 inconclusive; P3 not ready. Both review windows are under 12 usable rows (9 before, 6 after), the before exposure cohorts and the hand root counts are not rebuilt, and the acceptance audit of routed closures is not complete. No change failed, so no question went to the user.
+- P3 exposure counts distinct started ledger batches before each exposure; the recorded round number overstates it. 18 of 57 completed declarations qualify.
+- By showrunner order (2026-11-08), a proposal under 30 exposed phases is recorded "not ready" and is not judged; the phase does not stop for it.
+- The second count came from a separate read-only Codex thread inside the study worker, not a `test` slot: the Codex launcher could not start a further worker that night.
 
-**Spec:**
-- First add a line to the head of `docs/plans/sdlc-fix-rounds-study.md`: `Changes took effect: <Phase 5 checkpoint hash> on main, <YYYY-MM-DDTHH:MM:SS±HH:MM>`, the time that checkpoint reached `~/.claude` main (the first main commit that contains it), with its offset. A bare date reads as local midnight in `rounds.run` and can take in work from before the change. Every window below counts from that time.
-- Before window: the 30 days that end just before the time Phase 5 records. After window: from that time to the run. The windows do not overlap; a phase that started before the time and ended after it is listed apart and not judged.
-- **Fewer rounds:** from `history.py rounds`: median rounds per phase, share of phases with ≥3 rounds, share of fix time those hold, rounds past the hard landing, and rounds by root cause class for the causes each change targets.
-- **Work kept:** follow-up phases written after a landing and how many reached `done` (plan docs under each production's units); merge design-check defects per phase and holds per phase from `review_regime.py report` on rows in each window; findings routed to other units and whether their phases ran.
-- A change passes when its round measure meets the target Phase 4 set and no work-kept measure is worse by more than its stated margin. A change that fails goes to the user as a question through the showrunner: keep, change, or revert, with the numbers and the one recommended.
-- State the sample sizes beside every number. Each window needs at least 20 completed phases, 10 exposed phases and 12 merge design-check rows that are not excluded; a window under any minimum is reported, not judged.
-- Apply `### Evaluation shared by all five questions` and each adopted proposal's **Measure** in `## Proposals` of the study as written: exposure decided before the treated step runs, zero-repair exposed phases kept, the work-kept margins, combined parent-plus-follow-up rounds and agent-seconds, moved seconds apart from saved seconds, closure of each follow-up due in the window, and defects that reach the user or merge. Missing evidence or unfinished due work gives `inconclusive`, never a pass. When adopted changes cannot be separated, each one's attribution is `inconclusive`.
-- When P4 is adopted, its accuracy target is not read from `history.py rounds` alone: `load_phases` drops a launch with no recorded `phase_started`, and the `mixed` check cannot prove each launch's phase. Reconcile launch evidence with phase boundaries and recorded activities, list each missing or wrong association, and count it against the target.
-
-- Proposal statistics come from the explicitly selected exposed rows of each proposal, unreviewed zero-repair exposures included; never from the reviewed-only `_meta` statistics of `history.py rounds`.
-- P4 accuracy judges three records apart: `launch_refused`, UX `launch_checked` and `pass_started.launch_check`, including refusals with no phase instance. A correct refusal of a stale or missing-phase request counts as a success. A false refusal, or a launch associated with the wrong phase, counts against the target. The `test` slot checks one case of each.
-- Routed-work closure: the recount checks an open route, a valid cross-run closure, a closure with a wrong key, and a closure event with no acceptance evidence (commit, test result or review). The last one is `inconclusive`, never closed.
-- Root counts use the Phase 2 study method by hand, one evidence line per round, with the second writer recounting each window on its own; `history.py rounds` gives only the Phase 1 causes.
-- Review rows come from `review_regime.py`'s shared row reader with both window bounds applied in the study's extraction, not from `report`'s fixed regimes; state the boundary field, the excluded rows and each window's sample size. Bound review rows on `merged`. Before any total, sort each `Row` as usable, excluded or insufficient evidence: an absent plan identity, review minutes or repair minutes is not a measured zero, and a required field that is absent blocks a pass instead of making the sample smaller.
-- The readiness count takes phases from `history.py rounds --since <time> --status all --format json --top 100000` with a `check` of `ok`, a start at or after the time, and exposure as each proposal's **Measure** defines it, zero rounds included; open and mixed phases are listed apart and not judged.
 **Files:**
-- `docs/plans/sdlc-fix-rounds-study.md` — `## Effect`.
+- `docs/plans/sdlc-fix-rounds-study.md` — the head line and `## Effect`.
 
-**Workers:** `2 writers`
-- `impl` — `docs/plans/sdlc-fix-rounds-study.md`: the effect tables and verdicts.
-- `test` — opens as `impl`, writes no repository file: recounts on its own the roots, exposure, routing, follow-up closure evidence and each number taken from a command, and sends `impl` each one that differs.
-
-**Constraints from prior phases:** set at Phase 5's checkpoint.
-
-**Acceptance gate:** every number in `## Effect` names the command that produced it and matches a rerun; the test recount agrees with each root, exposure and closure call; each window meets the sample minimums or is marked reported, not judged; each adopted change has a verdict of pass, fail or inconclusive; each failed change's question is sent to the showrunner.
+**Gotchas:** Review rows can be written after their `merged` time, so a C2 rerun can add rows to a window; the run records do not change under the fixed upper bound.
 
 ### Phase 8 — Ad hoc review commands review in the invoking session  · status: done
 
@@ -448,3 +429,35 @@ From the sdlc showrunner, 2026-11-08 [f15c6428], urgent. `merge_checkpoint.pull_
 Fix: when ssh cannot reach the Mac, queue one pull-only Mac pull with the existing `main_publish` queue (the record `/zone` and `/tune` already use), report `promote ok: mac unreachable, pull pending`, and let the merge finish. The next promotion that reaches the Mac pulls once (a fast-forward carries every commit) and clears that record. A Mac that answers but whose pull fails still stops, as now. `tune.py` and the promotion share one queue-and-clear helper in `main_publish`. Add no other check.
 
 As built: `pull_mac_checkout` returns `main_publish.MacPulled` or `MacPullPending`. After its last try, ssh exit 255 with no `rc=` line queues a pull-only record through `main_publish.queue_pull_only`; any other failure still raises `Stop`. A pull clears a pull-only record with `main_publish.clear_pull_only`, and `tune.py` uses the same two helpers. Both promotion paths report `mac unreachable, pull pending: <path>` and go on; `finish_promotion_targets` then skips the zone send and the Mac notice.
+
+### Phase 10i — An as-built commit that deletes its plan passes the scope check  · status: done
+
+**Depends on:** none.
+
+From the sdlc showrunner, 2026-11-08 [be8c1303]. `merge_checkpoint._unit_paths` keeps a path only when its content at the checkpoint differs from every origin merge base. The origin/natedev base ea75bef84 never had `docs/plans/models-pane-thread-link.md`. The models as-built commit cc9634bef deletes that file, so the path is absent at the base and at the commit, and reads as no change. The scope check then drops the plan's deletion and holds a correct as-built commit.
+
+Fix: a path that is absent at an origin merge base did not come from that origin, so that base does not drop it. A path that the base has, and that the commit has with the same content, still came from that origin. Add one row to the existing scope tests in `scripts/production/test_merge_checkpoint.py`: an as-built commit deletes its plan while an origin merge base never had the plan, and the scope check passes. Add no other check.
+
+As built: `_unit_paths` reads, per origin merge ref, the paths the merge base has (`git ls-tree -r`) and the paths the diff to the commit names. It drops only a path that the base has and the diff does not name. A path that the base lacks stays in scope. `test_scope_keeps_deleted_plan_absent_at_an_origin_merge_base` lands an as-built commit that deletes `docs/plans/alpha.md` while the other production's merge base never had it.
+
+### Phase 10j — The checkpoint's review trial line reports the checkpointed phase  · status: done
+
+**Depends on:** none.
+
+From the sdlc showrunner, 2026-11-09 [9e63d522]. devtools phase 3z (575d3b5cb) sent `review trial: ux 0 findings, code 0 findings, review-worker minutes 0`, but two pane reviewers ran and the 3z ledger holds F001 and F002.
+
+Cause: `<CheckpointCommit/>` step 9 in `commands/unit/checkpoint.md` runs `review-trial --session-dir` with no `--phase-id`. With no id, `_review_trial` reports the current phase. devtools had started phase 8u beside 3z, so the line counted 8u, which had no findings and no review passes yet. `review-trial --phase-id 3z` on the same run gives `code 2 findings, review-worker minutes 8`. The recorder counts pane-reviewer passes and ledger findings correctly once it reads the right instance.
+
+Fix: `commands/unit/checkpoint.md` step 9 passes the checkpointed phase's id with `--phase-id`. The recorder does not change, and no refusal is added. Add one test row: a phase with a ledger finding and a finished review pass is parked while a later phase is current, and `review-trial --phase-id` of the parked phase reports its finding and its minutes.
+
+As built: `<CheckpointCommit/>` step 9 runs `review-trial --session-dir "${SESSION_DIR}" --phase-id <phase id>`. `--phase-id` stays optional (showrunner, 2026-11-09 [f58e9b76]); a call with no id still reports the current phase. `test_review_trial_reports_the_parked_phase_findings_and_review_minutes` parks phase A, with one finding and an 8-minute review pass, behind current phase B, and reads A by id.
+
+### Phase 10k — A Change-Review line under any unit commit subject adds its row  · status: done
+
+**Depends on:** none.
+
+From the sdlc showrunner, 2026-11-09 [b8a10551], reported by builds. `change_review._checkpoint_entries` (used by `visible`) reads Change-Review lines only from `checkpoint(...)` subjects. `merge_checkpoint.change_review_commits` counts every unit commit and prints `N unit commit(s) carry their Change-Review lines`. A unit commit with a Change-Review line under another subject (builds queue: `queue(N):` for phases 10m, 32, 33, 34, 36) passes, and its rows are never added.
+
+Fix: one selection of unit commits serves both the count and the row adder, so a Change-Review line under any unit commit subject adds its row. `needs_trailer` keeps its rule: no new refusal. Add a test row: a unit commit with subject `queue(7): ...` and a Change-Review line adds its row.
+
+As built: `change_review._checkpoint_entries` reads the visible lines of every unit commit, with no subject filter. `visible` and `publication_changes` both use it, so the count in `merge_checkpoint.change_review_commits` and the row adder see the same commits. `needs_trailer` and `missing` do not change, and no refusal is added. New `queue(7): ...` rows: `ProducerWriterTests` (the merge adds its row), `ParseTest` (`needs_trailer` stays false) and `RepositoryTest` (`visible` reads it).

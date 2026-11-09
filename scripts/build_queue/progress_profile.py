@@ -59,6 +59,27 @@ def profile_rank(rank: int | ConfiguredProfileRank = CONFIGURED_PROFILE_RANK) ->
 
 
 @dataclass(frozen=True)
+class ConfiguredPeakShare:
+    pass
+
+
+CONFIGURED_PEAK_SHARE = ConfiguredPeakShare()
+
+
+def peak_share_percent(share: int | ConfiguredPeakShare = CONFIGURED_PEAK_SHARE) -> int:
+    return conf.read("build_admission").whole("peak_history_share_percent") if isinstance(share, ConfiguredPeakShare) else share
+
+
+def ranked_peak(values: list[int], floor: int, *,
+                share_percent: int | ConfiguredPeakShare = CONFIGURED_PEAK_SHARE) -> int:
+    """Select a descending rank above the configured share, with a minimum rank."""
+    share_rank = len(values) * peak_share_percent(share_percent) // 100 + 1
+    rank = min(len(values), max(floor, share_rank))
+    values.sort()
+    return values[len(values) - rank]
+
+
+@dataclass(frozen=True)
 class ScopeReading:
     directory: Path
 
@@ -264,10 +285,12 @@ class ProfileRecorder:
         return ProgressProfile(tuple(PhaseProfile(name, tuple(bins)) for name, bins in self.phases.items()))
 
 
-def merge_profiles(profiles: Iterable[ProgressProfile], rank: int | ConfiguredProfileRank = CONFIGURED_PROFILE_RANK
+def merge_profiles(profiles: Iterable[ProgressProfile], rank: int | ConfiguredProfileRank = CONFIGURED_PROFILE_RANK, *,
+                   share_percent: int | ConfiguredPeakShare = CONFIGURED_PEAK_SHARE
                    ) -> ProgressProfile | NoMatchingProfile:
     """Keep phase order and select the configured highest run in each bin."""
     selected_rank = profile_rank(rank)
+    selected_share = peak_share_percent(share_percent)
     recorder = ProfileRecorder()
     samples: dict[tuple[str, int], list[int]] = {}
     before: dict[str, set[str]] = {}
@@ -287,8 +310,7 @@ def merge_profiles(profiles: Iterable[ProgressProfile], rank: int | ConfiguredPr
     if not before:
         return NoMatchingProfile()
     for (phase, index), values in samples.items():
-        values.sort(reverse=True)
-        recorder.phases[phase][index] = values[min(selected_rank, len(values)) - 1]
+        recorder.phases[phase][index] = ranked_peak(values, selected_rank, share_percent=selected_share)
     for name, predecessors in before.items():
         kind, separator, number = name.rpartition(":")
         if separator and number.isdecimal():
@@ -457,6 +479,7 @@ class MergedHistory:
     profile: ProgressProfile | NoMatchingProfile
     oldest: float
     rank: int
+    share_percent: int
 
 
 @dataclass
@@ -471,7 +494,7 @@ class ProfileHistory:
             self.cached[path] = read_profile_record(path)
         return self.cached[path]
 
-    def _history(self, key: str, cutoff: float, rank: int) -> MergedHistory:
+    def _history(self, key: str, cutoff: float, rank: int, share_percent: int) -> MergedHistory:
         profiles: list[ProgressProfile] = []
         oldest = math.inf
         directory = self.root / key
@@ -486,24 +509,30 @@ class ProfileHistory:
             oldest = min(oldest, record.at)
             if path.suffix == ".json":
                 profiles.append(record.profile)
-        history = MergedHistory(merge_profiles(profiles, rank), oldest, rank)
+        history = MergedHistory(merge_profiles(profiles, rank, share_percent=share_percent), oldest, rank, share_percent)
         self.merged[key] = history
         return history
 
-    def prune(self, cutoff: float, *, rank: int | ConfiguredProfileRank = CONFIGURED_PROFILE_RANK) -> None:
+    def prune(self, cutoff: float, *, rank: int | ConfiguredProfileRank = CONFIGURED_PROFILE_RANK,
+              share_percent: int | ConfiguredPeakShare = CONFIGURED_PEAK_SHARE) -> None:
         selected_rank = profile_rank(rank)
+        selected_share = peak_share_percent(share_percent)
         for directory in self.root.glob("*"):
             if directory.is_dir():
                 history = self.merged.get(directory.name)
-                if history is None or history.oldest < cutoff or history.rank != selected_rank:
-                    _ = self._history(directory.name, cutoff, selected_rank)
+                if (history is None or history.oldest < cutoff or history.rank != selected_rank
+                        or history.share_percent != selected_share):
+                    _ = self._history(directory.name, cutoff, selected_rank, selected_share)
 
-    def matching(self, key: str, cutoff: float, *, rank: int | ConfiguredProfileRank = CONFIGURED_PROFILE_RANK
+    def matching(self, key: str, cutoff: float, *, rank: int | ConfiguredProfileRank = CONFIGURED_PROFILE_RANK,
+                 share_percent: int | ConfiguredPeakShare = CONFIGURED_PEAK_SHARE
                  ) -> ProgressProfile | NoMatchingProfile:
         selected_rank = profile_rank(rank)
+        selected_share = peak_share_percent(share_percent)
         history = self.merged.get(key)
-        if history is None or history.oldest < cutoff or history.rank != selected_rank:
-            history = self._history(key, cutoff, selected_rank)
+        if (history is None or history.oldest < cutoff or history.rank != selected_rank
+                or history.share_percent != selected_share):
+            history = self._history(key, cutoff, selected_rank, selected_share)
         return history.profile
 
     def observe(self, episode: str, key: str, counter: ProgressCounter | NoCounter,
@@ -540,7 +569,7 @@ class ProfileHistory:
             _ = self.cached.pop(pending.path, None)
             history = self.merged.get(key)
             if history is not None:
-                self.merged[key] = MergedHistory(history.profile, min(history.oldest, at), history.rank)
+                self.merged[key] = MergedHistory(history.profile, min(history.oldest, at), history.rank, history.share_percent)
 
     def finish(self, episode: str, at: float, cutoff: float) -> None:
         paths = {path for path in self.root.glob(f"*/{episode}.active")}
@@ -560,4 +589,4 @@ class ProfileHistory:
             _ = self.cached.pop(active.with_suffix(".json"), None)
             previous = self.merged.pop(key, None)
             if previous is not None:
-                _ = self._history(key, cutoff, previous.rank)
+                _ = self._history(key, cutoff, previous.rank, previous.share_percent)

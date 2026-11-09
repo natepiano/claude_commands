@@ -343,12 +343,12 @@ class ClaudeLauncherTests(unittest.TestCase):
     def test_shell_fixture_cannot_use_the_parent_session_state(self) -> None:
         parent = self.home / "parent-session"
         parent.mkdir()
-        paths = (parent / "mesh_roster.json", parent / "staff.json", parent / "impl_worker_impl.json")
+        paths = (parent / "progress_history_state.json", parent / "staff.json", parent / "impl_worker_impl.json")
         for path in paths:
             _ = path.write_text('{"parent": "must remain unchanged"}\n')
         before = {path.name: path.read_bytes() for path in paths}
         environment = {**self.environment, "UNIT_RUN_DIR": str(parent),
-            "PLAN_DELEGATE_BOARD_DIR": str(parent), "MESH_SESSION_DIR": str(parent),
+            "PLAN_DELEGATE_BOARD_DIR": str(parent), "UNIT_RUN_ROOT": str(parent),
             "STAFF_FILE": str(paths[1]), "STAFF_ID": "parent-worker",
             "WORKER_STAFF_ID": "parent-worker", "CODEX_THREAD_ID": "parent-thread",
             "CLAUDE_CODE_SESSION_ID": "parent-session", "ROSTER_RUN_ROOT": str(parent),

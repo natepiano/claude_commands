@@ -61,6 +61,7 @@ class VerifyNixShellTests(NixFixture):
     @override
     def setUp(self) -> None:
         super().setUp()
+        _ = (self.work / "Cargo.toml").write_text("[workspace]\n")
         scripts = self.root / "fixture scripts"
         direct = scripts / "direct"
         direct.mkdir(parents=True)

@@ -19,7 +19,6 @@ from typing import cast
 from scripts.lib import atomic_file, git_exclude
 from scripts.production.staff import StaffId
 from scripts.production import staff
-from scripts.production.production_doc import cell_value
 
 
 class ConfigRefused(ValueError):
@@ -74,6 +73,8 @@ class NoAppPort:
 
 def parse_port_cell(raw: str) -> AppPort | NoAppPort:
     """Read a raw Port cell and keep its text in each refusal."""
+    from scripts.production.production_doc import cell_value
+
     value = cell_value(raw)
     if value.casefold() in ("", "—", "-", "none"):
         return NoAppPort()

@@ -1,8 +1,13 @@
 """Check feed configuration and publication with private queue readings."""
 from __future__ import annotations
 
+from scripts.build_queue import admission_records
+
 import json
+import io
 import os
+from collections import Counter
+from contextlib import redirect_stdout
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -31,9 +36,9 @@ class FeedStopped(Exception):
     """The fixture stops the feed after its recorded cycles."""
 
 
-def captured_reading(*, running: tuple[gate.RunningStep, ...] = ()) -> gate.QueueRead:
-    inputs = gate.QueueInputs([], running, (), gate.HostMemory(30 * gate.GIB, 60 * gate.GIB),
-        gate.NO_PRESSURE_HOLD, gate.ReadyToStart(), gate.NoHeadAdmissionOverride(), 200_000)
+def captured_reading(*, running: tuple[admission_records.RunningStep, ...] = ()) -> admission_records.QueueRead:
+    inputs = admission_records.QueueInputs([], running, (), admission_records.HostMemory(30 * admission_records.GIB, 60 * admission_records.GIB),
+        admission_records.NO_PRESSURE_HOLD, admission_records.ReadyToStart(), admission_records.NoHeadAdmissionOverride(), 200_000)
     return gate.queue_read_from(inputs, admission_policy_fixture())
 
 
@@ -53,27 +58,27 @@ def report_fixture(*, empty: bool = False) -> charts.PageData:
         charts.TopCosts(end - timedelta(days=3), end, 3, rows))
 
 
-def reservation_reading(*, project: str = "fixture-project") -> gate.QueueRead:
+def reservation_reading(*, project: str = "fixture-project") -> admission_records.QueueRead:
     reservation = memory_tests.ProgressKeepAsideTests.reservation("nextest")
-    memory = gate.MeasuredMemory(2 * gate.GIB, anonymous=gate.AnonymousRunUse(gate.GIB))
+    memory = admission_records.MeasuredMemory(2 * admission_records.GIB, anonymous=admission_records.AnonymousRunUse(admission_records.GIB))
     inputs = memory_tests.ProgressKeepAsideTests.inputs((reservation,), (memory,))
     inputs = replace(inputs, running=(replace(inputs.running[0], project=project),))
     return gate.queue_read_from(inputs, admission_policy_fixture())
 
 
-def with_wait_reason(reading: gate.QueueRead, reason: gate.WaitReason) -> gate.QueueRead:
-    waiter = gate.WaitingStep(200, "fixture", "fixture", "nextest", "/fixture", 10,
-                              gate.GIB, reason, project="fixture-project")
+def with_wait_reason(reading: admission_records.QueueRead, reason: admission_records.WaitReason) -> admission_records.QueueRead:
+    waiter = admission_records.WaitingStep(200, "fixture", "fixture", "nextest", "/fixture", 10,
+                              admission_records.GIB, reason, project="fixture-project")
     return replace(reading, view=replace(reading.view, waiting=(waiter,)))
 
 
-def leftover_step(minutes: int, *, small: bool = False, members: tuple[ScopeProcess, ...] = ()) -> gate.RunningStep:
+def leftover_step(minutes: int, *, small: bool = False, members: tuple[ScopeProcess, ...] = ()) -> admission_records.RunningStep:
     started_at = 200_000 - minutes * 60
     activity = ScopeProcesses(len(members) or 1, "fixture", "fixture", "/fixture", "python3", started_at,
                               True, NoLiveBuildRun(), members=members)
-    memory = gate.UnownedSliceMemory(gate.GIB // 4 if small else gate.GIB,
+    memory = admission_records.UnownedSliceMemory(admission_records.GIB // 4 if small else admission_records.GIB,
         owner=f"leftover-{minutes}", activity=activity, pid=minutes)
-    return gate.RunningStep("fixture", "fixture", f"leftover-{minutes}", "/fixture", 0,
+    return admission_records.RunningStep("fixture", "fixture", f"leftover-{minutes}", "/fixture", 0,
                             memory, pid=minutes, started_at=started_at)
 
 
@@ -88,6 +93,9 @@ class MemoryFeedTests(unittest.TestCase):
         self.output = self.root / "page"
         self.configuration = self.root / "memory_feed.conf"
         self.configure()
+        proc = self.root / "proc"
+        proc.mkdir()
+        _ = (proc / "meminfo").write_text("SwapTotal: 8388608 kB\nSwapFree: 8388608 kB\n")
         _ = (self.root / "buildlog.conf").write_text("# whole: 1..\nTOP_COST_RECENT_DAYS=3\n")
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
             "CONF_DIR": str(self.root),
@@ -102,6 +110,7 @@ class MemoryFeedTests(unittest.TestCase):
         _ = self.enterContext(mock.patch.object(memory_feed, "host_name", return_value="fixture"))
         _ = self.enterContext(mock.patch.object(memory_feed, "PROC", self.root / "proc"))
         _ = self.enterContext(mock.patch.object(memory_feed, "CI_CGROUP", self.root / "ci"))
+        _ = self.enterContext(mock.patch.object(memory_feed, "CGROUP", self.root / "cgroup"))
         _ = self.enterContext(mock.patch.object(charts, "page_data", return_value=report_fixture()))
 
     def configure(self, *, seconds: float = 0.125) -> None:
@@ -136,8 +145,31 @@ class MemoryFeedTests(unittest.TestCase):
                 with conf.diagnostics(report=False), self.assertRaisesRegex(conf.Unusable, key):
                     _ = memory_feed.read_configuration(conf.read(self.configuration))
 
+    def test_link_prints_the_configured_folder_with_the_review_host_and_port(self) -> None:
+        root = self.root / "review-links"
+        folder = root / "fixture folder"
+        _ = self.configuration.write_text(f"output_folder={folder}\n")
+        _ = (self.root / "review_links.conf").write_text("# whole: 1..65535\nserver_port=9432\n")
+        output = io.StringIO()
+        with (mock.patch.dict(os.environ, {"REVIEW_LINKS_ROOT": str(root), "REVIEW_LINKS_HOST": "fixture.example."}),
+              mock.patch.object(memory_feed, "publish_page", side_effect=AssertionError("The link must not publish the page")),
+              redirect_stdout(output)):
+            self.assertEqual(memory_feed.main(["link"]), 0)
+        self.assertEqual(output.getvalue(), "http://fixture.example:9432/fixture%20folder/memory_live.html\n")
+        self.assertFalse(root.exists())
+
+    def test_link_refuses_a_folder_outside_the_review_root_with_one_plain_line(self) -> None:
+        root = self.root / "review-links"
+        output = io.StringIO()
+        with (mock.patch.dict(os.environ, {"REVIEW_LINKS_ROOT": str(root), "REVIEW_LINKS_HOST": "fixture.example"}),
+              redirect_stdout(output)):
+            self.assertEqual(memory_feed.main(["link"]), 1)
+        self.assertEqual(len(output.getvalue().splitlines()), 1)
+        self.assertTrue(output.getvalue().startswith("Build page link: "))
+        self.assertFalse(self.output.exists())
+
     def test_start_publishes_the_page_before_the_first_queue_reading(self) -> None:
-        def view() -> gate.QueueRead:
+        def view() -> admission_records.QueueRead:
             self.assertEqual((self.output / "memory_live.html").read_text(), self.expected_page())
             return captured_reading()
 
@@ -224,7 +256,7 @@ class MemoryFeedTests(unittest.TestCase):
               mock.patch.object(charts, "page_data", return_value=report_fixture()) as provider,
               mock.patch.object(time, "monotonic", side_effect=[0.0, 100.0, 301.0]),
               mock.patch.object(time, "sleep", side_effect=[None, None, FeedStopped])):
-            def view() -> gate.QueueRead:
+            def view() -> admission_records.QueueRead:
                 report_calls_per_cycle.append(provider.call_count)
                 return captured_reading()
 
@@ -242,6 +274,131 @@ class MemoryFeedTests(unittest.TestCase):
         self.assertEqual(report.zone, "America/New_York")
         self.assertEqual(report.start, "2026-11-04T19:00:00-05:00")
         self.assertEqual(report.end, "2026-11-07T19:00:00-05:00")
+
+    def cgroup(self, name: str, swapped: int) -> Path:
+        path = self.root / "cgroup" / name
+        path.mkdir(parents=True, exist_ok=True)
+        _ = (path / "memory.swap.current").write_text(str(swapped))
+        return path
+
+    def host_swap(self, total: int, used: int) -> None:
+        _ = (self.root / "proc/meminfo").write_text(
+            f"SwapTotal: {total // 1024} kB\nSwapFree: {(total - used) // 1024} kB\n")
+
+    def test_swap_accounts_for_the_host_and_names_the_agent_owner_once(self) -> None:
+        self.host_swap(32 * admission_records.GIB, 20 * admission_records.GIB)
+        _ = self.cgroup("user.slice", 16 * admission_records.GIB)
+        user = "user.slice/user@1000.service"
+        _ = self.cgroup(user, 15 * admission_records.GIB)
+        _ = self.cgroup(user + "/app.slice", 12 * admission_records.GIB)
+        _ = self.cgroup(user + "/app.slice/app-agents.slice", 10 * admission_records.GIB)
+        agent = self.cgroup(user + "/app.slice/app-agents.slice/first.scope", 4 * admission_records.GIB)
+        _ = self.cgroup(user + "/app.slice/app-agents.slice/second.scope", 6 * admission_records.GIB)
+        _ = self.cgroup(user + "/app.slice/app-browser.scope", 2 * admission_records.GIB)
+        _ = self.cgroup(user + "/session.slice", 2 * admission_records.GIB)
+        _ = self.cgroup(user + "/builds.slice", admission_records.GIB)
+        scope = self.cgroup(user + "/builds.slice/run.scope", admission_records.GIB)
+        _ = self.cgroup("system.slice", 2 * admission_records.GIB)
+        _ = self.cgroup("hana.slice", admission_records.GIB)
+        queued = reservation_reading().view.running[0]
+        memory = queued.measured
+        assert isinstance(memory, admission_records.MeasuredMemory)
+        queued = replace(queued, measured=replace(memory, anonymous_source=admission_records.ScopeSource(scope, frozenset())))
+        reads: Counter[Path] = Counter()
+        original = Path.read_text
+
+        def read(path: Path) -> str:
+            reads[path] += 1
+            return original(path)
+
+        with mock.patch.object(Path, "read_text", new=read):
+            swap = memory_feed.read_swap((queued, queued), {}, 6)
+        assert isinstance(swap, memory_feed.SwapReading)
+        rows = {row["name"]: row for row in swap.rows}
+        self.assertEqual(rows["agent sessions (2)"]["bytes"], 10 * admission_records.GIB)
+        self.assertEqual(rows["other apps: browser"]["bytes"], 2 * admission_records.GIB)
+        self.assertEqual(rows["desktop session"]["bytes"], 2 * admission_records.GIB)
+        self.assertEqual(rows["system services"]["bytes"], 2 * admission_records.GIB)
+        self.assertEqual(rows["hana CI"]["bytes"], admission_records.GIB)
+        self.assertEqual(rows[queue_lines.step_text(queued, RECORDED_STEP_NAMES)]["bytes"], admission_records.GIB)
+        self.assertEqual(rows["not in a group"]["bytes"], admission_records.GIB)
+        self.assertEqual(rows["not attributed"]["bytes"], admission_records.GIB)
+        self.assertEqual(rows["Total"]["bytes"], swap.used)
+        self.assertEqual(sum(row["bytes"] for row in swap.rows if row["kind"] != "total"), swap.used)
+        self.assertEqual(swap.files_read, sum(reads.values()))
+        self.assertTrue(all(count == 1 for count in reads.values()))
+        self.assertNotIn(agent / "memory.swap.current", reads)
+
+    def test_swap_keeps_the_unattributed_bytes_without_rounding_them_away(self) -> None:
+        self.host_swap(2 ** 20, 2 ** 20)
+        _ = self.cgroup("system.slice", 2 ** 20 - 7)
+        swap = memory_feed.read_swap((), {}, 6)
+        assert isinstance(swap, memory_feed.SwapReading)
+        residual = next(row for row in swap.rows if row["kind"] == "unattributed")
+        self.assertEqual(residual["bytes"], 7)
+        self.assertEqual(sum(row["bytes"] for row in swap.rows[:-1]), swap.used)
+        self.assertIn("not attributed: 7 B", memory_feed.swap_text(swap.rows))
+
+    def test_swap_exposes_a_signed_counter_difference_without_changing_owner_values(self) -> None:
+        self.host_swap(2 ** 20, 2 ** 20)
+        _ = self.cgroup("system.slice", 2 ** 20 + 7)
+        swap = memory_feed.read_swap((), {}, 6)
+        assert isinstance(swap, memory_feed.SwapReading)
+        self.assertEqual(swap.rows[0]["bytes"], 2 ** 20 + 7)
+        residual = next(row for row in swap.rows if row["kind"] == "unattributed")
+        self.assertEqual(residual["bytes"], -7)
+        self.assertEqual(sum(row["bytes"] for row in swap.rows[:-1]), swap.used)
+
+    def test_swap_names_ci_instead_of_the_raw_service_step(self) -> None:
+        self.host_swap(2 * admission_records.GIB, admission_records.GIB)
+        _ = self.cgroup("hana.slice", admission_records.GIB)
+        path = self.cgroup("hana.slice/hana-ci.slice", admission_records.GIB)
+        step = admission_records.RunningStep("", "hana-ci.slice", "service", str(path), 0,
+            admission_records.UnownedSliceMemory(admission_records.GIB, cgroup=str(path), owner="hana-ci.slice",
+                                    pid=admission_records.PidNotRecorded(), job_state=IdleService()), pid=admission_records.PidNotRecorded())
+        swap = memory_feed.read_swap((step,), {}, 6)
+        assert isinstance(swap, memory_feed.SwapReading)
+        self.assertEqual(swap.rows[0]["name"], "hana CI")
+        self.assertEqual(swap.rows[0]["bytes"], admission_records.GIB)
+
+    def test_swap_names_between_steps_owners_in_the_shared_rows(self) -> None:
+        self.host_swap(4 * admission_records.GIB, 2 * admission_records.GIB)
+        _ = self.cgroup("builds.slice", 2 * admission_records.GIB)
+        steps: list[admission_records.RunningStep] = []
+        labels = {name: unit_labels.UnitLabels(name) for name in ("owner-a", "owner-b")}
+        for owner in labels:
+            path = self.cgroup("builds.slice/" + owner + ".scope", admission_records.GIB)
+            steps.append(admission_records.RunningStep(owner, owner, "between steps", str(path), 0,
+                admission_records.UnownedSliceMemory(admission_records.GIB, cgroup=str(path), owner=owner, pid=admission_records.PidNotRecorded()),
+                pid=admission_records.PidNotRecorded()))
+        swap = memory_feed.read_swap(steps, labels, 6)
+        assert isinstance(swap, memory_feed.SwapReading)
+        self.assertEqual({row["name"] for row in swap.rows if row["kind"] == "owner"}, set(labels))
+        self.assertTrue(all("between steps" in row["detail"] for row in swap.rows if row["kind"] == "owner"))
+
+    def test_swap_small_groups_and_total_use_the_same_current_host_reading(self) -> None:
+        self.host_swap(4 * admission_records.GIB, 3 * admission_records.GIB)
+        for number in range(3):
+            _ = self.cgroup(f"owner-{number}.slice", admission_records.GIB // 2)
+        with mock.patch.object(admission_client, "view", return_value=captured_reading()):
+            page = memory_feed.reading(replace(memory_feed.read_configuration(), swap_rows=1))
+        self.assertEqual(page["swap_used"], 3)
+        self.assertEqual(page["swap_total"], 4)
+        self.assertEqual([row["kind"] for row in page["swap_by"]], ["owner", "smaller", "unattributed", "total"])
+        self.assertEqual(sum(row["bytes"] for row in page["swap_by"][:-1]), 3 * admission_records.GIB)
+        self.assertEqual(page["swap_by"][1]["bytes"], admission_records.GIB)
+
+    def test_between_steps_holds_name_their_distinct_owners(self) -> None:
+        reading = captured_reading()
+        room = reading.explanation.room
+        assert isinstance(room, admission_records.MemoryRoom)
+        holds = tuple(admission_records.RunKeepAside(admission_records.RunMemory(owner, admission_records.GIB, admission_records.AnonymousRunUse(0)), admission_records.GIB)
+                      for owner in ("owner-a", "owner-b", "owner-c"))
+        reading = replace(reading, explanation=replace(reading.explanation, room=replace(room, runs=holds)))
+        with mock.patch.object(admission_client, "view", return_value=reading):
+            page = memory_feed.reading()
+        self.assertEqual({row["name"] for row in page["walk"]}, {"owner-a", "owner-b", "owner-c"})
+        self.assertTrue(all(row["detail"] == "between steps" for row in page["walk"]))
 
     def test_pressure_failure_names_the_path_without_the_python_error(self) -> None:
         values = memory_feed.read_stalls()
@@ -292,9 +449,9 @@ class MemoryFeedTests(unittest.TestCase):
 
     def test_each_wait_state_keeps_its_reason_and_the_other_readings(self) -> None:
         reasons = (
-            (gate.PressureUnavailable("cannot read /private/proc/pressure/memory"), "/private/proc/pressure/memory"),
-            (gate.StartSpacingWait(200_010), "start spacing"),
-            (gate.BehindHead("first", 1, "head-session"), "behind"),
+            (admission_records.PressureUnavailable("cannot read /private/proc/pressure/memory"), "/private/proc/pressure/memory"),
+            (admission_records.StartSpacingWait(200_010), "start spacing"),
+            (admission_records.BehindHead("first", 1, "head-session"), "behind"),
         )
         for reason, expected in reasons:
             with self.subTest(reason=reason):
@@ -373,7 +530,7 @@ class MemoryFeedTests(unittest.TestCase):
                 explanation_step = replace(reading.explanation.running[0], step=step)
                 reading = replace(reading, view=replace(reading.view, running=(step,)),
                     explanation=replace(reading.explanation, running=(explanation_step,)))
-                reading = with_wait_reason(reading, gate.StartSpacingWait(110))
+                reading = with_wait_reason(reading, admission_records.StartSpacingWait(110))
                 waiter = replace(reading.view.waiting[0], project=project, folder=folder)
                 reading = replace(reading, view=replace(reading.view, waiting=(waiter,)))
                 with mock.patch.object(admission_client, "view", return_value=reading):
@@ -401,14 +558,14 @@ class MemoryFeedTests(unittest.TestCase):
     def test_the_leftover_list_uses_the_queue_rule_and_keeps_all_scope_members(self) -> None:
         ended = leftover_step(45)
         memory = ended.measured
-        assert isinstance(memory, gate.UnownedSliceMemory)
+        assert isinstance(memory, admission_records.UnownedSliceMemory)
         activity = memory.activity
         assert isinstance(activity, ScopeProcesses)
         ended = replace(ended, measured=replace(memory, activity=replace(activity, count=2,
             members=(ScopeProcess(45, "python3"), ScopeProcess(46, "helper")))))
         live = replace(ended, pid=60, measured=replace(memory,
             activity=replace(activity, run=LiveBuildRun(60, "live", 199_000))))
-        compiler = replace(ended, pid=70, measured=gate.CompilerServiceMemory(gate.GIB, pid=70))
+        compiler = replace(ended, pid=70, measured=admission_records.CompilerServiceMemory(admission_records.GIB, pid=70))
         service = replace(ended, pid=80, measured=replace(memory, job_state=IdleService()))
         reading = captured_reading(running=(ended, live, compiler, service))
         with (mock.patch.object(queue_view, "leftover_processes", wraps=queue_view.leftover_processes) as shared_rule,
@@ -423,15 +580,15 @@ class MemoryFeedTests(unittest.TestCase):
     def test_an_unavailable_cap_keeps_rows_room_and_reason(self) -> None:
         reading = reservation_reading()
         room = reading.explanation.room
-        assert isinstance(room, gate.MemoryRoom)
-        missing_run = replace(room.runs[0].memory, use=gate.RunUseUnavailable("private memory.stat is missing"))
-        for cap in (gate.CapUnavailable(()), gate.CapUnavailable((missing_run,))):
+        assert isinstance(room, admission_records.MemoryRoom)
+        missing_run = replace(room.runs[0].memory, use=admission_records.RunUseUnavailable("private memory.stat is missing"))
+        for cap in (admission_records.CapUnavailable(()), admission_records.CapUnavailable((missing_run,))):
             with self.subTest(cap=cap):
                 changed = replace(reading, explanation=replace(reading.explanation, room=replace(room, cap=cap)))
                 with mock.patch.object(admission_client, "view", return_value=changed):
                     page = memory_feed.reading()
-                self.assertIsInstance(page["cap"], gate.CapUnavailable)
-                self.assertEqual(page["room"], room.room / gate.GIB)
+                self.assertIsInstance(page["cap"], admission_records.CapUnavailable)
+                self.assertEqual(page["room"], room.room / admission_records.GIB)
                 self.assertTrue(page["walk"])
                 self.assertIn("unavailable", page["cap_text"])
                 if cap.runs:
@@ -440,10 +597,10 @@ class MemoryFeedTests(unittest.TestCase):
     def test_an_unavailable_run_use_keeps_its_named_reason(self) -> None:
         reading = reservation_reading()
         room = reading.explanation.room
-        assert isinstance(room, gate.MemoryRoom)
-        missing = gate.RunUseUnavailable("private memory.stat is missing")
+        assert isinstance(room, admission_records.MemoryRoom)
+        missing = admission_records.RunUseUnavailable("private memory.stat is missing")
         run = replace(room.runs[0], memory=replace(room.runs[0].memory, use=missing))
-        room = replace(room, runs=(run,), cap=gate.CapUnavailable((run.memory,)))
+        room = replace(room, runs=(run,), cap=admission_records.CapUnavailable((run.memory,)))
         reading = replace(reading, explanation=replace(reading.explanation, room=room))
         with mock.patch.object(admission_client, "view", return_value=reading):
             page = memory_feed.reading()
@@ -484,7 +641,7 @@ class MemoryFeedTests(unittest.TestCase):
     def test_the_json_boundary_preserves_named_missing_states(self) -> None:
         with mock.patch.object(admission_client, "view", return_value=captured_reading()):
             payload = memory_feed.reading()
-        payload["cap"] = gate.CapUnavailable(())
+        payload["cap"] = admission_records.CapUnavailable(())
         page = cast(dict[str, object], json.loads(memory_feed.page_json(payload)))
         self.assertEqual(page["cap"], {"kind": "CapUnavailable", "runs": []})
         self.assertIn("PressureNotRecorded", json.dumps(page["psi"]))
@@ -506,29 +663,29 @@ def write_browser_fixture(folder: Path) -> None:
         inputs = base.explanation.decided_from
         live = leftover_step(30)
         memory = live.measured
-        assert isinstance(memory, gate.UnownedSliceMemory)
+        assert isinstance(memory, admission_records.UnownedSliceMemory)
         activity = memory.activity
         assert isinstance(activity, ScopeProcesses)
         live = replace(live, pid=70, measured=replace(memory,
             activity=replace(activity, run=LiveBuildRun(70, "live", 199_000))))
-        compiler = replace(live, pid=80, measured=gate.CompilerServiceMemory(gate.GIB, pid=80))
+        compiler = replace(live, pid=80, measured=admission_records.CompilerServiceMemory(admission_records.GIB, pid=80))
         inputs = replace(inputs, now=200_000, running=(*inputs.running, leftover_step(45,
             members=(ScopeProcess(45, "python3"), ScopeProcess(46, "helper"))),
             leftover_step(19 * 60, small=True), leftover_step(2 * 24 * 60, small=True), live, compiler))
         base = gate.queue_read_from(inputs, admission_policy_fixture())
-        readings: dict[str, gate.QueueRead] = {"good": base}
+        readings: dict[str, admission_records.QueueRead] = {"good": base}
         for name, reason in (
-            ("pressure", gate.PressureUnavailable("cannot read /private/proc/pressure/memory")),
-            ("spacing", gate.StartSpacingWait(110)),
-            ("head", gate.BehindHead("first", 1, "head-session")),
+            ("pressure", admission_records.PressureUnavailable("cannot read /private/proc/pressure/memory")),
+            ("spacing", admission_records.StartSpacingWait(110)),
+            ("head", admission_records.BehindHead("first", 1, "head-session")),
         ):
             readings[name] = with_wait_reason(base, reason)
         room = base.explanation.room
-        assert isinstance(room, gate.MemoryRoom)
-        missing = replace(room.runs[0].memory, use=gate.RunUseUnavailable("private memory.stat is missing"))
-        for name, cap in (("old_cap", gate.CapUnavailable(())), ("missing_cap", gate.CapUnavailable((missing,)))):
+        assert isinstance(room, admission_records.MemoryRoom)
+        missing = replace(room.runs[0].memory, use=admission_records.RunUseUnavailable("private memory.stat is missing"))
+        for name, cap in (("old_cap", admission_records.CapUnavailable(())), ("missing_cap", admission_records.CapUnavailable((missing,)))):
             readings[name] = replace(base, explanation=replace(base.explanation, room=replace(room, cap=cap)))
-        missing_room = replace(room, cap=gate.CapUnavailable((missing,)),
+        missing_room = replace(room, cap=admission_records.CapUnavailable((missing,)),
             runs=(replace(room.runs[0], memory=missing),))
         readings["missing_use"] = replace(base, explanation=replace(base.explanation, room=missing_room))
         pages: dict[str, object] = {}

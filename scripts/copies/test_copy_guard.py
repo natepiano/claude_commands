@@ -6,11 +6,13 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from functools import cache
 import json
+import os
 from pathlib import Path
 import shlex
 import subprocess
 import tempfile
 import unittest
+from unittest import mock
 from typing import ClassVar, cast, override
 
 from scripts.copies import copies, copy_guard
@@ -110,8 +112,7 @@ def argv_policy_cases() -> tuple[tuple[list[str], str], ...]:
 
 def unresolved_policy_cases() -> tuple[tuple[str, str], ...]:
     return (("bash -s", "cannot resolve interpreter stdin"),
-            ("bash -c \"$(printf 'git status')\"", "cannot resolve interpreter program"),
-            ("bash <<DOC\necho $DYNAMIC\nDOC", "cannot resolve expanded interpreter stdin"),
+            ("bash -c", "missing interpreter command"),
             ("bash -s 3<<'DOC'\ngit status\nDOC", "cannot resolve interpreter stdin"))
 
 
@@ -124,12 +125,10 @@ class RecordedPolicyCase:
 
 
 def ordinary_agent_corpus() -> tuple[RecordedPolicyCase, ...]:
-    """Frozen tool payloads, never executed; manually assigned copy-policy results.
+    """Check recorded tool commands against fixed copy-policy results.
 
-    Source paths are normalized to /workspace without changing word boundaries.
-    Each front runs the same payload in its private fixture cwd. No case depends
-    on environment expansion or a repository at the normalized path. Rejected
-    commands stay in the corpus, including the intentionally unresolved input.
+    The commands use /workspace paths and each fixture's private working directory.
+    The tests inspect the commands without execution.
     """
     return (
         RecordedPolicyCase("python-version-long", "closure3 F030 rejected combined front", "python3 --version", ""),
@@ -150,9 +149,33 @@ def ordinary_agent_corpus() -> tuple[RecordedPolicyCase, ...]:
                            "cat <<'DOC'\n<(git clone a b)\nDOC", ""),
         RecordedPolicyCase("clone-refused", "round3 paired case via Claude and Codex fronts",
                            'echo "$(git clone a b)"', "git clone"),
-        RecordedPolicyCase("generated-program-unresolved", "round3 unresolved case via both fronts; intentional policy limit",
-                           'bash -c "$(printf \'git status\')"',
-                           "unresolved relevant operation: cannot resolve interpreter program"),
+        RecordedPolicyCase("generated-program-unresolved", "round3 command; Spec item 1 permits expanded program text",
+                           'bash -c "$(printf \'git status\')"', ""),
+        RecordedPolicyCase("joined-expanded-python", "Phase 41t command review",
+                           '''python3 -c "import os; os.system('git clone ' + '$(printf source)' + ' /tmp/x')"''',
+                           "git clone"),
+        RecordedPolicyCase("attached-expanded-command", "Phase 41t command review",
+                           '''python3 -c"import subprocess;subprocess.run(['git','clone','source','$(printf destination)'])"''',
+                           "git clone"),
+        RecordedPolicyCase("expanded-python-syntax", "Phase 41t command review",
+                           '''python3 -c "import subprocess;n=1${SUFFIX:-};subprocess.run(['git','clone','source','destination'])"''',
+                           "unresolved relevant operation: cannot parse Python program"),
+        RecordedPolicyCase("quoted-clone-before-error", "Phase 41t command review",
+                           'git cl""one source destination\necho "', "git clone"),
+        RecordedPolicyCase("multiline-clone-before-error", "Phase 41t command review",
+                           """python3 - <<'EOF'
+import subprocess
+subprocess.run(['git',
+'clone', 'a', 'b'])
+EOF
+if then fi""", "git clone"),
+        RecordedPolicyCase("clone-after-unsupported-ansi-escape", "Phase 41t shell lexer recovery",
+                           r"echo $'\q'; git clone a b", "git clone"),
+        RecordedPolicyCase("expanded-executable", "Phase 41t command review",
+                           '''python3 -c "import os; os.system('$GIT worktree add /tmp/x')"''',
+                           "unresolved relevant operation: cannot resolve executable name"),
+        RecordedPolicyCase("sequence-reassignment", "Phase 41t command review",
+                           'runner=git;runner=echo;"$runner" clone source destination', ""),
     )
 
 
@@ -243,6 +266,8 @@ class CopyGuardTests(unittest.TestCase):
         self.seed.copy_to(self.repo, self.root / "origin.git")
 
     def test_hook_refuses_each_repository_tree_making_form(self) -> None:
+        (self.root / ".claude").symlink_to(self.repo, target_is_directory=True)
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"HOME": str(self.root)})))
         source = shlex.quote(str(self.repo))
         commands = [
             f"git clone {source} destination",
@@ -255,6 +280,13 @@ class CopyGuardTests(unittest.TestCase):
             f"cp -a -t destination {source}", f"rsync -a {source}/ destination/",
             f"cd {source} && cp -a . destination",
             f'repo={source}; cp -a "$repo" destination',
+            'git worktree add /tmp/x -b y',  # Command 16.
+            'R=/tmp/x; git worktree add "$R" -b y',  # Command 17.
+            'git clone ~/.claude /tmp/x',  # Command 18.
+            'cp -r ~/.claude /tmp/x',  # Command 19.
+            'python3 - <<\'EOF\'\nimport subprocess\nsubprocess.run(["git", "worktree", "add", "/tmp/x"])\nEOF',  # Command 20.
+            'P=/tmp/x; python3 - <<EOF\nimport subprocess\nsubprocess.run(["git", "worktree", "add", "$P"])\nEOF',  # Command 21.
+            'python3 -c "import subprocess; subprocess.run([\'git\', \'clone\', \'$HOME/.claude\', \'/tmp/x\'])"',  # Command 22.
         ]
         for command in commands:
             with self.subTest(command=command):
@@ -263,6 +295,7 @@ class CopyGuardTests(unittest.TestCase):
                 }))
                 self.assertIn("copies.py run", reason)
                 self.assertIn("Example:", reason)
+                self.assertIn("copies.py", copy_guard.refusal(command, self.root))
 
     def test_worktree_git_pointer_also_counts_as_repository_source(self) -> None:
         linked = self.root / "linked worktree"
@@ -286,7 +319,8 @@ class CopyGuardTests(unittest.TestCase):
         self.assertIn("copies.py run", refusal)
         self.assertIn("make_worktree.sh <path> <branch>", refusal)
         result = subprocess.run(["bash", str(helper), str(checkout), "original-work"],
-                                cwd=self.repo, text=True, capture_output=True, timeout=10, check=False)
+                                cwd=self.repo, text=True, capture_output=True, timeout=10, check=False,
+                                env={**os.environ, "WORKTREES_STATE_DIR": str(self.root / "worktree state")})
         self.assertEqual(result.returncode, 0, result.stderr)
         branch = subprocess.run(["git", "-C", str(checkout), "branch", "--show-current"],
                                 text=True, capture_output=True, timeout=10, check=True).stdout.strip()
@@ -320,11 +354,64 @@ class CopyGuardTests(unittest.TestCase):
             with self.subTest(command=command):
                 self.assertIn("copies.py run", copy_guard.refusal(command, self.repo))
 
+    def test_branch_arguments_require_linear_invocation_work(self) -> None:
+        for count in (8, 12, 16):
+            assignments = [f"if test condition; then value{index}=left; else value{index}=right; fi"
+                           for index in range(count)]
+            variables = [f"$value{index}" for index in range(count)]
+            for arguments in (" ".join(f'"{value}"' for value in variables), '"' + "".join(variables) + '"'):
+                for program in ("printf %s", "git clone"):
+                    with self.subTest(variables=count, arguments=arguments, program=program):
+                        command = "; ".join([*assignments, program + " " + arguments])
+                        with mock.patch.object(copy_guard, "inspect_invocation", wraps=copy_guard.inspect_invocation) as inspected:
+                            reason = copy_guard.refusal(command, self.root)
+                        if program == "git clone":
+                            self.assertIn("copies.py run", reason)
+                        else:
+                            self.assertEqual(reason, "")
+                        self.assertLessEqual(inspected.call_count, 4 * count + copies.guard_choice_limit() + 1)
+
+        values = "".join(f"${{value{index}}}" for index in range(6))
+
+        def branches(left: str, right: str) -> list[str]:
+            return [f"if test condition; then value{index}={left}; else value{index}={right}; fi"
+                    for index in range(6)]
+
+        case_programs = ("case 0 in\n" + "\n".join(
+            f"{index}) program='git clone . /tmp/out-{index}';;" for index in range(33)) + "\nesac")
+        rows = (
+            ("shell-printf-above-choice-limit", branches("left", "right"), 'bash -c "printf %s ' + values + '"', ""),
+            ("shell-clone-above-choice-limit", branches("left", "right"), 'bash -c "git clone ' + values + ' dest"', "git clone:"),
+            ("shell-runner-above-choice-limit", branches("git", "''"),
+             'runner="' + values + '"; bash -c "$runner clone source destination"',
+             "unresolved relevant operation: cannot resolve executable name"),
+            ("copytree-above-choice-limit", branches("./", "././"),
+             'python3 -c "import shutil;shutil.copytree(\'' + values + '.\',\'/tmp/out\')"',
+             "unresolved relevant operation: cannot resolve interpreter program choices"),
+            ("git-options-above-choice-limit", branches("/", "//"),
+             'bash -c "/tmp/git-bin' + values + 'git -C . clone . /tmp/out"',
+             "unresolved relevant operation: cannot resolve interpreter program choices"),
+            ("eval-above-choice-limit", [case_programs], 'eval "$program"',
+             "unresolved relevant operation: cannot resolve interpreter program choices"),
+        )
+        for name, assignments, program, expected in rows:
+            with self.subTest(case=name):
+                reason = copy_guard.refusal("; ".join([*assignments, program]), self.repo)
+                if expected:
+                    self.assertTrue(reason.startswith(expected), reason)
+                    if expected == "git clone:":
+                        self.assertIn("copies.py", reason)
+                else:
+                    self.assertEqual(reason, "")
+
     def test_unparseable_shell_is_refused_instead_of_silently_allowed(self) -> None:
-        for command in ('git clone "unterminated', '"$(cat command-file)" source destination',
-                        "$unknown source destination", "if true; then git status"):
+        self.assertIn("copies.py run", copy_guard.refusal('git clone "unterminated', self.root))
+        for command, unreadable in (('"$(cat command-file)" source destination', "executable"),
+                                    ("$unknown source destination", "executable")):
             with self.subTest(command=command):
-                self.assertIn("copies.py run", copy_guard.refusal(command, self.root))
+                reason = copy_guard.refusal(command, self.root)
+                self.assertIn(unreadable, reason)
+                self.assertNotIn("copies.py", reason)
 
     def test_passes_the_service_and_non_repository_copy_commands(self) -> None:
         ordinary = self.root / "documents"
@@ -337,19 +424,46 @@ class CopyGuardTests(unittest.TestCase):
             f"cp {self.repo}/tracked destination", "git worktree list", "git status",
             "echo 'git clone source destination'", "# git clone source destination\ngit status",
             "cat <<'DOC'\ngit clone source destination\nDOC",
+            'echo "unterminated', "if true; then git status",
+            "bash <<DOC\necho $DYNAMIC\nDOC",
+            'bash -c "$(printf \'git status\')"',
+            'set -o pipefail; s=$(date +%s.%N); python3 ~/.claude/scripts/test_times/show.py top 2>&1; rc=$?; e=$(date +%s.%N); echo "rc=$rc"; python3 -c "print(f\'{$e-$s:.2f} s\')"',  # Command 1.
+            'f=$(ls -t /tmp/claude/unit/8bf65047-bbca-4bf7-819b-f44a96b6b053/mesh_runs/*.json | head -3 | tail -1); python3 -c "import json;d=json.load(open(\'$f\'));print(d.get(\'command\'))"; tail -5 ${f%.json}.log',  # Command 2.
+            'C=/home/natepiano/worktrees/claude-build-followups-sdlc\npython3 - <<EOF\nimport re\nt=open("$C/docs/plans/sdlc-log.md").read()\nfor m in re.finditer(r\'staff\\.py (pause|resume)\', t):\n    print(m.start(), t[max(0,m.start()-300):m.start()+300].replace(\'\\n\',\' | \'))\n    print(\'----\')\nEOF\n',  # Command 3.
+            'D=/tmp/claude/unit/1ce2e169-3129-4f89-b65d-25ead85f2048; R=$D/mesh_runs/20261104T093208-4066008-5de9; python3 - <<EOF\nimport json\nr=json.load(open("$R.json")); print(r.get("status"), r.get("pid"))\nEOF\nPID=$(python3 -c "import json;print(json.load(open(\'$R.json\'))[\'pid\'])"); ps -p $PID -o args= | cut -c1-200; ',  # Command 4.
+            'f=$(find ~/.claude/scripts -name work_order.py | head -1); echo $f; python3 $f --help 2>&1 | head -15',  # Command 5.
+            'f=$(ls ~/.claude/scripts/*/worker_panes.py | head -1); echo $f; python3 $f close --help 2>&1 | head -12',  # Command 6.
+            'tail -c 300000 /home/natepiano/.codex/sessions/2026/10/16/rollout-2026-10-16T00-19-57-01a142f0-279f-71f1-812e-dafdc7d51bf6.jsonl | python3 -c \'import sys,json\nlines=sys.stdin.read().splitlines()[1:]\nout=[]\nfor l in lines:\n  try: d=json.loads(l)\n  except: continue\n  p=d.get("payload",{});t=p.get("type")\n  if t in ("token_count","reasoning"): continue\n  s=p.get("message") or p.get("arguments") or p.get("output") or p.get("content") or ""\n  out.append(f"{d.get(\\"timestamp\\",\\"\\")[11:19]} {t} {str(s)[:260]}")\nprint("\\n".join(out[-30:]))\'',  # Command 7.
+            'cd /home/natepiano/rust/cargo-liner-port; S=/tmp/claude/unit/b6e56837-8fc7-4cd5-ba71-0ff1c804cfd1; ls $S/phases/4g/ | grep -i "diff\\|review_prompt"; git status --short | grep \'^??\'; ~/.claude/scripts/lib/py ~/.claude/scripts/direct/findings.py status --session-dir $S --phase 4g > $SP/dev/null 2>&1; ~/.claude/scripts/lib/py ~/.claude/scripts/direct/findings.py status --session-dir $S --phase 4g | python3 -c \'import json,sys; [print(f"- {f[\\"id\\"]} ({f[\\"severity\\"]}) {f[\\"file\\"]}:{f.get(\\"line\\") or \\"\\"} — {f[\\"title\\"]} [{f[\\"state\\"]}]") for f in json.load(sys.stdin)["findings"]]\'',  # Command 8.
+            'for a b in 2_a 2_b 2_b 2_c 2_c 2_d; do echo "$a->$b $(magick compare -metric AE -fuzz 5% $a.png $b.png null: 2>&1)"; done; ls',  # Command 9.
+            'F=/tmp/claude/unit/b090f8f1-cf8e-4d44-8e52-b223d94de9cc/phases/16/impl_summary.txt; wc -l $F; grep -n "^Driver\\|python3\\|import resource\\|^```" $F | head',  # Command 10.
+            'L=/tmp/claude/unit/b6e56837-8fc7-4cd5-ba71-0ff1c804cfd1/phases/4/live; cat $L/live2.log; ls -la $L/shots_final | head -40; O=$L/shots_final; echo ---RESCAN-TXT; sed -n 1,14p $O/color-3-after-rescan.txt 2>/dev/null | cut -c1-110; echo; for f in color-3-after-rescan nocolor-3-after-rescan; do echo "== $f"; grep -c $\'\\x1b\\[[0-9;]*9[;m]\' $O/$f.ansi; grep -n \'doomed\' $O/$f.ansi | cut -c1-200 | head -3; grep -n \'alpha\' $O/$f.ansi | cut -c1-200 | head -3; done; echo ---STATE; cat $L/xdg/cache/cargo-port/ci/tree_state.toml 2>/dev/null; sed -n 1,200p $L/live2.sh | grep -n "settle\\|^#" | head -30',  # Command 11.
+            'L=/tmp/claude/unit/b6e56837-8fc7-4cd5-ba71-0ff1c804cfd1/phases/4/live; tail -n 14 /tmp/claude-1000/-home-natepiano-rust-cargo-liner-port/56f73864-53c9-41fe-9ca0-532173a1e73b/tasks/b8h7appxk.output | cut -c1-120; cd $L/shots_final; ls *.txt | tr \'\\n\' \' \'; echo; for f in color-1-before-delete color-2-after-delete color-3-after-rescan nocolor-1-before-delete nocolor-2-after-delete nocolor-3-after-rescan; do echo "== $f"; grep -n "doomed" $f.txt | cut -c1-70 | head -n 3; grep -c "" $f.txt >/dev/null; done; echo "== ansi strike"; for f in color-2-after-delete color-3-after-rescan nocolor-2-after-delete nocolor-3-after-rescan; do echo "$f: $(grep -a \'doomed\' $f.ansi | head -n 1 | grep -ac $\'\\x1b\\[[0-9;]*9[;m]\')"; done; sed -n 1,14p color-3-after-rescan.txt | cut -c1-70',  # Command 12.
+            'python3 - <<\'EOF\'\nimport json,os\nsp=os.path.expanduser(\'~/.local/state/showrunner/sdlc/session/showrunner_state.json\')\ns=json.load(open(sp))\ns[\'next\'][0]=s[\'next\'][0]+" | DEVTOOLS ROWS IN 09:26 (code green ETAs): 1 impl2 10:15; 2 item2 10:00; 3 item3 09:45; 4 item4 09:45; 5 item5 10:15; 6 test 10:30; 7 item7 10:45; 8 item8 10:15; 9 fix 10:00; 10 item10 10:30; 11 item11 09:45; 12 item12 09:45; 13 item13 GREEN; 14 item14 10:45; 15 3t item15 GREEN, checkpoint 10:05; 16 claim-lock item16 10:15; 17 first-parent item17 09:50, hash 10:20. Landings: 3t 10:05; 3x 11:00; 4o 11:00; 4a 11:30; 4d 11:30; 7o 10:45. WAIT herdr rows.")\njson.dump(s,open(sp,\'w\'),indent=2)\nEOF',  # Command 13.
+            'for f in scripts/worktree/*.sh; do bash -n "$f"; done',  # Command 14.
+            'S=/tmp/claude/unit/x; python3 - <<EOF\nprint("$S")\nEOF',  # Command 15.
         ]
         for command in commands:
             with self.subTest(command=command):
                 self.assertEqual(copy_guard.refusal(command, self.root), "")
+                self.assertEqual(copy_guard.hook_refusal(json.dumps({
+                    "tool_name": "Bash", "tool_input": {"command": command}, "cwd": str(self.root)})), "")
 
     def test_service_mention_does_not_exempt_an_unrelated_clone(self) -> None:
         for command in (
             "echo copies.py; git clone source destination",
             "copies.py list && git clone source destination",
             "python3 helper.py copies.py; git clone source destination",
+            "bash -c; git clone source destination",
         ):
             with self.subTest(command=command):
-                self.assertIn("copies.py run", copy_guard.refusal(command, self.root))
+                reason = copy_guard.refusal(command, self.root)
+                self.assertIn("copies.py run", reason)
+                self.assertTrue(reason.startswith("git clone:"))
+                hook_reason = copy_guard.hook_refusal(json.dumps({
+                    "tool_name": "Bash", "tool_input": {"command": command}, "cwd": str(self.root)}))
+                self.assertTrue(hook_reason.startswith("git clone:"))
+                self.assertIn("copies.py", hook_reason)
 
     def test_non_bash_and_invalid_payloads_do_not_change_other_hooks(self) -> None:
         for payload in (
@@ -836,7 +950,7 @@ outer()
         self.assertEqual({finding.path.name: finding.operation for finding in findings}, expected)
 
     def test_malformed_syntax_and_unresolved_executables_have_distinct_outcomes(self) -> None:
-        for command in ('echo "unterminated', 'if true; then git status', '$unknown a b', '"$(cat command-file)" a b'):
+        for command in ('$unknown a b', '"$(cat command-file)" a b'):
             with self.subTest(command=command):
                 self.assertIsInstance(copy_guard.inspect_shell(command, self.root), copy_guard.UnresolvedOperation)
                 self.assertTrue(copy_guard.refusal(command, self.root).startswith("unresolved relevant operation:"))
@@ -933,6 +1047,16 @@ git_at(repo, "show", "clone")
         for command, reason in unresolved_policy_cases():
             with self.subTest(command=command):
                 self.assertEqual(copy_guard.inspect_shell(command, self.root), copy_guard.UnresolvedOperation(reason))
+                for message in (
+                    copy_guard.refusal(command, self.root),
+                    copy_guard.hook_refusal(json.dumps({
+                        "tool_name": "Bash", "tool_input": {"command": ["bash", "-c", command]},
+                        "cwd": str(self.root)})),
+                    str(copy_guard.TreeCreation(self.root / "unresolved.sh", 1,
+                                               "unresolved relevant operation: " + reason)),
+                ):
+                    self.assertIn(reason, message)
+                    self.assertNotIn("copies.py", message)
 
     def test_recorded_agent_commands_and_semantic_boundaries_have_exact_outcomes(self) -> None:
         for case in repair_policy_cases():

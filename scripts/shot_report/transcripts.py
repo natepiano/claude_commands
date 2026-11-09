@@ -1692,21 +1692,26 @@ def _message_text(value: object) -> str:
 def _outgoing_tool_message(name: str, value: object, command: str) -> str:
     if name == "SendMessage" or name.endswith(".SendMessage"):
         return _message_text(value)
-    if "codex_mesh.py" not in command or "--message" not in command:
+    if "send.py" not in command and "codex_mesh.py" not in command:
         return ""
     messages: list[str] = []
     for tokens in _shell_segments(command):
         program, arguments = _program(tokens)
-        if program == "codex_mesh.py":
+        if program in ("send.py", "codex_mesh.py"):
             options = arguments[1:]
-        elif program.startswith("python") and len(arguments) > 1 and Path(arguments[1]).name == "codex_mesh.py":
+        elif program.startswith("python") and len(arguments) > 1 and Path(arguments[1]).name in ("send.py", "codex_mesh.py"):
+            program = Path(arguments[1]).name
             options = arguments[2:]
         else:
             continue
+        if program == "codex_mesh.py":
+            message_option = "--message"
+        else:
+            message_option = "--text"
         for index, option in enumerate(options):
-            if option == "--message" and index + 1 < len(options):
+            if option == message_option and index + 1 < len(options):
                 messages.append(options[index + 1])
-            elif option.startswith("--message="):
+            elif option.startswith(message_option + "="):
                 messages.append(option.partition("=")[2])
     return " ".join(messages)
 

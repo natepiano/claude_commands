@@ -25,7 +25,7 @@ from pathlib import Path
 from typing import BinaryIO, Literal, Protocol, TypedDict, cast
 from itertools import chain
 
-from scripts.build_queue import admission_records as records, progress_profile as progress, snapshot_codec as codec
+from scripts.build_queue import admission_records as records, progress_profile as progress, snapshot_codec as codec, step_estimator
 from scripts.build_queue.scope_activity import (EmptyBuildScope, IdleService, LiveBuildRun, NoLiveBuildRun,
     NotServiceSlice, RunningServiceJob, ScopeActivityReader, ScopeProcesses)
 
@@ -35,244 +35,150 @@ from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib import conf
 
 from scripts.lib.test_phase import (
-    CallRecord as CallRecord,
-    NoCallRecord as NoCallRecord,
-    TestPhaseChargeUse as TestPhaseChargeUse,
-    NoTestPhaseChargeUse as NoTestPhaseChargeUse,
+    CallRecord,
+    NoCallRecord,
+    TestPhaseChargeUse,
+    NoTestPhaseChargeUse,
     parse_test_phase_charge_use,
     ObservedTestPhase,
     TestPhaseRecord,
     UnobservedTestPhase,
 )
 
-from scripts.buildlog import record, repository as repository, store
+from scripts.buildlog import record, store
 
 
 from scripts.build_queue.admission_records import (
-    AdmissionDecision as AdmissionDecision,
-    AdmissionPolicy as AdmissionPolicy,
-    AdmissionTimeNotRecorded as AdmissionTimeNotRecorded,
-    AdmissionTiming as AdmissionTiming,
-    AdmissionWaitSnapshot as AdmissionWaitSnapshot,
-    AnonymousRunUse as AnonymousRunUse,
-    BUILDLOG_UNIT as BUILDLOG_UNIT,
-    BasisNotRecorded as BasisNotRecorded,
-    BehindHead as BehindHead,
-    BetweenStepsSlot as BetweenStepsSlot,
-    BuildHistoryGeneration as BuildHistoryGeneration,
-    CIKeepAside as CIKeepAside,
-    Call as Call,
-    CallerRun as CallerRun,
-    CapNotRecorded as CapNotRecorded,
-    CapUnavailable as CapUnavailable,
-    CappedAtBudget as CappedAtBudget,
-    CompilerServiceMemory as CompilerServiceMemory,
-    ConfigurationDiagnostic as ConfigurationDiagnostic,
-    ContinuationSlot as ContinuationSlot,
-    DEV_HEADROOM as DEV_HEADROOM,
-    DevSizeHeadroom as DevSizeHeadroom,
-    DoesNotFit as DoesNotFit,
-    EstimateExpired as EstimateExpired,
-    ExpectedPeak as ExpectedPeak,
-    ExplainedRunningStep as ExplainedRunningStep,
-    FailedPeakFloor as FailedPeakFloor,
-    FinalOutcomeName as FinalOutcomeName,
-    FinalizationIntent as FinalizationIntent,
-    FirstProgramPeak as FirstProgramPeak,
-    Fits as Fits,
-    FoundRun as FoundRun,
-    FreeCheck as FreeCheck,
-    FreshTest as FreshTest,
-    GIB as GIB,
-    GoneMemory as GoneMemory,
-    HeadAdmissionOverride as HeadAdmissionOverride,
-    HeadAdmissionStatus as HeadAdmissionStatus,
-    HeadCause as HeadCause,
-    HeadExplanation as HeadExplanation,
-    HeadroomRule as HeadroomRule,
-    HeldBehindHead as HeldBehindHead,
-    HistoryPeakSizing as HistoryPeakSizing,
-    HostAvailable as HostAvailable,
-    HostMemory as HostMemory,
-    INFER_FROM_ARGV as INFER_FROM_ARGV,
-    InferFromArgv as InferFromArgv,
-    LegacyDevMultiplierHeadroom as LegacyDevMultiplierHeadroom,
-    LegacyNeedSource as LegacyNeedSource,
-    LifetimePromise as LifetimePromise,
-    LineWaiter as LineWaiter,
-    MeasuredMemory as MeasuredMemory,
-    MeasuredProgramPeak as MeasuredProgramPeak,
-    MemoryConfig as MemoryConfig,
-    MemoryPressure as MemoryPressure,
-    MemoryPromise as MemoryPromise,
-    MemoryRoom as MemoryRoom,
-    NO_PRESSURE_HOLD as NO_PRESSURE_HOLD,
-    NO_QUEUE_PRIORITY as NO_QUEUE_PRIORITY,
-    NeedBasis as NeedBasis,
-    NeedSource as NeedSource,
-    NeedSourceNotRecorded as NeedSourceNotRecorded,
-    NeedsMemory as NeedsMemory,
-    NextStartAt as NextStartAt,
-    NoBuildHistoryGeneration as NoBuildHistoryGeneration,
-    NoFloor as NoFloor,
-    NoHeadAdmissionOverride as NoHeadAdmissionOverride,
-    NoHeadroom as NoHeadroom,
-    NoOrderHold as NoOrderHold,
-    NoPeakRecorded as NoPeakRecorded,
-    NoPressureHold as NoPressureHold,
-    NoPromise as NoPromise,
-    NoQueuePriority as NoQueuePriority,
-    NoSource as NoSource,
-    NoTestWidth as NoTestWidth,
-    NoWaiter as NoWaiter,
-    NormalOrder as NormalOrder,
-    OverrideRoom as OverrideRoom,
-    PeakDecayed as PeakDecayed,
-    PeakFileUnreadable as PeakFileUnreadable,
-    PeakHistory as PeakHistory,
-    PeakHold as PeakHold,
-    PeakSoFar as PeakSoFar,
-    PeakTimeUnknown as PeakTimeUnknown,
-    PendingPriorityTransition as PendingPriorityTransition,
-    PidNotRecorded as PidNotRecorded,
-    Pressure as Pressure,
-    PressureConditionNotRecorded as PressureConditionNotRecorded,
-    PressurePolicy as PressurePolicy,
-    PressureUnavailable as PressureUnavailable,
-    PriorityUnit as PriorityUnit,
-    ProcessAnonymousUse as ProcessAnonymousUse,
-    ProcessSource as ProcessSource,
-    ProgramProfile as ProgramProfile,
-    ProgressAdjustedMemory as ProgressAdjustedMemory,
-    PromisedMemory as PromisedMemory,
-    QueueExplanation as QueueExplanation,
-    QueueInputs as QueueInputs,
-    QueueLifeIdentity as QueueLifeIdentity,
-    QueueMemoryTotals as QueueMemoryTotals,
-    QueuePriority as QueuePriority,
-    QueueRead as QueueRead,
-    QueueView as QueueView,
-    RampPromise as RampPromise,
-    RankedWaiter as RankedWaiter,
-    ReadingUnavailable as ReadingUnavailable,
-    ReadyForAdmission as ReadyForAdmission,
-    ReadyToStart as ReadyToStart,
-    RecordedNeed as RecordedNeed,
-    ReleaseHeadroom as ReleaseHeadroom,
-    Repository as Repository,
-    RepositoryIdentity as RepositoryIdentity,
-    RequestedTestWidth as RequestedTestWidth,
-    Reservation as Reservation,
-    RoomCheck as RoomCheck,
-    RunKeepAside as RunKeepAside,
-    RunMemory as RunMemory,
-    RunSlot as RunSlot,
-    RunUseUnavailable as RunUseUnavailable,
-    RunningStep as RunningStep,
-    ScopeSource as ScopeSource,
-    SettledPriority as SettledPriority,
-    ShapeFallback as ShapeFallback,
-    ShapeLargest as ShapeLargest,
-    ShapeNeedBasis as ShapeNeedBasis,
-    ShapeP90 as ShapeP90,
-    StartBasis as StartBasis,
-    StartSpacing as StartSpacing,
-    StartSpacingWait as StartSpacingWait,
-    StartsAlone as StartsAlone,
-    StepMemory as StepMemory,
-    StepProfile as StepProfile,
-    TEST_PHASE_MARGIN_FALLBACK as TEST_PHASE_MARGIN_FALLBACK,
-    TestPhaseNeed as TestPhaseNeed,
-    TestPhaseNeedForm as TestPhaseNeedForm,
-    TestPhaseStarted as TestPhaseStarted,
-    TestScope as TestScope,
-    TestWidth as TestWidth,
-    TokenWaitersOnly as TokenWaitersOnly,
-    TokenWaitingWaiter as TokenWaitingWaiter,
-    UnderBudget as UnderBudget,
-    UnknownHostTotal as UnknownHostTotal,
-    UnknownRepository as UnknownRepository,
-    UnownedSliceMemory as UnownedSliceMemory,
-    UnspecifiedTestWidth as UnspecifiedTestWidth,
-    WaitReason as WaitReason,
-    Waiter as Waiter,
-    WaiterIdentity as WaiterIdentity,
-    WaitingLine as WaitingLine,
-    WaitingStep as WaitingStep,
-    WidthNotRecorded as WidthNotRecorded,
-    WithinSlot as WithinSlot,
-    configuration_diagnostics as configuration_diagnostics,
-    head_wait_text as head_wait_text,
-    pressure_text as pressure_text,
-    process_start_time as process_start_time,
-    queue_command_actor as queue_command_actor,
-    read_memory_config as read_memory_config,
-    run_owner as run_owner,
-    stored_waiter as stored_waiter,
-    test_threads as test_threads,
-    waiter_identity as waiter_identity,
-    waiter_owner as waiter_owner,
-    waiter_priority as waiter_priority,
-    warn_configuration_diagnostics as warn_configuration_diagnostics,
+    AdmissionDecision,
+    AdmissionPolicy,
+    AdmissionTimeNotRecorded,
+    AnonymousRunUse,
+    BasisNotRecorded,
+    BehindHead,
+    BetweenStepsSlot,
+    CIKeepAside,
+    CallerRun,
+    CapNotRecorded,
+    CapUnavailable,
+    CappedAtBudget,
+    CompilerServiceMemory,
+    ContinuationSlot,
+    DevSizeHeadroom,
+    DoesNotFit,
+    EstimateExpired,
+    ExplainedRunningStep,
+    FailedPeakFloor,
+    FinalOutcomeName,
+    FinalizationIntent,
+    Fits,
+    FoundRun,
+    FreeCheck,
+    GIB,
+    GoneMemory,
+    HeadAdmissionOverride,
+    HeadAdmissionStatus,
+    HeadCause,
+    HeadExplanation,
+    HeadroomRule,
+    HeldBehindHead,
+    HostAvailable,
+    HostMemory,
+    LegacyDevMultiplierHeadroom,
+    LifetimePromise,
+    LineWaiter,
+    MeasuredMemory,
+    MemoryConfig,
+    MemoryPressure,
+    MemoryPromise,
+    MemoryRoom,
+    NO_PRESSURE_HOLD,
+    NO_QUEUE_PRIORITY,
+    NeedBasis,
+    NeedSource,
+    NeedSourceNotRecorded,
+    NeedsMemory,
+    NextStartAt,
+    NoFloor,
+    NoHeadAdmissionOverride,
+    NoHeadroom,
+    NoOrderHold,
+    NoPeakRecorded,
+    NoPressureHold,
+    NoPromise,
+    NoQueuePriority,
+    NoTestWidth,
+    NoWaiter,
+    NormalOrder,
+    OverrideRoom,
+    PeakDecayed,
+    PeakFileUnreadable,
+    PeakHistory,
+    PeakSoFar,
+    PeakTimeUnknown,
+    PendingPriorityTransition,
+    PidNotRecorded,
+    Pressure,
+    PressureUnavailable,
+    PriorityUnit,
+    ProcessAnonymousUse,
+    ProcessSource,
+    ProgressAdjustedMemory,
+    PromisedMemory,
+    QueueExplanation,
+    QueueInputs,
+    QueueLifeIdentity,
+    QueueMemoryTotals,
+    QueuePriority,
+    QueueRead,
+    QueueView,
+    RankedWaiter,
+    ReadingUnavailable,
+    ReadyForAdmission,
+    RecordedNeed,
+    ReleaseHeadroom,
+    RequestedTestWidth,
+    Reservation,
+    RoomCheck,
+    RunKeepAside,
+    RunMemory,
+    RunSlot,
+    RunUseUnavailable,
+    RunningStep,
+    ScopeSource,
+    SettledPriority,
+    ShapeFallback,
+    ShapeLargest,
+    ShapeRankedPeak,
+    StartBasis,
+    StartSpacing,
+    StartSpacingWait,
+    StartsAlone,
+    StepMemory,
+    TestPhaseNeed,
+    TestPhaseNeedForm,
+    TestPhaseStarted,
+    TokenWaitersOnly,
+    TokenWaitingWaiter,
+    UnderBudget,
+    UnknownHostTotal,
+    UnownedSliceMemory,
+    UnspecifiedTestWidth,
+    WaitReason,
+    Waiter,
+    WaiterIdentity,
+    WaitingLine,
+    WaitingStep,
+    WidthNotRecorded,
+    WithinSlot,
 )
 from scripts.build_queue.step_estimator import (
-    ANON_SHARE as ANON_SHARE,
-    BroadTestSelection as BroadTestSelection,
-    BuildPeak as BuildPeak,
-    Completed as Completed,
-    FILTERED_FLOOR as FILTERED_FLOOR,
-    Failed as Failed,
-    FinalOutcome as FinalOutcome,
-    GENERIC_REPO_NAMES as GENERIC_REPO_NAMES,
-    HISTORY_DAYS as HISTORY_DAYS,
-    HistoryOutcome as HistoryOutcome,
-    HistorySelection as HistorySelection,
-    Killed as Killed,
-    NO_BUILD_SHAPE as NO_BUILD_SHAPE,
-    NO_STEP_EVIDENCE as NO_STEP_EVIDENCE,
-    OutcomeNotRecorded as OutcomeNotRecorded,
-    OwnerGone as OwnerGone,
-    PackageTestSelection as PackageTestSelection,
-    ReusableEstimate as ReusableEstimate,
-    StepEstimate as StepEstimate,
-    TEST_EXPRESSION_OPTIONS as TEST_EXPRESSION_OPTIONS,
-    TEST_OPTION_VALUES as TEST_OPTION_VALUES,
-    TEST_PREDICATE as TEST_PREDICATE,
-    VERIFY_FILTER_SELECTION as VERIFY_FILTER_SELECTION,
-    VERIFY_NAME_PREDICATE as VERIFY_NAME_PREDICATE,
-    VERIFY_NAME_UNION as VERIFY_NAME_UNION,
-    VERIFY_PACKAGE_PREDICATE as VERIFY_PACKAGE_PREDICATE,
-    VERIFY_PACKAGE_SELECTION as VERIFY_PACKAGE_SELECTION,
-    VERIFY_TEST_NAMES as VERIFY_TEST_NAMES,
-    anonymous_history_rows as anonymous_history_rows,
-    build_expected_peak as build_expected_peak,
-    build_peaks as build_peaks,
-    compiling_history as compiling_history,
-    current_worktree_steps as current_worktree_steps,
-    epoch as epoch,
-    expected_peak as expected_peak,
-    filter_expressions as filter_expressions,
-    filter_set as filter_set,
-    read_estimate_history as read_estimate_history,
-    fresh_test_peak as fresh_test_peak,
-    git_identity as git_identity,
-    history_arguments as history_arguments,
-    history_matches_repository as history_matches_repository,
-    history_outcome as history_outcome,
-    history_selection as history_selection,
-    is_fresh_test as is_fresh_test,
-    memory_config as memory_config,
-    no_build_history_generation as no_build_history_generation,
-    percentile as percentile,
-    program_peak_estimate as program_peak_estimate,
-    repository_history as repository_history,
-    shape_headroom_bytes as shape_headroom_bytes,
-    step_estimate as step_estimate,
-    test_filters as test_filters,
-    test_package as test_package,
-    test_scope as test_scope,
-    test_selection as test_selection,
-    verify_test_selection as verify_test_selection,
+    Completed,
+    FILTERED_FLOOR,
+    Failed,
+    FinalOutcome,
+    HISTORY_DAYS,
+    Killed,
+    OutcomeNotRecorded,
 )
 
 MERGE_GATE_TESTS = "tests"
@@ -565,9 +471,9 @@ def estimate_expired(waiter: Waiter, now: float, policy: AdmissionPolicy) -> boo
 def ranked_queue_waiters(inputs: QueueInputs) -> list[tuple[Path, RankedWaiter]]:
     """Resolve order metadata without adding it to captured waiter rows."""
     claims = {slot.owner for slot in inputs.slots if isinstance(slot, ContinuationSlot)}
-    return sorted(((path, rank_waiter(row, inputs.waiter_orders[waiter_owner(row)]))
+    return sorted(((path, rank_waiter(row, inputs.waiter_orders[records.waiter_owner(row)]))
                    for path, row in inputs.ordered),
-                  key=lambda item: (waiter_owner(item[1]) not in claims, waiter_order(item[1])))
+                  key=lambda item: (records.waiter_owner(item[1]) not in claims, waiter_order(item[1])))
 
 
 @dataclass(frozen=True)
@@ -687,6 +593,7 @@ class UsableAdmissionConfiguration:
     cloud_gate_slots: int
     cloud_gate_stale_pushes: int
     progress_profile_rank: int
+    peak_history_share_percent: int
 
 
 @dataclass(frozen=True)
@@ -702,10 +609,11 @@ def read_admission_configuration() -> UsableAdmissionConfiguration | UnusableAdm
             cloud_gate_slots = settings.whole("cloud_gate_slots")
             cloud_gate_stale_pushes = settings.whole("cloud_gate_stale_pushes")
             progress_profile_rank = settings.whole("progress_profile_rank")
-        config = read_memory_config(report=False)
+            peak_history_share_percent = settings.whole("peak_history_share_percent")
+        config = records.read_memory_config(report=False)
         return UsableAdmissionConfiguration(replace(config,
-            diagnostics=(*config.diagnostics, *configuration_diagnostics(messages))),
-            cloud_gate_slots, cloud_gate_stale_pushes, progress_profile_rank)
+            diagnostics=(*config.diagnostics, *records.configuration_diagnostics(messages))),
+            cloud_gate_slots, cloud_gate_stale_pushes, progress_profile_rank, peak_history_share_percent)
     except conf.Unusable as error:
         return UnusableAdmissionConfiguration(str(error))
 
@@ -772,9 +680,10 @@ def _need_record(basis: NeedBasis | BasisNotRecorded | TestPhaseNeed | NoTestPha
             if isinstance(basis.factor, DevSizeHeadroom):
                 factor["margin_bytes"] = basis.factor.margin_bytes
             break
-    kind = "shape_p90" if isinstance(basis, ShapeP90) else "shape_largest"
-    return {"kind": kind, "runs": basis.runs,
-            "floor": floor, "factor": factor, "cap": cap}
+    if isinstance(basis, ShapeRankedPeak):
+        return {"kind": "shape_ranked_peak", "runs": basis.runs, "share_percent": basis.share_percent,
+                "floor": floor, "factor": factor, "cap": cap}
+    return {"kind": "shape_largest", "runs": basis.runs, "floor": floor, "factor": factor, "cap": cap}
 
 
 def _read_need_record(raw: object) -> NeedBasis | BasisNotRecorded | TestPhaseNeed | NoTestPhaseNeed:
@@ -783,6 +692,10 @@ def _read_need_record(raw: object) -> NeedBasis | BasisNotRecorded | TestPhaseNe
         return BasisNotRecorded()
     row = cast(dict[str, object], raw)
     kind = row.get("kind")
+    if kind == "shape_p90":
+        # Phase 33: older shape estimates always used a ten-percent share.
+        row = {**row, "kind": "shape_ranked_peak", "share_percent": 10}
+        kind = "shape_ranked_peak"
     if kind == "no_test_phase_need" and row.get("reason") in ("no_width", "no_history", "not_recorded"):
         return NoTestPhaseNeed(cast(Literal["no_width", "no_history", "not_recorded"], row["reason"]))
     if kind == "test_phase_need":
@@ -798,7 +711,7 @@ def _read_need_record(raw: object) -> NeedBasis | BasisNotRecorded | TestPhaseNe
         return BasisNotRecorded()
     if kind in ("measured", "buildlog", "pooled", "fallback"):
         return kind
-    if kind not in ("shape_p90", "shape_largest", "shape_fallback"):
+    if kind not in ("shape_ranked_peak", "shape_largest", "shape_fallback"):
         return BasisNotRecorded()
     try:
         cap_row = cast(dict[str, object], row["cap"])
@@ -856,8 +769,10 @@ def _read_need_record(raw: object) -> NeedBasis | BasisNotRecorded | TestPhaseNe
         runs = row["runs"]
         if not isinstance(runs, int) or runs < 0:
             return BasisNotRecorded()
-        if kind == "shape_p90" and runs >= 10:
-            return ShapeP90(runs, floor, factor, cap)
+        if kind == "shape_ranked_peak" and runs >= 10:
+            share_percent = row["share_percent"]
+            if type(share_percent) is int and 0 <= share_percent <= 50:
+                return ShapeRankedPeak(runs, share_percent, floor, factor, cap)
         if kind == "shape_largest" and 1 <= runs < 10:
             return ShapeLargest(runs, floor, factor, cap)
     except (KeyError, TypeError, ValueError):
@@ -884,8 +799,10 @@ def read_test_phase_need(raw: object) -> TestPhaseNeed | NoTestPhaseNeed:
 
 
 def test_phase_need_from_rows(rows: Iterable[Mapping[str, object]],
-                             row: Mapping[str, object], host: str, now: datetime, margin: float) -> TestPhaseNeed | NoTestPhaseNeed:
-    """Choose narrow-family history at the closest usable width; read no external state."""
+                             row: Mapping[str, object], host: str, now: datetime, margin: float, *,
+                             share_percent: int | progress.ConfiguredPeakShare = progress.CONFIGURED_PEAK_SHARE
+                             ) -> TestPhaseNeed | NoTestPhaseNeed:
+    """Choose narrow-family history at the closest usable width."""
     recorded = row.get("test_threads")
     width = recorded.threads if isinstance(recorded, RequestedTestWidth) else recorded
     if type(width) is not int or width <= 0:
@@ -900,7 +817,7 @@ def test_phase_need_from_rows(rows: Iterable[Mapping[str, object]],
                 or item.get("repo_identity") != repository
                 or item.get("test_scope", "full") != row.get("test_scope", "full")
                 or item.get("package", "") != row.get("package", "")
-                or sorted(history_arguments(item.get("filters"))) != sorted(history_arguments(row.get("filters")))):
+                or sorted(step_estimator.history_arguments(item.get("filters"))) != sorted(step_estimator.history_arguments(row.get("filters")))):
             continue
         peak, recorded_width = item.get("test_phase_peak_bytes"), item.get("test_threads")
         if type(peak) is not int or peak <= 0 or type(recorded_width) is not int or recorded_width <= 0:
@@ -922,7 +839,7 @@ def test_phase_need_from_rows(rows: Iterable[Mapping[str, object]],
     else:
         recorded_width, form = max(by_width), "scaled_up"
     peaks = by_width[recorded_width]
-    need = percentile(peaks)
+    need = progress.ranked_peak(peaks, 1, share_percent=share_percent)
     if form == "scaled_up":
         need = (need * width + recorded_width - 1) // recorded_width
     return TestPhaseNeed(max(FILTERED_FLOOR, need), len(peaks), width, recorded_width, form, margin)
@@ -930,12 +847,14 @@ def test_phase_need_from_rows(rows: Iterable[Mapping[str, object]],
 
 def test_phase_need(row: Mapping[str, object], host: str, now: datetime, root: Path, *,
                     history_path: Path | None = None,
-                    config: MemoryConfig
+                    config: MemoryConfig,
+                    share_percent: int | progress.ConfiguredPeakShare = progress.CONFIGURED_PEAK_SHARE
                     ) -> TestPhaseNeed | NoTestPhaseNeed:
     """Freeze the history need and margin when the reservation need is written."""
     try:
         path = history_path if history_path is not None else root / "admission/anon_peaks.jsonl"
-        return test_phase_need_from_rows(anonymous_history_rows(path), row, host, now, config.test_phase_margin)
+        return test_phase_need_from_rows(step_estimator.anonymous_history_rows(path), row, host, now, config.test_phase_margin,
+                                         share_percent=share_percent)
     except OSError:
         return NoTestPhaseNeed("no_history")
 
@@ -1374,7 +1293,7 @@ def read_token_wait(path: Path) -> TokenWaitIntent:
 def read_waiter(path: Path) -> Waiter:
     """Validate persisted waiter fields with the same schema used by snapshots."""
     value = cast(object, json.loads(path.read_text()))
-    return stored_waiter(cast(Waiter, codec.parse_snapshot_value(value, Waiter)))
+    return records.stored_waiter(cast(Waiter, codec.parse_snapshot_value(value, Waiter)))
 
 
 def waiter_label(row: Waiter) -> str:
@@ -1393,7 +1312,7 @@ def waiter_label(row: Waiter) -> str:
 
 
 def waiter_order(row: Waiter) -> tuple[int, float, int]:
-    return (0 if isinstance(waiter_priority(row), PriorityUnit) else 1), row.get("order_since", row["since"]), row["pid"]
+    return (0 if isinstance(records.waiter_priority(row), PriorityUnit) else 1), row.get("order_since", row["since"]), row["pid"]
 
 
 @dataclass(frozen=True)
@@ -1408,7 +1327,7 @@ def snapshot_head_override(override: HeadAdmissionOverride | NoHeadAdmissionOver
     candidate = first_queued_waiter(row for _, row in ordered)
     if isinstance(override, NoHeadAdmissionOverride) or isinstance(candidate, NoWaiter):
         return NoHeadAdmissionOverride()
-    path = next(path for path, row in ordered if waiter_owner(row) == waiter_owner(candidate.waiter))
+    path = next(path for path, row in ordered if records.waiter_owner(row) == records.waiter_owner(candidate.waiter))
     return override if head_override_matches(override, path, candidate.waiter) else NoHeadAdmissionOverride()
 
 
@@ -1549,7 +1468,7 @@ class QueueStepLifetime:
 def read_queue_lifetimes(directory: Path) -> tuple[QueueStepLifetime, ...]:
     """Join retained lifecycle records into logical steps under a shared read lock."""
     try:
-        events = list(anonymous_history_rows(directory / "queue_times.jsonl"))
+        events = list(step_estimator.anonymous_history_rows(directory / "queue_times.jsonl"))
     except FileNotFoundError:
         return ()
     grouped: dict[tuple[int, str, float], list[dict[str, object]]] = {}
@@ -1766,8 +1685,8 @@ def reservation_owner(row: Reservation | NoReservation, step: RunningStep) -> st
     """Use the recorded run identity or the standalone reservation identity."""
     run = reservation_run(row, step) if not isinstance(row, NoReservation) else step.run
     if isinstance(run, LiveBuildRun):
-        return run_owner(run.pid, run.start_time)
-    return row.get("reservation_id", run_owner(row["pid"], row["start_time"])) if not isinstance(row, NoReservation) else ""
+        return records.run_owner(run.pid, run.start_time)
+    return row.get("reservation_id", records.run_owner(row["pid"], row["start_time"])) if not isinstance(row, NoReservation) else ""
 
 
 @dataclass(frozen=True)
@@ -1829,7 +1748,7 @@ def attributed_step_uses(inputs: QueueInputs) -> tuple[tuple[Reservation, Runnin
         if not isinstance(step.measured, MeasuredMemory):
             continue
         source = step.measured.anonymous_source
-        key = row.get("reservation_id", run_owner(row["pid"], row["start_time"]))
+        key = row.get("reservation_id", records.run_owner(row["pid"], row["start_time"]))
         if isinstance(source, ScopeSource):
             previous_scope = scope_holders.get(source.directory)
             if previous_scope is None or key < previous_scope[0]:
@@ -1894,7 +1813,7 @@ def run_memories(inputs: QueueInputs) -> tuple[RunMemory, ...]:
         if not slot_in_force(slot, inputs.now):
             continue
         held = between_steps(slot)
-        owner = run_owner(held.run.pid, held.run.start_time)
+        owner = records.run_owner(held.run.pid, held.run.start_time)
         previous = groups.get(owner, RunMemory(owner, 0, AnonymousRunUse(0), run=held.run))
         groups[owner] = replace(previous, held=previous.held + held.bytes)
     return tuple(groups.values())
@@ -1910,7 +1829,7 @@ def reservation_profile_key(row: Reservation, host: str) -> str:
     width = row["test_threads"].threads if isinstance(row["test_threads"], RequestedTestWidth) else "unknown"
     return progress.profile_key((host, row.get("repo_identity", row["repo"]), row["step"],
         row.get("shape", ""), row.get("test_scope", "full"), row.get("package", ""),
-        sorted(history_arguments(row.get("filters"))), width))
+        sorted(step_estimator.history_arguments(row.get("filters"))), width))
 
 
 def progress_memory(row: Reservation, reading: MeasuredMemory, attributed: AttributedStepUse,
@@ -1925,7 +1844,7 @@ def progress_memory(row: Reservation, reading: MeasuredMemory, attributed: Attri
     need = full_need
     if isinstance(window, progress.WindowPeak):
         basis = read_need_basis(row.get("queue_waiter", {}).get("need_basis"))
-        need = shape_headroom_bytes(window.bytes, basis.factor) if isinstance(basis, (ShapeP90, ShapeLargest)) else window.bytes
+        need = step_estimator.shape_headroom_bytes(window.bytes, basis.factor) if isinstance(basis, (ShapeRankedPeak, ShapeLargest)) else window.bytes
         if row["step"] == "nextest" and isinstance(reading.peak_history, TestPhaseStarted):
             phase = reading.peak_history
             if isinstance(counter, progress.ProgressCounter) and counter.phase == "test:1":
@@ -1998,13 +1917,13 @@ def admission_walk(inputs: QueueInputs, ordered: list[tuple[Path, RankedWaiter]]
         remaining, readable = 0, False
     available = inputs.host.available if isinstance(inputs.host, HostMemory) else 0
     claims = {slot.owner: slot for slot in inputs.slots if isinstance(slot, ContinuationSlot)}
-    ordinary_head = first_queued_waiter(row for _, row in ordered if waiter_owner(row) not in claims)
+    ordinary_head = first_queued_waiter(row for _, row in ordered if records.waiter_owner(row) not in claims)
     decisions: list[WaiterAdmission] = []
     clear = isinstance(inputs.pressure, NoPressureHold)
     due = not isinstance(inputs.spacing, NextStartAt) or now >= inputs.spacing.at
-    head_owner = waiter_owner(head.waiter) if isinstance(head, QueuedHead) else ""
-    ordinary_row = stored_waiter(ordinary_head.waiter) if isinstance(ordinary_head, QueuedWaiter) else NoWaiter()
-    ordinary_owner = waiter_owner(ordinary_row) if not isinstance(ordinary_row, NoWaiter) else ""
+    head_owner = records.waiter_owner(head.waiter) if isinstance(head, QueuedHead) else ""
+    ordinary_row = records.stored_waiter(ordinary_head.waiter) if isinstance(ordinary_head, QueuedWaiter) else NoWaiter()
+    ordinary_owner = records.waiter_owner(ordinary_row) if not isinstance(ordinary_row, NoWaiter) else ""
     ordinary_need = ordinary_row["need"] if not isinstance(ordinary_row, NoWaiter) else 0
     has_override = not isinstance(inputs.override, NoHeadAdmissionOverride)
     no_runs = not inputs.reservations and not inputs.slots
@@ -2012,7 +1931,7 @@ def admission_walk(inputs: QueueInputs, ordered: list[tuple[Path, RankedWaiter]]
     protected_extra = 0
     protected_claim: Waiter | NoWaiter = NoWaiter()
     for _, row in ordered:
-        owner = waiter_owner(row)
+        owner = records.waiter_owner(row)
         claim = claims.get(owner)
         held = claim.slot.bytes if claim is not None else 0
         need = row["need"]
@@ -2056,7 +1975,7 @@ def admission_walk(inputs: QueueInputs, ordered: list[tuple[Path, RankedWaiter]]
                 new_started = True
         elif reused:
             protected_extra += extra
-            protected_claim = stored_waiter(row)
+            protected_claim = records.stored_waiter(row)
     return decisions
 
 
@@ -2100,14 +2019,14 @@ def admission_pass(inputs: QueueInputs, now: float, policy: AdmissionPolicy) -> 
     next_start = start_spacing_after(now, policy)
     resolved = head_policy(inputs, now, policy, next_start)
     candidate = resolved.queued_head
-    head_owner = waiter_owner(candidate.waiter) if isinstance(candidate, QueuedHead) else ""
+    head_owner = records.waiter_owner(candidate.waiter) if isinstance(candidate, QueuedHead) else ""
     available = inputs.host.available if isinstance(inputs.host, HostMemory) else 0
     rows: list[PassRow] = []
     endings: tuple[PassResult, ...] = ()
     rank = 0
     for entry in resolved.walk:
         row, decision = entry.waiter, entry.decision
-        owner = waiter_owner(row)
+        owner = records.waiter_owner(row)
         first = head_owner == owner
         within = isinstance(decision.room.basis, WithinSlot)
         if isinstance(entry.state, TokenWaitingWaiter):
@@ -2251,7 +2170,7 @@ def queue_read_from_pass(inputs: QueueInputs, policy: AdmissionPolicy,
         owner = reservation_owner(NoReservation(), step)
         if running_has_reservation(step):
             row = next(reservations)
-            admitted_at = epoch(row["admitted_at"])
+            admitted_at = step_estimator.epoch(row["admitted_at"])
             need = reservation_need(row, reading)
             owner = reservation_owner(row, step)
         measured = reading.bytes if isinstance(reading, (MeasuredMemory, CompilerServiceMemory, UnownedSliceMemory)) else 0
@@ -2268,7 +2187,7 @@ def queue_read_from_pass(inputs: QueueInputs, policy: AdmissionPolicy,
                            project=step_project(row.get("repository_name", "")),
                            run=row.get("build_run", NoLiveBuildRun()))
         waiting.append(step)
-        if isinstance(candidate, QueuedHead) and waiter_owner(row) == waiter_owner(candidate.waiter):
+        if isinstance(candidate, QueuedHead) and records.waiter_owner(row) == records.waiter_owner(candidate.waiter):
             width = row.get("test_threads")
             source: RecordedNeed | NeedSourceNotRecorded = NeedSourceNotRecorded()
             if "need_source" in row:
@@ -2276,7 +2195,7 @@ def queue_read_from_pass(inputs: QueueInputs, policy: AdmissionPolicy,
                     row.get("test_scope", "full"), row.get("package", ""), tuple(row.get("filters", [])),
                     width if width is not None else WidthNotRecorded(), read_need_basis(row.get("need_basis")))
             first = HeadExplanation(step, source, own, *decision_checks(own, step.need, available),
-                                    isinstance(waiter_priority(row), PriorityUnit),
+                                    isinstance(records.waiter_priority(row), PriorityUnit),
                                     cause=cast(HeadAdmissionStatus, admission.reason).cause)
         else:
             line.append(LineWaiter(step, own.state == "admit", own, *decision_checks(own, step.need, available)))
@@ -2346,7 +2265,7 @@ def head_after_steps_end(explanation: QueueExplanation, ended: tuple[int, ...]) 
     candidate = result.policy.queued_head
     if isinstance(candidate, NoQueuedHead):
         return NoWaiter()
-    owner = waiter_owner(candidate.waiter)
+    owner = records.waiter_owner(candidate.waiter)
     row = next(row for row in result.rows if row.owner == owner)
     cause = cast(HeadAdmissionStatus, row.reason).cause
     if isinstance(cause, (EstimateExpired, ReadingUnavailable)):
@@ -2516,7 +2435,7 @@ def finalize_reservation(path: Path, row: Reservation, outcome: FinalOutcome, no
         result = HistoryRecorded()
         intents.published(row)
     if "queue_identity" in intent:
-        ended_at = epoch(intent["ended_at"])
+        ended_at = step_estimator.epoch(intent["ended_at"])
         event: EndedEvent = {
             **lifecycle_event(intent["queue_identity"], "ended", intent["reservation_id"]),
             "reservation_id": intent["reservation_id"], "ended_at": ended_at, "outcome": intent["outcome"],
@@ -2585,7 +2504,7 @@ def build_queue_inputs(ordered: list[tuple[Path, RankedWaiter]],
         identity = reservation_identity(row)
         running.append(RunningStep(identity["session_id"], identity["session_name"],
                                    identity["step"], identity["folder"], row["need"], memory,
-                                   run=row.get("build_run", NoLiveBuildRun()), started_at=epoch(row["admitted_at"]),
+                                   run=row.get("build_run", NoLiveBuildRun()), started_at=step_estimator.epoch(row["admitted_at"]),
                                    unit=identity.get("unit", ""), pid=row["pid"],
                                    project=step_project(row.get("queue_waiter", {}).get("repository_name", ""), row["repo"])))
         rows.append(row)

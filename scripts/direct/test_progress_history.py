@@ -3922,6 +3922,30 @@ with patch.object(fcntl, "flock", admission):
         self.assertEqual(len(self.pass_events("dispatch-api", "pass_started")), 1)
         self.assertEqual(len(self.pass_events("dispatch-api", "pass_finished")), 1)
 
+    def test_hook_completion_keeps_the_delivery_and_closes_only_its_pass(self) -> None:
+        run = self.start_run("hook-completion", 41_000)
+        self.start_phase(run, 41_010)
+        prompt = self.root / "hook-prompt.txt"
+        _ = prompt.write_text("Complete the assigned work.\n")
+        instances: dict[str, str] = {}
+        for slot in ("impl", "test"):
+            instances[slot] = progress_history.begin_dispatch(run, slot=slot, phase="3", role=cast(staff.WorkerRole, slot),
+                worker_name=slot, worker_id=staff.StaffId(fixture_runtime_id("hook-" + slot)),
+                launcher_command=["assign.sh", "--role", slot], prompt=prompt, kind=slot, lens="")
+        delivery = progress_history.DispatchDelivery("The exact prompt.", instances["impl"], str(self.root / "reply.txt"),
+            actions=progress_history.CompletionActions(summary_file=str(self.root / "summary.txt"), held_role="held-reviewer",
+                finish_phase="3", finish_run=True))
+        progress_history.save_dispatch_delivery(run, instances["impl"], delivery)
+        before = self.pass_slots(run)["test"]
+        progress_history.complete_dispatch(run, "impl", instances["impl"])
+        progress_history.complete_dispatch(run, "impl", instances["impl"])
+        slots = self.pass_slots(run)
+        self.assertEqual(slots["impl"]["status"], "completed")
+        self.assertEqual(slots["test"], before)
+        self.assertEqual(progress_history.dispatch_delivery(slots["impl"]), delivery)
+        self.assertEqual(slots["impl"]["launcher_command"], ["assign.sh", "--role", "impl"])
+        self.assertEqual(len(self.pass_events("hook-completion", "pass_finished")), 1)
+
     def test_dispatch_worker_recovers_the_active_and_completed_worker_without_writes(self) -> None:
         session = self.start_run("dispatch-worker", 41_000)
         self.start_phase(session, 41_010)
@@ -3935,10 +3959,13 @@ with patch.object(fcntl, "flock", admission):
                 worker_id=staff.StaffId(fixture_runtime_id("dispatch-worker")),
                 launcher_command=command, prompt=prompt, kind="broad", lens="contract",
             )
-            for status in ("active", "completed"):
+            for status in ("active", "completed", "phase-completed"):
                 with self.subTest(status=status):
                     if status == "completed":
                         self.finish_slot_pass(session, "test", "completed", 41_030)
+                    elif status == "phase-completed":
+                        _ = self.run_command("finish-phase", "--session-dir", str(session),
+                            "--phase-id", "3", "--status", "completed", at=41_040)
                     before = {path: (path.read_bytes(), path.stat().st_mtime_ns)
                               for path in session.rglob("*") if path.is_file()}
                     result = progress_history.dispatch_worker(
@@ -5182,6 +5209,25 @@ with patch.object(fcntl, "flock", admission):
             expected,
         )
 
+    def test_review_trial_reports_the_parked_phase_findings_and_review_minutes(self) -> None:
+        self.write_full_config()
+        session = self.start_run("parked-review-trial", 71_000)
+        self.start_numbered_phase(session, "A", 71_010)
+        _ = self.run_findings(
+            session, "open", "--severity", "minor", "--title", "phase A finding",
+            "--caught-by", "worker", "--lens", "contract", at=71_020,
+        )
+        self.start_slot_pass(session, "review", "review", 71_030)
+        self.finish_slot_pass(session, "review", "completed", 71_510)
+        self.team_slot = ""
+        self.start_numbered_phase(session, "B", 71_520)
+        self.assertEqual(self.open_phase_ids(session), ("B", ["A"]))
+        self.assertEqual(
+            self.run_command("review-trial", "--session-dir", str(session), "--phase-id", "A", at=71_530),
+            "review trial: ux 0 findings, code 1 findings, review-worker minutes 8, "
+            + "ux check minutes 0, ux repair minutes 0",
+        )
+
     def test_the_review_writer_preserves_caller_counts_and_phase_identity(self) -> None:
         self.write_full_config()
         session = self.start_run("shared-review-writer", 71_200)
@@ -6259,8 +6305,8 @@ with patch.object(fcntl, "flock", admission):
         native = fixture_runtime_id("main-repaired")
         owner = fixture_member("showrunner", name="repair-owner")
         unit = fixture_member("unit", name="repair", parent=owner.id, runtime_id=native)
-        worker = fixture_worker("repair-worker", unit.id)
-        _ = (session_dir / "mesh_roster.json").write_text(json.dumps({worker.name: {"staff_id": worker.id}}))
+        state["owner_staff_id"] = unit.id
+        _ = (session_dir / "progress_history_state.json").write_text(json.dumps(state), encoding="utf-8")
         self.write_claude_transcript(native, "sonnet-5", "low")
         for identity in self.open_pass_and_activity(session_dir, started_at, native):
             self.assertEqual(
@@ -6474,7 +6520,14 @@ with patch.object(fcntl, "flock", admission):
         ))
         self.assertIsNone(state["phase"])
 
-    def test_start_phase_finds_a_standing_plan_phase_by_its_title_id(self) -> None:
+        _ = self.run_command(
+            "start-phase", "--session-dir", str(session_dir), "--phase-id", "final",
+            "--phase-title", "Final gate", at=70_000,
+        )
+        phase = cast(dict[str, object], self.read_state(session_dir)["phase"])
+        self.assertEqual(phase["id"], "final")
+
+    def test_start_phase_accepts_a_standing_ticket_id_outside_the_numbered_plan(self) -> None:
         session_dir = self.start_run("standing", 0)
         plan_path = self.working_dir / "docs" / "standing.md"
         # style_plan.py next-phase writes the ticket id as the title, not the number.
@@ -6491,6 +6544,7 @@ with patch.object(fcntl, "flock", admission):
         ))
         phase = cast(dict[str, object], state["phase"])
         self.assertEqual(phase["id"], "types-unit-201")
+        self.assertIn("| 0 of 1 done |", self.run_progress(session_dir, 80_000))
 
     def test_the_header_names_a_worktree_once_when_its_branch_shares_the_name(
         self,

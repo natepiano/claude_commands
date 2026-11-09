@@ -31,7 +31,7 @@ from scripts.message import sessions as runtime_sessions
 from scripts.production import unit_move
 
 from scripts.shutdown import pane_restore
-from scripts.herdr import herdr  # noqa: E402
+from scripts.herdr import herdr, worker_panes  # noqa: E402
 from scripts.shutdown import pane_record  # noqa: E402
 from scripts.herdr import pane_launch
 from scripts.message import sessions  # noqa: E402
@@ -506,7 +506,7 @@ class RestoreStaffNamesTests(StaffTestCase):
         configuration = self.root / "configuration"
         for config_source in (Path(__file__).resolve().parents[2] / "config").glob("*.conf"):
             write_text_atomic(configuration / config_source.name, config_source.read_text())
-        write_text_atomic(self.root / "run/worker_transport", "mesh\n")
+        (self.root / "run").mkdir()
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
             "CONF_DIR": str(configuration), "UNIT_RUN_DIR": str(self.root / "run"),
             "HERDR_PROC": str(self.root / "proc"), "XDG_STATE_HOME": str(self.root / "state"),
@@ -560,6 +560,7 @@ class RestoreStaffNamesTests(StaffTestCase):
         active: list[str] = []
         launches: list[str] = []
         record = staff.snapshot()
+        idle = next(row for row in record.rows if row.kind == "worker")
         row_operation = staff.row_operation
         expected: dict[str, str] = {}
 
@@ -594,6 +595,7 @@ class RestoreStaffNamesTests(StaffTestCase):
 
         with (mock.patch.object(pane_record, "RECORD_DIR", directory),
               mock.patch.object(herdr, "Herdr", return_value=client),
+              mock.patch.object(worker_panes, "observe", return_value=[worker_panes.ClosedWorker(idle)]),
               client.empty_shell(998042, self.root),
               mock.patch.object(staff, "row_operation", side_effect=lock),
               mock.patch.object(herdr, "open_tab", side_effect=(f"w1:p{n}" for n in range(4, 10))),
@@ -603,7 +605,8 @@ class RestoreStaffNamesTests(StaffTestCase):
               redirect_stdout(io.StringIO()) as output, redirect_stderr(output)):
             self.assertEqual(pane_restore.restore("agents", dry_run=False), 0, output.getvalue())
         self.assertEqual(len(launches), 2)
-        self.assertIn("impl1: closed; its next assign resumes it", output.getvalue())
+        self.assertNotIn(str(idle.current_session), launches)
+        self.assertEqual(staff.by_id(idle.id), idle)
         self.assertEqual(active, [])
 
 
@@ -661,6 +664,7 @@ class RestoreStaffNamesTests(StaffTestCase):
                        for index, row in enumerate(saved_client.rows)]
         client.count = 20
         record = staff.snapshot()
+        idle = next(row for row in record.rows if row.kind == "worker")
         path = directory / "agents.json"
         entries = pane_launch.read_strict(path)
         for entry in entries.values():
@@ -728,6 +732,7 @@ class RestoreStaffNamesTests(StaffTestCase):
               mock.patch.dict(os.environ, {"HERDR_PANE_RECORD_DIR": str(directory)}),
               mac_process_commands(self.root, process_responses),
               mock.patch.object(herdr, "Herdr", return_value=client),
+              mock.patch.object(worker_panes, "observe", return_value=[worker_panes.ClosedWorker(idle)]),
               mock.patch.object(herdr, "herdr_processes", return_value=[]),
               mock.patch.object(client, "order_tabs", wraps=client.order_tabs) as order,
               mock.patch.object(client, "assign_session", side_effect=assign_local_session),
@@ -741,11 +746,12 @@ class RestoreStaffNamesTests(StaffTestCase):
               redirect_stdout(output), redirect_stderr(output)):
             self.assertEqual(pane_restore.restore("agents", dry_run=False), 0, output.getvalue())
             self.assertEqual(len(pane_record.read("agents")), 3)
-        self.assertEqual(len(self.ssh_commands()), 10)
+        self.assertEqual(len(self.ssh_commands()), 8)
         self.assertTrue(all("--snapshot" in command for command in self.ssh_commands()))
         self.assertEqual(order.call_count, 2)
         self.assertEqual(started, ["renamed", "models"])
-        self.assertIn("impl1: closed; its next assign resumes it", output.getvalue())
+        self.assertNotIn(idle.name, started)
+        self.assertEqual(staff.by_id(idle.id), idle)
         self.assertEqual(sorted(title for _, titles in client.layout() for title in titles),
                          ["models", "old-worker-label", "renamed"])
 

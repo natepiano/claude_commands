@@ -8,14 +8,17 @@ Read at the point of use from `/unit:direct`. Defines `<FinalGateCommit/>`,
 <FinalGate>
 Loop/verbose only after plan exhaustion:
 
-1. Launch `verify.sh final` once under <BackgroundVerificationContract/>. It
-   owns the workspace all-targets check and full tests.
-2. On failure, create a synthetic phase `final` / `Final verification` once:
+1. Launch one final gate under <BackgroundVerificationContract/>. With a root
+   `Cargo.toml`, run `verify.sh final` for the workspace all-targets check and
+   full tests. Without a root `Cargo.toml`, run the repository's unit gate.
+   For `~/.claude`, use
+   `~/.claude/scripts/lib/py ~/.claude/scripts/production/targeted_test.py --checkout <tree>`.
+2. If either gate fails, create a synthetic phase `final` / `Final verification` once:
    capture a new baseline, run `start-phase`, reset review and smoke state, open
    the concrete failures in the ledger, then use its gate plus <FixDispatch/>.
    Later repairs do not repeat those resets. After closure convergence, run
    applicable smoke and return here; do not run phase review or a phase
-   checkpoint for the synthetic phase. Rerun this gate after each repair.
+   checkpoint for the synthetic phase. Rerun the selected gate after each repair.
 3. Batch all deferred smoke actions after the gate is green. Ask the user once;
    route discovered defects through the synthetic fix path. If declined, carry
    them as outstanding rather than blocking run completion.

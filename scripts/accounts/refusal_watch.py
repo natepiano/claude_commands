@@ -29,7 +29,6 @@ from uuid import uuid4
 
 ROOT = Path(__file__).resolve().parents[2]
 from scripts.lib import conf
-from scripts.agents import codex_mesh
 from scripts.accounts import accounts, moves, next_moves, refusals, role_map
 from scripts.whoami import account
 from scripts.whoami import agent_accounts
@@ -51,6 +50,9 @@ else:
     inventory_module = import_module("scripts.shutdown.inventory")
     sessions = import_module('scripts.message.sessions')
     herdr = import_module("scripts.herdr.herdr")
+
+
+QUOTA_REFUSAL = "hit your usage limit"
 
 
 CLAUDE_LIMIT_PHRASES = ("hit your session limit", "hit your weekly limit")
@@ -500,7 +502,7 @@ def _transcript_refusal(paths: list[Path], chunk_bytes: int, *, screen_text: str
             else:
                 text = ""
             quota = entry.get("quotaLimits")
-    if codex_error and codex_mesh.QUOTA_REFUSAL not in text.casefold():
+    if codex_error and QUOTA_REFUSAL not in text.casefold():
         if not isinstance(latest, NoExchange) or not any(phrase in text.casefold() for phrase in CLAUDE_LIMIT_PHRASES):
             return NoSessionRefusal()
     if not isinstance(entry_id, str) or not entry_id or not isinstance(timestamp, str):

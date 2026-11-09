@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Wind Codex agents down on every showrunner, and count the ones still running.
 
-A running Codex agent is one live `codex_mesh.py start|follow` turn or one plain
+A running Codex agent is one native pane process or one plain
 `codex exec`. It belongs to the nearest ancestor that is a named Claude session.
 """
 from __future__ import annotations

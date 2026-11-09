@@ -3,8 +3,10 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 from collections.abc import Generator
-from contextlib import ExitStack, contextmanager
+from contextlib import ExitStack, contextmanager, redirect_stdout
 import fcntl
+import io
+import json
 import os
 import select
 from pathlib import Path
@@ -13,7 +15,7 @@ import subprocess
 import sys
 import tempfile
 from threading import Event
-from typing import final, override
+from typing import cast, final, override
 import unittest
 from unittest import mock
 
@@ -26,7 +28,15 @@ from scripts.mac_test import floor_claims
 from scripts.lint import tmp_sweep
 from scripts.production.cli_fixture import ImmutableGitSeed
 from scripts.production import staff
-from scripts.production.staff_test_support import isolated_staff_file, fixture_member
+from scripts.production.staff_test_support import isolated_staff_file, fixture_member, fixture_worker
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+
+
+def expected_remote_lease_columns(state: str, session: str, holder_pid: str) -> tuple[str, str, str]:
+    """Keep Linux lease assertions and report unavailable when the real lock table is absent."""
+    if not Path(file_lock.PROC_LOCKS).exists():
+        return "unavailable", "-", "-"
+    return state, session, holder_pid
 
 
 @final
@@ -47,6 +57,154 @@ class RemoteCopiesTests(unittest.TestCase):
 
     def remote(self, owner: str = "alpha", path: str = "mirror/repository") -> copies.RemoteMirror:
         return copies.RemoteMirror(owner, copies.SelectedRepository(self.source.name), "host", path, "holder-session")
+
+    def list_rows(self) -> list[dict[str, str]]:
+        output = io.StringIO()
+        with redirect_stdout(output):
+            copies.list_trees()
+        lines = output.getvalue().splitlines()
+        self.assertGreater(len(lines), 1, output.getvalue())
+        columns = lines[0].split("\t")
+        self.assertEqual(columns, ["number", "owner", "repository", "host", "path", "session",
+                                   "commit", "state", "holder_pid", "target"])
+        return [dict(zip(columns, line.split("\t"), strict=True)) for line in lines[1:]]
+
+    def list_members(self) -> tuple[staff.StaffRow, staff.StaffRow]:
+        self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
+        parent = fixture_member("showrunner", name="list-production")
+        owner = fixture_member("unit", name="mirror-owner", parent=parent.id)
+        holder = fixture_worker("live-holder", owner.id)
+        return owner, holder
+
+    def test_list_reports_remote_only_held_idle_and_missing_lease_records(self) -> None:
+        owner, holder = self.list_members()
+        for lease in ("held", "idle", "missing"):
+            with self.subTest(lease=lease), ExitStack() as contexts:
+                mirror = copies.RemoteMirror(str(owner.id), copies.SelectedRepository(self.source.name),
+                                             "remote-host", "mirror/" + lease, holder.current_session)
+                if lease == "held":
+                    _ = contexts.enter_context(copies.remote_lease(mirror))
+                else:
+                    with copies.remote_lease(mirror):
+                        pass
+                    if lease == "missing":
+                        copies.remote_lease_path(mirror).unlink()
+                copies.register_remote(mirror)
+                row = next(row for row in self.list_rows() if row["path"] == mirror.path)
+                self.assertEqual((row["owner"], row["repository"], row["host"]),
+                                 ("mirror-owner", self.source.name, "remote-host"))
+                self.assertEqual((row["state"], row["session"], row["holder_pid"]),
+                                 expected_remote_lease_columns(
+                                     "held", "live-holder", str(os.getpid())) if lease == "held"
+                                 else expected_remote_lease_columns("idle", "-", "-"))
+                self.assertEqual((row["commit"], row["target"]), ("-", "-"))
+                self.assertNotIn(holder.current_session, "\t".join(row.values()))
+
+    def test_list_requires_matching_pid_before_naming_the_recorded_holder(self) -> None:
+        owner, holder = self.list_members()
+        for evidence, session in (("different-pid", "not recorded"), ("missing-pid", "not recorded"),
+                                  ("missing-holder", "unavailable")):
+            with self.subTest(evidence=evidence):
+                stored_session = "pid-2147483000" if evidence == "missing-holder" else holder.current_session
+                mirror = copies.RemoteMirror(str(owner.id), copies.SelectedRepository(self.source.name),
+                                             "remote-host", "mirror/" + evidence, stored_session)
+                with copies.remote_lease(mirror):
+                    copies.register_remote(mirror)
+                    record_path = copies.remote_record_path(mirror)
+                    record = cast(dict[str, object], json.loads(record_path.read_text()))
+                    if evidence == "different-pid":
+                        record["holder_pid"] = os.getpid() + 1
+                    elif evidence == "missing-pid":
+                        del record["holder_pid"]
+                    _ = record_path.write_text(json.dumps(record))
+                    row = next(row for row in self.list_rows() if row["path"] == mirror.path)
+                    self.assertEqual((row["state"], row["session"], row["holder_pid"]),
+                                     expected_remote_lease_columns("held", session, str(os.getpid())))
+                    self.assertNotIn(stored_session, "\t".join(row.values()))
+
+    def test_list_keeps_owner_and_holder_names_separate(self) -> None:
+        owner, holder = self.list_members()
+        missing_owner = "00000000-0000-4000-8000-000000000001"
+        for identity, expected_owner, expected_holder in (
+            (str(owner.id), "renamed-owner", "live-holder"),
+            ("toolchain-trial", "toolchain-trial", "live-holder"),
+            (missing_owner, "unavailable", "live-holder"),
+            ("staff-read-error", "unavailable", "unavailable"),
+        ):
+            with self.subTest(owner=identity), ExitStack() as contexts:
+                mirror = copies.RemoteMirror(str(owner.id) if identity == "staff-read-error" else identity,
+                    copies.SelectedRepository(self.source.name), "remote-host", "mirror/" + identity,
+                    holder.current_session)
+                _ = contexts.enter_context(copies.remote_lease(mirror))
+                copies.register_remote(mirror)
+                if identity == str(owner.id):
+                    _ = staff.rename(owner.id, "renamed-owner")
+                if identity == "staff-read-error":
+                    _ = cast(object, contexts.enter_context(mock.patch.dict(os.environ, {"STAFF_FILE": str(self.root)})))
+                before = copies.remote_record_path(mirror).read_bytes()
+                row = next(row for row in self.list_rows() if row["path"] == mirror.path)
+                self.assertEqual(row["owner"], expected_owner)
+                self.assertEqual((row["state"], row["session"], row["holder_pid"]),
+                                 expected_remote_lease_columns("held", expected_holder, str(os.getpid())))
+                if identity != "toolchain-trial":
+                    self.assertNotIn(mirror.owner, row["owner"])
+                self.assertEqual(copies.remote_record_path(mirror).read_bytes(), before)
+
+    def test_list_reports_unavailable_lease_evidence_without_naming_a_former_holder(self) -> None:
+        owner, holder = self.list_members()
+        read_locks = file_lock.held_flock_keys
+        for evidence in ("unreadable-table", "macos-no-proc", "unreadable-lease"):
+            with self.subTest(evidence=evidence), ExitStack() as contexts:
+                mirrors = [copies.RemoteMirror(str(owner.id), copies.SelectedRepository(self.source.name),
+                           "remote-host", f"mirror/{evidence}-{index}", holder.current_session) for index in range(2)]
+                for mirror in mirrors:
+                    copies.register_remote(mirror)
+                    if evidence == "unreadable-lease":
+                        lease = copies.remote_lease_path(mirror)
+                        lease.symlink_to(lease.name)
+                if evidence != "unreadable-lease":
+                    lock_table = self.root if evidence == "unreadable-table" else self.root / "absent-proc-locks"
+                    def fixture_locks() -> dict[str, int]:
+                        return read_locks(str(lock_table))
+                    _ = contexts.enter_context(mock.patch.object(file_lock, "held_flock_keys", side_effect=fixture_locks))
+                    if evidence == "macos-no-proc":
+                        _ = contexts.enter_context(mock.patch.object(sys, "platform", "darwin"))
+                rows = self.list_rows()
+                for mirror in mirrors:
+                    row = next(row for row in rows if row["path"] == mirror.path)
+                    self.assertEqual((row["owner"], row["state"], row["session"], row["holder_pid"]),
+                                     ("mirror-owner", "unavailable", "-", "-"))
+
+    def test_list_names_the_holder_registered_by_the_real_offload_process(self) -> None:
+        from scripts.mac_test.offload_test_support import OffloadCommandFixture
+
+        holder = self.list_members()[1]
+        fixture = OffloadCommandFixture()
+        self.addCleanup(fixture.doCleanups)
+        fixture.setUp()
+        fixture.fixture["hold_run"] = True
+        fixture.sync_fixture()
+        process = fixture.start_command(extra={"CLAUDE_CODE_SESSION_ID": holder.current_session,
+                                               "CODEX_THREAD_ID": "", "UNIT_RUN_DIR": "",
+                                               "UNIT_SESSION_DIR": "", "PLAN_DELEGATE_BOARD_DIR": "",
+                                               "PLAN_DELEGATE_SESSION_DIR": ""})
+        try:
+            fixture.wait_for_path(fixture.stub_directory / "run-started")
+            with mock.patch.dict(os.environ, fixture.environment):
+                mirror, = copies.owned_remote_mirrors("verify")
+                record = cast(dict[str, object], json.loads(copies.remote_record_path(mirror).read_text()))
+                self.assertEqual(record["holder_pid"], process.pid)
+                row, = self.list_rows()
+                self.assertEqual(row["owner"], "verify")
+                self.assertEqual((row["state"], row["session"], row["holder_pid"]),
+                                 expected_remote_lease_columns("held", "live-holder", str(process.pid)))
+            _ = (fixture.stub_directory / "finish-run").write_text("continue\n")
+            output, _ = process.communicate(timeout=TEST_HANG_GUARD_SECS)
+            self.assertEqual(process.returncode, 0, output)
+        finally:
+            if process.poll() is None:
+                process.kill()
+                _ = process.communicate(timeout=TEST_HANG_GUARD_SECS)
 
     def test_a_remote_mirror_keeps_its_staff_owner_after_a_rename(self) -> None:
         self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
@@ -450,7 +608,7 @@ exec(compile(program, '<remote-probe>', 'exec'))
         settings = conf.read(Path(__file__).resolve().parents[2] / "config/copies.conf").values()
         entries = {key.removeprefix("allow.") for key in settings if key.startswith("allow.")}
         self.assertEqual(entries, {"copies/copies.py", "production/add_unit.py", "shutdown/shutdown.py",
-            "style/add_style.py", "worktree/make_worktree.sh",
+            "style/add_style.py", "worktree/make_worktree.sh", "worktree/worktrees.py",
             "bevy_migration_plan/bevy_migration_ensure_repo.sh"})
 
 if __name__ == "__main__":

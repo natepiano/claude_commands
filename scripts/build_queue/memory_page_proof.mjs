@@ -28,9 +28,17 @@ const base = readings.good;
 base.walk.find(row => row.queued).progress = {kind:'RowProgress', phase:'testing', done:8, total:10, percent:80, unit:'modules'};
 base.walk.find(row => row.queued).unit = 'fixture-unit';
 base.walk.find(row => row.queued).showrunner = 'fixture-production';
-base.swap_by = Array.from({length:31}, (_, index) => ({name:'group '+index, detail:'fixture owner', swap:(31-index)/64}));
+const swapOwners = Array.from({length:31}, (_, index) => ({name:'group '+index, detail:'fixture owner',
+  kind:'owner', bytes:(31-index)*1024**3/64, swap:(31-index)/64}));
+const smaller = swapOwners.slice(base.swap_rows);
+const groupedBytes = smaller.reduce((sum,row)=>sum+row.bytes,0);
 base.swap_total = 8;
-base.swap_used = base.swap_by.reduce((sum,row) => sum+row.swap,0);
+base.swap_used = (swapOwners.reduce((sum,row)=>sum+row.bytes,0)+1031)/1024**3;
+base.swap_by = [...swapOwners.slice(0,base.swap_rows),
+  {name:smaller.length+' smaller groups',detail:'fixture owners',kind:'smaller',bytes:groupedBytes,swap:groupedBytes/1024**3},
+  {name:'not in a group',detail:'user.slice',kind:'ungrouped',bytes:1024,swap:1024/1024**3},
+  {name:'not attributed',detail:'Host swap minus the named groups.',kind:'unattributed',bytes:7,swap:7/1024**3},
+  {name:'Total',detail:'SwapTotal minus SwapFree',kind:'total',bytes:base.swap_used*1024**3,swap:base.swap_used}];
 readings.shrink = structuredClone(base);
 const extra = structuredClone(base.walk.find(row => row.queued));
 extra.name = 'second nextest'; extra.pid = 222;
@@ -130,7 +138,8 @@ try {
     return result.result.value;
   };
   await call('Page.enable');
-  await call('Page.addScriptToEvaluateOnNewDocument', {source:'window.setInterval = () => 0;'});
+  await call('Page.addScriptToEvaluateOnNewDocument', {
+    source:'window.proofSetInterval = window.setInterval; window.setInterval = () => 0;'});
   await call('Emulation.setEmulatedMedia', {features:[{name:'prefers-color-scheme',value:'dark'}]});
   await call('Emulation.setDeviceMetricsOverride', {width:1600,height:1200,deviceScaleFactor:1,mobile:false});
   const loaded = new Promise(resolve => events.set(`${sessionId}:Page.loadEventFired`, resolve));
@@ -226,6 +235,7 @@ try {
           cardColor:color('--card'), reservedColors:[color('--res-a'),color('--res-b')],
           reservedRatios:['--res-a','--res-b'].map(name=>contrast(color(name),color('--card'))),
           swapRows:swap.length, swapText:swap.map(e=>e.textContent),
+          swapBytes:swap.map(e=>Number(e.dataset.bytes)),
           swapContrast:small?contrast(getComputedStyle(small).color,color('--card')):null,
           swapBaseline:small?rect(small).bottom-rect(small.parentElement.querySelector('.name')).bottom:0,
           gauges, lower, values,
@@ -253,9 +263,13 @@ try {
       assert.ok(proof.progress && proof.progress.width > 0, 'The progress line is absent.');
       assert.ok(proof.progress.height <= 3, 'The progress line is too thick.');
       assert.ok(proof.progress.right <= proof.capLine.left + 1, 'The progress line crosses the cap.');
-      assert.equal(proof.swapRows, base.swap_rows + 1);
-      assert.match(proof.swapText.at(-1), /25 smaller groups/);
-      assert.match(proof.swapText.at(-1), /5\.1 GiB/);
+      assert.equal(proof.swapRows, base.swap_rows + 4);
+      assert.match(proof.swapText[base.swap_rows], /25 smaller groups/);
+      assert.match(proof.swapText[base.swap_rows], /5\.1 GiB/);
+      assert.match(proof.swapText.at(-2), /not attributed7 B/);
+      assert.match(proof.swapText.at(-1), /Total7\.8 GiB/);
+      assert.equal(proof.swapBytes.slice(0,-1).reduce((sum,bytes)=>sum+bytes,0),proof.swapBytes.at(-1));
+      assert.equal(proof.swapBytes.at(-1),base.swap_used*1024**3);
       assert.ok(!proof.legacySwapBar, 'The page repeats the swap bar.');
       assert.equal(proof.swapBars, 3);
       for (const ratio of proof.reservedRatios) assert.ok(ratio >= 3, 'The reservation contrast is below 3:1.');
@@ -301,6 +315,33 @@ try {
       const point=proof.reportPoints.at(-1);
       checkPixel((point.box.left+point.box.right)/2,(point.box.top+point.box.bottom)/2,point.color,'The report pixels differ.',true);
       proofs.push({theme,width,metrics:proof});
+
+      proof.swapRefresh=await evaluate(`(async () => {
+        const originalFetch=window.fetch, originalRender=window.render;
+        const data=structuredClone(latest);
+        const states=[];
+        document.querySelector('#swaprows .smaller details').open=true;
+        try {
+          window.render=window.renderReading;
+          window.fetch=async()=>({ok:true,json:async()=>structuredClone(data)});
+          await new Promise((resolve,reject)=>{
+            const timer=window.proofSetInterval(async()=>{
+              try {
+                const index=data.swap_by.findIndex(row=>row.kind==='smaller');
+                data.swap_by.splice(states.length+1,0,data.swap_by.splice(index,1)[0]);
+                await tick();
+                states.push(document.querySelector('#swaprows .smaller details').open);
+                if(states.length===2) { clearInterval(timer); resolve(); }
+              } catch(error) { clearInterval(timer); reject(error); }
+            },SECONDS*1000);
+          });
+          document.querySelector('#swaprows .smaller details').open=false;
+          window.renderReading(data);
+          return {states,closed:!document.querySelector('#swaprows .smaller details').open};
+        } finally { window.fetch=originalFetch; window.render=originalRender; }
+      })()`);
+      assert.deepEqual(proof.swapRefresh,{states:[true,true],closed:true},
+        'The smaller-owner list loses its state across two refreshes or a row move.');
 
       await evaluate(`(() => {
         document.querySelector('#history-machine').value='fixture';

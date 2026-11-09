@@ -1,10 +1,11 @@
 """Real verify.sh token reservation behavior."""
 from __future__ import annotations
 
+from scripts.build_queue import admission_records
+
 from scripts.build_queue.admission_test_support import AdmissionFixture, caller_admission
 from scripts.direct.wait_for_test_state import wait_until
 from scripts.build_queue import admission_protocol as wire
-from scripts.lint import memory_admit as gate
 
 import os
 import shutil
@@ -135,7 +136,7 @@ trap probe_local_attempt DEBUG
             if isinstance(reply, wire.Wait):
                 with log.open("a") as stream:
                     _ = stream.write("wait\n")
-                self.admission.free(60 * gate.GIB)
+                self.admission.free(60 * admission_records.GIB)
             return reply
 
         self.admission.server.reply_filter = free_after_wait
@@ -183,7 +184,7 @@ buildlog_release_memory 0
         self.wait_for_running(ready, old)
         with self.admission.loop_turn():
             self.assertEqual(len(self.admission.server.reservations), 1)
-            self.admission.free(20 * gate.GIB)
+            self.admission.free(20 * admission_records.GIB)
         new_errors = self.root / "new.err"
         new = self.start_memory_waiter({**self.environment, "UNIT_RUN_DIR": str(board),
             "UNIT_TEAM_ROLE": "new", "TEST_BLOCK": "1"}, new_errors)
