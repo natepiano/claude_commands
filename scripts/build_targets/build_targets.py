@@ -145,7 +145,7 @@ from scripts.build_targets.targets import (
     target_state,
     target_eligibility,
 )
-from scripts.direct.step_record import Pinned, ROUTED, TargetSelection
+from scripts.direct.step_selection import Pinned, ROUTED, TargetSelection
 
 
 class ActiveWaitProcess(TypedDict):
