@@ -269,6 +269,8 @@ class VaultPullTests(unittest.TestCase):
         self.assertEqual(self.git(self.mac, "rev-parse", "HEAD"), mac)
         self.assertEqual(self.git(self.mac, "status", "--porcelain"), "")
         self.assertFalse((self.mac / ".git/MERGE_HEAD").exists())
+        self.assertEqual(self.questions(), [])
+        self.assertEqual(self.hour()[0], 0)
         self.assertEqual(len(self.questions()), 1)
         self.assertIn("shared.md", self.question())
         self.assertIn("In a terminal on the Mac", self.question())
@@ -285,6 +287,8 @@ class VaultPullTests(unittest.TestCase):
         text = (self.mac / "shared.md").read_text()
         self.assertIn("<<<<<<< HEAD", text)
         self.assertEqual(self.git(self.mac, "rev-parse", "MERGE_HEAD"), local)
+        self.assertEqual(self.hour()[0], 0)
+        self.assertEqual(self.questions(), [])
 
         for staged in (False, True):
             with self.subTest(staged=staged):
@@ -323,15 +327,32 @@ class VaultPullTests(unittest.TestCase):
         self.assertFalse((self.local / ".git/MERGE_HEAD").exists())
 
     def test_a_second_stop_in_one_outage_files_no_second_question(self) -> None:
-        _ = self.conflict()
-        self.assertEqual(self.hour()[0], 0)
-        self.now += 3600
-        self.assertEqual(self.hour()[0], 0)
-        self.assertEqual(len(self.questions()), 1)
-        self.assertEqual(len(self.questions("attempts.jsonl")), 1)
+        for outcome in (vault_pull.VaultConflict(("shared.md",)), vault_pull.NotOnMain(),
+                        vault_pull.VaultLocked(self.lock_detail), vault_pull.MacUnreachable(),
+                        vault_pull.VaultCommandFailed("fixture command error")):
+            with self.subTest(outcome=outcome):
+                for name in ("questions.jsonl", "attempts.jsonl"):
+                    (self.folder / name).unlink(missing_ok=True)
+                vault_pull.write_state(vault_pull.VaultState(
+                    vault_pull.LastGoodPull(self.now - vault_pull.UNREACHABLE_GRACE_S), vault_pull.NoOutage()))
+                status = 1 if isinstance(outcome, vault_pull.VaultCommandFailed) else 0
+                with mock.patch.object(vault_pull, "pull", return_value=outcome):
+                    self.assertEqual(self.hour()[0], status)
+                    self.assertEqual(self.questions("attempts.jsonl"), [])
+                    outage = vault_pull.read_state().outage
+                    assert isinstance(outage, vault_pull.OpenOutage)
+                    self.assertFalse(outage.asked)
+                    self.now += 3600
+                    self.assertEqual(self.hour()[0], status)
+                    self.assertEqual(len(self.questions()), 1)
+                    self.now += 3600
+                    self.assertEqual(self.hour()[0], status)
+                self.assertEqual(len(self.questions()), 1)
+                self.assertEqual(len(self.questions("attempts.jsonl")), 1)
 
     def test_a_good_run_closes_the_outage_and_a_later_stop_files_a_new_question(self) -> None:
         _ = self.conflict()
+        self.assertEqual(self.hour()[0], 0)
         self.assertEqual(self.hour()[0], 0)
         first = self.questions()[0]
         _ = self.git(self.mac, "merge", "-s", "ours", "--no-edit", "origin/main")
@@ -346,6 +367,7 @@ class VaultPullTests(unittest.TestCase):
         _ = self.git(self.mac, "switch", "-c", "feature")
         self.now += 3600
         self.assertEqual(self.hour()[0], 0)
+        self.assertEqual(self.hour()[0], 0)
         self.assertEqual(len(self.questions()), 2)
         second = self.questions()[1]
         self.assertNotEqual(option(second, "--text"), option(first, "--text"))
@@ -359,6 +381,7 @@ class VaultPullTests(unittest.TestCase):
     def test_a_changed_cause_withdraws_the_original_question_text(self) -> None:
         _ = self.conflict()
         _ = self.git(self.mac, "switch", "-c", "feature")
+        self.assertEqual(self.hour()[0], 0)
         self.assertEqual(self.hour()[0], 0)
         first = self.questions()[0]
         _ = self.git(self.mac, "switch", "main")
@@ -387,6 +410,20 @@ class VaultPullTests(unittest.TestCase):
         self.assertEqual(self.questions("attempts.jsonl"), [])
         self.assertIsInstance(vault_pull.read_state().outage, vault_pull.NoOutage)
 
+        for outcome in (vault_pull.VaultConflict(("shared.md",)), vault_pull.NotOnMain(),
+                        vault_pull.VaultLocked(self.lock_detail), vault_pull.VaultCommandFailed("fixture error")):
+            with self.subTest(outcome=outcome):
+                with mock.patch.object(vault_pull, "pull", side_effect=[outcome, vault_pull.Current()]):
+                    status, line = self.hour()
+                    self.assertEqual(status, 1 if isinstance(outcome, vault_pull.VaultCommandFailed) else 0)
+                    self.assertIn("stopped:", line)
+                    outage = vault_pull.read_state().outage
+                    assert isinstance(outage, vault_pull.OpenOutage)
+                    self.assertFalse(outage.asked)
+                    self.assertEqual(self.hour(), (0, "buildlog vault: current"))
+                self.assertEqual(self.questions("attempts.jsonl"), [])
+                self.assertIsInstance(vault_pull.read_state().outage, vault_pull.NoOutage)
+
     def assert_withdraw_does_not_retry(self) -> None:
         self.assertIsInstance(vault_pull.read_state().outage, vault_pull.NoOutage)
         attempts = self.questions("attempts.jsonl")
@@ -397,6 +434,7 @@ class VaultPullTests(unittest.TestCase):
     def test_a_failed_withdraw_keeps_the_good_result_and_does_not_retry(self) -> None:
         _ = self.git(self.mac, "switch", "-c", "feature")
         self.assertEqual(self.hour()[0], 0)
+        self.assertEqual(self.hour()[0], 0)
         _ = self.git(self.mac, "switch", "main")
         _ = (self.folder / "withdraw_exit").write_text("2")
         self.assertEqual(self.hour(), (0, "buildlog vault: current; the question was not withdrawn"))
@@ -405,6 +443,7 @@ class VaultPullTests(unittest.TestCase):
 
     def test_a_timed_out_withdraw_keeps_the_good_result_and_does_not_retry(self) -> None:
         _ = self.conflict()
+        self.assertEqual(self.hour()[0], 0)
         self.assertEqual(self.hour()[0], 0)
         _ = self.git(self.mac, "merge", "-s", "ours", "--no-edit", "origin/main")
 
@@ -421,6 +460,7 @@ class VaultPullTests(unittest.TestCase):
 
     def test_a_deferral_keeps_the_question_until_the_first_good_sync(self) -> None:
         _ = self.conflict()
+        self.assertEqual(self.hour()[0], 0)
         self.assertEqual(self.hour()[0], 0)
         outage = vault_pull.read_state().outage
         attempts = self.questions("attempts.jsonl")
@@ -472,6 +512,8 @@ class VaultPullTests(unittest.TestCase):
     def test_failed_or_held_questions_retry_until_the_command_succeeds(self) -> None:
         _ = self.conflict()
         _ = (self.folder / "question_exit").write_text("2")
+        self.assertEqual(self.hour()[0], 0)
+        self.assertEqual(self.questions("attempts.jsonl"), [])
         self.assertEqual(self.hour()[0], 1)
         outage = vault_pull.read_state().outage
         assert isinstance(outage, vault_pull.OpenOutage)
@@ -487,11 +529,17 @@ class VaultPullTests(unittest.TestCase):
 
     def test_question_command_names_the_cause_date_production_and_urgency(self) -> None:
         _ = self.conflict()
+        _ = self.git(self.mac, "switch", "-c", "feature")
+        self.assertEqual(self.hour()[0], 0)
+        self.assertEqual(self.questions(), [])
+        _ = self.git(self.mac, "switch", "main")
         self.assertEqual(self.hour()[0], 0)
         args = self.questions()[0]
         self.assertEqual(args[0], "ask")
         self.assertEqual(option(args, "--production"), "natedev")
         self.assertIn("conflict", option(args, "--question"))
+        self.assertIn("Combine the edits and commit the result", option(args, "--question"))
+        self.assertNotIn("Keep the current branch", option(args, "--question"))
         self.assertEqual(option(args, "--text"), "Hanadocs vault sync stopped, 2027-01-15T08:00:00+00:00")
         self.assertEqual(option(args, "--urgency"), "soon")
         self.assertEqual(option(args, "--due"), "2027-01-16")
@@ -540,20 +588,39 @@ class VaultPullTests(unittest.TestCase):
         return self.hour()
 
     def test_commit_and_merge_retry_index_locks_and_then_complete(self) -> None:
+        remote_errors: list[str] = []
+
+        def captured_transport(args: list[str], timeout: float) -> subprocess.CompletedProcess[str] | None:
+            result = self.run_transport(args, timeout)
+            if args[0] == "ssh" and result is not None:
+                remote_errors.append(result.stderr)
+            return result
+
         for operation in ("commit", "merge"):
             with self.subTest(operation=operation):
-                self.assertEqual(self.locked_hour(operation, 2)[0], 0)
+                with mock.patch.object(vault_pull, "run", new=captured_transport):
+                    self.assertEqual(self.locked_hour(operation, 2)[0], 0)
+                self.assertNotIn(self.lock_detail, remote_errors[-1])
                 self.assertEqual((self.folder / "lock_count").read_text().strip(), "3")
                 self.assertEqual(self.git(self.github, "show", "main:note.md"), operation)
                 self.assertEqual(self.questions(), [])
 
     def test_exhausted_commit_and_merge_locks_file_a_question(self) -> None:
+        settings = self.folder / "config/build_targets.conf"
+        _ = settings.write_text(settings.read_text().replace("vault.lock_retries=2", "vault.lock_retries=5"))
         for operation in ("commit", "merge"):
             with self.subTest(operation=operation):
                 vault_pull.write_state(vault_pull.VaultState(vault_pull.NeverPulled(), vault_pull.NoOutage()))
-                self.assertEqual(self.locked_hour(operation, 3)[0], 0)
-                self.assertEqual((self.folder / "lock_count").read_text().strip(), "3")
+                questions_before = len(self.questions())
+                status, line = self.locked_hour(operation, 6)
+                self.assertEqual(status, 0)
+                self.assertEqual(len(self.questions()), questions_before)
+                self.assertEqual(line.count(self.lock_detail), 1)
+                self.assertEqual((self.folder / "lock_count").read_text().strip(), "6")
+                self.assertEqual(self.locked_hour(operation, 6)[0], 0)
+                self.assertEqual((self.folder / "lock_count").read_text().strip(), "6")
                 self.assertIn("index.lock", self.question())
+                self.assertEqual(self.question().count(self.lock_detail), 1)
         self.assertEqual(len(self.questions()), 2)
 
     def test_vault_retry_delay_limit_stays_below_one_minute(self) -> None:
@@ -583,10 +650,13 @@ class VaultPullTests(unittest.TestCase):
         status, line = self.hour()
         self.assertEqual(status, 1)
         self.assertIn("would be overwritten by merge", line)
+        self.assertEqual(self.questions(), [])
+        self.assertEqual(self.hour()[0], 1)
         self.assertIn("protected.txt", self.question())
 
     def test_no_state_save_after_a_filed_question_can_make_the_next_hour_repeat_it(self) -> None:
         _ = self.conflict()
+        self.assertEqual(self.hour()[0], 0)
         save = vault_pull.write_state
 
         def fail_after_question(state: vault_pull.VaultState) -> None:
@@ -610,6 +680,7 @@ class VaultPullTests(unittest.TestCase):
 
     def test_a_failed_pre_question_state_save_does_not_run_ask(self) -> None:
         _ = self.conflict()
+        self.assertEqual(self.hour()[0], 0)
         save = vault_pull.write_state
 
         def fail_question_intent(state: vault_pull.VaultState) -> None:
@@ -707,6 +778,7 @@ class VaultPullTests(unittest.TestCase):
                 assert isinstance(outage, vault_pull.OpenOutage)
                 self.assertEqual(outage.cause, "command_failed")
                 self.assertIn(detail, outage.detail)
+                self.assertEqual(outage.detail.count(detail), 1)
 
     def test_mac_transport_options_do_not_apply_to_github(self) -> None:
         _ = (self.mac / "note.md").write_text("Mac\n")
@@ -723,6 +795,7 @@ class VaultPullTests(unittest.TestCase):
         self.reject_push = True
         self.push_rejection = "[remote rejected]"
         _ = (self.mac / "note.md").write_text("Mac\n")
+        self.assertEqual(self.hour()[0], 1)
         self.assertEqual(self.hour()[0], 1)
         self.assertEqual(len(self.questions()), 1)
         self.assertIn("[remote rejected]", self.question())
