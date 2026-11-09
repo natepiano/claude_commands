@@ -7,6 +7,7 @@ import os
 import subprocess
 import sys
 import unittest
+from contextlib import redirect_stderr
 from tempfile import TemporaryDirectory
 from pathlib import Path
 from dataclasses import replace
@@ -444,6 +445,67 @@ class TurnEndTests(unittest.TestCase):
         self.assertEqual(self.case.fixture.world.closed, [(pane, "terminal-" + pane)])
         self.assertIsNone(staff.by_id(row.id))
         self.assertEqual(turn_end.handle(turn_end.WorkerEvent(str(row.current_session))), turn_end.TurnOutcome.IGNORED)
+
+        for recovery in ("plain", "same hold", "failed notice"):
+            with (self.subTest(recovery="dispatch in another run", case=recovery),
+                  patch.dict(os.environ, {"ASTRA_ROLES_STATE": str(self.case.fixture.root / "holds")}),
+                  self.case.fixture.world.process_starts()):
+                name = "late-" + recovery.replace(" ", "-")
+                role: staff.WorkerRole = "astra-reviewer" if recovery == "same hold" else "impl"
+                self.case.agent.finish_after = 0
+                opened = self.case.opened(name, role)
+                row = opened.row
+                actions = (progress_history.CompletionActions(end_worker=True, held_role=str(row.id))
+                           if recovery == "same hold" else progress_history.NO_COMPLETION_ACTIONS)
+                if recovery == "same hold":
+                    pid = self.case.fixture.world.foreground[opened.pane][0]
+                    held = astra_roles.hold("reviewer", astra_roles.ExecProcess(pid), str(row.id))
+                    self.assertNotIsInstance(held, astra_roles.HoldWorkerUnavailable)
+                first_run = self.case.run_dir
+                next_run = self.case.fixture.root / ("next-run-" + recovery.replace(" ", "-"))
+                next_state = cast(dict[str, object], json.loads((first_run / "progress_history_state.json").read_text()))
+                next_state["history_file"] = str(next_run / "history.jsonl")
+                atomic_file.write_text_atomic(next_run / "progress_history_state.json", json.dumps(next_state))
+                first_reply = first_run / (name + "-reply.md")
+                self.assertIs(worker.dispatch(self.case.fixture.parent.id, staff.WorkerName.parse(name), role, self.case.prompt,
+                    session_dir=first_run, slot=name, phase="8", kind=role, launcher_command=["first-assign"],
+                    reply=first_reply, completion_actions=actions), worker.DispatchSubmission.SUBMITTED)
+                pane = self.case.agent.submitted[-1][0]
+                row = self.case.agent.row(pane)
+                passed = worker_panes.worker_pass(row, first_run)
+                instance = str(passed["instance_id"])
+                worker.save_reply(first_reply, self.case.agent.replies[-1])
+                progress_history.save_hook_completion(first_run, instance,
+                    progress_history.HookCompletion(turn_end.TurnOutcome.DONE, str(first_reply), role_released=False))
+                self.assertEqual(worker_panes.worker_run(row), first_run)
+                notices = len(self.case.agent.notices)
+                closed = self.case.fixture.world.closed.copy()
+                self.case.agent.finish_after = 1
+                self.case.agent.notice_failures = int(recovery == "failed notice")
+                if recovery == "same hold":
+                    pid = self.case.fixture.world.foreground[pane][0]
+                    held = astra_roles.hold("reviewer", astra_roles.ExecProcess(pid), str(row.id))
+                    self.assertNotIsInstance(held, astra_roles.HoldWorkerUnavailable)
+                with redirect_stderr(io.StringIO()) as errors:
+                    self.assertIs(worker.dispatch(self.case.fixture.parent.id, staff.WorkerName.parse(name), role, self.case.prompt,
+                        session_dir=next_run, slot=name, phase="8", kind=role, launcher_command=["next-assign"],
+                        reply=next_run / "reply.md", completion_actions=actions), worker.DispatchSubmission.SUBMITTED)
+                if recovery == "failed notice":
+                    self.assertIn(f"late result of pass {instance} was not reported", errors.getvalue())
+                    self.assertIn(str(first_reply), errors.getvalue())
+                else:
+                    self.assertEqual(len(self.case.agent.notices), notices + 1)
+                    notice = self.case.agent.notices[-1]
+                    self.assertIn(f"; pass {instance}", notice)
+                    self.assertIn(f"late result of pass {instance}", notice)
+                if recovery == "same hold":
+                    live, = astra_roles.live_roles(staff.snapshot())
+                    self.assertEqual(live["staff_id"], row.id)
+                    self.assertIsNotNone(staff.by_id(row.id))
+                    self.assertEqual(errors.getvalue(), "")
+                self.assertIn(pane, self.case.fixture.world.locations)
+                self.assertEqual(self.case.fixture.world.closed, closed)
+                self.assertEqual(worker_panes.worker_run(row), next_run)
 
     def test_stage_two_recovers_busy_and_interrupted_submission(self) -> None:
         for reason in ("busy", "interrupt_before_submit", "interrupt_stage_two"):
