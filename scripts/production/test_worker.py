@@ -30,7 +30,7 @@ from scripts.production.staff_test_support import fixture_member, fixture_sessio
 from scripts.lib import atomic_file, unit_runs
 from scripts.lib.test_models_registry import write_registry
 from scripts.lib.test_hang_guard import LauncherHangGuard
-from scripts.message import sessions
+from scripts.message import send, sessions
 from scripts.usage import agents_log
 
 from scripts.herdr import herdr
@@ -51,6 +51,7 @@ class DispatchAgent:
         self.replies: list[str] = []
         self.last_replies: dict[str, str] = {}
         self.notices: list[str] = []
+        self.notice_senders: list[send.SenderStamp] = []
         self.questions: dict[str, str | herdr.HerdrFailure] = {}
         self.answers: list[tuple[str, str]] = []
         self.answer_inputs: dict[str, str] = {}
@@ -115,6 +116,18 @@ class DispatchAgent:
     def pane_commands(self, case: unittest.TestCase) -> None:
         run = self.fixture.world.run
         composer = self.fixture.world.composer
+
+        def notify(options: send.Options, *, membership: staff.StaffSnapshot) -> send.Result:
+            del membership
+            if self.notice_failures:
+                self.notice_failures -= 1
+                return send.Result("failed", "director message failed")
+            self.notices.append(send.body_text(options))
+            origin = options.sender_origin
+            self.notice_senders.append(origin.stamp if isinstance(origin, send.ForwardedSender) else send.sender_stamp())
+            return send.Result("sent", "private director")
+
+        _ = case.enterContext(patch.object(send, "_send", side_effect=notify))
 
         def accept(pane: str, text: str) -> None:
             del self.questions[pane]
@@ -189,12 +202,6 @@ class DispatchAgent:
         _ = case.enterContext(patch.object(os, "kill", side_effect=self.fixture.world.signal))
 
     def run(self, args: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
-        if len(args) > 1 and args[1].endswith("/message/send.py"):
-            if self.notice_failures:
-                self.notice_failures -= 1
-                return subprocess.CompletedProcess(args, 1, "", "director message failed")
-            self.notices.append(args[args.index("--text") + 1])
-            return subprocess.CompletedProcess(args, 0, "SENT: private director\n", "")
         if args[0] != "/nonexistent/herdr":
             return self.run_process(args, **kwargs)
         action, pane = args[4:6]
@@ -303,6 +310,8 @@ class WorkerCommandTests(unittest.TestCase):
         config = self.fixture.root / "conf/direct.conf"
         atomic_file.write_text_atomic(config, config.read_text()
                                       + "# range: 1..600\nWORKER_SETTLE_SECONDS=30\n")
+        atomic_file.write_text_atomic(config.with_name("send.conf"),
+                                      (Path(__file__).resolve().parents[2] / "config/send.conf").read_text())
         self.agent = DispatchAgent(self.fixture)
         self.agent.pane_commands(self)
         self.run_dir = self.fixture.root / "run"
