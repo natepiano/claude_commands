@@ -37,6 +37,7 @@ class VerifyRunPlaceTests(unittest.TestCase):
         library = scripts / "lib"
         library.mkdir()
         (library / "py").symlink_to(sys.executable)
+        (library / "package_root.py").symlink_to(VERIFY.parent.parent / "lib/package_root.py")
         (library / "build_folders.py").symlink_to(VERIFY.parent.parent / "lib/build_folders.py")
         lint = scripts / "lint"
         lint.mkdir()
@@ -70,6 +71,7 @@ fi
               **changes: str) -> subprocess.Popen[str]:
         environment = {**os.environ, "IN_NIX_SHELL": "fixture", "CODEX_THREAD_ID": "",
                        "UNIT_DETACHED_RUN": "", **changes}
+        _ = environment.pop("PYTHONPATH", None)
         _ = environment.pop("BUILDLOG_RUN", None)
         process = subprocess.Popen(["bash", str(script), name], env=environment,
                                    stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,

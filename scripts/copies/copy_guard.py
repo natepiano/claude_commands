@@ -9,12 +9,12 @@ import ast
 from collections import deque
 from collections.abc import Iterator, Mapping
 from dataclasses import dataclass, field
+from functools import cache
 import io
 import json
 import os
 from pathlib import Path
 import re
-import subprocess
 import sys
 from typing import Protocol, cast, override
 
@@ -58,7 +58,8 @@ class TreeCreation:
 
     @override
     def __str__(self) -> str:
-        return f"{self.path}:{self.line}: {self.operation}; use copies.py run"
+        instruction = "" if self.operation.startswith(("unresolved relevant operation:", "cannot ")) else "; use copies.py run"
+        return f"{self.path}:{self.line}: {self.operation}{instruction}"
 
 
 @dataclass(frozen=True)
@@ -88,6 +89,15 @@ class KnownArgument:
 @dataclass(frozen=True)
 class UnknownArgument:
     description: str
+    text: str = syntax.UNKNOWN_VALUE
+
+
+@dataclass(frozen=True)
+class UnresolvedChoices:
+    """The branch combinations exceed the configured inspection limit."""
+    description: str
+    text: str = syntax.UNKNOWN_VALUE
+    choice_texts: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -106,7 +116,59 @@ class ArgumentChoices:
     choices: tuple[tuple[Argument, ...], ...]
 
 
-Argument = KnownArgument | UnknownArgument | UnknownArguments | ForwardedArguments | ArgumentChoices
+Argument = KnownArgument | UnknownArgument | UnresolvedChoices | UnknownArguments | ForwardedArguments | ArgumentChoices
+
+
+def _retained_choice_texts(words: tuple[Argument, ...]) -> tuple[str, ...]:
+    """Keep value fragments without constructing combinations across words."""
+    texts: dict[str, None] = {}
+    pending = deque(words)
+    while pending:
+        word = pending.popleft()
+        if isinstance(word, ArgumentChoices):
+            pending.extend(argument for choice in word.choices for argument in choice)
+        elif isinstance(word, (KnownArgument, UnknownArgument, UnresolvedChoices)):
+            texts[word.text] = None
+            if isinstance(word, UnresolvedChoices):
+                texts.update(dict.fromkeys(word.choice_texts))
+    return tuple(texts)
+
+
+@cache
+def _choice_limit() -> int:
+    from scripts.copies.copies import guard_choice_limit
+    return guard_choice_limit()
+
+
+def _choice_options(choices: tuple[tuple[Argument, ...], ...], description: str) -> tuple[tuple[Argument, ...], ...]:
+    options: dict[tuple[Argument, ...], None] = {}
+    for choice in choices:
+        for vector in _choice_vectors(choice):
+            options[vector] = None
+            if len(options) > _choice_limit():
+                texts = _retained_choice_texts(tuple(argument for choice in choices for argument in choice))
+                return ((UnresolvedChoices(description, choice_texts=texts),),)
+    return tuple(options)
+
+
+def _choice_vectors(words: tuple[Argument, ...]) -> tuple[tuple[Argument, ...], ...]:
+    """Read a bounded set of combinations and retain unknown values beyond the limit."""
+    vectors: list[list[Argument]] = [[]]
+    for word in words:
+        options = _choice_options(word.choices, "branch choices") if isinstance(word, ArgumentChoices) else ((word,),)
+        if len(vectors) * len(options) > _choice_limit():
+            options = ((UnresolvedChoices("branch choices", choice_texts=_retained_choice_texts((word,))),),)
+        if len(options) == 1:
+            for vector in vectors:
+                vector.extend(options[0])
+        else:
+            vectors = [prefix + list(suffix) for prefix in vectors for suffix in options]
+    return tuple(tuple(vector) for vector in vectors)
+
+
+def _merged_arguments(choices: tuple[tuple[Argument, ...], ...], description: str) -> tuple[Argument, ...]:
+    options = _choice_options(choices, description)
+    return options[0] if len(options) == 1 else (ArgumentChoices(options),)
 
 
 @dataclass(frozen=True)
@@ -115,11 +177,23 @@ class LiteralProgramInput:
 
 
 @dataclass(frozen=True)
+class ExpandedProgramInput:
+    text: str
+
+
+@dataclass(frozen=True)
+class ProgramWithChoiceTexts:
+    """The program retains known text and value fragments above the inspection limit."""
+    text: str
+    choice_texts: tuple[str, ...]
+
+
+@dataclass(frozen=True)
 class UnknownProgramInput:
     reason: str
 
 
-ProgramInput = LiteralProgramInput | UnknownProgramInput
+ProgramInput = LiteralProgramInput | ExpandedProgramInput | ProgramWithChoiceTexts | UnknownProgramInput
 UNAVAILABLE_STDIN = UnknownProgramInput("cannot resolve interpreter stdin")
 
 
@@ -153,8 +227,13 @@ Invocation = CommandProgram | StdinProgram | ScriptProgram | NoProgramInvocation
 
 
 def _program_input(argument: Argument) -> ProgramInput:
-    return (LiteralProgramInput(argument.text) if isinstance(argument, KnownArgument)
-            else UnknownProgramInput("cannot resolve interpreter program"))
+    if isinstance(argument, KnownArgument):
+        return LiteralProgramInput(argument.text)
+    if isinstance(argument, UnknownArgument):
+        return ExpandedProgramInput(argument.text)
+    if isinstance(argument, UnresolvedChoices):
+        return ProgramWithChoiceTexts(argument.text, argument.choice_texts)
+    return UnknownProgramInput("cannot resolve interpreter program")
 
 
 def decode_invocation(words: list[Argument]) -> Invocation:
@@ -163,9 +242,13 @@ def decode_invocation(words: list[Argument]) -> Invocation:
         return OrdinaryInvocation()
     executable = Path(_text(words[0])).name
     if executable == "eval":
-        return CommandProgram("shell", LiteralProgramInput(" ".join(_text(word) for word in words[1:]))) if all(
-            isinstance(word, KnownArgument) for word in words[1:]) else CommandProgram(
-                "shell", UnknownProgramInput("cannot resolve interpreter program"))
+        text = " ".join(word.text if isinstance(word, (KnownArgument, UnknownArgument, UnresolvedChoices)) else syntax.UNKNOWN_VALUE
+                        for word in words[1:])
+        source = (ProgramWithChoiceTexts(text, _retained_choice_texts(tuple(words[1:])))
+                  if any(isinstance(word, UnresolvedChoices) for word in words[1:])
+                  else LiteralProgramInput(text) if all(isinstance(word, KnownArgument) for word in words[1:])
+                  else ExpandedProgramInput(text))
+        return CommandProgram("shell", source)
     python = re.fullmatch(r"python(?:[0-9.]+)?", executable) is not None
     if not python and executable not in {"bash", "sh", "zsh"}:
         return OrdinaryInvocation()
@@ -177,9 +260,8 @@ def _python_invocation(rest: list[Argument]) -> Invocation:
     index = 0
     while index < len(rest):
         word = rest[index]
-        if not isinstance(word, KnownArgument):
-            return (ScriptProgram() if isinstance(word, ForwardedArguments) else
-                    CommandProgram("python", UnknownProgramInput("cannot resolve interpreter invocation")))
+        if not isinstance(word, (KnownArgument, UnknownArgument, UnresolvedChoices)):
+            return ScriptProgram()
         text = word.text
         if text == "--":
             return StdinProgram("python") if index + 1 == len(rest) or _text(rest[index + 1]) == "-" else ScriptProgram()
@@ -194,10 +276,14 @@ def _python_invocation(rest: list[Argument]) -> Invocation:
             continue
         flags = text[1:]
         for offset, flag in enumerate(flags):
+            if flags.startswith(syntax.UNKNOWN_VALUE, offset):
+                return ScriptProgram()
             if flag in "?hV":
                 return NoProgramInvocation()
             if flag == "c":
-                source = (LiteralProgramInput(flags[offset + 1:]) if offset + 1 < len(flags)
+                source = ((ProgramWithChoiceTexts(flags[offset + 1:], word.choice_texts) if isinstance(word, UnresolvedChoices)
+                           else ExpandedProgramInput(flags[offset + 1:]) if isinstance(word, UnknownArgument)
+                           else LiteralProgramInput(flags[offset + 1:])) if offset + 1 < len(flags)
                           else _program_input(rest[index + 1]) if index + 1 < len(rest)
                           else UnknownProgramInput("missing interpreter command"))
                 return CommandProgram("python", source)
@@ -222,9 +308,8 @@ def _shell_invocation(executable: str, rest: list[Argument]) -> Invocation:
     long_options = True
     while index < len(rest):
         word = rest[index]
-        if not isinstance(word, KnownArgument):
-            return (ScriptProgram() if isinstance(word, ForwardedArguments) else
-                    CommandProgram("shell", UnknownProgramInput("cannot resolve interpreter invocation")))
+        if not isinstance(word, (KnownArgument, UnknownArgument, UnresolvedChoices)):
+            return ScriptProgram()
         text = word.text
         if text == "--" or text == "-":
             index += 1
@@ -242,8 +327,12 @@ def _shell_invocation(executable: str, rest: list[Argument]) -> Invocation:
         long_options = False
         flags = text[1:]
         for offset, flag in enumerate(flags):
+            if flags.startswith(syntax.UNKNOWN_VALUE, offset):
+                return ScriptProgram()
             if flag == "c" and text.startswith("-"):
-                source = (_program_input(rest[index + 1]) if index + 1 < len(rest)
+                source = (ProgramWithChoiceTexts(flags[offset + 1:], word.choice_texts) if isinstance(word, UnresolvedChoices)
+                          else ExpandedProgramInput(flags[offset + 1:]) if isinstance(word, UnknownArgument)
+                          else _program_input(rest[index + 1]) if index + 1 < len(rest)
                           else UnknownProgramInput("missing interpreter command"))
                 return CommandProgram("shell", source)
             if flag == "s" and text.startswith("-"):
@@ -256,16 +345,19 @@ def _shell_invocation(executable: str, rest: list[Argument]) -> Invocation:
     return StdinProgram("shell") if stdin or index == len(rest) else ScriptProgram()
 
 
+def _tree_making_text(text: str) -> bool:
+    return (TREE_COMMAND.search(text.replace("\n", " ")) is not None
+            or re.search(r"\b(?:copytree|clone_from|worktree)\b|\bRepo\s*\.\s*clone\b", text) is not None)
+
+
 def inspect_invocation(words: list[Argument], cwd: Path, *, static: bool,
                        stdin: ProgramInput = UNAVAILABLE_STDIN) -> PolicyOutcome:
     """One decoder for shell commands, tool argv and Python subprocess vectors."""
-    for index, argument in enumerate(words):
-        if isinstance(argument, ArgumentChoices):
-            outcome: PolicyOutcome = NoForbiddenOperation()
-            for choice in argument.choices:
-                outcome = _prefer(outcome, inspect_invocation(words[:index] + list(choice) + words[index + 1:],
-                                                             cwd, static=static, stdin=stdin))
-            return outcome
+    if any(isinstance(argument, ArgumentChoices) for argument in words):
+        outcome: PolicyOutcome = NoForbiddenOperation()
+        for vector in _choice_vectors(tuple(words)):
+            outcome = _prefer(outcome, inspect_invocation(list(vector), cwd, static=static, stdin=stdin))
+        return outcome
     actual = _unwrap(words)
     operation = _operation(actual, cwd, static=static)
     if _copies_command(actual):
@@ -277,20 +369,26 @@ def inspect_invocation(words: list[Argument], cwd: Path, *, static: bool,
     if isinstance(source, UnknownProgramInput):
         # Static abstract shell helpers are checked at concrete call sites.
         return operation if static else _prefer(operation, UnresolvedOperation(source.reason))
+    choices: PolicyOutcome = NoForbiddenOperation()
+    if isinstance(source, ProgramWithChoiceTexts) and any(
+            _tree_making_text(text) for text in (source.text, *source.choice_texts)):
+        choices = UnresolvedOperation("cannot resolve interpreter program choices")
     if invocation.language == "shell":
         parsed = inspect_shell(source.text, cwd, static=static)
     else:
         try:
             tree = ast.parse(source.text)
         except SyntaxError:
-            return _prefer(operation, UnresolvedOperation("cannot parse Python program"))
+            if isinstance(source, (ExpandedProgramInput, ProgramWithChoiceTexts)) and _tree_making_text(source.text):
+                return _prefer(operation, UnresolvedOperation("cannot parse Python program"))
+            return _prefer(operation, choices)
         parsed: PolicyOutcome = NoForbiddenOperation()
         for finding in PythonPolicy(cwd / "<python-command>", static=static).scan(tree):
             result: PolicyOutcome = (UnresolvedOperation(finding.operation.removeprefix("unresolved relevant operation: "))
                                      if finding.operation.startswith("unresolved relevant operation: ")
                                      else ForbiddenOperation(finding.operation))
             parsed = _prefer(parsed, result)
-    return _prefer(operation, parsed)
+    return _prefer(operation, _prefer(parsed, choices))
 
 
 def _prefer(left: PolicyOutcome, right: PolicyOutcome) -> PolicyOutcome:
@@ -307,6 +405,11 @@ def _description(outcome: PolicyOutcome) -> str:
     if isinstance(outcome, UnresolvedOperation):
         return "unresolved relevant operation: " + outcome.reason
     return ""
+
+
+def _refusal(outcome: PolicyOutcome) -> str:
+    description = _description(outcome)
+    return f"{description}: {REFUSAL}" if isinstance(outcome, ForbiddenOperation) else description
 
 
 def _text(argument: Argument) -> str:
@@ -376,17 +479,22 @@ def _unwrap(words: list[Argument]) -> list[Argument]:
 def _operation(words: list[Argument], cwd: Path, *, static: bool) -> PolicyOutcome:
     """Match only the real command/subcommand, never later operand text."""
     outcome: PolicyOutcome
-    for index, argument in enumerate(words):
-        if isinstance(argument, ArgumentChoices):
-            outcome = NoForbiddenOperation()
-            for choice in argument.choices:
-                outcome = _prefer(outcome, _operation(words[:index] + list(choice) + words[index + 1:], cwd, static=static))
-            return outcome
+    if any(isinstance(argument, ArgumentChoices) for argument in words):
+        outcome = NoForbiddenOperation()
+        for vector in _choice_vectors(tuple(words)):
+            outcome = _prefer(outcome, _operation(list(vector), cwd, static=static))
+        return outcome
     words = _unwrap(words)
     if not words or _copies_command(words):
         return NoForbiddenOperation()
     if not isinstance(words[0], KnownArgument):
-        return NoForbiddenOperation() if static else UnresolvedOperation("cannot resolve executable name")
+        arguments = [_text(word) for word in words[1:]]
+        tree_arguments = (arguments[:1] == ["clone"] or arguments[:2] == ["worktree", "add"]
+                          or any(text in {"--archive", "--recursive"}
+                                 or re.fullmatch(r"-[A-Za-z]*[arR][A-Za-z]*", text) for text in arguments))
+        return (NoForbiddenOperation() if static or isinstance(words[0], UnknownArgument)
+                and words[0].description == "expanded value" and not tree_arguments
+                else UnresolvedOperation("cannot resolve executable name"))
     program = Path(words[0].text).name
     rest = words[1:]
     if program == "git":
@@ -440,28 +548,46 @@ class ShellPolicy:
     directories: set[Path]
 
     def expand(self, word: syntax.Word) -> list[Argument]:
-        parts: list[str] = []
-        glob = False
+        value = word.literal()
+        if isinstance(value, syntax.LiteralWord):
+            text = value.text
+            if word.segments and isinstance(word.segments[0], syntax.Literal) and not word.segments[0].quoted:
+                text = os.path.expanduser(text)
+            glob = any(isinstance(segment, syntax.Literal) and not segment.quoted
+                       and any(char in segment.text for char in "*?[") for segment in word.segments)
+            return ([UnknownArgument("expanded value", text)] if syntax.UNKNOWN_VALUE in text
+                    else [KnownArgument(text, glob)])
+        parts: list[Argument] = []
+        glob = any(isinstance(segment, syntax.Literal) and not segment.quoted
+                   and any(char in segment.text for char in "*?[") for segment in word.segments)
         for segment in word.segments:
             if isinstance(segment, syntax.Literal):
-                parts.append(segment.text)
-                glob = glob or (not segment.quoted and any(char in segment.text for char in "*?["))
+                parts.append(KnownArgument(segment.text))
             elif isinstance(segment, syntax.Parameter):
                 key = segment.name.removesuffix("[@]").removesuffix("[*]")
                 values = self.variables.get(key, (UnknownArgument(key),))
-                if all(part is segment or isinstance(part, syntax.Literal) and not part.text for part in word.segments) and segment.name.endswith(("[@]", "[*]")):
+                whole_parameter = all(part is segment or isinstance(part, syntax.Literal) and not part.text
+                                      for part in word.segments)
+                if whole_parameter and (segment.name.endswith(("[@]", "[*]"))
+                                        or len(values) == 1 and isinstance(values[0], (ForwardedArguments, ArgumentChoices))):
                     return list(values)
-                if all(part is segment or isinstance(part, syntax.Literal) and not part.text for part in word.segments) and len(values) == 1 and isinstance(values[0], ForwardedArguments):
-                    return list(values)
-                if len(values) != 1 or not isinstance(values[0], KnownArgument):
-                    return [UnknownArgument(key)]
-                parts.append(values[0].text)
+                parts.append(values[0] if len(values) == 1 else UnknownArgument(key))
             else:
-                return [UnknownArgument("command output" if isinstance(segment, syntax.Execution) else "array")]
-        value = "".join(parts)
-        if word.segments and isinstance(word.segments[0], syntax.Literal) and not word.segments[0].quoted:
-            value = os.path.expanduser(value)
-        return [KnownArgument(value, glob)]
+                parts.append(UnknownArgument("command output" if isinstance(segment, syntax.Execution) else "array"))
+        joined: list[tuple[Argument, ...]] = []
+        for vector in _choice_vectors(tuple(parts)):
+            text = "".join(part.text if isinstance(part, (KnownArgument, UnknownArgument, UnresolvedChoices))
+                           else syntax.UNKNOWN_VALUE for part in vector)
+            if word.segments and isinstance(word.segments[0], syntax.Literal) and not word.segments[0].quoted:
+                text = os.path.expanduser(text)
+            if any(isinstance(part, UnresolvedChoices) for part in vector):
+                joined.append((UnresolvedChoices("word choices", text, _retained_choice_texts(vector)),))
+            elif all(isinstance(part, KnownArgument) for part in vector):
+                joined.append((KnownArgument(text, glob),))
+            else:
+                description = ", ".join(part.description for part in vector if not isinstance(part, (KnownArgument, ArgumentChoices)))
+                joined.append((UnknownArgument(description, text),))
+        return list(_merged_arguments(tuple(joined), "word choices"))
 
     def expansions(self, word: syntax.Word) -> PolicyOutcome:
         outcome: PolicyOutcome = NoForbiddenOperation()
@@ -489,8 +615,7 @@ class ShellPolicy:
         previous = self.variables.get(match[1])
         if match[2] == "+" and previous is not None:
             values = previous + values
-            previous = None
-        self.variables[match[1]] = values if previous is None or previous == values else (UnknownArgument(match[1]),)
+        self.variables[match[1]] = values
         return True
 
     def command(self, command: syntax.SimpleCommand) -> PolicyOutcome:
@@ -515,7 +640,7 @@ class ShellPolicy:
         inputs: dict[int, ProgramInput] = {0: UNAVAILABLE_STDIN}
         for redirect in command.redirects:
             if isinstance(redirect.document, syntax.HereDocument):
-                inputs[redirect.descriptor] = (UnknownProgramInput("cannot resolve expanded interpreter stdin")
+                inputs[redirect.descriptor] = (ExpandedProgramInput(syntax.expanded_text(redirect.document.body))
                                                if redirect.document.generated else LiteralProgramInput(redirect.document.body))
             elif redirect.operator == "<<<":
                 values = self.expand(redirect.target)
@@ -548,32 +673,41 @@ class ShellPolicy:
                 for word in command.headers:
                     outcome = _prefer(outcome, self.expansions(word))
                 previous = dict(self.variables)
+                if command.kind == "alternatives":
+                    branches: list[dict[str, tuple[Argument, ...]]] = []
+                    for branch in command.body.commands:
+                        self.variables = dict(previous)
+                        outcome = _prefer(outcome, self.program(syntax.Program((branch,))))
+                        branches.append(dict(self.variables))
+                    self.merge_branches(branches)
+                    continue
                 if command.kind == "function" and self.static:
                     self.variables["@"] = (ForwardedArguments("function argv"),)
                     self.variables["*"] = (ForwardedArguments("function argv"),)
                 outcome = _prefer(outcome, self.program(command.body))
                 if command.kind == "function":
                     self.variables = previous
+                elif command.kind in {"for", "loop"}:
+                    self.merge_branches([previous, self.variables])
             else:
                 outcome = _prefer(outcome, self.command(command))
         return outcome
 
+    def merge_branches(self, branches: list[dict[str, tuple[Argument, ...]]]) -> None:
+        self.variables = {}
+        for key in {key for branch in branches for key in branch}:
+            choices = tuple(dict.fromkeys(branch.get(key, (UnknownArgument(key),)) for branch in branches))
+            self.variables[key] = _merged_arguments(choices, key)
+
     def parse(self, source: str) -> PolicyOutcome:
         try:
             return self.program(syntax.parse(source))
-        except (syntax.ShellSyntaxError, RecursionError, OSError) as error:
-            return UnresolvedOperation("cannot parse shell program: " + str(error))
+        except (syntax.ShellSyntaxError, RecursionError, OSError):
+            parsed = self.program(syntax.readable_program(source))
+            return parsed if isinstance(parsed, ForbiddenOperation) else NoForbiddenOperation()
 
 
 def inspect_shell(command: str, cwd: Path, *, static: bool = False) -> PolicyOutcome:
-    if not static:
-        try:
-            checked = subprocess.run(["bash", "--noprofile", "--norc", "-n"], input=command,
-                                     text=True, capture_output=True, timeout=hook_timeout())
-            if checked.returncode:
-                return UnresolvedOperation("cannot parse shell program")
-        except (OSError, subprocess.TimeoutExpired):
-            return UnresolvedOperation("cannot validate shell syntax")
     policy = ShellPolicy(cwd, static, {key: (KnownArgument(value),) for key, value in os.environ.items()}, {cwd})
     return policy.parse(command)
 
@@ -583,8 +717,7 @@ def _first_operation(command: str, cwd: Path, *, static: bool = False) -> str:
 
 
 def refusal(command: str, cwd: Path) -> str:
-    operation = _first_operation(command, cwd)
-    return f"{operation}: {REFUSAL}" if operation else ""
+    return _refusal(inspect_shell(command, cwd))
 
 
 def hook_refusal(payload: str) -> str:
@@ -602,8 +735,7 @@ def hook_refusal(payload: str) -> str:
     directory = fields.get("cwd")
     cwd = Path(directory) if isinstance(directory, str) else Path.cwd()
     if isinstance(command, list) and all(isinstance(word, str) for word in cast(list[object], command)):
-        operation = _description(inspect_invocation([KnownArgument(word) for word in cast(list[str], command)], cwd, static=False))
-        return f"{operation}: {REFUSAL}" if operation else ""
+        return _refusal(inspect_invocation([KnownArgument(word) for word in cast(list[str], command)], cwd, static=False))
     return refusal(command, cwd) if isinstance(command, str) else ""
 
 
@@ -676,6 +808,8 @@ def _import_value(name: str) -> ModuleBinding | KnownGitFunction | ScalarValue:
 
 def _python_value(node: ast.AST, bindings: Mapping[str, PythonValue]) -> PythonValue:
     if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        if syntax.UNKNOWN_VALUE in node.value:
+            return ScalarValue(UnknownArgument("expanded value", node.value))
         return ScalarValue(KnownArgument(node.value))
     if isinstance(node, ast.Name):
         return bindings.get(node.id, ScalarValue(UnknownArgument(node.id)))
@@ -710,6 +844,8 @@ def _python_value(node: ast.AST, bindings: Mapping[str, PythonValue]) -> PythonV
                     alternatives.append(ArgumentVector(first.arguments + second.arguments))
                 elif isinstance(first, ScalarValue) and isinstance(second, ScalarValue) and isinstance(first.argument, KnownArgument) and isinstance(second.argument, KnownArgument):
                     alternatives.append(ScalarValue(KnownArgument(first.argument.text + second.argument.text)))
+                elif isinstance(first, ScalarValue) and isinstance(second, ScalarValue) and isinstance(first.argument, (KnownArgument, UnknownArgument)) and isinstance(second.argument, (KnownArgument, UnknownArgument)):
+                    alternatives.append(ScalarValue(UnknownArgument("expanded value", first.argument.text + second.argument.text)))
                 else:
                     alternatives.append(ScalarValue(UnknownArgument(ast.unparse(node))))
         return _union(alternatives)
@@ -849,7 +985,7 @@ class PythonPolicy:
                                             and keyword.value.value is True for keyword in node.keywords)
             outcome: PolicyOutcome = NoForbiddenOperation()
             for alternative in _possibilities(value):
-                if shell and isinstance(alternative, ScalarValue) and isinstance(alternative.argument, KnownArgument):
+                if shell and isinstance(alternative, ScalarValue) and isinstance(alternative.argument, (KnownArgument, UnknownArgument)):
                     outcome = _prefer(outcome, inspect_shell(alternative.argument.text, self.path.parent, static=self.static))
                 elif isinstance(alternative, ArgumentVector):
                     input_node = next((keyword.value for keyword in node.keywords if keyword.arg == "input"), None)
@@ -1086,7 +1222,8 @@ def main() -> None:
     payload = sys.stdin.read()
     reason = hook_refusal(payload)
     if reason:
-        print(reason, file=sys.stderr)
+        print(reason + ": provide readable command input." if reason.startswith("unresolved relevant operation:") else reason,
+              file=sys.stderr)
         raise SystemExit(2)
     previous = sys.stdin
     try:

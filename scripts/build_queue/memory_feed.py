@@ -50,6 +50,7 @@ from scripts.build_queue.queue_lines import age, plain, step_text
 from scripts.build_queue.queue_view import reason_phrase
 from scripts.lib.build_steps import RECORDED_STEP_NAMES
 from scripts.build_queue.scope_activity import LiveBuildRun, NotServiceSlice, ScopeProcesses
+from scripts.build_queue import admission_records
 from scripts.lint import memory_admit as gate
 from scripts.message import unit_labels
 from scripts.lib import conf
@@ -104,13 +105,13 @@ def gib(value: object) -> float:
 
 class GroupPart(TypedDict):
     who: str
-    pid: int | gate.PidNotRecorded
+    pid: int | admission_records.PidNotRecorded
     gib: float
     age: str
 
 
 class LeftoverProcess(TypedDict):
-    pid: int | gate.PidNotRecorded
+    pid: int | admission_records.PidNotRecorded
     program: str
 
 
@@ -125,7 +126,7 @@ class CIRunnerMemory(TypedDict):
     unit: str
     name: str
     used: float
-    pid: int | gate.PidNotRecorded
+    pid: int | admission_records.PidNotRecorded
 
 
 class BusyCIRunner(CIRunnerMemory):
@@ -179,10 +180,10 @@ class RunRow(TypedDict):
     unit: str
     progress: RowProgress | NoProgress
     state: str
-    pid: int | gate.PidNotRecorded
+    pid: int | admission_records.PidNotRecorded
     detail: str
-    used: float | gate.RunUseUnavailable
-    counted: float | gate.RunUseUnavailable
+    used: float | admission_records.RunUseUnavailable
+    counted: float | admission_records.RunUseUnavailable
     reserved: float
     started_at: float
     queued: bool
@@ -255,7 +256,7 @@ class MemoryPage(TypedDict):
     read_at: float
     total: float
     available: float
-    cap: float | gate.CapUnavailable
+    cap: float | admission_records.CapUnavailable
     floor: float
     cap_text: str
     shortfall: float
@@ -373,7 +374,7 @@ def read_ci_runner(unit: Path, proc: Path) -> CIRunner:
                     "job": min(jobs)[1] if jobs else "CI job"}
         listeners = sorted(p.pid for p in processes.values() if p.program == "Runner.Listener")
         return {"unit": unit.name, "name": name, "state": "idle", "used": used,
-                "pid": listeners[0] if listeners else gate.PidNotRecorded()}
+                "pid": listeners[0] if listeners else admission_records.PidNotRecorded()}
     except (OSError, ValueError, IndexError, StopIteration) as error:
         return {"unit": unit.name, "name": name, "state": "unreadable", "diagnostic": str(error)}
 
@@ -390,7 +391,7 @@ def job_age(started_at: float, now: float) -> str:
 
 def ci_amount(value: float) -> str:
     """Show the shared CI text for an amount in GiB."""
-    return ci_bytes_text(round(value * gate.GIB))
+    return ci_bytes_text(round(value * admission_records.GIB))
 
 
 def build_ci_row(used: float, ci_kept: float, now: float,
@@ -422,7 +423,7 @@ def build_ci_row(used: float, ci_kept: float, now: float,
         lines.append(f"CI keep-aside {ci_kept:g} GiB also reduces the room.")
     lines.append("CI builds do not wait in the queue yet.")
     idle = [runner for runner in runners if runner["state"] == "idle" and isinstance(runner["pid"], int)]
-    pid = busy[0]["pid"] if busy else idle[0]["pid"] if idle else gate.PidNotRecorded()
+    pid = busy[0]["pid"] if busy else idle[0]["pid"] if idle else admission_records.PidNotRecorded()
     return {"name": "hana CI", "showrunner": "", "unit": cgroup.name, "state": detail if not busy else "",
             "pid": pid, "detail": detail, "used": used,
             "counted": 0.0, "reserved": 0.0, "started_at": busy[0]["started_at"] if busy else 0,
@@ -430,14 +431,14 @@ def build_ci_row(used: float, ci_kept: float, now: float,
             "ci_runners": runners, "progress": {"kind": "NoProgress", "reason": "no admission counter"}}
 
 
-def row_progress(steps: Sequence[gate.RunningStep]) -> RowProgress | NoProgress:
+def row_progress(steps: Sequence[admission_records.RunningStep]) -> RowProgress | NoProgress:
     """Use the newest step counter from the admission reading."""
     reason = "no admission counter"
     phase: Literal["building", "testing"]
     unit: Literal["modules", "units", "tests"]
     for step in sorted(steps, key=lambda step: step.started_at, reverse=True):
         memory = step.measured
-        if not isinstance(memory, gate.ProgressAdjustedMemory):
+        if not isinstance(memory, admission_records.ProgressAdjustedMemory):
             continue
         counter = memory.counter
         if isinstance(counter, progress.NoCounter):
@@ -457,7 +458,7 @@ def row_progress(steps: Sequence[gate.RunningStep]) -> RowProgress | NoProgress:
     return {"kind": "NoProgress", "reason": reason}
 
 
-def run_keep_text(hold: gate.RunKeepAside, steps: Sequence[gate.RunningStep]) -> str:
+def run_keep_text(hold: admission_records.RunKeepAside, steps: Sequence[admission_records.RunningStep]) -> str:
     lines = [keep_aside_text(hold)]
     for step in steps:
         detail = gate.progress_text(step.measured)
@@ -523,7 +524,7 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
     explanation = parsed.explanation
     captured = explanation.room
     host = explanation.decided_from.host
-    if not isinstance(captured, gate.MemoryRoom) or not isinstance(host, gate.HostMemory):
+    if not isinstance(captured, admission_records.MemoryRoom) or not isinstance(host, admission_records.HostMemory):
         raise RuntimeError("recorded room unavailable")
     labels = unit_labels.unit_labels_for(
         [step.session_id for step in (*parsed.view.running, *parsed.view.waiting)], os.environ)
@@ -543,14 +544,14 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
     reserved = gib(sum(run.bytes for run in captured.runs))
     ci_kept = gib(captured.ci_keep_aside.bytes)
     ci_ram, ci_name = gib(captured.ci_use), "hana CI"
-    by_owner: dict[str, gate.RunningStep] = {}
-    steps_by_owner: dict[str, list[gate.RunningStep]] = {}
+    by_owner: dict[str, admission_records.RunningStep] = {}
+    steps_by_owner: dict[str, list[admission_records.RunningStep]] = {}
     reserved_steps = (entry for entry in explanation.running if gate.running_has_reservation(entry.step))
     for reservation, entry in zip(explanation.decided_from.reservations, reserved_steps, strict=True):
         owner = gate.reservation_owner(reservation, entry.step)
         by_owner[owner] = entry.step
         steps_by_owner.setdefault(owner, []).append(entry.step)
-    run_steps = {gate.run_owner(entry.step.run.pid, entry.step.run.start_time): entry.step
+    run_steps = {admission_records.run_owner(entry.step.run.pid, entry.step.run.start_time): entry.step
                  for entry in explanation.running if isinstance(entry.step.run, LiveBuildRun)}
     walk: list[RunRow] = []
     swaps: list[SwapRow] = []
@@ -561,10 +562,10 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
         identity = step_labels(metadata, labels) if metadata is not None else unit_labels.UnitLabels("")
         unit = identity.unit
         detail = unit if metadata is not None else hold.memory.owner
-        use = gib(hold.memory.use.bytes) if isinstance(hold.memory.use, gate.AnonymousRunUse) else hold.memory.use
+        use = gib(hold.memory.use.bytes) if isinstance(hold.memory.use, admission_records.AnonymousRunUse) else hold.memory.use
         run = hold.memory.run
         pid = (metadata.run.pid if isinstance(metadata.run, LiveBuildRun) else metadata.pid) if metadata is not None else (
-            run.pid if isinstance(run, LiveBuildRun) else gate.PidNotRecorded())
+            run.pid if isinstance(run, LiveBuildRun) else admission_records.PidNotRecorded())
         walk.append({"name": name, "showrunner": identity.showrunner, "unit": unit,
                      "state": "", "pid": pid, "detail": detail, "used": use,
                      "counted": use + gib(hold.bytes) if isinstance(use, float) else use, "reserved": gib(hold.bytes),
@@ -578,16 +579,16 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
         identity = step_labels(step, labels)
         name, detail = step_text(step, RECORDED_STEP_NAMES), identity.unit
         unit, state = detail, ""
-        if isinstance(memory, (gate.UnownedSliceMemory, gate.CompilerServiceMemory)):
-            service = (isinstance(memory, gate.CompilerServiceMemory)
+        if isinstance(memory, (admission_records.UnownedSliceMemory, admission_records.CompilerServiceMemory)):
+            service = (isinstance(memory, admission_records.CompilerServiceMemory)
                        or not isinstance(memory.job_state, NotServiceSlice) or bool(memory.diagnostic))
             if service:
-                name = memory.owner if isinstance(memory, gate.UnownedSliceMemory) else "compiler cache"
+                name = memory.owner if isinstance(memory, admission_records.UnownedSliceMemory) else "compiler cache"
                 activity = service_activity_text(memory, explanation.now)
                 state = activity
-                unit = memory.owner if isinstance(memory, gate.UnownedSliceMemory) else "sccache.service"
-                detail = activity if isinstance(memory, gate.UnownedSliceMemory) else "sccache.service · " + activity
-                if isinstance(memory, gate.UnownedSliceMemory):
+                unit = memory.owner if isinstance(memory, admission_records.UnownedSliceMemory) else "sccache.service"
+                detail = activity if isinstance(memory, admission_records.UnownedSliceMemory) else "sccache.service · " + activity
+                if isinstance(memory, admission_records.UnownedSliceMemory):
                     ci_name = "hana CI"
                     description = memory.diagnostic
                 else:
@@ -599,25 +600,25 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
                            "age": queue_view.leftover_age(age(step.started_at, explanation.now)) if step.started_at else "not recorded",
                            "progress": row_progress((step,)),
                            "queued": False, "keep_text": description, "group": "", "ci": False, "parts": []}
-            if service and isinstance(memory, gate.UnownedSliceMemory):
+            if service and isinstance(memory, admission_records.UnownedSliceMemory):
                 row = build_ci_row(gib(memory.bytes), ci_kept, explanation.now,
                                    Path(memory.cgroup) if memory.cgroup else CI_CGROUP)
                 if memory.diagnostic:
                     row["keep_text"] += "\n" + memory.diagnostic
                 name, detail = row["name"], row["detail"]
-            if not service and isinstance(memory, gate.UnownedSliceMemory) and isinstance(memory.activity, ScopeProcesses) and memory.bytes < GIB // 2:
+            if not service and isinstance(memory, admission_records.UnownedSliceMemory) and isinstance(memory.activity, ScopeProcesses) and memory.bytes < GIB // 2:
                 program = memory.activity.program
                 group = "Codex servers" if program in ("codex", "codex-real", "detached_runs.py") else "worker background runs"
                 row["detail"] = " · ".join(part for part in (detail, program) if part)
                 groups.setdefault(group, []).append(row)
             else:
                 walk.append(row)
-        if isinstance(memory, gate.MeasuredMemory) and memory.swap_bytes:
+        if isinstance(memory, admission_records.MeasuredMemory) and memory.swap_bytes:
             swaps.append({"name": name, "detail": detail, "swap": gib(memory.swap_bytes)})
     walk.sort(key=lambda row: row["started_at"])
     for name, members in groups.items():
         amount = sum(row["used"] for row in members if isinstance(row["used"], float))
-        walk.append({"name": f"{name} ({len(members)})", "showrunner": "", "unit": "", "state": "", "pid": gate.PidNotRecorded(), "detail": "each under 0.5 GiB",
+        walk.append({"name": f"{name} ({len(members)})", "showrunner": "", "unit": "", "state": "", "pid": admission_records.PidNotRecorded(), "detail": "each under 0.5 GiB",
                      "used": amount, "counted": 0.0, "reserved": 0.0, "started_at": 0,
                      "queued": False, "keep_text": "Memory these processes hold outside the build queue.",
                      "progress": {"kind": "NoProgress", "reason": "group has no admission counter"},
@@ -630,14 +631,14 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
         row["machine"] = machine
     waiters: list[WaitRow] = []
     checks = {row.waiter.pid: row.room for row in explanation.line.steps}
-    if isinstance(explanation.head, gate.HeadExplanation):
+    if isinstance(explanation.head, admission_records.HeadExplanation):
         checks[explanation.head.waiter.pid] = explanation.head.room
     for waiter in parsed.view.waiting:
         check = checks.get(waiter.pid)
         need = check.need if check is not None else waiter.need
         identity = step_labels(waiter, labels)
         reason = reason_phrase(waiter.reason, parsed.view.waiting)
-        if isinstance(waiter.reason, gate.BehindHead):
+        if isinstance(waiter.reason, admission_records.BehindHead):
             reason = "head protection · " + reason
         waiters.append({"name": step_text(waiter, RECORDED_STEP_NAMES), "showrunner": identity.showrunner, "unit": identity.unit, "pid": (waiter.run.pid if isinstance(waiter.run, LiveBuildRun) else waiter.pid), "detail": identity.unit,
                         "need": gib(waiter.need), "since": waiter.since,
@@ -650,10 +651,10 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
     if isinstance(parsed, wire.CloudQueueRead):
         cloud_slots = parsed.cloud_slots
         model = queue_view.QueueModel(
-            parsed, labels, gate.NoWaiter(), head_facts.PaceUnavailable(), ZoneInfo("UTC"),
-            queue_view.HostLoadUnavailable(), gate.NoWaiter(), names=RECORDED_STEP_NAMES)
+            parsed, labels, admission_records.NoWaiter(), head_facts.PaceUnavailable(), ZoneInfo("UTC"),
+            queue_view.HostLoadUnavailable(), admission_records.NoWaiter(), names=RECORDED_STEP_NAMES)
         rows = queue_view.cloud_rows(model)
-        cloud_slots_used = sum(isinstance(row.wait, gate.ReadyForAdmission) for row in rows)
+        cloud_slots_used = sum(isinstance(row.wait, admission_records.ReadyForAdmission) for row in rows)
         lines = queue_view.cloud_lines(model, 1_000_000)
         if lines:
             cloud_heading = plain(lines[:1])
@@ -662,9 +663,9 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
     policy = explanation.policy.pressure
     pressure_values = read_stalls()
     pressure_label = "none"
-    if isinstance(pressure, gate.MemoryPressure):
-        pressure_label = gate.pressure_text(pressure)
-    elif isinstance(pressure, gate.PressureUnavailable):
+    if isinstance(pressure, admission_records.MemoryPressure):
+        pressure_label = admission_records.pressure_text(pressure)
+    elif isinstance(pressure, admission_records.PressureUnavailable):
         pressure_label = "unavailable: " + pressure.reason
     return {
         "ok": True, "read_at": explanation.now, "total": total, "available": gib(captured.available),

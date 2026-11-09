@@ -1,0 +1,11 @@
+{"type":"assistant","timestamp":"2026-11-01T09:59:59Z","requestId":"before","message":{"id":"before","model":"before","usage":{"input_tokens":1,"output_tokens":1}}}
+{"type":"assistant","timestamp":"2026-11-01T10:00:00Z","requestId":"since","message":{"id":"since","model":"since","usage":{"input_tokens":2,"output_tokens":1}}}
+{"type":"assistant","timestamp":"2026-11-01T11:30:00+01:00","requestId":"inside","message":{"id":"inside","model":"inside","usage":{"input_tokens":3,"output_tokens":1}}}
+{"type":"assistant","timestamp":"2026-11-01T11:00:00Z","requestId":"until","message":{"id":"until","model":"until","usage":{"input_tokens":4,"output_tokens":1}}}
+{"type":"assistant","timestamp":"2026-11-01T11:00:01Z","requestId":"after","message":{"id":"after","model":"after","usage":{"input_tokens":5,"output_tokens":1}}}
+{"type":"system","subtype":"compact_boundary","timestamp":"2026-11-01T09:59:59Z","compactMetadata":{"trigger":"manual","preTokens":300,"postTokens":20}}
+{"type":"system","subtype":"compact_boundary","timestamp":"2026-11-01T10:00:00Z","compactMetadata":{"trigger":"manual","preTokens":300,"postTokens":20}}
+{"type":"system","subtype":"compact_boundary","timestamp":"2026-11-01T11:00:00Z","compactMetadata":{"trigger":"manual","preTokens":300,"postTokens":20}}
+{"type":"attachment","timestamp":"2026-11-01T09:59:59Z","attachment":{"type":"hook_success","hookEvent":"SessionStart","hookName":"SessionStart:startup","toolUseID":"before-start"}}
+{"type":"attachment","timestamp":"2026-11-01T10:00:00Z","attachment":{"type":"hook_success","hookEvent":"SessionStart","hookName":"SessionStart:resume","toolUseID":"since-start"}}
+{"type":"attachment","timestamp":"2026-11-01T11:00:00Z","attachment":{"type":"hook_success","hookEvent":"SessionStart","hookName":"SessionStart:resume","toolUseID":"until-start"}}

@@ -10,6 +10,7 @@ from scripts.build_queue.queue_lines import Line, Span, age, wrap
 from scripts.build_queue.scope_activity import NotServiceSlice
 from scripts.build_queue.queue_view import (QueueModel, behind_place, eligible_head_position, check_line, check_lines, clock, estimate_minutes,
     cloud_lines, cloud_matches, cloud_rows, has_move_priority, is_moved, name_spans, name_text, pressure_check, shown_waiters, reason_phrase, running_matches_selector, start_text, step_checks, same_waiter, HostLoad)
+from scripts.build_queue import admission_records
 from scripts.lint import memory_admit as gate
 
 
@@ -26,9 +27,9 @@ def ordinal(number: int) -> str:
 
 def order_check(model: QueueModel, position: int) -> Line:
     reason = model.reading.view.waiting[position - 1].reason
-    if isinstance(reason, gate.TokenWaitingWaiter):
+    if isinstance(reason, admission_records.TokenWaitingWaiter):
         return check_line(False, reason_phrase(reason, model.reading.view.waiting))
-    if isinstance(reason, gate.BehindHead):
+    if isinstance(reason, admission_records.BehindHead):
         text = f"#{behind_place(reason, model.reading.view.waiting) or eligible_head_position(model.reading.view.waiting)}'s turn"
         if isinstance(model.facts, head_facts.HeadFacts):
             text += "      " + head_facts.order_rule(model.facts)
@@ -48,24 +49,24 @@ def _waiting_cards(model: QueueModel, matches: Sequence[int], columns: int) -> l
         if card:
             add()
         add((Span(f"#{position} of {len(waiting)} · {queue_evidence.step_pid_text(step)} · ", bold=True), *name_spans(step, model.labels),
-             Span(f" · {queue_lines.step_text(step, model.names)} · {step.need / gate.GIB:.1f} GiB", bold=True)))
+             Span(f" · {queue_lines.step_text(step, model.names)} · {step.need / admission_records.GIB:.1f} GiB", bold=True)))
         add((Span(f"Folder {step.folder}. Queue arrival {clock(model, step.since)}; waiting {age(step.since, model.reading.explanation.now)} min. "
                   + (f"Likely start {start_text(model, position, clock_time=True)}." if estimate_minutes(model, position) else "Likely start —.")),))
         add()
         checks = step_checks(model, position)
-        if isinstance(step.reason, gate.TokenWaitingWaiter):
+        if isinstance(step.reason, admission_records.TokenWaitingWaiter):
             add((Span("Next? No. It is waiting for the cargo token.", bold=True),))
-        elif (isinstance(step.reason, gate.ReadyForAdmission)
-                or isinstance(checks, gate.HeadExplanation) and checks.decision.state == "admit"):
+        elif (isinstance(step.reason, admission_records.ReadyForAdmission)
+                or isinstance(checks, admission_records.HeadExplanation) and checks.decision.state == "admit"):
             add((Span("Next? Yes. It starts at the next check.", bold=True),))
-        elif isinstance(checks, gate.HeadExplanation):
+        elif isinstance(checks, admission_records.HeadExplanation):
             add((Span("Next? Yes, it is first. It starts when the checks below pass.", bold=True),))
         else:
             moved = sum(has_move_priority(model, place) for place in range(1, position))
             kept = sum(keeps_run_place(model, place) and not has_move_priority(model, place)
                        for place in range(1, position))
             priority = model.reading.explanation.priority
-            unit = priority["unit"] if not isinstance(priority, gate.NoQueuePriority) else ""
+            unit = priority["unit"] if not isinstance(priority, admission_records.NoQueuePriority) else ""
             causes = f"{moved} of {unit} (queue priority), " if moved else ""
             if kept:
                 causes += f"{kept} keep their run's place, "
@@ -75,7 +76,7 @@ def _waiting_cards(model: QueueModel, matches: Sequence[int], columns: int) -> l
             for place in range(1, min(position, 6)):
                 ahead = waiting[place - 1]
                 row = model.reading.ordered[place - 1][1]
-                priority_order = gate.waiter_priority(row)
+                priority_order = admission_records.waiter_priority(row)
                 if keeps_run_place(model, place):
                     detail = "keeps its run's place"
                 else:
@@ -85,7 +86,7 @@ def _waiting_cards(model: QueueModel, matches: Sequence[int], columns: int) -> l
                     later = order_since > step_order_since
                     minutes = age(step_order_since, order_since) if later else age(order_since, step_order_since)
                     detail = f"joined {clock(model, order_since)}, {minutes} min {'after' if later else 'before'} it"
-                if isinstance(priority_order, gate.PriorityUnit):
+                if isinstance(priority_order, admission_records.PriorityUnit):
                     detail += f"; {priority_order.unit} (queue priority)"
                 add((Span(f"  #{place} {queue_evidence.step_pid_text(ahead)} · "), Span("↑  " if is_moved(model, place) else "   "),
                      *name_spans(ahead, model.labels), Span(f" {queue_lines.step_text(ahead, model.names)}  {detail}")), 6)
@@ -96,10 +97,10 @@ def _waiting_cards(model: QueueModel, matches: Sequence[int], columns: int) -> l
                       + f"{ordinal(joined)} of the steps waiting now."),))
         add()
         add((Span("Waits on", bold=True),))
-        if not isinstance(checks, gate.ReadingUnavailable):
+        if not isinstance(checks, admission_records.ReadingUnavailable):
             add((Span("  "), *order_check(model, position)), 4)
         # Frees when shows the head's expired estimate.
-        if position != 1 and isinstance(step.reason, gate.EstimateExpired):
+        if position != 1 and isinstance(step.reason, admission_records.EstimateExpired):
             add((Span("  "), *check_line(False, "estimate       "
                 + queue_evidence.estimate_refresh_text(step.reason, model.zone))), 4)
         for check in check_lines(checks, model):
@@ -115,7 +116,7 @@ def _waiting_cards(model: QueueModel, matches: Sequence[int], columns: int) -> l
 
 
 def _recorded_evidence(model: QueueModel, head_card: bool, columns: int,
-                       selected_running: Sequence[gate.ExplainedRunningStep]) -> list[Line]:
+                       selected_running: Sequence[admission_records.ExplainedRunningStep]) -> list[Line]:
     """Show shared evidence once after the selected steps."""
     explanation = model.reading.explanation
     lines: list[Line] = []
@@ -125,7 +126,7 @@ def _recorded_evidence(model: QueueModel, head_card: bool, columns: int,
 
     add(queue_evidence.room_text(explanation.room))
     host = explanation.host
-    if isinstance(host, gate.HostAvailable):
+    if isinstance(host, admission_records.HostAvailable):
         total = queue_evidence.gib(host.total) if isinstance(host.total, int) else "unknown"
         add(f"Host: available RAM {queue_evidence.gib(host.available)}; total RAM {total}")
         lines.extend(wrap(check_line(*pressure_check(host.pressure, model)), columns))
@@ -144,12 +145,12 @@ def _recorded_evidence(model: QueueModel, head_card: bool, columns: int,
     machine = store.host_name() if running_steps else ""
     for running in running_steps:
         selected = running in selected_running
-        if (not selected and isinstance(running.step.measured, gate.UnownedSliceMemory)
+        if (not selected and isinstance(running.step.measured, admission_records.UnownedSliceMemory)
                 and isinstance(running.step.measured.job_state, NotServiceSlice)):
             continue
         prefix = "Selected running step: " if selected else ""
         text = queue_evidence.running_text(running, explanation, model.labels, model.zone, names=model.names)
-        if not isinstance(running.step.measured, (gate.CompilerServiceMemory, gate.UnownedSliceMemory)):
+        if not isinstance(running.step.measured, (admission_records.CompilerServiceMemory, admission_records.UnownedSliceMemory)):
             pid, separator, detail = text.partition(" · ")
             text = pid + separator + machine + separator + detail
         add(prefix + text)
@@ -157,10 +158,10 @@ def _recorded_evidence(model: QueueModel, head_card: bool, columns: int,
         add("None.")
     add(f"Total current use: {queue_evidence.gib(explanation.totals.measured)}")
     head = explanation.head
-    if isinstance(head, gate.NoWaiter):
+    if isinstance(head, admission_records.NoWaiter):
         add("Nothing waits.")
         return lines
-    if isinstance(head, gate.TokenWaitersOnly):
+    if isinstance(head, admission_records.TokenWaitersOnly):
         add("All waiting steps are waiting for the cargo token.")
         add("Frees when: " + queue_evidence.release_text(model.release, explanation, model.labels, model.zone, names=model.names) + ".")
         return lines
@@ -204,16 +205,16 @@ def keeps_run_place(model: QueueModel, position: int) -> bool:
     return row.get("order_since", row["since"]) < row["since"]
 
 
-def page_running_steps(model: QueueModel) -> list[gate.ExplainedRunningStep]:
+def page_running_steps(model: QueueModel) -> list[admission_records.ExplainedRunningStep]:
     return [running for running in model.reading.explanation.running
-            if not isinstance(running.step.measured, gate.GoneMemory)]
+            if not isinstance(running.step.measured, admission_records.GoneMemory)]
 
 
 def render_card(model: QueueModel, matches: Sequence[int], columns: int,
-                selected_running: Sequence[gate.ExplainedRunningStep] = (),
+                selected_running: Sequence[admission_records.ExplainedRunningStep] = (),
                 selected_cloud: tuple[wire.CloudRow, ...] = ()) -> list[Line]:
     head = model.reading.explanation.head
-    head_card = isinstance(head, gate.HeadExplanation) and any(
+    head_card = isinstance(head, admission_records.HeadExplanation) and any(
         same_waiter(model.reading.view.waiting[position - 1], head.waiter) for position in matches)
     lines = _waiting_cards(model, matches, columns)
     if lines:
