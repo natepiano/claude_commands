@@ -171,6 +171,11 @@ Herdr checks the target before each key.
 Idle workers and blocked Claude workers use `agent prompt`.
 The command refuses workers held by another parent.
 A repeated saved launcher reads the transcript and returns without another submission.
+For a completed dispatch, each explicit rerun sends one completion notice through the shared hook code.
+This rule also applies to a completed managed Astra review.
+The saved completion preserves the reason and pane for a close anomaly.
+A successful completed rerun sets its status file to `done` after it sends the notice.
+The hook follows the worker's link to its existing pass state, including runs outside the run root.
 Exit 0 means submitted. The turn hook records completion and sends the director its reply path.
 
 ### Matching a running session to its staff row
@@ -185,6 +190,9 @@ Exit 0 means submitted. The turn hook records completion and sends the director 
 
 Claude processes use their Claude session id.
 Codex processes use their Codex thread id.
+A fresh Codex uses its pane session report before it has a resume argument.
+The identity reader excludes only `scripts/herdr/turn_end.py` from the foreground process count.
+Every other foreground process prevents the pane report from proving a sole Codex process.
 Copied `STAFF_ID` values, folders, names, and retired pane marks do not select rows.
 `RecordedLabels.resolve` and `StaffLabels.environment` remove retired identity from the environment.
 `session_staff.LaunchMembership` resolves a saved staff reference to the current native runtime id.

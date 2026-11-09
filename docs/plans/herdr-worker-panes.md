@@ -3433,13 +3433,23 @@ A question has no outcome of its own (sdlc [cb2d951c]): the worker writes it in 
 - An identical rerun of a completed dispatch returns `submitted`, and no message follows (Phase 34a).
 - A test fixture that fakes a turn end calls `turn_end.handle`; otherwise the pane stays open and the next dispatch reuses it.
 
-### Phase 34a — Turn-end gaps from the Phase 34 live proof  · status: todo
+### Phase 34a — Turn-end gaps from the Phase 34 live proof  · status: done
 
 **Depends on:** Phase 34. sdlc [958d0e42], 2026-11-09.
 
 1. **A new Codex worker's first dispatch exits 8.** `assign.sh --new-worker` on a Codex worker gives `Codex launch identity is unavailable` and exit 8; the pane shows Codex ready with no job. The next dispatch to the same worker works. The 28f proof saw the same.
 2. **A run outside the run root is never completed.** `worker_panes.worker_run` finds a worker's run only among runs held by the parent session under `/tmp/claude/unit`. A dispatch with `--session-dir` elsewhere submits, and the hook never completes it.
 3. **An identical rerun gets no message.** `worker.dispatch` returns `SUBMITTED` for a dispatch that matches a completed pass (same slot, phase, role, prompt and launcher command) and types nothing. No turn ends, so no message reaches the director.
+
+The Work Order is written at the phase start.
+
+### Phase 34b — A turn end while a final run is live  · status: todo
+
+**Depends on:** Phase 34a. sdlc [03851fa8] and [429a1166], 2026-11-09.
+
+1. **Exit-3 recovery cannot record a finished pass.** fastest-unit Phase 52: the worker wrote `DONE f82a956c` in its pane, and lint and tests passed. The launcher exited 3: the worker ended a turn while its detached final run was live. The documented exit-3 recovery then failed twice with exit 2: first `last turn does not end with the dispatch DONE line`, then `launcher has not recorded a completed pass` (`worker_panes._idle_checks`; the pass is recorded as `error`). Fix it where it lives.
+2. **Each turn end sends a new identical notice.** fix-rounds Phase 10l: the turn-end hook sent `phase 10l: waiting on run reply; reply .../claude-build-followups-sdlc-fix-rounds-study_reply_turn.txt` three times to one session, 03:44 to 03:52 EST; the send repeat guard held the third copy. Send one notice per pass state.
+3. **WAITING_ON_REPLY with an empty reply while a final run is live.** In the same pass, `reply_turn.txt` held 1 byte while gate run 20261109T034623 was live; the final reply ended with DONE and the status is `done`. Evidence: `/tmp/claude/unit/e325ab73-1e3b-4649-88f2-c29cf0dda72f/phases/10l/`.
 
 The Work Order is written at the phase start.
 

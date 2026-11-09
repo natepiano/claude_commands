@@ -329,6 +329,32 @@ class PaneReviewLauncherTests(unittest.TestCase):
         self.assertTrue(reply.read_text().startswith(self.fixture.agent.final))
         self.assertEqual(len(self.fixture.agent.submitted), 1)
 
+    def test_completed_astra_review_rerun_repeats_its_notice_without_typing(self) -> None:
+        write_text_atomic(self.fixture.prompt, "Phase astra-review — Astra review\nReview the assigned change.\n")
+        self.fixture.run_dir = self.fixture.fixture.root / "astra-run"
+        reply = self.fixture.run_dir / "astra-review.md"
+        arguments = ["--role", "review", "--operation", "astra-review", "--new-worker", "astra-reviewer",
+                     "--cwd", str(self.fixture.fixture.root), "--session-dir", str(self.fixture.run_dir),
+                     "--prompt", str(self.fixture.prompt), "--summary", str(reply)]
+        with patch.dict(os.environ, {"ASTRA_ROLES_STATE": str(self.fixture.fixture.root / "roles")}), \
+                self.fixture.fixture.world.process_starts():
+            result = invoke_cli(assign, assign.main, arguments, os.environ.copy(), ROOT)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertEqual(len(self.fixture.agent.submitted), 1)
+            row = self.fixture.agent.row(self.fixture.agent.submitted[-1][0])
+            self.assertEqual(self.fixture.finish("astra-reviewer"), turn_end.TurnOutcome.DONE)
+            self.assertIsNone(staff.by_id(row.id))
+            notice, = self.fixture.agent.notices
+            saved = reply.read_bytes(), reply.stat().st_mtime_ns
+            submitted = self.fixture.agent.submitted.copy()
+            launches = self.fixture.fixture.world.launches.copy()
+            repeated = invoke_cli(assign, assign.main, arguments, os.environ.copy(), ROOT)
+        self.assertEqual(repeated.returncode, 0, repeated.stdout + repeated.stderr)
+        self.assertEqual(self.fixture.agent.notices, [notice, notice])
+        self.assertEqual(self.fixture.agent.submitted, submitted)
+        self.assertEqual(self.fixture.fixture.world.launches, launches)
+        self.assertEqual((reply.read_bytes(), reply.stat().st_mtime_ns), saved)
+
     def test_review_stage_two_uses_its_own_done_line_and_reuses_both_receipts(self) -> None:
         summary = self.phase / "review_summary_1.txt"
         summary.parent.mkdir(parents=True)
@@ -364,9 +390,18 @@ class PaneReviewLauncherTests(unittest.TestCase):
         self.assertEqual(self.fixture.finish("review"), turn_end.TurnOutcome.IGNORED)
         self.assertEqual(self.fixture.agent.submitted, [first, second])
         saved = summary.read_bytes(), (self.phase / "review_status_1").read_bytes()
+        notices = self.fixture.agent.notices.copy()
+        self.fixture.agent.notice_failures = 1
+        failed = self.launch_review()
+        self.assertNotEqual(failed.returncode, 0)
+        self.assertEqual((self.phase / "review_status_1").read_text(), "error\n")
+        self.assertEqual(summary.read_bytes(), saved[0])
+        self.assertEqual(self.fixture.agent.submitted, [first, second])
+        self.assertEqual(self.fixture.agent.notices, notices)
         repeated = self.launch_review()
         self.assertEqual(repeated.returncode, 0, repeated.stdout + repeated.stderr)
         self.assertEqual(self.fixture.agent.submitted, [first, second])
+        self.assertEqual(self.fixture.agent.notices, [*notices, notices[-1]])
         self.assertEqual((summary.read_bytes(), (self.phase / "review_status_1").read_bytes()), saved)
         self.assertEqual(self.fixture.prompt.read_bytes(), prompt)
 

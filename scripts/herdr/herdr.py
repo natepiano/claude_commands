@@ -2176,10 +2176,10 @@ class Herdr:
         """Return the sole foreground Codex PID, or zero for other foreground work."""
         info = json_object(self.result("pane", "process-info", "--pane", pane).get("process_info"),
                            "pane process info")
-        if not codex_without_session(info):
+        foreground = _codex_foreground(info)
+        if len(foreground) != 1:
             return 0
-        foreground = json_items(info.get("foreground_processes"), "native foreground processes")
-        pid = json_object(foreground[0], "native foreground process").get("pid")
+        pid = foreground[0].get("pid")
         if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
             raise HerdrFailure("native process pid is unavailable")
         return pid
@@ -2618,11 +2618,22 @@ def pane_session(row: Mapping[str, object]) -> str:
     return session if isinstance(session, str) else ""
 
 
+def _codex_foreground(info: dict[str, object]) -> list[dict[str, object]]:
+    """Select a sole Codex process after excluding the turn-end hook."""
+    foreground: list[dict[str, object]] = []
+    for value in json_items(info.get("foreground_processes"), "native foreground processes"):
+        process = json_object(value, "native foreground process")
+        arguments = _foreground_arguments(process)
+        program = (arguments[1] if len(arguments) > 1 and Path(arguments[0]).name.startswith("python")
+                   else arguments[0] if arguments else "")
+        if Path(program).parts[-3:] != ("scripts", "herdr", "turn_end.py"):
+            foreground.append(process)
+    return foreground if len(foreground) == 1 and is_codex_process(_foreground_arguments(foreground[0])) else []
+
+
 def codex_without_session(info: dict[str, object]) -> bool:
     """Identify one foreground Codex that can supply a session report."""
-    foreground = json_items(info.get("foreground_processes"), "native foreground processes")
-    return len(foreground) == 1 and is_codex_process(
-        _foreground_arguments(json_object(foreground[0], "native foreground process")))
+    return len(_codex_foreground(info)) == 1
 
 
 def pane_native_process(info: dict[str, object], kind: str,
@@ -3481,8 +3492,8 @@ def codex_pane_process(pid: int, place: HerdrPlace) -> NativeAgentProcess:
     client = Herdr(place.session)
     info = json_object(client.result("pane", "process-info", "--pane", place.pane).get("process_info"),
                        "Codex pane process info")
-    foreground = json_items(info.get("foreground_processes"), "Codex foreground processes")
-    if codex_without_session(info) and json_object(foreground[0], "Codex foreground process").get("pid") == pid:
+    foreground = _codex_foreground(info)
+    if len(foreground) == 1 and foreground[0].get("pid") == pid:
         pane = client.pane_row(place.pane)
         if not isinstance(pane, NoPane):
             try:
