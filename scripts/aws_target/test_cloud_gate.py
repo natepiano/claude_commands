@@ -41,6 +41,7 @@ class FakeGateAws:
         self.has_result: bool = True
         self.has_log: bool = True
         self.state: str = 'running'
+        self.state_reason: dict[str, str] = {}
         self.has_instance: bool = True
         self.terminated: bool = False
         self.confirm_termination: bool = True
@@ -84,8 +85,11 @@ class FakeGateAws:
             self.terminated = True
         elif operation == 'describe-instances':
             state = 'terminated' if self.terminated and self.confirm_termination else self.state
-            reply = {'Reservations': [{'Instances': [{'InstanceId': 'i-fixture', 'State': {'Name': state},
-                                                      'LaunchTime': '2026-01-15T00:00:00+00:00'}]}] if self.has_instance else []}
+            instance: dict[str, object] = {'InstanceId': 'i-fixture', 'State': {'Name': state},
+                                          'LaunchTime': '2026-01-15T00:00:00+00:00'}
+            if self.state_reason:
+                instance['StateReason'] = self.state_reason
+            reply = {'Reservations': [{'Instances': [instance]}] if self.has_instance else []}
         else:
             raise AssertionError((service, operation))
         return subprocess.CompletedProcess(args, int(bool(error)), json.dumps(reply), error)
@@ -367,7 +371,19 @@ with (mock.patch.object(cloud_gate, 'AwsCli', return_value=api),
     def test_dead_instance_without_result_allows_local_fallback(self) -> None:
         self.fake.has_result = False
         self.fake.state = 'terminated'
-        self.assertEqual(self.execute()['status'], 'fallback')
+        self.assertEqual(self.execute(), {'status': 'fallback', 'reason': 'The instance stopped without a final result'})
+        self.assertTrue(self.fake.terminated)
+
+    def test_stopped_instance_fallback_includes_aws_state_reason(self) -> None:
+        self.fake.has_result = False
+        self.fake.state = 'shutting-down'
+        code = 'Server.SpotInstanceTermination'
+        message = 'Server.SpotInstanceTermination: Spot instance termination'
+        self.fake.state_reason = {'Code': code, 'Message': message}
+        self.assertEqual(self.execute(), {
+            'status': 'fallback', 'reason': f'The instance stopped without a final result ({code}: {message})'})
+        descriptions = [command for command in self.fake.commands if 'describe-instances' in command]
+        self.assertEqual(len(descriptions), 3)
         self.assertTrue(self.fake.terminated)
 
     def test_expired_instance_without_result_allows_local_fallback(self) -> None:
