@@ -1,6 +1,8 @@
 """Private clocks, queue snapshots, and AWS replies for lifecycle tests."""
 from __future__ import annotations
 
+from scripts.build_queue import admission_records
+
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from decimal import Decimal
@@ -132,16 +134,16 @@ class ControlFixture(CostFixture):
                                                 now=self.clock.now, boot_id="fixture-boot"))
 
     def waiter(self, pid: int, *, step: str = "test", age: int = 121,
-               identity: str = "https://example.invalid/team/hana") -> memory_admit.Waiter:
+               identity: str = "https://example.invalid/team/hana") -> admission_records.Waiter:
         return {"pid": pid, "start_time": str(pid), "need": 1024,
                 "since": self.clock.now - age, "step": step,
                 "repo_identity": identity, "repository_name": "hana", "folder": str(self.root)}
 
-    def snapshot(self, *rows: memory_admit.Waiter, age: int = 0) -> None:
-        inputs = memory_admit.QueueInputs(
-            [(self.queue_directory / f"{row['pid']}.waiting", memory_admit.rank_waiter(row, memory_admit.NormalOrder()))
+    def snapshot(self, *rows: admission_records.Waiter, age: int = 0) -> None:
+        inputs = admission_records.QueueInputs(
+            [(self.queue_directory / f"{row['pid']}.waiting", memory_admit.rank_waiter(row, admission_records.NormalOrder()))
              for row in rows], (), (),
-            memory_admit.HostMemory(1024**3, 1024**3), memory_admit.NoPressureHold(),
-            memory_admit.ReadyToStart(), memory_admit.NoHeadAdmissionOverride(), float(self.clock.now - age))
+            admission_records.HostMemory(1024**3, 1024**3), admission_records.NoPressureHold(),
+            admission_records.ReadyToStart(), admission_records.NoHeadAdmissionOverride(), float(self.clock.now - age))
         queue_snapshot.write_queue_snapshot(self.queue_directory, inputs, admission_policy_fixture())
         self.assertIsInstance(queue_snapshot.read_queue_snapshot(self.queue_directory), queue_snapshot.QueueSnapshot)
