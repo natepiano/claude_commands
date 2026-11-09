@@ -52,7 +52,7 @@ from scripts.buildlog.mac_outcome import (
 
 from scripts.lib import conf
 from scripts.lib.user_zone import user_zone  # noqa: E402
-from scripts.aws_target import measurement
+from scripts.aws_target import config as aws_config, ledger, measurement
 from scripts.build_targets.target_config import SshTarget, is_aws_target, read_targets
 
 
@@ -2319,10 +2319,15 @@ def aws_target_section(connection: sqlite3.Connection, day: str, configured: Ssh
     target = configured.name
     directory = mac_test.state_paths(target).directory
     instant = int(time.time())
+    spends: tuple[ledger.DailySpend, ...] = ()
+    daily_limit = Decimal(0)
     try:
-        inputs = measurement.read_inputs(configured.settings, directory)
+        inputs = measurement.read_inputs(aws_config.account_settings_path(), directory)
         snapshot = measurement.read_measurement(configured.settings, directory, instant, inputs=inputs)
         usage = measurement.daily_usage(configured.settings, directory, day, instant, inputs=inputs)
+        if isinstance(snapshot, measurement.AwsMeasurement) and isinstance(snapshot.costs, ledger.CostEstimate) and not isinstance(inputs.settings, measurement.MeasurementUnavailable):
+            spends = ledger.CostLedger(directory).spend_days(inputs.settings, instant)
+            daily_limit = inputs.settings.daily_limit_usd
     except (OSError, ValueError, ArithmeticError) as error:
         snapshot = measurement.MeasurementUnavailable(str(error))
         usage = measurement.MeasurementUnavailable(str(error))
@@ -2349,8 +2354,13 @@ def aws_target_section(connection: sqlite3.Connection, day: str, configured: Ssh
         lines.append(f'AWS measurement unavailable: {snapshot.reason}.')
     else:
         for reading in snapshot.charge_reads:
-            if reading.day == day:
+            if ledger.is_billed_day(reading) and reading.period_end <= instant:
                 lines.extend(aws_report.bill_lines(reading, directory))
+        today = datetime.fromtimestamp(instant, UTC).date().isoformat()
+        current_report = day == datetime.fromtimestamp(instant, user_zone()).date().isoformat()
+        for spend in spends:
+            if spend.source == 'AWS bill' or (current_report and spend.day == today):
+                lines.extend(aws_report.spend_lines(spend, daily_limit, today=spend.day == today))
         if isinstance(snapshot.go_live_at, int):
             boundary = store.utc_iso(snapshot.go_live_at)
             periods: list[list[object]] = []

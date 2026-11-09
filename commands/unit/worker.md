@@ -8,7 +8,7 @@ Run `scripts/lib/py scripts/production/worker.py` from the unit's session.
 The caller's native identity selects the parent.
 Use the supplied arguments: `$ARGUMENTS`.
 
-1. Use `list [--json] [--all]` to show worker rows. Text columns show number, name, role, account, Pane, and State. Closed panes show `-` for account and State. Uncertain panes show `unknown` and retain their reason. `--all` uses saved dispatches and shows `-` for Pane. JSON output stays unchanged.
+1. Use `list [--json] [--all]` to show worker rows. Text columns show number, name, role, account, Pane, and State. A machine field follows the account when a row runs off the home machine. Closed panes show `-` for account and State. Uncertain panes show `unknown` and retain their reason. `--all` uses saved dispatches and shows `-` for Pane. JSON output stays unchanged.
 2. Use `add <role> [--name <name>] [--json]` to create a worker or reconcile named creation.
 3. Use `end <name>` to close a worker and remove its row after confirmed closure.
 4. Use `restore` to reopen only workers with active dispatches on their recorded native sessions.

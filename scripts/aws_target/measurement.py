@@ -156,6 +156,11 @@ def daily_usage(settings_path: Path, directory: Path, day: str, now: int, *,
             return MeasurementUnavailable('report day is in the future')
         costs = ledger.costs_from_evidence(source.state, source.settings, end, window=date.fromisoformat(day))
         uptime = sum(row.confirmed_uptime_s for row in costs.intervals)
-        return DailyUsage(uptime, ledger.period_cost(costs.intervals, start, end))
+        usd = ledger.period_cost(costs.intervals, start, end)
+        book = ledger.CostLedger(directory)
+        if source.state.gate_reservations or any(ledger.is_billed_day(row) for row in book.read_bills()):
+            usd = ledger.period_cost((charge for spend in book.spend_days(source.settings, now)
+                                      for charge in spend.intervals), start, end)
+        return DailyUsage(uptime, usd)
     except (OSError, ValueError, ArithmeticError) as error:
         return MeasurementUnavailable(str(error))

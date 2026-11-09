@@ -44,6 +44,20 @@ class MemoryHoverTests(unittest.TestCase):
                 self.assertIn(expected, hover[1])
 
 
+    def test_cloud_hover_shows_the_progress_and_reservation(self) -> None:
+        for status, counter, expected in (
+            ("7 of 12 modules", progress.ProgressCounter("modules", 7, 12), "testing · 7 of 12 modules · 58% done"),
+            ("setup", progress.NoCounter("no cloud counter"), "setup. Machine: aws."),
+            ("", progress.NoCounter("no cloud counter"), "Machine: aws. No local memory reservation."),
+        ):
+            with self.subTest(status=status):
+                hover = cast(list[str], self.page_expression("tipText('row:0', data)", {"walk": [{
+                    "kind": "cloud", "name": "merge-gate", "unit": "cloud-unit", "showrunner": "fixture",
+                    "status": status, "progress": memory_feed.cloud_row_progress(counter)}]}))
+                self.assertIn(expected, hover[1])
+                self.assertIn("Machine: aws. No local memory reservation.", hover[1])
+                self.assertFalse(hover[1].startswith("."), hover[1])
+
     def page_expression(self, expression: str, data: object) -> object:
         html = Path(memory_feed.__file__).with_name("memory_live.html").read_text()
         functions = html[html.index("const TIPS ="):html.index("const tip =")]

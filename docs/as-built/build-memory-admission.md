@@ -45,7 +45,10 @@ The service removes the progress files when the reservation ends.
 
 The queue pane and the build page show each cloud gate in the main table.
 A running row shows machine `aws` and its vCPU count.
-The last column shows the state, module count, and failed modules.
+The queue pane's last column shows the state, module count, and failed modules.
+On the build page, a cloud row with a module counter draws the local rows' progress line.
+Small text under the line shows the module count and failed modules.
+The page omits the state `running` and shows any other state first.
 A waiting row shows `cloud` in the # column and its slot wait text.
 Its machine and vCPU cells stay blank.
 The Head line shows `cloud N of M slots`.
