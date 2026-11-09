@@ -49,9 +49,9 @@ def need_text(source: admission_records.RecordedNeed | admission_records.NeedSou
     if isinstance(source, admission_records.NeedSourceNotRecorded):
         return "source not recorded"
     basis = source.basis
-    if isinstance(basis, (admission_records.ShapeP90, admission_records.ShapeLargest, admission_records.ShapeFallback)):
-        if isinstance(basis, admission_records.ShapeP90):
-            text = f"same-shape p90 of {basis.runs} runs"
+    if isinstance(basis, (admission_records.ShapeRankedPeak, admission_records.ShapeLargest, admission_records.ShapeFallback)):
+        if isinstance(basis, admission_records.ShapeRankedPeak):
+            text = f"same-shape peak of {basis.runs} runs, excluding the highest {basis.share_percent}%"
         elif isinstance(basis, admission_records.ShapeLargest):
             text = f"same-shape largest peak of {basis.runs} runs"
         else:
@@ -82,7 +82,7 @@ def need_text(source: admission_records.RecordedNeed | admission_records.NeedSou
             text += "; uncut estimate"
         return text
     if source.source == "measured":
-        text = f"measured process-memory p90 of {source.runs} runs"
+        text = f"measured process-memory estimate from {source.runs} runs"
     elif source.source == "buildlog":
         text = f"build-log peak × {step_estimator.ANON_SHARE:.2f} of {source.runs} runs"
     elif source.source == "pooled":

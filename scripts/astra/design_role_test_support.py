@@ -71,6 +71,7 @@ class HeldRolePaneFixture:
         self.router.setup(case, self.root)
         self.commands: list[list[str]] = []
         self.recorder_commands: list[list[str]] = []
+        self.router.recorder_commands = self.recorder_commands
         write_text_atomic(self.root / "design.md", "# Private design\n")
         _ = cast(object, case.enterContext(patch.dict(os.environ, {
             "DESIGN_ROLES_STATE": str(self.root / "designs"),
@@ -123,7 +124,22 @@ class HeldRolePaneFixture:
                                       binding=self.binding if bound else design_roles.UNBOUND)
 
     def resume(self, design: design_roles.HeldDesign, role: design_roles.Role) -> Path:
-        return design_roles.resume(design.placement.design_id + "/" + role, self.command_case.prompt)
+        submitted = design_roles.resume(design.placement.design_id + "/" + role, self.command_case.prompt)
+        self.finish(design, role)
+        return submitted.reply
+
+    def finish(self, design: design_roles.HeldDesign, role: design_roles.Role) -> None:
+        from scripts.herdr import turn_end
+
+        instance = next(item for item in design.roles if item.role == role)
+        if not isinstance(instance.lifecycle, (design_roles.RoleOpen, design_roles.RolePausedForMove)):
+            raise AssertionError("role has no worker")
+        row = staff.by_id(instance.lifecycle.staff_id)
+        if row is None:
+            raise AssertionError("role worker is missing")
+        thread = str(row.current_session)
+        with self.world.process_starts():
+            _ = turn_end.handle(turn_end.WorkerEvent(thread, reply=self.command_case.agent.last_replies.get(thread, "")))
 
 
 class HeldRolePaneCase(unittest.TestCase):

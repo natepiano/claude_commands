@@ -439,3 +439,35 @@ From the sdlc showrunner, 2026-11-08 [be8c1303]. `merge_checkpoint._unit_paths` 
 Fix: a path that is absent at an origin merge base did not come from that origin, so that base does not drop it. A path that the base has, and that the commit has with the same content, still came from that origin. Add one row to the existing scope tests in `scripts/production/test_merge_checkpoint.py`: an as-built commit deletes its plan while an origin merge base never had the plan, and the scope check passes. Add no other check.
 
 As built: `_unit_paths` reads, per origin merge ref, the paths the merge base has (`git ls-tree -r`) and the paths the diff to the commit names. It drops only a path that the base has and the diff does not name. A path that the base lacks stays in scope. `test_scope_keeps_deleted_plan_absent_at_an_origin_merge_base` lands an as-built commit that deletes `docs/plans/alpha.md` while the other production's merge base never had it.
+
+### Phase 10j — The checkpoint's review trial line reports the checkpointed phase  · status: done
+
+**Depends on:** none.
+
+From the sdlc showrunner, 2026-11-09 [9e63d522]. devtools phase 3z (575d3b5cb) sent `review trial: ux 0 findings, code 0 findings, review-worker minutes 0`, but two pane reviewers ran and the 3z ledger holds F001 and F002.
+
+Cause: `<CheckpointCommit/>` step 9 in `commands/unit/checkpoint.md` runs `review-trial --session-dir` with no `--phase-id`. With no id, `_review_trial` reports the current phase. devtools had started phase 8u beside 3z, so the line counted 8u, which had no findings and no review passes yet. `review-trial --phase-id 3z` on the same run gives `code 2 findings, review-worker minutes 8`. The recorder counts pane-reviewer passes and ledger findings correctly once it reads the right instance.
+
+Fix: `commands/unit/checkpoint.md` step 9 passes the checkpointed phase's id with `--phase-id`. The recorder does not change, and no refusal is added. Add one test row: a phase with a ledger finding and a finished review pass is parked while a later phase is current, and `review-trial --phase-id` of the parked phase reports its finding and its minutes.
+
+As built: `<CheckpointCommit/>` step 9 runs `review-trial --session-dir "${SESSION_DIR}" --phase-id <phase id>`. `--phase-id` stays optional (showrunner, 2026-11-09 [f58e9b76]); a call with no id still reports the current phase. `test_review_trial_reports_the_parked_phase_findings_and_review_minutes` parks phase A, with one finding and an 8-minute review pass, behind current phase B, and reads A by id.
+
+### Phase 10k — A Change-Review line under any unit commit subject adds its row  · status: done
+
+**Depends on:** none.
+
+From the sdlc showrunner, 2026-11-09 [b8a10551], reported by builds. `change_review._checkpoint_entries` (used by `visible`) reads Change-Review lines only from `checkpoint(...)` subjects. `merge_checkpoint.change_review_commits` counts every unit commit and prints `N unit commit(s) carry their Change-Review lines`. A unit commit with a Change-Review line under another subject (builds queue: `queue(N):` for phases 10m, 32, 33, 34, 36) passes, and its rows are never added.
+
+Fix: one selection of unit commits serves both the count and the row adder, so a Change-Review line under any unit commit subject adds its row. `needs_trailer` keeps its rule: no new refusal. Add a test row: a unit commit with subject `queue(7): ...` and a Change-Review line adds its row.
+
+As built: `change_review._checkpoint_entries` reads the visible lines of every unit commit, with no subject filter. `visible` and `publication_changes` both use it, so the count in `merge_checkpoint.change_review_commits` and the row adder see the same commits. `needs_trailer` and `missing` do not change, and no refusal is added. New `queue(7): ...` rows: `ProducerWriterTests` (the merge adds its row), `ParseTest` (`needs_trailer` stays false) and `RepositoryTest` (`visible` reads it).
+
+### Phase 10l — A worker commit's draft Change-Review line adds no row after its checkpoint  · status: done
+
+**Depends on:** Phase 10k.
+
+From the sdlc showrunner, 2026-11-09 [4abc161a]. At the panes phase 31 shrink merge, the row adder added C1312, C1313 and C1314 from older sdlc merges (016475b0f, 2810b9c20, cdf3e0ea8). Cause: `list_ready` scans every first-parent merge on the merge branch since `READY_FROM` that is on main, and 10k widened the commits it reads in each. The merge being processed (1e98e9f6b) read only its own new commit, 5e38c59a5. C1312 and C1313 are lost rows that 10k recovered. C1314 came from 1b0c43482, a shutdown worker commit whose draft line the later checkpoint 34a000ec4 restates; its cells are cut wrong.
+
+Fix (showrunner go, 2026-11-09 [70a30518]): a unit commit's Change-Review lines add rows unless a later `checkpoint(...)` commit in the same merge descends from it. One selection serves the count and the row adder. No refusal is added. Test row: a merge whose worker commit carries a draft line and whose later checkpoint carries the real line adds only the checkpoint's row; a `queue(7)` commit with no later checkpoint still adds its row.
+
+As built: `change_review.review_commits` is the one selection. A `checkpoint(...)` commit always keeps its lines. Another unit commit keeps its lines only when no checkpoint in the same set descends from it. `Commit.ancestry` carries the parent graph that `unit_commits` and `merge_commits` read in their one `git log` call. `visible`, `publication_changes` (and so `list_ready`), the `merge_checkpoint.change_review_commits` count and the `check` command count all read it. `needs_trailer` and `missing` do not change. Test rows: `RepositoryTest` layouts linear, merged draft, sibling queue and earlier-checkpoint, read through both `unit_commits` and `merge_commits`; a `ProducerWriterTests` merge with a draft, a checkpoint and a later `queue(7)`; and `test_merge_checkpoint` counts for a draft under a checkpoint (1) and under a `queue(7)` (2).

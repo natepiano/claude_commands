@@ -32,7 +32,7 @@ from uuid import UUID, uuid4
 
 from scripts.astra import astra_work
 from scripts.agents import worker_lifecycle
-from scripts.direct import recorder_state
+from scripts.direct import progress_history, recorder_state
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.production import staff, worker_admission
 
@@ -579,8 +579,25 @@ def _worker_command(arguments: list[str]) -> subprocess.CompletedProcess[str]:
                           capture_output=True, text=True, check=False)
 
 
-def dispatch_turn(design: HeldDesign, role: Role, prompt: Path, reply: Path) -> None:
-    """Dispatch through assign.sh and save the completed reply."""
+@dataclass(frozen=True)
+class SubmittedRoleTurn:
+    """The hook owns completion of this role turn."""
+
+    reply: Path
+    run: Path
+
+
+def submitted_review(reply: Path, run: Path) -> None:
+    """Give the caller the read command without retaining a waiting shell."""
+    command = [str(ROOT / "scripts/lib/py"), str(ROOT / "scripts/astra/astra_review.py"), "--read", str(reply),
+               "--run-directory", str(run)]
+    print(f"Submitted: {reply}")
+    print("End this turn. Read the review after the hook reports done:")
+    print(shlex.join(command))
+
+
+def dispatch_turn(design: HeldDesign, role: Role, prompt: Path, reply: Path) -> SubmittedRoleTurn:
+    """Submit through assign.sh and let the hook save the reply."""
     if isinstance(design.binding, DesignBoundToPhase):
         run, phase = Path(design.binding.run_directory), design.binding.phase
     else:
@@ -596,18 +613,19 @@ def dispatch_turn(design: HeldDesign, role: Role, prompt: Path, reply: Path) -> 
     result = _assign_command(['--role', 'review' if role == 'reviewer' else 'implement',
         '--target', 'durable-design-role', '--policy', 'astra-' + role,
         '--session-dir', str(run), '--parent', str(parent.id), '--to', name,
-        '--phase', phase, '--prompt', str(prompt), '--summary', str(reply)])
+        '--phase', phase, '--prompt', str(prompt), '--summary', str(reply),
+        '--completion-actions', json.dumps(asdict(progress_history.CompletionActions(
+            finish_phase=phase if isinstance(design.binding, DesignUnbound) else '')))])
     refusal = result.stderr.strip() or f'held dispatch exited {result.returncode}; pending input is retained'
-    if isinstance(design.binding, DesignUnbound):
-        try:
-            _recorder_command(['finish-phase', '--session-dir', str(run), '--phase-id', phase,
-                               '--status', 'error' if result.returncode else 'completed'])
-        except RoleRefused as error:
-            if result.returncode:
-                raise RoleRefused(refusal) from error
-            raise
     if result.returncode:
+        if isinstance(design.binding, DesignUnbound):
+            try:
+                _recorder_command(['finish-phase', '--session-dir', str(run), '--phase-id', phase,
+                                   '--status', 'error'])
+            except RoleRefused as error:
+                raise RoleRefused(refusal) from error
         raise RoleRefused(refusal)
+    return SubmittedRoleTurn(reply, run)
 
 
 def _assign_command(arguments: list[str]) -> subprocess.CompletedProcess[str]:
@@ -754,7 +772,7 @@ def recover(instance_id: str) -> HeldDesign:
         return updated
 
 
-def resume(instance_id: str, prompt_file: str | Path) -> Path:
+def resume(instance_id: str, prompt_file: str | Path) -> SubmittedRoleTurn:
     design_id, role_text = instance_id.split('/')
     if role_text not in ('designer', 'reviewer'):
         raise RoleRefused('unknown role')
@@ -789,7 +807,7 @@ def resume(instance_id: str, prompt_file: str | Path) -> Path:
         _save(current)
 
     try:
-        dispatch_turn(design, role, prompt, reply)
+        submitted = dispatch_turn(design, role, prompt, reply)
     except BaseException as error:
         with _lock(directory):
             current = read_design(design_id)
@@ -805,7 +823,7 @@ def resume(instance_id: str, prompt_file: str | Path) -> Path:
         for identifier in identifiers:
             (directory / 'pending' / role / f'{identifier}.json').unlink(missing_ok=True)
     _project_hold(design, role, staff.snapshot())
-    return reply
+    return submitted
 
 
 def rebind(design_id: str, *, expected_generation: int, reason: str,
@@ -1250,7 +1268,8 @@ def main(argv: list[str]) -> int:
                                host=argument('host'), binding=binding)
             print(design.placement.design_id + '/' + role)
         elif command == 'resume':
-            print(resume(argument('instance_id'), argument('prompt_file')))
+            submitted = resume(argument('instance_id'), argument('prompt_file'))
+            submitted_review(submitted.reply, submitted.run)
         elif command == 'rebind':
             repair = bool(args.get('unbind') or (argument('run_directory') and argument('phase')
                                                 and argument('checkout')))
