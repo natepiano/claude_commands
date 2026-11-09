@@ -923,35 +923,15 @@ The build log index uses WAL mode, so a spilled update takes no exclusive lock a
 - Chrome refuses a long temporary socket path. Run the proof under a short `$TMPDIR` when the default path is long.
 
 ### Phase 44 — A vault stop files a question only when the next hourly try also stops · status: done
-**Depends on:** none.
 
-From the builds showrunner (not the user), 2026-11-09, on C1273: a real stop at 11:36 filed one question that repeated the Git error six times. The Mac index lock was gone before the next hourly sync, so a lock that cleared by itself made a user question.
+#### As-built
 
-#### Work Order
-
-**Goal:** The vault sync files a user question only when a stop outlives the next try, and the question shows the Git error once.
-
-**Spec:**
-- `REMOTE_PULL` `retry_git` prints the Git output only for the final failure: when lock retries are exhausted, or for an error that is not a lock. A lock retry prints nothing.
-- `_vault_locked` asks only when the outage was already open before this run. The first stop opens the outage with `asked` false and prints its stopped line. Exit codes do not change.
-- This rule applies to every stop cause. The 24-hour Mac unreachable grace stays and is checked as it is today.
-- A good sync after a first stop closes the outage. It files no question and withdraws none.
-- A failed `ask` retries on the next run, as it does today.
-- The question text and choices come from the latest stop, as they do today.
-- No new config key: one try is not a tunable.
+- The Mac script's `retry_git` prints Git output only for the final failure: exhausted lock retries, or an error that is not a lock. A vault stop shows the Git error once.
+- `_vault_locked` files a question only when an outage was already open before the run, for every stop cause. A first stop opens the outage with `asked` false.
+- The 24-hour Mac unreachable grace still applies. A failed `ask` retries on the next run. A good sync after a first stop files no question and withdraws none.
+- Any run of `buildlog vault` counts as the next try, also a manual one.
+- Exit codes did not change. The rule has no config key: one try is not a tunable.
 
 **Files:**
-- `scripts/buildlog/vault_pull.py`
-- `scripts/buildlog/test_vault_pull.py`
-
-**Workers:** `1 writer`
-- writer — both files; runs the tests.
-
-**State:** none. The saved outage record keeps its fields.
-
-**Acceptance gate:**
-- With five lock retries, an exhausted lock stop has the Git error once in its detail.
-- One stop files no question. A second stop in a row files one question, and a third files no more.
-- A stop, then a good sync, files no question and withdraws none.
-- A stop that was already asked withdraws its question on the next good sync.
-- `test_vault_pull` passes and `basedpyright` reports 0 errors, 0 warnings on both files.
+- `scripts/buildlog/vault_pull.py` — the sync and its question rule.
+- `scripts/buildlog/test_vault_pull.py` — the rule for each stop cause, and the single error line.
