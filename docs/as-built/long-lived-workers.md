@@ -155,7 +155,8 @@ The launcher retains its original prompt identity and its dispatch record.
 
 ### Legacy mesh coordinator and friends
 
-`scripts/direct/claude_worker.py` runs the Claude launch steps in the assign process.
+`assign.py.execute_herdr` sends normal assignments through `worker.py` and native worker panes.
+The retained `scripts/direct/claude_worker.py` API runs Claude coordinator steps within its caller's process.
 `assign_claude._run` calls its functions directly.
 The module has no command line or shell protocol.
 It reads `CLAUDE_WORKER_REGISTER_WAIT_SECS` before it stops a source.
@@ -164,14 +165,41 @@ It records the role before delivery.
 Delivery starts one Python child through `scripts/lib/py`.
 The child calls `send.py --to session:<id> --from launcher --file <prompt>`.
 `CLAUDE_WORKER_SEND_SCRIPT` selects the delivery script.
-`assign_claude.py` records the worker after publication.
-The heartbeat watch follows the assign process during the wait.
+
+`assign_claude.run(ClaudeLaunch)` provides the retained coordinator API and its integration fixture entry.
+`ClaudeLaunch.worker` selects `NewClaudeWorker` or `ClaudeFollowUp`.
+`claude_worker.open_worker` and `follow_up` take a `ClaudeTurn`.
+The launch returns `Delivered(native_id, turns_before, launch_environment)`, `Unchanged`, or `NotDelivered(code)`.
+`TurnsNotCounted` represents a new session without an earlier turn count.
+`wait_for_turn` reads Claude agent listings and logs in the same process.
+`CLAUDE_WORKER_POLL_SECS` sets its interval; `UNIT_WORKER_POLL_SECS` overrides it.
+One `nix_env.ensure` supplies the settings and start environment.
+The account step uses `accounts.account_for_unscoped_launch`.
+The banner's `backgrounded` line supplies the native id.
+The registry lookup resolves that id within `CLAUDE_WORKER_REGISTER_WAIT_SECS`.
+`assign_claude._run` records published workers in `finally` before it starts the heartbeat watch.
+The watch follows the coordinator process during the wait.
+A signal after the banner stops an unpublished session through `claude stop`.
+An unreadable log supplies a fallback summary.
+A transcript record without a message object adds no turn.
+The launch uses exit 127 for a missing binary and exit 2 for refusal or failed delivery.
+Other launch failures use exit 1; TERM, INT, and HUP use 143, 130, and 129.
 
 A retry that finds its original user prompt in the transcript records acceptance without another send.
 A complete transcript without that prompt permits delivery.
 A damaged transcript without that prompt refuses uncertain delivery.
 The refusal says `Claude prompt delivery is unknown: transcript has a torn JSON line; resend refused`.
 A missing transcript keeps the published session and places the saved handoff before the assignment.
+
+### Launcher claims
+
+`worker_state.publish_worker_claim` writes `impl_claim_<slot>.json` atomically.
+The record holds `pid`, `worker`, and the process start in `started` when available.
+An unreadable start prints an anomaly and leaves `started` absent.
+`read_worker_claim` returns `HeldWorkerClaim(pid)` when the start matches or the current start cannot be read.
+It returns `EndedWorkerClaim` for a gone process, zombie, changed start, or missing recorded start.
+An absent or malformed record, or a record without a positive pid, gives `NoWorkerClaim`.
+Claim release compares the recorded pid with the launcher pid.
 
 ### Account selection
 
@@ -308,6 +336,16 @@ Ending an uncertain creation can record an empty id when no worker exists.
 It refuses a matching active design that needs recovery.
 `list` returns damaged record problems alongside readable roles.
 
+`DamagedDesignRecord` identifies the record path and damaged field.
+Holder-aware scans decide whether matching damage prevents the requested operation.
+Writes validate the complete design before publication.
+An omitted binding repository uses the authority checkout; an empty repository refuses.
+`rebind --unbind` or a complete replacement binding can repair an empty repository under the generation lock.
+Unrelated damaged records produce one warning per operation and do not stop other holders.
+`unbind-run` refuses matching damage, including damage without a live role.
+Plain `list` keeps diagnostics on stderr; JSON retains `problems`.
+An identical `rebind` retry completes only after launch context and census publication agree.
+
 ### Operations
 
 `open` reserves placement, checks the binding and records creation intent before launch.
@@ -379,6 +417,13 @@ The claim permits one `dispatch_turn` call through `assign.sh --target durable-d
 Success removes only the included pending messages.
 Failure retains pending input and records recovery state.
 A role's `send` queues text for its next authorized assignment without waking the role.
+An unbound design opens `astra-review` only when that phase is closed.
+Each `dispatch_turn` records `finish-phase` after assign returns, with `completed` or `error`.
+A failed recording after refusal preserves the dispatch refusal text.
+Ending an active unbound design records `finish-run --status completed` under the lock.
+A phase-bound design uses the unit run and records no separate design phase.
+The one-shot managed review closes its phase and run in `assign.py` after worker cleanup.
+`worker.dispatch` owns successful pass completion; `assign.py` records pass failure only.
 Detached command results use `detached_runs.deliver` and `send.deliver_worker_text`.
 The result carries `Detached run: <run_id>` as its stable marker.
 Under a per-run delivery lock, `detached_runs.deliver` checks the worker transcript for that marker.
