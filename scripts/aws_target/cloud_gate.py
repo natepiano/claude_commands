@@ -358,26 +358,29 @@ class GateWorker:
                 self.size_vcpus = int(ledger.text(arguments, 'InstanceType').split('.')[1].removesuffix('xlarge')) * 4
                 cloud_progress.publish(self.sidecar, cloud_progress.CloudProgress('setup', self.size_vcpus, 0, self.clock()))
                 while self.clock() < ledger.instant(request, 'expires'):
-                    bucket = ledger.text(deployment, 'bucket')
-                    if self.download(bucket, prefix + '/gate.log', folder / 'gate.log'):
-                        self.publish_log(folder)
-                    if self.download(bucket, prefix + '/boot-error.json', folder / 'boot-error.json'):
-                        raise ValueError(ledger.text(read(folder / 'boot-error.json'), 'error'))
-                    if self.download(bucket, prefix + '/result.json', folder / 'remote-result.json'):
-                        if not self.download(bucket, prefix + '/gate.log', folder / 'gate.log'):
-                            raise ValueError('The final log is absent')
-                        result = read(folder / 'remote-result.json')
-                        validate_result(result, request)
-                        row = result
-                        self.publish_log(folder)
-                        break
-                    state = self.api.observe(instance, int(self.clock())).state
-                    if state not in ('pending', 'running'):
-                        reply = self.api.call('describe-instances', '--instance-ids', instance)
-                        stopped = ledger.rows(ledger.rows(reply, 'Reservations')[0], 'Instances')[0]
-                        reason = ledger.mapping(stopped.get('StateReason', {}))
-                        detail = ': '.join(ledger.text(reason, key) for key in ('Code', 'Message') if reason.get(key))
-                        raise ValueError('The instance stopped without a final result' + (f' ({detail})' if detail else ''))
+                    try:
+                        bucket = ledger.text(deployment, 'bucket')
+                        if self.download(bucket, prefix + '/gate.log', folder / 'gate.log'):
+                            self.publish_log(folder)
+                        if self.download(bucket, prefix + '/boot-error.json', folder / 'boot-error.json'):
+                            raise ValueError(ledger.text(read(folder / 'boot-error.json'), 'error'))
+                        if self.download(bucket, prefix + '/result.json', folder / 'remote-result.json'):
+                            if not self.download(bucket, prefix + '/gate.log', folder / 'gate.log'):
+                                raise ValueError('The final log is absent')
+                            result = read(folder / 'remote-result.json')
+                            validate_result(result, request)
+                            row = result
+                            self.publish_log(folder)
+                            break
+                        state = self.api.observe(instance, int(self.clock())).state
+                        if state not in ('pending', 'running'):
+                            reply = self.api.call('describe-instances', '--instance-ids', instance)
+                            stopped = ledger.rows(ledger.rows(reply, 'Reservations')[0], 'Instances')[0]
+                            reason = ledger.mapping(stopped.get('StateReason', {}))
+                            detail = ': '.join(ledger.text(reason, key) for key in ('Code', 'Message') if reason.get(key))
+                            raise ValueError('The instance stopped without a final result' + (f' ({detail})' if detail else ''))
+                    except subprocess.TimeoutExpired:
+                        continue
                     self.pause(settings().number('result_poll_s'))
                 if not row:
                     raise ValueError('The instance expired without a final result')
@@ -559,7 +562,13 @@ def main() -> int:
         configuration = conf.read('aws_target')
         api = AwsCli(configuration.text('credentials_profile'), configuration.text('region'), settings().number('api_timeout_s'))
         worker = GateWorker(api, ledger.CostLedger(directory), conf.path('aws_target'), cast(Path, args.sidecar))
-        save(folder / 'outcome.json', worker.execute(folder, read(folder / 'request.json'), read(folder / 'deployment.json')))
+        try:
+            outcome = worker.execute(folder, read(folder / 'request.json'), read(folder / 'deployment.json'))
+        except SystemExit:
+            save(folder / 'outcome.json', {
+                'status': 'fallback', 'reason': 'The worker stopped, so its instance was terminated'})
+            raise
+        save(folder / 'outcome.json', outcome)
     return 0
 
 

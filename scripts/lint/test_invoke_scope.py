@@ -29,6 +29,7 @@ OOM_SCORE_ADJ = "/proc/self/oom_score_adj"
 
 class VerifyTemporaryParentTests(NixFixture):
     def test_verify_creates_missing_tmpdir_before_environment_loading(self) -> None:
+        _ = (self.work / "Cargo.toml").write_text("[workspace]\n")
         missing = self.root / "session with spaces" / "tmp"
         _ = self.envrc(self.work)
         self.env.update({"TMPDIR": str(missing), "CLAUDE_PYTHON": sys.executable})

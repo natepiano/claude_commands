@@ -426,7 +426,7 @@ def ancestry(request: MergeRequest) -> bool:
 
 
 def change_review_commits(request: MergeRequest) -> list[change_review.Commit]:
-    """The unit's own commits in this checkpoint; hold it when one lacks its Change-Review line."""
+    """Check required review lines and count checkpoints and commits without a descendant checkpoint."""
     previous = request.production.merge_branch
     try:
         commits = change_review.unit_commits(request.production.checkout, request.commit, previous,
@@ -435,7 +435,8 @@ def change_review_commits(request: MergeRequest) -> list[change_review.Commit]:
         raise Stop("change review", "failed", str(error), "the showrunner will inspect the failed command") from error
     if refused := change_review.missing(commits):
         raise Stop("change review", "held", "; ".join(refused), change_review.HELD_NEXT_STEP)
-    report("change review", "ok", f"{len(commits)} unit commit(s) carry their {change_review.TRAILER} lines")
+    selected = change_review.review_commits(commits)
+    report("change review", "ok", f"{len(selected)} unit commit(s) carry their {change_review.TRAILER} lines")
     return commits
 
 

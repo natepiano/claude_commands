@@ -20,6 +20,75 @@ Completed run folders keep their roster files.
 Unit workers retain their native conversations across assignments.
 Staff records identify each worker independently of its current session, run or account.
 A later assignment resumes the same conversation when the worker remains available.
+Codex code review uses read-only review workers.
+The [daily simplify run](simplify-lens.md) uses a fresh Claude review.
+Workers compact between assignments when their recorded context exceeds the configured limit.
+Unit pause, move, and end use staff membership.
+Usage reports compare checkpointed phases through the usage store.
+
+## Pane submission and completion
+
+`assign.sh` returns after successful prompt delivery. Exit 0 means submitted.
+The transcript can record the prompt later.
+A failed delivery command returns an error.
+The transcript prevents replay and proves completion.
+The native hook starts one separate handler process and returns.
+The handler runs once outside the terminal session.
+The pass retains its id, launcher arguments, reply path, and completion actions.
+The director ends its turn after the assigned synchronous review.
+The turn hook sends the director the worker, phase, outcome, and reply path.
+The director reads that reply when the message resumes it.
+
+`scripts/herdr/turn_end.py` serves both families.
+Codex receives `-c notify=[...]` on its launch line.
+Claude receives an asynchronous `Stop` command through launch-line `--settings` JSON.
+The launcher changes no account settings file.
+The hook finds the worker through its native conversation id.
+It follows a per-worker link to the dispatch's existing state file.
+The link lives in `dispatches/<staff id>` beside the staff record.
+This lookup includes dispatches outside the run root.
+Older workers without a link use the held-run lookup.
+A session without a worker pass changes nothing.
+A later event retries unfinished completion steps for a completed pass.
+
+An identical rerun of a completed dispatch sends one completion message through the hook's notice code.
+It saves the reply without typing another prompt.
+This rule also applies to a completed managed Astra review.
+The saved completion includes the reason and pane for a close anomaly.
+A successful completed rerun sets its status file to `done` after it sends the notice.
+Native duplicate hook events still send no second message.
+
+A new Codex worker has no resume argument.
+Its pane session report supplies the first native identity.
+The identity reader excludes only `scripts/herdr/turn_end.py` from the foreground process count.
+Every other foreground process prevents the pane report from proving a sole Codex process.
+
+`worker.dispatch_receipt` owns the completion rule.
+A live detached run holds DONE. A finished run permits completion with an anomaly for an absent transcript result.
+A pending run reply or friend reply keeps the pass active without another prompt.
+A worker puts its question in its reply and ends the turn.
+The turn hook sends that reply to the director.
+An unexpected screen prompt ends no turn, and the director finds it only when it reads the pane.
+A turn without DONE reports `no DONE` when no pending work explains it.
+The completion hook saves the reply, records the exact pass, runs completion actions, and closes the pane.
+`progress_history.complete_dispatch` records both completed passes and failed managed Astra review passes.
+It matches the slot and dispatch instance id before it records an outcome.
+A close anomaly retains the completed outcome and reaches the director in the hook message.
+A held reviewer role remains held after submission. Completion ends that reviewer and releases the role.
+
+Event producers call `handle(WorkerEvent(thread_id, EventKind.RUN_FINISHED))` after a run record reaches `finished`.
+The final diff event uses `EventKind.STAGE_READY` for a review with two stages.
+`detached_runs.py` calls the handler after supervisor completion and orphan completion.
+The director sends the final-diff event with `turn_end.py stage-ready <worker>`.
+
+### Hook input sources
+
+The [Codex notification reference](https://learn.chatgpt.com/docs/config-file/config-advanced#notifications) defines one JSON argument.
+Its fields include `type`, `thread-id`, `turn-id`, `cwd`, `input-messages`, and `last-assistant-message`.
+The event type is `agent-turn-complete`.
+The [Claude Stop reference](https://code.claude.com/docs/en/hooks#stop) defines JSON on stdin.
+Its fields include `session_id`, `transcript_path`, `cwd`, `permission_mode`, `hook_event_name`, `stop_hook_active`, and `last_assistant_message`.
+The hook uses the native id to select the worker. The shared transcript receipt decides completion.
 
 ## Unit code reviewers
 
@@ -100,9 +169,10 @@ An accepted retry prints `unchanged`.
 The launcher retains its original prompt identity and its dispatch record.
 `review.sh` has no pending dispatch check and does not restore a saved extract.
 
-### Claude coordinator and friends
+### Legacy mesh coordinator and friends
 
-`scripts/direct/claude_worker.py` runs the Claude launch steps in the assign process.
+`assign.py.execute_herdr` sends normal assignments through `worker.py` and native worker panes.
+The retained `scripts/direct/claude_worker.py` API runs Claude coordinator steps within its caller's process.
 `assign_claude._run` calls its functions directly.
 The module has no command line or shell protocol.
 It reads `CLAUDE_WORKER_REGISTER_WAIT_SECS` before it stops a source.
@@ -111,14 +181,41 @@ It records the role before delivery.
 Delivery starts one Python child through `scripts/lib/py`.
 The child calls `send.py --to session:<id> --from launcher --file <prompt>`.
 `CLAUDE_WORKER_SEND_SCRIPT` selects the delivery script.
-`assign_claude.py` records the worker after publication.
-The heartbeat watch follows the assign process during the wait.
+
+`assign_claude.run(ClaudeLaunch)` provides the retained coordinator API and its integration fixture entry.
+`ClaudeLaunch.worker` selects `NewClaudeWorker` or `ClaudeFollowUp`.
+`claude_worker.open_worker` and `follow_up` take a `ClaudeTurn`.
+The launch returns `Delivered(native_id, turns_before, launch_environment)`, `Unchanged`, or `NotDelivered(code)`.
+`TurnsNotCounted` represents a new session without an earlier turn count.
+`wait_for_turn` reads Claude agent listings and logs in the same process.
+`CLAUDE_WORKER_POLL_SECS` sets its interval; `UNIT_WORKER_POLL_SECS` overrides it.
+One `nix_env.ensure` supplies the settings and start environment.
+The account step uses `accounts.account_for_unscoped_launch`.
+The banner's `backgrounded` line supplies the native id.
+The registry lookup resolves that id within `CLAUDE_WORKER_REGISTER_WAIT_SECS`.
+`assign_claude._run` records published workers in `finally` before it starts the heartbeat watch.
+The watch follows the coordinator process during the wait.
+A signal after the banner stops an unpublished session through `claude stop`.
+An unreadable log supplies a fallback summary.
+A transcript record without a message object adds no turn.
+The launch uses exit 127 for a missing binary and exit 2 for refusal or failed delivery.
+Other launch failures use exit 1; TERM, INT, and HUP use 143, 130, and 129.
 
 A retry that finds its original user prompt in the transcript records acceptance without another send.
 A complete transcript without that prompt permits delivery.
 A damaged transcript without that prompt refuses uncertain delivery.
 The refusal says `Claude prompt delivery is unknown: transcript has a torn JSON line; resend refused`.
 A missing transcript keeps the published session and places the saved handoff before the assignment.
+
+### Launcher claims
+
+`worker_state.publish_worker_claim` writes `impl_claim_<slot>.json` atomically.
+The record holds `pid`, `worker`, and the process start in `started` when available.
+An unreadable start prints an anomaly and leaves `started` absent.
+`read_worker_claim` returns `HeldWorkerClaim(pid)` when the start matches or the current start cannot be read.
+It returns `EndedWorkerClaim` for a gone process, zombie, changed start, or missing recorded start.
+An absent or malformed record, or a record without a positive pid, gives `NoWorkerClaim`.
+Claim release compares the recorded pid with the launcher pid.
 
 ### Account selection
 
@@ -255,6 +352,16 @@ Ending an uncertain creation can record an empty id when no worker exists.
 It refuses a matching active design that needs recovery.
 `list` returns damaged record problems alongside readable roles.
 
+`DamagedDesignRecord` identifies the record path and damaged field.
+Holder-aware scans decide whether matching damage prevents the requested operation.
+Writes validate the complete design before publication.
+An omitted binding repository uses the authority checkout; an empty repository refuses.
+`rebind --unbind` or a complete replacement binding can repair an empty repository under the generation lock.
+Unrelated damaged records produce one warning per operation and do not stop other holders.
+`unbind-run` refuses matching damage, including damage without a live role.
+Plain `list` keeps diagnostics on stderr; JSON retains `problems`.
+An identical `rebind` retry completes only after launch context and census publication agree.
+
 ### Operations
 
 `open` reserves placement, checks the binding and records creation intent before launch.
@@ -326,6 +433,13 @@ The claim permits one `dispatch_turn` call through `assign.sh --target durable-d
 Success removes only the included pending messages.
 Failure retains pending input and records recovery state.
 A role's `send` queues text for its next authorized assignment without waking the role.
+An unbound design opens `astra-review` only when that phase is closed.
+Each `dispatch_turn` records `finish-phase` after assign returns, with `completed` or `error`.
+A failed recording after refusal preserves the dispatch refusal text.
+Ending an active unbound design records `finish-run --status completed` under the lock.
+A phase-bound design uses the unit run and records no separate design phase.
+The one-shot managed review closes its phase and run in `assign.py` after worker cleanup.
+`worker.dispatch` owns successful pass completion; `assign.py` records pass failure only.
 Detached command results use `detached_runs.deliver` and `send.deliver_worker_text`.
 The result carries `Detached run: <run_id>` as its stable marker.
 Under a per-run delivery lock, `detached_runs.deliver` checks the worker transcript for that marker.

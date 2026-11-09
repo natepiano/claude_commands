@@ -23,7 +23,7 @@ from scripts.message.repeat_guard_test_support import install_guard_test_budget
 
 
 PRIVATE_DELIVERY = """import json, os, sys
-sys.path.insert(0, os.environ["TEST_DETACHED_PACKAGE"])
+with open(os.environ["TEST_DETACHED_PACKAGE"] + "/scripts/lib/package_root.py") as package_root: exec(package_root.read(), {"__file__": package_root.name})
 from pathlib import Path
 from unittest.mock import patch
 from scripts.agents import detached_runs
