@@ -150,7 +150,7 @@ class ScopeActivityReader:
         command = self.command(pid)
         names = {Path(arg).name for arg in command}
         if ("verify.sh" in names or runs_suite_runner(command)
-                or "mesh_runs.py" in names and "supervise" in command):
+                or "detached_runs.py" in names and "supervise" in command):
             return LiveBuildRun(pid, self.processes[pid].start, self.started_at(pid))
         return inherited
 

@@ -190,8 +190,22 @@ The next standing use resets its tree.
   --repo ~/worktrees/claude-build-followups-verify
 ```
 
-`list` prints one row per tree: path, owner, repo, commit, busy or idle, last
-holder pid, and target size. `remove` removes the caller's trees
+`list` prints a tab-separated header, then numbered local trees followed by remote mirrors sorted by host and path. The header is `number owner repository host path session commit state holder_pid target`.
+Local host values come from `socket.gethostname()`.
+An unreadable `.gate.json` keeps a numbered row with state `unreadable` and owner `unavailable`.
+Its repository comes from the parent folder, unavailable fields use `-`, and stderr names the error. The owner column shows the current
+staff name, a role name, or `unavailable`. A local row shows its commit, busy
+or idle, the last holder pid and the target size. A remote row shows `held`,
+`idle` or `unavailable`. A held row names the holder session only when the
+lease pid equals the recorded `holder_pid`; otherwise it shows `not recorded`.
+`ListStaffNames` reads `staff.local_snapshot()` at most once, when a row needs it.
+Owner and session display use that same snapshot without changing folder identities.
+`list_remote_leases` reads `/proc/locks` once and reads each lease file's device key.
+A missing lease file means idle. Other lease-file errors or an unreadable lock table mean unavailable.
+Without `/proc/locks`, macOS lists remote lease state as unavailable.
+A lease holder without a staff match remains held, with its holder name unavailable.
+PID equality supplies display evidence; it does not authorize cleanup.
+`remove` removes the caller's trees
 across all repositories. An optional `--repo R` limits removal to that repository.
 The Python API accepts only a `RepositoryScope` value for `repo`.
 `copies.remove_trees(owner)` uses `AllRepositories()` by default.
@@ -258,7 +272,40 @@ PreToolUse Bash dispatcher refuses direct repository cloning, worktree
 creation, and recursive repository copying. Its refusal gives a `copies.py run` example and the `make_worktree.sh <path> <branch>` command for a lasting phase tree.
 Run that command from the source repository. The repository scan applies the same allow list to script code.
 
-The guard distinguishes no forbidden operation, a specific detected repository-tree operation, and an unresolved relevant operation. One invocation decoder handles shell commands, tool argv and Python subprocess vectors. It distinguishes command text, stdin programs, script/module operands and informational invocations using interpreter-specific option semantics: CPython options and operands, Bash/Zsh invocation options, and portable POSIX sh meanings. Script stdin and informational invocation input are data, while executable outer expansions are inspected before exemptions. Ordered descriptor duplication through <& and >&, moves, closure and replacement determine selected stdin; an unknown selected input refuses with a specific unresolved reason. Nested parsing distinguishes program, array word-list, parameter and arithmetic context. Literal data stays data while executable substitutions are inspected recursively. Runtime unresolved relevant programs refuse; static abstract analysis may defer unknown interpreter input to concrete call sites. Known gaps remain interprocedural analysis, generated programs such as bash -c "$(printf ...)", aliases and sourced files. Supported syntax is bounded by the documented tested forms rather than a claim to implement every shell dialect.
+The guard distinguishes a detected tree-making operation from an unresolved relevant input and an allowed operation.
+Only a detected tree-making operation adds the `copies.py` instruction.
+An unresolved input names the value that the guard could not read.
+A known tree-making operation keeps its refusal when another input is unresolved.
+
+`shell_syntax.py` distinguishes literal words from expanded words.
+The guard maps these to `KnownArgument` and `UnknownArgument`, while retaining known text.
+A lexer error resumes at the next command separator.
+No `bash -n` process runs for each hook call.
+Interpreter decoding distinguishes program text, stdin programs, script operands, modules, and informational input.
+Descriptor duplication, moves, closure, and replacement determine the selected stdin.
+Literal data remains data. Executable substitutions receive a recursive check.
+Unknown relevant runtime input refuses; static analysis can defer unknown function input to concrete calls.
+Python import bindings share one scope model.
+Deferred functions use a queue of function and execution pairs, so call order cannot hide a maker.
+
+Later assignments replace earlier values.
+Branches and loops merge values into flattened, deduplicated `ArgumentChoices`.
+`guard_choice_limit=32` bounds combinations for one command.
+Above that limit, `UnresolvedChoices.choice_texts` retains dropped text through one linear walk.
+`ProgramWithChoiceTexts` carries this text through `eval`, `bash -c`, and `python -c`.
+A program with no tree-making word passes.
+Known or retained tree-making text refuses with `cannot resolve interpreter program choices`.
+An unknown executable in a tree-making position keeps its unresolved-executable refusal.
+The required-key reader uses the repository configuration when an override omits `guard_choice_limit`.
+
+Expanded Python that does not parse passes unless its known text contains a tree-making word.
+That case refuses with `cannot parse Python program`.
+Supported syntax covers the tested forms, rather than every shell dialect.
+Aliases, sourced files, generated programs, and interprocedural analysis retain known limits.
+Above the choice limit, a tree word split across a literal and a dropped value can pass.
+An unset source or Git path inside interpreter text can also pass when its top-level command would refuse.
+[Pending verify work](../plans/natedev-verify-next.md) records these limits.
+`test_branch_arguments_require_linear_invocation_work` checks the branch-analysis work bound.
 
 | Allowed creator | Reason |
 | --- | --- |
@@ -330,3 +377,33 @@ It removes the Mac's `localhost` record before the natedev record.
 A failed clone cleanup keeps both records.
 A marked mirror probe starts no remote Python and skips `mirror_local_path`.
 An unmarked probe keeps the existing path check and metadata creation.
+
+## Original worktrees and landing
+
+`make_worktree.sh <path> <branch>` calls `worktrees.py make` from the source repository.
+`config/copies.conf` permits both original-worktree helpers.
+The helper creates the Git worktree and records it under `~/.local/state/worktrees/made/<path hash>.json`.
+The path hash uses SHA-256.
+`WORKTREES_STATE_DIR` selects private state.
+`WorktreeRecord` holds version, path, branch, repository, base, merge branch, owner, and creation time.
+A failed record write removes the new tree and branch.
+
+The caller's staff row supplies its owner and merge branch.
+Without a staff row, the helper uses `origin/HEAD` and an empty owner.
+Without `origin/HEAD`, it records an empty merge branch, so a production merge does not end that tree.
+
+`landed(record)` returns `Landed` or `NotLanded(commits, paths)`.
+It accepts patch-equivalent commits, merge commits, and commits that change only `docs/plans/`.
+Each other changed path must match the merge branch or have a newer change on that merge branch.
+
+After a successful merge-branch push, `merge_checkpoint.py` calls `end_landed(repo, merge_branch)`.
+It reports `Ended` or `Kept` as a `worktrees` step.
+It keeps a staff-held tree, a dirty tree, a different checked-out branch, and work that has not landed.
+A kept tree does not fail the merge.
+An eligible tree ends through worktree removal, local and origin branch deletion, then record deletion.
+Missing paths or branches allow a retry to complete an interrupted end.
+The main checkout is the first entry from `git worktree list`.
+
+There is no `end` command, sweep command, timer, or session-end cleanup for these original trees.
+The successful landing operation owns their end.
+Tests that call the helper must set a private `WORKTREES_STATE_DIR`.

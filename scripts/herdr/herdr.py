@@ -19,6 +19,9 @@ try:
 except FileNotFoundError:
     pass
 
+import base64
+import secrets
+import struct
 import json
 import hashlib
 import ctypes
@@ -42,7 +45,7 @@ from enum import Enum, StrEnum
 from datetime import datetime, timezone
 from pathlib import Path
 from collections.abc import Callable, Generator, Iterable, Mapping, Sequence, Set
-from typing import TYPE_CHECKING, Literal, NamedTuple, Never, NotRequired, TypedDict, TypeVar, cast, final, override
+from typing import TYPE_CHECKING, Literal, NamedTuple, Never, NotRequired, TypedDict, TypeVar, Protocol, cast, final, override
 
 
 from scripts.herdr import pane_launch
@@ -2173,10 +2176,10 @@ class Herdr:
         """Return the sole foreground Codex PID, or zero for other foreground work."""
         info = json_object(self.result("pane", "process-info", "--pane", pane).get("process_info"),
                            "pane process info")
-        if not codex_without_session(info):
+        foreground = _codex_foreground(info)
+        if len(foreground) != 1:
             return 0
-        foreground = json_items(info.get("foreground_processes"), "native foreground processes")
-        pid = json_object(foreground[0], "native foreground process").get("pid")
+        pid = foreground[0].get("pid")
         if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
             raise HerdrFailure("native process pid is unavailable")
         return pid
@@ -2208,7 +2211,10 @@ class Herdr:
             arguments = _foreground_arguments(process)
             if any(_is_agent_process(arguments, kind) for kind in ("claude", "codex")):
                 pid = cast(int, process["pid"])
-                processes.append(reader.identity(pid))
+                try:
+                    processes.append(reader.identity(pid))
+                except _StartupProcessGone as error:
+                    raise HerdrFailure(f"{pane}: {error}") from error
         if len(processes) != 1:
             raise HerdrFailure(f"{pane}: expected one foreground agent process")
         row = self.pane_row(pane)
@@ -2596,7 +2602,6 @@ class Herdr:
         return agents
 
 
-
 def _pane_process_ids(info: dict[str, object], context: str) -> tuple[int, int]:
     values = (info.get("shell_pid"), info.get("foreground_process_group_id"))
     if any(isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0 for pid in values):
@@ -2613,11 +2618,22 @@ def pane_session(row: Mapping[str, object]) -> str:
     return session if isinstance(session, str) else ""
 
 
+def _codex_foreground(info: dict[str, object]) -> list[dict[str, object]]:
+    """Select a sole Codex process after excluding the turn-end hook."""
+    foreground: list[dict[str, object]] = []
+    for value in json_items(info.get("foreground_processes"), "native foreground processes"):
+        process = json_object(value, "native foreground process")
+        arguments = _foreground_arguments(process)
+        program = (arguments[1] if len(arguments) > 1 and Path(arguments[0]).name.startswith("python")
+                   else arguments[0] if arguments else "")
+        if Path(program).parts[-3:] != ("scripts", "herdr", "turn_end.py"):
+            foreground.append(process)
+    return foreground if len(foreground) == 1 and is_codex_process(_foreground_arguments(foreground[0])) else []
+
+
 def codex_without_session(info: dict[str, object]) -> bool:
     """Identify one foreground Codex that can supply a session report."""
-    foreground = json_items(info.get("foreground_processes"), "native foreground processes")
-    return len(foreground) == 1 and is_codex_process(
-        _foreground_arguments(json_object(foreground[0], "native foreground process")))
+    return len(_codex_foreground(info)) == 1
 
 
 def pane_native_process(info: dict[str, object], kind: str,
@@ -3476,8 +3492,8 @@ def codex_pane_process(pid: int, place: HerdrPlace) -> NativeAgentProcess:
     client = Herdr(place.session)
     info = json_object(client.result("pane", "process-info", "--pane", place.pane).get("process_info"),
                        "Codex pane process info")
-    foreground = json_items(info.get("foreground_processes"), "Codex foreground processes")
-    if codex_without_session(info) and json_object(foreground[0], "Codex foreground process").get("pid") == pid:
+    foreground = _codex_foreground(info)
+    if len(foreground) == 1 and foreground[0].get("pid") == pid:
         pane = client.pane_row(place.pane)
         if not isinstance(pane, NoPane):
             try:
@@ -3589,13 +3605,127 @@ class CodexConversations:
     unknown: tuple[str, ...]
 
 
+@final
+class LoadedThreadRpc:
+    """Read native loaded-thread replies within one deadline."""
+
+    def __init__(self, port: int, deadline: float) -> None:
+        self.deadline: float = deadline
+        self.connection: socket.socket = socket.create_connection(("127.0.0.1", port), timeout=self.remaining())
+        self.buffer: bytearray = bytearray()
+        self.counter: int = 0
+        try:
+            key = base64.b64encode(secrets.token_bytes(16)).decode()
+            self.connection.sendall((f"GET / HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n"
+                f"Upgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {key}\r\n"
+                "Sec-WebSocket-Version: 13\r\n\r\n").encode())
+            while b"\r\n\r\n" not in self.buffer:
+                self.receive()
+            header, _, rest = self.buffer.partition(b"\r\n\r\n")
+            if b" 101 " not in header.split(b"\r\n")[0]:
+                raise ValueError("server refused the websocket handshake")
+            self.buffer = bytearray(rest)
+            _ = self.call("initialize", {"clientInfo": {"name": "staff-observe", "version": "1.0"},
+                                         "capabilities": {"experimentalApi": True}})
+        except BaseException:
+            self.connection.close()
+            raise
+
+    def remaining(self) -> float:
+        if time.monotonic() >= worker_lifecycle.effective_deadline():
+            raise worker_lifecycle.OperationDeadlineExpired("shutdown incomplete: RPC operation deadline expired")
+        remaining = min(self.deadline, worker_lifecycle.effective_deadline()) - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("loaded-thread observation timed out")
+        return remaining
+
+    def receive(self) -> None:
+        self.connection.settimeout(self.remaining())
+        data = self.connection.recv(262144)
+        if not data:
+            raise ConnectionError("server closed the connection")
+        self.buffer.extend(data)
+
+    def take(self, size: int) -> bytes:
+        while len(self.buffer) < size:
+            self.receive()
+        data = bytes(self.buffer[:size])
+        del self.buffer[:size]
+        return data
+
+    def call(self, method: str, params: dict[str, object], timeout: float = math.inf) -> dict[str, object]:
+        deadline = self.deadline
+        self.deadline = min(deadline, time.monotonic() + timeout)
+        try:
+            self.counter += 1
+            data = json.dumps({"jsonrpc": "2.0", "id": self.counter, "method": method, "params": params}).encode()
+            mask = secrets.token_bytes(4)
+            length = len(data)
+            header = bytes((0x81, 0x80 | length)) if length < 126 else (
+                bytes((0x81, 0xFE)) + struct.pack(">H", length) if length < 65536
+                else bytes((0x81, 0xFF)) + struct.pack(">Q", length))
+            self.connection.settimeout(self.remaining())
+            self.connection.sendall(header + mask + bytes(byte ^ mask[index % 4] for index, byte in enumerate(data)))
+            while True:
+                header = self.take(2)
+                length = header[1] & 0x7F
+                if length in (126, 127):
+                    length = int.from_bytes(self.take(2 if length == 126 else 8), "big")
+                payload = self.take(length)
+                if header[0] & 0x0F == 8:
+                    raise ConnectionError("server sent close")
+                if header[0] & 0x0F not in (1, 2):
+                    continue
+                message = cast(object, json.loads(payload))
+                if not isinstance(message, dict):
+                    continue
+                reply = cast(dict[str, object], message)
+                if reply.get("id") != self.counter:
+                    continue
+                return reply
+        finally:
+            self.deadline = deadline
+
+
+class LoadedThreadClient(Protocol):
+    def call(self, method: str, params: dict[str, object], timeout: float = ...) -> Mapping[str, object]: ...
+
+
+def loaded_threads(client: LoadedThreadClient, deadline: float) -> set[str]:
+    """Read every loaded-thread page before the supplied deadline."""
+    threads: set[str] = set()
+    cursor = ""
+    seen: set[str] = set()
+    while time.monotonic() < deadline:
+        response = client.call("thread/loaded/list", {"cursor": cursor} if cursor else {},
+                               timeout=max(0.01, deadline - time.monotonic()))
+        if response.get("error"):
+            raise ValueError(f"thread/loaded/list failed: {response['error']}")
+        result = response.get("result")
+        listed = cast(dict[str, object], result) if isinstance(result, dict) else {}
+        data = listed.get("data")
+        if not isinstance(data, list):
+            raise ValueError("server returned no loaded-thread list")
+        for item in cast(list[object], data):
+            if not isinstance(item, str) or not item:
+                raise ValueError("server returned an invalid loaded-thread id")
+            threads.add(item)
+        next_cursor = listed.get("nextCursor")
+        if next_cursor is None or next_cursor == "":
+            return threads
+        if not isinstance(next_cursor, str) or next_cursor in seen:
+            raise ValueError("server returned an invalid loaded-thread cursor")
+        cursor = next_cursor
+        seen.add(cursor)
+    if time.monotonic() >= worker_lifecycle.effective_deadline():
+        raise worker_lifecycle.OperationDeadlineExpired("shutdown incomplete: RPC operation deadline expired")
+    raise ValueError("loaded-thread list timed out")
+
+
 @observation_snapshot()
 def codex_conversations(*, wanted: str = "") -> CodexConversations:
-    from scripts.lib import unit_runs
     from scripts.message import codex_daemon
 
-    # A static import would close the cycle codex_mesh -> session_staff -> herdr -> codex_mesh.
-    loaded_threads = cast(Callable[[Path, float], set[str]], import_module("scripts.agents.codex_mesh").loaded_threads)
     candidates: list[tuple[int, list[str]]] = []
     unknown: list[tuple[int, str] | str] = []
     process_root = _proc_root()
@@ -3657,25 +3787,12 @@ def codex_conversations(*, wanted: str = "") -> CodexConversations:
         else:
             for session in observed:
                 _ = live.setdefault(session.thread_id, ())
-    runs: set[Path] = set()
-    for root in (*unit_runs.run_roots(os.environ.get("ROSTER_RUN_ROOT")), unit_runs.ASTRA_RUN_ROOT):
-        runs.update(path.parent for path in root.glob(f"*/{unit_runs.SERVER_FILE}"))
-    server_pids: set[int] = set()
-    for run in runs:
-        try:
-            pid = worker_lifecycle.read_json_object(run / unit_runs.SERVER_FILE).get("pid")
-            if isinstance(pid, int):
-                server_pids.add(pid)
-        except (OSError, ValueError):
-            pass
     for pid, arguments in candidates:
         if not is_codex_process(arguments) or codex_managed_daemon(arguments):
             continue
         environment: dict[str, str] | None = None
         try:
             environment = process_environment(pid)
-            if run := environment.get("UNIT_RUN_DIR"):
-                runs.add(Path(run))
             observed = native_process(pid, "codex")
             if isinstance(observed.identity, LaunchArgument):
                 add_unknown(pid, "Codex thread unknown")
@@ -3686,23 +3803,12 @@ def codex_conversations(*, wanted: str = "") -> CodexConversations:
             continue
         except (HerdrFailure, OSError, ValueError):
             if environment is not None:
-                if "app-server" in arguments:
-                    if environment.get("UNIT_RUN_DIR") or pid in server_pids:
-                        # The run read below resolves the threads of a server in a run.
-                        continue
-                elif "--no-daemon" not in arguments:
+                if "--no-daemon" not in arguments:
                     home = Path(environment.get("CODEX_HOME", str(Path.home() / ".codex"))).expanduser()
                     if home in daemon_reads:
                         # A failed daemon read already has one note for its account.
                         continue
             add_unknown(pid, "Codex thread unknown")
-    deadline = time.monotonic() + operation_deadline.remaining(PROGRAM_TIMEOUT_SECONDS)
-    for run in sorted(runs):
-        try:
-            for identity in loaded_threads(run, deadline):
-                _ = live.setdefault(identity, ())
-        except (OSError, ValueError) as error:
-            unknown.append(f"{run.name} (Codex hosted threads unknown: {error})")
     if wanted in live:
         return CodexConversations(live, ())
     return CodexConversations(live, tuple(

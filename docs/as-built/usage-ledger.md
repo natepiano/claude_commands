@@ -7,7 +7,7 @@ Each request records token classes, model, effort, and the role held at that tim
 The same store records runs, phases, reviews, findings, checkpoints, compactions, readings, and account-role changes.
 Named SQL queries compare usage across roles, models, and outcomes.
 The assignment log preserves role history independently of temporary run folders.
-The [worker design](long-lived-workers.md#roster-fields) defines the staff references in current run records.
+The [worker design](long-lived-workers.md#staff-membership-and-dispatch) defines the staff references in current run records.
 
 ## How it works
 
@@ -33,11 +33,10 @@ The code that assigns a role records it when it assigns it, in an append-only `<
 | `scripts/direct/prepare_session.sh` | `director`, under `CLAUDE_CODE_SESSION_ID` |
 | `scripts/production/update_registration.py register` | `showrunner`, at every showrunner start and resume |
 | `scripts/direct/claude_worker.py` | Records the dispatch role under the full destination id before delivery. A call without a role records nothing, so the session stays `interactive`. |
-| `scripts/agents/codex_mesh.py` | the worker's role and `--lens` on a new thread and on a follow-up claim; the previous role again when a claim is released |
-| `scripts/direct/review.sh` | Passes `--lens` to `codex_mesh.py`; records each fresh simplify session as `review` with lens `simplify`. |
+| `scripts/direct/review.sh` | Records each fresh review session as `review` with its lens. |
 | `scripts/hooks/session-start-agents-log.py` | `subagent` for a payload with a non-empty `agent_id`, else `interactive` for `session_id`, through `register_default` |
 
-The hook is registered twice in `settings.json`, with the command `"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/hooks/session-start-agents-log.py"`: in the `hooks.SessionStart` entry with no `matcher` (startup, resume, clear, compact) and in a `hooks.SubagentStart` entry with no `matcher`. `SubagentStart` delivers the parent `session_id` and the `agent_id` before the subagent's first request; `SessionStart` does not fire for a subagent. The lens lives only in `agents.jsonl`, never in `mesh_roster.json`.
+The hook is registered twice in `settings.json`, with the command `"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/hooks/session-start-agents-log.py"`: in the `hooks.SessionStart` entry with no `matcher` (startup, resume, clear, compact) and in a `hooks.SubagentStart` entry with no `matcher`. `SubagentStart` delivers the parent `session_id` and the `agent_id` before the subagent's first request; `SessionStart` does not fire for a subagent. The lens lives in `agents.jsonl`.
 
 `backfill` reads surviving run rosters through one staff snapshot.
 It resolves each entry's current session and worker name through staff.
@@ -74,7 +73,7 @@ Defaults: `<state_dir()>/usage.db`, machine `natedev`, `~/.claude/projects`, `~/
 
 **Request activity** (`scripts/usage/activity.py`, standard library only, shipped to the Mac). Each request is `Working() | Waiting(action) | PostingStatus()`, decided from atoms of the request's items: a final answer or any work atom makes it work; else any wait atom makes it wait, named by the first; else any status atom makes it a status post; else work. A Codex request's items are the `response_item` lines before its `token_count` record (`CodexContext.evidence`, also in the replayed prefix); a Claude request's are the lines of one message key, so a multi-line message takes the merged result and the merge `UPDATE` replaces `activity` and `wait_action`. A re-read Codex row that conflicts sets them with an `UPDATE` and does not count as added.
 
-- Shell commands come from Claude `Bash` and Codex `exec_command` `cmd`. The parser removes heredoc bodies and replaces separators in quoted text with `_`. It removes `/dev/null` redirections and file descriptor duplication. It makes one atom per statement, split at `&&`, `||`, `;`, newline, or `&`. A pipe into a command outside the filter list counts as work. The filters are `grep head tail wc awk sed sort uniq cut tr jq rg cat`. A filter with `>` also counts as work. The commands `sleep`, `wait`, `board.sh read`, and `tail` without `>` count as wait. The commands `cat`, `grep`, `rg`, `wc`, `stat`, and `head` count as wait when they read a status file. Status files include `.log .out .output .status .exit .rc .done .pid .code`, `/proc/loadavg`, `sentinel`, `marker`, and `exit_code`. The commands `test`, `[`, `[[`, `ps`, `pgrep`, and `kill -0` also count as wait. Both `board.sh post <dir> <who> status` and `board.sh post <who> status` count as status posts. An explicit `<dir>` starts with `/`; the form without a folder uses `UNIT_RUN_DIR`. The commands `echo`, `cd`, `done`, and the other neutral words add nothing. All other commands count as work.
+- Shell commands come from Claude `Bash` and Codex `exec_command` `cmd`. The parser removes heredoc bodies and replaces separators in quoted text with `_`. It removes `/dev/null` redirections and file descriptor duplication. It makes one atom per statement, split at `&&`, `||`, `;`, newline, or `&`. A pipe into a command outside the filter list counts as work. The filters are `grep head tail wc awk sed sort uniq cut tr jq rg cat`. A filter with `>` also counts as work. The commands `sleep`, `wait`, `board.sh read`, and `tail` without `>` count as wait. The commands `cat`, `grep`, `rg`, `wc`, `stat`, and `head` count as wait when they read a status file. Status files include `.log .out .output .status .exit .rc .done .pid .code`, `sentinel`, `marker`, and `exit_code`. These status words match only the file name. `/proc/loadavg` matches anywhere in the path. The commands `test`, `[`, `[[`, `ps`, `pgrep`, and `kill -0` also count as wait. Both `board.sh post <dir> <who> status` and `board.sh post <who> status` count as status posts. An explicit `<dir>` starts with `/`; the form without a folder uses `UNIT_RUN_DIR`. The commands `echo`, `cd`, `done`, and the other neutral words add nothing. All other commands count as work.
 - Codex: an `exec` custom tool call with `setTimeout(` waits; one calling any tool but `exec_command`/`write_stdin` works; an empty `chars` (or a `write_stdin` with none) waits as `empty write_stdin`; each `cmd` is classified as shell. `function_call` `sleep` and `wait` wait (`sleep tool`, `wait tool`); every other item type except messages, reasoning and outputs works.
 - Claude: `Read` of a status file waits (`Read *.output`); every other tool use works; a text-only message is work.
 - The Mac wire carries `activity` and `wait_action`; `remote_measurement` decodes them strictly (`decode_activity`) and a missing or invalid pair is a failed read.
@@ -191,6 +190,99 @@ A new metric, dimension or outcome is one registry entry. The report reads `turn
 
 **Output**, in order: `<metric> — <description>`; the bounds, the zone and, under `--exact`, `exact evidence only`; the table (dimension columns, numerator, denominator, value; a zero denominator gives `—`, a group with no weighted turn reads `unweighted`); `Coverage` (weighted usage and turns per attribution with shares; `Unweighted:` with each model lacking a weight entry and its turn count; review turns with lens `unrecorded`; `Turns with unclassified activity: <n>.`; outcome rows with unit `unknown`); `Sources` (one row per `turn_sources` and `role_log_sources` row, each source not `ready` first under `Not read in full:`, times in the zone or `never`). With no turn in range the report prints its headers, `No turns in range.` and `Sources`. `report_data`, `render_report` and `sources(db, zone)` are the pieces other readers call.
 
+### Context economy
+
+`scripts/usage/context_economy.py` reads context measurements on demand.
+`scripts/usage/context_economy_read.py` holds the readers: `read_claude`, `read_mac`, `read_codex`, `settings_timeline`, `settings_for` and `role_of`.
+`/context_economy` (`commands/context_economy.md`) defaults to `report`, also when its first argument starts with `--`.
+The CLI has `report`, `save`, `compare` and `trend`; `report` takes `--role` and `--by settings|week`.
+The default window covers the last seven days.
+Bounds use `scripts.lib.user_zone.user_zone`.
+
+The inputs are read at run time:
+
+1. Claude transcripts supply requests, starts, compactions, models, and CLI versions.
+   Requests are deduplicated by (`message.id`, `requestId`); records with model `<synthetic>` are not requests.
+   A Claude Code restart does not always write a `SessionStart:resume` hook record, so a change of the record `version` also counts as a resume start.
+2. Codex rollouts supply requests, thread openings, models from `turn_context`, and versions from `session_meta`.
+3. Each machine's checkout HEAD reflog supplies settings times and tracked file values.
+   `main` moves by fast-forward, so commit times are late; only the reflog gives the time the live files changed.
+   `CONTEXT_ECONOMY_CHECKOUT` sets the checkout; its default is `~/.claude`.
+4. The local usage ledger supplies roles; `weights.weighted` supplies dated request costs.
+
+`config/context_economy.conf` names the tracked settings, files, and thresholds.
+Each measurement uses the settings at its session's latest start.
+Groups carry the machine, family, settings set, role, and model.
+The tables include a `machine` column.
+`--family claude|codex|all` selects the family; its default is `all`.
+Repeated `--where KEY=JSON` arguments select settings values on `report`, `save`, and the current side of `compare`.
+The comparison keeps JSON types: `false` never matches `0`, including inside arrays and objects.
+An absent key differs from explicit JSON null.
+A settings label shows `key=<absent>` when a key disappears.
+
+Each quantity reports n, median, mean, p25, and p75:
+
+| Quantity | Measurement |
+| --- | --- |
+| `fresh_start` | Context of the first request after a startup inside the window. |
+| `after_compaction` | Context of the first request after a compaction. |
+| `at_compaction` | Reported context size before compaction. |
+| `context_per_request` | Input plus cache reads and cache writes. |
+| `cost_per_request` | The request's dated weighted token cost. |
+| `requests_per_cycle` | Requests between two compactions of one agent. |
+| `compactions_per_active_hour` | Compactions divided by active hours; only request gaps below `active_gap_seconds` count. |
+| `precomputed_share` | Precomputed compactions divided by precomputed plus normal compactions. |
+
+Codex requests count once per change of `total_token_usage`.
+Linked Codex homes read each resolved rollout once.
+Codex compactions carry `SizeNotReported` and add no size samples.
+`cost not weighted: <n> requests (<models>)` names requests without known model weights.
+Those requests remain in context quantities and contribute no cost samples.
+`left out:` counts whole sessions below `min_requests`, which defaults to 20 requests in the window.
+Resumes do not split this count or discard compaction pairs.
+
+The Mac reader uses one SSH call.
+It sends the reader modules to `python3 -c` (`collect.bootstrap_program`); the Mac prints JSON lines and writes nothing.
+`CONTEXT_ECONOMY_MAC_COMMAND` (a JSON list) replaces the SSH command, for tests and a forced failure.
+`mac_timeout_seconds` in `config/context_economy.conf` limits it to 300 seconds by default.
+A failed read prints `mac: <reason>` on `report` and `save`; local measurements remain available.
+An empty Mac result is a successful read.
+Saved results hold `"mac": {"state": "read"}` or `"mac": {"state": "failed", "reason": "<reason>"}`.
+`trend` marks failures with `mac failed`.
+An older result without the field reads as Mac unknown and has no mark.
+
+Only named results are written, under `<state_dir()>/context_economy/<name>.json`.
+`USAGE_STATE_DIR` overrides `state_dir()`; its default is `~/.local/state/usage-model`.
+`save NAME` publishes a complete temporary file and refuses an existing name.
+Results retain settings, bounds, machine and family, roles, models, versions, request counts, quantities, and the Mac outcome.
+`compare NAME` pools by role and quantity, prints both sample sizes, and names changed settings, CLI versions, models, machines, and families under `confounds:`.
+A side with fewer than ten samples prints `too few` instead of a percentage change.
+`trend` reads saved results in time order, also after transcripts disappear.
+Without `--role`, it includes empty results with zero requests, blank quantities, and their Mac mark.
+With `--role`, it omits results without that role.
+
+`save --last-week` names the previous complete ISO week `week-<ISO year>-W<week>`.
+Its bounds are Monday 00:00 through the next Monday 00:00 in the user zone.
+It takes no name, explicit time bounds, `--where`, or `--family` other than `all`.
+An existing week with a successful or unknown Mac state prints its path and exits 0 before any reader runs.
+A week with a failed Mac state retries its reads.
+A successful Mac retry replaces the complete result atomically.
+Another failed Mac read keeps the file unchanged, prints the path and `mac: <reason>`, and exits 0.
+The Linux `context-economy.nix` module declares `nate.jobs.context-economy` for natedev's user.
+It runs at login and every 86400 seconds with `save --last-week`.
+The job writes only `week-*` results and sends no message.
+
+The experiment names are `precompute-on-2026-11` and `precompute-off-2026-11`.
+Every experiment save, threshold read, and comparison uses `--family claude`.
+The ON save uses `--family claude --since 2026-11-01 --until 2026-11-08T12:36`.
+Precompute ON was the default while `precomputeCompactionEnabled` was absent.
+Commit `46471082e` added the key at 2026-11-08 12:36.
+`--where` cannot select an absent key.
+The OFF save selects `--where precomputeCompactionEnabled=false` after role `director` has at least 30 `requests_per_cycle` samples.
+Until that threshold, no OFF result is saved; on 2026-11-09 the director n was 8.
+
+The default `report` (seven days, both families, natedev and the Mac) measured 202.8 seconds on 2026-11-09.
+
 ### Worker readout: `scripts/whoami/worker_usage.py`
 
 `scripts/lib/py scripts/whoami/worker_usage.py [--db PATH] (--daily [--t-live WHEN] | --before START END --after START END)` compares Codex usage per checkpointed phase before and after long-lived workers went live (`DEFAULT_T_LIVE` 2026-10-10T18:17Z). It is a view over the store: no rollout, ssh, git or readings file. Rows cover `family = 'codex'` threads on both machines (a thread is one `machine, parent_id, agent_id`). Columns: threads opened, weighted usage, before-first-edit share, compactions with compactions per active thread (a thread with any opening, turn, edit or compaction in the piece), checkpointed phases, account switches per week and credits per day.
@@ -233,7 +325,7 @@ The script prints nothing when no alert applies.
   The `effective_context_window_percent` value controls usable input space and does not change the compaction limit.
   Source: [ModelInfo::auto_compact_token_limit](https://github.com/openai/codex/blob/rust-v0.166.0/codex-rs/protocol/src/openai_models.rs#L522-L544).
   The script silently omits models with unreadable required values.
-  The usage ledger cannot distinguish mesh threads with launch overrides from pane threads.
+  The usage ledger cannot distinguish historical launch settings from pane settings.
   The script therefore uses the model rule for all threads.
   One unit alert can contain both context findings and waiting findings.
 - **Message**: the first line reports the waiting share or the context finding.
@@ -248,22 +340,6 @@ The script prints nothing when no alert applies.
 ### Timer
 
 The hourly pass lives outside this repository, in `/etc/nixos/modules/linux/usage-collect.nix` (`nate.jobs.usage-collect`, `intervalSeconds = 3600`, `TimeoutStartSec = "45min"`): `exec "$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/usage/collect.py"` with the user's PATH, one hour after the last pass ended and one hour after login. The collector's only message is the waste watch's alert to a showrunner; its output, and any alert with no showrunner, goes to the journal. It takes effect at a NixOS rebuild.
-
-### Worker roster guards in `scripts/agents/codex_mesh.py`
-
-The roster stores the context size that controls launcher compaction.
-Staff resolves the current thread; the assignment log supplies the role.
-The [worker design](long-lived-workers.md#roster-fields) defines the stored fields and ownership rules.
-Conditional writes prevent an earlier thread or compaction from replacing a newer record.
-These writes do not enter the usage store.
-
-- `_update_roster_if_expected(session_dir, name, record, expected) -> bool` compares and writes inside one `fcntl.flock` section.
-  `ExpectedRoster` names the expected thread, active launcher, refusing launcher, absence, ended thread, unchanged revision, or replaced backend.
-  `_write_roster_record` applies the same storage rules to conditional and administrative writes.
-- Every entry carries `revision` (`RosterRevision`), raised by one on each write inside the lock. An entry without one reads as `RosterRevision(0)`. A writer that changes an entry in place calls `_advance_roster_revision(entry)`.
-- `command_compact` reads the revision at its start and writes the new size under `RosterUnchanged`, so a turn that wrote in between keeps its record.
-- `context_tokens` is an integer or `"not_measured_since_compaction"` (`RecordedContextSize = KnownContextSize | NotMeasuredSinceCompaction | ContextSizeUnavailable`). A compaction turn that reports 0 stores the state and prints `compacted <name>: <before> tokens, size not measured until its next turn`. `assign.py` and `review.sh` ignore a non-integer size, so such a worker gets its follow-up with no second compaction. `compact` of such a worker exits 2 with `size not measured since its last compaction; compact refused`.
-- A fork or a follow-up whose name was taken meanwhile releases only its own thread and refuses (`name was taken while the fork ran; fork refused`, `name was taken while the follow-up ran; follow-up did not start`).
 
 ### Key files
 
@@ -282,7 +358,6 @@ These writes do not enter the usage store.
 | `scripts/usage/compaction_replay.py` | Compaction-limit replay |
 | `scripts/whoami/worker_usage.py` | Codex before/after worker readout over the store |
 | `scripts/lib/user_zone.py`, `config/user_zone.conf` | The zone report bounds and times are read in |
-| `scripts/agents/codex_mesh.py` | Worker role and lens recording; roster revision and guarded writes |
 | `scripts/direct/prepare_session.sh`, `scripts/direct/claude_worker.py`, `scripts/production/update_registration.py`, `scripts/direct/review.sh` | Role writers |
 | `/etc/nixos/modules/linux/usage-collect.nix` | Hourly timer |
 | `scripts/usage/test_*.py`, `scripts/whoami/test_worker_usage.py`, `scripts/usage/fixtures/` | Tests over invented logs; expected reports compared whole |

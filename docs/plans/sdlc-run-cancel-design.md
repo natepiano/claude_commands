@@ -265,9 +265,8 @@ the record path and must be retried before claiming cancellation succeeded.
 Run status **77 always means cancelled**, never failed, and only when verify's
 own cancel path sets it (verify-unit). A child's raw 77 (a test binary or tool)
 records as a failure. The receipt names
-`Command`, `Round` or `Phase`; 77 alone does not mean the phase stopped. Tree-change
-cancellation planned at `docs/plans/natedev-verify.md:101` and explicit replacement
-both call the command form. Neither reruns work or closes its phase. A raw 77
+`Command`, `Round` or `Phase`; 77 alone does not mean the phase stopped. [Current tree-change cancellation](../as-built/build-targets.md#watched-scope-and-exit-77) exits 77 without a receipt.
+The proposed command form also covers explicit replacement. Neither reruns work or closes its phase. A raw 77
 without a receipt remains cancelled with `PendingReceipt(command_id, reason)`;
 reconcile a command
 stop and cleanup evidence, never fabricate a round/phase ruling. Forced execution
@@ -387,7 +386,7 @@ projection. Managed CONTROL is `<session>/run_control`; standalone CONTROL is
    targets. Ten seconds was too short with a Mac target (ssh connect up to about
    three seconds, five seconds of grace, a second ssh to check and force).
 4. **Cancellation result.** Agree command-only cancellation for explicit replacement
-   and `docs/plans/natedev-verify.md:101` tree changes. Both use the same stop and
+   and [tree-change cancellation](../as-built/build-targets.md#watched-scope-and-exit-77). Both use the same stop and
    receipt protocol; 77 always means cancelled. Receipts identify command, round
    or phase scope and pending cleanup. Preserve raw signal status; do not cache
    cancellation as a verdict or trigger repair. Keep 76 compatible. A command keeps

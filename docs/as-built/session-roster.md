@@ -13,7 +13,7 @@ this machine's records ──► roster._local_roster ──┐
 other machine: ssh roster.py --here --snapshot ──►├─► Roster(entries, problems)
                 (AllMachines only)                │
                                                   ├─► roster.py           text | --json
-                                                  ├─► send.py             one recipient ──► postmaster | relay | codex_mesh send
+                                                  ├─► send.py             one recipient ──► postmaster | relay | worker pane delivery
                                                   │                                         | thread/queue/add | pushover.py
                                                   │                                         | ssh send.py --here
                                                   ├─► broadcast.py        groups ──► send.py --to <address> --here per row
@@ -26,7 +26,7 @@ other machine: ssh roster.py --here --snapshot ──►├─► Roster(entries
 The roster joins staff, run records, process evidence, and assignment logs.
 Staff supplies each worker's current session and parent.
 The assignment log supplies its task role and lens.
-The [worker design](long-lived-workers.md#roster-fields) defines stored run fields.
+The [worker design](long-lived-workers.md#staff-membership-and-dispatch) defines stored run fields.
 
 | Source | Where | Gives |
 |---|---|---|
@@ -35,18 +35,17 @@ The [worker design](long-lived-workers.md#roster-fields) defines stored run fiel
 | Run markers | `/tmp/claude/unit/active/<director session id>`, and the same under `/tmp/claude/delegate/` for a run started before the folder rename (`ROSTER_RUN_ROOT` replaces both) | first line: the run's session directory |
 | Run heartbeats | `<run>/heartbeat.log` | a run is live if written within `unit_runs.LIVE_HEARTBEAT_SECS` (600 s) |
 | Staff worker rows | `staff.json`, through `staff.local_snapshot()`: rows of kind `worker` under the run's director whose backend reads `ClaudeBackend`. A running registry record counts as Claude evidence when no transcript exists yet | Claude workers |
-| Mesh roster | `<run>/mesh_roster.json`, `<run>/mesh_server.json` | Fixed `staff_id`, turn status, launcher PID, server PID, and run details |
-| Held role store | `~/.local/state/astra/design-roles/<design id>/design.json` and its `mesh/mesh_roster.json` | Held Astra role lifecycle and staff reference |
+| Staff workers | Staff membership and backend evidence | Fixed staff id, current native session and pane state |
+| Held role store | `~/.local/state/astra/design-roles/<design id>/design.json` | Held Astra role lifecycle and staff reference |
 | Review state | `<run>/<worker>_status[_<lens>]`, `<run>/<worker>_pid[_<lens>]` | running blind reviewers |
 | Codex account daemons | each account home from `agent_accounts.codex_homes`, at `<home>/app-server-control/app-server-control.sock` (`ROSTER_CODEX_SOCKET` replaces the list for tests) | loaded threads: id, name, cwd, status, owning daemon |
-| Process table | `ps -eo pid=,ppid=,comm=,args=` (`PROCESS_TABLE_PS`) | Codex agent processes, reviewer descendants, worker `--cwd` |
+| Process table | `ps -eo pid=,ppid=,comm=,args=` (`PROCESS_TABLE_PS`) | Codex exec processes and reviewer descendants |
 
-The mesh roster format belongs to `scripts/agents/codex_mesh.py` (see `docs/as-built/long-lived-workers.md`); the roster reads it and never writes it.
+The roster reads staff membership and pane evidence.
 
-`codex_mesh.py end` keeps the staff row and its thread id.
-`assign.sh --to` reopens an ended worker or a worker whose launcher died, using the recorded thread.
-A follow-up after reopen refuses a replacement thread if the recorded thread cannot resume.
-The unit ledger keeps ended workers until permanent removal retires their staff rows.
+The worker command preserves staff identity when it closes a worker.
+The held assignment launcher retains its thread and allocation helpers until round 2b.
+The roster uses the staff row's current native session.
 
 ### How each row's role is derived
 
@@ -56,12 +55,13 @@ Claude rows come from `sessions.running_sessions()`, one per `sessionId` (newest
 
 Codex rows:
 
-- **Worker.** A live run's mesh entry supplies status and process evidence.
-  The entry's `staff_id` resolves the current thread and parent through one staff snapshot.
+- **Worker.** Staff membership and pane evidence supply state and process evidence.
+  The fixed staff id resolves the current thread and parent through one staff snapshot.
   A worker whose backend is Claude appears only as a Claude row.
   The assignment log supplies the task role and review lens.
-  Status `done` displays `idle`; capacity states retain their named display text.
-  The process supplies the working directory when available; the director's directory is the fallback.
+  Open workers show the native status and pane.
+  Other workers show stopped, closed, unknown or incomplete evidence.
+  `session_staff.worker_directory` supplies the working directory.
   Staff parents supply the director and showrunner relationships.
 - **Held Astra role.** `_durable_roles` lists opened roles that have not ended.
   Staff supplies the current thread and the role's parent.
@@ -72,13 +72,17 @@ Codex rows:
   The [held-role design](long-lived-workers.md#lasting-roles) defines its authority.
 - **blind reviewer** — `<worker>_status[_<lens>]` reads `reviewing` with a live `<worker>_pid[_<lens>]`. Kind is `codex` for a `codex exec` descendant of that pid, else `claude` for a `claude` descendant, else `codex`. Named `<lens> reviewer` or `blind reviewer`, slot role `review (<lens>)` or `review`.
 - **freestanding** — each daemon thread that is not a worker's or held role's thread (such a thread is listed once, as the worker or held role).
+  A native Codex pane uses its reported session when available.
+  Without a report, `native_pane_process(...).current_identity` supplies its thread.
+  An unreadable process keeps the pane visible without a messaging address.
+  A reported session needs no process identity read.
 
 ### Domain types (`roster.py`)
 
 - `RosterEntry` (frozen): `machine`, `kind` (`claude` | `codex`), `role` (`showrunner` | `unit director` | `worker` | `astra-designer` | `astra-reviewer` | `freestanding`), `name`, `status`, `reach`, `cwd`, `showrunner`, `director`, `assignment`, `thread`, `session`, `account` (`AccountLabel`, `AccountUnread`, or `AccountAttributionUnavailable`).
 - `reach: Messageable(address) | CannotReceiveMessages(reason)`.
   - Claude: `session:<id>` with a messaging socket, else `CannotReceiveMessages("no messaging socket")`.
-  - Codex worker: `worker:<run id>/<worker name>` (run id = the run directory's name) at mesh status `running` / `waiting_capacity`; otherwise `between turns; its unit director resumes it` or `between turns; no unit director is running`.
+  - Codex worker: `worker:<parent>/<worker name>` uses the current native session and pane evidence.
   - Daemon session: `codex:<thread id>`.
   - Blind reviewer: `CannotReceiveMessages("blind reviewer")`.
   - Held Astra role: `CannotReceiveMessages("held role; its holder adds pending messages to an authorized assignment")`.
@@ -97,7 +101,13 @@ Codex rows:
 - `UnitLabels` shows the parent showrunner row's `name` and the unit row's `name`.
   A stopped showrunner keeps its staff name. `—` marks a missing part.
 - `unit_labels(entries) -> dict[str, UnitLabels]` keys a full roster's entries by Claude session id and Codex thread id. `/build:queue` uses it (`docs/as-built/build-memory-admission.md`, "Queue API").
-- `unit_labels_for(session_ids, environment) -> dict[str, UnitLabels]` is the fast path for known Claude session ids. It reads the session records, the showrunner registry through `showrunners.registered_showrunners(known_sessions=...)`, and session labels through `session_staff.session_staff_and_directors(records, environment)`, which reads only each record's `/proc/<pid>/environ` (`HERDR_PROC` replaces `/proc`). It never reads the process table, Codex meshes or accounts. A session whose `CLAUDE_CODE_SESSION_ID` names another known session resolves under that director and takes its production and unit. Unknown ids are left out, and any error returns `{}`. `/build:status` uses it (`docs/as-built/build-targets.md`).
+- `unit_labels_for(session_ids, environment) -> dict[str, UnitLabels]` resolves Claude session ids and Codex thread ids.
+  It reads session records, the showrunner registry, staff membership, and backend evidence.
+  Staff parent rows select each worker's director and showrunner.
+  It uses the worker's current native session.
+  It does not use the `environment` argument or read the process table or accounts.
+  It omits unknown ids and returns `{}` after an error.
+  `/build:status` uses this function (`docs/as-built/build-targets.md`).
 - Both paths use `session_staff.group_labeled_sessions`.
   Duplicate live or unknown processes produce a fault.
 - Native runtime IDs select staff rows for session labels.
@@ -105,7 +115,8 @@ Codex rows:
   A folder or session name does not select a staff row.
   The [staff identity contract](staff-accessors.md#staff-identity-and-backends) defines this join.
 - `UnitLabels.folder_name() -> str` names the copies folder `/tmp/claude/copies/<showrunner>-<unit>/<phase>-<purpose>`: showrunner `hana`, unit `lfo` gives `hana-lfo`. A unit name equal to the showrunner name, or one that starts with the showrunner name and `-`, is the folder name alone (`cargo-liner-style` + `cargo-liner-style-types` gives `cargo-liner-style-types`). The prefix rule needs the hyphen: `hana` + `hanami` gives `hana-hanami`. A `—` part is left out with its hyphen (`builds`, `lfo`); with both parts `—` the session name is the folder name. A caller looks up labels with `unit_labels_for([<session id from build_hold.owning_session()>], environment)`, so a Codex worker resolves to its unit director. No caller uses `folder_name` yet.
-- Imports: `roster.py` imports `scripts.shutdown.remote` by package and does not put `scripts/shutdown` on `sys.path`; `account`, `agent_accounts` and `note_file` load lazily, so a label-only caller does not load account discovery. `scripts/shutdown/inventory.py` appends its own folder after existing `sys.path` entries for its sibling imports.
+- `roster.py` and `inventory.py` use package imports for repository modules.
+  Account helpers load lazily, so label-only callers do not load account discovery.
 
 ### `roster.py` command
 
@@ -122,19 +133,25 @@ Durable-role warnings print once on stderr with `warning:`. JSON and snapshots c
 ### `send.py`: one recipient
 
 ```
-send.py --to NAME|uds:<path>|session:<id>|worker:<run>/<worker>|codex:<thread>
+send.py --to NAME|uds:<path>|session:<id>|worker:<parent>/<worker>|codex:<thread>
         [--from NAME] [--summary TEXT] [--key KEY [--repeat-minutes N]]
-        [--here | --machine HOST] [--codex --session-dir DIR] [--timeout SECONDS]
+        [--here | --machine HOST] [--timeout SECONDS]
         (--text TEXT | --file PATH | stdin)
 send.py --to user --text-id ID --value KEY=VALUE ...
 send.py ack KEY | reopen KEY | pending [NAME] | retire --to ADDRESS --from SENDER --key KEY
 send.py drain-sockets
 ```
 
-The argparse boundary builds `RecipientSelection = RosterLookup(to) | MeshWorker(session_dir, worker)` and `RecipientResolutionScope = LocalOnly | LocalThenPeer | NamedMachine(host)`: `--here` is `LocalOnly`, `--machine HOST` is `NamedMachine`, neither is `LocalThenPeer`; the two together are a usage error. `Options.action: MessageUserAction = UserAction | NoUserRecipient`.
+The argparse boundary builds `RosterLookup(to)` for each recipient.
+`RecipientResolutionScope` is `LocalOnly`, `LocalThenPeer`, or `NamedMachine(host)`.
+`--here` selects `LocalOnly`.
+`--machine HOST` selects `NamedMachine(host)`.
+The default is `LocalThenPeer`.
+The two flags together cause a usage error.
+`Options.action` is `UserAction` or `NoUserRecipient`.
 
 `send.py` reads one `staff.snapshot()` for each session send. `resolve_staff_recipient` selects each staff recipient.
-A typed name first matches a staff path or short name. Unit names accept both `resources` and `resources`.
+A typed name first matches a staff path or short name. Unit names use the staff name.
 One staff row selects its `current_session`. Several staff rows produce a named ambiguity error and no delivery.
 The repeat-notice owner follows staff parents to the showrunner. It uses the default owner for a non-staff sender.
 
@@ -147,7 +164,6 @@ Worker lookup uses the native ID from the local or peer roster. The roster and r
 A staff member's old live socket cannot override its current session.
 Explicit non-staff addresses keep their transport, peer lookup, and queue behavior.
 `uds:` stays on this machine. `--machine HOST` forwards the selected address.
-`--codex --session-dir DIR --to SLOT` selects a run-scoped worker slot without staff lookup.
 
 The SendMessage-miss hook uses the same resolver and snapshot. It reports the matching transport and a send command.
 The hook never sends a message. Successes, socket misses, and unrelated failures do not read the roster.
@@ -391,7 +407,7 @@ Reads the `ThisMachine` roster and runs no ssh. It prints `<name>\tuds:<socket p
 
 ### `process_table.py`
 
-`Process(pid, parent, command, arguments)` (`NamedTuple`); `snapshot() -> dict[int, Process]` runs `PS` (from `PROCESS_TABLE_PS`, read at import); `is_codex_agent(process)` is true for `codex exec` or a Python `codex_mesh.py start` / `follow`. Standard library only, importing no other script; `roster.py`, `broadcast.py` and `codex_winddown.py` read it.
+`Process(pid, parent, command, arguments)` (`NamedTuple`); `snapshot() -> dict[int, Process]` runs `PS` (from `PROCESS_TABLE_PS`, read at import); `is_codex_agent(process)` recognizes `codex exec`. Standard library only, importing no other script; `roster.py`, `broadcast.py` and `codex_winddown.py` read it.
 
 ### `codex_daemon.py`
 
@@ -490,7 +506,7 @@ Release recalculates the priority of a kept decision.
 
 - Every address is unique on both machines: `session:<id>`, `worker:<run id>/<worker name>`, `codex:<thread id>`. A `CannotReceiveMessages` row has an empty address and takes no messages; broadcast skips it rather than send to `""`.
 
-- A worker is `Messageable` only at mesh status `running` / `waiting_capacity`; a worker between turns is resumed only by its unit director.
+- Pane state determines whether a worker can receive a message.
 
 - `--action` / `--no-action` go only with `--to user`; every other recipient carries `NoUserRecipient`; `broadcast.py` passes no action flags; `remote()` forwards them only for `user`.
 
@@ -514,7 +530,7 @@ Release recalculates the priority of a kept decision.
 
 - Every `TestCase` in `scripts/shutdown/` derives from `ShutdownTestCase` and calls `super().setUp()` first. A new send leaf, or a new module that imports `run_remote` by name, gets an entry in `_REAL_LEAF_BINDINGS` and a stub in `setUp`.
 
-- Live checks never message a real session: they use a scratch background Claude session, a scratch mesh thread in a scratch session directory and a scratch daemon thread, all removed afterwards. The postmaster check uses throwaway recipients and leaves only the service session running for the trial. Listing real sessions is allowed.
+- Live checks never message a real session: they use a scratch background Claude session, a private pane worker and a scratch daemon thread, all removed afterwards. The postmaster check uses throwaway recipients and leaves only the service session running for the trial. Listing real sessions is allowed.
 
 - `commands/message.md` and `codex/AGENTS-messaging.md` share roster discovery, outcome/recovery rules and `<HeldRoleMessages>` (a held Astra role takes no direct message; its text is queued for the holder's next authorized assignment, `docs/as-built/long-lived-workers.md#lasting-roles`). Only the Claude receiving rules describe postmaster; Codex recipients bypass it.
 
@@ -529,7 +545,7 @@ Release recalculates the priority of a kept decision.
 
 - Blind reviewers (`codex exec` via `agent_exec.sh`) carry no `--name` or `--session-dir`; only the review status and pid files find them.
 
-- No launcher writes `lens` into the mesh roster; the lens lives in review artifact names and the progress and findings records.
+- Review artifact names and progress records retain the review lens.
 
 - No running registered showrunner is a correct, common state.
 
@@ -539,7 +555,7 @@ Release recalculates the priority of a kept decision.
 - Under `--machine HOST`, `remote()` keeps the outcome word from the other machine's last stdout line, so a `REFUSED:` there stays `REFUSED` (exit 2). Only stderr-only exit-2 errors (cannot take messages, ambiguous name, no roster session has address, usage) return as `FAILED: ssh <host>: <reason>` (exit 3).
 - `uds:` is always this machine's socket, even with `--machine`.
 - A `worker:` address of a worker between turns matches no row on either machine and reads `no roster session has address`, not `cannot take messages`.
-- `codex_mesh.py send` accepts only `running` / `waiting_capacity` workers.
+- Staff worker delivery resolves the observed pane and its holder.
 - `pushover.py` exit 2 also means usage or missing keys; only the `refused before sending:` stderr marker marks a refusal. A caller with no keys and no action flag gets the action refusal, not `keys missing`.
 - Every roster problem on stderr carries `could not read: `, so a machine not reached reads `could not read: <host>: not reached: <why>` (exit 1). In a sandbox this usually means rerun outside it, or use `--here`.
 - The ssh commands run `$HOME/.claude/scripts/...` on the other machine, its main checkout: a branch's changes reach it only once merged and pulled there. A `BROADCAST_SEND` set here is set there to the same path, and a path missing there fails the send there.
@@ -571,7 +587,8 @@ Release recalculates the priority of a kept decision.
 - `codex_winddown.start()` keeps the first record per name, so it depends on `sessions.live_sessions()` listing the newest first.
 
 **Imports**
-- `roster.py`'s module-level `sys.path` edits reach every importer: a change there must also run the herdr and shutdown folder suites.
+- Repository modules share one package identity.
+  The [package bootstrap](merge-gate-and-test-speed.md#python-package-imports) selects the entry checkout.
 - Buildlog imports `scripts.buildlog.record`. Shutdown uses `shutdown_record.py`. These modules have distinct names. Shutdown has no alias for an old module name. `roster.py` imports shutdown's `remote` by package.
 
 **Tests**
@@ -628,9 +645,15 @@ Release recalculates the priority of a kept decision.
 
 - **The process table has its own module** so `broadcast.py` can import `roster.py` without a cycle, and roster, broadcast and wind-down share one reader.
 
-Account attribution is read on the owning machine and travels in the snapshot. Claude rows use their process configuration; Codex workers use their serving server's home, including retired servers while a turn finishes. Daemon rows use the socket home; reviewers and herdr panes require a readable process environment. Missing attribution from an older peer is distinct from an unreadable account. Account notes retain that peer's rows until attribution returns.
+The owning machine reads account attribution and includes it in the snapshot.
+Claude rows use their process configuration.
+Codex workers use current backend evidence.
+Daemon rows use the socket home.
+Reviewers and herdr panes require a readable process environment.
+Missing attribution from an older peer is distinct from an unreadable account.
+Account notes retain that peer's rows until attribution returns.
 
-`peer_snapshot(environment)` returns a `Roster` or `PeerNotReached(host, reason)`; `peer_roster` retains its existing `Roster` interface. Snapshots accept the optional tagged `account` field: a missing field becomes `AccountAttributionUnavailable("peer sent no account")`, while a read failure is `AccountUnread`. Worker attribution reads `mesh_server.json` and `mesh_retired.json` by the worker's port, using the current server only between turns. It never infers a serving home from the workers' configured role.
+`peer_snapshot(environment)` returns a `Roster` or `PeerNotReached(host, reason)`; `peer_roster` retains its existing `Roster` interface. Snapshots accept the optional tagged `account` field: a missing field becomes `AccountAttributionUnavailable("peer sent no account")`, while a read failure is `AccountUnread`. Worker attribution uses current backend evidence.
 
 ## Herdr placement
 

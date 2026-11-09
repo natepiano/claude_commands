@@ -16,7 +16,7 @@ The kept-shot table separates exact capture attempts from attempts inferred from
 Each evidence type has its own median, p90, and episode count before the first kept shot.
 A citation requires the full recorded path later in the same transcript.
 Assistant text, message notices, checkpoint notices, and files written by the agent can supply that citation.
-Historical `codex_mesh.py --message` notices remain citation evidence; they do not select a live transport.
+Historical worker notices remain citation evidence.
 Matching timing records count failed views; older timing lines remain valid.
 
 Below are minutes per image, `/hana_shot` call and image totals, and the newest 20 sessions that shot by hand. The weekly trend shows by-hand and `/hana_shot` agent-hours at the 5-minute split. `changes.json` holds the dated product and measurement changes; the by-change section shows both methods before and after each product change at both splits. It flags sides with fewer than 20 episodes and host windows whose covered sources omit a measured source, even when the Mac read finished. Measurement changes are listed separately and never presented as speed gains.

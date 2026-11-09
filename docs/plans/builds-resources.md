@@ -1972,38 +1972,40 @@ Every nextest run that lint starts prints one line after admission: `nextest: <g
 
 **Change-Review:** none — the queue view shows the same rows; the room rises only when an unregistered job caused the margin. Registered jobs take no margin today (`test_memory_admit.py:5809`).
 
-### Phase 89 — The Mac folder audit reads process use and acts  · status: todo
+### Phase 89 — The Mac folder audit reads process use and acts  · status: done
 
-**Depends on:** Phase 87 checkpoint. Approved by builds on 2026-11-08 ("go for the Mac folder audit phase"). Source: Phase 81 Round 9 (`/tmp/claude/unit/20523639-3e08-48d6-9277-73e052bca297/phases/81/mac_link_report.md`).
+#### As-built
 
-#### Work Order
-
-**Goal:** The Mac folder audit reads which processes use a folder, as on natedev, so it removes idle loose folders there.
-
-**Spec:**
-
-1. **The cause.** Every Mac audit run logs "0 removed". Each due folder is kept with `maker unknown: no /proc or lsof to show which processes use it` (10,835 rows in `~/Library/Logs/nate-jobs/folder-audit.log`). `lsof -n -P -w -F pfn` runs in a Mac shell in 0.2 s with exit 0. Find why `folder_audit.process_uses()` returns `ProcessUsesUnavailable` in the launchd job (`org.nixos.folder-audit`). Read only on the Mac. Run no audit against the real `/tmp` or `~/rust`.
-2. **The fix.** Fix the cause where it lives. builds' scope: `scripts/lint/folder_audit.py` (and `tmp_sweep.lsof_paths` if the defect is there). If the cause is in the nixos job, report it to the director before any change; nixos pushes go through the showrunner.
-3. **No new roots.** `~/.cache` stays out of every cleanup root. The creator of a folder registers its lifetime.
-4. **Proof.** When a Python defect is fixed, add a row to an existing `test_folder_audit.py` test of the process-use read for the Mac case. No new test file. builds decided on 2026-11-08: with no Python defect, change no Python and add no test row; the existing fallback test covers it. Then the phase ends with the report: the loaded job's PATH, its activation time, and the first audit run after the next Mac switch (removed count, NO_PROC rows). If the loaded job lacks `/usr/sbin`, send builds the nixos facts; builds takes the Mac switch to natedev.
-5. **As-built.** Name the Phase 44 gap: the old standing `~/rust/hana_catalyst_mac` clone had no lifetime after the runner moved to scratch clones. The director removed its 85.8 GiB target on 2026-11-08 with builds' go; that closes the gap.
-
-**Constraints from prior phases:**
-- `process_uses()` (`scripts/lint/folder_audit.py:325`) already falls back to `tmp_sweep.lsof_paths()` when `/proc` is missing. `test_lsof_fallback_keeps_used_folders_and_judges_unused_folders` covers that fallback.
-- `tmp_sweep.LSOF` runs bare `lsof`, found through PATH. On the Mac it is `/usr/sbin/lsof`.
-- Phase 82 added `/usr/sbin` to the launchd job PATH in the nixos source (`modules/darwin/nate-backend.nix`). Round 9 did not prove that the loaded job has it. The audit log was last written on 2026-11-07 at 14:13.
-- So separate the audit runs before the PATH change was live from the runs after it. Report the loaded job's PATH and the activation time.
+- The Mac folder audit (`org.nixos.folder-audit`) kept every due folder as `maker unknown: no /proc or lsof to show which processes use it` because the old launchd job PATH had no `/usr/sbin`. The job could not start `lsof`, so `folder_audit.process_uses()` returned `ProcessUsesUnavailable`.
+- The Python fallback is correct: `process_uses()` (`scripts/lint/folder_audit.py:325`) calls `tmp_sweep.lsof_paths()` when `/proc` is missing, and `test_lsof_fallback_keeps_used_folders_and_judges_unused_folders` covers it. No Python or test changed.
+- Nixos `efdf8bf` adds `/usr/sbin` after `/usr/bin:/bin` to `jobPath` (`modules/darwin/nate-backend.nix:40`). The loaded job has that PATH. Its plist change time is 2026-11-08 11:04:48 EST. The job has `RunAtLoad=false` and an 86400-second interval, and had zero runs at inspection.
+- The as-built records the cause, the loaded PATH and the closed Phase 44 gap: the old standing `~/rust/hana_catalyst_mac` clone had no lifetime after the runner moved to scratch clones; its 85.8 GiB target was removed on 2026-11-08 with builds' approval. Folder creators register lifetimes; `~/.cache` stays outside every cleanup root.
+- The first audit run after the PATH change goes to builds as a note (removed count, NO_PROC rows). A run that still removes nothing becomes a new phase.
 
 **Files:**
-- `scripts/lint/folder_audit.py`
-- `scripts/lint/tmp_sweep.py` — only if the defect is in `lsof_paths`.
-- `scripts/lint/test_folder_audit.py`
-- `docs/as-built/build-memory-admission.md`
+- `docs/as-built/build-memory-admission.md` — the Mac audit PATH cause, the loaded job PATH and the Phase 44 gap.
 
-**Workers:** `1 writer + 1 tester`
-- `impl` — the cause, the fix and the as-built.
-- `test` — the test row.
+**Gotchas:**
+- An ssh shell finds `/usr/sbin/lsof`; a launchd job uses its own explicit PATH. Test a command lookup in the job environment, not over ssh.
+- The plist file time is not the launchd load time; `launchctl print` shows no load time.
 
-**Gate:** the targeted test, and `basedpyright` 0/0/0 on each changed file and each caller module.
+**Ruled out:** a Python change or a new test row for the Mac case — the existing fallback test covers the `lsof` path.
 
-**Change-Review:** none — the Mac audit removes idle folders in the background; the user sees no new screen or message.
+### Phase 90 — Find why the Mac drops off the network under test load, and propose the fix  · status: done
+
+#### As-built
+
+- The Mac drops of 11-08 13:35 EST and 11-09 02:23 EST are clamshell sleep: the MacBook lid was closed with no external display, so macOS slept. It did not restart (uptime 21 days). Tailscale and ssh stop because the Mac sleeps.
+- `pmset -g log` shows `Entering Sleep state due to 'Clamshell Sleep'` at both times. On 11-08 the charger came off at the same moment (`Using Batt`); the Mac woke only at 22:01:45 on `USB-C_plug` and `DarkWake to FullWake`.
+- Short dark wakes (2 to 45 s) explain the brief returns that natedev saw. A 14-minute dark wake (02:48 to 03:02 on 11-09) ran tests with the lid closed and ended in `Dark Wake Thermal Emergency`.
+- At 03:19 on 11-09: `AppleClamshellState = Yes`, only the internal display, AC power, `pmset` `sleep 0`. `sleep 0` does not stop a clamshell sleep.
+- builds accepted the cause and asked the user to open the lid. No config or concurrency change. No lid-state check (builds: no new check without the user's ask).
+
+**Files:** none changed. Records are in the run folder under `phases/90/`.
+
+**Gotchas:**
+- The Mac is a MacBook. A closed lid with no external display sleeps it whatever `pmset sleep` says.
+- `pmset disablesleep 1` with a closed lid is not a fix: the 11-09 thermal emergency shows a closed Mac overheats under test load.
+- Tailscale control can list the Mac as online for minutes after it sleeps; an ssh timeout with `online=yes` is the sign.
+
+**Ruled out:** a kernel panic and restart (uptime 21 days); memory pressure as the cause (the pmset log names clamshell sleep for each drop); a nextest concurrency change.

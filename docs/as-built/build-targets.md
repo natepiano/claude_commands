@@ -2,14 +2,28 @@
 
 ## What it is
 
-Each machine that can run a build job is a build target with its own rules. natedev is a `local` target: it takes as many jobs as its existing limits admit (the memory gate, the cargo token, build-folder turns). The Mac is an `ssh` target: it takes one job per repository, under the `mac_test.py` claim for that repository, so a hana run and a cargo-liner run share it. A hold names one target. natedev's hold is the build hold (`build_hold.py`); the Mac's hold is the Mac block (`mac_test.py block`). The tools enforce holds themselves: `verify.sh` waits out a natedev hold before any local step, and the BRP launch gate refuses a launch while natedev is held, except for the session whose own hold is the only one in force. `verify.sh test` goes to the first free target it may use, Mac first, and waits when every eligible target is held or full; it never falls back to a held target. A Mac claim whose Mac has run nothing for 15 minutes is released and its holder told, so an idle claim cannot turn tests away for long. `buildlog costs` ranks costs by machine. Use `buildlog report` for detailed step tables.
+Each build target has its own platform, capacity, hold, and admission rules.
+natedev uses the local memory gate, Cargo token, and build-folder limits.
+SSH targets use their configured runner and claims.
+The Mac admits one job per repository, so different repositories can run together.
+`verify.sh` selects targets through `step_routing_rule` and the configured target order.
+A held target admits only work that its hold rules permit.
+[Mac step offload](mac-test-offload.md) describes remote execution and claims.
 
 ## How it works
 
 ### Targets: `config/build_targets.conf` and `scripts/build_targets/target_config.py`
 
 - The config is in the `key=value` form `scripts/lib/conf.py` reads. `targets=mac,natedev,aws` lists the targets in the order a job tries them. natedev is `kind.natedev=local`, `platform.natedev=linux`. AWS is `kind.aws=ssh`, `platform.aws=linux`, `settings.aws=aws_target.conf`. The Mac is `kind.mac=ssh`, `platform.mac=macos`, `settings.mac=mac_test.conf`; its own settings (host, mirror, size budgets, CI switch, disk floor, `linux_only.<repo>`) stay in `config/mac_test.conf`.
-- `target_config.py` imports only `sweep`. It holds `Platform = Literal["linux", "macos"]`, the frozen dataclasses `LocalTarget(name, platform)` and `SshTarget(name, platform, settings: Path)`, `Target = LocalTarget | SshTarget`, `ConfigError(ValueError)` and `read_targets(path=None) -> tuple[Target, ...]`. Target names must be distinct and non-empty; a missing or unsupported `kind`, `platform` or `settings` key, or a settings file that does not exist, is a `ConfigError` naming the key. `BUILD_TARGETS_CONFIG` replaces the path, for tests.
+- `target_config.py` reads configuration through `scripts.lib.conf` without importing coordination state readers.
+  `LocalTarget(name, platform)` and `SshTarget(name, platform, settings)` form the `Target` union.
+  `Platform` is `linux` or `macos`. `ConfigError` aliases `conf.Unusable`.
+  `read_targets` returns the configured targets in order.
+  Names must be distinct and nonempty.
+  Missing or unsupported kind, platform, or settings values raise `ConfigError` with the key.
+  A missing settings file also raises `ConfigError`.
+  `BUILD_TARGETS_CONFIG` selects private test configuration.
+
 - `targets.py` re-exports those names, so callers import them from one place. `build_hold.py` imports `read_targets` from `target_config` directly; going through `targets` would form the import cycle `build_hold` → `targets` → `build_hold`.
 - A new `ssh` target is a new entry plus its own settings file, and it reuses the same runner (probe, copy, run, release). `mac_test.state_paths(target)` gives each target its own claim, block and backoff state: the Mac keeps `~/.local/state/mac-test`, and every other target uses `~/.local/state/build-targets/<target>/`. The AWS target is one such entry; see [builds-aws-target.md](builds-aws-target.md).
 
@@ -19,7 +33,7 @@ Each machine that can run a build job is a build target with its own rules. nate
 - A `RunningJob`'s `holder_session` is the claim record's `holder_session`. natedev's `Held` carries the local hold key (the holder's Claude session id, or its given name when it is no live session); the Mac block's `Held` carries its `RecordedSession` name, else `NO_HOLDER_SESSION`.
 - natedev is `Held` while `build_hold.natedev_holds` finds a hold in force: `ReleaseEstimated` with an ETA, else `UntilReleased`. The last release removes its file at once and natedev becomes free. Old cycle records still identify files left by a completed hold.
 - The Mac is `Held` whenever a block record exists (`read_claim_block`, the same reader `claim` uses): `ExpiresAt` before its expiry, `AwaitingBlockRemoval` after it. It is `Running` when `mac_test.read_claims` finds a live claim (a kept remote claim counts as live), with one `RunningJob` per live claim, oldest first, otherwise `Free`. A claim file it cannot read, `claims/<repo>.json` or `run.json`, is `StateUnreadable`.
-- `StateUnreadable` carries the `OSError`, `UnicodeError` or `mac_test.StateReadError` text. `Unreachable` comes only from `build_targets.py status --probe`.
+- `StateUnreadable` carries the `OSError`, `UnicodeError` or `mac_test.StateReadError` text. A failed-probe record also makes a target `Unreachable`, before any AWS state lookup.
 - `target_eligibility(repo_root, package, routing: Routing) -> tuple[EligibleTarget | ExcludedTarget, ...]` gives one result per configured target in config order. `Routing = AnyEligibleTarget | LocalRequired(reason)`, with `ANY_ELIGIBLE_TARGET` as the shared value. A `linux` target is always eligible. A `macos` target is excluded with the `LocalRequired` reason under `--local`, with `repo` when the repository is unknown or its settings have no `linux_only.<repo>` key, and with `linux_only` when the package is listed there. Each `ssh` target is judged by its own settings file.
 
 ### The target command: `scripts/build_targets/build_targets.py`
@@ -39,10 +53,14 @@ Every command checks holds through `target_state`. The sole holder may run its o
 `verify.sh` reads platforms from this table in Bash.
 Each loop uses its row's platform directly.
 `target_platform` scans the saved table for other callers and starts no process.
-Without a matching platform, `target_platform` returns no answer.
-The separate `build_targets.py platform` command is removed.
+Without a matching row, `target_platform` returns no answer and status 1.
+`eligible` supplies platform data; there is no separate platform command.
 
-- `status` names who holds each target: `command_status` collects every `HolderSession` from the states, calls `roster.unit_labels_for` once for all of them ([session-roster.md](session-roster.md), "Unit labels"), and `format_state` / `running_job_text` add the suffix through `unit_label_suffix`. Showrunner and unit are short names, `—` for a missing relationship. No holder session, an unknown holder or a lookup that raises keeps the line without the suffix. A status run costs about 0.10 s more for the lookup (median 0.204 → 0.307 s); under machine load status timings vary from 0.3 to 2 s, so measure on a quiet machine. The suffix joins a claim to its holder by the recorded holder session, never by `what` and `since`, which can match a stale claim.
+- `command_status` collects holder sessions and calls `roster.unit_labels_for` once.
+  `format_state` and `running_job_text` add the showrunner and unit through `unit_label_suffix`.
+  Missing relationships use `—`; an unknown session or failed lookup leaves the suffix absent.
+  The recorded session identifies the holder; job text and timestamps do not.
+
 - `BUILD_TARGETS_POLL_S` and `BUILD_TARGETS_ESCALATE_S` replace the 15 s re-check interval and the 2 h escalation; `BUILD_TARGETS_NOW` replaces the clock. All three are test overrides.
 
 ### Holds: `scripts/build_hold/build_hold.py`
@@ -114,8 +132,15 @@ It saves no pass because a saved pass describes this machine.
 ### The no-hold shortcut: `scripts/lint/memory_gate.sh`
 
 - `build_hold_nothing_held` returns 0 only when the holder directory (`BUILD_HOLD_DIR`, default `~/.local/state/build-hold`) is a readable, searchable directory with no entry at all (dot files and dangling links count), and the shell expands patterns unfiltered (no `noglob`, `GLOBIGNORE` or `failglob`). `BUILD_HOLD_DIR` set but empty, a missing directory, or any doubt returns 1, and the Python runs.
-- `build_hold_wait_local`, `build_hold_check_local`, `check_routing_hold` and the per-call `wait-local` in `verify.sh` all return through it before starting Python. With nothing held a local call starts no hold-check process anywhere, and an unreadable `config/build_targets.conf` stops only a `test` call (at `eligible`).
-- Every caller waits for natedev's hold, not only `verify.sh` (fixed 2026-10-19: cargo-port's `port-lint clippy` ran 5 hana clippy runs through a demo hold, load 134). `build_hold_applies` skips the wait only for `verify-mac`, for macOS (`OSTYPE` `darwin*`), and when the holder directory does not exist. A caller with no `verify` call id gets `BUILDLOG_HOLD_CALL_ID`, made once per shell in verify's form (`v<UTC stamp>-<pid>-<random>`) after `build_hold_nothing_held` says 1. It is not exported, so build log rows keep `call_id` null. `wait-local` and `check-local` get `--caller <BUILDLOG_CALLER or lint>`, and their lines start `lint (<caller>):` (or `lint:`) in place of `verify.sh:`; the waiting line ends `; waiting for the release.` The holder's own session still passes its hold (`caller_holds_only_own`).
+- `build_hold_wait_local`, `build_hold_check_local`, `check_routing_hold` and the per-call `wait-local` in `verify.sh` all return through it before starting Python. With nothing held a local call starts no hold-check process anywhere, and an unreadable target configuration refuses a call that needs an eligibility answer.
+- Every local compiling caller checks natedev's hold.
+  `build_hold_applies` skips the wait for `verify-mac`, Darwin, or a missing holder directory.
+  A caller without a verify call id creates `BUILDLOG_HOLD_CALL_ID` after the shell shortcut requires a Python check.
+  That identity remains local to the shell, so call records keep a null `call_id`.
+  `wait-local` and `check-local` receive `--caller <BUILDLOG_CALLER or lint>`.
+  Their output uses that caller's label and names the holder.
+  `caller_holds_only_own` permits the holder when no other hold applies.
+
 - Wait, check and launch lines name the oldest hold in force that the calling session does not own, with that hold's reason. A caller with no owning session sees the oldest hold. The own-hold check and the named hold use the same hold list.
 
 ### The launch gate: `scripts/hooks/pre-tool-use-brp-launch-gate.sh`
@@ -135,7 +160,11 @@ It saves no pass because a saved pass describes this machine.
 
 The runner, the claim and the block are covered in [mac-test-offload.md](mac-test-offload.md). The parts this feature depends on:
 
-- The probe checks reachability (with the unreachable backoff), the free-disk floor, the block and the claim. It counts no processes and reads no power source: `ProbeSnapshot(free_gib, hostname)` has no `procs` or `power`, others' cargo on the Mac no longer turns a test away, and a Mac on battery runs tests (user, 2026-10-18). `battery` stays in the build log's reason lists for old rows. `mac_busy` stays in `MacDeclineReason` for old build-log rows.
+- The probe checks reachability and free disk space. Claims and blocks provide coordination checks.
+  `ProbeSnapshot(free_gib, hostname)` contains no process count or power state.
+  A Mac on battery can run tests.
+  The report still decodes legacy `battery` and `mac_busy` decline reasons.
+
 - `offload.py run --settings <path>` reads that target's settings; `--last-decline busy|blocked` silences a decline line (and the claim's holder output) that repeats the last reason. A failed probe prints `mac_test: could not reach the Mac: <reason>`.
 - A lost run keeps the Mac busy until its leftovers are gone. The runner claims with `--remote <host>`; the claim (`RemoteJobClaim`) outlives its process until the printed `mac_exit=<n>` line with a confirmed cleanup marker, or a leftover check that counted no process (`check_leftovers` → `LeftoversEnded | LeftoversRemain(count) | LeftoverCheckFailed(reason)`). A later `claim --remote` for the same repository takes a kept claim over (exit 13). Leftovers decline `busy`; a failed check declines `unreachable`.
 - Every claim, remote or process-bound, starts a claim watcher (`mac_test.py watch-claim`, one at a time under `claim_watch.lock`). Every `claim_poll_seconds` (60) it checks the claim's host over ssh for the user's mirror work, `cargo`, `rustc`, `cargo-nextest` or binaries under a `/target/` path, sending no signal. After `claim_idle_minutes` (15) with none it deletes the unchanged claim and messages the holder's session (`holder_session`) how to claim again. A failed check changes nothing. Details are in [mac-test-offload.md](mac-test-offload.md) ("The idle claim").
@@ -362,7 +391,9 @@ the log does not record that connection. Journal retention also limits the evide
 
 ## Invariants
 
-- A Mac pass or failure ends a `verify.sh test` call (`passed_full`, `passed_filter`, `failed`; since 2026-10-16 natedev does not confirm it). CI's Linux jobs catch a Linux-only failure. `check`, `build`, `lint`, `doc`, `example` and `final` never leave natedev.
+- A remote pass or failure ends its step. CI checks platform differences.
+- The routing rule permits remote read-only steps. Tree-writing steps always remain on natedev.
+- Unpinned `build` and `final` remain on natedev. A target flag can pin their movable steps elsewhere.
 - natedev's own limits are unchanged: the memory gate, the cargo token, build-folder turns.
 - A job never runs on a held target and never falls back to one. When every eligible target is held or full it waits and says what it is waiting on.
 - Code that picks a target counts `StateUnreadable` and `Held(end=AwaitingBlockRemoval)` as not free, and every reader of `TargetState` handles all five cases.
@@ -372,17 +403,16 @@ the log does not record that connection. Journal retention also limits the evide
 - Defaults are "go": no load threshold and no check for others' processes on any target. The claim watcher's activity check counts processes only to release an idle claim, never to turn a test away.
 - The scripts keep their arguments and exit codes: `build_hold.py hold|wait|release|quiet|status|audit`, `mac_test.py claim|release|block|unblock|status`, and `build_targets.py`'s 0/10/12/2. `claim` takes no required argument beyond `--pid` and `--what`; `watch-claim` is the claim watcher's own entry point.
 - The guard lines stay first in `verify.sh` and `memory_gate.sh`, above every line that reads `HOME` or a listed variable. The guard runs at an entry point, never inside a function that reads a directory: `dailies_input.py` sets `BUILD_HOLD_DIR` in its own process on every run.
-- Callers and `override_guard.sh` arrive in one commit: a tree with the callers and without the guard refuses every build. `mac_test.py` and `offload.py` run on the Mac too, so its checkout takes the same commit before the next Mac test.
+- The installed callers require `override_guard.sh`. Both machines need compatible installed helpers.
 - `MACOSX_DEPLOYMENT_TARGET` stays at 12.0 or above and follows the value hana's development shell exports on the Mac; `offload.py` and `mac_run.sh` carry the same value.
-- A module added to `scripts/build_hold`, `scripts/build_targets` or `scripts/lint` shares no name with one in the others: importing `build_hold`, `targets` or `offload` puts several of them on `sys.path`.
+- Repository imports use package names such as `scripts.build_hold.build_hold`.
+  Modules in different packages can share a filename without import-path changes.
 
 ### Copy records and lifetime
 
-Standing gate checkouts build cold once and retain their own build folders;
-no target seed is copied. The unused per-repository Cargo folder helper was
-removed: the verify-copies measurement (2026-10-30, case D) spent 68.7 of 69.0 s
-waiting on that folder's build lock. Legacy copy records still load and their
-old shared-folder field has no effect.
+Standing gate checkouts retain their own build folders.
+They use no target seed or shared build directory.
+Legacy copy records still load, but their shared-folder field has no effect.
 Style lint uses a standing gate checkout with its own real `target/` and holds
 `.claude-busy` through verification and cleanup. The checkout and cache survive
 the run; the floor sweep discovers the configured gates root and may reclaim
@@ -407,37 +437,237 @@ Scratch end rechecks the task under the removal lock. A hold on a copy's ancesto
 - While a holder file exists, a local compiling step checks the hold before and after its memory gate. With an empty holder directory, the shell check answers without starting Python.
 - On a machine that never held, the holder directory is missing, so steps keep starting Python until the first hold creates it.
 - The launch hook always starts `check-local`; it has no shell shortcut.
-- `offload.py` is imported by `targets.py` (every `build_targets.py` command) and by both reports, and it imports `treekey` at module level. A module-level import added there runs in every hold check, launch check and report.
+- `build_targets.py` loads project modules inside their users. Local-only commands do not load `mac_test` or `offload`.
+- `targets.py` separates local hold state from SSH state. An import of `build_targets` alone does not load `mac_test`.
+- `step_selection.py` defines `Routed`, `Pinned`, `TargetSelection`, and `ROUTED`, and imports only `dataclasses`.
+- `step_record.py` re-exports these selection types for existing AWS callers. Each type has one definition.
 - `BUILDLOG_TARGET` becomes `mac` when a Mac attempt starts, before the claim is decided; it names where the call was when it ended, not proof that tests ran there.
 - A launch with no session id has the key `""` and waits while any holder file exists. A hold placed under a name that is no live session keys its file by that name, so no session's launch matches it.
 - `holders_in_force`, `natedev_holds` and local hold checks use present holder files, never cycle release fields. A damaged cycle cannot admit a waiter; removing the last holder file permits it even when that cycle remains damaged.
 - `parse_hold_target` runs as argparse's `type=`, so an exception other than `ConfigError` or `UnicodeError` from `read_targets` prints a traceback. A non-UTF-8 config reaches the caller as `conf.Unusable`, which names the file.
 - `mac_test.py unblock` matches the stored holder name, not the session id; the rename retry runs at most one extra `unblock`.
-- Install rules: change `build_hold.py` on the live machine only while natedev is free and no release runs, because a waiter or driver keeps the code it started with. Install `mac_test.py` and `offload.py` together with no active Mac claim and no old `watch`, `watch-claim` or waiting `claim` running: an older copy reads only `run.json` and never sees `claims/<repo>.json`.
+- Installed hold and claim writers must use compatible code. A running waiter retains the code that it started.
 - The build log carries two Mac host names (`Mac` and `Nates-MacBook-Pro-2023`), so report code selects the Mac as `host <> 'natedev'`, never by one name. The `scripts/buildlog/buildlog` wrapper runs the installed copy; check worktree report code with `~/.claude/scripts/lib/py scripts/buildlog/cli.py` and `BUILDLOG_DIR` on a scratch copy of the log.
 - The claim watcher's ssh activity check has a fixed 10 s total limit beside the configurable connect timeout. A live check of worktree claim code runs `mac_test.py` through `~/.claude/scripts/lib/py` with scratch `MAC_TEST_STATE_DIR` and `MAC_TEST_CONFIG`; the installed copy refuses those overrides.
-- The leftover check ends every process under the Mac's mirror root, for every repository, a person's shell or editor there included. ssh's exit status proves nothing (Tailscale SSH returns 0 whatever ran); only printed lines are read.
-- `MACOSX_DEPLOYMENT_TARGET` was unset because the remote command runs in a non-login ssh shell and the mirror is outside `~/rust`, so direnv never runs there; rustc then links for macOS 11.0. Below 12.0 the SDK records `@rpath/libswift_Concurrency.dylib` and a binary with no rpath aborts at load (exit 104). A changed value costs one rebuild on the Mac (a cold hana build measured 12 min 35 s); nothing in the mirror is deleted by hand.
+- The leftover check selects the current repository's mirror. A whole-Mac scope selects every mirror.
+- A shell or editor inside the selected mirror can match. Printed completion markers determine the remote result.
+- Remote commands use a non-login SSH shell outside the development checkout. They must set `MACOSX_DEPLOYMENT_TARGET` explicitly.
+- Below macOS 12.0, Swift concurrency linkage can fail at load. A changed deployment target requires a rebuild.
 - Guard limits: a checkout or any other copy of the scripts accepts the variables, so a worker that runs a copy still passes a hold. Report-only programs and variables outside the list (`VERIFY_MAC_RUNNER`, `LINT_CONFIG_READER`, `MAC_TEST_SESSIONS`, `MAC_TEST_SEND`, the `BUILDLOG_HOLD_*` files) are not guarded. A shell caller started through a link outside `scripts/` looks for `override_guard.sh` beside the link and stops with status 2.
 - Tests: every fixture that can reach the hold wait needs temporary `BUILD_HOLD_DIR`, `BUILD_HOLD_RELEASE_DIR` and `UNIT_ACTIVE_DIR` and cleared `BUILDLOG_CALL_ID` and `BUILDLOG_CALLER`; one that reaches the installed scripts through the real `HOME` rewrites the live release record. Shared test support and guarded suites call `override_guard.require_checkout(Path(__file__))` at import. From the installed scripts it raises one error: `<suite file>: this suite runs from a checkout, not from the installed scripts under <home>/.claude/scripts; run it from a worktree.` The home comes from the account database and links are followed. Run the suites from a worktree; the check does not skip tests. A test that changes `cycle.json` mid-wait writes it whole under `release_lock()` (`change_cycle`), never with `Path.write_text`. A case that reaches a hold-event write sets a temporary `BUILDLOG_DIR` and waits for the detached recorder before checking that no further event was written. The full `scripts/direct` suite takes about 12.5 minutes and is the only check that a sibling import loads where tests import a module as `scripts.<dir>.<file>`.
 - The test stand-in for `mac_run.sh` answers "not an ancestor" when the sha equals the clone head, where git answers "is an ancestor"; the bundle-path cases depend on that.
 
 ## Why
 
-- **Targets with their own rules, not one global hold.** natedev and the Mac fail for different reasons and have different capacity. One rule per target lets a natedev timing run hold natedev alone while tests keep reaching the Mac, and a new machine needs only a config entry and a settings file.
-- **Enforcement inside the tools.** A broadcast asking every session to stop depended on each agent obeying it and stopped Mac work too. `verify.sh` and the launch gate now wait or refuse by themselves, so the notice needs no action.
-- **Mac first, then natedev, never a held target.** The Mac is spare capacity, so it is tried first and natedev keeps its limits for everything else. Falling back to a held target would break the timing run the hold protects.
-- **The wait comes after the Mac attempt and before the cargo token.** A Mac run is never delayed by a natedev hold, and a call never waits for a hold while holding its run's cargo token.
-- **Release ends the hold at once.** Each recipient gets one notice, with no answer required. The memory gate orders the builds under its lock and starts each only when memory is available.
-- **The holder may launch its own apps.** A session holding natedev for a timing run needs its own app running; admitting it while another session's hold is also in force would break that session's timing. The hold file's name already is the session id, so no field was added.
-- **The guard compares files, not variables.** The installed root comes from the password database, so a worker cannot point the hold check at an empty directory by setting a variable or `HOME`. Tests keep their overrides because a checkout is a different file. Moving installed code to read no variable would have meant moving about 25 test files to per-process copies and adding a Python start to every build step.
-- **No process count or load cutoff on the Mac.** The user asked that apps running on the Mac never stop a build, and the count turned tests away whenever anyone built there. The claim already keeps two of our jobs for one repository apart, and the default is "go". The kept remote claim and the leftover check replace what the count used to catch after a lost run.
-- **An idle claim ends by itself.** Sessions claimed the Mac for their own work and then left the claim with nothing running; on one measured day 340 of 407 usable candidates declined `busy`. The watcher releases on a read-only activity check, never on the leftover check's answer, which kills what it finds, and messages only the holder, the one who can act.
-- **The report splits by host.** Mac steps with no recognized caller used to land in natedev's tables and Summary as `unknown (<Mac host>)`, while the offloaded runs appeared nowhere but a p50. Counting natedev alone keeps natedev's timings clean, and the Mac section shows the Mac's runs, times and failures.
-- **The deployment target, not an rpath.** One environment word fixes every crate in one place; crates that emit `-Wl,-rpath,/usr/lib/swift` cover only their own binaries.
-- **The power-profile comparison keys on the samples, like with like.** Every change the samples show gets a comparison, so no switch needs a hand-kept marker. Rows match step kind, caller and rebuild class so a cold build is never set against an edited-crate rebuild, and Change is withheld below 10 runs a side.
-- **One row per hold event, not per hold.** `forget` of one source file would otherwise leave half an interval. In-force state comes from the coordination records only, because an event can be lost.
+Separate target rules let a hold stop one machine while other machines keep working.
+The tools enforce holds before execution, so a notice needs no recipient action.
+The configured order uses free remote capacity before local capacity.
+Local admission still checks memory and Cargo ownership.
+
+A remote claim remains until cleanup confirms that its work ended.
+An idle claim watcher can release an unused claim through a separate activity check.
+[Mac step offload](mac-test-offload.md) defines those checks.
+
+A hold ends when its last holder file disappears.
+The memory gate then orders local builds without a release acknowledgement.
+The installed-script guard compares file identity, so tests can use private checkout state.
+
+Reports separate hosts and match comparable step kinds and rebuild classes.
+Hold events supply report evidence; coordination records determine current holds.
 
 Removal-log append, retention and readers take a separate stable lock before opening the log; retention replaces a complete temporary file, so a stopped pass keeps the rows and the next append uses the current log.
 
 Before deleting a linked worktree, the folder audit saves its source repositories beside the removal log; a rerun prunes those sources after the folder is gone and removes the record only after every prune succeeds.
+
+## Verify commands and metadata
+
+Every command uses `verify.sh <command> [<package>] [flags]`.
+No package selects the whole workspace.
+
+| Command | Selection |
+| --- | --- |
+| `check [<package>]` | Workspace check; a package owns feature names without a slash. |
+| `build [<package>]` | Workspace build; a package owns feature names without a slash. |
+| `test [<package>] [--test <name>]` | Workspace or package tests; an optional integration target uses `--test`. |
+| `lint [<package>] [--check]` | Workspace judgment and scoped local formatting. |
+| `doc [<package>]` | Workspace rustdoc against staged content. |
+| `example [<package>] [--name <name>]` | Workspace or named example selection. |
+| `final [<package>] [--saved] [--tree <tree>]` | Workspace check and selected tests, or a saved-pass query. |
+
+`parse_routing_arguments` removes routing flags into named shell values and returns the remaining `ARGS`.
+`parse_command_arguments` reads the command form.
+The caller restores positional arguments from `COMMAND_ARGS`.
+A refusal prints its reason and exits 2.
+An unknown command exits before detachment, run identity, target queries, or step records.
+The positional integration-test name, positional example name, `lint --workspace`, and `final-pass` forms refuse with the replacement usage.
+No alias accepts them.
+Call records use the package name or `workspace`.
+
+After help and saved-pass query exits, verify reads the Git top level.
+A missing root `Cargo.toml` prints `verify.sh: <root> has no Cargo.toml; verify.sh checks Cargo repositories only` and exits 2.
+This refusal precedes environment setup and Cargo calls.
+The final run contract chooses the repository's unit gate when the root has no Cargo manifest.
+For `~/.claude`, that gate is `scripts/lib/py scripts/production/targeted_test.py --checkout <tree>`.
+No configuration maps repositories to unit gates.
+[Checkpoint documentation and final targets](rustdoc-once-and-final-targets.md) defines the Cargo doc and final behavior.
+
+`read_metadata` uses `GATE_METADATA` or runs `cargo metadata --no-deps --format-version 1`.
+`load_metadata` decodes it once through `verify_metadata.py` and saves the shell answers.
+The helper reads JSON on stdin and writes shell-quoted `NAME=value` answers.
+Requests cover members, example features, test targets, check targets, build targets, untested examples, workspace root, and target directory.
+Queries and early doc exits need no metadata helper.
+`DEV_FEATURES_PY` reads the root manifest directly, so an invalid dev-feature list refuses before Cargo.
+
+`take_check_targets` includes `--lib` only when a workspace member has a library target.
+A binary-only workspace therefore checks successfully.
+A dependency's library cannot select `--lib`, because this metadata read excludes dependencies.
+
+`hash_stream` uses `sha256sum`, or `shasum -a 256` when the former is unavailable.
+It returns failure when the hash command fails.
+`lint_code_key` uses framed present or absent file bytes under `pipefail`.
+An unreadable file gives an empty key and a cache miss.
+
+`VERIFY_PY_TRACE=<file>` records one row per helper: helper name, wall milliseconds, and CPU milliseconds.
+The CPU value excludes child processes.
+Inline helpers use `VERIFY_PY_HELPER` as their name.
+The trace runner records at exit, exec, or SIGTERM and preserves the signal status.
+Without the trace variable, the wrapper adds no interpreter start.
+Repository Python helpers use the `scripts/lib/py` interpreter shim.
+User-zone timestamps use the direct `python3 -S` helper path.
+Bash clocks use `EPOCHREALTIME`; the initial step write supplies the wall-to-monotonic offset.
+A wall-clock jump can move a retry deadline because that offset is read once.
+
+## Verify cache and tree cancellation
+
+`scripts/direct/tree_watch.py` owns both the verdict key and the watched-input key.
+`TreeInputs(args, metadata)` applies the call's scope to one Git snapshot.
+`--key --with-tree-content` also returns the key without script-file hashes.
+`cache_record` keeps a separate lazy tree-content read for a mismatching verdict key.
+A content key ignores touch-only changes.
+
+A lint key includes the compiler, mend, nightly rustfmt, clippy, and Taplo versions.
+Per-call version files avoid repeated probes.
+Unknown or empty tool versions prevent reuse and publication.
+`lint_code_key` covers verify.sh, the installed invoke.sh, and the selected lint configuration.
+A lint verdict cannot publish if that code key differs from its value at script load.
+The fix-loop change check uses tree content without script hashes.
+A lost-token status 125 is never cached.
+`cargo mend` status 125 ends lint with that status.
+
+Test verdict keys include the result environment policy and explicit forwarded values.
+The key reader receives explicit values through `VERIFY_RESULT_ENVIRONMENT_FD`.
+The build key excludes filter names and run-only `NEXTEST_*` values, except `NEXTEST_CARGO_PROFILE`.
+It includes both Cargo output roots.
+`refresh_test_build_inputs` refreshes the key at test start and after a build-hold wait.
+It also refreshes `BUILDLOG_TREE` when recording has started.
+`BUILDLOG_TREE` alone cannot prove a fresh test build.
+[Memory admission](build-memory-admission.md#test-selection-and-fresh-build-evidence) describes the freshness check.
+[Mac step offload](mac-test-offload.md) defines result-environment forwarding on every route.
+
+### Watched scope and exit 77
+
+A test watches its package, path dependencies, workspace-member manifests, and Cargo root inputs.
+Cargo root inputs are `Cargo.toml`, `Cargo.lock`, `rust-toolchain`, `rust-toolchain.toml`, and `.cargo/`.
+These paths use metadata's workspace root, which can differ from the Git root.
+Without a known workspace root, root inputs do not trigger cancellation.
+Files inside `UNIT_SESSION_DIR` and `UNIT_RUN_DIR` do not count.
+
+`start_tree_watch` and `finish_tree_watch` enclose nextest, including a remote nextest run.
+Lint watches only the clippy judgment after mend, fixes, and formatting.
+Other commands have no tree watcher.
+The watcher checks every `VERIFY_TREE_WATCH_S` seconds, with a default of five seconds.
+A changed nonempty key writes `FIRED`, records the changed path, and sends USR2 to the parent.
+An unreadable snapshot cannot prove a change and does not fire.
+A missing parent ends the watcher with status 3.
+
+`cancel_tree_run` stops the watcher and remote runner, releases the Cargo token, and stops the local step group.
+It removes this call's token waiter files, including `.again`, and its recorded memory resources.
+It records `cancelled`, prints the resubmit message, and exits `TREE_CHANGED_STATUS=77`.
+It writes no verdict cache and starts no retry.
+The final `cache_record` tree check still prevents a stale pass.
+Progress history uses `canceled`; `finish_activity` converts the build log's `cancelled` spelling.
+
+The build report excludes `cancelled` from failure counts.
+Detached run output identifies exit 77 as cancellation and requests resubmission.
+`merge_checkpoint.stop_cancelled_test` stops on a first or flaky-test rerun with status 77.
+It performs no retry or rollback.
+A child handoff writes `checkpoint-tests-pending/<checkpoint>` before merging.
+A resumed handoff runs those tests before any push or promotion and removes the marker after success.
+
+### Signal ownership and output
+
+`verify_interrupted` handles a local group stop and records exit 128 plus INT, TERM, or HUP.
+`verify_interrupted` and `hold_interrupted` ignore repeated signals during cleanup.
+The parent retains `RUN_STEP_PID`, including during mend.
+The existing `run()` tee captures `MEND_LOG`; an outer pipeline must not hide the step PID in another shell.
+
+`run_log_tee` ignores INT, TERM, and HUP and reads to EOF with `tee -i`.
+This preserves the last cleanup output and avoids SIGPIPE status 141.
+The local stop path waits for the step leader.
+It does not prove that every stopped descendant has exited before verify releases its resources.
+[Pending verify work](../plans/natedev-verify-next.md) records that remaining limit.
+Remote launch signals use `find_mac_runner_pid` and the rules in [Mac step offload](mac-test-offload.md).
+
+## Cargo token ownership and wait holders
+
+`config/direct.conf` supplies `VERIFY_TOKEN_HOLD_SECONDS` and `VERIFY_TOKEN_RENEW_SECONDS`.
+The shipped values are 3600 and 60 seconds.
+The renewal interval cannot exceed one third of the lease.
+`start_token_renewer`, `stop_token_renewer`, and `with_token_renewal` maintain one renewer per owned span.
+Nested spans reuse it.
+Renewal continues during memory admission, remote claim waits, and local hold waits while the call owns the token.
+`renew_token` passes `--pid $$` to `board.sh renew`.
+An inconclusive busy guard returns 2 and does not end renewal.
+A different recorded holder PID refuses renewal.
+
+The renewer records only its own sleep PID.
+Its launch flag and prior-job value recover `$!` before the PID assignment when a signal arrives during launch.
+Its trap stops and waits only for that sleep.
+A bare `wait` or `kill $(jobs -p)` can reach inherited jobs that the subshell did not start.
+
+`board.sh` retains an expired token when the live holder and recorded process group still match.
+`scripts/lib/process_start.py` supplies `Started`, `Zombie`, `Gone`, and `Unreadable` process-start results.
+Linux reads field 22 from the process stat file; Darwin uses `ps -o lstart=` under `LC_ALL=C TZ=UTC`.
+Different result kinds never compare equal.
+Unreadable start evidence retains ownership; a gone owner or a different start permits reclamation.
+All token, claim, and watcher readers must use the same host-specific start form.
+
+`STEP_OWNER_PY` checks ownership before a step starts.
+Lost ownership writes `VERIFY_TOKEN_LOST_FILE` and returns 125 without running the command.
+`buildlog_retry_unstarted_step` releases memory, reacquires the token, and repeats admission without recording an attempt result.
+`run()` wraps `run_step` and `finish_step_token`.
+It releases a token that the step acquired on success, failure, or an early return.
+It preserves a token that the caller already owned.
+The detached sweep calls `run_once` without board acquisition, so a verify call cannot wait on its sweep's token.
+
+`release_token` keeps `.given_back` across repeated releases from pipeline shells.
+`sync_token_state` checks that mark before either acquisition path.
+Only `token_acquired` removes it after successful acquisition.
+A local formatter uses `acquire_token local`, so a preceding remote step cannot send formatting to another target.
+
+### Recorded wait holders
+
+`phase_wait_start` supplies resource kind, resource, and a session or unit to the progress recorder.
+An absent identity records `HolderNotNamed`.
+`wait-holder` records a changed holder or its disappearance.
+No separate holder watcher runs beside a wait.
+
+Token lookup checks the roster key, implementation-worker slot or file stem, roster slot, then the herdr pass record.
+The herdr match uses the dispatch key or one matching `worker_name`.
+One staff identity resolves through the staff row's `current_session`.
+Missing or ambiguous matches give no session.
+The fallback unit comes from `unit_runs.run_owner`; `director` uses `unit_runs.director`.
+The lookup cache uses `slot:holder_pid` and retries unresolved identities on the next observation.
+
+Hold waits read `hold_waited_on`.
+Remote waits read overlapping claims owned by live runs of another session.
+Memory waits read the `holder <json>` event, including explicit `none`.
+The event pipe can open separate intervals after a refused remote claim while preserving the first queued time.
+A failed memory close writes `phase-close.<pid>.memory.<id>` for a later close attempt.
+
+A pinned target waits only while another live session holds its target claim.
+This includes a Linux reserve that loses a claim race and returns 1.
+Other refused answers retain their refusal.
+The pinned interval closes before execution starts, and a remote reservation closes the Cargo-token interval.
+Pinned routing skips the ordinary remote retry delay.
+Token wait timestamps read `scripts/lib/user_zone.py` directly and need no `USER_ZONE_SCRIPT` variable.

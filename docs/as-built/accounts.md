@@ -183,7 +183,6 @@ Pane workers move through their dispatch lock, fresh pane evidence, `restart.sto
 They keep the same conversation and reuse a stopped pane.
 Only an open pass receives resume text through the shared target check.
 `config/shutdown.conf` sets the stop deadline from `STOP_GRACE_SECONDS`, `KILL_GRACE_SECONDS`, and `MOVE_STOP_MARGIN_SECONDS`.
-Mesh-pinned runs keep the [worker design](long-lived-workers.md) server release path until herdr-worker-panes Phase 19.
 The [quota guide](../quota_alerts.md) owns phone episodes, forecasts, routing notices, and delivery retries.
 
 Login renewal uses named success and failure results.
@@ -203,7 +202,7 @@ Unavailable family evidence also refuses the restart.
 The real refusal leaves the source running.
 
 Source release preserves each stop reason and gives the next action.
-The [family handoff](long-lived-workers.md#family-handoff-and-retry) defines its named results and server evidence.
+The [family handoff](long-lived-workers.md#family-handoff-and-retry) defines its named results and native source evidence.
 A session move's opening message selects only its [own worker children](shutdown-and-restart.md#worker-resume-results).
 
 ## Recovery and alert ownership
@@ -239,6 +238,10 @@ Status attributes a session to its account independently of the current role sel
 This preserves visible off-target members during a move.
 
 Local role counts read the registry, staff, pane launches, and worker records without writing state.
+`session_state.classify` supplies the shared unit status for the accounts board and the units table.
+An exit record takes precedence over a pause record.
+A missing live session gives `exited`; live activity gives `busy` or `idle`.
+The workers role retains only `busy` and `idle`.
 `session-counts-read` prints the same live count document without publishing a file.
 Peer counts use the shared role-map transport in a detached fetch.
 One claim prevents concurrent fetches.
@@ -294,7 +297,8 @@ Promotion never hides an unrelated dirty setting.
 ## Runtime configuration and constraints
 
 `config/accounts.conf` supplies account timeouts, ages, limits, sizes, holds, leases, and path roots.
-Callers use `conf.whole`, `conf.number`, or `conf.text` at use.
+Each pass takes one `conf.read("accounts")` and shares its `ConfigRead` with its helpers.
+The read supplies `whole`, `number`, and `text` methods.
 Session loops reuse a value read for that call instead of reading configuration for each session.
 Paths with `~` expand through `HOME`, so scratch homes remain isolated.
 A configuration change needs no build.
@@ -304,7 +308,8 @@ Without that override, an absent file or key can use the repository's matching `
 That default lookup precedes Git recovery.
 An invalid present value still uses validated Git recovery, rather than an unrelated repository default.
 Explicit folders have no repository fallback.
-`value_origin()` applies the same rules and distinguishes live, recovered, and unavailable values.
+`ConfigRead.origin(key, convert)` applies the same rules and distinguishes live, recovered, and unavailable values.
+The [shared configuration contract](showrunner-automation.md#shared-runtime-configuration) defines reads, limits, and publication.
 
 `note_file.notes_dir()` gives `AGENT_NOTES_DIR` and an explicit `AGENTS_DIR` override precedence.
 Its private cached helper reads `notes_directory` at most once per process.

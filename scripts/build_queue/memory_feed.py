@@ -11,7 +11,7 @@ import json
 import os
 import sys
 import time
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
@@ -28,7 +28,6 @@ if __name__ == "__main__":
     bootstrap = argparse.ArgumentParser(add_help=False)
     _ = bootstrap.add_argument("--code-root", type=Path, default=Path(__file__).resolve().parents[2])
     installed, _remaining = bootstrap.parse_known_args(namespace=installed)
-    sys.path.insert(0, str(installed.code_root))
 
 from scripts.build_queue import admission_code
 
@@ -50,15 +49,30 @@ from scripts.build_queue.queue_lines import age, plain, step_text
 from scripts.build_queue.queue_view import reason_phrase
 from scripts.lib.build_steps import RECORDED_STEP_NAMES
 from scripts.build_queue.scope_activity import LiveBuildRun, NotServiceSlice, ScopeProcesses
+from scripts.build_queue import admission_records
 from scripts.lint import memory_admit as gate
 from scripts.message import unit_labels
 from scripts.lib import conf
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.user_zone import user_zone
+from scripts.review_links import review_link
 
 GIB = 1024 ** 3
 CI_CGROUP = Path("/sys/fs/cgroup/hana.slice/hana-ci.slice")
 PROC = Path("/proc")
+CGROUP = CI_CGROUP.parents[1]
+SWAP_NAMES = {
+    "agents": "agent sessions ({count})", "apps": "other apps: {app}",
+    "desktop": "desktop session", "system": "system services", "ci": "hana CI",
+    "ungrouped": "not in a group", "unattributed": "not attributed", "total": "Total",
+    "smaller": "{count} smaller groups", "between": "between steps",
+    "compiler": "compiler cache",
+    "unavailable": "Swap is unreadable: {path}",
+    "difference": "Host swap minus the named cgroup readings.",
+    "host": "SwapTotal minus SwapFree from {path}",
+}
+SWAP_OWNER_SLICES = {"app-agents.slice": "agents", "session.slice": "desktop",
+                     "system.slice": "system", "hana.slice": "ci", "hana-ci.slice": "ci"}
 
 
 @dataclass(frozen=True)
@@ -70,17 +84,23 @@ class FeedConfiguration:
     report_refresh_seconds: int
 
 
+def configured_output_folder(settings: conf.ConfigRead) -> Path:
+    """Expand the configured page folder."""
+    return Path(os.path.expandvars(settings.text("output_folder"))).expanduser()
+
+
 def read_configuration(settings: conf.ConfigRead | conf.UseConfiguredValue = conf.UseConfiguredValue.CURRENT) -> FeedConfiguration:
     """Read the page settings from one configuration."""
     if isinstance(settings, conf.UseConfiguredValue):
         settings = conf.read("memory_feed")
-    return FeedConfiguration(Path(os.path.expandvars(settings.text("output_folder"))).expanduser(),
+    return FeedConfiguration(configured_output_folder(settings),
                              settings.number("interval_seconds"), settings.whole("history_days"),
                              settings.whole("swap_rows"), settings.whole("report_refresh_seconds"))
 
 
 class PageArguments(CodeRootArguments):
     once: bool = False
+    command: Literal["feed", "link"] = "feed"
 
 
 def page_arguments(argv: Sequence[str]) -> PageArguments:
@@ -88,7 +108,22 @@ def page_arguments(argv: Sequence[str]) -> PageArguments:
     _ = parser.add_argument("--once", action="store_true", help="Write one reading and exit.")
     _ = parser.add_argument("--code-root", type=Path, default=PageArguments.code_root,
                             help="Read the installed admission code from this repository.")
+    commands = parser.add_subparsers(dest="command")
+    _ = commands.add_parser("link", help="Print the build memory page link.")
+    parser.set_defaults(command="feed")
     return parser.parse_args(argv, namespace=PageArguments())
+
+
+def page_link() -> int:
+    """Print the configured page URL without publishing a reading."""
+    try:
+        folder = configured_output_folder(conf.read("memory_feed")).resolve()
+        url = review_link.snapshot_url(review_link.review_root().resolve(), folder / "memory_live.html")
+    except review_link.SNAPSHOT_ERRORS as error:
+        print(f"Build page link: {error}")
+        return 1
+    print(url)
+    return 0
 
 
 def publish_page(configuration: FeedConfiguration) -> None:
@@ -104,13 +139,13 @@ def gib(value: object) -> float:
 
 class GroupPart(TypedDict):
     who: str
-    pid: int | gate.PidNotRecorded
+    pid: int | admission_records.PidNotRecorded
     gib: float
     age: str
 
 
 class LeftoverProcess(TypedDict):
-    pid: int | gate.PidNotRecorded
+    pid: int | admission_records.PidNotRecorded
     program: str
 
 
@@ -125,7 +160,7 @@ class CIRunnerMemory(TypedDict):
     unit: str
     name: str
     used: float
-    pid: int | gate.PidNotRecorded
+    pid: int | admission_records.PidNotRecorded
 
 
 class BusyCIRunner(CIRunnerMemory):
@@ -174,15 +209,16 @@ class RowProgress(TypedDict):
 class RunRow(TypedDict):
     machine: NotRequired[str]
     age: NotRequired[str]
+    between_steps: NotRequired[bool]
     name: str
     showrunner: str
     unit: str
     progress: RowProgress | NoProgress
     state: str
-    pid: int | gate.PidNotRecorded
+    pid: int | admission_records.PidNotRecorded
     detail: str
-    used: float | gate.RunUseUnavailable
-    counted: float | gate.RunUseUnavailable
+    used: float | admission_records.RunUseUnavailable
+    counted: float | admission_records.RunUseUnavailable
     reserved: float
     started_at: float
     queued: bool
@@ -197,6 +233,21 @@ class SwapRow(TypedDict):
     name: str
     detail: str
     swap: float
+    bytes: int
+    kind: Literal["owner", "ungrouped", "unattributed", "smaller", "total"]
+
+
+@dataclass(frozen=True)
+class SwapUnavailable:
+    reason: str
+
+
+@dataclass(frozen=True)
+class SwapReading:
+    used: int
+    total: int
+    rows: list[SwapRow]
+    files_read: int
 
 
 class WaitRow(TypedDict):
@@ -255,7 +306,7 @@ class MemoryPage(TypedDict):
     read_at: float
     total: float
     available: float
-    cap: float | gate.CapUnavailable
+    cap: float | admission_records.CapUnavailable
     floor: float
     cap_text: str
     shortfall: float
@@ -373,7 +424,7 @@ def read_ci_runner(unit: Path, proc: Path) -> CIRunner:
                     "job": min(jobs)[1] if jobs else "CI job"}
         listeners = sorted(p.pid for p in processes.values() if p.program == "Runner.Listener")
         return {"unit": unit.name, "name": name, "state": "idle", "used": used,
-                "pid": listeners[0] if listeners else gate.PidNotRecorded()}
+                "pid": listeners[0] if listeners else admission_records.PidNotRecorded()}
     except (OSError, ValueError, IndexError, StopIteration) as error:
         return {"unit": unit.name, "name": name, "state": "unreadable", "diagnostic": str(error)}
 
@@ -390,7 +441,7 @@ def job_age(started_at: float, now: float) -> str:
 
 def ci_amount(value: float) -> str:
     """Show the shared CI text for an amount in GiB."""
-    return ci_bytes_text(round(value * gate.GIB))
+    return ci_bytes_text(round(value * admission_records.GIB))
 
 
 def build_ci_row(used: float, ci_kept: float, now: float,
@@ -422,7 +473,7 @@ def build_ci_row(used: float, ci_kept: float, now: float,
         lines.append(f"CI keep-aside {ci_kept:g} GiB also reduces the room.")
     lines.append("CI builds do not wait in the queue yet.")
     idle = [runner for runner in runners if runner["state"] == "idle" and isinstance(runner["pid"], int)]
-    pid = busy[0]["pid"] if busy else idle[0]["pid"] if idle else gate.PidNotRecorded()
+    pid = busy[0]["pid"] if busy else idle[0]["pid"] if idle else admission_records.PidNotRecorded()
     return {"name": "hana CI", "showrunner": "", "unit": cgroup.name, "state": detail if not busy else "",
             "pid": pid, "detail": detail, "used": used,
             "counted": 0.0, "reserved": 0.0, "started_at": busy[0]["started_at"] if busy else 0,
@@ -430,14 +481,14 @@ def build_ci_row(used: float, ci_kept: float, now: float,
             "ci_runners": runners, "progress": {"kind": "NoProgress", "reason": "no admission counter"}}
 
 
-def row_progress(steps: Sequence[gate.RunningStep]) -> RowProgress | NoProgress:
+def row_progress(steps: Sequence[admission_records.RunningStep]) -> RowProgress | NoProgress:
     """Use the newest step counter from the admission reading."""
     reason = "no admission counter"
     phase: Literal["building", "testing"]
     unit: Literal["modules", "units", "tests"]
     for step in sorted(steps, key=lambda step: step.started_at, reverse=True):
         memory = step.measured
-        if not isinstance(memory, gate.ProgressAdjustedMemory):
+        if not isinstance(memory, admission_records.ProgressAdjustedMemory):
             continue
         counter = memory.counter
         if isinstance(counter, progress.NoCounter):
@@ -457,7 +508,7 @@ def row_progress(steps: Sequence[gate.RunningStep]) -> RowProgress | NoProgress:
     return {"kind": "NoProgress", "reason": reason}
 
 
-def run_keep_text(hold: gate.RunKeepAside, steps: Sequence[gate.RunningStep]) -> str:
+def run_keep_text(hold: admission_records.RunKeepAside, steps: Sequence[admission_records.RunningStep]) -> str:
     lines = [keep_aside_text(hold)]
     for step in steps:
         detail = gate.progress_text(step.measured)
@@ -515,6 +566,149 @@ def report_reading(days: int) -> ReportSections | charts.IndexUnavailable:
         return charts.IndexUnavailable(str(error))
 
 
+def swap_row(name: str, detail: str, amount: int,
+             kind: Literal["owner", "ungrouped", "unattributed", "smaller", "total"] = "owner") -> SwapRow:
+    return {"name": name, "detail": detail, "swap": gib(amount), "bytes": amount, "kind": kind}
+
+
+class SwapReadingPass:
+    """Read each selected cgroup counter once for one host reading."""
+
+    def __init__(self, owners: Mapping[Path, tuple[str, str]]) -> None:
+        self.owners: Mapping[Path, tuple[str, str]] = owners
+        self.owner_ancestors: set[Path] = {parent for owner in owners for parent in owner.parents}
+        self.counters: dict[Path, int | SwapUnavailable] = {}
+        self.rows: dict[str, SwapRow] = {}
+        self.agent_count: int = 0
+
+    def counter(self, path: Path) -> int | SwapUnavailable:
+        if path not in self.counters:
+            try:
+                self.counters[path] = int((path / "memory.swap.current").read_text())
+            except (OSError, ValueError):
+                self.counters[path] = SwapUnavailable(SWAP_NAMES["unavailable"].format(path=path / "memory.swap.current"))
+        return self.counters[path]
+
+    def children(self, path: Path) -> list[Path]:
+        try:
+            with os.scandir(path) as entries:
+                return sorted(Path(entry.path) for entry in entries if entry.is_dir(follow_symlinks=False))
+        except OSError:
+            return []
+
+    def add(self, key: str, name: str, path: str, amount: int,
+            kind: Literal["owner", "ungrouped"] = "owner") -> None:
+        if not amount:
+            return
+        if key in self.rows:
+            row = self.rows[key]
+            row["bytes"] += amount
+            row["swap"] = gib(row["bytes"])
+            row["detail"] += "; " + path
+        else:
+            self.rows[key] = swap_row(name, path, amount, kind)
+
+    def visit(self, path: Path) -> int:
+        counter = self.counter(path)
+        nested_owner = path in self.owner_ancestors
+        category = SWAP_OWNER_SLICES.get(path.name, "")
+        if path.name.startswith("session-") and path.name.endswith(".scope"):
+            category = "desktop"
+        leaf = path in self.owners or bool(category) or path.parent.name in ("app.slice", "background.slice")
+        children = self.children(path) if not leaf or nested_owner or category == "agents" else []
+        charged = 0
+        if category == "agents":
+            self.agent_count += sum(child.name.endswith(".scope") for child in children)
+        if path in self.owners and not nested_owner:
+            name, detail = self.owners[path]
+            if isinstance(counter, int):
+                self.add(str(path), name, detail + " · " + str(path.relative_to(CGROUP)), counter)
+        elif category and not nested_owner:
+            if isinstance(counter, int):
+                self.add(category, SWAP_NAMES[category], str(path.relative_to(CGROUP)), counter)
+        elif path.parent.name in ("app.slice", "background.slice") and not nested_owner:
+            app = path.name.removeprefix("app-").removesuffix(".scope").removesuffix(".service")
+            if isinstance(counter, int):
+                self.add(str(path), SWAP_NAMES["apps"].format(app=app), str(path.relative_to(CGROUP)), counter)
+        elif children:
+            charged = sum(self.visit(child) for child in children)
+            if isinstance(counter, int):
+                if path in self.owners:
+                    name, detail = self.owners[path]
+                    self.add(str(path), name, detail, counter - charged)
+                elif category:
+                    self.add(category, SWAP_NAMES[category], str(path.relative_to(CGROUP)), counter - charged)
+                else:
+                    self.add("ungrouped", SWAP_NAMES["ungrouped"], str(path.relative_to(CGROUP)),
+                             counter - charged, "ungrouped")
+        elif isinstance(counter, int):
+            self.add(str(path), path.name.removesuffix(".scope").removesuffix(".service").removesuffix(".slice"),
+                     str(path.relative_to(CGROUP)), counter)
+        return counter if isinstance(counter, int) else charged
+
+
+def read_swap(steps: Sequence[admission_records.RunningStep], labels: Mapping[str, unit_labels.UnitLabels],
+              row_limit: int) -> SwapReading | SwapUnavailable:
+    """Account for host swap with disjoint cgroup owners and an explicit difference."""
+    owners: dict[Path, tuple[str, str]] = {}
+    for step in steps:
+        memory = step.measured
+        if not isinstance(memory, admission_records.MeasuredMemory):
+            continue
+        source = memory.anonymous_source
+        path: Path
+        if isinstance(source, admission_records.ScopeSource):
+            path = source.directory
+        elif isinstance(memory, admission_records.UnownedSliceMemory) and memory.cgroup:
+            path = Path(memory.cgroup)
+        else:
+            continue
+        if path.is_relative_to(CGROUP) and path.name not in SWAP_OWNER_SLICES:
+            identity = step_labels(step, labels)
+            name, detail = step_text(step, RECORDED_STEP_NAMES), identity.session
+            if step.step == SWAP_NAMES["between"]:
+                name, detail = identity.session or str(path.name), SWAP_NAMES["between"]
+            elif isinstance(memory, admission_records.UnownedSliceMemory):
+                name = identity.session or memory.owner
+            elif isinstance(memory, admission_records.CompilerServiceMemory):
+                name = SWAP_NAMES["compiler"]
+            _ = owners.setdefault(path, (name, detail))
+    reading = SwapReadingPass(owners)
+    for child in reading.children(CGROUP):
+        _ = reading.visit(child)
+    path = PROC / "meminfo"
+    try:
+        values = {fields[0].removesuffix(":"): int(fields[1]) * 1024
+                  for line in path.read_text().splitlines() if (fields := line.split()) and fields[0] in ("SwapTotal:", "SwapFree:")}
+        total = values["SwapTotal"]
+        used = total - values["SwapFree"]
+    except (OSError, ValueError, KeyError, IndexError):
+        return SwapUnavailable(SWAP_NAMES["unavailable"].format(path=path))
+    if "agents" in reading.rows:
+        reading.rows["agents"]["name"] = SWAP_NAMES["agents"].format(count=reading.agent_count)
+    rows = sorted((row for row in reading.rows.values() if row["kind"] == "owner"),
+                  key=lambda row: row["bytes"], reverse=True)
+    main_owners = [reading.rows[key] for key in ("agents", "desktop", "system", "ci") if key in reading.rows]
+    other_owners = [row for row in rows if row not in main_owners]
+    count = max(0, row_limit - len(main_owners))
+    visible = sorted(main_owners + other_owners[:count], key=lambda row: row["bytes"], reverse=True)
+    smaller = other_owners[count:]
+    if smaller:
+        visible.append(swap_row(SWAP_NAMES["smaller"].format(count=len(smaller)),
+            "; ".join(f"{row['name']}: {row['bytes']} B" for row in smaller),
+            sum(row["bytes"] for row in smaller), "smaller"))
+    visible.extend(row for row in reading.rows.values() if row["kind"] == "ungrouped")
+    attributed = sum(row["bytes"] for row in visible)
+    visible.append(swap_row(SWAP_NAMES["unattributed"], SWAP_NAMES["difference"], used - attributed, "unattributed"))
+    visible.append(swap_row(SWAP_NAMES["total"], SWAP_NAMES["host"].format(path=path), used, "total"))
+    return SwapReading(used, total, visible, len(reading.counters) + 1)
+
+
+def swap_text(rows: Sequence[SwapRow]) -> str:
+    """Show the same swap rows and Total as the page."""
+    return "\n".join(f"{row['name']}: {row['bytes']} B ({row['swap']:.6f} GiB) · {row['detail']}" for row in rows)
+
+
 def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.UseConfiguredValue.CURRENT,
             report: ReportSections | charts.IndexUnavailable | ReportNotRead = ReportNotRead.VALUE) -> MemoryPage:
     if isinstance(configuration, conf.UseConfiguredValue):
@@ -523,7 +717,7 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
     explanation = parsed.explanation
     captured = explanation.room
     host = explanation.decided_from.host
-    if not isinstance(captured, gate.MemoryRoom) or not isinstance(host, gate.HostMemory):
+    if not isinstance(captured, admission_records.MemoryRoom) or not isinstance(host, admission_records.HostMemory):
         raise RuntimeError("recorded room unavailable")
     labels = unit_labels.unit_labels_for(
         [step.session_id for step in (*parsed.view.running, *parsed.view.waiting)], os.environ)
@@ -543,29 +737,28 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
     reserved = gib(sum(run.bytes for run in captured.runs))
     ci_kept = gib(captured.ci_keep_aside.bytes)
     ci_ram, ci_name = gib(captured.ci_use), "hana CI"
-    by_owner: dict[str, gate.RunningStep] = {}
-    steps_by_owner: dict[str, list[gate.RunningStep]] = {}
+    by_owner: dict[str, admission_records.RunningStep] = {}
+    steps_by_owner: dict[str, list[admission_records.RunningStep]] = {}
     reserved_steps = (entry for entry in explanation.running if gate.running_has_reservation(entry.step))
     for reservation, entry in zip(explanation.decided_from.reservations, reserved_steps, strict=True):
         owner = gate.reservation_owner(reservation, entry.step)
         by_owner[owner] = entry.step
         steps_by_owner.setdefault(owner, []).append(entry.step)
-    run_steps = {gate.run_owner(entry.step.run.pid, entry.step.run.start_time): entry.step
+    run_steps = {admission_records.run_owner(entry.step.run.pid, entry.step.run.start_time): entry.step
                  for entry in explanation.running if isinstance(entry.step.run, LiveBuildRun)}
     walk: list[RunRow] = []
-    swaps: list[SwapRow] = []
     for hold in captured.runs:
         step = by_owner.get(hold.memory.owner)
         metadata = step if step is not None else run_steps.get(hold.memory.owner)
-        name = step_text(step, RECORDED_STEP_NAMES) if step is not None else "between steps"
         identity = step_labels(metadata, labels) if metadata is not None else unit_labels.UnitLabels("")
         unit = identity.unit
-        detail = unit if metadata is not None else hold.memory.owner
-        use = gib(hold.memory.use.bytes) if isinstance(hold.memory.use, gate.AnonymousRunUse) else hold.memory.use
+        name = step_text(step, RECORDED_STEP_NAMES) if step is not None else identity.session or hold.memory.owner
+        detail = unit if step is not None else SWAP_NAMES["between"]
+        use = gib(hold.memory.use.bytes) if isinstance(hold.memory.use, admission_records.AnonymousRunUse) else hold.memory.use
         run = hold.memory.run
         pid = (metadata.run.pid if isinstance(metadata.run, LiveBuildRun) else metadata.pid) if metadata is not None else (
-            run.pid if isinstance(run, LiveBuildRun) else gate.PidNotRecorded())
-        walk.append({"name": name, "showrunner": identity.showrunner, "unit": unit,
+            run.pid if isinstance(run, LiveBuildRun) else admission_records.PidNotRecorded())
+        walk.append({"name": name, "showrunner": identity.showrunner, "unit": unit, "between_steps": step is None,
                      "state": "", "pid": pid, "detail": detail, "used": use,
                      "counted": use + gib(hold.bytes) if isinstance(use, float) else use, "reserved": gib(hold.bytes),
                      "started_at": metadata.started_at if metadata is not None else 0,
@@ -578,16 +771,16 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
         identity = step_labels(step, labels)
         name, detail = step_text(step, RECORDED_STEP_NAMES), identity.unit
         unit, state = detail, ""
-        if isinstance(memory, (gate.UnownedSliceMemory, gate.CompilerServiceMemory)):
-            service = (isinstance(memory, gate.CompilerServiceMemory)
+        if isinstance(memory, (admission_records.UnownedSliceMemory, admission_records.CompilerServiceMemory)):
+            service = (isinstance(memory, admission_records.CompilerServiceMemory)
                        or not isinstance(memory.job_state, NotServiceSlice) or bool(memory.diagnostic))
             if service:
-                name = memory.owner if isinstance(memory, gate.UnownedSliceMemory) else "compiler cache"
+                name = memory.owner if isinstance(memory, admission_records.UnownedSliceMemory) else "compiler cache"
                 activity = service_activity_text(memory, explanation.now)
                 state = activity
-                unit = memory.owner if isinstance(memory, gate.UnownedSliceMemory) else "sccache.service"
-                detail = activity if isinstance(memory, gate.UnownedSliceMemory) else "sccache.service · " + activity
-                if isinstance(memory, gate.UnownedSliceMemory):
+                unit = memory.owner if isinstance(memory, admission_records.UnownedSliceMemory) else "sccache.service"
+                detail = activity if isinstance(memory, admission_records.UnownedSliceMemory) else "sccache.service · " + activity
+                if isinstance(memory, admission_records.UnownedSliceMemory):
                     ci_name = "hana CI"
                     description = memory.diagnostic
                 else:
@@ -599,25 +792,23 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
                            "age": queue_view.leftover_age(age(step.started_at, explanation.now)) if step.started_at else "not recorded",
                            "progress": row_progress((step,)),
                            "queued": False, "keep_text": description, "group": "", "ci": False, "parts": []}
-            if service and isinstance(memory, gate.UnownedSliceMemory):
+            if service and isinstance(memory, admission_records.UnownedSliceMemory):
                 row = build_ci_row(gib(memory.bytes), ci_kept, explanation.now,
                                    Path(memory.cgroup) if memory.cgroup else CI_CGROUP)
                 if memory.diagnostic:
                     row["keep_text"] += "\n" + memory.diagnostic
                 name, detail = row["name"], row["detail"]
-            if not service and isinstance(memory, gate.UnownedSliceMemory) and isinstance(memory.activity, ScopeProcesses) and memory.bytes < GIB // 2:
+            if not service and isinstance(memory, admission_records.UnownedSliceMemory) and isinstance(memory.activity, ScopeProcesses) and memory.bytes < GIB // 2:
                 program = memory.activity.program
-                group = "Codex servers" if program in ("codex", "codex-real", "mesh_runs.py") else "worker background runs"
+                group = "Codex servers" if program in ("codex", "codex-real", "detached_runs.py") else "worker background runs"
                 row["detail"] = " · ".join(part for part in (detail, program) if part)
                 groups.setdefault(group, []).append(row)
             else:
                 walk.append(row)
-        if isinstance(memory, gate.MeasuredMemory) and memory.swap_bytes:
-            swaps.append({"name": name, "detail": detail, "swap": gib(memory.swap_bytes)})
     walk.sort(key=lambda row: row["started_at"])
     for name, members in groups.items():
         amount = sum(row["used"] for row in members if isinstance(row["used"], float))
-        walk.append({"name": f"{name} ({len(members)})", "showrunner": "", "unit": "", "state": "", "pid": gate.PidNotRecorded(), "detail": "each under 0.5 GiB",
+        walk.append({"name": f"{name} ({len(members)})", "showrunner": "", "unit": "", "state": "", "pid": admission_records.PidNotRecorded(), "detail": "each under 0.5 GiB",
                      "used": amount, "counted": 0.0, "reserved": 0.0, "started_at": 0,
                      "queued": False, "keep_text": "Memory these processes hold outside the build queue.",
                      "progress": {"kind": "NoProgress", "reason": "group has no admission counter"},
@@ -630,14 +821,14 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
         row["machine"] = machine
     waiters: list[WaitRow] = []
     checks = {row.waiter.pid: row.room for row in explanation.line.steps}
-    if isinstance(explanation.head, gate.HeadExplanation):
+    if isinstance(explanation.head, admission_records.HeadExplanation):
         checks[explanation.head.waiter.pid] = explanation.head.room
     for waiter in parsed.view.waiting:
         check = checks.get(waiter.pid)
         need = check.need if check is not None else waiter.need
         identity = step_labels(waiter, labels)
         reason = reason_phrase(waiter.reason, parsed.view.waiting)
-        if isinstance(waiter.reason, gate.BehindHead):
+        if isinstance(waiter.reason, admission_records.BehindHead):
             reason = "head protection · " + reason
         waiters.append({"name": step_text(waiter, RECORDED_STEP_NAMES), "showrunner": identity.showrunner, "unit": identity.unit, "pid": (waiter.run.pid if isinstance(waiter.run, LiveBuildRun) else waiter.pid), "detail": identity.unit,
                         "need": gib(waiter.need), "since": waiter.since,
@@ -650,21 +841,24 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
     if isinstance(parsed, wire.CloudQueueRead):
         cloud_slots = parsed.cloud_slots
         model = queue_view.QueueModel(
-            parsed, labels, gate.NoWaiter(), head_facts.PaceUnavailable(), ZoneInfo("UTC"),
-            queue_view.HostLoadUnavailable(), gate.NoWaiter(), names=RECORDED_STEP_NAMES)
+            parsed, labels, admission_records.NoWaiter(), head_facts.PaceUnavailable(), ZoneInfo("UTC"),
+            queue_view.HostLoadUnavailable(), admission_records.NoWaiter(), names=RECORDED_STEP_NAMES)
         rows = queue_view.cloud_rows(model)
-        cloud_slots_used = sum(isinstance(row.wait, gate.ReadyForAdmission) for row in rows)
+        cloud_slots_used = sum(isinstance(row.wait, admission_records.ReadyForAdmission) for row in rows)
         lines = queue_view.cloud_lines(model, 1_000_000)
         if lines:
             cloud_heading = plain(lines[:1])
             cloud = [plain([line]).strip() for line in lines[1:]]
     pressure = explanation.decided_from.pressure
     policy = explanation.policy.pressure
+    swap = read_swap(parsed.view.running, labels, configuration.swap_rows)
+    if isinstance(swap, SwapUnavailable):
+        raise RuntimeError(swap.reason)
     pressure_values = read_stalls()
     pressure_label = "none"
-    if isinstance(pressure, gate.MemoryPressure):
-        pressure_label = gate.pressure_text(pressure)
-    elif isinstance(pressure, gate.PressureUnavailable):
+    if isinstance(pressure, admission_records.MemoryPressure):
+        pressure_label = admission_records.pressure_text(pressure)
+    elif isinstance(pressure, admission_records.PressureUnavailable):
         pressure_label = "unavailable: " + pressure.reason
     return {
         "ok": True, "read_at": explanation.now, "total": total, "available": gib(captured.available),
@@ -678,8 +872,8 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
         "shown_reserved": max(0.0, min(reserved, gib(captured.available) - safety)),
         "waiting": len(waiters), "smallest_need": min((step.need / GIB for step in parsed.view.waiting), default=0.0),
         "pressure": pressure_label,
-        "swap_used": gib(host.swap_total - host.swap_free), "swap_total": gib(host.swap_total),
-        "walk": walk, "waiters": waiters, "swap_by": swaps, "psi": pressure_values,
+        "swap_used": gib(swap.used), "swap_total": gib(swap.total),
+        "walk": walk, "waiters": waiters, "swap_by": swap.rows, "psi": pressure_values,
         "cloud": cloud, "cloud_heading": cloud_heading,
         "cloud_slots_used": cloud_slots_used, "cloud_slots": cloud_slots,
         "limits": {"some": policy.some_avg10_limit, "full": policy.full_avg10_limit, "swap": policy.swap_used_limit},
@@ -695,6 +889,8 @@ def page_json(payload: MemoryPage | RetainedReading | PageUnavailable) -> str:
 
 def main(argv: Sequence[str]) -> int:
     args = page_arguments(argv)
+    if args.command == "link":
+        return page_link()
     configuration = read_configuration()
     publish_page(configuration)
     target = configuration.output_folder / "memory.json"

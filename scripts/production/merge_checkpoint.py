@@ -34,6 +34,7 @@ from pathlib import Path, PurePath, PurePosixPath
 from typing import Literal, NamedTuple, TypedDict, cast
 
 from scripts.production import change_review
+from scripts.worktree import worktrees
 from scripts.lib import main_publish, scratch
 from scripts.production.showrunners import owner_for
 from scripts.production.production_doc import Production, ProductionDocument, Refusal, cell_value, production_field, read_production
@@ -161,6 +162,14 @@ class Stop(Exception):
 
 def report(step: str, state: str, detail: str) -> None:
     print(f"{step}: {state} — {detail}", flush=True)
+
+
+def end_pushed_worktrees(production: ProductionDocument) -> None:
+    for result in worktrees.end_landed(production.checkout, production.merge_branch):
+        if isinstance(result, worktrees.Ended):
+            report("worktrees", "ended", f"{result.path}; branch {result.branch}")
+        else:
+            report("worktrees", "kept", f"{result.path}: {result.reason}".replace("\n", "; "))
 
 
 @contextmanager
@@ -417,7 +426,7 @@ def ancestry(request: MergeRequest) -> bool:
 
 
 def change_review_commits(request: MergeRequest) -> list[change_review.Commit]:
-    """The unit's own commits in this checkpoint; hold it when one lacks its Change-Review line."""
+    """Check required review lines and count checkpoints and commits without a descendant checkpoint."""
     previous = request.production.merge_branch
     try:
         commits = change_review.unit_commits(request.production.checkout, request.commit, previous,
@@ -426,7 +435,8 @@ def change_review_commits(request: MergeRequest) -> list[change_review.Commit]:
         raise Stop("change review", "failed", str(error), "the showrunner will inspect the failed command") from error
     if refused := change_review.missing(commits):
         raise Stop("change review", "held", "; ".join(refused), change_review.HELD_NEXT_STEP)
-    report("change review", "ok", f"{len(commits)} unit commit(s) carry their {change_review.TRAILER} lines")
+    selected = change_review.review_commits(commits)
+    report("change review", "ok", f"{len(selected)} unit commit(s) carry their {change_review.TRAILER} lines")
     return commits
 
 
@@ -479,7 +489,7 @@ def _origin_merge_refs(request: MergeRequest) -> list[str]:
 
 
 def _unit_paths(request: MergeRequest, paths: tuple[str, ...]) -> tuple[str, ...]:
-    """Keep paths whose checkpoint content differs from every origin merge base."""
+    """Keep paths absent at an origin merge base or changed from every base that contains them."""
     if not paths:
         return ()
     own = set(paths)
@@ -490,11 +500,14 @@ def _unit_paths(request: MergeRequest, paths: tuple[str, ...]) -> tuple[str, ...
                 continue
             changed = git(request.production.checkout, "diff", "--name-only", "--no-renames", "-z",
                           base.stdout.strip(), request.commit, "--", *paths)
-            if changed.returncode:
+            present = git(request.production.checkout, "ls-tree", "--name-only", "-r", "-z",
+                          base.stdout.strip(), "--", *paths)
+            if changed.returncode or present.returncode:
                 continue
         except OSError:
             continue
-        own.intersection_update(changed.stdout.split("\0"))
+        unchanged = set(present.stdout.split("\0")) - set(changed.stdout.split("\0"))
+        own.difference_update(unchanged)
     return tuple(path for path in paths if path in own)
 
 
@@ -801,6 +814,7 @@ def push_git(production: ProductionDocument, may_undo: bool) -> str:
             undo_failed_push(production, old_origin, before_merge_tip)
         raise
     report("push", "ok", f"{production.merge_branch} pushed at {tip}")
+    end_pushed_worktrees(production)
     return tip
 
 
@@ -842,6 +856,7 @@ def push_validate(production: ProductionDocument, fix_commit: str, may_undo: boo
         raise
     tip = good(git(production.checkout, "rev-parse", "HEAD"), "push")
     report("push", "ok", f"validated and pushed {tip}")
+    end_pushed_worktrees(production)
     return tip
 
 
@@ -1392,6 +1407,7 @@ def run(request: MergeRequest) -> int:
                             if not promotion_done.exists():
                                 tip = refresh_pushed_tip(request.production, tip)
                             report("push", "ok", f"{request.production.merge_branch} already pushed at {tip}")
+                            end_pushed_worktrees(request.production)
                         elif isinstance(request.push, GitPush):
                             tip = push_git(request.production, not already)
                         else:

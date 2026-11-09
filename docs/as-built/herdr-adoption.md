@@ -2,7 +2,7 @@
 
 ## What it is
 
-Every showrunner, unit director and standalone Claude session uses a tab in the shared herdr session, `agents`, on both machines. Each production has one workspace. Each standalone session has a workspace with its tab name. A unit uses its fixed parent row's production workspace. No launcher starts a separate herdr session. `start_server` and `restore_server` refuse other session names. Open `agents` with `herdr session attach agents` (`hsa agents`). Use `herdr_sessions.py attach-remote <host> <tab>` for a tab on the other machine. Codex workers remain headless `codex app-server` threads. Crash recovery also restores interactive Codex conversations into tabs in `agents`. tmux remains only in old records, which produce manual restart instructions. The implementation uses `scripts/herdr/`, `scripts/production/`, `scripts/message/roster.py` and `scripts/shutdown/`. See [herdr-trial.md](herdr-trial.md) for the trial results.
+Every showrunner, unit director and standalone Claude session uses a tab in the shared herdr session, `agents`, on both machines. Each production has one workspace. Each standalone session has a workspace with its tab name. A unit uses its fixed parent row's production workspace. No launcher starts a separate herdr session. `start_server` and `restore_server` refuse other session names. Open `agents` with `herdr session attach agents` (`hsa agents`). Use `herdr_sessions.py attach-remote <host> <tab>` for a tab on the other machine. Workers use interactive Claude or Codex panes under their staff parent. Crash recovery also restores interactive Codex conversations into tabs in `agents`. tmux remains only in old records, which produce manual restart instructions. The implementation uses `scripts/herdr/`, `scripts/production/`, `scripts/message/roster.py` and `scripts/shutdown/`. See [herdr-trial.md](herdr-trial.md) for the trial results.
 
 ## How it works
 
@@ -154,19 +154,29 @@ These all use this path: effort changes (`unit_effort.py`), promotion, relays an
 
 ### Worker questions
 
+A worker puts its question in its reply and ends the turn.
+The turn hook sends that reply to the director.
+An unexpected screen prompt ends no turn, and the director finds it only when it reads the pane.
+
 `worker.py assign` returns exit 4 when a worker asks a question or is blocked, including before dispatch submission.
 It prints `question: <worker> pane <pane>` and the pane's recent visible lines.
 Exit 6 means busy before submission.
 
 1. Read the question text after the `question:` line.
 2. Run `worker.py answer <name> --text "<answer>"` from the director's session.
-3. Rerun that worker's saved `launcher_command` from `<run>/progress_history_state.json`.
+3. End the director turn until the completion hook sends its next message.
 
 A blocked Codex worker receives `shift+left`, the answer through `pane send-text`, and two `enter` keys.
 Herdr checks the target before each key.
 Idle workers and blocked Claude workers use `agent prompt`.
 The command refuses workers held by another parent.
-The saved launcher reads the transcript and waits for `DONE <dispatch id>` without submitting the dispatch again.
+A repeated saved launcher reads the transcript and returns without another submission.
+For a completed dispatch, each explicit rerun sends one completion notice through the shared hook code.
+This rule also applies to a completed managed Astra review.
+The saved completion preserves the reason and pane for a close anomaly.
+A successful completed rerun sets its status file to `done` after it sends the notice.
+The hook follows the worker's link to its existing pass state, including runs outside the run root.
+Exit 0 means submitted. The turn hook records completion and sends the director its reply path.
 
 ### Matching a running session to its staff row
 
@@ -180,6 +190,9 @@ The saved launcher reads the transcript and waits for `DONE <dispatch id>` witho
 
 Claude processes use their Claude session id.
 Codex processes use their Codex thread id.
+A fresh Codex uses its pane session report before it has a resume argument.
+The identity reader excludes only `scripts/herdr/turn_end.py` from the foreground process count.
+Every other foreground process prevents the pane report from proving a sole Codex process.
 Copied `STAFF_ID` values, folders, names, and retired pane marks do not select rows.
 `RecordedLabels.resolve` and `StaffLabels.environment` remove retired identity from the environment.
 `session_staff.LaunchMembership` resolves a saved staff reference to the current native runtime id.
@@ -312,18 +325,18 @@ Run these suites on the Mac with a scratch home. Run the command from the root o
 - Trust counts only on an exact key: the folder, its toplevel, or its main checkout. An accepted ancestor folder never counts.
 - The trust survey prints only the key, accepted and kind fields of `.claude.json`, never any other field.
 - One prompt per launch, never sent twice. `agent start` carries no prompt; the opening prompt goes through `agent prompt` once the agent is ready. Callers choose `OpeningPrompt` or `NoOpeningPrompt` explicitly.
-- Prompt input requires an agent status of `working`, `idle`, or `done` and an empty visible composer. An absent `interactive_ready` permits input. A boolean value controls input. A non-boolean value prints one readiness anomaly and prevents input. No Remote Control turn is required. A matching new user turn in the destination transcript proves submission. An unreadable transcript prevents a retry. Both `idle` and `done` permit retyping after the settle time.
+- Prompt input requires an agent status of `working`, `idle`, or `done` and an empty visible composer. An absent `interactive_ready` permits input. A boolean value controls input. A non-boolean value prints one readiness anomaly and prevents input. No Remote Control turn is required. Successful worker prompt delivery returns the launcher before the transcript must contain the prompt. A matching transcript prompt prevents replay. The matching final reply proves completion. A failed delivery command returns an error. An unreadable transcript prevents a retry. Both `idle` and `done` permit retyping after the settle time.
 - Each composer read uses `pane read --source visible --format ansi` and removes faint text. SGR 2 starts faint text. SGR 22 or 0 ends faint text. The parser skips colour arguments for SGR 38, 48, and 58. A faint hint can appear in an empty composer.
 
-The launcher records a completed pass, ends the worker's agent, and closes its pane.
-The close retains the staff row and native conversation.
-The next assign resumes that conversation in a new pane.
+The turn hook closes a completed pane after DONE.
+The close retains the staff row and thread. The next assign resumes that thread in a new pane.
+A busy worker or live detached run prevents closure until that work ends.
 Restore reopens only workers with active dispatches. Idle workers stay closed until their next assign.
 Shutdown restart uses the shared worker restore.
 Pane worker account moves use the shared stop, resume, and prompt APIs.
 Account moves resume only workers with active dispatches; each move closes an idle worker's pane.
 An idle worker's next assign opens its conversation on the current role account.
-A worker pane closes when its agent command returns. The staff row and native conversation remain.
+A worker pane closes after the completion hook records its pass. The staff row and native conversation remain.
 A resumed worker opens in a new pane after an assign, restore, or account move.
 Unit sessions and side panes keep their shells when their agents end.
 A busy worker receives one prompt to continue the same pass. An idle worker receives no prompt.
@@ -390,7 +403,7 @@ The resume message builder retains the launcher prompt path for restored workers
   The exec path prepares the target environment and removes conflicting account variables.
   Pane variables alone do not replace account admission.
   The [shutdown design](shutdown-and-restart.md) owns this shared move path.
-- A detached run is not a unit's second pane. The supervisor of a worker build that `mesh_runs.py supervise` runs stays in its pane's scope (in the herdr service's cgroup when pane scopes are not available), so herdr places it in the session; the command itself runs in a `builds.slice` scope. It inherits the unit's marks and a pane id that can be out of date. `unit_lookup` keeps only the places that can hold the unit's Claude when one does. Without that rule, a unit with a detached run reads as marked twice, and `roster.py` exits 1.
+- A detached run is not a unit's second pane. The supervisor of a worker build that `detached_runs.py supervise` runs stays in its pane's scope (in the herdr service's cgroup when pane scopes are not available), so herdr places it in the session; the command itself runs in a `builds.slice` scope. It inherits the unit's marks and a pane id that can be out of date. `unit_lookup` keeps only the places that can hold the unit's Claude when one does. Without that rule, a unit with a detached run reads as marked twice, and `roster.py` exits 1.
 - `herdr_place_of` reads every process for each call, so 40 calls took 10.7 s. `herdr_places()` places every pid in one read. `roster.py` uses it and takes about 1 s in total.
 
 **Mac.**
@@ -415,10 +428,11 @@ The resume message builder retains the launcher prompt path for restored workers
 
 ## Ruled out
 
-- Interactive Codex panes for workers. They stalled at the trust screen, lost Work Orders and hid from the roster, while headless workers ask nothing and the roster already finds them.
+- The earlier worker trial used headless Codex threads. Current workers use staff membership and interactive panes.
+- Shell waits for pane workers. Launch-line Codex notify and Claude Stop hooks now report turn results.
 - Installing herdr's Claude integration. It writes `~/.claude` hooks and settings that every session loads.
 - Ancestor folder keys as trust, and a trusted default start folder. Nothing records which folder the user last worked in, and a session opened somewhere unasked is worse than one prompt.
-- A Codex trust check. No launcher starts new Codex work in herdr, and crash restore only resumes a Codex session in the folder it already ran in.
+- A separate Codex trust check during crash restore. Restore resumes the saved conversation in its recorded folder.
 - Probing pane process info to detect shell readiness, because herdr sends no field that tells them apart. Killing an in-flight `agent start` at the deadline, because it leaves a half-started agent.
 - Copying the caller's environment into a pane. Only named marks and account variables pass.
 - A store-path fallback in `herdr_binary`, because a garbage-collected path fails late.
@@ -433,7 +447,7 @@ The resume message builder retains the launcher prompt path for restored workers
 ## Why
 
 - **One herdr session, one tab per Claude session (user, 2026-10-26).** One attach shows every session, with one workspace per production. `attach <tab>` and `attach-remote` focus the named tab first, so an attach still opens the session the user names. A tab has its session's name, so `list` and attach lines need no lookup table. A stop closes one tab and changes nothing else in the session.
-- **Codex workers stay headless.** App-server threads ask for no trust and already report through the worker ledger. Only Claude sessions, which the user watches, need a terminal.
+- **Native pane workers report through hooks.** Assignment returns after submission. The hook completes the pass and resumes the director with one message.
 - **Launches write trust.** The shared writer grants the exact repository key before Claude starts. A failed write prints one anomaly and prevents the start.
 - **Unique tab names.** A tab name is a session name, so two sessions must never share one. A taken `--name` refuses, and a generated name moves to the next suffix. Every launcher adopts the one shared server, so only the tab name must be unique.
 - **Socket ownership as identity.** Argv and `HERDR_SESSION` both mislead (attach-started servers, inherited variables). The process holding the listening socket cannot.

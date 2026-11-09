@@ -1,5 +1,7 @@
 """Check the memory page hover with private captured readings."""
 from __future__ import annotations
+from scripts.build_queue import admission_records
+
 import json
 from pathlib import Path
 import shutil
@@ -13,19 +15,19 @@ from scripts.build_queue.admission_records import reason_phrase
 from scripts.lint.memory_test_support import admission_policy_fixture
 from scripts.lint import test_memory_admit as memory_tests
 from scripts.lib import test_hang_guard
-GIB = gate.GIB
+GIB = admission_records.GIB
 
 
 class MemoryHoverTests(unittest.TestCase):
     def test_the_memory_page_hover_shows_the_captured_phase_percent_hold_and_reason(self) -> None:
         row = memory_tests.ProgressKeepAsideTests.reservation("merge-gate", need=4 * GIB)
-        memory = gate.MeasuredMemory(9 * GIB, anonymous=gate.AnonymousRunUse(GIB))
+        memory = admission_records.MeasuredMemory(9 * GIB, anonymous=admission_records.AnonymousRunUse(GIB))
         adjusted = gate.progress_memory(row, memory, gate.AttributedStepUse(memory.anonymous, True),
             progress.ProgressCounter("suites:1", 8, 10), memory_tests.ProgressKeepAsideTests.profile("suites:1", 3 * GIB // 2),
             admission_policy_fixture())
         inputs = memory_tests.ProgressKeepAsideTests.inputs((row,), (adjusted,))
         room = gate.inputs_room(inputs, admission_policy_fixture())
-        assert isinstance(room, gate.MemoryRoom)
+        assert isinstance(room, admission_records.MemoryRoom)
         text = memory_feed.run_keep_text(room.runs[0], inputs.running)
         self.assertIn("suites:1, 80% done", text)
         self.assertIn("0.5 GiB", text)
@@ -56,9 +58,9 @@ class MemoryHoverTests(unittest.TestCase):
 
     def test_each_wait_state_has_a_page_hover_reason(self) -> None:
         for reason, expected in (
-            (gate.PressureUnavailable("cannot read /private/proc/pressure/memory"), "/private/proc/pressure/memory"),
-            (gate.StartSpacingWait(110), "start spacing"),
-            (gate.BehindHead("first", 1, "head-session"), "behind"),
+            (admission_records.PressureUnavailable("cannot read /private/proc/pressure/memory"), "/private/proc/pressure/memory"),
+            (admission_records.StartSpacingWait(110), "start spacing"),
+            (admission_records.BehindHead("first", 1, "head-session"), "behind"),
         ):
             with self.subTest(reason=reason):
                 reading = feed_tests.with_wait_reason(feed_tests.captured_reading(), reason)

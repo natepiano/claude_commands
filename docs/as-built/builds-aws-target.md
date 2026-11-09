@@ -57,17 +57,23 @@ An interruption marker reports the instance generation.
 
 ### Routing: `scripts/direct/verify.sh`, `scripts/build_targets/build_targets.py`
 
-- `verify.sh test PACKAGE --target aws` pins one step to AWS. `check` and staged `doc` also accept `--target`.
+- `verify.sh <command> [PACKAGE] --target aws` pins movable steps to AWS.
+  This includes test, check, staged doc, example, build, final, and lint judgments.
+  Tree-writing lint repairs remain on natedev.
+  A pinned final runs its check and tests on AWS and saves no local pass.
   A pin keeps admission, spending, and version checks. It takes no natedev grant or cargo token.
   A refusal ends the step with a nonzero status. Remote step records include `target=aws`, `host=aws-build`, and `pinned=true`.
-- Queued `test`, `check` and staged `doc` steps try eligible SSH targets in configured order. `ssh_target_eligibility` checks configuration, backoff, capacity and reachability, with no shell evaluation.
+- Unpinned test, check, doc, example, and lint judgments try eligible SSH targets in configured order. `ssh_target_eligibility` checks configuration, backoff, capacity and reachability, with no shell evaluation.
 - `build_targets.py reserve` returns 0 (reserved or recovered), 11 (busy macOS target) or 1 (no reservation). `--recover-only` recovers only an existing claim. `MacClaimFromWait` moves ownership from the wait to the claim with no unclaimed interval.
 - `BUILDLOG_MEM_WAIT_SINCE` and `BUILDLOG_MEM_WAIT_FIRST_FILE` keep the first queue time across remote loss and local fallback. Local fallback needs admission. A confirmed remote failure does not cause a local rerun.
 - `hold_enforcer.protected_reason` protects every step state except `ON_NATEDEV`, so a natedev hold stops only local work.
 
 ### Cost ledger and spending guard: `scripts/aws_target/`
 
-- `config.py` reads the spending settings into `SpendingSettings`. Only a usable live limit permits spend. A committed value that `conf` recovers never permits spend (`conf.value_origin`: `UsableLiveValue`, `RecoveredValue`, `UnavailableValue`).
+- `config.py` reads the spending settings into `SpendingSettings`.
+  Only a usable live limit permits spend.
+  `ConfigRead.origin` returns `UsableLiveValue`, `RecoveredValue`, or `UnavailableValue`.
+  A recovered value never permits spend.
 - `ledger.CostLedger` is a locked, atomic JSON ledger. It records instance-state observations, price samples, charged intervals, compute requests, reconciliations and limit events. Times are integers and money is `Decimal`. Intervals split at day and month boundaries in the accounting zone. A corrupt ledger keeps its evidence and refuses new spend.
 - The estimate uses Spot price history, `fallback_usd_per_hour` when no sample exists, and the fixed costs (retained and root storage, IPv4, gp3 performance, Cost Explorer reads). Fixed costs continue while the instance is stopped.
 - `spending_guard` returns `SpendingAllowed`, `SpendingRefused` or `SpendingUnavailable`. It refuses when the estimate plus `limit_reserve_usd` reaches either cap. Each decision is written through `ledger._decision_record`. Readers decode that record and never compute the decision again.

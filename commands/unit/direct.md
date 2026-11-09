@@ -2,7 +2,7 @@
 description: Direct phases, reviews, and checkpoints.
 ---
 
-Run every worker through `bash ~/.claude/scripts/direct/assign.sh` as a background shell of the director session.
+Run every worker through `bash ~/.claude/scripts/direct/assign.sh` from the director session.
 This rule covers all roles and both Claude and Codex.
 Direct calls to worker launchers refuse with one line that names `assign.sh`.
 
@@ -61,7 +61,6 @@ State:
   launch names the phase with `--phase`, so status, summaries, findings and
   logs never collide with a phase running beside it. Run-wide files
   (`board.log`, `heartbeat.log`, the findings ledger and recorder state) stay in `${SESSION_DIR}`.
-  An existing mesh-pinned run also keeps `mesh_server.json` and `mesh_roster.json` there.
 - `PHASE_RESERVATION_STATE`: the tagged state persisted at
   `${PHASE_DIR}/delegated_phase_reservation_state.json`; see
   <PhaseReservationContract/>.
@@ -88,7 +87,7 @@ it:
 | <PeriodicCI/>, <CICleanup/> | `commands/unit/ci.md` | `/unit:ci` |
 | <VerbosePrePhaseGate/>, <BriefingFreshness/>, <PhaseBriefing/>, <TypeTableCells/>, <CombinedWindowBriefing/>, <AutoWindowBatchBriefing/> | `commands/unit/brief.md` | `/unit:brief` |
 | <ComposeWorkOrder/> | `docs/direct/compose_work_order.md` | — |
-| <WritePromptContract/>, <PhaseTeam/>, <CoordinationBoard/>, <PhaseMesh/>, <BuildTokenContract/>, <TeamFilePartition/>, <RoleReassignment/> | `docs/direct/write_prompt_contract.md` | — |
+| <WritePromptContract/>, <PhaseTeam/>, <CoordinationBoard/>, <BuildTokenContract/>, <TeamFilePartition/>, <RoleReassignment/> | `docs/direct/write_prompt_contract.md` | — |
 | <LaunchImplementation/> | `docs/direct/launch_implementation.md` | — |
 | <DualReview/>, <TeamReview/>, <ReviewPromptContract/>, <BroadReviewPrompt/>, <ClosureReview/> | `docs/direct/dual_review.md` | — |
 | <RunPhaseReview/>, <RunPhaseShrink/> | `docs/direct/run_phase_review.md` | — |
@@ -119,50 +118,40 @@ the director neither prepares style inputs nor pastes a style assignment.
 </TagReferenceContract>
 
 <LongLivedWorkers>
-Read the run's transport through `unit_runs.worker_transport(run)` once.
-Use the pinned transport for <WorkerRuns/>, <WorkerLaunchFailure/>, <FixDispatch/>, and <PhaseCleanup/>.
-The configuration selects a new run's transport. Never change an existing run's pin.
-Apply mesh instructions only when that existing pin is `mesh`.
-
-For `herdr`, dispatch through `assign.sh --role implement|test|fix|review --prompt <path> --cwd <worktree>`.
+Dispatch through `assign.sh --role implement|test|fix|review --prompt <path> --cwd <worktree>`.
 The launcher calls `worker.py assign` with the explicit role.
 Use `worker.py list` to inspect workers and `worker.py restore` to resume workers with active dispatches.
 The list uses `worker_panes.observe` for open, stopped, closed, unknown, and incomplete states.
 An unknown pane outside this parent's tabs does not make its absent workers uncertain.
 An unknown pane in a parent's tab, or an unreadable parent pane, can leave absence unproved.
 Use `worker.py end <name>` only for permanent removal.
-The launcher closes the worker's pane when its pass completes.
-The close keeps the native conversation and staff row.
-The next assign resumes that conversation in a new pane.
 The worker command selects idle workers and resumes stopped workers in new panes.
 Use the short name from `worker.py list` with `--to` when selecting a retained pane worker.
 Keep every busy or unknown worker unchanged.
-The transcript records prompt submission and the matching `DONE <dispatch id>` reply.
-Only exit 0 completes a pass.
-Exit 2 means refused.
-Exit 3 means no DONE reply. Exit 5 means stalled.
-Exit 4 means the worker asks a question or is blocked.
-Read `question: <worker> pane <pane>` and the question text.
-Run `worker.py answer <name> --text "<answer>"`, then rerun the worker's saved launcher command.
+Successful prompt delivery returns the launcher.
+The transcript prevents replay and proves completion with the matching `DONE <dispatch id>` reply.
+Exit 0 means submitted. The pass stays active until the turn hook proves completion.
+The launcher returns at once. End the director turn after the assigned synchronous review.
+The hook message names the worker, phase, outcome, and reply path.
+Read that reply before the next workflow step.
+A completed pass closes its pane and keeps its staff row and native conversation.
+A live detached run keeps the pass active. Its completion uses the same receipt rule.
+A finished run with an absent transcript result permits DONE completion and adds one anomaly line.
+A pending friend reply keeps the same pass and saved launcher arguments.
+Send no recovery prompt while either result remains pending.
+For `no DONE`, request a complete result with the saved dispatch id. The next turn hook records it.
+Exit 2 means refused. Exit 4 reports a Codex question and its visible pane lines.
+Answer with `worker.py answer <name> --text "<answer>"`. Keep the same pass.
+An unexpected screen prompt ends no turn, and the director finds it only when it reads the pane.
 Exit 6 means busy before submission. Exit 7 means retained. Exit 8 means uncertain.
-After an incomplete pass, inspect the named pane and rerun the saved launcher command before another role's dispatch.
-A rerun never types a prompt that the transcript records. It reads the transcript and waits for the worker.
-So when a turn ended with no DONE line, a rerun alone returns exit 3 (`NO_DONE`) again. Recover in this order:
-1. Tell the worker to write its complete result and to end with `DONE <dispatch id>` alone on the last line.
-   Use `send.py --from <holder> --to worker:<holder>/<worker> --text "<request>"`. The launcher's prompt line in the pane holds the id.
-2. Read the worker's reply in the pane. Check the result and the DONE line.
-3. Rerun the saved launcher command with its original arguments. The command is the worker's `launcher_command` in `<run>/progress_history_state.json`.
-A worker that waits on a friend's reply also ends its turn with no DONE, so the launcher exits 3.
-When the pane shows the worker's DONE line, rerun the saved launcher command. Do not send a message.
-After all repair workers complete successfully, run `findings.py landed` if the launcher does not run it.
-Use `--session-dir "${SESSION_DIR}" --phase "<phase id>"`.
+A failed delivery command returns an error even when the transcript contains the prompt.
+A repeated launcher reads the receipt and returns without another prompt.
 Read-only pane reviewers post no board lines and run no suites.
 The director or a writer handles required board posts and suites.
 A pane worker has no in-turn compaction option.
 Codex keeps its own full-window limit.
-Do not use mesh claims, mesh roster entries, or phase dispatch locks for this transport.
 
-A worker pane closes when its agent command returns. Shutdown retains the worker's row and native conversation.
+The completion hook closes a worker pane after DONE. Shutdown retains the worker's row and native conversation.
 Restore resumes only conversations with active dispatches through `worker.py restore`. Idle workers stay closed until their next assign.
 Restore reads the role and active pass from the recorder, then reuses the saved launcher command.
 It reads the transcript before input and never submits the same dispatch twice.
@@ -174,20 +163,6 @@ Unrelated proved moves can continue.
 A completed restore or move rerun prints one `unchanged` line and exits 0 without a restart notice.
 An interrupted split rebuild can leave panes in the source workspace and lose the split ratio.
 Inspect the tab and panes named by the anomaly line. A retry does not rebuild that split.
-
-For an existing `mesh` pin, keep each worker's thread through the existing unit ledger.
-Use `docs/as-built/long-lived-workers.md` for pause, move, end, and compaction.
-A failed compaction keeps the thread available for its own compaction.
-Never create another reviewer while its retained thread exists.
-At the next phase start, the director of a run with a `mesh` pin must follow these steps:
-
-1. Finish the current pass, or record the unfinished work in the plan.
-2. Keep the run's history, saved launcher arguments, and durable design bindings.
-3. Run `progress_history.py finish-run --status stopped`, then `end_session.sh`.
-4. Confirm with one `ps` read that no process of that run remains.
-   This includes `mesh_runs.py supervise`, `codex_mesh.py`, and `codex app-server`.
-   `end_session.sh` continues past a cleanup failure. Its exit does not prove that these processes stopped.
-5. Start a new run with `prepare_session.sh`. It pins herdr. Continue at the same plan phase.
 
 Every review prompt names `config/review/code.md` under <ReviewPromptContract/>.
 Other prompts carry the Three Gods and Type Design Contract under <WritePromptContract/>.
@@ -308,11 +283,8 @@ Run every command under `~/.claude/scripts/direct/` with
 calls run in the foreground. Unqualified worker script names below resolve
 under that directory. This avoids half-applied durable-state writes.
 
-- Claude: launchers and `verify.sh final` use `run_in_background: true`; retain
-  the returned task handle.
-- Codex: launch the same command in a managed unified-exec terminal with
-  `tty: true` and a short initial yield; retain its returned `session_id`. Do not
-  shell-background the launcher: it waits for its worker and remains attached.
+- Run pane assignments in the foreground. They return after submission.
+- Run `verify.sh final` through its detached verification path.
 - Saved run output (traces, captures, logs) stays under a few GB: read each run
   and delete it before the next. A disk-floor sweeper keeps 300 GiB free on `/`
   by deleting only the shortfall, least recently used build output first, never
@@ -323,36 +295,29 @@ under that directory. This avoids half-applied durable-state writes.
 </ToolingContract>
 
 <DispatchContract>
-Applies to every implementation, test, fix, and review launcher.
+Applies to implementation, test, fix, and review assignments.
 
-1. Launch under <ToolingContract/> and save `${DISPATCH_HANDLE}`.
-2. Tell the user in one line what is running and what happens on completion.
-3. Perform only synchronous work assigned by the call site: the main half of
-   <DualReview/> or the shrink assigned by <PhaseEnd/>. Do not inspect launcher
-   output as a substitute for that review.
-4. Claude: after assigned synchronous work, end the turn under <TurnEndGate/>,
-   naming what is running in the `— holding: waiting on <what is running>`
-   line, never its handle. A task message resumes the workflow.
-5. Codex: apply <CodexDispatchWait/>. Never end the turn while the launcher is
-   active; its terminal result drives the next workflow step.
-6. For `herdr`, recover an incomplete pass under <LongLivedWorkers/> before another role's dispatch.
-   For an existing `mesh` pin, a launcher killed at its time limit leaves its Codex
-   worker running with no one watching. Arm a Monitor on
-   `${SESSION_DIR}/board.log` until that worker
-   posts its own `done`, not a `launcher:` line. Once it has, and its last lint
-   and test passed after its last edit, retain its native conversation under
-   <LongLivedWorkers/> and record the outcome the launcher would have; for a
-   repair, that is <FixDispatch/>'s third outcome.
+1. Submit each assignment through `assign.sh` under <ToolingContract/>.
+2. Report the running work and the expected hook message.
+3. Complete the synchronous review assigned by the call site.
+4. End the director turn after submission and that review.
+5. Read the hook message and its reply file when the message resumes the director.
+6. Resolve `question` or `no DONE` under <LongLivedWorkers/> before changing the worker's role.
+
+Submission does not finish a pass or release a held role.
+The hook records completion and runs the saved completion actions.
+It receives Codex `notify` or Claude `Stop` input from the launch line.
+No launcher shell waits for a worker.
 </DispatchContract>
 
 <WorkerRuns>
 A Codex worker runs only commands that finish within one call and never makes
 an empty `write_stdin` poll. A longer command, a `verify.sh` run or any other
-started with `mesh_runs.py start`, detaches and pushes its own result to the
+started with `detached_runs.py start`, detaches and pushes its own result to the
 worker, per <WritePromptContract/> item 3. A live run keeps the worker's
 launcher attached, so the dispatch finishes only when the worker is done.
-Records are in `${SESSION_DIR}/mesh_runs/`, each log beside its record.
-`start` checks for a live twin before it applies `config/mesh_runs.conf` `LIVE_RUN_LIMIT` to that worker.
+Records are in `${SESSION_DIR}/detached_runs/`, each log beside its record.
+`start` checks for a live twin before it applies `config/detached_runs.conf` `LIVE_RUN_LIMIT` to that worker.
 At the limit, exit 4 starts nothing and names the live runs on stderr.
 Wait for a run's result as the next message, or put more files in one run.
 Exit 3 means the caller has no registered worker route; only that exit permits attached execution.
@@ -365,7 +330,6 @@ Stopped, blocked, closed, or uncertain workers' results go to their holder with 
 Unknown process evidence produces one anomaly line and permits no pane input.
 Use the result without sending another dispatch prompt.
 
-For an existing `mesh` pin, a result can report that no launcher is attached.
 Dispatch that worker through `assign.sh --role implement --to <full worker name>` when it must act on the result.
 
 When a decision makes a running or queued test, lint or build run useless,
@@ -374,14 +338,14 @@ This applies when a phase is parked, a round fails, a newer tree replaces the
 run's tree, or a result already in hand answers the question. No run finishes
 only to complete a report.
 
-- For a `mesh_runs.py` run, read `pid` from its record in
-  `${SESSION_DIR}/mesh_runs/` (the `.json` beside its log). Signal only while
+- For a `detached_runs.py` run, read `pid` from its record in
+  `${SESSION_DIR}/detached_runs/` (the `.json` beside its log). Signal only while
   its `status` is `running` and `ps -p <pid> -o args=` shows
-  `mesh_runs.py supervise` with that record's path, so a reused pid is never
+  `detached_runs.py supervise` with that record's path, so a reused pid is never
   hit; then run `kill -TERM -- -<pid>`. A start that found the same run live
   prints no pid: read it from that run's record.
 - A detached `verify.sh` run uses the same record and command: `verify.sh`
-  detaches through `mesh_runs.py` and handles TERM to stop its step.
+  detaches through `detached_runs.py` and handles TERM to stop its step.
 - For a run in the memory queue, cancel its owning run as above. The queue
   drops dead callers on its next read. It has no separate cancel command;
   `memory_admit.py release` only releases a reservation. A clean queue cancel
@@ -464,7 +428,7 @@ to that file per <WritePromptContract/>.
 <WritePromptContract>
 Read `~/.claude/docs/direct/write_prompt_contract.md` in full before writing any
 implementation, fix, or review prompt. It also defines <PhaseTeam/>,
-<CoordinationBoard/>, <PhaseMesh/>, <BuildTokenContract/>,
+<CoordinationBoard/>, <BuildTokenContract/>,
 <TeamFilePartition/>, and <RoleReassignment/>.
 </WritePromptContract>
 
@@ -732,16 +696,9 @@ plan-doc edit acquires that phase's reservation in an enrolled repository.
 </ShrinkCommit>
 
 <PhaseCleanup>
-For `herdr`, apply <LongLivedWorkers/> to close idle panes and retain worker rows for the next phase.
+Apply <LongLivedWorkers/> to close idle panes and retain worker rows for the next phase.
 
-For an existing `mesh` pin, run this command at <PhaseEnd/>'s worker cleanup point:
-`~/.claude/scripts/lib/py ~/.claude/scripts/direct/remove_workers.py --session-dir "${SESSION_DIR}"`.
-It removes the completed phase's Claude workers and any worker a dead run left
-alive; a failure is one line in the report, never a stop. Under
-<LongLivedWorkers/>, do not end this run's Codex workers: their turns finish, their
-threads stay open, and `end_session.sh` ends them with the run.
-
-For both transports, stop each Claude Agent helper and end finished launchers.
+For each phase, stop each Claude Agent helper and end finished launchers.
 Shut down every Hana or example app this phase launched. Never touch what another session started.
 Mid-phase, stop each helper once its result is read and each app once no step
 uses it.

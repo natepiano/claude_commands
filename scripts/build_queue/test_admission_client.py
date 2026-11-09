@@ -26,7 +26,6 @@ from scripts.message.codex_test_support import FakeDaemon, receive_frame, reply,
 from scripts.lib.socket_test_support import short_socket_directory
 from scripts.production import staff
 from scripts.production.staff_test_support import fixture_member, fixture_worker, fixture_runtime_id, isolated_staff_file
-from scripts.lint import memory_admit as gate
 from typing import cast
 from scripts.lib import conf
 from scripts.build_queue import admission_client as client, admission_protocol as wire
@@ -38,8 +37,8 @@ from scripts.build_queue.admission_test_support import (
 from scripts.build_queue.queue_fixture import QueueFixture, write_memory_config
 from scripts.lint.memory_test_support import commit_config_fixture, config_environment
 
-WAIT = wait_reply(gate.NeedsMemory(), 1, "head", "free memory")
-EXPIRED = wait_reply(gate.EstimateExpired(1), 1, "head", "estimate expired")
+WAIT = wait_reply(records.NeedsMemory(), 1, "head", "free memory")
+EXPIRED = wait_reply(records.EstimateExpired(1), 1, "head", "estimate expired")
 GRANTED = admitted_reply("stem", GIB, "new-source", "stem.max", "stem.wave")
 
 
@@ -53,18 +52,18 @@ class ClientTests(unittest.TestCase):
             transport = self.use_transport(fixture, Exchange(reply_bytes(wire.BuildHistoryReply(7))))
             with mock.patch.object(records, "read_memory_config", wraps=records.read_memory_config) as read:
                 generation = client.build_history_generation(client.READ_CONFIGURATION_AT_USE)
-            self.assertEqual(generation, gate.BuildHistoryGeneration(7))
+            self.assertEqual(generation, records.BuildHistoryGeneration(7))
             self.assertEqual(len(transport.requests), 1)
             self.assertIsInstance(transport.requests[0], wire.BuildHistoryRequest)
             read.assert_called_once()
 
     def test_history_generation_uses_supplied_configuration_without_another_read(self) -> None:
         with AdmissionFixture() as fixture:
-            configuration = gate.read_memory_config()
+            configuration = records.read_memory_config()
             transport = self.use_transport(fixture, Exchange(reply_bytes(wire.BuildHistoryReply(8))))
             with mock.patch.object(records, "read_memory_config", side_effect=AssertionError("supplied configuration was not used")):
                 generation = client.build_history_generation(configuration)
-            self.assertEqual(generation, gate.BuildHistoryGeneration(8))
+            self.assertEqual(generation, records.BuildHistoryGeneration(8))
             self.assertEqual(len(transport.requests), 1)
             self.assertIsInstance(transport.requests[0], wire.BuildHistoryRequest)
 
@@ -132,7 +131,7 @@ class ClientTests(unittest.TestCase):
                 "DESIGN_ROLES_STATE": str(root / "roles"), "XDG_STATE_HOME": str(root / "state"),
                 **config_environment(root / "config")}
             direct_config = root / "config/direct.conf"
-            _ = direct_config.write_text(direct_config.read_text().replace("WORKER_TRANSPORT=mesh", "WORKER_TRANSPORT=herdr"))
+            _ = direct_config.write_text(direct_config.read_text())
             received: list[dict[str, object]] = []
 
             def receive(connection: socket.socket) -> None:
@@ -286,14 +285,14 @@ class ClientTests(unittest.TestCase):
         with AdmissionFixture() as fixture:
             original = fixture.request()
             for unit in ("queue-unit", ""):
-                with self.subTest(unit=unit), mock.patch.dict(os.environ, {gate.BUILDLOG_UNIT: unit}):
+                with self.subTest(unit=unit), mock.patch.dict(os.environ, {records.BUILDLOG_UNIT: unit}):
                     request = client.step_request(list(original.argv), original.cwd, original.owner,
                         original.since, original.sidecar, original.episode, original.profile)
                     self.assertEqual(request.identity.unit, unit)
                     launch = wire.LaunchRequest(request.episode, request.owner, request.since,
                                                 request.identity, request.profile)
                     self.assertEqual(launch.identity.unit, unit)
-                    self.assertEqual(gate.waiter_identity("nextest", "tree").get("unit", ""), unit)
+                    self.assertEqual(records.waiter_identity("nextest", "tree").get("unit", ""), unit)
 
     def use_transport(self, fixture: AdmissionFixture, *exchanges: Exchange) -> ScriptedTransport:
         transport = ScriptedTransport(fixture.clock, *exchanges)
@@ -351,11 +350,11 @@ class ClientTests(unittest.TestCase):
                                                   wire.ExplainRequest(code_version=client.LOADED_ADMISSION_CODE_VERSION)])
 
     def test_recorded_pressure_snapshot_waits_then_admits_without_inventing_condition(self) -> None:
-        pressure = gate.MemoryPressure(8, 15, 80)
+        pressure = records.MemoryPressure(8, 15, 80)
         captured = wait_reply(pressure)
         captured = replace(captured, snapshot=replace(captured.snapshot,
-            running=tuple(gate.RunningStep("fixture", "worker", "check", "/tree", use,
-                gate.MeasuredMemory(use), pid=index) for index, use in enumerate((4 * GIB, GIB), 1)),
+            running=tuple(records.RunningStep("fixture", "worker", "check", "/tree", use,
+                records.MeasuredMemory(use), pid=index) for index, use in enumerate((4 * GIB, GIB), 1)),
             decision=replace(captured.snapshot.decision, pressure=pressure)))
         with AdmissionFixture() as fixture:
             request = fixture.request()
@@ -366,13 +365,13 @@ class ClientTests(unittest.TestCase):
             self.assertEqual(transport.requests, [request])
             self.assertEqual(len(waits), 1)
             pressure = waits[0].snapshot.decision.pressure
-            assert isinstance(pressure, gate.MemoryPressure)
-            self.assertIsInstance(pressure.condition, gate.PressureConditionNotRecorded)
+            assert isinstance(pressure, records.MemoryPressure)
+            self.assertIsInstance(pressure.condition, records.PressureConditionNotRecorded)
             self.assertEqual((pressure.full_avg10, pressure.some_avg10, pressure.swap_used_percent), (8, 15, 80))
             self.assertEqual(waits[0].reason, pressure)
             self.assertEqual([step.measured.bytes for step in waits[0].snapshot.running
-                              if isinstance(step.measured, gate.MeasuredMemory)], [4 * GIB, GIB])
-            self.assertEqual(gate.pressure_text(pressure),
+                              if isinstance(step.measured, records.MeasuredMemory)], [4 * GIB, GIB])
+            self.assertEqual(records.pressure_text(pressure),
                              "memory pressure: condition not recorded by service; full avg10 8.0; "
                              + "some avg10 15.0; swap 80.0% used")
             self.assertEqual(queue_evidence.pressure_text(pressure, waits[0].snapshot.policy),
@@ -417,7 +416,7 @@ class ClientTests(unittest.TestCase):
         with AdmissionFixture() as fixture:
             original = fixture.request()
             checkout = str(fixture.root / "other-checkout")
-            profile = gate.ProgramProfile("merge-gate", "repo", checkout, gate.HistoryPeakSizing(6 * GIB, gate.FirstProgramPeak(6 * GIB), fixture.clock.now()))
+            profile = records.ProgramProfile("merge-gate", "repo", checkout, records.HistoryPeakSizing(6 * GIB, records.FirstProgramPeak(6 * GIB), fixture.clock.now()))
             with mock.patch.object(step_estimator, "git_identity", side_effect=AssertionError("program inferred cargo")), \
                  mock.patch.object(client, "CLOCK", fixture.clock):
                 request = client.step_request([], str(fixture.root), original.owner, original.since,
@@ -425,7 +424,7 @@ class ClientTests(unittest.TestCase):
             self.assertEqual(request.identity.folder, checkout)
             self.assertEqual(request.profile, profile)
             self.assertEqual(request.identity.step, "merge-gate")
-            self.assertEqual(request.profile.peak, gate.ExpectedPeak(6 * GIB, "fallback", 0))
+            self.assertEqual(request.profile.peak, records.ExpectedPeak(6 * GIB, "fallback", 0))
 
     def test_failed_grant_file_write_releases_the_reservation_before_refusing(self) -> None:
         from pathlib import Path
@@ -435,7 +434,7 @@ class ClientTests(unittest.TestCase):
             _ = self.use_transport(fixture, Exchange(reply_bytes(GRANTED)), Exchange(reply_bytes(wire.Ok())))
             released: list[str] = []
             release = client.release
-            def observe_release(reservation: str, status: int, configuration: gate.MemoryConfig | wire.CleanupTiming) -> wire.Ok | wire.Refused:
+            def observe_release(reservation: str, status: int, configuration: records.MemoryConfig | wire.CleanupTiming) -> wire.Ok | wire.Refused:
                 released.append(reservation)
                 return release(reservation, status, configuration)
             with mock.patch.object(client, "step_request", return_value=original), \
@@ -456,8 +455,8 @@ class ClientTests(unittest.TestCase):
             original = fixture.request()
             updated = replace(original.profile, estimated_at=fixture.clock.now() + 1)
             transport = self.use_transport(fixture, Exchange(reply_bytes(EXPIRED)), Exchange(reply_bytes(GRANTED)))
-            estimates = [gate.StepEstimate(original.profile, gate.FreshTest()),
-                         gate.StepEstimate(updated, gate.ReusableEstimate())]
+            estimates = [step_estimator.StepEstimate(original.profile, records.FreshTest()),
+                         step_estimator.StepEstimate(updated, step_estimator.ReusableEstimate())]
             with mock.patch.object(step_estimator, "step_estimate", side_effect=estimates) as estimate, \
                  mock.patch.object(records, "process_start_time", return_value=original.owner.start_time), \
                  redirect_stderr(io.StringIO()), mock.patch("sys.stdout", io.StringIO()):
@@ -478,17 +477,17 @@ class ClientTests(unittest.TestCase):
         for expired_cache in (False, True):
             with self.subTest(expired_cache=expired_cache), AdmissionFixture() as fixture:
                 owner = fixture.request()
-                profile: gate.InferFromArgv | wire.Profile = gate.INFER_FROM_ARGV
+                profile: records.InferFromArgv | wire.Profile = records.INFER_FROM_ARGV
                 if expired_cache:
-                    assert isinstance(owner.profile, gate.StepProfile)
-                    profile = replace(owner.profile, step="build", build_history_generation=gate.BuildHistoryGeneration(6),
-                        estimated_at=fixture.clock.now() - gate.read_memory_config().policy.timing.estimate_refresh_seconds - 1)
+                    assert isinstance(owner.profile, records.StepProfile)
+                    profile = replace(owner.profile, step="build", build_history_generation=records.BuildHistoryGeneration(6),
+                        estimated_at=fixture.clock.now() - records.read_memory_config().policy.timing.estimate_refresh_seconds - 1)
                 transport = self.use_transport(fixture, Exchange(reply_bytes(wire.BuildHistoryReply(7))),
                     Exchange(reply_bytes(WAIT), b""), Exchange(reply_bytes(GRANTED)))
-                def history_peak(*_args: object, **_kwargs: object) -> gate.ExpectedPeak:
+                def history_peak(*_args: object, **_kwargs: object) -> records.ExpectedPeak:
                     self.assertIsInstance(transport.requests[-1], wire.BuildHistoryRequest)
-                    return gate.ExpectedPeak(12 * GIB, "fallback", 0)
-                with mock.patch.object(step_estimator, "git_identity", return_value=(gate.UnknownRepository(), str(fixture.root))), \
+                    return records.ExpectedPeak(12 * GIB, "fallback", 0)
+                with mock.patch.object(step_estimator, "git_identity", return_value=(records.UnknownRepository(), str(fixture.root))), \
                         mock.patch.object(step_estimator, "expected_peak", side_effect=history_peak) as history:
                     with mock.patch.object(conf, "read", wraps=conf.read) as reader:
                         request = client.step_request(["cargo", "build"], str(fixture.root), owner.owner,
@@ -499,8 +498,8 @@ class ClientTests(unittest.TestCase):
                 self.assertEqual(sum(isinstance(item, wire.BuildHistoryRequest) for item in transport.requests), 1)
                 first, second = [item for item in transport.requests if isinstance(item, wire.AdmitRequest)]
                 self.assertEqual(first, second)
-                assert isinstance(second.profile, gate.StepProfile)
-                self.assertEqual(second.profile.build_history_generation, gate.BuildHistoryGeneration(7))
+                assert isinstance(second.profile, records.StepProfile)
+                self.assertEqual(second.profile.build_history_generation, records.BuildHistoryGeneration(7))
                 self.doCleanups()
 
     def test_cached_build_estimate_keeps_its_original_history_generation(self) -> None:
@@ -522,13 +521,13 @@ class ClientTests(unittest.TestCase):
             transport = self.use_transport(fixture,
                 Exchange(reply_bytes(EXPIRED), reply_bytes(wire.BuildHistoryReply(1))),
                 Exchange(reply_bytes(granted)))
-            def history_peak(*_args: object, **_kwargs: object) -> gate.ExpectedPeak:
+            def history_peak(*_args: object, **_kwargs: object) -> records.ExpectedPeak:
                 self.assertIsInstance(transport.requests[-1], wire.BuildHistoryRequest)
-                return gate.ExpectedPeak(16 * GIB, "fallback", 0)
+                return records.ExpectedPeak(16 * GIB, "fallback", 0)
             def refresh() -> wire.AdmitRequest:
                 return client.step_request(list(request.argv), request.cwd, request.owner,
                     request.since, request.sidecar, request.episode)
-            with mock.patch.object(step_estimator, "git_identity", return_value=(gate.UnknownRepository(), str(fixture.root))), \
+            with mock.patch.object(step_estimator, "git_identity", return_value=(records.UnknownRepository(), str(fixture.root))), \
                     mock.patch.object(step_estimator, "expected_peak", side_effect=history_peak) as history:
                 self.assertEqual(client.admit(request, lambda _wait: None, refresh), granted)
             self.assertEqual(history.call_count, 1)
@@ -538,15 +537,15 @@ class ClientTests(unittest.TestCase):
             assert isinstance(first, wire.AdmitRequest) and isinstance(refreshed, wire.AdmitRequest)
             self.assertEqual((first.owner, first.episode, first.since),
                 (refreshed.owner, refreshed.episode, refreshed.since))
-            assert isinstance(refreshed.profile, gate.StepProfile)
-            self.assertEqual(refreshed.profile.build_history_generation, gate.BuildHistoryGeneration(1))
+            assert isinstance(refreshed.profile, records.StepProfile)
+            self.assertEqual(refreshed.profile.build_history_generation, records.BuildHistoryGeneration(1))
             self.assertEqual(refreshed.profile.peak.bytes, granted.need)
 
     def test_generation_outage_after_expiry_keeps_the_leave_hook_time_and_cli_status(self) -> None:
         for failure in (b"", b"invalid generation reply\n"):
             with self.subTest(failure=failure), AdmissionFixture() as fixture:
                 fixture.configure(running_pass_seconds=5, reconnect_seconds=2)
-                interval = gate.read_memory_config().running_pass_seconds
+                interval = records.read_memory_config().running_pass_seconds
                 original = fixture.request()
                 transport = self.use_transport(fixture,
                     Exchange(reply_bytes(wire.BuildHistoryReply(0))),
@@ -563,8 +562,8 @@ class ClientTests(unittest.TestCase):
                 with mock.patch.dict(os.environ, {"LINT_QUEUE_LEAVE_HOOK": "test-leave"}), \
                         mock.patch.object(client, "_leave_queue", side_effect=leave), \
                         mock.patch.object(records, "process_start_time", return_value=original.owner.start_time), \
-                        mock.patch.object(step_estimator, "git_identity", return_value=(gate.UnknownRepository(), str(fixture.root))), \
-                        mock.patch.object(step_estimator, "expected_peak", return_value=gate.ExpectedPeak(12 * GIB, "fallback", 0)), \
+                        mock.patch.object(step_estimator, "git_identity", return_value=(records.UnknownRepository(), str(fixture.root))), \
+                        mock.patch.object(step_estimator, "expected_peak", return_value=records.ExpectedPeak(12 * GIB, "fallback", 0)), \
                         redirect_stderr(io.StringIO()) as errors, mock.patch("sys.stdout", io.StringIO()) as output:
                     status = client.main(["admit", "--pid", str(original.owner.pid), "--", "cargo", "build"])
                 self.assertEqual(status, 75, errors.getvalue())
@@ -591,8 +590,8 @@ class ClientTests(unittest.TestCase):
                         Exchange(reply_bytes(EXPIRED), generation_failure),
                         *(Exchange(connect_error=FileNotFoundError()) for _ in range(3)))
                     with mock.patch.object(records, "process_start_time", return_value=original.owner.start_time), \
-                            mock.patch.object(step_estimator, "git_identity", return_value=(gate.UnknownRepository(), str(fixture.root))), \
-                            mock.patch.object(step_estimator, "expected_peak", return_value=gate.ExpectedPeak(12 * GIB, "fallback", 0)), \
+                            mock.patch.object(step_estimator, "git_identity", return_value=(records.UnknownRepository(), str(fixture.root))), \
+                            mock.patch.object(step_estimator, "expected_peak", return_value=records.ExpectedPeak(12 * GIB, "fallback", 0)), \
                             redirect_stderr(io.StringIO()) as errors, redirect_stdout(io.StringIO()):
                         status = client.main([command, "--pid", str(original.owner.pid), "--", "cargo", "build"])
                     self.assertEqual(status, 2)
@@ -619,8 +618,8 @@ class ClientTests(unittest.TestCase):
                     transport = self.use_transport(fixture, *exchanges)
                     with mock.patch.dict(os.environ, {"BUILDLOG_MEM_WAIT_LIMIT_S": "6", "LINT_QUEUE_LEAVE_HOOK": "", "BUILDLOG_MAC_IDLE_HOOK": ""}), \
                             mock.patch.object(records, "process_start_time", return_value=original.owner.start_time), \
-                            mock.patch.object(step_estimator, "git_identity", return_value=(gate.UnknownRepository(), str(fixture.root))), \
-                            mock.patch.object(step_estimator, "expected_peak", return_value=gate.ExpectedPeak(12 * GIB, "fallback", 0)), \
+                            mock.patch.object(step_estimator, "git_identity", return_value=(records.UnknownRepository(), str(fixture.root))), \
+                            mock.patch.object(step_estimator, "expected_peak", return_value=records.ExpectedPeak(12 * GIB, "fallback", 0)), \
                             redirect_stderr(io.StringIO()) as errors, mock.patch("sys.stdout", io.StringIO()) as output:
                         status = client.main(["launch", "--pid", str(original.owner.pid), "--", "cargo", "build"])
                     self.assertEqual(status, 2)
@@ -633,7 +632,7 @@ class ClientTests(unittest.TestCase):
     def test_grant_sent_during_a_slow_leave_hook_is_read_before_the_next_hook(self) -> None:
         with AdmissionFixture() as fixture:
             write_memory_config(fixture.root / "build_admission.conf", running_pass_seconds="5")
-            interval = gate.read_memory_config().running_pass_seconds
+            interval = records.read_memory_config().running_pass_seconds
             request = fixture.request()
             exchange = Exchange(reply_bytes(WAIT), TimeoutError())
             transport = self.use_transport(fixture, exchange)
@@ -659,7 +658,7 @@ class ClientTests(unittest.TestCase):
         for kind, partial_at_deadline in (("admit", False), ("launch", False), ("admit", True), ("launch", True)):
             with self.subTest(kind=kind, partial_at_deadline=partial_at_deadline), AdmissionFixture() as fixture:
                 write_memory_config(fixture.root / "build_admission.conf", running_pass_seconds="5")
-                interval = gate.read_memory_config().running_pass_seconds
+                interval = records.read_memory_config().running_pass_seconds
                 request = fixture.request() if kind == "admit" else fixture.launch()
                 grant = GRANTED if kind == "admit" else wire.LaunchAdmitted(GIB, "new-source")
                 encoded = reply_bytes(grant)
@@ -694,16 +693,16 @@ class ClientTests(unittest.TestCase):
 
     def test_split_reply_survives_a_silence_timeout(self) -> None:
         mutations: dict[str, Callable[[], object]] = {
-            "release": lambda: client.release("stem", 137, gate.read_memory_config()),
+            "release": lambda: client.release("stem", 137, records.read_memory_config()),
             "width": lambda: client.width("stem", 3),
             "admit-head": lambda: client.admit_head("urgent", "director"),
             "priority-set": lambda: client.priority_set("unit", "urgent", "director"),
             "priority-clear": lambda: client.priority_clear("director"),
-            "token-wait": lambda: client.token_wait("stem", gate.read_memory_config())}
+            "token-wait": lambda: client.token_wait("stem", records.read_memory_config())}
         for kind in ("admit", "launch", *mutations):
             with self.subTest(kind=kind), AdmissionFixture() as fixture:
                 write_memory_config(fixture.root / "build_admission.conf", silence_seconds="7")
-                interval = gate.read_memory_config().silence_seconds
+                interval = records.read_memory_config().silence_seconds
                 request = fixture.request() if kind == "admit" else fixture.launch()
                 grant = GRANTED if kind == "admit" else wire.LaunchAdmitted(GIB, "new-source")
                 expected = grant if kind in ("admit", "launch") else wire.Ok()
@@ -736,7 +735,7 @@ class ClientTests(unittest.TestCase):
             with self.subTest(kind=kind), AdmissionFixture() as fixture:
                 config = fixture.root / "build_admission.conf"
                 write_memory_config(config, silence_seconds="7")
-                acquired = gate.read_memory_config()
+                acquired = records.read_memory_config()
                 write_memory_config(config, silence_seconds="invalid")
                 encoded = reply_bytes(wire.Ok())
                 split = len(encoded) // 2
@@ -775,7 +774,7 @@ class ClientTests(unittest.TestCase):
             commit_config_fixture(config)
             write_memory_config(config, **{"program_first_peak_gib.cargo": "invalid"})
             original = fixture.request()
-            repository = gate.RepositoryIdentity("github.com/team/project", "project")
+            repository = records.RepositoryIdentity("github.com/team/project", "project")
             with mock.patch.object(step_estimator, "git_identity", return_value=(repository, "tree")), \
                     mock.patch.object(conf, "read", wraps=conf.read) as reader, \
                     redirect_stderr(io.StringIO()) as errors:
@@ -807,7 +806,7 @@ class ClientTests(unittest.TestCase):
         for stage in ("initial", "refresh"):
             with self.subTest(stage=stage), AdmissionFixture() as fixture:
                 write_memory_config(fixture.root / "build_admission.conf", running_pass_seconds="0.25")
-                interval = gate.read_memory_config().running_pass_seconds
+                interval = records.read_memory_config().running_pass_seconds
                 original = fixture.request(step="build")
                 encoded = reply_bytes(wire.BuildHistoryReply(7))
                 split = len(encoded) // 2
@@ -829,8 +828,8 @@ class ClientTests(unittest.TestCase):
                 waits: list[wire.Wait] = []
                 with mock.patch.dict(os.environ, {"LINT_QUEUE_LEAVE_HOOK": "test-decline"}), \
                         mock.patch.object(client, "_leave_queue", side_effect=decline), \
-                        mock.patch.object(step_estimator, "git_identity", return_value=(gate.UnknownRepository(), original.cwd)), \
-                        mock.patch.object(step_estimator, "expected_peak", return_value=gate.ExpectedPeak(12 * GIB, "fallback", 0)) as history, \
+                        mock.patch.object(step_estimator, "git_identity", return_value=(records.UnknownRepository(), original.cwd)), \
+                        mock.patch.object(step_estimator, "expected_peak", return_value=records.ExpectedPeak(12 * GIB, "fallback", 0)) as history, \
                         redirect_stderr(io.StringIO()) as errors:
                     request = refresh() if stage == "initial" else original
                     result = client.admit(request, waits.append, refresh)
@@ -844,8 +843,8 @@ class ClientTests(unittest.TestCase):
                 self.assertTrue(all((item.owner, item.episode, item.since) ==
                     (original.owner, original.episode, original.since) for item in admissions))
                 self.assertEqual(len(admissions), 1 if stage == "initial" else 2)
-                assert isinstance(admissions[-1].profile, gate.StepProfile)
-                self.assertEqual(admissions[-1].profile.build_history_generation, gate.BuildHistoryGeneration(7))
+                assert isinstance(admissions[-1].profile, records.StepProfile)
+                self.assertEqual(admissions[-1].profile.build_history_generation, records.BuildHistoryGeneration(7))
                 self.assertEqual(errors.getvalue(), "")
                 self.doCleanups()
 
@@ -853,7 +852,7 @@ class ClientTests(unittest.TestCase):
         for next_reply in ("grant", "generation"):
             with self.subTest(next_reply=next_reply), AdmissionFixture() as fixture:
                 write_memory_config(fixture.root / "build_admission.conf", running_pass_seconds="0.25")
-                interval = gate.read_memory_config().running_pass_seconds
+                interval = records.read_memory_config().running_pass_seconds
                 request = fixture.request(step="build")
                 first = WAIT if next_reply == "grant" else EXPIRED
                 encoded = reply_bytes(GRANTED if next_reply == "grant" else wire.BuildHistoryReply(7))
@@ -874,8 +873,8 @@ class ClientTests(unittest.TestCase):
 
                 with mock.patch.dict(os.environ, {"LINT_QUEUE_LEAVE_HOOK": "test-decline"}), \
                         mock.patch.object(client, "_leave_queue", side_effect=decline), \
-                        mock.patch.object(step_estimator, "git_identity", return_value=(gate.UnknownRepository(), request.cwd)), \
-                        mock.patch.object(step_estimator, "expected_peak", return_value=gate.ExpectedPeak(12 * GIB, "fallback", 0)), \
+                        mock.patch.object(step_estimator, "git_identity", return_value=(records.UnknownRepository(), request.cwd)), \
+                        mock.patch.object(step_estimator, "expected_peak", return_value=records.ExpectedPeak(12 * GIB, "fallback", 0)), \
                         redirect_stderr(io.StringIO()) as errors:
                     result = client.admit(request, waits.append, refresh)
                 self.assertEqual(result, GRANTED)
@@ -899,7 +898,7 @@ class ClientTests(unittest.TestCase):
                         redirect_stderr(io.StringIO()) as errors:
                     result = client.admit(request, lambda _wait: None, lambda: request) if kind == "admit" \
                         else client.build_history_generation()
-                self.assertEqual(result, GRANTED if kind == "admit" else gate.BuildHistoryGeneration(7))
+                self.assertEqual(result, GRANTED if kind == "admit" else records.BuildHistoryGeneration(7))
                 self.assertEqual(len(transport.attempts), 2)
                 self.assertEqual(len(transport.requests), 2)
                 self.assertEqual(transport.requests[0], transport.requests[1])
@@ -1151,14 +1150,14 @@ class ClientTests(unittest.TestCase):
             commit_config_fixture(config)
             write_memory_config(config, estimate_refresh_seconds="invalid")
             request = fixture.request()
-            with fixture.serving(), mock.patch.object(records, "_warned_configuration_diagnostics", set[gate.ConfigurationDiagnostic]()), \
+            with fixture.serving(), mock.patch.object(records, "_warned_configuration_diagnostics", set[records.ConfigurationDiagnostic]()), \
                     mock.patch.object(client, "CLOCK", fixture.clock), redirect_stderr(io.StringIO()) as errors:
                 first = client.admit(request, lambda _wait: None, lambda: request)
                 second = client.admit(request, lambda _wait: None, lambda: request)
             self.assertIsInstance(first, wire.Admitted)
             self.assertEqual(second, first)
             policy = fixture.server.last_policy
-            assert isinstance(policy, gate.AdmissionPolicy)
+            assert isinstance(policy, records.AdmissionPolicy)
             self.assertEqual(policy.timing.estimate_refresh_seconds, 321)
             self.assertIn(str(config), errors.getvalue())
             self.assertIn("estimate_refresh_seconds='invalid'", errors.getvalue())
@@ -1302,7 +1301,7 @@ class ClientTests(unittest.TestCase):
             request = fixture.request(since=fixture.clock.now() - 700)
             updated = replace(request, episode="must-not-replace", since=fixture.clock.now(),
                 owner=wire.Owner(1, "wrong"), profile=replace(request.profile,
-                    peak=gate.ExpectedPeak(2 * GIB, "measured", 9)), fresh_test=True)
+                    peak=records.ExpectedPeak(2 * GIB, "measured", 9)), fresh_test=True)
             transport = self.use_transport(fixture, Exchange(reply_bytes(EXPIRED)), Exchange(reply_bytes(GRANTED)))
             refresh = mock.Mock(return_value=updated)
             self.assertEqual(client.admit(request, lambda _wait: None, refresh), GRANTED)
@@ -1390,7 +1389,7 @@ class ClientTests(unittest.TestCase):
 
     def test_mutations_resend_the_same_request_id_after_transport_closes(self) -> None:
         mutations: tuple[Callable[[], object], ...] = (
-            lambda: client.release("stem", 137, gate.read_memory_config()), lambda: client.width("stem", 3),
+            lambda: client.release("stem", 137, records.read_memory_config()), lambda: client.width("stem", 3),
             lambda: client.admit_head("urgent", "director"))
         for mutation in mutations:
             with self.subTest(mutation=mutation), AdmissionFixture() as fixture:
@@ -1410,11 +1409,11 @@ class ClientTests(unittest.TestCase):
                 Exchange(reply_bytes(GRANTED)))
             calls: list[int] = []
 
-            def estimate(*_args: object, **_kwargs: object) -> gate.StepEstimate:
+            def estimate(*_args: object, **_kwargs: object) -> step_estimator.StepEstimate:
                 calls.append(len(calls))
                 if len(calls) == 2:
                     os.environ["BUILDLOG_RUN"] = "999999:111111"
-                return gate.StepEstimate(original.profile, gate.ReusableEstimate())
+                return step_estimator.StepEstimate(original.profile, step_estimator.ReusableEstimate())
 
             with mock.patch.dict(os.environ, {"BUILDLOG_RUN": f"{run.pid}:{run.start_time}"}), \
                  mock.patch.object(step_estimator, "step_estimate", side_effect=estimate), \
@@ -1443,8 +1442,8 @@ class ClientTests(unittest.TestCase):
                 else:
                     environment["BUILDLOG_RUN"] = value
                 with mock.patch.dict(os.environ, environment, clear=True), \
-                     mock.patch.object(step_estimator, "step_estimate", return_value=gate.StepEstimate(
-                         original.profile, gate.ReusableEstimate())), \
+                     mock.patch.object(step_estimator, "step_estimate", return_value=step_estimator.StepEstimate(
+                         original.profile, step_estimator.ReusableEstimate())), \
                      mock.patch.object(records, "process_start_time", return_value=original.owner.start_time), \
                      redirect_stderr(io.StringIO()), mock.patch("sys.stdout", io.StringIO()):
                     status = client.main(["admit", "--pid", str(original.owner.pid),
@@ -1463,8 +1462,8 @@ class ClientTests(unittest.TestCase):
             transport = self.use_transport(fixture, Exchange(reply_bytes(GRANTED)))
             with mock.patch.object(sys, "platform", "darwin"), \
                  mock.patch.dict(os.environ, {"BUILDLOG_RUN": f"{run.pid}:{run.start_time}"}), \
-                 mock.patch.object(step_estimator, "step_estimate", return_value=gate.StepEstimate(
-                     original.profile, gate.ReusableEstimate())), \
+                 mock.patch.object(step_estimator, "step_estimate", return_value=step_estimator.StepEstimate(
+                     original.profile, step_estimator.ReusableEstimate())), \
                  mock.patch.object(records, "process_start_time", return_value=original.owner.start_time), \
                  redirect_stderr(io.StringIO()), mock.patch("sys.stdout", io.StringIO()):
                 status = client.main(["admit", "--pid", str(original.owner.pid), "--", "cargo", "nextest"])

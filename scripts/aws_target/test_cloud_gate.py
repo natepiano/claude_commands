@@ -12,6 +12,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import sys
 from typing import cast, override
 from unittest import mock
 from urllib.parse import parse_qs, urlsplit
@@ -26,6 +27,7 @@ from scripts.buildlog import store
 from scripts.build_targets import target_config
 from scripts.production import affected_modules
 from scripts.production import merge_gate as gate
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
 class FakeGateAws:
@@ -39,12 +41,14 @@ class FakeGateAws:
         self.has_result: bool = True
         self.has_log: bool = True
         self.state: str = 'running'
+        self.state_reason: dict[str, str] = {}
         self.has_instance: bool = True
         self.terminated: bool = False
         self.confirm_termination: bool = True
         self.upload_error: str = ''
         self.upload_timeout: bool = False
         self.launch_timeouts: int = 0
+        self.read_timeouts: int = 0
 
     def __call__(self, arguments: Sequence[str], **_options: object) -> subprocess.CompletedProcess[str]:
         args = list(arguments)
@@ -70,6 +74,9 @@ class FakeGateAws:
             error = self.refusals.pop(0) if self.refusals else ''
             reply = {'Instances': [{'InstanceId': 'i-fixture'}]}
         elif operation == 'get-object':
+            if self.read_timeouts:
+                self.read_timeouts -= 1
+                raise subprocess.TimeoutExpired('aws s3api get-object', 30)
             key_at = args.index('--key') + 1
             key, destination = args[key_at], Path(args[key_at + 1])
             if key.endswith('/gate.log') and self.has_log:
@@ -82,8 +89,11 @@ class FakeGateAws:
             self.terminated = True
         elif operation == 'describe-instances':
             state = 'terminated' if self.terminated and self.confirm_termination else self.state
-            reply = {'Reservations': [{'Instances': [{'InstanceId': 'i-fixture', 'State': {'Name': state},
-                                                      'LaunchTime': '2026-01-15T00:00:00+00:00'}]}] if self.has_instance else []}
+            instance: dict[str, object] = {'InstanceId': 'i-fixture', 'State': {'Name': state},
+                                          'LaunchTime': '2026-01-15T00:00:00+00:00'}
+            if self.state_reason:
+                instance['StateReason'] = self.state_reason
+            reply = {'Reservations': [{'Instances': [instance]}] if self.has_instance else []}
         else:
             raise AssertionError((service, operation))
         return subprocess.CompletedProcess(args, int(bool(error)), json.dumps(reply), error)
@@ -142,6 +152,53 @@ class CloudGateTests(CostFixture):
         self.assertEqual((self.folder / 'gate.log').read_text(), 'fixture cloud output\n')
         self.assertIsInstance(self.book.read_snapshot().gate_reservations[0].state, ledger.GateTerminated)
         self.assertTrue(self.fake.terminated)
+
+    def test_poll_read_timeout_retries_and_completes(self) -> None:
+        self.fake.read_timeouts = 1
+        self.assertEqual(self.execute()['status'], 'complete')
+        reads = [command[command.index('--key') + 1] for command in self.fake.commands if 'get-object' in command]
+        self.assertEqual(reads[:2], ['artifacts/attempt/gate.log', 'artifacts/attempt/gate.log'])
+        self.assertIn('artifacts/attempt/result.json', reads)
+        self.assertEqual(len(self.fake.launches), 1)
+        self.assertTrue(self.fake.terminated)
+
+    def test_worker_sigterm_during_result_poll_terminates_launched_instance(self) -> None:
+        cloud_gate.save(self.folder / 'deployment.json', self.deployment)
+        script = '''import json, signal, sys
+from pathlib import Path
+from unittest import mock
+from scripts.aws_target import cloud_gate, ledger
+from scripts.aws_target.aws_target import AwsCli
+from scripts.aws_target.test_cloud_gate import FakeGateAws
+
+folder, state, configuration = map(Path, sys.argv[1:4])
+at = float(sys.argv[4])
+fake = FakeGateAws()
+fake.has_result = False
+def execute(arguments, **options):
+    reply = fake(arguments, **options)
+    (folder / 'commands.json').write_text(json.dumps(fake.commands))
+    if 'get-object' in arguments and arguments[arguments.index('--key') + 1].endswith('/result.json'):
+        signal.raise_signal(signal.SIGTERM)
+    return reply
+api = AwsCli('build-scaler', 'fixture-region', 1, execute=execute)
+worker = cloud_gate.GateWorker(api, ledger.CostLedger(state), configuration, folder / 'reservation.cgroup', clock=lambda: at)
+with (mock.patch.object(cloud_gate, 'AwsCli', return_value=api),
+      mock.patch.object(cloud_gate, 'GateWorker', return_value=worker),
+      mock.patch.object(sys, 'argv', ['cloud-gate', '--worker', str(folder), '--directory', str(state),
+                                   '--sidecar', str(folder / 'reservation.cgroup')])):
+    raise SystemExit(cloud_gate.main())
+'''
+        reply = subprocess.run([sys.executable, '-c', script, str(self.folder), str(self.state), str(self.settings), str(self.now)],
+                               capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
+        commands = cast(list[list[str]], json.loads((self.folder / 'commands.json').read_text()))
+        terminated = [command[command.index('--instance-ids') + 1] for command in commands if 'terminate-instances' in command]
+        self.assertEqual(terminated, ['i-fixture'], reply.stdout + reply.stderr)
+        self.assertEqual(reply.returncode, 143, reply.stderr)
+        self.assertEqual(self.book.read_snapshot().gate_reservations[0].state,
+                         ledger.GateTerminated(int(self.now), 'i-fixture'))
+        self.assertEqual(cloud_gate.read(self.folder / 'outcome.json'), {
+            'status': 'fallback', 'reason': 'The worker stopped, so its instance was terminated'})
 
     def test_each_log_download_publishes_module_progress(self) -> None:
         self.fake.log = ('Runner: 1 modules, whole machine, 32 CPUs\n'
@@ -329,7 +386,19 @@ class CloudGateTests(CostFixture):
     def test_dead_instance_without_result_allows_local_fallback(self) -> None:
         self.fake.has_result = False
         self.fake.state = 'terminated'
-        self.assertEqual(self.execute()['status'], 'fallback')
+        self.assertEqual(self.execute(), {'status': 'fallback', 'reason': 'The instance stopped without a final result'})
+        self.assertTrue(self.fake.terminated)
+
+    def test_stopped_instance_fallback_includes_aws_state_reason(self) -> None:
+        self.fake.has_result = False
+        self.fake.state = 'shutting-down'
+        code = 'Server.SpotInstanceTermination'
+        message = 'Server.SpotInstanceTermination: Spot instance termination'
+        self.fake.state_reason = {'Code': code, 'Message': message}
+        self.assertEqual(self.execute(), {
+            'status': 'fallback', 'reason': f'The instance stopped without a final result ({code}: {message})'})
+        descriptions = [command for command in self.fake.commands if 'describe-instances' in command]
+        self.assertEqual(len(descriptions), 3)
         self.assertTrue(self.fake.terminated)
 
     def test_expired_instance_without_result_allows_local_fallback(self) -> None:

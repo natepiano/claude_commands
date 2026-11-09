@@ -14,14 +14,13 @@ import signal
 import subprocess
 import sys
 import time
-from contextlib import closing
 from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
 from typing import Literal, TypedDict, NamedTuple, cast
 
 from scripts.accounts import accounts
-from scripts.agents import worker_lifecycle, codex_mesh
+from scripts.agents import worker_lifecycle
 from scripts.copies import copies
 from scripts.direct import progress_history
 from scripts.herdr import herdr, worker_panes
@@ -148,13 +147,6 @@ def _session_lines(session: Session, _report: Inventory) -> list[str]:
     summary = f"  {session['kind']} {session['name']} · {_host_text(session['host'])}"
     summary += f" · {session['status']} · {_checkout_text(session['checkout'])}"
     lines = [summary]
-    for server in session["codex_servers"]:
-        activity = (
-            "busy: " + ", ".join(server["busy_workers"])
-            if server["busy_workers"]
-            else "idle"
-        )
-        lines.append(f"    Codex {server['run_dir']} · pid {server['pid']} · {activity}")
     lines.extend(f"    timer {timer}" for timer in session["timers"])
     return lines
 
@@ -208,24 +200,22 @@ def _status(selected: Account, here: bool, only: tuple[str, ...] = ()) -> list[M
 
 def wait_for_workers(record: staff.StaffSnapshot) -> None:
     """Name local worker turns and wait until each turn ends."""
-    names = {str(row.current_session): f"{row.name}: {row.current_session}"
-             for row in record.rows if row.kind == "worker"}
+    from scripts.herdr import worker_panes
+    from scripts.production import session_staff
+
+    parents = session_staff.pane_parents(record)
     announced: set[str] = set()
     while True:
         waiting: set[str] = set()
         notices: set[str] = set()
-        for server in codex_mesh._running_servers():  # pyright: ignore[reportPrivateUsage]
-            try:
-                with closing(codex_mesh.Client(server.port, "shutdown")) as client:
-                    loaded = codex_mesh._loaded_thread_ids(client, time.monotonic() + 10)  # pyright: ignore[reportPrivateUsage]
-                    for identity in names.keys() & loaded:
-                        state = codex_mesh._read_live_turn(client, identity)  # pyright: ignore[reportPrivateUsage]
-                        if isinstance(state, (codex_mesh.ThreadLive, codex_mesh.ThreadActiveWithoutTurn)):
-                            waiting.add(names[identity])
-                        elif isinstance(state, codex_mesh.ThreadStateUnknown):
-                            notices.add(f"{names[identity]}: readiness anomaly: {state.reason}")
-            except (ConnectionError, OSError, SystemExit) as error:
-                notices.add(f"worker readiness anomaly: {error}")
+        states = worker_panes.observe_parents(parents, record)
+        for rows in states.values():
+            for state in rows:
+                label = f"{state.row.name}: {state.row.current_session}"
+                if isinstance(state, worker_panes.OpenWorker) and state.status in (herdr.AgentStatus.WORKING, herdr.AgentStatus.RUNNING):
+                    waiting.add(label)
+                elif isinstance(state, (worker_panes.UncertainWorker, worker_panes.ProcessUnknownWorker)):
+                    notices.add(f"{label}: readiness anomaly: {state.reason}")
         for line in sorted((notices | waiting) - announced):
             print(line if line in notices else f"{line}: waiting for worker turn",
                   file=sys.stderr if line in notices else sys.stdout, flush=True)
@@ -493,9 +483,7 @@ def main(argv: list[str] | None = None) -> int:
 
 SCRIPTS = Path(__file__).resolve().parent.parent
 
-MESH = SCRIPTS / "agents" / "codex_mesh.py"
-
-DETACHED_RUNS = "mesh_runs"
+DETACHED_RUNS = "detached_runs"
 
 BUILD_HOLD = SCRIPTS / "build_hold" / "build_hold.py"
 
@@ -750,11 +738,6 @@ def retirement_stop_orphan(unit: RetiringUnit, pid: int, recorded_session_id: st
 def retirement_live_claims(claims: tuple[MacClaim, ...]) -> tuple[MacClaim, ...]:
     return tuple(claim for claim in claims if retirement_alive(claim.pid) and retirement_proc_start(claim.pid) == claim.proc_start)
 
-class MeshRun(NamedTuple):
-    run: Path
-    pid: int
-    seats: tuple[str, ...]
-
 def retirement_runs_of(worktree: Path) -> list[Path]:
     """Read run ownership through the staff row's session identities."""
     record = staff.snapshot()
@@ -768,18 +751,6 @@ def retirement_runs_of(worktree: Path) -> list[Path]:
                 found.append(folder)
     return found
 
-def retirement_mesh_runs(runs: list[Path]) -> tuple[MeshRun, ...]:
-    found: list[MeshRun] = []
-    for folder in runs:
-        pid = retirement_json(folder / "mesh_server.json").get("pid")
-        if not isinstance(pid, int) or isinstance(pid, bool) or not retirement_alive(pid):
-            continue
-        roster = retirement_json(folder / "mesh_roster.json")
-        seats = tuple(name for name, entry in roster.items()
-                      if isinstance(entry, dict) and cast(dict[str, object], entry).get("status") != "ended")
-        found.append(MeshRun(folder, pid, seats))
-    return tuple(found)
-
 def retirement_session_of(pid: int) -> int:
     try:
         return os.getsid(pid)
@@ -787,18 +758,11 @@ def retirement_session_of(pid: int) -> int:
         return 0
 
 def retirement_run_processes(worktree: Path, inside: list[int], *, settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT) -> dict[int, str]:
-    """The processes inside the worktree that its runs leave behind once their sessions stop, each named.
-
-    A run's detached command (mesh_runs.py supervise) is found by its record, which holds the
-    supervisor's pid and is in the supervisor's arguments; an app-server by its run's
-    mesh_server.json; a live server's idle-stop watcher by its mesh entry point and run folder
-    arguments. A dead server's watcher needs no matching run history: its own kill -0 rule would
-    end it at its next wake. Each leads its own session, so its children go with it.
-    """
+    """Name the detached command processes that remain in the worktree."""
     if isinstance(settings, UseConfiguredValue):
         settings = conf.read("production")
     runs = retirement_runs_of(worktree)
-    leaders = {item.pid: f"app-server {item.pid} of run {item.run.name}" for item in retirement_mesh_runs(runs)}
+    leaders: dict[int, str] = {}
     for folder in runs:
         for path in sorted((folder / DETACHED_RUNS).glob("*.json")):
             record = retirement_json(path)
@@ -806,22 +770,6 @@ def retirement_run_processes(worktree: Path, inside: list[int], *, settings: con
             if (record.get("status") == "running" and isinstance(pid, int) and not isinstance(pid, bool)
                     and pid > 0 and str(path) in retirement_command_line(pid, settings=settings)):
                 leaders[pid] = f"run supervisor {pid} of {record.get('label', path.stem)} in run {folder.name}"
-    folders = {str(folder.resolve()): folder.name for folder in runs}
-    for pid in inside:
-        words = retirement_command_line(pid, settings=settings)
-        if (len(words) < 7 or Path(words[0]).name != "sh" or words[1] != "-c"
-                or "idle-stop" not in words[2] or Path(words[3]).resolve() != MESH.resolve()):
-            continue
-        try:
-            server = int(words[4])
-        except ValueError:
-            continue
-        if server <= 0:
-            continue
-        if not retirement_alive(server):
-            leaders[pid] = f"app-server watcher {pid} of dead server {server}"
-        elif (folder := str(Path(words[6]).resolve())) in folders:
-            leaders[pid] = f"app-server watcher {pid} of run {folders[folder]}"
     return {pid: f"process {pid} ({retirement_command_name(pid)}) of the {leaders[leader]}"
             for pid in inside if (leader := retirement_session_of(pid)) in leaders}
 
@@ -929,10 +877,8 @@ def retirement_retire(unit: RetiringUnit, *, settings: conf.ConfigRead,
                                             row.current_session, unit_config.Branch(unit.branch)))
         _ = unit_config.write_parked(row.id, replace(config, retired=facts))
     owned = retirement_members(unit, record)
-    pane_run = worker_panes.worker_run(row)
-    pane_workers = worker_panes.observe(row.id, record) if unit_runs.worker_transport(pane_run) == "herdr" else []
+    pane_workers = worker_panes.observe(row.id, record)
     pane_ids = {item.row.id for item in pane_workers}
-    _ = stop_resume.stop_unit_workers(row.id, record)
     for member in owned:
         if member.id in pane_ids or isinstance(record.backends.get(member.id), staff.CodexBackend):
             continue
@@ -942,6 +888,9 @@ def retirement_retire(unit: RetiringUnit, *, settings: conf.ConfigRead,
                 print(f"anomaly: {member.name}: {outcome.reason}")
         except (OSError, ValueError, herdr.HerdrFailure) as error:
             print(f"anomaly: {member.name}: {' '.join(str(error).splitlines())}")
+    stop_reasons = stop_resume.stop_unit_workers(row.id, record)
+    for reason in stop_reasons:
+        print(f"anomaly: {reason}")
     for key in retirement_holds({member.current_session for member in owned}):
         result = retirement_run([sys.executable, str(BUILD_HOLD), "release", "--holder", key], settings=settings)
         if result.returncode:

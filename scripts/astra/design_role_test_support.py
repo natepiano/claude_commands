@@ -5,8 +5,8 @@ import json
 import io
 import subprocess
 import unittest
-from collections.abc import Generator, Mapping
-from contextlib import contextmanager, redirect_stderr, redirect_stdout
+from collections.abc import Mapping
+from contextlib import redirect_stderr, redirect_stdout
 from unittest.mock import patch
 from dataclasses import replace
 import os
@@ -19,18 +19,8 @@ from scripts.production.staff_test_support import fixture_worker, unit_membershi
 from scripts.astra import design_roles
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.direct.recorder_fixture import invoke_recorder
-from scripts.lib.server_test_support import owned_server_record
 
 _NOT_OPENED = design_roles.RoleNotOpened()
-
-
-@contextmanager
-def write_mesh_server_record(mesh: Path, codex_home: Path) -> Generator[None]:
-    write_text_atomic(mesh / "mesh_server.json", json.dumps({
-        "codex_home": str(codex_home), "port": 32100,
-    }))
-    with owned_server_record(mesh / "mesh_server.json"):
-        yield
 
 
 def designer_fixture(parent: staff.StaffId, name: str, codex_home: Path) -> staff.StaffRow:
@@ -81,6 +71,7 @@ class HeldRolePaneFixture:
         self.router.setup(case, self.root)
         self.commands: list[list[str]] = []
         self.recorder_commands: list[list[str]] = []
+        self.router.recorder_commands = self.recorder_commands
         write_text_atomic(self.root / "design.md", "# Private design\n")
         _ = cast(object, case.enterContext(patch.dict(os.environ, {
             "DESIGN_ROLES_STATE": str(self.root / "designs"),
@@ -133,7 +124,22 @@ class HeldRolePaneFixture:
                                       binding=self.binding if bound else design_roles.UNBOUND)
 
     def resume(self, design: design_roles.HeldDesign, role: design_roles.Role) -> Path:
-        return design_roles.resume(design.placement.design_id + "/" + role, self.command_case.prompt)
+        submitted = design_roles.resume(design.placement.design_id + "/" + role, self.command_case.prompt)
+        self.finish(design, role)
+        return submitted.reply
+
+    def finish(self, design: design_roles.HeldDesign, role: design_roles.Role) -> None:
+        from scripts.herdr import turn_end
+
+        instance = next(item for item in design.roles if item.role == role)
+        if not isinstance(instance.lifecycle, (design_roles.RoleOpen, design_roles.RolePausedForMove)):
+            raise AssertionError("role has no worker")
+        row = staff.by_id(instance.lifecycle.staff_id)
+        if row is None:
+            raise AssertionError("role worker is missing")
+        thread = str(row.current_session)
+        with self.world.process_starts():
+            _ = turn_end.handle(turn_end.WorkerEvent(thread, reply=self.command_case.agent.last_replies.get(thread, "")))
 
 
 class HeldRolePaneCase(unittest.TestCase):
