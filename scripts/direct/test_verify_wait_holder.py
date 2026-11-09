@@ -309,9 +309,9 @@ exec "$TEST_REAL_PYTHON" "$@"
         _ = (self.root / "token-board" / name).write_text(json.dumps(record))
 
     def worker_reference(self, name: str) -> str:
-        roster = cast(dict[str, dict[str, str]], json.loads(
-            (self.root / "session/mesh_roster.json").read_text()))
-        return roster[name]["staff_id"]
+        roster = cast(dict[str, str], json.loads(
+            (self.root / f"session/impl_worker_{name}.json").read_text()))
+        return roster["staff_id"]
 
     def acquire_identity_token(self, owner: str) -> None:
         result = subprocess.run(["bash", str(BOARD), "acquire", str(self.root / "token-board"),
@@ -388,28 +388,9 @@ BOARD_DIR=$TEST_IDENTITY_ROOT/token-board
         self.assertEqual(recorded_holders(self.record_token_passes()),
                          [named_holder("slot", "cargo", "wait", unit=True)])
 
-    def test_exact_roster_key_wins_over_a_suffix_match_and_saved_record(self) -> None:
-        self.write_token_record("mesh_roster.json", {
-            "writer": {"staff_id": self.worker_reference("fixture-first")},
-            "other-writer": {"staff_id": self.worker_reference("fixture-second")}})
-        self.write_token_record("impl_worker_writer.json", {
-            "slot": "writer", "staff_id": self.worker_reference("fixture-second")})
-        self.acquire_identity_token("writer")
-        self.assertEqual(recorded_holders(self.record_token_passes()),
-                         [named_holder("slot", "cargo", FIRST_SESSION)])
-
     def test_saved_worker_stem_wins_over_a_roster_slot_match(self) -> None:
         self.write_token_record("impl_worker_writer.json", {
             "staff_id": self.worker_reference("fixture-first")})
-        self.write_token_record("mesh_roster.json", {
-            "other": {"slot": "writer", "staff_id": self.worker_reference("fixture-second")}})
-        self.acquire_identity_token("writer")
-        self.assertEqual(recorded_holders(self.record_token_passes()),
-                         [named_holder("slot", "cargo", FIRST_SESSION)])
-
-    def test_roster_slot_match_names_the_worker_when_no_exact_record_exists(self) -> None:
-        self.write_token_record("mesh_roster.json", {
-            "other": {"slot": "writer", "staff_id": self.worker_reference("fixture-first")}})
         self.acquire_identity_token("writer")
         self.assertEqual(recorded_holders(self.record_token_passes()),
                          [named_holder("slot", "cargo", FIRST_SESSION)])

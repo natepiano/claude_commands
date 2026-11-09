@@ -216,7 +216,7 @@ def dispatch(published):
     assert staff.by_id(row.id) == published.row
     return admission.SwitchState.ASSIGNMENT_ACCEPTED
 with patch.object(stop_resume, "stop", return_value=stop_resume.Stopped(row.current_session, 987654)):
-    admission.switch_worker(allowed, "codex", start=start, dispatch=dispatch, cleanup=lambda identity: None)
+    admission.switch_worker(allowed, "codex", start=start, dispatch=dispatch, cleanup=lambda identity: admission.NoDestinationToStop())
 '''
 
 
@@ -1024,8 +1024,7 @@ class StaffTestCase(unittest.TestCase):
         return path
 
     def worker_run(self, production_name: str, unit: str, director: str, *,
-                   passes: tuple[dict[str, object], ...] = (), transport: Literal["mesh", "herdr"] = "mesh",
-                   director_run: bool = False) -> Path:
+                   passes: tuple[dict[str, object], ...] = (), director_run: bool = False) -> Path:
         """Create private run evidence for a director and its worker passes."""
         run = Path(os.environ["ROSTER_RUN_ROOT"]) / f"{production_name}-{unit}"
         run.mkdir(parents=True, exist_ok=True)
@@ -1035,10 +1034,6 @@ class StaffTestCase(unittest.TestCase):
             "pass": {str(passed["worker_name"]): passed for passed in passes},
         })
         write_text_atomic(run / "director", director + "\n")
-        write_text_atomic(run / "worker_transport", transport + "\n")
-        self.write_json(run / "mesh_roster.json", {})
-        if transport == "mesh":
-            self.write_json(run / "mesh_server.json", {"pid": os.getpid(), "port": 12345, "codex_home": str(self.root / "codex")})
         if director_run:
             from scripts.lib import unit_runs
 

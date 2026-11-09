@@ -183,7 +183,6 @@ Pane workers move through their dispatch lock, fresh pane evidence, `restart.sto
 They keep the same conversation and reuse a stopped pane.
 Only an open pass receives resume text through the shared target check.
 `config/shutdown.conf` sets the stop deadline from `STOP_GRACE_SECONDS`, `KILL_GRACE_SECONDS`, and `MOVE_STOP_MARGIN_SECONDS`.
-Mesh-pinned runs keep the [worker design](long-lived-workers.md) server release path until herdr-worker-panes Phase 19.
 The [quota guide](../quota_alerts.md) owns phone episodes, forecasts, routing notices, and delivery retries.
 
 Login renewal uses named success and failure results.
@@ -203,7 +202,7 @@ Unavailable family evidence also refuses the restart.
 The real refusal leaves the source running.
 
 Source release preserves each stop reason and gives the next action.
-The [family handoff](long-lived-workers.md#family-handoff-and-retry) defines its named results and server evidence.
+The [family handoff](long-lived-workers.md#family-handoff-and-retry) defines its named results and native source evidence.
 A session move's opening message selects only its [own worker children](shutdown-and-restart.md#worker-resume-results).
 
 ## Recovery and alert ownership

@@ -5,8 +5,8 @@ import json
 import io
 import subprocess
 import unittest
-from collections.abc import Generator, Mapping
-from contextlib import contextmanager, redirect_stderr, redirect_stdout
+from collections.abc import Mapping
+from contextlib import redirect_stderr, redirect_stdout
 from unittest.mock import patch
 from dataclasses import replace
 import os
@@ -19,18 +19,8 @@ from scripts.production.staff_test_support import fixture_worker, unit_membershi
 from scripts.astra import design_roles
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.direct.recorder_fixture import invoke_recorder
-from scripts.lib.server_test_support import owned_server_record
 
 _NOT_OPENED = design_roles.RoleNotOpened()
-
-
-@contextmanager
-def write_mesh_server_record(mesh: Path, codex_home: Path) -> Generator[None]:
-    write_text_atomic(mesh / "mesh_server.json", json.dumps({
-        "codex_home": str(codex_home), "port": 32100,
-    }))
-    with owned_server_record(mesh / "mesh_server.json"):
-        yield
 
 
 def designer_fixture(parent: staff.StaffId, name: str, codex_home: Path) -> staff.StaffRow:

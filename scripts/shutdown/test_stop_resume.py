@@ -30,10 +30,10 @@ from scripts.lib import agent_program, atomic_file, conf, operation_deadline, un
 from scripts.herdr import worker_panes
 from scripts.shutdown.stop_results import ClaudeStartState, StopResult
 
-from scripts.shutdown.stop_results import SourceReleased
+from scripts.shutdown.stop_results import SourceReleased, SourceReleaseUnknown
 from scripts.shutdown.launch_names import LaunchNames
-from scripts.production import showrunners, staff, staff_sources, stall_watch
-from scripts.lib.resume_message import PausedSeat
+from scripts.production import showrunners, staff, staff_sources, stall_watch, worker_admission
+from scripts.lib.resume_message import ClaudeChildResume
 from scripts.production.staff_test_support import StaffTestCase, fixture_member, fixture_worker, isolated_staff_file
 from scripts.usage import agents_log
 from scripts.herdr import herdr, pane_launch
@@ -679,7 +679,7 @@ class StopResumeTests(unittest.TestCase):
         role.assert_called_once_with("showrunner")
         self.assertEqual(start.call_args.args[1]["config_dir"], str(self.root / ".claude4"))
 
-    def test_moved_showrunner_resumes_only_its_worker_children_with_one_command_for_each_family(self) -> None:
+    def test_moved_showrunner_resumes_only_its_worker_children_with_native_dispatch_ids(self) -> None:
         fixture = StaffTestCase()
         fixture.setUp()
         self.addCleanup(fixture.doCleanups)
@@ -696,15 +696,22 @@ class StopResumeTests(unittest.TestCase):
         runs = fixture.root / "runs"
         run = runs / "unit-run"
         run.mkdir(parents=True)
-        atomic_file.write_text_atomic(run / "worker_transport", "mesh\n")
         for child in (codex, claude):
             agents_log.append(child.current_session, "impl", None, datetime.now(timezone.utc))
-        fixture.write_json(run / "progress_history_state.json", {"main_agent": {"session_id": owner.current_session}})
-        fixture.write_json(run / "impl_worker_impl.json", {"staff_id": claude.id, "slot": "impl", "model": "opus"})
-        _ = (run / "impl_status_impl").write_text("implementing\n")
-        fixture.write_json(run / "mesh_roster.json", {
-            codex.name: {"staff_id": codex.id, "status": "running"},
-            foreign.name: {"staff_id": foreign.id, "status": "running"}})
+        fixture.write_json(run / "progress_history_state.json", {
+            "owner_staff_id": owner.id, "pass": {child.name: {
+                "worker_name": child.name, "status": "active", "instance_id": f"dispatch-{child.name}",
+                "launcher_command": ["assign.sh", "--to", child.name],
+            } for child in (codex, claude, foreign)}})
+        for child in (codex, claude):
+            backend = staff.backend(child)
+            assert isinstance(backend, (staff.ClaudeBackend, staff.CodexBackend))
+            text = f"End your final reply with DONE dispatch-{child.name}."
+            event = ({"type": "user", "message": {"role": "user", "content": text}}
+                     if isinstance(backend, staff.ClaudeBackend) else
+                     {"type": "response_item", "payload": {"type": "message", "role": "user",
+                         "content": [{"type": "input_text", "text": text}]}})
+            atomic_file.write_text_atomic(worker_admission.transcript_source(child, backend), json.dumps(event) + "\n")
         from scripts.lib import unit_runs as owned_runs
         with (patch("scripts.lib.unit_runs.run_roots", return_value=(runs,)),
               patch.object(owned_runs, "held", return_value=[str(run)]),
@@ -716,12 +723,12 @@ class StopResumeTests(unittest.TestCase):
             result = stop_resume.resume(owner.current_session, why="account move", to="claude4")
         self.assertIsInstance(result, stop_resume.ClaudeUp)
         message = cast(str, start.call_args.args[3])
-        self.assertNotIn(f"--to {foreign.name}", message)
-        self.assertNotIn("foreign (", message)
+        self.assertNotIn(f"Worker {foreign.id}:", message)
+        self.assertNotIn(f"dispatch-{foreign.name}", message)
         for child in (codex, claude):
-            self.assertEqual(message.count(f"{child.name} (impl, was working):"), 1)
-            self.assertIn(f"--to {child.name}", message)
-            self.assertIn(str(run / f"{child.name}.resume-prompt.md"), message)
+            self.assertEqual(message.count(f"Worker {child.id}: busy dispatch dispatch-{child.name}."), 1)
+        self.assertIn("moved from claude3 to claude4", message)
+        self.assertNotIn("assign.sh --to", message)
 
     def test_resume_without_a_pane_record_starts_the_staff_row(self) -> None:
         identity = self.entry["session_id"]
@@ -1358,7 +1365,7 @@ class StopResumeTests(unittest.TestCase):
         old, current = str(self.root / "old folder"), str(self.root / "staff folder")
         command = ["bash", str(stop_resume.SCRIPTS / "direct/review.sh"), "--lens", "contract",
                    "--phase", "4w", run, old, "old prompt.md", "review", "check the contract", "reviewing", "3"]
-        seat = PausedSeat(run_dir=run, seat="review2", role="review", staff_id="019b3a40-4250-7000-8000-000000000104",
+        seat = ClaudeChildResume(run_dir=run, seat="review2", role="review", staff_id="019b3a40-4250-7000-8000-000000000104",
                           turn_live=True, launcher_command=command)
         rebuilt = shlex.split(stop_resume.resume_worker_command(seat, current))
         self.assertEqual(rebuilt, ["bash", str(stop_resume.SCRIPTS / "direct/assign.sh"),
@@ -1373,7 +1380,7 @@ class StopResumeTests(unittest.TestCase):
         command = ["bash", str(stop_resume.SCRIPTS / "direct/review.sh"),
                    "--pool", "code", "--lease", "x/y/7", "--phase", "3p", "--lens", "contract",
                    "--slot", "review", *task]
-        seat = PausedSeat(run_dir=run, seat="review2", role="review", staff_id="019b3a40-4250-7000-8000-000000000104",
+        seat = ClaudeChildResume(run_dir=run, seat="review2", role="review", staff_id="019b3a40-4250-7000-8000-000000000104",
                           turn_live=True, launcher_command=command)
         expected = ["bash", str(stop_resume.SCRIPTS / "direct/assign.sh"), "--to", "review2",
                     "--session-dir", run, "--cwd", cwd, "--prompt", str(Path(run) / "review2.resume-prompt.md"),
@@ -1395,7 +1402,7 @@ class StopResumeTests(unittest.TestCase):
                     command.extend(("--lens", requested_lens))
                 command.extend((run, "/old tree", "old prompt", "review", "check this change", "reviewing",
                                 "3", "adversary", ready))
-                seat = PausedSeat(run_dir=run, seat="review2", role="review", staff_id="worker-id",
+                seat = ClaudeChildResume(run_dir=run, seat="review2", role="review", staff_id="worker-id",
                                   turn_live=True, launcher_command=command)
                 rebuilt = shlex.split(stop_resume.resume_worker_command(seat, cwd))
                 options = dict(zip(rebuilt[2::2], rebuilt[3::2]))
@@ -1421,7 +1428,7 @@ class StopResumeTests(unittest.TestCase):
                 saved = ["bash" if launcher.endswith(".sh") else "python3",
                          str(stop_resume.SCRIPTS / "direct" / launcher), "--new-worker", "former-worker",
                          "--session-dir", "/old run", "--cwd", "/old tree", "--prompt", "/old prompt", *task]
-                seat = PausedSeat(run_dir=run, seat="review2", role="impl", staff_id="worker-id",
+                seat = ClaudeChildResume(run_dir=run, seat="review2", role="impl", staff_id="worker-id",
                                   turn_live=True, launcher_command=saved)
                 rebuilt = shlex.split(stop_resume.resume_worker_command(seat, cwd))
                 self.assertEqual(rebuilt, ["bash", str(stop_resume.SCRIPTS / "direct/assign.sh"),
@@ -1439,7 +1446,7 @@ class StopResumeTests(unittest.TestCase):
                            "--session-dir", run, "--cwd", "/old tree", "--prompt", "old prompt", "--to", "writer"]
                 if phase:
                     command.extend(("--phase", phase))
-                seat = PausedSeat(run_dir=run, seat="writer", role="impl", staff_id="worker-id",
+                seat = ClaudeChildResume(run_dir=run, seat="writer", role="impl", staff_id="worker-id",
                                   turn_live=True, launcher_command=command)
                 rebuilt = shlex.split(stop_resume.resume_worker_command(seat, "/current tree"))
                 options = dict(zip(rebuilt[2::2], rebuilt[3::2]))
@@ -1453,7 +1460,7 @@ class StopResumeTests(unittest.TestCase):
         from scripts.direct import progress_history
 
         run = self.root / "worker run"
-        seat = PausedSeat(run_dir=str(run), seat="worker", role="impl",
+        seat = ClaudeChildResume(run_dir=str(run), seat="worker", role="impl",
                           staff_id="019b3a40-4250-7000-8000-000000000104", turn_live=True, launcher_command=[])
         for role in ("review", "test"):
             with self.subTest(role=role):
@@ -2110,34 +2117,50 @@ class StopResumeTests(unittest.TestCase):
             assert isinstance(result, stop_resume.StopFailed)
             self.assertIn("test-tab", result.reason)
 
-    def test_codex_release_uses_recorded_servers_after_an_unknown_process(self) -> None:
+    def test_codex_release_keeps_an_unknown_native_process_unproved(self) -> None:
         identity = staff.StaffId(self.entry["session_id"])
         row = staff.StaffRow(identity, "worker", "alpha", staff.STAFF_ROOT, current_session=identity)
-        runs = (self.root / "source-run",)
         unknown = "pid 998071 (Codex thread unknown)"
         with (patch.object(herdr, "_scan_herdr_processes", return_value=[]),
               patch.object(runtime_sessions, "session_liveness", return_value=runtime_sessions.SessionNotLive()),
               patch.object(herdr, "codex_conversations", return_value=herdr.CodexConversations({}, (unknown,))),
-              patch("scripts.agents.codex_mesh.stop_worker_for_switch", return_value=SourceReleased()) as release,
               redirect_stderr(io.StringIO()) as output):
-            result = stop_resume.release_source(row, lambda: runs, staff.CodexBackend(self.root / "codex"))
-        self.assertIsInstance(result, SourceReleased)
-        release.assert_called_once_with(row, runs)
-        self.assertEqual(output.getvalue().splitlines(), [
-            f"anomaly: {identity} is not proved live or stopped: 1 processes unknown, first: {unknown}; not blocking"])
+            result = stop_resume.release_source(row, staff.CodexBackend(self.root / "codex"))
+        self.assertIsInstance(result, SourceReleaseUnknown)
+        assert isinstance(result, SourceReleaseUnknown)
+        self.assertIn(unknown, result.reason)
+        self.assertEqual(output.getvalue(), "")
         self.kill.assert_not_called()
 
-    def test_codex_release_uses_recorded_servers_for_a_hosted_thread_without_a_pid(self) -> None:
+    def test_source_release_confirms_the_native_process_exit(self) -> None:
         identity = staff.StaffId(self.entry["session_id"])
         row = staff.StaffRow(identity, "worker", "alpha", staff.STAFF_ROOT, current_session=identity)
-        runs = (self.root / "hosted-run",)
+        self.live.return_value = sessions.LiveSessionProcess(123)
+        self.process.side_effect = [sessions.LiveSessionProcess(123), sessions.SessionNotLive()]
+        result = stop_resume.release_source(row, staff.ClaudeBackend())
+        self.assertIsInstance(result, SourceReleased)
+        self.assertEqual(self.kill.call_args_list, [call(123, signal.SIGTERM)])
+
+    def test_source_release_keeps_unavailable_backend_evidence_unproved(self) -> None:
+        identity = staff.StaffId(self.entry["session_id"])
+        row = staff.StaffRow(identity, "worker", "alpha", staff.STAFF_ROOT, current_session=identity)
+        with patch.object(herdr, "read_conversation", return_value=herdr.UnknownConversation("source identity unreadable")):
+            result = stop_resume.release_source(row, staff.BACKEND_UNAVAILABLE)
+        self.assertIsInstance(result, SourceReleaseUnknown)
+        assert isinstance(result, SourceReleaseUnknown)
+        self.assertIn("source identity unreadable", result.reason)
+        self.kill.assert_not_called()
+
+    def test_codex_release_refuses_a_hosted_thread_without_a_signal_target(self) -> None:
+        identity = staff.StaffId(self.entry["session_id"])
+        row = staff.StaffRow(identity, "worker", "alpha", staff.STAFF_ROOT, current_session=identity)
         with (patch.object(herdr, "_scan_herdr_processes", return_value=[]),
               patch.object(runtime_sessions, "session_liveness", return_value=runtime_sessions.SessionNotLive()),
-              patch.object(herdr, "codex_conversations", return_value=herdr.CodexConversations({identity: ()}, ())),
-              patch("scripts.agents.codex_mesh.stop_worker_for_switch", return_value=SourceReleased()) as release):
-            result = stop_resume.release_source(row, lambda: runs, staff.CodexBackend(self.root / "codex"))
-        self.assertIsInstance(result, SourceReleased)
-        release.assert_called_once_with(row, runs)
+              patch.object(herdr, "codex_conversations", return_value=herdr.CodexConversations({identity: ()}, ()))):
+            result = stop_resume.release_source(row, staff.CodexBackend(self.root / "codex"))
+        self.assertIsInstance(result, SourceReleaseUnknown)
+        assert isinstance(result, SourceReleaseUnknown)
+        self.assertIn("no unique signal target", result.reason)
         self.kill.assert_not_called()
 
     def test_claude_release_ignores_unrelated_unknown_codex_processes(self) -> None:
@@ -2147,7 +2170,7 @@ class StopResumeTests(unittest.TestCase):
               patch.object(runtime_sessions, "session_liveness", return_value=runtime_sessions.SessionNotLive()) as claude,
               patch.object(herdr, "codex_conversations", return_value=herdr.CodexConversations(
                   {}, ("pid 998071 (Codex thread unknown)",))) as codex):
-            result = stop_resume.release_source(row, lambda: (), staff.ClaudeBackend())
+            result = stop_resume.release_source(row, staff.ClaudeBackend())
         self.assertIsInstance(result, SourceReleased)
         claude.assert_called_once_with(identity)
         codex.assert_not_called()
@@ -2156,14 +2179,11 @@ class StopResumeTests(unittest.TestCase):
     def test_codex_release_does_not_read_an_unreadable_claude_registry(self) -> None:
         identity = staff.StaffId(self.entry["session_id"])
         row = staff.StaffRow(identity, "worker", "alpha", staff.STAFF_ROOT, current_session=identity)
-        runs = (self.root / "codex-run",)
         with (patch.object(herdr, "_scan_herdr_processes", return_value=[]),
               patch.object(runtime_sessions, "session_liveness", side_effect=OSError("Claude registry unreadable")) as claude,
-              patch.object(herdr, "codex_conversations", return_value=herdr.CodexConversations({}, ())),
-              patch("scripts.agents.codex_mesh.stop_worker_for_switch", return_value=SourceReleased()) as release):
-            result = stop_resume.release_source(row, lambda: runs, staff.CodexBackend(self.root / "codex"))
+              patch.object(herdr, "codex_conversations", return_value=herdr.CodexConversations({}, ()))):
+            result = stop_resume.release_source(row, staff.CodexBackend(self.root / "codex"))
         self.assertIsInstance(result, SourceReleased)
-        release.assert_called_once_with(row, runs)
         claude.assert_not_called()
         self.kill.assert_not_called()
 

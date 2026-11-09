@@ -143,16 +143,29 @@ class ContextEconomyReadTests(unittest.TestCase):
     def test_startup_and_resume_hooks_give_one_start_at_the_first_hook_time(self) -> None:
         expected = [
             (self.since, "startup", "2.1.1"),
+            (instant("2026-11-01T10:00:01Z"), "resume", "2.1.2"),
+            (instant("2026-11-01T10:01:00Z"), "resume", "2.1.1"),
+            (instant("2026-11-01T10:02:00Z"), "resume", "2.1.2"),
             (instant("2026-11-01T10:20:00Z"), "resume", "2.1.3"),
+            (instant("2026-11-01T10:20:01Z"), "resume", "2.1.4"),
             (instant("2026-11-01T10:22:00Z"), "resume", "2.1.5"),
+            (instant("2026-11-01T10:30:00Z"), "resume", "2.1.4"),
         ]
-        _ = self.transcript("parent-fixture.jsonl", "project/parent-fixture.jsonl")
-        for since, starts in (
-            (self.since, expected),
-            (self.since + timedelta(seconds=1), expected[1:]),
-            (instant("2026-11-01T10:20:01Z"), expected[2:]),
+        for fixture, since, starts in (
+            ("parent-fixture.jsonl", self.since, expected),
+            ("parent-fixture.jsonl", self.since + timedelta(seconds=1), expected),
+            ("parent-fixture.jsonl", instant("2026-11-01T10:20:01Z"), expected[4:]),
+            ("parent-fixture.jsonl", instant("2026-11-01T10:21:00Z"), expected[5:]),
+            ("version-restarts.jsonl", self.since, [
+                (instant("2026-11-01T09:50:00Z"), "startup", "2.1.296"),
+                (instant("2026-11-01T10:01:00Z"), "resume", "2.1.316"),
+                (instant("2026-11-01T10:03:00Z"), "resume", "2.1.317"),
+                (instant("2026-11-01T10:04:00Z"), "resume", "2.1.318"),
+                (instant("2026-11-01T10:05:00Z"), "resume", "2.1.319"),
+            ]),
         ):
-            with self.subTest(since=since):
+            with self.subTest(fixture=fixture, since=since):
+                _ = self.transcript(fixture, "project/starts.jsonl")
                 session, = reader.read_claude(self.projects, since, self.until, "fixture-machine")
                 self.assertEqual([(start.at, start.source, start.cli_version) for start in session.starts], starts)
 
@@ -170,7 +183,8 @@ class ContextEconomyReadTests(unittest.TestCase):
                 self.assertEqual([request.model for session in sessions for request in session.requests], expected)
                 expected_times = [self.since] if expected else []
                 self.assertEqual([event.at for session in sessions for event in session.compactions], expected_times)
-                self.assertEqual([start.at for session in sessions for start in session.starts], expected_times)
+                start_times = [instant("2026-11-01T09:59:59Z"), self.since] if expected else []
+                self.assertEqual([start.at for session in sessions for start in session.starts], start_times)
                 first_times = [instant("2026-11-01T09:59:59Z")] if expected else []
                 self.assertEqual([session.first_record_at for session in sessions], first_times)
 
@@ -186,6 +200,10 @@ class ContextEconomyReadTests(unittest.TestCase):
 
     def test_settings_timeline_keeps_the_baseline_and_only_tracked_changes(self) -> None:
         commits, first_content, last_content = self.settings_history()
+        tree = self.git("rev-parse", "HEAD^{tree}")
+        merge = self.git("commit-tree", tree, "-p", commits[0], "-p", commits[-1],
+                         "-m", "Merge the settings branch", at="2026-11-01T12:00:00Z")
+        _ = self.git("merge", "--ff-only", merge, at="2026-11-01T10:40:00Z")
         timeline = reader.settings_timeline(self.checkout, self.since, self.until)
         self.assertEqual([entry.commit for entry in timeline], commits)
         expected_values: dict[str, object] = {
@@ -207,6 +225,7 @@ class ContextEconomyReadTests(unittest.TestCase):
         for since, until, expected in (
             (self.since, instant("2026-11-01T10:30:00Z"), commits[:2]),
             (instant("2026-11-01T10:15:00Z"), self.until, commits[1:]),
+            (instant("2026-11-01T10:40:00Z"), self.until, commits[2:]),
         ):
             with self.subTest(since=since, until=until):
                 window = reader.settings_timeline(self.checkout, since, until)
