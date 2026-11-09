@@ -1218,41 +1218,24 @@ Checkpoint `1f9e9c484` on `verify-not-mac-wait`, merged to builds as `a62793f07`
 
 ### Phase 41u — copies.py list shows remote mirrors  · status: done
 
-**Depends on:** 41t. Runs after 41v.
+#### As-built
 
-#### Work Order
-
-**Source:** builds, 2026-11-08, moving queue-unit Phase 17 to this unit. Queue order was 18c, then 16, then 17. Builds rulings of 2026-11-05: the verify 35b unit keeps the 26 simplify items; the copy start object scan moved to natest's copies.py Git-work speed phase. On `copies.py` the second lander resolves.
-
-**Goal:** `copies.py list` answers who holds a mirror.
-
-**Spec:**
-1. **List.** `copies.py list` prints a header row with labeled columns, the number column included: owner, repository, host, path and session. It shows remote mirrors. The owner column shows the current staff name, looked up from the row id; a role owner shows its role name. Today it shows local standing checkouts only and skips `.remote-mirrors` (`list_trees`, `copies.py:1038`). Local rows keep the facts they show today: commit, busy state, holder pid and target size. `test_list_reports_tree_owner_repo_commit_busy_pid_and_target_size` keeps its assertions.
-2. **Holder states (architect review of queue 18, 2026-11-06).** `RemoteMirror.session` stays stored after `remote_lease()` ends, so it can name a former holder. The session column names a holder only with live lease evidence. A mirror is in one of three named states: held (the holder's current staff name, read from its session), idle, or unavailable.
-   - **A live lease does not prove the stored holder (architect review of 41t, 2026-11-08).** A run takes `remote_lease()` (`offload.py:2333`) before it publishes its session with `register_remote()` (`offload.py:2124`). During admission and copy, the record can still name the former holder. `register_remote()` (`copies.py:1357`) already stores `holder_pid` (`os.getpid()`). Name the holder only when the lease pid from `held_flock_keys` equals the record's `holder_pid`. When the pids differ, or the record has no `holder_pid`, the mirror is held with the holder not yet recorded. Prove on the real call path that the lease and the registration come from one process.
-   - **Holder name (architect review of 41t).** The stored session is a session id or `pid-<pid>` (`holder_session()`, `offload.py:2447`), not a staff row id. Look up the name with `staff.local_snapshot().by_current_session()` (`scripts/production/staff.py:484`). Convert its `None` result, or a staff read error, into a named holder-name-unavailable state at that boundary. A held mirror with an unavailable holder name stays held.
-   - `held_remote_mirrors()` (`copies.py:1340`) returns `()` when `/proc/locks` cannot be read, and `file_lock.lock_holder()` returns `None` for several outcomes. Neither tells idle from unavailable.
-   - Add a list reader in `copies.py` that reads `file_lock.held_flock_keys` once and calls `file_lock.device_key` per mirror. An unreadable lock table makes every mirror unavailable. A missing lease file makes the mirror idle. Any other read error makes it unavailable.
-   - Do not change `held_remote_mirrors()`, `lock_holder()` or `scripts/lib/file_lock.py`; their other callers keep their behavior.
-3. **Owner and holder are two columns (architect review of queue 18c, 2026-11-07).** `request_mirror` carries an owner and a holder as two values (`offload.py:2342`). The owner column shows the mirror's owner. The session column shows the live holder. Each has its own display rule. A role owner keeps its fixed role name.
-4. **Owner name states (architect review of queue 18c).** `owner_name` returns the raw row id when the staff read fails or the row is missing (`copies.py:84`). The list must not show a row id. The owner is in one of these named states: a current staff name, a role name, or unavailable. An unavailable owner keeps its row in the list and keeps its lease state.
-   - `owner_name()` also gives names to `tree_paths()` (`copies.py:431`) and `_scratch_gate_word()` (`copies.py:559`), so a change to its fallback can move checkout folders. Do not change `owner_name()`. Add a list-only owner display result with the three states, convert a missing staff row at that boundary, and keep the stored owner identity.
-5. **Proof.** List tests for remote-only records and for mixed local and remote records. Lease-state tests for held, idle and unavailable, with a former holder that the list does not name. A renamed owner with a different live holder shows the new owner name and the holder. A missing staff row shows the owner as unavailable, keeps the row and keeps its lease state. Lease-evidence tests: a missing lease file shows idle; an unreadable lock table shows unavailable; on macOS, where `/proc/locks` does not exist, the list shows unavailable and does not fail. A test proves that `tree_paths()` and `_scratch_gate_word()` give the same folders as before. Holder tests: a held lease whose pid differs from the record's `holder_pid` does not name the stored session; a held lease with no staff row for the holder session stays held with the holder name unavailable.
+- `copies.py list` prints a tab-separated header `number owner repository host path session commit state holder_pid target`. Local standing checkouts come first; remote mirrors follow, sorted by host and path. Local rows show the host from `socket.gethostname()` and keep commit, busy state, holder pid and target size.
+- An unreadable `.gate.json` keeps a numbered row: owner `unavailable`, repository from the tree's parent folder, state `unreadable`, other facts `-`. The error goes to stderr as `<tree>: <error>`.
+- Owner column: `OwnerDisplay` is `CurrentStaffOwnerName`, `RoleOwnerName` or `OwnerNameUnavailable`, from `list_owner_name(owner, staff_names)`. An unavailable owner keeps its row and its lease state. `owner_name()` is unchanged, so `tree_paths()` and `_scratch_gate_word()` keep their folders.
+- `ListStaffNames` reads `staff.local_snapshot()` at most once per list call, and only when a row needs it (`UnreadStaffNames`, `AvailableStaffNames`, `UnavailableStaffNames`). Owner and session columns resolve from that one snapshot.
+- Lease state: `list_remote_leases(mirrors, staff_names)` reads `file_lock.held_flock_keys()` once and calls `file_lock.device_key` per mirror. The result is `HeldMirrorLease(pid, holder)`, `IdleMirrorLease` or `UnavailableMirrorLease`. An OSError on the lock table makes every mirror unavailable; `FileNotFoundError` on the lease file means idle; any other OSError means unavailable. On macOS, with no `/proc/locks`, every mirror lists as unavailable.
+- Holder: `_list_holder_name` names the holder only when the lease pid equals the record's `holder_pid` (`CurrentHolderName`); otherwise `HolderNotRecorded` (`not recorded`). A held lease with no staff row for its session stays held with `HolderNameUnavailable`. `held_remote_mirrors()`, `lock_holder()` and `scripts/lib/file_lock.py` are unchanged.
 
 **Files:**
-- `scripts/copies/copies.py` — the list.
-- `scripts/copies/test_copies.py`, `scripts/copies/test_remote_copies.py` — the tests.
+- `scripts/copies/copies.py` — the list, owner display, lease and holder states.
+- `scripts/copies/test_copies.py` — local list rows, the unreadable-record row, folder-name stability.
+- `scripts/copies/test_remote_copies.py` — remote-only and mixed rows, lease, holder and owner states; `expected_remote_lease_columns` names the `/proc/locks` platform choice once.
+- `docs/as-built/gate-checkouts.md` — the `list` paragraph.
 
-**Constraints from prior phases:**
-- Phase 41t: `guard_choice_limit()` (`copies.py:301`) reads `config_settings()` and falls back to the repository `config/copies.conf` when the key is missing. A new copies key follows the same required-key form. Keep the key, the fallback and the bound.
-- Phase 41t: `test_branch_arguments_require_linear_invocation_work` in `test_copy_guard.py` stays green.
+**Gotchas:** holder identity rests on pid equality between the lease and `holder_pid`; one process takes the lease and registers on the real path.
 
-**Workers:** 1 writer + 1 tester — `impl` owns `copies.py`; `test` owns `test_copies.py` and `test_remote_copies.py`.
-
-**Acceptance gate:**
-- The copies suites pass, `test_copy_guard.py` included; `basedpyright` reports 0 errors and 0 warnings on the changed files.
-- The director runs the targeted test.
-- Change-Review: `copies.py list` output.
+**Ruled out:** a process or lease generation check for the holder — pid reuse inside one run's lease-to-register window only changes list output.
 
 ### Phase 41w — Two helper starts in the verify wait tests load less  · status: todo
 
@@ -1305,7 +1288,7 @@ Checkpoint `1f9e9c484` on `verify-not-mac-wait`, merged to builds as `a62793f07`
 **Files:**
 - `docs/direct/final_gate_commit.md` — the gate choice (owned by sdlc; the checkpoint notice names it).
 - `scripts/direct/verify.sh` — the early exit.
-- the existing `scripts/direct/test_verify_*.py` test that runs `verify.sh` in a temporary repository — the row.
+- `scripts/direct/test_verify_check_no_library.py` — the row. Its `DevFeatureFixture` (`verify_dev_features_test_support.py:74`) runs `verify.sh` in a temporary workspace.
 
 **Workers:** 1 writer — `impl` owns every file above.
 
