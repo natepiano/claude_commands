@@ -193,15 +193,21 @@ A new metric, dimension or outcome is one registry entry. The report reads `turn
 ### Context economy
 
 `scripts/usage/context_economy.py` reads context measurements on demand.
-`/context_economy` defaults to `report`, also when its first argument starts with `--`.
+`scripts/usage/context_economy_read.py` holds the readers: `read_claude`, `read_mac`, `read_codex`, `settings_timeline`, `settings_for` and `role_of`.
+`/context_economy` (`commands/context_economy.md`) defaults to `report`, also when its first argument starts with `--`.
+The CLI has `report`, `save`, `compare` and `trend`; `report` takes `--role` and `--by settings|week`.
 The default window covers the last seven days.
 Bounds use `scripts.lib.user_zone.user_zone`.
 
 The inputs are read at run time:
 
 1. Claude transcripts supply requests, starts, compactions, models, and CLI versions.
+   Requests are deduplicated by (`message.id`, `requestId`); records with model `<synthetic>` are not requests.
+   A Claude Code restart does not always write a `SessionStart:resume` hook record, so a change of the record `version` also counts as a resume start.
 2. Codex rollouts supply requests, thread openings, models from `turn_context`, and versions from `session_meta`.
 3. Each machine's checkout HEAD reflog supplies settings times and tracked file values.
+   `main` moves by fast-forward, so commit times are late; only the reflog gives the time the live files changed.
+   `CONTEXT_ECONOMY_CHECKOUT` sets the checkout; its default is `~/.claude`.
 4. The local usage ledger supplies roles; `weights.weighted` supplies dated request costs.
 
 `config/context_economy.conf` names the tracked settings, files, and thresholds.
@@ -236,6 +242,8 @@ Those requests remain in context quantities and contribute no cost samples.
 Resumes do not split this count or discard compaction pairs.
 
 The Mac reader uses one SSH call.
+It sends the reader modules to `python3 -c` (`collect.bootstrap_program`); the Mac prints JSON lines and writes nothing.
+`CONTEXT_ECONOMY_MAC_COMMAND` (a JSON list) replaces the SSH command, for tests and a forced failure.
 `mac_timeout_seconds` in `config/context_economy.conf` limits it to 300 seconds by default.
 A failed read prints `mac: <reason>` on `report` and `save`; local measurements remain available.
 An empty Mac result is a successful read.
@@ -271,8 +279,7 @@ Precompute ON was the default while `precomputeCompactionEnabled` was absent.
 Commit `46471082e` added the key at 2026-11-08 12:36.
 `--where` cannot select an absent key.
 The OFF save selects `--where precomputeCompactionEnabled=false` after role `director` has at least 30 `requests_per_cycle` samples.
-Until that threshold, the director reports n and saves no OFF result.
-The director creates these experiment saves during live acceptance.
+Until that threshold, no OFF result is saved; on 2026-11-09 the director n was 8.
 
 The default `report` (seven days, both families, natedev and the Mac) measured 202.8 seconds on 2026-11-09.
 
