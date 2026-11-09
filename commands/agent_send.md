@@ -66,6 +66,8 @@ One `SendMessage` call:
 - `summary`: `send to <name>` — or `send to <name>, reply requested` in respond mode
 - `message`: the composed text
 
+A `Remote Control` row is on another machine: send with `send.py --machine <other machine> --to <name> --from "<your session name>" --text "<message>"` (/message) and report its outcome line.
+
 Do not set `notify_when_idle`. If the send errors asking for disambiguation, retry once with the ` [ref]` from the listing; if it still fails, report the error verbatim.
 </Send>
 
