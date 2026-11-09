@@ -812,6 +812,13 @@ class FolderChoice:
 
 
 @dataclass(frozen=True)
+class CurrentMacFolders:
+    """Folder choices measured on the Mac during this crossing delivery."""
+
+    folders: tuple[FolderChoice, ...]
+
+
+@dataclass(frozen=True)
 class AvailableFolderChoices:
     choices: tuple[FolderChoice, ...]
 
@@ -3242,12 +3249,15 @@ def folder_choice(path: str, size: int) -> FolderChoice:
     return FolderChoice(label, size, FolderChoiceKind.OTHER)
 
 
-def folder_choices(measurement: DiskMeasurement, protected: Sequence[tuple[str, int]], shortfall: int, *,
+def folder_choices(measurement: DiskMeasurement | CurrentMacFolders, protected: Sequence[tuple[str, int]], shortfall: int, *,
                    now: float, lint_settings: conf.ConfigRead) -> FolderChoices:
     """Use current measurements and keep protected folders distinct from holders."""
     choices = [FolderChoice(home_relative(path), size, FolderChoiceKind.PROTECTED)
                for path, size in protected if size > 0]
-    if isinstance(measurement, AvailableDiskMeasurement):
+    if isinstance(measurement, CurrentMacFolders):
+        protected_labels = {item.label for item in choices}
+        choices.extend(item for item in measurement.folders if item.bytes > 0 and item.label not in protected_labels)
+    elif isinstance(measurement, AvailableDiskMeasurement):
         age = now - measurement.measured_at.timestamp()
         if 0 <= age <= lint_settings.number("sweep_snapshot_max_age_seconds"):
             protected_paths = {item[0] for item in protected}
@@ -3590,6 +3600,48 @@ class NatedevFloor(Enum):
     CURRENT = "natedev"
 
 
+def mac_folder_reclaimable_bytes(directory: str) -> int:
+    """Count file blocks once only when every hard link is inside this folder."""
+    total = 0
+    links: dict[InodeKey, int] = {}
+    shared: dict[InodeKey, os.stat_result] = {}
+    frontier = [directory]
+    while frontier:
+        try:
+            with os.scandir(frontier.pop()) as entries:
+                listed = list(entries)
+        except OSError:
+            continue
+        for entry in listed:
+            try:
+                observed = entry.stat(follow_symlinks=False)
+                is_directory = entry.is_dir(follow_symlinks=False)
+            except OSError:
+                continue
+            if is_directory:
+                frontier.append(entry.path)
+                continue
+            if observed.st_nlink == 1:
+                total += observed.st_blocks * 512
+                continue
+            key = (observed.st_dev, observed.st_ino)
+            links[key] = links.get(key, 0) + 1
+            shared[key] = observed
+    return total + sum(observed.st_blocks * 512 for key, observed in shared.items() if links[key] == observed.st_nlink)
+
+
+def mac_folder_measurement(policy: MacFloor) -> CurrentMacFolders:
+    """Measure each root's direct folder children without following directory symlinks."""
+    folders: set[str] = set()
+    for root in policy.roots:
+        try:
+            with os.scandir(Path(root).expanduser().resolve()) as entries:
+                folders.update(entry.path for entry in entries if entry.is_dir(follow_symlinks=False))
+        except OSError as error:
+            print(f"lint sweep: cannot measure folders under {root}: {error}", file=sys.stderr)
+    return CurrentMacFolders(tuple(folder_choice(path, mac_folder_reclaimable_bytes(path)) for path in sorted(folders)))
+
+
 class FloorFailureScope(Enum):
     FILESYSTEM = "filesystem"
     DISCOVERY = "discovery"
@@ -3783,10 +3835,11 @@ def _hold_floor(floor: int, dry_run: bool, *,
 
 def notify_floor_problem(outcome: FloorOutcome | tmp_sweep.SweepAssessment, *, lint_settings: conf.ConfigRead, detail: str = "",
                          scope: SweepFailureScope = FloorFailureScope.FILESYSTEM,
-                         machine: FloorMachine = FloorMachine.NATEDEV) -> None:
+                         policy: MacFloor | NatedevFloor = NatedevFloor.CURRENT) -> None:
     """Finalize delivery and state before an acquired floor lock closes."""
     from scripts.lint import tmp_sweep
 
+    machine = FloorMachine.MAC if isinstance(policy, MacFloor) else FloorMachine.NATEDEV
     assessment = outcome.assessment if isinstance(outcome, FloorOutcome) else outcome
     if isinstance(assessment, tmp_sweep.SkippedSweepAssessment):
         return
@@ -3800,6 +3853,7 @@ def notify_floor_problem(outcome: FloorOutcome | tmp_sweep.SweepAssessment, *, l
     if not root_scope and not assessment.status and not path.exists():
         return
     phone_floor = int(lint_settings.number("sweep_phone_floor_gib") * GIB)
+    phone_rearm = phone_floor + int(lint_settings.number("sweep_phone_rearm_gib") * GIB)
 
     def finalize(previous: NoFloorRecord | FloorRecord, save: Callable[[FloorRecord], bool]) -> FloorRecord:
         current = floor_record_or_new(previous, after)
@@ -3809,7 +3863,7 @@ def notify_floor_problem(outcome: FloorOutcome | tmp_sweep.SweepAssessment, *, l
                 # Measure inside the record lock. Older callers cannot reset a newer crossing.
                 free = free_bytes(filesystem.probe_path if isinstance(filesystem, FilesystemFloor)
                                   else os.path.expanduser("~"))
-                if free > phone_floor:
+                if free > phone_rearm:
                     current = replace(current, phone_crossing=AbovePhoneFloor())
                 elif free < phone_floor and isinstance(current.phone_crossing, AbovePhoneFloor):
                     current = replace(current, phone_crossing=OpenPhoneCrossing(uuid.uuid4().hex))
@@ -3823,9 +3877,10 @@ def notify_floor_problem(outcome: FloorOutcome | tmp_sweep.SweepAssessment, *, l
             failure = NoFailure()
         current = replace(current, failure=failure)
         crossing = current.phone_crossing if root_scope else AbovePhoneFloor()
-        natedev_pending = isinstance(crossing, OpenPhoneCrossing) and crossing.natedev is CrossingReceipt.PENDING
-        phone_due = (isinstance(crossing, OpenPhoneCrossing) and crossing.phone is CrossingReceipt.PENDING
-                     and not assessment.status)
+        natedev_pending = (free < phone_floor and isinstance(crossing, OpenPhoneCrossing)
+                           and crossing.natedev is CrossingReceipt.PENDING)
+        phone_due = (free < phone_floor and isinstance(crossing, OpenPhoneCrossing)
+                     and crossing.phone is CrossingReceipt.PENDING and not assessment.status)
         phone_pending = phone_due and disk_floor_channels() is FloorAlertChannels.NATEDEV_AND_PHONE
         crossing_pending = natedev_pending or phone_pending
         pending_failure = isinstance(failure, FailurePending)
@@ -3834,7 +3889,8 @@ def notify_floor_problem(outcome: FloorOutcome | tmp_sweep.SweepAssessment, *, l
         shortfall = max(0, phone_floor - free)
         choices: FolderChoices = UNAVAILABLE_FOLDER_CHOICES
         if crossing_pending:
-            choices = folder_choices(read_disk_measurement(), protected, shortfall,
+            measurement = mac_folder_measurement(policy) if isinstance(policy, MacFloor) else read_disk_measurement()
+            choices = folder_choices(measurement, protected, shortfall,
                                      now=time.time(), lint_settings=lint_settings)
 
         def render(path_limit: int) -> str:
@@ -3856,7 +3912,8 @@ def notify_floor_problem(outcome: FloorOutcome | tmp_sweep.SweepAssessment, *, l
             receipt = current.phone_crossing
             if isinstance(receipt, OpenPhoneCrossing):
                 receipt = replace(receipt,
-                                  natedev=CrossingReceipt.ACCEPTED if delivery.natedev.accepted else receipt.natedev,
+                                  natedev=(CrossingReceipt.ACCEPTED if natedev_pending and delivery.natedev.accepted
+                                           else receipt.natedev),
                                   phone=CrossingReceipt.ACCEPTED if delivery.phone.accepted else receipt.phone)
                 current = replace(current, phone_crossing=receipt)
             if delivery.natedev.accepted and isinstance(current.failure, FailurePending):
@@ -4207,7 +4264,7 @@ def _hold_floor_pass(floor: int, dry_run: bool, *,
         try:
             if not dry_run:
                 notify_floor_problem(replace(outcome, protected=protected), lint_settings=lint_settings, detail=detail,
-                                     machine=FloorMachine.MAC if isinstance(policy, MacFloor) else FloorMachine.NATEDEV)
+                                     policy=policy)
         finally:
             try:
                 if guard is not None:

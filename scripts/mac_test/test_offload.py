@@ -274,6 +274,7 @@ class CompletedRunSyncTests(unittest.TestCase):
             return 0
 
         with (
+            mock.patch.dict(os.environ, copies_environment(root)),
             mock.patch.object(offload, "configured_ssh_target", return_value=configured),
             mock.patch.object(offload, "expected_instance_generation", return_value=""),
             mock.patch.object(offload, "expected_linux_parity", return_value={}),

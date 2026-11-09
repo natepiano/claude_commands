@@ -640,7 +640,10 @@ def can_close(worker: OpenWorker | StoppedWorker | ClosedWorker, *,
                             if isinstance(latest, progress_history.RecordedDispatch) else ("", ""))
     if status not in ("canceled", "interrupted", "completed", "active"):
         return Kept("launcher has not recorded a completed pass")
-    completion = CloseAllowed() if status in ("canceled", "interrupted") else _completed_turn(worker.row, dispatch)
+    hook_completion = progress_history.hook_completion(passed)
+    completion = (CloseAllowed() if status in ("canceled", "interrupted") or (
+        status == "completed" and isinstance(hook_completion, progress_history.HookCompletion)
+        and hook_completion.outcome == "done") else _completed_turn(worker.row, dispatch))
     if isinstance(completion, Kept):
         return completion
     return _idle_checks(worker.row, directory, lock, closing_turn=status == "active")
@@ -673,14 +676,14 @@ def _launch_policy(settings: models_registry.LaunchSettings, sandbox: str) -> La
 
 
 def turn_end_command() -> list[str]:
-    """Give both families the same hook from the launch line."""
+    """Build the shared turn handler command for the Claude launch settings."""
     scripts = Path(__file__).resolve().parents[1]
     return [str(scripts / "lib/py"), str(scripts / "herdr/turn_end.py")]
 
 
 def _turn_end_arguments(kind: Literal["codex", "claude"]) -> list[str]:
     if kind == "codex":
-        return ["-c", "notify=" + json.dumps(turn_end_command())]
+        return []
     hooks = {"hooks": {"Stop": [{"hooks": [{"type": "command", "command": shlex.join(turn_end_command()), "async": True}]}]}}
     return ["--settings", json.dumps(hooks, separators=(",", ":"))]
 
@@ -762,7 +765,8 @@ def _live_policy(worker: OpenWorker, policy: LaunchPolicy, client: herdr.Herdr, 
         same_permissions = (["--sandbox", policy.sandbox] in pairs and ["--ask-for-approval", "never"] in pairs
                             if policy.settings.kind == "codex" else ["--permission-mode", policy.permission] in pairs)
         if same_permissions and same_role:
-            return _turn_end_arguments(policy.settings.kind) in pairs
+            hook_arguments = _turn_end_arguments(policy.settings.kind)
+            return not hook_arguments or hook_arguments in pairs
         return all(expected[index:index + 2] in [actual[pos:pos + 2] for pos in range(len(actual) - 1)]
                    for index in range(0, len(expected), 2))
     except (herdr.HerdrFailure, OSError, ValueError, subprocess.SubprocessError) as error:

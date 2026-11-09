@@ -13,6 +13,7 @@ import subprocess
 import sys
 from contextlib import redirect_stderr
 from dataclasses import asdict, dataclass, replace
+from datetime import datetime, timezone
 from enum import StrEnum
 from pathlib import Path
 from typing import cast
@@ -52,10 +53,8 @@ class TurnOutcome(StrEnum):
 
 def hook_event(value: dict[str, object]) -> WorkerEvent:
     """Convert each native hook input at the boundary."""
-    if value.get("type") == "agent-turn-complete":
-        return WorkerEvent(str(value.get("thread-id", "")), reply=str(value.get("last-assistant-message", "")))
     if value.get("hook_event_name") == "Stop":
-        return WorkerEvent(str(value.get("session_id", "")), reply=str(value.get("last_assistant_message", "")))
+        return WorkerEvent(str(value.get("session_id", "")), reply=str(value.get("last_assistant_message") or ""))
     kind = value.get("event")
     if kind in (EventKind.RUN_FINISHED, EventKind.STAGE_READY):
         return WorkerEvent(str(value.get("thread_id", "")), EventKind(str(kind)))
@@ -234,52 +233,74 @@ def _finish_completion(row: staff.StaffRow, parent: staff.StaffRow, run: Path, p
     return outcome
 
 
+def _ignored(event: WorkerEvent, reason: str, worker_name: str = "unknown") -> TurnOutcome:
+    """Save each ignored event for the director without sending a notice."""
+    path = herdr.layout_path(herdr.shared_session()).parent / "turn-end-ignored.jsonl"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a") as stream:
+        _ = stream.write(json.dumps({"timestamp": datetime.now(timezone.utc).isoformat(),
+            "reason": reason, "thread_id": event.thread_id, "worker_name": worker_name,
+            "event": event.kind}) + "\n")
+    return TurnOutcome.IGNORED
+
+
 def handle(event: WorkerEvent) -> TurnOutcome:
     """Recover unfinished completion steps without retaining a watcher."""
     record = staff.snapshot()
     row = record.by_current_session(event.thread_id) if event.thread_id else None
-    if row is None or row.kind != "worker":
-        return TurnOutcome.IGNORED
+    if row is None:
+        return _ignored(event, "no staff row for the current thread")
+    if row.kind != "worker":
+        return _ignored(event, "the staff row is not a worker", row.name)
     parent = record.parent_of(row)
     if parent is None:
-        return TurnOutcome.IGNORED
+        return _ignored(event, "the worker has no parent", row.name)
     run = worker_panes.worker_run(row, record=record)
     with worker_panes.worker_lock(parent.id, staff.WorkerName.parse(row.name), blocking=True) as hold:
         if isinstance(hold, worker_panes.Kept):
-            return TurnOutcome.IGNORED
+            return _ignored(event, f"the worker lock was kept: {hold.blocker}", row.name)
         passed = worker_panes.worker_pass(row, run)
         completion = progress_history.hook_completion(passed)
         if isinstance(completion, progress_history.HookCompletion) and completion.finished:
-            return TurnOutcome.IGNORED
+            return _ignored(event, "the hook completion is already finished", row.name)
         active = progress_history.active_dispatch(row.id, run)
         if not isinstance(active, progress_history.ActiveDispatch) and not (
                 isinstance(completion, progress_history.HookCompletion) or
                 passed.get("status") in ("completed", "error")):
-            return TurnOutcome.IGNORED
+            return _ignored(event, "no active dispatch or recoverable completion exists", row.name)
         instance = active.instance_id if isinstance(active, progress_history.ActiveDispatch) else str(passed.get("instance_id", ""))
         delivery = progress_history.dispatch_delivery(passed)
         if not delivery.line:
-            return TurnOutcome.IGNORED
+            return _ignored(event, "the dispatch delivery line is empty", row.name)
         client = herdr.Herdr(herdr.shared_session())
         state = worker_panes.observe_worker(parent.id, row, record)
         if isinstance(state, worker_panes.WorkerNotObserved):
-            return TurnOutcome.IGNORED
+            return _ignored(event, "the worker pane was not observed", row.name)
         if isinstance(completion, progress_history.HookCompletion):
             return _finish_completion(row, parent, run, passed, instance, delivery, completion, state, hold)
         receipt = worker.dispatch_receipt(row, delivery.line, delivery.completion_id, run=run)
         if isinstance(receipt, worker.DispatchNotSubmitted):
             if event.kind == EventKind.STAGE_READY and delivery.completion_id != instance:
                 return _submit_stage(parent, row, state, client, run, passed, instance, delivery)
-            return TurnOutcome.IGNORED
+            return _ignored(event, "the transcript has no matching dispatch prompt", row.name)
         if isinstance(receipt, worker.DispatchEvidenceUnknown):
-            return TurnOutcome.IGNORED
-        if isinstance(receipt, worker.DispatchSubmitted) and not receipt.reply:
-            return TurnOutcome.SUBMITTED if event.kind == EventKind.STAGE_READY else TurnOutcome.IGNORED
-        anomalies = receipt.anomalies if isinstance(receipt, worker.DispatchComplete) else ()
+            return _ignored(event, f"the transcript evidence is unknown: {receipt.reason}", row.name)
         turn_reply = receipt.reply if isinstance(receipt, worker.DispatchWaitingForRuns) else receipt
         reply = turn_reply.last_reply if isinstance(turn_reply, worker.DispatchAwaitingReply) else turn_reply.reply
+        if (event.kind == EventKind.TURN_END and reply != event.reply
+                and event.reply.rstrip().splitlines()[-1:] == [f"DONE {delivery.completion_id}"]
+                and not (isinstance(receipt, worker.DispatchWaitingForRuns) and receipt.has_live_run)):
+            receipt = worker.DispatchComplete(event.reply,
+                receipt.anomalies if isinstance(receipt, worker.DispatchComplete) else ())
+            reply = event.reply
+        if isinstance(receipt, worker.DispatchSubmitted) and not receipt.reply:
+            if event.kind == EventKind.STAGE_READY:
+                return TurnOutcome.SUBMITTED
+            return _ignored(event, "the submitted dispatch has no final reply", row.name)
+        anomalies = receipt.anomalies if isinstance(receipt, worker.DispatchComplete) else ()
         if event.kind == EventKind.TURN_END and (not reply or reply != event.reply):
-            return TurnOutcome.IGNORED
+            reason = "the transcript reply is empty" if not reply else "the transcript reply differs from the turn reply"
+            return _ignored(event, reason, row.name)
         if isinstance(receipt, worker.DispatchComplete):
             if delivery.early_ready and delivery.completion_id == instance:
                 if not Path(delivery.early_ready).exists():
@@ -333,14 +354,16 @@ def main(arguments: list[str] | None = None) -> int:
                 raise ValueError(f"worker {args[1]} is not in this director's staff")
             _ = handle(WorkerEvent(str(row.current_session), EventKind.STAGE_READY))
             return 0
-        separate = len(args) == 2 and args[0] == "--handle-hook"
-        payload = args[1] if separate else args[0] if args else sys.stdin.read()
+        separate = args == ["--handle-hook"]
+        payload = args[0] if args and not separate else sys.stdin.read()
         value = cast(dict[str, object], json.loads(payload))
         if separate:
             _ = handle(hook_event(value))
         else:
-            _ = subprocess.Popen([sys.executable, str(Path(__file__).resolve()), "--handle-hook", payload],
-                start_new_session=True, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            child = subprocess.Popen([sys.executable, str(Path(__file__).resolve()), "--handle-hook"],
+                start_new_session=True, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            with cast(io.BufferedWriter, child.stdin) as stream:
+                _ = stream.write(payload.encode())
         return 0
     except (OSError, ValueError, staff.StaffUnreadable, staff.StaffRefused, herdr.HerdrFailure) as error:
         print(f"turn_end: {error}", file=sys.stderr)

@@ -24,7 +24,7 @@ from scripts.build_queue.queue_fixture import (
     ci_step,
     ASKING_SESSION, GOLDEN, NOW, QueueFixture, QueueFixtureTests, queue_read_fixture, waiting_rows, with_waiting,
 )
-from scripts.build_queue.queue_lines import json_form, plain, wrap
+from scripts.build_queue.queue_lines import QueueLines, json_form, plain, wrap
 from scripts.lib.build_steps import read_step_names
 from scripts.lib.terminal_cells import terminal_width
 from scripts.lint import memory_admit as gate
@@ -32,6 +32,11 @@ from scripts.lint.memory_test_support import fake_memory_readings
 from scripts.message.unit_labels import UnitLabels
 from scripts.message import unit_labels
 from scripts.build_queue.queue_fixture import write_memory_config
+
+
+def queue_json_text(data: QueueLines) -> str:
+    """Read the text cells from the queue pane's JSON lines."""
+    return "\n".join("".join(span["text"] for span in row) for row in data["lines"])
 
 
 class BumpRecordsWithVisitCount(tuple[head_facts.BumpRecord, ...]):
