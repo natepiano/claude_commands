@@ -35,39 +35,23 @@ The user, through fastest-unit and the sdlc showrunner, 2026-11-09: "it doesn't 
 
 **Depends on:** none
 
-#### Work Order
+#### As-built
 
-**Goal:** `worker.py list` text rows read `<n> <name> <role> <account> <pane> <state>`, with a reason after them only where one exists. Pane is `open` or `closed`. State is `busy`, `idle`, `paused` or `exited` for an open pane, and `-` for a pane that is not open. A worker whose pane is not open shows `-` for its account.
+`worker.py list` text rows read `<n> <name> <role> <account> <pane> <state>[ <reason>]`. `_worker_pane_state` in `worker.py` is the one mapping from an observed worker to its pane and state words:
 
-**Spec:**
+- `OpenWorker`: pane `open`, state `paused` or `exited` from the staff row, else `worker_panes.worker_state` (`busy`, `idle` or `unknown`).
+- `StoppedWorker`: pane `open`, state `exited`.
+- `ClosedWorker`: pane `closed`, state `-`.
+- Any other observed state: pane `unknown`, state `-`, and the row keeps its reason.
 
-1. Add one function in `worker.py` that maps an observed worker to its pane word and its state word.
-   - `OpenWorker`: pane `open`. State `paused` when the staff row is paused, `exited` when the staff row is exited, else `worker_panes.worker_state(state)` (`busy`, `idle`, or `unknown` for a herdr status of unknown).
-   - `StoppedWorker`: pane `open`, state `exited` (the pane is there and its agent process is not).
-   - `ClosedWorker`: pane `closed`, state `-`.
-   - Any other state (uncertain, process unknown): pane `unknown`, state `-`. The row keeps its reason after the columns.
-2. The per-unit `list` text row prints `<n> <name> <role> <account> <pane> <state>[ <reason>]`. The account is the label (or `account unknown`) only when the pane is `open`; otherwise it is `-`. The type name (`OpenWorker`, `ClosedWorker`) and the separate activity word go away from the text row.
-3. `list --all` does not observe panes. Its text row prints `-` for the pane, the account as today, and a state from its dispatch status: `busy`, `idle`, `paused` or `exited`.
-4. `list --json` and `list --json --all` keep their keys and values unchanged.
-5. `commands/unit/worker.md` line 11 describes the new text columns.
-6. Tests: change the expected text in the existing list tests in `test_worker.py` (near lines 2166, 2177, 2182-2183 and 2257). Add rows to the existing list test for an open idle worker, an open busy worker, a stopped worker, a closed worker and a paused row, where that test can hold them (test growth rule 1). Add no new test file.
+A pane that is not open prints `-` for the account. `list --all` prints `-` for the pane, the account, and a state from the dispatch status. `list --json` and `list --json --all` keep their keys and values.
 
 **Files:**
-- `scripts/production/worker.py` — the pane and state mapping; the text row
-- `scripts/production/test_worker.py` — expected text rows
+- `scripts/production/worker.py` — `_worker_pane_state`; `list_workers` adds the words for text output; `_print_workers` prints the columns
+- `scripts/production/test_worker.py` — the expected text rows and the open, busy, stopped, closed, paused and uncertain rows
 - `commands/unit/worker.md` — the `list` description
 
-**Workers:** 1 writer — one function and its text row; nothing splits.
-- `impl` — all Files above.
-
-**State:** none — the phase changes text output only.
-
-**Constraints from prior phases:** none.
-
-**Acceptance gate:**
-- `scripts/lib/py -m unittest scripts.production.test_worker` passes, and `basedpyright scripts/production/worker.py scripts/production/test_worker.py` gives `0 errors, 0 warnings, 0 notes`.
-- A closed worker row in the test output reads `<n> <name> <role> - closed -`.
-- `list --json` output in the existing JSON tests is unchanged.
+**Gotchas:** `list_workers(as_json=False)` replaces the `state` key with the column word, so the key holds the observed class name only in JSON output.
 
 ### Phase 2 — Status has no machine word; a Machine column shows only off natedev  · status: todo
 
@@ -94,7 +78,9 @@ The user, through fastest-unit and the sdlc showrunner, 2026-11-09: "it doesn't 
 - `scripts/production/unit_phases.py`, `scripts/production/style_units.py` — the column
 - `scripts/production/worker.py` — the column
 - `scripts/production/display_cells.py` — the one column function
-- the matching test modules, and `docs/as-built/unit-board.md`
+- `scripts/production/test_live_units.py`, `scripts/production/test_unit_phases.py`, `scripts/production/test_style_units.py`, `scripts/production/test_worker.py` — the tests
+- `scripts/accounts/accounts.py`, `scripts/accounts/test_accounts.py`, `mods/unit-board/` — only where Spec item 5 finds an `on <machine>` status
+- `docs/as-built/unit-board.md` — the status text
 
 **Workers:** 1 writer — one function and its callers; nothing splits.
 - `impl` — all Files above.
