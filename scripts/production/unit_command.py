@@ -16,7 +16,7 @@ from typing import cast
 
 sys.dont_write_bytecode = True
 from scripts.production import staff, unit_config
-from scripts.shutdown import remote
+from scripts.agents import remote
 from scripts.herdr import herdr
 
 

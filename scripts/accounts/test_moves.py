@@ -25,7 +25,7 @@ from scripts.production import staff, session_staff
 from scripts.production.staff_test_support import (
     StaffTestCase, fixture_member, fixture_worker, fixture_runtime_id,
 )
-from scripts.shutdown import inventory, stop_results
+from scripts.agents import inventory, stop_results
 from scripts.whoami import agent_accounts, note_file
 from scripts.whoami.account_test_support import create_claude_account, write_codex_auth
 

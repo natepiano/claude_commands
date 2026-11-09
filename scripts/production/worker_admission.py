@@ -18,7 +18,7 @@ from typing import cast
 from scripts.agents import worker_lifecycle
 from scripts.lib import unit_runs
 from scripts.production import staff, session_staff
-from scripts.shutdown.stop_results import ReleaseSource, SourceReleased
+from scripts.agents.stop_results import ReleaseSource, SourceReleased
 
 
 class AdmissionRefused(ValueError):
@@ -439,7 +439,7 @@ def switch_worker(allowed: WorkerStartAllowed, family: str, *,
         else:
             if row is not None and not same:
                 handoff = extract_transcript(row, allowed.run, backend)
-                release_source = cast(ReleaseSource, import_module("scripts.shutdown.stop_resume").release_source)
+                release_source = cast(ReleaseSource, import_module("scripts.agents.stop_resume").release_source)
                 released = release_source(row, backend)
                 if not isinstance(released, SourceReleased):
                     raise AdmissionRefused(released.reason)

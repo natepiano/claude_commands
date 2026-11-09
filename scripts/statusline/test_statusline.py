@@ -19,7 +19,7 @@ from zoneinfo import ZoneInfo
 from scripts.accounts import new_account
 from scripts.lib.py_floor_test_support import seed_interpreter_cache
 from scripts.production import session_labels, staff
-from scripts.shutdown import remote
+from scripts.agents import remote
 from scripts.statusline import adhoc_items, assignment, rebuild_row
 
 PROGRAM = Path(__file__).with_name("statusline.jq")

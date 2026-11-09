@@ -328,7 +328,7 @@ class MergeGateLedgerTests(MergeGateFixture):
     def test_nightly_notice_resolves_the_production_from_its_branch_without_a_calling_session(self) -> None:
         from scripts.production import showrunners, staff
         from scripts.production.staff_test_support import fixture_member
-        from scripts.shutdown import remote
+        from scripts.agents import remote
 
         production = self.checkout / "quiet-production.md"
         self.write(production, "# Quiet production\n")

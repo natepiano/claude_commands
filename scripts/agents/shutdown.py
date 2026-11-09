@@ -44,7 +44,7 @@ from scripts.production import (
 from scripts.production.production_doc import Production, Refusal, read_production
 from scripts.production.rename_state import RenameRefused, production_journal, read_json, write_json
 from scripts.lib.atomic_file import write_text_atomic
-from scripts.shutdown import (
+from scripts.agents import (
     restart,
     restart_support,
     shutdown_record,
@@ -53,7 +53,7 @@ from scripts.shutdown import (
     remote,
     pane_record,
 )
-from scripts.shutdown.inventory import (
+from scripts.agents.inventory import (
     CheckoutState,
     Host,
     InvalidInventory,
@@ -62,8 +62,8 @@ from scripts.shutdown.inventory import (
     inventory,
     parse_inventory,
 )
-from scripts.shutdown.remote import other_machine, run_remote as run_remote, local_machine
-from scripts.shutdown.stop_results import StopResult, ResumeResult
+from scripts.agents.remote import other_machine, run_remote as run_remote, local_machine
+from scripts.agents.stop_results import StopResult, ResumeResult
 from scripts.whoami import agent_accounts, note_file
 from scripts.whoami.account import (
     Account,

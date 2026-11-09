@@ -33,7 +33,7 @@ from scripts.production import add_unit
 from scripts.production import dailies_render
 from scripts.production import merge_checkpoint
 from scripts.production import production_doc, staff
-from scripts.shutdown.remote import local_machine
+from scripts.agents.remote import local_machine
 from scripts.production.staff_test_support import isolated_staff_file, showrunner_relationship, unit_membership
 from scripts.production.fake_showrunner import write_timer
 from scripts.production import update_registration

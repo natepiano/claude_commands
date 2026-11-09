@@ -2,7 +2,7 @@
 import subprocess
 import unittest
 from unittest.mock import patch
-from scripts.shutdown import restart_support as settle
+from scripts.agents import restart_support as settle
 NOW = "2026-10-09T21:49:10+00:00"
 
 class SendOutcomeTests(unittest.TestCase):

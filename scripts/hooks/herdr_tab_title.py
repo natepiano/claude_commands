@@ -18,7 +18,7 @@ from typing import TypedDict, cast
 from scripts.herdr import herdr, worker_panes  # noqa: E402
 from scripts.message import sessions  # noqa: E402
 from scripts.production import staff
-from scripts.shutdown import pane_record
+from scripts.agents import pane_record
 
 
 class StopPayload(TypedDict, total=False):

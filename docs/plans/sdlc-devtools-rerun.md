@@ -32,7 +32,7 @@ The user, through the sdlc showrunner, 2026-10-30: "all of our tools need to be 
 
 Owners: models-unit (the flag), hierarchies-unit (its caller), roles-unit (`workers.py`, `review_pool.py`). This is outside cleanup, not Phase 8's state-and-event rule.
 
-**Obsolete: code deleted** (the user's go on natedev's proposal, through the sdlc showrunner, 2026-10-30). Shutdown and herdr delete the stop records (`shutdown/shutdown_record.py`), the stop conductor (`shutdown/settle.py`), the transfer journal (`production/transfer_unit.py`) and the long rename steps (`production/rename.py`, `production/rename_unit.py`). Rows in that code are marked obsolete below and get no fix; Phase 1's check skips exactly those paths until they leave main. The rest of the old hold (`pane_record.py`, `restart.py`, `lib/relaunch.py`, `production/rename_state.py`) is no longer held: a row there is the named phase's work, checked again on main at that phase's Work Order. sdlc-phases Phase 17 changed some of these files before the hold (81e41ae5); Phases 3 and 8 only wait for that code to reach main.
+**Obsolete: code deleted** (the user's go on natedev's proposal, through the sdlc showrunner, 2026-10-30). Shutdown and herdr delete the stop records (`agents/shutdown_record.py`), the stop conductor (`shutdown/settle.py`), the transfer journal (`production/transfer_unit.py`) and the long rename steps (`production/rename.py`, `production/rename_unit.py`). Rows in that code are marked obsolete below and get no fix; Phase 1's check skips exactly those paths until they leave main. The rest of the old hold (`pane_record.py`, `restart.py`, `lib/relaunch.py`, `production/rename_state.py`) is no longer held: a row there is the named phase's work, checked again on main at that phase's Work Order. sdlc-phases Phase 17 changed some of these files before the hold (81e41ae5); Phases 3 and 8 only wait for that code to reach main.
 
 Read on origin/main `c9381f22` (2026-10-30 12:41 EDT); facts marked `256a7214` or `b8afa569` were read at those commits on 2026-10-30. Counts come from an AST and grep scan of `scripts/` without test files, fixtures and `*_test_support.py`.
 
@@ -89,7 +89,7 @@ Q1 stop-and-rerun finishes · Q2 live check, not stored status · Q3 failure kee
   - Each rerun test uses `scripts/lib/rerun_test_support.py` or the module's own existing fixture. No second fault-injection harness.
   - Tests use fixtures; they never read live state (`~/.claude` main, `/tmp/claude`, `~/.cargo/bin`).
   - Python is typed throughout, with no `Any` and no file-level type ignores (user, `~/.claude/CLAUDE.md`).
-  - Owners: natedev owns `verify.sh`, `merge_gate.py` and `build_hold.py` (ask natedev before an edit, memory `devtools-unit-goals`); shutdown-unit owns `scripts/shutdown/`; accounts-unit owns `scripts/accounts/`; models-unit owns `scripts/agents/`. A phase that changes their files agrees the edit with the owner first and names each owner in the checkpoint notice.
+  - Owners: natedev owns `verify.sh`, `merge_gate.py` and `build_hold.py` (ask natedev before an edit, memory `devtools-unit-goals`); shutdown-unit owns `scripts/agents/`; accounts-unit owns `scripts/accounts/`; models-unit owns `scripts/agents/`. A phase that changes their files agrees the edit with the owner first and names each owner in the checkpoint notice.
   - All text uses Simplified Technical English (user, 2026-10-18).
 
 ## Phases

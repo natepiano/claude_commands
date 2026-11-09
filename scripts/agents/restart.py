@@ -29,9 +29,9 @@ from scripts.production import staff, session_staff
 from scripts.accounts import accounts
 from scripts.lib import conf, nix_env, operation_deadline, unit_runs
 from scripts.lib.atomic_file import write_text_atomic
-from scripts.shutdown import member_account, shutdown_record, pane_record
-from scripts.shutdown.stop_results import StopResult, Stopped, NotRunning, StopFailed
-from scripts.shutdown.codex_trust import trust_arguments
+from scripts.agents import member_account, shutdown_record, pane_record
+from scripts.agents.stop_results import StopResult, Stopped, NotRunning, StopFailed
+from scripts.agents.codex_trust import trust_arguments
 from scripts.herdr import pane_launch
 from scripts.whoami.account import named_account_environment
 
@@ -100,7 +100,7 @@ class MemberLifecycle(Protocol):
 
 
 worker_panes = cast(WorkerPanes, cast(object, import_module("scripts.herdr.worker_panes")))
-stop_resume = cast(MemberLifecycle, cast(object, import_module("scripts.shutdown.stop_resume")))
+stop_resume = cast(MemberLifecycle, cast(object, import_module("scripts.agents.stop_resume")))
 
 
 @dataclass(frozen=True)
@@ -265,10 +265,10 @@ def start_row(row: staff.StaffRow, record: staff.StaffSnapshot, client: herdr.He
         if row.kind == "worker":
             return _restore_workers(row, record, observed=observed, target_account=target_account)
         machine, folder = shutdown_record.row_folder(row, record, resolver=resolver)
-        from scripts.shutdown import remote
+        from scripts.agents import remote
         if machine != remote.local_machine():
             raise ValueError(f"{row.name}: session is on {machine}")
-        from scripts.shutdown.launch_names import LaunchNames
+        from scripts.agents.launch_names import LaunchNames
 
         names = LaunchNames(record)
         publication = pane_record.publication_for_session(str(row.current_session), record=record)
@@ -382,7 +382,7 @@ def live_members(rows: Iterable[staff.StaffRow], record: staff.StaffSnapshot, *,
                  codex: herdr.CodexConversations | None = None,
                  account: AllRestartAccounts | accounts.AccountSelection = ALL_RESTART_ACCOUNTS) -> list[staff.StaffRow]:
     """Read only the supplied rows and return their live local conversations."""
-    from scripts.shutdown import remote
+    from scripts.agents import remote
 
     selected: list[staff.StaffRow] = []
     shared_unknown = 0
@@ -773,7 +773,7 @@ def restart(*, stop_all: bool = False, dry_run: bool = False, only: tuple[str, .
 
 def main() -> int:
     """Run detached restart work and save its output."""
-    command = cast(AgentsCommand, cast(object, import_module("scripts.shutdown.shutdown")))
+    command = cast(AgentsCommand, cast(object, import_module("scripts.agents.shutdown")))
 
     parser = argparse.ArgumentParser(add_help=False)
     _ = parser.add_argument("--log", type=Path, required=True)

@@ -21,8 +21,8 @@ from typing import NotRequired, TypedDict, cast
 
 from scripts.herdr import herdr
 from scripts.production import staff, worker
-from scripts.shutdown import pane_record
-from scripts.shutdown.launch_names import LaunchNames
+from scripts.agents import pane_record
+from scripts.agents.launch_names import LaunchNames
 from scripts.lib.agent_program import resolve_program
 from scripts.lib.models_registry import agent_environment
 from scripts.lib.resume_message import NO_WORKERS, resume_message

@@ -42,7 +42,7 @@ from scripts.usage import agents_log
 
 from scripts.lib import names
 from scripts.lib.process_failure import failure_detail
-from scripts.shutdown.remote import local_machine
+from scripts.agents.remote import local_machine
 
 
 class InputError(Exception):

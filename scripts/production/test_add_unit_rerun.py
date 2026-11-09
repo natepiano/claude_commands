@@ -16,7 +16,7 @@ from scripts.production import add_unit
 from scripts.herdr import herdr
 from scripts.production import unit_lookup
 from scripts.message import sessions
-from scripts.shutdown import shutdown
+from scripts.agents import shutdown
 from scripts.production import unit_lookup as script_unit_lookup
 from scripts.lib import atomic_file
 from scripts.production.production_doc import Refusal, read_production

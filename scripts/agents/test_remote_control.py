@@ -13,13 +13,13 @@ from pathlib import Path
 from typing import Literal, TypedDict, cast, final, override
 from unittest.mock import patch
 
-from scripts.shutdown.test_support import ShutdownSendLeaf, ShutdownTestCase
-from scripts.shutdown import remote_control
+from scripts.agents.test_support import ShutdownSendLeaf, ShutdownTestCase
+from scripts.agents import remote_control
 from scripts.herdr import herdr
 from scripts.message import sessions
 from scripts.production import session_pane
 from scripts.whoami import quota_alert
-from scripts.shutdown import remote
+from scripts.agents import remote
 from scripts.lib import detached
 from scripts.notify.push_texts import RenderedPush
 from scripts.herdr.herdr import HerdrPlace, AgentBlocked

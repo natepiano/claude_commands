@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from scripts.shutdown import remote
+from scripts.agents import remote
 
 import io
 import json
@@ -17,7 +17,7 @@ from typing import Literal, cast, final, override
 from unittest import mock
 
 
-from scripts.shutdown import pane_record
+from scripts.agents import pane_record
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.production import staff
 from scripts.production.staff_test_support import fixture_runtime_id, isolated_staff_file
@@ -25,7 +25,7 @@ from scripts.herdr import herdr, pane_launch
 from scripts.herdr.test_herdr import native_process_commands
 from scripts.message import sessions
 from scripts.message import sessions as runtime_sessions
-from scripts.shutdown.test_pane_restore import FakeClient
+from scripts.agents.test_pane_restore import FakeClient
 from scripts.whoami import account  # noqa: E402  Imported before a test sets the platform to the Mac: urllib checks it on import.
 
 HOOK = Path(__file__).resolve().parent.parent / "hooks/session-start-pane-record.py"
@@ -415,7 +415,7 @@ class PaneRecordTests(unittest.TestCase):
         self.assertEqual(entry["environment"]["STAFF_ID"], "parent")
 
     def test_worker_resume_uses_the_typed_parent_for_its_folder(self) -> None:
-        from scripts.shutdown import launch_names, session_types
+        from scripts.agents import launch_names, session_types
 
         location = staff.PresentWorktree(remote.local_machine(), self.root / "unit")
         unit = staff.StaffRow(staff.StaffId("unit"), "unit", "alpha", staff.StaffRoot(),
@@ -511,7 +511,7 @@ class PaneRecordTests(unittest.TestCase):
 
     def assert_repair_recovers_history(self, *, legacy: bool) -> None:
         from scripts.production import staff, session_staff
-        from scripts.shutdown import pane_record
+        from scripts.agents import pane_record
         from scripts.production.staff_test_support import isolated_staff_file, unit_membership
         from scripts.message import sessions
 
@@ -574,7 +574,7 @@ class PaneRecordTests(unittest.TestCase):
 
     def test_unmarked_compaction_keeps_repaired_labels_only_for_the_same_conversation(self) -> None:
         from scripts.production import staff, session_staff
-        from scripts.shutdown import pane_record
+        from scripts.agents import pane_record
         from scripts.production.staff_test_support import isolated_staff_file, unit_membership
         from scripts.message import sessions
 

@@ -25,7 +25,7 @@ from typing import NamedTuple, cast
 
 
 from scripts.production import completion_receipt, staff, staff_sources, unit_config, worker
-from scripts.shutdown import remote, stop_resume
+from scripts.agents import remote, stop_resume
 from scripts.agents import worker_lifecycle
 
 from scripts.lib.atomic_file import write_text_atomic

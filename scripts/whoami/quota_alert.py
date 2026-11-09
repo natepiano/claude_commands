@@ -35,7 +35,7 @@ from scripts.lib import process_group
 
 from scripts.lib.process_failure import failure_detail
 from scripts.message import send_result, send_budget, session_send
-from scripts.shutdown import remote
+from scripts.agents import remote
 from scripts.whoami import note_file
 
 from scripts.lib import conf, models_registry  # noqa: E402

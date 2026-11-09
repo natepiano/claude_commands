@@ -5,9 +5,9 @@ The staff row owns the current unit folder. Other records must use the staff ide
 | Record | File and field | Writer | Readers |
 |---|---|---|---|
 | Staff location | `staff.json`: `rows[].worktree.path` | `production/staff.py:set_worktree` | `session_staff.RowResolver`, `unit_lookup`, all unit location readers |
-| Pane launch | `herdr-panes/*.json`: `cwd` | `herdr/pane_launch.py:launch`, `shutdown/pane_record.py:write` | `pane_restore`, `stop_resume`, `staff_sources`, `unit_watchdog`, `session_staff` |
-| Shutdown session and workers | shutdown records: `session.cwd`, `workers[].cwd`, `checkout.path` | `shutdown/inventory.py:_session_details`, `shutdown_record.py:create_session`, `update_session` | `restart`, `restart_support`, `unit_watchdog`, `rename_unit`, `unit_move` |
-| Paused Codex seats | `codex_seats[].launcher_command` | Kept in `shutdown/inventory.py` and `shutdown_record.py` as task state (task options, review lens) | Resume replaces its first 3 arguments with the run folder, the staff folder and the resume prompt |
+| Pane launch | `herdr-panes/*.json`: `cwd` | `herdr/pane_launch.py:launch`, `agents/pane_record.py:write` | `pane_restore`, `stop_resume`, `staff_sources`, `unit_watchdog`, `session_staff` |
+| Shutdown session and workers | shutdown records: `session.cwd`, `workers[].cwd`, `checkout.path` | `agents/inventory.py:_session_details`, `shutdown_record.py:create_session`, `update_session` | `restart`, `restart_support`, `unit_watchdog`, `rename_unit`, `unit_move` |
+| Paused Codex seats | `codex_seats[].launcher_command` | Kept in `agents/inventory.py` and `shutdown_record.py` as task state (task options, review lens) | Resume replaces its first 3 arguments with the run folder, the staff folder and the resume prompt |
 | Mesh roster | `mesh_roster.json`: legacy `cwd` | `agents/codex_mesh.py`, `astra/design_roles.py`, `direct/workers.py` relocation | `direct/workers.py`, `unit_move`, `rename_unit`, `staff_sources` |
 | Worker ledger | unit worker ledger: legacy worker `cwd` | `direct/workers.py` publication and relocation | `direct/workers.py`, `unit_move`, `rename_unit` |
 | Worker review context | worker review identity: `working_dir` | `direct/workers.py:_reviewer_destination` | worker naming and assignment |
@@ -26,7 +26,7 @@ The staff row owns the current unit folder. Other records must use the staff ide
 | Showrunner promotion journal | promotion journal: `worktree` | `production/promote_showrunner.py` | promotion recovery |
 | Showrunner launch receipt | Legacy `add_showrunner.json`: `cwd` | Removed from `production/add_showrunner.py` | Launch recovery uses the owner and session identities |
 | Checkout move journal, deleted | No new record | Removed from checkout rename and shutdown storage | Restart reads the current session location |
-| Relaunch request | Legacy relaunch JSON: `cwd` | Removed from `shutdown/restart.py` | `lib/relaunch.py` attaches to herdr without a folder change |
+| Relaunch request | Legacy relaunch JSON: `cwd` | Removed from `agents/restart.py` | `lib/relaunch.py` attaches to herdr without a folder change |
 | Native Claude records | Claude session files and transcripts: `cwd`, project directory | Claude and session hooks | `message/sessions.py`, transcript readers; transcripts are found by session id |
 | Claude folder trust | account config: `projects` keys | Claude, `unit_move.copy_trust`, rename commands | Claude folder permission checks |
 | Native Codex records | Codex rollout/thread metadata: `cwd` | Codex server | Codex server and daemon reader; threads are found by thread id |

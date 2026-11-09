@@ -24,15 +24,15 @@ from scripts.lib import unit_runs as owned_runs
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.resume_message import ClaudeChildResume, Resumable, Idle, Unavailable
 from scripts.usage import agents_log
-from scripts.shutdown.test_support import ShutdownTestCase, linux_process_fixture
-from scripts.shutdown import inventory
+from scripts.agents.test_support import ShutdownTestCase, linux_process_fixture
+from scripts.agents import inventory
 from scripts.lib import unit_runs
 from scripts.whoami import account
 from scripts.herdr import herdr
 from scripts.message import sessions
 from scripts.production import showrunners
 from scripts.production import unit_lookup
-from scripts.shutdown import shutdown
+from scripts.agents import shutdown
 from scripts.herdr.fake_herdr import CommandResponse
 from scripts.production.cli_fixture import ImmutableGitSeed, invoke_cli
 from scripts.herdr import fake_herdr
@@ -111,8 +111,8 @@ from pathlib import Path
 root = Path(sys.argv[1])
 with open(root / "scripts/lib/package_root.py") as package_root:
     exec(package_root.read(), {"__file__": package_root.name})
-assert str(root / "scripts/shutdown") not in sys.path
-from scripts.shutdown import inventory
+assert str(root / "scripts/agents") not in sys.path
+from scripts.agents import inventory
 from scripts.production import staff
 from scripts.lib import unit_runs as owned_runs
 parent = staff.StaffRow(staff.StaffId("parent"), "unit", "parent", staff.STAFF_ROOT, current_session=staff.StaffId("parent"))
@@ -487,10 +487,10 @@ class InventoryTests(ShutdownTestCase):
         )
         _process_environment_context = cast(
             object,
-            self.enterContext(patch("scripts.shutdown.inventory._process_environment", return_value={})),
+            self.enterContext(patch("scripts.agents.inventory._process_environment", return_value={})),
         )
         _process_start_context: object = self.enterContext(
-            patch("scripts.shutdown.inventory._process_start", return_value=CURRENT_PROCESS_START)
+            patch("scripts.agents.inventory._process_start", return_value=CURRENT_PROCESS_START)
         )
 
         self.director_pid = os.getpid()
@@ -978,7 +978,7 @@ elif "comm=" in joined:
     def test_user_tmux_is_unknown_despite_inherited_herdr_environment(self) -> None:
         self.herdr_process(71_001, 1, ["/fixture/herdr", "--session", "outer", "server"], {})
         self.herdr_process(DESKTOP_PID, 71_001, ["/bin/claude"], {"HERDR_PANE_ID": "w1:p1"})
-        with patch("scripts.shutdown.inventory._process_environment", return_value={"TMUX_PANE": "%9", "HERDR_PANE_ID": "w1:p1"}):
+        with patch("scripts.agents.inventory._process_environment", return_value={"TMUX_PANE": "%9", "HERDR_PANE_ID": "w1:p1"}):
             found = inventory.inventory(TARGET_LOGIN)
         desktop = next(session for session in found["sessions"] if session["session_id"] == DESKTOP_ID)
         self.assertEqual(desktop["host"], {"kind": "unknown"})
@@ -1058,7 +1058,7 @@ elif "comm=" in joined:
         record["procStart"] = "recorded-before-pid-reuse"
         _ = path.write_text(json.dumps(record), encoding="utf-8")
 
-        with patch("scripts.shutdown.inventory._process_start", return_value="live-reused-pid-start"):
+        with patch("scripts.agents.inventory._process_start", return_value="live-reused-pid-start"):
             found = inventory.inventory(TARGET_LOGIN)
 
         self.assertNotIn(DESKTOP_ID, {session["session_id"] for session in found["sessions"]})

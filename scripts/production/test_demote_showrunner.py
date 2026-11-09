@@ -19,7 +19,7 @@ from scripts.lib.atomic_file import write_text_atomic
 from scripts.production import add_unit, demote_showrunner as demote, promote_showrunner, session_staff, showrunners, staff, transfer_unit, unit_config, unit_effort, unit_lookup, update_registration
 from scripts.production.production_doc import read_production
 from scripts.production.staff_test_support import StaffTestCase, fixture_member
-from scripts.shutdown import pane_record, remote, stop_resume
+from scripts.agents import pane_record, remote, stop_resume
 
 
 class DemoteShowrunnerTests(StaffTestCase):

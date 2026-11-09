@@ -50,8 +50,8 @@ from scripts.production.staff_test_support import (
     CHECKOUT,
     unit_membership,
 )
-from scripts.shutdown import shutdown, remote, stop_resume, restart, pane_record as staff_pane_record, pane_record
-from scripts.shutdown.stop_results import StopResult
+from scripts.agents import shutdown, remote, stop_resume, restart, pane_record as staff_pane_record, pane_record
+from scripts.agents.stop_results import StopResult
 
 from scripts.production import rename_test_support as support
 from scripts.production.rename_test_support import (
@@ -63,7 +63,7 @@ from scripts.production.rename_unit_test_support import FolderRenameFixture, Fol
 
 class AgentsUsageTests(unittest.TestCase):
     def test_status_excludes_a_retired_unit_whose_process_still_runs(self) -> None:
-        from scripts.shutdown.test_inventory import InventoryTests, TARGET_LOGIN, UNIT_ID, DESKTOP_ID
+        from scripts.agents.test_inventory import InventoryTests, TARGET_LOGIN, UNIT_ID, DESKTOP_ID
         from scripts.whoami.account import Account
 
         fixture = InventoryTests()
@@ -1347,7 +1347,7 @@ class ResumeUnitTests(unittest.TestCase):
             "def launch(arguments):",
             "    name = arguments[arguments.index('--production') + 1]",
             "    row = add_unit.ensure_staff_unit(read_production(name), arguments[2])",
-            "    from scripts.shutdown import pane_record",
+            "    from scripts.agents import pane_record",
             f"    pane_record.write('agents', pane_record.launch('w1:p1', {DIRECTOR!r}, {str(self.worktree)!r}, {{}}, ['claude']))",
             "    print(row.id)", "    return 0",
             "with patch.object(add_unit, '_main', side_effect=launch):",
@@ -2668,7 +2668,7 @@ class FolderRenameTests(FolderRenameFixture):
 
     def test_same_name_with_unit_suffix_changes_nothing(self) -> None:
         from scripts.production import unit_move
-        from scripts.shutdown import shutdown
+        from scripts.agents import shutdown
 
         displays = RenameDisplays(self.owner)
         displays.pane = displays.tab = self.owner.name
@@ -2744,7 +2744,7 @@ class FolderRenameTests(FolderRenameFixture):
 
     def test_same_name_writes_nothing_and_moves_nothing(self) -> None:
         from scripts.production import unit_move
-        from scripts.shutdown import shutdown
+        from scripts.agents import shutdown
 
         before = file_versions(self.root)
         with (mock.patch.object(shutdown, "rename_repair_displays", return_value=False),
@@ -2758,7 +2758,7 @@ class FolderRenameTests(FolderRenameFixture):
 
     def test_new_name_preserves_the_folder_parent_and_branch_prefix(self) -> None:
         from dataclasses import replace
-        from scripts.shutdown import shutdown
+        from scripts.agents import shutdown
 
         with (FolderSessionFixture(self.owner, live=False).installed(),
               mock.patch.object(shutdown, "rename_repair_displays", return_value=False)):
@@ -2774,7 +2774,7 @@ class FolderRenameTests(FolderRenameFixture):
 
     def test_unmatched_folder_stays_and_reports_one_anomaly_while_branch_moves(self) -> None:
         from dataclasses import replace
-        from scripts.shutdown import shutdown
+        from scripts.agents import shutdown
 
         original = self.source
         self.source = original.with_name("unmatched")

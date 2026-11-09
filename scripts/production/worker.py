@@ -663,7 +663,7 @@ def own_pass(row: staff.StaffRow, record: staff.StaffSnapshot) -> BusyPass | Uns
 
 def resume_workers(parent: StaffId, record: staff.StaffSnapshot) -> ResumeWorkers:
     """Supply Claude child launchers and pane dispatch ids to the shared builder."""
-    from scripts.shutdown.inventory import worker_resumes
+    from scripts.agents.inventory import worker_resumes
 
     holder = record.by_id(parent)
     if holder is None:

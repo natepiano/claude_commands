@@ -10,7 +10,7 @@ from typing import cast, final, override
 from unittest.mock import patch
 
 from scripts.herdr import pane_launch
-from scripts.shutdown import pane_record
+from scripts.agents import pane_record
 
 @final
 class RecordedMarksTests(unittest.TestCase):

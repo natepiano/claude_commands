@@ -21,7 +21,7 @@ from scripts.herdr import herdr, pane_launch
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.production import add_unit, production_lifecycle, promote_showrunner, session_staff, showrunners, staff, transfer_unit, unit_config, unit_lookup, update_registration
 from scripts.production.production_doc import Production, Refusal, read_production
-from scripts.shutdown import pane_record, remote, stop_resume
+from scripts.agents import pane_record, remote, stop_resume
 from scripts.whoami.account import named_account_environment
 
 

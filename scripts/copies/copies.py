@@ -397,7 +397,7 @@ def source_owner(source: Path) -> str:
         if isinstance(owner, str):
             return checked_owner(owner)
     from scripts.production import staff
-    from scripts.shutdown.remote import local_machine
+    from scripts.agents.remote import local_machine
     try:
         member = staff.local_snapshot().by_worktree(local_machine(), source.resolve())
         if member is not None:

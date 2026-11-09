@@ -14,8 +14,8 @@ from unittest.mock import patch
 
 from scripts.production import staff
 from scripts.production.staff_test_support import fixture_member, fixture_runtime_id
-from scripts.shutdown import shutdown_record
-from scripts.shutdown.test_support import ShutdownTestCase
+from scripts.agents import shutdown_record
+from scripts.agents.test_support import ShutdownTestCase
 
 
 class ShutdownRecordTests(ShutdownTestCase):

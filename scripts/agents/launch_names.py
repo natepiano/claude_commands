@@ -7,7 +7,7 @@ from functools import cached_property
 from typing import TYPE_CHECKING
 
 
-from scripts.shutdown import pane_record  # noqa: E402
+from scripts.agents import pane_record  # noqa: E402
 from scripts.herdr import pane_launch  # noqa: E402
 from scripts.herdr.pane_launch import PaneLaunch  # noqa: E402
 

@@ -21,7 +21,7 @@ from typing import Literal, TypedDict, cast
 
 from scripts.direct.assign_gate import WORKER_LAUNCHERS
 from scripts.whoami import account
-from scripts.shutdown import remote
+from scripts.agents import remote
 from scripts.lib.probe_session import PROBE_ENV
 from scripts.lib import unit_runs
 from scripts.herdr import herdr
@@ -35,7 +35,7 @@ from scripts.production import unit_lookup
 from scripts.whoami.account import Account, label_for
 
 
-from scripts.shutdown.session_types import (
+from scripts.agents.session_types import (
     InvalidInventory as InvalidInventory,
     parse_session as parse_session,
     wire_object as _wire_object,

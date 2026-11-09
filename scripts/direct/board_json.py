@@ -29,7 +29,7 @@ from scripts.production import display_cells
 from scripts.direct import phase_table, plan_history, worker_runs
 from scripts.lib import unit_runs
 from scripts.production import session_staff, showrunners, staff, unit_run, unit_config
-from scripts.shutdown import remote
+from scripts.agents import remote
 
 
 def text(value: object) -> str:

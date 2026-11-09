@@ -19,7 +19,8 @@ The public commands are `help`, `status`, `pause`, `exit`, `resume`, `restart`, 
 `agents status [ACCOUNT] [--json] [--here]` reports live sessions.
 `agents stop SESSION` stops the selected session and its workers.
 Add `--dry-run` to print their names without stopping them.
-`agents` runs `scripts/shutdown/shutdown.py`; script callers keep that path.
+`agents` runs `scripts/agents/shutdown.py`.
+All lifecycle scripts use `scripts/agents/`.
 
 `agents pause NAME --why TEXT` stops the workers now.
 The director finishes its current turn and holds at the prompt.
@@ -40,7 +41,7 @@ It executes that path directly. A missing executable retains the exit record.
 The stop hook skips the automatic continuation for that director.
 Stop does not save or restore composer drafts.
 
-Stop, resume and account move use `scripts/shutdown/stop_resume.py`.
+Stop, resume and account move use `scripts/agents/stop_resume.py`.
 
 `stop(session)` ends only the selected local session's process.
 It reads the session identity, pid, and start time before TERM.
@@ -67,12 +68,12 @@ Unknown process evidence or an unproved stop gives `SourceReleaseUnknown`.
 A family switch preserves its source when release remains unproved.
 
 `agents resume NAME [--why TEXT] [--to ACCOUNT]` works from any directory.
-The short form is `resume NAME`, through `scripts/shutdown/resume`.
+The short form is `resume NAME`, through `scripts/agents/resume`.
 The wrapper uses the shared Python launcher and locates `shutdown.py` beside the wrapper.
 
 The lookup accepts a short name, a staff id, or a current session id.
 An exact Codex thread name resolves through the shared `session_index.jsonl`.
-A raw session id takes priority over a thread name.
+A canonical UUID takes priority over a thread name and reads no index.
 Unknown names return status 1.
 They list up to five close names from local units and showrunners when available.
 Ambiguous names return status 1 with up to five matching members.
@@ -82,10 +83,13 @@ Resume does not stop or move a running session.
 Unknown Codex process evidence prints an anomaly and does not block resume.
 A pane with the session id and a foreground program counts as already running.
 Without process evidence, its account remains unknown.
+Unknown process evidence without a pane that reports the id can allow a second process on the same conversation.
 A pane at its shell does not prevent resume.
 The default reason is `resumed by name`.
 
 The shared resume path reads the saved environment, arguments, and folder.
+`member_account.resume_account` selects the account for both families at invocation.
+The source account does not select the target account.
 A named Codex resume uses the configured `workers` account, with or without a staff row.
 Claude units and showrunners use their configured role account, even without a pane launch record.
 Other Claude sessions, and sessions with no staff row, use the configured units account.
@@ -93,6 +97,7 @@ When the account does not change, the resume message names no move.
 `--to ACCOUNT` overrides the account for either family.
 Restart without ACCOUNT and folder moves use the role account.
 A herdr server restore keeps the saved account for both families.
+It passes the saved home to `restart.start_row` as an `AccountSelection`.
 It restores a closed tab when a saved launch exists.
 An explicit CLI resume can restore an intentionally stopped session.
 Automatic recovery preserves an intentional stop.
@@ -102,6 +107,10 @@ The command changes to the saved folder before the account launch.
 The pane receives one opening message after identity confirmation.
 
 Resume from its own empty pane executes the saved launch in that pane.
+`stop_resume._resume_once` and `restart.start_row` use `herdr.row_workspace` for new tabs.
+The workspace comes from the row's parent showrunner, the entry name, or the shared session.
+A role account change does not update an existing pane shell's `resume` alias.
+An alias with an old `CLAUDE_CONFIG_DIR` remains until a herdr restart or reboot.
 
 `resume_message.py` builds every opening message.
 The restore paths use these causes:
@@ -152,6 +161,9 @@ Watchdog recovery uses the retained pane launch and staff row.
 An ended pane launch keeps an intentionally stopped session down.
 A unit with no pane launch record stays down.
 The watchdog does not read shutdown session records.
+Unit recovery writes its completion receipt and discards the parked facts before it restores workers.
+It returns the worker restore exit code.
+A completed recovery rerun restores the workers again.
 
 ## Worker resume results
 

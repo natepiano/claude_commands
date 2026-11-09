@@ -16,10 +16,10 @@ from scripts.production import add_unit
 from scripts.production import staff, unit_config
 from scripts.production import unit_lookup
 from scripts.message import sessions
-from scripts.shutdown import stop_resume
+from scripts.agents import stop_resume
 from scripts.herdr import herdr
 from scripts.herdr.herdr import HerdrPlace
-from scripts.shutdown.test_support import ShutdownTestCase
+from scripts.agents.test_support import ShutdownTestCase
 
 
 from scripts.production.add_unit_test_support import AddUnitTestCase, configure_test_zone, SCRIPT

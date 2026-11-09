@@ -582,7 +582,7 @@ Do we have a unit director that is dedicated to, I guess it's showrunners and pr
 
 #### As-built
 
-- `worker_panes.observe_parents(parents, record) -> dict[StaffId, list[WorkerPane]]` makes one pane read for many parents and no read for no parents. `PaneRead`, `PaneReadUnavailable`, `_read_panes` and `_parent_evidence` hold that read. `agent_inventory(client)` reads agent status for worker and freestanding displays. `_stop_row` imports `scripts.shutdown.restart` at use, which removes a type-graph import cycle.
+- `worker_panes.observe_parents(parents, record) -> dict[StaffId, list[WorkerPane]]` makes one pane read for many parents and no read for no parents. `PaneRead`, `PaneReadUnavailable`, `_read_panes` and `_parent_evidence` hold that read. `agent_inventory(client)` reads agent status for worker and freestanding displays. `_stop_row` imports `scripts.agents.restart` at use, which removes a type-graph import cycle.
 - `session_staff.pane_parents(record)` selects the parents whose held run reads herdr. `unit_runs.parent_transport(session_id, *, scanned, record)` decides this from the first held run's pin, else configuration, and writes nothing.
 - `unit_runs.run_pin(run) -> Literal["mesh", "herdr"] | NoRunPin` is the one reader of a run's pin. An invalid pin raises `ValueError`. `RunStaffAtUse.LOCAL` names a staff read at the point of use.
 - `held_by_session` includes a folder with `progress_history_state.json` or `mesh_roster.json`, because `worker_admission.parent` resolves a run through either file.

@@ -19,10 +19,10 @@ from typing import NamedTuple, cast
 
 
 from scripts.production import session_staff, staff, unit_config
-from scripts.shutdown import stop_resume
+from scripts.agents import stop_resume
 from scripts.lib import main_publish
 from scripts.herdr import worker_panes
-from scripts.shutdown.remote import local_machine
+from scripts.agents.remote import local_machine
 from scripts.lib.git_exclude import ExcludeRefused, ensure_excluded, require_untracked_ignored
 
 from scripts.production.store_owner import showrunner_id

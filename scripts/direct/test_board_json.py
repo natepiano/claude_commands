@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from scripts.shutdown import remote
+from scripts.agents import remote
 
 from scripts.production.staff_test_support import fixture_member, fixture_runtime_id, recorded_unit
 
@@ -38,7 +38,7 @@ import io
 from scripts.herdr import worker_panes
 from scripts.herdr.test_worker_panes import PaneWorld
 from scripts.herdr import herdr
-from scripts.shutdown import pane_record
+from scripts.agents import pane_record
 from scripts.production import display_cells
 
 

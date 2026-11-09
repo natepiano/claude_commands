@@ -3,7 +3,7 @@
 herdr restores the layout without starting agents. A restore opens a tab on the retained account.
 It keeps running sessions and occupied panes. It resumes intentionally stopped sessions when requested.
 
-Run: ~/.claude/scripts/lib/py ~/.claude/scripts/shutdown/pane_restore.py [--session NAME] [--dry-run]
+Run: ~/.claude/scripts/lib/py ~/.claude/scripts/agents/pane_restore.py [--session NAME] [--dry-run]
 """
 
 from __future__ import annotations
@@ -17,15 +17,15 @@ import sys
 from typing import cast
 
 from scripts.herdr import herdr, pane_launch
-from scripts.shutdown import pane_record
+from scripts.agents import pane_record
 from scripts.lib import conf
-from scripts.shutdown.codex_trust import trust_arguments
+from scripts.agents.codex_trust import trust_arguments
 from scripts.whoami import agent_accounts
 from scripts.whoami.account import named_account_environment
-from scripts.shutdown.launch_names import LaunchNames
+from scripts.agents.launch_names import LaunchNames
 from scripts.production import staff  # noqa: E402
 from scripts.accounts import accounts
-from scripts.shutdown import restart
+from scripts.agents import restart
 
 SERVER_TIMEOUT_MS = 60_000
 
@@ -37,7 +37,7 @@ def _resume_saved(session: str, client: herdr.Herdr, pane: herdr.TabSession,
     kind = pane_launch.agent_kind(entry)
     home = pane_launch.config_home(entry)
     if isinstance(home, staff.HomeUnknown):
-        from scripts.shutdown import member_account
+        from scripts.agents import member_account
 
         print(f"anomaly: {entry['session_id']}: session home is unknown; select the normal account", file=sys.stderr)
         selected = member_account.resume_account(kind)

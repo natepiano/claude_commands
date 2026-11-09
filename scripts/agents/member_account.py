@@ -4,7 +4,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Literal
 
 from scripts.accounts import accounts
-from scripts.shutdown.stop_results import SessionWithoutStaffRow, SESSION_WITHOUT_STAFF_ROW
+from scripts.agents.stop_results import SessionWithoutStaffRow, SESSION_WITHOUT_STAFF_ROW
 from scripts.whoami import agent_accounts
 
 if TYPE_CHECKING:

@@ -14,10 +14,10 @@ from typing import cast, override
 from unittest.mock import Mock, patch
 
 from scripts.herdr import herdr
-from scripts.shutdown import restart
+from scripts.agents import restart
 from scripts.lib import atomic_file, conf, operation_deadline
 from scripts.production import staff
-from scripts.shutdown import stop_resume
+from scripts.agents import stop_resume
 
 
 class DeadlineTests(unittest.TestCase):

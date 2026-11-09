@@ -17,9 +17,9 @@ from scripts.production import live_units, staff, unit_lookup, worker
 from scripts.lib.resume_message import BusyPass, NoOwnPass
 from scripts.production.cli_fixture import invoke_cli
 from scripts.production.staff_test_support import CHECKOUT, StaffTestCase, fixture_member
-from scripts.shutdown import pane_record, restart_support, shutdown, stop_resume, remote
-from scripts.shutdown.stop_resume import stop as stop_session
-from scripts.shutdown.stop_results import StopResult
+from scripts.agents import pane_record, restart_support, shutdown, stop_resume, remote
+from scripts.agents.stop_resume import stop as stop_session
+from scripts.agents.stop_results import StopResult
 
 
 @final

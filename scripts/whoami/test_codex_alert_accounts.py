@@ -28,7 +28,7 @@ from scripts.accounts.home_test_support import scratch_accounts_config
 from scripts.lib import models_registry
 from scripts.production import showrunners, staff
 from scripts.production.staff_test_support import fixture_member, fixture_worker
-from scripts.shutdown import stop_resume
+from scripts.agents import stop_resume
 from scripts.whoami import usage_store
 from scripts.notify.push_texts import RenderedPush, catalog, render_entry
 from scripts.notify.user_action import ActionRequired

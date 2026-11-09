@@ -24,7 +24,7 @@ from typing import NamedTuple, cast
 from scripts.production import live_units
 from scripts.production import session_staff, showrunners, staff, staff_sources, unit_lookup
 from scripts.production.production_doc import Refusal, production_field, read_production
-from scripts.shutdown import remote
+from scripts.agents import remote
 from scripts.lib import conf
 from scripts.message import session_send
 from scripts.lib.process_failure import failure_detail
