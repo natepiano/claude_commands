@@ -125,7 +125,7 @@ The list uses `worker_panes.observe` for open, stopped, closed, unknown, and inc
 An unknown pane outside this parent's tabs does not make its absent workers uncertain.
 An unknown pane in a parent's tab, or an unreadable parent pane, can leave absence unproved.
 Use `worker.py end <name>` only for permanent removal.
-The worker command selects idle workers and resumes stopped workers in new panes.
+The worker command selects idle workers and resumes a stopped worker in its same pane.
 Use the short name from `worker.py list` with `--to` when selecting a retained pane worker.
 Keep every busy or unknown worker unchanged.
 Successful prompt delivery returns the launcher.
@@ -155,9 +155,9 @@ The completion hook closes a worker pane after DONE. Shutdown retains the worker
 Restore resumes only conversations with active dispatches through `worker.py restore`. Idle workers stay closed until their next assign.
 Restore reads the role and active pass from the recorder, then reuses the saved launcher command.
 It reads the transcript before input and never submits the same dispatch twice.
-Account moves resume only workers with active dispatches; each move closes an idle worker's pane.
+An account move resumes an open or stopped worker on the new account in its same pane and closes no pane.
 An idle worker's next assign opens its conversation on the current role account.
-Assign, restore, and account moves resume a stopped worker in a new pane.
+A closed worker with no active dispatch has nothing to move. A worker that changes family opens a new pane.
 An unknown worker supplies no stopped proof. Inspect its named pane.
 Unrelated proved moves can continue.
 A completed restore or move rerun prints one `unchanged` line and exits 0 without a restart notice.

@@ -2158,3 +2158,25 @@ A changed `config/<name>.conf` selects every test module whose transitive import
 
 **Gotchas:**
 - Cases in one driver share `sys.modules`. `hook_dispatch._execute` loads each hook as a fresh module, so hook globals do not carry; keep HOME, PATH and cwd the same for all cases of one driver.
+
+### Phase 109 — The sender guard folder goes when its test module ends  · status: done
+
+#### As-built
+
+- `forbid_real_sender()` makes the `sender-guard-` folder with `unittest.enterModuleContext(tempfile.TemporaryDirectory(prefix="sender-guard-"))`, so the folder goes when its module ends. No `atexit` registration and no signal handler exist.
+- A module cleanup records the result in the in-memory `real_sender_started` value, restores `TEST_SENDER_GUARD` to its value before the install and resets `refusal_marker`. A later module in the same process makes its own folder. The record is never a file.
+- `real_sender_was_started()` returns `real_sender_started` or the existence of the installed marker file. `module_run.py` calls it, and a module that started the real sender exits 1 with `<pattern>: started the real scripts/message/send.py`.
+- A `TEST_SENDER_GUARD` value from a parent process makes no folder, and the module cleanup keeps that value.
+
+**Files:**
+- `scripts/message/session_send_test_support.py` — guard install, module cleanup, outcome record
+- `scripts/test_times/module_run.py` — reads the outcome through `real_sender_was_started()`
+- `scripts/test_times/test_module_run.py` — `setup_exit` row; cleanup and no-folder assertions in the runner fixtures
+- `scripts/message/test_session_send.py` — `GUARD_PROBE` asserts the marker reset and the kept inherited value
+
+**Gotchas:**
+- Module cleanups run in reverse order. The record step registers after the folder context, so it runs before the folder goes.
+- A `SystemExit` in `setUpModule` ends the module before its cleanups run. The marker file still exists at that time, so `real_sender_was_started()` reads both sources.
+
+**Ruled out:**
+- A guard for a test that runs a second in-process `unittest` runner: no test does this, and module cleanups are process-wide in `unittest`.

@@ -119,6 +119,10 @@ class SenderRequest(unittest.TestCase):
         self.assertEqual(result.stderr, "REFUSED: real scripts/message/send.py is forbidden in tests\n")
 
 result = unittest.TextTestRunner().run(unittest.defaultTestLoader.loadTestsFromTestCase(SenderRequest))
+assert isinstance(session_send_test_support.refusal_marker, session_send_test_support.SenderGuardNotInstalled)
+assert os.environ["TEST_SENDER_GUARD"] == str(marker)
+if mode != "fake":
+    assert marker.read_text() == "real sender refused\n"
 raise SystemExit(not result.wasSuccessful())
 '''
 

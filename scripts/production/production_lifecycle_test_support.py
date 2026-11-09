@@ -112,12 +112,12 @@ class LifecycleFixture(unittest.TestCase):
         socket_for = showrunners.socket_for
         labeled_sessions = unit_lookup.labeled_sessions
         self.staff = StaffTestCase()
-        self.staff.setUp()
         self.addCleanup(self.staff.doCleanups)
+        self.staff.setUp()
         _ = self.enterContext(mock.patch.object(showrunners, "socket_for", socket_for))
         _ = self.enterContext(mock.patch.object(unit_lookup, "labeled_sessions", labeled_sessions))
-        _ = shutil.copytree(self.fixture_snapshot, self.fixture_root)
         self.addCleanup(self.remove_fixture)
+        _ = shutil.copytree(self.fixture_snapshot, self.fixture_root)
         self.root = self.fixture_root
         self.bind_fixture()
         self.env = self.fixture_env.copy()
@@ -133,9 +133,8 @@ class LifecycleFixture(unittest.TestCase):
 
     def remove_fixture(self) -> None:
         """Release the next fixture path before removal can fail."""
-        finished = Path(tempfile.mkdtemp(prefix="finished-", dir=self.fixture_root.parent))
-        _ = self.fixture_root.rename(finished)
-        shutil.rmtree(finished)
+        with tempfile.TemporaryDirectory(prefix="finished-", dir=self.fixture_root.parent) as finished:
+            _ = self.fixture_root.rename(finished)
 
     def bind_fixture(self) -> None:
         self.origin = self.root / "origin.git"

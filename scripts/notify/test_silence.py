@@ -49,14 +49,14 @@ class SilenceTests(unittest.TestCase):
         self.assertIn("until off", self.main("on"))
         self.assertEqual(self.commands, [])
         self.assertIn("silence on from", self.main("status"))
-        self.assertEqual(silence.keep(PUSH, "Linux"), silence.Kept("until off"))
+        self.assertEqual(silence.keep_here(PUSH), silence.Kept("until off"))
         self.assertIn("1 push kept", self.main("status"))
 
     def test_off_clears_silence_and_posts_the_kept_pushes_oldest_first(self) -> None:
         _ = self.main("on")
         second: silence.KeptPush = {**PUSH, "title": "Tests done"}
         for push in (PUSH, second):
-            _ = silence.keep(push, "Linux")
+            _ = silence.keep_here(push)
         posted: list[str] = []
 
         def deliver(push: silence.KeptPush) -> int:
@@ -67,7 +67,7 @@ class SilenceTests(unittest.TestCase):
             self.assertEqual(silence.off(self.runner, deliver), 0)
         self.assertEqual(output.getvalue(), "silence off; 2 kept pushes delivered\n")
         self.assertEqual(posted, ["Build done", "Tests done"])
-        self.assertEqual(silence.keep(PUSH, "Linux"), silence.NotSilent())
+        self.assertEqual(silence.keep_here(PUSH), silence.NotSilent())
         self.assertEqual(self.main("status"), "silence off\n")
 
     def test_nightly_result_without_herdr_keeps_only_the_newest_result_until_silence_ends(self) -> None:
@@ -132,7 +132,7 @@ raise SystemExit(pushover.send(sys.argv[1:], keys, post))
 
     def test_a_failed_post_is_counted(self) -> None:
         _ = self.main("on")
-        _ = silence.keep(PUSH, "Linux")
+        _ = silence.keep_here(PUSH)
         with redirect_stdout(io.StringIO()) as output:
             self.assertEqual(silence.off(self.runner, lambda _push: 1), 1)
         self.assertIn("0 kept pushes delivered; 1 failed", output.getvalue())
@@ -142,7 +142,7 @@ raise SystemExit(pushover.send(sys.argv[1:], keys, post))
                                          "timer": None, "auto": True}
         with silence.locked():
             silence.write_state(record)
-        _ = silence.keep(PUSH, "Linux")
+        _ = silence.keep_here(PUSH)
         posted: list[silence.KeptPush] = []
 
         def deliver(push: silence.KeptPush) -> int:
@@ -166,7 +166,7 @@ raise SystemExit(pushover.send(sys.argv[1:], keys, post))
                                          "timer": None, "auto": True}
         with silence.locked():
             silence.write_state(record)
-        _ = silence.keep(PUSH, "Linux")
+        _ = silence.keep_here(PUSH)
         state, kept = silence.state_file().read_bytes(), silence.kept_file().read_bytes()
         with (mock.patch.object(auto_silence, "append_event", side_effect=OSError("disk full")),
               mock.patch.object(silence, "post_kept") as deliver,
@@ -194,7 +194,7 @@ raise SystemExit(pushover.send(sys.argv[1:], keys, post))
                 _ = self.main("on")
                 second: silence.KeptPush = {**PUSH, "title": "Tests done"}
                 for push in (PUSH, second):
-                    _ = silence.keep(push, "Linux")
+                    _ = silence.keep_here(push)
                 posted: list[str] = []
 
                 def fail_second(push: silence.KeptPush) -> int:
@@ -228,7 +228,7 @@ raise SystemExit(pushover.send(sys.argv[1:], keys, post))
                 record = silence.read_state()
                 assert record is not None and record["timer"] is not None
                 command = ["off", "--timer", record["timer"]]
-                _ = silence.keep(PUSH, "Linux")
+                _ = silence.keep_here(PUSH)
                 posted: list[silence.KeptPush] = []
 
                 def fail_delivery(push: silence.KeptPush) -> int:
@@ -263,7 +263,7 @@ raise SystemExit(pushover.send(sys.argv[1:], keys, post))
     def test_a_kept_push_replaces_the_older_one_with_its_source_and_key(self) -> None:
         _ = self.main("on")
         for title in ("Old note", "Other", "New note"):
-            _ = silence.keep({**PUSH, "title": title, "key": "other" if title == "Other" else "subject"}, "Linux")
+            _ = silence.keep_here({**PUSH, "title": title, "key": "other" if title == "Other" else "subject"})
         self.assertEqual(self.kept_titles(), ["Other", "New note"])
 
     def test_an_empty_key_or_another_source_never_replaces(self) -> None:
@@ -272,7 +272,7 @@ raise SystemExit(pushover.send(sys.argv[1:], keys, post))
                                           {**PUSH, "title": "Build", "key": "subject"},
                                           {**PUSH, "title": "Tests", "source": "tests", "key": "subject"}]
         for push in pushes:
-            _ = silence.keep(push, "Linux")
+            _ = silence.keep_here(push)
         self.assertEqual(self.kept_titles(), ["First", "Second", "Build", "Tests"])
 
     def test_drop_removes_the_kept_pushes_with_its_source_and_key_and_says_how_many(self) -> None:
@@ -282,7 +282,7 @@ raise SystemExit(pushover.send(sys.argv[1:], keys, post))
                                           {**PUSH, "title": "No key"}, {**PUSH, "title": "Other key", "source": "stall-watch",
                                                                         "key": "prompt-2"}]
         for push in pushes:
-            _ = silence.keep(push, "Linux")
+            _ = silence.keep_here(push)
         self.assertEqual(silence.drop("stall-watch", "prompt", "Linux"), 1)
         self.assertEqual(self.kept_titles(), ["Other source", "No key", "Other key"])
         # An empty key drops nothing, as an empty key never replaces; a second drop finds nothing.
@@ -299,7 +299,7 @@ raise SystemExit(pushover.send(sys.argv[1:], keys, post))
 
     def test_a_kept_push_keeps_its_text_id(self) -> None:
         _ = self.main("on")
-        _ = silence.keep({**PUSH, "text_id": "nixos.ups_battery"}, "Linux")
+        _ = silence.keep_here({**PUSH, "text_id": "nixos.ups_battery"})
         self.assertEqual([push["text_id"] for push in silence.read_kept()], ["nixos.ups_battery"])
 
     def test_until_makes_a_timer_that_runs_off_and_a_new_end_stops_the_old_timer(self) -> None:
@@ -350,7 +350,7 @@ raise SystemExit(pushover.send(sys.argv[1:], keys, post))
     def test_an_interrupted_extension_leaves_a_timer_that_cannot_end_the_replacement_silence(self) -> None:
         _ = self.main("on", "--for", "45min")
         old = silence.read_state()
-        _ = silence.keep(PUSH, "Linux")
+        _ = silence.keep_here(PUSH)
         with mock.patch.object(silence, "stop_timer", side_effect=RuntimeError("stopped at old timer stop")):
             with self.assertRaisesRegex(RuntimeError, "stopped at old timer stop"):
                 _ = self.main("on", "--for", "90min")
@@ -456,25 +456,6 @@ class MacTests(unittest.TestCase):
         self.assertEqual(seen[0][-2], "natedev")
         self.assertEqual(seen[0][-1], silence.REMOTE + " on --until '2026-10-21 07:00'")
 
-    def test_a_push_asks_natedev_and_sends_when_natedev_cannot_answer(self) -> None:
-        asked: list[tuple[list[str], str]] = []
-
-        def asker(answer: tuple[int, str]) -> silence.Ask:
-            def ask(argv: Sequence[str], text: str) -> tuple[int, str]:
-                asked.append((list(argv), text))
-                return answer
-            return ask
-
-        self.assertEqual(silence.keep(PUSH, "Darwin", asker((0, "until 07:00 EDT\n"))), silence.Kept("until 07:00 EDT"))
-        self.assertEqual(asked[0][0][-1], silence.REMOTE + " keep")
-        self.assertIn('"title": "Build done"', asked[0][1])
-        _ = silence.keep({**PUSH, "key": "subject"}, "Darwin", asker((0, "until off\n")))
-        self.assertIn('"key": "subject"', asked[1][1])
-        self.assertEqual(silence.keep(PUSH, "Darwin", asker((1, ""))), silence.NotSilent())
-        with redirect_stderr(io.StringIO()) as errors:
-            self.assertEqual(silence.keep(PUSH, "Darwin", asker((255, ""))), silence.NotSilent())
-        self.assertIn("natedev could not be asked", errors.getvalue())
-
     def test_a_drop_asks_natedev_and_drops_nothing_when_natedev_cannot_answer(self) -> None:
         asked: list[tuple[list[str], str]] = []
 
@@ -490,22 +471,6 @@ class MacTests(unittest.TestCase):
             with self.subTest(answer=answer), redirect_stderr(io.StringIO()) as errors:
                 self.assertEqual(silence.drop("stall-watch", "k", "Darwin", asker(answer)), 0)
             self.assertIn("natedev could not be asked to drop k", errors.getvalue())
-
-    def test_natedev_keep_reads_the_push_on_stdin(self) -> None:
-        with (tempfile.TemporaryDirectory() as folder, mock.patch.object(silence, "state_dir", return_value=Path(folder)),
-              mock.patch("sys.stdin", io.StringIO(json.dumps(PUSH)))):
-            self.assertEqual(silence.main(["keep"], lambda _argv: 0, "Linux"), 1)
-            _ = (Path(folder) / "silence.json").write_text('{"since": "2026-10-20T22:00:00-04:00", "until": null, "timer": null}')
-            with mock.patch("sys.stdin", io.StringIO('{"source": "b", "priority": "0", "title": "t", "message": "m", "detail": ""}')), \
-                    redirect_stdout(io.StringIO()) as output:
-                self.assertEqual(silence.main(["keep"], lambda _argv: 0, "Linux"), 0)
-            self.assertEqual(output.getvalue(), "until off\n")
-            self.assertEqual(len(silence.read_kept()), 1)
-            for title in ("old", "new"):
-                with (mock.patch("sys.stdin", io.StringIO(json.dumps({**PUSH, "title": title, "key": "subject"}))),
-                      redirect_stdout(io.StringIO())):
-                    self.assertEqual(silence.main(["keep"], lambda _argv: 0, "Linux"), 0)
-            self.assertEqual([push["title"] for push in silence.read_kept()], ["t", "new"])
 
 
 if __name__ == "__main__":

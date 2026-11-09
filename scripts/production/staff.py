@@ -1388,7 +1388,7 @@ def ensure_worker(identity: StaffId, name: str, parent: StaffId) -> StaffRow:
 
 
 def set_worker_role(identity: StaffId, role: KnownWorkerRole) -> StaffRow:
-    """Record the role of the worker's last dispatch."""
+    """Record the role of the worker's last launch or dispatch."""
     if not is_owner():
         return _remote_row(["set-worker-role", identity, role.value])
     def edit(rows: list[StaffRow]) -> StaffRow:

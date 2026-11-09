@@ -12,6 +12,7 @@ import select
 import shutil
 import subprocess
 import sys
+import tempfile
 from typing import cast, final, override
 import unittest
 from unittest.mock import patch
@@ -260,6 +261,8 @@ class FastTrackTests(MergeCheckpointFixture):
     @override
     def setUp(self) -> None:
         super().setUp()
+        # SIGKILL bypasses the child context, so the test owns its temporary parent.
+        self.env["TMPDIR"] = self.enterContext(tempfile.TemporaryDirectory())
         self.config = self.root / "config" / "fast_track.conf"
         self.config.parent.mkdir()
         self.env.update(config_environment(self.config.parent))

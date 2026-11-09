@@ -192,13 +192,11 @@ def _finish_completion(row: staff.StaffRow, parent: staff.StaffRow, run: Path, p
         if not completion.pane_closed:
             with redirect_stderr(io.StringIO()) as diagnostics:
                 if delivery.actions.end_worker:
-                    ended = worker.end(parent.id, staff.WorkerName.parse(row.name), run=worker_panes.DispatchRun(run),
-                                       lock=hold, interrupt=outcome != TurnOutcome.DONE, retire=False)
+                    ended = worker.end(parent.id, staff.WorkerName.parse(row.name), lock=hold, retire=False)
                     closed = worker_panes.Closed() if ended == worker.ExitCode.OK else worker_panes.Kept(
                         diagnostics.getvalue().strip() or f"worker end returned {ended}")
                 else:
-                    closed = worker_panes.close(parent.id, staff.WorkerName.parse(row.name),
-                                                run=worker_panes.DispatchRun(run), lock=hold)
+                    closed = worker_panes.close(parent.id, staff.WorkerName.parse(row.name), lock=hold)
             if isinstance(closed, worker_panes.Closed):
                 completion = replace(completion, pane_closed=True)
                 progress_history.save_hook_completion(run, instance, completion)

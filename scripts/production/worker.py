@@ -572,18 +572,17 @@ def answer(parent: StaffId, name: WorkerName, text: str) -> ExitCode:
 
 
 def end(parent: StaffId, name: WorkerName, *,
-        run: worker_panes.DispatchRun | worker_panes.HolderRun = worker_panes.HolderRun.CURRENT,
         lock: worker_panes.WorkerLockHold | worker_panes.WorkerLockAtUse = worker_panes.WorkerLockAtUse.ACQUIRE,
-        interrupt: bool = False, retire: bool = True) -> ExitCode:
+        retire: bool = True) -> ExitCode:
     with ExitStack() as operations:
-        hold = operations.enter_context(worker_panes.worker_lock(parent, name)) if isinstance(lock, worker_panes.WorkerLockAtUse) else lock
+        hold = operations.enter_context(worker_panes.worker_lock(parent, name, blocking=True)) if isinstance(lock, worker_panes.WorkerLockAtUse) else lock
         if isinstance(hold, worker_panes.Kept):
             print(hold.blocker, file=sys.stderr)
             return ExitCode.KEPT
         row = worker_admission.find_worker(staff.snapshot(), parent, name.value)
         if row is None:
             return ExitCode.OK
-        result = worker_panes.close(parent, name, run=run, lock=hold, interrupt=interrupt)
+        result = worker_panes.close(parent, name, lock=hold)
         if isinstance(result, worker_panes.Kept):
             print(result.blocker, file=sys.stderr)
             return ExitCode.KEPT
@@ -1095,8 +1094,7 @@ def main(arguments: list[str] | None = None) -> int:
         if args.command == "answer":
             code = answer(owner.id, WorkerName.parse(args.name), args.text)
         elif args.command == "end":
-            code = end(owner.id, WorkerName.parse(args.name),
-                run=worker_panes.DispatchRun(Path(args.session_dir)) if args.session_dir else worker_panes.HolderRun.CURRENT)
+            code = end(owner.id, WorkerName.parse(args.name))
         elif args.command == "add":
             result = add(owner.id, cast(WorkerRole, args.role), name=args.name)
             if args.json and isinstance(result, worker_panes.OpenWorker):

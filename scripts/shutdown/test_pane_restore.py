@@ -432,7 +432,7 @@ class PaneRestoreTests(unittest.TestCase):
         self.assertEqual(len(client.started), 1)
         self.assertEqual(client.closed, ["w1:p2"], output)
 
-    def test_restore_opens_a_new_worker_pane_on_the_same_conversation(self) -> None:
+    def test_restore_resumes_the_worker_in_the_same_pane_and_conversation(self) -> None:
         from scripts.direct import progress_history
         from scripts.herdr import test_worker_panes, worker_panes
         from scripts.production import worker
@@ -457,14 +457,14 @@ class PaneRestoreTests(unittest.TestCase):
               redirect_stdout(io.StringIO()) as output, redirect_stderr(output)):
             self.assertEqual(pane_restore.restore("agents", dry_run=False), 0, output.getvalue())
             self.assertEqual(pane_restore.restore("agents", dry_run=False), 0, output.getvalue())
-        self.assertEqual(fixture.world.launches, [herdr.SplitPane("w1:p0", "right", 0.667, "unit-impl2")])
+        self.assertEqual(fixture.world.launches, [herdr.ExistingPane("w1:p1", "terminal-w1:p1")])
         restored = fixture.observation(row)
         self.assertIsInstance(restored, worker_panes.OpenWorker)
         assert isinstance(restored, worker_panes.OpenWorker)
         self.assertEqual(restored.row.current_session, row.current_session)
-        self.assertNotEqual(restored.pane, "w1:p1")
-        self.assertNotEqual(restored.terminal, "terminal-w1:p1")
-        self.assertEqual(fixture.world.closed, [("w1:p1", "terminal-w1:p1")])
+        self.assertEqual(restored.pane, "w1:p1")
+        self.assertEqual(restored.terminal, "terminal-w1:p1")
+        self.assertEqual(fixture.world.closed, [])
         after = fixture.world.panes()
         self.assertEqual(len(before), len(after))
         self.assertEqual([(pane["pane_id"], pane.get("terminal_id")) for pane in before if pane["pane_id"] != "w1:p1"],

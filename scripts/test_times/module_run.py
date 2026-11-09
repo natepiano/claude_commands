@@ -376,8 +376,7 @@ def main() -> None:
         if "scripts.message.session_send_test_support" in sys.modules:
             from scripts.message import session_send_test_support
 
-            marker = session_send_test_support.refusal_marker
-            if isinstance(marker, session_send_test_support.SenderRefusalMarker) and marker.path.is_file():
+            if session_send_test_support.real_sender_was_started():
                 print(f"{pattern}: started the real scripts/message/send.py", file=sys.stderr)
                 sys.exit(1)
         raise
