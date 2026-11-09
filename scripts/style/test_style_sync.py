@@ -720,7 +720,7 @@ if arguments[:2] == ["+nightly", "fmt"] and "--version" not in arguments:
 
     def test_lint_keeps_its_own_warm_target_after_metadata_cleanup(self) -> None:
         target = self.standing_target()
-        code, output = self.run_lint('[[ -d target && ! -L target ]] || exit 2\nprintf warm > target/artifact\n')
+        code, output = self.run_lint('[[ -d target && -L target ]] || exit 2\nprintf warm > target/artifact\n')
         self.assertEqual(code, 0, output)
         self.assertEqual((target / "artifact").read_text(), "warm")
         self.assertEqual(list(self.lint_temp.iterdir()), [])
@@ -728,7 +728,7 @@ if arguments[:2] == ["+nightly", "fmt"] and "--version" not in arguments:
         # A later checkout uses the same artifacts. No Cargo environment variable is overridden.
         with mock.patch.dict(os.environ, {"CARGO_TARGET_DIR": "inherited-value"}):
             code, output = self.run_lint(
-                '[[ -d target && ! -L target && $(cat target/artifact) == warm && $CARGO_TARGET_DIR == inherited-value ]] || exit 2\n'
+                '[[ -d target && -L target && $(cat target/artifact) == warm && $CARGO_TARGET_DIR == inherited-value ]] || exit 2\n'
             )
         self.assertEqual(code, 0, output)
         self.assertEqual(list(self.lint_temp.iterdir()), [])
@@ -742,7 +742,7 @@ if arguments[:2] == ["+nightly", "fmt"] and "--version" not in arguments:
             with self.subTest(state=state):
                 self.assertFalse(target.exists())
                 code, output = self.run_lint(
-                    '[[ -d target && ! -L target && ! -e target/artifact ]] || exit 2\nprintf fresh > target/artifact\n'
+                    '[[ -d target && -L target && ! -e target/artifact ]] || exit 2\nprintf fresh > target/artifact\n'
                 )
                 self.assertEqual(code, 0, output)
                 self.assertEqual((target / "artifact").read_text(), "fresh")
@@ -758,8 +758,9 @@ if arguments[:2] == ["+nightly", "fmt"] and "--version" not in arguments:
             code, output = self.run_lint(f"pwd -P > {observed}\n")
         self.assertEqual(code, 0, output)
         checkout = Path(observed.read_text().strip())
-        self.assertEqual(checkout.name, "configured-style-gate")
-        self.assertTrue((checkout / ".git").is_dir())
+        self.assertEqual(checkout.name, "checkout")
+        self.assertFalse(checkout.exists())
+        self.assertTrue((copies.gates_root() / self.repo.name / "configured-style-gate/target").is_dir())
         self.assertEqual(list(self.lint_temp.iterdir()), [])
 
     def test_lint_takes_second_checkout_when_first_is_busy(self) -> None:
@@ -767,7 +768,7 @@ if arguments[:2] == ["+nightly", "fmt"] and "--version" not in arguments:
         with copies.standing("sample-style", self.repo, copies.CommittedSource(self.tip)) as first:
             probe = """import fcntl
 from pathlib import Path
-with Path('.claude-busy').open('r+') as lock:
+with (Path('target').resolve().parent / '.claude-busy').open('r+') as lock:
     try:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
@@ -780,19 +781,23 @@ with Path('.claude-busy').open('r+') as lock:
             self.assertEqual(code, 0, output)
             second = Path(observed.read_text().strip())
             self.assertNotEqual(first, second)
-            self.assertEqual(second.name, "sample-style-gate-2")
+            self.assertEqual(second.name, "checkout")
+            second_cache = self.standing_target().parent.with_name("sample-style-gate-2")
+            self.assertTrue((second_cache / "target").is_dir())
+            self.assertFalse(second.exists())
             self.assertTrue((first / ".git").is_dir())
-            with (second / ".claude-busy").open("r+") as lock:
+            with (second_cache / ".claude-busy").open("r+") as lock:
                 fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
                 fcntl.flock(lock, fcntl.LOCK_UN)
         with copies.standing("sample-style", self.repo, copies.CommittedSource(self.tip)) as reused:
-            self.assertEqual(reused, first)
+            self.assertNotEqual(reused, first)
+            self.assertEqual((reused / "target").resolve(), self.standing_target())
         self.assertEqual(list(self.lint_temp.iterdir()), [])
 
     def test_redirecting_the_target_cannot_grant_successful_lint_coverage(self) -> None:
         outside = self.root / "outside-target"
         outside.mkdir()
-        code, output = self.run_lint(f'rm -rf target\nln -s {outside} target\n')
+        code, output = self.run_lint(f'rm -f target\nln -s {outside} target\n')
         self.assertEqual(code, 1, output)
         self.assertIn("lint rewrote the checked tree", output)
         with closing(sqlite3.connect(self.root / "state/sample/ledger.sqlite")) as connection:
@@ -867,10 +872,13 @@ with Path('.claude-busy').open('r+') as lock:
 
     def test_standing_checkout_has_no_registration_in_the_source(self) -> None:
         original_worktrees = self.git("worktree", "list", "--porcelain")
-        code, output = self.run_lint()
+        observed = self.root / "unregistered-checkout"
+        code, output = self.run_lint(f"pwd -P > {observed}\n[[ -d .git ]] || exit 2\n")
         self.assertEqual(code, 0, output)
-        checkout = self.standing_target().parent
-        self.assertTrue((checkout / ".git").is_dir())
+        checkout = Path(observed.read_text().strip())
+        self.assertFalse(checkout.exists())
+        self.assertTrue(self.standing_target().is_dir())
+        self.assertFalse((self.standing_target().parent / ".git").exists())
         self.assertEqual(self.git("worktree", "list", "--porcelain"), original_worktrees)
         self.assertEqual(list(self.lint_temp.iterdir()), [])
 
@@ -947,7 +955,8 @@ with Path('.claude-busy').open('r+') as lock:
                       + f"[Errno {errno.EAGAIN}] {os.strerror(errno.EAGAIN)}: 'git'", output.splitlines())
         self.assertFalse((kept / "checkout").exists())
         self.assertEqual(self.git("worktree", "list", "--porcelain"), original_worktrees)
-        self.assertTrue((self.standing_target().parent / ".git").is_dir())
+        self.assertFalse((self.standing_target().parent / ".git").exists())
+        self.assertTrue(self.standing_target().is_dir())
         # The next lint run starts after this one's owner has exited.
         style_sync.OwnerRecord(ended_pid(), style_sync.OwnerRecord.read(kept).repo).write(kept)
         sweep_output = io.StringIO()

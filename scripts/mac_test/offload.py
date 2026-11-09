@@ -36,6 +36,7 @@ from scripts.build_hold import override_guard
 from scripts.copies import copies
 from scripts.direct import result_environment
 from scripts.lib import conf
+from scripts.lib.atomic_file import write_text_atomic
 from scripts.buildlog import treekey
 from scripts.mac_test.mirror_root import MacMirrorRoot
 from scripts.buildlog import repository, store
@@ -398,6 +399,10 @@ class OffloadConfig:
         return float(self.values["fetch_limit_mib"])
 
     @property
+    def mirror_busy_backoff_s(self) -> float:
+        return float(self.values["mirror_busy_backoff_s"])
+
+    @property
     def fetch_retention_days(self) -> float:
         return float(self.values["fetch_retention_days"])
 
@@ -651,6 +656,11 @@ class MissingMacStatus:
 
 
 @dataclass(frozen=True)
+class MirrorUseBusy:
+    """The mirror lease refused the command before the runner started."""
+
+
+@dataclass(frozen=True)
 class UnresolvedSlotStartup:
     """The Linux slot refused startup because earlier ownership remains unresolved."""
 
@@ -660,7 +670,7 @@ class InterruptedTargetStatus:
     generation: str
 
 
-RemoteRunStatus = ReportedMacStatus | MissingMacStatus | UnresolvedSlotStartup | InterruptedTargetStatus | ToolVersionMismatch
+RemoteRunStatus = ReportedMacStatus | MissingMacStatus | UnresolvedSlotStartup | InterruptedTargetStatus | ToolVersionMismatch | MirrorUseBusy
 MISSING_MAC_STATUS = MissingMacStatus()
 
 
@@ -872,6 +882,7 @@ class ProcessController:
         cleanup: CleanupOutcome = CleanupUnconfirmed()
         held_status_line = ""
         mismatch = ""
+        mirror_refused = False
         build_target_directory = ""
         received_bytes = 0
         finished_output = False
@@ -885,6 +896,8 @@ class ProcessController:
                     line = raw_line
                 line = line.replace("\r\n", "\n").replace("\r", "\n")
                 marker = line.rstrip("\r\n")
+                if mirror_busy_refusal(marker):
+                    mirror_refused = True
                 if marker.startswith("build_target_directory="):
                     build_target_directory = marker.removeprefix("build_target_directory=")
                     continue
@@ -940,6 +953,8 @@ class ProcessController:
             return ToolVersionMismatch(mismatch)
         if isinstance(status, ReportedMacStatus):
             return ReportedMacStatus(status.status, cleanup, build_target_directory)
+        if mirror_refused:
+            return MirrorUseBusy()
         if isinstance(status, (UnresolvedSlotStartup, InterruptedTargetStatus)):
             return status
         return MissingMacStatus(f"runner exited with status {exit_status} without a final status")
@@ -1016,6 +1031,7 @@ def read_config(path: Path | DefaultMacSettings = DEFAULT_MAC_SETTINGS) -> Offlo
     settings = config_path() if isinstance(path, DefaultMacSettings) else path.expanduser()
     config = conf.read(settings)
     values = config.values()
+    values["mirror_busy_backoff_s"] = str(config.number("mirror_busy_backoff_s"))
     return OffloadConfig(
         enabled=(target_config.aws_routing_enabled(config) if settings.name == "aws_target.conf"
                  else config.text("offload") == "on"),
@@ -1140,6 +1156,29 @@ def write_result(
 
 def backoff_path(target: str = "mac") -> Path:
     return state_directory(target) / "unreachable_until"
+
+
+def mirror_busy_path(repository: str, target: str = "mac") -> Path:
+    """Keep one refusal time for each target and repository."""
+    return state_directory(target) / f"mirror-busy-{quote(repository, safe='')}.until"
+
+
+def read_mirror_busy(now: float, repository: str, target: str = "mac") -> BackoffState:
+    try:
+        until = float(mirror_busy_path(repository, target).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return NO_BACKOFF
+    return ACTIVE_BACKOFF if math.isfinite(until) and until > now else NO_BACKOFF
+
+
+def write_mirror_busy(config: OffloadConfig, repository: str, target: str) -> None:
+    path = mirror_busy_path(repository, target)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    write_text_atomic(path, f"{time.time() + config.mirror_busy_backoff_s:.6f}\n")
+
+
+def mirror_busy_refusal(detail: str) -> bool:
+    return re.search(r"\bcopies: [^\n]+: busy; held by session ", detail) is not None
 
 
 @dataclass(frozen=True)
@@ -2156,6 +2195,7 @@ def claimed_run(
             if isinstance(copied, TreeCopyFailed):
                 return DeclinedMacRun("copy", elapsed_seconds(started), copied.detail)
             copy_seconds = elapsed_seconds(copy_started)
+        mirror_busy_path(repository.name, request.target).unlink(missing_ok=True)
         running = (
             f"running a copy on the Mac while natedev compiles (host {probe.hostname})"
             if request.copy
@@ -2173,6 +2213,10 @@ def claimed_run(
                                           remote_test_command(config, request, repository, copied.tree_key)),
             ]
         )
+        if isinstance(remote_status, MirrorUseBusy):
+            release_allowed = True
+            write_mirror_busy(config, repository.name, request.target)
+            return BusyMacDecline(LostRunLeftovers(), elapsed_seconds(started))
         if isinstance(remote_status, InterruptedTargetStatus) and (not generation or remote_status.generation != generation):
             remote_status = MISSING_MAC_STATUS
         if not isinstance(remote_status, ReportedMacStatus):
@@ -2377,7 +2421,10 @@ def run_offload(
                 except copies.BusyRemoteMirror:
                     continue
                 leases[slot] = admission_leases.enter_context(lease)
-            return leased_offload(controller, config, request, repository, started, linux, leases)
+            result = leased_offload(controller, config, request, repository, started, linux, leases)
+            if isinstance(result, DeclinedMacRun) and result.reason == "copy" and mirror_busy_refusal(result.detail):
+                write_mirror_busy(config, repository.name, request.target)
+            return result
     except copies.CopyError as error:
         return DeclinedMacRun("copy", elapsed_seconds(started), str(error))
 
@@ -2395,6 +2442,7 @@ def leased_offload(controller: ProcessController, config: OffloadConfig, request
                    repository: KnownRepository, started: float, linux: bool,
                    leases: dict[int, ExitStack]) -> MacOffloadResult:
     if not leases:
+        write_mirror_busy(config, repository.name, request.target)
         return BusyMacDecline(LostRunLeftovers(), elapsed_seconds(started))
     claim = claim_for_run(controller, config, request, repository, tuple(leases))
     # A transferred reservation can be adopted only once.

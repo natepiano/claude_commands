@@ -948,6 +948,33 @@ class OffloadCommandTests(OffloadCommandFixture):
         self.assertEqual(len(self.events_for("ssh")), 1)
         self.assertEqual(len(self.events_for("rsync")), 1)
         self.assert_claimed_commands()
+        path = self.state_directory / "mirror-busy-hana.until"
+        self.assertFalse(path.exists())
+        self.fixture["rsync_status"] = 0
+        self.sync_fixture()
+        config = offload.read_config(self.config_path)
+        request = offload.OffloadRequest(self.repository, "hana", "busy", offload.NO_RESULT_FILE, (),
+                                        owner="verify", target="mac", holder_session="fixture")
+        mirror = offload.request_mirror(config, request, HANA)
+        with mock.patch.dict(os.environ, self.environment), copies.remote_lease(mirror):
+            result = self.command(runner_options=("--target", "mac"))
+            self.assertEqual(result.returncode, 75, result.stdout)
+            self.assertEqual(result.stdout, "mac_test: not running on the mac (busy)\n")
+            self.assert_wire("declined", "busy")
+        self.assertGreater(float(path.read_text()), time.time())
+        self.assertLessEqual(float(path.read_text()), time.time() + 120)
+        result = self.command(runner_options=("--target", "mac"))
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertFalse(path.exists())
+        self.fixture["run_status_reported"] = False
+        self.fixture["run_lines"] = [{"stream": "stderr", "text": "copies: /mirror/hana: busy; held by session grep"}]
+        self.sync_fixture()
+        result = self.command(runner_options=("--target", "mac"))
+        self.assertEqual(result.returncode, 75, result.stdout)
+        self.assert_wire("declined", "busy")
+        self.assertNotIn("without a final status", result.stdout)
+        self.assertTrue(path.exists())
+        self.assertFalse(self.claim_file.exists())
 
     def test_copy_refusal_keeps_rsync_stderr_in_output_and_the_result(self) -> None:
         self.fixture["rsync_status"] = 23
@@ -964,6 +991,11 @@ class OffloadCommandTests(OffloadCommandFixture):
         self.assert_claimed_commands()
         self.assertEqual(len(self.events_for("rsync")), 1)
         self.assertEqual(len(self.events_for("ssh")), 1)
+
+        _ = stub.write_text(source.replace("rsync: destination denied", "copies: /mirror/hana: busy; held by session reader"))
+        result = self.command(runner_options=("--target", "mac"))
+        self.assertEqual(result.returncode, 75, result.stdout)
+        self.assertTrue((self.state_directory / "mirror-busy-hana.until").exists())
 
     def test_tracked_script_transfer_keeps_the_failed_command_error(self) -> None:
         controller = offload.ProcessController()

@@ -139,11 +139,15 @@ SESSION_SCRATCH_PREFIX = "claude-"
 RUN_MARKERS = "active"
 PROC_DIR = "/proc"
 # Where no /proc exists (the Mac), one lsof scan lists what each process uses.
-LSOF = ("lsof", "-n", "-P", "-w", "-F", "pfn")
+LSOF = ("lsof", "-n", "-P", "-w", "-F", "pfan")
 LSOF_TIMEOUT_SECONDS = 120
 # lsof's fd names for a working folder and for mapped files (program text, memory maps).
 LSOF_CWD = "cwd"
 LSOF_MAPPED = ("txt", "mem")
+WORKS_IN = "works in it"
+MAPS_FILE = "maps a file in it"
+HOLDS_FILE = "holds a file open in it"
+WRITES_FILE = "holds a file open for writing in it"
 # The folder names tempfile makers give by default: Rust's tempfile crate ".tmp" and 6 letters or
 # digits, mktemp "tmp." and 8 to 10, Python's tempfile "tmp" and 8 lower-case letters, digits or "_".
 # Test runs leave them behind in the temp folders (3,058 Rust ones in natedev /tmp since 2026-09-06;
@@ -526,7 +530,7 @@ def process_paths(proc: str, prefix: str | tuple[str, ...]) -> ProcessUsesKnown 
         except OSError:
             continue
         if cwd.startswith(prefix):
-            found.append((cwd, pid, "works in it"))
+            found.append((cwd, pid, WORKS_IN))
         fds = os.path.join(entry.path, "fd")
         for fd in listing(fds):
             try:
@@ -534,13 +538,21 @@ def process_paths(proc: str, prefix: str | tuple[str, ...]) -> ProcessUsesKnown 
             except OSError:
                 continue
             if target.startswith(prefix):
-                found.append((target.removesuffix(DELETED_SUFFIX), pid, "holds a file open in it"))
+                how = HOLDS_FILE
+                try:
+                    with open(os.path.join(entry.path, "fdinfo", fd.name), encoding="utf-8") as info:
+                        for line in info:
+                            if line.startswith("flags:") and int(line.split()[1], 8) & os.O_ACCMODE in (os.O_WRONLY, os.O_RDWR):
+                                how = WRITES_FILE
+                except (OSError, ValueError):
+                    pass
+                found.append((target.removesuffix(DELETED_SUFFIX), pid, how))
         try:
             with open(os.path.join(entry.path, "maps"), encoding="utf-8", errors="replace") as handle:
                 for line in handle:
                     parts = line.rstrip("\n").split(maxsplit=5)
                     if len(parts) == 6 and parts[5].startswith(prefix):
-                        found.append((parts[5].removesuffix(DELETED_SUFFIX), pid, "maps a file in it"))
+                        found.append((parts[5].removesuffix(DELETED_SUFFIX), pid, MAPS_FILE))
         except OSError:
             continue
     return ProcessUsesKnown(found, tuple(unreadable))
@@ -559,7 +571,7 @@ def lsof_paths(prefix: str | tuple[str, ...]) -> ProcessUsesKnown | ProcessUsesU
 
 
 def parse_lsof(text: str, prefix: str | tuple[str, ...]) -> list[tuple[str, int, str]]:
-    """Each path under prefix in `lsof -F pfn` output, with its pid and how the process uses it."""
+    """Read each process path and its access from `lsof -F pfan` output."""
     found: list[tuple[str, int, str]] = []
     pid = 0
     how = ""
@@ -568,8 +580,9 @@ def parse_lsof(text: str, prefix: str | tuple[str, ...]) -> list[tuple[str, int,
         if field == "p" and value.isdigit():
             pid = int(value)
         elif field == "f":
-            how = ("works in it" if value == LSOF_CWD
-                   else "maps a file in it" if value in LSOF_MAPPED else "holds a file open in it")
+            how = WORKS_IN if value == LSOF_CWD else MAPS_FILE if value in LSOF_MAPPED else HOLDS_FILE
+        elif field == "a" and value in ("w", "u") and how == HOLDS_FILE:
+            how = WRITES_FILE
         elif field == "n" and pid and how and value.startswith(prefix):
             found.append((value, pid, how))
     return found
@@ -579,6 +592,8 @@ def entry_uses(paths: Sequence[tuple[str, int, str]], roots: Sequence[str]) -> d
     """For each entry a process uses, under any root, how the first such process uses it."""
     uses: dict[str, str] = {}
     for path, pid, how in paths:
+        if how == WRITES_FILE:
+            how = HOLDS_FILE
         for root in roots:
             if path.startswith(root + os.sep):
                 name = path[len(root) + 1:].split(os.sep, 1)[0]

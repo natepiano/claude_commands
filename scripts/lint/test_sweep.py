@@ -2842,7 +2842,7 @@ class FloorTests(SweepCase):
                                        {"Cargo.toml": "[workspace]\n", "source.txt": "style source\n"})
         with mock.patch.dict(os.environ, {"HOME": str(base), scratch.HOLDS_ENV: str(base / "holds.json")}):
             with copies.standing("style-unit", seed.checkout, copies.CommittedSource("HEAD")) as checkout:
-                target = checkout / "target"
+                target = (checkout / "target").resolve()
                 output = unit(target / "debug", "deps", "style", APP, time.time() - DAY)
                 with (mock.patch.object(sweep, "held_cargo_lock_files", return_value=set()),
                       mock.patch.object(sweep, "lock_holder", return_value=os.getpid()),
@@ -2852,7 +2852,8 @@ class FloorTests(SweepCase):
                 self.assertEqual(status, 0, text)
                 self.assertTrue(output.exists(), "The floor removed a standing target between Cargo commands")
                 self.assertEqual(self.trim_rows(), [])
-            self.assertTrue((checkout / scratch.BUSY).is_file())
+            self.assertFalse(checkout.exists())
+            self.assertTrue((target.parent / scratch.BUSY).is_file())
             with mock.patch.object(sweep, "held_cargo_lock_files", return_value=set()):
                 status, text = self.hold(base, 10 * GIB, [10 * GIB - 1, 10 * GIB], recorded=True)
         self.assertEqual(status, 0, text)
@@ -2866,7 +2867,7 @@ class FloorTests(SweepCase):
                                        {"Cargo.toml": "[workspace]\n", "source.txt": "style source\n"})
         with mock.patch.dict(os.environ, {"HOME": str(base), scratch.HOLDS_ENV: str(base / "holds.json")}):
             with copies.standing("style-unit", seed.checkout, copies.CommittedSource("HEAD")) as checkout:
-                target = checkout / "target"
+                target = (checkout / "target").resolve()
             output = unit(target / "debug", "deps", "style", APP, time.time() - DAY)
             # Cargo may omit rustc-info when its caller made the target directory.
             self.assertFalse((target / sweep.RUSTC_INFO).exists())
@@ -2904,7 +2905,7 @@ class FloorTests(SweepCase):
               mock.patch.object(sweep, "send_holder_message", return_value=sweep.FloorChannelOutcome.FAILED),
               redirect_stdout(io.StringIO())):
             with copies.standing("style-unit", seed.checkout, copies.CommittedSource("HEAD")) as checkout:
-                target = checkout / "target"
+                target = (checkout / "target").resolve()
                 output = unit(target / "debug", "deps", "style", APP, time.time() - DAY)
                 self.root_row(checkout, target, target)
                 with mock.patch.object(sweep, "free_bytes", return_value=0):

@@ -565,12 +565,18 @@ with (mock.patch.object(linux_runner, 'prepare_shell', return_value=linux_runner
         for damaged in (False, True):
             with self.subTest(damaged=damaged):
                 with copies.standing("alpha", self.source, copies.StagedSource(copies.staged_tree(self.source))) as tree:
-                    pass
-                _ = (tree / ".git/index.lock").write_text("stopped writer")
-                if damaged:
-                    _ = (tree / ".git/index").write_bytes(b"broken")
+                    cache = (tree / "target").resolve()
+                    _ = (tree / ".git/index.lock").write_text("stopped writer")
+                    if damaged:
+                        _ = (tree / ".git/index").write_bytes(b"broken")
+                    copies.initialize_git(tree, self.source)
+                    self.assertFalse((tree / ".git/index.lock").exists())
+                    _ = copies.git(tree, "read-tree", "HEAD")
+                    self.assertEqual((tree / "source.txt").read_text(), "content\n")
+                self.assertFalse(tree.exists())
                 with copies.standing("alpha", self.source, copies.StagedSource(copies.staged_tree(self.source))) as reused:
-                    self.assertEqual(reused, tree)
+                    self.assertNotEqual(reused, tree)
+                    self.assertEqual((reused / "target").resolve(), cache)
                     self.assertEqual((reused / "source.txt").read_text(), "content\n")
                     self.assertFalse((reused / ".git/index.lock").exists())
 

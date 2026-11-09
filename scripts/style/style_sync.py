@@ -375,6 +375,7 @@ def lint(repo: Path, checkout: Path, tip: str) -> int:
             with signal_mask(signal.SIG_UNBLOCK):
                 (directory / "checkout").symlink_to(snapshot, target_is_directory=True)
                 intermediates = snapshot / "target/intermediates"
+                retained_target = (snapshot / "target").resolve()
                 scratch.mark_cargo_cache(intermediates)
                 saved = subprocess.run(
                     [str(PYTHON), str(Path(scratch.__file__)), "cargo-save", str(snapshot)],
@@ -387,7 +388,7 @@ def lint(repo: Path, checkout: Path, tip: str) -> int:
                 print(output, end="")
                 # Build outputs are retained; only source changes invalidate coverage.
                 rewritten = bool(git(snapshot, "status", "--porcelain", "--", ".", ":(exclude)target"))
-                rewritten = rewritten or (snapshot / "target").is_symlink()
+                rewritten = rewritten or (snapshot / "target").resolve() != retained_target
                 records = lint_records(output, snapshot)
                 for record in records:
                     passed = record.passed and not rewritten
