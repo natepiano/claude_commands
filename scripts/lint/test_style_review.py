@@ -101,6 +101,8 @@ class PreparationTests(unittest.TestCase):
         ], capture_output=True, text=True, check=False)
         self.assertEqual(completed.returncode, 0, completed.stderr)
         first = Path(directory_file.read_text().strip())
+        self.assertTrue((first / "prompt.md").is_file())
+        self.assertTrue((first / "assignment.md").is_file())
         second = self.style_start("replacement-dispatch")
         self.assertNotEqual(first, second)
 
