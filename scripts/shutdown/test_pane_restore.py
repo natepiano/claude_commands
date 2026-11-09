@@ -144,7 +144,7 @@ class FakeClient(herdr.Herdr):
                 owner = staff.initial_snapshot().by_current_session(self.native_ids[pane])
                 reference = owner.id if owner is not None else self.native_ids[pane]
                 original = next(entry for entry in entries.values() if entry["session_id"] == reference)
-                environment = {**original["environment"], "CLAUDE_CONFIG_DIR": pane_launch.config_home(original)}
+                environment = {**original["environment"], "CLAUDE_CONFIG_DIR": str(cast(staff.SessionHome, pane_launch.config_home(original)).path)}
                 replacement = pane_record.launch(pane, self.native_ids[pane], original["cwd"],
                     environment, ["claude", *agent_arguments])
                 pane_record.write(self.session, replacement)
@@ -362,6 +362,17 @@ class PaneRestoreTests(unittest.TestCase):
                 self.assertEqual(output.count("pane close anomaly:"), 1)
                 self.assertIn("w1:p2", pane_record.read("agents"))
 
+    def test_unknown_staff_home_reports_once_and_keeps_normal_account_selection(self) -> None:
+        self.entry()
+        self.row = replace(self.row, home=staff.HomeUnknown())
+        client = self.restored()
+        with mock.patch.object(restart, "start_row", return_value="w1:p3") as start:
+            code, output = self.run_restore(client)
+        self.assertEqual(code, 0, output)
+        self.assertEqual(start.call_args.kwargs["target_account"], "")
+        self.assertEqual(sum("anomaly:" in line for line in output.splitlines()), 1, output)
+        self.assertIn("home", output)
+
     def test_server_restore_keeps_numbered_and_unnamed_codex_homes_through_start_row(self) -> None:
         for name, label in ((".codex2", "codex2"), ("saved-home", "~/.codex")):
             with self.subTest(home=name):
@@ -477,7 +488,7 @@ class PaneRestoreTests(unittest.TestCase):
               redirect_stdout(io.StringIO())):
             self.assertEqual(pane_record.seed("agents"), 0)
         entry = pane_record.read("agents")["w1:p2"]
-        self.assertEqual((entry["session_id"], pane_launch.config_home(entry), entry["name"], entry["model"], entry["cwd"]),
+        self.assertEqual((entry["session_id"], str(cast(staff.SessionHome, pane_launch.config_home(entry)).path), entry["name"], entry["model"], entry["cwd"]),
                          (str(self.row.id), str(self.config), "alpha", "opus", "/work/alpha"))
         self.assertEqual(entry["environment"], {})
 
@@ -990,7 +1001,7 @@ class CodexPaneRestoreTests(FolderMoveFixture):
         def start(tab: herdr.TabSession, entry: pane_record.PaneLaunch,
                   _account: str, _message: str) -> runtime_sessions.LiveSessionProcess:
             replacement = pane_record.launch(tab.pane_id, self.owner.current_session, entry["cwd"],
-                {"CLAUDE_CONFIG_DIR": pane_launch.config_home(entry)}, ["claude", "--resume", self.owner.current_session])
+                {"CLAUDE_CONFIG_DIR": str(cast(staff.SessionHome, pane_launch.config_home(entry)).path)}, ["claude", "--resume", self.owner.current_session])
             pane_record.write("agents", replacement)
             return runtime_sessions.LiveSessionProcess(backend.pid)
 

@@ -538,8 +538,15 @@ def sweep(only: str = "", check: bool = False) -> int:
                 if pending["kind"] == "none" or (only and only != session_id):
                     continue
                 pending_ids.add(session_id)
+                home = pane_launch.config_home({**pending, "session_id": session_id})
+                if isinstance(home, staff.HomeUnknown):
+                    from scripts.accounts import accounts
+
+                    print(f"anomaly: {session_id}: session home is unknown; select the normal account", file=sys.stderr)
+                    selected_account = accounts.role_account("unit")
+                    home = staff.SessionHome(selected_account.dir)
                 session = HealSession(session_id, pending["pid"], pending["proc_start"], pending["name"],
-                                      Path(pending["cwd"]), "idle", Path(pane_launch.config_home({**pending, "session_id": session_id})))
+                                      Path(pending["cwd"]), "idle", home.path)
                 try:
                     resume_pending(directory, limits, session, pending, history, histories)
                 except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:

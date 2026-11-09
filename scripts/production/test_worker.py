@@ -412,6 +412,7 @@ class WorkerCommandTests(unittest.TestCase):
         opened = self.opened()
         active = progress_history.ActiveDispatch("saved-pass", ("bash", "assign.sh", "argument with spaces"))
         self.fixture.dispatch(opened.row, "impl")
+        opened = replace(opened, row=staff.set_worker_role(opened.row.id, staff.KnownWorkerRole("impl")))
         director = herdr.TabSession("director-pane", "unit", "workspace", str(self.fixture.parent.current_session))
         lock_path = staff.record_path().parent / "locks" / f"{opened.row.id}.lock"
         atomic_file.write_text_atomic(lock_path, "")
@@ -446,6 +447,7 @@ class WorkerCommandTests(unittest.TestCase):
         opened = self.opened()
         active = progress_history.ActiveDispatch("saved-pass", ("bash", "assign.sh"))
         self.fixture.dispatch(opened.row, "impl")
+        opened = replace(opened, row=staff.set_worker_role(opened.row.id, staff.KnownWorkerRole("impl")))
         _ = self.fixture.world.stop(opened.row, self.fixture.world)
         director = herdr.TabSession("director-pane", "unit", "workspace", str(self.fixture.parent.current_session))
         with (patch.object(self.fixture.world, "tab_sessions", return_value=[director]),
@@ -1727,7 +1729,9 @@ class WorkerCommandTests(unittest.TestCase):
             prompt=self.prompt, kind="review", lens="")
         passed = worker_panes.worker_pass(opened.row, self.run_dir)
         self.assertEqual((passed["instance_id"], passed["status"]), (dispatch_id, "active"))
-        self.assertEqual(worker_panes.dispatch_role(opened.row), "review")
+        current = staff.by_id(opened.row.id)
+        assert current is not None
+        self.assertEqual(worker_panes.dispatch_role(current), "review")
 
     def test_private_run_restore_uses_finished_dispatch_history(self) -> None:
         self.assertEqual(self.dispatch(role="review"), worker.ExitCode.OK)
@@ -2165,6 +2169,18 @@ class WorkerCommandTests(unittest.TestCase):
         self.assertEqual(staff.snapshot().by_id(opened.row.id), opened.row)
         self.assertNotIn(opened.pane, self.fixture.world.foreground)
 
+    def test_restore_uses_the_known_row_role_without_history(self) -> None:
+        opened = self.opened()
+        _ = staff.set_worker_role(opened.row.id, staff.KnownWorkerRole("impl"))
+        _ = self.fixture.world.stop(opened.row, self.fixture.world)
+        active = progress_history.ActiveDispatch("saved-pass", ("assign.sh",))
+        with (patch.object(progress_history, "last_dispatch", return_value=progress_history.NoDispatchRecorded()),
+              patch.object(progress_history, "active_dispatch", return_value=active),
+              patch.object(worker, "_resume_launcher", return_value=worker.ExitCode.OK)):
+            code, _output, errors = self.command("restore")
+        self.assertEqual(code, 0, errors)
+        self.assertEqual(len(self.fixture.world.launches), 2)
+
     def test_restore_reports_the_unavailable_role_and_continues_other_workers(self) -> None:
         missing = self.opened("impl")
         retained = self.opened("review", "review")
@@ -2215,6 +2231,7 @@ class WorkerCommandTests(unittest.TestCase):
     def test_check_distinguishes_resumable_workers_from_unknown_evidence(self) -> None:
         opened = self.opened()
         self.fixture.dispatch(opened.row, "impl", completed=True)
+        opened = replace(opened, row=staff.set_worker_role(opened.row.id, staff.KnownWorkerRole("impl")))
         self.assertEqual(self.command("check")[0], 0)
         _ = self.fixture.world.stop(opened.row, self.fixture.world)
         self.assertEqual(self.command("check")[0], 0)

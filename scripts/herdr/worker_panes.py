@@ -550,13 +550,8 @@ def worker_pass(row: staff.StaffRow, run: Path) -> dict[str, object]:
 
 
 def dispatch_role(row: staff.StaffRow) -> WorkerRole | WorkerRoleUnavailable:
-    """Read the worker's role from its newest open or finished dispatch."""
-    from scripts.direct import progress_history
-
-    dispatch = progress_history.last_dispatch(row.id)
-    if isinstance(dispatch, progress_history.RecordedDispatch) and dispatch.role in staff.WORKER_ROLES:
-        return dispatch.role
-    return WorkerRoleUnavailable("dispatch role is unavailable")
+    """Read the worker role from its staff row."""
+    return row.role.value if isinstance(row.role, staff.KnownWorkerRole) else WorkerRoleUnavailable("dispatch role is unavailable")
 
 
 def _completed_turn(row: staff.StaffRow, dispatch: object) -> CloseAllowed | Kept:

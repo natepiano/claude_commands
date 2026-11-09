@@ -49,22 +49,21 @@ class PaneLaunch(TypedDict):
     proc_start: NotRequired[str]
 
 
-def config_home(entry: Mapping[str, object], *, record: staff.StaffSnapshot | None = None) -> str:
+def config_home(entry: Mapping[str, object], *, record: staff.StaffSnapshot | None = None) -> staff.SessionHome | staff.HomeUnknown:
     """Read a staffed session's home, or an unstaffed launch's config folder."""
     if record is None:
         try:
             record = staff.local_snapshot()
         except staff.StaffAbsent:
             record = staff.StaffSnapshot(())
-        except staff.StaffUnreadable as error:
-            print(f"anomaly: session home is unavailable: {error}", file=sys.stderr)
-            return ""
+        except staff.StaffUnreadable:
+            return staff.HomeUnknown()
     reference = entry.get("session_id", "")
     row = record.by_member_reference(reference) if isinstance(reference, str) else None
     if row is not None:
-        return str(row.home.path) if isinstance(row.home, staff.SessionHome) else ""
+        return row.home
     directory = entry.get("config_dir", "")
-    return directory if isinstance(directory, str) else ""
+    return staff.SessionHome(Path(directory)) if isinstance(directory, str) and directory else staff.HomeUnknown()
 
 
 def _record_home(entry: PaneLaunch) -> PaneLaunch:
@@ -330,9 +329,15 @@ def _usable_replacement(path: Path, attempt: ResumeAttempt, entry: PaneLaunch,
     required = frozenset({"pane_id", "session_id", "cwd", "name", "model", "written_at"})
     _ = _validated_launch(path, attempt.pane_id, entry, required_strings=required)
     expected = proof.expected
+    home, expected_home = config_home(entry), config_home(expected)
+    home_changed = False
+    if isinstance(home, staff.SessionHome) and isinstance(expected_home, staff.SessionHome):
+        home_changed = home.path.resolve() != expected_home.path.resolve()
+    else:
+        print(f"anomaly: {attempt.pane_id}: session home is unknown; keep the selected account", file=sys.stderr)
     if (entry["pane_id"] != attempt.pane_id or entry["session_id"] not in proof.references
             or agent_kind(entry) != agent_kind(expected)
-            or Path(config_home(entry)).resolve() != Path(config_home(expected)).resolve()
+            or home_changed
             or Path(entry["cwd"]).resolve() != Path(expected["cwd"]).resolve()
             or not entry.get("flags_read", False)
             or (not same_pane and entry.get("ended", False))):

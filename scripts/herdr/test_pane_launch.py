@@ -67,7 +67,7 @@ class LaunchEnvironmentTests(unittest.TestCase):
                 entries[current["pane_id"]] = current
             pane_launch.save(path, entries)
             with patch.object(staff, "local_snapshot", return_value=staff.StaffSnapshot((row,))) as snapshot:
-                self.assertEqual(pane_launch.config_home(entry), "")
+                self.assertIsInstance(pane_launch.config_home(entry), staff.HomeUnknown)
                 snapshot.reset_mock()
                 self.assertEqual(pane_launch.read_valid_entries(path), entries)
                 snapshot.assert_called_once_with()

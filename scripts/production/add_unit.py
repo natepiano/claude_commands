@@ -855,7 +855,14 @@ def finish_opening(request: UnitLaunch, marked: LabeledSessionFound) -> herdr.Pr
         if isinstance(observed, sessions.SessionLivenessUnknown):
             raise Refusal(f"cannot tell whether pending session {fields['session_id']} runs: {observed.reason}")
         raise Refusal("pending opening does not name the session that carries the unit's session label")
-    transcript = herdr.SessionTranscript(Path(pane_launch.config_home(fields)), fields["session_id"])
+    home = pane_launch.config_home(fields)
+    if isinstance(home, staff.HomeUnknown):
+        from scripts.accounts import accounts
+
+        print(f"anomaly: {fields['session_id']}: session home is unknown; select the normal account", file=sys.stderr)
+        selected = accounts.role_account("unit")
+        home = staff.SessionHome(selected.dir)
+    transcript = herdr.SessionTranscript(home.path, fields["session_id"])
     _ = ensure_staff_unit(request.production, request.unit_id,
         worktree=staff.PresentWorktree(remote.local_machine(), request.worktree.resolve()),
         runtime_id=transcript.session_id)

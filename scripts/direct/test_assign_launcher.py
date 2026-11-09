@@ -438,20 +438,20 @@ class PaneReviewLauncherTests(unittest.TestCase):
         self.assertEqual(self.fixture.agent.submitted, [])
         self.assertEqual((self.phase / "review_status_1").read_text(), "error\n")
 
-    def test_review_incomplete_start_keeps_the_pane_without_either_stage(self) -> None:
+    def test_review_incomplete_start_closes_the_pane_without_either_stage(self) -> None:
         self.fixture.fixture.world.outcome = herdr.PromptNotSubmitted("startup hook failed")
         self.assert_start_not_delivered(worker.ExitCode.UNCERTAIN, "publication failed: startup hook failed")
         self.assertEqual(len(self.fixture.fixture.world.launches), 2)
-        self.assertEqual(self.fixture.fixture.world.closed, [])
+        self.assertEqual(self.fixture.fixture.world.closed, [("w1:p2", "terminal-w1:p2")])
 
-    def test_review_failed_publication_keeps_the_backend_without_either_stage(self) -> None:
+    def test_review_failed_publication_closes_the_backend_without_either_stage(self) -> None:
         rows = staff.snapshot().find(kind="worker", parent=self.fixture.fixture.parent.id)
         with patch.object(staff, "ensure_worker", side_effect=staff.StaffRefused("publication unavailable")):
             self.assert_start_not_delivered(worker.ExitCode.UNCERTAIN, "publication refused: publication unavailable")
         self.assertIn("review: publication failed: staff: review:", (self.phase / "review_agent_1.log").read_text())
         self.assertEqual(staff.snapshot().find(kind="worker", parent=self.fixture.fixture.parent.id), rows)
         self.assertEqual(len(self.fixture.fixture.world.launches), 2)
-        self.assertEqual(self.fixture.fixture.world.closed, [])
+        self.assertEqual(self.fixture.fixture.world.closed, [("w1:p2", "terminal-w1:p2")])
 
     def test_review_admission_failure_sends_neither_stage(self) -> None:
         launches = self.fixture.fixture.world.launches.copy()
@@ -478,7 +478,8 @@ class PaneReviewLauncherTests(unittest.TestCase):
         _ = progress_history.begin_dispatch(self.fixture.run_dir, slot="review", phase="8", role="impl",
             worker_name="review", worker_id=opened.row.id, launcher_command=["previous-launcher"], prompt=self.fixture.prompt, kind="impl", lens="")
         before = self.fixture.fixture.staff_state()
-        self.assert_start_not_delivered(worker.ExitCode.REFUSED, "role change blocked by active work: active dispatch has another role")
+        with patch("scripts.agents.mesh_runs.live_runs", return_value=[object()]):
+            self.assert_start_not_delivered(worker.ExitCode.REFUSED, "role change blocked by active work: a detached run is live")
         self.assertEqual(self.fixture.fixture.staff_state(), before)
         self.assertIn(opened.pane, self.fixture.fixture.world.foreground)
         self.assertEqual(self.fixture.fixture.world.stops, [])

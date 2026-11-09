@@ -512,7 +512,7 @@ class WorkerPaneTests(StaffTestCase):
             self.assertIsNone(staff.snapshot().by_current_session(identity))
             entry = pane_launch.launch(result.pane, identity, str(prepared.directory), prepared.env,
                                        [kind, *arguments], kind=cast(Literal["claude", "codex"], kind))
-            homes.append(pane_launch.config_home(entry, record=staff.StaffSnapshot(())))
+            homes.append(str(cast(staff.SessionHome, pane_launch.config_home(entry, record=staff.StaffSnapshot(()))).path))
             pane_record.write("TEST-admission", entry)
             self.assertIn("config_dir", entry)
             return result
@@ -1138,10 +1138,17 @@ class WorkerPaneTests(StaffTestCase):
         self.assertEqual(staff.snapshot().find(kind="worker", parent=self.parent.id), [])
         self.assertEqual(self.world.closed, [("w1:p1", "terminal-w1:p1")])
 
-    def test_dispatch_role_reports_missing_history_and_uses_the_recorded_role(self) -> None:
+    def test_dispatch_role_uses_the_known_row_role_without_history(self) -> None:
+        row = replace(self.worker("known-role"), role=staff.KnownWorkerRole("review"))
+        with patch.object(progress_history, "last_dispatch", side_effect=AssertionError("no history read")):
+            self.assertEqual(worker_panes.dispatch_role(row), "review")
+
+    def test_dispatch_role_keeps_an_unknown_row_unavailable_until_the_writer_sets_it(self) -> None:
         row = self.worker("impl2")
         self.assertIsInstance(worker_panes.dispatch_role(row), worker_panes.WorkerRoleUnavailable)
         self.dispatch(row, "astra-reviewer")
+        self.assertIsInstance(worker_panes.dispatch_role(row), worker_panes.WorkerRoleUnavailable)
+        row = staff.set_worker_role(row.id, staff.KnownWorkerRole("astra-reviewer"))
         self.assertEqual(worker_panes.dispatch_role(row), "astra-reviewer")
         self.assertEqual(staff.snapshot().by_id(row.id), row)
 

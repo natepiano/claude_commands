@@ -100,7 +100,7 @@ class PaneRecordTests(unittest.TestCase):
             self.assertEqual(row.to_json().get("home"), str(home))
             retained = pane_record.read("TEST-admission")["TEST-" + member_kind]
             self.assertNotIn("config_dir", retained)
-            self.assertEqual(pane_launch.config_home(retained), str(home))
+            self.assertEqual(pane_launch.config_home(retained), staff.SessionHome(home))
 
     def test_retained_write_keeps_the_running_home_until_a_pane_start(self) -> None:
         owner = staff.ensure("showrunner", name="TEST-write-order", runtime_id=fixture_runtime_id("TEST-write-order"))
@@ -626,7 +626,7 @@ class PaneRecordTests(unittest.TestCase):
                 published = pane_record.read_strict("agents")["w1:p2"]
                 self.assertEqual(published.get("kind"), "codex")
                 self.assertNotIn("config_dir", published)
-                self.assertEqual(pane_launch.config_home(published), environment["CODEX_HOME"])
+                self.assertEqual(pane_launch.config_home(published), staff.SessionHome(Path(environment["CODEX_HOME"])))
                 self.assertEqual(published["session_id"], owner.id)
                 self.assertEqual(published["environment"], {
                     "CODEX_HOME": environment["CODEX_HOME"], "ENABLE_TOOL_SEARCH": "true",
@@ -703,7 +703,7 @@ class MacRecordTests(unittest.TestCase):
             environment = pane_record._process_environment(100)  # pyright: ignore[reportPrivateUsage]
         entry = pane_record.launch("w1:p1", "019b3a40-4250-7000-8000-000000000102", "/work/alpha", environment, arguments)
         self.assertEqual((entry["name"], entry["model"], entry["flags_read"]), ("alpha", "opus", True))
-        self.assertEqual(pane_launch.config_home(entry), "/Users/n/.claude3")
+        self.assertEqual(pane_launch.config_home(entry), staff.SessionHome(Path("/Users/n/.claude3")))
         self.assertNotIn(TOKEN, json.dumps(environment) + json.dumps(entry))
 
 

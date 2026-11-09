@@ -18,6 +18,7 @@ import unittest
 from collections.abc import Callable, Mapping
 from contextlib import closing, nullcontext, redirect_stderr, redirect_stdout
 from datetime import datetime, timezone
+from dataclasses import replace
 from pathlib import Path
 from threading import Barrier, Lock, local
 from typing import cast, final, override
@@ -436,7 +437,7 @@ class StopResumeTests(unittest.TestCase):
                     entry = cast(pane_record.PaneLaunch, start.call_args.args[1])
                     self.assertEqual(entry["environment"]["CLAUDE_CONFIG_DIR"], str(self.root / f".{expected}"))
                     if kind == "missing":
-                        self.assertEqual(pane_launch.config_home(entry), str(self.root / f".{expected}"))
+                        self.assertEqual(str(cast(staff.SessionHome, pane_launch.config_home(entry)).path), str(self.root / f".{expected}"))
                     else:
                         self.assertNotIn("config_dir", entry)
                     if target is None:
@@ -527,10 +528,16 @@ class StopResumeTests(unittest.TestCase):
                              current_session=staff.StaffId(identity), home=staff.SessionHome(self.root / ".codex2"))
         self.entry["kind"] = "codex"
         self.entry["config_dir"] = str(self.root / ".codex2")
-        self.entry["environment"] = {"CODEX_HOME": pane_launch.config_home(self.entry)}
+        self.entry["environment"] = {"CODEX_HOME": str(cast(staff.SessionHome, pane_launch.config_home(self.entry)).path)}
         pane_record.save("agents", {"w1:p2": self.entry})
-        with (patch.object(staff, "initial_snapshot", return_value=staff.StaffSnapshot((row,))),
-              patch.object(staff, "local_snapshot", return_value=staff.StaffSnapshot((row,))),
+        def record_home(identity: staff.StaffId, home: staff.SessionHome) -> staff.StaffRow:
+            nonlocal row
+            self.assertEqual(identity, row.id)
+            row = replace(row, home=home)
+            return row
+        with (patch.object(staff, "initial_snapshot", side_effect=lambda: staff.StaffSnapshot((row,))),
+              patch.object(staff, "local_snapshot", side_effect=lambda: staff.StaffSnapshot((row,))),
+              patch.object(staff, "set_home", side_effect=record_home),
               patch.object(accounts, "role_account", return_value=accounts.CodexWorkersAccount(
                   "codex1", self.root / ".codex1")),
               patch.object(agent_accounts, "codex_home_role_label", return_value="codex7") as source_label,
@@ -1014,6 +1021,20 @@ class StopResumeTests(unittest.TestCase):
         self.assertNotIn("config_dir", entry)
         self.assertEqual(entry["environment"]["CODEX_HOME"], str(workers))
 
+    def test_codex_own_pane_exec_publishes_the_target_home(self) -> None:
+        source, target = self.root / ".codex1", self.root / ".codex2"
+        row = fixture_member("agent", name="own-codex", runtime_id=self.entry["session_id"])
+        _ = staff.set_home(row.id, staff.SessionHome(source))
+        entry = self.entry.copy()
+        entry.update(kind="codex", config_dir=str(source), environment={"CODEX_HOME": str(target)})
+        tab = herdr.TabSession("w1:p2", row.name, "w1", row.current_session)
+        with (patch.object(os, "chdir"), patch.object(os, "execvpe", side_effect=SystemExit)):
+            with self.assertRaises(SystemExit):
+                stop_resume._exec_in_own_pane(tab, entry, "codex2", "")  # pyright: ignore[reportPrivateUsage]
+        current = staff.by_id(row.id)
+        assert current is not None
+        self.assertEqual(current.home, staff.SessionHome(target))
+
     def test_codex_own_pane_exec_has_no_prompt_and_uses_workers_home(self) -> None:
         identity = self.entry["session_id"]
         row = staff.StaffRow(staff.StaffId("saved-codex-owner"), "agent", "alpha", staff.STAFF_ROOT,
@@ -1081,7 +1102,7 @@ class StopResumeTests(unittest.TestCase):
         self.assertEqual(arguments[0], str(self.root / "bin" / "claude"))
         self.assertIn("resumed by name", arguments[-1])
         environment = cast(dict[str, str], execute.call_args.args[2])
-        self.assertEqual(environment["CLAUDE_CONFIG_DIR"], pane_launch.config_home(self.entry))
+        self.assertEqual(environment["CLAUDE_CONFIG_DIR"], str(cast(staff.SessionHome, pane_launch.config_home(self.entry)).path))
         self.assertTrue(pane_record.read("agents")["w1:p2"].get("ended", False))
         self.start.assert_not_called()
         observed = pane_record.launch("w1:p2", self.entry["session_id"], str(self.root),
@@ -1382,7 +1403,7 @@ class StopResumeTests(unittest.TestCase):
 
     def add_beta(self) -> None:
         second = pane_record.launch("w1:p4", "sid-beta", str(self.root),
-            {"CLAUDE_CONFIG_DIR": pane_launch.config_home(self.entry)}, ["claude", "-n", "beta", "--model", "opus"])
+            {"CLAUDE_CONFIG_DIR": str(self.root / ".claude3")}, ["claude", "-n", "beta", "--model", "opus"])
         self.client.rows.append({"pane_id": "w1:p4", "terminal_id": "beta-terminal", "tab_id": "w1:t7", "label": "beta", "workspace_id": "w1",
                                  "agent_session": {"kind": "id", "value": "sid-beta"}})
         pane_record.write("agents", second)
@@ -2568,7 +2589,7 @@ class StopResumeTests(unittest.TestCase):
         self.detach.assert_called()
 
     def test_resume_prepares_the_transcript_cursor_before_launch(self) -> None:
-        path = Path(pane_launch.config_home(self.entry)) / "projects" / "fixture" / f"{self.entry['session_id']}.jsonl"
+        path = Path(str(cast(staff.SessionHome, pane_launch.config_home(self.entry)).path)) / "projects" / "fixture" / f"{self.entry['session_id']}.jsonl"
         path.parent.mkdir(parents=True, exist_ok=True)
         _ = path.write_text('{"type":"assistant","message":{"content":"old context"}}\n')
         before = path.stat().st_size
@@ -3153,7 +3174,8 @@ class StopResumeTests(unittest.TestCase):
         self.assertEqual([entry["kind"] for entry in entries], ["requested", "requested", "confirmed"])
         self.assertEqual(entries[-1]["subject"], "good")
         self.assertIn("bad: move log anomaly:", output.getvalue())
-        self.assertEqual(len(output.getvalue().splitlines()), 1)
+        self.assertEqual(len(output.getvalue().splitlines()), 3)
+        self.assertEqual(output.getvalue().count("session home is unknown"), 2)
 
     def test_batch_stops_all_before_any_resume_and_uses_each_own_pane(self) -> None:
         self.add_beta()

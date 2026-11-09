@@ -166,10 +166,12 @@ def _saved_launch(entry: pane_record.PaneLaunch, identity: str, name: str) -> tu
     projected["name"] = name
     arguments = pane_record.resume_arguments(projected)
     kind = pane_launch.agent_kind(entry)
-    if kind == "codex":
-        home = pane_launch.config_home(entry)
-        return kind, {"CODEX_HOME": home}, arguments
-    return kind, named_account_environment(Path(pane_launch.config_home(entry))), arguments
+    home = pane_launch.config_home(entry)
+    if isinstance(home, staff.HomeUnknown):
+        print(f"anomaly: {identity}: session home is unknown; select the normal account", file=sys.stderr)
+        return kind, {}, arguments
+    environment = {"CODEX_HOME": str(home.path)} if kind == "codex" else named_account_environment(home.path)
+    return kind, environment, arguments
 
 
 def session_launch(identity: str, name: str) -> tuple[Literal["claude", "codex"], dict[str, str], list[str]]:

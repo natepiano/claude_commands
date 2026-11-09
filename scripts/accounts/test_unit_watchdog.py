@@ -407,7 +407,7 @@ class UnitWatchdogTests(unittest.TestCase):
         self.assertIsInstance(result, stop_resume.ClaudeUp)
         entry = pane_record.read("shared")["alpha"]
         self.assertFalse(entry.get("ended", False))
-        self.assertEqual((entry["session_id"], pane_launch.config_home(entry)), (member.id, str(config)))
+        self.assertEqual((entry["session_id"], str(cast(staff.SessionHome, pane_launch.config_home(entry)).path)), (member.id, str(config)))
         self.assertFalse(any(name.startswith("SHOWRUNNER_") for name in entry["environment"]))
         self.die("alpha")
         for minute in (0, 2, 4):
