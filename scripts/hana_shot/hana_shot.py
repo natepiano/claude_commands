@@ -12,7 +12,7 @@ from functools import partial
 import argparse
 from collections.abc import Callable, Generator
 from concurrent.futures import Future, ThreadPoolExecutor
-from contextlib import closing, contextmanager
+from contextlib import ExitStack, closing, contextmanager, nullcontext
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from difflib import get_close_matches
@@ -37,7 +37,7 @@ import tomllib
 from types import FrameType
 from typing import IO, Literal, NamedTuple, NoReturn, NotRequired, TypedDict, cast, override
 
-from scripts.lib import conf, process_group
+from scripts.lib import conf, process_group, scratch
 from scripts.lib.conf import UseConfiguredValue
 
 PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
@@ -2215,48 +2215,55 @@ def launch(port: int, worktree: str | None, binary: str | None, purpose: str = "
                     owner = row.name
         except staff.StaffUnreadable:
             pass
-    scratch = Path(tempfile.mkdtemp(prefix=f"hana-shot-{port}-"))
-    config = scratch / "config"
-    config.mkdir()
-    log = scratch / "hana.log"
-    command = [
-        "env", f"XDG_CONFIG_HOME={config}", f"BRP_EXTRAS_PORT={port}",
-        f"HANA_TEST_PURPOSE={purpose.strip()}", f"HANA_TEST_OWNER={owner}",
-        f"BEVY_ASSET_ROOT={root / 'crates' / 'hana'}", str(executable),
-    ]
-    direnv = shutil.which("direnv")
-    if direnv is not None and (root / ".envrc").exists():
-        command = [direnv, "exec", str(root), *command]
-    if sys.platform == "darwin":
-        print("hana_shot: macOS ignores XDG_CONFIG_HOME; this Hana reads your real config", file=sys.stderr)
-    with log.open("wb") as handle:
-        process = subprocess.Popen(
-            command, cwd=root, stdin=subprocess.DEVNULL, stdout=handle, stderr=subprocess.STDOUT,
-            start_new_session=True,
-        )
-    state: LaunchState = {
-        "pid": process.pid,
-        "port": port,
-        "scratch": str(scratch),
-        "log": str(log),
-        "binary": str(executable),
-        "started": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-    }
-    if uncommitted_paths:
-        state["uncommitted_paths"] = uncommitted_paths
-    state_path = launch_state_path(port)
-    state_path.parent.mkdir(parents=True, exist_ok=True)
-    _write_launch_state(state_path, state)
-    start = time.monotonic()
-    try:
-        from scripts.buildlog import record
-        _ = record.launch(state_path, root)
-        wait_ready(Brp(port, settings=hana_shot_settings), process, log)
-    except BaseException:
-        shutdown(port, process, hana_shot_settings=hana_shot_settings)
-        raise
-    print(f"hana_shot: Hana pid {process.pid} ready on port {port} in {time.monotonic() - start:.1f} s (log {log})", file=sys.stderr)
-    return state, process
+    with ExitStack() as cleanup:
+        # The app reads this folder after launch returns, so it must outlive this process.
+        # shutdown removes it; the deadline bounds a forgotten app.
+        launch_folder = scratch.new(word=f"hana-shot-{port}")
+        _ = cleanup.callback(shutil.rmtree, launch_folder, ignore_errors=True)
+        config = launch_folder / "config"
+        config.mkdir()
+        log = launch_folder / "hana.log"
+        command = [
+            "env", f"XDG_CONFIG_HOME={config}", f"BRP_EXTRAS_PORT={port}",
+            f"HANA_TEST_PURPOSE={purpose.strip()}", f"HANA_TEST_OWNER={owner}",
+            f"BEVY_ASSET_ROOT={root / 'crates' / 'hana'}", str(executable),
+        ]
+        direnv = shutil.which("direnv")
+        if direnv is not None and (root / ".envrc").exists():
+            command = [direnv, "exec", str(root), *command]
+        if sys.platform == "darwin":
+            print("hana_shot: macOS ignores XDG_CONFIG_HOME; this Hana reads your real config", file=sys.stderr)
+        process: subprocess.Popen[bytes] | None = None
+        try:
+            with log.open("wb") as handle:
+                process = subprocess.Popen(
+                    command, cwd=root, stdin=subprocess.DEVNULL, stdout=handle, stderr=subprocess.STDOUT,
+                    start_new_session=True,
+                )
+            state: LaunchState = {
+                "pid": process.pid,
+                "port": port,
+                "scratch": str(launch_folder),
+                "log": str(log),
+                "binary": str(executable),
+                "started": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            }
+            if uncommitted_paths:
+                state["uncommitted_paths"] = uncommitted_paths
+            state_path = launch_state_path(port)
+            state_path.parent.mkdir(parents=True, exist_ok=True)
+            _write_launch_state(state_path, state)
+            start = time.monotonic()
+            from scripts.buildlog import record
+            _ = record.launch(state_path, root)
+            wait_ready(Brp(port, settings=hana_shot_settings), process, log)
+            print(f"hana_shot: Hana pid {process.pid} ready on port {port} in {time.monotonic() - start:.1f} s (log {log})", file=sys.stderr)
+            _ = cleanup.pop_all()
+            return state, process
+        except BaseException:
+            if process is not None:
+                shutdown(port, process, hana_shot_settings=hana_shot_settings)
+            raise
 
 
 def wait_ready(brp: Brp, process: subprocess.Popen[bytes], log: Path) -> None:
@@ -2334,9 +2341,24 @@ def shutdown(port: int, process: subprocess.Popen[bytes] | None = None, *,
         shutdown_answered = True
     except Failure:
         pass
+    if not isinstance(launch_record, WholeLaunchRecord) and process is not None:
+        # A state-write failure can leave only the process owned by this launch.
+        try:
+            _ = process.wait(timeout=shutdown_seconds)
+        except subprocess.TimeoutExpired:
+            for signal_number in (signal.SIGTERM, signal.SIGKILL):
+                try:
+                    process_group.send_process_group(process.pid, signal_number)
+                except ProcessLookupError:
+                    break
+                time.sleep(signal_grace_seconds)
+            try:
+                _ = process.wait(timeout=signal_grace_seconds)
+            except subprocess.TimeoutExpired:
+                pass
     if isinstance(launch_record, WholeLaunchRecord):
         state = launch_record.state
-        pid = state["pid"]
+        pid = process.pid if process is not None else state["pid"]
         deadline = time.monotonic() + shutdown_seconds
         while time.monotonic() < deadline:
             if process is not None:
@@ -2346,7 +2368,7 @@ def shutdown(port: int, process: subprocess.Popen[bytes] | None = None, *,
                 break
             time.sleep(poll_seconds)
         else:
-            if same_binary(pid, state["binary"]):
+            if process is not None or same_binary(pid, state["binary"]):
                 for signal_number in (signal.SIGTERM, signal.SIGKILL):
                     try:
                         process_group.send_process_group(pid, signal_number)
@@ -2375,7 +2397,7 @@ def shutdown(port: int, process: subprocess.Popen[bytes] | None = None, *,
         print(
             f"hana_shot: launch record {state_path} is unreadable ({record.reason}); "
             + f"asked Hana on port {port} to stop and removed the record; "
-            + f"check scratch parent {tempfile.gettempdir()} for hana-shot-{port}-* folders",
+            + f"check scratch.py list for new folders, or scratch parent {tempfile.gettempdir()} for old hana-shot-{port}-* folders",
             file=sys.stderr,
         )
     if shutdown_answered or isinstance(launch_record, WholeLaunchRecord):
@@ -2818,66 +2840,67 @@ def views_check(args: Arguments, path: Path, invocation: InProgressCaptureInvoca
         raise Refused(f"no view named {', '.join(missing)} in {path}")
     invocation.shot = with_overrides(shot_from_view(names[0], views[names[0]], hana_shot_settings=hana_shot_settings), args, hana_shot_settings=hana_shot_settings)
     invocation.orientation = invocation.shot.orientation
-    out = args.out or tempfile.mkdtemp(prefix="hana-shot-check-")
     failures: list[str] = []
     passed: list[str] = []
     with (
-        instance(args.port, args.launch, args.shutdown, args.worktree, args.binary, args.purpose, args.owner, hana_shot_settings=hana_shot_settings) as brp,
-        closing(Session(brp, args.remote)) as session,
-    ):
-        _ = session.start()
-        sha = git_sha(path.parent, hana_shot_settings=hana_shot_settings)
-        today = datetime.now().strftime("%Y-%m-%d")
-        for name, final in zip(names, output_paths(out, names, hana_shot_settings=hana_shot_settings), strict=True):
-            shot = with_overrides(shot_from_view(name, views[name], hana_shot_settings=hana_shot_settings), args, hana_shot_settings=hana_shot_settings)
-            invocation.shot = shot
-            invocation.orientation = shot.orientation
-            started_ns = time.time_ns()
-            try:
-                result = take(session, shot, final)
-            except (Refused, Failure, CaptureTimeout) as exc:
-                reason = failure_reason(exc)
-                invocation.attempts.append(failed_attempt(shot, final, reason, started_ns, str(exc)))
-                invocation.failures.append(CaptureFailure(reason, f"{name}: {exc}"))
-                failures.append(f"FAIL {name}: {exc}")
-                print(failures[-1], file=sys.stderr)
-                continue
-            window = session.last_state.size if session.last_state else (0, 0)
-            try:
-                peak = brightest(result.path)
-            except Failure as exc:
-                reason = failure_reason(exc)
-                invocation.attempts.append(failed_attempt(shot, result.path, reason, started_ns, str(exc)))
-                invocation.failures.append(CaptureFailure(reason, f"{name}: {exc}"))
-                failures.append(f"FAIL {name}: {exc}")
-                print(failures[-1], file=sys.stderr)
-                continue
-            if peak < hana_shot_settings.number("black_maximum"):
-                error = f"the shot is black (brightest {peak:.3f}) at {result.path}"
-                invocation.attempts.append(failed_attempt(shot, result.path, FailureReason.BLACK_CAPTURE, started_ns, error))
-                invocation.failures.append(CaptureFailure(FailureReason.BLACK_CAPTURE, f"{name}: {error}"))
-                failures.append(f"FAIL {name}: {error}")
-                print(failures[-1], file=sys.stderr)
-                continue
-            if result.width < 2 or result.height < 2:
-                error = f"the crop is empty ({result.width}x{result.height})"
-                invocation.attempts.append(failed_attempt(shot, result.path, FailureReason.EMPTY_CROP, started_ns, error))
-                invocation.failures.append(CaptureFailure(FailureReason.EMPTY_CROP, f"{name}: {error}"))
-                failures.append(f"FAIL {name}: {error}")
-                print(failures[-1], file=sys.stderr)
-                continue
-            timing = timing_record(result, brp.port, sha, session.frame_ms, window, args.remote)
-            invocation.successful_timings.append(timing)
-            invocation.attempts.append({
-                **timing, "status": "success", "image_paths": [str(result.path)],
-            })
-            views[name]["verified"] = {"sha": sha, "date": today}
-            passed.append(name)
-            print(f"PASS {name} {result.width}x{result.height} {result.phases['total_ms']:.0f} ms {result.path}")
-    if passed:
-        write_views(path, views)
-    if args.out is None:
-        shutil.rmtree(out, ignore_errors=True)
+        nullcontext(args.out) if args.out is not None
+        else tempfile.TemporaryDirectory(prefix="hana-shot-check-")
+    ) as out:
+        with (
+            instance(args.port, args.launch, args.shutdown, args.worktree, args.binary, args.purpose, args.owner, hana_shot_settings=hana_shot_settings) as brp,
+            closing(Session(brp, args.remote)) as session,
+        ):
+            _ = session.start()
+            sha = git_sha(path.parent, hana_shot_settings=hana_shot_settings)
+            today = datetime.now().strftime("%Y-%m-%d")
+            for name, final in zip(names, output_paths(out, names, hana_shot_settings=hana_shot_settings), strict=True):
+                shot = with_overrides(shot_from_view(name, views[name], hana_shot_settings=hana_shot_settings), args, hana_shot_settings=hana_shot_settings)
+                invocation.shot = shot
+                invocation.orientation = shot.orientation
+                started_ns = time.time_ns()
+                try:
+                    result = take(session, shot, final)
+                except (Refused, Failure, CaptureTimeout) as exc:
+                    reason = failure_reason(exc)
+                    invocation.attempts.append(failed_attempt(shot, final, reason, started_ns, str(exc)))
+                    invocation.failures.append(CaptureFailure(reason, f"{name}: {exc}"))
+                    failures.append(f"FAIL {name}: {exc}")
+                    print(failures[-1], file=sys.stderr)
+                    continue
+                window = session.last_state.size if session.last_state else (0, 0)
+                try:
+                    peak = brightest(result.path)
+                except Failure as exc:
+                    reason = failure_reason(exc)
+                    invocation.attempts.append(failed_attempt(shot, result.path, reason, started_ns, str(exc)))
+                    invocation.failures.append(CaptureFailure(reason, f"{name}: {exc}"))
+                    failures.append(f"FAIL {name}: {exc}")
+                    print(failures[-1], file=sys.stderr)
+                    continue
+                if peak < hana_shot_settings.number("black_maximum"):
+                    error = f"the shot is black (brightest {peak:.3f}) at {result.path}"
+                    invocation.attempts.append(failed_attempt(shot, result.path, FailureReason.BLACK_CAPTURE, started_ns, error))
+                    invocation.failures.append(CaptureFailure(FailureReason.BLACK_CAPTURE, f"{name}: {error}"))
+                    failures.append(f"FAIL {name}: {error}")
+                    print(failures[-1], file=sys.stderr)
+                    continue
+                if result.width < 2 or result.height < 2:
+                    error = f"the crop is empty ({result.width}x{result.height})"
+                    invocation.attempts.append(failed_attempt(shot, result.path, FailureReason.EMPTY_CROP, started_ns, error))
+                    invocation.failures.append(CaptureFailure(FailureReason.EMPTY_CROP, f"{name}: {error}"))
+                    failures.append(f"FAIL {name}: {error}")
+                    print(failures[-1], file=sys.stderr)
+                    continue
+                timing = timing_record(result, brp.port, sha, session.frame_ms, window, args.remote)
+                invocation.successful_timings.append(timing)
+                invocation.attempts.append({
+                    **timing, "status": "success", "image_paths": [str(result.path)],
+                })
+                views[name]["verified"] = {"sha": sha, "date": today}
+                passed.append(name)
+                print(f"PASS {name} {result.width}x{result.height} {result.phases['total_ms']:.0f} ms {result.path}")
+        if passed:
+            write_views(path, views)
     print(f"hana_shot: {len(passed)} passed, {len(failures)} failed; stamped {len(passed)} in {path}", file=sys.stderr)
     return 1 if failures else 0
 

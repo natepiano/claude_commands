@@ -29,7 +29,6 @@ REMOVE_RUN_SCRATCH = Path(__file__).with_name("remove_run_scratch.py")
 class EndSessionTests(unittest.TestCase):
     """Run cleanup keeps other directors' files."""
 
-    temporary: tempfile.TemporaryDirectory[str]  # pyright: ignore[reportUninitializedInstanceVariable]
     root: Path  # pyright: ignore[reportUninitializedInstanceVariable]
     session_dir: Path  # pyright: ignore[reportUninitializedInstanceVariable]
     marker: Path  # pyright: ignore[reportUninitializedInstanceVariable]
@@ -41,8 +40,7 @@ class EndSessionTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         _ = self.enterContext(fake_cargo_output_roots(children=True))
-        self.temporary = tempfile.TemporaryDirectory()
-        self.root = Path(self.temporary.name)
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         self.session_dir = self.root / "run"
         self.session_dir.mkdir()
         session_id = fixture_runtime_id(f"end-session:{self.root.name}")
@@ -89,7 +87,6 @@ class EndSessionTests(unittest.TestCase):
     @override
     def tearDown(self) -> None:
         self.marker.unlink(missing_ok=True)
-        self.temporary.cleanup()
 
     def environment(self) -> dict[str, str]:
         environment = {name: value for name, value in os.environ.items()
