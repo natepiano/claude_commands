@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import io
 import os
+from collections import Counter
 from contextlib import redirect_stdout
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
@@ -90,6 +91,9 @@ class MemoryFeedTests(unittest.TestCase):
         self.output = self.root / "page"
         self.configuration = self.root / "memory_feed.conf"
         self.configure()
+        proc = self.root / "proc"
+        proc.mkdir()
+        _ = (proc / "meminfo").write_text("SwapTotal: 8388608 kB\nSwapFree: 8388608 kB\n")
         _ = (self.root / "buildlog.conf").write_text("# whole: 1..\nTOP_COST_RECENT_DAYS=3\n")
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
             "CONF_DIR": str(self.root),
@@ -104,6 +108,7 @@ class MemoryFeedTests(unittest.TestCase):
         _ = self.enterContext(mock.patch.object(memory_feed, "host_name", return_value="fixture"))
         _ = self.enterContext(mock.patch.object(memory_feed, "PROC", self.root / "proc"))
         _ = self.enterContext(mock.patch.object(memory_feed, "CI_CGROUP", self.root / "ci"))
+        _ = self.enterContext(mock.patch.object(memory_feed, "CGROUP", self.root / "cgroup"))
         _ = self.enterContext(mock.patch.object(charts, "page_data", return_value=report_fixture()))
 
     def configure(self, *, seconds: float = 0.125) -> None:
@@ -267,6 +272,131 @@ class MemoryFeedTests(unittest.TestCase):
         self.assertEqual(report.zone, "America/New_York")
         self.assertEqual(report.start, "2026-11-04T19:00:00-05:00")
         self.assertEqual(report.end, "2026-11-07T19:00:00-05:00")
+
+    def cgroup(self, name: str, swapped: int) -> Path:
+        path = self.root / "cgroup" / name
+        path.mkdir(parents=True, exist_ok=True)
+        _ = (path / "memory.swap.current").write_text(str(swapped))
+        return path
+
+    def host_swap(self, total: int, used: int) -> None:
+        _ = (self.root / "proc/meminfo").write_text(
+            f"SwapTotal: {total // 1024} kB\nSwapFree: {(total - used) // 1024} kB\n")
+
+    def test_swap_accounts_for_the_host_and_names_the_agent_owner_once(self) -> None:
+        self.host_swap(32 * gate.GIB, 20 * gate.GIB)
+        _ = self.cgroup("user.slice", 16 * gate.GIB)
+        user = "user.slice/user@1000.service"
+        _ = self.cgroup(user, 15 * gate.GIB)
+        _ = self.cgroup(user + "/app.slice", 12 * gate.GIB)
+        _ = self.cgroup(user + "/app.slice/app-agents.slice", 10 * gate.GIB)
+        agent = self.cgroup(user + "/app.slice/app-agents.slice/first.scope", 4 * gate.GIB)
+        _ = self.cgroup(user + "/app.slice/app-agents.slice/second.scope", 6 * gate.GIB)
+        _ = self.cgroup(user + "/app.slice/app-browser.scope", 2 * gate.GIB)
+        _ = self.cgroup(user + "/session.slice", 2 * gate.GIB)
+        _ = self.cgroup(user + "/builds.slice", gate.GIB)
+        scope = self.cgroup(user + "/builds.slice/run.scope", gate.GIB)
+        _ = self.cgroup("system.slice", 2 * gate.GIB)
+        _ = self.cgroup("hana.slice", gate.GIB)
+        queued = reservation_reading().view.running[0]
+        memory = queued.measured
+        assert isinstance(memory, gate.MeasuredMemory)
+        queued = replace(queued, measured=replace(memory, anonymous_source=gate.ScopeSource(scope, frozenset())))
+        reads: Counter[Path] = Counter()
+        original = Path.read_text
+
+        def read(path: Path) -> str:
+            reads[path] += 1
+            return original(path)
+
+        with mock.patch.object(Path, "read_text", new=read):
+            swap = memory_feed.read_swap((queued, queued), {}, 6)
+        assert isinstance(swap, memory_feed.SwapReading)
+        rows = {row["name"]: row for row in swap.rows}
+        self.assertEqual(rows["agent sessions (2)"]["bytes"], 10 * gate.GIB)
+        self.assertEqual(rows["other apps: browser"]["bytes"], 2 * gate.GIB)
+        self.assertEqual(rows["desktop session"]["bytes"], 2 * gate.GIB)
+        self.assertEqual(rows["system services"]["bytes"], 2 * gate.GIB)
+        self.assertEqual(rows["hana CI"]["bytes"], gate.GIB)
+        self.assertEqual(rows[queue_lines.step_text(queued, RECORDED_STEP_NAMES)]["bytes"], gate.GIB)
+        self.assertEqual(rows["not in a group"]["bytes"], gate.GIB)
+        self.assertEqual(rows["not attributed"]["bytes"], gate.GIB)
+        self.assertEqual(rows["Total"]["bytes"], swap.used)
+        self.assertEqual(sum(row["bytes"] for row in swap.rows if row["kind"] != "total"), swap.used)
+        self.assertEqual(swap.files_read, sum(reads.values()))
+        self.assertTrue(all(count == 1 for count in reads.values()))
+        self.assertNotIn(agent / "memory.swap.current", reads)
+
+    def test_swap_keeps_the_unattributed_bytes_without_rounding_them_away(self) -> None:
+        self.host_swap(2 ** 20, 2 ** 20)
+        _ = self.cgroup("system.slice", 2 ** 20 - 7)
+        swap = memory_feed.read_swap((), {}, 6)
+        assert isinstance(swap, memory_feed.SwapReading)
+        residual = next(row for row in swap.rows if row["kind"] == "unattributed")
+        self.assertEqual(residual["bytes"], 7)
+        self.assertEqual(sum(row["bytes"] for row in swap.rows[:-1]), swap.used)
+        self.assertIn("not attributed: 7 B", memory_feed.swap_text(swap.rows))
+
+    def test_swap_exposes_a_signed_counter_difference_without_changing_owner_values(self) -> None:
+        self.host_swap(2 ** 20, 2 ** 20)
+        _ = self.cgroup("system.slice", 2 ** 20 + 7)
+        swap = memory_feed.read_swap((), {}, 6)
+        assert isinstance(swap, memory_feed.SwapReading)
+        self.assertEqual(swap.rows[0]["bytes"], 2 ** 20 + 7)
+        residual = next(row for row in swap.rows if row["kind"] == "unattributed")
+        self.assertEqual(residual["bytes"], -7)
+        self.assertEqual(sum(row["bytes"] for row in swap.rows[:-1]), swap.used)
+
+    def test_swap_names_ci_instead_of_the_raw_service_step(self) -> None:
+        self.host_swap(2 * gate.GIB, gate.GIB)
+        _ = self.cgroup("hana.slice", gate.GIB)
+        path = self.cgroup("hana.slice/hana-ci.slice", gate.GIB)
+        step = gate.RunningStep("", "hana-ci.slice", "service", str(path), 0,
+            gate.UnownedSliceMemory(gate.GIB, cgroup=str(path), owner="hana-ci.slice",
+                                    pid=gate.PidNotRecorded(), job_state=IdleService()), pid=gate.PidNotRecorded())
+        swap = memory_feed.read_swap((step,), {}, 6)
+        assert isinstance(swap, memory_feed.SwapReading)
+        self.assertEqual(swap.rows[0]["name"], "hana CI")
+        self.assertEqual(swap.rows[0]["bytes"], gate.GIB)
+
+    def test_swap_names_between_steps_owners_in_the_shared_rows(self) -> None:
+        self.host_swap(4 * gate.GIB, 2 * gate.GIB)
+        _ = self.cgroup("builds.slice", 2 * gate.GIB)
+        steps: list[gate.RunningStep] = []
+        labels = {name: unit_labels.UnitLabels(name) for name in ("owner-a", "owner-b")}
+        for owner in labels:
+            path = self.cgroup("builds.slice/" + owner + ".scope", gate.GIB)
+            steps.append(gate.RunningStep(owner, owner, "between steps", str(path), 0,
+                gate.UnownedSliceMemory(gate.GIB, cgroup=str(path), owner=owner, pid=gate.PidNotRecorded()),
+                pid=gate.PidNotRecorded()))
+        swap = memory_feed.read_swap(steps, labels, 6)
+        assert isinstance(swap, memory_feed.SwapReading)
+        self.assertEqual({row["name"] for row in swap.rows if row["kind"] == "owner"}, set(labels))
+        self.assertTrue(all("between steps" in row["detail"] for row in swap.rows if row["kind"] == "owner"))
+
+    def test_swap_small_groups_and_total_use_the_same_current_host_reading(self) -> None:
+        self.host_swap(4 * gate.GIB, 3 * gate.GIB)
+        for number in range(3):
+            _ = self.cgroup(f"owner-{number}.slice", gate.GIB // 2)
+        with mock.patch.object(admission_client, "view", return_value=captured_reading()):
+            page = memory_feed.reading(replace(memory_feed.read_configuration(), swap_rows=1))
+        self.assertEqual(page["swap_used"], 3)
+        self.assertEqual(page["swap_total"], 4)
+        self.assertEqual([row["kind"] for row in page["swap_by"]], ["owner", "smaller", "unattributed", "total"])
+        self.assertEqual(sum(row["bytes"] for row in page["swap_by"][:-1]), 3 * gate.GIB)
+        self.assertEqual(page["swap_by"][1]["bytes"], gate.GIB)
+
+    def test_between_steps_holds_name_their_distinct_owners(self) -> None:
+        reading = captured_reading()
+        room = reading.explanation.room
+        assert isinstance(room, gate.MemoryRoom)
+        holds = tuple(gate.RunKeepAside(gate.RunMemory(owner, gate.GIB, gate.AnonymousRunUse(0)), gate.GIB)
+                      for owner in ("owner-a", "owner-b", "owner-c"))
+        reading = replace(reading, explanation=replace(reading.explanation, room=replace(room, runs=holds)))
+        with mock.patch.object(admission_client, "view", return_value=reading):
+            page = memory_feed.reading()
+        self.assertEqual({row["name"] for row in page["walk"]}, {"owner-a", "owner-b", "owner-c"})
+        self.assertTrue(all(row["detail"] == "between steps" for row in page["walk"]))
 
     def test_pressure_failure_names_the_path_without_the_python_error(self) -> None:
         values = memory_feed.read_stalls()
