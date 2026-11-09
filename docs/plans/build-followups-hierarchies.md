@@ -826,28 +826,21 @@ A read-only report. It went to the sdlc showrunner on 2026-11-09, grouped by pro
 
 **Depends on:** Phase 33, and the panes unit's close-at-once phase (the worker close at DONE) merged into sdlc.
 
-#### Work Order
+#### As-built
 
-**Goal:** when a worker's assignment ends with DONE, every folder it made with `scratch.py new --worker` is removed.
-
-**Spec:**
-- Merge origin/sdlc after the panes close-at-once phase lands there.
-- In the panes close path that runs at DONE, add one call: `scratch.py end --task <the worker task>` for that worker. It removes only that worker's folders. A failed end prints one line and does not stop the close.
-- Add a row to the existing close-path test: a worker folder made before DONE is gone after the close.
-- Worker prompt rule, remote case (sdlc showrunner, 2026-11-09: a hana worker built a 10G clone in the Mac `~/.cache` and removed nothing). Add this sentence after the phase 33 rule in `docs/direct/write_prompt_contract.md` and in `config/review/code.md`: "A folder or file you make on another machine (the Mac) follows the same rule: make it in a `with` block or a `scratch.py` task with an end, and never use a fixed path such as `~/.cache`."
-- Director rule, remote case (sdlc showrunner, 2026-11-09: the cargo-liner `~/.cache` leftovers on the Mac came from one-off director commands). Add one bullet to <ToolingContract/> in `commands/unit/direct.md`: "A folder or file you make on another machine (the Mac) belongs to a `with` block or a `scratch.py` task with an end. Never use a fixed path such as `~/.cache`."
-- Add no check or scan.
+- `_finish_completion` in `scripts/herdr/turn_end.py` ends `scratch.worker_task(row.id)` before the pane close. Only that worker's folders go. A failed end adds one line to the notice details and does not stop the close.
+- The worker prompt rule in `docs/direct/write_prompt_contract.md` and `config/review/code.md`, and the director rule in `commands/unit/direct.md`, cover a folder or file made on another machine: a `with` block or a `scratch.py` task with an end, and never a fixed path such as `~/.cache`.
+- `WorkerCommandTests` owns its scratch settings, so the close path reads no live scratch state in a test.
 
 **Files:**
-- `scripts/herdr/turn_end.py` — the close at DONE (about line 192, where `worker_panes.close` runs); the panes phase may move it, then follow it — one end call.
-- `scripts/herdr/test_turn_end.py` — one row.
-- `docs/direct/write_prompt_contract.md` — the remote sentence.
-- `config/review/code.md` — the remote sentence.
-- `commands/unit/direct.md` — the director bullet.
+- `scripts/herdr/turn_end.py` — the end call in the close path.
+- `scripts/herdr/test_turn_end.py` — a worker folder goes at the close, and a peer folder stays.
+- `scripts/production/test_worker.py` — the fixture's scratch settings.
+- `scripts/direct/test_assign_launcher.py` — the failed-launch test gives its children the fixture host.
+- `docs/direct/write_prompt_contract.md`, `config/review/code.md`, `commands/unit/direct.md` — the remote rule.
 
-**Workers:** 1 writer; one call, one test row and one sentence in three docs.
-- `impl` — all five files.
+**Gotchas:**
+- The native turn-end hook child runs with stderr discarded. Only the notice details reach the director.
+- `StaffTestCase` patches the host in process only. A test whose child processes read staff rows needs `foreign_hostname` with `GATE_TEST_HOST`.
 
-**State:** none.
-
-**Acceptance gate:** the targeted test is green; basedpyright reports 0 on the changed files.
+**Ruled out:** a check or scan for leftover worker folders (the user allows no added check).
