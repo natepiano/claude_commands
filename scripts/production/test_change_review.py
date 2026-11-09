@@ -1868,11 +1868,25 @@ class CommitTest(unittest.TestCase):
         self.assertEqual(self.git("status", "--porcelain"), "")
 
     def test_a_verdict_commits_the_list(self) -> None:
-        _ = run("add", "--production", DOC, "--list", str(self.path), "--change", "A", "--check", "B", "--see", "C")
-        self.assertEqual(run("verdict", "--production", DOC, "--list", str(self.path), "--row", "C1", "--verdict", "works"),
-                         (0, "C1 landed\n", ""))
-        self.assertEqual(self.last(), ("change-review: hana verdict C1", ["change-review/change-review - hana.md"]))
-        self.assertIn("| C1 | A | works |", self.git("show", "HEAD:change-review/change-review - hana.md"))
+        for row, held in (("C1", False), ("C2", True)):
+            with self.subTest(held=held):
+                _ = run("add", "--production", DOC, "--list", str(self.path), "--change", "A", "--check", "B", "--see", "C")
+                command = ("verdict", "--production", DOC, "--list", str(self.path), "--row", row, "--verdict", "works")
+                lock = self.repo / ".git/index.lock"
+                if held:
+                    _ = lock.write_text("", encoding="utf-8")
+                code, output, error = run(*command)
+                self.assertEqual((code, output), (0, f"{row} landed\n"))
+                if held:
+                    self.assertIn(f"change review: {self.path} written but not committed: ", error)
+                    self.assertEqual(len(error.splitlines()), 1)
+                    lock.unlink()
+                    code, output, error = run(*command)
+                    self.assertEqual(code, 0)
+                    self.assertIn("already has this verdict", output)
+                self.assertEqual(error, "")
+                self.assertEqual(self.last(), (f"change-review: hana verdict {row}", ["change-review/change-review - hana.md"]))
+                self.assertIn(f"| {row} | A | works |", self.git("show", "HEAD:change-review/change-review - hana.md"))
 
     def test_unchanged_edit_keeps_list_bytes_timestamp_and_git_history(self) -> None:
         _ = change_review.append_rows(self.path, [GRID], date(2026, 10, 15), "216c4e1d", PRODUCTION, record=staff.snapshot())
