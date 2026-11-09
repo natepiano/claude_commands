@@ -69,6 +69,7 @@ class QueueTests(NotificationGuardedTestCase):
         write_memory_config(config)
         self.enterContext(mock.patch.dict(os.environ, {"COLUMNS": "100", "CONF_DIR": str(config.parent)}))
         self.enterContext(mock.patch.dict(os.environ, {"MAC_IDLE_STATE_DIR": str(self.root / "mac-idle")}))
+        _ = self.enterContext(mock.patch.object(os, "cpu_count", return_value=17))
 
     @staticmethod
     def entry(session: str, name: str) -> tuple[str, UnitLabels]:

@@ -48,6 +48,7 @@ class FakeGateAws:
         self.upload_error: str = ''
         self.upload_timeout: bool = False
         self.launch_timeouts: int = 0
+        self.read_timeouts: int = 0
 
     def __call__(self, arguments: Sequence[str], **_options: object) -> subprocess.CompletedProcess[str]:
         args = list(arguments)
@@ -73,6 +74,9 @@ class FakeGateAws:
             error = self.refusals.pop(0) if self.refusals else ''
             reply = {'Instances': [{'InstanceId': 'i-fixture'}]}
         elif operation == 'get-object':
+            if self.read_timeouts:
+                self.read_timeouts -= 1
+                raise subprocess.TimeoutExpired('aws s3api get-object', 30)
             key_at = args.index('--key') + 1
             key, destination = args[key_at], Path(args[key_at + 1])
             if key.endswith('/gate.log') and self.has_log:
@@ -149,6 +153,15 @@ class CloudGateTests(CostFixture):
         self.assertIsInstance(self.book.read_snapshot().gate_reservations[0].state, ledger.GateTerminated)
         self.assertTrue(self.fake.terminated)
 
+    def test_poll_read_timeout_retries_and_completes(self) -> None:
+        self.fake.read_timeouts = 1
+        self.assertEqual(self.execute()['status'], 'complete')
+        reads = [command[command.index('--key') + 1] for command in self.fake.commands if 'get-object' in command]
+        self.assertEqual(reads[:2], ['artifacts/attempt/gate.log', 'artifacts/attempt/gate.log'])
+        self.assertIn('artifacts/attempt/result.json', reads)
+        self.assertEqual(len(self.fake.launches), 1)
+        self.assertTrue(self.fake.terminated)
+
     def test_worker_sigterm_during_result_poll_terminates_launched_instance(self) -> None:
         cloud_gate.save(self.folder / 'deployment.json', self.deployment)
         script = '''import json, signal, sys
@@ -184,6 +197,8 @@ with (mock.patch.object(cloud_gate, 'AwsCli', return_value=api),
         self.assertEqual(reply.returncode, 143, reply.stderr)
         self.assertEqual(self.book.read_snapshot().gate_reservations[0].state,
                          ledger.GateTerminated(int(self.now), 'i-fixture'))
+        self.assertEqual(cloud_gate.read(self.folder / 'outcome.json'), {
+            'status': 'fallback', 'reason': 'The worker stopped, so its instance was terminated'})
 
     def test_each_log_download_publishes_module_progress(self) -> None:
         self.fake.log = ('Runner: 1 modules, whole machine, 32 CPUs\n'

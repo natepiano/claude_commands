@@ -28,9 +28,17 @@ const base = readings.good;
 base.walk.find(row => row.queued).progress = {kind:'RowProgress', phase:'testing', done:8, total:10, percent:80, unit:'modules'};
 base.walk.find(row => row.queued).unit = 'fixture-unit';
 base.walk.find(row => row.queued).showrunner = 'fixture-production';
-base.swap_by = Array.from({length:31}, (_, index) => ({name:'group '+index, detail:'fixture owner', swap:(31-index)/64}));
+const swapOwners = Array.from({length:31}, (_, index) => ({name:'group '+index, detail:'fixture owner',
+  kind:'owner', bytes:(31-index)*1024**3/64, swap:(31-index)/64}));
+const smaller = swapOwners.slice(base.swap_rows);
+const groupedBytes = smaller.reduce((sum,row)=>sum+row.bytes,0);
 base.swap_total = 8;
-base.swap_used = base.swap_by.reduce((sum,row) => sum+row.swap,0);
+base.swap_used = (swapOwners.reduce((sum,row)=>sum+row.bytes,0)+1031)/1024**3;
+base.swap_by = [...swapOwners.slice(0,base.swap_rows),
+  {name:smaller.length+' smaller groups',detail:'fixture owners',kind:'smaller',bytes:groupedBytes,swap:groupedBytes/1024**3},
+  {name:'not in a group',detail:'user.slice',kind:'ungrouped',bytes:1024,swap:1024/1024**3},
+  {name:'not attributed',detail:'Host swap minus the named groups.',kind:'unattributed',bytes:7,swap:7/1024**3},
+  {name:'Total',detail:'SwapTotal minus SwapFree',kind:'total',bytes:base.swap_used*1024**3,swap:base.swap_used}];
 readings.shrink = structuredClone(base);
 const extra = structuredClone(base.walk.find(row => row.queued));
 extra.name = 'second nextest'; extra.pid = 222;
@@ -130,7 +138,8 @@ try {
     return result.result.value;
   };
   await call('Page.enable');
-  await call('Page.addScriptToEvaluateOnNewDocument', {source:'window.setInterval = () => 0;'});
+  await call('Page.addScriptToEvaluateOnNewDocument', {
+    source:'window.proofSetInterval = window.setInterval; window.setInterval = () => 0;'});
   await call('Emulation.setEmulatedMedia', {features:[{name:'prefers-color-scheme',value:'dark'}]});
   await call('Emulation.setDeviceMetricsOverride', {width:1600,height:1200,deviceScaleFactor:1,mobile:false});
   const loaded = new Promise(resolve => events.set(`${sessionId}:Page.loadEventFired`, resolve));
@@ -226,6 +235,7 @@ try {
           cardColor:color('--card'), reservedColors:[color('--res-a'),color('--res-b')],
           reservedRatios:['--res-a','--res-b'].map(name=>contrast(color(name),color('--card'))),
           swapRows:swap.length, swapText:swap.map(e=>e.textContent),
+          swapBytes:swap.map(e=>Number(e.dataset.bytes)),
           swapContrast:small?contrast(getComputedStyle(small).color,color('--card')):null,
           swapBaseline:small?rect(small).bottom-rect(small.parentElement.querySelector('.name')).bottom:0,
           gauges, lower, values,
@@ -238,7 +248,7 @@ try {
         };
         return metrics;
       })()`);
-      assert.deepEqual(proof.headings, ['Step','Duration','Machine','Unit','Pid']);
+      assert.deepEqual(proof.headings, ['#','Step','Duration','Machine','vCPU','Unit','Pid']);
       assert.equal(proof.machine, 'fixture');
       assert.match(proof.room, /GiB/);
       for (const age of ['45 min','19 h','2 d']) assert.ok(proof.leftover.includes(age), age);
@@ -253,9 +263,13 @@ try {
       assert.ok(proof.progress && proof.progress.width > 0, 'The progress line is absent.');
       assert.ok(proof.progress.height <= 3, 'The progress line is too thick.');
       assert.ok(proof.progress.right <= proof.capLine.left + 1, 'The progress line crosses the cap.');
-      assert.equal(proof.swapRows, base.swap_rows + 1);
-      assert.match(proof.swapText.at(-1), /25 smaller groups/);
-      assert.match(proof.swapText.at(-1), /5\.1 GiB/);
+      assert.equal(proof.swapRows, base.swap_rows + 4);
+      assert.match(proof.swapText[base.swap_rows], /25 smaller groups/);
+      assert.match(proof.swapText[base.swap_rows], /5\.1 GiB/);
+      assert.match(proof.swapText.at(-2), /not attributed7 B/);
+      assert.match(proof.swapText.at(-1), /Total7\.8 GiB/);
+      assert.equal(proof.swapBytes.slice(0,-1).reduce((sum,bytes)=>sum+bytes,0),proof.swapBytes.at(-1));
+      assert.equal(proof.swapBytes.at(-1),base.swap_used*1024**3);
       assert.ok(!proof.legacySwapBar, 'The page repeats the swap bar.');
       assert.equal(proof.swapBars, 3);
       for (const ratio of proof.reservedRatios) assert.ok(ratio >= 3, 'The reservation contrast is below 3:1.');
@@ -266,7 +280,7 @@ try {
       assert.equal(proof.reservedAmount,proof.dimColor);
       assert.ok(!proof.owner.includes('fixture-unit'), 'The page repeats the unit beside the name.');
       assert.ok(proof.amountHeader.includes('Used · reserved'), 'The memory amounts have no header.');
-      assert.ok(proof.scroll <= proof.client, 'The page overflows.');
+      assert.ok(proof.scroll <= proof.client, 'The page overflows. '+JSON.stringify({theme,width,scroll:proof.scroll,client:proof.client}));
       const roomLegend=proof.values.find(row=>row.label==='Next step room');
       assert.ok(Math.abs(roomLegend.labelBox.top-roomLegend.value.top)<2, 'The room value uses a second line.');
       assert.ok(roomLegend.value.left-roomLegend.labelBox.right<80, 'The legend value is too far from its label.');
@@ -302,6 +316,33 @@ try {
       checkPixel((point.box.left+point.box.right)/2,(point.box.top+point.box.bottom)/2,point.color,'The report pixels differ.',true);
       proofs.push({theme,width,metrics:proof});
 
+      proof.swapRefresh=await evaluate(`(async () => {
+        const originalFetch=window.fetch, originalRender=window.render;
+        const data=structuredClone(latest);
+        const states=[];
+        document.querySelector('#swaprows .smaller details').open=true;
+        try {
+          window.render=window.renderReading;
+          window.fetch=async()=>({ok:true,json:async()=>structuredClone(data)});
+          await new Promise((resolve,reject)=>{
+            const timer=window.proofSetInterval(async()=>{
+              try {
+                const index=data.swap_by.findIndex(row=>row.kind==='smaller');
+                data.swap_by.splice(states.length+1,0,data.swap_by.splice(index,1)[0]);
+                await tick();
+                states.push(document.querySelector('#swaprows .smaller details').open);
+                if(states.length===2) { clearInterval(timer); resolve(); }
+              } catch(error) { clearInterval(timer); reject(error); }
+            },SECONDS*1000);
+          });
+          document.querySelector('#swaprows .smaller details').open=false;
+          window.renderReading(data);
+          return {states,closed:!document.querySelector('#swaprows .smaller details').open};
+        } finally { window.fetch=originalFetch; window.render=originalRender; }
+      })()`);
+      assert.deepEqual(proof.swapRefresh,{states:[true,true],closed:true},
+        'The smaller-owner list loses its state across two refreshes or a row move.');
+
       await evaluate(`(() => {
         document.querySelector('#history-machine').value='fixture';
         document.querySelector('#history-cause').value='Cold rebuilds';
@@ -333,6 +374,60 @@ try {
         const unit=document.querySelector('#history-unit');unit.value='daily';
         unit.dispatchEvent(new Event('change'));
       })()`);
+
+      for(const [name,lateAge,modules,failed] of [
+        ['cloud','2 min','7 of 12 modules','1 failed module'],
+        ['cloud_zero','2 d','123456 of 999999 modules','123456 failed modules']]) {
+      await show(readings[name]);
+      const cloudRow=readings[name].walk.find(row=>row.kind==='cloud');
+      assert.equal(cloudRow.late_age,lateAge);
+      assert.ok(!cloudRow.status.includes('no update for'),'The feed mixes the state and late age.');
+      const cloudProof=await evaluate(`(() => {
+        const table=document.querySelector('.walk-table');
+        const rows=[...table.querySelectorAll('tbody tr')];
+        const running=rows.find(row=>row.textContent.includes('700001'));
+        const waiting=rows.find(row=>row.textContent.includes('700002'));
+        const details=row=>row?document.querySelector('.wrow[data-tip="'+row.dataset.tip+'"]'):null;
+        const runningDetails=details(running),waitingDetails=details(waiting);
+        const cloudText=(running?.textContent || '')+' '+(runningDetails?.textContent || '');
+        const stale=[...(runningDetails?.querySelectorAll('*') || [])].find(element=>
+          element.childElementCount===0 && element.textContent.includes('no update for'));
+        return {headings:[...table.querySelectorAll('thead th')].map(e=>e.textContent),
+          running:cloudText,waiting:(waiting?.textContent || '')+' '+(waitingDetails?.textContent || ''),
+          machine:running?.querySelector('.machine')?.textContent,
+          place:waiting?.querySelector('.place')?.textContent,
+          waitingMachine:waiting?.querySelector('.machine')?.textContent,
+          waitingVcpus:waiting?.querySelector('.vcpus')?.textContent,
+          vcpus:running?.querySelector('.vcpus')?.textContent,
+          cloudCard:!!document.querySelector('#cloud'),
+          statusInTable:!!running && !!waiting,
+          cloudMemory:!!runningDetails?.querySelector('.row-progress,.reserved-amount,.used-amount,.b'),
+          localMemory:!!document.querySelector('.wrow .track .seg-used'),
+          staleColor:stale?getComputedStyle(stale).color:null,
+          errorColor:(() => {const span=document.createElement('span');span.style.color='var(--cap)';
+            document.body.append(span);const color=getComputedStyle(span).color;span.remove();return color;})(),
+          slots:document.querySelector('#walk').closest('.card').textContent,
+          scroll:document.documentElement.scrollWidth,client:document.documentElement.clientWidth};
+      })()`);
+      assert.deepEqual(cloudProof.headings,['#','Step','Duration','Machine','vCPU','Unit','Pid']);
+      assert.ok(cloudProof.statusInTable,'Cloud work is absent from the main table.');
+      assert.equal(cloudProof.machine,'aws');
+      assert.equal(cloudProof.vcpus,'32');
+      for(const value of ['running',modules,failed,'no update for '+cloudRow.late_age])
+        assert.ok(cloudProof.running.includes(value),value+' is absent from the cloud row.');
+      assert.equal(cloudProof.place,'cloud');
+      assert.equal(cloudProof.waitingMachine,'');
+      assert.equal(cloudProof.waitingVcpus,'');
+      assert.match(cloudProof.waiting,/waits for a cloud slot: 1 of 1 in use/);
+      assert.match(cloudProof.slots,/cloud 1 of 1 slots/);
+      assert.ok(!cloudProof.cloudCard,'The page retains a separate Cloud card.');
+      assert.ok(!cloudProof.cloudMemory,'Cloud work has a memory reservation.');
+      assert.ok(cloudProof.localMemory,'The local memory bar is absent.');
+      assert.equal(cloudProof.staleColor,cloudProof.errorColor,'The stale age is not red.');
+      assert.ok(cloudProof.scroll<=cloudProof.client,'Cloud rows overflow the page.');
+      proof[name]=cloudProof;
+      }
+      await show(base);
 
       const positions=()=>evaluate(`(() => {
         const row=document.querySelector('.walk-table tr[data-tip^="row:"]');

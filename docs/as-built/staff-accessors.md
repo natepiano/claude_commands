@@ -62,6 +62,19 @@ It also removes the [operation configuration](agent-registry.md#agent-environmen
 Staff lock and remote waits read `OPERATION_LOCK_SECONDS` and `REMOTE_SECONDS` from `config/staff.conf` at use.
 Each wait uses the smaller configured limit or remaining operation deadline.
 
+## Production document lookup
+
+`StaffSnapshot.by_doc(machine, path)` prefers an exact document path.
+Otherwise, it compares the Git common directory and repository-relative document path.
+`_document_checkout` reads `.git`, `gitdir:`, and `commondir` without a subprocess.
+It returns `CheckoutDocument`, `OutsideGitCheckout`, or `UnreadableGitCheckout`.
+A document outside Git matches only an exact path.
+Unreadable metadata for the requested document raises `StaffRefused`.
+Unreadable metadata for another candidate causes the lookup to skip that candidate.
+Several repository matches raise `StaffRefused` with the matching staff ids.
+Question writers resolve relative folders from the selected owner's document.
+Each checkout therefore uses the same question store.
+
 ## Accessor table
 
 The write functions are `ensure`, `ensure_worker`, `move`, `rename`, `retire`, and `retire_pending`.
@@ -118,6 +131,7 @@ They also include `set_doc`, `set_worktree`, `update_current_session`, `set_hold
 | `scripts/herdr/herdr_sessions.py` | read | initial_snapshot |
 | `scripts/herdr/pane_launch.py` | read | initial_snapshot |
 | `scripts/herdr/side_pane.py` | read | runtime_id |
+| `scripts/herdr/turn_end.py` | write | snapshot, backend, native_id, runtime_id, retire; worker_admission.parent, find_worker, transcript_source, transcript_entries |
 | `scripts/herdr/worker_panes.py` | write | snapshot, runtime_id, row_operation, slot_operation; worker_admission.publish |
 | `scripts/hooks/conversation_pause.py` | read | snapshot; LiveDoc, WrappedDoc |
 | `scripts/hooks/conversation_pause_test_support.py` | write | LiveDoc; fixture_member calls ensure |

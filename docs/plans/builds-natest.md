@@ -1786,43 +1786,24 @@ The staff, add-unit and fast-track test modules use less CPU, with all 14,774 as
 **Ruled out:**
 - One Git seed per module: the seeds were already built once per class.
 
-### Phase 89 — The main assign launcher test file uses half its CPU  · status: todo
-**Depends on:** Phase 68
-**Blocked by:** hierarchies-unit Phase 30 on `origin/builds` — it deletes `agents/codex_mesh.py` and `agents/test_codex_mesh.py`, which this phase's fixture imports. Merge `origin/builds` at phase start.
+### Phase 89 — The main assign launcher test file uses half its CPU  · status: done
 
-#### Work Order
+#### As-built
 
-**Source:** Phase 68 contract review (F001). Phase 68 same-load pairs cut the four assign launcher files from 482.4 to 303.6 CPU s (37%), short of half. The director split the rest of the work into this phase, so the Phase 68 gain lands now.
-
-**Goal:** `scripts/direct/test_assign_launcher.py` (61 tests, 214.8 CPU s same-load median after Phase 68, 286.6 before) uses half its Phase 68 CPU, or a measured floor shows why it cannot, with every checked behavior kept.
-
-**Spec:**
-1. Follow the Speed method. Measure CPU with `module_cost.py --tests 10 --commands 10` first. Name each test's CPU, and each real launcher process that it starts.
-2. Move each test that does not test the process boundary to `InProcessAssignment`, as Phase 68 did. Keep the process tests that the Phase 68 behavior map names: ancestor check, launcher ownership, worker failure and concurrent review stages.
-3. Measure the recorder and resolver children (58.6 CPU s in the Phase 68 command profile). If only a production API change can cut them, write the floor and send the director an architecture proposal with its measured gain.
-4. Read the importers of a changed fixture before you change it. Every importer stays green.
-5. Add no guard, refusal or check (user rule, 2026-11-05).
+- `assignment_helpers()` in `assign_launcher_test_support.py` seeds the interpreter cache once and patches `subprocess.run`: `phase_table.py` runs through `invoke_cli(phase_table, phase_table.main, ...)` and `findings.py` through `invoke_findings(...)` in the test process. The patch prints captured output when the caller does not capture it and honors `check`.
+- `AssignLauncherFixture.setUp` and `PaneReviewLauncherTests.setUp` enter the context. `HookAssignmentFixture` and the native completion step stay unchanged.
+- 63 tests stay, and no assertion is removed. `module_cost.py` CPU 95.0 → 61.1 s, processes 4444 → 3785, execs 3939 → 3449, wall 96.9 → 71.8 s. Same-load pairs (/tmp roots, default bytecode cache): CPU 47.2 → 26.0 s (44.8% less), wall 51.3 → 29.0 s.
+- The module is at a CPU floor: `models_registry.launch_settings` starts a shell and a Python registry command for each launch. The models unit owns that resolver change.
 
 **Files:**
-- `scripts/direct/test_assign_launcher.py`
-- `scripts/direct/assign_launcher_test_support.py`
+- `scripts/direct/assign_launcher_test_support.py` — shared assign launcher fixture; `assignment_helpers()` runs helper commands in the test process
+- `scripts/direct/test_assign_launcher.py` — main assign launcher tests
 
-**Workers:** 1 writer; one test file and its fixture do not split
-- `impl` — `test_assign_launcher.py`, hub: `assign_launcher_test_support.py`
+**Gotchas:**
+- `assign_launcher_test_support.py` is the hub every assign launcher test module imports. One writer holds it.
 
-**Constraints from prior phases:**
-- Phase 68: `invoke_assignment` in `assign_launcher_test_support.py` runs the real coordinator in process and calls the recorder, `workers.py` and `codex_mesh` in process. `snapshot_files` and `changed_files` share the first-dispatch snapshot.
-- Phase 68 behavior map: `/tmp/claude/unit/2113de4f-9913-485a-9a51-61558bfd81db/phases/68/profile/behavior_map.md`.
-- Before hierarchies Phase 30, `AssignLauncherFixture` inherits `MeshCommandFixture` from `agents/test_codex_mesh.py`, and `invoke_assignment` routes `codex_mesh` calls in process (`assign_launcher_test_support.py:15`). After Phase 30, the fixture and that route go. Measure the new baseline with `module_cost.py` on the merged tree before any change. The 214.8 CPU s figure is the pre-deletion baseline.
-- Phase 68: `MeshCommandFixture.setUp` uses `dir="/tmp"` and `AssignLauncherFixture.setUp` sets the child `TMPDIR` to `/tmp`, so `/dev/shm` pairs do not reach the fixture. Run each pair on `/tmp` at the same time, and state that in the result. If the deletion moves the fixture root, state the new filesystem basis.
-- Tests never read or write live state: `~/.claude` main, `~/.local/state/merge-gate`, `/tmp/claude`.
-
-**Acceptance gate:**
-- The behavior map has a row for each assertion. No assertion is removed.
-- CPU s, processes, execs and wall s before and after, from `module_cost.py` and same-load pairs, in the checkpoint notice.
-- The changed file and every importer of a changed fixture pass.
-- the targeted test green on the phase commit merged with `origin/builds`
-- `basedpyright` on the changed files prints `0 errors, 0 warnings, 0 notes`
+**Ruled out:**
+- An `assign.resolve_model` change: it leaves the process count unchanged.
 
 ### Phase 90 — The style ledger tests seed staff once per class and close every database  · status: done
 **Depends on:** Phase 85
@@ -1979,74 +1960,89 @@ A changed `config/<name>.conf` selects every test module whose transitive import
 - A restored seed must call `copies.register_remote` again, because the registry lives outside the copied tree.
 - Other SSH paths in the module stay real.
 
-### Phase 98 — The merge gate resources test never waits out its hang guard  · status: todo
-**Depends on:** none
+### Phase 98 — The merge gate resources test never waits out its hang guard  · status: done
 
-#### Work Order
+#### As-built
 
-**Source:** builds showrunner order, 2026-11-08 23:xx EST, ranked after Phase 97. `production/test_merge_gate_suites_resources.py` took 617.75 s, 618.31 s and 625 s on three of 29 cloud gates that day; in 25 other gates it took 17-26 s. Each case passed. The extra 600 s equals `TEST_HANG_GUARD_SECS` (`scripts/lib/test_hang_guard.py`), and the box CPU was idle.
-
-**Goal:** no test in `scripts/production/test_merge_gate_suites_resources.py` waits out its hang guard; the cause of the long wait is found and fixed where it lives.
-
-**Spec:**
-1. The gate record names the slow test: `MergeGateResourcesTests.test_stop_during_a_blocking_read_returns_every_owned_slot`, 600.022 s in the last run (`show.py top`). Confirm it, and check the `waiting` / `released` waits near lines 140-200 as well.
-2. Reproduce the long wait before you change code. Run the test many times, alone and under CPU load, and record how often it waits.
-3. Find the cause. One lead to test, not a fact: the stop thread calls `os.kill(os.getpid(), signal.SIGTERM)` while the main thread blocks in `os.read`. If the kernel gives the signal to a thread other than the main thread, the main thread's read is not interrupted.
-4. Fix the cause where it lives. A defect in `scripts/production/merge_gate.py` is fixed there; send the director its evidence first, because another unit owns that file.
-5. Keep every assertion. Add no guard, refusal or check (user rule, 2026-11-05).
+- `SharedCPUPool.acquire` in `scripts/production/merge_gate.py` waits in `select` on the jobserver descriptor and a private signal wakeup pipe (`os.pipe2(O_NONBLOCK | O_CLOEXEC)`, `signal.set_wakeup_fd`). A stop signal wakes the wait when the kernel delivers it to another thread, or when it arrives just before the wait starts. Either case used to leave the gate blocked in `read()` until the 600 s hang guard.
+- When the jobserver is readable, `acquire` takes the token through `try_acquire` inside `build_folders.defer_signals()`. Another gate can take the token first; the loop then waits again. `try_acquire` keeps the empty-read `GateRefused` and slot ownership.
+- `test_merge_gate_suites_resources.py` patches `select.select` and waits on the real `pool.blocking`. `test_stop_during_a_blocking_read_returns_every_owned_slot` has rows `before_wait`, `process` and `sender_thread` (`signal.pthread_kill` to the sender thread). `test_stop_after_blocking_acquisition_returns_the_new_slot_too` has rows `read` and `return`. Every row requires every token to return.
+- Measured on copies with a 3 s guard: guard waits 11/40 alone and 1/40 under CPU load before; 0/40 and 0/40 after.
 
 **Files:**
-- `scripts/production/test_merge_gate_suites_resources.py`
-- `scripts/production/merge_gate.py`
+- `scripts/production/merge_gate.py` — `SharedCPUPool.acquire` (owner sdlc devtools-unit)
+- `scripts/production/test_merge_gate_suites_resources.py` — the stop and acquire rows
 
-**Workers:** 1 writer; the test and its cause do not split
-- `impl` — `test_merge_gate_suites_resources.py`, `merge_gate.py`
+**Gotchas:**
+- The wakeup descriptor is set and restored inside `build_folders.defer_signals()`. `ExitStack` restores the previous wakeup descriptor before it closes the pipe.
 
-**Constraints from prior phases:**
-- `TEST_HANG_GUARD_SECS` is 600 s; a test that waits on it still passes, so the gate reports no failure.
-- Tests never read or write live state: `~/.claude` main, `~/.local/state/merge-gate`, `/tmp/claude`.
+**Ruled out:**
+- A signal pipe in the test fixture only: it hides the production race.
 
-**Acceptance gate:**
-- The repeat count and the long-wait count before and after the fix, alone and under load, in the checkpoint notice. After the fix, no run waits on the hang guard.
-- `test_merge_gate_suites_resources.py` and every importer of a changed file pass.
-- the targeted test green on the phase commit merged with `origin/builds`
-- `basedpyright` on the changed files prints `0 errors, 0 warnings, 0 notes`
+### Phase 99 — The Claude assign launcher test file uses half its CPU  · status: done
 
-### Phase 99 — The Claude assign launcher test file uses half its CPU  · status: todo
-**Depends on:** none
+#### As-built
 
-#### Work Order
-
-**Source:** the backlog rank rule (next items, item 2). On 2026-11-08 23:20 EST, `direct/test_assign_claude.py` is the highest module by median CPU that no phase holds and that has no floor: 49.3 CPU s per gate, 19 tests. Higher rows are held: `test_assign_launcher.py` (Phase 89), `test_style_sync.py` (devtools), and modules at a floor.
-
-**Goal:** `scripts/direct/test_assign_claude.py` uses half its current CPU, or a measured floor shows why it cannot, with every checked behavior kept.
-
-**Spec:**
-1. Follow the Speed method. Measure CPU with `module_cost.py --tests 10 --commands 10` first. Name each test's CPU, and each real process that it starts.
-2. Start with the slowest test: `AssignClaudeLauncherWorkerTests.test_new_worker_identity_precedes_the_heartbeat_watcher` (4.3 s in the last gate).
-3. Write a behavior map with a row for each assertion before you change a test.
-4. Read the importers of a changed fixture before you change it. Every importer stays green.
-5. If only a production change can cut a cost, write the floor and send the director an architecture proposal with its measured gain.
-6. Add no guard, refusal or check (user rule, 2026-11-05).
+- `direct_launcher_helpers()` in `scripts/direct/assign_claude_test_support.py` patches `subprocess.run`. It runs the `progress_history`, `phase_reservation`, `worker_state` and `build_folders` CLIs in the test process through runpy and `invoke_cli`.
+- Merged output (`stdout=PIPE, stderr=STDOUT`) uses `invoke_cli(..., combined_output=True)` and returns `CompletedProcess(args, code, stdout, None)`.
+- The fixture flag `direct_cli_calls: ClassVar[bool] = False` selects the adapter. When it is set, the child source runs inside `with direct_launcher_helpers():` (`child_bootstrap` + `child_source`).
+- `run_assignment` runs the child in process, with patched `scripts.direct.__path__` and the assign and assign_claude `SCRIPTS` and `PYTHON` values, unless `process_boundary_for_case` names the case.
+- 19 tests and 76 assertions stay; 6 tests keep a real process boundary. `module_cost.py` CPU 49.3 → 14.9 s. Same-load pairs on `/tmp`: CPU 43.4 → 22.4 s (0.517), wall 59.7 → 33.0 s.
 
 **Files:**
-- `scripts/direct/test_assign_claude.py`
-- `scripts/direct/assign_claude_test_support.py`
+- `scripts/direct/assign_claude_test_support.py` — the adapter and the in-process child
+- `scripts/direct/test_assign_claude.py` — the launcher tests
+- `scripts/direct/test_assign_claude_test_support.py` — the adapter against a real run, 3 capture modes × 2 arguments
 
-**Workers:** 1 writer; one test file and its fixture do not split
-- `impl` — `test_assign_claude.py`, hub: `assign_claude_test_support.py`
+**Binds later work:** `test_assign_launcher.py` imports `assign_claude_test_support.py`. A reuse of `direct_launcher_helpers()` from `assign_launcher_test_support.py` imports it inside the function that uses it, to avoid an import cycle. `direct_cli_calls` on the Claude fixture does not change `AssignLauncherFixture`.
 
-**Constraints from prior phases:**
-- Phase 68: `invoke_assignment` in `assign_launcher_test_support.py` runs the real coordinator in process. `snapshot_files` and `changed_files` hold the first-dispatch snapshot; `AssignClaudeLauncherFixture.first_worker_launch` uses them and keeps its own restoration.
-- Phase 89 holds `assign_launcher_test_support.py` and `test_assign_launcher.py`. Do not edit them.
-- `assign_claude_test_support.py` is also imported by `test_assign_claude_probes.py`, `test_assign_claude_records.py`, `test_assign_claude_claim_follow.py`, `test_assign_claude_claims.py`, `test_assign_launcher.py` and `assign_claude_native_test_support.py`.
-- Phase 68: `AssignLauncherFixture` sets the child `TMPDIR` to `/tmp`, so `/dev/shm` pairs do not reach it. Check where this fixture's children write, and state the filesystem basis of each pair.
-- Phase 97: an in-process call of a real CLI `main` through `invoke_cli` (`scripts/production/cli_fixture.py`) replaced one interpreter start per case and kept the real code path.
-- Tests never read or write live state: `~/.claude` main, `~/.local/state/merge-gate`, `/tmp/claude`.
+**Gotchas:**
+- A merged-capture caller must get `stderr=None`; `invoke_cli` merges the streams itself.
 
-**Acceptance gate:**
-- The behavior map has a row for each assertion. No assertion is removed.
-- CPU s, processes, execs and wall s before and after, from `module_cost.py` and same-load pairs, in the checkpoint notice.
-- The changed file and every importer of a changed fixture pass.
-- the targeted test green on the phase commit merged with `origin/builds`
-- `basedpyright` on the changed files prints `0 errors, 0 warnings, 0 notes`
+### Phase 100 — The director turn-wait hook tests use half their CPU  · status: done
+
+#### As-built
+
+- `DirectorWaitFixture` takes `execution: Literal["direct", "process"] = "direct"`; `director_wait_fixture(*, execution=...)` passes it on.
+- The direct path builds a `ConversationPauseFixture`, sets its `root`, and runs the real hook through `execute_script(script, [str(HOOKS / hook)], environment, payload)`. A `subprocess.Popen` patch keeps each child; the fixture reaps each one with `wait(timeout=TEST_HANG_GUARD_SECS)` and restores the SIGALRM handler and ITIMER_REAL.
+- Two tests keep `execution="process"`: `test_final_decision_and_gate_lines_start_one_user_wait_and_allow_the_stop` and `test_typed_user_prompt_finishes_the_user_wait_before_conversation_pause`.
+- 25 tests and 48 assertions stay. `module_cost.py` CPU 33.3 → 4.0 s, processes 315 → 225, execs 283 → 193, wall 36.1 → 5.7 s. Same-load pairs (TMPDIR on tmpfs, sockets under `/tmp`): CPU 26.1 → 3.9 s (85% less), wall 27.3 → 4.9 s.
+
+**Files:**
+- `scripts/hooks/test_direct_turn_wait_hooks.py` — director turn-wait hook tests; the hook runs in the test process by default
+
+**Gotchas:**
+- A test that asserts on Stop output or a typed prompt across the process boundary keeps `execution="process"`.
+
+### Phase 101 — The herdr tests use half their CPU  · status: done
+
+#### As-built
+
+- `HerdrTests.setUp` patches `subprocess.run`: a synchronous fake herdr command runs through `run_fake` in the test process. Tests marked `@process_boundary` (from `scripts.production.cli_fixture`) keep a real process.
+- `run_fake` replaces the environment when the caller gives `env` and inherits `os.environ` otherwise, as `subprocess` does.
+- `StartupClock.advance(seconds)` drives a test clock. The two `LaunchDestinationTests` refusal tests patch `herdr.time` with `SimpleNamespace(monotonic=..., sleep=clock.advance)`, so no ten-second production deadline elapses.
+- 370 tests stay, and no assertion is removed. `module_cost.py` CPU 44.1 → 5.6 s, processes 1092 → 122, execs 1069 → 99, wall 72.5 → 6.2 s. Same-load pairs: CPU 26.0 → 5.7 s (78% less), wall 46.6 → 6.2 s.
+
+**Files:**
+- `scripts/herdr/test_herdr.py` — herdr library tests; fake herdr commands run in the test process by default
+
+**Gotchas:**
+- Three tests keep a real process through `process_boundary`: pane labels, Darwin process identity and an unreadable observation.
+
+### Phase 102 — The verify result environment tests use half their CPU  · status: done
+
+#### As-built
+
+- `test_result_values_distinguish_unset_empty_and_changed_values_in_saved_passes` runs one shared first pass and repeat with `NO_COLOR` and `CLICOLOR` set, under `--filter result_values`. Then, for each name, it sets the value to empty and then unsets it, and each step runs again.
+- Real `verify.sh` calls drop from 18 to 16. 7 tests and 29 assertions stay, and no assertion is removed.
+- Same-load pairs: /tmp roots, default bytecode cache, CPU 41.2 → 37.7 s (8.3% less); /dev/shm roots, empty bytecode cache, CPU 77.6 → 70.5 s (9.1% less).
+- The module is at a CPU floor: real `verify.sh` routing, admission, key and record work (`build_targets.py`, `tree_watch.py`, `admission_client.py` starts). verify-unit owns the target-selection, recorder import and routing boundary proposals for that cost.
+
+**Files:**
+- `scripts/direct/test_verify_result_environment.py` — result environment behavior through real `verify.sh` runs
+
+**Gotchas:**
+- Bytecode cache state changes the measured CPU by about two times. Compare readings only under the same roots and cache state.
+
+**Ruled out:**
+- Direct policy calls for the remaining cases: they cannot prove Cargo input, cache reuse or remote command input.

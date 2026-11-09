@@ -49,6 +49,24 @@ class BumpRecordsWithVisitCount(tuple[head_facts.BumpRecord, ...]):
             yield record
 
 
+def cloud_reading(reading: admission_records.QueueRead) -> wire.CloudQueueRead:
+    """Add running and waiting cloud work to a private queue reading."""
+    now = reading.explanation.now
+    rows = (
+        wire.CloudRow(wire.Owner(700001, "100"),
+            wire.Identity("cloud-session", "route-one", "merge-gate", "/private/cloud", "cloud-unit"),
+            wire.CloudPlace("aws"), now - 245, now - 240,
+            cloud_progress.CloudProgress("running", 32, 1, now - 120),
+            progress_profile.ProgressCounter("modules", 7, 12), admission_records.ReadyForAdmission()),
+        wire.CloudRow(wire.Owner(700002, "200"),
+            wire.Identity("cloud-waiter", "route-two", "targeted-test", "/private/waiting", "waiting-unit"),
+            wire.CloudPlace("aws"), now - 60, 0,
+            cloud_progress.NoCloudProgress(), progress_profile.NoCounter(), wire.CloudSlotWait(1, 1)),
+    )
+    return wire.CloudQueueRead(reading.view, reading.explanation, reading.ordered,
+        reading.diagnostics, rows, 1, cloud_gate_stale_pushes=3)
+
+
 class CloudQueueViewTests(unittest.TestCase):
     def cloud_model(self) -> tuple[queue_view.QueueModel, QueueFixture]:
         fixture = self.enterContext(QueueFixture(captured=False))
@@ -57,22 +75,9 @@ class CloudQueueViewTests(unittest.TestCase):
         _ = (fixture.root / "cloud_gate.conf").write_text(
             "[cloud_gate]\n# range: 5e-324..\nlog_push_s=5\n")
         model = fixture.model()
-        rows = (
-            wire.CloudRow(wire.Owner(700001, "100"),
-                wire.Identity("cloud-session", "route-one", "merge-gate", "/private/cloud", "cloud-unit"),
-                wire.CloudPlace("aws"), NOW - 245, NOW - 240,
-                cloud_progress.CloudProgress("running", 32, 1, NOW - 120),
-                progress_profile.ProgressCounter("modules", 7, 12), admission_records.ReadyForAdmission()),
-            wire.CloudRow(wire.Owner(700002, "200"),
-                wire.Identity("cloud-waiter", "route-two", "targeted-test", "/private/waiting", "waiting-unit"),
-                wire.CloudPlace("aws"), NOW - 60, 0,
-                cloud_progress.NoCloudProgress(), progress_profile.NoCounter(), wire.CloudSlotWait(1, 1)),
-        )
-        reading = model.reading
-        return replace(model, reading=wire.CloudQueueRead(reading.view, reading.explanation, reading.ordered,
-            reading.diagnostics, rows, 1, cloud_gate_stale_pushes=3)), fixture
+        return replace(model, reading=cloud_reading(model.reading)), fixture
 
-    def test_cloud_group_shows_slots_progress_size_elapsed_and_wait(self) -> None:
+    def test_cloud_rows_share_the_table_with_slots_progress_size_elapsed_and_wait(self) -> None:
         model, _fixture = self.cloud_model()
         names = read_step_names()
         reading = model.reading
@@ -80,21 +85,76 @@ class CloudQueueViewTests(unittest.TestCase):
         row = reading.cloud[0]
         assert isinstance(row.progress, cloud_progress.CloudProgress)
         expected = (GOLDEN / "cloud_view.txt").read_text()
-        for failures, failure_text in ((1, "1 failed module"), (2, "2 failed modules")):
-            with self.subTest(failures=failures):
-                current = replace(row, progress=replace(row.progress, failed_modules=failures))
+        cases: tuple[tuple[cloud_progress.CloudState, int, str, float, str], ...] = (
+            ("running", 1, "1 failed module", NOW - 120, "2 min"),
+            ("running", 2, "2 failed modules", NOW - 120, "2 min"),
+            ("requesting", 0, "", NOW - 120, "2 min"),
+            ("setup", 1, "1 failed module", NOW - 120, "2 min"),
+            ("uploading", 2, "2 failed modules", NOW - 120, "2 min"),
+            ("running", 1, "1 failed module", NOW - 45, "45 s"),
+            ("running", 1, "1 failed module", NOW - 10800, "3 h"),
+            ("running", 1, "1 failed module", NOW - 172800, "2 d"),
+            ("running", 1, "1 failed module", 0.0, "20756 d"),
+        )
+        for state, failures, failure_text, updated_at, late_age in cases:
+            with self.subTest(state=state, failures=failures, updated_at=updated_at):
+                current = replace(row, progress=replace(row.progress, state=state,
+                    failed_modules=failures, updated_at=updated_at))
                 model = replace(model, reading=replace(reading, cloud=(current, *reading.cloud[1:])))
                 text = plain(queue_view.render_view(model, 140))
-                self.assertIn("Cloud", text)
+                self.assertNotIn("Cloud ·", text)
                 self.assertIn("1 of 1 slots", text)
-                for value in ("cloud-unit", names.shown("merge-gate"), "running", "waiting-unit",
-                              names.shown("targeted-test"), "32", "vCPUs"):
+                for value in ("cloud-unit", names.shown("merge-gate"), state, "waiting-unit",
+                              names.shown("targeted-test"), "32", "vCPU"):
                     self.assertIn(value, text)
                 self.assertRegex(text, r"7(?: of |/)12")
-                self.assertIn("4 min", text)
-                self.assertIn("no update for 2 min", text)
-                self.assertIn("waits for a cloud slot: 1 of 1 in use", text)
-                self.assertEqual(text + "\n", expected.replace("1 failed module", failure_text))
+                header, = [line for line in text.splitlines() if line.lstrip().startswith("# ")]
+                running, = [line for line in text.splitlines() if line.lstrip().startswith("run ")]
+                waiting, = [line for line in text.splitlines() if line.startswith("cloud")]
+                self.assertLess(header.index("machine"), header.index("vCPU"))
+                self.assertLess(header.index("vCPU"), header.index("pid"))
+                self.assertEqual(running[header.index("min"):header.index("machine")].strip(), "4")
+                self.assertEqual(running[header.index("machine"):header.index("vCPU")].strip(), "aws")
+                self.assertEqual(running[header.index("vCPU"):header.index("pid")].strip(), "32")
+                self.assertIn("pid 700001", running)
+                self.assertIn("pid 700002", waiting)
+                self.assertEqual(waiting[header.index("machine"):header.index("pid")].strip(), "")
+                self.assertNotRegex(running, r"[█░▒]")
+                self.assertNotRegex(waiting, r"[█░▒]")
+                error_text = " ".join(span.text.strip() for line in queue_view.render_view(model, 140)
+                    for span in line if span.tone == "error")
+                self.assertIn(f"no update for {late_age}", error_text)
+                head, = [line for line in text.splitlines() if line.startswith("Head:")]
+                self.assertIn("cloud 1 of 1 slots", head)
+                row_text = " ".join(line.removeprefix("· ").strip() for line in text.splitlines())
+                self.assertIn(f"no update for {late_age}", row_text)
+                self.assertIn("waits for a cloud slot: 1 of 1 in use", row_text)
+                if state == "running" and updated_at == NOW - 120:
+                    self.assertEqual(text + "\n", expected.replace("1 failed module", failure_text))
+                elif failures:
+                    self.assertIn(failure_text, text)
+                else:
+                    self.assertNotIn("failed module", text)
+
+    def test_cloud_rows_sort_with_local_steps_and_keep_the_local_memory_bars(self) -> None:
+        model, fixture = self.cloud_model()
+        fixture.write_running(used=admission_records.GIB, need=3 * admission_records.GIB)
+        _ = fixture.write_waiter({"pid": 123, "start_time": "123", "need": 9 * admission_records.GIB,
+            "since": NOW - 30, "session_id": "local-waiter", "session_name": "local",
+            "step": "check", "folder": "/private/local"})
+        model = replace(model, reading=cloud_reading(fixture.read()))
+        with mock.patch.object(os, "cpu_count", return_value=17):
+            text = plain(queue_view.render_view(model, 140))
+        rows = [line for line in text.splitlines()
+            if "pid " in line and line.split("pid ", 1)[1].split()[0].isdigit()]
+        self.assertEqual([line.split("pid ", 1)[1].split()[0] for line in rows],
+            ["700001", "900", "700002", "123"])
+        header, = [line for line in text.splitlines() if line.lstrip().startswith("# ")]
+        self.assertEqual(rows[1][header.index("vCPU"):header.index("pid")].strip(), "17")
+        self.assertEqual(rows[3][header.index("machine"):header.index("pid")].strip(), "")
+        self.assertIn("2.0 / 1.0", rows[1])
+        self.assertRegex(rows[1], r"[█░▒]")
+        self.assertRegex(rows[3], r"[█░▒]")
 
     def test_missing_cloud_progress_has_a_named_display_state(self) -> None:
         model, _fixture = self.cloud_model()
@@ -173,7 +233,14 @@ class CloudQueueViewTests(unittest.TestCase):
                 self.assertNotIn("no update for", text)
 
 
-class QueueViewTests(QueueFixtureTests):
+class QueueViewFixtureTests(QueueFixtureTests):
+    @override
+    def setUp(self) -> None:
+        super().setUp()
+        _ = self.enterContext(mock.patch.object(os, "cpu_count", return_value=17))
+
+
+class QueueViewTests(QueueViewFixtureTests):
 
     def test_targeted_test_step_uses_its_shown_name(self) -> None:
         model = self.fixture.model()
@@ -197,12 +264,17 @@ class QueueViewTests(QueueFixtureTests):
                 header, = [row for row in text.splitlines() if row.lstrip().startswith("# ")]
                 rows = [row for row in text.splitlines() if row.startswith("run")]
                 self.assertTrue(rows)
+                for row in rows:
+                    self.assertRegex(row, r"[█░▒]")
                 if columns >= 100:
                     self.assertLess(header.index("min"), header.index("machine"))
-                    self.assertLess(header.index("machine"), header.index("pid"))
+                    self.assertIn("vCPU", header)
+                    self.assertLess(header.index("machine"), header.index("vCPU"))
+                    self.assertLess(header.index("vCPU"), header.index("pid"))
                     for row in rows:
                         self.assertEqual(row.index("fixture-host"), header.index("machine"))
                         self.assertEqual(row.index("pid "), header.index("pid"))
+                        self.assertEqual(row[header.index("vCPU"):header.index("pid")].strip(), "17")
                     for row in waiting_rows(queue_view.render_view(model, columns)):
                         self.assertEqual(row[header.index("machine"):header.index("pid")].strip(), "")
                 else:
@@ -1222,7 +1294,7 @@ class QueueViewTests(QueueFixtureTests):
         self.assertNotIn("budget", text.lower())
 
 
-class CapViewTests(QueueFixtureTests):
+class CapViewTests(QueueViewFixtureTests):
     def cap_model(self, *, available: int = 20, need: int = 10, used: int = 5) -> queue_view.QueueModel:
         model = self.fixture.cap_model()
         room = gate.memory_room(admission_records.HostMemory(available * admission_records.GIB, 60 * admission_records.GIB), [admission_records.RunMemory("run", need * admission_records.GIB, admission_records.AnonymousRunUse(used * admission_records.GIB))], admission_policy_fixture())

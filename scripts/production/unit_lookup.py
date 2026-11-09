@@ -223,11 +223,12 @@ class RunRecord(NamedTuple):
 
 
 class HeldRun(NamedTuple):
-    """A directed run and its recorded worktree and state."""
+    """A directed run with its history, worktree, state, and held folder."""
 
     path: Path
     worktree: Path
     state: UnitState
+    folder: Path
 
 
 @dataclass(frozen=True)
@@ -272,7 +273,7 @@ class HeldRunLookup:
                     last = _last_event(path)
                     state = (UnitState.RUN_FINISHED if last is not None
                              and last.get("event_type") == "run_finished" else UnitState.RUNNING)
-                    self._histories[path] = HeldRun(path, row.worktree.path, state)
+                    self._histories[path] = HeldRun(path, row.worktree.path, state, Path(folder))
                 except (OSError, UnicodeError, ValueError) as error:
                     self._histories[path] = HeldRunUnknown(path, str(error))
             run = self._histories[path]

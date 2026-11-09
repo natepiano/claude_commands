@@ -1,5 +1,5 @@
 #!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
-"""Read checkpoint trailers and write change review rows.
+"""Read unit commit trailers and write change review rows.
 
 A visible trailer has three fields and an optional fourth field: after <step>.
 An invisible change uses Change-Review: none — <reason>.
@@ -26,9 +26,9 @@ import re
 import shlex
 import subprocess
 import sys
-from collections.abc import Callable, Generator, Iterable, Sequence
+from collections.abc import Callable, Generator, Iterable, Mapping, Sequence
 from contextlib import contextmanager
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import date, datetime
 from enum import Enum
 from pathlib import Path
@@ -143,10 +143,13 @@ Entry = Visible | Invisible | Malformed
 
 @dataclass(frozen=True)
 class Commit:
+    """A unit commit with the shared parent graph, including connecting merges."""
+
     sha: str
     subject: str
     message: str
     files: tuple[str, ...]
+    ancestry: Mapping[str, tuple[str, ...]] = field(default_factory=dict[str, tuple[str, ...]], repr=False, compare=False)
 
 
 class ChangeReviewError(Exception):
@@ -171,7 +174,7 @@ def entries(message: str) -> list[Entry]:
 
 
 def checkpoint_changes(message: str) -> tuple[str, ...]:
-    """The visible change names in a checkpoint message."""
+    """The visible change names in a unit commit message."""
     return tuple(item.change for item in entries(message) if isinstance(item, Visible))
 
 
@@ -268,16 +271,18 @@ def unit_commits(repo: Path, checkpoint: str, previous: str, merge_branch: str,
                  productions: Callable[[], Iterable[Path]] = registered_productions) -> list[Commit]:
     """The unit's commits, excluding origin merge branches that already write review rows."""
     excluded = list(dict.fromkeys([f"origin/{merge_branch}", *reviewed_merge_refs(repo, productions)]))
-    records = _git(repo, "log", "-z", "--format=%H %ct %P%n%B", checkpoint, f"^{previous}",
+    records = _git(repo, "log", "--topo-order", "-z", "--format=%H %ct %P%n%B", checkpoint, f"^{previous}",
                    *(f"^{ref}" for ref in excluded), "--").split("\0")
     commits: list[Commit] = []
+    ancestry: dict[str, tuple[str, ...]] = {}
     for record in filter(str.strip, records):
         header, message = record.split("\n", 1)
         sha, stamp, *parents = header.split()
+        ancestry[sha] = tuple(parents)
         if int(stamp) < checked_from:
             continue
         if len(parents) < 2:
-            commits.append(Commit(sha, message.partition("\n")[0], message, _files(repo, sha)))
+            commits.append(Commit(sha, message.partition("\n")[0], message, _files(repo, sha), ancestry))
         elif reason := merge_review_problem(message, is_merge=True):
             raise ChangeReviewError(f"{sha[:SHORT]}: {reason}. Make the merge again without the lines")
     return commits
@@ -295,16 +300,32 @@ def missing(commits: list[Commit]) -> list[str]:
             and not any(commit.sha.startswith(sha) for sha in covered)]
 
 
+def review_commits(commits: list[Commit]) -> list[Commit]:
+    """Keep all checkpoints and commits without a descendant checkpoint in this set."""
+    replaced: set[str] = set()
+    for commit in commits:
+        if not commit.subject.startswith("checkpoint("):
+            continue
+        pending = list(commit.ancestry.get(commit.sha, ()))
+        while pending:
+            ancestor = pending.pop()
+            if ancestor in replaced:
+                continue
+            replaced.add(ancestor)
+            pending.extend(commit.ancestry.get(ancestor, ()))
+    return [commit for commit in commits if commit.subject.startswith("checkpoint(") or commit.sha not in replaced]
+
+
 def _checkpoint_entries(commits: list[Commit]) -> Iterable[tuple[Commit, Visible]]:
-    for commit in reversed(commits):
-        if commit.subject.startswith("checkpoint("):
-            for item in entries(commit.message):
-                if isinstance(item, Visible):
-                    yield commit, item
+    """Read checkpoint lines and lines without a descendant checkpoint."""
+    for commit in reversed(review_commits(commits)):
+        for item in entries(commit.message):
+            if isinstance(item, Visible):
+                yield commit, item
 
 
 def visible(commits: list[Commit]) -> list[Visible]:
-    """Read each visible change from checkpoint commits."""
+    """Read checkpoint changes and changes without a descendant checkpoint."""
     return [item for _, item in _checkpoint_entries(commits)]
 
 
@@ -1026,12 +1047,12 @@ def _owner_of(commit: Commit, branches: dict[str, UnitSource]) -> Path | None:
 
 @dataclass(frozen=True)
 class UnresolvedSource:
-    """The checkpoint has no matching unit source."""
+    """The unit commit has no matching unit source."""
 
 
 @dataclass(frozen=True)
 class PublicationChange:
-    """One checkpoint change with its unit and fixed producer identity."""
+    """A change from a unit commit, with its unit and fixed producer identity."""
 
     item: Visible
     source: UnitSource | UnresolvedSource
@@ -1073,7 +1094,7 @@ def _publication_docs(production: Path, record: staff.StaffSnapshot) -> list[Pat
 def publication_changes(commits: list[Commit], production: Path, *,
                         record: staff.StaffSnapshot | None = None,
                         known_producer: staff.StaffId | UnknownProducer = UNKNOWN_PRODUCER) -> list[PublicationChange]:
-    """Resolve each visible change's unit and producer in one pass."""
+    """Resolve the selected review changes, their units, and their producers."""
     record = staff.snapshot() if record is None else record
     branches = _publication_branches(production, record)
     machine = remote.local_machine()
@@ -1094,12 +1115,16 @@ def merge_commits(repo: Path, merge: str, *, excluded_refs: Sequence[str] = ()) 
     parents = _git(repo, "rev-list", "--parents", "-n", "1", merge, "--").split()[1:]
     if len(parents) < 2:
         return []
-    records = _git(repo, "log", "--no-merges", "--format=%x1e%H%x1f%B", parents[1], f"^{parents[0]}",
+    records = _git(repo, "log", "--topo-order", "--format=%x1e%H %P%x1f%B", parents[1], f"^{parents[0]}",
                    *(f"^{ref}" for ref in excluded_refs), "--")
     commits: list[Commit] = []
+    ancestry: dict[str, tuple[str, ...]] = {}
     for record in records.split("\x1e")[1:]:
-        sha, message = record.split("\x1f", 1)
-        commits.append(Commit(sha, message.split("\n", 1)[0], message, ()))
+        header, message = record.split("\x1f", 1)
+        sha, *parents = header.split()
+        ancestry[sha] = tuple(parents)
+        if len(parents) < 2:
+            commits.append(Commit(sha, message.split("\n", 1)[0], message, (), ancestry))
     return commits
 
 
@@ -1816,7 +1841,7 @@ def _run(options: CommandLine) -> int:
             commits = unit_commits(Path(options.repo).resolve(), options.checkpoint, options.previous,
                                    options.merge_branch)
             refused = missing(commits)
-            print("\n".join(refused) if refused else f"{len(commits)} commit(s) carry their {TRAILER} lines")
+            print("\n".join(refused) if refused else f"{len(review_commits(commits))} commit(s) carry their {TRAILER} lines")
             return 1 if refused else 0
         case _:
             pass

@@ -184,11 +184,15 @@ Verdicts: `clean | fixed | exception | held | waived | removed`. A `removed` row
 
 **Board.** `berth_board.read_board(repo) -> Board | BoardUnavailable(reason)` runs `cargo-berth board --json` and parses the envelope first. Status `unconfigured` with payload kind `no_facts`, or no reservation, is an empty `Board`. `ledger_unreadable`, empty or non-JSON output, a non-`board` envelope, missing fields, conflicting snapshots of one id, or a reference to an unknown id is `BoardUnavailable`. `Board.reservations()` collects `targets[].reservations` and the `ready_now`, `waiting`, `unresolved_overlaps`, `unconstrained_reservations` and `resolved` sections, deduplicated. `Reservation.blocks(path)` is true only when `edit_blocking_status == "blocking"` and a scope matches (`file:<path>` or bare path exactly, `tree:<root>` by prefix, `tree:.` all). Never persisted.
 
-**Busy files.** `busy_files(...) -> BusyFiles(board, paths)`; `contains(path)` is membership or a blocking reservation. `unit_file_holders` collects, for every Units row of the parent production and of the style production: `git diff --name-only --no-renames <merge branch>...<branch>` when the branch exists, every `git status --porcelain` path in its worktree (both sides of a rename, untracked included), and other style units' open-ticket files.
+**Busy files.** `busy_files(...) -> BusyFiles(board, paths)` supplies path and blocking-reservation membership.
+`unit_file_holders` reads the parent and style productions' staff units.
+It collects each unit's branch diff, dirty paths, and other style units' open-ticket files.
+Dirty paths include untracked files and both sides of a rename.
 
 **`style_plan.py next-phase --unit U --plan P --repo R`** (`next_phase -> NextPhase`):
 
-1. Find the style doc and the unit's Units row. `--plan` must equal `<row Worktree>/<Plan cell>`, else exit 2. A rename keeps the Plan cell path.
+1. Resolve the unit's configured plan through staff and `.unit.toml`.
+   A different `--plan` refuses with exit 2.
 2. A `### Phase` heading with `repair` and `status: todo` returns `repair first` before any write.
 3. Run `style_proposals.complete`. Discard each ticket phase whose state is `merged` or `dropped` (`discarded <id>: <state>`).
 4. An assigned ticket rebuilds its phase, `resume <id>`, without reading the board. Two checkpointed tickets return exit 5. With one checkpointed ticket, require a readable checkpoint exactly at the unit branch tip, then select a disjoint successor as described below; unknown footprints keep exit 5.
@@ -212,7 +216,10 @@ Verdicts: `clean | fixed | exception | held | waived | removed`. A `removed` row
 | 5 | `waiting for merge: <id> checkpointed at <commit7>` |
 | 6 | `merge the style branch first: <n> cells judged at <tip7> wait for <style branch>` |
 
-`queue --repo R [--unit U]` iterates the style doc's Units rows and is a read-only preview: `<unit>: <kind> <crate> <rules> — <n> files: <files>`; exit 4 on an unavailable board. It applies no pilot scope.
+`queue --repo R [--unit U]` previews each style staff unit without writing state.
+It prints `<unit>: <kind> <crate> <rules> — <n> files: <files>`.
+An unavailable board gives exit 4.
+The preview applies no pilot scope.
 
 **Coverage candidates** (`_tickets_from`) use only `open` and `stale` cells. `_refill_cells` leaves out two kinds of stale cell: a held cell whose file blob did not change since its held judgment and whose live findings are all filed on open decisions; and a unit cell whose newest judgment is in the unit tip and the style branch and saw the inputs the unit tip has (`judged_at_base`), because a new ticket would record the same verdict. Ranking and structure blocking still count both.
 
@@ -273,7 +280,7 @@ Schema 25 also adds `held_findings.built_at`. For old built findings it uses the
 
 **Unit side** (`docs/direct/standing_plan_refill.md` `<StandingPlanRefill>`, `commands/unit/checkpoint.md`): refill uses this command:
 
-`style_plan.py next-phase --unit <unit> --plan <unit worktree>/<Plan cell> --repo <unit worktree>`
+`style_plan.py next-phase --unit <unit> --plan <unit worktree>/<configured plan> --repo <unit worktree>`
 
 It runs at startup, after compaction or restart, and at each `<NextPhase/>`.
 It first resumes checkpoint step 7 for any reservation record in `checkpoint_committed_awaiting_release_confirmation`.
@@ -486,7 +493,8 @@ All follow writes run in one `BEGIN IMMEDIATE` transaction. The write refuses wh
   `board_json.py` joins ticket owners through staff and reads phase records through `phase_table.build_run`.
 
 - A style unit id already starts with `<style showrunner name>-`. Code that builds a worktree, branch or herdr host name from a unit stem goes through `unit_names.branch` (or `worktree`), which returns the stem unchanged when it starts with `<showrunner name>-`; else the prefix doubles. `add_unit.host_session_name` uses this rule. Shutdown restart uses the staff name.
-- Every ledger row and `--rule` uses `Rule.rule_id`. Map a unit to its branch through the Units row, never by name derivation.
+- Every ledger row and `--rule` uses `Rule.rule_id`.
+  Staff supplies the worktree, and Git supplies its branch.
 - Every `set-tip` caller that expects awaiting-merge cells passes `--style-branch`. `reconcile` never moves the synced tip.
 - Read committed trees only through git objects (`ls-tree`, `cat-file --batch`), never `git archive`.
 - `rule_counts` is the one per-rule reader. The report's header numbers come from `summary_of`; the report defines no second count.

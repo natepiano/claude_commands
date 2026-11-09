@@ -527,43 +527,24 @@ The user, 2026-11-04, change review C948 (`buildlog costs`), through builds: the
 
 **Ruled out:** a per-kill `cached_property` (under 1 ms per report).
 
-### Phase 26 — buildlog costs is gone and buildlog charts opens the shared build page  · status: todo
-**Depends on:** Phase 15; queue-unit's Phase 10m (the build page and its feed in the repo, drawing Phase 15's `page_data`); queue-unit's Phase 34 (`/build:page`: `commands/build/page.md` runs `scripts/build_queue/memory_feed.py link`, which prints the page URL from `output_folder` in `config/memory_feed.conf`). From the builds showrunner (not the user), 2026-11-08: "queue owns the page link command and builds it after its Phase 33. The name still waits on the user." From the user (via the builds showrunner), 2026-11-08: "use /build:page that is fine". The builds showrunner added: start Phase 26 now with that name, and merge queue's Phase 34 when it lands on builds.
+### Phase 26 — buildlog costs is gone and buildlog charts opens the shared build page  · status: done
 
-From the builds showrunner (not the user), 2026-11-05: after queue 10m, delete `buildlog costs`, and `buildlog charts` prints the shared page's tailnet link, with a non-zero exit and a reason when there is no link. The user's C948 ruling (2026-11-04, through builds): the ranking lives on the one build page; hours show in the user's zone, with no seconds, UTC or microseconds; the Definitions block moves into the as-built doc.
+#### As-built
 
-#### Work Order
-
-**Goal:** One build page. `buildlog costs` no longer exists. `buildlog charts` publishes no page of its own: it prints the tailnet link of queue's shared build page, or prints the reason and exits non-zero when no link is available.
-
-**Spec:**
-- Remove the `costs` command from `scripts/buildlog/cli.py` (usage line 7 and the branch at line 271) and `costs.main`, `costs.render_costs`, `costs.phase_line`, `FOOTER`, `OUTPUT_LINE_LIMIT` and `MAX_RANKED_ROWS` when no other caller remains (LSP `findReferences`). Keep `read_costs`, `aggregate_costs`, `collect_costs` and the types: `charts` reads them.
-- Move the `FOOTER` definitions into `docs/as-built/buildlog-memory-stalls.md` as plain sentences, in Simplified Technical English.
-- `charts.main` keeps its arguments (`--days 7|30`, `--no-open`). It stops writing `latest.html` and stops calling `present_page`'s publish path. It runs `scripts/build_queue/memory_feed.py link` from the same checkout (the `/build:page` command) and prints the one URL line from its stdout, or opens it when a local display exists and `--no-open` is absent. A non-zero exit, a missing command, or stdout that is not one `http`/`https` URL is no link: it prints `buildlog charts: <reason>` to stderr (the command's stderr when it gave one) and exits 1. Tests use a stand-in link command; after queue Phase 34 is merged from builds, run the real `buildlog charts --no-open` once and quote its line.
-- Delete `render_html`, `publish`, `PAGE` and `chart_data` when no caller remains.
-- A test that calls `chart_data` and also proves a calculation keeps that proof. Change it to read the typed `ChartSet`, for example `test_exact_edges_assign_steps_phases_ci_and_moments_to_the_later_bucket` in `test_charts.py`. Delete only assertions about removed output.
-- Replace each `buildlog costs` instruction in the three as-built docs below with `buildlog charts`. Measurement records that name `costs` as a reader in `docs/as-built/buildlog-memory-stalls.md` stay as written.
+- `buildlog charts` publishes no page of its own. `charts.main` runs `scripts/build_queue/memory_feed.py link` (the `/build:page` command) from the same checkout and prints its one URL line. It opens the URL when a local display exists and `--no-open` is absent. `--days 7|30` stays.
+- No link prints `buildlog charts: <reason>` to stderr and exits 1. No link means: a non-zero exit, a missing command, or stdout that is not one printable `http`/`https` URL with a valid port. The reason is the command's stderr when it gave one.
+- `buildlog costs` is gone: the CLI prints its unknown-command usage and exits 2. `read_costs`, `aggregate_costs`, `collect_costs` and the cost types stay; the shared page reads them through `page_data`.
+- `render_html`, `publish`, `PAGE`, `chart_data` and the cost text output are gone. Calculation tests read the typed `ChartSet`.
+- The cost Definitions are sentences in `docs/as-built/buildlog-memory-stalls.md`. `build-report-session.md`, `build-targets.md` and `mac-test-offload.md` name `buildlog charts`.
+- Live check, 2026-11-09, from this branch: `buildlog charts --no-open` printed `http://100.103.14.30:8765/h7uj5c/memory_live.html`, the same line as `/build:page`.
 
 **Files:**
-- `docs/as-built/build-report-session.md`, `docs/as-built/build-targets.md`, `docs/as-built/mac-test-offload.md` — `buildlog charts` in place of `buildlog costs`.
-- `scripts/buildlog/cli.py` — no `costs` command.
-- `scripts/buildlog/costs.py` — no text output.
-- `scripts/buildlog/charts.py` — `main` prints the shared page link; page code removed.
-- `scripts/buildlog/test_costs.py`, `scripts/buildlog/test_charts.py` — assertions about removed output go; calculation assertions stay on the typed data; new link tests.
-- `docs/as-built/buildlog-memory-stalls.md` — Definitions.
+- `scripts/buildlog/cli.py`, `scripts/buildlog/costs.py`, `scripts/buildlog/charts.py`
+- `scripts/buildlog/test_costs.py`, `scripts/buildlog/test_charts.py`
+- `docs/as-built/build-report-session.md`, `docs/as-built/build-targets.md`, `docs/as-built/mac-test-offload.md`, `docs/as-built/buildlog-memory-stalls.md`
 
-**Workers:** 1 writer — `rowcpu` owns all files; nothing splits.
-
-**State:** none.
-
-**Constraints from prior phases:** Phase 15's `page_data` stays; queue's feed calls it. Phase 22 made `buildlog charts` publish its own page and print its tailnet link; this phase replaces that page with queue's. Phase 33: every import in `scripts/buildlog` uses the repo root (`from scripts.buildlog import y`), a patch string names the root form (`mock.patch("scripts.buildlog.charts.x")`), and a library module adds no `sys.path` line. Phase 37: the index uses WAL mode. `page_data` reads it through `charts.read_index` and gets the last committed snapshot during a rebuild. A read-only file comparison may permit only the index `-wal` and `-shm` sidecar changes (`read_only_evidence` in `scripts/aws_target/measurement_test_support.py`). A test that needs a blocked reader uses `PRAGMA locking_mode = EXCLUSIVE`; `BEGIN EXCLUSIVE` alone does not block WAL readers.
-
-**Acceptance gate:**
-- A test proves `buildlog charts` prints the shared page's tailnet link and writes no page file.
-- A test proves a missing link prints the reason and exits non-zero.
-- `buildlog costs` prints the CLI's unknown-command usage and exits 2.
-- `scripts.buildlog.test_charts`, `test_costs`, `test_report`, `test_cli` (if present) green with and without `PYTHONPATH`.
-- `basedpyright` on the changed Python files: 0 errors, 0 warnings, 0 notes.
+**Gotchas:**
+- `~/.claude/scripts/buildlog/buildlog` runs the installed copy, not the worktree. Check a branch with `scripts/lib/py scripts/buildlog/cli.py charts --no-open` from the worktree.
 
 ### Phase 27 — A step whose Cargo folders are unknown records them as unknown  · status: done
 
@@ -849,7 +830,7 @@ The build log index uses WAL mode, so a spilled update takes no exclusive lock a
 - The static import walk does not see Python source in string literals. Search the scripts that tests write at run time for the old path.
 - A new caller that reads a moved name through `memory_admit` fails basedpyright with an unknown attribute.
 
-### Phase 39 — Cloud gates show as normal rows on /build:queue and the build page · status: todo
+### Phase 39 — Cloud gates show as normal rows on /build:queue and the build page · status: done
 **Depends on:** queue-unit's Phase 36 (swap by owner) on builds, because both change `memory_feed.py` and `memory_live.html`. Merge builds before the start. This phase was queue-unit's Phase 35.
 
 From the user (via aws-unit, 2026-11-08): "each row is work and it needs to reflect that work", "design approved - we need to make sure it's reflected in the build page also". From the builds showrunner (not the user), 2026-11-08: start after queue's Phase 36 lands on builds.
@@ -886,10 +867,13 @@ Head: free 25.5 GiB; reserve 3.0 GiB; need 4.6 GiB · cloud 2 of 9 slots
 - `scripts/build_queue/memory_live.html` — the rows and columns; no `renderCloud` card.
 - `scripts/build_queue/memory_page_proof.mjs` — the browser proof.
 - `scripts/build_queue/test_queue_view.py`, `scripts/build_queue/test_memory_feed.py` — row tests.
+- `scripts/build_queue/test_queue_card.py`, `scripts/build_queue/golden/*.txt` — the reviewed view and card text. The cloud step card (`queue_card.py` calls `cloud_lines` with a selected row) stays.
 
 **Workers:** `1 writer + 1 tester`
 - writer — `queue_view.py`, `memory_feed.py`, `memory_live.html`.
-- tester — the Python tests and `memory_page_proof.mjs`.
+- tester — the Python tests, the golden files and `memory_page_proof.mjs`.
+
+The vCPU count of a local row is the host's `os.cpu_count()`, read at use: the queue's running rows all run on this host.
 
 **State:** none.
 
@@ -954,3 +938,18 @@ From the user (C959, 2026-11-04, through builds): "we are moving to the new buil
 
 **Ruled out:**
 - A catch or default for a deleted `vault.question_production` key: the key ships in the same commit as the code that reads it.
+
+### Phase 42 — Build log tests compare file times with a file-system clock · status: done
+
+#### As-built
+
+- `test_record_rerun.py` `test_late_finish_refreshes_completion_before_rename_and_survives_a_stop` takes `now` from the `st_mtime` of a file it touches first, then removes the file.
+- `test_record.py` takes `released_at` from the `meminfo` `st_mtime` after the write that releases the memory wait.
+- No sleep and no tolerance. The assertions do not change.
+
+**Files:**
+- `scripts/buildlog/test_record_rerun.py`
+- `scripts/buildlog/test_record.py`
+
+**Gotchas:**
+- The kernel stamps file times from a coarse clock that can be one tick behind `time.time()`. A test that compares a file time with `time.time()` fails now and then; a cloud gate saw a 0.16 ms miss.

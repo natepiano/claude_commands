@@ -23,7 +23,7 @@ from collections import defaultdict
 from collections.abc import Callable, Collection, Generator, Iterable, Mapping
 from contextlib import contextmanager
 from contextvars import ContextVar
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from enum import Enum
 from functools import cache
@@ -1088,6 +1088,14 @@ def active_dispatch(worker_id: staff.StaffId, run: Path) -> ActiveDispatch | NoA
         return ActiveDispatchUnavailable(f"worker {worker_id}: {error}")
 
 
+def reply_completed(run: Path, reply: Path) -> bool:
+    """Read a saved reply only after the hook completes its recorded pass."""
+    state = _read_state(run)
+    return any(item.get("status") == "completed" and
+               Path(dispatch_delivery(item).reply_file) == reply
+               for item in _pass_slots(state).values())
+
+
 class DispatchDetailNotRecorded(Enum):
     """The dispatch has no unique value for this detail."""
 
@@ -1845,7 +1853,9 @@ def dispatch_worker(session_dir: Path, *, slot: str, phase: str, role: staff.Wor
     state = _read_state(session_dir)
     recorded_phase = _open_phase_named(state, phase)
     if recorded_phase is None:
-        return NoMatchedDispatch()
+        recorded_phase = _object_dict(_pass_slots(state).get(slot, {}).get("phase"))
+        if recorded_phase is None or _string(recorded_phase.get("id")) != phase:
+            return NoMatchedDispatch()
     return _dispatch_match(
         _pass_slots(state).get(slot), recorded_phase,
         {"kind": role, "prompt_file": str(prompt), "launcher_command": launcher_command},
@@ -1936,6 +1946,39 @@ def _launcher_arguments(text: str) -> list[str]:
     return cast(list[str], value)
 
 
+@dataclass(frozen=True)
+class RecordedDispatchRun:
+    directory: Path
+
+
+class DispatchRunNotRecorded(Enum):
+    MISSING = "the worker has no dispatch state link"
+
+
+def _dispatch_state_link(worker_id: staff.StaffId) -> Path:
+    return staff.record_path().parent / "dispatches" / str(worker_id)
+
+
+def recorded_dispatch_run(worker_id: staff.StaffId) -> RecordedDispatchRun | DispatchRunNotRecorded:
+    """Find the existing pass state without searching the run root."""
+    try:
+        path = _dispatch_state_link(worker_id).resolve(strict=True)
+    except FileNotFoundError:
+        return DispatchRunNotRecorded.MISSING
+    return RecordedDispatchRun(path.parent)
+
+
+def _link_dispatch_state(worker_id: staff.StaffId, session_dir: Path) -> None:
+    link = _dispatch_state_link(worker_id)
+    link.parent.mkdir(parents=True, exist_ok=True)
+    temporary = link.with_name(f".{worker_id}.{uuid.uuid4().hex}")
+    try:
+        temporary.symlink_to(_state_path(session_dir).resolve())
+        _ = temporary.replace(link)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
 def begin_dispatch(session_dir: Path, *, slot: str, phase: str, role: staff.WorkerRole,
                    worker_name: str, worker_id: staff.StaffId, launcher_command: list[str], prompt: Path, kind: str, lens: str,
                    fix_cause: str = "", fix_pass: int = 0, activity: str = "") -> str:
@@ -1954,22 +1997,133 @@ def begin_dispatch(session_dir: Path, *, slot: str, phase: str, role: staff.Work
         fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
         try:
             _start_pass(args)
+            _link_dispatch_state(worker_id, session_dir)
             return _string(_pass_slots(_read_state(session_dir))[slot]["instance_id"])
         finally:
             fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
 
 
-def complete_dispatch(session_dir: Path, slot: str, instance_id: str) -> None:
-    """Record completion in the slot that dispatch owns."""
+def complete_dispatch(session_dir: Path, slot: str, instance_id: str, *,
+                      status: Literal["completed", "error"] = "completed") -> None:
+    """Record one terminal outcome for the exact dispatch in its slot."""
     with (session_dir / ".progress_history.lock").open("a+", encoding="utf-8") as lock:
         fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
         try:
             state = _read_state(session_dir)
             opened = _open_passes(state).get(slot)
             if opened is not None and opened.get("instance_id") == instance_id:
-                _ = _close_slot_pass(session_dir, state, slot, "completed", plan_history.now_epoch())
+                _ = _close_slot_pass(session_dir, state, slot, status, plan_history.now_epoch())
         finally:
             fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+
+
+@dataclass(frozen=True)
+class CompletionActions:
+    """The launcher's artifact paths and actions survive submission."""
+
+    summary_file: str = ""
+    status_file: str = ""
+    report_file: str = ""
+    style_directory: str = ""
+    end_worker: bool = False
+    held_role: str = ""
+    resolve_fix: bool = False
+    review_pass: int = 1
+    finish_phase: str = ""
+    finish_run: bool = False
+
+
+NO_COMPLETION_ACTIONS = CompletionActions()
+
+
+@dataclass(frozen=True)
+class DispatchDelivery:
+    """The hook uses the exact prompt and destinations saved before submission."""
+
+    line: str
+    completion_id: str
+    reply_file: str
+    early_ready: str = ""
+    actions: CompletionActions = CompletionActions()
+
+
+def _update_dispatch(session_dir: Path, instance_id: str, key: str, value: object) -> None:
+    with (session_dir / ".progress_history.lock").open("a+", encoding="utf-8") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        state = _read_state(session_dir)
+        for passed in _pass_slots(state).values():
+            if passed.get("instance_id") == instance_id:
+                if passed.get(key) != value:
+                    passed[key] = value
+                    _write_state(session_dir, state)
+                return
+
+
+def worker_artifact(path: Path, slot: str, worker: str) -> Path:
+    """Keep artifacts with the worker selected for the recorded slot."""
+    return path.with_name(worker + path.name.removeprefix(slot)) if path.name.startswith(slot + "_") else path
+
+
+def save_dispatch_delivery(session_dir: Path, instance_id: str, delivery: DispatchDelivery) -> None:
+    _update_dispatch(session_dir, instance_id, "delivery", asdict(delivery))
+
+
+def dispatch_delivery(passed: dict[str, object]) -> DispatchDelivery:
+    fields = _object_dict(passed.get("delivery")) or {}
+    actions = _object_dict(fields.get("actions")) or {}
+    return DispatchDelivery(
+        line=_string(fields.get("line")), completion_id=_string(fields.get("completion_id")),
+        reply_file=_string(fields.get("reply_file")), early_ready=_string(fields.get("early_ready")),
+        actions=CompletionActions(
+            summary_file=_string(actions.get("summary_file")), status_file=_string(actions.get("status_file")),
+            report_file=_string(actions.get("report_file")), style_directory=_string(actions.get("style_directory")),
+            end_worker=actions.get("end_worker") is True, held_role=_string(actions.get("held_role")),
+            resolve_fix=actions.get("resolve_fix") is True, review_pass=int(_number(actions.get("review_pass"), 1)),
+            finish_phase=_string(actions.get("finish_phase")), finish_run=actions.get("finish_run") is True),
+    )
+
+
+@dataclass(frozen=True)
+class HookCompletion:
+    """Keep each unfinished completion step available to the next event."""
+
+    outcome: str
+    reply_file: str
+    details: tuple[str, ...] = ()
+    actions_done: bool = False
+    pane_closed: bool = False
+    role_released: bool = False
+    finished: bool = False
+    recording_done: bool = False
+
+
+class NoHookCompletion(Enum):
+    UNRECORDED = "no terminal outcome recorded"
+
+
+def hook_completion(passed: dict[str, object]) -> HookCompletion | NoHookCompletion:
+    fields = _object_dict(passed.get("hook_completion"))
+    if fields is None:
+        return NoHookCompletion.UNRECORDED
+    details = fields.get("details", [])
+    return HookCompletion(_string(fields.get("outcome")), _string(fields.get("reply_file")),
+        tuple(str(item) for item in cast(list[object], details)) if isinstance(details, list) else (),
+        fields.get("actions_done") is True, fields.get("pane_closed") is True,
+        fields.get("role_released") is True, fields.get("finished") is True, fields.get("recording_done") is True)
+
+
+def save_hook_completion(run: Path, instance_id: str, completion: HookCompletion) -> None:
+    _update_dispatch(run, instance_id, "hook_completion", asdict(completion))
+
+
+def dispatch_completed(run: Path, slot: str, instance_id: str) -> bool:
+    passed = _pass_slots(_read_state(run)).get(slot, {})
+    return passed.get("instance_id") == instance_id and passed.get("status") == "completed"
+
+
+def record_dispatch_notice(session_dir: Path, instance_id: str, notice: str) -> None:
+    """Record a notice only after its message succeeds."""
+    _update_dispatch(session_dir, instance_id, "hook_notice", notice)
 
 
 def mark_pass_refused(session_dir: Path, worker_name: str) -> None:

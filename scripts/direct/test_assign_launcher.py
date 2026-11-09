@@ -15,9 +15,9 @@ from unittest.mock import patch
 from scripts.agents import codex_test_support as codex_fixture
 from scripts.direct import assign, progress_history
 from scripts.direct.assign_claude_test_support import AssignClaudeLauncherFixture
-from scripts.direct.assign_launcher_test_support import ASSIGN, ROOT, AssignLauncherFixture, InProcessAssignment, invoke_assignment, read_object
+from scripts.direct.assign_launcher_test_support import ASSIGN, ROOT, HookAssignmentFixture, InProcessAssignment, assignment_helpers, invoke_assignment, read_object
 from scripts.direct.findings_test_support import invoke_findings
-from scripts.herdr import herdr
+from scripts.herdr import herdr, turn_end
 from scripts.lint import style_review
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.test_models_registry import write_registry
@@ -43,7 +43,7 @@ class RepairState(TypedDict):
 
 
 @final
-class FailedLaunchRunTests(AssignLauncherFixture):
+class FailedLaunchRunTests(HookAssignmentFixture):
     @override
     def setUp(self) -> None:
         super().setUp()
@@ -303,6 +303,7 @@ class PaneReviewLauncherTests(unittest.TestCase):
     def setUp(self) -> None:
         self.fixture.setUp()
         self.addCleanup(self.fixture.doCleanups)
+        _ = self.enterContext(assignment_helpers())
         self.ready = self.fixture.run_dir / "final.ready"
         self.phase = self.fixture.run_dir / "phases/8"
         write_text_atomic(self.fixture.prompt, "Phase 8 — Workers\nReview Stage 1, then review the final diff in Stage 2.\n")
@@ -324,24 +325,41 @@ class PaneReviewLauncherTests(unittest.TestCase):
                      "--session-dir", str(self.fixture.run_dir), "--prompt", str(self.fixture.prompt)]
         result = invoke_cli(assign, assign.main, arguments, os.environ.copy(), ROOT)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.fixture.finish("TEST-astra-reviewer"), turn_end.TurnOutcome.DONE)
         reply = self.fixture.prompt.with_name(self.fixture.prompt.stem + "_reply.txt")
         self.assertTrue(reply.read_text().startswith(self.fixture.agent.final))
         self.assertEqual(len(self.fixture.agent.submitted), 1)
 
+    def test_completed_astra_review_rerun_repeats_its_notice_without_typing(self) -> None:
+        write_text_atomic(self.fixture.prompt, "Phase astra-review — Astra review\nReview the assigned change.\n")
+        self.fixture.run_dir = self.fixture.fixture.root / "astra-run"
+        reply = self.fixture.run_dir / "astra-review.md"
+        arguments = ["--role", "review", "--operation", "astra-review", "--new-worker", "astra-reviewer",
+                     "--cwd", str(self.fixture.fixture.root), "--session-dir", str(self.fixture.run_dir),
+                     "--prompt", str(self.fixture.prompt), "--summary", str(reply)]
+        with patch.dict(os.environ, {"ASTRA_ROLES_STATE": str(self.fixture.fixture.root / "roles")}), \
+                self.fixture.fixture.world.process_starts():
+            result = invoke_cli(assign, assign.main, arguments, os.environ.copy(), ROOT)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertEqual(len(self.fixture.agent.submitted), 1)
+            row = self.fixture.agent.row(self.fixture.agent.submitted[-1][0])
+            self.assertEqual(self.fixture.finish("astra-reviewer"), turn_end.TurnOutcome.DONE)
+            self.assertIsNone(staff.by_id(row.id))
+            notice, = self.fixture.agent.notices
+            saved = reply.read_bytes(), reply.stat().st_mtime_ns
+            submitted = self.fixture.agent.submitted.copy()
+            launches = self.fixture.fixture.world.launches.copy()
+            repeated = invoke_cli(assign, assign.main, arguments, os.environ.copy(), ROOT)
+        self.assertEqual(repeated.returncode, 0, repeated.stdout + repeated.stderr)
+        self.assertEqual(self.fixture.agent.notices, [notice, notice])
+        self.assertEqual(self.fixture.agent.submitted, submitted)
+        self.assertEqual(self.fixture.fixture.world.launches, launches)
+        self.assertEqual((reply.read_bytes(), reply.stat().st_mtime_ns), saved)
+
     def test_review_stage_two_uses_its_own_done_line_and_reuses_both_receipts(self) -> None:
-        reports: list[str] = []
         summary = self.phase / "review_summary_1.txt"
         summary.parent.mkdir(parents=True)
         write_text_atomic(summary, "The previous full report.\n")
-
-        def final_diff_ready() -> None:
-            if len(self.fixture.agent.submitted) == 1:
-                write_text_atomic(self.ready.with_suffix(".diff"), "+the final change\n")
-                write_text_atomic(self.ready, "ready\n")
-            else:
-                reports.append(summary.read_text())
-
-        self.fixture.agent.during_prompt = final_diff_ready
         prompt = self.fixture.prompt.read_bytes()
         completed_commands: list[list[str]] = []
         original_call = assign.call
@@ -356,60 +374,68 @@ class PaneReviewLauncherTests(unittest.TestCase):
             result = self.launch_review()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(completed_commands, [])
+        self.assertEqual(len(self.fixture.agent.submitted), 1)
+        self.assertEqual(self.fixture.finish("review"), turn_end.TurnOutcome.WAITING_ON_STAGE_TWO)
+        write_text_atomic(self.ready.with_suffix(".diff"), "+the final change\n")
+        write_text_atomic(self.ready, "ready\n")
+        self.assertEqual(self.fixture.finish("review", turn_end.EventKind.STAGE_READY), turn_end.TurnOutcome.SUBMITTED)
         first, second = self.fixture.agent.submitted
-        self.assertEqual(first[0], second[0])
         dispatch_id = first[1].split("DONE ")[-1].split(".")[0]
+        self.assertEqual(first[0], second[0])
         self.assertIn(f"DONE {dispatch_id}-2.", second[1])
         self.assertIn(str(self.ready.with_suffix(".diff")), second[1])
-        self.assertEqual(reports, ["The previous full report.\n"])
+        self.assertEqual(summary.read_text(), "The previous full report.\n")
+        self.assertEqual(self.fixture.finish("review"), turn_end.TurnOutcome.DONE)
         self.assertTrue(summary.read_text().endswith(f"DONE {dispatch_id}-2\n"))
         self.assertEqual((self.phase / "review_status_1").read_text(), "done\n")
-        panes = self.fixture.fixture.world.locations.copy()
+        self.assertEqual(self.fixture.finish("review"), turn_end.TurnOutcome.IGNORED)
+        self.assertEqual(self.fixture.agent.submitted, [first, second])
+        saved = summary.read_bytes(), (self.phase / "review_status_1").read_bytes()
+        notices = self.fixture.agent.notices.copy()
+        self.fixture.agent.notice_failures = 1
+        failed = self.launch_review()
+        self.assertNotEqual(failed.returncode, 0)
+        self.assertEqual((self.phase / "review_status_1").read_text(), "error\n")
+        self.assertEqual(summary.read_bytes(), saved[0])
+        self.assertEqual(self.fixture.agent.submitted, [first, second])
+        self.assertEqual(self.fixture.agent.notices, notices)
         repeated = self.launch_review()
         self.assertEqual(repeated.returncode, 0, repeated.stdout + repeated.stderr)
         self.assertEqual(self.fixture.agent.submitted, [first, second])
-        self.assertEqual(self.fixture.fixture.world.locations, panes)
+        self.assertEqual(self.fixture.agent.notices, [*notices, notices[-1]])
+        self.assertEqual((summary.read_bytes(), (self.phase / "review_status_1").read_bytes()), saved)
         self.assertEqual(self.fixture.prompt.read_bytes(), prompt)
 
     def test_review_stage_two_retry_waits_for_the_submitted_turn_without_another_prompt(self) -> None:
-        def interrupt_stage_two() -> None:
-            if len(self.fixture.agent.submitted) == 1:
-                write_text_atomic(self.ready, "ready\n")
-            else:
-                pane = self.fixture.agent.submitted[-1][0]
-                self.fixture.fixture.world.locations[pane]["agent_status"] = "working"
-                self.fixture.agent.interrupt = "prompt"
-                self.fixture.agent.finish_after = 1
-
-        self.fixture.agent.during_prompt = interrupt_stage_two
         first = self.launch_review()
-        self.assertNotEqual(first.returncode, 0, first.stdout + first.stderr)
+        self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+        write_text_atomic(self.ready, "ready\n")
+        self.fixture.agent.finish_after = 1
+        self.assertEqual(self.fixture.finish("review", turn_end.EventKind.STAGE_READY), turn_end.TurnOutcome.SUBMITTED)
         submitted = self.fixture.agent.submitted.copy()
         self.assertEqual(len(submitted), 2)
-        self.fixture.agent.during_prompt = lambda: None
         repeated = self.launch_review()
         self.assertEqual(repeated.returncode, 0, repeated.stdout + repeated.stderr)
         self.assertEqual(self.fixture.agent.submitted, submitted)
-        self.assertEqual(self.fixture.agent.waited, [submitted[-1][0]])
+        self.assertEqual(self.fixture.agent.waited, [])
+        self.fixture.agent.complete(submitted[-1][0])
+        self.assertEqual(self.fixture.finish("review"), turn_end.TurnOutcome.DONE)
         second_id = submitted[-1][1].split("DONE ")[-1].split(".")[0]
         self.assertTrue((self.phase / "review_summary_1.txt").read_text().endswith(f"DONE {second_id}\n"))
 
     def test_review_stage_one_done_does_not_complete_stage_two_or_replace_the_report(self) -> None:
-        def omit_stage_two_done() -> None:
-            if len(self.fixture.agent.submitted) == 1:
-                write_text_atomic(self.ready, "ready\n")
-            else:
-                self.fixture.agent.without_done = True
-
-        self.fixture.agent.during_prompt = omit_stage_two_done
         summary = self.phase / "review_summary_1.txt"
         summary.parent.mkdir(parents=True)
         write_text_atomic(summary, "The previous full report.\n")
         result = self.launch_review()
-        self.assertEqual(result.returncode, worker.ExitCode.NO_DONE, result.stdout + result.stderr)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        write_text_atomic(self.ready, "ready\n")
+        self.fixture.agent.without_done = True
+        self.assertEqual(self.fixture.finish("review", turn_end.EventKind.STAGE_READY), turn_end.TurnOutcome.SUBMITTED)
+        self.assertEqual(self.fixture.finish("review"), turn_end.TurnOutcome.NO_DONE)
         self.assertEqual(len(self.fixture.agent.submitted), 2)
         self.assertEqual(summary.read_text(), "The previous full report.\n")
-        self.assertEqual((self.phase / "review_status_1").read_text(), "error\n")
+        self.assertEqual((self.phase / "review_status_1").read_text(), "running\n")
         state = read_object(self.fixture.run_dir / "progress_history_state.json")
         self.assertEqual(assign.object_map(assign.object_map(state["pass"])["review"])["status"], "active")
 
@@ -476,7 +502,8 @@ class HerdrClaimFixture(AssignClaudeLauncherFixture):
 
 
 @final
-class AssignLauncherTests(AssignLauncherFixture):
+class AssignLauncherTests(HookAssignmentFixture):
+
     def test_claude_worker_returns_through_start_and_then_follows_its_codex_thread(self) -> None:
         self.commit_project()
         cases = ((False, True), (True, True), (True, False))
@@ -529,6 +556,7 @@ class AssignLauncherTests(AssignLauncherFixture):
                     result = invoke_assignment(arguments, os.environ.copy())
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr +
                                  "\n".join(path.read_text() for path in (self.session_dir / "phases/7").glob("*_agent.log")))
+                self.assertEqual(self.native.finish(name), turn_end.TurnOutcome.DONE)
                 moved = staff.by_id(row.id)
                 assert moved is not None
                 self.assertNotEqual(moved.current_session, row.current_session)
@@ -556,7 +584,8 @@ class AssignLauncherTests(AssignLauncherFixture):
     def test_incomplete_dispatch_rerun_keeps_its_pass_and_only_waits(self) -> None:
         self.native.agent.without_done = True
         first = self.launch()
-        self.assertEqual(first.returncode, worker.ExitCode.NO_DONE, first.stdout + first.stderr)
+        self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+        self.assertEqual(self.native.finish("impl"), turn_end.TurnOutcome.NO_DONE)
         state = read_object(self.session_dir / "progress_history_state.json")
         passed = assign.object_map(assign.object_map(state["pass"])["impl"])
         self.assertEqual(passed["status"], "active")
@@ -569,11 +598,13 @@ class AssignLauncherTests(AssignLauncherFixture):
         self.native.agent.finish_after = 1
         repeated = self.launch()
         self.assertEqual(repeated.returncode, 0, repeated.stdout + repeated.stderr)
+        self.native.agent.complete(pane)
+        self.assertEqual(self.native.finish("impl"), turn_end.TurnOutcome.DONE)
         state = read_object(self.session_dir / "progress_history_state.json")
         finished = assign.object_map(assign.object_map(state["pass"])["impl"])
         self.assertEqual((finished["instance_id"], finished["status"]), (identity, "completed"))
         self.assertEqual(self.native.agent.submitted, submitted)
-        self.assertEqual(self.native.agent.waited, [pane])
+        self.assertEqual(self.native.agent.waited, [])
         self.assertEqual(sum(event.get("event_type") == "pass_started" for event in self.events()), 1)
 
     def test_unnamed_assignment_finishes_the_selected_workers_pass_and_artifacts(self) -> None:
@@ -588,6 +619,7 @@ class AssignLauncherTests(AssignLauncherFixture):
                      "--prompt", str(self.prompt), "--paths", str(self.paths), "--session-dir", str(self.session_dir)]
         result = invoke_assignment(arguments, os.environ.copy())
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.native.finish("impl2"), turn_end.TurnOutcome.DONE)
         state = read_object(self.session_dir / "progress_history_state.json")
         passed = assign.object_map(assign.object_map(state["pass"])["impl"])
         self.assertEqual((passed["worker_name"], passed["worker_id"], passed["status"]),
@@ -595,7 +627,7 @@ class AssignLauncherTests(AssignLauncherFixture):
         phase = self.session_dir / "phases/7"
         self.assertEqual((phase / "impl2_status").read_text(), "done\n")
         self.assertIn(self.native.agent.final, (phase / "impl2_summary.txt").read_text())
-        self.assertIn("done", (phase / "impl2_agent.log").read_text())
+        self.assertIn("submitted", (phase / "impl2_agent.log").read_text())
         self.assertEqual(read_object(phase / "dispatch_2_paths.json")["worker"], "impl2")
         self.assertEqual(staff.by_id(opened.row.id), opened.row)
 
@@ -758,16 +790,17 @@ class AssignLauncherTests(AssignLauncherFixture):
         )))
         with patch.dict(os.environ, {"UNIT_RESOLVES_ROUND": "1"}):
             result = self.launch("fix")
-        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
-        self.assertIn("repair resolution failed", result.stderr)
+        self.assertEqual(result.returncode, 1 if worker_failed else 0, result.stdout + result.stderr)
+        details = result.stderr if worker_failed else self.native.agent.notices[-1]
+        self.assertIn("repair resolution failed", details)
         name = next(iter(self.assignment_records()))
         status = self.session_dir / f"phases/7/{name}_status"
         self.assertEqual(status.read_text(), "error\n")
         ended = [event for event in self.events() if event.get("event_type") == "pass_finished"]
-        self.assertEqual([event["status"] for event in ended], ["error"] if worker_failed else ["completed"])
+        self.assertEqual([event["status"] for event in ended], ["error"])
         ledger.rmdir()
         _ = saved.rename(ledger)
-        repaired = self.run_resolution_commands(result.stderr)
+        repaired = self.run_resolution_commands(details)
         self.assertEqual(repaired.returncode, 0, repaired.stdout + repaired.stderr)
         self.assertEqual(self.turn_starts, 1)
         self.assertEqual(self.repair_state()["rounds"][-1]["outcome"], "abandoned" if worker_failed else "landed")

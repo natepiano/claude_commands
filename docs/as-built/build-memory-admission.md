@@ -43,14 +43,19 @@ The next check handles an unusable cloud setting like other unusable settings.
 The API supplies `progress_profile.publish_counter` for the route to write module counts.
 The service removes the progress files when the reservation ends.
 
-The queue view and card show cloud rows under `Cloud`, with used slots and total slots.
-Each row shows the unit, step, state, module counts, vCPUs, and elapsed time.
+The queue view and the build page show each cloud gate in the main table.
+A running row shows machine `aws` and its vCPU count.
+The last column shows the state, module count, and failed modules.
+A waiting row shows `cloud` in the # column and its slot wait text.
+Its machine and vCPU cells stay blank.
+The Head line shows `cloud N of M slots`.
+The selected cloud step card keeps its `Cloud` lines.
 Missing progress and module counts have explicit display states.
-Waiting rows show their cloud slot wait.
 `cloud_gate_stale_pushes=3` sets the update age threshold in `config/build_admission.conf`.
 The queue reading carries the checked threshold to the display.
 The display reads the push interval from `conf.read("cloud_gate").number("log_push_s")`.
-An older update shows `no update for <age>`.
+An older update shows `no update for <age>` in red.
+The display uses one age formatter for the table, the card, and the feed.
 `CloudPushIntervalUnavailable` names an unavailable push interval.
 The display omits the stale age when the push interval is unavailable.
 
@@ -410,11 +415,11 @@ Merge-gate peaks keep their separate class and remain in the anonymous history.
 The gate uses its own cap, so Cargo estimates do not use those peaks.
 
 Five keyed rows exclude the older unkeyed rows for the same repository.
-With one to four own rows, a non-build estimate uses their largest peak or a lower pool p90.
+With one to four own rows, a non-build estimate uses their largest peak or a lower ranked pool peak.
 A repository without own history keeps the pool and fallback order.
 A full test estimate with a package keeps only rows whose package and scope match.
 Other steps, and requests with no package, keep the recorded scope rule.
-A filtered compile estimate (`filtered_history_peak`) takes the larger of two anonymous p90 values:
+A filtered compile estimate (`filtered_history_peak`) takes the larger of two ranked anonymous peaks:
 the exact filter set's rows and the package's filtered rows.
 Indexed peaks times `ANON_SHARE` come next, exact filter first. Check or build compile peaks come last.
 A full-suite estimate does not cap a filtered compile estimate.
@@ -575,8 +580,9 @@ The cause is in the selection of history rows, not in the tier order:
 2. A full test estimate with a package mixed every package and older filtered rows: 79 high promises.
 3. Three high promises came from large earlier samples. The fix keeps them.
 
-The fix recovers the missing fields from the indexed argv, selects full test rows by package and scope,
-and takes the larger of the exact-filter and package p90 before any indexed tier.
+The selector recovers missing fields from the indexed argv.
+It selects full test rows by package and scope.
+It uses the larger exact-filter or package ranked peak before any indexed tier.
 
 | Compile class | Budget GiB | Runs | Under-half before | Under-half after | Over-three before | Over-three after |
 |---|---:|---:|---:|---:|---:|---:|
@@ -598,7 +604,14 @@ Promises under half the peak rose from 395 to 423, and ten repositories got wors
 The adopt rule needs fewer under-half promises in total and no rise in any repository, so bands are not adopted and the estimate is unchanged.
 
 Build estimates use completed same-shape history from the last 14 days.
-Ten or more earlier runs supply p90. One to nine earlier runs supply their largest peak.
+Ten or more earlier runs supply a ranked peak. One to nine earlier runs supply their largest peak.
+`ShapeRankedPeak` records the run count and the share used to select the peak.
+Stored `shape_ranked_peak` records retain that share; the decoder reads older `shape_p90` records as share 10.
+The wire retains protocol version 2.
+The encoder writes share-10 bases with the older `ShapeP90` tag and no share field.
+The wire decoder reads older `ShapeP90` tags as `ShapeRankedPeak` with share 10.
+Other shares use the `ShapeRankedPeak` tag and retain their recorded share.
+A config change introduces those shares after deployment of the new service.
 The newest failed-build floor can raise that base.
 Each new estimate reads `[memory]` in `config/build_admission.conf` through `memory_config()`.
 A dev build uses `ceil(base × dev_size_factor + margin_bytes)`.
@@ -648,7 +661,7 @@ An unavailable reading keeps the full accepted need aside and makes the cap unav
 The service freezes `TestPhaseNeed` and its margin when it writes a nextest reservation need.
 A width update selects history again at the recorded width.
 `test_phase_need` uses the existing history selector through `store.locked_rows`.
-The selector uses the p90 test-phase peak from matching repository, scope, package, filters, and width history.
+The selector uses the ranked test-phase peak from matching repository, scope, package, filters, and width history.
 `test_phase_margin=1.2` has range `1..`. Missing or invalid values use `TEST_PHASE_MARGIN_FALLBACK`, which is 1.2.
 The config reader resolves the margin once. Each reservation retains its selected margin.
 `record.read_test_phase` supplies the observed test window and test peak.
@@ -1499,17 +1512,19 @@ No adaptive controller, fixed admission limit, order window, CI growth promise, 
 
 ### Progress memory profiles
 
-Merge gates start with the p90 of their host's recorded peaks from the last 14 days, as other programs do.
+Merge gates start with a ranked peak from their host's recorded peaks from the last 14 days, as other programs do.
 Without history, they use `program_first_peak_gib.merge-gate` from `config/build_admission.conf`.
-Matching progress profiles still determine the running need; `progress_profile_rank` applies only to progress bins.
+Matching progress profiles still determine the running need.
 
 Cargo build, check, clippy, mend, nextest, and merge gates record attributed swap-backed use in five-percent phase bins.
-Each bin selects the Nth-highest run value from matching completed profiles.
-`progress_profile_rank=2` sets N in `config/build_admission.conf`.
-A bin with fewer than N measurements uses its lowest measured run value.
-Rank 1 selects the highest run value.
-The service validates the rank through its existing configuration check before each pass.
-It rebuilds merged profiles when the rank changes.
+Progress bins and program peaks use one ranked selection rule.
+For count `n`, the rule selects the Nth-highest value, with `N = min(n, max(floor, n * share // 100 + 1))`.
+`peak_history_share_percent=10` sets the share in `config/build_admission.conf`; its whole-percent range is 0 through 50.
+Progress bins use `progress_profile_rank=2` as the floor; program peaks and nextest phase peaks use floor 1.
+At a 10% share, floor 1 gives the previous p90 result, including counts divisible by ten.
+A count below the floor selects the lowest available value.
+The service checks the rank and share before each pass.
+It rebuilds merged profiles when the rank or share changes.
 The service applies each step's recorded headroom rule to the highest selected bin within its look-ahead window.
 `progress_lookahead_percent` is read at use; its initial value is 20.
 The window crosses Cargo phase boundaries, including repeated build phases.
@@ -1614,3 +1629,44 @@ Set `TMPDIR` to a shared runner-owned directory if `PrivateTmp` hides the defaul
 For example, `/run/build-admission/ci/<uid>` uses mode `0755` and the runner's ownership.
 The fixed slice limits remain `MemoryMax=34G` and `MemorySwapMax=2G`.
 The service authorization and protocol must be live before runner socket access starts.
+
+## Test selection and fresh-build evidence
+
+`scripts/build_queue/step_estimator.py` owns the test-history selection and freshness checks.
+`verify_test_selection` returns `PackageTestSelection(package, filters)` only for the whole positive expression that verify emits.
+It accepts a package with one `test()` predicate or a union of those predicates.
+A bare package expression selects a full package run.
+Every other expression gives `BroadTestSelection`.
+Negation cannot supply an exact filter key.
+`test_selection` parses package, scope, and canonical sorted filters together.
+A package-less filtered run keeps broad filtered history.
+Waiter estimates reuse a selection only when package and filters match.
+
+`filtered_history_peak` uses the larger exact-filter and package-filtered anonymous p90.
+It then tries indexed exact-filter peaks, indexed package peaks, and package check/build compile peaks.
+Indexed peaks use `ANON_SHARE`.
+Without usable compile history, it uses `FILTERED_FLOOR`, which is 1 GiB.
+A full-suite estimate does not cap this compile estimate.
+The recorded package, filters, and scope take priority over values recovered from argv.
+
+`is_fresh_test` reads the last completed nextest step for the same worktree, package, and scope.
+That step must have the same `test_build_key` and either status 0 or a positive test count.
+It must end less than 24 hours before the estimate.
+Both Cargo output roots must still exist.
+No matching deletion record or later sweep with unknown or positive freed bytes may invalidate them.
+A read error, malformed JSONL tail, missing key, or unknown output roots rejects freshness.
+`current_worktree_steps` uses an index prefix only after validating its file marks and then reads the JSONL tail.
+The index cannot hide a newer step.
+
+`fresh_test_peak` uses completed zero-compile measurements from the same package and scope.
+It tries exact-filter anonymous and indexed history before package history.
+It joins anonymous rows by call id and keeps the 1 GiB floor.
+`NoFreshHistory` returns the estimate to its compile-history path.
+Fresh waiters receive another estimate at each check.
+
+`TreeInputs.keys` writes the build key and both output roots through `VERIFY_TEST_BUILD_INPUTS_FILE`.
+The key excludes run-only filters and result-environment values.
+It retains Cargo inputs and `NEXTEST_CARGO_PROFILE`.
+`record.py` stores `test_build_key` only when source stays unchanged during nextest.
+Rows without a key cannot prove a fresh build.
+The broader `BUILDLOG_TREE` field cannot replace this key.
