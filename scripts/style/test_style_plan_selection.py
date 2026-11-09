@@ -5,6 +5,7 @@ from __future__ import annotations
 from scripts.production.staff_test_support import foreign_hostname
 
 from scripts.style.ledger_test_support import ticket_owner_id
+from scripts.style.style_config import StyleUnitAssignment
 
 import errno
 import io
@@ -18,7 +19,7 @@ from typing import final
 from unittest import mock
 
 
-from scripts.style import style_plan
+from scripts.style import style_plan, unit_plans
 from scripts.style import style_proposals
 
 from scripts.lib import berth_board
@@ -240,13 +241,15 @@ class StylePlanTests(StylePlanFixture):
             ticket = self.select_for_family("modules", plan)
         self.assertEqual((ticket["kind"], ticket["files"]), ("structure", list(self.sources[:2])))
 
-    def test_borrowed_structure_skips_product_reservations_and_refill_is_idempotent(self) -> None:
+    def test_owned_structure_skips_product_reservations_and_refill_is_idempotent(self) -> None:
         structure = self.rule("structure", "tier: D\nfamily: modules\ninput_scope: file\n")
         _ = self.rule("read")
         self.sync()
         held, available = self.sources[:2]
         _ = self.plan.write_text(self.plan_header().replace("## Phases", "**Pilot scope:** alpha\n\n## Phases"))
-        # Own modules and borrowed modules use the same busy set before slicing.
+        self.style_units((StyleUnitAssignment("names", ("names", "modules")),
+                          StyleUnitAssignment("values", ("values",)), StyleUnitAssignment("types", ("types",))))
+        # Owned families use the same busy files before selection.
         candidates = self.candidates("modules", blocked=(held,))
         self.assertEqual({path for ticket in candidates for path in ticket.files}, set(self.sources[1:]))
         ledger = self.ledger()
@@ -288,15 +291,18 @@ class StylePlanTests(StylePlanFixture):
         finding, = self.ledger().proposal_findings(issue)
         _ = self.git("rm", finding.path)
         self.commit_to_every_checkout()
-        # A prior declaration reading cannot make a file missing at today's tip buildable.
+        for path in self.sources[1:]:
+            self.record(read, path, self.tip)
+        # A declaration reading cannot make a missing file available.
         follow = style_proposals.FollowRun(style_ledger.DeclarationReading(
             self.tip, (style_ledger.DeclarationInPlace(finding),)), (), ())
         with mock.patch.object(style_proposals, "run_follow", return_value=follow):
-            ticket = self.select_for_family("modules", plan)
+            result = style_plan.next_phase("modules", plan, self.repo)
+        self.assertIsInstance(result, style_plan.WaitingForSync)
         self.assertIsInstance(self.ledger().proposal_findings(issue)[0].state, style_ledger.Waived)
-        self.assertNotIn(finding.path, ticket["files"])
+        self.assertEqual(self.ledger().ticket_open(ticket_owner_id("modules")), ())
 
-    def test_modules_keeps_approved_decisions_first_without_blocked_cells(self) -> None:
+    def test_modules_selects_tier_d_before_an_unrelated_approved_decision(self) -> None:
         plan = self.modules_unit()
         structure = self.rule("structure", "tier: D\nfamily: modules\ninput_scope: file\n")
         self.sync()
@@ -305,26 +311,175 @@ class StylePlanTests(StylePlanFixture):
         ticket = self.select_for_family("modules", plan)
 
         self.assertEqual((ticket["kind"], ticket["family"], ticket["files"]),
-                         ("proposal", "modules", [self.sources[2]]))
-        self.assertEqual(ticket["finding_ids"], [self.ledger().proposal_findings(issue)[0].finding_id])
+                         ("structure", "modules", list(self.sources[:2])))
+        self.assertIsInstance(self.ledger().proposal_findings(issue)[0].build_ticket, style_ledger.NoBuildTicket)
 
-    def test_values_takes_its_blocking_structure_before_borrowing_a_proposal(self) -> None:
+    def test_values_waits_for_structure_owned_by_another_unit(self) -> None:
         plan = self.values_unit()
-        values = self.rule("values", "tier: C\nfamily: values\ninput_scope: file\n")
-        structure = self.rule("structure", "tier: D\nfamily: modules\ninput_scope: file\n")
-        names = self.rule("read")
+        _ = self.rule("values", "tier: C\nfamily: values\ninput_scope: file\n")
+        _ = self.rule("structure", "tier: D\nfamily: modules\ninput_scope: file\n")
         self.sync()
+
+        result = style_plan.next_phase("values", plan, self.repo)
+
+        self.assertIsInstance(result, style_plan.WaitingForStructure)
+        self.assertEqual(self.ledger().ticket_open(ticket_owner_id("values")), ())
+
+    def test_one_unit_selects_tier_d_then_families_by_rank(self) -> None:
+        families: tuple[rules.Family, ...] = ("names", "values", "types", "modules")
+        self.style_units((StyleUnitAssignment("names", families),))
+        owned = {family: self.rule("owned-" + family,
+                 f"tier: {'D' if family == 'modules' else 'C'}\nfamily: {family}\ninput_scope: file\n")
+                 for family in families}
+        self.sync()
+        for family, path in zip(families, self.sources, strict=True):
+            for other in self.sources:
+                if other != path:
+                    self.record(owned[family], other, self.tip)
+
+        for family in ("modules", *rules.FAMILY_RANKS):
+            with self.subTest(family=family):
+                ticket = self.select_for_family("names", self.plan)
+                self.assertEqual((ticket["family"], ticket["rules"]), (family, [owned[family]]))
+                self.ledger().ticket_drop(ticket["id"])
+                for path in self.sources:
+                    self.record(owned[family], path, self.tip)
+
+    def test_one_and_four_units_keep_each_tickets_rule_family(self) -> None:
+        _ = self.modules_unit()
+        _ = self.types_unit()
+        _ = self.values_unit()
+        families: tuple[rules.Family, ...] = ("names", "values", "types", "modules")
+        owned = {family: self.rule("partition-" + family,
+                 f"tier: {'D' if family == 'modules' else 'C'}\nfamily: {family}\ninput_scope: file\n")
+                 for family in families}
+        self.sync()
+        for family, path in zip(families, self.sources, strict=True):
+            for other in self.sources:
+                if other != path:
+                    self.record(owned[family], other, self.tip)
+        partitions = (tuple(StyleUnitAssignment(family, (family,)) for family in families),
+                      (StyleUnitAssignment("names", families),))
+        selections: list[set[tuple[str, str]]] = []
+        for assignments in partitions:
+            self.style_units(assignments)
+            ledger = self.ledger()
+            scopes = unit_plans.family_pilot_scopes(self.doc, self.repo)
+            definitions = {rule.rule_id: rule for rule in rules.load_rules(self.repo)}
+            tickets = tuple(ticket for assignment in assignments for ticket in style_plan.ranked_candidates(
+                self.repo, ledger, style_plan.BusyFiles(self.board(), frozenset()), assignment.families,
+                unit_plans.AllCrates(), scopes, self.base(), frozenset(), definitions, tuple(ledger.cells())))
+            selections.append({(rule, ticket.family) for ticket in tickets for rule in ticket.rules})
+        self.assertEqual(selections[0], selections[1])
+        self.assertEqual(selections[0], {(rule, family) for family, rule in owned.items()})
+
+    def test_combined_unit_keeps_another_owned_familys_queued_ticket(self) -> None:
+        self.style_units((StyleUnitAssignment("names", ("names", "types")),
+                          StyleUnitAssignment("values", ("values",)), StyleUnitAssignment("modules", ("modules",))))
+        names = self.rule("queued-names")
+        types = self.rule("queued-types", "tier: C\nfamily: types\ninput_scope: file\n")
+        self.sync()
+        ledger = self.ledger()
+        ledger.ticket_add("4001", ticket_owner_id("names"), "read", "names", "crates/alpha", [self.sources[0]], [names])
+        ledger.ticket_add("4002", ticket_owner_id("names"), "read", "types", "crates/beta", [self.sources[2]], [types])
+        for path in self.sources:
+            if path != self.sources[2]:
+                self.record(types, path, self.tip)
+
+        ticket = self.select_for_family("names", self.plan)
+
+        self.assertEqual((ticket["id"], ticket["family"]), ("4002", "types"))
+        self.assertEqual([item["id"] for item in ledger.queued_tickets(ticket_owner_id("names"))], ["4001"])
+
+    def test_unit_does_not_select_another_owners_approved_findings(self) -> None:
+        plan = self.values_unit()
+        values = self.rule("foreign-values", "tier: C\nfamily: values\ninput_scope: file\n")
+        self.sync()
+        issue = self.borrowing_decision(values, "values", self.sources[0])
+
+        result = style_plan.next_phase("names", self.plan, self.repo)
+
+        self.assertIsInstance(result, style_plan.WaitingForSync)
+        self.assertEqual(self.ledger().ticket_open(ticket_owner_id("names")), ())
+        self.assertIsInstance(self.ledger().proposal_findings(issue)[0].build_ticket, style_ledger.NoBuildTicket)
+        self.assertTrue(plan.exists())
+
+    def test_combined_unit_filters_approved_findings_by_their_rule_family(self) -> None:
+        self.style_units((StyleUnitAssignment("names", ("names", "types")),
+                          StyleUnitAssignment("values", ("values",)), StyleUnitAssignment("modules", ("modules",))))
+        names = self.rule("approved-names")
+        types = self.rule("approved-types", "tier: C\nfamily: types\ninput_scope: file\n")
+        self.sync()
+        names_issue = self.approved_decision(names, self.sources[:1], "type", name="names")
+        types_issue = self.approved_decision(types, self.sources[2:3], "type", name="types")
+        for rule in (names, types):
+            for path in self.sources:
+                self.record(rule, path, self.tip)
+
+        ticket = self.select_for_family("names", self.plan)
+
+        self.assertEqual((ticket["kind"], ticket["family"], ticket["rules"]), ("proposal", "types", [types]))
+        self.assertEqual(ticket["finding_ids"], [self.ledger().proposal_findings(types_issue)[0].finding_id])
+        self.assertIsInstance(self.ledger().proposal_findings(names_issue)[0].build_ticket, style_ledger.NoBuildTicket)
+
+    def test_combined_unit_ranks_coverage_before_a_lower_family_decision(self) -> None:
+        self.style_units((StyleUnitAssignment("names", ("names", "types")),
+                          StyleUnitAssignment("values", ("values",)), StyleUnitAssignment("modules", ("modules",))))
+        names = self.rule("approved-names")
+        types = self.rule("pending-types", "tier: C\nfamily: types\ninput_scope: file\n")
+        self.sync()
+        issue = self.approved_decision(names, self.sources[:1], "type")
         for path in self.sources:
             self.record(names, path, self.tip)
-        issue = self.borrowing_decision(names, "names", self.sources[2])
+            if path != self.sources[2]:
+                self.record(types, path, self.tip)
 
-        ticket = self.select_for_family("values", plan)
+        ticket = self.select_for_family("names", self.plan)
 
-        self.assertEqual((ticket["kind"], ticket["family"], ticket["rules"], ticket["files"]),
-                         ("structure", "modules", [structure], list(self.sources[:2])))
-        self.assertNotIn(values, ticket["rules"])
+        self.assertEqual((ticket["kind"], ticket["family"], ticket["rules"]), ("read", "types", [types]))
         self.assertIsInstance(self.ledger().proposal_findings(issue)[0].build_ticket, style_ledger.NoBuildTicket)
-        self.assertIn("Borrowed from modules: values has no buildable work (waiting for structure).", plan.read_text())
+
+    def test_combined_unit_ranks_structure_before_another_familys_queue(self) -> None:
+        self.style_units((StyleUnitAssignment("names", ("names", "modules")),
+                          StyleUnitAssignment("values", ("values",)), StyleUnitAssignment("types", ("types",))))
+        names = self.rule("queued-names")
+        structure = self.rule("pending-structure", "tier: D\nfamily: modules\ninput_scope: file\n")
+        self.sync()
+        ledger = self.ledger()
+        ledger.ticket_add("4001", ticket_owner_id("names"), "read", "names", "crates/alpha", [self.sources[0]], [names])
+
+        ticket = self.select_for_family("names", self.plan)
+
+        self.assertEqual((ticket["kind"], ticket["family"], ticket["rules"]), ("structure", "modules", [structure]))
+        self.assertEqual([item["id"] for item in ledger.queued_tickets(ticket_owner_id("names"))], ["4001"])
+
+    def test_combined_unit_selects_an_approved_tier_d_finding_before_types_coverage(self) -> None:
+        self.style_units((StyleUnitAssignment("names", ("names", "types", "values", "modules")),))
+        structure = self.rule("approved-structure", "tier: D\nfamily: modules\ninput_scope: file\n")
+        types = self.rule("pending-types", "tier: C\nfamily: types\ninput_scope: file\n")
+        self.sync()
+        issue = self.approved_decision(structure, self.sources[:1], "type")
+        for path in self.sources:
+            self.record(structure, path, self.tip)
+            if path != self.sources[2]:
+                self.record(types, path, self.tip)
+
+        for queued, busy, family in ((False, False, "modules"), (True, False, "modules"), (True, True, "types")):
+            with self.subTest(queued=queued, busy=busy):
+                ledger = self.ledger()
+                if queued and not busy:
+                    ledger.ticket_add("4001", ticket_owner_id("names"), "read", "types", "crates/beta",
+                                      [self.sources[2]], [types])
+                board = self.board(self.sources[0]) if busy else self.board()
+                with mock.patch.object(berth_board, "read_board", return_value=board):
+                    ticket = self.select_for_family("names", self.plan)
+                self.assertEqual((ticket["kind"], ticket["family"], ticket["rules"]),
+                                 ("read", "types", [types]) if busy else ("proposal", family, [structure]))
+                if not busy:
+                    self.assertEqual(ticket["finding_ids"], [ledger.proposal_findings(issue)[0].finding_id])
+                if queued and not busy:
+                    self.assertEqual([row["id"] for row in ledger.queued_tickets(ticket_owner_id("names"))], ["4001"])
+                ledger.ticket_drop(ticket["id"])
 
     def test_refill_blob_failures_do_not_reissue_held_cells(self) -> None:
         read = self.rule("read", "tier: C\nfamily: names\ninput_scope: crate\n")

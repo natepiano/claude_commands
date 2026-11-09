@@ -7,7 +7,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
-from scripts.style import rules
+from scripts.style import rules, style_config
 from scripts.style import style_ledger
 from scripts.production import unit_config
 from scripts.style.unit_files import unit_worktrees
@@ -72,14 +72,18 @@ def unit_plan_path(unit: str, worktree: Path) -> Path:
 def family_plan_texts(doc: Path) -> Mapping[rules.Family, str | MissingUnitPlan]:
     """Read each style unit's own standing plan copy."""
     texts: dict[rules.Family, str | MissingUnitPlan] = {}
-    for row in unit_worktrees(doc):
-        family = rules.style_family(row.unit)
-        if isinstance(family, rules.NotStyleUnit):
+    config = style_config.read_config(doc, unit_branch="")
+    worktrees = {row.unit: row.worktree for row in unit_worktrees(doc)}
+    for assignment in config.assignments:
+        if assignment.unit not in worktrees:
             continue
+        text: str | MissingUnitPlan = MissingUnitPlan()
         try:
-            texts[family] = unit_plan_path(row.unit, row.worktree).read_text()
+            text = unit_plan_path(assignment.unit, worktrees[assignment.unit]).read_text()
         except (FileNotFoundError, style_ledger.LedgerError):
-            texts[family] = MissingUnitPlan()
+            pass
+        for family in assignment.families:
+            texts[family] = text
     return texts
 
 
