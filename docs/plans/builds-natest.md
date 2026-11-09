@@ -1963,7 +1963,7 @@ A changed `config/<name>.conf` selects every test module whose transitive import
 **Ruled out:**
 - A narrower closure: the wide selection follows the approved design.
 
-### Phase 97 — The remote copies review test uses half its CPU again  · status: todo
+### Phase 97 — The remote copies review test uses half its CPU again  · status: done
 **Depends on:** none
 
 #### Work Order
