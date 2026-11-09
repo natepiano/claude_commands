@@ -1,5 +1,7 @@
 # Repair rounds: evidence study
 
+Changes took effect: 56b8f93be3d2d16151ac3ae4080bdb17cfa4abeb on main, 2026-10-28T21:26:05-04:00
+
 The study covers the **15 phases with the most repair rounds** among the 1,867 phases started in the 60 days to 2026-10-20 (mixed records removed): **260 repair rounds and 271 hours of fix time**. These figures describe those 15 phases, not all phases. In them, failed fixes account for **36% of rounds and 49% of time**; specification gaps account for **17% and 19%**; mechanical work accounts for **15% and 11%**. These rounded figures come from [Totals](#totals); the three mixed records are excluded. Medians and phase/time shares in the round report use reviewed phases only; unreviewed phases remain in its rows and totals.
 
 ## Milestones
@@ -1114,3 +1116,633 @@ No other fix-failed row is counted. Rank 2 R19–R23 repairs retained regression
 **Measure:** Exposure is a phase with a repair prompt whose **planned edited paths reach an already accepted behavior or check**, determined from callers, verdicts and tests before the patch. Include phases where those checks prevent all regressions. Target at least **10% fewer fix-regressed original-phase rounds per exposed phase**. Report regression-check and review costs, moved work and any proven seconds spent nowhere separately. Beside the target apply the shared 0 holds/merge-defect increase, 100% due follow-up closure, no escaped defect, 30 after exposed phases and 20/10/12 per-window samples. Missing accepted baseline, follow-up or review evidence is inconclusive. Hand roots determine the regression rate; corrected `history.py rounds` totals and windowed `review_regime.py report` fields give time and merge quality.
 
 **Answers:** Adopt as a 30-exposed-phase trial (**recommended**); adopt with the named change “apply accepted-check lists only to integration, lifecycle and visible-layout repairs”; do not adopt and retain the new-finding regression-test requirement alone.
+
+## Effect
+
+The evidence does not establish a pass for any ready proposal. P3 is not ready.
+The other proposals remain inconclusive under the shared sample and evidence rules.
+The showrunner permits this report to finish while a proposal remains not ready.
+
+### Boundary and commands
+
+C1 confirms the effective main boundary from the local main reflog.
+The preceding main head excludes the Phase 5 checkpoint.
+The next main head contains it.
+Its commit time precedes the main update time; the windows use the main update time.
+
+| Field | Value | Command |
+| --- | --- | --- |
+| Phase 5 checkpoint | `56b8f93be3d2d16151ac3ae4080bdb17cfa4abeb` | C1 |
+| First main head containing it | `535426d3e80960bad7078382fa49a18db8129d16` | C1 |
+| Effective main update | 2026-10-28T21:26:05-04:00 | C1 |
+| Before window | [2026-09-28T21:26:05-04:00, 2026-10-28T21:26:05-04:00) | C2 |
+| After window | [2026-10-28T21:26:05-04:00, 2026-11-09T03:32:17+00:00] | C2 |
+
+C1:
+
+```sh
+git -C ~/.claude reflog show main --date=iso-strict --format='%H %gD %gs' |
+  rg '2026-10-28T21:(11:53|26:05)-04:00'
+git -C ~/.claude merge-base --is-ancestor 56b8f93be 8e8151c498da2815e8102695a3de050d6458d3bb
+# The preceding command returns 1.
+git -C ~/.claude merge-base --is-ancestor 56b8f93be 535426d3e80960bad7078382fa49a18db8129d16
+# The preceding command returns 0.
+```
+
+C2 below reads recorded events through the fixed upper bound.
+It uses `rounds.load_phases` and `rounds.phase_rounds`, the API used by `history.py rounds`.
+This preserves the CLI's phase-start selection without using its reviewed-only summary for proposal statistics.
+The extraction uses the checkout at `a9446764001d94fdd9ee0b638f53678455e9ae35`.
+It applies the same API to both windows.
+It includes refunded-batch and relaunch corrections present at that revision.
+These corrections differ from the earlier study's interval implementation.
+
+C2 reads `~/.local/state/plan-delegate/runs/*.jsonl` directly.
+It reads review rows through `review_regime.read_rows()`.
+It does not read live staff, processes, or unit state.
+The fixed upper bound excludes later finishes and closure events.
+The input digest identifies the selected run records.
+
+| Input result | Count | Sample | Command output |
+| --- | ---: | --- | --- |
+| Selected events | 154,174 | All events through the upper bound | C2 `INPUT` |
+| Phase instances | 4,152 | Selected events | C2 `INPUT` |
+| Unreadable JSON lines | 0 | All scanned lines | C2 `INPUT` |
+| Newer spine events | 0 | Events through the upper bound | C2 `INPUT` |
+
+Run-record digest: `aad4c47bfa9b75b8ba6943c175d9c7434556d189e996b84611270dd3115aa8b6` (C2 `INPUT`).
+
+### Selection and common observations
+
+Each classification gives mixed records priority over completion.
+The crossing count overlaps the classifications.
+The comparison excludes every completed phase that crosses the boundary.
+Open and mixed phases remain separate observations.
+
+| Phase selection | Before | After | Command output |
+| --- | ---: | ---: | --- |
+| All selected starts | 2,396 | 1,607 | C2 `WINDOW_before/after` |
+| Completed, non-mixed, including crossing records | 2,237 / 2,396 | 1,348 / 1,607 | C2 `classes` |
+| Open, stopped, or other non-mixed status | 89 / 2,396 | 228 / 1,607 | C2 `classes` |
+| Mixed | 70 / 2,396 | 31 / 1,607 | C2 `classes` |
+| Open at the boundary or completed across it | 132 / 2,396 | Not applicable | C2 `crossing` |
+| Completed crossing records excluded | 30 / 2,237 | Not applicable | C2 `completed_crossing` |
+| Completed phases retained for observation | 2,207 | 1,348 | C2 `metrics.n` |
+| Retained phases with no repair | 1,379 / 2,207 | 553 / 1,348 | C2 `metrics.zero` |
+
+C2 with `EFFECT_DETAIL=1` lists each excluded record under `SEPARATE_before` or `SEPARATE_after`.
+These labels retain the run, instance, phase, status, mixed check, and crossing decision.
+
+The next table describes the combined population.
+It does not estimate the effect of an individual proposal.
+Fractions retain the exact numerator and sample size.
+
+| Measure | Before | After | Command output |
+| --- | --- | --- | --- |
+| Median rounds among reviewed phases | 1; n=919 | 1; n=884 | C2 `WINDOW_*.metrics.median_reviewed` |
+| Reviewed phases with at least three rounds | 168/919 | 235/884 | C2 `heavy/reviewed` |
+| Their share of reviewed fix seconds | 3,466,882/4,592,467; n=919 phases | 1,382,822/1,980,509; n=884 phases | C2 `heavy_seconds/reviewed_seconds` |
+| Repair rounds per completed phase | 1,763/2,207 | 2,129/1,348 | C2 `rounds/n` |
+| Fix agent-seconds per completed phase | 5,270,051/2,207 | 2,154,436/1,348 | C2 `fix_seconds/n` |
+| Rounds past the hard landing | 412; n=2,207 | 637; n=1,348 | C2 `past_landing` |
+
+The API's immediate causes describe scale. They do not identify the hand roots.
+
+| Immediate cause | Before; n=2,396 selected phases | After; n=1,607 selected phases | Command output |
+| --- | ---: | ---: | --- |
+| review-code | 1,095 | 1,194 | C2 `WINDOW_*.all_causes` |
+| review-ux | 360 | 34 | C2 `WINDOW_*.all_causes` |
+| gate | 482 | 300 | C2 `WINDOW_*.all_causes` |
+| merge | 85 | 101 | C2 `WINDOW_*.all_causes` |
+| live | 12 | 0 | C2 `WINDOW_*.all_causes` |
+| other | 666 | 1,276 | C2 `WINDOW_*.all_causes` |
+
+### Exposure and verdicts
+
+The next table counts distinct completed, non-mixed phase instances.
+A recorded basis is an exposure declaration, not proof of the complete before-step evidence.
+Missing original handoffs, Work Orders, accepted baselines, and path evidence prevent a pass.
+An independent read-only writer recounted the declarations, timing exclusions, and corrected P3 count.
+
+| Proposal | Recorded completed candidates | Count used after timing or round checks | Open or other candidates | Mixed candidates | Zero-repair phases in the used count | Verdict | Command output |
+| --- | ---: | ---: | ---: | ---: | ---: | --- | --- |
+| P1 | 379 | 379 | 13 | 11 | 5/379 | inconclusive | C2 `after_P1` |
+| P2 | 266 | 255 | 19 | 11 | 39/255 | inconclusive | C2 `after_P2`, `P2_TIMING`, `P2_ONTIME` |
+| P3 | 57 | 18 | 2 qualified; 5 declared | 2 qualified; 5 declared | 0/18 | not ready | C2 `P3_DECLARED`, `after_P3` |
+| P4 | 1,324 | 1,324 | 209 | 31 | 529/1,324 | inconclusive | C2 `after_P4` |
+| P5 | 598 | 598 | 32 | 22 | 17/598 | inconclusive | C2 `after_P5` |
+
+P2 has 255 declarations before the first recorded implementation or test pass.
+Its remaining completed candidates contain seven late declarations and four without that pass.
+These counts use the same 266-phase sample (C2 `P2_TIMING`).
+The timing check does not replace an audit of the start Work Order.
+
+P3's recorded round number overstates exposure.
+The corrected decision counts distinct started ledger batches before each exposure.
+Of 57 completed declarations, 39 do not reach the qualifying round (C2 `P3_DECLARED`, `after_P3`).
+The remaining 18 phases do not meet the required 30-phase minimum.
+The earlier worker's corrected count agrees with this recount.
+P3 receives no effect judgment.
+
+P5 excludes `accepted_checks` values that start with `none:`.
+Including those values would give 658 completed candidates (C2 `P5_ANY`).
+A named accepted check still needs its accepted baseline and affected-path evidence.
+
+The before window lacks reconstructed P1, P2, and P5 exposure cohorts.
+The absence of trial declarations is not a count of unexposed phases.
+P4 has 2,162 completed baseline phases with recorded incoming pass starts (C2 `P4_BASELINE`).
+The before window lacks the same launch-check detail available after adoption.
+
+| Proposal | Before comparison | After observation, including zero repairs | Deciding limitation |
+| --- | --- | --- | --- |
+| P1 | Exposure and mechanical roots not reconstructed | n=379; median 2; 943 rounds; 1,344,743 seconds; 248 past landing | No comparable root rate or complete command-cost audit; review sample below minimum |
+| P2 | Exposure and spec-gap roots not reconstructed | n=255; median 1; 532 rounds; 619,180 seconds; 126 past landing | No comparable root rate or complete due-closure audit; review sample below minimum |
+| P3 | Not judged | n=18 qualifying phases | Exposure sample below minimum |
+| P4 | n=2,162 incoming-launch phases; accuracy not reconstructed | n=1,324; median 1; 2,129 rounds; 2,154,436 seconds; 637 past landing | Recorded activity errors; incomplete launch evidence; review sample below minimum |
+| P5 | Exposure and fix-regressed roots not reconstructed | n=598; median 2; 1,566 rounds; 1,802,672 seconds; 452 past landing | No comparable root rate or full accepted-check audit; review sample below minimum |
+
+Every after value in this table comes from C2 `after_P1`, `P2_ONTIME`, `after_P3`, `after_P4`, or `after_P5`.
+These medians use every selected exposure, including unreviewed zero-repair phases.
+They do not use the CLI's reviewed-only `_meta`.
+
+The full comparison does not have independent hand labels for every round in either window.
+Thus no target-root reduction rate is available.
+C2 with `EFFECT_DETAIL=1` emits one `ROOT_EVIDENCE` line per recorded round.
+The line includes activities, covered findings, time, cause, run, and instance.
+It is an evidence inventory, not a root classification.
+The independent writer confirmed the hand roots below.
+Neither writer substitutes the immediate cause for a root.
+
+### P4 launch and activity audit
+
+The audit keeps refusals, UX checks, and checked pass starts separate.
+A correct refusal protects the boundary and does not count as an accuracy failure.
+A matching recorded identity does not prove that the activity belongs to that phase.
+
+| Launch record | Result | Sample | Command output |
+| --- | --- | --- | --- |
+| `pass_started.launch_check` | 12,559 records | All after-window pass starts | C2 `P4_LAUNCHES` |
+| Identity mismatches | 0 | 12,559 checked starts | C2 `identity_mismatch` |
+| Missing recorded phase boundary | 0 | 12,559 checked starts | C2 `missing_boundary` |
+| Starts outside the recorded boundary | 0 | 12,559 checked starts | C2 `outside_boundary` |
+| Prompt phase line matched | 8,448 | 12,559 checked starts | C2 `prompt_matched` |
+| Prompt phase line absent | 4,111 | 12,559 checked starts | C2 `prompt_absent` |
+| UX `launch_checked` | 0 | All after-window events | C2 `P4_LAUNCHES` |
+| `launch_refused` | 566 | All after-window events | C2 `refusals` |
+| Refused stale prompt | 303 | 566 refusals | C2 `stale` |
+| Refused absent fix cause | 119 | 566 refusals | C2 `cause` |
+| Refused closed phase | 117 | 566 refusals | C2 `closed_phase` |
+| Refused missing phase | 24 | 566 refusals | C2 `missing_phase` |
+| Other refusal reason | 3 | 566 refusals | C2 `other` |
+
+Missing-phase refusals are recorded boundary protections, including requests with no phase instance.
+The count does not classify every other refusal as correct.
+Event `dd933505-3731-42fa-9d6f-94dcc96fcf5a` refuses the same phase ID because its prompt title adds a final period.
+The recorded contract requires the exact title.
+This case does not establish a wrong phase request or prove a false refusal.
+
+No recorded UX check is available for the required UX case audit.
+The missing category prevents a complete launch-accuracy conclusion.
+
+The following activity associations are wrong.
+Both launches name phase 16's Mac idle alert, but their activities and fix causes explicitly name planned ports.
+The run is `bf5b8d4c-77ff-4f7b-9318-afb6114ad8f2`.
+The phase instance is `5fe67fb8-aded-4379-b8e3-3f25476e25b6`.
+
+| Recorded round | Launch event | Activity evidence | Hand root | Agent-seconds | Command output |
+| --- | --- | --- | --- | ---: | --- |
+| 5 | `5effaac3-75bd-4d4e-8a79-5a788e22d3a4` | Port Phase 14 onto builds; cause explicitly remakes phases 14–24 under phase 16 | record | 4,502; n=1 interval | C2 `CASE`, `HAND_RECORD` |
+| 7 | `a1cbc37b-9236-4a74-84b0-272a7086a6eb` | Port Phase 1 helper-start work as a phase 16 fix | record | 896; n=1 interval | C2 `CASE`, `HAND_RECORD` |
+
+These intervals prove an activity-association defect despite matching launch identities.
+Their phase is mixed, so they remain outside comparative root totals.
+Their combined cost is 5,398 agent-seconds across two intervals (C2 `HAND_RECORD`).
+Correct labels would not prove that this work disappeared.
+The P4 accuracy target is therefore unmet in these cases.
+The shared sample rules still require an overall inconclusive verdict.
+
+### Review quality and cost
+
+The extraction bounds each row on `merged`, with both window limits.
+It first classifies explicit exclusions.
+It then classifies absent plan identity or required cost fields as insufficient evidence.
+It never converts absent values to measured zero.
+A review row can be written after its `merged` time, so a later rerun can add rows to a window.
+The run records have a fixed upper bound; the review rows do not.
+A rerun at 2026-11-08T22:40-05:00 added one excluded after row; the usable counts did not change.
+
+| Review row classification | Before; n=534 rows | After; n=762 rows | Command output |
+| --- | ---: | ---: | --- |
+| Explicitly excluded | 458 | 756 | C2 `REVIEW_before/after` |
+| Insufficient evidence | 67 | 0 | C2 `classes` |
+| Usable | 9 | 6 | C2 `classes` |
+| Required usable sample | 12 | 12 | Shared evaluation rule |
+
+| Explicit exclusion | Before; n=458 excluded | After; n=756 excluded | Command output |
+| --- | ---: | ---: | --- |
+| No visible change | 409 | 455 | C2 `exclusions` |
+| No merge design check | 42 | 301 | C2 `exclusions` |
+| Defect count absent | 1 | 0 | C2 `exclusions` |
+| Merge design check absent from log | 3 | 0 | C2 `exclusions` |
+| Final gate only | 1 | 0 | C2 `exclusions` |
+| Dependency bump only | 1 | 0 | C2 `exclusions` |
+| Repair of another merge defect | 1 | 0 | C2 `exclusions` |
+
+Among the insufficient before rows, 67 lack plan identity, 13 lack review minutes, and 38 lack repair minutes.
+These counts overlap within the same 67-row sample (C2 `REVIEW_before.missing`).
+The missing fields block a pass; they are not additional permitted exclusions.
+
+| Mean per usable row | Before; n=9 | After; n=6 | Command output |
+| --- | --- | --- | --- |
+| Holds | 0/9 | 0/6 | C2 `REVIEW_*.sums.holds` |
+| Merge design-check defects | 4/9 | 0/6 | C2 `merge_defects` |
+| Review minutes | 188/9 | 143/6 | C2 `review_minutes` |
+| UX repair minutes | 1,805/9 | 162/6 | C2 `ux_repair_minutes` |
+
+Both usable samples fall below the required minimum.
+These observations cannot establish the work-kept margins.
+They also do not establish proposal-specific margins.
+
+### Routed work and receiving phases
+
+A closure key joins the source run, phase instance, and finding.
+A matching key alone does not establish acceptance.
+
+| Route observation | Count | Sample | Command output |
+| --- | ---: | --- | --- |
+| Outgoing routes | 459 | After-window route events | C2 `ROUTES.n` |
+| Open keys | 261 | 459 routes | C2 `states` |
+| Keys with a matching closure | 198 | 459 routes | C2 `states` |
+| Closures across runs | 13 | 198 matching closures | C2 `cross_run` |
+| Closure events | 210 | After-window closure events | C2 `closure_events` |
+| Closure events without any historical route key | 12 | 210 closure events | C2 `unmatched` |
+| Distinct owner/order/due combinations | 138 | 459 routes | C2 `orders` |
+
+The independent writer checked the required closure cases.
+
+| Case | Evidence key or event | Assessment | Command |
+| --- | --- | --- | --- |
+| Open route | `a433b49e-d462-472a-9f5b-3e767f5be8b6:b62a1ee7-5c52-40f8-b0bc-07a44602b9db:F001` | Owner berth-unit; due at phase 44 checkpoint; no matching closure | C2 `CASE_ROUTE` |
+| Cross-run closure | `822b6b3d-e256-4b3a-9081-4dae6186616a` | Exact source key; evidence names checkpoint, passing gate, and accepted closure review | C2 `CASE` |
+| Wrong key | `a867b3fe-3d74-48e3-9194-5f73e98d68fe` | Uses phase label `43c` instead of the instance, so this event closes nothing; later event `247a37ce-16cf-412a-8e90-724eb73bf44f` (2026-11-07T14:42:02Z) closes the route with the instance key | C2 `CASE` |
+| Missing acceptance evidence | `6c471f0a-dd5a-4a36-90fb-f2af9fecca6f` | Key matches F030, but evidence names no commit, passing result, or accepted review; inconclusive | C2 `CASE` |
+
+The cross-run case refers to source `9ea324fb-cb62-4f94-be65-ec0f2cf45bee:6ce43bb9-65cb-43f4-a119-c0313fbd925f:F032`.
+Its receiving run is `c8e8fbeb-951d-471f-84ef-d97dd70699e9`.
+The F030 case belongs to source phase instance `425eacba-d57c-4a92-8b75-63146f5ce263` in the verify run.
+Its closure text explains a decision to make no change.
+That explanation does not supply the required acceptance evidence.
+
+C2 also attempts a limited receiving-phase link.
+It matches the plan basename and phase ID named in each receiving Work Order.
+It does not read current plan status as historical completion.
+Repeated matches remain ambiguous.
+
+| Receiving-phase observation | Count | Sample | Command output |
+| --- | ---: | --- | --- |
+| Routes with one recorded target match | 344 | 459 routes | C2 `TARGETS.routes` |
+| Unmatched routes | 114 | 459 routes | C2 `unmatched` |
+| Ambiguous routes | 1 | 459 routes | C2 `ambiguous` |
+| Distinct target phase instances | 63 | Uniquely matched routes | C2 `TARGETS.targets` |
+| Completed non-mixed targets | 58 | 63 target instances | C2 `completed` |
+| Mixed targets | 2 | 63 target instances | C2 `mixed` |
+| Other target status | 3 | 63 target instances | C2 `other` |
+
+The ambiguous order names `docs/plans/builds-report.md`, phase 5.
+Separate runs contain that same plan and phase ID.
+The unique matches show recorded receiving activity, not complete closure of routed findings.
+Missing creation history prevents a count of all receiving orders written after landing.
+The recorded target status does not prove that every route received its required implementation and review.
+
+| Partial linked population | Phase instances | Repair rounds | Fix agent-seconds | Command output |
+| --- | ---: | ---: | ---: | --- |
+| Source parents | 108 | 510 | 3,721,113 | C2 `TARGETS.parents` |
+| Matched targets | 63 | 177 | 296,822 | C2 `TARGETS.children` |
+| Deduplicated combined population | 155 | 605 | 3,831,718 | C2 `TARGETS.combined` |
+
+These totals retain open and mixed records as cost observations.
+The populations overlap, so their costs must not be added without deduplication.
+They do not establish complete parent-plus-follow-up costs.
+Preparation, diagnosis, command execution, and review lack complete linked cost records.
+Moved seconds and seconds spent nowhere remain unmeasured.
+No reduction in those costs is claimed.
+
+The checkpoint join establishes some due checkpoints.
+It requires a unique receiving phase and the same phase ID in the recorded due text.
+It then requires a recorded receiving checkpoint after the route event and within the observation window.
+
+| Due-checkpoint observation | Count | Sample | Command output |
+| --- | ---: | --- | --- |
+| Routes with a named receiving phase and matching due phase | 310 | 459 routes | C2 `DUE.named_target` |
+| Receiving checkpoint reached after routing | 302 | 310 named targets | C2 `checkpoint_reached` |
+| Reached checkpoint with a matching closure key | 152 | 302 reached checkpoints | C2 `matching_closure` |
+| Reached checkpoint with an open route key | 150 | 302 reached checkpoints | C2 `open_key` |
+| No later checkpoint recorded | 8 | 310 named targets | C2 `no_later_checkpoint` |
+| Due identity unresolved | 149 | 459 routes | C2 `unresolved` |
+
+One open example is `3267c956-0a88-4ed6-be9e-0e3cff3e89ef:d6923bd0-9418-4eb6-8b23-8137ad485ca1:F001`.
+Its due text names phase 7's checkpoint.
+The receiving instance is `ac5935a1-d920-4772-b3d7-6a3f0ecac15a` in the same run.
+Its recorded checkpoint is `820357a27cb3eb7571d7cd4c7840c046ee416bc1` (C2 `DUE_OPEN_CASE`).
+That checkpoint does not supply the missing route closure and acceptance evidence.
+
+The matching closures still require an acceptance audit.
+The complete accepted due-closure rate is therefore not established.
+The stopped-repair defect-escape audit is not complete.
+The originating phase remains incomplete wherever its required routed result is missing.
+This report does not close the trial or its unresolved follow-ups.
+
+### Questions and limits
+
+No proposal receives a pass or fail verdict under the shared minimums.
+Thus this report produces no keep/change/revert question.
+No message is sent to the user or showrunner.
+
+The independent writer agrees with the reported exposure, timing, review, route, partial-linkage, and hand-case counts.
+The full hand-root comparison, historical exposure reconstruction, and complete acceptance audit are not complete.
+The records contain inputs for further reconstruction; this report does not prove that those inputs are absent.
+These gaps keep P1, P2, P4, and P5 inconclusive.
+The adopted changes also overlap, so this evidence cannot separate their individual effects.
+P3 remains not ready.
+
+### Reproduce C2
+
+Run this command from the study checkout.
+Set `EFFECT_DETAIL=1` to print separate records and round evidence.
+The command writes no file.
+
+```sh
+PYTHONDONTWRITEBYTECODE=1 python3 - <<'PY'
+import collections
+from datetime import datetime
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import statistics
+from scripts.history import rounds, routed
+from scripts.production import review_regime
+
+boundary = datetime.fromisoformat("2026-10-28T21:26:05-04:00").timestamp()
+upper = datetime.fromisoformat("2026-11-09T03:32:17+00:00").timestamp()
+lower = boundary - 30 * 86400
+records = []
+unreadable = 0
+newer = 0
+for path in sorted((Path.home() / ".local/state/plan-delegate/runs").glob("*.jsonl")):
+    for line in path.read_text().splitlines():
+        if not line.strip():
+            continue
+        try:
+            event = json.loads(line)
+        except ValueError:
+            unreadable += 1
+            continue
+        if float(event.get("timestamp_epoch") or 0) > upper:
+            continue
+        if int(event.get("spine_version") or 0) > 1:
+            newer += 1
+            continue
+        records.append((path.stem, event))
+events = [event for _, event in records]
+phases = rounds.load_phases(events)
+owners = collections.defaultdict(set)
+for phase in phases:
+    owners[phase["phase_instance_id"]].add(phase["run_id"])
+grouped = collections.defaultdict(list)
+for _, event in records:
+    instance = str(event.get("phase_instance_id") or "")
+    run = str(event.get("run_id") or "")
+    if not run and len(owners[instance]) == 1:
+        run = next(iter(owners[instance]))
+    grouped[(run, instance)].append(event)
+
+def key(phase):
+    return phase["run_id"], phase["phase_instance_id"]
+
+def stamp(event):
+    return float(event.get("timestamp_epoch") or 0)
+
+def classification(phase):
+    if phase["check"] != "ok":
+        return "mixed"
+    if phase["status"] == "completed" and phase["finished_at"]:
+        return "completed"
+    return "other"
+
+def window(phase):
+    start = phase["started_at"]
+    return "before" if lower <= start < boundary else "after" if boundary <= start <= upper else "outside"
+
+def metrics(rows):
+    reviewed = [p for p in rows if p["reviews"]]
+    heavy = [p for p in reviewed if len(p["rounds"]) >= 3]
+    seconds = sum(p["fix_seconds"] for p in reviewed)
+    return dict(n=len(rows), zero=sum(not p["rounds"] for p in rows),
+        reviewed=len(reviewed),
+        median_all=statistics.median([len(p["rounds"]) for p in rows]) if rows else None,
+        median_reviewed=statistics.median([len(p["rounds"]) for p in reviewed]) if reviewed else None,
+        heavy=len(heavy), heavy_seconds=sum(p["fix_seconds"] for p in heavy),
+        reviewed_seconds=seconds,
+        heavy_all=sum(len(p["rounds"]) >= 3 for p in rows),
+        heavy_all_seconds=sum(p["fix_seconds"] for p in rows if len(p["rounds"]) >= 3),
+        rounds=sum(len(p["rounds"]) for p in rows),
+        fix_seconds=sum(p["fix_seconds"] for p in rows),
+        past_landing=sum(p["past_landing"] for p in rows),
+        causes=dict(collections.Counter(r["cause"] for p in rows for r in p["rounds"])))
+
+def emit(label, value):
+    print(label, json.dumps(value, sort_keys=True))
+
+exposures = collections.defaultdict(set)
+p3_audit = []
+p3_declared = set()
+p5_any = set()
+for phase in phases:
+    ordered = sorted(grouped[key(phase)], key=stamp)
+    for event in ordered:
+        kind = event.get("event_type")
+        proposal = event.get("proposal") if kind == "trial_exposure" else ""
+        if proposal in ("P1", "P2"):
+            exposures[proposal].add(key(phase))
+        if proposal == "P3":
+            p3_declared.add(key(phase))
+            prefix = [e for e in ordered if stamp(e) <= stamp(event)]
+            actual = len({n for r in rounds.phase_rounds(prefix) for n in r["ledger_rounds"]}) + 1
+            within = phase["started_at"] <= stamp(event) and (not phase["finished_at"] or stamp(event) <= phase["finished_at"])
+            p3_audit.append(dict(run=key(phase), event=event.get("event_id"), reported=event.get("repair_round"), corrected=actual, within=within))
+            if actual >= 4 and within:
+                exposures["P3"].add(key(phase))
+        if kind in ("launch_checked", "launch_refused") or (kind == "pass_started" and isinstance(event.get("launch_check"), dict)):
+            exposures["P4"].add(key(phase))
+        if kind == "finding_batch_dispatched":
+            checks = str(event.get("accepted_checks") or "").strip()
+            if checks:
+                p5_any.add(key(phase))
+            if checks and not checks.lower().startswith("none:"):
+                exposures["P5"].add(key(phase))
+
+for name in ("before", "after"):
+    selected = [p for p in phases if window(p) == name]
+    crossing = [p for p in selected if name == "before" and (not p["finished_at"] or p["finished_at"] >= boundary)]
+    completed = [p for p in selected if classification(p) == "completed" and p not in crossing]
+    emit("WINDOW_" + name, dict(selected=len(selected),
+        classes=dict(collections.Counter(classification(p) for p in selected)),
+        crossing=len(crossing),
+        completed_crossing=sum(classification(p) == "completed" for p in crossing),
+        all_causes=dict(collections.Counter(r["cause"] for p in selected for r in p["rounds"])),
+        metrics=metrics(completed)))
+    for proposal in ("P1", "P2", "P3", "P4", "P5"):
+        candidates = [p for p in selected if key(p) in exposures[proposal]]
+        usable = [p for p in completed if key(p) in exposures[proposal]]
+        emit(name + "_" + proposal, dict(classes=dict(collections.Counter(classification(p) for p in candidates)), metrics=metrics(usable)))
+    if name == "before":
+        incoming = [p for p in completed if any(e.get("event_type") == "pass_started" for e in grouped[key(p)])]
+        emit("P4_BASELINE", metrics(incoming))
+    if os.environ.get("EFFECT_DETAIL"):
+        for phase in selected:
+            if phase not in completed:
+                emit("SEPARATE_" + name, dict(run=key(phase), phase=phase["phase_id"], status=phase["status"], check=phase["check"], crossing=phase in crossing))
+    review_rows = [r for r in review_regime.read_rows()
+        if (lower <= datetime.fromisoformat(r.merged).timestamp() < boundary if name == "before"
+            else boundary <= datetime.fromisoformat(r.merged).timestamp() <= upper)]
+    classes = collections.Counter()
+    missing = collections.Counter()
+    usable = []
+    for row in review_rows:
+        if row.excluded:
+            classes["excluded"] += 1
+            continue
+        absent = [field for field in ("plan", "review_minutes", "ux_repair_minutes") if getattr(row, field) in (None, "")]
+        if absent:
+            classes["insufficient"] += 1
+            missing.update(absent)
+        else:
+            classes["usable"] += 1
+            usable.append(row)
+    emit("REVIEW_" + name, dict(total=len(review_rows), classes=classes, missing=missing,
+        exclusions=dict(collections.Counter(r.excluded for r in review_rows if r.excluded)),
+        sums={field:sum(getattr(r, field) for r in usable) for field in ("holds", "merge_defects", "review_minutes", "ux_repair_minutes")}))
+
+timing = collections.Counter()
+p2_ontime = []
+for phase in phases:
+    if window(phase) != "after" or classification(phase) != "completed" or key(phase) not in exposures["P2"]:
+        continue
+    es = grouped[key(phase)]
+    starts = [float(e.get("pass_started_at") or stamp(e)) for e in es if e.get("event_type") == "pass_started" and e.get("pass_kind") in ("impl", "test")]
+    declarations = [stamp(e) for e in es if e.get("event_type") == "trial_exposure" and e.get("proposal") == "P2"]
+    timing["missing_pass" if not starts else "before" if min(declarations) <= min(starts) else "late"] += 1
+    if starts and min(declarations) <= min(starts):
+        p2_ontime.append(phase)
+emit("P2_TIMING", timing)
+emit("P2_ONTIME", metrics(p2_ontime))
+emit("P3_DECLARED", dict(collections.Counter(classification(p) for p in phases if window(p) == "after" and key(p) in p3_declared)))
+emit("P3_AUDIT_COUNTS", dict(completed=sum(window(p) == "after" and classification(p) == "completed" and key(p) in exposures["P3"] for p in phases),
+    audits=len(p3_audit)))
+emit("P5_ANY", dict(completed=sum(window(p) == "after" and classification(p) == "completed" and key(p) in p5_any for p in phases)))
+
+phase_map = {key(p):p for p in phases}
+launches = collections.Counter()
+refusals = collections.Counter()
+for event in events:
+    if not boundary <= stamp(event) <= upper:
+        continue
+    kind = event.get("event_type")
+    if kind == "launch_refused":
+        reason = str(event.get("reason") or "")
+        label = "stale" if reason.startswith("Stale prompt") else "cause" if reason.startswith("Fix launch") else "missing_phase" if reason.startswith("Missing phase") else "closed_phase" if reason.startswith("Phase ") else "other"
+        refusals[label] += 1
+    elif kind == "launch_checked":
+        launches["ux_checked" if event.get("lens") == "ux" else "other_checked"] += 1
+    elif kind == "pass_started":
+        launches["pass_started"] += 1
+        check = event.get("launch_check")
+        if isinstance(check, dict):
+            launches["checked"] += 1
+            launches["prompt_" + str(check.get("prompt_phase_line"))] += 1
+            launches["identity_mismatch"] += check.get("phase_id") != event.get("phase_id") or check.get("phase_title") != event.get("phase_title")
+            phase = phase_map.get((str(event.get("run_id") or ""), str(event.get("phase_instance_id") or "")))
+            launches["missing_boundary"] += phase is None
+            if phase:
+                launches["outside_boundary"] += stamp(event) < phase["started_at"] or bool(phase["finished_at"] and stamp(event) > phase["finished_at"])
+emit("P4_LAUNCHES", dict(launches=launches, refusals=refusals))
+
+routes = [r for r in routed.routed_work(records, upper) if boundary <= r["timestamp_epoch"] <= upper]
+for route in routes:
+    if route["key"] == "a433b49e-d462-472a-9f5b-3e767f5be8b6:b62a1ee7-5c52-40f8-b0bc-07a44602b9db:F001":
+        emit("CASE_ROUTE", route)
+all_route_keys = {r["key"] for r in routed.routed_work(records, upper)}
+closures = [(run,e) for run,e in records if e.get("event_type") == "finding_route_closed" and boundary <= stamp(e) <= upper]
+emit("ROUTES", dict(n=len(routes), states=dict(collections.Counter(r["status"] for r in routes)),
+    closure_events=len(closures), unmatched=sum(str(e.get("from") or "") not in all_route_keys for _,e in closures),
+    cross_run=sum(bool(r["closure"]) and r["closure"]["run"] != r["run"] for r in routes),
+    orders=len({(r["owner"],r["work_order"],r["due"]) for r in routes})))
+index = collections.defaultdict(list)
+for phase in phases:
+    index[(phase["plan"],phase["phase_id"])].append(phase)
+target_counts = collections.Counter()
+targets = {}
+parents = {}
+route_targets = {}
+for route in routes:
+    plan = re.search(r"([\w-]+\.md)", route["work_order"])
+    phase = re.search(r"\bphase\s+([\w.-]+)", route["work_order"], re.I)
+    matches = index[(plan.group(1),phase.group(1))] if plan and phase else []
+    if len(matches) == 1:
+        target = matches[0]
+        targets[key(target)] = target
+        route_targets[route["key"]] = target
+        target_counts[classification(target)] += 1
+    else:
+        target_counts["ambiguous" if matches else "unmatched"] += 1
+    source = phase_map.get((route["run"],route["phase_instance_id"]))
+    if source:
+        parents[key(source)] = source
+emit("TARGETS", dict(routes=target_counts, targets=dict(collections.Counter(classification(p) for p in targets.values())),
+    parents=metrics(list(parents.values())), children=metrics(list(targets.values())),
+    combined=metrics(list((parents | targets).values()))))
+
+due_counts = collections.Counter()
+due_open = []
+for route in routes:
+    target = route_targets.get(route["key"])
+    due_phase = re.search(r"\bphase\s+([\w.-]+)", route["due"], re.I)
+    if not target or not due_phase or due_phase.group(1) != target["phase_id"]:
+        due_counts["unresolved"] += 1
+        continue
+    due_counts["named_target"] += 1
+    checkpoints = [e for e in grouped[key(target)] if e.get("event_type") == "checkpoint"
+        and route["timestamp_epoch"] <= stamp(e) <= upper and e.get("checkpoint_commit")]
+    if not checkpoints:
+        due_counts["no_later_checkpoint"] += 1
+        continue
+    due_counts["checkpoint_reached"] += 1
+    due_counts["matching_closure" if route["closure"] else "open_key"] += 1
+    if not route["closure"]:
+        due_open.append(dict(source=route["key"], target=key(target), due=route["due"],
+            checkpoint=min(checkpoints, key=stamp)["checkpoint_commit"]))
+emit("DUE", due_counts)
+for case in due_open[:3]:
+    emit("DUE_OPEN_CASE", case)
+
+case_ids = {"5effaac3-75bd-4d4e-8a79-5a788e22d3a4", "a1cbc37b-9236-4a74-84b0-272a7086a6eb",
+    "822b6b3d-e256-4b3a-9081-4dae6186616a", "a867b3fe-3d74-48e3-9194-5f73e98d68fe",
+    "6c471f0a-dd5a-4a36-90fb-f2af9fecca6f", "dd933505-3731-42fa-9d6f-94dcc96fcf5a"}
+for run,event in records:
+    if event.get("event_id") in case_ids:
+        emit("CASE", dict(file=run + ".jsonl", event=event))
+for phase in phases:
+    if phase["phase_instance_id"] == "5fe67fb8-aded-4379-b8e3-3f25476e25b6":
+        for repair in phase["rounds"]:
+            if repair["round"] in (5, 7):
+                emit("HAND_RECORD", dict(run=key(phase), check=phase["check"], repair=repair))
+    if os.environ.get("EFFECT_DETAIL") and window(phase) != "outside":
+        for repair in phase["rounds"]:
+            emit("ROOT_EVIDENCE", dict(window=window(phase), run=key(phase), phase=phase["phase_id"], check=phase["check"], repair=repair))
+emit("INPUT", dict(events=len(events), phases=len(phases), unreadable=unreadable, newer=newer,
+    digest=hashlib.sha256(json.dumps(records, sort_keys=True).encode()).hexdigest()))
+
+PY
+```

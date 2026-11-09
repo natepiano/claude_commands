@@ -103,7 +103,7 @@ def _validate(turn: ClaudeTurn, environment: Mapping[str, str]) -> str:
         print(f"claude_worker: prompt file not found: {turn.prompt}", file=sys.stderr)
         raise _LaunchFailed(2)
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}", turn.name):
-        print(f"claude_worker: invalid mesh name '{turn.name}'.", file=sys.stderr)
+        print(f"claude_worker: invalid worker name '{turn.name}'.", file=sys.stderr)
         raise _LaunchFailed(2)
     return binary
 
@@ -296,7 +296,7 @@ def open_worker(turn: ClaudeTurn) -> Delivered | Unchanged | NotDelivered:
                 return worker_admission.SwitchState.ASSIGNMENT_ACCEPTED
 
             _ = worker_admission.switch_worker(allowed, "claude", start=start, dispatch=dispatch,
-                                               cleanup=lambda identity: None, request=request)
+                                               cleanup=lambda identity: worker_admission.NoDestinationToStop(), request=request)
             return delivered
         except _LaunchFailed as error:
             return NotDelivered(error.code)

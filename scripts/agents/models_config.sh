@@ -280,7 +280,7 @@ _agents_families_inline_from_table() {
 # `caller` in [assignments] means the function runs on the family of the agent
 # invoking it, not on a fixed one. ask_a_friend uses it: a friend of the caller's
 # own kind is the only friend that can talk back -- claude reaches claude by
-# SendMessage, codex reaches codex through codex_mesh.py, and a codex friend has
+# SendMessage. Codex uses native pane messages. A Codex friend has
 # no route to a claude caller. A function assigned `caller` has no family switch.
 AGENTS_CALLER_ASSIGNMENT="caller"
 

@@ -17,7 +17,7 @@ import tempfile
 import threading
 import time
 import unittest
-from collections.abc import Callable, Generator
+from collections.abc import Callable, Generator, Mapping
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
@@ -31,7 +31,6 @@ from scripts.direct.verify_mac_offload_test_support import VerifyMacOffloadFixtu
 from scripts.direct.local_release_wait import RELEASE_CHANGES, LocalReleaseEvents, local_release_waiter
 from scripts.lib import inotify
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
-from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.shell_test_support import shell_functions
 
 
@@ -68,9 +67,25 @@ class CallWithHoldWait(CallRecord):
 def read_cycle_file(path: Path) -> build_hold.HoldCycle:
     return cast(build_hold.HoldCycle, json.loads(path.read_text()))
 
+
+@contextmanager
+def local_hold_environment(environment: Mapping[str, str]) -> Generator[None, None, None]:
+    """Restore changed keys without clearing the admission reader's environment."""
+    previous_values = {name: os.environ[name] for name in environment if name in os.environ}
+    try:
+        os.environ.update(environment)
+        yield
+    finally:
+        for name in environment:
+            if name in previous_values:
+                os.environ[name] = previous_values[name]
+            else:
+                _ = os.environ.pop(name, None)
+
+
 def grant_call(path: Path) -> None:
     release = path.parent.parent
-    with mock.patch.dict(os.environ, {
+    with local_hold_environment({
         "BUILD_HOLD_DIR": str(release.parent / "build-hold"),
         "BUILD_HOLD_RELEASE_DIR": str(release),
         "UNIT_ACTIVE_DIR": str(release.parent / "active"),
@@ -83,7 +98,7 @@ def grant_call(path: Path) -> None:
 
 def change_cycle(path: Path, change: Callable[[build_hold.HoldCycle], None]) -> None:
     release = path.parent.parent
-    with mock.patch.dict(os.environ, {
+    with local_hold_environment({
         "BUILD_HOLD_DIR": str(release.parent / "build-hold"),
         "BUILD_HOLD_RELEASE_DIR": str(release),
         "UNIT_ACTIVE_DIR": str(release.parent / "active"),
@@ -184,6 +199,7 @@ class VerifyHoldTools(VerifyMacOffloadFixture):
         cls.fixture_environment = {
             **builder.environment,
             "IN_NIX_SHELL": "pure",
+            "UNIT_DETACHED_RUN": "1",
             "ROSTER_RUN_ROOT": str(builder.root / "unit"),
             "UNIT_RUN_ROOT": str(builder.root / "unit"),
             "SCRATCH_ROOT": str(builder.root / "scratch"),
@@ -402,7 +418,6 @@ else:
     def record_phase(self) -> Path:
         session = self.fixture.root / "unit-run"
         record_wait_workers(self.fixture.root, session, self.fixture.environment, {"fixture-impl": "thread-impl"})
-        write_text_atomic(session / "worker_transport", "mesh\n")
         self.fixture.environment.update({"UNIT_RUN_DIR": str(session), "UNIT_PHASE_ID": "closed-server-phase",
                                          "UNIT_TEAM_ROLE": "impl", "CODEX_THREAD_ID": fixture_runtime_id("thread-impl"),
                                          "UNIT_PASS_OWNER": "launcher",

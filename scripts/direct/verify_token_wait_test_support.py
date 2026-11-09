@@ -1,9 +1,10 @@
 """Independent tools, state and process cleanup for verify token tests."""
 from __future__ import annotations
 
+from scripts.build_queue import admission_records
+
 from scripts.build_queue.admission_test_support import caller_admission
 
-from scripts.lint import memory_admit as gate
 from scripts.lib.py_floor_test_support import seed_interpreter_cache
 
 from scripts.lint.memory_test_support import config_environment, write_pressure_reading
@@ -26,7 +27,6 @@ from typing import ClassVar, cast, override
 from scripts.lib.process_group import send_process_group
 from scripts.direct.wait_for_test_state import wait_until
 from scripts.direct.recorder_fixture import invoke_recorder, record_wait_workers
-from scripts.lib.atomic_file import write_text_atomic
 from scripts.production.staff_test_support import fixture_runtime_id
 from scripts.direct.verify_mac_offload_test_support import RUSTC_STUB, stub_build_tool_path
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
@@ -194,6 +194,7 @@ esac
             + '    if [ "$available" = 0 ]; then exec python3 "$TEST_MEMORY_EVENT"; fi\n'
             + 'fi\nexit 0\n')
         self.environment = {
+            "UNIT_DETACHED_RUN": "1",
             **{name: value for name, value in os.environ.items()
                if name not in {"UNIT_RUN_DIR", "UNIT_TEAM_ROLE", "CODEX_THREAD_ID",
                                "CODEX_SESSION_ID", "UNIT_DETACHED_RUN", "BASH_ENV", "ENV"}
@@ -329,7 +330,6 @@ esac
     def record_phase(self, session: Path) -> None:
         record_wait_workers(self.root, session, self.environment,
                             {f"fixture-{slot}": f"thread-{slot}" for slot in ("impl", "first", "second")})
-        write_text_atomic(session / "worker_transport", "mesh\n")
         self.environment.update({"UNIT_HISTORY_DIR": str(self.root / "history"),
                                  "UNIT_PHASE_ID": "6", "UNIT_SYNC_WRITES": "0",
                                  "UNIT_PASS_OWNER": "launcher", "CODEX_THREAD_ID": fixture_runtime_id("thread-impl"),
@@ -374,13 +374,13 @@ esac
         with admission.loop_turn():
             waiting, = admission.server.waiters.values()
             need = waiting.row["need"]
-            waiting.row["need"] = 60 * gate.GIB
-            admission.free(48 * gate.GIB)
+            waiting.row["need"] = 60 * admission_records.GIB
+            admission.free(48 * admission_records.GIB)
 
         def resume() -> None:
             with admission.loop_turn():
                 waiting.row["need"] = need
-                admission.free(48 * gate.GIB)
+                admission.free(48 * admission_records.GIB)
 
         self.addCleanup(resume)
         return resume
@@ -558,17 +558,17 @@ exit "$status"
             _ = first.wait(timeout=TEST_HANG_GUARD_SECS)
 
     def detach_environment(self, status: int) -> dict[str, str]:
-        """A Codex worker's environment whose mesh_runs.py stub records its argv and exits `status`."""
-        stub = self.root / "mesh_runs_stub.py"
+        """A Codex worker's environment whose detached_runs.py stub records its argv and exits `status`."""
+        stub = self.root / "detached_runs_stub.py"
         _ = stub.write_text("import json, os, sys\n"
-                            + "with open(os.environ['TEST_MESH_RUNS_CALLS'], 'a', encoding='utf-8') as calls:\n"
+                            + "with open(os.environ['TEST_DETACHED_RUNS_CALLS'], 'a', encoding='utf-8') as calls:\n"
                             + "    calls.write(json.dumps(sys.argv[1:]) + '\\n')\n"
-                            + "raise SystemExit(int(os.environ['TEST_MESH_RUNS_STATUS']))\n")
-        return {**self.environment, "CODEX_THREAD_ID": "thread-worker", "VERIFY_MESH_RUNS_SCRIPT": str(stub),
-                "TEST_MESH_RUNS_CALLS": str(self.root / "mesh-runs-calls"), "TEST_MESH_RUNS_STATUS": str(status)}
+                            + "raise SystemExit(int(os.environ['TEST_DETACHED_RUNS_STATUS']))\n")
+        return {**self.environment, "UNIT_DETACHED_RUN": "", "CODEX_THREAD_ID": "thread-worker", "VERIFY_DETACHED_RUNS_SCRIPT": str(stub),
+                "TEST_DETACHED_RUNS_CALLS": str(self.root / "detached-runs-calls"), "TEST_DETACHED_RUNS_STATUS": str(status)}
 
-    def mesh_runs_calls(self) -> list[list[str]]:
-        path = self.root / "mesh-runs-calls"
+    def detached_runs_calls(self) -> list[list[str]]:
+        path = self.root / "detached-runs-calls"
         if not path.exists():
             return []
         return [cast(list[str], json.loads(line)) for line in path.read_text(encoding="utf-8").splitlines()]

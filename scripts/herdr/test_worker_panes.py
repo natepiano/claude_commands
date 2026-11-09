@@ -13,7 +13,7 @@ import subprocess
 from copy import deepcopy
 from collections.abc import Generator, Mapping
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import contextmanager, redirect_stderr, redirect_stdout
+from contextlib import ExitStack, contextmanager, redirect_stderr, redirect_stdout
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from threading import Event
@@ -22,7 +22,8 @@ from unittest.mock import patch
 from weakref import finalize
 
 from scripts.production import staff, worker_admission
-from scripts.shutdown import restart
+from scripts.shutdown import restart, stop_resume
+from scripts.shutdown.stop_results import SourceReleased
 from scripts.production.staff_test_support import StaffTestCase, fixture_member, fixture_runtime_id, fixture_session, fixture_worker
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib import models_registry, process_start, unit_runs
@@ -79,7 +80,7 @@ class PaneWorld(herdr.Herdr):
         """Install shared accounts, configuration, and process facts."""
         config = test.root / "conf"
         config.mkdir()
-        write_text_atomic(config / "direct.conf", "WORKER_TRANSPORT=mesh\n# range: 0.1..0.9\nWORKER_SPLIT_RATIO=0.667\n"
+        write_text_atomic(config / "direct.conf", "# range: 0.1..0.9\nWORKER_SPLIT_RATIO=0.667\n"
                           + "# whole: 1..\nUNIT_COMPACT_ABOVE_TOKENS=43000\n"
                           + "WORKER_FIRST_TURN_TEXT=Reply with ready. Do not use tools.\n"
                           + "# range: 1..600\nWORKER_FIRST_TURN_SECONDS=120\n"
@@ -164,7 +165,7 @@ class PaneWorld(herdr.Herdr):
 
     def activate(self, identity: str, pane: str, family: Literal["claude", "codex"]) -> None:
         pid = 998600 + len(self.processes)
-        native = herdr.EnvironmentThread(identity) if family == "claude" else herdr.RolloutThread(identity)
+        native = herdr.EnvironmentThread(identity) if family == "claude" else herdr.PaneSessionReport(identity)
         environment = {"UNIT_RUN_DIR": run} if (run := os.environ.get("UNIT_RUN_DIR")) else {}
         self.processes[pid] = herdr.NativeAgentProcess(native, "fixture-generation", environment)
         self.foreground[pane] = pid, family, [family, "--resume" if family == "claude" else "resume", identity]
@@ -274,6 +275,8 @@ class PaneWorld(herdr.Herdr):
         process_root = self.process_root / str(pid)
         process_root.mkdir(parents=True, exist_ok=True)
         write_text_atomic(process_root / "stat", f"{pid} (fixture) S " + "0 " * 18 + "1\n")
+        write_text_atomic(process_root / "environ",
+                          "\0".join(f"{key}={value}" for key, value in self.processes[pid].environment.items()) + "\0")
         self.foreground[pane] = pid, family, [kind, *agent_arguments]
         if kind == "codex" and "resume" not in agent_arguments:
             process = self.processes[pid]
@@ -284,14 +287,6 @@ class PaneWorld(herdr.Herdr):
             source = Path(prepared.env["CODEX_HOME"]) / "sessions" / f"{identity}.jsonl"
             if not source.read_text():
                 write_text_atomic(source, json.dumps({"type": "session_meta", "payload": {"id": identity}}) + "\n")
-            rollout = source.with_name(f"rollout-fixture-{identity}.jsonl")
-            rollout.unlink(missing_ok=True)
-            rollout.symlink_to(source)
-            descriptors = process_root / "fd"
-            descriptors.mkdir(exist_ok=True)
-            descriptor = descriptors / "3"
-            descriptor.unlink(missing_ok=True)
-            descriptor.symlink_to(rollout)
         if self.interrupt == "agent":
             self.interrupt = ""
             raise OSError("interrupted after agent start")
@@ -646,7 +641,6 @@ class WorkerPaneTests(StaffTestCase):
         write_text_atomic(run / "progress_history_state.json", json.dumps({"owner_staff_id": str(self.parent.id), "pass": {
             row.name: {"instance_id": "dispatch-" + row.name, "worker_name": row.name,
                        "team_slot": row.name, "kind": role, "status": "completed" if completed else "active"}}}))
-        write_text_atomic(run / "worker_transport", "herdr\n")
 
     def completed_dispatch(self, row: staff.StaffRow, role: staff.WorkerRole) -> None:
         self.dispatch(row, role, completed=True)
@@ -675,7 +669,6 @@ class WorkerPaneTests(StaffTestCase):
         state = run / "progress_history_state.json"
         if not state.exists():
             run.mkdir(exist_ok=True)
-            write_text_atomic(run / "worker_transport", "herdr\n")
             write_text_atomic(state, json.dumps({"owner_staff_id": self.parent.id, "working_dir": str(self.root),
                 "phase": {"id": "earlier", "title": "Earlier", "instance_id": "earlier-phase", "started_at": 1,
                           "status": "active"}, "pass": {}, "events": [],
@@ -774,8 +767,8 @@ class WorkerPaneTests(StaffTestCase):
         self.assertEqual([command[3] for command in self.prompts()], ["/quit"] * len(cases))
 
     def test_first_admission_uses_the_parent_run_when_two_runs_exist(self) -> None:
-        first = self.worker_run("a-first", "unit", self.parent.current_session, transport="herdr")
-        _ = self.worker_run("z-second", "unit", self.parent.current_session, transport="herdr")
+        first = self.worker_run("a-first", "unit", self.parent.current_session)
+        _ = self.worker_run("z-second", "unit", self.parent.current_session)
         result = self.start("new-worker")
         self.assertIsInstance(result, worker_panes.OpenWorker)
         self.assertEqual(self.world.requests[-1][2]["UNIT_RUN_DIR"], str(first))
@@ -807,7 +800,7 @@ class WorkerPaneTests(StaffTestCase):
                 else:
                     passes["test"] = older
                 write_text_atomic(path, json.dumps(state))
-                first = self.worker_run("a-old", "unit", self.parent.current_session, transport="herdr", director_run=True,
+                first = self.worker_run("a-old", "unit", self.parent.current_session, director_run=True,
                     passes=(own_pass if foreign_worker else {"worker_name": row.name, "status": "active", "kind": "review",
                              "instance_id": "older-run-dispatch", "started_at": -10},))
                 self.assertEqual(worker_panes.worker_pass(row, run), {} if foreign_worker else newest)
@@ -877,7 +870,7 @@ class WorkerPaneTests(StaffTestCase):
         return [command for command in self.world.commands if command[:2] == ("agent", "prompt")]
 
     def test_dispatch_holder_starts_its_worker_and_keeps_other_operations_out(self) -> None:
-        row = self.worker()
+        row = self.worker(family="codex")
         self.world.add(row, "w1:p1", live=False)
         name = staff.WorkerName.parse(row.name)
         with worker_panes.worker_lock(self.parent.id, name) as hold:
@@ -1037,12 +1030,11 @@ class WorkerPaneTests(StaffTestCase):
         self.assertEqual(self.world.closed, [])
 
     def test_live_detached_run_keeps_its_pane_until_the_result_finishes(self) -> None:
-        from scripts.agents import mesh_run_process
+        from scripts.agents import detached_run_process
 
         run = self.root / "run"
-        runs = run / "mesh_runs"
+        runs = run / "detached_runs"
         runs.mkdir(parents=True)
-        write_text_atomic(run / "worker_transport", "herdr\n")
         record = runs / "private-run.json"
 
         def supervisor(pid: int, path: Path) -> bool:
@@ -1058,7 +1050,7 @@ class WorkerPaneTests(StaffTestCase):
                 before = list(self.world.closed)
                 write_text_atomic(record, json.dumps({"worker": row.name, "staff_id": row.id,
                                                      "status": "running", "pid": 998901}))
-                with (patch.object(mesh_run_process, "supervises", supervisor),
+                with (patch.object(detached_run_process, "supervises", supervisor),
                       patch.object(self.world, "quit_agent", wraps=self.world.quit_agent) as quit_agent):
                     result = worker_panes.close(self.parent.id, staff.WorkerName.parse(row.name))
                     quit_agent.assert_not_called()
@@ -1090,12 +1082,11 @@ class WorkerPaneTests(StaffTestCase):
         self.assertEqual(worker_panes.dispatch_role(row), "astra-reviewer")
         self.assertEqual(staff.snapshot().by_id(row.id), row)
 
-    def test_herdr_pinned_close_ignores_a_mesh_phase_lock(self) -> None:
+    def test_close_ignores_a_phase_dispatch_lock(self) -> None:
         row = self.worker()
         self.world.add(row, "w1:p1", live=False)
         run = self.root / "run"
         run.mkdir()
-        write_text_atomic(run / "worker_transport", "herdr\n")
         phase = run / "phases/8"
         phase.mkdir(parents=True)
         with (phase / "dispatch.lock").open("w") as lock:
@@ -1537,6 +1528,240 @@ class WorkerPaneTests(StaffTestCase):
         self.assertEqual(len(self.world.launches), 1)
         self.assertIn(result.pane, self.world.locations)
 
+    def test_family_change_keeps_busy_workers_and_live_detached_results(self) -> None:
+        from scripts.agents import detached_run_process
+
+        cases = (("open", "working", False, False, False),
+                 ("open", "idle", True, False, False),
+                 ("stopped", "idle", True, False, False),
+                 ("closed", "idle", True, False, False),
+                 ("closed", "idle", False, True, False),
+                 ("closed", "idle", True, False, True))
+        for index, (source_state, status, detached, unfinished, earlier) in enumerate(cases, 1):
+            with self.subTest(source_state=source_state, detached=detached, unfinished=unfinished, earlier=earlier):
+                row = self.worker(f"switch-{index}", family="claude")
+                pane = f"w1:p{index}"
+                if source_state != "closed":
+                    self.world.add(row, pane, family="claude", live=source_state == "open")
+                    self.world.locations[pane]["agent_status"] = status
+                if unfinished:
+                    self.dispatch(row, "impl")
+                else:
+                    self.completed_dispatch(row, "impl")
+                source_run = self.root / "run"
+                if earlier:
+                    source_run = self.worker_run("z-source", "unit", self.parent.current_session,
+                        passes=({"worker_name": row.name, "kind": "impl", "status": "completed", "started_at": 10},))
+                    destination_run = self.worker_run("a-destination", "unit", self.parent.current_session, director_run=True)
+                    self.assertNotEqual(worker_panes.worker_run(row), destination_run)
+                record = source_run / "detached_runs/private-run.json"
+                write_text_atomic(record, json.dumps({"worker": row.name, "staff_id": row.id,
+                    "status": "running" if detached else "finished", "pid": 998901}))
+                before = self.staff_state(), self.world.foreground.copy(), len(self.world.launches), self.world.stops.copy()
+
+                def release(source: staff.StaffRow, backend: staff.ClaudeBackend | staff.CodexBackend | staff.BackendUnavailable) -> SourceReleased:
+                    del backend
+                    _ = self.world.stop(source, self.world)
+                    return SourceReleased()
+
+                def supervisor(pid: int, path: Path) -> bool:
+                    return pid == 998901 and path == record
+
+                with (patch.object(detached_run_process, "supervises", side_effect=supervisor),
+                      patch.object(stop_resume, "release_source", side_effect=release) as released):
+                    changed = self.start(row.name)
+                self.assertIsInstance(changed, worker_panes.StartRefused)
+                assert isinstance(changed, worker_panes.StartRefused)
+                reason = ("detached run is live" if detached else "launcher has not recorded a completed pass"
+                          if unfinished else "agent state is working")
+                self.assertIn(reason, changed.detail)
+                released.assert_not_called()
+                self.assertEqual((self.staff_state(), self.world.foreground, len(self.world.launches), self.world.stops), before)
+
+    def test_family_change_publication_failure_stops_the_destination_and_retries(self) -> None:
+        families: tuple[Literal["claude", "codex"], ...] = ("claude", "codex")
+        for family in families:
+            for source_state in ("open", "exiting", "closed"):
+                for failure in ("publication", "native-proof", "persistent-native-proof", "replacement-native-proof", "none"):
+                    with self.subTest(family=family, source_state=source_state, failure=failure):
+                        self.world.foreground = {"w1:p0": self.world.foreground["w1:p0"]}
+                        destination_family: Literal["claude", "codex"] = "codex" if family == "claude" else "claude"
+                        _ = write_registry(self.root / "conf/models.conf", {"assignments": {"direct": destination_family}})
+                        row = self.worker(f"retry-{family}-{source_state}-{failure}", family=family)
+                        source_pane = f"w1:p{len(self.world.used_panes) + 1}"
+                        source_terminal = "terminal-" + source_pane
+                        if source_state != "closed":
+                            self.world.add(row, source_pane, family=family, terminal=source_terminal)
+                            if source_state == "exiting":
+                                self.world.exiting_panes.add(source_pane)
+                        self.completed_dispatch(row, "impl")
+                        before = self.staff_state()
+                        launch_count = len(self.world.launches)
+                        locations = set(self.world.locations)
+                        used_panes = self.world.used_panes.copy()
+                        closed = self.world.closed.copy()
+                        if source_state != "closed":
+                            locations.remove(source_pane)
+                            closed.append((source_pane, source_terminal))
+                        native = self.world.native_session
+                        codex_native = worker_panes.first_turn_session
+                        proof_failed = False
+                        proof_inputs: list[tuple[str, ...]] = []
+                        proof_signals: list[tuple[int, int]] = []
+                        replacement_identity = fixture_runtime_id("replacement-" + row.name)
+                        replacement_terminals: list[str] = []
+
+                        def replace_after_proof(pane: str) -> None:
+                            if failure != "replacement-native-proof":
+                                return
+                            replacement_terminals.append(cast(str, self.world.locations[pane]["terminal_id"]))
+                            self.world.activate(replacement_identity, pane, destination_family)
+                            pid = self.world.foreground[pane][0]
+                            process_root = self.world.process_root / str(pid)
+                            process_root.mkdir(parents=True, exist_ok=True)
+                            write_text_atomic(process_root / "stat", f"{pid} (fixture) S " + "0 " * 18 + "2\n")
+                            fixture_session(replacement_identity, staff.ClaudeBackend() if destination_family == "claude"
+                                            else staff.CodexBackend(self.root / "codex"))
+                            self.world.locations[pane]["agent_session"] = {"value": replacement_identity}
+
+                        def release(source: staff.StaffRow, backend: staff.ClaudeBackend | staff.CodexBackend | staff.BackendUnavailable) -> SourceReleased:
+                            del backend
+                            _ = self.world.stop(source, self.world)
+                            return SourceReleased()
+
+                        def prove_native(pane: str, kind: str, timeout: float, *,
+                                         pane_row: Mapping[str, object] | herdr.PaneNotRead = herdr.PANE_NOT_READ) -> str:
+                            nonlocal proof_failed
+                            identity = native(pane, kind, timeout, pane_row=pane_row)
+                            if (len(self.world.launches) > launch_count and (kind == "claude" or proof_failed)
+                                    and (not proof_failed or failure == "persistent-native-proof")):
+                                if not proof_failed:
+                                    proof_inputs.extend(self.world.commands)
+                                    proof_signals.extend(self.world.signals)
+                                proof_failed = True
+                                replace_after_proof(pane)
+                                raise herdr.HerdrFailure("native proof interrupted")
+                            return identity
+
+                        def prove_codex(client: herdr.Herdr, pane: str, terminal: str) -> str:
+                            nonlocal proof_failed
+                            _ = codex_native(client, pane, terminal)
+                            proof_inputs.extend(self.world.commands)
+                            proof_signals.extend(self.world.signals)
+                            proof_failed = True
+                            replace_after_proof(pane)
+                            raise herdr.HerdrFailure("native proof interrupted")
+
+                        with patch.object(stop_resume, "release_source", side_effect=release):
+                            with ExitStack() as faults:
+                                if failure == "publication":
+                                    _ = faults.enter_context(patch.object(staff, "update_current_session",
+                                        side_effect=staff.StaffRefused("publication unavailable")))
+                                elif failure in ("native-proof", "persistent-native-proof", "replacement-native-proof"):
+                                    _ = faults.enter_context(patch.object(self.world, "native_session", side_effect=prove_native))
+                                    _ = faults.enter_context(patch.object(worker_panes, "first_turn_session", side_effect=prove_codex))
+                                failed = self.start(row.name)
+                            launched_destination = self.world.launches[-1]
+                            self.assertIsInstance(launched_destination, herdr.SplitPane)
+                            pane, = self.world.used_panes - used_panes
+                            terminal = "terminal-" + pane
+                            if source_state != "closed":
+                                self.assertNotIn(source_pane, self.world.locations)
+                                self.assertNotEqual(pane, source_pane)
+                            if failure == "none":
+                                self.assertIsInstance(failed, worker_panes.OpenWorker)
+                                assert isinstance(failed, worker_panes.OpenWorker)
+                                self.assertEqual((failed.row.id, failed.row.parent), (row.id, row.parent))
+                                self.assertNotEqual(failed.row.current_session, row.current_session)
+                                self.assertEqual(len(self.world.launches), launch_count + 1)
+                                self.assertEqual(self.world.closed, closed)
+                                continue
+                            self.assertIsInstance(failed, worker_panes.UncertainWorker)
+                            self.assertEqual(staff.by_id(row.id), row)
+                            self.assertEqual(self.staff_state(), before)
+                            if failure in ("persistent-native-proof", "replacement-native-proof"):
+                                assert isinstance(failed, worker_panes.UncertainWorker)
+                                self.assertIn(pane, failed.reason)
+                                self.assertIn("native proof interrupted", failed.reason)
+                                self.assertIn(pane, self.world.foreground)
+                                self.assertEqual(self.world.commands, proof_inputs)
+                                self.assertEqual(self.world.signals, proof_signals)
+                                self.assertEqual(self.world.closed, closed)
+                                if failure == "replacement-native-proof":
+                                    pid = self.world.foreground[pane][0]
+                                    self.assertEqual(self.world.processes[pid].identity.id, replacement_identity)
+                                    self.assertEqual([self.world.locations[pane]["terminal_id"]], replacement_terminals)
+                                continue
+                            self.assertNotIn(pane, self.world.foreground)
+                            self.assertNotIn(pane, self.world.locations)
+                            self.assertEqual(len(self.world.launches), launch_count + 1)
+                            self.assertEqual(set(self.world.locations), locations)
+                            self.assertEqual(self.world.closed, closed + [(pane, terminal)])
+                            retry_panes = self.world.used_panes.copy()
+                            repeated = self.start(row.name)
+                        self.assertIsInstance(repeated, worker_panes.OpenWorker)
+                        assert isinstance(repeated, worker_panes.OpenWorker)
+                        retry_pane, = self.world.used_panes - retry_panes
+                        self.assertEqual((repeated.row.id, repeated.row.parent, repeated.pane, repeated.terminal),
+                                         (row.id, row.parent, retry_pane, "terminal-" + retry_pane))
+                        self.assertNotEqual(retry_pane, pane)
+                        self.assertNotEqual(repeated.row.current_session, row.current_session)
+                        self.assertEqual(len(self.world.launches), launch_count + 2)
+                        self.assertIsInstance(self.world.launches[-1], herdr.SplitPane)
+                        self.assertEqual(set(self.world.locations), locations | {retry_pane})
+                        self.assertEqual(self.world.closed, closed + [(pane, terminal)])
+
+    def test_family_change_cleanup_keeps_an_unproved_terminal_without_input(self) -> None:
+        families: tuple[Literal["claude", "codex"], ...] = ("claude", "codex")
+        for family in families:
+            for source_state in ("open", "closed"):
+                for terminal_state in ("missing", "changed"):
+                    with self.subTest(family=family, source_state=source_state, terminal_state=terminal_state):
+                        self.world.foreground = {"w1:p0": self.world.foreground["w1:p0"]}
+                        destination_family = "codex" if family == "claude" else "claude"
+                        _ = write_registry(self.root / "conf/models.conf", {"assignments": {"direct": destination_family}})
+                        row = self.worker(f"retained-{family}-{source_state}-{terminal_state}", family=family)
+                        closed = self.world.closed.copy()
+                        if source_state == "open":
+                            source_pane = f"w1:p{len(self.world.used_panes) + 1}"
+                            self.world.add(row, source_pane, family=family)
+                            closed.append((source_pane, "terminal-" + source_pane))
+                        self.completed_dispatch(row, "impl")
+                        before = self.staff_state()
+                        retained: list[str] = []
+                        inputs: list[tuple[str, ...]] = []
+                        signals: list[tuple[int, int]] = []
+
+                        def release(source: staff.StaffRow, backend: staff.ClaudeBackend | staff.CodexBackend | staff.BackendUnavailable) -> SourceReleased:
+                            del backend
+                            _ = self.world.stop(source, self.world)
+                            return SourceReleased()
+
+                        def refuse(old: str, new: str) -> staff.StaffRow:
+                            self.assertEqual(old, row.current_session)
+                            pane = next(pane for pane, (pid, _, _) in self.world.foreground.items()
+                                        if self.world.processes[pid].current_identity == new)
+                            retained.append(pane)
+                            self.world.locations[pane]["terminal_id"] = "" if terminal_state == "missing" else "replacement-terminal"
+                            inputs.extend(self.world.commands)
+                            signals.extend(self.world.signals)
+                            raise staff.StaffRefused("publication unavailable")
+
+                        with (patch.object(stop_resume, "release_source", side_effect=release),
+                              patch.object(staff, "update_current_session", side_effect=refuse)):
+                            failed = self.start(row.name)
+                        self.assertIsInstance(failed, worker_panes.UncertainWorker)
+                        assert isinstance(failed, worker_panes.UncertainWorker)
+                        self.assertEqual(self.staff_state(), before)
+                        self.assertEqual(staff.by_id(row.id), row)
+                        self.assertEqual(len(retained), 1)
+                        self.assertIn(retained[0], failed.reason)
+                        self.assertIn("terminal", failed.reason)
+                        self.assertIn(retained[0], self.world.foreground)
+                        self.assertEqual(self.world.commands, inputs)
+                        self.assertEqual(self.world.signals, signals)
+                        self.assertEqual(self.world.closed, closed)
+
     def test_failed_publication_retains_one_backend_and_publishes_once_on_rerun(self) -> None:
         with patch.object(staff, "ensure_worker", side_effect=staff.StaffRefused("fixture publication failure")):
             failed = self.start()
@@ -1932,40 +2157,8 @@ class WorkerPaneTests(StaffTestCase):
                 self.world.locations = {"w1:p0": self.world.locations["w1:p0"]}
                 self.world.foreground = {"w1:p0": self.world.foreground["w1:p0"]}
 
-    def saved_mesh_run(self) -> Path:
-        run = self.root / "run"
-        run.mkdir()
-        write_text_atomic(run / "worker_transport", "mesh\n")
-        return run
-
-    def test_a_dispatch_lock_keeps_a_stopped_pane_open(self) -> None:
-        row = self.worker()
-        self.world.add(row, "w1:p1", live=False)
-        run = self.saved_mesh_run()
-        with (run / "dispatch.lock").open("w") as lock:
-            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            result = worker_panes.close(self.parent.id, staff.WorkerName.parse(row.name))
-        self.assertIsInstance(result, worker_panes.Kept)
-        assert isinstance(result, worker_panes.Kept)
-        self.assertIn("lock", result.blocker)
-        self.assertEqual(self.world.closed, [])
-
-    def test_stopped_worker_close_honors_the_phase_dispatch_lock(self) -> None:
-        row = self.worker()
-        self.world.add(row, "w1:p1", live=False)
-        phase = self.saved_mesh_run() / "phases/7"
-        phase.mkdir(parents=True)
-        with (phase / "dispatch.lock").open("w") as lock:
-            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            result = worker_panes.close(self.parent.id, staff.WorkerName.parse(row.name))
-        self.assertIsInstance(result, worker_panes.Kept)
-        assert isinstance(result, worker_panes.Kept)
-        self.assertEqual(result.blocker, "dispatch lock is held")
-        self.assertEqual(self.world.closed, [])
-        self.assertEqual(set(self.world.locations), {"w1:p0", "w1:p1"})
-
     def test_stale_session_mark_does_not_prevent_proved_shell_recovery(self) -> None:
-        row = self.worker()
+        row = self.worker(family="codex")
         self.world.add(row, "w1:p1", live=False)
         self.world.locations["w1:p1"]["agent_session"] = {"value": fixture_runtime_id("stale-mark")}
         observed = self.observation(row)

@@ -53,7 +53,6 @@ Apply <RoleReassignment/> and <ReviewPromptContract/>.
 Use `assign.sh --role review` with this session and the next review index.
 For `herdr`, use `worker.py list` and pass the short name with `--to` for a retained worker.
 If all pane workers are busy, pass `--new-worker <free review name>` to `assign.sh --role review`.
-For an existing mesh pin, use the full registered name with `--to`.
 For a phase review outside a unit run, omit both worker options.
 Otherwise omit `--to` only for a new worker allowed by <LongLivedWorkers/>.
 The prompt keeps the inline Three Gods sentence and Type Design Contract or its permitted pointer.

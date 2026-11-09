@@ -1,6 +1,8 @@
 """The wire transports admission's domain records without another representation."""
 from __future__ import annotations
 
+from scripts.lib import test_phase
+
 from scripts.build_queue import snapshot_codec as codec
 
 from scripts.lint.memory_test_support import admission_policy_fixture
@@ -49,7 +51,7 @@ class ProtocolTests(unittest.TestCase):
                 wire.Identity("cloud-session", "cloud-worker", "merge-gate", "/private", "cloud-unit"),
                 wire.CloudPlace("aws"), NOW - 60, NOW - 50,
                 cloud_progress.CloudProgress("running", 32, 1, NOW - 20),
-                progress_profile.ProgressCounter("modules", 7, 12), gate.ReadyForAdmission())
+                progress_profile.ProgressCounter("modules", 7, 12), records.ReadyForAdmission())
             reading = wire.CloudQueueRead(base.view, base.explanation, base.ordered,
                 diagnostics=base.diagnostics, cloud=(cloud_row,), cloud_slots=9, cloud_gate_stale_pushes=3)
             for outcome in (wire.ViewReply(reading), wire.MineReply(reading)):
@@ -57,7 +59,7 @@ class ProtocolTests(unittest.TestCase):
                     self.assertEqual(wire.parse_reply(wire.encode_reply(outcome)), outcome)
 
     def test_cloud_slot_wait_survives_the_reply_wire(self) -> None:
-        reply = replace(wait_reply(gate.NeedsMemory()),
+        reply = replace(wait_reply(records.NeedsMemory()),
             reason=wire.CloudSlotWait(9, 9), text="waits for a cloud slot: 9 of 9 in use")
         self.assertEqual(wire.parse_reply(wire.encode_reply(reply)), reply)
 
@@ -153,34 +155,34 @@ class ProtocolTests(unittest.TestCase):
         with QueueFixture() as fixture:
             inputs = fixture.inputs(policy=admission_policy_fixture())
             running = replace(inputs.running[0], promise=6 * GIB,
-                measured=gate.MeasuredMemory(2 * GIB, swap_bytes=4 * GIB,
-                                            anonymous=gate.AnonymousRunUse(2 * GIB)))
+                measured=records.MeasuredMemory(2 * GIB, swap_bytes=4 * GIB,
+                                            anonymous=records.AnonymousRunUse(2 * GIB)))
             reservation = inputs.reservations[0].copy()
             reservation["need"] = 6 * GIB
             inputs = replace(inputs, running=(running,), reservations=(reservation,),
-                host=gate.HostMemory(10 * GIB, 60 * GIB),
-                pressure=gate.PressureUnavailable("PSI unreadable"))
+                host=records.HostMemory(10 * GIB, 60 * GIB),
+                pressure=records.PressureUnavailable("PSI unreadable"))
             reading = gate.queue_read_from(inputs, admission_policy_fixture())
             reply = wire.ViewReply(reading)
             parsed = wire.parse_reply(wire.encode_reply(reply))
             self.assertEqual(parsed, reply)
             assert isinstance(parsed, wire.ViewReply)
             room = parsed.reading.explanation.room
-            assert isinstance(room, gate.MemoryRoom)
+            assert isinstance(room, records.MemoryRoom)
             self.assertEqual((room.room, room.kept, room.used, room.cap),
                              (3 * GIB, 4 * GIB, 2 * GIB, 9 * GIB))
             self.assertEqual(parsed.reading.view.running[0].measured, running.measured)
-            self.assertIsInstance(parsed.reading.explanation.host, gate.HostAvailable)
-            assert isinstance(parsed.reading.explanation.host, gate.HostAvailable)
+            self.assertIsInstance(parsed.reading.explanation.host, records.HostAvailable)
+            assert isinstance(parsed.reading.explanation.host, records.HostAvailable)
             self.assertEqual(parsed.reading.explanation.host.pressure,
-                             gate.PressureUnavailable("PSI unreadable"))
+                             records.PressureUnavailable("PSI unreadable"))
 
     def test_unowned_scope_activity_round_trips(self) -> None:
         from scripts.build_queue.scope_activity import ScopeProcesses, NoLiveBuildRun
 
         activity = ScopeProcesses(2, "session", "worker", "/tree", "python3", NOW, False, NoLiveBuildRun())
-        current = gate.UnownedSliceMemory(GIB, owner="scope", activity=activity, pid=gate.PidNotRecorded())
-        self.assertEqual(codec.parse_snapshot_value(codec.snapshot_value(current), gate.UnownedSliceMemory), current)
+        current = records.UnownedSliceMemory(GIB, owner="scope", activity=activity, pid=records.PidNotRecorded())
+        self.assertEqual(codec.parse_snapshot_value(codec.snapshot_value(current), records.UnownedSliceMemory), current)
 
     def test_service_job_state_and_separate_swap_survive_the_view_reply(self) -> None:
         from scripts.build_queue.scope_activity import IdleService, RunningServiceJob
@@ -188,10 +190,10 @@ class ProtocolTests(unittest.TestCase):
 
         for state in (IdleService(), RunningServiceJob(NOW - 120)):
             with self.subTest(state=state):
-                memory = gate.UnownedSliceMemory(GIB // 10, swap_bytes=2 * GIB,
-                    owner="hana-ci.slice", job_state=state, pid=gate.PidNotRecorded())
-                step = gate.RunningStep("", "", "unowned", "ci.slice", 0, memory, pid=gate.PidNotRecorded())
-                view = gate.QueueView((), (step,), 20 * GIB, 0, 3 * GIB, NOW)
+                memory = records.UnownedSliceMemory(GIB // 10, swap_bytes=2 * GIB,
+                    owner="hana-ci.slice", job_state=state, pid=records.PidNotRecorded())
+                step = records.RunningStep("", "", "unowned", "ci.slice", 0, memory, pid=records.PidNotRecorded())
+                view = records.QueueView((), (step,), 20 * GIB, 0, 3 * GIB, NOW)
                 reading = queue_read_fixture(view, policy=admission_policy_fixture())
                 reply = wire.ViewReply(reading)
                 parsed = wire.parse_reply(wire.encode_reply(reply))
@@ -206,16 +208,16 @@ class ProtocolTests(unittest.TestCase):
         from scripts.build_queue.scope_activity import LiveBuildRun
         from scripts.build_queue.queue_fixture import queue_read_fixture
 
-        view = gate.QueueView((), (), 0, 0, 0, NOW)
+        view = records.QueueView((), (), 0, 0, 0, NOW)
         reading = queue_read_fixture(view, policy=admission_policy_fixture())
         current = cast(dict[str, object], codec.snapshot_value(reading))
         del current["diagnostics"]
         current["diagnostics"] = [{"kind": "ConfigurationDiagnostic", "diagnostic": "service warning"}]
-        parsed = codec.parse_snapshot_value(current, gate.QueueRead)
-        self.assertEqual(parsed, replace(reading, diagnostics=(gate.ConfigurationDiagnostic("service warning"),)))
-        step = gate.RunningStep("owner", "worker", "merge-gate", "/tree", GIB, gate.MeasuredMemory(0),
+        parsed = codec.parse_snapshot_value(current, records.QueueRead)
+        self.assertEqual(parsed, replace(reading, diagnostics=(records.ConfigurationDiagnostic("service warning"),)))
+        step = records.RunningStep("owner", "worker", "merge-gate", "/tree", GIB, records.MeasuredMemory(0),
                                 run=LiveBuildRun(123, "456", NOW - 60), started_at=NOW - 30, pid=123)
-        self.assertEqual(codec.parse_snapshot_value(codec.snapshot_value(step), gate.RunningStep), step)
+        self.assertEqual(codec.parse_snapshot_value(codec.snapshot_value(step), records.RunningStep), step)
 
     def test_unit_override_round_trips(self) -> None:
         with AdmissionFixture() as fixture:
@@ -266,11 +268,11 @@ printf '%s\\n' "$BUILDLOG_ADMISSION_CODE_VERSION"
             self.assertEqual(cast(dict[str, object], run_encoded["data"])["run"], codec.snapshot_value(run))
 
     def test_pressure_condition_variants_keep_their_meaning_through_the_codec(self) -> None:
-        conditions: tuple[gate.PressureConditionNotRecorded | Literal["full", "swap"], ...] = (
-            "full", "swap", gate.PressureConditionNotRecorded())
+        conditions: tuple[records.PressureConditionNotRecorded | Literal["full", "swap"], ...] = (
+            "full", "swap", records.PressureConditionNotRecorded())
         for condition in conditions:
             with self.subTest(condition=condition):
-                pressure = gate.MemoryPressure(8, 15, 80, condition=condition)
+                pressure = records.MemoryPressure(8, 15, 80, condition=condition)
                 reply = wait_reply(pressure)
                 reply = replace(reply, snapshot=replace(reply.snapshot,
                     decision=replace(reply.snapshot.decision, pressure=pressure)))
@@ -281,19 +283,19 @@ printf '%s\\n' "$BUILDLOG_ADMISSION_CODE_VERSION"
         with AdmissionFixture() as fixture:
             request = fixture.request()
             requests: list[wire.Request] = [request, fixture.launch(),
-                replace(request, profile=gate.ProgramProfile("merge-gate", "repo", "tree", gate.HistoryPeakSizing(3 * GIB, gate.FirstProgramPeak(3 * GIB), 0.0))),
-                replace(request, profile=gate.ProgramProfile("rust-analyzer", "repo", "tree",
-                    gate.HistoryPeakSizing(18 * GIB, gate.FirstProgramPeak(18 * GIB), NOW))),
-                replace(request, profile=gate.ProgramProfile("rust-analyzer", "repo", "tree",
-                    gate.HistoryPeakSizing(18 * GIB, gate.MeasuredProgramPeak(7 * GIB, 5), NOW))),
+                replace(request, profile=records.ProgramProfile("merge-gate", "repo", "tree", records.HistoryPeakSizing(3 * GIB, records.FirstProgramPeak(3 * GIB), 0.0))),
+                replace(request, profile=records.ProgramProfile("rust-analyzer", "repo", "tree",
+                    records.HistoryPeakSizing(18 * GIB, records.FirstProgramPeak(18 * GIB), NOW))),
+                replace(request, profile=records.ProgramProfile("rust-analyzer", "repo", "tree",
+                    records.HistoryPeakSizing(18 * GIB, records.MeasuredProgramPeak(7 * GIB, 5), NOW))),
                 wire.ReleaseRequest("release", "/tmp/stem", 137),
                 wire.WidthRequest("width", "/tmp/stem", 4), wire.ViewRequest(),
                 wire.ExplainRequest(), wire.MineRequest("session"),
                 wire.AdmitHeadRequest("head", "urgent", "actor"),
                 wire.PrioritySetRequest("priority", "queue-unit", "urgent", "actor"),
                 wire.PriorityClearRequest("clear", "actor"), wire.TokenWaitRequest("token", "stem")]
-            for width in (gate.RequestedTestWidth(3), gate.UnspecifiedTestWidth(), gate.NoTestWidth()):
-                for call in (gate.CallRecord("a-call"), gate.NoCallRecord()):
+            for width in (records.RequestedTestWidth(3), records.UnspecifiedTestWidth(), records.NoTestWidth()):
+                for call in (test_phase.CallRecord("a-call"), test_phase.NoCallRecord()):
                     requests.append(replace(request, test_width=width, call=call))
             for value in requests:
                 with self.subTest(request=value):
@@ -308,10 +310,10 @@ printf '%s\\n' "$BUILDLOG_ADMISSION_CODE_VERSION"
             fixture.free(0)
             _ = fixture.server.handle_request(fixture.request())
             inputs = fixture.server.last_inputs
-            assert isinstance(inputs, gate.QueueInputs)
+            assert isinstance(inputs, records.QueueInputs)
             reading = gate.queue_read_from(inputs, policy=admission_policy_fixture())
             replies: tuple[wire.Reply, ...] = (
-                wait_reply(gate.EstimateExpired(NOW - admission_policy_fixture().timing.estimate_refresh_seconds), 1, "head", "estimate expired"),
+                wait_reply(records.EstimateExpired(NOW - admission_policy_fixture().timing.estimate_refresh_seconds), 1, "head", "estimate expired"),
                 admitted_reply("stem", GIB, "future-source", "stem.max", "stem.wave"),
                 wire.LaunchAdmitted(GIB, "future-source"), wire.Refused("no"), wire.Ok(),
                 wire.ViewReply(reading), wire.ExplainReply(reading.explanation), wire.MineReply(reading))
@@ -327,7 +329,7 @@ printf '%s\\n' "$BUILDLOG_ADMISSION_CODE_VERSION"
     def test_admit_and_launch_have_distinct_outcomes(self) -> None:
         with AdmissionFixture() as fixture:
             admit, launch = fixture.request(), fixture.launch()
-            held = wait_reply(gate.ReadyForAdmission(), 1, "head", "ready")
+            held = wait_reply(records.ReadyForAdmission(), 1, "head", "ready")
             admitted = admitted_reply("stem", GIB, "arbitrary source", "stem.max", "stem.wave")
             launched = wire.LaunchAdmitted(GIB, "arbitrary source")
             self.assertEqual(wire.parse_reply(wire.encode_reply(admitted), admit), admitted)
@@ -364,23 +366,23 @@ printf '%s\\n' "$BUILDLOG_ADMISSION_CODE_VERSION"
             fixture.free(0)
             _ = fixture.server.handle_request(fixture.request(age=admission_policy_fixture().timing.estimate_refresh_seconds))
             inputs = fixture.server.last_inputs
-            assert isinstance(inputs, gate.QueueInputs)
-            inputs = replace(inputs, spacing=gate.NextStartAt(NOW + 30))
+            assert isinstance(inputs, records.QueueInputs)
+            inputs = replace(inputs, spacing=records.NextStartAt(NOW + 30))
             local = gate.queue_read_from(inputs, policy=admission_policy_fixture()).explanation
             parsed = wire.parse_reply(wire.encode_reply(wire.ExplainReply(local)))
             assert isinstance(parsed, wire.ExplainReply)
             self.assertEqual(parsed.explanation, local)
             self.assertEqual(parsed.explanation.decided_from, inputs)
-            self.assertIsInstance(gate.smallest_head_release(parsed.explanation), gate.EstimateExpired)
+            self.assertIsInstance(gate.smallest_head_release(parsed.explanation), records.EstimateExpired)
             zone = ZoneInfo("UTC")
             names = read_step_names()
             shown = queue_evidence.release_text(gate.smallest_head_release(parsed.explanation), parsed.explanation, {}, zone, names=names)
             self.assertEqual(shown,
                              queue_evidence.release_text(gate.smallest_head_release(local), local, {}, zone, names=names))
             self.assertTrue(shown.startswith("the estimate expired at"))
-            assert isinstance(local.head, gate.HeadExplanation)
-            assert isinstance(local.head.cause, gate.EstimateExpired)
-            assert isinstance(parsed.explanation.head, gate.HeadExplanation)
-            assert isinstance(parsed.explanation.head.cause, gate.EstimateExpired)
+            assert isinstance(local.head, records.HeadExplanation)
+            assert isinstance(local.head.cause, records.EstimateExpired)
+            assert isinstance(parsed.explanation.head, records.HeadExplanation)
+            assert isinstance(parsed.explanation.head.cause, records.EstimateExpired)
             self.assertEqual(queue_evidence.estimate_refresh_text(parsed.explanation.head.cause, zone),
                              queue_evidence.estimate_refresh_text(local.head.cause, zone))

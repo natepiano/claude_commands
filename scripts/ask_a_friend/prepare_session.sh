@@ -6,7 +6,7 @@
 # Produces:
 #   /tmp/claude/ask_a_friend/<uuid>/             — unique session directory
 #   /tmp/claude/ask_a_friend/<uuid>/history.md   — empty history file
-#   /tmp/claude/ask_a_friend/<uuid>/friend_name  — the friend's mesh address
+#   /tmp/claude/ask_a_friend/<uuid>/friend_name  — the friend's worker address
 #
 # Prints the friend name and, as its last line, the session directory path.
 
