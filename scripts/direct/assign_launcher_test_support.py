@@ -306,23 +306,3 @@ class HookAssignmentFixture(AssignLauncherFixture):
 class FirstDispatchFixture(HookAssignmentFixture):
     def first_assignment(self, role: str = "implement", *options: str) -> None:
         _ = self.successful(role, *options)
-
-
-@dataclass(frozen=True)
-class FirstDispatchArtifact:
-    """A completed first dispatch publishes this file."""
-
-    relative: Path
-    content: bytes
-    mode: int
-
-def snapshot_files(root: Path) -> dict[Path, bytes]:
-    """Read regular files before a dispatch."""
-    return {path.relative_to(root): path.read_bytes() for path in root.rglob("*")
-            if path.is_file() and not path.is_symlink()}
-
-def changed_files(root: Path, before: dict[Path, bytes]) -> tuple[FirstDispatchArtifact, ...]:
-    """Keep files that the dispatch changed."""
-    return tuple(FirstDispatchArtifact(relative, content, (root / relative).stat().st_mode)
-                 for relative, content in snapshot_files(root).items()
-                 if before.get(relative) != content)

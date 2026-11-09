@@ -78,6 +78,7 @@ class DispatchAwaitingReply:
     """A detached result has no worker reply yet."""
 
     last_reply: str = ""
+    runs: tuple[str, ...] = ()
 
 
 DispatchReceipt = (DispatchNotSubmitted | DispatchSubmitted | DispatchComplete | DispatchEvidenceUnknown
@@ -152,7 +153,8 @@ def transcript_receipt(entries: Iterable[str | worker_admission.TornTranscriptRe
                     responding = False
                 elif submitted and responding and results:
                     reply = DispatchAwaitingReply(
-                        reply.last_reply if isinstance(reply, DispatchAwaitingReply) else reply.reply)
+                        reply.last_reply if isinstance(reply, DispatchAwaitingReply) else reply.reply,
+                        tuple(sorted(results.union(reply.runs if isinstance(reply, DispatchAwaitingReply) else ()))))
             elif (responding or isinstance(line, DispatchPrompt)) and entry.startswith("assistant:\n"):
                 text = entry.removeprefix("assistant:\n")
                 if isinstance(completion, FinalReply):
@@ -214,6 +216,8 @@ def dispatch_receipt(row: staff.StaffRow, line: str, dispatch_id: str, *, run: P
     pending = detached_runs.delivered_worker_results(directory, row.name, since=since) - received
     live = detached_runs.live_runs(directory, row.name)
     pending.update(record["run_id"] for record in live)
+    if isinstance(reply, DispatchAwaitingReply):
+        pending.update(reply.runs)
     if pending and not live and isinstance(reply, DispatchComplete):
         return replace(reply, anomalies=tuple(
             f"run {run_id} finished, but its result is not in the transcript" for run_id in sorted(pending)))

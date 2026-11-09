@@ -686,6 +686,11 @@ class NoStaffRecipient:
 
 
 @dataclass(frozen=True)
+class NoStaffSender:
+    """The environment does not identify a current staff sender."""
+
+
+@dataclass(frozen=True)
 class StableRecipient:
     """Identify the recipient across changes to its transport address."""
 
@@ -2106,6 +2111,16 @@ def _ambiguous_name(name: str, entries: list[roster.RosterEntry]) -> NoReturn:
     usage_error("\n".join(lines))
 
 
+def _sender_staff_row(membership: staff.StaffSnapshot) -> staff.StaffRow | NoStaffSender:
+    from scripts.message import roster
+
+    sender = roster.sender_identity(os.environ)
+    identity = (sender.thread_id if isinstance(sender, roster.CodexThread)
+                else sender.session_id if isinstance(sender, roster.ClaudeSession) else "")
+    member = membership.by_current_session(identity)
+    return member if member is not None else NoStaffSender()
+
+
 def resolve_staff_recipient(
     target: str, membership: staff.StaffSnapshot, *, records: tuple[sessions.SessionRecord, ...] | list[sessions.SessionRecord] = (),
     observed: tuple[roster.RosterEntry, ...] | list[roster.RosterEntry] = (),
@@ -2124,10 +2139,8 @@ def resolve_staff_recipient(
         if reference == target:
             path = target.removeprefix("worker:")
             if len(path.split("/")) == 2:
-                sender = roster.sender_identity(os.environ)
-                identity = (sender.thread_id if isinstance(sender, roster.CodexThread)
-                            else sender.session_id if isinstance(sender, roster.ClaudeSession) else "")
-                ancestor = membership.by_current_session(identity)
+                sender = _sender_staff_row(membership)
+                ancestor = sender if isinstance(sender, staff.StaffRow) else None
                 while ancestor is not None and ancestor.kind != "showrunner":
                     ancestor = membership.parent_of(ancestor)
                 if ancestor is not None and path.split("/", 1)[0] != ancestor.name:
@@ -2154,6 +2167,7 @@ def resolve_staff_recipient(
 
     normalized = "/".join(normalized_name(part) for part in reference.split("/"))
     matches: dict[staff.StaffId, staff.StaffRow] = {}
+    paths: dict[staff.StaffId, str] = {}
     for candidate in membership.find():
         chain = [candidate.name]
         parent = candidate
@@ -2169,15 +2183,28 @@ def resolve_staff_recipient(
         canonical = "/".join(normalized_name(part) for part in chain)
         short = normalized_name(candidate.name)
         if normalized == canonical or ("/" not in normalized and normalized == short):
-            # by_path handles canonical paths; by_id preserves duplicate-path evidence.
+            # Preserve each identity when staff has duplicate paths.
             found = membership.by_path(path)
             row = found if found is not None and found.id == candidate.id else membership.by_id(candidate.id)
             if row is not None:
                 matches[row.id] = row
-    if len(matches) == 1:
+                paths[row.id] = path
+    foreign_workers_only = False
+    if "/" not in normalized and matches and all(row.kind == "worker" for row in matches.values()):
+        sender = _sender_staff_row(membership)
+        unit = sender if isinstance(sender, staff.StaffRow) else None
+        if unit is not None and unit.kind == "worker":
+            unit = membership.parent_of(unit)
+        if unit is not None and unit.kind == "unit":
+            own_workers = {key: row for key, row in matches.items() if row.parent == staff.ReportsTo(unit.id)}
+            if own_workers:
+                matches = own_workers
+            else:
+                foreign_workers_only = True
+    if len(matches) == 1 and not foreign_workers_only:
         return next(iter(matches.values()))
     if matches:
-        details = ", ".join(f"{row.name} (staff:{row.id}, session:{row.current_session})" for row in matches.values())
+        details = ", ".join(f"{paths[row.id]} (staff:{row.id}, session:{row.current_session})" for row in matches.values())
         return RecipientLookupFailed(f"ambiguous staff row for {target!r}: {details}")
     return NoStaffRecipient()
 

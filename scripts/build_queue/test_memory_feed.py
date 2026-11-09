@@ -22,7 +22,8 @@ from typing import cast, override
 from unittest import mock
 
 from scripts.buildlog import charts, costs, moments
-from scripts.build_queue import admission_client, admission_code, admission_protocol as wire, memory_feed, queue_lines, queue_view
+from scripts.build_queue import admission_client, admission_code, admission_protocol as wire, cloud_progress, memory_feed, progress_profile, queue_lines, queue_view
+from scripts.build_queue.test_queue_view import cloud_reading
 from scripts.build_queue.scope_activity import IdleService, LiveBuildRun, NoLiveBuildRun, ScopeProcess, ScopeProcesses
 from scripts.lint import test_memory_admit as memory_tests
 from scripts.lib import conf, test_hang_guard
@@ -521,6 +522,65 @@ class MemoryFeedTests(unittest.TestCase):
         page = cast(dict[str, object], json.loads((self.output / "memory.json").read_text()))
         self.assertEqual(page["decoder_revision"], "after")
 
+    def test_cloud_rows_share_the_feed_without_memory_reservations(self) -> None:
+        _ = (self.root / "cloud_gate.conf").write_text(
+            "[cloud_gate]\n# range: 5e-324..\nlog_push_s=5\n")
+        reading = cloud_reading(reservation_reading())
+        first = reading.cloud[0]
+        assert isinstance(first.progress, cloud_progress.CloudProgress)
+        cases: tuple[tuple[cloud_progress.CloudState, float, str], ...] = (
+            ("requesting", first.progress.updated_at, "2 min"),
+            ("setup", first.progress.updated_at, "2 min"),
+            ("running", first.progress.updated_at, "2 min"),
+            ("uploading", first.progress.updated_at, "2 min"),
+            ("running", 0.0, "1 min"),
+            ("running", reading.explanation.now, ""),
+            ("running", reading.explanation.now - 45, "45 s"),
+            ("running", reading.explanation.now - 10800, "3 h"),
+            ("running", reading.explanation.now - 172800, "2 d"),
+        )
+        for state, updated_at, late_age in cases:
+            with self.subTest(state=state, updated_at=updated_at):
+                cloud = replace(first, progress=replace(first.progress, state=state, updated_at=updated_at))
+                current = replace(reading, cloud=(cloud, *reading.cloud[1:]))
+                with (mock.patch.object(admission_client, "view", return_value=current),
+                      mock.patch.object(os, "cpu_count", return_value=17)):
+                    page = memory_feed.reading()
+                text = memory_feed.page_json(page)
+                payload = cast(dict[str, object], json.loads(text))
+                self.assertNotIn("cloud", payload)
+                self.assertNotIn("cloud_heading", payload)
+                self.assertEqual(page["cloud_slots_used"], 1)
+                self.assertEqual(page["cloud_slots"], 1)
+                self.assertIn("cloud 1 of 1 slots", page["head_text"])
+                runs = cast(list[dict[str, object]], payload["walk"])
+                waits = cast(list[dict[str, object]], payload["waiters"])
+                remote, = [row for row in runs if row.get("kind") == "cloud"]
+                local, = [row for row in runs if row.get("kind") != "cloud"]
+                waiter, = [row for row in waits if row.get("kind") == "cloud"]
+                self.assertEqual(remote["machine"], "aws")
+                self.assertEqual(remote["vcpus"], 32)
+                self.assertEqual(remote["state"], state)
+                self.assertEqual(remote["pid"], 700001)
+                self.assertEqual(remote["started_at"], first.started_at)
+                self.assertIn("7 of 12 modules", str(remote["status"]))
+                self.assertIn("1 failed module", str(remote["status"]))
+                self.assertNotIn("no update for", str(remote["status"]))
+                self.assertEqual(remote["late_age"], late_age)
+                self.assertEqual(remote["stale"], bool(late_age))
+                self.assertEqual(local["machine"], "fixture")
+                self.assertEqual(local["vcpus"], 17)
+                self.assertGreater(float(str(local["reserved"])), 0)
+                self.assertEqual(waiter["pid"], 700002)
+                self.assertEqual(waiter["machine"], "")
+                self.assertEqual(waiter["late_age"], "")
+                self.assertFalse(waiter["stale"])
+                self.assertEqual(waiter["since"], reading.cloud[1].since)
+                self.assertIn("waits for a cloud slot: 1 of 1 in use", str(waiter["reason"]))
+                for row in (remote, waiter):
+                    for field in ("used", "counted", "reserved", "need"):
+                        self.assertNotIn(field, row)
+
     def test_project_names_follow_the_queue_formatter_for_running_and_waiting_steps(self) -> None:
         for project, folder in (("known-project", "/fixture"), ("", "/fixture"),
                                 ("", "/absolute/repository")):
@@ -604,7 +664,9 @@ class MemoryFeedTests(unittest.TestCase):
         reading = replace(reading, explanation=replace(reading.explanation, room=room))
         with mock.patch.object(admission_client, "view", return_value=reading):
             page = memory_feed.reading()
-        self.assertEqual(page["walk"][0]["used"], missing)
+        run_row = page["walk"][0]
+        assert "used" in run_row
+        self.assertEqual(run_row["used"], missing)
         self.assertIn("RunUseUnavailable", memory_feed.page_json(page))
 
     def test_one_report_call_supplies_both_sections(self) -> None:
@@ -680,6 +742,15 @@ def write_browser_fixture(folder: Path) -> None:
             ("head", admission_records.BehindHead("first", 1, "head-session")),
         ):
             readings[name] = with_wait_reason(base, reason)
+        _ = (fixture.root / "cloud_gate.conf").write_text(
+            "[cloud_gate]\n# range: 5e-324..\nlog_push_s=5\n")
+        cloud = cloud_reading(with_wait_reason(base, admission_records.StartSpacingWait(110)))
+        readings["cloud"] = cloud
+        first = cloud.cloud[0]
+        assert isinstance(first.progress, cloud_progress.CloudProgress)
+        readings["cloud_zero"] = replace(cloud, cloud=(replace(first,
+            progress=replace(first.progress, updated_at=0.0, failed_modules=123456),
+            counter=progress_profile.ProgressCounter("modules", 123456, 999999)), *cloud.cloud[1:]))
         room = base.explanation.room
         assert isinstance(room, admission_records.MemoryRoom)
         missing = replace(room.runs[0].memory, use=admission_records.RunUseUnavailable("private memory.stat is missing"))

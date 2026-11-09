@@ -890,6 +890,7 @@ class PaneRunDeliveryTests(unittest.TestCase):
                 self.assertEqual(active.instance_id, dispatch_id)
                 if completed:
                     agent = test_worker.DispatchAgent(self.fixture)
+                    agent.pane_commands(self)
                     line = f"Read the unchanged prompt file {json.dumps(str(prompt))}. End your final reply with DONE {dispatch_id}."
                     reply = self.fixture.root / "finished-reply.txt"
                     progress_history.save_dispatch_delivery(self.run_dir, dispatch_id,
@@ -903,6 +904,7 @@ class PaneRunDeliveryTests(unittest.TestCase):
                     self.assertTrue(reply.read_text().endswith(f"DONE {dispatch_id}\n"))
                     self.assertEqual(len(agent.notices), 1)
                     self.assertIn("phase 40: done", agent.notices[0])
+                    self.assertIn(f"; pass {dispatch_id}", agent.notices[0])
                     self.assertNotIn(pane, self.fixture.world.locations)
 
     def test_native_caller_ignores_inherited_session_and_run(self) -> None:
