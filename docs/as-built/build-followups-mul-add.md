@@ -32,7 +32,8 @@ The release check sets `CARGO_INCREMENTAL=0` for clippy. It sets `CARGO_TARGET_X
 
 ### Lint-step fix
 
-The normal `verify.sh lint` path runs mend, fmt, Taplo, and Clippy judgment under the tree watch. The judgment uses `--workspace --all-targets --all-features --keep-going -- -D warnings`. A passing judgment ends the stage. Status 101 permits repairs for lint findings, compile errors, and unknown diagnostics. A kill, a compiler signal report, or a lint hold prevents repairs. Other initial statuses return directly.
+The normal `verify.sh lint` path runs mend, fmt, Taplo, and Clippy judgment.
+Only the judgment runs under the tree watch. The judgment uses `--workspace --all-targets --all-features --keep-going -- -D warnings`. A passing judgment ends the stage. Status 101 permits repairs for lint findings, compile errors, and unknown diagnostics. A kill, a compiler signal report, or a lint hold prevents repairs. Other initial statuses return directly.
 
 The repair loop reads `clippy_fix_pass_limit` from `${LINT_CONFIG_FILE:-$HOME/.claude/config/lint.conf}` when repairs start. The default is 3. Valid values are integers from 1 through 9999.
 
