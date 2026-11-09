@@ -412,7 +412,9 @@ class AccountsTests(unittest.TestCase):
             messagingSocketPath="/fixture.sock", updatedAt=1, tmux="", formerNames=[])
         moves.append_move(moves.FailedMove(at="2026-10-14T12:00:00+00:00", tool="claude",
             subject="moved-session", move_id="move-one", kind="failed", reason="still on claude1"))
-        with (patch.object(sessions, "live_sessions", return_value=[owner]),
+        # Each run stores a usage reading at the current time; the two outputs must match.
+        with (patch.object(accounts, "datetime", RoleWriteTime),
+              patch.object(sessions, "live_sessions", return_value=[owner]),
               patch.object(sessions, "running_sessions", return_value=[owner]),
               patch.object(import_module("scripts.message.sessions"), "live_sessions", return_value=[owner]),
               patch.object(account, "process_config_dir", return_value=account.ConfiguredClaudeFolder(self.main_dir))):
@@ -2069,6 +2071,19 @@ class AccountsTests(unittest.TestCase):
             listing.assert_called_once_with()
             moved.assert_called_once_with([owner.session_id], "claude2", why="fixture move", cause="by hand",
                                           source_accounts={owner.session_id: "claude1"} if live else {})
+
+        self.login_directory("claude1", "move@example.invalid")
+        stored_room("move@example.invalid", 0, datetime.now(timezone.utc) + timedelta(days=1))
+        for dry_run in (False, True):
+            with (self.subTest(dry_run=dry_run),
+                  patch.object(inventory, "listing", return_value=[owner]) as listing,
+                  patch.object(accounts, "check_move_target", wraps=accounts.check_move_target) as checked,
+                  patch.object(stop_resume, "move_sessions") as moved):
+                result = self.run_cli("move", owner.name, "claude1", *(["--dry-run"] if dry_run else []))
+                self.assertEqual(result, (0, "fixture session: already on claude1\n", ""))
+                listing.assert_called_once_with()
+                checked.assert_not_called()
+                moved.assert_not_called()
 
     def test_showrunner_group_preview_names_unregistered_timers_without_configuring_or_requesting(self) -> None:
         from scripts.shutdown.inventory import ShowrunnerRegistration, ShowrunnerRegistrations

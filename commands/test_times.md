@@ -11,6 +11,7 @@ Run `~/.claude/scripts/lib/py ~/.claude/scripts/test_times/show.py $ARGUMENTS` a
 - `test <text> [--runs N]`: show kept test names that contain the text and later missing measurements.
 
 In the ~/.claude repository, `top` ranks live gate modules by median CPU time.
+The nightly type check has a footnote with its latest passed CPU and wall time. It does not count toward the limit.
 In another repository, `top` ranks recorded nextest tests on the current host within `TOP_MAX_AGE_DAYS`.
 The repository key follows its origin, so worktrees share the same test history.
 Each list holds the records from the last complete index update.

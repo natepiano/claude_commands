@@ -240,7 +240,7 @@ class AccountMoveTests(ShutdownTestCase):
         status, output, error = self.cli(target="claude1")
         self.assertEqual((status, error), (0, ""))
         self.assertEqual(len(output.splitlines()), 1)
-        self.assertIn("Claude is up on claude1", output)
+        self.assertIn("kept name: already on claude1", output)
 
 
     def test_target_with_exhausted_window_and_credits_can_still_be_previewed(self) -> None:
