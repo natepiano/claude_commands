@@ -21,7 +21,7 @@ from scripts.lint.memory_test_support import write_config_fixture
 from scripts.lib.shell_test_support import shell_functions
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
-from scripts.direct.step_record import Pinned, ROUTED
+from scripts.direct.step_selection import Pinned, ROUTED
 
 
 class RoutingRuleTests(unittest.TestCase):

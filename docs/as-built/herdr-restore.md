@@ -102,6 +102,15 @@ Settings entry for the user, one more SessionEnd item:
   `WORKER_FIRST_TURN_SECONDS` (`config/direct.conf`). `worker_panes.start_or_resume` then publishes
   the staff row from the pane's `agent_session`.
 - A known identity launches with `resume <id>` and gets no first turn.
+- A Codex launch entry holds `codex_policy`: the `--sandbox`, `--ask-for-approval` and `-c` option
+  and value pairs, in launch order (`pane_launch.launch`, paired and `--opt=<v>` forms, stopping at
+  `--`). A Claude entry has no such field.
+- `pane_record.resume_arguments` gives `resume <id>`, then `--model <m>` when set, then the recorded
+  pairs unchanged. So a restored worker keeps its `model_reasoning_effort`, `service_tier`,
+  rate-limit nudge and `notify` settings. An entry without the field resumes with `resume <id>` and
+  `--model` only.
+- The record leaves out a `-c projects=...` pair. `codex_trust.trust_arguments` puts its own
+  `projects` pair before every Codex resume, and a recorded pair after it would win after a folder move.
 - `herdr.pane_native_process` reads pane membership for one foreground `codex`:
   - an `agent_session` equal to the row's `current_session` proves the pane;
   - a `resume` argument proves the pane when the report is empty (`UnreportedResume`: a resumed

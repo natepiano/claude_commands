@@ -15,8 +15,8 @@ from typing import final, override
 import unittest
 from unittest.mock import patch
 
-from scripts.agents import codex_mesh
-from scripts.agents.test_codex_mesh import FixtureLoopBudget, LifecycleTestClock, StubAppServer
+from scripts.agents import worker_lifecycle
+from scripts.agents.codex_test_support import FixtureLoopBudget, LifecycleTestClock, StubAppServer
 
 
 @final
@@ -24,7 +24,7 @@ class LauncherWaitTests(unittest.TestCase):
     # unittest constructs the live watcher and its clock together in setUp.
     clock: LifecycleTestClock  # pyright: ignore[reportUninitializedInstanceVariable]
     target: Path  # pyright: ignore[reportUninitializedInstanceVariable]
-    watch: codex_mesh.LinuxFileChanges | codex_mesh.KqueueFileChanges  # pyright: ignore[reportUninitializedInstanceVariable]
+    watch: worker_lifecycle.LinuxFileChanges | worker_lifecycle.KqueueFileChanges  # pyright: ignore[reportUninitializedInstanceVariable]
     guard: LauncherHangGuard  # pyright: ignore[reportUninitializedInstanceVariable]
 
     @override
@@ -33,9 +33,9 @@ class LauncherWaitTests(unittest.TestCase):
         self.clock.freeze()
         directory = self.enterContext(tempfile.TemporaryDirectory())
         self.target = Path(directory) / "ready"
-        _ = self.enterContext(patch.object(codex_mesh, "time", self.clock))
-        self.watch = (codex_mesh.LinuxFileChanges({self.target}) if sys.platform.startswith("linux")
-                      else codex_mesh.KqueueFileChanges({self.target}))
+        _ = self.enterContext(patch.object(worker_lifecycle, "time", self.clock))
+        self.watch = (worker_lifecycle.LinuxFileChanges({self.target}) if sys.platform.startswith("linux")
+                      else worker_lifecycle.KqueueFileChanges({self.target}))
         self.addCleanup(self.watch.close)
         self.guard = LauncherHangGuard(self.id())
 
@@ -48,11 +48,11 @@ class LauncherWaitTests(unittest.TestCase):
                 waiting = executor.submit(self.guard.change, self.watch.wait, self.clock.monotonic)
                 self.target.touch()
                 event = self.guard.result(waiting)
-            self.assertIsInstance(event, codex_mesh.StateFilesChanged)
+            self.assertIsInstance(event, worker_lifecycle.StateFilesChanged)
         self.clock.advance(1)
         wake, peer = socket.socketpair()
         with wake, peer:
-            self.assertEqual(self.watch.wait(wake, deadline), codex_mesh.WaitDeadlineExpired.EXPIRED)
+            self.assertEqual(self.watch.wait(wake, deadline), worker_lifecycle.WaitDeadlineExpired.EXPIRED)
 
     def test_hang_guard_wakes_a_file_wait_even_when_lifecycle_time_is_frozen(self) -> None:
         # Exercise the real watchdog/socket wakeup without waiting out the hang budget.
@@ -82,7 +82,7 @@ class LauncherWaitTests(unittest.TestCase):
         def budget(name: str, *, seconds: float = TEST_HANG_GUARD_SECS, max_calls: int = 2_000) -> FixtureLoopBudget:
             return FixtureLoopBudget(name, seconds=seconds, max_calls=max_calls, clock=self.clock.monotonic)
 
-        with (patch("scripts.agents.test_codex_mesh.FixtureLoopBudget", side_effect=budget),
+        with (patch("scripts.agents.codex_test_support.FixtureLoopBudget", side_effect=budget),
               patch.object(socket.socket, "recv", new=delayed_recv),
               socket.create_connection(("127.0.0.1", server.port)) as client):
             client.settimeout(self.guard.remaining())

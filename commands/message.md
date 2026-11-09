@@ -29,7 +29,6 @@ Blocked, stopped, closed, or uncertain workers route the message to their direct
 A missing worker row returns exit 2 and reaches nobody.
 Roster output shows unknown and incomplete workers with their reasons.
 An unreadable staff record produces a problem, not an empty worker list.
-Only an existing run pinned to `mesh` uses `worker:<run id>/<worker name>` and its retained message queue.
 
 Load `/message_style` before the first message to the user in a session.
 
@@ -46,7 +45,6 @@ Filing a question alone never sends a push.
 - `REPLACED: <why>` (exit 0): a newer version replaced this push, and that version carries the message; nothing was sent. Use no other phone path.
 - `REFUSED: <why>` (exit 2): fix the action flags, or add `--clears-when`, as the line says and send again. Use no other phone path.
 - `not sent: probe sessions never push to the phone` (exit 0): this session was started with `accounts.py exec --probe`; nothing was sent. Use no other phone path.
-- For an existing mesh-pinned run, `send.py: <name> cannot take messages (<reason>); contact its unit director <director> or wait` returns exit 2.
   Only its director can resume a worker between turns.
   Contact that director or await its next turn.
   Without a running director, the reason omits the contact advice.

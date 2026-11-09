@@ -59,9 +59,7 @@ A refunded batch adds no round unless it later lands.
 
 `dispatch` leaves its batch `repair_in_flight`.
 `gate` and `verdict` refuse a finding that remains in flight.
-For `herdr`, apply the completion and recovery rules in <LongLivedWorkers/>.
-For an existing `mesh` pin, `assign.sh` runs `landed` after a clean exit or `abandon --edits-landed` after an error.
-When that mesh launcher is gone, run `abandon --reason "<how it ended>"` before the next workflow step.
+Apply the completion and recovery rules in <LongLivedWorkers/>.
 Report the interruption and the reopened findings in one line.
 Pass `--edits-landed` only when repair edits exist in the tree.
 Without that flag, the ledger refunds the attempt, which preserves the budget that decides
@@ -213,7 +211,6 @@ without `none:` records P5 exposure (the user, 2026-10-28).
 
 For `herdr`, dispatch repairs through `assign.sh --role fix --prompt <path> --cwd <worktree> --fix-cause "<defect>"`.
 The worker command selects the worker and keeps its native session.
-For an existing `mesh` pin, use `assign.sh --role fix --to <full-worker-name>` with the repair prompt and phase options.
 Omit `--to` only for a new worker allowed by <LongLivedWorkers/>.
 Use messages only for questions; the launcher sends the assignment prompt.
 
@@ -259,8 +256,7 @@ UNIT_RESOLVES_ROUND=1 bash ~/.claude/scripts/direct/assign.sh --role fix \
   --fix-cause "<failed gate or defect>" --pass "${FIX_ROUND}" &
 ```
 
-For an existing `mesh` pin, `UNIT_RESOLVES_ROUND=1` makes the launcher resolve the round.
-For `herdr`, apply the completion and recovery rules in <LongLivedWorkers/>.
+Apply the completion and recovery rules in <LongLivedWorkers/>.
 Each further worker uses `UNIT_RESOLVES_ROUND=0`, its own prompt, and its slot.
 The round ends only after every worker completes.
 
@@ -306,8 +302,7 @@ A successful dispatch continues as above. An error applies <WorkerLaunchFailure/
 If the error remains, apply <RetainPhaseReservation/> and report the fix log.
 Record the error, clear the session marker, and stop.
 The launcher records either outcome in the ledger.
-For an existing `mesh` pin, if a dispatch ends without a terminal status, resolve its round with `findings.py abandon` under <FindingsLedger/>.
-For `herdr`, apply the recovery in <LongLivedWorkers/> first, because the pane worker can still finish the round.
+Apply the recovery in <LongLivedWorkers/> first, because the pane worker can still finish the round.
 Run `abandon` only when that recovery cannot finish it.
 Then apply <RetainPhaseReservation/> before review, another dispatch, or a report about the round.
 </FixDispatch>

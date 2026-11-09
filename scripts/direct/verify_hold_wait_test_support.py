@@ -31,7 +31,6 @@ from scripts.direct.verify_mac_offload_test_support import VerifyMacOffloadFixtu
 from scripts.direct.local_release_wait import RELEASE_CHANGES, LocalReleaseEvents, local_release_waiter
 from scripts.lib import inotify
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
-from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.shell_test_support import shell_functions
 
 
@@ -200,6 +199,7 @@ class VerifyHoldTools(VerifyMacOffloadFixture):
         cls.fixture_environment = {
             **builder.environment,
             "IN_NIX_SHELL": "pure",
+            "UNIT_DETACHED_RUN": "1",
             "ROSTER_RUN_ROOT": str(builder.root / "unit"),
             "UNIT_RUN_ROOT": str(builder.root / "unit"),
             "SCRATCH_ROOT": str(builder.root / "scratch"),
@@ -418,7 +418,6 @@ else:
     def record_phase(self) -> Path:
         session = self.fixture.root / "unit-run"
         record_wait_workers(self.fixture.root, session, self.fixture.environment, {"fixture-impl": "thread-impl"})
-        write_text_atomic(session / "worker_transport", "mesh\n")
         self.fixture.environment.update({"UNIT_RUN_DIR": str(session), "UNIT_PHASE_ID": "closed-server-phase",
                                          "UNIT_TEAM_ROLE": "impl", "CODEX_THREAD_ID": fixture_runtime_id("thread-impl"),
                                          "UNIT_PASS_OWNER": "launcher",

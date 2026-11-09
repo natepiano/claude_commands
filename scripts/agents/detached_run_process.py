@@ -20,7 +20,7 @@ def supervises(pid: int, record_path: Path) -> bool:
     if pid <= 0:
         return False
     parts = process_args(pid)
-    if "supervise" not in parts or not any(part.endswith("mesh_runs.py") for part in parts):
+    if "supervise" not in parts or not any(part.endswith("detached_runs.py") for part in parts):
         return False
     expected = record_path.resolve()
     return any(Path(part).resolve() == expected for part in parts if part)

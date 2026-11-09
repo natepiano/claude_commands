@@ -177,13 +177,13 @@ class AffectedModulesTests(unittest.TestCase):
                               ["test_bare.py"])
 
     def test_imported_test_module_selects_its_importer_without_requesting_full_suite(self) -> None:
-        self.add_test("agents/test_codex_mesh.py", "VALUE = 1\n")
-        self.add_test("direct/test_workers.py", "from scripts.agents.test_codex_mesh import VALUE\n")
+        self.add_test("agents/test_native_worker.py", "VALUE = 1\n")
+        self.add_test("direct/test_workers.py", "from scripts.agents.test_native_worker import VALUE\n")
         self.certify()
-        self.write("scripts/agents/test_codex_mesh.py", "VALUE = 2\n")
+        self.write("scripts/agents/test_native_worker.py", "VALUE = 2\n")
         _ = self.commit()
         self.assertCountEqual([path.name for path in self.selection().modules],
-                              ["test_codex_mesh.py", "test_workers.py"])
+                              ["test_native_worker.py", "test_workers.py"])
 
     def test_package_initializers_and_relative_imports_are_dependencies(self) -> None:
         self.write("scripts/component/__init__.py", "VALUE = 1\n")
