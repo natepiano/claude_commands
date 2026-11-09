@@ -1695,6 +1695,15 @@ class FloorTests(SweepCase):
         self.assertTrue(all(protected not in text for text in holder_messages))
         self.assertTrue(protected_file.exists())
         self.assertTrue(busy_file.exists())
+        with (mock.patch.object(sweep, "process_uses", return_value={protected: use, busy: use}),
+              mock.patch.object(sweep, "send_floor_alert", return_value=DELIVERED_NATEDEV_ALERT),
+              mock.patch.object(sweep, "send_holder_message", return_value=DELIVERED_NATEDEV_ALERT),
+              mock.patch.object(sweep, "notify_floor_problem", wraps=sweep.notify_floor_problem) as notify):
+            status, _ = self.hold(base, 10 * GIB, [0], dry_run=False, recorded=False)
+        self.assertEqual(status, 0)
+        outcome = cast(sweep.FloorOutcome, notify.call_args.args[0])
+        self.assertCountEqual(outcome.held_targets, (protected, busy))
+        self.assertIn(protected, dict(outcome.protected))
 
     def test_unavailable_index_uses_saved_roots_after_the_checkout_is_gone(self) -> None:
         base = self.base()
@@ -3164,10 +3173,13 @@ class FloorTests(SweepCase):
                 fcntl.flock(holder, fcntl.LOCK_SH)
                 return result
             with (mock.patch.object(sweep, "scan_floor_roots", side_effect=start_after_scan),
-                  mock.patch.object(sweep, "send_floor_alert", return_value=DELIVERED_NATEDEV_ALERT)):
+                  mock.patch.object(sweep, "send_floor_alert", return_value=DELIVERED_NATEDEV_ALERT),
+                  mock.patch.object(sweep, "notify_floor_problem", wraps=sweep.notify_floor_problem) as notify):
                 status, text = self.hold(base, 10 * GIB, [10 * GIB - SIZE, 10 * GIB - SIZE], recorded=True)
             self.assertEqual(status, 0, text)
             self.assertTrue(output.exists())
+            outcome = cast(sweep.FloorOutcome, notify.call_args.args[0])
+            self.assertCountEqual(outcome.held_targets, (str(tree.parent),))
 
     def test_outside_link_leaves_floor_exhausted_and_sends_alert(self) -> None:
         base = self.base()
@@ -4053,8 +4065,11 @@ with mock.patch.object(sweep, "free_bytes", return_value=130 * sweep.GIB), mock.
 
     def test_crossing_recommends_one_measured_choice_that_frees_the_shortfall(self) -> None:
         for machine, links in (("natedev", "none"), ("Mac", "none"),
-                               ("Mac", "external"), ("Mac", "internal")):
+                               ("Mac", "external"), ("Mac", "internal"),
+                               ("Mac", "held-next"), ("Mac", "held-insufficient"),
+                               ("Mac", "held-only"), ("natedev", "held-next")):
             with self.subTest(machine=machine, links=links), self.crossing_delivery({}) as delivery:
+                held_targets: tuple[str, ...] = ()
                 if machine == "Mac":
                     root = delivery.base / "mac-folders"
                     large = root / "large"
@@ -4074,49 +4089,86 @@ with mock.patch.object(sweep, "free_bytes", return_value=130 * sweep.GIB), mock.
                         (large / "deps").mkdir()
                         os.link(large / "output", large / "deps" / "output")
                         free = 150 * GIB - 96 * 1024 * 1024
+                    elif links == "held-insufficient":
+                        free = 120 * GIB
+                        large_size, small_size = "180.0 GiB", "20.0 GiB"
                 else:
-                    large = Path("/tmp/claude/large/target")
-                    small = Path("/tmp/claude/small/target")
+                    large = (delivery.base / "large" if links == "held-next"
+                             else Path("/tmp/claude/large/target"))
+                    small = (delivery.base / "small" if links == "held-next"
+                             else Path("/tmp/claude/small/target"))
                     free = 140 * GIB
                     large_size, small_size = "180.0 GiB", "20.0 GiB"
                     measurement = sweep.AvailableDiskMeasurement(datetime.now(UTC), sweep.NoEarlierDiskMeasurement(), [
                         sweep.OutsideCacheDirectory(str(large), 180 * GIB, 0, sweep.NoLargestGrowingChild()),
                         sweep.OutsideCacheDirectory(str(small), 20 * GIB, 0, sweep.NoLargestGrowingChild()),
                     ], 0)
+                if links.startswith("held-"):
+                    held_targets = (str(large / "target"),)
+                    if links == "held-only":
+                        held_targets += (str(small / "target"),)
+                mac_measurement = (mock.patch.object(sweep, "mac_folder_measurement", return_value=sweep.CurrentMacFolders((
+                    sweep.FolderChoice(str(large), 180 * GIB, sweep.FolderChoiceKind.OTHER),
+                    sweep.FolderChoice(str(small), 20 * GIB, sweep.FolderChoiceKind.OTHER),
+                ))) if links == "held-insufficient" else nullcontext())
                 with (mock.patch.object(sweep, "read_disk_measurement", return_value=measurement),
-                      mock.patch.object(sweep, "folder_choices", wraps=sweep.folder_choices) as choices):
+                      mock.patch.object(sweep, "folder_choices", wraps=sweep.folder_choices) as choices,
+                      mac_measurement):
                     if machine == "Mac":
                         policy = sweep.MacFloor((str(large.parent),), floor_claims.LockedClaims(frozenset()),
                                                 large.parent / "mirror")
                         with mock.patch.object(sweep, "free_bytes", return_value=free):
                             sweep.notify_floor_problem(sweep.FloorOutcome(
-                                tmp_sweep.CompletedSweepAssessment(0), after=free, removed=2 * GIB),
+                                tmp_sweep.CompletedSweepAssessment(0), after=free, removed=2 * GIB,
+                                held_targets=held_targets),
                                 lint_settings=conf.read("lint"), policy=policy)
+                    elif held_targets:
+                        with mock.patch.object(sweep, "free_bytes", return_value=free):
+                            sweep.notify_floor_problem(sweep.FloorOutcome(
+                                tmp_sweep.CompletedSweepAssessment(0), after=free, removed=2 * GIB,
+                                held_targets=held_targets), lint_settings=conf.read("lint"))
                     else:
                         self.finalize_crossing(140, removed=2 * GIB)
                 choices.assert_called_once()
                 shortfall = sweep.gib(150 * GIB - free)
-                if links == "external":
+                if links == "held-only":
+                    recommendation = ("Every measured folder holds output a build is using. "
+                                      "The sweep frees it when the build ends.")
+                elif links == "held-insufficient":
+                    recommendation = (f"The largest folder is {small} at {small_size}. "
+                                      + f"Deleting it frees only part of the {shortfall} shortfall.")
+                elif links == "held-next":
+                    recommendation = (f"Review {small} first (recommended): deleting it frees {small_size}, "
+                                      + f"which covers the {shortfall} shortfall.")
+                elif links == "external":
                     recommendation = (f"The largest folder is {large} at {large_size}. "
                                       + f"Deleting it frees only part of the {shortfall} shortfall.")
                 else:
                     recommendation = (f"Review {large} first (recommended): deleting it frees {large_size}, "
                                       + f"which covers the {shortfall} shortfall.")
                 text = phone_text(delivery.attempts)
-                if links == "external":
+                if links in ("external", "held-insufficient"):
                     self.assertNotIn("which covers", text)
                     self.assertIn(recommendation[:-1] + "; the natedev session lists every folder.", text)
                 else:
                     self.assertIn(recommendation, text)
-                self.assertNotIn(str(small), text)
-                self.assertIn(f"In the natedev Claude session, say which {machine} folders to delete.", text)
+                if links.startswith("held-"):
+                    self.assertNotIn(f"Review {large} first (recommended)", text)
+                else:
+                    self.assertNotIn(str(small), text)
+                if links == "held-only":
+                    self.assertIn("In the natedev Claude session, reply delete nothing.", text)
+                else:
+                    self.assertIn(f"In the natedev Claude session, say which {machine} folders to delete.", text)
                 message = delivery.attempts[0].text
+                held_effect = "A build is using output inside it; deleting it can break that build."
+                other_effect = "Deleting it removes its contents; their use is unknown."
                 lines = [
                     f"Free disk space fell below the 150.0 GiB alert line. {sweep.gib(free)} remains."
                     + (" This is the Mac disk." if machine == "Mac" else ""),
                     "Cleanup removed 2.0 GiB.",
-                    f"{large}: holds {large_size}. Deleting it removes its contents; their use is unknown.",
-                    f"{small}: holds {small_size}. Deleting it removes its contents; their use is unknown.",
+                    f"{large}: holds {large_size}. " + (held_effect if held_targets else other_effect),
+                    f"{small}: holds {small_size}. " + (held_effect if links == "held-only" else other_effect),
                     recommendation,
                     "Delete nothing: builds can fail when the disk is full.",
                     "natedev checks your choice before it deletes anything.",

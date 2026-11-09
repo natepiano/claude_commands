@@ -2058,7 +2058,7 @@ Every nextest run that lint starts prints one line after admission: `nextest: <g
 
 **Ruled out:** a trim defect in the floor sweep for the mirror targets (the targets were busy at each scan); raw block counts for folder sizes (hard links outside the folder free nothing).
 
-### Phase 93 — The floor alert never recommends a folder that holds output a build is using  · status: todo
+### Phase 93 — The floor alert never recommends a folder that holds output a build is using  · status: done
 **Depends on:** Phase 92 (same file, `scripts/lint/sweep.py`). Merge `origin/builds` first.
 
 **Approved:** builds showrunner, 2026-11-09 ("Your open nit is a wrong result: the alert can recommend a folder that holds output a build holds. Fix it now as phase 93. The recommendation must leave out held output, or name a different folder.").
@@ -2086,7 +2086,7 @@ Every nextest run that lint starts prints one line after admission: `nextest: <g
    - A held 180 GiB folder, an eligible 20 GiB folder and a 30 GiB shortfall. The text names the 20 GiB folder as insufficient.
    - Only held folders. The alert uses the held-only recommendation.
    - Each row fails before the fix and passes after it.
-7. Extend `test_protected_folder_is_not_a_floor_holder_in_a_low_space_pass` (its protected root also has a live process use) or another existing `_hold_floor_pass` test. Run the pass with `dry_run=False` on private folders. Read the `FloorOutcome` it returns: the held paths name the busy target and the protected-and-used target. Add a natedev disk-measurement row: a leaf folder that contains a held target gets the held line and is not recommended.
+7. Extend `test_protected_folder_is_not_a_floor_holder_in_a_low_space_pass` (its protected root also has a live process use) or another existing `_hold_floor_pass` test. Run the pass with `dry_run=False` on private folders. Read the `FloorOutcome` that `notify_floor_problem` receives (no caller reads held paths from the returned outcome): the held paths name the busy target and the protected-and-used target. A live use that `shrink_floor` finds after the first scan is also a held path. Add a natedev disk-measurement row: a leaf folder that contains a held target gets the held line and is not recommended.
 8. Update `docs/as-built/build-memory-admission.md` for the changed rule.
 
 **Constraints from prior phases:**
