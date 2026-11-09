@@ -693,14 +693,13 @@ class WorkerCommandTests(unittest.TestCase):
                     if foreign_tab:
                         self.fixture.world.locations[pane]["tab_id"] = "w1:t5"
                 self.agent.after_complete = relocate
-                before = self.fixture.staff_state()
                 with redirect_stderr(io.StringIO()) as errors:
                     self.assertEqual(self.dispatch(opened.row.name), worker.ExitCode.OK)
                 state = cast(dict[str, dict[str, dict[str, object]]],
                              json.loads((self.run_dir / "progress_history_state.json").read_text()))
                 self.assertEqual(state["pass"]["impl"]["worker_id"], opened.row.id)
                 self.assertEqual(state["pass"]["impl"]["status"], "completed")
-                self.assertEqual(self.fixture.staff_state(), before)
+                self.assertEqual(staff.snapshot().by_id(opened.row.id), replace(opened.row, role=staff.KnownWorkerRole("impl")))
                 self.assertIn(self.agent.final, self.reply.read_text())
                 if foreign_tab:
                     self.assertIn(opened.pane, self.fixture.world.locations)
@@ -1141,7 +1140,7 @@ class WorkerCommandTests(unittest.TestCase):
                 self.assertEqual(errors.getvalue(), f"question: impl pane {opened.pane}\n" + expected)
                 self.assertEqual(len(self.agent.submitted), 0 if stage == "before" else 1)
                 self.assertIn(opened.pane, self.fixture.world.locations)
-                self.assertEqual(staff.snapshot().by_id(opened.row.id), opened.row)
+                self.assertEqual(staff.snapshot().by_id(opened.row.id), replace(opened.row, role=staff.KnownWorkerRole("impl")))
         self.assertIn(("pane", "read", opened.pane, "--source", "recent", "--lines", "40"), self.fixture.world.commands)
 
     def test_answer_continues_a_blocked_dispatch_and_refuses_another_parents_worker(self) -> None:
