@@ -439,3 +439,15 @@ From the sdlc showrunner, 2026-11-08 [be8c1303]. `merge_checkpoint._unit_paths` 
 Fix: a path that is absent at an origin merge base did not come from that origin, so that base does not drop it. A path that the base has, and that the commit has with the same content, still came from that origin. Add one row to the existing scope tests in `scripts/production/test_merge_checkpoint.py`: an as-built commit deletes its plan while an origin merge base never had the plan, and the scope check passes. Add no other check.
 
 As built: `_unit_paths` reads, per origin merge ref, the paths the merge base has (`git ls-tree -r`) and the paths the diff to the commit names. It drops only a path that the base has and the diff does not name. A path that the base lacks stays in scope. `test_scope_keeps_deleted_plan_absent_at_an_origin_merge_base` lands an as-built commit that deletes `docs/plans/alpha.md` while the other production's merge base never had it.
+
+### Phase 10j — The checkpoint's review trial line reports the checkpointed phase  · status: done
+
+**Depends on:** none.
+
+From the sdlc showrunner, 2026-11-09 [9e63d522]. devtools phase 3z (575d3b5cb) sent `review trial: ux 0 findings, code 0 findings, review-worker minutes 0`, but two pane reviewers ran and the 3z ledger holds F001 and F002.
+
+Cause: `<CheckpointCommit/>` step 9 in `commands/unit/checkpoint.md` runs `review-trial --session-dir` with no `--phase-id`. With no id, `_review_trial` reports the current phase. devtools had started phase 8u beside 3z, so the line counted 8u, which had no findings and no review passes yet. `review-trial --phase-id 3z` on the same run gives `code 2 findings, review-worker minutes 8`. The recorder counts pane-reviewer passes and ledger findings correctly once it reads the right instance.
+
+Fix: `commands/unit/checkpoint.md` step 9 passes the checkpointed phase's id with `--phase-id`. The recorder does not change, and no refusal is added. Add one test row: a phase with a ledger finding and a finished review pass is parked while a later phase is current, and `review-trial --phase-id` of the parked phase reports its finding and its minutes.
+
+As built: `<CheckpointCommit/>` step 9 runs `review-trial --session-dir "${SESSION_DIR}" --phase-id <phase id>`. `--phase-id` stays optional (showrunner, 2026-11-09 [f58e9b76]); a call with no id still reports the current phase. `test_review_trial_reports_the_parked_phase_findings_and_review_minutes` parks phase A, with one finding and an 8-minute review pass, behind current phase B, and reads A by id.

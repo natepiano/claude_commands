@@ -31,7 +31,7 @@
   - Tests never read or write `~/.claude`, `~/.codex*`, the live `settings.json`, real transcripts, the real ledger store, the live checkout's git history or the Mac. Every path comes from an argument or an environment variable the tests set.
   - Estimated numbers and measured numbers never share a column. The report marks each estimate.
   - Every comparison prints both sample sizes and the other settings that changed between the two sides.
-  - The command runs on demand. The weekly save job (Phase 4) is its one scheduled caller. It sends no message (memory `build-report-on-demand`).
+  - The command runs on demand. The daily save job (Phase 4) is its one scheduled caller. It sends no message (memory `build-report-on-demand`).
   - The tracked settings keys and files come from `config/context_economy.conf`, never from code (memory `no-hard-coded-config`).
   - Add no guard, refusal or check the user did not ask for.
 
@@ -94,73 +94,78 @@
 ### Phase 3 — Mac sessions and Codex workers  · status: done
 **Depends on:** Phase 2
 
-#### Work Order
+#### As-built
 
-**Goal:** the report covers Claude sessions on the Mac and Codex worker threads on both machines.
-
-**Spec:**
-1. Mac: `read_mac(since, until) -> MacRead` sends the source of `context_economy_read.py` to the Mac over `ssh` with the options and bootstrap form of `collect.collect_mac`. On the Mac it calls `read_claude`, `read_codex` and `settings_timeline` on the Mac checkout (its HEAD reflog). The Mac prints JSON lines; natedev decodes each one strictly. `MacRead` is `MacSessions(sessions, timeline)` or `MacReadFailed(reason)`. An empty `MacSessions` is a Mac with no sessions in the window, not a failure. Nothing is written on the Mac.
-2. Each session takes its settings from its own machine's timeline. `build_report` takes `timelines: Mapping[str, Sequence[SettingsSet]]` keyed by machine.
-3. Codex: `read_codex(sessions_roots, since, until, machine) -> list[Session]` with `rollouts.py`. Requests come from `token_usage` (Codex `cached_input_tokens` is `cache_read`, the rest of input is `input`, no cache writes). The model comes from the rollout's `turn_context` (as `collect.CodexContext` reads it); the Codex version from `session_meta`. Compactions come from `is_compaction` with `kind = 'unknown'` and no sizes. Starts are the thread openings, with the same rule as Claude: the starts inside the window and the latest start before `since`. Roots are `~/.codex*/sessions`. Numbered Codex homes link `sessions` to `~/.codex/sessions` (`docs/accounts.md` setup), so read each file once by its resolved path.
-4. `CompactionEvent.pre_tokens` and `post_tokens` become `int | SizeNotReported`. `at_compaction` takes only reported sizes.
-5. A request whose model `weights.weights_at` cannot weight (`UnweightedModel`) counts in the context quantities and not in `cost_per_request`. The report prints `cost not weighted: <n> requests (<models>)`.
-6. Groups and saved results carry `machine` and `family`. The report gets `--family claude|codex|all` (default `all`) and a `machine` column. `compare` pools by role and quantity across machines, as now; its `confounds:` line also names a machine or family present on one side only.
-7. `report` and `save` get `--where <key>=<json>` (repeatable), which keeps only measurements whose settings values match each key. `--where precomputeCompactionEnabled=false` selects every OFF settings set, whatever file changes split it. `--settings <label>` is removed.
-8. A failed Mac read prints `mac: <reason>` on the report and the natedev numbers still print.
+The report covers Claude sessions on the Mac and Codex worker threads on both machines.
+- `read_mac(since, until) -> MacRead` sends `context_economy_read.py`, `conf` and `rollouts` to the Mac in one `ssh` call; the program comes from `collect.bootstrap_program(call)`, which also builds `collect.REMOTE_BOOTSTRAP`. The Mac prints JSON lines; natedev decodes each one strictly and rejects a negative count. `MacRead` is `MacSessions(sessions, timeline) | MacReadFailed(reason)`. `mac_timeout_seconds` (300) in `config/context_economy.conf` limits the call; a timeout is `MacReadFailed`.
+- `read_codex(sessions_roots, since, until, machine) -> list[Session]` reads each rollout once by resolved path. A `token_count` is a request only when `total_token_usage` changes. The model comes from `turn_context`, the version from `session_meta`. Compactions carry `SizeNotReported` sizes.
+- `CompactionEvent.pre_tokens` and `post_tokens` are `int | SizeNotReported`; `at_compaction` takes only reported sizes.
+- `timeline_start(sessions, since)` in `context_economy_read.py` is the one timeline anchor. A settings key absent from `settings.json` is omitted from `SettingsSet.values`; `label` shows `key=<absent>` for a removed key. An explicit JSON null is a present key.
+- `build_report` takes timelines keyed by machine, plus `family` and `where`. Groups and saved results carry `machine` and `family`. `report` and `save` take `--family claude|codex|all` (default `all`) and `--where <key>=<json>`, repeatable; `--where` compares JSON values with types kept, so `false` never matches `0`. `--settings` is gone.
+- A request from a model `weights.weights_at` cannot weight counts in context quantities, not in `cost_per_request`; the report prints `cost not weighted: <n> requests (<models>)`. A failed Mac read prints `mac: <reason>` on `report`, and natedev rows still print.
 
 **Files:**
-- `scripts/usage/context_economy_read.py` — `read_mac`, `MacRead`, `read_codex`, `SizeNotReported`.
-- `scripts/usage/test_context_economy_read.py` — the Codex reader on fixture rollouts (model, version, starts, overlapping linked roots); the Mac JSON decode; a failed Mac read.
-- `scripts/usage/context_economy.py` — timelines per machine, `--family`, `--where`, the `machine` column, the `mac:` and `cost not weighted:` lines.
-- `scripts/usage/test_context_economy.py` — two machines with different timelines over the same commits; `--where`; an unweighted model; saved results with machine and family.
+- `scripts/usage/context_economy_read.py` — `read_mac`, `MacRead`, `read_codex`, `SizeNotReported`, `timeline_start`.
+- `scripts/usage/context_economy.py` — per-machine timelines, `--family`, `--where`, the `machine` column, the `mac:` and `cost not weighted:` lines.
+- `scripts/usage/collect.py` — `bootstrap_program`.
+- `config/context_economy.conf` — `mac_timeout_seconds`.
+- `scripts/usage/test_context_economy_read.py`, `scripts/usage/test_context_economy.py`, `scripts/usage/fixtures/context_economy/codex-fixture.jsonl` — reader, Mac decode and failure, two-machine, `--where` and unweighted-model tests.
 
-**Workers:** 2 writers; split by file. Agree the `MacRead`, `Session` and `CompactionEvent` contract on the board before the report edits use it.
-- `impl` — `scripts/usage/context_economy_read.py`, `scripts/usage/test_context_economy_read.py`, fixtures; hub: `scripts/usage/context_economy_read.py` (the `Session`, `CompactionEvent` and `MacRead` types).
-- `test` — opens as impl: `scripts/usage/context_economy.py`, `scripts/usage/test_context_economy.py`.
+**Binds later work:** `main` reads `read_mac` once and prints `mac:` only for `report`; `save_result` does not record the Mac read. Codex sessions on natedev take the natedev settings timeline, so a settings `--where` also matches Codex rows unless `--family claude` is given.
 
-**State:** none.
-
-**Constraints from prior phases:** Phase 1: the reader types and `read_claude`; `Session.family` already holds `codex`. The reader imports `scripts.lib.conf`, `scripts.usage.collect`, `scripts.usage.rollouts` and `scripts.usage.usage_report`; the Mac call must carry the modules `read_claude` needs, or split them out of the payload.
-- Phase 2: `read_claude` skips `<synthetic>` records, adds a `resume` start at each Claude Code `version` change, and keeps the latest start before `since`. The reader parses only lines that can hold a request, a compaction, a start, a version change or the first timestamp. `settings_timeline` reads the checkout HEAD reflog and batched `git cat-file`.
-- Phase 2: `build_report(sessions, timeline, store, since, until, by, role, settings_label)` applies `min_requests` to each whole session in the window. `_settings_at` gives each request and measurement the settings of the session's latest start at or before it, else `settings_for(first_record_at)`. Rate quantities are keyed by settings commit. `main` asks the timeline from `_timeline_start(sessions, since)`.
-- Phase 2: `GroupResult(settings_label, settings_values, settings_commit, week, role, model, requests, cli_versions, quantities)`; `save_result` writes a temp file, then `os.link`; `trend` reads `*.json`. No result is saved yet, so the saved format can change.
-- The natedev report takes 65-90 s (66 sessions). Keep the Mac and Codex reads to one pass each.
-
-**Acceptance gate:**
-- `python3 -m unittest scripts.usage.test_context_economy_read scripts.usage.test_context_economy` passes.
-- `basedpyright scripts/usage` reports 0 errors and 0 warnings.
-- On natedev, `report --family all` prints natedev and Mac rows, or the `mac:` line when the Mac is asleep. Codex rows show a model, and no request is counted twice.
-- On natedev, `report --where precomputeCompactionEnabled=false --since 2026-11-08` prints only OFF rows, each with 0.0% `precomputed_share`.
+**Gotchas:**
+- Codex rollouts repeat a `token_count` record with the same total (6 of 297 in one rollout).
+- On 11-08 the Mac's 18 Claude sessions were all under `min_requests` 20, so the report showed no Mac rows; the Mac has no Codex sessions.
+- `scripts.usage.test_context_economy` takes about 300 s (git fixture repositories).
+- A Codex request before the first `turn_context` has a blank model; none seen in 40 real rollouts.
 
 ### Phase 4 — The command, the as-built and the first saved results  · status: todo
 **Depends on:** Phase 3
 
 #### Work Order
 
-**Goal:** `/context_economy` runs the report, the as-built describes it, the precompute ON and OFF results are saved, and a weekly job saves the trend.
+**Goal:** `/context_economy` runs the report, saved results record the Mac read, the as-built describes it, the precompute ON and OFF results are saved, and a weekly job saves each complete week.
 
 **Spec:**
-1. New `commands/context_economy.md`: `/context_economy [report|compare <name>|save <name>|trend] [args]` runs `~/.claude/scripts/lib/py ~/.claude/scripts/usage/context_economy.py ...` and prints its output as it comes. Keep it under 30 lines (`/succinct_style`).
-2. `docs/as-built/usage-ledger.md` gets a `### Context economy` section: the run-time inputs, the quantities, `--where`, saved results and their names, how a comparison names confounds, the `left out:` line (it counts whole sessions under `min_requests`), and the measured run time.
-3. Save `precompute-on-2026-11` with `--where precomputeCompactionEnabled=true` over the 11-08 sessions that ran with it on.
-4. Save `precompute-off-2026-11` with `--where precomputeCompactionEnabled=false` from the first day where `requests_per_cycle` for role `director` has n of 30 or more. Until that day, report the n and save nothing.
-5. Transcripts can be removed by Claude Code (`cleanupPeriodDays`), so the trend lives in saved results. A weekly job runs `save week-<ISO year>-W<week>`: a `nate.jobs.context-economy` entry in `/etc/nixos` (`intervalSeconds = 604800`). The job owner is natedev's user; it writes only `week-*` files under `<state_dir()>/context_economy/` and sends no message. The director commits it on a nixos branch and sends the branch and hash to natedev, which pushes it.
+1. New `commands/context_economy.md`: `/context_economy [report|compare <name>|save <name>|trend] [args]` runs `~/.claude/scripts/lib/py ~/.claude/scripts/usage/context_economy.py ...` and prints its output as it comes. With no subcommand, or when the first argument starts with `--`, the command puts `report` first. Keep it under 30 lines (`/succinct_style`).
+2. Saved results record the Mac read. `save_result` writes `"mac": {"state": "read"}` or `"mac": {"state": "failed", "reason": "<reason>"}`. `save` prints the `mac: <reason>` line on a failed read, as `report` does. `trend` marks a result whose Mac read failed with `mac failed` on its row. A result saved before this field exists reads as `mac` unknown; `trend` prints nothing for it.
+3. `save --last-week` names and bounds the result itself: the previous complete ISO week in the user zone (`scripts.lib.user_zone.user_zone`), Monday 00:00 to the next Monday 00:00, saved as `week-<ISO year>-W<week>`. It takes no name and no `--since`/`--until`. When that week's file already exists, it prints the existing path and exits 0.
+4. `docs/as-built/usage-ledger.md` gets a `### Context economy` section:
+   - the run-time inputs, the quantities, `--family`, `--where` (JSON values compared with types kept: `false` never matches `0`), the `machine` column;
+   - Codex requests counted once per change of `total_token_usage`; Codex compactions carry no sizes (`SizeNotReported`) and add no size samples;
+   - a settings label shows `key=<absent>` for a removed key;
+   - the `mac:` line, `mac_timeout_seconds` in `config/context_economy.conf`, and the saved `mac` field;
+   - the `cost not weighted:` line, and the `left out:` line (it counts whole sessions under `min_requests`);
+   - saved results, their names, `save --last-week`, how a comparison names confounds, and the measured run time.
+5. The precompute experiment uses `--family claude` in every save, threshold read and comparison: Codex has no precompute setting, and the Codex sessions on natedev take the same settings timeline.
+6. Save `precompute-on-2026-11` with `--family claude --where precomputeCompactionEnabled=true` over the 11-08 sessions that ran with it on.
+7. Save `precompute-off-2026-11` with `--family claude --where precomputeCompactionEnabled=false` from the first day where `requests_per_cycle` for role `director` has n of 30 or more. Until that day, report the n and save nothing.
+8. Transcripts can be removed by Claude Code (`cleanupPeriodDays`), so the trend lives in saved results. A `nate.jobs.context-economy` entry in `/etc/nixos` runs `save --last-week` once a day (`intervalSeconds = 86400`): the first run in a new week saves the last week, and a missed day or a restart loses no week. The job owner is natedev's user; it writes only `week-*` files under `<state_dir()>/context_economy/` and sends no message. The director commits it on a nixos branch and sends the branch and hash to natedev, which pushes it.
 
 **Files:**
+- `scripts/usage/context_economy.py` — the saved `mac` field, the `mac:` line on `save`, the `mac failed` trend mark, `save --last-week`.
+- `scripts/usage/test_context_economy.py` — a saved failed and a saved read Mac outcome; `trend` with both and with an old result; `save --last-week` names, bounds and a second run that exits 0 unchanged.
 - `commands/context_economy.md` — new.
 - `docs/as-built/usage-ledger.md` — the new section.
 
-**Workers:** 1 writer; doc work does not split.
-- `impl` — both repository files and the nixos entry.
-- `test` — opens as impl: checks the as-built against `scripts/usage/context_economy.py` and `scripts/usage/context_economy_read.py`.
+**Workers:** 1 writer + 1 tester.
+- `impl` — `scripts/usage/context_economy.py`, `commands/context_economy.md`, `docs/as-built/usage-ledger.md` and the nixos entry; hub: `scripts/usage/context_economy.py`.
+- `test` — `scripts/usage/test_context_economy.py`; then checks the as-built against `scripts/usage/context_economy.py` and `scripts/usage/context_economy_read.py`.
 
-**State:** the saved result files under `<state_dir()>/context_economy/`: `precompute-on-2026-11`, `precompute-off-2026-11` (when n reaches 30), and one `week-*` file each week.
+**State:** the saved result files under `<state_dir()>/context_economy/`: `precompute-on-2026-11`, `precompute-off-2026-11` (when n reaches 30), and one `week-*` file each week. Each holds a `mac` field.
 
-**Constraints from prior phases:** Phases 1-3 as built: `context_economy_read.py` readers for Claude, Mac and Codex; `context_economy.py report|save|compare|trend` with `--where`, `--family` and the `machine` column. `save` refuses an existing name.
-- The invariant "the command runs on demand only" reads: the command runs on demand; the weekly save job is its one scheduled caller and sends no message.
+**Constraints from prior phases:** Phases 1-3 as built: `context_economy_read.py` readers for Claude, Mac and Codex; `context_economy.py report|save|compare|trend` with `--where`, `--family` (default `all`) and the `machine` column. `save` refuses an existing name.
+- Phase 3: `main` (`scripts/usage/context_economy.py:563`) reads `read_mac` once and prints `mac:` only for `report`. `save_result` (line 377) writes `name`, `window`, `left_out`, `groups`, `unweighted_models` and `role_quantities`. The CLI requires a subcommand (line 535). The default window is the last seven days.
+- Phase 3: `config/context_economy.conf` holds `mac_timeout_seconds = 300`. `collect.bootstrap_program` builds the Mac program. `timeline_start(sessions, since)` is public in `context_economy_read.py`.
+- The report test module takes about 300 s: put new rows in existing tests where they fit.
+- The invariant "the command runs on demand only" reads: the command runs on demand; the daily save job is its one scheduled caller and sends no message.
 
 **Acceptance gate:**
-- `/context_economy compare precompute-on-2026-11` prints every quantity with both n and a `confounds:` line.
-- `/context_economy save precompute-on-2026-11` a second time refuses and leaves the file unchanged.
-- `/etc/nixos` evaluates with the new job (`nix flake check` or the repo's own check), and the job's command runs once by hand and writes one `week-*` file.
+- `python3 -m unittest scripts.usage.test_context_economy` passes.
 - `basedpyright scripts/usage` reports 0 errors and 0 warnings.
+- `/context_economy` with no arguments and `/context_economy --family claude` both print the report.
+- `/context_economy compare precompute-on-2026-11 --family claude` prints every quantity with both n and a `confounds:` line.
+- `/context_economy save precompute-on-2026-11` a second time refuses and leaves the file unchanged.
+- A saved file holds the `mac` field; `trend` shows `mac failed` for a result saved with the Mac asleep (a test, or a live save with `CONTEXT_ECONOMY_MAC_COMMAND` set to a failing command).
+- `/etc/nixos` evaluates with the new job (`nix flake check` or the repo's own check), and the job's command runs once by hand and writes one `week-*` file; a second run exits 0 and writes nothing.
+- The as-built section names each item in Spec 4.

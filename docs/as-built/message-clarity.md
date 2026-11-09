@@ -408,8 +408,13 @@ The user asked for this on 2026-10-23: each permission alert starts a root cause
     - `QuestionReviewUnavailable(question, reason)`: stored as written. A blank rewrite from the reviewer lands here.
   - An awaiting-facts or failed outcome fails the whole registration with `question held for review: …`. Nothing is written: outstanding and history stay unchanged.
   - Such a question is held in `~/.local/state/notify/questions/<sha256(name+text)[:16]>.json` (`QuestionHoldRecord`). Running the same item again counts as its revision. Question holds never reach the post path.
-- **Stored fields:** an outstanding item carries `question` plus either `reviewed` or `review_unavailable`. Items that were already outstanding keep their fields and are not reviewed again. Accepted text is printed as `reviewed question: <text>`, and the reply must carry that text. `commands/showrunner/produce.md` (under `open_for_user`) tells the showrunner to register before any reply asks the user a question, makes a request such as "Say go and I'll …", or offers `(recommended` choices.
-- **History:** `record_question_history()` records each new open item in `~/.local/state/showrunner/outstanding/<showrunner name>.history.jsonl`.
+- **Stored fields:** a canonical question record carries `question` and either `reviewed` or `review_unavailable`.
+  The [production question store](showrunner-automation.md#updates-time-log-and-questions-update_registrationpy) owns question files and fixed asker ids.
+  Existing questions retain their fields without another review.
+  Accepted text prints as `reviewed question: <text>`.
+  The reply carries that reviewed text.
+  `commands/showrunner/produce.md` defines registration before a reply asks the user for input.
+- **History:** `record_question_history()` records each new open item in `~/.local/state/showrunner/outstanding/<showrunner staff id>.history.jsonl`.
   Each record contains `text`, `question` and `reviewed`.
   `withdraw` sets `withdrawn` to the withdrawal time on the item's history record.
   History remains for 48 h.
