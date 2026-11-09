@@ -2034,7 +2034,7 @@ A changed `config/<name>.conf` selects every test module whose transitive import
 **Gotchas:**
 - A test that asserts on Stop output or a typed prompt across the process boundary keeps `execution="process"`.
 
-### Phase 101 — The herdr tests use half their CPU  · status: todo
+### Phase 101 — The herdr tests use half their CPU  · status: done
 **Depends on:** none
 
 #### Work Order
