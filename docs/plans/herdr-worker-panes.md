@@ -3652,28 +3652,19 @@ Case (natedev, 2026-11-08): accounts phase 1 sent jobs to two resumed Codex work
 
 **Depends on:** none. sdlc [e692c5a7], 2026-11-08 (defect from natedev).
 
-Case (natedev, 2026-11-08): `scripts/usage/activity.py:120` `STATUS_FILE` matches `sentinel`, `marker` and `exit_code` anywhere in a path. A worker's first read of its own prompt in `phases/compaction-start-marker/` then counts as a status-file wait. usage-waste-watch told messaging that 28% of its usage was waiting. That is false.
+Case (natedev, 2026-11-08): `scripts/usage/activity.py` `STATUS_FILE` matched `sentinel`, `marker` and `exit_code` anywhere in a path. A worker's first read of its own prompt in `phases/compaction-start-marker/` counted as a status-file wait. usage-waste-watch told messaging that 28% of its usage was waiting. That was false.
 
-#### Work Order
+#### As-built
 
-**Goal:** status words match only in the file name. A read of a file in a folder whose name holds a status word counts as work.
+- `status_file_label(paths: Iterable[str])` (`scripts/usage/activity.py`): a path that contains `/proc/loadavg` gives `/proc/loadavg`. Else `STATUS_FILE` matches the file name (`os.path.basename`) only. The labels are as before (`*.log`, `marker`, `exit_code`).
+- The shell statement path passes `rest.split()`. The Claude `Read` path passes `(path,)`, so a Read path with a space stays one path.
+- `STATUS_FILE` no longer holds the `/proc/loadavg` alternative.
+- Review round 1 (review2): F001 a Read path with a space still matched a folder name; F002 `cat </proc/loadavg` lost its wait. Both fixed in round 1 and accepted at closure.
 
-**Spec:**
-
-1. `scripts/usage/activity.py` `status_file_label`: match `STATUS_FILE` against the file name of each path, not against folder names. Keep `/proc/loadavg` as a whole-path match. Keep the labels as today (`*.log`, `marker`, `exit_code`).
-2. The one function serves both callers: the shell statement path and the Claude `Read` path. Change no caller.
-3. Test rows: add a row with a `marker` folder to the existing tests in `scripts/usage/test_activity.py`. One row in `test_working_statements` (for example `cat /tmp/u/phases/compaction-start-marker/implementation_prompt.md`). One row in `test_tool_blocks` (a `Read` of the same path is `WorkAtom()`). Keep every existing row.
-4. Docs: `docs/as-built/usage-ledger.md` line 77 says that the status words match the file name only.
-5. Add no check, refusal, validation, retry or wait that this list does not name.
-
-**Files:** `scripts/usage/activity.py`, `scripts/usage/test_activity.py`, `docs/as-built/usage-ledger.md`.
-
-**Workers:** `1 writer`.
-
-**Acceptance gate:**
-- `scripts.usage.test_activity` passes with the Spec item 3 rows.
-- basedpyright on the changed Python files reads `0 errors, 0 warnings, 0 notes`.
-- The targeted gate passes.
+**Files:**
+- `scripts/usage/activity.py` — `status_file_label` and its two callers.
+- `docs/as-built/usage-ledger.md` — the status words match the file name only.
+- Tests: `scripts/usage/test_activity.py` (`test_working_statements`: a `marker` folder; `test_waiting_statements`: `cat </proc/loadavg`; `test_tool_blocks`: Reads in a `marker` folder and in `/tmp/marker folder/`).
 
 ## Reference
 
