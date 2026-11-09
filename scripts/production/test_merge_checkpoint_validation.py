@@ -6,6 +6,7 @@ from contextlib import redirect_stdout
 from io import StringIO
 import os
 import sys
+import tomllib
 import unittest
 from unittest import mock
 from pathlib import Path
@@ -200,6 +201,18 @@ with (Path(common) / "main-push.lock").open("a") as lock:
             self.assertEqual(self.git("rev-parse", "production", cwd=self.origin), refreshed)
             self.assertEqual(self.git("merge-base", "--is-ancestor", main, refreshed), "")
             self.assertIn(["test", "main-proof"], self.events("verify.sh"))
+        with self.subTest(refresh="main has a malformed manifest"):
+            before_refresh = self.git("rev-parse", "HEAD")
+            writer = self.root / "main-fix-writer"
+            self.write(writer, "crates/main-proof/Cargo.toml", "[package\n")
+            _ = self.git("add", "crates/main-proof/Cargo.toml", cwd=writer)
+            _ = self.git("commit", "-m", "malformed manifest on main", cwd=writer)
+            _ = self.git("push", "origin", "main", cwd=writer)
+            with mock.patch.dict(os.environ, self.env), self.assertRaises(tomllib.TOMLDecodeError):
+                _ = merge_checkpoint.refresh_pushed_tip(production, before_refresh)
+            self.assertEqual(self.git("rev-parse", "HEAD"), before_refresh)
+            self.assertEqual(self.git("rev-parse", "production", cwd=self.origin), before_refresh)
+            self.assertEqual(self.git("status", "--porcelain"), "")
     def test_style_notification_failure_does_not_fail_a_pushed_checkpoint(self) -> None:
         _ = (self.state / "fail-style_sync.py").touch()
         result = self.run_checkpoint(self.checkpoint())
