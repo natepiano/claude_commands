@@ -12,7 +12,7 @@ Median CPU per gate, from `show.py top --limit 400` on 2026-11-06. The speed pha
 4. Phase 63 is complete. Phase 70 reports the token order hang; its cause stays open. Read the call output and queue files at its next recurrence.
 5. Phase 72 complete; the lifecycle writer and the first admission stack stay unproved. Phase 73 makes no code change: verify-unit owns the surviving token-renewal delay, and the Mac case needs no edit because queue lacked Phase 63's marker wait.
 6. Further `test_verify*` batches follow CPU rank. Measure with `module_cost.py --tests 10 --commands 10` before direct moves. Queue Phases 30-31 and verify Phase 41w are merged. The 2026-11-09 remeasure shows that the real `build_targets.py` commands in the SSH and wait-holder modules run through `verify.sh`, so their import hold stays. Hold routing decisions without a narrow function for verify's function change. These include Mac retry, fallback, queue-age and handoff cases. Profile doc, lint-scope and existing token-renewal function cases now. Their fixtures and function boundaries differ from the SSH fixtures. Include admission, setup and cleanup CPU. Give each shared fixture one owner. Each batch has one phase and one bumped checkpoint. Use `docs/plans/natedev-verify-test-cost.md` for the file list.
-6a. Pick each speed phase by the CPU a test change can remove (showrunner, 2026-11-09). Refresh the CPU rank. Profile the highest eligible module with `module_cost.py --tests 10 --commands 10` and separate fixture cost from required production cost. Open a phase only for a measured removable cost. Link modules with the same production limit to one owner proposal, and send each production-limit proposal to the showrunner for routing. Keep each module's behavior map and verification separate. Revisit a floor after its owner change lands. No CPU limit holds the plan. The mission is to take the next longest test each time. A module at its floor gets a Floors row or an owner proposal, and the next module follows. When no module has a test-side cost, take the item 11 rare-case cleanup, then the shared test code work.
+6a. Pick each speed phase by the CPU a test change can remove (showrunner, 2026-11-09). Refresh the CPU rank. Compare the highest eligible module with shared test command chains before selecting a phase. Attribute the measured 268 CPU s of fixture and stub `python -c` calls to their callers. Profile the leading candidates with `module_cost.py --tests 10 --commands 10`, and identify removable CPU while retaining required process boundaries. Select the largest measured removable cost. Open a phase only for a measured removable cost. Link modules with the same production limit to one owner proposal, and send each production-limit proposal to the showrunner for routing. Keep each module's behavior map and verification separate. Revisit a floor after its owner change lands. No CPU limit holds the plan. The mission is to take the next longest test each time. A module at its floor gets a Floors row or an owner proposal, and the next module follows. When neither modules nor shared test commands have removable CPU, take the item 11 rare-case cleanup.
    - Phase 95 complete: `direct/test_verify_wait_holder.py`, 94.1 to 81.5 CPU s in pairs, at its floor. Real target, reservation and recorder commands limit it. Remeasured 2026-11-09 at 74.0 CPU s; the import hold stays (Floors). verify-unit still owns the routing boundary proposal. Phase 102 already includes 41w. Keep the other verify modules as candidates under `docs/plans/natedev-verify-test-cost.md`, subject to refreshed CPU rank and their existing holds.
 7. Phases 67, 68, 84, 85, 86, 88, 90, 91 and 92 are complete. Phase 86 reports no measured CPU gain from the table proposals in the two streamline reports. The codex_mesh deletion is merged; item 10 owns the remaining measurements. Phase 90: the six `LedgerTestCase` modules, 109.0 to 78.3 CPU s in pairs. Phase 91: the SSH result module, 59.9 to 49.9 CPU s. Phase 88: the staff modules 49.2 to 26.2 CPU s, add-unit 23.7 to 14.6, fast-track 66.6 to 58.4. Phase 92 reports a 27 GiB gate tmpfs reading from a suspected runaway verify module. Verify Phase 41r owns the fix. Phase 89 is complete at `d23c0bf81`: `direct/test_assign_launcher.py`, 47.2 to 26.0 CPU s in pairs, an accepted floor (Floors). Models-launch-settings phase 1 is merged at `6cde34726` and `b381eb355`. Keep 26.0 CPU s as the historical floor. Measure all four launcher modules across that change with fixed fixtures, `/tmp` roots and matching bytecode conditions.
 8. Phase 59 complete: `style/test_style_proposals.py`, 53.75 to 28.51 CPU s in pairs; the rule-loading proposal is with the style owner.
@@ -20,15 +20,15 @@ Median CPU per gate, from `show.py top --limit 400` on 2026-11-06. The speed pha
 
 10. Locate the builds merge for hierarchies-unit Phase 30 deletion commit `ce529466f`. Builds revision `a87536252` and worktree merge `d7234eaac` contain the deletion. Compare the gate CPU and test count before and after that builds merge. Historical baseline: `agents/test_codex_mesh.py`, 736 tests and 194.3 CPU s median per gate (`show.py top`, 2026-11-07 14:50 EST). Also compare the `config/postmaster.conf` selection count and the cold-cache and warm-cache selection times. Phase 96 baseline: 574 of 738 modules selected; 572 reach `send_budget.py` and 570 reach `codex_mesh.py`. Keep the approved transitive closure (the user, 2026-11-07).
 
-11. Rule 2 cleanup (the user, 2026-11-07: "do rules 1 and 2"). After Phase 87 measures the yield, the cleanup takes the next modules by CPU s spent on rare-case tests: `production/test_dailies_render_holds.py`, `agents/test_models_conf_publish.py`, `direct/test_progress_history.py`, `lint/test_memory_admit.py`, then the rest. Skip modules that a speed phase holds and `agents/test_codex_mesh.py`, which hierarchies deletes.
+11. Rule 2 cleanup (the user, 2026-11-07: "do rules 1 and 2"). After Phase 87 measures the yield, the cleanup takes the next modules by CPU s spent on rare-case tests: `production/test_dailies_render_holds.py`, `agents/test_models_conf_publish.py`, `direct/test_progress_history.py`, `lint/test_memory_admit.py`, then the rest. Skip modules that a speed phase holds.
 
-Waiting: `style/test_style_sync.py`, 66.6 CPU s, starts after the style unit's multi-unit hash merges. The style unit reports the merge. Never: `types/basedpyright`, 238.4 CPU s; `agents/test_codex_mesh.py`, 232.6 CPU s, retires.
+Waiting: `style/test_style_sync.py`, 66.6 CPU s, starts after the style unit's multi-unit hash merges. The style unit reports the merge. Never: `types/basedpyright`, 238.4 CPU s.
 
 `types/basedpyright` takes 2-4 min in a gate (report-unit, 2026-11-03). It is not in the gate's module files; Phase 2 records it, and it goes to the proposal below, never to a speed phase.
 
 ## Items to consider
 
-- [ ] **Shared test setup costs are measured across a whole gate before the next speed phase is picked.**
+- [x] **Shared test setup costs are measured across a whole gate before the next speed phase is picked.** Done 2026-11-09, 739 modules, natedev at low load, total 3,056 CPU s. Admission setup 28.0, admission loop 25.9, admission cleanup 3.1, process scans 24.8, process cleanup 24.0, seed copies 13.3. The highest eligible module is 50.3. Phase 113 takes the admission costs. The process scans stay: 77% is the kernel read of each environment.
   - Target: `scripts/build_queue/admission_test_support.py` and the shared verify fixture modules.
   - Why needed: `caller_admission()` starts a private server for each fixture, and shared verify cleanup reads process environments across `/proc`. A one-module order misses a cost split over many callers.
   - Completion condition: admission setup, admission cleanup, seed copies and process cleanup are measured apart from production commands, and each cost is summed across its callers and compared with the highest eligible module.
@@ -44,11 +44,15 @@ Waiting: `style/test_style_sync.py`, 66.6 CPU s, starts after the style unit's m
   - Why needed: after Phase 26, only the four modules that call `forbid_real_sender()` are guarded, and the runner finds the marker through that module's stored record. A module that never installs the guard, or a marker variable inherited from a parent, is not checked (Phase 26 adversary round 2). No module in the gate takes either path today.
   - Completion condition: the runner sets one marker path before `unittest.main` for every module and checks that path after it; the four installs reuse it; the gate shows which modules, if any, start the real `send.py`.
   - Revealed by: Phase 26 adversary review round 2, 2026-11-05.
-- [ ] **Report the red merges that a unit targeted test missed.**
-  - Target: the showrunner's notice, from the merge gate records.
-  - Why needed: Phase 37's selection is outside the K row, because the merge gate runs all modules. The estimate is about 7 more red merges per 104 runs. Rank by CPU per gate settled the target order (the user, 2026-11-06).
-  - Completion condition: after a day on builds, report the count against the 104-run estimate of 15.
-  - Revealed by: Phase 37 architect review, 2026-11-06.
+- [ ] **Report missed failures under the current targeted selector.**
+  - Target: the showrunner's notice, using targeted-test and full merge-gate records.
+  - Record the selector revision, chosen base, changed paths and selected modules for each tested tree.
+  - Compare omitted modules with full-gate results for that same tree.
+  - Separate same-commit passes, failures on nearby commits and unresolved single-commit failures.
+  - Keep Phase 112's replay counts of 55, 41 and 4 as historical evidence.
+  - Completion condition: after a day on builds, report missed failing modules and affected gate runs.
+  - Keep the Phase 37 estimates as history. The merge gate continues to run all modules.
+  - Revealed by: Phase 37 architect review, 2026-11-06. Updated after Phases 111 and 112.
 - [ ] **Architecture proposal: the assign launcher starts fewer child processes**
   - Target: `scripts/direct/assign.py` for recorder coordination, owned by sdlc. Target: `scripts/lib/models_registry.py:launch_settings` and `scripts/agents/models_config.sh` for resolver cost, owned by the models unit. Retain the comparable-build measurements across all four launcher modules. The Phase 89 prototype gain of 14.9% is one pair, measured before the port onto builds.
   - Why needed: the current coordinator starts recorder commands and a shell resolver. The codex_mesh deletion removes the follow commands from the Phase 54 profile. Phase 99's adapter changes test execution only. Profile the current production commands before using the historical gain estimates.
@@ -109,15 +113,19 @@ Waiting: `style/test_style_sync.py`, 66.6 CPU s, starts after the style unit's m
   - Proposal: rename each to a `*_test_support.py` name and switch every importer in one change. Do not rename until the showrunner places it (showrunner, 2026-11-05).
   - Completion condition: no `test_*.py` file under `scripts/lib` is without tests; every importer passes. Add no new check.
   - Revealed by: Phase 34 survey, 2026-11-05.
-- [ ] **Architecture proposal: the build target commands import less**
-  - Target: `scripts/build_hold/build_hold.py` (owner resources; queue-unit takes the cut), `scripts/build_targets/build_targets.py` `eligible` answer (owner verify-unit)
-  - Why needed: after Phase 24, `eligible` and `reserve` set the floor of `test_verify_ssh_targets_routing.py`: they import `build_hold`, which imports `admission_service` and `memory_admit` at once (`build_hold.py:40-46`). `eligible` runs 24 times (23.4 traced s).
-  - Owners: queue-unit owns the admission import change after the `build_hold.py` freeze (measured 9.6 s on this module). The `eligible` platform column is complete. Verify-unit owns the remaining eligibility, result and reservation consumer changes named by Phase 66.
-  - Phase 41 result, 2026-11-05: lazy imports in `build_targets.py` alone gain 1% CPU in `test_verify_mac_only.py`, so they did not land. The gain needs `build_hold`'s chain to leave `eligible` and `reserve`.
-  - Phase 42 result, 2026-11-06: the same method in `mac_idle.py` gains 17.9% CPU in `test_verify_mac_only.py`, because the whole chain leaves four of five commands.
-  - Phase 56 result, 2026-11-06: `test_verify_ssh_targets_retained.py` and `_retry.py` reach this same floor after all fixed waits left. Measure them in the same pairs.
-  - Completion condition: after each owner change reaches builds, measure routing, retained, retry, and Mac-only modules in same-load pairs. Report CPU s and process counts first. Use the test forms that Phase 61 leaves.
-  - Revealed by: Phase 24, 2026-11-05.
+- [ ] **Route and measure the verify helper-chain proposals.**
+  - Target: queue-unit for `admission_client.py`; verify-unit for `build_targets.py` and `verify.sh`; route direct and buildlog helper changes through the showrunner.
+  - Evidence: the helper chain costs about 540 CPU s per measured gate. This total includes its component commands.
+  - Admission client: 129 CPU s across 910 starts. Queue-unit assesses the wire-format-only client path.
+  - Build targets: 117 CPU s across 786 starts. Each start averages 31 ms of imports and 118 ms of work.
+  - Profile repeated build-target work before proposing another import change.
+  - Verify-unit assesses one helper process for the direct, buildlog and build-folder operations that `verify.sh` starts separately.
+  - Queue Phases 30–31 removed the old admission imports. Keep the earlier measurements as history.
+  - Per-helper trial (Phase 114): with `record.py` or `progress_history.py` as a no-op the tests stay green, 171 CPU s per gate. `tree_watch` fails four lint scope tests, 66 CPU s. `step_record` is required.
+  - Builds decided against a test-only path in `verify.sh`. Verify measures after its Phase 42e and moves `progress_history.py` into the helper process if it still costs real CPU.
+  - Completion condition: record each owner proposal and landing revision. Measure affected callers before and after each landing under matching conditions.
+  - Report CPU and process counts, then update the affected Floors rows. Do not add overlapping command costs.
+  - Revealed by: Phase 24, 2026-11-05. Updated from the whole-gate measurement, 2026-11-09.
 
 - [x] **Phase notes stopped updating.** Text: `phase table not written: phase note target is not owned by builds/natest-unit: ~/rust/hanadocs/showrunners/builds/natest.md`. Cause: `_note_ownership` in `scripts/direct/phase_table.py` looks up the note's `unit:` field as a staff id, and the notes still hold the older `unit: natest-unit` header (queue, report and fastest also). So each write refuses. Fix: run the one-off `phase_table.py migrate-notes`, which reads `*/*.md` below `--vault-root` and rewrites the header to the staff id. Done 2026-11-05: the showrunner assigned the builds notes to natest; `phase_table.py migrate-notes` rewrote natest, queue, report, resources and verify. natedev has the fastest note.
 

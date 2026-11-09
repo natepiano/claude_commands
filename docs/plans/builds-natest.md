@@ -2246,41 +2246,48 @@ A changed `config/<name>.conf` selects every test module whose transitive import
 
 
 ### Phase 113 — A private admission server costs less to start and to keep running  · status: done
-**Depends on:** none
 
-#### Work Order
+#### As-built
 
-**Source:** the showrunner, 2026-11-09: "Add-on 1: next (measure shared setup across a whole gate before you pick the slow-module phase)", and "Phase 113 (shared admission setup and process scans) is yours: go." The user: "our goal is dramatically reduced cpu time".
-
-**Why:** the private admission server runs in 179 modules. Whole-gate measurement on natedev at low load, 739 modules: setup 28.0 CPU s, loop 25.9 CPU s, cleanup 3.1 CPU s. Two parts of that are waste. First, `AdmissionServer._source_stamps` resolves every loaded module path at each fixture start: 7 of 13 ms per fixture, because a test process makes many servers and each one resolves the same paths. Second, the loop polls at 10 ms: 4.55 ms of CPU per idle second, against 1.60 at 50 ms. A test thread that needs a turn waits for the poll to end, a median 7 ms now. A longer poll needs a wake so that the test thread does not wait longer.
-
-The process scans stay as they are. 77% of a scan is the kernel reading each process's environment, a cost set by the process count on the host: a rewrite with `os` calls saves 23%, and a cloud box runs fewer processes than natedev's 999.
-
-**Goal:** the fixture resolves the module paths once per process, and the private loop wakes for a test thread or a stop in place of a 10 ms poll.
-
-**Spec:**
-All changes are in `scripts/build_queue/admission_test_support.py`.
-1. Add the named value `SERVING_POLL_SECONDS = 0.05`. `serve()` calls `self.server.run_once(SERVING_POLL_SECONDS)`.
-2. Override `_source_stamps` in `ObservedAdmissionServer`. Keep one class-level record: the `len(sys.modules)` it was computed at and the set of paths from `super()._source_stamps()`. When the count is unchanged, return a new stamp for each kept path with `self._stamp(path)`. When the count changed, call `super()._source_stamps()`, keep its paths and return its result.
-3. `serve()` sets `self.loop_permission.serves_loop = True` as its first statement. A thread that has this mark is the loop thread.
-4. Add a plain `threading.Lock` called `self.turn_gate`. In `loop_turn()`, a call at depth 0 takes `turn_gate`, then `loop_access`, then releases `turn_gate`. A call at depth above 0 does not take `turn_gate`, because its thread already holds `loop_access`. Keep the `TEST_HANG_GUARD_SECS` timeout and the existing message form on both acquires.
-5. `ObservedAdmissionServer` owns the wake. It sets `self.wake_lock`, a `threading.Lock`, before `super().__init__`. It overrides `close` to run `super().close()` while it holds `wake_lock`. Its `wake_loop` method holds `wake_lock` and calls `os.eventfd_write(self.priority_events, 1)` when `self.closed` is false. A wake then cannot write a descriptor that a restart closed. While it holds `turn_gate`, a depth-0 caller that does not have the `serves_loop` mark calls `self.server.wake_loop()` when serving is active. The loop thread then ends its poll and releases `loop_access`, and the waiter takes it. The loop waits on `turn_gate` while a waiter holds it. This order closes the race where a wake lands before the waiter blocks.
-6. In the `finally` of `serving()`, after `stopped.set()`, call `self.server.wake_loop()`. A stop then does not wait for the poll.
-7. Change no production file. Add no check. Do not change a test assertion.
+- `ObservedAdmissionServer` in `scripts/build_queue/admission_test_support.py` keeps one class-level record of source paths, keyed by the count of `sys.modules`. A fixture start with an unchanged count stamps the kept paths and resolves none.
+- `SERVING_POLL_SECONDS` is 0.05. `serve()` marks its thread with `serves_loop`, and `serving()` wakes the loop at stop through `wake_loop`.
+- `loop_turn` takes `turn_gate` at depth 0, wakes the loop when the caller is not the loop thread, then takes `loop_access`. A nested call skips `turn_gate`.
+- `wake_loop` and `close` both hold `wake_lock`, so a wake cannot write a descriptor that a restart closed.
+- Same-load measurement, three rounds: setup plus close 13.4-13.7 ms to 6.0-6.3 ms, idle loop 1.8-3.3 ms/s to 1.1-1.7 ms/s, median turn wait 7.04 ms to 0.02-0.03 ms. Gate estimate: about 27 of 3,056 CPU s.
 
 **Files:**
 - `scripts/build_queue/admission_test_support.py` — the poll value, the path record, the turn gate and the wakes
 
-**Workers:** 1 writer; the work is one file
-- `impl` — the file above
+**Gotchas:**
+- Shared fixtures are a small part of a gate. Python child processes are 57% of gate CPU, and the helper chain per `verify.sh` call is about 18%.
 
-**Constraints from prior phases:**
-- Tests never read or write live state: `~/.claude` main, `~/.local/state/merge-gate`, `/tmp/claude`.
-- `build_hold.py` stays frozen.
-- The owner of this file was told before the edit, under the user's rule on test code.
+**Ruled out:**
+- Rewriting the process scans with `os` calls: it saves 23%, because the kernel read of each process environment is 77% of a scan.
 
-**Acceptance gate:**
-- `scripts/build_queue/test_admission_service*.py` and the other modules that use `serving()` or `caller_admission` pass. The targeted test selects them.
-- `basedpyright` on the changed file prints `0 errors, 0 warnings, 0 notes`.
-- The targeted test is green on the phase commit merged with `origin/builds`.
-- The director measures on one tree, at one load, before and after: fixture setup plus cleanup falls from 13.3 ms; idle loop CPU falls from 4.55 ms per second; a test thread's median wait for a turn while serving falls from 7 ms.
+### Phase 114 — A test that starts Python for one function stops loading what the function does not use  · status: done
+
+#### As-built
+
+- `test_each_module_uses_a_temporary_log` in `scripts/buildlog/test_index.py` runs one `lib/py -c` parent. The parent imports each production module named on its command line, with no `try`, then forks one child per test module. Each child imports its test module and prints `store.root()`. The production list comes from the folder listing, without `test_*.py`, `*_test_support.py` and `__init__.py`. Children run one at a time, so wall time rises from 7.1 s to 16.0 s and CPU falls.
+- `CliWork`, `MeasuredCliRun`, `probe_cli` and `measure_cli_work` live in `scripts/buildlog/cli_probe_test_support.py`. `test_report.py` and `test_mac_report.py` import them. The host is read in the parent under `mock.patch.dict(os.environ, environment, clear=True)`.
+- `configured_host_cli` in `test_memory_window.py` receives `configured_local_host()!r` from the parent, and its bootstrap imports only `store`.
+- The fake child in `scripts/mac_test/test_linux_runner.py` matches `argv[1] == "-c"` with `sweep.sweep_workspace` in `argv[2]`, and yields to `use_real_sweep`. Four tests keep `use_real_sweep = True`.
+- Same-load pairs, three rounds, median CPU s: `test_index` 30.7 to 12.0, `test_linux_runner` 27.3 to 13.3, `test_report` 24.8 to 23.1, `test_mac_report` 15.7 to 12.8, `test_memory_window` 7.6 to 7.5; total 106.1 to 68.7. The test names and assertions are the same.
+
+**Files:**
+- `scripts/buildlog/test_index.py` — the preloaded parent and its forked children
+- `scripts/buildlog/cli_probe_test_support.py` — the shared CLI probe helpers
+- `scripts/buildlog/test_report.py`, `scripts/buildlog/test_mac_report.py` — use the shared helpers
+- `scripts/buildlog/test_memory_window.py` — the small CLI bootstrap
+- `scripts/mac_test/test_linux_runner.py` — the fake child match
+
+**Gotchas:**
+- Index isolation must keep a separate test-module import in each child. Sharing that import removes what the test proves.
+- Floors per site, by the largest import: `scripts.buildlog.report` 0.41 s, `scripts.buildlog.memory` 0.19 s, style `queue_place` 0.146 s, statusline `update_registration` 0.30 s, `scripts.accounts.accounts` 0.12 s. Each lower cost needs a production import change.
+- Blanket no-op helpers in `verify.sh` make every test red. Per helper, `record.py` and `progress_history.py` stay green at 171 CPU s per gate, `tree_watch` fails four lint scope tests, and `step_record` is required.
+
+**Ruled out:**
+- A style CLI helper split: 206-249 ms per start against 225-247 ms, because the fake must import `queue_place`.
+- Bytecode work: compiling the whole tree costs 3.4 CPU s, and main-script compile across all starts costs 67.3 CPU s.
+- A preloaded Python start server: tests inspect real process trees, signals and process groups.
+- A test-only path in `verify.sh`: it breaks the one-way rule.
