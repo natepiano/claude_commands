@@ -1963,43 +1963,21 @@ A changed `config/<name>.conf` selects every test module whose transitive import
 **Ruled out:**
 - A narrower closure: the wide selection follows the approved design.
 
-### Phase 97 — The remote copies review test uses half its CPU again  · status: todo
-**Depends on:** none
+### Phase 97 — The remote copies review test uses half its CPU again  · status: done
 
-#### Work Order
+#### As-built
 
-**Source:** the backlog rank rule (next items, item 2). On 2026-11-08 22:48 EST, `copies/test_review_remote_copies.py` is the highest module by median CPU that no phase holds and that has no floor: 65.9 CPU s per gate, 29 tests. Phase 69 cut it from 350.0 to 120.2 CPU s in `/dev/shm` pairs and reached its target with no floor.
+`copies/test_review_remote_copies.py` uses 52.6% less CPU, with all 29 tests and 167 assertions kept. Three same-time pairs on `/dev/shm`: median CPU 45.8 to 21.7 s, wall 51.8 to 24.8 s. `module_cost.py`: 60.9 to 23.6 CPU s, 771 to 568 processes, 848 to 609 execs. No floor and no architecture proposal.
 
-**Goal:** `scripts/copies/test_review_remote_copies.py` uses half its current CPU, or a measured floor shows why it cannot, with every checked behavior kept.
-
-**Spec:**
-1. Follow the Speed method. Measure CPU with `module_cost.py --tests 10 --commands 10` first. Name each test's CPU, and each real process that it starts.
-2. Start with the slowest test: `RemoteEntryTests.test_repeated_receive_keeps_registered_owner_after_each_recovery_interruption` (16.1 s in the last gate).
-3. Write a behavior map with a row for each assertion before you change a test.
-4. Read the importers of a changed fixture before you change it. Every importer stays green.
-5. If only a production change can cut a cost, write the floor and send the director an architecture proposal with its measured gain.
-6. Add no guard, refusal or check (user rule, 2026-11-05).
+- `RemoteEntryTests` saves each interrupted mirror once per `(moment, stage)` key: `save_interrupted_mirror` copies the tree and its removal authority into a class seed under `interruption_root`. Later cases call `restore_interrupted_mirror`, which copies them back and registers the mirror again.
+- `remove_trees_through_cli` runs the real `copies.main` remote CLI in process through `invoke_cli` (`scripts/production/cli_fixture.py`). It patches `copies.subprocess` only for that call, so no SSH interpreter starts. The two recovery-interruption matrices use it.
 
 **Files:**
-- `scripts/copies/test_review_remote_copies.py`
-- `scripts/copies/remote_test_support.py`
+- `scripts/copies/test_review_remote_copies.py` — remote copy entry, interruption and recovery tests.
 
-**Workers:** 1 writer; one test file and its fixture do not split
-- `impl` — `test_review_remote_copies.py`, hub: `remote_test_support.py`
-
-**Constraints from prior phases:**
-- Phase 69: each test class copies one immutable Git seed with `ImmutableGitSeed.copy_to`. `warm_claim_servers()` runs a warm fork `ClaimServer` over the real `floor_claims` source and entry points. `seed_interpreter_cache` replaces repeated interpreter probes. The threaded cancellation test keeps fresh subprocesses, and the real slot shell stays.
-- Phase 69: warm fork children keep the `module_run` command name until an exec, so a command table credits their CPU to it. Attribute CPU by test, not only by command name.
-- `remote_test_support.py` is also imported by `scripts/production/test_tidy_wrapped.py` and `scripts/shutdown/test_shutdown_cli.py`.
-- Phase 69 pairs ran on `/dev/shm`. State the filesystem basis of each pair.
-- Tests never read or write live state: `~/.claude` main, `~/.local/state/merge-gate`, `/tmp/claude`.
-
-**Acceptance gate:**
-- The behavior map has a row for each assertion. No assertion is removed.
-- CPU s, processes, execs and wall s before and after, from `module_cost.py` and same-load pairs, in the checkpoint notice.
-- The changed file and every importer of a changed fixture pass.
-- the targeted test green on the phase commit merged with `origin/builds`
-- `basedpyright` on the changed files prints `0 errors, 0 warnings, 0 notes`
+**Gotchas:**
+- A restored seed must call `copies.register_remote` again, because the registry lives outside the copied tree.
+- Other SSH paths in the module stay real.
 
 ### Phase 98 — The merge gate resources test never waits out its hang guard  · status: todo
 **Depends on:** none
@@ -2031,5 +2009,44 @@ A changed `config/<name>.conf` selects every test module whose transitive import
 **Acceptance gate:**
 - The repeat count and the long-wait count before and after the fix, alone and under load, in the checkpoint notice. After the fix, no run waits on the hang guard.
 - `test_merge_gate_suites_resources.py` and every importer of a changed file pass.
+- the targeted test green on the phase commit merged with `origin/builds`
+- `basedpyright` on the changed files prints `0 errors, 0 warnings, 0 notes`
+
+### Phase 99 — The Claude assign launcher test file uses half its CPU  · status: todo
+**Depends on:** none
+
+#### Work Order
+
+**Source:** the backlog rank rule (next items, item 2). On 2026-11-08 23:20 EST, `direct/test_assign_claude.py` is the highest module by median CPU that no phase holds and that has no floor: 49.3 CPU s per gate, 19 tests. Higher rows are held: `test_assign_launcher.py` (Phase 89), `test_style_sync.py` (devtools), and modules at a floor.
+
+**Goal:** `scripts/direct/test_assign_claude.py` uses half its current CPU, or a measured floor shows why it cannot, with every checked behavior kept.
+
+**Spec:**
+1. Follow the Speed method. Measure CPU with `module_cost.py --tests 10 --commands 10` first. Name each test's CPU, and each real process that it starts.
+2. Start with the slowest test: `AssignClaudeLauncherWorkerTests.test_new_worker_identity_precedes_the_heartbeat_watcher` (4.3 s in the last gate).
+3. Write a behavior map with a row for each assertion before you change a test.
+4. Read the importers of a changed fixture before you change it. Every importer stays green.
+5. If only a production change can cut a cost, write the floor and send the director an architecture proposal with its measured gain.
+6. Add no guard, refusal or check (user rule, 2026-11-05).
+
+**Files:**
+- `scripts/direct/test_assign_claude.py`
+- `scripts/direct/assign_claude_test_support.py`
+
+**Workers:** 1 writer; one test file and its fixture do not split
+- `impl` — `test_assign_claude.py`, hub: `assign_claude_test_support.py`
+
+**Constraints from prior phases:**
+- Phase 68: `invoke_assignment` in `assign_launcher_test_support.py` runs the real coordinator in process. `snapshot_files` and `changed_files` hold the first-dispatch snapshot; `AssignClaudeLauncherFixture.first_worker_launch` uses them and keeps its own restoration.
+- Phase 89 holds `assign_launcher_test_support.py` and `test_assign_launcher.py`. Do not edit them.
+- `assign_claude_test_support.py` is also imported by `test_assign_claude_probes.py`, `test_assign_claude_records.py`, `test_assign_claude_claim_follow.py`, `test_assign_claude_claims.py`, `test_assign_launcher.py` and `assign_claude_native_test_support.py`.
+- Phase 68: `AssignLauncherFixture` sets the child `TMPDIR` to `/tmp`, so `/dev/shm` pairs do not reach it. Check where this fixture's children write, and state the filesystem basis of each pair.
+- Phase 97: an in-process call of a real CLI `main` through `invoke_cli` (`scripts/production/cli_fixture.py`) replaced one interpreter start per case and kept the real code path.
+- Tests never read or write live state: `~/.claude` main, `~/.local/state/merge-gate`, `/tmp/claude`.
+
+**Acceptance gate:**
+- The behavior map has a row for each assertion. No assertion is removed.
+- CPU s, processes, execs and wall s before and after, from `module_cost.py` and same-load pairs, in the checkpoint notice.
+- The changed file and every importer of a changed fixture pass.
 - the targeted test green on the phase commit merged with `origin/builds`
 - `basedpyright` on the changed files prints `0 errors, 0 warnings, 0 notes`
