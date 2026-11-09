@@ -137,11 +137,11 @@ Closed by the roles-unit rerun work: see `docs/as-built/script-rerun-recovery.md
 
 | Path:line | Q | On a rerun | Owner |
 |---|---|---|---|
-| `scripts/production/change_review.py:397` | 3 | Interrupt the in-place list write after truncation or a partial write. A repeated edit reads the damaged list and either refuses its missing table or keeps only the surviving rows; it does not restore the lost reviews. | hierarchies-unit (`checkpoint(build-followups-hierarchies)`) |
-| `scripts/production/change_review.py:1206` | 1 | Stop verdict after record_verdict moves the row to Reviewed but before end_row_scratch runs, or let that cleanup fail. The same verdict rerun refuses the row because it is no longer in To review, so its scratch folders and holds stay behind. | hierarchies-unit (`checkpoint(build-followups-hierarchies)`) |
-| `scripts/production/update_registration.py:584` | 3 | Interrupt an open-question list rewrite after truncation or a partial JSON write. ask and mark-important then fail to read the saved list, and questions cannot recover the unit questions that were kept only in it. | hierarchies-unit (`checkpoint(build-followups-hierarchies)`) |
-| `scripts/production/update_registration.py:613` | 3 | Stop answer after removing the question but before printing its relay recipient. A repeated answer finds no matching open item and cannot recover who must receive the answer from that list. | hierarchies-unit (`checkpoint(build-followups-hierarchies)`) |
-| `scripts/hierarchies/worker_owners.py:449` | 2 | Let mesh end save `ended` and then fail its server cleanup. Rerunning worker-owner end omits that roster entry; if another source still reports it, the end check at line 553 also skips it, leaving cleanup unfinished. | models-unit (`codex_mesh.py end --cleanup-only`, mesh follow-up; sdlc showrunner, 2026-10-30) |
+| `scripts/production/change_review.py:397` | 3 | Fixed: the shared atomic writer publishes the complete list under its lock. | hierarchies-unit (`checkpoint(build-followups-hierarchies)`) |
+| `scripts/production/change_review.py:1206` | 1 | Fixed: an identical saved verdict repeats its result and row-scratch cleanup. A conflict reports the saved verdict and also attempts cleanup. | hierarchies-unit (`checkpoint(build-followups-hierarchies)`) |
+| `scripts/production/update_registration.py:584` | 3 | Fixed: open-question list updates use the shared atomic writer. | hierarchies-unit (`checkpoint(build-followups-hierarchies)`) |
+| `scripts/production/update_registration.py:613` | 3 | Fixed: answer records its replay before removing the item. A retry resolves the current asker through staff. | hierarchies-unit (`checkpoint(build-followups-hierarchies)`) |
+| `scripts/hierarchies/worker_owners.py:449` | 2 | Removed: the ownership reporter, pending-cleanup journal, and mesh backend have no live implementation. Native worker operations own closure. | models-unit (`codex_mesh.py end --cleanup-only`, mesh follow-up; sdlc showrunner, 2026-10-30) |
 
 ## message-clarity-unit (3)
 
