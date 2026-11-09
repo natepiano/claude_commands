@@ -194,7 +194,8 @@ class ScratchTests(unittest.TestCase):
         started = time.time()
         with mock.patch.dict(os.environ, {"HOME": str(self.base)}):
             with copies.standing("style", seed.checkout, copies.CommittedSource("HEAD")) as checkout:
-                target = checkout / "target"
+                target = (checkout / "target").resolve()
+            self.assertFalse(checkout.exists())
             # Supply build output, but let copies supply every cache marker.
             fingerprint = target / "debug" / ".fingerprint" / "sample-0123456789abcdef"
             fingerprint.mkdir(parents=True)
