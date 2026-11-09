@@ -20,7 +20,7 @@ from urllib.parse import parse_qs, urlsplit
 from scripts.aws_target import cloud_gate, gate_box, ledger
 from scripts.aws_target.aws_target import AwsCli
 from scripts.aws_target.config import read_settings
-from scripts.aws_target.ledger_test_support import CostFixture, instant
+from scripts.aws_target.ledger_test_support import CostFixture, account_reply, instant
 from scripts.build_queue import admission_client, admission_protocol as wire, cloud_progress, progress_profile
 from scripts.build_queue.admission_test_support import AdmissionFixture, caller_admission
 from scripts.buildlog import store
@@ -49,6 +49,7 @@ class FakeGateAws:
         self.upload_timeout: bool = False
         self.launch_timeouts: int = 0
         self.read_timeouts: int = 0
+        self.billing_pages: list[dict[str, object]] = []
 
     def __call__(self, arguments: Sequence[str], **_options: object) -> subprocess.CompletedProcess[str]:
         args = list(arguments)
@@ -58,7 +59,7 @@ class FakeGateAws:
         reply: dict[str, object] = {}
         error = ''
         if operation == 'get-cost-and-usage':
-            reply = {'ResultsByTime': [{'Total': {'UnblendedCost': {'Amount': '0', 'Unit': 'USD'}}}]}
+            reply = self.billing_pages.pop(0) if self.billing_pages else account_reply(arguments)
         elif operation == 'export-credentials':
             assert service == 'configure'
             reply = {'AccessKeyId': 'fixture-access', 'SecretAccessKey': 'fixture-secret', 'SessionToken': 'fixture-token'}
@@ -262,6 +263,15 @@ with (mock.patch.object(cloud_gate, 'AwsCli', return_value=api),
         self.assertLess(reading.period_end, self.book.read_snapshot().inventories[0].at)
         self.assertEqual(reading.estimated_usd, Decimal(0))
         self.assertEqual(reading.actual_usd, Decimal(0))
+        commands = [row for row in self.fake.commands if 'get-cost-and-usage' in row]
+        self.assertNotIn('--filter', commands[0])
+        self.assertEqual(commands[0][commands[0].index('--group-by') + 1], 'Type=DIMENSION,Key=USAGE_TYPE')
+        self.fake.billing_pages = [{'ResultsByTime': []}]
+        worker = cloud_gate.GateWorker(AwsCli('build-scaler', 'fixture-region', 1, execute=self.fake),
+                                      self.book, self.settings, self.folder / 'reservation.cgroup',
+                                      clock=lambda: self.now + 86400)
+        with self.assertRaisesRegex(ValueError, 'daily reply is unavailable'):
+            worker.charges()
 
     def test_remote_failure_remains_red_without_fallback(self) -> None:
         self.fake.result = self.result(1)
