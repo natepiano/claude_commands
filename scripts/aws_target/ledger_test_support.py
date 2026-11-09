@@ -88,7 +88,8 @@ def account_reply(arguments: Sequence[str], amount: str = '0') -> dict[str, obje
         days.append({'TimePeriod': {'Start': start.date().isoformat(), 'End': following.date().isoformat()},
                      'Estimated': False, 'Total': {}, 'Groups': [
                          {'Keys': ['USE2-SpotUsage:m7a.4xlarge'],
-                          'Metrics': {'UnblendedCost': {'Amount': amount, 'Unit': 'USD'}}}]})
+                          'Metrics': {'UnblendedCost': {'Amount': amount, 'Unit': 'USD'},
+                                      'UsageQuantity': {'Amount': '1', 'Unit': 'Hrs'}}}]})
         start = following
     return {'ResultsByTime': days}
 
@@ -115,6 +116,7 @@ class CostFixture(unittest.TestCase):
         environment = config_environment(self.root)
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
             **environment, "HOME": str(self.root),
+            "AWS_TARGET_CONFIG": str(self.settings),
             "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1",
         })))
         install_cost_settings(self.settings)

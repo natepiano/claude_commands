@@ -110,8 +110,8 @@ class VerifyDocFixture(unittest.TestCase):
             _ = caller_admission(self, self.root, self.environment)
             return
         self.root = self.fixture_root
-        _ = shutil.copytree(self.fixture_seed, self.root, symlinks=True)
         self.addCleanup(shutil.rmtree, self.root)
+        _ = shutil.copytree(self.fixture_seed, self.root, symlinks=True)
         self.repo = self.root / "workspace"
         self.records = self.root / "home/.local/state/verify/doc_pass"
         self.events = self.root / "cargo-events.jsonl"

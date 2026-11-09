@@ -37,8 +37,8 @@ class FinalPassFixture(ExampleWorkspaceFixture):
 
     @override
     def setUp(self) -> None:
-        _ = shutil.copytree(self.fixture_seed, self.fixture_root, symlinks=True)
         self.addCleanup(shutil.rmtree, self.fixture_root)
+        _ = shutil.copytree(self.fixture_seed, self.fixture_root, symlinks=True)
         self.root: Path = self.fixture_root / "repo"
         self.calls: Path = self.fixture_root / "cargo-calls"
         self.metadata_calls: Path = self.fixture_root / "metadata-calls"
