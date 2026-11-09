@@ -6,6 +6,7 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Literal, TypeVar, cast
 from collections.abc import Callable
+import os
 import subprocess
 import sys
 import time
@@ -16,6 +17,12 @@ from zoneinfo import ZoneInfo
 
 from scripts.lib import conf
 from scripts.build_targets import target_config
+
+
+def account_settings_path() -> Path:
+    """Use the installed account settings regardless of the checkout's CONF_DIR."""
+    override = os.environ.get('AWS_TARGET_CONFIG')
+    return Path(override).expanduser() if override else Path.home() / '.claude/config/aws_target.conf'
 
 
 @dataclass(frozen=True)
@@ -50,12 +57,16 @@ class SpendingSettings:
     observation_max_age_seconds: int
     cost_explorer_interval_seconds: int
     cost_explorer_read_usd: Decimal
+    cost_explorer_lookback_days: int
     notification_recipient: str
     notification_timeout_s: int
     notification_retry_s: int
     cost_explorer_tag_key: str
     cost_explorer_tag_value: str
     limits: tuple[LimitSettingEvidence, ...]
+    box_minimum_seconds: int
+    instance_type: str
+    spot_max_usd_per_hour: Decimal
 
 
 def money(value: str) -> Decimal:
@@ -127,6 +138,7 @@ def read_settings(path: Path | conf.ConfigRead) -> SpendingSettings:
         "retained_storage_usd_per_month", "root_storage_usd_per_month", "ipv4_usd_per_month",
         "gp3_iops_usd_per_month", "gp3_throughput_usd_per_month"))
     explorer = amount("cost_explorer_read_usd")
+    spot_bid = amount('spot_max_usd_per_hour')
     if errors:
         raise SpendingConfigurationUnavailable("; ".join(errors), tuple(limits))
 
@@ -151,9 +163,10 @@ def read_settings(path: Path | conf.ConfigRead) -> SpendingSettings:
     return SpendingSettings(daily, monthly, reserve, fallback, max(fixed, sum((cost for _, cost in components), Decimal(0))),
                             components, zone, seconds("price_refresh_seconds"), seconds("price_max_age_seconds"),
                             seconds("observation_max_age_seconds"), seconds("cost_explorer_interval_seconds"),
-                            explorer, live_text("notification_recipient"), seconds("notification_timeout_s"),
+                            explorer, seconds("cost_explorer_lookback_days"), live_text("notification_recipient"), seconds("notification_timeout_s"),
                             seconds("notification_retry_s"), live_text("cost_explorer_tag_key"),
-                            live_text("cost_explorer_tag_value"), tuple(limits))
+                            live_text("cost_explorer_tag_value"), tuple(limits), seconds('box_minimum_seconds'),
+                            live_text('instance_type'), spot_bid)
 
 
 @dataclass(frozen=True)

@@ -10,7 +10,6 @@ import io
 import json
 import os
 from pathlib import Path
-from queue import Queue
 import select
 import shlex
 import shutil
@@ -28,7 +27,7 @@ from scripts.copies import copies
 from scripts.copies.copies_test_support import mirror_arguments, publish_mirror
 from scripts.copies.remote_test_support import local_remote_transport, warm_claim_servers
 from scripts.lint import sweep
-from scripts.lib import conf
+from scripts.lib import conf, scratch
 from scripts.lib import process_start as process_identity
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.process_group import send_process_group
@@ -84,11 +83,11 @@ class RemoteEntryTests(unittest.TestCase):
         self.assertEqual(publish_mirror(mine), 0)
         self.assertEqual(publish_mirror(other), 0)
         with copies.remote_lease(other):
-            with floor_claims.locked_claims(TEST_HANG_GUARD_SECS) as claims:
-                identity = floor_claims.MirrorIdentity(other.host, other.path)
-                self.assertIn(floor_claims.HeldMirror(identity, other.session), claims.mirrors)
-                self.assertTrue(claims.holds(other.path, self.mirror.parent))
-                self.assertFalse(claims.holds(other.path, self.mirror.parent, exemption=identity))
+            claims = floor_claims.read_claims(TEST_HANG_GUARD_SECS)
+            identity = floor_claims.MirrorIdentity(other.host, other.path)
+            self.assertIn(floor_claims.HeldMirror(identity, other.session), claims.mirrors)
+            self.assertTrue(claims.holds(other.path, self.mirror.parent))
+            self.assertFalse(claims.holds(other.path, self.mirror.parent, exemption=identity))
             copies.remove_trees("alpha")
             self.assertFalse(self.mirror.exists())
             with self.assertRaisesRegex(copies.CopyError, "other.*holder-session"):
@@ -96,30 +95,91 @@ class RemoteEntryTests(unittest.TestCase):
         self.assertEqual(copies.owned_remote_mirrors("beta"), [other])
         self.assertTrue(Path(other.path).exists())
 
-    def test_claim_server_keeps_a_second_admission_waiting_until_release(self) -> None:
+        checkout = copies.clone(self.source, "gate:removal-race", "task-removal")
+        task_mirror = self.mirror_record(path=checkout)
+        self.assertEqual(publish_mirror(task_mirror), 0)
+        marker = self.root / "use-started"
+        use_results: list[subprocess.CompletedProcess[str]] = []
+
+        def use_during_removal(parent: Path) -> None:
+            # Remove the old lock files before checkout, as scratch.remove does.
+            for path in (floor_claims.mirror_lock_path(checkout), floor_claims.record_lock_path(checkout)):
+                path.unlink()
+            result = subprocess.run([sys.executable, str(copies.__file__),
+                "mirror-use", "--path", str(checkout), "--owner", "alpha",
+                "--repository", "repository", "--session", "late-use", "--",
+                sys.executable, "-c", "from pathlib import Path; import sys; Path(sys.argv[1]).touch()", str(marker),
+            ], capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS)
+            use_results.append(result)
+            self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+            self.assertIn("busy", result.stderr)
+            self.assertFalse(marker.exists())
+            shutil.rmtree(parent)
+
+        with (mock.patch.object(scratch, "save_cargo_outputs", return_value=()),
+              mock.patch.object(scratch, "remove", side_effect=use_during_removal)):
+            self.assertEqual(copies.mirror_remove(mirror_arguments(task_mirror, "mirror-remove")), 0)
+        self.assertEqual(len(use_results), 1)
+        self.assertFalse(checkout.parent.exists())
+        self.assertFalse(floor_claims.mirror_parent_lock_path(checkout).exists())
+
+        replacement_tree = self.root / "replacement-parent/checkout"
+        parent_lock = floor_claims.mirror_parent_lock_path(replacement_tree)
+        original_flock = fcntl.flock
+        replaced = False
+
+        def replace_before_lock(descriptor: int, operation: int) -> None:
+            nonlocal replaced
+            if not replaced:
+                self.assertEqual(os.fstat(descriptor).st_ino, parent_lock.stat().st_ino)
+                result = subprocess.run([sys.executable, "-c",
+                    "from pathlib import Path; import sys; "
+                    + "path=Path(sys.argv[1]); path.unlink(); path.touch()", str(parent_lock)],
+                    capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                replaced = True
+            original_flock(descriptor, operation)
+
+        with mock.patch.object(fcntl, "flock", side_effect=replace_before_lock):
+            with self.assertRaisesRegex(copies.CopyError, "busy"):
+                with copies.local_mirror_lease(replacement_tree, "replaced-lease"):
+                    self.fail("A replaced lease must not admit a command")
+        self.assertTrue(replaced)
+        self.assertFalse(replacement_tree.exists())
+
+    def test_claim_server_exits_with_stdin_open_and_releases_admission(self) -> None:
         paths = mac_test.state_paths()
+        with subprocess.Popen([sys.executable, str(Path(floor_claims.__file__))],
+                              stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                              text=True) as reader:
+            self.assertIsNotNone(reader.stdin)
+            self.assertIsNotNone(reader.stdout)
+            assert reader.stdin is not None and reader.stdout is not None
+            self.assertTrue(select.select([reader.stdout], [], [], TEST_HANG_GUARD_SECS)[0])
+            reply = cast(object, json.loads(cast(str, reader.stdout.readline())))
+            self.assertEqual(reply, {"repositories": [], "mirrors": []})
+            self.assertEqual(reader.wait(timeout=TEST_HANG_GUARD_SECS), 0)
+            self.assertFalse(reader.stdin.closed)
+            with paths.lock.open("a+") as lock:
+                fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+
+        def print_after_release(*values: object, flush: bool = False) -> None:
+            self.assertTrue(flush)
+            self.assertEqual(len(values), 1)
+            with paths.lock.open("a+") as lock:
+                fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+
+        with mock.patch("builtins.print", side_effect=print_after_release) as output:
+            self.assertEqual(floor_claims.serve(), 0)
+        output.assert_called_once()
         args = mac_test.CliArguments()
         args.pid, args.worktree, args.what = os.getpid(), str(self.source), "second admission"
-        turns: Queue[str] = Queue()
-        flock = fcntl.flock
-
-        def observe_lock(descriptor: int, operation: int) -> None:
-            if operation == fcntl.LOCK_EX:
-                try:
-                    flock(descriptor, operation | fcntl.LOCK_NB)
-                except BlockingIOError:
-                    # Report the kernel conflict before the real blocking request.
-                    turns.put("waiting")
-                else:
-                    turns.put("admitted")
-                    return
-            flock(descriptor, operation)
-
         with ThreadPoolExecutor(max_workers=1) as executor:
-            with floor_claims.locked_claims(TEST_HANG_GUARD_SECS):
-                with mock.patch.object(fcntl, "flock", side_effect=observe_lock):
-                    admission = executor.submit(mac_test.command_claim, args, paths, watch_claim=False)
-                    self.assertEqual(turns.get(timeout=TEST_HANG_GUARD_SECS), "waiting")
+            claims = floor_claims.read_claims(TEST_HANG_GUARD_SECS)
+            self.assertFalse(claims.repositories)
+            admission = executor.submit(mac_test.command_claim, args, paths, watch_claim=False)
             self.assertEqual(admission.result(timeout=TEST_HANG_GUARD_SECS), 0)
         claim, = mac_test.read_claims(paths)
         self.assertEqual(claim.record["what"], args.what)
@@ -457,7 +517,7 @@ assert Path(sys.argv[1]).read_text() == 'complete replacement'
                     tree = Path(original.path)
                     with copies.local_mirror_lease(tree, "active-session", create=False):
                         with copies.mirror_sweep_leases(tree.parent) as protected:
-                            self.assertIn(tree, protected)
+                            self.assertIn(tree, protected.busy)
 
     def test_replacement_owner_removes_despite_another_owners_stale_authority(self) -> None:
         original = self.mirror_record()
@@ -565,12 +625,18 @@ with (mock.patch.object(linux_runner, 'prepare_shell', return_value=linux_runner
         for damaged in (False, True):
             with self.subTest(damaged=damaged):
                 with copies.standing("alpha", self.source, copies.StagedSource(copies.staged_tree(self.source))) as tree:
-                    pass
-                _ = (tree / ".git/index.lock").write_text("stopped writer")
-                if damaged:
-                    _ = (tree / ".git/index").write_bytes(b"broken")
+                    cache = (tree / "target").resolve()
+                    _ = (tree / ".git/index.lock").write_text("stopped writer")
+                    if damaged:
+                        _ = (tree / ".git/index").write_bytes(b"broken")
+                    copies.initialize_git(tree, self.source)
+                    self.assertFalse((tree / ".git/index.lock").exists())
+                    _ = copies.git(tree, "read-tree", "HEAD")
+                    self.assertEqual((tree / "source.txt").read_text(), "content\n")
+                self.assertFalse(tree.exists())
                 with copies.standing("alpha", self.source, copies.StagedSource(copies.staged_tree(self.source))) as reused:
-                    self.assertEqual(reused, tree)
+                    self.assertNotEqual(reused, tree)
+                    self.assertEqual((reused / "target").resolve(), cache)
                     self.assertEqual((reused / "source.txt").read_text(), "content\n")
                     self.assertFalse((reused / ".git/index.lock").exists())
 

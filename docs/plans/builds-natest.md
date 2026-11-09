@@ -2180,3 +2180,17 @@ A changed `config/<name>.conf` selects every test module whose transitive import
 
 **Ruled out:**
 - A guard for a test that runs a second in-process `unittest` runner: no test does this, and module cleanups are process-wide in `unittest`.
+
+### Phase 110 — The nightly type check is a footnote under the slowest modules list  · status: done
+
+#### As-built
+
+- `show.py top` in the `~/.claude` repository ranks test modules only. `types/basedpyright` takes no rank, no `--limit` slot and no share of the `sum of median CPU` line.
+- After the sum line, one footnote gives the type check's latest passed run: `types/basedpyright runs nightly, so it is not ranked: last run <cpu> CPU s, <wall> s`. With no qualifying run, no footnote prints.
+- The footnote reads the same history query as a module: host, configured checkout, age limit, status 0, no restart, not aborted.
+- The `module`, `suites` and nextest views are unchanged, and the gate still records the type check.
+
+**Files:**
+- `scripts/test_times/show.py` — ranked rows and the footnote
+- `scripts/test_times/test_show.py` — the limit, the sum, the footnote values and the history filters, in three existing tests
+- `commands/test_times.md` — the `top` description

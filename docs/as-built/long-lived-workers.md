@@ -56,6 +56,11 @@ This lookup includes dispatches outside the run root.
 Older workers without a link use the held-run lookup.
 A session without a worker pass changes nothing.
 A later event retries unfinished completion steps for a completed pass.
+The hook reads the worker's run inside the worker lock.
+A new assign finishes the unfinished completion before it replaces the link.
+That notice names its own pass and says it is a late result. The pane stays for the new assign.
+The late step does not retire the worker, and it keeps a hold that the new assign also owns.
+If the late notice fails, the assign continues and prints an anomaly line that names the saved result file.
 
 An identical rerun of a completed dispatch sends one completion message through the hook's notice code.
 It saves the reply without typing another prompt.
@@ -136,7 +141,9 @@ Each registered Codex home must trust the shared `hooks.json` handlers.
 The installer reports the `turn-end` handler as trusted.
 A worker needs no new launch-line setting to use the installed Stop hook.
 Every Codex session runs the handler at each turn end. A non-worker turn exits as ignored and adds one line to `~/.local/state/herdr/turn-end-ignored.jsonl`.
-A pane launched before the change keeps `-c notify` on its launch line. The handler ignores that payload, and the Stop hook carries the turn.
+A Codex process that started before the Stop hook was installed (2026-11-09 08:27 EST) runs no Stop hook. Measured: such a process finished turns after that time and added no line.
+Close that worker's pane. Its next assign starts a new process that has the hook.
+A pane launched with `-c notify` sends a payload that the handler saves as an ignored line with an empty thread.
 Why: legacy notify passed the payload as one argument, and Linux refuses one argument over 128 KiB. Long-lived threads lost turn ends that way (2026-11-09).
 
 ## Unit code reviewers
@@ -624,6 +631,24 @@ It stores none of these three fields.
 `member_account.resume_account` supplies the account label and absolute home path.
 Unavailable backend evidence gives `account` the `AccountUnavailable` state and its cause.
 That row has no `home` field.
+
+`worker.py list` text rows read `<n> <name> <role> <account>[ <machine>] <pane> <state>[ <reason>]`.
+`_worker_pane_state` is the one mapping from an observed worker to its pane and state words.
+
+| Observed worker | Pane | State |
+| --- | --- | --- |
+| `OpenWorker` | `open` | `paused` or `exited` from the staff row, else `busy`, `idle` or `unknown` |
+| `StoppedWorker` | `open` | `exited` |
+| `ClosedWorker` | `closed` | `-` |
+| Any other class | `unknown` | `-`, and the row keeps its reason |
+
+A row whose pane is not open prints `-` for the account.
+`list --all` prints `-` for the pane and the account, and a state from the dispatch status.
+`display_cells.machine_column` decides the machine field.
+The field shows only when a row uses a machine other than the home machine in `config/build_targets.conf`.
+A worker uses the machine of its parent's worktree.
+`list_workers(as_json=False)` replaces the `state` key with the column word, so the key holds the observed class name only in JSON output.
+`list --json` and `list --json --all` have no pane column and no machine field.
 
 ## Assignment settings and command files
 

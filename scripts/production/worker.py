@@ -31,7 +31,7 @@ from scripts.lib import atomic_file, conf, unit_runs
 from scripts.lib.resume_message import BusyPass, IdleWorker, NoOwnPass, NO_OWN_PASS, PaneWorkerResume, ResumeWorkers, Unavailable, launcher_prompt, resume_message
 from scripts.lib.resume_message import UnsubmittedAssignment as UnsubmittedAssignment
 from scripts.lib.script_envelope import script_prompt
-from scripts.production import session_staff, staff, worker_admission
+from scripts.production import display_cells, session_staff, staff, worker_admission
 
 from scripts.herdr import herdr
 
@@ -335,6 +335,12 @@ def dispatch(parent: StaffId, name: WorkerName, role: WorkerRole, prompt: Path, 
             repeat(row.name, worker_admission.parent(staff.snapshot(), run=session_dir), session_dir,
                    worker_panes.worker_pass(row, session_dir))
             return DispatchSubmission.SUBMITTED
+        if row is not None:
+            owner = staff.snapshot().parent_of(row)
+            if owner is not None:
+                finish_late = cast(Callable[[staff.StaffRow, staff.StaffRow, worker_panes.WorkerLockHold, str], None],
+                                   import_module("scripts.herdr.turn_end").finish_late_completion)
+                finish_late(row, owner, hold, completion_actions.held_role)
         if isinstance(started, StartAtDispatch):
             current_start = worker_panes.start_or_resume(parent, name, role, lock=hold, policy=policy)
         else:
@@ -977,10 +983,16 @@ def list_workers(parent: StaffId, record: staff.StaffSnapshot, *, as_json: bool 
     return listing
 
 
-def _print_workers(listing: list[dict[str, object]], as_json: bool) -> ExitCode:
+def _print_workers(listing: list[dict[str, object]], as_json: bool, record: staff.StaffSnapshot) -> ExitCode:
     if as_json:
         print(json.dumps(listing))
     else:
+        locations: list[str] = []
+        for fields in listing:
+            row = record.by_id(StaffId(str(fields.get("id", ""))))
+            parent = record.parent_of(row) if row is not None else None
+            locations.append(staff.worktree_machine(parent) if parent is not None else "")
+        machines = display_cells.machine_column(locations)
         width = len(str(len(listing)))
         for number, fields in enumerate(listing, 1):
             role = fields["role"] if isinstance(fields.get("role"), str) else "role unknown"
@@ -991,7 +1003,8 @@ def _print_workers(listing: list[dict[str, object]], as_json: bool) -> ExitCode:
                 state = state if state in ("paused", "exited") else "busy" if state == "active" else "idle"
             elif pane != "open":
                 account = "-"
-            print(f"{number:>{width}} {fields['name']} {role} {account} {pane} {state} {fields.get('reason', '')}".rstrip())
+            machine = f" {machines[number - 1]}" if machines else ""
+            print(f"{number:>{width}} {fields['name']} {role} {account}{machine} {pane} {state} {fields.get('reason', '')}".rstrip())
     return ExitCode.OK
 
 
@@ -1063,14 +1076,15 @@ def main(arguments: list[str] | None = None) -> int:
     args = parser.parse_args(arguments, namespace=Arguments())
     try:
         if args.command == "list" and args.all:
-            return _print_workers(list_all_workers(staff.local_snapshot()), args.json)
+            record = staff.local_snapshot()
+            return _print_workers(list_all_workers(record), args.json, record)
         record = staff.snapshot()
         owner = record.by_id(StaffId(args.parent)) if args.parent else record.by_current_session(staff.runtime_id())
         if owner is None or owner.kind not in ("unit", "showrunner"):
             print("staff: caller: not opened: caller is not a unit or showrunner", file=sys.stderr)
             return ExitCode.REFUSED
         if args.command == "list":
-            return _print_workers(list_workers(owner.id, record, as_json=args.json), args.json)
+            return _print_workers(list_workers(owner.id, record, as_json=args.json), args.json, record)
         if args.command == "check":
             observed = _read_workers(owner, record)
             with progress_history.dispatch_reads(record, observed.runs):

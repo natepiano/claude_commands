@@ -820,10 +820,12 @@ class AddUnitLaunchTests(AddUnitTestCase):
 
     def test_refuses_checkout_off_merge_branch(self) -> None:
         _ = self.git("checkout", "-b", "wrong-branch")
-        result = self.cli("alpha", "--plan", "docs/plans/given.md")
-        self.assertEqual(result.returncode, 2, (result.stdout, result.stderr))
-        self.assertFalse((self.root / "project-alpha").exists())
-        self.assert_staff_units()
+        for flags in (("--check",), ()):
+            with self.subTest(flags=flags):
+                result = self.cli("alpha", "--plan", "docs/plans/given.md", *flags)
+                self.assertEqual(result.returncode, 2, (result.stdout, result.stderr))
+                self.assertFalse((self.root / "project-alpha").exists())
+                self.assert_staff_units()
 
     def test_new_work_records_no_scheduled_prompt(self) -> None:
         _ = self.successful("alpha", "--plan", "docs/plans/given.md")

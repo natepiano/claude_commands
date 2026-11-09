@@ -658,6 +658,24 @@ class ProcessUseTests(TmpSweepCase):
         self.assertEqual(tmp_sweep.parse_lsof(text, "/tmp/"), [
             ("/tmp/a", 7, "works in it"), ("/tmp/b/lib", 7, "maps a file in it"),
             ("/tmp/c/log", 7, "holds a file open in it"), ("/tmp/d", 8, "maps a file in it")])
+        for access, how in (("r", tmp_sweep.HOLDS_FILE), ("w", tmp_sweep.WRITES_FILE),
+                            ("u", tmp_sweep.WRITES_FILE)):
+            with self.subTest(access=access):
+                paths = tmp_sweep.parse_lsof(f"p7\nf4\na{access}\nn/tmp/open/file\n", "/tmp/")
+                self.assertEqual(paths, [("/tmp/open/file", 7, how)])
+                self.assertEqual(tmp_sweep.entry_uses(paths, ["/tmp"]),
+                                 {"/tmp/open": "pid 7 holds a file open in it"})
+        fake_process(self.proc, 25, fds=(str(self.tmp / "open/file"),))
+        info = self.proc / "25/fdinfo"
+        info.mkdir()
+        for flags, how in (("0100000", tmp_sweep.HOLDS_FILE), ("0100001", tmp_sweep.WRITES_FILE),
+                           ("0100002", tmp_sweep.WRITES_FILE)):
+            with self.subTest(flags=flags):
+                _ = (info / "0").write_text(f"flags:\t{flags}\n")
+                found = tmp_sweep.process_paths(str(self.proc), str(self.tmp))
+                self.assertIsInstance(found, tmp_sweep.ProcessUsesKnown)
+                assert isinstance(found, tmp_sweep.ProcessUsesKnown)
+                self.assertEqual(found.paths, [(str(self.tmp / "open/file"), 25, how)])
 
 
 class ScratchRootTests(TmpSweepCase):
@@ -1443,7 +1461,7 @@ class WorkerAndGitTests(TmpSweepCase):
                 self.assertIn(str(folder), [entry["path"] for entry in result.deleted])
                 self.assertFalse(folder.exists())
 
-    def test_sweep_removes_a_killed_fresh_gate_but_keeps_unmarked_git_work(self) -> None:
+    def test_a_killed_fresh_gate_stays_under_tmpdir_without_a_scratch_record(self) -> None:
         source = self.tmp.parent / "fresh-source"
         source.mkdir()
         self.git(source, "init", "-q")
@@ -1463,10 +1481,14 @@ with copies.standing("verify-unit", source, copies.WorktreeSource("HEAD", source
     signal.pause()
 '''
         environment = {**os.environ, **copies_environment(self.tmp.parent / "fresh-settings"),
-                       "SCRATCH_ROOT": str(self.tmp / "scratch"),
+                       "SCRATCH_ROOT": str(self.tmp / "scratch"), "TMPDIR": str(self.tmp),
                        "PYTHONPATH": str(Path(__file__).resolve().parents[2])}
-        for marked in (True, False):
-            with self.subTest(marked=marked), mock.patch.dict(os.environ, environment):
+        for cargo in (False, True):
+            if cargo:
+                _ = write(source / "Cargo.toml", "[workspace]\n")
+                self.git(source, "add", "Cargo.toml")
+                self.git(source, "commit", "-qm", "add a Cargo manifest")
+            with self.subTest(cargo=cargo), mock.patch.dict(os.environ, environment):
                 with subprocess.Popen([sys.executable, "-c", code, str(source)], env=environment,
                                       stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) as child:
                     try:
@@ -1487,18 +1509,11 @@ with copies.standing("verify-unit", source, copies.WorktreeSource("HEAD", source
                 checkout = folder / "checkout"
                 self.assertEqual((checkout / "file").read_text(), "working edit\n")
                 self.assertEqual((checkout / "untracked").read_text(), "test output\n")
-                if not marked:
-                    record_path = folder / copy_record.RECORD
-                    fields = cast(dict[str, object], json.loads(record_path.read_text()))
-                    del fields["throwaway"]
-                    _ = record_path.write_text(json.dumps(fields))
+                self.assertTrue(folder.is_relative_to(self.tmp))
+                self.assertFalse((folder / copy_record.RECORD).exists())
                 result = self.sweep()
-                if marked:
-                    self.assertFalse(folder.exists())
-                    self.assertIn(str(folder), [entry["path"] for entry in result.deleted])
-                else:
-                    self.assertTrue(folder.exists())
-                    self.assertIn(str(folder), result.kept[tmp_sweep.UNSAVED_WORK])
+                self.assertTrue(folder.exists())
+                self.assertIn(str(folder), result.kept[tmp_sweep.UNSAVED_WORK])
 
     def git(self, repo: Path, *arguments: str) -> None:
         _ = subprocess.run(["git", "-C", str(repo), "-c", "user.name=test", "-c", "user.email=test@test",

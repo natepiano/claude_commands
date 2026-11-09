@@ -70,6 +70,7 @@ with open(os.environ["TEST_SENT"], "a") as handle:
 
 from scripts.production.staff_test_support import fixture_member, StaffTestCase
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.lib.git_test_support import write_fixture_git_config
 from scripts.lint.memory_test_support import config_environment
 
 class LifecycleFixture(unittest.TestCase):
@@ -161,6 +162,7 @@ class LifecycleFixture(unittest.TestCase):
                          ".claude/scripts/lib/py"):
             self.stub(self.home / relative)
         self.env = {**os.environ, "HOME": str(self.home), "LIFECYCLE_TEST_STATE": str(self.state),
+                    "GIT_CONFIG_GLOBAL": str(write_fixture_git_config(self.root.parent)), "GIT_CONFIG_NOSYSTEM": "1",
                     "PATH": str(bin_path) + os.pathsep + os.environ.get("PATH", ""),
                     "CLAUDE_CODE_SESSION_ID": "test-showrunner",
                     "SHOWRUNNER_SESSION": "environment-showrunner",

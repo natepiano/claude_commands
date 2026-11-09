@@ -9,14 +9,17 @@ Run this in the showrunner session. Run
 and print its output exactly as it comes, with nothing added. It finds the
 production from this session's update timer. Print its total line too, when present.
 Both tables show only the production's staff units.
-For the phase table, **Status** is `busy`, `idle`, `paused`, `exited`, or `on <machine>`.
+For the phase table, **Status** is `busy`, `idle`, `paused` or `exited`.
 The accounts board uses the same status rule. An exit record gives `exited`.
 A pause record gives `paused`, even with no live session.
-An active unit on another machine shows `on <machine>`. Exit and pause records still win.
+Exit and pause records take priority.
 A local live pane process without a Claude registry record gives `idle`.
 With no live session or process, the status is `exited`. Otherwise the live session gives `busy` or `idle`.
-The style table keeps `active`, `paused` and `exited` from staff records.
+The style table uses the same status words as the phase table.
 **Unit** is the unit's staff name, including stopped units and units without a session.
+
+Both tables add a **Machine** column after **Status** only when a row runs on another machine.
+The home machine is the `kind.<machine>=local` entry in `config/build_targets.conf`.
 
 For a production without `Kind: style`, the table is `| Unit | Status | Phase | Non-Phase Work | Queued |`:
 

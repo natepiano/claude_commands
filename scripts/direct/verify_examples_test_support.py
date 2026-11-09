@@ -304,8 +304,8 @@ class SeededExampleWorkspaceFixture(ExampleWorkspaceFixture):
     @override
     def setUpClass(cls) -> None:
         builder = ExampleWorkspaceFixture()
-        builder.setUp()
         cls.addClassCleanup(builder.doCleanups)
+        builder.setUp()
         cls.fixture_root = builder.root
         seed = cls.enterClassContext(tempfile.TemporaryDirectory(prefix="example-workspace-seed-"))
         cls.fixture_seed = Path(seed) / "seed"
@@ -327,8 +327,8 @@ class SeededExampleWorkspaceFixture(ExampleWorkspaceFixture):
             super().setUp()
             return
         self.root = self.fixture_root
-        _ = shutil.copytree(self.fixture_seed, self.root, symlinks=True)
         self.addCleanup(shutil.rmtree, self.root)
+        _ = shutil.copytree(self.fixture_seed, self.root, symlinks=True)
         self.calls = self.root / "cargo-calls"
         self.metadata_calls = self.root / "metadata-calls"
         self.environment = self.fixture_environment.copy()

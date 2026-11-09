@@ -248,6 +248,7 @@ class FolderMoveFixture(StaffTestCase):
             "GIT_CONFIG_NOSYSTEM": "1",
         })))
         _ = self.enterContext(mock.patch.object(pane_record, "RECORD_DIR", self.records))
+        _ = self.enterContext(mock.patch("scripts.production.stall_watch.STATE_DIR", self.root / "stall-watch"))
         _ = self.enterContext(mock.patch.object(progress_history, "SESSION_ROOTS", (self.run_dir.parent,)))
         _ = self.folder_git(self.checkout, "init", "-b", "kept-branch")
         _ = self.folder_git(self.checkout, "config", "user.name", "Folder Move Test")
@@ -523,8 +524,8 @@ class ProductionRenameFixture(StaffTestCase):
         super().setUp()
         # Linked worktree metadata and the committed documents name absolute
         # paths. Restore private files, refs and origin at the seed's same path.
-        _ = shutil.copytree(self.fixture_snapshot, self.fixture_root, symlinks=True)
         self.addCleanup(shutil.rmtree, self.fixture_root)
+        _ = shutil.copytree(self.fixture_snapshot, self.fixture_root, symlinks=True)
         self.bind_fixture(self.fixture_root)
         self.old_tip = self.fixture_tip
         self.staff_file: Path = self.root / "state/staff/staff.json"
