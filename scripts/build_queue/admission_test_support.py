@@ -17,12 +17,13 @@ import select
 import signal
 import socket
 import subprocess
+import sys
 import threading
 import time
 import unittest
 import uuid
 from unittest import mock
-from typing import cast, override
+from typing import ClassVar, cast, override
 
 from scripts.lint import memory_admit as gate
 
@@ -40,6 +41,7 @@ GIB = records.GIB
 DEFAULT_WIDTH = records.RequestedTestWidth(8)
 DEFAULT_CALL = test_phase.CallRecord("call-1")
 FIXTURE_POLICY = admission_policy_fixture()
+SERVING_POLL_SECONDS = 0.05
 
 
 class FakeClock:
@@ -117,12 +119,35 @@ class ScopeEvents:
 class ObservedAdmissionServer(service.AdmissionServer):
     """Expose loop instrumentation only at the shared test fixture boundary."""
 
+    _source_paths: ClassVar[tuple[int, set[Path]]] = (-1, set())
+
     def __init__(self, state_dir: Path, clock: service.Clock, readings: service.Readings,
                  proc: service.Proc, *, fault: Callable[[str], None], socket_path: Path,
                  check_access: Callable[[str], None], before_admission: Callable[[], None]) -> None:
         self.check_access: Callable[[str], None] = check_access
         self.before_admission: Callable[[], None] = before_admission
+        self.wake_lock: threading.Lock = threading.Lock()
         super().__init__(state_dir, clock, readings, proc, fault=fault, socket_path=socket_path)
+
+    @override
+    def close(self) -> None:
+        with self.wake_lock:
+            super().close()
+
+    def wake_loop(self) -> None:
+        with self.wake_lock:
+            if not self.closed:
+                os.eventfd_write(self.priority_events, 1)
+
+    @override
+    def _source_stamps(self) -> dict[Path, tuple[int, int] | service.SourceMissing]:
+        module_count = len(sys.modules)
+        previous_count, paths = ObservedAdmissionServer._source_paths
+        if module_count == previous_count:
+            return {path: self._stamp(path) for path in paths}
+        stamps = super()._source_stamps()
+        ObservedAdmissionServer._source_paths = (module_count, set(stamps))
+        return stamps
 
     @override
     def persist(self) -> None:
@@ -356,6 +381,7 @@ class AdmissionFixture(ExitStack):
         if not (self.root / "build_admission.conf").exists():
             write_memory_config(self.root / "build_admission.conf")
         self.readings: PrivateReadings = PrivateReadings(self.root)
+        self.turn_gate: threading.Lock = threading.Lock()
         self.loop_access: threading.RLock = threading.RLock()
         self.serving_active: threading.Event = threading.Event()
         self.loop_permission: threading.local = threading.local()
@@ -387,6 +413,7 @@ class AdmissionFixture(ExitStack):
         real_monotonic = time.monotonic
 
         def serve() -> None:
+            self.loop_permission.serves_loop = True
             previous = real_monotonic()
             try:
                 while not stopped.is_set():
@@ -394,7 +421,7 @@ class AdmissionFixture(ExitStack):
                     self.clock.advance(current - previous)
                     previous = current
                     with self.loop_turn():
-                        self.server.run_once(0.01)
+                        self.server.run_once(SERVING_POLL_SECONDS)
             except BaseException as error:
                 failures.append(error)
                 stopped.set()
@@ -406,6 +433,7 @@ class AdmissionFixture(ExitStack):
             yield self
         finally:
             stopped.set()
+            self.server.wake_loop()
             worker.join(timeout=TEST_HANG_GUARD_SECS)
             if worker.is_alive():
                 raise AssertionError(f"the private admission loop did not stop within {TEST_HANG_GUARD_SECS} seconds")
@@ -427,9 +455,18 @@ class AdmissionFixture(ExitStack):
 
     @contextmanager
     def loop_turn(self) -> Generator[None]:
-        if not self.loop_access.acquire(timeout=TEST_HANG_GUARD_SECS):
+        depth = getattr(self.loop_permission, "depth", 0)
+        if depth == 0 and not self.turn_gate.acquire(timeout=TEST_HANG_GUARD_SECS):
             raise AssertionError(f"the private admission loop did not yield within {TEST_HANG_GUARD_SECS} seconds")
-        self.loop_permission.depth = getattr(self.loop_permission, "depth", 0) + 1
+        try:
+            if depth == 0 and self.serving_active.is_set() and not getattr(self.loop_permission, "serves_loop", False):
+                self.server.wake_loop()
+            if not self.loop_access.acquire(timeout=TEST_HANG_GUARD_SECS):
+                raise AssertionError(f"the private admission loop did not yield within {TEST_HANG_GUARD_SECS} seconds")
+        finally:
+            if depth == 0:
+                self.turn_gate.release()
+        self.loop_permission.depth = depth + 1
         try:
             yield
         finally:
