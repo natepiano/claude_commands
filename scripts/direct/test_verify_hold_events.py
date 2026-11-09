@@ -15,6 +15,7 @@ from unittest import mock
 from scripts.direct.verify_hold_wait_test_support import (
     VerifyHoldWaitFixture,
     grant_call,
+    local_hold_environment,
     read_cycle_file,
     release_registered_call,
 )
@@ -31,7 +32,7 @@ class VerifyHoldWaitTests(VerifyHoldWaitFixture):
         def grant_on_notification(_seconds: float) -> None:
             grant_call(self.cycle_file)
 
-        with mock.patch.dict(os.environ, self.fixture.environment), \
+        with local_hold_environment(self.fixture.environment), \
              mock.patch.object(time, "sleep", side_effect=AssertionError("local admission must wake on release")), \
              mock.patch.object(LocalReleaseEvents, "wait", side_effect=grant_on_notification) as waiting:
             self.assertEqual(build_targets.command_wait_local("notification-call"), 0)
@@ -44,7 +45,7 @@ class VerifyHoldWaitTests(VerifyHoldWaitFixture):
         def release_on_poll(_seconds: float) -> None:
             grant_call(self.cycle_file)
 
-        with mock.patch.dict(os.environ, self.fixture.environment):
+        with local_hold_environment(self.fixture.environment):
             with mock.patch.object(ctypes, "CDLL", return_value=object()), \
                  mock.patch.object(time, "sleep", side_effect=release_on_poll) as polling:
                 self.assertEqual(build_targets.command_wait_local("polling-call"), 0)

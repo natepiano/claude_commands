@@ -44,7 +44,7 @@ All seven correctness defects are fixed. Cuts applied, by section:
 (`<DelegatedPhaseReservationContract/>`, `<RetainDelegatedPhaseReservation/>`,
 `<CoordinateDelegatedPhaseReservation/>`), `<DelegationResultFormat/>`,
 `<FixDispatch/>`, `<TypeTableCells/>`, `<ComposeWorkOrder/>`,
-`<VerificationContract/>`, `<PhaseMesh/>`, `<WritePromptContract/>` items 4 and
+`<VerificationContract/>`, `<CoordinationBoard/>`, `<WritePromptContract/>` items 4 and
 8, plus the earlier `<FindingsLedger/>`, `<PassOwnership/>`,
 `<CoordinationBoard/>`, `<BuildTokenContract/>`, `<PhaseTeam/>`,
 `<DiscardPhaseReviewText/>`, and `<LaunchImplementation/>` step 3.
@@ -126,7 +126,7 @@ Estimated total **≈30,000 bytes, ~23%**.
 | `<ProgressContract/>` | 11,032 | ~6,300 | 5/5 | The recorder owns its output. After "copy the Markdown exactly", ~1.9KB re-describes every table, column, duration, ETA band and clock the script renders. Replace with a byte-for-byte imperative naming the whole output units. |
 | `<EarlyReviewArm/>` | 7,760 | ~3,700 | 4/5 | Marker mechanics the recorder enforces (`arm-review` cannot create a pass; the real pass supersedes the marker). **Guarded:** the stale-sentinel story at 1407-1422 and the void-verdict rule are not cuttable — see below. |
 | `<CheckpointCommit/>` | 8,504 | ~3,000 | 4/5 | Steps 5-7 become state/result matrices. `claim_state.py` validates ids, cardinality, blockers and alternatives before `state` exists; the unit director keeps only the acceptance allowlist and the `protected_tip` comparison. |
-| Board + mesh + prompt `## Team` | 8,865 | ~3,200 | 5/5 | Three passages restate one channel split. Canonical homes: board owns the durable record and its commands, `<PhaseMesh/>` owns addresses, `<BuildTokenContract/>` owns mutual exclusion. |
+| Board + message + prompt `## Team` | 8,865 | ~3,200 | 5/5 | Three passages restate one channel split. Canonical homes: board owns the durable record and its commands, `commands/message.md` owns addresses, `<BuildTokenContract/>` owns mutual exclusion. |
 | Token + ledger + pass ownership | 6,524 | ~3,200 | 5/5 | `verify.sh` owns token acquisition and every release path; `findings.py` refuses partial batches and premature verdicts; the recorder rejects unowned pass calls. Keep only what the scripts cannot enforce. |
 | `<ConsiderNextItems/>` | 5,765 | ~2,200 | 3/5 | `phase_review.md` already assigns every proposal a `Class: apply\|gate`. The consumer re-derives the classification instead of obeying the field. |
 | Reservation contract trio | 6,167 | ~2,000 | 2/5 | Lifecycle facts become one state table. **Guarded:** all four JSON records, every invocation and argument order, and the "current `HEAD` is not proof" passage stay byte-identical. |
@@ -148,7 +148,7 @@ a reachable failure.
 - **Both timer absolutes** (`<ProgressContract/>` 666-669 and 803-812). They read as one rule twice and prevent opposite defects: running work with no wake-up, and satisfying the Stop hook by re-arming without giving the report already owed. The hook blocks once and cannot compose a report.
 - **The phase-count story at both sites.** `progress_history.py` corrects the percentage only when called; it cannot stop a *later* report from counting by hand. `<RemainingWorkOutlook/>` runs after phase completion when no live progress call exists — a cross-reference there is not equivalent.
 - **Token self-deadlock and premature-green.** `verify.sh` cannot stop a delegate acquiring the token first, and cannot know whether the peer owning a package has posted `done`.
-- **Provider and transport fallbacks.** `codex_mesh=0` remains supported. Claude `--bg` has no reply redirect, so keep the summary-as-last-act rule. A finished Claude session resumes. A finished Codex thread stays open for `assign.sh --to` follow-ups.
+- **Provider and transport fallbacks.** Claude `--bg` has no reply redirect, so keep the summary-as-last-act rule. A finished Claude session resumes. A finished Codex thread stays open for `assign.sh --to` follow-ups.
 - **Every literal block**: the four reservation JSON records, the commit-message template, exact authorization strings, `<BroadReviewPrompt/>`, the result template, report tables. Scripts do not reconstruct these; rewording an authorization string changes which reply advances the run.
 - **The "Not this / This" progress example** (775-792). The imported guide states the rule; this pair is the only thing that demonstrates turning "edge" and "ancestry" into what the user actually receives.
 

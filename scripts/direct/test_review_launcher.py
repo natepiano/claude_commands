@@ -320,7 +320,7 @@ exec bash "''' + str(agent_exec) + '''" "$@"
         )
 
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertFalse((session_dir / "mesh_events.txt").exists())
+        self.assertFalse((session_dir / "dispatch_events.txt").exists())
         self.assertEqual(
             (session_dir / "review_findings_1.txt").read_text(encoding="utf-8"),
             "No findings.\n",
@@ -362,7 +362,6 @@ exec bash "''' + str(agent_exec) + '''" "$@"
         self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
         self.assertEqual(result.stderr.splitlines(), ["review.sh: Codex workers must use assign.sh."])
         self.assertFalse((session / "review-worker-started").exists())
-        self.assertFalse((session / "mesh_roster.json").exists())
         self.assertEqual({path.name: (path.read_bytes(), path.stat().st_mtime_ns)
                           for path in phase.iterdir()}, before)
         self.assertEqual(self.turn_records(session), [])
@@ -380,7 +379,6 @@ exec bash "''' + str(agent_exec) + '''" "$@"
                                         env=self.environment(), timeout=TEST_HANG_GUARD_SECS)
                 self.assertEqual(result.returncode, 2, result.stderr)
                 self.assertEqual(result.stderr.splitlines(), ["ERROR: unknown review option '" + flag + "'."])
-                self.assertFalse((session / "mesh_roster.json").exists())
                 self.assertEqual(self.turn_records(session), [])
 
 

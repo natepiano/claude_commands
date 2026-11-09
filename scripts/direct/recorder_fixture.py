@@ -40,9 +40,10 @@ def record_wait_workers(root: Path, session: Path, environment: dict[str, str],
         roster = {name: {"staff_id": fixture_worker(name, parent.id, runtime_id=fixture_runtime_id(identity)).id}
                   for name, identity in workers.items()}
     session.mkdir(parents=True, exist_ok=True)
+    # The recorder still reads historical aliases from this roster.
     _ = (session / "mesh_roster.json").write_text(json.dumps(roster))
-
-
+    for name, entry in roster.items():
+        _ = (session / f"impl_worker_{name}.json").write_text(json.dumps({"slot": name, **entry}))
 
 
 LEGACY_RECORDER_ARGUMENTS = """
@@ -158,7 +159,7 @@ def prepare_launcher_runtime(root: Path) -> tuple[Path, Path, Path]:
     for name in ("py", "process_group.py"):
         _ = shutil.copy2(source / "lib" / name, home_lib / name)
     _ = shutil.copy2(source / "production/production_doc.py", root / "scripts/production/production_doc.py")
-    for name in ("models_config.sh", "heartbeat.sh", "heartbeat_watch.sh", "worker_lifecycle.py", "codex_mesh.py"):
+    for name in ("models_config.sh", "heartbeat.sh", "heartbeat_watch.sh", "worker_lifecycle.py"):
         _ = shutil.copy2(source / "agents" / name, agents / name)
     for name in ("assign.sh", "assign.py", "assign_claude.py", "claude_worker.py", "assign_gate.py", "workers.py", "end_session.sh", "remove_run_scratch.py", "worker_name.sh", "worker_state.py", "progress_history.py", "plan_history.py",
                  "phase_reservation.py", "recorder_state.py", "findings.py", "board.sh"):

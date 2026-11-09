@@ -177,13 +177,13 @@ class AffectedModulesTests(unittest.TestCase):
                               ["test_bare.py"])
 
     def test_imported_test_module_selects_its_importer_without_requesting_full_suite(self) -> None:
-        self.add_test("agents/test_codex_mesh.py", "VALUE = 1\n")
-        self.add_test("direct/test_workers.py", "from scripts.agents.test_codex_mesh import VALUE\n")
+        self.add_test("agents/test_native_worker.py", "VALUE = 1\n")
+        self.add_test("direct/test_workers.py", "from scripts.agents.test_native_worker import VALUE\n")
         self.certify()
-        self.write("scripts/agents/test_codex_mesh.py", "VALUE = 2\n")
+        self.write("scripts/agents/test_native_worker.py", "VALUE = 2\n")
         _ = self.commit()
         self.assertCountEqual([path.name for path in self.selection().modules],
-                              ["test_codex_mesh.py", "test_workers.py"])
+                              ["test_native_worker.py", "test_workers.py"])
 
     def test_package_initializers_and_relative_imports_are_dependencies(self) -> None:
         self.write("scripts/component/__init__.py", "VALUE = 1\n")
@@ -195,7 +195,7 @@ class AffectedModulesTests(unittest.TestCase):
         _ = self.commit()
         self.assertEqual([path.name for path in self.selection().modules], ["test_package.py"])
 
-    def test_configuration_names_without_complete_paths_select_no_modules(self) -> None:
+    def test_configuration_names_without_complete_paths_select_their_readers(self) -> None:
         self.write("config/limits.conf", "amount=1\n")
         self.write("scripts/component/reader.py", 'import conf\nVALUE = conf.read("limits").whole("amount")\n')
         self.add_test("checks/test_limits.py", "import reader\n")
@@ -203,7 +203,58 @@ class AffectedModulesTests(unittest.TestCase):
         self.write("config/limits.conf", "amount=2\n")
         _ = self.commit()
         result = self.selection()
-        self.assertEqual(result.modules, ())
+        self.assertEqual(result.modules, (self.repo / "scripts/checks/test_limits.py",))
+
+    def test_configuration_changes_select_transitive_readers(self) -> None:
+        readers = (
+            ("module", 'from scripts.lib import conf\nVALUE = conf.read("limits")\n'),
+            ("module alias", 'from scripts.lib import conf as settings\nVALUE = settings.read("limits")\n'),
+            ("qualified alias", 'import scripts.lib.conf as settings\nVALUE = settings.read("limits")\n'),
+            ("qualified module", 'import scripts.lib.conf\nVALUE = scripts.lib.conf.read("limits")\n'),
+            ("function", 'from scripts.lib.conf import read\nVALUE = read("limits")\n'),
+            ("function alias", 'from scripts.lib.conf import read as load\nVALUE = load("settings/limits.conf")\n'),
+            ("path token", 'SETTINGS = "settings/limits.conf"\n'),
+            ("relative cycle", 'from . import adapter\nfrom scripts.lib import conf\nVALUE = conf.read("limits")\n'),
+        )
+        self.write("scripts/component/adapter.py", "from . import reader\n")
+        self.add_test("checks/test_limits.py", "from scripts.component import adapter\n")
+        for name, reader in readers:
+            with self.subTest(reader=name):
+                self.write("config/limits.conf", "amount=1\n")
+                self.write("config/unrelated.conf", "amount=1\n")
+                self.write("scripts/component/reader.py", reader)
+                self.certify()
+                self.write("config/limits.conf", "amount=2\n")
+                _ = self.commit()
+                self.assertEqual(self.selection().modules, (self.repo / "scripts/checks/test_limits.py",))
+                self.certify()
+                self.write("config/unrelated.conf", "amount=2\n")
+                _ = self.commit()
+                self.assertEqual(self.selection().modules, ())
+
+    def test_configuration_selection_reuses_all_source_facts(self) -> None:
+        self.write("config/limits.conf", "amount=1\n")
+        self.write("scripts/component/reader.py", 'from scripts.lib import conf\nVALUE = conf.read("limits")\n')
+        self.write("scripts/component/adapter.py", "import reader\n")
+        self.add_test("checks/test_limits.py", "from scripts.component import adapter\n")
+        self.certify()
+        _ = affected.select_affected(self.repo, self.base, self.modules, set(), state_dir=self.cache_dir())
+        self.write("config/limits.conf", "amount=2\n")
+        _ = self.commit()
+        with mock.patch.object(ast, "parse", wraps=ast.parse) as parse:
+            result = affected.select_affected(self.repo, self.base, self.modules, set(), state_dir=self.cache_dir())
+        self.assertIsInstance(result, affected.AffectedSelection)
+        assert isinstance(result, affected.AffectedSelection)
+        self.assertEqual(result.modules, (self.repo / "scripts/checks/test_limits.py",))
+        self.assertEqual(parse.call_count, 0)
+        self.write("scripts/component/reader.py", 'from scripts.lib import conf\nVALUE = conf.read("limits").whole("amount")\n')
+        _ = self.commit()
+        with mock.patch.object(ast, "parse", wraps=ast.parse) as parse:
+            changed = affected.select_affected(self.repo, self.base, self.modules, set(), state_dir=self.cache_dir())
+        self.assertEqual(changed, affected.AffectedSelection(self.base,
+            ("config/limits.conf", "scripts/component/reader.py"), result.modules))
+        self.assertEqual([call.kwargs["filename"] for call in parse.call_args_list],
+                         ["scripts/component/reader.py"])
 
     def test_unreferenced_inputs_select_only_tests_in_a_changed_python_folder(self) -> None:
         paths = ["scripts/lib/new.py", "scripts/other/conftest.py", "settings.json",
@@ -271,6 +322,7 @@ class AffectedModulesTests(unittest.TestCase):
         _ = self.commit()
         self.assertEqual(affected.select_affected(self.repo, affected.NoCertifiedBase(), self.modules, affected.dirty_paths(self.repo)),
                          affected.FullSuite("no certified base"))
+        self.write("scripts/component/invalid.py", "this is invalid (\n")
         self.write("scripts/component/test_broken.py", "this is invalid (\n")
         _ = self.commit()
         result = affected.select_affected(self.repo, self.base, self.modules, affected.dirty_paths(self.repo))

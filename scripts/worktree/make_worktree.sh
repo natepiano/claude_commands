@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Make an approved original work checkout; run from its source repository.
+# Make and record a worktree from its source repository.
 set -euo pipefail
 
 if [[ $# != 2 ]]; then
@@ -7,4 +7,5 @@ if [[ $# != 2 ]]; then
     exit 2
 fi
 
-exec git worktree add "$1" -b "$2"
+script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+exec "$script_dir/../lib/py" "$script_dir/worktrees.py" make "$1" "$2"

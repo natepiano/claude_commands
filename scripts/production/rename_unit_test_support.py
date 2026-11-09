@@ -356,14 +356,6 @@ class FolderRenameFixture(StaffTestCase):
             "CLAUDE_CONFIG_DIR": str(self.home / ".claude"), "CLAUDE_CODE_SESSION_ID": self.owner.current_session}
         fake_unit_host.process(os.environ, pid, 998040 if live else 1, arguments if live else [],
                                environment, cwd=folder.path)
-        descriptor = self.root / "proc" / str(pid) / "fd/4"
-        descriptor.parent.mkdir(exist_ok=True)
-        descriptor.unlink(missing_ok=True)
-        if live and kind == "codex":
-            record = self.root / "rollout-folder-current.jsonl"
-            _ = record.write_text(json.dumps({"type": "session_meta", "payload": {
-                "id": self.owner.current_session}}) + "\n")
-            descriptor.symlink_to(record)
 
     def transcript(self, kind: Literal["claude", "codex"]) -> None:
         for directory in (self.home / ".claude", self.home / ".codex"):

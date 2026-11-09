@@ -51,7 +51,7 @@ both are true:
 These stay too: runs named by active markers, runs with any worker not ended (including
 paused workers), and runs using a live or paused session worktree. Unreadable ownership records
 keep runs too, including their temp entries. These runs also keep folders named by cwd in their
-mesh_runs/*.json records. Empty mesh_runs files are not records. Pending files are not read.
+detached_runs/*.json records. Empty detached_runs files are not records. Pending files are not read.
 A worker thread not ended keeps its session temp parent, but its old temp entries can go.
 An unreadable worker record keeps scratch entries and top-level /tmp/claude entries, and names
 the record in the log. Before an idle entry can go, a git check searches
@@ -643,7 +643,7 @@ def delete_tree(path: str) -> None:
 
 
 class RunKeepReason(Enum):
-    ACTIVE_MARKER = "an active-run marker names it"
+    ACTIVE_MARKER = "an active run marker"
     UNENDED_WORKER = "a worker has not ended"
     SESSION_WORKTREE = "a live or paused session uses its worktree"
     UNREADABLE_RECORD = "a run ownership record cannot be read"
@@ -727,6 +727,7 @@ class PaneRunUse:
     parents: frozenset[staff.StaffId]
     active: frozenset[staff.StaffId]
     threads: dict[staff.StaffId, frozenset[str]]
+    ended: frozenset[staff.StaffId] = frozenset()
 
 
 @dataclass(frozen=True)
@@ -753,12 +754,15 @@ def pane_run_use() -> PaneRunUse:
     record = staff.snapshot()
     parents = session_staff.pane_parents(record)
     active: set[staff.StaffId] = set()
+    ended: set[staff.StaffId] = set()
     threads: dict[staff.StaffId, frozenset[str]] = {}
     if parents:
         from scripts.herdr import worker_panes
 
         for parent, observed in worker_panes.observe_parents(parents, record).items():
             identities: set[str] = set()
+            if observed and all(isinstance(worker, (worker_panes.StoppedWorker, worker_panes.ClosedWorker)) for worker in observed):
+                ended.add(parent)
             for worker in observed:
                 if isinstance(worker, (worker_panes.OpenWorker, worker_panes.ProcessUnknownWorker, worker_panes.UncertainWorker)):
                     active.add(parent)
@@ -767,27 +771,19 @@ def pane_run_use() -> PaneRunUse:
                     state = "unknown" if isinstance(worker, worker_panes.ProcessUnknownWorker) else "incomplete"
                     print(f"tmp sweep: {worker.row.name}: {state}: {worker.reason}", file=sys.stderr)
             threads[parent] = frozenset(identities)
-    return PaneRunUse(record, frozenset(row.id for row in parents), frozenset(active), threads)
+    return PaneRunUse(record, frozenset(row.id for row in parents), frozenset(active), threads, frozenset(ended))
 
 
 def run_pane_owner(folder: Path, use: PaneRunUse) -> staff.StaffRow | unit_runs.RunOwnerUnrecorded:
     from scripts.production import staff
 
-    selected = unit_runs.run_pin(folder)
-    if selected == "mesh":
-        return unit_runs.RunOwnerUnrecorded("mesh run")
     state = record_object(folder / unit_runs.STATE_FILE)
     owner = unit_runs.run_owner(state, use.record) if isinstance(state, dict) else unit_runs.RunOwnerUnrecorded("run has no unit staff owner")
-    if isinstance(owner, staff.StaffRow) and owner.id in use.parents:
-        return owner
-    if selected == "herdr":
-        if isinstance(owner, unit_runs.RunOwnerUnrecorded):
-            raise staff.StaffUnreadable(f"{folder}: {owner.reason}")
+    if isinstance(owner, staff.StaffRow):
         location = owner.worktree
         if isinstance(location, (staff.PresentWorktree, staff.RemovedWorktree)) and location.machine != remote.local_machine():
             raise staff.StaffUnreadable(f"{folder}: {owner.name}: pane owner is on {location.machine}")
-        return owner
-    return unit_runs.RunOwnerUnrecorded("mesh run")
+    return owner
 
 
 def run_folder_guards(roots: Roots, live: frozenset[str] | None,
@@ -809,14 +805,6 @@ def run_folder_guards(roots: Roots, live: frozenset[str] | None,
             pane_owner = run_pane_owner(Path(folder), workers)
             if isinstance(pane_owner, staff.StaffRow) and pane_owner.id in workers.active:
                 kept[folder] = RunKeepReason.UNENDED_WORKER
-            roster = (record_object(Path(folder) / "mesh_roster.json")
-                      if isinstance(pane_owner, unit_runs.RunOwnerUnrecorded) else MissingRecord.ABSENT)
-            if not isinstance(roster, MissingRecord):
-                for worker in roster.values():
-                    if not isinstance(worker, dict) or not isinstance(cast(dict[str, object], worker).get("status"), str):
-                        raise ValueError("worker roster entry unreadable")
-                    if cast(dict[str, object], worker)["status"] != "ended":
-                        kept[folder] = RunKeepReason.UNENDED_WORKER
             # Read even when another reason keeps the folder, so errors are visible.
             state = record_object(Path(folder) / unit_runs.STATE_FILE)
             if not isinstance(state, MissingRecord):
@@ -836,7 +824,6 @@ def run_folder_guards(roots: Roots, live: frozenset[str] | None,
                 if director in markers.unreadable_sessions:
                     kept[folder] = RunKeepReason.UNREADABLE_RECORD
                 elif director in live:
-                    kept[folder] = RunKeepReason.DIRECTOR
                     kept[folder] = RunKeepReason.DIRECTOR
             if not isinstance(state, MissingRecord) and state.get("history_file"):
                 history = state["history_file"]
@@ -861,33 +848,22 @@ class WorkerUse:
 
 def worker_use(guarded: dict[str, RunKeepReason], use: PaneRunUse) -> WorkerUse:
     """Read working folders and live thread ids only from runs that must stay."""
-    from scripts.production import staff, session_staff
+    from scripts.production import staff
 
     folders: set[str] = set()
     threads: set[str] = set()
     unreadable: list[str] = []
 
-    membership = use.record
     for folder in guarded:
-        roster_path = Path(folder) / "mesh_roster.json"
+        state_path = Path(folder) / unit_runs.STATE_FILE
         try:
             owner = run_pane_owner(Path(folder), use)
             if isinstance(owner, staff.StaffRow):
                 threads.update(use.threads.get(owner.id, ()))
-            roster = record_object(roster_path) if isinstance(owner, unit_runs.RunOwnerUnrecorded) else MissingRecord.ABSENT
-            if not isinstance(roster, MissingRecord):
-                for value in roster.values():
-                    if not isinstance(value, dict):
-                        raise ValueError("worker roster unreadable")
-                    worker = cast(dict[str, object], value)
-                    if worker.get("status") != "ended":
-                        thread = session_staff.worker_session(worker, membership)
-                        if thread:
-                            threads.add(thread)
         except (staff.StaffUnreadable, OSError, UnicodeError, ValueError) as error:
-            print(f"tmp sweep: {roster_path}: {error}", file=sys.stderr)
-            unreadable.append(str(roster_path))
-        runs_path = Path(folder) / "mesh_runs"
+            print(f"tmp sweep: {state_path}: {error}", file=sys.stderr)
+            unreadable.append(str(state_path))
+        runs_path = Path(folder) / "detached_runs"
         try:
             for path in record_entries(runs_path):
                 if path.suffix != ".json":
@@ -1231,7 +1207,7 @@ def sweep(dry_run: bool, roots: Roots, now: float, proc: str = PROC_DIR, *,
 
 
 class CleanupEndReason(Enum):
-    WORKERS_ENDED = "all recorded workers ended; idle and unused"
+    WORKERS_ENDED = "all pane workers stopped or closed; idle and unused"
     TASK_ENDED = "its scratch task ended; idle and unused"
     VERIFY_STOPPED = "its recorded verify.sh run stopped; idle and unused"
 
@@ -1242,9 +1218,12 @@ class CleanupKeepReason(Enum):
 
 
 def cleanup_end_reason(entry: RemovableEntry, roots: Roots, now: float, proc: str, *,
+    pane_use: PaneRunUse | PaneRunsUnreadable,
     scratch_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
 ) -> CleanupEndReason | CleanupKeepReason:
     """Require end evidence as well as the timed sweep's checks."""
+    from scripts.production import staff
+
     if isinstance(scratch_settings, UseConfiguredValue):
         scratch_settings = conf.read("scratch")
     try:
@@ -1252,12 +1231,12 @@ def cleanup_end_reason(entry: RemovableEntry, roots: Roots, now: float, proc: st
             relative = Path(entry.path).relative_to(root) if Path(entry.path).is_relative_to(root) else Path()
             if relative.parts:
                 run = Path(root) / relative.parts[0]
-                if not run.is_dir(follow_symlinks=False) or unit_runs.run_pin(run) == "herdr":
+                if not run.is_dir(follow_symlinks=False):
                     continue
-                roster = record_object(run / "mesh_roster.json")
-                if isinstance(roster, dict) and roster and all(
-                        isinstance(worker, dict) and cast(dict[str, object], worker).get("status") == "ended"
-                        for worker in roster.values()):
+                if isinstance(pane_use, PaneRunsUnreadable):
+                    return CleanupKeepReason.UNREADABLE
+                owner = run_pane_owner(run, pane_use)
+                if isinstance(owner, staff.StaffRow) and owner.id in pane_use.ended:
                     return CleanupEndReason.WORKERS_ENDED
         if entry.root in roots.scratch:
             record = scratch.task_of(Path(entry.path), scratch_settings=scratch_settings)
@@ -1285,6 +1264,7 @@ def timed_entries(roots: Roots, now: float, proc: str, *,
         scratch_settings = conf.read("scratch")
     if isinstance(lint_settings, UseConfiguredValue):
         lint_settings = conf.read("lint")
+    pane_use = read_pane_runs() if isinstance(pane_use, ReadPaneRuns) else pane_use
     for entry in judge_entries(roots, now, proc, lint_settings=lint_settings, scratch_settings=scratch_settings, pane_use=pane_use):
         if isinstance(entry, KeptEntry) or entry.root not in roots.plain + roots.runs:
             yield entry
@@ -1293,7 +1273,7 @@ def timed_entries(roots: Roots, now: float, proc: str, *,
         if any(pattern.fullmatch(name) for pattern in (TEMPFILE_NAME, INVOKE_TEMP_NAME, roots.verify_temp_name)):
             yield entry
             continue
-        ended = cleanup_end_reason(entry, roots, now, proc, scratch_settings=scratch_settings)
+        ended = cleanup_end_reason(entry, roots, now, proc, pane_use=pane_use, scratch_settings=scratch_settings)
         if isinstance(ended, CleanupEndReason):
             yield replace(entry, reason=ended.value)
             continue
@@ -1328,12 +1308,13 @@ def cleanup_entries(roots: Roots, now: float, proc: str, *,
         scratch_settings = conf.read("scratch")
     if isinstance(lint_settings, UseConfiguredValue):
         lint_settings = conf.read("lint")
+    pane_use = read_pane_runs()
     result: list[KeptEntry | CleanupRemoval] = []
-    for entry in judge_entries(roots, now, proc, lint_settings=lint_settings, scratch_settings=scratch_settings):
+    for entry in judge_entries(roots, now, proc, lint_settings=lint_settings, scratch_settings=scratch_settings, pane_use=pane_use):
         if isinstance(entry, KeptEntry):
             result.append(entry)
             continue
-        reason = cleanup_end_reason(entry, roots, now, proc, scratch_settings=scratch_settings)
+        reason = cleanup_end_reason(entry, roots, now, proc, pane_use=pane_use, scratch_settings=scratch_settings)
         if isinstance(reason, CleanupKeepReason):
             result.append(KeptEntry(entry.path, reason.value))
         else:
