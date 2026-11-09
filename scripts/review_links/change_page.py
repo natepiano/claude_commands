@@ -603,24 +603,16 @@ def close_feature_log(page: ReviewPage, doc: Path, row_id: str, verdict: str) ->
                 if spec.closes_by_change_review}
     lines = doc.read_text(encoding="utf-8").splitlines()
     repo = Path(production_field(lines, "Showrunner checkout")).expanduser()
-    script = str(Path(feature_log.__file__))
-    project = subprocess.run([str(Path(__file__).resolve().parents[1] / "lib/py"), script, "project-of", str(repo)],
-                             capture_output=True, text=True, check=True).stdout.strip()
+    project = feature_log.project_of(str(repo))
     if project not in projects:
         return
-    command = "add" if change_review.lands(verdict) else "drop"
-    arguments = ["--review", review, "--if-proposed"]
-    if command == "drop":
-        arguments.append(f"--verdict={verdict}")
-    result = subprocess.run([str(Path(__file__).resolve().parents[1] / "lib/py"), script, command, *arguments],
-                            capture_output=True, text=True, check=False)
-    # The writer names the required operation when a proposal replaces an old note.
-    if command == "add" and result.returncode and (
-            f"proposal {review} uses supersede; run supersede --review {review}" in result.stderr):
-        result = subprocess.run([str(Path(__file__).resolve().parents[1] / "lib/py"), script, "supersede", *arguments],
-                                capture_output=True, text=True, check=False)
-    if result.returncode:
-        raise RuntimeError((result.stderr or result.stdout).strip() or "feature-log operation failed")
+    try:
+        if change_review.lands(verdict):
+            _ = feature_log.land_review(review, if_proposed=True)
+        else:
+            _ = feature_log.drop_review(review, verdict, if_proposed=True)
+    except feature_log.FeatureLogError as error:
+        raise RuntimeError(error.diagnostic) from error
 
 
 def closeout_before_save(page: ReviewPage, doc: Path, row_id: str, verdict: str) -> None:
@@ -700,14 +692,17 @@ def submit(page: ReviewPage, body: str, status: DeliveryStatus, *,
     recipients = verdict_recipients(owner, verdict)
     closeout_before_save(page, doc, row_id, verdict)
     attempt = status.begin(page, row_id, "verdict", recipients=recipients) if recipients else ""
-    result = subprocess.run([str(Path(__file__).resolve().parents[1] / "lib/py"), str(Path(change_review.__file__)), "verdict",
-                             "--production", unit_lookup.doc_owner(page.production, staff.snapshot()).name, "--list", str(page.review_list),
-                             "--row", row_id, f"--verdict={verdict}"], capture_output=True, text=True, check=False)
-    if result.returncode:
+    try:
+        production = change_review.production_doc(unit_lookup.doc_owner(page.production, staff.snapshot()).name)
+        result = change_review.save_verdict(page.review_list, row_id, verdict, production)
+    except (change_review.ChangeReviewError, OSError) as error:
         status.clear(page, row_id, "verdict")
-        raise AnswerRefused((result.stderr or result.stdout).strip())
+        raise AnswerRefused(str(error).strip()) from error
+    if isinstance(result, change_review.VerdictRefused):
+        status.clear(page, row_id, "verdict")
+        raise AnswerRefused(result.reason)
     message = review_message(message_page, row, verdict, f"Merged: {row.get('Merged', '')}",
-                             f"User feedback: {feedback if feedback.strip() else verdict}", result.stdout.strip())
+                             f"User feedback: {feedback if feedback.strip() else verdict}", "\n".join(result.lines).strip())
     return MessageDelivery(message_page, row_id, recipients, message, attempt, owner.showrunner_recipients) if recipients else NoMessageDelivery()
 
 

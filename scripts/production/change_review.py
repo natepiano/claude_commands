@@ -21,6 +21,7 @@ except FileNotFoundError:
 
 import argparse
 import fcntl
+import json
 import os
 import re
 import shlex
@@ -35,7 +36,8 @@ from pathlib import Path
 from typing import TypeVar, cast
 
 from scripts.lib.atomic_file import write_text_atomic  # noqa: E402
-from scripts.lib import scratch  # noqa: E402
+from scripts.lib import scratch, unit_runs  # noqa: E402
+from scripts.direct.progress_history import load_events  # noqa: E402
 from scripts.lib import urgency  # noqa: E402
 from scripts.lib.user_zone import user_zone  # noqa: E402
 
@@ -475,13 +477,18 @@ def _stamp(path: Path, lines: list[str], production: Path, day: date) -> None:
     _set_key(lines, end, PRODUCTIONS, [f"{PRODUCTIONS}:\n", *(f'  - "{item}"\n' for item in [*listed, _shown(production)])])
 
 
-def _edit(path: Path, production: Path, day: date, write: Callable[[list[str]], Result],
-          what: Callable[[Result], str]) -> Result:
-    """Change the list's lines under the lock, write and commit them; a change that raises writes nothing.
+def _print_warning(message: str) -> None:
+    print(message, file=sys.stderr)
 
-    The lock is the list's directory, so concurrent writers never lose a row and no lock file
-    lands beside the list. A missing list starts from the skeleton. Every write stamps the
-    frontmatter for `production` on `day`. `what` names the write in the commit subject.
+
+def _edit(path: Path, production: Path, day: date, write: Callable[[list[str]], Result],
+          what: Callable[[Result], str], *, report_warning: Callable[[str], None] = _print_warning) -> Result:
+    """Change the list's lines under the lock, then write and commit them.
+
+    A change that raises an error writes nothing. The lock is the list's directory.
+    Concurrent writers never lose a row. No lock file appears beside the list.
+    A missing list starts from the skeleton. Each write stamps the frontmatter for `production` on `day`.
+    `what` names the write in the commit subject.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
     with _list_lock(path):
@@ -489,21 +496,21 @@ def _edit(path: Path, production: Path, day: date, write: Callable[[list[str]], 
         lines = text.splitlines(keepends=True)
         result = write(lines)
         if lines == text.splitlines(keepends=True):
-            _commit(path, what(result))
+            _commit(path, what(result), report_warning=report_warning)
             return result
         _sort(path, lines)
         _stamp(path, lines, production, day)
         write_text_atomic(path, "".join(lines))
-        _commit(path, what(result))
+        _commit(path, what(result), report_warning=report_warning)
         return result
 
 
-def _commit(path: Path, what: str) -> None:
-    """Commit the list alone when it sits in a git work tree; nothing is pushed.
+def _commit(path: Path, what: str, *, report_warning: Callable[[str], None] = _print_warning) -> None:
+    """Commit the list alone when it is in a Git repository. Push nothing.
 
-    `--only` with the one path commits the file's whole content and leaves every other change,
-    staged or not, where it was. A refusal (another git process holding index.lock, say) warns
-    on one line and leaves the write standing: the next write's commit carries this one too.
+    `--only` with one path commits the file's whole content. It keeps every other change where it was, staged or not.
+    A refusal, such as another Git process holding `index.lock`, gives one warning through `report_warning` and keeps the write.
+    The next write's commit includes this write too.
     """
 
     def git(*arguments: str) -> subprocess.CompletedProcess[str]:
@@ -521,8 +528,7 @@ def _commit(path: Path, what: str) -> None:
         done = git(*step)
         if done.returncode:
             reason = next(iter((done.stderr or done.stdout).strip().splitlines()), f"git {step[0]} failed")
-            print(f"change review: {path} written but not committed: {reason}; the next write commits it",
-                  file=sys.stderr)
+            report_warning(f"change review: {path} written but not committed: {reason}; the next write commits it")
             return
 
 
@@ -1023,21 +1029,6 @@ def _branches_from_units(pairs: Iterable[tuple[Path, staff.StaffRow]],
     return found
 
 
-def _publication_branches(production: Path, record: staff.StaffSnapshot) -> dict[str, UnitSource]:
-    """Resolve live units before retired units, with scoped units first in each group."""
-    pairs = _document_units(_publication_docs(production, record), record)
-    scoped = {pair[1].id for pair in pairs}
-    machine = remote.local_machine()
-    resolver = session_staff.RowResolver(record)
-    for row in record.find(kind="unit"):
-        if row.id in scoped or isinstance(row.worktree, staff.WorktreeUnfilled) or row.worktree.machine != machine:
-            continue
-        doc = resolver.production_doc(row)
-        pairs.append((doc.path if isinstance(doc, session_staff.ProductionDoc) else production, row))
-    pairs.sort(key=lambda pair: isinstance(pair[1].worktree, staff.RemovedWorktree))
-    return _branches_from_units(pairs, record)
-
-
 def _owner_of(commit: Commit, branches: dict[str, UnitSource]) -> Path | None:
     """The production of the unit whose branch the checkpoint names, or None for another commit."""
     found = _CHECKPOINT.match(commit.subject)
@@ -1091,21 +1082,49 @@ def _publication_docs(production: Path, record: staff.StaffSnapshot) -> list[Pat
     return scope_docs(production, below=True, record=record)
 
 
+def checkpoint_producers(record: staff.StaffSnapshot) -> dict[str, tuple[staff.StaffId | UnknownProducer, str]]:
+    """Read each checkpoint's recorded owner once for a publication scan."""
+    recorded: dict[str, tuple[staff.StaffId | UnknownProducer, str]] = {}
+    events, _ = load_events({"checkpoint"}, record=record)
+    for event in events:
+        checkpoint = event.get("checkpoint_commit")
+        if not isinstance(checkpoint, str):
+            continue
+        owner = event.get("owner_staff_id")
+        if isinstance(owner, str) and owner:
+            producer: staff.StaffId | UnknownProducer = staff.StaffId(owner)
+        else:
+            unit = record.unit_by_worktree(remote.local_machine(), Path(str(event.get("working_dir", ""))))
+            producer = unit.id if unit is not None else UNKNOWN_PRODUCER
+        recorded[checkpoint] = producer, str(event.get("unit", ""))
+    return recorded
+
+
 def publication_changes(commits: list[Commit], production: Path, *,
                         record: staff.StaffSnapshot | None = None,
-                        known_producer: staff.StaffId | UnknownProducer = UNKNOWN_PRODUCER) -> list[PublicationChange]:
-    """Resolve the selected review changes, their units, and their producers."""
+                        known_producer: staff.StaffId | UnknownProducer = UNKNOWN_PRODUCER,
+                        recorded_producers: Mapping[str, tuple[staff.StaffId | UnknownProducer, str]] | None = None) -> list[PublicationChange]:
+    """Use checkpoint owners first, then the producer recorded for this merge."""
     record = staff.snapshot() if record is None else record
-    branches = _publication_branches(production, record)
+    recorded = checkpoint_producers(record) if recorded_producers is None else recorded_producers
     machine = remote.local_machine()
+    sources: dict[staff.StaffId, UnitSource] = {}
+    for member in record.find(kind="unit"):
+        tree = member.worktree
+        if isinstance(tree, staff.WorktreeUnfilled) or tree.machine != machine:
+            continue
+        owner = record.parent_of(member)
+        doc = owner.doc.path if owner is not None and isinstance(owner.doc, (staff.LiveDoc, staff.WrappedDoc)) else production
+        sources[member.id] = UnitSource(doc, tree.path if isinstance(tree, staff.PresentWorktree) else MissingUnitWorktree(),
+                                       member.name, member.id)
     changes: list[PublicationChange] = []
     for commit, item in _checkpoint_entries(commits):
-        match = _CHECKPOINT.match(commit.subject)
-        source = branches.get(match["branch"]) if match is not None else None
+        identity, name = recorded.get(commit.sha, (known_producer, ""))
+        if isinstance(identity, UnknownProducer):
+            identity = known_producer
+        source = sources.get(identity) if isinstance(identity, str) else None
         producer = producer_for(source, record, machine) if source is not None else UNKNOWN_PRODUCER
-        if isinstance(known_producer, str) and (source is None or source.producer == known_producer):
-            producer = known_producer
-        name = source.name if source is not None and source.name else match["branch"] if match is not None else ""
+        name = source.name if source is not None else name
         changes.append(PublicationChange(item, source if source is not None else UnresolvedSource(), producer, commit.sha, name))
     return changes
 
@@ -1379,9 +1398,11 @@ def row_merge(cells: dict[str, str]) -> RecordedMerge | MergeNotRecorded:
     return RecordedMerge(text) if text else MergeNotRecorded()
 
 
-def record_verdict(path: Path, row: str, verdict: str, day: date,
-                   production: Path) -> VerdictRecorded | VerdictAlreadyRecorded | VerdictConflict:
-    """Record a verdict once, retaining its merge and the outcome of an earlier write."""
+def record_verdict(
+    path: Path, row: str, verdict: str, day: date, production: Path, *,
+    report_warning: Callable[[str], None] = _print_warning,
+) -> VerdictRecorded | VerdictAlreadyRecorded | VerdictConflict:
+    """Record a verdict once. Retain its merge and the result of an earlier write."""
 
     def write(lines: list[str]) -> VerdictRecorded | VerdictAlreadyRecorded | VerdictConflict:
         columns, first, end = _table(path, lines, SECTION)
@@ -1420,7 +1441,7 @@ def record_verdict(path: Path, row: str, verdict: str, day: date,
                                                    "Merged": cells.get("Merged", "")})])
         return VerdictRecorded(row_merge(cells))
 
-    return _edit(path, production, day, write, lambda _: f"verdict {row}")
+    return _edit(path, production, day, write, lambda _: f"verdict {row}", report_warning=report_warning)
 
 
 def review_rows(path: Path) -> list[dict[str, str]]:
@@ -1485,6 +1506,42 @@ def end_row_scratch(path: Path, row: str) -> list[str]:
         return [f"scratch not removed: {error}"]
 
 
+@dataclass(frozen=True)
+class VerdictSaved:
+    """The output lines for a saved or repeated verdict."""
+
+    lines: list[str]
+    warnings: list[str] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class VerdictRefused:
+    """The output lines and refusal for a conflicting verdict."""
+
+    lines: list[str]
+    reason: str
+    warnings: list[str] = field(default_factory=list)
+
+
+def save_verdict(path: Path, row: str, verdict: str, production: Path) -> VerdictSaved | VerdictRefused:
+    """Save a verdict and remove its scratch folders without printing output."""
+    verdict = _words("verdict", verdict)
+    local_row = _row_id("row", row.rpartition("/")[2])
+    warnings: list[str] = []
+    result = record_verdict(path, local_row, verdict, today(), production, report_warning=warnings.append)
+    lines: list[str] = []
+    if isinstance(result, VerdictConflict):
+        reason = (f'change review: {row} has the verdict "{result.recorded}" from {result.day}; '
+                  + 'this verdict is not recorded')
+        return VerdictRefused(end_row_scratch(path, local_row), reason, warnings)
+    if isinstance(result, VerdictAlreadyRecorded):
+        lines.append(f"{row} already has this verdict ({result.day}); the list is unchanged")
+    merged = result.merged.text if isinstance(result.merged, RecordedMerge) else "not recorded"
+    lines.append(f"{row} landed" if lands(verdict) else f"{row} returns to its unit (merged {merged})")
+    lines.extend(end_row_scratch(path, local_row))
+    return VerdictSaved(lines, warnings)
+
+
 def hold_for_row(path: Path, row: str, folders: list[str]) -> list[str]:
     """Hold each folder the user checks `row` in until the row's verdict; return one line per folder."""
     lines: list[str] = []
@@ -1546,6 +1603,22 @@ class KnownMergeProducer:
     producer: staff.StaffId
 
 
+def record_merge_producer(known: KnownMergeProducer) -> None:
+    """Store the producer supplied by the request when its merge is made."""
+    path = unit_runs.history_root() / "merge_producers" / f"{known.merge}.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    write_text_atomic(path, json.dumps({"producer": known.producer}) + "\n")
+
+
+def merge_producer(merge: str) -> staff.StaffId | UnknownProducer:
+    """Read the producer recorded when this merge was made."""
+    path = unit_runs.history_root() / "merge_producers" / f"{merge}.json"
+    if not path.exists():
+        return UNKNOWN_PRODUCER
+    saved = cast(dict[str, str], json.loads(path.read_text(encoding="utf-8")))
+    return staff.StaffId(saved["producer"])
+
+
 @dataclass(frozen=True)
 class ReadinessScan:
     """Scan published merges for changes that need no further step."""
@@ -1605,6 +1678,7 @@ def list_ready(repo: Path, production: Path, merge_branch: str, *,
     outside_refs = set(reviewed_merge_refs(repo, lambda: outside_docs, record=record))
     rows: list[str] = []
     matched_step = False
+    recorded = checkpoint_producers(record)
     for entry in merges:
         merge, subject = entry.split("\t", 1)
         if any(subject.endswith(f" into {ref.removeprefix('origin/')}") for ref in outside_refs):
@@ -1631,8 +1705,20 @@ def list_ready(repo: Path, production: Path, merge_branch: str, *,
 
         producer = (known_producer.producer
                     if isinstance(known_producer, KnownMergeProducer) and known_producer.merge == merge
-                    else UNKNOWN_PRODUCER)
-        for change in publication_changes(commits, production, record=record, known_producer=producer):
+                    else merge_producer(merge))
+        producers = dict(recorded)
+        ancestry: Mapping[str, tuple[str, ...]] = commits[0].ancestry if commits else {}
+        for inner, parents in reversed(tuple(ancestry.items())):
+            if len(parents) < 2:
+                continue
+            inner_producer = merge_producer(inner)
+            if isinstance(inner_producer, UnknownProducer):
+                continue
+            for checkpoint in _git(repo, "rev-list", parents[1], f"^{parents[0]}", "--").splitlines():
+                if checkpoint not in producers or isinstance(producers[checkpoint][0], UnknownProducer):
+                    producers[checkpoint] = inner_producer, ""
+        for change in publication_changes(commits, production, record=record, known_producer=producer,
+                                          recorded_producers=producers):
             readiness = change.item.readiness
             if isinstance(selection, CompletedStep) and isinstance(readiness, AfterStep) and readiness.step == selection.step:
                 matched_step = True
@@ -1798,20 +1884,14 @@ def _run(options: CommandLine) -> int:
             print(set_row_kind(target.path, target.row, options.kind, production_doc(options.production)))
         case "verdict":
             target = _row_option(options)
-            verdict = _words("verdict", options.verdict)
-            result = record_verdict(target.path, target.row, verdict, today(), production_doc(options.production))
-            row = options.row.strip()
-            if isinstance(result, VerdictConflict):
-                print(f'change review: {row} has the verdict "{result.recorded}" from {result.day}; '
-                      + 'this verdict is not recorded', file=sys.stderr)
-            else:
-                if isinstance(result, VerdictAlreadyRecorded):
-                    print(f"{row} already has this verdict ({result.day}); the list is unchanged")
-                merged = result.merged.text if isinstance(result.merged, RecordedMerge) else "not recorded"
-                print(f"{row} landed" if lands(verdict) else f"{row} returns to its unit (merged {merged})")
-            for line in end_row_scratch(target.path, target.row):
+            result = save_verdict(target.path, options.row.strip(), options.verdict, production_doc(options.production))
+            for warning in result.warnings:
+                print(warning, file=sys.stderr)
+            if isinstance(result, VerdictRefused):
+                print(result.reason, file=sys.stderr)
+            for line in result.lines:
                 print(line)
-            if isinstance(result, VerdictConflict):
+            if isinstance(result, VerdictRefused):
                 return 1
         case "list-path":
             print(production_list(options.production))

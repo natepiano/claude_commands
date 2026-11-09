@@ -1,4 +1,4 @@
-"""Real page publishing, HTTP forms, verdict subprocesses and checkpoint routing."""
+"""Test page publication, HTTP forms, verdict calls and checkpoint routing."""
 from __future__ import annotations
 
 import fcntl
@@ -348,22 +348,6 @@ class ChangePageTests(unittest.TestCase):
             date(2026, 11, 1), merged, self.production, producers=[self.unit.id] * 3, record=staff.snapshot())
         for row, kind in (("C1", "See in action"), ("C2", "See in action"), ("C3", "Read only")):
             _ = change_review.set_row_kind(self.review_list, row, kind, self.production)
-        run_process = cast(Callable[..., subprocess.CompletedProcess[str]], subprocess.run)
-        entries = {str(module.__file__): (module, main) for module, main in
-                   ((change_review, change_review.main), (feature_log, feature_log.main))}
-
-        def run(command: list[str], **options: object) -> subprocess.CompletedProcess[str]:
-            # invoke_cli changes process state, so a call from an HTTP worker thread keeps its real process.
-            if (process_boundary_for_case(self) or threading.current_thread() is not threading.main_thread()
-                    or len(command) < 2 or command[1] not in entries):
-                return run_process(command, **options)
-            module, main = entries[command[1]]
-            result = self.command(module, main, command[2:])
-            if options.get("check"):
-                result.check_returncode()
-            return result
-
-        _ = self.enterContext(patch.object(subprocess, "run", side_effect=run))
         self.page_path = urlsplit(change_page.publish(self.production, self.review_list, ["C1", "C3"])).path
         self.page = change_page.page_at(self.root, self.page_path)
         self.messages = []
@@ -415,7 +399,6 @@ class ChangePageTests(unittest.TestCase):
                         "Send question again", "Send validation request again", "data-resend", 'value="retry"'):
             self.assertNotIn(removed, content)
 
-    @process_boundary
     def test_recovery_does_not_erase_a_live_request_before_its_verdict_saves(self) -> None:
         status = change_page.DeliveryStatus(self.root)
         began, release = threading.Event(), threading.Event()
@@ -1381,15 +1364,19 @@ class ChangePageTests(unittest.TestCase):
         self.assert_no_delivery_controls(landed)
 
     def test_a_failed_browser_save_returns_plain_words_and_accepts_the_same_typed_answer_again(self) -> None:
+        _ = self.git("remote", "add", "origin", "https://github.com/natepiano/claude_commands.git")
         path, forms, body = self.browser()
         del body
         fields = self.browser_fields(forms, "page-owner/C1", "not works", "Keep <my> words & outcome")
-        with patch.object(change_page, "close_feature_log", side_effect=RuntimeError("bad proposal /private/file.json")):
-            failed = self.http_request(path, fields)
-        self.assertEqual(failed.status, 503)
-        self.assertEqual(json.loads(failed.body), {"reason": "The feature log could not be updated."})
-        self.assertNotIn("/private/", failed.body)
-        self.assertEqual(len(change_review.pending(self.review_list)), 3)
+        for refusal in ("bad proposal /private/file.json", "feature_log: bad proposal /private/file.json"):
+            with (self.subTest(refusal=refusal),
+                  patch.object(feature_log, "drop_review", side_effect=feature_log.FeatureLogError(refusal))):
+                failed = self.http_request(path, fields)
+                self.assertEqual(failed.status, 503)
+                self.assertEqual(json.loads(failed.body), {"reason": "The feature log could not be updated."})
+                self.assertNotIn("/private/", failed.body)
+                self.assertEqual(len(change_review.pending(self.review_list)), 3)
+                self.assertEqual(self.messages[-1][2].splitlines()[1], "feature_log: bad proposal /private/file.json")
         self.delivery_done.clear()
         saved = self.http_request(path, fields)
         self.assertEqual(saved.status, 200)
@@ -2149,19 +2136,20 @@ class ChangePageTests(unittest.TestCase):
         path = feature_log.state_dir() / "proposals" / f"{review}.json"
         return cast(dict[str, object], json.loads(path.read_text(encoding="utf-8")))
 
-    @process_boundary
     def test_a_feature_log_project_saves_when_the_writer_skips_an_absent_proposal(self) -> None:
         _ = self.git("remote", "add", "origin", "https://github.com/natepiano/claude_commands.git")
-        with patch.object(subprocess, "run", wraps=subprocess.run) as commands:
+        with (patch.object(subprocess, "run", wraps=subprocess.run) as commands,
+              patch.object(feature_log, "project_of", wraps=feature_log.project_of) as project,
+              patch.object(feature_log, "land_review", wraps=feature_log.land_review) as land,
+              patch.object(change_review, "save_verdict", wraps=change_review.save_verdict) as save):
             reply = self.request(self.page_path, self.answer())
         self.assertEqual((reply.status, reply.location), (303, self.page_path))
         invocations = [cast(list[str], call.args[0]) for call in commands.call_args_list]
-        self.assertEqual([args[2] for args in invocations], ["project-of", "add", "verdict"])
-        self.assertEqual(invocations[1], [str(Path(change_page.__file__).resolve().parents[1] / "lib/py"), feature_log.__file__, "add", "--review",
-                                          "page-owner/C1", "--if-proposed"])
-        self.assertEqual(invocations[2],
-                         [str(Path(change_page.__file__).resolve().parents[1] / "lib/py"), str(Path(change_review.__file__)), "verdict", "--production",
-                          "page-owner", "--list", str(self.review_list), "--row", "C1", "--verdict=works"])
+        self.assertTrue(invocations)
+        self.assertTrue(all(args[0] == "git" for args in invocations), invocations)
+        project.assert_called_once_with(str(self.repo))
+        land.assert_called_once_with("page-owner/C1", if_proposed=True)
+        save.assert_called_once_with(self.review_list, "C1", "works", self.production)
         saved = next(row for row in change_review.review_rows(self.review_list) if row["#"] == "C1")
         self.assertEqual(saved["Verdict"], "works")
         self.assertEqual([row["#"] for row in change_review.pending(self.review_list)], ["C2", "C3"])
@@ -2496,18 +2484,16 @@ class ChangePageTests(unittest.TestCase):
         self.assertTrue(status.path(self.page, "C1").exists())
         self.assertEqual(self.request("/" + status.path(self.page, "C1").name, {}).status, 404)
 
-    @process_boundary
     def test_an_interruption_after_the_verdict_preserves_a_pending_message_for_server_recovery(self) -> None:
-        run = subprocess.run
+        save = change_review.save_verdict
 
-        def interrupt_after_verdict(arguments: list[str], **options: object) -> subprocess.CompletedProcess[str]:
-            del options
-            result = run(arguments, capture_output=True, text=True, check=False)
-            if arguments[2] == "verdict" and result.returncode == 0:
+        def interrupt_after_verdict(path: Path, row: str, verdict: str, production: Path) -> change_review.VerdictSaved | change_review.VerdictRefused:
+            result = save(path, row, verdict, production)
+            if isinstance(result, change_review.VerdictSaved):
                 raise RuntimeError("interrupted after verdict")
             return result
 
-        with patch.object(subprocess, "run", side_effect=interrupt_after_verdict):
+        with patch.object(change_review, "save_verdict", side_effect=interrupt_after_verdict):
             reply = self.request(self.page_path, self.answer(feedback="Clear numbers"))
         self.assertEqual(reply.status, 503)
         self.assertEqual(self.messages, [])
@@ -2527,23 +2513,22 @@ class ChangePageTests(unittest.TestCase):
         self.assertEqual(self.messages, [])
         self.assertNotIn("Saved:", reply.body)
 
-    @process_boundary
     def test_a_failed_or_interrupted_verdict_write_preserves_validation_ownership_and_feedback(self) -> None:
         status = change_page.DeliveryStatus(self.root)
         self.assertEqual(self.request(self.page_path, self.answer(outcome="validate", feedback="Keep these words")).status, 303)
         validation = status.slots(self.page, "C1").validation
         before = self.review_list.read_bytes()
-        run = subprocess.run
-        for interruption in (False, True):
-            with self.subTest(interruption=interruption):
-                def fail_verdict(arguments: list[str], **options: object) -> subprocess.CompletedProcess[str]:
-                    del options
-                    if arguments[2] == "verdict":
-                        if interruption:
-                            raise RuntimeError("interrupted before verdict")
-                        return subprocess.CompletedProcess(arguments, 1, "", "verdict write failed")
-                    return run(arguments, capture_output=True, text=True, check=False)
-                with patch.object(subprocess, "run", side_effect=fail_verdict):
+        for failure in (change_review.VerdictRefused([], "verdict write failed"),
+                        change_review.ChangeReviewError("verdict write failed"), OSError("verdict write failed"),
+                        RuntimeError("interrupted before verdict")):
+            interruption = isinstance(failure, RuntimeError)
+            with self.subTest(failure=failure):
+                def fail_verdict(path: Path, row: str, verdict: str, production: Path) -> change_review.VerdictRefused:
+                    del path, row, verdict, production
+                    if isinstance(failure, Exception):
+                        raise failure
+                    return failure
+                with patch.object(change_review, "save_verdict", side_effect=fail_verdict):
                     reply = self.request(self.page_path, self.answer(feedback="New answer"))
                 self.assertEqual(reply.status, 503 if interruption else 400)
                 self.assertEqual(self.review_list.read_bytes(), before)
@@ -2557,26 +2542,23 @@ class ChangePageTests(unittest.TestCase):
                 self.assertNotIn("Saved:", body)
                 self.assert_no_delivery_controls(body)
 
-    @process_boundary
     def test_an_interruption_after_saving_selects_the_verdict_slot_and_keeps_validation_feedback(self) -> None:
         words = "Check the small text"
         with patch.object(change_page, "send_message", side_effect=RuntimeError("socket unavailable")):
             self.assertEqual(self.request(self.page_path, self.answer(outcome="validate", feedback=words)).status, 303)
         status = change_page.DeliveryStatus(self.root)
         validation = status.slots(self.page, "C1").validation
-        run = subprocess.run
+        save = change_review.save_verdict
 
-        def interrupt_after_save(arguments: list[str], **options: object) -> subprocess.CompletedProcess[str]:
-            del options
-            if arguments[2] == "verdict":
-                self.assertEqual(status.slots(self.page, "C1").validation, validation)
-                self.assertIsInstance(status.slots(self.page, "C1").verdict, change_page.DeliveryIntent)
-            result = run(arguments, capture_output=True, text=True, check=False)
-            if arguments[2] == "verdict" and result.returncode == 0:
+        def interrupt_after_save(path: Path, row: str, verdict: str, production: Path) -> change_review.VerdictSaved | change_review.VerdictRefused:
+            self.assertEqual(status.slots(self.page, "C1").validation, validation)
+            self.assertIsInstance(status.slots(self.page, "C1").verdict, change_page.DeliveryIntent)
+            result = save(path, row, verdict, production)
+            if isinstance(result, change_review.VerdictSaved):
                 raise RuntimeError("interrupted after verdict")
             return result
 
-        with patch.object(subprocess, "run", side_effect=interrupt_after_save):
+        with patch.object(change_review, "save_verdict", side_effect=interrupt_after_save):
             self.assertEqual(self.request(self.page_path, self.answer()).status, 503)
         slots = status.slots(self.page, "C1")
         self.assertEqual(slots.validation, validation)
