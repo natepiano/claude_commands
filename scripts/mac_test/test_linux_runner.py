@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
-from contextlib import chdir, nullcontext, redirect_stderr, redirect_stdout
+from contextlib import nullcontext, redirect_stderr, redirect_stdout
 from dataclasses import replace
 import io
 import hashlib
@@ -24,7 +24,6 @@ from scripts.copies.copies_test_support import copies_environment
 from scripts.aws_target.runner_test_support import interrupt_runner, seed_runner_permission
 from scripts.mac_test import linux_runner, mac_test, offload, test_target_slots
 from scripts.mac_test.offload_test_support import mirror_use_payload
-from scripts.lint import sweep
 from scripts.lint.memory_test_support import write_config_fixture
 
 
@@ -150,6 +149,7 @@ class LinuxShellTests(unittest.TestCase):
         self.source = self.root / "rust/phase-copy"
         self.source.mkdir(parents=True)
         self.settings = self.root / "aws.conf"
+        _ = write_config_fixture(self.root / "mac_test.conf", template="mac_test")
         _ = write_config_fixture(self.settings,
             "offload=on\nhost=fake-linux\nkinds=test,check,doc\nslots=2\n"
             + "free_floor_gib=10\nbuild_budget_gib=32\ntarget_budget_gib=24\n"
@@ -238,31 +238,12 @@ class LinuxShellTests(unittest.TestCase):
         output, errors = io.StringIO(), io.StringIO()
         free = int(self.environment.get("FAKE_FREE_GIB", "100")) * 1024 ** 3
         real_run = subprocess.run
-        real_uses = sweep.process_uses
-        proc = self.root / "proc"
-        proc.mkdir(exist_ok=True)
-
-        def private_uses(targets: Sequence[str]) -> dict[str, sweep.TargetUse]:
-            return real_uses(targets, str(proc))
-
         def child(argv: list[str], *, cwd: Path | str = "", check: bool = False,
                   capture_output: bool = False, text: bool = False, timeout: float = 5,
                   env: dict[str, str] | None = None, pass_fds: tuple[int, ...] = ()) -> subprocess.CompletedProcess[str]:
             _ = text
-            if argv[:2] == [sys.executable, "-c"] and "sweep.sweep_workspace" in argv[2]:
-                if not self.use_real_sweep:
-                    return subprocess.CompletedProcess(argv, 0, "", "")
-                with chdir(os.getcwd()), mock.patch.dict(os.environ, env or {}), \
-                        mock.patch.object(sys, "argv", ["-c", argv[3]]), \
-                        mock.patch.object(sweep, "process_uses", side_effect=private_uses), \
-                        mock.patch.object(time, "time", return_value=1_793_570_400.0):
-                    try:
-                        exec(argv[2], {"__name__": "__main__"})
-                    except SystemExit as stopped:
-                        status = stopped.code if isinstance(stopped.code, int) else 1
-                    else:
-                        status = 0
-                return subprocess.CompletedProcess(argv, status, "", "")
+            if len(argv) > 2 and argv[1] == "-c" and "sweep.sweep_workspace" in argv[2] and not self.use_real_sweep:
+                return subprocess.CompletedProcess(argv, 0, "", "")
             completed = real_run(argv, cwd=cwd or self.root, check=check, capture_output=True,
                                  text=True, timeout=timeout, env=env, pass_fds=pass_fds)
             if not capture_output:
@@ -1661,6 +1642,7 @@ class LinuxCopyTests(unittest.TestCase):
         _ = self.git("config", "user.email", "fixture@example.invalid")
         registry = self.root / "build_targets.conf"
         _ = registry.write_text("targets=aws\nkind.aws=ssh\nplatform.aws=linux\nsettings.aws=aws.conf\n")
+        _ = write_config_fixture(self.root / "mac_test.conf", template="mac_test")
         _ = write_config_fixture(self.root / "aws.conf", "host=fake-linux\noffload=on\n", template="mac_test")
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
             "BUILD_TARGETS_CONFIG": str(registry), "CONF_DIR": str(self.root),

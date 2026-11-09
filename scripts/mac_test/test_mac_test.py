@@ -1145,7 +1145,7 @@ class MacTestCommandTests(NotificationGuardedTestCase):
         self.assertFalse((self.state_directory / "run.json").exists())
 
     def repository(self, name: str) -> Path:
-        """A folder that sweep.repo_name reads as the named repository."""
+        """A folder that repository.repo_name reads as the named repository."""
         directory = self.root / "repositories" / name
         (directory / ".git").mkdir(parents=True)
         return directory
@@ -1218,6 +1218,17 @@ class MacTestCommandTests(NotificationGuardedTestCase):
         hana, liner = self.repository("hana"), self.repository("cargo-liner")
         (hana / "crates").mkdir()
         self.write_config(offload="on")
+        path = self.state_directory / "mirror-busy-hana.until"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        for value, answer in ((str(time.time() + 120), "busy"), (str(time.time() - 1), "free"),
+                              ("nan", "free"), ("invalid", "free")):
+            with self.subTest(backoff=value):
+                _ = path.write_text(value)
+                self.assert_command(self.command("free-now", "--repo-root", str(hana)),
+                                    1 if answer == "busy" else 0, answer + "\n")
+                self.assert_command(self.command("free-now", "--repo-root", str(liner)), 0, "free\n")
+        path.unlink()
+        self.assertEqual(self.logged_arguments("ssh"), [])
         owner = self.start_child()
         self.assert_command(self.claim_in(owner.pid, "hana tests", hana), 0, "claimed\n")
         self.assert_command(self.command("free-now", "--repo-root", str(liner)), 0, "free\n")

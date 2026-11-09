@@ -163,7 +163,12 @@ reason this run stopped, or coordination not active]
 Apply <UserFacingText/> and <RetainPhaseReservation/> for every ending
 that did not complete <CheckpointCommit/>. Then run `progress_history.py finish-run` with
 `completed`, `stopped`, or `error`; it closes active pass/phase as incomplete
-when needed. Finally run `bash ~/.claude/scripts/direct/end_session.sh` on
-every exit so the Stop hook cannot revive a finished run. Then run
+when needed. Run this command on every exit, without a pipe:
+
+```sh
+bash ~/.claude/scripts/direct/end_session.sh
+```
+
+Report a non-zero exit and the failed step. Then run
 <ReviewPendingAddOns/>; the summary and its commits never wait on it.
 </RunSummary>
