@@ -21,10 +21,9 @@ from pathlib import Path
 import subprocess
 import sys
 from typing import Literal, cast, final
-from uuid import UUID
 
 from scripts.agents import detached_runs, worker_lifecycle
-from scripts.accounts import accounts, role_map
+from scripts.accounts import accounts
 from scripts.direct import progress_history
 from scripts.herdr import worker_panes
 from scripts.usage import rollouts
@@ -33,7 +32,6 @@ from scripts.lib.resume_message import BusyPass, IdleWorker, NoOwnPass, NO_OWN_P
 from scripts.lib.resume_message import UnsubmittedAssignment as UnsubmittedAssignment
 from scripts.lib.script_envelope import script_prompt
 from scripts.production import session_staff, staff, worker_admission
-from scripts.shutdown import member_account
 
 from scripts.herdr import herdr
 
@@ -280,7 +278,7 @@ def startup_result(name: WorkerName, result: worker_panes.WorkerStart) -> ExitCo
     if isinstance(result, worker_panes.IncompleteStart):
         print(f"{name.value}: incomplete startup: {result.reason}", file=sys.stderr)
     elif isinstance(result, worker_panes.UnpublishedWorker):
-        print(f"{name.value}: publication failed: {result.cause}; pane {result.pane} retained", file=sys.stderr)
+        print(f"{name.value}: publication failed: {result.cause}; {worker_panes.unpublished_cleanup_text(result)}", file=sys.stderr)
     # The shared scan already reports unknown and structural evidence.
     return ExitCode.UNCERTAIN
 
@@ -574,18 +572,17 @@ def answer(parent: StaffId, name: WorkerName, text: str) -> ExitCode:
 
 
 def end(parent: StaffId, name: WorkerName, *,
-        run: worker_panes.DispatchRun | worker_panes.HolderRun = worker_panes.HolderRun.CURRENT,
         lock: worker_panes.WorkerLockHold | worker_panes.WorkerLockAtUse = worker_panes.WorkerLockAtUse.ACQUIRE,
-        interrupt: bool = False, retire: bool = True) -> ExitCode:
+        retire: bool = True) -> ExitCode:
     with ExitStack() as operations:
-        hold = operations.enter_context(worker_panes.worker_lock(parent, name)) if isinstance(lock, worker_panes.WorkerLockAtUse) else lock
+        hold = operations.enter_context(worker_panes.worker_lock(parent, name, blocking=True)) if isinstance(lock, worker_panes.WorkerLockAtUse) else lock
         if isinstance(hold, worker_panes.Kept):
             print(hold.blocker, file=sys.stderr)
             return ExitCode.KEPT
         row = worker_admission.find_worker(staff.snapshot(), parent, name.value)
         if row is None:
             return ExitCode.OK
-        result = worker_panes.close(parent, name, run=run, lock=hold, interrupt=interrupt)
+        result = worker_panes.close(parent, name, lock=hold)
         if isinstance(result, worker_panes.Kept):
             print(result.blocker, file=sys.stderr)
             return ExitCode.KEPT
@@ -778,21 +775,14 @@ def restore(parent: StaffId, *, record: staff.StaffSnapshot | None = None,
     return outcome
 
 
-@dataclass(frozen=True)
-class WorkerAccountUnavailable:
-    reason: str
-
-
-def _worker_list_row(row: staff.StaffRow, role: WorkerRole | worker_panes.WorkerRoleUnavailable,
-                     account: accounts.AccountSelection | WorkerAccountUnavailable,
-                     facts: dict[str, object]) -> dict[str, object]:
+def _worker_list_row(row: staff.StaffRow, facts: dict[str, object]) -> dict[str, object]:
     fields: dict[str, object] = {"name": row.name, "id": str(row.id), "current_session": str(row.current_session), **facts}
-    fields["role"] = role if isinstance(role, str) else {"state": "WorkerRoleUnavailable", "reason": role.reason}
-    if isinstance(account, WorkerAccountUnavailable):
-        fields["account"] = {"state": "AccountUnavailable", "reason": account.reason}
+    fields["role"] = (row.role.value if isinstance(row.role, staff.KnownWorkerRole)
+                      else {"state": "WorkerRoleUnavailable", "reason": "dispatch role is unavailable"})
+    if isinstance(row.home, staff.HomeUnknown):
+        fields["account"] = {"state": "AccountUnavailable", "reason": "worker home is unavailable"}
     else:
-        home = account.home if isinstance(account, accounts.CodexWorkersAccount) else account.dir
-        fields.update(account=account.label, home=str(home.absolute()))
+        fields.update(account=accounts.claude_config_label(row.home.path), home=str(row.home.path))
     return fields
 
 
@@ -926,45 +916,8 @@ def _recorded_worker_dispatches(record: staff.StaffSnapshot) -> dict[StaffId, Wo
     return found
 
 
-def _stored_unit_account(configured: role_map.RoleMap) -> str:
-    selection = configured.groups.get("units", "")
-    label = selection["label"] if isinstance(selection, dict) else selection
-    evidence, stamp, login = label, "", ""
-    if label in ("default", "~/.claude"):
-        try:
-            for line in accounts.roles_history_file().read_text(encoding="utf-8").splitlines():
-                value = cast(object, json.loads(line))
-                if not isinstance(value, dict):
-                    continue
-                row = cast(dict[str, object], value)
-                if row.get("group") != "units" and row.get("role") != "unit":
-                    continue
-                evidence, stamp, login = label, "", ""
-                if row.get("label") == label:
-                    recorded = row.get("account_label", label)
-                    evidence = recorded if isinstance(recorded, str) and recorded.startswith("claude") else label
-                    at, held_login = row.get("at"), row.get("login")
-                    stamp = at if isinstance(at, str) else ""
-                    login = held_login if isinstance(held_login, str) else ""
-        except (OSError, ValueError):
-            pass
-    resolved = accounts.resolve_history_label(evidence, stamp, login=login)
-    return resolved.label if isinstance(resolved, accounts.ResolvedHistoryLabel) else ""
-
-
 def list_all_workers(record: staff.StaffSnapshot) -> list[dict[str, object]]:
     dispatches = _recorded_worker_dispatches(record)
-    with role_map.stored_role_map():
-        configured = accounts.read_role_map()
-        claude = _stored_unit_account(configured)
-    labels = {"claude": claude, "codex": configured.workers}
-    selections: dict[str, accounts.AccountSelection | WorkerAccountUnavailable] = {}
-    for family, label in labels.items():
-        try:
-            selections[family] = (accounts.CodexWorkersAccount(label, accounts.codex_setup_home(label)) if family == "codex"
-                                  else accounts.NamedAccount(label, accounts.account_dir(label)))
-        except ValueError as error:
-            selections[family] = WorkerAccountUnavailable(str(error))
     listing: list[dict[str, object]] = []
     for row in record.find(kind="worker"):
         parent = record.parent_of(row)
@@ -979,34 +932,47 @@ def list_all_workers(record: staff.StaffSnapshot) -> list[dict[str, object]]:
         elif isinstance(row.paused, staff.Paused):
             status = "paused"
         work = "busy" if status == "active" else "idle" if status in ("completed", "error", "canceled", "interrupted", "paused", "exited") else "unknown"
-        role = fields.get("kind")
-        role = role if isinstance(role, str) and role in staff.WORKER_ROLES else worker_panes.WorkerRoleUnavailable("dispatch role is unavailable")
-        agent = fields.get("called_agent", {})
-        family = cast(dict[str, object], agent).get("family") if isinstance(agent, dict) else ""
-        if family not in ("claude", "codex"):
-            family = {4: "claude", 7: "codex"}.get(UUID(row.current_session).version or 0, "")
-        account = selections.get(str(family), WorkerAccountUnavailable("worker backend is unavailable"))
-        listing.append(_worker_list_row(row, role, account, {"manager": parent.name, "state": status, "work": work,
+        if status == "active":
+            try:
+                dispatch = worker_panes.worker_dispatch_state(row, worker_panes.worker_run(row, record=record))
+                if isinstance(dispatch, worker_panes.ReleasedWorkerPass):
+                    status, work = dispatch.value, "idle"
+                elif isinstance(dispatch, worker_panes.CompletedWorkerPass):
+                    status, work = "completed", "idle"
+            except (OSError, ValueError) as error:
+                print(f"anomaly: {row.name}: {' '.join(str(error).splitlines())}", file=sys.stderr)
+        listing.append(_worker_list_row(row, {"manager": parent.name, "state": status, "work": work,
             "activity": fields.get("activity") or status}))
     return listing
 
 
-def list_workers(parent: StaffId, record: staff.StaffSnapshot) -> list[dict[str, object]]:
+def _worker_pane_state(state: worker_panes.WorkerPane) -> tuple[str, str]:
+    if isinstance(state, worker_panes.OpenWorker):
+        if isinstance(state.row.paused, staff.Paused):
+            return "open", "paused"
+        if isinstance(state.row.exited, staff.Exited):
+            return "open", "exited"
+        return "open", worker_panes.worker_state(state)
+    if isinstance(state, worker_panes.StoppedWorker):
+        return "open", "exited"
+    if isinstance(state, worker_panes.ClosedWorker):
+        return "closed", "-"
+    return "unknown", "-"
+
+
+def list_workers(parent: StaffId, record: staff.StaffSnapshot, *, as_json: bool = True) -> list[dict[str, object]]:
     listing: list[dict[str, object]] = []
     observed = _read_workers(next(row for row in record.rows if row.id == parent), record)
     with progress_history.dispatch_reads(record, observed.runs):
         for state in observed.states:
-            role = worker_panes.dispatch_role(state.row)
             facts: dict[str, object] = {"state": type(state).__name__, "work": worker_panes.worker_state(state)}
-            backend = record.backends.get(state.row.id, staff.BACKEND_UNAVAILABLE)
-            account = (member_account.resume_account("codex" if isinstance(backend, staff.CodexBackend) else "claude", state.row)
-                       if isinstance(backend, (staff.CodexBackend, staff.ClaudeBackend))
-                       else WorkerAccountUnavailable("worker backend is unavailable"))
-            fields = _worker_list_row(state.row, role, account, facts)
+            fields = _worker_list_row(state.row, facts)
             if isinstance(state, worker_panes.OpenWorker):
                 fields["activity"] = state.status.value
             if isinstance(state, (worker_panes.ProcessUnknownWorker, worker_panes.UncertainWorker)):
                 fields["reason"] = state.reason
+            if not as_json:
+                fields["pane"], fields["state"] = _worker_pane_state(state)
             listing.append(fields)
     return listing
 
@@ -1017,7 +983,15 @@ def _print_workers(listing: list[dict[str, object]], as_json: bool) -> ExitCode:
     else:
         width = len(str(len(listing)))
         for number, fields in enumerate(listing, 1):
-            print(f"{number:>{width}} {fields['name']} {fields['role']} {fields['state']} {fields.get('activity', '')} {fields.get('reason', '')}".rstrip())
+            role = fields["role"] if isinstance(fields.get("role"), str) else "role unknown"
+            account = fields["account"] if isinstance(fields.get("account"), str) else "account unknown"
+            pane = fields.get("pane", "-")
+            state = fields["state"]
+            if pane == "-":
+                state = state if state in ("paused", "exited") else "busy" if state == "active" else "idle"
+            elif pane != "open":
+                account = "-"
+            print(f"{number:>{width}} {fields['name']} {role} {account} {pane} {state} {fields.get('reason', '')}".rstrip())
     return ExitCode.OK
 
 
@@ -1096,7 +1070,7 @@ def main(arguments: list[str] | None = None) -> int:
             print("staff: caller: not opened: caller is not a unit or showrunner", file=sys.stderr)
             return ExitCode.REFUSED
         if args.command == "list":
-            return _print_workers(list_workers(owner.id, record), args.json)
+            return _print_workers(list_workers(owner.id, record, as_json=args.json), args.json)
         if args.command == "check":
             observed = _read_workers(owner, record)
             with progress_history.dispatch_reads(record, observed.runs):
@@ -1112,8 +1086,7 @@ def main(arguments: list[str] | None = None) -> int:
         if args.command == "answer":
             code = answer(owner.id, WorkerName.parse(args.name), args.text)
         elif args.command == "end":
-            code = end(owner.id, WorkerName.parse(args.name),
-                run=worker_panes.DispatchRun(Path(args.session_dir)) if args.session_dir else worker_panes.HolderRun.CURRENT)
+            code = end(owner.id, WorkerName.parse(args.name))
         elif args.command == "add":
             result = add(owner.id, cast(WorkerRole, args.role), name=args.name)
             if args.json and isinstance(result, worker_panes.OpenWorker):

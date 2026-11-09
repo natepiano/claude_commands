@@ -608,7 +608,8 @@ def dispatch_turn(design: HeldDesign, role: Role, prompt: Path, reply: Path) -> 
         if phase not in recorder_state.open_phase_ids(state):
             _recorder_command(['start-phase', '--session-dir', str(run), '--phase-id', phase,
                                '--phase-title', 'Held Astra review'])
-    name = _instance(design, role).name
+    instance = _instance(design, role)
+    name = instance.name
     parent = worker_parent(design, role, staff.snapshot())
     result = _assign_command(['--role', 'review' if role == 'reviewer' else 'implement',
         '--target', 'durable-design-role', '--policy', 'astra-' + role,
