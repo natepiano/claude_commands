@@ -2081,43 +2081,26 @@ A changed `config/<name>.conf` selects every test module whose transitive import
 - `invoke_cli` restores signal handlers and changes the process cwd, environment and streams. Call it only for sequential calls on the main thread.
 
 ### Phase 105 — The change page tests use half their CPU  · status: done
-**Depends on:** none
 
-#### Work Order
+#### As-built
 
-**Source:** next items, items 2 and 6a. On 2026-11-09 05:26 EST (`show.py top`), `review_links/test_change_page.py` is the top eligible module: 41.4 CPU s per gate, 139 tests. `style/test_bulk_run.py` ranks first at 41.9, but its profile measured 22.5 CPU s, below the 30 CPU s stop line. The profile on a copy of `f04341475` (`module_cost.py --tests 10 --commands 10`) measured 30.7 CPU s, 3040 processes and 33.6 wall s for the change page module. The removable fixture cost is in child Python starts: `change_review.py` 61 starts and 13.3 CPU s, `change_page.py` 13 starts and 8.0 CPU s, `feature_log.py` 88 starts and 4.0 CPU s, `git` 2877 starts and 1.8 CPU s. The slowest tests are the two answer-question tests (2.5 CPU s each).
-
-**Goal:** `scripts/review_links/test_change_page.py` uses half its current CPU, or a measured floor shows why it cannot, with every checked behavior kept.
-
-**Spec:**
-1. Follow the Speed method. Measure CPU with `module_cost.py --tests 10 --commands 10` first. Name each test's CPU, and each real process that it starts.
-2. Find what starts each `change_review.py` process: `change_page.py` production code or the test. Run it in process through `scripts/production/cli_fixture.py` `invoke_cli` where the test does not assert on the process boundary, as Phase 103 did for `phase_table.py` with a `subprocess.run` side effect that routes only that command.
-3. Run the test's own `change_page.py` and `feature_log.py` command calls in process through `invoke_cli`. Keep a real process for each behavior that only a process proves: an interrupt between steps, an exit code across a process, any cwd or environment that the entry reads at start.
-4. Share expensive setup: build a seed Git repository once and copy it for each test, where tests make the same repository.
-5. Write a behavior map with a row for each assertion before you change a test. Group rows by test class and helper where the assertions are the same.
-6. Do not change `scripts/review_links/change_page.py`, `scripts/production/change_review.py`, `scripts/feature_log/feature_log.py` or other production files. sdlc owns them. If only a production change can cut a cost, write the floor and send the director an architecture proposal with its measured gain.
-7. Add no guard, refusal or check (user rule, 2026-11-05).
+- `test_change_page.py` builds one seed Git repository and copies it for each test.
+- setUp patches `subprocess.run` with a `run` side effect. A main-thread call of a test-owned CLI entry runs in process through `invoke_cli`. A call from any other thread, from a `@process_boundary` case, or for another command runs through the real process.
+- `serve.py` answers HTTP calls on worker threads, so CLI calls made inside an HTTP request keep their real `change_page.py`, `change_review.py` and `feature_log.py` processes.
+- 7 `@process_boundary` tests keep a real process. All 139 tests and 829 assertions are kept.
+- `module_cost` on a copy of `befc1a04a`: 30.7 -> 25.7 CPU s; processes 3040 -> 1001. `change_review.py` keeps 55 starts and 13.4 CPU s from HTTP-thread calls.
+- Same-load pairs against `befc1a04a`: `/tmp` with a warm bytecode cache 23.5 -> 17.7 CPU s (24.6% less); `/dev/shm` with no bytecode writes 36.9 -> 18.0 CPU s (51.2% less).
 
 **Files:**
-- `scripts/review_links/test_change_page.py`
+- `scripts/review_links/test_change_page.py` — change page tests; seed repository copy and main-thread in-process CLI calls
+- `docs/plans/builds-natest-next.md` — Floors row for the change page tests
 
-**Workers:** 1 writer; one test file
-- `impl` — `test_change_page.py`
+**Gotchas:**
+- `invoke_cli` changes process state. Use it only on the main thread; a call from an HTTP worker thread keeps a real process.
+- The warm-cache floor is `change_page.py` starting `change_review.py` and `feature_log.py` as child processes. An in-process call in production removes about 10 CPU s; sdlc owns that change.
 
-**Constraints from prior phases:**
-- Phase 89, Phase 97, Phase 100 and Phase 103: an in-process call of a real entry through `invoke_cli` cut CPU and kept the code path. Tests that assert on a process boundary kept a real process.
-- Phase 103: a process start costs more with no bytecode writes, so start cuts gain more there. Report pairs with no bytecode writes and on `/tmp` with a warm bytecode cache.
-- Phase 104 is complete: the fake aws and ssh tools of `scripts/aws_target/test_box.py` run in process through `invoke_cli`. Keep its files and `scripts/production/cli_fixture.py` outside this phase's edits.
-- `invoke_cli` restores signal handlers (`cli_fixture.py:133`), and Python allows that only on the main thread. It also changes the process cwd, environment and streams. `serve.py` answers HTTP verdict calls on worker threads (`ThreadingHTTPServer`). Call `invoke_cli` only for sequential calls on the main thread, and keep a real process for each call made from an HTTP worker thread or beside another request. A change to the shared helper goes to the director as a proposal.
-- Tests never read or write live state: `~/.claude` main, `~/.local/state/merge-gate`, `/tmp/claude`. State the filesystem basis of each pair.
-
-**Acceptance gate:**
-- The behavior map has a row for each assertion. No assertion is removed.
-- CPU s, processes, execs and wall s before and after, from `module_cost.py` and same-load pairs, in the checkpoint notice.
-- The changed file passes, and every module that imports a changed helper passes.
-- the targeted test green on the phase commit merged with `origin/builds`
-- `basedpyright` on the changed files prints `0 errors, 0 warnings, 0 notes`
-- Floors: a floor claim adds a row to the next-items Floors table with its revision, roots, cache state, limiting operation, owner and revisit condition.
+**Ruled out:**
+- Queueing HTTP worker-thread CLI calls onto the main thread: it removes the process boundary that the HTTP path needs.
 
 ### Phase 106 — The memory admission tests use half their CPU  · status: todo
 **Depends on:** none
