@@ -1,12 +1,14 @@
 # Stall watch and pane workers
 
-> **Status: IMPLEMENTATION PLAN — phased, direct-ready.** Stall watch does not bump a unit director while one of its pane workers is busy.
+> **Status: IMPLEMENTATION PLAN — phased, direct-ready.** Stall watch does not bump a unit director while one of its pane workers is busy or a detached run of one of its workers is live.
 
 > **As-built disposition: amend** — `docs/as-built/showrunner-automation.md` (stall watch)
 
 ## Source
 
-sdlc [63b1adde] 2026-11-09. Since panes 34, a dispatch returns at once and no director shell waits on the worker. Stall watch then bumped unit directors while their pane workers ran: at 03:39 and 04:05 EST it sent "idle since 04:05 EST, nothing running; bumped" while panes waited on workers hook34 (34b) and impl7 (41).
+Phase 2: sdlc [cd056195] 2026-11-09. Hana reported that stall-watch bumped fastest-unit every 8 to 10 minutes from 03:54 EST. Its Phase 53 Codex worker had ended its turn and waited on its own live detached test run. `worker_panes.worker_state` reads only the herdr agent status, so that worker reads idle.
+
+Phase 1: sdlc [63b1adde] 2026-11-09. Since panes 34, a dispatch returns at once and no director shell waits on the worker. Stall watch then bumped unit directors while their pane workers ran: at 03:39 and 04:05 EST it sent "idle since 04:05 EST, nothing running; bumped" while panes waited on workers hook34 (34b) and impl7 (41).
 
 ## Delegation Context
 
@@ -45,3 +47,21 @@ sdlc [63b1adde] 2026-11-09. Since panes 34, a dispatch returns at once and no di
 **Gotchas:** an existing test counts shared-session pane reads per cycle; a read for directors with no workers breaks it.
 
 **Ruled out:** changing `worker_panes` to raise a failed read to the caller — the fix is a `worker_panes` call only.
+
+### Phase 2 — Stall watch counts a live detached run of a worker as running work  · status: done
+
+#### As-built
+
+- In the per-unit decision of `stall_watch.watch_pass`, a unit director with no process work and no busy pane worker is `running`, and gets no idle bump, when a staff worker whose parent is the director has a live detached run. Live is `detached_runs.live_runs(<held run folder>/detached_runs, <worker name>)`, the call `worker_panes` uses to keep a worker pane open; there is no second liveness rule.
+- `has_live_detached_worker_run(parent: staff.StaffRow, run: unit_lookup.HeldRun, record: staff.StaffSnapshot) -> bool` reads `run.folder / "detached_runs"`. A director with no staff workers causes no read. A missing folder is no detached work.
+- `unit_lookup.HeldRun` carries `folder: Path`, the held run folder that `HeldRunLookup.unfinished_held_run` found.
+- A failed read (`OSError` or `ValueError`) counts as no detached work and prints one `stall-watch: detached runs: <unit>: <error>` stderr line.
+
+**Files:**
+- `scripts/production/stall_watch.py` — the detached run check and its use in the per-unit decision
+- `scripts/production/unit_lookup.py` — `HeldRun.folder`
+- `scripts/production/test_stall_watch.py` — live, finished, and outside-the-run-roots detached run rows in `test_running_shell_or_worker_launcher_prevents_a_bump`
+
+**Gotchas:** `Path.glob` in `live_runs` hides folder errors, so the helper opens the folder with `os.scandir` first. A held run folder can be a verified marker target outside `unit_runs.run_roots()`, so it cannot be rebuilt from the history name.
+
+**Ruled out:** rebuilding the folder from `HeldRun.path.stem` under `unit_runs.run_roots()` — it misses marker targets outside the roots.

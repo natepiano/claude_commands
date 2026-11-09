@@ -33,6 +33,7 @@ from zoneinfo import ZoneInfo
 from uuid import uuid4
 
 
+from scripts.agents import detached_runs
 from scripts.lib import conf as tunables
 from scripts.message import session_send
 from scripts.lib.atomic_file import write_text_atomic
@@ -358,6 +359,26 @@ def read_busy_pane_worker_parents(parents: tuple[staff.StaffRow, ...], record: s
     return BusyPaneWorkerParents(frozenset(
         parent for parent, workers in observations.items()
         if any(worker_panes.worker_state(observed) == "busy" for observed in workers)))
+
+
+def has_live_detached_worker_run(parent: staff.StaffRow, run: unit_lookup.HeldRun,
+                                record: staff.StaffSnapshot) -> bool:
+    """Check detached work for the director's staff workers in its unfinished run."""
+    workers = record.find(kind="worker", parent=parent.id)
+    if not workers:
+        return False
+    directory = run.folder / "detached_runs"
+    try:
+        try:
+            # Path.glob suppresses folder errors in live_runs.
+            with os.scandir(directory):
+                pass
+        except FileNotFoundError:
+            return False
+        return any(detached_runs.live_runs(directory, worker.name) for worker in workers)
+    except (OSError, ValueError) as error:
+        print(f"stall-watch: detached runs: {parent.name}: {' '.join(str(error).splitlines())}", file=sys.stderr)
+    return False
 
 
 def latest_transcript_activity(session_id: str) -> float:
@@ -1392,6 +1413,8 @@ def watch_pass(now: float, *, deadline: float, read_panes: Callable[[str], list[
                 if isinstance(busy_pane_workers, PaneWorkersUnread):
                     busy_pane_workers = read_busy_pane_worker_parents(pane_worker_parents, record)
                 running_work = row.id in busy_pane_workers.ids
+            if not running_work:
+                running_work = has_live_detached_worker_run(row, run, record)
             if running_work or (stretch["reported_status"] and last != stretch["reported_status"]):
                 stretch = Stretch(pane_hash=hashlib.sha256(pane.encode()).hexdigest(), since=now,
                                   bump_sent=False, tell_sent=False, reported_status="")

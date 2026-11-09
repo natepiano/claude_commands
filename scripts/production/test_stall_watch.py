@@ -26,6 +26,7 @@ from pathlib import Path
 from typing import cast, override
 from zoneinfo import ZoneInfo
 
+from scripts.agents import detached_runs
 from scripts.lib import unit_runs
 from scripts.lib.test_models_registry import write_registry
 from scripts.lib.process_group import send_process_group
@@ -2540,14 +2541,24 @@ always=natedev
         director = next(row for row in staff.find(kind="unit")
                         if row.current_session == unit_session("unit-one"))
         pane_worker = fixture_member("worker", name="test", parent=director.id)
+        live_records: dict[tuple[Path, str], list[detached_runs.RunRecord]] = {}
+
+        def read_live_runs(runs: Path, worker: str) -> list[detached_runs.RunRecord]:
+            return live_records.get((runs, worker), [])
+
         cases = (
-            ("shell", "bash", herdr.AgentStatus.IDLE, "running"),
-            ("launcher", "bash scripts/agents/agent_bg.sh", herdr.AgentStatus.IDLE, "running"),
-            ("busy pane", "", herdr.AgentStatus.WORKING, "running"),
-            ("idle pane", "", herdr.AgentStatus.IDLE, "idle bump requested"),
+            ("shell", "bash", herdr.AgentStatus.IDLE, "", False, "running"),
+            ("launcher", "bash scripts/agents/agent_bg.sh", herdr.AgentStatus.IDLE, "", False, "running"),
+            ("busy pane", "", herdr.AgentStatus.WORKING, "", False, "running"),
+            ("idle pane", "", herdr.AgentStatus.IDLE, "", False, "idle bump requested"),
+            ("live detached run", "", herdr.AgentStatus.IDLE, "running", False, "running"),
+            ("finished detached run", "", herdr.AgentStatus.IDLE, "finished", False, "idle bump requested"),
+            ("live detached run outside the run roots", "", herdr.AgentStatus.IDLE, "running", True, "running"),
         )
-        for label, command, status, decision in cases:
-            with self.subTest(case=label):
+        for label, command, status, detached_status, outside_roots, decision in cases:
+            with (self.subTest(case=label),
+                  mock.patch.object(detached_runs, "live_runs", side_effect=read_live_runs)):
+                live_records.clear()
                 self.state.mkdir(exist_ok=True)
                 for path in self.state.glob("*.json"):
                     path.unlink()
@@ -2556,6 +2567,28 @@ always=natedev
                     initial = self.tick(START)
                 self.assertEqual(initial.returncode, 0, initial.stderr)
                 self.assertIn("inspected showrunner/unit-one: fresh", initial.stdout)
+                held_folder = self.root / "held" / "unit-one"
+                if outside_roots:
+                    outside_folder = self.root / "outside" / "unit-one"
+                    outside_folder.parent.mkdir()
+                    _ = held_folder.rename(outside_folder)
+                    held_folder = outside_folder
+                    self.unheld_runs.add("unit-one")
+                    active = self.root / "held" / "active"
+                    active.mkdir()
+                    _ = (active / director.current_session).write_text(str(held_folder) + "\n")
+                detached_folder = held_folder / "detached_runs"
+                if detached_status:
+                    detached_folder.mkdir(parents=True, exist_ok=True)
+                    record: detached_runs.RunRecord = {
+                        "run_id": "worker-test", "status": "running" if detached_status == "running" else "finished",
+                        "session_dir": str(detached_folder.parent), "worker": pane_worker.name,
+                        "staff_id": pane_worker.id, "label": "worker tests", "command": ["test"],
+                        "log": str(detached_folder / "worker-test.log"), "started_at": START,
+                        "pid": 900001, "director_dir": str(self.root), "done_message_file": "",
+                    }
+                    _ = (detached_folder / "worker-test.json").write_text(json.dumps(record))
+                    live_records[(detached_folder, pane_worker.name)] = [record] if detached_status == "running" else []
                 if command:
                     worker = subprocess.Popen(["sleep", str(TEST_HANG_GUARD_SECS)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                     self.children.append(worker)
@@ -2573,6 +2606,7 @@ always=natedev
                     self.assertEqual(self.sent(), [])
                     saved = cast(stall_watch.Stretch, json.loads(self.watches["unit-one"].stretch_path.read_text()))
                     self.assertEqual(saved["since"], START + 300)
+                    live_records.clear()
                     with mock.patch.object(worker_panes, "observe_parents", return_value={}):
                         fresh = self.tick(START + 301)
                     self.assertEqual(fresh.returncode, 0, fresh.stderr)
