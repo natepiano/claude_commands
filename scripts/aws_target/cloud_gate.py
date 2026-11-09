@@ -559,7 +559,13 @@ def main() -> int:
         configuration = conf.read('aws_target')
         api = AwsCli(configuration.text('credentials_profile'), configuration.text('region'), settings().number('api_timeout_s'))
         worker = GateWorker(api, ledger.CostLedger(directory), conf.path('aws_target'), cast(Path, args.sidecar))
-        save(folder / 'outcome.json', worker.execute(folder, read(folder / 'request.json'), read(folder / 'deployment.json')))
+        try:
+            outcome = worker.execute(folder, read(folder / 'request.json'), read(folder / 'deployment.json'))
+        except SystemExit:
+            save(folder / 'outcome.json', {
+                'status': 'fallback', 'reason': 'The worker stopped, so its instance was terminated'})
+            raise
+        save(folder / 'outcome.json', outcome)
     return 0
 
 
