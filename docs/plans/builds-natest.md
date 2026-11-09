@@ -2143,3 +2143,18 @@ A changed `config/<name>.conf` selects every test module whose transitive import
 **Ruled out:**
 - A deferred `feature_log` import in `change_page.py`: no CPU gain in three pairs per condition.
 - The architect's reword of the Phase 106 Floors row: the showrunner said to keep that row as it is.
+
+### Phase 108 — The hook dispatch tests use half their CPU  · status: done
+
+#### As-built
+
+- `CopyGuardDispatchTests.dispatch_cases` sends a list of Bash payloads through the real `hook_dispatch.main` and the registered hooks in one isolated main-thread driver process. `invoke_cli` captures each case's return code, stdout and stderr. A driver crash fails the test with the driver stderr.
+- Three matrix tests use it: registered dispatch, interpreter vectors with unresolved programs, and recorded commands. Real dispatcher process starts stay for the refusal, pass and first unresolved case.
+- All 39 tests, 136 matrix cases and 95 assertions are kept. Sequential `module_cost`: 47.1 -> 13.4 CPU s, processes 411 -> 280.
+- Director pairs on base `5db3e42fd`: `/tmp` with a warm bytecode cache 26.9 -> 10.3 CPU s (62% less); `/dev/shm` with no bytecode writes 36.7 -> 12.2 CPU s (67% less).
+
+**Files:**
+- `scripts/hooks/test_hook_dispatch.py` — hook dispatcher tests; `dispatch_cases` groups matrix cases in one driver
+
+**Gotchas:**
+- Cases in one driver share `sys.modules`. `hook_dispatch._execute` loads each hook as a fresh module, so hook globals do not carry; keep HOME, PATH and cwd the same for all cases of one driver.
