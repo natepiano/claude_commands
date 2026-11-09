@@ -31,8 +31,12 @@ The staff row records the time, caller, and reason under `paused` or `exited`.
 The board shows that state.
 `agents pause --production SHOWRUNNER [--except UNIT ...] --why TEXT` selects units within one production.
 `agents resume --production SHOWRUNNER` resumes its units.
-Resume removes a pause record and sends the director one continuation message.
+Resume removes a pause record and sends a running director one continuation message.
+A paused director on the other machine gets the continuation message without a local liveness read.
+The machine comes from its worktree or its showrunner document.
+A stopped paused director starts through the shared resume path, including its requested `--to` account.
 Queued or failed delivery restores the same pause record and returns failure.
+A failed start or a start exception also restores the pause record.
 Resume starts an exited director through the shared role-account path and removes its exit record after success.
 The prompt hook retains a paused director's hold for every prompt source.
 It adds context without blocking or removing the message.

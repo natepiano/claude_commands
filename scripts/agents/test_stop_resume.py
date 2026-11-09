@@ -1874,7 +1874,7 @@ class StopResumeTests(unittest.TestCase):
     def test_launch_deletion_after_stop_cannot_lose_the_old_alerts_cancellation(self) -> None:
         log, row = self.prompt_retirement_fixture(alerted=True)
         self.assertEqual(stop_resume.stop("alpha"), stop_resume.NotRunning("019b3a40-4250-7000-8000-000000000102"))
-        # retire_unit removes launch records after stop and before the next watcher pass.
+        # Launch deletion must preserve pending prompt cancellation.
         pane_record.record_path("agents").unlink()
         self.drain_prompt_cancellations()
         self.assertEqual(json.loads(log.read_text()), ["retire", "--to", "user", "--from", "stall-watch",

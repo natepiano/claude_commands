@@ -281,6 +281,19 @@ def _finish_tasks(row: staff.StaffRow, record: staff.StaffSnapshot) -> None:
     wait_for_workers(staff.StaffSnapshot(tuple(children)))
 
 
+def _worktree_is_remote(row: staff.StaffRow) -> bool:
+    return not isinstance(row.worktree, staff.WorktreeUnfilled) and not unit_machine_is_local(row.worktree.machine)
+
+
+def _paused_resume_needs_message(row: staff.StaffRow) -> bool:
+    remote = (_worktree_is_remote(row) if not isinstance(row.worktree, staff.WorktreeUnfilled) else
+              isinstance(row.doc, (staff.LiveDoc, staff.WrappedDoc)) and not unit_machine_is_local(row.doc.machine))
+    return isinstance(row.paused, staff.Paused) and (remote or isinstance(
+        stop_resume.running_on_account(str(row.current_session), "",
+            kind="codex" if isinstance(staff.backend(row), staff.CodexBackend) else "claude"),
+        stop_resume.ClaudeUp))
+
+
 def _lifecycle(options: CommandLine) -> int:
     from scripts.production import session_staff
 
@@ -309,7 +322,7 @@ def _lifecycle(options: CommandLine) -> int:
                 print(f"{row.name}: retired; use agents resume {row.name} --retired", file=sys.stderr)
                 code = 2
                 continue
-            if isinstance(row.paused, staff.Paused):
+            if _paused_resume_needs_message(row):
                 _ = staff.resume(str(row.id))
                 delivery = _message(row, "Continue where you stopped. Resume your existing workers. Do not open new workers.")
                 if restart_support.message_was_delivered(delivery):
@@ -318,14 +331,22 @@ def _lifecycle(options: CommandLine) -> int:
                     _ = staff.set_hold(str(row.id), row.paused)
                     code = 1
             else:
-                result = stop_resume.resume(str(row.id), why=options.why, to=options.to)
-                if isinstance(result, stop_resume.ClaudeUp) and isinstance(row.exited, staff.Exited):
-                    _ = staff.resume(str(row.id))
-                code = max(code, _result_code(result))
+                started = False
+                try:
+                    if isinstance(row.paused, staff.Paused):
+                        _ = staff.resume(str(row.id))
+                    result = stop_resume.resume(str(row.id), why=options.why, to=options.to)
+                    started = isinstance(result, stop_resume.ClaudeUp)
+                    if started and isinstance(row.exited, staff.Exited):
+                        _ = staff.resume(str(row.id))
+                    code = max(code, _result_code(result))
+                finally:
+                    if not started and isinstance(row.paused, staff.Paused):
+                        _ = staff.set_hold(str(row.id), row.paused)
             continue
         already_exited = options.command == "exit" and isinstance(row.exited, staff.Exited)
         held = row if already_exited else staff.pause(str(row.id), options.why)
-        remote_exit = options.command == "exit" and not isinstance(row.worktree, staff.WorktreeUnfilled) and not unit_machine_is_local(row.worktree.machine)
+        remote_exit = options.command == "exit" and _worktree_is_remote(row)
         if options.finish_step and not remote_exit:
             _finish_tasks(row, record)
         if remote_exit:
