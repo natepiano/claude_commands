@@ -10,7 +10,6 @@ import tempfile
 import socket
 import subprocess
 import sys
-import time
 from typing import cast
 import unittest
 from unittest.mock import patch
@@ -28,18 +27,23 @@ class StepRecordTests(unittest.TestCase):
                          "--pid", str(os.getpid()), "--repo", directory, "--kind", "test",
                          "--runs-on", "any_target", "--eligible-targets", "mac,aws", "--mac-targets", "mac",
                          "--pinned-target", "mac", "--package", "sample", "--state", "waiting_hold"]
-            before = (time.time_ns() - time.monotonic_ns()) // 1000
-            result = subprocess.run([*arguments, "--report"], env=environment,
-                                    capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS)
-            after = (time.time_ns() - time.monotonic_ns()) // 1000
+            fixed_clocks = """
+import runpy
+import sys
+from unittest.mock import patch
+sys.argv = sys.argv[1:]
+with patch("time.time_ns", return_value=1_700_000_000_123_456_789), \
+     patch("time.monotonic_ns", return_value=123_456_000):
+    runpy.run_path(sys.argv[0], run_name="__main__")
+"""
+            result = subprocess.run([arguments[0], "-c", fixed_clocks, *arguments[1:], "--report"],
+                                    env=environment, capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS)
             self.assertEqual(result.returncode, 0, result.stderr)
             offset_text, record_text, state_text = result.stdout.splitlines()
             offset = int(offset_text)
             self.assertEqual(Path(record_text), root / "clock.json")
             self.assertEqual(Path(state_text), root / "clock.state")
-            # Separate clock reads can cross a microsecond boundary.
-            self.assertLessEqual(min(before, after) - 1, offset)
-            self.assertLessEqual(offset, max(before, after) + 1)
+            self.assertEqual(offset, 1_700_000_000_000_000)
             with patch.dict(os.environ, environment):
                 record = steps.read("clock")
             self.assertIsInstance(record, steps.StepRecord)

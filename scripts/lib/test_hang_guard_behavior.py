@@ -7,8 +7,6 @@ import unittest
 from unittest.mock import patch
 
 from scripts.lib import test_hang_guard
-from scripts.agents import codex_mesh
-from scripts.usage import agents_log
 
 
 class HangGuardTests(unittest.TestCase):
@@ -35,18 +33,6 @@ class HangGuardTests(unittest.TestCase):
         self.assertEqual(signal.getsignal(signal.SIGALRM), handler)
         self.assertEqual(signal.getitimer(signal.ITIMER_REAL), (0.0, 0.0))
 
-    def test_alarm_escapes_assignment_recording_recovery_and_restores_the_handler(self) -> None:
-        handler = signal.getsignal(signal.SIGALRM)
-
-        def alarm(*_args: object) -> None:
-            signal.raise_signal(signal.SIGALRM)
-
-        with patch.object(agents_log, "append", side_effect=alarm):
-            with self.assertRaisesRegex(test_hang_guard.FixtureHang, "assignment recording.*synchronous fixture"):
-                with test_hang_guard.LauncherHangGuard("assignment recording").protect():
-                    codex_mesh._record_assignment("fixture-thread", "test", None)  # pyright: ignore[reportPrivateUsage]
-        self.assertEqual(signal.getsignal(signal.SIGALRM), handler)
-        self.assertEqual(signal.getitimer(signal.ITIMER_REAL), (0.0, 0.0))
 
     def test_a_task_timeout_is_preserved(self) -> None:
         result: Future[None] = Future()

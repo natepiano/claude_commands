@@ -115,22 +115,22 @@ class VerifyVerbTests(VerifyLintCacheFixture):
         self.assertEqual(list((self.root / "verify-steps").glob("*.json")), [])
         self.assertEqual(self.cargo_calls(), [])
 
-    def test_unknown_verb_from_mesh_worker_prints_usage_without_creating_a_run(self) -> None:
-        mesh_runs = self.root / "mesh_runs"
-        mesh_script = self.root / "mesh-runs.py"
+    def test_unknown_verb_from_native_worker_prints_usage_without_creating_a_run(self) -> None:
+        detached_runs = self.root / "detached_runs"
+        detached_script = self.root / "detached-runs.py"
         self.write_executable(
-            mesh_script,
-            f"from pathlib import Path\nruns = Path({str(mesh_runs)!r})\n"
+            detached_script,
+            f"from pathlib import Path\nruns = Path({str(detached_runs)!r})\n"
             + "runs.mkdir()\n(runs / 'unexpected.json').write_text('{}')\n",
         )
         self.environment.update({
-            "CODEX_THREAD_ID": "test-mesh-worker",
-            "VERIFY_MESH_RUNS_SCRIPT": str(mesh_script),
+            "CODEX_THREAD_ID": "test-native-worker",
+            "VERIFY_DETACHED_RUNS_SCRIPT": str(detached_script),
         })
         result = self.invoke_verify("fmt", "sample", cwd=self.root)
         self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
         self.assertIn("Usage:", result.stderr)
-        self.assertEqual(list(mesh_runs.glob("*.json")), [])
+        self.assertEqual(list(detached_runs.glob("*.json")), [])
         self.assertEqual(list((self.root / "verify-steps").glob("*.json")), [])
         self.assertEqual(self.cargo_calls(), [])
 

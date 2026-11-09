@@ -1,6 +1,8 @@
 """Record resource holders through private event pipes and real verify calls."""
 from __future__ import annotations
 
+from scripts.build_queue import admission_records
+
 import json
 import os
 from pathlib import Path
@@ -17,7 +19,6 @@ from scripts.direct.verify_mac_offload_test_support import ROUTING_WAIT_STUB
 from scripts.direct.verify_lint_scope_test_support import CARGO_STUB, SCRIPTS, TAPLO_STUB
 from scripts.build_queue.admission_test_support import caller_admission
 from scripts.lint.memory_test_support import write_config_fixture
-from scripts.lint import memory_admit
 from scripts.lib.shell_test_support import shell_functions
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.production.staff_test_support import fixture_runtime_id
@@ -308,9 +309,9 @@ exec "$TEST_REAL_PYTHON" "$@"
         _ = (self.root / "token-board" / name).write_text(json.dumps(record))
 
     def worker_reference(self, name: str) -> str:
-        roster = cast(dict[str, dict[str, str]], json.loads(
-            (self.root / "session/mesh_roster.json").read_text()))
-        return roster[name]["staff_id"]
+        roster = cast(dict[str, str], json.loads(
+            (self.root / f"session/impl_worker_{name}.json").read_text()))
+        return roster["staff_id"]
 
     def acquire_identity_token(self, owner: str) -> None:
         result = subprocess.run(["bash", str(BOARD), "acquire", str(self.root / "token-board"),
@@ -387,28 +388,9 @@ BOARD_DIR=$TEST_IDENTITY_ROOT/token-board
         self.assertEqual(recorded_holders(self.record_token_passes()),
                          [named_holder("slot", "cargo", "wait", unit=True)])
 
-    def test_exact_roster_key_wins_over_a_suffix_match_and_saved_record(self) -> None:
-        self.write_token_record("mesh_roster.json", {
-            "writer": {"staff_id": self.worker_reference("fixture-first")},
-            "other-writer": {"staff_id": self.worker_reference("fixture-second")}})
-        self.write_token_record("impl_worker_writer.json", {
-            "slot": "writer", "staff_id": self.worker_reference("fixture-second")})
-        self.acquire_identity_token("writer")
-        self.assertEqual(recorded_holders(self.record_token_passes()),
-                         [named_holder("slot", "cargo", FIRST_SESSION)])
-
     def test_saved_worker_stem_wins_over_a_roster_slot_match(self) -> None:
         self.write_token_record("impl_worker_writer.json", {
             "staff_id": self.worker_reference("fixture-first")})
-        self.write_token_record("mesh_roster.json", {
-            "other": {"slot": "writer", "staff_id": self.worker_reference("fixture-second")}})
-        self.acquire_identity_token("writer")
-        self.assertEqual(recorded_holders(self.record_token_passes()),
-                         [named_holder("slot", "cargo", FIRST_SESSION)])
-
-    def test_roster_slot_match_names_the_worker_when_no_exact_record_exists(self) -> None:
-        self.write_token_record("mesh_roster.json", {
-            "other": {"slot": "writer", "staff_id": self.worker_reference("fixture-first")}})
         self.acquire_identity_token("writer")
         self.assertEqual(recorded_holders(self.record_token_passes()),
                          [named_holder("slot", "cargo", FIRST_SESSION)])
@@ -590,7 +572,7 @@ raise SystemExit(runner_status)
         return claims / f"{root.name}.json"
 
     def claim(self, path: Path, owner: str) -> dict[str, object]:
-        row: dict[str, object] = {"pid": os.getpid(), "proc_start": memory_admit.process_start_time(os.getpid()),
+        row: dict[str, object] = {"pid": os.getpid(), "proc_start": admission_records.process_start_time(os.getpid()),
             "what": "private fixture work", "worktree": str(self.fixture.root),
             "since": datetime.now(timezone.utc).isoformat(), "holder_session": owner}
         _ = path.write_text(json.dumps(row))

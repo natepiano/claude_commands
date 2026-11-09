@@ -19,7 +19,7 @@ import uuid
 from scripts.mac_test import linux_runner
 from scripts.lib import conf
 
-from scripts.lint import memory_admit
+from scripts.build_queue import admission_records
 
 
 REMOTE_PROOF = r"""
@@ -93,10 +93,10 @@ def main() -> int:
     registry = Path(os.environ.get('BUILD_TARGETS_CONFIG', str(root / 'config/build_targets.conf'))).expanduser()
     config = conf.read(registry)
     values = config.values()
-    memory = int(linux_runner.positive_setting(values, 'loopback.memory_gib') * memory_admit.GIB)
+    memory = int(linux_runner.positive_setting(values, 'loopback.memory_gib') * admission_records.GIB)
     # The isolated fixture has no history for nextest, check or doc.
     try:
-        configuration = memory_admit.read_memory_config()
+        configuration = admission_records.read_memory_config()
         need = configuration.program_first_peaks["cargo"]
         required_free = need + configuration.policy.safety_bytes
     except conf.Unusable as error:
@@ -104,7 +104,7 @@ def main() -> int:
         return 2
     if memory < required_free:
         print(f'loopback: cannot admit the fixture; loopback.memory_gib must provide '
-              + f'{required_free / memory_admit.GIB:g} GiB including the safety reserve', file=sys.stderr)
+              + f'{required_free / admission_records.GIB:g} GiB including the safety reserve', file=sys.stderr)
         return 2
     host = values['loopback.host']
     connect = config.number('loopback.connect_timeout_s')

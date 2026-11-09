@@ -27,7 +27,7 @@ from scripts.build_queue import queue_snapshot
 from scripts.build_targets.target_config import SshTarget, is_aws_target
 from scripts.lib import conf
 from scripts.lib.atomic_file import write_text_atomic
-from scripts.lint import memory_admit
+from scripts.build_queue import admission_records
 from scripts.mac_test import mac_test, offload
 from scripts.buildlog import store
 from scripts.direct import step_record
@@ -182,7 +182,7 @@ class Controller:
         snapshot = queue_snapshot.read_queue_snapshot(self.queue_directory)
         if (not isinstance(snapshot, queue_snapshot.QueueSnapshot)
                 or not 0 <= now - snapshot.written_at <= settings.snapshot_max_age_s
-                or isinstance(snapshot.inputs.host, memory_admit.ReadingUnavailable)):
+                or isinstance(snapshot.inputs.host, admission_records.ReadingUnavailable)):
             return 0
         values = configuration.values()
         return sum(1 for _, row in snapshot.inputs.ordered

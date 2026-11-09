@@ -264,7 +264,7 @@ exec python3 "$TEST_WAIT_HELPER" "$STUB_CLAUDE_ROOT/never-release"
         self.assertEqual(calls.read_text().splitlines(), ["sid-director.phase-3 check reviewed.txt --json"])
         state = (session / "phases/3/delegated_phase_reservation_state.json").read_text()
         self.assertIn('"r1"', state)
-        self.assertEqual((session / "mesh_events.txt").read_text().splitlines(), ["claim", "open"])
+        self.assertEqual((session / "dispatch_events.txt").read_text().splitlines(), ["claim", "open"])
 
     def test_refused_phase_claim_prevents_the_claude_worker_open(self) -> None:
         session = self.start_phase("claim-refused")
@@ -275,7 +275,7 @@ exec python3 "$TEST_WAIT_HELPER" "$STUB_CLAUDE_ROOT/never-release"
         self.assertEqual(result.returncode, 1, result.stderr)
         self.assertIn("phase 3 could not claim its files", result.stderr)
         self.assertEqual(len(calls.read_text().splitlines()), 1)
-        self.assertEqual((session / "mesh_events.txt").read_text().splitlines(), ["claim"])
+        self.assertEqual((session / "dispatch_events.txt").read_text().splitlines(), ["claim"])
         self.assertEqual(self.launch_records(session, "pass_started"), [])
 
     def test_unreadable_ledger_allows_the_worker_with_the_claim_pending(self) -> None:
@@ -288,7 +288,7 @@ exec python3 "$TEST_WAIT_HELPER" "$STUB_CLAUDE_ROOT/never-release"
         self.assertEqual(len(calls.read_text().splitlines()), 1)
         state = (session / "phases/3/delegated_phase_reservation_state.json").read_text()
         self.assertIn("enrolled_awaiting_first_touch", state)
-        self.assertEqual((session / "mesh_events.txt").read_text().splitlines(), ["claim", "open"])
+        self.assertEqual((session / "dispatch_events.txt").read_text().splitlines(), ["claim", "open"])
 
     def test_new_worker_identity_precedes_the_heartbeat_watcher(self) -> None:
         session = self.start_phase("identity-before-heartbeat")

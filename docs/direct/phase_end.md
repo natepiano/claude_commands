@@ -53,7 +53,6 @@ Run these steps in order for each completed loop or verbose phase:
 4. **Add-on check.** Run <ConsiderNextItems/>.
 5. **Worker cleanup and completion.** Run the worker half of <PhaseCleanup/> before the next launch.
    Retain pane workers and their native conversations under <LongLivedWorkers/>.
-   Apply the compatibility cleanup only when the existing run's pin is `mesh`.
    Then run <RecordPhaseCompletion/>, including `finish-phase` and deletion of the
    inactive reservation state file before the next phase writes its own.
 6. **Next launch.** In loop mode or an active auto window with a next phase,
