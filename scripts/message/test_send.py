@@ -996,6 +996,25 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
         self.assertEqual(send.send(local_options(["--to", "builds", "--text", "hello"])).outcome, "sent")
         self.assertEqual(self.relayed[0].to, f"uds:{self.root / 'runner-current.sock'}")
 
+        report = staff.StaffRow(staff.StaffId("report-runner"), "showrunner", "report", staff.StaffRoot(),
+                               current_session=staff.StaffId("report-current"))
+        direct = staff.StaffRow(staff.StaffId("direct-worker"), "worker", "test2", staff.ReportsTo(report.id),
+                               current_session=staff.StaffId("direct-current"))
+        report_unit = staff.StaffRow(staff.StaffId("report-unit"), "unit", "report", staff.ReportsTo(runner.id),
+                                    current_session=staff.StaffId("report-director"))
+        nested = staff.StaffRow(staff.StaffId("nested-worker"), "worker", "test2", staff.ReportsTo(report_unit.id),
+                               current_session=staff.StaffId("nested-current"))
+        other = staff.StaffRow(staff.StaffId("other-runner"), "showrunner", "other", staff.StaffRoot(),
+                              current_session=staff.StaffId("other-current"))
+        other_unit = staff.StaffRow(staff.StaffId("other-unit"), "unit", "builds", staff.ReportsTo(other.id),
+                                   current_session=staff.StaffId("other-director"))
+        resources = staff.StaffRow(staff.StaffId("resources-worker"), "worker", "resources", staff.ReportsTo(other_unit.id),
+                                  current_session=staff.StaffId("resources-current"))
+        record = staff.StaffSnapshot((*record.rows, report, direct, report_unit, nested, other, other_unit, resources))
+        for target, expected in (("report/test2", direct), ("builds/resources", unit)):
+            with self.subTest(target=target):
+                self.assertEqual(send.resolve_staff_recipient(target, record), expected)
+
     def test_one_staff_snapshot_supplies_resolution_and_roster(self) -> None:
         self.session("resources-current", "transport")
         self.staff_member("resources-current", "resources")
@@ -5815,11 +5834,37 @@ class PaneWorkerMessageTests(unittest.TestCase):
         self.assertEqual(result.outcome, "sent", result.detail)
         prompts = [command for command in self.fixture.world.commands if command[:2] == ("agent", "prompt")]
         self.assertEqual([command[2] for command in prompts], ["w1:p3"])
-
-
-
-
-
+        sender = self.fixture.worker("sender")
+        outside = fixture_member("showrunner", name="builds")
+        foreign: list[staff.StaffRow] = []
+        for index, unit_name in enumerate(("panes", "report"), 1):
+            holder = fixture_member("unit", name=unit_name, parent=outside.id)
+            worker = fixture_worker("test2", holder.id)
+            foreign.append(worker)
+            self.fixture.world.add(worker, f"w2:p{index + 3}", tab="w2:t3", workspace="w2")
+            observed = roster.Roster([roster.RosterEntry(
+                "fixture", "claude", "worker", worker.name, "working",
+                roster.Messageable(f"session:{worker.current_session}"), str(self.fixture.root),
+                roster.UnderShowrunner(outside.name, outside.name, f"session:{outside.current_session}"),
+                roster.UnderDirector(holder.name, holder.name, f"session:{holder.current_session}"),
+                roster.WorkerAssignment("test", str(self.fixture.root / "run")),
+                session=roster.ClaudeSession(str(worker.current_session)),
+            )], [])
+            commands = self.fixture.world.commands.copy()
+            state = self.fixture.staff_state()
+            with self.subTest(other_units=index):
+                with (mock.patch.dict(os.environ, {"CODEX_THREAD_ID": str(sender.current_session)}),
+                      mock.patch.object(roster, "roster", return_value=observed),
+                      redirect_stderr(io.StringIO()) as errors, redirect_stdout(io.StringIO()),
+                      self.assertRaises(SystemExit) as refused):
+                    _ = self.deliver("test2", "Keep this message in the sender's unit.")
+                self.assertEqual(refused.exception.code, 2)
+                self.assertIn("ambiguous staff row for 'test2'", errors.getvalue())
+                for candidate, candidate_unit in zip(foreign, ("panes", "report")):
+                    self.assertIn(f"builds/{candidate_unit}/test2", errors.getvalue())
+                    self.assertEqual(send.pending(f"staff:{candidate.id}"), "")
+                self.assertEqual(self.fixture.world.commands, commands)
+                self.assertEqual(self.fixture.staff_state(), state)
 
     def test_delivery_requires_the_callers_snapshot_and_retains_its_holder(self) -> None:
         holder = staff.update_current_session(self.fixture.parent.current_session,
@@ -5856,15 +5901,44 @@ class PaneWorkerMessageTests(unittest.TestCase):
         unit = fixture_member("unit", name="unit", parent=other.id)
         sibling = fixture_worker("impl", unit.id)
         self.fixture.world.add(sibling, "w2:p2", tab="w2:t2", workspace="w2")
+        root = staff.snapshot().parent_of(self.fixture.parent)
+        assert root is not None
+        second_unit = fixture_member("unit", name="second-unit", parent=root.id)
+        second_worker = fixture_worker("impl", second_unit.id)
+        self.fixture.world.add(second_worker, "w2:p3", tab="w2:t3", workspace="w2")
+        sender = self.fixture.worker("sender")
         location = self.fixture.world.locations["w1:p1"]
         location.update({"label": "changed", "workspace_id": "w2", "tab_id": "w2:t2"})
         location["agent_status"] = "working"
-        result = self.deliver("worker:unit/impl", "Continue the active turn.")
-        self.assertEqual(result.outcome, "sent")
-        self.assertIsInstance(result, send.PaneTextDelivered)
-        prompts = [command for command in self.fixture.world.commands if command[:2] == ("agent", "prompt")]
-        self.assertEqual([command[2] for command in prompts], ["w1:p1"])
-        self.assertIn("Continue the active turn.", prompts[0][3])
+        observed = roster.Roster([roster.RosterEntry(
+            "fixture", "claude", "worker", sibling.name, "working",
+            roster.Messageable(f"session:{sibling.current_session}"), str(self.fixture.root),
+            roster.UnderShowrunner(other.name, other.name, f"session:{other.current_session}"),
+            roster.UnderDirector(unit.name, unit.name, f"session:{unit.current_session}"),
+            roster.WorkerAssignment("impl", str(self.fixture.root / "run")),
+            session=roster.ClaudeSession(str(sibling.current_session)),
+        )], [])
+        cases = ((self.fixture.parent, "worker:unit/impl", self.row, "w1:p1"),
+                 (sender, "impl", self.row, "w1:p1"),
+                 (self.fixture.parent, "impl", self.row, "w1:p1"),
+                 (sender, "IMPL", self.row, "w1:p1"),
+                 (sender, "other/unit/impl", sibling, "w2:p2"),
+                 (sender, "worker:showrunner/second-unit/impl", second_worker, "w2:p3"),
+                 (sender, "showrunner/second-unit/impl", second_worker, "w2:p3"),
+                 (sender, "worker:second-unit/impl", second_worker, "w2:p3"))
+        for source, target, recipient, pane in cases:
+            with self.subTest(sender=source.kind, target=target):
+                with (mock.patch.dict(os.environ, {"CODEX_THREAD_ID": str(source.current_session)}),
+                      mock.patch.object(roster, "roster", return_value=observed)):
+                    before = len(self.fixture.world.commands)
+                    result = self.deliver(target, f"Continue the active turn. From {source.kind} to {target}.")
+                self.assertEqual(result.outcome, "sent")
+                self.assertIsInstance(result, send.PaneTextDelivered)
+                prompts = [command for command in self.fixture.world.commands[before:] if command[:2] == ("agent", "prompt")]
+                self.assertEqual([command[2] for command in prompts], [pane])
+                self.assertIn("Continue the active turn.", prompts[0][3])
+                self.assertEqual(self.fixture.world.processes[self.fixture.world.foreground[pane][0]].identity.id,
+                                 recipient.current_session)
         self.assertNotEqual(self.row.id, self.row.current_session)
 
     def test_full_worker_path_accepts_an_outside_sender_and_a_showrunner_holder(self) -> None:
