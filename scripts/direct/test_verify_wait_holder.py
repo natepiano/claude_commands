@@ -1,6 +1,8 @@
 """Record resource holders through private event pipes and real verify calls."""
 from __future__ import annotations
 
+from scripts.build_queue import admission_records
+
 import json
 import os
 from pathlib import Path
@@ -8,7 +10,7 @@ import shutil
 import subprocess
 import sys
 from datetime import datetime, timezone
-from typing import cast, override
+from typing import ClassVar, cast, override
 import unittest
 
 from scripts.direct.verify_token_wait_test_support import BOARD, VERIFY, VerifyTokenWaitFixture
@@ -17,7 +19,6 @@ from scripts.direct.verify_mac_offload_test_support import ROUTING_WAIT_STUB
 from scripts.direct.verify_lint_scope_test_support import CARGO_STUB, SCRIPTS, TAPLO_STUB
 from scripts.build_queue.admission_test_support import caller_admission
 from scripts.lint.memory_test_support import write_config_fixture
-from scripts.lint import memory_admit
 from scripts.lib.shell_test_support import shell_functions
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.production.staff_test_support import fixture_runtime_id
@@ -30,9 +31,11 @@ NEXT_SESSION = fixture_runtime_id("thread-second")
 
 
 def isolate_run_sources(environment: dict[str, str], root: Path) -> None:
+    """Use private sources for the worker process that the fixture starts."""
     environment.update({"SCRATCH_ROOT": str(root / "sources/scratch"),
                         "ROSTER_RUN_ROOT": str(root / "sources/unit"),
-                        "ASTRA_REVIEW_DIR": str(root / "sources/astra")})
+                        "ASTRA_REVIEW_DIR": str(root / "sources/astra"),
+                        "UNIT_DETACHED_RUN": "1"})
 
 
 def wait_rows(session: Path) -> list[dict[str, object]]:
@@ -83,15 +86,23 @@ raise SystemExit(75 if episode["outcome"] == "LeftQueue" else 0)
 '''
 
 
-class VerifyMemoryWaitHolderTests(VerifyTokenWaitFixture):
+class RecordedWaitFixture(VerifyTokenWaitFixture):
+    """Seed private wait history once for each test class."""
+
+    @override
+    def build_fixture(self) -> None:
+        super().build_fixture()
+        isolate_run_sources(self.environment, self.root)
+        self.record_phase(self.root / "session")
+
+
+class VerifyMemoryWaitHolderTests(RecordedWaitFixture):
     event_errors: str = ""
 
     @override
-    def setUp(self) -> None:
-        super().setUp()
-        isolate_run_sources(self.environment, self.root)
+    def build_fixture(self) -> None:
+        super().build_fixture()
         session = self.root / "session"
-        self.record_phase(session)
         self.environment.update({"UNIT_RUN_DIR": str(session), "UNIT_TEAM_ROLE": "impl",
                                  "TEST_EVENT_ROOT": str(self.root), "TEST_REAL_PYTHON": sys.executable,
                                  "TEST_RECORDER_CALLS": str(self.root / "recorder-calls.jsonl"),
@@ -273,13 +284,10 @@ exit 0
         self.assertEqual(wait_rows(board)[-1]["event_type"], "wait_finished")
 
 
-class VerifyRecordedTokenIdentityTests(VerifyTokenWaitFixture):
+class VerifyRecordedTokenIdentityTests(RecordedWaitFixture):
     @override
-    def setUp(self) -> None:
-        super().setUp()
-        isolate_run_sources(self.environment, self.root)
-        session = self.root / "session"
-        self.record_phase(session)
+    def build_fixture(self) -> None:
+        super().build_fixture()
         board = self.root / "token-board"
         board.mkdir()
         with isolated_staff_file(self.root / "staff.json", self.environment):
@@ -500,12 +508,12 @@ with (Path(os.environ["PACKAGE_ROOT"]) / "run-waits.jsonl").open("a") as output:
 
 RESERVATION_RACE_TOOL = '''import os, runpy, sys
 from pathlib import Path
-with open(Path(os.environ["TEST_REAL_TARGETS"]).resolve().parents[2] / "scripts/lib/package_root.py") as package_root: exec(package_root.read(), {"__file__": package_root.name})
-from scripts.mac_test import mac_test
 root = Path(os.environ["PACKAGE_ROOT"])
 if sys.argv[1] == "reserve" and not (root / "reservation-raced").exists():
     if os.environ["TEST_RACE_WITH_CLAIM"] == "0":
         raise SystemExit(1)
+    with open(Path(os.environ["TEST_REAL_TARGETS"]).resolve().parents[2] / "scripts/lib/package_root.py") as package_root: exec(package_root.read(), {"__file__": package_root.name})
+    from scripts.mac_test import mac_test
     paths = mac_test.state_paths("linux-box")
     scope = mac_test.target_claim_scope(paths, str(root))
     claim = mac_test.claim_path(paths, scope)
@@ -523,9 +531,33 @@ except SystemExit as result:
 
 
 class VerifyTargetWaitHolderTests(VerifyHoldWaitFixture):
+    recorded_environment: ClassVar[dict[str, str]]
+
+    @classmethod
+    @override
+    def setUpClass(cls) -> None:
+        super().setUpClass()
+        seed = cls()
+        fixture = seed.fixture
+        fixture.root = fixture.fixture_root
+        fixture.environment = fixture.fixture_environment.copy()
+        _ = shutil.copytree(fixture.fixture_seed, fixture.root, symlinks=True)
+        try:
+            isolate_run_sources(fixture.environment, fixture.root)
+            _ = seed.record_phase()
+            cls.recorded_environment = {key: value for key, value in fixture.environment.items()
+                                        if fixture.fixture_environment.get(key) != value}
+            shutil.rmtree(fixture.fixture_seed)
+            _ = shutil.copytree(fixture.root, fixture.fixture_seed, symlinks=True)
+        finally:
+            shutil.rmtree(fixture.root)
+
+    @override
+    def setUp(self) -> None:
+        super().setUp()
+        self.fixture.environment.update(self.recorded_environment)
+
     def prepare_target_wait(self) -> Path:
-        isolate_run_sources(self.fixture.environment, self.fixture.root)
-        _ = self.record_phase()
         root = self.fixture.root
         claims = Path(self.fixture.environment["MAC_TEST_STATE_DIR"]) / "claims"
         claims.mkdir(parents=True, exist_ok=True)
@@ -537,7 +569,7 @@ class VerifyTargetWaitHolderTests(VerifyHoldWaitFixture):
         self.fixture.write_executable(self.fixture.bin_directory / "sleep", POLL_SLEEP)
         local_wait = root / "target-local-wait.py"
         _ = local_wait.write_text(ROUTING_WAIT_STUB)
-        self.fixture.environment.update({"BUILD_TARGETS_SCRIPT": str(tool),
+        self.fixture.environment.update({"BUILD_TARGETS_SCRIPT": str(VERIFY.parents[1] / "build_targets/build_targets.py"),
             "TEST_REAL_TARGETS": str(VERIFY.parents[1] / "build_targets/build_targets.py"),
             "TEST_REAL_SLEEP": real_sleep, "VERIFY_LOCAL_RELEASE_WAIT_SCRIPT": str(local_wait),
             "TEST_RUNNER_MAC": "passed", "TEST_RUNNER_STATUS": "0"})
@@ -559,7 +591,7 @@ raise SystemExit(runner_status)
         return claims / f"{root.name}.json"
 
     def claim(self, path: Path, owner: str) -> dict[str, object]:
-        row: dict[str, object] = {"pid": os.getpid(), "proc_start": memory_admit.process_start_time(os.getpid()),
+        row: dict[str, object] = {"pid": os.getpid(), "proc_start": admission_records.process_start_time(os.getpid()),
             "what": "private fixture work", "worktree": str(self.fixture.root),
             "since": datetime.now(timezone.utc).isoformat(), "holder_session": owner}
         _ = path.write_text(json.dumps(row))
@@ -693,6 +725,7 @@ raise SystemExit(runner_status)
 
     def test_pinned_starting_target_records_an_unnamed_holder(self) -> None:
         _ = self.prepare_target_wait()
+        self.fixture.environment["BUILD_TARGETS_SCRIPT"] = str(self.fixture.root / "capacity-tool.py")
         starting = self.fixture.root / "target-starting"
         starting.touch()
         process = self.start("check", "sample", "--target", "mac", "--no-cache")
@@ -761,7 +794,19 @@ class VerifyMemoryRouteHolderTests(VerifyHoldWaitFixture):
         isolate_run_sources(self.fixture.environment, self.fixture.root)
         _ = self.record_phase()
         observer = self.fixture.root / "observe-memory-python"
-        self.fixture.write_executable(observer, MEMORY_CLIENT_OBSERVER)
+        recorder = self.fixture.root / "observe-memory-client.py"
+        self.fixture.write_executable(recorder, MEMORY_CLIENT_OBSERVER)
+        self.fixture.write_executable(observer, '''#!/bin/sh
+case "$1" in
+    */admission_client.py)
+        if [ "$2" = admit ]; then
+            exec "$TEST_REAL_PYTHON" "$TEST_MEMORY_OBSERVER" "$@"
+        fi
+        ;;
+esac
+exec "$TEST_REAL_PYTHON" "$@"
+''')
+        self.fixture.environment["TEST_MEMORY_OBSERVER"] = str(recorder)
         self.fixture.environment["CLAUDE_PYTHON"] = str(observer)
         _ = self.fixture.hold_memory()
         return Path(self.fixture.environment["UNIT_RUN_DIR"])

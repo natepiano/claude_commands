@@ -37,18 +37,33 @@ class ArrayElements:
 
 
 @dataclass(frozen=True)
+class LiteralWord:
+    text: str
+
+
+@dataclass(frozen=True)
+class ExpandedWord:
+    text: str
+
+
+UNKNOWN_VALUE = "__copy_guard_unknown_value__"
+
+
+@dataclass(frozen=True)
 class Word:
     segments: tuple[Literal | Parameter | Execution | ArrayElements, ...]
     line: int
 
-    def literal(self) -> str | None:
+    def literal(self) -> LiteralWord | ExpandedWord:
         if all(isinstance(segment, Literal) for segment in self.segments):
-            return "".join(segment.text for segment in self.segments if isinstance(segment, Literal))
-        return None
+            return LiteralWord("".join(segment.text for segment in self.segments if isinstance(segment, Literal)))
+        return ExpandedWord("".join(segment.text if isinstance(segment, Literal) else UNKNOWN_VALUE
+                                    for segment in self.segments))
 
     def keyword(self, text: str) -> bool:
-        return self.literal() == text and all(isinstance(segment, Literal) and not segment.quoted
-                                             for segment in self.segments)
+        value = self.literal()
+        return isinstance(value, LiteralWord) and value.text == text and all(
+            isinstance(segment, Literal) and not segment.quoted for segment in self.segments)
 
 
 @dataclass
@@ -105,6 +120,11 @@ class Program:
     commands: tuple[SimpleCommand | Compound, ...]
 
 
+def alternatives(programs: tuple[Program, ...]) -> Compound:
+    """Keep each possible branch separate from the surrounding sequence."""
+    return Compound("alternatives", Program(tuple(Compound("branch", program) for program in programs)))
+
+
 _OPERATORS = (";;&", ";;", ";&", "&&", "||", "|&", ";", "&", "|", "(", ")", "\n")
 _REDIRECT = re.compile(r"([0-9]*)(<<<|<<-|<<|&>>|&>|>>|<>|<&|>&|>\||<|>)")
 _NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
@@ -123,6 +143,7 @@ class Lexer:
     position: int = 0
     line: int = 1
     pending: list[HereDocument] = field(default_factory=list)
+    readable_tokens: list[Word | Operator | Redirection] = field(default_factory=list, init=False)
 
     def advance(self, count: int = 1) -> str:
         text = self.source[self.position:self.position + count]
@@ -160,9 +181,9 @@ class Lexer:
                     _ = self.advance()
                 delimiter = self.word()
                 literal = delimiter.literal()
-                if literal is None:
+                if isinstance(literal, ExpandedWord):
                     raise ShellSyntaxError("dynamic heredoc delimiter")
-                documents.append(HereDocument(literal, any(isinstance(part, Literal) and part.quoted for part in delimiter.segments), tabs))
+                documents.append(HereDocument(literal.text, any(isinstance(part, Literal) and part.quoted for part in delimiter.segments), tabs))
                 continue
             if char == "\n" and documents:
                 _ = self.advance()
@@ -362,7 +383,7 @@ class Lexer:
         self.pending.clear()
 
     def tokens(self) -> list[Word | Operator | Redirection]:
-        result: list[Word | Operator | Redirection] = []
+        result = self.readable_tokens
         while self.position < len(self.source):
             char = self.source[self.position]
             if char in " \t\r":
@@ -386,9 +407,9 @@ class Lexer:
                 document: HereDocument | NoHereDocument = NoHereDocument()
                 if operator in {"<<", "<<-"}:
                     delimiter = target.literal()
-                    if delimiter is None:
+                    if isinstance(delimiter, ExpandedWord):
                         raise ShellSyntaxError("dynamic heredoc delimiter")
-                    document = HereDocument(delimiter, any(isinstance(part, Literal) and part.quoted
+                    document = HereDocument(delimiter.text, any(isinstance(part, Literal) and part.quoted
                                                           for part in target.segments), operator == "<<-")
                     self.pending.append(document)
                 result.append(Redirection(descriptor, operator, target, document))
@@ -401,7 +422,8 @@ class Lexer:
                     self.documents()
                 continue
             word = self.word()
-            if word.literal() is not None and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*(?:\[[^]]+\])?\+?=", word.literal() or "") and self.source.startswith("(", self.position):
+            value = word.literal()
+            if isinstance(value, LiteralWord) and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*(?:\[[^]]+\])?\+?=", value.text) and self.source.startswith("(", self.position):
                 _ = self.advance()
                 inner = Lexer(self.balanced("(", ")", context=DelimiterContext.WORD_LIST)).tokens()
                 if any(not isinstance(item, Word) and not (isinstance(item, Operator) and item.text == "\n") for item in inner):
@@ -425,6 +447,21 @@ def embedded_segments(text: str, *, process: bool) -> tuple[Literal | Parameter 
         else:
             _ = lexer.advance()
     return tuple(segments)
+
+
+def expanded_text(text: str) -> str:
+    """Keep the known text and replace each heredoc expansion with an unknown value."""
+    lexer = Lexer(text)
+    parts: list[str] = []
+    while lexer.position < len(text):
+        if text[lexer.position] == "\\":
+            parts.append(lexer.advance(2))
+        elif text[lexer.position] in "$`":
+            segment = lexer.expansion(process=False)
+            parts.append(segment.text if isinstance(segment, Literal) else UNKNOWN_VALUE)
+        else:
+            parts.append(lexer.advance())
+    return "".join(parts)
 
 
 def _programs(segments: tuple[Literal | Parameter | Execution, ...]) -> tuple[Program, ...]:
@@ -456,14 +493,33 @@ class Parser:
 
     def program(self, stops: tuple[str, ...] = ()) -> Program:
         commands: list[SimpleCommand | Compound] = []
+        conditional = False
         while self.position < len(self.tokens) and not self.at(*stops):
-            if self.at(";", "&", "&&", "||", "|", "|&", "\n"):
+            if self.at("&&", "||"):
+                conditional = True
                 self.position += 1
                 continue
-            commands.append(self.command())
+            if self.at(";", "&", "|", "|&", "\n"):
+                self.position += 1
+                continue
+            command = self.command()
+            commands.append(alternatives((Program(()), Program((command,)))) if conditional else command)
+            conditional = False
         return Program(tuple(commands))
 
     def command(self) -> SimpleCommand | Compound:
+        if self.at("[["):
+            self.position += 1
+            headers: list[Word] = []
+            while self.position < len(self.tokens) and not self.at("]]"):
+                token = self.tokens[self.position]
+                self.position += 1
+                if isinstance(token, Word):
+                    headers.append(token)
+                elif isinstance(token, Redirection):
+                    headers.append(token.target)
+            self.consume("]]")
+            return Compound("test", Program(()), tuple(headers))
         if self.at("(", "{"):
             subshell = self.at("(")
             self.position += 1
@@ -473,24 +529,26 @@ class Parser:
             return Compound("subshell" if subshell else "group", body)
         if self.at("if"):
             self.position += 1
-            commands = list(self.program(("then",)).commands)
+            conditions = list(self.program(("then",)).commands)
             self.consume("then")
-            commands.extend(self.program(("elif", "else", "fi")).commands)
+            branches = [Program((*conditions, *self.program(("elif", "else", "fi")).commands))]
             while self.at("elif"):
                 self.position += 1
-                commands.extend(self.program(("then",)).commands)
+                conditions.extend(self.program(("then",)).commands)
                 self.consume("then")
-                commands.extend(self.program(("elif", "else", "fi")).commands)
+                branches.append(Program((*conditions, *self.program(("elif", "else", "fi")).commands)))
             if self.at("else"):
                 self.position += 1
-                commands.extend(self.program(("fi",)).commands)
+                branches.append(Program((*conditions, *self.program(("fi",)).commands)))
+            else:
+                branches.append(Program(tuple(conditions)))
             self.consume("fi")
-            return Compound("if", Program(tuple(commands)))
+            return alternatives(tuple(branches))
         if self.at("while", "until", "for", "select"):
             kind = self.tokens[self.position]
             self.position += 1
-            if isinstance(kind, Word) and kind.literal() in {"for", "select"}:
-                headers: list[Word] = []
+            if isinstance(kind, Word) and (kind.keyword("for") or kind.keyword("select")):
+                headers = []
                 while self.position < len(self.tokens) and not self.at("do"):
                     token = self.tokens[self.position]
                     self.position += 1
@@ -514,7 +572,7 @@ class Parser:
                 if isinstance(token, Word):
                     headers.append(token)
             self.consume("in")
-            commands: list[SimpleCommand | Compound] = []
+            branches = [Program(())]
             while not self.at("esac"):
                 while self.at("\n", ";;", ";&", ";;&"):
                     self.position += 1
@@ -526,9 +584,9 @@ class Parser:
                     if isinstance(token, Word):
                         headers.append(token)
                 self.consume(")")
-                commands.extend(self.program((";;", ";&", ";;&", "esac")).commands)
+                branches.append(self.program((";;", ";&", ";;&", "esac")))
             self.consume("esac")
-            return Compound("case", Program(tuple(commands)), tuple(headers))
+            return Compound("case", Program((alternatives(tuple(branches)),)), tuple(headers))
         if self.at("function"):
             self.position += 1
             if self.position == len(self.tokens) or not isinstance(self.tokens[self.position], Word):
@@ -581,3 +639,32 @@ def parse(source: str) -> Program:
     if parser.position != len(parser.tokens):
         raise ShellSyntaxError("unexpected shell suffix")
     return program
+
+
+def readable_program(source: str) -> Program:
+    """Read the commands that remain available after a shell syntax error."""
+    lexer = Lexer(source)
+    tokens: list[Word | Operator | Redirection] = []
+    while lexer.position < len(source):
+        try:
+            tokens.extend(lexer.tokens())
+            break
+        except (ShellSyntaxError, RecursionError):
+            tokens.extend(lexer.readable_tokens)
+            while lexer.position < len(source) and source[lexer.position] not in ";&|\n":
+                _ = lexer.advance()
+            if lexer.position == len(source):
+                break
+            lexer = Lexer(source, lexer.position, lexer.line)
+    parser = Parser(tokens)
+    commands: list[SimpleCommand | Compound] = []
+    while parser.position < len(tokens):
+        start = parser.position
+        if parser.at(";", "&", "&&", "||", "|", "|&", "\n"):
+            parser.position += 1
+            continue
+        try:
+            commands.append(parser.command())
+        except (ShellSyntaxError, RecursionError):
+            parser.position = start + 1
+    return Program(tuple(commands))

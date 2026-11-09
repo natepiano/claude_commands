@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
-"""Install and trust Codex tool checks and the STE context hooks.
+"""Install and trust Codex tool checks, context hooks, and compaction markers.
 
 The tool checks match `apply_patch` or `Bash`. STE runs at SessionStart and
 SubagentStart. Their `*` matchers cover every session source and subagent type.
 Session sources include startup, resume, clear and compact; they are not tool
-names. Listing and trust use the event, matcher, command and timeout together,
+names. PreCompact records the start of manual and automatic compaction.
+UserPromptSubmit and PostCompact clear the session's compaction marker.
+Listing and trust use the event, matcher, command and timeout together,
 so two events can share one script without sharing a trust identity.
 """
 
@@ -19,6 +21,7 @@ import json
 import math
 import os
 import selectors
+import shlex
 import shutil
 import subprocess
 import sys
@@ -35,9 +38,11 @@ class PythonHookScript(NamedTuple):
     """A hook run through the shared Python launcher."""
 
     script: str
+    arguments: tuple[str, ...] = ()
 
     def command(self) -> str:
-        return f'"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/hooks/{self.script}"'
+        command = f'"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/hooks/{self.script}"'
+        return command + (" " + shlex.join(self.arguments) if self.arguments else "")
 
 
 class ShellHookFront(NamedTuple):
@@ -88,6 +93,12 @@ HOOKS: tuple[CodexHook, ...] = (
     CodexHook("ste-subagent", PythonHookScript("session-start-ste.py"), "SubagentStart", 10, "*"),
     CodexHook("queue-start", PythonHookScript("codex-queue-drain.py"), "SessionStart", matcher="*"),
     CodexHook("queue-tools", PythonHookScript("codex-queue-drain.py"), matcher="*"),
+    CodexHook("compaction-marker", PythonHookScript("pre-compact-marker.py", ("--family", "codex")),
+              "PreCompact", matcher="*"),
+    CodexHook("compaction-clear-turn", ShellHookFront("compaction-marker-clear.sh"),
+              "UserPromptSubmit", matcher="*"),
+    CodexHook("compaction-clear-end", PythonHookScript("compaction-marker-clear.py"),
+              "PostCompact", matcher="*"),
 )
 
 
@@ -434,7 +445,8 @@ def _restore_moved_trust(
 
 
 def _listed_fields(hook: CodexHook) -> dict[str, object]:
-    return {"command": hook.command, "eventName": hook.listed_event(), "matcher": hook.matcher,
+    return {"command": hook.command, "eventName": hook.listed_event(),
+            "matcher": None if hook.event == "UserPromptSubmit" else hook.matcher,
             "handlerType": "command", "timeoutSec": hook.timeout}
 
 

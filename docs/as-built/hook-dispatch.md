@@ -28,13 +28,13 @@ their old order; push-delivered runs last, for PushNotification only.
 | `post_tool_use` | basedpyright, fn-length | `Edit\|MultiEdit\|Write` |
 | | context-usage (message off in `config/context_usage.conf`), banned-words | all tools |
 | | push-delivered | `PushNotification` |
-| `stop` | conversation-pause, prose-banned-words, context-deferral (10 s), herdr_tab_title | — |
+| `stop` | compaction-marker-clear, conversation-pause, prose-banned-words, context-deferral (10 s), herdr_tab_title | — |
 
 `settings.json` has one dispatcher entry per event:
 
 - PreToolUse: matcher `Bash|Write|NotebookEdit`, timeout 3040 s.
 - PostToolUse: no matcher, timeout 2430 s.
-- Stop: no matcher, timeout 1840 s.
+- Stop: no matcher, timeout 1850 s.
 
 Each outer timeout covers the largest sum of hook budgets that match one tool, plus 30 s of
 dispatcher overhead, so every hook keeps its full budget.
@@ -57,7 +57,7 @@ These hooks stay outside the dispatcher, as their own entries:
 - the shell hooks: `pre-tool-use-build-hold-guard.sh` (Bash),
   `berth_pre_edit.sh`, `berth_post_bash.sh` and `pre-tool-use-brp-launch-gate.sh`;
 - `pre-tool-use-push-gate.py` (PushNotification, 120 s);
-- the SessionStart, SubagentStart, PreCompact and UserPromptSubmit hooks.
+- the SessionStart, SubagentStart, PreCompact, PostCompact and UserPromptSubmit hooks.
 
 The random-ack PostToolUse entry is removed (user, 2026-10-28 11:59 EDT).
 `post-tool-use-random-ack.sh` stays. Its header names the `settings.json` entry
@@ -95,6 +95,43 @@ The full rules are in the module docstring. In short:
   `systemMessage` line that names the hook and its stderr.
 - Where the Claude Code docs state no rule (simultaneous stderr, reasons,
   `updatedInput`, unknown keys), the docstring writes down the policy.
+
+## Compaction start markers
+
+`pre-compact-marker.py` runs separately because session hooks stay outside the dispatcher.
+Claude's `PreCompact` registration passes `--family claude`.
+The managed Codex `PreCompact` handler passes `--family codex` and uses matcher `*`.
+Both commands read `session_id` from the hook input.
+Codex 0.167.0 supports `PreCompact`; its common input includes `session_id`.
+See the [Codex hook reference](https://learn.chatgpt.com/docs/hooks).
+
+The hook writes `~/.local/state/compaction/<session_id>.json`.
+The file has exactly three fields: `session_id`, `family`, and `started_at`.
+`family` is `claude` or `codex`.
+`started_at` uses ISO 8601 with a UTC offset.
+The atomic file helper writes a temporary file beside the marker, then replaces the marker.
+A new marker replaces the previous marker for that session.
+An exclusive flock on `.lock` covers cleanup, publication, and rollback.
+The hook never waits for the lock: when another run holds it, the hook exits 0 and writes no marker.
+Each invocation removes marker files older than `retention_hours` in `config/compaction_marker.conf`.
+The default retention is 24 hours.
+An input or publication error produces no stdout, publishes no new marker, and exits 0.
+A cleanup error skips that entry and permits the marker write.
+The cargo-handler compares this marker with the last transcript `compact_boundary`.
+`compaction_marker.py` shares the marker folder, session id pattern, and `clear(session_id)` function.
+The clear function deletes only that session's marker and takes no lock.
+Claude clears the marker at Stop, UserPromptSubmit, and PostCompact.
+Stop uses the existing dispatcher process.
+UserPromptSubmit clears the marker before the conversation-pause work in its existing process.
+PostCompact uses `compaction-marker-clear.py` as a separate command.
+Codex clears the marker at UserPromptSubmit and PostCompact.
+Its UserPromptSubmit shell command exits before Python starts when no `*.json` marker exists.
+Codex 0.167.0 lists both events; UserPromptSubmit reports no matcher.
+All clear entry errors exit 0 without output.
+The next turn clears a marker when compaction fails or the user cancels it.
+
+Claude reads the registration from `settings.json` after deployment.
+Install and trust the Codex handler separately for each account home through `CODEX_HOME`.
 
 ## Bench
 

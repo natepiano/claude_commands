@@ -78,7 +78,7 @@ from scripts.lib.user_zone import user_zone  # noqa: E402
 from scripts.lib.process_failure import failure_detail  # noqa: E402
 from scripts.lib import scratch  # noqa: E402
 from scripts.test_times import gate_record
-from scripts.lint import memory_admit  # noqa: E402
+from scripts.build_queue import admission_records  # noqa: E402
 from scripts.build_queue import progress_profile
 from scripts.build_queue.admission_client import AdmissionHoldCheck  # noqa: E402
 from scripts.build_queue.queue_place import (  # noqa: E402
@@ -694,7 +694,7 @@ def kill_job_group(job: RunningGateJob) -> None:
 
 def stop_gate_jobs(jobs: Sequence[RunningGateJob]) -> None:
     """Stop all groups with one deadline, then reap their leaders."""
-    config = memory_admit.read_memory_config()
+    config = admission_records.read_memory_config()
     deadline = time.monotonic() + config.program_stop_seconds
     for job in jobs:
         try:
@@ -1643,16 +1643,16 @@ def merge_checkpoint(args: GateArguments) -> int:
         if merged != baseline:
             write_push_record(push_record_path(repo, "checkpoint", origin + ":" + checkpoint),
                               RecordedPush(baseline, merged, checkpoint))
-        previous_unit = os.environ.get(memory_admit.BUILDLOG_UNIT)
-        os.environ[memory_admit.BUILDLOG_UNIT] = args.unit
+        previous_unit = os.environ.get(admission_records.BUILDLOG_UNIT)
+        os.environ[admission_records.BUILDLOG_UNIT] = args.unit
         try:
             suites = run_gate_suites(repo, args.type_dirs, float(args.module_time_limit_s),
                                 source="checkpoint", full=args.full)
         finally:
             if previous_unit is None:
-                _ = os.environ.pop(memory_admit.BUILDLOG_UNIT, None)
+                _ = os.environ.pop(admission_records.BUILDLOG_UNIT, None)
             else:
-                os.environ[memory_admit.BUILDLOG_UNIT] = previous_unit
+                os.environ[admission_records.BUILDLOG_UNIT] = previous_unit
         if not suites.passed:
             raise GateRefused("RED: types or suites failed")
         fetch_branches(repo, "main")
