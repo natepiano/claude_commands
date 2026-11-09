@@ -571,11 +571,9 @@ if os.environ.get('STAFF_TEST_SSH_FAIL'):
     if reason:
         print(reason, file=sys.stderr)
     raise SystemExit(int(os.environ.get('STAFF_TEST_SSH_EXIT', '255')))
-if (len(arguments) < 6 or arguments[:3] != ['-o', 'BatchMode=yes', '-o']
-        or not arguments[3].startswith('ConnectTimeout=') or arguments[4] != 'natedev'
-        or int(arguments[3].split('=', 1)[1]) <= 0):
+if len(arguments) < 4 or arguments[:3] != ['-o', 'BatchMode=yes', 'natedev']:
     raise SystemExit('unexpected SSH target or options')
-command = arguments[5:]
+command = arguments[3:]
 if len(command) == 1:
     command = shlex.split(command[0])
 if command[:2] != ['~/.claude/scripts/lib/py', '~/.claude/scripts/production/staff.py']:
@@ -1077,10 +1075,9 @@ class StaffTestCase(unittest.TestCase):
         commands: list[list[str]] = []
         for line in self.ssh_log.read_text().splitlines():
             arguments = cast(list[str], json.loads(line))
-            self.assertEqual(arguments[:3], ["-o", "BatchMode=yes", "-o"])
-            self.assertEqual(arguments[4], "natedev")
-            self.assertRegex(arguments[3], r"^ConnectTimeout=[1-9][0-9]*$")
-            command = shlex.split(arguments[5]) if len(arguments) == 6 else arguments[5:]
+            self.assertEqual(arguments[:2], ["-o", "BatchMode=yes"])
+            self.assertEqual(arguments[2], "natedev")
+            command = shlex.split(arguments[3]) if len(arguments) == 4 else arguments[3:]
             self.assertEqual(command[:2], ["~/.claude/scripts/lib/py", "~/.claude/scripts/production/staff.py"])
             self.assertIn("--json", command[2:])
             commands.append(command[2:])

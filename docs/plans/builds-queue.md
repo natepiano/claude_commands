@@ -704,6 +704,23 @@ After Phase 30, `build_targets.py` eligible, reserve and release-wait still use 
 
 The user approved aws-unit's design on 2026-11-08. Builds moved it to report, which starts after Phase 36 lands, because both edit memory_feed.py and memory_live.html.
 
+### Phase 41 — Every natedev process that talks to the Mac ends when the link dies  · status: done
+
+**Depends on:** none.
+
+1. **The ask (user, 2026-11-09).** "these connections should be self-healing". Mac cleanup must never need the user again. At 13:40 the Mac went off during a floor sweep. `scripts/mac_test/floor_claims.py` held `~/.local/state/mac-test/state.lock` for more than two hours, four build steps waited, and the user had to kill the process.
+2. **Goal.** When the Mac drops, every natedev process that talks to it ends by itself within a short bound, and every lock or claim it held is free with no person. Bounds come from config. The design adds no signal handlers and no watchdog process.
+3. **Cause (checked 2026-11-09).** `ssh -G mac` shows `ServerAliveInterval 15` and `ServerAliveCountMax 3`, set under `Host *` on both machines, so a dead outbound link ends in 45 s. `ConnectTimeout` has no shared value. The 13:40 hang ran inbound: the Mac opened ssh to natedev, and `floor_claims.py` held `state.lock` in `sys.stdin.read()`. Nothing on natedev checks that an inbound client is alive. The stdin wait is an inference from the code, because the process and its journal are gone.
+4. **Lock (verify).** Verify's phase 42c, tip `e990e8be7`, releases the lock before the print and removes the stdin wait. Queue adds no lock code.
+5. **One place for link bounds (natedev).** `ConnectTimeout 10` goes under `Host *` in `/etc/nixos/modules/linux/ssh.nix` and `modules/darwin/ssh.nix`. Natedev removes the per-call value in `rebuild.nix` and `remote-desktop.nix`.
+6. **Callers outside `scripts/mac_test` (queue).** Remove `-o ConnectTimeout` and `-o ServerAlive*`. Keep each whole-call limit and `BatchMode`. Delete the two config keys that set the same bound, `codex_update_connect_timeout_seconds` and `role_map_connect_timeout_seconds`. `scripts/buildlog/sync.py` chooses its options by destination host, from `sync.hosts.mac` and `sync.hosts.natedev`, so an AWS destination keeps its connect option. Land only after item 5 is live on natedev.
+7. **Callers in `scripts/mac_test` (verify).** The same removal, on top of 42c (tip `e990e8be7`), after queue tells verify that the shared `ConnectTimeout` is live.
+8. **Inbound check (queue).** The check listed each command the Mac runs on natedev. Besides `floor_claims.py`, one command held a lock while it waited on the link: `staff.py apply-seed` read stdin inside the staff operation lock. It now reads stdin before it takes the lock. An offload `mirror-receive` holds its mirror lease across the rsync pipe only when natedev is the target, which the loopback proof alone does.
+9. **Retained remote claims stay.** A claim stays while the Mac is off and frees `claim_idle_minutes` after the Mac returns, with no person. Verify found that the 1 h 52 min wait was the same held `state.lock` as the 13:40 case, from 13:34:30 to about 15:52:38, so no claim change is necessary.
+
+**Workers:** 1 writer for items 6 and 8. **Gate:** targeted test, basedpyright 0/0/0, adversary review.
+**Change-Review:** none — a Mac link that dies ends the same way; only where the bound is set changes.
+
 ### Phase 40 — The admission client starts with only the wire format  · status: done
 
 **Depends on:** none.

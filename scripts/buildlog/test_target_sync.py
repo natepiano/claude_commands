@@ -206,7 +206,8 @@ class TargetSyncTests(unittest.TestCase):
         self.assertEqual(self.exchange(), 0)
         for argv, timeout in self.commands:
             self.assertEqual(timeout, 7 if argv[0] == "ssh" else 11)
-            self.assertIn("ConnectTimeout=3", " ".join(argv))
+            if "fake-aws" in " ".join(argv):
+                self.assertIn("ConnectTimeout=3", " ".join(argv))
         self.commands.clear()
         _ = self.registry.write_text(self.registry.read_text().replace("sync.reach_timeout_s=7", "sync.reach_timeout_s=13"))
 
@@ -340,7 +341,7 @@ class TargetSyncTests(unittest.TestCase):
 
         self.assertIn(health.Machine.NATEDEV, machines)
 
-    def test_vault_and_sync_share_the_configured_connect_timeout(self) -> None:
+    def test_vault_transport_selects_connect_timeout_by_destination_host(self) -> None:
         commands: list[list[str]] = []
 
         def reply(argv: list[str], timeout: float) -> subprocess.CompletedProcess[str]:
@@ -350,15 +351,20 @@ class TargetSyncTests(unittest.TestCase):
             outcome = f"VAULT_OUTCOME=merged:0:{'a' * 40}\n" if argv[0] == "ssh" else ""
             return subprocess.CompletedProcess(argv, 0, outcome, "")
 
-        with mock.patch.object(vault_pull, "run", side_effect=reply), mock.patch.object(ci, "warm", return_value=True):
-            self.assertIsInstance(vault_pull.pull(), vault_pull.Current)
-        self.assertTrue(all("ConnectTimeout=3" in " ".join(argv) for argv in commands))
-        commands.clear()
-        _ = self.registry.write_text(self.registry.read_text().replace(
-            "sync.connect_timeout_s=3", "sync.connect_timeout_s=9"))
-        with mock.patch.object(vault_pull, "run", side_effect=reply), mock.patch.object(ci, "warm", return_value=True):
-            self.assertIsInstance(vault_pull.pull(), vault_pull.Current)
-        self.assertTrue(all("ConnectTimeout=9" in " ".join(argv) for argv in commands))
+        settings = self.registry.read_text()
+        for host, timeout in (("aws-build", 3), ("aws-build", 9), ("Mac", 9)):
+            with self.subTest(host=host, timeout=timeout), mock.patch.dict(os.environ, {"BUILDLOG_PEER": host}):
+                commands.clear()
+                _ = self.registry.write_text(settings.replace(
+                    "sync.connect_timeout_s=3", f"sync.connect_timeout_s={timeout}"))
+                with mock.patch.object(vault_pull, "run", side_effect=reply), mock.patch.object(ci, "warm", return_value=True):
+                    self.assertIsInstance(vault_pull.pull(), vault_pull.Current)
+                self.assertEqual([argv[0] for argv in commands], ["git", "ssh", "git"])
+                for argv in commands:
+                    if host == "aws-build":
+                        self.assertIn(f"ConnectTimeout={timeout}", " ".join(argv))
+                    else:
+                        self.assertNotIn("ConnectTimeout", " ".join(argv))
 
 
 if __name__ == "__main__":

@@ -129,7 +129,7 @@ In `runs`, `phases` and `passes`, `state` is `open` until the finish event and `
 
 ### The Mac half
 
-The Mac is read on the Mac. `collect_mac` runs `python3 -c REMOTE_BOOTSTRAP` over `ssh -o BatchMode=yes -o ConnectTimeout=5 -o ServerAliveInterval=5 -o ServerAliveCountMax=1 natemccoy@mac` (`MAC_HOST`), with `; printf "\nrc=%s\n" "$?"` appended. `reader_payload` sends the sources of `scripts/usage/activity.py`, `agents_log.py`, `rollouts.py` and `collect.py`, in that order, and the stored Mac cursors on stdin; the bootstrap loads them under their module names and calls `read_mac(offsets)`. The Mac needs `python3` and no checkout, and nothing is written to its disk.
+The Mac is read on the Mac. `collect_mac` runs `python3 -c REMOTE_BOOTSTRAP` over `ssh -o BatchMode=yes natemccoy@mac` (`MAC_HOST`). It appends `; printf "\nrc=%s\n" "$?"`. `reader_payload` sends the sources of `scripts/usage/activity.py`, `agents_log.py`, `rollouts.py` and `collect.py`, in that order, and the stored Mac cursors on stdin; the bootstrap loads them under their module names and calls `read_mac(offsets)`. The Mac needs `python3` and no checkout, and nothing is written to its disk.
 
 `read_mac` prints one JSON record per line: `manifest`; `agents.jsonl` as base64 `chunk` records; one `director` record per run-history director; `attribution_ready`; then per changed file a `file` record, one `measurement` per turn, compaction, opening, edit or folder (`kind` names which), one `outcome` per kept run-history event, and its `cursor`, or `problem` when the file cannot be read. Transcripts and run-history files never cross the link.
 

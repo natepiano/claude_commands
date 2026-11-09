@@ -276,7 +276,7 @@ always=
         commands = (
             ("git", "symbolic-ref", "HEAD", "refs/heads/other"),
             ("git", "status", "--porcelain", "--output=/tmp/marker"),
-            ("ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", "mac",
+            ("ssh", "-o", "BatchMode=yes", "mac",
              "python3 ~/.claude/scripts/accounts/accounts.py role-map-read; touch /tmp/marker"),
             ("ssh", "mac", "python3 ~/.claude/scripts/message/roster.py --here --snapshot; touch /tmp/marker"),
             ("herdr", "pane", "list", "--output", "/tmp/marker"),
@@ -301,11 +301,11 @@ always=
             ("git", "-C", "/fixture", "rev-list", "--count", "--invert-grep",
              "--grep=^agent-sessions-snapshot: ", "@{u}..HEAD"),
             ("git", "-C", "/fixture", "status", "--porcelain"),
-            ("ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", "natedev",
+            ("ssh", "-o", "BatchMode=yes", "natedev",
              "python3 ~/.claude/scripts/accounts/accounts.py role-map-read"),
-            ("ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", "natedev",
+            ("ssh", "-o", "BatchMode=yes", "natedev",
              "python3 ~/.claude/scripts/accounts/accounts.py next-read"),
-            ("ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "mac",
+            ("ssh", "-o", "BatchMode=yes", "mac",
              "~/.claude/scripts/lib/py ~/.claude/scripts/message/roster.py --here --snapshot"),
             ("herdr", "--session", "agents", "pane", "list"),
             ("herdr", "--session", "agents", "pane", "process-info", "--pane", "new-pane"),
@@ -328,11 +328,11 @@ always=
         read = "python3 ~/.claude/scripts/accounts/accounts.py role-map-read"
         for operator in (";", "|", "&", "`", "$", "<", ">", "\n"):
             with self.subTest(operator=operator):
-                self.assertFalse(profile.readonly_child(("ssh", "-o", "BatchMode=yes", "-o",
-                    "ConnectTimeout=5", "mac", read + operator + "touch /tmp/marker")))
+                self.assertFalse(profile.readonly_child(("ssh", "-o", "BatchMode=yes",
+                    "mac", read + operator + "touch /tmp/marker")))
 
     def test_roster_child_runs_the_fixed_read_form_without_shell_expansion(self) -> None:
-        words = ("ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "mac",
+        words = ("ssh", "-o", "BatchMode=yes", "mac",
                  '\"$HOME/.claude/scripts/lib/py\" \"$HOME/.claude/scripts/message/roster.py\" --here --snapshot')
         entry = next(entry for entry in profile.patch_list(self.pass_) if entry.mode == "child_launch")
         with patch.object(subprocess.Popen, "__init__") as started:

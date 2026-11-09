@@ -1061,7 +1061,7 @@ class AccountsTests(unittest.TestCase):
         self.assertEqual({path: path.read_bytes() for path in self.home.rglob("*") if path.is_file()}, before)
         with patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0, stdout=text, stderr="")) as fetch:
             self.assertEqual(role_map.ssh_role_map(("session-counts-read",), machine=peer), text)
-        fetch.assert_called_once_with(("ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", peer,
+        fetch.assert_called_once_with(("ssh", "-o", "BatchMode=yes", peer,
             "~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py session-counts-read"),
             capture_output=True, text=True, timeout=20)
 
@@ -1768,7 +1768,7 @@ class AccountsTests(unittest.TestCase):
                     self.assertEqual(run.call_args_list, [
                         call([program, "update", "--yes"], env=environment, check=False),
                         call([program, "--version"], env=environment, capture_output=True, text=True, timeout=15, check=False),
-                        call(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", peer,
+                        call(["ssh", "-o", "BatchMode=yes", peer,
                             'CODEX_HOME="$HOME/.codex" "$HOME/.local/bin/codex" update >&2 && "$HOME/.local/bin/codex" --version'],
                             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, timeout=600, check=False),
                     ])

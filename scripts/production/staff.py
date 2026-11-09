@@ -1062,7 +1062,7 @@ def _remote(arguments: list[str], *, input_text: str | None = None) -> object:
     elif arguments[0] == "retire":
         arguments = [*arguments, "--worker-row"]
     timeout = _wait_seconds("REMOTE_SECONDS")
-    command = ["ssh", "-o", "BatchMode=yes", "-o", f"ConnectTimeout={max(1, int(timeout))}", OWNER_MACHINE,
+    command = ["ssh", "-o", "BatchMode=yes", OWNER_MACHINE,
                "~/.claude/scripts/lib/py ~/.claude/scripts/production/staff.py "
                + shlex.join([*arguments, "--json"])]
     try:
@@ -1255,9 +1255,7 @@ mv -f "$temporary" "$directory/staff.json"
             previous_handler = signal.signal(signal.SIGTERM, stop)
             try:
                 with subprocess.Popen(
-                    ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
-                     "-o", "ServerAliveInterval=5", "-o", "ServerAliveCountMax=2",
-                     remote.other_machine(), command],
+                    ["ssh", "-o", "BatchMode=yes", remote.other_machine(), command],
                     stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
                 ) as process:
                     try:
@@ -2028,7 +2026,7 @@ def _print_row(row: StaffRow, path: str) -> None:
     print(f"{row.id:<12}  {row.kind:<10}  {path}")
 
 
-def _mutate(arguments: _Arguments) -> StaffRow | StaffSnapshot | tuple[StaffId, ...] | None:
+def _mutate(arguments: _Arguments, seed_text: str) -> StaffRow | StaffSnapshot | tuple[StaffId, ...] | None:
     if arguments.verb == "set-worker-role":
         return set_worker_role(StaffId(arguments.target), KnownWorkerRole(cast(WorkerRole, arguments.value)))
     if arguments.verb == "set-home":
@@ -2084,7 +2082,7 @@ def _mutate(arguments: _Arguments) -> StaffRow | StaffSnapshot | tuple[StaffId, 
     if arguments.verb == "move":
         return move(StaffId(arguments.target), _parent(arguments.parent))
     if arguments.verb == "apply-seed":
-        return apply_seed(SeedInput.from_json(_decode(sys.stdin.read())))
+        return apply_seed(SeedInput.from_json(_decode(seed_text)))
     if arguments.row_write and is_owner():
         require_stopped(StaffId(arguments.target))
         return _transaction(lambda rows: _retire_row(rows, StaffId(arguments.target)))
@@ -2147,8 +2145,9 @@ def _main(arguments: _Arguments) -> int:
     if arguments.row_write and not (arguments.verb in ("retire", "ensure-worker", "update-current-session") or
                                     arguments.verb == "ensure" and arguments.kind == "worker"):
         raise StaffRefused("row writes are for worker admission and retirement")
+    seed_text = sys.stdin.read() if arguments.verb == "apply-seed" else ""
     with operation() if is_owner() and not arguments.row_write and arguments.verb not in ("set-worker-role", "set-home") else nullcontext():
-        result = _mutate(arguments)
+        result = _mutate(arguments, seed_text)
     if isinstance(result, tuple):
         print(json.dumps(result))
         return 0

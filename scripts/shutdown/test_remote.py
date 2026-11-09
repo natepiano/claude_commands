@@ -109,13 +109,13 @@ raise SystemExit(int(os.environ.get("SHUTDOWN_TEST_SSH_STATUS", "0")))
         self.assertEqual((status, output), (3, "remote output"))
         called = self.invocation()
         self.assertEqual(
-            called["arguments"][:5],
-            ["-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "mac"],
+            called["arguments"][:3],
+            ["-o", "BatchMode=yes", "mac"],
         )
         self.assertEqual(called["stdin"], "request body")
         self.assertNotIn("ServerAliveInterval=15", called["arguments"])
         self.assertNotIn("ServerAliveCountMax=4", called["arguments"])
-        command = called["arguments"][5]
+        command = called["arguments"][3]
         self.assertIn('"$HOME/.claude/scripts/lib/py"', command)
         self.assertIn('"$HOME/.claude/scripts/shutdown/shutdown.py"', command)
         self.assertIn("status claude2 --json", command)
@@ -130,7 +130,7 @@ raise SystemExit(int(os.environ.get("SHUTDOWN_TEST_SSH_STATUS", "0")))
         self.assertEqual(status, 255)
         self.assertEqual(output, "partial output")
 
-    def test_while_link_alive_adds_keepalives_before_the_host(self) -> None:
+    def test_while_link_alive_leaves_link_bounds_in_the_ssh_config(self) -> None:
         os.environ["SHUTDOWN_TEST_REMOTE_STATUS"] = "0"
 
         status, _ = remote.run_remote(
@@ -141,16 +141,10 @@ raise SystemExit(int(os.environ.get("SHUTDOWN_TEST_SSH_STATUS", "0")))
         self.assertEqual(status, 0)
         called = self.invocation()
         self.assertEqual(
-            called["arguments"][:9],
+            called["arguments"][:3],
             [
                 "-o",
                 "BatchMode=yes",
-                "-o",
-                "ConnectTimeout=10",
-                "-o",
-                "ServerAliveInterval=15",
-                "-o",
-                "ServerAliveCountMax=4",
                 "mac",
             ],
         )

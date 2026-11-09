@@ -1426,7 +1426,7 @@ class PeerNotReached:
 def peer_snapshot(environment: Mapping[str, str]) -> Roster | PeerNotReached:
     """Read only the peer, decoding states immediately at the ssh boundary."""
     host = remote.other_machine()
-    command = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", host,
+    command = ["ssh", "-o", "BatchMode=yes", host,
                '\"$HOME/.claude/scripts/lib/py\" \"$HOME/.claude/scripts/message/roster.py\" --here --snapshot']
     try:
         # ssh forwards its input to the peer. It gets none, so it never waits on the caller's

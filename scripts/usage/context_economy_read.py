@@ -557,8 +557,7 @@ def _mac_command() -> list[str]:
     if configured:
         return [*(_wire_text(value) for value in _wire_list(cast(object, json.loads(configured)))), program]
 
-    return ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", "-o", "ServerAliveInterval=5",
-            "-o", "ServerAliveCountMax=1", os.environ.get("CONTEXT_ECONOMY_MAC_HOST", MAC_HOST),
+    return ["ssh", "-o", "BatchMode=yes", os.environ.get("CONTEXT_ECONOMY_MAC_HOST", MAC_HOST),
             shlex.join(("python3", "-c", program))]
 
 

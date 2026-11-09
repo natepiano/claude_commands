@@ -391,7 +391,7 @@ class RowResolver:
             )
             try:
                 result = subprocess.run(
-                    ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", machine,
+                    ["ssh", "-o", "BatchMode=yes", machine,
                      "~/.claude/scripts/lib/py -B -c " + shlex.quote(code)],
                     input=json.dumps(requests), capture_output=True, text=True, check=False,
                 )
