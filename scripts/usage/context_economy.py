@@ -71,6 +71,19 @@ class GroupResult:
 
 
 @dataclass(frozen=True)
+class MacReadSucceeded:
+    """The Mac read completed, also when it returned no sessions."""
+
+
+@dataclass(frozen=True)
+class MacReadUnknown:
+    """An older result did not record the Mac read."""
+
+
+MacReadStatus = MacReadSucceeded | MacReadFailed | MacReadUnknown
+
+
+@dataclass(frozen=True)
 class Report:
     since: datetime
     until: datetime
@@ -78,6 +91,7 @@ class Report:
     left_out: int
     role_quantities: dict[str, dict[str, QuantitySummary]] = field(default_factory=dict)
     unweighted_models: dict[str, int] = field(default_factory=dict)
+    mac: MacReadStatus = field(default_factory=MacReadSucceeded)
 
 
 def summarize(values: Sequence[float]) -> QuantitySummary:
@@ -374,8 +388,25 @@ def _summary_data(summary: QuantitySummary) -> dict[str, object]:
     return {"n": summary.n, "median": summary.median, "mean": summary.mean, "p25": summary.p25, "p75": summary.p75}
 
 
+def _mac_data(mac: MacReadStatus) -> dict[str, object]:
+    if isinstance(mac, MacReadFailed):
+        return {"state": "failed", "reason": mac.reason}
+    return {"state": "unknown" if isinstance(mac, MacReadUnknown) else "read"}
+
+
+def _saved_mac(data: dict[str, object]) -> MacReadStatus:
+    mac = _object(data.get("mac", {"state": "unknown"}))
+    if mac["state"] == "failed":
+        return MacReadFailed(cast(str, mac["reason"]))
+    return MacReadSucceeded() if mac["state"] == "read" else MacReadUnknown()
+
+
 def save_result(name: str, report: Report, folder: Path) -> Path:
     """Write one result with exclusive creation; an existing result remains unchanged."""
+    return _publish_result(name, report, folder, replace_existing=False)
+
+
+def _publish_result(name: str, report: Report, folder: Path, *, replace_existing: bool) -> Path:
     path = folder / (name + ".json")
     groups: list[dict[str, object]] = [{
         "machine": group.machine, "family": group.family,
@@ -386,6 +417,7 @@ def save_result(name: str, report: Report, folder: Path) -> Path:
     } for group in report.groups]
     data = {"name": name, "window": {"since": report.since.isoformat(), "until": report.until.isoformat()},
             "left_out": report.left_out, "groups": groups, "unweighted_models": report.unweighted_models,
+            "mac": _mac_data(report.mac),
             "role_quantities": {role: {quantity: _summary_data(summary) for quantity, summary in quantities.items()}
                                 for role, quantities in report.role_quantities.items()}}
     folder.mkdir(parents=True, exist_ok=True)
@@ -396,9 +428,12 @@ def save_result(name: str, report: Report, folder: Path) -> Path:
         with temporary as stream:
             json.dump(data, stream, ensure_ascii=False, indent=2)
             _ = stream.write("\n")
-        os.link(temporary_path, path)
+        if replace_existing:
+            os.replace(temporary_path, path)
+        else:
+            os.link(temporary_path, path)
     finally:
-        temporary_path.unlink()
+        temporary_path.unlink(missing_ok=True)
     return path
 
 
@@ -427,7 +462,7 @@ def read_result(path: Path) -> Report:
                   groups, cast(int, data["left_out"]),
                   {role: {name: _summary(value) for name, value in _object(quantities).items()}
                    for role, quantities in _object(data["role_quantities"]).items()},
-                  {model: cast(int, count) for model, count in _object(data["unweighted_models"]).items()})
+                  {model: cast(int, count) for model, count in _object(data["unweighted_models"]).items()}, _saved_mac(data))
 
 
 def _confounds(saved: Report, current: Report) -> list[str]:
@@ -478,11 +513,11 @@ def compare_reports(saved: Report, current: Report) -> str:
 
 def trend(folder: Path, role: str = "") -> str:
     reports = [(path.stem, read_result(path)) for path in folder.glob("*.json")]
-    lines = ["| result | window | roles | requests | " + " | ".join(QUANTITIES) + " |",
-             "| --- | --- | --- | ---: | " + " | ".join(["---"] * len(QUANTITIES)) + " |"]
+    lines = ["| result | window | mac | roles | requests | " + " | ".join(QUANTITIES) + " |",
+             "| --- | --- | --- | --- | ---: | " + " | ".join(["---"] * len(QUANTITIES)) + " |"]
     for name, report in sorted(reports, key=lambda entry: (entry[1].since, entry[0])):
         roles = sorted(group_role for group_role in report.role_quantities if not role or group_role == role)
-        if not roles:
+        if role and not roles:
             continue
         quantities = ["; ".join(f"{group_role}: {_value(summary.mean, quantity)} (n={summary.n})"
                                if summary.n else f"{group_role}: — (n=0)"
@@ -491,13 +526,15 @@ def trend(folder: Path, role: str = "") -> str:
                       for quantity in QUANTITIES]
         count = sum(group.requests for group in report.groups if group.role in roles)
         lines.append("| " + " | ".join(_cell(column) for column in
-            [name, _window(report), ", ".join(roles), str(count), *quantities]) + " |")
+            [name, _window(report), "mac failed" if isinstance(report.mac, MacReadFailed) else "",
+             ", ".join(roles), str(count), *quantities]) + " |")
     return "\n".join(lines)
 
 
 class _Arguments(argparse.Namespace):
     command: str = "report"
     name: str = ""
+    last_week: bool = False
     since: str = ""
     until: str = ""
     role: str = ""
@@ -537,8 +574,11 @@ def _parser() -> argparse.ArgumentParser:
         subcommand = commands.add_parser(command)
         for path in ("projects-root", "store", "checkout", "saved-results"):
             _ = subcommand.add_argument("--" + path, type=Path, default=argparse.SUPPRESS)
-        if command in ("save", "compare"):
+        if command == "compare":
             _ = subcommand.add_argument("name")
+        if command == "save":
+            _ = subcommand.add_argument("name", nargs="?", default="")
+            _ = subcommand.add_argument("--last-week", action="store_true")
         if command != "trend":
             _ = subcommand.add_argument("--since", default="")
             _ = subcommand.add_argument("--until", default="")
@@ -548,7 +588,7 @@ def _parser() -> argparse.ArgumentParser:
             _ = subcommand.add_argument("--role", default="")
         if command == "report":
             _ = subcommand.add_argument("--by", choices=("settings", "week"), default="settings")
-        if command in ("report", "save"):
+        if command in ("report", "save", "compare"):
             _ = subcommand.add_argument("--where", type=_where, action="append", default=argparse.SUPPRESS)
     return parser
 
@@ -560,15 +600,42 @@ def _bound(value: str, fallback: datetime) -> datetime:
     return at.replace(tzinfo=user_zone()) if at.tzinfo is None else at
 
 
+def current_time() -> datetime:
+    return datetime.now(user_zone())
+
+
+def last_week(now: datetime) -> tuple[str, datetime, datetime]:
+    """Name the previous complete ISO week and retain its local midnight bounds."""
+    local = now.astimezone(user_zone())
+    until = local.replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(days=local.weekday())
+    since = until - timedelta(days=7)
+    year, week, _ = since.isocalendar()
+    return f"week-{year}-W{week:02d}", since, until
+
+
 def main(argv: Sequence[str] = ()) -> int:
     args = _parser().parse_args(argv, namespace=_Arguments())
     try:
         if args.command == "trend":
             print(trend(args.saved_results, args.role))
             return 0
-        now = datetime.now(user_zone())
-        since = _bound(args.since, now - timedelta(days=7))
-        until = _bound(args.until, now)
+        now = current_time()
+        retry_week = False
+        if args.command == "save" and args.last_week:
+            if args.name or args.since or args.until or args.where or args.family != "all":
+                raise ValueError("save --last-week takes no name, --since/--until, --where, or filtered --family")
+            args.name, since, until = last_week(now)
+            existing = args.saved_results / (args.name + ".json")
+            if existing.is_file():
+                if not isinstance(read_result(existing).mac, MacReadFailed):
+                    print(existing)
+                    return 0
+                retry_week = True
+        else:
+            if args.command == "save" and not args.name:
+                raise ValueError("save needs a name or --last-week")
+            since = _bound(args.since, now - timedelta(days=7))
+            until = _bound(args.until, now)
         machine = socket.gethostname()
         sessions = read_claude(args.projects_root, since, until, machine)
         roots = args.codex_root or sorted(Path.home().glob(".codex*/sessions"))
@@ -581,8 +648,22 @@ def main(argv: Sequence[str] = ()) -> int:
                 timelines[remote_machine] = mac.timeline
         report = build_report(sessions, timelines, args.store, since, until,
                               by=args.by, role=args.role, family=args.family, where=args.where)
+        report = replace(report, mac=mac if isinstance(mac, MacReadFailed) else MacReadSucceeded())
         if args.command == "save":
-            print(save_result(args.name, report, args.saved_results))
+            if retry_week:
+                saved = args.saved_results / (args.name + ".json")
+                if isinstance(mac, MacSessions):
+                    saved = _publish_result(args.name, report, args.saved_results, replace_existing=True)
+            else:
+                try:
+                    saved = save_result(args.name, report, args.saved_results)
+                except FileExistsError:
+                    if not args.last_week:
+                        raise
+                    saved = args.saved_results / (args.name + ".json")
+            print(saved)
+            if isinstance(mac, MacReadFailed):
+                print(f"mac: {mac.reason}")
         elif args.command == "compare":
             print(compare_reports(read_result(args.saved_results / (args.name + ".json")), report))
         else:
