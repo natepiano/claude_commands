@@ -40,51 +40,28 @@
 ### Phase 1 — Read sessions and settings at run time  · status: done
 **Depends on:** none
 
-#### Work Order
+#### As-built
 
-**Goal:** `context_economy_read.py` gives, for a time window, every Claude session's requests, compactions and starts from the transcripts, and the timeline of tracked settings from git.
-
-**Spec:**
-1. New `config/context_economy.conf`, read with the `scripts/lib` conf reader the other `config/*.conf` files use:
-   ```
-   # settings.json keys to track, space-separated
-   settings_keys = autoCompactWindow precomputeCompactionEnabled model
-   # repo files to track by size and short sha, space-separated
-   files = commands/unit/direct.md docs/direct/write_prompt_contract.md
-   # sessions with fewer requests than this are left out of comparisons
-   min_requests = 20
-   # a request gap longer than this ends an active stretch (seconds)
-   active_gap_seconds = 600
-   ```
-2. Types in `scripts/usage/context_economy_read.py`:
-   - `Request(at, model, cli_version, input, cache_read, cache_write_5m, cache_write_1h, output)`; `context` = input + cache_read + cache_write_5m + cache_write_1h.
-   - `CompactionEvent(at, trigger: str | None, pre_tokens: int | None, post_tokens: int | None, kind: Literal['precomputed','normal','unknown'])`. `precomputed` when `compactMetadata.precomputed` is true; `normal` when `compactMetadata` exists without it; `unknown` when the record has no `compactMetadata`.
-   - `Start(at, source: Literal['startup','resume'], cli_version: str | None)`, one per `toolUseID`, at the first record's time.
-   - `Session(machine, family, session_id, agent_id, requests, compactions, starts)`; `agent_id` is the subagent id or the session id.
-3. `read_claude(projects_root: Path, since: datetime, until: datetime, machine: str) -> list[Session]`. It opens only files whose modification time is at or after `since`, and keeps records with `since <= timestamp < until`. Requests are deduplicated by (`message.id`, `requestId`); the last record of a request gives its usage.
-4. `SettingsSet(at, commit, values: dict[str, object])`: each tracked key's value (`None` when absent) and, for each tracked file, `{"bytes": N, "sha": "<12 hex>"}`. `settings_timeline(checkout: Path, since, until) -> list[SettingsSet]` reads `git -C <checkout> log --first-parent --format=%H%x00%cI main -- settings.json <tracked files>` and, for each commit, `git show <commit>:<path>`. It keeps a commit only when `values` differ from the previous kept one, and adds the set in force at `since`. The checkout path comes from `CONTEXT_ECONOMY_CHECKOUT` when set, else `Path.home() / ".claude"`.
-5. `settings_for(session_start: datetime, timeline) -> SettingsSet | SettingsUnknown`: the latest set at or before the start. A session's requests belong to the set of its latest start at or before each request; a request before any start in the window uses the first record of its file.
-6. `label(set, previous) -> str`: the changed values, for example `precomputeCompactionEnabled=false`.
-7. `role_of(store: Path, machine, family, session_id, agent_id) -> str`: the latest `turns.role` in the ledger store, opened read-only with `usage_report.open_read_store`; `unknown` when the agent has no row or the store is missing.
+`scripts/usage/context_economy_read.py` reads one time window at run time and writes nothing.
+- `read_claude(projects_root, since, until, machine) -> list[Session]` reads `*/*.jsonl` and `*/*/subagents/*.jsonl` with modification time at or after `since`, and keeps records with `since <= timestamp < until`. Requests are deduplicated by (`message.id`, `requestId`); the last record gives the usage. It returns only sessions with requests, compactions or starts in the window.
+- `Request(at, model, cli_version, input, cache_read, cache_write_5m, cache_write_1h, output)`; `context` is the sum of input and the three cache fields.
+- `CompactionEvent(at, trigger, pre_tokens, post_tokens, kind)`; `kind` is `precomputed`, `normal` or `unknown`.
+- `Start(at, source, cli_version)`: one per `toolUseID` at its first hook record over the whole file, kept only inside the window. `startup` and `resume` only.
+- `Session(machine, family, session_id, agent_id, requests, compactions, starts, first_record_at)`; `first_record_at: datetime | SessionBeginningUnknown` is the first record of the file, also before `since`.
+- `configured_checkout()` gives `CONTEXT_ECONOMY_CHECKOUT`, else `~/.claude`. `settings_timeline(checkout, since, until) -> list[SettingsSet]` reads `git log --first-parent main`, keeps a commit only when the tracked values change, and adds the set in force at `since`. A tracked file is `{"bytes", "sha": sha256[:12]}`.
+- `settings_for(at, timeline) -> SettingsSet | SettingsUnknown` gives the latest set at or before `at`; on equal times the later timeline entry wins. `label(current, previous)` gives `key=<json>` for each changed value, joined by `, `.
+- `role_of(store, machine, family, session_id, agent_id) -> str` opens the ledger read-only, maps the identity through `collect.identity_columns`, and gives `unknown` when no row matches or the store is missing.
 
 **Files:**
-- `config/context_economy.conf` — new.
-- `scripts/usage/context_economy_read.py` — new.
-- `scripts/usage/test_context_economy_read.py` — new.
-- `scripts/usage/fixtures/context_economy/` — new fixture transcripts: a precomputed compaction, a normal compaction, a startup, a resume with two hooks, a compact start, a duplicated request.
+- `scripts/usage/context_economy_read.py` — the reader types and functions.
+- `config/context_economy.conf` — `settings_keys`, `files`, `min_requests = 20`, `active_gap_seconds = 600`.
+- `scripts/usage/test_context_economy_read.py` — reader tests; fixtures in `scripts/usage/fixtures/context_economy/`.
 
-**Workers:** 1 writer + 1 tester; one new module, the tester writes from the Spec.
-- `impl` — `scripts/usage/context_economy_read.py`, `config/context_economy.conf`.
-- `test` — `scripts/usage/test_context_economy_read.py`, the fixtures; the git timeline test builds a temporary repository with three commits: one changes `precomputeCompactionEnabled`, one changes nothing tracked, one changes `commands/unit/direct.md`.
+**Binds later work:** no reader function assigns settings to a request; the report applies the latest-start rule with `first_record_at` as the fallback. The reader imports `scripts.lib.conf`, `scripts.usage.collect`, `scripts.usage.rollouts` and `scripts.usage.usage_report`, so the Mac read must carry them.
 
-**State:** none.
-
-**Constraints from prior phases:**
-
-**Acceptance gate:**
-- `python3 -m unittest scripts.usage.test_context_economy_read` passes.
-- `basedpyright scripts/usage` reports 0 errors and 0 warnings.
-- The temporary repository gives three settings sets: the one in force at `since` and the two tracked changes.
+**Gotchas:**
+- The ledger stores a main Claude session with `parent_id = ''`.
+- `~/.claude/scripts/lib/py -m` imports the main checkout; test a worktree with `python3 -m unittest` or the worktree's `scripts/lib/py`.
 
 ### Phase 2 — The report, saved results and comparisons  · status: todo
 **Depends on:** Phase 1
@@ -119,7 +96,13 @@
 
 **State:** `save` writes one result file per name and never overwrites one.
 
-**Constraints from prior phases:** Phase 1 gives `context_economy_read.py`: `Request`, `CompactionEvent`, `Start`, `Session`, `read_claude`, `SettingsSet`, `SettingsUnknown`, `settings_timeline`, `settings_for`, `label`, `role_of`; `config/context_economy.conf` keys `settings_keys`, `files`, `min_requests`, `active_gap_seconds`.
+**Constraints from prior phases:** Phase 1 gives `scripts/usage/context_economy_read.py` and `config/context_economy.conf` (keys `settings_keys`, `files`, `min_requests`, `active_gap_seconds`, read with `conf.read("context_economy")`).
+- `read_claude(projects_root, since, until, machine) -> list[Session]`. `Session` has `machine`, `family`, `session_id`, `agent_id`, `requests`, `compactions`, `starts` and `first_record_at: datetime | SessionBeginningUnknown`.
+- `Request` has `at`, `model`, `cli_version`, the token fields and a `context` property. `CompactionEvent` has `at`, `trigger`, `pre_tokens`, `post_tokens` and `kind` (`precomputed|normal|unknown`). `Start` has `at`, `source` (`startup|resume`) and `cli_version`.
+- `read_claude` keeps only starts inside the window. No reader function assigns settings to a request. This phase applies Spec item 2: a request takes the settings of its session's latest start at or before it. A request before any start in the window takes `settings_for(first_record_at, timeline)`, or `SettingsUnknown` when `first_record_at` is `SessionBeginningUnknown`.
+- `settings_timeline(checkout, since, until) -> list[SettingsSet]`; get the checkout from `configured_checkout()`. `settings_for(at, timeline) -> SettingsSet | SettingsUnknown`. `label(current, previous) -> str`.
+- `role_of(store, machine, family, session_id, agent_id) -> str` opens the ledger read-only and returns `unknown` when no row matches.
+- Run the worktree tests with `python3 -m unittest`. `~/.claude/scripts/lib/py -m` imports the main checkout, not the worktree.
 
 **Acceptance gate:**
 - `python3 -m unittest scripts.usage.test_context_economy` passes.
@@ -150,7 +133,7 @@
 
 **State:** none.
 
-**Constraints from prior phases:** Phase 1: the reader types and `read_claude`. Phase 2: `context_economy.py` quantities and commands; saved results under `<state_dir()>/context_economy/`.
+**Constraints from prior phases:** Phase 1: the reader types and `read_claude`; `Session.family` already holds `codex`. The reader imports `scripts.lib.conf`, `scripts.usage.collect`, `scripts.usage.rollouts` and `scripts.usage.usage_report`; the Mac call must carry the modules `read_claude` needs, or split them out of the payload. Phase 2: `context_economy.py` quantities and commands; saved results under `<state_dir()>/context_economy/`.
 
 **Acceptance gate:**
 - `python3 -m unittest scripts.usage.test_context_economy_read scripts.usage.test_context_economy` passes.
