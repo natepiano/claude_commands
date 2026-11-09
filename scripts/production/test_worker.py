@@ -417,8 +417,8 @@ class WorkerCommandTests(unittest.TestCase):
         self.assertIsInstance(states[busy.row.id], worker_panes.OpenWorker)
         resumed = states[busy.row.id]
         assert isinstance(resumed, worker_panes.OpenWorker)
-        self.assertNotEqual(resumed.pane, busy.pane)
-        self.assertNotEqual(resumed.terminal, busy.terminal)
+        self.assertEqual(resumed.pane, busy.pane)
+        self.assertEqual(resumed.terminal, busy.terminal)
         self.assertIsInstance(states[idle.row.id], worker_panes.ClosedWorker)
         self.assertEqual(states[busy.row.id].row.current_session, busy.row.current_session)
         self.assertEqual(states[idle.row.id].row.current_session, idle.row.current_session)
@@ -782,6 +782,8 @@ class WorkerCommandTests(unittest.TestCase):
                 opened = self.opened("foreign-tab" if foreign_tab else "impl")
                 def relocate(pane: str) -> None:
                     if foreign_tab:
+                        self.fixture.world.remove_leaf(pane)
+                        self.fixture.world.layouts["w1:t5"] = {"type": "pane", "pane_id": pane}
                         self.fixture.world.locations[pane]["tab_id"] = "w1:t5"
                 self.agent.after_complete = relocate
                 with redirect_stderr(io.StringIO()) as errors:
@@ -794,14 +796,9 @@ class WorkerCommandTests(unittest.TestCase):
                 self.assertEqual(state["pass"]["impl"]["status"], "completed")
                 self.assertEqual(staff.snapshot().by_id(opened.row.id), replace(opened.row, role=staff.KnownWorkerRole("impl")))
                 self.assertIn(self.agent.final, self.reply.read_text())
-                if foreign_tab:
-                    self.assertIn(opened.pane, self.fixture.world.locations)
-                    self.assertEqual(errors.getvalue(),
-                                     f"anomaly: foreign-tab: worker pane is outside its parent's tabs; kept pane {opened.pane}\n")
-                else:
-                    self.assertIsInstance(self.fixture.observation(opened.row), worker_panes.ClosedWorker)
-                    self.assertNotIn(opened.pane, self.fixture.world.locations)
-                    self.assertEqual(errors.getvalue(), "")
+                self.assertIsInstance(self.fixture.observation(opened.row), worker_panes.ClosedWorker)
+                self.assertNotIn(opened.pane, self.fixture.world.locations)
+                self.assertEqual(errors.getvalue(), "")
 
     def test_fast_dispatch_writes_reply_without_changing_the_prompt(self) -> None:
         before = self.prompt.read_bytes(), self.prompt.stat().st_mtime_ns
@@ -1436,18 +1433,16 @@ class WorkerCommandTests(unittest.TestCase):
         self.assertEqual(self.dispatch(), worker.ExitCode.BUSY)
         self.assertEqual(self.agent.submitted, [])
 
-    def test_dispatch_lock_blocks_a_competing_dispatch_and_close(self) -> None:
+    def test_dispatch_lock_blocks_a_competing_dispatch_and_role_change(self) -> None:
         opened = self.opened()
         results: list[object] = []
         def concurrent() -> None:
             results.append(self.dispatch())
-            results.append(worker.end(self.fixture.parent.id, staff.WorkerName.parse("impl")))
             results.append(worker_panes.start_or_resume(self.fixture.parent.id, staff.WorkerName.parse("impl"), "review"))
         self.agent.during_prompt = concurrent
         self.assertEqual(self.dispatch(), worker.ExitCode.OK)
         self.assertEqual(results[0], worker.ExitCode.BUSY)
-        self.assertEqual(results[1], worker.ExitCode.KEPT)
-        self.assertIsInstance(results[2], worker_panes.StartRefused)
+        self.assertIsInstance(results[1], worker_panes.StartRefused)
         self.assertEqual(len(self.agent.submitted), 1)
         self.assertIsNotNone(staff.by_id(opened.row.id))
 
@@ -1625,7 +1620,7 @@ class WorkerCommandTests(unittest.TestCase):
         launches = len(self.fixture.world.launches)
         self.assertEqual(self.dispatch("impl2"), worker.ExitCode.OK)
         self.assertEqual(len(self.fixture.world.launches), launches + 1)
-        self.assertNotEqual(self.agent.submitted[0][0], second.pane)
+        self.assertEqual(self.agent.submitted[0][0], second.pane)
         self.assertEqual(self.agent.row(self.agent.submitted[0][0]).current_session, second.row.current_session)
 
     def test_all_busy_assignment_names_each_worker_and_refuses(self) -> None:
@@ -1656,7 +1651,8 @@ class WorkerCommandTests(unittest.TestCase):
         self.assertEqual(len(self.agent.submitted), 1)
 
     def test_assignment_continues_after_a_default_split_interruption(self) -> None:
-        _ = self.opened("impl")
+        row = self.fixture.worker("impl", family="codex")
+        self.fixture.world.add(row, "w1:p1", family="codex", live=False)
         self.fixture.world.interrupt = "split"
         with redirect_stderr(io.StringIO()) as errors:
             result = worker.assign(self.fixture.parent.id, "impl", self.prompt, session_dir=self.run_dir,
@@ -2271,15 +2267,16 @@ class WorkerCommandTests(unittest.TestCase):
         self.assertNotIn(retained.pane, self.fixture.world.foreground)
         self.assertNotIn(missing.pane, self.fixture.world.foreground)
 
-    def test_end_keeps_a_busy_worker_and_reports_the_blocker(self) -> None:
+    def test_end_closes_a_busy_worker_and_retires_its_row(self) -> None:
         opened = self.opened()
         self.fixture.world.locations[opened.pane]["agent_status"] = "working"
-        before = self.fixture.staff_state()
-        code, output, errors = self.command("end", "impl")
-        self.assertEqual((code, output), (7, ""))
-        self.assertIn("working", errors)
-        self.assertEqual(self.fixture.staff_state(), before)
-        self.assertIn(opened.pane, self.fixture.world.foreground)
+        with patch.object(sessions, "session_liveness", return_value=sessions.SessionNotLive()), \
+             patch("scripts.production.staff_sources.require_worker_stopped"):
+            code, output, errors = self.command("end", "impl")
+        self.assertEqual((code, output, errors), (0, "done\n", ""))
+        self.assertIsNone(staff.by_id(opened.row.id))
+        self.assertNotIn(opened.pane, self.fixture.world.locations)
+        self.assertEqual(self.fixture.world.stops, [])
 
     def test_end_removes_an_idle_worker_with_an_interrupted_pass(self) -> None:
         opened = self.opened()
