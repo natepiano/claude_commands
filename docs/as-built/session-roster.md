@@ -151,8 +151,10 @@ The two flags together cause a usage error.
 `Options.action` is `UserAction` or `NoUserRecipient`.
 
 `send.py` reads one `staff.snapshot()` for each session send. `resolve_staff_recipient` selects each staff recipient.
-A typed name first matches a staff path or short name. Unit names use the staff name.
-One staff row selects its `current_session`. Several staff rows produce a named ambiguity error and no delivery.
+A typed name first matches an exact canonical staff path or short name. Unit names use the staff name.
+A bare worker name selects a worker under the sender's own unit.
+A match only in another unit refuses delivery and lists the full paths.
+One selected staff row supplies its `current_session`. Several matching rows produce a named ambiguity error and no delivery.
 The repeat-notice owner follows staff parents to the showrunner. It uses the default owner for a non-staff sender.
 
 A non-staff name uses a unique live roster session. Lookup checks this machine before the peer.
@@ -504,7 +506,8 @@ Release recalculates the priority of a kept decision.
 
 - A source that cannot be read becomes one problem line naming it; the rest still prints. Every consumer prints `Roster.problems` and continues.
 
-- Every address is unique on both machines: `session:<id>`, `worker:<run id>/<worker name>`, `codex:<thread id>`. A `CannotReceiveMessages` row has an empty address and takes no messages; broadcast skips it rather than send to `""`.
+- Every address is unique on both machines: `session:<id>`, `worker:<parent>/<worker>`, `codex:<thread id>`.
+  A `CannotReceiveMessages` row has an empty address and takes no messages. Broadcast skips that row.
 
 - Pane state determines whether a worker can receive a message.
 
@@ -554,7 +557,7 @@ Release recalculates the priority of a kept decision.
 **Sending**
 - Under `--machine HOST`, `remote()` keeps the outcome word from the other machine's last stdout line, so a `REFUSED:` there stays `REFUSED` (exit 2). Only stderr-only exit-2 errors (cannot take messages, ambiguous name, no roster session has address, usage) return as `FAILED: ssh <host>: <reason>` (exit 3).
 - `uds:` is always this machine's socket, even with `--machine`.
-- A `worker:` address of a worker between turns matches no row on either machine and reads `no roster session has address`, not `cannot take messages`.
+- A worker keeps its staff identity between turns. Current pane evidence determines whether it can receive a message.
 - Staff worker delivery resolves the observed pane and its holder.
 - `pushover.py` exit 2 also means usage or missing keys; only the `refused before sending:` stderr marker marks a refusal. A caller with no keys and no action flag gets the action refusal, not `keys missing`.
 - Every roster problem on stderr carries `could not read: `, so a machine not reached reads `could not read: <host>: not reached: <why>` (exit 1). In a sandbox this usually means rerun outside it, or use `--here`.
