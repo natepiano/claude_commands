@@ -1500,30 +1500,46 @@ A change review row whose Change text was edited still covers its own change, an
 
 ### Phase 8s — A hold that names any showrunner waits  · status: done
 
-**Depends on:** none
+#### As-built
 
-Source: sdlc [f434973f], from natedev [d924569c]. stall-watch bumped the accounts unit twice (09:55 and 10:01 EST) while its status was `— holding: waiting on sdlc's message that ...`. `holding_names_outside` found no outside party: the peer list holds only the unit's sibling units, its own showrunner's session and its production name, and the config patterns know `showrunner`, `natedev` and `*-unit`. `sdlc` is another showrunner, so it is in neither.
+A holding or waiting status that names any showrunner, or a sibling unit, reads as a wait on an outside party, and stall-watch does not bump the unit.
 
-#### Work Order
-
-**Goal:** a holding or waiting status that names any showrunner, or a sibling unit, reads as a wait on an outside party.
-
-**Spec:**
-1. In `scripts/production/stall_watch.py`, the peers given to `status_defers_bump` and `holding_names_outside` are the names of every staff row of kind `showrunner` whose worktree is not removed, plus the unit's sibling units as before, less the unit's own row. Read them from the one `staff.snapshot()` that the pass already takes. Keep the configured session and production name. A unit of another production matches as `<name>-unit` through the config pattern. Every staff name was ruled out: many unit names are common words (sdlc [22ebe0aa]).
-3. In `config/stall_watch.conf`, remove `natedev` from `external_owner_pattern` and `holding_party_pattern`, and fix the comments above them. The staff record now supplies every showrunner and unit name.
-4. Own names still win: an occurrence inside a complete own name is not outside (`names_outside` is unchanged).
+- `scripts/production/stall_watch.py` builds the peers for `status_defers_bump` and `holding_names_outside` from the one staff snapshot of the pass: every `showrunner` row whose worktree is not removed, the unit's sibling units less its own row, the configured session and the production name. `PaneInspection` carries the peers. Showrunner names are read once per pass, and sibling names once per parent.
+- A unit of another production matches as `<name>-unit` through the config pattern.
+- `config/stall_watch.conf` no longer names `natedev` in `external_owner_pattern` or `holding_party_pattern`; the staff record supplies it.
+- Own names still win: `names_outside` is unchanged.
 
 **Files:**
-- `scripts/production/stall_watch.py`
-- `config/stall_watch.conf`
-- `scripts/production/test_stall_watch.py`
+- `scripts/production/stall_watch.py` — peer names per inspection.
+- `config/stall_watch.conf` — outside-party patterns without fixed showrunner names.
+- `scripts/production/test_stall_watch.py` — a cases table in `test_holding_names_a_peer_or_showrunner_anywhere_in_the_line` (a natedev unit waiting on sdlc waits), and a row in `test_own_work_order_and_own_names_do_not_hold_the_unit` (an unrelated `style` unit in the status still bumps).
 
-**Workers:** 1 writer. `impl` owns all three files. The change is one function's input and one config line, so a second slot has no disjoint work.
+**Gotchas:** a sibling unit name that is a common word still defers a bump.
 
-**State:** none.
+**Ruled out:** every staff name as a peer — many unit names are common words (style, verify, queue) and hide an own-work hold.
 
-**Test:** add one row to `test_holding_names_a_peer_or_showrunner_anywhere_in_the_line`, or to the existing test that drives a full pass with staff rows: a unit whose parent is natedev, with status `— holding: waiting on sdlc's message that ...`, where `sdlc` is a showrunner staff row and not the unit's parent, is not bumped. Run `~/.claude/scripts/lib/py -m unittest scripts.production.test_stall_watch` from the worktree root.
+### Phase 8t — The units table shows board status, phase work, other work and queued work  · status: done
 
-**Lint:** `basedpyright scripts/production/stall_watch.py scripts/production/test_stall_watch.py` gives `0 errors, 0 warnings, 0 notes`.
+**Depends on:** none
 
-**Acceptance gate:** the new row fails before the change and passes after it; the full `test_stall_watch` module passes; `natedev` is not in `config/stall_watch.conf`.
+#### As-built
+
+- `/showrunner:units` prints `| Unit | Status | Phase | Non-Phase Work | Queued |`.
+- `session_state.classify(member, activity)` gives a unit session's state in this order: an exit record gives `exited`; a pause record gives `paused`; no live session gives `exited`; a live `busy` session gives `busy`; else `idle`. The accounts board (`_read_local_role_sessions`) and the units table both call it. The board keeps its account attribution and worker counts in `accounts.py`; its workers role keeps busy and idle only.
+- A live herdr pane process (Claude or Codex) counts as a live session. A unit whose worktree is on another machine, with no hold, shows `on <machine>`.
+- Phase shows `phase <n> of <m> — <task>` for an open plan phase. The task is the newest run's open step, else the phase title. With no open phase the cell keeps the old texts. Each cell is cut to 80 characters with `…`.
+- Non-Phase Work reads only each unit's newest run (`open_unit_runs`). A finished run gives `—`. Otherwise it shows `<phase id>: <open step>` for open phases that are not plan phases, plus ` +<k> more`.
+- `/unit:queue add <text> | done | clear | show` runs `unit_queue.py`. The list is at `UNIT_QUEUE_STATE_DIR/<staff id>.json`, default `~/.local/state/unit-queue/`. The Queued cell shows the first item plus ` +<n> more`, or `—`. An unreadable file gives `queue unreadable` and one stderr line; `clear` does not read the old list, so it repairs the file.
+
+**Files:**
+- `scripts/accounts/session_state.py` — `classify`, `staff_state` and the activity types.
+- `scripts/accounts/accounts.py` — the board calls `classify`.
+- `scripts/production/live_units.py` — `LiveUnit.member`, `staff_status`, pane-process and other-machine status.
+- `scripts/production/unit_phases.py` — the table cells and the newest-run reader.
+- `scripts/production/unit_queue.py`, `commands/unit/queue.md` — the queue.
+- `commands/showrunner/units.md` — the columns and statuses.
+- `docs/as-built/staff-accessors.md` — rows for the two new staff readers.
+
+**Gotchas:** A held astra-role run never records a finish, so it can be a unit's newest run and show in Non-Phase Work.
+
+**Ruled out:** Reading every open run of a unit's current session — old runs never record a finish, so 64 stale runs showed as open.

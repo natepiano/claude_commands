@@ -383,7 +383,7 @@ def cloud_lines(model: QueueModel, columns: int, rows: tuple[wire.CloudRow, ...]
                    if isinstance(counter, progress_profile.ProgressCounter) else "modules unknown")
         size = f"{progress.size_vcpus} vCPUs" if isinstance(progress, cloud_progress.CloudProgress) else "vCPUs unknown"
         elapsed = leftover_age(age(row.started_at or row.since, now))
-        text = f"{field(unit)} · {field(identity.step)} · {state} · {modules} · {size} · elapsed {elapsed}"
+        text = f"{field(unit)} · {field(model.names.shown(identity.step))} · {state} · {modules} · {size} · elapsed {elapsed}"
         if isinstance(progress, cloud_progress.CloudProgress):
             if progress.failed_modules:
                 noun = "module" if progress.failed_modules == 1 else "modules"
