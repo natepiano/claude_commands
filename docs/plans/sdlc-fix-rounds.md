@@ -451,3 +451,13 @@ Cause: `<CheckpointCommit/>` step 9 in `commands/unit/checkpoint.md` runs `revie
 Fix: `commands/unit/checkpoint.md` step 9 passes the checkpointed phase's id with `--phase-id`. The recorder does not change, and no refusal is added. Add one test row: a phase with a ledger finding and a finished review pass is parked while a later phase is current, and `review-trial --phase-id` of the parked phase reports its finding and its minutes.
 
 As built: `<CheckpointCommit/>` step 9 runs `review-trial --session-dir "${SESSION_DIR}" --phase-id <phase id>`. `--phase-id` stays optional (showrunner, 2026-11-09 [f58e9b76]); a call with no id still reports the current phase. `test_review_trial_reports_the_parked_phase_findings_and_review_minutes` parks phase A, with one finding and an 8-minute review pass, behind current phase B, and reads A by id.
+
+### Phase 10k — A Change-Review line under any unit commit subject adds its row  · status: done
+
+**Depends on:** none.
+
+From the sdlc showrunner, 2026-11-09 [b8a10551], reported by builds. `change_review._checkpoint_entries` (used by `visible`) reads Change-Review lines only from `checkpoint(...)` subjects. `merge_checkpoint.change_review_commits` counts every unit commit and prints `N unit commit(s) carry their Change-Review lines`. A unit commit with a Change-Review line under another subject (builds queue: `queue(N):` for phases 10m, 32, 33, 34, 36) passes, and its rows are never added.
+
+Fix: one selection of unit commits serves both the count and the row adder, so a Change-Review line under any unit commit subject adds its row. `needs_trailer` keeps its rule: no new refusal. Add a test row: a unit commit with subject `queue(7): ...` and a Change-Review line adds its row.
+
+As built: `change_review._checkpoint_entries` reads the visible lines of every unit commit, with no subject filter. `visible` and `publication_changes` both use it, so the count in `merge_checkpoint.change_review_commits` and the row adder see the same commits. `needs_trailer` and `missing` do not change, and no refusal is added. New `queue(7): ...` rows: `ProducerWriterTests` (the merge adds its row), `ParseTest` (`needs_trailer` stays false) and `RepositoryTest` (`visible` reads it).
