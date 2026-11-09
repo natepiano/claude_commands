@@ -953,38 +953,20 @@ The build log index uses WAL mode, so a spilled update takes no exclusive lock a
 
 ### Phase 46 — Report and memory commands load only the code they use · status: done
 
-**Depends on:** none.
+#### As-built
 
-From the builds showrunner (not the user), 2026-11-09: natest measured that the report and memory page entry points import queue and sweep code they do not use. Prototype the split, measure, and keep it only if the gain is real.
-
-#### Work Order
-
-**Goal:** The report and memory commands stop loading queue and sweep code on paths that do not use it, if a paired measurement shows a real CPU saving per merge gate.
-
-**Spec:**
-- `scripts/buildlog/disk.py` loads `scripts.lint.sweep` only inside the functions that use it. `disk.read_snapshot` does not load it.
-- `scripts/buildlog/memory.py` loads `queue_snapshot` inside `window_report`. It loads `room_text` and `memory_admit` only after a queue snapshot is found in the window.
-- Use the function-level import form that `memory.build_output_program` already uses. Use one form in both files.
-- `scripts/buildlog/report.py` does not change. It reaches queue and sweep code only through `memory` and `disk`.
-- Program output, row counts, SQL assertions and instruction limits do not change.
-- Measure before and after with interleaved pairs, as the acceptance gate states. Keep the change only if the keep rule passes. If it fails, restore both files and report the numbers.
-
-Keep rule (director's call): `7 × R + 41 × R + 23 × M` is at least 1.0 CPU second, and the mean paired saving for R and for M each exceeds twice its standard error. R and M are the mean CPU saving per process. The counts are natest's child counts for one gate: 7 report children, 41 `test_index` children that import `test_report`, 23 memory children.
+- `disk.py` imports `scripts.lint.sweep` inside the four functions that use it. `disk.read_snapshot` does not load it.
+- `memory.window_report` imports `queue_snapshot` on each run. It imports `room_text` and `memory_admit` only for a queue snapshot in the window.
+- `report.py` has no direct queue or sweep import, so the report command loads neither `sweep` nor `queue_evidence`.
+- Thirty interleaved process pairs measured 0.268 CPU seconds saved per report process and 0.148 per memory process. The saving is 16.25 CPU seconds per merge gate at 7 report, 41 `test_index` and 23 memory children, and 5.3 without the `test_index` children.
+- Program output, row counts and SQL do not change.
 
 **Files:**
-- `scripts/buildlog/disk.py`
-- `scripts/buildlog/memory.py`
+- `scripts/buildlog/disk.py` — the disk snapshot and its floor.
+- `scripts/buildlog/memory.py` — the memory snapshot and the window report.
 
-**Workers:** `1 writer`
-- writer — both files, the measurement, and the tests.
+**Gotchas:**
+- A module-level import of `sweep` or `queue_evidence` in these files brings the cost back.
 
-**State:** none.
-
-**Acceptance gate:**
-- 30 interleaved before and after pairs of fresh processes, with one discarded warm-up each. CPU is user plus system time of the child process.
-- R program: `from scripts.buildlog import cli, index, report`.
-- M program: `from scripts.buildlog import cli, index, memory`, then `from scripts.build_queue import queue_snapshot`.
-- The reply gives the mean saving, standard error, per-gate saving and the keep or restore result.
-- After a kept split, `python3 -X importtime` shows no `scripts.lint.sweep` and no `scripts.build_queue.queue_evidence` for the R program.
-- `scripts.buildlog.test_memory_window`, `test_memory_records`, `test_disk`, `test_report` and `test_index` pass.
-- `basedpyright` reports 0 errors and 0 warnings on both files.
+**Ruled out:**
+- A separate module for the `disk.py` writers needs caller and test edits and saves no more.
