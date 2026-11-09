@@ -29,6 +29,7 @@ from scripts.herdr.herdr import HerdrPlace
 from scripts.production import unit_phases
 from scripts.production import style_units
 from scripts.style import style_ledger
+from scripts.style.ledger_test_support import write_style_units
 from scripts.production import staff
 from scripts.production.staff_test_support import isolated_staff_file, fixture_member, fixture_runtime_id
 
@@ -513,7 +514,9 @@ class UnitPhasesTests(unittest.TestCase):
 
     def test_style_kind_routes_to_the_ticket_table(self) -> None:
         doc = self.root / "style-production.md"
-        _ = doc.write_text(f"# Production\n- **Kind:** style\n- **Showrunner checkout:** `{self.root}`\n")
+        _ = doc.write_text(f"# Production\n- **Kind:** style\n- **Merge branch:** style/main\n"
+                           + f"- **Branch point:** main\n- **Showrunner checkout:** `{self.root}`\n")
+        write_style_units(doc)
         self.production_document(doc)
         _ = subprocess.run(["git", "init", "-q", str(self.root)], check=True, capture_output=True,
                            timeout=10)
@@ -536,6 +539,32 @@ class UnitPhasesTests(unittest.TestCase):
         phases.assert_not_called()
         self.assertEqual(output.getvalue(), "ticket table\n")
 
+    def test_product_parent_reports_direct_style_units_and_product_units(self) -> None:
+        from scripts.style import style_config
+
+        doc = self.root / "product-production.md"
+        _ = doc.write_text(f"# Production\n- **Kind:** product\n- **Merge branch:** main\n"
+                           + f"- **Showrunner checkout:** {self.root}\n")
+        write_style_units(doc, (style_config.StyleUnitAssignment(
+            "cargo-liner-style", ("names", "values", "types", "modules")),))
+        self.production_document(doc)
+        style_unit = unit("cargo-liner-style", live("cargo-liner-style"))
+        product_unit = unit("feature", live("feature"))
+        units = [product_unit, style_unit]
+        output = io.StringIO()
+        before = doc.read_bytes()
+        with (patch.object(live_units, "read_units", return_value=live_units.UnitListing(units, ())),
+              patch.object(phase_table, "show_production", return_value="{}"),
+              patch.object(unit_phases, "style_ledger_paths", return_value={}),
+              patch.object(unit_phases, "table", return_value="product table") as phases,
+              patch.object(style_units, "table", return_value="ticket table") as tickets,
+              contextlib.redirect_stdout(output)):
+            self.assertEqual(unit_phases.main(["--production", "show"]), 0)
+        phases.assert_called_once_with([product_unit], {})
+        tickets.assert_called_once_with([style_unit], {}, doc=doc, ledger_paths={})
+        self.assertEqual(doc.read_bytes(), before)
+        self.assertEqual(output.getvalue(), "product table\n\nticket table\n")
+
     def test_other_or_absent_kind_keeps_the_phase_table(self) -> None:
         owner = fixture_member("showrunner", name="table-owner")
         _ = fixture_member("unit", name="a", parent=owner.id)
@@ -557,7 +586,9 @@ class UnitPhasesTests(unittest.TestCase):
         _ = subprocess.run(["git", "init", "-q", str(self.root)], check=True, capture_output=True)
         _ = self.enterContext(patch.dict(os.environ, {"STYLE_LEDGER_STATE_DIR": str(self.root / "state")}))  # pyright: ignore[reportAny]
         doc = self.root / "style-production.md"
-        _ = doc.write_text(f"# Production\n- **Kind:** style\n- **Showrunner checkout:** `{self.root}`\n")
+        _ = doc.write_text(f"# Production\n- **Kind:** style\n- **Merge branch:** style/main\n"
+                           + f"- **Branch point:** main\n- **Showrunner checkout:** `{self.root}`\n")
+        write_style_units(doc)
         self.production_document(doc)
         owner = fixture_member("showrunner", name="show", doc=staff.LiveDoc(remote.local_machine(), doc))
         for name, folder in (("names", self.root), ("types", self.root / "gone")):
@@ -565,7 +596,7 @@ class UnitPhasesTests(unittest.TestCase):
                                worktree=staff.PresentWorktree(remote.local_machine(), folder))
         decision = self.root / "decision.md"
         names = next(row for row in staff.initial_snapshot().find(kind="unit", parent=owner.id) if row.name == "names")
-        _ = decision.write_text(f"---\nstatus: open\nunit: {names.id}\nplan: approved\n---\n")
+        _ = decision.write_text(f"---\nstatus: open\nunit: {names.id}\nplan: approved\nstyle_rule_blob: names\n---\n")
         database = style_ledger.ledger_location(self.root).database
         database.parent.mkdir(parents=True)
         with contextlib.closing(sqlite3.connect(database)) as connection, connection:
@@ -577,6 +608,7 @@ class UnitPhasesTests(unittest.TestCase):
                 CREATE TABLE refill_results(unit TEXT,at TEXT,outcome TEXT,split_at TEXT,
                     ready INTEGER,changed INTEGER,structure INTEGER,other INTEGER);
             """)
+            _ = connection.execute("INSERT INTO rule_texts VALUES ('names',?)", (b"---\nfamily: names\n---\n",))
             _ = connection.execute("INSERT INTO tickets VALUES ('12',?,'proposal','names',"
                 + "'global:rust/read.md','alpha','[]','[]','[]','[\"one\"]','assigned','2026-10-01')", (str(names.id),))
             _ = connection.execute("INSERT INTO held_findings VALUES (?,'filed','12','')", (str(decision),))

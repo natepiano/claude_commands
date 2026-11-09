@@ -20,11 +20,10 @@ from datetime import datetime, timedelta
 from pathlib import Path, PurePosixPath
 from typing import TypedDict, cast
 
-from scripts.style import rules
+from scripts.style import rules, style_config
 from scripts.style import style_ledger
-from scripts.production import staff, unit_lookup
 from scripts.lib.user_zone import user_zone
-from scripts.style.add_style import NoStyleProduction, standing_style_production
+from scripts.style.add_style import NoStyleProduction, configured_style_production
 
 
 class RuleSnapshot(TypedDict):
@@ -65,15 +64,14 @@ def git(repo: Path, *arguments: str) -> str:
 
 
 def production(ledger: style_ledger.Ledger, tip: str) -> StyleProduction:
-    standing = standing_style_production(ledger.repo)
-    units = tuple(f"{standing.name}-{family}" for family in ("modules", "names", "values", "types"))
+    standing = configured_style_production(ledger.repo)
     if not isinstance(standing, NoStyleProduction):
-        declared = tuple(unit for unit in (row.name for row in unit_lookup.doc_units(standing.doc, staff.snapshot()))
-                         if not isinstance(rules.style_family(unit), rules.NotStyleUnit))
-        return StyleProduction(standing.name, standing.branch_point, declared or units)
+        config = style_config.read_config(standing.doc, unit_branch="")
+        return StyleProduction(standing.name, config.route.branch_point,
+                               tuple(assignment.unit for assignment in config.assignments))
     branches = git(ledger.repo, "for-each-ref", "--format=%(refname:short)", "--points-at", tip, "refs/heads").splitlines()
     branch_point = next((branch for branch in branches if not branch.startswith("style/")), tip[:7])
-    return StyleProduction(standing.name, branch_point, units)
+    return StyleProduction(standing.name, branch_point, ())
 
 
 def previous_report(path: Path) -> FirstReport | PreviousReport:

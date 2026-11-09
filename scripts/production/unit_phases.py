@@ -29,6 +29,7 @@ from scripts.lib import conf
 from scripts.message import session_send
 from scripts.lib.process_failure import failure_detail
 
+from scripts.style import style_config
 from scripts.direct import phase_table
 from scripts.direct import plan_history
 
@@ -306,14 +307,22 @@ def main(arguments: list[str]) -> int:
                 records = cast(dict[str, object], json.loads(phase_table.show_production(doc)))
                 listing = sessions.result()
                 units = listing.units
-            paths = style_ledger_paths(doc, units) if style and units else {}
+            configured: set[str] = set()
+            if not style and re.search(r"(?m)^#{1,6}\s+Style units\s*#*\s*$", doc.read_text()):
+                configured = {assignment.unit for assignment in style_config.read_config(doc, unit_branch="").assignments}
+            ticket_units = [unit for unit in units if style or unit.unit in configured]
+            product_units = [unit for unit in units if unit not in ticket_units]
+            paths = style_ledger_paths(doc, ticket_units) if ticket_units else {}
             if not units:
                 output = "no live units"
-            elif style:
-                from scripts.production import style_units
-                output = style_units.table(units, records, doc=doc, ledger_paths=paths)
             else:
-                output = table(units, records)
+                sections: list[str] = []
+                if product_units:
+                    sections.append(table(product_units, records))
+                if ticket_units:
+                    from scripts.production import style_units
+                    sections.append(style_units.table(ticket_units, records, doc=doc, ledger_paths=paths))
+                output = "\n\n".join(sections)
         except (OSError, ValueError, Refusal) as error:
             print(f"unit_phases: {error}", file=sys.stderr)
             return 1
