@@ -45,20 +45,22 @@ completes.
    ```sh
    bash ~/.claude/scripts/direct/assign.sh --role implement --to "<impl worker name>" \
      --phase "<phase id>" --session-dir "${SESSION_DIR}" --cwd "${WORKING_DIR}" \
-     --prompt "${PHASE_DIR}/implementation_prompt.md" --paths "${PHASE_DIR}/implementation_paths.txt" &
+     --prompt "${PHASE_DIR}/implementation_prompt.md" --paths "${PHASE_DIR}/implementation_paths.txt"
    bash ~/.claude/scripts/direct/assign.sh --role test --to "<test worker name>" \
      --phase "<phase id>" --session-dir "${SESSION_DIR}" --cwd "${WORKING_DIR}" \
-     --prompt "${PHASE_DIR}/test_prompt.md" --paths "${PHASE_DIR}/test_paths.txt" &
+     --prompt "${PHASE_DIR}/test_prompt.md" --paths "${PHASE_DIR}/test_paths.txt"
    ```
 
    Set each `--role` from the Work Order's assignment.
    Each launch carries `--phase "<phase id>"` and keeps its artifacts under `${PHASE_DIR}`.
-   Keep the returned dispatch handles and artifact paths.
+   Keep the artifact paths. Exit 0 means submission, with the pass still active.
+   End the director turn after the assigned synchronous review.
+   Each turn hook sends the director the worker result and reply path.
    Each worker records its assigned role as its pass kind.
    Responsibility follows <ProgressContract/>.
 6. Announce prompt, board, and heartbeat paths, set `EARLY_REVIEW=none`, then
    apply <DispatchContract/> once for the whole team.
-7. On completion, read each dispatch's returned status and summary paths.
+7. Read each hook message and its saved reply when the message resumes the director.
    Complete the phase only after both workers finish.
    Load the implementation summary into `${IMPL_SUMMARY}` and read the other worker's summary.
    Apply <WorkerLaunchFailure/> before reporting a launch error.

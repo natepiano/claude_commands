@@ -20,6 +20,59 @@ Completed run folders keep their roster files.
 Unit workers retain their native conversations across assignments.
 Staff records identify each worker independently of its current session, run or account.
 A later assignment resumes the same conversation when the worker remains available.
+Codex code review uses read-only review workers.
+The [daily simplify run](simplify-lens.md) uses a fresh Claude review.
+Workers compact between assignments when their recorded context exceeds the configured limit.
+Unit pause, move, and end use staff membership.
+Usage reports compare checkpointed phases through the usage store.
+
+## Pane submission and completion
+
+`assign.sh` returns after successful prompt delivery. Exit 0 means submitted.
+The transcript can record the prompt later.
+A failed delivery command returns an error.
+The transcript prevents replay and proves completion.
+The native hook starts one separate handler process and returns.
+The handler runs once outside the terminal session.
+The pass retains its id, launcher arguments, reply path, and completion actions.
+The director ends its turn after the assigned synchronous review.
+The turn hook sends the director the worker, phase, outcome, and reply path.
+The director reads that reply when the message resumes it.
+
+`scripts/herdr/turn_end.py` serves both families.
+Codex receives `-c notify=[...]` on its launch line.
+Claude receives an asynchronous `Stop` command through launch-line `--settings` JSON.
+The launcher changes no account settings file.
+The hook finds the worker through its native conversation id and reads its active pass.
+A session without a worker pass changes nothing.
+A later event retries unfinished completion steps for a completed pass.
+
+`worker.dispatch_receipt` owns the completion rule.
+A live detached run holds DONE. A finished run permits completion with an anomaly for an absent transcript result.
+A pending run reply or friend reply keeps the pass active without another prompt.
+A worker puts its question in its reply and ends the turn.
+The turn hook sends that reply to the director.
+An unexpected screen prompt ends no turn, and the director finds it only when it reads the pane.
+A turn without DONE reports `no DONE` when no pending work explains it.
+The completion hook saves the reply, records the exact pass, runs completion actions, and closes the pane.
+`progress_history.complete_dispatch` records both completed passes and failed managed Astra review passes.
+It matches the slot and dispatch instance id before it records an outcome.
+A close anomaly retains the completed outcome and reaches the director in the hook message.
+A held reviewer role remains held after submission. Completion ends that reviewer and releases the role.
+
+Event producers call `handle(WorkerEvent(thread_id, EventKind.RUN_FINISHED))` after a run record reaches `finished`.
+The final diff event uses `EventKind.STAGE_READY` for a review with two stages.
+`detached_runs.py` calls the handler after supervisor completion and orphan completion.
+The director sends the final-diff event with `turn_end.py stage-ready <worker>`.
+
+### Hook input sources
+
+The [Codex notification reference](https://learn.chatgpt.com/docs/config-file/config-advanced#notifications) defines one JSON argument.
+Its fields include `type`, `thread-id`, `turn-id`, `cwd`, `input-messages`, and `last-assistant-message`.
+The event type is `agent-turn-complete`.
+The [Claude Stop reference](https://code.claude.com/docs/en/hooks#stop) defines JSON on stdin.
+Its fields include `session_id`, `transcript_path`, `cwd`, `permission_mode`, `hook_event_name`, `stop_hook_active`, and `last_assistant_message`.
+The hook uses the native id to select the worker. The shared transcript receipt decides completion.
 
 ## Unit code reviewers
 
@@ -100,7 +153,7 @@ An accepted retry prints `unchanged`.
 The launcher retains its original prompt identity and its dispatch record.
 `review.sh` has no pending dispatch check and does not restore a saved extract.
 
-### Claude coordinator and friends
+### Legacy mesh coordinator and friends
 
 `scripts/direct/claude_worker.py` runs the Claude launch steps in the assign process.
 `assign_claude._run` calls its functions directly.
