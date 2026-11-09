@@ -47,9 +47,9 @@ def need_text(source: gate.RecordedNeed | gate.NeedSourceNotRecorded, *,
     if isinstance(source, gate.NeedSourceNotRecorded):
         return "source not recorded"
     basis = source.basis
-    if isinstance(basis, (gate.ShapeP90, gate.ShapeLargest, gate.ShapeFallback)):
-        if isinstance(basis, gate.ShapeP90):
-            text = f"same-shape p90 of {basis.runs} runs"
+    if isinstance(basis, (gate.ShapeRankedPeak, gate.ShapeLargest, gate.ShapeFallback)):
+        if isinstance(basis, gate.ShapeRankedPeak):
+            text = f"same-shape peak of {basis.runs} runs, excluding the highest {basis.share_percent}%"
         elif isinstance(basis, gate.ShapeLargest):
             text = f"same-shape largest peak of {basis.runs} runs"
         else:
@@ -80,7 +80,7 @@ def need_text(source: gate.RecordedNeed | gate.NeedSourceNotRecorded, *,
             text += "; uncut estimate"
         return text
     if source.source == "measured":
-        text = f"measured process-memory p90 of {source.runs} runs"
+        text = f"measured process-memory estimate from {source.runs} runs"
     elif source.source == "buildlog":
         text = f"build-log peak × {gate.ANON_SHARE:.2f} of {source.runs} runs"
     elif source.source == "pooled":

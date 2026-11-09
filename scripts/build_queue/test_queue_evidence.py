@@ -276,7 +276,7 @@ class QueueEvidenceTests(unittest.TestCase):
     def test_capped_need_uses_the_saved_budget_without_configuration_reads(self) -> None:
         rule = gate.ReleaseHeadroom(gate.read_memory_config(report=False).release_headroom)
         source = gate.RecordedNeed("shape", 10, 14, "full", "", (), gate.WidthNotRecorded(),
-            gate.ShapeP90(10, gate.FailedPeakFloor(16 * GIB, "2026-10-30T01:40:00Z"),
+            gate.ShapeRankedPeak(10, 10, gate.FailedPeakFloor(16 * GIB, "2026-10-30T01:40:00Z"),
                           rule, gate.CappedAtBudget(30 * GIB, 19 * GIB)))
         zone = user_zone()
         with mock.patch.object(gate, "read_memory_config", side_effect=AssertionError("live policy")), \
@@ -287,7 +287,7 @@ class QueueEvidenceTests(unittest.TestCase):
         self.assertNotIn("21.0 GiB", text)
 
     def test_full_package_estimates_keep_package_and_width_for_every_basis(self) -> None:
-        for basis in (gate.BasisNotRecorded(), gate.ShapeP90(7), gate.ShapeLargest(2),
+        for basis in (gate.BasisNotRecorded(), gate.ShapeRankedPeak(7, 10), gate.ShapeLargest(2),
                       gate.ShapeFallback()):
             with self.subTest(basis=basis):
                 self.change_head(test_scope="full", package="hana_widget", filters=[],
@@ -335,7 +335,7 @@ class QueueEvidenceTests(unittest.TestCase):
                     if unreadable:
                         load.rmdir()
                 self.assertIn("host load: unavailable", text.lower())
-                self.assertIn("measured process-memory p90 of 7 runs", text)
+                self.assertIn("measured process-memory estimate from 7 runs", text)
                 self.assertIn("Frees when:", text)
 
     def test_renderers_use_model_inputs_without_load_reads_or_release_search(self) -> None:
@@ -369,7 +369,7 @@ class QueueEvidenceTests(unittest.TestCase):
         facts.assert_called_once_with(reading)
         labels.assert_called_once()
         self.assertEqual(text.count("Frees when:"), 1)
-        self.assertEqual(text.count("measured process-memory p90 of 7 runs"), 1)
+        self.assertEqual(text.count("measured process-memory estimate from 7 runs"), 1)
         self.assertEqual(text.count("Cargo token waits:"), 1)
         self.assertEqual(text.count("Host load: 64.25"), 1)
         self.assertEqual(text.count("#1 of 17"), 1)
@@ -593,7 +593,7 @@ class QueueEvidenceTests(unittest.TestCase):
 
     def test_need_source_records_explain_sample_window_filter_and_width(self) -> None:
         output = self.output()
-        for word in ("measured", "p90", "7 runs", "14 days", "filtered", "hana_inspectors", "filters: test(one), test(two)", "width: 8"):
+        for word in ("measured", "estimate", "7 runs", "14 days", "filtered", "hana_inspectors", "filters: test(one), test(two)", "width: 8"):
             self.assertIn(word, output)
         details = self.line(output, "Package:")
         self.assertEqual(len(details.partition("filters: ")[2].partition(";")[0].split(", ")), 2)
@@ -610,25 +610,25 @@ class QueueEvidenceTests(unittest.TestCase):
 
     def test_shape_need_text_names_each_tier_and_its_run_count(self) -> None:
         for basis, words in (
-            (gate.ShapeP90(12), ("same-shape", "p90", "12 runs")),
+            (gate.ShapeRankedPeak(12, 10), ("same-shape", "highest 10%", "12 runs")),
+            (gate.ShapeRankedPeak(20, 50), ("same-shape", "highest 50%", "20 runs")),
             (gate.ShapeLargest(3), ("same-shape", "largest", "3 runs")),
             (gate.ShapeFallback(), ("same-profile", "fallback")),
         ):
             with self.subTest(basis=basis):
-                source = gate.RecordedNeed("shape", 12 if isinstance(basis, gate.ShapeP90) else 3,
+                source = gate.RecordedNeed("shape", basis.runs if isinstance(basis, gate.ShapeRankedPeak) else 3,
                                            14, "full", "", (), gate.WidthNotRecorded(), basis)
                 text = queue_evidence.need_text(source, zone=user_zone())
                 for word in (*words, "14 days"):
                     self.assertIn(word, text)
-                if not isinstance(basis, gate.ShapeP90):
-                    self.assertNotIn("p90", text)
+                self.assertNotIn("p90", text)
 
     def test_shape_need_text_names_floor_release_factor_and_budget_cap(self) -> None:
         ended_at = "2026-10-29T09:09:52Z"
         floor = gate.FailedPeakFloor(gib(15.76), ended_at)
         rule = gate.ReleaseHeadroom(gate.read_memory_config(report=False).release_headroom)
         for tier in (
-            gate.ShapeP90(10, floor, rule, gate.CappedAtBudget(gib(24), 21 * GIB)),
+            gate.ShapeRankedPeak(10, 10, floor, rule, gate.CappedAtBudget(gib(24), 21 * GIB)),
             gate.ShapeLargest(2, floor, rule, gate.CappedAtBudget(gib(24), 21 * GIB)),
             gate.ShapeFallback(gate.CappedAtBudget(gib(24), 21 * GIB)),
         ):
@@ -682,7 +682,7 @@ class QueueEvidenceTests(unittest.TestCase):
         need_line = self.line(text, "Need source:")
         self.assertIn("6.0 GiB", text)
         self.assertEqual(head.cause, gate.EstimateExpired(expired_at))
-        self.assertIn("p90 of 10", need_line)
+        self.assertIn("measured process-memory estimate from 10 runs", need_line)
         self.assertIn("the estimate expired at", text)
         self.assertIn("the client refreshes it through the admission service", text)
 

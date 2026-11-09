@@ -174,7 +174,7 @@ from scripts.build_queue.admission_records import (
     ShapeFallback as ShapeFallback,
     ShapeLargest as ShapeLargest,
     ShapeNeedBasis as ShapeNeedBasis,
-    ShapeP90 as ShapeP90,
+    ShapeRankedPeak as ShapeRankedPeak,
     StartBasis as StartBasis,
     StartSpacing as StartSpacing,
     StartSpacingWait as StartSpacingWait,
@@ -687,6 +687,7 @@ class UsableAdmissionConfiguration:
     cloud_gate_slots: int
     cloud_gate_stale_pushes: int
     progress_profile_rank: int
+    peak_history_share_percent: int
 
 
 @dataclass(frozen=True)
@@ -702,10 +703,11 @@ def read_admission_configuration() -> UsableAdmissionConfiguration | UnusableAdm
             cloud_gate_slots = settings.whole("cloud_gate_slots")
             cloud_gate_stale_pushes = settings.whole("cloud_gate_stale_pushes")
             progress_profile_rank = settings.whole("progress_profile_rank")
+            peak_history_share_percent = settings.whole("peak_history_share_percent")
         config = read_memory_config(report=False)
         return UsableAdmissionConfiguration(replace(config,
             diagnostics=(*config.diagnostics, *configuration_diagnostics(messages))),
-            cloud_gate_slots, cloud_gate_stale_pushes, progress_profile_rank)
+            cloud_gate_slots, cloud_gate_stale_pushes, progress_profile_rank, peak_history_share_percent)
     except conf.Unusable as error:
         return UnusableAdmissionConfiguration(str(error))
 
@@ -772,9 +774,10 @@ def _need_record(basis: NeedBasis | BasisNotRecorded | TestPhaseNeed | NoTestPha
             if isinstance(basis.factor, DevSizeHeadroom):
                 factor["margin_bytes"] = basis.factor.margin_bytes
             break
-    kind = "shape_p90" if isinstance(basis, ShapeP90) else "shape_largest"
-    return {"kind": kind, "runs": basis.runs,
-            "floor": floor, "factor": factor, "cap": cap}
+    if isinstance(basis, ShapeRankedPeak):
+        return {"kind": "shape_ranked_peak", "runs": basis.runs, "share_percent": basis.share_percent,
+                "floor": floor, "factor": factor, "cap": cap}
+    return {"kind": "shape_largest", "runs": basis.runs, "floor": floor, "factor": factor, "cap": cap}
 
 
 def _read_need_record(raw: object) -> NeedBasis | BasisNotRecorded | TestPhaseNeed | NoTestPhaseNeed:
@@ -783,6 +786,10 @@ def _read_need_record(raw: object) -> NeedBasis | BasisNotRecorded | TestPhaseNe
         return BasisNotRecorded()
     row = cast(dict[str, object], raw)
     kind = row.get("kind")
+    if kind == "shape_p90":
+        # Phase 33: older shape estimates always used a ten-percent share.
+        row = {**row, "kind": "shape_ranked_peak", "share_percent": 10}
+        kind = "shape_ranked_peak"
     if kind == "no_test_phase_need" and row.get("reason") in ("no_width", "no_history", "not_recorded"):
         return NoTestPhaseNeed(cast(Literal["no_width", "no_history", "not_recorded"], row["reason"]))
     if kind == "test_phase_need":
@@ -798,7 +805,7 @@ def _read_need_record(raw: object) -> NeedBasis | BasisNotRecorded | TestPhaseNe
         return BasisNotRecorded()
     if kind in ("measured", "buildlog", "pooled", "fallback"):
         return kind
-    if kind not in ("shape_p90", "shape_largest", "shape_fallback"):
+    if kind not in ("shape_ranked_peak", "shape_largest", "shape_fallback"):
         return BasisNotRecorded()
     try:
         cap_row = cast(dict[str, object], row["cap"])
@@ -856,8 +863,10 @@ def _read_need_record(raw: object) -> NeedBasis | BasisNotRecorded | TestPhaseNe
         runs = row["runs"]
         if not isinstance(runs, int) or runs < 0:
             return BasisNotRecorded()
-        if kind == "shape_p90" and runs >= 10:
-            return ShapeP90(runs, floor, factor, cap)
+        if kind == "shape_ranked_peak" and runs >= 10:
+            share_percent = row["share_percent"]
+            if type(share_percent) is int and 0 <= share_percent <= 50:
+                return ShapeRankedPeak(runs, share_percent, floor, factor, cap)
         if kind == "shape_largest" and 1 <= runs < 10:
             return ShapeLargest(runs, floor, factor, cap)
     except (KeyError, TypeError, ValueError):
@@ -884,8 +893,10 @@ def read_test_phase_need(raw: object) -> TestPhaseNeed | NoTestPhaseNeed:
 
 
 def test_phase_need_from_rows(rows: Iterable[Mapping[str, object]],
-                             row: Mapping[str, object], host: str, now: datetime, margin: float) -> TestPhaseNeed | NoTestPhaseNeed:
-    """Choose narrow-family history at the closest usable width; read no external state."""
+                             row: Mapping[str, object], host: str, now: datetime, margin: float, *,
+                             share_percent: int | progress.ConfiguredPeakShare = progress.CONFIGURED_PEAK_SHARE
+                             ) -> TestPhaseNeed | NoTestPhaseNeed:
+    """Choose narrow-family history at the closest usable width."""
     recorded = row.get("test_threads")
     width = recorded.threads if isinstance(recorded, RequestedTestWidth) else recorded
     if type(width) is not int or width <= 0:
@@ -922,7 +933,7 @@ def test_phase_need_from_rows(rows: Iterable[Mapping[str, object]],
     else:
         recorded_width, form = max(by_width), "scaled_up"
     peaks = by_width[recorded_width]
-    need = percentile(peaks)
+    need = progress.ranked_peak(peaks, 1, share_percent=share_percent)
     if form == "scaled_up":
         need = (need * width + recorded_width - 1) // recorded_width
     return TestPhaseNeed(max(FILTERED_FLOOR, need), len(peaks), width, recorded_width, form, margin)
@@ -930,12 +941,14 @@ def test_phase_need_from_rows(rows: Iterable[Mapping[str, object]],
 
 def test_phase_need(row: Mapping[str, object], host: str, now: datetime, root: Path, *,
                     history_path: Path | None = None,
-                    config: MemoryConfig
+                    config: MemoryConfig,
+                    share_percent: int | progress.ConfiguredPeakShare = progress.CONFIGURED_PEAK_SHARE
                     ) -> TestPhaseNeed | NoTestPhaseNeed:
     """Freeze the history need and margin when the reservation need is written."""
     try:
         path = history_path if history_path is not None else root / "admission/anon_peaks.jsonl"
-        return test_phase_need_from_rows(anonymous_history_rows(path), row, host, now, config.test_phase_margin)
+        return test_phase_need_from_rows(anonymous_history_rows(path), row, host, now, config.test_phase_margin,
+                                         share_percent=share_percent)
     except OSError:
         return NoTestPhaseNeed("no_history")
 
@@ -1925,7 +1938,7 @@ def progress_memory(row: Reservation, reading: MeasuredMemory, attributed: Attri
     need = full_need
     if isinstance(window, progress.WindowPeak):
         basis = read_need_basis(row.get("queue_waiter", {}).get("need_basis"))
-        need = shape_headroom_bytes(window.bytes, basis.factor) if isinstance(basis, (ShapeP90, ShapeLargest)) else window.bytes
+        need = shape_headroom_bytes(window.bytes, basis.factor) if isinstance(basis, (ShapeRankedPeak, ShapeLargest)) else window.bytes
         if row["step"] == "nextest" and isinstance(reading.peak_history, TestPhaseStarted):
             phase = reading.peak_history
             if isinstance(counter, progress.ProgressCounter) and counter.phase == "test:1":

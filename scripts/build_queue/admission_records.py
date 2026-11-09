@@ -140,8 +140,9 @@ class CappedAtBudget:
 
 
 @dataclass(frozen=True)
-class ShapeP90:
+class ShapeRankedPeak:
     runs: int
+    share_percent: int
     floor: FailedPeakFloor | NoFloor = NoFloor()
     factor: HeadroomRule = NoHeadroom()
     cap: CappedAtBudget | UnderBudget = UnderBudget()
@@ -159,7 +160,7 @@ class ShapeLargest:
 class ShapeFallback:
     cap: CappedAtBudget | UnderBudget = UnderBudget()
 
-ShapeNeedBasis = ShapeP90 | ShapeLargest | ShapeFallback
+ShapeNeedBasis = ShapeRankedPeak | ShapeLargest | ShapeFallback
 
 NeedBasis = LegacyNeedSource | ShapeNeedBasis
 
@@ -285,7 +286,7 @@ class ExpectedPeak:
     basis: NeedBasis | BasisNotRecorded = BasisNotRecorded()
 
     def __post_init__(self) -> None:
-        if self.source == "shape" and not isinstance(self.basis, (ShapeP90, ShapeLargest, ShapeFallback)):
+        if self.source == "shape" and not isinstance(self.basis, (ShapeRankedPeak, ShapeLargest, ShapeFallback)):
             raise ValueError("a shape estimate needs its shape basis")
         if isinstance(self.basis, BasisNotRecorded):
             if self.source in ("measured", "buildlog", "pooled", "fallback"):

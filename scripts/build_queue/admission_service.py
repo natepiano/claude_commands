@@ -1289,7 +1289,7 @@ class AdmissionServer:
             return self.system_reader.latest.lifetimes.get(record.episode, gate.LiveOwnerProcess())
         return self.proc.lifetime(reservation_row(record), self._live(record.owner))
 
-    def _inputs(self, config: gate.MemoryConfig, profile_rank: int) -> gate.QueueInputs:
+    def _inputs(self, config: gate.MemoryConfig, profile_rank: int, profile_share: int) -> gate.QueueInputs:
         now = self.clock.now()
         plan = self._reading_plan(config)
         if isinstance(self.system_reader, NoSystemReader):
@@ -1356,7 +1356,8 @@ class AdmissionServer:
                         if isinstance(step.run, LiveBuildRun) and (step.run.pid, step.run.start_time) not in represented)
         if between:
             inputs = replace(inputs, running=(*inputs.running, *between))
-        return self._progress_inputs(self._inputs_with_current_slots(inputs), dict(evidence.processes), config.policy, profile_rank)
+        return self._progress_inputs(self._inputs_with_current_slots(inputs), dict(evidence.processes),
+                                     config.policy, profile_rank, profile_share)
 
     def _unowned_memory(self, evidence: SystemEvidence, rows: list[gate.Reservation]
                         ) -> tuple[gate.UnownedSliceMemory, ...]:
@@ -1422,12 +1423,12 @@ class AdmissionServer:
                 pass
 
     def _progress_inputs(self, inputs: gate.QueueInputs, processes: dict[int, gate.ProcessIdentity],
-                         policy: gate.AdmissionPolicy, profile_rank: int) -> gate.QueueInputs:
+                         policy: gate.AdmissionPolicy, profile_rank: int, profile_share: int) -> gate.QueueInputs:
         """Capture counters and profile samples on the service loop thread."""
         attributed = iter(gate.attributed_step_uses(inputs))
         running: list[gate.RunningStep] = []
         cutoff = inputs.now - gate.HISTORY_DAYS * 86400
-        self.progress_history.prune(cutoff, rank=profile_rank)
+        self.progress_history.prune(cutoff, rank=profile_rank, share_percent=profile_share)
         for step in inputs.running:
             if not gate.running_has_reservation(step):
                 running.append(step)
@@ -1448,7 +1449,7 @@ class AdmissionServer:
                 pids = gate.process_tree({row["pid"]: row["start_time"]}, processes)
                 counter = self.progress_captures.counter({pid: processes[pid].start for pid in pids}, self.boot_id)
             key = gate.reservation_profile_key(row, self.host)
-            profile = self.progress_history.matching(key, cutoff, rank=profile_rank)
+            profile = self.progress_history.matching(key, cutoff, rank=profile_rank, share_percent=profile_share)
             adjusted = gate.progress_memory(row, memory, use, counter, profile, policy)
             running.append(replace(step, measured=adjusted))
             if use.owns_source and isinstance(use.use, gate.AnonymousRunUse) and "reservation_id" in row:
@@ -1566,7 +1567,7 @@ class AdmissionServer:
                                      self.clock.monotonic() + config.source_check_seconds)
         policy = config.policy
         self.last_diagnostics = config.diagnostics
-        inputs = self._inputs(config, self.configuration.progress_profile_rank)
+        inputs = self._inputs(config, self.configuration.progress_profile_rank, self.configuration.peak_history_share_percent)
         preserve_override = self._override_pending_reconnect()
         if preserve_override:
             inputs = replace(inputs, override=gate.NoHeadAdmissionOverride())
@@ -1584,7 +1585,7 @@ class AdmissionServer:
             waiting = self.waiters[episode]
             proposed = cast(gate.ProposedAdmission, decision.admission)
             self._effects(proposed.spacing, proposed.override, decision.decision, preserve_override)
-            self._admit(waiting, config)
+            self._admit(waiting, config, self.configuration.peak_history_share_percent)
         self.persist()
         waiting_steps = tuple(gate.WaitingStep(row["pid"], row.get("session_id", ""), row.get("session_name", ""),
             row.get("step", ""), row.get("folder", ""), row["since"], row["need"], decision.reason, row.get("unit", ""))
@@ -1636,7 +1637,7 @@ class AdmissionServer:
         position = 0
         for waiting in waiting_cloud:
             if used < slots:
-                self._admit(waiting, config)
+                self._admit(waiting, config, configuration.peak_history_share_percent)
                 used += 1
                 started = True
                 continue
@@ -1776,15 +1777,16 @@ class AdmissionServer:
     def _record_left(self, episode: str, identity: gate.QueueLifeIdentity, reason: gate.LeftReason) -> None:
         self.lifecycle_outbox = (*self.lifecycle_outbox, PendingLeft(identity, episode, reason, self.clock.now()))
 
-    def _freeze_test_phase_need(self, record: ReservationRecord, config: gate.MemoryConfig) -> ReservationRecord:
+    def _freeze_test_phase_need(self, record: ReservationRecord, config: gate.MemoryConfig,
+                                share_percent: int) -> ReservationRecord:
         if record.step != "nextest":
             return record
         need = gate.test_phase_need(reservation_row(record), self.host,
             datetime.fromtimestamp(self.clock.now(), UTC), self.state_dir,
-            history_path=self.state_dir / "anon_peaks.jsonl", config=config)
+            history_path=self.state_dir / "anon_peaks.jsonl", config=config, share_percent=share_percent)
         return replace(record, test_phase_need=need)
 
-    def _admit(self, waiting: WaitingAdmission, config: gate.MemoryConfig) -> None:
+    def _admit(self, waiting: WaitingAdmission, config: gate.MemoryConfig, share_percent: int) -> None:
         request, profile = waiting.request, waiting.request.profile
         now = self.clock.now()
         if isinstance(request, wire.LaunchRequest):
@@ -1809,7 +1811,7 @@ class AdmissionServer:
                 profile.scope, gate.test_package(list(request.argv)), tuple(gate.test_filters(list(request.argv))),
                 shape, run=request.run, place=request.place)
             if not cloud:
-                record = self._freeze_test_phase_need(record, config)
+                record = self._freeze_test_phase_need(record, config, share_percent)
             result = self.last_result
             candidate = result.policy.queued_head if isinstance(result, gate.PassResult) else gate.NoQueuedHead()
             self.lifecycle_outbox = (*self.lifecycle_outbox, PendingAdmission(request.episode, profile.peak.source,
@@ -1910,11 +1912,13 @@ class AdmissionServer:
             execution=wire.RunnerExecutionTiming(config.program_sample_seconds,
                 config.program_stop_seconds, config.peak_wave_seconds))
 
-    def _service_estimate(self, request: wire.ServiceEstimateRequest) -> wire.AdmitRequest:
-        config = records.read_memory_config()
+    def _service_estimate(self, request: wire.ServiceEstimateRequest,
+                          configuration: gate.UsableAdmissionConfiguration) -> wire.AdmitRequest:
+        config = configuration.config
         estimate = step_estimator.step_estimate(list(request.argv), request.cwd, records.INFER_FROM_ARGV,
             lambda: datetime.fromtimestamp(self.clock.now(), UTC), self.state_dir.parent, config.policy,
             first_peak_bytes=config.program_first_peaks["cargo"],
+            share_percent=configuration.peak_history_share_percent,
             build_history_generation=lambda: records.BuildHistoryGeneration(self.build_history_generation),
             location=step_estimator.RepositoryLocation(request.repository, request.worktree))
         label = config.ci_label.format(runner=request.runner, job=request.job)
@@ -1955,7 +1959,12 @@ class AdmissionServer:
             replay = self.ledger.get(request.episode)
             if replay is not None:
                 return [self._runner_reply(replay.reply)]
-            request = self._service_estimate(request)
+            configuration = self._take_configuration()
+            if isinstance(configuration, gate.UnusableAdmissionConfiguration):
+                _ = self._run_pass(configuration)
+                return [wire.Refused(configuration.reason)]
+            request = self._service_estimate(request, configuration)
+            self.pending_configuration = configuration
         if isinstance(request, (wire.AdmitRequest, wire.LaunchRequest)) and request.code_version:
             self.caller_versions[gate.run_owner(request.owner.pid, request.owner.start_time)] = request.code_version
         if isinstance(request, wire.BuildHistoryRequest):
@@ -2025,7 +2034,8 @@ class AdmissionServer:
                                       test_phase_need=gate.NoTestPhaseNeed("not_recorded"))
                     if (isinstance(record.place, wire.LocalPlace)
                             and isinstance(configuration, gate.UsableAdmissionConfiguration)):
-                        updated = self._freeze_test_phase_need(updated, configuration.config)
+                        updated = self._freeze_test_phase_need(updated, configuration.config,
+                                                               configuration.peak_history_share_percent)
                     self.reservations[episode] = updated
             live = any(record.reservation_id == request.reservation for record in self.reservations.values())
             self.ledger[key] = ReplayEntry(wire.Ok(), LiveGrant() if live else self.clock.now(), request.reservation)
