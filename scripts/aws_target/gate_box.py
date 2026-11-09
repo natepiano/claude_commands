@@ -98,7 +98,7 @@ try:
             subprocess.run(['git', 'clone', gate_request['clone_url'], str(repo)], check=True)
             if links.get('source'):
                 get(links['source'], root / 'source.bundle')
-                subprocess.run(['git', '-C', str(repo), 'fetch', str(root / 'source.bundle'), 'HEAD'], check=True)
+                subprocess.run(['git', '-C', str(repo), 'fetch', str(root / 'source.bundle'), links['commit']], check=True)
             subprocess.run(['git', '-C', str(repo), 'update-ref', 'refs/remotes/origin/main', gate_request['origin_main']], check=True)
         else:
             get(links['source'], root / 'source.bundle')
@@ -146,6 +146,9 @@ try:
                     from scripts.aws_target.gate_box import encode_run, completion_record
                     result['record'] = completion_record(gate, links['attempt'], links['commit'], tree, os.uname().nodename,
                                                          result['gate_started_at'], time.time(), links['mode'])
+                    dirty = gate_request['dirty_paths']
+                    result['record'].update(head=gate_request['head'], dirty=bool(dirty), dirty_paths=dirty,
+                                            dirty_path_count=len(dirty))
                     result.update(attempt=links['attempt'], commit=links['commit'], tree=tree,
                                   host=os.uname().nodename, gate=encode_run(gate))
                 result['gate_finished_at'] = time.time()
