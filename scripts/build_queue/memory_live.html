@@ -260,6 +260,7 @@ body.queue-unavailable .status, body.queue-unavailable .card { display: none; }
 </head>
 <body>
 <main>
+  <p class="error" id="mac-idle-alert" role="status" hidden></p>
   <h1>Build memory on natedev</h1>
   <div class="queue-error" id="queue-error" role="status"></div>
   <div class="status"><div class="status-content"><span class="dot" id="dot"></span><span id="status">Reading…</span><a class="pill" id="pill" href="#swap" data-tip="pill"><span class="pd"></span><span id="pill-t">pressure –</span></a></div></div>
@@ -313,6 +314,7 @@ body.queue-unavailable .status, body.queue-unavailable .card { display: none; }
   <section class="card">
     <div class="walk-head"><span class="section-head" data-tip="walkhead">Running, in start order</span><span class="walk-sum num" id="walk-sum" data-tip="walksum"></span></div>
     <div class="walk" id="walk"></div>
+    <p class="report-window" id="priority-line"></p>
     <p class="report-window" id="head-line"></p>
     <p class="pressure-reason" id="cap-reason"></p>
     <div class="wait-reasons" id="wait-reasons"></div>
@@ -525,6 +527,8 @@ function render(d) {
     recordReadFailure("The queue did not answer.");
     return;
   }
+  $("mac-idle-alert").textContent = d.mac_idle_alert;
+  $("mac-idle-alert").hidden = !d.mac_idle_alert;
   $("room-equation").textContent = roomEquation(d);
   document.body.classList.remove("queue-unavailable");
   const t = d.total;
@@ -781,6 +785,7 @@ function renderWalk(d) {
   $("ticks").innerHTML = lowerTicks.join("");
   $("ticks-top").innerHTML = ticks.join("");
   $("walk-sum").textContent = !hasCap(d) ? `${f1(d.taken)} GiB taken · cap unavailable` : `${f1(d.taken)} of ${f1(d.cap)} GiB taken`;
+  $("priority-line").textContent = d.priority_text || "";
   $("head-line").textContent = d.head_text || "";
   $("wait-reasons").innerHTML = d.waiters.map(waiter =>
     `<p class="wait-reason"><strong>${esc(waiter.name)}</strong> · ${esc(waiter.reason)}</p>`).join("");

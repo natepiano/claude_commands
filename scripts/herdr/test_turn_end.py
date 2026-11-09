@@ -18,38 +18,76 @@ from scripts.direct import assign, progress_history
 from scripts.herdr import herdr, side_pane, turn_end, worker_panes
 from scripts.lib import atomic_file, process_start
 from scripts.message import send
-from scripts.lib.test_hang_guard import LauncherHangGuard
+from scripts.lib.test_hang_guard import LauncherHangGuard, TEST_HANG_GUARD_SECS
 from scripts.lib.test_models_registry import write_registry
 from scripts.production import staff, test_worker, worker
 
 
 class NativeHookEntryTests(unittest.TestCase):
     def test_native_entry_starts_a_separate_handler_without_calling_handle(self) -> None:
-        for family in ("codex", "claude"):
-            with self.subTest(family=family):
-                reply = 'The work is complete.\nDONE "dispatch"'
-                value = ({"type": "agent-turn-complete", "thread-id": "native-thread",
-                          "last-assistant-message": reply} if family == "codex" else
-                         {"hook_event_name": "Stop", "session_id": "native-thread", "last_assistant_message": reply})
+        real_popen = subprocess.Popen
+        for family, size in (("codex", 1), ("claude", 1), ("codex", 5_000)):
+            with self.subTest(family=family, size=size), TemporaryDirectory() as folder:
+                reply = 'The work is complete.\nDONE "dispatch"' * size
+                value: dict[str, object] = {"hook_event_name": "Stop", "session_id": "native-thread", "last_assistant_message": reply}
+                if family == "codex":
+                    value.update({"turn_id": "turn-1", "model": "sol", "transcript_path": None})
                 payload = json.dumps(value)
-                arguments = [payload] if family == "codex" else []
-                with patch.object(turn_end, "handle") as handler, \
-                        patch.object(subprocess, "Popen") as start, \
-                        patch.object(sys, "stdin", io.StringIO(payload)):
-                    self.assertEqual(turn_end.main(arguments), 0)
+                receiver = Path(folder) / "receive.py"
+                receipt = Path(folder) / "receipt.json"
+                atomic_file.write_text_atomic(receiver, "\n".join((
+                    "from dataclasses import asdict",
+                    "import json, sys",
+                    "from pathlib import Path",
+                    "from scripts.herdr import turn_end",
+                    "from scripts.lib.atomic_file import write_text_atomic",
+                    "turn_end.handle = lambda event: write_text_atomic(Path(sys.argv[1]), json.dumps(asdict(event)))",
+                    "raise SystemExit(turn_end.main(sys.argv[2:]))", "")))
+                children: list[subprocess.Popen[bytes]] = []
+
+                def receive(arguments: list[str], *, start_new_session: bool, stdin: int,
+                            stdout: int, stderr: int) -> subprocess.Popen[bytes]:
+                    child = real_popen([arguments[0], str(receiver), str(receipt), *arguments[2:]],
+                        start_new_session=start_new_session, stdin=stdin, stdout=stdout, stderr=stderr)
+                    self.addCleanup(child.wait, timeout=TEST_HANG_GUARD_SECS)
+                    self.addCleanup(child.kill)
+                    children.append(child)
+                    return child
+
+                output = io.StringIO()
+                with (patch.object(turn_end, "handle") as handler,
+                      patch.object(subprocess, "Popen", side_effect=receive) as start,
+                      patch.object(sys, "stdin", io.StringIO(payload)),
+                      patch.object(sys, "stdout", output)):
+                    self.assertEqual(turn_end.main([]), 0)
                 handler.assert_not_called()
                 start.assert_called_once_with(
-                    [sys.executable, str(Path(turn_end.__file__).resolve()), "--handle-hook", payload],
-                    start_new_session=True, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    [sys.executable, str(Path(turn_end.__file__).resolve()), "--handle-hook"],
+                    start_new_session=True, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                self.assertEqual(children[0].wait(timeout=TEST_HANG_GUARD_SECS), 0)
+                self.assertEqual(json.loads(receipt.read_text()),
+                                 {"thread_id": "native-thread", "kind": "turn end", "reply": reply})
+                self.assertEqual(output.getvalue(), "")
 
     def test_separate_invocation_calls_handle_once_without_starting_another_process(self) -> None:
-        payload = json.dumps({"type": "agent-turn-complete", "thread-id": "native-thread",
-                              "last-assistant-message": "The work is complete."})
-        with patch.object(turn_end, "handle", return_value=turn_end.TurnOutcome.DONE) as handler, \
-                patch.object(subprocess, "Popen") as start:
-            self.assertEqual(turn_end.main(["--handle-hook", payload]), 0)
-        handler.assert_called_once_with(turn_end.WorkerEvent("native-thread", reply="The work is complete."))
-        start.assert_not_called()
+        cases: tuple[tuple[dict[str, object], turn_end.WorkerEvent], ...] = (
+            ({"hook_event_name": "Stop", "session_id": "native-thread", "last_assistant_message": "The work is complete."},
+             turn_end.WorkerEvent("native-thread", reply="The work is complete.")),
+            ({"hook_event_name": "Stop", "session_id": "native-thread", "last_assistant_message": None},
+             turn_end.WorkerEvent("native-thread")),
+            ({"type": "agent-turn-complete", "thread-id": "native-thread", "last-assistant-message": "The work is complete."},
+             turn_end.WorkerEvent("")),
+        )
+        for value, expected in cases:
+            with (self.subTest(value=value),
+                  patch.object(turn_end, "handle", return_value=turn_end.TurnOutcome.DONE) as handler,
+                  patch.object(subprocess, "Popen") as start,
+                  patch.object(sys, "stdin", io.StringIO(json.dumps(value))),
+                  patch.object(sys, "stdout", io.StringIO()) as output):
+                self.assertEqual(turn_end.main(["--handle-hook"]), 0)
+            handler.assert_called_once_with(expected)
+            start.assert_not_called()
+            self.assertEqual(output.getvalue(), "")
 
 
 @final
@@ -85,11 +123,11 @@ class TurnEndTests(unittest.TestCase):
                         self.case.agent.append(pane, "assistant", "The previous result is pending.")
                     self.case.agent.replies.append("The work is complete.\nDONE " + active.instance_id)
                     self.case.fixture.world.locations[pane]["agent_status"] = "done"
-                payload: dict[str, object] = ({"type": "agent-turn-complete", "thread-id": str(row.current_session),
-                    "turn-id": "turn-1", "cwd": str(self.case.fixture.root), "input-messages": [self.case.agent.submitted[-1][1]],
-                    "last-assistant-message": self.case.agent.replies[-1]} if family == "codex" else
-                    {"hook_event_name": "Stop", "session_id": str(row.current_session), "transcript_path": "unused",
-                     "stop_hook_active": False, "last_assistant_message": self.case.agent.replies[-1]})
+                payload: dict[str, object] = {
+                    "hook_event_name": "Stop", "session_id": str(row.current_session), "transcript_path": "unused",
+                    "stop_hook_active": False, "last_assistant_message": self.case.agent.replies[-1]}
+                if family == "codex":
+                    payload.update({"turn_id": "turn-1", "cwd": str(self.case.fixture.root), "model": "sol"})
                 if close == "kept":
                     self.case.fixture.world.unknown[pane] = "worker process is unreadable"
                 elif close == "outside":
@@ -183,12 +221,14 @@ class TurnEndTests(unittest.TestCase):
                 (self.case.fixture.parent.current_session, self.case.fixture.parent.name, "the staff row is not a worker"),
                 (row.current_session, row.name, "no active dispatch or recoverable completion exists"),
                 ("unknown-thread", "unknown", "no staff row for the current thread"),
+                (turn_end.hook_event({"type": "agent-turn-complete", "thread-id": str(row.current_session)}).thread_id,
+                 "unknown", "no staff row for the current thread"),
                 ("", "unknown", "no staff row for the current thread")):
             with self.subTest(identity=identity):
                 self.assertEqual(turn_end.handle(turn_end.WorkerEvent(str(identity))), turn_end.TurnOutcome.IGNORED)
                 entry = cast(dict[str, object], json.loads(log.read_text().splitlines()[-1]))
                 self.assertEqual((entry["thread_id"], entry["worker_name"], entry["reason"]), (identity, name, reason))
-        self.assertEqual(len(log.read_text().splitlines()), 4)
+        self.assertEqual(len(log.read_text().splitlines()), 5)
         self.assertEqual((self.case.run_dir / "progress_history_state.json").read_bytes(), before)
         self.assertEqual(self.case.agent.notices, [])
         self.assertEqual(self.case.agent.submitted, [])
@@ -478,8 +518,8 @@ class TurnEndTests(unittest.TestCase):
                 completion_actions=progress_history.CompletionActions(end_worker=True, held_role=str(current.row.id)))
             self.assertIs(result, worker.DispatchSubmission.SUBMITTED)
             active = progress_history.active_dispatch(current.row.id, self.case.run_dir)
-            event = turn_end.hook_event({"type": "agent-turn-complete", "thread-id": str(current.row.current_session),
-                                         "last-assistant-message": old_reply})
+            event = turn_end.hook_event({"hook_event_name": "Stop", "session_id": str(current.row.current_session),
+                                         "last_assistant_message": old_reply})
             stops = self.case.fixture.world.stops.copy()
             cases = (("", old_reply), ("Still reviewing.", old_reply),
                      ("The older result is pending.", "The work is complete.\nDONE another-dispatch"))
