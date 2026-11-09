@@ -623,7 +623,7 @@ Each new step releases the previous step's reservation before local waits.
 
 ## Mirror refusal times
 
-`mirror_busy_backoff_s=120` appears in both `mac_test.conf` and `aws_target.conf`.
+One `mirror_busy_backoff_s` key in `mac_test.conf` serves both Mac and AWS targets.
 Each target stores `mirror-busy-<repository>.until` beside its unreachable backoff record.
 A mirror busy refusal during copy writes this time.
 No available slot lease also writes this time.
