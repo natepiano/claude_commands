@@ -2152,41 +2152,23 @@ Registered jobs already take no margin: `test_registered_and_unregistered_jobs_e
 
 ### Phase 97 — A build target command repeats no work at start  · status: done
 
-**Depends on:** none. Merge `origin/builds` first.
+#### As-built
 
-**Approved:** builds showrunner, 2026-11-09 ("next phase, start now ... `scripts/build_targets/build_targets.py` does 118 ms of work per start outside its import. Profile it and remove repeated work. Send the ETA, and the before/after per-start time with the hash.").
+`eligible` and `release-wait` open `build_targets.conf` once per start. `target_config.command_configuration` keeps one `read_targets` result for one command. The state readers load only when a branch reads state, the AWS ledger loads only when AWS routing is on, and `release-wait` loads the Mac test code only when a target state folder exists. Output lines and exit codes do not change.
 
-#### Work Order
-
-**Goal:** Each `build_targets.py` start that `verify.sh` makes does no work twice and loads only what its command needs.
-
-**Measured:** natest's whole-gate report (`/tmp/claude/unit/2113de4f-9913-485a-9a51-61558bfd81db/phases/rank113/whole_gate_report.md`, 2026-11-09) counts 786 starts at 149 ms each: 31 ms of import and 118 ms of work. The verify unit measured 199 ms of CPU for the same call. `verify.sh` starts `eligible` on every step (line 2289, and line 699 for each probe mark) and `release-wait` when the step ends (line 2543). `register-local`, `wait-local` and `interrupt-local` run only when a hold exists or a wait is stopped.
-
-**Spec:**
-
-1. **Profile.** Before any edit, profile the real entry, `python3 scripts/build_targets/build_targets.py <command>`, for `eligible` and `release-wait`. Count an import made inside a command function as work. Use a private state folder and config, as `test_build_targets.py` does with `CONF_DIR`, `BUILDLOG_DIR`, `BUILD_HOLD_DIR`, `BUILD_HOLD_RELEASE_DIR`, `MAC_TEST_STATE_DIR` and `MAC_IDLE_STATE_DIR`. Do not read or write the real hold or queue state. Write the costs, largest first, to `profile.md` in the phase's run folder.
-2. **Before numbers.** Before any edit, start each of the two commands 50 times with the same private state. Record the median CPU time (user plus system of the child) and the median wall time, in ms.
-3. **Remove.** Remove each repeated cost that the profile shows: a file read or parsed more than once in one start, a module loaded on a path that does not use it, and a process started for an answer that the start already holds. Keep each repeated result in memory for one start only.
-4. **Same behavior.** Keep every output line, exit code, refusal and hold decision the same. Add no guard, refusal, check, config key or cache file.
-5. **After numbers.** Repeat the measurement of item 2 on the changed code. State both sets of numbers in the final reply.
-6. **Proof.** A test starts the real entry in a child process with private state and records file opens with `sys.addaudithook` and loaded modules from `sys.modules`. For `eligible` and `release-wait`, the test shows that `build_targets.conf` opens once and that each module this phase removes from that path is not loaded. Assert no times.
-7. **Other units' files.** In this unit's files, remove each load that the two paths do not need. The profile also named costs in other units' files: `mac_test.py` (62 ms on `release-wait`), `offload.py` (48 ms), `copies.py` (24 ms) and `ledger.py` (13 ms). Agree each small change with its owner first: verify for the first three, aws for `ledger.py` (builds showrunner, 2026-11-09). Verify Phase 42c and aws are editing those files now.
+Median CPU over 50 starts on the real entry, Mac state folder present: `eligible` 160.887 to 137.673 ms, `release-wait` 106.328 to 101.707 ms. With the folder absent: `eligible` 150.415 to 130.788 ms, `release-wait` 99.996 to 42.445 ms.
 
 **Files:**
-- `scripts/build_targets/build_targets.py`
-- `scripts/build_targets/target_config.py`
-- `scripts/build_targets/targets.py`
-- `scripts/lint/sweep.py`
-- `scripts/build_targets/test_build_targets.py`
-- `docs/as-built/build-targets.md` — only when this change makes a statement in it wrong.
+- `scripts/build_targets/build_targets.py` — delayed state reader and ledger loads; `command_configuration` around `eligible` and `release-wait`.
+- `scripts/build_targets/target_config.py` — one-command registry retention; home of `AnyEligibleTarget`, `LocalRequired`, `Routing`, `ANY_ELIGIBLE_TARGET`, `EligibleTarget` and `ExcludedTarget`.
+- `scripts/build_targets/targets.py` — re-exports those eligibility types.
+- `scripts/build_targets/test_build_targets.py` — real-entry rows for one registry open and module absence by branch.
 
-**Workers:** `1 writer + 1 tester`
-- `impl` owns the production files and the as-built doc. It does Spec items 1 to 5 and 7.
-- `test` owns `test_build_targets.py` and each test file of a moved name. It does Spec item 6 and runs the existing `scripts/build_targets` test modules.
+**Binds later work:** `command_release_wait` checks `target_config.ssh_target_state_directory` before it loads `mac_test`.
 
-**State:** none.
+**Gotchas:** natedev has the Mac state folder, so the rows with the folder present are its normal case.
 
-**Gate:** the targeted test; `scripts/build_targets/test_build_targets.py`, `test_targets.py`, `test_ssh_eligibility.py`, `test_aws_status.py` and `test_working_set.py` pass; `basedpyright` reports 0/0/0 on each changed file; the median CPU and wall time per start of `eligible` and `release-wait`, in ms over 50 starts, are lower after the change than before it. Observed on the real entry with private state.
+**Ruled out:** a shared cache of `mac_test.conf`, because it saves 0.8 ms.
 
 ### Phase 98 — A build target start loads no sweep, copy or Mac test code it does not use  · status: todo
 
@@ -2208,6 +2190,8 @@ Registered jobs already take no margin: `test_registered_and_unregistered_jobs_e
 4. **Move only.** Each change only moves code. Each moved name has one home and no copy. Add no guard, check or config key.
 5. **Numbers.** Report the median CPU and wall ms per start over 50 starts, before and after, for `eligible` and `release-wait`, with the Mac state folder present.
 6. **Owner read.** Send verify the diff before the checkpoint.
+
+**Constraints from prior phases:** `command_release_wait` checks `target_config.ssh_target_state_directory` before it loads `mac_test`. `target_config.command_configuration` keeps one `read_targets` result for one `eligible` or `release-wait` start. The eligibility types live in `target_config.py`, and `targets.py` re-exports them. The numbers to improve are CPU 137.673 ms on `eligible` and 101.707 ms on `release-wait`, with the Mac state folder present.
 
 **Files:**
 - `scripts/lint/sweep.py`
