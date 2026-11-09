@@ -714,8 +714,8 @@ class VerifyMacOffloadFixture(unittest.TestCase):
     def setUp(self) -> None:
         if "fixture_seed" in type(self).__dict__:
             self.root = self.fixture_root
-            _ = shutil.copytree(self.fixture_seed, self.root, symlinks=True)
             self.addCleanup(shutil.rmtree, self.root)
+            _ = shutil.copytree(self.fixture_seed, self.root, symlinks=True)
             self.fixture_paths()
             self.environment = self.fixture_environment.copy()
         else:

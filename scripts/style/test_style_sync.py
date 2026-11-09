@@ -938,7 +938,7 @@ with (Path('target').resolve().parent / '.claude-busy').open('r+') as lock:
                       + "[Errno 2] No such file or directory: 'git'", output.splitlines())
         self.assertEqual(style_sync.OwnerRecord.read(stale).repo, stale_repo)
 
-    def test_a_git_failure_in_cleanup_keeps_metadata_until_the_next_sweep(self) -> None:
+    def test_lint_folder_cleanup_needs_no_git_registration_read(self) -> None:
         original_worktrees = self.git("worktree", "list", "--porcelain")
         real_git = style_sync.git
 
@@ -950,21 +950,16 @@ with (Path('target').resolve().parent / '.claude-busy').open('r+') as lock:
         with mock.patch.object(style_sync, "git", git_launch_fails_in_cleanup):
             code, output = self.run_lint()
         self.assertEqual(code, 0, output)
-        [kept] = list(self.lint_temp.iterdir())
-        self.assertIn(f"style_sync: kept {kept} for the next lint run; worktree registration: "
-                      + f"[Errno {errno.EAGAIN}] {os.strerror(errno.EAGAIN)}: 'git'", output.splitlines())
-        self.assertFalse((kept / "checkout").exists())
+        self.assertEqual(list(self.lint_temp.iterdir()), [])
         self.assertEqual(self.git("worktree", "list", "--porcelain"), original_worktrees)
         self.assertFalse((self.standing_target().parent / ".git").exists())
         self.assertTrue(self.standing_target().is_dir())
-        # The next lint run starts after this one's owner has exited.
-        style_sync.OwnerRecord(ended_pid(), style_sync.OwnerRecord.read(kept).repo).write(kept)
-        sweep_output = io.StringIO()
-        with redirect_stdout(sweep_output):
-            style_sync.sweep_stale_lint_dirs()
-        self.assertIn(f"style_sync: removed stale lint checkout {kept}", sweep_output.getvalue())
+
+    def test_lint_folder_is_removed_when_verify_raises(self) -> None:
+        with mock.patch.object(style_sync, "verify_lint", side_effect=RuntimeError("verify failed")):
+            with self.assertRaisesRegex(RuntimeError, "verify failed"):
+                _ = style_sync.lint(self.repo, self.repo, self.tip)
         self.assertEqual(list(self.lint_temp.iterdir()), [])
-        self.assertEqual(self.git("worktree", "list", "--porcelain"), original_worktrees)
 
     def test_a_stop_signal_right_after_verify_starts_stops_it_and_cleans_up(self) -> None:
         real_popen = cast(Callable[..., subprocess.Popen[str]], subprocess.Popen)

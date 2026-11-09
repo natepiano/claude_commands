@@ -1195,13 +1195,16 @@ class FastTrackTests(MergeCheckpointFixture):
         self.save_config()
         pid_file = self.root / "check-descendant.pid"
         self.env["FAST_TRACK_DESCENDANT_PID"] = str(pid_file)
+        # The alarm outlasts the wait below, so only the time limit can satisfy the assertions.
+        self.env["FAST_TRACK_FIXTURE_ALARM_SECS"] = str(2 * TEST_HANG_GUARD_SECS)
         self.write(self.unit, "scripts/sample/test_item.py", '''import os
 from pathlib import Path
 import signal
 import subprocess
 import sys
-child = subprocess.Popen([sys.executable, "-c", "import signal; signal.pause()"])
+child = subprocess.Popen([sys.executable, "-c", "import os, signal; signal.alarm(int(os.environ[\\\"FAST_TRACK_FIXTURE_ALARM_SECS\\\"])); signal.pause()"])
 Path(os.environ["FAST_TRACK_DESCENDANT_PID"]).write_text(str(child.pid))
+signal.alarm(int(os.environ["FAST_TRACK_FIXTURE_ALARM_SECS"]))
 signal.pause()
 ''')
         result = self.fast_track("scripts/sample/item.py", "scripts/sample/test_item.py")

@@ -6,8 +6,13 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal
 import sqlite3
+import json
+from pathlib import Path
 from statistics import median
 from typing import TYPE_CHECKING, cast
+
+from scripts.aws_target import ledger
+from scripts.aws_target.ledger import ChargeRead
 
 if TYPE_CHECKING:
     from scripts.aws_target.measurement import MeasurementUnavailable, number
@@ -18,6 +23,51 @@ else:
     from scripts.buildlog import record
     from scripts.buildlog import store
     from scripts.mac_test import offload
+
+
+def bill_lines(reading: ChargeRead, directory: Path) -> list[str]:
+    """Show the account bill and allocate daily Spot compute across launched boxes."""
+    if not reading.account_bill:
+        return ['AWS bill: unavailable; the saved reading uses the old format.']
+    if not ledger.is_billed_day(reading):
+        return []
+    state = 'provisional' if reading.provisional else 'reported'
+    at = datetime.fromtimestamp(reading.at, UTC).isoformat()
+    lines = [f'AWS bill (account, UTC {reading.day}, {state}): ${reading.actual_usd:.2f}; '
+             + f'read at {at}; query cost ${reading.query_usd:.2f}.']
+    compute: dict[str, Decimal] = {}
+    for row in reading.usage_types:
+        if 'SpotUsage' in row.usage_type:
+            instance_type = row.usage_type.partition('SpotUsage:')[2] or 'unspecified'
+            compute[instance_type] = compute.get(instance_type, Decimal(0)) + row.usd
+    counts: dict[str, int] = {}
+    path = directory / 'cloud-gate-launches.jsonl'
+    if path.exists():
+        for line in path.read_text().splitlines():
+            row = ledger.mapping(cast(object, json.loads(line)))
+            if row.get('result') == 'launched' and reading.period_start <= float(str(row['time'])) < reading.period_end:
+                instance_type = ledger.text(row, 'instance_type')
+                counts[instance_type] = counts.get(instance_type, 0) + 1
+    for instance_type, usd in sorted(compute.items()):
+        boxes = counts.get(instance_type, 0)
+        allocation = f'${usd / boxes:.4f} per run (daily allocation)' if boxes else 'cost per run unavailable'
+        lines.append(f'AWS bill Spot compute, {instance_type}: ${usd:.4f}; {boxes} launched boxes; {allocation}.')
+    if compute:
+        lines.append('Account Spot compute can include the older Spot builder. Per-run costs use the daily allocation.')
+    return lines
+
+
+def spend_lines(spend: ledger.DailySpend, limit: Decimal, *, today: bool) -> list[str]:
+    label = "Today's spend" if today else 'Spend'
+    runs = 'run' if spend.runs == 1 else 'runs'
+    lines = [f'{label} (UTC {spend.day}): ${spend.usd:.2f}; limit ${limit:.2f}; '
+             + f'{spend.runs} {runs}; {spend.source}.', '',
+             '| Spend group | Amount | Share |', '|---|---:|---:|']
+    for row in spend.groups:
+        share = row.usd * 100 / spend.usd if spend.usd else Decimal(0)
+        lines.append(f'| {row.group} | ${row.usd:.4f} | {share:.1f}% |')
+    lines.extend(('', f'Ledger query fees: ${spend.query_usd:.2f}.', ''))
+    return lines
 
 
 @dataclass(frozen=True)

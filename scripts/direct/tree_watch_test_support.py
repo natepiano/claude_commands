@@ -173,8 +173,8 @@ class TreeWatchFixture(unittest.TestCase):
     @override
     def setUp(self) -> None:
         self.root = self.fixture_root
-        _ = shutil.copytree(self.fixture_snapshot, self.root)
         self.addCleanup(shutil.rmtree, self.root)
+        _ = shutil.copytree(self.fixture_snapshot, self.root)
         self.metadata = deepcopy(self.fixture_metadata)
         self.environment = {**os.environ, "PATH": f"{self.root / 'tools'}:{os.environ['PATH']}",
                             "VERIFY_TREE_WATCH_S": str(WATCH_INTERVAL),
