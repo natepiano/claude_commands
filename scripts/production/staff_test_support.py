@@ -662,8 +662,10 @@ import json
 import os
 import socket
 import sys
+from pathlib import Path
 
-sys.path.insert(0, os.environ['STAFF_TEST_CHECKOUT'])
+with open(Path(os.environ['STAFF_TEST_CHECKOUT']) / "scripts/lib/package_root.py") as package_root:
+    exec(package_root.read(), {"__file__": package_root.name})
 children = []
 with socket.socket() as listener:
     listener.bind(('127.0.0.1', 0))

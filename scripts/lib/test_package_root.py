@@ -62,15 +62,26 @@ class PackageRootTests(unittest.TestCase):
     def test_entry_selects_its_checkout_with_both_launchers_and_pythonpaths(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             folder = Path(directory)
+            selected_checkout = folder / "selected"
+            for relative_path in (
+                "scripts/prioritize/runner_lock.py", "scripts/prioritize/writer_lock.py",
+                "scripts/lib/package_root.py", "scripts/lib/py",
+            ):
+                destination = selected_checkout / relative_path
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                _ = shutil.copy2(ROOT / relative_path, destination)
             conflicting_checkout = folder / "conflicting"
             conflicting_package = conflicting_checkout / "scripts/prioritize"
             conflicting_package.mkdir(parents=True)
             _ = (conflicting_package / "writer_lock.py").write_text(
                 'raise SystemExit("conflicting writer_lock imported")\n', encoding="utf-8",
             )
-            entry = ROOT / "scripts/prioritize/runner_lock.py"
-            for launcher in ("python3", str(ROOT / "scripts/lib/py")):
-                for pythonpath in ("", str(conflicting_checkout)):
+            entry = selected_checkout / "scripts/prioritize/runner_lock.py"
+            for launcher in ("python3", str(selected_checkout / "scripts/lib/py")):
+                for pythonpath in (
+                    "", str(conflicting_checkout),
+                    os.pathsep.join((str(conflicting_checkout), str(selected_checkout))),
+                ):
                     with self.subTest(launcher=launcher, pythonpath=pythonpath):
                         environment = {name: value for name, value in os.environ.items() if name != "PYTHONPATH"}
                         if pythonpath:
