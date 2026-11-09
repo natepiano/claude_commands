@@ -138,15 +138,14 @@ class PaneAstraReviewTests(HeldRolePaneCase):
         endings: list[str] = []
 
         def check_end(parent: staff.StaffId, name: staff.WorkerName, *,
-                      run: worker_panes.DispatchRun | worker_panes.HolderRun = worker_panes.HolderRun.CURRENT,
                       lock: worker_panes.WorkerLockHold | worker_panes.WorkerLockAtUse = worker_panes.WorkerLockAtUse.ACQUIRE,
-                      interrupt: bool = False, retire: bool = True) -> worker.ExitCode:
+                      retire: bool = True) -> worker.ExitCode:
             passed = read_object(self.panes.root / "astra-run/progress_history_state.json")
             status = assign.object_map(assign.object_map(passed["pass"])[row.name])["status"]
             endings.append(str(status))
             self.assertEqual(status, "error" if failed else "completed")
             self.assertEqual(len(list((self.panes.root / "holds").glob("*.json"))), 1)
-            return end(parent, name, run=run, lock=lock, interrupt=interrupt, retire=retire)
+            return end(parent, name, lock=lock, retire=retire)
 
         with patch.object(worker, "end", side_effect=check_end):
             outcome = self.panes.command_case.finish(row.name)
@@ -221,9 +220,8 @@ class PaneAstraReviewTests(HeldRolePaneCase):
         result = self.run_review()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         row, = staff.snapshot().find(kind="worker")
-        pane = self.panes.command_case.agent.submitted[-1][0]
-        self.panes.world.unknown[pane] = "reviewer process is unreadable"
-        self.assertEqual(self.panes.command_case.finish(row.name), turn_end.TurnOutcome.DONE)
+        with patch.object(self.panes.world, "close_terminal_pane", return_value=False):
+            self.assertEqual(self.panes.command_case.finish(row.name), turn_end.TurnOutcome.DONE)
         record = read_object(self.panes.root / "holds" / (str(row.id) + ".json"))
         self.assertEqual(record["staff_id"], row.id)
         self.assertEqual(self.panes.world.closed, [])
@@ -231,4 +229,4 @@ class PaneAstraReviewTests(HeldRolePaneCase):
         state = read_object(self.panes.root / "astra-run/progress_history_state.json")
         self.assertEqual(recorder_state.open_phase_ids(state), [])
         self.assertEqual(state["status"], "error")
-        self.assertIn("reviewer process is unreadable", self.panes.command_case.agent.notices[-1])
+        self.assertIn("pane close is incomplete", self.panes.command_case.agent.notices[-1])
