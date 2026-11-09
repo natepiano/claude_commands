@@ -2064,7 +2064,7 @@ A changed `config/<name>.conf` selects every test module whose transitive import
 - `invoke_cli` ignores the `timeout` argument of the routed `phase_table.py` calls.
 - Fewer child starts save more CPU with no bytecode writes than with a warm cache. State the bytecode condition with each measurement.
 
-### Phase 104 — The AWS box tests use half their CPU  · status: todo
+### Phase 104 — The AWS box tests use half their CPU  · status: done
 **Depends on:** none
 
 #### Work Order
@@ -2097,6 +2097,44 @@ A changed `config/<name>.conf` selects every test module whose transitive import
 - The behavior map has a row for each assertion. No assertion is removed.
 - CPU s, processes, execs and wall s before and after, from `module_cost.py` and same-load pairs, in the checkpoint notice.
 - The changed file and `test_deploy.py` pass.
+- the targeted test green on the phase commit merged with `origin/builds`
+- `basedpyright` on the changed files prints `0 errors, 0 warnings, 0 notes`
+- Floors: a floor claim adds a row to the next-items Floors table with its revision, roots, cache state, limiting operation, owner and revisit condition.
+
+### Phase 105 — The change page tests use half their CPU  · status: todo
+**Depends on:** none
+
+#### Work Order
+
+**Source:** next items, items 2 and 6a. On 2026-11-09 05:26 EST (`show.py top`), `review_links/test_change_page.py` is the top eligible module: 41.4 CPU s per gate, 139 tests. `style/test_bulk_run.py` ranks first at 41.9, but its profile measured 22.5 CPU s, below the 30 CPU s stop line. The profile on a copy of `f04341475` (`module_cost.py --tests 10 --commands 10`) measured 30.7 CPU s, 3040 processes and 33.6 wall s for the change page module. The removable fixture cost is in child Python starts: `change_review.py` 61 starts and 13.3 CPU s, `change_page.py` 13 starts and 8.0 CPU s, `feature_log.py` 88 starts and 4.0 CPU s, `git` 2877 starts and 1.8 CPU s. The slowest tests are the two answer-question tests (2.5 CPU s each).
+
+**Goal:** `scripts/review_links/test_change_page.py` uses half its current CPU, or a measured floor shows why it cannot, with every checked behavior kept.
+
+**Spec:**
+1. Follow the Speed method. Measure CPU with `module_cost.py --tests 10 --commands 10` first. Name each test's CPU, and each real process that it starts.
+2. Find what starts each `change_review.py` process: `change_page.py` production code or the test. Run it in process through `scripts/production/cli_fixture.py` `invoke_cli` where the test does not assert on the process boundary, as Phase 103 did for `phase_table.py` with a `subprocess.run` side effect that routes only that command.
+3. Run the test's own `change_page.py` and `feature_log.py` command calls in process through `invoke_cli`. Keep a real process for each behavior that only a process proves: an interrupt between steps, an exit code across a process, any cwd or environment that the entry reads at start.
+4. Share expensive setup: build a seed Git repository once and copy it for each test, where tests make the same repository.
+5. Write a behavior map with a row for each assertion before you change a test. Group rows by test class and helper where the assertions are the same.
+6. Do not change `scripts/review_links/change_page.py`, `scripts/production/change_review.py`, `scripts/feature_log/feature_log.py` or other production files. sdlc owns them. If only a production change can cut a cost, write the floor and send the director an architecture proposal with its measured gain.
+7. Add no guard, refusal or check (user rule, 2026-11-05).
+
+**Files:**
+- `scripts/review_links/test_change_page.py`
+
+**Workers:** 1 writer; one test file
+- `impl` — `test_change_page.py`
+
+**Constraints from prior phases:**
+- Phase 89, Phase 97, Phase 100 and Phase 103: an in-process call of a real entry through `invoke_cli` cut CPU and kept the code path. Tests that assert on a process boundary kept a real process.
+- Phase 103: a process start costs more with no bytecode writes, so start cuts gain more there. Report pairs with no bytecode writes and on `/tmp` with a warm bytecode cache.
+- Phase 104 runs beside this phase and holds `scripts/aws_target/test_box.py`. Do not edit it.
+- Tests never read or write live state: `~/.claude` main, `~/.local/state/merge-gate`, `/tmp/claude`. State the filesystem basis of each pair.
+
+**Acceptance gate:**
+- The behavior map has a row for each assertion. No assertion is removed.
+- CPU s, processes, execs and wall s before and after, from `module_cost.py` and same-load pairs, in the checkpoint notice.
+- The changed file passes, and every module that imports a changed helper passes.
 - the targeted test green on the phase commit merged with `origin/builds`
 - `basedpyright` on the changed files prints `0 errors, 0 warnings, 0 notes`
 - Floors: a floor claim adds a row to the next-items Floors table with its revision, roots, cache state, limiting operation, owner and revisit condition.
