@@ -78,10 +78,11 @@ progress_history.py eta --session-dir <dir> --time <t> --basis <basis>
 
   `Standing by` therefore means no phase is open.
 - `state` comes from `unit_run.local_run`, which reads each run file only up to its `run_started` line (every run file holds one, on line 1) and skips lines without `"run_started"` before parsing.
-- The record is built from the found run's own plan (`project_plan_doc`, else `plan_doc` resolved against the worktree), falling back to the Plan cell's plan.
+- The record uses the run's plan, resolved against the staff worktree.
+  The configured `.unit.toml` plan supplies the fallback.
   - It is `build_plan` on that plan; when that has no phases, `build_run(plan, events)` from the run's events.
-  - A run on another plan than its production row (hana `demo`) shows its real phase.
-  - `plan` is the Plan cell, and is empty when that file no longer exists.
+  - A run with a plan different from `.unit.toml` shows the run's own phase.
+  - `plan` comes from `.unit.toml` and is empty when that file no longer exists.
 - `workers` reads the run owner and that owner's staff workers.
   It displays pane state and the cause of unknown or incomplete evidence.
   Worker posts and launcher writes update the watched run folder and `board.log`.
