@@ -99,7 +99,6 @@ class RemoteEntryTests(unittest.TestCase):
         task_mirror = self.mirror_record(path=checkout)
         self.assertEqual(publish_mirror(task_mirror), 0)
         marker = self.root / "use-started"
-        original_remove = scratch.remove
         use_results: list[subprocess.CompletedProcess[str]] = []
 
         def use_during_removal(parent: Path) -> None:
@@ -115,7 +114,7 @@ class RemoteEntryTests(unittest.TestCase):
             self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
             self.assertIn("busy", result.stderr)
             self.assertFalse(marker.exists())
-            original_remove(parent)
+            shutil.rmtree(parent)
 
         with mock.patch.object(scratch, "remove", side_effect=use_during_removal):
             self.assertEqual(copies.mirror_remove(mirror_arguments(task_mirror, "mirror-remove")), 0)
