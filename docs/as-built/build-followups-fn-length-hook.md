@@ -33,17 +33,48 @@ Claude's `Edit|MultiEdit|Write` PostToolUse group runs basedpyright and fn-lengt
 
 ### Codex registration and trust
 
-`scripts/hooks/codex_hooks.py install|check` manages eight handlers. The `queue-start` and `queue-tools` handlers run `codex-queue-drain.py` at `SessionStart` and `PostToolUse`, with `matcher: "*"` and 10-second timeouts; `docs/as-built/session-roster.md` describes them. Fn-length uses `PostToolUse` on `apply_patch` with a 10-second timeout. Berth uses `PreToolUse` on `apply_patch` with a 30-second timeout and runs `pre-tool-use-berth.py`. The scratch guard and build-hold guard use `PreToolUse` on `Bash`, with 10-second timeouts. Codex uses `Bash` for shell commands, as Claude Code does. The guards run `pre-tool-use-scratch-guard.py` and `pre-tool-use-build-hold-guard.sh`.
+`scripts/hooks/codex_hooks.py install|check` manages eleven handlers.
+The `queue-start` and `queue-tools` handlers run `codex-queue-drain.py` at `SessionStart` and `PostToolUse`.
+Both use matcher `*` and 10-second timeouts.
+`docs/as-built/session-roster.md` describes these handlers.
+Fn-length uses `PostToolUse` on `apply_patch` with a 10-second timeout.
+Berth uses `PreToolUse` on `apply_patch` with a 30-second timeout and runs `pre-tool-use-berth.py`.
+The scratch guard and build-hold guard use `PreToolUse` on `Bash`.
+The scratch guard reads `guard_timeout_seconds` from `config/copies.conf`; the build-hold guard uses 10 seconds.
+Codex uses `Bash` for shell commands, as Claude Code does.
+The guards run `copies/copy_guard.py` and `pre-tool-use-build-hold-guard.sh`.
+
+The `compaction-marker` handler runs `pre-compact-marker.py --family codex` at `PreCompact`, with matcher `*`.
+It records the input `session_id` before manual or automatic compaction.
+The installer lists this event as `preCompact` and records its trust separately.
+The `compaction-clear-turn` handler runs `compaction-marker-clear.sh` at `UserPromptSubmit`.
+The shell command starts no Python process when the marker folder has no `*.json` file.
+The `compaction-clear-end` handler runs `compaction-marker-clear.py` at `PostCompact`.
+Both handlers delete only the input session's marker through the shared clear function.
+Codex 0.167.0 lists these events as `userPromptSubmit` and `postCompact`.
+It reports no matcher for `UserPromptSubmit`, so listing checks use `null` for that field.
+See [compaction markers](hook-dispatch.md#compaction-start-markers) for the marker format and retention setting.
 
 The `ste` and `ste-subagent` handlers run `session-start-ste.py` through the shared Python launcher, with 10-second timeouts. They use `SessionStart` and `SubagentStart`, respectively. Both use `matcher: "*"`. For `SessionStart`, the matcher filters the session source, including startup, resume, clear and compact. For `SubagentStart`, it filters the subagent type. The wildcard covers every source and type. See the [Codex hook reference](https://learn.chatgpt.com/docs/hooks).
 
 `session-start-ste.py` reads `config/simplified-technical-english.md` from its own checkout on each call. It prints the full text as `hookSpecificOutput.additionalContext`, with `hookEventName` set to the input event. Claude Code can use the same script for both events. A missing or unreadable file produces no output and exits 0. Invalid input also exits silently. The rule file is the single source; the hook does not copy its text into code.
 
-Both `install` and `check` return 0 only when every handler is trusted and enabled. A trusted, enabled duplicate takes precedence over another matching entry. Selection compares event, matcher, command and timeout. The two STE events share a command but retain separate trust identities. `hooks/list` reports their events as `sessionStart` and `subagentStart`. Registration in Claude's `settings.json` and installation into live Codex homes are separate deployment steps. Claude's `settings.json` runs `session-start-ste.py` in the `SessionStart` group with matcher `startup|resume|clear|compact` and in `SubagentStart`. On natedev and on the Mac, the live Codex homes `~/.codex`, `~/.codex1` and `~/.codex2` share one `hooks.json`; each home has all six handlers trusted.
+Both `install` and `check` return 0 only when every handler is trusted and enabled.
+A trusted, enabled duplicate takes precedence over another matching entry.
+Selection compares event, matcher, command, handler type, and timeout through one shared field definition.
+The two STE events share a command but retain separate trust identities.
+`hooks/list` reports their events as `sessionStart` and `subagentStart`.
+Claude registration in `settings.json` and Codex installation are separate deployment steps.
+Claude's `SessionStart` registration runs `session-start-ste.py` with matcher `startup|resume|clear|compact`.
+Its `SubagentStart` registration runs the same script.
+On natedev and the Mac, `~/.codex`, `~/.codex1`, and `~/.codex2` share one `hooks.json`.
+Each home must trust its eleven handlers separately.
+
+Codex 0.167.0 requires integer `timeout` values in `hooks.json`. A floating value such as `10.0` rejects the whole file, including fn-length, STE, and queue handlers. The installer rounds configured timeouts up to whole seconds. It also rounds existing floating timeouts up to integers in every handler, including user handlers. It keeps every other field of a user handler unchanged. This preserves their groups and indexes. The listed `timeoutSec` is then an integer. No older-version matching rule is used.
 
 `CodexHook(name, script, event, timeout)` defines a required handler. `LocatedHook` holds its definition, key, current hash, trust state and enabled state. `MissingHook` means no matching handler was listed from the managed configuration.
 
-`install` reads `CODEX_HOME/hooks.json`, or `~/.codex/hooks.json` when `CODEX_HOME` is unset. It appends missing groups and writes through atomic replacement. A symlink keeps its link and updates its target. The installer uses `codex app-server` to initialize, list handlers and trust each untrusted or modified managed handler. Each trust write uses `config/batchWrite` with a `hooks.state` upsert and `reloadUserConfig: true`. It lists again after each write. `check` only lists and reports status. File or RPC errors return 1. Each app-server session has a 30-second deadline. Its child stops when the session closes. Binary and home overrides resolve before the child changes directory.
+`install` reads `CODEX_HOME/hooks.json`, or `~/.codex/hooks.json` when `CODEX_HOME` is unset. It appends missing groups and writes through atomic replacement. A symlink keeps its link and updates its target. The installer uses `codex app-server` to initialize, list handlers and trust each untrusted or modified managed handler. Each trust write uses `config/batchWrite` with a `hooks.state` upsert and `reloadUserConfig: true`. It lists again after each write. `check` only lists and reports status. File or RPC errors return 1. A failed command names its action and reason on stderr. The installer reports Codex listing warnings and errors. A missing handler reports its command or the field values that differ. An untrusted or disabled handler reports `trustStatus` and `enabled`. Each app-server session has a 30-second deadline. Its child stops when the session closes. Binary and home overrides resolve before the child changes directory.
 
 `install` also removes a command handler when its `command` equals `RETIRED_COMMAND` exactly, with any timeout. The constant is:
 
@@ -172,7 +203,7 @@ Run files keep staff references instead of copied native identities.
 
 - Stalled detection belongs to the stall watcher, not `unit_status.sh`. Idleness rests on the pane hash plus transcript and `subagents/` mtimes, never on status-file text.
 
-- The follow-up claim must exist before any status record, so a refusal leaves no stale record. `assign_claude.py`'s final status write comes after every record step (`finish-pass`, `landed`); unit directors and `launch_implementation.md` read `impl_status_<slot>`. `codex_mesh.py`'s roster states are read by `can-follow`, `follow` and the launcher alike.
+- The follow-up claim must exist before any status record, so a refusal leaves no stale record. `assign_claude.py`'s final status write comes after every record step (`finish-pass`, `landed`); unit directors and `launch_implementation.md` read `impl_status_<slot>`.
 
 - `prepare_session.sh` calls `unit_notifier.sh` with the session id alone to create the instance; that form stays unchanged.
 

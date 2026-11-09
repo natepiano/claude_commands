@@ -5,10 +5,11 @@ The queue reservation and the test runner governor use separate configuration ke
 The governor starts a job when its expected memory fits and a CPU slot is free.
 With no job running, the governor always starts one job.
 Memory samples update the queue reservation and the recorded peaks.
-A memory peak does not kill a job or fail the gate.
+A module above the governor's memory limit stops and runs again alone.
+merge_gate.conf sets the memory retry count. Each stop sends a message to sdlc.
 A job still running at the module time limit fails the gate (default 1800 s).
 After the parallel pass, up to eight failed test modules run once more, alone.
-Runner-killed jobs and the type check do not run again. Each test module uses a
+Time-limited jobs and the type check do not run again. Each test module uses a
 builds.slice scope when its probe succeeds, unless disabled or already in that slice.
 --tests-only runs the same suite runner without changing git refs or files.
 Clean trees reuse full passes on the same host. Merge gates run all modules.
@@ -77,7 +78,7 @@ from scripts.lib.user_zone import user_zone  # noqa: E402
 from scripts.lib.process_failure import failure_detail  # noqa: E402
 from scripts.lib import scratch  # noqa: E402
 from scripts.test_times import gate_record
-from scripts.lint import memory_admit  # noqa: E402
+from scripts.build_queue import admission_records  # noqa: E402
 from scripts.build_queue import progress_profile
 from scripts.build_queue.admission_client import AdmissionHoldCheck  # noqa: E402
 from scripts.build_queue.queue_place import (  # noqa: E402
@@ -102,10 +103,10 @@ NIGHTLY_TYPE_DIAGNOSTIC_LINES = 20
 # An unrecorded type job keeps its own fallback; recorded jobs all use one margin.
 TYPES_MEMORY_MIB = 3072
 MEMORY_PEAK_MARGIN = 1.2
-# A module this many times slower than the median of its last MODULE_HISTORY_RUNS times, and at least
-# the floor slower, is named in the report. On 2026-10-19 agents/test_codex_mesh.py went from 49 s to
-# 1264 s (four tests each waited a 300 s call timeout) and no line said so. Load alone moved modules
-# about 2x. The median names a regression on about three runs in a row, then takes it as the normal.
+# Report a module when its runtime exceeds this factor and the floor above its recent median.
+# On 2026-10-19, one module increased from 49 s to 1264 s without a report.
+# Four tests each reached a 300 s timeout. System load alone changed runtime by about 2x.
+# The median reports a repeated regression for about three runs before it becomes the baseline.
 SLOW_MODULE_FACTOR = 3.0
 SLOW_MODULE_FLOOR_S = 60.0
 MODULE_HISTORY_RUNS = 5
@@ -213,6 +214,7 @@ class GateJobResult:
     times: gate_record.ModuleTimes | gate_record.NoModuleTimes | gate_record.TimingNotApplicable = gate_record.NoModuleTimes("job has no timing data")
     peak_mib: float = 0.0
     restart: Literal["", "hold"] = ""
+    memory_stopped: bool = False
 
 
 @dataclass(frozen=True)
@@ -240,12 +242,13 @@ class RunningGateJob:
     output: TextIO
     log: Path
     module: str
-    # Set when the runner kills the job for its time limit.
+    # Set when the runner stops the job at its time or memory limit.
     killed_for: str = ""
     cpu_slot: SharedCPUSlot | NoSharedCPU = field(default_factory=lambda: NoSharedCPU())
     peak_memory_mib: float = 0.0
     kind: GateJobKind = GateJobKind.TEST_MODULE
     cpu_seconds: float = 0.0
+    memory_stopped: bool = False
 
 
 @dataclass(frozen=True)
@@ -398,6 +401,27 @@ def merge_gate_governor_gib() -> float:
     except conf.Unusable as error:
         raise GateRefused(str(error)) from error
     return value
+
+
+def tell_memory_stop(repo: Path, job: RunningGateJob, limit_gib: float,
+                     mode: SuiteMode, rerun: bool) -> None:
+    """Report each memory stop without changing the gate result on delivery failure."""
+    from scripts.message import send_budget, session_send
+
+    try:
+        branch = checked_git(repo, "branch", "--show-current")
+        checkpoint = checked_git(repo, "rev-parse", "--short", "HEAD")
+        action = "runs again alone" if rerun else "the gate fails"
+        text = (f"{mode.value} gate {branch} checkpoint {checkpoint}.\n"
+                f"{job.suite}/{job.module} stopped at {job.peak_memory_mib / 1024:.3f} GiB; "
+                f"limit {limit_gib:g} GiB; {action}.")
+        sent = subprocess.run(session_send.send_argv("--to", "sdlc", "--from", "merge_gate", "--text", text),
+                              stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                              check=False, timeout=send_budget.seconds())
+        if sent.returncode:
+            raise ValueError(failure_detail(sent))
+    except Exception as error:
+        print("Memory stop message could not be sent: " + " ".join(str(error).split()), flush=True)
 
 
 @contextmanager
@@ -670,7 +694,7 @@ def kill_job_group(job: RunningGateJob) -> None:
 
 def stop_gate_jobs(jobs: Sequence[RunningGateJob]) -> None:
     """Stop all groups with one deadline, then reap their leaders."""
-    config = memory_admit.read_memory_config()
+    config = admission_records.read_memory_config()
     deadline = time.monotonic() + config.program_stop_seconds
     for job in jobs:
         try:
@@ -778,11 +802,14 @@ def finish_gate_job(job: RunningGateJob, status: int) -> GateJobResult:
         status = 0
     if job.kind is GateJobKind.TYPE_CHECK:
         status = 0 if status == 0 and re.search(r"^0 errors, 0 warnings, 0 notes\s*$", captured, re.MULTILINE) else 1
+    if job.memory_stopped and status == 0:
+        status = 1
     tripwire_tripped = bool(calls or readings)
     if tripwire_tripped:
         status = 1
     return GateJobResult(job.suite, job.module, status, seconds, captured, job.killed_for,
-                         tripwire_tripped, job.kind, job.cpu_seconds, times, job.peak_memory_mib)
+                         tripwire_tripped, job.kind, job.cpu_seconds, times, job.peak_memory_mib,
+                         memory_stopped=job.memory_stopped)
 
 
 @dataclass(frozen=True)
@@ -1000,6 +1027,10 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
                selected: AllModules | SelectedModules = ALL_MODULES) -> GateRun:
     shared = isinstance(machine, SharedMachine)
     governor_gib = merge_gate_governor_gib() if shared else 0.0
+    try:
+        memory_stop_reruns = conf.read("merge_gate").whole("memory_stop_reruns") if shared else 0
+    except conf.Unusable as error:
+        raise GateRefused(str(error)) from error
     if isinstance(machine, WholeMachine):
         max_running_jobs = os.cpu_count() or 1
     if module_time_limit_s <= 0:
@@ -1084,6 +1115,7 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
     executions: list[GateJobResult] = []
     job_started = False
     first_runs: dict[tuple[str, str], GateJobResult] = {}
+    memory_reruns: dict[tuple[str, str], int] = {}
     rerunning = False
     suite_started: dict[str, float] = {}
     suite_finished: dict[str, float] = {}
@@ -1097,6 +1129,10 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
     python = os.environ.get("MERGE_GATE_PYTHON", str(python_shim(repo)))
     reason = selection.reason if isinstance(selection, FullSuite) and not reused else ""
     elapsed = 0.0
+
+    def can_retry_memory_stop(result: GateJobResult) -> bool:
+        return (result.memory_stopped and result.returncode != 0 and not result.tripwire_tripped
+                and memory_reruns.get((result.suite, result.module), 0) < memory_stop_reruns)
 
     def record(status: int, aborted: bool) -> None:
         if ledger is None or hold is None or admission is None:
@@ -1158,6 +1194,13 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
                         if job.kind is GateJobKind.TEST_MODULE and measured > largest_module_peak_mib:
                             largest_module_peak_mib = measured
                             largest_module = f"{job.suite}/{job.module}"
+                        if (job.kind is GateJobKind.TEST_MODULE and not job.killed_for
+                                and measured > admission.governor_mib):
+                            job.memory_stopped = True
+                            job.killed_for = (f"killed: peak memory {job.peak_memory_mib / 1024:.3f} GiB "
+                                              f"exceeds the memory limit of {governor_gib:g} GiB")
+                            print(f"{job.suite}/{job.module} {job.killed_for}", flush=True)
+                            stop_gate_jobs([job])
                 while (pending and len(running) < max_running_jobs
                        and (admission is None or admission.admits(recorded_peaks.reservation_mib(pending[0])))
                        and (not rerunning or not running)):
@@ -1221,6 +1264,8 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
                     running.remove(job)
                     if admission is not None:
                         admission.release(job.process.pid)
+                    if result.memory_stopped:
+                        tell_memory_stop(repo, job, governor_gib, mode, can_retry_memory_stop(result))
                     if not shared:
                         print(f"{result.suite}/{result.module} exit={result.returncode} seconds={result.seconds:.2f}"
                               + (" stopped" if result.killed_for else ""), flush=True)
@@ -1250,7 +1295,10 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
                         timings[key] = seconds
                     if rerunning:
                         first = first_runs[(result.suite, result.module)]
-                        results[results.index(first)] = result
+                        position = next(index for index, previous in enumerate(results)
+                                        if (previous.suite, previous.module) == (result.suite, result.module)
+                                        and previous.kind is result.kind)
+                        results[position] = result
                         if result.returncode == 0:
                             print(f"Rerun alone: {result.suite}/{result.module} passed "
                                   + f"(first run exit {first.returncode}, {first.seconds:.2f} s)", flush=True)
@@ -1258,19 +1306,24 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
                         results.append(result)
                     if job.kind is GateJobKind.TEST_MODULE:
                         suite_finished[job.suite] = job.started + result.seconds
-                if (shared or isinstance(selected, SelectedModules)) and not pending and not running and not rerunning:
-                    failed = [result for result in results
+                if (shared or isinstance(selected, SelectedModules)) and not pending and not running:
+                    failed = [] if rerunning else [result for result in results
                               if result.kind is GateJobKind.TEST_MODULE and result.returncode and not result.killed_for
                               and not result.tripwire_tripped]
-                    rerunning = True
                     if len(failed) > RERUN_LIMIT:
-                        print(f"{len(failed)} modules failed; this is a real breakage, not load; no reruns", flush=True)
-                    else:
-                        first_runs = {(result.suite, result.module): result for result in failed}
-                        pending.extend(requests[(result.kind, result.suite, result.module)] for result in failed)
-                        if failed and reservation is not None:
-                            progress_total = 0
-                            progress_profile.clear_counter(reservation.sidecar)
+                        print(f"{len(failed)} modules failed; this is a real breakage, not load; no ordinary reruns", flush=True)
+                        failed = []
+                    memory_failed = [result for result in results if can_retry_memory_stop(result)]
+                    for result in memory_failed:
+                        key = (result.suite, result.module)
+                        memory_reruns[key] = memory_reruns.get(key, 0) + 1
+                    rerunning = True
+                    for result in [*failed, *memory_failed]:
+                        _ = first_runs.setdefault((result.suite, result.module), result)
+                        pending.append(requests[(result.kind, result.suite, result.module)])
+                    if pending and reservation is not None:
+                        progress_total = 0
+                        progress_profile.clear_counter(reservation.sidecar)
                 if running or pending:
                     time.sleep(0.05)
         finally:
@@ -1590,16 +1643,16 @@ def merge_checkpoint(args: GateArguments) -> int:
         if merged != baseline:
             write_push_record(push_record_path(repo, "checkpoint", origin + ":" + checkpoint),
                               RecordedPush(baseline, merged, checkpoint))
-        previous_unit = os.environ.get(memory_admit.BUILDLOG_UNIT)
-        os.environ[memory_admit.BUILDLOG_UNIT] = args.unit
+        previous_unit = os.environ.get(admission_records.BUILDLOG_UNIT)
+        os.environ[admission_records.BUILDLOG_UNIT] = args.unit
         try:
             suites = run_gate_suites(repo, args.type_dirs, float(args.module_time_limit_s),
                                 source="checkpoint", full=args.full)
         finally:
             if previous_unit is None:
-                _ = os.environ.pop(memory_admit.BUILDLOG_UNIT, None)
+                _ = os.environ.pop(admission_records.BUILDLOG_UNIT, None)
             else:
-                os.environ[memory_admit.BUILDLOG_UNIT] = previous_unit
+                os.environ[admission_records.BUILDLOG_UNIT] = previous_unit
         if not suites.passed:
             raise GateRefused("RED: types or suites failed")
         fetch_branches(repo, "main")

@@ -59,7 +59,7 @@
 
 **Owner:** whoever holds `scripts/lint/sweep.py` when the builds file freeze lifts. Queue-unit owns the `sweep.py` callers of the floor interfaces once Phase 35 is on GitHub builds.
 
-**Needed:** `lint/sweep.py` (near lines 3298, 3321 and 3678-3682) has one busy-mirror `LockHeld` loop in `_hold_floor_pass`. Rename `leased_mirrors` to `busy_mirrors`. Then close its route from the Phase 35 ledger (F031).
+**Needed:** `_hold_floor_pass` already uses `busy_mirrors` at `scripts/lint/sweep.py:3988`. Verify that loop against F031 and close its Phase 35 ledger route. `MacFloor.leased_mirrors` (`sweep.py:3542`) holds a different value; do not rename it.
 
 ## Mirror scans after the sweep.py file freeze
 
@@ -101,3 +101,19 @@
 **Needed:**
 1. Measure a live stopped call. Record whether a step member outlives the token release.
 2. Only if one does: wait for the whole step process group before the token releases, with a test that fails on the old code.
+
+## The copy guard refuses an unset source or git path inside a program
+
+**Source:** builds (showrunner), 2026-11-08, settled as `next`: "build it only when a real session makes a tree that way. The guard is already large, and no session writes these forms." Found in the phase 41v review; the 41t tree gives the same result.
+
+**Today:** `python3 -c "import shutil;shutil.copytree('$UNSET', '/tmp/o')"` passes, while `cp -r "$UNSET" dest` refuses with `cannot resolve recursive copy source`. `bash -c "$UNSET_DIR/git -C . clone . /tmp/o"` passes, because the unknown-executable check in `_operation` (`scripts/copies/copy_guard.py`) does not skip git options before `clone`; the top-level form refuses with `cannot resolve executable name`.
+
+**Needed:** only when a real session makes a tree in one of these forms. Then both commands refuse, and the copy guard command list and transcript corpus keep their results.
+
+## A smaller verify.sh routing boundary
+
+**Source:** builds (showrunner), 2026-11-08, settled as `next`: natest's third idea; it needs a design first. Measured in natest run `/tmp/claude/unit/2113de4f-9913-485a-9a51-61558bfd81db/phases/95/behavior_map.md`, section "Routing proposal".
+
+**Today:** in `test_verify_wait_holder.py`, the inline Python helper commands of `verify.sh` routing use 14.974 CPU s per run. The gain from fewer helper starts is at most that, and lower in practice, because the routing decisions still run.
+
+**Needed:** a design that keeps shell state, cleanup traps, reservations and memory admission in their current order, then a phase that cuts helper starts. Done when the module cost measurement shows the cut, and every routing test keeps its assertions.

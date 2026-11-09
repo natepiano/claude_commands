@@ -12,7 +12,7 @@ low, and to codex_pacer.py, which decides the `pace` tier from them; `refresh`
 `usage-only` reads and saves usage, then starts `renew-logins` when renewal is due.
 `renew-logins` renews expired local Claude logins under its own schedule lock.
 It sends no quota alerts and runs neither account moves nor the Codex pacer.
-`blocked` is codex_mesh.py reporting that Codex refused a launch for quota: it reads the notes
+`blocked` records a launch that Codex refused for quota: it reads the notes
 as the timer left them and hands them to quota_alert.blocked().
 """
 

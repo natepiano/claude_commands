@@ -1475,7 +1475,7 @@ The goal was not reached: the hang is not fixed and its cause stays open. The ha
 
 An unchanged index update writes nothing, a read leaves no side file, and a list reads during an ordinary refresh.
 
-- `open_for_update()` uses the rollback journal and sets `PRAGMA cache_spill` from `INDEX_SPILL_PAGES=65536` in `config/buildlog.conf`. A transaction up to about 256 MiB of changed pages takes the exclusive lock only at commit.
+- `open_for_update()` uses the rollback journal and sets `PRAGMA cache_spill` from `INDEX_SPILL_PAGES=65536` in `config/buildlog.conf`. SQLite reads that value through 8 bits (65536 & 255 = 0), so cache spill is off: no index update spills, and every update takes the exclusive lock only at commit (builds report Phase 35, 2026-11-08).
 - `update_in()` writes the `meta` key `updated_at` only when the transaction changed rows or `has_numeric_update_time()` is false. `rows as of` names the last update that changed rows.
 - `complete_gate_index_in()` waits up to `INDEX_READ_WAIT_SECONDS=1` while it selects an index. The `show.py` report connection waits `BUSY_TIMEOUT_MS`, 30 s, so a writer that takes the exclusive lock after selection does not stop the report.
 - A list during a refresh on a scratch index of 100 gates takes 0.111 CPU s, 0.187 wall s and 5 processes. That refresh peaks at 66.9 MiB RSS.
@@ -1488,7 +1488,7 @@ An unchanged index update writes nothing, a read leaves no side file, and a list
 - `commands/test_times.md` — the time line
 - `config/buildlog.conf` — the two keys
 
-**Gotchas:** `cache_spill` is not a hard memory limit. A refresh above the spill size blocks readers from the first spill until commit, up to the 30 s wait. Memory for a full build at live scale is not measured.
+**Gotchas:** with cache spill off, an update keeps all its changed pages in memory until commit; no size limit applies. A value that keeps spill on must not reduce to 0 in 8 bits. Memory for a full build at live scale is not measured; report measures the value, and any value change goes to the user first.
 
 **Ruled out:** WAL, because an unchanged update and a read then change the index files; a 1 s wait on the report connection, because a commit after selection then stops the report.
 
@@ -1879,3 +1879,157 @@ A find with no code change; the builds showrunner closed it so on 2026-11-08. At
 
 **Ruled out:**
 - A gate cap on a module's `TMPDIR` size: it is a new check that needs the user's approval, and verify Phase 41r fixes the cause.
+
+### Phase 93 — The build queue shows a merge gate as "merge gate", with no hyphen  · status: done
+**Depends on:** none
+
+#### As-built
+
+The build queue shows each step by its configured name. `config/build_steps.conf` `[names]` maps `merge-gate` to "merge gate" and `targeted-test` to "targeted test". The queue table, the cards and the cloud rows show names through `StepNames.shown`; recorded step ids and keys stay raw.
+
+**Files:**
+- `config/build_steps.conf` — `[names]`: the shown name of each step id
+- `scripts/build_queue/queue_view.py` — cloud row text shows `model.names.shown(identity.step)`
+- `scripts/build_queue/test_queue_view.py`, `test_queue_card.py`, `test_build_queue.py` — read names through `read_step_names()`, never a mapping in the test
+- `scripts/build_queue/golden/` — cloud and unit-override card and view files show the configured names
+
+**Gotchas:**
+- A shown name can hold a space. Row tests read table cells by header column, not by a whitespace split.
+
+### Phase 94 — The merge gate stops a module that goes above its memory limit  · status: done
+**Depends on:** none
+
+#### As-built
+
+On a shared machine, a merge gate stops a test module whose own memory sample (resident plus swapped memory of the module and its descendants) goes above `merge_gate_governor_gib` (4 GiB). The stop uses the time-limit path: `killed_for` names the peak and the limit, and `stop_gate_jobs` ends the module. The module runs again alone up to `memory_stop_reruns` times (`config/merge_gate.conf`, 1). These reruns do not count toward `RERUN_LIMIT`, and a further overrun fails the gate. A stopped run records no peak in `module_peak_mib.json`.
+
+Each stop sends sdlc one message through `session_send.send_argv`, after the result is known. It names the gate mode, branch and checkpoint, the module, its peak, the limit, and "runs again alone" or "the gate fails". A failed send prints one line and does not change the gate result.
+
+**Files:**
+- `scripts/production/merge_gate.py` — the stop in the sampling loop, `tell_memory_stop`, `can_retry_memory_stop`, the memory rerun pass
+- `config/merge_gate.conf` — `memory_stop_reruns`
+- `config/README.md`, `docs/as-built/merge-gate-and-test-speed.md` — the stop, the rerun and the message
+- `scripts/production/merge_gate_test_support.py` — fake `send.py` (a send-fails file makes it exit 3) and the `sampling_module_memory` hook
+- `scripts/production/test_merge_gate_suites_reruns.py`, `test_merge_gate_suites_resources.py` — stop, rerun, fail and message rows
+
+**Gotchas:**
+- `WholeMachine` mode has no admission, so it has no memory stop.
+- A tripwire result never reruns; its memory-stop message says "the gate fails".
+
+### Phase 95 — The verify wait-holder test file uses half its CPU  · status: done
+**Depends on:** none
+
+#### As-built
+
+`scripts/direct/test_verify_wait_holder.py` keeps its 29 tests and 125 assertions at a measured floor of 81.5 CPU s (same-load pairs: 94.1 to 81.5 CPU s, wall 127.8 to 114.4 s).
+
+- `RecordedWaitFixture` seeds `isolate_run_sources` and `record_phase` once for each class. `VerifyMemoryWaitHolderTests` and `VerifyRecordedTokenIdentityTests` use it.
+- `VerifyTargetWaitHolderTests.setUpClass` seeds the recorder once, and `setUp` applies the recorded environment again.
+- `isolate_run_sources` sets `UNIT_DETACHED_RUN=1`, so `verify.sh` skips its detach attempt.
+- The memory observer is a shell wrapper. It sends only `admission_client.py admit` calls to the Python observer.
+- Target tests call the real `build_targets.py`. Only the pinned starting-target case uses `capacity-tool.py`.
+- The floor is held by real target, reservation and recorder commands in production code.
+
+**Files:**
+- `scripts/direct/test_verify_wait_holder.py` — verify wait-holder tests with class seeds
+
+**Gotchas:**
+- A class seed keeps absolute paths valid only because the class root is the same as each test root.
+
+**Ruled out:**
+- Direct calls for routing cases: no narrow production function exists, and a fixture must not copy the routing decision.
+- The remaining cost is verify-unit's: `step_selection.py` imports (2.4 CPU s measured), a lazy `cell_value` import (1.6 CPU s measured), and a routing boundary (up to 15.0 CPU s estimated).
+
+### Phase 96 — A changed config file selects the tests that read it  · status: done
+**Depends on:** none
+
+#### As-built
+
+A changed `config/<name>.conf` selects every test module whose transitive import closure reaches a source that reads `<name>`. There is no hand map. Full-tree selection takes 22.98 s with an empty fact cache and 0.39 s with a warm cache.
+
+- A source reads `<name>` through an AST call `conf.<fn>("<name>")` on the conf module (`import conf`, `from scripts.lib import conf`, `import scripts.lib.conf [as x]`), through a call to a function imported from `scripts.lib.conf` with a string-literal first argument, or through a `<name>.conf` path token. The read is the literal's file name with `.conf` removed.
+- `SourceFacts` carries `config_reads` and `syntax` (`ValidPython` | `InvalidPython(message)`). `SourceGraph(imports, tokens, config_reads)` is the parsed graph; `transitive_config_reads` carries reads back through importers. `EXTRACTOR_VERSION` is 6.
+- Every tracked source is parsed and its facts are cached by blob (`source_blobs`), so a warm cache parses only changed blobs.
+- A changed `.py` file still selects only through direct imports, tokens and the same folder.
+
+**Files:**
+- `scripts/production/affected_modules.py` — selection, fact extraction and the blob fact cache
+- `scripts/production/test_affected_modules.py` — selection tests, with rows for a two-hop reader, a function import, a path token, an unrelated config and a warm cache
+
+**Gotchas:**
+- A syntax error in a non-test source does not raise. Only an invalid test module raises `SyntaxError`.
+- `config/postmaster.conf` selects 574 of 738 modules: 572 reach `send_budget.py` and 570 reach `codex_mesh.py` (for example `test_add_unit.py` -> `accounts.py` -> `codex_mesh.py` -> `send_budget.py`). Only the targeted test widens; merge gates run all modules.
+
+**Ruled out:**
+- A narrower closure: the wide selection follows the approved design.
+
+### Phase 97 — The remote copies review test uses half its CPU again  · status: todo
+**Depends on:** none
+
+#### Work Order
+
+**Source:** the backlog rank rule (next items, item 2). On 2026-11-08 22:48 EST, `copies/test_review_remote_copies.py` is the highest module by median CPU that no phase holds and that has no floor: 65.9 CPU s per gate, 29 tests. Phase 69 cut it from 350.0 to 120.2 CPU s in `/dev/shm` pairs and reached its target with no floor.
+
+**Goal:** `scripts/copies/test_review_remote_copies.py` uses half its current CPU, or a measured floor shows why it cannot, with every checked behavior kept.
+
+**Spec:**
+1. Follow the Speed method. Measure CPU with `module_cost.py --tests 10 --commands 10` first. Name each test's CPU, and each real process that it starts.
+2. Start with the slowest test: `RemoteEntryTests.test_repeated_receive_keeps_registered_owner_after_each_recovery_interruption` (16.1 s in the last gate).
+3. Write a behavior map with a row for each assertion before you change a test.
+4. Read the importers of a changed fixture before you change it. Every importer stays green.
+5. If only a production change can cut a cost, write the floor and send the director an architecture proposal with its measured gain.
+6. Add no guard, refusal or check (user rule, 2026-11-05).
+
+**Files:**
+- `scripts/copies/test_review_remote_copies.py`
+- `scripts/copies/remote_test_support.py`
+
+**Workers:** 1 writer; one test file and its fixture do not split
+- `impl` — `test_review_remote_copies.py`, hub: `remote_test_support.py`
+
+**Constraints from prior phases:**
+- Phase 69: each test class copies one immutable Git seed with `ImmutableGitSeed.copy_to`. `warm_claim_servers()` runs a warm fork `ClaimServer` over the real `floor_claims` source and entry points. `seed_interpreter_cache` replaces repeated interpreter probes. The threaded cancellation test keeps fresh subprocesses, and the real slot shell stays.
+- Phase 69: warm fork children keep the `module_run` command name until an exec, so a command table credits their CPU to it. Attribute CPU by test, not only by command name.
+- `remote_test_support.py` is also imported by `scripts/production/test_tidy_wrapped.py` and `scripts/shutdown/test_shutdown_cli.py`.
+- Phase 69 pairs ran on `/dev/shm`. State the filesystem basis of each pair.
+- Tests never read or write live state: `~/.claude` main, `~/.local/state/merge-gate`, `/tmp/claude`.
+
+**Acceptance gate:**
+- The behavior map has a row for each assertion. No assertion is removed.
+- CPU s, processes, execs and wall s before and after, from `module_cost.py` and same-load pairs, in the checkpoint notice.
+- The changed file and every importer of a changed fixture pass.
+- the targeted test green on the phase commit merged with `origin/builds`
+- `basedpyright` on the changed files prints `0 errors, 0 warnings, 0 notes`
+
+### Phase 98 — The merge gate resources test never waits out its hang guard  · status: todo
+**Depends on:** none
+
+#### Work Order
+
+**Source:** builds showrunner order, 2026-11-08 23:xx EST, ranked after Phase 97. `production/test_merge_gate_suites_resources.py` took 617.75 s, 618.31 s and 625 s on three of 29 cloud gates that day; in 25 other gates it took 17-26 s. Each case passed. The extra 600 s equals `TEST_HANG_GUARD_SECS` (`scripts/lib/test_hang_guard.py`), and the box CPU was idle.
+
+**Goal:** no test in `scripts/production/test_merge_gate_suites_resources.py` waits out its hang guard; the cause of the long wait is found and fixed where it lives.
+
+**Spec:**
+1. The gate record names the slow test: `MergeGateResourcesTests.test_stop_during_a_blocking_read_returns_every_owned_slot`, 600.022 s in the last run (`show.py top`). Confirm it, and check the `waiting` / `released` waits near lines 140-200 as well.
+2. Reproduce the long wait before you change code. Run the test many times, alone and under CPU load, and record how often it waits.
+3. Find the cause. One lead to test, not a fact: the stop thread calls `os.kill(os.getpid(), signal.SIGTERM)` while the main thread blocks in `os.read`. If the kernel gives the signal to a thread other than the main thread, the main thread's read is not interrupted.
+4. Fix the cause where it lives. A defect in `scripts/production/merge_gate.py` is fixed there; send the director its evidence first, because another unit owns that file.
+5. Keep every assertion. Add no guard, refusal or check (user rule, 2026-11-05).
+
+**Files:**
+- `scripts/production/test_merge_gate_suites_resources.py`
+- `scripts/production/merge_gate.py`
+
+**Workers:** 1 writer; the test and its cause do not split
+- `impl` — `test_merge_gate_suites_resources.py`, `merge_gate.py`
+
+**Constraints from prior phases:**
+- `TEST_HANG_GUARD_SECS` is 600 s; a test that waits on it still passes, so the gate reports no failure.
+- Tests never read or write live state: `~/.claude` main, `~/.local/state/merge-gate`, `/tmp/claude`.
+
+**Acceptance gate:**
+- The repeat count and the long-wait count before and after the fix, alone and under load, in the checkpoint notice. After the fix, no run waits on the hang guard.
+- `test_merge_gate_suites_resources.py` and every importer of a changed file pass.
+- the targeted test green on the phase commit merged with `origin/builds`
+- `basedpyright` on the changed files prints `0 errors, 0 warnings, 0 notes`

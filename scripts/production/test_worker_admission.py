@@ -9,18 +9,28 @@ import subprocess
 import sys
 from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import replace
+from functools import partial
 from pathlib import Path
 from typing import Literal
 from unittest import mock
 
 from scripts.agents import worker_lifecycle
 from scripts.lib import unit_runs
+from scripts.lib.atomic_file import write_text_atomic
+from scripts.direct import claude_worker
+from scripts.message import sessions
 from scripts.production import fake_unit_host, session_staff, staff, worker_admission, showrunners
 from scripts.production.staff_test_support import (
-    CHECKOUT, StaffTestCase, fixture_runtime_id, fixture_session, fixture_worker, transcript_fixture,
+    CHECKOUT, StaffTestCase, fixture_member, fixture_runtime_id, fixture_session, fixture_worker,
+    production_membership, unit_membership, recorded_showrunner, transcript_fixture,
 )
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.shutdown import stop_resume
+
+
+def record_destination_stop(identities: list[str], identity: str) -> worker_admission.DestinationStopped:
+    identities.append(identity)
+    return worker_admission.DestinationStopped()
 
 
 class RecordedDirectorAdmissionTests(StaffTestCase):
@@ -32,7 +42,7 @@ class RecordedDirectorAdmissionTests(StaffTestCase):
         with self.assertRaises(ValueError) as missing_run:
             _ = worker_admission.parent(record, run=run)
         self.assertEqual(str(missing_run.exception),
-                         f"this run has no owner because {unit_runs.STATE_FILE} and mesh_roster.json name no unit, production or staff row")
+                         f"this run has no owner because {unit_runs.STATE_FILE} names no staff row")
         with self.assertRaises(ValueError) as missing_caller:
             _ = worker_admission.parent(record)
         self.assertEqual(str(missing_caller.exception), "the caller has no staff row and names no unit or production")
@@ -189,89 +199,50 @@ class WorkerAdmissionTests(StaffTestCase):
 
 
 class FamilyHandoffTests(StaffTestCase):
+    def test_claude_transcript_entries_ignore_api_request_blobs(self) -> None:
+        for kind, expected in (("api-request-blob", ""), ("user", "user:\nThe request"),
+                               ("assistant", "assistant:\nThe request")):
+            with self.subTest(kind=kind):
+                self.assertEqual(worker_admission.transcript_entry({
+                    "type": kind,
+                    "message": {"role": "assistant" if kind == "assistant" else "user",
+                                "content": [{"type": "text", "text": "The request"}]},
+                }, set()), expected)
+
     def source(self, family: Literal["claude", "codex"], *, turns: int = 1,
-               malformed: bool = False) -> tuple[worker_admission.WorkerStartAllowed, Path,
+               malformed: bool = False, worker_name: str = "switch") -> tuple[worker_admission.WorkerStartAllowed, Path,
                                                 tuple[list[str], list[str], list[str]]]:
         _, unit, _ = self.tree()
         tree = self.root / "worktree"
         tree.mkdir(exist_ok=True)
         _ = staff.set_worktree(unit.id, staff.PresentWorktree("natedev", tree), expected=unit.worktree)
         backend = staff.ClaudeBackend() if family == "claude" else staff.CodexBackend(self.root / "codex")
-        row = fixture_worker("switch-" + family, unit.id, backend=backend)
+        row = fixture_worker(worker_name + "-" + family, unit.id, backend=backend)
         path, evidence = transcript_fixture(row, backend, turns=turns, malformed=malformed)
         run = self.root / ("run-" + family)
         run.mkdir(exist_ok=True)
         return worker_admission.WorkerStartAllowed(row.name, unit.id, run,
             worker_admission.ExistingWorkerSlot(row)), path, evidence
 
-    def test_dispatch_update_preserves_a_request_replaced_before_the_exclusive_lock(self) -> None:
-        allowed, _, _ = self.source("claude")
-        worker_admission.record_dispatch(allowed, "old-request", worker_admission.SwitchState.DISPATCH_IN_FLIGHT)
-        original = worker_lifecycle.acquire_flock
-        saved: list[bytes] = []
-        path = allowed.run / "mesh_roster.json"
 
-        def supersede(handle: int | worker_lifecycle.LockFileDescriptor, *, mode: int = fcntl.LOCK_EX,
-                      deadline: float = worker_lifecycle.NO_LOCK_DEADLINE) -> None:
-            if mode == fcntl.LOCK_EX and not saved:
-                with mock.patch.object(worker_lifecycle, "acquire_flock", original):
-                    worker_admission.record_dispatch(allowed, "new-request",
-                                                     worker_admission.SwitchState.CREATION_INTENT_RECORDED)
-                saved.append(path.read_bytes())
-            original(handle, mode=mode, deadline=deadline)
 
-        with mock.patch.object(worker_lifecycle, "acquire_flock", side_effect=supersede):
-            worker_admission.record_dispatch(allowed, "old-request",
-                worker_admission.SwitchState.ASSIGNMENT_ACCEPTED, expected_request="old-request")
-        self.assertEqual(path.read_bytes(), saved[0])
-        self.assertEqual(worker_admission.dispatch_record(allowed.run, allowed.name), worker_admission.DispatchRecord(
-            "new-request", worker_admission.SwitchState.CREATION_INTENT_RECORDED))
-        worker_admission.record_dispatch(allowed, "new-request",
-            worker_admission.SwitchState.ASSIGNMENT_ACCEPTED, expected_request="new-request")
-        self.assertEqual(worker_admission.dispatch_record(allowed.run, allowed.name), worker_admission.DispatchRecord(
-            "new-request", worker_admission.SwitchState.ASSIGNMENT_ACCEPTED))
 
-    def test_pending_dispatch_accepts_an_unset_state_and_reports_an_unreadable_roster(self) -> None:
-        allowed, _, _ = self.source("claude")
-        prompt = allowed.run / "assignment.txt"
-        _ = prompt.write_text("Complete this assignment.\n")
-        worker_admission.record_dispatch(allowed, worker_admission.assignment_id(prompt), worker_admission.SwitchState.NO_RECORD)
-        self.assertTrue(worker_admission.dispatch_pending(allowed.run, allowed.name, prompt))
-        path = allowed.run / "mesh_roster.json"
-        _ = path.write_text("{torn")
-        with redirect_stderr(io.StringIO()) as errors:
-            pending = worker_admission.dispatch_pending(allowed.run, allowed.name, prompt)
-        self.assertFalse(pending)
-        self.assertEqual(len(errors.getvalue().splitlines()), 1)
-        self.assertIn(f"anomaly: {allowed.name}:", errors.getvalue())
-        self.assertIn(str(path), errors.getvalue())
-
-    def test_unknown_dispatch_state_reports_an_anomaly_and_allows_admission(self) -> None:
-        allowed, _, _ = self.source("claude")
-        _ = (allowed.run / "mesh_roster.json").write_text(json.dumps({allowed.name: {"dispatch_state": "invalid"}}))
-        before = self.staff_state()
-        with redirect_stderr(io.StringIO()) as errors:
-            record = worker_admission.dispatch_record(allowed.run, allowed.name)
-            repeated = worker_admission.admit(allowed.name, allowed.run, reference=allowed.lock_reference)
-        self.assertEqual(errors.getvalue().splitlines(),
-                         [f"anomaly: {allowed.name}: unknown dispatch_state 'invalid'; using NO_RECORD"])
-        self.assertEqual(record.state, worker_admission.SwitchState.NO_RECORD)
-        self.assertEqual(repeated, allowed)
-        self.assertEqual(self.staff_state(), before)
-
-    def test_source_run_discovery_only_follows_an_idle_codex_source(self) -> None:
-        cases: tuple[tuple[Literal["claude", "codex"], bool], ...] = (("claude", False), ("codex", True))
+    def test_family_switch_uses_native_release_without_run_discovery(self) -> None:
+        cases: tuple[tuple[Literal["claude", "codex"], bool], ...] = (
+            ("claude", False), ("claude", True), ("codex", False), ("codex", True))
         for family, stopped in cases:
-            allowed, _, _ = self.source(family)
+            allowed, _, _ = self.source(family, worker_name=f"native-{stopped}")
             assert isinstance(allowed.slot, worker_admission.ExistingWorkerSlot)
             row = allowed.slot.row
             result = stop_resume.Stopped(row.current_session, 123) if stopped else stop_resume.NotRunning(row.current_session)
-            identity = fixture_runtime_id("lazy-" + family)
+            identity = fixture_runtime_id(f"native-{family}-{stopped}")
             fixture_session(identity, staff.ClaudeBackend() if family == "codex" else staff.CodexBackend(self.root / "destination"))
             with (mock.patch.object(stop_resume, "stop", return_value=result),
                   mock.patch.object(session_staff, "worker_run_index", side_effect=AssertionError("unnecessary run discovery"))):
-                _ = worker_admission.switch_worker(allowed, "claude" if family == "codex" else "codex",
-                    start=lambda handoff: identity, dispatch=lambda published: worker_admission.SwitchState.ASSIGNMENT_ACCEPTED, cleanup=lambda identity: None)
+                published = worker_admission.switch_worker(allowed, "claude" if family == "codex" else "codex",
+                    start=lambda handoff: identity, dispatch=lambda published: worker_admission.SwitchState.ASSIGNMENT_ACCEPTED, cleanup=lambda identity: worker_admission.NoDestinationToStop())
+            self.assertEqual(published.row.id, row.id)
+            self.assertEqual(published.row.current_session, identity)
 
     def test_sibling_slots_can_launch_together_and_equal_slots_refuse_contention(self) -> None:
         _, unit, _ = self.tree()
@@ -281,7 +252,7 @@ class FamilyHandoffTests(StaffTestCase):
             allowed = worker_admission.WorkerStartAllowed(name, unit.id, self.root, worker_admission.NewWorkerSlot())
             identity = fixture_runtime_id("slot-" + name)
             fixture_session(identity, staff.ClaudeBackend())
-            program = 'import sys\nfrom pathlib import Path\nfrom scripts.production import staff, worker_admission as admission\nfrom scripts.production.staff_test_support import fixture_session, fixture_runtime_id\nallowed = admission.WorkerStartAllowed(sys.argv[2], staff.StaffId(sys.argv[1]), Path(sys.argv[3]), admission.NewWorkerSlot())\nidentity = fixture_runtime_id("slot-child-" + sys.argv[2])\nfixture_session(identity, staff.ClaudeBackend())\ntry:\n    admission.switch_worker(allowed, "claude", start=lambda handoff: identity, dispatch=admission.DispatchOwner.TURN_SUBMISSION, cleanup=lambda identity: None)\nexcept admission.AdmissionRefused:\n    raise SystemExit(2)\n'
+            program = 'import sys\nfrom pathlib import Path\nfrom scripts.production import staff, worker_admission as admission\nfrom scripts.production.staff_test_support import fixture_session, fixture_runtime_id\nallowed = admission.WorkerStartAllowed(sys.argv[2], staff.StaffId(sys.argv[1]), Path(sys.argv[3]), admission.NewWorkerSlot())\nidentity = fixture_runtime_id("slot-child-" + sys.argv[2])\nfixture_session(identity, staff.ClaudeBackend())\ntry:\n    admission.switch_worker(allowed, "claude", start=lambda handoff: identity, dispatch=admission.DispatchOwner.TURN_SUBMISSION, cleanup=lambda identity: admission.NoDestinationToStop())\nexcept admission.AdmissionRefused:\n    raise SystemExit(2)\n'
             def start(_handoff: worker_admission.FamilyHandoff) -> str:
                 child = subprocess.run([sys.executable, "-c", program, unit.id, sibling, str(self.root)],
                     env=staff.child_environment(os.environ), cwd=CHECKOUT, capture_output=True, text=True,
@@ -289,7 +260,7 @@ class FamilyHandoffTests(StaffTestCase):
                 self.assertEqual(child.returncode, 2 if equal else 0, child.stdout + child.stderr)
                 return identity
 
-            _ = worker_admission.switch_worker(allowed, "claude", start=start, dispatch=worker_admission.DispatchOwner.TURN_SUBMISSION, cleanup=lambda identity: None)
+            _ = worker_admission.switch_worker(allowed, "claude", start=start, dispatch=worker_admission.DispatchOwner.TURN_SUBMISSION, cleanup=lambda identity: worker_admission.NoDestinationToStop())
             self.assertEqual(len([row for row in staff.local_snapshot().find(kind="worker", parent=unit.id) if row.name == name]), 1)
 
     def test_both_formats_keep_complete_histories_and_report_malformed_records_once(self) -> None:
@@ -345,6 +316,61 @@ class FamilyHandoffTests(StaffTestCase):
                 self.assertTrue(handoff.reason)
                 self.assertEqual(len(errors.getvalue().splitlines()), 1, errors.getvalue())
 
+    def test_dispatch_update_preserves_a_request_replaced_before_the_exclusive_lock(self) -> None:
+        allowed = self.source("claude")[0]
+        worker_admission.record_dispatch(allowed, "old-request", worker_admission.SwitchState.DISPATCH_IN_FLIGHT)
+        original = worker_lifecycle.acquire_flock
+        saved: list[bytes] = []
+        path = worker_admission.switch_record_path(allowed.run, allowed.name)
+
+        def supersede(handle: int | worker_lifecycle.LockFileDescriptor, *, mode: int = fcntl.LOCK_EX,
+                      deadline: float = worker_lifecycle.NO_LOCK_DEADLINE) -> None:
+            if mode == fcntl.LOCK_EX and not saved:
+                with mock.patch.object(worker_lifecycle, "acquire_flock", original):
+                    worker_admission.record_dispatch(allowed, "new-request",
+                                                     worker_admission.SwitchState.CREATION_INTENT_RECORDED)
+                saved.append(path.read_bytes())
+            original(handle, mode=mode, deadline=deadline)
+
+        with mock.patch.object(worker_lifecycle, "acquire_flock", side_effect=supersede):
+            worker_admission.record_dispatch(allowed, "old-request",
+                worker_admission.SwitchState.ASSIGNMENT_ACCEPTED, expected_request="old-request")
+        self.assertEqual(path.read_bytes(), saved[0])
+        self.assertEqual(worker_admission.dispatch_record(allowed.run, allowed.name), worker_admission.DispatchRecord(
+            "new-request", worker_admission.SwitchState.CREATION_INTENT_RECORDED))
+        worker_admission.record_dispatch(allowed, "new-request",
+            worker_admission.SwitchState.ASSIGNMENT_ACCEPTED, expected_request="new-request")
+        self.assertEqual(worker_admission.dispatch_record(allowed.run, allowed.name), worker_admission.DispatchRecord(
+            "new-request", worker_admission.SwitchState.ASSIGNMENT_ACCEPTED))
+
+    def test_pending_dispatch_accepts_an_unset_state_and_reports_an_unreadable_record(self) -> None:
+        allowed = self.source("claude")[0]
+        prompt = allowed.run / "assignment.txt"
+        write_text_atomic(prompt, "Complete this assignment.\n")
+        worker_admission.record_dispatch(allowed, worker_admission.assignment_id(prompt), worker_admission.SwitchState.NO_RECORD)
+        self.assertTrue(worker_admission.dispatch_pending(allowed.run, allowed.name, prompt))
+        path = worker_admission.switch_record_path(allowed.run, allowed.name)
+        write_text_atomic(path, "{torn")
+        with redirect_stderr(io.StringIO()) as errors:
+            pending = worker_admission.dispatch_pending(allowed.run, allowed.name, prompt)
+        self.assertFalse(pending)
+        self.assertEqual(len(errors.getvalue().splitlines()), 1)
+        self.assertIn(f"anomaly: {allowed.name}:", errors.getvalue())
+        self.assertIn(str(path), errors.getvalue())
+
+    def test_unknown_dispatch_state_reports_an_anomaly_and_allows_admission(self) -> None:
+        allowed = self.source("claude")[0]
+        write_text_atomic(worker_admission.switch_record_path(allowed.run, allowed.name), json.dumps({"dispatch_state": "invalid"}))
+        before = self.staff_state()
+        with redirect_stderr(io.StringIO()) as errors:
+            record = worker_admission.dispatch_record(allowed.run, allowed.name)
+            repeated = worker_admission.admit(allowed.name, allowed.run, reference=allowed.lock_reference)
+        self.assertEqual(errors.getvalue().splitlines(),
+                         [f"anomaly: {allowed.name}: unknown dispatch_state 'invalid'; using NO_RECORD"])
+        self.assertEqual(record.state, worker_admission.SwitchState.NO_RECORD)
+        self.assertEqual(repeated, allowed)
+        self.assertEqual(self.staff_state(), before)
+
     def test_switch_preserves_staff_graph_slot_folder_and_held_messages_before_dispatch(self) -> None:
         families: tuple[Literal["claude", "codex"], ...] = ("claude", "codex")
         for family in families:
@@ -360,14 +386,13 @@ class FamilyHandoffTests(StaffTestCase):
                 _ = inbox.write_text(json.dumps({"messages": ["held work"], "accepting_messages": True}))
                 previous_run = self.root / (f"previous-director-{family}-{interrupted}")
                 previous_run.mkdir()
-                reference = previous_run / "mesh_roster.json"
-                _ = reference.write_text(json.dumps({old.name: {"staff_id": old.id, "status": "done"}}))
                 parent = staff.by_id(allowed.parent)
                 assert parent is not None
                 _ = staff.update_current_session(parent.current_session, staff.native_id(
                     fixture_runtime_id(f"next-director-{family}-{interrupted}")))
-                before = self.staff_file.read_bytes(), inbox.read_bytes(), reference.read_bytes()
                 tree = session_staff.worker_directory(staff.snapshot(), old.id)
+                before = self.staff_state()
+                held_messages = inbox.read_bytes()
                 events: list[str] = []
                 attempts: list[worker_admission.FamilyHandoff] = []
 
@@ -415,10 +440,10 @@ class FamilyHandoffTests(StaffTestCase):
                     if interrupted:
                         with self.assertRaisesRegex(OSError, "dispatch interrupted"):
                             _ = worker_admission.switch_worker(allowed, destination,
-                                start=start, dispatch=dispatch, cleanup=cleaned.append, request="stable-assignment")
+                                start=start, dispatch=dispatch, cleanup=partial(record_destination_stop, cleaned), request="stable-assignment")
                     allowed = worker_admission.admit(old.name, allowed.run, reference=old.id)
                     result = worker_admission.switch_worker(allowed, destination,
-                        start=start, dispatch=dispatch, cleanup=cleaned.append, request="stable-assignment")
+                        start=start, dispatch=dispatch, cleanup=partial(record_destination_stop, cleaned), request="stable-assignment")
                 self.assertEqual(result.row, replace(old, current_session=staff.StaffId(identity)))
                 self.assertEqual(events, ["stop", "start", *(["dispatch"] * (2 if interrupted else 1))])
                 self.assertEqual(cleaned, [])
@@ -427,16 +452,17 @@ class FamilyHandoffTests(StaffTestCase):
                 assert isinstance(attempts[-1], worker_admission.TranscriptHandoff)
                 self.assertEqual(attempts[-1].source, source)
                 self.assert_only_current_session_changed(before[0], old, identity)
-                self.assertEqual((inbox.read_bytes(), reference.read_bytes()), before[1:])
+                self.assertEqual(inbox.read_bytes(), held_messages)
                 self.assertEqual(session_staff.worker_directory(staff.snapshot(), old.id), tree)
                 saved = self.staff_state()
                 with redirect_stdout(io.StringIO()) as output:
                     allowed = worker_admission.admit(old.name, allowed.run, reference=old.id)
                     repeated = worker_admission.switch_worker(allowed, destination,
-                        start=start, dispatch=dispatch, cleanup=cleaned.append, request="stable-assignment")
+                        start=start, dispatch=dispatch, cleanup=partial(record_destination_stop, cleaned), request="stable-assignment")
                 self.assertEqual(repeated.row, result.row)
                 self.assertEqual(output.getvalue().strip(), "unchanged")
                 self.assertEqual(self.staff_state(), saved)
+                self.assertEqual(inbox.read_bytes(), held_messages)
                 self.assertEqual(events, ["stop", "start", *(["dispatch"] * (2 if interrupted else 1))])
 
     def test_default_switch_request_reuses_the_published_destination_after_fresh_admission(self) -> None:
@@ -457,8 +483,6 @@ class FamilyHandoffTests(StaffTestCase):
                 old = source.slot.row
                 run = source.run / ("prime" if deferred else "dispatch")
                 run.mkdir()
-                _ = (run / "mesh_roster.json").write_text(json.dumps({old.name: {"staff_id": old.id, "status": "done"}}))
-                _ = (run / "mesh_server.json").write_text(json.dumps({"previous_servers": [{"pid": 987654321, "port": 9}]}))
                 allowed = worker_admission.admit(old.name, run, reference=old.id)
                 created: list[str] = []
                 dispatched: list[str] = []
@@ -485,7 +509,7 @@ class FamilyHandoffTests(StaffTestCase):
 
                 with self.assertRaisesRegex(OSError, "interrupted after publication"):
                     _ = worker_admission.switch_worker(allowed, destination, start=start,
-                        dispatch=worker_admission.DispatchOwner.TURN_SUBMISSION if deferred else dispatch, cleanup=cleaned.append)
+                        dispatch=worker_admission.DispatchOwner.TURN_SUBMISSION if deferred else dispatch, cleanup=partial(record_destination_stop, cleaned))
                     raise OSError("interrupted after publication")
                 published = staff.by_id(old.id)
                 assert published is not None
@@ -494,7 +518,7 @@ class FamilyHandoffTests(StaffTestCase):
                 intent = worker_admission.dispatch_record(allowed.run, allowed.name)
                 allowed = worker_admission.admit(old.name, run, reference=old.id)
                 result = worker_admission.switch_worker(allowed, destination, start=start,
-                    dispatch=worker_admission.DispatchOwner.TURN_SUBMISSION if deferred else dispatch, cleanup=cleaned.append)
+                    dispatch=worker_admission.DispatchOwner.TURN_SUBMISSION if deferred else dispatch, cleanup=partial(record_destination_stop, cleaned))
                 self.assertEqual(created, [published.current_session])
                 self.assertEqual(result.row, published)
                 self.assertEqual(worker_admission.dispatch_record(allowed.run, allowed.name).assignment_id, intent.assignment_id)
@@ -526,8 +550,8 @@ class FamilyHandoffTests(StaffTestCase):
 
         with mock.patch.object(stop_resume, "stop", return_value=stop_resume.NotRunning(old.current_session)):
             with self.assertRaisesRegex(OSError, "dispatch interrupted"):
-                _ = worker_admission.switch_worker(allowed, "codex", start=start, dispatch=dispatch, cleanup=starts.append)
-            _ = worker_admission.switch_worker(allowed, "codex", start=start, dispatch=dispatch, cleanup=starts.append)
+                _ = worker_admission.switch_worker(allowed, "codex", start=start, dispatch=dispatch, cleanup=partial(record_destination_stop, starts))
+            _ = worker_admission.switch_worker(allowed, "codex", start=start, dispatch=dispatch, cleanup=partial(record_destination_stop, starts))
         self.assertEqual(starts, [identity])
         self.assertEqual(len(attempts), 2)
         self.assertEqual(attempts[0], attempts[1])
@@ -535,39 +559,67 @@ class FamilyHandoffTests(StaffTestCase):
         self.assertEqual(attempts[1].source, source)
 
     def test_failed_creation_or_publication_dispatches_nothing_and_preserves_current_session(self) -> None:
-        for failure in ("creation", "publication"):
-            with self.subTest(failure=failure):
-                allowed, _, _ = self.source("claude")
-                assert isinstance(allowed.slot, worker_admission.ExistingWorkerSlot)
-                old = allowed.slot.row
-                identity = fixture_runtime_id("failed-" + failure)
-                before = self.staff_file.read_bytes()
-                events: list[str] = []
+        families: tuple[Literal["claude", "codex"], ...] = ("claude", "codex")
+        for family in families:
+            for failure, retained in (("creation", False), ("publication", False),
+                                      ("publication", True), ("native-proof", False), ("native-proof", True), ("interrupt", True)):
+                with self.subTest(family=family, failure=failure, retained=retained):
+                    allowed, _, _ = self.source(family, worker_name=f"failed-{failure}-{retained}")
+                    assert isinstance(allowed.slot, worker_admission.ExistingWorkerSlot)
+                    old = allowed.slot.row
+                    destination = "codex" if family == "claude" else "claude"
+                    identity = fixture_runtime_id(f"failed-{family}-{failure}-{retained}")
+                    before = self.staff_file.read_bytes()
+                    events: list[str] = []
+                    launched: list[str] = []
+                    cleaned: list[str] = []
+                    cleanup_attempts: list[str] = []
 
-                def start(handoff: worker_admission.FamilyHandoff) -> str:
-                    self.assertIsInstance(handoff, worker_admission.TranscriptHandoff)
-                    if failure == "creation":
-                        raise OSError("destination creation failed")
-                    return identity
+                    def start(handoff: worker_admission.FamilyHandoff) -> str:
+                        self.assertIsInstance(handoff, worker_admission.TranscriptHandoff)
+                        if failure == "creation":
+                            raise OSError("destination creation failed")
+                        launched.append(identity)
+                        if failure == "native-proof":
+                            raise ValueError("native proof interrupted")
+                        if failure == "interrupt":
+                            raise KeyboardInterrupt("native proof interrupted")
+                        return identity
 
-                def dispatch(published: worker_admission.PublishedWorker) -> worker_admission.SwitchState:
-                    events.append("dispatch:" + published.row.current_session + str(type(published.handoff)))
-                    return worker_admission.SwitchState.ASSIGNMENT_ACCEPTED
+                    def dispatch(published: worker_admission.PublishedWorker) -> worker_admission.SwitchState:
+                        events.append("dispatch:" + published.row.current_session + str(type(published.handoff)))
+                        return worker_admission.SwitchState.ASSIGNMENT_ACCEPTED
 
-                def publish(old_session: str, new_session: str) -> staff.StaffRow:
-                    self.assertEqual((old_session, new_session), (old.current_session, identity))
-                    raise staff.StaffUnreadable("publication failed")
+                    def publish(old_session: str, new_session: str) -> staff.StaffRow:
+                        self.assertEqual((old_session, new_session), (old.current_session, identity))
+                        raise staff.StaffUnreadable("publication failed")
 
-                cleaned: list[str] = []
-                with (mock.patch.object(stop_resume, "stop", return_value=stop_resume.Stopped(old.current_session, 987654)),
-                      mock.patch.object(staff, "update_current_session", side_effect=publish)):
-                    with self.assertRaises((OSError, worker_admission.AdmissionRefused)):
-                        _ = worker_admission.switch_worker(allowed, "codex", start=start,
-                            dispatch=dispatch, cleanup=cleaned.append)
-                self.assertEqual(events, [])
-                self.assertEqual(cleaned, [identity] if failure == "publication" else [])
-                self.assertEqual(staff.by_id(old.id), old)
-                self.assertEqual(self.staff_file.read_bytes(), before)
+                    def cleanup(proved: str) -> worker_admission.CleanupOutcome:
+                        cleanup_attempts.append(proved)
+                        if not launched:
+                            return worker_admission.NoDestinationToStop()
+                        if retained:
+                            return worker_admission.DestinationRetained("w1:destination", "native identity is unproved")
+                        self.assertEqual(proved, "" if failure == "native-proof" else identity)
+                        cleaned.extend(launched)
+                        return worker_admission.DestinationStopped()
+
+                    expected_error = (KeyboardInterrupt if failure == "interrupt"
+                                      else worker_admission.AdmissionRefused if retained or failure == "publication"
+                                      else ValueError if failure == "native-proof" else OSError)
+                    with (mock.patch.object(stop_resume, "stop", return_value=stop_resume.Stopped(old.current_session, 987654)),
+                          mock.patch.object(staff, "update_current_session", side_effect=publish)):
+                        with self.assertRaises(expected_error) as refused:
+                            _ = worker_admission.switch_worker(allowed, destination, start=start,
+                                dispatch=dispatch, cleanup=cleanup)
+                    self.assertEqual(events, [])
+                    self.assertEqual(cleanup_attempts, [identity] if failure == "publication" else [""])
+                    self.assertEqual(cleaned, [identity] if failure != "creation" and not retained else [])
+                    self.assertEqual(staff.by_id(old.id), old)
+                    self.assertEqual(self.staff_file.read_bytes(), before)
+                    if retained and failure != "interrupt":
+                        self.assertIn("w1:destination", str(refused.exception))
+                        self.assertIn("native identity is unproved", str(refused.exception))
 
     def test_competing_switch_cannot_start_or_dispatch_a_second_destination(self) -> None:
         _ = self.staff_config(lock_seconds=0.1)
@@ -611,7 +663,7 @@ except admission.AdmissionRefused as error:
 
         with mock.patch.object(stop_resume, "stop", return_value=stop_resume.Stopped(old.current_session, 987654)):
             _ = worker_admission.switch_worker(allowed, "codex", start=start,
-                dispatch=dispatch, cleanup=events.append)
+                dispatch=dispatch, cleanup=partial(record_destination_stop, events))
         self.assertEqual(events, [identity])
 
     def test_missing_claude_transcript_is_empty_but_missing_codex_transcript_is_unavailable(self) -> None:
@@ -663,12 +715,12 @@ except admission.AdmissionRefused as error:
                         reason = "source identity changed" if failure == "stop" else "could not resolve the staff reference"
                         with self.assertRaisesRegex(worker_admission.AdmissionRefused, reason) as refusal:
                             _ = worker_admission.switch_worker(allowed, "codex", start=start,
-                                dispatch=dispatch, cleanup=events.append)
+                                dispatch=dispatch, cleanup=partial(record_destination_stop, events))
                         if failure == "stop":
                             self.assertIn("source identity changed", str(refusal.exception))
                     else:
                         _ = worker_admission.switch_worker(allowed, "codex", start=start,
-                            dispatch=dispatch, cleanup=events.append)
+                            dispatch=dispatch, cleanup=partial(record_destination_stop, events))
                 if failure != "transcript":
                     self.assertEqual(events, [])
                     self.assertEqual(self.staff_file.read_bytes(), before)
@@ -676,3 +728,127 @@ except admission.AdmissionRefused as error:
                     self.assertEqual(events, ["start", "dispatch"])
                     self.assertEqual(staff.by_id(old.id), replace(old, current_session=staff.StaffId(identity)))
                 self.assertEqual(errors.getvalue().count("transcript extract:"), 1)
+
+
+class ClaudeChildAdmissionTests(StaffTestCase):
+
+    def turn(self, row: staff.StaffRow, run: Path, prompt: Path) -> claude_worker.ClaudeTurn:
+        sender = self.root / 'send.py'
+        write_text_atomic(sender, "print('SENT: fixture')\n")
+        environment = {**os.environ, 'CLAUDE_BIN': '/bin/true', 'CLAUDE_WORKER_SEND_SCRIPT': str(sender)}
+        return claude_worker.ClaudeTurn(row.name, run, self.root, prompt, run / 'summary', run / 'log', '', '', '', row.id, False, environment)
+
+    def test_claude_retry_without_a_transcript_keeps_the_session_and_delivers_the_saved_handoff(self) -> None:
+        runner = fixture_member('showrunner', name='sdlc')
+        unit = fixture_member('unit', name='models', parent=runner.id)
+        native = staff.native_id(fixture_runtime_id('published-claude-without-transcript'))
+        row = staff.ensure_worker(native, 'impl', unit.id)
+        registry = Path(os.environ['NOTIFIER_SESSIONS_DIR']) / f'{os.getpid()}.json'
+        write_text_atomic(registry, json.dumps({'pid': os.getpid(), 'sessionId': native, 'name': row.name, 'messagingSocketPath': '', 'procStart': sessions.process_start(os.getpid()), 'updatedAt': 1}))
+        run = self.root / 'published-retry'
+        run.mkdir()
+        prompt = run / 'prompt.md'
+        write_text_atomic(prompt, 'Complete the assignment after the family switch.')
+        source = run / 'source.jsonl'
+        write_text_atomic(source, 'Source conversation before the switch.\n')
+        extract = worker_admission.handoff_path(run, row)
+        write_text_atomic(extract, f'{worker_admission.HANDOFF_SOURCE_PREFIX}{source}\nSaved source conversation.\n')
+        allowed = worker_admission.WorkerStartAllowed(row.name, unit.id, run, worker_admission.ExistingWorkerSlot(row))
+        worker_admission.record_dispatch(allowed, worker_admission.assignment_id(prompt), worker_admission.SwitchState.DISPATCH_IN_FLIGHT)
+        before = self.staff_file.read_bytes()
+        self.assertEqual(sessions.transcript_locations(native), [])
+        result = claude_worker.open_worker(self.turn(row, run, prompt))
+        self.assertIsInstance(result, claude_worker.Delivered)
+        assert isinstance(result, claude_worker.Delivered)
+        self.assertEqual(result.native_id, row.current_session)
+        prepared = (run / f'{row.id}.opening.md').read_text()
+        self.assertIn(prompt.read_text(), prepared)
+        self.assertLess(prepared.index(str(extract)), prepared.index(prompt.read_text()))
+        self.assertEqual(self.staff_file.read_bytes(), before)
+        self.assertEqual(staff.by_id(row.id), row)
+        self.assertEqual(worker_admission.dispatch_record(allowed.run, allowed.name).state, worker_admission.SwitchState.ASSIGNMENT_ACCEPTED)
+
+    def test_claude_retry_reports_one_unknown_dispatch_state_and_completes_dispatch(self) -> None:
+        unit, row = self.tree()[1:]
+        run = self.root / 'retry'
+        run.mkdir()
+        prompt = run / 'prompt.md'
+        write_text_atomic(prompt, 'Complete the retry assignment.')
+        source = transcript_fixture(row, staff.ClaudeBackend())[0]
+        write_text_atomic(worker_admission.handoff_path(run, row), f'{worker_admission.HANDOFF_SOURCE_PREFIX}{source}\n')
+        write_text_atomic(worker_admission.switch_record_path(run, row.name), json.dumps({'staff_id': row.id, 'assignment_id': worker_admission.assignment_id(prompt), 'dispatch_state': 'invalid'}))
+        with redirect_stderr(io.StringIO()) as errors:
+            result = claude_worker.open_worker(self.turn(row, run, prompt))
+        self.assertIsInstance(result, claude_worker.Delivered)
+        assert isinstance(result, claude_worker.Delivered)
+        self.assertEqual(result.native_id, row.current_session)
+        self.assertEqual(errors.getvalue().splitlines(), [f"anomaly: {row.name}: unknown dispatch_state 'invalid'; using NO_RECORD"])
+        allowed = worker_admission.WorkerStartAllowed(row.name, unit.id, run, worker_admission.ExistingWorkerSlot(row))
+        self.assertEqual(worker_admission.dispatch_record(allowed.run, allowed.name).state, worker_admission.SwitchState.ASSIGNMENT_ACCEPTED)
+
+    def test_uncertain_claude_dispatch_requires_readable_evidence_before_resending(self) -> None:
+        unit, row = self.tree()[1:]
+        for case, torn, matching in (('matched', True, True), ('unknown', True, False), ('absent', False, False)):
+            with self.subTest(case=case):
+                run = self.root / case
+                run.mkdir()
+                prompt = run / 'prompt.md'
+                write_text_atomic(prompt, 'Complete the private assignment.')
+                source = transcript_fixture(row, staff.ClaudeBackend())[0]
+                text = prompt.read_text() if matching else 'An unrelated assignment.'
+                write_text_atomic(source, ('{"torn":\n' if torn else '') + json.dumps({'type': 'user', 'message': {'role': 'user', 'content': text}}) + '\n')
+                write_text_atomic(worker_admission.handoff_path(run, row), f'{worker_admission.HANDOFF_SOURCE_PREFIX}{source}\n')
+                allowed = worker_admission.WorkerStartAllowed(row.name, unit.id, run, worker_admission.ExistingWorkerSlot(row))
+                worker_admission.record_dispatch(allowed, worker_admission.assignment_id(prompt), worker_admission.SwitchState.DISPATCH_IN_FLIGHT)
+                before = (self.staff_file.read_bytes(), source.read_bytes())
+                refused = case == 'unknown'
+                with redirect_stdout(io.StringIO()) as out, redirect_stderr(io.StringIO()) as err:
+                    result = claude_worker.open_worker(self.turn(row, run, prompt))
+                output, errors = (out.getvalue(), err.getvalue())
+                self.assertIsInstance(result, claude_worker.NotDelivered if refused else claude_worker.Delivered if case == 'absent' else claude_worker.Unchanged)
+                if isinstance(result, claude_worker.NotDelivered):
+                    self.assertEqual(result.code, 2)
+                if refused:
+                    self.assertIn('delivery is unknown', errors)
+                self.assertEqual(output.splitlines(), ['unchanged'] if case == 'matched' else [])
+                if case == 'absent':
+                    assert isinstance(result, claude_worker.Delivered)
+                    self.assertEqual(result.native_id, row.current_session)
+                    opening = (run / f'{row.id}.opening.md').read_text()
+                    self.assertIn(prompt.read_text(), opening)
+                    self.assertLess(opening.index(str(worker_admission.handoff_path(run, row))), opening.index(str(source)))
+                self.assertEqual((self.staff_file.read_bytes(), source.read_bytes()), before)
+                self.assertEqual(worker_admission.dispatch_record(allowed.run, allowed.name).state, worker_admission.SwitchState.DISPATCH_IN_FLIGHT if refused else worker_admission.SwitchState.ASSIGNMENT_ACCEPTED)
+
+    def test_staff_id_admits_without_reading_unrelated_malformed_evidence(self) -> None:
+        production_membership('demo', 'models')
+        parent = unit_membership('demo', 'models')
+        run = self.worker_run('demo', 'models', 'director')
+        for evidence in (Path(os.environ['HERDR_PANE_RECORD_DIR']) / 'agents.json', run / 'progress_history_state.json'):
+            with self.subTest(evidence=evidence.name):
+                evidence.parent.mkdir(parents=True, exist_ok=True)
+                write_text_atomic(evidence, '{malformed unrelated evidence')
+                self.assertEqual(staff.find(kind='worker', parent=parent.id), [])
+                with mock.patch.dict(os.environ, {'CODEX_THREAD_ID': parent.id}):
+                    allowed = worker_admission.admit('impl', run)
+                    self.assertEqual(staff.find(kind='worker', parent=parent.id), [])
+                    admitted = worker_admission.publish(allowed, fixture_runtime_id('published-test-worker'))
+                self.assertEqual(admitted.row.parent, staff.ReportsTo(parent.id))
+                self.assertEqual(staff.find(kind='worker', parent=parent.id), [admitted.row])
+                self.assertEqual(evidence.read_text(), '{malformed unrelated evidence')
+                evidence.unlink()
+                self.assertTrue(staff.retire(admitted.row.id))
+
+    def test_retired_unit_cannot_admit_a_worker(self) -> None:
+        doc = self.production('demo', 'models')
+        production_membership('demo', 'models')
+        parent = unit_membership(recorded_showrunner('demo', doc).name, 'models')
+        parent = staff.set_worktree(parent.id, staff.RemovedWorktree('natedev', self.root / 'gone'), expected=parent.worktree)
+        run = self.worker_run('demo', 'models', 'director')
+        write_text_atomic(run / 'progress_history_state.json', json.dumps({'owner_staff_id': parent.id, 'main_agent': {'family': 'claude', 'session_id': 'director'}}))
+        with redirect_stderr(io.StringIO()) as errors:
+            allowed = worker_admission.admit('impl', run)
+        self.assertEqual(allowed.parent, parent.id)
+        self.assertEqual(len(errors.getvalue().splitlines()), 1)
+        self.assertIn('retired', errors.getvalue())
+        self.assertEqual(staff.find(kind='worker'), [])

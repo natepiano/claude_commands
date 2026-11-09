@@ -34,7 +34,8 @@ from pathlib import Path, PurePath, PurePosixPath
 from typing import Literal, NamedTuple, TypedDict, cast
 
 from scripts.production import change_review
-from scripts.lib import scratch
+from scripts.worktree import worktrees
+from scripts.lib import main_publish, scratch
 from scripts.production.showrunners import owner_for
 from scripts.production.production_doc import Production, ProductionDocument, Refusal, cell_value, production_field, read_production
 
@@ -161,6 +162,14 @@ class Stop(Exception):
 
 def report(step: str, state: str, detail: str) -> None:
     print(f"{step}: {state} — {detail}", flush=True)
+
+
+def end_pushed_worktrees(production: ProductionDocument) -> None:
+    for result in worktrees.end_landed(production.checkout, production.merge_branch):
+        if isinstance(result, worktrees.Ended):
+            report("worktrees", "ended", f"{result.path}; branch {result.branch}")
+        else:
+            report("worktrees", "kept", f"{result.path}: {result.reason}".replace("\n", "; "))
 
 
 @contextmanager
@@ -479,7 +488,7 @@ def _origin_merge_refs(request: MergeRequest) -> list[str]:
 
 
 def _unit_paths(request: MergeRequest, paths: tuple[str, ...]) -> tuple[str, ...]:
-    """Keep paths whose checkpoint content differs from every origin merge base."""
+    """Keep paths absent at an origin merge base or changed from every base that contains them."""
     if not paths:
         return ()
     own = set(paths)
@@ -490,11 +499,14 @@ def _unit_paths(request: MergeRequest, paths: tuple[str, ...]) -> tuple[str, ...
                 continue
             changed = git(request.production.checkout, "diff", "--name-only", "--no-renames", "-z",
                           base.stdout.strip(), request.commit, "--", *paths)
-            if changed.returncode:
+            present = git(request.production.checkout, "ls-tree", "--name-only", "-r", "-z",
+                          base.stdout.strip(), "--", *paths)
+            if changed.returncode or present.returncode:
                 continue
         except OSError:
             continue
-        own.intersection_update(changed.stdout.split("\0"))
+        unchanged = set(present.stdout.split("\0")) - set(changed.stdout.split("\0"))
+        own.difference_update(unchanged)
     return tuple(path for path in paths if path in own)
 
 
@@ -801,6 +813,7 @@ def push_git(production: ProductionDocument, may_undo: bool) -> str:
             undo_failed_push(production, old_origin, before_merge_tip)
         raise
     report("push", "ok", f"{production.merge_branch} pushed at {tip}")
+    end_pushed_worktrees(production)
     return tip
 
 
@@ -842,6 +855,7 @@ def push_validate(production: ProductionDocument, fix_commit: str, may_undo: boo
         raise
     tip = good(git(production.checkout, "rev-parse", "HEAD"), "push")
     report("push", "ok", f"validated and pushed {tip}")
+    end_pushed_worktrees(production)
     return tip
 
 
@@ -892,7 +906,7 @@ def remote_path(path: PurePosixPath) -> str:
     return shlex.quote(text)
 
 
-def pull_mac_checkout(mac: PurePosixPath, source: Path) -> None:
+def pull_mac_checkout(mac: PurePosixPath, source: Path) -> main_publish.MacPulled | main_publish.MacPullPending:
     settings_read = conf.read('merge_checkpoint')
     try:
         tries = settings_read.whole("MAC_PULL_TRIES")
@@ -901,12 +915,18 @@ def pull_mac_checkout(mac: PurePosixPath, source: Path) -> None:
         raise Stop("promote", "failed", str(error), "repair the Mac pull configuration and rerun this checkpoint") from error
     remote = (f"cd {remote_path(mac)} && git pull --ff-only "
               f"natedev:{shlex.quote(str(source))} main; printf 'rc=%s\\n' \"$?\"")
-    for attempt in range(tries):
+    attempt = 0
+    while True:
         result = subprocess.run(["ssh", "mac", remote], capture_output=True, text=True, check=False)
         match = re.search(r"(?:^|\n)rc=(\d+)", result.stdout)
         if result.returncode == 0 and match is not None and int(match.group(1)) == 0:
-            return
-        if attempt + 1 == tries:
+            main_publish.clear_pull_only()
+            return main_publish.MacPulled()
+        attempt += 1
+        if attempt == tries:
+            if result.returncode == 255 and match is None:
+                main_publish.queue_pull_only(f"mac {mac}", main_publish.first_line(result))
+                return main_publish.MacPullPending()
             raise Stop("promote", "failed", f"mac {mac}: {result.stdout.strip()} {result.stderr.strip()}",
                        "the showrunner will repair the Mac pull and rerun this checkpoint")
         time.sleep(retry_seconds)
@@ -964,7 +984,10 @@ def finish_promotion_targets(promotion: production_doc.NoPromotion | production_
     if isinstance(promotion.mac, production_doc.MacCheckout):
         mac = promotion.mac.path
         source = promotion.checkouts[0] if promotion.checkouts else source
-        pull_mac_checkout(mac, source)
+        outcome = pull_mac_checkout(mac, source)
+        if isinstance(outcome, main_publish.MacPullPending):
+            report("promote", "ok", f"mac unreachable, pull pending: {mac}")
+            return
         report("promote", "ok", f"mac {mac} main pulled")
         send_queued_zone()
         into(mac, "main", "sessions on mac run the installed commands from it",
@@ -1383,6 +1406,7 @@ def run(request: MergeRequest) -> int:
                             if not promotion_done.exists():
                                 tip = refresh_pushed_tip(request.production, tip)
                             report("push", "ok", f"{request.production.merge_branch} already pushed at {tip}")
+                            end_pushed_worktrees(request.production)
                         elif isinstance(request.push, GitPush):
                             tip = push_git(request.production, not already)
                         else:

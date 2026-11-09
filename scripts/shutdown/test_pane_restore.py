@@ -31,7 +31,7 @@ from scripts.message import sessions as runtime_sessions
 from scripts.production import unit_move
 
 from scripts.shutdown import pane_restore
-from scripts.herdr import herdr  # noqa: E402
+from scripts.herdr import herdr, worker_panes  # noqa: E402
 from scripts.shutdown import pane_record  # noqa: E402
 from scripts.herdr import pane_launch
 from scripts.message import sessions  # noqa: E402
@@ -411,7 +411,7 @@ class PaneRestoreTests(unittest.TestCase):
         self.assertEqual(len(client.started), 1)
         self.assertEqual(client.closed, ["w1:p2"], output)
 
-    def test_restore_reuses_worker_shell(self) -> None:
+    def test_restore_opens_a_new_worker_pane_on_the_same_conversation(self) -> None:
         from scripts.direct import progress_history
         from scripts.herdr import test_worker_panes, worker_panes
         from scripts.production import worker
@@ -436,10 +436,18 @@ class PaneRestoreTests(unittest.TestCase):
               redirect_stdout(io.StringIO()) as output, redirect_stderr(output)):
             self.assertEqual(pane_restore.restore("agents", dry_run=False), 0, output.getvalue())
             self.assertEqual(pane_restore.restore("agents", dry_run=False), 0, output.getvalue())
-        self.assertEqual(fixture.world.launches, [herdr.ExistingPane("w1:p1", "terminal-w1:p1")])
-        self.assertEqual([(pane["pane_id"], pane.get("terminal_id")) for pane in before],
-                         [(pane["pane_id"], pane.get("terminal_id")) for pane in fixture.world.panes()])
-        self.assertIsInstance(fixture.observation(row), worker_panes.OpenWorker)
+        self.assertEqual(fixture.world.launches, [herdr.SplitPane("w1:p0", "right", 0.667, "unit-impl2")])
+        restored = fixture.observation(row)
+        self.assertIsInstance(restored, worker_panes.OpenWorker)
+        assert isinstance(restored, worker_panes.OpenWorker)
+        self.assertEqual(restored.row.current_session, row.current_session)
+        self.assertNotEqual(restored.pane, "w1:p1")
+        self.assertNotEqual(restored.terminal, "terminal-w1:p1")
+        self.assertEqual(fixture.world.closed, [("w1:p1", "terminal-w1:p1")])
+        after = fixture.world.panes()
+        self.assertEqual(len(before), len(after))
+        self.assertEqual([(pane["pane_id"], pane.get("terminal_id")) for pane in before if pane["pane_id"] != "w1:p1"],
+                         [(pane["pane_id"], pane.get("terminal_id")) for pane in after if pane["pane_id"] != restored.pane])
         self.assertEqual(staff.snapshot().by_id(row.id), row)
 
 
@@ -476,7 +484,7 @@ class RestoreStaffNamesTests(StaffTestCase):
         configuration = self.root / "configuration"
         for config_source in (Path(__file__).resolve().parents[2] / "config").glob("*.conf"):
             write_text_atomic(configuration / config_source.name, config_source.read_text())
-        write_text_atomic(self.root / "run/worker_transport", "mesh\n")
+        (self.root / "run").mkdir()
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
             "CONF_DIR": str(configuration), "UNIT_RUN_DIR": str(self.root / "run"),
             "HERDR_PROC": str(self.root / "proc"), "XDG_STATE_HOME": str(self.root / "state"),
@@ -530,6 +538,7 @@ class RestoreStaffNamesTests(StaffTestCase):
         active: list[str] = []
         launches: list[str] = []
         record = staff.snapshot()
+        idle = next(row for row in record.rows if row.kind == "worker")
         row_operation = staff.row_operation
         expected: dict[str, str] = {}
 
@@ -564,6 +573,7 @@ class RestoreStaffNamesTests(StaffTestCase):
 
         with (mock.patch.object(pane_record, "RECORD_DIR", directory),
               mock.patch.object(herdr, "Herdr", return_value=client),
+              mock.patch.object(worker_panes, "observe", return_value=[worker_panes.ClosedWorker(idle)]),
               client.empty_shell(998042, self.root),
               mock.patch.object(staff, "row_operation", side_effect=lock),
               mock.patch.object(herdr, "open_tab", side_effect=(f"w1:p{n}" for n in range(4, 10))),
@@ -573,7 +583,8 @@ class RestoreStaffNamesTests(StaffTestCase):
               redirect_stdout(io.StringIO()) as output, redirect_stderr(output)):
             self.assertEqual(pane_restore.restore("agents", dry_run=False), 0, output.getvalue())
         self.assertEqual(len(launches), 2)
-        self.assertIn("impl1: closed; its next assign resumes it", output.getvalue())
+        self.assertNotIn(str(idle.current_session), launches)
+        self.assertEqual(staff.by_id(idle.id), idle)
         self.assertEqual(active, [])
 
 
@@ -631,6 +642,7 @@ class RestoreStaffNamesTests(StaffTestCase):
                        for index, row in enumerate(saved_client.rows)]
         client.count = 20
         record = staff.snapshot()
+        idle = next(row for row in record.rows if row.kind == "worker")
         path = directory / "agents.json"
         entries = pane_launch.read_strict(path)
         for entry in entries.values():
@@ -698,6 +710,7 @@ class RestoreStaffNamesTests(StaffTestCase):
               mock.patch.dict(os.environ, {"HERDR_PANE_RECORD_DIR": str(directory)}),
               mac_process_commands(self.root, process_responses),
               mock.patch.object(herdr, "Herdr", return_value=client),
+              mock.patch.object(worker_panes, "observe", return_value=[worker_panes.ClosedWorker(idle)]),
               mock.patch.object(herdr, "herdr_processes", return_value=[]),
               mock.patch.object(client, "order_tabs", wraps=client.order_tabs) as order,
               mock.patch.object(client, "assign_session", side_effect=assign_local_session),
@@ -711,11 +724,12 @@ class RestoreStaffNamesTests(StaffTestCase):
               redirect_stdout(output), redirect_stderr(output)):
             self.assertEqual(pane_restore.restore("agents", dry_run=False), 0, output.getvalue())
             self.assertEqual(len(pane_record.read("agents")), 3)
-        self.assertEqual(len(self.ssh_commands()), 8)
+        self.assertEqual(len(self.ssh_commands()), 6)
         self.assertTrue(all("--snapshot" in command for command in self.ssh_commands()))
         self.assertEqual(order.call_count, 2)
         self.assertEqual(started, ["renamed", "models"])
-        self.assertIn("impl1: closed; its next assign resumes it", output.getvalue())
+        self.assertNotIn(idle.name, started)
+        self.assertEqual(staff.by_id(idle.id), idle)
         self.assertEqual(sorted(title for _, titles in client.layout() for title in titles),
                          ["models", "old-worker-label", "renamed"])
 
@@ -743,26 +757,14 @@ class CodexPaneRestoreTests(FolderMoveFixture):
 
 
     @contextmanager
-    def replaced_codex_process(self, backend: FolderMoveBackend, *,
-                               rollout: Literal["current", "unreadable"] = "current") -> Generator[None]:
-        """Keep the old environment identity while the open rollout proves the current thread."""
+    def replaced_codex_process(self, backend: FolderMoveBackend) -> Generator[None]:
+        """Keep the old environment identity while resume arguments identify the current thread."""
         proc = self.root / "replaced-codex-proc"
         process = proc / str(backend.pid)
-        descriptors = process / "fd"
-        descriptors.mkdir(parents=True)
-        transcript = backend.config / "sessions" / f"rollout-{self.owner.current_session}.jsonl"
-        transcript.parent.mkdir(parents=True, exist_ok=True)
-        _ = transcript.write_text(json.dumps({"type": "session_meta", "payload": {
-            "id": self.owner.current_session}}) + "\n")
-        (descriptors / "7").symlink_to(transcript)
+        process.mkdir(parents=True)
         _ = (process / "cmdline").write_bytes(f"codex\0resume\0{self.owner.current_session}\0".encode())
         _ = (process / "environ").write_bytes(
             f"CODEX_THREAD_ID={self.owner.id}\0CODEX_HOME={backend.config}\0".encode())
-        if rollout == "unreadable":
-            (descriptors / "7").unlink()
-            descriptors.rmdir()
-            _ = descriptors.write_text("descriptor observation is unavailable\n")
-
         def environment(pid: int) -> dict[str, str]:
             self.assertEqual(pid, backend.pid)
             return {"CODEX_HOME": str(backend.config), "CODEX_THREAD_ID":
@@ -774,11 +776,6 @@ class CodexPaneRestoreTests(FolderMoveFixture):
             publish()
             _ = (process / "cmdline").write_bytes(
                 f"codex\0resume\0{self.owner.current_session}\0".encode() if backend.live else b"")
-            if rollout == "current":
-                descriptor = descriptors / "7"
-                descriptor.unlink(missing_ok=True)
-                if backend.live:
-                    descriptor.symlink_to(transcript)
 
         with (mock.patch.dict(os.environ, {"HERDR_PROC": str(proc)}),
               mock.patch.object(backend, "publish_process_state", side_effect=publish_process_state),
@@ -790,7 +787,7 @@ class CodexPaneRestoreTests(FolderMoveFixture):
     def retirement_evidence(self, backend: FolderMoveBackend, client: FakeClient, *,
                             current_pane: str = "w1:p3", stale_agent: bool = False,
                             shared_tab: bool = False, stopped: bool = False,
-                            rollout: bool = True, exported_claude_id: bool = True) -> Generator[None]:
+                            exported_claude_id: bool = True) -> Generator[None]:
         """Supply fresh process evidence for a replacement and its old shell."""
         for row in client.rows:
             pane = cast(str, row["pane_id"])
@@ -813,12 +810,6 @@ class CodexPaneRestoreTests(FolderMoveFixture):
                         *(["0"] * 13), "100"]
         _ = (shell_task.parent.parent / "stat").write_text(
             f"{backend.shell_pid} (zsh) {' '.join(shell_fields)}\n")
-        transcript = backend.config / f"rollout-{self.owner.current_session}.jsonl"
-        transcript.parent.mkdir(parents=True, exist_ok=True)
-        _ = transcript.write_text(json.dumps({"type": "session_meta", "payload": {
-            "id": self.owner.current_session}}) + "\n")
-        if rollout:
-            (descriptors / "7").symlink_to(transcript)
         registry = runtime_sessions.sessions_dir() / f"{backend.pid}.json"
         _ = registry.write_text(json.dumps({"pid": backend.pid, "procStart": "retirement-start",
             "sessionId": self.owner.current_session, "name": "kept-name", "updatedAt": 1,
@@ -914,10 +905,12 @@ class CodexPaneRestoreTests(FolderMoveFixture):
         self.assertEqual([entry["pane_id"] for entry in entries], ["w1:p3"])
 
 
-    def test_restore_liveness_uses_the_replaced_codex_thread_running_outside_herdr(self) -> None:
+    def test_restore_liveness_uses_the_replaced_codex_thread_reported_by_its_pane(self) -> None:
         backend = self.folder_backend("codex", live=True)
         client = FakeClient([{"pane_id": "w1:p1", "label": "kept-name", "workspace_id": "w1",
                               "agent_session": {"kind": "id", "value": self.owner.current_session}}])
+        client.process_info = {"foreground_processes": [
+            {"pid": backend.pid, "argv": ["codex", "resume", self.owner.current_session]}]}
         output = io.StringIO()
         with (self.replaced_codex_process(backend),
               mock.patch.object(herdr, "Herdr", return_value=client),
@@ -1051,7 +1044,6 @@ class CodexPaneRestoreTests(FolderMoveFixture):
         held_id = "019b3a40-4250-7000-8000-000000000199" if wrong_identity else self.owner.current_session
         published = False
         publishing = False
-        read_rollout = herdr.codex_rollout_thread
 
         def open_tab(session: str, space: str, name: str, cwd: str, environment: dict[str, str]) -> str:
             client.opened.append((session, space, name, cwd, environment.copy()))
@@ -1108,14 +1100,6 @@ class CodexPaneRestoreTests(FolderMoveFixture):
                 proof.append("start")
             return "changed-start" if reused_pid and proof.count("start") > 1 else "restore-start"
 
-        def rollout_process_birth(pid: int) -> str:
-            self.assertEqual(pid, backend.pid)
-            return "restore-start"
-
-        def rollout_thread(pid: int) -> str:
-            with mock.patch.object(herdr, "_process_birth", side_effect=rollout_process_birth):
-                return read_rollout(pid)
-
         def close(pane: str) -> None:
             FakeClient.close_tab_of(client, pane)
             if pane == "w1:p3":
@@ -1136,10 +1120,12 @@ class CodexPaneRestoreTests(FolderMoveFixture):
 
         with (mock.patch.dict(os.environ, {"HERDR_PROC": str(proc)}),
               mock.patch.object(herdr, "Herdr", return_value=client),
+              mock.patch.object(herdr, "herdr_places", side_effect=lambda: {
+                  backend.pid: herdr.HerdrPlace(client.session, "w1:p3")}),
+              mock.patch.object(herdr, "herdr_place_of", return_value=herdr.HerdrPlace(client.session, "w1:p3")),
               mock.patch.object(herdr, "open_tab", side_effect=open_tab),
               mock.patch.object(herdr, "run_program", side_effect=process_info),
               mock.patch.object(herdr, "process_environment", side_effect=environment),
-              mock.patch.object(herdr, "codex_rollout_thread", side_effect=rollout_thread),
               mock.patch.object(runtime_sessions, "process_start", side_effect=process_start),
               mock.patch.object(runtime_sessions, "session_liveness", return_value=runtime_sessions.SessionNotLive()),
               mock.patch.object(sessions, "running_sessions", return_value=[]),

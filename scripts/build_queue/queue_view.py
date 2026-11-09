@@ -18,6 +18,7 @@ from scripts.build_queue.queue_lines import Line, Span, age, clip, cut_tail, pla
 from scripts.lib.terminal_cells import pad_left, pad_right, terminal_width
 from scripts.lib import conf
 from scripts.lib.build_steps import StepNames, read_step_names
+from scripts.build_queue import admission_records
 from scripts.lint import memory_admit as gate
 from scripts.message.unit_labels import UnitLabels
 from scripts.message import unit_labels
@@ -42,9 +43,9 @@ class HostLoadUnavailable:
 
 @dataclass(frozen=True)
 class QueueModel:
-    reading: gate.QueueRead
+    reading: admission_records.QueueRead
     labels: Mapping[str, UnitLabels]
-    facts: head_facts.HeadFacts | gate.TokenWaitersOnly | gate.NoWaiter
+    facts: head_facts.HeadFacts | admission_records.TokenWaitersOnly | admission_records.NoWaiter
     pace: head_facts.RecordedPace | head_facts.PaceUnavailable
     zone: ZoneInfo
     load: HostLoad | HostLoadUnavailable
@@ -63,36 +64,36 @@ class QueueModel:
         return {**unit_labels.unit_labels_for(missing, os.environ), **self.labels} if missing else self.labels
 
 
-def same_waiter(left: gate.WaitingStep, right: gate.WaitingStep) -> bool:
+def same_waiter(left: admission_records.WaitingStep, right: admission_records.WaitingStep) -> bool:
     """Match a saved decision to its row even when display fields change."""
     return left.pid == right.pid and left.since == right.since
 
 
-def step_checks(model: QueueModel, position: int) -> gate.HeadExplanation | gate.LineWaiter | gate.ReadingUnavailable:
+def step_checks(model: QueueModel, position: int) -> admission_records.HeadExplanation | admission_records.LineWaiter | admission_records.ReadingUnavailable:
     explanation = model.reading.explanation
-    if isinstance(explanation.host, gate.ReadingUnavailable):
+    if isinstance(explanation.host, admission_records.ReadingUnavailable):
         return explanation.host
     step = model.reading.view.waiting[position - 1]
-    if isinstance(step.reason, gate.ReadingUnavailable):
+    if isinstance(step.reason, admission_records.ReadingUnavailable):
         return step.reason
-    if isinstance(explanation.head, gate.HeadExplanation) and same_waiter(explanation.head.waiter, step):
+    if isinstance(explanation.head, admission_records.HeadExplanation) and same_waiter(explanation.head.waiter, step):
         return explanation.head
     return next((item for item in explanation.line.steps if same_waiter(item.waiter, step)),
-                gate.ReadingUnavailable("step admission checks unavailable"))
+                admission_records.ReadingUnavailable("step admission checks unavailable"))
 
 
-def shown_waiters(selector: str, reading: gate.QueueRead, labels: Mapping[str, UnitLabels]) -> list[int]:
+def shown_waiters(selector: str, reading: admission_records.QueueRead, labels: Mapping[str, UnitLabels]) -> list[int]:
     return [position for position, step in enumerate(reading.view.waiting, 1)
             if step_labels(step, labels).session == selector]
 
 
-def running_matches_selector(step: gate.RunningStep, selector: str, labels: Mapping[str, UnitLabels]) -> bool:
+def running_matches_selector(step: admission_records.RunningStep, selector: str, labels: Mapping[str, UnitLabels]) -> bool:
     return (selector == step_labels(step, labels).session
             or gate.step_matches(selector, step)
-            or isinstance(step.measured, gate.UnownedSliceMemory) and selector == step.measured.owner)
+            or isinstance(step.measured, admission_records.UnownedSliceMemory) and selector == step.measured.owner)
 
 
-def name_spans(step: gate.WaitingStep | gate.RunningStep, labels: Mapping[str, UnitLabels],
+def name_spans(step: admission_records.WaitingStep | admission_records.RunningStep, labels: Mapping[str, UnitLabels],
                *, production: bool = True) -> Line:
     identity = step_labels(step, labels)
     seen: set[str] = set()
@@ -109,7 +110,7 @@ def name_spans(step: gate.WaitingStep | gate.RunningStep, labels: Mapping[str, U
     return tuple(parts)
 
 
-def name_text(step: gate.WaitingStep | gate.RunningStep, model: QueueModel) -> str:
+def name_text(step: admission_records.WaitingStep | admission_records.RunningStep, model: QueueModel) -> str:
     return plain([name_spans(step, model.labels)])
 
 
@@ -137,11 +138,11 @@ def is_moved(model: QueueModel, position: int) -> bool:
 
 
 def has_move_priority(model: QueueModel, position: int) -> bool:
-    return isinstance(gate.waiter_priority(model.reading.ordered[position - 1][1]), gate.PriorityUnit)
+    return isinstance(admission_records.waiter_priority(model.reading.ordered[position - 1][1]), admission_records.PriorityUnit)
 
 
-def pressure_check(pressure: gate.Pressure, model: QueueModel) -> tuple[bool, str]:
-    if isinstance(pressure, gate.NoPressureHold):
+def pressure_check(pressure: admission_records.Pressure, model: QueueModel) -> tuple[bool, str]:
+    if isinstance(pressure, admission_records.NoPressureHold):
         return True, "memory pressure: no hold"
     return False, queue_evidence.pressure_text(pressure, model.reading.explanation.policy)
 
@@ -150,9 +151,9 @@ def check_line(passes: bool, text: str) -> Line:
     return (Span("✓ " if passes else "✗ ", "success" if passes else "error"), Span(text))
 
 
-def check_lines(checks: gate.HeadExplanation | gate.LineWaiter | gate.ReadingUnavailable,
+def check_lines(checks: admission_records.HeadExplanation | admission_records.LineWaiter | admission_records.ReadingUnavailable,
                 model: QueueModel) -> list[Line]:
-    if isinstance(checks, gate.ReadingUnavailable):
+    if isinstance(checks, admission_records.ReadingUnavailable):
         return [(Span(reason_phrase(checks, model.reading.view.waiting)),)]
     return [check_line(checks.room.passes, queue_evidence.room_check_text(checks.room))]
 
@@ -176,33 +177,33 @@ def size_bar(gib: float, cap: float) -> str:
 
 def head_status(model: QueueModel) -> Line:
     head = model.reading.explanation.head
-    if not isinstance(head, gate.HeadExplanation):
+    if not isinstance(head, admission_records.HeadExplanation):
         return ()
     result: Line = (Span(" ↑", "warning" if head.has_priority else "success"),)
     cause = head.cause
-    if isinstance(cause, gate.MemoryPressure):
+    if isinstance(cause, admission_records.MemoryPressure):
         return (*result, Span(" pressure", "error"))
-    if isinstance(cause, gate.PressureUnavailable):
+    if isinstance(cause, admission_records.PressureUnavailable):
         return (*result, Span(" pressure unreadable", "error"))
-    if isinstance(cause, gate.StartSpacingWait):
+    if isinstance(cause, admission_records.StartSpacingWait):
         return (*result, Span(" spacing", "inactive"))
-    if isinstance(cause, gate.EstimateExpired):
+    if isinstance(cause, admission_records.EstimateExpired):
         return (*result, Span(" estimate expired", "error"))
-    if isinstance(cause, gate.ReadingUnavailable):
+    if isinstance(cause, admission_records.ReadingUnavailable):
         return (*result, Span(" " + cause.reason, "error"))
-    if isinstance(cause, gate.NeedsMemory):
+    if isinstance(cause, admission_records.NeedsMemory):
         return (*result, Span(" low room", "error"))
-    if isinstance(cause, gate.BehindHead):
+    if isinstance(cause, admission_records.BehindHead):
         return (*result, Span(" queue order", "inactive"))
     return result
 
 
-def cap_bar(room: gate.MemoryRoom | gate.ReadingUnavailable, width: int, *, colour: bool) -> Line:
+def cap_bar(room: admission_records.MemoryRoom | admission_records.ReadingUnavailable, width: int, *, colour: bool) -> Line:
     """Draw captured use, keep-aside, room, safety, and other programs."""
-    if not isinstance(room, gate.MemoryRoom) or not isinstance(room.cap, int):
+    if not isinstance(room, admission_records.MemoryRoom) or not isinstance(room.cap, int):
         return (Span("cap unavailable", "inactive"),)
     total = room.total if isinstance(room.total, int) else max(1, room.cap + room.safety)
-    cells = max(1, min(width, (total + gate.GIB - 1) // gate.GIB))
+    cells = max(1, min(width, (total + admission_records.GIB - 1) // admission_records.GIB))
     scale = total / cells
     cap_at = min(cells - 1, max(0, int(room.cap / scale)))
     used = room.cap_use
@@ -227,7 +228,7 @@ def cap_bar(room: gate.MemoryRoom | gate.ReadingUnavailable, width: int, *, colo
 
 @dataclass(frozen=True)
 class RunningBuild:
-    step: gate.RunningStep
+    step: admission_records.RunningStep
     used: int
     kept: int
     started_at: float
@@ -235,61 +236,61 @@ class RunningBuild:
     swap_bytes: int = 0
 
 
-def anonymous_measurement(use: gate.AnonymousRunUse | gate.RunUseUnavailable) -> tuple[int, bool]:
+def anonymous_measurement(use: admission_records.AnonymousRunUse | admission_records.RunUseUnavailable) -> tuple[int, bool]:
     """Show the captured amount and whether its reading is available."""
-    return (use.bytes, True) if isinstance(use, gate.AnonymousRunUse) else (0, False)
+    return (use.bytes, True) if isinstance(use, admission_records.AnonymousRunUse) else (0, False)
 
 
 def running_builds(model: QueueModel) -> list[RunningBuild]:
     """Combine captured keep-asides and scope evidence for each run."""
     explanation = model.reading.explanation
     captured = explanation.room
-    holds = {hold.memory.owner: hold for hold in captured.runs} if isinstance(captured, gate.MemoryRoom) else {}
+    holds = {hold.memory.owner: hold for hold in captured.runs} if isinstance(captured, admission_records.MemoryRoom) else {}
     rows: dict[str, RunningBuild] = {}
     for index, running in enumerate(model.reading.explanation.running):
         step = running.step
         memory = step.measured
-        if isinstance(memory, (gate.GoneMemory, gate.CompilerServiceMemory, gate.UnownedSliceMemory)):
+        if isinstance(memory, (admission_records.GoneMemory, admission_records.CompilerServiceMemory, admission_records.UnownedSliceMemory)):
             continue
-        key = gate.run_owner(step.run.pid, step.run.start_time) if isinstance(step.run, LiveBuildRun) else str(index)
+        key = admission_records.run_owner(step.run.pid, step.run.start_time) if isinstance(step.run, LiveBuildRun) else str(index)
         started = step.run.started_at if isinstance(step.run, LiveBuildRun) else step.started_at
         if not started and isinstance(running.admitted_at, float):
             started = running.admitted_at
         previous = rows.get(key)
-        used = (memory.anonymous.bytes if isinstance(memory, gate.MeasuredMemory)
-                and isinstance(memory.anonymous, gate.AnonymousRunUse) else 0)
-        measured = isinstance(memory, gate.MeasuredMemory) and isinstance(memory.anonymous, gate.AnonymousRunUse)
+        used = (memory.anonymous.bytes if isinstance(memory, admission_records.MeasuredMemory)
+                and isinstance(memory.anonymous, admission_records.AnonymousRunUse) else 0)
+        measured = isinstance(memory, admission_records.MeasuredMemory) and isinstance(memory.anonymous, admission_records.AnonymousRunUse)
         hold = holds.get(running.owner)
         if hold is not None and not isinstance(step.run, LiveBuildRun):
             used, measured = anonymous_measurement(hold.memory.use)
         kept = hold.bytes if hold is not None and not isinstance(step.run, LiveBuildRun) else 0
         if previous is None:
             rows[key] = RunningBuild(step, used, kept, started, measured,
-                                      memory.swap_bytes if isinstance(memory, gate.MeasuredMemory) else 0)
+                                      memory.swap_bytes if isinstance(memory, admission_records.MeasuredMemory) else 0)
         else:
             chosen = step if step.promise and not previous.step.promise else previous.step
             rows[key] = RunningBuild(chosen, previous.used + used, previous.kept + kept,
                                      previous.started_at or started, previous.measured and measured,
-                                     previous.swap_bytes + (memory.swap_bytes if isinstance(memory, gate.MeasuredMemory) else 0))
-    if isinstance(captured, gate.MemoryRoom):
+                                     previous.swap_bytes + (memory.swap_bytes if isinstance(memory, admission_records.MeasuredMemory) else 0))
+    if isinstance(captured, admission_records.MemoryRoom):
         for key, row in rows.items():
             if not isinstance(row.step.run, LiveBuildRun):
                 continue
-            hold = holds.get(gate.run_owner(row.step.run.pid, row.step.run.start_time))
+            hold = holds.get(admission_records.run_owner(row.step.run.pid, row.step.run.start_time))
             if hold is not None:
                 used, measured = anonymous_measurement(hold.memory.use)
                 rows[key] = RunningBuild(row.step, used, hold.bytes, row.started_at, measured, row.swap_bytes)
-        owners = {gate.run_owner(row.step.run.pid, row.step.run.start_time) for row in rows.values()
+        owners = {admission_records.run_owner(row.step.run.pid, row.step.run.start_time) for row in rows.values()
                   if isinstance(row.step.run, LiveBuildRun)}
         owners.update(entry.owner for entry in explanation.running
-                      if not isinstance(entry.step.measured, gate.UnownedSliceMemory))
+                      if not isinstance(entry.step.measured, admission_records.UnownedSliceMemory))
         for hold in captured.runs:
             run = hold.memory.run
             if hold.memory.owner in owners or not isinstance(run, LiveBuildRun):
                 continue
             used, measured = anonymous_measurement(hold.memory.use)
-            step = gate.RunningStep("", "", "between steps", "", 0, gate.MeasuredMemory(used), pid=run.pid, run=run)
-            rows[gate.run_owner(run.pid, run.start_time)] = RunningBuild(step, used, hold.bytes, 0.0, measured)
+            step = admission_records.RunningStep("", "", "between steps", "", 0, admission_records.MeasuredMemory(used), pid=run.pid, run=run)
+            rows[admission_records.run_owner(run.pid, run.start_time)] = RunningBuild(step, used, hold.bytes, 0.0, measured)
     return list(rows.values())
 
 
@@ -318,11 +319,11 @@ def leftover_age(minutes: int) -> str:
     return f"{minutes // (24 * 60)} d"
 
 
-def leftover_processes(steps: Sequence[gate.RunningStep]) -> list[tuple[gate.RunningStep, gate.UnownedSliceMemory, ScopeProcesses]]:
+def leftover_processes(steps: Sequence[admission_records.RunningStep]) -> list[tuple[admission_records.RunningStep, admission_records.UnownedSliceMemory, ScopeProcesses]]:
     """Return the process scopes whose builds have ended."""
-    ended: list[tuple[gate.RunningStep, gate.UnownedSliceMemory, ScopeProcesses]] = []
+    ended: list[tuple[admission_records.RunningStep, admission_records.UnownedSliceMemory, ScopeProcesses]] = []
     for step in steps:
-        if not isinstance(step.measured, gate.UnownedSliceMemory):
+        if not isinstance(step.measured, admission_records.UnownedSliceMemory):
             continue
         activity = step.measured.activity
         if not isinstance(step.measured.job_state, NotServiceSlice):
@@ -365,7 +366,7 @@ def cloud_lines(model: QueueModel, columns: int, rows: tuple[wire.CloudRow, ...]
     all_rows = cloud_rows(model)
     if not all_rows or not isinstance(reading, wire.CloudQueueRead):
         return []
-    used = sum(isinstance(row.wait, gate.ReadyForAdmission) for row in all_rows)
+    used = sum(isinstance(row.wait, admission_records.ReadyForAdmission) for row in all_rows)
     lines: list[Line] = [(Span(f"Cloud · {used} of {reading.cloud_slots} slots", bold=True),)]
     interval = cloud_push_interval()
     now = reading.explanation.now
@@ -383,7 +384,7 @@ def cloud_lines(model: QueueModel, columns: int, rows: tuple[wire.CloudRow, ...]
                    if isinstance(counter, progress_profile.ProgressCounter) else "modules unknown")
         size = f"{progress.size_vcpus} vCPUs" if isinstance(progress, cloud_progress.CloudProgress) else "vCPUs unknown"
         elapsed = leftover_age(age(row.started_at or row.since, now))
-        text = f"{field(unit)} · {field(identity.step)} · {state} · {modules} · {size} · elapsed {elapsed}"
+        text = f"{field(unit)} · {field(model.names.shown(identity.step))} · {state} · {modules} · {size} · elapsed {elapsed}"
         if isinstance(progress, cloud_progress.CloudProgress):
             if progress.failed_modules:
                 noun = "module" if progress.failed_modules == 1 else "modules"
@@ -402,13 +403,13 @@ def render_view(model: QueueModel, columns: int, *, colour: bool = False, you: s
     explanation = model.reading.explanation
     head = explanation.head
     room = explanation.room
-    cap_bytes = room.cap if isinstance(room, gate.MemoryRoom) and isinstance(room.cap, int) else 0
-    cap = cap_bytes / gate.GIB
+    cap_bytes = room.cap if isinstance(room, admission_records.MemoryRoom) and isinstance(room.cap, int) else 0
+    cap = cap_bytes / admission_records.GIB
     waiting = model.reading.view.waiting
     running = running_builds(model)
-    bumped_unit = "" if isinstance(explanation.priority, gate.NoQueuePriority) else explanation.priority["unit"]
+    bumped_unit = "" if isinstance(explanation.priority, admission_records.NoQueuePriority) else explanation.priority["unit"]
 
-    def names(step: gate.WaitingStep | gate.RunningStep) -> tuple[str, str, bool]:
+    def names(step: admission_records.WaitingStep | admission_records.RunningStep) -> tuple[str, str, bool]:
         identity = step_labels(step, model.labels)
         show = field(step.session_name if not step.session_id and step.unit else identity.showrunner) or "—"
         unit = field(identity.unit).removeprefix(show + "-")
@@ -418,12 +419,12 @@ def render_view(model: QueueModel, columns: int, *, colour: bool = False, you: s
     waiting_names = [names(step) for step in waiting]
     running_names = [names(row.step) for row in running]
     all_names = [*waiting_names, *running_names]
-    bars = [size_bar(step.need / gate.GIB, cap) for step in waiting]
+    bars = [size_bar(step.need / admission_records.GIB, cap) for step in waiting]
     status = head_status(model)
     waiting_status = [
         (Span(" " + reason_phrase(step.reason, waiting), "error"),)
-        if isinstance(step.reason, gate.ReadingUnavailable) else
-        status if isinstance(head, gate.HeadExplanation) and same_waiter(head.waiter, step) else ()
+        if isinstance(step.reason, admission_records.ReadingUnavailable) else
+        status if isinstance(head, admission_records.HeadExplanation) and same_waiter(head.waiter, step) else ()
         for step in waiting]
     place_width = max(3, len(str(len(waiting))))
     minutes_width = max(3, max((len(str(age(step.since, explanation.now))) for step in waiting), default=0),
@@ -462,16 +463,16 @@ def render_view(model: QueueModel, columns: int, *, colour: bool = False, you: s
     machine_cells = machine_width + 1 if machine_width else 0
     bar_column = fixed + show_width + unit_width + pid_width + 1 + machine_cells
     running_text = [
-        (f" {row.kept / gate.GIB:.1f} / {row.used / gate.GIB:.1f}" if row.measured
-         else f" {row.kept / gate.GIB:.1f} / —")
-        + (f"; {row.swap_bytes / gate.GIB:.1f} GiB swapped" if row.swap_bytes else "")
+        (f" {row.kept / admission_records.GIB:.1f} / {row.used / admission_records.GIB:.1f}" if row.measured
+         else f" {row.kept / admission_records.GIB:.1f} / —")
+        + (f"; {row.swap_bytes / admission_records.GIB:.1f} GiB swapped" if row.swap_bytes else "")
         for row in running]
     number_width = max(
         max((terminal_width(text) for text in running_text), default=0),
-        max((len(f" {step.need / gate.GIB:.1f}") + terminal_width(plain([suffix]))
+        max((len(f" {step.need / admission_records.GIB:.1f}") + terminal_width(plain([suffix]))
              for step, suffix in zip(waiting, waiting_status)), default=0))
     bar_width = max(0, columns - bar_column - number_width)
-    cap_label = f"cap {cap:.1f}" if isinstance(room, gate.MemoryRoom) and isinstance(room.cap, int) else "cap unavailable"
+    cap_label = f"cap {cap:.1f}" if isinstance(room, admission_records.MemoryRoom) and isinstance(room.cap, int) else "cap unavailable"
     memory_bar = cap_bar(room, max(1, columns - bar_column), colour=colour)
     cap_cell = next((index for index, span in enumerate(memory_bar) if span.text == "│"), 0)
     lines: list[Line] = [
@@ -519,8 +520,8 @@ def render_view(model: QueueModel, columns: int, *, colour: bool = False, you: s
     lines.extend(wrap((Span(queue_evidence.room_text(explanation.room), "inactive"),), columns))
     lines.append(heading())
     for index, (row, pair, text) in enumerate(zip(running, running_names, running_text)):
-        used = row.used / gate.GIB
-        held_end = used + row.kept / gate.GIB
+        used = row.used / admission_records.GIB
+        held_end = used + row.kept / admission_records.GIB
         bar = running_bar(min(used, bar_width), min(held_end, bar_width), cap)
         minutes = str(age(row.started_at, explanation.now)) if row.started_at else "—"
         append_row((*identity_columns("run", queue_lines.step_text(row.step, model.names), pair, minutes,
@@ -533,18 +534,18 @@ def render_view(model: QueueModel, columns: int, *, colour: bool = False, you: s
         row = (*identity_columns(str(index + 1), queue_lines.step_text(step, model.names), pair, str(age(step.since, explanation.now)),
                                 "▸" if you and step.session_id == you else " "),
                *((Span(" " * machine_cells),) if machine_width else ()),
-               Span(column(pids[index], pid_width), "inactive"), Span(bar[:bar_width], "warning"), Span(f" {step.need / gate.GIB:.1f}", "warning" if isinstance(head, gate.HeadExplanation) and same_waiter(head.waiter, step) else "inactive"))
+               Span(column(pids[index], pid_width), "inactive"), Span(bar[:bar_width], "warning"), Span(f" {step.need / admission_records.GIB:.1f}", "warning" if isinstance(head, admission_records.HeadExplanation) and same_waiter(head.waiter, step) else "inactive"))
         append_row((*row, *suffix))
-    if isinstance(head, gate.TokenWaitersOnly):
+    if isinstance(head, admission_records.TokenWaitersOnly):
         lines.extend([(), (Span("All waiting steps are waiting for the cargo token."),)])
-    if isinstance(head, gate.HeadExplanation) and head.decision.state == "hold":
-        lines.append((Span(f"Head: free {head.free.available / gate.GIB:.1f} GiB; "
-            + f"reserve {head.free.reserve / gate.GIB:.1f} GiB; need {head.free.need / gate.GIB:.1f} GiB"),))
-    if isinstance(head, gate.HeadExplanation) and isinstance(head.cause, (gate.PressureUnavailable, gate.ReadingUnavailable)):
+    if isinstance(head, admission_records.HeadExplanation) and head.decision.state == "hold":
+        lines.append((Span(f"Head: free {head.free.available / admission_records.GIB:.1f} GiB; "
+            + f"reserve {head.free.reserve / admission_records.GIB:.1f} GiB; need {head.free.need / admission_records.GIB:.1f} GiB"),))
+    if isinstance(head, admission_records.HeadExplanation) and isinstance(head.cause, (admission_records.PressureUnavailable, admission_records.ReadingUnavailable)):
         append_row((Span("Head: " + head.cause.reason, "error"),))
     services = [step.measured for step in model.reading.view.running
-                if isinstance(step.measured, gate.CompilerServiceMemory)
-                or isinstance(step.measured, gate.UnownedSliceMemory)
+                if isinstance(step.measured, admission_records.CompilerServiceMemory)
+                or isinstance(step.measured, admission_records.UnownedSliceMemory)
                 and not isinstance(step.measured.job_state, NotServiceSlice)]
     if services:
         lines.extend([(), (Span("Services", bold=True),)])
@@ -555,15 +556,15 @@ def render_view(model: QueueModel, columns: int, *, colour: bool = False, you: s
         count = sum(activity.count for _, _, activity in ended)
         total = sum(memory.bytes for _, memory, _ in ended)
         noun = "process" if count == 1 else "processes"
-        lines.extend([(), (Span(f"Still running after their build ended ({count} {noun}, {total / gate.GIB:.1f} GiB)",
+        lines.extend([(), (Span(f"Still running after their build ended ({count} {noun}, {total / admission_records.GIB:.1f} GiB)",
                                bold=True),),
                       (Span("These processes outlive their builds; ask the named owner to stop them if no longer needed."),)])
         for step, memory, activity in ended:
             identity = model.labels.get(activity.session_id)
             owner = field(identity.session if identity else "") or field(activity.session_name) or "unlabelled session"
             elapsed = leftover_age(age(activity.started_at, explanation.now)) if activity.started_at else "—"
-            lines.append((Span(f"   {queue_evidence.step_pid_text(step)} · {owner} · {field(activity.program)} · {elapsed} · {memory.bytes / gate.GIB:.1f} GiB"
-                              + (f"; {memory.swap_bytes / gate.GIB:.1f} GiB swapped" if memory.swap_bytes else "")),))
+            lines.append((Span(f"   {queue_evidence.step_pid_text(step)} · {owner} · {field(activity.program)} · {elapsed} · {memory.bytes / admission_records.GIB:.1f} GiB"
+                              + (f"; {memory.swap_bytes / admission_records.GIB:.1f} GiB swapped" if memory.swap_bytes else "")),))
             for member in activity.members[1:]:
                 lines.append((Span(f"   pid {member.pid} · {field(member.program)} · {owner}"),))
     cloud = cloud_lines(model, columns)

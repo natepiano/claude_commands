@@ -6,7 +6,6 @@ from scripts.herdr import worker_panes
 from scripts.herdr.test_worker_panes import PaneWorld
 
 import io
-import json
 import os
 import unittest
 from contextlib import redirect_stderr
@@ -60,7 +59,7 @@ class StaffSourcesTests(StaffTestCase):
         world.add(rows[3], "w1:p4")
         config = self.root / "config"
         config.mkdir()
-        write_text_atomic(config / "direct.conf", "# one of: mesh, herdr\nWORKER_TRANSPORT=herdr\n")
+        write_text_atomic(config / "direct.conf", "# Worker settings.\n")
         before = self.staff_file.read_bytes()
         with (mock.patch.dict(os.environ, {"CONF_DIR": str(config), "ROSTER_RUN_ROOT": str(self.root / "runs")}),
               mock.patch.object(worker_panes, "_client", return_value=world),
@@ -85,34 +84,7 @@ class StaffSourcesTests(StaffTestCase):
             self.assertIn("unknown: process read denied", cast(list[str], document["problems"]))
             self.assertFalse(document["complete"])
             self.assertEqual(self.staff_file.read_bytes(), before)
-            self.assertEqual(list((self.root / "runs").glob("**/worker_transport*")), [])
 
-    def test_live_reports_a_bad_run_pin_and_keeps_mesh_members(self) -> None:
-        fixture = self.row_production()
-        _ = self.session_record(fixture.unit.current_session, fixture.unit.name)
-        worker = fixture_worker("mesh-worker", fixture.unit.id)
-        run = self.root / "runs/pinned"
-        run.mkdir(parents=True)
-        write_text_atomic(run / "mesh_roster.json", json.dumps({"mesh-worker": {"staff_id": worker.id}}))
-        pin = run / "worker_transport"
-        for failure in ("invalid", "unreadable"):
-            with self.subTest(failure=failure):
-                if failure == "invalid":
-                    write_text_atomic(pin, "junk\n")
-                else:
-                    pin.unlink()
-                    pin.mkdir()
-                with (mock.patch.dict(os.environ, {"ROSTER_RUN_ROOT": str(run.parent)}),
-                      redirect_stderr(io.StringIO()) as errors):
-                    document = staff_sources.live()
-                self.assertFalse(document["complete"])
-                self.assertIn(str(pin), errors.getvalue())
-                problems = cast(list[str], document["problems"])
-                self.assertTrue(any(str(pin) in problem for problem in problems), problems)
-                if failure == "invalid":
-                    self.assertTrue(any("junk" in problem for problem in problems), problems)
-                members = cast(list[dict[str, object]], document["members"])
-                self.assertIn(worker.id, [member["id"] for member in members])
 
     def test_live_reports_unreadable_owner_and_record_without_an_empty_member_list(self) -> None:
         _ = self.row_production()
@@ -170,9 +142,6 @@ class StaffSourcesTests(StaffTestCase):
     @override
     def setUp(self) -> None:
         super().setUp()
-        # Synthetic processes have no open rollout unless the test supplies one.
-        _ = self.enterContext(mock.patch.object(herdr, "codex_rollout_thread",
-                                                side_effect=herdr.NoOpenCodexRollout("no open rollout")))
         # Keep the host's scratch policy, with a private root for this fixture.
         _ = self.enterContext(mock.patch.object(showrunners, "SCRATCH_ROOT", self.root / "scratch-checkout"))
 
@@ -401,36 +370,36 @@ class StaffSourcesTests(StaffTestCase):
             ])
             staff_sources.require_worker_stopped(staff.snapshot(), worker.id)
 
-    def test_current_rollout_overrides_resume_and_does_not_block_the_old_thread(self) -> None:
+    def test_resume_argument_overrides_an_inherited_thread_and_does_not_block_the_old_thread(self) -> None:
         from scripts.message import process_table
 
         owner = unit_membership("show", "unit")
         old = fixture_worker("old", owner.id, backend=staff.CodexBackend(self.root / "codex"))
         current = fixture_worker("current", owner.id, backend=staff.CodexBackend(self.root / "codex"))
-        table = {42401: process_table.Process(42401, 1, "codex", f"codex resume {old.current_session}")}
+        process = self.root / "proc/42401"
+        process.mkdir(parents=True)
         record = staff.snapshot()
-        with (mock.patch.object(herdr, "codex_rollout_thread", return_value=current.current_session),
-              mock.patch.object(herdr, "codex_resume_thread", return_value=old.current_session) as resume,
-              mock.patch.object(herdr, "process_environment", return_value={"CODEX_THREAD_ID": old.current_session}),
-              mock.patch.object(process_table, "snapshot", return_value=table),
-              mock.patch.object(session_staff, "member_sources", return_value=MemberSources(()))):
-            reader = staff_sources.CodexProcessThreads()
-            self.assertEqual(reader.thread(42401, {"CODEX_THREAD_ID": old.current_session}), current.current_session)
-            staff_sources.require_worker_stopped(record, old.id)
-            with self.assertRaises(staff.StaffRefused):
-                staff_sources.require_worker_stopped(record, current.id)
-        resume.assert_not_called()
-
-    def test_unreadable_open_rollout_never_uses_a_lower_identity_source(self) -> None:
-        for failure in (PermissionError("rollout denied"), ValueError("rollout ambiguous"),
-                        herdr.HerdrFailure("rollout read failed")):
-            with (self.subTest(failure=type(failure).__name__),
-                  mock.patch.object(herdr, "codex_rollout_thread", side_effect=failure),
-                  mock.patch.object(herdr, "codex_resume_thread") as resume,
-                  mock.patch.object(herdr, "herdr_place_of") as place):
-                self.assertEqual(staff_sources.CodexProcessThreads().thread(42401, {"CODEX_THREAD_ID": "old"}), "")
-            resume.assert_not_called()
-            place.assert_not_called()
+        environment = {"CODEX_THREAD_ID": old.current_session}
+        for evidence in ("resume", "another foreground process", "herdr read failure"):
+            with self.subTest(evidence=evidence):
+                arguments = ["codex", "resume", current.current_session] if evidence == "resume" else ["codex"]
+                write_text_atomic(process / "cmdline", "\0".join(arguments) + "\0")
+                table = {42401: process_table.Process(42401, 1, "codex", " ".join(arguments))}
+                with (mock.patch.dict(os.environ, {"HERDR_PROC": str(process.parent), "HERDR_PLATFORM": "linux"}),
+                      mock.patch.object(herdr, "process_environment", return_value=environment),
+                      mock.patch.object(herdr, "herdr_place_of", return_value=herdr.HerdrPlace("agents", "test:pane"),
+                          side_effect=herdr.HerdrFailure("pane read failed") if evidence == "herdr read failure" else None),
+                      mock.patch.object(herdr.Herdr, "result", return_value={"process_info": {
+                          "foreground_processes": [{"pid": 42402, "argv": ["codex"]}]}}),
+                      mock.patch.object(process_table, "snapshot", return_value=table),
+                      mock.patch.object(session_staff, "member_sources", return_value=MemberSources(()))):
+                    reader = staff_sources.CodexProcessThreads()
+                    expected = current.current_session if evidence == "resume" else old.current_session
+                    self.assertEqual(reader.thread(42401, environment), expected)
+                    if evidence == "resume":
+                        staff_sources.require_worker_stopped(record, old.id)
+                        with self.assertRaises(staff.StaffRefused):
+                            staff_sources.require_worker_stopped(record, current.id)
 
     def test_resumed_codex_session_without_a_staff_row_is_quiet(self) -> None:
         from scripts.message import process_table
