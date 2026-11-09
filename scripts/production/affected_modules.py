@@ -1,4 +1,4 @@
-"""Select tests from direct imports, path references and changed Python folders.
+"""Select tests from direct Python imports and transitive configuration reads.
 
 No source is imported or evaluated. Callers own certification and execution.
 """
@@ -60,8 +60,18 @@ def git_output(repo: Path, *arguments: str) -> str:
 
 # Bump the extractor version whenever source-fact semantics change.
 CACHE_FORMAT_VERSION = 2
-EXTRACTOR_VERSION = 4
+EXTRACTOR_VERSION = 6
 PATH_TOKEN = re.compile(r"[A-Za-z0-9_.\-/]+")
+
+
+@dataclass(frozen=True)
+class ValidPython:
+    pass
+
+
+@dataclass(frozen=True)
+class InvalidPython:
+    message: str
 
 
 @dataclass(frozen=True)
@@ -69,18 +79,55 @@ class SourceFacts:
     # Relative imports retain their level until resolved from the current path.
     imports: tuple[tuple[int, str, tuple[str, ...]], ...]
     tokens: frozenset[str]
+    config_reads: frozenset[str]
+    syntax: ValidPython | InvalidPython = ValidPython()
+
+
+@dataclass(frozen=True)
+class SourceGraph:
+    imports: dict[str, set[str]]
+    tokens: dict[str, frozenset[str]]
+    config_reads: dict[str, frozenset[str]]
 
 
 def extract_facts(text: str, path: str) -> SourceFacts:
-    tree = ast.parse(text, filename=path)
+    tokens = frozenset(match.group().removeprefix("./") for match in PATH_TOKEN.finditer(text))
+    config_reads = {Path(token).name.removesuffix(".conf") for token in tokens if token.endswith(".conf")}
+    try:
+        tree = ast.parse(text, filename=path)
+    except SyntaxError as error:
+        return SourceFacts((), tokens, frozenset(config_reads), InvalidPython(error.msg))
     imports: list[tuple[int, str, tuple[str, ...]]] = []
+    conf_modules: set[str] = set()
+    conf_functions: set[str] = set()
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             imports.extend((0, alias.name, ()) for alias in node.names)
+            conf_modules.update(alias.asname or alias.name for alias in node.names
+                                if alias.name in {"conf", "scripts.lib.conf"})
         elif isinstance(node, ast.ImportFrom):
             imports.append((node.level, node.module or "", tuple(alias.name for alias in node.names)))
-    return SourceFacts(tuple(imports), frozenset(match.group().removeprefix("./")
-                                               for match in PATH_TOKEN.finditer(text)))
+            if not node.level and node.module == "scripts.lib":
+                conf_modules.update(alias.asname or alias.name for alias in node.names if alias.name == "conf")
+            elif not node.level and node.module == "scripts.lib.conf":
+                conf_functions.update(alias.asname or alias.name for alias in node.names)
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call) or not node.args:
+            continue
+        function = node.func
+        reader = isinstance(function, ast.Name) and function.id in conf_functions
+        if isinstance(function, ast.Attribute):
+            parts: list[str] = []
+            module = function.value
+            while isinstance(module, ast.Attribute):
+                parts.append(module.attr)
+                module = module.value
+            if isinstance(module, ast.Name):
+                reader = ".".join((module.id, *reversed(parts))) in conf_modules
+        first = node.args[0]
+        if reader and isinstance(first, ast.Constant) and isinstance(first.value, str):
+            config_reads.add(Path(first.value).name.removesuffix(".conf"))
+    return SourceFacts(tuple(imports), tokens, frozenset(config_reads))
 
 
 def indexed_files(repo: Path) -> tuple[set[str], dict[str, str]]:
@@ -104,9 +151,13 @@ def decoded_facts(value: object) -> SourceFacts:
     if not isinstance(value, dict):
         raise ValueError("invalid source facts")
     row = cast(dict[str, object], value)
-    imports, tokens = row.get("imports"), row.get("tokens")
+    imports, tokens, config_reads = row.get("imports"), row.get("tokens"), row.get("config_reads")
+    syntax_error = row.get("syntax_error")
     if (not isinstance(imports, list) or not isinstance(tokens, list)
-            or not all(isinstance(token, str) for token in cast(list[object], tokens))):
+            or not all(isinstance(token, str) for token in cast(list[object], tokens))
+            or not isinstance(config_reads, list)
+            or not all(isinstance(name, str) for name in cast(list[object], config_reads))
+            or syntax_error is not None and not isinstance(syntax_error, str)):
         raise ValueError("invalid source facts fields")
     decoded: list[tuple[int, str, tuple[str, ...]]] = []
     for item in cast(list[object], imports):
@@ -118,7 +169,8 @@ def decoded_facts(value: object) -> SourceFacts:
                 or not all(isinstance(name, str) for name in cast(list[object], names))):
             raise ValueError("invalid source import fields")
         decoded.append((level, module, tuple(cast(list[str], names))))
-    return SourceFacts(tuple(decoded), frozenset(cast(list[str], tokens)))
+    syntax = InvalidPython(syntax_error) if isinstance(syntax_error, str) else ValidPython()
+    return SourceFacts(tuple(decoded), frozenset(cast(list[str], tokens)), frozenset(cast(list[str], config_reads)), syntax)
 
 
 def read_fact_cache(path: Path) -> dict[str, SourceFacts]:
@@ -145,7 +197,9 @@ def write_fact_cache(path: Path, facts: dict[str, SourceFacts]) -> None:
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         value = {"format": CACHE_FORMAT_VERSION, "extractor": EXTRACTOR_VERSION,
-                 "blobs": {blob: {"imports": entry.imports, "tokens": sorted(entry.tokens)}
+                 "blobs": {blob: {"imports": entry.imports, "tokens": sorted(entry.tokens),
+                                  "config_reads": sorted(entry.config_reads),
+                                  "syntax_error": entry.syntax.message if isinstance(entry.syntax, InvalidPython) else None}
                            for blob, entry in facts.items()}}
         with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent, delete=False) as output:
             temporary = Path(output.name)
@@ -202,17 +256,18 @@ def worktree_files(repo: Path, dirty: set[str]) -> tuple[set[str], dict[str, str
 
 def graph_for_files(repo: Path, paths: set[str], blobs: dict[str, str], dirty: set[str],
                     cached: dict[str, SourceFacts], *, worktree: bool
-                    ) -> tuple[dict[str, set[str]], dict[str, frozenset[str]]]:
+                    ) -> SourceGraph:
     bare_modules: dict[str, set[str]] = defaultdict(set)
     for path in paths:
         name = Path(path).parent.name if Path(path).name == "__init__.py" else Path(path).stem
         bare_modules[name].add(path)
-    sources = sorted(path for path in paths if is_test_module(path))
+    sources = sorted(paths)
     missing = {blobs[path] for path in sources if path in blobs and blobs[path] not in cached}
     texts = blob_texts(repo, missing) if not worktree and missing else {}
     external = set(sys.stdlib_module_names) | set(packages_distributions())
     graph: dict[str, set[str]] = {}
     tokens: dict[str, frozenset[str]] = {}
+    config_reads: dict[str, frozenset[str]] = {}
     for path in sources:
         blob = blobs.get(path) if path not in dirty else None
         facts = cached.get(blob) if blob is not None else None
@@ -221,7 +276,10 @@ def graph_for_files(repo: Path, paths: set[str], blobs: dict[str, str], dirty: s
             facts = extract_facts(text, path)
             if blob is not None:
                 cached[blob] = facts
+        if isinstance(facts.syntax, InvalidPython) and is_test_module(path):
+            raise SyntaxError(f"{facts.syntax.message} ({path})")
         tokens[path] = facts.tokens
+        config_reads[path] = facts.config_reads
         dependencies: set[str] = set()
         for level, module, names in facts.imports:
             if level:
@@ -235,7 +293,24 @@ def graph_for_files(repo: Path, paths: set[str], blobs: dict[str, str], dirty: s
                         dependencies.update(bare_modules.get(root, set()))
         dependencies.discard(path)
         graph[path] = dependencies
-    return graph, tokens
+    return SourceGraph(graph, tokens, config_reads)
+
+
+def transitive_config_reads(graph: SourceGraph) -> dict[str, set[str]]:
+    importers: dict[str, set[str]] = defaultdict(set)
+    for path, dependencies in graph.imports.items():
+        for dependency in dependencies:
+            importers[dependency].add(path)
+    reads = {path: set(names) for path, names in graph.config_reads.items()}
+    pending = [path for path, names in reads.items() if names]
+    while pending:
+        source = pending.pop()
+        for importer in importers[source]:
+            added = reads[source] - reads[importer]
+            if added:
+                reads[importer].update(added)
+                pending.append(importer)
+    return reads
 
 
 def retain_facts(cache_path: Path | None, cached: dict[str, SourceFacts],
@@ -245,8 +320,8 @@ def retain_facts(cache_path: Path | None, cached: dict[str, SourceFacts],
         write_fact_cache(cache_path, current)
 
 
-def test_blobs(paths: set[str], blobs: dict[str, str]) -> set[str]:
-    return {blob for path, blob in blobs.items() if path in paths and is_test_module(path)}
+def source_blobs(paths: set[str], blobs: dict[str, str]) -> set[str]:
+    return {blob for path, blob in blobs.items() if path in paths}
 
 
 def dependency_graph(repo: Path, *, state_dir: Path | None = None
@@ -257,8 +332,8 @@ def dependency_graph(repo: Path, *, state_dir: Path | None = None
     cached = read_fact_cache(cache_path) if cache_path is not None else {}
     before = set(cached)
     result = graph_for_files(repo, paths, blobs, dirty, cached, worktree=True)
-    retain_facts(cache_path, cached, before, test_blobs(paths | dirty, blobs))
-    return result
+    retain_facts(cache_path, cached, before, source_blobs(paths | dirty, blobs))
+    return result.imports, result.tokens
 
 
 def select_affected(repo: Path, base: CertifiedBase | NoCertifiedBase,
@@ -273,23 +348,27 @@ def select_affected(repo: Path, base: CertifiedBase | NoCertifiedBase,
         cache_path = state_dir / "affected-module-facts.json" if state_dir is not None else None
         cached = read_fact_cache(cache_path) if cache_path is not None else {}
         before = set(cached)
-        graph, tokens = graph_for_files(repo, paths, blobs, dirty, cached, worktree=True)
-        retained = test_blobs(paths | dirty, blobs)
+        graph = graph_for_files(repo, paths, blobs, dirty, cached, worktree=True)
+        config_reads = transitive_config_reads(graph)
+        configs = {Path(path).name.removesuffix(".conf") for path in changed
+                   if path.startswith("config/") and path.endswith(".conf")}
+        retained = source_blobs(paths | dirty, blobs)
         python = {path for path in changed if path.endswith(".py")}
         removed = {path for path in python if not (repo / path).is_file()}
         old_graph: dict[str, set[str]] = {}
         if removed:
             old_blobs = revision_files(repo, base.commit)
             old_paths = {path for path in old_blobs if path.endswith(".py")}
-            old_graph, _ = graph_for_files(repo, old_paths, old_blobs, set(), cached, worktree=False)
-            retained.update(test_blobs(old_paths, old_blobs))
+            old_graph = graph_for_files(repo, old_paths, old_blobs, set(), cached, worktree=False).imports
+            retained.update(source_blobs(old_paths, old_blobs))
         retain_facts(cache_path, cached, before, retained)
         folders = {str(Path(path).parent) for path in python if not is_test_module(path)}
         selected: list[Path] = []
         for module in modules:
             path = module.relative_to(repo).as_posix()
-            if (path in changed or graph.get(path, set()) & python
-                    or old_graph.get(path, set()) & removed or tokens.get(path, frozenset()) & changed
+            if (path in changed or graph.imports.get(path, set()) & python
+                    or old_graph.get(path, set()) & removed or graph.tokens.get(path, frozenset()) & changed
+                    or config_reads.get(path, set()) & configs
                     or str(Path(path).parent) in folders):
                 selected.append(module)
         return AffectedSelection(base, tuple(sorted(changed)), tuple(selected))
