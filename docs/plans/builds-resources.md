@@ -232,6 +232,7 @@ Own what a build may use and when it starts: memory admission and the memory que
    Cover `release_records_for_change()`, `complete_release_record()` and `set_aside_damaged_record()` through that capability.
    Do not take the same flock again inside a helper. Keep hold status read-only.
    Refuse mixed private and real directories before either real directory changes.
+   `read_cycle()` (`build_hold.py:978`) returns `HoldCycle | None`. Replace the `None` with a named no-current-cycle state of the release domain, and update its callers.
 5. Route callers through the installed copy.
    `memory_gate.sh` and `invoke.sh` use the installed admission client.
    `verify.sh` uses the installed helpers for holds, local release waits, detached runs, Mac idle state and build targets.
@@ -1858,6 +1859,13 @@ Every nextest run that lint starts prints one line after admission: `nextest: <g
 - builds decided on 2026-11-08 that the reproduction uses one private target at a time. One case needs about 89.06 GiB (source and one debug target). Change the script's room check from four targets to one. Also change its schedule: today it keeps `target-A`, `target-B` and both control targets until the final cleanup (`reproduce.sh` lines 190-204), about 355 GiB. Record each build's result, then remove that private target before the next case or control starts.
 - The 150 GiB Mac floor stays. So a case needs about 239 GiB free before it starts. The Mac had 238.71 GiB free after the 2026-11-08 core cleanup. Start a case only when the room is there and builds approves the start.
 - Keep sccache and the hana test mirror. Run no gc command on the Mac.
+- New evidence, 2026-11-09 (Phase 92 retrospective): a Mac hana link failed at 11:56 UTC with the same signature, undefined `.llvm.<hash>` symbols in `libhana_conduit`.
+  - The Mac build log shows the builds in series under the mirror lease, with no overlap.
+  - The log shows no floor take between the last good link (11:53 UTC) and the failure. So the floor sweep and a two-build overlap are ruled out as causes.
+  - hana sets `[profile.dev.package.hana_conduit] opt-level = 3` and `[profile.dev.package."*"] opt-level = 3`. The earlier failures (hana_diegetic, hana_catalyst) were also workspace members above opt-level 0. Incremental compilation plus local ThinLTO promotes `.llvm.<hash>` names in such members.
+  - Separate the package profile settings in hana's `Cargo.toml` from the effective profile of the generated instance the Mac builds. Read the instance's real profile before you name a cause.
+  - builds approved one `cargo clean -p hana_conduit` in the Mac mirror. It finished at 12:08 UTC on 2026-11-09. That approval is used; it permits no other cleanup.
+- The reproduction hold and the start approval stay: start no reproduction case until builds approves its start.
 
 **Files:**
 - `scripts/mac_test/offload.py` — the Mac copy, target and cleanup, when the cause is there.
@@ -1954,21 +1962,25 @@ Every nextest run that lint starts prints one line after admission: `nextest: <g
 **Spec:**
 
 1. **The wait.** natedev confirms the runner activation. resources then files the key deletion with /unit:question, because a config key deletion needs the user's approval. Do not start before both answers are on the plan.
-2. **The deletion.** `ci_memory_margin_gib` leaves `config/build_admission.conf` and `AdmissionPolicy` (`ci_memory_margin_bytes`, `admission_records.py:78`). `ci_keep_aside` (`scripts/lint/memory_admit.py`) and the mixed rule go with it.
+2. **The deletion.** `ci_memory_margin_gib` leaves `config/build_admission.conf` and `AdmissionPolicy` (`ci_memory_margin_bytes`, `admission_records.py:68`). `ci_keep_aside` (`scripts/lint/memory_admit.py`) and the mixed rule go with it.
 3. **The limit.** A CI job that the front cannot cover has no keep-aside. `MemoryMax=34G` is its limit. The notice says so.
-4. **Proof.** Tests: registered jobs still have no keep-aside; an unregistered job counts once in the cap and now takes no margin, so the room rises only in that case. Remove the tests of the mixed rule only with an approved assertion change.
+4. **Proof.** Tests: registered jobs still have no keep-aside; an unregistered job counts once in the cap and now takes no margin, so the room rises only in that case. Remove or change the tests of the mixed rule only with an approved assertion change. Two modules hold such tests:
+   - `scripts/lint/test_memory_admit.py`.
+   - `scripts/build_queue/test_queue_evidence.py`: `test_release_advice_retains_the_running_ci_keep_aside` (line 481) expects the running CI margin to keep the head held and the room to fall from 15 GiB to 8 GiB.
 
 **Files:**
 - `config/build_admission.conf`
 - `scripts/build_queue/admission_records.py`
 - `scripts/lint/memory_admit.py`
 - `scripts/lint/test_memory_admit.py`
+- `scripts/build_queue/test_queue_evidence.py`
 - `docs/as-built/build-memory-admission.md`
 
-**Workers:** `1 writer`
-- `impl` — the deletion and its tests.
+**Workers:** `1 writer + 1 tester`
+- `impl` owns `config/build_admission.conf`, `admission_records.py`, `memory_admit.py` and the as-built doc.
+- `test` owns `test_memory_admit.py` and `test_queue_evidence.py`.
 
-**Gate:** the targeted test, and `basedpyright` 0/0/0 on each changed file and each caller module.
+**Gate:** the targeted test; `scripts/lint/test_memory_admit.py` and `scripts/build_queue/test_queue_evidence.py` pass; and `basedpyright` 0/0/0 on each changed file and each caller module.
 
 **Change-Review:** none — the queue view shows the same rows; the room rises only when an unregistered job caused the margin. Registered jobs take no margin today (`test_memory_admit.py:5809`).
 
@@ -2024,47 +2036,77 @@ Every nextest run that lint starts prints one line after admission: `nextest: <g
 
 **Gotchas:** a failure-only notification must not consume the crossing receipt, or the next real crossing sends nothing.
 
-### Phase 92 — The Mac floor sweep trims the mirror targets, and its alert names folder sizes  · status: todo
+### Phase 92 — The Mac floor sweep trims the mirror targets, and its alert names folder sizes  · status: done
 **Depends on:** Phase 91 (same file, `scripts/lint/sweep.py`). Merge `origin/builds` first.
 
 **Approved:** builds showrunner, 2026-11-09 (the Mac disk defect, items 1 and 2; order change: after the repeat fix).
 
-#### Work Order
-
-**Goal:** fix two defects in the Mac floor path at their source.
-
-**Measured (natedev, 2026-11-09):** the Mac had 150 GiB free. Each alert said "The cleanup run freed nothing. Folder sizes are unknown." `~/.local/state/mac-test/mirror` held 220 GiB of build output: `hana/target` 156 GiB and `cargo-liner/target` 64 GiB. `config/mac_test.conf` names the mirror root in `sweep_floor_roots`. Phase 91 reads: later floor passes found the mirror targets and removed 0.7 and 1.1 GiB, with one or two targets busy. A claimed mirror that is missing makes `LockedClaims.holds` protect an unrecorded marked target.
-
-**Spec:**
-1. **The floor sweep trims the mirror targets.** Find why the floor pass keeps `hana/target` and `cargo-liner/target`. Write the cause with its evidence in `phases/92/cause.md` in the run folder (Phase 91 notes are in `phases/91/cause.md`). Fix the proven cause, so the sweep removes mirror build output, least recently used first, down to the floor. A target that a live build holds stays. Fix the `LockedClaims.holds` defect.
-2. **The alert names folder sizes on the Mac.** Today the Mac alert reads "Folder sizes are unknown." because the folder choices come only from the natedev disk measurement. Make the Mac alert name its largest folders under its floor roots, with their sizes, from a measurement on the Mac.
-3. Add one table row to the existing test of each behavior. Each row fails before its fix and passes after it.
-4. Update `docs/as-built/build-memory-admission.md` for the changed rules.
-5. Start from the saved patches in `phases/92/` in the run folder when they exist. `test_spec12.patch` passes `"natedev measurement is missing"` to `UnavailableDiskMeasurement`; that type accepts only `"missing"`, `"unreadable"` or `"old shape"`. Change the fixture to `"missing"`. The patch expects a `policy` parameter that this phase adds or adapts.
-
-**Constraints from prior phases:**
-- Phase 91 rule in `notify_floor_problem` and `save_delivery`: rearm only above the line plus `sweep_phone_rearm_gib`, strictly; send crossing text only below the line; accept a crossing receipt only when the delivered message held crossing text. Keep all three.
-- `scripts/copies/copies.py:1819` calls `LockedClaims.holds()` with a lease exemption for remote mirror removal. The `LockedClaims.holds` fix keeps that exemption: idle removal exempts its own lease and keeps a busy sibling.
-
-**Constraints:**
-- Run no cleanup on the Mac, and no gc command of any kind. natedev asks the user whether to clear the two mirror targets now.
-- Read the Mac only with read-only commands. Change no Mac file, setting or claim.
-- Tests make their projects in a tempdir and never touch the real `/tmp`, `~/rust` or Mac home.
-- The alert text `sweep.disk_floor` keeps its approved words. If a fix needs a changed catalog text, post blocked.
+#### As-built
+- The floor sweep trims the Mac mirror targets by design: it removes only the shortfall, least recently used first, and never a target a live build holds. On 2026-11-09 both mirror targets held live nextest runs at each scan; later trims took them.
+- `LockedClaims.holds` (`scripts/mac_test/floor_claims.py`) skips a claimed mirror path that does not exist, so a missing unrelated mirror no longer protects a marked target without a copy record. Other claim read errors still protect the target. Remote mirror removal (`scripts/copies/copies.py`) keeps its own lease exemption and still checks sibling leases.
+- While a crossing delivery is pending, the Mac measures each direct folder child of its floor roots (`mac_folder_measurement`, `CurrentMacFolders` in `scripts/lint/sweep.py`). `mac_folder_reclaimable_bytes` counts the blocks that deleting that folder alone frees: an inode counts once only when all its hard links are inside the folder; symlinks are not followed. The alert lists the folders by size and recommends the largest; protected folders keep their labels. No natedev disk snapshot is needed.
+- `notify_floor_problem` takes the machine name from its floor policy; it has no `machine` parameter.
+- `docs/as-built/build-memory-admission.md` states the claim and folder-measurement rules.
 
 **Files:**
-- `scripts/lint/sweep.py` — the floor scan and the folder choices.
-- `scripts/mac_test/floor_claims.py` — the floor claims.
-- `scripts/lint/test_sweep.py`, `scripts/mac_test/test_floor_sweep.py` — the table rows.
+- `scripts/lint/sweep.py` — the Mac folder measurement and the folder choices.
+- `scripts/mac_test/floor_claims.py` — the missing-mirror rule in `LockedClaims.holds`.
+- `scripts/lint/test_sweep.py`, `scripts/mac_test/test_floor_sweep.py` — rows in `test_crossing_recommends_one_measured_choice_that_frees_the_shortfall` (Mac rows) and `test_no_proc_mac_sweep_takes_only_the_oldest_shortfall` (mirror row).
 - `docs/as-built/build-memory-admission.md` — the changed rules.
 
+**Gotchas:** a recommended Mac folder can contain a held target; the folder measurement does not yet know the held paths.
+
+**Ruled out:** a trim defect in the floor sweep for the mirror targets (the targets were busy at each scan); raw block counts for folder sizes (hard links outside the folder free nothing).
+
+### Phase 93 — The floor alert never recommends a folder that holds output a build is using  · status: todo
+**Depends on:** Phase 92 (same file, `scripts/lint/sweep.py`). Merge `origin/builds` first.
+
+**Approved:** builds showrunner, 2026-11-09 ("Your open nit is a wrong result: the alert can recommend a folder that holds output a build holds. Fix it now as phase 93. The recommendation must leave out held output, or name a different folder.").
+
+#### Work Order
+
+**Goal:** the floor alert's recommendation never names a folder whose deletion removes output a live build holds.
+
+**Defect:** `mac_folder_measurement` lists each direct folder child of the Mac floor roots, for example `~/.local/state/mac-test/mirror/hana`. When a build holds `mirror/hana/target`, that folder is still a plain choice. `folder_recommendation` picks the largest choice, so the alert can say "Review ~/.local/state/mac-test/mirror/hana first (recommended): deleting it frees …". Deleting it removes the held target and breaks the live build. The floor pass knows the held targets (its `busy` map in `_hold_floor_pass`), but `FloorOutcome` carries only the `protected` folders (no build record) to `notify_floor_problem`.
+
+**Spec:**
+1. Carry the held target paths of the floor pass to `notify_floor_problem` in `FloorOutcome`, beside `protected`. A held target is a target with live-use evidence: an entry in `uses` (process use, Mac claim or busy mirror lease), an entry in `hold_targets`, a `.claude-busy` judgment lock, or a held cargo lock file.
+   - Read that evidence apart from the `busy` map. Today the loop in `_hold_floor_pass` (`sweep.py:4072`) sets `NoRecordedEvidence` and `continue`s before it reads `uses` or `hold_targets`, so `busy` loses the live use.
+   - A target with no recorded evidence and a live use stays in `protected` and is also held. Keep the existing `busy` values and printed lines.
+2. In `folder_choices`, a choice whose path is a held target, is inside one, or contains one gets a new `FolderChoiceKind` for held output. This applies to the Mac measurement and to the natedev disk measurement. Held wins over `PROTECTED` for a folder that is both.
+   - `FolderChoice.label` is a display label. Compare real paths: expand the home prefix, then compare path components, never string prefixes.
+3. Its folder line reads: `<label>: holds <size>. A build is using output inside it; deleting it can break that build.`
+4. Classify the choices from the largest choice that is not held:
+   - It covers the shortfall: `AvailableFolderChoices`, and `folder_recommendation` names that choice.
+   - It does not cover the shortfall: `InsufficientFolderChoices`, and the text names that choice, not a larger held one.
+   - Every choice is held: a named state for held-only choices. The alert lists the held folder lines, and the recommendation reads `Every measured folder holds output a build is using. The sweep frees it when the build ends.` The session choice stays "Delete nothing".
+5. The alert text `sweep.disk_floor` in `scripts/notify/push_catalog.py` keeps its approved words.
+6. Add rows to `test_crossing_recommends_one_measured_choice_that_frees_the_shortfall` (Mac measurement):
+   - The largest Mac folder contains a held target, and the next folder covers the shortfall. The recommendation names the next folder; the held folder line says a build is using it.
+   - A held 180 GiB folder, an eligible 20 GiB folder and a 30 GiB shortfall. The text names the 20 GiB folder as insufficient.
+   - Only held folders. The alert uses the held-only recommendation.
+   - Each row fails before the fix and passes after it.
+7. Extend `test_protected_folder_is_not_a_floor_holder_in_a_low_space_pass` (its protected root also has a live process use) or another existing `_hold_floor_pass` test. Run the pass with `dry_run=False` on private folders. Read the `FloorOutcome` it returns: the held paths name the busy target and the protected-and-used target. Add a natedev disk-measurement row: a leaf folder that contains a held target gets the held line and is not recommended.
+8. Update `docs/as-built/build-memory-admission.md` for the changed rule.
+
+**Constraints from prior phases:**
+- Phase 92: each Mac folder size counts only reclaimable blocks (`mac_folder_reclaimable_bytes`): a file with a hard link outside the folder does not count, and symlinks are not followed. `notify_floor_problem` takes the machine from its `policy`. Keep both.
+- Phase 91 rule in `notify_floor_problem` and `save_delivery`: rearm only above the line plus `sweep_phone_rearm_gib`, strictly; send crossing text only below the line; accept a crossing receipt only when the delivered message held crossing text. Keep all three.
+
+**Constraints:**
+- Run nothing on the Mac. Tests make their folders in a tempdir and never touch the real `/tmp`, `~/rust` or Mac home.
+- Never run the real sweep without `--dry-run`.
+
+**Files:**
+- `scripts/lint/sweep.py` — `FloorOutcome`, `FolderChoiceKind`, `folder_choices`, `folder_recommendation`, `folder_choice_lines`, `_hold_floor_pass`.
+- `scripts/lint/test_sweep.py` — the table rows and the floor-pass test.
+- `docs/as-built/build-memory-admission.md` — the changed rule.
+
 **Workers:** `1 writer + 1 tester`
-- `impl` owns `cause.md`, the source files and the as-built doc, and runs the final suites.
-- `test` owns the test files.
+- `impl` owns `sweep.py` and the as-built doc, and runs the final suites.
+- `test` owns `test_sweep.py`.
 
 **Acceptance gate:**
-- `cause.md` names the proven cause of the kept targets with its evidence.
-- Each new row fails before its fix and passes after it.
-- The changed test modules pass. Basedpyright reports `0 errors, 0 warnings, 0 notes` for every changed Python file.
-- The Phase 91 tests still pass: `test_crossing_sends_both_channels_once_and_rearms_only_above_the_line`, `test_phone_floor_crossing_sends_once_until_free_space_rises`, `test_crossing_retries_only_the_channel_without_a_receipt` and `test_failure_after_an_interrupted_crossing_receipt_uses_no_crossing_key`.
-- `scripts/copies/test_review_remote_copies.py` passes, with `test_idle_removal_exempts_its_lease_and_keeps_a_busy_sibling`.
+- The new rows fail before the fix and pass after it.
+- `scripts/lint/test_sweep.py` and `scripts/mac_test/test_floor_sweep.py` pass. Basedpyright reports `0 errors, 0 warnings, 0 notes` for every changed Python file.
+- The Phase 91 and Phase 92 crossing tests still pass.
