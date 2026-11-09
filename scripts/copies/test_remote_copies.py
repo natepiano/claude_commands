@@ -350,7 +350,8 @@ class RemoteCopiesTests(unittest.TestCase):
         with copies.local_mirror_lease(self.mirror, "run-session"):
             with self.assertRaisesRegex(RuntimeError, "cancelled sweep"):
                 with copies.mirror_sweep_leases(self.mirror.parent) as protected:
-                    self.assertEqual(protected, frozenset({self.mirror}))
+                    self.assertEqual(protected.busy, frozenset({self.mirror}))
+                    self.assertEqual(protected.held, frozenset({idle}))
                     with copies.target_mirror_leases([str(self.mirror / "target")]) as linux_protected:
                         self.assertEqual(linux_protected, frozenset({self.mirror}))
                     with file_lock.exclusive(floor_claims.mirror_lock_path(idle), wait=False) as state:
@@ -401,7 +402,7 @@ class RemoteCopiesTests(unittest.TestCase):
 
         def sweep() -> None:
             with copies.mirror_sweep_leases(self.mirror.parent) as protected:
-                self.assertFalse(protected)
+                self.assertFalse(protected.busy)
                 with file_lock.exclusive(self.root / "claims.lock"):
                     with file_lock.exclusive(self.root / "records.lock"):
                         entered.set()
@@ -421,33 +422,29 @@ class RemoteCopiesTests(unittest.TestCase):
         with copies.local_mirror_lease(self.mirror, "admission"):
             pass
 
-    def test_receiver_takes_lease_then_claim_then_record_and_keeps_metadata(self) -> None:
+    def test_receiver_takes_lease_then_reads_claims_then_locks_record_and_keeps_metadata(self) -> None:
         args = copies.CopyArguments()
         args.path, args.action = str(self.mirror), "mirror-receive"
         args.owner, args.repository, args.session = "alpha", "repository", "receiver-session"
         args.command = [sys.executable, "-c", "pass"]
-        claim_held = Event()
+        claims_read = Event()
         real_write = write_text_atomic
 
-        @contextmanager
-        def claims(_timeout: float) -> Generator[floor_claims.LockedClaims]:
+        def claims(_timeout: float) -> floor_claims.ClaimSnapshot:
             with file_lock.exclusive(floor_claims.mirror_lock_path(self.mirror), wait=False) as state:
                 self.assertIs(state, file_lock.LockResult.BUSY)
-            claim_held.set()
-            try:
-                yield floor_claims.LockedClaims(frozenset())
-            finally:
-                claim_held.clear()
+            claims_read.set()
+            return floor_claims.ClaimSnapshot(frozenset())
 
         def record(path: Path, content: str) -> None:
             if path.name == ".copy-record.json":
-                self.assertTrue(claim_held.is_set())
+                self.assertTrue(claims_read.is_set())
                 lock = self.mirror.parent / ("." + self.mirror.name + ".copy-record.lock")
                 with file_lock.exclusive(lock, wait=False) as state:
                     self.assertIs(state, file_lock.LockResult.BUSY)
             real_write(path, content)
 
-        with mock.patch.object(floor_claims, "locked_claims", side_effect=claims), \
+        with mock.patch.object(floor_claims, "read_claims", side_effect=claims), \
                 mock.patch.object(copies, "write_text_atomic", side_effect=record):
             self.assertEqual(copies.mirror_run(args), 0)
         metadata = self.mirror / ".copy-record.json"

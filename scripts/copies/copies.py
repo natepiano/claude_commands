@@ -1785,16 +1785,26 @@ def mirror_has_process(tree: Path, processes: MirrorProcessScan) -> bool:
 @contextmanager
 def local_mirror_lease(tree: Path, session: str, *, create: bool = True) -> Generator[None]:
     """Lock the mirror before any claim or record operation."""
-    if create:
-        tree.parent.mkdir(parents=True, exist_ok=True)
-    elif not tree.parent.exists():
+    if not create and not tree.parent.exists():
         yield
         return
-    with floor_claims.mirror_lock_path(tree).open("a+") as lock:
+    parent_lock = floor_claims.mirror_parent_lock_path(tree)
+    parent_lock.parent.mkdir(parents=True, exist_ok=True)
+    with ExitStack() as leases:
+        lease_files: list[TextIO] = []
         try:
+            outside = leases.enter_context(parent_lock.open("a+"))
+            lease_files.append(outside)
+            fcntl.flock(outside.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            if os.fstat(outside.fileno()).st_ino != parent_lock.stat().st_ino:
+                raise BlockingIOError
+            if create:
+                tree.parent.mkdir(parents=True, exist_ok=True)
+            lock = leases.enter_context(floor_claims.mirror_lock_path(tree).open("a+"))
+            lease_files.append(lock)
             fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
             busy = mirror_has_process(tree, scan_mirror_processes((tree,)))
-        except BlockingIOError:
+        except (BlockingIOError, FileNotFoundError):
             busy = True
         if busy:
             try:
@@ -1805,11 +1815,13 @@ def local_mirror_lease(tree: Path, session: str, *, create: bool = True) -> Gene
         if create:
             tree.mkdir(parents=True, exist_ok=True)
             write_text_atomic(tree / floor_claims.MIRROR_SESSION, session + "\n")
-        token = COMMAND_LOCKS.set((*COMMAND_LOCKS.get(), lock.fileno()))
+        token = COMMAND_LOCKS.set((*COMMAND_LOCKS.get(), *(lease.fileno() for lease in lease_files)))
         try:
             yield
         finally:
             COMMAND_LOCKS.reset(token)
+            if not tree.parent.exists():
+                parent_lock.unlink(missing_ok=True)
             # Closing releases only our descriptor. Live children retain the flock.
 
 
@@ -1837,9 +1849,17 @@ def mirror_lease_set(mirrors: set[Path]) -> Generator[frozenset[Path]]:
         yield frozenset(protected)
 
 
+@dataclass(frozen=True)
+class MirrorSweepLeases:
+    """Separate acquired mirror leases from mirrors that another process holds."""
+
+    held: frozenset[Path]
+    busy: frozenset[Path]
+
+
 @contextmanager
-def mirror_sweep_leases(root: Path) -> Generator[frozenset[Path]]:
-    """Take idle mirror leases before the floor claim lock."""
+def mirror_sweep_leases(root: Path) -> Generator[MirrorSweepLeases]:
+    """Take idle mirror leases before reading the floor claims."""
     mirrors = {mark.parent for pattern in (f"*/{floor_claims.MIRROR_MARK}", f"*/*/{floor_claims.MIRROR_MARK}")
                for mark in root.glob(pattern)}
     for item in remote_mirrors():
@@ -1854,7 +1874,7 @@ def mirror_sweep_leases(root: Path) -> Generator[frozenset[Path]]:
                    for pattern in (authority_glob, "*/" + authority_glob)
                    for path in root.glob(pattern))
     with mirror_lease_set(mirrors) as protected:
-        yield protected
+        yield MirrorSweepLeases(frozenset(mirrors) - protected, protected)
 
 
 @contextmanager
@@ -1894,11 +1914,11 @@ def clear_mirror_content(tree: Path) -> None:
 
 
 @contextmanager
-def mirror_metadata_locks(tree: Path) -> Generator[floor_claims.LockedClaims]:
-    """Take the claim lock, then the record lock, while the caller holds the lease."""
-    with floor_claims.locked_claims(load_config().git_timeout_seconds) as claims:
-        with file_lock.exclusive(floor_claims.record_lock_path(tree)):
-            yield claims
+def mirror_metadata_locks(tree: Path) -> Generator[floor_claims.ClaimSnapshot]:
+    """Read claims, then lock the record while the caller holds the mirror lease."""
+    claims = floor_claims.read_claims(load_config().git_timeout_seconds)
+    with file_lock.exclusive(floor_claims.record_lock_path(tree)):
+        yield claims
 
 
 def mirror_remove(args: CopyArguments) -> int:
