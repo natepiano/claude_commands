@@ -2124,7 +2124,7 @@ A changed `config/<name>.conf` selects every test module whose transitive import
 **Ruled out:**
 - A source-stamp path change in the queue client: about 0.5 CPU s (3%) of gain, with a path-equivalence risk across platforms (showrunner, 2026-11-09).
 
-### Phase 107 — The change page tests drop the processes kept at the floor  · status: todo
+### Phase 107 — The change page tests drop the processes kept at the floor  · status: done
 **Depends on:** none
 
 #### Work Order

@@ -348,22 +348,6 @@ class ChangePageTests(unittest.TestCase):
             date(2026, 11, 1), merged, self.production, producers=[self.unit.id] * 3, record=staff.snapshot())
         for row, kind in (("C1", "See in action"), ("C2", "See in action"), ("C3", "Read only")):
             _ = change_review.set_row_kind(self.review_list, row, kind, self.production)
-        run_process = cast(Callable[..., subprocess.CompletedProcess[str]], subprocess.run)
-        entries = {str(module.__file__): (module, main) for module, main in
-                   ((change_review, change_review.main), (feature_log, feature_log.main))}
-
-        def run(command: list[str], **options: object) -> subprocess.CompletedProcess[str]:
-            # invoke_cli changes process state, so a call from an HTTP worker thread keeps its real process.
-            if (process_boundary_for_case(self) or threading.current_thread() is not threading.main_thread()
-                    or len(command) < 2 or command[1] not in entries):
-                return run_process(command, **options)
-            module, main = entries[command[1]]
-            result = self.command(module, main, command[2:])
-            if options.get("check"):
-                result.check_returncode()
-            return result
-
-        _ = self.enterContext(patch.object(subprocess, "run", side_effect=run))
         self.page_path = urlsplit(change_page.publish(self.production, self.review_list, ["C1", "C3"])).path
         self.page = change_page.page_at(self.root, self.page_path)
         self.messages = []
@@ -415,7 +399,6 @@ class ChangePageTests(unittest.TestCase):
                         "Send question again", "Send validation request again", "data-resend", 'value="retry"'):
             self.assertNotIn(removed, content)
 
-    @process_boundary
     def test_recovery_does_not_erase_a_live_request_before_its_verdict_saves(self) -> None:
         status = change_page.DeliveryStatus(self.root)
         began, release = threading.Event(), threading.Event()
@@ -2153,7 +2136,6 @@ class ChangePageTests(unittest.TestCase):
         path = feature_log.state_dir() / "proposals" / f"{review}.json"
         return cast(dict[str, object], json.loads(path.read_text(encoding="utf-8")))
 
-    @process_boundary
     def test_a_feature_log_project_saves_when_the_writer_skips_an_absent_proposal(self) -> None:
         _ = self.git("remote", "add", "origin", "https://github.com/natepiano/claude_commands.git")
         with (patch.object(subprocess, "run", wraps=subprocess.run) as commands,
@@ -2502,7 +2484,6 @@ class ChangePageTests(unittest.TestCase):
         self.assertTrue(status.path(self.page, "C1").exists())
         self.assertEqual(self.request("/" + status.path(self.page, "C1").name, {}).status, 404)
 
-    @process_boundary
     def test_an_interruption_after_the_verdict_preserves_a_pending_message_for_server_recovery(self) -> None:
         save = change_review.save_verdict
 
@@ -2532,7 +2513,6 @@ class ChangePageTests(unittest.TestCase):
         self.assertEqual(self.messages, [])
         self.assertNotIn("Saved:", reply.body)
 
-    @process_boundary
     def test_a_failed_or_interrupted_verdict_write_preserves_validation_ownership_and_feedback(self) -> None:
         status = change_page.DeliveryStatus(self.root)
         self.assertEqual(self.request(self.page_path, self.answer(outcome="validate", feedback="Keep these words")).status, 303)
@@ -2562,7 +2542,6 @@ class ChangePageTests(unittest.TestCase):
                 self.assertNotIn("Saved:", body)
                 self.assert_no_delivery_controls(body)
 
-    @process_boundary
     def test_an_interruption_after_saving_selects_the_verdict_slot_and_keeps_validation_feedback(self) -> None:
         words = "Check the small text"
         with patch.object(change_page, "send_message", side_effect=RuntimeError("socket unavailable")):
