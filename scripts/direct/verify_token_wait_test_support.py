@@ -78,8 +78,8 @@ class VerifyTokenWaitFixture(unittest.TestCase):
     def setUp(self) -> None:
         self.started_groups = set()
         self.root = self.fixture_root
-        _ = shutil.copytree(self.fixture_snapshot, self.root, symlinks=True)
         self.addCleanup(shutil.rmtree, self.root)
+        _ = shutil.copytree(self.fixture_snapshot, self.root, symlinks=True)
         self.environment = self.fixture_environment.copy()
         _ = caller_admission(self, self.root, self.environment)
 

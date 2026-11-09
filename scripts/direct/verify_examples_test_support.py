@@ -327,8 +327,8 @@ class SeededExampleWorkspaceFixture(ExampleWorkspaceFixture):
             super().setUp()
             return
         self.root = self.fixture_root
-        _ = shutil.copytree(self.fixture_seed, self.root, symlinks=True)
         self.addCleanup(shutil.rmtree, self.root)
+        _ = shutil.copytree(self.fixture_seed, self.root, symlinks=True)
         self.calls = self.root / "cargo-calls"
         self.metadata_calls = self.root / "metadata-calls"
         self.environment = self.fixture_environment.copy()
