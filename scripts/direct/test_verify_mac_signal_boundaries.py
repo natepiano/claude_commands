@@ -22,7 +22,12 @@ class VerifyMacSignalBoundariesTests(VerifyMacOffloadFixture):
                 self.assertEqual(len(self.runner_events()), attempts)
 
     def test_signal_before_runner_start_removes_result_without_local_work(self) -> None:
-        self.check_signal_before_runner_start(delay_tee=False)
+        for signal_number in (signal.SIGTERM, signal.SIGINT):
+            for before_pid in (False, True):
+                with self.subTest(signal_number=signal_number, before_pid=before_pid):
+                    self.clear_observations()
+                    self.check_signal_before_runner_start(delay_tee=False, before_pid=before_pid,
+                                                          signal_number=signal_number)
 
     def test_signal_before_delayed_tee_opens_leaves_no_temp_log(self) -> None:
         self.check_signal_before_runner_start(delay_tee=True)
@@ -33,7 +38,9 @@ class VerifyMacSignalBoundariesTests(VerifyMacOffloadFixture):
     def test_build_stop_before_delayed_tee_opens_leaves_no_temp_log(self) -> None:
         self.check_signal_before_runner_start(delay_tee=True, command="build")
 
-    def check_signal_before_runner_start(self, *, delay_tee: bool, command: str = "test") -> None:
+    def check_signal_before_runner_start(self, *, delay_tee: bool, command: str = "test",
+                                        before_pid: bool = False,
+                                        signal_number: signal.Signals = signal.SIGTERM) -> None:
         if command == "build":
             source = self.root / "src/main.rs"
             _ = source.write_text("fn main() {}\n")
@@ -45,6 +52,9 @@ class VerifyMacSignalBoundariesTests(VerifyMacOffloadFixture):
             })
             self.environment["TEST_METADATA"] = json.dumps(metadata)
         marker = self.runner_state / "before-runner"
+        pid_boundary = self.runner_state / "pid-boundary"
+        for name in ("before-runner", "pid-boundary", "signal-forwarded", "continue-parent", "continue-runner", "release-tee"):
+            (self.runner_state / name).unlink(missing_ok=True)
         gate = self.root / "debug-gate.sh"
         tee_gate = '''tee() {
     "$TEST_REAL_PYTHON" "$TEST_WAIT_HELPER" "$TEST_TEE_RELEASE"
@@ -54,15 +64,33 @@ class VerifyMacSignalBoundariesTests(VerifyMacOffloadFixture):
         _ = gate.write_text(
             "set -T\n"
             + tee_gate
-            + "before_mac_runner() {\n"
-            + "    if [[ \"$BASH_COMMAND\" == *'\"$MAC_RUNNER\"'* "
-            + "&& \"$BASH_COMMAND\" == *'\"${runner_args[@]}\"'* ]]; then\n"
-            + "        trap - DEBUG\n"
-            + '        printf \'%s\\n\' "$MAC_LOG_FILE" > "$TEST_BEFORE_RUNNER_MARKER"\n'
-            + '        "$TEST_REAL_PYTHON" "$TEST_WAIT_HELPER" "$TEST_CONTINUE_RUNNER"\n'
-            + "    fi\n"
-            + "}\n"
-            + "trap before_mac_runner DEBUG\n",
+            + r'''kill() {
+    local status=0
+    builtin kill "$@" || status=$?
+    if [[ "${1:-}" == -s ]]; then
+        printf 'forwarded\n' > "$TEST_SIGNAL_FORWARDED"
+    fi
+    return "$status"
+}
+before_mac_runner() {
+    if [[ "$BASHPID" == "$$" ]]; then
+        if [[ "$TEST_SIGNAL_BEFORE_PID" == 1 && "$BASH_COMMAND" == 'MAC_RUNNER_PID=$!' ]]; then
+            trap - DEBUG
+            printf 'before:%s\n' "${MAC_RUNNER_PID:-unassigned}" > "$TEST_PID_BOUNDARY"
+            "$TEST_REAL_PYTHON" "$TEST_WAIT_HELPER" "$TEST_CONTINUE_PARENT"
+        elif [[ "$TEST_SIGNAL_BEFORE_PID" == 0 && "$BASH_COMMAND" == 'wait "$MAC_RUNNER_PID"' ]]; then
+            trap - DEBUG
+            printf 'after:%s\n' "$MAC_RUNNER_PID" > "$TEST_PID_BOUNDARY"
+        fi
+    fi
+    if [[ "$BASH_COMMAND" == *'"$MAC_RUNNER"'* && "$BASH_COMMAND" == *'"${runner_args[@]}"'* ]]; then
+        trap - DEBUG
+        printf '%s\n' "$MAC_LOG_FILE" > "$TEST_BEFORE_RUNNER_MARKER"
+        "$TEST_REAL_PYTHON" "$TEST_WAIT_HELPER" "$TEST_CONTINUE_RUNNER"
+    fi
+}
+trap before_mac_runner DEBUG
+''',
             encoding="utf-8",
         )
         process = self.start_verify(
@@ -75,28 +103,43 @@ class VerifyMacSignalBoundariesTests(VerifyMacOffloadFixture):
                 "TEST_BEFORE_RUNNER_MARKER": str(marker),
                 "TEST_CONTINUE_RUNNER": str(self.runner_state / "continue-runner"),
                 "TEST_TEE_RELEASE": str(self.runner_state / "release-tee"),
+                "TEST_SIGNAL_BEFORE_PID": "1" if before_pid else "0",
+                "TEST_PID_BOUNDARY": str(pid_boundary),
+                "TEST_CONTINUE_PARENT": str(self.runner_state / "continue-parent"),
+                "TEST_SIGNAL_FORWARDED": str(self.runner_state / "signal-forwarded"),
             },
         )
         try:
             self.wait_until(lambda: marker.exists() and bool(marker.read_text()),
                             "the runner boundary", (process,), directory=marker.parent)
-            process.send_signal(signal.SIGTERM)
-            # Bash handles a queued trap after its foreground command returns.
-            # Release that command by event; the pending TERM must still stop
-            # verify before the runner command itself can execute.
+            self.wait_until(lambda: pid_boundary.exists() and bool(pid_boundary.read_text()),
+                            "the PID assignment boundary", (process,), directory=pid_boundary.parent)
+            if before_pid:
+                self.assertEqual(pid_boundary.read_text().strip(), "before:unassigned")
+            else:
+                self.assertGreater(int(pid_boundary.read_text().strip().removeprefix("after:")), 0)
+            process.send_signal(signal_number)
+            if before_pid:
+                (self.runner_state / "continue-parent").touch()
+            if signal_number == signal.SIGINT:
+                self.wait_for_path(self.runner_state / "signal-forwarded", (process,))
+                (self.runner_state / "continue-runner").touch()
+            # Log removal proves that the parent completed signal cleanup.
+            log = Path(marker.read_text().strip())
+            self.wait_until(lambda: not log.exists(), "the Mac log removal", directory=log.parent)
             (self.runner_state / "continue-runner").touch()
             if delay_tee:
-                log = Path(marker.read_text().strip())
-                self.wait_until(lambda: not log.exists(), "the Mac log removal", directory=log.parent)
                 (self.runner_state / "release-tee").touch()
             output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
         except BaseException:
+            (self.runner_state / "continue-parent").touch()
+            (self.runner_state / "continue-runner").touch()
             (self.runner_state / "release-tee").touch()
             self.stop_verify(process)
             raise
 
         self.assertEqual(
-            process.returncode, 128 + signal.SIGTERM, output + errors
+            process.returncode, 128 + signal_number, output + errors
         )
         self.assertFalse((self.runner_state / "runner-started").exists())
         self.assertEqual(self.runner_events(), [])

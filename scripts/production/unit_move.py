@@ -28,6 +28,7 @@ from typing import NamedTuple, cast
 from scripts.direct import progress_history  # noqa: E402
 from scripts.production import tidy_wrapped  # noqa: E402
 from scripts.production import unit_lookup  # noqa: E402
+from scripts.herdr import pane_launch
 from scripts.herdr import herdr  # noqa: E402
 from scripts.shutdown import pane_record  # noqa: E402
 from scripts.lib.process_failure import failure_detail  # noqa: E402
@@ -291,16 +292,19 @@ def unit_conversation(found: unit_lookup.LabeledSession | None, *, session_id: s
         session_id = found.claude.session_id
     if not session_id:
         return NoUnitConversation()
-    if found is not None:
-        entry = pane_record.read(found.place.session).get(found.place.pane)
-        if entry is not None and entry["session_id"] == session_id and entry["config_dir"]:
-            return UnitConversation(session_id, accounts.claude_config_label(Path(entry["config_dir"])))
-    try:
-        entry = pane_record.launch_for_session(session_id)
-    except ValueError as error:
-        raise RenameRefused(str(error)) from error
-    return (UnitConversation(session_id, accounts.claude_config_label(Path(entry["config_dir"])))
-            if entry is not None and entry["config_dir"] else NoUnitConversation())
+    entry = pane_record.read(found.place.session).get(found.place.pane) if found is not None else None
+    if entry is None or entry["session_id"] != session_id:
+        try:
+            entry = pane_record.launch_for_session(session_id)
+        except ValueError as error:
+            raise RenameRefused(str(error)) from error
+    if entry is None:
+        return NoUnitConversation()
+    home = pane_launch.config_home(entry)
+    if isinstance(home, staff.HomeUnknown):
+        print(f"anomaly: {session_id}: session home is unknown; select the normal account", file=sys.stderr)
+        return UnitConversation(session_id, accounts.role_account("unit").label)
+    return UnitConversation(session_id, accounts.claude_config_label(home.path))
 
 
 

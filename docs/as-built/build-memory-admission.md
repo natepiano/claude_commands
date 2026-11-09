@@ -43,14 +43,19 @@ The next check handles an unusable cloud setting like other unusable settings.
 The API supplies `progress_profile.publish_counter` for the route to write module counts.
 The service removes the progress files when the reservation ends.
 
-The queue view and card show cloud rows under `Cloud`, with used slots and total slots.
-Each row shows the unit, step, state, module counts, vCPUs, and elapsed time.
+The queue pane and the build page show each cloud gate in the main table.
+A running row shows machine `aws` and its vCPU count.
+The last column shows the state, module count, and failed modules.
+A waiting row shows `cloud` in the # column and its slot wait text.
+Its machine and vCPU cells stay blank.
+The Head line shows `cloud N of M slots`.
+The selected cloud step card keeps its `Cloud` lines.
 Missing progress and module counts have explicit display states.
-Waiting rows show their cloud slot wait.
 `cloud_gate_stale_pushes=3` sets the update age threshold in `config/build_admission.conf`.
 The queue reading carries the checked threshold to the display.
 The display reads the push interval from `conf.read("cloud_gate").number("log_push_s")`.
-An older update shows `no update for <age>`.
+An older update shows `no update for <age>` in red.
+The display uses one age formatter for the table, the card, and the feed.
 `CloudPushIntervalUnavailable` names an unavailable push interval.
 The display omits the stale age when the push interval is unavailable.
 
@@ -228,15 +233,24 @@ The pass uses that policy for readings, decisions, and explanations. Its stored 
 Queries project the stored `PassResult` through `queue_read_from_pass`. A release marks the stored result stale; the next query computes its evidence once without granting a step.
 `queue_read()` supplies one `QueueRead` for the complete queue page.
 A failed query raises `AdmissionUnavailable` within the query bound. Commands print `build queue: admission service unavailable: <reason>` and exit 2.
-`/build:queue <position|session|folder>` shows the full queue, one blank line, and the selected cards.
-`mine` uses the same layout. The page resolves labels once and reads optional history once through `head_facts.read_head_facts()`.
+`/build:page` shows the running and waiting steps, memory use, wait reasons, priority, and cloud slot counts.
+The page and the queue pane show the same saved Mac idle alert first, in red.
+The feed reads it through `mac_idle_alert.alert_line()` and sends its text in `mac_idle_alert`.
+An empty value hides the alert on the page.
+The feed uses `head_facts.priority_text()` for the page's `priority_text` line.
+The unit-board queue pane keeps `build_queue.py --json` and its selected cards.
+A position, session, folder, or `mine` selects cards in the pane.
+The pane resolves labels once and reads optional history once through `head_facts.read_head_facts()`.
+A view request without `--json` exits 3 with `build queue: the queue view is on the build page; run /build:page`.
+The controls `bump`, `clear`, and `admit-head` remain available.
 `queue_evidence.py` formats the recorded need, run keep-aside, room calculation, head cause, and release advice.
 The card uses the reply's policy and limits. It reads no current admission configuration to reinterpret the reply.
 The evidence includes host RAM, optional load, run needs, swap-backed use, held slots, keep-asides, room, and start spacing.
 It also includes estimate history, shape tiers, failed-peak floors, factors, recorded limits, package, filters, width, and completed CPU-token waits.
 A missing optional record remains unknown. Queue arrival and time waiting use `joined_at`. Start spacing has its own deadline.
 Admission and release calculations remain in `memory_admit.py`. An expired estimate requires a client refresh through the service.
-The page prints priority and unowned memory once in the queue view. It prints shared evidence once below the selected cards.
+The pane prints priority and unowned memory once in the queue view.
+It prints shared evidence once below the selected cards.
 `build_why.py` and its command are removed. There is no alias.
 The pane keeps the last successful page after a failed refresh.
 A failed first query shows `Build queue could not be read.`
@@ -1207,7 +1221,11 @@ The message names the Mac when its disk is low.
 A current `sweep.disk_floor` text approval also permits one phone push per episode.
 The push names the machine and recommends one measured folder, or asks for measurements when folder sizes are unavailable.
 Each channel keeps its own receipt; a failed channel can retry without repeating the accepted delivery.
-A reading above the alert line rearms both channels. Equality does not rearm them.
+A reading above the alert line plus `sweep_phone_rearm_gib` rearms both channels.
+Equality with that boundary does not rearm them.
+`config/lint.conf` sets the margin to 5 GiB beside `sweep_phone_floor_gib`.
+With the 150 GiB alert line, free space must exceed 155 GiB before a later crossing can send another alert.
+The same rule applies to natedev and the Mac.
 While text approval is stale, the natedev message still sends and the phone receipt stays pending.
 The phone channel can send that pending episode after the showrunner records the new approval.
 
@@ -1219,6 +1237,11 @@ Natedev also records cache sizes, growth and removal accounting. These reports s
 `send_floor_alert()` delivers the session message; exit 0 or 1 counts as accepted.
 `send_phone_push()` delivers the separate phone push; only exit 0 counts as accepted.
 Folder choices come from `disk.json` as `AvailableDiskMeasurement | UnavailableDiskMeasurement`.
+The choices use the same held-output rule as the Mac choices described below.
+`FloorOutcome.held_targets` carries live-use paths, including protected targets with live use.
+The floor pass sets these paths when it sends the notification.
+It includes live use found during the deletion checks after the scan and includes paired output roots.
+`HeldOnlyFolderChoices` identifies a measurement that contains no folder without held output.
 `buildlog disk` records large directories outside Cargo targets, their growth and their largest child.
 It also records `outside_build_cache_totals` and `previous_measured_at`.
 `send.py`'s `log.jsonl` lines carry `text`.
@@ -1436,6 +1459,10 @@ Resolved paths must stay inside these roots. The scan does not follow directory 
 
 The sweep reads the local and natedev Mac claims under their existing admission locks.
 It keeps these locks until deletion ends. A live or kept claim protects its mirror.
+For a marked target without a copy record, the claim check compares each existing claimed mirror path.
+A missing unrelated claimed mirror does not protect the target.
+Other claim read errors still protect the target.
+Remote mirror removal keeps its own lease exemption and still checks sibling leases.
 An unreadable claim reply or a lost lock process protects every target.
 The Mac uses `lsof` for other process use. Unreadable process use protects every target.
 The sweep checks protection again before each target deletion.
@@ -1455,6 +1482,24 @@ The floor job writes both output streams to `~/Library/Logs/nate-jobs/disk-floor
 Nix-darwin activation deploys the job definition and its PATH.
 The Mac floor finalizer uses the shared crossing path above and saves its receipts on the Mac.
 Its session message goes to natedev; its phone title and body name `Mac`.
+When a crossing delivery is pending, the Mac measures each direct folder child under its floor roots.
+Each size estimates the file blocks that deleting that folder alone frees.
+An inode counts once only when every hard link is inside that folder.
+An inode with a link outside the folder counts zero.
+The measurement does not follow directory symlinks.
+The alert lists these folders from largest to smallest.
+The floor pass carries held target paths separately from folders with no recorded evidence.
+Live process use, Mac claims, mirror leases, build holds, busy judgment locks, and held cargo locks identify held output.
+A folder that contains held output, lies inside held output, or equals held output gets the held label.
+The comparison uses resolved paths after home expansion and compares path components.
+The held label takes priority over the protected label.
+The alert recommends the largest folder without held output.
+If that folder cannot cover the shortfall, the alert names its size and the partial result.
+If every measured folder holds output, the alert says the sweep frees it when the build ends.
+The session keeps the choice to delete nothing.
+The measurement reads the Mac folders directly and needs no natedev disk snapshot.
+The finalizer derives the machine name from its floor policy.
+Unreadable folders can make the measured sizes incomplete.
 
 
 ### Free memory, head protection, and step slots
@@ -1624,3 +1669,44 @@ Set `TMPDIR` to a shared runner-owned directory if `PrivateTmp` hides the defaul
 For example, `/run/build-admission/ci/<uid>` uses mode `0755` and the runner's ownership.
 The fixed slice limits remain `MemoryMax=34G` and `MemorySwapMax=2G`.
 The service authorization and protocol must be live before runner socket access starts.
+
+## Test selection and fresh-build evidence
+
+`scripts/build_queue/step_estimator.py` owns the test-history selection and freshness checks.
+`verify_test_selection` returns `PackageTestSelection(package, filters)` only for the whole positive expression that verify emits.
+It accepts a package with one `test()` predicate or a union of those predicates.
+A bare package expression selects a full package run.
+Every other expression gives `BroadTestSelection`.
+Negation cannot supply an exact filter key.
+`test_selection` parses package, scope, and canonical sorted filters together.
+A package-less filtered run keeps broad filtered history.
+Waiter estimates reuse a selection only when package and filters match.
+
+`filtered_history_peak` uses the larger exact-filter and package-filtered anonymous p90.
+It then tries indexed exact-filter peaks, indexed package peaks, and package check/build compile peaks.
+Indexed peaks use `ANON_SHARE`.
+Without usable compile history, it uses `FILTERED_FLOOR`, which is 1 GiB.
+A full-suite estimate does not cap this compile estimate.
+The recorded package, filters, and scope take priority over values recovered from argv.
+
+`is_fresh_test` reads the last completed nextest step for the same worktree, package, and scope.
+That step must have the same `test_build_key` and either status 0 or a positive test count.
+It must end less than 24 hours before the estimate.
+Both Cargo output roots must still exist.
+No matching deletion record or later sweep with unknown or positive freed bytes may invalidate them.
+A read error, malformed JSONL tail, missing key, or unknown output roots rejects freshness.
+`current_worktree_steps` uses an index prefix only after validating its file marks and then reads the JSONL tail.
+The index cannot hide a newer step.
+
+`fresh_test_peak` uses completed zero-compile measurements from the same package and scope.
+It tries exact-filter anonymous and indexed history before package history.
+It joins anonymous rows by call id and keeps the 1 GiB floor.
+`NoFreshHistory` returns the estimate to its compile-history path.
+Fresh waiters receive another estimate at each check.
+
+`TreeInputs.keys` writes the build key and both output roots through `VERIFY_TEST_BUILD_INPUTS_FILE`.
+The key excludes run-only filters and result-environment values.
+It retains Cargo inputs and `NEXTEST_CARGO_PROFILE`.
+`record.py` stores `test_build_key` only when source stays unchanged during nextest.
+Rows without a key cannot prove a fresh build.
+The broader `BUILDLOG_TREE` field cannot replace this key.
