@@ -1076,7 +1076,7 @@ The phase stopped at Spec 2. The builds showrunner ruled the `ANON_SHARE` share 
 `scratch.registered_plan(unit)` is the single resolver, using `unit_lookup.unit_parent` with `staff.snapshot`, `phase_table.show_production` and `proposals_table.unit_plan_paths` to locate the registered plan.
 `target` and `hand_over` validate new phase tasks through `plan_history.plan_phases` before creation, adoption or record replacement; missing phases and unreadable plans raise cause-bearing refusals naming a real phase, `gate:<id>` or `--until <when>`.
 `checked_task` stays shape-only for legacy updates, holds and end, so existing invalid phase tasks remain cleanable.
-`tmp_sweep.worker_use` keeps a mesh record's cwd only while its status is `running`; other keeps and the 7-day fallback still apply.
+`tmp_sweep.worker_use` keeps a detached run record's cwd only while its status is `running`; other keeps and the 7-day fallback still apply.
 
 **Files:**
 - `scripts/lib/scratch.py`, `scripts/lib/test_scratch.py` — resolver, assignment guard and private-plan assignment/legacy-cleanup cases.
@@ -1084,9 +1084,9 @@ The phase stopped at Spec 2. The builds showrunner ruled the `ANON_SHARE` share 
 - `scripts/production/test_merge_checkpoint.py` — private `registered_plan` fixture for phase-end cleanup.
 - `docs/as-built/build-memory-admission.md` — scratch task and retention rules.
 
-**Binds later work:** “Test Hana clones go through scratch, and the Mac keeps no idle clone below its floor” uses the single resolver, real registered phase or gate/deadline tasks, shape-only legacy cleanup, private-plan tests and running-only mesh cwd keeps.
+**Binds later work:** “Test Hana clones go through scratch, and the Mac keeps no idle clone below its floor” uses the single resolver, real registered phase or gate/deadline tasks, shape-only legacy cleanup, private-plan tests and running-only detached run cwd keeps.
 
-**Gotchas:** Staff records carry no plan; resolution uses the registered production rather than the caller's checkout. Tests patch `registered_plan` and keep scratch/copy roots private. A paused roster worker or active unit run does not make a finished mesh record's cwd live.
+**Gotchas:** Staff records carry no plan; resolution uses the registered production rather than the caller's checkout. Tests patch `registered_plan` and keep scratch/copy roots private. A paused roster worker or active unit run does not make a finished detached run record's cwd live.
 
 **Ruled out:** A second unit-plan registry; semantic validation on legacy update/end paths.
 
@@ -1681,7 +1681,6 @@ One bad entry in a run marker folder keeps only its own session's runs; every ot
 **Gotchas:**
 - A NUL byte in a marker path makes `os.path.realpath` raise `ValueError`; the per-marker handler catches `OSError`, `UnicodeError` and `ValueError`.
 - The guard reads the director only for a folder not already kept, so a good marker keeps `ACTIVE_MARKER` when another marker is bad.
-- `session_staff.worker_run_index` lists the `active` folder as a run, and the shared roster lock creates `active/mesh_roster.json.lock`; models-rename-track owns that caller.
 
 **Ruled out:** a test that counts director reads (it needs a configured mock).
 
@@ -1903,7 +1902,7 @@ Every nextest run that lint starts prints one line after admission: `nextest: <g
 
 #### As-built
 - nixos branch `resources-mac-floor` (`efdf8bfc1`, on nixos main `064af4a3c`) adds `modules/darwin/disk-floor.nix`: `nate.jobs.disk-floor` runs `sweep.py --floor-only --host mac` on the Mac every 120 s. It is the same command as the on-demand sweep in `offload.ensure_mac_disk_floor()`, so it takes the same mirror leases, both claim locks and the floor lock, and trims only the shortfall below `sweep_floor_gib` (150 GiB). The 100 GiB on-demand trigger is unchanged.
-- The same branch puts `/usr/sbin` on the Mac `jobPath` (`modules/darwin/nate-backend.nix`), after `/usr/bin:/bin`. Before it, launchd jobs found no `lsof`, so tmp-sweep, folder-audit and codex-mesh-sweep kept every entry.
+- The same branch puts `/usr/sbin` on the Mac `jobPath` (`modules/darwin/nate-backend.nix`), after `/usr/bin:/bin`. Before it, launchd jobs found no `lsof`, so tmp-sweep and folder-audit kept every entry.
 - `docs/as-built/build-memory-admission.md` describes the Mac floor job.
 - The job runs only after the showrunner pushes the branch to nixos main and the Mac runs `darwin-rebuild`.
 - No Python change and no new test: the job calls an existing entry point.
@@ -2150,3 +2149,64 @@ Registered jobs already take no margin: `test_registered_and_unregistered_jobs_e
 - `scripts/lint/tmp_sweep.py` — mode only.
 
 **Gotchas:** the small-fix path refuses this file because it imports `scripts/production/staff.py`.
+
+### Phase 97 — A build target command repeats no work at start  · status: done
+
+#### As-built
+
+`eligible` and `release-wait` open `build_targets.conf` once per start. `target_config.command_configuration` keeps one `read_targets` result for one command. The state readers load only when a branch reads state, the AWS ledger loads only when AWS routing is on, and `release-wait` loads the Mac test code only when a target state folder exists. Output lines and exit codes do not change.
+
+Median CPU over 50 starts on the real entry, Mac state folder present: `eligible` 160.887 to 137.673 ms, `release-wait` 106.328 to 101.707 ms. With the folder absent: `eligible` 150.415 to 130.788 ms, `release-wait` 99.996 to 42.445 ms.
+
+**Files:**
+- `scripts/build_targets/build_targets.py` — delayed state reader and ledger loads; `command_configuration` around `eligible` and `release-wait`.
+- `scripts/build_targets/target_config.py` — one-command registry retention; home of `AnyEligibleTarget`, `LocalRequired`, `Routing`, `ANY_ELIGIBLE_TARGET`, `EligibleTarget` and `ExcludedTarget`.
+- `scripts/build_targets/targets.py` — re-exports those eligibility types.
+- `scripts/build_targets/test_build_targets.py` — real-entry rows for one registry open and module absence by branch.
+
+**Binds later work:** `command_release_wait` checks `target_config.ssh_target_state_directory` before it loads `mac_test`.
+
+**Gotchas:** natedev has the Mac state folder, so the rows with the folder present are its normal case.
+
+**Ruled out:** a shared cache of `mac_test.conf`, because it saves 0.8 ms.
+
+### Phase 98 — A build target start loads no sweep, copy or Mac test code it does not use  · status: todo
+
+**Depends on:** verify's Phase 42c on `builds` (verify tells resources when it lands), and Phase 97. Merge `origin/builds` first.
+
+**Approved:** builds showrunner, 2026-11-09 ("agree the change with its owner first"). verify-unit, 2026-11-09: "agree to all three rows, and you write them after 42c lands."
+
+#### Work Order
+
+**Goal:** `eligible` and `release-wait` with Mac state present load no `sweep`, `copies` or whole `mac_test` module.
+
+**Measured:** Phase 97's profile, as upper bounds that overlap: the `sweep` import 32 ms on `eligible`, the `copies` import 24 ms on `eligible` and 27 ms on `release-wait`, and the `mac_test` import 62 ms on `release-wait`.
+
+**Spec:**
+
+1. **Git path helpers.** Move `repo_name`, `git_common_dir`, `source_git_dir`, `borrowed_git_dir` and `local_origin_git_dir` from `scripts/lint/sweep.py` to `scripts/buildlog/repository.py`. Remove the `sweep` import from `offload.repository_identity`.
+2. **Repository scope types.** Move `AllRepositories`, `SelectedRepository`, `RepositoryScope` and `ALL_REPOSITORIES` from `scripts/copies/copies.py` to `scripts/lib/copy_record.py`. Import `copies` in `offload.py` only where copying occurs.
+3. **Claim reader.** Move the claim reader that `build_targets.command_release_wait` needs, with its state paths, lock and record types, from `scripts/mac_test/mac_test.py` to a module with few imports. Keep the decoder and the lock behavior. Build on the claim reads as 42c leaves them.
+4. **Move only.** Each change only moves code. Each moved name has one home and no copy. Add no guard, check or config key.
+5. **Numbers.** Report the median CPU and wall ms per start over 50 starts, before and after, for `eligible` and `release-wait`, with the Mac state folder present.
+6. **Owner read.** Send verify the diff before the checkpoint.
+
+**Constraints from prior phases:** `command_release_wait` checks `target_config.ssh_target_state_directory` before it loads `mac_test`. `target_config.command_configuration` keeps one `read_targets` result for one `eligible` or `release-wait` start. The eligibility types live in `target_config.py`, and `targets.py` re-exports them. The numbers to improve are CPU 137.673 ms on `eligible` and 101.707 ms on `release-wait`, with the Mac state folder present.
+
+**Files:**
+- `scripts/lint/sweep.py`
+- `scripts/buildlog/repository.py`
+- `scripts/mac_test/offload.py`
+- `scripts/copies/copies.py`
+- `scripts/lib/copy_record.py`
+- `scripts/mac_test/mac_test.py`
+- `scripts/build_targets/build_targets.py`
+- `scripts/build_targets/test_build_targets.py`
+
+**Workers:** `1 writer + 1 tester`
+- `impl` owns the production files.
+- `test` owns `test_build_targets.py` and each test file that names a moved item.
+
+**State:** none.
+
+**Gate:** the targeted test; `basedpyright` 0/0/0 on each changed file; the module rows of `test_build_targets.py` show the three modules absent on the named paths; the median CPU per start falls on the real entry with the Mac state folder present; verify has read the diff.
