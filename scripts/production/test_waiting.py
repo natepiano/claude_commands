@@ -523,7 +523,7 @@ class WaitingTests(unittest.TestCase):
         self.assertLess(verdict.index("stdout first"), verdict.index("stderr second"))
         self.assertLess(verdict.index("stderr second"), verdict.index("stdout third"))
 
-    def test_scratch_uses_no_worktree_cleanup_and_reuses_the_checkout(self) -> None:
+    def test_scratch_uses_no_worktree_cleanup_and_reuses_the_cache(self) -> None:
         _ = self.commit(self.alpha, "alpha.txt", "unit work\n")
         _ = self.commit(self.checkout, "merged.txt", "merge branch work\n")
         self.push_scratch_branches()
@@ -543,7 +543,7 @@ os.execv(os.environ["WAITING_TEST_REAL_GIT"], [os.environ["WAITING_TEST_REAL_GIT
         wrapper.chmod(0o755)
         self.env["WAITING_TEST_REAL_GIT"] = real_git or "git"
         observed = self.state / "checkout-paths"
-        command = f"pwd -P >> {shlex.quote(str(observed))}; printf 'green marker\\n'"
+        command = f"pwd -P >> {shlex.quote(str(observed))}; realpath target >> {shlex.quote(str(observed))}; printf 'green marker\\n'"
         result = self.run_waiting("scratch-test", ALPHA, "--tests", command,
                                   "--state-dir", str(self.state))
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -554,8 +554,11 @@ os.execv(os.environ["WAITING_TEST_REAL_GIT"], [os.environ["WAITING_TEST_REAL_GIT
                                   "--state-dir", str(self.state))
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         paths = observed.read_text().splitlines()
-        self.assertEqual(len(paths), 2)
-        self.assertEqual(paths[0], paths[1])
+        self.assertEqual(len(paths), 4)
+        self.assertNotEqual(paths[0], paths[2])
+        self.assertFalse(any(Path(paths[index]).exists() for index in (0, 2)))
+        self.assertEqual(paths[1], paths[3])
+        self.assertTrue(Path(paths[1]).is_dir())
 
     def test_scratch_post_use_failure_preserves_green_and_red_verdicts(self) -> None:
         from scripts.copies import copies
@@ -566,18 +569,17 @@ os.execv(os.environ["WAITING_TEST_REAL_GIT"], [os.environ["WAITING_TEST_REAL_GIT
         mark = copies.mark_target
         for code, verdict in ((0, "ok — green"), (7, "failed — red")):
             with self.subTest(code=code):
-                calls = 0
+                used = self.state / "gate-command-finished"
+                used.unlink(missing_ok=True)
 
                 def fail_after_use(tree: Path) -> None:
-                    nonlocal calls
-                    calls += 1
-                    if calls == 2:
+                    if used.exists():
                         raise OSError("cache marking refused")
                     mark(tree)
 
                 with mock.patch.object(copies, "mark_target", side_effect=fail_after_use):
                     result = self.run_waiting("scratch-test", ALPHA, "--tests",
-                                              f"printf 'tests ran\\n'; exit {code}",
+                                              f"printf 'tests ran\\n'; touch {shlex.quote(str(used))}; exit {code}",
                                               "--state-dir", str(self.state))
                 self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
                 lines = result.stdout.splitlines()

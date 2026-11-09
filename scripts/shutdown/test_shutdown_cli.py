@@ -302,9 +302,9 @@ class RetireUnitTests(unittest.TestCase):
     def test_retire_removes_only_the_units_idle_trees_and_workspaces(self) -> None:
         _ = write_config_fixture(self.root / "scratch.conf")
         with copies.standing(str(self.unit_staff_id), self.checkout, copies.CommittedSource("HEAD")) as tree:
-            pass
+            cache = (tree / "target").resolve().parent
         with copies.standing("other-unit", self.checkout, copies.CommittedSource("HEAD")) as other:
-            pass
+            other_cache = (other / "target").resolve().parent
         with copies.workspace(
             str(self.unit_staff_id), self.checkout, "HEAD", name="worker", branch="worker", task="gate:retire-worker",
         ) as workspace:
@@ -313,7 +313,9 @@ class RetireUnitTests(unittest.TestCase):
         self.assertEqual(code, 0, output)
         self.assertFalse(tree.exists())
         self.assertFalse(workspace.exists())
-        self.assertTrue(other.exists())
+        self.assertFalse(other.exists())
+        self.assertFalse(cache.exists())
+        self.assertTrue(other_cache.is_dir())
 
     def test_retire_keeps_a_same_named_units_copy_in_another_production(self) -> None:
         from scripts.production.staff_test_support import fixture_member
@@ -321,13 +323,18 @@ class RetireUnitTests(unittest.TestCase):
         parent = fixture_member("showrunner", name="other-production")
         other = fixture_member("unit", name="alpha", parent=parent.id)
         with copies.standing(str(self.unit_staff_id), self.checkout, copies.CommittedSource("HEAD")) as mine:
-            pass
+            mine_cache = (mine / "target").resolve().parent
         with copies.standing(str(other.id), self.checkout, copies.CommittedSource("HEAD")) as theirs:
-            pass
+            their_cache = (theirs / "target").resolve().parent
+            their_commit = git(theirs, "rev-parse", "HEAD")
         code, output = self.retire()
         self.assertEqual(code, 0, output)
         self.assertFalse(mine.exists())
-        self.assertEqual(git(theirs, "rev-parse", "HEAD"), git(self.checkout, "rev-parse", "HEAD"))
+        self.assertFalse(theirs.exists())
+        self.assertFalse(mine_cache.exists())
+        self.assertTrue(their_cache.is_dir())
+        self.assertEqual(copies.read_record(their_cache).commit, their_commit)
+        self.assertEqual(their_commit, git(self.checkout, "rev-parse", "HEAD"))
 
     def test_retire_without_a_build_cache_has_no_standing_tree_to_remove(self) -> None:
         _ = write_config_fixture(self.root / "scratch.conf")
@@ -336,7 +343,7 @@ class RetireUnitTests(unittest.TestCase):
         _ = git(self.worktree, "push", "-q", "origin", "alpha-branch")
         _ = git(self.checkout, "merge", "-q", "--no-ff", "-m", "Merge manifest removal", "alpha-branch")
         with copies.standing(str(self.unit_staff_id), self.worktree, copies.CommittedSource("HEAD")) as tree:
-            self.assertTrue(tree.is_relative_to(Path(os.environ["SCRATCH_ROOT"])))
+            self.assertTrue(tree.is_relative_to(Path(tempfile.gettempdir())))
             self.assertEqual(copies.owned_trees(str(self.unit_staff_id)).standing, ())
             self.assertEqual(git(tree, "rev-parse", "HEAD"), git(self.worktree, "rev-parse", "HEAD"))
         self.assertFalse(tree.exists())

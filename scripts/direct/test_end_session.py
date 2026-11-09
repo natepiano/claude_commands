@@ -130,16 +130,18 @@ class EndSessionTests(unittest.TestCase):
         with patch.dict(os.environ, environment):
             source = self.seed()
             with copies.standing(str(next(row.id for row in staff.local_snapshot().rows if row.name == "end-unit")), source, copies.CommittedSource("HEAD")) as tree:
-                pass
+                cache = (tree / "target").resolve().parent
             with copies.standing("other-unit", source, copies.CommittedSource("HEAD")) as other:
-                pass
+                other_cache = (other / "target").resolve().parent
             with copies.workspace(str(next(row.id for row in staff.local_snapshot().rows if row.name == "end-unit")), source, "HEAD", name="worker", branch="worker") as workspace:
                 pass
             result = self.run_end(environment)
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertFalse(tree.exists())
             self.assertFalse(workspace.exists())
-            self.assertTrue(other.exists())
+            self.assertFalse(other.exists())
+            self.assertFalse(cache.exists())
+            self.assertTrue(other_cache.is_dir())
             self.assertFalse(self.marker.exists())
 
     def test_end_without_a_build_cache_has_no_standing_tree_to_remove(self) -> None:
@@ -150,7 +152,7 @@ class EndSessionTests(unittest.TestCase):
             source = ImmutableGitSeed.create(self.root / "repo", "main", "End Test",
                                              "end@example.invalid", {"file": "content"}).checkout
             with copies.standing(owner, source, copies.CommittedSource("HEAD")) as tree:
-                self.assertTrue(tree.is_relative_to(Path(environment["SCRATCH_ROOT"])))
+                self.assertTrue(tree.is_relative_to(Path(tempfile.gettempdir())))
                 self.assertEqual(copies.owned_trees(owner).standing, ())
                 self.assertTrue((tree / ".git").is_dir())
             self.assertFalse(tree.exists())
