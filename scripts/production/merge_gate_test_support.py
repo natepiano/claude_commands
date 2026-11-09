@@ -319,9 +319,9 @@ class MergeGateFixture(unittest.TestCase):
         from scripts.message import session_send
 
         _ = self.enterContext(LauncherHangGuard(self.id()).protect())
+        self.addCleanup(shutil.rmtree, self.fixture_root)
         self.restore_fixture(suites_for_case(self))
         _ = self.enterContext(mock.patch.object(session_send, "SEND_SCRIPT", self.bin / "send.py"))
-        self.addCleanup(shutil.rmtree, self.fixture_root)
         self.admission = caller_admission(self, self.root, self.environment)
         self.admission_started = True
 
