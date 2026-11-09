@@ -57,39 +57,20 @@ A pane that is not open prints `-` for the account. `list --all` prints `-` for 
 
 **Depends on:** Phase 1
 
-**Source:** The user, through natedev and the sdlc showrunner, 2026-11-09: "there should be no such thing as a status of "on mac". If you need to specify the machine, i.e. any time something runs other than on natedev, add a column for that. If they are all on natedev, don't show a column." The showrunner: Status stays busy, idle, paused or exited. The same rule holds for the accounts board. Fix it where the status is made, so the tables and `worker.py list` take it from one place.
+#### As-built
 
-#### Work Order
+`session_state.classify` gives the one status word: `busy`, `idle`, `paused` or `exited`. `LiveUnit.status` holds that word in the unit and style tables. No table prints `on <machine>` as a status. The accounts board and `mods/unit-board/` have no such status.
 
-**Goal:** No status reads `on mac`. Each status keeps its status word. A table that lists sessions shows a Machine column only when at least one of its rows runs off natedev.
+`display_cells.machine_column(machines: list[str]) -> tuple[str, ...]` is the one Machine rule. It returns one cell for each row when a row uses a machine other than the home machine, else an empty tuple. The home machine is the sole `kind.<machine>=local` entry in `config/build_targets.conf`. Any other number of such entries raises `conf.Unusable`, which `worker.py` reports as an anomaly.
 
-**Spec:**
-
-1. Remove the `on {machine}` status at `scripts/production/live_units.py:86`. The status stays the word that `session_state.classify` gives.
-2. Add one function that takes the machine of each row and decides the Machine column. It shows the column only when a row is off natedev. Read the name of the home machine from existing config (`config/build_targets.conf`); add no literal.
-3. `LiveUnit` carries the machine of its staff row. `unit_phases.table` and `style_units.table` print the Machine column through the function in item 2.
-4. `worker.py list` text prints the Machine column through the same function, after the account column. A worker's machine is the machine of its parent's worktree. `list --json` stays unchanged.
-5. Find each other place that prints `on <machine>` as a status, in `scripts/accounts/` and `mods/unit-board/`. Give each the same column rule. If the accounts board has no such place, say so in the summary.
-6. Tests: add rows to the existing table tests for all rows on natedev (no column) and one row on the Mac (column shown). Change each existing expected `on mac` value. Add no new test file.
-7. Update each doc that describes the `on <machine>` status.
+`staff.worktree_machine(row)` reads the machine of a present or removed worktree, else `""`. `LiveUnit.machine` holds it, and a worker uses the machine of its parent's worktree. `unit_phases.table` and `style_units.table` print a `Machine` column after Status only when the cells are not empty. `worker.py list` text prints an optional machine field after the account. `list --json` keeps its keys and values.
 
 **Files:**
-- `scripts/production/live_units.py` — the status; the machine on `LiveUnit`
-- `scripts/production/unit_phases.py`, `scripts/production/style_units.py` — the column
-- `scripts/production/worker.py` — the column
-- `scripts/production/display_cells.py` — the one column function
-- `scripts/production/test_live_units.py`, `scripts/production/test_unit_phases.py`, `scripts/production/test_style_units.py`, `scripts/production/test_worker.py` — the tests
-- `scripts/accounts/accounts.py`, `scripts/accounts/test_accounts.py`, `mods/unit-board/` — only where Spec item 5 finds an `on <machine>` status
-- `docs/as-built/unit-board.md` — the status text
+- `scripts/production/display_cells.py` — `machine_column`
+- `scripts/production/staff.py` — `worktree_machine`
+- `scripts/production/live_units.py` — `LiveUnit.status` and `LiveUnit.machine`
+- `scripts/production/unit_phases.py`, `scripts/production/style_units.py`, `scripts/production/worker.py` — print the column
+- `scripts/production/test_unit_phases.py`, `scripts/production/test_style_units.py`, `scripts/production/test_worker.py`, `scripts/style/test_style_plan_split.py` — the expected rows
+- `commands/showrunner/units.md`, `docs/as-built/showrunner-automation.md`, `docs/as-built/unit-board.md` — the status words and the column
 
-**Workers:** 1 writer — one function and its callers; nothing splits.
-- `impl` — all Files above.
-
-**State:** none — the phase changes text output only.
-
-**Constraints from prior phases:** The Phase 1 text row order is `<n> <name> <role> <account> <pane> <state>[ <reason>]`.
-
-**Acceptance gate:**
-- The changed test modules pass, and `basedpyright` on the changed Python files gives `0 errors, 0 warnings, 0 notes`.
-- With every row on natedev, no table has a Machine column.
-- With one row on the Mac, the table has a Machine column and that row's status is a status word.
+**Gotchas:** `UnitPhasesTests.setUp` fixes `socket.gethostname` to `natedev`. The fixture records the host name as the machine, and the merge gate runs on a cloud box with a different host name.
