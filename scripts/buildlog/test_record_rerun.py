@@ -655,7 +655,10 @@ class RecordRerunTests(unittest.TestCase):
         paths = list(record.pending_steps_root().glob("*.json"))
         self.assertEqual(len(paths), 1)
         pending = paths[0]
-        now = time.time()
+        clock = self.fixture.base / "file-clock"
+        clock.touch()
+        now = clock.stat().st_mtime
+        clock.unlink()
         old = now - 3 * 24 * 60 * 60
         os.utime(pending, (old, old))
         replace = os.replace

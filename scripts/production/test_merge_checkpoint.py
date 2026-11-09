@@ -327,6 +327,17 @@ class MergeCheckpointTests(MergeCheckpointFixture):
         self.assertIn("change review: ok — 1 unit commit(s)", accepted.process.stdout)
         self.assertEqual(self.git("rev-parse", "HEAD^2"), sha)
 
+        for subject, count in (("checkpoint(alpha): final change", 1), ("queue(7): final change", 2)):
+            with self.subTest(subject=subject):
+                _ = self.checkpoint(content=f"draft for {subject}\n",
+                                    subject="fix(alpha): draft\n\nChange-Review: Draft change | Read | Draft result")
+                final = self.checkpoint(content=f"final for {subject}\n",
+                                        subject=f"{subject}\n\nChange-Review: Final change | Read | Final result")
+                with mock.patch.object(showrunners, "timer_docs", return_value={"other": other_doc}):
+                    accepted = self.run_checkpoint(final)
+                self.assertEqual(accepted.process.returncode, 0, accepted.process.stdout + accepted.process.stderr)
+                self.assertIn(f"change review: ok — {count} unit commit(s)", accepted.process.stdout)
+
     def test_missing_hash_and_unpushed_checkpoint_stop_at_ancestry(self) -> None:
         missing = self.run_checkpoint("0" * 40)
         self.assert_stopped_before_merge(missing, "failed", "commit")

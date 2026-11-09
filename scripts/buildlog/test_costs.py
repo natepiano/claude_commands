@@ -15,6 +15,7 @@ from unittest import mock
 
 
 from scripts.buildlog import costs
+from scripts.buildlog import cli
 from scripts.buildlog import index
 from scripts.buildlog import moments
 from scripts.buildlog import record
@@ -78,9 +79,11 @@ class CostTests(unittest.TestCase):
         self.progress([("/r/hana", 60), ("/r/hana", 120), ("/r/tool-based-ui", 180), ("/r/other", 240)])
         with closing(self.fixture.connection()) as connection:
             result = costs.collect_costs(connection, fixtures.START, fixtures.END)
-        lines = costs.render_costs(result).splitlines()
-        self.assertEqual(lines[1], "Hana phases: 3 finished; median 120 s/phase; p90 180 s/phase.")
-        self.assertEqual(lines[2], "All phases: 4 finished; median 120 s/phase; p90 240 s/phase.")
+        durations = [phase.wall_s for phase in result.phases if isinstance(phase.wall_s, float)]
+        hana = [phase.wall_s for phase in result.phases
+                if moments.hana_name(phase.working_dir) and isinstance(phase.wall_s, float)]
+        self.assertEqual((len(hana), moments.nearest_rank(hana, 50), moments.nearest_rank(hana, 90)), (3, 120, 180))
+        self.assertEqual((len(durations), moments.nearest_rank(durations, 50), moments.nearest_rank(durations, 90)), (4, 120, 240))
         self.assertEqual(len(result.phases), 4)
 
     def test_missing_start_preserves_finished_count_without_inventing_duration(self) -> None:
@@ -90,7 +93,6 @@ class CostTests(unittest.TestCase):
         phases = costs.finished_phases(fixtures.START, fixtures.END)
         self.assertEqual(len(phases), 1)
         self.assertIsInstance(phases[0].wall_s, moments.PhaseStartUnavailable)
-        self.assertIn("1 finished; median unavailable; p90 unavailable", costs.phase_line("All phases", phases))
 
     def test_finish_wall_time_needs_no_start_event_or_event_field_substring(self) -> None:
         self.fixture.progress([
@@ -118,16 +120,14 @@ class CostTests(unittest.TestCase):
             ("natedev", "Memory wait", 21600), ("natedev", "Failed runs", 10800),
             ("aws-builder-1", "Cold rebuilds", 7200),
         ])
-        lines = costs.render_costs(result).splitlines()
-        self.assertIn("aws-builder-1: Cold rebuilds: 1.00 h/day; 1.000 h/phase.", lines)
-        self.assertLess(lines.index("natedev: Memory wait: 3.00 h/day; 3.000 h/phase."),
-                        lines.index("natedev: Failed runs: 1.50 h/day; 1.500 h/phase."))
+        self.assertEqual(len(result.phases), 2)
+        self.assertEqual(result.ranked[2].seconds / len(result.phases), 3600)
 
-    def test_no_phases_prints_unknown_cost_per_phase_instead_of_zero(self) -> None:
+    def test_costs_preserve_an_empty_phase_denominator(self) -> None:
         with closing(self.fixture.connection(fixtures.build("wait", 10, mem_wait_s=7200))) as connection:
-            text = costs.render_costs(costs.collect_costs(connection, fixtures.START, fixtures.END))
-        self.assertIn("All phases: 0 finished; median unavailable; p90 unavailable.", text)
-        self.assertIn("1.00 h/day; unavailable h/phase (no finished phases)", text)
+            result = costs.collect_costs(connection, fixtures.START, fixtures.END)
+        self.assertEqual(result.phases, ())
+        self.assertEqual(result.ranked[0], costs.RankedCost("natedev", "Memory wait", 7200))
 
     def test_passed_tree_cost_requires_the_same_tree_build_input_and_worker(self) -> None:
         records = [
@@ -190,17 +190,6 @@ class CostTests(unittest.TestCase):
             result = costs.collect_costs(connection, fixtures.START, fixtures.END)
         self.assertEqual([(row.machine, row.cause, row.seconds) for row in result.ranked], [("CI", "Cancelled CI", 3600)])
 
-    def test_cli_reads_fixture_index_without_changing_it(self) -> None:
-        with closing(self.fixture.connection(fixtures.build("record", 10, mem_wait_s=3600))):
-            pass
-        result = fixtures.read_only_cli(self, ["costs", "--days", "7"])
-        self.assertIn("Build costs: 7 days", result.stdout)
-        self.assertLess(len(result.stdout.splitlines()), 25)
-
-    def test_cli_rejects_invalid_windows_before_reading_the_index(self) -> None:
-        for args in (["--days", "0"], ["--days", "-1"], ["--days", "seven"], ["7"], ["--days", "999999999999999999"]):
-            with self.subTest(args=args), mock.patch.object(index, "read_only", side_effect=AssertionError("index opened")):
-                self.assertEqual(costs.main(args), 2)
 
     def test_recorded_target_wins_and_configured_legacy_hosts_map_to_each_target(self) -> None:
         config = self.fixture.fixture.root / "targets.conf"
@@ -234,7 +223,6 @@ class CostTests(unittest.TestCase):
             result = costs.collect_costs(connection, fixtures.START, fixtures.END)
         self.assertEqual([row.seconds for row in result.ranked if row.cause == "Mac idle while natedev waits"], [1800])
         self.assertEqual([row.seconds for row in result.ranked if row.cause == "Memory wait"], [7200])
-        self.assertIn("minus Mac execution and recorded holds", costs.render_costs(result))
 
     def test_missing_outcome_never_seeds_a_passed_tree_repeat(self) -> None:
         with closing(self.fixture.connection(
@@ -270,10 +258,6 @@ class CostTests(unittest.TestCase):
                 self.assertEqual([(row.seconds, row.unknown_seconds) for row in result.ranked
                                   if row.cause == "Mac idle while natedev waits"], [(upper_bound, unknown)])
                 self.assertEqual(result.mac_idle, costs.MacIdleEstimate(3600, 0, held, upper_bound, unknown))
-                idle_line = next(line for line in costs.render_costs(result).splitlines()
-                                 if line.startswith("mac: Mac idle while natedev waits:"))
-                self.assertIn("upper bound", idle_line)
-                self.assertIn("h/day unknown", idle_line)
 
     def test_sql_instants_treat_unzoned_times_as_utc(self) -> None:
         self.addCleanup(time.tzset)
@@ -288,15 +272,18 @@ class CostTests(unittest.TestCase):
             result = costs.collect_costs(connection, fixtures.START, fixtures.END)
         self.assertEqual([row.seconds for row in result.ranked if row.cause == "Reruns after a pass"], [120])
 
-    def test_both_window_options_reject_overflow_before_opening_the_index(self) -> None:
+    def test_mac_window_rejects_overflow_before_opening_the_index(self) -> None:
         from scripts.buildlog import mac_report
 
         with mock.patch.object(index, "update", side_effect=AssertionError("index updated")):
             self.assertEqual(mac_report.main(["--hours", "1e300"]), 2)
+
+    def test_removed_costs_command_prints_usage_without_reading_the_index(self) -> None:
         errors = io.StringIO()
-        with redirect_stderr(errors):
-            self.assertEqual(costs.main(["--days", "9" * 400]), 2)
-        self.assertIn("usage: buildlog costs", errors.getvalue())
+        with redirect_stderr(errors), mock.patch.object(index, "read_only", side_effect=AssertionError("index opened")):
+            self.assertEqual(cli.main(["costs", "--days", "7"]), 2)
+        self.assertEqual(errors.getvalue(), f"{cli.__doc__}\n")
+        self.assertNotIn("buildlog costs", errors.getvalue())
 
     def test_cli_help_does_not_import_collectors_or_the_report(self) -> None:
         command = ("import sys; from scripts.buildlog import cli; cli.main(['help']); "
@@ -314,13 +301,12 @@ class CostTests(unittest.TestCase):
                                       moments.window_parameters(fixtures.START, fixtures.END)).fetchall()
         self.assertEqual(rows, [(120.0,)])
 
-    def test_output_limits_many_machines_without_hiding_the_omission(self) -> None:
+    def test_ranking_keeps_every_machine(self) -> None:
         with closing(self.fixture.connection(*(fixtures.build(f"row-{number}", number, host=f"host-{number}", mem_wait_s=number + 1)
                                       for number in range(30)))) as connection:
-            text = costs.render_costs(costs.collect_costs(connection, fixtures.START, fixtures.END))
-        self.assertLess(len(text.splitlines()), 25)
-        self.assertIn("16 smaller machine/cause costs omitted.", text)
-        self.assertIn("host-29: Memory wait:", text)
+            result = costs.collect_costs(connection, fixtures.START, fixtures.END)
+        self.assertEqual(len(result.ranked), 30)
+        self.assertEqual(result.ranked[0], costs.RankedCost("host-29", "Memory wait", 30))
 
     def test_partial_mac_coverage_splits_residual_waits_without_using_individual_events(self) -> None:
         origin = fixtures.START.timestamp()
@@ -348,7 +334,6 @@ class CostTests(unittest.TestCase):
         )) as connection:
             result = costs.collect_costs(connection, fixtures.START, fixtures.END)
         self.assertEqual(result.mac_idle, costs.MacIdleEstimate(3600, 900, 900, 1800, 1800))
-        self.assertIn("upper bound", costs.render_costs(result))
 
 
 if __name__ == "__main__":

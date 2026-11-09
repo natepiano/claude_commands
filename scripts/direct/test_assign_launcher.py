@@ -16,7 +16,7 @@ from unittest.mock import patch
 from scripts.agents import codex_test_support as codex_fixture
 from scripts.direct import assign, progress_history
 from scripts.direct.assign_claude_test_support import AssignClaudeLauncherFixture
-from scripts.direct.assign_launcher_test_support import ASSIGN, ROOT, HookAssignmentFixture, InProcessAssignment, invoke_assignment, read_object
+from scripts.direct.assign_launcher_test_support import ASSIGN, ROOT, HookAssignmentFixture, InProcessAssignment, assignment_helpers, invoke_assignment, read_object
 from scripts.direct.findings_test_support import invoke_findings
 from scripts.herdr import herdr, turn_end, worker_panes
 from scripts.lib import unit_runs
@@ -305,6 +305,7 @@ class PaneReviewLauncherTests(unittest.TestCase):
     def setUp(self) -> None:
         self.fixture.setUp()
         self.addCleanup(self.fixture.doCleanups)
+        _ = self.enterContext(assignment_helpers())
         self.ready = self.fixture.run_dir / "final.ready"
         self.phase = self.fixture.run_dir / "phases/8"
         write_text_atomic(self.fixture.prompt, "Phase 8 — Workers\nReview Stage 1, then review the final diff in Stage 2.\n")

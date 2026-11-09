@@ -36,6 +36,7 @@ from scripts.lib.agent_scope import agents_slice
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.production import staff, fake_unit_host
+from scripts.production.cli_fixture import process_boundary, process_boundary_for_case
 from scripts.message import sessions
 from scripts.message.sessions_test_support import copy_session_modules
 from scripts.production.staff_test_support import StaffTestCase, fixture_member, fixture_runtime_id, isolated_staff_file, unit_membership
@@ -553,6 +554,9 @@ class CodexAnomalyNameTests(StaffTestCase):
 
 class StartupClock:
     elapsed: float = 0.0
+
+    def advance(self, seconds: float) -> None:
+        self.elapsed += seconds
 
 
 class WaitingAgentCLI:
@@ -1818,6 +1822,7 @@ class LaunchDestinationTests(StaffTestCase):
     def test_existing_pane_refuses_overwriting_proved_foreground_work(self) -> None:
         client = herdr.Herdr("agents")
         log = self.root / "occupied-pane.jsonl"
+        clock = StartupClock()
 
         def transport(*arguments: str, deadline: float = math.inf) -> str:
             del deadline
@@ -1833,6 +1838,7 @@ class LaunchDestinationTests(StaffTestCase):
             return "{}"
 
         with (patch.object(herdr, "Herdr", return_value=client),
+              patch.object(herdr, "time", SimpleNamespace(monotonic=lambda: clock.elapsed, sleep=clock.advance)),
               patch.object(client, "run", side_effect=transport),
               patch.object(herdr, "start_agent") as started,
               self.assertRaises(herdr.HerdrFailure)):
@@ -1937,6 +1943,7 @@ class LaunchDestinationTests(StaffTestCase):
     def test_refused_environment_command_never_starts_an_agent(self) -> None:
         client = herdr.Herdr("agents")
         commands: list[tuple[str, ...]] = []
+        clock = StartupClock()
 
         def run(*arguments: str, deadline: float = math.inf) -> str:
             del deadline
@@ -1946,6 +1953,7 @@ class LaunchDestinationTests(StaffTestCase):
             return "{}"
 
         with (patch.object(herdr, "Herdr", return_value=client),
+              patch.object(herdr, "time", SimpleNamespace(monotonic=lambda: clock.elapsed, sleep=clock.advance)),
               patch.object(client, "panes", return_value=[{
                   "pane_id": "worker", "terminal_id": "terminal-one", "session_id": None}]),
               patch.object(client, "run", side_effect=run),
@@ -2420,6 +2428,16 @@ class HerdrTests(unittest.TestCase):
         _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
         self.configure([], "")
         self.configure_herdr(["workspace", "list"], json.dumps({"result": {"workspaces": []}}))
+        if not process_boundary_for_case(self):
+            real_run = cast(Callable[..., subprocess.CompletedProcess[str]], subprocess.run)
+
+            def fixture_command(command: list[str], **options: object) -> subprocess.CompletedProcess[str]:
+                if command[0] != str(self.fake):
+                    return real_run(command, **options)
+                return self.run_fake(command, cast(float, options.get("timeout", herdr.PROGRAM_TIMEOUT_SECONDS)),
+                                     environment=cast(dict[str, str] | None, options.get("env")))
+
+            _ = self.enterContext(patch.object(subprocess, "run", fixture_command))
 
     def test_agent_status_decodes_all_server_states_and_future_states_as_unknown(self) -> None:
         for raw, state in [(value.value, value) for value in herdr.AgentStatus] + [("future-state", herdr.AgentStatus.UNKNOWN)]:
@@ -2466,6 +2484,7 @@ class HerdrTests(unittest.TestCase):
                 with self.assertRaisesRegex(herdr.HerdrFailure, "herdr agent session"):
                     _ = self.herdr.agents()
 
+    @process_boundary
     def test_label_pane_uses_a_persistent_pane_label(self) -> None:
         self.herdr.label_pane("worker", "dispatch-owner")
         self.assertEqual(self.commands()[-1], ["--session", "fixture", "pane", "rename", "worker", "dispatch-owner"])
@@ -2942,7 +2961,8 @@ class HerdrTests(unittest.TestCase):
         """Replay the command fake in process while Popen models the server child."""
         self.assertGreater(timeout, 0)
         stdout, stderr = io.StringIO(), io.StringIO()
-        with patch.dict(os.environ, environment or {}), redirect_stdout(stdout), redirect_stderr(stderr):
+        with patch.dict(os.environ, environment if environment is not None else dict(os.environ), clear=True), \
+                redirect_stdout(stdout), redirect_stderr(stderr):
             code = fake_herdr.main(argv[1:])
         return subprocess.CompletedProcess(argv, code, stdout.getvalue(), stderr.getvalue())
 
@@ -3141,6 +3161,7 @@ class HerdrTests(unittest.TestCase):
         self.assertEqual(budgets, [10, 8, 6])
         self.assertEqual(clock.elapsed, 10)
 
+    @process_boundary
     def test_darwin_identity_preserves_registry_start_time_and_pins_locale_and_zone(self) -> None:
         self.darwin()
         started = "Thu Oct  1 12:00:00 2026"
@@ -4388,6 +4409,7 @@ class HerdrTests(unittest.TestCase):
         self.assertTrue(all(timeout <= 1 - called_at for called_at, timeout in calls))
         self.assertLess(calls[-1][1], 0.5)
 
+    @process_boundary
     def test_start_does_not_treat_an_unreadable_observation_as_an_exit(self) -> None:
         source = self.fake.read_text().replace(
             '    responses = cast(',
