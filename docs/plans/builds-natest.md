@@ -2102,7 +2102,7 @@ A changed `config/<name>.conf` selects every test module whose transitive import
 **Ruled out:**
 - Queueing HTTP worker-thread CLI calls onto the main thread: it removes the process boundary that the HTTP path needs.
 
-### Phase 106 — The memory admission tests use half their CPU  · status: todo
+### Phase 106 — The memory admission tests use half their CPU  · status: done
 **Depends on:** none
 
 #### Work Order
@@ -2144,3 +2144,44 @@ A changed `config/<name>.conf` selects every test module whose transitive import
 - the targeted test green on the phase commit merged with `origin/builds`
 - `basedpyright` on the changed files prints `0 errors, 0 warnings, 0 notes`
 - Floors: a floor claim adds a row to the next-items Floors table with its revision, roots, cache state, limiting operation, owner and revisit condition.
+
+### Phase 107 — The change page tests drop the processes kept at the floor  · status: todo
+**Depends on:** none
+**Blocked by:** merge — `origin/builds` carries `~/.claude` main `e2232ced0` (devtools `52256c239`, the change page in-process calls)
+
+#### Work Order
+
+**Source:** the showrunner, 2026-11-09: devtools `52256c239` makes `change_page.py` save a verdict and close a feature-log proposal through library calls in its own process. sdlc measured the CPU per verdict at 24.4 s before and 11.4 s after. The Phase 105 Floors row kept real `change_review.py` and `feature_log.py` processes for calls from HTTP worker threads. The showrunner asks for a new measure on top of that change and the removal of the kept processes where the test can now run in process.
+
+**Goal:** `scripts/review_links/test_change_page.py` starts no process that the in-process change page calls made unneeded, and its CPU is measured against the Phase 105 floor, with every checked behavior kept.
+
+**Spec:**
+1. Follow the Speed method. Measure CPU with `module_cost.py --tests 10 --commands 10` on the phase base first. Name each test's CPU, and each real process that it starts.
+2. Find each remaining `change_review.py`, `feature_log.py` and `change_page.py` start, and the thread that makes it. Remove each start that only the test fixture makes.
+3. Remove the fixture route for HTTP worker-thread calls when no such call remains. Keep `invoke_cli` for main-thread calls only.
+4. Keep a real process for each behavior that only a process proves: an exit code across a process, any cwd or environment that the entry reads at start. Keep each `@process_boundary` case that still proves such a behavior.
+5. Update the behavior map from Phase 105 with a row for each assertion before you change a test.
+6. Do not change `scripts/review_links/change_page.py`, `scripts/production/change_review.py`, `scripts/feature_log/feature_log.py` or other production files. sdlc owns them. If only a production change can cut a cost, write the floor and send the director an architecture proposal with its measured gain.
+7. Add no guard, refusal or check (user rule, 2026-11-05).
+
+**Files:**
+- `scripts/review_links/test_change_page.py`
+
+**Workers:** 1 writer; one test file
+- `impl` — `test_change_page.py`
+
+**Constraints from prior phases:**
+- Phase 105: `test_change_page.py` copies one seed repository per test. Its `run` side effect sends main-thread test-owned CLI calls through `invoke_cli`, and calls from other threads, `@process_boundary` cases and other commands through the real process. 7 `@process_boundary` tests, 139 tests and 829 assertions.
+- Phase 105 floor: 17.7 CPU s pair median, base `befc1a04a`, /tmp roots, warm bytecode cache; 18.0 CPU s with no bytecode writes on /dev/shm roots.
+- devtools `52256c239` also edited `test_change_page.py`. Build on its version.
+- `invoke_cli` restores signal handlers (`cli_fixture.py:133`), and Python allows that only on the main thread. It also changes the process cwd, environment and streams. Check the thread of each routed call; a worker-thread call routed in process was the Phase 105 review blocker.
+- Phase 103: a process start costs more with no bytecode writes. Report pairs with no bytecode writes and on `/tmp` with a warm bytecode cache.
+- Tests never read or write live state: `~/.claude` main, `~/.local/state/merge-gate`, `/tmp/claude`. State the filesystem basis of each pair.
+
+**Acceptance gate:**
+- The behavior map has a row for each assertion. No assertion is removed.
+- CPU s, processes, execs and wall s before and after, from `module_cost.py` and same-load pairs against the phase base, in the checkpoint notice.
+- The changed file passes.
+- the targeted test green on the phase commit merged with `origin/builds`
+- `basedpyright` on the changed file prints `0 errors, 0 warnings, 0 notes`
+- Floors: the Phase 105 change page row is replaced with the new figures, or removed when no floor remains.
