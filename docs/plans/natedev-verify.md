@@ -1216,7 +1216,7 @@ Checkpoint `1f9e9c484` on `verify-not-mac-wait`, merged to builds as `a62793f07`
 
 **Ruled out:** refuse every choice-limited program — that is the false refusal this phase removes.
 
-### Phase 41u — copies.py list shows remote mirrors  · status: todo
+### Phase 41u — copies.py list shows remote mirrors  · status: done
 
 **Depends on:** 41t. Runs after 41v.
 
@@ -1253,6 +1253,65 @@ Checkpoint `1f9e9c484` on `verify-not-mac-wait`, merged to builds as `a62793f07`
 - The copies suites pass, `test_copy_guard.py` included; `basedpyright` reports 0 errors and 0 warnings on the changed files.
 - The director runs the targeted test.
 - Change-Review: `copies.py list` output.
+
+### Phase 41w — Two helper starts in the verify wait tests load less  · status: todo
+
+**Depends on:** none. Runs after 41u.
+
+#### Work Order
+
+**Source:** builds, 2026-11-08, from natest's measurement on scratch copies (natest run `/tmp/claude/unit/2113de4f-9913-485a-9a51-61558bfd81db/phases/95/behavior_map.md`, sections "Target prototype" and "Recorder prototype"). The showrunner gives the user the before and after numbers.
+
+**Goal:** `test_verify_wait_holder.py` uses less CPU per run, with every target decision and recorder result unchanged.
+
+**Spec:**
+1. **Target selection.** Move `Routed`, `Pinned`, `TargetSelection` and `ROUTED` (`step_record.py:273-283`) to a new small module `scripts/direct/step_selection.py`. `step_record.py` and `build_targets.py` (`build_targets.py:148`) import them from there, so a `build_targets.py` start no longer loads the full step recorder. Measured on a scratch copy: 2.4 CPU s less per run of `test_verify_wait_holder.py`.
+2. **Recorder import.** Move the `cell_value` import (`unit_config.py:22`) from module scope into `unit_config.parse_port_cell` (`unit_config.py:75`), its only use in that file. A recorder start then does not load the production document and showrunner modules. Measured on a scratch copy: 1.6 CPU s less per run.
+3. **Callers.** Tests that name these types (`test_verify_routing_rule.py:24`, `test_step_record.py`, `test_verify_step_state.py`) import them from `step_selection.py`. Keep one definition of each type.
+4. **Measure.** The director runs `~/.claude/scripts/lib/py scripts/test_times/module_cost.py --tree <tree> --tests 40 --commands 10 direct/test_verify_wait_holder.py` three times on the phase-start tree and three times on the final tree, and reports the median CPU s of each.
+
+**Files:**
+- `scripts/direct/step_selection.py` — the new selection types module.
+- `scripts/direct/step_record.py` — imports the selection types.
+- `scripts/build_targets/build_targets.py` — imports the selection types (owned by another unit; the checkpoint notice names it).
+- `scripts/production/unit_config.py` — the local `cell_value` import (owned by another unit; the checkpoint notice names it).
+- `scripts/direct/test_verify_routing_rule.py`, `scripts/direct/test_step_record.py`, `scripts/direct/test_verify_step_state.py` — import changes only.
+
+**Constraints from prior phases:**
+- Phase 41p: each `build_targets.py` subcommand imports only what it uses. Keep that form.
+
+**Workers:** 1 writer — `impl` owns every file above. The work is import moves; no test lane.
+
+**Acceptance gate:**
+- `test_verify_wait_holder.py`, `test_step_record.py`, `test_verify_routing_rule.py`, `test_verify_step_state.py`, `test_build_targets.py` and `test_unit_config.py` pass with no assertion changed; `basedpyright` reports 0 errors and 0 warnings on the changed files.
+- The director runs the targeted test and the before and after measurement of Spec item 4.
+
+### Phase 41x — The final gate runs the repository's own gate in a repository with no Cargo  · status: todo
+
+**Depends on:** none. Runs after 41w.
+
+#### Work Order
+
+**Source:** builds, 2026-11-08, an anomaly from sdlc. In the `~/.claude` models unit worktree (at 3535b65d7), `verify.sh final` exits 2 with `could not find Cargo.toml`. It did not block that unit.
+
+**Goal:** a unit run in a repository with no `Cargo.toml` reaches its final gate with a gate that fits the repository, and `verify.sh` names the cause in one line when it is called there.
+
+**Spec:**
+1. **Cause.** <FinalGate/> step 1 (`docs/direct/final_gate_commit.md:11`) launches `verify.sh final` in every repository. `verify.sh` is the Cargo verifier: in a repository with no `Cargo.toml`, cargo prints `could not find Cargo.toml` and `verify.sh` exits 2. The writer confirms this on the real path before the edit and quotes the line that runs cargo.
+2. **Final gate.** <FinalGate/> step 1 launches `verify.sh final` only in a Cargo repository (a `Cargo.toml` at the repository root). In a repository with no `Cargo.toml`, it runs that repository's unit gate. If config already names a unit gate per repository, the doc names that config. Otherwise it names the `~/.claude` gate, `targeted_test.py --checkout <tree>`, with no other repository. Step 2's failure path applies to both gates.
+3. **verify.sh.** In a repository with no `Cargo.toml`, each `verify.sh` command exits 2 before any cargo call, with one line: `verify.sh: <root> has no Cargo.toml; verify.sh checks Cargo repositories only`.
+4. **Proof.** One row in the existing test that runs `verify.sh` in a temporary repository: a git repository with no `Cargo.toml` gets exit 2, the line from item 3, and no cargo start. The row fails on the current tree.
+
+**Files:**
+- `docs/direct/final_gate_commit.md` — the gate choice (owned by sdlc; the checkpoint notice names it).
+- `scripts/direct/verify.sh` — the early exit.
+- the existing `scripts/direct/test_verify_*.py` test that runs `verify.sh` in a temporary repository — the row.
+
+**Workers:** 1 writer — `impl` owns every file above.
+
+**Acceptance gate:**
+- The changed test module passes with no assertion changed; `basedpyright` reports 0 errors and 0 warnings on the changed test file.
+- The director runs the targeted test.
 
 ### Phase 41c — Send a lint that waits for memory to a free Mac  · status: done
 

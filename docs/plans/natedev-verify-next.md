@@ -109,3 +109,11 @@
 **Today:** `python3 -c "import shutil;shutil.copytree('$UNSET', '/tmp/o')"` passes, while `cp -r "$UNSET" dest` refuses with `cannot resolve recursive copy source`. `bash -c "$UNSET_DIR/git -C . clone . /tmp/o"` passes, because the unknown-executable check in `_operation` (`scripts/copies/copy_guard.py`) does not skip git options before `clone`; the top-level form refuses with `cannot resolve executable name`.
 
 **Needed:** only when a real session makes a tree in one of these forms. Then both commands refuse, and the copy guard command list and transcript corpus keep their results.
+
+## A smaller verify.sh routing boundary
+
+**Source:** builds (showrunner), 2026-11-08, settled as `next`: natest's third idea; it needs a design first. Measured in natest run `/tmp/claude/unit/2113de4f-9913-485a-9a51-61558bfd81db/phases/95/behavior_map.md`, section "Routing proposal".
+
+**Today:** in `test_verify_wait_holder.py`, the inline Python helper commands of `verify.sh` routing use 14.974 CPU s per run. The gain from fewer helper starts is at most that, and lower in practice, because the routing decisions still run.
+
+**Needed:** a design that keeps shell state, cleanup traps, reservations and memory admission in their current order, then a phase that cuts helper starts. Done when the module cost measurement shows the cut, and every routing test keeps its assertions.

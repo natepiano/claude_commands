@@ -21,6 +21,7 @@ import os
 from pathlib import Path
 import re
 import shutil
+import socket
 import stat
 import subprocess
 import sys
@@ -39,6 +40,7 @@ from scripts.lib.atomic_file import remove_dead_temporary_files, write_text_atom
 from scripts.mac_test import floor_claims
 if TYPE_CHECKING:
     from scripts.lint import tmp_sweep
+    from scripts.production import staff
 
 GATE_RECORD = ".gate.json"
 LEGACY_WORKER_HOLD_REASON = "legacy crate worker"
@@ -92,6 +94,73 @@ def owner_name(owner: CopyOwner) -> str:
     except staff.StaffUnreadable:
         row = None
     return row.name if row is not None else owner.row_id
+
+
+@dataclass(frozen=True)
+class CurrentStaffOwnerName:
+    name: str
+
+
+@dataclass(frozen=True)
+class RoleOwnerName:
+    name: str
+
+
+@dataclass(frozen=True)
+class OwnerNameUnavailable:
+    """The list cannot resolve the stored staff owner to a current name."""
+
+
+OwnerDisplay = CurrentStaffOwnerName | RoleOwnerName | OwnerNameUnavailable
+
+
+@dataclass(frozen=True)
+class UnreadStaffNames:
+    """The list has not needed staff names yet."""
+
+
+@dataclass(frozen=True)
+class AvailableStaffNames:
+    snapshot: staff.StaffSnapshot
+
+
+@dataclass(frozen=True)
+class UnavailableStaffNames:
+    """The staff read failed for this list call."""
+
+
+class ListStaffNames:
+    """Use one staff snapshot for all names in a list call."""
+
+    def __init__(self) -> None:
+        self._state: UnreadStaffNames | AvailableStaffNames | UnavailableStaffNames = UnreadStaffNames()
+
+    def read(self) -> AvailableStaffNames | UnavailableStaffNames:
+        if isinstance(self._state, UnreadStaffNames):
+            from scripts.production import staff
+
+            try:
+                self._state = AvailableStaffNames(staff.local_snapshot())
+            except staff.StaffUnreadable:
+                self._state = UnavailableStaffNames()
+        return self._state
+
+
+def list_owner_name(owner: CopyOwner, staff_names: ListStaffNames) -> OwnerDisplay:
+    """Resolve an owner for display without changing its stored identity or folder name."""
+    if isinstance(owner, RoleOwner):
+        return RoleOwnerName(owner.name)
+    from scripts.production import staff
+
+    names = staff_names.read()
+    if isinstance(names, UnavailableStaffNames):
+        return OwnerNameUnavailable()
+    row = names.snapshot.by_id(staff.StaffId(owner.row_id))
+    return CurrentStaffOwnerName(row.name) if row is not None else OwnerNameUnavailable()
+
+
+def _owner_display_text(owner: OwnerDisplay) -> str:
+    return owner.name if isinstance(owner, (CurrentStaffOwnerName, RoleOwnerName)) else "unavailable"
 
 
 @dataclass(frozen=True)
@@ -1037,9 +1106,12 @@ def standing(owner: str, repo: str | Path, policy: SourcePolicy, *,
 
 def list_trees() -> None:
     root = gates_root()
-    if not root.exists():
-        return
-    for directory in sorted(root.iterdir()):
+    staff_names = ListStaffNames()
+    print("number\towner\trepository\thost\tpath\tsession\tcommit\tstate\tholder_pid\ttarget")
+    number = 0
+    host = socket.gethostname()
+    directories = sorted(root.iterdir()) if root.exists() else []
+    for directory in directories:
         if directory.name.startswith(".") or directory.is_symlink() or not directory.is_dir():
             continue
         for tree in sorted(directory.iterdir()):
@@ -1048,7 +1120,9 @@ def list_trees() -> None:
             try:
                 record = read_record(tree)
             except CopyError as error:
-                print(f"{tree}\t{error}")
+                number += 1
+                print(f"{number}\tunavailable\t{tree.parent.name}\t{host}\t{tree}\t-\t-\tunreadable\t-\t-")
+                print(f"{tree}: {error}", file=sys.stderr)
                 continue
             with scratch.busy_locks(tree, create=False) as idle:
                 state = "idle" if idle else "busy"
@@ -1058,7 +1132,25 @@ def list_trees() -> None:
                 size = subprocess.run(["du", "-sh", str(target)], capture_output=True, text=True)
                 words = size.stdout.split()
                 disk = words[0] if size.returncode == 0 and words else "unreadable"
-            print(f"{tree}\t{owner_name(copy_owner(record.owner))}\t{record.repo}\t{record.commit}\t{state}\t{record.holder_pid}\t{disk}")
+            number += 1
+            owner = _owner_display_text(list_owner_name(copy_owner(record.owner), staff_names))
+            print(f"{number}\t{owner}\t{record.repo}\t{host}\t{tree}\t-\t{record.commit}\t{state}\t{record.holder_pid}\t{disk}")
+    mirrors = sorted(remote_mirrors(), key=lambda mirror: (mirror.host, mirror.path))
+    for mirror, lease in list_remote_leases(mirrors, staff_names):
+        number += 1
+        owner = _owner_display_text(list_owner_name(copy_owner(mirror.owner), staff_names))
+        if isinstance(lease, HeldMirrorLease):
+            state = "held"
+            pid = str(lease.pid)
+            if isinstance(lease.holder, CurrentHolderName):
+                session = lease.holder.name
+            else:
+                session = "not recorded" if isinstance(lease.holder, HolderNotRecorded) else "unavailable"
+        else:
+            state = "idle" if isinstance(lease, IdleMirrorLease) else "unavailable"
+            pid = "-"
+            session = "-"
+        print(f"{number}\t{owner}\t{mirror.repository.name}\t{mirror.host}\t{mirror.path}\t{session}\t-\t{state}\t{pid}\t-")
 
 
 def removing_path(tree: Path) -> Path:
@@ -1321,6 +1413,43 @@ class RemoteMirror:
     session: str
 
 
+@dataclass(frozen=True)
+class CurrentHolderName:
+    name: str
+
+
+@dataclass(frozen=True)
+class HolderNameUnavailable:
+    """The recorded live holder has no available current staff name."""
+
+
+@dataclass(frozen=True)
+class HolderNotRecorded:
+    """The record does not identify the process that holds the current lease."""
+
+
+MirrorHolderName = CurrentHolderName | HolderNameUnavailable | HolderNotRecorded
+
+
+@dataclass(frozen=True)
+class HeldMirrorLease:
+    pid: int
+    holder: MirrorHolderName
+
+
+@dataclass(frozen=True)
+class IdleMirrorLease:
+    """The readable lock table has no lease for this mirror."""
+
+
+@dataclass(frozen=True)
+class UnavailableMirrorLease:
+    """The list cannot read the mirror's lease evidence."""
+
+
+MirrorLeaseState = HeldMirrorLease | IdleMirrorLease | UnavailableMirrorLease
+
+
 def remote_registry() -> Path:
     return gates_root() / ".remote-mirrors"
 
@@ -1335,6 +1464,48 @@ def remote_record_path(mirror: RemoteMirror) -> Path:
 
 def remote_lease_path(mirror: RemoteMirror) -> Path:
     return remote_registry() / (remote_key(mirror.host, mirror.path) + ".lease")
+
+
+def _list_holder_name(mirror: RemoteMirror, pid: int, staff_names: ListStaffNames) -> MirrorHolderName:
+    """Read the recorded pid and session together before resolving the live holder's name."""
+    try:
+        raw = cast(object, json.loads(remote_record_path(mirror).read_text(encoding="utf-8")))
+    except (OSError, ValueError):
+        return HolderNotRecorded()
+    if not isinstance(raw, dict):
+        return HolderNotRecorded()
+    fields = cast(dict[str, object], raw)
+    session = fields.get("session")
+    if fields.get("holder_pid") != pid or not isinstance(session, str):
+        return HolderNotRecorded()
+    names = staff_names.read()
+    if isinstance(names, UnavailableStaffNames):
+        return HolderNameUnavailable()
+    row = names.snapshot.by_current_session(session)
+    return CurrentHolderName(row.name) if row is not None else HolderNameUnavailable()
+
+
+def list_remote_leases(mirrors: Sequence[RemoteMirror], staff_names: ListStaffNames) -> list[tuple[RemoteMirror, MirrorLeaseState]]:
+    """Read the lock table once and preserve each mirror's held, idle, or unavailable state."""
+    if not mirrors:
+        return []
+    try:
+        devices = file_lock.held_flock_keys()
+    except OSError:
+        return [(mirror, UnavailableMirrorLease()) for mirror in mirrors]
+    leases: list[tuple[RemoteMirror, MirrorLeaseState]] = []
+    for mirror in mirrors:
+        try:
+            device = file_lock.device_key(remote_lease_path(mirror))
+        except FileNotFoundError:
+            state: MirrorLeaseState = IdleMirrorLease()
+        except OSError:
+            state = UnavailableMirrorLease()
+        else:
+            pid = devices.get(device)
+            state = IdleMirrorLease() if pid is None else HeldMirrorLease(pid, _list_holder_name(mirror, pid, staff_names))
+        leases.append((mirror, state))
+    return leases
 
 
 def held_remote_mirrors() -> tuple[floor_claims.HeldMirror, ...]:
