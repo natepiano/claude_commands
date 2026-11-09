@@ -3534,49 +3534,23 @@ The user (2026-11-07, through sdlc [4fdbe4b7]): "yes i definitely want this - ke
 
 ### Phase 28b — A worker's pane closes when its agent ends  · status: done
 
-**Depends on:** Phase 28a (both edit `worker_panes.can_close` and close). sdlc [e19b58aa], 2026-11-08.
+#### As-built
 
-Phase 27's rule is "only working workers hold a pane". Today only a manual close after an accepted pass releases a pane. devtools [26af13ea]: when a worker's agent ends without an accepted pass (a move, a quota stop or shutdown: `zsh: terminated ... accounts.py exec workers`), the row reads `StoppedWorker` and the pane stays at the shell. `ClosedWorker` rows also leave panes at the shell (devtools review, review2; w16:p27, p28). A row `fix` reads "dispatch role is unavailable"; the herdr proof row `answerproof` reads the same.
-
-Goal: when a worker's agent ends and nothing is sent to it, its pane closes; the row and thread stay for resume. Restore and moves already reopen only busy workers.
-
-Design: sdlc [4e9d6f2f] chose A (2026-11-08): the worker pane's zsh exits when the agent's command returns, so herdr closes the pane at once. No watcher. Restore, moves and shutdown never reuse a stopped worker pane; a worker with an active dispatch reopens in a new pane, the same as an idle worker's next assign. The dead agent's last screen is lost; that is accepted. The stopped-pane reuse path and its tests go. The old leftover panes (devtools w16:p27, p28) are already closed.
-
-#### Work Order
-
-**Goal:** a worker pane closes when its agent ends. The worker's row and native conversation stay, and its next assign, restore or move opens it in a new pane.
-
-**Spec:**
-
-1. Worker panes only (`worker_panes._start_locked` through `herdr.launch_prepared_agent`): the pane's shell exits after the agent's command returns, so herdr closes the pane. Unit sessions (`scripts/shutdown/stop_resume.py`, `scripts/shutdown/restart.py`) and side panes (`scripts/herdr/side_pane.py`) keep their shell; do not change them. Use the launch script that `launch_prepared_agent` already runs in the pane (`client.run_in_pane(pane, ["eval", script])`); `herdr agent start` types the agent command into that shell. Start no watcher process and add no wait.
-2. Remove the stopped-pane reuse in `worker_panes._start_locked`: a `StoppedWorker` (a pane from before this phase) or an `OpenWorker` stopped for a policy change no longer becomes `herdr.ExistingPane`. Close its pane with the existing close path, then open the worker in a new pane through `_destination`, as for a closed worker.
-3. Moves (`scripts/accounts/pane_moves.py`) and shutdown and restore (`scripts/shutdown/stop_resume.py`, `scripts/production/worker.py` restore): after a worker's agent stops, a closed pane is the stop proof, as a `StoppedWorker` was. A worker with an active dispatch reopens in a new pane. Remove the code and tests that require the same terminal to stay after the stop.
-4. If the launcher already records the agent's exit code, keep it. Record nothing new.
-5. `Herdr.quit_agent` (`scripts/herdr/herdr.py`) waits for `PaneAtShell` after the quit; `worker_panes.py close --interrupt` calls it before it takes the worker lock. A pane that closed after the quit is also a stopped agent. Add no other wait.
-6. Docs match the new rule: `docs/as-built/herdr-adoption.md` and `commands/unit/direct.md` <LongLivedWorkers/> ("Shutdown leaves proved stopped workers at the shell", "A stopped worker with an active dispatch keeps its pane and terminal", and the moves lines) say that a worker pane closes when its agent ends and a resumed worker opens in a new pane.
-7. Add no check, refusal, validation, retry or wait that this list does not name.
+- A worker pane closes when its agent ends. `herdr.WorkerPaneEnvironment` (a `PreparedAgentEnvironment`) makes `launch_prepared_agent` add zsh `precmd`/`preexec` hooks to the pane's launch script. The shell exits with the agent's status when the agent command returns, and herdr closes the pane. No watcher process runs.
+- Unit sessions (`stop_resume.py`, `restart.py`) and side panes (`side_pane.py`) keep their shell; only worker launches use `WorkerPaneEnvironment`.
+- `worker_panes._start_locked` never reuses a stopped worker pane as `herdr.ExistingPane`. It closes a `StoppedWorker` pane, or an `OpenWorker` pane stopped for a policy change, through the close path, then opens the worker in a new pane through `_destination`.
+- Moves (`pane_moves.py`), shutdown and restore (`stop_resume.py`, `worker.py` restore) take a closed pane as the stop proof. A worker with an active dispatch reopens in a new pane on the same native conversation.
+- `Herdr.quit_agent` returns when the pane row reads `NoPane`, the pane reads `PaneAtShell`, or herdr answers `pane_not_found`.
 
 **Files:**
-- `scripts/herdr/herdr.py`
-- `scripts/herdr/test_herdr.py`
-- `scripts/herdr/worker_panes.py`
-- `scripts/herdr/test_worker_panes.py`
-- `scripts/accounts/pane_moves.py`
-- `scripts/accounts/test_accounts.py`
-- `scripts/shutdown/stop_resume.py`
-- `scripts/shutdown/test_stop_resume.py`
-- `scripts/production/worker.py`
-- `scripts/production/test_worker.py`
-- `docs/as-built/herdr-adoption.md`
-- `commands/unit/direct.md`
+- `scripts/herdr/herdr.py` — `WorkerPaneEnvironment`, the worker launch-script exit hooks, `quit_agent`.
+- `scripts/herdr/worker_panes.py` — a start closes a stopped pane and opens a new one.
+- `scripts/accounts/pane_moves.py`, `scripts/shutdown/stop_resume.py` — a closed pane is a stopped agent.
+- `docs/as-built/herdr-adoption.md`, `commands/unit/direct.md` <LongLivedWorkers/> — the new rule.
 
-**Workers:** `1 writer`.
+**Gotchas:** the dead agent's last screen is lost when its pane closes; sdlc [4e9d6f2f] accepts that.
 
-**Acceptance gate:**
-- `scripts.herdr.test_herdr`, `scripts.herdr.test_worker_panes`, `scripts.accounts.test_accounts`, `scripts.shutdown.test_stop_resume` and `scripts.production.test_worker` pass. New or changed test rows: a worker launch script makes the shell exit after the agent returns and a unit-session or side-pane launch does not; a start of a stopped worker closes its old pane and opens a new one; a move and a restore of a worker with an active dispatch open a new pane after the stop; `quit_agent` returns stopped when the pane closes after the quit.
-- basedpyright on the changed Python files reads `0 errors, 0 warnings, 0 notes`.
-- The full gate passes.
-- Director proof after the gate, in a test run under `/home/natepiano/scratch/herdrcheck/`: start a Codex worker with `assign.sh`, let the pass complete, then end its agent with `/exit` typed by the director in that proof pane; the pane closes and `worker.py list` shows the worker `ClosedWorker` with its row. A second assign to the same worker opens a new pane on the same native conversation.
+**Ruled out:** a watcher process that closes stopped panes (design B).
 
 ### Phase 28c — A new Codex worker is linked to its pane when it opens  · status: moved: models-unit (sdlc [f9d7e5d2], 2026-11-08)
 
