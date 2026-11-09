@@ -165,8 +165,18 @@ from scripts.message import session_send
 from scripts.message import session_send_test_support
 
 def setUpModule():
+    previous_guard = os.environ.get("TEST_SENDER_GUARD")
+    temporary = Path(os.environ["TMPDIR"])
+    def check_cleanup():
+        assert isinstance(session_send_test_support.refusal_marker, session_send_test_support.SenderGuardNotInstalled)
+        assert os.environ.get("TEST_SENDER_GUARD") == previous_guard
+        assert not list(temporary.glob("sender-guard-*"))
+    unittest.addModuleCleanup(check_cleanup)
     session_send_test_support.forbid_real_sender()
     sys.addaudithook(last_guard)
+    if MODE == "setup_exit":
+        subprocess.run([python, str(real_sender), "--help"], check=False)
+        raise SystemExit(0)
 
 real_sender = Path(session_send.__file__).resolve().with_name("send.py")
 python = str(real_sender.parents[1] / "lib/py")
@@ -233,10 +243,23 @@ if MODE == "expected_failure":
 
 
 @dataclass(frozen=True)
+class UnwrittenFixtureTimes:
+    """The fixture exited before the runner wrote its times."""
+
+
+@dataclass(frozen=True)
 class FixtureRun:
     timed: subprocess.CompletedProcess[str]
     standard: subprocess.CompletedProcess[str]
-    times: ModuleTimes
+    recorded_times: ModuleTimes | UnwrittenFixtureTimes
+    standard_sender_folders: list[str]
+    timed_sender_folders: list[str]
+
+    @property
+    def times(self) -> ModuleTimes:
+        if isinstance(self.recorded_times, UnwrittenFixtureTimes):
+            raise AssertionError("The fixture exited without a timing report")
+        return self.recorded_times
 
 
 def read_times(path: Path) -> ModuleTimes:
@@ -258,22 +281,27 @@ def run_fixture(root: Path, name: str, source: str) -> FixtureRun:
     output = root / f"{name}.json"
     _ = output.write_text("stale output\n", encoding="utf-8")
     env = dict(os.environ)
-    for key in ("TEST_TIMES_OUT", "PYTHONPATH", "PYTHONWARNINGS"):
+    for key in ("TEST_TIMES_OUT", "PYTHONPATH", "PYTHONWARNINGS", "TEST_SENDER_GUARD"):
         _ = env.pop(key, None)
+    temporary = root / f"{name}_temporary"
+    temporary.mkdir()
     env.update({"HOME": str(root / "home"), "BUILDLOG_DIR": str(root / "buildlog"),
                 "CONF_DIR": str(root / "config"), "PYTHONDONTWRITEBYTECODE": "1",
-                "PYTHONPATH": os.pathsep.join((str(root), str(folder)))})
+                "PYTHONPATH": os.pathsep.join((str(root), str(folder))), "TMPDIR": str(temporary)})
     args = [f"{name}.test_fixture"]
     standard = subprocess.run(
         [str(RUNNER.parents[1] / "lib/py"), "-m", "unittest", *args], cwd=root, env=env,
         capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS,
     )
+    standard_sender_folders = [path.name for path in temporary.glob("sender-guard-*")]
     timed = subprocess.run(
         [str(RUNNER.parents[1] / "lib/py"), str(RUNNER), str(folder), "test_fixture.py"], cwd=root,
         env={**env, "TEST_TIMES_OUT": str(output), "CHECK_REMOVED": "1"},
         capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS,
     )
-    return FixtureRun(timed, standard, read_times(output))
+    timed_sender_folders = [path.name for path in temporary.glob("sender-guard-*")]
+    times = UnwrittenFixtureTimes() if output.read_text() == "stale output\n" else read_times(output)
+    return FixtureRun(timed, standard, times, standard_sender_folders, timed_sender_folders)
 
 
 class ModuleRunnerTests(unittest.TestCase):
@@ -311,7 +339,12 @@ class ModuleRunnerTests(unittest.TestCase):
             config.mkdir()
             _ = (config / "lint.conf").write_text("# range: 1..\nsweep_sender_timeout_seconds=17\n")
             source = SENDER_REQUEST
-            return run_fixture(root, "sender", source.replace("__MODE__", repr(mode)))
+            fixture = run_fixture(root, "sender", source.replace("__MODE__", repr(mode)))
+            if mode != "setup_exit" and isinstance(fixture.recorded_times, UnwrittenFixtureTimes):
+                raise AssertionError("The sender fixture exited without a timing report")
+            self.assertEqual(fixture.standard_sender_folders, [], fixture.standard.stderr)
+            self.assertEqual(fixture.timed_sender_folders, [], fixture.timed.stderr)
+            return fixture
 
     def test_real_sender_request_fails_the_module_with_one_diagnostic(self) -> None:
         fixture = self.sender_fixture("uncaught")
@@ -325,14 +358,17 @@ class ModuleRunnerTests(unittest.TestCase):
         self.assertEqual(fixture.times["failures"], 1)
 
     def test_sender_from_its_folder_or_as_a_module_fails_with_one_diagnostic(self) -> None:
-        for mode in ("cd", "module"):
+        for mode in ("cd", "module", "setup_exit"):
             with self.subTest(mode=mode):
                 fixture = self.sender_fixture(mode)
                 self.assertNotEqual(fixture.timed.returncode, 0, fixture.timed.stderr)
+                self.assertEqual(fixture.timed.returncode, 1, fixture.timed.stderr)
                 diagnostic = "test_fixture.py: started the real scripts/message/send.py"
                 self.assertEqual(fixture.timed.stderr.splitlines().count(diagnostic), 1, fixture.timed.stderr)
                 self.assertIn("REFUSED: real scripts/message/send.py is forbidden in tests", fixture.timed.stderr)
                 self.assertNotIn("the sender probe attempted", fixture.timed.stderr)
+                if mode == "setup_exit":
+                    self.assertEqual(fixture.standard.returncode, 0, fixture.standard.stderr)
 
     def test_caught_sender_refusal_still_fails_the_module(self) -> None:
         for mode in ("caught", "expected_failure"):
