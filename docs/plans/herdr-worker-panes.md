@@ -3357,37 +3357,21 @@ A Codex launch reads its thread only from its own process (`native_process(pid, 
 
 **Gotchas:** live check 2026-11-08 02:17 EST: `close --interrupt` on a working reviewer printed `done` in 7 s, and its follower exited 3.
 
-### Phase 41 — A pane worker compacts at the cheaper limit · status: todo
+### Phase 41 — A pane worker compacts at the cheaper limit · status: done
 
-**Depends on:** Phase 40 (both edit the pane worker launch) and Phase 34 (item 5 adds the between-turn compaction that this phase measures; pane dispatch does not read `UNIT_COMPACT_ABOVE_TOKENS` before it). sdlc [6ed41bd7], [82aaadcb], 2026-11-07.
+#### As-built
 
-Report: A pane worker's Codex launch sets the auto-compact limit from config, near 200k tokens, well above the post-compaction floor (about 100k). Report the value and the measured floor to sdlc. Cost measure (natedev via sdlc [82aaadcb], 2026-11-07): since Phase 35, pane workers compact near the full 500k window; a fix worker ran 61 requests between 250k and 343k tokens. Measure quota per request at a 200k limit and at full-window compaction, put the cheaper point in config, and send sdlc both numbers with the hash.
+`UNIT_COMPACT_ABOVE_TOKENS` in `config/direct.conf` is 200000 (was 100000). `worker._compact_before_dispatch` reads it between turns, after a closed conversation reopens and before the next prompt is typed (Phase 34 item 5). No code changed.
 
-**Decision (sdlc [b384f355], 2026-11-08):** compaction runs between turns only (Phase 34 item 5). This phase sets `UNIT_COMPACT_ABOVE_TOKENS` to the measured cheaper point; it adds no launch limit. One long turn can grow past the point until it ends; Codex's own full-window compaction covers it. Send natedev both numbers and the main hash.
-
-**Constraint from Phase 28f:** a done worker's pane closes after each pass, and its next pass resumes the same conversation in a new pane (`scripts/astra/test_design_roles.py:160`). Run the threshold compaction after the saved conversation reopens and before the next prompt is typed. Test row: complete and close one pass, resume its conversation in a new pane, compact above the limit, and keep the native identity.
-
-#### Work Order
-
-**Goal:** `UNIT_COMPACT_ABOVE_TOKENS` holds the measured cheaper compaction point, and sdlc gets both numbers.
-
-**Spec:**
-
-1. Read the Codex rollouts of pane workers since Phase 35 (2026-11-07). Read only `token_count` events: input, cached input, output and the `rate_limits` used percent.
-2. Measure the post-compaction floor: the context size of the first request after each compaction.
-3. Measure the quota cost per request in context bands. Then compare the quota per unit of work at three points: the current 100k, 200k and the full window. Include the cost of each compaction request.
-4. Keep the measurement script and its output in the phase folder. Commit no script.
-5. Set `UNIT_COMPACT_ABOVE_TOKENS` in `config/direct.conf` to the cheaper point. Update its comment with both numbers and the date.
-6. Phase 34 item 5 built the between-turn compaction. `test_closed_conversation_compacts_before_the_next_dispatch` is the 28f test row: it closes a pass, reopens the conversation in a new pane, compacts above the limit and keeps the native identity. Change no code unless the measurement shows a defect.
-7. Add no check, refusal, validation, retry or wait that this list does not name.
+Measurement (2026-11-09, sdlc [b384f355]): a replay of 36,115 pane worker requests from 189 Codex rollouts since 2026-11-07, reading only `token_count` events. Median context after a compaction: 94,144 tokens. Estimated cost per request, with weights 1 uncached input, 0.05 cached input and 5 output: 20,583 at 200k, 22,563 at the full window, 94,402 at 100k. 200k is cheaper than the full window in every sensitivity case. When compaction chances are sparse, 100k and 200k differ by less than 1%.
 
 **Files:**
-
 - `config/direct.conf` — the value and its comment.
+- Test row (existing): `scripts/production/test_worker.py` `test_closed_conversation_compacts_before_the_next_dispatch` closes a pass, reopens the conversation in a new pane, compacts above the limit and keeps the native identity.
 
-**Workers:** `1 writer` — `impl7`.
+**Binds later work:** a limit at or below the post-compaction floor compacts again at once; keep the limit well above that floor.
 
-**State:** none new.
+**Gotchas:** compaction costs and the full-window cutoff are model assumptions; token records carry no dispatch boundaries. The floor of newer sessions is lower (median 39,275), so the cheaper point can move.
 
 ### Phase 38 — One worker's assign reads only its own pane and row · status: done
 
