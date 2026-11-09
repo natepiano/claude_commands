@@ -53,10 +53,8 @@ class TurnOutcome(StrEnum):
 
 def hook_event(value: dict[str, object]) -> WorkerEvent:
     """Convert each native hook input at the boundary."""
-    if value.get("type") == "agent-turn-complete":
-        return WorkerEvent(str(value.get("thread-id", "")), reply=str(value.get("last-assistant-message", "")))
     if value.get("hook_event_name") == "Stop":
-        return WorkerEvent(str(value.get("session_id", "")), reply=str(value.get("last_assistant_message", "")))
+        return WorkerEvent(str(value.get("session_id", "")), reply=str(value.get("last_assistant_message") or ""))
     kind = value.get("event")
     if kind in (EventKind.RUN_FINISHED, EventKind.STAGE_READY):
         return WorkerEvent(str(value.get("thread_id", "")), EventKind(str(kind)))
@@ -356,14 +354,16 @@ def main(arguments: list[str] | None = None) -> int:
                 raise ValueError(f"worker {args[1]} is not in this director's staff")
             _ = handle(WorkerEvent(str(row.current_session), EventKind.STAGE_READY))
             return 0
-        separate = len(args) == 2 and args[0] == "--handle-hook"
-        payload = args[1] if separate else args[0] if args else sys.stdin.read()
+        separate = args == ["--handle-hook"]
+        payload = args[0] if args and not separate else sys.stdin.read()
         value = cast(dict[str, object], json.loads(payload))
         if separate:
             _ = handle(hook_event(value))
         else:
-            _ = subprocess.Popen([sys.executable, str(Path(__file__).resolve()), "--handle-hook", payload],
-                start_new_session=True, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            child = subprocess.Popen([sys.executable, str(Path(__file__).resolve()), "--handle-hook"],
+                start_new_session=True, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            with cast(io.BufferedWriter, child.stdin) as stream:
+                _ = stream.write(payload.encode())
         return 0
     except (OSError, ValueError, staff.StaffUnreadable, staff.StaffRefused, herdr.HerdrFailure) as error:
         print(f"turn_end: {error}", file=sys.stderr)
