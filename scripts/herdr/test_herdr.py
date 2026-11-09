@@ -1606,14 +1606,13 @@ class LaunchDestinationTests(StaffTestCase):
         _ = self.enterContext(patch.object(herdr, "_PLATFORM", "linux"))
         _ = self.enterContext(patch.object(herdr, "_startup_processes", return_value=herdr.PaneAtShell()))
 
-    def test_launch_exits_the_shell_only_for_worker_panes(self) -> None:
+    def test_every_launch_keeps_the_shell_after_the_agent_returns(self) -> None:
         for kind in ("claude", "codex"):
             for purpose in ("worker", "unit", "side"):
                 for setups in (1, 2):
                     with self.subTest(kind=kind, purpose=purpose, setups=setups):
                         environment = {"CLAUDE_CONFIG_DIR": str(self.root / "account"), "PATH": os.defpath}
-                        prepared = (herdr.WorkerPaneEnvironment(self.root, environment) if purpose == "worker" else
-                                    herdr.PreparedAgentEnvironment(self.root, environment))
+                        prepared = herdr.PreparedAgentEnvironment(self.root, environment)
                         destination = (herdr.NewTab("units", "unit") if purpose == "unit" else
                                        herdr.SplitPane("parent", "right", 0.5, purpose))
                         client = Mock(spec=herdr.Herdr)
@@ -1625,15 +1624,14 @@ class LaunchDestinationTests(StaffTestCase):
                                 herdr.NoOpeningPrompt(), 5000, agent=purpose)
                         self.assertEqual(launched.pane, "launched-pane")
                         script = cast(list[str], cast(Mock, client.run_in_pane).call_args.args[1])[1]
-                        command = shlex.join(["eval", script + '; print -r -- "worker-hooks:${#preexec_functions}"'])
+                        command = shlex.join(["eval", script])
                         setup = (command + "\n") * setups
                         shell = subprocess.run([shutil.which("zsh") or "/bin/zsh", "-dfi"],
                             input=f'{kind}() {{ print agent-returned; return 23; }}\n{setup}{kind}\nprint shell-retained\n',
                             cwd=self.root, env=environment, capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS)
                         self.assertIn("agent-returned", shell.stdout)
-                        self.assertEqual(shell.stdout.splitlines().count("worker-hooks:1"), setups if purpose == "worker" else 0)
-                        self.assertEqual("shell-retained" in shell.stdout, purpose != "worker")
-                        self.assertEqual(shell.returncode, 23 if purpose == "worker" else 0, shell.stderr)
+                        self.assertIn("shell-retained", shell.stdout)
+                        self.assertEqual(shell.returncode, 0, shell.stderr)
 
     def test_quit_agent_accepts_a_shell_or_a_closed_worker_pane(self) -> None:
         from scripts.herdr import test_worker_panes, worker_panes
@@ -1645,8 +1643,8 @@ class LaunchDestinationTests(StaffTestCase):
                 self.addCleanup(case.doCleanups)
                 opened = case.start()
                 assert isinstance(opened, worker_panes.OpenWorker)
-                if closure != "before-row":
-                    case.world.exiting_panes.discard(opened.pane)
+                if closure == "before-row":
+                    case.world.exiting_panes.add(opened.pane)
                 activity = case.world.pane_activity
 
                 def read_activity(pane: str) -> herdr.PaneAtShell | herdr.PaneRunning:

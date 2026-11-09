@@ -190,8 +190,11 @@ class MergeCheckpointTests(MergeCheckpointFixture):
                 self.assertEqual(self.events("checkpoint-test"), [])
 
     def test_as_built_merges_after_code_checkpoint_reaches_branch_through_second_parent(self) -> None:
-        for merge_production, unmerged_code in ((False, False), (True, False), (True, True)):
-            with self.subTest(merge_production=merge_production, unmerged_code=unmerged_code):
+        for merge_production, unmerged_code, side_docs, missing_main in (
+                (False, False, False, False), (True, False, False, False), (True, True, False, False),
+                (False, False, True, False), (False, False, False, True)):
+            with self.subTest(merge_production=merge_production, unmerged_code=unmerged_code,
+                              side_docs=side_docs, missing_main=missing_main):
                 shutil.rmtree(self.root)
                 _ = shutil.copytree(self.fixture_snapshot, self.root)
                 self.bind_fixture(self.root)
@@ -208,15 +211,30 @@ class MergeCheckpointTests(MergeCheckpointFixture):
                 closing = self.as_built_commit()
                 if unmerged_code:
                     closing = self.checkpoint(content="code after the as-built commit\n")
+                if side_docs:
+                    _ = self.git("checkout", "-b", "side-phase", f"{closing}^", cwd=self.unit)
+                    side = self.checkpoint("docs/side.md", "unmerged side phase\n",
+                                           subject="checkpoint(beta): side phase", push=False)
+                    _ = self.git("checkout", "alpha-branch", cwd=self.unit)
+                    _ = self.git("merge", "--no-ff", "-m", "Merge side phase after as-built", side, cwd=self.unit)
+                    _ = self.git("push", "origin", "alpha-branch", cwd=self.unit)
+                    closing = self.git("rev-parse", "HEAD", cwd=self.unit)
                 if merge_production:
                     _ = self.git("fetch", "origin", "production", cwd=self.unit)
                     _ = self.git("merge", "--no-ff", "-m", "Merge production after as-built",
                                  "origin/production", cwd=self.unit)
                     _ = self.git("push", "origin", "alpha-branch", cwd=self.unit)
                     closing = self.git("rev-parse", "HEAD", cwd=self.unit)
+                if missing_main:
+                    _ = self.push_main_change("docs/main.md", "independent main change\n")
+                    _ = self.git("fetch", "origin", "main", cwd=self.unit)
+                    _ = self.git("merge", "--no-ff", "-m", "Merge main after as-built", "origin/main", cwd=self.unit)
+                    _ = self.git("push", "origin", "alpha-branch", cwd=self.unit)
+                    closing = self.git("rev-parse", "HEAD", cwd=self.unit)
+                    _ = self.git("update-ref", "-d", "refs/remotes/origin/main")
                 (self.state / "events.jsonl").unlink()
                 result = self.run_checkpoint(closing, "--as-built", review=False)
-                if unmerged_code:
+                if unmerged_code or side_docs:
                     self.assert_stopped_before_merge(result, "held", "phase 2 code checkpoint has not merged")
                     self.assertIn("wait for the phase code checkpoint to merge, then resend the shrink",
                                   result.process.stdout)
