@@ -224,7 +224,8 @@ def _reap_orphans_locked(runs: Path, worker: str = "") -> list[str]:
         if worker and raw.get("worker") != worker:
             continue
         if raw.get("status") == "finished" and raw.get("completion_pending"):
-            _finish_record(path, _read_record(path))
+            if not detached_run_process.supervises(_integer(raw.get("pid")), path):
+                _finish_record(path, _read_record(path))
             continue
         if not _orphaned(path, raw, now):
             continue

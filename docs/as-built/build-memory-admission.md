@@ -1454,6 +1454,10 @@ Resolved paths must stay inside these roots. The scan does not follow directory 
 
 The sweep reads the local and natedev Mac claims under their existing admission locks.
 It keeps these locks until deletion ends. A live or kept claim protects its mirror.
+For a marked target without a copy record, the claim check compares each existing claimed mirror path.
+A missing unrelated claimed mirror does not protect the target.
+Other claim read errors still protect the target.
+Remote mirror removal keeps its own lease exemption and still checks sibling leases.
 An unreadable claim reply or a lost lock process protects every target.
 The Mac uses `lsof` for other process use. Unreadable process use protects every target.
 The sweep checks protection again before each target deletion.
@@ -1473,6 +1477,16 @@ The floor job writes both output streams to `~/Library/Logs/nate-jobs/disk-floor
 Nix-darwin activation deploys the job definition and its PATH.
 The Mac floor finalizer uses the shared crossing path above and saves its receipts on the Mac.
 Its session message goes to natedev; its phone title and body name `Mac`.
+When a crossing delivery is pending, the Mac measures each direct folder child under its floor roots.
+Each size estimates the file blocks that deleting that folder alone frees.
+An inode counts once only when every hard link is inside that folder.
+An inode with a link outside the folder counts zero.
+The measurement does not follow directory symlinks.
+The alert lists these folders from largest to smallest and recommends the largest folder.
+Protected folders keep their protected labels.
+The measurement reads the Mac folders directly and needs no natedev disk snapshot.
+The finalizer derives the machine name from its floor policy.
+Unreadable folders can make the measured sizes incomplete.
 
 
 ### Free memory, head protection, and step slots
