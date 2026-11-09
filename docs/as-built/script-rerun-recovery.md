@@ -14,7 +14,8 @@ Messages, run records, unit retirement and held design roles also finish on a re
 
 - `scripts/message/send.py`: an emergency attempt saves its owner pid and process start before delivery. Only a gone or replaced owner releases the claim; a live owner or an unknown result keeps it. An undelivered emergency releases its claim, so only delivery starts the live window. `accept_sent` saves the clearing record with the acceptance. `pending` prints under the queue lock before it removes queue files. `template_fix_notice` starts its child before it publishes the daily stamp.
 - `scripts/direct/progress_history.py`: `_start_phase` saves the event intent, and `_finish_phase_start` repairs a missing `phase_started`. `record_turn_wait` saves the declaration before the wait event. `record_turn_wait` and `finish_turn_wait` share the marker lookup `_turn_waits_for_marker`.
-- `scripts/direct/workers.py`: `end_unit` repeats the worker end for an `ended` entry, and a cleanup failure keeps the ledger. Roster writes go through `worker_lifecycle.locked_state` and `session_staff.publish_worker_roster`.
+- Native worker cleanup retains staff identity and dispatch history.
+  The [worker lifecycle](long-lived-workers.md#retirement-and-resume) defines cleanup, closed panes, and later assignment.
 - `scripts/astra/astra_roles.py`: `ExecProcess` saves the process identity through `process_start`. `scripts/astra/astra_work.py`: `create_text_atomic` writes the whole brief, and an identical retry succeeds.
 - `scripts/astra/design_roles.py`: creation keeps `not_started` apart from `outcome_unknown` and never starts a second thread. Rebind and checkout moves finish through `_finish_rebind`, and `end` finishes through `_finish_end`. `unbind_run` compares run folders as paths.
 

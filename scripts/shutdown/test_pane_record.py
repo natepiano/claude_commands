@@ -21,7 +21,7 @@ from scripts.shutdown import pane_record
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.production import staff
 from scripts.production.staff_test_support import fixture_runtime_id, isolated_staff_file
-from scripts.herdr import herdr
+from scripts.herdr import herdr, pane_launch
 from scripts.herdr.test_herdr import native_process_commands
 from scripts.message import sessions
 from scripts.message import sessions as runtime_sessions
@@ -65,6 +65,55 @@ class PaneRecordTests(unittest.TestCase):
         }
 
         _ = self.enterContext(isolated_staff_file(self.root / "staff.json", self.env))
+
+    def test_pane_start_replaces_staff_home_without_a_launch_copy(self) -> None:
+        for kind, variable, folder in (("claude", "CLAUDE_CONFIG_DIR", ".claude2"),
+                                       ("codex", "CODEX_HOME", ".codex2")):
+            owner = staff.ensure("showrunner", name="TEST-" + kind,
+                                 runtime_id=fixture_runtime_id("TEST-home-" + kind))
+            for home in (self.root / folder, self.root / (folder + "-moved")):
+                entry = pane_record.launch("TEST-pane", owner.current_session, str(self.root),
+                                           {variable: str(home)}, [kind], kind=cast(Literal["claude", "codex"], kind))
+                pane_record.write("TEST-session", entry)
+                saved = staff.by_id(owner.id)
+                self.assertIsNotNone(saved)
+                assert saved is not None
+                self.assertEqual(saved.to_json().get("home"), str(home))
+                self.assertNotIn("config_dir", pane_record.read("TEST-session")["TEST-pane"])
+
+    def test_admission_completes_the_pane_home_publication(self) -> None:
+        parent = staff.ensure("showrunner", name="TEST-parent", runtime_id=fixture_runtime_id("TEST-pane-parent"))
+        for member_kind in ("showrunner", "unit", "worker"):
+            session = staff.native_id(fixture_runtime_id("TEST-pane-" + member_kind))
+            home = self.root / ("TEST-home-" + member_kind)
+            entry = pane_record.launch("TEST-" + member_kind, session, str(self.root),
+                {"CLAUDE_CONFIG_DIR": str(home)}, ["claude"])
+            pane_record.write("TEST-admission", entry)
+            self.assertIn("config_dir", pane_record.read("TEST-admission")["TEST-" + member_kind])
+            if member_kind == "worker":
+                row = staff.ensure_worker(session, "TEST-worker", parent.id)
+            else:
+                row = staff.ensure(cast(staff.Kind, member_kind), name="TEST-" + member_kind,
+                    parent=staff.ReportsTo(parent.id), runtime_id=session)
+            self.assertIsInstance(row.home, staff.HomeUnknown)
+            row = pane_launch.staff_admitted(row)
+            self.assertEqual(row.to_json().get("home"), str(home))
+            retained = pane_record.read("TEST-admission")["TEST-" + member_kind]
+            self.assertNotIn("config_dir", retained)
+            self.assertEqual(pane_launch.config_home(retained), staff.SessionHome(home))
+
+    def test_retained_write_keeps_the_running_home_until_a_pane_start(self) -> None:
+        owner = staff.ensure("showrunner", name="TEST-write-order", runtime_id=fixture_runtime_id("TEST-write-order"))
+        running_home, target_home = self.root / ".claude2", self.root / ".claude3"
+        entry = pane_record.launch("TEST-write-order", owner.current_session, str(self.root),
+                                   {"CLAUDE_CONFIG_DIR": str(running_home)}, ["claude"])
+        pane_record.write("TEST-write-order", entry)
+        entry["config_dir"] = str(target_home)
+        pane_record.write("TEST-write-order", entry)
+        current = staff.by_id(owner.id)
+        assert current is not None
+        self.assertEqual(current.to_json().get("home"), str(running_home))
+        self.assertNotIn("config_dir", pane_record.read("TEST-write-order")["TEST-write-order"])
 
     def start(self, pane: str, session_id: str, *flags: str, source: str = "startup") -> subprocess.CompletedProcess[str]:
         """The hook under a process whose argv is `claude <flags>`, as a pane's Claude runs it."""
@@ -299,6 +348,7 @@ class PaneRecordTests(unittest.TestCase):
             pane_record.write("agents", entry)
             expected = entry.copy()
             expected["environment"] = {}
+            _ = expected.pop("config_dir", None)
             self.assertEqual(pane_record.read("agents"), {"w1:p2": expected})
             self.assertEqual(pane_record.forget_unit(identity), ["agents:w1:p2"])
             self.assertEqual(pane_record.read("agents"), {})
@@ -361,7 +411,7 @@ class PaneRecordTests(unittest.TestCase):
             self.assertEqual(pane_record.read("agents")["w1:p2"]["environment"], {"ENABLE_TOOL_SEARCH": "true"})
             pane_record.save("agents", {"w1:p2": entry})
             self.assertEqual(pane_record.read("agents")["w1:p2"]["environment"], {"ENABLE_TOOL_SEARCH": "true"})
-            self.assertEqual(pane_record.read("agents")["w1:p2"]["config_dir"], entry["config_dir"])
+            self.assertEqual(pane_launch.config_home(pane_record.read("agents")["w1:p2"]), pane_launch.config_home(entry))
         self.assertEqual(entry["environment"]["STAFF_ID"], "parent")
 
     def test_worker_resume_uses_the_typed_parent_for_its_folder(self) -> None:
@@ -575,7 +625,8 @@ class PaneRecordTests(unittest.TestCase):
                 pane_record.write("agents", session_staff.record_membership(launch))
                 published = pane_record.read_strict("agents")["w1:p2"]
                 self.assertEqual(published.get("kind"), "codex")
-                self.assertEqual(published["config_dir"], environment["CODEX_HOME"])
+                self.assertNotIn("config_dir", published)
+                self.assertEqual(pane_launch.config_home(published), staff.SessionHome(Path(environment["CODEX_HOME"])))
                 self.assertEqual(published["session_id"], owner.id)
                 self.assertEqual(published["environment"], {
                     "CODEX_HOME": environment["CODEX_HOME"], "ENABLE_TOOL_SEARCH": "true",
@@ -652,7 +703,7 @@ class MacRecordTests(unittest.TestCase):
             environment = pane_record._process_environment(100)  # pyright: ignore[reportPrivateUsage]
         entry = pane_record.launch("w1:p1", "019b3a40-4250-7000-8000-000000000102", "/work/alpha", environment, arguments)
         self.assertEqual((entry["name"], entry["model"], entry["flags_read"]), ("alpha", "opus", True))
-        self.assertEqual(entry["config_dir"], "/Users/n/.claude3")
+        self.assertEqual(pane_launch.config_home(entry), staff.SessionHome(Path("/Users/n/.claude3")))
         self.assertNotIn(TOKEN, json.dumps(environment) + json.dumps(entry))
 
 

@@ -2,8 +2,10 @@
 from __future__ import annotations
 
 from pathlib import Path
+import os
 import tempfile
 import unittest
+from typing import cast
 from unittest.mock import patch
 
 
@@ -23,6 +25,11 @@ BAD_GATE_RECORDS: tuple[tuple[str, str], ...] = (
 )
 
 
+def setUpModule() -> None:
+    root = Path(unittest.enterModuleContext(tempfile.TemporaryDirectory()))
+    write_memory_config(root / "build_admission.conf")
+    _ = cast(object, unittest.enterModuleContext(patch.dict(os.environ, {"CONF_DIR": str(root)})))
+
 
 class ProfileRankTests(unittest.TestCase):
     @staticmethod
@@ -32,10 +39,18 @@ class ProfileRankTests(unittest.TestCase):
                            (3 * GIB, 8 * GIB, GIB, 4 * GIB),
                            (6 * GIB, 4 * GIB, 7 * GIB, 3 * GIB)))
 
-    def test_rank_two_uses_the_second_highest_run_in_each_bin(self) -> None:
-        merged = progress.merge_profiles(self.runs(), rank=2)
-        assert isinstance(merged, progress.ProgressProfile)
-        self.assertEqual(merged.phases[0].bins, (6 * GIB, 4 * GIB, 5 * GIB, 3 * GIB) * 5)
+    def test_rank_floor_and_share_select_each_bin(self) -> None:
+        ordinary = progress.ProgressProfile((progress.PhaseProfile("build:1", (GIB,) * 20),))
+        runaway = tuple(progress.ProgressProfile((progress.PhaseProfile("build:1", (peak,) * 20),))
+                        for peak in (16 * GIB, 26 * GIB))
+        for runs, expected in (
+            (self.runs(), (6 * GIB, 4 * GIB, 5 * GIB, 3 * GIB) * 5),
+            ((ordinary,) * 20 + runaway, (GIB,) * 20),
+        ):
+            with self.subTest(count=len(runs)):
+                merged = progress.merge_profiles(runs, rank=2)
+                assert isinstance(merged, progress.ProgressProfile)
+                self.assertEqual(merged.phases[0].bins, expected)
 
     def test_rank_one_keeps_the_highest_run_in_each_bin(self) -> None:
         merged = progress.merge_profiles(self.runs(), rank=1)
@@ -75,10 +90,13 @@ class ProfileRankTests(unittest.TestCase):
                 progress.save_profile(directory / f"run-{index}.json", profile, 100)
             history = progress.ProfileHistory(root)
             config = fixture.root / "build_admission.conf"
-            for rank in (2, 1, 2):
-                with self.subTest(rank=rank):
-                    write_memory_config(config, progress_profile_rank=str(rank))
+            for rank, share in ((2, 10), (1, 10), (1, 50), (1, 0), (2, 10), (1, 0)):
+                with self.subTest(rank=rank, share=share):
+                    write_memory_config(config, progress_profile_rank=str(rank), peak_history_share_percent=str(share))
+                    history.prune(90)
                     self.assertEqual(history.matching("build", 90), progress.merge_profiles(self.runs(), rank=rank))
+            write_memory_config(config, progress_profile_rank="1", peak_history_share_percent="50")
+            self.assertEqual(history.matching("build", 90), progress.merge_profiles(self.runs(), rank=2, share_percent=0))
 
     def test_saved_records_preserve_the_source_and_the_highest_bin_processes(self) -> None:
         with AdmissionFixture() as fixture:
@@ -121,6 +139,11 @@ class ProfileRankTests(unittest.TestCase):
             for value in ("0", "-1", "text"):
                 with self.subTest(value=value), self.assertRaises(conf.Unusable):
                     conf.check(path, "progress_profile_rank", value)
+            for value in ("0", "10", "50"):
+                conf.check(path, "peak_history_share_percent", value)
+            for value in ("-1", "51", "0.1", "text"):
+                with self.subTest(share=value), self.assertRaises(conf.Unusable):
+                    conf.check(path, "peak_history_share_percent", value)
 
     def test_two_saved_gate_outliers_do_not_set_the_rank_two_need(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

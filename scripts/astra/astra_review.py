@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""astra_review.py — Ask gpt-6-astra for a review of one document and print the review.
+"""Ask gpt-6-astra to review one document.
 
 Usage: astra_review.py [--run-directory <dir> --phase <id>] <document> [focus...]
 
 The review uses the workers account with read-only access and xhigh reasoning.
 A managed review publishes its worker before it submits the prompt.
-The final message is saved under /tmp/claude/astra/ and printed.
+The hook saves a managed reply under /tmp/claude/astra/.
+Use --read <reply> --run-directory <run> after the hook reports completion.
 A failed review exits 1. A missing document or refused admission exits 2.
 """
 
@@ -24,7 +25,8 @@ from pathlib import Path
 
 from scripts.astra import astra_work, design_roles  # noqa: E402
 from scripts.lib import unit_runs
-from scripts.production import staff
+from scripts.production import staff, worker
+from scripts.direct import progress_history
 from scripts.lib.atomic_file import write_text_atomic
 
 MODEL = "gpt-6-astra"
@@ -87,13 +89,16 @@ def _managed_review(review: Path, log: Path, target: str) -> int:
     """Run one managed review through assign.sh."""
     run = log.parent
     with log.open("w", encoding="utf-8") as output:
-        return subprocess.run([
+        result = subprocess.run([
             "bash", str(SCRIPTS / "direct/assign.sh"), "--role", "review", "--operation", "astra-review",
             "--target", target, "--policy", "astra-reviewer",
             "--new-worker", f"astra-reviewer{os.getpid()}", "--session-dir", str(run), "--cwd", str(Path.cwd()),
             "--prompt", str(run / "prompt.md"), "--summary", str(review), "--log", str(run / "turn.log"),
             "--model", MODEL, "--effort", REASONING,
-        ], stdout=output, stderr=subprocess.STDOUT, text=True, check=False).returncode
+        ], stdout=output, stderr=subprocess.STDOUT, text=True, check=False)
+    if result.returncode == 0 and log.read_text(encoding="utf-8").splitlines()[-1:] == ["submitted"]:
+        return worker.DispatchSubmission.SUBMITTED
+    return result.returncode
 
 
 def run_review(review: Path, prompt: str, log: Path) -> int:
@@ -105,6 +110,19 @@ def run_review(review: Path, prompt: str, log: Path) -> int:
         target = "staff-worker"
     write_text_atomic(log.parent / "prompt.md", prompt)
     return _managed_review(review, log, target)
+
+
+submitted_review = design_roles.submitted_review
+
+
+def read_review(reply: Path, run: Path) -> int:
+    """Read a completed pass after the caller receives its hook message."""
+    if not progress_history.reply_completed(run, reply):
+        print("astra_review: the review pass is not completed", file=sys.stderr)
+        return 1
+    print(reply.read_text(encoding="utf-8").strip())
+    print(f"\nSaved: {reply}")
+    return 0
 
 
 def held_review(design: design_roles.HeldDesign, focus: str, work: astra_work.PhaseWork | astra_work.StandaloneWork) -> int:
@@ -122,12 +140,8 @@ def held_review(design: design_roles.HeldDesign, focus: str, work: astra_work.Ph
     request = folder / f"review-request-{os.getpid()}-{time.time_ns()}.txt"
     write_text_atomic(request, f"Review {design.document}.\nFocus: {focus}\n")
     try:
-        reply = design_roles.resume(design.placement.design_id + "/reviewer", request)
-        if not reply.is_file():
-            raise design_roles.RoleRefused("held reviewer returned no saved reply")
-        print(f"# {MODEL} review of {design.document} (held reviewer)\n")
-        print(reply.read_text(encoding="utf-8").strip())
-        print(f"\nSaved: {reply}")
+        submitted = design_roles.resume(design.placement.design_id + "/reviewer", request)
+        submitted_review(submitted.reply, submitted.run)
         return 0
     except (OSError, ValueError) as error:
         print(f"astra_review: held reviewer busy or unavailable: {str(error).replace(chr(10), ' ')}", file=sys.stderr)
@@ -137,6 +151,12 @@ def held_review(design: design_roles.HeldDesign, focus: str, work: astra_work.Ph
 
 
 def main(arguments: list[str]) -> int:
+    if len(arguments) == 4 and arguments[0] == "--read" and arguments[2] == "--run-directory":
+        try:
+            return read_review(Path(arguments[1]).expanduser().resolve(), Path(arguments[3]).expanduser().resolve())
+        except (OSError, ValueError, SystemExit) as error:
+            print(f"astra_review: {error}", file=sys.stderr)
+            return 1
     usage = "usage: astra_review.py [--run-directory <dir> --phase <id>] <document> [focus...]"
     if not arguments or arguments[0] in ("-h", "--help"):
         print(usage, file=sys.stderr)
@@ -182,6 +202,9 @@ def main(arguments: list[str]) -> int:
     write_text_atomic(folder / "prompt.md", prompt)
     log = folder / "codex.log"
     returncode = run_review(review, prompt, log)
+    if returncode is worker.DispatchSubmission.SUBMITTED:
+        submitted_review(review, folder)
+        return 0
     written = review.read_text(encoding="utf-8").strip() if review.is_file() else ""
     if returncode != 0 or not written:
         why = f"exit {returncode}" if returncode != 0 else "no review was written"

@@ -23,10 +23,11 @@ from zoneinfo import ZoneInfo
 
 from scripts.build_queue import build_queue, head_facts, queue_card, queue_evidence, queue_view
 from scripts.build_queue.queue_fixture import (
-    NOW, ZONE, GOLDEN, QueueFixture, bump_line, head_reading, queue_read_fixture,
+    NOW, ZONE, QueueFixture, bump_line, head_reading, queue_read_fixture,
     queue_time_line, token_gap_line, waiting_rows, write_bumps, write_process, write_token_gaps,
 )
 from scripts.build_queue.queue_lines import QueueLines, Span, json_form, plain
+from scripts.build_queue.test_queue_view import queue_json_text
 from scripts.lib.terminal_cells import terminal_width
 from scripts.lib.build_steps import read_step_names
 from scripts.buildlog import store
@@ -69,6 +70,7 @@ class QueueTests(NotificationGuardedTestCase):
         write_memory_config(config)
         self.enterContext(mock.patch.dict(os.environ, {"COLUMNS": "100", "CONF_DIR": str(config.parent)}))
         self.enterContext(mock.patch.dict(os.environ, {"MAC_IDLE_STATE_DIR": str(self.root / "mac-idle")}))
+        _ = self.enterContext(mock.patch.object(os, "cpu_count", return_value=17))
 
     @staticmethod
     def entry(session: str, name: str) -> tuple[str, UnitLabels]:
@@ -114,6 +116,28 @@ class QueueTests(NotificationGuardedTestCase):
             mine.assert_not_called()
         return status, output.getvalue(), errors.getvalue()
 
+    def invoke_text(self, reading: records.QueueRead, *arguments: str) -> tuple[int, str, str]:
+        status, output, errors = self.invoke(reading, "--json", *arguments)
+        self.assertEqual(status, 0, errors)
+        return status, queue_json_text(cast(QueueLines, json.loads(output))) + "\n", errors
+
+    def test_plain_view_routes_refuse_and_name_the_build_page(self) -> None:
+        reading = self.fixture.read()
+        for arguments in ((), ("1",), ("mine",), ("--columns", "60"), ("--you", "caller", "folder")):
+            with self.subTest(arguments=arguments):
+                output, errors = io.StringIO(), io.StringIO()
+                with mock.patch("sys.argv", ["build_queue.py", *arguments]), \
+                     mock.patch.object(memory_admit, "queue_read", return_value=reading) as read, \
+                     mock.patch.object(admission_client, "mine", return_value=reading) as mine, \
+                     redirect_stdout(output), redirect_stderr(errors):
+                    status = build_queue.main()
+                self.assertEqual(status, 3)
+                self.assertEqual(output.getvalue(),
+                    "build queue: the queue view is on the build page; run /build:page\n")
+                self.assertEqual(errors.getvalue(), "")
+                read.assert_not_called()
+                mine.assert_not_called()
+
     def test_cli_keeps_running_grants_above_numbered_waiters(self) -> None:
         with QueueFixture() as fixture:
             reading = fixture.read()
@@ -126,7 +150,7 @@ class QueueTests(NotificationGuardedTestCase):
             reading = queue_read_fixture(replace(reading.view, running=grants), policy=admission_policy_fixture())
             self.labels_read.return_value = {**fixture.labels,
                 **{step.session_id: UnitLabels("gate", "builds", "wrong-unit") for step in grants}}
-            text = self.snapshot_text(self.snapshot(reading))
+            text = queue_json_text(self.snapshot(reading))
             rows = text.splitlines()
             running = [line for line in rows if line.lstrip().startswith("run")]
             self.assertEqual(len(running), 3)
@@ -147,7 +171,7 @@ class QueueTests(NotificationGuardedTestCase):
             with admission.serving(), \
                  mock.patch.object(memory_admit, "queue_read", side_effect=admission_client.view), \
                  mock.patch.object(records, "_warned_configuration_diagnostics", set[records.ConfigurationDiagnostic]()), \
-                 mock.patch("sys.argv", ["build_queue.py"]), \
+                 mock.patch("sys.argv", ["build_queue.py", "--json"]), \
                  redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()) as errors:
                 self.assertEqual(build_queue.main(), 0)
                 self.assertEqual(build_queue.main(), 0)
@@ -160,24 +184,19 @@ class QueueTests(NotificationGuardedTestCase):
         self.assertEqual(errors, "")
         return cast(QueueLines, json.loads(output))
 
-    @staticmethod
-    def snapshot_text(data: QueueLines) -> str:
-        return "\n".join("".join(span["text"] for span in row) for row in data["lines"])
-
-    def test_terminal_and_pane_share_the_recorded_complete_page(self) -> None:
+    def test_pane_matches_the_recorded_complete_page(self) -> None:
         fixture = self.enterContext(QueueFixture())
         reading = fixture.read()
         self.labels_read.return_value = fixture.labels
         status, output, errors = self.invoke(reading, "--json", "--columns", "100", "1")
         self.assertEqual((status, errors), (0, ""))
         recorded = cast(QueueLines, json.loads(output))
-        status, terminal, errors = self.invoke(reading, "--columns", "100", "1")
-        self.assertEqual((status, errors), (0, ""))
-        self.assertEqual(terminal, (GOLDEN / "card_1.txt").read_text())
-        def cells(text: str) -> str:
-            return text.translate(str.maketrans({glyph: "█" for glyph in "░·▒▏▎▍▌▋▊▉"}))
-        self.assertEqual(cells(self.snapshot_text(recorded)), cells(terminal.rstrip("\n")))
-        self.assertIn("Frees when:", self.snapshot_text(recorded))
+        model = replace(self.model(reading, selected=True),
+                        ci_memory_slice=records.read_memory_config().ci_memory_slice)
+        page = [*queue_view.render_view(model, 100, colour=True, selector="1"),
+                (), *queue_card.render_selection(model, "1", 100)]
+        self.assertEqual(queue_json_text(recorded), plain(page))
+        self.assertIn("Frees when:", queue_json_text(recorded))
 
     def test_head_line_uses_singular_for_one_recorded_bump(self) -> None:
         write_bumps(NOW, [bump_line(NOW - 1)])
@@ -197,7 +216,7 @@ class QueueTests(NotificationGuardedTestCase):
                     env=environment, capture_output=True, text=True, timeout=30, check=False)
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
-    def test_mac_idle_alert_precedes_queue_and_selection_in_text_and_json(self) -> None:
+    def test_mac_idle_alert_precedes_queue_and_selection_in_json(self) -> None:
         _ = write_idle_alert(self.root / "mac-idle", NOW)
         reading = head_reading(now=NOW)
         expected = ("MAC IDLE 10 min: 7 steps wait for the Mac. Blocked by research since "
@@ -207,7 +226,7 @@ class QueueTests(NotificationGuardedTestCase):
              mock.patch.object(build_queue, "user_zone", return_value=ZoneInfo("UTC")):
             for arguments in ((), ("1",)):
                 with self.subTest(arguments=arguments):
-                    code, output, errors = self.invoke(reading, *arguments)
+                    code, output, errors = self.invoke_text(reading, *arguments)
                     self.assertEqual((code, errors), (0, ""))
                     self.assertEqual(output.splitlines()[0], expected)
                     data = self.snapshot(reading, *arguments)
@@ -217,7 +236,7 @@ class QueueTests(NotificationGuardedTestCase):
     def test_mac_idle_alert_read_does_not_mask_admission_failure(self) -> None:
         _ = write_idle_alert(self.root / "mac-idle", NOW)
         with mock.patch.object(memory_admit, "queue_read", side_effect=wire.AdmissionUnavailable("fixture unavailable")), \
-             mock.patch("sys.argv", ["build_queue.py"]), redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()) as errors:
+             mock.patch("sys.argv", ["build_queue.py", "--json"]), redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()) as errors:
             self.assertEqual(build_queue.main(), 2)
         self.assertIn("admission service unavailable: fixture unavailable", errors.getvalue())
 
@@ -243,7 +262,7 @@ class QueueTests(NotificationGuardedTestCase):
         self.assertLess(elapsed, 0.05)
 
 
-    def test_expired_head_json_paints_the_same_sixty_column_error_as_inline(self) -> None:
+    def test_expired_head_json_preserves_the_sixty_column_error_and_cells(self) -> None:
         _ = self.fixture.waiter(500, "id-expired", "expired")
         inputs = self.fixture.inputs(policy=admission_policy_fixture())
         path, row = inputs.ordered[0]
@@ -252,8 +271,8 @@ class QueueTests(NotificationGuardedTestCase):
         status, output, errors = self.invoke(reading, "--json", "--columns", "60")
         self.assertEqual((status, errors), (0, ""))
         data = cast(QueueLines, json.loads(output))
-        pane = self.snapshot_text(data)
-        status, inline, errors = self.invoke(reading, "--columns", "60")
+        pane = queue_json_text(data)
+        status, inline, errors = self.invoke_text(reading, "--columns", "60")
         self.assertEqual((status, errors), (0, ""))
         self.assertIn("│", inline)
         bar_cells = str.maketrans({glyph: "█" for glyph in "░·▒"})
@@ -399,7 +418,7 @@ class QueueTests(NotificationGuardedTestCase):
             with self.subTest(error=error):
                 output, errors = io.StringIO(), io.StringIO()
                 with mock.patch.object(memory_admit, "queue_read", side_effect=error), \
-                     mock.patch("sys.argv", ["build_queue.py"]), \
+                     mock.patch("sys.argv", ["build_queue.py", "--json"]), \
                      redirect_stdout(output), redirect_stderr(errors):
                     self.assertEqual(build_queue.main(), 2)
                 self.assertEqual(output.getvalue(), "")
@@ -426,7 +445,7 @@ class QueueTests(NotificationGuardedTestCase):
         self.assertIn("Frees when:", evidence)
         with mock.patch.object(memory_admit, "queue_view", side_effect=AssertionError("no separate queue read")):
             data = self.snapshot(reading)
-        self.assertEqual(self.snapshot_text(data), plain(queue_view.render_view(model, 400, colour=True)))
+        self.assertEqual(queue_json_text(data), plain(queue_view.render_view(model, 400, colour=True)))
 
     def test_every_text_table_marks_numbers_right_and_text_left(self) -> None:
         with QueueFixture() as fixture:
@@ -446,7 +465,7 @@ class QueueTests(NotificationGuardedTestCase):
         write_bumps(NOW, [bump_line(NOW - 5, folder="/tmp/alpha"),
                           bump_line(NOW - 4, folder="/tmp/beta", step="clippy"),
                           bump_line(NOW - 3, folder="/tmp/alpha")])
-        text = self.snapshot_text(self.snapshot(reading))
+        text = queue_json_text(self.snapshot(reading))
         self.assertNotIn("Head for:", text)
         self.assertNotIn("158 min (since", text)
         facts = head_facts.read_head_facts(reading)
@@ -457,7 +476,7 @@ class QueueTests(NotificationGuardedTestCase):
         self.assertEqual(facts.bumps.groups[0].folder, "/tmp/alpha")
 
     def test_missing_head_time_and_empty_bump_history_have_distinct_short_forms(self) -> None:
-        text = self.snapshot_text(self.snapshot(head_reading(since=NOW - 600, now=NOW)))
+        text = queue_json_text(self.snapshot(head_reading(since=NOW - 600, now=NOW)))
         self.assertNotIn("head for: unknown", text)
         self.assertNotIn("no bumps since it joined", text)
         self.assertNotIn("head for 10 min", text)
@@ -474,7 +493,7 @@ class QueueTests(NotificationGuardedTestCase):
             self.assertNotIn("head_since", text)
         data = self.snapshot(reading)
         self.assertNotIn("head_since", json.dumps(data))
-        self.assertIn("40", self.snapshot_text(data))
+        self.assertIn("40", queue_json_text(data))
 
 
     def test_bump_read_failure_is_unknown_and_snapshot_keys_stay_unchanged(self) -> None:
@@ -482,8 +501,8 @@ class QueueTests(NotificationGuardedTestCase):
         store.host_file(store.host_name(), NOW).mkdir()
         data = self.snapshot(head_reading(since=NOW - 600, now=NOW))
         self.assertEqual(set(data), {"columns", "as_of", "lines"})
-        self.assertNotIn("bumps: unknown", self.snapshot_text(data))
-        self.assertNotIn("no bumps since it joined", self.snapshot_text(data))
+        self.assertNotIn("bumps: unknown", queue_json_text(data))
+        self.assertNotIn("no bumps since it joined", queue_json_text(data))
         self.assertTrue(all({"text"} <= set(span)
                             and set(span) <= {"text", "tone", "bold", "background", "until"}
                             for row in data["lines"] for span in row))
@@ -496,7 +515,7 @@ class QueueTests(NotificationGuardedTestCase):
             ordered=[*reading.ordered, (Path("124.waiting"), {"pid":124, "start_time":"124", "need":GIB, "since":NOW - 600})])
         write_token_gaps([queue_time_line(NOW - 60, kind="token_gap", session_id="head-session",
             step="nextest", pid=123, start_time="123", token_left_at=NOW - 60)])
-        text = self.snapshot_text(self.snapshot(reading))
+        text = queue_json_text(self.snapshot(reading))
         self.assertEqual(len(waiting_rows(queue_view.render_view(self.model(reading), 400))), 2)
         self.assertNotIn("waiting for the cargo token", text)
         self.assertNotIn("cargo token:", text)
@@ -510,7 +529,7 @@ class QueueTests(NotificationGuardedTestCase):
         reading = head_reading(since=NOW - 600, now=NOW)
         write_token_gaps([token_gap_line(NOW - 200, NOW - 46)])
         data = self.snapshot(reading)
-        self.assertNotIn("cargo token:", self.snapshot_text(data))
+        self.assertNotIn("cargo token:", queue_json_text(data))
         facts = head_facts.read_head_facts(reading)
         assert isinstance(facts, head_facts.HeadFacts)
         self.assertEqual(head_facts.head_token_text(facts, ZONE), "cargo token: waited 154 s (10:42-10:45)")
@@ -535,16 +554,16 @@ class QueueTests(NotificationGuardedTestCase):
 
     def test_head_line_distinguishes_missing_history_from_no_head_token_wait(self) -> None:
         reading = head_reading(since=NOW - 600, now=NOW)
-        missing = self.snapshot_text(self.snapshot(reading))
+        missing = queue_json_text(self.snapshot(reading))
         self.assertNotIn("cargo token:", missing)
         write_token_gaps([token_gap_line(NOW - 200, NOW - 46, session="unrelated", pid=999)])
-        self.assertNotIn("cargo token:", self.snapshot_text(self.snapshot(reading)))
-        self.assertNotIn("no cargo token wait", self.snapshot_text(self.snapshot(reading)))
+        self.assertNotIn("cargo token:", queue_json_text(self.snapshot(reading)))
+        self.assertNotIn("no cargo token wait", queue_json_text(self.snapshot(reading)))
 
     def test_head_line_partial_token_history_does_not_claim_a_complete_sum(self) -> None:
         reading = head_reading(since=NOW - 600, now=NOW)
         write_token_gaps([token_gap_line(NOW - 200, NOW - 46)], tail=token_gap_line(NOW - 40, NOW - 20).rstrip(b"\n"))
-        text = self.snapshot_text(self.snapshot(reading))
+        text = queue_json_text(self.snapshot(reading))
         self.assertNotIn("cargo token: unknown", text)
         self.assertNotIn("cargo token: waited", text)
 
@@ -563,10 +582,10 @@ class QueueTests(NotificationGuardedTestCase):
         view = records.QueueView((waiting, ), running, 20 * GIB, 2 * GIB, 3 * GIB, NOW)
         reading = queue_read_fixture(view, policy=admission_policy_fixture())
         data = self.snapshot(reading)
-        status, text, errors = self.invoke(reading, "--columns", "400")
+        status, text, errors = self.invoke_text(reading, "--columns", "400")
         self.assertEqual(status, 0, errors)
-        self.assertEqual(self.snapshot_text(data), plain(queue_view.render_view(self.model(reading), 400, colour=True)))
-        self.assertEqual(text.rstrip("\n"), plain(queue_view.render_view(self.model(reading), 400)))
+        self.assertEqual(queue_json_text(data), plain(queue_view.render_view(self.model(reading), 400, colour=True)))
+        self.assertEqual(text.rstrip("\n"), plain(queue_view.render_view(self.model(reading), 400, colour=True)))
         self.assertEqual(data["columns"], 400)
         self.assertEqual(data["as_of"], NOW)
         self.assertFalse(any(line.startswith("●") for line in text.splitlines()))
@@ -581,7 +600,7 @@ class QueueTests(NotificationGuardedTestCase):
     def test_json_empty_tables_are_arrays_and_do_not_invent_a_head(self) -> None:
         data = self.snapshot(queue_read_fixture(records.QueueView((), (), 20 * GIB, 0, GIB, NOW), policy=admission_policy_fixture()))
         self.assertIsInstance(data["lines"], list)
-        text = self.snapshot_text(data)
+        text = queue_json_text(data)
         self.assertIn("Build queue · 10:46", text)
         self.assertIn("cap 17.0", text)
         self.assertNotIn("#1 waits on", text)
@@ -592,14 +611,14 @@ class QueueTests(NotificationGuardedTestCase):
         with QueueFixture() as fixture:
             reading = fixture.read()
             self.labels_read.return_value = fixture.labels
-            status, text, errors = self.invoke(reading, "--columns", "100")
+            status, text, errors = self.invoke_text(reading, "--columns", "100")
             json_status, encoded, json_errors = self.invoke(reading, "--json", "--columns", "100")
         self.assertEqual(status, 0, errors)
         self.assertEqual(json_status, 0, json_errors)
         self.assertEqual(errors, "")
         self.assertEqual(json_errors, "")
         data = cast(QueueLines, json.loads(encoded))
-        self.assertEqual(self.snapshot_text(data) + "\n",
+        self.assertEqual(queue_json_text(data) + "\n",
                          plain(queue_view.render_view(self.model(reading), 100, colour=True)) + "\n")
         self.assertLessEqual(len(encoded.encode()), 4 * len(text.encode()))
         defaults = Span("")
@@ -652,8 +671,8 @@ class QueueTests(NotificationGuardedTestCase):
         running = (records.RunningStep("known", "old", "mend", "/tmp/tree", GIB, records.MeasuredMemory(GIB, anonymous=records.AnonymousRunUse(GIB)), pid=123),
             records.RunningStep("unknown", "recorded", "doc", "/tmp/other", GIB, records.MeasuredMemory(GIB, anonymous=records.AnonymousRunUse(GIB)), pid=123))
         reading = queue_read_fixture(records.QueueView((), running, 20 * GIB, 0, GIB, NOW), policy=admission_policy_fixture())
-        status, text, errors = self.invoke(reading, "known")
-        other_status, other, other_errors = self.invoke(reading, "unknown")
+        status, text, errors = self.invoke_text(reading, "known")
+        other_status, other, other_errors = self.invoke_text(reading, "unknown")
         self.assertEqual((other_status, other_errors), (0, ""))
         text += other
         self.assertEqual(status, 0, errors)
@@ -665,7 +684,7 @@ class QueueTests(NotificationGuardedTestCase):
         self.labels_read.return_value = {"style-id":UnitLabels("style-impl", "cargo-liner", "cargo-liner-style-types")}
         waiting = records.WaitingStep(10, "style-id", "recorded-name", "nextest", "/tmp/style", NOW, GIB, records.ReadyForAdmission())
         running = records.RunningStep("style-id", "recorded-name", "clippy", "/tmp/style", GIB, records.MeasuredMemory(GIB, anonymous=records.AnonymousRunUse(GIB)), pid=123)
-        status, text, errors = self.invoke(queue_read_fixture(records.QueueView((waiting, ), (running, ), 20 * GIB, 0, GIB, NOW), policy=admission_policy_fixture()), "--columns", "140")
+        status, text, errors = self.invoke_text(queue_read_fixture(records.QueueView((waiting, ), (running, ), 20 * GIB, 0, GIB, NOW), policy=admission_policy_fixture()), "--columns", "140")
         self.assertEqual(status, 0, errors)
         self.assertIn("cargo-liner", text)
         self.assertIn("style-types", text)
@@ -682,8 +701,8 @@ class QueueTests(NotificationGuardedTestCase):
         with mock.patch.object(unit_labels, "unit_labels_for", unit_labels_for), \
              mock.patch.object(staff, "snapshot", return_value=staff.StaffSnapshot(())), \
              mock.patch.object(unit_labels, "newest_sessions", side_effect=OSError("session files unavailable")) as sessions:
-            status, text, errors = self.invoke(reading, "recorded")
-            other_status, other, other_errors = self.invoke(reading, "folder")
+            status, text, errors = self.invoke_text(reading, "recorded")
+            other_status, other, other_errors = self.invoke_text(reading, "folder")
         self.assertEqual(sessions.call_args_list, [mock.call(), mock.call()])
         self.assertEqual((other_status, other_errors), (0, ""))
         text += other
@@ -710,7 +729,7 @@ class QueueTests(NotificationGuardedTestCase):
             output = io.StringIO()
             with mock.patch.object(memory_admit, "queue_read", side_effect=read), \
                  mock.patch.object(roster, "roster", side_effect=AssertionError("no full roster")), \
-                 mock.patch("sys.argv", ["build_queue.py"]), redirect_stdout(output):
+                 mock.patch("sys.argv", ["build_queue.py", "--json"]), redirect_stdout(output):
                 self.assertEqual(build_queue.main(), 0)
         self.assertEqual(events, ["queue", "labels"])
         self.labels_read.assert_called_once_with(expected_ids, os.environ)
@@ -765,12 +784,13 @@ class QueueTests(NotificationGuardedTestCase):
             "since":NOW, "session_name":"unit", "step":"check", "folder":"/tree"})
         _ = (self.root / "pressure").write_text("full avg10=23.4 avg60=1.0 total=1\n")
         output = io.StringIO()
-        with mock.patch("sys.argv", ["build_queue.py"]), redirect_stdout(output):
+        with mock.patch("sys.argv", ["build_queue.py", "--json"]), redirect_stdout(output):
             self.assertEqual(build_queue.main(), 0)
-        self.assertIn("check", output.getvalue())
-        self.assertIn("pressure", output.getvalue())
-        self.assertNotIn("swap", output.getvalue())
-        self.assertNotIn("ready", output.getvalue())
+        text = queue_json_text(cast(QueueLines, json.loads(output.getvalue())))
+        self.assertIn("check", text)
+        self.assertIn("pressure", text)
+        self.assertNotIn("swap", text)
+        self.assertNotIn("ready", text)
 
     def test_unavailable_reading_does_not_claim_zero_free_memory(self) -> None:
         first = records.WaitingStep(10, "session", "unit", "check", "/tmp/tree", NOW - 300, 12 * GIB, records.ReadingUnavailable())
@@ -813,13 +833,14 @@ class QueueTests(NotificationGuardedTestCase):
         with mock.patch.object(memory_admit, "queue_read", return_value=reading) as read, \
              mock.patch("subprocess.run", side_effect=AssertionError("no subprocess")), \
              mock.patch("time.sleep", side_effect=AssertionError("no wait")), \
-             mock.patch("sys.argv", ["build_queue.py"]), redirect_stdout(output):
+             mock.patch("sys.argv", ["build_queue.py", "--json"]), redirect_stdout(output):
             self.assertEqual(build_queue.main(), 0)
         read.assert_called_once_with()
         self.labels_read.assert_called_once_with([], os.environ)
-        self.assertIn("Build queue · 10:46", output.getvalue())
-        self.assertIn("cap 17.0", output.getvalue())
-        self.assertNotIn("|", output.getvalue())
+        text = queue_json_text(cast(QueueLines, json.loads(output.getvalue())))
+        self.assertIn("Build queue · 10:46", text)
+        self.assertIn("cap 17.0", text)
+        self.assertNotIn("|", text)
 
     def test_one_row_per_table_uses_names_and_escapes_cell_text(self) -> None:
         waiting = records.WaitingStep(10, "hidden-id", "", "doc", "/tmp/hana/", NOW - 60, GIB, records.ReadyForAdmission())
@@ -973,7 +994,7 @@ class QueueTests(NotificationGuardedTestCase):
                 seen.clear()
                 with self.subTest(args=args), mock.patch.object(
                         roster, "roster", side_effect=AssertionError("the queue must not read the full roster")) as full:
-                    status, text, errors = self.invoke(reading, *args)
+                    status, text, errors = self.invoke_text(reading, *args)
                     self.assertEqual(status, 0, errors)
                     self.labels_read.assert_called_once()
                     ids, environment = seen[0]
@@ -991,12 +1012,12 @@ class QueueTests(NotificationGuardedTestCase):
         self.labels_read.return_value = fixture.labels
         for session, expected in (("id-work-lead", ["2", "3"]), ("id-widget", ["run"]), ("unknown", [])):
             with self.subTest(session=session):
-                status, text, errors = self.invoke(reading, "--you", session)
+                status, text, errors = self.invoke_text(reading, "--you", session)
                 self.assertEqual(status, 0, errors)
                 self.assertEqual(text.count("▸"), len(expected))
                 self.assertEqual([row[:row.index("▸")].strip() for row in text.splitlines() if "▸" in row], expected)
 
-    def test_inline_you_defaults_to_the_caller_and_a_shell_has_no_mark(self) -> None:
+    def test_json_you_defaults_to_the_caller_and_a_shell_has_no_mark(self) -> None:
         fixture = self.enterContext(QueueFixture())
         reading = fixture.cap_model().reading
         for values, count in (({}, 0), ({"CODEX_THREAD_ID": "id-work-lead"}, 2),
@@ -1007,7 +1028,7 @@ class QueueTests(NotificationGuardedTestCase):
                     if key not in values:
                         if key in os.environ:
                             del os.environ[key]
-                status, text, errors = self.invoke(reading)
+                status, text, errors = self.invoke_text(reading)
                 self.assertEqual(status, 0, errors)
                 self.assertEqual(text.count("▸"), count)
 
@@ -1015,7 +1036,7 @@ class QueueTests(NotificationGuardedTestCase):
         fixture = self.enterContext(QueueFixture())
         reading = fixture.cap_model().reading
         with mock.patch.object(head_facts, "read_pace", side_effect=AssertionError("view has no start estimate")):
-            status, text, errors = self.invoke(reading)
+            status, text, errors = self.invoke_text(reading)
         self.assertEqual(status, 0, errors)
         self.assertTrue(text.startswith("Build queue · 10:46\n\n"))
         self.assertNotIn("starts", text)
@@ -1046,7 +1067,7 @@ class QueueTests(NotificationGuardedTestCase):
     def test_cli_card_no_match_succeeds_without_a_bump(self) -> None:
         reading = queue_read_fixture(records.QueueView((), (), 20 * GIB, 0, GIB, NOW), policy=admission_policy_fixture())
         with mock.patch.object(admission_client, "priority_set", side_effect=AssertionError("card cannot move queue")):
-            status, text, errors = self.invoke(reading, "nobody")
+            status, text, errors = self.invoke_text(reading, "nobody")
         self.assertEqual((status, errors), (0, ""))
         self.assertTrue(text.startswith("Build queue · 10:46\n\n"))
         self.assertTrue(text.endswith("\n\nNo waiting or running step matches nobody.\n"))
@@ -1058,28 +1079,22 @@ class QueueTests(NotificationGuardedTestCase):
         session = "id-work-lead"
         for columns in (60, 80, 100, 140):
             for selector in ("1", session, "/tmp/tree", "mine"):
-                for as_json in (False, True):
-                    with self.subTest(columns=columns, selector=selector, json=as_json), \
-                         mock.patch.dict(os.environ, {"CODEX_THREAD_ID": session}):
-                        args = ["--columns", str(columns), "--you", session, selector]
-                        if as_json:
-                            args.insert(0, "--json")
-                        status, output, errors = self.invoke(model.reading, *args)
-                        self.assertEqual((status, errors), (0, ""))
-                        view = queue_view.render_view(model, columns, colour=as_json, you=session)
-                        card = queue_card.render_selection(model, session if selector == "mine" else selector, columns)
-                        if as_json:
-                            data = cast(QueueLines, json.loads(output))
-                            self.assertEqual(data["lines"][:len(view)], json_form(view, columns, NOW)["lines"])
-                            self.assertEqual(data["lines"][len(view)], [])
-                            self.assertEqual(data["lines"][len(view) + 1:], json_form(card, columns, NOW)["lines"])
-                            text = self.snapshot_text(data)
-                        else:
-                            text = output.removesuffix("\n")
-                            self.assertTrue(text.startswith(plain(view) + "\n\n"))
-                            self.assertTrue(text.endswith("\n\n" + plain(card)))
-                        self.assertEqual(text.splitlines()[0], "Build queue · 10:46")
-                        self.assertTrue(all(terminal_width(line) <= columns for line in text.splitlines()))
+                with self.subTest(columns=columns, selector=selector), \
+                     mock.patch.dict(os.environ, {"CODEX_THREAD_ID": session}):
+                    status, output, errors = self.invoke(model.reading,
+                        "--json", "--columns", str(columns), "--you", session, selector)
+                    self.assertEqual((status, errors), (0, ""))
+                    view = queue_view.render_view(model, columns, colour=True, you=session)
+                    card = queue_card.render_selection(model, session if selector == "mine" else selector, columns)
+                    data = cast(QueueLines, json.loads(output))
+                    self.assertEqual(data["lines"][:len(view)], json_form(view, columns, NOW)["lines"])
+                    self.assertEqual(data["lines"][len(view)], [])
+                    self.assertEqual(data["lines"][len(view) + 1:], json_form(card, columns, NOW)["lines"])
+                    text = queue_json_text(data)
+                    self.assertTrue(text.startswith(plain(view) + "\n\n"))
+                    self.assertTrue(text.endswith("\n\n" + plain(card)))
+                    self.assertEqual(text.splitlines()[0], "Build queue · 10:46")
+                    self.assertTrue(all(terminal_width(line) <= columns for line in text.splitlines()))
 
 
 if __name__ == "__main__":
@@ -1091,7 +1106,7 @@ class ServiceQueryFailureTests(unittest.TestCase):
         for silent in (False, True):
             with self.subTest(silent=silent), AdmissionFixture() as fixture:
                 timeout = records.read_memory_config().query_timeout_seconds
-                for arguments in ([], ["4"], ["--json", "1"]):
+                for arguments in (["--json"], ["--json", "4"], ["--json", "1"]):
                     exchange = (Exchange(TimedChunk(timeout / 4, b"{"), TimeoutError()) if silent
                                 else Exchange(connect_error=FileNotFoundError()))
                     transport = ScriptedTransport(fixture.clock, exchange)

@@ -20,7 +20,13 @@ Mend rewrites the code first.
 Fmt formats what mend wrote.
 Clippy judges first.
 A passing judgment skips repairs.
-A failed judgment starts up to three `cargo clippy --fix` and fmt passes, followed by a final judgment.
+`first_judgment_permits_repair` permits repair only for status 101 without a lint hold, memory kill, or compiler signal report.
+Compile errors and unknown 101 diagnostics also permit repair.
+No diagnostic classifier separates lint findings from compile errors.
+The repair loop reads `clippy_fix_pass_limit` from `config/lint.conf` at use.
+Valid integers are 1–9999; missing or invalid values use 3.
+Fix and fmt passes stop when the tree stops changing or the limit is reached.
+A final judgment supplies the result.
 Every clippy run in this path uses `--keep-going`.
 `invoke_clippy_fix` removes `CARGO_MAKEFLAGS`, `MAKEFLAGS` and `MFLAGS` from cargo's environment on Linux and macOS.
 It sets `--jobs` from `clippy_fix_jobs` in `config/lint.conf`.
@@ -78,7 +84,10 @@ The contract reviewer retains the style assignment.
 
 **Run end.**
 
-- `<FinalGate/>` runs `verify.sh final` once: `cargo check --workspace --all-targets`, then nextest `--workspace --tests`, which links no example. It has no fmt, no lint and no style review.
+- With a root `Cargo.toml`, `<FinalGate/>` runs `verify.sh final` for the workspace check and tests without example linking.
+- Without that manifest, it runs the repository's unit gate.
+  For `~/.claude`, this is `scripts/lib/py scripts/production/targeted_test.py --checkout <tree>`.
+- Neither gate repeats formatting, lint, or style review.
 - On failure, a synthetic `final` phase opens the failures in the ledger and repairs them through `<FixDispatch/>`, then the gate reruns.
 - `<FinalGateCommit/>` commits only synthetic-phase repairs and source-comment edits from the last plan review. After staging in a Cargo repository, it runs `verify.sh doc` as its own command. On failure, it repairs through `<FixDispatch/>`, stages, and runs `doc` again. It does not reformat; the repair workers' `lint` covers formatting.
 

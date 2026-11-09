@@ -21,7 +21,8 @@ They do not add records to the real build log.
 
 | File | Role |
 | --- | --- |
-| `scripts/direct/verify.sh` | `TEST_TARGETS_PY` picks the targets from `cargo metadata`; `take_test_targets` reads them into `TEST_SELECTION`; the `test` arm builds with them. |
+| `scripts/direct/verify.sh` | `take_test_targets` reads the saved metadata answer into `TEST_SELECTION`; the `test` arm uses that selection. |
+| `scripts/direct/verify_metadata.py` | Answers `test-targets` from the call's saved Cargo metadata. |
 | `scripts/buildlog/report.py` | `report()` assembles the day. `rebuilds_section` with the rebuild-bin constants, `PACKAGE_PATTERN`, `KnownCrateStep`, `RebuildTiming`, `PackageRebuilds`, `rebuild_bin`, `known_crate_steps`, `rebuild_timings`, `rebuild_rows`, `whole_percent`, `nextest_rebuild_lines`, `rebuild_package`, `package_rebuild_rows`; `SCRATCH`, `GROUP_AS_SCRATCH`, `SCRATCH_LABEL`, `kind_section`, `summary` for scratch rows; `test_builds_section`; `disk_section`. |
 | `scripts/buildlog/disk.py` | The Disk rows (`FOLDERS`), the walk (`measure`), the floor (`read_floor`, `InvalidFloor`), the snapshot file, and the directories outside the build caches that the disk-floor alerts read (`docs/as-built/build-memory-admission.md`). |
 | `scripts/buildlog/filesystem.py` | `FilesystemUsage` and `filesystem_usage(path)`, shared by `disk.py` and the 60 s sample. |
@@ -212,7 +213,20 @@ Measured by the buildlog disk job at 12:14 EDT: allocated blocks, each hard-link
 - Rows, `other` and free add up to less than the disk: ext4's reserved blocks are in neither used (`f_blocks - f_bfree`) nor free (`f_bavail`), about 93 GiB on natedev (`stat -f /`, 2026-10-04).
 - `read_snapshot` casts the JSON to `DiskSnapshot` without checking its shape. A change to the snapshot's keys must still render the old `disk.json`, or the report raises `KeyError` until the job's next write.
 - The heading's host is `store.host_name()` (short); the floor key's host is `socket.gethostname()` (full), as the sweep reads it.
-- To try a disk change by hand without replacing the live snapshot: `BUILDLOG_DIR=$(mktemp -d) scripts/lib/py scripts/buildlog/cli.py disk`, then `report` with the same `BUILDLOG_DIR`, and compare used and free with `df -B1 /`.
+- Run this block from the worktree root to check a disk change without replacing the live snapshot.
+  Compare used and free space in the report with the `df` output.
+
+  ```sh
+  (
+    set -e
+    BUILDLOG_DIR=$(mktemp -d)
+    trap 'rm -rf "$BUILDLOG_DIR"' EXIT
+    export BUILDLOG_DIR
+    scripts/lib/py scripts/buildlog/cli.py disk
+    scripts/lib/py scripts/buildlog/cli.py report
+    df -B1 /
+  )
+  ```
 - In a worktree, `./scripts/buildlog/buildlog` execs the live `~/.claude` CLI; render the worktree's report with `scripts/lib/py scripts/buildlog/cli.py report <day>`.
 - `test_report.py` has no `sys.path` setup and runs only under `~/.claude/scripts/lib/py -m unittest discover -s scripts/buildlog -p 'test_*.py'`.
 - `disk.py` imports `scripts.lint.sweep` by package name and changes no `sys.path`.

@@ -408,7 +408,8 @@ def submit_command(argv):
 '''
         source = source.replace('if __name__ == "__main__":',
                                 hook + 'if __name__ == "__main__":\n'
-                                + f'    sys.path.insert(0, {str(SCRIPT.parents[2])!r})')
+                                + f'    with open({str(SCRIPT.parents[1] / "lib/package_root.py")!r}) as package_root:\n'
+                                + '        exec(package_root.read(), {"__file__": package_root.name})')
         _ = fake_path.write_text(source)
         fake_path.chmod(0o755)
         fake = str(fake_path)

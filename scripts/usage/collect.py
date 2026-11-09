@@ -427,6 +427,8 @@ CREATE UNIQUE INDEX IF NOT EXISTS claude_message ON turns (machine, turn_key)
     WHERE family = 'claude';
 CREATE INDEX IF NOT EXISTS turns_at ON turns (at);
 CREATE INDEX IF NOT EXISTS turns_agent_at ON turns (machine, family, parent_id, agent_id, at);
+CREATE INDEX IF NOT EXISTS turns_director_cost ON turns (at, machine, agent_id, model, input, cache_read, cache_write_5m, cache_write_1h, output)
+    WHERE role = 'director';
 CREATE TABLE IF NOT EXISTS compactions (
     machine TEXT NOT NULL, family TEXT NOT NULL, parent_id TEXT NOT NULL,
     agent_id TEXT NOT NULL, at TEXT NOT NULL,
@@ -1123,7 +1125,9 @@ def collect_local(db: sqlite3.Connection, args: CommandLine) -> None:
 
 
 # Only the bootstrap is a separate program; all reading uses this module.
-REMOTE_BOOTSTRAP = """
+def bootstrap_program(call: str) -> str:
+    """Load the supplied reader modules and run the caller's final statement."""
+    return """
 import json, sys, types
 request = json.load(sys.stdin)
 for name in ('scripts', 'scripts.lib', 'scripts.usage'):
@@ -1136,8 +1140,10 @@ for name, source in request['modules'].items():
     module.__package__ = name.rpartition('.')[0]
     sys.modules[name] = module
     exec(compile(source, module.__file__, 'exec'), module.__dict__)
-sys.modules['scripts.usage.collect'].read_mac(request['cursors'])
-"""
+""" + call + "\n"
+
+
+REMOTE_BOOTSTRAP = bootstrap_program("sys.modules['scripts.usage.collect'].read_mac(request['cursors'])")
 
 
 def emit_remote(record: dict[str, object]) -> None:
