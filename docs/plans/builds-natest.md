@@ -1787,43 +1787,23 @@ The staff, add-unit and fast-track test modules use less CPU, with all 14,774 as
 - One Git seed per module: the seeds were already built once per class.
 
 ### Phase 89 — The main assign launcher test file uses half its CPU  · status: done
-**Depends on:** Phase 68
 
-#### Work Order
+#### As-built
 
-**Source:** Phase 68 contract review (F001). Phase 68 same-load pairs cut the four assign launcher files from 482.4 to 303.6 CPU s (37%), short of half. The director split the rest of the work into this phase, so the Phase 68 gain lands now.
-
-**Goal:** `scripts/direct/test_assign_launcher.py` (63 tests at `d7234eaac`; 214.8 CPU s same-load median after Phase 68, 286.6 before) uses half its current CPU, or a measured floor shows why it cannot, with every checked behavior kept.
-
-**Spec:**
-1. Follow the Speed method. Measure CPU with `module_cost.py --tests 10 --commands 10` on the current tree first; this is the baseline. Name each test's CPU, and each real launcher process that it starts. Keep 214.8 and 58.6 CPU s as history only, and report gains against the current baseline.
-2. Default execution is already `InProcessAssignment`. Find the tests and commands that still start real processes. Keep the process tests that the behavior map names: ancestor check, launcher ownership, worker failure and concurrent review stages.
-3. Measure the recorder and resolver children. Phase 99's `direct_launcher_helpers()` runs helper CLIs in process; it does not cover the shell resolver. If only a production API change can cut a cost, write the floor and send the director an architecture proposal with its measured gain.
-4. Read the importers of a changed fixture before you change it. Every importer stays green.
-5. Add no guard, refusal or check (user rule, 2026-11-05).
+- `assignment_helpers()` in `assign_launcher_test_support.py` seeds the interpreter cache once and patches `subprocess.run`: `phase_table.py` runs through `invoke_cli(phase_table, phase_table.main, ...)` and `findings.py` through `invoke_findings(...)` in the test process. The patch prints captured output when the caller does not capture it and honors `check`.
+- `AssignLauncherFixture.setUp` and `PaneReviewLauncherTests.setUp` enter the context. `HookAssignmentFixture` and the native completion step stay unchanged.
+- 63 tests stay, and no assertion is removed. `module_cost.py` CPU 95.0 → 61.1 s, processes 4444 → 3785, execs 3939 → 3449, wall 96.9 → 71.8 s. Same-load pairs (/tmp roots, default bytecode cache): CPU 47.2 → 26.0 s (44.8% less), wall 51.3 → 29.0 s.
+- The module is at a CPU floor: `models_registry.launch_settings` starts a shell and a Python registry command for each launch. The models unit owns that resolver change.
 
 **Files:**
-- `scripts/direct/test_assign_launcher.py`
-- `scripts/direct/assign_launcher_test_support.py`
+- `scripts/direct/assign_launcher_test_support.py` — shared assign launcher fixture; `assignment_helpers()` runs helper commands in the test process
+- `scripts/direct/test_assign_launcher.py` — main assign launcher tests
 
-**Workers:** 1 writer; one test file and its fixture do not split
-- `impl` — `test_assign_launcher.py`, hub: `assign_launcher_test_support.py`
+**Gotchas:**
+- `assign_launcher_test_support.py` is the hub every assign launcher test module imports. One writer holds it.
 
-**Constraints from prior phases:**
-- `invoke_assignment` in `assign_launcher_test_support.py` runs the real coordinator in process through `invoke_cli`. `snapshot_files` and `changed_files` share the first-dispatch snapshot.
-- Phase 68 behavior map: `/tmp/claude/unit/2113de4f-9913-485a-9a51-61558bfd81db/phases/68/profile/behavior_map.md`. It predates the codex_mesh deletion: refresh it against the current module before any change.
-- The codex_mesh deletion (hierarchies Phase 30, `ce529466f`) is merged at `d7234eaac`. `AssignLauncherFixture` now holds a native worker fixture, `test_worker.WorkerCommandTests`; its `setUp()` intercepts recorder and worker commands.
-- Phase 99: `assign_claude_test_support.py` imports `assign_launcher_test_support.py`. To reuse `direct_launcher_helpers()`, import it locally inside the function that uses it, to avoid an import cycle. Setting `direct_cli_calls` on the Claude fixture does not change `AssignLauncherFixture`.
-- Temporary root: `codex_test_support.setUpModule()` sets `tempfile.tempdir` to `/tmp`, which places the native fixture root, and the pane setup sets the child `TMPDIR` to that root. So `/dev/shm` pairs do not reach the fixture. Run each pair on `/tmp` at the same time, and state that in the result.
-- Read for context, do not edit: `scripts/direct/assign_claude_test_support.py`, `scripts/direct/test_assign_claude_test_support.py`, `scripts/production/cli_fixture.py`, `scripts/production/test_worker.py`, `scripts/agents/codex_test_support.py`.
-- Tests never read or write live state: `~/.claude` main, `~/.local/state/merge-gate`, `/tmp/claude`.
-
-**Acceptance gate:**
-- The behavior map has a row for each assertion. No assertion is removed.
-- CPU s, processes, execs and wall s before and after, from `module_cost.py` and same-load pairs, in the checkpoint notice.
-- The changed file and every importer of a changed fixture pass, with `test_assign_claude_test_support.py` and the retained process tests.
-- the targeted test green on the phase commit merged with `origin/builds`
-- `basedpyright` on the changed files prints `0 errors, 0 warnings, 0 notes`
+**Ruled out:**
+- An `assign.resolve_model` change: it leaves the process count unchanged.
 
 ### Phase 90 — The style ledger tests seed staff once per class and close every database  · status: done
 **Depends on:** Phase 85
@@ -2077,7 +2057,6 @@ A changed `config/<name>.conf` selects every test module whose transitive import
 **Constraints from prior phases:**
 - Phase 95: real target, reservation and recorder commands limit `test_verify_wait_holder.py`. verify-unit owns the target-selection and recorder import proposals. Do not repeat those proposals; cite them when the same cost limits this module.
 - Phase 97 and Phase 100: an in-process call of a real entry cut CPU and kept the code path. Tests that assert on a process boundary kept a real process.
-- Phase 89 runs beside this phase and holds `scripts/direct/test_assign_launcher.py` and `scripts/direct/assign_launcher_test_support.py`. Do not edit them.
 - Tests never read or write live state: `~/.claude` main, `~/.local/state/merge-gate`, `/tmp/claude`. State the filesystem basis of each pair.
 
 **Acceptance gate:**
@@ -2086,3 +2065,4 @@ A changed `config/<name>.conf` selects every test module whose transitive import
 - The changed file and `test_verify_routing_rule.py` pass.
 - the targeted test green on the phase commit merged with `origin/builds`
 - `basedpyright` on the changed files prints `0 errors, 0 warnings, 0 notes`
+- A floor goes into the next-items Floors table with its revision, filesystem roots, bytecode cache state and count of real `verify.sh` calls.
