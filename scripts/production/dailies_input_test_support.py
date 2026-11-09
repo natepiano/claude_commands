@@ -193,8 +193,8 @@ class DailiesInputFixture(unittest.TestCase):
         # Production docs, Git remotes and fake tools embed absolute paths.
         # Copy files and Git metadata privately, preserving those paths per test.
         self.root = self.fixture_root
-        _ = shutil.copytree(self.fixture_snapshot, self.root, symlinks=True)
         self.addCleanup(shutil.rmtree, self.root)
+        _ = shutil.copytree(self.fixture_snapshot, self.root, symlinks=True)
         for name, value in self.fixture_attributes.items():
             setattr(self, name, value)
         self.env = self.fixture_env.copy()

@@ -22,7 +22,6 @@ CLEAR = Path(__file__).with_name("clear_phase_review.sh")
 
 
 class PhaseArtifactTests(StaffTestCase):
-    temporary: tempfile.TemporaryDirectory[str]  # pyright: ignore[reportUninitializedInstanceVariable]
     session: Path  # pyright: ignore[reportUninitializedInstanceVariable]
 
     @cached_property
@@ -32,15 +31,10 @@ class PhaseArtifactTests(StaffTestCase):
     @override
     def setUp(self) -> None:
         super().setUp()
-        self.temporary = tempfile.TemporaryDirectory()
-        self.session = Path(self.temporary.name) / "run"
+        self.session = Path(self.enterContext(tempfile.TemporaryDirectory())) / "run"
         for phase in ("3", "4"):
             (self.session / "phases" / phase).mkdir(parents=True)
         self.write_json(self.session / "progress_history_state.json", {"owner_staff_id": self.parent.id})
-
-    @override
-    def tearDown(self) -> None:
-        self.temporary.cleanup()
 
     def write(self, relative: str, text: str = "") -> Path:
         path = self.session / relative

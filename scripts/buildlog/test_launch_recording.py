@@ -26,6 +26,7 @@ from scripts.buildlog import report
 from scripts.buildlog import store
 from scripts.buildlog.test_index import Record, encode, point_root_at, step
 from scripts.buildlog.test_launches import CLI, result_line
+from scripts.lib import scratch as scratch_folders
 from scripts.lib import test_hang_guard
 from scripts.lint.memory_test_support import config_environment
 
@@ -131,7 +132,7 @@ class LaunchRecordingTests(unittest.TestCase):
             mock.patch.object(hana_shot, "port_answers", return_value=False),
             mock.patch.object(hana_shot, "uncommitted_build_paths", return_value=[]),
             mock.patch.object(hana_shot, "wait_ready"),
-            mock.patch.object(tempfile, "mkdtemp", return_value=str(scratch)),
+            mock.patch.object(scratch_folders, "new", return_value=scratch),
             mock.patch.object(subprocess, "Popen", side_effect=start, wraps=subprocess.Popen),
             mock.patch.object(hana_shot, "Brp", return_value=mock.Mock(call=mock.Mock(side_effect=stop))),
             redirect_stderr(io.StringIO()),

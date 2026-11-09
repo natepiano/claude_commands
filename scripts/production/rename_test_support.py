@@ -523,8 +523,8 @@ class ProductionRenameFixture(StaffTestCase):
         super().setUp()
         # Linked worktree metadata and the committed documents name absolute
         # paths. Restore private files, refs and origin at the seed's same path.
-        _ = shutil.copytree(self.fixture_snapshot, self.fixture_root, symlinks=True)
         self.addCleanup(shutil.rmtree, self.fixture_root)
+        _ = shutil.copytree(self.fixture_snapshot, self.fixture_root, symlinks=True)
         self.bind_fixture(self.fixture_root)
         self.old_tip = self.fixture_tip
         self.staff_file: Path = self.root / "state/staff/staff.json"
