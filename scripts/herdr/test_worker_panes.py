@@ -487,6 +487,7 @@ class WorkerPaneTests(StaffTestCase):
         return worker_panes.start_or_resume(self.parent.id, staff.WorkerName.parse(name), role, account=account)
 
     def test_new_worker_admission_completes_the_started_pane_home(self) -> None:
+        _ = cast(object, self.enterContext(patch.dict(os.environ, {"HERDR_PANE_RECORD_DIR": str(pane_record.record_directory())})))
         homes: list[str] = []
 
         def started(session: str, destination: herdr.NewTab | herdr.SplitPane | herdr.ExistingPane,
@@ -517,6 +518,7 @@ class WorkerPaneTests(StaffTestCase):
         self.assertEqual(saved["session_id"], result.row.id)
 
     def test_recovered_worker_admission_completes_the_started_pane_home(self) -> None:
+        _ = cast(object, self.enterContext(patch.dict(os.environ, {"HERDR_PANE_RECORD_DIR": str(pane_record.record_directory())})))
         identity = staff.native_id(fixture_runtime_id("TEST-recovered-worker"))
         row = staff.StaffRow(identity, "worker", "TEST-recovered", staff.ReportsTo(self.parent.id), current_session=identity)
         home = self.root / "codex"

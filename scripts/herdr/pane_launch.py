@@ -87,10 +87,8 @@ def _record_home(entry: PaneLaunch) -> PaneLaunch:
 
 def staff_admitted(row: staff.StaffRow) -> staff.StaffRow:
     """Complete pane publication after the first native identity admission."""
-    from scripts.shutdown import pane_record
-
     try:
-        publication = pane_record.publication_for_session(row.current_session, record=staff.StaffSnapshot(()))
+        publication = newest_publication(record_directory(), (row.current_session,))
         if publication is not None and "config_dir" in publication.entry:
             write(publication.path, _record_home(publication.entry))
             return staff.by_id(row.id) or row
@@ -273,6 +271,15 @@ class LaunchPublication:
 
     path: Path
     entry: PaneLaunch
+
+
+def newest_publication(directory: Path, references: Sequence[str]) -> LaunchPublication | None:
+    """Read the newest retained publication for the supplied session references."""
+    matches = [LaunchPublication(path, entry)
+               for path in sorted(directory.glob("*.json"))
+               for entry in read_strict(path).values()
+               if entry["session_id"] in references]
+    return max(matches, key=lambda publication: publication.entry["written_at"], default=None)
 
 
 @dataclass(frozen=True)
