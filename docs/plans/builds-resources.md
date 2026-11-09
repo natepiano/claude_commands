@@ -1918,7 +1918,7 @@ Every nextest run that lint starts prints one line after admission: `nextest: <g
 - `modules/darwin/tailscale.nix`, `modules/linux/ssh.nix`: Remote Login is on for the loopback hop only.
 - User steps: Remote Login on with "Allow full disk access for remote users"; first `rebuild` in the Mac's Terminal; then `ssh -t mac rebuild`. The live hop result comes from natedev through the showrunner.
 
-### Phase 87 — The Mac floor alert reaches the user's phone  · status: todo
+### Phase 87 — The Mac floor alert reaches the user's phone  · status: done
 **Depends on:** none. Merge `origin/builds` first.
 
 **Approved:** builds showrunner, 2026-11-08: "Did the Mac floor job send that push? If not, find why and fix it in Phase 85 or a new phase. If it did, tell me its time. Find what besides the 110 GiB hana target holds the other Mac space, from a read-only size list, and send me the top five folders."
