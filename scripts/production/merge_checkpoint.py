@@ -603,6 +603,7 @@ def merge(request: MergeRequest) -> str:
         raise Stop("merge", "failed", result.stderr.strip() or "merge failed",
                    "the showrunner will inspect the merge failure")
     head = good(git(checkout, "rev-parse", "HEAD"), "merge")
+    change_review.record_merge_producer(change_review.KnownMergeProducer(head, request.unit.staff_id))
     report("merge", "ok", f"merged as {head}")
     return head
 
@@ -948,16 +949,6 @@ def promote_local_checkout(checkout: Path, merge_branch: str, tip: str) -> (
     return PromotionAdvanced(tip)
 
 
-def remote_path(path: PurePosixPath) -> str:
-    """Quote a Mac path for its shell, leaving a leading ~ for the Mac to expand to its own home."""
-    text = str(path)
-    if text == "~":
-        return '"$HOME"'
-    if text.startswith("~/"):
-        return '"$HOME"/' + shlex.quote(text[2:])
-    return shlex.quote(text)
-
-
 def pull_mac_checkout(mac: PurePosixPath, source: Path) -> main_publish.MacPulled | main_publish.MacPullPending:
     settings_read = conf.read('merge_checkpoint')
     try:
@@ -965,28 +956,29 @@ def pull_mac_checkout(mac: PurePosixPath, source: Path) -> main_publish.MacPulle
         retry_seconds = settings_read.number("MAC_PULL_RETRY_SECONDS")
     except ValueError as error:
         raise Stop("promote", "failed", str(error), "repair the Mac pull configuration and rerun this checkpoint") from error
-    remote = (f"cd {remote_path(mac)} && git pull --ff-only "
+    remote = (f"cd {main_publish.remote_path(mac)} && git pull --ff-only "
               f"natedev:{shlex.quote(str(source))} main; printf 'rc=%s\\n' \"$?\"")
     attempt = 0
     while True:
         result = subprocess.run(["ssh", "mac", remote], capture_output=True, text=True, check=False)
         match = re.search(r"(?:^|\n)rc=(\d+)", result.stdout)
         if result.returncode == 0 and match is not None and int(match.group(1)) == 0:
-            main_publish.clear_pull_only()
+            main_publish.clear_pull_only(mac)
             return main_publish.MacPulled()
         attempt += 1
         if attempt == tries:
             if result.returncode == 255 and match is None:
-                main_publish.queue_pull_only(f"mac {mac}", main_publish.first_line(result))
+                main_publish.queue_pull_only(f"mac {mac}", main_publish.first_line(result),
+                                             pulls=(main_publish.MacCheckoutPull(mac, source),))
                 return main_publish.MacPullPending()
             raise Stop("promote", "failed", f"mac {mac}: {result.stdout.strip()} {result.stderr.strip()}",
                        "the showrunner will repair the Mac pull and rerun this checkpoint")
         time.sleep(retry_seconds)
 
 
-def send_queued_zone() -> None:
+def send_queued_zone(mac: PurePosixPath) -> None:
     """Send a /zone change queued while the Mac was offline: the pull just done carried its commit."""
-    done = subprocess.run([PYTHON, str(ZONE_SCRIPT), "drain", "--pulled"],
+    done = subprocess.run([PYTHON, str(ZONE_SCRIPT), "drain", "--pulled", str(mac)],
                           capture_output=True, text=True, check=False)
     for line in done.stdout.splitlines():
         report("promote", "ok", line)
@@ -1041,7 +1033,7 @@ def finish_promotion_targets(promotion: production_doc.NoPromotion | production_
             report("promote", "ok", f"mac unreachable, pull pending: {mac}")
             return
         report("promote", "ok", f"mac {mac} main pulled")
-        send_queued_zone()
+        send_queued_zone(mac)
         into(mac, "main", "sessions on mac run the installed commands from it",
              f"the live gate of {label}")
 

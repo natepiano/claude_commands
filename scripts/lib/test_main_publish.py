@@ -534,6 +534,7 @@ class MainPublishTests(PublicationTestCase):
             waiting = main_publish.PendingMacPull(change.label, change.text, change.since, "still asleep")
             self.assertEqual(main_publish.read_queue(), waiting)
             main_publish.clear_pull_only()
+            waiting = main_publish.PendingMacPull(waiting.label, waiting.text, waiting.since, waiting.reason, ())
             self.assertEqual(main_publish.read_queue(), waiting)
         with self.subTest(queue="pull only"):
             queue_path.unlink()
