@@ -1916,6 +1916,21 @@ class WorkerPaneTests(StaffTestCase):
                 self.assertEqual((self.staff_state(), self.world.foreground, len(self.world.launches), self.world.stops), before)
 
     def test_family_change_publication_failure_stops_the_destination_and_retries(self) -> None:
+        _ = cast(object, self.enterContext(patch.dict(os.environ, {"HERDR_PANE_RECORD_DIR": str(self.root / "switch-pane-records")})))
+
+        def started(session: str, destination: herdr.NewTab | herdr.SplitPane | herdr.ExistingPane,
+                    prepared: herdr.PreparedAgentEnvironment, kind: str, arguments: list[str],
+                    opening: herdr.OpeningPrompt | herdr.NoOpeningPrompt, timeout_ms: int, *, agent: str,
+                    reported_unknown: str = "",
+                    agent_name: str | herdr.AgentNameSource = herdr.AgentNameSource.MEMBER_REFERENCE) -> herdr.AgentLaunched:
+            result = self.world.launch(session, destination, prepared, kind, arguments, opening, timeout_ms,
+                                       agent=agent, reported_unknown=reported_unknown, agent_name=agent_name)
+            process = self.world.processes[self.world.foreground[result.pane][0]]
+            entry = pane_launch.launch(result.pane, process.identity.id, str(prepared.directory), prepared.env,
+                                       [kind, *arguments], kind=cast(Literal["claude", "codex"], kind))
+            pane_launch.write(pane_launch.record_directory() / "TEST-switch.json", entry)
+            return result
+
         families: tuple[Literal["claude", "codex"], ...] = ("claude", "codex")
         for family in families:
             for source_state in ("open", "exiting", "closed"):
@@ -1925,6 +1940,8 @@ class WorkerPaneTests(StaffTestCase):
                         destination_family: Literal["claude", "codex"] = "codex" if family == "claude" else "claude"
                         _ = write_registry(self.root / "conf/models.conf", {"assignments": {"direct": destination_family}})
                         row = self.worker(f"retry-{family}-{source_state}-{failure}", family=family)
+                        if family == "claude" and failure == "none":
+                            row = staff.set_home(row.id, staff.SessionHome(self.root / ".claude1"))
                         source_pane = f"w1:p{len(self.world.used_panes) + 1}"
                         source_terminal = "terminal-" + source_pane
                         if source_state != "closed":
@@ -1991,6 +2008,8 @@ class WorkerPaneTests(StaffTestCase):
 
                         with patch.object(stop_resume, "release_source", side_effect=release):
                             with ExitStack() as faults:
+                                if family == "claude" and failure == "none":
+                                    _ = faults.enter_context(patch.object(herdr, "launch_prepared_agent", side_effect=started))
                                 if failure == "publication":
                                     _ = faults.enter_context(patch.object(staff, "update_current_session",
                                         side_effect=staff.StaffRefused("publication unavailable")))
@@ -2012,6 +2031,9 @@ class WorkerPaneTests(StaffTestCase):
                                 self.assertNotEqual(failed.row.current_session, row.current_session)
                                 self.assertEqual(len(self.world.launches), launch_count + 1)
                                 self.assertEqual(self.world.closed, closed)
+                                if family == "claude":
+                                    self.assertEqual(failed.row.home, staff.SessionHome(Path(self.world.requests[-1][2]["CODEX_HOME"])))
+                                    self.assertEqual(staff.by_id(row.id), failed.row)
                                 continue
                             self.assertIsInstance(failed, worker_panes.UncertainWorker)
                             self.assertEqual(staff.by_id(row.id), row)

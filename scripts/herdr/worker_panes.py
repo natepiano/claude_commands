@@ -1139,7 +1139,7 @@ def _start_locked(owner: staff.StaffRow, name: WorkerName, role: WorkerRole, pol
             request = hashlib.sha256(f"{row.current_session if row else ''}:{policy.settings.kind}".encode()).hexdigest()
             published = worker_admission.switch_worker(allowed, policy.settings.kind, start=start,
                 dispatch=worker_admission.DispatchOwner.TURN_SUBMISSION, cleanup=cleanup, request=request)
-            row = published.row
+            row = pane_launch.staff_admitted(published.row)
         else:
             identity = start(worker_admission.NoFamilyHandoff())
             if row is not None and identity != row.current_session:
