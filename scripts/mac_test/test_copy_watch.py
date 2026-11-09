@@ -48,8 +48,9 @@ class ClaimRecord(TypedDict):
 # 0 once `finish` exists. SIGTERM ends it with 143 after writing `terminated`.
 STEP_STUB = r'''
 import os
-from pathlib import Path
 import signal
+signal.alarm(int(os.environ["TEST_HANG_GUARD_SECS"]))
+from pathlib import Path
 import sys
 import time
 
@@ -85,10 +86,11 @@ with log.open("a") as output:
 # or wait_failed (fail once `release-runner` exists). A `+busy` suffix first
 # writes TEST_BUSY_CLAIM as a live claim, so no further copy can start.
 RUNNER_STUB = r'''
-import json
 import os
-from pathlib import Path
 import signal
+signal.alarm(int(os.environ["TEST_HANG_GUARD_SECS"]))
+import json
+from pathlib import Path
 import sys
 import time
 
@@ -324,7 +326,10 @@ class CandidateTests(unittest.TestCase):
             _ = child.wait()
 
     def live_pid(self) -> int:
-        child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+        child = subprocess.Popen([
+            sys.executable, "-c",
+            'import os, signal; signal.alarm(int(os.environ["TEST_HANG_GUARD_SECS"])); signal.pause()',
+        ], env={**os.environ, "TEST_HANG_GUARD_SECS": str(test_hang_guard.TEST_HANG_GUARD_SECS)})
         self.children.append(child)
         return child.pid
 
@@ -400,6 +405,7 @@ class CopyWatchProcessTests(unittest.TestCase):
             "BUILD_TARGETS_POLL_S": "0.05",
             "TEST_BUSY_CLAIM": json.dumps(busy),
             "TEST_COPY_MODES": "failed",
+            "TEST_HANG_GUARD_SECS": str(test_hang_guard.TEST_HANG_GUARD_SECS),
         }
         self.step = None
         self.watcher = None
@@ -415,7 +421,7 @@ class CopyWatchProcessTests(unittest.TestCase):
     def start_step(self) -> subprocess.Popen[bytes]:
         log = self.root / "step.log"
         self.step = subprocess.Popen([sys.executable, str(self.root / "step.py"), str(self.root), str(log)],
-                                     start_new_session=True)
+                                     env=self.environment, start_new_session=True)
         _ = self.info.write_text(f"pgid={self.step.pid}\nlog={log}\n")
         return self.step
 
@@ -658,10 +664,14 @@ class CopyWatchProcessTests(unittest.TestCase):
         # The delayed wrapper starts the watcher after its parent exits.
         parent: subprocess.Popen[str] = subprocess.Popen([
             sys.executable, "-c",
-            "import os, signal, subprocess, sys\n"
+            "import os, signal\n"
+            + 'signal.alarm(int(os.environ["TEST_HANG_GUARD_SECS"]))\n'
+            + "import subprocess, sys\n"
             + "sys.argv[sys.argv.index('--parent-pid') + 1] = str(os.getpid())\n"
             + ("child = subprocess.Popen([sys.executable, '-c', "
-               + repr("import os, sys, time\n"
+               + repr("import os, signal\n"
+                      + 'signal.alarm(int(os.environ["TEST_HANG_GUARD_SECS"]))\n'
+                      + "import sys, time\n"
                       + "parent = int(sys.argv[1])\n"
                       + "while os.getppid() == parent: time.sleep(0.01)\n"
                       + "os.execv(sys.executable, [sys.executable, *sys.argv[3:]])\n")
