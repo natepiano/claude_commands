@@ -7,6 +7,7 @@ from scripts.shutdown import remote
 from scripts.production.staff_test_support import isolated_staff_file, unit_membership, recorded_showrunner
 from scripts.production import staff
 
+import json
 import os
 import subprocess
 import sys
@@ -112,6 +113,50 @@ class CheckpointTestFolderTests(unittest.TestCase):
 
 @final
 class MergeCheckpointTests(MergeCheckpointFixture):
+    def test_successful_push_ends_landed_worktrees_and_keeps_dirty_worktrees(self) -> None:
+        checkout = Path(__file__).resolve().parents[2]
+        records = self.root / "worktree-records"
+        config = self.root / "staff.conf"
+        _ = config.write_text((checkout / "config/staff.conf").read_text())
+        self.env.update({"WORKTREES_STATE_DIR": str(records), "STAFF_CONFIG": str(config),
+                         "CLAUDE_PYTHON": sys.executable})
+        library = Path(self.env["HOME"]) / ".claude/scripts/lib"
+        library.symlink_to(checkout / "scripts/lib", target_is_directory=True)
+        _ = self.git("remote", "set-head", "origin", "production")
+        checkpoint = self.checkpoint()
+        trees = {"landed-work": self.root / "landed-work", "dirty-work": self.root / "dirty-work"}
+        for branch, tree in trees.items():
+            made = subprocess.run(
+                ["bash", str(checkout / "scripts/worktree/make_worktree.sh"), str(tree), branch],
+                cwd=self.checkout, env=self.env, capture_output=True, text=True, check=False, timeout=20)
+            self.assertEqual(made.returncode, 0, made.stdout + made.stderr)
+            _ = self.git("merge", "--ff-only", checkpoint, cwd=tree)
+            _ = self.git("push", "-u", "origin", branch, cwd=tree)
+        self.write(trees["dirty-work"], "src/alpha.txt", "uncommitted work\n")
+
+        result = self.run_checkpoint(checkpoint).process
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("push: ok", result.stdout)
+        self.assertIn("worktrees: ended", result.stdout)
+        self.assertIn(str(trees["landed-work"]), result.stdout)
+        self.assertIn("worktrees: kept", result.stdout)
+        self.assertIn(str(trees["dirty-work"]), result.stdout)
+        self.assertEqual(self.git("rev-parse", "HEAD"),
+                         self.git("rev-parse", "refs/heads/production", cwd=self.origin))
+        worktrees = self.git("worktree", "list", "--porcelain")
+        self.assertNotIn(f"worktree {trees['landed-work']}\n", worktrees + "\n")
+        self.assertNotIn(trees["landed-work"].name, [path.name for path in self.root.iterdir()])
+        for folder in (self.checkout, self.origin):
+            branches = self.git("for-each-ref", "--format=%(refname)", "refs/heads", cwd=folder).splitlines()
+            self.assertNotIn("refs/heads/landed-work", branches)
+            self.assertIn("refs/heads/dirty-work", branches)
+        remaining = [cast(dict[str, object], json.loads(path.read_text()))
+                     for path in (records / "made").glob("*.json")]
+        self.assertEqual([(row["path"], row["branch"]) for row in remaining],
+                         [(str(trees["dirty-work"]), "dirty-work")])
+        self.assertEqual((trees["dirty-work"] / "src/alpha.txt").read_text(), "uncommitted work\n")
+
     def test_merge_uses_the_staff_name_with_a_different_document_name(self) -> None:
         with isolated_staff_file(Path(self.env["STAFF_FILE"]), self.env):
             _ = staff.rename(showrunners.owner_for("example").id, "hana")
