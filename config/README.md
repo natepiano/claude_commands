@@ -283,7 +283,7 @@ The controller reads the instance ID from `deployment.json`.
 A build or final uses AWS only when a flag pins the command.
 An empty `ci_repo` disables GitHub calls.
 
-`monthly_limit_usd=400` is the user's monthly spending limit (approved 2026-11-01). `daily_limit_usd=20` is derived (the monthly limit / 20); the user approved it on 2026-11-03.
+`monthly_limit_usd` and `daily_limit_usd` are the user's spending limits. `aws_target.conf` holds each value on one line.
 The AWS Budget must read `monthly_limit_usd`. Code must never raise either limit.
 The spending reserve is $3. The maximum drain time is 60 minutes.
 Each repository budget stays within the 32 GiB build budget.
