@@ -195,8 +195,7 @@ def _valid(value: object) -> bool:
                 "failed": ("reason",), "waited": ("window", "reset"),
                 "wait ended": (), "no room": ("earliest_reset",), "room again": ("label",)}
     if kind == "confirmed":
-        return (isinstance(fields.get("home"), str) or isinstance(fields.get("config_dir"), str)) and (
-            "worker" not in fields or isinstance(fields["worker"], str))
+        return "worker" not in fields or isinstance(fields["worker"], str)
     return isinstance(kind, str) and kind in required and all(isinstance(fields.get(key), str) for key in required[kind])
 
 

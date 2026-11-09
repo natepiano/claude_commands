@@ -24,7 +24,8 @@ from scripts.lib.process_failure import failure_detail
 from scripts.production import session_staff, staff, unit_lookup
 from scripts.production.production_doc import Production, Refusal, read_production
 
-from scripts.production.merge_checkpoint import Stop, git, report as merge_report
+from scripts.production.checkpoint_gate import Stop, report as merge_report
+from scripts.production.merge_checkpoint import git
 from scripts.direct import progress_history
 from scripts.lib.user_zone import user_zone
 

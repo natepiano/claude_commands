@@ -14,7 +14,7 @@ from zoneinfo import ZoneInfo
 
 from scripts.copies import copies
 
-from scripts.production.merge_checkpoint import (
+from scripts.production.checkpoint_gate import (
     Stop, complete_gate, read_record, record_lock,
     run_checkpoint_test_steps, save_record,
 )

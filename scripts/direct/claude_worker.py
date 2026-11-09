@@ -291,6 +291,11 @@ def open_worker(turn: ClaudeTurn) -> Delivered | Unchanged | NotDelivered:
                 before = TurnsNotCounted() if created else _transcript_count(worker.row.current_session)
                 worker_admission.record_dispatch(allowed, request, worker_admission.SwitchState.DISPATCH_IN_FLIGHT,
                                                  expected_request=request)
+                if turn.role in staff.WORKER_ROLES and worker.row.role != staff.KnownWorkerRole(turn.role):
+                    try:
+                        _ = staff.set_worker_role(worker.row.id, staff.KnownWorkerRole(turn.role))
+                    except (OSError, staff.StaffNotFound, staff.StaffRefused) as error:
+                        print(f"anomaly: {worker.row.id}: {' '.join(str(error).splitlines())}", file=sys.stderr)
                 _deliver(prepared, worker.row.current_session, environment)
                 delivered = Delivered(worker.row.current_session, before, dict(environment))
                 return worker_admission.SwitchState.ASSIGNMENT_ACCEPTED

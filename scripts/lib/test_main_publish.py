@@ -5,7 +5,7 @@ import os
 from contextlib import redirect_stderr
 from functools import cached_property
 import io
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import shlex
 import shutil
 import subprocess
@@ -344,7 +344,7 @@ class MainPublishTests(PublicationTestCase):
         self.assertIn("User-Approved: yes set 3", approval)
         self.assertIn("amount=3", repo.git(repo.origin, "show", "main:config/example.conf"))
         self.assertEqual((repo.checkout / "remote.txt").read_text(), "another writer's work\n")
-        self.assertIn("git pull -q --ff-only", repo.ssh_log.read_text())
+        self.assertIn("git fetch -q --no-write-fetch-head", repo.ssh_log.read_text())
         head = repo.head()
         again = self.retry_tune()
         self.assertEqual(again.returncode, 0, again.stdout + again.stderr)
@@ -368,7 +368,7 @@ class MainPublishTests(PublicationTestCase):
         self.assertEqual((repo.head(), repo.remote_tip()), (advanced, advanced))
         self.assertEqual(repo.git(repo.checkout, "rev-list", "--count", "HEAD"), count)
         self.assertEqual(repo.git(repo.checkout, "status", "--porcelain=v1"), "")
-        self.assertIn("git pull -q --ff-only", repo.ssh_log.read_text())
+        self.assertIn("git fetch -q --no-write-fetch-head", repo.ssh_log.read_text())
 
     def test_ready_rebases_tune_zone_and_installed_zone_commits_in_order(self) -> None:
         repo = self.repository
@@ -478,13 +478,37 @@ class MainPublishTests(PublicationTestCase):
         self.assertIsInstance(main_publish.pull_mac(repo.checkout, ssh_program=str(repo.ssh)), main_publish.MacPulled)
         arguments = repo.ssh_log.read_text()
         self.assertIn("mac\n", arguments)
-        self.assertIn(f"git pull -q --ff-only natedev:{shlex.quote(str(repo.checkout))} main", arguments)
+        self.assertIn(f"tip=$(git ls-remote natedev:{shlex.quote(str(repo.checkout))} refs/heads/main | cut -f1)", arguments)
+        self.assertIn(f"git fetch -q --no-write-fetch-head natedev:{shlex.quote(str(repo.checkout))} main", arguments)
+        self.assertIn('git merge -q --ff-only "$tip"', arguments)
         _ = (repo.root / "OFFLINE").write_text("")
         outcome = main_publish.pull_mac(repo.checkout, ssh_program=str(repo.ssh))
         self.assertIsInstance(outcome, main_publish.MacPullFailed)
         if not isinstance(outcome, main_publish.MacPullFailed):
             self.fail("an asleep Mac did not return a failure reason")
         self.assertIn("Mac asleep", outcome.reason)
+
+        mac = repo.root / "Mac checkout"
+        _ = repo.git(repo.root, "clone", "-q", str(repo.checkout), str(mac))
+        fetch_head = mac / ".git/FETCH_HEAD"
+        previous_tip = repo.head()
+        fetch_text = f"{previous_tip}\t\tfirst fetch\n{previous_tip}\t\tsecond fetch\n"
+        _ = fetch_head.write_text(fetch_text)
+        refs = repo.git(mac, "show-ref")
+        _ = repo.change()
+        _ = repo.git(repo.checkout, "commit", "-qam", "advance main")
+        _ = (repo.root / "OFFLINE").unlink()
+        _ = repo.ssh.write_text('#!/bin/sh\nfor command do :; done\nexec sh -c "$command"\n')
+        with mock.patch.dict(os.environ, {"GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "url.file://.insteadOf",
+                                          "GIT_CONFIG_VALUE_0": "natedev:"}):
+            for attempt in ("first pull", "repeat pull"):
+                with self.subTest(attempt=attempt):
+                    pulled = main_publish.pull_mac(repo.checkout, ssh_program=str(repo.ssh), mac=PurePosixPath(str(mac)))
+                    self.assertIsInstance(pulled, main_publish.MacPulled)
+                    self.assertEqual(repo.git(mac, "rev-parse", "HEAD"), repo.head())
+                    self.assertEqual(fetch_head.read_text(), fetch_text)
+                    self.assertEqual(repo.git(mac, "for-each-ref", "--format=%(objectname) %(refname)", "refs/remotes"),
+                                     "\n".join(line for line in refs.splitlines() if " refs/remotes/" in line))
 
     def test_remote_git_failure_returns_a_named_failure_after_a_successful_ssh_connection(self) -> None:
         repo = self.repository
