@@ -3431,6 +3431,8 @@ The user (2026-11-07, through sdlc [4fdbe4b7]): "yes i definitely want this - ke
 
 **Constraint from Phases 28 and 28a:** a blocked worker gives exit 4, prints `question: <worker> pane <pane>` and the pane lines (`worker._blocked_question`), and the director answers with `worker.py answer`. (1) Only a Codex worker stops on a question: a Claude pane worker has no `AskUserQuestion` tool (28a director proof). A Codex question ends no turn, so give the blocked state its own event to the director (herdr pane state `blocked`). Question handling is Codex-only. The 28a Codex answer proof passed; the Claude completion proof is Phase 28d's, so this phase depends on 28d before Claude completion moves into the Stop hook. (2) A turn end without `DONE` is not always a question: a pending detached run, a pending friend reply and `NO_DONE` are other outcomes. Name each outcome. Test that pending work keeps its pass id and saved launcher arguments, sends no question or recovery message, and submits no second prompt; after a friend's reply and the matching `DONE`, the same pass completes.
 
+**Question route (sdlc [cb2d951c], 2026-11-08):** no watcher, and no blocked-event producer. Codex has no hook at a question; `notify` runs only at `agent-turn-complete`. Worker panes launch Codex with `--ask-for-approval never` (`worker_panes.py:670`), so a worker meets no approval prompt in a turn. A question the worker writes in its reply ends the turn, and the turn-end hook sends it. The one gap: an unexpected screen prompt ends no turn, and the director finds it only when it reads the pane. The docs this phase changes state that gap.
+
 **Constraint from Phase 42:** `worker.restore(parent, only=..., account=..., started_panes=...)` restores selected rows with `worker_panes.observe_selected`, and `restart.start_row` returns the pane from `started_panes`. `worker_panes.start_or_resume` and `launch_environment` take `accounts.AccountSelection` and use it only for a worker of its own family. When this phase changes those signatures (item 9), keep the selected restore, the typed account and the returned pane; the acceptance gate adds `scripts.shutdown.test_restart`, `scripts.shutdown.test_pane_restore` and `test_launch_environment_matches_the_policy_family_for_typed_accounts`.
 
 **Constraint from Phase 39:** herdr gives some resumed Codex panes no `agent_session`. Read a pane's thread through `Herdr.native_pane_process(...).current_identity` when the report is absent; do not rely on `agent_session` alone.
@@ -3623,6 +3625,31 @@ Test rows: a new launch with a foreign rollout open publishes the pane's reporte
 phases-unit Phase 21 (run 29fc6964): the impl launch exited 5 although its worker opened and worked. The log line: `herdr agent prompt: agent_prompt_stalled: agent prompt produced no observed working or blocked state within 5000 ms; current status is idle`. Cause: `worker._dispatch_turn` types the job with `_agent_command(..., "prompt", line)`, which runs `herdr agent prompt <pane> <text> --wait` with herdr's 5000 ms default. herdr's working state for the pane came later than 5 s, and `_delivery_failure` maps `agent_prompt_stalled` to exit 5 without a read of the transcript. The transcript, not the herdr state, records submission (`dispatch_receipt`).
 
 Fix: after a prompt, `agent_prompt_stalled` is not a failure. `_dispatch_turn` goes on to its wait loop, which already reads `dispatch_receipt` and the worker state and returns the right outcome. No new check, wait or retry. One test row: a prompt that herdr reports stalled, with the prompt in the transcript and the worker then done, completes the pass. Work Order: written at phase start.
+
+### Phase 28g — A resumed worker that starts its turn slowly is not stalled  · status: done
+
+**Depends on:** Phase 28f (both edit `scripts/production/worker.py`). agents 17b also edits `worker.py`: merge origin/sdlc after 17b lands, before the hash. sdlc [417d0b13], 2026-11-08.
+
+Case (natedev, 2026-11-08): accounts phase 1 sent jobs to two resumed Codex workers (impl, fix2). Each assign exited 5: `agent_prompt_stalled: no working state within 5000 ms`. Both panes then showed the prompt as working. A resumed Codex thread takes more than 5 s to show working. herdr 0.9.5 fixes this 5000 ms inside `herdr agent prompt --wait`; no option changes it. Phase 28e (moved into Phase 34 item 10) removes the wait when Phase 34 lands. This phase is the fix until then.
+
+`herdr.py:2376` (`submit_opening_prompt`) already treats `agent_prompt_stalled` as no failure and goes on to its transcript proof. This phase does not edit `herdr.py`.
+
+#### Work Order
+
+**Goal:** a resumed worker that shows working later than 5 s after its prompt completes its pass. A worker that never starts its turn still exits 5.
+
+**Spec:**
+
+1. `config/direct.conf`: add `WORKER_PROMPT_START_SECONDS=60`, range 1..600, with the comment "Seconds a worker has to start its turn after a prompt." Put it after `WORKER_SETTLE_SECONDS`.
+2. `worker._dispatch_turn` (`scripts/production/worker.py`): when `_agent_command(..., "prompt", line)` raises `HerdrFailure` with code `agent_prompt_stalled`, run `herdr agent wait <pane> --until working --until blocked --until done --timeout <ms>`. Read the ms from `WORKER_PROMPT_START_SECONDS` through `conf.read("direct")`. On a match, go on to the existing wait loop. On a timeout or other failure, return through `_delivery_failure` as today.
+3. Use one place for the herdr call: the existing `_agent_command` or `Herdr` client path. Do not add a second subprocess call site.
+4. Test rows in `scripts/production/test_worker.py`: (a) herdr reports the prompt stalled, the start wait then sees working, and the pass completes with exit 0; (b) herdr reports the prompt stalled and the start wait times out: exit 5. Add the rows to the existing stall test, not a new test class.
+5. Docs: `docs/as-built/herdr-adoption.md` names the start window and its config key where it describes the dispatch prompt.
+6. Add no check, refusal, validation, retry or wait that this list does not name.
+
+**Files:** `config/direct.conf`, `scripts/production/worker.py`, `scripts/production/test_worker.py`, `docs/as-built/herdr-adoption.md`.
+
+**Phase 34 merge note:** Phase 34 returns at submission and treats the stall as submitted. At the Phase 34 merge, keep the Phase 34 code and remove `WORKER_PROMPT_START_SECONDS` if nothing reads it.
 
 ## Reference
 

@@ -215,9 +215,13 @@ def _agent_command(client: herdr.Herdr, worker: worker_panes.OpenWorker, action:
     if not herdr.check_target(str(worker.row.current_session), action="keys",
             place=herdr.HerdrPlace(client.session, worker.pane), terminal=worker.terminal, text=line, client=client):
         raise herdr.HerdrFailure(f"{worker.row.name}: dispatch target is unproved", "wrong_target")
-    arguments = ["agent", action, worker.pane]
+    arguments = ["agent", "wait" if action == "wait-start" else action, worker.pane]
     if action == "prompt":
         arguments.extend((script_prompt(line), "--wait"))
+    elif action == "wait-start":
+        seconds = conf.read("direct").number("WORKER_PROMPT_START_SECONDS")
+        arguments.extend(("--until", "working", "--until", "blocked", "--until", "done",
+                          "--timeout", str(int(seconds * 1000))))
     result = subprocess.run(client.argv(*arguments), text=True, capture_output=True, check=False)
     herdr.require_success(result, f"herdr agent {action}")
 
@@ -383,7 +387,12 @@ def _dispatch_turn(parent: StaffId, started: worker_panes.OpenWorker, client: he
                 print(f"{name.value}: agent is {current.status.value}", file=sys.stderr)
                 return ExitCode.BUSY
             try:
-                _agent_command(client, current, "prompt", line)
+                try:
+                    _agent_command(client, current, "prompt", line)
+                except herdr.HerdrFailure as error:
+                    if error.code != "agent_prompt_stalled":
+                        raise
+                    _agent_command(client, current, "wait-start")
             except (herdr.HerdrFailure, subprocess.TimeoutExpired) as error:
                 return _delivery_failure(error, client, current)
     last_wait_was_quiet = False
