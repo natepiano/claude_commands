@@ -53,8 +53,7 @@ The trial and route share `scripts/aws_target/gate_box.py`.
 The boot script downloads the guest program before Python starts.
 Production also downloads the request that contains the module list.
 User data contains the download links instead of the program or module paths.
-Production uses the instance role and S3 inside the tools shell.
-The trial uses signed HTTPS links for its program and source bundle.
+Production and trial use curl with signed HTTPS links for every box transfer.
 The guest performs no type check and installs no basedpyright package.
 An explicit type request and the nightly checker remain local.
 
@@ -98,7 +97,7 @@ The existing Rust foundation stack must exist first.
 The command adds the gate bucket, role, profile, security group, launch template, scaler policy, expiry Lambda, schedule, and log group.
 It preserves Rust parameters and refuses a change set that changes a Rust resource.
 It records a priced shared resource entry before creation.
-It saves the image, template version, public subnets, nixpkgs revision, and artifact role prefix locally.
+It saves the image, template version, public subnets, and nixpkgs revision locally.
 This phase prepares tools at boot. A prepared image belongs to plan phase 7.
 
 | Scaler grant | Scope |
@@ -109,11 +108,11 @@ This phase prepares tools at boot. A prepared image belongs to plan phase 7.
 | `ec2:TerminateInstances` | This deployment's gate ownership and workload tags. |
 | `ec2:DescribeInstances` | Regional describe scope. |
 | `ce:GetCostAndUsage` | Combined cost query; AWS requires wildcard resource scope. |
-| `s3:PutObject` | Gate source and request prefixes. |
-| `s3:GetObject` | Gate artifact prefix. |
+| `s3:PutObject` | Gate source, request, and artifact prefixes. |
+| `s3:GetObject` | Gate artifact, source, and request prefixes. |
 
 The guest reads source and request objects.
-Its writes use only `artifacts/${aws:userid}/*`, which contains its role and instance identity.
+The scaler signs box uploads under `artifacts/<attempt>/`; the guest role has no S3 grants.
 The expiry role terminates only gate-tagged instances and writes only its function logs.
 The gate bucket blocks public access, requires HTTPS, encrypts objects, and removes old artifacts.
 

@@ -58,6 +58,17 @@ class AwsReportTests(MeasurementFixture):
     def peer_line(self, output: str, target: str) -> str:
         return next(line for line in output.splitlines() if f"{target} (" in line)
 
+    def test_read_only_evidence_rejects_changes_outside_index_wal_sidecars(self) -> None:
+        _ = index.update()
+        database = index.index_path()
+        paths = (database, self.root / "evidence", Path(str(database) + index.INDEX_SIDECAR_SUFFIXES[0]),
+                 self.root / (database.name + index.INDEX_SIDECAR_SUFFIXES[1]))
+        for path in paths:
+            with self.subTest(path=path.relative_to(self.root)), self.assertRaises(AssertionError):
+                with read_only_evidence(self, self.root):
+                    with path.open("ab") as handle:
+                        _ = handle.write(b"x")
+
     def test_legacy_local_hosts_match_sql_and_python_classification(self) -> None:
         registry = self.root / "build_targets.conf"
         _ = registry.write_text(registry.read_text().replace(

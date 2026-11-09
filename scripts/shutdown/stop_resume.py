@@ -248,7 +248,7 @@ def _stop_recorded(session: str, kind: str = "", *,
             codex.unknown)) if isinstance(result, (Stopped, NotRunning)) else codex
         if before is not None and isinstance(result, (Stopped, NotRunning)) and not _worker_stopped(
                 before, **({"codex": after} if after is not None else {})):
-            return StopFailed(str(before.row.current_session), "worker stop has no fresh shell proof on the same terminal")
+            return StopFailed(str(before.row.current_session), "worker stop has no fresh shell or closed-pane proof")
     if isinstance(result, (Stopped, NotRunning)):
         _retire_prompt(result.session_id)
     if isinstance(result, Stopped):
@@ -272,8 +272,11 @@ def _worker_stopped(before: worker_panes.WorkerPane, *,
     if isinstance(before, (worker_panes.OpenWorker, worker_panes.StoppedWorker)):
         client = herdr.Herdr(herdr.shared_session())
         try:
-            return (any(pane["pane_id"] == before.pane and pane.get("terminal_id") == before.terminal for pane in client.panes())
-                    and isinstance(client.pane_activity(before.pane), herdr.PaneAtShell)
+            panes = client.panes()
+            closed = not any(pane["pane_id"] == before.pane or pane.get("terminal_id") == before.terminal for pane in panes)
+            at_shell = (any(pane["pane_id"] == before.pane and pane.get("terminal_id") == before.terminal for pane in panes)
+                        and isinstance(client.pane_activity(before.pane), herdr.PaneAtShell))
+            return ((closed or at_shell)
                     and not isinstance(herdr.read_conversation(str(before.row.current_session), codex=codex), herdr.LiveConversation))
         except (OSError, ValueError, herdr.HerdrFailure):
             return False
