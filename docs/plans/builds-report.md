@@ -921,3 +921,17 @@ The build log index uses WAL mode, so a spilled update takes no exclusive lock a
 
 **Gotchas:**
 - Chrome refuses a long temporary socket path. Run the proof under a short `$TMPDIR` when the default path is long.
+
+### Phase 44 — A vault stop files a question only when the next hourly try also stops · status: done
+
+#### As-built
+
+- The Mac script's `retry_git` prints Git output only for the final failure: exhausted lock retries, or an error that is not a lock. A vault stop shows the Git error once.
+- `_vault_locked` files a question only when an outage was already open before the run, for every stop cause. A first stop opens the outage with `asked` false.
+- The 24-hour Mac unreachable grace still applies. A failed `ask` retries on the next run. A good sync after a first stop files no question and withdraws none.
+- Any run of `buildlog vault` counts as the next try, also a manual one.
+- Exit codes did not change. The rule has no config key: one try is not a tunable.
+
+**Files:**
+- `scripts/buildlog/vault_pull.py` — the sync and its question rule.
+- `scripts/buildlog/test_vault_pull.py` — the rule for each stop cause, and the single error line.
