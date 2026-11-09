@@ -2020,34 +2020,50 @@ A changed `config/<name>.conf` selects every test module whose transitive import
 - A merged-capture caller must get `stderr=None`; `invoke_cli` merges the streams itself.
 
 ### Phase 100 — The director turn-wait hook tests use half their CPU  · status: done
+
+#### As-built
+
+- `DirectorWaitFixture` takes `execution: Literal["direct", "process"] = "direct"`; `director_wait_fixture(*, execution=...)` passes it on.
+- The direct path builds a `ConversationPauseFixture`, sets its `root`, and runs the real hook through `execute_script(script, [str(HOOKS / hook)], environment, payload)`. A `subprocess.Popen` patch keeps each child; the fixture reaps each one with `wait(timeout=TEST_HANG_GUARD_SECS)` and restores the SIGALRM handler and ITIMER_REAL.
+- Two tests keep `execution="process"`: `test_final_decision_and_gate_lines_start_one_user_wait_and_allow_the_stop` and `test_typed_user_prompt_finishes_the_user_wait_before_conversation_pause`.
+- 25 tests and 48 assertions stay. `module_cost.py` CPU 33.3 → 4.0 s, processes 315 → 225, execs 283 → 193, wall 36.1 → 5.7 s. Same-load pairs (TMPDIR on tmpfs, sockets under `/tmp`): CPU 26.1 → 3.9 s (85% less), wall 27.3 → 4.9 s.
+
+**Files:**
+- `scripts/hooks/test_direct_turn_wait_hooks.py` — director turn-wait hook tests; the hook runs in the test process by default
+
+**Gotchas:**
+- A test that asserts on Stop output or a typed prompt across the process boundary keeps `execution="process"`.
+
+### Phase 101 — The herdr tests use half their CPU  · status: todo
 **Depends on:** none
 
 #### Work Order
 
-**Source:** the backlog rank rule (next items, item 2). On 2026-11-09 02:20 EST (`show.py top`, rows as of 01:19 EST), `hooks/test_direct_turn_wait_hooks.py` is the highest module by median CPU that no phase holds and that has no floor: 46.1 CPU s per gate, 25 tests. Higher rows are held or at a floor: `test_assign_launcher.py` (Phase 89), `test_verify_wait_holder.py` (Phase 95 floor), `test_style_sync.py` (devtools), `test_review_remote_copies.py` (Phase 97, rows predate it), `test_verify_mac_only.py` and `test_verify_ssh_targets_routing.py` (the `build_hold` chain floor), `test_crate_run.py` (Phase 77 floor), `test_fast_track.py` (floor), `test_assign_claude.py` (Phase 99, rows predate it).
+**Source:** the backlog rank rule (next items, item 2). On 2026-11-09 03:10 EST (`show.py top`, rows as of 02:23 EST), `herdr/test_herdr.py` is the highest module by median CPU that no phase holds and that has no floor: 44.9 CPU s per gate, 377 tests. Higher rows are held, done or at a floor: `test_assign_launcher.py` (Phase 89), `test_verify_wait_holder.py` (Phase 95 floor), `test_style_sync.py` (devtools), `test_review_remote_copies.py` (Phase 97), `test_verify_mac_only.py` and `test_verify_ssh_targets_routing.py` (the `build_hold` chain floor), `test_crate_run.py` (Phase 77 floor), `test_fast_track.py` (floor), `test_assign_claude.py` (Phase 99), `test_direct_turn_wait_hooks.py` (Phase 100).
 
-**Goal:** `scripts/hooks/test_direct_turn_wait_hooks.py` uses half its current CPU, or a measured floor shows why it cannot, with every checked behavior kept.
+**Goal:** `scripts/herdr/test_herdr.py` uses half its current CPU, or a measured floor shows why it cannot, with every checked behavior kept.
 
 **Spec:**
 1. Follow the Speed method. Measure CPU with `module_cost.py --tests 10 --commands 10` first. Name each test's CPU, and each real process that it starts.
-2. Start with the slowest test: `DirectorTurnWaitHookTests.test_supplier_wait_only_finishes_on_its_current_address` (7.6 s in the last gate).
-3. `DirectorWaitFixture.call` starts `session_lookup.py` with a hook script for each hook call. Check whether an in-process call of the real hook entry (as Phase 97 and Phase 99 did with `invoke_cli`) keeps the real code path. Keep a real process for each test whose behavior is the process boundary.
+2. Start with the slowest tests in the 02:47 EST gate: `LaunchDestinationTests.test_existing_pane_refuses_overwriting_proved_foreground_work` (10.0 s), `LaunchDestinationTests.test_refused_environment_command_never_starts_an_agent` (10.0 s) and `HerdrTests.test_darwin_process_discovery_uses_sockets_uid_cwd_and_real_environment` (6.1 s). Find what each one waits for. A wait that ends only at a production deadline gets a test-set deadline or clock through an existing parameter, not a production change.
+3. Where a test starts a Python process for a CLI `main` and its behavior is not the process boundary, check an in-process call of the real entry (Phase 97 `invoke_cli`, Phase 100 in-process hook entry). Keep a real process for each test whose behavior is the process boundary.
 4. Write a behavior map with a row for each assertion before you change a test.
-5. Read the importers of a changed fixture before you change it. Every importer stays green.
+5. Read the importers of a changed fixture before you change it. `scripts/shutdown/test_pane_restore.py`, `scripts/shutdown/test_pane_record.py` and `scripts/herdr/test_herdr_sessions.py` import from this module. Every importer stays green.
 6. If only a production change can cut a cost, write the floor and send the director an architecture proposal with its measured gain.
 7. Add no guard, refusal or check (user rule, 2026-11-05).
 
 **Files:**
-- `scripts/hooks/test_direct_turn_wait_hooks.py`
+- `scripts/herdr/test_herdr.py`
 
 **Workers:** 1 writer; one test file
-- `impl` — `test_direct_turn_wait_hooks.py`
+- `impl` — `test_herdr.py`
 
 **Constraints from prior phases:**
 - Phase 97: an in-process call of a real CLI `main` through `invoke_cli` (`scripts/production/cli_fixture.py`) replaced one interpreter start per case and kept the real code path. `combined_output=True` merges stdout and stderr.
-- Phase 99: `direct_launcher_helpers()` in `scripts/direct/assign_claude_test_support.py` routes `subprocess.run` calls of helper CLIs in process; `test_assign_claude_test_support.py` compares that adapter with a real run.
+- Phase 100: running the real hook entry inside the test process cut CPU by 85%. Tests that assert on a process boundary kept a real process.
 - Phase 89 runs beside this phase and holds `scripts/direct/test_assign_launcher.py` and `scripts/direct/assign_launcher_test_support.py`. Do not edit them.
-- Tests never read or write live state: `~/.claude` main, `~/.local/state/merge-gate`, `/tmp/claude`. The fixture uses `short_socket_directory`; state the filesystem basis of each pair.
+- The panes unit (sdlc) owns herdr production code and changes this test file often. Edit only the test file; a merge conflict is resolved on this side.
+- Tests never read or write live state: `~/.claude` main, `~/.local/state/merge-gate`, `/tmp/claude`. State the filesystem basis of each pair.
 
 **Acceptance gate:**
 - The behavior map has a row for each assertion. No assertion is removed.
