@@ -965,11 +965,11 @@ def codex_email_on_disk(home: Path | None = None) -> str | None:
     return email if isinstance(email, str) and email else None
 
 
-class CodexServerClosed(RuntimeError):
+class CodexAccountClosed(RuntimeError):
     """The server closed its output before answering a request."""
 
 
-class CodexServer:
+class CodexAccountClient:
     """A `codex app-server` over stdio, spoken to one JSON-RPC request at a time."""
 
     process: asyncio.subprocess.Process
@@ -999,7 +999,7 @@ class CodexServer:
                     if "error" in response:
                         raise RuntimeError("account API request failed")
                     return cast(object, response.get("result", {}))
-            raise CodexServerClosed("account API closed")
+            raise CodexAccountClosed("account API closed")
 
         return await asyncio.wait_for(receive(), timeout=timeout_seconds)
 
@@ -1074,9 +1074,9 @@ async def prepare_codex_home(home: Path) -> CodexHomePreparation:
     deadline = time.monotonic() + CODEX_HOME_PREPARATION_SECONDS
     reason = "initialize was not answered"
     while deadline - time.monotonic() > 0:
-        server: CodexServer | None = None
+        server: CodexAccountClient | None = None
         try:
-            server = CodexServer(await asyncio.create_subprocess_exec(
+            server = CodexAccountClient(await asyncio.create_subprocess_exec(
                 executable("codex"), "app-server", "--listen", "stdio://",
                 stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.DEVNULL,
@@ -1093,7 +1093,7 @@ async def prepare_codex_home(home: Path) -> CodexHomePreparation:
             break
         except OSError as error:
             return CodexHomePreparationFailed(f"Codex did not start at {codex_home_display(home)}: {error}")
-        except CodexServerClosed as error:
+        except CodexAccountClosed as error:
             reason = str(error) or type(error).__name__
         except (RuntimeError, ValueError, KeyError) as error:
             reason = str(error) or type(error).__name__
@@ -1110,10 +1110,10 @@ async def prepare_codex_home(home: Path) -> CodexHomePreparation:
 
 async def codex_live(home: Path) -> Report:
     report = Report("Codex", source=CodexHomeSource(home))
-    server: CodexServer | None = None
+    server: CodexAccountClient | None = None
     initialized = False
     try:
-        server = CodexServer(await asyncio.create_subprocess_exec(
+        server = CodexAccountClient(await asyncio.create_subprocess_exec(
             executable("codex"), "app-server", "--listen", "stdio://",
             stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.DEVNULL,

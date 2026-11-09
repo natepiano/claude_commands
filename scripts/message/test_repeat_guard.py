@@ -267,11 +267,11 @@ print(json.dumps([guard_site_probe.ready, 'NIX_PYTHONPATH' in os.environ,
         self.assertEqual([notice.kind for notice in self.state.notices], ["owner"])
 
     def test_restart_results_spread_over_seven_receivers_do_not_notify_or_hold(self) -> None:
-        self.state = guard.SenderState("mesh-runs", "fixture-host", 0)
+        self.state = guard.SenderState("detached-runs", "fixture-host", 0)
         index = 0
         for receiver, count in enumerate((50, 22, 15, 8, 3, 3, 1)):
             for _ in range(count):
-                attempt = guard.Attempt("mesh-runs", f"session:{receiver}", f"run-{index} finished",
+                attempt = guard.Attempt("detached-runs", f"session:{receiver}", f"run-{index} finished",
                                         "fixture-host", index * 22 * 60 / 101)
                 self.assertFalse(guard.transition(self.state, attempt, self.limits).held)
                 index += 1

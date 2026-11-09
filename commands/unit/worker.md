@@ -15,8 +15,7 @@ Use the supplied arguments: `$ARGUMENTS`.
 5. Use `check` to list workers without running or resumable evidence.
 6. Use `answer <name> --text "<answer>"` to submit an answer in that worker's pane.
 
-Keep launchers for assignment and their run's pinned transport.
-The default transport stays `mesh`.
+Use the assignment launcher with the worker pane.
 Pane launchers call `assign <role> <prompt-file>` with these options:
 
 - `--session-dir <run> --slot <slot> --phase <phase> --kind <kind>`
@@ -30,10 +29,8 @@ Selection uses the first idle or resumable worker in role-number order.
 The first standard assignment creates the default team.
 A rerun uses the same pass and transcript receipt without another submission.
 The prompt file remains unchanged.
-For a mesh-pinned run, `list` reads the mesh roster through the shared board reader.
-For that run, `check` prints incomplete rows and returns 1 only when one exists.
-For that run, `restore` prints `unchanged`, returns 0, and changes no pane or staff row.
-Other callers use the pane states.
+`list` reads staff membership and pane states.
+`check` prints incomplete rows and returns 1 when one exists.
 A complete restore rerun prints `unchanged`.
 Retire, wrap, and promote retain worker threads. Idle workers stay closed until their next assign.
 

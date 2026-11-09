@@ -3648,6 +3648,24 @@ Case (natedev, 2026-11-08): accounts phase 1 sent jobs to two resumed Codex work
 
 **Binds later work:** Phase 34 returns at submission and treats the stall as submitted. At the Phase 34 merge, keep the Phase 34 code and remove `WORKER_PROMPT_START_SECONDS` and the `wait-start` action if nothing reads them.
 
+### Phase 28h — A read of a file in a "marker" folder is not a status-file wait  · status: done
+
+**Depends on:** none. sdlc [e692c5a7], 2026-11-08 (defect from natedev).
+
+Case (natedev, 2026-11-08): `scripts/usage/activity.py` `STATUS_FILE` matched `sentinel`, `marker` and `exit_code` anywhere in a path. A worker's first read of its own prompt in `phases/compaction-start-marker/` counted as a status-file wait. usage-waste-watch told messaging that 28% of its usage was waiting. That was false.
+
+#### As-built
+
+- `status_file_label(paths: Iterable[str])` (`scripts/usage/activity.py`): a path that contains `/proc/loadavg` gives `/proc/loadavg`. Else `STATUS_FILE` matches the file name (`os.path.basename`) only. The labels are as before (`*.log`, `marker`, `exit_code`).
+- The shell statement path passes `rest.split()`. The Claude `Read` path passes `(path,)`, so a Read path with a space stays one path.
+- `STATUS_FILE` no longer holds the `/proc/loadavg` alternative.
+- Review round 1 (review2): F001 a Read path with a space still matched a folder name; F002 `cat </proc/loadavg` lost its wait. Both fixed in round 1 and accepted at closure.
+
+**Files:**
+- `scripts/usage/activity.py` — `status_file_label` and its two callers.
+- `docs/as-built/usage-ledger.md` — the status words match the file name only.
+- Tests: `scripts/usage/test_activity.py` (`test_working_statements`: a `marker` folder; `test_waiting_statements`: `cat </proc/loadavg`; `test_tool_blocks`: Reads in a `marker` folder and in `/tmp/marker folder/`).
+
 ## Reference
 
 ### Job table (main at 7e85a74b)

@@ -10,6 +10,7 @@ import os
 from pathlib import Path
 import select
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
@@ -20,6 +21,7 @@ from typing import TextIO, cast, override
 from unittest import mock
 
 from scripts.copies import copies
+from scripts.copies.test_remote_copies import expected_remote_lease_columns
 from scripts.accounts import accounts
 from scripts.lib import copy_record, scratch
 from scripts.lint import folder_audit, tmp_sweep
@@ -1261,17 +1263,68 @@ class StandingTests(unittest.TestCase):
             self.assertTrue(idle)
 
     def test_list_reports_tree_owner_repo_commit_busy_pid_and_target_size(self) -> None:
-        with copies.standing(self.owner_id, self.source, copies.CommittedSource(self.head)) as tree:
-            result = self.cli("list")
-            self.assertEqual(result.returncode, 0, result.stderr)
-            line = next(line for line in result.stdout.splitlines() if str(tree) in line)
-            for value in ("verify-unit", self.source.name, self.head[:7], "busy", str(os.getpid())):
-                self.assertIn(value, line)
-        result = self.cli("list")
-        self.assertEqual(result.returncode, 0, result.stderr)
-        line = next(line for line in result.stdout.splitlines() if str(tree) in line)
-        self.assertIn("idle", line)
-        self.assertRegex(line, r"\s\d+(?:\.\d+)?[KMGTPE]?B?\s*$")
+        mirror = copies.RemoteMirror(self.owner_id, copies.SelectedRepository(self.source.name),
+                                     "remote-host", "mirror/mixed-records", "former-holder")
+        unreadable = self.gates / "zz-unreadable-gate"
+        for layout in ("local-only", "mixed", "unreadable"):
+            with self.subTest(layout=layout):
+                if layout == "mixed":
+                    copies.register_remote(mirror)
+                elif layout == "unreadable":
+                    copies.unregister_remote(mirror.host, mirror.path)
+                    unreadable.mkdir()
+                with copies.standing(self.owner_id, self.source, copies.CommittedSource(self.head)) as tree:
+                    result = self.cli("list")
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    line = next(line for line in result.stdout.splitlines() if str(tree) in line)
+                    for value in ("verify-unit", self.source.name, self.head[:7], "busy", str(os.getpid())):
+                        self.assertIn(value, line)
+                    self.assertIn(socket.gethostname(), line)
+                result = self.cli("list")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                line = next(line for line in result.stdout.splitlines() if str(tree) in line)
+                self.assertIn("idle", line)
+                self.assertRegex(line, r"\s\d+(?:\.\d+)?[KMGTPE]?B?\s*$")
+                lines = result.stdout.splitlines()
+                if layout == "unreadable":
+                    missing_record = next(row for row in lines if str(unreadable) in row)
+                    self.assertEqual(missing_record.split("\t"),
+                                     ["2", "unavailable", self.source.name, socket.gethostname(),
+                                      str(unreadable), "-", "-", "unreadable", "-", "-"])
+                    self.assertTrue(result.stderr.startswith(f"{unreadable}: "), result.stderr)
+                    self.assertIn(str(unreadable / ".gate.json"), result.stderr)
+                columns = lines[0].split("\t")
+                self.assertEqual(columns, ["number", "owner", "repository", "host", "path", "session",
+                                           "commit", "state", "holder_pid", "target"])
+                rows = [dict(zip(columns, row.split("\t"), strict=True)) for row in lines[1:]]
+                self.assertEqual([row["number"] for row in rows], ["1"] if layout == "local-only" else ["1", "2"])
+                if layout == "mixed":
+                    remote = next(row for row in rows if row["path"] == mirror.path)
+                    self.assertEqual((remote["owner"], remote["repository"], remote["host"]),
+                                     ("verify-unit", self.source.name, "remote-host"))
+                    self.assertEqual((remote["state"], remote["session"], remote["holder_pid"]),
+                                     expected_remote_lease_columns("idle", "-", "-"))
+
+    def test_list_owner_display_preserves_gate_folder_names(self) -> None:
+        commit = self.fresh_base()
+        _ = staff.rename(staff.StaffId(self.owner_id), "renamed")
+        missing_owner = "00000000-0000-4000-8000-000000000001"
+        for owner, name, staff_read in ((self.owner_id, "renamed", "readable"),
+                                       ("toolchain-trial", "toolchain-trial", "readable"),
+                                       (missing_owner, missing_owner, "readable"),
+                                       (self.owner_id, self.owner_id, "unreadable")):
+            with self.subTest(owner=owner, staff_read=staff_read), ExitStack() as contexts:
+                if staff_read == "unreadable":
+                    _ = cast(object, contexts.enter_context(mock.patch.dict(os.environ, {"STAFF_FILE": str(self.base)})))
+                mirror = copies.RemoteMirror(owner, copies.SelectedRepository(self.source.name),
+                                             "remote-host", "mirror/" + name, "former-holder")
+                copies.register_remote(mirror)
+                result = self.cli("list")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(copies.tree_paths(owner, self.source.name, copies.load_config()),
+                                 (self.gates / f"{name}-gate", self.gates / f"{name}-gate-2"))
+                with copies.standing(owner, self.source, copies.CommittedSource(commit)) as tree:
+                    self.assertIn(f"{name}-gate-", tree.parent.name)
 
     def test_remove_refuses_busy_tree_then_deletes_both_idle_trees_and_repeats(self) -> None:
         with copies.standing(self.owner_id, self.source, copies.CommittedSource(self.head)) as first:

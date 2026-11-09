@@ -18,6 +18,7 @@ from scripts.direct import verify_ssh_targets_test_support as support
 from scripts.direct.verify_ssh_targets_test_support import VerifySshTargetsFixture
 from scripts.lint.memory_test_support import write_config_fixture
 from scripts.lib.process_start_test_support import process_reader
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 from scripts.lib import process_start as process_identity
 
@@ -154,14 +155,20 @@ steps_path.write_text(json.dumps(steps))
     def test_mac_memory_retry_cleans_a_retained_claim_after_its_owner_exits(self) -> None:
         self.configure("natedev,mac")
         self.enable_mac()
-        with mock.patch.dict(os.environ, self.environment), \
-             mock.patch.object(process_identity, "process_start", return_value=process_identity.Started("old-owner")):
-            paths = mac_test.state_paths("mac")
-            args = mac_test.CliArguments()
-            args.target, args.worktree, args.pid = "mac", str(self.root), 2147483000
-            args.what, args.remote = "test sample", "test-mac"
-            with redirect_stdout(io.StringIO()):
-                self.assertEqual(mac_test.command_claim(args, paths, watch_claim=False), 0)
+        # Keep os.environ stable while the admission reader uses the private memory paths.
+        claim = subprocess.run([sys.executable, "-c", """
+import os
+from unittest import mock
+from scripts.lib import process_start as process_identity
+from scripts.mac_test import mac_test
+args = mac_test.CliArguments()
+args.target, args.worktree, args.pid = "mac", os.getcwd(), 2147483000
+args.what, args.remote = "test sample", "test-mac"
+with mock.patch.object(process_identity, "process_start", return_value=process_identity.Started("old-owner")):
+    raise SystemExit(mac_test.command_claim(args, mac_test.state_paths("mac"), watch_claim=False))
+"""], cwd=self.root, env=self.environment, capture_output=True, text=True,
+                               timeout=TEST_HANG_GUARD_SECS)
+        self.assertEqual(claim.returncode, 0, claim.stdout + claim.stderr)
         self.release_memory_after_hook()
         result = self.verify("test", "sample", "--no-cache", extra={
             "VERIFY_MAC_TEST_SCRIPT": str(support.MAC_TEST_SCRIPT)})

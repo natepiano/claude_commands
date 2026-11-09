@@ -65,7 +65,7 @@ progress_history.py eta --session-dir <dir> --time <t> --basis <basis>
 - The JSON contract is [`mods/unit-board/types/board.d.ts`](../../mods/unit-board/types/board.d.ts).
   [`test_board_json.py`](../../scripts/direct/test_board_json.py) checks every output key against it.
   The top level holds `production`, `as_of`, `zone`, `utc_offset_minutes`, `units`, `sources`, and `live`.
-  `live` is true when a worker is `working` or `waiting on run`.
+  `live` is true when a worker is `working`, `running`, `starting` or `waiting on run`.
   Every time uses `BoardTime {at: epoch s, text}` in the production's zone.
   The text uses `HH:MM` today and `ddd DD Mon HH:MM` on other days.
 - `BoardUnit`: `key` (the staff name), `plan`, `state` (`running` | `run-finished` | `standing-by`, from the unit's own newest run via `unit_run.local_run`), `phase` (tagged by `kind`: `plan {id, of, title}`, or `ticket {id, title, merged}` when the plan holds a `> **Standing:**` line; one read-only ledger read gives `merged`, the unit's `merged` tickets, and `id`, its newest `assigned` or `checkpointed` ticket (the current phase is then the open `phase_table.build_run` row whose phase or leading title word is that id, so a ticket that a unit rename moved still shows under its old prefix), else the title's leading `<unit>-<n>`, else the phase id; `title` drops that leading id) or null, `phases` (`BoardPhase`: `status` `done|open|todo|gated`, `took`, `fix_done`, `fix_running`, `findings {blocker, minor, nit}`, `eta {first, trail, finished, delta_minutes}`, todo `start`/`finish`, `gate` `none|timed|untimed`; a non-`none` gate makes the status `gated`), `finish` (`predicted`/`finished` with `at`, `after_gate` with `gate`/`waits_on`, or `unknown`), `stage`, `eta` (`BoardEta {at, first, trail, moved, delta_minutes, schedule_end, fix_done, fix_running}`) or null, `summary` (newest `progress_reported` text), `steps` (`[state, what, started, took_seconds]` for the open instance's passes and activities), `workers` (`slot`, `role`, `state`, `model`, `doing`).
@@ -82,15 +82,9 @@ progress_history.py eta --session-dir <dir> --time <t> --basis <basis>
   - It is `build_plan` on that plan; when that has no phases, `build_run(plan, events)` from the run's events.
   - A run on another plan than its production row (hana `demo`) shows its real phase.
   - `plan` is the Plan cell, and is empty when that file no longer exists.
-- `workers` combines the run roster, slot metadata, and each slot's newest board activity.
-  `recorded_turn_settings` supplies the accepted model and effort.
-  `done` displays as `idle`; `ended` stays unchanged.
-  The reader displays raw role and family values when the records contain them.
-  Missing values display as empty fields.
-  The [worker design](long-lived-workers.md#roster-fields) defines the current records without copied role or family fields.
-  - Slots drop the worktree's mesh prefix.
-  - Roster entries that become one slot merge into the entry its `impl_worker_<slot>.json` names, else the last in roster order. Roster `revision` values are per-entry counters, never compared.
-  - `doing` is less a leading `launcher: ` and a trailing `; summary at …` or `; findings in …`, stripped and cut to 80 characters.
+- `workers` reads the run owner and that owner's staff workers.
+  It displays pane state and the cause of unknown or incomplete evidence.
+  Worker posts and launcher writes update the watched run folder and `board.log`.
 - Pane workers also use [`worker_runs.py`](../../scripts/direct/worker_runs.py) to read detached runs from their run folder.
   It matches each worker by staff id and selects its newest run by `started_at`.
   A working pane has state `working`.
@@ -122,7 +116,7 @@ progress_history.py eta --session-dir <dir> --time <t> --basis <basis>
   An idle build never deletes another board's fresh readings.
   A build with no readings creates no readings file.
 - `eta.at`/`first`/`trail` are stated promises only; `schedule_end` is the chain's end and never a trail entry.
-- `sources` lists existing paths only: each unit's run `.jsonl`, `mesh_roster.json`, `board.log`, every `impl_worker_<slot>.json`, the plan doc, every `plan_runs` `.jsonl`, a standing unit's style ledger, the production doc, plus each session dir, the run roots and the history `runs/` dir (or the history root while `runs/` is missing), so a run that starts later moves a watched mtime.
+- `sources` lists existing paths only: each unit's run `.jsonl`, the run state file, `board.log`, the plan doc, every `plan_runs` `.jsonl`, a standing unit's style ledger, the production doc, plus each session dir, the run roots and the history `runs/` dir (or the history root while `runs/` is missing), so a run that starts later moves a watched mtime.
 
 ### The mod
 

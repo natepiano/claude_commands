@@ -78,7 +78,7 @@ from scripts.lib.user_zone import user_zone  # noqa: E402
 from scripts.lib.process_failure import failure_detail  # noqa: E402
 from scripts.lib import scratch  # noqa: E402
 from scripts.test_times import gate_record
-from scripts.lint import memory_admit  # noqa: E402
+from scripts.build_queue import admission_records  # noqa: E402
 from scripts.build_queue import progress_profile
 from scripts.build_queue.admission_client import AdmissionHoldCheck  # noqa: E402
 from scripts.build_queue.queue_place import (  # noqa: E402
@@ -103,10 +103,10 @@ NIGHTLY_TYPE_DIAGNOSTIC_LINES = 20
 # An unrecorded type job keeps its own fallback; recorded jobs all use one margin.
 TYPES_MEMORY_MIB = 3072
 MEMORY_PEAK_MARGIN = 1.2
-# A module this many times slower than the median of its last MODULE_HISTORY_RUNS times, and at least
-# the floor slower, is named in the report. On 2026-10-19 agents/test_codex_mesh.py went from 49 s to
-# 1264 s (four tests each waited a 300 s call timeout) and no line said so. Load alone moved modules
-# about 2x. The median names a regression on about three runs in a row, then takes it as the normal.
+# Report a module when its runtime exceeds this factor and the floor above its recent median.
+# On 2026-10-19, one module increased from 49 s to 1264 s without a report.
+# Four tests each reached a 300 s timeout. System load alone changed runtime by about 2x.
+# The median reports a repeated regression for about three runs before it becomes the baseline.
 SLOW_MODULE_FACTOR = 3.0
 SLOW_MODULE_FLOOR_S = 60.0
 MODULE_HISTORY_RUNS = 5
@@ -694,7 +694,7 @@ def kill_job_group(job: RunningGateJob) -> None:
 
 def stop_gate_jobs(jobs: Sequence[RunningGateJob]) -> None:
     """Stop all groups with one deadline, then reap their leaders."""
-    config = memory_admit.read_memory_config()
+    config = admission_records.read_memory_config()
     deadline = time.monotonic() + config.program_stop_seconds
     for job in jobs:
         try:
@@ -1643,16 +1643,16 @@ def merge_checkpoint(args: GateArguments) -> int:
         if merged != baseline:
             write_push_record(push_record_path(repo, "checkpoint", origin + ":" + checkpoint),
                               RecordedPush(baseline, merged, checkpoint))
-        previous_unit = os.environ.get(memory_admit.BUILDLOG_UNIT)
-        os.environ[memory_admit.BUILDLOG_UNIT] = args.unit
+        previous_unit = os.environ.get(admission_records.BUILDLOG_UNIT)
+        os.environ[admission_records.BUILDLOG_UNIT] = args.unit
         try:
             suites = run_gate_suites(repo, args.type_dirs, float(args.module_time_limit_s),
                                 source="checkpoint", full=args.full)
         finally:
             if previous_unit is None:
-                _ = os.environ.pop(memory_admit.BUILDLOG_UNIT, None)
+                _ = os.environ.pop(admission_records.BUILDLOG_UNIT, None)
             else:
-                os.environ[memory_admit.BUILDLOG_UNIT] = previous_unit
+                os.environ[admission_records.BUILDLOG_UNIT] = previous_unit
         if not suites.passed:
             raise GateRefused("RED: types or suites failed")
         fetch_branches(repo, "main")
