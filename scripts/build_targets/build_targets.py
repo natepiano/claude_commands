@@ -618,14 +618,16 @@ def owns_wait_claim(paths: mac_test.StatePaths, repo_root: str, pid: int) -> boo
     start = process_identity.process_start(pid)
     if not isinstance(start, process_identity.Started):
         return False
-    scope = mac_test.target_claim_scope(paths, repo_root)
-    with mac_test.locked(paths.lock):
+    try:
+        scope = mac_test.target_claim_scope(paths, repo_root)
         block = mac_test.blocking_claim_block(paths)
         return any(mac_test.scopes_overlap(claim.scope, scope)
                    and claim.record["pid"] == pid and claim.record["proc_start"] == start.start
                    and ("remote_host" not in claim.record or claim.record.get("cleanup_pending"))
                    and (isinstance(block, mac_test.NoMacBlock) or "remote_host" in claim.record)
                    for claim in mac_test.read_claims(paths))
+    except (OSError, mac_test.StateReadError):
+        return False
 
 
 def cleanup_refused_claims(target: SshTarget, args: CliArguments) -> None:
@@ -686,7 +688,7 @@ def command_reserve(args: CliArguments) -> int:
     destination = Path(args.reservation_file)
     if destination.exists():
         name, separator, settings = destination.read_text().strip().partition("\t")
-        if separator:
+        if separator and (not args.target or name == args.target):
             target = target_config.configured_ssh_target(name)
             if settings != str(target.settings):
                 destination.unlink()
@@ -697,7 +699,7 @@ def command_reserve(args: CliArguments) -> int:
                     from scripts.mac_test import mac_test
 
                     paths = mac_test.state_paths(name)
-                    if (not args.target or name == args.target) and owns_wait_claim(paths, args.repo_root, args.pid):
+                    if owns_wait_claim(paths, args.repo_root, args.pid):
                         return 0
         destination.unlink(missing_ok=True)
     if args.kind not in ("test", "check", "doc", "lint", "example", "build", "final"):
@@ -714,11 +716,18 @@ def command_reserve(args: CliArguments) -> int:
             if config.reason != "off":
                 cleanup_refused_claims(target, args)
             continue
+        if not config.enabled:
+            continue
+        paths = mac_test.state_paths(target.name)
+        owned = owns_wait_claim(paths, args.repo_root, args.pid)
+        if not owned:
+            answer = mac_test.free_now(paths, target.settings, Path(args.repo_root))
+            if answer not in ("free", "busy") and not (answer == "bad" and args.new_step):
+                continue
         policy = offload.mac_step_eligibility(config, Path(args.repo_root), args.package, verb, target.name, kind=args.kind)
         if isinstance(policy, offload.IneligibleMacStep):
             continue
-        paths = mac_test.state_paths(target.name)
-        if owns_wait_claim(paths, args.repo_root, args.pid):
+        if owned:
             write_text_atomic(destination, f"{target.name}\t{target.settings}\n")
             return 0
         if args.recover_only:
@@ -730,9 +739,6 @@ def command_reserve(args: CliArguments) -> int:
             if not retained:
                 busy_mac = busy_mac or target.platform == "macos"
                 continue
-        answer = mac_test.free_now(paths, target.settings, Path(args.repo_root))
-        if answer not in ("free", "busy") and not (answer == "bad" and args.new_step):
-            continue
         if isinstance(offload.probe_reachability(offload.ProcessController(), config), offload.UnreachableHost):
             continue
         claim = mac_test.CliArguments()

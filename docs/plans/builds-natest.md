@@ -2180,3 +2180,66 @@ A changed `config/<name>.conf` selects every test module whose transitive import
 
 **Ruled out:**
 - A guard for a test that runs a second in-process `unittest` runner: no test does this, and module cleanups are process-wide in `unittest`.
+
+### Phase 110 — The nightly type check is a footnote under the slowest modules list  · status: done
+
+#### As-built
+
+- `show.py top` in the `~/.claude` repository ranks test modules only. `types/basedpyright` takes no rank, no `--limit` slot and no share of the `sum of median CPU` line.
+- After the sum line, one footnote gives the type check's latest passed run: `types/basedpyright runs nightly, so it is not ranked: last run <cpu> CPU s, <wall> s`. With no qualifying run, no footnote prints.
+- The footnote reads the same history query as a module: host, configured checkout, age limit, status 0, no restart, not aborted.
+- The `module`, `suites` and nextest views are unchanged, and the gate still records the type check.
+
+**Files:**
+- `scripts/test_times/show.py` — ranked rows and the footnote
+- `scripts/test_times/test_show.py` — the limit, the sum, the footnote values and the history filters, in three existing tests
+- `commands/test_times.md` — the `top` description
+
+
+### Phase 111 — A targeted test runs only what the unit's own change can reach  · status: done
+
+#### As-built
+
+- `select_affected` in `scripts/production/affected_modules.py` builds its base candidates from the certified base, when one exists, and `git merge-base HEAD refs/remotes/origin/<branch>` for each branch of `landing_branches` in `config/merge_gate.conf`. A missing ref or a branch with no common ancestor gives no candidate.
+- It compares each distinct commit once and takes the candidate with the fewest changed paths. On a tie the certified base comes first, then the config order. With no candidate the result is `FullSuite("no certified base")`.
+- A landing candidate is a `CertifiedBase` with its committer time, so `report_selection` prints it unchanged. Each landing passed a merge gate that runs all modules, so landed work is not this unit's change.
+- `SuiteMode.MERGE_GATE` still runs all modules. Dirty paths, removed-file facts, the module rules and the fact cache are unchanged, and `merge_gate.py` and `cloud_gate.py` take no edit.
+- Replay of 19 landings on `builds`: the old rule selects a median 692 of 743 modules and 5193 CPU s, and the new rule a median 6 modules and 78 CPU s (mean 72 modules, 642 CPU s).
+
+**Files:**
+- `scripts/production/affected_modules.py` — the base choice
+- `config/merge_gate.conf` — `landing_branches`
+- `docs/as-built/merge-gate-and-test-speed.md` — the base rule, its reason and the fallback
+- `scripts/production/test_affected_modules.py` — landing bases, a merge with a landing branch, a dirty file at the tip, and candidate priority
+- `scripts/production/test_targeted_test.py` — the fixture sets a private branch list
+
+**Gotchas:**
+- An edit of `config/merge_gate.conf` alone selects 429 modules through the approved transitive config rule.
+- A missing `landing_branches` key gives a full suite through the graph-error result.
+
+**Ruled out:**
+- The import closure in place of the same-folder rule: replay selects more modules (596 against 426 on one 39-file run).
+
+
+### Phase 112 — A targeted test skips folder neighbors that do not name the changed file  · status: done
+
+#### As-built
+
+- In `select_affected` in `scripts/production/affected_modules.py`, a changed non-test Python file selects a test module of its folder only when that module's text holds the file's stem as a whole word. Imports, strings and comments each count. Removed files count.
+- The selector reads the text only for a module in such a folder that no earlier rule selected. A read or decode error gives the existing graph-error result.
+- The other module rules, the base choice and the fact cache are unchanged.
+- Replay of 19 landings on `builds`: mean 91 to 68 modules, mean 768 to 590 CPU s, median 77 to 64 CPU s. With no folder rule at all the mean is 67 modules and 581 CPU s.
+
+**Files:**
+- `scripts/production/affected_modules.py` — the folder rule
+- `scripts/production/test_affected_modules.py` — the changed rows and the new rows
+- `scripts/production/test_targeted_test.py` — the fixture's folder neighbor names the changed file
+- `docs/as-built/merge-gate-and-test-speed.md` — the fourth rule
+
+**Gotchas:**
+- A test that reaches a changed sibling only through a helper, and does not name it, is not selected. The merge gate still runs it.
+- The transitive config rule now holds most of the targeted cost: two `config/lint.conf` edits ran 580 modules each, 86% of the replay's CPU. A question to the user about it is open.
+
+**Ruled out:**
+- A measured per-module file map: the name check keeps nearly the same gain with much less work.
+- Config selection by changed key: replay gain is small (590 to 569 CPU s), because `scripts/lint/sweep.py` alone reaches 477 test modules by imports.

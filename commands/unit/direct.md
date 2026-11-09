@@ -306,7 +306,7 @@ Applies to implementation, test, fix, and review assignments.
 
 Submission does not finish a pass or release a held role.
 The hook records completion and runs the saved completion actions.
-It receives Codex `notify` or Claude `Stop` input from the launch line.
+It receives the Codex `Stop` event from `hooks.json` and the Claude `Stop` event from the launch line.
 No launcher shell waits for a worker.
 </DispatchContract>
 

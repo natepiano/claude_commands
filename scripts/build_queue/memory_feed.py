@@ -7,6 +7,8 @@ except FileNotFoundError:
     pass
 
 import argparse
+import hashlib
+import importlib
 import json
 import os
 import sys
@@ -29,15 +31,13 @@ if __name__ == "__main__":
     _ = bootstrap.add_argument("--code-root", type=Path, default=Path(__file__).resolve().parents[2])
     installed, _remaining = bootstrap.parse_known_args(namespace=installed)
 
+FEED_IMPORT_STARTED_AT_NS = time.time_ns()
+
 from scripts.build_queue import admission_code
 
 
-def installed_code_version(code_root: Path) -> str:
-    """Use the admission service fingerprint for the installed sources."""
-    return admission_code.admission_code_version(code_root / "scripts")
-
-
-LOADED_ADMISSION_CODE_VERSION = installed_code_version(installed.code_root)
+# Preserve the schema check across the imports below.
+ADMISSION_VERSION_AT_IMPORT = admission_code.admission_code_version(installed.code_root / "scripts")
 
 from scripts.buildlog import charts, mac_idle_alert
 from scripts.buildlog.store import host_name
@@ -56,6 +56,61 @@ from scripts.lib import conf
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.user_zone import user_zone
 from scripts.review_links import review_link
+
+# These function-level imports also belong to the fixed source list.
+FUNCTION_IMPORT_MODULES = (
+    "scripts.buildlog.record", "scripts.buildlog.holds", "scripts.build_targets.target_config",
+    "scripts.production.production_doc", "scripts.build_hold.override_guard",
+    "scripts.production.change_routing",
+)
+
+
+def feed_code_paths() -> tuple[str, ...]:
+    """Freeze the feed modules and startup files after the imports finish."""
+    for name in FUNCTION_IMPORT_MODULES:
+        _ = importlib.import_module(name)
+    source_root = Path(__file__).resolve().parents[2]
+    paths = {"scripts/" + relative for relative in admission_code.ADMISSION_CODE_PATHS}
+    paths.update(("scripts/lib/package_root.py", "scripts/build_queue/memory_live.html", "config/memory_feed.conf"))
+    for module in tuple(sys.modules.values()):
+        source = getattr(module, "__file__", None)
+        if isinstance(source, str) and source.endswith(".py"):
+            path = Path(source).resolve()
+            if path.is_relative_to(source_root):
+                paths.add(path.relative_to(source_root).as_posix())
+    return tuple(sorted(paths))
+
+
+FEED_CODE_PATHS = feed_code_paths()
+
+
+def installed_feed_code_version(code_root: Path) -> str:
+    """Hash the fixed feed sources and startup files in the installed copy."""
+    digest = hashlib.sha256()
+    for relative in FEED_CODE_PATHS:
+        try:
+            content = (code_root / relative).read_bytes()
+        except OSError:
+            return ""
+        digest.update(relative.encode() + b"\0" + content + b"\0")
+    return digest.hexdigest()
+
+
+def loaded_feed_code_version(code_root: Path) -> str:
+    """Reject an installation that changes while the feed imports its modules."""
+    if admission_code.admission_code_version(code_root / "scripts") != ADMISSION_VERSION_AT_IMPORT:
+        return ""
+    version = installed_feed_code_version(code_root)
+    try:
+        if any((code_root / relative).stat().st_mtime_ns > FEED_IMPORT_STARTED_AT_NS for relative in FEED_CODE_PATHS):
+            return ""
+    except OSError:
+        return ""
+    return version
+
+
+LOADED_FEED_CODE_VERSION = loaded_feed_code_version(installed.code_root)
+
 
 GIB = 1024 ** 3
 CI_CGROUP = Path("/sys/fs/cgroup/hana.slice/hana-ci.slice")
@@ -956,8 +1011,8 @@ def main(argv: Sequence[str]) -> int:
     report: ReportSections | charts.IndexUnavailable | ReportNotRead = ReportNotRead.VALUE
     next_report_at = 0.0
     while True:
-        if installed_code_version(args.code_root) != LOADED_ADMISSION_CODE_VERSION:
-            print("The installed admission code changed. Restart the feed.", file=sys.stderr)
+        if installed_feed_code_version(args.code_root) != LOADED_FEED_CODE_VERSION:
+            print("The installed feed code changed. Restart the feed.", file=sys.stderr)
             return 1
         now = time.monotonic()
         if isinstance(report, ReportNotRead) or now >= next_report_at:

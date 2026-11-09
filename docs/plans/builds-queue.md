@@ -704,6 +704,20 @@ After Phase 30, `build_targets.py` eligible, reserve and release-wait still use 
 
 The user approved aws-unit's design on 2026-11-08. Builds moved it to report, which starts after Phase 36 lands, because both edit memory_feed.py and memory_live.html.
 
+### Phase 40 — The admission client starts with only the wire format  · status: done
+
+**Depends on:** none.
+
+1. **The measurement (builds and natest, 2026-11-09).** One whole gate starts `scripts/build_queue/admission_client.py` 910 times, at 142 ms of CPU per start and 129 CPU seconds in all. `admission_protocol` and `admission_records` take 58 ms of its 87 ms warm import. Report: `/tmp/claude/unit/2113de4f-9913-485a-9a51-61558bfd81db/phases/rank113/whole_gate_report.md`.
+2. **Fix.** The client path that a `verify.sh` run takes imports only the wire format. The target is about 60 ms less per start. Code that needs the record types, such as reading the queue view, imports them when it runs.
+3. **Unchanged.** The command line, the bytes on the socket, exit codes and printed text.
+4. **Measure.** CPU (user + system, children counted) and wall per start, 15 interleaved runs before and after, warm, on the same command.
+5. **Proof.** A test that the client path starts without loading the record types, and fails without the fix. The existing tests of the changed modules pass.
+6. **The feed restarts itself (builds and natedev, 2026-11-09).** `installed_code_version` in `memory_feed.py` hashes only the admission sources, so an install that changes the feed's own modules leaves the old feed running. The fingerprint now also covers each Python module the feed loaded under the install root, and each other file it reads once at start. An install that changes one of those files makes the feed exit, and systemd starts the new code. A listed file with a modification time after the feed's import started also makes the feed exit. A row in the existing fingerprint test proves it and fails without the fix.
+
+**Workers:** 2 writers and testers, one for the client and one for the feed. **Gate:** targeted test, basedpyright 0/0/0, adversary review, the measured times.
+**Change-Review:** none — verify runs start faster, and nothing visible changes.
+
 ### Phase 39 — The build page shows step names from the config  · status: done
 
 1. **The defect (builds, 2026-11-09; change review C1285 returned).** The build page shows `merge-gate`, not `merge gate`. `scripts/build_queue/memory_feed.py` passes `RECORDED_STEP_NAMES`, an empty map, at five places: `step_text` for swap holds, held rows, running rows and waiters, and `names=` on the `QueueModel`.
