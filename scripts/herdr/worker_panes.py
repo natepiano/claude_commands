@@ -139,6 +139,11 @@ class UnpublishedWorker:
     cause: str
 
 
+@dataclass(frozen=True)
+class DestinationAfterSourceRelease:
+    """Select the switch destination after the source pane closes."""
+
+
 class StartRefusal(Enum):
     UNKNOWN_ROLE = "unknown role"
     ROLE_UNAVAILABLE = "dispatch role unavailable"
@@ -952,13 +957,13 @@ def _start_locked(owner: staff.StaffRow, name: WorkerName, role: WorkerRole, pol
         if not _stop_row(current.row, client, deadline=deadline):
             return _uncertain(current.row, "agent stop is incomplete; pane retained")
         current = StoppedWorker(current.row, current.pane, current.terminal)
-    if isinstance(current, StoppedWorker):
+    if not switching and isinstance(current, StoppedWorker):
         if not client.close_tab_confirmed(current.pane, target=str(current.row.current_session), terminal=current.terminal):
             return _uncertain(current.row, "stopped pane close is incomplete")
         _retire_launch(current.row, client, record)
         evidence = _evidence(owner.id, record, client, selection=selection)
-    if switching and isinstance(current, OpenWorker):
-        destination = herdr.ExistingPane(current.pane, current.terminal)
+    if switching:
+        destination = DestinationAfterSourceRelease()
     else:
         try:
             destination = _destination(owner, name.value, evidence, client)
@@ -973,7 +978,7 @@ def _start_locked(owner: staff.StaffRow, name: WorkerName, role: WorkerRole, pol
             return _uncertain(row or owner, "terminal moved or duplicated before start")
         if not any(pane["pane_id"] == destination.pane and pane.get("terminal_id") == destination.terminal for pane in panes):
             return _uncertain(row or owner, "terminal moved before start")
-        if not switching and not isinstance(client.pane_activity(destination.pane), herdr.PaneAtShell):
+        if not isinstance(client.pane_activity(destination.pane), herdr.PaneAtShell):
             return StartRefused(StartRefusal.PANE_NOT_AT_SHELL, "recovery pane has foreground work")
     launches: list[herdr.AgentLaunched] = []
     launch_terminals: dict[str, str] = {}
@@ -981,9 +986,22 @@ def _start_locked(owner: staff.StaffRow, name: WorkerName, role: WorkerRole, pol
 
     def start(handoff: worker_admission.FamilyHandoff) -> str:
         del handoff
+        launch_destination = destination
+        if isinstance(launch_destination, DestinationAfterSourceRelease):
+            if isinstance(current, (OpenWorker, StoppedWorker)):
+                if not client.close_tab_confirmed(current.pane, target=str(current.row.current_session), terminal=current.terminal):
+                    raise herdr.HerdrFailure("source pane close is incomplete")
+                _retire_launch(current.row, client, record)
+            fresh = _evidence(owner.id, record, client, selection=selection)
+            selected = _destination(owner, name.value, fresh, client)
+            if isinstance(selected, StartRefused):
+                raise worker_admission.AdmissionRefused(selected.detail)
+            if isinstance(selected, UncertainWorker):
+                raise worker_admission.AdmissionRefused(selected.reason)
+            launch_destination = selected
         identity = str(row.current_session) if row is not None and not switching else ""
         launch = partial(herdr.launch_prepared_agent, codex=codex) if isinstance(codex, herdr.CodexConversations) else herdr.launch_prepared_agent
-        launched = launch(client.session, destination, prepared, policy.settings.kind,
+        launched = launch(client.session, launch_destination, prepared, policy.settings.kind,
             launch_arguments(policy, identity, directory), herdr.NoOpeningPrompt(),
             int(start_seconds * 1000), agent=name.value, agent_name=agent_name(owner, name.value))
         launches.append(launched)
@@ -991,7 +1009,7 @@ def _start_locked(owner: staff.StaffRow, name: WorkerName, role: WorkerRole, pol
             pane = client.pane_row(launched.pane)
             if isinstance(pane, herdr.NoPane) or not (terminal := pane.get("terminal_id", "")):
                 raise herdr.HerdrFailure("launched terminal is missing")
-            if isinstance(destination, herdr.ExistingPane) and terminal != destination.terminal:
+            if isinstance(launch_destination, herdr.ExistingPane) and terminal != launch_destination.terminal:
                 raise herdr.HerdrFailure("launched terminal changed")
             launch_terminals[launched.pane] = terminal
             process = client.pane_agent_process(launched.pane, terminal)

@@ -742,3 +742,13 @@ Do we have a unit director that is dedicated to, I guess it's showrunners and pr
 **Gotchas:** a failed native proof calls cleanup with an empty identity. Only the recorded launch process protects a replacement agent of the same family in that terminal.
 
 **Ruled out:** code to detect pre-rename `mesh_runs.py` supervisors — the case is temporary, and one `ps` check at landing covers it.
+
+### Phase 30b — final verification after the sdlc batch 2 merge  · status: done
+
+#### As-built
+
+The sdlc batch 2 merge brought the 28b pane rule: a worker pane closes when its agent stops.
+
+- `scripts/herdr/worker_panes.py` — a family switch selects its destination after the source release. `start()` closes the source pane if it is still present, retires its launch, reads the evidence again and calls `_destination`. Every switch starts in a new pane. The marker type `DestinationAfterSourceRelease` holds the place of the destination until then.
+- `scripts/herdr/test_worker_panes.py` — the family-switch tables expect a new pane, the source pane close, and a new pane on the retry. A new `exiting` source row covers a source pane that closes by itself.
+- `scripts/direct/test_assign_launcher.py`, `scripts/direct/test_assign_launcher_reuse.py` — a switched or stopped worker resumes in a new pane, not the source pane.

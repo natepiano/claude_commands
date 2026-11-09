@@ -1582,21 +1582,28 @@ class WorkerPaneTests(StaffTestCase):
     def test_family_change_publication_failure_stops_the_destination_and_retries(self) -> None:
         families: tuple[Literal["claude", "codex"], ...] = ("claude", "codex")
         for family in families:
-            for source_state in ("open", "closed"):
+            for source_state in ("open", "exiting", "closed"):
                 for failure in ("publication", "native-proof", "persistent-native-proof", "replacement-native-proof", "none"):
                     with self.subTest(family=family, source_state=source_state, failure=failure):
                         self.world.foreground = {"w1:p0": self.world.foreground["w1:p0"]}
                         destination_family: Literal["claude", "codex"] = "codex" if family == "claude" else "claude"
                         _ = write_registry(self.root / "conf/models.conf", {"assignments": {"direct": destination_family}})
                         row = self.worker(f"retry-{family}-{source_state}-{failure}", family=family)
-                        source_pane = f"w1:p{len(self.world.locations)}"
+                        source_pane = f"w1:p{len(self.world.used_panes) + 1}"
                         source_terminal = "terminal-" + source_pane
-                        if source_state == "open":
+                        if source_state != "closed":
                             self.world.add(row, source_pane, family=family, terminal=source_terminal)
+                            if source_state == "exiting":
+                                self.world.exiting_panes.add(source_pane)
                         self.completed_dispatch(row, "impl")
                         before = self.staff_state()
                         launch_count = len(self.world.launches)
                         locations = set(self.world.locations)
+                        used_panes = self.world.used_panes.copy()
+                        closed = self.world.closed.copy()
+                        if source_state != "closed":
+                            locations.remove(source_pane)
+                            closed.append((source_pane, source_terminal))
                         native = self.world.native_session
                         codex_native = worker_panes.first_turn_session
                         proof_failed = False
@@ -1656,18 +1663,19 @@ class WorkerPaneTests(StaffTestCase):
                                     _ = faults.enter_context(patch.object(worker_panes, "first_turn_session", side_effect=prove_codex))
                                 failed = self.start(row.name)
                             launched_destination = self.world.launches[-1]
-                            self.assertIsInstance(launched_destination,
-                                                  herdr.ExistingPane if source_state == "open" else herdr.SplitPane)
-                            if source_state == "open":
-                                self.assertEqual(launched_destination, herdr.ExistingPane(source_pane, source_terminal))
-                            pane = source_pane if source_state == "open" else (set(self.world.locations) - locations).pop()
+                            self.assertIsInstance(launched_destination, herdr.SplitPane)
+                            pane, = self.world.used_panes - used_panes
+                            terminal = "terminal-" + pane
+                            if source_state != "closed":
+                                self.assertNotIn(source_pane, self.world.locations)
+                                self.assertNotEqual(pane, source_pane)
                             if failure == "none":
                                 self.assertIsInstance(failed, worker_panes.OpenWorker)
                                 assert isinstance(failed, worker_panes.OpenWorker)
                                 self.assertEqual((failed.row.id, failed.row.parent), (row.id, row.parent))
                                 self.assertNotEqual(failed.row.current_session, row.current_session)
                                 self.assertEqual(len(self.world.launches), launch_count + 1)
-                                self.assertEqual(self.world.closed, [])
+                                self.assertEqual(self.world.closed, closed)
                                 continue
                             self.assertIsInstance(failed, worker_panes.UncertainWorker)
                             self.assertEqual(staff.by_id(row.id), row)
@@ -1679,27 +1687,30 @@ class WorkerPaneTests(StaffTestCase):
                                 self.assertIn(pane, self.world.foreground)
                                 self.assertEqual(self.world.commands, proof_inputs)
                                 self.assertEqual(self.world.signals, proof_signals)
-                                self.assertEqual(self.world.closed, [])
+                                self.assertEqual(self.world.closed, closed)
                                 if failure == "replacement-native-proof":
                                     pid = self.world.foreground[pane][0]
                                     self.assertEqual(self.world.processes[pid].identity.id, replacement_identity)
                                     self.assertEqual([self.world.locations[pane]["terminal_id"]], replacement_terminals)
                                 continue
                             self.assertNotIn(pane, self.world.foreground)
-                            self.assertIn(pane, self.world.locations)
-                            terminal = source_terminal if source_state == "open" else self.world.locations[pane]["terminal_id"]
+                            self.assertNotIn(pane, self.world.locations)
                             self.assertEqual(len(self.world.launches), launch_count + 1)
-                            self.assertEqual(set(self.world.locations), locations | {pane})
+                            self.assertEqual(set(self.world.locations), locations)
+                            self.assertEqual(self.world.closed, closed + [(pane, terminal)])
+                            retry_panes = self.world.used_panes.copy()
                             repeated = self.start(row.name)
                         self.assertIsInstance(repeated, worker_panes.OpenWorker)
                         assert isinstance(repeated, worker_panes.OpenWorker)
+                        retry_pane, = self.world.used_panes - retry_panes
                         self.assertEqual((repeated.row.id, repeated.row.parent, repeated.pane, repeated.terminal),
-                                         (row.id, row.parent, pane, terminal))
+                                         (row.id, row.parent, retry_pane, "terminal-" + retry_pane))
+                        self.assertNotEqual(retry_pane, pane)
                         self.assertNotEqual(repeated.row.current_session, row.current_session)
                         self.assertEqual(len(self.world.launches), launch_count + 2)
-                        self.assertIsInstance(self.world.launches[-1], herdr.ExistingPane)
-                        self.assertEqual(set(self.world.locations), locations | {pane})
-                        self.assertEqual(self.world.closed, [])
+                        self.assertIsInstance(self.world.launches[-1], herdr.SplitPane)
+                        self.assertEqual(set(self.world.locations), locations | {retry_pane})
+                        self.assertEqual(self.world.closed, closed + [(pane, terminal)])
 
     def test_family_change_cleanup_keeps_an_unproved_terminal_without_input(self) -> None:
         families: tuple[Literal["claude", "codex"], ...] = ("claude", "codex")
@@ -1711,8 +1722,11 @@ class WorkerPaneTests(StaffTestCase):
                         destination_family = "codex" if family == "claude" else "claude"
                         _ = write_registry(self.root / "conf/models.conf", {"assignments": {"direct": destination_family}})
                         row = self.worker(f"retained-{family}-{source_state}-{terminal_state}", family=family)
+                        closed = self.world.closed.copy()
                         if source_state == "open":
-                            self.world.add(row, f"w1:p{len(self.world.locations)}", family=family)
+                            source_pane = f"w1:p{len(self.world.used_panes) + 1}"
+                            self.world.add(row, source_pane, family=family)
+                            closed.append((source_pane, "terminal-" + source_pane))
                         self.completed_dispatch(row, "impl")
                         before = self.staff_state()
                         retained: list[str] = []
@@ -1747,7 +1761,7 @@ class WorkerPaneTests(StaffTestCase):
                         self.assertIn(retained[0], self.world.foreground)
                         self.assertEqual(self.world.commands, inputs)
                         self.assertEqual(self.world.signals, signals)
-                        self.assertEqual(self.world.closed, [])
+                        self.assertEqual(self.world.closed, closed)
 
     def test_failed_publication_retains_one_backend_and_publishes_once_on_rerun(self) -> None:
         with patch.object(staff, "ensure_worker", side_effect=staff.StaffRefused("fixture publication failure")):

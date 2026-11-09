@@ -19,15 +19,16 @@ class AssignReuseTests(launcher_fixture.FirstDispatchFixture):
         row = staff.by_id(staff.StaffId(str(original["staff_id"])))
         assert row is not None
         world = self.native.fixture.world
+        source_pane = self.native.agent.submitted[-1][0]
         _ = world.stop(row, world)
         _ = self.successful("implement", "--to", name)
         self.assertEqual(self.assignment_records()[name], original)
         self.assertEqual(self.turn_starts, 2)
         self.assertEqual(len(world.locations), 2)
         destination = world.launches[-1]
-        self.assertIsInstance(destination, herdr.ExistingPane)
-        assert isinstance(destination, herdr.ExistingPane)
-        self.assertEqual(destination.pane, "w1:p1")
+        self.assertIsInstance(destination, herdr.SplitPane)
+        self.assertNotIn(source_pane, world.locations)
+        self.assertNotEqual(self.native.agent.submitted[-1][0], source_pane)
 
     def test_a_closed_worker_dispatches_again_on_its_recorded_thread(self) -> None:
         self.first_assignment()

@@ -474,6 +474,11 @@ class AssignLauncherTests(AssignLauncherFixture):
                 name = "impl"
                 self.prompt = self.session_dir.parent / f"switch-{source_live}-{named}.md"
                 current = worker_admission.find_worker(staff.snapshot(), self.native.fixture.parent.id, name)
+                world = self.native.fixture.world
+                if current is not None:
+                    for pane, (pid, _, _) in tuple(world.foreground.items()):
+                        if world.processes[pid].identity.id == current.current_session:
+                            world.end_agent(pane)
                 source_identity = staff.native_id(fixture_runtime_id(f"source-{source_live}-{named}"))
                 fixture_session(source_identity, staff.ClaudeBackend())
                 row = (staff.update_current_session(current.current_session, source_identity) if current is not None else
@@ -519,7 +524,8 @@ class AssignLauncherTests(AssignLauncherFixture):
                 self.assertIsInstance(staff.backend(moved), staff.CodexBackend)
                 self.assertEqual(moved.parent, row.parent)
                 self.assertEqual(moved.to_json() | {"current_session": row.current_session}, row.to_json())
-                self.assertEqual(self.native.agent.submitted[-1][0], "w1:p1")
+                self.assertNotEqual(self.native.agent.submitted[-1][0], "w1:p1")
+                self.assertIsInstance(world.launches[-1], herdr.SplitPane)
                 extract = worker_admission.handoff_path(self.session_dir, row)
                 self.assertIn(str(source), extract.read_text())
                 self.assertIn(evidence[0][0], extract.read_text())
