@@ -1998,7 +1998,7 @@ A changed `config/<name>.conf` selects every test module whose transitive import
 **Ruled out:**
 - A signal pipe in the test fixture only: it hides the production race.
 
-### Phase 99 — The Claude assign launcher test file uses half its CPU  · status: todo
+### Phase 99 — The Claude assign launcher test file uses half its CPU  · status: done
 **Depends on:** none
 
 #### Work Order
