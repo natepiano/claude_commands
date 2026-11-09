@@ -490,11 +490,16 @@ class VaultPullTests(unittest.TestCase):
         self.assertEqual(self.hour()[0], 0)
         args = self.questions()[0]
         self.assertEqual(args[0], "ask")
-        self.assertEqual(option(args, "--production"), str(vault_pull.PRODUCTION))
+        self.assertEqual(option(args, "--production"), "natedev")
         self.assertIn("conflict", option(args, "--question"))
         self.assertEqual(option(args, "--text"), "Hanadocs vault sync stopped, 2027-01-15T08:00:00+00:00")
         self.assertEqual(option(args, "--urgency"), "soon")
         self.assertEqual(option(args, "--due"), "2027-01-16")
+        settings = self.folder / "config/build_targets.conf"
+        _ = settings.write_text("vault.question_production=fixture-production\n" + settings.read_text())
+        _ = self.git(self.mac, "merge", "-s", "ours", "--no-edit", "origin/main")
+        self.assertEqual(self.hour()[0], 0)
+        self.assertEqual(option(self.withdrawals()[0], "--production"), "fixture-production")
 
     def test_cold_credentials_defer_without_a_question_or_an_origin_fetch(self) -> None:
         self.warm = False
@@ -834,14 +839,24 @@ class VaultPullTests(unittest.TestCase):
                               vault_pull.MacUnreachable)
 
     def test_current_run_saves_last_good_and_uses_the_expected_transport(self) -> None:
-        self.assertEqual(self.hour(), (0, "buildlog vault: current"))
-        self.assertEqual(vault_pull.read_state(), vault_pull.VaultState(vault_pull.LastGoodPull(self.now), vault_pull.NoOutage()))
-        self.assertEqual(self.commands[0][-2:], ["fixture-mac:rust/hanadocs", "refs/remotes/origin/main:refs/remotes/origin/main"])
-        ssh = next(args for args in self.commands if args[0] == "ssh")
-        self.assertEqual(ssh[:-1], ["ssh", *sync.ssh_options(), "fixture-mac"])
-        for args in self.commands:
-            if args[0] == "git":
-                self.assertFalse(any(token in args for token in ("checkout", "reset", "merge", "rebase", "stash")))
+        for repository in (self.local, self.mac, self.github):
+            _ = self.git(repository, "config", "fetch.prune", "true")
+        for mac_changes in (False, True):
+            with self.subTest(mac_changes=mac_changes):
+                _ = self.git(self.local, "update-ref", "-d", "refs/remotes/mac/main")
+                self.assertEqual(self.hour(), (0, "buildlog vault: current"))
+                self.assertEqual(vault_pull.read_state(), vault_pull.VaultState(vault_pull.LastGoodPull(self.now), vault_pull.NoOutage()))
+                self.assertEqual(self.commands[0][-2:], ["fixture-mac:rust/hanadocs", "refs/remotes/origin/main:refs/remotes/origin/main"])
+                ssh = next(args for args in self.commands if args[0] == "ssh")
+                self.assertEqual(ssh[:-1], ["ssh", *sync.ssh_options(), "fixture-mac"])
+                self.assertEqual(self.git(self.local, "rev-parse", "refs/remotes/mac/main"), self.git(self.mac, "rev-parse", "HEAD"))
+                if mac_changes:
+                    _ = self.commit(self.mac, {"note.md": "new Mac commit\n"})
+                self.assertEqual(self.hour()[0], 0)
+                self.assertEqual(self.git(self.local, "rev-parse", "refs/remotes/mac/main"), self.git(self.mac, "rev-parse", "HEAD"))
+                for args in self.commands:
+                    if args[0] == "git":
+                        self.assertFalse(any(token in args for token in ("checkout", "reset", "merge", "rebase", "stash")))
 
     def test_manual_vault_command_uses_the_same_transport(self) -> None:
         with redirect_stdout(StringIO()):

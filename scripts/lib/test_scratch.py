@@ -278,12 +278,27 @@ print(scratch.target('gate:proof', 'tree', False))
         self.assertFalse((self.base / "old-build-folder").exists())
 
     def test_record_and_lifetime_results_distinguish_missing_bad_and_external_end(self) -> None:
-        self.assertIsInstance(scratch.task_of(self.base), copy_record.NotRegistered)
+        plain = self.base / "notes.txt"
+        _ = plain.write_text("scratch output")
+        for path in (self.base, plain):
+            with self.subTest(path=path.name):
+                self.assertIsInstance(scratch.task_of(path), copy_record.NotRegistered)
         _ = (self.base / copy_record.RECORD).write_text("bad json")
         bad = scratch.task_of(self.base)
         self.assertIsInstance(bad, copy_record.UnreadableRecord)
         assert isinstance(bad, copy_record.UnreadableRecord)
         self.assertIn(str(self.base / copy_record.RECORD), bad.reason)
+        with self.subTest(path="folder with an unsearchable parent"):
+            if os.geteuid() == 0:
+                self.skipTest("root ignores the parent permission mode")
+            parent = self.base / "unsearchable"
+            folder = parent / "folder"
+            folder.mkdir(parents=True)
+            parent.chmod(0o600)
+            try:
+                self.assertIsInstance(scratch.task_of(folder), copy_record.UnreadableRecord)
+            finally:
+                parent.chmod(0o700)
         self.assertIsInstance(scratch.task_end("until:bad"), scratch.Unknown)
         self.assertIsInstance(scratch.task_end("gate:outside"), scratch.Live)
         self.assertIsInstance(scratch.task_end("until:2000-01-01T0000Z"), scratch.Ended)

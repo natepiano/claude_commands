@@ -528,7 +528,7 @@ The user, 2026-11-04, change review C948 (`buildlog costs`), through builds: the
 **Ruled out:** a per-kill `cached_property` (under 1 ms per report).
 
 ### Phase 26 — buildlog costs is gone and buildlog charts opens the shared build page  · status: todo
-**Depends on:** Phase 15; queue-unit's Phase 10m (the build page and its feed in the repo, drawing Phase 15's `page_data`)
+**Depends on:** Phase 15; queue-unit's Phase 10m (the build page and its feed in the repo, drawing Phase 15's `page_data`); queue-unit's Phase 34 (`/build:page`: `commands/build/page.md` runs `scripts/build_queue/memory_feed.py link`, which prints the page URL from `output_folder` in `config/memory_feed.conf`). From the builds showrunner (not the user), 2026-11-08: "queue owns the page link command and builds it after its Phase 33. The name still waits on the user." From the user (via the builds showrunner), 2026-11-08: "use /build:page that is fine". The builds showrunner added: start Phase 26 now with that name, and merge queue's Phase 34 when it lands on builds.
 
 From the builds showrunner (not the user), 2026-11-05: after queue 10m, delete `buildlog costs`, and `buildlog charts` prints the shared page's tailnet link, with a non-zero exit and a reason when there is no link. The user's C948 ruling (2026-11-04, through builds): the ranking lives on the one build page; hours show in the user's zone, with no seconds, UTC or microseconds; the Definitions block moves into the as-built doc.
 
@@ -539,10 +539,10 @@ From the builds showrunner (not the user), 2026-11-05: after queue 10m, delete `
 **Spec:**
 - Remove the `costs` command from `scripts/buildlog/cli.py` (usage line 7 and the branch at line 271) and `costs.main`, `costs.render_costs`, `costs.phase_line`, `FOOTER`, `OUTPUT_LINE_LIMIT` and `MAX_RANKED_ROWS` when no other caller remains (LSP `findReferences`). Keep `read_costs`, `aggregate_costs`, `collect_costs` and the types: `charts` reads them.
 - Move the `FOOTER` definitions into `docs/as-built/buildlog-memory-stalls.md` as plain sentences, in Simplified Technical English.
-- `charts.main` keeps its arguments (`--days 7|30`, `--no-open`). It stops writing `latest.html` and stops calling `present_page`'s publish path. It asks queue 10m's page command for the page's tailnet link (10m names it; read its as-built before the Work Order is used) and prints it, or opens it when a local display exists and `--no-open` is absent. With no link, it prints `buildlog charts: <reason>` to stderr and exits 1.
+- `charts.main` keeps its arguments (`--days 7|30`, `--no-open`). It stops writing `latest.html` and stops calling `present_page`'s publish path. It runs `scripts/build_queue/memory_feed.py link` from the same checkout (the `/build:page` command) and prints the one URL line from its stdout, or opens it when a local display exists and `--no-open` is absent. A non-zero exit, a missing command, or stdout that is not one `http`/`https` URL is no link: it prints `buildlog charts: <reason>` to stderr (the command's stderr when it gave one) and exits 1. Tests use a stand-in link command; after queue Phase 34 is merged from builds, run the real `buildlog charts --no-open` once and quote its line.
 - Delete `render_html`, `publish`, `PAGE` and `chart_data` when no caller remains.
 - A test that calls `chart_data` and also proves a calculation keeps that proof. Change it to read the typed `ChartSet`, for example `test_exact_edges_assign_steps_phases_ci_and_moments_to_the_later_bucket` in `test_charts.py`. Delete only assertions about removed output.
-- Replace each `buildlog costs` instruction in the three as-built docs below with `buildlog charts`.
+- Replace each `buildlog costs` instruction in the three as-built docs below with `buildlog charts`. Measurement records that name `costs` as a reader in `docs/as-built/buildlog-memory-stalls.md` stay as written.
 
 **Files:**
 - `docs/as-built/build-report-session.md`, `docs/as-built/build-targets.md`, `docs/as-built/mac-test-offload.md` — `buildlog charts` in place of `buildlog costs`.
@@ -556,7 +556,7 @@ From the builds showrunner (not the user), 2026-11-05: after queue 10m, delete `
 
 **State:** none.
 
-**Constraints from prior phases:** Phase 15's `page_data` stays; queue's feed calls it. Phase 22 made `buildlog charts` publish its own page and print its tailnet link; this phase replaces that page with queue's. Phase 33: every import in `scripts/buildlog` uses the repo root (`from scripts.buildlog import y`), a patch string names the root form (`mock.patch("scripts.buildlog.charts.x")`), and a library module adds no `sys.path` line.
+**Constraints from prior phases:** Phase 15's `page_data` stays; queue's feed calls it. Phase 22 made `buildlog charts` publish its own page and print its tailnet link; this phase replaces that page with queue's. Phase 33: every import in `scripts/buildlog` uses the repo root (`from scripts.buildlog import y`), a patch string names the root form (`mock.patch("scripts.buildlog.charts.x")`), and a library module adds no `sys.path` line. Phase 37: the index uses WAL mode. `page_data` reads it through `charts.read_index` and gets the last committed snapshot during a rebuild. A read-only file comparison may permit only the index `-wal` and `-shm` sidecar changes (`read_only_evidence` in `scripts/aws_target/measurement_test_support.py`). A test that needs a blocked reader uses `PRAGMA locking_mode = EXCLUSIVE`; `BEGIN EXCLUSIVE` alone does not block WAL readers.
 
 **Acceptance gate:**
 - A test proves `buildlog charts` prints the shared page's tailnet link and writes no page file.
@@ -786,3 +786,217 @@ Measurement only; no code changed. Two full rebuilds ran on private copies of th
 **Gotchas:**
 - CLI readers (`buildlog query`, `test_times show`) wait on the update file lock for the whole rebuild, with spill on or off; neither run measured the 30 s direct SQL timeout.
 - A value change to `INDEX_SPILL_PAGES` needs the user's approval first (builds showrunner, 2026-11-08).
+
+### Phase 36 — A full rebuild of the build log index uses about a third of the memory · status: done
+
+#### As-built
+
+`INDEX_SPILL_PAGES` takes effect: an index update spills at 65,536 changed pages.
+- `scripts/buildlog/index.py` `open_for_update` runs `PRAGMA cache_spill = {INDEX_SPILL_PAGES}` and then `PRAGMA cache_spill = ON`. SQLite reads N as a boolean through 8 bits, so 65536 alone turns spill off; `ON` sets the flag and keeps the threshold.
+- `test_update_enables_the_configured_spill_threshold` checks that the writer reports the configured threshold.
+- One full rebuild (443 files, 276,466 records, load 47.2 to 68.9): peak RSS 1,378,896 KiB, 154.33 s wall, 98.01 CPU s, first spill at 9.975 s.
+
+**Files:**
+- `scripts/buildlog/index.py` — `open_for_update` enables spill.
+- `scripts/buildlog/test_index.py` — the spill threshold test.
+- `config/buildlog.conf` — `INDEX_SPILL_PAGES` basis comment; the value stays 65536.
+- `docs/as-built/buildlog-memory-stalls.md` — "Full rebuilds and spill, 2026-11-08": the measurements and the reader cost.
+
+**Gotchas:**
+- In rollback-journal mode a spill takes an exclusive lock. Direct readers that skip `index.update()` wait 30 s and fail (`database is locked`): `buildlog costs`, `buildlog moments` and charts. `complete_gate_index_in` raises `NoCompleteGateIndex` after 1 s; the step estimator falls back after 5 s.
+- A value change to `INDEX_SPILL_PAGES` needs the user's approval first (builds showrunner, 2026-11-08).
+
+### Phase 37 — Readers get their answer during a full rebuild of the build log index · status: done
+
+#### As-built
+
+The build log index uses WAL mode, so a spilled update takes no exclusive lock and readers get the last committed snapshot.
+- `scripts/buildlog/index.py` `open_for_update` runs `PRAGMA journal_mode = WAL` on a new and an existing index, and raises `sqlite3.OperationalError` when SQLite does not return `wal`. A rebuild removes the old index, enables WAL, then creates the schema.
+- One full rebuild (444 files, 276,884 records, load 108.2 to 61.3): peak RSS 1,386,436 KiB, 240.09 s wall, 119.54 CPU s, largest WAL 3,094,976,992 bytes. Four readers started after the first spill exited 0 in 0.097-1.709 s.
+- `read_only_evidence` (`scripts/aws_target/measurement_test_support.py`, aws-unit) leaves out only the index `-wal` and `-shm` sidecars in the build log root.
+- The two lock tests in `scripts/test_times/test_show.py` hold `PRAGMA locking_mode = EXCLUSIVE` and assert that a reader gets `database is locked`.
+
+**Files:**
+- `scripts/buildlog/index.py` — `open_for_update` sets WAL.
+- `scripts/buildlog/test_index.py` — WAL for a new and an existing index; committed rows during spill and after the writer closes.
+- `config/buildlog.conf` — `INDEX_SPILL_PAGES` comment with the WAL measurement; the value stays 65536.
+- `docs/as-built/buildlog-memory-stalls.md` — the WAL measurement, the sidecar and conversion facts.
+- `scripts/aws_target/measurement_test_support.py`, `scripts/buildlog/test_aws_report.py` — the sidecar rule and its test.
+- `scripts/test_times/test_show.py` — the two lock tests.
+
+**Gotchas:**
+- A `mode=ro` reader creates the `-wal` and `-shm` sidecars and cannot remove them; an update that closes with no other connection open removes them.
+- Conversion from `delete` to WAL waits for open read transactions, up to the 30 s busy timeout.
+- `BEGIN EXCLUSIVE` does not block WAL readers; a test that needs a blocked reader uses `PRAGMA locking_mode = EXCLUSIVE`.
+- A full rebuild needs about 3 GB more disk for the WAL file. During the first rebuild after a schema change, readers see an empty index.
+
+**Ruled out:**
+- A change to `INDEX_SPILL_PAGES`: a value change needs the user's approval (builds showrunner, 2026-11-08).
+
+### Phase 38 — Each moved admission name has one import path · status: todo
+**Depends on:** queue-unit's Phase 10o and resources 0dfe65382 (both on this branch); nothing in this plan. This phase was queue-unit's Phase 21 (builds-queue.md).
+
+From the builds showrunner (not the user), 2026-11-08: "queue has too much work. You get three of its phases … Phase 21: each moved admission name has one import path. … Order 21 freely." The design call is the builds showrunner's, 2026-11-06: "The owner of a move switches every caller, and the old path goes."
+
+#### Work Order
+
+**Goal:** A name that queue Phase 10o moved has one import path, its defining module. No caller reads it through `memory_admit`.
+
+**Spec:**
+- Phase 10o left about 230 names re-exported from `scripts/lint/memory_admit.py` (`from x import A as A`), so one name has two import paths. Each caller that reads a moved name through `memory_admit` imports it from its defining module: `scripts/build_queue/admission_records.py`, `scripts/build_queue/step_estimator.py`, `scripts/build_queue/system_clock.py` or `scripts/lib/test_phase.py`.
+- Find the callers with a static walk on this phase's merged tree (a one-off script in the phase folder, not in the repo). A walk on `136497f98` found 39 files; other units' landings change the list. Each caller file the walk lists is in this phase's scope; the director adds it to the phase `files` list before dispatch.
+- A `mock.patch` target on a moved name names the defining module. A patch that changes a name the code reads through another module keeps its effect; the tests prove it.
+- In `memory_admit.py`, each `A as A` re-export goes. `memory_admit` imports only the names it uses.
+- `scripts/buildlog/mac_idle.py` is frozen except for this one import change (builds ruling, 2026-11-06). The checkpoint notice names it on its also-touches line.
+- Replies, wire shapes, stored records, config keys and printed text do not change. No assertion changes. Add no new import test: a new check goes to the user first.
+
+**Files:**
+- `scripts/lint/memory_admit.py` — no re-exports.
+- `scripts/buildlog/mac_idle.py` — one import line.
+
+**Workers:** `1 writer + 1 tester`
+- writer — production callers and `memory_admit.py`.
+- tester — test files and test support, patch targets, and the walk.
+
+**State:** none.
+
+**Constraints from prior phases:** Phase 33: every import uses the repo root (`from scripts.buildlog import y`); a patch string names the root form; a library module adds no `sys.path` line. After a merge of builds or main, run `scripts/lint/package_imports.py bootstrap` and the import-group check on changed files.
+
+**Acceptance gate:**
+- The one-off walk prints no caller of a moved name through `memory_admit`; the checkpoint notice carries that result.
+- The client start measurement stays: `memory_admit.py release` loads no module it did not load before.
+- The unit's targeted test passes, and `basedpyright` reports 0 errors, 0 warnings, 0 notes on each changed file and each caller module.
+- Change-Review: none — no behavior changes.
+
+### Phase 39 — Cloud gates show as normal rows on /build:queue and the build page · status: todo
+**Depends on:** queue-unit's Phase 36 (swap by owner) on builds, because both change `memory_feed.py` and `memory_live.html`. Merge builds before the start. This phase was queue-unit's Phase 35.
+
+From the user (via aws-unit, 2026-11-08): "each row is work and it needs to reflect that work", "design approved - we need to make sure it's reflected in the build page also". From the builds showrunner (not the user), 2026-11-08: start after queue's Phase 36 lands on builds.
+
+Approved layout:
+
+```
+  # showrunner   unit       step           min machine vCPU pid         GiB: kept/use; need
+run hana         merge-gate hana nextest     2 natedev   32 pid 361734  ░░ 13.3 / 0.1
+run sdlc         agents     merge-gate       4 aws       32 pid 1084018 running · 312 of 737 modules · 1 failed
+run builds       queue      targeted test    1 aws       16 pid 1631041 setup · 0 of 130 modules
+  1 sdlc         devtools   merge-gate       2                pid 1676409 ██ 4.6
+cloud            natest     targeted test    0                pid 1868327 waits for a cloud slot: 9 of 9 in use
+Head: free 25.5 GiB; reserve 3.0 GiB; need 4.6 GiB · cloud 2 of 9 slots
+```
+
+#### Work Order
+
+**Goal:** A cloud gate is a normal row of the queue table, in the text view and on the build page, and the separate Cloud section and card go.
+
+**Spec:**
+- Each cloud gate is a row of the main table, sorted with the other running and waiting rows.
+- The machine column shows `aws` for a cloud gate. natedev and the Mac rows do not change.
+- A new vCPU column after machine, on every running row, shows the CPU count of the machine that runs the work. Cloud: `CloudProgress.size_vcpus`. Local counts come from the system or config, not a literal.
+- The last column: a local row keeps its memory bar. A cloud row shows its state (requesting, setup, running, uploading), modules done of total, and failed modules when any. After 3 missed progress pushes it adds "no update for <age>" in red. A cloud row has no memory reservation.
+- A cloud gate that waits for a slot has `cloud` in the # column, and its last column is the slot wait text.
+- The head line adds "cloud N of 9 slots"; the slot count comes from config.
+- `memory_live.html` shows the same rows and columns; the Cloud card goes. The text view loses its Cloud section (`queue_view.cloud_lines`).
+- Data: `admission_protocol` `CloudRow` / `CloudPlace`, `cloud_progress.CloudProgress(state, size_vcpus, failed_modules, updated_at)`, and the modules counter on the same sidecar. No aws-side change.
+
+**Files:**
+- `scripts/build_queue/queue_view.py` — cloud rows in the table; no `cloud_lines` section.
+- `scripts/build_queue/memory_feed.py` — cloud rows and the vCPU column in the feed.
+- `scripts/build_queue/memory_live.html` — the rows and columns; no `renderCloud` card.
+- `scripts/build_queue/memory_page_proof.mjs` — the browser proof.
+- `scripts/build_queue/test_queue_view.py`, `scripts/build_queue/test_memory_feed.py` — row tests.
+
+**Workers:** `1 writer + 1 tester`
+- writer — `queue_view.py`, `memory_feed.py`, `memory_live.html`.
+- tester — the Python tests and `memory_page_proof.mjs`.
+
+**State:** none.
+
+**Constraints from prior phases:** Read `admission_protocol` `CloudRow`/`CloudPlace` and `cloud_progress.CloudProgress` as they are; aws-unit owns them. Tunables live in config and are read at use.
+
+**Acceptance gate:**
+- Tests show a running cloud row, a waiting cloud row with `cloud` in the # column, a stale cloud row with "no update for <age>", the vCPU column, and the head line slot count, in the text view and in the feed.
+- The browser proof shows the same rows on the page and no Cloud card.
+- The unit's targeted test passes; `basedpyright` 0 errors, 0 warnings, 0 notes on the changed Python files.
+- The checkpoint notice goes to aws-unit too; aws checks it with a live cloud gate.
+
+### Phase 40 — /build:queue retires when the build page covers it · status: todo
+**Depends on:** Phase 39; queue-unit's Phase 10m. This phase was queue-unit's Phase 10n.
+
+From the user (C959, 2026-11-04, through builds): "we are moving to the new build html page - we will use /build:queue for reference until we can retire it". From the builds showrunner (not the user), 2026-11-08: do this one last, after Phase 39.
+
+#### Work Order
+
+**Goal:** The `/build:queue` view goes once the build page shows each thing it shows; its controls stay.
+
+**Spec:**
+- List what `/build:queue` shows and confirm the page shows each item, the queue 10m wait states included. Then remove the view routes and the view code that only they use.
+- `build_queue.py` keeps the `bump`, `clear` and `admit-head` controls: the page does not have them, and they stay until the user approves a replacement (architect review of queue 18, 2026-11-06).
+- Keep each formatter that a current caller uses: the queue card uses `queue_view` formatters. `admission_service.py:32` imports `reason_phrase` from `admission_records`; `queue_view.py:10` only re-exports it, so that re-export is no reason to keep view code. Keep `queue_lines.step_text`: the card and the build page use it.
+- The queue card and the unit-board queue pane stay unless the user says otherwise.
+
+**Files:**
+- `commands/build/queue.md` — the controls only.
+- `scripts/build_queue/build_queue.py` — no view routes.
+- `scripts/build_queue/queue_view.py` — no code that only the view routes used.
+- `scripts/build_queue/test_build_queue.py` — tests for the removed routes go.
+
+**Workers:** `1 writer + 1 tester`
+- writer — `commands/build/queue.md`, `build_queue.py` and the view code that only it uses.
+- tester — `test_build_queue.py`, the golden files it alone reads and the suites of the shared formatters.
+
+**State:** none.
+
+**Constraints from prior phases:** Phase 39 put cloud rows in the main table; the page and the text view show the same rows.
+
+**Acceptance gate:**
+- The summary lists each `/build:queue` item and where the page shows it.
+- No caller of the removed code remains (LSP `findReferences` or `rg`).
+- The unit's targeted test passes; `basedpyright` 0 errors, 0 warnings, 0 notes on the changed Python files.
+
+### Phase 41 — The vault sync keeps the Mac main ref and files its stop question · status: done
+**Depends on:** nothing in this plan. Files: `scripts/buildlog/vault_pull.py`, `scripts/buildlog/test_vault_pull.py`, `config/build_targets.conf`; no other phase touches them.
+
+From the builds showrunner (not the user), 2026-11-08: "C1272 (Mac vault syncs both ways) landed on my validation. One live defect to look at: the 11:00 EST buildlog vault run stopped with 'unknown command error ... cannot lock ref refs/remotes/mac/main' ... Find the cause ... and whether the stop filed a question on natedev's list ... Send me the cause, and a phase if a fix is needed."
+
+From the builds showrunner (not the user), 2026-11-08: "go on Phase 41. The full refspec fixes the cause, and the question production from config is right (a new key needs no go). Add a change row only when the fix is live and the user can check it."
+
+Cause, measured 2026-11-08 on git 2.54.0 in a scratch pair of repositories:
+- The global git config sets `fetch.prune true`. `vault_pull.py:228` fetches `main:refs/remotes/mac/main` from a URL. With a short source name, prune counts the destination ref as stale. Each second fetch deletes `refs/remotes/mac/main`.
+- When the Mac main moved, that fetch fails: `cannot lock ref ... unable to resolve reference ... (unable to update local ref)`. This is the 11:00 stop.
+- When the Mac main did not move, the fetch exits 0 and leaves the ref deleted. The next `merge-base` on the ref then fails.
+- So every second hourly run stops. It is not a race. Runs: 09:58 created the ref, 11:00 stopped, 12:02 created it again.
+- The full source name `refs/heads/main:refs/remotes/mac/main` updates the ref on each of four runs, with prune on.
+
+Question list, measured 2026-11-08:
+- The 11:00 stop filed no question; nothing needs clearing. The 12:02 run printed no "question was not withdrawn", so the ask had failed.
+- `vault_pull.py` passes `--production ~/.claude/docs/plans/natedev-production.md`. The natedev showrunner's staff row names the doc in `worktrees/claude-natedev-trunk`, so `update_registration.py` answers "no showrunner staff row". No vault stop has reached the list since that move.
+- `update_registration.py questions --production natedev` works: the flag takes the production name.
+
+#### Work Order
+
+**Goal:** Each hourly vault run keeps `refs/remotes/mac/main`, and a vault stop puts its question on natedev's list.
+
+**Spec:**
+- The Mac fetch uses the full source name: `refs/heads/main:refs/remotes/mac/main`.
+- A vault question names its production by name, read from `config/build_targets.conf` key `vault.question_production` (value `natedev`) at use. The hard-coded production doc path goes.
+- Replies, printed text, stored state and the question text do not change.
+
+**Files:**
+- `scripts/buildlog/vault_pull.py` — the fetch refspec; the production name from config.
+- `scripts/buildlog/test_vault_pull.py` — rows in the existing tests.
+- `config/build_targets.conf` — `vault.question_production`.
+
+**Workers:** `1 writer`
+- writer — all three files. The tests are small and live beside the change.
+
+**State:** none.
+
+**Constraints from prior phases:** Phase 33: every import uses the repo root. Tunables live in config and are read at use.
+
+**Acceptance gate:**
+- A test runs two syncs in a row with `fetch.prune=true` set on the test repositories, once with a new Mac commit and once with none. Both keep `refs/remotes/mac/main`. Each case fails on the old refspec.
+- The existing registration test reads `--production natedev` from config.
+- The unit's targeted test passes; `basedpyright` 0 errors, 0 warnings, 0 notes on the changed Python files.
+- The first two hourly runs after the merge each print `synced` or `current`.
+- Change-Review: none — the vault sync already recovers each second hour; the user sees no new behavior.

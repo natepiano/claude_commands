@@ -586,6 +586,28 @@ models_registry.store_registry(p, text, text.replace('impl=gpt-a:high', 'impl=gp
         self.assertEqual(index.read_bytes(), index_bytes)
         self.assertEqual(self.git("rev-parse", "HEAD").strip(), self.initial)
 
+    def test_another_fetch_between_the_fetch_and_the_read_does_not_change_the_target(self) -> None:
+        _ = self.git("checkout", "-b", "phases", cwd=self.competitor)
+        _ = (self.competitor / "phases.txt").write_text("another branch\n")
+        _ = self.git("add", "phases.txt", cwd=self.competitor)
+        _ = self.git("commit", "-m", "another branch", cwd=self.competitor)
+        _ = self.git("push", "origin", "phases", cwd=self.competitor)
+        program = "\n".join((
+            "from pathlib import Path",
+            "from scripts.lib import models_registry",
+            "real = models_registry._git",
+            "def peer(repo, *arguments, **options):",
+            "    output = real(repo, *arguments, **options)",
+            "    if arguments[:1] == ('fetch',):",
+            "        _ = real(repo, 'fetch', 'origin', 'phases')",
+            "    return output",
+            "models_registry._git = peer",
+            "print(models_registry._fetch(Path.cwd(), 'main'))",
+        ))
+        result = self.command(sys.executable, "-c", program)
+        self.assert_ok(result)
+        self.assertEqual(result.stdout.strip(), self.initial)
+
     def assert_unfinished_merge_is_refused(self, *, ahead: bool, unmerged: bool,
                                           merge_head_present: bool = True) -> None:
         if ahead:

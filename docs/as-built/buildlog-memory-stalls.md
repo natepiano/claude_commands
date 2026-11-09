@@ -253,21 +253,33 @@ Each host with a counted pair gets one line, `<host>: CPU some X%, full Y%; IO s
 
 - **Full rebuilds and spill, 2026-11-08.** SQLite 3.51.2 reads the spill boolean through 8 bits.
   `PRAGMA cache_spill = 65536` disables spill because `65536 & 255 = 0`.
-  Both trials used 4096-byte pages, `cache_size=-2000`, rollback journal mode `delete`, and separate private disk roots.
-  Run 1 copied 443 JSONL files with 1,247,655,070 bytes and indexed 276,226 records.
-  It took 132.73 s wall and 102.02 s CPU, with peak RSS 3,846,340 KiB (3,756.2 MiB).
-  Its `cache_spill` getter returned 0; it held every dirty page until commit.
-  Its six late readers waited 9.404–10.919 s during commit, not during a spill.
-  Run 2 copied 443 JSONL files with 1,247,920,323 bytes and indexed 276,363 records.
-  A trial wrapper applied `PRAGMA cache_spill = ON` after `open_for_update` and confirmed `cache_spill=65536` on the writer connection.
-  It took 252.73 s wall and 109.89 s CPU, with peak RSS 1,372,548 KiB (1,340.4 MiB).
-  The database first grew past its 307,200-byte schema at 11.523 s, when the first spill occurred.
-  Query/report pairs started near that spill and at 50% and 90% of run 1's final index size.
-  Their wall times were 241.254/245.754 s, 166.623/174.815 s, and 43.593/46.620 s.
-  All twelve readers exited 0 and read the new index; neither private root had an older index.
-  These CLI calls waited on the update file lock; they did not measure the 30-second direct SQL timeout.
-  Machine load and the copied records differed, so these runs do not isolate the effect on wall time.
-  `INDEX_SPILL_PAGES` remains 65536; only the trial wrapper enabled spill.
+  `open_for_update` now applies `PRAGMA cache_spill = ON` after the threshold; spill stays enabled at 65,536 pages.
+  The index now uses WAL mode because spill takes no exclusive database lock; readers read the last committed snapshot.
+  Every measurement used 4096-byte pages, `cache_size=-2000`, and a private disk root without an index.
+  Phases 35 and 36 used rollback journal mode `delete`.
+  Phase 35 measured spill off: 132.73 s wall, 102.02 s CPU, and peak RSS 3,846,340 KiB (3,756.2 MiB).
+  Its one-minute load rose from 48.4 to 58.5.
+  The Phase 35 wrapper enabled spill: 252.73 s wall, 109.89 s CPU, and peak RSS 1,372,548 KiB (1,340.4 MiB).
+  Its one-minute load rose from 63.9 to 102.8.
+  Phase 36 used the repaired code with 443 JSONL files, 1,250,849,618 bytes, and 276,466 records.
+  It took 154.33 s wall and 98.01 s CPU, with peak RSS 1,378,896 KiB (1,346.6 MiB).
+  Its one-minute load rose from 47.2 to 68.9; peak RSS was 35.9% of the spill-off measurement.
+  The writer reported `cache_spill=65536`; the first spill grew the database past 307,200 bytes at 9.975 s.
+  During Phase 36 spill, `read_only()` failed after 30.214 s with `database is locked`; selection returned `NoCompleteGateIndex` after 1.006 s.
+  Phase 37 rebuilt 444 JSONL files, 1,256,597,996 bytes, and 276,884 records with WAL enabled.
+  It took 240.09 s wall and 119.54 s CPU, with peak RSS 1,386,436 KiB (1,353.9 MiB).
+  Peak RSS rose 0.55% from Phase 36; the one-minute load fell from 108.2 to 61.3.
+  The first spill grew the WAL beyond its 309,032-byte schema at 12.252 s.
+  Reader processes took 0.097 s (`read_only`), 0.103 s (selection), 0.205 s (`costs`), and 1.709 s (`moments`); all exited 0.
+  Each reader saw zero indexed steps, calls, samples, and gate runs; selection returned `NoCompleteGateIndex` during this first rebuild.
+  Costs reported no recorded costs; moments retained its fixed sections and external journal data.
+  The WAL reached 3,094,976,992 bytes, about the rebuilt index size of 3,076,661,248 bytes.
+  This WAL file adds disk use during a full rebuild; no WAL or SHM file remained after the writer closed.
+  A reader open when the writer closes keeps the WAL and SHM files; read-only readers cannot remove them, and the next update that closes alone removes them.
+  An update that converts a `delete` index to WAL waits for open read transactions, up to the 30 s busy timeout.
+  Phase 35 CLI readers waited on the update file lock and then succeeded; Phase 36 measured the direct SQL timeout.
+  Load and source records differed between measurements, so wall times do not isolate the effect of spill.
+  `INDEX_SPILL_PAGES` remains 65536; the private roots were deleted.
 - **The 5-minute gap rule.** `MAX_SAMPLE_GAP_S = 300`, five 60 s intervals. A counter rise across a longer gap cannot be placed on a day, so it is dropped. That happens when the timer stopped or the machine was off. A `boot_id` change also makes the interval unknown; a new counter cannot reveal its start time.
 - **Temp-folder steps are in the stall table.** They appear as `scratch (temp folders)` (`SCRATCH_LABEL`), and they count in every step's "at once". `SCRATCH` matches a cwd under `/tmp/`, `/var/folders/` or `/private/var/folders/`.
 - **Linux only.** `buildlog sample` without any of its three `/proc` files prints one line and exits 1. That includes a Linux kernel without PSI. A malformed `/proc/pressure/memory` raises and writes no row, and the next minute tries again. Step stalls need the systemd scope as well: a user manager, `systemd-run`, and `BUILDLOG_SCOPE` not set to `0`. That means natedev only, the same as `peak_mem_bytes`.
