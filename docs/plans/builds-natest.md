@@ -2246,41 +2246,20 @@ A changed `config/<name>.conf` selects every test module whose transitive import
 
 
 ### Phase 113 — A private admission server costs less to start and to keep running  · status: done
-**Depends on:** none
 
-#### Work Order
+#### As-built
 
-**Source:** the showrunner, 2026-11-09: "Add-on 1: next (measure shared setup across a whole gate before you pick the slow-module phase)", and "Phase 113 (shared admission setup and process scans) is yours: go." The user: "our goal is dramatically reduced cpu time".
-
-**Why:** the private admission server runs in 179 modules. Whole-gate measurement on natedev at low load, 739 modules: setup 28.0 CPU s, loop 25.9 CPU s, cleanup 3.1 CPU s. Two parts of that are waste. First, `AdmissionServer._source_stamps` resolves every loaded module path at each fixture start: 7 of 13 ms per fixture, because a test process makes many servers and each one resolves the same paths. Second, the loop polls at 10 ms: 4.55 ms of CPU per idle second, against 1.60 at 50 ms. A test thread that needs a turn waits for the poll to end, a median 7 ms now. A longer poll needs a wake so that the test thread does not wait longer.
-
-The process scans stay as they are. 77% of a scan is the kernel reading each process's environment, a cost set by the process count on the host: a rewrite with `os` calls saves 23%, and a cloud box runs fewer processes than natedev's 999.
-
-**Goal:** the fixture resolves the module paths once per process, and the private loop wakes for a test thread or a stop in place of a 10 ms poll.
-
-**Spec:**
-All changes are in `scripts/build_queue/admission_test_support.py`.
-1. Add the named value `SERVING_POLL_SECONDS = 0.05`. `serve()` calls `self.server.run_once(SERVING_POLL_SECONDS)`.
-2. Override `_source_stamps` in `ObservedAdmissionServer`. Keep one class-level record: the `len(sys.modules)` it was computed at and the set of paths from `super()._source_stamps()`. When the count is unchanged, return a new stamp for each kept path with `self._stamp(path)`. When the count changed, call `super()._source_stamps()`, keep its paths and return its result.
-3. `serve()` sets `self.loop_permission.serves_loop = True` as its first statement. A thread that has this mark is the loop thread.
-4. Add a plain `threading.Lock` called `self.turn_gate`. In `loop_turn()`, a call at depth 0 takes `turn_gate`, then `loop_access`, then releases `turn_gate`. A call at depth above 0 does not take `turn_gate`, because its thread already holds `loop_access`. Keep the `TEST_HANG_GUARD_SECS` timeout and the existing message form on both acquires.
-5. `ObservedAdmissionServer` owns the wake. It sets `self.wake_lock`, a `threading.Lock`, before `super().__init__`. It overrides `close` to run `super().close()` while it holds `wake_lock`. Its `wake_loop` method holds `wake_lock` and calls `os.eventfd_write(self.priority_events, 1)` when `self.closed` is false. A wake then cannot write a descriptor that a restart closed. While it holds `turn_gate`, a depth-0 caller that does not have the `serves_loop` mark calls `self.server.wake_loop()` when serving is active. The loop thread then ends its poll and releases `loop_access`, and the waiter takes it. The loop waits on `turn_gate` while a waiter holds it. This order closes the race where a wake lands before the waiter blocks.
-6. In the `finally` of `serving()`, after `stopped.set()`, call `self.server.wake_loop()`. A stop then does not wait for the poll.
-7. Change no production file. Add no check. Do not change a test assertion.
+- `ObservedAdmissionServer` in `scripts/build_queue/admission_test_support.py` keeps one class-level record of source paths, keyed by the count of `sys.modules`. A fixture start with an unchanged count stamps the kept paths and resolves none.
+- `SERVING_POLL_SECONDS` is 0.05. `serve()` marks its thread with `serves_loop`, and `serving()` wakes the loop at stop through `wake_loop`.
+- `loop_turn` takes `turn_gate` at depth 0, wakes the loop when the caller is not the loop thread, then takes `loop_access`. A nested call skips `turn_gate`.
+- `wake_loop` and `close` both hold `wake_lock`, so a wake cannot write a descriptor that a restart closed.
+- Same-load measurement, three rounds: setup plus close 13.4-13.7 ms to 6.0-6.3 ms, idle loop 1.8-3.3 ms/s to 1.1-1.7 ms/s, median turn wait 7.04 ms to 0.02-0.03 ms. Gate estimate: about 27 of 3,056 CPU s.
 
 **Files:**
 - `scripts/build_queue/admission_test_support.py` — the poll value, the path record, the turn gate and the wakes
 
-**Workers:** 1 writer; the work is one file
-- `impl` — the file above
+**Gotchas:**
+- Shared fixtures are a small part of a gate. Python child processes are 57% of gate CPU, and the helper chain per `verify.sh` call is about 18%.
 
-**Constraints from prior phases:**
-- Tests never read or write live state: `~/.claude` main, `~/.local/state/merge-gate`, `/tmp/claude`.
-- `build_hold.py` stays frozen.
-- The owner of this file was told before the edit, under the user's rule on test code.
-
-**Acceptance gate:**
-- `scripts/build_queue/test_admission_service*.py` and the other modules that use `serving()` or `caller_admission` pass. The targeted test selects them.
-- `basedpyright` on the changed file prints `0 errors, 0 warnings, 0 notes`.
-- The targeted test is green on the phase commit merged with `origin/builds`.
-- The director measures on one tree, at one load, before and after: fixture setup plus cleanup falls from 13.3 ms; idle loop CPU falls from 4.55 ms per second; a test thread's median wait for a turn while serving falls from 7 ms.
+**Ruled out:**
+- Rewriting the process scans with `os` calls: it saves 23%, because the kernel read of each process environment is 77% of a scan.
