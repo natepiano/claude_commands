@@ -134,14 +134,7 @@ def _move_locked(move: WorkerMove, hold: worker_panes.WorkerLockHold) -> Session
     active = progress_history.active_dispatch(move.row.id, move.run)
     if isinstance(active, progress_history.ActiveDispatchUnavailable):
         return accounts.SessionMoveRefused(move.row.id, f"anomaly: {' '.join(active.reason.splitlines())}")
-    if isinstance(active, progress_history.NoActiveDispatch):
-        if isinstance(state, (worker_panes.OpenWorker, worker_panes.StoppedWorker)):
-            closed = worker_panes.close(move.parent, staff.WorkerName.parse(move.row.name),
-                                        run=worker_panes.DispatchRun(move.run), lock=hold)
-            if isinstance(closed, worker_panes.Kept):
-                return accounts.SessionMoveRefused(move.row.id, closed.blocker)
-            if isinstance(closed, worker_panes.UncertainWorker):
-                return accounts.SessionMoveRefused(move.row.id, f"anomaly: {closed.reason}")
+    if isinstance(active, progress_history.NoActiveDispatch) and isinstance(state, worker_panes.ClosedWorker):
         return accounts.SessionMoveRefused(move.row.id, "nothing to move", 0)
     role = worker_panes.dispatch_role(move.row)
     if isinstance(role, worker_panes.WorkerRoleUnavailable):

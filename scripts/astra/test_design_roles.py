@@ -189,7 +189,7 @@ class HeldRolePaneTests(HeldRolePaneCase):
                     _ = self.panes.resume(design, role)
                 dispatch.assert_called_once()
                 self.assertEqual(dispatch.call_args.kwargs["role"], "astra-" + role)
-                writer.assert_called_once_with(row.id, staff.KnownWorkerRole(cast(staff.WorkerRole, "astra-" + role)))
+                writer.assert_not_called()
                 saved = staff.by_id(row.id)
                 assert saved is not None
                 self.assertEqual(saved.role, staff.KnownWorkerRole(cast(staff.WorkerRole, "astra-" + role)))
@@ -741,7 +741,7 @@ class DurableRolesTests(HeldRolePaneCase):
         row = worker_admission.find_worker(staff.snapshot(), parent.id, self.instance(saved, "designer").name)
         assert row is not None
         _ = world.foreground.pop("w1:p1")
-        with patch.object(world, "close_tab_confirmed", return_value=False):
+        with patch.object(world, "close_terminal_pane", return_value=False):
             with self.assertRaisesRegex(design_roles.RoleRefused, "pane close is incomplete"):
                 _ = design_roles.end(path.parent.name + "/designer")
         self.assertEqual(design_roles.read_design(path.parent.name), saved)
@@ -786,7 +786,7 @@ class DurableRolesTests(HeldRolePaneCase):
         transition = design_roles.design_directory(identifier) / "transition.json"
         lifecycle = self.instance(design, "designer").lifecycle
         assert isinstance(lifecycle, design_roles.RoleOpen)
-        with patch.object(world, "close_tab_confirmed", return_value=False):
+        with patch.object(world, "close_terminal_pane", return_value=False):
             with self.assertRaisesRegex(design_roles.RoleRefused, "pane close is incomplete"):
                 _ = design_roles.end(identifier + "/designer")
         self.assertTrue(transition.exists())
@@ -1952,19 +1952,16 @@ class DurableRolesTests(HeldRolePaneCase):
                                                  "host": "natedev"}), authority_before)
 
 
-    def test_end_retry_requires_proof_that_the_original_turn_is_no_longer_live(self) -> None:
+    def test_end_closes_the_worker_while_its_agent_status_is_working(self) -> None:
         design = self.open_designer()
         instance_id = design.placement.design_id + "/designer"
         self.panes.world.locations["w1:p1"]["agent_status"] = "working"
-        with self.assertRaisesRegex(design_roles.RoleRefused, "agent state is working"):
-            _ = design_roles.end(instance_id)
-        self.assertEqual(design_roles.read_design(design.placement.design_id), design)
-        self.assertTrue((self.root / "holds/9309c903-5894-501a-8aa7-f33ea912e074.json").exists())
-        _ = self.panes.world.foreground.pop("w1:p1")
         ended = design_roles.end(instance_id)
         self.assertEqual(self.instance(ended, "designer").lifecycle,
                          design_roles.RoleEnded(staff.StaffId("9309c903-5894-501a-8aa7-f33ea912e074")))
         self.assertFalse((self.root / "holds/9309c903-5894-501a-8aa7-f33ea912e074.json").exists())
+        self.assertEqual(self.panes.world.closed, [("w1:p1", "terminal-w1:p1")])
+        self.assertEqual(design_roles.end(instance_id), ended)
 
 
     def test_showrunner_notifier_target_requires_a_live_local_session(self) -> None:

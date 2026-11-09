@@ -26,9 +26,10 @@ class AssignReuseTests(launcher_fixture.FirstDispatchFixture):
         self.assertEqual(self.turn_starts, 2)
         self.assertEqual(len(world.locations), 1)
         destination = world.launches[-1]
-        self.assertIsInstance(destination, herdr.SplitPane)
+        self.assertEqual(destination, herdr.ExistingPane(source_pane, "terminal-" + source_pane))
         self.assertNotIn(source_pane, world.locations)
-        self.assertNotEqual(self.native.agent.submitted[-1][0], source_pane)
+        self.assertEqual(self.native.agent.submitted[-1][0], source_pane)
+        self.assertEqual(world.closed, [(source_pane, "terminal-" + source_pane)] * 2)
 
     def test_a_closed_worker_dispatches_again_on_its_recorded_thread(self) -> None:
         self.first_assignment()
