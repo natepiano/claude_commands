@@ -555,6 +555,13 @@ sys.exit(1)
         _ = another.write_text(path.read_text())
         self.assertFalse(detached_run_process.supervises(original["pid"], another))
         self.assertFalse(detached_run_process.supervises(os.getpid(), path))
+        alias = self.root / "record-alias.json"
+        alias.symlink_to(path)
+        for recorded in (alias, Path(os.path.relpath(path))):
+            with self.subTest(recorded=recorded):
+                with patch.object(detached_run_process, "process_args",
+                                  return_value=["python", "detached_runs.py", "supervise", str(recorded)]):
+                    self.assertTrue(detached_run_process.supervises(4321, path))
         command = ["assign.py", "impl", "prompt with spaces"]
         for arguments, matches in ((["python", "/fixture/assign.py", *command[1:]], True),
                                    ([], False),
@@ -563,6 +570,12 @@ sys.exit(1)
             with self.subTest(arguments=arguments):
                 with patch.object(detached_run_process, "process_args", return_value=arguments):
                     self.assertEqual(detached_run_process.runs_command(4321, command), matches)
+        for argument in ("prompt with spaces", "prompt  with  spaces"):
+            with self.subTest(argument=argument):
+                output = subprocess.CompletedProcess(["ps"], 0, f"python /fixture/assign.py impl {argument}\n", "")
+                with (patch.object(Path, "exists", return_value=False),
+                      patch.object(subprocess, "run", return_value=output)):
+                    self.assertTrue(detached_run_process.runs_command(4321, ["assign.py", "impl", argument]))
 
     def test_a_live_supervisor_is_not_ended(self) -> None:
         path = self.live_run(["bash", "verify.sh", "check"])
