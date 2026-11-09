@@ -133,11 +133,15 @@ class LaunchSettings(NamedTuple):
 
 def launch_settings(section: str, key: str) -> LaunchSettings:
     """Read launch settings through the existing shell resolver."""
+    configuration = LaunchModelConfiguration(*_snapshot(os.environ, OPERATION_ENVIRONMENT[0], registry_path()))
     result = subprocess.run(
-        ["bash", "-c", 'source "$1" && agents_resolve "$2.$3" && '
+        ["bash", "-c", 'source "$1" && { IFS= read -r -d "" table; eval "$table"; } && '
+         + '_models_table_file="$MODELS_CONFIG_FILE" && '
+         + 'agents_resolve "$2.$3" && '
          + 'printf "%s\\n%s\\n%s\\n%s\\n" "$AGENT_FAMILY" "$AGENT_MODEL" "$AGENT_EFFORT" "$AGENT_SERVICE_TIER"',
          "launch-settings", str(Path(__file__).resolve().parents[1] / "agents/models_config.sh"), section, key],
-        text=True, capture_output=True, check=False, env={**os.environ, "MODELS_CONFIG_TIER_ONLY": "1"})
+        input=configuration_shell(configuration), text=True, capture_output=True, check=False,
+        env={**os.environ, "MODELS_CONFIG_TIER_ONLY": "1"})
     values = result.stdout.splitlines()
     kind = values[0] if values else ""
     if result.returncode or len(values) != 4 or kind not in ("claude", "codex") or not values[1]:
