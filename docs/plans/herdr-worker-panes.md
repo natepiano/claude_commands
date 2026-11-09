@@ -3462,7 +3462,7 @@ An identical rerun of a completed dispatch sends the saved completion notice aga
 
 **Ruled out:** a wait or retry for the first-launch identity — the cause was the hook process in the foreground group.
 
-### Phase 34b — A turn end while a final run is live  · status: todo
+### Phase 34b — A turn end while a final run is live  · status: done
 
 **Depends on:** Phase 34a. sdlc [03851fa8] and [429a1166], 2026-11-09.
 
@@ -3497,6 +3497,19 @@ An identical rerun of a completed dispatch sends the saved completion notice aga
 **Workers:** `1 writer` — `hook34`, which holds the Phase 34 and 34a design.
 
 **State:** none new.
+
+### Phase 34c — Worker-pane anomalies from the builds report  · status: todo
+
+**Depends on:** Phase 34b (same hook and close code). sdlc [c2b76faf], 2026-11-09, from the builds showrunner's report.
+
+1. **A turn end with no DONE sends no message.** A `recorder` worker ended its turn without the DONE reply. No turn-hook message reached the director; the director read the result from the transcript. A turn end with no DONE must send the director one message.
+2. **A worker close exits 8 with the pane still open.** The `worker_panes.py` close of `recorder` exited 8: `worker stop has no fresh shell or closed-pane proof` (`scripts/shutdown/stop_resume.py:239`). The pane is still open.
+3. **A review DONE sends no turn-hook message.** sdlc [7b64ed16], from models Phase 1. Reviewers `models-review2` (adversary) and `models-review3` (contract) printed DONE in their panes at 04:44 to 04:45 EST. No turn-hook message reached the models director. Their status files still read `running`, and the style state reads `Error`. Check the `review.sh` pass path through `turn_end`. The models director read the results from the panes.
+4. **The completion hook's staff lookup fails.** sdlc [3e629889]. A models worker finished its turn, and the hook did not wake the models director. The hook run log reads `staff worktree is unavailable` (`session_staff.py:259` or `unit_lookup.py:272`). Models worktree: `/home/natepiano/worktrees/models`. Find why the lookup fails for this worker, and fix it at the cause.
+
+Evidence (sdlc [335976f2]): `/tmp/claude/unit/ed9c66cd-d74e-480c-9cca-766bc9f0702c/phases/42/`. `recorder_status` reads `running` after the 04:06 turn end, `recorder_reply_turn.txt` is 1 byte, and `recorder_agent.log` holds the launch. The 1-byte turn reply is the Phase 34b item 3 shape; check item 1 against the 34b fix first. Ask the builds showrunner for the close exit-8 output.
+
+The Work Order is written at the phase start.
 
 ### Phase 42 — A renamed unit keeps its workers  · status: done
 

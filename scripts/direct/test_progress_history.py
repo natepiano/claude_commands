@@ -3805,25 +3805,38 @@ with patch.object(fcntl, "flock", admission):
                              [["bash", "assign.sh", role, "prompt with spaces", "--literal=$HOME"] for role in roles])
 
     def test_launcher_recovery_keeps_the_active_pass_and_saved_command(self) -> None:
-        session = self.start_run("launcher-recovery", 41_000)
-        self.start_phase(session, 41_010)
-        command = ["bash", "review.sh", "prompt with spaces", "--phase", "3"]
-        self.start_slot_pass(session, "review", "review", 41_020, "gpt-called", 0,
-                             "--launcher-command", json.dumps(command), worker_name="review2")
-        path = session / "progress_history_state.json"
-        before = (path.read_bytes(), path.stat().st_mtime_ns)
-        active = self.pass_slots(session)["review"]
-        self.start_slot_pass(session, "review", "review", 41_030, "gpt-new", worker_name="review2")
-        self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns), before)
-        self.assertEqual(self.pass_slots(session)["review"], active)
-        self.assertEqual(len(self.pass_events("launcher-recovery", "pass_started")), 1)
-        self.assertEqual(self.pass_events("launcher-recovery", "pass_finished"), [])
-        self.finish_slot_pass(session, "review", "completed", 41_040)
-        finished, = self.pass_events("launcher-recovery", "pass_finished")
-        self.assertEqual(finished["pass_instance_id"], active["instance_id"])
-        self.assertEqual(finished["launcher_command"], command)
-        self.start_slot_pass(session, "review", "review", 41_050, worker_name="review2")
-        self.assertNotEqual(self.pass_slots(session)["review"]["instance_id"], active["instance_id"])
+        for status, finished_at, minutes in (("active", 41_040, 0), ("error", 41_140, 2)):
+            with self.subTest(status=status):
+                name = "launcher-recovery-" + status
+                session = self.start_run(name, 41_000)
+                self.start_phase(session, 41_010)
+                command = ["bash", "review.sh", "prompt with spaces", "--phase", "3"]
+                self.start_slot_pass(session, "review", "review", 41_020, "gpt-called", 0,
+                                     "--launcher-command", json.dumps(command), worker_name="review2")
+                path = session / "progress_history_state.json"
+                before = (path.read_bytes(), path.stat().st_mtime_ns)
+                active = self.pass_slots(session)["review"]
+                self.start_slot_pass(session, "review", "review", 41_030, "gpt-new", worker_name="review2")
+                self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns), before)
+                self.assertEqual(self.pass_slots(session)["review"], active)
+                self.assertEqual(len(self.pass_events(name, "pass_started")), 1)
+                self.assertEqual(self.pass_events(name, "pass_finished"), [])
+                if status == "error":
+                    self.finish_slot_pass(session, "review", "error", 41_080)
+                    with patch.object(plan_history, "now_epoch", return_value=finished_at):
+                        progress_history.complete_dispatch(session, "review", str(active["instance_id"]))
+                    failed, finished = self.pass_events(name, "pass_finished")
+                    self.assertEqual(failed["status"], "error")
+                    self.assertEqual(finished["status"], "completed")
+                else:
+                    self.finish_slot_pass(session, "review", "completed", finished_at)
+                    finished, = self.pass_events(name, "pass_finished")
+                self.assertIn(f"review-worker minutes {minutes},", self.run_command(
+                    "review-trial", "--session-dir", str(session), at=finished_at + 1))
+                self.assertEqual(finished["pass_instance_id"], active["instance_id"])
+                self.assertEqual(finished["launcher_command"], command)
+                self.start_slot_pass(session, "review", "review", finished_at + 10, worker_name="review2")
+                self.assertNotEqual(self.pass_slots(session)["review"]["instance_id"], active["instance_id"])
 
     def test_refused_pass_keeps_its_id_for_redispatch_and_finish(self) -> None:
         session = self.start_run("refused-pass", 41_000)
