@@ -2090,7 +2090,7 @@ Registered jobs already take no margin: `test_registered_and_unregistered_jobs_e
 
 **Gotchas:** held paths taken at the first scan miss a live use that `shrink_floor` finds later; compute them from the final `busy` map. The no-evidence branch walks `_build_trees` only when a cargo lock is held.
 
-### Phase 94 — Each fall below the floor line gives one phone push, and the return gives one more  · status: todo
+### Phase 94 — Each fall below the floor line gives one phone push, and the return gives one more  · status: done
 **Depends on:** Phase 93 (same file, `scripts/lint/sweep.py`). Merge `origin/builds` first.
 
 **Approved:** builds added Spec 7 and 8 on 2026-11-09 ("Both go in the phase 94 checkpoint"); a new config key needs no user go. The user, via natedev and the builds showrunner, 2026-11-09: "I got about 8 pushovers for Mac being below 150gib. All by less than 2gib. This is unhelpful. A single notice is fine. And a notice when we are back for good above 150. But telling me over and over is not helpful." builds, 2026-11-09: "Each fall gives exactly two pushes: one at the fall below 150 GiB and one at the return above 155 GiB. Nothing between them."
