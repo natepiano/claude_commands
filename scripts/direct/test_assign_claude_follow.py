@@ -40,7 +40,7 @@ class AssignClaudeLauncherWorkerTests(ClaudeLauncherFixture):
         opening = (self.root / "delivered_message.txt").read_text()
         assignment = self.prompt_file.read_text()
         self.assertLess(opening.index(str(extract)), opening.index(assignment))
-        self.assertEqual(self.recorded_worker(session_dir), row)
+        self.assertEqual(self.recorded_worker(session_dir), replace(row, role=staff.KnownWorkerRole("impl")))
         accepted = worker_admission.dispatch_record(allowed.run, allowed.name)
         self.assertEqual(accepted, worker_admission.DispatchRecord(request, worker_admission.SwitchState.ASSIGNMENT_ACCEPTED))
 
