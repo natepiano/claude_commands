@@ -8,10 +8,10 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from scripts.build_hold.override_guard import require_checkout
-    from scripts.lint.memory_admit import AdmissionPolicy, MemoryConfig, read_memory_config as read_fixture_config
+    from scripts.build_queue.admission_records import AdmissionPolicy, MemoryConfig, read_memory_config as read_fixture_config
 else:
     from scripts.build_hold.override_guard import require_checkout
-    from scripts.lint.memory_admit import read_memory_config as read_fixture_config
+    from scripts.build_queue.admission_records import read_memory_config as read_fixture_config
 
 require_checkout(Path(__file__))
 

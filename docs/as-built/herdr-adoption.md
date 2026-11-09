@@ -2,7 +2,7 @@
 
 ## What it is
 
-Every showrunner, unit director and standalone Claude session uses a tab in the shared herdr session, `agents`, on both machines. Each production has one workspace. Each standalone session has a workspace with its tab name. A unit uses its fixed parent row's production workspace. No launcher starts a separate herdr session. `start_server` and `restore_server` refuse other session names. Open `agents` with `herdr session attach agents` (`hsa agents`). Use `herdr_sessions.py attach-remote <host> <tab>` for a tab on the other machine. Codex workers remain headless `codex app-server` threads. Crash recovery also restores interactive Codex conversations into tabs in `agents`. tmux remains only in old records, which produce manual restart instructions. The implementation uses `scripts/herdr/`, `scripts/production/`, `scripts/message/roster.py` and `scripts/shutdown/`. See [herdr-trial.md](herdr-trial.md) for the trial results.
+Every showrunner, unit director and standalone Claude session uses a tab in the shared herdr session, `agents`, on both machines. Each production has one workspace. Each standalone session has a workspace with its tab name. A unit uses its fixed parent row's production workspace. No launcher starts a separate herdr session. `start_server` and `restore_server` refuse other session names. Open `agents` with `herdr session attach agents` (`hsa agents`). Use `herdr_sessions.py attach-remote <host> <tab>` for a tab on the other machine. Workers use interactive Claude or Codex panes under their staff parent. Crash recovery also restores interactive Codex conversations into tabs in `agents`. tmux remains only in old records, which produce manual restart instructions. The implementation uses `scripts/herdr/`, `scripts/production/`, `scripts/message/roster.py` and `scripts/shutdown/`. See [herdr-trial.md](herdr-trial.md) for the trial results.
 
 ## How it works
 
@@ -315,15 +315,22 @@ Run these suites on the Mac with a scratch home. Run the command from the root o
 - Prompt input requires an agent status of `working`, `idle`, or `done` and an empty visible composer. An absent `interactive_ready` permits input. A boolean value controls input. A non-boolean value prints one readiness anomaly and prevents input. No Remote Control turn is required. A matching new user turn in the destination transcript proves submission. An unreadable transcript prevents a retry. Both `idle` and `done` permit retyping after the settle time.
 - Each composer read uses `pane read --source visible --format ansi` and removes faint text. SGR 2 starts faint text. SGR 22 or 0 ends faint text. The parser skips colour arguments for SGR 38, 48, and 58. A faint hint can appear in an empty composer.
 
-After accepting a pass, the director closes its pane unless another fix round or phase dispatch starts immediately.
-The close retains the staff row and thread. The next assign resumes that thread in a new pane.
-A busy worker or live detached run prevents closure until that work ends.
+Worker dispatch sends its prompt once with `agent prompt --wait`.
+If herdr reports `agent_prompt_stalled`, dispatch waits for working, blocked, or done.
+`WORKER_PROMPT_START_SECONDS` sets this start window to 60 seconds by default.
+A start timeout returns exit 5.
+
+The launcher records a completed pass, ends the worker's agent, and closes its pane.
+The close retains the staff row and native conversation.
+The next assign resumes that conversation in a new pane.
 Restore reopens only workers with active dispatches. Idle workers stay closed until their next assign.
 Shutdown restart uses the shared worker restore.
 Pane worker account moves use the shared stop, resume, and prompt APIs.
 Account moves resume only workers with active dispatches; each move closes an idle worker's pane.
 An idle worker's next assign opens its conversation on the current role account.
-An open worker with an active dispatch keeps its conversation and terminal during an account move.
+A worker pane closes when its agent command returns. The staff row and native conversation remain.
+A resumed worker opens in a new pane after an assign, restore, or account move.
+Unit sessions and side panes keep their shells when their agents end.
 A busy worker receives one prompt to continue the same pass. An idle worker receives no prompt.
 The resume message builder retains the launcher prompt path for restored workers.
 
@@ -388,7 +395,7 @@ The resume message builder retains the launcher prompt path for restored workers
   The exec path prepares the target environment and removes conflicting account variables.
   Pane variables alone do not replace account admission.
   The [shutdown design](shutdown-and-restart.md) owns this shared move path.
-- A detached run is not a unit's second pane. The supervisor of a worker build that `mesh_runs.py supervise` runs stays in its pane's scope (in the herdr service's cgroup when pane scopes are not available), so herdr places it in the session; the command itself runs in a `builds.slice` scope. It inherits the unit's marks and a pane id that can be out of date. `unit_lookup` keeps only the places that can hold the unit's Claude when one does. Without that rule, a unit with a detached run reads as marked twice, and `roster.py` exits 1.
+- A detached run is not a unit's second pane. The supervisor of a worker build that `detached_runs.py supervise` runs stays in its pane's scope (in the herdr service's cgroup when pane scopes are not available), so herdr places it in the session; the command itself runs in a `builds.slice` scope. It inherits the unit's marks and a pane id that can be out of date. `unit_lookup` keeps only the places that can hold the unit's Claude when one does. Without that rule, a unit with a detached run reads as marked twice, and `roster.py` exits 1.
 - `herdr_place_of` reads every process for each call, so 40 calls took 10.7 s. `herdr_places()` places every pid in one read. `roster.py` uses it and takes about 1 s in total.
 
 **Mac.**
@@ -413,10 +420,10 @@ The resume message builder retains the launcher prompt path for restored workers
 
 ## Ruled out
 
-- Interactive Codex panes for workers. They stalled at the trust screen, lost Work Orders and hid from the roster, while headless workers ask nothing and the roster already finds them.
+- The earlier worker trial used headless Codex threads. Current workers use staff membership and interactive panes.
 - Installing herdr's Claude integration. It writes `~/.claude` hooks and settings that every session loads.
 - Ancestor folder keys as trust, and a trusted default start folder. Nothing records which folder the user last worked in, and a session opened somewhere unasked is worse than one prompt.
-- A Codex trust check. No launcher starts new Codex work in herdr, and crash restore only resumes a Codex session in the folder it already ran in.
+- A separate Codex trust check during crash restore. Restore resumes the saved conversation in its recorded folder.
 - Probing pane process info to detect shell readiness, because herdr sends no field that tells them apart. Killing an in-flight `agent start` at the deadline, because it leaves a half-started agent.
 - Copying the caller's environment into a pane. Only named marks and account variables pass.
 - A store-path fallback in `herdr_binary`, because a garbage-collected path fails late.

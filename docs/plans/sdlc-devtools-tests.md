@@ -1382,14 +1382,14 @@ The order stays: admit, `worker_state.py`, switch check, claim, `phase_reservati
 
 #### As-built
 
-`scripts/direct/claude_worker.py` holds each step of a Claude worker launch and has no `__main__`. `assign_claude._run` calls `open_worker(turn)` or `follow_up(turn, native_id)`, then `wait_for_turn(turn, delivered)`, all in the assign process. `ClaudeTurn` holds the inputs of one turn. A launch returns `Delivered(native_id, turns_before, launch_environment)`, `Unchanged` or `NotDelivered(code)`; `TurnsNotCounted` is the turn count of a new session. `scripts/agents/agent_bg.sh`, `worker_fill.py coordinate-claude`, `assign_gate.PYTHON_HOPS` and `AGENT_BG_WORKERS` do not exist.
+`scripts/direct/claude_worker.py` holds each step of a Claude worker launch and has no `__main__`. `assign_claude._run` calls `open_worker(turn)` or `follow_up(turn, native_id)`, then `wait_for_turn(turn, delivered)`, all in the assign process. `ClaudeTurn` holds the inputs of one turn. A launch returns `Delivered(native_id, turns_before, launch_environment)`, `Unchanged` or `NotDelivered(code)`; `TurnsNotCounted` is the turn count of a new session. `scripts/agents/agent_bg.sh`, `assign_gate.PYTHON_HOPS` and `AGENT_BG_WORKERS` do not exist.
 
 `worker_admission.switch_worker` keeps its `start` and `dispatch` callbacks. The account step calls `accounts.account_for_unscoped_launch`. One `nix_env.ensure` serves the settings and the start. The id comes only from the `backgrounded` line of the banner, and `_registered` waits `CLAUDE_WORKER_REGISTER_WAIT_SECS` for the full id. `agents_log.append` runs before delivery, and delivery is one child: `send.py --to session:<id> --from launcher --file <prompt>`, with `CLAUDE_WORKER_SEND_SCRIPT` as its test override. `wait_for_turn` parses `claude agents --json` and `claude logs` in process each `CLAUDE_WORKER_POLL_SECS`, which `UNIT_WORKER_POLL_SECS` overrides.
 
 `assign_claude._run` runs `_record` in `finally` around the launch, before `heartbeat_watch.sh`, and writes nothing when no session is published. A signal after the banner stops the unpublished session with `claude stop`. Exit codes: 127 no binary, 2 refused or not delivered, 1 no banner, gone with no summary or any other launch error, 143, 130 and 129 on a signal. An unreadable log gives the fallback summary. A transcript record with no message object does not count as a turn.
 
 **Files:**
-- `scripts/direct/claude_worker.py`, `scripts/direct/assign_claude.py`, `scripts/direct/assign_gate.py`, `scripts/production/worker_fill.py`, `config/direct.conf` — the launch.
+- `scripts/direct/claude_worker.py`, `scripts/direct/assign_claude.py`, `scripts/direct/assign_gate.py`, `config/direct.conf` — the launch.
 - `scripts/direct/test_claude_worker.py`, `scripts/direct/test_assign_claude.py` — moved launcher behaviors and regression tests; other launcher tests use `fixtures/background.sh` or `assign.sh` with the fixture Claude binary.
 
 **Binds later work:** the recorder and resolver children of `assign_claude._run` are the remaining launcher Python, with `send.py` (180 ms) and the `heartbeat_watch.sh` digest (24 ms each minute).
@@ -1406,16 +1406,17 @@ A Codex worker whose launcher and app-server died recovers on its recorded threa
 - `assign.py` `claim_worker` calls `codex_mesh.py reopen` for an `ended` worker, and for a worker in `ROSTER_LIVE` or `WAITING_CAPACITY` whose launcher is not attached (`codex_mesh.worker_launcher_attached`).
 - `command_reopen` accepts `WAITING_CAPACITY` and sets `dead_launcher_recovery` on the paused entry. A follow-up with that mark refuses a replacement thread when `thread/resume` fails.
 - `codex_mesh.command_end` keeps the staff row and thread id; a second `end` on an ended worker retries the cleanup. `workers.ending_worker` records the end and keeps the worker in the unit ledger.
-- Each caller that removes a worker for good retires the row itself: unit retirement (`workers.end_unit`), `remove_workers.py`, `worker.py end`, `worker_fill.end_friend` (after `command_end` returns 0; on `staff.StaffRefused` it stops the server, then returns 1) and `assign.py` `execute_astra_review` (end, release the role, then retire through `session_staff.worker_row`).
+- Unit retirement stops workers through `stop_resume.stop_unit_workers`.
+- `remove_workers.py` resolves staff membership before it calls the worker command.
+- The held `worker.py` and `assign.py` callers retain their mesh interfaces until round 2.
 - The account move tries each recorded server, the recorded port first, and uses the one that has the thread loaded. When `_server_availability` cannot prove that no server holds the thread, it refuses.
 
 **Files:**
 - `scripts/direct/assign.py` — reopen on a dead launcher; the Astra reviewer retire.
 - `scripts/agents/codex_mesh.py` — end keeps the row; the recovery mark; the account move server choice.
 - `scripts/direct/workers.py` — the unit ledger keeps ended workers.
-- `scripts/production/worker_fill.py` — the end-friend retire.
 - `docs/as-built/long-lived-workers.md`, `docs/as-built/session-roster.md` — end, reopen and retire rules.
-- `scripts/direct/test_assign_launcher_reuse.py`, `scripts/agents/test_codex_mesh.py`, `scripts/ask_a_friend/test_end_friend.py`, `scripts/direct/test_workers.py`, `scripts/astra/test_astra_review.py` — the tests.
+- `scripts/direct/test_assign_launcher_reuse.py`, `scripts/agents/test_codex_mesh.py`, `scripts/direct/test_workers.py`, `scripts/astra/test_astra_review.py` — the tests.
 
 **Binds later work:** `codex_mesh.py end` never retires a staff row; a new caller that ends a worker for good retires it after `end` exits 0.
 
@@ -1497,3 +1498,64 @@ A change review row whose Change text was edited still covers its own change, an
 **Gotchas:** a row does not record its step. With two held steps uncovered, an edited row covers nothing by its hash, and the scan adds a duplicate row rather than hide a change.
 
 **Ruled out:** pairing every `AfterStep` change in commit order — with two steps released out of order, an edited row covers the wrong step and hides the other change.
+
+## Phase 30 consumer conversion
+
+Live readers use staff membership and backend evidence.
+The board, roster and sweep use pane observations.
+Shutdown keeps Claude child commands in `ClaudeChildResume`.
+`refusal_watch.py` owns `QUOTA_REFUSAL`.
+The unused `worker_fill.py` and its test are removed.
+
+Round 2 removes the held launcher and shutdown dependencies.
+It deletes `codex_mesh.py`, allocation helpers and worker ledgers.
+It removes `PausedSeat`, transport pins and `unit_runs.worker_transport`.
+It moves sandbox constants into `worker_panes.py`.
+It renames the detached command modules, config and record folder.
+Historical readers keep completed run rosters.
+
+### Phase 8s — A hold that names any showrunner waits  · status: done
+
+#### As-built
+
+A holding or waiting status that names any showrunner, or a sibling unit, reads as a wait on an outside party, and stall-watch does not bump the unit.
+
+- `scripts/production/stall_watch.py` builds the peers for `status_defers_bump` and `holding_names_outside` from the one staff snapshot of the pass: every `showrunner` row whose worktree is not removed, the unit's sibling units less its own row, the configured session and the production name. `PaneInspection` carries the peers. Showrunner names are read once per pass, and sibling names once per parent.
+- A unit of another production matches as `<name>-unit` through the config pattern.
+- `config/stall_watch.conf` no longer names `natedev` in `external_owner_pattern` or `holding_party_pattern`; the staff record supplies it.
+- Own names still win: `names_outside` is unchanged.
+
+**Files:**
+- `scripts/production/stall_watch.py` — peer names per inspection.
+- `config/stall_watch.conf` — outside-party patterns without fixed showrunner names.
+- `scripts/production/test_stall_watch.py` — a cases table in `test_holding_names_a_peer_or_showrunner_anywhere_in_the_line` (a natedev unit waiting on sdlc waits), and a row in `test_own_work_order_and_own_names_do_not_hold_the_unit` (an unrelated `style` unit in the status still bumps).
+
+**Gotchas:** a sibling unit name that is a common word still defers a bump.
+
+**Ruled out:** every staff name as a peer — many unit names are common words (style, verify, queue) and hide an own-work hold.
+
+### Phase 8t — The units table shows board status, phase work, other work and queued work  · status: done
+
+**Depends on:** none
+
+#### As-built
+
+- `/showrunner:units` prints `| Unit | Status | Phase | Non-Phase Work | Queued |`.
+- `session_state.classify(member, activity)` gives a unit session's state in this order: an exit record gives `exited`; a pause record gives `paused`; no live session gives `exited`; a live `busy` session gives `busy`; else `idle`. The accounts board (`_read_local_role_sessions`) and the units table both call it. The board keeps its account attribution and worker counts in `accounts.py`; its workers role keeps busy and idle only.
+- A live herdr pane process (Claude or Codex) counts as a live session. A unit whose worktree is on another machine, with no hold, shows `on <machine>`.
+- Phase shows `phase <n> of <m> — <task>` for an open plan phase. The task is the newest run's open step, else the phase title. With no open phase the cell keeps the old texts. Each cell is cut to 80 characters with `…`.
+- Non-Phase Work reads only each unit's newest run (`open_unit_runs`). A finished run gives `—`. Otherwise it shows `<phase id>: <open step>` for open phases that are not plan phases, plus ` +<k> more`.
+- `/unit:queue add <text> | done | clear | show` runs `unit_queue.py`. The list is at `UNIT_QUEUE_STATE_DIR/<staff id>.json`, default `~/.local/state/unit-queue/`. The Queued cell shows the first item plus ` +<n> more`, or `—`. An unreadable file gives `queue unreadable` and one stderr line; `clear` does not read the old list, so it repairs the file.
+
+**Files:**
+- `scripts/accounts/session_state.py` — `classify`, `staff_state` and the activity types.
+- `scripts/accounts/accounts.py` — the board calls `classify`.
+- `scripts/production/live_units.py` — `LiveUnit.member`, `staff_status`, pane-process and other-machine status.
+- `scripts/production/unit_phases.py` — the table cells and the newest-run reader.
+- `scripts/production/unit_queue.py`, `commands/unit/queue.md` — the queue.
+- `commands/showrunner/units.md` — the columns and statuses.
+- `docs/as-built/staff-accessors.md` — rows for the two new staff readers.
+
+**Gotchas:** A held astra-role run never records a finish, so it can be a unit's newest run and show in Non-Phase Work.
+
+**Ruled out:** Reading every open run of a unit's current session — old runs never record a finish, so 64 stale runs showed as open.

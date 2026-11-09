@@ -25,7 +25,6 @@ from scripts.lib import conf
 STATE_NAME = "vault_pull.json"
 LOCAL_VAULT = Path("/home/natepiano/rust/hanadocs")
 REGISTRATION = Path.home() / ".claude/scripts/production/update_registration.py"
-PRODUCTION = Path.home() / ".claude/docs/plans/natedev-production.md"
 UNREACHABLE_GRACE_S = 24 * 60 * 60
 COMMAND_TIMEOUT_S = 120
 ORIGIN_MAIN = "refs/remotes/origin/main"
@@ -225,7 +224,7 @@ def remote_outcome(result: subprocess.CompletedProcess[str]) -> MacMerged | Pull
 
 
 def publish_mac(merged: MacMerged) -> PullOutcome:
-    fetched = mac_git("fetch", f"{sync.peer_name()}:rust/hanadocs", f"main:{MAC_MAIN}")
+    fetched = mac_git("fetch", f"{sync.peer_name()}:rust/hanadocs", f"refs/heads/main:{MAC_MAIN}")
     if isinstance(fetched, (VaultCommandFailed, MacUnreachable)):
         return fetched
     if not ci.warm():
@@ -366,8 +365,9 @@ def question_text(since: float) -> str:
 
 
 def registration(command: str, *args: str) -> bool:
+    production = conf.read("build_targets").text("vault.question_production")
     result = run([
-        "python3", str(REGISTRATION), command, "--production", str(PRODUCTION), *args,
+        "python3", str(REGISTRATION), command, "--production", production, *args,
     ], COMMAND_TIMEOUT_S)
     return result is not None and result.returncode == 0
 

@@ -24,7 +24,8 @@ from typing import Literal, NamedTuple, TypedDict, cast
 from scripts.buildlog import store
 from scripts.buildlog import index as buildlog_index
 from scripts.buildlog.step_outputs import indexed_argv
-from scripts.lint.memory_admit import expected_peak, git_identity, test_threads, read_memory_config
+from scripts.build_queue.admission_records import test_threads, read_memory_config
+from scripts.build_queue.step_estimator import expected_peak, git_identity
 from scripts.lib.user_zone import user_zone  # noqa: E402
 
 BLOCK_S = 6000

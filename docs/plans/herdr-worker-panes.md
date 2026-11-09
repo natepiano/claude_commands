@@ -3368,6 +3368,8 @@ Report: A pane worker's Codex launch sets the auto-compact limit from config, ne
 
 **Decision (sdlc [b384f355], 2026-11-08):** compaction runs between turns only (Phase 34 item 5). This phase sets `UNIT_COMPACT_ABOVE_TOKENS` to the measured cheaper point; it adds no launch limit. One long turn can grow past the point until it ends; Codex's own full-window compaction covers it. Send natedev both numbers and the main hash.
 
+**Constraint from Phase 28f:** a done worker's pane closes after each pass, and its next pass resumes the same conversation in a new pane (`scripts/astra/test_design_roles.py:160`). Run the threshold compaction after the saved conversation reopens and before the next prompt is typed. Test row: complete and close one pass, resume its conversation in a new pane, compact above the limit, and keep the native identity.
+
 The Work Order is written at the phase start.
 
 ### Phase 38 — One worker's assign reads only its own pane and row · status: done
@@ -3407,7 +3409,7 @@ An assign judges only the worker it uses. `worker_panes.observe_selected(parent,
 
 ### Phase 34 — A worker's turn end tells the director; no shell waits  · status: todo
 
-**Depends on:** Phase 28 (the question path), and the agents unit's phase 15b on sdlc (sdlc [4bc87048], 2026-11-07: 15b owns `scripts/production/worker.py` and its test until it merges; build this phase's `worker.py` edits on it). sdlc accepted both launch-line hook calls. Phase 19 moved to hierarchies-unit and does not wait for this phase (sdlc [e5bdea18], 2026-11-07): hierarchies moves the Stage 2 file watchers out of `codex_mesh` under its Spec item 5. Build this phase's wait-loop deletion on that move.
+**Depends on:** Phase 28 (the question path), Phase 28d (the Claude DONE reply is read), and the agents unit's phase 15b on sdlc (sdlc [4bc87048], 2026-11-07: 15b owns `scripts/production/worker.py` and its test until it merges; build this phase's `worker.py` edits on it). sdlc accepted both launch-line hook calls. Phase 19 moved to hierarchies-unit and does not wait for this phase (sdlc [e5bdea18], 2026-11-07): hierarchies moves the Stage 2 file watchers out of `codex_mesh` under its Spec item 5. Build this phase's wait-loop deletion on that move.
 
 The user (2026-11-07, through sdlc [4fdbe4b7]): "yes i definitely want this - keeping a sahell around to watch is inelegant and doesn't satisfy my beauty requirements". sdlc's design:
 
@@ -3415,18 +3417,21 @@ The user (2026-11-07, through sdlc [4fdbe4b7]): "yes i definitely want this - ke
 2. A turn that ends without the dispatch `DONE` line is a question: the same hook sends the director the question (herdr pane state confirms the worker waits).
 3. `assign.sh` types the job into the pane and returns at once. No shell waits on the worker.
 4. Every caller moves at once; no record keeps the waiting-shell mode. Delete the wait loop in this phase (`worker._wait_for_dispatch` and `_wait_for_ready`, `scripts/production/worker.py:290-316`).
-5. **Compact an idle worker before new work (Phase 35).** Before `worker.dispatch` types a job, compact a Codex worker whose recorded context is above `UNIT_COMPACT_ABOVE_TOKENS` (`config/direct.conf:65`), between turns. Phase 35 removed the in-turn limit that made long threads compact in a loop.
+5. **Compact an idle worker before new work (Phase 35).** Before `worker.dispatch` types a job, compact a Codex worker whose recorded context is above `UNIT_COMPACT_ABOVE_TOKENS` (`config/direct.conf:65`), between turns. Phase 35 removed the in-turn limit that made long threads compact in a loop. After Phase 28f a done worker's pane is closed: compact after the saved conversation reopens in its new pane and before the next prompt is typed. Test row: complete and close one pass, resume its conversation in a new pane, compact above the limit, and keep the native identity.
 6. **The pass rule of Phase 22 (C1210) under the hook (user, through sdlc [41b8d0c7], 2026-11-07).** A `DONE` pass whose only open runs are finished completes, with one `run <id> finished, but its result is not in the transcript` line.
     1. The hook decides that a pass is done with the one rule in `worker._dispatch_turn` (`dispatch_receipt`). Call it; do not write a second copy.
     2. A turn end with `DONE` while a background run still runs is not a result yet. The run's own completion checks the pass again when it finishes.
     3. A finished run whose result never reached the transcript puts the anomaly line in the director's message, and the pass completes.
     4. One test for each of 6.1, 6.2 and 6.3.
 
-7. **Submission and completion are two outcomes (plan review after Phase 32).** Today `assign.py` reads a successful dispatch return as completion, and its Astra path ends the worker and releases the role. Give submission and completion named outcomes. The completion actions (finish the pass, end or release a held role) move to the hook. Tests: after submission returns, the pass stays active and the role stays held.
+7. **Submission and completion are two outcomes (plan review after Phase 32).** Today `assign.py` reads a successful dispatch return as completion, and its Astra path ends the worker and releases the role. Give submission and completion named outcomes. The completion actions (finish the pass, end or release a held role) move to the hook. Tests: after submission returns, the pass stays active and the role stays held. **Constraint from Phase 28f:** `worker.dispatch` (`scripts/production/worker.py:310`), not `assign.py`, now records `completed` (`progress_history.complete_dispatch(run, slot, instance_id)`) and closes the pane under one worker lock. The launcher's only pass-end record is `finish-pass --status error` for a failed managed Astra review (`assign.py` `execute_astra_review_herdr`), before `worker.py end`. That record moves to the hook with the no-DONE outcome: record `error` before `worker.py end`, and release the hold only after the end succeeds. A managed review hold (`astra_roles.hold` with `ExecProcess`) ends when the launcher exits; give it a named dispatch lifetime that survives the launcher's exit and ends through the hook. Tests: terminal no DONE records `error` before the end; the hold is released after a successful end and kept when the end fails; `live_roles` keeps the hold after the launcher exits.
 8. **One completion rule (plan review after Phase 32).** The C1210 exception is in `_dispatch_turn` after a quiet wait, not in `dispatch_receipt`, which returns `DispatchWaitingForRuns` when a finished run's result is absent. Extract one completion decision before the wait is deleted. The hook and a detached run's completion both call it; 6.4's tests go through both.
 9. **Default policy is a named state.** `worker.dispatch` and `worker_panes.start_or_resume` take `LaunchPolicy | None`, where `None` means the role's configured policy. When this phase changes those signatures, replace `None` with a named state (for example `ConfiguredRolePolicy`).
+10. **A slow start is not a stall (Phase 28e, folded in by sdlc [57452db1]).** When `assign.sh` types the job, herdr's `agent_prompt_stalled` (no working state within 5000 ms) is not a failure. The transcript records submission (`dispatch_receipt`); read it and return the submitted outcome. Test row: herdr reports the prompt stalled, the prompt is in the transcript, and the submission succeeds. Phase 28g added a configured start wait (`WORKER_PROMPT_START_SECONDS`, `_agent_command` `wait-start`) on the current dispatch path; at the merge keep this item's code and remove that key and action if nothing reads them.
 
-**Constraint from Phase 28:** a blocked worker gives exit 4, prints `question: <worker> pane <pane>` and the pane lines (`worker._blocked_question`), and the director answers with `worker.py answer`. (1) A Claude `Stop` hook runs after Claude finishes its reply, so an unanswered `AskUserQuestion` blocks before the hook runs. Give the blocked state its own event to the director (herdr pane state `blocked`), and keep the existing wait path until Phase 28a's answer proof passes. (2) A turn end without `DONE` is not always a question: a pending detached run, a pending friend reply and `NO_DONE` are other outcomes. Name each outcome; test that pending work keeps its pass with no question message and no second submission.
+**Constraint from Phases 28 and 28a:** a blocked worker gives exit 4, prints `question: <worker> pane <pane>` and the pane lines (`worker._blocked_question`), and the director answers with `worker.py answer`. (1) Only a Codex worker stops on a question: a Claude pane worker has no `AskUserQuestion` tool (28a director proof). A Codex question ends no turn, so give the blocked state its own event to the director (herdr pane state `blocked`). Question handling is Codex-only. The 28a Codex answer proof passed; the Claude completion proof is Phase 28d's, so this phase depends on 28d before Claude completion moves into the Stop hook. (2) A turn end without `DONE` is not always a question: a pending detached run, a pending friend reply and `NO_DONE` are other outcomes. Name each outcome. Test that pending work keeps its pass id and saved launcher arguments, sends no question or recovery message, and submits no second prompt; after a friend's reply and the matching `DONE`, the same pass completes.
+
+**Question route (sdlc [cb2d951c], 2026-11-08):** no watcher, and no blocked-event producer. Codex has no hook at a question; `notify` runs only at `agent-turn-complete`. Worker panes launch Codex with `--ask-for-approval never` (`worker_panes.py:670`), so a worker meets no approval prompt in a turn. A question the worker writes in its reply ends the turn, and the turn-end hook sends it. The one gap: an unexpected screen prompt ends no turn, and the director finds it only when it reads the pane. The docs this phase changes state that gap.
 
 **Constraint from Phase 42:** `worker.restore(parent, only=..., account=..., started_panes=...)` restores selected rows with `worker_panes.observe_selected`, and `restart.start_row` returns the pane from `started_panes`. `worker_panes.start_or_resume` and `launch_environment` take `accounts.AccountSelection` and use it only for a worker of its own family. When this phase changes those signatures (item 9), keep the selected restore, the typed account and the returned pane; the acceptance gate adds `scripts.shutdown.test_restart`, `scripts.shutdown.test_pane_restore` and `test_launch_environment_matches_the_policy_family_for_typed_accounts`.
 
@@ -3437,6 +3442,61 @@ The user (2026-11-07, through sdlc [4fdbe4b7]): "yes i definitely want this - ke
 **Restructure (sdlc [a3ae4ca3], 2026-11-07):** fix-rounds-unit cuts `commands/unit/direct.md` to a core and moves mode-only sections to files read on demand. Merge sdlc after it lands, then put this phase's `direct.md` edits into the new layout.
 
 **Files (first list; the Work Order at the phase start settles it):** `scripts/production/worker.py` and `test_worker.py`; `scripts/direct/assign.py`, `assign.sh`, `progress_history.py` and their tests; `scripts/herdr/worker_panes.py` and `test_worker_panes.py`; one new turn-end hook script in `scripts/herdr/` with its test; `commands/unit/direct.md`, `docs/direct/launch_implementation.md`, `docs/direct/dual_review.md`; `docs/as-built/long-lived-workers.md` and `herdr-adoption.md`.
+
+**Packaging (panes-unit, 2026-11-08, from sdlc [f9d7e5d2]):** Phase 34 runs beside Phase 28f in its own worktree, `/home/natepiano/worktrees/panes-34` on branch `natedev-panes-34`, made from the Phase 28b checkpoint. Phase 28f also edits the DONE path in `worker.py`, so this branch merges the 28f checkpoint, the 28d fix (unit-board) and the 28c fix (models) before its gate. 28c makes every `_dispatch_turn` failure line after the prompt is typed say `prompt delivered to pane <pane>` (sdlc [d0df7cb8]); keep that rule wherever those outcomes move. The restored Codex launch policy (`scripts/shutdown/pane_record.py` `resume_arguments`) is models Phase 4; do not build it here. The Claude Stop-hook part (item 1, Claude) is built last, on 28d.
+
+#### Work Order
+
+**Goal:** `assign.sh` types the job into the worker's pane and returns at once. When the worker's turn ends, a hook that the launch line gives the agent saves the result, completes the pass, and sends the director one message. No shell waits on a worker.
+
+**Spec:**
+
+1. Items 1-10 above are the spec, with the constraints from Phases 28, 28a, 32, 39 and 42.
+2. The hook is one new script, `scripts/herdr/turn_end.py`, for both families. Codex runs it as its `notify` program, given on the launch command line (`-c notify=[...]`) by `worker_panes` launch policy. Claude runs it as its `Stop` hook, given at launch with `--settings <json>`. Write no `~/.codex*` or `~/.claude*` settings file.
+3. The hook finds the worker row by the native thread id in the hook input, then the row's active pass. With no worker row or no active pass, it does nothing and exits 0: a director or other agent session also runs the hook.
+4. One completion decision (item 8) is the only rule. `_dispatch_turn`'s quiet-wait exception moves into it. The hook and a detached run's completion call it.
+5. On completion the hook does what `worker.dispatch` does today after exit 0 (Phase 28f), under the same worker lock: save the reply where the launcher saves it, finish the pass in the recorder, run the role's completion actions (item 7), and close the pane through the Phase 28f close path. Move `worker.dispatch`'s completion sequence to the hook, with `complete_dispatch(run, slot, instance_id)` and the submitted dispatch's instance id. Test row: a delayed hook for dispatch A does not change a replacement dispatch B.
+6. The message to the director names the worker, the phase, the outcome (`done`, `question`, `no DONE`, `waiting on runs`) and the reply path, through `scripts/message/send.py`. When the close cannot finish, the pass stays completed and the message carries the one `anomaly:` reason and the kept pane. Test rows: a kept close and an outside-tab refusal keep the pane and send one message.
+7. `assign.sh` exit codes: submission returns 0. Refusal, busy, retained and uncertain keep their codes. Exit 3 (no DONE) and exit 5 (stalled) leave the launcher; their cases reach the director as hook messages.
+8. Every caller moves at once (item 4): `commands/unit/direct.md` <LongLivedWorkers/> and <DispatchContract/>, `docs/direct/launch_implementation.md`, `docs/direct/dual_review.md`, the `/unit:worker` and `/showrunner:worker` commands, and `docs/as-built/long-lived-workers.md` and `herdr-adoption.md` describe a dispatch that returns at once and a hook message that resumes the director. The director ends its turn after the dispatch and acts on the hook message. Also `scripts/astra/astra_review.py` (it reads the reply after the launcher returns) and `scripts/astra/design_roles.py` (completed-reply contract): they take named submission outcomes and read a reply only after the hook completes. Test rows: submission returns before the reply exists; two completed dispatches keep one conversation.
+9. Prove the Codex `notify` input fields and the Claude `Stop` input fields from each tool's own documentation or a scratch launch under `/home/natepiano/scratch/herdrcheck/` through `assign.sh`. Start no bare `codex` or `claude` process. Write the fields and their source in the summary.
+10. Add no check, refusal, validation, retry or wait that this list does not name.
+
+**Files:**
+- `scripts/herdr/turn_end.py`
+- `scripts/herdr/test_turn_end.py`
+- `scripts/production/worker.py`
+- `scripts/production/test_worker.py`
+- `scripts/direct/assign.py`
+- `scripts/direct/assign.sh`
+- `scripts/direct/test_assign_launcher.py`
+- `scripts/direct/test_one_launch_path.py`
+- `scripts/direct/progress_history.py`
+- `scripts/direct/test_progress_history.py`
+- `scripts/herdr/worker_panes.py`
+- `scripts/herdr/test_worker_panes.py`
+- `commands/unit/direct.md`
+- `docs/direct/launch_implementation.md`
+- `docs/direct/dual_review.md`
+- `docs/as-built/long-lived-workers.md`
+- `docs/as-built/herdr-adoption.md`
+- `scripts/agents/mesh_runs.py`
+- `scripts/agents/test_mesh_runs.py`
+- `scripts/direct/test_assign_launcher_review.py`
+- `scripts/astra/astra_roles.py`
+- `scripts/astra/test_astra_roles.py`
+- `scripts/astra/astra_review.py`
+- `scripts/astra/test_astra_review.py`
+- `scripts/astra/design_roles.py`
+- `scripts/astra/test_design_roles.py`
+
+**Workers:** `1 writer`.
+
+**Acceptance gate:**
+- `scripts.herdr.test_turn_end`, `scripts.agents.test_mesh_runs`, `scripts.astra.test_astra_roles`, `scripts.astra.test_astra_review`, `scripts.astra.test_design_roles`, `scripts.production.test_worker`, `scripts.direct.test_assign_launcher`, `scripts.direct.test_one_launch_path`, every other `scripts.direct.test_assign_*` module, `scripts.direct.test_progress_history`, `scripts.herdr.test_worker_panes`, `scripts.shutdown.test_restart` and `scripts.shutdown.test_pane_restore` pass, with the test rows that items 6.4, 7, 10 and the Phase 28 constraint name, and `test_launch_environment_matches_the_policy_family_for_typed_accounts`.
+- basedpyright on the changed Python files reads `0 errors, 0 warnings, 0 notes`.
+- The full gate passes.
+- Director proof after the gate, in a test run under `/home/natepiano/scratch/herdrcheck/`: a Codex pass and a Claude pass through `assign.sh` each return at once; no launcher process stays; each turn end completes its pass, closes its pane and sends the director one message; a Codex question reaches the director as a `question` message.
 
 ### Phase 42 — A renamed unit keeps its workers  · status: done
 
@@ -3462,79 +3522,149 @@ The user (2026-11-07, through sdlc [4fdbe4b7]): "yes i definitely want this - ke
 
 ### Phase 28a — A new Claude worker gets its first prompt  · status: done
 
-**Depends on:** Phase 28 (the question path) and Phase 42 (it runs after 42: cargo-liner waits on 42).
+#### As-built
 
-Found by Phase 28's director proof, 2026-11-08 (test run `/home/natepiano/scratch/herdrcheck/answer-1794138524`). Both defects were there before Phase 28.
-
-1. Live evidence (Phase 42 repair, 2026-11-08): a Codex worker does block. impl6 asked a question with Codex's question tool (pane shows `? 1 question`, `shift+← to answer`); herdr reported `blocked`, and the launcher gave exit 4 with the `question:` line. `worker.py answer` then failed: `herdr agent prompt: agent_blocked: agent w16:p63 is blocked and requires interactive input`. The director answered by hand: `herdr pane send-keys <pane> shift+left`, `herdr pane send-text <pane> "<answer>"`, then `send-keys <pane> enter` twice (the first enter did not submit). Make `answer` use that path for a blocked Codex pane, and the Claude equivalent for `AskUserQuestion`. Approval prompts stay off (`--ask-for-approval never`). `Herdr.send_keys` gives `check_target` no expected text, so it can reject the Enter after the answer is in the question box, and herdr.py has no guarded `send_text`. Add one answer operation in `scripts/herdr/herdr.py` that keeps the target check and passes `check_target` the expected box text before each key; `scripts/herdr/herdr.py` and its tests are in this phase's files.
-2. A new Claude worker gets no first prompt. `worker_admission.transcript_source` raises "no source transcript found" for a Claude conversation that has no transcript yet, so `dispatch_receipt` returns evidence unknown and the launcher exits 8 with "no prompt sent". A new Codex conversation writes its rollout file at start, so Codex is not affected. Also check why the new Claude pane started in the director's worktree and not in `--cwd`.
-3. `worker_panes.py close` and `worker.py end` refuse a worker whose last pass is `interrupted` ("launcher has not recorded a completed pass"), so the proof pane `answerproof` (w16:p6A) stays open.
-4. `worker_panes.py close` reads a short shell prompt-hook process (direnv, with its bash child) in a stopped worker's pane as other work and refuses (cargo-liner [7ac1dfcc], 2026-11-08, pane p17). The process ended seconds later. A retry closes the pane.
-
-Cause of the cwd question (phase start, 2026-11-08): `worker_panes._start_locked` opens every worker pane, Codex and Claude, in the holder's worktree (`owner.worktree.path`), and a Codex resume passes the same directory with `--cd`. `assign.sh --cwd` reaches only the prompt. The proof passed a scratch `--cwd`, so the pane and `--cwd` differed. This is the same for both families and is not a Claude defect; a unit dispatches with `--cwd` set to its own worktree. No change.
-
-Defect 4: sdlc [1d1e7440] chose answer C (2026-11-08): when close sees another process in a stopped worker's pane, it reads the pane once more after about 1 s and refuses only if that process is still there. C adds a wait and a second read. The user's rule says the user approves each added check, so it is filed as a user question. It enters a follow-up phase when the user approves it.
-
-Director proof, 2026-11-08 (test run `/home/natepiano/scratch/herdrcheck/answer28a-1794150217`, branch scripts):
-- Codex: impl6 asked "May I edit outside.txt" with its question tool; the launcher gave exit 4 and `question: impl6 pane w16:p6W`. `worker.py answer impl6 --text "Yes"` exited 0, and the pane showed the answer under the question. The rerun of the saved launcher exited 0 with `DONE a776d152-…`, the same dispatch, and the worker wrote `outside.txt`.
-- Claude: the new-worker first prompt now reaches the pane (item 4): answerproof read the prompt and replied with its DONE line. A Claude worker session has no `AskUserQuestion` tool (the worker said so and a tool search found none), so a Claude worker never stops on a question. Item 3 needs no Claude key sequence; a Claude worker keeps `prompt`.
-- Claude: the launcher and its rerun both gave exit 3, although the transcript ends with the DONE line. Cause: the Claude transcript now holds `api-request-blob` records whose `message.role` is `user` and whose text holds the whole request, the dispatch reminder included. `worker_admission.transcript_entry` reads them as user turns, so `transcript_receipt` stops reading the reply. This was there before this phase (28a did not change `transcript_entry`). It moves to Phase 28d with the Claude pass-completes proof and the `answerproof` close (its newest pass is not complete, so close refuses).
-
-#### Work Order
-
-**Goal:** a director answers a worker's question with `worker.py answer` and reruns the saved launcher, and the same pass completes. A new Claude worker gets its first prompt. An idle worker with an interrupted pass closes.
-
-**Spec:**
-
-1. Add one answer operation to `scripts/herdr/herdr.Herdr`, for example `answer_question(pane, text, *, target)`. It sends the Codex question keys from the live evidence: `shift+left`, the answer text (`herdr pane send-text`), then `enter` two times. Before each key send, it calls `check_target(target, action="keys", ...)` with the composer text it expects at that point (empty before the text, the answer after it), so the target check does not reject the Enter after the answer is in the box. Use the existing `_send_keys` and `run` helpers; add no second target check.
-2. `worker.answer` uses item 1 when the worker's herdr status is `blocked`, and keeps `client.prompt` for an idle worker. Read the status from the `OpenWorker` that `observe_worker` returns.
-3. A Claude worker: do not use key sequences that no evidence shows. The director's Claude proof (below) records the `AskUserQuestion` keys. When the proof shows a Claude sequence, a repair round adds it to item 1's operation. Until then, item 2 applies only to a Codex worker; a blocked Claude worker keeps the current `client.prompt` path.
-4. `worker.dispatch_receipt` reads a Claude worker that has no transcript file as an empty transcript: the dispatch is not submitted (`DispatchNotSubmitted`), so the launcher types the first prompt. `scripts/direct/claude_worker.py:278` already uses this rule; move it to one place in `worker_admission` that both call. A Codex worker with no rollout file keeps its current result.
-5. `worker_panes.can_close` accepts a last pass with status `interrupted` the same as `canceled` when the agent is idle or done. `worker.py end` uses `close`, so it gets the same result.
-6. Add no check, refusal, validation, retry or wait that this list does not name.
+- `Herdr.answer_question(pane, text, *, target)` (`scripts/herdr/herdr.py`) answers a Codex question: `shift+left`, the answer text through send-text, then `enter` two times. Before each key it calls `check_target` with the composer text it expects at that point (empty, then the answer).
+- `worker.answer` sends a blocked Codex worker's answer through `answer_question`. Every other worker, a Claude worker included, gets `client.prompt`.
+- `worker_admission.conversation_entries(row, backend, changed)` reads a worker's transcript. A Claude worker with no transcript file yields no entries, so the dispatch is `DispatchNotSubmitted` and the launcher types the first prompt. `worker.py` and `claude_worker.py` both call it; `transcript_receipt` takes entries. A Codex worker with no rollout file keeps its earlier result.
+- `worker_panes.can_close` accepts a newest pass `interrupted` the same as `canceled` for an idle or done agent; `worker.py end` gets the same result through `close`.
+- Every worker pane, Codex and Claude, opens in the holder's worktree (`owner.worktree.path`); `assign.sh --cwd` reaches only the prompt.
+- `docs/as-built/herdr-adoption.md` "Worker questions" names the key path for a blocked Codex worker.
 
 **Files:**
-- `scripts/herdr/herdr.py`
-- `scripts/herdr/test_herdr.py`
-- `scripts/production/worker.py`
-- `scripts/production/test_worker.py`
-- `scripts/production/worker_admission.py`
-- `scripts/production/test_worker_admission.py`
-- `scripts/direct/claude_worker.py`
-- `scripts/herdr/worker_panes.py`
-- `scripts/herdr/test_worker_panes.py`
-- `docs/as-built/herdr-adoption.md`
+- `scripts/herdr/herdr.py` — `answer_question`
+- `scripts/production/worker.py` — answer routing
+- `scripts/production/worker_admission.py` — `conversation_entries`, `transcript_receipt`
+- `scripts/direct/claude_worker.py` — calls `conversation_entries`
+- `scripts/herdr/worker_panes.py` — `can_close`
+- `docs/as-built/herdr-adoption.md` — Worker questions
 
-**Workers:** `1 writer`.
+**Binds later work:** a Claude pane worker has no `AskUserQuestion` tool and never stops on a question; question handling is Codex-only. The Claude transcript reader still reads `api-request-blob` records as user turns, so a Claude pass ends exit 3 until "A Claude worker's DONE reply is read" lands. Defect 4 (a short direnv prompt-hook process makes `close` refuse once; a retry closes) waits on the user's answer to a 1 s second read.
 
-**Acceptance gate:**
-- `scripts.herdr.test_herdr`, `scripts.production.test_worker`, `scripts.production.test_worker_admission` and `scripts.herdr.test_worker_panes` pass. New test rows: the answer operation sends `shift+left`, the text and two `enter` keys in that order, with the expected composer text at each target check; `worker.answer` on a blocked Codex worker uses it and on an idle worker uses `prompt`; a blocked Claude worker still uses `prompt`; a Claude worker with no transcript file gives `DispatchNotSubmitted`; an idle worker whose last pass is `interrupted` closes.
-- `docs/as-built/herdr-adoption.md` "Worker questions" names the key path for a blocked Codex worker.
-- basedpyright on the changed Python files reads `0 errors, 0 warnings, 0 notes`.
-- The full gate passes.
-- Director proof after the gate, for both families, in test runs under `/home/natepiano/scratch/herdrcheck/`: a Codex worker and a Claude worker, each asked to edit a file outside its paths, stop on the question; the director answers through `worker.py answer`, reruns the saved launcher, and the same pass completes with no second dispatch. A Claude worker needs a private `MODELS_CONFIG_FILE` with `direct=claude`. Close the proof pane `answerproof` (w16:p6A) with `worker_panes.py close` after item 5 lands. (Proof result above: Codex passed; the Claude part moved to Phase 28d.)
+**Gotchas:** `prompt_in_input` reads no composer for the Codex `›` marker; do not use it to confirm typed text before Enter. The first `enter` after a Codex answer does not submit; the second does.
 
-### Phase 28b — A worker's pane closes when its agent ends  · status: todo
+**Ruled out:** a Claude question key sequence (no tool, no evidence); a `prompt_in_input` confirmation before Enter; changing the pane working directory to `--cwd`.
 
-**Depends on:** Phase 28a (both edit `worker_panes.can_close` and close). sdlc [e19b58aa], 2026-11-08.
+### Phase 28b — A worker's pane closes when its agent ends  · status: done
 
-Phase 27's rule is "only working workers hold a pane". Today only a manual close after an accepted pass releases a pane. devtools [26af13ea]: when a worker's agent ends without an accepted pass (a move, a quota stop or shutdown: `zsh: terminated ... accounts.py exec workers`), the row reads `StoppedWorker` and the pane stays at the shell. `ClosedWorker` rows also leave panes at the shell (devtools review, review2; w16:p27, p28). A row `fix` reads "dispatch role is unavailable"; the herdr proof row `answerproof` reads the same.
+#### As-built
 
-Goal: when a worker's agent ends and nothing is sent to it, its pane closes; the row and thread stay for resume. Restore and moves already reopen only busy workers. Work Order: written at phase start.
+- A worker pane closes when its agent ends. `herdr.WorkerPaneEnvironment` (a `PreparedAgentEnvironment`) makes `launch_prepared_agent` add zsh `precmd`/`preexec` hooks to the pane's launch script. The shell exits with the agent's status when the agent command returns, and herdr closes the pane. No watcher process runs.
+- Unit sessions (`stop_resume.py`, `restart.py`) and side panes (`side_pane.py`) keep their shell; only worker launches use `WorkerPaneEnvironment`.
+- `worker_panes._start_locked` never reuses a stopped worker pane as `herdr.ExistingPane`. It closes a `StoppedWorker` pane, or an `OpenWorker` pane stopped for a policy change, through the close path, then opens the worker in a new pane through `_destination`.
+- Moves (`pane_moves.py`), shutdown and restore (`stop_resume.py`, `worker.py` restore) take a closed pane as the stop proof. A worker with an active dispatch reopens in a new pane on the same native conversation.
+- `Herdr.quit_agent` returns when the pane row reads `NoPane`, the pane reads `PaneAtShell`, or herdr answers `pane_not_found`.
 
-### Phase 28c — A new Codex worker proves only its own conversation  · status: todo
+**Files:**
+- `scripts/herdr/herdr.py` — `WorkerPaneEnvironment`, the worker launch-script exit hooks, `quit_agent`.
+- `scripts/herdr/worker_panes.py` — a start closes a stopped pane and opens a new one.
+- `scripts/accounts/pane_moves.py`, `scripts/shutdown/stop_resume.py` — a closed pane is a stopped agent.
+- `docs/as-built/herdr-adoption.md`, `commands/unit/direct.md` <LongLivedWorkers/> — the new rule.
 
-**Depends on:** Phase 28a. Waits on the user's answer to the open question on old conversation files. sdlc [c0771f21], 2026-11-08.
+**Gotchas:** the dead agent's last screen is lost when its pane closes; sdlc [4e9d6f2f] accepts that.
 
-Cause (proved from the run records, 2026-11-08): a fresh Codex launch proves its thread inside `herdr.launch_rollout_proof`, where the only identity source is the new process's open `rollout-*` descriptors. queue cause28 (pid 195008) published herdr's `review` thread from 11-06, and handler review2 (pid 383931) published the agents `restore` thread from 11-05. Neither foreign rollout got a write then; each process now holds only its own rollout, made 4-6 s after the process started. So at the proof read the process had another thread's rollout open and its own not yet. Why Codex opens the old file is not proved.
+**Ruled out:** a watcher process that closes stopped panes (design B).
 
-Fix when the user approves: in `launch_rollout_proof`, accept only a rollout whose file name time is at or after the process start. One test row. Work Order: written at phase start.
+### Phase 28c — A new Codex worker is linked to its pane when it opens  · status: moved: models-unit (sdlc [f9d7e5d2], 2026-11-08)
 
-### Phase 28d — A Claude worker's DONE reply is read  · status: todo
+**Depends on:** Phase 28b. Runs before 28f (sdlc [a0d6967e], 2026-11-08: new Codex panes fail across units). User via sdlc [df34dab2], 2026-11-08: "there has to be a better way ... to have a showrunner or a unit director open a worker pane and have that be associated with it correctly and instantly". The earlier time filter on rollout files is dropped.
+
+Fault (proved 2026-11-08): a fresh Codex launch proves its thread inside `herdr.launch_rollout_proof`. `herdr.native_process` reads the new process's open `rollout-*` files first. queue cause28 (pid 195008) and handler review2 (pid 383931) each had another thread's old rollout open at that read, so each published the wrong thread.
+
+What Codex gives the caller at start (evidence, 2026-11-08, codex-cli 0.167.0):
+1. No start option sets or prints a thread id. `codex --help` has none; `codex resume [SESSION_ID]` takes one for a resume.
+2. Codex runs its `SessionStart` hook with the new `session_id` in the hook input. herdr's own hook (`~/.codex/hooks.json` -> `~/.codex/herdr-agent-state.sh session`) sends it to herdr with `pane.report_agent_session`, keyed by the pane's `HERDR_PANE_ID`. herdr shows it on the pane row as `agent_session.value`; `herdr.pane_session` reads it. Live rows: herdr-impl7 w16:p60, herdr-review w16:p7C, herdr-review2 w16:p7D and cargo-liner's astra panes each carry their own thread id.
+3. The open rollout file of the pane's process also names the thread, but at start it can name another thread (the fault above).
+
+Design: the link comes from Codex itself, through the pane it runs in. For a new conversation, the worker's thread is the pane's `agent_session` report, read from that one pane row. For a resume, it is the thread id in the launch arguments, as today. Remove the rollout-file identity from the launch proof (`native_process` under `RolloutProofPhase.LAUNCH`). No search across other workers' files, no time filter. This adds no check: it changes which existing source the proof reads first.
+
+Open point for the phase start: prove in a test run under `/home/natepiano/scratch/herdrcheck/` whether Codex sends `SessionStart` when the pane opens or only at the first prompt. If only at the first prompt, the launch reads the report after it types the first prompt, before it publishes the staff row.
+
+sdlc [1a39967b] accepted this design. Prove the `SessionStart` timing in a scratch run with its own pane, never a live unit's pane. If another caller still reads a thread from open rollout files, remove that read in this phase too, so one way remains.
+
+Second case (sdlc [a0d6967e], 2026-11-08): cargo-liner handler Phase 71, three `assign.sh` runs into a new Codex pane since 11:56 EST exit 8 with `pid <n>: current Codex rollout is unavailable or ambiguous` and `running launch policy is incomplete` (run /tmp/claude/unit/21496649-0876-4315-8701-05f8943b788f). The failed pane w12:p2V runs `codex resume 01a1b104-…` and its row has no `agent_session` (12:05 EST), so the resume path must use the argument thread, as the design says; a resumed pane gives no report (Phase 39). The process had no rollout file open at the read. The pane report removes this read. The same scratch run finds the cause of `running launch policy is incomplete` (`worker_panes._live_policy`) and fixes it where it lives.
+
+Test rows: a new launch with a foreign rollout open publishes the pane's reported thread; a new launch with no rollout open publishes the pane's reported thread; a resume publishes its argument thread. Work Order: written at phase start.
+
+### Phase 28d — A Claude worker's DONE reply is read  · status: moved: unit-board-unit (sdlc [f9d7e5d2], 2026-11-08)
 
 **Depends on:** Phase 28a. Found by the 28a director proof.
 
-`worker_admission.transcript_entry` reads Claude `api-request-blob` records (`message.role` `user`, text holding the whole request) as user turns, so `transcript_receipt` stops reading the reply after one, and a Claude pass gives exit 3 with its DONE line in the transcript. Fix: read only Claude records whose top-level `type` is `user` or `assistant`. Acceptance adds the Claude part of the 28a proof (the pass completes with no second dispatch) and closes `answerproof` (w16:p6A) with `worker_panes.py close`. Work Order: written at phase start.
+`worker_admission.transcript_entry` reads Claude `api-request-blob` records (`message.role` `user`, text holding the whole request) as user turns, so `transcript_receipt` stops reading the reply after one, and a Claude pass gives exit 3 with its DONE line in the transcript. Fix: read only Claude records whose top-level `type` is `user` or `assistant`. Acceptance adds the Claude part of the 28a proof (the pass completes with no second dispatch) and closes `answerproof` (w16:p6A) with `worker_panes.py close --interrupt` (its newest pass is `error`, which a plain close refuses; add no close policy). Work Order: written at phase start.
+
+### Phase 28f — A done worker exits and its pane closes  · status: done
+
+#### As-built
+
+- On dispatch exit 0, `worker.dispatch` (`scripts/production/worker.py`) records the pass as completed with `progress_history.complete_dispatch(session_dir, slot, instance_id)` and then closes the pane with `worker_panes.close(parent, name, run=DispatchRun(session_dir), lock=hold)`, under the dispatch's worker lock. The worker row and native conversation stay; the next assign opens a new pane and resumes the same conversation.
+- `complete_dispatch` closes the open pass only when its `instance_id` is the dispatch's own, under the recorder lock, so a late completion never changes a replacement dispatch in the same slot.
+- A close that cannot finish prints one `anomaly:` line; the dispatch exit stays 0. An exit 4 (question) pass keeps its pane.
+- The launcher (`scripts/direct/assign.py`) records no `completed`. Its one pass-end record is `finish-pass --status error` for a failed managed Astra review in `execute_astra_review_herdr`, before `worker.py end`; `worker.dispatch` owns `completed`.
+- `close` selects only the named worker (`SelectedWorkers({name})`) and looks only in the parent's tabs; `_close_target` refuses "worker pane is outside its parent's tabs", and `_layout` reads only the parent's tabs. `close --interrupt` keeps the pane it saw before the quit (`StoppedWorker.before_quit`), so a pane with an old label still closes.
+- `execute_durable` publishes to `staff_worker.REPLY_BESIDE_PROMPT` when `--summary` is absent.
+
+**Files:**
+- `scripts/production/worker.py` — `dispatch` completion and close after exit 0.
+- `scripts/direct/progress_history.py` — `complete_dispatch`.
+- `scripts/herdr/worker_panes.py` — `close`, `_close_target`, `_layout`, `before_quit`.
+- `scripts/direct/assign.py` — Astra failure `error` record; durable reply default.
+- Tests: `scripts/production/test_worker.py`, `scripts/herdr/test_worker_panes.py`, `scripts/direct/test_progress_history.py`, `scripts/astra/test_design_roles.py`, `scripts/direct/test_assign_launcher_review.py`.
+
+**Binds later work:** completion on exit 0 lives in `worker.dispatch` (`complete_dispatch` with the dispatch's instance id, then the close) under one worker lock; the turn-end hook takes over that sequence. The launcher's only pass-end record is the managed Astra review `error`.
+
+**Gotchas:**
+- `worker.py end` keeps a pane whose pass is still `active` ("launcher has not recorded a completed pass"); a failure path that skips its `error` record returns 1.
+- A held role's second dispatch opens a second pane; tests count two launches and prove one native conversation.
+
+**Ruled out:** a rerun of `close --interrupt` that keeps its pre-quit target — a quit closes a post-28b pane by itself.
+
+### Phase 28e — A worker that starts work slowly is not stalled  · status: moved: Phase 34 item 10 (sdlc [57452db1], 2026-11-08)
+
+**Depends on:** Phase 28b (both edit `scripts/production/worker.py`). sdlc [abcdfbec], 2026-11-08.
+
+phases-unit Phase 21 (run 29fc6964): the impl launch exited 5 although its worker opened and worked. The log line: `herdr agent prompt: agent_prompt_stalled: agent prompt produced no observed working or blocked state within 5000 ms; current status is idle`. Cause: `worker._dispatch_turn` types the job with `_agent_command(..., "prompt", line)`, which runs `herdr agent prompt <pane> <text> --wait` with herdr's 5000 ms default. herdr's working state for the pane came later than 5 s, and `_delivery_failure` maps `agent_prompt_stalled` to exit 5 without a read of the transcript. The transcript, not the herdr state, records submission (`dispatch_receipt`).
+
+Fix: after a prompt, `agent_prompt_stalled` is not a failure. `_dispatch_turn` goes on to its wait loop, which already reads `dispatch_receipt` and the worker state and returns the right outcome. No new check, wait or retry. One test row: a prompt that herdr reports stalled, with the prompt in the transcript and the worker then done, completes the pass. Work Order: written at phase start.
+
+### Phase 28g — A resumed worker that starts its turn slowly is not stalled  · status: done
+
+**Depends on:** Phase 28f (both edit `scripts/production/worker.py`). agents 17b also edits `worker.py`: merge origin/sdlc after 17b lands, before the hash. sdlc [417d0b13], 2026-11-08.
+
+Case (natedev, 2026-11-08): accounts phase 1 sent jobs to two resumed Codex workers (impl, fix2). Each assign exited 5: `agent_prompt_stalled: no working state within 5000 ms`. Both panes then showed the prompt as working. A resumed Codex thread takes more than 5 s to show working. herdr 0.9.5 fixes this 5000 ms inside `herdr agent prompt --wait`; no option changes it. Phase 28e (moved into Phase 34 item 10) removes the wait when Phase 34 lands. This phase is the fix until then.
+
+`herdr.py:2376` (`submit_opening_prompt`) already treats `agent_prompt_stalled` as no failure and goes on to its transcript proof. This phase does not edit `herdr.py`.
+
+#### As-built
+
+- `worker._dispatch_turn` (`scripts/production/worker.py`): when `herdr agent prompt --wait` raises `agent_prompt_stalled`, it runs `_agent_command(..., "wait-start")`. That is `herdr agent wait <pane> --until working --until blocked --until done --timeout <ms>`, with the ms from `WORKER_PROMPT_START_SECONDS`. A match goes on to the existing wait loop. A timeout or other herdr error goes to `_delivery_failure` (timeout: exit 5).
+- `config/direct.conf`: `WORKER_PROMPT_START_SECONDS=60`, range 1..600.
+- `herdr.py` is unchanged: `submit_opening_prompt` already treats the stall as no failure.
+
+**Files:**
+- `scripts/production/worker.py` — `_agent_command` `wait-start`; `_dispatch_turn` stall path.
+- `config/direct.conf` — `WORKER_PROMPT_START_SECONDS`.
+- `docs/as-built/herdr-adoption.md` — the start window.
+- Tests: `scripts/production/test_worker.py` (`test_stalled_dispatch_returns_stalled_and_never_retypes`: a delayed start and a start timeout).
+
+**Binds later work:** Phase 34 returns at submission and treats the stall as submitted. At the Phase 34 merge, keep the Phase 34 code and remove `WORKER_PROMPT_START_SECONDS` and the `wait-start` action if nothing reads them.
+
+### Phase 28h — A read of a file in a "marker" folder is not a status-file wait  · status: done
+
+**Depends on:** none. sdlc [e692c5a7], 2026-11-08 (defect from natedev).
+
+Case (natedev, 2026-11-08): `scripts/usage/activity.py` `STATUS_FILE` matched `sentinel`, `marker` and `exit_code` anywhere in a path. A worker's first read of its own prompt in `phases/compaction-start-marker/` counted as a status-file wait. usage-waste-watch told messaging that 28% of its usage was waiting. That was false.
+
+#### As-built
+
+- `status_file_label(paths: Iterable[str])` (`scripts/usage/activity.py`): a path that contains `/proc/loadavg` gives `/proc/loadavg`. Else `STATUS_FILE` matches the file name (`os.path.basename`) only. The labels are as before (`*.log`, `marker`, `exit_code`).
+- The shell statement path passes `rest.split()`. The Claude `Read` path passes `(path,)`, so a Read path with a space stays one path.
+- `STATUS_FILE` no longer holds the `/proc/loadavg` alternative.
+- Review round 1 (review2): F001 a Read path with a space still matched a folder name; F002 `cat </proc/loadavg` lost its wait. Both fixed in round 1 and accepted at closure.
+
+**Files:**
+- `scripts/usage/activity.py` — `status_file_label` and its two callers.
+- `docs/as-built/usage-ledger.md` — the status words match the file name only.
+- Tests: `scripts/usage/test_activity.py` (`test_working_statements`: a `marker` folder; `test_waiting_statements`: `cat </proc/loadavg`; `test_tool_blocks`: Reads in a `marker` folder and in `/tmp/marker folder/`).
 
 ## Reference
 

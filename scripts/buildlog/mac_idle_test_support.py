@@ -138,13 +138,18 @@ def private_sender_acceptance(state: Path, *, before_accept: Callable[[], None] 
         after_accept()
         return 0, "accepted by private transport", ""
 
-    def discover(address: str, _scope: send.RecipientResolutionScope,
-                 _observed: object, **_kwargs: object) -> send.DeliveryRoute:
-        return send.CodexWorkerRecipient(address, "fixture", str(state / "seat"))
+    def discover(address: str, *arguments: object, **keywords: object) -> send.DeliveryRoute:
+        del arguments, keywords
+        return send.ClaudeRecipient(address)
+
+    def relay(message: send.Message, timeout: float) -> send.Result:
+        code, output, errors = send.run([message.to], "", timeout)
+        return send.Result("sent" if code == 0 else "failed", output or errors)
 
     with mock.patch.object(staff, "snapshot", return_value=staff.StaffSnapshot(())), \
          mock.patch.object(process_start, "process_start", side_effect=sender_process_start), \
          mock.patch.object(sessions, "running_sessions", return_value=[]), \
          mock.patch.object(send, "STATE", state), mock.patch.object(send, "wrong_template", return_value=None), mock.patch.object(send, "run", side_effect=transport), \
-         mock.patch.object(send, "resolve_recipient", side_effect=discover):
+         mock.patch.object(send, "resolve_recipient", side_effect=discover), \
+         mock.patch.object(send, "relay", side_effect=relay):
         yield fixture

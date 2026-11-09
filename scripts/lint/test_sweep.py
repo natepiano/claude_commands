@@ -32,7 +32,7 @@ from zoneinfo import ZoneInfo
 from scripts.lint import sweep, tmp_sweep
 from scripts.lib import cargo_target_config
 from scripts.lib import file_lock
-from scripts.message import session_send
+from scripts.message import send_budget, session_send
 from scripts.message.session_send_test_support import forbid_real_sender
 from scripts.lib import conf
 from scripts.lib.cargo_output import CargoOutputRoots
@@ -4809,7 +4809,9 @@ raise SystemExit(int(os.environ[variable]))
             self.assertEqual(sweep.send_floor_alert("disk notice"), sweep.FloorChannelOutcome.DELIVERED)
             self.assertEqual(sweep.send_phone_push(render("nixos.disk_low", free="9", shortfall="1")),
                              sweep.FloorChannelOutcome.DELIVERED)
-        self.assertEqual([call.kwargs["timeout"] for call in run.call_args_list], [170, 345])
+            expected_timeouts = [send_budget.seconds(conf.read("lint").number("sweep_sender_timeout_seconds")),
+                                 send_budget.user_seconds(review.user_send_seconds())]
+        self.assertEqual([call.kwargs["timeout"] for call in run.call_args_list], expected_timeouts)
         self.assertEqual(run.call_count, 2)
 
     def test_phone_disk_alert_keeps_action_and_build_shortfall_without_directory_dump(self) -> None:

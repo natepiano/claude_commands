@@ -17,7 +17,6 @@ from contextlib import AbstractContextManager, ExitStack, contextmanager
 from types import SimpleNamespace
 
 
-from scripts.direct import workers
 from scripts.production import staff, unit_config, fake_unit_host
 from scripts.production.staff_test_support import fixture_member, fixture_runtime_id, StaffTestCase, isolated_source_readers
 from scripts.lib.atomic_file import write_text_atomic
@@ -101,7 +100,7 @@ class RenameDisplays:
               mock.patch.object(herdr.Herdr, "result", side_effect=self.result),
               mock.patch.object(herdr, "run_program", side_effect=self.native_result),
               mock.patch.object(herdr, "native_process", return_value=herdr.NativeAgentProcess(
-                  herdr.RolloutThread(self.row.current_session) if self.backend == "codex" else
+                  herdr.PaneSessionReport(self.row.current_session) if self.backend == "codex" else
                   herdr.EnvironmentThread(self.row.current_session), "probe-generation", {})),
               mock.patch.object(herdr, "_LayoutLock"),
               mock.patch.object(herdr.Herdr, "order_tabs", return_value=False),
@@ -126,21 +125,12 @@ class FolderMoveBackend:
         self.config: Path = fixture.root / "home" / (".claude4" if kind == "claude" else ".codex2")
 
     def publish_process_state(self) -> None:
-        """Expose the process generation and its current Codex rollout."""
+        """Expose the process generation and its resume arguments."""
         environment = {"HERDR_PROC": str(self.fixture.root / "folder-processes")}
         fake_unit_host.process(environment, self.shell_pid, 1, ["zsh"], {}, cwd=self.cwd)
         arguments = [self.kind] if self.kind == "claude" else [self.kind, "resume", self.fixture.owner.current_session]
         fake_unit_host.process(environment, self.pid, self.shell_pid if self.live else 1, arguments if self.live else [],
                                self.environment(self.pid), cwd=self.cwd)
-        process = Path(environment["HERDR_PROC"]) / str(self.pid)
-        descriptors = process / "fd"
-        descriptors.mkdir(exist_ok=True)
-        descriptor = descriptors / "4"
-        descriptor.unlink(missing_ok=True)
-        if self.live and self.kind == "codex":
-            record = self.fixture.root / "rollout-folder-current.jsonl"
-            _ = record.write_text(json.dumps({"type": "session_meta", "payload": {"id": self.fixture.owner.current_session}}) + "\n")
-            descriptor.symlink_to(record)
 
     def pane_row(self, pane: str) -> herdr.PaneIdentity | herdr.NoPane:
         return next((row for row in self.panes() if row["pane_id"] == pane), herdr.NoPane(pane))
@@ -328,11 +318,18 @@ class FolderMoveFixture(StaffTestCase):
             backend.live = False
             backend.publish_process_state()
 
+        def process_place(pid: int) -> herdr.HerdrPlace | herdr.NotInHerdr:
+            return (herdr.HerdrPlace(backend.session, "w1:p1")
+                    if backend.live and pid == backend.pid else herdr.NotInHerdr())
+
         for target, attribute, replacement in (
             (herdr, "Herdr", mock.Mock(return_value=backend)),
             (herdr, "shared_session", mock.Mock(return_value="agents")),
             (pane_record, "seed", mock.Mock(return_value=0)),
             (herdr, "herdr_processes", backend.observed_processes),
+            (herdr, "herdr_places", lambda: {backend.pid: herdr.HerdrPlace(backend.session, "w1:p1")}
+             if backend.live else {}),
+            (herdr, "herdr_place_of", process_place),
             (herdr, "process_environment", backend.environment),
             (sessions, "session_liveness", session_liveness),
             (sessions, "process_liveness", process_liveness),
@@ -391,7 +388,10 @@ def run_rename(arguments: list[str], environment: dict[str, str], cwd: Path,
         if seconds != 2:
             raise AssertionError(f"unexpected rename wait: {seconds}")
 
-    with ExitStack() as scope:
+    # Restore file operations after each failure injection.
+    with (ExitStack() as scope,
+          mock.patch.object(os, "rename", os.rename),
+          mock.patch.object(os, "replace", os.replace)):
         for module, fields in (
             (showrunners, {"CONFIG": Path(environment["SHOWRUNNERS_CONFIG"]),
                            "NOTIFIER_STATE_DIR": Path(environment["NOTIFIER_STATE_DIR"]),
@@ -403,12 +403,6 @@ def run_rename(arguments: list[str], environment: dict[str, str], cwd: Path,
                 _ = scope.enter_context(mock.patch.object(module, name, value))
         _ = scope.enter_context(mock.patch.object(subprocess, "run", side_effect=run))
         _ = scope.enter_context(mock.patch.object(unit_move, "time", SimpleNamespace(sleep=trust_readback, monotonic=time.monotonic)))
-        # Failure injection scripts assign these names just as they do in a CLI
-        # subprocess. Each call restores them before another test can observe it.
-        for module, names in ((os, ("rename", "replace")),
-                              (workers, ("end_unit",))):
-            for name in names:
-                _ = scope.enter_context(mock.patch.object(module, name, cast(object, getattr(module, name))))
 
         def main() -> int:
             if wrapper:

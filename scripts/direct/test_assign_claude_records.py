@@ -42,7 +42,7 @@ class AssignClaudeLauncherWorkerTests(support.AssignClaudeLauncherFixture):
                 first_board = (session / "board.log").read_text().splitlines()
                 self.assertEqual(sum("register:" in line for line in first_board), 1)
                 self.assertEqual(sum("done:" in line for line in first_board), 1)
-                self.assertTrue(any(f"mesh={worker.name}" in line for line in first_board))
+                self.assertTrue(any(f"worker={worker.name}" in line for line in first_board))
                 started, = self.launch_records(session, "pass_started")
                 finished, = self.launch_records(session, "pass_finished")
                 self.assertEqual(started["pass_kind"], kind)

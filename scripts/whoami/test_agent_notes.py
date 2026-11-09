@@ -1352,7 +1352,7 @@ class AgentNotesTests(unittest.TestCase):
         self.assertEqual(blocked.call_args.kwargs["stopped"], quota_alert.StoppedCommandUnknown())
 
     def test_blocked_cli_converts_stopped_worker_command_at_the_argument_boundary(self) -> None:
-        command = "codex_mesh follow --to impl --prompt 'finish the patch'"
+        command = "worker.py assign impl 'finish the patch'"
         with (patch.object(sys, "argv", ["agent_notes.py", "blocked", str(self.root / ".codex"),
                   "workers@example.invalid", "codex1", "--stopped", "own-director", "impl", command]),
               patch.object(agent_notes, "blocked", return_value=[]) as blocked,
