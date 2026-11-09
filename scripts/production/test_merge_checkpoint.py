@@ -223,6 +223,18 @@ class MergeCheckpointTests(MergeCheckpointFixture):
         self.assertIn("scope: ok — 1 changed paths; 1 came from origin merge branches", accepted.process.stdout)
         self.assertEqual((self.checkout / "outside/imported.txt").read_text(), "unit changed this\n")
 
+    def test_scope_keeps_deleted_plan_absent_at_an_origin_merge_base(self) -> None:
+        doc = self.import_production_paths()
+        with mock.patch.object(showrunners, "timer_docs", return_value={"other": doc}):
+            code = self.run_checkpoint(self.checkpoint())
+            self.assertEqual(code.process.returncode, 0, code.process.stdout + code.process.stderr)
+            sha = self.as_built_commit()
+            accepted = self.run_checkpoint(sha, "--as-built", review=False)
+        self.assertEqual(accepted.process.returncode, 0, accepted.process.stdout + accepted.process.stderr)
+        self.assertIn("scope: ok — 2 changed paths", accepted.process.stdout)
+        self.assertIn("docs/plans/alpha.md", self.git(
+            "diff", "--name-only", "--diff-filter=D", "HEAD^1", "HEAD").splitlines())
+
     def test_scope_leaves_out_own_origin_paths_not_in_local_merge_branch(self) -> None:
         self.write(self.other, "outside/own-production.txt", "already on own origin branch\n")
         _ = self.git("add", "outside/own-production.txt", cwd=self.other)

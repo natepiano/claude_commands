@@ -429,3 +429,13 @@ From the sdlc showrunner, 2026-11-08 [f15c6428], urgent. `merge_checkpoint.pull_
 Fix: when ssh cannot reach the Mac, queue one pull-only Mac pull with the existing `main_publish` queue (the record `/zone` and `/tune` already use), report `promote ok: mac unreachable, pull pending`, and let the merge finish. The next promotion that reaches the Mac pulls once (a fast-forward carries every commit) and clears that record. A Mac that answers but whose pull fails still stops, as now. `tune.py` and the promotion share one queue-and-clear helper in `main_publish`. Add no other check.
 
 As built: `pull_mac_checkout` returns `main_publish.MacPulled` or `MacPullPending`. After its last try, ssh exit 255 with no `rc=` line queues a pull-only record through `main_publish.queue_pull_only`; any other failure still raises `Stop`. A pull clears a pull-only record with `main_publish.clear_pull_only`, and `tune.py` uses the same two helpers. Both promotion paths report `mac unreachable, pull pending: <path>` and go on; `finish_promotion_targets` then skips the zone send and the Mac notice.
+
+### Phase 10i — An as-built commit that deletes its plan passes the scope check  · status: done
+
+**Depends on:** none.
+
+From the sdlc showrunner, 2026-11-08 [be8c1303]. `merge_checkpoint._unit_paths` keeps a path only when its content at the checkpoint differs from every origin merge base. The origin/natedev base ea75bef84 never had `docs/plans/models-pane-thread-link.md`. The models as-built commit cc9634bef deletes that file, so the path is absent at the base and at the commit, and reads as no change. The scope check then drops the plan's deletion and holds a correct as-built commit.
+
+Fix: a path that is absent at an origin merge base did not come from that origin, so that base does not drop it. A path that the base has, and that the commit has with the same content, still came from that origin. Add one row to the existing scope tests in `scripts/production/test_merge_checkpoint.py`: an as-built commit deletes its plan while an origin merge base never had the plan, and the scope check passes. Add no other check.
+
+As built: `_unit_paths` reads, per origin merge ref, the paths the merge base has (`git ls-tree -r`) and the paths the diff to the commit names. It drops only a path that the base has and the diff does not name. A path that the base lacks stays in scope. `test_scope_keeps_deleted_plan_absent_at_an_origin_merge_base` lands an as-built commit that deletes `docs/plans/alpha.md` while the other production's merge base never had it.
