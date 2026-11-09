@@ -99,18 +99,18 @@ Loop/verbose only:
    Run the publication coordinator:
    `~/.claude/scripts/lib/py ~/.claude/scripts/style/style_plan.py checkpoint --repo . --ticket <ticket> --session-dir "${SESSION_DIR}" --phase <phase id> --message-file <message file>`.
    The coordinator gates the ticket's candidate and publishes it with an expected-HEAD update.
-   It updates only the ticket's index entries and records the checkpoint.
+   It updates the published paths in the index and records the checkpoint.
    It releases the reservation while HEAD names that checkpoint.
    The next publication waits for release confirmation.
    Other workers continue to edit their assigned paths.
    With N=1 and one assigned ticket, the gate and verification use the editing tree.
    Otherwise, they use the unit's reused candidate copy.
+   The coordinator runs `doc`, so a standing ticket does not run it by hand.
    Keep the ledger and approval documents in the original repository.
    Never stage the plan, `docs/style-production/`, or pinned rule files.
    On failure, retain the reservation and repeat the same coordinator command after repair.
    A retained publication record completes the same checkpoint without another commit.
    Before refill, use `next-phase --session-dir "${SESSION_DIR}"` to restore every ticket's phase and worker.
-   Use `style_plan.py sync-unit --repo . --unit <unit>` for a main merge.
    Pending sync stops new assignments while assigned workers finish.
 
    **N=1 no-change standing ticket:** with one assigned ticket and every cell recorded `clean`, `exception`

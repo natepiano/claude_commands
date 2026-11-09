@@ -335,11 +335,6 @@ class StyleSyncTests(unittest.TestCase):
         tip = self.git("rev-parse", "HEAD")
         arguments = ["own-handoff", "--repo", str(self.repo), "--tip", tip,
                      "--style-branch", "main", "--unit", "names"]
-        self.assertEqual(style_sync.main(arguments), 1)
-        with style_ledger.open_ledger(self.repo) as ledger:
-            self.assertEqual(ledger.synced_commit(), self.tip)
-            self.assertIsInstance(ledger.tip_seen(tip), style_ledger.UnseenTip)
-        _ = style_sync.git(self.root / "direct-names", "merge", "--no-ff", "-qm", "Sync main", "main")
         with redirect_stdout(io.StringIO()):
             self.assertEqual(style_sync.main(arguments), 0)
         with style_ledger.open_ledger(self.repo) as ledger, closing(sqlite3.connect(ledger.database)) as connection:
@@ -357,13 +352,50 @@ class StyleSyncTests(unittest.TestCase):
             ledger.tip_done(tip)
         arguments = ["own-handoff", "--repo", str(self.repo), "--tip", tip,
                      "--style-branch", "main", "--unit", "types"]
-        self.assertEqual(style_sync.main(arguments), 1)
         self.assertEqual(self.git("rev-parse", "unit-types"), self.tip)
-        _ = style_sync.git(self.root / "direct-types", "merge", "--no-ff", "-qm", "Sync main", "main")
         with redirect_stdout(io.StringIO()):
             self.assertEqual(style_sync.main(arguments), 0)
-        self.assertNotEqual(self.git("rev-parse", "unit-types"), tip)
+        self.assertNotEqual(self.git("rev-parse", "unit-types"), self.tip)
         self.assertEqual(self.git("merge-base", "unit-types", tip), tip)
+
+    def test_direct_merge_refuses_assigned_or_dirty_work_and_repeats_the_open_ticket_proof(self) -> None:
+        self.direct_production()
+        worktree = self.root / "direct-names"
+        _ = (self.root / "nate_style/rust/names.md").write_text("---\ntier: C\nfamily: names\ninput_scope: file\n---\n# Names\n")
+        with style_ledger.open_ledger(self.repo) as ledger:
+            ledger.set_tip(self.tip, "main")
+            rule = "global:rust/names.md"
+            ledger.ticket_add("3001", ticket_owner_id("names"), "read", "names", ".", ["src/lib.rs"], [rule])
+            ledger.ticket_assign("3001", "unit-names")
+            _ = (self.repo / "main.txt").write_text("Main change.\n")
+            _ = self.git("add", "main.txt")
+            _ = self.git("commit", "-qm", "Change main")
+            tip = self.git("rev-parse", "HEAD")
+            arguments = ["own-handoff", "--repo", str(self.repo), "--tip", tip,
+                         "--style-branch", "main", "--unit", "names"]
+            self.assertEqual(style_sync.main(arguments), 4)
+            self.assertEqual(self.git("rev-parse", "unit-names"), self.tip)
+            blob = ledger.pinned_rule_texts("3001")[0].blob
+            ledger.record(rule, "src/lib.rs", self.tip, blob, "clean", ticket="3001", worker="test")
+            ledger.ticket_checkpoint("3001", self.tip)
+            partial = worktree / "partial.rs"
+            _ = partial.write_text("fn partial(\n")
+            self.assertEqual(style_sync.main(arguments), 4)
+            self.assertEqual(self.git("rev-parse", "unit-names"), self.tip)
+            partial.unlink()
+            pending = style_ledger.publication_path(worktree, "pending-sync")
+            _ = pending.write_text(tip + "\n")
+            original_proof = ledger.check_ticket_pipeline
+            def prove(ticket: str) -> None:
+                self.assertEqual(style_sync.git(worktree, "merge-base", "HEAD", tip), tip)
+                with style_ledger.publication_path(worktree, "publication.lock").open("a") as lock:
+                    with self.assertRaises(BlockingIOError):
+                        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                original_proof(ticket)
+            with mock.patch.object(style_ledger.Ledger, "check_ticket_pipeline", side_effect=prove) as proof, redirect_stdout(io.StringIO()):
+                self.assertEqual(style_sync.main(arguments), 0)
+            proof.assert_called_once_with("3001")
+            self.assertFalse(pending.exists())
 
     def test_direct_startup_reconciles_main_without_parent_lookup_or_handoff_replay(self) -> None:
         self.direct_production()

@@ -192,6 +192,39 @@ class StandingCheckpointTests(unittest.TestCase):
     def publish(self, ticket: str) -> str:
         return style_plan.publish_checkpoint(self.unit, ticket, self.root / "run", ticket, "Checkpoint test\n")
 
+    def test_single_ticket_publishes_a_mechanical_file_outside_its_footprint_and_runs_doc_in_the_tree(self) -> None:
+        extra = "alpha/src/extra.rs"
+        self.write(self.repo / extra, "fn extra() {}\n")
+        _ = self.git(self.repo, "add", extra)
+        _ = self.git(self.repo, "commit", "-qm", "Add another source")
+        self.tip = self.git(self.repo, "rev-parse", "HEAD")
+        for worktree in (self.unit, self.style):
+            _ = self.git(worktree, "merge", "--no-edit", self.tip)
+        _ = self.enterContext(unqueued_style_children())
+        self.enterContext(mock.patch.dict(os.environ, self.env))
+        _ = self.enterContext(mock.patch.object(style_rules, "NATE_STYLE_DIR", self.catalog.parent))
+        with style_ledger.open_ledger(self.unit) as ledger:
+            ledger.set_tip(self.tip, "style/main")
+            ledger.ticket_add("1", unit_staff_id("names"), "read", "names", "alpha", ["alpha/src/lib.rs"], [self.rule])
+        self.assertEqual(self.refill().returncode, 0)
+        ticket = self.open_ticket()
+        self.record_ticket_verdicts(ticket)
+        self.assertNotIn(extra, ticket["files"])
+        self.write(self.unit / ticket["files"][0], "fn value() -> usize {\n        1\n}\n")
+        self.write(self.unit / extra, "fn extra() { }\n")
+        def verify(tree: Path, stage: str, package: str) -> subprocess.CompletedProcess[bytes]:
+            self.assertEqual(tree, self.unit)
+            if stage == "doc":
+                self.assertEqual(set(self.git(tree, "diff", "--cached", "--name-only").splitlines()),
+                                 {ticket["files"][0], extra})
+            return subprocess.CompletedProcess([stage, package], 0)
+        with mock.patch.object(style_plan, "run_verification_step", side_effect=verify), \
+                mock.patch.object(style_plan, "candidate_source", side_effect=AssertionError("N=1 uses the editing tree")):
+            checkpoint = self.publish(ticket["id"])
+        self.assertEqual(set(self.git(self.unit, "diff-tree", "--no-commit-id", "--name-only", "-r", checkpoint).splitlines()),
+                         {ticket["files"][0], extra})
+        self.assertEqual(self.git(self.unit, "status", "--porcelain"), "")
+
     def test_publication_preserves_partial_sibling_bytes_and_index_entries(self) -> None:
         first, second = self.parallel_tickets()
         own, sibling = first["files"][0], second["files"][0]
@@ -239,7 +272,7 @@ class StandingCheckpointTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "crash"):
                 _ = self.publish(first["id"])
         self.assertEqual(self.git(self.unit, "rev-parse", "HEAD"), before)
-        journal = style_plan.publication_path(self.unit, "publication.json")
+        journal = style_ledger.publication_path(self.unit, "publication.json")
         pending = cast(dict[str, str], json.loads(journal.read_text()))["commit"]
         self.assertEqual(self.publish(first["id"]), pending)
         self.assertFalse(journal.exists())

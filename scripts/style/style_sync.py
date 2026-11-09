@@ -35,6 +35,7 @@ from scripts.message import send_result, send_budget, session_send
 from scripts.production import showrunners
 from scripts.style import style_ledger
 from scripts.style import style_config
+from scripts.style.unit_files import changed_files
 from scripts.lib.process_failure import failure_detail
 from scripts.lib import scratch
 
@@ -80,6 +81,8 @@ class DirectUnitSync:
     """A direct sync uses the parent route and the unit's current branch."""
     route: style_config.ParentUnitRoute
     branch: session_staff.Branch
+    unit: staff.StaffId
+    worktree: Path
 
 
 @dataclass(frozen=True)
@@ -125,7 +128,9 @@ def direct_route(repo: Path, unit: str = "") -> DirectUnitSync | NoDirectRoute:
     branch = session_staff.RowResolver(record, rows=(row,)).unit_branch(row)
     if not isinstance(branch, session_staff.Branch):
         raise style_config.StyleConfigError(f"{row.name}: {branch.reason}")
-    return DirectUnitSync(route, branch)
+    if not isinstance(row.worktree, staff.PresentWorktree):
+        raise style_config.StyleConfigError(f"{row.name}: no unit worktree")
+    return DirectUnitSync(route, branch, row.id, row.worktree.path)
 
 
 def sync_notice(address: str, target: str, branch: str, tip: str) -> None:
@@ -224,6 +229,21 @@ def own_handoff(repo: Path, tip: str, style_branch: str, unit: str = "") -> int:
     comparison_branch = sync.branch.name if isinstance(sync, DirectUnitSync) else style_branch
     if isinstance(sync, DirectUnitSync):
         style_branch = sync.route.receiving_branch
+        with style_ledger.publication_lock(sync.worktree), style_ledger.open_ledger(repo) as ledger:
+            opened = ledger.ticket_open(str(sync.unit))
+            if any(ticket["state"] == "assigned" for ticket in opened) or changed_files(sync.worktree):
+                ledger.wait_for_sync(str(sync.unit))
+                return 4
+            _ = git(sync.worktree, "merge", "--no-edit", tip)
+            for ticket in opened:
+                ledger.check_ticket_pipeline(ticket["id"])
+            pending = style_ledger.publication_path(sync.worktree, "pending-sync")
+            if pending.exists():
+                target = pending.read_text().strip()
+                if subprocess.run(["git", "-C", str(sync.worktree), "merge-base", "--is-ancestor", target, "HEAD"],
+                                  capture_output=True, check=False).returncode == 0:
+                    pending.unlink()
+            ledger.clear_sync_wait(str(sync.unit))
     style_branch = "refs/heads/" + style_branch.removeprefix("refs/heads/")
     comparison_branch = "refs/heads/" + comparison_branch.removeprefix("refs/heads/")
     tree = git(repo, "rev-parse", "--verify", f"{tip}^{{tree}}")

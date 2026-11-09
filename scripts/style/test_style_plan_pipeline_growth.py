@@ -257,7 +257,7 @@ class StylePlanTests(StylePlanFixture):
         self.assertEqual((code, error), (5, ""))
         self.assertIn("overlap: " + self.sources[1], output)
         self.assertEqual(self.plan.read_bytes(), before)
-        with mock.patch.object(style_ledger.Ledger, "_pipeline_footprint", side_effect=style_ledger.LedgerError("unreadable")):
+        with mock.patch.object(style_ledger.Ledger, "pipeline_footprint", side_effect=style_ledger.LedgerError("unreadable")):
             code, output, error = self.run_next()
         self.assertEqual((code, error), (5, ""))
         self.assertIn("unreadable", output)

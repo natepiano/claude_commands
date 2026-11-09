@@ -3491,7 +3491,7 @@ class Ledger:
                 raise LedgerError(f"{id}: cannot resume or gate from {ticket['state']}")
             self._check_ticket_pipelines(ticket["unit"])
 
-    def _pipeline_footprint(self, ticket: TicketRecord, commits: frozenset[str]) -> frozenset[str]:
+    def pipeline_footprint(self, ticket: TicketRecord, commits: frozenset[str]) -> frozenset[str]:
         """Conservative edit paths at every relevant immutable tree, including current finding rows.
 
         Selection can parse exact module references. This mutation guard includes every mention of a module name
@@ -3564,7 +3564,7 @@ class Ledger:
                     commits.add(ticket["checkpoint"])
             ends: list[str] = []
             for ticket in (predecessor, successor):
-                paths = self._pipeline_footprint(ticket, frozenset(commits))
+                paths = self.pipeline_footprint(ticket, frozenset(commits))
                 end = ticket["checkpoint"] or live[ticket["branch"]]
                 if ticket["state"] == "assigned":
                     from scripts.shutdown import remote
@@ -3579,7 +3579,7 @@ class Ledger:
             crates = tuple(sorted({crate for commit in trees for crate in self._tip(commit).crate_dirs}, key=len, reverse=True))
             footprints: list[frozenset[str]] = []
             for ticket, end in zip((predecessor, successor), ends, strict=True):
-                paths = self._pipeline_footprint(ticket, trees)
+                paths = self.pipeline_footprint(ticket, trees)
                 actual = self.ticket_changed_paths(ticket, end)
                 footprints.append(paths | actual)
             waiting, selected = footprints
@@ -7647,6 +7647,18 @@ def record_split(repo: Path, unit: str, split: RecordedSplit, *,
             + "structure=excluded.structure,other=excluded.other",
             (unit, split.measured_at, split.ready, split.changed, split.structure, split.other),
         )
+
+
+def publication_path(repo: Path, name: str) -> Path:
+    return Path(_git(repo, "rev-parse", "--path-format=absolute", "--git-path", "style-" + name).strip())
+
+
+@contextmanager
+def publication_lock(repo: Path) -> Generator[None]:
+    """Serialize checkpoint publication and main merges in the unit worktree."""
+    with publication_path(repo, "publication.lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        yield
 
 
 @contextmanager

@@ -49,6 +49,7 @@ from scripts.style.approved_renames import (BindingProof, AppliedInCode, Applied
                               file_rename, inline_modules)
 from scripts.style import rules, style_config
 from scripts.style import style_ledger
+from scripts.style.style_ledger import publication_lock, publication_path
 from scripts.style import approved_renames
 from scripts.style import style_footprint
 from scripts.style import style_proposals
@@ -397,7 +398,7 @@ def busy_files(repo: Path, doc: Path, ledger: style_ledger.Ledger, unit: str, bo
                 if ticket["branch"]:
                     commits.add(git(repo, "rev-parse", "--verify", f"{ticket['branch']}^{{commit}}").strip())
             # The ledger owns this proof; keep selection and mutation guards on that implementation.
-            busy.update(ledger._pipeline_footprint(ticket, frozenset(commits)))  # pyright: ignore[reportPrivateUsage]
+            busy.update(ledger.pipeline_footprint(ticket, frozenset(commits)))
     return BusyFiles(board, frozenset(busy))
 
 
@@ -1148,7 +1149,7 @@ def ticket_paths(ledger: style_ledger.Ledger, ticket: style_ledger.TicketRecord,
     """Use the ledger's conservative footprint for snapshots and worker authority."""
     commits = frozenset(commit for commit in (ticket["base"], ticket["checkpoint"],
                         git(repo, "rev-parse", "HEAD").strip(), ledger.synced_commit()) if commit)
-    paths = ledger._pipeline_footprint(ticket, commits)  # pyright: ignore[reportPrivateUsage]
+    paths = ledger.pipeline_footprint(ticket, commits)
     return tuple(sorted(paths))
 
 
@@ -1164,11 +1165,11 @@ def isolated_ticket_source(ledger: style_ledger.Ledger, ticket: style_ledger.Tic
 
 
 @contextmanager
-def candidate_source(repo: Path, ticket: style_ledger.TicketRecord, commit: str) -> Generator[TicketSourceView]:
+def candidate_source(repo: Path, commit: str) -> Generator[TicketSourceView]:
     """Use the unit's reused copy with the candidate changes visible against its parent."""
     with publication_path(repo, "candidate.lock").open("a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
-        with copies.standing("style-" + ticket["unit"], repo, copies.CommittedSource(commit)) as tree:
+        with copies.standing(copies.source_owner(repo), repo, copies.CommittedSource(commit)) as tree:
             _ = git(tree, "config", "user.name", "Style gate")
             _ = git(tree, "config", "user.email", "style-gate@example.invalid")
             parent = git(tree, "rev-parse", commit + "^").strip()
@@ -1181,7 +1182,7 @@ def ticket_source(ledger: style_ledger.Ledger, repo: Path, ticket_id: str) -> Ge
     ticket = ledger.ticket_get(ticket_id)
     if isolated_ticket_source(ledger, ticket):
         commit = ticket_snapshot(ledger, ticket, repo)
-        with candidate_source(repo, ticket, commit) as view:
+        with candidate_source(repo, commit) as view:
             yield view
     else:
         yield TicketSourceView(repo, "HEAD", False)
@@ -1230,20 +1231,8 @@ class PendingPublication:
     phase: str
 
 
-def publication_path(repo: Path, name: str) -> Path:
-    return Path(git(repo, "rev-parse", "--path-format=absolute", "--git-path", "style-" + name).strip())
-
-
-@contextmanager
-def publication_lock(repo: Path) -> Generator[None]:
-    """Serialize branch movement, index updates, checkpoint records and reservation release."""
-    with publication_path(repo, "publication.lock").open("a") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
-        yield
-
-
 def update_ticket_index(repo: Path, publication: PendingPublication) -> None:
-    """Replace only the ticket's index entries with its published entries."""
+    """Update the index entries for the published paths."""
     paths = [":(literal)" + path for path in publication.paths]
     current = git(repo, "ls-files", "-z", "--", *paths).split("\0")
     entries = ["0 " + "0" * 40 + "\t" + path + "\0" for path in current if path]
@@ -1293,7 +1282,7 @@ def recover_publication(repo: Path, ledger: style_ledger.Ledger) -> str:
 def checkpoint_source(ledger: style_ledger.Ledger, repo: Path, ticket: style_ledger.TicketRecord,
                       snapshot: str) -> Generator[TicketSourceView]:
     if isolated_ticket_source(ledger, ticket):
-        with candidate_source(repo, ticket, snapshot) as view:
+        with candidate_source(repo, snapshot) as view:
             yield view
     else:
         yield TicketSourceView(repo, snapshot, False)
@@ -1309,8 +1298,9 @@ def publish_checkpoint(repo: Path, ticket_id: str, session_dir: Path, phase: str
             if ticket["state"] == "checkpointed":
                 return ticket["checkpoint"]
             ledger.check_ticket_pipeline(ticket_id)
-            snapshot = ticket_snapshot(ledger, ticket, repo)
-            parent = git(repo, "rev-parse", snapshot + "^").strip()
+            isolated = isolated_ticket_source(ledger, ticket)
+            snapshot = ticket_snapshot(ledger, ticket, repo) if isolated else style_footprint.worktree_commit(repo)
+            parent = git(repo, "rev-parse", "HEAD").strip()
         # Verification holds the reused copy, without holding the publication lock.
         with checkpoint_source(ledger, repo, ticket, snapshot) as view:
             status = gate_source(ledger, view.repo, ticket_id, parent if view.isolated else "")
@@ -1320,13 +1310,13 @@ def publish_checkpoint(repo: Path, ticket_id: str, session_dir: Path, phase: str
                 if view.isolated:
                     status = run_verification_step(view.repo, "doc", "").returncode
                 else:
-                    with candidate_source(repo, ticket, snapshot) as documentation:
-                        status = run_verification_step(documentation.repo, "doc", "").returncode
+                    _ = git(repo, "read-tree", snapshot)
+                    status = run_verification_step(repo, "doc", "").returncode
             if status:
                 raise style_ledger.LedgerError(f"{ticket_id}: checkpoint gate exited {status}")
         with publication_lock(repo):
             _ = recover_publication(repo, ledger)
-            current = ticket_snapshot(ledger, ticket, repo)
+            current = ticket_snapshot(ledger, ticket, repo) if isolated else style_footprint.worktree_commit(repo)
             if (git(repo, "rev-parse", "HEAD").strip() != parent
                     or git(repo, "rev-parse", current + "^{tree}").strip()
                     != git(repo, "rev-parse", snapshot + "^{tree}").strip()):
@@ -1338,30 +1328,13 @@ def publish_checkpoint(repo: Path, ticket_id: str, session_dir: Path, phase: str
             if made.returncode:
                 raise style_ledger.LedgerError(made.stderr.strip())
             commit = made.stdout.strip()
-            paths = ledger._pipeline_footprint(ticket, frozenset({parent, snapshot}))  # pyright: ignore[reportPrivateUsage]
+            paths = (ledger.pipeline_footprint(ticket, frozenset({parent, snapshot})) if isolated else
+                     frozenset(path for path in git(repo, "diff", "--no-renames", "--name-only", "-z", parent, snapshot).split("\0") if path))
             publication = PendingPublication(ticket_id, git(repo, "symbolic-ref", "HEAD").strip(), parent,
                                              commit, tuple(sorted(paths)), str(session_dir.resolve()), phase)
             _ = git(repo, "update-ref", "refs/style-publication/" + publication.branch.removeprefix("refs/heads/"), commit)
             atomic_write(publication_path(repo, "publication.json"), json.dumps(asdict(publication)).encode())
             return complete_publication(repo, ledger, publication)
-
-
-def sync_unit(repo: Path, unit: str) -> int:
-    """Merge the configured branch after assigned tickets and source changes finish."""
-    with style_ledger.open_ledger(repo) as ledger, publication_lock(repo):
-        _ = recover_publication(repo, ledger)
-        config = style_config.config_for_unit(unit, ledger.staff_resolver().record)
-        unit_id = str(next(row.staff_id for row in unit_worktrees(config.route.doc) if row.unit == unit))
-        if any(ticket["state"] == "assigned" for ticket in ledger.ticket_open(unit_id)) or changed_files(repo):
-            ledger.wait_for_sync(unit_id)
-            return 4
-        target = style_ledger.pushed_branch_point_tip(repo, config.route.branch_point)
-        _ = git(repo, "merge", "--no-edit", target)
-        for ticket in ledger.ticket_open(unit_id):
-            ledger.check_ticket_pipeline(ticket["id"])
-        publication_path(repo, "pending-sync").unlink(missing_ok=True)
-        ledger.clear_sync_wait(unit_id)
-        return 0
 
 
 def approved_documentation_sites(ledger: style_ledger.Ledger, ticket_id: str,
@@ -1424,7 +1397,6 @@ def gate(repo: Path, ticket_id: str) -> int:
     except ValueError as error:
         print(f"review: {error}")
         return 1
-
 
 
 def gate_source(ledger: style_ledger.Ledger, repo: Path, ticket_id: str, source_base: str = "") -> int:
@@ -3195,19 +3167,27 @@ class NoWorkerDispatch:
 _NO_WORKER_DISPATCH = NoWorkerDispatch()
 
 
-def restore_ticket_worker(run: Path, worktree: Path, plan: Path, ticket: style_ledger.TicketRecord,
+def restore_ticket_worker(run: Path, worktree: Path, plan: Path, ticket_id: str,
                           authorized: tuple[str, ...]) -> None:
     """Restore one ticket's phase and submit only a missing or failed worker dispatch."""
-    match = next(match for match in PHASE.finditer(plan.read_text()) if match.group("id") == ticket["id"])
+    match = next(match for match in PHASE.finditer(plan.read_text()) if match.group("id") == ticket_id)
     phase = re.search(r"^### Phase (\d+)", match.group(0))
     assert phase is not None
     phase_id = phase.group(1)
-    slot = "style-ticket-" + ticket["id"]
+    slot = "style-ticket-" + ticket_id
     directory = phase_reservation.phase_directory(run, phase_id)
     directory.mkdir(parents=True, exist_ok=True)
     prompt = directory / "ticket-work-order.md"
     if not prompt.exists():
-        atomic_write(prompt, match.group(0).encode())
+        header = (
+            "We believe in three gods, Simple, Fast and Beautiful, with correctness as the floor beneath them.\n"
+            "Type Design Contract: ~/.claude/docs/type_design.md applies to the code you change.\n"
+            "Edit only the listed paths.\n"
+            "Run no git add, commit, stash, reset or checkout.\n"
+            "Start no detached run you will not wait on.\n"
+            "Finish your summary before you end your turn.\n\n"
+        )
+        atomic_write(prompt, (header + match.group(0)).encode())
     paths = directory / "ticket-paths.txt"
     atomic_write(paths, ("\n".join(authorized) + "\n").encode())
     record_path = run / "progress_history_state.json"
@@ -3219,7 +3199,7 @@ def restore_ticket_worker(run: Path, worktree: Path, plan: Path, ticket: style_l
         commands.append([str(SCRIPTS / "lib/py"), str(SCRIPTS / "direct/progress_history.py"), "start-run",
                          "--session-dir", str(run), "--working-dir", str(worktree)])
     commands.append([str(SCRIPTS / "lib/py"), str(SCRIPTS / "direct/progress_history.py"), "start-phase",
-                     "--session-dir", str(run), "--phase-id", phase_id, "--phase-title", ticket["id"]])
+                     "--session-dir", str(run), "--phase-id", phase_id, "--phase-title", ticket_id])
     if passed.get("status") not in ("active", "completed"):
         commands.append(["bash", str(SCRIPTS / "direct/assign.sh"), "--role", "implement", "--new-worker", slot,
                      "--session-dir", str(run), "--phase", phase_id, "--prompt", str(prompt),
@@ -3271,7 +3251,7 @@ def _next_phase(unit: str, plan: Path, repo: Path, run: Path | NoWorkerDispatch)
             text = plan.read_text()
         if isinstance(run, Path):
             for ticket in assigned:
-                restore_ticket_worker(run, row.worktree, plan, ticket, ticket_paths(ledger, ticket, row.worktree))
+                restore_ticket_worker(run, row.worktree, plan, ticket["id"], ticket_paths(ledger, ticket, row.worktree))
         waiting = tuple(ticket for ticket in opened if ticket["state"] == "checkpointed")
         if len(waiting) >= 2:
             ticket = waiting[0]
@@ -3299,20 +3279,30 @@ def _next_phase(unit: str, plan: Path, repo: Path, run: Path | NoWorkerDispatch)
                 return WaitingForMerge(predecessor.ticket_id, predecessor.commit, f"footprint unknown: {changes_on_main.reason}")
             ledger.wait_for_sync(unit)
             return WaitingForSync(0, f"touched set unknown: {changes_on_main.reason}")
-        if assigned and changes_on_main.paths:
-            atomic_write(publication_path(row.worktree, "pending-sync"), (changes_on_main.pushed_tip + "\n").encode())
-            if len(assigned) >= limit:
+        concurrent = limit > 1 or len(assigned) > 1
+        pending_sync = publication_path(row.worktree, "pending-sync")
+        if concurrent and pending_sync.exists():
+            target = pending_sync.read_text().strip()
+            merged = subprocess.run(["git", "-C", str(row.worktree), "merge-base", "--is-ancestor", target, "HEAD"],
+                                    capture_output=True, check=False)
+            if merged.returncode == 0:
+                pending_sync.unlink()
+        if (concurrent and assigned and changes_on_main.paths
+                and subprocess.run(["git", "-C", str(row.worktree), "merge-base", "--is-ancestor",
+                                    changes_on_main.pushed_tip, "HEAD"], capture_output=True, check=False).returncode != 0):
+            atomic_write(pending_sync, (changes_on_main.pushed_tip + "\n").encode())
+            if assigned and len(assigned) >= limit:
                 ledger.clear_sync_wait(unit)
                 return Resumed(assigned[0]["id"])
             ledger.wait_for_sync(unit)
             return WaitingForSync(0, "main moved while tickets are assigned")
-        if publication_path(row.worktree, "pending-sync").exists():
-            if len(assigned) >= limit:
+        if concurrent and pending_sync.exists():
+            if assigned and len(assigned) >= limit:
                 ledger.clear_sync_wait(unit)
                 return Resumed(assigned[0]["id"])
             ledger.wait_for_sync(unit)
             return WaitingForSync(0, "queued main sync")
-        if len(assigned) >= limit:
+        if assigned and len(assigned) >= limit:
             ledger.clear_sync_wait(unit)
             return Resumed(assigned[0]["id"])
         # The catalog read above serves reconciliation and both refill passes.
@@ -3372,7 +3362,8 @@ def next_phase(unit: str, plan: Path, repo: Path, run: Path | NoWorkerDispatch =
         return RepairFirst()
     config = style_config.config_for_unit(unit, staff.snapshot())
     limit = config.assignment(unit).open_tickets
-    unit_id = str(next(row.staff_id for row in unit_worktrees(config.route.doc) if row.unit == unit))
+    row = next(row for row in unit_worktrees(config.route.doc) if row.unit == unit)
+    unit_id = str(row.staff_id)
     with style_ledger.open_ledger(repo) as ledger:
         resumed = tuple(ticket["id"] for ticket in ledger.ticket_open(unit_id) if ticket["state"] == "assigned")
     written: list[str] = []
@@ -3384,8 +3375,7 @@ def next_phase(unit: str, plan: Path, repo: Path, run: Path | NoWorkerDispatch =
         with style_ledger.open_ledger(repo) as ledger:
             if isinstance(run, Path):
                 ticket = ledger.ticket_get(result.ticket_id)
-                worktree = plan.resolve().parents[3]
-                restore_ticket_worker(run, worktree, plan, ticket, ticket_paths(ledger, ticket, worktree))
+                restore_ticket_worker(run, row.worktree, plan, ticket["id"], ticket_paths(ledger, ticket, row.worktree))
             assigned = sum(ticket["state"] == "assigned" for ticket in ledger.ticket_open(unit_id))
         if assigned >= limit:
             break
@@ -3393,7 +3383,9 @@ def next_phase(unit: str, plan: Path, repo: Path, run: Path | NoWorkerDispatch =
     if limit == 1 and len(resumed) <= 1:
         return PhaseWritten(written[0], unclassified) if written else result
     if written or resumed and isinstance(result, Resumed):
-        return PhasesReady(tuple(written), resumed, max(unclassified, getattr(result, "unclassified", 0)))
+        if isinstance(result, PhaseWritten | PhasesReady | WaitingForSync | WaitingForStructure):
+            unclassified = max(unclassified, result.unclassified)
+        return PhasesReady(tuple(written), resumed, unclassified)
     return result
 
 
@@ -3663,9 +3655,6 @@ def main(argv: list[str]) -> int:
     _ = checkpoint.add_argument("--session-dir", required=True)
     _ = checkpoint.add_argument("--phase", required=True)
     _ = checkpoint.add_argument("--message-file", type=Path, required=True)
-    sync = sub.add_parser("sync-unit")
-    _ = sync.add_argument("--repo", type=Path, required=True)
-    _ = sync.add_argument("--unit", required=True)
     queue = sub.add_parser("queue")
     _ = queue.add_argument("--repo", type=Path, required=True)
     _ = queue.add_argument("--unit")
@@ -3689,8 +3678,6 @@ def main(argv: list[str]) -> int:
         if args.command == "checkpoint":
             print(publish_checkpoint(args.repo, args.ticket, Path(args.session_dir), args.phase, args.message_file.read_text()))
             return 0
-        if args.command == "sync-unit":
-            return sync_unit(args.repo, args.unit)
         if args.command == "gate":
             return gate(args.repo, args.ticket)
         if args.command == "verify":
