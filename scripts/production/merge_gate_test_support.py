@@ -105,6 +105,11 @@ if name == "style_sync.py":
                               capture_output=True, text=True, check=True, timeout=TEST_HANG_GUARD_SECS).stdout.split()[0]
     (state / "notified-tip").write_text(observed)
     raise SystemExit(1 if (state / "notify-fails").exists() else 0)
+if name == "send.py":
+    if (state / "send-fails").exists():
+        print("fixture message failed", file=sys.stderr)
+        raise SystemExit(3)
+    raise SystemExit(0)
 raise SystemExit("unexpected tool: " + name)
 '''.replace("__TEST_HANG_GUARD_SECS__", str(TEST_HANG_GUARD_SECS))
 
@@ -154,6 +159,13 @@ class FixtureTest(unittest.TestCase):
             self.assertNotIn(os.environ["MERGE_GATE_TEST_REPO"], sys.path)
         record({"suite": suite, "module": module_name, "pid": os.getpid(),
                 "event": "start", "tmpdir": str(tmp)})
+        if (state / "sample-module-memory").exists():
+            with open(Path(os.environ["MERGE_GATE_TEST_REPO"]) / "scripts/lib/package_root.py") as package_root:
+                exec(package_root.read(), {"__file__": package_root.name})
+            from scripts.direct.wait_for_test_state import wait_until
+            (state / (str(os.getpgrp()) + ".memory-ready")).touch()
+            wait_until((state / (str(os.getpgrp()) + ".memory-done")).exists,
+                       state, timeout=TEST_HANG_GUARD_SECS)
         death = state / ("signal-" + suite)
         if death.exists():
             if death.read_text() == "once":
@@ -302,8 +314,11 @@ class MergeGateFixture(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
+        from scripts.message import session_send
+
         _ = self.enterContext(LauncherHangGuard(self.id()).protect())
         self.restore_fixture(suites_for_case(self))
+        _ = self.enterContext(mock.patch.object(session_send, "SEND_SCRIPT", self.bin / "send.py"))
         self.addCleanup(shutil.rmtree, self.fixture_root)
         self.admission = caller_admission(self, self.root, self.environment)
         self.admission_started = True
@@ -341,6 +356,44 @@ class MergeGateFixture(unittest.TestCase):
 
     def record_module_peaks(self, peaks: dict[str, float]) -> None:
         merge_gate.save_measures(self.state / "runner" / "module_peak_mib.json", peaks)
+
+    @contextlib.contextmanager
+    def sampling_module_memory(self, attempts: dict[str, Sequence[float]]) -> Generator[list[merge_gate.RunningGateJob]]:
+        """Sample real, held modules with private per-attempt memory readings."""
+        self.write(self.state / "sample-module-memory", "held")
+        started: list[merge_gate.RunningGateJob] = []
+        counts: dict[str, int] = {}
+        readings: dict[int, float] = {}
+        sampled: set[int] = set()
+        start = merge_gate.start_gate_job
+
+        def start_held(suite: str, path: Path, argv: list[str], repo: Path,
+                       environment: dict[str, str], log: Path, *,
+                       kind: merge_gate.GateJobKind = merge_gate.GateJobKind.TEST_MODULE) -> merge_gate.RunningGateJob:
+            job = start(suite, path, argv, repo, environment, log, kind=kind)
+            started.append(job)
+            if kind is merge_gate.GateJobKind.TEST_MODULE:
+                key = f"{suite}/{job.module}"
+                values = attempts.get(key, (32.0,))
+                number = counts.get(key, 0)
+                readings[job.process.pid] = values[min(number, len(values) - 1)]
+                counts[key] = number + 1
+                wait_for_file(self.state / f"{job.process.pid}.memory-ready")
+            return job
+
+        def sample(roots: set[int]) -> dict[int, float]:
+            result = {pid: readings.get(pid, 32.0) for pid in roots}
+            result[os.getpid()] = sum(value for pid, value in result.items() if pid != os.getpid()) + 32.0
+            for pid in roots & readings.keys():
+                # The next sample releases a job even if the runner fails to stop it.
+                if pid in sampled:
+                    (self.state / f"{pid}.memory-done").touch()
+                sampled.add(pid)
+            return result
+
+        with mock.patch.object(merge_gate, "start_gate_job", side_effect=start_held), \
+                mock.patch.object(merge_gate, "process_memory_mib", side_effect=sample):
+            yield started
 
     def bind_fixture(self, root: Path) -> None:
         self.root = root
@@ -506,7 +559,7 @@ class MergeGateFixture(unittest.TestCase):
         self.write(self.unit / "unit.txt", "checkpoint\n")
         self.checkpoint = self.commit(self.unit, "unit checkpoint")
         _ = self.git(self.unit, "push", "-u", "origin", "unit-phase")
-        for name in ("basedpyright", "uv", "ssh", "suite-python", "style_sync.py", "systemd-run"):
+        for name in ("basedpyright", "uv", "ssh", "suite-python", "style_sync.py", "systemd-run", "send.py"):
             self.write(self.bin / name, TOOL_STUB.replace("#!/usr/bin/env python3", "#!" + sys.executable, 1))
             (self.bin / name).chmod(0o755)
 
@@ -595,6 +648,8 @@ class MergeGateFixture(unittest.TestCase):
             source += ("[signal.signal(sig, signal.SIG_IGN) for sig in "
                        "(signal.SIGINT, signal.SIGTERM, signal.SIGHUP, signal.SIGQUIT)]; ")
         source += ("from scripts.production import merge_gate; \n"
+                   + "from pathlib import Path\nimport os\nfrom scripts.message import session_send\n"
+                   + "session_send.SEND_SCRIPT = Path(os.environ['MERGE_GATE_TEST_STATE']).parent / 'bin/send.py'\n"
                    + ("from scripts.production import targeted_test as entry\n"
                       if self.suite_mode is merge_gate.SuiteMode.TARGETED_TEST else "entry = merge_gate\n")
                    + preamble + "\n"

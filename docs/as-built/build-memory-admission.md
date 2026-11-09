@@ -1160,6 +1160,25 @@ Before arming, each selected folder prints `would remove`.
 The first dry runs on 2026-10-27 found 106 loose folders on natedev and 13 on the Mac.
 They selected 36 and eight folders for removal.
 
+Phase 44 moved the Mac runner from the standing `~/rust/hana_catalyst_mac` clone to scratch clones.
+The old standing clone had no lifetime after that change.
+The director removed its 85.8 GiB target on 2026-11-08 with builds' approval.
+That removal closes the Phase 44 gap for the old target.
+Each folder creator must register its lifetime.
+`~/.cache` remains outside the Mac cleanup roots.
+
+The Mac audit log last changed on 2026-11-07 at 14:13:40 EST.
+Its saved runs predate the deployed `/usr/sbin` PATH repair.
+The old launchd PATH could not resolve the system `lsof`.
+The audit therefore kept due folders because process use was unavailable.
+The loaded `org.nixos.folder-audit` job now includes `/usr/sbin` in its PATH.
+Its plist has a change time of 2026-11-08 at 11:04:48 EST.
+The inspection does not expose the exact job load time.
+The 2026-11-08 inspection reports zero runs and no previous exit for the loaded job.
+The job has `RunAtLoad=false` and an 86400-second interval.
+No audit result after the PATH repair exists in that inspection.
+The next scheduled result must establish the removed count and the count of unavailable process-use rows.
+
 The maker is the earliest-started session whose own command creates the folder.
 The audit uses the scratch guard's `commands()` and `targets()` parser and resolves targets against the transcript row's `cwd`.
 Read-only commands, command output and message text do not prove ownership.
@@ -1170,12 +1189,28 @@ A folder without a proven maker prints `maker unknown` and receives no message.
 
 ### Disk-floor alerts (`scripts/lint/sweep.py`, `scripts/buildlog/disk.py`)
 
-`hold_floor` writes `floor.json` in `${LINT_SWEEP_STATE_DIR:-~/.local/state/lint-sweep}` under `FLOOR_LOCK` after each floor sweep: time, free bytes, build-cache bytes (idle and busy target dirs plus both CI runner trees), `last_alert_at` and `last_push_at`. After a non-dry sweep it sends at most one alert:
+Each machine keeps its crossing state in `${LINT_SWEEP_STATE_DIR:-~/.local/state/lint-sweep}/floor.json`.
+After a non-dry pass, natedev and the Mac use the same phone-floor crossing path.
+A reading below `sweep_phone_floor_gib` opens an episode and sends a message to the natedev session.
+The message names the Mac when its disk is low.
+A current `sweep.disk_floor` text approval also permits one phone push per episode.
+The push names the machine and recommends one measured folder, or asks for measurements when folder sizes are unavailable.
+Each channel keeps its own receipt; a failed channel can retry without repeating the accepted delivery.
+A reading above the alert line rearms both channels. Equality does not rearm them.
+While text approval is stale, the natedev message still sends and the phone receipt stays pending.
+The phone channel can send that pending episode after the showrunner records the new approval.
+
+Natedev also records cache sizes, growth and removal accounting. These reports stay outside the Mac path:
 
 - **Floor out of reach.** The sweep reports this state when it selects every removable unit and free space remains below the floor. It uses the `push_history` interval. It never asks the user to free space by hand (2026-10-21). `floor_holders` identifies each busy target, its size, its holding process and its session. `process_uses` finds the process, or `lock_holder` reads `/proc/locks` up to `sweep_proc_locks_reads` times for a held Cargo lock. `holder_sessions` finds the nearest ancestor with a live session record through `process_table.nearest_named`. Each session holding busy targets gets `holder_message_text` through `send_holder_message`. natedev gets `floor_out_of_reach_text`, which lists busy targets and the sessions that received a message. This report sends no phone page.
 - **Growth** (free space fell more than `sweep_unexplained_fall_bytes` 10 GiB beyond build-cache growth since a floor sweep at most `sweep_growth_window_seconds` 30 min earlier; this sweep's free is read after the scan that measures its caches (`scanned_free`), and the record's free before its caches walk, so a target another process deletes during either walk cannot read as a fall. On 2026-10-25 a free read from before the scan reported a 122.6 GiB fall while 123 GiB was freed. A target held by a build hold counts 0 bytes, so the growth check runs only when the previous record's `held_roots` equals this pass's held set; an older record without it skips the check. The sweeper records its own last delete per target in `target-deletes.json` beside `floor.json`, and a directory mtime no later than that time plus 2 s does not make a target held. On 2026-10-29 its own deletes made a 34.7 GiB target look written during a hold, and a false 36.4 GiB fall was reported) and **large removal** (more than `sweep_large_removal_bytes` 32 GiB): natedev alone (`send.py --to natedev --from disk_floor`), at most one per `sweep_alert_interval_seconds` (1 h) counted from the last delivered alert.
 
-`send_floor_alert(message, channels: FloorAlertChannels.NATEDEV | NATEDEV_AND_PHONE)` returns whether either `send.py` call delivered: exit 0 or 1 counts for the natedev message, while only exit 0 counts for the user channel. The texts name what fell, what grew and the largest directories outside the caches, read from `disk.json` as `AvailableDiskMeasurement | UnavailableDiskMeasurement`. `buildlog disk` adds `outside_build_caches` (directories one and two levels under each measured folder holding at least 1 GiB outside cargo target dirs as `sweep.is_cargo_target` decides them, with growth and largest child, so a scratch target is never listed as unexplained growth), `outside_build_cache_totals` and `previous_measured_at`. `send.py`'s `log.jsonl` lines carry `text`.
+`send_floor_alert()` delivers the session message; exit 0 or 1 counts as accepted.
+`send_phone_push()` delivers the separate phone push; only exit 0 counts as accepted.
+Folder choices come from `disk.json` as `AvailableDiskMeasurement | UnavailableDiskMeasurement`.
+`buildlog disk` records large directories outside Cargo targets, their growth and their largest child.
+It also records `outside_build_cache_totals` and `previous_measured_at`.
+`send.py`'s `log.jsonl` lines carry `text`.
 
 ### Rust release trial
 
@@ -1236,7 +1271,7 @@ Turns end as `TurnCompleted | TurnRefusedForCapacity | TurnFailed`; runs as `Run
 - `steps.mem_wait_s` is the memory wait. `steps.wait_s` is the call's lookup and token wait. The file name hashes the schema SQL. Bump `SCHEMA_VERSION` only when the way rows are derived changes.
 - Only `ran` CI jobs carry duration and queue time. CI days key on the run attempt's `started_at` everywhere.
 - The window report is host-scoped; the daily report aggregates hosts. A run's own peak comes from `ci_anon_bytes` / `builds_anon_bytes` samples, never from `memory.peak`.
-- Only the floor-out-of-reach alert reaches the phone; diagnostics go to natedev.
+- Only a phone-floor crossing reaches the phone, with current text approval; diagnostics go to natedev.
 - Tests never read the real cgroup tree, `/proc/meminfo`, `/proc/pressure/memory`, journal or transcripts, and never write `~/.local/state/buildlog`, `build-hold`, `build-hold-release`, `notify` or the agent notes: they take `BUILDLOG_MEMINFO` and `BUILDLOG_MEMORY_PRESSURE` from `scripts/lint/memory_test_support.py`, set `BUILDLOG_*_CGROUP`, `BUILDLOG_TRANSCRIPTS`, `BUILD_HOLD_DIR`, `BUILD_HOLD_RELEASE_DIR`, `HOME`, and stub `journalctl`, `zramctl`, cargo and git on `PATH`. Tests set the hold variables for a checkout's scripts; installed scripts refuse to run with them set.
 - When `BUILDLOG_LIVE_MEMORY_TRIPWIRE` names a record file, the shell gate and Python checker refuse a path that resolves to `/proc/meminfo` or `/proc/pressure/memory` before reading it, append a JSON record, and name the fake readings the test must set. The merge gate sets this variable for every test module and fails any module with a recorded live reading. The default-path test removes the tripwire but supplies fake pressure text. A failed record write still refuses the reading but leaves no record, so the gate detects only recorded readings.
 - A verify.sh routing test follows `scripts/direct/test_verify_untested_examples.py`: cargo passes `metadata` to real cargo and logs every other call, git is stubbed, and the environment drops `UNIT_RUN_DIR`/`UNIT_TEAM_ROLE` and sets `BUILDLOG_OFF=1`, `BUILDLOG_SCOPE=0`, `BUILDLOG_MEMINFO`, `BUILD_HOLD_DIR` and `CARGO_TARGET_DIR`. Tests set `BUILD_HOLD_DIR` for a checkout's scripts; installed scripts refuse to run with it set.
@@ -1406,10 +1441,13 @@ The job uses the mirror leases and claim locks above, plus the shared floor lock
 It trims only the shortfall below `sweep_floor_gib`, without an offload request.
 `ensure_mac_disk_floor()` keeps its 100 GiB on-demand trigger.
 
-The launchd job PATH includes `/usr/sbin` after `/usr/bin:/bin`.
-This lets the floor, scratch and folder-audit jobs find the system `lsof`.
+Nixos commit `efdf8bf` adds `/usr/sbin` after `/usr/bin:/bin` in the launchd job PATH.
+The loaded folder-audit job includes that PATH at the 2026-11-08 inspection.
+This PATH lets the floor, scratch and folder-audit jobs find the system `lsof`.
 The floor job writes both output streams to `~/Library/Logs/nate-jobs/disk-floor.log`.
-The nixos patch must be applied and nix-darwin activated before this job runs.
+Nix-darwin activation deploys the job definition and its PATH.
+The Mac floor finalizer uses the shared crossing path above and saves its receipts on the Mac.
+Its session message goes to natedev; its phone title and body name `Mac`.
 
 
 ### Free memory, head protection, and step slots

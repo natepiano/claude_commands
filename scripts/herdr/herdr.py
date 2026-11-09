@@ -3463,7 +3463,7 @@ _rollout_proof_phase: ContextVar[RolloutProofPhase] = ContextVar("rollout_proof_
 
 @contextmanager
 def launch_rollout_proof() -> Generator[None]:
-    """Allow rollout descriptors to open within the launch proof deadline."""
+    """Use launch arguments and pane reports while the conversation opens."""
     token = _rollout_proof_phase.set(RolloutProofPhase.LAUNCH)
     try:
         yield
@@ -3566,22 +3566,27 @@ def codex_resume_thread(pid: int) -> str:
     raise ValueError(f"pid {pid}: Codex launch identity is unavailable")
 
 
+def _codex_launch_identity(pid: int, reported: str) -> LaunchArgument | PaneSessionReport:
+    """Use the resume argument or the new conversation's pane report."""
+    try:
+        resume = codex_resume_thread(pid)
+    except ValueError:
+        if not reported:
+            raise
+        return PaneSessionReport(reported)
+    return PaneSessionReport(reported) if reported == resume else LaunchArgument(resume)
+
+
 def native_process(pid: int, kind: str, reported: str = "") -> NativeAgentProcess:
     """Bind the current identity and account to one unchanged process."""
     started = _process_birth(pid)
     environment = process_environment(pid)
     if kind == "codex":
         try:
-            identity = RolloutThread(codex_rollout_thread(pid))
+            identity = (_codex_launch_identity(pid, reported) if _rollout_proof_phase.get() == RolloutProofPhase.LAUNCH
+                        else RolloutThread(codex_rollout_thread(pid)))
         except NoOpenCodexRollout:
-            try:
-                resume = codex_resume_thread(pid)
-            except ValueError:
-                if not reported or _rollout_proof_phase.get() == RolloutProofPhase.LAUNCH:
-                    raise
-                identity = PaneSessionReport(reported)
-            else:
-                identity = PaneSessionReport(reported) if reported == resume else LaunchArgument(resume)
+            identity = _codex_launch_identity(pid, reported)
     elif kind == "claude":
         try:
             current = staff.runtime_id(pid)
