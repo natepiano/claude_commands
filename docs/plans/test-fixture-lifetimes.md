@@ -31,28 +31,11 @@ The sdlc showrunner, 2026-11-09, on leftover processes that builds found on nate
 
 ### Phase 1 — The fast-track check fixture ends by itself when its test runner is killed  · status: done
 
-**Depends on:** none
+#### As-built
 
-#### Work Order
-
-**Goal:** The fast-track check fixture and its child end by themselves within twice `TEST_HANG_GUARD_SECS` when nothing stops them. A killed test runner leaves no process.
-
-**Spec:**
-
-1. The `test_item.py` text in `test_check_time_limit_stops_the_check_process_group` in `scripts/production/test_fast_track.py`: the file and its child each call `signal.alarm(int(os.environ["FAST_TRACK_FIXTURE_ALARM_SECS"]))` before `signal.pause()`. The test sets `self.env["FAST_TRACK_FIXTURE_ALARM_SECS"]` to twice `TEST_HANG_GUARD_SECS`, as it sets `FAST_TRACK_DESCENDANT_PID`. The alarm is longer than the wait of the test, so the alarm cannot satisfy the assertions that the time limit stopped the child.
-2. Add no test, check, scan or new helper. The showrunner set this boundary. Keep every existing assertion.
-3. Do not edit `scripts/mac_test/test_copy_watch.py`. The builds report unit owns the same fix in that file (the showrunner, 2026-11-09).
+`test_check_time_limit_stops_the_check_process_group` starts a `test_item.py` fixture and a child. Each sets `signal.alarm` from `FAST_TRACK_FIXTURE_ALARM_SECS` before `signal.pause()`. A killed test runner leaves no process.
 
 **Files:**
-- `scripts/production/test_fast_track.py` — the check fixture
+- `scripts/production/test_fast_track.py` — the time-limit fixture
 
-**Workers:** 1 writer — one small edit; nothing splits.
-- `impl` — the file above.
-
-**State:** none — the phase changes test fixtures only.
-
-**Constraints from prior phases:** none.
-
-**Acceptance gate:**
-- `scripts/lib/py -m unittest scripts.production.test_fast_track` passes.
-- `basedpyright` on the file gives `0 errors, 0 warnings, 0 notes`.
+**Gotchas:** The alarm is twice `TEST_HANG_GUARD_SECS`, longer than the wait of the test. An equal alarm lets a surviving child satisfy the assertions.
