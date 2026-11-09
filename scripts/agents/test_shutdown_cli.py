@@ -769,6 +769,39 @@ class RetireUnitTests(unittest.TestCase):
                 case.assertIn("unmerged commits on alpha-branch", output)
                 case.assertIsInstance(case.unit_worktree(), staff.PresentWorktree)
 
+        for unmerged, tail_match, fetch_tags in ((False, False, False), (True, False, False),
+                                                (True, True, False), (False, False, True)):
+            with self.subTest(origin_merge_branch=True, unmerged=unmerged, tail_match=tail_match, fetch_tags=fetch_tags):
+                case = RetireUnitTests()
+                case.setUp()
+                try:
+                    if not tail_match:
+                        _ = git(case.checkout, "push", "-q", "origin", "main")
+                    _ = git(case.checkout, "branch", "-m", "main", "local-checkout")
+                    _ = git(case.checkout, "update-ref", "-d", "refs/remotes/origin/main")
+                    if unmerged:
+                        write_text_atomic(case.worktree / "late.txt", "late\n")
+                        _ = git(case.worktree, "add", "late.txt")
+                        _ = git(case.worktree, "commit", "-q", "-m", "checkpoint(alpha): the late work")
+                    commit = git(case.worktree, "rev-parse", "HEAD")
+                    if tail_match:
+                        _ = git(case.checkout, "push", "-q", "origin", f"{commit}:refs/heads/a/main")
+                    if fetch_tags:
+                        _ = git(case.checkout, "config", "remote.origin.tagOpt", "--tags")
+                        _ = git(case.checkout, "push", "-q", "origin", f"{commit}:refs/tags/TEST-origin-tag")
+                        case.assertEqual(git(case.checkout, "for-each-ref", "refs/tags/TEST-origin-tag"), "")
+                    unit = shutdown.retirement_find_unit("alpha", "alpha")
+                    refusals = shutdown.retirement_refusals(unit, settings=conf.read("production"))
+                    case.assertEqual(refusals, [f"unmerged commits on alpha-branch: {commit}"] if unmerged else [])
+                    case.assertEqual(git(case.checkout, "branch", "--list", "main"), "")
+                    case.assertEqual(git(case.checkout, "for-each-ref", "refs/remotes/origin/main"), "")
+                    if fetch_tags:
+                        case.assertEqual(git(case.checkout, "for-each-ref", "refs/tags/TEST-origin-tag"), "")
+                    case.assertEqual(case.calls, [])
+                    case.assertTrue(case.worktree.is_dir())
+                finally:
+                    case.doCleanups()
+
     def test_the_recorders_project_started_line_is_not_uncommitted_work(self) -> None:
         plan = self.worktree / "work.txt"
         recorded = plan.read_text(encoding="utf-8") + "- **Project started:** 2026-10-18T22:00:00-04:00\n"

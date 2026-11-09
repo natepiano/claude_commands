@@ -853,6 +853,24 @@ def retirement_find_unit(production_name: str, given: str, *,
 def retirement_last_session(unit: RetiringUnit) -> str:
     return unit.staff_member.current_session
 
+def retirement_branch_commits(unit: RetiringUnit, branch: str, *, settings: conf.ConfigRead) -> list[str]:
+    commits: list[str] = []
+    branch_ref = f"refs/heads/{branch}"
+    observed = retirement_git(unit, "show-ref", "--verify", "--quiet", branch_ref, settings=settings)
+    if observed.returncode == 0:
+        commits.append(branch_ref)
+    elif observed.returncode != 1:
+        raise OSError(retirement_failure(observed))
+    remote = retirement_git(unit, "ls-remote", "--exit-code", "--heads", "origin", branch_ref, settings=settings)
+    if remote.returncode not in (0, 2):
+        raise OSError(retirement_failure(remote))
+    if remote.returncode == 0:
+        fetched = retirement_git(unit, "fetch", "--no-tags", "--no-write-fetch-head", "--refmap=", "-q", "origin", branch_ref, settings=settings)
+        if fetched.returncode:
+            raise OSError(retirement_failure(fetched))
+        commits.append(remote.stdout.split()[0])
+    return commits
+
 def retirement_refusals(unit: RetiringUnit, *, settings: conf.ConfigRead, check_absent_branch: bool = False) -> list[str]:
     """Keep uncommitted work and commits outside the merge branch."""
     present = unit.worktree.is_dir()
@@ -867,26 +885,13 @@ def retirement_refusals(unit: RetiringUnit, *, settings: conf.ConfigRead, check_
                  if not (line[:2] == " M" and retirement_recorder_line_only(unit.worktree, line[3:], settings=settings))]
         if paths:
             found.append(f"uncommitted work in {unit.worktree}: {', '.join(paths)}")
-    refs: list[str] = []
-    if unit.branch:
-        branch_ref = f"refs/heads/{unit.branch}"
-        observed = retirement_git(unit, "show-ref", "--verify", "--quiet", branch_ref, settings=settings)
-        if observed.returncode == 0:
-            refs.append(branch_ref)
-        elif observed.returncode != 1:
-            raise OSError(retirement_failure(observed))
-    elif present:
-        refs.append("HEAD")
-    remote = retirement_git(unit, "ls-remote", "--exit-code", "--heads", "origin", unit.branch, settings=settings)
-    if remote.returncode not in (0, 2):
-        raise OSError(retirement_failure(remote))
-    if remote.returncode == 0:
-        fetched = retirement_git(unit, "fetch", "--no-write-fetch-head", "--refmap=", "-q", "origin", unit.branch, settings=settings)
-        if fetched.returncode:
-            raise OSError(retirement_failure(fetched))
-        refs.append(remote.stdout.split()[0])
+    refs = (retirement_branch_commits(unit, unit.branch, settings=settings) if unit.branch else
+            ["HEAD"] if present else [])
+    merge_refs = retirement_branch_commits(unit, unit.production.merge_branch, settings=settings)
+    if not merge_refs:
+        raise OSError(f"merge branch {unit.production.merge_branch} is absent from origin and this clone")
     for ref in refs:
-        commits = retirement_git(unit, "rev-list", "--no-merges", ref, "--not", unit.production.merge_branch, settings=settings)
+        commits = retirement_git(unit, "rev-list", "--no-merges", ref, "--not", *merge_refs, settings=settings)
         if commits.returncode:
             raise OSError(retirement_failure(commits))
         if commits.stdout.strip():
