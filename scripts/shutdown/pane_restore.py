@@ -14,7 +14,6 @@ except FileNotFoundError:
 
 import argparse
 import sys
-from pathlib import Path
 from typing import cast
 
 from scripts.herdr import herdr, pane_launch
@@ -36,8 +35,14 @@ def _resume_saved(session: str, client: herdr.Herdr, pane: herdr.TabSession,
     if not isinstance(client.pane_activity(pane.pane_id), herdr.PaneAtShell):
         raise herdr.HerdrFailure("the pane runs a program")
     kind = pane_launch.agent_kind(entry)
-    account = ({"CODEX_HOME": entry["config_dir"]} if kind == "codex"
-               else named_account_environment(Path(entry["config_dir"])))
+    home = pane_launch.config_home(entry)
+    if isinstance(home, staff.HomeUnknown):
+        from scripts.shutdown import member_account
+
+        print(f"anomaly: {entry['session_id']}: session home is unknown; select the normal account", file=sys.stderr)
+        selected = member_account.resume_account(kind)
+        home = staff.SessionHome(selected.dir if isinstance(selected, accounts.NamedAccount) else selected.home)
+    account = {"CODEX_HOME": str(home.path)} if kind == "codex" else named_account_environment(home.path)
     title = entry["name"] or pane.label
     launched = herdr.launch_agent(session, pane.workspace, title, entry["cwd"], {**entry["environment"], **account},
         kind, trust_arguments(kind, entry["cwd"], pane_record.resume_arguments(entry)), herdr.NoOpeningPrompt(),
@@ -82,12 +87,16 @@ def restore(session: str, *, dry_run: bool) -> int:
         holder = parent if parent is not None else row
         selected[holder.id] = holder
         if saved is not None and holder.id == row.id:
-            home = Path(saved["config_dir"])
-            target_accounts[holder.id] = (accounts.CodexWorkersAccount(agent_accounts.codex_home_role_label(home), home)
-                if pane_launch.agent_kind(saved) == "codex" else accounts.NamedAccount(accounts.claude_config_label(home), home))
+            home = pane_launch.config_home(saved, record=record)
+            if isinstance(home, staff.SessionHome):
+                target_accounts[holder.id] = (accounts.CodexWorkersAccount(agent_accounts.codex_home_role_label(home.path), home.path)
+                    if pane_launch.agent_kind(saved) == "codex" else accounts.NamedAccount(accounts.claude_config_label(home.path), home.path))
+            else:
+                print(f"anomaly: {row.name}: session home is unknown; select the normal account", file=sys.stderr)
         if dry_run:
             entry = names.resume(saved) if saved is not None else None
-            account = entry["config_dir"] if entry is not None else "retained account"
+            home = pane_launch.config_home(entry, record=record) if entry is not None else staff.HomeUnknown()
+            account = str(home.path) if isinstance(home, staff.SessionHome) else "normal account"
             print(f"{pane.pane_id} {row.name}: resume {row.current_session} on {account}")
     for holder in (() if dry_run else selected.values()):
         try:
@@ -115,7 +124,11 @@ def restore(session: str, *, dry_run: bool) -> int:
                 print(f"{pane.pane_id} {label}: left as it is: it already runs")
                 continue
             if dry_run:
-                print(f"{pane.pane_id} {label}: resume {entry['session_id']} on {entry['config_dir']}")
+                home = pane_launch.config_home(entry)
+                if isinstance(home, staff.HomeUnknown):
+                    print(f"anomaly: {entry['session_id']}: session home is unknown; select the normal account", file=sys.stderr)
+                account = str(home.path) if isinstance(home, staff.SessionHome) else "normal account"
+                print(f"{pane.pane_id} {label}: resume {entry['session_id']} on {account}")
                 continue
             with staff.row_operation(entry["session_id"]):
                 current = herdr.read_conversation(entry["session_id"], pane_launch.agent_kind(entry))

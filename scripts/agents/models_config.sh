@@ -82,8 +82,7 @@ models_registry_store() {
         "${extra[@]}")" || result=$?
     rm -f "$registry"
     [[ "$result" == 0 ]] || return "$result"
-    eval "$assignments"
-    _models_table_file="$MODELS_CONFIG_FILE"
+    _models_table_load "$assignments"
 }
 
 models_agent_environment() {
@@ -121,7 +120,11 @@ _models_registry_parse() {
         done
     fi
     assignments="$("$MODELS_CONFIG_DIR/../lib/py" "$MODELS_CONFIG_DIR/../lib/models_registry.py" shell "${registry[@]}" "$@")" || return 1
-    eval "$assignments"
+    _models_table_load "$assignments"
+}
+
+_models_table_load() {
+    eval "$1"
     _models_table_file="$MODELS_CONFIG_FILE"
 }
 

@@ -10,18 +10,25 @@ from scripts.production.staff_test_support import isolated_staff_file
 
 from scripts.lib.test_models_registry import registry_text, write_registry
 
+from collections.abc import Callable, Generator, Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass
 from functools import cached_property
+from importlib import import_module
 import json
 import os
+import runpy
 import shutil
 import subprocess
 import sys
 from pathlib import Path
-from typing import ClassVar, TypedDict, cast, override
+from textwrap import indent
+from types import ModuleType
+from typing import ClassVar, TextIO, TypedDict, cast, override
+from unittest.mock import patch
 
 from scripts.direct.recorder_fixture import LauncherFixture, configure_launcher_fixture, launcher_environment, prepare_launcher_runtime
-from scripts.direct.assign_launcher_test_support import changed_files, snapshot_files
+from scripts.production.cli_fixture import invoke_cli, process_boundary_for_case
 
 from scripts.lint.memory_test_support import config_environment, write_config_fixture
 
@@ -30,8 +37,70 @@ DIRECT_DIR = Path(__file__).parent
 AGENTS_DIR = DIRECT_DIR.parent / "agents"
 
 
+@dataclass(frozen=True)
+class FirstDispatchArtifact:
+    """A completed first dispatch publishes this file."""
+
+    relative: Path
+    content: bytes
+    mode: int
+
+def snapshot_files(root: Path) -> dict[Path, bytes]:
+    """Read regular files before a dispatch."""
+    return {path.relative_to(root): path.read_bytes() for path in root.rglob("*")
+            if path.is_file() and not path.is_symlink()}
+
+def changed_files(root: Path, before: dict[Path, bytes]) -> tuple[FirstDispatchArtifact, ...]:
+    """Keep files that the dispatch changed."""
+    return tuple(FirstDispatchArtifact(relative, content, (root / relative).stat().st_mode)
+                 for relative, content in snapshot_files(root).items()
+                 if before.get(relative) != content)
+
 
 CLAUDE_REGISTRY = registry_text({'assignments': {'direct': 'claude'}, 'direct.claude': {'impl': 'opus:high', 'test': 'opus:high', 'fix': 'opus:high'}, 'claude.agents': {'opus': 'low,medium,high,xhigh,max'}})
+
+@contextmanager
+def direct_launcher_helpers() -> Generator[None]:
+    """Run synchronous helper entry points with the launcher's warm imports."""
+    real_run = cast(Callable[..., subprocess.CompletedProcess[str]], subprocess.run)
+
+    def fixture_command(command: Sequence[str], **options: object) -> subprocess.CompletedProcess[str]:
+        if len(command) < 2 or Path(command[1]).name not in {
+                "progress_history.py", "phase_reservation.py", "worker_state.py", "build_folders.py"}:
+            return real_run(command, **options)
+        script = command[1]
+        module = ModuleType("launcher_helper")
+        module.__file__ = script
+
+        def helper_main() -> int:
+            _ = runpy.run_path(script, run_name="__main__")
+            return 0
+
+        environment = cast(Mapping[str, str], options.get("env", os.environ))
+        directory = Path(cast(str | Path, options.get("cwd") or Path.cwd()))
+        captured = bool(options.get("capture_output"))
+        output = options.get("stdout")
+        errors = options.get("stderr")
+        merged_pipe = output == subprocess.PIPE and errors == subprocess.STDOUT
+        result = invoke_cli(module, helper_main, list(command[2:]), environment, directory,
+                            combined_output=merged_pipe)
+        if not captured and output not in (subprocess.PIPE, subprocess.DEVNULL):
+            _ = cast(TextIO, output if output is not None else sys.stdout).write(result.stdout)
+        if not captured and not merged_pipe and errors not in (subprocess.PIPE, subprocess.DEVNULL):
+            destination = output if errors == subprocess.STDOUT else errors
+            fallback = sys.stdout if errors == subprocess.STDOUT else sys.stderr
+            if destination != subprocess.DEVNULL:
+                _ = cast(TextIO, destination if destination is not None else fallback).write(result.stderr)
+        if merged_pipe:
+            result = subprocess.CompletedProcess(list(command), result.returncode, result.stdout, None)
+        if options.get("check"):
+            result.check_returncode()
+        return result
+
+    with patch.object(subprocess, "run", fixture_command):
+        yield
+
+
 
 STUB_CLAUDE = """#!/usr/bin/env python3
 import json
@@ -155,6 +224,7 @@ class AssignClaudeLauncherFixture(LauncherFixture):
     """Every worker carries a kind, and the board line says which."""
 
     assign_script: Path = Path()
+    direct_cli_calls: ClassVar[bool] = False
     completed_setups: ClassVar[dict[str, CompletedLauncherSetup]] = {}
 
     @classmethod
@@ -268,12 +338,14 @@ class AssignClaudeLauncherFixture(LauncherFixture):
         configure_launcher_fixture(direct_dir / "assign.sh")
         # Retained child tests call the child API through a private test entry.
         child_entry = direct_dir / "assign.py"
-        _ = child_entry.write_text("\n".join((
+        child_bootstrap = "\n".join((
             "import os, sys",
             "from pathlib import Path",
             "import scripts.direct",
             f"scripts.direct.__path__ = [{str(DIRECT_DIR)!r}, *scripts.direct.__path__]",
             "from scripts.direct import assign, assign_claude",
+        )) + "\n"
+        child_source = "\n".join((
             "assign.SCRIPTS = assign_claude.SCRIPTS = Path(__file__).resolve().parent",
             "assign.PYTHON = assign_claude.PYTHON = str(assign.SCRIPTS.parent / 'lib/py')",
             "args = assign.parse_arguments()",
@@ -290,7 +362,11 @@ class AssignClaudeLauncherFixture(LauncherFixture):
             "code = assign_claude.run(assign_claude.ClaudeLaunch(run, phase, cwd, prompt, role, slot, args.fix_cause, args.pass_number, model[1], model[2], worker, ('bash', str(assign.SCRIPTS / 'assign.sh'), *sys.argv[1:]), env))",
             "if code and assign.pass_start_count(run, slot) > before: assign.end_failed_launch(run, slot, env)",
             "raise SystemExit(code)",
-        )) + "\n")
+        )) + "\n"
+        if self.direct_cli_calls:
+            child_source = ("from scripts.direct.assign_claude_test_support import direct_launcher_helpers\n"
+                            + "with direct_launcher_helpers():\n" + indent(child_source, "    "))
+        _ = child_entry.write_text(child_bootstrap + child_source)
         _ = shutil.copy2(AGENTS_DIR / "claude_account.sh", agents / "claude_account.sh")
         claude = self.root / "claude-bin"
         _ = claude.write_text(STUB_CLAUDE, encoding="utf-8")
@@ -365,10 +441,32 @@ class AssignClaudeLauncherFixture(LauncherFixture):
         _ = environment.pop("TEST_LEGACY_LAUNCH", None)
         environment["TEST_WORKER_STARTED"] = str(session / "worker-started")
         environment["STUB_SUMMARY"] = str(session / "phases" / "3" / "impl_summary_impl.txt")
-        return subprocess.run(
-            self.assign_command(session, *options, kind=kind),
-            check=False, capture_output=True, text=True, env=environment, timeout=test_hang_guard.TEST_HANG_GUARD_SECS,
-        )
+        return self.run_assignment(self.assign_command(session, *options, kind=kind), environment)
+
+    def run_assignment(self, command: list[str], environment: dict[str, str]) -> subprocess.CompletedProcess[str]:
+        """Run the same private child entry in both execution modes."""
+        if not self.direct_cli_calls or process_boundary_for_case(self):
+            return subprocess.run(command, check=False, capture_output=True, text=True,
+                                  env=environment, timeout=test_hang_guard.TEST_HANG_GUARD_SECS)
+        direct_package = import_module("scripts.direct")
+        from scripts.direct import assign, assign_claude
+
+        direct = self.assign_script.parent
+        entry = self.assign_script.with_suffix(".py")
+        arguments = command[command.index(str(self.assign_script)) + 1:]
+        module = ModuleType("claude_assignment")
+        module.__file__ = str(entry)
+
+        def child_main() -> int:
+            _ = runpy.run_path(str(entry), run_name="__main__")
+            return 0
+
+        with (patch.object(direct_package, "__path__", list(cast(Sequence[str], getattr(direct_package, "__path__")))),
+              patch.object(assign, "SCRIPTS", direct),
+              patch.object(assign, "PYTHON", str(direct.parent / "lib/py")),
+              patch.object(assign_claude, "SCRIPTS", direct),
+              patch.object(assign_claude, "PYTHON", str(direct.parent / "lib/py"))):
+            return invoke_cli(module, child_main, arguments, environment, self.working_dir)
 
     def launch_records(self, session: Path, kind: str) -> list[dict[str, object]]:
         path = self.history_dir / "runs" / f"{session.name}.jsonl"
@@ -423,9 +521,7 @@ printf '%s\\n' '{answer}'
                                     "STUB_SEND_BEHAVIOR": behavior})
         if resolves_round:
             environment["UNIT_RESOLVES_ROUND"] = "1"
-        return subprocess.run(self.assign_command(session_dir, *options, kind=kind, slot=slot),
-                              check=False, capture_output=True, text=True,
-                              env=environment, timeout=test_hang_guard.TEST_HANG_GUARD_SECS)
+        return self.run_assignment(self.assign_command(session_dir, *options, kind=kind, slot=slot), environment)
 
     def open_repair_round(self, session_dir: Path) -> None:
         findings = self.root / "scripts" / "direct" / "findings.py"
@@ -524,10 +620,7 @@ if len(_probe_sys.argv) > 1 and _probe_sys.argv[1] in {commands!r}:
         registry = self.root / ".claude" / "config" / "models.conf"
         _ = write_registry(registry, {"direct.claude": {"impl": registry_row}}, base_text=CLAUDE_REGISTRY)
         environment = self.launch_environment(session_dir)
-        return subprocess.run(
-            self.assign_command(session_dir, kind=kind),
-            check=False, capture_output=True, text=True, env=environment, timeout=test_hang_guard.TEST_HANG_GUARD_SECS,
-        )
+        return self.run_assignment(self.assign_command(session_dir, kind=kind), environment)
 
     def open_passes(self, session_dir: Path) -> dict[str, OpenPass]:
         stored = cast(

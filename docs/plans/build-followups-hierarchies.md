@@ -768,3 +768,19 @@ Acceptance: the targeted test, the package import bootstrap and basedpyright are
 - The `test_roster.py` `fixture_process` stand-in takes the `reported` pane session and passes it to `native_process`.
 - The cause was in `assign.py`. Since panes 28f the worker records a completed pass end and closes its pane. The launcher now records a pass end only as `error`: `failed_pass_command()` replaces `finish_pass_command(status)`.
 - The launcher tests now expect one new pane for each assign after a done pass. The refusal test for an unproved worker is kept.
+
+### Phase 31 — A bare worker name reaches only the sender's own unit's worker  · status: done
+
+#### As-built
+
+`send.py --to <bare worker name>` resolves the name among the workers of the sender's own unit. The sender's unit is the sender itself for a unit director, and its parent director for a worker. When only other units' workers match, the send refuses with `ambiguous staff row for '<name>'` and lists each full path; nothing is delivered. A bare name that matches a unit or a showrunner keeps its earlier behavior. A full path matches only its exact canonical path (`<production>/<unit>/<worker>`, or `worker:<unit>/<worker>` under the sender's showrunner).
+
+The earlier cause: `resolve_staff_recipient` matched a bare name globally over staff, so a single match in another unit was delivered.
+
+**Files:**
+- `scripts/message/send.py` — `resolve_staff_recipient` holds the own-unit rule; `_sender_staff_row` gives the sender's staff row (or `NoStaffSender`) to this rule and to the short `worker:` path.
+- `scripts/message/test_send.py` — rows in `test_parent_showrunner_path_uses_staff_current_session` and the pane worker delivery tests.
+
+**Gotchas:** a match on the last parts of a path makes an exact full path ambiguous when a longer path ends with the same parts; keep canonical-only matching.
+
+**Ruled out:** a `<unit>/<worker>` form without the production name.

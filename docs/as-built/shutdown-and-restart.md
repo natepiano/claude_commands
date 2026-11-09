@@ -1,5 +1,18 @@
 # Shutdown and restart
 
+## Process-group signals
+
+`scripts/lib/process_group.py` owns process-group signal validation.
+`check_process_group(pid)` requires an integer greater than one and refuses the caller's own group.
+It also refuses booleans and mock values.
+`send_process_group(pid, signum)` validates before the sole raw `os.killpg` call.
+Callers handle `ProcessLookupError` when the group has ended.
+Shell callers use their checkout's helper through `scripts/lib/py`.
+The helper returns exit 3 for a missing group and exit 2 for refusal or failure.
+`test_process_group.unguarded_group_signals` checks Python references, embedded scripts, and shell commands for unguarded signals.
+
+## Session commands
+
 The `/agents` skill uses the `agents` program.
 `agents` and `agents help` print the same usage and return status 0.
 The public commands are `help`, `status`, `pause`, `exit`, `resume`, `restart`, and `stop`.

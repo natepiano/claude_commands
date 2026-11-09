@@ -11,8 +11,9 @@ from zoneinfo import ZoneInfo
 
 from scripts.build_queue import head_facts, queue_card, queue_evidence, queue_view
 from scripts.build_queue import admission_protocol as wire, cloud_progress, progress_profile
+from scripts.build_queue.test_queue_view import QueueViewFixtureTests, cloud_reading
 from scripts.build_queue.admission_test_support import AdmissionFixture, only_admitted
-from scripts.build_queue.queue_fixture import GOLDEN, NOW, QueueFixture, QueueFixtureTests, queue_read_fixture, with_waiting, write_memory_config
+from scripts.build_queue.queue_fixture import GOLDEN, NOW, QueueFixture, queue_read_fixture, with_waiting, write_memory_config
 from scripts.build_queue.queue_lines import plain
 from scripts.build_queue.scope_activity import LiveBuildRun, ScopeProcesses
 from scripts.lib.build_steps import read_step_names
@@ -51,20 +52,7 @@ class CloudQueueCardTests(unittest.TestCase):
         _ = (fixture.root / "cloud_gate.conf").write_text(
             "[cloud_gate]\n# range: 5e-324..\nlog_push_s=5\n")
         model = fixture.model()
-        rows = (
-            wire.CloudRow(wire.Owner(700001, "100"),
-                wire.Identity("cloud-session", "route-one", "merge-gate", "/private/cloud", "cloud-unit"),
-                wire.CloudPlace("aws"), NOW - 245, NOW - 240,
-                cloud_progress.CloudProgress("running", 32, 1, NOW - 120),
-                progress_profile.ProgressCounter("modules", 7, 12), admission_records.ReadyForAdmission()),
-            wire.CloudRow(wire.Owner(700002, "200"),
-                wire.Identity("cloud-waiter", "route-two", "targeted-test", "/private/waiting", "waiting-unit"),
-                wire.CloudPlace("aws"), NOW - 60, 0,
-                cloud_progress.NoCloudProgress(), progress_profile.NoCounter(), wire.CloudSlotWait(1, 1)),
-        )
-        reading = model.reading
-        return replace(model, reading=wire.CloudQueueRead(reading.view, reading.explanation, reading.ordered,
-            reading.diagnostics, rows, 1, cloud_gate_stale_pushes=3)), fixture
+        return replace(model, reading=cloud_reading(model.reading)), fixture
 
     def test_cloud_card_shows_slots_progress_size_elapsed_and_age(self) -> None:
         model, _fixture = self.cloud_model()
@@ -112,7 +100,7 @@ class CloudQueueCardTests(unittest.TestCase):
                 self.assertNotIn("no update for", text)
 
 
-class QueueCardTests(QueueFixtureTests):
+class QueueCardTests(QueueViewFixtureTests):
 
     def test_targeted_test_step_uses_its_shown_name(self) -> None:
         model = self.fixture.model()
