@@ -2958,7 +2958,7 @@ class FeatureLogTests(unittest.TestCase):
                 self.assert_rejected(arguments, "cannot read proposal")
 
     def test_optional_review_flag_reaches_the_writer_host_and_keeps_ssh_failures(self) -> None:
-        for verb in ("add", "supersede", "drop"):
+        for verb in ("add", "supersede", "land", "drop"):
             arguments = [verb, "--review", "natedev/C908", "--if-proposed"]
             if verb == "drop":
                 arguments.extend(("--verdict", "not works"))
@@ -2971,6 +2971,40 @@ class FeatureLogTests(unittest.TestCase):
                           + shlex.join(arguments))
                 self.assertEqual(runner.commands, [["ssh", "natedev", remote]])
                 self.assertEqual(result, CliResult(7, "", "ssh failed\n"))
+
+        transport = self.root / "bin"
+        transport.mkdir()
+        ssh = transport / "ssh"
+        _ = ssh.write_text(
+            "\n".join([
+                f"#!{sys.executable}",
+                "import os, shlex, sys",
+                "if os.environ['FEATURE_LOG_TEST_SSH_FAILURE'] == '1':",
+                "    sys.stderr.write('ssh failed\\n')",
+                "    sys.exit(7)",
+                f"os.environ['FEATURE_LOG_VAULT'] = {str(self.vault)!r}",
+                f"os.execv(sys.executable, [sys.executable, {feature_log.__file__!r}, *shlex.split(sys.argv[2])[2:]])",
+                "",
+            ]),
+            encoding="utf-8",
+        )
+        ssh.chmod(0o700)
+        actions: tuple[Callable[[], list[str]], ...] = (
+            lambda: feature_log.land_review("natedev/C908", if_proposed=True),
+            lambda: feature_log.drop_review("natedev/C908", "not works", if_proposed=True),
+        )
+        for action in actions:
+            for failure in (False, True):
+                with (self.subTest(action=action, failure=failure),
+                      patch.dict(os.environ, {"PATH": f"{transport}{os.pathsep}{os.environ['PATH']}",
+                                              "FEATURE_LOG_TEST_SSH_FAILURE": str(int(failure))}),
+                      patch.object(socket, "gethostname", return_value="macbook.local")):
+                    _ = os.environ.pop("FEATURE_LOG_VAULT")
+                    if failure:
+                        with self.assertRaisesRegex(feature_log.FeatureLogError, "^ssh failed$"):
+                            _ = action()
+                    else:
+                        self.assertEqual(action(), ["skipped: no proposal for natedev/C908"])
 
     def test_review_requires_a_proposal_and_the_matching_verb(self) -> None:
         missing = self.cli(["add", "--review", "A999"])
