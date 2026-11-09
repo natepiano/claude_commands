@@ -15,6 +15,7 @@ import unittest
 from unittest.mock import patch
 
 from scripts.direct import step_record as steps
+from scripts.direct.step_selection import Pinned
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
@@ -49,7 +50,7 @@ with patch("time.time_ns", return_value=1_700_000_000_123_456_789), \
             self.assertIsInstance(record, steps.StepRecord)
             assert isinstance(record, steps.StepRecord)
             self.assertEqual(record.runs_on, steps.AnyTarget(("mac", "aws"), ("mac",)))
-            self.assertEqual(record.selection, steps.Pinned("mac"))
+            self.assertEqual(record.selection, Pinned("mac"))
             self.assertEqual((record.kind, record.package), ("test", steps.NamedPackage("sample")))
             self.assertTrue((root / "clock.json").is_file())
 
@@ -58,7 +59,7 @@ with patch("time.time_ns", return_value=1_700_000_000_123_456_789), \
         record = steps.StepRecord("joined", pid, steps.process_start(pid), root, "test", steps.NamedPackage("sample"),
                                   steps.AnyTarget(("mac", "aws"), ("mac",)),
                                   steps.StepState.WAITING_HOLD, "2026-01-01T00:00:00+00:00",
-                                  selection=steps.Pinned("mac"))
+                                  selection=Pinned("mac"))
         steps.write(record)
         return record
 
@@ -111,7 +112,7 @@ with patch("time.time_ns", return_value=1_700_000_000_123_456_789), \
             self.assertIsInstance(joined, steps.StepRecord)
             assert isinstance(joined, steps.StepRecord)
             self.assertEqual(joined.runs_on, steps.NatedevOnly("step writes the tree"))
-            self.assertEqual(joined.selection, steps.Pinned("natedev"))
+            self.assertEqual(joined.selection, Pinned("natedev"))
             self.assertEqual(joined.state, steps.StepState.LOCAL_NONCOMPILING)
             self.assertEqual(joined.selected_target, "")
             with self.subTest(state="on_natedev"):
