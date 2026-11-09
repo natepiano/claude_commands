@@ -365,19 +365,33 @@ The block removes the temporary home when the tests end:
 - Prompt input requires an agent status of `working`, `idle`, or `done` and an empty visible composer. An absent `interactive_ready` permits input. A boolean value controls input. A non-boolean value prints one readiness anomaly and prevents input. No Remote Control turn is required. Successful worker prompt delivery returns the launcher before the transcript must contain the prompt. A matching transcript prompt prevents replay. A matching final transcript reply proves completion. With a matching transcript prompt, the hook can use its own DONE reply before the final transcript record appears. A live detached run still holds completion. A failed delivery command returns an error. An unreadable transcript prevents a retry. Both `idle` and `done` permit retyping after the settle time.
 - Each composer read uses `pane read --source visible --format ansi` and removes faint text. SGR 2 starts faint text. SGR 22 or 0 ends faint text. The parser skips colour arguments for SGR 38, 48, and 58. A faint hint can appear in an empty composer.
 
-The turn hook closes a completed pane after DONE.
-The close retains the staff row and thread. The next assign resumes that thread in a new pane.
-A busy worker or live detached run prevents closure until that work ends.
-Restore reopens only workers with active dispatches. Idle workers stay closed until their next assign.
+The turn hook closes a completed pane at once after DONE.
+The close retains the staff row and conversation.
+The next assign resumes the conversation in a new pane.
+The close reads no agent state, dispatch state, transcript, detached run, or foreground activity to permit closure.
+It sends no graceful quit and calls no process check before closure.
+
+The close keeps these identity and completion rules:
+
+1. Match the pane's terminal id to the terminal from the evidence read.
+2. Exclude a labelled pane that another staff session owns.
+3. Acquire the worker lock with blocking enabled.
+4. Confirm removal with `_pane_closed`; report "pane close is incomplete" if the pane remains.
+
+A labelled pane in the parent's tab is a stopped worker when no other staff session owns it.
+Its foreground process does not change that state.
+A stopped worker resumes in its existing pane without a foreground activity read.
+A failed family change closes a new destination pane after it stops the agent.
+Restore resumes only workers with active dispatches.
+Idle workers remain closed until their next assign.
 Shutdown restart uses the shared worker restore.
-Pane worker account moves use the shared stop, resume, and prompt APIs.
-Account moves resume only workers with active dispatches; each move closes an idle worker's pane.
-An idle worker's next assign opens its conversation on the current role account.
-A worker pane closes after the completion hook records its pass. The staff row and native conversation remain.
-A resumed worker opens in a new pane after an assign, restore, or account move.
-Unit sessions and side panes keep their shells when their agents end.
-A busy worker receives one prompt to continue the same pass. An idle worker receives no prompt.
+Account moves stop and resume open workers in the same pane, including workers without active dispatches.
+An account move closes no worker pane and runs no close check.
+A closed worker without an active dispatch has nothing to move.
+A busy worker receives one prompt to continue the same pass.
+An idle worker receives no prompt.
 The resume message builder retains the launcher prompt path for restored workers.
+Every pane keeps its shell when its agent ends.
 
 - `start_agent` gets the agent's arguments only, never the binary. Every herdr launcher builds from structured parts (`ResumeParts`, argument lists), never a shell string.
 - One herdr session, `agents` (user, 2026-10-26). Every launcher opens a tab there with `start_server(shared_session())` and `open_tab`. Probes and live checks run as tabs there too, never in a server of their own. `_require_shared` refuses a server start under any other name, and `test_one_session.py` fails on code that starts one or tells the user to attach to one.
