@@ -23,7 +23,7 @@ PYTHON_SHIM = '''import json, os, sys
 from pathlib import Path
 with Path(os.environ["VERIFY_PYTHON_LOG"]).open("a") as output:
     output.write(json.dumps(sys.argv[1:]) + "\\n")
-os.execv(sys.executable, [sys.executable, *sys.argv[1:]])
+os.execv(os.environ["VERIFY_REAL_PY"], [os.environ["VERIFY_REAL_PY"], *sys.argv[1:]])
 '''
 
 TOOL_SETUP = '''"$CLAUDE_PYTHON" - "$@" <<'PYTHON'
@@ -81,6 +81,7 @@ class VerifyNixShellTests(NixFixture):
         self.setup_log = self.root / "verification.json"
         self.python_log = self.root / "python.jsonl"
         self.env.update({"CLAUDE_PYTHON": sys.executable,
+                         "VERIFY_REAL_PY": str(SCRIPTS / "lib/py"),
                          "VERIFY_SETUP_LOG": str(self.setup_log),
                          "VERIFY_PYTHON_LOG": str(self.python_log),
                          "VERIFY_FIXTURE_EXIT": "37"})
@@ -195,7 +196,8 @@ class VerifyNixShellTests(NixFixture):
         configuration = self.root / "user_zone.conf"
         _ = configuration.write_text("zone=Europe/Paris\n", encoding="utf-8")
         result = subprocess.run(["bash", str(clock)], cwd=self.work,
-                                env={**self.env, "USER_ZONE_CONF": str(configuration)},
+                                env={**self.env, "PY": str(self.bin / "python3"),
+                                     "USER_ZONE_CONF": str(configuration)},
                                 capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout, "Europe/Paris\n")

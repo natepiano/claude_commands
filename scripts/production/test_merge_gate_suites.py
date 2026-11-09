@@ -7,26 +7,151 @@ import json
 import contextlib
 import io
 import os
+import sys
 from pathlib import Path
 from typing import cast, final
 from unittest import mock
 from scripts.production import merge_gate
-from scripts.production.merge_gate_test_support import SUITE_MODULE, gate_suites
+from scripts.production.gate_modules import discover_test_modules, test_module_name
+from scripts.production.merge_gate_test_support import SUITE_MODULE, gate_suites, install_test_runner
 from scripts.production.merge_gate_suites_test_support import GateSuitesFixture
 
 
 @final
 class MergeGateSuitesTests(GateSuitesFixture):
+    @gate_suites("hooks", "direct")
+    def test_whole_machine_orders_modules_from_supplied_times_without_writing_them(self) -> None:
+        path = self.state / "module_seconds.json"
+        content = json.dumps({"hooks/test_first.py": 100.0, "direct/test_first.py": 1.0})
+        self.write(path, content)
+        machine = merge_gate.WholeMachine(merge_gate.read_measures(path))
+        with (mock.patch.dict(os.environ, self.environment),
+              mock.patch.object(os, "cpu_count", return_value=1),
+              mock.patch.object(merge_gate, "save_measures", side_effect=AssertionError("measure write")),
+              contextlib.redirect_stdout(io.StringIO()) as output):
+            run = merge_gate.run_suites(self.checkout, machine=machine)
+        self.assertTrue(run.passed, output.getvalue())
+        starts = [event["suite"] for event in self.module_events() if event["event"] == "start"]
+        self.assertEqual(starts, ["hooks", "direct"])
+        self.assertEqual(path.read_text(), content)
+        self.assertEqual(machine.module_seconds, {"hooks/test_first.py": 100.0, "direct/test_first.py": 1.0})
+
+    @gate_suites("hooks", "direct")
+    def test_whole_machine_without_times_keeps_the_discovery_order(self) -> None:
+        with (mock.patch.dict(os.environ, self.environment),
+              mock.patch.object(os, "cpu_count", return_value=1),
+              contextlib.redirect_stdout(io.StringIO()) as output):
+            run = merge_gate.run_suites(self.checkout, machine=merge_gate.WholeMachine())
+        self.assertTrue(run.passed, output.getvalue())
+        starts = [event["suite"] for event in self.module_events() if event["event"] == "start"]
+        self.assertEqual(starts, ["direct", "hooks"])
+
+    @gate_suites("lib")
+    def test_whole_machine_uses_all_cpus_without_shared_admission_or_holds(self) -> None:
+        self.write(self.state / "barrier", "two")
+        output = io.StringIO()
+        with (mock.patch.dict(os.environ, self.environment),
+              mock.patch.object(os, "cpu_count", return_value=2),
+              mock.patch.object(merge_gate, "typecheck_python", return_value=Path(sys.executable)),
+              contextlib.ExitStack() as blocked, contextlib.redirect_stdout(output)):
+            for name in ("BuildHoldWait", "gate_reservation", "queue_place", "shared_cpu_pool",
+                         "suite_scope_prefix", "merge_gate_governor_gib", "SampledRSSAdmission",
+                         "PassedTreeLedger", "clean_test_tree", "gate_state_dir", "process_memory_mib"):
+                _ = blocked.enter_context(mock.patch.object(merge_gate, name, side_effect=AssertionError(name)))
+            run = merge_gate.run_suites(self.checkout, type_dirs=("scripts",), max_running_jobs=1,
+                                       machine=merge_gate.WholeMachine())
+        self.assertTrue(run.passed, output.getvalue())
+        self.assertEqual(len(run.jobs), 3)
+        self.assertIn("at most 2 modules at once", output.getvalue())
+        active: set[int] = set()
+        peak = 0
+        for event in self.module_events():
+            if event["event"] == "start":
+                active.add(event["pid"])
+            else:
+                active.remove(event["pid"])
+            peak = max(peak, len(active))
+        self.assertEqual(peak, 2)
+        self.assertEqual(active, set())
+        self.assertFalse(any(call["tool"] in ("systemd-run", "ssh") for call in self.calls()))
+        for job in run.jobs:
+            self.assertIn(f"{job.suite}/{job.module} exit=0 seconds=", output.getvalue())
+
+    @gate_suites("hooks")
+    def test_whole_machine_does_not_rerun_a_failed_module(self) -> None:
+        self.write(self.state / "fail-first-hooks", "once")
+        with mock.patch.dict(os.environ, self.environment), contextlib.redirect_stdout(io.StringIO()) as output:
+            run = merge_gate.run_suites(self.checkout, machine=merge_gate.WholeMachine())
+        self.assertFalse(run.passed, output.getvalue())
+        self.assertEqual(len(run.jobs), 1)
+        self.assertEqual(run.jobs[0].returncode, 1)
+        self.assertEqual(len([event for event in self.module_events() if event["event"] == "start"]), 1)
+        self.assertIn("hooks/test_first.py exit=1 seconds=", output.getvalue())
+        self.assertNotIn("Rerun alone", output.getvalue())
+
+    @gate_suites("hooks")
+    def test_whole_machine_stops_a_module_at_its_time_limit(self) -> None:
+        self.write(self.state / "hold-module", "held")
+        with mock.patch.dict(os.environ, self.environment), contextlib.redirect_stdout(io.StringIO()) as output:
+            run = merge_gate.run_suites(self.checkout, module_time_limit_s=2,
+                                       machine=merge_gate.WholeMachine())
+        self.assertFalse(run.passed, output.getvalue())
+        self.assertEqual(len(run.jobs), 1)
+        self.assertTrue(run.jobs[0].killed_for)
+        self.assertIn("seconds=", output.getvalue())
+        self.assertIn("stopped", output.getvalue())
+
+    def test_modules_run_the_checkout_runner_and_import_from_the_checkout(self) -> None:
+        runner = install_test_runner(self.checkout)
+        marker = self.state / "checkout-runner"
+        self.write(runner, runner.read_text().replace(
+            'if __name__ == "__main__":',
+            f'Path({str(marker)!r}).write_text(str(Path(__file__).resolve()))\n\n'
+            + 'if __name__ == "__main__":'))
+        self.write(self.checkout / "checkout_identity.py", 'VALUE = "tested checkout"\n')
+        self.write(self.checkout / "scripts/hooks/test_first.py", SUITE_MODULE + '''
+    def test_imports_use_the_checkout(self):
+        import checkout_identity
+        self.assertEqual(checkout_identity.VALUE, "tested checkout")
+''')
+        result = self.run_gate("--tests-only", "--full")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(marker.read_text(), str(runner))
+        self.assert_all_modules_started()
+
+    def test_a_missing_checkout_runner_is_refused_before_any_job_starts(self) -> None:
+        runner = self.checkout / "scripts/test_times/module_run.py"
+        runner.unlink(missing_ok=True)
+        result = self.run_gate("--tests-only", "--full")
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(result.stderr.strip(), f"REFUSED: test runner not found: {runner}")
+        self.assertEqual(self.calls(), [])
+        self.assertEqual(self.module_events(), [])
+
     def test_recovery_suites_include_their_real_regression_modules(self) -> None:
         repo = Path(__file__).resolve().parents[2]
-        found = {(suite, merge_gate.test_module_name(repo, suite, path))
-                 for suite, path in merge_gate.discover_test_modules(repo)}
+        found = {(suite, test_module_name(repo, suite, path))
+                 for suite, path in discover_test_modules(repo)}
         self.assertTrue({
             ("release", "test_release.py"), ("claude_to_codex", "test_sync.py"),
             ("new_rust_project", "test_rust_generate.py"), ("validate_and_push", "test_rerun.py"),
             ("exclude", "test_exclude.py"), ("prioritize", "tests/test_renumber.py"),
             ("prioritize", "tests/test_run_watcher.py"),
         }.issubset(found), found)
+
+    def test_discovery_keeps_path_order_and_skips_cache_folders(self) -> None:
+        repo = self.checkout / "discovery"
+        for name in ("z/test_last.py", "a/test_last.py", "a/nested/test_first.py",
+                     "a/__pycache__/test_hidden.py", "__pycache__/test_hidden.py"):
+            self.write(repo / "scripts" / name, "# A fixture module.\n")
+        found = discover_test_modules(repo)
+        self.assertEqual(found, [
+            ("a", repo / "scripts/a/nested/test_first.py"),
+            ("a", repo / "scripts/a/test_last.py"),
+            ("z", repo / "scripts/z/test_last.py"),
+        ])
+        self.assertEqual([test_module_name(repo, suite, path) for suite, path in found],
+                         ["nested/test_first.py", "test_last.py", "test_last.py"])
 
     @gate_suites("prioritize")
     def test_a_nested_suite_module_runs_and_retries_at_its_discovered_path(self) -> None:
@@ -81,13 +206,44 @@ class MergeGateSuitesTests(GateSuitesFixture):
         self.assertRegex(result.stdout, r"(?m)^hooks: OK \d+\.\d+s$")
         self.assertNotRegex(result.stdout, r"(?m)^notify:")
 
-    def test_modules_preserve_the_callers_pythonpath(self) -> None:
+    def test_modules_use_only_the_checked_tree_pythonpath(self) -> None:
         caller_path = self.root / "caller-pythonpath"
         caller_path.mkdir()
         self.environment.update({"PYTHONPATH": str(caller_path), "MERGE_GATE_TEST_PYTHONPATH": str(caller_path),
                                  "MERGE_GATE_TEST_ISOLATION": "1"})
         result = self.run_gate("--tests-only")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    @gate_suites("hooks", "message")
+    def test_caller_modules_fail_and_plain_python_children_import_the_checked_tree(self) -> None:
+        caller_path = self.root / "caller-pythonpath"
+        self.write(caller_path / "caller_only.py", 'VALUE = "caller"\n')
+        self.environment["PYTHONPATH"] = str(caller_path)
+        del self.environment["MERGE_GATE_PYTHON"]
+        self.write(self.checkout / "scripts/hooks/test_first.py", "import caller_only\n")
+        identity = self.checkout / "scripts/message/checkout_identity.py"
+        self.write(identity, 'VALUE = "checked tree"\n')
+        marker = self.state / "plain-python-import"
+        self.write(self.checkout / "scripts/message/test_first.py", f'''import subprocess
+import sys
+import unittest
+from pathlib import Path
+
+class ChildImports(unittest.TestCase):
+    def test_child_imports_the_checked_tree(self):
+        result = subprocess.run(
+            [sys.executable, "-c", "from scripts.message import checkout_identity; print(checkout_identity.__file__)"],
+            capture_output=True, text=True, check=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), {str(identity)!r})
+        Path({str(marker)!r}).write_text(result.stdout.strip())
+''')
+        result = self.run_gate("--tests-only", "--full", own_process=True, type_dirs=())
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("No module named 'caller_only'", result.stdout)
+        self.assertIn("hooks: RED", result.stdout)
+        self.assertIn("message: OK", result.stdout)
+        self.assertEqual(marker.read_text(), str(identity))
 
     @gate_suites("lib")
     def test_modules_use_private_build_logs_and_remove_them(self) -> None:
@@ -103,7 +259,11 @@ class MergeGateSuitesTests(GateSuitesFixture):
         for row in rows:
             self.assertTrue(Path(row["buildlog"]).is_relative_to(row["tmpdir"]))
             self.assertFalse(Path(row["tmpdir"]).exists())
-        self.assertEqual(set(caller_log.iterdir()), {caller_log / "keep"})
+        gate_records = [cast(dict[str, object], json.loads(line))
+                        for path in caller_log.rglob("*")
+                        if path.is_file() and path != caller_log / "keep"
+                        for line in path.read_text().splitlines()]
+        self.assertEqual([record.get("kind") for record in gate_records], ["gate_run"])
         self.assertEqual((caller_log / "keep").read_text(), "caller log")
         self.assertEqual(list((caller_log / "admission").glob("*.reservation")), [])
         self.assertEqual(list((caller_log / "admission").glob("*.waiting")), [])

@@ -6,18 +6,83 @@ import fcntl
 import io
 import json
 import os
+import sys
 import tempfile
 import unittest
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import redirect_stdout
-from datetime import timezone
+from contextlib import redirect_stderr, redirect_stdout
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import TextIO, cast, override
+from typing import Literal, TextIO, cast, override
 from unittest.mock import patch
 
 from scripts.accounts.home_test_support import scratch_account_home
-from scripts.accounts import moves, worker_names
+from scripts.accounts import accounts, moves, pane_moves, role_map, worker_names
+from scripts.herdr import worker_panes
+from scripts.lib.atomic_file import write_text_atomic
+from scripts.lib import unit_runs
+from scripts.production import staff, session_staff
+from scripts.production.staff_test_support import (
+    StaffTestCase, fixture_member, fixture_worker, fixture_runtime_id,
+)
+from scripts.shutdown import inventory, stop_results
+from scripts.whoami import agent_accounts, note_file
+from scripts.whoami.account_test_support import create_claude_account, write_codex_auth
 
+
+class SingleSessionMoveNoticeTests(unittest.TestCase):
+    home: Path = Path()
+
+    @override
+    def setUp(self) -> None:
+        self.home = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        _ = self.enterContext(scratch_account_home(self.home, {}, clear=True))
+
+    def move_lines(self, kind: Literal["unit", "showrunner", "top-level"], target: str, *, dry_run: bool) -> list[str]:
+        owner = inventory.ListedSession("session-alpha", 123, "fixture-start", "alpha", kind,
+                                        self.home / ".claude1", "fixture-login", "fixture", "")
+        checked = accounts.MoveTargetReady(accounts.NamedAccount(target, self.home / ("." + target)))
+        with (patch.object(accounts, "import_module", return_value=inventory),
+              patch.object(inventory, "listing", return_value=[owner]),
+              patch.object(accounts, "check_move_target", return_value=checked),
+              patch.object(accounts, "session_account_label", return_value="claude1"),
+              patch.object(accounts, "group_accounts", return_value=accounts.GroupAccounts(
+                  units="claude4", showrunners="claude4")),
+              patch.object(accounts, "move_sessions", return_value=(stop_results.ClaudeUp(
+                  owner.session_id, "w1:p1", target),)) as move):
+            result = accounts.move(owner.name, target, dry_run=dry_run)
+        if dry_run:
+            self.assertIsInstance(result, accounts.MoveDryRun)
+            assert isinstance(result, accounts.MoveDryRun)
+            move.assert_not_called()
+            return list(result.lines)
+        self.assertIsInstance(result, accounts.MoveStarted)
+        assert isinstance(result, accounts.MoveStarted)
+        move.assert_called_once()
+        return result.stdout.splitlines()
+
+    def test_move_outside_the_group_account_names_the_return_account_and_group_command(self) -> None:
+        for kind in ("unit", "showrunner"):
+            group = "units" if kind == "unit" else "showrunners"
+            for dry_run in (False, True):
+                with self.subTest(kind=kind, dry_run=dry_run):
+                    lines = self.move_lines(kind, "claude3", dry_run=dry_run)
+                    self.assertEqual(lines[-1], "alpha returns to claude4 at its next resume; "
+                                     + f"to keep claude3, run: accounts.py move {group} claude3")
+                    self.assertEqual(sum("returns to" in line for line in lines), 1)
+
+    def test_move_to_the_group_account_has_no_return_notice(self) -> None:
+        for kind in ("unit", "showrunner"):
+            for dry_run in (False, True):
+                with self.subTest(kind=kind, dry_run=dry_run):
+                    lines = self.move_lines(kind, "claude4", dry_run=dry_run)
+                    self.assertFalse(any("returns to" in line for line in lines))
+
+    def test_ad_hoc_move_has_no_return_notice(self) -> None:
+        for dry_run in (False, True):
+            with self.subTest(dry_run=dry_run):
+                lines = self.move_lines("top-level", "claude3", dry_run=dry_run)
+                self.assertFalse(any("returns to" in line for line in lines))
 
 
 class MoveJournalTests(unittest.TestCase):
@@ -606,6 +671,150 @@ class MoveJournalTests(unittest.TestCase):
         unchanged = roles.stat().st_mtime_ns
         self.assertEqual(moves.read_moves()[0].get("from"), "codex3")
         self.assertEqual(roles.stat().st_mtime_ns, unchanged)
+
+
+class WorkerGroupPendingTests(StaffTestCase):
+    def __init__(self, methodName: str = "runTest") -> None:
+        super().__init__(methodName)
+        self.stop_requests: list[str] = []
+        self.failed_worker: str = ""
+
+    @override
+    def setUp(self) -> None:
+        super().setUp()
+        _ = self.enterContext(patch.object(unit_runs, "RUN_ROOT", self.root / "runs"))
+        _ = self.enterContext(patch.object(unit_runs, "FORMER_RUN_ROOT", self.root / "former-runs"))
+        _ = cast(object, self.enterContext(patch.dict(os.environ, {"UNIT_RUN_DIR": "", "PLAN_DELEGATE_BOARD_DIR": ""})))
+        home = Path(os.environ["HOME"])
+        home.mkdir(parents=True, exist_ok=True)
+        _ = self.enterContext(scratch_account_home(home, {}, clear=False))
+        Path(os.environ["NOTIFIER_SESSIONS_DIR"]).mkdir(parents=True, exist_ok=True)
+        _ = self.enterContext(patch.object(role_map, "is_role_map_host", return_value=True))
+        _ = (home / ".claude.json").write_text(json.dumps({"oauthAccount": {"emailAddress": "fixture@example.invalid"}}))
+        create_claude_account("claude1", "claude@example.invalid")
+        notes = note_file.notes_dir()
+        _ = (notes / note_file.note_name("codex1")).write_text("---\nlogin: codex@example.invalid\n---\n")
+        binary = self.root / "bin"
+        binary.mkdir(exist_ok=True)
+        codex = binary / "codex"
+        _ = codex.write_text("#!" + sys.executable + "\n" +
+            "import json, sys\nfor line in sys.stdin:\n"
+            + "    request = json.loads(line)\n"
+            + "    if 'id' in request:\n"
+            + "        print(json.dumps({'id': request['id'], 'result': {}}), flush=True)\n")
+        codex.chmod(0o700)
+        _ = cast(object, self.enterContext(patch.dict(os.environ, {"PATH": str(binary) + os.pathsep + os.environ.get("PATH", "")})))
+        self.assertEqual(accounts.setup("codex1"), [])
+        write_codex_auth(home / ".codex1", "codex@example.invalid")
+        report = agent_accounts.Report("Codex", email="codex@example.invalid",
+            quotas=[agent_accounts.Quota("Weekly", 80, datetime.now(timezone.utc) + timedelta(days=1))])
+        _ = self.enterContext(patch.object(accounts, "_codex_live", return_value=report))
+        self.stop_requests.clear()
+        self.failed_worker = ""
+        patches = [
+            cast(object, self.enterContext(patch.object(pane_moves, "_move_locked", side_effect=self.stop_worker))),
+            cast(object, self.enterContext(patch.object(worker_panes, "worker_run", return_value=self.root / "pane-run"))),
+        ]
+        self.addCleanup(patches.clear)
+        _ = self.enterContext(patch.object(accounts, "SCRIPTS", self.root / "no-launchers"))
+
+    def stop_worker(self, move: pane_moves.WorkerMove,
+                    hold: worker_panes.WorkerLockHold) -> accounts.SessionMoveOutcome:
+        del hold
+        self.stop_requests.append(move.row.id)
+        if move.row.id == self.failed_worker:
+            return accounts.SessionMoveRefused(move.row.id, "source process could not stop")
+        return stop_results.ResumePending(move.row.id, move.target, "destination is not ready")
+
+    def worker(self, name: str, family: Literal["claude", "codex"]) -> tuple[staff.StaffRow, Path]:
+        owner = fixture_member("showrunner", name="history-owner")
+        unit = fixture_member("unit", name="history-unit", parent=owner.id,
+                              worktree=staff.PresentWorktree("natedev", self.root))
+        backend = staff.ClaudeBackend() if family == "claude" else staff.CodexBackend(Path(os.environ["HOME"]) / ".codex")
+        with patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(Path.home() / ".claude")}):
+            row = fixture_worker(name, unit.id, backend=backend)
+        run = self.root / "old-runs" / name
+        run.mkdir(parents=True)
+        write_text_atomic(run / "progress_history_state.json", json.dumps({"owner_staff_id": unit.id}))
+        _ = staff.update_current_session(unit.current_session, staff.native_id(fixture_runtime_id("replacement director")))
+        return row, run
+
+
+    def test_account_moves_stop_fixed_workers_and_keep_pending_rows_in_both_families(self) -> None:
+        for family in ("claude", "codex"):
+            for target in ("codex1", "claude1"):
+                with self.subTest(family=family, target=target):
+                    self.stop_requests.clear()
+                    row, run = self.worker("worker-" + family + target, family)
+                    before = {path: path.read_bytes() for path in self.root.rglob("*") if path.is_file()}
+                    result = accounts.move_workers(target, dry_run=True)
+                    assert isinstance(result, accounts.GroupMoveDryRun)
+                    same_family = target.startswith(family)
+                    preview = (f"would stop and resume the same conversation on {target} in its worker pane" if same_family
+                               else f"not moved: cannot restart on {target} through assign.sh")
+                    self.assertEqual(result.lines, (f"{row.name} ({row.id}): {preview}",))
+                    self.assertIn(str(row.id), "\n".join(result.lines))
+                    self.assertIn(target, "\n".join(result.lines))
+                    self.assertEqual({path: path.read_bytes() for path in self.root.rglob("*") if path.is_file()}, before)
+                    self.assertEqual(staff.by_id(row.id), row)
+                    self.assertEqual(self.stop_requests, [])
+                    inbox = session_staff.inbox_path(row.id)
+                    inbox.parent.mkdir(parents=True, exist_ok=True)
+                    write_text_atomic(inbox, '{"messages": ["held assignment"], "accepting_messages": true}')
+                    reference = (run / "progress_history_state.json").read_bytes(), inbox.read_bytes()
+                    saved = self.staff_file.read_bytes()
+                    with redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as errors:
+                        code = accounts.main(["move", "workers", target])
+                    self.assertEqual(code, 1, output.getvalue() + errors.getvalue())
+                    self.assertEqual(self.stop_requests, [row.id] if same_family else [])
+                    self.assertEqual(staff.by_id(row.id), row)
+                    self.assertEqual(self.staff_file.read_bytes(), saved)
+                    self.assertEqual(((run / "progress_history_state.json").read_bytes(), inbox.read_bytes()), reference)
+                    self.assertEqual(session_staff.worker_directory(staff.local_snapshot(), row.id), self.root)
+                    lines = (output.getvalue() + errors.getvalue()).splitlines()
+                    self.assertEqual(len(lines), 1, lines)
+                    self.assertIn(str(row.id), lines[0])
+                    self.assertIn(target, lines[0])
+                    if same_family:
+                        self.assertIn("pending", lines[0])
+                    else:
+                        self.assertIn(f"cannot restart on {target} through assign.sh", lines[0])
+                    self.assertEqual(staff.retire(row.id), row)
+
+    def test_one_failed_stop_reports_the_worker_and_keeps_other_moves_pending(self) -> None:
+        for failure in ("stop", "locked"):
+            with self.subTest(failure=failure):
+                self.stop_requests.clear()
+                failed, failed_run = self.worker("first-fails-" + failure, "claude")
+                healthy, healthy_run = self.worker("second-works-" + failure, "claude")
+                saved = {path: path.read_bytes() for run in (failed_run, healthy_run) for path in run.iterdir()}
+                before = self.staff_file.read_bytes()
+                self.failed_worker = failed.id
+                lock_path = self.staff_file.parent / "locks" / f"{failed.id}.lock"
+                lock_path.parent.mkdir(parents=True, exist_ok=True)
+                with lock_path.open("a") as lock:
+                    if failure == "locked":
+                        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    with redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as errors:
+                        code = accounts.main(["move", "workers", "claude1"])
+                self.assertEqual(code, 1)
+                self.assertEqual(set(self.stop_requests),
+                                 {failed.id, healthy.id} if failure == "stop" else {healthy.id})
+                self.assertEqual(len(self.stop_requests), 2 if failure == "stop" else 1)
+                self.assertEqual(staff.by_id(failed.id), failed)
+                self.assertEqual(staff.by_id(healthy.id), healthy)
+                self.assertEqual(self.staff_file.read_bytes(), before)
+                self.assertEqual({path: path.read_bytes() for run in (failed_run, healthy_run) for path in run.iterdir()}, saved)
+                lines = (output.getvalue() + errors.getvalue()).splitlines()
+                self.assertEqual(len(lines), 2, lines)
+                failed_line = next(line for line in lines if str(failed.id) in line)
+                healthy_line = next(line for line in lines if str(healthy.id) in line)
+                self.assertIn("source process could not stop" if failure == "stop"
+                              else "dispatch lock is held", failed_line)
+                self.assertIn("pending", healthy_line)
+                self.assertIn("claude1", healthy_line)
+                _ = staff.retire(failed.id)
+                _ = staff.retire(healthy.id)
 
 
 if __name__ == "__main__":

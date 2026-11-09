@@ -2,6 +2,10 @@
 """Find a live Claude session's socket, `SendMessage` address, session ID or transcript."""
 
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import json
 import os
@@ -9,22 +13,17 @@ import stat
 import sys
 import time
 import tomllib
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass
 from enum import Enum
 from importlib import import_module
 from pathlib import Path
 from typing import Literal, NotRequired, TypedDict, cast
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.lib.session_paths import sessions_directory
 
-if __package__:
-    from .process_identity import process_start as process_start
-    from .relay_identity import RelayIdentity, live_relay_identity, relay_senders_directory
-else:
-    from process_identity import process_start as process_start
-    from relay_identity import RelayIdentity, live_relay_identity, relay_senders_directory
+from scripts.message.process_identity import process_start as process_start
+from scripts.message.relay_identity import RelayIdentity, live_relay_identity, relay_senders_directory
 
 
 # Claude's entrypoint for a print-mode run starts with this; an interactive session's is "cli".
@@ -302,8 +301,6 @@ def _session_observations(session_id: str) -> Iterator[LiveSessionProcess | Sess
             observed = process_liveness(registered["pid"], registered.get("procStart", ""))
             if not isinstance(observed, SessionNotLive):
                 yield observed
-    if registry.unreadable:
-        yield SessionLivenessUnknown("unreadable session registry record: " + registry.unreadable[0].name)
 
 
 def session_liveness(session_id: str) -> LiveSessionProcess | SessionNotLive | SessionLivenessUnknown:
@@ -340,12 +337,19 @@ def _readable_records() -> Iterator[SessionRecord]:
     yield from (item.record for item in read_registry().entries)
 
 
+def _running(records: Iterable[SessionRecord]) -> list[SessionRecord]:
+    return sorted((record for record in records if running_session(record)),
+                  key=lambda record: record["updatedAt"], reverse=True)
+
+
+def running_records(registry: RegistryRead) -> list[SessionRecord]:
+    """Every running record of one registry read, newest first, including processes without sockets."""
+    return _running(item.record for item in registry.entries)
+
+
 def running_sessions() -> list[SessionRecord]:
     """Every running record, newest first, including processes without sockets."""
-    return sorted(
-        (record for record in _readable_records() if running_session(record)),
-        key=lambda record: record["updatedAt"], reverse=True,
-    )
+    return _running(_readable_records())
 
 
 def live_sessions() -> list[SessionRecord]:
@@ -371,11 +375,22 @@ def addressed(to: str, records: list[SessionRecord]) -> SessionRecord | None:
 
 
 def named(name: str, records: list[SessionRecord]) -> SessionRecord | None:
-    """The live session a session name or unit id means, as `addressed` finds it: "handler-unit" and
-    "handler" each find the session named either way."""
-    bare = name.removesuffix("-unit")
-    return next((found for candidate in dict.fromkeys((name, bare, f"{bare}-unit"))
-                 if (found := addressed(candidate, records)) is not None), None)
+    """Find the live session with this staff name."""
+    return addressed(name, records)
+
+
+def config_dirs() -> list[Path]:
+    directories = {path for path in Path.home().glob(".claude*") if path.is_dir()}
+    override = os.environ.get("CLAUDE_CONFIG_DIR")
+    if override:
+        directories.add(Path(override).expanduser())
+    return sorted(directories)
+
+
+def transcript_locations(session_id: str) -> list[Path]:
+    """Return distinct transcript paths across the Claude accounts."""
+    return sorted({path.resolve() for directory in config_dirs()
+                   for path in (directory / "projects").glob(f"*/{session_id}.jsonl")})
 
 
 def latest_transcript(session_id: str, projects: Path) -> Path | None:
@@ -388,7 +403,6 @@ def member_target(target: str) -> str:
     """Resolve a retained staff reference to its current conversation at delivery."""
     if not target.startswith("session:"):
         return target
-    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
     resolve = cast(Callable[[str], str], import_module("scripts.production.staff").current_session_target)
     return resolve(target)
 
@@ -403,7 +417,6 @@ def main(argv: list[str]) -> int:
 
     command, target = argv[1:]
     if command == "member-socket":
-        sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
         try:
             target = member_target(target)
         except (OSError, ValueError) as error:

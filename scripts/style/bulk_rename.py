@@ -1,10 +1,14 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
 """Apply approved local renames with rust-analyzer, the shared proof and crate verification.
 
 Nothing is committed. Refused findings return to ordinary tickets; kept findings become built at the normal merge.
 The review file samples the verified findings that the batch will build.
 """
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import argparse
 import hashlib
@@ -34,16 +38,14 @@ from pathlib import Path
 from types import MappingProxyType, TracebackType
 from typing import BinaryIO, Protocol, TypedDict, cast
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.build_queue import queue_place
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
 
-import berth_board
-import style_footprint
-import style_ledger
-import approved_renames
-from approved_renames import (BindingComments, BindingRename, BindingScope, NoBindingScope, OuterBindingBlocked, OuterBindingUnproved,
+from scripts.lib import berth_board
+from scripts.style import style_footprint
+from scripts.style import style_ledger
+from scripts.style import approved_renames
+from scripts.style.approved_renames import (BindingComments, BindingRename, BindingScope, NoBindingScope, OuterBindingBlocked, OuterBindingUnproved,
                               RenameDeclaration, rename_declaration, refactor_rename, refactor_comments, binding_comments,
                               PatternBindingCollision, pattern_binding_check,
                               backtick_mentions, identifier_mentions, field_sites)
@@ -75,12 +77,12 @@ def admission_attempt(begin: Callable[[], None], started: Callable[[], None]) ->
 
 
 @contextmanager
-def style_program_place(program: str, repo: Path) -> Generator[queue_place.QueuePlace]:
+def style_program_place(arguments: Sequence[str], repo: Path) -> Generator[queue_place.QueuePlace]:
     """Stop the command before a queue refusal can change finding state."""
     begin, started = _admission_changes.get()
     begin()
     try:
-        with queue_place.queue_place(program, repo) as place:
+        with queue_place.queue_place(arguments, repo, batch=True) as place:
             place.on_started = started
             yield place
     except queue_place.QueuePlaceRefused as error:
@@ -398,7 +400,7 @@ class RustAnalyzer:
         self.timeout: float = timeout
         self.lifetime: ExitStack = ExitStack()
         try:
-            place = self.lifetime.enter_context(style_program_place("rust-analyzer", repo))
+            place = self.lifetime.enter_context(style_program_place(["rust-analyzer"], repo))
             self.process: subprocess.Popen[bytes] = place.popen(
                 ["rust-analyzer"], cwd=repo, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
         except BaseException:
@@ -1985,7 +1987,7 @@ def combine_file_renames(files: Sequence[FileRenames]) -> tuple[FileRenames, ...
 
 def cargo_output(repo: Path, arguments: Sequence[str]) -> subprocess.CompletedProcess[str]:
     """Capture Cargo output while the shared queue owns the program lifetime."""
-    with style_program_place("cargo", repo) as place:
+    with style_program_place(arguments, repo) as place:
         process = place.popen(arguments, cwd=repo, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         try:
             output, errors = process.communicate()
@@ -1999,7 +2001,7 @@ def cargo_output(repo: Path, arguments: Sequence[str]) -> subprocess.CompletedPr
 def command(repo: Path, arguments: Sequence[str]) -> None:
     print("bulk rename: " + " ".join(arguments), flush=True)
     if arguments and Path(arguments[0]).name == "cargo":
-        with style_program_place("cargo", repo) as place:
+        with style_program_place(arguments, repo) as place:
             code = place.popen(arguments, cwd=repo).wait()
     else:
         code = subprocess.run(arguments, cwd=repo, check=False).returncode

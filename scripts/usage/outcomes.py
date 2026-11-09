@@ -14,7 +14,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import BinaryIO, Literal, cast
 
-from scripts.production import production_units, session_staff, staff, unit_lookup, unit_names
+from scripts.production import session_staff, staff
+from scripts.production.production_doc import cell_value
 from scripts.accounts.worker_names import journal_entry
 from scripts.usage.rollouts import parse_timestamp
 from scripts.whoami import run_out
@@ -41,13 +42,16 @@ def git_text(repo: Path, *arguments: str) -> str | None:
     return result.stdout if result.returncode == 0 else None
 
 
-def cell_value(value: str) -> str:
-    quoted = re.search(r"`([^`]+)`", value)
-    return quoted.group(1) if quoted else value.split(" — ", 1)[0].strip()
+def production_owners(production_docs: Path, record: staff.StaffSnapshot) -> Iterator[staff.StaffRow]:
+    """Yield the showrunners with documents in the production folder."""
+    return (owner for owner in record.find(kind="showrunner")
+            if isinstance(owner.doc, (staff.LiveDoc, staff.WrappedDoc))
+            and owner.doc.path.parent == production_docs)
 
 
-def production_paths(path: Path, *, resolver: session_staff.RowResolver | None = None) -> tuple[Path, ...]:
-    """Read the worktrees held by the document owner's staff rows."""
+def production_paths(owner: staff.StaffRow, *, resolver: session_staff.RowResolver | None = None) -> tuple[Path, ...]:
+    """Read the worktrees for a showrunner with a recorded document."""
+    path = cast(staff.LiveDoc | staff.WrappedDoc, owner.doc).path
     try:
         lines = path.read_text(encoding="utf-8").splitlines()
     except (OSError, UnicodeError):
@@ -56,17 +60,13 @@ def production_paths(path: Path, *, resolver: session_staff.RowResolver | None =
                     if (value := cell_value(line.removeprefix("- **Repository:** "))))
     try:
         resolver = resolver if resolver is not None else session_staff.RowResolver(staff.snapshot())
-        cells = {cell_value(row.get("Unit", "")): row for row in production_units.unit_table(lines)}
-    except (staff.StaffUnreadable, production_units.Refusal) as error:
+        rows = resolver.record.find(kind="unit", parent=owner.id)
+    except staff.StaffUnreadable as error:
         print(f"outcomes: {path}: {error}", file=sys.stderr)
-        return headers
-    owner = resolver.record.by_doc(remote.local_machine(), path)
-    if owner is None:
-        print(f"outcomes: {path}: no staff owner binds the document", file=sys.stderr)
         return headers
     paths: list[Path] = []
     found_main = False
-    for row in resolver.record.find(kind="unit", parent=owner.id):
+    for row in rows:
         tree = resolver.unit_worktree(row)
         if isinstance(tree, staff.WorktreeUnfilled):
             print(f"outcomes: {row.name}: the worktree is not recorded", file=sys.stderr)
@@ -74,15 +74,6 @@ def production_paths(path: Path, *, resolver: session_staff.RowResolver | None =
         if tree.machine != remote.local_machine():
             continue
         folder = tree.path
-        for unit_cells in cells.values():
-            if unit_names.name(cell_value(unit_cells.get("Unit", ""))) != row.name:
-                continue
-            if cell_value(unit_cells.get("Plan", "")):
-                try:
-                    folder = unit_lookup.plan_worktree(unit_cells, session_staff.MemberFound(row))
-                except staff.StaffUnreadable as error:
-                    print(f"outcomes: {row.name}: {error}", file=sys.stderr)
-            break
         worktrees = git_text(folder, "worktree", "list", "--porcelain")
         if worktrees:
             first = worktrees.splitlines()[0]
@@ -107,8 +98,8 @@ def repositories(claude_repo: Path, production_docs: Path, *, resolver: session_
     candidates = [claude_repo]
     candidates.extend(
         path
-        for document in sorted(production_docs.glob("*-production.md"))
-        for path in production_paths(document, resolver=resolver)
+        for owner in production_owners(production_docs, resolver.record)
+        for path in production_paths(owner, resolver=resolver)
     )
     unique: dict[str, Path] = {}
     for candidate in candidates:
@@ -378,8 +369,8 @@ def collect_checkpoints(db: sqlite3.Connection, claude_repo: Path, production_do
             record = staff.StaffSnapshot(())
             state = PartialSourceRead()
         resolver = session_staff.RowResolver(record)
-        candidates = (claude_repo, *(path for document in sorted(production_docs.glob("*-production.md"))
-                                     for path in production_paths(document, resolver=resolver)))
+        candidates = (claude_repo, *(path for owner in production_owners(production_docs, record)
+                                   for path in production_paths(owner, resolver=resolver)))
         # Repository discovery omits failures; retain them in this source's state.
         # A worktree removed after its merge is no failure: its commits stay in the shared repository.
         for candidate in candidates:

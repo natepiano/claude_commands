@@ -11,24 +11,32 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from functools import cached_property
 from typing import override
 
+from scripts.production import staff
+from scripts.production.staff_test_support import StaffTestCase, fixture_worker, unit_membership
 from scripts.hooks import direct_run
 
 CLEAR = Path(__file__).with_name("clear_phase_review.sh")
 
 
-class PhaseArtifactTests(unittest.TestCase):
+class PhaseArtifactTests(StaffTestCase):
     temporary: tempfile.TemporaryDirectory[str]  # pyright: ignore[reportUninitializedInstanceVariable]
     session: Path  # pyright: ignore[reportUninitializedInstanceVariable]
 
+    @cached_property
+    def parent(self) -> staff.StaffRow:
+        return unit_membership("phase", "review")
+
     @override
     def setUp(self) -> None:
+        super().setUp()
         self.temporary = tempfile.TemporaryDirectory()
         self.session = Path(self.temporary.name) / "run"
         for phase in ("3", "4"):
             (self.session / "phases" / phase).mkdir(parents=True)
-        _ = (self.session / "progress_history_state.json").write_text("{}", encoding="utf-8")
+        self.write_json(self.session / "progress_history_state.json", {"owner_staff_id": self.parent.id})
 
     @override
     def tearDown(self) -> None:
@@ -40,12 +48,18 @@ class PhaseArtifactTests(unittest.TestCase):
         return path
 
     def test_clearing_a_phase_review_leaves_the_phase_beside_it(self) -> None:
+        reviewer = fixture_worker("project-review", self.parent.id)
+        self.write_json(self.session / "progress_history_state.json", {
+            "owner_staff_id": self.parent.id,
+            "pass": {"review": {"instance_id": "review-pass", "worker_id": reviewer.id,
+                                  "kind": "review", "status": "completed"}}})
         cleared = [self.write(f"phases/3/{name}") for name in ("review_prompt_1_adversary.md",
                                                                 "review_findings_1_adversary.txt",
-                                                                "review_status_adversary", "ux_shots_1.txt")]
+                                                                "review_status_adversary", "project-review_status_adversary", "ux_shots_1.txt")]
         kept = [self.write(f"phases/4/{name}") for name in ("review_prompt_1_adversary.md",
                                                              "review_findings_1_adversary.txt")]
         kept.append(self.write("phases/3/implementation_prompt.md"))
+        kept.append(self.write("phases/3/impl_status_impl", "implementing\n"))
         result = subprocess.run(["bash", str(CLEAR), str(self.session), "3"], capture_output=True,
                                 text=True, check=False)
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -53,17 +67,11 @@ class PhaseArtifactTests(unittest.TestCase):
         self.assertEqual([path for path in kept if not path.exists()], [])
 
     def test_a_phase_reviewing_counts_as_running_work(self) -> None:
-        _ = self.write("phases/4/review_status_adversary", "reviewing\n")
-        self.assertEqual(direct_run.running_work(self.session), "a review pass")
-
-    def test_running_work_recognizes_the_simplify_status_writer(self) -> None:
-        from scripts.lib.atomic_file import write_text_atomic
-
-        write_text_atomic(self.session / "phases/4/review_status_simplify", "reviewing\n")
+        _ = self.write("phases/4/project-review_status_adversary", "reviewing\n")
         self.assertEqual(direct_run.running_work(self.session), "a review pass")
 
     def test_a_phase_implementing_counts_as_running_work(self) -> None:
-        _ = self.write("phases/3/impl_status_impl", "implementing\n")
+        _ = self.write("phases/3/fix7_status", "running\n")
         self.assertEqual(direct_run.running_work(self.session), "an implementation or fix pass")
 
 

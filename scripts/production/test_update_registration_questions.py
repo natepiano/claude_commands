@@ -2,15 +2,18 @@
 
 from __future__ import annotations
 
+from scripts.shutdown import remote
+
 import json
 import os
 import unittest
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone, tzinfo
 from pathlib import Path
 from typing import cast
 from unittest import mock
 
-from scripts.production import staff
+from scripts.production import proposal_issue, proposals_folder, staff
+from scripts.production.issues import Issue, frontmatter
 from scripts.production.cli_fixture import invoke_cli
 from scripts.production.staff_test_support import fixture_member
 from scripts.production.update_registration_test_support import RegistrationFixture, QuestionRegistration, registration, review
@@ -19,6 +22,82 @@ from scripts.production.update_registration_test_support import setUpModule as s
 
 
 class RegistrationTests(RegistrationFixture):
+    def test_shared_proposals_and_questions_follow_staff_rename_and_transfer_without_rewrites(self) -> None:
+        owner_id = self.owner_id
+        unit_id = self.fixture_staff_id("alpha")
+        destination_doc = self.doc.with_name("other-production.md")
+        _ = destination_doc.write_text(self.doc.read_text())
+        destination = fixture_member("showrunner", name="destination",
+                                     doc=staff.LiveDoc(remote.local_machine(), destination_doc))
+        proposal = self.root / "issues/layout-proposal.md"
+        _ = proposal.write_text("\n".join([
+            "---", "status: open", "tags: [issue, proposal]", "proposal_id: P1",
+            f"proposed_by: {unit_id}", f"unit: {unit_id}", "date_created: 2026-11-02",
+            "---", "A separate proposal.", "",
+        ]))
+        with mock.patch.object(review, "review_question", return_value=review.QuestionAccepted("Keep this layout?")):
+            for title, asker in (("Choose the layout", str(unit_id)), ("Choose the colors", "")):
+                filed = self.run_command("ask", "--text", title, "--question", "Keep this layout?",
+                                         "--unit", asker)
+                self.assertEqual(filed.returncode, 0, filed.stdout + filed.stderr)
+        questions = list((self.root / "issues").glob("question-*.md"))
+        self.assertEqual(len(questions), 2)
+        self.assertEqual({frontmatter(path)["production_id"][0] for path in questions}, {owner_id})
+        self.assertEqual({frontmatter(path)["asked_by"][0] for path in questions}, {owner_id, unit_id})
+        before = {path: (path.read_bytes(), path.stat().st_mtime_ns) for path in [proposal, *questions]}
+        _ = staff.rename(owner_id, "renamed-owner")
+        _ = staff.rename(unit_id, "renamed-unit")
+        for transferred in (False, True):
+            with self.subTest(transferred=transferred):
+                if transferred:
+                    _ = staff.move(unit_id, staff.ReportsTo(destination.id))
+                self.assertEqual([issue.path for issue in proposals_folder.open_proposals(self.doc)],
+                                 [] if transferred else [proposal])
+                self.assertEqual([issue.path for issue in proposals_folder.open_proposals(destination_doc)],
+                                 [proposal] if transferred else [])
+                self.assertEqual(proposal_issue.proposal_unit(Issue(proposal, frontmatter(proposal))), "renamed-unit")
+                listed = self.run_command("questions-table")
+                self.assertEqual(listed.returncode, 0, listed.stdout + listed.stderr)
+                for text in ("Choose the layout", "Choose the colors", "renamed-unit", "renamed-owner"):
+                    self.assertIn(text, listed.stdout)
+                self.assertNotIn("A separate proposal", listed.stdout)
+                other = invoke_cli(registration, registration.main,
+                                   ["questions-table", "--production", destination.name],
+                                   self.env, self.checkout, production_state=True)
+                self.assertEqual(other.returncode, 0, other.stdout + other.stderr)
+                self.assertEqual(other.stdout.strip(), "no open questions")
+                self.assertEqual({path: (path.read_bytes(), path.stat().st_mtime_ns)
+                                  for path in before}, before)
+
+    def check_question_reopening(self, minutes: int) -> tuple[str, str]:
+        title = "Choose the layout"
+        first = datetime(2026, 11, 3, 12, 0, tzinfo=timezone.utc)
+        moment = first
+
+        def now(zone: tzinfo | None = None) -> datetime:
+            return moment.astimezone(zone)
+
+        with (mock.patch.object(registration, "datetime", wraps=datetime, now=now),
+              mock.patch.object(review, "review_question", return_value=review.QuestionAccepted("Keep this layout?"))):
+            _ = self.run_ask(title, "Keep this layout?")
+            path = self.question_record_path(title)
+            first_since = self.open_rows()[0]["since"]
+            answered = self.run_command("answer", "--item", title)
+            self.assertEqual(answered.returncode, 0, answered.stdout + answered.stderr)
+            self.assertIn("status: closed", path.read_text().splitlines())
+            moment = first + timedelta(minutes=minutes)
+            _ = self.run_ask(title, "Keep this layout?")
+        self.assertEqual(self.question_record_path(title), path)
+        return first_since, self.open_rows()[0]["since"]
+
+    def test_reopening_a_question_in_a_later_minute_changes_since(self) -> None:
+        first, reopened = self.check_question_reopening(1)
+        self.assertNotEqual(reopened, first)
+
+    def test_same_minute_reopening_keeps_since_as_a_documented_limit(self) -> None:
+        first, reopened = self.check_question_reopening(0)
+        self.assertEqual(reopened, first)
+
     def test_question_from_a_linked_checkout_uses_the_showrunner_relative_proposals_folder(self) -> None:
         main = self.checkout
         relative = self.doc.relative_to(main)
@@ -30,10 +109,10 @@ class RegistrationTests(RegistrationFixture):
         owner = self.root / "question-owner-checkout"
         unit = self.root / "question-unit-checkout"
         _ = self.git("worktree", "add", "-b", "question-owner", str(owner))
-        _ = self.git("worktree", "add", "-b", "question-unit", str(unit))
+        _ = self.git("worktree", "add", "-b", "question", str(unit))
         owner_id = self.fixture_staff_id()
-        asker_id = self.fixture_staff_id("alpha-unit")
-        _ = staff.set_doc(owner_id, staff.LiveDoc("natedev", owner / relative))
+        asker_id = self.fixture_staff_id("alpha")
+        _ = staff.set_doc(owner_id, staff.LiveDoc(remote.local_machine(), owner / relative))
         self.checkout = unit
         self.doc = unit / relative
         with mock.patch.object(review, "review_question", return_value=review.QuestionAccepted("Keep this layout?")):
@@ -58,38 +137,40 @@ class RegistrationTests(RegistrationFixture):
         _ = self.git("worktree", "add", "-b", "other-question-owner", str(other))
         _ = self.git("worktree", "add", "-b", "ambiguous-question-caller", str(caller))
         second = fixture_member("showrunner", name="other-question-owner",
-                                doc=staff.LiveDoc("natedev", other / relative))
+                                doc=staff.LiveDoc(remote.local_machine(), other / relative))
         return caller / relative, self.fixture_staff_id(), second.id
 
-    def test_ask_refuses_ambiguous_document_ownership_without_writing_a_question(self) -> None:
+    def test_ask_uses_the_staff_name_when_checkouts_share_a_document_path(self) -> None:
         document, first, second = self.ambiguous_question_document()
-        asker_id = self.fixture_staff_id("alpha-unit")
-        before = {path: (path.read_bytes(), path.stat().st_mtime_ns)
-                  for path in self.state.rglob("*") if path.is_file()}
+        asker_id = self.fixture_staff_id("alpha")
+        staff_file = self.state / "staff/staff.json"
+        before = staff_file.read_bytes()
         self.checkout = document.parents[2]
         self.doc = document
         with mock.patch.object(review, "review_question", return_value=review.QuestionAccepted("Keep this layout?")):
             result = self.run_command("ask", "--text", "Choose the layout", "--question", "Keep this layout?",
                                       "--unit", str(asker_id))
-        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertIn(str(first), result.stdout + result.stderr)
-        self.assertIn(str(second), result.stdout + result.stderr)
-        self.assertEqual({path: (path.read_bytes(), path.stat().st_mtime_ns)
-                          for path in self.state.rglob("*") if path.is_file()}, before)
-        self.assertEqual(list((self.root / "issues").iterdir()), [])
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        question, = (self.root / "issues").glob("question-*.md")
+        self.assertIn(f"production_id: {first}", question.read_text().splitlines())
+        self.assertNotIn(f"production_id: {second}", question.read_text().splitlines())
+        self.assertEqual(staff_file.read_bytes(), before)
 
-    def test_footer_sources_refuses_ambiguous_document_ownership_without_a_traceback(self) -> None:
-        import footer_counts
+    def test_footer_sources_reports_ambiguous_document_ownership_without_a_traceback(self) -> None:
+        from scripts.production import footer_counts
 
         document, first, second = self.ambiguous_question_document()
         staff_file = self.state / "staff/staff.json"
         before = staff_file.read_bytes(), staff_file.stat().st_mtime_ns
         def read_sources() -> int:
-            _ = footer_counts.sources(document)
+            for path in footer_counts.sources(document):
+                print(path)
             return 0
 
         result = invoke_cli(footer_counts, read_sources, [], self.env, self.checkout, production_state=True)
-        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn(str(document), result.stdout.splitlines())
+        self.assertIn("unavailable", result.stderr)
         self.assertIn(str(first), result.stderr)
         self.assertIn(str(second), result.stderr)
         self.assertNotIn("Traceback", result.stderr)
@@ -99,12 +180,12 @@ class RegistrationTests(RegistrationFixture):
         main = self.checkout
         relative = self.doc.relative_to(main)
         owner_id = self.fixture_staff_id()
-        asker_id = self.fixture_staff_id("alpha-unit")
+        asker_id = self.fixture_staff_id("alpha")
         owner = self.root / "owner-checkout"
         unit = self.root / "unit-checkout"
         _ = self.git("worktree", "add", "-b", "owner-copy", str(owner))
         _ = self.git("worktree", "add", "-b", "unit-copy", str(unit))
-        _ = staff.set_doc(owner_id, staff.LiveDoc("natedev", owner / relative))
+        _ = staff.set_doc(owner_id, staff.LiveDoc(remote.local_machine(), owner / relative))
         staff_file = self.state / "staff/staff.json"
         before = staff_file.read_bytes()
         for checkout, title in ((unit, "Unit checkout question"), (main, "Main checkout question")):
@@ -184,11 +265,11 @@ class RegistrationTests(RegistrationFixture):
             with self.subTest(action=action):
                 self.write_open_for("example", {"since": "2026-10-06T08:00", "text": "Reminder"},
                                     {"since": "2026-10-06T08:00", "text": "unit question?", "question": "Keep the layout?",
-                                     "asked_by": "alpha-unit"})
+                                     "asked_by": "alpha"})
                 path = self.outstanding()
                 history = path.with_suffix(".history.jsonl")
                 before = path.read_bytes()
-                command = (("ask", "--text", "new question?", "--question", "Try the new layout?", "--unit", "alpha-unit")
+                command = (("ask", "--text", "new question?", "--question", "Try the new layout?", "--unit", "alpha")
                            if action == "ask" else ("mark-important", "--item", "Reminder")
                            if action == "mark-important" else
                            ("questions", "--state", str(self.question_state(["Reminder", "New reminder"]))))
@@ -216,7 +297,7 @@ class RegistrationTests(RegistrationFixture):
                 saved = self.open_rows()
                 unit_question = next(item for item in saved if item["text"] == "unit question?")
                 self.assertEqual((unit_question["question"], unit_question["asked_by"]),
-                                 ("Keep the layout?", self.fixture_staff_id("alpha-unit")))
+                                 ("Keep the layout?", self.fixture_staff_id("alpha")))
                 if action == "ask":
                     self.assertEqual(sum(item["text"] == "new question?" for item in saved), 1)
                     entries = [cast(dict[str, object], json.loads(line)) for line in history.read_text().splitlines()]
@@ -243,15 +324,15 @@ class RegistrationTests(RegistrationFixture):
 
         with mock.patch.object(review, "review_question", return_value=review.QuestionAccepted("Retry it?")):
             with mock.patch.object(os, "replace", side_effect=stop), self.assertRaises(KeyboardInterrupt):
-                _ = self.run_ask("retry?", "Retry it?", "alpha-unit")
+                _ = self.run_ask("retry?", "Retry it?", "alpha")
             self.assertEqual((path.read_bytes(), history.read_bytes()), before)
-            _ = self.run_ask("retry?", "Retry it?", "alpha-unit")
+            _ = self.run_ask("retry?", "Retry it?", "alpha")
         self.assertEqual([item.text for item in self.read_items(path)], ["Reminder", "retry?"])
         entries = [cast(dict[str, object], json.loads(line)) for line in history.read_text().splitlines()]
         self.assertEqual([item["text"] for item in entries], ["Earlier registration", "retry?"])
 
     def test_stopped_report_replacement_preserves_report_and_rerun_updates_it(self) -> None:
-        reports = self.outstanding().parent.parent / "reports/example.json"
+        reports = self.outstanding().parent.parent / "reports" / self.outstanding().name
         reports.parent.mkdir(parents=True)
         _ = reports.write_text('[{"text":"Earlier report","until":"2026-10-17T09:00"}]\n')
         before = reports.read_bytes()
@@ -293,7 +374,7 @@ class RegistrationTests(RegistrationFixture):
         self.assertEqual(json.loads(outstanding.read_text(encoding="utf-8")), [])
 
     def test_questions_state_replaces_reports_only_when_report_to_user_is_present(self) -> None:
-        written = self.outstanding().parent.parent / "reports/example.json"
+        written = self.outstanding().parent.parent / "reports" / self.outstanding().name
         state = self.root / "judgment.json"
         report = {"text": "hanadocs is back", "until": "2026-10-17T09:00"}
         _ = state.write_text(json.dumps({"report_to_user": [report]}), encoding="utf-8")

@@ -9,10 +9,9 @@ import unittest
 from pathlib import Path
 from typing import final, override
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 from scripts.lib.process_group import send_process_group
 from scripts.lib.rerun_test_support import ScriptRepositoryTestCase
-from test_renumber import GOALS, issue_text  # pyright: ignore[reportImplicitRelativeImport]
+from scripts.prioritize.tests.test_renumber import GOALS, issue_text
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 PRIORITIZE_DIR = Path(__file__).parents[1]
@@ -86,7 +85,7 @@ raise SystemExit(2)
 
         content = RUN_WATCHER.read_text(encoding="utf-8")
         replacements = {
-            'PY="$HOME/.claude/scripts/lib/py"': f'PY="{sys.executable}"',
+            'PY="${BASH_SOURCE[0]%/*}/../lib/py"': f'PY="{PY_SHIM}"',
             'WRITER_LOCK_TOOL="$HOME/.claude/scripts/prioritize/writer_lock.py"': f'WRITER_LOCK_TOOL="{PRIORITIZE_DIR / "writer_lock.py"}"',
             'RUNNER_LOCK_TOOL="$HOME/.claude/scripts/prioritize/runner_lock.py"': f'RUNNER_LOCK_TOOL="{RUNNER_LOCK}"',
             'SNAPSHOT_TOOL="$HOME/.claude/scripts/prioritize/snapshot.py"': (
@@ -143,7 +142,7 @@ raise SystemExit(2)
         while time.monotonic() < deadline:
             result = subprocess.run(
                 [
-                    sys.executable,
+                    str(PY_SHIM),
                     str(RUNNER_LOCK),
                     "status",
                     str(self.runner_lock_path),
@@ -176,7 +175,7 @@ class RunWatcherTests(ScriptRepositoryTestCase):
     def _start_lock_owner(self, command: list[str]) -> subprocess.Popen[bytes]:
         owner = subprocess.Popen(
             [
-                sys.executable,
+                str(PY_SHIM),
                 str(RUNNER_LOCK),
                 "run",
                 str(self.fixture.runner_lock_path),
@@ -460,10 +459,9 @@ raise SystemExit(0)
         _ = issue.write_text(issue_text(), encoding="utf-8")
         _ = self.fixture.goals.write_text(GOALS, encoding="utf-8")
         blocked = self.write(self.root / "export-blocked", "blocked\n")
-        _ = self.fixture.renumber.write_text(f'''import os, sys
+        _ = self.fixture.renumber.write_text(f'''import os
 from pathlib import Path
-sys.path.insert(0, {str(PRIORITIZE_DIR)!r})
-import renumber, writer_lock
+from scripts.prioritize import renumber, writer_lock
 root = Path({str(self.fixture.root)!r})
 renumber.PRODUCTION_SCOPE = renumber.Scope(root, root / "issues", root / "prioritization goals.md")
 acquire = writer_lock.acquire_writer_lock

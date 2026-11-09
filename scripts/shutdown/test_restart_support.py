@@ -2,7 +2,7 @@
 import subprocess
 import unittest
 from unittest.mock import patch
-import restart_support as settle
+from scripts.shutdown import restart_support as settle
 NOW = "2026-10-09T21:49:10+00:00"
 
 class SendOutcomeTests(unittest.TestCase):
@@ -34,3 +34,8 @@ class SendOutcomeTests(unittest.TestCase):
         with patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 3, "SENT: inconsistent", "")):
             self.assertEqual(settle.send_message("fixture", "summary", "message"),
                              settle.MessageUnconfirmed(kind="unconfirmed", reason="send returned no confirmed outcome"))
+
+    def test_retry_reports_without_recording_delivery(self) -> None:
+        with patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 6, "RETRY: active", "")):
+            with self.assertRaisesRegex(RuntimeError, "needs a retry: active"):
+                _ = settle.send_message("fixture", "summary", "message")

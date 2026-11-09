@@ -41,6 +41,8 @@ Wait for that answer before continuing. Never write "existing path": name the do
 
 ## Step 3: Build the todo list
 
+Run `"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/statusline/adhoc_items.py" <remaining>` with the item count.
+
 If a todo tool is available (e.g. `TaskCreate`), add one task per item, in order, each with a short label and status `pending`. If not, keep an inline numbered checklist and refer to items by number.
 
 ## Step 3.5: Establish the shared model
@@ -109,6 +111,9 @@ For each item, in order:
 
 Do not ask "continue or add more?" between items — assume continue unless the user volunteers something.
 
+After each terminal choice, including a skip, run `"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/statusline/adhoc_items.py" <remaining>` with the open count.
+Run it again when the user returns to a closed item; include that item in the count.
+
 ### Decision frame
 
 Use this order by default:
@@ -149,6 +154,8 @@ approve (recommended — reason) / alternative / elaborate
 This is a scaffold, not a demand for headings when a very small item reads more clearly in a few sentences.
 
 ## Step 5: Wrap up
+
+Run `"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/statusline/adhoc_items.py" 0` when the review ends, including an early end.
 
 When every item is done:
 

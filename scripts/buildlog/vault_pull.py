@@ -1,32 +1,34 @@
-"""Fast-forward the Mac's vault through natedev; alert once until it works again."""
+"""Sync the Mac vault through natedev and file one question for each outage."""
 
 from __future__ import annotations
 
-import fcntl
 import json
 import math
+import re
 import shlex
 import subprocess
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal, cast
+from typing import Literal, cast, get_args
 
-import rust_release
-import store
-import sync
-import conf
-
-if TYPE_CHECKING:
-    from ..notify import push_texts
-else:
-    import push_texts
+from scripts.buildlog import ci
+from scripts.buildlog.health import Machine
+from scripts.lib.atomic_file import write_text_atomic
+from scripts.lib import file_lock
+from scripts.lib.process_failure import failure_detail
+from scripts.buildlog import store
+from scripts.buildlog import sync
+from scripts.lib import conf
 
 STATE_NAME = "vault_pull.json"
-PUSH_TEXT_ID = "vault.stopped"
 LOCAL_VAULT = Path("/home/natepiano/rust/hanadocs")
+REGISTRATION = Path.home() / ".claude/scripts/production/update_registration.py"
 UNREACHABLE_GRACE_S = 24 * 60 * 60
 COMMAND_TIMEOUT_S = 120
+ORIGIN_MAIN = "refs/remotes/origin/main"
+MAC_MAIN = "refs/remotes/mac/main"
 
 
 @dataclass(frozen=True)
@@ -40,22 +42,22 @@ class Current:
 
 
 @dataclass(frozen=True)
-class TrackedFilesChanged:
-    pass
+class MacMerged:
+    commits: int
+
+
+@dataclass(frozen=True)
+class DeferredSync:
+    reason: str
+
+
+@dataclass(frozen=True)
+class VaultConflict:
+    files: tuple[str, ...]
 
 
 @dataclass(frozen=True)
 class NotOnMain:
-    pass
-
-
-@dataclass(frozen=True)
-class HistoryDiverged:
-    pass
-
-
-@dataclass(frozen=True)
-class UntrackedWouldBeOverwritten:
     pass
 
 
@@ -72,11 +74,13 @@ class VaultLocked:
 @dataclass(frozen=True)
 class VaultCommandFailed:
     detail: str
+    machine: Machine = Machine.NATEDEV
 
 
-PullStop = TrackedFilesChanged | NotOnMain | HistoryDiverged | UntrackedWouldBeOverwritten | MacUnreachable | VaultLocked | VaultCommandFailed
-PullOutcome = Pulled | Current | PullStop
-StopCause = Literal["tracked_files_changed", "not_on_main", "history_diverged", "untracked_would_be_overwritten", "mac_unreachable", "vault_locked", "command_failed"]
+PullStop = VaultConflict | NotOnMain | MacUnreachable | VaultLocked | VaultCommandFailed
+PullOutcome = Pulled | Current | DeferredSync | PullStop
+StopCause = Literal["conflict", "not_on_main", "mac_unreachable", "vault_locked", "command_failed"]
+STOP_CAUSES = frozenset(cast(tuple[StopCause, ...], get_args(StopCause)))
 
 
 @dataclass(frozen=True)
@@ -93,7 +97,7 @@ class NeverPulled:
 class OpenOutage:
     cause: StopCause
     since: float
-    alerted: bool
+    asked: bool
     detail: str
 
 
@@ -108,97 +112,175 @@ class VaultState:
     outage: OpenOutage | NoOutage
 
 
-# Mac login can hide the command's exit status; only the printed marker is its outcome.
-# No command changes branch, index, or worktree except the final fast-forward.
+# Mac login can hide the exit status. The printed marker gives the outcome.
 REMOTE_PULL = """export LC_ALL=C
 outcome() { printf 'VAULT_OUTCOME=%s\\n' "$1"; exit 0; }
-branch=$(git -C rust/hanadocs symbolic-ref --quiet --short HEAD) || outcome branch
+g() { git -C rust/hanadocs "$@"; }
+retry_git() {
+  retries_left=${vault_lock_retries:-0}
+  while :; do
+    output=$(g "$@" 2>&1)
+    result=$?
+    [ "$result" != 0 ] || return 0
+    printf '%s\\n' "$output" >&2
+    case "$output" in
+      *"index.lock"*"File exists"*|*"File exists"*"index.lock"*)
+        [ "$retries_left" -gt 0 ] || outcome locked
+        retries_left=$((retries_left - 1))
+        sleep "$vault_lock_retry_delay_s" || outcome failed
+        ;;
+      *) return "$result" ;;
+    esac
+  done
+}
+branch=$(g symbolic-ref --quiet --short HEAD) || outcome branch
 [ "$branch" = main ] || outcome branch
-changed=$(git -C rust/hanadocs status --porcelain --untracked-files=no) || outcome failed
-[ -z "$changed" ] || outcome tracked
-git -C rust/hanadocs merge-base --is-ancestor HEAD refs/remotes/origin/main
-ancestor=$?
-[ "$ancestor" = 0 ] || { [ "$ancestor" = 1 ] && outcome diverged; outcome failed; }
-count=$(git -C rust/hanadocs rev-list --count HEAD..refs/remotes/origin/main) || outcome failed
-retries_left=${vault_lock_retries:-0}
-while :; do
-  merged=$(git -C rust/hanadocs merge --ff-only --no-overwrite-ignore refs/remotes/origin/main 2>&1)
-  result=$?
-  [ "$result" != 0 ] || break
-  printf '%s\\n' "$merged" >&2
-  case "$merged" in
-    *"index.lock"*"File exists"*|*"File exists"*"index.lock"*)
-      [ "$retries_left" -gt 0 ] || outcome locked
-      retries_left=$((retries_left - 1))
-      sleep "$vault_lock_retry_delay_s" || outcome failed
-      ;;
-    *"untracked working tree files would be overwritten"*) outcome untracked ;;
-    *"Not possible to fast-forward"*|*"not possible to fast-forward"*) outcome diverged ;;
-    *) outcome failed ;;
-  esac
-done
-outcome "pulled:$count"
+if g rev-parse -q --verify MERGE_HEAD >/dev/null; then
+  files=$(g diff --name-only --diff-filter=U) || outcome failed
+  if [ -z "$files" ]; then
+    files=$(g diff --name-only HEAD) || outcome failed
+  fi
+  printf '%s\\n' "$files" | sed 's/^/VAULT_CONFLICT=/'
+  outcome conflict
+fi
+retry_git add -A || outcome failed
+g diff --cached --quiet
+case $? in
+  0) ;;
+  1) retry_git commit -m 'vault: Mac edits' || outcome failed ;;
+  *) outcome failed ;;
+esac
+count=$(g rev-list --count HEAD..refs/remotes/origin/main) || outcome failed
+if ! retry_git merge --no-edit --no-overwrite-ignore refs/remotes/origin/main; then
+  files=$(g diff --name-only --diff-filter=U) || outcome failed
+  [ -n "$files" ] || outcome failed
+  retry_git merge --abort || outcome failed
+  printf '%s\\n' "$files" | sed 's/^/VAULT_CONFLICT=/'
+  outcome conflict
+fi
+commit=$(g rev-parse HEAD) || outcome failed
+outcome "merged:$count:$commit"
 """
 
 
 def run(args: list[str], timeout: float) -> subprocess.CompletedProcess[str] | None:
-    """One replaceable transport boundary; sync owns process execution and SSH options."""
+    """Use the shared transport boundary for every external command."""
     return sync.run(args, timeout)
+
+
+def git(*args: str) -> subprocess.CompletedProcess[str] | VaultCommandFailed:
+    result = run(["git", "-C", str(LOCAL_VAULT), *args], COMMAND_TIMEOUT_S)
+    if result is None:
+        return VaultCommandFailed("natedev git command did not complete")
+    return result
+
+
+def command_failure(result: subprocess.CompletedProcess[str], machine: Machine = Machine.NATEDEV) -> VaultCommandFailed:
+    return VaultCommandFailed(failure_detail(result), machine)
+
+
+def git_ok(*args: str) -> subprocess.CompletedProcess[str] | VaultCommandFailed:
+    result = git(*args)
+    if isinstance(result, VaultCommandFailed):
+        return result
+    return command_failure(result) if result.returncode != 0 else result
+
+
+def mac_git(*args: str) -> subprocess.CompletedProcess[str] | VaultCommandFailed | MacUnreachable:
+    transport = ["-c", "core.sshCommand=" + shlex.join(["ssh", *sync.ssh_options()])]
+    result = git(*transport, *args)
+    if isinstance(result, VaultCommandFailed):
+        return MacUnreachable()
+    if result.returncode == 0:
+        return result
+    if result.returncode == 255 or any(text in result.stderr.lower() for text in (
+        "connection timed out", "connection refused", "could not resolve hostname",
+        "no route to host", "network is unreachable", "connection closed", "permission denied (publickey",
+    )):
+        return MacUnreachable()
+    return command_failure(result, Machine.MAC)
+
+
+def marked(stdout: str, prefix: str) -> tuple[str, ...]:
+    return tuple(line.removeprefix(prefix) for line in stdout.splitlines() if line.startswith(prefix))
+
+
+def remote_outcome(result: subprocess.CompletedProcess[str]) -> MacMerged | PullStop:
+    markers = marked(result.stdout, "VAULT_OUTCOME=")
+    if len(markers) == 1:
+        value = markers[0]
+        if value == "branch":
+            return NotOnMain()
+        if value == "locked":
+            return VaultLocked(result.stderr.strip())
+        if value == "conflict":
+            return VaultConflict(marked(result.stdout, "VAULT_CONFLICT="))
+        merged = re.fullmatch(r"merged:([0-9]+):([0-9a-f]{40}|[0-9a-f]{64})", value)
+        if merged:
+            return MacMerged(int(merged[1]))
+    elif not markers and result.returncode == 255:
+        return MacUnreachable()
+    return command_failure(result, Machine.MAC)
+
+
+def publish_mac(merged: MacMerged) -> PullOutcome:
+    fetched = mac_git("fetch", f"{sync.peer_name()}:rust/hanadocs", f"refs/heads/main:{MAC_MAIN}")
+    if isinstance(fetched, (VaultCommandFailed, MacUnreachable)):
+        return fetched
+    if not ci.warm():
+        return DeferredSync("GitHub credentials are cold; the next hour retries")
+    fetched = git_ok("fetch", "origin", "main")
+    if isinstance(fetched, VaultCommandFailed):
+        return fetched
+    contained = git("merge-base", "--is-ancestor", MAC_MAIN, ORIGIN_MAIN)
+    if isinstance(contained, VaultCommandFailed):
+        return contained
+    if contained.returncode == 0:
+        return Pulled(merged.commits) if merged.commits else Current()
+    if contained.returncode != 1:
+        return command_failure(contained)
+    forward = git("merge-base", "--is-ancestor", ORIGIN_MAIN, MAC_MAIN)
+    if isinstance(forward, VaultCommandFailed):
+        return forward
+    target = MAC_MAIN
+    if forward.returncode == 1:
+        tree = git("merge-tree", "--write-tree", "--name-only", "-z", ORIGIN_MAIN, target)
+        if isinstance(tree, VaultCommandFailed):
+            return tree
+        if tree.returncode == 1:
+            return DeferredSync("GitHub main conflicts with the Mac; the next hour merges it on the Mac")
+        if tree.returncode != 0:
+            return command_failure(tree)
+        commit = git_ok("commit-tree", tree.stdout.split("\0", 1)[0].strip(),
+                        "-p", ORIGIN_MAIN, "-p", target, "-m", "vault: merge Mac edits")
+        if isinstance(commit, VaultCommandFailed):
+            return commit
+        target = commit.stdout.strip()
+    elif forward.returncode != 0:
+        return command_failure(forward)
+    pushed = git("push", "--porcelain", "origin", f"{target}:refs/heads/main")
+    if isinstance(pushed, VaultCommandFailed):
+        return pushed
+    if pushed.returncode != 0:
+        if any(line.startswith("!") and "[rejected]" in line for line in pushed.stdout.splitlines()):
+            return DeferredSync("GitHub main changed; the next hour retries")
+        return command_failure(pushed)
+    return Pulled(merged.commits)
 
 
 def pull() -> PullOutcome:
     peer = sync.peer_name()
-    options = sync.ssh_options()
-    pushed = run([
-        "git", "-C", str(LOCAL_VAULT), "-c", "core.sshCommand=" + shlex.join(["ssh", *options]),
-        "push", f"{peer}:rust/hanadocs", "refs/remotes/origin/main:refs/remotes/origin/main",
-    ], COMMAND_TIMEOUT_S)
-    if pushed is None:
-        return MacUnreachable()
-    if pushed.returncode != 0:
-        detail = pushed.stderr.lower()
-        if any(text in detail for text in ("[rejected]", "non-fast-forward", "fetch first")):
-            return HistoryDiverged()
-        if pushed.returncode == 255 or any(text in detail for text in (
-            "connection timed out", "connection refused", "could not resolve hostname",
-            "no route to host", "network is unreachable", "connection closed", "permission denied (publickey",
-        )):
-            return MacUnreachable()
-        return VaultCommandFailed(pushed.stderr.strip() or f"git push exited {pushed.returncode}")
+    pushed = mac_git("push", f"{peer}:rust/hanadocs", f"{ORIGIN_MAIN}:{ORIGIN_MAIN}")
+    if isinstance(pushed, (VaultCommandFailed, MacUnreachable)):
+        return pushed
     settings = conf.read("build_targets")
-    retries = settings.whole("vault.lock_retries")
-    delay = settings.number("vault.lock_retry_delay_s")
-    remote = (
-        f"vault_lock_retries={shlex.quote(str(retries))}\n"
-        + f"vault_lock_retry_delay_s={shlex.quote(str(delay))}\n" + REMOTE_PULL
-    )
-    result = run(["ssh", *options, peer, remote], COMMAND_TIMEOUT_S)
+    remote = (f"vault_lock_retries={settings.whole('vault.lock_retries')}\n"
+              + f"vault_lock_retry_delay_s={settings.number('vault.lock_retry_delay_s')}\n" + REMOTE_PULL)
+    result = run(["ssh", *sync.ssh_options(), peer, remote], COMMAND_TIMEOUT_S)
     if result is None:
         return MacUnreachable()
-    markers = [line.removeprefix("VAULT_OUTCOME=") for line in result.stdout.splitlines()
-               if line.startswith("VAULT_OUTCOME=")]
-    if len(markers) == 1:
-        match markers[0]:
-            case "tracked":
-                return TrackedFilesChanged()
-            case "branch":
-                return NotOnMain()
-            case "diverged":
-                return HistoryDiverged()
-            case "locked":
-                return VaultLocked(result.stderr.strip())
-            case "untracked":
-                return UntrackedWouldBeOverwritten()
-            case value if value.startswith("pulled:"):
-                count = value.removeprefix("pulled:")
-                if count.isascii() and count.isdecimal():
-                    commits = int(count)
-                    return Pulled(commits) if commits else Current()
-            case _:
-                pass
-    elif not markers and result.returncode == 255:
-        return MacUnreachable()
-    return VaultCommandFailed(result.stderr.strip() or "Mac pull result unavailable")
+    outcome = remote_outcome(result)
+    return publish_mac(outcome) if isinstance(outcome, MacMerged) else outcome
 
 
 def state_path() -> Path:
@@ -224,10 +306,13 @@ def read_state() -> VaultState:
     raw_outage = fields.get("outage")
     if isinstance(raw_outage, dict):
         outage = cast(dict[str, object], raw_outage)
-        cause, since, alerted = outage.get("cause"), timestamp(outage.get("since")), outage.get("alerted")
-        if cause in ("tracked_files_changed", "not_on_main", "history_diverged", "untracked_would_be_overwritten", "mac_unreachable", "vault_locked", "command_failed") and isinstance(since, float) and isinstance(alerted, bool):
+        since = timestamp(outage.get("since"))
+        if isinstance(since, float):
+            cause = outage.get("cause")
             detail = outage.get("detail", "")
-            return VaultState(last_good, OpenOutage(cause, since, alerted, detail if isinstance(detail, str) else ""))
+            return VaultState(last_good, OpenOutage(
+                cause if isinstance(cause, str) and cause in STOP_CAUSES else "command_failed",
+                since, outage.get("asked") is True, detail if isinstance(detail, str) else ""))
     return VaultState(last_good, NoOutage())
 
 
@@ -237,33 +322,71 @@ def write_state(state: VaultState) -> None:
     outage = state.outage
     data = {
         "last_good": state.last_good.at if isinstance(state.last_good, LastGoodPull) else None,
-        "outage": {"cause": outage.cause, "since": outage.since, "alerted": outage.alerted, "detail": outage.detail} if isinstance(outage, OpenOutage) else None,
+        "outage": {"cause": outage.cause, "since": outage.since, "asked": outage.asked, "detail": outage.detail}
+        if isinstance(outage, OpenOutage) else None,
     }
-    partial = path.with_name(path.name + ".tmp")
-    _ = partial.write_text(json.dumps(data) + "\n")
-    _ = partial.replace(path)
+    write_text_atomic(path, json.dumps(data) + "\n")
 
 
 def stop_details(outcome: PullStop) -> tuple[StopCause, str, str]:
     match outcome:
-        case TrackedFilesChanged():
-            return "tracked_files_changed", "Some files in ~/rust/hanadocs on the Mac have changes that are not committed.", "In a terminal on the Mac, commit or discard the changes in ~/rust/hanadocs."
+        case VaultConflict(files):
+            return ("conflict", f"The hanadocs merge has a conflict on Mac. Files: {', '.join(files)}.",
+                    "In a terminal on the Mac, resolve the conflicting edits in ~/rust/hanadocs. "
+                    + "Both copies changed the same content. The commits remain available. "
+                    + "1. Combine the edits and commit the result. This keeps the wanted content from both copies. "
+                    + "2. Choose one copy for each file and commit the result. This replaces the other copy's content. "
+                    + "I recommend choice 1. The next hourly sync retries the merge.")
         case NotOnMain():
-            return "not_on_main", "~/rust/hanadocs on the Mac is not on the main branch.", "In a terminal on the Mac, switch ~/rust/hanadocs to the main branch."
-        case HistoryDiverged():
-            return "history_diverged", "The Mac copy has commits that GitHub does not have, so a safe update is not possible.", "In a terminal on the Mac, push the commits in ~/rust/hanadocs to GitHub."
-        case UntrackedWouldBeOverwritten():
-            return "untracked_would_be_overwritten", "An update would replace a file on the Mac that git does not track.", "In a terminal on the Mac, move the untracked file that blocks the hanadocs update out of ~/rust/hanadocs. Run git -C ~/rust/hanadocs merge --ff-only origin/main to see its name."
+            return ("not_on_main", "The hanadocs vault on the Mac is not on main.",
+                    "In a terminal on the Mac, select a branch for ~/rust/hanadocs. "
+                    + "1. Switch to main. The next hourly sync merges the vault. "
+                    + "2. Keep the current branch. The hourly sync remains stopped. I recommend choice 1.")
         case MacUnreachable():
-            return "mac_unreachable", "natedev could not reach the Mac for more than 24 hours.", "Wake the Mac and connect it to the network."
-        case VaultLocked():
-            return "vault_locked", "Another git process held ~/rust/hanadocs/.git/index.lock on the Mac for every try.", "In a terminal on the Mac, check that no git process uses ~/rust/hanadocs; if none does, remove ~/rust/hanadocs/.git/index.lock."
-        case VaultCommandFailed():
-            return "command_failed", "The update failed with an error the job does not know.", f"On natedev, read the detail in {state_path()}, or run journalctl --user -u buildlog.service | grep 'buildlog vault'."
+            return ("mac_unreachable", "natedev cannot reach the Mac for the hanadocs sync for at least 24 hours.",
+                    "In a terminal on the Mac, restore its network connection. "
+                    + "1. Wake the Mac and connect it to the network. The next hourly sync retries. "
+                    + "2. Keep the Mac offline. The Mac vault remains unchanged. I recommend choice 1.")
+        case VaultLocked(detail):
+            return ("vault_locked", f"A Git index lock stops the hanadocs sync on the Mac. Detail: {detail}",
+                    "In a terminal on the Mac, examine ~/rust/hanadocs/.git/index.lock. "
+                    + "1. Let an active Git process finish. Remove the lock if no Git process uses it. The next hourly sync retries. "
+                    + "2. Keep the lock. The sync retries each hour. I recommend choice 1.")
+        case VaultCommandFailed(detail, machine):
+            return ("command_failed", f"The hanadocs sync has an unknown command error on {machine}. Detail: {detail}",
+                    "In the natedev session on natedev, examine the buildlog.service log for the failing command and machine. "
+                    + "1. Repair the command error. The next hourly sync retries. "
+                    + "2. Leave the error unresolved. The vault sync remains stopped. I recommend choice 1.")
+
+
+def question_text(since: float) -> str:
+    opened = datetime.fromtimestamp(since, UTC)
+    return f"Hanadocs vault sync stopped, {opened.isoformat()}"
+
+
+def registration(command: str, *args: str) -> bool:
+    production = conf.read("build_targets").text("vault.question_production")
+    result = run([
+        "python3", str(REGISTRATION), command, "--production", production, *args,
+    ], COMMAND_TIMEOUT_S)
+    return result is not None and result.returncode == 0
+
+
+def ask_question(reason: str, choices: str, since: float) -> bool:
+    opened = datetime.fromtimestamp(since, UTC)
+    return registration(
+        "ask",
+        "--text", question_text(since),
+        "--question", reason + " " + choices, "--urgency", "soon",
+        "--due", (opened + timedelta(days=1)).date().isoformat(),
+    )
+
+
+def withdraw_question(since: float) -> bool:
+    return registration("withdraw", "--item", question_text(since))
 
 
 def vault() -> int:
-    # Pause uses this same contact lock, so no Mac work outlives pause's return.
     with sync.sync_lock():
         paused = sync.read_pause()
         if isinstance(paused, sync.SyncPaused):
@@ -273,38 +396,36 @@ def vault() -> int:
 
 
 def _vault_locked() -> int:
-    # The manual command and the hourly job share both the outage and its send.
     path = state_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.with_suffix(".lock").open("a+b") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
+    with file_lock.exclusive(path.with_suffix(".lock")):
         state = read_state()
         outcome = pull()
         now = time.time()
+        if isinstance(outcome, DeferredSync):
+            write_state(replace(state, last_good=LastGoodPull(now)))
+            print("buildlog vault: " + outcome.reason)
+            return 0
         if isinstance(outcome, (Pulled, Current)):
             write_state(VaultState(LastGoodPull(now), NoOutage()))
-            print(f"buildlog vault: pulled {outcome.commits} commits" if isinstance(outcome, Pulled) else "buildlog vault: current")
+            description = f"buildlog vault: synced {outcome.commits} incoming commits" if isinstance(outcome, Pulled) else "buildlog vault: current"
+            if isinstance(state.outage, OpenOutage) and state.outage.asked and not withdraw_question(state.outage.since):
+                description += "; the question was not withdrawn"
+            print(description)
             return 0
-        cause, reason, action = stop_details(outcome)
-        detail = outcome.detail if isinstance(outcome, (VaultCommandFailed, VaultLocked)) else reason
+        cause, reason, choices = stop_details(outcome)
         previous = state.outage
-        outage = OpenOutage(cause, previous.since, previous.alerted, detail) if isinstance(previous, OpenOutage) else OpenOutage(cause, now, False, detail)
+        outage = replace(previous, cause=cause, detail=reason) if isinstance(previous, OpenOutage) else OpenOutage(cause, now, False, reason)
         last_good = state.last_good.at if isinstance(state.last_good, LastGoodPull) else outage.since
-        sleeping = isinstance(outcome, MacUnreachable) and now - last_good <= UNREACHABLE_GRACE_S
-        # Save before sending: a send failure must retry without losing the outage's start.
-        write_state(VaultState(state.last_good, outage))
-        if not outage.alerted and not sleeping:
-            # A note's send key has no permanent deduplication window. Commit the
-            # alert before sending, so a later save failure cannot repeat it.
-            write_state(VaultState(state.last_good, OpenOutage(cause, outage.since, True, detail)))
-            try:
-                sent = rust_release.send_release_text(push_texts.render(PUSH_TEXT_ID, reason=reason, action=action))
-            except (OSError, subprocess.SubprocessError):
-                sent = False
-            if not sent:
-                write_state(VaultState(state.last_good, outage))
-        description = " ".join(detail.splitlines())
-        if sleeping:
-            description = "Mac unreachable; the next hour retries"
+        sleeping = isinstance(outcome, MacUnreachable) and now - last_good < UNREACHABLE_GRACE_S
+        if not outage.asked and not sleeping:
+            outage = replace(outage, asked=True)
+            write_state(replace(state, outage=outage))
+            if not ask_question(reason, choices, outage.since):
+                outage = replace(outage, asked=False)
+                write_state(replace(state, outage=outage))
+        else:
+            write_state(replace(state, outage=outage))
+        description = "Mac unreachable; the next hour retries" if sleeping else " ".join(reason.splitlines())
         print("buildlog vault: stopped: " + description)
-        return 0 if sleeping else 1
+        return 0 if sleeping or (outage.asked and not isinstance(outcome, VaultCommandFailed)) else 1

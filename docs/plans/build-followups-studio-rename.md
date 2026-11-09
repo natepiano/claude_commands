@@ -2,7 +2,6 @@
 
 > Proposed 2026-10-16 14:45 EDT by a natedev subagent, for the user ("studio is good - task an agent to plan a full on rename of all of the current builder-followups production").
 > Status: approved by the user 2026-10-16; team-reviewed 2026-10-16 (section 5). Builder: enh-showrunner-unit, after the unit rename. Survey taken 2026-10-16 14:35 EDT.
-> **Production:** build-followups (enh-showrunner-unit)
 
 ## Situation
 

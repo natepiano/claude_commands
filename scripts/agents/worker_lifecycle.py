@@ -1,72 +1,51 @@
-"""Own run membership, worker operations and server maintenance flocks.
-
-Order: ledger, design, membership, future staff, lifecycle, server, inbox, roster.
-
-An operation owns this lock through its server effects and final publication,
-but releases it before watching a turn. Nested acquisition is a programming
-error; callers must pass ownership down instead of reacquiring it.
-"""
+"""Read worker state, bound operations, and watch files or sockets."""
 from __future__ import annotations
+
+import ctypes
+import errno
+import socket
+import struct
+from enum import Enum
+from importlib import import_module
 
 import fcntl
 import contextlib
 import os
-import inspect
 import json
 import threading
 import time
 import select
-import sys
-from collections.abc import Callable, Generator, Sequence
-from contextlib import ExitStack, contextmanager
+from collections.abc import Callable, Generator, Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import datetime, timezone
 from pathlib import Path
-from typing import Protocol, TypeGuard, final, cast
+from typing import Protocol, final, cast
 
 from scripts.lib.atomic_file import write_text_atomic
 
 
-@dataclass(frozen=True, order=True)
-class WorkerIdentity:
-    session: Path
-    name: str
+@dataclass(frozen=True)
+class RecordedTurnSettings:
+    """The recorded model and effort for display."""
+    model: str
+    effort: str
 
-    def __post_init__(self) -> None:
-        object.__setattr__(self, "session", self.session.resolve())
-        if not self.name or Path(self.name).name != self.name or self.name in (".", ".."):
-            raise ValueError(f"invalid worker name: {self.name!r}")
+
+def recorded_turn_settings(record: Mapping[str, object]) -> RecordedTurnSettings:
+    """Use accepted-turn fields together, with the legacy pair as a fallback."""
+    model = record.get("turn_model")
+    prefix = "turn_" if isinstance(model, str) and model else ""
+    model, effort = record.get(prefix + "model"), record.get(prefix + "effort")
+    return RecordedTurnSettings(model if isinstance(model, str) else "", effort if isinstance(effort, str) else "")
 
 
 NO_LOCK_DEADLINE = float("inf")
-
-
-def is_process_pid(pid: object) -> TypeGuard[int]:
-    """Only an actual process ID above init is eligible for signalling."""
-    return type(pid) is int and pid > 1
-
-
-@dataclass(frozen=True)
-class LockIdentity:
-    session: Path
-    name: str
-    kind: str
-
-
-@dataclass(frozen=True)
-class MembershipLease:
-    """Runs whose admission boundary this operation currently owns."""
-    sessions: tuple[Path, ...]
-
-    def covers(self, session_dir: str | Path) -> bool:
-        return Path(session_dir).resolve() in self.sessions and Path(session_dir).resolve() in held_memberships()
 
 
 @final
 class _OperationState(threading.local):
     def __init__(self) -> None:
         self.deadline: float = NO_LOCK_DEADLINE
-        self.sites: dict[tuple[int, LockIdentity], str] = {}
         self.state_files: dict[Path, int] = {}
 
 
@@ -127,101 +106,6 @@ def acquire_flock(handle: int | LockFileDescriptor, *, mode: int = fcntl.LOCK_EX
             _ = select.select([], [], [], min(0.05, max(0.0, deadline - time.monotonic())))
 
 
-@contextmanager
-def _locks(identities: Sequence[LockIdentity], deadline: float) -> Generator[None]:
-    caller = inspect.currentframe()
-    assert caller is not None
-    while caller.f_back and caller.f_code.co_filename in (__file__, contextlib.__file__):
-        caller = caller.f_back
-    site = f"{caller.f_code.co_filename}:{caller.f_lineno} ({caller.f_code.co_name})"
-    del caller
-    keys = [(os.getpid(), identity) for identity in identities]
-    for key in keys:
-        if key in _operation.sites:
-            raise RuntimeError(f"recursive worker {key[1].kind} lock for {key[1]}: {_operation.sites[key]} -> {site}")
-    for key in keys:
-        _operation.sites[key] = site
-    try:
-        with ExitStack() as locks:
-            for identity in identities:
-                identity.session.mkdir(parents=True, exist_ok=True)
-                handle = locks.enter_context((identity.session / identity.name).open("a"))
-                acquire_flock(handle, deadline=deadline)
-            yield
-    finally:
-        for key in keys:
-            del _operation.sites[key]
-
-
-@contextmanager
-def lock_memberships(*session_dirs: str | Path, deadline: float = NO_LOCK_DEADLINE) -> Generator[MembershipLease]:
-    """Own admission for sorted runs, before lifecycle and server locks."""
-    sessions = tuple(sorted({Path(session).resolve() for session in session_dirs}))
-    with _locks([LockIdentity(session, "membership.lock", "membership") for session in sessions], deadline):
-        yield MembershipLease(sessions)
-
-
-@contextmanager
-def lock_membership(session_dir: str | Path, *, deadline: float = NO_LOCK_DEADLINE) -> Generator[MembershipLease]:
-    with lock_memberships(session_dir, deadline=deadline) as membership:
-        yield membership
-
-
-@contextmanager
-def lock_worker(session_dir: str | Path, name: str, *, deadline: float = NO_LOCK_DEADLINE) -> Generator[None]:
-    """Own one worker operation; report both sites on recursive acquisition."""
-    with lock_workers(WorkerIdentity(Path(session_dir), name), deadline=deadline):
-        yield
-
-
-@contextmanager
-def lock_workers(*workers: WorkerIdentity, deadline: float = NO_LOCK_DEADLINE) -> Generator[None]:
-    """Own a transfer's workers in canonical (session, name) order."""
-    with _locks([LockIdentity(worker.session, f"{worker.name}.lifecycle.lock", "lifecycle")
-                 for worker in sorted(set(workers))], deadline):
-        yield
-
-
-@contextmanager
-def lock_server(session_dir: str | Path, filename: str, *, deadline: float = NO_LOCK_DEADLINE) -> Generator[None]:
-    """Serialize server selection/retirement/reaping after lifecycle, before inbox."""
-    with _locks([LockIdentity(Path(session_dir).resolve(), filename, "server")], deadline):
-        yield
-
-
-def _held(kind: str) -> tuple[LockIdentity, ...]:
-    return tuple(identity for (pid, identity) in _operation.sites
-                 if pid == os.getpid() and identity.kind == kind)
-
-
-def held_workers() -> tuple[WorkerIdentity, ...]:
-    """Operation ownership passed down to shared-server maintenance in this thread."""
-    return tuple(sorted(WorkerIdentity(identity.session, identity.name.removesuffix(".lifecycle.lock"))
-                        for identity in _held("lifecycle")))
-
-
-def held_memberships() -> tuple[Path, ...]:
-    return tuple(sorted(identity.session for identity in _held("membership")))
-
-
-@contextmanager
-def membership_operation(*session_dirs: str | Path, deadline: float = NO_LOCK_DEADLINE) -> Generator[MembershipLease]:
-    """Join an explicitly enclosing admission, or acquire a new outer boundary.
-
-    Public lock_membership still rejects recursion. Composition passes the
-    existing lease through this operation boundary; it never inverts lifecycle.
-    """
-    sessions = tuple(sorted({Path(session).resolve() for session in session_dirs}))
-    held = held_memberships()
-    missing = tuple(session for session in sessions if session not in held)
-    if any(worker.session in missing for worker in held_workers()):
-        raise RuntimeError("membership must precede worker lifecycle acquisition")
-    if missing and held and min(missing) < max(held):
-        raise RuntimeError("membership runs must be acquired in sorted order")
-    with lock_memberships(*missing, deadline=deadline):
-        yield MembershipLease(sessions)
-
-
 class WorkerStateUnreadable(ValueError):
     """Existing worker evidence cannot be interpreted safely; never overwrite it."""
 
@@ -245,52 +129,15 @@ def validate_worker_state(path: Path, value: object) -> dict[str, object]:
             if not key or not isinstance(entry, dict):
                 raise WorkerStateUnreadable(path, f"invalid {field} entry {key!r}")
         return result
-    if path.name == "mesh_roster.json":
-        for name, raw in objects(record, "roster").items():
-            entry = _state_object(path, raw)
-            for key in ("thread_id", "status", "role", "adopted_to", "held_design_id", "held_role", "unit_ledger"):
-                if key in entry and not isinstance(entry[key], str):
-                    raise WorkerStateUnreadable(path, f"{name}: invalid {key}")
-            for key in ("access_policy", "transferring_role", "role_redirect"):
-                if key in entry:
-                    _ = _state_object(path, entry[key])
-            revision = entry.get("revision", 0)
-            if not isinstance(revision, int) or isinstance(revision, bool) or revision < 0:
-                raise WorkerStateUnreadable(path, f"{name}: invalid revision")
-    elif path.name.endswith(".pending.json"):
+    if path.name.endswith(".pending.json"):
         if not record:
             return record
-        if (not isinstance(record.get("thread_id"), str) or not isinstance(record.get("messages"), list)
+        if (not isinstance(record.get("messages"), list)
                 or any(not isinstance(item, str) for item in cast(list[object], record.get("messages", [])))
-                or ("accepting_messages" in record and not isinstance(record["accepting_messages"], bool))
-                or ("adoption_id" in record and not isinstance(record["adoption_id"], str))
-                or ("reviewer_inbox_sources" in record and (not isinstance(record["reviewer_inbox_sources"], list)
-                    or any(not isinstance(item, str) for item in cast(list[object], record["reviewer_inbox_sources"]))))):
+                or ("accepting_messages" in record and not isinstance(record["accepting_messages"], bool))):
             raise WorkerStateUnreadable(path, "invalid queue fields")
-    elif path.name in ("mesh_server.json", "mesh_server_start.json"):
-        if not is_process_pid(record.get("pid")):
-            raise WorkerStateUnreadable(path, "invalid server pid")
-        if type(record.get("port")) is not int:
-            raise WorkerStateUnreadable(path, "invalid server port")
-        for key in ("codex_home", "dev_shell_worktree"):
-            if key in record and not isinstance(record[key], str):
-                raise WorkerStateUnreadable(path, f"invalid server {key}")
-        if "design_context" in record:
-            _ = _state_object(path, record["design_context"])
-    elif path.name == "mesh_retired.json":
-        servers = record.get("servers")
-        if not isinstance(servers, list):
-            raise WorkerStateUnreadable(path, "invalid retired server list")
-        for server in cast(list[object], servers):
-            try:
-                _ = validate_worker_state(path.with_name("mesh_server.json"), server)
-            except WorkerStateUnreadable as error:
-                raise WorkerStateUnreadable(path, f"invalid retired server: {error}") from error
-    elif path.name == "serving_home.json":
-        if not isinstance(record.get("codex_home"), str) or not record["codex_home"]:
-            raise WorkerStateUnreadable(path, "invalid serving home")
     if path.name == "design.json":
-        for key in ("placement", "holder", "binding"):
+        for key in ("placement", "binding"):
             _ = _state_object(path, record.get(key))
         roles = record.get("roles")
         if not isinstance(roles, list):
@@ -299,10 +146,11 @@ def validate_worker_state(path: Path, value: object) -> dict[str, object]:
             role = _state_object(path, raw)
             _ = _state_object(path, role.get("lifecycle"))
     if path.name.endswith(".account-move.json"):
-        for key in ("thread_id", "turn_id", "label", "move_id"):
+        identity = "staff_id"
+        for key in (identity, "turn_id", "label", "move_id"):
             if not isinstance(record.get(key), str) or not record[key]:
                 raise WorkerStateUnreadable(path, f"invalid account move {key}")
-    for key in ("workers", "adoptions", "quarantined_workers", "quarantined_adoptions", "roles"):
+    for key in ("workers", "roles"):
         if key in record:
             # Design role instances are a list; their decoder checks their tagged variants.
             if key == "roles" and isinstance(record[key], list):
@@ -313,7 +161,13 @@ def validate_worker_state(path: Path, value: object) -> dict[str, object]:
     if "workers" in record:
         for name, raw in _state_object(path, record["workers"]).items():
             worker = _state_object(path, raw)
-            for key in ("backend", "ownership", "access_policy"):
+            if "staff_id" in worker:
+                if not isinstance(worker["staff_id"], str) or not worker["staff_id"]:
+                    raise WorkerStateUnreadable(path, f"{name}: invalid staff_id")
+                required = ("ownership", "access_policy")
+            else:
+                required = ("ownership", "access_policy")
+            for key in required:
                 if key not in worker:
                     raise WorkerStateUnreadable(path, f"{name}: missing {key}")
                 _ = _state_object(path, worker[key])
@@ -339,22 +193,6 @@ def _read_validated_json(path: Path, validate: Callable[[Path, object], object])
         raise
     except (OSError, UnicodeError) as error:
         raise WorkerStateUnreadable(path, str(error)) from error
-    if text == "" and path.name.endswith(".pending.json"):
-        # Shared readers leave recovery to the next exclusive reader. Otherwise
-        # reread under the exclusive lock before mutating a snapshot.
-        mode = _operation.state_files.get(path.resolve(), fcntl.LOCK_UN)
-        if mode & fcntl.LOCK_SH:
-            return {}
-        if not mode & fcntl.LOCK_EX:
-            with locked_state(path) as state:
-                return state.read_object()
-        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
-        archived = path.with_name(f"{path.name}.empty-legacy-{stamp}")
-        _ = path.rename(archived)
-        print(f"worker_lifecycle: {path}: quarantined as {archived.name}: "
-              + "zero-byte legacy inbox may have lost messages during an in-place write; continuing empty",
-              file=sys.stderr)
-        return {}
     try:
         value = cast(object, json.loads(text))
     except (ValueError, UnicodeError) as error:
@@ -373,12 +211,7 @@ def read_worker_value(path: Path) -> object:
 
 
 def read_worker_state(path: Path) -> dict[str, object]:
-    """Strict lock-free atomic snapshot; absence still requires ownership reconciliation.
-
-    Complete snapshots need no lock; zero-byte legacy inbox recovery takes the
-    exclusive sidecar lock. Shared readers defer recovery and return an empty
-    queue. Writers hold locked_state through their read and replacement.
-    """
+    """Read one atomic worker snapshot."""
     return _state_object(path, read_worker_value(path))
 
 
@@ -410,6 +243,9 @@ class WorkerStateFile:
 def locked_state(path: Path, *, mode: int = fcntl.LOCK_EX,
                  deadline: float = NO_LOCK_DEADLINE) -> Generator[WorkerStateFile]:
     """Lock before opening data; replacement never changes the lock's inode."""
+    if mode == fcntl.LOCK_SH and not path.parent.exists():
+        yield WorkerStateFile(path)
+        return
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.with_name(path.name + ".lock").open("a", encoding="utf-8") as lock:
         acquire_flock(lock, mode=mode, deadline=deadline)
@@ -422,6 +258,227 @@ def locked_state(path: Path, *, mode: int = fcntl.LOCK_EX,
             acquire_flock(lock, mode=fcntl.LOCK_UN)
 
 
-def empty_inbox() -> dict[str, object]:
-    """The sole empty-queue representation, before a thread has been assigned."""
-    return {"thread_id": "", "messages": [], "accepting_messages": True}
+class SocketReady(Enum):
+    """The watched connection can be read without blocking."""
+
+    READY = "ready"
+
+
+class WaitDeadlineExpired(Enum):
+    """No relevant event arrived before the monotonic wait deadline."""
+
+    EXPIRED = "expired"
+
+
+@dataclass(frozen=True)
+class StateFilesChanged:
+    paths: frozenset[Path]
+
+
+FileWaitResult = SocketReady | StateFilesChanged | WaitDeadlineExpired
+
+# inotify's parent watches discover replacements; only file watches subscribe
+# to content writes. Unrelated logs and heartbeats never enter our event queue.
+_IN_MODIFY = 0x00000002
+_IN_ATTRIB = 0x00000004
+_IN_MOVED_FROM = 0x00000040
+_IN_MOVED_TO = 0x00000080
+_IN_CREATE = 0x00000100
+_IN_DELETE = 0x00000200
+_IN_DELETE_SELF = 0x00000400
+_IN_MOVE_SELF = 0x00000800
+_IN_Q_OVERFLOW = 0x00004000
+_IN_IGNORED = 0x00008000
+_IN_REPLACEMENT = _IN_MOVED_FROM | _IN_MOVED_TO | _IN_CREATE | _IN_DELETE
+_IN_INVALIDATED = _IN_DELETE_SELF | _IN_MOVE_SELF | _IN_IGNORED
+
+
+@final
+class LinuxFileChanges:
+    """Watch state files directly, and names in parents only for replacements."""
+
+    def __init__(self, paths: set[Path]) -> None:
+        library = ctypes.CDLL(None, use_errno=True)
+        initialize = cast(Callable[[int], int], library.inotify_init1)
+        self._add_watch = cast(Callable[[int, bytes, int], int], library.inotify_add_watch)
+        self._remove_watch = cast(Callable[[int, int], int], library.inotify_rm_watch)
+        self.descriptor: int = initialize(os.O_CLOEXEC | os.O_NONBLOCK)
+        if self.descriptor < 0:
+            raise OSError(ctypes.get_errno(), "cannot watch follower state")
+        self.paths: set[Path] = paths
+        self.watches: dict[int, Path] = {}
+        self.directories: set[Path] = set()
+        try:
+            self._arm()
+        except BaseException:
+            self.close()
+            raise
+
+    def _arm(self) -> None:
+        wanted: dict[Path, int] = {}
+        for path in self.paths:
+            directory = path.parent
+            while not directory.is_dir():
+                directory = directory.parent
+            self.directories.add(directory)
+            wanted[directory] = _IN_REPLACEMENT | _IN_DELETE_SELF | _IN_MOVE_SELF
+            if path.is_file():
+                wanted[path] = _IN_MODIFY | _IN_DELETE_SELF | _IN_MOVE_SELF | _IN_ATTRIB
+        for path, mask in wanted.items():
+            if path in self.watches.values():
+                continue
+            watch = self._add_watch(self.descriptor, os.fsencode(path), mask)
+            if watch < 0:
+                if ctypes.get_errno() == errno.ENOENT:
+                    continue  # The already armed parent reports the next creation.
+                raise OSError(ctypes.get_errno(), f"cannot watch {path}")
+            self.watches[watch] = path
+
+    def wait(self, connection: socket.socket, deadline: float) -> FileWaitResult:
+        while time.monotonic() < deadline:
+            ready, _, _ = select.select(
+                [connection, self.descriptor], [], [], max(0.0, deadline - time.monotonic()))
+            changed: set[Path] = set()
+            if self.descriptor in ready:
+                data = os.read(self.descriptor, 65536)
+                offset = 0
+                while offset < len(data):
+                    watch, mask, _cookie, length = struct.unpack_from("iIII", data, offset)
+                    name = os.fsdecode(data[offset + 16:offset + 16 + length].split(b"\0", 1)[0])
+                    offset += 16 + length
+                    path = self.watches.get(watch)
+                    if mask & _IN_Q_OVERFLOW:
+                        changed.update(self.paths)
+                    if path is None:
+                        continue
+                    if path in self.directories:
+                        target = path / name
+                        changed.update(wanted for wanted in self.paths
+                                       if target == wanted or target in wanted.parents)
+                        # A replacement's pathname now names a different inode.
+                        for old_watch, old_path in tuple(self.watches.items()):
+                            if old_path == target and old_path not in self.directories:
+                                _ = self._remove_watch(self.descriptor, old_watch)
+                                _ = self.watches.pop(old_watch, None)
+                    else:
+                        changed.add(path)
+                    if mask & _IN_INVALIDATED:
+                        _ = self.watches.pop(watch, None)
+                self._arm()
+            if changed:
+                return StateFilesChanged(frozenset(changed))
+            if connection in ready:
+                return SocketReady.READY
+        return WaitDeadlineExpired.EXPIRED
+
+    def close(self) -> None:
+        os.close(self.descriptor)
+
+
+@dataclass(frozen=True)
+class WatchedFileVersion:
+    """The identity and content-write timestamp of a named state file."""
+
+    inode: int
+    size: int
+    modified_ns: int
+
+
+class MissingWatchedFile(Enum):
+    MISSING = "missing"
+
+
+def _watched_file_version(path: Path) -> WatchedFileVersion | MissingWatchedFile:
+    try:
+        record = path.stat()
+        return WatchedFileVersion(record.st_ino, record.st_size, record.st_mtime_ns)
+    except FileNotFoundError:
+        return MissingWatchedFile.MISSING
+
+
+@final
+class KqueueFileChanges:
+    """Filter parent vnode events through the versions of the watched files."""
+
+    def __init__(self, paths: set[Path]) -> None:
+        self.paths: set[Path] = paths
+        self.queue: select.kqueue = select.kqueue()
+        self.watches: dict[Path, int] = {}
+        self.versions: dict[Path, WatchedFileVersion | MissingWatchedFile] = {
+            path: _watched_file_version(path) for path in paths}
+        try:
+            self._arm()
+        except BaseException:
+            self.close()
+            raise
+
+    def _arm(self) -> None:
+        wanted = set(self.paths)
+        for path in self.paths:
+            directory = path.parent
+            while not directory.is_dir():
+                directory = directory.parent
+            wanted.add(directory)
+        for path in wanted - self.watches.keys():
+            try:
+                descriptor = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+            except FileNotFoundError:
+                continue
+            self.watches[path] = descriptor
+            flags = select.KQ_NOTE_WRITE | select.KQ_NOTE_DELETE | select.KQ_NOTE_RENAME
+            if path in self.paths:
+                flags |= select.KQ_NOTE_ATTRIB
+            _ = self.queue.control([select.kevent(descriptor, filter=select.KQ_FILTER_VNODE,
+                flags=select.KQ_EV_ADD | select.KQ_EV_CLEAR, fflags=flags)], 0)
+
+    def wait(self, connection: socket.socket, deadline: float) -> FileWaitResult:
+        descriptor = connection.fileno()
+        _ = self.queue.control([select.kevent(descriptor, filter=select.KQ_FILTER_READ,
+            flags=select.KQ_EV_ADD | select.KQ_EV_CLEAR)], 0)
+        try:
+            while time.monotonic() < deadline:
+                events = self.queue.control([], 64, max(0.0, deadline - time.monotonic()))
+                changed: set[Path] = set()
+                if any(event.filter == select.KQ_FILTER_VNODE for event in events):
+                    for path in self.paths:
+                        version = _watched_file_version(path)
+                        if version != self.versions[path]:
+                            self.versions[path] = version
+                            changed.add(path)
+                            old_descriptor = self.watches.pop(path, -1)
+                            if old_descriptor >= 0:
+                                os.close(old_descriptor)
+                    for event in events:
+                        if (event.filter == select.KQ_FILTER_VNODE
+                                and event.fflags & (select.KQ_NOTE_DELETE | select.KQ_NOTE_RENAME)):
+                            for path, watched_descriptor in tuple(self.watches.items()):
+                                if watched_descriptor == event.ident:
+                                    os.close(self.watches.pop(path))
+                    self._arm()
+                if changed:
+                    return StateFilesChanged(frozenset(changed))
+                if any(event.filter == select.KQ_FILTER_READ and event.ident == descriptor for event in events):
+                    return SocketReady.READY
+            return WaitDeadlineExpired.EXPIRED
+        finally:
+            # No READ registration for an earlier connection may wake a moved worker.
+            with contextlib.suppress(OSError):
+                _ = self.queue.control([select.kevent(descriptor, filter=select.KQ_FILTER_READ,
+                    flags=select.KQ_EV_DELETE)], 0)
+
+    def close(self) -> None:
+        self.queue.close()
+        for descriptor in self.watches.values():
+            os.close(descriptor)
+
+
+def finished_run_status(session_dir: str) -> str:
+    """Return the final run status, or an empty string for an unfinished run."""
+    state_file = cast(str, import_module("scripts.lib.unit_runs").STATE_FILE)
+    state = read_json_object(Path(session_dir) / state_file)
+    status = state.get("status")
+    return status if isinstance(status, str) and status != "active" and "finished_at" in state else ""
+
+
+DETACHED_RUNS_DIR = "detached_runs"
+DETACHED_RUN_START_GRACE_SECS = 60.0

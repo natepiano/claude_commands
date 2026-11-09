@@ -4,7 +4,7 @@ from __future__ import annotations
 import subprocess
 import unittest
 
-from scripts.direct.verify_tree_cancel_test_support import CANCEL_LINE as CANCEL_LINE, VerifyTreeCancelFixture as VerifyTreeCancelFixture
+from scripts.direct.verify_tree_cancel_test_support import VerifyTreeCancelFixture as VerifyTreeCancelFixture
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
@@ -14,7 +14,8 @@ class VerifyTreeCancelTests(VerifyTreeCancelFixture):
         self.wait_for_running(self.control / "running", process)
         self.assert_resources_held()
         self.edit_source()
-        self.assert_cancelled(process, "test")
+        cancellation = self.assert_cancelled(process, "test")
+        self.assertEqual(cancellation["path"], "sample/src/lib.rs")
         attempts = [args for args in self.cargo_calls() if args[:2] == ["nextest", "run"]]
         self.assertEqual(len(attempts), 1, "cancelled call restarted its tests")
 

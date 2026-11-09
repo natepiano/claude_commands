@@ -5,7 +5,6 @@ from __future__ import annotations
 import io
 import json
 import math
-import sys
 import tempfile
 import unittest
 from contextlib import redirect_stderr
@@ -13,20 +12,19 @@ from pathlib import Path
 from typing import override
 from unittest.mock import patch
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "herdr"))
 from scripts.lib import names
 from scripts.lib.test_names import fixture_names
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.production import staff
 from scripts.production.staff_test_support import fixture_member, fixture_runtime_id, fixture_worker, isolated_staff_file
 from scripts.shutdown import pane_record
-import herdr  # noqa: E402
-import sessions  # noqa: E402
-import herdr_tab_title  # noqa: E402
-from herdr_tab_title import StopPayload  # noqa: E402
+from scripts.herdr import herdr  # noqa: E402
+from scripts.message import sessions  # noqa: E402
+from scripts.hooks import herdr_tab_title  # noqa: E402
+from scripts.hooks.herdr_tab_title import StopPayload  # noqa: E402
 
 REAL_RETITLE = herdr.Herdr.retitle
+REAL_PANES = herdr.Herdr.panes
 
 
 class HerdrTabTitleTests(unittest.TestCase):
@@ -48,16 +46,20 @@ class HerdrTabTitleTests(unittest.TestCase):
         self.enterContext(patch.dict("os.environ", {
             "HOME": str(root / "home"),
             "NOTIFIER_SESSIONS_DIR": str(self.records), "NOTIFIER_STATE_DIR": str(root / "notifier"),
+            "HERDR_BIN": "/nonexistent/herdr",
             "XDG_CONFIG_HOME": str(root / "config"), "XDG_STATE_HOME": str(root / "state"),
-            "SHOWRUNNER_UNIT": "", "SHOWRUNNER_UNIT_ID": ""}))
+            "SHOWRUNNER_" + "UNIT": "", "SHOWRUNNER_" + "UNIT_ID": ""}))
         _ = fixture_member("showrunner", name="fixture-owner")
         _ = self.enterContext(patch.object(names, "runtime_names", return_value=fixture_names()))
         self.record(41, "session-a", "showrunner-fixer")
         self.record(42, "session-b", "send-relay", entrypoint="sdk-cli")
         self.retitled, self.fault = [], False
+        _ = self.enterContext(patch.object(herdr.Herdr, "panes", return_value=[{
+            "pane_id": "w3:p7", "tab_id": "w3:t2", "workspace_id": "w3", "label": "original"}]))
         _ = self.enterContext(patch.object(herdr.Herdr, "retitle", autospec=True, side_effect=self.fake_retitle))
 
-    def fake_retitle(self, _client: herdr.Herdr, pane: str, title: str) -> bool:
+    def fake_retitle(self, _client: herdr.Herdr, pane: str, title: str, *, tab: bool = True) -> bool:
+        self.assertTrue(tab)
         self.retitled.append((pane, title))
         if self.fault:
             raise herdr.HerdrFailure("server gone")
@@ -86,7 +88,7 @@ class HerdrTabTitleTests(unittest.TestCase):
         self.assertNotEqual(unit.id, unit.current_session)
         self.record(41, unit.current_session, "typed-name")
         environment = {"HERDR_PANE_ID": "w3:p7", "HERDR_SESSION": "agents",
-                       "STAFF_ID": "inherited-worker", "SHOWRUNNER_UNIT_ID": "old-unit",
+                       "STAFF_ID": "inherited-worker", "SHOWRUNNER_" + "UNIT_ID": "old-unit",
                        "CLAUDE_CODE_SESSION_ID": "inherited-session"}
         before = self.staff_file.read_bytes(), self.staff_file.stat().st_mtime_ns
         with (redirect_stderr(io.StringIO()) as errors,
@@ -94,7 +96,7 @@ class HerdrTabTitleTests(unittest.TestCase):
             self.assertTrue(herdr_tab_title.sync({"session_id": unit.current_session}, environment))
         self.assertEqual(reads.call_count, 1)
         self.assertEqual(self.retitled, [("w3:p7", "render")])
-        self.assertIn("/showrunner:rename_unit", errors.getvalue())
+        self.assertIn("/agents rename", errors.getvalue())
         self.assertIn("typed-name", errors.getvalue())
         self.assertIn("render", errors.getvalue())
         self.assertEqual(len(errors.getvalue().splitlines()), 1)
@@ -112,18 +114,37 @@ class HerdrTabTitleTests(unittest.TestCase):
         self.assertEqual(errors.getvalue(), "")
         self.assertEqual((self.staff_file.read_bytes(), self.staff_file.stat().st_mtime_ns), before)
 
-    def test_showrunner_titles_keep_the_row_name_despite_inherited_unit_marks(self) -> None:
+    def test_showrunner_titles_keep_the_row_name_despite_inherited_session_labels(self) -> None:
         runner = fixture_member("showrunner", name="tools")
         runner = staff.update_current_session(runner.current_session, staff.native_id(fixture_runtime_id("runner-after-clear")))
         self.record(41, runner.current_session, "typed-production")
         before = self.staff_file.read_bytes(), self.staff_file.stat().st_mtime_ns
-        with redirect_stderr(io.StringIO()) as errors:
+        with redirect_stderr(io.StringIO()) as errors, patch.object(herdr.Herdr, "panes", return_value=[
+                {"pane_id": "w3:p7", "tab_id": "w3:t2"}, {"pane_id": "w3:p8", "tab_id": "w3:t2"}]):
             self.assertTrue(herdr_tab_title.sync({"session_id": runner.current_session},
-                {"HERDR_PANE_ID": "w3:p7", "HERDR_SESSION": "agents", "SHOWRUNNER_UNIT_ID": "wrong-unit"}))
+                {"HERDR_PANE_ID": "w3:p7", "HERDR_SESSION": "agents", "SHOWRUNNER_" + "UNIT_ID": "wrong-unit"}))
         self.assertEqual(self.retitled, [("w3:p7", runner.name)])
-        self.assertNotIn("/showrunner:rename_unit", errors.getvalue())
+        self.assertNotIn("/agents rename", errors.getvalue())
         self.assertEqual(herdr_tab_title.current_name(runner.current_session), "typed-production")
         self.assertEqual((self.staff_file.read_bytes(), self.staff_file.stat().st_mtime_ns), before)
+
+    def test_nonstaff_pane_in_a_shared_tab_keeps_the_pane_and_tab_labels(self) -> None:
+        from scripts.herdr.test_worker_panes import PaneWorld
+
+        world = PaneWorld()
+        world.locations["w3:p7"] = {"pane_id": "w3:p7", "tab_id": "w3:t2", "workspace_id": "w3",
+                                    "terminal_id": "friend-terminal", "label": "friend"}
+        world.locations["w3:p8"] = {"pane_id": "w3:p8", "tab_id": "w3:t2", "workspace_id": "w3",
+                                    "terminal_id": "caller-terminal", "label": "caller"}
+        before = {key: value.copy() for key, value in world.locations.items()}
+        with patch.object(herdr, "Herdr", return_value=world), patch.object(
+                world, "panes", side_effect=lambda: REAL_PANES(world)):
+            changed = herdr_tab_title.sync({"session_id": "session-a"},
+                {"HERDR_PANE_ID": "w3:p7", "HERDR_SESSION": "agents"})
+        self.assertFalse(changed)
+        self.assertEqual(world.locations, before)
+        self.assertEqual(world.commands, [])
+        self.assertEqual(self.retitled, [])
 
     def test_worker_renames_only_its_pane_and_a_rerun_changes_nothing(self) -> None:
         unit = self.renamed_unit()
@@ -131,23 +152,30 @@ class HerdrTabTitleTests(unittest.TestCase):
         worker = staff.update_current_session(worker.current_session, staff.native_id(fixture_runtime_id("worker-after-clear")))
         self.record(41, worker.current_session, "typed-worker")
         environment = {"HERDR_PANE_ID": "w3:p7", "HERDR_SESSION": "agents",
-                       "STAFF_ID": str(unit.id), "SHOWRUNNER_UNIT_ID": "render-unit"}
+                       "STAFF_ID": str(unit.id), "SHOWRUNNER_" + "UNIT_ID": "render-unit"}
         pane: herdr.PaneIdentity = {"pane_id": "w3:p7", "label": "typed-worker",
                                    "workspace_id": "w3", "session_id": worker.current_session}
         before = self.staff_file.read_bytes(), self.staff_file.stat().st_mtime_ns
 
         def rename(_client: herdr.Herdr, *arguments: str, deadline: float = math.inf) -> str:
             del deadline
-            self.assertEqual(arguments, ("pane", "rename", "w3:p7", worker.name))
+            self.assertEqual(arguments, ("pane", "rename", "w3:p7", "render-impl1"))
             pane["label"] = arguments[-1]
             return ""
 
-        with (patch.object(herdr.Herdr, "panes", return_value=[pane]),
+        def result(_client: herdr.Herdr, *arguments: str, deadline: float = math.inf) -> dict[str, object]:
+            del deadline
+            self.assertEqual(arguments, ("pane", "list"))
+            return {"panes": [pane]}
+
+        with (patch.object(herdr.Herdr, "retitle", new=REAL_RETITLE),
+              patch.object(herdr.Herdr, "result", autospec=True, side_effect=result),
+              patch.object(herdr.Herdr, "save_layout"),
               patch.object(herdr.Herdr, "run", autospec=True, side_effect=rename) as writes,
               redirect_stderr(io.StringIO()) as errors):
             self.assertTrue(herdr_tab_title.sync({"session_id": worker.current_session}, environment))
             self.assertFalse(herdr_tab_title.sync({"session_id": worker.current_session}, environment))
-        self.assertEqual(pane["label"], "impl1")
+        self.assertEqual(pane["label"], "render-impl1")
         self.assertEqual(writes.call_count, 1)
         self.assertEqual(self.retitled, [])
         self.assertEqual(errors.getvalue(), "")
@@ -181,7 +209,7 @@ class HerdrTabTitleTests(unittest.TestCase):
         self.assertEqual(reads.call_count, 1)
         self.assertIn("no staff row", errors.getvalue())
         self.assertIn(pending, errors.getvalue())
-        self.assertNotIn("/showrunner:rename_unit", errors.getvalue())
+        self.assertNotIn("/agents rename", errors.getvalue())
         self.assertEqual(self.retitled, [("w3:p7", "typed-name")])
         self.assertEqual((self.staff_file.read_bytes(), self.staff_file.stat().st_mtime_ns), before)
         self.assertEqual((retained.read_bytes(), retained.stat().st_mtime_ns), retained_before)
@@ -190,7 +218,7 @@ class HerdrTabTitleTests(unittest.TestCase):
         with redirect_stderr(io.StringIO()) as errors:
             self.assertTrue(herdr_tab_title.sync({"session_id": pending}, environment))
         self.assertEqual(self.retitled[-1], ("w3:p7", unit.name))
-        self.assertIn("/showrunner:rename_unit", errors.getvalue())
+        self.assertIn("/agents rename", errors.getvalue())
         self.assertEqual((self.staff_file.read_bytes(), self.staff_file.stat().st_mtime_ns), completed)
         self.assertEqual((retained.read_bytes(), retained.stat().st_mtime_ns), retained_before)
 
@@ -295,7 +323,7 @@ class HerdrTabTitleTests(unittest.TestCase):
 
     def test_turn_end_preserves_session_name_and_rename_updates_tab_and_pane(self) -> None:
         environment = {"HERDR_PANE_ID": "w3:p7", "HERDR_SESSION": "agents",
-                       "SHOWRUNNER_UNIT": "sdlc", "SHOWRUNNER_UNIT_ID": "roles-unit"}
+                       "SHOWRUNNER_" + "UNIT": "sdlc", "SHOWRUNNER_" + "UNIT_ID": "roles-unit"}
         pane: dict[str, object] = {"pane_id": "w3:p7", "tab_id": "w3:t2", "workspace_id": "w3",
                                    "label": "showrunner-fixer"}
         tab: dict[str, object] = {"tab_id": "w3:t2", "label": "showrunner-fixer"}
@@ -334,7 +362,7 @@ class HerdrTabTitleTests(unittest.TestCase):
         instance = state / "showrunner-sdlc"
         instance.mkdir(parents=True)
         _ = (instance / "conf").write_text(
-            "TARGET=session:session-a\nCHECK=/scripts/production_check.sh /docs/sdlc-production.md\n")
+            "TARGET=session:session-a\nCHECK=/scripts/production_check.sh fixture-owner\n")
         environment = {"HERDR_PANE_ID": "w3:p7", "HERDR_SESSION": "agents", "NOTIFIER_STATE_DIR": str(state)}
         self.record(41, "session-a", "renamed-showrunner")
         self.assertTrue(herdr_tab_title.sync({"session_id": "session-a"}, environment))
@@ -344,10 +372,10 @@ class HerdrTabTitleTests(unittest.TestCase):
         state = self.records.parent / "notifier/showrunner-sdlc"
         state.mkdir(parents=True)
         _ = (state / "conf").write_text(
-            "TARGET=session:showrunner-id\nCHECK=/scripts/production_check.sh /docs/sdlc-production.md\n")
+            "TARGET=session:showrunner-id\nCHECK=/scripts/production_check.sh fixture-owner\n")
         cases: tuple[tuple[str, str, dict[str, str]], ...] = (
             ("showrunner-id", "control", {}),
-            ("director-id", "roles", {"SHOWRUNNER_UNIT": "sdlc", "SHOWRUNNER_UNIT_ID": "roles-unit"}),
+            ("director-id", "roles", {"SHOWRUNNER_" + "UNIT": "sdlc", "SHOWRUNNER_" + "UNIT_ID": "roles-unit"}),
             ("plain-id", "scratch", {}))
         for pid, (session_id, name, marks) in enumerate(cases, 50):
             with self.subTest(session=session_id):

@@ -9,6 +9,10 @@ Action counters include zeroes. Read-only children run normally; only their firs
 two command words appear in the report. Pass messages and child output stay private.
 """
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import argparse
 import builtins
@@ -35,7 +39,6 @@ from types import MappingProxyType, ModuleType
 from typing import Literal, cast, override
 from unittest.mock import patch
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 
 class DiscardedTextWrite(io.StringIO):
@@ -132,14 +135,12 @@ class NotesPass:
 
 
 def load_pass() -> NotesPass:
-    # Keep the timer modules on their existing sibling import names.
-    sys.path.insert(0, str(Path(__file__).resolve().parent))
-    notes = import_module("agent_notes")
+    notes = import_module('scripts.whoami.agent_notes')
     watch = import_module("scripts.accounts.refusal_watch")
     watchdog = import_module("scripts.accounts.unit_watchdog")
     return NotesPass(notes, import_module("scripts.accounts.accounts"), watch, watchdog,
-        import_module("quota_alert"), import_module("codex_pacer"), import_module("scripts.whoami.usage_store"),
-        import_module("five_hour"), import_module("scripts.accounts.role_map"),
+        import_module('scripts.whoami.quota_alert'), import_module('scripts.whoami.codex_pacer'), import_module("scripts.whoami.usage_store"),
+        import_module("scripts.whoami.five_hour"), import_module("scripts.accounts.role_map"),
         import_module("scripts.accounts.moves"), import_module("scripts.accounts.next_moves"),
         import_module("scripts.accounts.refusals"), import_module("scripts.production.showrunners"),
         import_module("scripts.whoami.run_out"), import_module("scripts.accounts.outage_alerts"))
@@ -164,7 +165,7 @@ def patch_list(pass_: NotesPass) -> tuple[PassCallPatch, ...]:
         PassCallPatch(n, "rename_legacy_notes", "links and unlinks vault notes", []),
         PassCallPatch(n, "write_note", "replaces vault note text", False),
         PassCallPatch(n, "append_readings", "replaces the usage readings log"),
-        PassCallPatch(n, "write_sessions_seen", "replaces session observation state"),
+        PassCallPatch(n, "write_sessions_seen", "writes machine observation times"),
         PassCallPatch(u, "save", "writes usage and account-label readings"),
         PassCallPatch(u, "save_timer_usage", "writes timer reports"),
         PassCallPatch(u, "write", "writes usage read claims and outcomes"),
@@ -176,8 +177,8 @@ def patch_list(pass_: NotesPass) -> tuple[PassCallPatch, ...]:
         PassCallPatch(pass_.five, "relay", "sends or queues a five-hour message", "profile: message suppressed"),
         PassCallPatch(q, "tell_user", "sends a phone push", result(q, "PushFailed", "profile: push suppressed")),
         PassCallPatch(pass_.five, "cancel_outgoing_notices", "retires queued warnings and removes markers"),
-        PassCallPatch(import_module("escalate"), "close", "removes an escalation and retires its push", False),
-        PassCallPatch(import_module("escalate"), "reconcile_codex_holds", "cancels outgoing account escalation holds"),
+        PassCallPatch(import_module('scripts.message.escalate'), "close", "removes an escalation and retires its push", False),
+        PassCallPatch(import_module('scripts.message.escalate'), "reconcile_codex_holds", "cancels outgoing account escalation holds"),
         PassCallPatch(pass_.roles, "_atomic_write", "updates the remote role-map read cache"),
         PassCallPatch(pass_.roles, "write_role_map", "changes account roles locally or remotely"),
         PassCallPatch(pass_.moves, "append_move", "appends the move journal"),
@@ -227,10 +228,9 @@ def patch_list(pass_: NotesPass) -> tuple[PassCallPatch, ...]:
 def state_copies(pass_: NotesPass) -> tuple[StateCopy, ...]:
     """Only side-effect state is copied. Notes, transcripts, registry and rosters stay live."""
     account_patterns = ("refusal_watch.json", "login_renewals.json",
-                        "assumed_refusals/*.json", "unit-watchdog-results/*.json")
+                        "unit-watchdog-results/*.json")
     return (
         StateCopy(pass_.usage, "store_file", state_path(pass_.usage, "store_file", True), True),
-        StateCopy(pass_.notes, "SESSIONS_SEEN", state_path(pass_.notes, "SESSIONS_SEEN").expanduser()),
         StateCopy(pass_.notes, "READINGS_LOG", state_path(pass_.notes, "READINGS_LOG")),
         StateCopy(pass_.run_out, "READINGS_LOG", state_path(pass_.run_out, "READINGS_LOG")),
         StateCopy(pass_.accounts, "readings_file", state_path(pass_.accounts, "readings_file", True), True),
@@ -341,8 +341,6 @@ def replacement(entry: PassCallPatch, measurements: Measurements) -> Callable[..
             if not any(flag in mode for flag in "wax+"):
                 return original(*args, **kwargs)
             measurements.count(entry.name)
-            if "x" in mode and Path(cast(str, args[0] if args else kwargs["file"])).exists():
-                raise FileExistsError("profile: existing marker")
             content: str | bytes = b"" if "b" in mode else ""
             if "+" in mode or mode.startswith("r"):
                 read_args, read_kwargs = list(args), dict(kwargs)
@@ -447,7 +445,8 @@ def command_words(arguments: object) -> tuple[str, ...]:
     if isinstance(arguments, Sequence):
         return tuple(os.fsdecode(cast(str | bytes | os.PathLike[str], item))
                      for item in arguments)
-    raise OSError("profile: child argv is not readable")
+    print("profile: anomaly: child argv is not readable", file=sys.stderr)
+    return ()
 
 
 @dataclass(frozen=True)
@@ -502,7 +501,6 @@ def herdr_read(args: tuple[str, ...]) -> bool:
                 and tail[1] in {"recent", "recent-unwrapped"} and tail[2] == "--lines"
                 and tail[3].isdecimal() and (len(tail) == 4 or tail[4:] == ("--format", "ansi")))
     return False
-
 
 
 def ps_read(args: tuple[str, ...]) -> bool:
@@ -562,7 +560,10 @@ def child_policy(peer_python: Mapping[str, str] = NO_PEER_PYTHON) -> tuple[Trust
         return ("-o", "StrictHostKeyChecking=yes", "-o", "UpdateHostKeys=no",
                 "-o", "ControlMaster=no", "-o", "ControlPath=none", "-o", "PermitLocalCommand=no",
                 "-o", "ProxyCommand=none", *args[:5], command)
-    unmarked = ("SHOWRUNNER_UNIT", "SHOWRUNNER_UNIT_ID", "NIX_HEAL_PREPARED_SESSION", "NIX_HEAL_PREPARED_DIRECTORY")
+    unmarked = (
+        *(name for name in environment if name.startswith("SHOWRUNNER_")),
+        "NIX_HEAL_PREPARED_SESSION", "NIX_HEAL_PREPARED_DIRECTORY",
+    )
     specs: tuple[tuple[str, Callable[[tuple[str, ...]], bool], Callable[[tuple[str, ...]], tuple[str, ...]], tuple[tuple[str, str], ...], tuple[str, ...]], ...] = (
         ("ps", ps_read, identity, (("LC_ALL", "C"), ("TZ", "UTC")), unmarked),
         ("lsof", lsof_read, lambda args: ("-Di", *args), (), unmarked),

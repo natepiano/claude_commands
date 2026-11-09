@@ -1,5 +1,9 @@
 """Record local settings keys and deliver notices outside Git."""
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import fcntl
 import hashlib
@@ -10,11 +14,9 @@ import subprocess
 import sys
 from typing import Literal, cast
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.lib import conf
 from scripts.lib.atomic_file import write_text_atomic
-from scripts.message import send_result
-from scripts.message import send_budget
+from scripts.message import send_result, send_budget, session_send
 
 NoticeStatus = Literal["pending", "accepted"]
 NoticeHistory = dict[str, dict[str, NoticeStatus]]
@@ -75,7 +77,7 @@ def deliver(root: Path, machine: str) -> None:
     destination = conf.read("settings").text("local_key_notice_to")
     for key in pending:
         identity = hashlib.sha256(json.dumps([machine, key]).encode()).hexdigest()
-        command = [str(root / "scripts/lib/py"), str(root / "scripts/message/send.py"),
+        command = [str(root / "scripts/lib/py"), str(session_send.SEND_SCRIPT),
                    "--to", destination, "--from", "settings", "--key", "settings-local:" + identity,
                    "--repeat-minutes", str(timedelta.max.days * 1440),
                    "--text", f"Settings key {key} is local on {machine}."]

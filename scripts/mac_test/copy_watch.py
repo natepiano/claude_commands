@@ -12,6 +12,10 @@ first.
 """
 
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import argparse
 from collections.abc import Generator
@@ -25,27 +29,17 @@ import re
 import select
 import signal
 import subprocess
-import sys
 import tempfile
 import time
 from types import FrameType
-from typing import TYPE_CHECKING, Literal, TypedDict, cast
+from typing import Literal, TypedDict, cast
 
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lint"))
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "build_hold"))
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
-import process_group
-import override_guard
-import mac_test
-import offload
-if TYPE_CHECKING:
-    from ..lib import build_folders
-    from ..direct import step_record
-else:
-    from scripts.lib import build_folders
-    from scripts.direct import step_record
+from scripts.lib import process_group
+from scripts.build_hold import override_guard
+from scripts.mac_test import mac_test, offload
+from scripts.lib import build_folders, process_start as process_identity
+from scripts.direct import step_record
 
 
 ANSI_ESCAPE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
@@ -75,6 +69,7 @@ class CliArguments(argparse.Namespace):
         self.package: str = ""
         self.call_id: str = ""
         self.call_started: str = ""
+        self.parent_pid: int = 0
         self.filter_run: bool = False
         self.nextest_words: list[str] = []
 
@@ -203,8 +198,8 @@ class StepProgress:
 
     def __init__(self, info: StepInfo | NoStepInfo) -> None:
         self.info: StepInfo | NoStepInfo = info
-        self.leader_start: str | None = (
-            mac_test.process_start_time(info.pgid) if isinstance(info, StepInfo) else None
+        self.leader_start: process_identity.ProcessStart = (
+            process_identity.process_start(info.pgid) if isinstance(info, StepInfo) else process_identity.Gone()
         )
         self.offset: int = 0
         self.pending: bytes = b""
@@ -236,15 +231,10 @@ class StepProgress:
 
     def leader_alive(self) -> bool:
         """The step's group leader still runs: not reaped, not a zombie, not a reused pid."""
-        if isinstance(self.info, NoStepInfo) or self.leader_start is None:
+        if isinstance(self.info, NoStepInfo) or not isinstance(self.leader_start, process_identity.Started):
             return False
         pgid = self.info.pgid
-        try:
-            stat = Path(f"/proc/{pgid}/stat").read_text(encoding="utf-8", errors="replace")
-        except OSError:
-            return False
-        fields = stat[stat.rfind(")") + 1 :].split()
-        if not fields or fields[0] == "Z" or mac_test.process_start_time(pgid) != self.leader_start:
+        if process_identity.process_start(pgid) != self.leader_start:
             return False
         try:
             return os.getpgid(pgid) == pgid
@@ -292,7 +282,7 @@ def newest_candidate(directory: Path) -> str | None:
         record = read_candidate(path)
         if record is None:
             continue
-        if mac_test.process_start_time(record["pid"]) != record["proc_start"]:
+        if process_identity.process_start(record["pid"]) != process_identity.Started(record["proc_start"]):
             path.unlink(missing_ok=True)
             continue
         if newest is None or (record["call_started"], record["call_id"]) > (
@@ -338,7 +328,7 @@ def copy_result(words: MacWords | None, status: int) -> CopyWin | CopyEnded:
 def start_copy(request: WatchRequest, result: Path) -> RunningCopy:
     result.unlink(missing_ok=True)
     command = [
-        sys.executable, str(request.runner), "run", "--copy",
+        str(Path(__file__).resolve().parents[1] / "lib/py"), str(request.runner), "run", "--copy",
         "--repo-root", str(request.repo_root),
         "--package", request.package,
         "--call-id", request.call_id,
@@ -347,6 +337,8 @@ def start_copy(request: WatchRequest, result: Path) -> RunningCopy:
     ]
     if request.filter_run:
         command.append("--filter-run")
+    for name in os.environ.get("VERIFY_TEST_ENV_NAMES", "").split():
+        command.extend(("--env", name))
     command += ["--", *request.nextest_words]
     return RunningCopy(subprocess.Popen(command, stdin=subprocess.DEVNULL), result, time.monotonic())
 
@@ -395,9 +387,9 @@ def poll_seconds() -> float:
 class Wakeup:
     """Stop on TERM, HUP, INT or parent loss; signals end sleep at once."""
 
-    def __init__(self, read_fd: int) -> None:
+    def __init__(self, read_fd: int, parent_pid: int) -> None:
         self.read_fd: int = read_fd
-        self.parent_pid: int = os.getppid()
+        self.parent_pid: int = parent_pid
         self.stopped: bool = False
 
     @property
@@ -429,11 +421,11 @@ def note_child(signal_number: int, frame: FrameType | None) -> None:
 
 
 @contextmanager
-def wakeup_on_signals() -> Generator[Wakeup, None, None]:
+def wakeup_on_signals(parent_pid: int) -> Generator[Wakeup, None, None]:
     read_fd, write_fd = os.pipe()
     os.set_blocking(read_fd, False)
     os.set_blocking(write_fd, False)
-    wakeup = Wakeup(read_fd)
+    wakeup = Wakeup(read_fd, parent_pid)
     names = [signal.SIGTERM, signal.SIGHUP]
     if signal.getsignal(signal.SIGINT) != signal.SIG_IGN:
         names.append(signal.SIGINT)
@@ -525,9 +517,10 @@ class Watch:
         if not wanted:
             self.candidate.unlink(missing_ok=True)
         elif not self.candidate.exists():
+            identity = process_identity.process_start(os.getpid())
             record: CandidateRecord = {
                 "pid": os.getpid(),
-                "proc_start": mac_test.process_start_time(os.getpid()) or "",
+                "proc_start": identity.start if isinstance(identity, process_identity.Started) else "",
                 "call_started": self.request.call_started,
                 "call_id": self.request.call_id,
             }
@@ -599,6 +592,7 @@ def parser() -> argparse.ArgumentParser:
                  "--call-started"):
         _ = root.add_argument(name, required=True)
     _ = root.add_argument("--filter-run", action="store_true")
+    _ = root.add_argument("--parent-pid", type=int, required=True)
     _ = root.add_argument("nextest_words", nargs=argparse.REMAINDER)
     return root
 
@@ -632,8 +626,9 @@ def request_from_arguments(arguments: CliArguments) -> WatchRequest:
 
 def main() -> int:
     override_guard.refuse_overrides(Path(__file__), "mac_test/copy_watch.py")
-    request = request_from_arguments(parser().parse_args(namespace=CliArguments()))
-    with wakeup_on_signals() as wakeup, build_folders.temporary_build_folder(build_folders.UniqueBuildFolder(prefix=build_folders.FOLDER_PREFIXES["copy-watch"])) as work:
+    arguments = parser().parse_args(namespace=CliArguments())
+    request = request_from_arguments(arguments)
+    with wakeup_on_signals(arguments.parent_pid) as wakeup, build_folders.temporary_build_folder(build_folders.UniqueBuildFolder(prefix=build_folders.FOLDER_PREFIXES["copy-watch"])) as work:
         repository = offload.repository_identity(request.repo_root)
         if isinstance(repository, offload.UnknownRepository):
             report = wait_for_stop(wakeup)

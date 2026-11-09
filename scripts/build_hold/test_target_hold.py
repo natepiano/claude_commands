@@ -5,18 +5,12 @@ from __future__ import annotations
 from contextlib import redirect_stderr, redirect_stdout
 from datetime import timedelta
 import io
-from pathlib import Path
 import subprocess
-import sys
-from typing import TYPE_CHECKING, override
+from typing import override
 from unittest import mock
 import unittest
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "mac_test"))
-if TYPE_CHECKING:
-    from ..mac_test.test_target_state import IsolatedTargetState, SCRIPTS, TARGET_NAMES, build_hold, mac_test, targets
-else:
-    from test_target_state import IsolatedTargetState, SCRIPTS, TARGET_NAMES, build_hold, mac_test, targets
+from scripts.mac_test.test_target_state import IsolatedTargetState, SCRIPTS, TARGET_NAMES, build_hold, mac_test, targets
 
 ORIGINAL_RUN = subprocess.run
 ORIGINAL_POPEN = subprocess.Popen
@@ -32,7 +26,7 @@ class TargetHoldTests(IsolatedTargetState):
         if arguments[:2] == ["git", "-C"]:
             with mock.patch.object(subprocess, "Popen", ORIGINAL_POPEN):
                 return ORIGINAL_RUN(arguments, capture_output=True, text=True, check=False)
-        self.assertEqual(arguments[:2], [sys.executable, str(SCRIPTS / "mac_test/mac_test.py")])
+        self.assertEqual(arguments[:2], [str(SCRIPTS / "lib/py"), str(SCRIPTS / "mac_test/mac_test.py")])
         self.assertTrue(options.get("capture_output"))
         self.assertTrue(options.get("text"))
         return self.invoke_mac(arguments[2:])

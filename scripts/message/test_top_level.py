@@ -17,13 +17,14 @@ from pathlib import Path
 from typing import cast, override
 from unittest import mock
 
-import process_table
-import codex_daemon
-import roster
-import herdr
-import sessions
-import top_level
-from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.message import process_table
+from scripts.message import codex_daemon
+from scripts.message import roster
+from scripts.herdr import herdr
+from scripts.message import sessions
+from scripts.message import top_level
+from scripts.message.process_test_support import OwnedTestProcesses
+from scripts.message import unit_labels
 from scripts.production import staff
 
 NO_SHOWRUNNER = roster.NoShowrunner()
@@ -213,7 +214,7 @@ class TopLevelTests(unittest.TestCase):
                                      f"solo\tuds:{solo}", f"orphaned unit\tuds:{orphaned}"})
         self.assertEqual({session_id for _, session_id in recorded}, {"showrunner", "ordinary", "solo", "orphaned unit"})
 
-    def test_stale_tmux_names_do_not_override_roster_unit_identity(self) -> None:
+    def test_roster_unit_identity_overrides_tmux_labels(self) -> None:
         _ = self.add("renamed unit", tmux="old-name:@3.%7", role="unit director",
                      showrunner=roster.UnderShowrunner("production", "runner", "session:runner"))
         ordinary = self.add("ordinary", tmux="unit-looking-name:@1.%1")
@@ -257,6 +258,20 @@ class TopLevelTests(unittest.TestCase):
         self.assertEqual(result, 0)
         self.assertEqual(lines, [f"reachable\tuds:{address}"])
         self.assertEqual(errors, ["top_level: roster: daemon closed mid-call"])
+        self.assertEqual(recorded, [("reachable", "reachable-id")])
+
+    def test_docless_staff_warning_keeps_other_top_level_recipients(self) -> None:
+        address = self.add("reachable", session_id="reachable-id")
+        bad = staff.StaffRow(staff.StaffId("bad"), "showrunner", "bad", staff.STAFF_ROOT,
+                             current_session=staff.StaffId("bad-session"))
+        diagnostics = unit_labels.StaffDiagnostics()
+        self.assertEqual(unit_labels.registered_showrunners(
+            diagnostics, known_sessions={}, membership=staff.StaffSnapshot((bad,))), [])
+        self.problems, self.warnings = diagnostics.problems, diagnostics.warnings
+        result, lines, errors, recorded = self.run_main()
+        self.assertEqual(result, 0)
+        self.assertEqual(lines, [f"reachable\tuds:{address}"])
+        self.assertEqual(errors, ["top_level: roster: warning: bad: the production document is not recorded"])
         self.assertEqual(recorded, [("reachable", "reachable-id")])
 
     def test_durable_warning_prints_once_without_losing_a_readable_recipient(self) -> None:
@@ -307,13 +322,16 @@ class TopLevelRunningRecordTests(unittest.TestCase):
         self.socket_path = self.folder / "live.sock"
         listener = self.enterContext(socket.socket(socket.AF_UNIX))
         listener.bind(str(self.socket_path))
-        child = self.enterContext(subprocess.Popen(
+        owned = OwnedTestProcesses()
+        self.addCleanup(owned.finish)
+        child = subprocess.Popen(
             [sys.executable, "-c", "import sys; sys.stdin.read()"],
             stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-        ))
+            env=owned.environment(),
+        )
+        owned.track(child)
         self.child_pid = child.pid
         self.process_starts = {}
-        self.addCleanup(child.communicate, timeout=TEST_HANG_GUARD_SECS)
         environment = cast(AbstractContextManager[object], mock.patch.dict(os.environ, {
             "HOME": str(self.folder), "NOTIFIER_SESSIONS_DIR": str(self.directory),
             "PATH": f"{binaries}{os.pathsep}{os.environ.get('PATH', '')}", "SSH_RECORD": str(self.folder / "ssh.log"),

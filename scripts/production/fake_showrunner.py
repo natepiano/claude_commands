@@ -1,8 +1,4 @@
-"""A stand-in for one showrunner in tests: its update timer and, when running, its live session record.
-
-A showrunner is recorded nowhere but in its update timer, `showrunner-<slug>` in the notifier's state
-directory, which is addressed to the Claude session id and checks the production doc.
-"""
+"""Write staff-owned showrunner timers and session records for tests."""
 from __future__ import annotations
 
 import json
@@ -11,30 +7,43 @@ import socket
 from pathlib import Path
 
 from scripts.lib.socket_test_support import ShortUnixSocket
+from scripts.production.staff_test_support import recorded_showrunner, fixture_runtime_id
+from scripts.production import staff
 
 
-def write_timer(notifier_dir: Path, slug: str, session_id: str, zone: str, doc: Path | str) -> Path:
-    """Write the update timer of the production `slug`, addressed to `session_id`.
+def write_timer(notifier_dir: Path, production_name: str, session_id: str, zone: str, doc: Path | str) -> Path:
+    """Write the update timer of the production `production_name`, addressed to `session_id`.
 
     Older docs carry a User zone line, so the doc is given one unless `zone` is empty. It is not read.
     """
-    instance = notifier_dir / f"showrunner-{slug}"
+    row = recorded_showrunner(production_name, Path(doc))
+    try:
+        runtime = staff.native_id(session_id)
+    except staff.StaffRefused:
+        runtime = staff.native_id(fixture_runtime_id(session_id))
+    if row.current_session != runtime:
+        row = staff.update_current_session(row.current_session, runtime)
+    instance = notifier_dir / f"showrunner-{row.id}"
     instance.mkdir(parents=True, exist_ok=True)
     prompt = instance / "prompt.txt"
-    _ = prompt.write_text(f"Run `zsh unit_status.sh /scratch/unit_status {zone} --production {doc}`.\n",
+    _ = prompt.write_text(f"Run `zsh unit_status.sh /scratch/unit_status {zone} --production {row.name}`.\n",
                           encoding="utf-8")
     path = Path(doc)
     held = path.read_text(encoding="utf-8") if path.is_file() else ""
     if zone and "- **User zone:** " not in held:
         _ = path.write_text(f"- **User zone:** {zone}\n{held}", encoding="utf-8")
     _ = (instance / "conf").write_text(
-        f"TARGET=session:{session_id}\nPROMPT_FILE={prompt}\nCHECK=zsh /scripts/production_check.sh {doc}\n",
+        f"TARGET=session:{row.id}\nPROMPT_FILE={prompt}\nCHECK=zsh /scripts/production_check.sh {row.id}\n",
         encoding="utf-8")
     return instance
 
 
 def write_session(sessions_dir: Path, name: str, session_id: str, pid: int | None = None) -> socket.socket:
     """Record a live Claude session called `name`. The caller closes the returned socket at cleanup."""
+    try:
+        session_id = staff.native_id(session_id)
+    except staff.StaffRefused:
+        session_id = fixture_runtime_id(session_id)
     sessions_dir.mkdir(parents=True, exist_ok=True)
     process = os.getpid() if pid is None else pid
     held = ShortUnixSocket()

@@ -1,6 +1,8 @@
 """Private clocks, queue snapshots, and AWS replies for lifecycle tests."""
 from __future__ import annotations
 
+from scripts.build_queue import admission_records
+
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from decimal import Decimal
@@ -17,7 +19,7 @@ from scripts.build_queue import queue_snapshot
 from scripts.mac_test import mac_test
 from scripts.aws_target.ledger_test_support import CostFixture, instant
 from scripts.lint import memory_admit
-from scripts.lint.memory_test_support import fake_memory_readings
+from scripts.lint.memory_test_support import admission_policy_fixture, fake_memory_readings
 
 
 @dataclass
@@ -132,15 +134,16 @@ class ControlFixture(CostFixture):
                                                 now=self.clock.now, boot_id="fixture-boot"))
 
     def waiter(self, pid: int, *, step: str = "test", age: int = 121,
-               identity: str = "https://example.invalid/team/hana") -> memory_admit.Waiter:
+               identity: str = "https://example.invalid/team/hana") -> admission_records.Waiter:
         return {"pid": pid, "start_time": str(pid), "need": 1024,
                 "since": self.clock.now - age, "step": step,
                 "repo_identity": identity, "repository_name": "hana", "folder": str(self.root)}
 
-    def snapshot(self, *rows: memory_admit.Waiter, age: int = 0) -> None:
-        inputs = memory_admit.QueueInputs(
-            [(self.queue_directory / f"{row['pid']}.waiting", row) for row in rows], (), (),
-            memory_admit.HostMemory(1024**3, 1024**3), memory_admit.NoPressureHold(),
-            memory_admit.NoRecoverySpacing(), memory_admit.NoHeadAdmissionOverride(), float(self.clock.now - age))
-        queue_snapshot.write_queue_snapshot(self.queue_directory, inputs, memory_admit.DEFAULT_ADMISSION_POLICY)
+    def snapshot(self, *rows: admission_records.Waiter, age: int = 0) -> None:
+        inputs = admission_records.QueueInputs(
+            [(self.queue_directory / f"{row['pid']}.waiting", memory_admit.rank_waiter(row, admission_records.NormalOrder()))
+             for row in rows], (), (),
+            admission_records.HostMemory(1024**3, 1024**3), admission_records.NoPressureHold(),
+            admission_records.ReadyToStart(), admission_records.NoHeadAdmissionOverride(), float(self.clock.now - age))
+        queue_snapshot.write_queue_snapshot(self.queue_directory, inputs, admission_policy_fixture())
         self.assertIsInstance(queue_snapshot.read_queue_snapshot(self.queue_directory), queue_snapshot.QueueSnapshot)

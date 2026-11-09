@@ -13,6 +13,7 @@ from typing import cast, override
 from unittest.mock import patch
 
 from scripts.settings import local_key_notices as notices
+from scripts.message import session_send
 
 
 class LocalKeyNoticeTests(unittest.TestCase):
@@ -23,6 +24,7 @@ class LocalKeyNoticeTests(unittest.TestCase):
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         self.ledger = self.root / notices.LEDGER
+        _ = cast(object, self.enterContext(patch.object(session_send, "SEND_SCRIPT", self.root / "scripts/message/send.py")))
         config = self.root / "config"
         config.mkdir()
         _ = (config / "send.conf").write_text(

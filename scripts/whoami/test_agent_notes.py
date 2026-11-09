@@ -17,29 +17,27 @@ from dataclasses import dataclass, field
 from contextvars import ContextVar
 from datetime import datetime, timedelta, timezone, tzinfo
 from pathlib import Path
-from typing import TYPE_CHECKING, Self, cast, override
+from typing import Self, cast, override
 from unittest.mock import ANY, MagicMock, call, patch
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.lib.signal_test_support import install_signal_pid_guard
 from scripts.lib import conf
 from scripts.whoami.note_file import note_name
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-import agent_notes
+from scripts.whoami import agent_notes
 from scripts.whoami import note_file
 from scripts.whoami import session_table
 from scripts.whoami import account
 from scripts.whoami import agent_accounts
-import codex_pacer
-import five_hour
-import quota_alert
+from scripts.whoami import codex_pacer
+from scripts.whoami import five_hour
+from scripts.whoami import quota_alert
 from scripts.whoami import usage_store
-import whoami
+from scripts.whoami import whoami
 from scripts.whoami.agent_accounts import (ClaudeDirectorySource, CodexHomeSource, CodexRateLimits, Quota, Report,
                             codex_credits, reset_credits)
-from agent_notes import local_reset
+from scripts.whoami.agent_notes import local_reset
 from scripts.whoami.note_file import Note, read_note
 from scripts.accounts import accounts, refusal_watch, refusals, role_map
 from scripts.accounts.home_test_support import scratch_accounts_config
@@ -114,7 +112,7 @@ class AgentNotesTests(unittest.TestCase):
         _ = self.enterContext(patch.object(agent_notes, "READINGS_LOG", self.root / "readings.jsonl", create=True))
         _ = self.enterContext(patch.object(showrunners, "NOTIFIER_STATE_DIR", self.root / "notifier"))
         self.rows = cast(MagicMock, self.enterContext(patch.object(session_table, "live_sessions", return_value=session_table.ReadSessions({}, frozenset()))))
-        _ = self.enterContext(patch("sessions.live_sessions", return_value=[]))
+        _ = self.enterContext(patch("scripts.message.sessions.live_sessions", return_value=[]))
 
     def snapshot(self, reports: list[Report]) -> agent_notes.UpdatedAgentNotes:
         selection = agent_accounts.ClaudeAccountsInUse(agent_accounts.UnreadableIdentity(Path.home() / ".claude", "fixture identity unavailable"), False, (), frozenset())
@@ -293,7 +291,7 @@ class AgentNotesTests(unittest.TestCase):
         renewal.assert_not_called()
         launch.assert_not_called()
         probe.assert_not_called()
-        self.assertEqual(output.getvalue(), "")
+        self.assertEqual(output.getvalue(), f"already claimed by {os.getpid()}\n")
         self.assertFalse(usage_store.store_file().exists())
         self.assertFalse(accounts.login_renewals_file().exists())
 
@@ -311,7 +309,8 @@ class AgentNotesTests(unittest.TestCase):
         launch.assert_called_once()
         probe.assert_not_called()
         self.assertEqual(output.getvalue(),
-                         "usage refresh: 1 account(s) have login credentials unavailable in this session\n")
+                         "usage refresh: 1 account(s) have login credentials unavailable in this session\n"
+                         + f"already claimed by {os.getpid()}\n")
         self.assertEqual(usage_store.latest_read_outcome(usage_store.load()["desktop@example.invalid"]),
                          agent_accounts.UsageReadOutcome.STALE_TOKEN)
         self.assertFalse(accounts.login_renewals_file().exists())
@@ -394,7 +393,7 @@ class AgentNotesTests(unittest.TestCase):
                 agent_notes.usage_only()
             agent_notes.usage_only()
             read.assert_called_once()
-        self.assertEqual(output.getvalue(), "")
+        self.assertEqual(output.getvalue(), f"already claimed by {os.getpid()}\n")
 
     def test_usage_only_waits_the_full_interval_without_a_poll_argument(self) -> None:
         with self.live_usage_reader() as (clock, http):
@@ -844,7 +843,7 @@ class AgentNotesTests(unittest.TestCase):
 
     def test_first_snapshot_renames_legacy_notes_without_changing_body_or_mode(self) -> None:
         old = self.root / "codex 2.md"
-        text = "---\nlogin: legacy@example.invalid\nuse_credits: off\n---\nMy untouched account notes.\n"
+        text = "---\nlogin: legacy@example.invalid\nuse_credits: off\nsessions: 0\n---\nMy untouched account notes.\n"
         _ = old.write_text(text)
         old.chmod(0o644)
         inode = old.stat().st_ino
@@ -906,7 +905,8 @@ class AgentNotesTests(unittest.TestCase):
         self.assertIn("role: []", notes["claude2"].text)
         self.assertTrue(all(current.get("state") is None for current in notes.values()))
         self.assertEqual(notes["claude1"].get("sessions"), "1")
-        self.assertEqual(session_table.section_rows(notes["claude1"].text)[0].session_id, "sid-1")
+        self.assertEqual(session_table.section_rows(notes["claude1"].text), ())
+        self.assertNotIn("sid-1", notes["claude1"].text)
         self.assertIn("Body stays.", notes["claude1"].text)
 
     def test_unreadable_group_configuration_and_codex_identity_keep_existing_roles(self) -> None:
@@ -993,13 +993,15 @@ class AgentNotesTests(unittest.TestCase):
         updated = read_note(note.path)
         assert isinstance(updated, Note)
         self.assertEqual(updated.get("sessions"), "1")
-        self.assertIn("last seen", updated.text)
-        self.assertEqual({row.session_id for row in session_table.section_rows(updated.text)}, {"new-id", "mac-id"})
+        self.assertNotIn("## Live sessions", updated.text)
+        self.assertEqual(session_table.section_rows(updated.text), ())
         self.rows.return_value = session_table.SessionsUnread("local registry unreadable")
-        before = updated.text
         result = self.snapshot([])
-        self.assertEqual(note.path.read_text(), before)
-        self.assertTrue(any("sessions: local registry unreadable" in line for line in result.messages))
+        current = read_note(note.path)
+        assert isinstance(current, Note)
+        self.assertEqual(current.get("sessions"), "0")
+        self.assertEqual(current.text[current.end:], updated.text[updated.end:])
+        self.assertTrue(any("sessions: anomaly: local registry unreadable" in line for line in result.messages))
 
     def test_machine_observations_replace_once_for_all_notes_and_keep_unreached_times(self) -> None:
         _ = self.note("claude1.md", "unit@example.invalid")
@@ -1040,12 +1042,12 @@ class AgentNotesTests(unittest.TestCase):
                     messages = self.snapshot([]).messages
                     self.assertFalse(any(message.startswith("sessions seen:") for message in messages))
                     self.assertEqual(set(agent_notes.read_sessions_seen()), {"natedev"})
-                    self.assertIn("No live sessions.", note.path.read_text())
+                    self.assertNotIn("## Live sessions", note.path.read_text())
             path.unlink()
             path.mkdir()
             messages = self.snapshot([]).messages
             self.assertTrue(any(message.startswith("sessions seen:") for message in messages))
-            self.assertIn("No live sessions.", note.path.read_text())
+            self.assertNotIn("## Live sessions", note.path.read_text())
             self.assertEqual(list(self.root.glob(".sessions-seen-*")), [])
 
     def test_writer_replaces_role_blocks_and_owned_sections_without_disturbing_user_text(self) -> None:
@@ -1094,10 +1096,7 @@ class AgentNotesTests(unittest.TestCase):
 
     def test_notes_pass_shares_process_scan_without_changing_outputs_or_decisions(self) -> None:
         from scripts.accounts import unit_watchdog
-        if TYPE_CHECKING:
-            from scripts.herdr import herdr
-        else:
-            import herdr
+        from scripts.herdr import herdr
         proc = self.root / "proc"
         proc.mkdir()
         home = self.root / ".codex"
@@ -1353,7 +1352,7 @@ class AgentNotesTests(unittest.TestCase):
         self.assertEqual(blocked.call_args.kwargs["stopped"], quota_alert.StoppedCommandUnknown())
 
     def test_blocked_cli_converts_stopped_worker_command_at_the_argument_boundary(self) -> None:
-        command = "codex_mesh follow --to impl --prompt 'finish the patch'"
+        command = "worker.py assign impl 'finish the patch'"
         with (patch.object(sys, "argv", ["agent_notes.py", "blocked", str(self.root / ".codex"),
                   "workers@example.invalid", "codex1", "--stopped", "own-director", "impl", command]),
               patch.object(agent_notes, "blocked", return_value=[]) as blocked,

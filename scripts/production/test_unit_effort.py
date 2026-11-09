@@ -1,30 +1,30 @@
 """Tests for setting every unit director's effort and the launch row together."""
 from __future__ import annotations
 
-from scripts.lib.test_models_registry import write_registry
+from scripts.production.fake_unit_host import labeled as labeled_host
+
+from scripts.lib.test_models_registry import RegistryReadProbe, write_registry
 
 import contextlib
 import io
 import json
 import os
-import sys
 import tempfile
 import unittest
 from pathlib import Path
-from typing import override
+from typing import cast, override
 from unittest import mock
 
-import fake_unit_host
-import unit_effort
-import unit_lookup
-import herdr
-from fake_herdr import CommandResponse
-from fake_unit_host import HostedUnit
-from unit_effort import Ready, Skipped
+from scripts.production import fake_unit_host
+from scripts.production import unit_effort
+from scripts.production import unit_lookup
+from scripts.herdr import herdr
+from scripts.herdr.fake_herdr import CommandResponse
+from scripts.production.fake_unit_host import HostedUnit
+from scripts.production.unit_effort import Ready, Skipped
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.lib import models_registry  # noqa: E402
-from scripts.production.staff_test_support import isolated_staff_file, unit_membership, fixture_runtime_id
+from scripts.production.staff_test_support import StaffTestCase, isolated_staff_file, fixture_runtime_id, fixture_member
 
 RULE_TOP = "──── review ──────────"
 RULE = "───────────────────────────"
@@ -81,6 +81,7 @@ class UnitEffortTests(unittest.TestCase):
         synced = self.root / "catalog-sync-success"
         synced.touch()
         self.enterContext(mock.patch.dict(os.environ, {
+            "HOME": str(self.root),
             "HERDR_BIN": str(Path(__file__).parents[1] / "herdr/fake_herdr.py"),
             "HERDR_PROC": str(self.root / "proc"),
             "HERDR_PLATFORM": "linux",
@@ -92,24 +93,38 @@ class UnitEffortTests(unittest.TestCase):
             "CODEX_MODELS_CACHE_FILE": str(self.root / "models.json"),
             "CODEX_CATALOG_SYNC_STATE_FILE": str(synced)}))
         _ = self.enterContext(mock.patch.object(unit_lookup, "live_session", return_value=True))
+        _ = self.enterContext(fake_unit_host.private_process_registry())
         units = [
-            HostedUnit("review", "w1:p1", {"SHOWRUNNER_UNIT": "build-followups", "SHOWRUNNER_UNIT_ID": "review-unit"}, EMPTY),
-            HostedUnit("widget", "w2:p1", {"SHOWRUNNER_UNIT": "tool-based-ui", "SHOWRUNNER_UNIT_ID": "widget-unit"}, screen("❯ my draft")),
-            HostedUnit("trunk", "w3:p1", {"SHOWRUNNER_UNIT": "tool-based-ui", "SHOWRUNNER_UNIT_ID": "trunk-unit"}, screen("❯ \x1b[2mtry this\x1b[22m")),
+            labeled_host("review", "w1:p1", "review", production_name="build-followups", screen=EMPTY),
+            labeled_host("widget", "w2:p1", "widget", production_name="tool-based-ui", screen=screen("❯ my draft")),
+            labeled_host("trunk", "w3:p1", "trunk", production_name="tool-based-ui", screen=screen("❯ \x1b[2mtry this\x1b[22m")),
             HostedUnit("notes", "w4:p1", {}, EMPTY),
         ]
-        identities: dict[str, str] = {}
-        for unit in units:
-            if "SHOWRUNNER_UNIT_ID" in unit.marks:
-                row = unit_membership(unit.marks["SHOWRUNNER_UNIT"], unit.marks["SHOWRUNNER_UNIT_ID"])
-                identities[unit.session] = row.id
+        identities = {unit.session: unit.marks["CODEX_THREAD_ID"] for unit in units
+                      if "CODEX_THREAD_ID" in unit.marks}
+        notes = fixture_member("agent", name="notes", runtime_id=fixture_runtime_id("notes"))
+        identities["notes"] = notes.current_session
         fake_unit_host.write(os.environ, units)
         for index, unit in enumerate(units):
-            _ = (self.records / f"{unit.session}.json").write_text(json.dumps({
-                "pid": 991001 + index * 2,
-                "sessionId": identities.get(unit.session, fixture_runtime_id(unit.session)), "name": unit.session,
-                "messagingSocketPath": str(self.root / f"{unit.session}.sock"), "updatedAt": 1,
-                "tmux": ""}), encoding="utf-8")
+            self.native_target(unit, 991001 + index * 2, 998050 + index,
+                               identities.get(unit.session, fixture_runtime_id(unit.session)))
+
+    def native_target(self, unit: HostedUnit, shell: int, pid: int, identity: str) -> None:
+        fake_unit_host.process(os.environ, pid, shell, ["claude"], {
+            **unit.marks, "HERDR_SESSION": unit.session, "HERDR_PANE_ID": unit.pane})
+        path = self.root / "herdr-responses.json"
+        responses = cast(dict[str, CommandResponse], json.loads(path.read_text()))
+        responses[f"--session {unit.session} pane process-info --pane {unit.pane}"] = {
+            "code": 0, "stdout": json.dumps({"result": {"process_info": {
+                "shell_pid": shell, "foreground_process_group_id": pid,
+                "foreground_processes": [{"pid": pid, "name": "claude", "argv": ["claude"]}]}}})}
+        responses[f"--session {unit.session} pane read {unit.pane} --source visible --format ansi"] = {
+            "code": 0, "stdout": unit.screen}
+        _ = path.write_text(json.dumps(responses))
+        _ = (self.records / f"{pid}.json").write_text(json.dumps({
+            "pid": pid, "procStart": "1", "sessionId": identity, "name": unit.session,
+            "messagingSocketPath": str(self.root / f"{unit.session}.sock"), "updatedAt": 1,
+            "tmux": ""}), encoding="utf-8")
 
     def run_main(self, *arguments: str) -> tuple[int, str, str]:
         out, err = io.StringIO(), io.StringIO()
@@ -136,6 +151,20 @@ class UnitEffortTests(unittest.TestCase):
         self.assertEqual(self.sent(), [])
         self.assertEqual(self.director_row(), "director=opus:xhigh")
 
+    def test_each_effort_command_reads_one_base_and_its_children_share_it(self) -> None:
+        probe = RegistryReadProbe(self.root, self.registry)
+        for current, expected in (("opus:xhigh", "opus:high (now opus:xhigh)"),
+                                  ("sonnet:medium", "sonnet:high (now sonnet:medium)")):
+            with self.subTest(current=current):
+                _ = write_registry(self.registry, {"production.claude": {"director": current}})
+                probe.clear()
+                with probe.active(os.environ):
+                    code, output, errors = self.run_main("high", "--check")
+                self.assertEqual((code, errors), (0, ""))
+                self.assertIn("registry: production.director would be " + expected, output)
+                self.assertEqual(probe.total(), 1, probe.reads())
+        self.assertEqual(self.sent(), [])
+
     def test_every_productions_directors_get_effort_and_the_row_keeps_its_model(self) -> None:
         code, out, _ = self.run_main("high")
         self.assertEqual(code, 0)
@@ -155,7 +184,8 @@ class UnitEffortTests(unittest.TestCase):
 
     def test_a_herdr_director_reads_ansi_and_receives_effort_once(self) -> None:
         place = herdr.HerdrPlace("native", "w1:p1")
-        marked = unit_lookup.MarkedUnit("native-unit", unit_lookup.LiveClaude("native", "id", "/sock", 1), place)
+        identity = fixture_runtime_id("native-effort")
+        marked = unit_lookup.LabeledSession("native", unit_lookup.LiveClaude("native", identity, "/sock", 998060), place)
         responses = self.root / "herdr-responses.json"
         replies: dict[str, CommandResponse] = {
             "--session native pane read w1:p1 --source recent --lines 60 --format ansi": {
@@ -163,14 +193,20 @@ class UnitEffortTests(unittest.TestCase):
             "default": {"code": 0, "stdout": ""},
         }
         _ = responses.write_text(json.dumps(replies))
-        with mock.patch.object(unit_lookup, "every_marked_unit", return_value=unit_lookup.MarkedProductions(
-                {"show": {"native-unit": marked}}, {})):
+        unit = HostedUnit("native", "w1:p1", {}, screen("❯ \x1b[2mtry this\x1b[22m"))
+        fake_unit_host.write(os.environ, [unit])
+        self.native_target(unit, 991001, 998060, identity)
+        with mock.patch.object(unit_lookup, "every_labeled_session", return_value=unit_lookup.LabeledProductions(
+                {"show": {"native": marked}})):
             code, out, err = self.run_main("high")
         self.assertEqual(code, 0, err)
         self.assertIn("native: sent", out)
         self.assertEqual((self.root / "herdr.log").read_text().splitlines(), [
             json.dumps(["--session", "native", "pane", "read", "w1:p1", "--source", "recent", "--lines", "60",
                         "--format", "ansi"]),
+            json.dumps(["--session", "native", "pane", "list"]),
+            json.dumps(["--session", "native", "pane", "process-info", "--pane", "w1:p1"]),
+            json.dumps(["--session", "native", "pane", "read", "w1:p1", "--source", "visible", "--format", "ansi"]),
             json.dumps(["--session", "native", "agent", "prompt", "w1:p1", "/effort high"]),
         ])
         self.assertEqual(self.sent(), [["--session", "native", "agent", "prompt", "w1:p1", "/effort high"]])
@@ -179,9 +215,37 @@ class UnitEffortTests(unittest.TestCase):
         refusal: herdr.HerdrRefusal = {"error": {"code": "agent_blocked", "message": "blocked at a prompt"}}
         _ = (self.root / "herdr-responses.json").write_text(json.dumps({"default": {
             "code": 1, "stdout": json.dumps(refusal)}}))
-        problem = unit_effort.send(herdr.HerdrPlace("native", "w1:p1"), "high")
+        problem = unit_effort.send(herdr.HerdrPlace("native", "w1:p1"), "high", target="id")
         self.assertIn("agent_blocked", problem)
         self.assertEqual(len((self.root / "herdr.log").read_text().splitlines()), 1)
+
+
+class NativeDirectorEffortTests(StaffTestCase):
+    def test_unknown_and_stopped_directors_require_no_pane_io(self) -> None:
+        for state in (unit_lookup.ClaudeUnknown("unreadable session"), unit_lookup.ClaudeNotRunning()):
+            with self.subTest(state=state):
+                labeled = unit_lookup.LabeledSession("unit", state, herdr.HerdrPlace("agents", "w1:p1"))
+                with (mock.patch.object(unit_effort, "read_place", side_effect=AssertionError("unexpected pane read")),
+                      mock.patch.object(unit_effort, "send", side_effect=AssertionError("unexpected pane write"))):
+                    lines = unit_effort.director_lines(
+                        unit_lookup.LabeledProductions({"show": {"unit": labeled}}), "high", False)
+                self.assertEqual(lines, ["unit: skipped — cannot tell whether Claude runs: unreadable session"]
+                                 if isinstance(state, unit_lookup.ClaudeUnknown) else ["no unit director is running"])
+
+    def test_live_director_receives_effort_through_its_current_native_session(self) -> None:
+        fixture = self.row_production()
+        self.assertNotEqual(fixture.unit.id, fixture.unit.current_session)
+        place = herdr.HerdrPlace("agents", "w1:p1")
+        labeled = unit_lookup.LabeledSession("unit", unit_lookup.LiveClaude(
+            "current-name", fixture.unit.current_session, "/fixture.sock", 998060), place,
+            identity=unit_lookup.LiveSession(fixture.unit.current_session))
+        with (mock.patch.object(unit_effort, "read_place", return_value=EMPTY) as read,
+              mock.patch.object(unit_effort, "send", return_value="") as send):
+            self.assertEqual(unit_effort.director_lines(
+                unit_lookup.LabeledProductions({"show": {"unit": labeled}}), "high", False),
+                ["current-name: sent"])
+        read.assert_called_once_with(place, ansi=True)
+        send.assert_called_once_with(place, "high", target=fixture.unit.current_session)
 
 
 if __name__ == "__main__":

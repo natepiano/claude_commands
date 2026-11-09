@@ -16,10 +16,9 @@ import unittest
 from pathlib import Path
 from typing import TypedDict, cast, final, override
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-import ci_points
-from cli_fixture import invoke_cli
-from merge_checkpoint import merge_lock
+from scripts.production import ci_points
+from scripts.production.cli_fixture import invoke_cli
+from scripts.production.merge_checkpoint import merge_lock
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
@@ -112,6 +111,7 @@ class ValidationObservation(TypedDict):
     initial: str
     validated: str
     origin: str
+    push_origin: str
     remote_tip: str
     cargo_target: str
 
@@ -144,7 +144,7 @@ class CiPointsTests(unittest.TestCase):
         self.stub_state.mkdir()
         self.bin = self.root / "bin"
         self.bin.mkdir()
-        self.doc = self.root / "example-production.md"
+        self.doc = self.root / "tool-based-ui-production.md"
         self.log = self.checkout / "production.log"
         for name in ("review_regime.py", "gh", "claude",
                      "systemd-run", "ssh", "nix", "cargo-berth"):
@@ -162,6 +162,7 @@ class CiPointsTests(unittest.TestCase):
                     "PATH": str(self.bin) + os.pathsep + os.environ.get("PATH", ""),
                     "DAILIES_REVIEW_REGIME": str(self.bin / "review_regime.py"),
                     "CLAUDE_CODE_SESSION_ID": "test-showrunner",
+                    "UNIT_HISTORY_DIR": str(self.root / "history"),
                     "NOTIFIER_STATE_DIR": str(self.state / "notifier"),
                     "NOTIFIER_SESSIONS_DIR": str(self.state / "sessions")}
         _ = self.git("init", "--bare", str(self.origin), cwd=self.root)
@@ -170,7 +171,8 @@ class CiPointsTests(unittest.TestCase):
         _ = self.git("config", "user.email", "ci-points@example.invalid")
         _ = self.git("remote", "add", "origin", str(self.origin))
         self.write(self.checkout / "README.md", "base\n")
-        _ = self.git("add", "README.md")
+        self.write(self.checkout / "Cargo.toml", "[workspace]\n")
+        _ = self.git("add", "README.md", "Cargo.toml")
         _ = self.git("commit", "-m", "initial")
         _ = self.git("push", "-u", "origin", "main")
         _ = self.git("switch", "-c", "production")
@@ -178,6 +180,13 @@ class CiPointsTests(unittest.TestCase):
             _ = excluded.write("production.log\n")
         self.write(self.log, "# Production log — example\n\n### STATE\n")
         self.production_doc()
+        from scripts.production.staff_test_support import fixture_member, isolated_staff_file
+        from scripts.production import staff
+        self.env["STAFF_FILE"] = str(self.root / "staff.json")
+        with isolated_staff_file(Path(self.env["STAFF_FILE"]), self.env):
+            owner = fixture_member("showrunner", name="example", doc=staff.LiveDoc("natedev", self.doc))
+            _ = fixture_member("unit", name="alpha", parent=owner.id,
+                               worktree=staff.PresentWorktree("natedev", self.checkout))
         _ = self.git("push", "-u", "origin", "production")
         self.ci_result(self.git("rev-parse", "HEAD"))
 
@@ -203,17 +212,11 @@ class CiPointsTests(unittest.TestCase):
             f"- **Showrunner checkout:** `{self.checkout}`", "- **Showrunner session:** test-showrunner",
             "- **Log:** `production.log`", "- **User zone:** America/Los_Angeles",
             "- **Updates:** every 15 minutes", "- **Push:** git", "",
-            "## Units", "", "| Unit | Plan | Worktree | Branch | Session | Port | Owns |",
-            "| --- | --- | --- | --- | --- | --- | --- |",
-            "| alpha-unit | docs/alpha.md | `alpha` | alpha | alpha | — | — |", "",
-            "## Gates", "", "| Gate | Waiting | Waits on | Clears when |",
-            "| --- | --- | --- | --- |",
-            "| G1 | alpha-unit Phase 4 | beta-unit Phase 2 | checkpoint merged |", "",
             "## Production rules", "", "- CI runs on the production branch.", "",
         )))
 
     def run_ci(self, *args: str) -> subprocess.CompletedProcess[str]:
-        arguments = [*args, "--production", str(self.doc)]
+        arguments = [*args, "--production", "example"]
         return invoke_cli(ci_points, ci_points.main, arguments, self.env, self.checkout)
 
     def calls(self, name: str) -> list[list[str]]:
@@ -272,7 +275,7 @@ if os.environ["CI_POINTS_TEST_MOVE"] == "1":
 remote_tip = git("ls-remote", "origin", "refs/heads/production").split()[0]
 observation = {
     "directory": str(directory), "initial": initial, "validated": validated,
-    "origin": origin, "remote_tip": remote_tip,
+    "origin": origin, "push_origin": git("remote", "get-url", "--push", "origin"), "remote_tip": remote_tip,
     "cargo_target": os.environ.get("CARGO_TARGET_DIR", ""),
 }
 (state / "validation-observation.json").write_text(json.dumps(observation))
@@ -294,6 +297,42 @@ PY
         return cast(ValidationObservation, json.loads(
             (self.stub_state / "validation-observation.json").read_text(encoding="utf-8")))
 
+    def test_validation_without_a_build_cache_publishes_the_fix_and_removes_its_copy(self) -> None:
+        _ = self.git("rm", "Cargo.toml")
+        _ = self.git("commit", "-m", "repository without a build cache")
+        _ = self.git("push", "origin", "production")
+        self.fixed_commit_validation(fix_commit=True)
+
+        result = self.start_point()
+
+        observed = self.validation_observation()
+        checkout = Path(observed["directory"])
+        self.assertNotEqual(checkout, self.checkout)
+        self.assertEqual(observed["origin"], str(self.origin))
+        self.assertNotEqual(observed["validated"], observed["initial"])
+        self.assertEqual(ci_points.read_run(self.state).tip, observed["validated"])
+        self.assertEqual(self.git("rev-parse", "HEAD"), observed["validated"])
+        self.assertIn("fast-forward push", result.stdout)
+        self.assertFalse(checkout.exists())
+
+    def test_failed_validation_without_a_build_cache_keeps_its_log_and_removes_its_copy(self) -> None:
+        _ = self.git("rm", "Cargo.toml")
+        _ = self.git("commit", "-m", "repository without a build cache")
+        _ = self.git("push", "origin", "production")
+        self.fixed_commit_validation(fail=True)
+
+        result = self.run_ci("ci", "start", "--state-dir", str(self.state))
+
+        self.assert_step(result, "validation", False)
+        checkout = Path(self.validation_observation()["directory"])
+        self.assertNotEqual(checkout, self.checkout)
+        self.assertFalse(checkout.exists())
+        log = self.state / "ci_validation.log"
+        self.assertIn(str(log), result.stdout)
+        self.assertIn("FAILED: fixed-commit validation", log.read_text())
+        self.assertNotIn(str(checkout), result.stdout)
+        self.assertFalse((self.state / "ci_run.json").exists())
+
     def test_a_contained_validated_commit_passes_after_the_branch_moves_without_pushing(self) -> None:
         initial = self.git("rev-parse", "HEAD")
         self.fixed_commit_validation(move_branch=True)
@@ -312,7 +351,7 @@ PY
         self.assertEqual(ci_points.read_run(self.state).tip, observed["remote_tip"])
         self.assertTrue(any("--commit" in call and observed["remote_tip"] in call
                             for call in self.calls("gh")), self.calls("gh"))
-        self.assertFalse(Path(observed["directory"]).exists())
+        self.assertTrue((Path(observed["directory"]) / ".git").is_dir())
 
     def test_a_validation_fix_fast_forwards_an_unchanged_remote_branch(self) -> None:
         initial = self.git("rev-parse", "HEAD")
@@ -333,7 +372,28 @@ PY
         self.assertEqual(self.git("rev-parse", "HEAD"), fixed)
         self.assertEqual(self.git("show", "production:README.md", cwd=self.origin), "validation fix")
         self.assertEqual((self.checkout / "README.md").read_text(), "validation fix\n")
-        self.assertFalse(Path(observed["directory"]).exists())
+        self.assertTrue((Path(observed["directory"]) / ".git").is_dir())
+
+    def test_validation_keeps_the_standing_git_configuration_clean(self) -> None:
+        push_origin = self.origin.as_uri()
+        _ = self.git("remote", "set-url", "--push", "origin", push_origin)
+        self.fixed_commit_validation()
+        result = self.run_ci("ci", "start", "--state-dir", str(self.state))
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        observed = self.validation_observation()
+        checkout = Path(observed["directory"])
+        self.assertEqual(observed["origin"], str(self.origin))
+        self.assertEqual(observed["push_origin"], push_origin)
+        self.assertEqual(self.git("config", "--local", "--get", "remote.origin.url", cwd=checkout),
+                         str(self.origin))
+        for key in ("remote.origin.pushurl", "user.name", "user.email"):
+            config = subprocess.run(["git", "config", "--local", "--get", key], cwd=checkout,
+                                    env=self.env, capture_output=True, text=True, check=False)
+            self.assertEqual(config.returncode, 1, (key, config.stdout, config.stderr))
+        before = (checkout / ".git/config").read_bytes()
+        result = self.run_ci("ci", "start", "--state-dir", str(self.state))
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual((checkout / ".git/config").read_bytes(), before)
 
     def test_collect_accepts_green_ci_on_the_published_validation_fix(self) -> None:
         self.fixed_commit_validation(fix_commit=True)
@@ -363,7 +423,7 @@ PY
         self.assertEqual(self.git("rev-parse", "production"), fixed)
         self.assertEqual(self.git("rev-parse", "production", cwd=self.origin), fixed)
         self.assertFalse((self.state / "ci_run.json").exists())
-        self.assertFalse(Path(self.validation_observation()["directory"]).exists())
+        self.assertTrue((Path(self.validation_observation()["directory"]) / ".git").is_dir())
 
         result = self.start_point()
 
@@ -378,7 +438,8 @@ PY
         self.assertIn(f"validation: ok — validated {fixed}; no push; following {fixed}", result.stdout)
         self.assertEqual(ci_points.read_run(self.state).tip, fixed)
         self.assertTrue(any("--commit" in call and fixed in call for call in self.calls("gh")))
-        self.assertTrue(all(not Path(attempt["directory"]).exists() for attempt in attempts))
+        self.assertTrue(all((Path(attempt["directory"]) / ".git").is_dir() for attempt in attempts))
+        self.assertEqual(len({attempt["directory"] for attempt in attempts}), 1)
 
     def test_retry_after_a_failed_push_publishes_the_existing_fix_without_a_sibling_commit(self) -> None:
         initial = self.git("rev-parse", "HEAD")
@@ -398,7 +459,7 @@ PY
         self.assertFalse((self.stub_state / "pushes").exists())
         self.assertFalse((self.state / "ci_run.json").exists())
         self.assertFalse(self.calls("gh"))
-        self.assertFalse(Path(self.validation_observation()["directory"]).exists())
+        self.assertTrue((Path(self.validation_observation()["directory"]) / ".git").is_dir())
         reject.unlink()
 
         result = self.start_point()
@@ -416,7 +477,8 @@ PY
                       result.stdout)
         self.assertEqual(ci_points.read_run(self.state).tip, fixed)
         self.assertTrue(any("--commit" in call and fixed in call for call in self.calls("gh")))
-        self.assertTrue(all(not Path(attempt["directory"]).exists() for attempt in attempts))
+        self.assertTrue(all((Path(attempt["directory"]) / ".git").is_dir() for attempt in attempts))
+        self.assertEqual(len({attempt["directory"] for attempt in attempts}), 1)
 
     def test_a_later_merge_push_fast_forwards_from_the_published_ci_fix(self) -> None:
         initial = self.git("rev-parse", "HEAD")
@@ -439,7 +501,7 @@ PY
         self.fixed_commit_validation(fix_commit=True)
         with merge_lock(self.checkout, "example"):
             process = subprocess.Popen(
-                [sys.executable, str(SCRIPT), "ci", "start", "--production", str(self.doc),
+                [sys.executable, str(SCRIPT), "ci", "start", "--production", "example",
                  "--state-dir", str(self.state)],
                 cwd=self.checkout, env=self.env, stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE, text=True,
@@ -481,7 +543,7 @@ PY
         self.assertEqual((self.stub_state / "pushes").read_text().splitlines(),
                          [f"refs/heads/production {initial} {merged}"])
         self.assertFalse((self.state / "ci_run.json").exists())
-        self.assertFalse(Path(observed["directory"]).exists())
+        self.assertTrue((Path(observed["directory"]) / ".git").is_dir())
 
     def test_a_validation_fix_cannot_overwrite_a_branch_that_moves_during_validation(self) -> None:
         initial = self.git("rev-parse", "HEAD")
@@ -497,7 +559,7 @@ PY
         self.assertEqual((self.stub_state / "pushes").read_text().splitlines(),
                          [f"refs/heads/production {initial} {observed['remote_tip']}"])
         self.assertFalse((self.state / "ci_run.json").exists())
-        self.assertFalse(Path(observed["directory"]).exists())
+        self.assertTrue((Path(observed["directory"]) / ".git").is_dir())
 
     def test_validation_uses_a_private_copy_and_leaves_the_production_checkout_unchanged(self) -> None:
         initial = self.git("rev-parse", "HEAD")
@@ -516,9 +578,9 @@ PY
         self.assertEqual(self.git("status", "--porcelain"), before_status)
         self.assertEqual((self.checkout / "README.md").read_bytes(), before_readme)
         self.assertFalse((self.stub_state / "pushes").exists())
-        self.assertFalse(Path(observed["directory"]).exists())
+        self.assertTrue((Path(observed["directory"]) / ".git").is_dir())
 
-    def test_a_failed_validation_removes_its_private_copy_without_pushing(self) -> None:
+    def test_a_failed_validation_keeps_its_private_checkout_without_pushing(self) -> None:
         initial = self.git("rev-parse", "HEAD")
         self.fixed_commit_validation(fail=True)
 
@@ -532,19 +594,26 @@ PY
         self.assertEqual((self.state / "ci_validation.log").read_text(),
                          "=== STEP: validation ===\nFAILED: fixed-commit validation\n")
         observed = self.validation_observation()
-        self.assertFalse(Path(observed["directory"]).exists())
+        self.assertTrue((Path(observed["directory"]) / ".git").is_dir())
         self.assertEqual(self.git("rev-parse", "production", cwd=self.origin), initial)
         self.assertEqual(self.git("rev-parse", "HEAD"), initial)
         self.assertFalse((self.stub_state / "pushes").exists())
         self.assertFalse((self.state / "ci_run.json").exists())
 
-    def merge(self, number: int, *, shrink: bool = False, unit: str = "alpha-unit") -> str:
+    def merge(self, number: int, *, shrink: bool = False, unit: str = "alpha") -> str:
         branch = f"unit-{number}{'-shrink' if shrink else ''}"
         _ = self.git("switch", "-c", branch)
         self.write(self.checkout / f"{branch}.txt", branch + "\n")
         _ = self.git("add", f"{branch}.txt")
         _ = self.git("commit", "-m", f"work {branch}")
         unit_tip = self.git("rev-parse", "HEAD")
+        if not shrink:
+            path = self.root / "history/runs/unit.jsonl"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("a", encoding="utf-8") as output:
+                _ = output.write(json.dumps({"schema_version": 1, "event_type": "checkpoint",
+                    "working_dir": str(self.checkout), "checkpoint_commit": unit_tip,
+                    "phase_id": str(number), "timestamp_epoch": number}) + "\n")
         _ = self.git("switch", "production")
         subject = f"Merge {unit} phase {number}{' shrink' if shrink else ''} ({unit_tip[:7]}) into production"
         _ = self.git("merge", "--no-ff", "-m", subject, branch)
@@ -583,6 +652,21 @@ PY
         self.assert_step(sixth, "due", True)
         self.assertIn("CI point due", sixth.stdout)
 
+    def test_a_lower_checkpoint_count_starts_a_new_ci_interval(self) -> None:
+        _ = self.merge(1)
+        self.write(self.state / "ci_points.json", json.dumps({"count": 50, "tip": self.git("rev-parse", "HEAD")}))
+        result = self.run_ci("due", "--state-dir", str(self.state))
+        self.assert_step(result, "due", True)
+        self.assertIn("CI point due", result.stdout)
+        self.ci_result(self.git("rev-parse", "HEAD"))
+        _ = self.start_point()
+        self.assert_step(self.collect_point(), "ci collect", True)
+        record = cast(dict[str, object], json.loads((self.state / "ci_points.json").read_text()))
+        self.assertEqual(record["count"], 1)
+        after = self.run_ci("due", "--state-dir", str(self.state))
+        self.assert_step(after, "due", True)
+        self.assertIn("0 of 5 code merges", after.stdout)
+
     def test_no_ci_skips_due_start_and_collect_without_side_effects(self) -> None:
         for args, step in (("due", "due"), ("ci start", "ci start"), ("ci collect", "ci collect")):
             with self.subTest(command=args):
@@ -601,9 +685,9 @@ PY
         state_list = produce.split("State:\n\n", 1)[1].split("\n\n", 1)[0]
         self.assertRegex(state_list, r"`DAILIES_STATE_DIR`\s+—\s+`<STATE_DIR>/dailies_input_state`")
         calls = cast(list[tuple[str, str]], re.findall(
-            r"ci_points\.py\s+(due|watch|ci start|ci collect|notice clear|notice lift)\b([^`]*)`",
+            r"ci_points\.py\s+(due|watch|ci start|ci collect)\b([^`]*)`",
             produce, flags=re.DOTALL))
-        self.assertEqual(len(calls), 6, calls)
+        self.assertEqual(len(calls), 4, calls)
         stateful = [(command, body) for command, body in calls
                     if command in ("due", "watch", "ci start", "ci collect")]
         self.assertEqual(len(stateful), 4, calls)
@@ -785,7 +869,8 @@ PY
         _ = self.start_point()
         hook = self.stub_state / "merge-during-watch.py"
         self.write(hook, textwrap.dedent('''\
-            import subprocess
+            import json, os, subprocess
+            from pathlib import Path
 
             def git(*args: str) -> str:
                 result = subprocess.run(["git", *args], check=True, capture_output=True, text=True)
@@ -794,8 +879,12 @@ PY
             git("switch", "-c", "unit-6")
             git("commit", "--allow-empty", "-m", "work unit-6")
             unit_tip = git("rev-parse", "HEAD")
+            with (Path(os.environ["UNIT_HISTORY_DIR"]) / "runs/unit.jsonl").open("a") as output:
+                output.write(json.dumps({"schema_version": 1, "event_type": "checkpoint",
+                    "working_dir": str(Path.cwd()), "checkpoint_commit": unit_tip,
+                    "phase_id": "6", "timestamp_epoch": 6}) + "\\n")
             git("switch", "production")
-            git("merge", "--no-ff", "-m", f"Merge alpha-unit phase 6 ({unit_tip[:7]}) into production", "unit-6")
+            git("merge", "--no-ff", "-m", f"Merge alpha phase 6 ({unit_tip[:7]}) into production", "unit-6")
             git("push", "origin", "production")
             '''))
         self.env["CI_POINTS_TEST_WATCH_HOOK"] = str(hook)
@@ -851,14 +940,14 @@ PY
         flag, value = collected.stdout.splitlines()[-1].split()
         self.assertEqual((flag, value), ("--ci-green", tip))
         promoted = subprocess.run([sys.executable, str(LIFECYCLE), "promote-main", "--production",
-                                   str(self.doc), flag, value, "--smoke-passed", tip],
+                                   "example", flag, value, "--smoke-passed", tip],
                                   cwd=self.checkout, env=self.env, capture_output=True,
                                   text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(promoted.returncode, 0, promoted.stdout + promoted.stderr)
         self.assertIn("ci: ok", promoted.stdout)
         _ = self.merge(2)
         held = subprocess.run([sys.executable, str(LIFECYCLE), "promote-main", "--production",
-                               str(self.doc), flag, value, "--smoke-passed", tip],
+                               "example", flag, value, "--smoke-passed", tip],
                               cwd=self.checkout, env=self.env, capture_output=True,
                               text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(held.returncode, 2, held.stdout + held.stderr)
@@ -895,7 +984,6 @@ def observed_lock(fd, operation):
         fcntl.flock = original
     return original(fd, operation)
 fcntl.flock = observed_lock
-sys.path.insert(0, os.path.dirname(sys.argv[0]))
 runpy.run_path(sys.argv[0], run_name='__main__')
 """
         self.state.mkdir(exist_ok=True)
@@ -910,7 +998,7 @@ runpy.run_path(sys.argv[0], run_name='__main__')
                     try:
                         processes.append(subprocess.Popen(
                             [sys.executable, "-c", program, str(write_ready), str(SCRIPT),
-                             "watch", "--production", str(self.doc), "--state-dir", str(self.state)],
+                             "watch", "--production", "example", "--state-dir", str(self.state)],
                             cwd=self.checkout, env=self.env, pass_fds=(write_ready,),
                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
                         ))
@@ -937,32 +1025,15 @@ runpy.run_path(sys.argv[0], run_name='__main__')
         self.assertEqual(len(self.calls("send.py")), 0)
         self.assertEqual(self.log.read_text().count("review watch"), 1)
 
-    def test_notice_clear_names_waiting_unit_and_merge_hash(self) -> None:
-        tip = self.merge(2, unit="beta-unit")
-        result = self.run_ci("notice", "clear", "G1")
-        self.assert_step(result, "notice clear", True)
-        self.assertIn(f"send alpha-unit: From the showrunner: G1 clear — beta-unit phase 2 is on production as {tip}",
-                      result.stdout)
-
-    def test_notice_lift_requires_log_and_names_test_evidence(self) -> None:
-        missing = self.run_ci("notice", "lift", "G1")
-        self.assertEqual(missing.returncode, 2, missing.stdout + missing.stderr)
-        log = self.root / "scratch-test.log"
-        self.write(log, "tests passed\n")
-        lifted = self.run_ci("notice", "lift", "G1", "--log", str(log))
-        self.assert_step(lifted, "notice lift", True)
-        self.assertIn(f"send alpha-unit: From the showrunner: G1 lifted — your tests pass without beta-unit phase 2 ({log}). Continue.",
-                      lifted.stdout)
-
 
     def test_mixed_handoff_history_does_not_advance_the_ci_interval(self) -> None:
         for number in range(1, 5):
             _ = self.merge(number)
         for subject in (
-            "Merge alpha-unit hand-off (aaaaaaa) into production",
+            "Merge alpha hand-off (aaaaaaa) into production",
             "Merge style-child hand-off (bbbbbbb) into production",
-            "Merge alpha-unit phase 4 shrink (ccccccc) into production",
-            "chore(example): rename unit alpha-unit to renamed-unit",
+            "Merge alpha phase 4 shrink (ccccccc) into production",
+            "chore(example): rename unit alpha to renamed",
         ):
             _ = self.git("commit", "--allow-empty", "-m", subject)
         due = self.run_ci("due", "--state-dir", str(self.state))
@@ -974,20 +1045,32 @@ runpy.run_path(sys.argv[0], run_name='__main__')
         record = cast(dict[str, object], json.loads((self.state / "ci_points.json").read_text()))
         self.assertEqual(record["count"], 4)
 
+    def test_ci_fix_label_uses_git_order_across_unit_records(self) -> None:
+        from scripts.production import staff
+        from scripts.production.staff_test_support import fixture_member, isolated_staff_file
+
+        _ = self.merge(1, unit="beta")
+        _ = self.merge(2)
+        other = self.root / "beta"
+        with isolated_staff_file(Path(self.env["STAFF_FILE"]), self.env):
+            owner = next(row for row in staff.snapshot().find(kind="showrunner") if row.name == "example")
+            _ = fixture_member("unit", name="beta", parent=owner.id,
+                               worktree=staff.PresentWorktree("natedev", other))
+        path = self.root / "history/runs/unit.jsonl"
+        events = [cast(dict[str, object], json.loads(line)) for line in path.read_text().splitlines()]
+        events[0]["working_dir"] = str(other)
+        self.write(path, "".join(json.dumps(event) + "\n" for event in events))
+        _ = self.start_point()
+        self.assertIn("ci(example): validation fixes after alpha phase 2",
+                      (self.stub_state / "validate-calls").read_text())
+
     def test_ci_fix_commit_label_uses_last_unit_phase_when_a_handoff_is_newest(self) -> None:
         _ = self.merge(2)
-        _ = self.git("commit", "--allow-empty", "-m", "Merge alpha-unit hand-off (aaaaaaa) into production")
+        _ = self.git("commit", "--allow-empty", "-m", "Merge alpha hand-off (aaaaaaa) into production")
         _ = self.start_point()
         command = (self.stub_state / "validate-calls").read_text()
-        self.assertIn("ci(example): validation fixes after alpha-unit phase 2", command)
+        self.assertIn("ci(example): validation fixes after alpha phase 2", command)
         self.assertNotIn("hand-off", command)
-
-    def test_notice_clear_cannot_treat_a_child_named_like_the_target_as_a_unit_phase(self) -> None:
-        _ = self.git("commit", "--allow-empty", "-m", "Merge beta-unit hand-off (bbbbbbb) into production")
-        result = self.run_ci("notice", "clear", "G1")
-        self.assert_step(result, "notice clear", False)
-        self.assertIn("beta-unit phase 2 has no code merge", result.stdout)
-        self.assertNotIn("send alpha-unit", result.stdout)
 
 
 if __name__ == "__main__":

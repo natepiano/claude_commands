@@ -53,6 +53,7 @@ export function snapshotPaths(snapshot: BoardSnapshot<BoardData>): RefreshPaths[
   return [
     ...snapshot.files.map((board, index): RefreshPaths => ({ kind: 'board', board, sources: snapshot.boards[index]?.sources ?? [] })),
     { kind: 'discovery', sources: snapshot.watch, loadedAt: snapshot.loadedAt },
+    ...(snapshot.boards.some(board => board.live) ? [{ kind: 'liveness' } as const] : []),
   ];
 }
 
@@ -81,6 +82,7 @@ export async function loadBoard(
   }
   watch({ kind: 'discovery', sources: response.watch, loadedAt });
   const boards: BoardData[] = [];
+  // The generator supplies staff-id paths from the staff record.
   for (const path of response.files) {
     ensureOpen();
     boards.push(JSON.parse(await calls.read(path)) as BoardData);
@@ -165,11 +167,16 @@ export async function loadAccounts(
   try {
     const status = JSON.parse(result.stdout) as StoredAccountsStatus;
     if (!Array.isArray(status.accounts) || !Array.isArray(status.problems)) throw new Error();
+    if (status.upcoming_moves !== undefined && (!Array.isArray(status.upcoming_moves)
+      || !status.upcoming_moves.every(line => typeof line === 'string'))) throw new Error();
+    if (status.accounts.some(account => account.selected_roles !== undefined
+      && (!Array.isArray(account.selected_roles) || !account.selected_roles.every(role => typeof role === 'string')))) throw new Error();
     if (status.session_inputs) {
       if (!Array.isArray(status.session_inputs) || !status.session_inputs.every(path => typeof path === 'string')) throw new Error();
       refreshLiveness = status.session_inputs.length > 0;
       await watchInputs(status.session_inputs);
     }
+    // Keep Python's combined role_counts and separate machine records unchanged.
     return status;
   } catch { throw new Error('Stored accounts status is invalid.'); }
 }

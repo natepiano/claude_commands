@@ -1,4 +1,4 @@
-"""Real verify.sh Mac retry clock with disposable tools."""
+"""Check routing directly and memory and token waits through verify.sh."""
 from __future__ import annotations
 
 import unittest
@@ -12,7 +12,7 @@ class VerifyMacRetryClockTests(VerifyMacOffloadFixture):
         self.check_idle_marker("memory")
 
     def test_idle_marker_bypasses_routing_retry_spacing(self) -> None:
-        self.check_idle_marker("routing")
+        self.check_routing_idle_hook()
 
     def test_idle_marker_bypasses_token_retry_spacing(self) -> None:
         self.check_idle_marker("token")

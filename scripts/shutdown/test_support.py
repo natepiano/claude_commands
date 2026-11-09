@@ -17,14 +17,14 @@ from pathlib import Path
 from typing import Never, cast, override
 from unittest.mock import patch
 
-import remote
-import remote_control
-import restart
-import herdr
-import restart_support
-import shutdown
-import sessions
-from unit_staff_test_support import isolated_parents
+from scripts.shutdown import remote
+from scripts.shutdown import remote_control
+from scripts.shutdown import restart
+from scripts.herdr import herdr
+from scripts.shutdown import restart_support
+from scripts.shutdown import shutdown
+from scripts.message import sessions
+from scripts.shutdown.unit_staff_test_support import isolated_parents
 from scripts.production.staff_test_support import isolated_staff_file, showrunner_relationship
 
 
@@ -89,7 +89,6 @@ class ShutdownTestCase(unittest.TestCase):
         # Records and reports in these fixtures belong to natedev.
         _ = self.enterContext(patch.object(socket, "gethostname", return_value="natedev"))
         # Launch limits stay as written on a loaded machine.
-        _ = self.enterContext(patch.object(herdr, "load_factor", return_value=1.0))
         self._send_leaf_hits.clear()
         # Run after patch cleanups, so caught assertions still fail the test.
         self.addCleanup(self._fail_send_leaf_hits)

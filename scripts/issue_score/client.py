@@ -22,10 +22,10 @@ from uuid import uuid4
 import zlib
 
 from scripts.lib import conf
-from .selection import UseConfiguredValue
+from scripts.lib.conf import UseConfiguredValue
 
-from . import questions as policy
-from .questions import Question
+from scripts.issue_score import questions as policy
+from scripts.issue_score.questions import Question
 
 def endpoint(scoring_config: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT) -> str:
     scoring_config = conf.read("issue_score") if isinstance(scoring_config, UseConfiguredValue) else scoring_config

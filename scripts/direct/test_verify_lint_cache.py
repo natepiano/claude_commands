@@ -3,14 +3,15 @@
 from __future__ import annotations
 
 import unittest
-from scripts.direct import verify_lint_cache_test_support as support
+from scripts.direct.test_verify_lint_judgment import VerifyLintJudgmentFixture
 
 
-class VerifyLintScopeTests(support.VerifyLintCacheFixture):
+class VerifyLintScopeTests(VerifyLintJudgmentFixture):
     def test_fixed_and_formatted_tree_is_cached(self) -> None:
         cache = self.dirty_cache()
         formatted = "pub fn value() -> u8 {\n    2\n}\n"
         self.environment.update({
+            "TEST_CLIPPY_FIRST_STATUS": "101",
             "TEST_FIX_SOURCE": "pub fn value()->u8{2}\n",
             "TEST_FMT_SOURCE": formatted,
             "TEST_CLIPPY_EXPECT_SOURCE": formatted,

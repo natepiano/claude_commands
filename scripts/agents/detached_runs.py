@@ -1,0 +1,612 @@
+#!/usr/bin/env python3
+"""Run a worker command detached and deliver its result through the native worker route.
+
+Start writes a run record and returns after it starts the supervisor.
+The supervisor runs the command and delivers its result to the current worker.
+Reap delivers results for records whose supervisor disappeared.
+Exit 3 means that no registered worker owns the caller.
+"""
+
+from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
+
+from collections.abc import Callable
+
+import argparse
+import contextlib
+import fcntl
+import json
+import os
+import secrets
+import shutil
+import signal
+import subprocess
+import sys
+import time
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from types import FrameType
+from typing import Literal, NotRequired, TypedDict, cast
+
+from scripts.agents import detached_run_process, worker_lifecycle
+from scripts.buildlog import treekey
+from scripts.lib import conf, unit_runs
+from scripts.lib.atomic_file import write_text_atomic
+from scripts.message import send_budget
+from scripts.production import staff, worker_admission
+
+# Exit status of `start` when the caller is not a registered worker: run the command attached.
+NOT_A_DETACHED_WORKER = 3
+# A worker at its live-run limit must keep its command pending, never run it attached.
+LIVE_RUN_LIMIT_REACHED = 4
+# Lines of the log the result message carries.
+RESULT_TAIL_LINES = 20
+# verify.sh's VERIFY_SUPERSEDED_STATUS: a newer call of the same verb from the same worker in the
+# same worktree replaced this one while it waited for the cargo token. It ran nothing, so it is
+# neither a pass nor a failure, and the newer call's result answers instead.
+SUPERSEDED_STATUS = 76
+TREE_CHANGED_STATUS = 77
+TREE_CHANGED_VERDICT = "CANCELLED (exit 77): resubmit after your edits."
+SUPERSEDED_VERDICT = ("SUPERSEDED (exit 76): a newer call of the same verb replaced this one before it built. "
+                      + "Nothing failed and nothing needs a repair; read the newer call's result.")
+# The verdict of a run whose supervisor is gone: it reported no exit status.
+ORPHAN_VERDICT = ("FAIL (no exit status): the run's supervisor process is gone, so the command was killed or "
+                  + "crashed before it reported. Start the run again if you still need its result.")
+# Where run folders and their active markers live; tests point this at a temporary folder.
+RUN_ROOTS: tuple[Path, ...] = unit_runs.run_roots()
+from scripts.agents.worker_lifecycle import DETACHED_RUNS_DIR as DETACHED_RUNS_DIR, DETACHED_RUN_START_GRACE_SECS
+FORWARDED_SIGNALS = (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)
+# On natedev the command runs in a scope in builds.slice, beside the steps scripts/lint/invoke.sh
+# places there, so its compiles take the builds' memory limit and CPU weight, below the sessions.
+# Worker cargo builds ran at the panes' weight in herdr-agents.service (2026-10-20). The scope
+# writes the marker just before the command starts; a marker missing after the scope exits proves
+# the scope never ran it (no user manager, a systemd that rejects an option), so the command runs
+# plainly. BUILDLOG_SCOPE=0 turns the scope off, as it does for invoke.sh.
+SCOPE_SCRIPT = ': > "$0" || exit 125; exec "$@"'
+
+
+class RunRecord(TypedDict):
+    run_id: str
+    status: Literal["running", "finished"]
+    session_dir: str
+    worker: str
+    staff_id: str
+    label: str
+    command: list[str]
+    log: str
+    started_at: float
+    pid: int
+    director_dir: str
+    done_message_file: str
+    # The tree key of cwd at start, "" when unknown; records before 2026-10-21 have none.
+    tree_key: NotRequired[str]
+    exit_code: NotRequired[int]
+    finished_at: NotRequired[str]
+    delivery: NotRequired[str]
+    # Set when the run ended without its supervisor: "supervisor gone".
+    ended: NotRequired[str]
+
+
+@dataclass(frozen=True)
+class NotDetachedWorker:
+    """The caller is not a registered worker, so its command runs attached."""
+
+
+@dataclass(frozen=True)
+class PaneCaller:
+    """A worker with a published staff parent."""
+
+    session_dir: str
+    name: str
+    staff_id: staff.StaffId
+
+
+Caller = PaneCaller | NotDetachedWorker
+
+
+def caller_from_environment(environment: dict[str, str]) -> Caller:
+    """Find the worker through its current native session and staff parent."""
+    membership = staff.local_snapshot()
+    member = membership.by_current_session(staff.runtime_id())
+    if member is None or member.kind != "worker":
+        identity = environment.get("CODEX_THREAD_ID") or environment.get("CLAUDE_CODE_SESSION_ID", "")
+        member = membership.by_current_session(identity)
+    if member is not None and member.kind == "worker":
+        from scripts.herdr import worker_panes
+
+        parent = membership.parent_of(member)
+        if parent is not None:
+            return PaneCaller(str(worker_panes.worker_run(member, record=membership)), member.name, member.id)
+    return NotDetachedWorker()
+
+
+def _worker_reference(session_dir: str, name: str) -> str:
+    member = worker_admission.member(Path(session_dir), name)
+    return str(member.id) if member is not None else ""
+
+
+@dataclass(frozen=True)
+class RunWorkerUnavailable:
+    reason: str
+
+
+def _run_worker(record: RunRecord, membership: staff.StaffSnapshot) -> staff.StaffRow | RunWorkerUnavailable:
+    member = membership.by_id(staff.StaffId(record.get("staff_id", "")))
+    if member is None or member.kind != "worker":
+        reason = f"{record['worker']}: detached run has no worker staff row"
+        print(f"anomaly: {reason}", file=sys.stderr)
+        return RunWorkerUnavailable(reason)
+    return member
+
+
+def _runs_dir(session_dir: str) -> Path:
+    return Path(session_dir) / DETACHED_RUNS_DIR
+
+
+def _write_record(path: Path, record: RunRecord) -> None:
+    write_text_atomic(path, json.dumps(record, indent=2, sort_keys=True))
+
+
+def _read_record(path: Path) -> RunRecord:
+    raw = worker_lifecycle.read_json_object(path)
+    if not raw.get("run_id") or not isinstance(raw.get("command"), list):
+        raise SystemExit(f"detached_runs: {path} is not a run record")
+    return cast(RunRecord, cast(object, raw))
+
+
+def seat_name(session_dir: str, name: str) -> str:
+    """Resolve the current staff worker through its active recorder slot."""
+    run = Path(session_dir)
+    membership = staff.local_snapshot()
+    owner = worker_admission.parent(membership, run=run)
+    state = worker_lifecycle.read_json_object(run / unit_runs.STATE_FILE)
+    passes = state.get("pass")
+    current = cast(dict[str, object], passes).get(name) if isinstance(passes, dict) else None
+    member = None
+    if isinstance(current, dict):
+        dispatch = cast(dict[str, object], current)
+        if dispatch.get("status") == "active":
+            name = str(dispatch.get("worker_name", "")) or name
+            member = membership.by_id(staff.StaffId(str(dispatch.get("worker_id", ""))))
+    if member is None:
+        member = worker_admission.find_worker(membership, owner.id, name)
+    return member.name if member is not None and member.kind == "worker" and member.reports_to(owner.id) else name
+
+
+def _integer(value: object) -> int:
+    return value if type(value) is int else 0
+
+
+def _number(value: object, default: float) -> float:
+    return float(value) if isinstance(value, (int, float)) else default
+
+
+def _orphaned(path: Path, raw: dict[str, object], now: float) -> bool:
+    """A running record that no supervisor runs. A record with no pid yet is still starting for its
+    first minute: `start` writes the record before it spawns the supervisor."""
+    if raw.get("status") != "running":
+        return False
+    pid = _integer(raw.get("pid"))
+    if pid > 0:
+        return not detached_run_process.supervises(pid, path)
+    started = _number(raw.get("started_at"), now)
+    return now - started >= DETACHED_RUN_START_GRACE_SECS
+
+
+def reap_orphans(session_dir: str, worker: str = "") -> list[str]:
+    """End each running record whose supervisor is gone, of one worker or of all, and return their run ids.
+
+    Its worker gets a FAIL result with no exit status, unless a newer run of the same command in
+    the same folder answers for it. On 2026-10-22 a unit stopped 23 queued runs by their process
+    group; a supervisor that dies that way delivers nothing, and its worker waited for a result
+    that never came. A claim file keeps two callers from delivering one result twice.
+    """
+    runs = _runs_dir(session_dir)
+    if not runs.is_dir():
+        return []
+    with (runs / ".start.lock").open("a") as admission:
+        fcntl.flock(admission, fcntl.LOCK_EX)
+        return _reap_orphans_locked(runs, worker)
+
+
+def _reap_orphans_locked(runs: Path, worker: str = "") -> list[str]:
+    """Reap orphan records while the caller holds the runs-folder admission lock."""
+    now = time.time()
+    records = [(path, raw) for path in sorted(runs.glob("*.json"))
+               if (raw := worker_lifecycle.read_json_object(path)).get("run_id")]
+    reaped: list[str] = []
+    for path, raw in records:
+        if (worker and raw.get("worker") != worker) or not _orphaned(path, raw, now):
+            continue
+        claim = path.with_suffix(".reap")
+        try:
+            os.close(os.open(claim, os.O_CREAT | os.O_EXCL | os.O_WRONLY))
+        except FileExistsError:
+            continue
+        try:
+            record = _read_record(path)
+            if record["status"] != "running":
+                continue
+            newer = any(other.get("worker") == record["worker"] and other.get("command") == record["command"]
+                        and other.get("staff_id") == record["staff_id"]
+                        and _number(other.get("started_at"), 0.0) > record["started_at"]
+                        for _, other in records)
+            try:
+                delivery = ("nothing delivered: the supervisor is gone and a newer run of the same command answers"
+                            if newer else deliver(record, command_result(record)))
+            except RunDeliveryFailed as error:
+                print(f"detached_runs: {record['run_id']}: {error}", file=sys.stderr)
+                continue
+            record = _read_record(path)
+            record.update({
+                "status": "finished", "ended": "supervisor gone", "delivery": delivery,
+                "finished_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            })
+            _write_record(path, record)
+            reaped.append(record["run_id"])
+        finally:
+            claim.unlink(missing_ok=True)
+    return reaped
+
+
+def live_twin(runs: Path, worker: str, command: list[str], tree_key: str) -> RunRecord | None:
+    """A running record of the same worker, command, folder and tree key whose supervisor lives.
+    After an interrupt on 2026-10-21, hana_catalyst-inspectors started its lint run three times
+    on one tree; each run took memory, the cargo token and build time."""
+    if not tree_key:
+        return None
+    for path in sorted(runs.glob("*.json")):
+        raw = worker_lifecycle.read_json_object(path)
+        if (raw.get("status") == "running" and raw.get("worker") == worker and raw.get("command") == command
+                and raw.get("tree_key") == tree_key
+                and detached_run_process.supervises(_integer(raw.get("pid")), path)):
+            return cast(RunRecord, cast(object, raw))
+    return None
+
+
+def worker_runs(runs: Path, worker: str, *, since: float = 0) -> list[RunRecord]:
+    """Read this worker's runs that started during the selected dispatch."""
+    found: list[RunRecord] = []
+    for path in sorted(runs.glob("*.json")):
+        raw = worker_lifecycle.read_json_object(path)
+        if raw.get("worker") == worker and _number(raw.get("started_at"), 0) >= since:
+            found.append(cast(RunRecord, cast(object, raw)))
+    return found
+
+
+def delivered_worker_results(runs: Path, worker: str, *, since: float) -> set[str]:
+    """Name finished results sent directly to this worker's pane."""
+    return {record["run_id"] for record in worker_runs(runs, worker, since=since)
+            if record["status"] == "finished" and record.get("delivery", "").startswith(
+                (f"sent: worker {worker} at ", "already delivered: "))}
+
+
+def live_runs(runs: Path, worker: str) -> list[RunRecord]:
+    """Return running records whose supervisor still owns the record."""
+    found: list[RunRecord] = []
+    for path in sorted(runs.glob("*.json")):
+        raw = worker_lifecycle.read_json_object(path)
+        if (raw.get("status") == "running" and raw.get("worker") == worker
+                and detached_run_process.supervises(_integer(raw.get("pid")), path)):
+            found.append(cast(RunRecord, cast(object, raw)))
+    return found
+
+
+def command_start(args: argparse.Namespace) -> int:
+    command = [str(part) for part in cast(list[object], getattr(args, "command", []) or [])]
+    if command and command[0] == "--":
+        command = command[1:]
+    if not command:
+        print("detached_runs: start needs a command after --", file=sys.stderr)
+        return 2
+    session_dir = str(getattr(args, "session_dir", "") or "")
+    name = str(getattr(args, "to", "") or "")
+    caller = caller_from_environment(dict(os.environ))
+    reference = ""
+    if isinstance(caller, PaneCaller):
+        if name and name != caller.name:
+            print(f"detached_runs: --to {name} ignored; run belongs to worker {caller.name}", file=sys.stderr)
+        session_dir, name = caller.session_dir, caller.name
+        reference = caller.staff_id
+    else:
+        if bool(session_dir) != bool(name):
+            print("detached_runs: --session-dir and --to go together", file=sys.stderr)
+            return 2
+        if not session_dir:
+            return NOT_A_DETACHED_WORKER
+        name = seat_name(session_dir, name)
+    label = str(getattr(args, "label", "") or "") or " ".join(command)
+    done_file = str(getattr(args, "done_message_file", "") or "")
+    director_dir = str(getattr(args, "director_dir", "") or "") or session_dir
+    runs = _runs_dir(session_dir)
+    runs.mkdir(parents=True, exist_ok=True)
+    cwd = os.getcwd()
+    tree_key = treekey.tree_key(cwd) or ""
+    with (runs / ".start.lock").open("a") as admission:
+        fcntl.flock(admission, fcntl.LOCK_EX)
+        _ = _reap_orphans_locked(runs)
+        if twin := live_twin(runs, name, command, tree_key):
+            started = time.strftime("%H:%M:%S", time.localtime(twin["started_at"]))
+            print(f"run {twin['run_id']} is already running for {name} on these files (started {started}, "
+                  + f"log {twin['log']}); started nothing; its result arrives as your next message")
+            return 0
+        try:
+            limit = conf.read("detached_runs").whole("LIVE_RUN_LIMIT")
+        except conf.Unusable as error:
+            print(f"detached_runs: {error}", file=sys.stderr)
+            return 2
+        active = live_runs(runs, name)
+        if len(active) >= limit:
+            details = "\n".join(f"  {run['run_id']}: {run['label']}" for run in active)
+            print(f"detached_runs: live-run limit {limit} reached for {name}; started nothing.\n"
+                  + f"Live runs:\n{details}\n"
+                  + "Wait for a run's result; it arrives as your next message. "
+                  + "Or put more files in one run.", file=sys.stderr)
+            return LIVE_RUN_LIMIT_REACHED
+        run_id = f"{time.strftime('%Y%m%dT%H%M%S')}-{os.getpid()}-{secrets.token_hex(2)}"
+        record_path = runs / f"{run_id}.json"
+        log_path = runs / f"{run_id}.log"
+        record: RunRecord = {
+            "run_id": run_id, "status": "running", "session_dir": session_dir, "worker": name,
+            "staff_id": reference or _worker_reference(session_dir, name), "label": label, "command": command,
+            "log": str(log_path), "started_at": time.time(), "pid": 0,
+            "director_dir": director_dir, "done_message_file": done_file, "tree_key": tree_key,
+        }
+        _write_record(record_path, record)
+        with log_path.open("ab") as log:
+            supervisor = subprocess.Popen(
+                [str(Path(__file__).resolve().parents[1] / "lib/py"), str(Path(__file__).resolve()), "supervise", str(record_path)],
+                stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
+                start_new_session=True, cwd=cwd,
+            )
+        record["pid"] = supervisor.pid
+        _write_record(record_path, record)
+    print(f"run {run_id} started detached for {name} (pid {supervisor.pid}, log {log_path}); "
+          + "its result arrives as your next message")
+    return 0
+
+
+def _exit_status(returncode: int) -> int:
+    return 128 - returncode if returncode < 0 else returncode
+
+
+def _cut_line(line: str) -> str:
+    limit = conf.read("detached_runs").whole("RESULT_LINE_CHARS")
+    if len(line) <= limit:
+        return line
+    return f"{line[:limit]} [cut: {len(line) - limit} more characters]"
+
+
+def _tail(path: Path, count: int, budget: int) -> list[str]:
+    """Keep the latest lines within the message budget. Collapse repeated memory waits."""
+    try:
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return []
+    collapsed: list[str] = []
+    for line in lines:
+        if (collapsed and line.startswith("still waiting for memory")
+                and collapsed[-1].startswith("still waiting for memory")):
+            collapsed[-1] = line
+        else:
+            collapsed.append(line)
+    kept: list[str] = []
+    total = 0
+    for line in map(_cut_line, reversed(collapsed[-count:])):
+        total += len(line) + 1
+        if total > budget:
+            break
+        kept.append(line)
+    return kept[::-1]
+
+
+@dataclass(frozen=True)
+class CompletedCommand:
+    code: int
+
+
+@dataclass(frozen=True)
+class SupervisorLost:
+    """The supervisor disappeared before it reported an exit status."""
+
+
+CommandResult = CompletedCommand | SupervisorLost
+
+
+def command_result(record: RunRecord) -> CommandResult:
+    code = record.get("exit_code")
+    return CompletedCommand(code) if isinstance(code, int) else SupervisorLost()
+
+
+def _exit_words(result: CommandResult) -> str:
+    return f"exit {result.code}" if isinstance(result, CompletedCommand) else "no exit status"
+
+
+def result_text(record: RunRecord, result: CommandResult) -> str:
+    exit_code = result.code if isinstance(result, CompletedCommand) else result
+    verdict = (ORPHAN_VERDICT if isinstance(exit_code, SupervisorLost) else "PASS (exit 0)" if exit_code == 0
+               else SUPERSEDED_VERDICT if exit_code == SUPERSEDED_STATUS
+               else TREE_CHANGED_VERDICT if exit_code == TREE_CHANGED_STATUS else f"FAIL (exit {exit_code})")
+    heading = "Run ended with no result" if isinstance(exit_code, SupervisorLost) else "Run finished"
+    lines = [f"{heading}: ", f"Result: {verdict}", f"Log: {record['log']}"]
+    cancellation = ""
+    if exit_code == TREE_CHANGED_STATUS:
+        # Keep the cancellation instruction when cleanup moves it outside the tail.
+        try:
+            with Path(record["log"]).open(encoding="utf-8", errors="replace") as log:
+                cancellation = next((line.rstrip("\n") for line in log
+                                     if line.startswith("verify.sh: cancelled — ")), "")
+        except OSError:
+            cancellation = ""
+        if cancellation:
+            lines.extend(["", cancellation])
+    header = "\n".join(lines)
+    limits = conf.read("detached_runs")
+    tail_heading = f"\n\nLast log lines (lines over {limits.whole('RESULT_LINE_CHARS')} characters are cut):\n"
+    tail = _tail(Path(record["log"]), RESULT_TAIL_LINES,
+                 limits.whole("RESULT_TEXT_CHARS") - len(header) - len(tail_heading))
+    if cancellation:
+        tail = [line for line in tail if line != _cut_line(cancellation)]
+    body = tail_heading + "\n".join(tail) if tail else ""
+    label_budget = max(0, limits.whole("RESULT_TEXT_CHARS") - len(header) - len(body))
+    lines[0] += record["label"][:label_budget]
+    header = "\n".join(lines)
+    return header + body
+
+
+class RunDeliveryFailed(RuntimeError):
+    """The running record still needs result delivery."""
+
+
+def _result_received(member: staff.StaffRow, membership: staff.StaffSnapshot, marker: str) -> bool:
+    backend = membership.backends.get(member.id, staff.BACKEND_UNAVAILABLE)
+    if isinstance(backend, staff.BackendUnavailable):
+        raise ValueError("worker transcript backend is unavailable")
+    source = worker_admission.transcript_source(member, backend)
+    return any(isinstance(entry, str) and entry.startswith("user:\n") and marker in entry.splitlines()
+               for entry in worker_admission.transcript_entries(source, set()))
+
+
+def deliver(record: RunRecord, result: CommandResult) -> str:
+    """Deliver the command result to its current worker."""
+    exit_code = result.code if isinstance(result, CompletedCommand) else result
+    done_file = record["done_message_file"]
+    if done_file and exit_code not in (0, SUPERSEDED_STATUS, TREE_CHANGED_STATUS):
+        return f"nothing delivered: {_exit_words(result)} with a done message"
+    if done_file and exit_code == 0:
+        try:
+            text = Path(done_file).read_text(encoding="utf-8")
+        except OSError as exc:
+            text = f"Run finished: {record['label']}\nResult: PASS (exit 0)\n(done message {done_file} unreadable: {exc})"
+    else:
+        text = result_text(record, result)
+    session_dir = record["session_dir"]
+    membership = staff.local_snapshot()
+    member = _run_worker(record, membership)
+    if isinstance(member, RunWorkerUnavailable):
+        return "finished: worker retired"
+    from scripts.message import send
+
+    marker = f"Detached run: {record['run_id']}"
+    runs = _runs_dir(session_dir)
+    runs.mkdir(parents=True, exist_ok=True)
+    with (runs / f".{record['run_id']}.delivery.lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        reason = ""
+        try:
+            if _result_received(member, membership, marker):
+                return f"already delivered: {record['run_id']}"
+        except (OSError, ValueError) as error:
+            reason = f"worker transcript is unavailable: {error}"
+        timeout = send_budget.seconds()
+        delivery = send.deliver_worker_text(member, membership, marker + "\n" + text,
+                                          sender="detached-runs", timeout=timeout, reason=reason)
+        if delivery.outcome in ("failed", "refused"):
+            raise RunDeliveryFailed(f"{delivery.outcome}: {delivery.detail}")
+        return f"{delivery.outcome}: {delivery.detail}"
+
+
+def scope_prefix(marker: Path, environment: dict[str, str]) -> list[str]:
+    """The argv that runs a command in a builds.slice scope, or nothing where no scope is possible."""
+    runtime = environment.get("XDG_RUNTIME_DIR", "")
+    if (environment.get("BUILDLOG_SCOPE", "1") == "0" or not runtime
+            or not Path(runtime, "systemd", "private").is_socket() or shutil.which("systemd-run") is None):
+        return []
+    return ["systemd-run", "--user", "--scope", "--quiet", "--collect", "--expand-environment=no",
+            "--slice=builds.slice", "--", "/bin/sh", "-c", SCOPE_SCRIPT, str(marker)]
+
+
+def _run(command: list[str], environment: dict[str, str], log: Path) -> int:
+    """Run the command with its output appended to the log, forward signals to it, and return its status."""
+    try:
+        with log.open("ab") as output:
+            child = subprocess.Popen(command, env=environment,
+                                     stdin=subprocess.DEVNULL, stdout=output, stderr=subprocess.STDOUT)
+    except OSError as exc:
+        with log.open("a", encoding="utf-8") as output:
+            _ = output.write(f"detached_runs: command did not start: {exc}\n")
+        return 127
+
+    def forward(signum: int, _frame: FrameType | None) -> None:
+        with contextlib.suppress(OSError):
+            child.send_signal(signum)
+
+    for forwarded in FORWARDED_SIGNALS:
+        _ = signal.signal(forwarded, forward)
+    return _exit_status(child.wait())
+
+
+def command_supervise(args: argparse.Namespace) -> int:
+    record_path = Path(str(getattr(args, "record", "")))
+    with (record_path.parent / ".start.lock").open("a") as admission:
+        fcntl.flock(admission, fcntl.LOCK_EX)
+        record = _read_record(record_path)
+        if record["pid"] == 0:
+            record["pid"] = os.getpid()
+            _write_record(record_path, record)
+    environment = dict(os.environ)
+    environment.update({
+        "UNIT_DETACHED_RUN": "1",
+        "UNIT_RUN_DIR": record["session_dir"],
+        "UNIT_TEAM_ROLE": record["worker"].rsplit("-", 1)[-1],
+    })
+    log = Path(record["log"])
+    marker = log.with_suffix(".scope")
+    prefix = scope_prefix(marker, environment)
+    exit_code = _run(prefix + record["command"], environment, log)
+    if prefix and not marker.exists():
+        exit_code = _run(record["command"], environment, log)
+    marker.unlink(missing_ok=True)
+    # Deliver before marking finished: a launcher that reads the run as finished closes its inbox
+    # unless the result is already held.
+    record["exit_code"] = exit_code
+    _write_record(record_path, record)
+    try:
+        delivery = deliver(record, CompletedCommand(exit_code))
+    except RunDeliveryFailed as error:
+        print(f"detached_runs: {record['run_id']}: {error}", file=sys.stderr)
+        return 1
+    record = _read_record(record_path)
+    record.update({
+        "status": "finished", "exit_code": exit_code,
+        "finished_at": datetime.now(timezone.utc).isoformat(timespec="seconds"), "delivery": delivery,
+    })
+    _write_record(record_path, record)
+    return 0
+
+
+def command_reap(args: argparse.Namespace) -> int:
+    for run_id in reap_orphans(str(getattr(args, "session_dir", "")), str(getattr(args, "worker", "") or "")):
+        print(f"run {run_id} ended: its supervisor is gone")
+    return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    verbs = parser.add_subparsers(dest="verb", required=True)
+    start = verbs.add_parser("start", help="run a command detached for the calling worker, unless its same run is live")
+    _ = start.add_argument("--session-dir", default="")
+    _ = start.add_argument("--to", default="")
+    _ = start.add_argument("--director-dir", default="", help="the run folder whose director hears results")
+    _ = start.add_argument("--label", default="")
+    _ = start.add_argument("--done-message-file", default="")
+    _ = start.add_argument("command", nargs=argparse.REMAINDER)
+    start.set_defaults(handler=command_start)
+    supervise = verbs.add_parser("supervise", help="run one recorded command and deliver its result")
+    _ = supervise.add_argument("record")
+    supervise.set_defaults(handler=command_supervise)
+    reap = verbs.add_parser("reap", help="end the running records whose supervisor is gone")
+    _ = reap.add_argument("--session-dir", required=True)
+    _ = reap.add_argument("--worker", default="")
+    reap.set_defaults(handler=command_reap)
+    args = parser.parse_args(argv)
+    handler = cast("Callable[[argparse.Namespace], int]", getattr(args, "handler"))
+    return handler(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

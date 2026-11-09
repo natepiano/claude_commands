@@ -2,6 +2,9 @@
 from __future__ import annotations
 
 from dataclasses import replace
+import io
+import json
+from contextlib import redirect_stderr
 import shlex
 import subprocess
 import sys
@@ -16,30 +19,73 @@ from scripts.production.staff_test_support import StaffTestCase, fixture_runtime
 
 
 class NativeSessionLabelTests(StaffTestCase):
-    def test_runtime_identity_selects_the_member_despite_a_stale_mark_and_display_name(self) -> None:
-        runner, unit, worker = self.tree()
-        labels = session_labels.StaffLabels(staff.snapshot(), {}, {})
-        environment = {"STAFF_ID": worker.id, "SHOWRUNNER_UNIT_ID": "models-unit"}
-        selected = labels.environment(environment, unit.id)
-        self.assertEqual(selected["CLAUDE_CODE_SESSION_ID"], unit.id)
-        self.assertEqual(selected["SHOWRUNNER_UNIT"], runner.name)
-        self.assertEqual(selected["SHOWRUNNER_UNIT_ID"], "models-unit")
-        self.assertNotIn("STAFF_ID", selected)
-        self.assertEqual(labels.environment(environment, worker.id)["CLAUDE_CODE_SESSION_ID"], worker.id)
+    def test_labels_use_staff_without_reading_an_unreadable_timer_document(self) -> None:
+        fixture = self.row_production()
+        fixture.doc.unlink()
+        errors = io.StringIO()
+        with redirect_stderr(errors):
+            labels = session_labels.StaffLabels.for_record(staff.snapshot())
+        self.assertEqual(labels.environment({}, fixture.unit.current_session),
+                         {"CLAUDE_CODE_SESSION_ID": fixture.unit.current_session})
+        self.assertEqual(errors.getvalue(), "")
+
+    def test_runtime_identity_selects_the_current_member_and_removes_copied_labels(self) -> None:
+        _, unit, worker = self.tree()
+        current = staff.native_id(fixture_runtime_id("label-unit-after-clear"))
+        unit = staff.update_current_session(unit.current_session, current)
+        self.assertNotEqual(unit.id, unit.current_session)
+        labels = session_labels.StaffLabels(staff.snapshot())
+        environment = {"STAFF_ID": worker.id, "SHOWRUNNER_" + "UNIT_ID": "models"}
+        selected = labels.environment(environment, unit.current_session)
+        self.assertEqual(selected, {"CLAUDE_CODE_SESSION_ID": unit.current_session})
+        self.assertEqual(labels.environment(environment, worker.current_session),
+                         {"CLAUDE_CODE_SESSION_ID": worker.current_session})
+        self.assertEqual(labels.environment(environment, unit.id), {})
+
+    def test_retained_reference_projects_the_current_session_without_copied_identity(self) -> None:
+        from scripts.shutdown import pane_record
+        from scripts.shutdown.launch_names import LaunchNames
+
+        fixture = self.row_production()
+        self.assertNotEqual(fixture.unit.id, fixture.unit.current_session)
+        names = LaunchNames(staff.snapshot())
+        launch = pane_record.launch("w1:p1", fixture.unit.id, str(fixture.worktree),
+            {"STAFF_ID": fixture.unit.id, "SHOWRUNNER_" + "UNIT": "old", "ENABLE_TOOL_SEARCH": "true"},
+            ["claude"])
+        before = self.staff_file.read_bytes()
+        selected = names.environment(launch)
+        self.assertEqual(selected, {"CLAUDE_CODE_SESSION_ID": fixture.unit.current_session,
+                                    "ENABLE_TOOL_SEARCH": "true"})
+        self.assertEqual(self.staff_file.read_bytes(), before)
 
     def test_unknown_runtime_is_not_assigned_by_its_unique_folder_or_display_name(self) -> None:
         runner, unit, _ = self.tree()
         located = replace(unit, worktree=staff.PresentWorktree("natedev", self.root))
-        labels = session_labels.StaffLabels(staff.StaffSnapshot((runner, located)), {}, {})
+        labels = session_labels.StaffLabels(staff.StaffSnapshot((runner, located)))
         before = self.staff_file.read_bytes()
         selected = labels.environment({"STAFF_ID": unit.id}, fixture_runtime_id("unpublished"))
         self.assertNotIn("CLAUDE_CODE_SESSION_ID", selected)
         self.assertNotIn("STAFF_ID", selected)
-        self.assertNotIn("SHOWRUNNER_UNIT", selected)
+        self.assertFalse(any(key.startswith("SHOWRUNNER_") for key in selected))
         self.assertEqual(self.staff_file.read_bytes(), before)
 
 
 class RowResolverTests(StaffTestCase):
+    def test_retired_worker_keeps_its_fixed_inbox_path_for_cleanup_retries(self) -> None:
+        worker = self.tree()[2]
+        before = session_staff.inbox_path(worker.id)
+        before.parent.mkdir(parents=True, exist_ok=True)
+        write_text_atomic(before, json.dumps({"messages": ["cleanup evidence"]}))
+        evidence = before.read_bytes()
+        retired = staff.retire(worker.id)
+        self.assertEqual(retired, worker)
+        self.assertIsNone(staff.by_id(worker.id))
+        for attempt in range(2):
+            with self.subTest(attempt=attempt):
+                after = session_staff.inbox_path(worker.id)
+                self.assertEqual(after, before)
+                self.assertEqual(after.read_bytes(), evidence)
+
     def test_unit_and_worker_read_the_row_location_config_and_git_from_one_snapshot(self) -> None:
         fixture = self.row_production()
         record = staff.snapshot()
@@ -54,7 +100,7 @@ class RowResolverTests(StaffTestCase):
                 ("shared-fixture",)))
             self.assertEqual(resolver.unit_config(fixture.worker), resolver.unit_config(fixture.unit))
             self.assertEqual(resolver.production_doc(fixture.unit),
-                             session_staff.ProductionDoc("natedev", fixture.doc))
+                             session_staff.ProductionDoc("natedev", fixture.doc, fixture.runner))
             self.assertEqual(resolver.merge_branch(fixture.unit), session_staff.Branch("merge-from-git"))
             self.assertIsInstance(resolver.unit_state(fixture.unit), session_staff.ActiveUnit)
             self.assertEqual(resolver.member_by_folder("natedev", fixture.worktree),
@@ -63,10 +109,10 @@ class RowResolverTests(StaffTestCase):
 
     def test_a_showrunner_held_worker_has_no_unit_configuration(self) -> None:
         fixture = self.row_production()
-        worker = replace(fixture.worker, parent=fixture.runner.id)
+        worker = replace(fixture.worker, parent=staff.ReportsTo(fixture.runner.id))
         resolver = session_staff.RowResolver(staff.StaffSnapshot((fixture.runner, fixture.unit, worker)))
         self.assertIsInstance(resolver.unit_config(worker), session_staff.NoUnitConfig)
-        self.assertEqual(resolver.production_doc(worker), session_staff.ProductionDoc("natedev", fixture.doc))
+        self.assertEqual(resolver.production_doc(worker), session_staff.ProductionDoc("natedev", fixture.doc, fixture.runner))
 
     def test_unfilled_locations_keep_explicit_incomplete_outcomes(self) -> None:
         runner, unit, worker = self.tree()
@@ -176,7 +222,7 @@ class RowResolverTests(StaffTestCase):
             self.assertIsInstance(config, unit_config.UnitConfig)
             assert isinstance(config, unit_config.UnitConfig)
             self.assertEqual(config.plan, unit_config.StandbyPlan())
-            self.assertEqual(resolver.production_doc(first), session_staff.ProductionDoc("mac", fixture.doc))
+            self.assertEqual(resolver.production_doc(first), session_staff.ProductionDoc("mac", fixture.doc, runner))
             self.assertEqual(resolver.merge_branch(first), session_staff.Branch("merge-from-git"))
         self.assertEqual(len(transports), 1)
 
@@ -204,7 +250,7 @@ class RowResolverTests(StaffTestCase):
     def test_stored_references_keep_the_member_after_a_session_change_without_a_name_match(self) -> None:
         fixture = self.row_production()
         record = staff.snapshot()
-        selector = session_staff.ObservedUnit("unrelated-unit", session_staff.NoSession())
+        selector = session_staff.ObservedUnit("unrelated", session_staff.NoSession())
         self.assertEqual(session_staff.unit_match(selector, record,
                          session_staff.StoredReference(fixture.unit.id)), session_staff.MemberFound(fixture.unit))
         self.assertEqual(session_staff.unit_match(selector, record,

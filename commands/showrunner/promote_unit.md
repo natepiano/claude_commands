@@ -10,10 +10,9 @@ The other direction, a unit becoming the showrunner of its own production under 
 2. **Check fit.** Stop and say why when:
    - its work is in a repository other than the production's;
    - it is mid-turn or a form waits (the idle test in `/showrunner:produce` → Compact after a checkpoint): wait for idle;
-   - `SHOWRUNNER_UNIT` in `/proc/<pid>/environ` marks it as another showrunner's unit with work open: ask that showrunner to release it. A unit whose run is done is free; tell its showrunner it moved.
-3. **Plan.** Use the given plan, or write one from work this production already holds. Moving a phase from another unit is packaging; that unit director drops the phase from its plan. Give the plan the `> **Production:**` header (`production_format.md`) and commit and push it on `MERGE_BRANCH`.
-4. **Check.** Run `$HOME/.claude/scripts/lib/py $HOME/.claude/scripts/production/add_unit.py --production PRODUCTION_DOC <unit name> --resume <sessionId> --cwd <cwd> --plan <plan> --check`. On exit 2, stop and tell the user its line; the session remains running.
-5. **Stop it.** First note its pane: `~/.claude/scripts/lib/py ~/.claude/scripts/production/session_pane.py where session <sessionId>` prints `herdr:agents:<pane>`. Run `~/.claude/scripts/lib/py ~/.claude/scripts/production/session_pane.py type session <sessionId> /exit`. On exit 4, tell the user the session is at a prompt and nothing was typed. Relaunch only once `pid` is gone, since two processes on one session corrupt it. Then close its old tab: `herdr --session agents pane close <pane>`. Never stop a herdr server: `agents` holds every session.
-6. **Launch and record.** Run `$HOME/.claude/scripts/lib/py $HOME/.claude/scripts/production/add_unit.py --production PRODUCTION_DOC <unit name> --resume <sessionId> --cwd <cwd> --plan <plan>`. When step 2 found it was another showrunner's unit, tell that showrunner after the launch succeeds: the unit's row stays in its production doc until it marks the Plan cell `retired`.
+   - `$HOME/.claude/scripts/lib/py $HOME/.claude/scripts/production/staff.py get <sessionId>` prints a path under another showrunner: ask that showrunner for `/showrunner:transfer_unit` first.
+3. **Plan.** Use the given plan, or write one from work this production already holds. Moving a phase from another unit is packaging; that unit director drops the phase from its plan. Commit the plan on `MERGE_BRANCH`. Push the branch.
+4. **Check.** Run `$HOME/.claude/scripts/lib/py $HOME/.claude/scripts/production/add_unit.py --production <showrunner name> <unit name> --attach <sessionId> --cwd <cwd> --plan <plan> --check`. On exit 2, stop and tell the user its line; the session remains running.
+5. **Attach and record.** Run the same command without `--check`. add_unit stops the session safely, then resumes it as the unit.
    The unit director launch takes its model and effort from `/default_models production.director`.
-7. **Tell the user** one line: `<unit name>` is now `<unit name>-unit`, and the place add_unit printed. If the name changed, name the original ListAgents name too.
+6. Tell the user the staff name and the place that add_unit printed.

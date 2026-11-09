@@ -23,12 +23,12 @@ it joins; a tier A or E rule, local or global, has no family.
 
 | Unit | B: listed rules | C: file reads | D: crate checks |
 | --- | --- | --- | --- |
-| `<style slug>-names-unit` | dont-repeat-type-name-in-fields, dont-repeat-enum-domain-in-variant-names, avoid-repeated-field-affixes, forbidden-words | spell-out-names, name-bindings-to-match-parameters, prefer-type-named-fields-and-bindings, comments-name-code-constructs | — |
-| `<style slug>-values-unit` | never-prefix-unused-fields-or-variables-with, import-constants-at-the-top, derive-test-values-from-production-constants, test-module-allow-boilerplate, agent-must-review-allows, always-use-nextest | no-magic-values, constants-file-organization, prefer-functional-patterns, tests-live-with-the-type-under-test, prefer-observers-over-polling, system-params-carry-their-behavior | — |
-| `<style slug>-types-unit` | enums-over-bool-for-owned-booleans, if-else-chains-signal-missing-types, dont-create-traits-for-single-implementations, prefer-from-impl-over-named-constructors, public-failures-return-named-errors, bevy-plugin-ownership, bevy-reflection-registration, extract-observer-run-conditions, prefer-events-over-messages, use-bevy_kana-in-all-bevy-crates | make-invalid-states-unrepresentable, uncovered components of its partial B rules | — |
-| `<style slug>-modules-unit` | — | — | module-roots-as-table-of-contents, name-submodules-after-anchor-types, workspace-dependencies, module-structure, when-to-split-a-module, split-by-type-ownership, types-live-with-their-behavior |
+| `<style showrunner name>-names` | dont-repeat-type-name-in-fields, dont-repeat-enum-domain-in-variant-names, avoid-repeated-field-affixes, forbidden-words | spell-out-names, name-bindings-to-match-parameters, prefer-type-named-fields-and-bindings, comments-name-code-constructs | — |
+| `<style showrunner name>-values` | never-prefix-unused-fields-or-variables-with, import-constants-at-the-top, derive-test-values-from-production-constants, test-module-allow-boilerplate, agent-must-review-allows, always-use-nextest | no-magic-values, constants-file-organization, prefer-functional-patterns, tests-live-with-the-type-under-test, prefer-observers-over-polling, system-params-carry-their-behavior | — |
+| `<style showrunner name>-types` | enums-over-bool-for-owned-booleans, if-else-chains-signal-missing-types, dont-create-traits-for-single-implementations, prefer-from-impl-over-named-constructors, public-failures-return-named-errors, bevy-plugin-ownership, bevy-reflection-registration, extract-observer-run-conditions, prefer-events-over-messages, use-bevy_kana-in-all-bevy-crates | make-invalid-states-unrepresentable, uncovered components of its partial B rules | — |
+| `<style showrunner name>-modules` | — | — | module-roots-as-table-of-contents, name-submodules-after-anchor-types, workspace-dependencies, module-structure, when-to-split-a-module, split-by-type-ownership, types-live-with-their-behavior |
 
-A unit id is `<style slug>-<family>-unit`, where the style slug is `<repo>-style`.
+A unit id is `<style showrunner name>-<family>-unit`, where the style showrunner name is `<repo>-style`.
 Old `<family>-unit` ids remain valid. Every partial B rule also has a C read
 in its own family.
 
@@ -398,16 +398,18 @@ keeps a dropped ticket's abandoned commits reachable.
 Create a restricted pilot with repeated `add_style.py --pilot <unit>[=<package>,...]`.
 The selector accepts a family (`names`), its old id (`names-unit`) or its full
 id (`cargo-liner-style-names-unit`). `--check` prints full unit ids.
-Only named units get Units rows; all four standing plans are written. A unit
+`add_style.py` writes the named units to the doc's `- **Pilot units:** <ids>` field.
+The style showrunner launches only those units, or all four when the field is
+absent. All four standing plans are written. A unit
 without a scope covers every crate. Package names map to workspace member
 directories through `rules.workspace_members`.
 
 The plan's Delegation Context carries `- **Pilot scope:** cargo-handler, cargo-port`
 below its Family snapshot. Before first launch, edit the showrunner copy;
-an interrupted bootstrap rewrites only unlaunched units' rows and scope lines.
+an interrupted bootstrap rewrites only the Pilot units field and the scope lines of unlaunched units.
 After launch, only the unit's own copy counts:
-`<main checkout parent>/<style slug>-<family>/docs/style-production/units/<style slug>-<family>-unit.md`.
-Read the plan path from the Units row's Plan cell relative to that worktree;
+`<main checkout parent>/<style showrunner name>-<family>/docs/style-production/units/<style showrunner name>-<family>-unit.md`.
+Read the plan path from `plan` in the unit's `.unit.toml`, relative to that worktree;
 a unit rename keeps its existing plan filename.
 `next-phase` honors the `--plan` copy it receives for coverage and approved
 proposals. An out-of-scope approved proposal stays approved and unassigned;
@@ -517,34 +519,27 @@ Exit 1 means the trees differ; run the five steps:
 
 1. Merge the new tip into the style merge branch and run its Merge tests.
 2. Run `~/.claude/scripts/lib/py ~/.claude/scripts/style/style_sync.py lint --repo <checkout> --checkout <style checkout> --tip <branch-point tip>`.
-   This uses `bash ~/.claude/scripts/direct/verify.sh lint --workspace --no-cache --check`
-   at the exact requested commit in a disposable checkout, with workspace mend,
-   rustfmt and clippy (`--all-targets --all-features`, workspace lint config).
+   This uses `bash ~/.claude/scripts/direct/verify.sh lint --no-cache --check`
+   at the exact requested commit in a standing gate checkout.
+   Without a package, lint checks the workspace with mend, rustfmt, and Clippy.
+   Clippy uses `--all-targets --all-features` and the workspace lint config.
    Nothing rewrites the tree: mend runs in report mode and rustfmt with `--check`.
-   Before verify starts, `checkout/target` links to `<main git dir>/style-sync-target`
-   (about 2-3 GiB), shared by all syncs of that repo. `scratch.py hold` owns it under
-   `run:<repo>-style` until the style production itself wraps (see Lifetime).
-   Checkout cleanup unlinks the symlink and keeps the target. A missing or swept
-   target is recreated for a cold run. Each sync takes a blocking exclusive flock
-   on `style-sync-target/sync.lock` before creating its checkout and holds it
-   through lint and cleanup. This keeps source timestamps newer than the previous
-   sync's Cargo fingerprints. Cargo's build lock also serializes builds on the
-   target; this starts no extra parallel build. The link avoids setting `CARGO_TARGET_DIR`,
-   which would change sccache's key.
+   `copies.standing` holds the checkout's `.claude-busy` lock through lint and
+   cleanup. Each checkout keeps its own real `target/`; a second busy checkout
+   uses its own cache. A missing or swept cache builds cold. The configured
+   gates root and pool limit come from `config/copies.conf` (see
+   `docs/as-built/gate-checkouts.md`). No `CARGO_TARGET_DIR` is set.
    It records per-file diagnostics once per tool; disabled or incomplete checks
    grant no successful coverage. Exit 0 means clean, every tool recorded passing;
    continue the sync. Exit 1 means diagnostics recorded or a tool did not pass;
    continue to `set-tip` and `tip done`. Exit 2 means an error (refusal, failed
    `lint-record` or unreadable checkout); stop the sync. Exit 143 or 129 means
    SIGTERM or SIGHUP stopped the run; stop the sync.
-   Every exit the run can catch stops verify.sh and its processes, then deletes the
-   checkout and removes its worktree registration, also a locked one. Each
-   `style-sync-lint-*` dir holds `owner.json` (the run's pid and repo) and
-   `verifier.pgid` (written by verify.sh's own process, which then starts verify.sh
-   only while the owner runs). The owner
-   record goes last; if the registration step fails, the dir keeps it and the next
-   run retries. A run first removes the dir and registration of a run whose owner and
-   verify.sh group are both gone; the dir stays while a killed run's verify.sh runs.
+   Every exit the run can catch stops verify.sh and its processes, removes
+   its temporary supervision metadata, and releases the standing checkout.
+   Each `style-sync-lint-*` dir holds `owner.json`, `verifier.pgid`, and a link
+   to the checkout. Recovery keeps the metadata while its owner or verifier
+   group runs; stale legacy worktree registrations are removed on recovery.
 3. Run `style_ledger.py set-tip --repo <checkout> --tip <branch-point tip> --style-branch <style merge branch>`,
    then `style_ledger.py status --repo <checkout>`: changed inputs become stale,
    new files open. Report a nonzero unclassified count to the parent with
@@ -567,19 +562,18 @@ remaining finding touches, rerun the gate and leave dropped cells stale.
 
 ## Merging back
 
-Merge each unit checkpoint into the style merge branch as soon as it arrives;
-the `ticket merge` after it releases its berth reservation. Use the ordinary
-`merge_checkpoint.py --production <style doc> <unit> <phase> <hash> --started …`
-with one `--also <path>` for each entry of the unit's open ticket's `files`
-(`style_ledger.py ticket open --repo <checkout> --unit <unit>`). Its Owns is
-`none — takes what the board leaves free`; paths outside that ticket stay refused.
+Merge each unit checkpoint into the style merge branch when it arrives.
+Run `ticket merge` after the checkpoint merge to release the berth reservation.
+Use `merge_checkpoint.py --production <showrunner name> <unit> <phase> <hash> --started …`.
+The checkpoint does not filter code paths by responsibilities.
+The ticket gate and cargo-berth manage the ticket files and reservations.
 
 A style ticket's checkpoint does not release its berth reservation: the unit's
 reservation record holds it for the ticket, and `ticket checkpoint` keeps the
 record's run folder and phase on the ticket.
 After the merge, run `style_ledger.py ticket merge --repo <checkout> --id <ticket>`
 to release that reservation and wake every unit waiting for sync, and send the owning unit director
-`From the showrunner of <style slug>: ticket <id> merged; refill.`
+`From the showrunner of <style showrunner name>: ticket <id> merged; refill.`
 For each `has no applied check` line that merge prints, check the change in the
 code, and run the printed `held built` command when the change is there. A rerun
 of `ticket merge` on a merged ticket prints these lines again. A finding whose
@@ -593,9 +587,9 @@ cause and run `ticket merge` again, or let the next `reconcile` retry it. A
 merge after the release is confirmed releases nothing more.
 The ledger accepts only a checkpoint contained by its stored style merge branch.
 Then run
-`style_sync.py send-handoff --repo <checkout> --slug <style slug> --checkpoint <style branch tip>`.
+`style_sync.py send-handoff --repo <checkout> --production <style showrunner name> --checkpoint <style branch tip>`.
 It adds the hand-off, sends
-`From the showrunner of <style slug>: hand-off <hash>` to the current parent's
+`From the showrunner of <style showrunner name>: hand-off <hash>` to the current parent's
 `showrunners.py address <parent>`, then records `handoff send`.
 A send that send.py queued (`QUEUED:`, exit 1) is sent too: send.py delivers
 it later. The command prints `hand-off <hash7>: queued for <parent>`.
@@ -603,13 +597,13 @@ Style work never waits for a sync to go home.
 
 The parent correctness-reviews the hand-off's diff against the branch point
 as for a unit checkpoint, then runs
-`merge_checkpoint.py --from-child <style slug> --checkpoint <hash> --production <parent doc> --started <time>`.
+`merge_checkpoint.py --from-child <style showrunner name> --checkpoint <hash> --production <showrunner name> --started <time>`.
 The child must be attached, the checkpoint on its merge branch and descended
 from its last merged hand-off. The subject is
-`Merge <style slug> hand-off (<hash7>) into <branch point>`.
+`Merge <style showrunner name> hand-off (<hash7>) into <branch point>`.
 After pushing, notifying sync and promoting, the attached receiver records the
 hand-off as merged in the style ledger with its merge commit, then sends
-`From the showrunner of <parent slug>: hand-off <hash7> merged as <merge7>.`
+`From the showrunner of <parent showrunner name>: hand-off <hash7> merged as <merge7>.`
 The acknowledgment is a notice; only after a `hand-off ledger:` line run
 `style_ledger.py handoff merged --repo <checkout> --checkpoint <hash> --merge-commit <merge>`;
 ancestry on the branch point is the evidence, so it also takes a pending row.
@@ -623,7 +617,7 @@ successful push. Hand-offs run the same package and Merge tests and test log
 as unit checkpoints.
 
 At startup, first run
-`style_sync.py resume --repo <checkout> --slug <style slug> --branch-point <branch point> --style-branch <style merge branch>`
+`style_sync.py resume --repo <checkout> --production <style showrunner name> --branch-point <branch point> --style-branch <style merge branch>`
 and append its reconcile change lines to **Log**. Act on its `not built` lines as
 after `ticket merge`. Reconcile stores the branch
 point before any acknowledgment and marks merged hand-offs by ancestry.
@@ -638,7 +632,7 @@ Reattaching runs this resume after updating Parent production and Proposals.
 
 While root, resume prints `root: merge <hash7> with --root-self` and sends nothing.
 Correctness-review and merge each own hand-off with
-`merge_checkpoint.py --from-child <own slug> --checkpoint <hash> --root-self --production <doc in Parent production> --started <time>`.
+`merge_checkpoint.py --from-child <own showrunner name> --checkpoint <hash> --root-self --production <parent showrunner name> --started <time>`.
 No other production writes that branch then. The root receives no
 acknowledgment; the receiver prints
 `root: run style_ledger.py reconcile to mark <hash7> merged`.
@@ -783,8 +777,8 @@ Changes inside macro invocations require review even when only spacing changes;
 type-shape checks include unions and their derives.
 
 File held changes with `style_proposals.py file --repo <style checkout>
---proposals <folder> --parent <slug>`. Read the folder from the production's
-`**Proposals:**` line and the parent from `showrunners.py parent <style slug>`.
+--proposals <folder> --parent <showrunner name>`. Read the folder from the production's
+`**Proposals:**` line and the parent from `showrunners.py parent <style showrunner name>`.
 Run filing after each checkpoint with held cells and each no-change notice
 with held findings. Findings held by assigned or checkpointed tickets wait.
 Findings judged under an older rule text stay unfiled until a judgment under
@@ -928,8 +922,8 @@ Approval sets the decision's stage active (in progress), so it leaves the
 footer's proposal count.
 A rule whose frontmatter says `approval: always` never asks the user: `file`
 creates each new decision under it approved, with the fields a user approval
-writes. The unit and plan are the live family unit's Units row of the standing
-production, `showrunner` and `approved_in` are the style slug, and `approved_by`
+writes. The unit and plan are the live family unit's staff row and its `.unit.toml` plan in the standing
+production, `showrunner` and `approved_in` are the style showrunner name, and `approved_by`
 is `rule <rule id>`. It prints `approved <decision>: rule <rule id> is always
 approved`. With no live unit of the rule's family, `file` prints `skipped
 <decision>: rule <rule id> is always approved, but no <family> unit builds it`.
@@ -1106,7 +1100,7 @@ block that is not a doc comment stays above it, as rustfmt keeps it there.
 The decision stays open and approved until every finding is built or waived.
 
 To repair a decision or an old issue that closed too early, run
-`style_proposals.py reopen --repo <style checkout> --issue <issue> --parent <slug> [--dry-run]`.
+`style_proposals.py reopen --repo <style checkout> --issue <issue> --parent <showrunner name> [--dry-run]`.
 It checks each built rename at the synced tip and sets each one that is not
 applied back to filed, with no build ticket. Findings with no check stay built.
 A decision opens again with its approval. The findings of an old issue move to
@@ -1147,7 +1141,7 @@ the issue, one finding named by both, and an `--applied` rename that the check
 finds not applied (the old name is still declared):
 `<issue>: finding <finding id>: the check finds the rename not applied; use --finding`.
 A refusal writes nothing.
-`style_proposals.py reopen --repo <style checkout> --all [--parent <slug>] [--dry-run]`
+`style_proposals.py reopen --repo <style checkout> --all [--parent <showrunner name>] [--dry-run]`
 runs reopen on every approved decision and old issue that holds a built finding.
 An old issue takes the parent that its own `Parent:` line names. Only an old
 issue with no `Parent:` line takes `--parent`, and with no `--parent` it prints
@@ -1179,7 +1173,7 @@ through `/new_style`, or drops the idea with `style_proposals.py drop-candidate
 --repo <style checkout> --idea "<text>"`. Use `style_proposals.py sites --repo
 <style checkout> --issue <issue>` for a decision's full findings. Review
 `style_proposals.py migrate --repo <style checkout> --proposals <folder>
---parent <slug> --dry-run` before migrating old style issues. Migration moves
+--parent <showrunner name> --dry-run` before migrating old style issues. Migration moves
 only the findings filed to each old issue. A moved finding takes the answer of
 its decision: a declined decision waives it with the stored words, and a
 closed decision opens again by the rule for a later finding that `file` files
@@ -1220,13 +1214,10 @@ hold the wrap. The style checkout, unit worktrees with their own plan copies
 and pinned rule files, and ledger remain in place. A later `/showrunner:add_style`
 from a new parent attaches through `resume`, which handles pending hand-offs.
 
-The sync target at `<main git dir>/style-sync-target` belongs to the production-wide
-scratch task `run:<repo>-style`, using the main repository's basename. This is the
-standing production's task, not a unit's phase or run. When the style production
-itself wraps, after its sync processes finish, run
-`~/.claude/scripts/lib/py ~/.claude/scripts/lib/scratch.py end --task run:<repo>-style`
-to remove the target and its hold. A parent's wrap keeps this target with the
-detached style production.
+Standing gate checkouts retain their own `target/` after a sync or a production
+wrap. The floor sweep may reclaim an idle marked cache; it keeps a busy tree's
+cache. A wrap leaves the standing checkouts in place.
+See `docs/as-built/gate-checkouts.md` for removal.
 
 ## Report
 

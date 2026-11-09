@@ -1,0 +1,2 @@
+Cloud · 1 of 1 slots
+   waiting-unit · targeted test · waiting; waits for a cloud slot: 1 of 1 in use · modules unknown · vCPUs unknown · elapsed 1 min

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from scripts.style.ledger_test_support import ticket_owner_id
+
 import unittest
 import fcntl
 import io
@@ -18,19 +20,19 @@ from contextlib import closing, redirect_stdout
 from datetime import datetime, timezone
 from typing import IO, cast, final
 from unittest import mock
-import rules
-import style_ledger
-from approved_renames import AppliedInCode
+from scripts.style import rules
+from scripts.style import style_ledger
+from scripts.style.approved_renames import AppliedInCode
 
 
-from ledger_test_support import (remove_generation_schema, LedgerTestCase, LedgerStatus, PARENT_FILE)
+from scripts.style.ledger_test_support import (remove_generation_schema, LedgerTestCase, LedgerStatus, PARENT_FILE, style_unit_id)
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
 @final
 class StyleLedgerRecordsTests(LedgerTestCase):
     def test_path_attributes_classify_meta_roles_and_nested_cfg_attr_payloads(self) -> None:
-        from style_ledger import _path_attributes  # pyright: ignore[reportPrivateUsage]
+        from scripts.style.style_ledger import _path_attributes  # pyright: ignore[reportPrivateUsage]
         data = ('#[cfg(path = "predicate.rs")] fn f() {} '
                 '#[cfg_attr(path = "predicate.rs", allow(dead_code))] fn g() {} '
                 '#[custom(path = "argument.rs")] fn h() {} '
@@ -66,16 +68,16 @@ class StyleLedgerRecordsTests(LedgerTestCase):
             with mock.patch.object(rules, "load_rules", side_effect=observed):
                 with self.assertRaisesRegex(RuntimeError, "interrupted"):
                     with ledger.rules_from_checkout(private):
-                        ledger.ticket_add("scope-1", "scope", "read", "names", "crates/alpha",
+                        ledger.ticket_add("24001", ticket_owner_id("scope"), "read", "names", "crates/alpha",
                                           [self.sources[0]], [rule_id])
                         with ledger.rules_from_checkout(nested):
-                            ledger.ticket_add("scope-2", "scope", "read", "names", "crates/alpha",
+                            ledger.ticket_add("24002", ticket_owner_id("scope"), "read", "names", "crates/alpha",
                                               [self.sources[0]], [rule_id])
-                        ledger.ticket_add("scope-3", "scope", "read", "names", "crates/alpha",
+                        ledger.ticket_add("24003", ticket_owner_id("scope"), "read", "names", "crates/alpha",
                                           [self.sources[0]], [rule_id])
                         raise RuntimeError("interrupted")
                 invalid.unlink()
-                ledger.ticket_add("scope-4", "scope", "read", "names", "crates/alpha",
+                ledger.ticket_add("24004", ticket_owner_id("scope"), "read", "names", "crates/alpha",
                                   [self.sources[0]], [rule_id])
             self.assertEqual(roots, [private, nested, private, self.repo])
             self.assertEqual(ledger.repo, self.repo)
@@ -103,15 +105,15 @@ class StyleLedgerRecordsTests(LedgerTestCase):
         with self.ledger() as ledger:
             ledger.set_tip(self.initial_tip)
             old = self.blob(rule_id)
-            ledger.ticket_add("read-1", "read", "read", "names", "crates/alpha", [self.sources[0]], [rule_id])
-            ledger.record(rule_id, self.sources[0], self.initial_tip, old, "clean", ticket="read-1", worker="old")
+            ledger.ticket_add("1001", style_unit_id("read"), "read", "names", "crates/alpha", [self.sources[0]], [rule_id])
+            ledger.record(rule_id, self.sources[0], self.initial_tip, old, "clean", ticket="1001", worker="old")
             _ = path.write_text(path.read_text().replace("input_scope: file", "input_scope: file\napproval: always"))
             current = self.blob(rule_id)
             with self.ledger() as refreshed:
                 self.assertTrue(any(cell.path == self.sources[0] and cell.state == "current"
                                     for cell in refreshed.cells(rule_id)))
             try:
-                ledger.record(rule_id, self.sources[0], self.initial_tip, current, "clean", ticket="read-1", worker="new")
+                ledger.record(rule_id, self.sources[0], self.initial_tip, current, "clean", ticket="1001", worker="new")
             except style_ledger.LedgerError as error:
                 self.fail(f"metadata-only pin must remain valid: {error}")
             self.assertEqual(ledger._judgments(rule_id, self.sources[0])[0].rule_blob, current)  # pyright: ignore[reportPrivateUsage]
@@ -121,7 +123,7 @@ class StyleLedgerRecordsTests(LedgerTestCase):
                                     for cell in state))
             _ = path.write_text(path.read_text() + "Changed body\n")
             with self.assertRaisesRegex(style_ledger.LedgerError, "differs from ticket pin"):
-                ledger.record(rule_id, self.sources[0], self.initial_tip, self.blob(rule_id), "clean", ticket="read-1", worker="body")
+                ledger.record(rule_id, self.sources[0], self.initial_tip, self.blob(rule_id), "clean", ticket="1001", worker="body")
 
     def test_refill_lock_blocks_another_worktree_until_the_body_exits(self) -> None:
         worktree = self.root / "other-checkout"
@@ -265,16 +267,17 @@ class StyleLedgerRecordsTests(LedgerTestCase):
         rule = self.rule("pipeline")
         ledger = self.ledger()
         ledger.set_tip(self.initial_tip, "main")
-        ledger.ticket_add("names-9", "names", "read", "names", "crates/alpha", [self.sources[0]], [rule])
-        ledger.ticket_assign("names-9", "main")
-        _ = ledger.ticket_base("names-9")
-        self.record(rule, self.sources[0], self.initial_tip, ticket="names-9")
-        ledger.ticket_checkpoint("names-9", self.initial_tip)
-        schema = {"bulk_workspace_tickets", "bulk_workspace_batch", "ticket_predecessors", "tickets_one_assigned"}
+        ledger.ticket_add("9", ticket_owner_id("names"), "read", "names", "crates/alpha", [self.sources[0]], [rule])
+        ledger.ticket_assign("9", "main")
+        _ = ledger.ticket_base("9")
+        self.record(rule, self.sources[0], self.initial_tip, ticket="9")
+        ledger.ticket_checkpoint("9", self.initial_tip)
+        schema = {"bulk_workspace_tickets", "bulk_workspace_batch", "ticket_predecessors", "ticket_counter"}
         with closing(sqlite3.connect(ledger.database)) as fresh:
             self.assertEqual(fresh.execute("SELECT version FROM schema_version").fetchone(), (max(style_ledger.MIGRATIONS),))
             names = cast(list[tuple[str]], fresh.execute("SELECT name FROM sqlite_master").fetchall())
             self.assertTrue(schema.issubset({row[0] for row in names}))
+            self.assertNotIn("tickets_one_assigned", {row[0] for row in names})
         for version in (25, 26):
             with self.subTest(version=version):
                 database = self.root / f"existing-copy-{version}.sqlite"
@@ -282,14 +285,14 @@ class StyleLedgerRecordsTests(LedgerTestCase):
                     source.backup(copy)
                     remove_generation_schema(copy)
                     _ = copy.executescript("""
-                        DROP INDEX tickets_one_assigned;
+                        DROP INDEX IF EXISTS tickets_one_assigned;
                         DROP TABLE ticket_predecessors;
                         CREATE UNIQUE INDEX tickets_one_open ON tickets(unit) WHERE state IN ('assigned','checkpointed');
                     """)
                     if version == 25:
                         _ = copy.execute("DROP TABLE bulk_workspace_tickets")
                     else:
-                        _ = copy.execute("INSERT INTO bulk_workspace_tickets VALUES ('names-9','existing-batch')")
+                        _ = copy.execute("INSERT INTO bulk_workspace_tickets VALUES ('9','existing-batch')")
                     _ = copy.execute("UPDATE schema_version SET version=?", (version,))
                     copy.commit()
                     rows = copy.execute("SELECT * FROM tickets").fetchall()
@@ -302,19 +305,20 @@ class StyleLedgerRecordsTests(LedgerTestCase):
                     self.assertEqual(copy.execute("SELECT version FROM schema_version").fetchone(), (max(style_ledger.MIGRATIONS),))
                     names = cast(list[tuple[str]], copy.execute("SELECT name FROM sqlite_master").fetchall())
                     self.assertTrue(schema.issubset({row[0] for row in names}))
+                    self.assertNotIn("tickets_one_assigned", {row[0] for row in names})
                     self.assertEqual(copy.execute("SELECT * FROM tickets").fetchall(), rows)
                     self.assertEqual(copy.execute("SELECT * FROM judgments").fetchall(), judgments)
                     self.assertEqual(copy.execute("SELECT * FROM bulk_workspace_tickets").fetchall(),
-                                     [("names-9", "existing-batch")] if version == 26 else [])
+                                     [("9", "existing-batch")] if version == 26 else [])
                     for _ in range(2):
                         _ = copy.executescript(style_ledger.MIGRATIONS[27])
                     self.assertEqual(copy.execute("SELECT name FROM sqlite_master WHERE name='tickets_one_open'").fetchall(), [])
                 with style_ledger.Ledger(self.repo, database) as upgraded:
-                    upgraded.ticket_add("names-10", "names", "read", "names", "crates/beta", [self.sources[2]], [rule])
-                    upgraded.ticket_assign("names-10", "main")
-                    self.assertEqual(upgraded.ticket_base("names-10"), self.initial_tip)
-                    self.assertEqual(len(upgraded.ticket_open("names")), 2)
-        self.assertEqual(len(ledger.ticket_open("names")), 1)
+                    upgraded.ticket_add("10", ticket_owner_id("names"), "read", "names", "crates/beta", [self.sources[2]], [rule])
+                    upgraded.ticket_assign("10", "main")
+                    self.assertEqual(upgraded.ticket_base("10"), self.initial_tip)
+                    self.assertEqual(len(upgraded.ticket_open(ticket_owner_id("names"))), 2)
+        self.assertEqual(len(ledger.ticket_open(ticket_owner_id("names"))), 1)
 
     def pipeline_tickets(self) -> tuple[style_ledger.Ledger, str, str]:
         rule = self.rule("pipeline")
@@ -322,72 +326,72 @@ class StyleLedgerRecordsTests(LedgerTestCase):
         _ = self.git("branch", "style/main")
         ledger.set_tip(self.initial_tip, "style/main")
         # A queued lower-number id proves reconcile follows dependencies rather than textual/numeric ids.
-        for ticket, path in (("names-10", self.sources[0]), ("names-2", self.sources[2]), ("names-11", self.sources[3])):
-            ledger.ticket_add(ticket, "names", "read", "names", path.split("/src/")[0], [path], [rule])
-        ledger.ticket_assign("names-10", "main")
-        _ = ledger.ticket_base("names-10")
+        for ticket, path in (("10", self.sources[0]), ("2", self.sources[2]), ("11", self.sources[3])):
+            ledger.ticket_add(ticket, ticket_owner_id("names"), "read", "names", path.split("/src/")[0], [path], [rule])
+        ledger.ticket_assign("10", "main")
+        _ = ledger.ticket_base("10")
         self.write(self.sources[0], "pub fn first() {}\n")
         first = self.commit("First ticket")
-        self.record(rule, self.sources[0], first, ticket="names-10")
-        ledger.ticket_checkpoint("names-10", first)
-        ledger.ticket_assign("names-2", "main")
-        self.assertEqual(ledger.ticket_base("names-2"), first)
+        self.record(rule, self.sources[0], first, ticket="10")
+        ledger.ticket_checkpoint("10", first)
+        ledger.ticket_assign("2", "main")
+        self.assertEqual(ledger.ticket_base("2"), first)
         self.write(self.sources[2], "pub fn second() {}\n")
         second = self.commit("Second ticket")
-        self.record(rule, self.sources[2], second, ticket="names-2")
-        ledger.ticket_checkpoint("names-2", second)
+        self.record(rule, self.sources[2], second, ticket="2")
+        ledger.ticket_checkpoint("2", second)
         return ledger, first, second
 
     def test_pipeline_bounds_assignment_and_merge_waits_for_the_predecessor(self) -> None:
         ledger, _, second = self.pipeline_tickets()
         with self.assertRaisesRegex(style_ledger.LedgerError, "already has"):
-            ledger.ticket_assign("names-11", "main")
+            ledger.ticket_assign("11", "main")
         _ = self.git("update-ref", "refs/heads/style/main", second)
-        with self.assertRaisesRegex(style_ledger.LedgerError, "waiting for predecessor names-10"):
-            _ = ledger.ticket_merge("names-2")
-        self.assertEqual(len(ledger.ticket_open("names")), 2)
-        _ = ledger.ticket_merge("names-10")
-        _ = ledger.ticket_merge("names-2")
-        self.assertEqual(ledger.ticket_open("names"), ())
+        with self.assertRaisesRegex(style_ledger.LedgerError, "waiting for predecessor 10"):
+            _ = ledger.ticket_merge("2")
+        self.assertEqual(len(ledger.ticket_open(ticket_owner_id("names"))), 2)
+        _ = ledger.ticket_merge("10")
+        _ = ledger.ticket_merge("2")
+        self.assertEqual(ledger.ticket_open(ticket_owner_id("names")), ())
 
     def test_pipeline_reconcile_merges_predecessors_before_successors(self) -> None:
         ledger, _, second = self.pipeline_tickets()
         _ = self.git("update-ref", "refs/heads/style/main", second)
         output = self.cli("reconcile", "--branch-point", "main", "--style-branch", "style/main")
-        self.assertLess(output.stdout.index("ticket names-10:"), output.stdout.index("ticket names-2:"))
-        self.assertEqual(ledger.ticket_open("names"), ())
+        self.assertLess(output.stdout.index("ticket 10:"), output.stdout.index("ticket 2:"))
+        self.assertEqual(ledger.ticket_open(ticket_owner_id("names")), ())
 
     def test_pipeline_growth_merge_refuses_legacy_overlap_even_after_predecessor_merged(self) -> None:
         ledger, _, second = self.pipeline_tickets()
         _ = self.git("update-ref", "refs/heads/style/main", second)
         # A ledger written by the earlier implementation can already contain overlapping footprints.
         with closing(sqlite3.connect(ledger.database)) as connection, connection:
-            _ = connection.execute("UPDATE tickets SET files=? WHERE id='names-2'",
+            _ = connection.execute("UPDATE tickets SET files=? WHERE id='2'",
                                    (json.dumps([self.sources[0], self.sources[2]]),))
         with self.assertRaisesRegex(style_ledger.LedgerError, "overlap: " + self.sources[0]):
-            _ = ledger.ticket_merge("names-10")
+            _ = ledger.ticket_merge("10")
         with closing(sqlite3.connect(ledger.database)) as connection, connection:
-            _ = connection.execute("UPDATE tickets SET state='merged' WHERE id='names-10'")
+            _ = connection.execute("UPDATE tickets SET state='merged' WHERE id='10'")
         with self.assertRaisesRegex(style_ledger.LedgerError, "overlap: " + self.sources[0]):
-            _ = ledger.ticket_merge("names-2")
-        self.assertEqual(ledger.ticket_open("names")[0]["state"], "checkpointed")
+            _ = ledger.ticket_merge("2")
+        self.assertEqual(ledger.ticket_open(ticket_owner_id("names"))[0]["state"], "checkpointed")
 
     def test_pipeline_assignment_refuses_an_assigned_predecessor_and_wrong_branch_tip(self) -> None:
         rule = self.rule("pipeline")
         ledger = self.ledger()
         ledger.set_tip(self.initial_tip, "main")
         for number in (1, 2):
-            ledger.ticket_add(f"names-{number}", "names", "read", "names", "crates/alpha", [self.sources[number - 1]], [rule])
-        ledger.ticket_assign("names-1", "main")
+            ledger.ticket_add(f"{number}", ticket_owner_id("names"), "read", "names", "crates/alpha", [self.sources[number - 1]], [rule])
+        ledger.ticket_assign("1", "main")
         with self.assertRaisesRegex(style_ledger.LedgerError, "already has"):
-            ledger.ticket_assign("names-2", "main")
-        self.record(rule, self.sources[0], self.initial_tip, ticket="names-1")
-        ledger.ticket_checkpoint("names-1", self.initial_tip)
+            ledger.ticket_assign("2", "main")
+        self.record(rule, self.sources[0], self.initial_tip, ticket="1")
+        ledger.ticket_checkpoint("1", self.initial_tip)
         self.write(self.sources[0], "pub fn unrelated() {}\n")
         _ = self.commit("Wrong branch tip")
         with self.assertRaisesRegex(style_ledger.LedgerError, "branch must start at waiting checkpoint"):
-            ledger.ticket_assign("names-2", "main")
-        self.assertEqual(len(ledger.ticket_open("names")), 1)
+            ledger.ticket_assign("2", "main")
+        self.assertEqual(len(ledger.ticket_open(ticket_owner_id("names"))), 1)
 
     def test_migration_25_backfills_from_merged_build_ticket_else_the_finding(self) -> None:
         database = self.root / "version-24.sqlite"
@@ -439,28 +443,28 @@ class StyleLedgerRecordsTests(LedgerTestCase):
         with (mock.patch.object(rules, "load_rules", side_effect=AssertionError("record_refill loads no catalog")),
               mock.patch.object(style_ledger, "open_ledger", side_effect=AssertionError("record_refill runs no migration"))):
             with mock.patch.object(style_ledger, "_now", return_value=first):
-                style_ledger.record_refill(self.repo, "names-unit", "phase written")
+                style_ledger.record_refill(self.repo, "names", "phase written")
             self.assertEqual(self.refill_result(ledger.database), (first, "phase written", "", 0, 0, 0, 0))
             with closing(sqlite3.connect(ledger.database)) as connection, connection:
                 _ = connection.execute("UPDATE refill_results SET split_at=?,ready=1,changed=2,structure=3,other=4", (first,))
             with mock.patch.object(style_ledger, "_now", return_value=later):
-                style_ledger.record_refill(self.repo, "names-unit", "repair first")
-                style_ledger.record_refill(self.repo, "types-unit", "board unavailable")
+                style_ledger.record_refill(self.repo, "names", "repair first")
+                style_ledger.record_refill(self.repo, "types", "board unavailable")
             self.assertEqual(self.refill_result(ledger.database), (later, "repair first", first, 1, 2, 3, 4))
-            self.assertEqual(self.refill_result(ledger.database, "types-unit"), (later, "board unavailable", "", 0, 0, 0, 0))
+            self.assertEqual(self.refill_result(ledger.database, "types"), (later, "board unavailable", "", 0, 0, 0, 0))
         with closing(sqlite3.connect(ledger.database)) as connection:
             self.assertEqual(connection.execute("SELECT COUNT(*) FROM refill_results").fetchone(), (2,))
 
     def test_record_refill_does_nothing_without_a_database_or_table(self) -> None:
         database = style_ledger.ledger_location(self.repo).database
-        style_ledger.record_refill(self.repo, "names-unit", "repair first")
+        style_ledger.record_refill(self.repo, "names", "repair first")
         self.assertFalse(database.exists())
         database.parent.mkdir(parents=True)
         with closing(sqlite3.connect(database)) as connection, connection:
             _ = connection.execute("CREATE TABLE existing(value TEXT)")
             _ = connection.execute("INSERT INTO existing VALUES ('kept')")
         before = database.read_bytes()
-        style_ledger.record_refill(self.repo, "names-unit", "no work")
+        style_ledger.record_refill(self.repo, "names", "no work")
         self.assertEqual(database.read_bytes(), before)
         with closing(sqlite3.connect(database)) as connection:
             self.assertEqual(connection.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall(), [("existing",)])
@@ -471,7 +475,7 @@ class StyleLedgerRecordsTests(LedgerTestCase):
         split = style_ledger.RecordedSplit(7, 6, 5, 4, measured_at)
         with (mock.patch.object(rules, "load_rules", side_effect=AssertionError("no catalog write")),
               mock.patch.object(style_ledger, "open_ledger", side_effect=AssertionError("no migration"))):
-            style_ledger.record_split(self.repo, "names-unit", split)
+            style_ledger.record_split(self.repo, "names", split)
         self.assertEqual(self.refill_result(ledger.database), ("", "", measured_at, 7, 6, 5, 4))
 
     def test_the_split_blob_cache_reads_each_tree_once_and_keeps_versions_distinct(self) -> None:
@@ -538,7 +542,7 @@ class StyleLedgerRecordsTests(LedgerTestCase):
     def test_split_write_uses_a_small_busy_timeout_on_a_locked_ledger(self) -> None:
         ledger = self.ledger()
         previous = style_ledger.RecordedSplit(9, 8, 7, 6, "2026-10-27T12:00:00+00:00")
-        style_ledger.record_split(self.repo, "names-unit", previous)
+        style_ledger.record_split(self.repo, "names", previous)
         before = self.refill_result(ledger.database)
         with closing(sqlite3.connect(ledger.database)) as writer:
             _ = writer.execute("BEGIN IMMEDIATE")
@@ -552,7 +556,7 @@ class StyleLedgerRecordsTests(LedgerTestCase):
 
             with (mock.patch.object(sqlite3, "connect", side_effect=observe_connect),
                   self.assertRaisesRegex(sqlite3.OperationalError, "database is locked")):
-                style_ledger.record_split(self.repo, "names-unit",
+                style_ledger.record_split(self.repo, "names",
                                           style_ledger.RecordedSplit(1, 2, 3, 4, "2026-10-28T12:00:00+00:00"),
                                           busy_timeout_seconds=0.05)
             writer.rollback()
@@ -564,12 +568,12 @@ class StyleLedgerRecordsTests(LedgerTestCase):
         first_at = "2026-10-27T12:00:00+00:00"
         later_at = "2026-10-28T10:00:00+00:00"
         with mock.patch.object(style_ledger, "_now", return_value=first_at):
-            style_ledger.record_refill(self.repo, "names-unit", "phase written")
-        style_ledger.record_split(self.repo, "names-unit", style_ledger.RecordedSplit(1, 2, 3, 4, first_at))
-        style_ledger.record_split(self.repo, "names-unit", style_ledger.RecordedSplit(0, 0, 0, 0, later_at))
+            style_ledger.record_refill(self.repo, "names", "phase written")
+        style_ledger.record_split(self.repo, "names", style_ledger.RecordedSplit(1, 2, 3, 4, first_at))
+        style_ledger.record_split(self.repo, "names", style_ledger.RecordedSplit(0, 0, 0, 0, later_at))
         self.assertEqual(self.refill_result(ledger.database), (first_at, "phase written", later_at, 0, 0, 0, 0))
         with mock.patch.object(style_ledger, "_now", return_value=later_at):
-            style_ledger.record_refill(self.repo, "names-unit", "waiting for sync")
+            style_ledger.record_refill(self.repo, "names", "waiting for sync")
         self.assertEqual(self.refill_result(ledger.database), (later_at, "waiting for sync", later_at, 0, 0, 0, 0))
 
     def test_withdraw_duplicates_is_idempotent_refuses_an_open_ticket_and_the_held_list_names_the_duplicate(self) -> None:
@@ -580,10 +584,10 @@ class StyleLedgerRecordsTests(LedgerTestCase):
         for finding_id in bare:
             ledger.file_held(finding_id, issue)
         duplicates = [style_ledger.BareDuplicate(finding_id, qualified, issue) for finding_id, qualified in zip(bare, ids)]
-        ledger.ticket_add("names-1", "names", "proposal", "names", "crates/alpha", [self.sources[1]], [rule],
+        ledger.ticket_add("1", ticket_owner_id("names"), "proposal", "names", "crates/alpha", [self.sources[1]], [rule],
                           proposal=str(issue), finding_ids=(bare[1],))
         before = self.held_rows(ledger.database)
-        with self.assertRaisesRegex(style_ledger.LedgerError, re.escape(f"{bare[1]}: build ticket names-1 still holds the finding")):
+        with self.assertRaisesRegex(style_ledger.LedgerError, re.escape(f"{bare[1]}: build ticket 1 still holds the finding")):
             ledger.withdraw_duplicates(duplicates)
         self.assertEqual(self.held_rows(ledger.database), before)
         ledger.withdraw_duplicates(duplicates[:1])
@@ -640,17 +644,17 @@ class StyleLedgerRecordsTests(LedgerTestCase):
             _ = connection.execute("INSERT INTO schema_version VALUES (10)")
             _ = connection.execute("INSERT INTO held_findings VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                                    ("legacy", rule, self.sources[0], 2, "change", "rename", "old", "new", self.blob(rule),
-                                    "read-1", "filed", str(self.root / "issue.md"), "created", "updated"))
+                                    "1001", "filed", str(self.root / "issue.md"), "created", "updated"))
             _ = connection.execute("INSERT INTO tickets VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                                   ("read-1", "read", "read", "names", "", "crates/alpha", json.dumps(list(self.sources[:2])), "[]",
+                                   ("1001", style_unit_id("read"), "read", "names", "", "crates/alpha", json.dumps(list(self.sources[:2])), "[]",
                                     json.dumps([rule]), json.dumps({rule: self.blob(rule)}), "assigned", "refs/heads/main", "", "created", "updated", "", "", "[]"))
             connection.commit()
         with style_ledger.Ledger(self.repo, database) as ledger:
             finding, = ledger.proposal_findings(self.root / "issue.md")
-            self.assertEqual((finding.finding_id, finding.before, finding.after, finding.ticket), ("legacy", "old", "new", "read-1"))
+            self.assertEqual((finding.finding_id, finding.before, finding.after, finding.ticket), ("legacy", "old", "new", "1001"))
             self.assertIsInstance(finding.build_ticket, style_ledger.NoBuildTicket)
-            self.assertEqual(ledger.ticket_open("read")[0]["files"], list(self.sources[:2]))
-            ledger.record_candidate("read-1", self.sources[0], 2, "Check this idea")
+            self.assertEqual(ledger.ticket_open(ticket_owner_id("read"))[0]["files"], list(self.sources[:2]))
+            ledger.record_candidate("1001", self.sources[0], 2, "Check this idea")
             self.assertEqual(ledger.rule_candidates()[0].idea, "Check this idea")
 
     def test_file_scope_verdict_crate_clean_tracks_only_its_file_and_rule(self) -> None:
@@ -950,14 +954,14 @@ class StyleLedgerRecordsTests(LedgerTestCase):
         path = self.sources[0]
         ledger = self.ledger()
         ledger.set_tip(self.initial_tip, "main")
-        ledger.ticket_add("names-1", "names", "read", "names", "crates/alpha", [path], [rule])
-        ledger.ticket_assign("names-1", "main")
-        self.assertEqual(ledger.ticket_base("names-1"), self.initial_tip)
-        self.record_reads(rule, path, self.initial_tip, (self.sources[1],), ticket="names-1")
+        ledger.ticket_add("1", ticket_owner_id("names"), "read", "names", "crates/alpha", [path], [rule])
+        ledger.ticket_assign("1", "main")
+        self.assertEqual(ledger.ticket_base("1"), self.initial_tip)
+        self.record_reads(rule, path, self.initial_tip, (self.sources[1],), ticket="1")
         self.write(path, "pub fn ticket_changed() {}\n")
         checkpoint = self.commit("Ticket edit")
-        ledger.ticket_checkpoint("names-1", checkpoint)
-        _ = ledger.ticket_merge("names-1")
+        ledger.ticket_checkpoint("1", checkpoint)
+        _ = ledger.ticket_merge("1")
         self.write("crates/alpha/src/added.rs", "pub fn unrelated() {}\n")
         ledger.set_tip(self.commit("Unrelated change after checkpoint"), "main")
         self.assertEqual({cell.path: cell.state for cell in ledger.cells(rule=rule)}[path], "current")
@@ -1129,15 +1133,15 @@ class StyleLedgerRecordsTests(LedgerTestCase):
         path = self.sources[0]
         ledger = self.ledger()
         ledger.set_tip(self.initial_tip, "main")
-        ledger.ticket_add("names-1", "names", "read", "names", "crates/alpha", [path], [rule])
-        ledger.ticket_assign("names-1", "main")
-        self.assertEqual(ledger.ticket_base("names-1"), self.initial_tip)
-        ledger.record(rule, path, self.initial_tip, self.blob(rule), "clean", ticket="names-1",
+        ledger.ticket_add("1", ticket_owner_id("names"), "read", "names", "crates/alpha", [path], [rule])
+        ledger.ticket_assign("1", "main")
+        self.assertEqual(ledger.ticket_base("1"), self.initial_tip)
+        ledger.record(rule, path, self.initial_tip, self.blob(rule), "clean", ticket="1",
                       input_scope=style_ledger.DeclaredInputScope.FILE)
         self.write(path, "pub fn ticket_changed() {}\n")
         checkpoint = self.commit("Ticket edit")
-        ledger.ticket_checkpoint("names-1", checkpoint)
-        _ = ledger.ticket_merge("names-1")
+        ledger.ticket_checkpoint("1", checkpoint)
+        _ = ledger.ticket_merge("1")
         self.write(self.sources[1], "pub fn later_sibling_changed() {}\n")
         ledger.set_tip(self.commit("Change sibling after checkpoint"), "main")
         self.assertEqual(self.states(rule)[path], "current")
@@ -1371,25 +1375,25 @@ class StyleLedgerRecordsTests(LedgerTestCase):
         rule = self.rule("structure", "tier: D\nfamily: modules\n")
         self.set_tip(self.initial_tip)
         ledger = self.ledger()
-        _ = self.cli("ticket", "add", "--id", "modules-1", "--unit", "modules", "--kind", "structure",
+        _ = self.cli("ticket", "add", "--id", "3001", "--unit", "modules", "--kind", "structure",
                      "--family", "modules", "--crate", "crates/alpha", "--files", json.dumps(list(self.sources[:2])),
                      "--rules", json.dumps([rule]), "--cells", json.dumps([[rule, self.sources[0]]]))
-        ledger.ticket_assign("modules-1", "main")
+        ledger.ticket_assign("3001", "main")
         with self.assertRaisesRegex(style_ledger.LedgerError, f"{rule} {self.sources[1]} is outside ticket cells"):
-            ledger.record(rule, self.sources[1], self.initial_tip, "", "clean", ticket="modules-1")
-        ledger.record(rule, self.sources[0], self.initial_tip, "", "clean", ticket="modules-1",
+            ledger.record(rule, self.sources[1], self.initial_tip, "", "clean", ticket="3001")
+        ledger.record(rule, self.sources[0], self.initial_tip, "", "clean", ticket="3001",
                       input_scope=style_ledger.DeclaredInputScope.RULE)
-        self.assertEqual(ledger.unjudged_ticket_cells("modules-1", "HEAD", self.in_worktree), ())
+        self.assertEqual(ledger.unjudged_ticket_cells("3001", "HEAD", self.in_worktree), ())
         with self.assertRaisesRegex(style_ledger.LedgerError, "different fields"):
-            ledger.ticket_add("modules-1", "modules", "structure", "modules", "crates/alpha",
+            ledger.ticket_add("3001", ticket_owner_id("modules"), "structure", "modules", "crates/alpha",
                               list(self.sources[:2]), [rule], cells=((rule, self.sources[1]),))
 
     def test_migration_nine_preserves_legacy_crate_ticket_and_does_not_cover_new_file_cells(self) -> None:
         rule = self.rule("structure", "tier: D\nfamily: modules\ninput_scope: file\n")
         ledger = self.ledger()
         ledger.set_tip(self.initial_tip, "main")
-        ledger.ticket_add("modules-1", "modules", "structure", "modules", "crates/alpha", list(self.sources[:2]), [rule])
-        ledger.ticket_assign("modules-1", "main")
+        ledger.ticket_add("3001", ticket_owner_id("modules"), "structure", "modules", "crates/alpha", list(self.sources[:2]), [rule])
+        ledger.ticket_assign("3001", "main")
         database = ledger.database
         ledger.close()
         with closing(sqlite3.connect(database)) as connection:
@@ -1420,11 +1424,11 @@ class StyleLedgerRecordsTests(LedgerTestCase):
             _ = connection.execute("UPDATE schema_version SET version=8")
             connection.commit()
         migrated = self.ledger()
-        self.assertEqual(migrated.ticket_open("modules")[0]["cells"], [])
-        self.assertEqual(migrated.unjudged_ticket_cells("modules-1", "HEAD", self.in_worktree), (style_ledger.UnjudgedTicketCell(rule, "crates/alpha"),))
-        migrated.record(rule, "crates/alpha", self.initial_tip, "", "clean", ticket="modules-1")
-        migrated.ticket_checkpoint("modules-1", self.initial_tip)
-        self.assertEqual(migrated.ticket_open("modules")[0]["state"], "checkpointed")
+        self.assertEqual(migrated.ticket_open(ticket_owner_id("modules"))[0]["cells"], [])
+        self.assertEqual(migrated.unjudged_ticket_cells("3001", "HEAD", self.in_worktree), (style_ledger.UnjudgedTicketCell(rule, "crates/alpha"),))
+        migrated.record(rule, "crates/alpha", self.initial_tip, "", "clean", ticket="3001")
+        migrated.ticket_checkpoint("3001", self.initial_tip)
+        self.assertEqual(migrated.ticket_open(ticket_owner_id("modules"))[0]["state"], "checkpointed")
         self.assertEqual(self.states(rule), dict.fromkeys(self.sources, "open"))
 
     def test_structure_file_cells_track_module_inputs_and_decline_only_the_matching_file(self) -> None:
@@ -1818,7 +1822,7 @@ class StyleLedgerRecordsTests(LedgerTestCase):
             with self.subTest(component=component):
                 refusal = self.cli(
                     "record", "--rule", component, "--path", self.sources[2], "--commit", self.initial_tip,
-                    "--rule-blob", self.blob(rule_id), "--verdict", "clean", "--ticket", "unit-1",
+                    "--rule-blob", self.blob(rule_id), "--verdict", "clean", "--ticket", "27001",
                     "--worker", "test-worker", success=False,
                 )
                 self.assertEqual(refusal.returncode, 2)
@@ -1998,7 +2002,7 @@ class StyleLedgerRecordsTests(LedgerTestCase):
             _ = connection.execute("INSERT INTO sync VALUES (1,?,?,?)", (self.initial_tip, "refs/heads/main", now))
             _ = connection.execute(
                 "INSERT INTO tickets VALUES (?,?,?,?,?,?,?,?,?,?,'queued','','',?,?)",
-                ("read-1", "read", "read", "names", "", "crates/alpha", json.dumps(list(self.sources[:2])), "[]",
+                ("1001", style_unit_id("read"), "read", "names", "", "crates/alpha", json.dumps(list(self.sources[:2])), "[]",
                  json.dumps([rule]), json.dumps({rule: blob}), now, now),
             )
             _ = connection.execute("INSERT INTO handoffs VALUES (?,'sent','','parent',?,?)", (self.initial_tip, now, now))
@@ -2006,21 +2010,21 @@ class StyleLedgerRecordsTests(LedgerTestCase):
                 'INSERT INTO judgments(rule,rule_blob,input_scope,input_fingerprint,path,"commit",verdict,verdict_detail,ticket,worker,recorded_at) '
                 + 'VALUES (?,?,?,?,?,?,?,?,?,?,?)',
                 (rule, blob, "file", self.git("rev-parse", f"{self.initial_tip}:{self.sources[0]}"), self.sources[0],
-                 self.initial_tip, "clean", "", "read-1", "worker", now),
+                 self.initial_tip, "clean", "", "1001", "worker", now),
             )
             connection.commit()
 
         ledger = self.ledger()
 
-        self.assertEqual([ticket["id"] for ticket in ledger.queued_tickets("read")], ["read-1"])
-        self.assertEqual(ledger.queued_tickets("read")[0]["base"], "")
-        self.assertEqual(ledger.next_ticket_id("read"), "read-2")
+        self.assertEqual([ticket["id"] for ticket in ledger.queued_tickets(ticket_owner_id("read"))], ["1001"])
+        self.assertEqual(ledger.queued_tickets(ticket_owner_id("read"))[0]["base"], "")
+        self.assertEqual(ledger.next_ticket_id(), "1002")
         self.assertEqual([(handoff["checkpoint"], handoff["state"]) for handoff in ledger.pending_handoffs()], [(self.initial_tip, "sent")])
         self.assertEqual(self.states(rule)[self.sources[0]], "current")
-        with self.assertRaisesRegex(style_ledger.LedgerError, f"read-1: no pinned text for {blob}"):
-            _ = ledger.pinned_rule_texts("read-1")
-        ledger.ticket_add("read-2", "read", "read", "names", "crates/alpha", list(self.sources[:2]), [rule])
-        self.assertEqual(ledger.pinned_rule_texts("read-1"), ledger.pinned_rule_texts("read-2"))
+        with self.assertRaisesRegex(style_ledger.LedgerError, f"1001: no pinned text for {blob}"):
+            _ = ledger.pinned_rule_texts("1001")
+        ledger.ticket_add("1002", ticket_owner_id("read"), "read", "names", "crates/alpha", list(self.sources[:2]), [rule])
+        self.assertEqual(ledger.pinned_rule_texts("1001"), ledger.pinned_rule_texts("1002"))
         with closing(sqlite3.connect(database)) as connection:
             versions = cast(list[tuple[int]], connection.execute("SELECT version FROM schema_version").fetchall())
         self.assertEqual(versions, [(max(style_ledger.MIGRATIONS),)])
@@ -2038,39 +2042,39 @@ class StyleLedgerRecordsTests(LedgerTestCase):
         ledger.ticket_drop(judging)
         # Workspace tickets retain separate decisions and finding ownership.
         with closing(sqlite3.connect(ledger.database)) as connection, connection:
-            _ = connection.execute("UPDATE tickets SET crate='.' WHERE id='names-1'")
-        ledger.ticket_add("names-second-1", "names-second", "proposal", "names", ".", [path], [rule],
+            _ = connection.execute("UPDATE tickets SET crate='.' WHERE id='1'")
+        ledger.ticket_add("10001", ticket_owner_id("names-second"), "proposal", "names", ".", [path], [rule],
                           proposal=str(other_issue), finding_ids=(second.finding_id,))
-        ledger.ticket_assign("names-second-1", "main")
-        self.assertEqual(ledger.ticket_base("names-second-1"), base)
+        ledger.ticket_assign("10001", "main")
+        self.assertEqual(ledger.ticket_base("10001"), base)
         self.write(path, source.replace("old", "fresh").replace("second", "next"))
         checkpoint = self.commit("Two separately approved binding renames")
         ledger.set_tip(checkpoint, "main")
-        ledger.ticket_checkpoint("names-1", checkpoint)
+        ledger.ticket_checkpoint("1", checkpoint)
         with self.assertRaises(style_ledger.LedgerError):
-            ledger.bulk_share_checkpoint(("names-1", "names-second-1"))
-        ledger.ticket_checkpoint("names-second-1", checkpoint)
+            ledger.bulk_share_checkpoint(("1", "10001"))
+        ledger.ticket_checkpoint("10001", checkpoint)
         first, = ledger.proposal_findings(issue)
         self.assertNotIsInstance(ledger.applied_check(first, checkpoint), AppliedInCode)
         for column, changed in (("base", self.initial_tip), ("branch", "refs/heads/unrelated"),
                                 ("checkpoint", base), ("rules", "[]"), ("crate", "crates/alpha"),
                                 ("kind", "read"), ("family", "values")):
             with self.subTest(column=column), closing(sqlite3.connect(ledger.database)) as connection:
-                previous = cast(tuple[str], connection.execute(f"SELECT {column} FROM tickets WHERE id='names-second-1'").fetchone())[0]
+                previous = cast(tuple[str], connection.execute(f"SELECT {column} FROM tickets WHERE id='10001'").fetchone())[0]
                 with connection:
-                    _ = connection.execute(f"UPDATE tickets SET {column}=? WHERE id='names-second-1'", (changed,))
+                    _ = connection.execute(f"UPDATE tickets SET {column}=? WHERE id='10001'", (changed,))
                 with self.assertRaises(style_ledger.LedgerError):
-                    ledger.bulk_share_checkpoint(("names-1", "names-second-1"))
+                    ledger.bulk_share_checkpoint(("1", "10001"))
                 with connection:
-                    _ = connection.execute(f"UPDATE tickets SET {column}=? WHERE id='names-second-1'", (previous,))
-        ledger.bulk_share_checkpoint(("names-1", "names-second-1"))
-        ledger.bulk_share_checkpoint(("names-second-1", "names-1"))  # Idempotent; also clears an earlier incomplete proof.
+                    _ = connection.execute(f"UPDATE tickets SET {column}=? WHERE id='10001'", (previous,))
+        ledger.bulk_share_checkpoint(("1", "10001"))
+        ledger.bulk_share_checkpoint(("10001", "1"))  # Idempotent; also clears an earlier incomplete proof.
         self.assertIsInstance(ledger.applied_check(first, checkpoint), AppliedInCode)
         self.assertNotIsInstance(ledger.applied_check(first, base), AppliedInCode)
         # A fresh process reads the group; merging the first ticket must not hide its proof from the second.
         reopened = self.ledger()
-        self.assertEqual(reopened.ticket_merge("names-1"), ())
-        self.assertEqual(reopened.ticket_merge("names-second-1"), ())
+        self.assertEqual(reopened.ticket_merge("1"), ())
+        self.assertEqual(reopened.ticket_merge("10001"), ())
         self.assertTrue(all(isinstance(f.state, style_ledger.Built)
                             for f in reopened.named_held((first.finding_id, second.finding_id))))
 

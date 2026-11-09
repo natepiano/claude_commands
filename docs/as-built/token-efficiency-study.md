@@ -15,7 +15,9 @@ The status line's `For you:` row shows how many efficiency proposals wait on the
 - An absent field, a missing file, a directory, or a file that is not UTF-8 counts 0. The other counts stay as they are.
 - `read_counts(doc, *, questions)` fills all four counts. `total(each)` adds them by column across productions.
 - `sources(doc)` includes the Efficiency ledger and Improvement queue ledger paths even before the files exist. This makes the status line cache refresh when either ledger appears or changes.
-- `counts_line` puts the counts in this order: questions, changes, efficiency, proposals, and leaves out zero counts: `For you: 1 question, 2 changes, 130 efficiency, 2 proposals`. "efficiency" has no plural. Every kind can be shown through `/next`.
+- `counts_line` orders production counts as questions, changes, efficiency, proposals. It omits zero counts. "efficiency" has no plural. Every kind is available through `/next`.
+- The status line puts the session's adhoc count first, then questions, changes, rebuild items, efficiency and proposals. Example: `For you: 3 adhoc items, 1 question, 2 changes, 130 efficiency`.
+- `scripts/statusline/adhoc_items.py` reads one number from `~/.local/state/adhoc_review/<session id>`. Pink text shows the count in any Claude session during `/adhoc_review`. The number is bold. Zero removes the file and the part.
 - `scripts/hooks/showrunner_footer.py`, `scripts/statusline/counts_row.py` and the dailies footer (`dailies_render.py`) pass `FooterCounts` through without change.
 - Tests: `scripts/production/test_footer_counts.py` covers the parser, missing and non-UTF-8 ledgers, sources and render order. `scripts/statusline/test_statusline.py` covers the count end to end in the status line.
 

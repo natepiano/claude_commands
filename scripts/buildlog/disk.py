@@ -1,24 +1,22 @@
-"""Measure the root filesystem once for the build report's disk table."""
+"""Measure each output filesystem once for the build report's disk table."""
 
 from __future__ import annotations
 
 import json
 import os
 import socket
-import sys
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import NotRequired, TypedDict, cast
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lint"))
-import sweep
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
-import conf
+from scripts.lint import sweep
+from scripts.lib import conf
+from scripts.lib.cargo_output import CargoOutputUnavailable, read_cargo_output_roots
 
-import store
-import filesystem
+from scripts.buildlog import store
+from scripts.buildlog import filesystem
 
 
 class DiskRow(TypedDict):
@@ -41,6 +39,14 @@ class OutsideBuildCacheTotal(TypedDict):
     growth_bytes: int
 
 
+class FilesystemCapacity(TypedDict):
+    path: str
+    device: str
+    device_name: str
+    used: int
+    free: int
+
+
 class DiskSnapshot(TypedDict):
     measured_at: str
     host: str
@@ -48,6 +54,8 @@ class DiskSnapshot(TypedDict):
     used: int
     free: int
     floor: int | None
+    output_unavailable: NotRequired[list[str]]
+    filesystems: NotRequired[list[FilesystemCapacity]]
     previous_measured_at: NotRequired[str | None]
     outside_build_caches: NotRequired[list[OutsideBuildCacheDirectory]]
     outside_build_cache_totals: NotRequired[list[OutsideBuildCacheTotal]]
@@ -60,6 +68,8 @@ class MeasuredDiskSnapshot(TypedDict):
     used: int
     free: int
     floor: int | None
+    output_unavailable: NotRequired[list[str]]
+    filesystems: NotRequired[list[FilesystemCapacity]]
     previous_measured_at: str | None
     outside_build_caches: list[OutsideBuildCacheDirectory]
     outside_build_cache_totals: list[OutsideBuildCacheTotal]
@@ -221,10 +231,69 @@ def measure(
     }
 
 
+def capacity_rows(paths: list[Path], measured: tuple[tuple[int, filesystem.FilesystemUsage], ...] = ()) -> list[FilesystemCapacity]:
+    rows: list[FilesystemCapacity] = []
+    seen: set[str] = set()
+    for path in paths:
+        existing = path.expanduser().resolve()
+        while not existing.exists() and existing != existing.parent:
+            existing = existing.parent
+        try:
+            usage = dict(measured).get(existing.stat().st_dev)
+            if usage is None:
+                usage = filesystem.filesystem_usage(str(existing))
+        except OSError:
+            continue
+        identity = usage.device if usage.device != "unavailable" else str(existing.stat().st_dev)
+        if identity in seen:
+            continue
+        seen.add(identity)
+        rows.append({"path": str(existing), "device": identity, "device_name": usage.device_name,
+                     "used": usage.used, "free": usage.free})
+    return rows
+
+
+def mapped_output_paths(folders: list[tuple[str, str]]) -> tuple[list[Path], list[str]]:
+    """Read current mappings and retain saved output roots for older workspaces."""
+    saved = sweep.saved_cargo_output_roots()
+    mappings = list((*saved.workspaces, *saved.history))
+    checkouts: list[str] = []
+    _ = sweep.target_dirs([path for _, path in folders], checkouts=checkouts)
+    checkouts.extend(str(item.workspace_root) for item in saved.workspaces
+                     if (item.workspace_root / "Cargo.toml").is_file())
+    unavailable: list[str] = []
+    for checkout in sorted(set(checkouts)):
+        roots = read_cargo_output_roots(Path(checkout))
+        if isinstance(roots, CargoOutputUnavailable):
+            unavailable.append(f"{checkout}: {roots.reason}")
+        else:
+            mappings.append(roots)
+    return sorted({path for roots in mappings
+                   for path in (roots.target_directory, roots.build_directory)}), unavailable
+
+
 def snapshot() -> MeasuredDiskSnapshot:
     floor = read_floor()
     previous = previous_outside_measurement(read_snapshot())
-    return measure(FOLDERS, lambda: filesystem.filesystem_usage("/"), floor, previous)
+    folders = list(FOLDERS)
+    outputs, unavailable = mapped_output_paths(folders)
+    for output in outputs:
+        if not any(output.is_relative_to(Path(path).expanduser().resolve()) for _, path in folders):
+            folders.append((str(output), str(output)))
+    cache = os.environ.get("SCCACHE_DIR")
+    if cache and not any(Path(cache).expanduser().is_relative_to(Path(path).expanduser()) for _, path in folders):
+        folders.append(("sccache", cache))
+    measured: list[tuple[int, filesystem.FilesystemUsage]] = []
+
+    def root_usage() -> filesystem.FilesystemUsage:
+        usage = filesystem.filesystem_usage("/")
+        measured.append((Path("/").stat().st_dev, usage))
+        return usage
+
+    result = measure(folders, root_usage, floor, previous)
+    result["filesystems"] = capacity_rows([Path("/"), *(Path(path) for _, path in folders), *outputs], tuple(measured))
+    result["output_unavailable"] = unavailable
+    return result
 
 
 def write_snapshot(snapshot: DiskSnapshot | MeasuredDiskSnapshot) -> None:

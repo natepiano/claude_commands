@@ -1,6 +1,10 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
 """Score open issues; keep payloads and decisions in local JSONL run files."""
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import argparse
 from collections.abc import Mapping, Sequence
@@ -21,12 +25,9 @@ from tempfile import NamedTemporaryFile
 from typing import cast
 from uuid import uuid4
 
-# Support the documented direct script invocation and package imports in tests.
-if __package__ in (None, ""):
-    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from scripts.issue_score import client, decide, questions, vault
-from scripts.issue_score.selection import UseConfiguredValue
+from scripts.lib.conf import UseConfiguredValue
 from scripts.issue_score import experiment as wording
 from scripts.issue_score.blind import blind, blind_score
 from scripts.issue_score.evaluate import Split, compare, in_split, load_run

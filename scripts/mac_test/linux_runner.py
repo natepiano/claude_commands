@@ -1,10 +1,14 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
 """Execute trusted source in a cached Linux development shell."""
 
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import argparse
-from collections.abc import Generator
+from collections.abc import Generator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import Enum
@@ -20,31 +24,29 @@ import shlex
 import shutil
 import signal
 import subprocess
-import sys
 import tempfile
 import time
 from typing import TYPE_CHECKING, NotRequired, Protocol, TypedDict, cast
 from types import FrameType
 import uuid
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 if TYPE_CHECKING:
-    from ..lib import build_folders
-    from ..aws_target import ledger
-    from ..build_targets.target_config import SshTarget, is_aws_target
-else:
+    from scripts.copies import copies
     from scripts.lib import build_folders
+    from scripts.lib.boot_identity import boot_identity as boot_identity
+    from scripts.lib.cargo_output import CargoOutputUnavailable, read_cargo_output_roots
+    from scripts.aws_target import ledger
+    from scripts.build_targets.target_config import SshTarget, is_aws_target
+else:
+    from scripts.copies import copies
+    from scripts.lib import build_folders
+    from scripts.lib.boot_identity import boot_identity as boot_identity
+    from scripts.lib.cargo_output import CargoOutputUnavailable, read_cargo_output_roots
     from scripts.build_targets.target_config import SshTarget, is_aws_target
 
 
+
 PROC_ROOT = Path('/proc')
-
-
-def boot_identity(proc_root: Path = PROC_ROOT) -> str:
-    identity = (proc_root / 'sys/kernel/random/boot_id').read_text().strip()
-    if not identity:
-        raise ValueError('boot identity is missing')
-    return identity
 
 
 class SlotBoot(Enum):
@@ -161,23 +163,50 @@ def positive_setting(values: dict[str, str], key: str) -> float:
     return value
 
 
+def shell_environment_script(shell: ShellEnvironment) -> str:
+    """Keep the caller's tools after the development shell's tools."""
+    return ('linux_runner_path=$PATH\n'
+            + f'source {shlex.quote(str(shell.exports))} || exit 75\n'
+            + 'export PATH="$PATH:$linux_runner_path"\n'
+            + 'unset linux_runner_path\n'
+            + 'if [[ -n ${shellHook-} ]]; then eval "$shellHook" || exit 75; fi\n')
+
+
 def policy_setting(values: dict[str, str], key: str, repository: str) -> str:
     return values[f'{key}.{repository}'] if f'{key}.{repository}' in values else values[key]
+
+
+def normalize_tool_version(value: str) -> str:
+    """Keep each nonempty version line in one common form."""
+    return ' '.join(line.strip() for line in value.splitlines() if line.strip())
+
+
+def tool_version_filter() -> str:
+    """Use the same normalizer for versions read by Bash."""
+    code = "\n".join((
+        "import sys",
+        "from scripts.mac_test.linux_runner import normalize_tool_version",
+        "print(normalize_tool_version(sys.stdin.read()))",
+    ))
+    return f'"$HOME/.claude/scripts/lib/py" -c {shlex.quote(code)}'
 
 
 def probe_script(mirror: str, *, shell_environment: bool = False) -> str:
     """Read Linux disk capacity and the public tool versions."""
     return '\n'.join((
         ':' if shell_environment else 'export PATH="$HOME/.cargo/bin:$PATH"',
-        f'mkdir -p -- "$HOME"/{shlex.quote(mirror)} || exit 1',
-        'free_gib=$(df -Pk "$HOME" | awk \'NR == 2 {printf "%.6f", $4 / 1048576}\') || exit 1',
+        copies.mirror_probe_setup(mirror),
+        f'checkout="$HOME"/{shlex.quote(mirror)}',
+        'disk_usage=$(df -Pk "$checkout") || exit 1',
+        'free_gib=$(printf \'%s\\n\' "$disk_usage" | awk \'NR > 1 {if (!seen || $4 < free) free=$4; seen=1} END {printf "%.6f", free / 1048576}\') || exit 1',
         'printf \'free_gib=%s\\nhost=%s\\n\' "$free_gib" "$(hostname -s)"',
-        'rustc_version=$(rustc -V) || exit 1',
-        'nextest_version=$(cargo nextest --version) || exit 1',
-        'mend_version=$(cargo mend --version) || exit 1',
+        'nextest_version=$(cargo-nextest nextest --version) || exit 1',
+        'mend_version=$(cargo-mend mend --version) || exit 1',
+        f'nextest_version=$(printf \'%s\' "$nextest_version" | {tool_version_filter()}) || exit 1',
+        f'mend_version=$(printf \'%s\' "$mend_version" | {tool_version_filter()}) || exit 1',
         'scripts_commit=$(cat "$HOME/.claude/.build-target-script-commit") || exit 1',
-        'printf \'rustc=%s\\nnextest=%s\\nmend=%s\\nscripts_commit=%s\\nrc=0\\n\' '
-        + '"$rustc_version" "$nextest_version" "$mend_version" "$scripts_commit"',
+        'printf \'nextest=%s\\nmend=%s\\nscripts_commit=%s\\nrc=0\\n\' '
+        + '"$nextest_version" "$mend_version" "$scripts_commit"',
     ))
 
 
@@ -243,6 +272,26 @@ SLOT_PROCESSES_UNRESOLVED = 3
 STARTUP_REFUSAL_RECORD = 'linux_startup=unresolved'
 
 
+@dataclass(frozen=True)
+class ProcessIdentity:
+    """Public process fields that remain readable for non-dumpable processes."""
+
+    real_uid: int
+    parent: int
+    group: int
+    start_time: int
+    state: str
+
+
+def process_identity(pid: int, proc_root: Path) -> ProcessIdentity:
+    fields = process_fields(pid, proc_root)
+    status = (proc_root / str(pid) / 'status').read_text()
+    uid = re.search(r'^Uid:\s+(\d+)\b', status, re.MULTILINE)
+    if uid is None:
+        raise ValueError('process real UID is unavailable')
+    return ProcessIdentity(int(uid[1]), int(fields[1]), int(fields[2]), int(fields[19]), fields[0])
+
+
 def select_slot_processes(mirror: Path, proc_root: Path = PROC_ROOT, *,
                           require_boot_identity: bool = False) -> SlotProcessSelection:
     """Read each ownership source independently before deciding uncertainty."""
@@ -256,32 +305,44 @@ def select_slot_processes(mirror: Path, proc_root: Path = PROC_ROOT, *,
     uncertain: set[int] = set()
     root = mirror.resolve()
     own_pid = os.getpid()
+    own_uid = os.getuid()
+    identities: dict[int, ProcessIdentity] = {}
     for process in proc_root.glob('[0-9]*'):
         pid = int(process.name)
         try:
-            if process.stat().st_uid != os.getuid():
-                continue
-            fields = process_fields(pid, proc_root)
+            identities[pid] = process_identity(pid, proc_root)
         except (FileNotFoundError, ProcessLookupError):
             continue
         except PermissionError:
-            uncertain.add(pid)
-            continue
-        if fields[0] in ('Z', 'X'):
+            if not isinstance(lease, UnmarkedSlot):
+                uncertain.add(pid)
+    # The checking process and its ancestors cannot be leftovers of a lost run.
+    checking_chain: set[int] = set()
+    ancestor = own_pid
+    while ancestor in identities and ancestor not in checking_chain:
+        checking_chain.add(ancestor)
+        ancestor = identities[ancestor].parent
+    for pid, identity in identities.items():
+        if identity.real_uid != own_uid or identity.state in ('Z', 'X'):
             continue
         if not isinstance(lease, UnmarkedSlot):
             if pid == lease['pid']:
-                if (int(fields[19]) != lease['start_time']
-                        or int(fields[2]) != lease['process_group']):
+                if (identity.start_time != lease['start_time']
+                        or identity.group != lease['process_group']):
                     raise ValueError('slot process identity changed')
                 selected.add(pid)
-                parents[pid] = int(fields[1])
+                parents[pid] = identity.parent
                 continue
-            if int(fields[19]) < lease['start_time']:
+            if identity.start_time < lease['start_time']:
                 continue
-        parents[pid] = int(fields[1])
-        if pid == own_pid:
+        if pid in checking_chain:
             continue
+        # Slot children keep their user; only an orphan can acquire a root parent (PID 1).
+        parent = identities.get(identity.parent)
+        if identity.parent != 1 and parent is not None and parent.real_uid != own_uid:
+            continue
+        parents[pid] = identity.parent
+        process = proc_root / str(pid)
         denied = False
         try:
             command = (process / 'cmdline').read_bytes().split(b'\0')
@@ -310,7 +371,7 @@ def select_slot_processes(mirror: Path, proc_root: Path = PROC_ROOT, *,
                 selected.add(pid)
         except (PermissionError, FileNotFoundError, ProcessLookupError):
             denied = True
-        if denied and pid not in selected:
+        if denied and pid not in selected and not isinstance(lease, UnmarkedSlot):
             # Confirm that missing evidence does not belong to an exited process.
             try:
                 if process_fields(pid, proc_root)[0] in ('Z', 'X'):
@@ -395,11 +456,10 @@ def slot_run(mirror: Path, *, require_boot_identity: bool = False) -> Generator[
 def mirror_selector_script(mirror: str, *, require_boot_identity: bool = False) -> str:
     """Select the runner and its children even outside the slot directory."""
     code = ("import sys; from pathlib import Path; "
-            + "sys.path.insert(0, str(Path.home()/'.claude/scripts/mac_test')); "
-            + "from linux_runner import print_slot_processes; "
+            + "from scripts.mac_test.linux_runner import print_slot_processes; "
             + f"sys.exit(print_slot_processes(Path(sys.argv[1]), require_boot_identity={require_boot_identity!r}))")
     return ('select_leftovers() {\n'
-            + f'    python3 -c {shlex.quote(code)} "$HOME"/{shlex.quote(mirror)}\n'
+            + f'    "$HOME/.claude/scripts/lib/py" -c {shlex.quote(code)} "$HOME"/{shlex.quote(mirror)}\n'
             + '}\n')
 
 
@@ -428,15 +488,24 @@ def nextest_words_with_skip(
 
 
 def command_script(mirror: str, values: dict[str, str], repository: str, verb: str,
-                   words: tuple[str, ...], call_id: str, tree_key: str) -> str:
-    arguments = ['python3', '.claude/scripts/mac_test/linux_runner.py', 'run',
+                   words: tuple[str, ...], call_id: str, tree_key: str, repo_identity: str,
+                   test_environment: tuple[tuple[str, str], ...] = (),
+                   clear_environment: str = '') -> str:
+    arguments = ['.claude/scripts/lib/py', '.claude/scripts/mac_test/linux_runner.py', 'run',
                  '--mirror', mirror, '--values', json.dumps(values), '--repository', repository,
-                 '--verb', verb, '--call-id', call_id, '--tree-key', tree_key, '--', *words]
+                 '--verb', verb, '--call-id', call_id, '--tree-key', tree_key]
+    if repo_identity:
+        arguments.extend(['--repo-identity', repo_identity])
+    for name, value in test_environment:
+        arguments.extend(['--env', name + '=' + value])
+    if clear_environment:
+        arguments.extend(['--clear-environment', clear_environment])
+    arguments.extend(['--', *words])
     return shlex.join(arguments)
 
 
 def probe_command_script(mirror: str, values: dict[str, str], repository: str) -> str:
-    return shlex.join(['python3', '.claude/scripts/mac_test/linux_runner.py', 'probe',
+    return shlex.join(['.claude/scripts/lib/py', '.claude/scripts/mac_test/linux_runner.py', 'probe',
                        '--mirror', mirror, '--values', json.dumps(values), '--repository', repository])
 
 
@@ -488,10 +557,7 @@ def permission_refused(values: dict[str, str]) -> bool:
         context = aws_execution_context(values)
         if isinstance(context, IndependentLinuxExecution):
             return False
-        if TYPE_CHECKING:
-            from ..aws_target import ledger
-        else:
-            from scripts.aws_target import ledger
+        from scripts.aws_target import ledger
         remote = aws_execution_evidence()
         permission = remote.execution_permission(context.directory, context.target, now=int(time.time()),
                                                  boot_id=boot_identity())
@@ -542,26 +608,52 @@ def probe_shell(mirror: Path, values: dict[str, str], repository: str) -> int:
                                   positive_setting(values, 'shell_timeout_s'))
             if permission_refused(values):
                 return 75
-            command = (f'source {shlex.quote(str(shell.exports))} || exit 75\n'
-                       + 'if [[ -n ${shellHook-} ]]; then eval "$shellHook" || exit 75; fi\n'
+            command = (shell_environment_script(shell)
                        + f'cd -- {shlex.quote(str(mirror))} || exit 75\n'
                        + probe_script(str(mirror.relative_to(Path.home())), shell_environment=True))
-            return subprocess.run(['bash', '-c', command], cwd=mirror, check=False).returncode
+            return subprocess.run(['bash', '-c', command], cwd=mirror, check=False,
+                                   pass_fds=copies.inherited_mirror_descriptors()).returncode
     except SlotStartupRefused:
         print(STARTUP_REFUSAL_RECORD, flush=True)
         return 75
 
 
 def run(mirror: Path, values: dict[str, str], repository: str, verb: str,
-        words: tuple[str, ...], call_id: str, tree_key: str) -> int:
+        words: tuple[str, ...], call_id: str, tree_key: str, repo_identity: str = '',
+        test_environment: tuple[tuple[str, str], ...] = (),
+        clear_environment: str = '') -> int:
     if permission_refused(values):
         return 75
     try:
         with interruptible_slot(mirror, values):
-            return execute_slot(mirror, values, repository, verb, words, call_id, tree_key)
+            return execute_slot(mirror, values, repository, verb, words, call_id, tree_key, repo_identity, test_environment, clear_environment)
     except SlotStartupRefused:
         print(STARTUP_REFUSAL_RECORD, flush=True)
         return 75
+
+
+def output_filesystem_paths(checkout: Path, environment: Mapping[str, str] | None = None) -> tuple[Path, ...]:
+    """Resolve the checkout and its Cargo output filesystems."""
+    outputs = read_cargo_output_roots(checkout, environment=environment)
+    if isinstance(outputs, CargoOutputUnavailable):
+        if not (checkout / "Cargo.toml").exists():
+            return (checkout,)
+        raise OSError(outputs.reason)
+    return (checkout, outputs.target_directory, outputs.build_directory)
+
+
+def output_free_bytes(checkout: Path, environment: Mapping[str, str] | None = None) -> int:
+    readings: list[int] = []
+    for path in output_filesystem_paths(checkout, environment):
+        while True:
+            try:
+                readings.append(shutil.disk_usage(path)[2])
+                break
+            except FileNotFoundError:
+                if path == path.parent:
+                    raise
+                path = path.parent
+    return min(readings)
 
 
 def trim_build_folder(target: Path, environment: dict[str, str]) -> int:
@@ -569,24 +661,82 @@ def trim_build_folder(target: Path, environment: dict[str, str]) -> int:
     code = '\n'.join((
         'import sys',
         'from pathlib import Path',
-        "sys.path.insert(0, str(Path.home() / '.claude/scripts/lint'))",
-        'import sweep',
-        'import conf',
-        'config = conf.path("lint")',
-        'recent_seconds = int(conf.read(config).number(sweep.RECENT_KEY) * 60)',
-        'sys.exit(sweep.sweep_workspace(sys.argv[1], str(config), False, recent_seconds / 60))',
+        'from scripts.lint import sweep',
+        'from scripts.lib import conf',
+        'config = conf.read(conf.path("lint"))',
+        'recent_seconds = int(config.number(sweep.RECENT_KEY) * 60)',
+        'import os',
+        'target = Path(sys.argv[1])',
+        'checkout = Path(os.environ["BUILDLOG_WORKSPACE"])',
+        'os.chdir(checkout)',
+        'selected = None if (checkout / "Cargo.toml").is_file() else str(target)',
+        'sys.exit(sweep.sweep_workspace(selected, config, False, recent_seconds / 60))',
     ))
-    return subprocess.run([sys.executable, '-c', code, str(target)],
+    return subprocess.run([str(Path.home() / '.claude/scripts/lib/py'), '-c', code, str(target)],
                           env={**os.environ, **environment}, check=False).returncode
 
 
+def version_mismatch(target: str, actual: Mapping[str, str], expected: Mapping[str, str], pin_file: str) -> str:
+    """Name each tool mismatch and the configured file that controls its version."""
+    differences = [f"{name} box={actual.get(name, 'unavailable')} natedev={expected[name]}"
+                   for name in ('rustc', 'nextest', 'mend')
+                   if expected.get(name) and actual.get(name) != expected[name]]
+    if not differences:
+        return ''
+    hint = f'; move the box pins in {pin_file}' if pin_file else ''
+    return f'{target} version mismatch: ' + '; '.join(differences) + hint
+
+
+def toolchain_install_script(expected_rustc: str, target: str = 'linux') -> str:
+    """Install the tree's toolchain under one lock for its channel."""
+    version = re.fullmatch(r'rustc (\d+\.\d+\.\d+)(?: .*)?', expected_rustc)
+    fallback = (f'export RUSTUP_TOOLCHAIN={shlex.quote(version[1])}' if version else ':')
+    name_code = '\n'.join((
+        'import hashlib, os, tomllib',
+        'from pathlib import Path',
+        'path = next((p for p in (Path("rust-toolchain"), Path("rust-toolchain.toml")) if p.is_file()), None)',
+        'if os.environ.get("RUSTUP_TOOLCHAIN"):',
+        '    print(os.environ["RUSTUP_TOOLCHAIN"])',
+        'elif path is None:',
+        '    print("")',
+        'else:',
+        '    text = path.read_text()',
+        '    try:',
+        '        toolchain = tomllib.loads(text)["toolchain"].get("channel") or hashlib.sha256(text.encode()).hexdigest()',
+        '    except tomllib.TOMLDecodeError:',
+        '        toolchain = text.strip()',
+        '    print(toolchain)',
+    ))
+    return '\n'.join((
+        'if [[ -z ${RUSTUP_TOOLCHAIN-} && ! -f rust-toolchain && ! -f rust-toolchain.toml ]]; then',
+        f'  {fallback}',
+        'fi',
+        f'toolchain=$(python3 -c {shlex.quote(name_code)}) || exit 75',
+        'if [[ -n "$toolchain" ]]; then',
+        '  mkdir -p -- "${RUSTUP_HOME:-$HOME/.rustup}" || exit 75',
+        '  (',
+        '    flock -x 9 || exit 75',
+        '    if install_output=$(rustup toolchain install --no-self-update --no-update 2>&1); then',
+        '      if [[ -n "$install_output" ]]; then printf \'%s\\n\' "$install_output"; fi',
+        '    else',
+        '      install_output=${install_output//$\'\\n\'/ }',
+        f'      printf \'%s version mismatch: toolchain install failed: %s\\n\' {shlex.quote(target)} "$install_output" >&2',
+        '      exit 75',
+        '    fi',
+        '  ) 9>"${RUSTUP_HOME:-$HOME/.rustup}/$toolchain.lock" || exit 75',
+        'fi',
+    ))
+
+
 def execute_slot(mirror: Path, values: dict[str, str], repository: str, verb: str,
-        words: tuple[str, ...], call_id: str, tree_key: str) -> int:
-    if verb not in ('nextest', 'check', 'doc'):
-        raise ValueError('Linux targets accept only test, check and doc')
+        words: tuple[str, ...], call_id: str, tree_key: str, repo_identity: str = '',
+        test_environment: tuple[tuple[str, str], ...] = (),
+        clear_environment: str = '') -> int:
+    if verb not in ('nextest', 'check', 'doc', 'clippy', 'mend-check', 'build'):
+        raise ValueError('unsupported remote verb')
     if verb == 'nextest':
         words = nextest_words_with_skip(words, values.get(f'skip.{repository}', ''), insert_filter=True)
-    kind = 'test' if verb == 'nextest' else verb
+    kind = values.get('step_kind') or ('test' if verb == 'nextest' else 'lint' if verb in ('clippy', 'mend-check') else verb)
     if kind not in {word.strip() for word in values['kinds'].split(',')}:
         raise ValueError(f'{kind}: target does not permit this command')
     selector = policy_setting(values, 'devshell', repository)
@@ -609,45 +759,76 @@ def execute_slot(mirror: Path, values: dict[str, str], repository: str, verb: st
     target = target.resolve()
     if target == mirror.resolve() or mirror.resolve() not in target.parents:
         raise ValueError('the Linux build folder must stay inside its slot')
+    # Finish the recorder write before the completion marker lets natedev pull the records.
     environment = {
-        'BUILDLOG_BUILD_BUDGET_GIB': f'{build_budget:g}',
         'LINT_SWEEP_BUDGET_GIB': f'{budget:g}',
         'BUILDLOG_CALLER': 'verify-linux', 'BUILDLOG_CALL_ID': call_id,
         'BUILDLOG_TARGET': values.get('selected_target', ''),
-        'BUILDLOG_SYNC': '0', 'LINT_SKIP_SWEEP': '1',
+        'BUILDLOG_PINNED_TARGET': values.get('pinned_target', ''),
+        'BUILDLOG_SYNC': '1', 'LINT_SKIP_SWEEP': '1',
         'CARGO_TARGET_DIR': str(target),
+        'BUILDLOG_WORKSPACE': str(mirror),
     }
+    if verb == 'nextest':
+        environment.update(test_environment)
     if tree_key:
         environment['BUILDLOG_SENT_TREE_KEY'] = tree_key
+    if repo_identity:
+        environment['BUILDLOG_REPO_IDENTITY'] = repo_identity
     if verb == 'doc':
         environment['LINT_CONFIG_FORCE'] = '1'
     assignments = ' '.join(f'{key}={shlex.quote(value)}' for key, value in environment.items())
-    parity: list[str] = []
+    parity: list[str] = ["mismatches=()"]
     for name, invocation in (('rustc', 'rustc -V'), ('nextest', 'cargo nextest --version'),
                              ('mend', 'cargo mend --version')):
-        expected = values.get(f'parity.{name}', '')
+        expected = normalize_tool_version(values.get(f'parity.{name}', ''))
         if expected:
-            parity.append(f'[ "$({invocation})" = {shlex.quote(expected)} ] || exit 75')
-    command = (f'source {shlex.quote(str(shell.exports))} || exit 75\n'
-               + 'if [[ -n ${shellHook-} ]]; then eval "$shellHook" || exit 75; fi\n'
-               + f'cd -- {shlex.quote(str(mirror))} || exit 75\n'
-               + '\n'.join(parity) + '\n'
-               + f'export {assignments}\n')
+            parity.extend([
+                f'actual=$({invocation} 2>/dev/null) || actual=unavailable',
+                f'actual=$(printf \'%s\' "$actual" | {tool_version_filter()}) || exit 75',
+                f'if [ "$actual" != {shlex.quote(expected)} ]; then',
+                f'  mismatches+=("{name} box=$actual natedev="{shlex.quote(expected)})',
+                'fi',
+            ])
+    target_name = values.get('selected_target', '')
+    hint = values.get('version_pin_file', '')
+    advice = '; move the box pins in ' + hint if hint else ''
+    parity.extend([
+        'if (( ${#mismatches[@]} )); then',
+        f'  printf \'%s version mismatch: %s\' {shlex.quote(target_name)} "${{mismatches[0]}}" >&2',
+        '  for mismatch in "${mismatches[@]:1}"; do printf \'; %s\' "$mismatch" >&2; done',
+        f'  printf \'%s\\n\' {shlex.quote(advice)} >&2',
+        '  exit 75',
+        'fi',
+    ])
     print(f'linux_runner: mirror={mirror} shell_key={shell.key}', flush=True)
     with build_folders.temporary_build_folder(build_folders.UniqueBuildFolder(
             build_folders.FOLDER_PREFIXES["linux-step"], build_folders.ExplicitBuildParent(mirror))) as step_directory:
         started = step_directory / 'started'
-        command += (f': > {shlex.quote(str(started))} || exit 75\n'
+        toolchain_environment = step_directory / 'toolchain'
+        _ = toolchain_environment.write_text('')
+        command = (shell_environment_script(shell)
+                    + f'cd -- {shlex.quote(str(mirror))} || exit 75\n'
+                    + toolchain_install_script(normalize_tool_version(values.get('parity.rustc', '')), target_name) + '\n'
+                    + f'printf \'%s\' "${{RUSTUP_TOOLCHAIN-}}" > {shlex.quote(str(toolchain_environment))} || exit 75\n'
+                    + '\n'.join(parity) + '\n'
+                    + (clear_environment + '\n' if verb == 'nextest' and clear_environment else '')
+                    + f'export {assignments}\n'
+                    + f': > {shlex.quote(str(started))} || exit 75\n'
                     + f'exec "$HOME/.claude/scripts/lint/lint" {shlex.join([verb, *words])}')
-        completed = subprocess.run(['bash', '-c', command], cwd=mirror, check=False)
+        completed = subprocess.run(['bash', '-c', command], cwd=mirror, check=False,
+                                   pass_fds=copies.inherited_mirror_descriptors())
         status = completed.returncode if completed.returncode >= 0 else 128 - completed.returncode
         step_started = started.exists()
+        toolchain = toolchain_environment.read_text()
+        if toolchain:
+            environment['RUSTUP_TOOLCHAIN'] = toolchain
     try:
-        free = shutil.disk_usage(mirror).free / (1024 ** 3)
+        free = output_free_bytes(mirror, {**os.environ, **environment}) / (1024 ** 3)
         if free < floor:
             if target.exists():
                 shutil.rmtree(target)
-            cleanup = '0'
+            cleanup = '0' if trim_build_folder(target, environment) == 0 else '1'
         else:
             trimmed = trim_build_folder(target, environment)
             cleanup = 'kept' if trimmed == 0 else '1'
@@ -669,6 +850,9 @@ class RunnerArguments(argparse.Namespace):
         self.verb: str = ''
         self.call_id: str = ''
         self.tree_key: str = ''
+        self.repo_identity: str = ''
+        self.environment: list[str] = []
+        self.clear_environment: str = ''
         self.words: list[str] = []
 
 
@@ -684,6 +868,9 @@ def main() -> int:
     _ = runner.add_argument('--verb', required=True)
     _ = runner.add_argument('--call-id', required=True)
     _ = runner.add_argument('--tree-key', default='')
+    _ = runner.add_argument('--repo-identity', default='')
+    _ = runner.add_argument('--clear-environment', default='')
+    _ = runner.add_argument('--env', dest='environment', action='append', default=[])
     _ = runner.add_argument('words', nargs=argparse.REMAINDER)
     arguments = parser.parse_args(namespace=RunnerArguments())
     values = cast(object, json.loads(arguments.values))
@@ -695,7 +882,10 @@ def main() -> int:
     return run(Path.home() / arguments.mirror, cast(dict[str, str], values),
                arguments.repository, arguments.verb,
                tuple(words[1:] if words[:1] == ['--'] else words),
-               arguments.call_id, arguments.tree_key)
+               arguments.call_id, arguments.tree_key, arguments.repo_identity,
+               tuple((name, value) for entry in arguments.environment
+                     for name, _, value in (entry.partition('='),)),
+               arguments.clear_environment)
 
 
 if __name__ == '__main__':

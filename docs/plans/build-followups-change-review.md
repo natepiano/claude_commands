@@ -2,7 +2,6 @@
 
 > **Status: IMPLEMENTATION PLAN — two checkpoints, build-report unit.** Every top-level showrunner keeps a change review list the user asks for on demand, generalized from Hana's.
 
-> **Production: build-followups** — unit `build-report`; production doc `docs/plans/build-followups-production.md`
 
 ## Request (user via showrunner, 2026-10-15 ~18:15 EDT)
 

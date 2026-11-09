@@ -5,16 +5,15 @@ from __future__ import annotations
 import json
 import sqlite3
 import subprocess
-import sys
 import tempfile
 import unittest
 from contextlib import closing
 from pathlib import Path
 from typing import cast, final, override
 
-import order_waste
-import style_ledger
-from order_waste import AnalysisOrder, FamilyRead, RuleFix
+from scripts.style import order_waste
+from scripts.style import style_ledger
+from scripts.style.order_waste import AnalysisOrder, FamilyRead, RuleFix
 
 ALPHA = """pub fn alpha_configuration_value() -> u32 {
     let selected_mode_number = 1;
@@ -85,7 +84,7 @@ class OrderWasteTests(unittest.TestCase):
         _ = self.connection.execute(
             "INSERT INTO tickets(id,unit,kind,family,rule,crate,files,sites,rules,rule_blobs,state,branch,checkpoint,"
             + "created_at,updated_at,base) VALUES (?,?,'read',?,'','.','[]','[]',?,'{}',?,'',?,?,?,?)",
-            (id, f"{family}-unit", family, json.dumps(rules), state, checkpoint, at(0), merged_at, base))
+            (id, family, family, json.dumps(rules), state, checkpoint, at(0), merged_at, base))
 
     def judgment(self, rule: str, path: str, verdict: str, ticket: str, recorded_at: str) -> int:
         cursor = self.connection.execute(
@@ -360,7 +359,7 @@ class OrderWasteTests(unittest.TestCase):
         ledger = self.root / "ledger.sqlite"
         with closing(sqlite3.connect(ledger)) as copy:
             self.connection.backup(copy)
-        command = [sys.executable, str(Path(__file__).with_name("order_waste.py")), "--ledger", str(ledger), "--repo", str(self.repo)]
+        command = [str(Path(__file__).resolve().parents[1] / "lib/py"), str(Path(__file__).with_name("order_waste.py")), "--ledger", str(ledger), "--repo", str(self.repo)]
         table = subprocess.run(command, check=True, capture_output=True, text=True).stdout
         self.assertIn(f"| {INVALID_STATES} | {IF_ELSE} | 0 | 1 | 1 | 1 | A first, position |", table)
         printed = cast(order_waste.Report, json.loads(subprocess.run([*command, "--json"], check=True, capture_output=True,

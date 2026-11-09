@@ -7,26 +7,22 @@ from decimal import Decimal
 import json
 from pathlib import Path
 import time
-from typing import TYPE_CHECKING, cast, override
+from typing import cast, override
 from unittest import mock
 import unittest
 
-import index
-import mac_outcome
-import report
-import record
-import store
-import sync
-from test_index import use_test_log
+from scripts.buildlog import index
+from scripts.buildlog import mac_outcome
+from scripts.buildlog import report
+from scripts.buildlog import record
+from scripts.buildlog import store
+from scripts.buildlog import sync
+from scripts.buildlog.test_index import use_test_log
 
 use_test_log()
 
-if TYPE_CHECKING:
-    from ..aws_target import ledger, measurement
-    from ..aws_target.measurement_test_support import DAY, MIDNIGHT, NOW, MeasurementFixture, narrow, read_only_evidence
-else:
-    from scripts.aws_target import ledger, measurement
-    from scripts.aws_target.measurement_test_support import DAY, MIDNIGHT, NOW, MeasurementFixture, narrow, read_only_evidence
+from scripts.aws_target import ledger, measurement
+from scripts.aws_target.measurement_test_support import DAY, MIDNIGHT, NOW, MeasurementFixture, narrow, read_only_evidence
 
 
 class AwsReportTests(MeasurementFixture):
@@ -61,6 +57,17 @@ class AwsReportTests(MeasurementFixture):
 
     def peer_line(self, output: str, target: str) -> str:
         return next(line for line in output.splitlines() if f"{target} (" in line)
+
+    def test_read_only_evidence_rejects_changes_outside_index_wal_sidecars(self) -> None:
+        _ = index.update()
+        database = index.index_path()
+        paths = (database, self.root / "evidence", Path(str(database) + index.INDEX_SIDECAR_SUFFIXES[0]),
+                 self.root / (database.name + index.INDEX_SIDECAR_SUFFIXES[1]))
+        for path in paths:
+            with self.subTest(path=path.relative_to(self.root)), self.assertRaises(AssertionError):
+                with read_only_evidence(self, self.root):
+                    with path.open("ab") as handle:
+                        _ = handle.write(b"x")
 
     def test_legacy_local_hosts_match_sql_and_python_classification(self) -> None:
         registry = self.root / "build_targets.conf"

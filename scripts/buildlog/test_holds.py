@@ -11,13 +11,13 @@ from pathlib import Path
 from typing import Literal, TypedDict, cast, override
 from unittest.mock import patch
 
-import holds
-import build_hold
-import mac_test
-from user_zone import user_zone
-import index
-import store
-from test_index import Record, point_root_at
+from scripts.buildlog import holds
+from scripts.build_hold import build_hold
+from scripts.mac_test import mac_test
+from scripts.lib.user_zone import user_zone
+from scripts.buildlog import index
+from scripts.buildlog import store
+from scripts.buildlog.test_index import Record, point_root_at
 import tempfile
 
 NOW = datetime(2026, 10, 12, 16, tzinfo=UTC)
@@ -136,6 +136,17 @@ class HoldsTests(unittest.TestCase):
         intervals = self.history().intervals
         self.assertEqual(len(intervals), 1)
         self.assertEqual(intervals[0].began, intervals[0].ended)
+
+    def test_fractional_hold_seconds_preserve_a_full_minute(self) -> None:
+        start = datetime(2026, 11, 5, tzinfo=UTC)
+        end = start + timedelta(seconds=80)
+        for number, (low, high) in enumerate(((0, 20.1), (30, 50.1), (60, 79.8))):
+            self.add(hold_event("began", str(number), (start + timedelta(seconds=low)).isoformat()),
+                     hold_event("ended", str(number), (start + timedelta(seconds=high)).isoformat()))
+        history = holds.read_hold_history(self.connection, holds.read_current_holds(), end)
+        duration = holds.hold_duration(history, "natedev", start.isoformat(), end.isoformat())
+        self.assertEqual(duration, holds.HoldDuration(60.0, False))
+        self.assertEqual(holds.duration_text(duration), "0:01")
 
     def test_a_missing_end_adds_no_time_until_its_key_is_in_the_coordination_record(self) -> None:
         since = datetime(2026, 10, 12, 12, tzinfo=UTC)

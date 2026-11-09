@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """Validate admission and stop idle or interrupted AWS work."""
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import argparse
 from collections.abc import Callable, Sequence
@@ -18,7 +22,6 @@ from typing import cast, final
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.aws_target import ledger
 from scripts.aws_target.config import read_control_settings, service_loop
 from scripts.lib import conf
@@ -240,7 +243,7 @@ class RemoteAgent:
         self.boot = boot
 
     def tick(self) -> str:
-        settings = read_control_settings(self.settings_path)
+        settings = read_control_settings(self.settings_path, remote_identity=True)
         if not settings.enabled:
             return 'off'
         now = int(self.clock())
@@ -318,7 +321,7 @@ def main() -> int:
         parser.error('--settings is required for tick or serve')
     if args.command == 'tick' and args.directory == Path():
         parser.error('--directory is required for tick')
-    directory = args.directory.expanduser() if args.directory != Path() else Path.home() / read_control_settings(args.settings).remote_state_directory
+    directory = args.directory.expanduser() if args.directory != Path() else Path.home() / read_control_settings(args.settings, remote_identity=True).remote_state_directory
     agent = RemoteAgent(args.settings, directory)
     if args.command == 'serve':
         service_loop(args.settings, 'interruption_poll_s', agent.tick)

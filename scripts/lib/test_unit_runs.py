@@ -5,23 +5,166 @@ import contextlib
 import io
 import json
 import os
-import sys
+import subprocess
 import tempfile
-import unittest
 from pathlib import Path
-from typing import TYPE_CHECKING
 from unittest.mock import patch
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.lib import unit_runs  # noqa: E402
-if TYPE_CHECKING:
-    from scripts.message import sessions
-else:
-    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "message"))
-    import sessions
+from scripts.lib.atomic_file import write_text_atomic
+from scripts.production import staff
+from scripts.production.staff_test_support import StaffTestCase, fixture_member, fixture_runtime_id, fixture_worker, showrunner_relationship
+from scripts.message import sessions
 
 
-class UnitRunsTest(unittest.TestCase):
+class UnitRunsTest(StaffTestCase):
+    def test_showrunner_run_resolves_both_session_and_fixed_owner_records(self) -> None:
+        owner = fixture_member("showrunner", name="production-owner")
+        run = self.root / "production-run"
+        run.mkdir()
+        record = staff.snapshot()
+        states = (
+            {"main_agent": {"session_id": owner.current_session}},
+            {unit_runs.OWNER_FIELD: owner.id},
+        )
+        for state in states:
+            with self.subTest(state=state):
+                self.write_json(run / unit_runs.STATE_FILE, state)
+                self.assertEqual(unit_runs.director(run, record=record), owner.current_session)
+
+    def test_anomaly_prints_once_across_both_import_names(self) -> None:
+        repository = Path(__file__).resolve().parents[2]
+        imports = ("from scripts.lib import unit_runs", "import scripts.lib.unit_runs as packaged")
+        for statements in (imports, tuple(reversed(imports))):
+            with self.subTest(names=statements):
+                command = ("; ".join(statements) + "; assert unit_runs is packaged; "
+                           + "[module.report_anomaly('anomaly: import test') for module in (unit_runs, packaged)]")
+                result = subprocess.run([str(repository / "scripts/lib/py"), "-c", command], cwd=self.root,
+                                        env={key: value for key, value in os.environ.items() if key != "PYTHONPATH"},
+                                        capture_output=True, text=True, check=False)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stderr.splitlines(), ["anomaly: import test"])
+
+    def test_director_prints_each_anomaly_once_but_keeps_changed_causes(self) -> None:
+        unit_runs.report_anomaly.cache_clear()
+        self.addCleanup(unit_runs.report_anomaly.cache_clear)
+        _ = fixture_member("showrunner", name="anomaly-fixture")
+        first, second = self.root / "first", self.root / "second"
+        for run in (first, second):
+            run.mkdir()
+            write_text_atomic(run / unit_runs.STATE_FILE, "{}")
+            write_text_atomic(run / "fixture-impl_status", "running\n")
+        record = staff.snapshot()
+        with contextlib.redirect_stderr(io.StringIO()) as errors:
+            for run in (first, second, first, second):
+                self.assertEqual(unit_runs.director(run, record=record), "")
+            write_text_atomic(first / unit_runs.STATE_FILE, json.dumps({unit_runs.OWNER_FIELD: "gone"}))
+            self.assertEqual(unit_runs.director(first, record=record), "")
+        self.assertEqual(errors.getvalue().splitlines(), [
+            f"anomaly: {first}: this run has no owner because {unit_runs.STATE_FILE} names no staff row",
+            f"anomaly: {second}: this run has no owner because {unit_runs.STATE_FILE} names no staff row",
+            f"anomaly: {first}: run owner gone: unit staff row is unavailable"])
+
+
+
+
+
+
+
+
+    def staff_owner(self, run: Path, session_id: str) -> None:
+        parent = showrunner_relationship("runs-fixture")
+        owner = fixture_member("unit", name="owner-" + session_id[:8], parent=parent.id, runtime_id=session_id)
+        _ = (run / unit_runs.STATE_FILE).write_text(json.dumps({"production": parent.name, "unit": owner.name, "owner_staff_id": owner.id}))
+
+    def test_owner_scans_are_quiet_for_ended_runs_and_runs_without_resumable_workers(self) -> None:
+        owner = fixture_member("showrunner", name="quiet-scan-fixture")
+        record = staff.StaffSnapshot((owner,))
+        session = fixture_runtime_id("quiet-runs")
+        for status in ("ended", "active"):
+            with self.subTest(status=status):
+                root = self.root / status
+                runs, active = root / "runs", root / "active"
+                run = runs / "run"
+                run.mkdir(parents=True)
+                active.mkdir()
+                write_text_atomic(run / unit_runs.STATE_FILE, json.dumps({"status": status}))
+                if status == "ended":
+                    write_text_atomic(run / "impl_status_fixture", "implementing\n")
+                else:
+                    phase = run / "phases/1"
+                    phase.mkdir(parents=True)
+                    write_text_atomic(phase / "fixture-impl_status", "idle\n")
+                write_text_atomic(active / session, str(run))
+                with contextlib.redirect_stderr(io.StringIO()) as errors:
+                    scanned = unit_runs.held_by_session(runs, record=record)
+                    self.assertNotIn(session, scanned)
+                    self.assertEqual(unit_runs.held(session, runs, active, scanned=scanned, record=record), [])
+                self.assertEqual(errors.getvalue(), "")
+
+    def test_director_without_progress_state_has_no_owner_or_output(self) -> None:
+        owner = fixture_member("showrunner", name="no-state-production")
+        run = self.root / "no-state-run"
+        run.mkdir()
+        with contextlib.redirect_stdout(io.StringIO()) as output, contextlib.redirect_stderr(io.StringIO()) as errors:
+            self.assertEqual(unit_runs.director(run, record=staff.StaffSnapshot((owner,))), "")
+        self.assertEqual(output.getvalue(), "")
+        self.assertEqual(errors.getvalue(), "")
+
+    def test_held_keeps_a_herdr_run_with_an_idle_worker(self) -> None:
+        session = fixture_runtime_id("idle-herdr-owner")
+        runs, active = self.root / "runs", self.root / "active"
+        run = runs / "herdr"
+        phase = run / "phases/1"
+        phase.mkdir(parents=True)
+        self.staff_owner(run, session)
+        _ = (phase / "fixture-impl_status").write_text("idle\n")
+        self.assertEqual(unit_runs.held(session, runs, active), [str(run)])
+
+    def test_director_reports_a_missing_owner_for_active_pane_workers(self) -> None:
+        for folder in ("", "phases/1"):
+            with self.subTest(folder=folder):
+                run = self.root / ("phase" if folder else "root")
+                directory = run / folder
+                directory.mkdir(parents=True)
+                write_text_atomic(run / unit_runs.STATE_FILE, '{"status":"active"}')
+                write_text_atomic(directory / "fixture-impl_status", "running\n")
+                with contextlib.redirect_stderr(io.StringIO()) as errors:
+                    self.assertEqual(unit_runs.director(run), "")
+                self.assertIn(f"anomaly: {run}:", errors.getvalue())
+
+    def test_director_uses_the_recorder_for_an_idle_worker_with_an_active_dispatch(self) -> None:
+        from scripts.direct import progress_history
+
+        owner = fixture_member("showrunner", name="dispatch-owner")
+        worker = fixture_worker("fixture-impl", owner.id)
+        run = self.root / "dispatch"
+        run.mkdir()
+        _ = (run / unit_runs.STATE_FILE).write_text('{"status":"active"}')
+        _ = (run / f"{worker.name}_status").write_text("idle\n")
+        with (patch.object(progress_history, "active_dispatch",
+                           return_value=progress_history.ActiveDispatch("instance", ("fixture",))) as read,
+              contextlib.redirect_stderr(io.StringIO()) as errors):
+            self.assertEqual(unit_runs.director(run), "")
+        read.assert_called_once_with(worker.id, run)
+        self.assertIn(f"anomaly: {run}:", errors.getvalue())
+
+    def test_director_reports_existing_invalid_or_unreadable_progress_state(self) -> None:
+        _ = fixture_member("showrunner", name="state-diagnostics")
+        for kind in ("invalid", "unreadable"):
+            with self.subTest(kind=kind):
+                run = self.root / kind
+                run.mkdir()
+                path = run / unit_runs.STATE_FILE
+                if kind == "invalid":
+                    _ = path.write_text("{")
+                else:
+                    path.mkdir()
+                with contextlib.redirect_stderr(io.StringIO()) as errors:
+                    _ = unit_runs.director(run)
+                self.assertIn("anomaly:", errors.getvalue())
+                self.assertIn(str(path), errors.getvalue())
+
     def test_both_roots_are_read_the_new_name_first(self) -> None:
         self.assertEqual(unit_runs.run_roots(), (Path("/tmp/claude/unit"), Path("/tmp/claude/delegate")))
         self.assertEqual(unit_runs.active_dirs(), (Path("/tmp/claude/unit/active"), Path("/tmp/claude/delegate/active")))
@@ -90,58 +233,6 @@ class UnitRunsTest(unittest.TestCase):
             self.assertIn("can go", shown.getvalue())
             self.assertTrue(marker.exists(), "removal-check only judges; it never unlinks")
 
-    def test_the_recorded_director_wins_over_the_session_that_started_the_run(self) -> None:
-        with tempfile.TemporaryDirectory() as folder:
-            run, history = Path(folder) / "run", Path(folder) / "history.jsonl"
-            run.mkdir()
-            self.assertEqual(unit_runs.director(run), "")
-            _ = history.write_text(json.dumps({"event_type": "run_started", "main_agent": {"session_id": "sid-start"}})
-                                   + "\n" + json.dumps({"event_type": "phase_started"}) + "\n")
-            # A pass opened inside a Codex worker rewrote the state's identity with its own thread.
-            _ = (run / unit_runs.STATE_FILE).write_text(json.dumps(
-                {"history_file": str(history), "main_agent": {"session_id": "thread-worker"}}))
-            self.assertEqual(unit_runs.director(run), "sid-start")
-            unit_runs.record_director(run, "sid-now")
-            self.assertEqual(unit_runs.director(run), "sid-now")
-            self.assertEqual(sorted(path.name for path in run.iterdir()), [unit_runs.DIRECTOR_FILE, unit_runs.STATE_FILE])
-
-    def test_a_history_that_does_not_open_with_the_start_names_no_director(self) -> None:
-        with tempfile.TemporaryDirectory() as folder:
-            run, history = Path(folder) / "run", Path(folder) / "history.jsonl"
-            run.mkdir()
-            _ = (run / unit_runs.STATE_FILE).write_text(json.dumps({"history_file": str(history)}))
-            self.assertEqual(unit_runs.director(run), "")
-            _ = history.write_text(json.dumps({"event_type": "phase_started", "main_agent": {"session_id": "sid"}}) + "\n")
-            self.assertEqual(unit_runs.director(run), "")
-            _ = (run / unit_runs.STATE_FILE).write_text("not json")
-            self.assertEqual(unit_runs.director(run), "")
-
-    def test_a_claude_worker_of_the_run_is_never_recorded_as_its_director(self) -> None:
-        with tempfile.TemporaryDirectory() as folder:
-            run = Path(folder)
-            unit_runs.record_director(run, "sid-director")
-            _ = (run / "impl_worker_impl.json").write_text(json.dumps(
-                {"slot": "impl", "family": "claude", "worker_id": "sid-claude-impl"}))
-            _ = (run / "impl_worker_fix.json").write_text(json.dumps(
-                {"slot": "fix", "family": "codex", "worker_id": "sid-codex-shaped"}))
-            _ = (run / "workers").write_text("sid-clau\tproj-test\n")
-            for worker in ("sid-claude-impl", "sid-claude-test"):
-                unit_runs.record_director(run, worker)
-                self.assertEqual(unit_runs.director(run), "sid-director")
-            unit_runs.record_director(run, "sid-codex-shaped")
-            self.assertEqual(unit_runs.director(run), "sid-codex-shaped")
-
-    def test_record_director_names_the_shell_session_and_skips_without_one(self) -> None:
-        with tempfile.TemporaryDirectory() as folder:
-            run = Path(folder)
-            with patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": ""}):
-                self.assertEqual(unit_runs.main(["record-director", str(run)]), 0)
-            self.assertFalse((run / unit_runs.DIRECTOR_FILE).exists())
-            with patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "sid-shell"}):
-                self.assertEqual(unit_runs.main(["record-director", str(run)]), 0)
-                self.assertEqual(unit_runs.main(["record-director", str(run / "missing")]), 0)
-            self.assertEqual((run / unit_runs.DIRECTOR_FILE).read_text(encoding="utf-8"), "sid-shell\n")
-            self.assertFalse((run / "missing").exists())
 
     def test_held_lists_the_marker_run_then_every_run_the_session_directs(self) -> None:
         with tempfile.TemporaryDirectory() as folder:
@@ -149,22 +240,63 @@ class UnitRunsTest(unittest.TestCase):
             for run in (new / "run-marked", new / "run-side", new / "run-other", old / "run-former"):
                 run.mkdir(parents=True)
             active.mkdir()
-            _ = (active / "sid-me").write_text(f"{new / 'run-marked'}\n")
-            # The marker's run also records its director; it is listed once, first.
-            unit_runs.record_director(new / "run-marked", "sid-me")
-            unit_runs.record_director(new / "run-side", "sid-me")
-            unit_runs.record_director(new / "run-other", "sid-other")
-            unit_runs.record_director(old / "run-former", "sid-me")
+            _ = (active / fixture_runtime_id("sid-me")).write_text(f"{new / 'run-marked'}\n")
+            # Staff identifies the owner. The marker places the run first.
+            self.staff_owner(new / "run-marked", fixture_runtime_id("sid-me"))
+            self.staff_owner(new / "run-side", fixture_runtime_id("sid-me"))
+            self.staff_owner(new / "run-other", fixture_runtime_id("sid-other"))
+            self.staff_owner(old / "run-former", fixture_runtime_id("sid-me"))
             with patch.object(unit_runs, "RUN_ROOT", new), patch.object(unit_runs, "FORMER_RUN_ROOT", old):
-                self.assertEqual(unit_runs.held("sid-me", active_override=active), [
+                self.assertEqual(unit_runs.held(fixture_runtime_id("sid-me"), active_override=active), [
                     str(new / "run-marked"), str(new / "run-side"), str(old / "run-former")])
-                self.assertEqual(unit_runs.held("sid-other", active_override=active), [str(new / "run-other")])
-                self.assertEqual(unit_runs.held("sid-none", active_override=active), [])
+                self.assertEqual(unit_runs.held(fixture_runtime_id("sid-other"), active_override=active), [str(new / "run-other")])
+                self.assertEqual(unit_runs.held(fixture_runtime_id("sid-none"), active_override=active), [])
                 self.assertEqual(unit_runs.held("", active_override=active), [])
-            self.assertEqual(unit_runs.held("sid-me", new, active), [str(new / "run-marked"), str(new / "run-side")])
+            self.assertEqual(unit_runs.held(fixture_runtime_id("sid-me"), new, active), [str(new / "run-marked"), str(new / "run-side")])
             with contextlib.redirect_stdout(io.StringIO()) as shown:
-                self.assertEqual(unit_runs.main(["held", "sid-me", "--root", str(new), "--active", str(active)]), 0)
+                self.assertEqual(unit_runs.main(["held", fixture_runtime_id("sid-me"), "--root", str(new), "--active", str(active)]), 0)
             self.assertEqual(shown.getvalue().splitlines(), [str(new / "run-marked"), str(new / "run-side")])
+
+    def test_held_uses_the_override_roots_active_marker(self) -> None:
+        root = self.root / "override"
+        active = root / "active"
+        active.mkdir(parents=True)
+        session = fixture_runtime_id("director")
+        for name in ("a-side", "z-marked"):
+            run = root / name
+            run.mkdir()
+            self.staff_owner(run, session)
+        with (active / session).open("w") as stream:
+            stream.writelines([str(root / "z-marked") + "\n"])
+        self.assertEqual(unit_runs.held(session, root), [str(root / "z-marked"), str(root / "a-side")])
+
+    def test_held_scan_excludes_marker_folders_from_both_default_roots(self) -> None:
+        current, former = self.root / "unit", self.root / "delegate"
+        session = fixture_runtime_id("director")
+        for root in (current, former):
+            (root / "active").mkdir(parents=True)
+            for name in ("z-run", "a-run"):
+                run = root / name
+                run.mkdir()
+                self.staff_owner(run, session)
+        (former / "duplicate").symlink_to(current / "a-run", target_is_directory=True)
+        before = [list((root / "active").iterdir()) for root in (current, former)]
+        with patch.object(unit_runs, "RUN_ROOT", current), patch.object(unit_runs, "FORMER_RUN_ROOT", former):
+            found = unit_runs.held_by_session()
+        self.assertEqual(found, {session: [str(current / "a-run"), str(current / "z-run"),
+                                          str(former / "a-run"), str(former / "z-run")]})
+        self.assertEqual([list((root / "active").iterdir()) for root in (current, former)], before)
+
+    def test_held_scan_excludes_the_override_roots_marker_folder(self) -> None:
+        root = self.root / "override"
+        (root / "active").mkdir(parents=True)
+        run = root / "run"
+        run.mkdir()
+        session = fixture_runtime_id("director")
+        self.staff_owner(run, session)
+        before = list((root / "active").iterdir())
+        self.assertEqual(unit_runs.held_by_session(root), {session: [str(run)]})
+        self.assertEqual(list((root / "active").iterdir()), before)
 
     def test_shared_scan_keeps_a_late_marker_first_without_rereading_directors(self) -> None:
         with tempfile.TemporaryDirectory() as folder:
@@ -173,16 +305,28 @@ class UnitRunsTest(unittest.TestCase):
             for name in ("a-run", "z-run", "other-run"):
                 run = root / name
                 run.mkdir(parents=True)
-                unit_runs.record_director(run, "other" if name == "other-run" else "director")
-            _ = (active / "director").write_text(str(root / "z-run") + "\n")
-            _ = (active / "other").write_text(str(root / "other-run") + "\n")
+                self.staff_owner(run, fixture_runtime_id("other") if name == "other-run" else fixture_runtime_id("director"))
+            _ = (active / fixture_runtime_id("director")).write_text(str(root / "z-run") + "\n")
+            _ = (active / fixture_runtime_id("other")).write_text(str(root / "other-run") + "\n")
             with patch.object(unit_runs, "director", wraps=unit_runs.director) as read:
                 scanned = unit_runs.held_by_session(root)
-                self.assertEqual(unit_runs.held("director", root, active, scanned=scanned),
+                self.assertEqual(unit_runs.held(fixture_runtime_id("director"), root, active, scanned=scanned),
                                  [str(root / "z-run"), str(root / "a-run")])
-                self.assertEqual(unit_runs.held("other", root, active, scanned=scanned), [str(root / "other-run")])
+                self.assertEqual(unit_runs.held(fixture_runtime_id("other"), root, active, scanned=scanned), [str(root / "other-run")])
                 self.assertEqual(read.call_count, 3)
                 self.assertEqual({call.args[0] for call in read.call_args_list}, set(root.iterdir()))
+
+    def test_shared_scan_omits_folders_without_run_state(self) -> None:
+        root = self.root / "runs"
+        run = root / "recorded"
+        run.mkdir(parents=True)
+        self.staff_owner(run, fixture_runtime_id("director"))
+        (root / "active").mkdir()
+        (root / "solo").mkdir()
+        with contextlib.redirect_stderr(io.StringIO()) as errors:
+            scanned = unit_runs.held_by_session(root)
+        self.assertEqual(scanned, {fixture_runtime_id("director"): [str(run)]})
+        self.assertEqual(errors.getvalue(), "")
 
     def test_marker_outside_the_scan_is_verified_and_keeps_its_spelling(self) -> None:
         with tempfile.TemporaryDirectory() as folder:
@@ -190,14 +334,14 @@ class UnitRunsTest(unittest.TestCase):
             (root / "a-run").mkdir(parents=True)
             outside.mkdir()
             active.mkdir()
-            unit_runs.record_director(root / "a-run", "director")
-            unit_runs.record_director(outside, "director")
+            self.staff_owner(root / "a-run", fixture_runtime_id("director"))
+            self.staff_owner(outside, fixture_runtime_id("director"))
             target = str(outside) + "/."
-            _ = (active / "director").write_text(target + "\n")
+            _ = (active / fixture_runtime_id("director")).write_text(target + "\n")
             scanned = unit_runs.held_by_session(root)
-            self.assertEqual(unit_runs.held("director", root, active, scanned=scanned),
+            self.assertEqual(unit_runs.held(fixture_runtime_id("director"), root, active, scanned=scanned),
                              [target, str(root / "a-run")])
-            self.assertEqual(unit_runs.held("director", root, active), [target, str(root / "a-run")])
+            self.assertEqual(unit_runs.held(fixture_runtime_id("director"), root, active), [target, str(root / "a-run")])
 
     def test_a_stale_marker_does_not_assign_another_directors_run(self) -> None:
         with tempfile.TemporaryDirectory() as folder:
@@ -205,12 +349,12 @@ class UnitRunsTest(unittest.TestCase):
             run = root / "run"
             run.mkdir(parents=True)
             active.mkdir()
-            unit_runs.record_director(run, "replacement")
-            _ = (active / "original").write_text(str(run) + "\n")
+            self.staff_owner(run, fixture_runtime_id("replacement"))
+            _ = (active / fixture_runtime_id("original")).write_text(str(run) + "\n")
             scanned = unit_runs.held_by_session(root)
-            self.assertEqual(unit_runs.held("original", root, active, scanned=scanned), [])
-            self.assertEqual(unit_runs.held("original", root, active), [])
-            self.assertEqual(unit_runs.held("replacement", root, active, scanned=scanned), [str(run)])
+            self.assertEqual(unit_runs.held(fixture_runtime_id("original"), root, active, scanned=scanned), [])
+            self.assertEqual(unit_runs.held(fixture_runtime_id("original"), root, active), [])
+            self.assertEqual(unit_runs.held(fixture_runtime_id("replacement"), root, active, scanned=scanned), [str(run)])
 
     def test_a_foreign_outside_marker_does_not_change_another_directors_shared_list(self) -> None:
         with tempfile.TemporaryDirectory() as folder:
@@ -218,22 +362,22 @@ class UnitRunsTest(unittest.TestCase):
             root.mkdir()
             active.mkdir()
             outside.mkdir()
-            unit_runs.record_director(outside, "director-b")
-            _ = (active / "director-a").write_text(str(outside) + "\n")
+            self.staff_owner(outside, fixture_runtime_id("director-b"))
+            _ = (active / fixture_runtime_id("director-a")).write_text(str(outside) + "\n")
             scanned = unit_runs.held_by_session(root)
-            self.assertEqual(unit_runs.held("director-a", root, active, scanned=scanned), [])
-            self.assertEqual(unit_runs.held("director-a", root, active), [])
-            independent = unit_runs.held("director-b", root, active)
+            self.assertEqual(unit_runs.held(fixture_runtime_id("director-a"), root, active, scanned=scanned), [])
+            self.assertEqual(unit_runs.held(fixture_runtime_id("director-a"), root, active), [])
+            independent = unit_runs.held(fixture_runtime_id("director-b"), root, active)
             self.assertEqual(independent, [])
-            self.assertEqual(unit_runs.held("director-b", root, active, scanned=scanned), independent)
+            self.assertEqual(unit_runs.held(fixture_runtime_id("director-b"), root, active, scanned=scanned), independent)
 
     def test_held_without_a_marker_lists_only_the_directed_runs(self) -> None:
         with tempfile.TemporaryDirectory() as folder:
             runs, active = Path(folder) / "runs", Path(folder) / "active"
             (runs / "run-side").mkdir(parents=True)
-            unit_runs.record_director(runs / "run-side", "sid-me")
-            self.assertEqual(unit_runs.held("sid-me", runs, active), [str(runs / "run-side")])
-            self.assertEqual(unit_runs.held("sid-me", Path(folder) / "missing", active), [])
+            self.staff_owner(runs / "run-side", fixture_runtime_id("sid-me"))
+            self.assertEqual(unit_runs.held(fixture_runtime_id("sid-me"), runs, active), [str(runs / "run-side")])
+            self.assertEqual(unit_runs.held(fixture_runtime_id("sid-me"), Path(folder) / "missing", active), [])
 
     def test_the_removal_check_refuses_while_a_running_session_owns_a_former_marker(self) -> None:
         with tempfile.TemporaryDirectory() as folder:
@@ -244,8 +388,8 @@ class UnitRunsTest(unittest.TestCase):
             with patch.object(unit_runs, "FORMER_RUN_ROOT", former), \
                     contextlib.redirect_stdout(io.StringIO()) as shown, \
                     patch.object(sessions, "session_liveness", return_value=sessions.SessionNotLive()):
-                self.assertEqual(unit_runs.removal_check({"sid-open": "two-accounts", "sid-other": "elsewhere"}), 1)
-                self.assertEqual(unit_runs.removal_check({"sid-other": "elsewhere"}), 0)
+                self.assertEqual(unit_runs.removal_check({"sid-open": "two-accounts", fixture_runtime_id("sid-other"): "elsewhere"}), 1)
+                self.assertEqual(unit_runs.removal_check({fixture_runtime_id("sid-other"): "elsewhere"}), 0)
             self.assertIn(f"two-accounts (sid-open): {former / 'run-open'}", shown.getvalue())
             self.assertNotIn("sid-ended", shown.getvalue())
             self.assertIn("the former name can go", shown.getvalue())
@@ -298,4 +442,6 @@ class UnitRunsTest(unittest.TestCase):
             self.assertIn("nothing to move", shown.getvalue())
 
 if __name__ == "__main__":
+    import unittest
+
     _ = unittest.main()

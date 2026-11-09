@@ -8,11 +8,11 @@ from datetime import datetime, timedelta, timezone
 from typing import final, override
 from urllib.parse import urlsplit
 
-import pins
-import upgrade_check
-import upgrade_record
-import upgrade_report
-import upstream
+from scripts.bevy_upgrade import pins
+from scripts.bevy_upgrade import upgrade_check
+from scripts.bevy_upgrade import upgrade_record
+from scripts.bevy_upgrade import upgrade_report
+from scripts.bevy_upgrade import upstream
 
 API = "https://crates.io/api/v1/crates"
 NOW = datetime(2026, 10, 12, 19, 8, 41, tzinfo=timezone.utc)
@@ -76,7 +76,7 @@ class CheckTests(unittest.TestCase):
     def __init__(self, methodName: str = "runTest") -> None:
         super().__init__(methodName)
         self.current: upgrade_record.Record = {
-            "slug": "demo", "production": "", "checkout": "", "target": "0.20",
+            "staff_id": "fixture-owner", "production": "", "checkout": "", "target": "0.20",
             "started": OLD.isoformat(), "closed": None, "bevy": ["0.19.1"],
             "pins_read": OLD.isoformat(), "dependencies": {}, "target_bevy": {"status": "unread"},
             "target_error": "", "checked": None, "announced": None,

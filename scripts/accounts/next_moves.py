@@ -19,7 +19,7 @@ from uuid import uuid4
 
 from scripts.accounts import role_map
 from scripts.lib import conf
-from scripts.issue_score.selection import UseConfiguredValue
+from scripts.lib.conf import UseConfiguredValue
 
 
 class NextMoveError(ValueError):
@@ -184,15 +184,18 @@ class ClaudeGroupMove:
     hold_mode: HoldMode
     to: str
     added_at: datetime
+    fallback_targets: tuple[str, ...]
 
     def __init__(self, id: str, group: Literal["units", "showrunners"], at_percent: float,
-                 hold_mode: HoldMode | float, to: str, added_at: datetime) -> None:
+                 hold_mode: HoldMode | float, to: str, added_at: datetime,
+                 fallback_targets: tuple[str, ...] = ()) -> None:
         object.__setattr__(self, "id", id)
         object.__setattr__(self, "group", group)
         object.__setattr__(self, "at_percent", at_percent)
         object.__setattr__(self, "hold_mode", hold_mode if isinstance(hold_mode, (FixedHold, HalfPointHold)) else FixedHold(hold_mode))
         object.__setattr__(self, "to", to)
         object.__setattr__(self, "added_at", added_at)
+        object.__setattr__(self, "fallback_targets", fallback_targets)
         self.__post_init__()
 
     @property
@@ -205,7 +208,7 @@ class ClaudeGroupMove:
         if not self.id or self.group not in ("units", "showrunners"):
             raise NextMoveError("next: expected an id and units or showrunners")
         _check_move_input(self.at_percent, self.added_at)
-        if not re.fullmatch(r"claude[1-9][0-9]*", self.to):
+        if any(not re.fullmatch(r"claude[1-9][0-9]*", target) for target in (self.to, *self.fallback_targets)):
             raise NextMoveError("next: target must be a numbered Claude account")
 
 
@@ -275,6 +278,7 @@ def next_moves_file() -> Path:
 def encode_next_moves(entries: tuple[NextMove, ...]) -> str:
     return json.dumps([dict(id=entry.id, group=entry.group, at_percent=entry.at_percent,
                             **(encode_hold_mode(entry.hold_mode) if isinstance(entry, ClaudeGroupMove) else {}),
+                            **({"else": entry.fallback_targets} if isinstance(entry, ClaudeGroupMove) and entry.fallback_targets else {}),
                             to=target_label(entry), added_at=entry.added_at.isoformat()) for entry in entries])
 
 
@@ -304,8 +308,14 @@ def decode_next_moves(text: str) -> tuple[NextMove, ...]:
                     or not isinstance(percent, (int, float)) or isinstance(percent, bool)
                     or not isinstance(hold, (int, float)) or isinstance(hold, bool)):
                 raise NextMoveError("next: invalid entry fields")
+            fallbacks = fields.get("else", [])
+            if not isinstance(fallbacks, list) or any(not isinstance(label, str) for label in cast(list[object], fallbacks)):
+                raise NextMoveError("next: else must be a list of Claude accounts")
+            fallback_targets = tuple(cast(list[str], fallbacks))
             entry: NextMove
             if group == "workers":
+                if fallback_targets:
+                    raise NextMoveError("next: workers entries cannot use --else")
                 if hold != 0 or mode != "fixed":
                     raise NextMoveError("next: workers entries cannot hold minutes")
                 destination = (WorkersToClaude() if target == "claude" else
@@ -315,7 +325,7 @@ def decode_next_moves(text: str) -> tuple[NextMove, ...]:
             else:
                 entry = ClaudeGroupMove(name, group, float(percent),
                                         HalfPointHold() if mode == "half-point" else FixedHold(float(hold)),
-                                        target, datetime.fromisoformat(added))
+                                        target, datetime.fromisoformat(added), fallback_targets)
             if entry.id in ids:
                 raise NextMoveError("next: duplicate entry id")
             ids.add(entry.id)
@@ -390,11 +400,12 @@ def insert_next_move(entry: NextMove, insertion: AppendToGroup | InsertAt = APPE
 
 
 def add_next_move(group: NextMoveGroup, at_percent: float, to: str,
-                  hold_minutes: float | HoldMode = 0, *, insertion: AppendToGroup | InsertAt = APPEND_TO_GROUP) -> NextMove:
+                  hold_minutes: float | HoldMode = 0, *, fallback_targets: tuple[str, ...] = (),
+                  insertion: AppendToGroup | InsertAt = APPEND_TO_GROUP) -> NextMove:
     # All text-to-domain conversions use the same boundary as file and remote reads.
     entry = decode_next_moves(json.dumps([dict(id=uuid4().hex, group=group, at_percent=at_percent,
         **encode_hold_mode(hold_minutes if isinstance(hold_minutes, (FixedHold, HalfPointHold)) else FixedHold(hold_minutes)),
-        to=to, added_at=datetime.now(timezone.utc).isoformat())]))[0]
+        to=to, **{"else": fallback_targets}, added_at=datetime.now(timezone.utc).isoformat())]))[0]
     if not role_map.is_role_map_host():
         try:
             arguments = ("next-write", encode_next_moves((entry,)))
@@ -495,7 +506,8 @@ def _render_next_move(entry: NextMove, position: GroupPosition,
             estimate = (f"{duration.minutes:g} min default: no pace history" if isinstance(duration.source, NoUsablePace)
                         else f"≈{duration.minutes:g} min")
             hold = f", hold half a point ({estimate})"
-    return f"{entry.group} {position.value}: at {format_next_move_percent(entry.at_percent)}% → {target_label(entry)}{hold}"
+    fallback = "".join(f", else {target}" for target in entry.fallback_targets) if isinstance(entry, ClaudeGroupMove) else ""
+    return f"{entry.group} {position.value}: at {format_next_move_percent(entry.at_percent)}% → {target_label(entry)}{fallback}{hold}"
 
 
 def render_next_moves(entries: tuple[NextMove, ...]) -> str:

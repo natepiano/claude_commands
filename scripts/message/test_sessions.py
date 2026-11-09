@@ -15,13 +15,12 @@ from collections.abc import Iterator
 from typing import cast, override
 from unittest import mock
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "shutdown"))
 from scripts.lib.socket_test_support import short_socket_directory
-from test_support import ShutdownTestCase
-import sessions
-import process_identity
-from relay_identity import SavedRelaySender, read_relay_sender, relay_session_name
-from relay_test_support import write_relay_record
+from scripts.shutdown.test_support import ShutdownTestCase
+from scripts.message import sessions
+from scripts.message import process_identity
+from scripts.message.relay_identity import SavedRelaySender, read_relay_sender, relay_session_name
+from scripts.message.relay_test_support import write_relay_record
 
 
 SCRIPT = Path(__file__).with_name("sessions.py")
@@ -89,16 +88,13 @@ class SessionLookupTests(ShutdownTestCase):
         self.assertEqual(observed.pids, (os.getpid(), os.getpid()))
         self.assertEqual(absent, sessions.SessionProcesses(()))
 
-    def test_session_process_count_cannot_prove_uniqueness_with_unreadable_evidence(self) -> None:
+    def test_unreadable_record_does_not_change_a_session_answer(self) -> None:
         self.record("live.json", session_id="attached")
         _ = (self.sessions / "broken.json").write_text("{broken")
         with mock.patch.dict(os.environ, {"NOTIFIER_SESSIONS_DIR": str(self.sessions)}):
-            observed = sessions.session_processes("attached")
-            legacy = sessions.session_liveness("attached")
-        self.assertIsInstance(observed, sessions.SessionLivenessUnknown)
-        assert isinstance(observed, sessions.SessionLivenessUnknown)
-        self.assertIn("broken.json", observed.reason)
-        self.assertEqual(legacy, sessions.LiveSessionProcess(os.getpid()))
+            self.assertEqual(sessions.session_processes("attached"), sessions.SessionProcesses((os.getpid(),)))
+            self.assertEqual(sessions.session_liveness("attached"), sessions.LiveSessionProcess(os.getpid()))
+            self.assertEqual(sessions.session_liveness("absent"), sessions.SessionNotLive())
 
     def test_remote_control_reads_present_missing_empty_and_unreadable_fields(self) -> None:
         self.record(f"{os.getpid()}.json")
@@ -216,14 +212,14 @@ class SessionLookupTests(ShutdownTestCase):
         self.assertEqual(self.run_cli("socket", "same").stdout.strip(), str(other_path))
         self.assertEqual(self.run_cli("socket", "session:same-id").stdout.strip(), str(other_path))
 
-    def test_a_unit_id_and_its_bare_name_find_the_same_session(self) -> None:
+    def test_staff_names_match_exactly_without_suffix_aliases(self) -> None:
         def record(name: str, session_id: str) -> sessions.SessionRecord:
             return sessions.SessionRecord(pid=1, sessionId=session_id, name=name, messagingSocketPath="", updatedAt=1,
                                           tmux="", formerNames=[])
         records = [record("handler", "bare"), record("modules-unit", "suffixed"), record("modules", "exact")]
-        found = [sessions.named(name, records) for name in ("handler-unit", "handler", "modules-unit", "modules", "gone")]
+        found = [sessions.named(name, records) for name in ("handler", "handler-unit", "modules-unit", "modules", "gone")]
         self.assertEqual([None if item is None else item["sessionId"] for item in found],
-                         ["bare", "bare", "suffixed", "exact", None])
+                         ["bare", None, "suffixed", "exact", None])
 
     def test_dead_pid_and_missing_socket_return_absent(self) -> None:
         self.record("dead.json", pid=2**29 + os.getpid())
@@ -465,12 +461,13 @@ class SessionLookupTests(ShutdownTestCase):
                 self.assertNotIsInstance(result, sessions.UnreadableSessionRecord)
                 self.assertEqual(read.call_count, 2)
 
-    def test_persistently_unreadable_registry_read_has_one_reread(self) -> None:
+    def test_persistently_unreadable_registry_read_uses_the_configured_rereads(self) -> None:
+        policy = sessions.retry_policy()
         with mock.patch.object(Path, "read_text", side_effect=PermissionError("denied")) as read, \
              mock.patch.object(time, "sleep") as sleep:
             self.assertEqual(sessions.read_session(self.sessions / "bad.json"), sessions.UnreadableSessionRecord.FOUND)
-        self.assertEqual(read.call_count, 2)
-        self.assertEqual(sleep.call_args_list, [mock.call(0.05)])
+        self.assertEqual(read.call_count, policy.registry_reads)
+        self.assertEqual(sleep.call_args_list, [mock.call(policy.registry_delay_seconds)] * (policy.registry_reads - 1))
 
     def test_unreadable_dead_pid_is_dropped_but_live_pid_stays_unknown(self) -> None:
         path = self.sessions / "4242.json"
@@ -479,9 +476,7 @@ class SessionLookupTests(ShutdownTestCase):
             for error, expected in ((ProcessLookupError(), ()), (PermissionError(), (path,)), (None, (path,))):
                 with self.subTest(error=error), mock.patch.object(os, "kill", side_effect=error):
                     self.assertEqual(sessions.read_registry().unreadable, expected)
-                    self.assertEqual(sessions.session_liveness("stopped"),
-                        sessions.SessionNotLive() if not expected else
-                        sessions.SessionLivenessUnknown("unreadable session registry record: 4242.json"))
+                    self.assertEqual(sessions.session_liveness("stopped"), sessions.SessionNotLive())
 
     def test_record_removed_between_unreadable_read_and_reread_is_dropped(self) -> None:
         path = self.sessions / "4242.json"

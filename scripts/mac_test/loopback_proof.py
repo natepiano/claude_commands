@@ -2,6 +2,10 @@
 """Prove Linux execution over Tailscale SSH in a managed scratch home."""
 
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import json
 import os
@@ -10,18 +14,12 @@ import shlex
 import subprocess
 import sys
 import tempfile
-from typing import TYPE_CHECKING
 import uuid
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'lib'))
-import linux_runner
-import conf
+from scripts.mac_test import linux_runner
+from scripts.lib import conf
 
-if TYPE_CHECKING:
-    from ..lint import memory_admit
-else:
-    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'lint'))
-    import memory_admit
+from scripts.build_queue import admission_records
 
 
 REMOTE_PROOF = r"""
@@ -33,10 +31,10 @@ import sys
 
 home = Path(sys.argv[1])
 values = json.loads(sys.argv[2])
-sys.path.insert(0, str(home / '.claude/scripts/mac_test'))
-sys.path.insert(0, str(home / '.claude/scripts/lint'))
-import linux_runner
-from memory_test_support import fake_memory_readings, gate_isolation_environment
+with open(home / '.claude/scripts/lib/package_root.py') as package_root:
+    exec(package_root.read(), {'__file__': package_root.name})
+from scripts.mac_test import linux_runner
+from scripts.lint.memory_test_support import fake_memory_readings, gate_isolation_environment
 
 fixture = home / 'fixture'
 fixture.mkdir()
@@ -95,15 +93,18 @@ def main() -> int:
     registry = Path(os.environ.get('BUILD_TARGETS_CONFIG', str(root / 'config/build_targets.conf'))).expanduser()
     config = conf.read(registry)
     values = config.values()
-    memory = int(linux_runner.positive_setting(values, 'loopback.memory_gib') * memory_admit.GIB)
-    budget = int(linux_runner.positive_setting(values, 'loopback.build_budget_gib') * memory_admit.GIB)
+    memory = int(linux_runner.positive_setting(values, 'loopback.memory_gib') * admission_records.GIB)
     # The isolated fixture has no history for nextest, check or doc.
-    need = memory_admit.FALLBACK
-    required_free = need + memory_admit.resolve_admission_limits(memory).reserve
-    if memory < required_free or budget < need:
+    try:
+        configuration = admission_records.read_memory_config()
+        need = configuration.program_first_peaks["cargo"]
+        required_free = need + configuration.policy.safety_bytes
+    except conf.Unusable as error:
+        print(str(error), file=sys.stderr)
+        return 2
+    if memory < required_free:
         print(f'loopback: cannot admit the fixture; loopback.memory_gib must provide '
-              + f'{required_free / memory_admit.GIB:g} GiB including the gate reserve; '
-              + f'loopback.build_budget_gib must be at least {need / memory_admit.GIB:g} GiB', file=sys.stderr)
+              + f'{required_free / admission_records.GIB:g} GiB including the safety reserve', file=sys.stderr)
         return 2
     host = values['loopback.host']
     connect = config.number('loopback.connect_timeout_s')
@@ -120,9 +121,10 @@ def main() -> int:
     ssh.append(host)
     task = 'gate:linux-loopback-' + uuid.uuid4().hex
     bootstrap = (
-        'import sys; from pathlib import Path; '
-        'sys.path.insert(0,str(Path.home()/".claude/scripts/lib")); '
-        'import scratch; print(scratch.new(task=sys.argv[1],word="linux-home"))'
+        'import sys; from pathlib import Path\n'
+        'with open(Path.home()/".claude/scripts/lib/package_root.py") as package_root:\n'
+        '    exec(package_root.read(), {"__file__": package_root.name})\n'
+        'from scripts.lib import scratch; print(scratch.new(task=sys.argv[1],word="linux-home"))'
     )
     created = subprocess.run([*ssh, shlex.join(['python3', '-c', bootstrap, task])],
                              capture_output=True, text=True, timeout=deadline, check=True)
@@ -150,9 +152,12 @@ def main() -> int:
                                    check=False, timeout=deadline)
         return completed.returncode
     finally:
-        cleanup = ('import sys; from pathlib import Path; '
-                   'sys.path.insert(0,str(Path.home()/".claude/scripts/lib")); '
-                   'import scratch; scratch.end(sys.argv[1])')
+        cleanup = (
+            'import sys; from pathlib import Path\n'
+            'with open(Path.home()/".claude/scripts/lib/package_root.py") as package_root:\n'
+            '    exec(package_root.read(), {"__file__": package_root.name})\n'
+            'from scripts.lib import scratch; scratch.end(sys.argv[1])'
+        )
         _ = subprocess.run([*ssh, shlex.join(['python3', '-c', cleanup, task])], check=True, timeout=deadline)
         print(f'loopback: removed the managed scratch home {home}', flush=True)
 

@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import cast, override
 from unittest.mock import patch
 
-import dailies_render
+from scripts.production import dailies_render
 from scripts.whoami import note_file
 from scripts.production.staff_test_support import (
     fixture_member, isolated_source_readers, isolated_staff_file, source_environment,

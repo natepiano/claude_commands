@@ -7,10 +7,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import cast
 
-if __package__:
-    from .process_identity import process_start
-else:
-    from process_identity import process_start
+from scripts.message.process_identity import process_start
+
+from scripts.lib.boot_identity import boot_identity
 
 RELAY_PREFIX = "relay/"
 
@@ -58,8 +57,8 @@ def _process_lifetime(pid: int) -> ProcessLifetime | ProcessLifetimeUnknown:
     if not started:
         return ProcessLifetimeUnknown()
     try:
-        boot = Path("/proc/sys/kernel/random/boot_id").read_text().strip() if sys.platform == "linux" else ""
-    except (OSError, UnicodeError):
+        boot = boot_identity() if sys.platform == "linux" else ""
+    except (OSError, UnicodeError, ValueError):
         return ProcessLifetimeUnknown()
     if sys.platform == "linux" and not boot:
         return ProcessLifetimeUnknown()
@@ -82,7 +81,6 @@ def read_relay_sender(pid: int, directory: Path) -> SavedRelaySender | NoSavedRe
 def publish_relay_identity(pid: int, sender: str, directory: Path) -> None:
     """Publish the lifetime before its sender, before Claude can receive a reply."""
     # This module also runs in the small pre-exec launcher.
-    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
     from scripts.lib.atomic_file import write_text_atomic
 
     lifetime = _process_lifetime(pid)

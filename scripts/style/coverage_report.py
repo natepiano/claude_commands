@@ -1,12 +1,15 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
 """Print style coverage at the synced tip and remember the last report."""
 
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import argparse
 import json
 import os
-import re
 import sqlite3
 import subprocess
 import sys
@@ -17,12 +20,11 @@ from datetime import datetime, timedelta
 from pathlib import Path, PurePosixPath
 from typing import TypedDict, cast
 
-SCRIPTS = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(SCRIPTS / "lib"))
-
-import rules
-import style_ledger
-from user_zone import user_zone
+from scripts.style import rules
+from scripts.style import style_ledger
+from scripts.production import staff, unit_lookup
+from scripts.lib.user_zone import user_zone
+from scripts.style.add_style import NoStyleProduction, standing_style_production
 
 
 class RuleSnapshot(TypedDict):
@@ -50,7 +52,7 @@ class PreviousReport:
 
 @dataclass(frozen=True)
 class StyleProduction:
-    slug: str
+    name: str
     branch_point: str
     units: tuple[str, ...]
 
@@ -63,22 +65,15 @@ def git(repo: Path, *arguments: str) -> str:
 
 
 def production(ledger: style_ledger.Ledger, tip: str) -> StyleProduction:
-    main = Path(git(ledger.repo, "rev-parse", "--path-format=absolute", "--git-common-dir")).parent
-    slug = main.name + "-style"
-    doc = main.parent / slug / "docs" / f"{slug}-production.md"
-    units = tuple(f"{slug}-{family}-unit" for family in ("modules", "names", "values", "types"))
-    if doc.is_file():
-        text = doc.read_text(encoding="utf-8")
-        branch = re.search(r"^\s*-?\s*\*\*Branch point:\*\*\s*(.+)$", text, re.MULTILINE)
-        if branch is None:
-            raise style_ledger.LedgerError(f"{doc}: missing Branch point")
-        rows = text.split("## Units", 1)[-1].split("\n## ", 1)[0]
-        declared = tuple(match[1].strip(" `") for match in re.finditer(r"^\|\s*([^|]+)\|", rows, re.MULTILINE)
-                         if not isinstance(rules.style_family(match[1].strip(" `")), rules.NotStyleUnit))
-        return StyleProduction(slug, branch[1].strip().removeprefix("refs/heads/"), declared or units)
+    standing = standing_style_production(ledger.repo)
+    units = tuple(f"{standing.name}-{family}" for family in ("modules", "names", "values", "types"))
+    if not isinstance(standing, NoStyleProduction):
+        declared = tuple(unit for unit in (row.name for row in unit_lookup.doc_units(standing.doc, staff.snapshot()))
+                         if not isinstance(rules.style_family(unit), rules.NotStyleUnit))
+        return StyleProduction(standing.name, standing.branch_point, declared or units)
     branches = git(ledger.repo, "for-each-ref", "--format=%(refname:short)", "--points-at", tip, "refs/heads").splitlines()
     branch_point = next((branch for branch in branches if not branch.startswith("style/")), tip[:7])
-    return StyleProduction(slug, branch_point, units)
+    return StyleProduction(standing.name, branch_point, units)
 
 
 def previous_report(path: Path) -> FirstReport | PreviousReport:
@@ -164,9 +159,9 @@ def workspace(ledger: style_ledger.Ledger, tip: str) -> tuple[rules.WorkspaceMem
     return rules.workspace_members(manifests)
 
 
-def ticket_line(ticket: style_ledger.TicketRecord) -> str:
+def ticket_line(ticket: style_ledger.TicketRecord, unit_name: str) -> str:
     at = datetime.fromisoformat(ticket["created_at"]).astimezone(user_zone())
-    line = f"{ticket['id']} · {ticket['state']} · {ticket['unit']} · {ticket['crate']} · opened {at:%a %H:%M %Z}"
+    line = f"{ticket['id']} · {ticket['state']} · {unit_name} · {ticket['crate']} · opened {at:%a %H:%M %Z}"
     return "\n".join([line, *(style_ledger.widened_line(widened) for widened in ticket["widened"]),
                       *(style_ledger.yielded_line(yielded) for yielded in ticket["yielded"]),
                       *(style_ledger.removed_line(removed) for removed in ticket["removed"])])
@@ -205,7 +200,7 @@ def prepare_report(ledger: style_ledger.Ledger, rule: str = "", crate: str = "")
     file_delta = f" ({file_count - days[yesterday]:+d} since yesterday)" if yesterday in days else ""
     synced = summary.synced_at.astimezone(user_zone())
     lines = [
-        f"{style.slug} — synced {style.branch_point} {summary.synced_tip[:7]} at {synced:%H:%M %Z}, {file_count:,} files{file_delta}",
+        f"{style.name} — synced {style.branch_point} {summary.synced_tip[:7]} at {synced:%H:%M %Z}, {file_count:,} files{file_delta}",
         f"Rules done: {summary.rules_done} of {summary.rules_total} ({sum(row.complete and row.tier == 'A' for row in progress)} by lint)"
         + f" · cells current {one_decimal(summary.cells_current_pct)}% · open {sum(row.open for row in counts.values()):,}"
         + f" · stale {summary.stale:,} · awaiting merge {sum(row.awaiting_merge for row in counts.values()):,}"
@@ -228,14 +223,22 @@ def prepare_report(ledger: style_ledger.Ledger, rule: str = "", crate: str = "")
         stem = PurePosixPath(row.rule_id).stem
         lines.append(table_row(row.rule_id if stems[stem] > 1 else stem, row, shown_counts[row.rule_id]))
     if selected_rule or crate:
-        tickets = sorted((ticket for unit in style.units for ticket in ledger.ticket_open(unit)
+        tickets = sorted((ticket for ticket in ledger.open_tickets()
                           if (not selected_rule or selected_rule in {value.removesuffix("#uncovered")
                                                                    for value in (ticket["rule"], *ticket["rules"])})
                           and (not crate or ticket["crate"] == crate)), key=lambda ticket: (ticket["created_at"], ticket["id"]))
+        descriptions: list[str] = []
+        for ticket in tickets:
+            try:
+                owner = ledger.unit_name(ticket["unit"])
+            except style_ledger.LedgerError as error:
+                print(f"anomaly: ticket {ticket['id']}: " + " ".join(str(error).splitlines()))
+                owner = ticket["unit"]
+            descriptions.append(ticket_line(ticket, owner))
         if selected_rule:
-            lines.extend(["", "Open tickets:", *(ticket_line(ticket) for ticket in tickets)] if tickets else ["", "Open tickets: none"])
+            lines.extend(["", "Open tickets:", *descriptions] if descriptions else ["", "Open tickets: none"])
         else:
-            lines.extend(["", "Oldest open ticket: " + (ticket_line(tickets[0]) if tickets else "none")])
+            lines.extend(["", "Oldest open ticket: " + (descriptions[0] if descriptions else "none")])
     gained = lost = lost_to_new_files = 0
     current_proposals = {str(finding.state.proposal) for finding in ledger.held_findings(style_ledger.HeldFindingsInState("filed"))
                          if isinstance(finding.state, style_ledger.Filed)}

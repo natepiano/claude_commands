@@ -6,22 +6,16 @@ from contextlib import contextmanager
 from decimal import Decimal
 import os
 from pathlib import Path
-import sys
 import subprocess
-from typing import TYPE_CHECKING, cast, override
+from typing import cast, override
 import unittest
 from unittest import mock
 
 from scripts.aws_target import ledger
 from scripts.aws_target.ledger_test_support import REAL_POPEN, CostFixture, git_only, instant
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "buildlog"))
-if TYPE_CHECKING:
-    from ..buildlog import store
-    from ..buildlog.test_index import COORDINATION_VARIABLES, call, encode, step
-else:
-    import store
-    from test_index import COORDINATION_VARIABLES, call, encode, step
+from scripts.buildlog import index, store
+from scripts.buildlog.test_index import COORDINATION_VARIABLES, call, encode, step
 
 
 DAY = "2026-01-15"
@@ -40,7 +34,16 @@ def narrow[T](test: unittest.TestCase, value: object, expected: type[T]) -> T:
 @contextmanager
 def read_only_evidence(test: MeasurementFixture, directory: Path, *,
                        allow_private_history: bool = False) -> Generator[None]:
-    before = test.snapshot_files(directory)
+    buildlog_root = store.root()
+
+    def snapshot_files() -> dict[str, tuple[bytes, int]]:
+        # Only the index WAL and SHM sidecars can change during a read.
+        return {name: evidence for name, evidence in test.snapshot_files(directory).items()
+                if not ((directory / name).parent == buildlog_root and any(
+                    index.INDEX_PATTERN.fullmatch(Path(name).name.removesuffix(suffix))
+                    for suffix in index.INDEX_SIDECAR_SUFFIXES[1:] if name.endswith(suffix)))}
+
+    before = snapshot_files()
     commands = private_history if allow_private_history else AssertionError("readers cannot run commands")
     with mock.patch.object(subprocess, "run", side_effect=commands), \
          mock.patch.object(subprocess, "Popen", side_effect=AssertionError("readers cannot run commands")), \
@@ -49,7 +52,7 @@ def read_only_evidence(test: MeasurementFixture, directory: Path, *,
          mock.patch.object(ledger.CostLedger, "guard", side_effect=AssertionError("readers cannot decide spending")), \
          mock.patch.object(ledger.CostLedger, "estimate", side_effect=AssertionError("readers cannot lock costs")):
         yield
-    test.assertEqual(test.snapshot_files(directory), before)
+    test.assertEqual(snapshot_files(), before)
 
 
 def private_history(arguments: Sequence[str], **options: object) -> subprocess.CompletedProcess[str]:

@@ -11,7 +11,7 @@ import os
 import re
 import time
 import subprocess
-from typing import TYPE_CHECKING, cast
+from typing import cast
 from unittest import mock
 import unittest
 
@@ -20,12 +20,7 @@ from scripts.aws_target.measurement_test_support import DAY, MIDNIGHT, NOW, Meas
 from scripts.aws_target.ledger_test_support import instant
 from scripts.aws_target.control_test_support import AwsReplies
 
-if TYPE_CHECKING:
-    from ..buildlog import aws_report, index, report
-else:
-    import aws_report
-    import index
-    import report
+from scripts.buildlog import aws_report, index, report
 
 
 class MeasurementTests(MeasurementFixture):
@@ -43,6 +38,8 @@ class MeasurementTests(MeasurementFixture):
             _ = measurement.read_charges(self.settings, self.state, NOW, fetch)
         older = self.state / "charges" / "2026-01-13.json"
         _ = older.write_text("{broken")
+        _ = (self.state / "deployment.json").write_text(json.dumps({
+            "region": "us-east-1", "outputs": {"InstanceId": "i-fixture"}}))
         replies = AwsReplies()
         controller = aws_target.Controller(self.settings, self.state, self.root / "admission", execute=replies,
             clock=lambda: float(NOW + 1), notify=lambda _event: True, publish=lambda _envelope: True)
@@ -115,6 +112,8 @@ class MeasurementTests(MeasurementFixture):
 
     def test_tick_does_not_persist_an_unused_charge_error(self) -> None:
         self.seed_cost()
+        _ = (self.state / "deployment.json").write_text(json.dumps({
+            "region": "us-east-1", "outputs": {"InstanceId": "i-fixture"}}))
         replies = AwsReplies()
         controller = aws_target.Controller(self.settings, self.state, self.root / "admission", execute=replies,
             clock=lambda: float(NOW + 1), notify=lambda _event: True, publish=lambda _envelope: True)
@@ -168,7 +167,8 @@ class MeasurementTests(MeasurementFixture):
                 book.observe(ledger.InstanceObservation(instant(first + "T00:00:00+00:00"), "stopped", "fixture"))
 
                 def date_only_api(arguments: Sequence[str], *, capture_output: bool, text: bool,
-                                  timeout: float, check: bool) -> subprocess.CompletedProcess[str]:
+                                  timeout: float, check: bool, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+                    self.assertIsNone(env)
                     self.assertTrue(capture_output and text)
                     self.assertGreater(timeout, 0)
                     self.assertFalse(check)
@@ -354,7 +354,8 @@ class MeasurementTests(MeasurementFixture):
         calls: list[list[str]] = []
 
         def execute(arguments: Sequence[str], *, capture_output: bool, text: bool,
-                    timeout: float, check: bool) -> subprocess.CompletedProcess[str]:
+                    timeout: float, check: bool, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+            self.assertIsNone(env)
             self.assertTrue(capture_output and text)
             self.assertGreater(timeout, 0)
             self.assertFalse(check)

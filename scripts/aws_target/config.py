@@ -4,16 +4,18 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from decimal import Decimal
 from pathlib import Path
-from typing import Literal, TypeVar
+from typing import Literal, TypeVar, cast
 from collections.abc import Callable
 import subprocess
 import sys
 import time
 from urllib.parse import urlsplit
 import re
+import json
 from zoneinfo import ZoneInfo
 
 from scripts.lib import conf
+from scripts.build_targets import target_config
 
 
 @dataclass(frozen=True)
@@ -163,6 +165,7 @@ class ControlSettings:
     credentials_profile: str
     start_after_wait_s: float
     start_min_waiting: int
+    version_decline_hold_s: float
     capacity_backoff_s: float
     drain_max_minutes: float
     idle_stop_minutes: float
@@ -176,22 +179,51 @@ class ControlSettings:
 
 
 def offload_enabled(settings: conf.ConfigRead) -> bool:
-    return settings.text('offload') == 'on'
+    return target_config.aws_routing_enabled(settings)
 
 
-def read_control_settings(path: Path | conf.ConfigRead) -> ControlSettings:
+def deployment_record(directory: Path | None = None) -> dict[str, object]:
+    """Read saved resource identities without changing deployment state."""
+    if directory is None:
+        directory = target_config.ssh_target_state_directory('aws')
+    try:
+        value = cast(object, json.loads((directory / 'deployment.json').read_text()))
+    except FileNotFoundError:
+        return {}
+    if not isinstance(value, dict):
+        raise ValueError('deployment.json: expected a deployment record')
+    return cast(dict[str, object], value)
+
+
+def deployment_outputs(directory: Path | None = None) -> dict[str, str]:
+    value = deployment_record(directory).get('outputs', {})
+    if not isinstance(value, dict):
+        raise ValueError('deployment.json: expected text resource identities')
+    entries = cast(dict[object, object], value)
+    if any(not isinstance(key, str) or not isinstance(item, str) for key, item in entries.items()):
+        raise ValueError('deployment.json: expected text resource identities')
+    return cast(dict[str, str], value)
+
+
+def read_control_settings(path: Path | conf.ConfigRead, directory: Path | None = None, *,
+                          remote_identity: bool = False) -> ControlSettings:
     settings = conf.read(path) if isinstance(path, Path) else path
     values = settings.values()
     enabled = offload_enabled(settings)
+    if enabled and not remote_identity:
+        saved = deployment_record(directory)
+        if saved and saved.get('region') != values.get('region'):
+            raise ValueError('deployment.json: the saved region differs from configuration')
     def required(key: str) -> str:
         value = settings.text(key)
         if not value.strip():
             raise ValueError(f'{key}: expected nonempty text')
         return value
     return ControlSettings(enabled, required('instance_type'), required('region') if enabled else values.get('region', ''),
-                           required('instance_id') if enabled else values.get('instance_id', ''),
+                           values.get('instance_id', '') if remote_identity else deployment_outputs(directory).get('InstanceId', ''),
                            required('credentials_profile'), settings.number('start_after_wait_s'),
-                           settings.whole('start_min_waiting'), settings.number('capacity_backoff_s'),
+                           settings.whole('start_min_waiting'), settings.number('version_decline_hold_s'),
+                           settings.number('capacity_backoff_s'),
                            settings.number('drain_max_minutes'), settings.number('idle_stop_minutes'),
                            settings.number('tick_interval_s'), settings.number('aws_timeout_s'),
                            settings.number('snapshot_max_age_s'), settings.number('permission_ttl_s'),
@@ -251,7 +283,7 @@ class DeploymentSettings:
     bootstrap_template_path: Path
 
 
-def read_deployment_settings(path: Path) -> DeploymentSettings:
+def read_deployment_settings(path: Path, directory: Path | None = None) -> DeploymentSettings:
     """Require current deployment inputs before preparing any resource request."""
     settings = conf.read(path)
     def text(key: str) -> str:
@@ -290,7 +322,7 @@ def read_deployment_settings(path: Path) -> DeploymentSettings:
         template = path.parent / template
     return DeploymentSettings(region, text('deployment_profile'), text('stack_name'), instance_type,
                               text('ami_id'), owner, text('nixos_release'), zone, text('vpc_id'),
-                              text('subnet_id'), settings.values()['existing_data_volume_id'],
+                              text('subnet_id'), retained_volume(path, directory),
                               text('root_device_name'), whole('root_volume_gib'), whole('data_volume_gib'),
                               whole('data_volume_iops'), whole('data_volume_throughput'),
                               positive_money('spot_max_usd_per_hour'), low, high, stop,
@@ -298,11 +330,32 @@ def read_deployment_settings(path: Path) -> DeploymentSettings:
                               source_url, commit, source_hash, template)
 
 
+
+def retained_volume(path: Path, directory: Path | None = None) -> str:
+    """Keep the saved volume selection until the stack owner changes."""
+    saved = deployment_record(directory)
+    outputs = deployment_outputs(directory)
+    if saved.get('stack') == conf.read(path).text('stack_name'):
+        return outputs.get('ExistingDataInput', '')
+    return outputs.get('DataVolumeId', '')
+
+def deployment_price_path(path: Path) -> Path:
+    """Locate the deployment price state outside the public repository."""
+    key = 'deployment_price_file'
+    state_path = Path(_live(conf.read(path), key, str)).expanduser().resolve()
+    if state_path.is_relative_to(Path(__file__).resolve().parents[2]):
+        raise ValueError(f'{key}: {state_path}: the price file must stay outside the public repository')
+    return state_path
+
+
 def deployment_price(path: Path, now: int) -> tuple[int, Decimal]:
-    configuration = conf.read(path)
-    settings = read_settings(configuration)
-    at = _live(configuration, 'deployment_price_at', positive_seconds)
-    price = _live(configuration, 'deployment_price_usd_per_hour', money)
-    if price <= 0 or not 0 <= now - at <= settings.price_max_age_seconds:
-        raise ValueError('deployment requires a fresh public price recorded in live configuration')
+    state_path = deployment_price_path(path)
+    try:
+        state = conf.read(state_path)
+        at = _live(state, 'deployment_price_at', positive_seconds)
+        price = _live(state, 'deployment_price_usd_per_hour', money)
+        if price <= 0 or not 0 <= now - at <= read_settings(path).price_max_age_seconds:
+            raise ValueError('deployment requires a fresh positive public price')
+    except ValueError as error:
+        raise ValueError(f'deployment_price_file: {state_path}: {error}; run deploy.py price') from None
     return at, price

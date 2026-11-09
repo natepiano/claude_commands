@@ -1,7 +1,11 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
 """Report named usage metrics from the ledger without reading logs or changing it."""
 
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import argparse
 import sqlite3
@@ -16,10 +20,8 @@ from pathlib import Path
 from typing import NoReturn, cast, override
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-if __package__ in (None, ""):
-    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from scripts.production import production_units, session_staff, staff, unit_lookup, unit_names
+from scripts.production import session_staff, staff
 from scripts.usage import collect, outcomes, weights
 from scripts.shutdown import remote
 from scripts.lib.user_zone import user_zone_name
@@ -284,37 +286,21 @@ class UnitWorktree:
     worktree: Path
 
 
-def document_units(path: Path, *, resolver: session_staff.RowResolver | None = None) -> tuple[UnitWorktree, ...]:
-    """Read a document owner's unit worktrees from one staff snapshot."""
+def document_units(owner: staff.StaffRow, *, resolver: session_staff.RowResolver | None = None) -> tuple[UnitWorktree, ...]:
+    """Read the showrunner's unit worktrees from one staff snapshot."""
     try:
         resolver = resolver if resolver is not None else session_staff.RowResolver(staff.snapshot())
-        cells = production_units.unit_table(path.read_text(encoding="utf-8").splitlines())
-    except (staff.StaffUnreadable, OSError, UnicodeError, production_units.Refusal) as error:
-        print(f"usage_report: {path}: {error}", file=sys.stderr)
-        return ()
-    owner = resolver.record.by_doc(remote.local_machine(), path)
-    if owner is None:
-        print(f"usage_report: {path}: no staff owner binds the document", file=sys.stderr)
+        rows = resolver.record.find(kind="unit", parent=owner.id)
+    except staff.StaffUnreadable as error:
+        print(f"usage_report: {owner.name}: {error}", file=sys.stderr)
         return ()
     found: list[UnitWorktree] = []
-    for row in resolver.record.find(kind="unit", parent=owner.id):
+    for row in rows:
         tree = resolver.unit_worktree(row)
         if isinstance(tree, staff.WorktreeUnfilled):
             print(f"usage_report: {row.name}: the worktree is not recorded", file=sys.stderr)
         else:
-            folder = tree.path
-            name = row.name
-            for unit_cells in cells:
-                if unit_names.name(outcomes.cell_value(unit_cells.get("Unit", ""))) != row.name:
-                    continue
-                name = outcomes.cell_value(unit_cells["Unit"])
-                if outcomes.cell_value(unit_cells.get("Plan", "")) and isinstance(tree, staff.PresentWorktree):
-                    try:
-                        folder = unit_lookup.plan_worktree(unit_cells, session_staff.MemberFound(row))
-                    except staff.StaffUnreadable as error:
-                        print(f"usage_report: {row.name}: {error}", file=sys.stderr)
-                break
-            found.append(UnitWorktree(name, folder))
+            found.append(UnitWorktree(row.name, tree.path))
     return tuple(found)
 
 
@@ -325,8 +311,8 @@ def longest_first(worktrees: Iterable[UnitWorktree]) -> tuple[UnitWorktree, ...]
 
 def unit_worktrees(production_docs: Path, *, resolver: session_staff.RowResolver | None = None) -> tuple[UnitWorktree, ...]:
     resolver = resolver if resolver is not None else session_staff.RowResolver(staff.snapshot())
-    return longest_first(row for document in sorted(production_docs.glob("*-production.md"))
-                         for row in document_units(document, resolver=resolver))
+    return longest_first(row for owner in outcomes.production_owners(production_docs, resolver.record)
+                         for row in document_units(owner, resolver=resolver))
 
 
 def register_report_functions(db: sqlite3.Connection, worktrees: tuple[UnitWorktree, ...],

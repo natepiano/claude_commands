@@ -58,9 +58,49 @@ advertises a model alias that `[claude.agents]` does not yet list.
 
 `[claude.context]` is the fourth layer: `default=<window>` plus one
 `<family>=<first version>:<window>` row per Claude family (`opus=4.7:1m`). The
-context-usage hooks read it to place the auto-compaction trigger they warn
-against; nothing in the hook scripts names a model. A new family, or a family
+context-usage hooks read it to calculate the auto-compaction trigger.
+The per-call message uses `context_usage.conf`. A new family, or a family
 whose first 1M release changes, is a row here.
+
+## codex_daemon.conf
+
+`agents_slice` selects the systemd slice for agent panes and Codex app-server processes.
+Both callers read the value when they use it.
+
+## merge_gate.conf
+
+`nightly_result_push=on` sends the nightly result or the reason that the checks did not run.
+`off` disables both pushes. The user can remove this push later.
+`nightly_result_modules=8` limits the failed test modules named in a result push.
+Both values are read at use. The module limit must be a whole number of at least one.
+`memory_stop_reruns=1` sets the reruns alone after a module exceeds `merge_gate_governor_gib` from `build_admission.conf`.
+The gate reads the retry count at use. It must be a whole number of at least zero.
+Each memory stop sends sdlc the module, peak, limit, gate, and next action.
+An exhausted retry count fails the gate. A failed message does not change the result.
+
+## context_usage.conf
+
+`message = off` disables the per-call context message for main threads and subagents.
+`on` enables the existing thresholds and messages.
+A missing file, missing key, or invalid value means `on`.
+The hook reads the file on each call through `scripts.lib.conf`.
+Tests select a temporary config folder with `CONF_DIR`.
+The hook still reads the transcript and writes its debug log.
+Compaction runs by itself during work.
+
+## context_deferral.conf
+
+Each non-comment line uses `kind: value`; `#` starts a comment.
+`window` sets the maximum region length in characters, after whitespace is collapsed.
+`action`, `marker`, `state`, `later`, and `exclude` hold case-insensitive regular expressions.
+The hook joins the expressions of each kind with `|`.
+It blocks an `action` with a `marker`, or an `action` with both a `state` and a `later` phrase.
+Each region must fit the window and contain no `exclude` match.
+`window`, `action`, and `exclude` are required; absent `marker`, `state`, or `later` entries disable their rule.
+`stop-context-deferral.py` reads this file at each stop through the same `CONF_DIR` folder selection.
+The hook removes code, paired quotations, and block quotes, including continuation lines, before it collapses whitespace.
+It blocks once with exit 2 and permits a stop with `stop_hook_active` set.
+A missing file, invalid entry, or hook error permits the stop without output.
 
 ## lint.conf
 
@@ -77,6 +117,11 @@ next run, so a change is immediate:
 - `scripts/lint/invoke.sh` — the lint CLI and
   `scripts/direct/verify.sh`'s `lint` and `fmt` arms
 
+Use `bash ~/.claude/scripts/direct/verify.sh lint [<package>] [--check]`.
+Without a package, lint covers the workspace. `--check` prevents repairs with
+or without a package. See `<VerificationContract/>` in `docs/direct/verification.md`
+for all command forms.
+
 Deliberately not gated: `verify.sh check`/`test`/`example`, the workspace check
 and test inside `verify.sh final`, `pre_release_checks.sh`, and
 `validate_ci.sh`. Those are correctness gates rather than lints, and a release
@@ -87,6 +132,125 @@ config decides whether a check runs, never with what flags.
 `scripts/lint/lint_config.sh` is both the reader and the editor: source it and
 call `lint_config_enabled <op>` (plus `lint_config_skip_notice <op> <what>` for
 the SKIPPED line), or run it as the `/lint_config` CLI.
+
+
+The folder audit and build sweep also read these settings through `scripts/lib/conf.py`.
+The `folder_*` keys control the folder audit. The `sweep_*` keys control the build sweep.
+
+| Key | Meaning |
+| --- | --- |
+| `folder_min_age_seconds` | Minimum idle time before the audit names a loose folder. |
+| `folder_remove_after_seconds` | Shared idle time for loose folders and ordinary temporary folders. |
+| `folder_idle_depth` | Maximum folder depth for the idle scan. |
+| `folder_idle_entry_limit` | Maximum entries in one idle scan. |
+| `folder_rg_files_per_call` | Maximum transcript files in one search. |
+| `folder_start_lines` | Maximum transcript lines for the session start time. |
+| `folder_start_bytes` | Maximum bytes in one transcript start line. |
+| `folder_state_dir` | State folder for the daily folder audit. |
+| `sweep_doc_index_mib` | Maximum size of the rustdoc merge index in MiB. |
+| `sweep_proc_locks_reads` | Number of process lock reads before a lock is absent. |
+| `sweep_dep_info_head_bytes` | Maximum bytes read from a dependency file header. |
+| `sweep_max_tree_depth` | Maximum depth for Cargo build tree discovery. |
+| `sweep_free_floor_percent` | Free-space floor on other build filesystems, in percent (20). |
+| `sweep_floor_roots` | Roots for Cargo target discovery. |
+| `sweep_ci_targets` | CI targets measured outside the removable roots. |
+| `sweep_growth_window_seconds` | Maximum interval for a disk growth comparison. |
+| `sweep_snapshot_max_age_seconds` | Maximum age of a current disk snapshot. |
+| `sweep_alert_interval_seconds` | Minimum interval between disk alerts. |
+| `sweep_push_text_limit` | Maximum length of a phone alert. |
+| `sweep_crossing_repeat_minutes` | Delivery key lifetime for a disk crossing, in minutes. |
+| `sweep_unexplained_fall_bytes` | Unexplained disk loss that triggers an alert. |
+| `sweep_large_removal_bytes` | Removed bytes that trigger an alert. |
+| `sweep_floor_search_depth` | Maximum folder depth for target discovery. |
+| `sweep_sender_timeout_seconds` | Maximum time passed to the session sender. |
+| `sweep_holder_lookback_seconds` | Use window before a build hold starts. |
+| `sweep_delete_stamp_grace_seconds` | Use stamp tolerance after a sweep deletion. |
+| `sweep_history_timeout_seconds` | Maximum time to read build history. |
+| `sweep_cold_crates` | Minimum compiled crates for a cold rebuild. |
+| `sweep_message_path_widths` | Alert path widths. The first width is the default. |
+| `sweep_message_limit` | Maximum length of a session alert. |
+| `sweep_measurement_paths` | Maximum disk measurement paths in an alert. |
+| `sweep_floor_skip` | Folder names excluded from target discovery. |
+| `sweep_scan_workers` | Maximum concurrent target scans. |
+
+Floor records and `floor.lock` use `tmp_sweep.state_dir()`.
+Disk measurements and build history use `scripts/buildlog/store.py::root()`.
+
+## hana_instances.conf
+
+`scripts/hana_instances/hana_instances.py` reads these settings through `scripts/lib/conf.py` on each invocation.
+`CONF_DIR` selects the configuration folder, including temporary test folders.
+An exempt port still identifies a test Hana when the process has test labels or an agent environment.
+Mac host and SSH settings remain in `mac_test.conf`.
+
+| Key | Meaning |
+| --- | --- |
+| `exempt_ports` | User and demo Hana ports, separated by commas. |
+| `test_max_hours` | Maximum age of a labelled test Hana. |
+| `unlabelled_max_minutes` | Maximum age of a test Hana without labels. |
+| `stop_grace_seconds` | Time between TERM and KILL. |
+| `clone_max_hours` | Maximum idle age of a test clone. |
+
+
+## scratch.conf
+
+`scripts/lib/scratch.py` reads these settings through `scripts/lib/conf.py`.
+`CONF_DIR` selects the configuration folder. Values retain the previous defaults.
+
+| Key | Meaning |
+| --- | --- |
+| `visible_root` | Root for visible scratch folders. |
+| `holds_file` | File that records scratch holds. |
+| `default_life_seconds` | Lifetime of a scratch folder without an explicit task. |
+| `repo_depth` | Maximum folder depth for the repository scan. |
+| `suffix_length` | Number of random characters in a scratch folder name. |
+| `repo_skip` | Folder names excluded from repository scans and folder audit scans. |
+| `record_lock_attempts` | Maximum attempts to lock a changing copy folder. |
+
+
+## hana_shot.conf
+
+`scripts/hana_shot/hana_shot.py` reads these settings through `scripts/lib/conf.py`.
+`CONF_DIR` selects the configuration folder. Values retain the previous defaults.
+
+| Key | Meaning |
+| --- | --- |
+| `refused_port` | Port reserved for the user Hana. |
+| `host` | Local address for BRP calls. |
+| `call_timeout_seconds` | Maximum time for a BRP call. |
+| `capture_timeout_seconds` | Maximum time for a screenshot capture. |
+| `copy_timeout_seconds` | Maximum time to copy a screenshot. |
+| `settle_seconds` | Maximum time for the camera to become stable. |
+| `unchanged_frames` | Frames required when the camera does not move. |
+| `window_frames` | Frames required after a window change. |
+| `resend_seconds` | Maximum interval for a capture retry. |
+| `setup_seconds` | Maximum time for a setup target to appear. |
+| `ready_seconds` | Maximum time for the ready log line. |
+| `warm_frame_ms` | Maximum frame time before a capture. |
+| `warm_seconds` | Maximum time to wait for warm frames. |
+| `black_maximum` | Maximum pixel value treated as a black capture. |
+| `max_margin` | Maximum clear viewport fraction on each side. |
+| `shot_directory_bytes` | Maximum retained screenshot bytes. |
+| `max_age_seconds` | Maximum age of a retained screenshot. |
+| `workers` | Maximum concurrent capture operations. |
+| `remote_awake_seconds` | Maximum remote display wake time. |
+| `local_awake_seconds` | Maximum local display wake time. |
+| `minimum_frame_seconds` | Minimum delay between frame samples. |
+| `default_frame_ms` | Frame time when diagnostics have no value. |
+| `margin_probe` | Viewport margin change for a fit probe. |
+| `selector_suggestions` | Maximum selector suggestions. |
+| `git_timeout_seconds` | Maximum time for a Git identity query. |
+| `git_status_seconds` | Maximum time to inspect uncommitted build paths. |
+| `port_probe_seconds` | Maximum time for a port probe. |
+| `poll_seconds` | Delay between process readiness checks. |
+| `shutdown_call_seconds` | Maximum time for the shutdown BRP call. |
+| `shutdown_seconds` | Maximum time to wait for a Hana exit. |
+| `signal_grace_seconds` | Time after a shutdown signal. |
+| `panic_context_lines` | Maximum lines per panic excerpt. |
+| `panic_max_lines` | Maximum panic excerpt lines. |
+| `dirty_path_limit` | Maximum dirty build paths in a label. |
+| `fit_iterations` | Maximum iterations when measuring the current margin. |
+| `default_margin` | Default clear viewport fraction on each side. |
 
 ## mac_test.conf
 
@@ -100,15 +264,24 @@ Linux-only packages, and Mac nextest exclusions. A repository needs a
 `linux_only.<repo>` key, even when its value is empty, before tests can run on
 the Mac. An empty `ci_repo` disables CI calls. `CONF_DIR` selects the fixture folder in tests.
 
+The Mac floor sweep reads `sweep_floor_gib=150` from this file.
+The value must meet `free_floor_gib`. A missing or lower floor refuses the pass.
+`sweep_floor_roots` names `/tmp`, `~/rust`, and `~/.local/state/mac-test/mirror`.
+Only marked build output and mirrors inside these roots are eligible.
+The on-demand command and the future timer use `sweep.py --floor-only --host mac`.
+
 ## aws_target.conf
 
 This file defines the disabled AWS SSH target. `offload=off` prevents work.
 The active target list remains `targets=mac,natedev` in `build_targets.conf`.
 The user completes deployment before target activation.
 
-`host=aws-build` names the Tailscale SSH host. `instance_id` and `region` remain empty before deployment.
+`host=aws-build` names the Tailscale SSH host. `region` selects the AWS region.
+The controller reads the instance ID from `deployment.json`.
 `credentials_profile=build-scaler` names the user's AWS CLI profile. This file contains no credential.
-`kinds=test,check,doc` excludes lint. An empty `ci_repo` disables GitHub calls.
+`kinds=test,check,doc,lint,example,build` permits tests, checks, docs, lint judgments, examples, and builds.
+A build or final uses AWS only when a flag pins the command.
+An empty `ci_repo` disables GitHub calls.
 
 `monthly_limit_usd=400` is the user's monthly spending limit (approved 2026-11-01). `daily_limit_usd=20` is derived (the monthly limit / 20); the user approved it on 2026-11-03.
 The AWS Budget must read `monthly_limit_usd`. Code must never raise either limit.
@@ -156,7 +329,12 @@ Positive numeric settings use the readable lower bound `# range: 0.001..`.
 Zero-permitted settings retain `# range: 0..`. Whole-number settings retain their existing limits.
 
 Deployment settings require the account inputs before preparation.
-`deployment_profile` names the administrator profile. `credentials_profile` names the scaler profile.
+`deployment_profile` names the legacy administrator section for migration.
+`credentials_profile` names the unattended scaler profile.
+`admin_secret_file=~/.config/aws-build/admin.gpg` holds symmetric AES256 encrypted administrator credentials.
+Run `deploy.py secrets` in a terminal to create or update it.
+The command removes imported plain administrator credentials after encryption succeeds.
+Deployment reads the passphrase once through `/dev/tty` and disables the GPG symmetric passphrase cache.
 `stack_name`, `availability_zone`, `vpc_id`, and `subnet_id` select the deployment location.
 `ami_id`, `ami_owner_id`, `nixos_release`, and `root_device_name` identify the official x86_64 NixOS image.
 `notification_email_file` names a private file with one address for Budget notices.
@@ -167,11 +345,24 @@ The `budget_notice_*_percent` keys set the notice thresholds.
 `budget_stop_percent` sets the stop threshold. The live spending guard remains the primary limit.
 `root_volume_gib` sizes the root volume.
 `data_volume_gib`, `data_volume_iops`, and `data_volume_throughput` fix the retained volume settings through their conf limits.
-`existing_data_volume_id` selects a retained volume. An empty value requests a new volume.
+The saved `deployment.json` record identifies the instance and retained data volume.
+Replacement uses its saved `DataVolumeId`. Configuration contains no instance or volume ID.
 `spot_max_usd_per_hour` limits the Spot request price.
-`deployment_price_usd_per_hour` and `deployment_price_at` record the current public price and its Unix timestamp.
-`preflight_max_age_s` limits preparation age. `deployment_timeout_s` bounds each deployment command.
+`deployment_price_file` names the price state file outside the repository. Its default path is `~/.config/aws-build/deployment-price`.
+Run `scripts/lib/py scripts/aws_target/deploy.py up --approve-resources` to complete the price, bootstrap, stacks, and scaler-key stages.
+The command records stage results and times in `up.json` beside `deployment.json`.
+It checks live state before each stage. It always refreshes the price.
+Separate `price`, `bootstrap`, `prepare`, `apply`, and `setup-start` commands remain available.
+The command reads the current Spot price for the configured instance type and zone through `deployment_profile`.
+It writes the price and its read time atomically with mode `0600`.
+`prepare`, `apply`, and `setup-start` read this file. `bootstrap` needs no price file.
+`preflight_max_age_s` limits preparation age. A completed foundation wait renews preparation for unchanged inputs.
+The guard runs before each resource request. `deployment_timeout_s` bounds each deployment command.
 `scaler_user_name` names the IAM user.
+`scaler_key_check_attempts=12` bounds the identity checks after key creation.
+`scaler_key_check_delay_s=5` allows IAM time to publish the key between checks.
+The scaler stage keeps other credential profiles and writes the private file with mode `0600`.
+It verifies the new key before deleting old keys. It deletes a new key that fails verification.
 `bootstrap_template_path` selects the reviewed template in the separate NixOS checkout.
 `scripts_source_url`, `scripts_source_sha256`, and `scripts_source_commit` identify the public archive.
 The bootstrap command writes `bootstrap.sh` and `remote.conf` in the output directory.
@@ -266,7 +457,7 @@ The AWS mapping permits `aws-build` records without activating the AWS target.
 Each exchange reads these settings again.
 Vault transfers use the same configured SSH connection timeout.
 
-`vault.lock_retries` sets the extra fast-forward tries after a busy vault index lock.
+`vault.lock_retries` sets the extra tries after a busy vault index lock.
 The default is 5; the allowed whole numbers are 0 through 10.
 `vault.lock_retry_delay_s` sets the seconds between these tries.
 The default is 3; the allowed range is 0 through 5.
@@ -285,11 +476,28 @@ Each configured peer supplies only its own host folders.
 The `BUILDLOG_PEER` override retains the legacy transfer of all other synchronized host folders.
 Rsync replaces complete files and preserves this host's append files.
 
+## memory_feed.conf
+
+`scripts/build_queue/memory_feed.py` reads these settings through `scripts/lib/conf.py` when the service starts.
+`CONF_DIR` selects another configuration folder.
+
+| Key | Value | Use |
+| --- | --- | --- |
+| `output_folder` | `~/.local/share/review-links/h7uj5c` | Publish `memory_live.html` and `memory.json` in this folder. |
+| `interval_seconds` | `3` | Set the interval between readings and the page refresh interval. |
+| `history_days` | `7` | Show this many days of build history and top costs; at least `TOP_COST_RECENT_DAYS`. |
+| `swap_rows` | `6` | Show this many of the largest swap users; one line sums the rest. |
+| `report_refresh_seconds` | `300` | Read the history charts and top costs again after this many seconds. |
+
+The service publishes the repository page with an atomic write at each start.
+The service retains the last successful reading when the admission service does not answer.
+
 ## test_times.conf
 
-`SLOW_TEST_S` sets the minimum test time retained in the build log.
+`SLOW_TEST_S` sets the minimum gate test time retained in the build log.
+`NEXTEST_SLOW_TEST_S` sets the recording threshold for nextest rows.
 Failed tests, errors, and unexpected successes remain in the log at every duration.
-`TOP_RUNS` sets the number of recent gate runs used to rank each module by its median wall time.
+`TOP_RUNS` sets the number of recent gate runs used to rank each module by its median CPU time.
 Callers read these settings through `scripts/lib/conf.py` at each use.
 `CONF_DIR` selects a fixture folder for tests.
 
@@ -312,7 +520,7 @@ agent says something, not when it halts — the decision to stop is the user's,
 made from what gets reported.
 
 `UNIT_PROGRESS_INTERVAL_SECONDS` sets the Codex poll timeout, per
-`<CodexDispatchWait/>` in `commands/unit/direct.md`; Codex requires a positive
+`<CodexDispatchWait/>` in `docs/direct/codex_dispatch_wait.md`; Codex requires a positive
 integer. It is 3600, one hour (user, 2026-10-10). Unit reports come only when
 someone asks (2026-10-19): no notifier instance or timer sends them.
 
@@ -322,22 +530,40 @@ or invalid value warns and uses the newest valid committed value; without a
 usable revision, `findings.py` lists the problems and exits 2 before running
 the command. `CONF_DIR` selects the fixture folder in tests.
 
+The test environment policy has three keys:
+
+- `VERIFY_RESULT_ENV_NAMES` names exported values that change test results.
+  The default names are `NO_COLOR`, `CLICOLOR`, `CLICOLOR_FORCE`, `FORCE_COLOR`, `CI`, `TZ`, and `LANG`.
+  The locale names are `LC_ALL`, `LC_COLLATE`, `LC_CTYPE`, `LC_MESSAGES`, `LC_MONETARY`, `LC_NUMERIC`, and `LC_TIME`.
+  The list also includes `LC_ADDRESS`, `LC_IDENTIFICATION`, `LC_MEASUREMENT`, `LC_NAME`, `LC_PAPER`, and `LC_TELEPHONE`.
+- `VERIFY_RESULT_ENV_PREFIXES` selects exported values by prefix.
+  The default prefixes are `HANA_`, `WGPU_`, `BEVY_`, `INSTA_`, and `TRACE_`.
+  `LC_TERMINAL` and `LC_TERMINAL_VERSION` do not enter the key.
+- `VERIFY_TEST_FIXED_ENV` sets terminal values for each test, including the test step of `final`.
+  The defaults are `TERM=xterm-256color`, `COLORTERM=truecolor`, `TERM_PROGRAM=verify`, `COLUMNS=80`, and `LINES=24`.
+
+`scripts/direct/result_environment.py` reads these keys through `conf.read` at use.
+The existing feature reader supplies the policy to Bash without another Python start.
+Test verdict keys include selected values and configured fixed values.
+Unset values differ from empty values.
+The new inputs do not change build keys or other command keys.
+Mac and SSH nextest runs receive the same values, including copy runs.
+
 ## dailies.conf
 
 The counts each production's dailies show on one line above the chart, in
 every length: `counts: nightly queue 8 · proposals 3`. A line is
-`<production slug>.<label>=lines <file> <regex>`, which counts the file's lines
-matching the regex, `<production slug>.<label>=files <glob>`, which counts the
-matching files, or `<production slug>.<label>=issues <folder> <tag>`, which
+`<staff id>.<label>=lines <file> <regex>`, which counts the file's lines
+matching the regex, `<staff id>.<label>=files <glob>`, which counts the
+matching files, or `<staff id>.<label>=issues <folder> <tag>`, which
 counts the issues directly in the folder whose frontmatter is open and tagged
-with the tag. The slug is the production doc's file name less
-`-production.md`. `~` expands, and a hyphen in the label reads as a space.
+with the tag. The key uses the showrunner staff id. `~` expands, and a hyphen in the label reads as a space.
 `scripts/production/dailies_counts.py` reads it each time the dailies input is
 built, so an edit applies to the next dailies. A missing file or folder shows as
 `not found`. A bad line leaves out the counts line, and the builder prints
 `counts: unavailable — dailies.conf line <n>: …`. `DAILIES_COUNTS_CONFIG`
 overrides the path. Today it holds build-followups' nightly review queue and
-plan backlog, and tool-based-ui's open hanadocs proposal issues (user, 2026-10-10).
+plan backlog, and hana's open hanadocs proposal issues (user, 2026-10-10).
 
 ## user_zone.conf
 
@@ -394,7 +620,7 @@ Files that the `/orphans` command should ignore when checking for unreferenced s
 
 Linux SSH targets use the admission repository name for `slots.<repo>`, `devshell.<repo>`, `skip.<repo>`, and `target_budget_gib.<repo>`.
 The source directory name still selects the legacy Mac mirror and claim.
-`kinds=test,check,doc` selects Linux commands without Mac `linux_only.*` keys.
+`kinds=test,check,doc,lint,example,build` permits tests, checks, docs, lint judgments, examples, and builds on Linux targets.
 
 `devshell` selects the default shell. `devshell.hana=ci` selects Hana's CI shell.
 `shell_cache` gives the cache path relative to the remote home.
@@ -410,14 +636,17 @@ Missing store paths force a new evaluation. Each claimed slot retains its own wa
 
 `parity.rustc`, `parity.nextest`, `parity.mend`, and `parity.scripts_commit` can pin the public tool versions and script commit.
 An empty pin uses the sender's version. A mismatch prevents execution.
-The sender transfers clean tracked scripts and named public configuration before the probe.
+`aws_target.conf` sets `version_pin_file=nixos hosts/aws-build.nix`.
+A version refusal names each mismatched tool, both versions, and this file.
+The verify output and the step attempt record keep this reason.
+The sender transfers every tracked file under `scripts/` and `config/` before the probe.
 It checks their contents and commit before and after transfer. A dirty script set prevents execution.
 Source transfers include untracked files and omit ignored paths, Git metadata, and the target folder.
 Directory transfers delete removed source files from warm mirrors.
 The probe checks disk capacity, the script commit, and tool versions inside the selected shell.
 The runner checks tool versions again before execution. A mismatch permits local fallback without a test result.
 The local trust rules must permit shell evaluation before the sender claims Linux capacity.
-`build_budget_gib` sets the Linux memory budget. Repository build folder budgets cannot exceed it.
+`build_budget_gib` bounds the repository build folder budgets on disk.
 After each step, the runner uses the existing lint budget sweep on the selected build folder.
 The sweep removes the least recently used output and keeps the remaining output warm.
 Only a disk floor violation removes the whole folder.
@@ -436,3 +665,81 @@ A selected known_hosts file requires strict host key checking for SSH and rsync.
 The proof creates a managed scratch home and a tiny Rust fixture.
 It uses private memory files and executes test, check, and staged doc in one warm slot.
 It removes the scratch home when the proof ends. Automated tests never execute this proof.
+
+## production.conf
+
+The production launch scripts read these settings through the shared reader at use.
+Smoke launches read `host` and `refused_port` from `hana_shot.conf`.
+Mac runs read `connect_timeout_s` from `mac_test.conf` and round it up for SSH.
+`CONF_DIR` selects another configuration folder.
+
+| Key | Default | Use |
+| --- | --- | --- |
+| `mac_run_hold_seconds` | `60` | Default time for the main Hana run. |
+| `mac_run_host` | `natemccoy@mac` | SSH destination for the Mac run. |
+| `mac_run_port` | `15710` | BRP port for the Mac run. |
+| `mac_run_log` | `/tmp/mac_run_hana.log` | Remote log for the main Hana run. |
+| `mac_run_launch` | `/tmp/mac_run_hana.command` | Remote Terminal command for the Mac run. |
+| `mac_run_status` | `/tmp/mac_run_hana.status` | Remote exit record for the Mac run. |
+| `mac_run_example_seconds` | `20` | Time for each demo example. |
+| `mac_run_claim_seconds` | `600` | Maximum time to wait for the Mac claim. |
+| `mac_run_deployment_target` | `14.0` | Minimum macOS version for the test build. |
+| `mac_run_status_grace_seconds` | `60` | Extra time to wait for the exit record. |
+| `mac_run_poll_seconds` | `1` | Delay between exit record checks. |
+| `mac_run_log_lines` | `20` | Maximum main log lines after an early exit. |
+| `mac_run_example_log_lines` | `10` | Maximum example log lines after an early exit. |
+| `mac_run_bundle` | `/tmp/mac_run.bundle` | Remote Git bundle for the Mac run. |
+| `mac_run_example_log_prefix` | `/tmp/mac_run_` | Remote log prefix for each demo example. |
+| `mac_run_source` | `~/rust/hana` | Remote repository for the scratch clone. |
+| `mac_run_examples` | `hana_diegetic typography;hana_diegetic units;hana_diegetic widgets;hana_diegetic diegetic_text_stress;hana_conduit playground;hana_lagrange showcase fit_overlay;hana_liminal all_modes;hana_valence staggered_unfold;hana_mimesis_tools show_beam` | Demo examples separated by semicolons. Each entry names a crate, example, and optional feature. |
+| `smoke_port` | `15790` | Default BRP port for a smoke launch. |
+| `smoke_ready_seconds` | `300` | Maximum time for BRP readiness. |
+| `smoke_exit_seconds` | `30` | Maximum time for a graceful exit. |
+| `smoke_connect_seconds` | `1` | Maximum time to connect to BRP. |
+| `smoke_call_seconds` | `5` | Maximum time for a BRP request. |
+| `smoke_signal_grace_seconds` | `2` | Delay after the termination signal. |
+| `smoke_poll_seconds` | `1` | Delay between readiness and exit checks. |
+
+### AWS box setup inputs
+
+`deploy.py up` reads these inputs at use.
+
+| Key | Default | Reason |
+| --- | --- | --- |
+| `admin_secret_file` | `~/.config/aws-build/admin.gpg` | Encrypt AWS administrator keys and Tailscale OAuth values together with mode `0600`. |
+| `tailscale_key_expiry_s` | `300` | Expire an unused single-use join key after five minutes. |
+| `nixos_configuration_directory` | `/etc/nixos` | Read the reviewed box configuration from a clean `main` checkout. |
+| `box_setup_timeout_s` | `3600` | Bound each setup command and the idle shutdown hold. |
+| `box_check_attempts` | `60` | Bound SSM and SSH recovery checks. |
+| `box_check_delay_s` | `5` | Allow registration and Tailscale restarts between checks. |
+
+The OAuth JSON contains `client_id` and `client_secret`.
+`config/aws-build-tailscale.json` holds only the public box access rules and source device names.
+The helper prints policy changes and preserves unrelated rules.
+
+`idle_stop_margin_s=120` allows two extra minutes for the box to finish its idle stop.
+The range is 0 through 600 seconds.
+The routing proof writes its crate from `scripts/aws_target/routing_proof.py` into a Git repository in a scratch folder.
+The folder uses task `gate:aws-routing-proof`.
+The next `up` removes a folder left by a dead run.
+Its `default` development shell uses the host tools.
+
+`deploy.py gate-trial` reads these keys when it uses them:
+
+| Key | Value | Reason |
+| --- | --- | --- |
+| `gate_trial_size_reserve_usd` | `4` | Limit the spend of the size step. |
+| `gate_trial_start_reserve_usd` | `3` | Limit the spend of the start step. |
+| `gate_trial_lifetime_minutes` | `30` | Set the guest shutdown time and the attempt deadline. |
+| `gate_trial_url_lifetime_s` | `7200` | Keep presigned URLs valid through a stop and start. |
+| `gate_trial_target_gate_s` | `420` | Select the cheapest size that meets the 7-minute goal. |
+| `gate_trial_default_sizes` | `8,16,32,64` | Set the vCPU sizes of the size step. |
+| `gate_trial_size_runs` | `3` | Set the attempts for each size. |
+| `gate_trial_start_runs` | `5` | Set the attempts of the start step. |
+| `gate_trial_poll_pause_s` | `2` | Set the pause between state and result reads. |
+| `gate_trial_group_delete_wait_s` | `120` | Limit the security group delete retries. |
+The setup checks compare plain tool commands on both hosts.
+These stages need no other source repository.
+`deploy.py up` stores routing activation in `~/.local/state/build-targets/aws/routing.json`.
+The controller and sender use this record before the tracked `offload` value.
+The command edits no tracked file.

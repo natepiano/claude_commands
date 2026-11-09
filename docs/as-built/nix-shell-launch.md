@@ -22,25 +22,29 @@ It searches the start directory and then its parents. Resolved `.envrc` files
 under the default trusted roots `~/rust`, `~/worktrees`, and `~/.claude*` are approved with
 `direnv allow <envrc>`. Linked worktrees outside those roots are also approved
 when their `.git`, `commondir`, and `gitdir` back pointer prove registration by
-a repository under a trusted root, using file reads alone. This covers
-style-sync lint snapshots made with `git worktree add` under `/tmp/claude/session`;
-forged links still require explicit approval.
+a repository under a trusted root, using file reads alone.
+Style-sync lint uses `copies.standing` below the trusted `~/worktrees/gates` root.
+Forged links still require explicit approval.
 
-Copies registered by `copies.py` under the configured scratch copies root
-(normally `/tmp/claude/copies/<pair>/<copy>`) also qualify when `.envrc` is a
-regular file, not a symlink, at the copy's top level. `registered_copy` uses
-`copy_record.copy_folder` to prove that location and `copy_record.read_record` to
-require a readable `copy_record.Registered` record. Its `source_path` must resolve
-to a directory under a trusted root. Git resolves `.envrc` at the record's
-`source_commit` and hashes the copy's file with `hash-object --no-filters`;
-approval requires equal blob hashes. Both git commands run in the trusted
-source repository with no `GIT_*` variables in their environment, so the copy supplies no git configuration or filters.
-Missing, malformed, unreadable or mismatching evidence requires explicit
-approval; an unregistered clone or a copied record outside the copies root
-does not qualify. `scripts/lib/copy_record.py` owns the copy locations and record
-reader using only the standard library, so importing it does not reach scratch
-or herdr. It is imported only when checking a copy, preserving the helper's
-cheap startup.
+Standing copies under the configured copies root (normally `/tmp/claude/copies/<pair>/<copy>`) also qualify.
+Task clones from `copies.py clone` at `<scratch root>/<task>/checkout` qualify with the same proof.
+The `.envrc` must be a regular file at the checkout root.
+`copy_record.record_path` finds a standing copy's record inside the copy.
+For a task clone, it finds the parent's record and requires `test_hana_clone: true`.
+`copies.py clone` records the checkout HEAD as `source_commit` after its Git reset.
+`registered_copy` requires a readable `copy_record.Registered` record.
+Its `source_path` must resolve to a directory under a trusted root.
+Git resolves `.envrc` at `source_commit` and hashes the copy's file with `hash-object --no-filters`.
+Approval requires equal blob hashes.
+Both Git commands run in the trusted source repository without `GIT_*` environment variables.
+The copy supplies no Git configuration or filters.
+Missing, malformed, unreadable or mismatching evidence requires explicit approval.
+Older clones without `source_commit` and folders outside the configured copy locations do not qualify.
+`scripts/lib/copy_record.py` uses only the standard library.
+Importing it does not reach scratch or herdr.
+The helper imports it only when it checks a copy.
+
+A direct child of the scratch root without `.envrc` passes Linux source trust when its readable registered record has `generated_source: true`.
 
 This rule checks only `.envrc`. Files it loads, including `flake.nix`, are not
 checked and may differ from the source commit.
@@ -75,25 +79,14 @@ resolver before calling `exec`.
 | `production/add_showrunner.py` | Child showrunners use `launch_agent`. |
 | `shutdown/restart.py` | Record-driven restarts prepare the saved cwd and account environment before `restore_server`, then use `launch_prepared_agent`. Refusal retains the record. |
 | `shutdown/stop_resume.py` | Shared resume runs the account exec command in the session's pane. The exec path prepares the launch shell. |
-| `shutdown/pane_restore.py` | Saved Claude panes use `launch_agent` before replacing their old tab. |
+| `shutdown/pane_restore.py` | Staff rows use `restart.start_row`. Saved panes without staff rows use `launch_agent`. Both routes preserve live conversations and retained accounts. |
 | `herdr/herdr_sessions.py` | Standalone starts and resumes use `launch_agent`. |
-| `berth_fix/launch.sh` | Proves the worktree before opening a window; both window and current-terminal starts use `nix_env.py exec`. Worktree approval failure is fatal. |
-| `agents/agent_bg.sh` | Proves the cwd while making worker settings, passes the loaded env through settings for the long-lived background daemon, and starts the CLI through `exec`. |
+| `direct/claude_worker.py` | Calls `nix_env.ensure` once in the assign process. The settings and the Claude start use the same loaded environment. |
 | `agents/agent_exec.sh` | Claude print runs use `exec` after changing to their requested directory. |
-| `agents/codex_mesh.py` | The shared Codex app-server calls `ensure(worktree, environment)` and starts Codex directly with the loaded env. Protected account, run, temporary-directory and held-role values come from the caller. `Refused` logs the helper's line, remembers the failed shell, and falls back to the caller env so other workers keep their shared server. The recorded pid is the server's pid. |
 | `accounts/accounts.py` | Normal `exec` launches call `launch_shell_environment(cwd)`. It calls `ensure`, restores the caller's HOME, and refuses an unusable shell. `codex update` bypasses account launch. |
 | `cli_agent/cli_agent.sh` | Interactive and command Claude launches use `exec` in the caller's directory. |
 | `notify/review.py` | Loads the current directory's env before the Claude reviewer starts; refusal returns an unreviewed result. |
 | `make_a_worktree/direnv_allow.sh` | Thin, silent-on-success `ensure` call; failure retains the helper's stderr and exit status. `commands/make_a_worktree.md` requires stopping on failure. |
-
-The berth fixer reserves its conversation id before launch. It uses `-r` only
-when that id's transcript exists in `${CLAUDE_CONFIG_DIR:-$HOME/.claude}/projects`;
-otherwise a rerun keeps the id and uses `--session-id`. Claude encodes the
-worktree path by replacing each character outside ASCII letters and digits
-with `-`, including slashes, dots and underscores. Every launch also repairs
-history left under the legacy worktree path after an interrupted checkout move,
-using the selected account's projects directory. It moves the old history only
-when that folder exists and the new one does not.
 
 `herdr agent start --help` and the herdr adoption documentation specify that
 `--kind claude` selects the executable itself. Prefixing its argument list with
@@ -119,8 +112,7 @@ only its `nix_env:` line before verification runs. A caller already in the nix
 shell takes the original path silently. If the re-run loses shell proof while
 `NIX_ENV_ENVRC` still names the loaded file, it refuses with one line instead
 of another re-exec. The internal marker is removed before tool setup.
-The final command's exit status passes through. This also covers Codex workers
-whose shared mesh server cannot carry each worktree's environment.
+The final command's exit status passes through.
 `user_clock` runs `user_zone.py` with `python3 -S`; that helper and `/zone` share
 the `stored_zone` configuration reader.
 
@@ -136,6 +128,12 @@ that status until no more guards are found. Nested functions and classes are
 excluded from each body's scan, and methods and other-module attribute calls
 do not establish module guards. Shell scripts must reference the helper.
 No file is exempt.
+
+## Agent operation environment
+
+`nix_env.py exec` filters its final environment immediately before `os.execvpe`.
+The [model registry boundary](agent-registry.md#agent-environment-boundary) defines which operation values the filter removes.
+Helpers retain these values until the agent starts.
 
 ## Existing sessions
 
@@ -216,7 +214,7 @@ The local five-minute sweep is a notifier timer, registered on main on natedev:
 
 The showrunner still owns the bare `claude` and `codex` PATH wrappers in
 `/etc/nixos`; each must call this helper with the real absolute executable.
-Accounts-unit owns `accounts.py exec`, which calls `launch_shell_environment`;
+Accounts owns `accounts.py exec`, which calls `launch_shell_environment`;
 the scan recognizes that function as a guard.
 
 

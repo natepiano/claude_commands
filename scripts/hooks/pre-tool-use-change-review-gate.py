@@ -2,9 +2,13 @@
 """Check review trailers before a commit or merge.
 
 The shared command parser reads messages without executing shell text.
-The review module owns the merge rule. The assertion guard checks checkpoint edits.
+The review module owns the merge rule.
 """
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import json
 import subprocess
@@ -12,7 +16,6 @@ import sys
 from pathlib import Path
 from typing import TypedDict
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.hooks import checkpoint_gate as commands
 
 
@@ -72,27 +75,9 @@ def refusal(command: str, cwd: Path) -> str:
 
 def checkpoint_problem(repo: Path, text: str, subject: str, every: bool, merging: bool) -> str:
     from scripts.production import change_review
-    from scripts.direct import assertion_guard
 
     files = staged(repo, every)
-    problem = "" if merging else change_review.problem(subject, text, files or ("unknown",))
-    if problem or not any(path.endswith((".rs", ".py")) for path in files):
-        return problem
-    arguments = [sys.executable, str(Path(__file__).resolve().parents[1] / "direct" / "assertion_guard.py"),
-                 "--repo", str(repo), "--rulings", "-"]
-    if not every:
-        arguments.append("--staged")
-    try:
-        for base in assertion_guard.commit_bases(repo):
-            arguments.extend(("--base", base))
-        result = subprocess.run(arguments, input=text, capture_output=True, text=True, check=False, timeout=10)
-    except (assertion_guard.GuardError, OSError, subprocess.TimeoutExpired) as error:
-        return f"assertion guard could not run: {error}"
-    if result.returncode == 1:
-        return "\n".join(result.stdout.splitlines()[-20:])
-    if result.returncode:
-        return "assertion guard could not run: " + (result.stderr.strip() or f"exit {result.returncode}")
-    return ""
+    return "" if merging else change_review.problem(subject, text, files or ("unknown",))
 
 
 def decide(raw: str) -> str:

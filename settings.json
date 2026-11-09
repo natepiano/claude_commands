@@ -4,7 +4,8 @@
     "CLAUDE_CODE_DISABLE_BG_SHELL_PRESSURE_REAP": "1",
     "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "1",
     "ENABLE_LSP_TOOL": "1",
-    "TMPPREFIX": "/tmp/claude/zsh"
+    "TMPPREFIX": "/tmp/claude/zsh",
+    "DISABLE_AUTOUPDATER": "1"
   },
   "includeCoAuthoredBy": false,
   "permissions": {
@@ -17,6 +18,7 @@
       "Read(~/.claude2/projects/**/tool-results/**)",
       "Read(~/.claude3/projects/**/tool-results/**)",
       "Read(~/.claude4/projects/**/tool-results/**)",
+      "Read(~/.claude5/projects/**/tool-results/**)",
       "Bash(cargo *)",
       "Bash(cargo-berth *)",
       "Bash(gh *)",
@@ -53,6 +55,7 @@
       "Edit(~/.claude2/**)",
       "Edit(~/.claude3/**)",
       "Edit(~/.claude4/**)",
+      "Edit(~/.claude5/**)",
       "Edit(~/Library/Application Support/**)",
       "Edit(//tmp/claude/**)",
       "Read(~/.cargo/registry/src**)",
@@ -62,7 +65,6 @@
       "Read(//var/folders/rf/twhh0jfd243fpltn5k0w1t980000gn/T/**)",
       "Read(/private/tmp*)",
       "mcp__brp",
-      "Bash(~/.claude/scripts/berth_fix/*)",
       "Bash(zsh ~/.claude/scripts/direct/unit_notifier.sh *)",
       "Bash(bash ~/.claude/scripts/direct/verify.sh *)",
       "Bash(bash ~/.claude/scripts/direct/implement.sh *)",
@@ -98,7 +100,7 @@
       "Bash(date)",
       "Bash(true)",
       "Bash(git ls-files)",
-      "Bash(python3 ~/.claude/scripts/direct/progress_history.py *)",
+      "Bash(~/.claude/scripts/lib/py ~/.claude/scripts/direct/progress_history.py *)",
       "Bash(~/.claude/scripts/lib/py ~/.claude/scripts/style/style_plan.py *)"
     ],
     "deny": [
@@ -113,7 +115,6 @@
       "Bash(gh auth token*)",
       "Bash(gh auth refresh*)",
       "Bash(gh auth setup-git*)",
-      "Bash(gh gist *)",
       "Bash(gh extension *)",
       "Bash(gh alias *)",
       "Bash(gh ssh-key *)",
@@ -146,13 +147,16 @@
       "Read(~/.codex*/auth.json)"
     ],
     "ask": [
+      "Bash(gh gist *)",
       "Bash(git push --force*)",
       "Bash(git push * --force*)",
       "Bash(git push -f*)",
-      "Bash(git push * -f*)",
+      "Bash(git push * -f)",
+      "Bash(git push * -f *)",
       "Bash(git push --mirror*)",
       "Bash(git push * --mirror*)",
-      "Bash(git push * +*)",
+      "Bash(git push * +refs/*)",
+      "Bash(git push * +HEAD*)",
       "Bash(git push * :main*)",
       "Bash(git push * --delete main*)",
       "Bash(git push --delete * main*)",
@@ -236,6 +240,16 @@
     "nightly_review": "user-invocable-only"
   },
   "hooks": {
+    "PostCompact": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$HOME/.claude/scripts/lib/py\" \"$HOME/.claude/scripts/hooks/compaction-marker-clear.py\""
+          }
+        ]
+      }
+    ],
     "PostToolUse": [
       {
         "matcher": "Bash",
@@ -261,7 +275,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "\"$HOME/.claude/scripts/lib/py\" \"$HOME/.claude/scripts/hooks/showrunner-compaction.py\""
+            "command": "\"$HOME/.claude/scripts/lib/py\" \"$HOME/.claude/scripts/hooks/pre-compact-marker.py\" --family claude"
           }
         ]
       }
@@ -394,7 +408,14 @@
           {
             "type": "command",
             "command": "\"$HOME/.claude/scripts/lib/py\" \"$HOME/.claude/scripts/hooks/hook_dispatch.py\" stop",
-            "timeout": 2430
+            "timeout": 1850
+          },
+          {
+            "type": "command",
+            "command": "\"$HOME/.claude/scripts/lib/py\" \"$HOME/.claude/scripts/hooks/stop-direct-continue.py\"",
+            "timeout": 60,
+            "asyncRewake": true,
+            "rewakeSummary": "Continuing the unit run"
           }
         ]
       }
@@ -454,6 +475,7 @@
         "~/.claude2",
         "~/.claude3",
         "~/.claude4",
+        "~/.claude5",
         "~/.local/state/gh-1password",
         "~/.local/state/plan-delegate",
         "~/Library/Application Support",
@@ -474,7 +496,7 @@
   },
   "feedbackDrafts": "quiet",
   "alwaysThinkingEnabled": true,
-  "autoCompactWindow": 283800,
+  "autoCompactWindow": 258000,
   "askUserQuestionTimeout": "never",
   "remote": {
     "defaultEnvironmentId": "env_01DRVkPj3Ec3qaNwfki4iyms"
@@ -528,5 +550,6 @@
   "voiceEnabled": true,
   "feedbackSurveyState": {
     "lastShownTime": 1754090074729
-  }
+  },
+  "precomputeCompactionEnabled": false
 }

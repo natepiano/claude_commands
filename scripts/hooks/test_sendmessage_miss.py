@@ -5,7 +5,6 @@ import json
 import os
 import shlex
 import subprocess
-import sys
 import unittest
 from dataclasses import replace
 from pathlib import Path
@@ -18,10 +17,9 @@ from unittest.mock import patch
 
 from scripts.lib.socket_test_support import short_socket_directory
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "message"))
-from codex_test_support import FakeDaemon, loaded_session_daemon, write_codex_account
-from relay_identity import relay_session_name
-from relay_test_support import write_relay_session
+from scripts.message.codex_test_support import FakeDaemon, loaded_session_daemon, write_codex_account
+from scripts.message.relay_identity import relay_session_name
+from scripts.message.relay_test_support import write_relay_session
 
 HOOK = Path(__file__).with_name("post-tool-use-sendmessage-miss.py")
 
@@ -62,19 +60,19 @@ class SendMessageMissTests(unittest.TestCase):
     def loaded_daemon(self, home: Path, members: dict[str, str], *,
                       expect_contact: bool = True) -> Generator[FakeDaemon, None, None]:
         for identity, name in members.items():
-            self.members[identity] = staff.StaffRow(staff.StaffId(identity), "unit", name, None,
+            self.members[identity] = staff.StaffRow(staff.StaffId(identity), "unit", name, staff.StaffRoot(),
                                                    current_session=staff.StaffId(identity))
         with loaded_session_daemon(home, members, expect_contact=expect_contact) as daemon:
             yield daemon
 
     def peer_snapshot(self, *, name: str = "", problems: tuple[str, ...] = ()) -> None:
         if name:
-            self.members["peer-thread"] = staff.StaffRow(staff.StaffId("peer-thread"), "unit", name, None,
+            self.members["peer-thread"] = staff.StaffRow(staff.StaffId("peer-thread"), "unit", name, staff.StaffRoot(),
                                                        current_session=staff.StaffId("peer-thread"))
         with patch.dict(os.environ, self.environment, clear=True):
-            import codex_daemon
-            import roster
-            from codex_test_support import daemon_session_row
+            from scripts.message import codex_daemon
+            from scripts.message import roster
+            from scripts.message.codex_test_support import daemon_session_row
 
             rows = [replace(daemon_session_row(codex_daemon.CodexDaemon(
                 self.home, self.home / "app-server-control/app-server-control.sock"), "peer-thread", name),
@@ -161,7 +159,7 @@ class SendMessageMissTests(unittest.TestCase):
         self.assert_silent_without_roster(success=True)
 
     def test_a_clean_miss_checks_the_peer_before_reporting_no_session(self) -> None:
-        self.members["missing"] = staff.StaffRow(staff.StaffId("missing"), "unit", "morty", None,
+        self.members["missing"] = staff.StaffRow(staff.StaffId("missing"), "unit", "morty", staff.StaffRoot(),
                                                  current_session=staff.StaffId("missing"))
         text = self.additional_context(self.run_hook())
         self.assertIn("no session named 'morty' on either machine either", text)
@@ -192,7 +190,7 @@ class SendMessageMissTests(unittest.TestCase):
         self.assertIn('--to "<one listed address>"', text)
 
     def test_a_roster_error_is_context_and_never_blocks(self) -> None:
-        self.members["missing"] = staff.StaffRow(staff.StaffId("missing"), "unit", "morty", None,
+        self.members["missing"] = staff.StaffRow(staff.StaffId("missing"), "unit", "morty", staff.StaffRoot(),
                                                  current_session=staff.StaffId("missing"))
         self.peer_snapshot(problems=("fixture peer failure",))
         text = self.additional_context(self.run_hook())

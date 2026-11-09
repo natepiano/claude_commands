@@ -3,15 +3,10 @@ from __future__ import annotations
 
 import os
 import subprocess
-import sys
 from collections.abc import Mapping
-from pathlib import Path
 from typing import Literal, TypedDict
 
-from scripts.message import send as message_send, send_result, send_budget
-
-SCRIPTS = Path(__file__).resolve().parents[1]
-SEND = SCRIPTS / "message/send.py"
+from scripts.message import send as message_send, send_result, send_budget, session_send
 
 class MessageSent(TypedDict):
     kind: Literal["sent"]
@@ -58,7 +53,7 @@ def message_was_delivered(outcome: Mapping[str, object]) -> bool:
 
 def _send_command() -> list[str]:
     override = os.environ.get("SHUTDOWN_SEND")
-    return [override] if override else [sys.executable, str(SEND)]
+    return [override] if override else session_send.send_argv()
 
 
 def _deliver_message(
@@ -95,6 +90,8 @@ def _deliver_message(
                 return MessageReplaced(kind="replaced", reason=detail)
             case "queued":
                 return MessageQueued(kind="queued", reason=detail)
+            case "retry":
+                raise RuntimeError(f"send to {recipient} needs a retry: {detail}")
             case "failed" | "refused" | "held" | "pending":
                 pass
     if isinstance(outcome, send_result.UnconfirmedSendOutcome):

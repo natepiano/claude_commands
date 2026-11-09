@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from scripts.shutdown import remote
+
 import importlib
 import json
 import os
@@ -224,24 +226,15 @@ class ProductionPathsTests(unittest.TestCase):
             capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS,
         )
         self.assertEqual(result.returncode, 0, result.stderr)
-        plan = branch_worktree / "docs" / "plan.md"
-        plan.parent.mkdir()
-        _ = plan.write_text("# Unit plan\n", encoding="utf-8")
-        _ = document.write_text(
-            "".join((
-                "# Production\n\n- **Repository:** `/repo/main`\n",
-                "- **Showrunner checkout:** `/repo/main`\n\n",
-                "## Units\n\n| Unit | Worktree | Plan |\n| --- | --- | --- |\n",
-                f"| a | `/wrong/cell` | `{plan}` |\n",
-            )),
-            encoding="utf-8",
-        )
+        _ = document.write_text("# Production\n\n- **Repository:** `/repo/main`\n", encoding="utf-8")
         with isolated_staff_file(Path(directory.name) / "staff.json", {}):
-            owner = fixture_member("showrunner", name="sample", doc=staff.LiveDoc("natedev", document))
+            owner = fixture_member("showrunner", name="sample", doc=staff.LiveDoc(remote.local_machine(), document))
             _ = fixture_member("unit", name="a", parent=owner.id,
-                               worktree=staff.PresentWorktree("natedev", Path("/director")))
+                               worktree=staff.PresentWorktree(remote.local_machine(), branch_worktree))
+            self.assertEqual(tuple(outcomes.production_owners(document.parent, staff.snapshot())), (owner,))
+            self.assertEqual(tuple(outcomes.production_owners(document.parent / "other", staff.snapshot())), ())
             self.assertEqual(
-                outcomes.production_paths(document),
+                outcomes.production_paths(owner),
                 (Path("/repo/main"), branch_worktree),
             )
 
@@ -260,20 +253,13 @@ class ProductionPathsTests(unittest.TestCase):
         ):
             _ = subprocess.run(command, capture_output=True, check=True, timeout=TEST_HANG_GUARD_SECS)
         document = root / "sample-production.md"
-        _ = document.write_text(
-            "".join((
-                "# Production\n\n- **Repository:** `/wrong/header`\n\n",
-                "## Units\n\n| Unit | Worktree |\n| --- | --- |\n",
-                f"| a | `{worktree}` |\n",
-            )),
-            encoding="utf-8",
-        )
+        _ = document.write_text("# Production\n\n- **Repository:** `/wrong/header`\n", encoding="utf-8")
         _ = self.enterContext(isolated_staff_file(Path(directory.name) / "staff.json", {}))
         owner = recorded_showrunner("fixture-owner", document)
         _ = fixture_member("unit", name="a", parent=owner.id,
-                           worktree=staff.PresentWorktree("natedev", worktree))
+                           worktree=staff.PresentWorktree(remote.local_machine(), worktree))
         self.assertEqual(
-            outcomes.production_paths(document),
+            outcomes.production_paths(owner),
             (repository, worktree),
         )
 
@@ -589,13 +575,13 @@ class OutcomeTests(OutcomeFixture):
                      "checkpoint(fixture-plan): phase 6 — Other repository")
         second = self.git(second_repo, "rev-parse", "HEAD")
         _ = (self.production_docs / "fixture-production.md").write_text(
-            f"- **Repository:** `{second_repo}`\n\n## Units\n\n| Worktree |\n| --- |\n| `{self.repository}` |\n",
+            f"- **Repository:** `{second_repo}`\n",
             encoding="utf-8")
         owner = recorded_showrunner("second-owner", self.production_docs / "fixture-production.md")
         _ = fixture_member("unit", name="second", parent=owner.id,
-                           worktree=staff.PresentWorktree("natedev", second_repo))
+                           worktree=staff.PresentWorktree(remote.local_machine(), second_repo))
         _ = fixture_member("unit", name="first", parent=owner.id,
-                           worktree=staff.PresentWorktree("natedev", self.repository))
+                           worktree=staff.PresentWorktree(remote.local_machine(), self.repository))
         _ = self.collect()
         self.assertEqual({cast(str, row["commit_id"]) for row in self.rows("SELECT * FROM checkpoints")}, {first, side, second})
         _ = self.collect()
@@ -636,12 +622,11 @@ class OutcomeTests(OutcomeFixture):
     def test_removed_worktree_named_by_production_doc_leaves_checkpoints_ready(self) -> None:
         commit_id = self.commit("checkpoint(fixture-plan): phase 6 — Outcomes")
         _ = (self.production_docs / "fixture-production.md").write_text(
-            "## Units\n\n| Unit | Plan | Worktree |\n| --- | --- | --- |\n"
-            + f"| retired-unit | docs/plan.md | `{self.root / 'removed-worktree'}` |\n", encoding="utf-8")
+            "# Production\n", encoding="utf-8")
         owner = fixture_member("showrunner", name="fixture",
-                               doc=staff.LiveDoc("natedev", self.production_docs / "fixture-production.md"))
+                               doc=staff.LiveDoc(remote.local_machine(), self.production_docs / "fixture-production.md"))
         _ = fixture_member("unit", name="retired", parent=owner.id,
-                           worktree=staff.RemovedWorktree("natedev", self.root / "removed-worktree"))
+                           worktree=staff.RemovedWorktree(remote.local_machine(), self.root / "removed-worktree"))
         output = self.collect()
         self.assert_family_state(output, "natedev", "checkpoints", "ready")
         self.assertEqual({cast(str, row["commit_id"]) for row in self.rows("SELECT * FROM checkpoints")}, {commit_id})
@@ -772,9 +757,12 @@ class OutcomeTests(OutcomeFixture):
         with closing(sqlite3.connect(self.db_path)) as database, database:
             for table in ("openings", "edits", *OUTCOME_TABLES, "checkpoints", "account_readings", "account_role_changes"):
                 _ = database.execute(f"DROP TABLE {table}")
+            _ = database.execute("ALTER TABLE cursors DROP COLUMN context")
             _ = database.execute("PRAGMA user_version = 0")
             _ = database.execute("INSERT INTO cursors VALUES ('natedev', 'old-cursor-sentinel', 123)")
         output = self.collect()
+        self.assertEqual([cast(str, row["name"]) for row in self.rows("PRAGMA table_info(cursors)")],
+                         ["machine", "path", "offset", "context"])
         self.assertEqual(cast(int, self.rows("PRAGMA user_version")[0][0]), version)
         self.assertFalse(self.rows("SELECT * FROM cursors WHERE path = 'old-cursor-sentinel'"))
         self.assertEqual(self.all_values(self.rows("SELECT * FROM turns ORDER BY family, agent_id, turn_key")), before)
@@ -783,7 +771,7 @@ class OutcomeTests(OutcomeFixture):
         self.assert_source_additions(output, "claude", 0)
         self.assert_source_additions(output, "codex", 0)
         with closing(sqlite3.connect(self.db_path)) as database, database:
-            _ = database.execute("INSERT INTO cursors VALUES ('natedev', 'current-cursor-sentinel', 456)")
+            _ = database.execute("INSERT INTO cursors (machine, path, offset) VALUES ('natedev', 'current-cursor-sentinel', 456)")
         before_rows = self.snapshot()
         _ = self.collect()
         self.assertEqual(self.snapshot(), before_rows, "The new version does not clear cursors again")
@@ -804,7 +792,8 @@ class MacOutcomeTests(OutcomeFixture):
         binary_directory = self.root / "bin"
         binary_directory.mkdir()
         ssh = binary_directory / "ssh"
-        _ = shutil.copyfile(COLLECT_FIXTURES / "mac/fake_ssh.py", ssh)
+        _ = ssh.write_text((COLLECT_FIXTURES / "mac/fake_ssh.py").read_text().replace(
+            "${HOME}/.claude/scripts/lib/py", str(Path(__file__).resolve().parents[1] / "lib/py")))
         ssh.chmod(0o700)
 
     def mac_collect(self, behavior: SshBehavior = "complete") -> MacRun:
@@ -1092,14 +1081,14 @@ class MacOutcomeTests(OutcomeFixture):
 
 
 
-from scripts.production.staff_test_support import StaffTestCase, without_worktree_column
+from scripts.production.staff_test_support import StaffTestCase
 
 
 class BranchRepositoryLocationTests(StaffTestCase):
-    def test_repository_discovery_uses_the_plan_worktree_without_the_worktree_column(self) -> None:
+    def test_repository_discovery_uses_the_staff_worktree(self) -> None:
         fixture = self.separated_unit_folders()
-        without_worktree_column(fixture.doc)
-        self.assertEqual(outcomes.production_paths(fixture.doc), (fixture.doc.parents[1], fixture.worktree))
+        with patch.object(staff.StaffSnapshot, "by_doc", side_effect=AssertionError("repeated owner lookup")):
+            self.assertEqual(outcomes.production_paths(fixture.runner), (fixture.doc.parents[1], fixture.worktree))
 
 
 if __name__ == "__main__":

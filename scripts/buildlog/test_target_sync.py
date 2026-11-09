@@ -14,12 +14,13 @@ from typing import cast, override
 import unittest
 from unittest import mock
 
-import health
-import record
-import store
-import sync
-import vault_pull
-from test_index import point_root_at
+from scripts.buildlog import ci
+from scripts.buildlog import health
+from scripts.buildlog import record
+from scripts.buildlog import store
+from scripts.buildlog import sync
+from scripts.buildlog import vault_pull
+from scripts.buildlog.test_index import point_root_at
 
 
 class TargetSyncTests(unittest.TestCase):
@@ -99,6 +100,60 @@ class TargetSyncTests(unittest.TestCase):
         self.assertEqual({argv[-2] for argv in self.pulls()}, {
             f"fake-mac:{sync.REMOTE_ROOT}", f"fake-aws:{sync.REMOTE_ROOT}",
         })
+
+    def test_finished_target_exchanges_only_its_host_with_configured_timeouts(self) -> None:
+        _ = (self.registry.parent / "aws.conf").write_text("host=aws-build\nci_repo=\n")
+        with redirect_stdout(io.StringIO()):
+            sync.sync_target("aws")
+
+        self.assertEqual(self.peers(), ["aws-build"])
+        pull, = self.pulls()
+        self.assertEqual(pull[-2:], [f"aws-build:{sync.REMOTE_ROOT}", f"{self.root}/"])
+        self.assertIn("--include=/aws-build/***", pull)
+        self.assertNotIn("--include=/Mac/***", pull)
+        for argv, timeout in self.commands:
+            self.assertEqual(timeout, 7 if argv[0] == "ssh" else 11)
+            self.assertIn("ConnectTimeout=3", " ".join(argv))
+
+    def test_finished_target_skips_a_running_sync_without_contacting_the_peer(self) -> None:
+        output = io.StringIO()
+        with sync.sync_lock(), redirect_stdout(output):
+            sync.sync_target("aws")
+
+        self.assertEqual(self.commands, [])
+        self.assertEqual(len(output.getvalue().splitlines()), 1)
+        self.assertIn("another sync holds the lock", output.getvalue())
+
+    def test_finished_target_holds_the_sync_lock_during_every_command(self) -> None:
+        def reply(argv: list[str], timeout: float) -> subprocess.CompletedProcess[str] | None:
+            with self.assertRaises(BlockingIOError), sync.sync_lock(blocking=False):
+                self.fail("The exchange must hold the sync lock")
+            return self.command_reply(argv, timeout)
+
+        with mock.patch.object(sync, "run", side_effect=reply), redirect_stdout(io.StringIO()):
+            sync.sync_target("aws")
+        self.assertEqual(self.peers(), ["fake-aws"])
+
+    def test_finished_target_respects_pause_and_missing_host_mapping(self) -> None:
+        with redirect_stdout(io.StringIO()):
+            _ = sync.pause("fixture pause")
+            sync.sync_target("aws")
+            _ = sync.resume()
+            _ = self.registry.write_text(self.registry.read_text().replace("sync.hosts.aws=aws-build", "sync.hosts.aws="))
+            sync.sync_target("aws")
+        self.assertEqual(self.commands, [])
+
+    def test_finished_target_failure_prints_one_line_and_preserves_retry(self) -> None:
+        self.unavailable.add("fake-aws")
+        output = io.StringIO()
+        with redirect_stdout(output):
+            sync.sync_target("aws")
+        self.assertEqual(len(output.getvalue().splitlines()), 1)
+        self.assertFalse(self.status("aws").ok)
+        self.unavailable.clear()
+        with redirect_stdout(io.StringIO()):
+            sync.sync_target("aws")
+        self.assertTrue(self.status("aws").ok)
 
     def test_unreachable_mac_does_not_prevent_aws_exchange(self) -> None:
         self.unavailable.add("fake-mac")
@@ -290,16 +345,18 @@ class TargetSyncTests(unittest.TestCase):
 
         def reply(argv: list[str], timeout: float) -> subprocess.CompletedProcess[str]:
             self.assertEqual(timeout, vault_pull.COMMAND_TIMEOUT_S)
-            commands.append(argv)
-            return subprocess.CompletedProcess(argv, 0, "VAULT_OUTCOME=pulled:0\n" if argv[0] == "ssh" else "", "")
+            if argv[0] == "ssh" or f"{sync.peer_name()}:rust/hanadocs" in argv:
+                commands.append(argv)
+            outcome = f"VAULT_OUTCOME=merged:0:{'a' * 40}\n" if argv[0] == "ssh" else ""
+            return subprocess.CompletedProcess(argv, 0, outcome, "")
 
-        with mock.patch.object(vault_pull, "run", side_effect=reply):
+        with mock.patch.object(vault_pull, "run", side_effect=reply), mock.patch.object(ci, "warm", return_value=True):
             self.assertIsInstance(vault_pull.pull(), vault_pull.Current)
         self.assertTrue(all("ConnectTimeout=3" in " ".join(argv) for argv in commands))
         commands.clear()
         _ = self.registry.write_text(self.registry.read_text().replace(
             "sync.connect_timeout_s=3", "sync.connect_timeout_s=9"))
-        with mock.patch.object(vault_pull, "run", side_effect=reply):
+        with mock.patch.object(vault_pull, "run", side_effect=reply), mock.patch.object(ci, "warm", return_value=True):
             self.assertIsInstance(vault_pull.pull(), vault_pull.Current)
         self.assertTrue(all("ConnectTimeout=9" in " ".join(argv) for argv in commands))
 

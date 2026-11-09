@@ -1,7 +1,8 @@
 """Claude session warnings, Codex log markers and legacy notice cleanup."""
 from __future__ import annotations
 
-import sys
+import io
+from contextlib import redirect_stdout
 import tempfile
 import subprocess
 import os
@@ -14,30 +15,29 @@ from pathlib import Path
 from typing import cast, override
 from unittest.mock import patch
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from scripts.whoami import agent_accounts
 from scripts.whoami import note_file
 from scripts.whoami.agent_accounts import KnownCodexAccount, UnknownCodexAccount
-import five_hour
+from scripts.whoami import five_hour
 from scripts.whoami.agent_accounts import CodexHomeSource, CodexRateLimits, Quota, Report
 from scripts.accounts import accounts, role_map
 from scripts.production.staff_test_support import isolated_staff_file, recorded_showrunner
 
-import escalate  # five_hour puts scripts/message on the path
-import quota_alert
-import push_texts
-import send
-import sessions
-from quota_alert import Config, Showrunner
-from user_action import NoActionRequired
+from scripts.message import escalate  # five_hour puts scripts/message on the path
+from scripts.whoami import quota_alert
+from scripts.notify import push_texts
+from scripts.message import send
+from scripts.message import sessions
+from scripts.whoami.quota_alert import Config, Showrunner
+from scripts.notify.user_action import NoActionRequired
 
 NOW = datetime(2026, 10, 15, 18, 20, tzinfo=timezone.utc)
 RESETS = NOW.replace(hour=21)
 CONFIG = cast(Config, cast(object, {
     "threshold_percent": 2, "repeat_minutes": 30, "stall_minutes": 5, "faults_to": "hana", "always": ["natedev"],
 }))
-SHOWRUNNERS = [Showrunner(session="hana", socket="/hana.sock", slug="show", zone="America/Los_Angeles", doc="")]
+SHOWRUNNERS = [Showrunner(session="hana", socket="/hana.sock", name="show", zone="America/Los_Angeles", doc="")]
 CLAUDE_LOGIN = "claude-fixture@example.invalid"
 
 
@@ -293,9 +293,11 @@ class WatchTests(unittest.TestCase):
             concurrent.append(self.watch([report("Claude", 90)]))
 
         with (patch.object(five_hour, "recipients", return_value=["natedev"]),
-              patch.object(five_hour, "relay", side_effect=relay)):
+              patch.object(five_hour, "relay", side_effect=relay),
+              redirect_stdout(io.StringIO()) as output):
             self.assertEqual(self.watch([report("Claude", 90)]),
                              ["5-hour limit: Claude 10% left -> natedev"])
+        self.assertEqual(output.getvalue(), f"already claimed by {os.getpid()}\n")
         self.assertEqual(concurrent, [[]])
         self.assertEqual(len(self.sent), 1)
         self.assertEqual(five_hour.notice_path(claude_notice_key()).read_text(), "Claude")

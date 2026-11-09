@@ -1,4 +1,4 @@
-"""The runner owns style writes while its retained reviewer stays read-only."""
+"""The runner owns style writes while the Claude reviewer remains read-only."""
 from __future__ import annotations
 
 import json
@@ -23,12 +23,12 @@ class StyleLauncherTests(support.ReviewLauncherFixture):
         environment["STUB_FINDINGS"] = ("1. minor: sample finding at reviewed.txt:1\n" if outcome == "Findings" else "") + (
             "No marked report\n" if outcome == "missing" else
             f"{BEGIN}\n| # | Rule | Result |\n| 1 | Scanner | Pass |\nStyle review: {outcome}\n{END}\n")
-        environment["STUB_MESH_CALLS"] = str(self.root / "style-mesh-calls")
+        environment["STUB_AGENT_CALLS"] = str(self.root / "style-agent-calls")
         if fail:
             environment["STUB_TURN_FAILURE"] = "1"
         if outcome != "missing" and since == "HEAD" and not fail:
             environment["STUB_EXPECT_PREPARED_STYLE"] = "1"
-        command = self.unit_review_command(session)
+        command = self.review_command(session)
         command[2:2] = ["--phase", "3", "--style-since", since]
         if until:
             command[2:2] = ["--style-until", until]
@@ -50,7 +50,7 @@ class StyleLauncherTests(support.ReviewLauncherFixture):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         state = self.state(session)
         self.assertEqual(state["state"], "complete")
-        prompt = (session / "follow_message.txt").read_text()
+        prompt = (session / "agent_prompt_received.txt").read_text()
         self.assertEqual(prompt.count("## Phase style review"), 1)
         self.assertNotIn("$diff", prompt)
         self.assertIn("Skip every write step", prompt)
@@ -70,19 +70,19 @@ class StyleLauncherTests(support.ReviewLauncherFixture):
         self.assertEqual(state["until"], end)
         directory = Path(str(state["input_directory"]))
         self.assertEqual((directory / "style-review-additions.txt").read_text(), "+new content\n")
-        calls = [cast(list[str], json.loads(line)) for line in (self.root / "style-mesh-calls").read_text().splitlines()]
-        follow = next(call for call in calls if call[0] == "follow")
-        self.assertIn("--read-only", follow)
-        self.assertNotIn("--sandbox", follow)
+        calls = [cast(list[str], json.loads(line)) for line in (self.root / "style-agent-calls").read_text().splitlines()]
+        dispatch, = calls
+        self.assertEqual(dispatch[1], "readonly")
+        self.assertNotIn("--sandbox", dispatch)
 
-    def test_pass_and_rerun_use_new_inputs_and_the_same_thread(self) -> None:
+    def test_pass_and_rerun_use_new_inputs_without_turn_records(self) -> None:
         session = self.session_with_changes("style-rerun")
         first = self.launch(session)
         self.assertEqual(first.returncode, 0, first.stderr)
         old = self.state(session)
         old_input = Path(str(old["input_directory"]))
         before = (old_input / "style-review.diff").read_bytes()
-        roster = (session / "mesh_roster.json").read_bytes()
+        self.assertEqual(self.turn_records(session), [])
         _ = (self.working_dir / "reviewed.txt").write_text("retry content\n")
         second = self.launch(session)
         self.assertEqual(second.returncode, 0, second.stderr)
@@ -90,8 +90,8 @@ class StyleLauncherTests(support.ReviewLauncherFixture):
         self.assertNotEqual(self.state(session)["input_directory"], old["input_directory"])
         self.assertEqual((old_input / "style-review.diff").read_bytes(), before)
         self.assertIn("+retry content", (session / "prepared_at_dispatch.diff").read_text())
-        self.assertEqual(json.loads(roster)["fixture-review"]["thread_id"],
-                         json.loads((session / "mesh_roster.json").read_text())["fixture-review"]["thread_id"])
+        records = self.turn_records(session)
+        self.assertEqual(records, [])
 
     def test_missing_error_and_failed_dispatch_remain_owed(self) -> None:
         for outcome, fail in (("missing", False), ("Error", False), ("Pass", True)):
@@ -113,7 +113,7 @@ class StyleLauncherTests(support.ReviewLauncherFixture):
                 environment = self.environment()
                 environment["LINT_CONFIG_FILE"] = str(config)
                 environment["CONF_DIR"] = str(Path(config).parent)
-                command = self.unit_review_command(session)
+                command = self.review_command(session)
                 command[2:2] = ["--phase", "3", "--style-since", "HEAD"]
                 result = subprocess.run(command, env=environment, text=True, capture_output=True,
                                         check=False, timeout=TEST_HANG_GUARD_SECS)
@@ -121,7 +121,7 @@ class StyleLauncherTests(support.ReviewLauncherFixture):
                 self.assertEqual(self.state(session)["state"], "complete")
                 self.assertIn("Style review: " + ("Off" if off else "No changes to review"),
                               Path(str(self.state(session)["report"])).read_text())
-                self.assertNotIn("## Phase style review", (session / "follow_message.txt").read_text())
+                self.assertNotIn("## Phase style review", (session / "agent_prompt_received.txt").read_text())
 
     def test_preparation_error_leaves_style_owed_but_code_review_runs(self) -> None:
         session = self.session_with_changes("style-bad-base")
@@ -129,7 +129,7 @@ class StyleLauncherTests(support.ReviewLauncherFixture):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(self.state(session)["state"], "owed")
         self.assertIn("invalid baseline", Path(str(self.state(session)["report"])).read_text())
-        self.assertNotIn("## Phase style review", (session / "follow_message.txt").read_text())
+        self.assertNotIn("## Phase style review", (session / "agent_prompt_received.txt").read_text())
         self.assertEqual((session / "phases/3/review_status_contract").read_text().strip(), "reviewed")
 
     def test_a_live_style_pass_refuses_another_dispatch_and_cancellation_allows_retry(self) -> None:
@@ -137,11 +137,11 @@ class StyleLauncherTests(support.ReviewLauncherFixture):
         environment = self.environment()
         finish = self.root / "finish-style-owner"
         environment["STUB_REVIEW_FINISH_FILE"] = str(finish)
-        command = self.unit_review_command(session)
+        command = self.review_command(session)
         command[2:2] = ["--phase", "3", "--style-since", "HEAD"]
         process = subprocess.Popen(command, env=environment, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         try:
-            wait_for_file(session / "follow_message.txt")
+            wait_for_file(session / "agent_prompt_received.txt")
             before = self.state(session)
             retry = list(command)
             retry[retry.index(str(session)) + 6] = "101"
@@ -171,11 +171,11 @@ class StyleLauncherTests(support.ReviewLauncherFixture):
         environment = self.environment()
         finish = self.root / "finish-style-worker"
         environment["STUB_REVIEW_FINISH_FILE"] = str(finish)
-        command = self.unit_review_command(session)
+        command = self.review_command(session)
         command[2:2] = ["--phase", "3", "--style-since", "HEAD"]
         process = subprocess.Popen(command, env=environment, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         try:
-            wait_for_file(session / "follow_message.txt")
+            wait_for_file(session / "agent_prompt_received.txt")
             process.terminate()
             finish.touch()
             out, err = process.communicate(timeout=TEST_HANG_GUARD_SECS)

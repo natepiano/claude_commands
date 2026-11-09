@@ -5,12 +5,9 @@ import unittest
 from pathlib import Path
 from typing import final
 
-import sys
 
 
-PRIORITIZE_DIR = Path(__file__).parents[1]
-sys.path.insert(0, str(PRIORITIZE_DIR))
-import watch_signature  # pyright: ignore[reportImplicitRelativeImport]
+from scripts.prioritize import watch_signature
 
 
 @final

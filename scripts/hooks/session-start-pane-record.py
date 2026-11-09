@@ -6,15 +6,17 @@ The entry is what a restore needs to resume the pane on its own account: see
 """
 
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import json
 import os
 import sys
-from pathlib import Path
 from typing import TypedDict, cast
 from collections.abc import Mapping
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.shutdown import pane_record  # noqa: E402
 from scripts.production import session_staff, staff  # noqa: E402
 from scripts.hooks import staff_session_identity  # noqa: E402
@@ -41,6 +43,9 @@ def main() -> None:
         return
     session = environment.get("HERDR_SESSION") or "default"
     arguments = pane_record.claude_arguments(os.getpid())
+    if not arguments:
+        print("cannot read Claude arguments; retained launch stays unchanged", file=sys.stderr)
+        return
     if "-p" in arguments or "--print" in arguments:
         return
     launch = pane_record.launch(pane_id, session_id, payload.get("cwd") or os.getcwd(), environment, arguments)

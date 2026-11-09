@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import final
 from unittest import mock
 
-import style_rules
+from scripts.style import style_rules
 
 
 @final

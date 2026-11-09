@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
 """Specification tests for frozen backfill ledgers, using only temporary git repos."""
 
 from __future__ import annotations
@@ -17,9 +17,9 @@ from typing import NamedTuple, cast, final, override
 import unittest
 from unittest.mock import patch
 
-from feature_log import state_dir
-import inventory
-from inventory import (
+from scripts.feature_log.feature_log import state_dir
+from scripts.feature_log import inventory
+from scripts.feature_log.inventory import (
     AfterRef,
     BackfillSourceRecord,
     ChangelogSource,
@@ -474,7 +474,7 @@ class InventoryTests(unittest.TestCase):
                     fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
             return real_collect(project, configuration)
 
-        with patch("inventory._collect", side_effect=collect_without_lock):
+        with patch("scripts.feature_log.inventory._collect", side_effect=collect_without_lock):
             _ = self.collect()
         self.assertTrue(read_while_unlocked)
         self.assertEqual(len(self.records()), 15)
@@ -505,7 +505,7 @@ class InventoryTests(unittest.TestCase):
             _ = path.write_bytes(concurrent_bytes)
             return real_collect(project, configuration)
 
-        with patch("inventory._collect", side_effect=collect_after_competing_freeze):
+        with patch("scripts.feature_log.inventory._collect", side_effect=collect_after_competing_freeze):
             result = self.collect()
         self.assertEqual(self.ledger_path().read_bytes(), concurrent_bytes)
         lines = result.stdout.splitlines()

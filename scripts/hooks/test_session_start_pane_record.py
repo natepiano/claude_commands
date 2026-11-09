@@ -43,6 +43,21 @@ class SessionStartPaneRecordTests(StaffTestCase):
                 self.record_start(['claude', flag, 'Review the change'], fixture_runtime_id('print-child'))
                 self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns), before)
 
+    def test_failed_argument_read_keeps_the_recorded_plugin_flags(self) -> None:
+        identity = fixture_runtime_id("postmaster")
+        entry = pane_record.launch("w16:p3", identity, str(self.root), {},
+                                   ["claude", "--plugin-dir", "../postmaster"])
+        pane_record.write("agents", entry)
+        path = pane_record.record_path("agents")
+        before = path.read_bytes(), path.stat().st_mtime_ns
+        output = io.StringIO()
+        with mock.patch("sys.stderr", output):
+            self.record_start([], identity)
+        self.assertEqual(output.getvalue(), "cannot read Claude arguments; retained launch stays unchanged\n")
+        self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns), before)
+        self.assertEqual(pane_record.read_strict("agents")["w16:p3"].get("plugin_directories"),
+                         [str((self.root / "../postmaster").resolve())])
+
     def test_interactive_launch_records_the_new_session_after_identity_handling(self) -> None:
         _, director, _ = self.tree()
         pane_record.write('agents', pane_record.launch('w16:p3', director.id, str(self.root), {}, ['claude']))

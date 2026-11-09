@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import unittest
-from scripts.direct import verify_lint_scope_test_support as support
+from scripts.direct.test_verify_lint_judgment import VerifyLintJudgmentFixture
 
 
-class VerifyLintScopeTests(support.VerifyLintScopeFixture):
+class VerifyLintScopeTests(VerifyLintJudgmentFixture):
     def test_changing_tree_stops_after_three_fix_passes_and_failed_lint_runs_again(self) -> None:
         cache = self.enable_cache()
         self.environment.update({
+            "TEST_CLIPPY_FIRST_STATUS": "101",
             "TEST_FIX_FILE": "src/fix-progress.rs",
             "TEST_GIT_UNTRACKED": "src/fix-progress.rs",
             "TEST_FIX_APPEND": "// fix pass\n",

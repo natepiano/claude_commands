@@ -1,33 +1,23 @@
-"""Fixture tests for names, source coverage, production names and message routing."""
+"""Fixture tests for retired names and source coverage."""
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
 from contextlib import redirect_stderr, redirect_stdout
 from io import StringIO
-import json
 from pathlib import Path
 import subprocess
 import tempfile
 import unittest
 from unittest.mock import call, patch
-from collections.abc import Callable
-from typing import cast
 
 
-import sys
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-
-import roles_audit as audit
-from scripts.production import showrunners
-from scripts.lib.test_names import NAMES_TOML
+from scripts.production import roles_audit as audit, showrunners
+from scripts.lib.test_names import NAMES_TOML, fixture_names
 
 
-def term(name: str, *others: str, defined_in: tuple[str, ...] = ("docs/words.md#Words",),
-         kept: tuple[str, ...] = (), other_meaning_files: tuple[str, ...] = (),
+def term(name: str, *others: str, kept: tuple[str, ...] = (),
          inflected_forms: tuple[audit.NameInflection, ...] = (), retired: tuple[str, ...] = (),
          kept_contexts: tuple[audit.KeptContext, ...] = ()) -> audit.Term:
-    return audit.Term(name, "role", defined_in, others, kept, other_meaning_files,
+    return audit.Term(name, others, kept,
                       inflected_forms, retired, kept_contexts)
 
 
@@ -46,23 +36,18 @@ delegate = ["delegates"]
 '''
 
 
-def message(at: datetime, sender: str = "alpha", recipient: str = "user", **fields: str) -> str:
-    return json.dumps({"time": at.isoformat(), "machine": "natedev", "from": sender,
-                       "to": recipient, "outcome": "sent", **fields})
+def retired_prose_locations(path: str, prose: audit.SourceProse) -> list[tuple[str, int, str]]:
+    terms = (term("maker", "worker", "seat", retired=("worker", "seat")),)
+    files = (audit.LiveFile(path, prose.text, prose.source_lines),)
+    return [(use.path, use.line, use.name) for use in audit.check_retired(terms, files)]
 
 
 class NameTests(unittest.TestCase):
-    def test_names_count_forms_independently_and_check_reports_longest_once(self) -> None:
+    def test_check_reports_longest_name_once(self) -> None:
         terms = (*audit.parse_terms(WORKER_TERMS), term("gate", "/unit:direct"))
         files = (audit.LiveFile("docs/a.md", "worker workers seat seats CODEX SEAT Codex seats "
                                 + "delegate delegates Codex worker Codex workers gate gates "
                                 + "/unit:direct /unit:directs seatbelt seats-unit"),)
-        rows = audit.measure_names(terms, files)
-        self.assertEqual([(row.name, row.hits) for row in rows], [
-            ("worker", 2), ("workers", 2), ("seat", 2), ("seats", 2),
-            ("Codex seat", 1), ("Codex seats", 1), ("delegate", 1), ("delegates", 1),
-            ("Codex worker", 1), ("Codex workers", 1), ("gate", 1), ("/unit:direct", 1),
-        ])
         uses = audit.check_retired(terms, files)
         self.assertEqual([(use.name, use.replacement) for use in uses],
                          [("seat", audit.CurrentName("worker")), ("seats", audit.CurrentName("worker")),
@@ -77,7 +62,14 @@ class NameTests(unittest.TestCase):
             "docs/a.md:1: retired 'seat'; use 'worker'",
         ])
 
-    def test_scoped_protocol_history_and_legacy_contexts_keep_lexical_counts(self) -> None:
+    def test_retired_candidates_keep_boundaries_and_spaces_created_by_masking(self) -> None:
+        terms = (term("worker", "seat", kept=("x",), retired=("seat",)),
+                 term("held design role", "guild head", kept=("x",), retired=("guild head",)))
+        files = (audit.LiveFile("docs/a.md", "Ready.\nxseat\nguildxhead\nguild/head\n"),)
+        self.assertEqual([(use.line, use.name) for use in audit.check_retired(terms, files)],
+                         [(2, "seat"), (3, "guild head")])
+
+    def test_scoped_protocol_history_and_legacy_contexts_keep_retired_uses(self) -> None:
         data = WORKER_TERMS + '''
 [[terms.kept_contexts]]
 path = "docs/protocol.md"
@@ -97,7 +89,6 @@ reason = "Legacy migration input."
                  audit.LiveFile("docs/history.md", "2026-10-16: two Codex seats resumed."),
                  audit.LiveFile("scripts/migrate.py", "DELETE FROM changes WHERE role = 'seats'"))
         self.assertEqual(audit.check_retired(terms, files), ())
-        self.assertEqual(sum(row.hits for row in audit.measure_names(terms, files)), 5)
         self.assertEqual(terms[0].kept_contexts[1].reason, "Dated probe history.")
 
     def test_copied_changed_and_repeated_contexts_do_not_hide_retired_uses(self) -> None:
@@ -130,20 +121,21 @@ reason = "Command placeholder."
             with self.subTest(invalid=invalid), self.assertRaises(ValueError):
                 _ = audit.parse_terms(invalid)
 
-    def test_counts_phrases_files_and_boundaries_but_not_paths_or_kept_commands(self) -> None:
-        terms = (term("worker", "seat", kept=("/keep:seat", "docs/seat/")), term("/unit:direct", "/unit:delegate"))
+    def test_retired_uses_keep_file_boundaries_and_exclude_paths_and_kept_commands(self) -> None:
+        terms = (
+            term("maker", "worker", "seat", kept=("/keep:seat", "docs/seat/"), retired=("worker", "seat")),
+            term("/unit:assign", "/unit:direct", "/unit:delegate", retired=("/unit:direct", "/unit:delegate")),
+        )
         files = (audit.LiveFile("commands/a.md", "Worker worker. seat seatbelt worker-unit /tmp/worker.md "
                                 + "docs/seat/worker.md worker.md /keep:seat /unit:direct /unit:delegate"),
                  audit.LiveFile("docs/b.md", "seat Worker"))
-        rows = audit.measure_names(terms, files)
-        self.assertEqual([(r.name, r.hits, r.files) for r in rows], [
-            ("worker", 3, ("commands/a.md", "docs/b.md")),
-            ("seat", 2, ("commands/a.md", "docs/b.md")),
-            ("/unit:direct", 1, ("commands/a.md",)),
-            ("/unit:delegate", 1, ("commands/a.md",)),
+        self.assertEqual([(use.path, use.line, use.name) for use in audit.check_retired(terms, files)], [
+            ("commands/a.md", 1, "Worker"), ("commands/a.md", 1, "worker"),
+            ("commands/a.md", 1, "seat"), ("docs/b.md", 1, "seat"), ("docs/b.md", 1, "Worker"),
+            ("commands/a.md", 1, "/unit:direct"), ("commands/a.md", 1, "/unit:delegate"),
         ])
 
-    def test_python_strings_exclude_code_comments_docstrings_keys_and_paths(self) -> None:
+    def test_retired_python_prose_excludes_code_comments_docstrings_keys_and_paths(self) -> None:
         source = '''"""worker docs"""
 worker = "worker_key"
 lookup = {"worker": 1}
@@ -155,17 +147,22 @@ parser.add_argument("--worker", help="worker picks a seat")
 if value == "worker":
     pass
 '''
-        rows = audit.measure_names((term("worker", "seat"),),
-                                   (audit.LiveFile("scripts/a.py", audit.python_prose(source).text),))
-        self.assertEqual([(r.name, r.hits) for r in rows], [("worker", 2), ("seat", 2)])
+        self.assertCountEqual(retired_prose_locations("scripts/a.py", audit.python_prose(source)), [
+            ("scripts/a.py", 6, "worker"),
+            ("scripts/a.py", 7, "seat"),
+            ("scripts/a.py", 8, "worker"),
+            ("scripts/a.py", 8, "seat"),
+        ])
 
-    def test_shell_output_excludes_comments_and_assignments(self) -> None:
+    def test_retired_shell_output_excludes_comments_and_assignments(self) -> None:
         text = '# echo "worker"\nWORKER="worker"\necho "worker has a seat" >&2\nprintf "%s\\n" "seat"\n'
-        rows = audit.measure_names((term("worker", "seat"),),
-                                   (audit.LiveFile("scripts/a.sh", audit.shell_prose(text).text),))
-        self.assertEqual([row.hits for row in rows], [1, 2])
+        self.assertCountEqual(retired_prose_locations("scripts/a.sh", audit.shell_prose(text)), [
+            ("scripts/a.sh", 3, "worker"),
+            ("scripts/a.sh", 3, "seat"),
+            ("scripts/a.sh", 4, "seat"),
+        ])
 
-    def test_python_output_follows_variable_labels_and_function_returns(self) -> None:
+    def test_retired_python_output_follows_variable_labels_and_function_returns(self) -> None:
         source = '''labels = {"worker": "seat"}
 label = "worker"
 def choose():
@@ -173,9 +170,41 @@ def choose():
 print(labels["worker"], choose())
 subprocess.run(["echo", "worker has a seat"])
 '''
-        rows = audit.measure_names((term("worker", "seat"),),
-                                   (audit.LiveFile("scripts/a.py", audit.python_prose(source).text),))
-        self.assertEqual([row.hits for row in rows], [1, 1])
+        self.assertCountEqual(retired_prose_locations("scripts/a.py", audit.python_prose(source)), [
+            ("scripts/a.py", 1, "seat"),
+            ("scripts/a.py", 2, "worker"),
+        ])
+
+    def test_retired_shell_output_heredocs_exclude_input_body_commands(self) -> None:
+        text = '''cat <<'EOF'
+worker
+seat
+EOF
+cat <<-"TEXT"
+\tseat
+\tTEXT
+consumer <<'INPUT'
+echo "worker"
+INPUT
+'''
+        self.assertCountEqual(retired_prose_locations("scripts/a.sh", audit.shell_prose(text)), [
+            ("scripts/a.sh", 2, "worker"),
+            ("scripts/a.sh", 3, "seat"),
+            ("scripts/a.sh", 6, "seat"),
+        ])
+
+    def test_retired_shell_output_excludes_test_operands(self) -> None:
+        text = '''if [ "$role" = "worker" ]; then echo "seat"; fi
+test "$role" = "worker" && printf "%s" "seat"
+[[ "$role" == "worker" ]] || echo "seat"
+echo "seat"; test "$role" = "worker"
+'''
+        self.assertCountEqual(retired_prose_locations("scripts/a.sh", audit.shell_prose(text)), [
+            ("scripts/a.sh", 1, "seat"),
+            ("scripts/a.sh", 2, "seat"),
+            ("scripts/a.sh", 3, "seat"),
+            ("scripts/a.sh", 4, "seat"),
+        ])
 
     def test_python_output_uses_its_own_scope_and_visible_module_bindings(self) -> None:
         source = '''label = "worker"
@@ -200,31 +229,20 @@ display("worker")
 '''
         self.assertEqual(audit.python_prose(source).text, "")
 
-    def test_shell_counts_output_heredocs_but_does_not_parse_input_bodies_as_commands(self) -> None:
-        text = '''cat <<'EOF'
-worker
-seat
-EOF
-cat <<-"TEXT"
-\tseat
-\tTEXT
-consumer <<'INPUT'
-echo "worker"
-INPUT
+    def test_nested_helper_returns_keep_their_scope_and_physical_lines(self) -> None:
+        source = '''def outer():
+    def shown():
+        return "worker"
+    def hidden():
+        return "tester"
+    return shown()
+print(outer())
 '''
-        rows = audit.measure_names((term("worker", "seat"),),
-                                   (audit.LiveFile("scripts/a.sh", audit.shell_prose(text).text),))
-        self.assertEqual([row.hits for row in rows], [1, 2])
-
-    def test_shell_counts_only_output_arguments_on_lines_with_test_operands(self) -> None:
-        text = '''if [ "$role" = "worker" ]; then echo "seat"; fi
-test "$role" = "worker" && printf "%s" "seat"
-[[ "$role" == "worker" ]] || echo "seat"
-echo "seat"; test "$role" = "worker"
-'''
-        rows = audit.measure_names((term("worker", "seat"),),
-                                   (audit.LiveFile("scripts/a.sh", audit.shell_prose(text).text),))
-        self.assertEqual([row.hits for row in rows], [0, 4])
+        prose = audit.python_prose(source)
+        self.assertEqual(audit.check_fixed_display(fixture_names(), (
+            audit.LiveFile("scripts/nested.py", prose.text, prose.source_lines,
+                           prose.printed_text, prose.printed_lines),)), (
+                audit.DisplayLabel("scripts/nested.py", 3, "worker"),))
 
     def test_reader_excludes_plans_tests_fixtures_and_non_script_data(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -243,33 +261,14 @@ echo "seat"; test "$role" = "worker"
         self.assertFalse(issues)
         self.assertEqual({file.path for file in files},
                          {"CLAUDE.md", "commands/a.md", "docs/words.md", "skills/a/SKILL.md", "scripts/a.py"})
-        self.assertEqual([row.hits for row in audit.measure_names((term("worker", "seat"),), files)], [3, 2])
+        uses = audit.check_retired((term("maker", "worker", "seat", retired=("worker", "seat")),), files)
+        self.assertEqual([(use.path, use.line, use.name) for use in uses], [
+            ("CLAUDE.md", 1, "worker"), ("commands/a.md", 1, "seat"),
+            ("docs/words.md", 1, "worker"), ("scripts/a.py", 1, "seat"),
+            ("skills/a/SKILL.md", 1, "worker"),
+        ])
 
-    def test_undefined_terms_and_multiple_definition_files_are_separate_findings(self) -> None:
-        terms = (term("worker"), term("landing call", defined_in=()))
-        files = (audit.LiveFile("docs/words.md", "- **Worker** — does work"),
-                 audit.LiveFile("docs/other.md", "**worker** — also does work"))
-        rows = audit.measure_definitions(terms, files)
-        self.assertEqual(rows, (audit.DefinitionFinding("worker", "multiple files", ("docs/other.md", "docs/words.md")),
-                                audit.DefinitionFinding("landing call", "no defined_in", ())))
-
-    def test_definition_discovery_excludes_other_meanings_and_keeps_second_definitions(self) -> None:
-        terms = audit.parse_terms('''[[terms]]
-name = "change"
-kind = "record"
-defined_in = "commands/change_review.md#add"
-other_names = []
-other_meaning_files = ["commands/changelog.md", "commands/commit_prep.md"]
-''')
-        menu_files = (audit.LiveFile("commands/changelog.md", "- **change** - Provide a different entry"),
-                      audit.LiveFile("commands/commit_prep.md", "- **change** - Revise the message"))
-        self.assertEqual(audit.measure_definitions(terms, menu_files), ())
-        second = audit.LiveFile("docs/records.md", "- **change** — A change-review record with a C number")
-        self.assertEqual(audit.measure_definitions(terms, (*menu_files, second)),
-                         (audit.DefinitionFinding("change", "multiple files",
-                                                  ("commands/change_review.md", "docs/records.md")),))
-
-    def test_terms_support_kept_names_and_multiple_sources_and_reject_invalid_data(self) -> None:
+    def test_terms_support_kept_names_and_reject_invalid_data(self) -> None:
         text = '''[[terms]]
 name = "worker"
 kind = "role"
@@ -278,11 +277,25 @@ other_names = ["seat"]
 kept = ["docs/seat/"]
 '''
         self.assertEqual(audit.parse_terms(text),
-                         (term("worker", "seat", defined_in=("docs/a.md#Words", "docs/b.md#Words"), kept=("docs/seat/",)),))
-        for invalid in (text.replace('kind = "role"', 'kind = "other"'),
-                        text.replace('["seat"]', '[2]'), text + text):
-            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
-                _ = audit.parse_terms(invalid)
+                         (term("worker", "seat", kept=("docs/seat/",)),))
+        for invalid, message in (
+            (text.replace('kind = "role"', 'kind = "other"'), "worker: invalid kind"),
+            (text.replace('defined_in = "docs/a.md#Words; docs/b.md#Words"', 'defined_in = ""'),
+             "worker: defined_in must name a file and section, or none"),
+            (text + 'other_meaning_files = [2]\n', "worker.other_meaning_files must contain nonempty strings"),
+            (text.replace('["seat"]', '[2]'), "worker.other_names must contain nonempty strings"),
+            (text + text, "defined term names must be unique"),
+            (text.replace('kind = "role"', 'kind = "other"').replace('defined_in = ', 'defined_in = 2 #'),
+             "worker: invalid kind"),
+            (text.replace('defined_in = ', 'defined_in = 2 #') + 'other_meaning_files = [2]\n',
+             "worker: defined_in must name a file and section, or none"),
+            (text.replace('["docs/seat/"]', '[2]') + 'other_meaning_files = [2]\n',
+             "worker.kept must contain nonempty strings"),
+        ):
+            with self.subTest(invalid=invalid):
+                with self.assertRaises(ValueError) as raised:
+                    _ = audit.parse_terms(invalid)
+                self.assertEqual(str(raised.exception), message)
 
 
 class SourceCheckTests(unittest.TestCase):
@@ -327,19 +340,16 @@ class SourceCheckTests(unittest.TestCase):
             self.assertTrue(any("scripts/label.py:3:" in issue and "builder" in issue for issue in issues), issues)
             self.assertTrue(any("scripts/label.sh:3:" in issue and "builder" in issue for issue in issues), issues)
             self.assertEqual(issues, audit.check_sources(root, full_extraction=True))
-            files, errors = audit.read_live_files(root)
+            errors = audit.read_live_files(root)[1]
             self.assertEqual(errors, ())
-            counts = audit.measure_names((term("builder"),), files)
-            self.assertEqual(counts[0].hits, 3)
 
     def test_stderr_output_heredoc_counts_retired_words_and_excludes_input(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             self.write_check_root(root, {"scripts/probe.sh":
                 "# excluded\ncat >&2 <<-'OUTPUT'\n\tseat\n\tOUTPUT\nconsumer <<'INPUT'\nseat\nINPUT\n"})
-            files, errors = audit.read_live_files(root)
+            errors = audit.read_live_files(root)[1]
             self.assertEqual(errors, ())
-            self.assertEqual(audit.measure_names((term("worker", "seat"),), files)[1].hits, 1)
             self.assertEqual(audit.check_sources(root), ("scripts/probe.sh:3: retired 'seat'; use 'worker'",))
 
     def test_output_heredocs_after_shell_boundaries_and_stderr_redirects_keep_source_lines(self) -> None:
@@ -349,10 +359,8 @@ class SourceCheckTests(unittest.TestCase):
                 root = Path(directory)
                 self.write_check_root(root, {"scripts/output.sh":
                     f"# header\n{command} <<'OUTPUT'\nseat\nworker\nOUTPUT\nconsumer <<'INPUT'\nseat\nworker\nINPUT\n"})
-                files, errors = audit.read_live_files(root)
+                errors = audit.read_live_files(root)[1]
                 self.assertEqual(errors, ())
-                counts = audit.measure_names((term("worker", "seat"),), files)
-                self.assertEqual([(row.name, row.hits) for row in counts], [("worker", 1), ("seat", 1)])
                 self.assertEqual(audit.check_sources(root), (
                     "scripts/output.sh:3: retired 'seat'; use 'worker'",
                     "scripts/output.sh:4: fixed display name 'worker'; read config/names.toml",
@@ -390,7 +398,7 @@ class SourceCheckTests(unittest.TestCase):
             ))
             self.assertEqual(result, audit.source_check(root, full_extraction=True))
 
-    def test_check_and_baseline_describe_missing_config_entries_in_plain_text(self) -> None:
+    def test_check_describes_missing_config_entries_in_plain_text(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             self.write_check_root(root, {})
@@ -398,19 +406,12 @@ class SourceCheckTests(unittest.TestCase):
             _ = config.write_text(NAMES_TOML.replace('worker = ["worker"]\n', ''), encoding="utf-8")
             expected = f"names: {config}: [jobs] has no worker entry"
             self.assertEqual(audit.check_sources(root), (expected,))
-            for action in ("check", "baseline"):
-                with self.subTest(action=action):
-                    output, errors = StringIO(), StringIO()
-                    with redirect_stdout(output), redirect_stderr(errors):
-                        status = audit.main([action, "--root", str(root)])
-                    self.assertEqual(status, 1)
-                    if action == "check":
-                        self.assertEqual(output.getvalue().splitlines(), [
-                            expected, "role words in sentences: 0 (list with --prose)"])
-                        self.assertEqual(errors.getvalue(), "")
-                    else:
-                        self.assertEqual(output.getvalue(), "")
-                        self.assertEqual(errors.getvalue().strip(), f"roles_audit: {expected}")
+            output, errors = StringIO(), StringIO()
+            with redirect_stdout(output), redirect_stderr(errors):
+                status = audit.main(["check", "--root", str(root)])
+            self.assertEqual(status, 1)
+            self.assertEqual(output.getvalue().splitlines(), [expected])
+            self.assertEqual(errors.getvalue(), "")
 
     def test_conditional_bindings_keep_sentence_and_shown_name_context(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -440,6 +441,34 @@ class SourceCheckTests(unittest.TestCase):
                 "scripts/output.py:1: fixed display name 'worker'; read config/names.toml",
             ))
             self.assertEqual(audit.source_check(root), audit.source_check(root, full_extraction=True))
+
+    def test_plain_selection_keeps_every_extracted_string_assembly(self) -> None:
+        cases = {
+            "conditional suffix binding": 'ending = "ker" if ready else "kers"\nprint("wor" + ending)\n',
+            "conditional prefix binding": 'prefix = "wor" if ready else "tes"\nprint(prefix + "ker")\n',
+            "annotated binding": 'ending: str = "ker" if ready else "kers"\nprint("wor" + ending)\n',
+            "binding alias": 'ending = "ker" if ready else "kers"\nalias = ending\nprint("wor" + alias)\n',
+            "lexical binding": 'ending = "ker" if ready else "kers"\ndef show():\n    print("wor" + ending)\n',
+            "helper return": 'def label():\n    return "wor" + "ker"\nprint(label())\n',
+            "direct branches": 'print("wor" + ("ker" if ready else "kers"))\n',
+            "f-string suffix binding": 'ending = "ker" if ready else "kers"\nprint(f"wor{ending}")\n',
+            "f-string prefix binding": 'prefix = "wor" if ready else "tes"\nprint(f"{prefix}ker")\n',
+            "f-string branches": 'print(f"wor{\"ker\" if ready else \"kers\"}")\n',
+            "nested joins": 'ending = "ker" if ready else "kers"\nprint("w" + ("or" + ending))\n',
+            "nested fields": 'ending = "ker" if ready else "kers"\nprint(f"w{f\"or{ending}\"}")\n',
+            "nested branches": 'ending = ("ker" if first else "kers") if ready else "ker"\nprint("wor" + ending)\n',
+            "literal join": 'print("wor" + "ker")\n',
+        }
+        for name, source in cases.items():
+            with self.subTest(assembly=name), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                self.write_check_root(root, {"scripts/output.py": source})
+                complete = audit.source_check(root, full_extraction=True, prose=False)
+                self.assertTrue(complete.labels, "The fixture must produce a display finding.")
+                terms = audit.parse_terms((root / "scripts/production/role_terms.toml").read_text())
+                retired = audit.forms_pattern(tuple(form for item in terms for form in item.retired))
+                self.assertTrue(audit.extraction_candidate(source, True, retired, frozenset({"worker"}), prose=False))
+                self.assertEqual(audit.source_check(root, prose=False), complete)
 
     def test_key_uses_stay_contracts_without_relying_on_binding_names(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -489,9 +518,8 @@ class SourceCheckTests(unittest.TestCase):
             output = StringIO()
             with redirect_stdout(output):
                 status = audit.main(["check", "--root", str(root)])
-            count_line = "role words in sentences: 2 (list with --prose)"
             self.assertEqual(status, 0)
-            self.assertEqual(output.getvalue().splitlines(), [count_line])
+            self.assertEqual(output.getvalue(), "")
             detailed = StringIO()
             with redirect_stdout(detailed):
                 status = audit.main(["check", "--root", str(root), "--prose"])
@@ -501,6 +529,30 @@ class SourceCheckTests(unittest.TestCase):
                 "scripts/messages.py:2: 'unit director'",
                 "scripts/messages.py:3: 'worker'",
             ])
+
+    def test_plain_check_keeps_findings_and_diagnostics_without_sentence_analysis(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.write_check_root(root, {
+                "scripts/sentences.py": 'print("The worker needs help.")\n',
+                "scripts/labels.py": 'print("wor" + "ker")\nprint(f"{name} · designer")\n',
+                "scripts/escaped.py": r'print("Dispatch a \x73eat.")' + "\n",
+                "scripts/conditional.py": 'print(f"wor{"ker" if ready else "kers"}")\n',
+                "scripts/broken.py": "print(\n",
+            })
+            detailed = audit.source_check(root)
+            plain = audit.source_check(root, prose=False)
+            self.assertEqual(detailed, audit.source_check(root, full_extraction=True))
+            self.assertEqual(plain.issues, detailed.issues)
+            self.assertEqual(plain.labels, detailed.labels)
+            self.assertEqual(plain.unread_sources, detailed.unread_sources)
+            self.assertEqual(plain.sentences, ())
+            self.assertTrue(detailed.sentences)
+            output = StringIO()
+            with redirect_stdout(output):
+                status = audit.main(["check", "--root", str(root)])
+            self.assertEqual(status, 1)
+            self.assertEqual(output.getvalue().splitlines(), list(detailed.issues))
 
     def test_account_group_keys_are_neither_label_failures_nor_sentence_uses(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -520,7 +572,7 @@ class SourceCheckTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             self.write_check_root(root, {"scripts/error.py":
-                'raise ValueError(f"showrunner {runner.slug} is not running")\n'})
+                'raise ValueError(f"showrunner {runner.name} is not running")\n'})
             output = StringIO()
             with redirect_stdout(output):
                 status = audit.main(["check", "--root", str(root), "--prose"])
@@ -531,17 +583,110 @@ class SourceCheckTests(unittest.TestCase):
             ])
             self.assertEqual(audit.check_sources(root), audit.check_sources(root, full_extraction=True))
 
-    def write_check_root(self, root: Path, sources: dict[str, str]) -> None:
+    def write_check_root(self, root: Path, sources: dict[str, str], terms: str = WORKER_TERMS) -> None:
         config = root / "config/names.toml"
         config.parent.mkdir(parents=True, exist_ok=True)
         _ = config.write_text(NAMES_TOML, encoding="utf-8")
         inventory = root / "scripts/production/role_terms.toml"
         inventory.parent.mkdir(parents=True)
-        _ = inventory.write_text(WORKER_TERMS, encoding="utf-8")
+        _ = inventory.write_text(terms, encoding="utf-8")
         for name, source in sources.items():
             path = root / name
             path.parent.mkdir(parents=True, exist_ok=True)
             _ = path.write_text(source, encoding="utf-8")
+
+    def write_source_coverage_root(self, root: Path) -> None:
+        self.write_check_root(root, {
+            "docs/words.md": "# Words\nworker seat seat delegate\n",
+            "scripts/output.py": 'print("worker")\n',
+            "fixture-production.md": "# Fixture\n",
+        }, terms='''[[terms]]
+name = "worker"
+kind = "role"
+defined_in = "docs/words.md#Words"
+other_names = ["seat", "delegate"]
+[[terms]]
+name = "gate"
+kind = "step"
+defined_in = "none"
+other_names = []
+''')
+
+    def test_check_has_no_label_findings_after_successful_source_reads(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.write_source_coverage_root(root)
+            _ = (root / "scripts/output.py").write_text('print("Ready.")\n', encoding="utf-8")
+            self.assertEqual(audit.check_sources(root), ())
+
+    def test_check_reports_unread_source_without_reading_production_documents(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.write_source_coverage_root(root)
+            _ = (root / "scripts/output.py").write_text('print("Ready.")\n', encoding="utf-8")
+            _ = (root / "scripts/bad.py").write_bytes(b"\xff")
+            unreadable_doc = root / "unreadable-production.md"
+            _ = unreadable_doc.write_bytes(b"\xff")
+            missing_doc = root / "missing-production.md"
+            with patch.object(showrunners, "timer_docs", return_value={"unreadable": unreadable_doc, "missing": missing_doc}):
+                issues = audit.check_sources(root)
+            self.assertEqual(len(issues), 1, issues)
+            self.assertRegex(issues[0], r"^scripts/bad\.py: .*codec can't decode")
+
+    def test_check_keeps_first_read_failure_without_reopening_the_source(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.write_source_coverage_root(root)
+            output = root / "scripts/output.py"
+            original_read = Path.read_text
+            output_reads = 0
+
+            def read_fixture(path: Path, encoding: str = "utf-8") -> str:
+                nonlocal output_reads
+                if path == output:
+                    output_reads += 1
+                    if output_reads == 1:
+                        raise OSError("fixture source temporarily unavailable")
+                return original_read(path, encoding=encoding)
+
+            with patch.object(Path, "read_text", new=read_fixture):
+                issues = audit.check_sources(root)
+            self.assertEqual(issues, ("scripts/output.py: fixture source temporarily unavailable",))
+            self.assertEqual(output_reads, 1)
+
+    def test_check_reports_the_fixed_label_from_the_former_report_fixture(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.write_source_coverage_root(root)
+            self.assertEqual(audit.check_sources(root), (
+                "scripts/output.py:1: fixed display name 'worker'; read config/names.toml",
+            ))
+
+    def test_check_keeps_label_findings_beside_source_warnings(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.write_source_coverage_root(root)
+            _ = (root / "scripts/bad.py").write_bytes(b"\xff")
+            missing_doc = root / "missing-production.md"
+            with patch.object(showrunners, "timer_docs", return_value={"missing": missing_doc}):
+                issues = audit.check_sources(root)
+            self.assertEqual(len(issues), 2, issues)
+            self.assertRegex(issues[0], r"^scripts/bad\.py: .*codec can't decode")
+            self.assertEqual(issues[1], "scripts/output.py:1: fixed display name 'worker'; read config/names.toml")
+
+    def test_sentence_output_is_information_without_label_failures(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.write_source_coverage_root(root)
+            _ = (root / "scripts/output.py").write_text('print("Ask the worker for help.")\n', encoding="utf-8")
+            self.assertEqual(audit.check_sources(root), ())
+            output = StringIO()
+            with redirect_stdout(output):
+                status = audit.main(["check", "--root", str(root), "--prose"])
+            self.assertEqual(status, 0)
+            self.assertEqual(output.getvalue().splitlines(), [
+                "role words in sentences: 1", "scripts/output.py:1: 'worker'",
+            ])
 
     def test_check_selects_python_literal_joins_and_decoded_escapes(self) -> None:
         control = 'print("Dispatch a process.")\n'
@@ -611,6 +756,22 @@ class SourceCheckTests(unittest.TestCase):
             _ = subprocess.run(["git", "init", "--quiet", str(root)], check=True, capture_output=True)
             self.assertEqual(audit.check_sources(root), expected)
 
+    def test_reader_does_not_read_ignored_binary_build_output(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.write_check_root(root, {"scripts/current.py": 'print("Dispatch a worker.")\n'})
+            _ = subprocess.run(["git", "init", "--quiet", str(root)], check=True, capture_output=True)
+            _ = (root / "scripts/.gitignore").write_text("target/\n", encoding="utf-8")
+            target = root / "scripts/target"
+            target.mkdir()
+            _ = (target / "binary").write_bytes(b"\x80")
+            _ = subprocess.run(["git", "-C", str(root), "add", "scripts/current.py"],
+                               check=True, capture_output=True)
+            _ = (root / "scripts/untracked.py").write_text('print("Ready.")\n', encoding="utf-8")
+            sources = audit.read_live_sources(root)
+            self.assertEqual([file.path for file in sources.files], ["scripts/current.py", "scripts/untracked.py"])
+            self.assertEqual(sources.unread_sources, ())
+
     def test_repository_candidate_check_matches_full_extraction(self) -> None:
         repository = Path(__file__).resolve().parents[2]
         # The full-tree reference found no findings or read issues. Keep its
@@ -624,8 +785,8 @@ class SourceCheckTests(unittest.TestCase):
             "docs/as-built/usage-ledger.md",
             "docs/as-built/build-memory-admission.md",
             "docs/production_format.md",
-            "scripts/production/rename_unit.py",
-            "scripts/direct/implement.sh",
+            "scripts/shutdown/shutdown.py",
+            "scripts/direct/assign.sh",
             "scripts/usage/collect.py",
         )
         with tempfile.TemporaryDirectory() as directory:
@@ -635,6 +796,36 @@ class SourceCheckTests(unittest.TestCase):
                 destination.parent.mkdir(parents=True, exist_ok=True)
                 _ = destination.write_bytes((repository / name).read_bytes())
             self.assertEqual(audit.check_sources(root), audit.check_sources(root, full_extraction=True))
+
+    def test_parallel_check_keeps_source_order_contexts_and_read_errors(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            sources = {f"scripts/source{index:02}.py": "# Padding.\n" * index + 'print("Ready.")\n'
+                       for index in range(64)}
+            sources.update({
+                "docs/protocol.md": "Keep a seat stable.\nA seat needs work.\n",
+                "scripts/first.py": 'print("Dispatch a seat.")\n',
+                "scripts/last.py": 'print("worker")\n',
+                "scripts/broken.py": "print(\n",
+            })
+            self.write_check_root(root, sources)
+            inventory = root / "scripts/production/role_terms.toml"
+            with inventory.open("a", encoding="utf-8") as output:
+                _ = output.write('''
+[[terms.kept_contexts]]
+path = "docs/protocol.md"
+text = "Keep a seat stable."
+reason = "The protocol keeps this term."
+''')
+            _ = (root / "scripts/unreadable.py").write_bytes(b"\xff")
+            checked = audit.source_check(root)
+            self.assertEqual(checked, audit.source_check(root, full_extraction=True))
+            self.assertEqual(len(checked.unread_sources), 2)
+            self.assertEqual(checked.issues[2:], (
+                "docs/protocol.md:2: retired 'seat'; use 'worker'",
+                "scripts/first.py:1: retired 'seat'; use 'worker'",
+                "scripts/last.py:1: fixed display name 'worker'; read config/names.toml",
+            ))
 
     def test_formatted_string_fragments_keep_prose_when_they_cannot_tokenize(self) -> None:
         sources = {
@@ -651,14 +842,12 @@ class SourceCheckTests(unittest.TestCase):
             files, issues = audit.read_live_files(root)
             terms = audit.parse_terms(WORKER_TERMS)
             uses = audit.check_retired(terms, files)
-            rows = audit.measure_names(terms, files)
         self.assertEqual(issues, ())
         self.assertEqual([(use.path, use.line, use.name) for use in uses], [
             ("scripts/apostrophe.py", 1, "seat"),
             ("scripts/parenthesis.py", 1, "seat"),
             ("scripts/spanning.py", 2, "seat"),
         ])
-        self.assertEqual(next(row.hits for row in rows if row.name == "seat"), 3)
 
     def test_script_findings_report_source_lines_after_excluded_text(self) -> None:
         sources = {
@@ -717,15 +906,6 @@ class SourceCheckTests(unittest.TestCase):
         issues = audit.check_sources(root)
         self.assertEqual(issues, (), "\n".join(issues))
 
-    def test_term_definitions_point_to_existing_repository_files(self) -> None:
-        root = Path(__file__).resolve().parents[2]
-        terms = audit.parse_terms((root / "scripts/production/role_terms.toml").read_text(encoding="utf-8"))
-        for item in terms:
-            for definition in item.defined_in:
-                with self.subTest(term=item.name, definition=definition):
-                    self.assertTrue((root / definition.split("#", 1)[0]).is_file(), definition)
-
-
     def test_retired_design_role_names_fail_the_live_source_check(self) -> None:
         repository = Path(__file__).resolve().parents[2]
         data = (repository / "scripts/production/role_terms.toml").read_text(encoding="utf-8")
@@ -751,320 +931,7 @@ class SourceCheckTests(unittest.TestCase):
                             self.assertEqual(audit.main(["check", "--root", str(root)]), 1)
                         self.assertEqual(output.getvalue().splitlines(), [
                             f"docs/roles.md:1: retired {name!r}; use 'held design role'",
-                            "role words in sentences: 0 (list with --prose)",
                         ])
-
-
-class ProductionNameTests(unittest.TestCase):
-    def test_reads_only_units_and_finds_format_and_cross_role_collisions(self) -> None:
-        text = '''# A
-- **Showrunner session:** alpha
-## Units
-| Unit | Plan | Worktree | Branch |
-| --- | --- | --- | --- |
-| `render-unit` | a.md | /tmp/a | a |
-| old | (retired) | /tmp/b | b |
-## Other
-| not-a-unit | ignored |
-'''
-        first = audit.parse_production("one", "/fixture/one.md", text)
-        second = audit.ProductionNames("two", "/fixture/two.md", "render-unit", ("tools-unit",))
-        rows = audit.measure_production_names((first, second))
-        self.assertEqual(first.units, ("render-unit", "old"))
-        self.assertEqual(rows, (
-            audit.ProductionNameFinding("unit format", "old", ("one",), ("/fixture/one.md",)),
-            audit.ProductionNameFinding("shared name", "render-unit", ("one", "two"), ("/fixture/one.md", "/fixture/two.md")),
-        ))
-
-
-class MessageTests(unittest.TestCase):
-    def test_window_machine_outcome_and_historical_roles_control_counts(self) -> None:
-        start = datetime(2026, 10, 1, tzinfo=timezone.utc)
-        end = start + timedelta(days=2)
-        director = {"from_role": "unit director", "from_production": "one"}
-        lines = [message(start, **director),
-                 message(start, recipient="another", to_role="showrunner", to_production="two", **director),
-                 message(start, recipient="own", to_role="showrunner", to_production="one", **director),
-                 message(start, recipient="unknown", to_role="showrunner", **director),
-                 message(start, sender="named-unit"),
-                 message(start, sender="unresolved", machine=""),
-                 message(start, sender="mac-unit", machine="mac", **director),
-                 message(start, outcome="skipped", **director),
-                 message(end, **director), message(start - timedelta(seconds=1), **director)]
-        source = audit.parse_messages("\n".join(lines))
-        counts = audit.measure_sent_contacts(source.records, audit.AuditWindow(start, end))
-        self.assertEqual(counts.senders, (audit.SenderContacts("alpha", 1, 1, 0, 1, 4),
-                                         audit.SenderContacts("named-unit", 0, 0, 1, 0, 1)))
-        self.assertEqual((counts.window_records, counts.sent_records, counts.other_machine_records, counts.machine_unknown),
-                         (8, 5, 1, 1))
-
-    def test_bad_lines_and_naive_times_are_counted_without_losing_good_records(self) -> None:
-        at = datetime(2026, 10, 1, tzinfo=timezone.utc)
-        source = audit.parse_messages('\n'.join([message(at), '{', '[]', '{}', message(at.replace(tzinfo=None))]))
-        self.assertEqual(source.invalid_lines, 4)
-        self.assertEqual([r.sender for r in source.records], ["alpha"])
-
-    def test_date_window_uses_local_midnight_and_until_is_inclusive(self) -> None:
-        with patch.dict("os.environ", {"USER_ZONE": "America/New_York"}):
-            window = audit.audit_window("2026-10-01", "2026-10-02", datetime(2026, 10, 9, tzinfo=timezone.utc))
-            self.assertEqual(window.since.astimezone(timezone.utc), datetime(2026, 10, 1, 4, tzinfo=timezone.utc))
-            self.assertEqual(window.until.astimezone(timezone.utc), datetime(2026, 10, 3, 4, tzinfo=timezone.utc))
-            self.assertIn("America/New_York", window.label())
-            with self.assertRaises(ValueError):
-                _ = audit.audit_window("2026-10-04", "2026-10-02", window.until)
-
-    def test_report_exposes_unknown_roles_sources_window_and_total_share(self) -> None:
-        start = datetime(2026, 10, 1, tzinfo=timezone.utc)
-        source = audit.parse_messages(message(start))
-        result = audit.report((term("worker", "seat"),), (audit.LiveFile("commands/a.md", "worker seat seat"),),
-                              (), source, audit.AuditWindow(start, start + timedelta(days=1)), (),
-                              source_result=audit.SourceCheck((), (), (), ()), unread_production_docs=())
-        self.assertIn("2 / 3", result)
-        self.assertIn("66.7%", result)
-        self.assertIn("role unknown (n=1)", result)
-        self.assertIn("Request intent is not recorded.", result)
-        self.assertIn("natedev only", result)
-        self.assertIn("2026-09-30", result)
-        self.assertIn("live: n=1 files", result)
-        self.assertNotIn("\nNames\n", result)
-
-    def test_baseline_reads_fixture_productions_and_reports_unavailable_log(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            config = root / "config/names.toml"
-            config.parent.mkdir()
-            _ = config.write_text(NAMES_TOML, encoding="utf-8")
-            inventory = root / "scripts/production/role_terms.toml"
-            inventory.parent.mkdir(parents=True)
-            _ = inventory.write_text('''[[terms]]
-name = "worker"
-kind = "role"
-defined_in = "none"
-other_names = ["seat"]
-''', encoding="utf-8")
-            doc = root / "fixture-production.md"
-            _ = doc.write_text("## Units\n| Unit | Plan |\n| --- | --- |\n| bad | a.md |\n", encoding="utf-8")
-            at = datetime(2026, 10, 1, tzinfo=timezone.utc)
-            with patch.object(showrunners, "timer_docs", return_value={"fixture": doc}), \
-                    patch.object(Path, "home", return_value=root), \
-                    patch.dict("os.environ", {"USER_ZONE": "America/New_York"}):
-                result = audit.baseline(root, audit.AuditWindow(at, at + timedelta(days=1)))
-            self.assertIn("invalid unit format", result)
-            self.assertIn("bad", result)
-            self.assertIn("has no declared definition", result)
-            self.assertIn("unavailable:", result)
-            self.assertIn("Sent contacts: unknown (n=0)", result)
-            self.assertIn(f"Warning: {root / '.local/state/message/log.jsonl'}:", result)
-
-
-class BaselineReportTests(unittest.TestCase):
-    def write_fixture(self, root: Path) -> audit.AuditWindow:
-        paths = {
-            "config/names.toml": NAMES_TOML,
-            "scripts/production/role_terms.toml": '''[[terms]]
-name = "worker"
-kind = "role"
-defined_in = "docs/words.md#Words"
-other_names = ["seat", "delegate"]
-[[terms]]
-name = "gate"
-kind = "step"
-defined_in = "none"
-other_names = []
-''',
-            "docs/words.md": "# Words\nworker seat seat delegate\n",
-            "scripts/output.py": 'print("worker")\n',
-            "fixture-production.md": "## Units\n| Unit | Plan |\n| --- | --- |\n| bad | a.md |\n",
-        }
-        at = datetime(2026, 10, 1, tzinfo=timezone.utc)
-        paths[".local/state/message/log.jsonl"] = message(at)
-        for relative, text in paths.items():
-            path = root / relative
-            path.parent.mkdir(parents=True, exist_ok=True)
-            _ = path.write_text(text, encoding="utf-8")
-        return audit.AuditWindow(at, at + timedelta(days=1))
-
-    def test_report_rejects_omitted_source_check_evidence(self) -> None:
-        at = datetime(2026, 10, 1, tzinfo=timezone.utc)
-        # Exercise runtime callers that bypass the required keyword's type check.
-        unchecked_report = cast(Callable[..., str], audit.report)
-        with self.assertRaisesRegex(TypeError, "source_result"):
-            _ = unchecked_report((), (), (), audit.parse_messages(""),
-                                 audit.AuditWindow(at, at + timedelta(days=1)), ())
-
-    def test_report_shows_zero_labels_after_a_successful_source_check(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            window = self.write_fixture(root)
-            _ = (root / "scripts/output.py").write_text('print("Ready.")\n', encoding="utf-8")
-            checked = audit.source_check(root)
-            self.assertEqual(checked.labels, ())
-            self.assertEqual(checked.unread_sources, ())
-            result = audit.report((), (), (), audit.parse_messages(""), window, (),
-                                  source_result=checked, unread_production_docs=())
-            self.assertIn("Fixed display labels: n=0 to fix;", result)
-            self.assertNotIn("sources not read", result)
-
-    def test_unread_sources_make_zero_label_and_production_counts_partial(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            window = self.write_fixture(root)
-            _ = (root / "scripts/output.py").write_text('print("Ready.")\n', encoding="utf-8")
-            _ = (root / "scripts/bad.py").write_bytes(b"\xff")
-            unreadable_doc = root / "unreadable-production.md"
-            _ = unreadable_doc.write_bytes(b"\xff")
-            missing_doc = root / "missing-production.md"
-            checked = audit.source_check(root)
-            self.assertEqual([source.path for source in checked.unread_sources], ["scripts/bad.py"])
-            with patch.object(Path, "home", return_value=root), \
-                    patch.object(showrunners, "timer_docs", return_value={"unreadable": unreadable_doc, "missing": missing_doc}):
-                result = audit.baseline(root, window)
-            label_line = next(line for line in result.splitlines() if line.startswith("Fixed display labels:"))
-            production_line = next(line for line in result.splitlines() if line.startswith("Unit and session names:"))
-            self.assertEqual(label_line, "Fixed display labels: n=0 to fix; n=1 sources not read; "
-                             + "role words in sentences: n=0 (information only; live: n=2 files; n=1 sources not read).")
-            self.assertEqual(production_line, "Unit and session names: n=0 findings across n=0 production docs "
-                             + "(including retired units); n=2 sources not read.")
-            for prefix in ("Other names:", "Most used other names:", "Definitions:", "Files:"):
-                line = next(line for line in result.splitlines() if line.startswith(prefix))
-                self.assertIn("n=1 sources not read", line)
-            for path in ("scripts/bad.py", str(unreadable_doc), str(missing_doc)):
-                self.assertTrue(any(line.startswith("Warning:") and path in line for line in result.splitlines()), result)
-
-    def test_baseline_keeps_first_read_failure_in_name_and_label_coverage(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            window = self.write_fixture(root)
-            output = root / "scripts/output.py"
-            original_read = Path.read_text
-            output_reads = 0
-
-            def read_fixture(path: Path, encoding: str = "utf-8") -> str:
-                nonlocal output_reads
-                if path == output:
-                    output_reads += 1
-                    if output_reads == 1:
-                        raise OSError("fixture source temporarily unavailable")
-                return original_read(path, encoding=encoding)
-
-            with patch.object(Path, "read_text", new=read_fixture), \
-                    patch.object(Path, "home", return_value=root), \
-                    patch.object(showrunners, "timer_docs", return_value={}):
-                result = audit.baseline(root, window)
-            lines = result.splitlines()
-            self.assertIn("Other names: 3 / 4 (75.0%; live: n=1 files; n=1 sources not read).", lines)
-            self.assertIn("Fixed display labels: n=0 to fix; n=1 sources not read; "
-                          + "role words in sentences: n=0 (information only; live: n=1 files; n=1 sources not read).", lines)
-            self.assertIn("Warning: scripts/output.py: fixture source temporarily unavailable", lines)
-            self.assertFalse(any(line.startswith("Fix: scripts/output.py:") for line in lines), result)
-            self.assertEqual(output_reads, 1)
-
-    def test_fixture_baseline_starts_with_share_worst_names_and_actionable_findings(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            window = self.write_fixture(root)
-            with patch.object(Path, "home", return_value=root), \
-                    patch.object(showrunners, "timer_docs", return_value={"fixture": root / "fixture-production.md"}):
-                result = audit.baseline(root, window)
-            self.assertEqual(result.splitlines()[:2], [
-                "Other names: 3 / 5 (60.0%; live: n=2 files).",
-                "Most used other names: 'seat' n=2 (worker); 'delegate' n=1 (worker) (live: n=2 files).",
-            ])
-            self.assertIn("Definition: 'gate' has no declared definition.", result)
-            self.assertIn("Name: 'bad' has an invalid unit format in fixture.", result)
-            self.assertIn("Fixed display labels: n=1 to fix; role words in sentences: n=0", result)
-            self.assertIn("Fix: scripts/output.py:1: fixed display name 'worker'; read config/names.toml", result)
-            self.assertIn(f"Message window: {window.label()} (natedev only).", result)
-            self.assertIn("role unknown (n=1)", result)
-            self.assertIn("Request intent is not recorded.", result)
-
-    def test_baseline_cli_prints_full_tables_only_when_requested(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            _ = self.write_fixture(root)
-            arguments = ["baseline", "--root", str(root), "--since", "2026-10-01", "--until", "2026-10-01"]
-            with patch.object(Path, "home", return_value=root), \
-                    patch.object(showrunners, "timer_docs", return_value={"fixture": root / "fixture-production.md"}):
-                short, detailed = StringIO(), StringIO()
-                with redirect_stdout(short):
-                    self.assertEqual(audit.main(arguments), 0)
-                with redirect_stdout(detailed):
-                    self.assertEqual(audit.main([*arguments, "--tables"]), 0)
-            self.assertTrue(detailed.getvalue().startswith(short.getvalue().rstrip() + "\n\n"))
-            for heading in ("Roles baseline", "Names", "Source issues"):
-                self.assertNotIn(heading, short.getvalue().splitlines())
-                self.assertIn(heading, detailed.getvalue().splitlines())
-            self.assertIn("Definitions (declared sources", detailed.getvalue())
-            self.assertIn("Unit and session names — natedev only", detailed.getvalue())
-            self.assertIn("Sent contacts — natedev only; request intent not recorded", detailed.getvalue())
-            self.assertNotIn("Wrong-party asks", detailed.getvalue())
-            self.assertIn(audit.ROLE_SOURCE, detailed.getvalue())
-            self.assertIn("helper call arguments are not followed into parameters", detailed.getvalue())
-
-    def test_sent_contact_tables_drop_zero_and_unknown_only_rows_without_hiding_coverage(self) -> None:
-        at = datetime(2026, 10, 1, tzinfo=timezone.utc)
-        source = audit.parse_messages("\n".join([
-            message(at, sender="zero-only", from_role="worker", from_production="one"),
-            message(at, sender="unknown-only"),
-            message(at, sender="known-director", from_role="unit director", from_production="one"),
-            message(at, sender="known-other-production", recipient="runner", from_role="unit director",
-                    from_production="one", to_role="showrunner", to_production="two"),
-            message(at, sender="unknown-production", recipient="runner", from_role="unit director", to_role="showrunner"),
-            message(at, sender="unknown-machine", machine=""),
-        ]))
-        window = audit.AuditWindow(at, at + timedelta(days=1))
-        coverage = audit.measure_sent_contacts(source.records, window)
-        self.assertIsInstance(coverage, audit.SentContactCoverage)
-        result = audit.report((), (), (), source, window, (), tables=True,
-                              source_result=audit.SourceCheck((), (), (), ()), unread_production_docs=())
-        contacts = result.split("Sent contacts — natedev only; request intent not recorded\n", 1)[1].split("\n\n", 1)[0]
-        self.assertIn("known-director", contacts)
-        self.assertIn("known-other-production", contacts)
-        for dropped in ("zero-only", "unknown-only", "unknown-production"):
-            self.assertNotIn(dropped, contacts)
-        self.assertIn("role unknown (n=1)", result)
-        self.assertIn("production unknown (n=1)", result)
-        self.assertIn("machine unknown (n=1)", result)
-        self.assertIn("n=5 sent / n=6 window records", result)
-
-    def test_short_summary_names_each_conflicting_definition_and_shared_unit(self) -> None:
-        at = datetime(2026, 10, 1, tzinfo=timezone.utc)
-        result = audit.report(
-            (term("worker", defined_in=("docs/a.md#Words", "docs/b.md#Words")),), (),
-            (audit.ProductionNames("one", "one.md", "runner-one", ("shared-unit",)),
-             audit.ProductionNames("two", "two.md", "runner-two", ("shared-unit",))),
-            audit.parse_messages(""), audit.AuditWindow(at, at + timedelta(days=1)), (),
-            source_result=audit.SourceCheck((), (), (), ()), unread_production_docs=())
-        self.assertIn("Definitions: n=1 findings across n=1 terms.", result)
-        self.assertIn("Definition: 'worker' has definitions in docs/a.md, docs/b.md.", result)
-        self.assertIn("Unit and session names: n=1 findings across n=2 production docs", result)
-        self.assertIn("Name: 'shared-unit' is shared by one, two.", result)
-
-    def test_unreadable_sources_have_individual_warnings_in_the_short_summary(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            window = self.write_fixture(root)
-            (root / ".local/state/message/log.jsonl").unlink()
-            _ = (root / "scripts/bad.py").write_bytes(b"\xff")
-            missing_doc = root / "missing-production.md"
-            with patch.object(Path, "home", return_value=root), \
-                    patch.object(showrunners, "timer_docs", return_value={"missing": missing_doc}):
-                result = audit.baseline(root, window)
-            for path in ("scripts/bad.py", str(missing_doc), str(root / ".local/state/message/log.jsonl")):
-                self.assertTrue(any(line.startswith("Warning:") and path in line for line in result.splitlines()), result)
-            self.assertIn("Sent contacts: unknown (n=0); message log unavailable:", result)
-            self.assertNotIn("Sent contacts: n=0 sent", result)
-
-    def test_sentence_only_baseline_reports_information_without_label_failures(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            window = self.write_fixture(root)
-            _ = (root / "scripts/output.py").write_text('print("Ask the worker for help.")\n', encoding="utf-8")
-            with patch.object(Path, "home", return_value=root), \
-                    patch.object(showrunners, "timer_docs", return_value={}):
-                result = audit.baseline(root, window)
-            self.assertIn("Fixed display labels: n=0 to fix; role words in sentences: n=1 (information only; live: n=2 files).", result)
-            self.assertFalse(any(line.startswith("Fix:") for line in result.splitlines()), result)
 
 
 if __name__ == "__main__":

@@ -12,10 +12,9 @@ from pathlib import Path
 from typing import cast
 from urllib.parse import parse_qs, urlencode, urlsplit
 
-from scripts.lib import urgency
-from scripts.production import change_review, change_routing
+from scripts.lib import conf, urgency
+from scripts.production import change_review, change_routing, staff
 from scripts.production.change_routing import UnavailableProduction
-from scripts.production.proposals_folder import slug_of
 from scripts.review_links import change_page
 from scripts.review_links.change_page import ReviewBrowser as ReviewBrowser
 
@@ -105,13 +104,13 @@ def prepare(browser: ReviewBrowser, status: change_page.DeliveryStatus) -> Prepa
         root = runner
         while root is not None:
             parent = root.parent
-            if parent is None or parent not in routing.runners:
+            if not isinstance(parent, staff.ReportsTo) or parent.id not in routing.runners:
                 break
-            root = routing.runners[parent]
+            root = routing.runners[parent.id]
         current = (defaults.get(root.name) if root is not None else None) or routing.list_paths.get(tab) or defaults.get(tab, page.review_list)
         name = change_review.queue(current)
-        if runner is not None and runner.parent is not None and isinstance(page, change_page.AssignedReviewPage):
-            name += "-" + slug_of(page.production)
+        if runner is not None and isinstance(runner.parent, staff.ReportsTo) and isinstance(page, change_page.AssignedReviewPage):
+            name += "-" + runner.name
         entries: list[urgency.Entry[dict[str, str]]] = []
         by_key: dict[str, WaitingChange] = {}
         for item in items:
@@ -130,16 +129,16 @@ def prepare(browser: ReviewBrowser, status: change_page.DeliveryStatus) -> Prepa
     return PreparedReviews(tuple(changes), queues)
 
 
-def section(change: WaitingChange) -> str:
+def section(change: WaitingChange, feedback_rows: int) -> str:
     page, row = change.page, change.row
     anomaly = f"<p>{html.escape(change.anomaly)}</p>" if change.anomaly else ""
     if isinstance(page, UnavailableProduction):
         return f'''<section hidden data-key="{html.escape(change.key)}" data-tab="{html.escape(change.tab)}" data-pending="{str(change.waiting).lower()}">
 <p class="kind">{html.escape(row.get(change_review.KIND) or 'Kind not recorded')}</p>
 <div class="id">{html.escape(change.key)}</div><h1>{html.escape(row.get('Change', ''))}</h1>
-<h2>Proof</h2><pre>{html.escape(row.get(change_review.CHECK, ''))}</pre>
+<h2>Proof</h2>{change_page.review_text_html(row.get(change_review.CHECK, ''), "pre")}
 {anomaly}{change_page.question_html(change.question)}<p>{html.escape(page.reason)}</p></section>'''
-    form = change_page.answer_form(page, change_page.AnswerNotice(row["#"])).replace(
+    form = change_page.answer_form(page, change_page.AnswerNotice(row["#"]), feedback_rows).replace(
         '<form method="post">', f'<form method="post" action="{change_page.PAGE_NAME}">') if change.waiting else ""
     text = change_page.answer_status(row.get("Verdict", ""), change.slots)
     saved = f'<p>{html.escape(text)}</p>' if text else ""
@@ -148,11 +147,12 @@ def section(change: WaitingChange) -> str:
 <div class="id">{html.escape(change.key)} · {html.escape(row.get('Merged', ''))}</div>
 <h1>{html.escape(row.get('Change', ''))}</h1>
 <h2>{'Proof' if row.get(change_review.KIND) == 'Read only' else 'How to check'}</h2>
-<pre>{html.escape(row.get(change_review.CHECK, ''))}</pre>
+{change_page.review_text_html(row.get(change_review.CHECK, ''), "pre")}
 {anomaly}{change_page.question_html(change.question)}{saved}<p role="status" data-save-state></p>{form}</section>'''
 
 
 def render(browser: ReviewBrowser, status: change_page.DeliveryStatus) -> bytes:
+    feedback_rows = conf.read("review_links").whole("feedback_rows")
     prepared = prepare(browser, status)
     tabs = ''.join(f'<button type="button" role="tab" data-showrunner="{html.escape(tab)}">'
                    + f'{html.escape(tab)} (<span data-count>{sum(item.tab == tab and item.waiting for item in prepared.changes)}</span>)</button>'
@@ -162,7 +162,7 @@ nav button{white-space:nowrap;margin:0}nav button[aria-selected=true]{outline:2p
 section+section{border:0;margin:0;padding:0}
 .navigation{position:sticky;bottom:0;padding:12px 0;background:Canvas}button{min-height:44px}
 </style><h1>Changes to review</h1><nav role="tablist" aria-label="Showrunner">''' + tabs + '</nav>'
-               + ''.join(section(item) for item in prepared.changes)
+               + ''.join(section(item, feedback_rows) for item in prepared.changes)
                + '<p data-left></p><div class="navigation"><button type="button" data-next hidden>Next</button></div>'
                + '<noscript>Enable JavaScript to review changes and use Next.</noscript>'
                + '<script>const initial=' + json.dumps(browser.initial).replace('<', '\\u003c') + ';' + SCRIPT + '</script>')

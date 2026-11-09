@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """Show one staff member without changing its records or its session."""
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import json
 import shlex
@@ -11,12 +15,9 @@ from pathlib import Path
 from typing import cast
 
 sys.dont_write_bytecode = True
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "herdr"))
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "message"))
 from scripts.production import staff, unit_config
 from scripts.shutdown import remote
-import herdr
+from scripts.herdr import herdr
 
 
 NOT_APPLICABLE = "not applicable"
@@ -141,8 +142,7 @@ def read_details(row: staff.StaffRow, holder: staff.StaffRow, machine: str) -> M
     if machine != destination:
         return unavailable_details(row, holder, f"machine {machine} has no configured connection")
     code = (
-        "import sys,json; from pathlib import Path; from dataclasses import asdict; "
-        "sys.path.insert(0,str(Path.home()/'.claude')); "
+        "import sys,json; from dataclasses import asdict; "
         "from scripts.production.unit_command import staff,local_details; "
         "rows=json.load(sys.stdin); "
         "print(json.dumps(asdict(local_details(*(staff.StaffRow.from_json(row) for row in rows)))))"
@@ -171,9 +171,9 @@ def read_details(row: staff.StaffRow, holder: staff.StaffRow, machine: str) -> M
 
 def describe(row: staff.StaffRow, record: staff.StaffSnapshot) -> str:
     """Resolve ownership through the supplied snapshot."""
-    parent = record.by_id(row.parent) if row.parent is not None else None
+    parent = record.by_id(row.parent.id) if isinstance(row.parent, staff.ReportsTo) else None
     parent_name = parent.name if parent is not None else (
-        NOT_APPLICABLE if row.parent is None else unavailable(f"parent {row.parent} is missing"))
+        NOT_APPLICABLE if isinstance(row.parent, staff.StaffRoot) else unavailable(f"parent {row.parent} is missing"))
     holder = parent if row.kind == "worker" and parent is not None else row
     machine, worktree = unavailable("the machine is not recorded"), NOT_APPLICABLE
     if isinstance(holder.worktree, (staff.PresentWorktree, staff.RemovedWorktree)):

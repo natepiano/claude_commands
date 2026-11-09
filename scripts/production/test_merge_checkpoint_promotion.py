@@ -12,6 +12,7 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import unittest
@@ -23,12 +24,13 @@ from scripts.shutdown import pane_record
 from zoneinfo import ZoneInfo
 from scripts.direct.wait_for_test_state import wait_until
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.lib import main_publish
 from scripts.message import sessions
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-from merge_checkpoint import promote, request_from
-import merge_checkpoint
-from production_units import Production
+from scripts.production.merge_checkpoint import promote, request_from
+from scripts.production import merge_checkpoint
+from scripts.production import change_review
+from scripts.production.production_doc import Production
 
 # Importable once merge_checkpoint has put scripts/lib on the path.
 
@@ -41,13 +43,17 @@ MERGED_AT = datetime(2026, 10, 6, 12, tzinfo=ZoneInfo("America/Los_Angeles"))
 
 def setUpModule() -> None:
     configure_test_environment()
+    state = tempfile.TemporaryDirectory()
+    unittest.addModuleCleanup(state.cleanup)
+    unittest.enterModuleContext(mock.patch.dict(os.environ, {"ZONE_STATE": state.name}))
 
 
 @final
 class MergeCheckpointTests(MergeCheckpointFixture):
     def assert_completed_handoff_preserves_published_tip(self, *, with_review: bool) -> None:
-        review = self.root / "change-review.md"
+        review = Path(self.env["HOME"]) / "rust/hanadocs/change-review/change-review - example.md"
         if with_review:
+            self.promotions = str(self.promote)
             self.production_doc(change_review=review)
         _ = self.child_production()
         checkpoint = self.dated_checkpoint(
@@ -85,7 +91,8 @@ class MergeCheckpointTests(MergeCheckpointFixture):
         self.assert_completed_handoff_preserves_published_tip(with_review=True)
 
     def test_completed_handoff_repairs_missing_publication_records(self) -> None:
-        review = self.root / "change-review.md"
+        review = Path(self.env["HOME"]) / "rust/hanadocs/change-review/change-review - example.md"
+        self.promotions = str(self.promote)
         self.production_doc(change_review=review)
         _ = self.child_production()
         checkpoint = self.dated_checkpoint(
@@ -97,7 +104,6 @@ class MergeCheckpointTests(MergeCheckpointFixture):
         receipts = self.receipts()
         notices = self.events("style_sync.py")
         review.unlink()
-        merge_checkpoint.checkpoint_step_record(self.checkout, merge_head, "change-review").unlink()
         (self.root / "history/merge_receipts.jsonl").unlink()
         repaired = self.run_handoff(checkpoint)
         self.assertEqual(repaired.returncode, 0, repaired.stdout + repaired.stderr)
@@ -109,6 +115,32 @@ class MergeCheckpointTests(MergeCheckpointFixture):
         self.assertEqual((duplicate.returncode, duplicate.stdout, duplicate.stderr),
                          (0, f"hand-off {checkpoint[:7]} already merged as {merge_head[:7]}\n", ""))
         self.assertEqual(self.receipts(), receipts)
+
+    def test_failed_main_push_adds_no_row_and_a_good_retry_adds_it_once(self) -> None:
+        self.promotions = str(self.promote)
+        review = Path(self.env["HOME"]) / "rust/hanadocs/change-review/change-review - example.md"
+        self.production_doc(change_review=review)
+        checkpoint = self.dated_checkpoint("checkpoint(alpha): published\n\nChange-Review: Published | Read | Ready")
+        hook = self.origin / "hooks/pre-receive"
+        self.executable(hook, '#!/bin/sh\nwhile read old new ref; do\n'
+                        + ' if [ "$ref" = refs/heads/main ]; then exit 1; fi\ndone\n')
+        failed = self.run_checkpoint(checkpoint)
+        self.assertNotEqual(failed.process.returncode, 0, failed.process.stdout + failed.process.stderr)
+        self.assertEqual(change_review.pending(review), [])
+        published = self.git("rev-parse", "production", cwd=self.origin)
+        receipt, = self.receipts()
+        self.assertEqual(receipt["merge_commit"], published)
+        self.assertEqual(len(self.events("style_sync.py")), 1)
+        hook.unlink()
+        retried = self.run_checkpoint(checkpoint)
+        self.assertEqual(retried.process.returncode, 0, retried.process.stdout + retried.process.stderr)
+        self.assertEqual(self.git("rev-parse", "main", cwd=self.origin), published)
+        self.assertEqual([row["Change"] for row in change_review.pending(review)], ["Published"])
+        written = review.read_bytes()
+        self.assertEqual(self.run_checkpoint(checkpoint).process.returncode, 0)
+        self.assertEqual(review.read_bytes(), written)
+        self.assertEqual(self.receipts(), [receipt])
+        self.assertEqual(len(self.events("style_sync.py")), 1)
 
     def test_failed_style_notice_retries_until_delivery_succeeds(self) -> None:
         checkpoint = self.checkpoint()
@@ -148,7 +180,7 @@ class MergeCheckpointTests(MergeCheckpointFixture):
         (self.state / "slow-delivery").touch()
         command = (
             "import sys\nfrom pathlib import Path\n"
-            "sys.path.insert(0, sys.argv[1])\nimport merge_checkpoint as checkpoint\n"
+            'with open(Path(sys.argv[1]).parents[1] / "scripts/lib/package_root.py") as package_root: exec(package_root.read(), {"__file__": package_root.name})\nfrom scripts.production import merge_checkpoint as checkpoint\n'
             "path = Path(sys.argv[2])\ncheckpoint.send_result(path, checkpoint.read_record(path))\n"
         )
         output = self.enterContext((self.state / "slow-delivery.log").open("w"))
@@ -210,7 +242,7 @@ class MergeCheckpointTests(MergeCheckpointFixture):
             _ = (self.state / "mac-rc").write_text("1\n")
         else:
             self.write(self.promote, "src/alpha.txt", "local edit\n")
-        review = self.root / "change-review.md"
+        review = Path(self.env["HOME"]) / "rust/hanadocs/change-review/change-review - example.md"
         self.production_doc(change_review=review)
         if handoff:
             _ = self.child_production()
@@ -229,14 +261,13 @@ class MergeCheckpointTests(MergeCheckpointFixture):
             if mac_failure:
                 self.assertIn("promote", failed.stdout)
             else:
-                self.assertIn(f"{self.promote}: M src/alpha.txt", failed.stdout)
+                self.assertIn('promotion refused: tracked edits overlap promotion: "src/alpha.txt"', failed.stdout)
             merge_head = self.git("rev-parse", "HEAD")
             self.assertEqual(self.git("rev-parse", "production", cwd=self.origin), merge_head)
             receipt, = self.receipts()
             self.assertEqual(receipt["source_checkpoint"], checkpoint)
             self.assertEqual(receipt["merge_commit"], merge_head)
-            self.assertTrue(review.exists(), "a published merge must register its changes before promotion succeeds")
-            self.assertEqual(review.read_text().count("The published change remains recorded"), 1)
+            self.assertEqual(change_review.pending(review), [], "a failed promotion must not add a row")
             notices = self.events("style_sync.py")
             self.assertEqual(len(notices), 1, "promotion retries must not duplicate the publication notice")
             self.assertIn(merge_head, notices[0])
@@ -247,10 +278,10 @@ class MergeCheckpointTests(MergeCheckpointFixture):
                 self.assertEqual(self.events("send.py"), [], "a failed promotion must not acknowledge completion")
             if attempt == 0:
                 receipts = self.receipts()
-                rows = review.read_bytes()
+                rows = change_review.read(review).encode()
             else:
                 self.assertEqual(self.receipts(), receipts)
-                self.assertEqual(review.read_bytes(), rows)
+                self.assertEqual(change_review.read(review).encode(), rows)
         if mac_failure:
             _ = (self.state / "mac-rc").write_text("0\n")
         else:
@@ -259,7 +290,11 @@ class MergeCheckpointTests(MergeCheckpointFixture):
             retried = invoke()
             self.assertEqual(retried.returncode, 0, f"retry {attempt}: {retried.stdout}{retried.stderr}")
             self.assertEqual(self.receipts(), receipts)
-            self.assertEqual(review.read_bytes(), rows)
+            self.assertEqual(review.read_text().count("The published change remains recorded"), 1)
+            if attempt == 0:
+                rows = review.read_bytes()
+            else:
+                self.assertEqual(review.read_bytes(), rows)
             self.assertEqual(len(self.events("style_sync.py")), 1)
         self.assertTrue(self.log.exists())
 
@@ -635,7 +670,7 @@ with lock.open("a") as held:
         with (mock.patch.dict(os.environ, self.env), production_paths(self.env),
               mock.patch.object(pane_record, "RECORD_DIR", self.root / "panes")):
             request = request_from(argparse.Namespace(
-                production=str(self.doc), unit="alpha-unit", phase="2", hash=sha,
+                production="example", unit="alpha", phase="2", hash=sha,
                 also=[], shrink=False, as_built=False, trailer=[], review_trial=TRIAL, delivers=DELIVERS, parallel=PARALLEL,
                 cancel_prior=False, started=STARTED, regime="after", holds=0,
                 merge_defects=0, excluded=None, scratch=str(self.root / "scratch"),
@@ -672,7 +707,7 @@ with lock.open("a") as held:
         def now(zone: tzinfo | None = None) -> datetime:
             return MERGED_AT.astimezone(zone)
 
-        with mock.patch("merge_checkpoint.datetime", wraps=datetime, now=now):
+        with mock.patch("scripts.production.merge_checkpoint.datetime", wraps=datetime, now=now):
             result = self.run_checkpoint(sha, "--holds", "2", "--merge-defects", "1",
                                          "--regime", "trial", "--excluded", "no merge design check")
         self.assertEqual(result.process.returncode, 0, result.process.stderr + result.process.stdout)
@@ -690,8 +725,8 @@ with lock.open("a") as held:
                          set(self.git("rev-list", "--first-parent", "--merges", "HEAD").splitlines()))
         integration, = [row for row in receipts if row["merge_commit"] == tip]
         self.assertEqual(integration["source_checkpoint"], self.git("rev-parse", "HEAD^2"))
-        self.assertRegex(result.process.stdout, re.escape(f"into: {self.checkout} (production) — ") + ".*unblocks: G1: beta-unit Phase 4")
-        self.assertRegex(result.process.stdout, re.escape(f"into: {self.promote} (main) — ") + ".*unblocks: the live gate of alpha-unit phase 2")
+        self.assertRegex(result.process.stdout, re.escape(f"into: {self.checkout} (production) — ") + ".*unblocks: the unit’s next checkpoint")
+        self.assertRegex(result.process.stdout, re.escape(f"into: {self.promote} (main) — ") + ".*unblocks: the live gate of alpha phase 2")
         self.assertIn("the merge branch collects every unit's checkpoints", result.process.stdout)
         self.assertIn("sessions on", result.process.stdout)
         self.assertIn("into: " + str(self.root / "mac-installed"), result.process.stdout)
@@ -701,35 +736,38 @@ with lock.open("a") as held:
         merged_at = review[0][review[0].index("--merged") + 1]
         self.assertRegex(merged_at, r"^\d{4}-\d\d-\d\dT")
         self.assertEqual(review[0], [
-            "add", "--unit", "alpha-unit", "--plan", "docs/plans/alpha.md", "--phase", "2", "--regime", "trial",
+            "add", "--unit", "alpha", "--plan", "docs/plans/alpha.md", "--phase", "2", "--regime", "trial",
             "--started", STARTED, "--merged", merged_at, "--holds", "2",
             "--merge-defects", "1", "--ux-findings", "2", "--code-findings", "3",
             "--review-minutes", "14", "--ux-check-minutes", "4",
             "--ux-repair-minutes", "1", "--excluded", "no merge design check",
         ])
-        self.assertRegex(self.log.read_text(), rf"- {MERGED_AT:%H:%M %Z}: alpha-unit phase 2 \([0-9a-f]+\) merged as [0-9a-f]+; .*green; pushed; promoted")
-        self.assertIn("send alpha-unit:", result.process.stdout)
+        self.assertRegex(self.log.read_text(), rf"- {MERGED_AT:%H:%M %Z}: alpha phase 2 \([0-9a-f]+\) merged as [0-9a-f]+; .*green; pushed; promoted")
+        self.assertIn("send alpha:", result.process.stdout)
     def test_promotion_refusal_keeps_pushed_merge_and_resume_reaches_only_missing_place(self) -> None:
         self.promotions = str(self.promote)
-        self.gate = False
         self.production_doc()
         sha = self.checkpoint()
+        self.write(self.promote, "src/beta.txt", "staged local edit\n")
+        _ = self.git("add", "src/beta.txt", cwd=self.promote)
+        self.write(self.promote, "src/beta.txt", "local edit\n")
         self.write(self.promote, "src/alpha.txt", "local edit\n")
         failed = self.run_checkpoint(sha)
         self.assertIn("failed", failed.process.stdout)
-        self.assertIn("src/alpha.txt", failed.process.stdout)
+        self.assertIn('promotion refused: tracked edits overlap promotion: "src/alpha.txt"', failed.process.stdout)
         pushed = self.git("rev-parse", "refs/heads/production", cwd=self.origin)
         self.assertEqual(self.git("rev-parse", "HEAD"), pushed)
         self.assertEqual(self.git("rev-parse", "HEAD", cwd=self.promote), failed.before)
         self.assertIn(f"into: {self.checkout} (production)", failed.process.stdout)
-        self.assertIn("unblocks: no gate", failed.process.stdout)
+        self.assertIn("unblocks: the unit’s next checkpoint", failed.process.stdout)
         self.assertNotIn(f"into: {self.promote} (main)", failed.process.stdout)
         _ = self.git("restore", "src/alpha.txt", cwd=self.promote)
         resumed = self.run_checkpoint(sha)
         self.assertEqual(resumed.process.returncode, 0, resumed.process.stderr + resumed.process.stdout)
         self.assertEqual(self.git("rev-parse", "HEAD", cwd=self.promote), pushed)
         self.assertIn(f"into: {self.promote} (main)", resumed.process.stdout)
-        self.assertNotIn("unblocks: G1", resumed.process.stdout)
+        self.assertEqual((self.promote / "src/beta.txt").read_text(), "local edit\n")
+        self.assertEqual(self.git("show", ":src/beta.txt", cwd=self.promote), "staged local edit")
     def test_mac_rc_failure_is_reported_after_local_promotion(self) -> None:
         self.promotions = str(self.promote) + ", mac " + str(self.root / "mac-installed")
         self.production_doc()
@@ -740,6 +778,27 @@ with lock.open("a") as held:
         self.assertIn(f"into: {self.checkout} (production)", result.process.stdout)
         self.assertIn(f"into: {self.promote} (main)", result.process.stdout)
         self.assertNotIn("into: " + str(self.root / "mac-installed"), result.process.stdout)
+        with self.subTest(mac="unreachable"):
+            self.env["ZONE_STATE"] = str(self.root / "zone")
+            self.executable(self.bin / "ssh", STUB.replace('if name == "ssh":\n',
+                'if name == "ssh":\n'
+                + '    print("connection timed out", file=sys.stderr)\n'
+                + '    raise SystemExit(255)\n'))
+            with mock.patch.object(merge_checkpoint, "send_queued_zone") as send_zone:
+                completed = self.run_checkpoint(sha)
+            self.assertEqual(completed.process.returncode, 0, completed.process.stdout + completed.process.stderr)
+            self.assertIn("promote: ok — mac unreachable, pull pending", completed.process.stdout)
+            self.assertNotIn("into: " + str(self.root / "mac-installed"), completed.process.stdout)
+            self.assertEqual(self.git("rev-parse", "HEAD", cwd=self.promote), self.git("rev-parse", "HEAD"))
+            self.assertIn("merged as", self.log.read_text())
+            send_zone.assert_not_called()
+            with mock.patch.dict(os.environ, self.env):
+                pending = main_publish.read_queue()
+            self.assertIsInstance(pending, main_publish.PendingMacPull)
+            assert isinstance(pending, main_publish.PendingMacPull)
+            self.assertEqual(pending.text, "")
+            self.assertIn("connection timed out", pending.reason)
+
     def test_mac_pull_retries_once_then_succeeds(self) -> None:
         config = self.root / "merge_checkpoint.conf"
         _ = config.write_text("# whole: 1..\nMAC_PULL_TRIES=3\n# range: 0..\nMAC_PULL_RETRY_SECONDS=0\n")
@@ -793,12 +852,12 @@ with lock.open("a") as held:
         self.assertEqual(self.git("rev-parse", "HEAD"), pushed)
         self.assertEqual(len(self.events("checkpoint-test")), 1)
         self.assertEqual(len(self.log.read_text().splitlines()), 1)
-        self.assertIn("unblocks: no gate", resumed.process.stdout)
+        self.assertIn("unblocks: the unit’s next checkpoint", resumed.process.stdout)
     def test_a_merge_killed_before_its_push_is_tested_before_a_rerun_pushes_it(self) -> None:
         # Killed after the merge and before its tests finished: nothing proves the merge green.
         sha = self.checkpoint()
         before = self.git("rev-parse", "refs/heads/production", cwd=self.origin)
-        subject = f"Merge alpha-unit phase 2 ({sha[:7]}) into production"
+        subject = f"Merge alpha phase 2 ({sha[:7]}) into production"
         _ = self.git("merge", "--no-ff", "-q", "-m", subject, sha, cwd=self.checkout)
         _ = (self.state / "fail-checkpoint-test").touch()
         red = self.run_checkpoint(sha)

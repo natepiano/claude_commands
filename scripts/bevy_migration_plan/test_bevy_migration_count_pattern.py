@@ -6,11 +6,8 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal, cast, final, override
-if TYPE_CHECKING:
-    from ..lib import test_hang_guard
-else:
-    from scripts.lib import test_hang_guard
+from typing import Literal, cast, final, override
+from scripts.lib import test_hang_guard
 
 
 CountMode = Literal["single", "multiple", "verify"]
@@ -25,9 +22,7 @@ class MigrationPatternCountTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
-        temporary_root = Path("/tmp/claude")
-        temporary_root.mkdir(parents=True, exist_ok=True)
-        folder = tempfile.TemporaryDirectory(prefix="migration-counter-", dir=temporary_root)
+        folder = tempfile.TemporaryDirectory(prefix="migration-counter-")
         self.addCleanup(folder.cleanup)
         self.root = Path(folder.name)
         self.codebase = self.root / "project"

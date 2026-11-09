@@ -1,7 +1,11 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
 """Record role assignments that would otherwise disappear when a run ends."""
 
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import argparse
 import fcntl
@@ -11,14 +15,18 @@ import re
 import sys
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import BinaryIO, Literal, cast, get_args
+from typing import TYPE_CHECKING, BinaryIO, Literal, cast, get_args
+
+if TYPE_CHECKING:
+    from scripts.production import staff
 
 Role = Literal["showrunner", "director", "impl", "test", "fix", "review", "worker", "interactive", "subagent"]
 Lens = Literal["adversary", "contract", "craft", "ux", "rerun", "simplify"]
 ROLES: tuple[Role, ...] = ("showrunner", "director", "impl", "test", "fix", "review", "worker", "interactive", "subagent")
 LENSES = cast(tuple[Lens, ...], get_args(Lens))
+PHASE_REVIEW_LENSES = tuple(lens for lens in LENSES if lens != "simplify")
 
 
 @dataclass(frozen=True)
@@ -188,10 +196,8 @@ def _review_lens(run: Path, name: str) -> Lens | None:
     return max(evidence_mtimes, key=lambda lens: evidence_mtimes[lens]) if evidence_mtimes else None
 
 
-def _run_assignments(run: Path) -> Iterator[tuple[str, Assignment]]:
-    # The remote reader loads this module without a worker checkout.
-    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-    from scripts.direct.worker_state import worker_ledger
+def _run_assignments(run: Path, membership: staff.StaffSnapshot) -> Iterator[tuple[str, Assignment]]:
+    from scripts.production import session_staff
 
     roster_path = run / "mesh_roster.json"
     try:
@@ -200,37 +206,21 @@ def _run_assignments(run: Path) -> Iterator[tuple[str, Assignment]]:
             value = cast(object, json.loads(roster_path.read_text(encoding="utf-8")))
             if not isinstance(value, dict):
                 raise ValueError("roster must be an object")
-            for name, value in cast(dict[str, object], value).items():
+            records = cast(dict[str, object], value)
+            for name, value in records.items():
                 if not isinstance(value, dict):
                     continue
                 worker = cast(dict[str, object], value)
-                agent_id = worker.get("thread_id")
-                if not isinstance(agent_id, str) or not agent_id.strip():
+                agent_id = session_staff.worker_session(worker, membership)
+                if not agent_id.strip():
                     continue
-                role = worker.get("role")
-                previous_role = worker.get("previous_role")
-                if isinstance(previous_role, str) and previous_role in ROLES:
-                    # The only surviving timestamp is the roster's mtime. One second
-                    # earlier preserves the known order without claiming precision.
-                    previous = _role(previous_role)
-                    lens = _review_lens(run, name) if previous == "review" else None
-                    yield agent_id, Assignment(stamp - timedelta(seconds=1), previous, lens, True)
-                if isinstance(role, str) and role in ROLES:
+                role = session_staff.worker_name(worker, membership)
+                if role in ROLES:
                     current = _role(role)
                     lens = _review_lens(run, name) if current == "review" else None
                     yield agent_id, Assignment(stamp, current, lens, True)
     except (OSError, ValueError, RecursionError) as exc:
         _report_problem(f"{roster_path}: {exc}")
-    workers_path = worker_ledger(run)
-    try:
-        if workers_path.is_file():
-            stamp = datetime.fromtimestamp(workers_path.stat().st_mtime, timezone.utc)
-            for line in workers_path.read_text(encoding="utf-8").splitlines():
-                agent_id, separator, _name = line.partition("\t")
-                if separator and agent_id.strip():
-                    yield agent_id, Assignment(stamp, "worker", None, True)
-    except (OSError, ValueError) as exc:
-        _report_problem(f"{workers_path}: {exc}")
 
 
 def _recover_directors(live: Path, recovered: list[tuple[str, Assignment]]) -> None:
@@ -252,16 +242,22 @@ def _recover_directors(live: Path, recovered: list[tuple[str, Assignment]]) -> N
 
 def backfill(archive: Path, *live: Path) -> int:
     """Recover assignments from the archive and each live run root."""
+    from scripts.production import staff
+
     recovered: list[tuple[str, Assignment]] = []
-    for root in (archive, *live):
-        if not root.exists():
-            continue
-        for run in sorted(root.iterdir()):
-            if run.is_dir() and run.name != "active":
-                try:
-                    recovered.extend(_run_assignments(run))
-                except (OSError, ValueError) as exc:
-                    _report_problem(exc)
+    try:
+        membership = staff.local_snapshot()
+        for root in (archive, *live):
+            if not root.exists():
+                continue
+            for run in sorted(root.iterdir()):
+                if run.is_dir() and run.name != "active":
+                    try:
+                        recovered.extend(_run_assignments(run, membership))
+                    except (OSError, ValueError) as exc:
+                        _report_problem(exc)
+    except (OSError, ValueError) as exc:
+        _report_problem(f"{staff.record_path()}: {exc}")
     for root in live:
         _recover_directors(root, recovered)
     path = state_dir() / "agents.jsonl"
@@ -331,7 +327,6 @@ def main(argv: list[str] | None = None) -> int:
         elif command == "register":
             _ = register_default(cast(str, args.id), cast(Role, args.role), datetime.now(timezone.utc))
         elif command == "backfill":
-            sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
             from scripts.lib import unit_runs
 
             archive = cast(Path | None, args.archive) or unit_runs.run_archive()

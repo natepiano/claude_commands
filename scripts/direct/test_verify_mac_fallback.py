@@ -14,6 +14,7 @@ class VerifyMacFallbackTests(VerifyMacOffloadFixture):
         for settings, reason in (("offload=on\n", "repo"), (f"offload=on\nlinux_only.{self.root.name}=sample\n", "linux_only")):
             with self.subTest(reason=reason):
                 self.clear_observations()
+                Path(self.environment["MAC_TEST_CONFIG"]).unlink()
                 _ = write_config_fixture(Path(self.environment["MAC_TEST_CONFIG"]), settings, template="mac_test")
                 result = self.verify("test", "sample", "--no-cache")
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)

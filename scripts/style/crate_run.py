@@ -1,10 +1,14 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
 """Identified serial crate batches, entered through bulk_run --crate.
 
 Canonical Git and the ledger own claims and publication. Private checkouts own edits and
 validation. The existing workspace validation and exact-tree test proof are unchanged.
 """
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import fcntl
 import hashlib
@@ -14,21 +18,24 @@ import re
 import subprocess
 from collections import defaultdict
 from collections.abc import Callable, Generator, Sequence
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from copy import deepcopy
 from dataclasses import asdict, dataclass, replace
 from enum import StrEnum
 from pathlib import Path
 from typing import NotRequired, Protocol, TypedDict, cast
 
-import bulk_rename as bulk
-import bulk_run as run
-import coverage_report
-import rules
-import style_ledger as ledger_api
-import style_proposals
-import style_footprint
-from style_ledger import _path_attributes  # pyright: ignore[reportPrivateUsage]
+from scripts.style import bulk_rename as bulk
+from scripts.style import bulk_run as run
+from scripts.style import coverage_report
+from scripts.lib import copy_record, scratch
+from scripts.style import rules
+from scripts.style import style_ledger as ledger_api
+from scripts.style import style_proposals
+from scripts.style import style_footprint
+from scripts.style import style_sync
+from scripts.copies import copies
+from scripts.style.style_ledger import _path_attributes  # pyright: ignore[reportPrivateUsage]
 
 
 class CrateStage(StrEnum):
@@ -771,6 +778,8 @@ class CrateRun:
         self.folder: Path = ledger.database.parent / "crate_runs" / run_id
         self.path: Path = self.folder / "manifest.json"
         self.run_id: str = run_id
+        self.owner: str = style_sync.gate_owner(self.repo)
+        self.task: str = "gate:crate-" + hashlib.sha256(str(self.path).encode()).hexdigest()
 
     def read(self) -> Manifest:
         value = bulk.object_fields(cast(object, json.loads(self.path.read_text())))
@@ -808,6 +817,7 @@ class CrateRun:
                 if isinstance(skipped, run.OpenTicketRefusal):
                     directory = style_proposals.crate_for(directories, skipped.path)
                     held_by_crate[directory][skipped.finding_id] = list(skipped.ticket_ids)
+            checkout_parent = copies.workspace_path(self.owner, self.repo, f"crate-{self.run_id}.selected").parent
             for member in members:
                 if not re.fullmatch(r"[A-Za-z0-9_-]+", member.package_name):
                     raise bulk.BulkRenameError("unsafe package name")
@@ -824,7 +834,7 @@ class CrateRun:
                     frozen.append({"id": finding.finding_id, "path": finding.path, "proposal": proposal,
                                    "rule_blob": finding.rule_blob, "evidence": evidence(finding),
                                    "proposal_sha256": hashlib.sha256(Path(proposal).read_bytes()).hexdigest()})
-                checkout = self.folder / member.package_name
+                checkout = checkout_parent / f"crate-{self.run_id}.{member.package_name}"
                 records[member.package_name] = {
                     "directory": member.directory, "checkout": str(checkout),
                     "branch": f"refs/heads/style-crate/{self.run_id}/workers/{member.package_name}",
@@ -840,14 +850,18 @@ class CrateRun:
                        "expected_tip": base, "integration_ref": f"refs/heads/style-crate/{self.run_id}/integration",
                        "crates": records, "refusals": refusals})
 
-    def frozen_checkout(self, manifest: Manifest) -> Path:
-        checkout = self.folder / "frozen-base"
-        self.clone(checkout, "refs/heads/frozen-base", manifest["base"])
-        return checkout
+    @contextmanager
+    def frozen_checkout(self, manifest: Manifest) -> Generator[Path]:
+        with copies.standing(self.owner, self.repo, copies.CommittedSource(manifest["base"])) as checkout:
+            yield checkout
 
     def definition(self, manifest: Manifest) -> rules.Rule:
-        """Read repository rules from an immutable private base, including during resume."""
-        definition = next(item for item in rules.load_rules(self.frozen_checkout(manifest))
+        """Read the pinned rule while the standing checkout stays locked."""
+        with self.frozen_checkout(manifest) as checkout:
+            return self.checked_definition(manifest, checkout)
+
+    def checked_definition(self, manifest: Manifest, checkout: Path) -> rules.Rule:
+        definition = next(item for item in rules.load_rules(checkout)
                           if item.rule_id == manifest["rule"])
         if (definition.blob != manifest["rule_blob"]
                 or definition.path.read_text() != manifest["rule_text"]):
@@ -910,15 +924,6 @@ class CrateRun:
                         != frozen["proposal_sha256"]):
                     raise bulk.BulkRenameError("frozen finding or ownership changed")
 
-    def clone(self, checkout: Path, branch: str, base: str) -> None:
-        if not checkout.exists():
-            _ = run.git(self.repo, "clone", "--shared", "--no-checkout", str(self.repo), str(checkout))
-            _ = run.git(checkout, "checkout", "-b", branch.removeprefix("refs/heads/"), base)
-            for key in ("user.name", "user.email"):
-                _ = run.git(checkout, "config", key, run.git(self.repo, "config", key))
-        if run.git(checkout, "remote", "get-url", "origin") != str(self.repo):
-            raise bulk.BulkRenameError("unrelated execution checkout")
-
     def publish_refusals(self, manifest: Manifest, record: CrateRecord,
                          refused: dict[str, str]) -> None:
         """Under the claim lock, save evidence before releasing membership; retries are idempotent."""
@@ -955,9 +960,10 @@ class CrateRun:
     def advance(self, package: str, planner: Planner = plan, runner: run.Runner = run.run_command,
                 available: Callable[[Path, str], None] = bulk.check_available,
                 executor: PlanExecutor | ExecutionService = ExecutionService.BULK_RUN) -> Manifest:
-        with serial(self.folder):
+        with serial(self.folder), self.complete_run():
             manifest = self.read()
-            with self.ledger.rules_from_checkout(self.frozen_checkout(manifest)):
+            with (self.frozen_checkout(manifest) as frozen,
+                  self.ledger.rules_from_checkout(frozen), ExitStack() as workers):
                 if package not in manifest["crates"]:
                     raise bulk.BulkRenameError("crate is not in the frozen run")
                 record = manifest["crates"][package]
@@ -966,7 +972,20 @@ class CrateRun:
                     return manifest
                 checkout = Path(record["checkout"])
                 base = manifest["base"]
-                definition = self.definition(manifest)
+                definition = self.checked_definition(manifest, frozen)
+                if stage != CrateStage.SELECTED or record["selected"]:
+                    legacy = checkout if checkout.exists() else None
+                    worker = workers.enter_context(copies.workspace(
+                        self.owner, self.repo, base,
+                        name=checkout.name, branch=record["branch"], task=self.task, path=legacy,
+                        run_manifest=self.path))
+                    if worker != checkout and stage == CrateStage.SELECTED and not checkout.exists():
+                        record["checkout"] = str(worker)
+                        record["intent"] = str(worker / ".git/style-batch-intent.json")
+                        self.save(manifest)
+                        checkout = worker
+                    if worker != checkout:
+                        raise bulk.BulkRenameError("worker registration differs from the frozen run")
                 intent = run.WorkspaceIntent(checkout, f"bulk_run --run {self.run_id} --crate {package} --repo {self.repo}") if checkout.exists() else None
                 if stage == CrateStage.CLAIMING:
                     # Write-ahead intent owns independently committed claims even if claim() never returned.
@@ -996,7 +1015,6 @@ class CrateRun:
                             _ = run.git(self.repo, "update-ref", record["branch"], base, "0" * 40)
                         elif existing.stdout.strip() != base:
                             raise bulk.BulkRenameError("worker branch moved before claiming")
-                        self.clone(checkout, record["branch"], base)
                         intent = run.WorkspaceIntent(checkout, f"bulk_run --run {self.run_id} --crate {package} --repo {self.repo}")
                         record["stage"] = CrateStage.CLAIMING
                         self.save(manifest)
@@ -1086,7 +1104,7 @@ class CrateRun:
                         raise bulk.BulkRenameError("worker checkout moved after commit")
                     if run.git(checkout, "status", "--porcelain", "--untracked-files=no"):
                         raise bulk.BulkRenameError("worker files changed after commit")
-                    result = run.test_tree(checkout, commit, result_evidence["tree"], runner, {})
+                    result = run.test_tree(checkout, commit, result_evidence["tree"], runner, {}, owner=self.owner)
                     if result.code:
                         self.abandon(manifest, record, "tests failed: " + run.first_failing_test(result),
                                      result_evidence["refusals"])
@@ -1117,6 +1135,24 @@ class CrateRun:
                 if stage == CrateStage.CHECKPOINT_PUBLISHED:
                     self.integrate(manifest, record, runner)
                 return manifest
+
+    @contextmanager
+    def complete_run(self) -> Generator[None]:
+        """End worker tasks after terminal manifest publication and worker lock release."""
+        try:
+            yield
+        finally:
+            manifest = self.read()
+            if all(CrateStage(record["stage"]) in {CrateStage.INTEGRATED, CrateStage.ABANDONED}
+                   for record in manifest["crates"].values()):
+                paths = [Path(record["checkout"]) for record in manifest["crates"].values()]
+                for record in manifest["crates"].values():
+                    path = Path(record["checkout"])
+                    if path.exists() and isinstance(scratch.pending_removal(path), copy_record.NotRegistered):
+                        with copies.workspace(self.owner, self.repo, manifest["base"], name=path.name,
+                                              branch=record["branch"], task=self.task, path=path, run_manifest=self.path):
+                            pass
+                copies.end_workspaces(self.task, paths)
 
     def wait_for_reservations(self, manifest: Manifest, record: CrateRecord,
                               pending: tuple[bulk.PendingFinding, ...], refused: dict[str, str]) -> None:
@@ -1323,22 +1359,22 @@ class CrateRun:
                          actual.stdout.strip() if actual.code == 0 else "0" * 40)
         assert "integration" in record
         if IntegrationStage(record["integration"]["stage"]) == IntegrationStage.PREPARED:
-            checkout = self.folder / ("integration-" + candidate)
-            self.clone(checkout, private, candidate)
-            tree = run.git(checkout, "rev-parse", "HEAD^{tree}")
-            if run.require_base(checkout, tree) != candidate:
-                raise bulk.BulkRenameError("integration checkout moved")
-            members = coverage_report.workspace(self.ledger, candidate)
-            ownership = SourceOwnership(checkout, candidate, members)
-            for path in changed(checkout, expected, candidate):
-                ownership.require(ownership.home(path), (path,))
-            workspace = run.WorkspaceEdits(checkout, candidate, ())
-            _ = run.validate(workspace, runner, {"check_clippy": 0.0}, [], lambda paths: paths)
-            result = run.test_tree(checkout, candidate, tree, runner, {})
-            if result.code:
-                raise bulk.BulkRenameError("combined-tree proof failed; tested claims remain pending")
-            record["integration"]["stage"] = IntegrationStage.TESTED
-            self.save(manifest)
+            with copies.standing(self.owner, self.repo, copies.CommittedSource(candidate)) as checkout:
+                tree = run.git(checkout, "rev-parse", "HEAD^{tree}")
+                run.require_test_tree(checkout, tree)
+                if run.git(checkout, "rev-parse", "HEAD") != candidate:
+                    raise bulk.BulkRenameError("integration checkout moved")
+                members = coverage_report.workspace(self.ledger, candidate)
+                ownership = SourceOwnership(checkout, candidate, members)
+                for path in changed(checkout, expected, candidate):
+                    ownership.require(ownership.home(path), (path,))
+                workspace = run.WorkspaceEdits(checkout, candidate, ())
+                _ = run.validate(workspace, runner, {"check_clippy": 0.0}, [], lambda paths: paths)
+                result = run.test_tree(checkout, candidate, tree, runner, {}, owner=self.owner)
+                if result.code:
+                    raise bulk.BulkRenameError("combined-tree proof failed; tested claims remain pending")
+                record["integration"]["stage"] = IntegrationStage.TESTED
+                self.save(manifest)
         with ledger_api.refill_lock(self.repo):
             self.owned(record)
             worktrees = run.git(self.repo, "worktree", "list", "--porcelain")

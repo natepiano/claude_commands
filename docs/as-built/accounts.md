@@ -68,7 +68,7 @@ An unreadable identity is never an absent identity.
 Codex identity resolution uses the account note's identity mapping.
 It handles numbered homes and a legacy `~/.codex` home through the same resolver.
 Status counts use that resolver too.
-Two homes with one sign-in can break token refresh, so setup and account checks detect duplicates.
+Setup and account checks detect duplicate sign-ins across homes.
 Cutover journals preserve interrupted identity moves and support an explicit undo.
 Setup waits for Codex to answer `initialize` before it reports success.
 Shared session indexing can require up to twenty minutes.
@@ -131,10 +131,17 @@ The [launch environment](nix-shell-launch.md) describes shared Nix setup and acc
 ## Moves, refusals, and workers
 
 Account moves use the shared stop and resume API.
+Each session attempt writes a request and one confirmed or failed outcome to `~/.local/state/accounts/moves.jsonl`.
+Each attempt has its own move ID and cause.
+A session already on the target writes nothing.
 The [shutdown design](shutdown-and-restart.md) owns process identity, pane reuse, prompt delivery, and recovery details.
 All selected stops finish before the batch resumes any session.
 Each session resumes its own conversation on the target account.
 A selected caller delegates the batch to a detached process before any signal.
+The notes timer delegates its moves through the same boundary before its part deadline can kill them.
+Requests use each session's observed process account, including members outside their selected group account.
+Blocked notices check the queue head and target again before delivery.
+Quota recipients use one session address for both names and IDs.
 Workers keep their threads when their Claude owner moves.
 
 A group move validates the destination before changing the selection or stopping members.
@@ -172,26 +179,55 @@ Without a queued workers move, provider refusal or unavailable included usage ca
 Credit policy determines whether an exhausted account can continue.
 Worker assignment fallback to Claude remains separate from the selected Codex account.
 Routing returns only when the selected Codex account can work and its refusal has resolved.
-The [worker design](long-lived-workers.md) owns thread interruption, continuation, held roles, and server retirement.
+Pane workers move through their dispatch lock, fresh pane evidence, `restart.stop_row`, and `worker_panes.start_or_resume`.
+They keep the same conversation and reuse a stopped pane.
+Only an open pass receives resume text through the shared target check.
+`config/shutdown.conf` sets the stop deadline from `STOP_GRACE_SECONDS`, `KILL_GRACE_SECONDS`, and `MOVE_STOP_MARGIN_SECONDS`.
 The [quota guide](../quota_alerts.md) owns phone episodes, forecasts, routing notices, and delivery retries.
 
 Login renewal uses named success and failure results.
 The watcher rate-limits attempts and records their reason.
 A failed renewal remains visible; it does not convert a stale reading into a fresh reading.
 
+### Worker move results
+
+`accounts.py move workers <target>` stops same-family workers and leaves their restart pending.
+`assign.sh` cannot yet carry both the fixed staff ID and the destination account for this operation.
+The result names the target account: `stopped, resume pending on <account>: <reason>`.
+
+The preview uses the same family decision before it takes a row lock or stops a source.
+A same-family worker prints `<name> (<id>): would stop; restart on <target> stays pending`.
+A cross-family worker prints `<name> (<id>): not moved: cannot restart on <target> through assign.sh`.
+Unavailable family evidence also refuses the restart.
+The real refusal leaves the source running.
+
+Source release preserves each stop reason and gives the next action.
+The [family handoff](long-lived-workers.md#family-handoff-and-retry) defines its named results and native source evidence.
+A session move's opening message selects only its [own worker children](shutdown-and-restart.md#worker-resume-results).
+
 ## Recovery and alert ownership
 
-The unit watchdog uses pane launch records and fresh process liveness.
-It preserves one pass of grace and dispatches bounded detached recovery jobs.
-An ended launch, intentional stop, retired unit, missing worktree, or finished run does not trigger recovery.
-Unknown liveness preserves pending evidence.
-A recovery worker rechecks the launch identity before it resumes the conversation.
-The current watchdog sends no phone push, showrunner notice, or message to a live session.
+The unit watchdog reads current names, parents, sessions, and folders from staff.
+It reads the account from the pane launch record and checks current process liveness.
+It saves pending jobs before it starts detached recovery services.
+Each child resolves the current staff session before resume.
+Historical jobs remain keyed by session id.
+Account notes keep historical rows without using them as current counts.
+A failed roster read reports one anomaly and sets the derived count to zero.
+Recovery keeps its grace period, dispatch limit, and result until a fresh observation confirms the session state.
+The watchdog sends no phone push, showrunner notice, or message to a live session.
 
 Retained record-driven restart paths share a durable alert ledger.
 The [shutdown design](shutdown-and-restart.md#outage-alert-ledger) describes claims, delivery, leases, machine ownership, and observation-scoped clearing.
 The ledger survives shutdown-record archival.
+Claim ownership prevents concurrent sends and stale updates.
+A second outage or five-hour delivery caller prints `already claimed by <id>` and does not repeat delivery.
 Its delivered state means a successful push, not an unfinished send claim.
+
+Config publication uses a blocking `fcntl.flock` with no time limit or retry settings.
+The kernel releases the lock when its holder exits.
+Usage and renewal schedules keep separate claims.
+A second schedule caller prints `already claimed by <id>` and exits with code 0.
 
 ## Status, counts, and notes
 
@@ -204,19 +240,20 @@ This preserves visible off-target members during a move.
 Local role counts read the registry, staff, pane launches, and worker records without writing state.
 `session-counts-read` prints the same live count document without publishing a file.
 Peer counts use the shared role-map transport in a detached fetch.
+One claim prevents concurrent fetches.
 The normal status path never waits for that fetch.
 The cache keeps each machine's counts separate and rejects copies older than ten minutes.
 Canonical `mac` and `natedev` names identify observations independently of a desktop hostname.
 The board sums available machine counts and identifies an unavailable peer.
 
 `status --stored` reads saved usage, role maps, and peer counts.
-It starts no discovery and does not wait for the detached counts fetch.
+It does not wait for the detached counts fetch.
 Local session counts still use current local registry evidence.
 The [board design](unit-board.md) owns the display contract and refresh lifecycle.
 
 Account notes use numbered filenames.
-Each note shows its roles, live session count, and attributed session rows.
-Retained peer rows carry a last-seen mark and do not count as live sessions.
+Each note shows its roles and live session count.
+Existing session rows remain as history and supply no current staff facts.
 Unchanged notes are not rewritten.
 Usage reads retain account identity and reading outcome; a failed read never becomes a zero-percent reading.
 Recent usage can be reused, but low quota, resets, queued moves, and identity changes require fresh checks.
@@ -274,6 +311,10 @@ Account creation, identity resolution, and missing-note instructions use that sa
 A new process sees a changed notes-folder setting.
 
 The default usage age is ten minutes.
+Codex alert readings use the same `usage_stale_minutes` setting.
+The quota relay limit defaults to 40 seconds, and the registry editor limit defaults to 30 seconds.
+Account commands and Claude usage HTTP requests each default to 15 seconds.
+The Codex account server has three seconds to stop after termination.
 The role-map transport has a five-second connection limit and a twenty-second command limit.
 The outage claim lease is fifteen minutes, longer than the normal send deadline.
 These values live in configuration; their values are not independent code defaults.
@@ -286,7 +327,7 @@ Account and role changes preserve these boundaries:
 3. Keep unknown evidence distinct from absence or exhausted allowance.
 4. Validate the destination before a destructive move step.
 5. Preserve conversation identity and worker threads across account changes.
-6. Keep stored status free of transport and cache writes.
+6. Keep status reads independent of the background counts fetch.
 7. Mark an alert delivered only after successful delivery.
 8. Clear only alerts that precede the observation of a live session.
 9. Preserve shared settings and concurrent edits during local-key filtering.

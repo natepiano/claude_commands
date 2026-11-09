@@ -10,8 +10,10 @@ import math
 import os
 import re
 import shlex
+import shutil
 from pathlib import Path
 import signal
+import socket
 import struct
 import subprocess
 import sys
@@ -26,8 +28,14 @@ import zlib
 
 from scripts.buildlog import store
 from scripts.hana_shot import hana_shot
+from scripts.lib import conf
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.lint.memory_test_support import config_environment, write_config_fixture
+from scripts.production import staff
+from scripts.production.staff_test_support import fixture_member, fixture_runtime_id, fixture_worker, isolated_staff_file
 
+
+LAUNCH_RECORDING_PURPOSE = "launch recovery"
 
 SCRIPT = Path(__file__).with_name("hana_shot.py")
 CAMERA_ENTITY = 5
@@ -329,13 +337,43 @@ class BuildLogIsolatedTest(unittest.TestCase):
     def setUp(self) -> None:
         super().setUp()
         self.scratch = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
+        settings = "capture_timeout_seconds=1\n"
+        if self._testMethodName == "test_screenshot_busy_past_the_resend_limit_fails":
+            settings += "resend_seconds=0.05\n"
+        _ = write_config_fixture(self.scratch / "config/hana_shot.conf", settings)
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
+            **config_environment(self.scratch / "config"),
             "BUILDLOG_DIR": str(self.scratch / "buildlog"),
         })))
 
 
+class FixtureServer(ThreadingHTTPServer):
+    """Wake the request loop when the fixture stops."""
+
+    def __init__(self, address: tuple[str, int], handler: type[BaseHTTPRequestHandler]) -> None:
+        super().__init__(address, handler)
+        self.stopping: threading.Event = threading.Event()
+        self.finished: threading.Event = threading.Event()
+
+    def serve(self) -> None:
+        try:
+            while not self.stopping.is_set():
+                self.handle_request()
+        finally:
+            self.finished.set()
+
+    @override
+    def shutdown(self) -> None:
+        if not self.stopping.is_set():
+            self.stopping.set()
+            with socket.create_connection(("127.0.0.1", self.server_port), timeout=TEST_HANG_GUARD_SECS):
+                pass
+        if not self.finished.wait(timeout=TEST_HANG_GUARD_SECS):
+            raise TimeoutError("The fixture server did not stop")
+
+
 class HanaShotTest(BuildLogIsolatedTest):
-    fake_listeners: list[ThreadingHTTPServer] = []
+    fake_listeners: list[FixtureServer] = []
     fake: Fake = Fake()
     port: int = 0
 
@@ -343,9 +381,9 @@ class HanaShotTest(BuildLogIsolatedTest):
     def setUp(self) -> None:
         super().setUp()
         self.fake = Fake()
-        server = ThreadingHTTPServer(("127.0.0.1", 0), handler_for(self.fake))
+        server = FixtureServer(("127.0.0.1", 0), handler_for(self.fake))
         self.fake_listeners = [server]
-        threading.Thread(target=server.serve_forever, daemon=True).start()
+        threading.Thread(target=server.serve, daemon=True).start()
         self.addCleanup(server.server_close)
         self.addCleanup(server.shutdown)
         self.addCleanup(self.fake.release.set)
@@ -362,7 +400,6 @@ class HanaShotTest(BuildLogIsolatedTest):
         environment = {
             **os.environ,
             "XDG_CACHE_HOME": str(self.scratch / "cache"),
-            "HANA_SHOT_CAPTURE_TIMEOUT": "1",
             # RemoteTests puts its fake scp and ssh here.
             "PATH": f"{self.scratch / 'bin'}{os.pathsep}{os.environ.get('PATH', '')}",
         }
@@ -376,7 +413,7 @@ class HanaShotTest(BuildLogIsolatedTest):
         self, program: Path, *args: str, session_variables: dict[str, str] | None = None,
     ) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
-            [sys.executable, str(program), *args],
+            [str(SCRIPT.parents[1] / "lib/py"), str(program), *args],
             cwd=self.scratch, env=self.script_environment(session_variables), capture_output=True, text=True,
             timeout=TEST_HANG_GUARD_SECS, check=False,
         )
@@ -386,7 +423,7 @@ class HanaShotTest(BuildLogIsolatedTest):
 
     def start_python(self, program: Path, *args: str) -> subprocess.Popen[str]:
         return subprocess.Popen(
-            [sys.executable, str(program), *args],
+            [str(SCRIPT.parents[1] / "lib/py"), str(program), *args],
             cwd=self.scratch, env=self.script_environment(), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
         )
 
@@ -420,6 +457,25 @@ def face_transforms() -> dict[str, list[float]]:
             13, -7, 21,
         ],
     }
+
+
+class ByPathImportTests(unittest.TestCase):
+    def test_help_prepares_the_recorder_import_from_an_unrelated_folder(self) -> None:
+        source = """import runpy, sys
+sys.argv = [sys.argv[1], "--help"]
+try:
+    runpy.run_path(sys.argv[0], run_name="__main__")
+except SystemExit as error:
+    if error.code:
+        raise
+import scripts.buildlog.record
+"""
+        environment = {key: value for key, value in os.environ.items() if key != "PYTHONPATH"}
+        with tempfile.TemporaryDirectory() as folder:
+            result = subprocess.run([sys.executable, "-c", source, str(SCRIPT.resolve())],
+                                    cwd=folder, env=environment, capture_output=True, text=True,
+                                    check=False, timeout=TEST_HANG_GUARD_SECS)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
 
 class FaceAngleTests(BuildLogIsolatedTest):
@@ -772,6 +828,18 @@ class LaunchBuildWarningTests(BuildLogIsolatedTest):
         _ = self.source.write_text("uncommitted source\n")
         os.utime(self.source, ns=(mtime_ns, mtime_ns))
 
+    def test_launch_without_a_purpose_refuses_before_starting_a_process(self) -> None:
+        for purpose in ("", "   "):
+            with (
+                self.subTest(purpose=purpose),
+                mock.patch.object(subprocess, "Popen") as start,
+                self.assertRaises(hana_shot.Refused) as refused,
+            ):
+                _ = hana_shot.launch(15797, str(self.root), str(self.executable), purpose=purpose)
+            self.assertIn("--purpose", str(refused.exception))
+            self.assertEqual(len(str(refused.exception).splitlines()), 1)
+            start.assert_not_called()
+
     def test_clean_crates_do_not_warn_about_binary(self) -> None:
         self.assertEqual(hana_shot.uncommitted_build_paths(self.root, self.executable), [])
 
@@ -857,7 +925,7 @@ class LaunchBuildWarningTests(BuildLogIsolatedTest):
         self.modify_source(3_000_000_000)
         self.executable.unlink()
         with mock.patch.object(hana_shot, "port_answers", return_value=False), self.assertRaises(hana_shot.Refused) as refused:
-            _ = hana_shot.launch(15797, str(self.root), str(self.executable))
+            _ = hana_shot.launch(15797, str(self.root), str(self.executable), purpose="launch warning")
         self.assertIn(f"no Hana binary at {self.executable}; build it first (cargo build -p hana)", str(refused.exception))
         self.assertIn("uncommitted edits in crates/ or the root Cargo files will be included by a build: crates/hana/main.rs", str(refused.exception))
 
@@ -870,10 +938,15 @@ class LaunchBuildWarningTests(BuildLogIsolatedTest):
             paths.append(path.relative_to(self.root).as_posix())
         diagnostics = io.StringIO()
         process = mock.Mock(pid=12345)
+        self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
+        runner = fixture_member("showrunner", name="fixture")
+        unit = fixture_member("unit", name="window-unit", parent=runner.id)
 
         def start_stub(command: list[str], **kwargs: object) -> subprocess.Popen[bytes]:
             self.assertEqual(command[-1], str(self.executable))
             self.assertEqual(kwargs["stdin"], subprocess.DEVNULL)
+            self.assertIn("HANA_TEST_PURPOSE=launch warning", command)
+            self.assertIn("HANA_TEST_OWNER=window-unit", command)
             self.assertIn("so this Hana runs that code:", diagnostics.getvalue())
             return cast(subprocess.Popen[bytes], process)
 
@@ -887,12 +960,13 @@ class LaunchBuildWarningTests(BuildLogIsolatedTest):
 
         with (
             redirect_stderr(diagnostics),
+            mock.patch.dict(os.environ, {"CODEX_THREAD_ID": unit.current_session, "HANA_TEST_OWNER": ""}),
             mock.patch.object(hana_shot, "port_answers", return_value=False),
             mock.patch.object(hana_shot, "wait_ready"),
             mock.patch.object(hana_shot, "launch_state_path", return_value=self.root / "launch.json"),
             mock.patch.object(tempfile, "mkdtemp", side_effect=make_scratch),
         ):
-            state, _ = hana_shot.launch(15797, str(self.root), str(self.executable))
+            state, _ = hana_shot.launch(15797, str(self.root), str(self.executable), purpose="launch warning")
         warning = next(line for line in diagnostics.getvalue().splitlines() if line.startswith("hana_shot: warning:"))
         self.assertIn(f"{self.executable} was built after uncommitted edits in crates/ or the root Cargo files,", warning)
         for path in paths[:10]:
@@ -906,6 +980,7 @@ class LaunchBuildWarningTests(BuildLogIsolatedTest):
 
 
 class LaunchRecordRecoveryTests(HanaShotTest):
+    launch_command: list[str] = []
     state_path: Path = Path()
     root: Path = Path()
     executable: Path = Path()
@@ -922,19 +997,55 @@ class LaunchRecordRecoveryTests(HanaShotTest):
         self.executable = self.root / "hana"
         _ = self.executable.write_bytes(b"fixture binary; never execute")
 
-    def launch_without_starting_hana(self) -> hana_shot.LaunchState:
+    def launch_without_starting_hana(self, *, owner: str = "") -> hana_shot.LaunchState:
         launch_scratch = self.scratch / "new-launch-scratch"
         launch_scratch.mkdir()
         process = cast(subprocess.Popen[bytes], mock.Mock(pid=424242))
+
+        def start(command: list[str], **kwargs: object) -> subprocess.Popen[bytes]:
+            if command[-1] == str(self.executable):
+                self.launch_command = command
+            self.assertEqual(kwargs["stdin"], subprocess.DEVNULL)
+            return process
+
         with (
             mock.patch.object(hana_shot, "uncommitted_build_paths", return_value=[]),
             mock.patch.object(tempfile, "mkdtemp", return_value=str(launch_scratch)),
-            mock.patch.object(subprocess, "Popen", return_value=process),
+            mock.patch.object(subprocess, "Popen", side_effect=start),
             mock.patch.object(hana_shot, "wait_ready"),
             redirect_stderr(io.StringIO()),
         ):
-            state, _ = hana_shot.launch(self.port, str(self.root), str(self.executable))
+            state, _ = hana_shot.launch(self.port, str(self.root), str(self.executable), purpose=LAUNCH_RECORDING_PURPOSE, owner=owner)
         return state
+
+    def test_explicit_launch_owner_takes_precedence_over_the_callers_unit(self) -> None:
+        self.stop_fake_listener()
+        self.enterContext(isolated_staff_file(self.scratch / "staff.json", {}))
+        runner = fixture_member("showrunner", name="fixture")
+        unit = fixture_member("unit", name="caller-unit", parent=runner.id)
+        with mock.patch.dict(os.environ, {"CODEX_THREAD_ID": unit.current_session}):
+            _ = self.launch_without_starting_hana(owner="feature-unit")
+        self.assertIn("HANA_TEST_OWNER=feature-unit", self.launch_command)
+        self.assertIn(f"HANA_TEST_PURPOSE={LAUNCH_RECORDING_PURPOSE}", self.launch_command)
+        self.assertNotIn("HANA_TEST_OWNER=caller-unit", self.launch_command)
+
+    def test_codex_worker_launch_uses_the_parent_unit_name(self) -> None:
+        self.stop_fake_listener()
+        self.enterContext(isolated_staff_file(self.scratch / "staff.json", {}))
+        runner = fixture_member("showrunner", name="fixture")
+        unit = fixture_member("unit", name="window-unit", parent=runner.id)
+        worker = fixture_worker("impl", unit.id, backend=staff.CodexBackend(self.scratch / "codex"))
+        with mock.patch.dict(os.environ, {"CODEX_THREAD_ID": worker.current_session}):
+            _ = self.launch_without_starting_hana()
+        self.assertIn("HANA_TEST_OWNER=window-unit", self.launch_command)
+
+    def test_caller_without_a_staff_row_launches_with_an_empty_owner(self) -> None:
+        self.stop_fake_listener()
+        self.enterContext(isolated_staff_file(self.scratch / "staff.json", {}))
+        _ = fixture_member("agent", name="another-caller")
+        with mock.patch.dict(os.environ, {"CODEX_THREAD_ID": fixture_runtime_id("missing-caller")}):
+            _ = self.launch_without_starting_hana()
+        self.assertIn("HANA_TEST_OWNER=", self.launch_command)
 
     def stop_fake_listener(self) -> None:
         server = self.fake_listeners[-1]
@@ -942,9 +1053,9 @@ class LaunchRecordRecoveryTests(HanaShotTest):
         server.server_close()
 
     def restart_fake_listener(self) -> None:
-        server = ThreadingHTTPServer(("127.0.0.1", self.port), handler_for(self.fake))
+        server = FixtureServer(("127.0.0.1", self.port), handler_for(self.fake))
         self.fake_listeners.append(server)
-        threading.Thread(target=server.serve_forever, daemon=True).start()
+        threading.Thread(target=server.serve, daemon=True).start()
         self.addCleanup(server.server_close)
         self.addCleanup(server.shutdown)
 
@@ -959,33 +1070,21 @@ class LaunchRecordRecoveryTests(HanaShotTest):
                 _ = signal.signal(number, handler)
         return exit_code, diagnostics.getvalue()
 
-    def test_launch_and_cleanup_keep_real_buildlog_unchanged(self) -> None:
+    def test_launch_and_cleanup_leave_the_default_buildlog_absent(self) -> None:
+        self.enterContext(mock.patch.dict(os.environ, {"HOME": str(self.scratch / "home")}))
         isolated_root = store.root()
         self.assertTrue(isolated_root.is_relative_to(self.scratch))
         with mock.patch.dict(os.environ):
             _ = os.environ.pop("BUILDLOG_DIR", None)
-            real_root = store.root()
-        real_paths = (real_root / store.ERRORS_NAME, real_root / store.host_name())
+            default_root = store.root()
 
-        def real_log_metadata() -> dict[Path, tuple[int, int]]:
-            metadata: dict[Path, tuple[int, int]] = {}
-            for base in real_paths:
-                for path in (base, *base.rglob("*")):
-                    try:
-                        reading = path.stat()
-                    except FileNotFoundError:
-                        continue
-                    metadata[path] = (reading.st_size, reading.st_mtime_ns)
-            return metadata
-
-        before = real_log_metadata()
         self.stop_fake_listener()
         state = self.launch_without_starting_hana()
         self.restart_fake_listener()
         with mock.patch.object(hana_shot, "process_alive", return_value=False):
             exit_code, diagnostics = self.shutdown_command()
 
-        self.assertEqual(real_log_metadata(), before)
+        self.assertFalse(default_root.exists())
         self.assertEqual(exit_code, 0, diagnostics)
         self.assertFalse(self.state_path.exists())
         self.assertFalse(Path(state["scratch"]).exists())
@@ -1211,12 +1310,32 @@ class LaunchRecordRecoveryTests(HanaShotTest):
 
 
 class PortGuardTests(HanaShotTest):
+    def test_standalone_command_runs_without_pythonpath_from_another_folder(self) -> None:
+        environment = self.script_environment()
+        _ = environment.pop("PYTHONPATH", None)
+        result = subprocess.run(
+            [str(SCRIPT.resolve().parents[1] / "lib/py"), "--isolated", str(SCRIPT.resolve()), "targets", "--port", str(self.port)],
+            cwd=self.scratch, env=environment, capture_output=True, text=True,
+            timeout=TEST_HANG_GUARD_SECS, check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(f"camera  entity:{CAMERA_ENTITY}", result.stdout)
+        self.assertTrue(self.fake.calls)
+
+    def test_launch_command_without_purpose_names_the_required_flag(self) -> None:
+        result = self.run_script("launch", "--port", "15797")
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("--purpose", result.stderr)
+        self.assertEqual(len(result.stderr.splitlines()), 1)
+        self.assertEqual(self.fake.calls, [])
+
     def test_user_port_is_refused_by_every_command(self) -> None:
+        _ = write_config_fixture(self.scratch / "config/hana_shot.conf", "refused_port=15702\n")
         for argv in (
             ["shot", "--port", "15702", "--mode", "home"],
             ["pose", "get", "--port", "15702"],
             ["targets", "--port", "15702"],
-            ["launch", "--port", "15702"],
+            ["launch", "--port", "15702", "--purpose", "port guard"],
             ["shutdown", "--port", "15702"],
             ["views", "check", "--port", "15702", "--views-file", str(self.scratch / "views.toml")],
         ):
@@ -1418,15 +1537,8 @@ class FailureGuidanceTests(HanaShotTest):
         return error
 
     def test_settle_timeout_names_retry_then_pose_recovery(self) -> None:
-        settle = hana_shot.Session.settle
-
-        def settle_with_short_limit(
-            session: hana_shot.Session, before: hana_shot.CameraState, extra_frames: int,
-        ) -> hana_shot.Settled:
-            return settle(session, before, extra_frames, limit=0.01)
-
-        with mock.patch.object(hana_shot.Session, "settle", settle_with_short_limit):
-            result = self.in_process_shot("--target", "name:Log", "--mode", "fit", "--settle", "1000000")
+        _ = write_config_fixture(self.scratch / "config/hana_shot.conf", "capture_timeout_seconds=1\nsettle_seconds=0.01\n")
+        result = self.in_process_shot("--target", "name:Log", "--mode", "fit", "--settle", "1000000")
 
         self.assertNotEqual(result.returncode, 0, result.stderr)
         error = self.assert_recorded_error(result)
@@ -1446,9 +1558,9 @@ class FailureGuidanceTests(HanaShotTest):
         ]
         for selector, expected in (("name:Panle", "Panel"), ("tool:Grayscal", "Grayscale")):
             with self.subTest(selector=selector):
-                with mock.patch.object(hana_shot, "SETUP_LIMIT", 0.01):
-                    result = self.in_process_shot("--target", selector, "--mode", "hana-frame",
-                                                  "--setup", "scene::spawn")
+                _ = write_config_fixture(self.scratch / "config/hana_shot.conf", "capture_timeout_seconds=1\nsetup_seconds=0.01\n")
+                result = self.in_process_shot("--target", selector, "--mode", "hana-frame",
+                                              "--setup", "scene::spawn")
 
                 self.assertEqual(result.returncode, 1, result.stderr)
                 line = self.timing_lines()[-1]
@@ -1641,6 +1753,59 @@ class ViewsTests(HanaShotTest):
 
 
 class ShotTests(HanaShotTest):
+    def test_both_window_operations_use_the_configured_frame_count(self) -> None:
+        _ = write_config_fixture(self.scratch / "config/hana_shot.conf", "window_frames=7\n")
+        session = hana_shot.Session(hana_shot.Brp(self.port))
+        _ = session.start()
+        with mock.patch.object(session, "wait_frames") as frames, mock.patch.object(shutil, "which", return_value=None):
+            hana_shot.ensure_window(session, "640x480")
+            hana_shot.keep_visible(session)
+        self.assertEqual(frames.call_args_list, [mock.call(7), mock.call(7)])
+        self.assertEqual(self.fake.window_physical_size, (640, 480))
+
+    def test_brp_reads_host_and_timeout_once_per_instance(self) -> None:
+        with (
+            mock.patch("scripts.lib.conf.ConfigRead.text", side_effect=conf.read("hana_shot").text) as text,
+            mock.patch("scripts.lib.conf.ConfigRead.number", side_effect=conf.read("hana_shot").number) as number,
+        ):
+            brp = hana_shot.Brp(self.port)
+            first = brp.diagnostics()
+            second = brp.diagnostics()
+        self.assertGreater(hana_shot.frame_number(second), hana_shot.frame_number(first))
+        self.assertEqual(text.call_args_list, [mock.call("host")])
+        self.assertEqual(number.call_args_list, [mock.call("call_timeout_seconds")])
+
+    def test_readiness_and_shutdown_read_poll_settings_once_per_call(self) -> None:
+        _ = write_config_fixture(self.scratch / "config/hana_shot.conf", "poll_seconds=0.001\nwarm_frame_ms=20\n")
+        log = self.scratch / "startup.log"
+        _ = log.write_text("")
+        process = cast(subprocess.Popen[bytes], mock.Mock())
+        process.poll = mock.Mock(return_value=None)
+        brp = hana_shot.Brp(self.port)
+        diagnostics = [{"frame_time_ms": {"current": value}} for value in (30.0, 25.0, 5.0)]
+        def tick(_seconds: float) -> None:
+            _ = log.write_text(hana_shot.READY_LOG_LINE)
+        with (
+            mock.patch.object(time, "sleep", side_effect=tick),
+            mock.patch.object(brp, "diagnostics", side_effect=diagnostics) as readings,
+            mock.patch("scripts.lib.conf.ConfigRead.number", side_effect=conf.read("hana_shot").number) as number,
+        ):
+            hana_shot.wait_ready(brp, process, log)
+        self.assertEqual(readings.call_count, 3)
+        for key in ("poll_seconds", "warm_frame_ms", "ready_seconds", "warm_seconds"):
+            self.assertEqual(number.call_args_list.count(mock.call(key)), 1, key)
+        with (
+            mock.patch.dict(os.environ, self.script_environment()),
+            mock.patch.object(hana_shot.Brp, "call", return_value=None),
+            mock.patch.object(hana_shot, "port_answers", side_effect=[True, True, False]) as answers,
+            mock.patch.object(time, "sleep"),
+            mock.patch("scripts.lib.conf.ConfigRead.number", side_effect=conf.read("hana_shot").number) as number,
+            redirect_stderr(io.StringIO()),
+        ):
+            hana_shot.shutdown(self.port)
+        self.assertEqual(answers.call_count, 3)
+        self.assertEqual(number.call_args_list.count(mock.call("poll_seconds")), 1)
+
     def test_home_shot_writes_the_png_and_one_timing_line(self) -> None:
         result = self.shot("--mode", "home")
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -1963,8 +2128,7 @@ class RemoteTests(HanaShotTest):
             "import os",
             "import signal",
             "import sys",
-            f"sys.path.insert(0, {str(SCRIPT.parent.resolve())!r})",
-            "import hana_shot",
+            "from scripts.hana_shot import hana_shot",
             "",
             setup,
             "",

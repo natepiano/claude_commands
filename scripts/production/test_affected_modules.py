@@ -2,101 +2,16 @@
 from __future__ import annotations
 
 import ast
-from collections import defaultdict
 from datetime import UTC, datetime
-from importlib.metadata import packages_distributions
 import json
 from pathlib import Path
 import subprocess
-import sys
 import tempfile
 import unittest
 from typing import override
 from unittest import mock
 
 from scripts.production import affected_modules as affected
-
-
-# Independent pre-cache traversal, retained as the graph-equivalence oracle.
-def reference_scans_tree(tree: ast.AST) -> bool:
-    """Include scans of fixture trees too: treating those as repository scans is safe."""
-    recursive = {"walk", "rglob"}
-    globbers = {"glob", "iglob"}
-    for node in ast.walk(tree):
-        if isinstance(node, ast.ImportFrom):
-            for alias in node.names:
-                if node.module == "os" and alias.name == "walk":
-                    recursive.add(alias.asname or alias.name)
-                if node.module == "glob" and alias.name in {"glob", "iglob"}:
-                    globbers.add(alias.asname or alias.name)
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Call):
-            name = node.func.attr if isinstance(node.func, ast.Attribute) else (
-                node.func.id if isinstance(node.func, ast.Name) else "")
-            if name in recursive:
-                return True
-            if name in globbers and any(
-                    isinstance(value, ast.Constant) and isinstance(value.value, str) and "**" in value.value
-                    for value in ast.walk(node)):
-                return True
-        if isinstance(node, ast.Constant) and isinstance(node.value, str) and "ls-files" in node.value:
-            return True
-    return False
-
-
-def reference_graph(repo: Path, tracked: set[str], changed_files: tuple[str, ...] = ()) -> tuple[dict[str, set[str]], set[str]]:
-    by_name: dict[str, set[str]] = defaultdict(set)
-    bare_modules: dict[str, set[str]] = defaultdict(set)
-    # Keep removed data/shell files as dependency targets, so their old names
-    # still connect callers across suites. Deleted Python already forces full.
-    targets = tracked | {path for path in changed_files if path.startswith(("scripts/", "config/"))}
-    for path in targets:
-        by_name[Path(path).name].add(path)
-        if path.startswith("scripts/") and path.endswith(".py"):
-            name = Path(path).parent.name if Path(path).name == "__init__.py" else Path(path).stem
-            bare_modules[name].add(path)
-    mentions = affected.FilenameDependencies(by_name)
-    external = set(sys.stdlib_module_names) | set(packages_distributions())
-    graph: dict[str, set[str]] = {}
-    scanners: set[str] = set()
-    for path in sorted(tracked):
-        if not path.startswith("scripts/") or Path(path).suffix not in {".py", ".sh"}:
-            continue
-        text = (repo / path).read_text(encoding="utf-8")
-        dependencies: set[str] = set()
-        if path.endswith(".py"):
-            tree = ast.parse(text, filename=path)
-            if reference_scans_tree(tree):
-                scanners.add(path)
-            strings: list[str] = []
-            for node in ast.walk(tree):
-                if isinstance(node, ast.Constant) and isinstance(node.value, str):
-                    strings.append(node.value)
-                if isinstance(node, ast.Import):
-                    imports = [alias.name for alias in node.names]
-                elif isinstance(node, ast.ImportFrom):
-                    module = node.module or ""
-                    if node.level:
-                        parents = Path(path).parent.parts
-                        module = ".".join((*parents[:len(parents) - node.level + 1], *module.split("."))).rstrip(".")
-                    imports = [module, *(f"{module}.{alias.name}" for alias in node.names)]
-                else:
-                    continue
-                for module in imports:
-                    root = module.split(".")[0]
-                    if root == "scripts":
-                        dependencies.update(affected.module_dependencies(module, tracked))
-                    elif root and root not in external:
-                        dependencies.update(bare_modules.get(root, set()))
-            text = "\0".join(strings)
-        # These full-suite triggers hold selection data, not runtime file uses.
-        # Their imports still contribute dependencies above.
-        if path not in {"scripts/production/affected_modules.py", "scripts/production/merge_gate.py"}:
-            dependencies.update(mentions.in_text(text))
-        dependencies.discard(path)
-        graph[path] = dependencies
-    return graph, scanners
-
 
 
 class AffectedModulesTests(unittest.TestCase):
@@ -110,10 +25,11 @@ class AffectedModulesTests(unittest.TestCase):
     def setUp(self) -> None:
         self.repo = Path(self.enterContext(tempfile.TemporaryDirectory(prefix="affected-test-")))
         _ = self.git("init", "-b", "main")
+        _ = self.git("config", "maintenance.auto", "false")
         _ = self.git("config", "user.name", "Selection Fixture")
         _ = self.git("config", "user.email", "fixture@example.invalid")
         self.write(".gitignore", "__pycache__/\n")
-        # Ten unrelated modules leave space below the 40% fail-closed limit.
+        # Ten unrelated modules distinguish direct selection from a full selection.
         for index in range(10):
             self.add_test(f"other/test_unrelated_{index}.py", "VALUE = 1\n")
         self.certify()
@@ -141,7 +57,7 @@ class AffectedModulesTests(unittest.TestCase):
         self.base = affected.CertifiedBase(self.commit(), datetime.now(UTC).isoformat())
 
     def selection(self) -> affected.AffectedSelection:
-        result = affected.select_affected(self.repo, self.base, self.modules)
+        result = affected.select_affected(self.repo, self.base, self.modules, affected.dirty_paths(self.repo))
         self.assertIsInstance(result, affected.AffectedSelection, result)
         assert isinstance(result, affected.AffectedSelection)
         return result
@@ -149,54 +65,35 @@ class AffectedModulesTests(unittest.TestCase):
     def cache_dir(self) -> Path:
         return self.repo / ".git" / "gate-state"
 
-    def tracked(self) -> set[str]:
-        return set(self.git("ls-files", "-z", "--", "scripts", "config").split("\0")) - {""}
-
-    def test_single_pass_and_cached_graphs_equal_the_reference_graph(self) -> None:
+    def test_cached_and_uncached_graphs_are_equal(self) -> None:
         sources = {
             "scripts/component/__init__.py": "VALUE = 1\n",
             "scripts/component/subject.py": "VALUE = 2\n",
             "scripts/duplicate/subject.py": "VALUE = 3\n",
-            "scripts/component/adapter.py": "from . import subject\nfrom ..component import subject\n",
-            "scripts/checks/imports.py": "import scripts.component.adapter, subject\nfrom subject import VALUE\nimport json\n",
-            "scripts/checks/recursive.py": "scan('.')\nfrom os import walk as scan\n",
-            "scripts/checks/recursive_glob.py": "scan(wrap('**/*.py'))\nfrom glob import iglob as scan\n",
-            "scripts/checks/attribute_glob.py": "other.glob(pattern=wrap('**'))\n",
-            "scripts/checks/nested_glob.py": "glob((lambda: '**')())\n",
-            "scripts/checks/plain_glob.py": "glob('*')\nUNRELATED = '**'\n",
-            "scripts/checks/alias_plain_glob.py": "scan('*')\nfrom glob import glob as scan\n",
-            "scripts/checks/path_walk.py": "other.walk()\n",
-            "scripts/checks/rglob.py": "other.rglob('*')\n",
-            "scripts/checks/index_scan.py": "COMMAND = 'git ls-files'\n",
-            "scripts/checks/runner.sh": "cat custom.json removed.json\n",
-            "scripts/checks/mention.py": "SOURCE = 'subject.py runner.sh'\n",
-            "scripts/production/affected_modules.py": "FILES = ['subject.py']\nimport scripts.component.adapter\n",
-            "scripts/production/merge_gate.py": "FILES = ['subject.py']\nimport scripts.component.adapter\n",
-            "config/custom.json": "{}\n",
+            "scripts/component/test_adapter.py": "from . import subject\nfrom ..component import subject\n",
+            "scripts/checks/test_imports.py": "import scripts.component.test_adapter, subject\nfrom subject import VALUE\nimport json\n",
         }
         for path, text in sources.items():
             self.write(path, text)
         _ = self.commit()
-        tracked = self.tracked()
-        removed = ("config/removed.json",)
-        expected = reference_graph(self.repo, tracked, removed)
-        cold = affected.dependency_graph(self.repo, tracked, removed, state_dir=self.cache_dir())
+        expected = affected.dependency_graph(self.repo)
+        cold = affected.dependency_graph(self.repo, state_dir=self.cache_dir())
         with mock.patch.object(ast, "parse", side_effect=AssertionError("warm cache parsed source")):
-            warm = affected.dependency_graph(self.repo, tracked, removed, state_dir=self.cache_dir())
+            warm = affected.dependency_graph(self.repo, state_dir=self.cache_dir())
         self.assertEqual(cold, expected)
         self.assertEqual(warm, expected)
 
     def test_new_blob_reparses_only_the_changed_file(self) -> None:
-        self.write("scripts/component/subject.py", "VALUE = 20\n")
+        self.write("scripts/component/test_subject.py", "VALUE = 20\n")
         _ = self.commit()
         _ = affected.dependency_graph(self.repo, state_dir=self.cache_dir())
-        self.write("scripts/component/subject.py", "VALUE = 21\n")
+        self.write("scripts/component/test_subject.py", "VALUE = 21\n")
         _ = self.commit()
         with mock.patch.object(ast, "parse", wraps=ast.parse) as parse:
             actual = affected.dependency_graph(self.repo, state_dir=self.cache_dir())
         self.assertEqual([call.kwargs["filename"] for call in parse.call_args_list],
-                         ["scripts/component/subject.py"])
-        self.assertEqual(actual, reference_graph(self.repo, self.tracked()))
+                         ["scripts/component/test_subject.py"])
+        self.assertEqual(actual, affected.dependency_graph(self.repo))
 
     def test_invalid_cache_rebuilds_without_changing_the_graph(self) -> None:
         expected = affected.dependency_graph(self.repo, state_dir=self.cache_dir())
@@ -205,7 +102,7 @@ class AffectedModulesTests(unittest.TestCase):
                          json.dumps({"format": -1, "extractor": affected.EXTRACTOR_VERSION, "blobs": {}}),
                          json.dumps({"format": affected.CACHE_FORMAT_VERSION, "extractor": -1, "blobs": {}}),
                          json.dumps({"format": affected.CACHE_FORMAT_VERSION, "extractor": affected.EXTRACTOR_VERSION,
-                                     "blobs": {"bad": {".py": {"imports": None}}}})):
+                                     "blobs": {"bad": {"imports": None, "tokens": []}}})):
             with self.subTest(contents=contents):
                 _ = cache.write_text(contents)
                 with mock.patch.object(ast, "parse", wraps=ast.parse) as parse:
@@ -214,56 +111,51 @@ class AffectedModulesTests(unittest.TestCase):
                 self.assertEqual(actual, expected)
 
     def test_deleted_blob_is_pruned_and_new_targets_resolve_cached_facts(self) -> None:
-        self.write("scripts/component/caller.py", "import future_subject\nNAME = 'future.json'\n")
+        self.write("scripts/component/test_caller.py", "import test_future_subject\n")
         _ = self.commit()
         _ = affected.dependency_graph(self.repo, state_dir=self.cache_dir())
-        self.write("scripts/component/future_subject.py", "VALUE = 42\n")
-        self.write("config/future.json", "{}\n")
+        self.write("scripts/component/test_future_subject.py", "VALUE = 42\n")
         _ = self.commit()
-        blob = self.git("rev-parse", "HEAD:scripts/component/future_subject.py")
+        blob = self.git("rev-parse", "HEAD:scripts/component/test_future_subject.py")
         with mock.patch.object(ast, "parse", wraps=ast.parse) as parse:
             graph, _ = affected.dependency_graph(self.repo, state_dir=self.cache_dir())
         self.assertEqual([call.kwargs["filename"] for call in parse.call_args_list],
-                         ["scripts/component/future_subject.py"])
-        self.assertEqual(graph["scripts/component/caller.py"],
-                         {"scripts/component/future_subject.py", "config/future.json"})
-        (self.repo / "scripts/component/future_subject.py").unlink()
-        (self.repo / "config/future.json").unlink()
+                         ["scripts/component/test_future_subject.py"])
+        self.assertEqual(graph["scripts/component/test_caller.py"],
+                         {"scripts/component/test_future_subject.py"})
+        (self.repo / "scripts/component/test_future_subject.py").unlink()
         _ = self.commit()
         with mock.patch.object(ast, "parse", side_effect=AssertionError("unchanged source parsed")):
             graph, _ = affected.dependency_graph(self.repo, state_dir=self.cache_dir())
-        self.assertEqual(graph["scripts/component/caller.py"], set())
+        self.assertEqual(graph["scripts/component/test_caller.py"], set())
         self.assertNotIn(blob, affected.read_fact_cache(self.cache_dir() / "affected-module-facts.json"))
 
     def test_shared_blob_resolves_relative_imports_from_each_current_path(self) -> None:
         for component in ("first", "second"):
-            self.write(f"scripts/{component}/adapter.py", "from . import subject\n")
+            self.write(f"scripts/{component}/test_adapter.py", "from . import subject\n")
             self.write(f"scripts/{component}/subject.py", "VALUE = 42\n")
-        # Identical source in a shell file must retain its full text as mentions.
-        self.write("scripts/first/runner.py", "# subject.py\n")
-        self.write("scripts/first/runner.sh", "# subject.py\n")
         _ = self.commit()
-        expected = reference_graph(self.repo, self.tracked())
+        expected = affected.dependency_graph(self.repo)
         self.assertEqual(affected.dependency_graph(self.repo, state_dir=self.cache_dir()), expected)
         self.assertEqual(affected.dependency_graph(self.repo, state_dir=self.cache_dir()), expected)
-        self.assertEqual(expected[0]["scripts/first/adapter.py"], {"scripts/first/subject.py"})
-        self.assertEqual(expected[0]["scripts/second/adapter.py"], {"scripts/second/subject.py"})
+        self.assertEqual(expected[0]["scripts/first/test_adapter.py"], {"scripts/first/subject.py"})
+        self.assertEqual(expected[0]["scripts/second/test_adapter.py"], {"scripts/second/subject.py"})
 
     def test_unstaged_sources_and_symlinks_do_not_reuse_index_blob_facts(self) -> None:
         self.write("scripts/component/subject.py", "VALUE = 42\n")
-        self.write("scripts/component/adapter.py", "VALUE = 43\n")
+        self.write("scripts/component/test_adapter.py", "VALUE = 43\n")
         self.write("scripts/component/target.txt", "VALUE = 44\n")
-        (self.repo / "scripts/component/link.py").symlink_to("target.txt")
+        (self.repo / "scripts/component/test_link.py").symlink_to("target.txt")
         _ = self.commit()
         _ = affected.dependency_graph(self.repo, state_dir=self.cache_dir())
-        self.write("scripts/component/adapter.py", "import scripts.component.subject\n")
+        self.write("scripts/component/test_adapter.py", "import scripts.component.subject\n")
         self.write("scripts/component/target.txt", "import scripts.component.subject\n")
         actual = affected.dependency_graph(self.repo, state_dir=self.cache_dir())
-        self.assertEqual(actual, reference_graph(self.repo, self.tracked()))
-        self.assertEqual(actual[0]["scripts/component/adapter.py"], {"scripts/component/subject.py"})
-        self.assertEqual(actual[0]["scripts/component/link.py"], {"scripts/component/subject.py"})
+        self.assertEqual(actual, affected.dependency_graph(self.repo))
+        self.assertEqual(actual[0]["scripts/component/test_adapter.py"], {"scripts/component/subject.py"})
+        self.assertEqual(actual[0]["scripts/component/test_link.py"], {"scripts/component/subject.py"})
 
-    def test_imports_bare_import_collisions_and_filename_mentions_follow_transitive_dependencies(self) -> None:
+    def test_bare_imports_select_each_matching_source_without_transitive_selection(self) -> None:
         self.write("scripts/component/subject.py", "VALUE = 1\n")
         self.write("scripts/duplicate/subject.py", "VALUE = 1\n")
         self.write("scripts/component/adapter.py", "from scripts.component import subject\n")
@@ -275,40 +167,23 @@ class AffectedModulesTests(unittest.TestCase):
         _ = self.commit()
         result = self.selection()
         self.assertCountEqual([path.name for path in result.modules],
-                              ["test_qualified.py", "test_bare.py", "test_mention.py"])
+                              ["test_bare.py"])
         self.assertEqual(result.changed_files, ("scripts/component/subject.py",))
         # Bare imports conservatively cover every same-named source.
         self.certify()
         self.write("scripts/duplicate/subject.py", "VALUE = 3\n")
         _ = self.commit()
         self.assertCountEqual([path.name for path in self.selection().modules],
-                              ["test_bare.py", "test_mention.py"])
+                              ["test_bare.py"])
 
     def test_imported_test_module_selects_its_importer_without_requesting_full_suite(self) -> None:
-        self.add_test("agents/test_codex_mesh.py", "VALUE = 1\n")
-        self.add_test("direct/test_workers.py", "from scripts.agents.test_codex_mesh import VALUE\n")
+        self.add_test("agents/test_native_worker.py", "VALUE = 1\n")
+        self.add_test("direct/test_workers.py", "from scripts.agents.test_native_worker import VALUE\n")
         self.certify()
-        self.write("scripts/agents/test_codex_mesh.py", "VALUE = 2\n")
+        self.write("scripts/agents/test_native_worker.py", "VALUE = 2\n")
         _ = self.commit()
         self.assertCountEqual([path.name for path in self.selection().modules],
-                              ["test_codex_mesh.py", "test_workers.py"])
-
-    def test_selection_file_strings_do_not_connect_dependents_but_imports_do(self) -> None:
-        self.write("scripts/component/subject.py", "VALUE = 1\n")
-        self.write("scripts/component/imported.py", "VALUE = 1\n")
-        for name in ("affected_modules", "merge_gate"):
-            self.write(f"scripts/production/{name}.py",
-                       'FILES = ["subject.py"]\nimport scripts.component.imported\n')
-            self.add_test(f"checks/test_{name}.py", f"import scripts.production.{name}\n")
-        self.certify()
-        self.write("scripts/component/subject.py", "VALUE = 2\n")
-        _ = self.commit()
-        self.assertEqual(self.selection().modules, ())
-        self.certify()
-        self.write("scripts/component/imported.py", "VALUE = 2\n")
-        _ = self.commit()
-        self.assertCountEqual([path.name for path in self.selection().modules],
-                              ["test_affected_modules.py", "test_merge_gate.py"])
+                              ["test_native_worker.py", "test_workers.py"])
 
     def test_package_initializers_and_relative_imports_are_dependencies(self) -> None:
         self.write("scripts/component/__init__.py", "VALUE = 1\n")
@@ -320,29 +195,7 @@ class AffectedModulesTests(unittest.TestCase):
         _ = self.commit()
         self.assertEqual([path.name for path in self.selection().modules], ["test_package.py"])
 
-    def test_overlapping_filename_mentions_preserve_both_dependencies(self) -> None:
-        self.write("config/aba", "first\n")
-        self.write("config/bab", "second\n")
-        self.add_test("checks/test_overlap.py", 'TEXT = "abab"\n')
-        self.certify()
-        self.write("config/bab", "changed\n")
-        _ = self.commit()
-        self.assertEqual([path.name for path in self.selection().modules], ["test_overlap.py"])
-
-    def test_shell_and_config_filename_dependencies_are_transitive(self) -> None:
-        self.write("config/custom.json", "{}\n")
-        self.write("scripts/component/runner.sh", 'cat ../config/custom.json\n')
-        self.add_test("checks/test_shell.py", 'SCRIPT = "runner.sh"\n')
-        self.certify()
-        self.write("config/custom.json", '{"changed": true}\n')
-        _ = self.commit()
-        self.assertEqual([path.name for path in self.selection().modules], ["test_shell.py"])
-        self.certify()
-        (self.repo / "scripts/component/runner.sh").unlink()
-        _ = self.commit()
-        self.assertEqual([path.name for path in self.selection().modules], ["test_shell.py"])
-
-    def test_named_configuration_selects_its_callers_without_a_full_suite(self) -> None:
+    def test_configuration_names_without_complete_paths_select_their_readers(self) -> None:
         self.write("config/limits.conf", "amount=1\n")
         self.write("scripts/component/reader.py", 'import conf\nVALUE = conf.read("limits").whole("amount")\n')
         self.add_test("checks/test_limits.py", "import reader\n")
@@ -350,9 +203,60 @@ class AffectedModulesTests(unittest.TestCase):
         self.write("config/limits.conf", "amount=2\n")
         _ = self.commit()
         result = self.selection()
-        self.assertEqual([path.name for path in result.modules], ["test_limits.py"])
+        self.assertEqual(result.modules, (self.repo / "scripts/checks/test_limits.py",))
 
-    def test_every_shared_input_trigger_requests_full_validation(self) -> None:
+    def test_configuration_changes_select_transitive_readers(self) -> None:
+        readers = (
+            ("module", 'from scripts.lib import conf\nVALUE = conf.read("limits")\n'),
+            ("module alias", 'from scripts.lib import conf as settings\nVALUE = settings.read("limits")\n'),
+            ("qualified alias", 'import scripts.lib.conf as settings\nVALUE = settings.read("limits")\n'),
+            ("qualified module", 'import scripts.lib.conf\nVALUE = scripts.lib.conf.read("limits")\n'),
+            ("function", 'from scripts.lib.conf import read\nVALUE = read("limits")\n'),
+            ("function alias", 'from scripts.lib.conf import read as load\nVALUE = load("settings/limits.conf")\n'),
+            ("path token", 'SETTINGS = "settings/limits.conf"\n'),
+            ("relative cycle", 'from . import adapter\nfrom scripts.lib import conf\nVALUE = conf.read("limits")\n'),
+        )
+        self.write("scripts/component/adapter.py", "from . import reader\n")
+        self.add_test("checks/test_limits.py", "from scripts.component import adapter\n")
+        for name, reader in readers:
+            with self.subTest(reader=name):
+                self.write("config/limits.conf", "amount=1\n")
+                self.write("config/unrelated.conf", "amount=1\n")
+                self.write("scripts/component/reader.py", reader)
+                self.certify()
+                self.write("config/limits.conf", "amount=2\n")
+                _ = self.commit()
+                self.assertEqual(self.selection().modules, (self.repo / "scripts/checks/test_limits.py",))
+                self.certify()
+                self.write("config/unrelated.conf", "amount=2\n")
+                _ = self.commit()
+                self.assertEqual(self.selection().modules, ())
+
+    def test_configuration_selection_reuses_all_source_facts(self) -> None:
+        self.write("config/limits.conf", "amount=1\n")
+        self.write("scripts/component/reader.py", 'from scripts.lib import conf\nVALUE = conf.read("limits")\n')
+        self.write("scripts/component/adapter.py", "import reader\n")
+        self.add_test("checks/test_limits.py", "from scripts.component import adapter\n")
+        self.certify()
+        _ = affected.select_affected(self.repo, self.base, self.modules, set(), state_dir=self.cache_dir())
+        self.write("config/limits.conf", "amount=2\n")
+        _ = self.commit()
+        with mock.patch.object(ast, "parse", wraps=ast.parse) as parse:
+            result = affected.select_affected(self.repo, self.base, self.modules, set(), state_dir=self.cache_dir())
+        self.assertIsInstance(result, affected.AffectedSelection)
+        assert isinstance(result, affected.AffectedSelection)
+        self.assertEqual(result.modules, (self.repo / "scripts/checks/test_limits.py",))
+        self.assertEqual(parse.call_count, 0)
+        self.write("scripts/component/reader.py", 'from scripts.lib import conf\nVALUE = conf.read("limits").whole("amount")\n')
+        _ = self.commit()
+        with mock.patch.object(ast, "parse", wraps=ast.parse) as parse:
+            changed = affected.select_affected(self.repo, self.base, self.modules, set(), state_dir=self.cache_dir())
+        self.assertEqual(changed, affected.AffectedSelection(self.base,
+            ("config/limits.conf", "scripts/component/reader.py"), result.modules))
+        self.assertEqual([call.kwargs["filename"] for call in parse.call_args_list],
+                         ["scripts/component/reader.py"])
+
+    def test_unreferenced_inputs_select_only_tests_in_a_changed_python_folder(self) -> None:
         paths = ["scripts/lib/new.py", "scripts/other/conftest.py", "settings.json",
                  "scripts/production/merge_gate.py", "scripts/production/affected_modules.py",
                  "scripts/agents/models_config.sh"]
@@ -360,57 +264,46 @@ class AffectedModulesTests(unittest.TestCase):
             with self.subTest(path=path):
                 self.write(path, "# changed\n")
                 _ = self.commit()
-                result = affected.select_affected(self.repo, self.base, self.modules)
-                self.assertIsInstance(result, affected.FullSuite)
-                assert isinstance(result, affected.FullSuite)
-                self.assertIn(path, result.reason)
+                expected = tuple(self.modules) if path == "scripts/other/conftest.py" else ()
+                self.assertEqual(self.selection().modules, expected)
                 self.certify()
 
-    def test_deleted_and_renamed_python_sources_request_full_validation(self) -> None:
+    def test_deleted_and_renamed_python_sources_select_direct_importers(self) -> None:
         self.write("scripts/component/deleted.py", "VALUE = 1\n")
         self.write("scripts/component/renamed.py", "VALUE = 1\n")
+        self.add_test("checks/test_deleted.py", "import scripts.component.deleted\n")
+        self.add_test("checks/test_old_name.py", "import scripts.component.renamed\n")
+        self.add_test("checks/test_new_name.py", "import scripts.component.new\n")
         self.certify()
         (self.repo / "scripts/component/deleted.py").unlink()
         _ = self.commit()
-        result = affected.select_affected(self.repo, self.base, self.modules)
-        self.assertIsInstance(result, affected.FullSuite)
-        assert isinstance(result, affected.FullSuite)
-        self.assertIn("Python file deleted", result.reason)
+        self.assertEqual([path.name for path in self.selection().modules], ["test_deleted.py"])
         self.certify()
         _ = self.git("mv", "scripts/component/renamed.py", "scripts/component/new.py")
         _ = self.commit()
-        result = affected.select_affected(self.repo, self.base, self.modules)
-        self.assertIsInstance(result, affected.FullSuite)
-        assert isinstance(result, affected.FullSuite)
-        self.assertIn("Python file renamed", result.reason)
+        self.assertCountEqual([path.name for path in self.selection().modules],
+                              ["test_old_name.py", "test_new_name.py"])
 
-    def test_unreferenced_suite_files_select_the_suite_and_outside_files_select_nothing(self) -> None:
+    def test_unreferenced_shell_files_and_outside_files_select_no_modules(self) -> None:
         self.add_test("component/test_orphan.py", "VALUE = 1\n")
         self.certify()
         self.write("scripts/component/new.sh", "true\n")
         _ = self.commit()
-        self.assertEqual([path.name for path in self.selection().modules], ["test_orphan.py"])
+        self.assertEqual(self.selection().modules, ())
         self.certify()
         self.write("notes/unrelated.md", "new notes\n")
         _ = self.commit()
         self.assertEqual(self.selection().modules, ())
 
-    def test_changed_test_and_all_tree_scan_forms_are_always_selected(self) -> None:
-        scans = ["import os\nos.walk('.')\n", "from pathlib import Path\nPath('.').rglob('*')\n",
-                 "from glob import glob\nglob('**/*.py')\n", "COMMAND = ['git', 'ls-files']\n",
-                 "from glob import glob as scan\nscan('**/*.sh')\n"]
-        for index, source in enumerate(scans):
-            self.add_test(f"scanners/test_scan_{index}.py", source)
+    def test_a_changed_test_selects_itself(self) -> None:
         self.add_test("checks/test_changed.py", "VALUE = 1\n")
         self.certify()
         self.write("scripts/checks/test_changed.py", "VALUE = 2\n")
         _ = self.commit()
         result = self.selection()
-        self.assertEqual(len(result.tree_scanners), 5)
-        self.assertCountEqual([path.name for path in result.modules],
-                              ["test_changed.py", *(f"test_scan_{index}.py" for index in range(5))])
+        self.assertEqual([path.name for path in result.modules], ["test_changed.py"])
 
-    def test_over_forty_percent_fails_closed_but_exactly_forty_does_not(self) -> None:
+    def test_selections_at_and_above_forty_percent_stay_affected(self) -> None:
         self.write("scripts/component/subject.py", "VALUE = 1\n")
         # Four of the ten original modules depend on this module.
         for index in range(4):
@@ -421,24 +314,123 @@ class AffectedModulesTests(unittest.TestCase):
         self.assertEqual(len(self.selection().modules), 4)
         self.write("scripts/other/test_unrelated_4.py", "import scripts.component.subject\n")
         _ = self.commit()
-        result = affected.select_affected(self.repo, self.base, self.modules)
-        self.assertIsInstance(result, affected.FullSuite)
-        assert isinstance(result, affected.FullSuite)
-        self.assertIn("more than 40%", result.reason)
+        self.assertEqual(len(self.selection().modules), 5)
 
-    def test_dirty_tree_no_base_and_unparsable_source_fail_closed(self) -> None:
+    def test_dirty_paths_allow_selection_but_no_base_and_invalid_tests_require_full_runs(self) -> None:
         self.write("untracked.txt", "pending\n")
-        self.assertEqual(affected.select_affected(self.repo, self.base, self.modules), affected.FullSuite("tree not clean"))
+        self.assertEqual(self.selection().modules, ())
         _ = self.commit()
-        self.assertEqual(affected.select_affected(self.repo, affected.NoCertifiedBase(), self.modules),
+        self.assertEqual(affected.select_affected(self.repo, affected.NoCertifiedBase(), self.modules, affected.dirty_paths(self.repo)),
                          affected.FullSuite("no certified base"))
-        self.write("scripts/component/broken.py", "this is invalid (\n")
+        self.write("scripts/component/invalid.py", "this is invalid (\n")
+        self.write("scripts/component/test_broken.py", "this is invalid (\n")
         _ = self.commit()
-        result = affected.select_affected(self.repo, self.base, self.modules)
+        result = affected.select_affected(self.repo, self.base, self.modules, affected.dirty_paths(self.repo))
         self.assertIsInstance(result, affected.FullSuite)
         assert isinstance(result, affected.FullSuite)
         self.assertIn("graph error:", result.reason)
         self.assertIn("broken.py", result.reason)
+
+    def test_direct_imports_and_same_folder_select_without_a_second_import_step(self) -> None:
+        self.write("scripts/component/subject.py", "VALUE = 1\n")
+        self.write("scripts/adapters/adapter.py", "import scripts.component.subject\n")
+        self.add_test("checks/test_direct.py", "import scripts.component.subject\n")
+        self.add_test("checks/test_indirect.py", "import scripts.adapters.adapter\n")
+        self.add_test("component/test_neighbor.py", "VALUE = 1\n")
+        self.certify()
+        self.write("scripts/component/subject.py", "VALUE = 2\n")
+        _ = self.commit()
+        self.assertCountEqual([path.name for path in self.selection().modules],
+                              ["test_direct.py", "test_neighbor.py"])
+
+    def test_complete_path_tokens_select_only_the_test_that_names_the_path(self) -> None:
+        self.write("config/custom.json", "{}\n")
+        self.write("verify.sh", "true\n")
+        self.write("scripts/adapters/adapter.py", "# config/custom.json\n")
+        self.add_test("checks/test_path.py", "# ./config/custom.json\n")
+        self.add_test("checks/test_root_path.py", "SCRIPT = 'verify.sh'\n")
+        self.add_test("checks/test_fragment.py", "PATHS = 'custom.json old/config/custom.json config/custom.json.bak'\n")
+        self.add_test("checks/test_indirect_path.py", "import scripts.adapters.adapter\n")
+        self.certify()
+        self.write("config/custom.json", '{"changed": true}\n')
+        self.write("verify.sh", "false\n")
+        _ = self.commit()
+        self.assertCountEqual([path.name for path in self.selection().modules],
+                              ["test_path.py", "test_root_path.py"])
+
+    def test_dirty_paths_include_edits_untracked_files_deletions_and_renames(self) -> None:
+        self.write("scripts/component/subject.py", "VALUE = 1\n")
+        self.write("scripts/component/deleted.py", "VALUE = 1\n")
+        self.write("scripts/component/old.py", "VALUE = 1\n")
+        self.add_test("checks/test_dirty.py", "import scripts.component.subject\n")
+        self.add_test("checks/test_new.py", "import scripts.component.new\n")
+        self.add_test("checks/test_deleted.py", "import scripts.component.deleted\n")
+        self.add_test("checks/test_old.py", "import scripts.component.old\n")
+        self.add_test("checks/test_renamed.py", "import scripts.component.renamed\n")
+        self.certify()
+        self.write("scripts/component/subject.py", "VALUE = 2\n")
+        self.write("scripts/component/new.py", "VALUE = 3\n")
+        (self.repo / "scripts/component/deleted.py").unlink()
+        _ = self.git("mv", "scripts/component/old.py", "scripts/component/renamed.py")
+        result = self.selection()
+        self.assertCountEqual([path.name for path in result.modules],
+                              ["test_dirty.py", "test_new.py", "test_deleted.py", "test_old.py", "test_renamed.py"])
+        self.assertEqual(result.changed_files,
+                         ("scripts/component/deleted.py", "scripts/component/new.py", "scripts/component/old.py",
+                          "scripts/component/renamed.py", "scripts/component/subject.py"))
+
+    def test_removed_python_sources_reuse_both_graphs_without_parsing_or_cache_writes(self) -> None:
+        self.write("scripts/component/subject.py", "VALUE = 1\n")
+        self.add_test("checks/test_deleted.py", "import scripts.component.subject\n")
+        self.certify()
+        (self.repo / "scripts/component/subject.py").unlink()
+        self.write("scripts/checks/test_deleted.py", "import scripts.component.subject\n# Source removed.\n")
+        _ = self.commit()
+        first = affected.select_affected(self.repo, self.base, self.modules, affected.dirty_paths(self.repo),
+                                         state_dir=self.cache_dir())
+        self.assertIsInstance(first, affected.AffectedSelection)
+        with (mock.patch.object(ast, "parse", wraps=ast.parse) as parse,
+              mock.patch.object(affected, "write_fact_cache", wraps=affected.write_fact_cache) as write,
+              mock.patch.object(affected, "blob_texts", wraps=affected.blob_texts) as read):
+            second = affected.select_affected(self.repo, self.base, self.modules, affected.dirty_paths(self.repo),
+                                              state_dir=self.cache_dir())
+        self.assertEqual(second, first)
+        self.assertEqual(parse.call_count, 0)
+        write.assert_not_called()
+        read.assert_not_called()
+
+    def test_a_dirty_python_test_does_not_write_the_fact_cache(self) -> None:
+        self.add_test("checks/test_dirty.py", "VALUE = 1\n")
+        self.certify()
+        expected = affected.select_affected(self.repo, self.base, self.modules, affected.dirty_paths(self.repo),
+                                            state_dir=self.cache_dir())
+        self.assertIsInstance(expected, affected.AffectedSelection)
+        self.write("scripts/checks/test_dirty.py", "VALUE = 2\n")
+        with mock.patch.object(affected, "write_fact_cache", wraps=affected.write_fact_cache) as write:
+            result = affected.select_affected(self.repo, self.base, self.modules, affected.dirty_paths(self.repo),
+                                              state_dir=self.cache_dir())
+        self.assertIsInstance(result, affected.AffectedSelection)
+        assert isinstance(result, affected.AffectedSelection)
+        self.assertEqual([path.name for path in result.modules], ["test_dirty.py"])
+        write.assert_not_called()
+
+    def test_invalid_non_test_python_sources_still_select_their_importers(self) -> None:
+        self.write("scripts/component/subject.py", "VALUE = 1\n")
+        self.add_test("checks/test_importer.py", "import scripts.component.subject\n")
+        self.certify()
+        self.write("scripts/component/subject.py", "this is invalid (\n")
+        _ = self.commit()
+        self.assertEqual([path.name for path in self.selection().modules], ["test_importer.py"])
+
+    def test_a_deleted_test_does_not_select_its_folder_neighbors(self) -> None:
+        self.add_test("checks/test_deleted.py", "VALUE = 1\n")
+        self.add_test("checks/test_neighbor.py", "VALUE = 2\n")
+        self.certify()
+        deleted = self.repo / "scripts/checks/test_deleted.py"
+        deleted.unlink()
+        self.modules.remove(deleted)
+        _ = self.commit()
+        self.assertEqual(self.selection().modules, ())
 
 
 if __name__ == "__main__":

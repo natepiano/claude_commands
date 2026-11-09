@@ -2,46 +2,40 @@
 """Inventory the live Claude work belonging to one account on this machine."""
 
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import json
 import os
-import re
 import shlex
 import socket
 import subprocess
 import sys
-import time
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal, TypedDict, cast
+from typing import Literal, TypedDict, cast
 
-SCRIPTS = Path(__file__).resolve().parents[1]
-# Sibling imports need this folder. Append it so a caller's own modules
-# (buildlog's record) keep precedence over shutdown's.
-if str(SCRIPTS / "shutdown") not in sys.path:
-    sys.path.append(str(SCRIPTS / "shutdown"))
-for dependency in ("whoami", "message", "production", "herdr", "direct", "lib", "hooks"):
-    sys.path.insert(0, str(SCRIPTS / dependency))
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-
+from scripts.direct.assign_gate import WORKER_LAUNCHERS
 from scripts.whoami import account
-from probe_session import PROBE_ENV
-import unit_runs
-if TYPE_CHECKING:
-    from ..direct.worker_state import worker_ledger
-else:
-    from worker_state import worker_ledger
-import herdr
-import sessions
-from sessions import process_start as _process_start
-from scripts.production import showrunners
-import unit_lookup
+from scripts.shutdown import remote
+from scripts.lib.probe_session import PROBE_ENV
+from scripts.lib import unit_runs
+from scripts.herdr import herdr
+from scripts.message import sessions
+from scripts.message.sessions import process_start as _process_start
+from scripts.production import showrunners, staff, session_staff
+from scripts.usage import agents_log
+from scripts.direct.worker_state import worker_status_path
+from scripts.lib.resume_message import ClaudeChildResume, Resumable, Idle, Unavailable, WorkerResume
+from scripts.production import unit_lookup
 from scripts.whoami.account import Account, label_for
 
 
-from session_types import (
+from scripts.shutdown.session_types import (
     InvalidInventory as InvalidInventory,
     parse_session as parse_session,
     wire_object as _wire_object,
@@ -82,7 +76,6 @@ from session_types import (
     DirectorOwner as DirectorOwner,
     NoDirector as NoDirector,
     WorkerOwner as WorkerOwner,
-    CodexServer as CodexServer,
     SessionFields as SessionFields,
     ShowrunnerSession as ShowrunnerSession,
     UnitSession as UnitSession,
@@ -161,20 +154,21 @@ class SessionFile(TypedDict, total=False):
 
 @dataclass(frozen=True)
 class ProductionSession:
-    slug: str
+    name: str
     doc: str
 
 
 @dataclass(frozen=True)
 class ShowrunnerRegistration:
     session_id: str
-    slug: str
+    name: str
     doc: str
 
 
 @dataclass(frozen=True)
 class ShowrunnerRegistrations:
     entries: tuple[ShowrunnerRegistration, ...]
+    retired_sessions: frozenset[str] = field(default_factory=frozenset)
 
 
 @dataclass(frozen=True)
@@ -261,8 +255,6 @@ def _string(value: object, default: str = "") -> str:
     return value if isinstance(value, str) else default
 
 
-def _positive_int(value: object) -> int | None:
-    return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else None
 
 
 def _pid_alive(pid: int) -> bool:
@@ -356,6 +348,7 @@ def _conf(path: Path) -> dict[str, str]:
 def showrunner_registrations() -> ShowrunnerRegistrations:
     """Read timer identities and production docs without resolving messaging sockets."""
     found: list[ShowrunnerRegistration] = []
+    record = staff.snapshot()
     for instance in sorted(_notifier_state_dir().glob("showrunner-*")):
         if not instance.is_dir():
             continue
@@ -363,15 +356,20 @@ def showrunner_registrations() -> ShowrunnerRegistrations:
         target = fields.get("TARGET", "")
         if not target.startswith("session:") or not target[8:]:
             continue
-        doc = showrunners.checked_doc(instance)
-        if isinstance(doc, showrunners.NoCheckedDoc):
+        owner = record.by_id(staff.StaffId(instance.name.removeprefix("showrunner-")))
+        if (owner is None or owner.kind != "showrunner"
+                or not isinstance(owner.doc, (staff.LiveDoc, staff.WrappedDoc))
+                or owner.doc.machine != remote.local_machine()):
             continue
+        doc = owner.doc
         try:
             _ = doc.path.read_text(encoding="utf-8")
         except (OSError, UnicodeError):
             continue
-        found.append(ShowrunnerRegistration(target[8:], instance.name.removeprefix("showrunner-"), str(doc.path)))
-    return ShowrunnerRegistrations(tuple(found))
+        found.append(ShowrunnerRegistration(target[8:], owner.name, str(doc.path)))
+    retired = frozenset(str(identity) for row in record.rows if isinstance(row.worktree, staff.RemovedWorktree)
+                        for identity in (row.id, row.current_session))
+    return ShowrunnerRegistrations(tuple(found), retired)
 
 
 def unregistered_showrunners(
@@ -389,35 +387,34 @@ def unregistered_showrunners(
     except OSError:
         return []
     live_ids = {entry.session_id for entry in entries}
-    return [showrunners.Showrunner(slug=timer.slug, doc=timer.doc, session="", socket="", zone="")
+    return [showrunners.Showrunner(name=timer.name, doc=timer.doc, session="", socket="", zone="")
             for timer in timers.entries if timer.session_id not in live_ids]
 
 
 def _unit_sessions(runners: tuple[ShowrunnerRegistration, ...]) -> dict[str, UnitMarks]:
     """Each running unit director of a registered production, by session id.
 
-    One read of every production's marks (`unit_lookup.every_marked_unit`) serves them all. A
-    production with no showrunner timer has no doc to restart its units from, so its units are not
-    counted here; a production whose marks are at fault is left out by the lookup.
+    Read the native session labels once for all productions.
+    Omit productions that have no showrunner timer or have faulty session labels.
     """
     try:
-        every = unit_lookup.every_marked_unit()
+        every = unit_lookup.every_labeled_session()
     except OSError:
         return {}
-    docs = {runner.slug: runner.doc for runner in runners}
+    docs = {runner.name: runner.doc for runner in runners}
     found: dict[str, UnitMarks] = {}
-    for slug, units in every.units.items():
-        if slug not in docs:
+    for name, units in every.units.items():
+        if name not in docs:
             continue
-        for unit_id, marked_unit in units.items():
-            claude = marked_unit.claude
+        for unit_id, labeled_session in units.items():
+            claude = labeled_session.claude
             if not isinstance(claude, unit_lookup.LiveClaude):
                 continue
             found[claude.session_id] = UnitMarks(
-                production=slug,
+                production=name,
                 unit=unit_id,
-                doc=docs[slug],
-                session_name=marked_unit.place.session,
+                doc=docs[name],
+                session_name=labeled_session.place.session,
                 session_host="herdr",
             )
     return found
@@ -445,20 +442,10 @@ def _active_run_directories() -> dict[str, list[Path]]:
 
 
 def _worker_owners(run_directories: dict[str, list[Path]], session_ids: set[str]) -> dict[str, str]:
-    short_to_session = {session_id[:8].casefold(): session_id for session_id in session_ids}
-    owners: dict[str, str] = {}
-    for owner, directories in run_directories.items():
-        for directory in directories:
-            try:
-                lines = worker_ledger(directory).read_text(encoding="utf-8").splitlines()
-            except (OSError, UnicodeError):
-                continue
-            for line in lines:
-                daemon_short = line.split("\t", 1)[0].strip().casefold()
-                worker = short_to_session.get(daemon_short)
-                if worker is not None:
-                    owners[worker] = owner
-    return owners
+    membership = staff.local_snapshot()
+    return {row.current_session: parent.current_session for row in membership.find(kind="worker")
+            if row.current_session in session_ids and (parent := membership.parent_of(row)) is not None
+            and parent.current_session in run_directories}
 
 
 def _newest_unit_plans() -> dict[str, str]:
@@ -775,17 +762,12 @@ def _model(session_id: str, config_dir: Path) -> LastModel:
 
 
 def _launcher_command(pid: int) -> list[str]:
-    """Find the nearest live launcher ancestor without flattening argv boundaries."""
-    try:
-        darwin = {process.pid: process for process in herdr._darwin_processes()} if sys.platform == "darwin" else {}  # pyright: ignore[reportPrivateUsage]
-    except (OSError, herdr.HerdrFailure):
-        return []
+    """Read the nearest live launcher ancestor and preserve argument boundaries."""
     visited: set[int] = set()
-    while pid > 1 and pid not in visited and len(visited) < 64:
-        visited.add(pid)
-        if not _pid_alive(pid):
-            return []
-        try:
+    try:
+        darwin = {process.pid: process for process in herdr._darwin_processes()} if sys.platform == "darwin" and pid > 1 else {}  # pyright: ignore[reportPrivateUsage]
+        while pid > 1 and pid not in visited and len(visited) < 64 and _pid_alive(pid):
+            visited.add(pid)
             if sys.platform == "linux":
                 process = Path(os.environ.get("HERDR_PROC", "/proc")) / str(pid)
                 argv = [os.fsdecode(part) for part in process.joinpath("cmdline").read_bytes().split(b"\0") if part]
@@ -797,85 +779,45 @@ def _launcher_command(pid: int) -> list[str]:
                     return []
                 parent = process.parent
                 argv = list(process.arguments.argv)
-        except (OSError, ValueError, IndexError, UnicodeError, subprocess.SubprocessError):
-            return []
-        if any(Path(arg).name in {"implement.sh", "review.sh"} for arg in argv):
-            return argv
-        pid = parent
+            if any(Path(arg).name in WORKER_LAUNCHERS for arg in argv):
+                return argv
+            pid = parent
+    except (OSError, ValueError, IndexError, subprocess.SubprocessError, herdr.HerdrFailure):
+        return []
     return []
 
 
-def _left_since_offered(directory: Path, roster: dict[str, dict[str, object]]) -> bool:
-    """An earlier stop paused every worker, and the director has written no board line since.
-
-    Each stop writes `<seat>.resume-prompt.md`, so the oldest one is the earliest offer
-    the restart made. A board older than that offer means the director took none back.
-    """
-    if not roster or any(entry.get("status") != "paused" for entry in roster.values()):
-        return False
+def worker_resumes(parent: staff.StaffRow, membership: staff.StaffSnapshot) -> list[WorkerResume]:
+    """Return one resume result for each Claude child."""
+    children = [child for child in membership.find(kind="worker", parent=parent.id)
+                if isinstance(membership.backends.get(child.id), staff.ClaudeBackend)]
+    if not children:
+        return []
     try:
-        board = (directory / "board.log").stat().st_mtime
-        offered = min((directory / f"{name}.resume-prompt.md").stat().st_mtime for name in roster)
-    except OSError:
-        return False
-    return board < offered
-
-
-class PausedSeat(TypedDict):
-    """A director's existing worker thread and the launcher that continues it."""
-    run_dir: str
-    seat: str
-    role: str
-    thread_id: str
-    turn_live: bool
-    launcher_command: list[str]
-
-
-def codex_seats(run_directories: list[Path]) -> list[PausedSeat]:
-    seats: list[PausedSeat] = []
-    for directory in run_directories:
-        run_dir = str(directory)
-        roster = {
-            name: cast(dict[str, object], raw)
-            for name, raw in sorted(_json_object(Path(run_dir) / "mesh_roster.json").items())
-            if isinstance(raw, dict) and cast(dict[str, object], raw).get("status") != "ended"
-        }
-        # A run whose director left it is not one to resume: its marker outlived the work.
-        if _left_since_offered(directory, roster):
-            continue
-        for name, entry in roster.items():
-            thread_id, role = entry.get("thread_id", ""), entry.get("role", "impl")
+        tasks = agents_log.assignments(agents_log.state_dir() / "agents.jsonl")
+        moment = datetime.now(timezone.utc)
+        runs = session_staff.worker_run_entries(membership, children)
+    except (OSError, ValueError) as error:
+        return [Unavailable(child.id, child.name, str(error).replace("\n", " ")) for child in children]
+    results: list[WorkerResume] = []
+    for child in children:
+        try:
+            found = next(reversed(runs.get(child.id, ())), None)
+            if found is None:
+                raise ValueError("Claude child record is unavailable in its recorded runs")
+            directory, entry = found
+            task = agents_log.role_at(tasks, child.current_session, moment)
+            if not isinstance(task, agents_log.Assignment):
+                raise ValueError("last assignment is unavailable" + (f": {'; '.join(tasks.problems)}" if tasks.problems else ""))
+            status = worker_status_path(directory, str(entry["slot"])).read_text().strip()
+            live = status == "implementing"
             launcher = entry.get("launcher_pid", 0)
-            turn_live = entry.get("status") in {"running", "starting"} or entry.get("paused_turn") is True
-            seat = PausedSeat(run_dir=run_dir, seat=name,
-                              role=role if isinstance(role, str) else "impl",
-                              thread_id=thread_id if isinstance(thread_id, str) else "",
-                              turn_live=turn_live,
+            seat = ClaudeChildResume(run_dir=str(directory), seat=child.name, role=task.role, staff_id=child.id, turn_live=live,
                               launcher_command=_launcher_command(launcher) if isinstance(launcher, int) else [])
-            seats.append(seat)
-    return seats
-
-
-def _codex_servers(run_directories: list[Path]) -> list[CodexServer]:
-    servers: list[CodexServer] = []
-    for directory in run_directories:
-        record = _json_object(directory / "mesh_server.json")
-        pid = _positive_int(record.get("pid"))
-        if pid is None or not _pid_alive(pid):
-            continue
-        busy: list[str] = []
-        for name, raw_entry in sorted(_json_object(directory / "mesh_roster.json").items()):
-            if not isinstance(raw_entry, dict):
-                continue
-            entry = cast(dict[str, object], raw_entry)
-            status = entry.get("status")
-            launcher = _positive_int(entry.get("launcher_pid"))
-            # Saved status alone does not prove a launcher is still doing work.
-            launcher_is_live = launcher is not None and _pid_alive(launcher)
-            if status in {"running", "starting"} and launcher_is_live:
-                busy.append(name)
-        servers.append({"run_dir": str(directory), "pid": pid, "busy_workers": busy})
-    return servers
+            results.append(Resumable(seat) if live else Idle(seat))
+        except (OSError, ValueError) as error:
+            results.append(Unavailable(child.id, child.name, str(error).replace("\n", " ")))
+    return results
 
 
 def _timers(session_id: str) -> list[str]:
@@ -910,13 +852,13 @@ def _listed_session(
     unit = units.get(session_id)
     if production is not None:
         kind: Literal["showrunner", "unit", "worker", "top-level"] = "showrunner"
-        slug, doc = production.slug, production.doc
+        name, doc = production.name, production.doc
     elif unit is not None:
         kind = "unit"
-        slug, doc = unit.production, unit.doc
+        name, doc = unit.production, unit.doc
     else:
         kind = "worker" if record.get("kind") == "bg" else "top-level"
-        slug, doc = "", ""
+        name, doc = "", ""
     return ListedSession(
         session_id=session_id,
         pid=pid,
@@ -925,7 +867,7 @@ def _listed_session(
         kind=kind,
         config_dir=attributed.config_dir,
         login=attributed.account.login,
-        production=slug,
+        production=name,
         doc=doc,
     )
 
@@ -935,7 +877,7 @@ def listing(login: str | None = None, *,
     """List membership without inspecting transcripts, worktrees or host resources."""
     home_state = account.home_account_state()
     timers = showrunner_registrations() if isinstance(registrations, str) else registrations
-    productions = {timer.session_id: ProductionSession(timer.slug, timer.doc) for timer in timers.entries}
+    productions = {timer.session_id: ProductionSession(timer.name, timer.doc) for timer in timers.entries}
     units = _unit_sessions(timers.entries)
     found: list[ListedSession] = []
     for record in sessions.live_sessions():
@@ -961,266 +903,6 @@ def all_live_accounts() -> list[Inventory]:
         return list(pool.map(read_account, logins))
 
 
-@dataclass(frozen=True)
-class ShutdownProcess:
-    """A process identity and its recorded ownership at shutdown observation."""
-
-    pid: int
-    parent: int
-    started: str
-    arguments: tuple[str, ...] = ()
-    session_id: str = ""
-    run_dir: str = ""
-    build_unit: str = ""
-    process_session: int = 0
-    observed_parents: frozenset[int] = frozenset()
-    observed_groups: frozenset[int] = frozenset()
-    ownership_unreadable: bool = False
-    unreconciled_ownership_text: str = ""
-    cgroups: frozenset[str] = frozenset()
-
-
-@dataclass(frozen=True)
-class ProcessObservation:
-    """Discovered identities plus every unresolved read that prevents proving absence."""
-
-    processes: dict[int, ShutdownProcess]
-    errors: tuple[str, ...] = ()
-    uncertain: frozenset[int] = frozenset()
-    terminated: frozenset[tuple[int, str]] = frozenset()
-    observed_identities: frozenset[tuple[int, str]] = frozenset()
-
-
-@dataclass(frozen=True)
-class ProcessLive:
-    started: str
-
-
-@dataclass(frozen=True)
-class ProcessGone:
-    """The process no longer exists (including a reaped/zombie identity)."""
-
-
-@dataclass(frozen=True)
-class ProcessUnknown:
-    reason: str
-
-
-ProcessIdentity = ProcessLive | ProcessGone | ProcessUnknown
-
-
-def shutdown_identity(pid: int, timeout: float = 5) -> ProcessIdentity:
-    try:
-        if sys.platform == "darwin":
-            shown = subprocess.run(["ps", "-p", str(pid), "-o", "stat=,lstart="],
-                capture_output=True, text=True, check=False, timeout=timeout,
-                env={**os.environ, "LC_ALL": "C", "TZ": "UTC"})
-            if shown.returncode == 1 and not shown.stdout.strip():
-                return ProcessGone()
-            if shown.returncode:
-                return ProcessUnknown(f"pid {pid}: ps exit {shown.returncode}: {shown.stderr.strip()}")
-            status, separator, started = shown.stdout.strip().partition(" ")
-            if not separator or not started.strip():
-                return ProcessUnknown(f"pid {pid}: malformed ps identity")
-            return ProcessGone() if status.startswith("Z") else ProcessLive(started.lstrip())
-        fields = Path(os.environ.get("HERDR_PROC", "/proc"), str(pid), "stat").read_bytes().rpartition(b")")[2].split()
-        return ProcessGone() if fields[0] == b"Z" else ProcessLive(fields[19].decode("ascii"))
-    except FileNotFoundError:
-        try:
-            present = Path(os.environ.get("HERDR_PROC", "/proc"), str(pid)).exists()
-        except OSError as error:
-            return ProcessUnknown(f"pid {pid}: identity unread: {error}")
-        return ProcessUnknown(f"pid {pid}: stat missing from existing process") if present else ProcessGone()
-    except (OSError, subprocess.SubprocessError, IndexError, UnicodeError) as error:
-        return ProcessUnknown(f"pid {pid}: identity unread: {error}")
-
-
-def shutdown_server_identities(timeout: float, *, server_unit: str = "") -> frozenset[tuple[int, str]]:
-    """Only the service's verified main process is a permanent server keep."""
-    if sys.platform != "linux":
-        return frozenset()
-    expires = time.monotonic() + timeout
-    try:
-        shown = subprocess.run(["systemctl", "--user", "show", server_unit or herdr.server_unit(herdr.shared_session()),
-            "--property=MainPID", "--value"], capture_output=True, text=True, check=False, timeout=timeout)
-        if shown.returncode or not shown.stdout.strip().isdecimal():
-            return frozenset()
-        pid = int(shown.stdout.strip())
-        remaining = expires - time.monotonic()
-        if pid <= 0 or remaining <= 0:
-            return frozenset()
-        identity = shutdown_identity(pid, remaining)
-        return frozenset({(pid, identity.started)}) if isinstance(identity, ProcessLive) else frozenset()
-    except (OSError, subprocess.SubprocessError):
-        return frozenset()
-
-
-def _collect_process_table(arguments: list[str], timeout: float) -> tuple[str, int]:
-    """Return the table and the exact collector pid, which is never a target."""
-    with subprocess.Popen(arguments, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            text=True, env={**os.environ, "LC_ALL": "C", "TZ": "UTC"}) as collector:
-        try:
-            output, error = collector.communicate(timeout=timeout)
-        except subprocess.TimeoutExpired:
-            collector.kill()
-            _ = collector.communicate()
-            raise
-        if collector.returncode:
-            raise subprocess.CalledProcessError(collector.returncode, arguments, output, error)
-        return output, collector.pid
-
-
-def shutdown_processes(timeout: float = 5) -> ProcessObservation:
-    """Observe ownership without turning failed or partial reads into absence."""
-    result: dict[int, ShutdownProcess] = {}
-    errors: list[str] = []
-    if sys.platform == "darwin":
-        tables: list[dict[int, tuple[ShutdownProcess, str, str]]] = []
-        collectors: set[tuple[int, str]] = set()
-        identity_errors: dict[tuple[int, str], list[str]] = {}
-        for flags in (("-axww",), ("eww", "-axww")):
-            try:
-                output, collector = _collect_process_table(
-                    ["ps", *flags, "-o", "pid=,ppid=,pgid=,stat=,lstart=,command="], max(0.001, timeout / 2))
-            except (OSError, subprocess.SubprocessError) as error:
-                return ProcessObservation(result, (f"ps observation: {error}",))
-            table: dict[int, tuple[ShutdownProcess, str, str]] = {}
-            for line in output.splitlines():
-                row = re.fullmatch(r"\s*(\d+)\s+(\d+)\s+(\d+)\s+(\S+)\s+(\S+\s+\S+\s+\d+\s+\d+:\d+:\d+\s+\d+)\s*(.*)", line)
-                if row is None:
-                    errors.append(f"ps malformed row: {line[:160]}")
-                    continue
-                pid, parent, group = map(int, row.groups()[:3])
-                status, started, text = row.groups()[3:]
-                row_errors = identity_errors.setdefault((pid, started), [])
-                ownership_unreadable = bool(re.fullmatch(r"\([^()]*\)", text))
-                if ownership_unreadable:
-                    row_errors.append(f"pid {pid}: argv unread: ps comm fallback")
-                try:
-                    arguments = tuple(shlex.split(text))
-                except ValueError:
-                    # ps renders argv as text, not shell syntax. Quotes do not
-                    # erase numeric ancestry or the raw environment suffix.
-                    arguments = ()
-                table[pid] = (ShutdownProcess(pid, parent, started, arguments, process_session=group,
-                    ownership_unreadable=ownership_unreadable,
-                    unreconciled_ownership_text=text if tables else ""), status, text)
-            # This collector produced its own row while still alive. Only that
-            # exact identity is exempt; a later reuse of its pid is ordinary.
-            if collector in table:
-                collectors.add((collector, table[collector][0].started))
-            tables.append(table)
-        uncertain: set[int] = set()
-        terminated: set[tuple[int, str]] = set()
-        for pid in tables[0].keys() | tables[1].keys():
-            first = tables[0].get(pid)
-            later = tables[1].get(pid)
-            latest = later if later is not None else first
-            assert latest is not None
-            process, status, text = latest
-            if (pid, process.started) in collectors:
-                continue
-            # Reconcile identity before status. Later Z proves this identity dead;
-            # it never proves an earlier/different identity alive.
-            if status.startswith("Z"):
-                gone = {(pid, row[0].started) for row in (first, later) if row is not None}
-                terminated.update(gone)
-                for identity in gone:
-                    _ = identity_errors.pop(identity, None)
-                continue
-            result[pid] = process
-            if first is None or later is None or first[0].started != later[0].started:
-                uncertain.add(pid)
-                errors.append(f"pid {pid}: unmatched process identity between tables")
-                continue
-            parents = frozenset({first[0].parent, process.parent})
-            groups = frozenset({first[0].process_session, process.process_session})
-            process = ShutdownProcess(pid, process.parent, process.started, process.arguments,
-                process_session=process.process_session, observed_parents=parents, observed_groups=groups,
-                ownership_unreadable=first[0].ownership_unreadable or process.ownership_unreadable)
-            result[pid] = process
-            argv = first[2]
-            if not text.startswith(argv) or (len(text) > len(argv) and not text[len(argv)].isspace()):
-                uncertain.add(pid)
-                result[pid] = ShutdownProcess(pid, process.parent, process.started, process.arguments,
-                    process_session=process.process_session, observed_parents=parents, observed_groups=groups,
-                    ownership_unreadable=process.ownership_unreadable, unreconciled_ownership_text=text)
-                errors.append(f"pid {pid}: environment prefix does not match argv identity")
-                continue
-            tail = text[len(argv):]
-            entries = list(re.finditer(r"(?:^|\s)([A-Za-z_][A-Za-z0-9_]*)=", tail))
-            ownership_keys = {"CLAUDE_CODE_SESSION_ID", "UNIT_RUN_DIR", "UNIT_SESSION_DIR"}
-            # ps does not encode environment value boundaries. A repeated key,
-            # or a marker after another value, might be text inside that value.
-            ambiguous = any(entry[1] in ownership_keys and (index != 0 or
-                bool(tail[:entry.start()].strip()) or sum(other[1] == entry[1] for other in entries) != 1)
-                for index, entry in enumerate(entries))
-            if ambiguous:
-                uncertain.add(pid)
-                errors.append(f"pid {pid}: ownership marker boundary unknown")
-                result[pid] = ShutdownProcess(pid, process.parent, process.started, first[0].arguments,
-                    process_session=process.process_session, observed_parents=parents, observed_groups=groups,
-                    ownership_unreadable=True, unreconciled_ownership_text=text)
-                continue
-            environment = {entry[1]: tail[entry.end():entries[index + 1].start()
-                if index + 1 < len(entries) else len(tail)].rstrip()
-                for index, entry in enumerate(entries)}
-            result[pid] = ShutdownProcess(pid, process.parent, process.started, first[0].arguments,
-                environment.get("CLAUDE_CODE_SESSION_ID", ""),
-                environment.get("UNIT_RUN_DIR") or environment.get("UNIT_SESSION_DIR", ""),
-                process_session=process.process_session, observed_parents=parents, observed_groups=groups,
-                ownership_unreadable=process.ownership_unreadable)
-        errors.extend(error for key, entries in identity_errors.items() if key not in collectors for error in entries)
-        identities = frozenset((pid, row[0].started) for table in tables for pid, row in table.items()
-                               if (pid, row[0].started) not in collectors)
-        return ProcessObservation(result, tuple(errors), frozenset(uncertain), frozenset(terminated), identities)
-    root = Path(os.environ.get("HERDR_PROC", "/proc"))
-    try:
-        paths = list(root.iterdir())
-    except OSError as error:
-        return ProcessObservation(result, (f"process table unread: {error}",))
-    for process in paths:
-        if not process.name.isdecimal():
-            continue
-        try:
-            if process.stat().st_uid != os.getuid():
-                continue
-            fields = process.joinpath("stat").read_text().rsplit(")", 1)[1].split()
-            if fields[0] == "Z":
-                continue
-            arguments = tuple(os.fsdecode(word) for word in process.joinpath("cmdline").read_bytes().split(b"\0") if word)
-            environment: dict[str, str] = {}
-            cgroups: list[tuple[str, Path]] = []
-            ownership_unreadable = False
-            try:
-                environment = dict(os.fsdecode(item).split("=", 1) for item in (process / "environ").read_bytes().split(b"\0") if b"=" in item)
-            except OSError as error:
-                errors.append(f"pid {process.name}: environment unread: {error}")
-            try:
-                cgroups = herdr.systemd_cgroups(process)
-            except OSError as error:
-                errors.append(f"pid {process.name}: cgroup unread: {error}")
-                ownership_unreadable = True
-            scope = next((group.name for _hierarchy, group in cgroups
-                          if "builds.slice" in group.parts and group.suffix in {".scope", ".service"}), "")
-            pid = int(process.name)
-            result[pid] = ShutdownProcess(pid, int(fields[1]), fields[19], arguments,
-                environment.get("CLAUDE_CODE_SESSION_ID", ""),
-                environment.get("UNIT_RUN_DIR") or environment.get("UNIT_SESSION_DIR", ""), scope, int(fields[3]),
-                ownership_unreadable=ownership_unreadable,
-                cgroups=frozenset(str(group) for _hierarchy, group in cgroups))
-        except FileNotFoundError:
-            try:
-                if process.exists():
-                    errors.append(f"pid {process.name}: required process file missing")
-            except OSError as error:
-                errors.append(f"pid {process.name}: observation unread: {error}")
-            continue
-        except (OSError, ValueError, IndexError) as error:
-            errors.append(f"pid {process.name}: observation unread: {error}")
-    return ProcessObservation(result, tuple(errors))
-
-
 def inventory(
     login: str,
     only: frozenset[str] = frozenset(),  # pyright: ignore[reportCallInDefaultInitializer]
@@ -1229,7 +911,7 @@ def inventory(
     home_state = account.home_account_state()
     records = [_session_file(record) for record in sessions.live_sessions()]
     timers = showrunner_registrations()
-    productions = {timer.session_id: ProductionSession(timer.slug, timer.doc) for timer in timers.entries}
+    productions = {timer.session_id: ProductionSession(timer.name, timer.doc) for timer in timers.entries}
     units = _unit_sessions(timers.entries)
     session_ids = {
         session_id
@@ -1243,8 +925,9 @@ def inventory(
     candidates = [
         (record, _listed_session(record, productions, units, home_state))
         for record in records
-        if not only or _string(record.get("sessionId")) in only
-        or worker_owners.get(_string(record.get("sessionId"))) in only
+        if _string(record.get("sessionId")) not in timers.retired_sessions
+        and (not only or _string(record.get("sessionId")) in only
+             or worker_owners.get(_string(record.get("sessionId"))) in only)
     ]
     has_sessions = any(
         isinstance(entry, ListedSession) and entry.login.casefold() == wanted_login
@@ -1283,68 +966,16 @@ def _session_details(record: SessionFile, entry: ListedSession, *, directories: 
         "name": entry.name, "cwd": cwd, "config_dir": str(entry.config_dir),
         "probe": environment.get(PROBE_ENV) == "1", "status": _string(record.get("status"), "unknown"),
         "updated_at": _wire_integer(record.get("updatedAt", 0), "session.updatedAt"),
-        "model": _model(entry.session_id, entry.config_dir), "checkout": _checkout(cwd),
+        "model": _model(entry.session_id, entry.config_dir), "checkout": {"kind": "not a checkout"},
         "run_dirs": [str(directory) for directory in directories],
-        "codex_servers": _codex_servers(directories), "timers": timers, "host": host,
+        "timers": timers, "host": host,
         "kind": "top-level" if entry.kind == "unit" and host["kind"] == "unknown" else entry.kind,
     }
     if entry.kind == "showrunner":
         common.update(production=entry.production, doc=entry.doc)
     elif entry.kind == "worker":
         common["owner"] = worker_owner
-    return parse_session(common, "observed session")
-
-
-class MatchingSession(TypedDict):
-    kind: Literal["matching session"]
-    session: Session
-    workers: list[Session]
-
-
-class SessionAbsent(TypedDict):
-    kind: Literal["session absent"]
-
-
-class SessionIdentityLost(TypedDict):
-    kind: Literal["session identity lost"]
-
-
-class SessionAccountUnreadable(TypedDict):
-    kind: Literal["session account unreadable"]
-
-
-FreshSession = (
-    MatchingSession | SessionAbsent | SessionIdentityLost | SessionAccountUnreadable
-)
-
-
-def fresh_session(stored: Session, report: Inventory) -> FreshSession:
-    session_id = stored["session_id"]
-    occurrences = [item for item in report["sessions"] if item["session_id"] == session_id]
-    if any(item["pid"] != stored["pid"] or item["proc_start"] != stored["proc_start"]
-           for item in occurrences):
-        return {"kind": "session identity lost"}
-    current = next(iter(occurrences), None)
-    if current is not None:
-        return {
-            "kind": "matching session", "session": current,
-            "workers": [
-                item for item in report["sessions"]
-                if item["kind"] == "worker"
-                and item["owner"]["kind"] == "director"
-                and item["owner"]["session_id"] == session_id
-            ],
-        }
-    reason = next(
-        (
-            item["reason"]
-            for item in report["unattributed"]
-            if item["pid"] == stored["pid"]
-        ),
-        "",
-    )
-    if reason == "process start mismatch":
-        return {"kind": "session identity lost"}
-    if reason == "account unreadable":
-        return {"kind": "session account unreadable"}
-    return {"kind": "session absent"}
+    session = parse_session(common, "observed session")
+    folder = session["cwd"]
+    session["checkout"] = _checkout(folder) if isinstance(folder, str) else NotACheckout(kind="not a checkout")
+    return session

@@ -12,8 +12,7 @@ must not drift from it:
 - `/showrunner:produce` — runs the production from the showrunner session.
 - `/showrunner:dailies` — reports the production to the executive producer.
 - `/showrunner:report_interval` — changes how often the scheduled updates come.
-- `/showrunner:accounts` — shows every Claude and Codex account in one table; sets up a
-  Claude folder or swaps the unit account.
+- `/showrunner:accounts` — opens the accounts board.
 - `/unit:direct` — a unit's run; it applies <ProductionUnit/> below.
 
 ---
@@ -30,40 +29,32 @@ must not drift from it:
   makes the visual choices, clears waits between units, relays the user's words
   and reports when asked. It writes no implementation code.
 - **Unit** — one `/unit:direct` run on one unit plan, in its own worktree and
-  branch. A unit is named `<area>-unit`, e.g. `widget-unit`. Its plan, worktree,
+  branch. A unit is named for its area, e.g. `widget`. Its plan, worktree,
   branch, phases, checkpoints and ETA are the unit's.
 - **Unit director** — the Claude session that runs a unit: the `/unit:direct`
   session the showrunner launches in its own herdr session. It receives messages,
   decides, writes Work Orders, dispatches workers, runs gates, checkpoints and
   reports. It writes no implementation code.
-- **Worker** — a Codex worker thread the unit director dispatches. Implementation
-  workers open once per run, continue across phases and repairs in whatever role
-  is needed, attempt compaction above `UNIT_COMPACT_ABOVE_TOKENS` but
-  continue after a failed attempt, press on after context overflow with
-  `Continue where you stopped.`, open anew only when no open worker can take the
-  work. The unit owns its reviewers too: `assign.sh --role review` resumes
-  `review`, then `review2` while the first is busy. Unit pause, move and end
-  apply to every worker.
-- **Reviewer** — a unit's read-only worker, role `review`. Its thread keeps
-  context across phases and plans; its standing instructions are in
-  `config/review/code.md`.
-- **Template** — a thread holding a type's standing prompt, forked into reviewers
-  and never leased.
-- **Lease** — one reviewer's assignment to one unit's phase, cleared at phase end.
+- **Worker** — a staff member under a unit or showrunner, with a native Claude or Codex conversation in a pane.
+  Launchers use the run's existing transport pin.
+  Pane assignments reuse an idle or resumable worker in role-number order.
+  Dispatch reads the transcript before submission and completes on the matching `DONE <dispatch id>` reply.
+  Retire, wrap, and promote stop workers and retain their rows and conversations for restore.
+  Only worker end or permanent unit removal deletes worker rows.
+- **Reviewer** — a unit's read-only worker, role `review`.
+  Its native conversation retains context across phases and plans.
+  Its standing instructions are in `config/review/code.md`.
 - **Merge branch** — the branch every unit's checkpoints merge into. cargo-berth
   calls it the trunk. In prose, call it by its branch name, because a unit may be
-  named `trunk-unit`.
-- **Gate** — a unit phase that cannot start until another unit's checkpoint is on
-  the merge branch.
+  named `trunk`.
 - **Parent, child and root showrunner** — a production's showrunner may report
   to another production's (`/showrunner:attach`). The one at the top of a tree is
   the root: it shows every item that needs the user from the productions below
   it, and the user may still work with any showrunner directly. A child showrunner is never a
-  unit: it keeps its own production doc, merge branch and units, and has no row
-  in its parent's Units table. Which production reports to which is state on the
-  machine, `~/.local/state/showrunner/<child slug>/parent`, and no line in either
-  production doc, so either side attaches without a commit in the other's
-  checkout. Look it up with `showrunners.py parent|children|root <slug>`.
+  unit: it keeps its own production doc, merge branch and units, and its staff
+  row is a showrunner row. Which production reports to which is state on the
+  staff row. Either side attaches without a commit in the other's checkout.
+  Read the relationship with `showrunners.py parent|children|root <showrunner name>`.
 
 User, 2026-09-28: production, showrunner and unit were chosen because Hana is a
 DCC app and the film words are short.
@@ -75,6 +66,7 @@ User, 2026-10-01: the session that runs a unit is its unit director.
 ## Production doc structure
 
 The production doc sits beside the source plan as `<source-stem>-production.md`.
+The showrunner staff row gives its path. The row's `name` is the production name.
 
 ```markdown
 # Production — <name>
@@ -83,8 +75,6 @@ The production doc sits beside the source plan as `<source-stem>-production.md`.
 
 ## Production Context
 
-- **Formerly:** `<old>`, `<older>` — previous production slugs, newest first, written by
-  `/showrunner:rename`; old names keep resolving through it; omit before the first rename
 - **Source plans:** <path(s)> — split on <date> by /producer:to_production
 - **Repository:** <main checkout path>
 - **Merge branch:** `<branch>` — every unit merges here; only the showrunner pushes it
@@ -95,16 +85,16 @@ The production doc sits beside the source plan as `<source-stem>-production.md`.
 - **Parent production:** <path to parent production doc> — style productions only:
   the hand-off destination and the doc used to merge hand-offs while a root
 - **Showrunner checkout:** <path, on the merge branch>
-- **Showrunner session:** <name> — the showrunner's session name; it also names the production's workspace in the shared herdr session (the slug when absent)
 - **Log:** <repo-relative path> — git-excluded; one line per event
 - **Updates:** `on demand` (the default, also when the line is missing), or every <N>
   minutes when the user asks for a schedule; each update reports every unit in full; the
   update timer reads N from this line, `on demand` runs no timer and a dailies runs only
   when the user asks, and `/showrunner:report_interval` changes it (user, 2026-10-13: no
   timer unless asked)
-- **Merge tests:** <backticked commands run in the showrunner checkout on every merge,
-  besides the changed packages' tests, e.g. `./verify.sh test -p app`; text after the
-  first unbackticked `(` is commentary>; `—` if none. Each command runs with no shell;
+- **Merge tests:** <backticked commands for the showrunner checkout on every merge,
+  in addition to the changed packages' tests.
+  Use `bash ~/.claude/scripts/direct/verify.sh test app`, for example.
+  Text after the first unbackticked `(` is commentary>; `—` if none. Each command runs with no shell;
   `~` and `$VAR` expand. Its first word must be on PATH or an executable file in the
   checkout: a package name, a directory or an unset variable is refused before the merge
   starts
@@ -113,11 +103,15 @@ The production doc sits beside the source plan as `<source-stem>-production.md`.
   nothing users see changes
 - **Change review:** `~/rust/hanadocs/change-review/change-review - <showrunner>.md`;
   required. One list per top-level showrunner, named for its session name, never the
-  production slug (`change-review - natedev.md`); a child production names its root's
+  document file name (`change-review - natedev.md`); a child production names its root's
   list. `change_review.py` resolves the list from the root showrunner while it runs and
   falls back to this path when it does not, warning when the two differ.
-  `merge_checkpoint.py` adds a row per `Change-Review:` line a merged checkpoint names, and
-  `/change_review` adds the rest; a missing file is created on its first row with
+  All merge callers use `change_review.list_ready` after the final promotion step succeeds, including the Mac pull.
+  It adds missing checkpoint changes only when they reach `origin/main` and become live.
+  A fourth field, `after <step>`, waits for `change_review.py live --merged <hash> --step <step> --repo <checkout> --production <showrunner>`.
+  The session that completes the step runs `live`.
+  The command requires both arguments and releases only the named step.
+  `/change_review add` adds other ready changes. A missing file is created on its first row with
   frontmatter (`date_created`, `date_modified` as `"[[YYYY-MM-DD]]"`, a `productions`
   list of production doc paths, `showrunner`), and every write moves `date_modified`
   and adds the writing production's doc to `productions`
@@ -131,60 +125,13 @@ The production doc sits beside the source plan as `<source-stem>-production.md`.
   proposed and deferred lines show as `N efficiency` in the `For you:`
   line on the status line and in the dailies footer
 
-The showrunner's session name is not in the doc: a name can change, so it is
-looked up when needed. `~/.claude/scripts/lib/py
-~/.claude/scripts/production/showrunners.py name <slug>` prints it as it is now.
-A unit sends to the address `showrunners.py address <slug>` prints, not to the
-name: the address is the showrunner's session on this machine, and `SendMessage`
-refuses a name that another session of the same account also has.
-
-## Units
-
-| Unit | Plan | Worktree | Branch | Port | Owns |
-| --- | --- | --- | --- | --- | --- |
-| <name>-unit | <plan path> | <path> | <branch> | <app port or —> | <dirs/files> |
-
-The Unit value names the unit everywhere: in the log, the dailies, the waits and every
-tool's arguments. A unit's session name is written nowhere, because the user may rename
-a session at any time. The unit's herdr session carries the production's
-slug and the unit's id as marks, set at launch. To reach a unit, look it up at that moment:
-`$HOME/.claude/scripts/lib/py $HOME/.claude/scripts/production/unit_lookup.py pane <slug> <unit>`
-prints its pane, and `unit_lookup.py list <slug>` prints every unit's pane and its
-session name now. `<slug>` is this doc's file name without `-production.md`; a former
-slug from the Formerly line also works, and a mark set before a rename is found under
-the current slug.
-
-To rename a unit, run `/showrunner:rename_unit <old> <new>` from the showrunner session,
-between phases. Never edit the Unit, Worktree or Branch cell by hand. The rename stops the unit,
-moves its branch, worktree and state, and commits `chore(<slug>): rename unit <old> to <new>` on
-the merge branch. Merge history follows that commit, so the unit's past merges still count under
-the new id. Then it relaunches the unit and verifies that nothing live still holds the old name.
-`nightly-review-unit` keeps its name.
-
-To retire a unit, run `/showrunner:retire_unit <unit>` from the showrunner session. It refuses
-while the unit has uncommitted work or a checkpoint not merged. It stops everything the unit owns
-(its sessions, Codex workers, reviewers, holds, reservations, Mac claims and processes), marks the row
-retired, and removes the worktree and branch. `--dry-run` lists all of it and changes nothing.
-The retired note names the director's last session. `/showrunner:resume_unit <unit>` makes the
-worktree again at the same path from the merge branch, resumes that session and makes the row live.
-
-A retired unit keeps its row. Its Plan cell begins with `retired`, alone or inside
-an opening parenthesis, as in `(retired by the user 2026-10-07, worktree removed)`.
-The status script, the dailies, the waits and the stall watch then skip it. The word
-anywhere else in the cell changes nothing. A
-unit's plan run ending retires nothing, because the unit's next plan keeps
-the same reviewer.
+Read the current showrunner name from its staff row.
+Send to the address from `showrunners.py address <showrunner name>`.
 
 ## Hub files
 
 | File | Owner unit | Other units that touch it |
 | --- | --- | --- |
-
-## Gates
-
-| Gate | Waiting | Waits on | Clears when |
-| --- | --- | --- | --- |
-| G1 | <unit> phase <N> | <unit> phase <M> | that checkpoint is on the merge branch |
 
 ## Close-out
 
@@ -197,32 +144,58 @@ the same reviewer.
   source; omit the section if none>
 ```
 
-Each unit plan carries a header line under its status line, preserved verbatim by
-`/plan:to_phased_plan`, `/plan:phase_review` and `/plan:shrink`:
+A production doc has no list of units. A unit is its staff row.
+The row gives its name, parent and worktree; git there gives the repository and branch.
+The units appear in staff.json row order. Untracked `.unit.toml` at the worktree root gives
+the plan, app port and short duty names. Responsibilities do not limit changed paths.
 
-```markdown
-> **Production: <name>** — unit `<unit>`; production doc `<path>`
-```
+The staff name names the unit everywhere: in the log, the dailies, the waits and
+every tool's arguments. A unit's session name can change, so find the unit at that moment:
+`$HOME/.claude/scripts/lib/py $HOME/.claude/scripts/production/unit_lookup.py pane <showrunner name> <unit>`
+prints its pane, and `unit_lookup.py list <showrunner name>` prints every unit's pane and its
+session name now. `<showrunner name>` is the parent showrunner row's `name`.
 
-Each gated phase carries its gate directly under the phase heading:
+Run `/agents rename OLD NEW` to rename a unit, showrunner, or worker.
+Use a staff id, `showrunner/name`, or a unique name.
+A bare name first selects the calling showrunner or unit and its direct children.
+The command searches all productions only when that scope has no match.
+A unit rename changes matching folder and branch suffixes and resumes its live sessions.
+A worker rename changes its pane title and keeps its shared tab and workspace names.
+The command keeps staff ids and creates no commit.
+Use `unit_move.py move-folder --unit <staff id> --to <path>` to move only the folder.
 
-```markdown
-**Blocked by:** G<k> — <unit> phase <M> merged into `<merge branch>`
-```
+A showrunner rename with a document move preserves staged document bytes separately from working bytes.
+Recovery restores the staged destination entry before removing the source index entry.
+It completes the pending move without staging the working edits.
+
+Run `/agents retire NAME` to remove the unit worktree and branch.
+Uncommitted work or an unmerged checkpoint prevents removal.
+Retire records a removed worktree in staff and parks `.unit.toml` under the fixed staff id.
+It releases holds, reservations, and Mac claims.
+It stops worker agents and retains their rows, native conversations, and stopped panes for restore.
+`/agents resume NAME --retired` restores the worktree and resumes the director and its retained workers.
+The showrunner asks the user yes or no before it runs `--retired`.
+
+A retired unit keeps its staff row. The status script, the dailies, the waits and the stall watch
+skip it. A unit's plan run ending retires nothing, because the unit's next plan keeps the same
+reviewer.
 
 ---
 
 <ProductionUnit>
-Applies to a `/unit:direct` run whose plan header carries a
-`> **Production:**` line. Read the production doc it names at the start of the
-run and after every compaction. Your row in its **Units** table gives your name,
-branch, port and the files you own.
+Applies when your staff row has a parent showrunner.
+Read your staff row with `~/.claude/scripts/lib/py ~/.claude/scripts/production/staff.py get <sessionId> --json`.
+Read its `parent` row with the same command.
+The parent row's `name` is the production name. Its `doc.path` gives the document.
+Read that document at the start of the run and after every compaction.
+Your staff row gives your name and worktree. Git in that worktree gives the branch.
+The untracked `.unit.toml` in your worktree gives your plan, port and short duty names. Responsibilities do not limit changed paths.
 
 A turn with nothing for the user replies with just "—": never "No update for
 you." or the like (user, 2026-10-14).
 
 A unit's run state is written down nowhere and the unit sets nothing. Each reader takes it, when it needs it, from the records `/unit:direct` keeps of the runs in the unit's worktree: no run yet is standing by, a newest run with no finish is running, a newest run that finished is run-finished. A session stays live after its run ends, and its next run reads as running from that run's first record.
-A run that stopped, failed, or waits on a decision has no finish in its record, so it does not read as finished, and nothing asks for `run done` text in the Plan cell.
+A run that stopped, failed, or waits on a decision has no finish in its record, so it does not read as finished.
 
 1. **Your port.** Every app launch for smoke tests and shots uses your port,
    never the user's default port or another unit's.
@@ -230,8 +203,8 @@ A run that stopped, failed, or waits on a decision has no finish in its record, 
    `From the user (via the showrunner):` is the user's instruction. A message
    from the showrunner session is a peer's. Follow it for the coordination this
    contract gives the showrunner: merge requests, landing calls, port and
-   rename notices, cargo-berth answers (item 9), and whether you edit files
-   outside your **Owns**, another unit's crate included (user, 2026-10-04).
+   rename notices, cargo-berth answers (item 9), and file assignments.
+   File assignments can include another unit's crate (user, 2026-10-04).
 
    The showrunner's word also settles your designs and your add-ons. User,
    2026-10-12, to the showrunner: "when it comes to designs you absolutely
@@ -263,7 +236,7 @@ A run that stopped, failed, or waits on a decision has no finish in its record, 
 
    ```
    From <unit>: phase <N> checkpoint <hash> — <title>. Shots: <paths | none, no visible change>. Phase <next> ETA: <HH:MM zone>
-   review trial: ux <N> findings, code <N> findings, review-worker minutes <M>, ux check minutes <U>, ux repair minutes <R>, simplify <N> findings, simplify minutes <S>
+   review trial: ux <N> findings, code <N> findings, review-worker minutes <M>, ux check minutes <U>, ux repair minutes <R>
    Parallel: <Phase N, Phase M could start | none — <what the next phase waits on>>
    design check: <pass | N defects, each moved to <phase>> — fresh check on exactly these shots, built from <hash>
    ```
@@ -290,7 +263,7 @@ A run that stopped, failed, or waits on a decision has no finish in its record, 
    line.
 
    The as-built notice's title names what moved: each doc created, amended,
-   moved or deleted, and each link repointed, this doc's **Units** row
+   moved or deleted, and each link repointed, the plan path in `.unit.toml`
    included. The close-out never waits on a reply.
 
    A phase that changes what users see, in the app or in any example,
@@ -322,7 +295,7 @@ A run that stopped, failed, or waits on a decision has no finish in its record, 
    on the merge branch.
 5. **One more commit kind.** Besides checkpoints, a unit director merges the
    merge branch into the unit's branch at the start of every phase, before
-   dispatch (user, 2026-10-16), and also when a gate clears or the showrunner asks:
+   dispatch (user, 2026-10-16), and when the showrunner asks:
    `git fetch origin <merge branch> && git merge --no-ff -m "merge(<plan-slug>): <merge branch> at <short hash> — <reason>" origin/<merge branch>`.
    Resolve conflicts on your side, build and test, then continue.
    Standing style units instead use
@@ -330,14 +303,8 @@ A run that stopped, failed, or waits on a decision has no finish in its record, 
    Refill waits for the previous ticket's merge, so no unmerged unit work remains
    at phase start. Report a refused fast-forward to the style showrunner as an
    error; never create a merge commit to work around it.
-6. **Gates.** A phase with `**Blocked by:** G<k>` starts only once
-   `git merge-base --is-ancestor <gating checkpoint> <merge branch>` succeeds.
-   Worktrees share refs, so no fetch is needed. Check it yourself; a message
-   saying the gate is clear is not proof. While it fails, end the turn with
-   `— blocked: waiting on the showrunner: G<k> (<unit> phase <M> merged)`.
-   When it passes, merge the merge branch (item 5), then dispatch. The one
-   exception: the showrunner lifts a gate after item 13's test passes without
-   it (`From the showrunner: G<k> lifted — …`); dispatch then.
+6. **Start order.** The showrunner records a start-order wait as an owed action in its notes.
+   Use `cargo-berth sequence` for merge order.
 7. **What a phase fixes** (user, 2026-09-28 and 2026-10-01). Reviews, design
    checks and smoke runs keep finding things. Two rules decide which of them
    this phase fixes before its checkpoint.
@@ -363,11 +330,11 @@ A run that stopped, failed, or waits on a decision has no finish in its record, 
      phase only when it is a regression the phase caused, breaks something
      that worked, or fails a test or gate. Every other finding moves to the
      follow-up phase, however visible, open since round 1 or found this round.
-   Count repair rounds as `history.py rounds` numbers its repair intervals, not as ledger batches. From repair round 4 onward, do not dispatch a missing target, rule interpretation or acceptance case in this phase unless evidence establishes a phase-caused regression, broken working behavior or test/gate failure. A broad original permission to fix pilot defects does not override this check. A later explicit user or showrunner ruling may keep named work; cite it. Route every other missing criterion to a follow-up Work Order in the owning unit, with its target decision, implementation, tests and acceptance evidence. Do not dispatch a batch until every finding is either retained with evidence or assigned to that follow-up. Split mixed batches; keep their eligible defects here. Never mark an unmet pilot acceptance bar passed because its work was routed.
+   Use `history.py rounds` for repair counts. Relaunches of one ledger batch count as one repair round. From repair round 4 onward, do not dispatch a missing target, rule interpretation or acceptance case in this phase unless evidence establishes a phase-caused regression, broken working behavior or test/gate failure. A broad original permission to fix pilot defects does not override this check. A later explicit user or showrunner ruling may keep named work; cite it. Route every other missing criterion to a follow-up Work Order in the owning unit, with its target decision, implementation, tests and acceptance evidence. Do not dispatch a batch until every finding is either retained with evidence or assigned to that follow-up. Split mixed batches; keep their eligible defects here. Never mark an unmet pilot acceptance bar passed because its work was routed.
 
    Work Orders state the acceptance observation, unit or comparison, and named real-path test or live check for changed behavior. Reuse established targets. Resolve choices through the showrunner before dependent work; do not invent a number to fill the form. A later changed goal updates the order explicitly. (the user, 2026-10-28)
 
-   Count repair rounds as `history.py rounds` numbers its repair intervals, not as ledger batches. Before any round 4-or-later dispatch on a repeated finding, require evidence that it is a phase-caused regression, broken working behavior or test/gate failure. Earlier attempts and an open verdict alone are not that evidence. Broad original permission for pilot fixes does not override landing. Cite any later explicit user/showrunner ruling that keeps the named work. Route a repeated finding outside these categories to its owning unit's follow-up Work Order before another repair starts. Keep the finding open and link its checks, previous attempts, due checkpoint and final acceptance result. Split mixed batches and retain all eligible work. If eligibility is unknown, diagnose it rather than silently route or count it as a certain saving.
+   Use `history.py rounds` for repair counts. Relaunches of one ledger batch count as one repair round. Before any round 4-or-later dispatch on a repeated finding, require evidence that it is a phase-caused regression, broken working behavior or test/gate failure. Earlier attempts and an open verdict alone are not that evidence. Broad original permission for pilot fixes does not override landing. Cite any later explicit user/showrunner ruling that keeps the named work. Route a repeated finding outside these categories to its owning unit's follow-up Work Order before another repair starts. Keep the finding open and link its checks, previous attempts, due checkpoint and final acceptance result. Split mixed batches and retain all eligible work. If eligibility is unknown, diagnose it rather than silently route or count it as a certain saving.
 
    For retained work after two completed failed fixes, record the failure, approaches tried, cause diagnosis and next distinguishing test before another approach. Interrupted workers and account moves remain continuations, not completed rejected patches. (the user, 2026-10-28)
 
@@ -465,7 +432,8 @@ A run that stopped, failed, or waits on a decision has no finish in its record, 
     `Change-Review:` line in its checkpoint (`/unit:checkpoint`). A change
     outside a checkpoint goes on the list through `/change_review add`. Never
     ask the user to check something directly.
-18. **Builds for the user.** Before a build goes to the user's machine, run
-    `assertion_guard.py --base main` in that repository (`/unit:direct`
-    <UserBuildGuard/>). Exit 1 or 2 stops the hand-off.
+    A row requires a change the user can check now, merged where they run it and live after rebuild, restart or deploy.
+    Until then, add no row.
+    Merge callers share `list_ready`, which fetches `origin main` before it adds missing rows.
+    A fourth field, `after <step>`, holds the line until the session completes the step and runs `change_review.py live --merged <hash> --step <step>`.
 </ProductionUnit>

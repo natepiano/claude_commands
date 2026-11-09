@@ -18,30 +18,27 @@ from pathlib import Path
 from typing import ClassVar, cast, override
 from unittest import mock
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from scripts.message import session_send
 from scripts.lib.test_models_registry import ExactRows, registry_text, write_registry
 from scripts.whoami.account_test_support import create_claude_account
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-import quota_alert
-from push_texts import RenderedPush
+from scripts.whoami import quota_alert
+from scripts.notify.push_texts import RenderedPush
 from scripts.whoami import agent_accounts
 from scripts.whoami.agent_accounts import ClaudeAccountsInUse, CodexHomeSource, Quota, Report
-import agent_notes
+from scripts.whoami import agent_notes
 from scripts.whoami import session_table
 from scripts.whoami import note_file
 from scripts.whoami import account
 from scripts.whoami import usage_store
-from agent_notes import local_reset
+from scripts.whoami.agent_notes import local_reset
 from scripts.whoami.note_file import read_note
 from scripts.accounts import accounts, moves, next_moves, role_map
 from scripts.production import showrunners
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "message"))
-import send
-# send puts scripts/notify on the path.
-from user_action import ActionRequired, UserAction, parse_user_action
+from scripts.message import send
+from scripts.notify.user_action import ActionRequired, UserAction, parse_user_action
 
 Notes = list[quota_alert.AgentNote]
 
@@ -67,7 +64,7 @@ REFUSAL_ACTION = "At chatgpt.com/codex/settings/usage, add credits for account c
 
 def running(*names: str) -> list[quota_alert.Showrunner]:
     """Running showrunners called `names`, as their update timers and session records would give them."""
-    return [quota_alert.Showrunner(session=name, socket=f"/{name}.sock", slug=name.replace(" ", "-"),
+    return [quota_alert.Showrunner(session=name, socket=f"/{name}.sock", name=name,
                                    zone="America/Los_Angeles", doc="") for name in names]
 
 
@@ -108,7 +105,7 @@ class QuotaReminderFixture(unittest.TestCase):
         self.prepare_files()
         _ = self.enterContext(mock.patch.object(note_file, "AGENTS_DIR", self.root))
         _ = self.enterContext(mock.patch.object(agent_notes, "READINGS_LOG", self.root / "readings.jsonl"))
-        config = self.root / "showrunners.json"
+        config = self.root / "showrunners.conf"
         registry = self.root / "models.conf"
         for name, value in (("CONFIG", config), ("STATE", self.root / "state.json"), ("relay", self.relay),
                             ("tell_user", self.tell_user), ("REGISTRY", registry)):
@@ -140,9 +137,15 @@ class QuotaReminderFixture(unittest.TestCase):
         codex_home.mkdir()
         claims = base64.urlsafe_b64encode(json.dumps({"email": "someone@example.com"}).encode()).decode().rstrip("=")
         _ = (codex_home / "auth.json").write_text(json.dumps({"tokens": {"id_token": f"header.{claims}.signature"}}))
-        _ = (self.root / "showrunners.json").write_text(json.dumps({
-            "threshold_percent": 1, "repeat_minutes": 30, "stall_minutes": 5,
-            "faults_to": "natedev", "always": ["natedev"]}))
+        _ = (self.root / "showrunners.conf").write_text(("""# range: 0..
+threshold_percent=1
+# range: 0..
+repeat_minutes=30
+# range: 0..
+stall_minutes=5
+faults_to=natedev
+always=natedev
+"""))
         _ = write_registry((self.root / "models.conf"), base_text=REGISTRY)
         (self.root / "catalog synced").touch()
 
@@ -185,13 +188,13 @@ class QuotaReminderFixture(unittest.TestCase):
             _ = deliver()
         sends: dict[str, tuple[str, UserAction]] = {}
         for command in commands:
-            self.assertEqual(command[:2], [sys.executable, str(quota_alert.SEND)])
+            self.assertEqual(command[:2], [sys.executable, str(session_send.SEND_SCRIPT)])
             with redirect_stderr(io.StringIO()) as refusal:
                 try:
                     options = send.parse(command[2:])
                 except SystemExit:
                     self.fail(f"send.py refused {command[2:]}: {refusal.getvalue().strip().splitlines()[-1]}")
-            from push_texts import render
+            from scripts.notify.push_texts import render
             values = dict(value.split("=", 1) for value in command[command.index("--text-id") + 2:] if "=" in value)
             push = render(command[command.index("--text-id") + 1], **values)
             options = options._replace(summary=push.title, action=push.action)
@@ -350,9 +353,16 @@ class CodexZeroEpisodeFixture(unittest.TestCase):
         _ = self.enterContext(mock.patch.object(note_file, "AGENTS_DIR", self.root))
         _ = self.enterContext(mock.patch.object(showrunners, "NOTIFIER_STATE_DIR", self.root / "notifier"))
         _ = self.enterContext(mock.patch.object(session_table, "live_sessions", return_value=session_table.ReadSessions({}, frozenset())))
-        config = self.root / "showrunners.json"
-        _ = config.write_text(json.dumps({"threshold_percent": 1, "repeat_minutes": 30,
-            "stall_minutes": 5, "faults_to": "director", "always": ["director"]}))
+        config = self.root / "showrunners.conf"
+        _ = config.write_text(("""# range: 0..
+threshold_percent=1
+# range: 0..
+repeat_minutes=30
+# range: 0..
+stall_minutes=5
+faults_to=director
+always=director
+"""))
         registry = self.root / "models.conf"
         _ = write_registry(registry, base_text=REGISTRY)
         _ = self.enterContext(mock.patch.object(quota_alert, "CONFIG", config))
@@ -455,7 +465,7 @@ class CodexZeroEpisodeFixture(unittest.TestCase):
             self.assertIn("codex1", push.body)
             for forbidden in ("codex2", "codex3", "Claude", "Within minutes", "workers move"):
                 self.assertNotIn(forbidden, push.body)
-            from push_texts import render
+            from scripts.notify.push_texts import render
             self.assertEqual(push, render("quota.paid_credits_queued", **push.values))
             self.assertEqual(set(push.values), {"sender", "account", "machine", "credits", "refill"})
             self.assertIn("workers stop and wait for your queued move", push.body)

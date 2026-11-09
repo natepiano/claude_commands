@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from scripts.shutdown import remote
+
 import hashlib
 import io
 import json
@@ -16,35 +18,27 @@ from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal, TypedDict, cast, final, override
+from typing import Literal, TypedDict, cast, final, override
 from unittest import mock
 from zoneinfo import ZoneInfo
 
-import pushover
-import review
-import reply_asks
-import push_texts
-from push_test_support import registered_send
-from user_action import ActionRequired, NoActionRequired, SessionLine, first_line
+from scripts.notify import pushover
+from scripts.notify import review
+from scripts.notify import reply_asks
+from scripts.notify import push_texts
+from scripts.notify import push_reference
+from scripts.notify.push_test_support import registered_send
+from scripts.notify.user_action import ActionRequired, NoActionRequired, SessionLine, first_line
 
 REAL_REVIEW = review.review
 
-if TYPE_CHECKING:
-    from ..accounts import accounts
-    from ..production import staff
-    from ..production.update_registration_test_support import RegistrationFixture
-    from ..production.cli_fixture import production_paths
-    from ..production.staff_test_support import (
-        fixture_member, isolated_staff_file, isolated_source_readers, source_environment,
-    )
-else:
-    from scripts.accounts import accounts
-    from scripts.production import staff
-    from scripts.production.update_registration_test_support import RegistrationFixture
-    from scripts.production.cli_fixture import production_paths
-    from scripts.production.staff_test_support import (
-        fixture_member, isolated_staff_file, isolated_source_readers, source_environment,
-    )
+from scripts.accounts import accounts
+from scripts.production import staff
+from scripts.production.update_registration_test_support import RegistrationFixture
+from scripts.production.cli_fixture import production_paths
+from scripts.production.staff_test_support import (
+    fixture_member, isolated_staff_file, isolated_source_readers, source_environment,
+)
 
 
 class VerdictJSON(TypedDict):
@@ -174,12 +168,12 @@ class LocalReviewTests(unittest.TestCase):
         binary.chmod(0o700)
         _ = self.enterContext(mock.patch.object(shutil, "which", return_value=str(binary)))
 
-    def question_record(self, fields: dict[str, str], *, slug: str) -> Path:
-        folder = self.root / "proposals" / slug
+    def question_record(self, fields: dict[str, str], *, name: str) -> Path:
+        folder = self.root / "proposals" / name
         folder.mkdir(parents=True, exist_ok=True)
-        document = self.root / f"{slug}-production.md"
-        _ = document.write_text(f"# Production — {slug}\n\n- **Proposals:** `{folder}`\n")
-        owner = fixture_member("showrunner", name=slug, doc=staff.LiveDoc("natedev", document))
+        document = self.root / f"{name}-production.md"
+        _ = document.write_text(f"# Production — {name}\n\n- **Proposals:** `{folder}`\n")
+        owner = fixture_member("showrunner", name=name, doc=staff.LiveDoc(remote.local_machine(), document))
         record = folder / "question-fixture.md"
         fields = {**fields, "asked_by": owner.id}
         _ = record.write_text(f"---\nrecord_type: question\ntags: [question]\nstatus: open\n"
@@ -558,6 +552,27 @@ class LocalReviewTests(unittest.TestCase):
         self.assertIn("passed: 0; failed: 1; unreviewed: 1", output.getvalue())
         self.assertIn("sample failed rules: reader-starts-cold=1", output.getvalue())
 
+    def test_sample_keeps_question_registration_unknown_when_staff_is_unreadable(self) -> None:
+        question = "Would you retry the build?"
+        path = self.transcript("question.jsonl", [("2026-10-13T10:00:00Z", question, "end_turn")])
+        record = self.question_record({"since": "2026-10-13T10:00", "text": question,
+                                       "question": question}, name="demo")
+        before = record.read_bytes(), record.stat().st_mtime_ns
+        staff_path = Path(os.environ["STAFF_FILE"])
+        _ = staff_path.write_text("{invalid")
+        cutoff = datetime.fromisoformat("2026-10-12T00:00:00+00:00")
+        with redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as errors:
+            _ = review.sample([path], since=cutoff, runner=FakeReviewer(verdict(self.draft)))
+        self.assertIn("incomplete", output.getvalue() + errors.getvalue())
+        self.assertIn(str(staff_path), output.getvalue() + errors.getvalue())
+        self.assertNotIn("replies with unregistered questions: 1", output.getvalue())
+        self.assertEqual((record.read_bytes(), record.stat().st_mtime_ns), before)
+        staff_path.unlink()
+        with redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as errors:
+            self.assertEqual(review.sample([path], since=cutoff, runner=FakeReviewer(verdict(self.draft))), 0)
+        self.assertIn("replies with unregistered questions: 1", output.getvalue())
+        self.assertNotIn("incomplete", output.getvalue() + errors.getvalue())
+
     def test_sample_registered_questions_and_quoted_examples_are_not_unregistered(self) -> None:
         path = self.transcript("session.jsonl", [
             ("2026-10-13T10:00:00Z", "Would you retry the build?", "end_turn"),
@@ -644,7 +659,7 @@ class LocalReviewTests(unittest.TestCase):
         question = "Should handler-enh go ahead with phases 1 and 2?"
         request = "Say go and I'll have cargo-liner do it."
         choice = ("Allow (recommended, since both requests are a day old): "
-                  + "the shutdown unit runs the cancel once, then moves dashboard-unit to claude 4.")
+                  + "the shutdown unit runs the cancel once, then moves dashboard to claude 4.")
         self.assertEqual(reply_asks.user_reply_questions(question + "\n" + request + "\n" + choice),
                          reply_asks.ReplyAsks((question, request), True, (choice,)))
 
@@ -730,15 +745,19 @@ class LocalReviewTests(unittest.TestCase):
                 "question": "Retry it?", "reviewed": accepted}
         current = directory / "demo.json"
         _ = current.write_text("[]")
-        record = self.question_record(item, slug="demo")
+        record = self.question_record(item, name="demo")
         with mock.patch.dict(os.environ, {"SHOWRUNNER_STATE_DIR": str(directory.parent)}):
-            self.assertIn(" ".join(accepted.split()), review.registered_questions(cutoff))
+            questions = review.registered_questions(cutoff)
+            assert isinstance(questions, list)
+            self.assertIn(" ".join(accepted.split()), questions)
             record.unlink()
             _ = current.write_text("[]")
             history = review.QuestionRegistration(time=datetime.now(timezone.utc).isoformat(),
                 text=item["text"], question=item["question"], reviewed=accepted)
             _ = current.with_suffix(".history.jsonl").write_text(json.dumps(history) + "\n")
-            self.assertIn(" ".join(accepted.split()), review.registered_questions(cutoff))
+            questions = review.registered_questions(cutoff)
+            assert isinstance(questions, list)
+            self.assertIn(" ".join(accepted.split()), questions)
 
     def test_sample_matches_registered_asks_without_matching_their_choice_lines(self) -> None:
         question = "Would you retry the build?"
@@ -774,7 +793,7 @@ class LocalReviewTests(unittest.TestCase):
         registration.parent.mkdir(parents=True)
         item = {"since": "2026-10-13T10:00", "text": "Run check", "question": question, "reviewed": question}
         _ = registration.write_text("[]")
-        record = self.question_record(item, slug="build")
+        record = self.question_record(item, name="build")
         draft = review.Draft("review.sample", "0", "", NoActionRequired(), "The build passed.", False)
         for closed in (False, True):
             with self.subTest(closed=closed):
@@ -1251,7 +1270,7 @@ class LocalReviewTests(unittest.TestCase):
             {"rule": "reader-starts-cold", "quote": "Not in the original"}])), review.Approved)
 
     def test_a_body_that_gives_a_second_action_fails_push_one_action(self) -> None:
-        action = ActionRequired("On natedev, in the tile pane, approve the prompt or add an allow rule")
+        action = ActionRequired("On natedev, in the tile pane, type: Go: run the refused command")
         draft = review.Draft("writer one", "1", "tile waits for you", action,
                              "Auto mode refused 1 command in tile. Type ! kill -TERM -3137969 in the cargo-liner session.", True)
         result = review.validate(verdict(draft), draft, False)
@@ -1514,6 +1533,19 @@ class LocalReviewTests(unittest.TestCase):
     def hold_file(self) -> Path:
         digest = hashlib.sha256(self.draft.source.encode()).hexdigest()[:16]
         return self.root / "state/held" / (digest + ".json")
+
+    def test_question_reference_survives_rewrite_and_the_held_record(self) -> None:
+        reference = push_reference.QuestionReference(kind="question", path=str(self.root / "question.md"), since="2026-11-03T12:00")
+        self.draft = replace(self.draft, reference=reference)
+        held = self.held()
+        with mock.patch.object(review, "schedule"):
+            review.hold(held)
+        found = review.held_for(held.source)
+        self.assertIsInstance(found, review.LiveHold)
+        assert isinstance(found, review.LiveHold)
+        self.assertEqual(found.hold.draft.reference, reference)
+        self.assertEqual(found.hold.best_version.reference, reference)
+        self.assertEqual(review.draft_record(found.hold.best_version).get("reference"), reference)
 
     def test_hold_round_trip_uses_source_hash_and_schedules_due(self) -> None:
         held = self.held()
@@ -1847,6 +1879,7 @@ class MigratedQuestionTests(RegistrationFixture):
         cutoff = datetime.fromisoformat("2026-10-12T00:00:00+00:00")
         with mock.patch.dict(os.environ, self.env), production_paths(self.env):
             questions = review.registered_questions(cutoff)
+        assert isinstance(questions, list)
         self.assertIn("Which compiler should we use?", questions)
         self.assertFalse(self.outstanding().exists())
 

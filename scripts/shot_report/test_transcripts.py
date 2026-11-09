@@ -5,7 +5,6 @@ from __future__ import annotations
 import json
 import pickle
 import subprocess
-import sys
 import tempfile
 import unittest
 from dataclasses import asdict, replace
@@ -1166,7 +1165,7 @@ class TranscriptTest(unittest.TestCase):
             state_dir = Path(directory)
             result = subprocess.run(
                 [
-                    sys.executable, str(Path(__file__).parent / "shot_report.py"), "scan",
+                    str(Path(__file__).resolve().parents[1] / "lib/py"), str(Path(__file__).parent / "shot_report.py"), "scan",
                     "--state-dir", str(state_dir),
                     "--claude-root", str(CLASSIFY / "claude" / "projects"),
                     "--codex-root", str(CLASSIFY / "codex" / "sessions"),
@@ -1715,45 +1714,46 @@ class TranscriptTest(unittest.TestCase):
             ("/tmp/front.png",), ("/tmp/side.png",), ("/tmp/string.png",),
         ])
 
-    def test_mesh_message_cites_shot_without_read_only_command_citation(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            claude_rows: list[dict[str, object]] = []
-            codex_rows: list[dict[str, object]] = []
-            for index, label in enumerate(("skip", "kept")):
-                seconds = index * 30
+    def test_outgoing_message_cites_shot_without_read_only_command_citation(self) -> None:
+        for command in ("send.py --to worker --text", "codex_mesh.py send --message"):
+            with self.subTest(command=command), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                claude_rows: list[dict[str, object]] = []
+                codex_rows: list[dict[str, object]] = []
+                for index, label in enumerate(("skip", "kept")):
+                    seconds = index * 30
+                    claude_rows.extend((
+                        _claude_part(seconds, "claude-send", "assistant", {"type": "tool_use", "id": label,
+                            "name": "mcp__brp__brp_extras_screenshot", "input": {}}),
+                        _claude_part(seconds + 5, "claude-send", "user", {"type": "tool_result",
+                            "tool_use_id": label, "content": f"saved /tmp/claude-{label}.png"}),
+                    ))
+                    codex_rows.extend((
+                        _codex_part(seconds, {"type": "function_call", "name": "exec_command", "call_id": label,
+                            "arguments": json.dumps({"cmd": "python3 hana_shot.py shot --view front"})}),
+                        _codex_part(seconds + 5, {"type": "function_call_output", "call_id": label,
+                            "output": f"saved /tmp/codex-{label}.png"}),
+                    ))
                 claude_rows.extend((
-                    _claude_part(seconds, "claude-mesh", "assistant", {"type": "tool_use", "id": label,
-                        "name": "mcp__brp__brp_extras_screenshot", "input": {}}),
-                    _claude_part(seconds + 5, "claude-mesh", "user", {"type": "tool_result",
-                        "tool_use_id": label, "content": f"saved /tmp/claude-{label}.png"}),
+                    _claude_part(70, "claude-send", "assistant", {"type": "tool_use", "id": "read",
+                        "name": "Bash", "input": {"command": "ls /tmp/claude-skip.png"}}),
+                    _claude_part(80, "claude-send", "assistant", {"type": "tool_use", "id": "send",
+                        "name": "Bash", "input": {"command": f"python3 {command} 'Use /tmp/claude-kept.png'"}}),
                 ))
                 codex_rows.extend((
-                    _codex_part(seconds, {"type": "function_call", "name": "exec_command", "call_id": label,
-                        "arguments": json.dumps({"cmd": "python3 hana_shot.py shot --view front"})}),
-                    _codex_part(seconds + 5, {"type": "function_call_output", "call_id": label,
-                        "output": f"saved /tmp/codex-{label}.png"}),
+                    _codex_part(70, {"type": "function_call", "name": "exec_command", "call_id": "copy",
+                        "arguments": json.dumps({"cmd": "cp /tmp/codex-skip.png /tmp/copy.png"})}),
+                    _codex_part(80, {"type": "function_call", "name": "exec_command", "call_id": "send",
+                        "arguments": json.dumps({"cmd": f"python3 {command} 'Use /tmp/codex-kept.png'"})}),
                 ))
-            claude_rows.extend((
-                _claude_part(70, "claude-mesh", "assistant", {"type": "tool_use", "id": "read",
-                    "name": "Bash", "input": {"command": "ls /tmp/claude-skip.png"}}),
-                _claude_part(80, "claude-mesh", "assistant", {"type": "tool_use", "id": "send",
-                    "name": "Bash", "input": {"command": "python3 codex_mesh.py send --message 'Use /tmp/claude-kept.png'"}}),
-            ))
-            codex_rows.extend((
-                _codex_part(70, {"type": "function_call", "name": "exec_command", "call_id": "copy",
-                    "arguments": json.dumps({"cmd": "cp /tmp/codex-skip.png /tmp/copy.png"})}),
-                _codex_part(80, {"type": "function_call", "name": "exec_command", "call_id": "send",
-                    "arguments": json.dumps({"cmd": "python3 codex_mesh.py send --message 'Use /tmp/codex-kept.png'"})}),
-            ))
-            _fixture_rows(root / "claude" / "mesh.jsonl", claude_rows)
-            _fixture_rows(root / "codex" / "mesh.jsonl", codex_rows)
-            calls = scan_calls(root / "claude", root / "codex")
-        cited = {(call.agent, path): call.cited_image_paths for call in calls for path in call.image_paths}
-        self.assertEqual(cited[("Claude", "/tmp/claude-skip.png")], ())
-        self.assertEqual(cited[("Claude", "/tmp/claude-kept.png")], ("/tmp/claude-kept.png",))
-        self.assertEqual(cited[("Codex", "/tmp/codex-skip.png")], ())
-        self.assertEqual(cited[("Codex", "/tmp/codex-kept.png")], ("/tmp/codex-kept.png",))
+                _fixture_rows(root / "claude" / "send.jsonl", claude_rows)
+                _fixture_rows(root / "codex" / "send.jsonl", codex_rows)
+                calls = scan_calls(root / "claude", root / "codex")
+            cited = {(call.agent, path): call.cited_image_paths for call in calls for path in call.image_paths}
+            self.assertEqual(cited[("Claude", "/tmp/claude-skip.png")], ())
+            self.assertEqual(cited[("Claude", "/tmp/claude-kept.png")], ("/tmp/claude-kept.png",))
+            self.assertEqual(cited[("Codex", "/tmp/codex-skip.png")], ())
+            self.assertEqual(cited[("Codex", "/tmp/codex-kept.png")], ("/tmp/codex-kept.png",))
 
     def test_two_invocations_in_one_tool_call_keep_attempt_order(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

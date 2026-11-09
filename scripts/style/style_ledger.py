@@ -1,7 +1,11 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
 """Store style judgments and derive coverage at a repository's synced tip."""
 
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import argparse
 import fcntl
@@ -28,30 +32,33 @@ from pathlib import Path, PurePosixPath
 from types import TracebackType
 from typing import Concatenate, Literal, TypedDict, cast
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "production"))
-from issues import Issue, frontmatter
+from scripts.production.issues import Issue, frontmatter
+from scripts.lib.atomic_file import write_text_atomic
+from scripts.lib.git_blob import git_blob_id
+from scripts.production import staff, session_staff
 
-from git_process import (CheckCouldNotRun as CheckCouldNotRun, GitReadFailed as GitReadFailed,
-                         LedgerError as LedgerError, GitExitAnswers, SUCCESS_ONLY, run_git)
+from scripts.style.git_process import (CheckCouldNotRun as CheckCouldNotRun, GitReadFailed as GitReadFailed,
+                         LedgerError as LedgerError, GitExitAnswers, SUCCESS_ONLY, run_git,
+                         TreeEntry as TreeEntry, parse_tree_listing, blob_contents as blob_contents)
 
-import rules as rule_catalog
-import style_footprint
-import declarations
-import finding_sites
-from finding_sites import (FilingEligibleWithoutHistory as FilingEligibleWithoutHistory,
+from scripts.style import rules as rule_catalog
+from scripts.style import style_footprint
+from scripts.style import declarations
+from scripts.style import finding_sites
+from scripts.style.finding_sites import (FilingEligibleWithoutHistory as FilingEligibleWithoutHistory,
                            FindingAnchor as FindingAnchor, NeedsJudgment as NeedsJudgment,
                            RenameJudgmentSite as RenameJudgmentSite,
                            SiteEvidence as SiteEvidence, UnchangedSite as UnchangedSite)
-import style_rules
-import approved_renames
-from approved_renames import (AppliedCheck, AppliedInCode, ApprovedRename, BindingProof, BindingRename, FileRename, Folder, MissingFile,
+from scripts.style import style_rules
+from scripts.style import approved_renames
+from scripts.style.approved_renames import (AppliedCheck, AppliedInCode, ApprovedRename, BindingProof, BindingRename, FileRename, Folder, MissingFile,
                               NoAppliedCheck, NoOuterBindingBlock, OuterBindingBlocked as OuterBindingBlocked, OuterBindingUnproved as OuterBindingUnproved, RenameNotApplied, applied_check,
                               approved_rename, binding_rename, binding_rename_check, binding_admission_check, file_rename)
-from candidate_generators import enumerate_candidates
-from declarations import (BlockScopedImpl, Declaration, DeclaredFile, DeclaredItem, FileLevelImpl, ImplementedTrait, ImplOrTraitItem,
+from scripts.style.candidate_generators import enumerate_candidates
+from scripts.style.declarations import (BlockScopedImpl, Declaration, DeclaredFile, DeclaredItem, FileLevelImpl, ImplementedTrait, ImplOrTraitItem,
                           ImplPosition, UnprovedImplPosition,
                           NoImplementedTrait, TraitMembership, UnreadableImplementedTrait, moved_site_line, read_declarations)
-from rules import Family, InputScope, MemberReach, Rule, Tier
+from scripts.style.rules import Family, InputScope, MemberReach, Rule, Tier
 
 
 @dataclass(frozen=True)
@@ -76,6 +83,7 @@ LintTool = Literal["clippy", "mend", "rustfmt"]
 ProcessedTipReason = Literal["linted", "own hand-off"]
 # How long every ledger connection waits for another writer's lock before it fails.
 BUSY_TIMEOUT_SECONDS = 30
+TICKET_NUMBER = re.compile(r"[1-9][0-9]*")
 FINDING_REPLACEMENT_GUIDANCE = (
     "The After text replaces the whole Before span. Supply the full replacement, never the old wording with a new line added. "
     + "Rewrite a comment to name the constructs and keep every reason."
@@ -188,12 +196,6 @@ def retry_on_change[T](attempt: Callable[[], T]) -> T:
         except ChangedBeforeLock:
             continue
     return attempt()
-
-
-@dataclass(frozen=True)
-class UnitRenamed:
-    tickets: int
-    waits: int
 
 
 @dataclass(frozen=True)
@@ -1764,15 +1766,6 @@ class LintCoverage:
     rule_blobs: dict[str, str]
 
 
-@dataclass(frozen=True)
-class TreeEntry:
-    """One `git ls-tree -r` entry: a blob, or a submodule's `commit`."""
-
-    mode: str
-    kind: str
-    object: str
-
-
 # A symlink is a blob too, but its content is a path, not Rust.
 REGULAR_FILE_MODES = ("100644", "100755")
 
@@ -1863,15 +1856,7 @@ def _is_ignored(path: str, patterns: tuple[str, ...]) -> bool:
 
 def tree_entries(repo: Path, revision: str) -> dict[str, TreeEntry]:
     """Read the complete inventory of a commit or bare tree, retaining modes and object kinds."""
-    listing = _git(repo, "ls-tree", "-rz", "--full-tree", revision)
-    entries: dict[str, TreeEntry] = {}
-    for entry in listing.split("\0"):
-        if not entry:
-            continue
-        metadata, path = entry.split("\t", 1)
-        mode, kind, name = metadata.split()
-        entries[path] = TreeEntry(mode, kind, name)
-    return entries
+    return parse_tree_listing(_git(repo, "ls-tree", "-rz", "--full-tree", revision))
 
 
 def _tip(repo: Path, commit: str) -> RepositoryTip:
@@ -1890,23 +1875,6 @@ def _tip(repo: Path, commit: str) -> RepositoryTip:
             ignored.extend(_ignored_paths(_table(tomllib.loads(contents[config]))))
     files = tuple(sorted(path for path in blobs if path.endswith(".rs") and not _is_ignored(path, tuple(ignored))))
     return RepositoryTip(commit, tree, blobs, directories, files, entries)
-
-
-def blob_contents(repo: Path, blobs: Mapping[str, str]) -> Iterator[tuple[str, bytes]]:
-    """Each path of blobs with the bytes of its blob, read by one `git cat-file --batch`."""
-    with tempfile.TemporaryFile() as contents:
-        command = ("git", "-C", str(repo), "cat-file", "--batch")
-        _ = run_git(command, input="".join(f"{blob}\n" for blob in blobs.values()).encode(), output=contents)
-        _ = contents.seek(0)
-        for path, blob in blobs.items():
-            header = contents.readline().split()
-            if len(header) != 3 or header[:2] != [blob.encode(), b"blob"]:
-                raise GitReadFailed(command, 0, f"{path}: invalid Git blob response")
-            size = int(header[2])
-            content = contents.read(size)
-            if len(content) != size or contents.read(1) != b"\n":
-                raise GitReadFailed(command, 0, f"{path}: incomplete Git blob response")
-            yield path, content
 
 
 def _export_blobs(repo: Path, tip: RepositoryTip, export: Path) -> None:
@@ -2283,6 +2251,13 @@ MIGRATIONS = {
             finding_ids TEXT NOT NULL, corrected_at TEXT NOT NULL
         );
     """,
+    36: """
+        CREATE TABLE ticket_counter (id INTEGER PRIMARY KEY CHECK(id=1), value INTEGER NOT NULL);
+        INSERT INTO ticket_counter SELECT 1,coalesce(max(cast(id AS INTEGER)),0) FROM tickets
+            WHERE id NOT GLOB '*[^0-9]*' AND id!='';
+    """,
+    # Assignment checks hold the write lock; batch tickets can share their showrunner.
+    37: "DROP INDEX IF EXISTS tickets_one_assigned;",
     33: """
         CREATE TABLE IF NOT EXISTS rename_outer_binding_blocks (
             finding_id TEXT PRIMARY KEY, name TEXT NOT NULL, line INTEGER NOT NULL, text TEXT NOT NULL
@@ -2367,9 +2342,42 @@ class LedgerAccess(StrEnum):
     HELD_CORRECTION_PREVIEW = "preview clean-to-held correction without migration or writes"
 
 
+def ticket_holder(reference: str, record: staff.StaffSnapshot) -> staff.StaffRow:
+    """Resolve a ticket's fixed staff id without matching a name or current session."""
+    row = record.by_id(staff.StaffId(reference))
+    if row is None or row.kind not in ("unit", "showrunner"):
+        raise LedgerError(f"{reference}: staff ticket ownership is unavailable")
+    return row
+
+
+def command_ticket_holder(reference: str, ledger: Ledger) -> staff.StaffRow:
+    """Resolve a command name inside this ledger's style production."""
+    record = ledger.staff_resolver().record
+    row = record.by_id(staff.StaffId(reference))
+    if row is not None:
+        return ticket_holder(reference, record)
+    from scripts.shutdown import remote
+
+    context = record.by_worktree(remote.local_machine(), ledger.repo)
+    if context is None:
+        owner = ledger.bulk_holder()
+    elif context.kind == "showrunner":
+        owner = context
+    else:
+        owner = record.parent_of(context)
+        if owner is None or owner.kind != "showrunner":
+            raise LedgerError(f"{reference}: the command worktree's production ownership is unavailable")
+    found = session_staff.unit_match(session_staff.UnitMember(owner.name, reference), record,
+                                    parent=session_staff.RequiredParent(owner))
+    if not isinstance(found, session_staff.MemberFound):
+        raise LedgerError(f"{reference}: staff ticket ownership is unavailable under {owner.name}")
+    return found.row
+
+
 class Ledger:
     def __init__(self, repo: Path, database: Path, *, git_cache: GitReadCache | NoGitReadCache = _NO_GIT_READ_CACHE,
-                 access: LedgerAccess = LedgerAccess.READ_WRITE) -> None:
+                 access: LedgerAccess = LedgerAccess.READ_WRITE,
+                 resolver: session_staff.RowResolver | None = None) -> None:
         self.repo: Path = repo
         self._git_operation_depth: int = 0
         self.database: Path = database
@@ -2411,6 +2419,7 @@ class Ledger:
         self._item_bodies: dict[tuple[str, str, DeclaredItem], declarations.ReadableBody | declarations.UnreadableBody] = {}
         if access == LedgerAccess.READ_WRITE:
             database.parent.mkdir(parents=True, exist_ok=True)
+        self._staff_resolver: session_staff.RowResolver | None = resolver
         self._connection: sqlite3.Connection = (
             sqlite3.connect(database.resolve().as_uri() + "?mode=ro", uri=True, timeout=BUSY_TIMEOUT_SECONDS)
             if access != LedgerAccess.READ_WRITE else sqlite3.connect(database, timeout=BUSY_TIMEOUT_SECONDS))
@@ -2658,6 +2667,10 @@ class Ledger:
             "removed": tuple(removed_cell(ticket_id, rule, path, commit) for rule, path, commit in removed),
         }
 
+    def ticket_get(self, ticket_id: str) -> TicketRecord:
+        """Read a ticket by its global id."""
+        return self._ticket(ticket_id)
+
     def _check_pin(self, ticket: str, rule: str, rule_blob: str) -> str:
         rows = cast(list[tuple[str, str]], self._connection.execute(
             "SELECT rule_blobs,state FROM tickets WHERE id=?", (ticket,)).fetchall())
@@ -2689,6 +2702,10 @@ class Ledger:
         *, batch_owner: BatchOwner | UnbatchedTicket = UNBATCHED_TICKET,
         proposals: tuple[Path, ...] = (),
     ) -> None:
+        holder = self.unit_row(unit)
+        if holder.kind == "showrunner" and (kind != "proposal" or not isinstance(batch_owner, BatchOwner)):
+            raise LedgerError("a showrunner holds only bulk proposal tickets")
+        unit = str(holder.id)
         if kind == "listed" and (not rule or rule not in rules or rule.endswith("#uncovered")):
             raise LedgerError(f"{id}: listed ticket requires its canonical rule in rules")
         if kind != "listed" and rule:
@@ -2719,8 +2736,10 @@ class Ledger:
                 if (previous["unit"], previous["kind"], previous["family"], previous["crate"], previous["files"], previous["rules"], previous["rule"], previous["sites"], previous["proposal"], previous["cells"], previous["finding_ids"]) != (unit, kind, family, crate, files, rules, rule, sites or [], proposal, [list(cell) for cell in cells], list(finding_ids)):
                     raise LedgerError(f"{id}: ticket already exists in state {previous['state']} with different fields")
                 return True
-            if not re.fullmatch(re.escape(unit) + r"-\d+", id):
-                raise LedgerError(f"{id}: ticket id must be {unit}-<n>")
+            if not TICKET_NUMBER.fullmatch(id):
+                raise LedgerError(f"{id}: ticket id must be a positive decimal number")
+            if self._connection.execute("SELECT 1 FROM tickets WHERE id GLOB '*[^0-9]*' LIMIT 1").fetchone():
+                raise LedgerError("legacy ticket ids remain; run migrate-staff-ids before creating tickets")
             if kind == "proposal":
                 findings = tuple(self._held(finding_id) for finding_id in finding_ids)
                 if not proposal or not findings:
@@ -2754,8 +2773,7 @@ class Ledger:
             texts: list[PinnedRuleText] = []
             for rule_id, definition in definitions.items():
                 text = definition.path.read_bytes()
-                result = _git_bytes(self.repo, "hash-object", "--stdin", input=text)
-                hashed = result.stdout.decode().strip()
+                hashed = git_blob_id(text)
                 if hashed != definition.blob:
                     raise ChangedBeforeLock(f"{rule_id}: rule changed while pinning; rerun")
                 texts.append(PinnedRuleText(rule_id, hashed, text))
@@ -2807,18 +2825,235 @@ class Ledger:
         return tuple(texts)
 
     def queued_tickets(self, unit: str) -> tuple[TicketRecord, ...]:
+        unit = str(self.unit_row(unit).id)
         rows = cast(list[tuple[str]], self._connection.execute(
             "SELECT id FROM tickets WHERE unit=? AND state='queued' ORDER BY created_at,id", (unit,),
         ).fetchall())
         return tuple(self._ticket(row[0]) for row in rows)
 
-    def next_ticket_id(self, unit: str) -> str:
-        rows = cast(list[tuple[str]], self._connection.execute(
-            "SELECT id FROM tickets WHERE substr(id,1,?)=?", (len(unit) + 1, unit + "-"),
+    def staff_resolver(self) -> session_staff.RowResolver:
+        """Share one staff snapshot across the ledger command."""
+        if self._staff_resolver is None:
+            self._staff_resolver = session_staff.RowResolver(staff.snapshot())
+        return self._staff_resolver
+
+    def unit_row(self, reference: str) -> staff.StaffRow:
+        """Resolve a ticket holder through the staff join."""
+        return ticket_holder(reference, self.staff_resolver().record)
+
+    def bulk_holder(self) -> staff.StaffRow:
+        """Resolve the style production's showrunner through the command's staff resolver."""
+        from scripts.production.production_doc import Refusal, production_field
+        from scripts.shutdown import remote
+
+        resolver = self.staff_resolver()
+        common = _git(self.repo, "rev-parse", "--path-format=absolute", "--git-common-dir")
+        holders: list[staff.StaffRow] = []
+        for row in resolver.record.find(kind="showrunner"):
+            if not isinstance(row.doc, staff.LiveDoc) or row.doc.machine != remote.local_machine():
+                continue
+            document = resolver.production_doc(row)
+            if not isinstance(document, session_staff.ProductionDoc):
+                raise LedgerError(f"{row.name}: the production document is unavailable")
+            try:
+                kind = production_field(document.path.read_text().splitlines(), "Kind")
+            except Refusal:
+                continue
+            if kind == "style" and _git(document.path.parent, "rev-parse", "--path-format=absolute", "--git-common-dir") == common:
+                holders.append(row)
+        if len(holders) != 1:
+            raise LedgerError("the style production's showrunner ownership is unavailable or ambiguous")
+        return holders[0]
+
+    def unit_name(self, reference: str) -> str:
+        return self.unit_row(reference).name
+
+    def migrate_staff_ids(self, *, references: tuple[Path, ...] = (),
+                          stop_after_first: bool = False) -> tuple[str, ...]:
+        """Publish ticket references before replacing ledger keys; never change staff."""
+        with self._connection:
+            _ = self._connection.execute("BEGIN IMMEDIATE")
+            return self._migrate_staff_ids(references, stop_after_first)
+
+    def _migration_owners(self, *, report: bool = True) -> dict[str, str]:
+        """Resolve proven legacy owners and keep unavailable owner text unchanged."""
+        record = self.staff_resolver().record
+        owners: dict[str, str] = {}
+        rows = cast(list[tuple[str, int, int]], self._connection.execute(
+            "SELECT t.unit,count(*),count(b.ticket) FROM tickets t "
+            + "LEFT JOIN ticket_batch_owners b ON b.ticket=t.id GROUP BY t.unit",
         ).fetchall())
-        highest = max((int(row[0][len(unit) + 1:]) for row in rows
-                       if re.fullmatch(re.escape(unit) + r"-\d+", row[0])), default=0)
-        return f"{unit}-{highest + 1}"
+        references = {reference: count == batched for reference, count, batched in rows}
+        for table in ("sync_waits", "rule_candidates"):
+            for (reference,) in cast(list[tuple[str]], self._connection.execute(
+                    f'SELECT DISTINCT unit FROM "{table}"').fetchall()):
+                _ = references.setdefault(reference, False)
+        for reference, bulk_label in references.items():
+            row = record.by_member_reference(reference)
+            try:
+                if row is None:
+                    found = session_staff.unit_match(session_staff.ObservedUnit(reference), record)
+                    row = found.row if isinstance(found, session_staff.MemberFound) else None
+                if row is None and bulk_label:
+                    row = self.bulk_holder()
+                if row is None or row.kind not in ("unit", "showrunner"):
+                    raise LedgerError(f"{reference}: staff ticket ownership is unavailable")
+            except (LedgerError, staff.StaffUnreadable) as error:
+                owners[reference] = reference
+                if report:
+                    print(f"anomaly: {reference}: " + " ".join(str(error).splitlines()))
+            else:
+                owners[reference] = str(row.id)
+        return owners
+
+    def _migrate_staff_ids(self, references: tuple[Path, ...], stop_after_first: bool) -> tuple[str, ...]:
+        # A migration cannot reuse ownership from before a clear or a rename.
+        self._staff_resolver = None
+        tickets = cast(list[tuple[str, str]], self._connection.execute(
+            "SELECT id,unit FROM tickets ORDER BY created_at,id",
+        ).fetchall())
+        highest = max((int(ticket[0]) for ticket in tickets if TICKET_NUMBER.fullmatch(ticket[0])), default=0)
+        counter = cast(tuple[int], self._connection.execute("SELECT value FROM ticket_counter WHERE id=1").fetchone())
+        highest = max(highest, counter[0])
+        identities: dict[str, str] = {}
+        owners = self._migration_owners()
+        for identity, _owner in tickets:
+            if not TICKET_NUMBER.fullmatch(identity):
+                highest += 1
+                identities[identity] = str(highest)
+        groups: dict[str, list[str]] = {}
+        for ticket, batch in cast(list[tuple[str, str]], self._connection.execute(
+                "SELECT ticket,batch FROM bulk_workspace_tickets").fetchall()):
+            groups.setdefault(batch, []).append(ticket)
+        batches = {batch: min(identities.get(ticket, ticket) for ticket in members)
+                   for batch, members in groups.items()}
+        if (not identities and all(old == new for old, new in owners.items())
+                and all(old == new for old, new in batches.items())):
+            return ()
+        changes: list[str] = []
+        paths = set(references)
+        if identities:
+            from scripts.direct import phase_reservation
+
+            for session_dir, phase in cast(list[tuple[str, str]], self._connection.execute(
+                    "SELECT DISTINCT reservation_session_dir,reservation_phase FROM tickets "
+                    + "WHERE reservation_session_dir!=''").fetchall()):
+                path = phase_reservation.phase_directory(Path(session_dir), phase) / phase_reservation.STATE_FILE
+                if path.exists():
+                    paths.add(path)
+            # These files belong to this ledger, rather than a guessed unit folder.
+            paths.update((self.database.parent / "bulk_review").glob("*.json"))
+            if not references:
+                from scripts.shutdown import remote
+                from scripts.production import unit_config
+
+                for identity in sorted(set(owners.values())):
+                    if self.staff_resolver().record.by_id(staff.StaffId(identity)) is None:
+                        continue
+                    row = self.unit_row(identity)
+                    resolver = self.staff_resolver()
+                    if row.kind == "showrunner":
+                        document = resolver.production_doc(row)
+                        if not isinstance(document, session_staff.ProductionDoc):
+                            raise LedgerError(f"{row.name}: migration references unavailable: {document}")
+                        if document.machine != remote.local_machine():
+                            raise LedgerError(f"{row.name}: migrate references on {document.machine}")
+                        paths.add(document.path)
+                        for line in _git(self.repo, "worktree", "list", "--porcelain").splitlines():
+                            if line.startswith("worktree "):
+                                intent = Path(_git(Path(line.removeprefix("worktree ")), "rev-parse",
+                                                   "--path-format=absolute", "--git-path", "style-batch-intent.json"))
+                                if intent.exists():
+                                    paths.add(intent)
+                        continue
+                    tree = resolver.unit_worktree(row)
+                    config = resolver.unit_config(row)
+                    if not isinstance(tree, (staff.PresentWorktree, staff.RemovedWorktree)):
+                        raise LedgerError(f"{row.name}: migration references unavailable: no worktree")
+                    if tree.machine != remote.local_machine():
+                        raise LedgerError(f"{row.name}: migrate references on {tree.machine}")
+                    if not isinstance(config, unit_config.UnitConfig):
+                        raise LedgerError(f"{row.name}: migration references unavailable: {config}")
+                    if isinstance(config.plan, unit_config.PlanFile):
+                        paths.add(tree.path / config.plan.path)
+                    intent = Path(_git(tree.path, "rev-parse", "--path-format=absolute", "--git-path", "style-batch-intent.json"))
+                    if intent.exists():
+                        paths.add(intent)
+        pattern = (re.compile(r"(?<![\w-])(?:" + "|".join(re.escape(key) for key in sorted(identities, key=len, reverse=True))
+                              + r")(?![\w-])") if identities else None)
+        for path in sorted(paths):
+            original = path.read_text(encoding="utf-8")
+            content = pattern.sub(lambda match: identities[match.group()], original) if pattern is not None else original
+            target = path
+            if path.parent == self.database.parent / "bulk_review" and path.stem in identities:
+                target = path.with_stem(identities[path.stem])
+            if content != original or target != path:
+                # Check the current owner before each reference publication.
+                self._check_migration_owners(owners)
+                if target != path and target.exists() and target.read_text(encoding="utf-8") != content:
+                    raise LedgerError(f"{target}: migration target has different content")
+                if not target.exists() or target.read_text(encoding="utf-8") != content:
+                    write_text_atomic(target, content)
+                if target != path:
+                    from scripts.lib.atomic_file import sync_folder
+
+                    path.unlink()
+                    sync_folder(path.parent)
+                changes.append(str(path))
+                if stop_after_first:
+                    return tuple(changes)
+        self._check_migration_owners(owners)
+        with self._connection:
+            _ = self._connection.execute("PRAGMA defer_foreign_keys=ON")
+            if cast(list[tuple[str, str]], self._connection.execute(
+                    "SELECT id,unit FROM tickets ORDER BY created_at,id").fetchall()) != tickets:
+                raise LedgerError("tickets changed; rerun the migration")
+            tables = cast(list[tuple[str]], self._connection.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'",
+            ).fetchall())
+            for (table,) in tables:
+                quoted = '"' + table.replace('"', '""') + '"'
+                columns = cast(list[tuple[int, str]], self._connection.execute(f"PRAGMA table_info({quoted})").fetchall())
+                for column in (entry[1] for entry in columns):
+                    if column == "unit" and table in ("tickets", "sync_waits", "rule_candidates"):
+                        mapping = owners
+                    elif (column in ("ticket", "build_ticket", "predecessor", "successor")
+                          or (table == "tickets" and column == "id")
+                          or (table == "bulk_workspace_tickets" and column == "batch")):
+                        mapping = identities
+                    else:
+                        continue
+                    for old, new in mapping.items():
+                        if old != new:
+                            _ = self._connection.execute(f'UPDATE {quoted} SET "{column}"=? WHERE "{column}"=?', (new, old))
+            for batch, members in groups.items():
+                for ticket in members:
+                    _ = self._connection.execute("UPDATE bulk_workspace_tickets SET batch=? WHERE ticket=? AND batch!=?",
+                        (batches[batch], identities.get(ticket, ticket), batches[batch]))
+            _ = self._connection.execute("UPDATE ticket_counter SET value=max(value,?) WHERE id=1", (highest,))
+            for old, new in identities.items():
+                _ = self._connection.execute(
+                    "UPDATE held_findings SET waived_by=? WHERE waived_by=? AND waive_provenance='unit'", (new, old),
+                )
+        changes.append(str(self.database))
+        return tuple(changes)
+
+    def _check_migration_owners(self, owners: Mapping[str, str]) -> None:
+        self._staff_resolver = None
+        if self._migration_owners(report=False) != owners:
+            raise LedgerError("staff ownership changed; rerun the migration")
+
+    def next_ticket_id(self) -> str:
+        """Reserve one number across every unit in this ledger."""
+        with self._connection:
+            _ = self._connection.execute("BEGIN IMMEDIATE")
+            if self._connection.execute("SELECT 1 FROM tickets WHERE id GLOB '*[^0-9]*' LIMIT 1").fetchone():
+                raise LedgerError("legacy ticket ids remain; run migrate-staff-ids before creating tickets")
+            row = cast(tuple[int], self._connection.execute(
+                "UPDATE ticket_counter SET value=max(value,coalesce((SELECT max(cast(id AS INTEGER)) "
+                + "FROM tickets WHERE id NOT GLOB '*[^0-9]*' AND id!=''),0))+1 WHERE id=1 RETURNING value",
+            ).fetchone())
+        return str(row[0])
 
     def _ticket_cells(self, ticket: TicketRecord) -> frozenset[tuple[str, str]]:
         """The rule and path cells the ticket owns, less the paths it yielded."""
@@ -3461,7 +3696,7 @@ class Ledger:
         if (target == "dropped" and state in ("merged", "dropped")) or (target != "dropped" and predecessor.get(target) != state):
             raise LedgerError(f"{ticket['id']}: cannot become {target} from {state}")
         if target == "assigned":
-            active = self.ticket_open(ticket["unit"])
+            active = self._assignment_predecessors(ticket)
             if active and (len(active) != 1 or active[0]["state"] != "checkpointed"):
                 raise LedgerError(f"{ticket['id']}: unit {ticket['unit']} already has {active[0]['id']} in state {active[0]['state']}")
         if target == "merged":
@@ -3472,6 +3707,13 @@ class Ledger:
             if rows:
                 raise LedgerError(f"{ticket['id']}: waiting for predecessor {rows[0][0]} to merge")
         return False
+
+    def _assignment_predecessors(self, ticket: TicketRecord) -> tuple[TicketRecord, ...]:
+        """Bulk tickets share a holder; ordinary tickets keep the unit's assignment order."""
+        if (isinstance(self.ticket_batch_owner(ticket["id"]), BatchOwner)
+                and self.unit_row(ticket["unit"]).kind == "showrunner"):
+            return ()
+        return self.ticket_open(ticket["unit"])
 
     def _ticket_transition(self, id: str, target: TicketState, commit: str = "", branch: str = "",
                            reservation: tuple[str, str] = ("", ""), *,
@@ -3511,7 +3753,7 @@ class Ledger:
                     raise
                 except LedgerError as error:
                     raise LedgerError(f"{id}: cannot assign: invalid branch {branch}") from error
-                active = self.ticket_open(ticket["unit"])
+                active = self._assignment_predecessors(ticket)
                 if active:
                     try:
                         assignment_tip = _git(self.repo, "rev-parse", "--verify", f"{branch}^{{commit}}")
@@ -3594,7 +3836,7 @@ class Ledger:
                         (_now(), id),
                     )
                 if target == "assigned":
-                    active = self.ticket_open(ticket["unit"])
+                    active = self._assignment_predecessors(ticket)
                     if active:
                         _ = self._connection.execute("INSERT INTO ticket_predecessors VALUES (?,?)", (id, active[0]["id"]))
                         _ = self._connection.execute("UPDATE tickets SET base=? WHERE id=?", (assignment_tip, id))
@@ -3915,39 +4157,15 @@ class Ledger:
         return HeldReservationRelease(f"ticket {id}: {answer or f'phase_reservation.py exited {result.returncode}'}",
                                       result.returncode != 0)
 
-    def rename_unit(self, old: str, new: str) -> UnitRenamed:
-        family = rule_catalog.style_family(old)
-        if isinstance(family, rule_catalog.NotStyleUnit) or family != rule_catalog.style_family(new):
-            raise LedgerError(f"{old} -> {new}: units must name the same style family")
-        if old == new:
-            return UnitRenamed(0, 0)
-        with self._connection:
-            _ = self._connection.execute("BEGIN IMMEDIATE")
-            source = cast(tuple[int, int], self._connection.execute(
-                "SELECT (SELECT count(*) FROM tickets WHERE unit=? AND state IN ('queued','assigned','checkpointed')), "
-                + "(SELECT count(*) FROM sync_waits WHERE unit=?)", (old, old),
-            ).fetchone())
-            if not any(source):
-                return UnitRenamed(0, 0)
-            target = cast(tuple[int, int], self._connection.execute(
-                "SELECT EXISTS(SELECT 1 FROM tickets WHERE unit=? AND state IN ('queued','assigned','checkpointed')), "
-                + "EXISTS(SELECT 1 FROM sync_waits WHERE unit=?)", (new, new),
-            ).fetchone())
-            if any(target):
-                raise LedgerError(f"{new}: target unit already owns a current ticket or sync wait")
-            _ = self._connection.execute(
-                "UPDATE tickets SET unit=? WHERE unit=? AND state IN ('queued','assigned','checkpointed')", (new, old),
-            )
-            _ = self._connection.execute("UPDATE sync_waits SET unit=? WHERE unit=?", (new, old))
-            return UnitRenamed(*source)
-
     def wait_for_sync(self, unit: str) -> None:
+        unit = str(self.unit_row(unit).id)
         with self._connection:
             _ = self._connection.execute(
                 "INSERT INTO sync_waits VALUES (?,?,?) ON CONFLICT(unit) DO NOTHING", (unit, _now(), uuid.uuid4().hex),
             )
 
     def clear_sync_wait(self, unit: str) -> None:
+        unit = str(self.unit_row(unit).id)
         with self._connection:
             _ = self._connection.execute("DELETE FROM sync_waits WHERE unit=?", (unit,))
 
@@ -4015,7 +4233,15 @@ class Ledger:
             return
         _ = self._ticket_transition(id, "dropped", required_owner=owner)
 
+    def open_tickets(self) -> tuple[TicketRecord, ...]:
+        """Read all assigned and checkpointed tickets without requiring an owner filter."""
+        rows = cast(list[tuple[str]], self._connection.execute(
+            "SELECT id FROM tickets WHERE state IN ('assigned','checkpointed') ORDER BY created_at,id",
+        ).fetchall())
+        return tuple(self._ticket(row[0]) for row in rows)
+
     def ticket_open(self, unit: str) -> tuple[TicketRecord, ...]:
+        unit = str(self.unit_row(unit).id)
         rows = cast(list[tuple[str]], self._connection.execute(
             "SELECT id FROM tickets WHERE unit=? AND state IN ('assigned','checkpointed') ORDER BY created_at,id", (unit,),
         ).fetchall())
@@ -5536,8 +5762,9 @@ class Ledger:
             except UnicodeDecodeError:
                 self._site_rule_families[blob] = "unreadable"
                 continue
-            if match := re.search(r"(?m)^family:[ \t]*(names|values|types|modules)[ \t]*$", source):
-                self._site_rule_families[blob] = match[1]
+            family = rule_catalog.pinned_family(source)
+            if isinstance(family, str):
+                self._site_rule_families[blob] = family
         grouped: dict[tuple[str, str], list[Judgment]] = {}
         self._site_holding_rows.clear()
         self._inactive_site_holders = set(cast(list[tuple[str, str]], self._connection.execute(
@@ -6587,7 +6814,7 @@ class Ledger:
         tickets = cast(list[tuple[str, str, str, str]], self._connection.execute(
             "SELECT id,branch,state,checkpoint FROM tickets WHERE state IN ('assigned','checkpointed') "
             + "ORDER BY EXISTS(SELECT 1 FROM ticket_predecessors p JOIN tickets prev ON prev.id=p.predecessor "
-            + "WHERE p.ticket=tickets.id AND prev.state='checkpointed'),unit,length(id),id",
+            + "WHERE p.ticket=tickets.id AND prev.state='checkpointed'),state,unit,length(id),id",
         ).fetchall())
         for id, branch, state, checkpoint in tickets:
             with self.git_operation(f"ticket {id} reconcile"):
@@ -7306,9 +7533,10 @@ def ledger_location(repo: Path) -> LedgerLocation:
     return LedgerLocation(repo, state / main_repo.name / "ledger.sqlite")
 
 
-def open_ledger(repo: Path, *, access: LedgerAccess = LedgerAccess.READ_WRITE) -> Ledger:
+def open_ledger(repo: Path, *, access: LedgerAccess = LedgerAccess.READ_WRITE,
+                resolver: session_staff.RowResolver | None = None) -> Ledger:
     location = ledger_location(repo)
-    return Ledger(location.repo, location.database, access=access)
+    return Ledger(location.repo, location.database, access=access, resolver=resolver)
 
 
 def record_refill(repo: Path, unit: str, outcome: str) -> None:
@@ -7394,6 +7622,8 @@ def preview_ledger(repo: Path, *, git_cache: GitReadCache | NoGitReadCache = _NO
 class LedgerArguments(argparse.Namespace):
     command: str = ""
     dry_run: bool = False
+    stop_after_first: bool = False
+    references: list[Path] = []
     repo: str = ""
     rule: str = ""
     path: str = ""
@@ -7415,7 +7645,6 @@ class LedgerArguments(argparse.Namespace):
     action: str = ""
     id: str = ""
     unit: str = ""
-    from_unit: str = ""
     branch: str = ""
     kind: str = ""
     family: str = ""
@@ -7518,6 +7747,10 @@ def _wake_sync_waiters(repo: Path, ticket_id: str) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
+    migrate = commands.add_parser("migrate-staff-ids")
+    _ = migrate.add_argument("--repo", required=True)
+    _ = migrate.add_argument("--reference", dest="references", type=Path, action="append", default=[])
+    _ = migrate.add_argument("--stop-after-first", action="store_true")
     record = commands.add_parser("record")
     for field in ("rule", "path", "commit", "ticket", "worker"):
         _ = record.add_argument(f"--{field}", required=True)
@@ -7553,7 +7786,6 @@ def main() -> None:
     for command in (record, correction, candidate, lint, sync, status, summary, reconcile):
         _ = command.add_argument("--repo", required=True)
     for name, actions in (
-        ("unit", ("rename",)),
         ("ticket", ("add", "assign", "checkpoint", "restore-checkpoint", "merge", "drop", "open", "yield", "refuse")),
         ("handoff", ("add", "send", "reroute", "merged", "pending")),
         ("tip", ("seen", "done")),
@@ -7565,10 +7797,7 @@ def main() -> None:
         for action in actions:
             command = children.add_parser(action)
             _ = command.add_argument("--repo", default=argparse.SUPPRESS)
-            if name == "unit":
-                _ = command.add_argument("--from", dest="from_unit", required=True)
-                _ = command.add_argument("--to", required=True)
-            elif name == "ticket":
+            if name == "ticket":
                 if action == "open":
                     _ = command.add_argument("--unit", required=True)
                 else:
@@ -7647,12 +7876,12 @@ def main() -> None:
         access = (LedgerAccess.HELD_CORRECTION_PREVIEW
                   if args.command == "correct-clean-to-held" and args.dry_run else LedgerAccess.READ_WRITE)
         with open_ledger(Path(args.repo), access=access) as ledger:
-            if args.command == "correct-clean-to-held":
+            if args.command == "migrate-staff-ids":
+                changes = ledger.migrate_staff_ids(references=tuple(args.references), stop_after_first=args.stop_after_first)
+                print("\n".join(changes) if changes else "unchanged")
+            elif args.command == "correct-clean-to-held":
                 mode = HeldCellCorrectionMode.PREVIEW if args.dry_run else HeldCellCorrectionMode.APPLY
                 print(held_cell_correction_line(ledger.correct_clean_to_held(args.ticket, args.rule, args.path, mode=mode)))
-            elif args.command == "unit":
-                renamed = ledger.rename_unit(args.from_unit, args.to)
-                print(f"moved {renamed.tickets} tickets and {renamed.waits} sync waits")
             elif args.command == "set-tip":
                 ledger.set_tip(args.tip, args.style_branch)
             elif args.command == "record" and args.verdict == "removed":
@@ -7687,7 +7916,7 @@ def main() -> None:
                     print(change)
             elif args.command == "ticket":
                 if args.action == "add":
-                    ledger.ticket_add(args.id, args.unit, cast(TicketKind, args.kind), args.family, args.crate,
+                    ledger.ticket_add(args.id, str(command_ticket_holder(args.unit, ledger).id), cast(TicketKind, args.kind), args.family, args.crate,
                                       _json_strings(args.files), _json_strings(args.rules), args.rule, _json_sites(args.sites), args.proposal, _json_cells(args.cells), tuple(_json_strings(args.finding_ids)))
                 elif args.action == "assign":
                     ledger.ticket_assign(args.id, args.branch)
@@ -7714,7 +7943,7 @@ def main() -> None:
                     _ = ledger.ticket_refuse(args.id, args.finding, args.by or "", args.reason)
                     print(f"{args.id}: named findings refused; remaining findings kept")
                 else:
-                    for ticket in ledger.ticket_open(args.unit):
+                    for ticket in ledger.ticket_open(str(command_ticket_holder(args.unit, ledger).id)):
                         print(json.dumps(ticket, sort_keys=True))
             elif args.command == "handoff":
                 if args.action == "add":

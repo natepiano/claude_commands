@@ -3,15 +3,13 @@
 
 from __future__ import annotations
 
-import sys
 import tempfile
 import textwrap
 import unittest
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from berth.work_order import (  # noqa: E402
+from scripts.berth.work_order import (  # noqa: E402
     EveryWorkOrderSelection,
     ExactPhaseSelection,
     ValidatedWorkOrder,

@@ -1,6 +1,6 @@
 """Script phone texts and named cases reviewed before delivery."""
-from gpu_xid import XID_MEANINGS
-from push_texts import ActionTemplate, NoActionNeeded, PushExample, PushText, SessionTemplate, decision_values
+from scripts.notify.gpu_xid import XID_MEANINGS
+from scripts.notify.push_texts import ActionTemplate, NoActionNeeded, PushExample, PushText, SessionTemplate, decision_values
 
 # Codex usage destination: https://learn.chatgpt.com/docs/pricing (read 2026-10-14).
 # Real quota case: notify/review.jsonl, 2026-10-13T22:30:22.569264-04:00.
@@ -8,7 +8,37 @@ from push_texts import ActionTemplate, NoActionNeeded, PushExample, PushText, Se
 # typical cases use existing test facts or the Nix thresholds, never invented log citations.
 
 
+def mac_idle_reservation(holder: str, detail: str) -> str:
+    """The optional reservation sentence used as a catalog value."""
+    return (f'The Mac reservation lists holder "{holder}" and label "{detail}".'
+            if holder not in ("", "none") else "")
+
+
 ENTRIES = (
+    PushText("nightly.result", "nightly", "note", "Nightly check {outcome}", NoActionNeeded(),
+        "The nightly check of {branch} finished at {time}.\nType check: {types}.\nFull tests: {tests}.",
+        (PushExample("passed", {"branch": "main", "time": "03:53 EST", "outcome": "passed",
+                               "types": "passed", "tests": "passed"}),
+         PushExample("tests_failed", {"branch": "main", "time": "03:53 EST", "outcome": "failed",
+             "types": "passed", "tests": "failed in direct/test_simplify_lens.py, production/test_staff.py"}),
+         PushExample("types_failed", {"branch": "main", "time": "03:53 EST", "outcome": "failed",
+             "types": "failed with 3 errors, 1 warning, 0 notes", "tests": "passed"}),
+         PushExample("many_failed", {"branch": "main", "time": "03:53 EST", "outcome": "failed",
+             "types": "passed", "tests": "failed in direct/test_assign.py, direct/test_board.py, "
+             + "message/test_send.py, notify/test_review.py, production/test_staff.py, "
+             + "shutdown/test_restart.py, settings/test_settings.py, whoami/test_usage.py and 12 more"}),
+         PushExample("did_not_finish", {"branch": "main", "time": "03:53 EST", "outcome": "failed",
+                                       "types": "did not run", "tests": "did not finish"})),
+        purpose="The nightly check finished. It says which parts passed."),
+    PushText("nightly.not_run", "nightly", "note", "Nightly check did not run", ActionTemplate("{action}"),
+        "The nightly check of {branch} did not run at {time}.\nWhy: {reason}.",
+        (PushExample("fetch_failed", {"branch": "main", "time": "03:53 EST",
+             "reason": "git fetch of main failed: ssh connection timed out",
+             "action": "None. The next nightly run tries again."}),
+         PushExample("cold_credentials", {"branch": "main", "time": "03:53 EST",
+             "reason": "GitHub credentials are cold",
+             "action": "In a terminal on natedev, run github-warmup"})),
+        purpose="The nightly check did not run. It says why."),
     PushText("decision.choices", "{sender}", "decision", "{title}",
         ActionTemplate("On {machine}, reply in the {session} terminal: {choice_labels}."),
         "Situation: {situation}\n\nChoices:\n{choices}\n\n"
@@ -29,19 +59,27 @@ ENTRIES = (
         + "Recommendation: Acknowledge after you read the report.",
         (PushExample("report", {"session": "natedev", "machine": "natedev", "report": "12 of 12 phases that change the screen merged without the extra code reviewer: report ready, waiting for your acknowledgment"}),),
         purpose="A build report reminds you to acknowledge its review report.", session=SessionTemplate("{session}"), agent_written=True),
-    PushText("build_admission.down", "build-admission", "note", "Build admission service is down",
-        NoActionNeeded(), "build admission service is down; builds wait",
-        (PushExample("down", {}),), purpose="The service has not answered for two minutes."),
-    PushText("vault.stopped", "buildlog", "note", "Mac vault copy is not updating",
-        ActionTemplate("{action}"),
-        "The hourly job that updates the hanadocs vault on the Mac skipped it. {reason} It tries again each hour and sends no more alerts until an update works. Until then, the Mac copy stays out of date.",
-        (PushExample("tracked_changes", {"reason": "Some files in ~/rust/hanadocs on the Mac have changes that are not committed.", "action": "In a terminal on the Mac, commit or discard the changes in ~/rust/hanadocs."}),
-         PushExample("branch", {"reason": "~/rust/hanadocs on the Mac is not on the main branch.", "action": "In a terminal on the Mac, switch ~/rust/hanadocs to the main branch."}),
-         PushExample("diverged", {"reason": "The Mac copy has commits that GitHub does not have, so a safe update is not possible.", "action": "In a terminal on the Mac, push the commits in ~/rust/hanadocs to GitHub."}),
-         PushExample("untracked", {"reason": "An update would replace a file on the Mac that git does not track.", "action": "In a terminal on the Mac, move the untracked file that blocks the hanadocs update out of ~/rust/hanadocs. Run git -C ~/rust/hanadocs merge --ff-only origin/main to see its name."}),
-         PushExample("unreachable", {"reason": "natedev could not reach the Mac for more than 24 hours.", "action": "Wake the Mac and connect it to the network."}),
-         PushExample("command", {"reason": "The update failed with an error the job does not know.", "action": "In the Claude session named natedev, ask it to read the vault update error in the hourly log."})),
-        purpose="The Mac vault cannot update. One alert is sent until a pull succeeds."),
+    PushText("mac_idle.blocked", "Mac idle watch", "blocked", "{holder} blocks waiting Mac tests",
+        ActionTemplate("On natedev, in the {holder} session, ask it to finish its Mac work and run /build:mac unblock"),
+        "No natedev build or test has run on the Mac for {minutes} minutes, since {since}. "
+        + "{waiting} steps wait behind the {holder} session's block. It labeled the reservation \"{detail}\". "
+        + "Waiting work can use the Mac after {clears}.",
+        (PushExample("research_block", {"minutes": "10", "waiting": "7", "holder": "research",
+            "detail": "P15 F11 L0 run", "since": "07:47 EDT", "clears": "/build:mac unblock by research"}),
+         PushExample("three_waiting", {"minutes": "12", "waiting": "3", "holder": "research",
+            "detail": "P15 F11 L0 run", "since": "07:47 EDT", "clears": "/build:mac unblock by research"})),
+        purpose="A Mac block holds up eligible steps past the configured threshold."),
+    PushText("mac_idle.stuck", "Mac idle watch", "decision", "Waiting tests are not using the Mac",
+        ActionTemplate("On natedev, ask the builds showrunner to get the waiting steps onto the Mac"),
+        "No natedev build or test has run on the Mac for {minutes} minutes, since {since}. "
+        + "{waiting} steps wait. {reservation} "
+        + "To restore Mac work: {clears}.",
+        (PushExample("idle_research_claim", {"minutes": "10", "waiting": "3",
+            "reservation": mac_idle_reservation("research", "P15 F11 L0 run"), "since": "07:50 EDT", "clears": "release of the idle claim P15 F11 L0 run"}),
+         PushExample("free_mac", {"minutes": "10", "waiting": "7",
+            "reservation": mac_idle_reservation("none", ""), "since": "07:47 EDT",
+            "clears": "the builds showrunner checks why the waiting steps do not take the Mac"})),
+        purpose="Eligible steps wait while the Mac has no build or test."),
     PushText("nix_heal.failed", "nix-heal", "blocked", "{session} builds will fail: no nix shell",
         ActionTemplate("On {machine}, fix the nix shell in {cwd}, then restart {session}"),
         "The nix shell for {session}'s worktree did not load, so its builds will fail. "
@@ -67,7 +105,7 @@ ENTRIES = (
         purpose="A session waits for you to answer its permission prompt.",
         session=SessionTemplate("{unit}")),
     PushText("shutdown.restart_failed", "shutdown", "decision", "Claude coding work remains stopped",
-        ActionTemplate('In the Claude session named natedev on the natedev computer, run /shutdown restart {account}.'),
+        ActionTemplate('In the Claude session named natedev on the natedev computer, run /agents restart {account}.'),
         "After your restart request, {stopped} on Claude account {account} did not restart on {machine}. "
         + "Coding work stays stopped until the restart succeeds.\n\n"
         + "The restart gave this error: {cause}.\n\n"
@@ -80,7 +118,7 @@ ENTRIES = (
         purpose="One restart problem sends one push with the failed session count."),
     PushText("shutdown.restart_untrusted", "shutdown", "decision", "Stopped Claude work needs folder trust",
         ActionTemplate("In a terminal on {machine}, run ~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py trust. "
-                       + "Then run /shutdown restart {account} in the natedev session."),
+                       + "Then run /agents restart {account} in the natedev session."),
         "After your restart request, {stopped} on Claude account {account} could not start on {machine}. Coding work stays stopped. "
         + "The first command trusts the configured folders. The second retries stopped sessions.",
         (PushExample("typical", {"stopped": "3 sessions", "machine": "natedev", "account": "claude2"}),),
@@ -103,7 +141,7 @@ ENTRIES = (
              "machine": "Mac", "source": "claude2", "target": "claude4"})),
         purpose="A session stopped for an account move did not start on its new account."),
     PushText("shutdown.restart_incomplete", "shutdown", "decision", "Claude restart could not be confirmed",
-        ActionTemplate('In the Claude session named natedev on the natedev computer, run /shutdown restart {account}.'),
+        ActionTemplate('In the Claude session named natedev on the natedev computer, run /agents restart {account}.'),
         "The restart of Claude account {account} could not be confirmed on {machine}. "
         + "Its stopped sessions may still be unable to work. Retrying asks any sessions that are still stopped to start again.",
         (PushExample("typical", {"account": 'claude2', "machine": "Mac"}),
@@ -166,21 +204,6 @@ ENTRIES = (
         (PushExample("typical", {"account": "codex1"}),
          PushExample("long_account", {"account": "codex999"})),
         purpose="Codex stopped work for lack of usage, and Claude could not take it."),
-    # sweep.py sends this only when no idle build output is left and no Claude session holds a busy
-    # target; {paths} lists, largest first, the busy targets and then the largest measured folders.
-    # Sizes follow the 2026-10-21 disk check on natedev (HANDOFF-builds-unit.md, 00:45 EDT): 26 GiB held in
-    # cargo-liner-berth's target, about 86 GiB of scratch clones under /tmp.
-    PushText("sweep.disk_floor", "sweep", "note", "Builds need more disk space",
-        ActionTemplate("In the Claude session named natedev, name the paths below that it may remove."),
-        "The natedev computer has {free} free. Builds need {floor}. They may fail until {shortfall} more is free. "
-        + "Build cache cleanup freed {removed} and has no idle build output left.\n\n{paths}\n\n"
-        + "The session removes only the paths you name.",
-        (PushExample("typical", {"shortfall": "10.0 GiB", "free": "290.0 GiB", "floor": "300.0 GiB", "removed": "2.0 GiB",
-            "paths": "/home/natepiano/rust/cargo-liner-berth/target: frees 26.0 GiB. Process 3104822 uses it now and can fail.\n\n"
-            + "/tmp/claude-1000/scratch: frees 86.0 GiB."}),
-         PushExample("no_free_space", {"shortfall": "300.0 GiB", "free": "0.0 GiB", "floor": "300.0 GiB", "removed": "0.0 GiB",
-            "paths": "/tmp/claude-1000/scratch: frees 86.0 GiB.\n\n/home/natepiano/.local/share/Trash: frees 40.0 GiB."})),
-        purpose="Builds need more disk space. You name the paths to remove."),
     PushText("rust.passed", "rust_release", "decision", "Hana can use the new Rust compiler",
         ActionTemplate("In the Claude session named natedev, reply upgrade or wait."),
         "Hana, the editor project, passed its compiler check on Rust {version}: no errors. "
@@ -223,6 +246,30 @@ ENTRIES = (
         (PushExample("typical", {"machine": "natedev"}),
          PushExample("long_machine", {"machine": "macbook-workstation"})),
         purpose="All Codex agents stopped. You can redeem your usage reset now."),
+    PushText("sweep.disk_floor", "disk_floor", "decision", "{machine} disk is low; {machine} tests can fail",
+        ActionTemplate("{folder_action}"),
+        "{machine} has {free} free, below the {floor} alert line, so {machine} test builds can fail. {recommendation}",
+        (PushExample("available", {
+            "machine": "natedev",
+            "folder_action": "In the natedev Claude session, say which natedev folders to delete.",
+            "free": "140.0 GiB", "floor": "150.0 GiB",
+            "recommendation": "Delete ~/.local/share/Trash (recommended): this frees 26.0 GiB, which covers the 10.0 GiB shortfall."}),
+         PushExample("unavailable", {
+            "machine": "natedev",
+            "folder_action": "In the natedev Claude session, reply measure or delete nothing.",
+            "free": "140.0 GiB", "floor": "150.0 GiB",
+            "recommendation": "Folder sizes are unknown. Measure (recommended): natedev lists folder sizes, then you choose. Delete nothing: free space stays low."}),
+         PushExample("insufficient", {
+            "machine": "natedev",
+            "folder_action": "In the natedev Claude session, say which natedev folders to delete.",
+            "free": "120.0 GiB", "floor": "150.0 GiB",
+            "recommendation": "The largest folder is ~/Trash at 20.0 GiB. Deleting it frees only part of the 30.0 GiB shortfall; the natedev session lists every folder."}),
+         PushExample("protected", {
+            "machine": "Mac",
+            "folder_action": "In the natedev Claude session, say which Mac folders to delete.",
+            "free": "140.0 GiB", "floor": "150.0 GiB",
+            "recommendation": "Review ~/old-output first (recommended): deleting it frees 26.0 GiB, which covers the 10.0 GiB shortfall."})),
+        purpose="A low-disk alert recommends one folder for natedev review."),
     # Current disk-floor.nix: alertGib=150, build floor=300 GiB.
     PushText("nixos.disk_low", "disk_floor", "note", "Builds need more disk space",
         ActionTemplate("In a terminal on natedev, delete {shortfall} GiB of personal files you no longer need."),
@@ -308,15 +355,15 @@ ENTRIES = (
                                      + "Both are done, and both units run under their new names."})),
         purpose="An update that an agent writes for you with /nate adhoc.",
         header=False, agent_written=True),
-    # Auto-mode refusal (user approved 2026-10-21): a session sends it with send.py --text-id auto_mode.refused.
+    # Auto-mode refusal (texts from 2026-11-06, on the user's question via natedev): a session sends it with send.py --text-id auto_mode.refused.
     # send.py fills sender from the session's own name, action from the commands' first words (rca.action_of),
     # refused from the command values (one per line), waits_line from waits when the 30 s push review passes it
     # (else ""), noun and this from the number of commands, and rule_line from rule.
-    PushText("auto_mode.refused", "{sender}", "decision", "{sender}: auto mode stopped {session}",
-        ActionTemplate("On {machine}, in the {session} pane, approve the prompt or add an allow rule"),
+    PushText("auto_mode.refused", "{sender}", "decision", "{sender}: {session} {noun} refused",
+        ActionTemplate("On {machine}, in the {session} pane, type: Go: run the refused {noun}"),
         "Auto mode refused {action} in the {session} session.{waits_line}\n{refused}\n\n"
-        + "Approve: the work goes on now, and auto mode can stop it on {this} {noun} again.\n\n"
-        + "Allow rule: the work goes on now, and auto mode lets {this} {noun} run from then on.{rule_line}",
+        + "Go: the session runs {this} {noun} now, and auto mode can refuse {this} {noun} again.\n\n"
+        + "Allow rule: auto mode lets {this} {noun} run from then on.{rule_line}",
         (PushExample("typical", {"sender": "cargo-liner-style", "session": "modules", "machine": "natedev",
             "action": "2 shell commands", "refused": "implement.sh --to modules-impl\nreview.sh --to modules-test",
             "noun": "commands", "this": "these", "waits_line": " The modules build waits for them.", "rule_line": ""}),
@@ -326,40 +373,39 @@ ENTRIES = (
          PushExample("file_change_no_waits", {"sender": "hana", "session": "demo", "machine": "natedev",
             "action": "a file change", "refused": "write phases/34h/delegated_phase_reservation_state.json",
             "noun": "command", "this": "this", "waits_line": "", "rule_line": ""})),
-        purpose="Auto mode refused a session's commands, and the session waits for you.",
+        purpose="Auto mode refused a session's commands. The commands wait for you.",
         session=SessionTemplate("{session}")),
     # Permission root cause (user ask, 2026-10-23): rca.py sends these when the owner of a case starts it
     # (`rca.py start`) and when its fix merges (`rca.py fixed`), with --key rca-<case id>. sender is the
-    # session's production, or messaging when it has none. rca.py fills time (silence.shown) and stop (what stopped
-    # it and the kind of action) from the case, and drops a final period from cause and fix. Only the started push
-    # has waits_line, the alert's present-tense waits sentence: once the stop is fixed, nothing waits.
+    # session's production, or messaging when it has none. rca.py fills time (silence.shown) and stop from the case.
+    # It removes a final period from cause and fix. Only the started push has the alert's waits_line.
     # No owner, file, command or commit (user, 2026-10-23 19:20). Examples: the demo and handler cases of 2026-10-23.
-    PushText("permission.rca_started", "{sender}", "note", "{sender}: finding why {session} stopped",
+    PushText("permission.rca_started", "{sender}", "note", "{sender}: finding why {session} hit a check",
         NoActionNeeded(),
-        "The {session} session stopped at {time} when {stop}.{waits_line} "
-        + "A session now finds the cause and fixes it, so it does not stop there again. "
+        "At {time} in the {session} session, {stop}.{waits_line} "
+        + "A session now finds the cause and fixes it, so this does not happen again. "
         + "A second push comes when the fix is in.",
         (PushExample("typical", {"sender": "hana", "session": "demo", "time": "14:23 AST",
             "stop": "auto mode refused a file change", "waits_line": " The demo build waits for it."}),
          PushExample("prompt", {"sender": "cargo-liner", "session": "handler", "time": "09:01 AST",
-            "stop": "it asked you to allow a shell command", "waits_line": ""})),
-        purpose="Someone starts to find why a session stopped for a permission."),
-    PushText("permission.rca_fixed", "{sender}", "note", "{sender}: fixed why {session} stopped",
+            "stop": "the session asked you to allow a shell command", "waits_line": ""})),
+        purpose="Someone starts to find the cause of a session's permission check."),
+    PushText("permission.rca_fixed", "{sender}", "note", "{sender}: fixed why {session} hit a check",
         NoActionNeeded(),
-        "The {session} session stopped at {time} when {stop}.\nWhy: {cause}.\nNow: {fix}.",
+        "At {time} in the {session} session, {stop}.\nWhy: {cause}.\nNow: {fix}.",
         (PushExample("typical", {"sender": "hana", "session": "demo", "time": "14:23 AST",
             "stop": "auto mode refused a file change",
             "cause": "the steps told the session to write a progress file by hand, which auto mode does not allow",
             "fix": "a script writes that file, so the session never has to"}),
          PushExample("prompt", {"sender": "cargo-liner", "session": "handler", "time": "09:01 AST",
-            "stop": "it asked you to allow a shell command",
+            "stop": "the session asked you to allow a shell command",
             "cause": "a helper ran a build command that needs your permission",
             "fix": "helpers use the build command that is always allowed"})),
-        purpose="The fix merged: the session does not stop for that permission again."),
+        purpose="The fix merged: that check no longer stops or refuses the session."),
     # rca.py fixed sends this when the push review refused the fixed text twice: the reviewer's own rewrite.
     PushText("permission.rca_fixed_rewritten", "{sender}", "note", "{title}", NoActionNeeded(), "{body}",
-        (PushExample("typical", {"sender": "hana", "title": "hana: fixed why demo stopped",
-            "body": "The demo session stopped at 14:23 AST when auto mode refused a file change.\n"
+        (PushExample("typical", {"sender": "hana", "title": "hana: fixed why demo hit a check",
+            "body": "At 14:23 AST in the demo session, auto mode refused a file change.\n"
             + "Why: its steps told it to write a progress file by hand.\nNow: a script writes that file."}),),
         purpose="The fix merged; the push review wrote this text after two refusals."),
     # Paid credits (user approved 2026-10-21): sent with send.py --text-id quota.paid_credits. send.py fills

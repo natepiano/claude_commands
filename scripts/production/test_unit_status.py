@@ -44,7 +44,7 @@ class UnitStatusTests(UnitStatusFixture):
         self.assertNotIn("CLAUDE NOT RUNNING", output)
         self.assertEqual(calls, "health unit-test-run\n")
 
-    def test_no_live_claude_record_reports_not_running(self) -> None:
+    def test_native_shell_without_a_live_claude_record_reports_not_running(self) -> None:
         output, calls = self.run_status("/tmp/test-run\n", "ok", 0, stopped_units=("hook",))
         self.assertIn("CLAUDE NOT RUNNING", output)
         self.assertNotIn("CLAUDE STATE UNKNOWN", output)

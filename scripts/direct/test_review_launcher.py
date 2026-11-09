@@ -1,6 +1,9 @@
-"""Check reviewer identity, reuse, compaction and interpreter resolution."""
+"""Check Claude reviews, Codex refusal, and interpreter resolution."""
 
 from __future__ import annotations
+
+from scripts.production import staff
+from scripts.production.staff_test_support import isolated_staff_file
 
 from scripts.lib.py_floor_test_support import cache_file_name
 
@@ -17,24 +20,81 @@ import os
 import hashlib
 from unittest.mock import patch
 import subprocess
+import shutil
 import sys
 import tempfile
 from typing import override
 from scripts.direct import wait_for_test_state
 from scripts.direct.wait_for_test_state import wait_until
+from scripts.lib.test_models_registry import RegistryReadProbe, write_registry
 
 
 class ReviewLauncherPassTests(support.ReviewLauncherFixture):
-    def test_own_claim_refusal_removes_a_stale_review_slot(self) -> None:
-        session = self.start_implementation("stale-review-slot")
+
+    def test_review_reads_one_registry_snapshot_across_its_child_processes(self) -> None:
+        session = self.start_implementation("registry-snapshot")
         self.finish_implementation(session)
-        slot = session / "review_slot_contract"
-        _ = slot.write_text("review2\n", encoding="utf-8")
-        _ = self.open_worker(session, name="fixture-review", role="review", status="running")
-        result = subprocess.run(self.unit_review_command(session), env=self.environment(), capture_output=True,
-                                text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
-        self.assertEqual(result.returncode, 2, result.stderr)
-        self.assertFalse(slot.exists())
+        environment = self.environment()
+        probe = RegistryReadProbe(self.root, Path(environment["MODELS_CONFIG_FILE"]))
+        result = subprocess.run(self.review_command(session, "contract", ""),
+                                env=probe.environment(environment), capture_output=True, text=True,
+                                timeout=TEST_HANG_GUARD_SECS)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(len(probe.reads()), 1, probe.reads())
+
+    def test_review_helper_keeps_the_launch_generation_after_a_registry_edit(self) -> None:
+        session = self.start_implementation("review-helper-generation")
+        self.finish_implementation(session)
+        environment = self.environment()
+        registry = Path(environment["MODELS_CONFIG_FILE"])
+        _ = write_registry(registry, {"assignments": {"direct": "claude"},
+            "direct.claude": {"review": "opus:high"},
+            "claude.agents": {"opus": "high", "sonnet": "low"}})
+        _ = (self.root / ".claude.json").write_text('{"oauthAccount":{"emailAddress":"review@example.invalid"}}')
+        backend = self.root / "bin/claude"
+        backend.parent.mkdir(exist_ok=True)
+        _ = backend.write_text("#!" + sys.executable + '''
+import json, os, sys
+from pathlib import Path
+Path(os.environ["REVIEW_AGENT"]).write_text(json.dumps({"arguments": sys.argv[1:], "environment": dict(os.environ)}))
+print(json.dumps({"type": "result", "result": "No findings."}))
+''')
+        backend.chmod(0o755)
+        scripts = Path(__file__).resolve().parents[1]
+        helper = self.root / "scripts/agents/agent_exec.sh"
+        agent_exec = helper.with_name("agent_exec_real.sh")
+        _ = shutil.copy2(scripts / "agents/agent_exec.sh", agent_exec)
+        for name in ("claude_account.sh", "claude_result.py"):
+            _ = shutil.copy2(scripts / "agents" / name, helper.with_name(name))
+        _ = shutil.copy2(scripts / "lib/nix_env.py", self.root / "scripts/lib/nix_env.py")
+        _ = helper.write_text('''#!/usr/bin/env bash
+set -euo pipefail
+python3 - <<'EDIT'
+import os
+from pathlib import Path
+path = Path(os.environ["MODELS_CONFIG_FILE"])
+path.write_text(os.environ["NEXT_REVIEW_REGISTRY"])
+EDIT
+exec bash "''' + str(agent_exec) + '''" "$@"
+''')
+        recorded = self.root / "review-agent.json"
+        environment.update(PATH=str(backend.parent) + os.pathsep + environment["PATH"], REVIEW_AGENT=str(recorded),
+            CLAUDE_CONFIG_DIR="",
+            CODEX_CATALOG_SYNC_STATE_FILE=str(registry),
+            NEXT_REVIEW_REGISTRY=registry.read_text().replace("review=opus:high", "review=sonnet:low"))
+        probe = RegistryReadProbe(self.root, registry)
+        result = subprocess.run(self.review_command(session, "contract", ""), env=probe.environment(environment),
+            capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        launched = cast(dict[str, object], json.loads(recorded.read_text()))
+        arguments = cast(list[str], launched["arguments"])
+        self.assertEqual(arguments[arguments.index("--model") + 1], "opus")
+        self.assertEqual(arguments[arguments.index("--effort") + 1], "high")
+        self.assertNotIn("MODELS_LAUNCH_CONFIGURATION", cast(dict[str, str], launched["environment"]))
+        self.assertNotIn("MODELS_REGISTRY_EDIT_BASE", cast(dict[str, str], launched["environment"]))
+        self.assertIn("review=sonnet:low", registry.read_text())
+        self.assertEqual(len(probe.reads()), 1, probe.reads())
+        self.assertIn("agent=opus", (session / "review_agent_contract").read_text())
 
     @override
     def environment(self) -> dict[str, str]:
@@ -45,14 +105,14 @@ class ReviewLauncherPassTests(support.ReviewLauncherFixture):
     def prepare_fast_track_review(self, name: str) -> tuple[Path, dict[str, str], str]:
         session = self.start_implementation(name)
         self.finish_implementation(session)
-        state_path = session / "progress_history_state.json"
-        state = cast(dict[str, object], json.loads(state_path.read_text()))
-        state["unit"] = "alpha-unit"
-        _ = state_path.write_text(json.dumps(state))
+        with isolated_staff_file(self.root / "staff.json", {}):
+            owner = staff.local_snapshot().by_member_reference(self.staff_parent)
+            assert owner is not None
+            _ = staff.rename(owner.id, "alpha")
         _ = (self.working_dir / "fast-fix.txt").write_text(f"already pushed fast fix {name}\n")
         for arguments in (["add", "fast-fix.txt"],
                           ["-c", "user.name=Review Test", "-c", "user.email=review@example.invalid",
-                           "commit", "-m", "fast-track(alpha-unit): repair the sample"]):
+                           "commit", "-m", "fast-track(alpha): repair the sample"]):
             _ = subprocess.run(["git", *arguments], cwd=self.working_dir, check=True, capture_output=True,
                                timeout=TEST_HANG_GUARD_SECS)
         tip = subprocess.run(["git", "rev-parse", "HEAD"], cwd=self.working_dir,
@@ -60,7 +120,7 @@ class ReviewLauncherPassTests(support.ReviewLauncherFixture):
         environment = self.environment()
         directory = Path(environment["FAST_TRACK_STATE_DIR"])
         directory.mkdir(exist_ok=True)
-        row = {"unit": "alpha-unit", "commit": tip, "why": "repair the sample",
+        row = {"unit": "alpha", "commit": tip, "why": "repair the sample",
                "patch_sha256": hashlib.sha256(b"sample fix").hexdigest(),
                "time": "2026-10-31T12:00:00+00:00", "review": "pending"}
         _ = (directory / "records.jsonl").write_text(json.dumps(row) + "\n")
@@ -174,7 +234,7 @@ class ReviewLauncherPassTests(support.ReviewLauncherFixture):
         interpreter = binaries / "python3"
         calls = self.root / "python-calls"
         _ = interpreter.write_text(
-            '#!/bin/bash\nprintf "%s\\n" "$2" >> "$CACHE_TEST_CALLS"\nexec "$CACHE_TEST_REAL_PYTHON" "$@"\n'
+            '#!/bin/bash\nprintf "%s\\n" "$*" >> "$CACHE_TEST_CALLS"\nexec "$CACHE_TEST_REAL_PYTHON" "$@"\n'
         )
         interpreter.chmod(0o755)
         environment = self.environment()
@@ -188,7 +248,7 @@ class ReviewLauncherPassTests(support.ReviewLauncherFixture):
         commands = calls.read_text().splitlines()
         self.assertEqual(len(commands), 3)
         self.assertIn("sys.version_info", commands[0])
-        self.assertEqual(commands[1:], ["print('ready')"] * 2)
+        self.assertEqual(commands[1:], ["-P -c print('ready')"] * 2)
         self.assertEqual((self.root / "cold-cache" / "claude" / cache_file_name()).read_text().strip(), str(interpreter))
 
     def test_interpreter_resolver_rejects_python310_and_its_old_cache(self) -> None:
@@ -245,154 +305,6 @@ class ReviewLauncherPassTests(support.ReviewLauncherFixture):
         self.assertEqual((result.returncode, result.stdout), (0, f"{sys.version_info[:2]}\n"), result.stderr)
         self.assertNotEqual((cache_root / "claude" / cache_file_name()).read_text().strip(), str(interpreter))
 
-    def test_a_named_open_worker_receives_the_review_and_writes_findings(self) -> None:
-        session_dir = self.start_implementation("assigned")
-        self.finish_implementation(session_dir)
-        worker = self.open_worker(session_dir)
-
-        result = self.run_assigned_review(session_dir, worker)
-
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(
-            (session_dir / "follow_message.txt").read_text(encoding="utf-8"),
-            "Review the diff.\n",
-        )
-        self.assertEqual(
-            (session_dir / "review_findings_1.txt").read_text(encoding="utf-8"),
-            "No findings.\n",
-        )
-        self.assertEqual(
-            (session_dir / "review_status").read_text(encoding="utf-8"),
-            "reviewed\n",
-        )
-        roster = cast(
-            "dict[str, dict[str, object]]",
-            json.loads((session_dir / "mesh_roster.json").read_text(encoding="utf-8")),
-        )
-        self.assertEqual(roster[worker]["role"], "review")
-        self.assertEqual(roster[worker]["task"], "direct.review")
-        reviews = [
-            event for event in self.pass_events("assigned")
-            if event.get("pass_kind") == "review"
-        ]
-        self.assertEqual(
-            [(event["event_type"], event.get("team_slot")) for event in reviews],
-            [("pass_started", "impl"), ("pass_finished", "impl")],
-        )
-        self.assertEqual(reviews[0]["worker_name"], worker)
-
-    def test_a_review_opened_worker_has_durable_identity_for_an_implementation_claim(self) -> None:
-        session_dir = self.start_implementation("new-worker")
-        self.finish_implementation(session_dir)
-
-        result = subprocess.run(
-            self.review_command(session_dir, "", "", new_slot="review2"),
-            check=False,
-            capture_output=True,
-            text=True,
-            env=self.environment(),
-            timeout=TEST_HANG_GUARD_SECS,
-        )
-
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(
-            (session_dir / "mesh_events.txt").read_text(encoding="utf-8").splitlines(),
-            ["start"],
-        )
-        roster = cast(
-            "dict[str, dict[str, object]]",
-            json.loads((session_dir / "mesh_roster.json").read_text(encoding="utf-8")),
-        )
-        worker = "project-review2"
-        self.assertEqual(roster[worker]["status"], "done")
-        self.assertEqual(roster[worker]["role"], "review")
-        self.assertEqual(roster[worker]["task"], "direct.review")
-        self.assertEqual(
-            (session_dir / "review_findings_1.txt").read_text(encoding="utf-8"),
-            "No findings.\n",
-        )
-        # The seat's log is its own, so a second seat on pass 1 cannot truncate it.
-        self.assertTrue((session_dir / "review_agent_1-review2.log").is_file())
-        self.assertEqual(os.readlink(session_dir / "review_agent.log"), "review_agent_1-review2.log")
-        reviews = [
-            event for event in self.pass_events("new-worker")
-            if event.get("pass_kind") == "review"
-        ]
-        self.assertEqual(
-            [(event["event_type"], event.get("team_slot")) for event in reviews],
-            [("pass_started", "review2"), ("pass_finished", "review2")],
-        )
-        identity = cast(
-            "dict[str, object]",
-            json.loads((session_dir / "impl_worker_review2.json").read_text()),
-        )
-        self.assertEqual(identity, {
-            "name": worker,
-            "slot": "review2",
-            "family": "codex",
-            "model": "gpt-called",
-            "worker_id": f"thread-{worker}",
-        })
-
-        implementation = subprocess.run(
-            [
-                "bash", str(self.review_script.with_name("implement.sh")),
-                "--to", worker, str(session_dir), str(self.working_dir),
-                str(self.prompt_file), "impl", "write the repair",
-                "impl", "writing the repair", "0", "review2",
-            ],
-            check=False,
-            capture_output=True,
-            text=True,
-            env=self.environment(),
-            timeout=TEST_HANG_GUARD_SECS,
-        )
-        self.assertEqual(implementation.returncode, 0, implementation.stderr)
-        self.assertEqual(
-            (session_dir / "impl_status_review2").read_text(encoding="utf-8"),
-            "implemented\n",
-        )
-
-    def test_a_test_worker_keeps_one_identity_when_assigned_a_review(self) -> None:
-        run = self.start_implementation("test-becomes-review")
-        self.finish_implementation(run)
-        worker = "project-test"
-        identity = {"name": worker, "slot": "test", "role": "test", "family": "codex",
-                    "model": "gpt-called", "worker_id": "thread-test"}
-        path = run / "impl_worker_test.json"
-        _ = path.write_text(json.dumps(identity))
-        _ = (run / "mesh_roster.json").write_text(json.dumps({worker: {
-            "thread_id": "thread-test", "status": "done", "role": "test", "context_tokens": 0}}))
-        _ = (run / "workers").write_text(f"thread-test\t{worker}\n")
-
-        reviewed = self.run_assigned_review(run, worker)
-
-        self.assertEqual(reviewed.returncode, 0, reviewed.stderr)
-        records = [cast(dict[str, object], json.loads(item.read_text()))
-                   for item in run.glob("impl_worker_*.json")]
-        identities = [record for record in records if record.get("name") == worker]
-        self.assertEqual(len(identities), 1, records)
-        self.assertEqual(identities[0]["worker_id"], "thread-test")
-        self.assertEqual(cast(dict[str, object], json.loads(path.read_text()))["name"], worker)
-        roster = cast(dict[str, dict[str, object]], json.loads((run / "mesh_roster.json").read_text()))
-        self.assertEqual(roster[worker]["role"], "review")
-
-    def test_hyphenated_new_slot_is_refused_to_keep_followup_identity_stable(self) -> None:
-        session_dir = self.start_implementation("hyphenated-slot")
-        self.finish_implementation(session_dir)
-
-        result = subprocess.run(
-            self.review_command(session_dir, "", "", new_slot="review-extra"),
-            check=False,
-            capture_output=True,
-            text=True,
-            env=self.environment(),
-            timeout=TEST_HANG_GUARD_SECS,
-        )
-
-        self.assertEqual(result.returncode, 2, result.stderr)
-        self.assertIn("alphanumeric/_ characters", result.stderr)
-        self.assertFalse((session_dir / "mesh_roster.json").exists())
 
     def test_without_a_named_worker_the_fresh_read_only_path_is_unchanged(self) -> None:
         session_dir = self.start_implementation("fresh")
@@ -408,7 +320,7 @@ class ReviewLauncherPassTests(support.ReviewLauncherFixture):
         )
 
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertFalse((session_dir / "mesh_events.txt").exists())
+        self.assertFalse((session_dir / "dispatch_events.txt").exists())
         self.assertEqual(
             (session_dir / "review_findings_1.txt").read_text(encoding="utf-8"),
             "No findings.\n",
@@ -417,36 +329,47 @@ class ReviewLauncherPassTests(support.ReviewLauncherFixture):
             (session_dir / "review_status").read_text(encoding="utf-8"), "reviewed\n"
         )
 
-    def test_unit_reviewer_runs_and_keeps_its_thread(self) -> None:
-        session_dir = self.start_implementation("fresh")
-        self.finish_implementation(session_dir)
 
-        result = subprocess.run(
-            self.unit_review_command(session_dir, ""),
-            check=False,
-            capture_output=True,
-            text=True,
-            env=self.environment(),
-            timeout=TEST_HANG_GUARD_SECS,
-        )
+    def test_a_refused_launch_check_removes_a_stale_review_slot(self) -> None:
+        session = self.start_implementation("stale-review-slot")
+        self.finish_implementation(session)
+        phase = session / "phases/99"
+        phase.mkdir(parents=True)
+        slot = phase / "review_slot_contract"
+        _ = slot.write_text("review2\n", encoding="utf-8")
+        result = self.checked_review(session, "--phase", "99", lens="contract")
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("unable to check the review launch", result.stderr)
+        self.assertFalse(slot.exists())
 
-        self.assertEqual(result.returncode, 0, result.stderr)
-        events = (session_dir / "mesh_events.txt").read_text().splitlines()
-        self.assertIn("follow", events)
-        records = cast(dict[str, dict[str, object]], json.loads((session_dir / "mesh_roster.json").read_text()))
-        self.assertEqual(len(records), 1)
-        self.assertEqual(next(iter(records.values()))["role"], "review")
-        self.assertEqual(self.turn_records(session_dir)[0]["arm"], "own")
-        self.assertEqual(
-            (session_dir / "review_findings_1.txt").read_text(encoding="utf-8"),
-            "No findings.\n",
-        )
-        self.assertEqual(
-            (session_dir / "review_status").read_text(encoding="utf-8"), "reviewed\n"
-        )
+    def test_codex_reviewers_must_use_assign(self) -> None:
+        session = self.start_implementation("codex-refused")
+        self.finish_implementation(session)
+        registry = self.root / ".claude/config/models.conf"
+        _ = registry.write_text(registry.read_text().replace("direct=claude", "direct=codex"))
+        phase = session / "phases/3"
+        phase.mkdir(parents=True, exist_ok=True)
+        for name in ("review_slot_contract", "review_agent_1_contract.log"):
+            _ = (phase / name).write_text("Keep this evidence.\n")
+        before = {path.name: (path.read_bytes(), path.stat().st_mtime_ns) for path in phase.iterdir()}
+        events = self.events(session.name)
+        environment = self.environment()
+        environment["TEST_WORKER_STARTED"] = str(session / "review-worker-started")
+        command = self.review_command(session)
+        command[2:2] = ["--phase", "3"]
+        result = subprocess.run(command, env=environment,
+                                capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertEqual(result.stderr.splitlines(), ["review.sh: Codex workers must use assign.sh."])
+        self.assertFalse((session / "review-worker-started").exists())
+        self.assertEqual({path.name: (path.read_bytes(), path.stat().st_mtime_ns)
+                          for path in phase.iterdir()}, before)
+        self.assertEqual(self.turn_records(session), [])
+        self.assertEqual(self.events(session.name), events)
+        self.assertEqual(list(phase.glob("review_status*")), [])
 
     def test_removed_review_options_refuse_before_any_review_starts(self) -> None:
-        for flag in ("--pool", "--lease"):
+        for flag in ("--pool", "--lease", "--to", "--slot"):
             with self.subTest(flag=flag):
                 session = self.start_implementation("removed-option-" + flag[2:])
                 self.finish_implementation(session)
@@ -456,129 +379,7 @@ class ReviewLauncherPassTests(support.ReviewLauncherFixture):
                                         env=self.environment(), timeout=TEST_HANG_GUARD_SECS)
                 self.assertEqual(result.returncode, 2, result.stderr)
                 self.assertEqual(result.stderr.splitlines(), ["ERROR: unknown review option '" + flag + "'."])
-                self.assertFalse((session / "mesh_roster.json").exists())
                 self.assertEqual(self.turn_records(session), [])
-
-    def test_paused_reviewer_receives_followup_on_its_recorded_thread(self) -> None:
-        session_dir = self.start_implementation("paused-review")
-        self.finish_implementation(session_dir)
-        worker = self.open_worker(session_dir, status="paused")
-        result = self.run_assigned_review(session_dir, worker)
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual((session_dir / "mesh_events.txt").read_text().splitlines(), ["can-follow", "follow"])
-        roster = cast(dict[str, dict[str, object]], json.loads((session_dir / "mesh_roster.json").read_text()))
-        self.assertEqual(roster[worker]["thread_id"], "thread-fixture")
-        self.assertEqual((session_dir / "follow_message.txt").read_text(), "Review the diff.\n")
-        self.assertEqual((session_dir / "review_status").read_text(), "reviewed\n")
-
-    def test_a_busy_named_worker_is_refused_before_review_artifacts_change(self) -> None:
-        session_dir = self.start_implementation("busy")
-        self.finish_implementation(session_dir)
-        worker = self.open_worker(session_dir, status="running")
-
-        result = self.run_assigned_review(session_dir, worker)
-
-        self.assertEqual(result.returncode, 2, result.stderr)
-        self.assertIn(f"codex_mesh: {worker}: worker is busy or not followable", result.stderr)
-        self.assertFalse((session_dir / "review_status").exists())
-        self.assertFalse((session_dir / "review_findings_1.txt").exists())
-
-    def test_a_large_named_worker_is_compacted_before_the_review_claim(self) -> None:
-        session_dir = self.start_implementation("compact")
-        self.finish_implementation(session_dir)
-        worker = self.open_worker(session_dir, context_tokens=100001)
-
-        result = self.run_assigned_review(session_dir, worker)
-
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(
-            (session_dir / "mesh_events.txt").read_text(encoding="utf-8").splitlines(),
-            ["compact", "can-follow", "follow"],
-        )
-        board = (session_dir / "board.log").read_text(encoding="utf-8")
-        self.assertIn(f"compacted {worker}: 100001 -> 12000 tokens", board)
-
-    def test_review_compaction_uses_the_first_private_config_value(self) -> None:
-        session = self.start_implementation("first-compact-value")
-        self.finish_implementation(session)
-        with self.config_file.open("a", encoding="utf-8") as output:
-            _ = output.write("\n# whole: 1..\nUNIT_COMPACT_ABOVE_TOKENS=300000\n")
-        worker = self.open_worker(session, context_tokens=100001)
-
-        result = self.run_assigned_review(session, worker)
-
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertEqual((session / "mesh_events.txt").read_text().splitlines(),
-                         ["compact", "can-follow", "follow"])
-
-    def test_a_compaction_roster_conflict_stops_review_before_claim_or_follow(self) -> None:
-        session_dir = self.start_implementation("compact-roster-changed")
-        self.finish_implementation(session_dir)
-        worker = self.open_worker(session_dir, context_tokens=100001)
-        original = (session_dir / "mesh_roster.json").read_bytes()
-        (session_dir / "compact_roster_changed").touch()
-
-        result = self.run_assigned_review(session_dir, worker)
-
-        self.assertEqual(result.returncode, 2, result.stderr)
-        self.assertIn("roster changed during compaction", result.stderr)
-        self.assertIn("reopen", result.stderr)
-        self.assertEqual((session_dir / "mesh_events.txt").read_text().splitlines(), ["compact"])
-        self.assertEqual((session_dir / "mesh_roster.json").read_bytes(), original)
-        self.assertFalse((session_dir / "follow_message.txt").exists())
-        self.assertFalse((session_dir / "review_status").exists())
-        self.assertFalse((session_dir / "review_findings_1.txt").exists())
-        board = (session_dir / "board.log").read_text(encoding="utf-8")
-        self.assertIn("follow-up not sent", board)
-        self.assertNotIn("continuing follow-up", board)
-
-    def test_review_of_an_unmeasured_worker_does_not_compact_again(self) -> None:
-        session_dir = self.start_implementation("unmeasured-review")
-        self.finish_implementation(session_dir)
-        worker = self.open_worker(session_dir)
-        path = session_dir / "mesh_roster.json"
-        roster = cast(dict[str, dict[str, object]], json.loads(path.read_text(encoding="utf-8")))
-        roster[worker]["context_tokens"] = "not_measured_since_compaction"
-        _ = path.write_text(json.dumps(roster), encoding="utf-8")
-
-        result = self.run_assigned_review(session_dir, worker)
-
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual((session_dir / "mesh_events.txt").read_text(encoding="utf-8").splitlines(),
-                         ["can-follow", "follow"])
-        stored = cast(dict[str, dict[str, object]], json.loads(path.read_text(encoding="utf-8")))
-        self.assertEqual(stored[worker]["context_tokens"], "not_measured_since_compaction")
-
-    def test_review_posts_the_unmeasured_compaction_line_unchanged(self) -> None:
-        session_dir = self.start_implementation("compact-unmeasured-line")
-        self.finish_implementation(session_dir)
-        worker = self.open_worker(session_dir, context_tokens=100001)
-        (session_dir / "compact_reports_zero").touch()
-
-        result = self.run_assigned_review(session_dir, worker)
-
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual((session_dir / "mesh_events.txt").read_text(encoding="utf-8").splitlines(),
-                         ["compact", "can-follow", "follow"])
-        board = (session_dir / "board.log").read_text(encoding="utf-8")
-        self.assertIn(f"launcher: compacted {worker}: 100001 tokens, size not measured until its next turn", board)
-
-    def test_a_worker_left_with_a_live_turn_by_compaction_gets_no_review_follow_up(self) -> None:
-        session_dir = self.start_implementation("compact-still-live")
-        self.finish_implementation(session_dir)
-        worker = self.open_worker(session_dir, context_tokens=100001)
-        (session_dir / "compact_still_live").touch()
-
-        result = self.run_assigned_review(session_dir, worker)
-
-        self.assertEqual(result.returncode, 2, result.stderr)
-        self.assertIn("still has a live turn after compaction; end the worker", result.stderr)
-        self.assertEqual(
-            (session_dir / "mesh_events.txt").read_text(encoding="utf-8").splitlines(),
-            ["compact"],
-        )
-        board = (session_dir / "board.log").read_text(encoding="utf-8")
-        self.assertIn("follow-up not sent", board)
 
 
 class FixtureReadinessTests(unittest.TestCase):
@@ -604,7 +405,7 @@ class FixtureReadinessTests(unittest.TestCase):
                         return False  # Exit races the wait, after registration.
                     return child.poll() is not None
 
-                def polling_waiter(_a: Path, _b: Path) -> IntervalReleasePolling:
+                def polling_waiter(_a: Path, _b: Path, _mask: int) -> IntervalReleasePolling:
                     return IntervalReleasePolling()
 
                 with ExitStack() as patches:

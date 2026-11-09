@@ -16,11 +16,13 @@ from pathlib import Path
 from unittest import mock
 from typing import cast, final, override
 
-import fake_fmt
-from style_child_test_support import style_cli_command
-import mechanical_classes
-import style_ledger
-import style_rules
+from scripts.style import fake_fmt
+from scripts.style.style_child_test_support import style_cli_command
+from scripts.style import mechanical_classes
+from scripts.style import style_ledger
+from scripts.style.style_plan_test_support import private_class_catalog, unit_staff_id
+from scripts.style import style_rules
+from scripts.production import unit_config
 from scripts.production.staff_test_support import fixture_unit_location, isolated_staff_file, recorded_showrunner
 
 
@@ -53,7 +55,9 @@ class StandingCheckpointTests(unittest.TestCase):
         self.catalog.mkdir(parents=True)
         # The CLI checks the class list against this catalog, so each listed rule is here as a tier E rule, which has
         # no cells.
-        for rule in sorted({rule for entry in mechanical_classes.classes() for rule in entry.rules}):
+        with private_class_catalog(self.root):
+            listed = mechanical_classes.classes()
+        for rule in sorted({rule for entry in listed for rule in entry.rules}):
             self.write(self.catalog / f"{rule}.md", f"---\ntier: E\n---\n# {rule}\n")
         self.bin = self.root / "bin"
         self.bin.mkdir()
@@ -94,16 +98,18 @@ class StandingCheckpointTests(unittest.TestCase):
         with (self.repo / ".git/info/exclude").open("a") as exclude:
             _ = exclude.write("/docs/product-production.md\n")
         self.write(parent, self.production("main", self.repo))
-        self.write(self.doc, self.production("style/main", self.style) + f"\n- **Parent production:** {parent}\n- **Branch point:** main\n")
+        self.write(self.doc, self.production("style/main", self.style) + "\n- **Kind:** style\n- **Branch point:** main\n")
         _ = recorded_showrunner("sample", parent)
-        owner = recorded_showrunner("sample-style", self.doc)
-        _ = fixture_unit_location(owner, "names-unit", self.unit)
+        owner = recorded_showrunner("sample-style", self.doc, parent="sample")
+        _ = fixture_unit_location(owner, "names", self.unit)
         self.plan = self.unit / "docs/style-production/units/names-unit.md"
+        _ = unit_config.write(self.unit, unit_config.UnitConfig(
+            unit_config.PlanFile(self.plan.relative_to(self.unit)), unit_config.NoAppPort(), ()))
         self.template = self.style / "docs/style-production/units/names-unit.md"
         header = "\n".join([
             "# Standing names", "> **Standing:** style_plan.py",
-            "> **Production: sample-style** — unit names-unit", "", "## Delegation Context", "",
-            "Read the pinned names rule and judge every ticket file.", "", "## Phases", "",
+            "", "## Delegation Context", "Read the pinned names rule and judge every ticket file.",
+            "", "## Phases", "",
         ])
         self.write(self.plan, header)
         self.write(self.template, header + "Showrunner-only template line.\n")
@@ -137,17 +143,14 @@ class StandingCheckpointTests(unittest.TestCase):
     def production(self, branch: str, checkout: Path) -> str:
         return "\n".join([
             "# Production", f"- **Merge branch:** {branch}", f"- **Showrunner checkout:** {checkout}",
-            "- **Log:** docs/sample-style-log.md", "", "## Units", "",
-            "| Unit | Plan | Worktree | Branch |", "| --- | --- | --- | --- |",
-            *([f"| names-unit | docs/style-production/units/names-unit.md | {self.unit} | sample-style-names |"]
-              if branch == "style/main" else []), "",
+            "- **Log:** docs/sample-style-log.md", "",
         ])
 
     def refill(self) -> subprocess.CompletedProcess[str]:
-        return self.cli("style_plan.py", "next-phase", "--unit", "names-unit", "--plan", str(self.plan), "--repo", str(self.unit))
+        return self.cli("style_plan.py", "next-phase", "--unit", "names", "--plan", str(self.plan), "--repo", str(self.unit))
 
     def open_ticket(self) -> style_ledger.TicketRecord:
-        result = self.cli("style_ledger.py", "ticket", "open", "--repo", str(self.unit), "--unit", "names-unit")
+        result = self.cli("style_ledger.py", "ticket", "open", "--repo", str(self.unit), "--unit", "names")
         self.assertEqual(result.returncode, 0, result.stderr)
         return cast(style_ledger.TicketRecord, json.loads(result.stdout))
 
@@ -178,9 +181,9 @@ class StandingCheckpointTests(unittest.TestCase):
                 finding = ledger.hold(self.rule, path, 2, "1", "type", "1", "2", rule_blob, "outside")
                 ledger.file_held(finding.finding_id, issue)
         _ = issue.write_text('---\nstatus: open\nstage: backlog\ntags: [issue, proposal, style]\n'
-                             + f'unit: names-unit\nplan: "{self.plan} Phase 1"\nstyle_rule: {self.rule}\nstyle_crate: alpha\n'
+                             + f'unit: {unit_staff_id("names")}\nplan: "{self.plan} Phase 1"\nstyle_rule: {self.rule}\nstyle_crate: alpha\n'
                              + f'style_rule_blob: {rule_blob}\nstyle_count: 1\n---\n')
-        _ = self.doc.write_text(self.doc.read_text().replace("## Units", f"- **Proposals:** {issue.parent}\n\n## Units"))
+        _ = self.doc.write_text(self.doc.read_text() + f"- **Proposals:** {issue.parent}\n")
         result = self.refill()
         self.assertEqual(result.returncode, 0, result.stderr)
         ticket = self.open_ticket()
@@ -204,7 +207,8 @@ class StandingCheckpointTests(unittest.TestCase):
         self.assertEqual(self.open_ticket()["checkpoint"], commit)
 
     def test_code_checkpoint_stages_only_status_code_paths_and_keeps_the_template_unchanged(self) -> None:
-        self.assertEqual(self.refill().returncode, 0)
+        result = self.refill()
+        self.assertEqual(result.returncode, 0, result.stderr)
         ticket = self.open_ticket()
         path = ticket["files"][0]
         source = self.unit / path
@@ -234,7 +238,8 @@ class StandingCheckpointTests(unittest.TestCase):
         self.assertEqual(self.template.read_bytes(), self.template_before)
 
     def close_without_code(self, verdict: str) -> None:
-        self.assertEqual(self.refill().returncode, 0)
+        result = self.refill()
+        self.assertEqual(result.returncode, 0, result.stderr)
         ticket = self.open_ticket()
         head = self.git(self.unit, "rev-parse", "HEAD")
         count = self.git(self.unit, "rev-list", "--count", "HEAD")
@@ -261,9 +266,9 @@ class StandingCheckpointTests(unittest.TestCase):
         result = self.refill()
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn(f"discarded {ticket['id']}: merged", result.stdout)
-        self.assertIn("phase written: names-unit-2", result.stdout)
+        self.assertIn("phase written: 2", result.stdout)
         self.assertNotIn(f"### Phase 1 — {ticket['id']}", self.plan.read_text())
-        self.assertIn("### Phase 2 — names-unit-2", self.plan.read_text())
+        self.assertIn("### Phase 2 — 2", self.plan.read_text())
         self.assertEqual(self.template.read_bytes(), self.template_before)
         self.assertEqual(self.git(self.unit, "rev-parse", "HEAD"), head)
 
@@ -274,7 +279,8 @@ class StandingCheckpointTests(unittest.TestCase):
         self.close_without_code("held")
 
     def test_uncommitted_literal_change_fails_the_ticket_gate_at_its_unchanged_base(self) -> None:
-        self.assertEqual(self.refill().returncode, 0)
+        result = self.refill()
+        self.assertEqual(result.returncode, 0, result.stderr)
         ticket = self.open_ticket()
         self.assertEqual(self.git(self.unit, "rev-parse", "HEAD"), ticket["base"])
         path = self.unit / ticket["files"][0]

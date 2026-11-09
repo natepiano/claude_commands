@@ -84,8 +84,10 @@ Read the canonical project from `~/rust/hanadocs/home-base/issues - <short>.base
    - `{{BACKLOG_URGENCY}}` — the confirmed urgency stars
    - `{{BACKLOG_EFFORT}}` — the confirmed effort stars
    - `{{DEPENDS_ON}}` — a YAML inline list of existing issue wikilinks, e.g. `["[[render backend]]"]`, or `[]`
-   - `{{PROPOSED_BY}}` — for a proposal, the unit or session that wrote it; empty otherwise
-   - `{{SHOWRUNNER}}`, `{{UNIT}}`, `{{PLAN}}`, `{{AS_BUILT}}` — empty unless already known; `proposal_issue.py` sets them as the work is approved and built (`/showrunner:proposal`)
+   - `{{PROPOSED_BY}}` — for a proposal, the writer’s fixed staff id; empty otherwise
+   - `{{UNIT}}` — the unit’s fixed staff id after approval
+   - `{{SHOWRUNNER}}`, `{{PLAN}}` — remove these fields from proposals
+   - `{{AS_BUILT}}` — the completed document
 
    A proposal's `tags` are `[issue, proposal]`.
 

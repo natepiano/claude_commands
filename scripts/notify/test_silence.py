@@ -6,6 +6,9 @@ from __future__ import annotations
 import io
 import json
 import os
+import shutil
+import subprocess
+import sys
 import tempfile
 import threading
 import unittest
@@ -16,8 +19,9 @@ from pathlib import Path
 from typing import cast, override
 from unittest import mock
 
-import silence
-from user_zone import user_zone
+from scripts.notify import push_texts, silence
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.lib.user_zone import user_zone
 
 PUSH: silence.KeptPush = {"source": "build", "priority": "0", "title": "Build done",
                           "message": "No action needed.\nThe build passed.", "detail": "", "key": "", "text_id": ""}
@@ -66,12 +70,72 @@ class SilenceTests(unittest.TestCase):
         self.assertEqual(silence.keep(PUSH, "Linux"), silence.NotSilent())
         self.assertEqual(self.main("status"), "silence off\n")
 
+    def test_nightly_result_without_herdr_keeps_only_the_newest_result_until_silence_ends(self) -> None:
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        checkout = Path(__file__).resolve().parents[2]
+        _ = shutil.copytree(checkout / "config", root / "config")
+        keys = root / "keys"
+        _ = keys.write_text("PUSHOVER_USER=fixture\nPUSHOVER_TOKEN=fixture\n")
+        posted = root / "posted.jsonl"
+        channel = root / "channel.py"
+        _ = channel.write_text('''import json
+import os
+from pathlib import Path
+import sys
+from urllib.parse import parse_qs
+from scripts.notify import pushover, push_texts, silence
+
+def post(url, data):
+    with Path(os.environ["FIXTURE_POSTED"]).open("a") as output:
+        output.write(json.dumps(parse_qs(data.decode())) + "\\n")
+    return 200, b'{"status":1}'
+
+keys = Path(os.environ["FIXTURE_KEYS"])
+push_texts.approval_date = lambda text_id: "2026-11-06"
+if sys.argv[1:] == ["release"]:
+    raise SystemExit(silence.off(lambda command: 0, lambda push: pushover.post_kept(push, keys, post)))
+raise SystemExit(pushover.send(sys.argv[1:], keys, post))
+''')
+        environment = {
+            "HOME": str(root), "PATH": os.environ["PATH"], "HERDR_BIN": "/nonexistent/herdr",
+            "PYTHONPATH": os.pathsep.join([str(checkout), *(str(path) for path in (checkout / "scripts").iterdir()
+                                                         if path.is_dir())]),
+            "CONF_DIR": str(root / "config"), "NOTIFY_STATE_DIR": str(root / "notify"),
+            "XDG_STATE_HOME": str(root / "state"), "USER_ZONE": "America/New_York",
+            "FIXTURE_KEYS": str(keys), "FIXTURE_POSTED": str(posted),
+        }
+        bootstrap = ("import sys; from pathlib import Path; from scripts.message import send; "
+                     "send.USER_CHANNEL = Path(sys.argv[1]); raise SystemExit(send.main(sys.argv[2:]))")
+        with mock.patch.dict(os.environ, environment, clear=True):
+            _ = self.main("on")
+            results = tuple(push_texts.render("nightly.result", branch="main", time="03:53 EST",
+                outcome=outcome, types="passed", tests="passed" if outcome == "passed" else "failed in message/test_send.py")
+                for outcome in ("passed", "failed"))
+            for rendered in results:
+                command = push_texts.user_send_argv(rendered, key="nightly-result")
+                result = subprocess.run([command[0], "-c", bootstrap, str(channel), *command[2:]],
+                    capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn("KEPT:", result.stdout)
+                self.assertFalse(posted.exists())
+                kept, = silence.read_kept()
+                self.assertEqual((kept["title"], kept["message"], kept["key"]),
+                                 (rendered.title, rendered.message, "nightly-result"))
+            released = subprocess.run([sys.executable, str(channel), "release"], capture_output=True,
+                text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
+            self.assertEqual(released.returncode, 0, released.stdout + released.stderr)
+            delivery, = [cast(dict[str, list[str]], json.loads(line)) for line in posted.read_text().splitlines()]
+            self.assertEqual(delivery["title"], [results[-1].title])
+            self.assertTrue(delivery["message"][0].startswith(results[-1].message + "\n"))
+            self.assertEqual(silence.read_kept(), [])
+            self.assertIsNone(silence.read_state())
+
     def test_a_failed_post_is_counted(self) -> None:
         _ = self.main("on")
         _ = silence.keep(PUSH, "Linux")
         with redirect_stdout(io.StringIO()) as output:
             self.assertEqual(silence.off(self.runner, lambda _push: 1), 1)
-        self.assertIn("1 kept push delivered; 1 failed", output.getvalue())
+        self.assertIn("0 kept pushes delivered; 1 failed", output.getvalue())
 
     def test_manual_off_logs_an_automatic_end_before_releasing_pushes(self) -> None:
         record: silence.SilenceRecord = {"since": "2026-11-03T06:00:00+00:00", "until": None,
@@ -96,7 +160,7 @@ class SilenceTests(unittest.TestCase):
         self.assertEqual(silence.read_kept(), [])
 
     def test_manual_off_keeps_automatic_silence_when_the_end_log_fails(self) -> None:
-        import auto_silence
+        from scripts.notify import auto_silence
 
         record: silence.SilenceRecord = {"since": "2026-11-03T06:00:00+00:00", "until": None,
                                          "timer": None, "auto": True}
@@ -113,7 +177,7 @@ class SilenceTests(unittest.TestCase):
         self.assertEqual(silence.kept_file().read_bytes(), kept)
 
     def test_manual_on_preserves_automatic_silence_when_its_end_log_fails(self) -> None:
-        import auto_silence
+        from scripts.notify import auto_silence
 
         record: silence.SilenceRecord = {"since": "2026-11-03T06:00:00+00:00", "until": None,
                                          "timer": None, "auto": True}

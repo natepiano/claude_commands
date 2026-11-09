@@ -11,12 +11,142 @@ from typing import final
 from contextlib import redirect_stdout
 from unittest import mock
 from scripts.production import merge_gate
+from scripts.production.gate_modules import GateRefused
 from scripts.production.merge_gate_test_support import FIXTURE_FOLDERS, gate_suites
 from scripts.production.merge_gate_suites_test_support import GateSuitesFixture
+from scripts.lint.memory_test_support import write_config_fixture
+from pathlib import Path
 
 
 @final
 class MergeGateRerunsTests(GateSuitesFixture):
+    def test_memory_stop_with_a_tripwire_reports_failure_without_a_rerun(self) -> None:
+        module = self.checkout / "scripts/hooks/test_first.py"
+        self.write(module, module.read_text().replace(
+            '        if (state / "sample-module-memory").exists():',
+            '        import subprocess\n'
+            + '        subprocess.run(["cargo", "--version"], check=False)\n'
+            + '        if (state / "sample-module-memory").exists():', 1))
+        self.configure_gate("merge_gate_governor_gib=4")
+        self.record_module_peaks({"hooks/test_first.py": 48.0})
+        output = io.StringIO()
+        with mock.patch.dict(os.environ, self.environment), \
+                self.sampling_module_memory({"hooks/test_first.py": (5120.0, 32.0)}), redirect_stdout(output):
+            run = merge_gate.run_suites(self.checkout)
+        self.assertFalse(run.passed, output.getvalue())
+        result, = run.executions
+        self.assertTrue(result.tripwire_tripped)
+        self.assertIn("peak memory 5.000 GiB", result.killed_for)
+        self.assertIn("a test started real cargo: --version", result.output)
+        starts = [event for event in self.module_events() if event["event"] == "start"]
+        self.assertEqual(len(starts), 1)
+        self.assertNotIn("Rerun alone:", output.getvalue())
+        self.assertEqual(merge_gate.read_measures(self.state / "runner/module_peak_mib.json"),
+                         {"hooks/test_first.py": 48.0})
+        message, = [call for call in self.calls() if call["tool"] == "send.py"]
+        self.assertEqual(message["args"][:4], ["--to", "sdlc", "--from", "merge_gate"])
+        text = message["args"][message["args"].index("--text") + 1]
+        self.assertIn("the gate fails", text)
+        self.assertNotIn("runs again alone", text)
+        self.assertTrue(text.startswith("merge-gate gate integration checkpoint "), text)
+        for detail in (self.base[:7], "hooks/test_first.py", "5.000 GiB", "limit 4 GiB"):
+            self.assertIn(detail, text)
+
+    @gate_suites("lib", "hooks")
+    def test_memory_stopped_module_passes_alone_and_messages_name_the_gate(self) -> None:
+        for mode in merge_gate.SuiteMode:
+            with self.subTest(mode=mode):
+                self.restore_fixture(("lib", "hooks"))
+                self.configure_gate("merge_gate_governor_gib=4")
+                output = io.StringIO()
+                with mock.patch.dict(os.environ, self.environment), \
+                        self.sampling_module_memory({"hooks/test_first.py": (5120.0, 64.0)}), redirect_stdout(output):
+                    run = merge_gate.run_suites(self.checkout, mode=mode, full=True)
+                self.assertTrue(run.passed, output.getvalue())
+                attempts = [job for job in run.executions if job.suite == "hooks"]
+                self.assertEqual(len(attempts), 2)
+                self.assertNotEqual(attempts[0].returncode, 0)
+                self.assertIn("peak memory 5.000 GiB", attempts[0].killed_for)
+                self.assertEqual(attempts[1].returncode, 0)
+                self.assertEqual([job for job in run.jobs if job.suite == "hooks"], [attempts[-1]])
+                events = self.module_events()
+                self.assertEqual([event["event"] for event in events[-2:]], ["start", "finish"])
+                self.assertEqual(events[-2]["suite"], "hooks")
+                self.assertIn("passed on rerun alone; first run", output.getvalue())
+                messages = [call for call in self.calls() if call["tool"] == "send.py"]
+                self.assertEqual(len(messages), 1)
+                self.assertEqual(messages[0]["args"][:4], ["--to", "sdlc", "--from", "merge_gate"])
+                text = messages[0]["args"][messages[0]["args"].index("--text") + 1]
+                for detail in (mode.value, "integration", self.base[:7], "hooks/test_first.py", "5.000 GiB",
+                               "limit 4 GiB", "runs again alone"):
+                    self.assertIn(detail, text)
+
+    def test_memory_retry_count_is_read_at_use_and_exhausted_stops_fail(self) -> None:
+        cases = ((0, (5120.0,), False), (1, (5120.0, 6144.0), False), (2, (5120.0, 6144.0, 64.0), True))
+        for reruns, samples, passed in cases:
+            with self.subTest(reruns=reruns):
+                self.restore_fixture(("hooks",))
+                self.configure_gate("merge_gate_governor_gib=4")
+                _ = write_config_fixture(Path(self.environment["CONF_DIR"]) / "merge_gate.conf",
+                                         f"memory_stop_reruns={reruns}")
+                self.record_module_peaks({"hooks/test_first.py": 48.0})
+                output = io.StringIO()
+                with mock.patch.dict(os.environ, self.environment), \
+                        self.sampling_module_memory({"hooks/test_first.py": samples}) as started, redirect_stdout(output):
+                    run = merge_gate.run_suites(self.checkout)
+                self.assertEqual(run.passed, passed, output.getvalue())
+                self.assertEqual(len(started), len(samples))
+                self.assertEqual(len(run.executions), len(samples))
+                peaks = merge_gate.read_measures(self.state / "runner/module_peak_mib.json")
+                self.assertEqual(peaks, {"hooks/test_first.py": 64.0 if passed else 48.0})
+                stops = [job for job in started if job.killed_for]
+                messages = [call for call in self.calls() if call["tool"] == "send.py"]
+                self.assertEqual(len(messages), len(stops))
+                for number, (job, message) in enumerate(zip(stops, messages, strict=True)):
+                    self.assert_process_stopped(job.process.pid)
+                    text = message["args"][message["args"].index("--text") + 1]
+                    self.assertIn(f"{samples[number] / 1024:.3f} GiB", text)
+                    self.assertIn("runs again alone" if number < reruns else "the gate fails", text)
+                if not passed:
+                    self.assertIn(f"peak memory {samples[-1] / 1024:.3f} GiB", run.jobs[0].killed_for)
+                    self.assertIn(run.jobs[0].killed_for, run.jobs[0].output)
+                    self.assertIn("hooks: RED", output.getvalue())
+
+    @gate_suites(*FIXTURE_FOLDERS)
+    def test_memory_stops_retry_even_when_ordinary_failures_exceed_the_limit(self) -> None:
+        for suite in self.suites:
+            self.write(self.state / ("red-" + suite), "red")
+        self.write(self.checkout / "scripts/lib/test_third.py",
+                   (self.checkout / "scripts/lib/test_first.py").read_text())
+        self.configure_gate("merge_gate_governor_gib=4")
+        output = io.StringIO()
+        with mock.patch.dict(os.environ, self.environment), \
+                self.sampling_module_memory({"hooks/test_first.py": (5120.0, 32.0)}), redirect_stdout(output):
+            run = merge_gate.run_suites(self.checkout)
+        self.assertFalse(run.passed, output.getvalue())
+        starts = [event for event in self.module_events() if event["event"] == "start"]
+        self.assertEqual(len(starts), self.module_count + 2)
+        self.assertEqual(sum(event["suite"] == "hooks" for event in starts), 2)
+        self.assertIn("9 modules failed; this is a real breakage", output.getvalue())
+        self.assertEqual(starts[-1]["suite"], "hooks")
+
+    def test_failed_memory_messages_do_not_change_the_gate_verdict(self) -> None:
+        for samples, passed in (((5120.0, 32.0), True), ((5120.0, 5120.0), False)):
+            with self.subTest(passed=passed):
+                self.restore_fixture(("hooks",))
+                self.configure_gate("merge_gate_governor_gib=4")
+                self.write(self.state / "send-fails", "fail")
+                output = io.StringIO()
+                with mock.patch.dict(os.environ, self.environment), \
+                        self.sampling_module_memory({"hooks/test_first.py": samples}), redirect_stdout(output):
+                    run = merge_gate.run_suites(self.checkout)
+                self.assertEqual(run.passed, passed, output.getvalue())
+                stops = [job for job in run.executions if job.killed_for]
+                messages = [call for call in self.calls() if call["tool"] == "send.py"]
+                self.assertEqual(len(messages), len(stops))
+                self.assertEqual(output.getvalue().count("Memory stop message could not be sent:"), len(stops))
+                self.assertIn("fixture message failed", output.getvalue())
+
     @gate_suites("lib", "hooks")
     def test_red_modules_fail_again_print_both_outputs_and_reset(self) -> None:
         self.write(self.state / "red-lib", "red")
@@ -129,7 +259,7 @@ class MergeGateRerunsTests(GateSuitesFixture):
     def test_failed_rollback_names_merge_commit_and_blocking_files(self) -> None:
         with mock.patch.object(merge_gate, "git", return_value=subprocess.CompletedProcess([], 1, " M unit.txt", "blocked")), mock.patch.object(
                 merge_gate, "checked_git", side_effect=["merge-commit", "unit.txt\0"]):
-            with self.assertRaisesRegex(merge_gate.GateRefused, "merge NOT undone; merge commit merge-commit; blocking files: M unit.txt"):
+            with self.assertRaisesRegex(GateRefused, "merge NOT undone; merge commit merge-commit; blocking files: M unit.txt"):
                 merge_gate.rollback_merge(self.checkout, self.base)
 
 

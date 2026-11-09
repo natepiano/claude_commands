@@ -1,9 +1,13 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
 """Run independent, bounded maintenance parts; never collect recovery snapshots."""
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import argparse
-import os
+import re
 import signal
 import subprocess
 import sys
@@ -16,7 +20,6 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 ROOT = Path(__file__).resolve().parents[2]
-sys.path.insert(0, str(ROOT))
 from scripts.lib import process_group
 from scripts.maintenance.schedule import ScheduleBusy, locked_history, schedule_directory
 from scripts.maintenance.settings import Part, Schedule, settings
@@ -27,7 +30,6 @@ class Outcome(str, Enum):
     FAILED = "failed"
     TIMED_OUT = "timed out"
     NOT_DUE = "not due"
-    SKIPPED = "skipped"
 
 
 @dataclass(frozen=True)
@@ -44,7 +46,7 @@ def run_part(part: Part, cadence: Schedule, deadline: float) -> PartResult:
     remaining = min(cadence.timeout_seconds, deadline - started)
     if remaining <= 0:
         return PartResult(part, Outcome.TIMED_OUT, 0, 124)
-    command = [sys.executable, str(Path(__file__).resolve()), "--part", part.value]
+    command = [str(ROOT / "scripts/lib/py"), str(Path(__file__).resolve()), "--part", part.value]
     try:
         with subprocess.Popen(command, cwd=ROOT, start_new_session=True, stdout=subprocess.PIPE,
                               stderr=subprocess.STDOUT, text=True) as child:
@@ -57,7 +59,7 @@ def run_part(part: Part, cadence: Schedule, deadline: float) -> PartResult:
                     pass
                 output, _ = child.communicate()
                 return PartResult(part, Outcome.TIMED_OUT, time.monotonic() - started, 124, output)
-            return PartResult(part, {0: Outcome.SUCCESS, os.EX_TEMPFAIL: Outcome.SKIPPED}.get(child.returncode, Outcome.FAILED),
+            return PartResult(part, Outcome.SUCCESS if child.returncode == 0 else Outcome.FAILED,
                               time.monotonic() - started, child.returncode, output)
     except OSError as error:
         return PartResult(part, Outcome.FAILED, time.monotonic() - started, 1, str(error))
@@ -74,7 +76,7 @@ def run_job() -> list[PartResult]:
 
         def record(result: PartResult) -> None:
             results[result.part] = result
-            if result.outcome in (Outcome.SUCCESS, Outcome.SKIPPED):
+            if result.outcome is Outcome.SUCCESS:
                 history.record(result.part.value, time.time())
 
         # Quota and the pacer read completed notes; the vault follows all writers.
@@ -103,24 +105,19 @@ def perform(part: Part) -> int:
 
 
 def _perform(part: Part) -> int:
-    # Match the sibling imports the existing command-line tools use.
-    sys.path[:0] = [str(ROOT / "scripts/whoami"), str(ROOT / "scripts/production")]
     if part in (Part.NOTES, Part.QUOTA, Part.PACER):
         if TYPE_CHECKING:
             from scripts.whoami import agent_notes, codex_pacer
         else:
-            import agent_notes
-            import codex_pacer
+            from scripts.whoami import agent_notes
+            from scripts.whoami import codex_pacer
         from scripts.whoami import note_file
         if part is Part.NOTES:
             for line in agent_notes.update(include_warnings=False):
                 print(line)
         elif part is Part.QUOTA:
             from scripts.accounts import accounts
-            if TYPE_CHECKING:
-                from scripts.whoami import quota_alert
-            else:
-                import quota_alert
+            from scripts.whoami import quota_alert
             from scripts.whoami import agent_accounts, usage_store
             # Quota uses the notes' saved usage, never a second live account probe.
             workers = agent_accounts.observe_workers_home()
@@ -137,10 +134,7 @@ def _perform(part: Part) -> int:
         else:
             agent_notes.mark_tier(codex_pacer.tick(list(note_file.read_notes())))
     elif part is Part.REFUSALS:
-        if TYPE_CHECKING:
-            from scripts.whoami import agent_notes
-        else:
-            import agent_notes
+        from scripts.whoami import agent_notes
         from scripts.accounts import accounts, refusal_watch
         from scripts.whoami import agent_accounts, note_file
         def refresh_refusal_usage() -> None:
@@ -148,8 +142,11 @@ def _perform(part: Part) -> int:
                 agent_accounts.observe_workers_home(), agent_notes.claude_note_logins(note_file.read_notes()))
             for line in refreshed.messages:
                 print(line)
-        for line in refusal_watch.run(recover_units=False, refresh_usage=refresh_refusal_usage):
-            print(line)
+        from scripts.shutdown import stop_resume
+
+        with stop_resume.detached_moves():
+            for line in refusal_watch.run(recover_units=False, refresh_usage=refresh_refusal_usage):
+                print(line)
     elif part is Part.WATCHDOG:
         from scripts.accounts import unit_watchdog
         for line in unit_watchdog.run(datetime.now(timezone.utc), dry_run=False):
@@ -157,9 +154,6 @@ def _perform(part: Part) -> int:
     elif part is Part.PRUNE:
         from scripts.production.prune_phase_notes import main
         return main()
-    elif part is Part.HIERARCHY:
-        from scripts.maintenance.hana_hierarchy import main
-        return main([], refusal_exit=os.EX_TEMPFAIL)
     else:
         from scripts.maintenance import vault_commit
         vault = Path.home() / "rust/hanadocs"
@@ -167,9 +161,34 @@ def _perform(part: Part) -> int:
         tracked = vault_commit.git(str(vault), "ls-files", "-z", "--", ":(glob)agents/*.md")
         paths = {str(path) for path in notes.glob("*.md")}
         paths.update(str(vault / path) for path in tracked.stdout.split("\0") if path)
-        paths.add(str(vault / "hana hierarchy.md"))
+        if not paths:
+            return 0
         timestamps = (r"^date_modified:", r"^weekly_usage_checked_at:", r"^weekly_remaining_usage:",
                       r"^credit_balance:", r"^resets:", r"^limit_reset:", r"^Snapshot taken ")
+        # Phase notes join an existing content commit without causing another commit.
+        patterns = [re.compile(pattern) for pattern in timestamps]
+        relative = [str(Path(path).relative_to(vault)) for path in paths]
+        if vault_commit.changed(str(vault), relative, patterns):
+            from scripts.direct import phase_table
+            from scripts.production import staff
+
+            phase_notes = vault / "showrunners"
+            tracked_phases = vault_commit.git(str(vault), "ls-files", "-z", "--", "showrunners")
+            candidates = set(phase_notes.glob("*/*.md"))
+            candidates.update(
+                vault / path for path in tracked_phases.stdout.split("\0")
+                if Path(path).suffix == ".md" and Path(path).parent.parent == Path("showrunners")
+            )
+            record = staff.snapshot()
+            for path in candidates:
+                content = vault_commit.read(str(path))
+                if isinstance(content, vault_commit.NoteAbsent):
+                    shown = vault_commit.git(str(vault), "show", f"HEAD:{path.relative_to(vault)}")
+                    if shown.returncode != 0:
+                        continue
+                    content = vault_commit.NoteContent(shown.stdout)
+                if isinstance(phase_table.phase_note_ownership(content.text, record), phase_table.NoteOwnership):
+                    paths.add(str(path))
         return vault_commit.main(["--job", "agent-notes", *[arg for pattern in timestamps for arg in ("--timestamp", pattern)], "--", *sorted(paths)])
     return 0
 

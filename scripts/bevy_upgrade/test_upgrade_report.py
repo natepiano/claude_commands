@@ -8,9 +8,9 @@ from pathlib import Path
 from typing import final, override
 from zoneinfo import ZoneInfo
 
-import pins
-import upgrade_record
-import upgrade_report
+from scripts.bevy_upgrade import pins
+from scripts.bevy_upgrade import upgrade_record
+from scripts.bevy_upgrade import upgrade_report
 
 NOW = datetime(2026, 10, 12, 19, 8, 41, tzinfo=timezone.utc)
 REVISION = "1234567890abcdef1234567890abcdef12345678"
@@ -29,7 +29,7 @@ class ReportTests(unittest.TestCase):
     def __init__(self, methodName: str = "runTest") -> None:
         super().__init__(methodName)
         self.current: upgrade_record.Record = {
-            "slug": "demo", "production": "", "checkout": "", "target": "0.20",
+            "staff_id": "fixture-owner", "production": "", "checkout": "", "target": "0.20",
             "started": NOW.isoformat(), "closed": None, "bevy": [],
             "pins_read": NOW.isoformat(), "dependencies": {},
             "target_bevy": {"status": "unread"}, "target_error": "", "checked": None, "announced": None,
@@ -49,11 +49,11 @@ class ReportTests(unittest.TestCase):
         _ = doc.write_text(
             "# Demo\n\n- **Merge branch:** demo\n"
             + f"- **Showrunner checkout:** {checkout}\n"
-            + "- **Log:** log.md\n- **User zone:** America/New_York\n\n## Units\n",
+            + "- **Log:** log.md\n- **User zone:** America/New_York\n",
             encoding="utf-8",
         )
         self.current = {
-            "slug": "demo", "production": str(doc), "checkout": str(checkout),
+            "staff_id": "fixture-owner", "production": "demo", "checkout": str(checkout),
             "target": "0.20", "started": NOW.isoformat(), "closed": None,
             "bevy": ["0.19.1", "0.20.0"], "pins_read": NOW.isoformat(), "dependencies": {},
             "target_bevy": {"status": "unread"}, "target_error": "", "checked": None, "announced": None,

@@ -1,46 +1,40 @@
 """Read the showrunner reporting tree from one staff snapshot."""
 from __future__ import annotations
 
-import sys
 from dataclasses import dataclass
-from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-from scripts.production import staff, staff_sources
+from scripts.production import staff
 from scripts.production import showrunners
 
 
 def parent_edges(*, record: staff.StaffSnapshot | None = None) -> dict[str, str]:
-    """Join showrunner parent ids from one snapshot to their production slugs."""
+    """Map showrunner parent ids to production names from one snapshot."""
     record = staff.snapshot() if record is None else record
-    members = staff_sources.showrunner_members(record)
     names = {row.id: row.name for row in staff.active(record, "showrunner")}
-    names.update({row.id: slug for slug, row in members.items() if row.id in names})
-    return {names[row.id]: names[row.parent] for row in staff.active(record, "showrunner")
-            if row.parent is not None and row.parent in names}
+    return {names[row.id]: names[row.parent.id] for row in staff.active(record, "showrunner")
+            if isinstance(row.parent, staff.ReportsTo) and row.parent.id in names}
 
 
-def edges(slugs: set[str] | None = None, *, record: staff.StaffSnapshot | None = None) -> dict[str, str]:
-    """Each recorded showrunner's parent, optionally restricted to the displayed slugs."""
+def edges(production_names: set[str] | None = None, *, record: staff.StaffSnapshot | None = None) -> dict[str, str]:
+    """Return each showrunner's parent, optionally limited to the displayed production names."""
     tree = parent_edges(record=record)
-    return tree if slugs is None else {child: parent for child, parent in tree.items()
-                                      if child in slugs and parent in slugs}
+    return tree if production_names is None else {child: parent for child, parent in tree.items()
+                                      if child in production_names and parent in production_names}
 
 
-def parent_of(slug: str, *, record: staff.StaffSnapshot | None = None) -> str:
-    """The production `slug` reports to. Empty for a root."""
-    return edges(record=record).get(slug, "")
+def parent_of(production_name: str, *, record: staff.StaffSnapshot | None = None) -> str:
+    """The production `production_name` reports to. Empty for a root."""
+    return edges(record=record).get(production_name, "")
 
 
-def children_of(slug: str, *, record: staff.StaffSnapshot | None = None) -> list[str]:
-    """The productions that report to `slug`, one level down."""
-    return sorted(child for child, parent in edges(record=record).items() if parent == slug)
+def children_of(production_name: str, *, record: staff.StaffSnapshot | None = None) -> list[str]:
+    """The productions that report to `production_name`, one level down."""
+    return sorted(child for child, parent in edges(record=record).items() if parent == production_name)
 
 
-def _below(slug: str, tree: dict[str, str]) -> list[str]:
-    level = [slug]
+def _below(production_name: str, tree: dict[str, str]) -> list[str]:
+    level = [production_name]
     found: list[str] = []
     while level:
         level = sorted(child for child, parent in tree.items() if parent in level)
@@ -48,30 +42,30 @@ def _below(slug: str, tree: dict[str, str]) -> list[str]:
     return found
 
 
-def descendants_of(slug: str, *, record: staff.StaffSnapshot | None = None) -> list[str]:
-    """Every production below `slug`, at any depth, the nearest level first."""
-    return _below(slug, edges(record=record))
+def descendants_of(production_name: str, *, record: staff.StaffSnapshot | None = None) -> list[str]:
+    """Every production below `production_name`, at any depth, the nearest level first."""
+    return _below(production_name, edges(record=record))
 
 
-def _root_in(slug: str, tree: dict[str, str]) -> str:
-    while slug in tree:
-        slug = tree[slug]
-    return slug
+def _root_in(production_name: str, tree: dict[str, str]) -> str:
+    while production_name in tree:
+        production_name = tree[production_name]
+    return production_name
 
 
-def user_facing(slug: str, below: bool = False, *, record: staff.StaffSnapshot | None = None) -> list[str]:
-    """The productions whose items for the user `slug`'s showrunner counts and lists.
+def user_facing(production_name: str, below: bool = False, *, record: staff.StaffSnapshot | None = None) -> list[str]:
+    """The productions whose items for the user `production_name`'s showrunner counts and lists.
 
     Each showrunner answers for its own production only: the showrunner above it and the
     showrunners below it answer for theirs (user, 2026-10-27). `below` adds every production
     below it, at any depth (`/next all-below`). A production above or beside it never counts.
     """
-    return [slug, *descendants_of(slug, record=record)] if below else [slug]
+    return [production_name, *descendants_of(production_name, record=record)] if below else [production_name]
 
 
-def root_of(slug: str, *, record: staff.StaffSnapshot | None = None) -> str:
-    """The top of the tree `slug` is in, the showrunner that shows the user everything below it. A root is its own."""
-    return _root_in(slug, edges(record=record))
+def root_of(production_name: str, *, record: staff.StaffSnapshot | None = None) -> str:
+    """The top of the tree `production_name` is in, the showrunner that shows the user everything below it. A root is its own."""
+    return _root_in(production_name, edges(record=record))
 
 
 def highest_running(runners: list[showrunners.Showrunner], *, record: staff.StaffSnapshot | None = None) -> list[showrunners.Showrunner]:
@@ -81,32 +75,32 @@ def highest_running(runners: list[showrunners.Showrunner], *, record: staff.Staf
     production must hear once, a machine-wide fault, goes to these.
     """
     tree = edges(record=record)
-    running = {runner["slug"] for runner in runners if runner["socket"]}
+    running = {runner["name"] for runner in runners if runner["socket"]}
 
-    def covered(slug: str) -> bool:
-        while slug in tree:
-            slug = tree[slug]
-            if slug in running:
+    def covered(production_name: str) -> bool:
+        while production_name in tree:
+            production_name = tree[production_name]
+            if production_name in running:
                 return True
         return False
 
-    return [runner for runner in runners if runner["socket"] and not covered(runner["slug"])]
+    return [runner for runner in runners if runner["socket"] and not covered(runner["name"])]
 
 
 def tree_lines(runners: list[showrunners.Showrunner], *, record: staff.StaffSnapshot | None = None) -> list[str]:
     """One line per showrunner, each child indented under its parent."""
-    tree = edges({runner["slug"] for runner in runners}, record=record)
-    names = {runner["slug"]: runner["session"] or "<not running>" for runner in runners}
+    tree = edges({runner["name"] for runner in runners}, record=record)
+    names = {runner["name"]: runner["session"] or "<not running>" for runner in runners}
     lines: list[str] = []
 
-    def add(slug: str, depth: int) -> None:
-        lines.append(f"{'  ' * depth}{slug}\t{names[slug]}")
-        for child in sorted(child for child, parent in tree.items() if parent == slug):
+    def add(production_name: str, depth: int) -> None:
+        lines.append(f"{'  ' * depth}{production_name}\t{names[production_name]}")
+        for child in sorted(child for child, parent in tree.items() if parent == production_name):
             add(child, depth + 1)
 
-    for slug in sorted(names):
-        if slug not in tree:
-            add(slug, 0)
+    for production_name in sorted(names):
+        if production_name not in tree:
+            add(production_name, 0)
     return lines
 
 
@@ -116,16 +110,14 @@ class ParentCycle(ValueError):
 
 def check_attach(child: str, parent: str, *, record: staff.StaffSnapshot | None = None) -> None:
     """Check the source-side attach rules before either record changes."""
-    child = showrunners.canonical_slug(child)
-    parent = showrunners.canonical_slug(parent)
-    known = showrunners.timer_slugs()
-    for slug in (child, parent):
-        if slug not in known:
-            raise ValueError(f"{slug} has no update timer, so it has no showrunner to attach")
+    known = showrunners.timer_names()
+    for production_name in (child, parent):
+        if production_name not in known:
+            raise ValueError(f"{production_name} has no update timer, so it has no showrunner to attach")
     if child == parent:
         raise ValueError(f"{child} cannot report to itself")
     for runner in showrunners.require_complete(showrunners.registered_showrunners()):
-        if runner["slug"] in (child, parent) and runner["socket"] and (why := showrunners.name_refusal(runner["slug"], runner["session"])):
+        if runner["name"] in (child, parent) and runner["socket"] and (why := showrunners.name_refusal(runner["name"], runner["session"])):
             raise ValueError(why)
     tree = edges(record=record)
     if child in tree and tree[child] != parent:
@@ -154,34 +146,20 @@ class WrapRelease:
     told: tuple[str, ...]
 
 
-def stored_children(slug: str, *, record: staff.StaffSnapshot | None = None) -> list[str]:
+def stored_children(production_name: str, *, record: staff.StaffSnapshot | None = None) -> list[str]:
     """Every child in the staff record, including productions with no local timer."""
-    return children_of(slug, record=record)
+    return children_of(production_name, record=record)
 
 
-def edges_to_release(slug: str, *, record: staff.StaffSnapshot | None = None) -> WrapRelease:
+def edges_to_release(production_name: str, *, record: staff.StaffSnapshot | None = None) -> WrapRelease:
     """Capture recorded edges before wrap retires any row."""
     tree = edges(record=record)
-    parent = tree.get(slug, "")
-    children = tuple(sorted(child for child, above in tree.items() if above == slug))
+    parent = tree.get(production_name, "")
+    children = tuple(sorted(child for child, above in tree.items() if above == production_name))
     return WrapRelease(ReportedTo(parent) if parent else Root(), children, ())
 
 
-def release_edges(slug: str, released: WrapRelease, *, record: staff.StaffSnapshot | None = None) -> None:
-    """Remove captured legacy files unless the record has a subsequent attachment."""
-    tree = edges(record=record)
-    captured = [(child, slug) for child in released.former_children]
-    if isinstance(released.former_parent, ReportedTo):
-        captured.insert(0, (slug, released.former_parent.parent))
-    for child, parent in captured:
-        current = tree.get(child, "")
-        if not current or current == parent:
-            (showrunners.SHOWRUNNER_STATE_DIR / child / showrunners.PARENT_FILE).unlink(missing_ok=True)
-        else:
-            print(f"showrunners: keep {child} -> {current}; captured parent was {parent}", file=sys.stderr)
-
-
-def main(action: str, slug: str) -> int:
+def main(action: str, production_name: str) -> int:
     """Answer the reporting-tree verbs parsed by the showrunner command."""
     if action == "tree":
         runners = showrunners.registered_showrunners()
@@ -189,12 +167,11 @@ def main(action: str, slug: str) -> int:
             print(line)
         _ = showrunners.require_complete(runners)
     else:
-        slug = showrunners.canonical_slug(slug)
-        if slug not in showrunners.timer_slugs():
-            raise ValueError(f"{slug} has no update timer")
+        if production_name not in showrunners.timer_names():
+            raise ValueError(f"{production_name} has no update timer")
         # A root prints no parent and no children: an empty answer is the answer.
-        answers = (children_of(slug) if action == "children"
-                   else [parent_of(slug) if action == "parent" else root_of(slug)])
+        answers = (children_of(production_name) if action == "children"
+                   else [parent_of(production_name) if action == "parent" else root_of(production_name)])
         for answer in answers:
             if answer:
                 print(answer)

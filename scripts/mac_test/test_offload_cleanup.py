@@ -11,16 +11,12 @@ import unittest
 from contextlib import redirect_stdout
 import io
 from pathlib import Path
-from typing import TYPE_CHECKING, cast, override
+from typing import cast, override
 from unittest import mock
-import offload
-import mac_test
-from offload_test_commands import ACTIVITY_SELECTOR_STUB, write_shell
-from offload_test_support import HANA, HANA_COMMAND_PATTERN, SelectorEvent
-if TYPE_CHECKING:
-    from ..lib import test_hang_guard
-else:
-    from scripts.lib import test_hang_guard
+from scripts.mac_test import offload, mac_test
+from scripts.mac_test.offload_test_commands import ACTIVITY_SELECTOR_STUB, write_shell
+from scripts.mac_test.offload_test_support import HANA, HANA_COMMAND_PATTERN, SelectorEvent
+from scripts.lib import test_hang_guard
 
 
 class MacCleanupProtocolTests(unittest.TestCase):
@@ -37,7 +33,8 @@ class MacCleanupProtocolTests(unittest.TestCase):
 
     def test_stream_returns_cleanup_outcome_beside_the_reported_test_status(self) -> None:
         cases = (
-            ("mac_cleanup=0\n", 0, offload.CleanupDone()),
+            ("mac_cleanup=0 32715571 92\n", 0, offload.CleanupDone(offload.MeasuredCleanupSize(32715571), 92)),
+            ("mac_cleanup=0 - 92.5\n", 0, offload.CleanupDone(offload.CleanupSizeNotMeasured(), 92.5)),
             ("mac_cleanup=kept\n", 0, offload.CleanupKept()),
             ("mac_cleanup=7\n", 0, offload.CleanupFailed(7)),
             ("mac_cleanup=skipped\n", 0, offload.CleanupSkipped()),
@@ -54,6 +51,33 @@ class MacCleanupProtocolTests(unittest.TestCase):
                     ])
                 self.assertEqual(answer, offload.ReportedMacStatus(42, expected))
                 self.assertEqual(output.getvalue(), "test output\n")
+
+    def test_bare_success_confirms_cleanup_without_a_removal_line(self) -> None:
+        output = io.StringIO()
+        controller = offload.ProcessController()
+        with redirect_stdout(output):
+            answer = controller.stream_mac_run([
+                "/bin/sh", "-c", 'printf "mac_exit=0\\nmac_cleanup=0\\n"',
+            ])
+            if not isinstance(answer, offload.ReportedMacStatus):
+                self.fail("The remote command did not report its status.")
+            self.assertEqual(answer, offload.ReportedMacStatus(0, offload.CleanupRemovedWithoutFacts()))
+            offload.report_cleanup(answer.cleanup, "", path="unused", free_floor_gib=100)
+        self.assertEqual(output.getvalue(), "")
+
+    def test_cleanup_reports_one_removal_line_with_the_size_and_free_space(self) -> None:
+        for size, free, text in (
+            (offload.MeasuredCleanupSize(32715571), 92, "31.2 GiB; Mac free 92 GiB"),
+            (offload.CleanupSizeNotMeasured(), 92.5, "size not measured; Mac free 92.5 GiB"),
+        ):
+            with self.subTest(size=size):
+                output = io.StringIO()
+                with redirect_stdout(output):
+                    offload.report_cleanup(offload.CleanupDone(size, free), "",
+                                           path="~/.local/state/mac-test/mirror/hana/target", free_floor_gib=100)
+                self.assertEqual(output.getvalue(),
+                                 "Mac build output removed: ~/.local/state/mac-test/mirror/hana/target, "
+                                 + text + " under the 100 GiB floor\n")
 
 
 class MacTargetCleanupShellTests(unittest.TestCase):
@@ -104,7 +128,7 @@ exit "$CLEANUP_TEST_STATUS"
         disk_status: int = 0,
         free_floor_gib: float = 100,
     ) -> subprocess.CompletedProcess[str]:
-        request = offload.OffloadRequest(self.root, "hana", "cleanup-call", offload.NO_RESULT_FILE, words)
+        request = offload.OffloadRequest(self.root, "hana", "cleanup-call", offload.NO_RESULT_FILE, words, owner="verify", holder_session="fixture-session")
         config = offload.OffloadConfig(
             enabled=True, connection=offload.SshConnectionSettings("unused-host", 6, 10), probe_timeout_s=1,
             unreachable_backoff_s=300, free_floor_gib=free_floor_gib,
@@ -138,7 +162,16 @@ exit "$CLEANUP_TEST_STATUS"
                     _ = (target / "previous-build").write_text("old\n")
                     answer = self.run_remote(shell, status)
                     self.assertEqual(answer.returncode, 0, answer.stdout + answer.stderr)
-                    self.assertEqual(answer.stdout.splitlines(), ["nextest finished", f"mac_exit={status}", "mac_cleanup=0"])
+                    lines = answer.stdout.splitlines()
+                    self.assertEqual(lines[:2], ["nextest finished", f"mac_exit={status}"])
+                    self.assertEqual(len(lines), 3)
+                    self.assertRegex(lines[2], r"^mac_cleanup=0 [0-9]+ 99$")
+                    cleanup = offload.parse_cleanup(lines[2].removeprefix("mac_cleanup="))
+                    if not isinstance(cleanup, offload.CleanupDone):
+                        self.fail("The removal marker did not report a completed cleanup.")
+                    if not isinstance(cleanup.size, offload.MeasuredCleanupSize):
+                        self.fail("The target size was not measured.")
+                    self.assertGreater(cleanup.size.kib, 0)
                     self.assertEqual(answer.stderr, "")
                     self.assertFalse(target.exists())
                     self.assertEqual((self.root / "sweep-switch").read_text(), "1")
@@ -148,6 +181,23 @@ exit "$CLEANUP_TEST_STATUS"
                     )
                     for path in (sibling, temporary_file, other_target):
                         self.assertEqual(path.read_text(), "keep\n")
+
+    def test_failed_size_measurement_still_removes_the_target_under_sh_and_zsh(self) -> None:
+        write_shell(self.bin_directory / "du", r'''
+json_args "$@" > "$CLEANUP_TEST_DIR/du-arguments.json"
+printf '12\t%s\n' "$2"
+exit 1
+''')
+        for shell in (["/bin/sh"], ["zsh", "-f"]):
+            with self.subTest(shell=shell):
+                answer = self.run_remote(shell, 0)
+                self.assertEqual(answer.returncode, 0, answer.stdout + answer.stderr)
+                self.assertEqual(answer.stdout.splitlines(),
+                                 ["nextest finished", "mac_exit=0", "mac_cleanup=0 - 99"])
+                self.assertEqual(answer.stderr, "")
+                self.assertFalse((self.mirror / "target").exists())
+                self.assertEqual(json.loads((self.root / "du-arguments.json").read_text()),
+                                 ["-sk", str(self.mirror / "target")])
 
     def test_remote_text_at_or_above_space_floor_keeps_build_output(self) -> None:
         target = self.mirror / "target"
@@ -253,7 +303,7 @@ class MacActivityShellTests(unittest.TestCase):
         for shell in (["/bin/sh"], ["zsh", "-f"]):
             with self.subTest(shell=shell):
                 answer = self.run_activity(shell, responses)
-                self.assertEqual((answer.returncode, answer.stdout, answer.stderr), (0, "active=0\nrc=0\n", ""))
+                self.assertEqual((answer.returncode, answer.stdout, answer.stderr), (0, "active=0\nwork=0\nrc=0\n", ""))
 
     def test_activity_text_counts_each_matching_user_pid_once_under_sh_and_zsh(self) -> None:
         responses = {
@@ -267,7 +317,7 @@ class MacActivityShellTests(unittest.TestCase):
         for shell in (["/bin/sh"], ["zsh", "-f"]):
             with self.subTest(shell=shell):
                 answer = self.run_activity(shell, responses)
-                self.assertEqual((answer.returncode, answer.stdout, answer.stderr), (0, "active=7\nrc=0\n", ""))
+                self.assertEqual((answer.returncode, answer.stdout, answer.stderr), (0, "active=7\nwork=5\nrc=0\n", ""))
                 calls = [cast(SelectorEvent, json.loads(line)) for line in (self.root / "commands.jsonl").read_text().splitlines()]
                 pgrep = [call for call in calls if call["command"] == "pgrep"]
                 lsof = [call for call in calls if call["command"] == "lsof"]
