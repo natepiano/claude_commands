@@ -281,7 +281,7 @@ class ConversationPauseTests(ConversationPauseFixture):
                 patch.object(herdr.Herdr, "result", return_value={"process_info": {
                     "shell_pid": 998041, "foreground_process_group_id": 998042,
                     "foreground_processes": [{"pid": 998042, "argv": ["claude"]}]}}), \
-                patch.object(herdr, "native_process", return_value=herdr.NativeAgentProcess(herdr.RolloutThread(SESSION), "fixture-start", {})), \
+                patch.object(herdr, "native_process", return_value=herdr.NativeAgentProcess(herdr.EnvironmentThread(SESSION), "fixture-start", {})), \
                 patch.object(herdr.Herdr, "composer", return_value=herdr.ComposerInput("")):
             conversation_pause.record_scheduled_prompts(SESSION, (resume,))
             with patch.object(herdr.Herdr, "prompt") as transmitted:

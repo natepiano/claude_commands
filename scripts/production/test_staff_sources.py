@@ -170,9 +170,6 @@ class StaffSourcesTests(StaffTestCase):
     @override
     def setUp(self) -> None:
         super().setUp()
-        # Synthetic processes have no open rollout unless the test supplies one.
-        _ = self.enterContext(mock.patch.object(herdr, "codex_rollout_thread",
-                                                side_effect=herdr.NoOpenCodexRollout("no open rollout")))
         # Keep the host's scratch policy, with a private root for this fixture.
         _ = self.enterContext(mock.patch.object(showrunners, "SCRATCH_ROOT", self.root / "scratch-checkout"))
 
@@ -401,36 +398,36 @@ class StaffSourcesTests(StaffTestCase):
             ])
             staff_sources.require_worker_stopped(staff.snapshot(), worker.id)
 
-    def test_current_rollout_overrides_resume_and_does_not_block_the_old_thread(self) -> None:
+    def test_resume_argument_overrides_an_inherited_thread_and_does_not_block_the_old_thread(self) -> None:
         from scripts.message import process_table
 
         owner = unit_membership("show", "unit")
         old = fixture_worker("old", owner.id, backend=staff.CodexBackend(self.root / "codex"))
         current = fixture_worker("current", owner.id, backend=staff.CodexBackend(self.root / "codex"))
-        table = {42401: process_table.Process(42401, 1, "codex", f"codex resume {old.current_session}")}
+        process = self.root / "proc/42401"
+        process.mkdir(parents=True)
         record = staff.snapshot()
-        with (mock.patch.object(herdr, "codex_rollout_thread", return_value=current.current_session),
-              mock.patch.object(herdr, "codex_resume_thread", return_value=old.current_session) as resume,
-              mock.patch.object(herdr, "process_environment", return_value={"CODEX_THREAD_ID": old.current_session}),
-              mock.patch.object(process_table, "snapshot", return_value=table),
-              mock.patch.object(session_staff, "member_sources", return_value=MemberSources(()))):
-            reader = staff_sources.CodexProcessThreads()
-            self.assertEqual(reader.thread(42401, {"CODEX_THREAD_ID": old.current_session}), current.current_session)
-            staff_sources.require_worker_stopped(record, old.id)
-            with self.assertRaises(staff.StaffRefused):
-                staff_sources.require_worker_stopped(record, current.id)
-        resume.assert_not_called()
-
-    def test_unreadable_open_rollout_never_uses_a_lower_identity_source(self) -> None:
-        for failure in (PermissionError("rollout denied"), ValueError("rollout ambiguous"),
-                        herdr.HerdrFailure("rollout read failed")):
-            with (self.subTest(failure=type(failure).__name__),
-                  mock.patch.object(herdr, "codex_rollout_thread", side_effect=failure),
-                  mock.patch.object(herdr, "codex_resume_thread") as resume,
-                  mock.patch.object(herdr, "herdr_place_of") as place):
-                self.assertEqual(staff_sources.CodexProcessThreads().thread(42401, {"CODEX_THREAD_ID": "old"}), "")
-            resume.assert_not_called()
-            place.assert_not_called()
+        environment = {"CODEX_THREAD_ID": old.current_session}
+        for evidence in ("resume", "another foreground process", "herdr read failure"):
+            with self.subTest(evidence=evidence):
+                arguments = ["codex", "resume", current.current_session] if evidence == "resume" else ["codex"]
+                write_text_atomic(process / "cmdline", "\0".join(arguments) + "\0")
+                table = {42401: process_table.Process(42401, 1, "codex", " ".join(arguments))}
+                with (mock.patch.dict(os.environ, {"HERDR_PROC": str(process.parent), "HERDR_PLATFORM": "linux"}),
+                      mock.patch.object(herdr, "process_environment", return_value=environment),
+                      mock.patch.object(herdr, "herdr_place_of", return_value=herdr.HerdrPlace("agents", "test:pane"),
+                          side_effect=herdr.HerdrFailure("pane read failed") if evidence == "herdr read failure" else None),
+                      mock.patch.object(herdr.Herdr, "result", return_value={"process_info": {
+                          "foreground_processes": [{"pid": 42402, "argv": ["codex"]}]}}),
+                      mock.patch.object(process_table, "snapshot", return_value=table),
+                      mock.patch.object(session_staff, "member_sources", return_value=MemberSources(()))):
+                    reader = staff_sources.CodexProcessThreads()
+                    expected = current.current_session if evidence == "resume" else old.current_session
+                    self.assertEqual(reader.thread(42401, environment), expected)
+                    if evidence == "resume":
+                        staff_sources.require_worker_stopped(record, old.id)
+                        with self.assertRaises(staff.StaffRefused):
+                            staff_sources.require_worker_stopped(record, current.id)
 
     def test_resumed_codex_session_without_a_staff_row_is_quiet(self) -> None:
         from scripts.message import process_table
