@@ -1,7 +1,7 @@
 #!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
 """Claude gets one phone reminder when a low account lacks an account-move entry.
 
-Codex refusal reruns reach only the stopped command's director; other notices are logged.
+Codex refusal broadcasts no-worker mode when no account has capacity.
 Failed phone delivery stays due until the next timer pass. Claude recovery closes
 its episode silently; /quota_refresh still refreshes readings.
 """
@@ -20,6 +20,7 @@ import json
 import math
 import os
 import signal
+import socket
 import subprocess
 import sys
 import uuid
@@ -258,6 +259,7 @@ AGENTS = Path(__file__).resolve().parent.parent / "agents" / "models_config.sh"
 REGISTRY = models_registry.registry_path()
 # The session whose user is shown a switch on their next prompt.
 OWNER = "natedev"
+NO_WORKER_MODE_SENDER = "quota-alert"
 KILL_GRACE = 10
 
 
@@ -406,6 +408,7 @@ class State(TypedDict):
     pending_routing: NotRequired[moves.RoutedToClaude]
     pending_move_failures: NotRequired[list[moves.FailedMove]]
     workers_move_notices: NotRequired[dict[str, str]]
+    no_worker_mode: NotRequired[bool]
 
 
 class StoredFallback(TypedDict):
@@ -429,6 +432,7 @@ class StoredState(TypedDict):
     pending_routing: NotRequired[moves.RoutedToClaude]
     pending_move_failures: NotRequired[list[moves.FailedMove]]
     workers_move_notices: NotRequired[dict[str, str]]
+    no_worker_mode: NotRequired[bool]
 
 
 class StoredPendingClaudeSwitch(TypedDict):
@@ -483,6 +487,8 @@ def _stored_fallback(fallback: AccountCodexQuotaFallback | UnknownOwnerCodexQuot
 
 def _stored_state(state: State) -> StoredState:
     saved = StoredState(episodes=state["episodes"])
+    if "no_worker_mode" in state:
+        saved["no_worker_mode"] = state["no_worker_mode"]
     if "codex_zero" in state:
         saved["codex_zero"] = state["codex_zero"]
     if "refusal_notices" in state:
@@ -640,6 +646,24 @@ def _write_state(state: State) -> None:
     os.replace(tmp, STATE)
 
 
+def _broadcast_worker_mode(active: bool) -> None:
+    """Start one notice unit after the state lock closes."""
+    try:
+        account_config = conf.read("accounts")
+        text = account_config.text("no_worker_mode_on") if active else account_config.text("no_worker_mode_off")
+        scripts = Path(__file__).resolve().parents[1]
+        command = [os.environ.get("SHUTDOWN_SYSTEMD_RUN", "systemd-run"), "--user", "--collect", "--quiet", "--no-block",
+                   "--working-directory=" + str(scripts.parent), "--", str(scripts / "lib/py"),
+                   str(scripts / "production/broadcast.py"), "--from", NO_WORKER_MODE_SENDER,
+                   "--showrunners", text, "--units", text]
+        result = subprocess.run(command, stdin=subprocess.DEVNULL, capture_output=True, text=True, check=False)
+    except (OSError, ValueError, subprocess.SubprocessError) as error:
+        print(f"quota-alert: no-worker mode broadcast failed: {' '.join(str(error).split())}")
+    else:
+        if result.returncode:
+            print(f"quota-alert: no-worker mode broadcast failed: exit {result.returncode}")
+
+
 @contextmanager
 def state_file() -> Generator[State]:
     """The state under an exclusive lock, written back on exit.
@@ -669,6 +693,8 @@ def state_file() -> Generator[State]:
                 state["unseen"] = saved["unseen"]
             if "workers_move_notices" in saved:
                 state["workers_move_notices"] = saved["workers_move_notices"]
+            if "no_worker_mode" in saved:
+                state["no_worker_mode"] = saved["no_worker_mode"]
             if "pending_routing" in saved:
                 state["pending_routing"] = saved["pending_routing"]
             if "pending_move_failures" in saved:
@@ -691,11 +717,15 @@ def state_file() -> Generator[State]:
         except (OSError, ValueError):
             state = State(episodes={}, fallback=NoCodexQuotaFallback())
         before = json.dumps(_stored_state(state), sort_keys=True)
+        mode_before = state.get("no_worker_mode", False)
         for episode in state["episodes"].values():
             _ = cast(dict[str, object], cast(object, episode)).pop("acknowledged", None)
         yield state
         if json.dumps(_stored_state(state), sort_keys=True) != before:
             _write_state(state)
+        mode_after = state.get("no_worker_mode", False)
+    if mode_after != mode_before:
+        _broadcast_worker_mode(mode_after)
 
 
 
@@ -982,7 +1012,7 @@ def switch_back(state: State, now: datetime, readings: CodexAlertPassReadings) -
     _finish_workers_transitions(now)
     _room_again(now)
     fallback = state["fallback"]
-    if isinstance(fallback, NoCodexQuotaFallback):
+    if isinstance(fallback, NoCodexQuotaFallback) and not state.get("no_worker_mode", False):
         return NoCodexFallbackRestoration()
     if (isinstance(fallback, AccountCodexQuotaFallback) and isinstance(fallback.hold, ScheduledMoveHold)
             and now < fallback.hold.until):
@@ -1036,8 +1066,11 @@ def switch_back(state: State, now: datetime, readings: CodexAlertPassReadings) -
             return NoCodexFallbackRestoration()
     if isinstance(readings.workers, NoWorkersHome):
         return NoCodexFallbackRestoration()
-    if isinstance(fallback, NoCodexQuotaFallback) or not isinstance(
+    if not isinstance(
             codex_can_work(selected_codex_report(readings, now), now, agent_accounts.codex_credits_setting(readings.workers.label)), CodexWorkAvailable):
+        return NoCodexFallbackRestoration()
+    if isinstance(fallback, NoCodexQuotaFallback):
+        _ = state.pop("no_worker_mode", None)
         return NoCodexFallbackRestoration()
     restored_account = selected if isinstance(selected, agent_accounts.KnownCodexAccount) else NO_RESTORATION_ACCOUNT
     role_map.write_role_map(role_map.WorkersClaudeRouteChange(
@@ -1059,6 +1092,8 @@ def switch_back(state: State, now: datetime, readings: CodexAlertPassReadings) -
             else:
                 back.moved.append(key)
     state["fallback"] = replace(fallback, moved=tuple(failed_keys)) if failed_keys else NoCodexQuotaFallback()
+    if not failed_keys:
+        _ = state.pop("no_worker_mode", None)
     if not failed_keys and isinstance(fallback, AccountCodexQuotaFallback):
         _ = state.get("refusal_notices", {}).pop(str(fallback.owner.home), None)
     stamp = now.isoformat(timespec="seconds")
@@ -2181,6 +2216,8 @@ def _route_refusal(notes: list[AgentNote], refusing_account: agent_accounts.Refu
                             move_id=uuid.uuid4().hex, earliest_reset=chosen.earliest_reset.at.isoformat()
                             if isinstance(chosen.earliest_reset, accounts.EarliestReset) else ""))
                     no_room = accounts.no_room_line("codex", chosen)
+                    if socket.gethostname().split(".", 1)[0] == role_map.ROLE_MAP_HOST:
+                        state["no_worker_mode"] = True
         if pending_head and not transition_line:
             return [f"workers next entry is pending; {name} refusal recorded without a fallback move"]
         if transition_line:
@@ -2255,7 +2292,7 @@ def _route_refusal(notes: list[AgentNote], refusing_account: agent_accounts.Refu
 def refresh(notes: list[AgentNote], here: str | None, now: datetime | None = None, *,
             selection: ClaudeAccountsInUse | ReadCurrentClaudeSelection = READ_CURRENT_CLAUDE_SELECTION,
             codex_readings: CodexAlertPassReadings | ReadCurrentCodexReadings = READ_CURRENT_CODEX_READINGS) -> list[str]:
-    """Refresh readings and restore routing without messaging sessions."""
+    """Refresh readings and restore routing, including the workers-back notice."""
     del here
     selection = _selection(selection)
     now = now or datetime.now(timezone.utc)
@@ -2263,15 +2300,17 @@ def refresh(notes: list[AgentNote], here: str | None, now: datetime | None = Non
     _save_codex_readings(codex_readings, now)
     threshold = load_config()["threshold_percent"]
     with state_file() as state:
+        mode_before = state.get("no_worker_mode", False)
         closed = close_recovered(state, notes, threshold, selection, now, codex_readings)
         back = switch_back(state, now, codex_readings)
         codex_readings = _readings_after_restoration(codex_readings, back)
+        workers_back = mode_before and not state.get("no_worker_mode", False)
     lines = [f"{name}: alert closed" for name in closed]
     lines += [f"switch to claude undone: {back.describe()}"] if isinstance(back, SwitchBack) else []
     lines += _alert_for_saved_readings(notes, now, selection, codex_readings)
     lines += [f"{note.label}: {percent(note)} left, resets {note.get('resets')}"
               for note in notes if note_file.in_use(note)]
-    return [*lines, "notes refreshed; nobody was told"]
+    return [*lines, "notes refreshed; workers-back notice sent" if workers_back else "notes refreshed; nobody was told"]
 
 
 def current_session() -> str | None:
