@@ -27,7 +27,7 @@ from uuid import uuid4
 
 from scripts.aws_target import gate_box, ledger
 from scripts.aws_target.aws_target import AwsCli, AwsUnavailable, control_lock, fetch_account_charges
-from scripts.aws_target.config import money, read_settings
+from scripts.aws_target.config import account_settings_path, money, read_settings
 from scripts.build_queue import admission_client, admission_protocol as wire, cloud_progress, progress_profile
 from scripts.build_queue.queue_place import defer_cleanup_signals
 from scripts.build_targets import target_config
@@ -281,7 +281,7 @@ class GateWorker:
                 if len(instances) == 1:
                     instance = ledger.text(instances[0], 'InstanceId')
                     save(path, {**launch, 'instance': instance})
-                    self.book.resolve_gate(ledger.text(request, 'attempt'), ledger.GateRunning(instance))
+                    self.book.resolve_gate(ledger.text(request, 'attempt'), ledger.GateRunning(instance), instance_type=size)
                     return instance
                 raise AwsUnavailable('The expired launch remains unconfirmed')
             try:
@@ -313,7 +313,7 @@ class GateWorker:
                 raise AwsUnavailable('The launch reply has no unique instance')
             instance = ledger.text(instances[0], 'InstanceId')
             save(path, {**launch, 'instance': instance})
-            self.book.resolve_gate(ledger.text(request, 'attempt'), ledger.GateRunning(instance))
+            self.book.resolve_gate(ledger.text(request, 'attempt'), ledger.GateRunning(instance), instance_type=size)
             return instance
         self.book.resolve_gate(ledger.text(request, 'attempt'), ledger.GateAbsent(int(self.clock())))
         return LocalFallback('Spot capacity is unavailable at both sizes')
@@ -329,7 +329,8 @@ class GateWorker:
                 reservation = self.book.reserve_gate(self.settings_path, ledger.GateReservation(
                     attempt, int(self.clock()), ledger.instant(request, 'expires'),
                     money(str(settings().number('spot_max_usd_per_hour'))),
-                    money(str(settings().number('attempt_allowance_usd')))))
+                    money(str(settings().number('attempt_allowance_usd'))),
+                    instance_type=settings().words('instance_types')[0]))
                 if isinstance(reservation, ledger.GateCapReached):
                     return {'status': 'fallback', 'reason': reservation.reason}
                 bucket = ledger.text(deployment, 'bucket')
@@ -514,10 +515,10 @@ def run_cloud(repo: Path, *, mode: gate.SuiteMode, full: bool, module_time_limit
                    '--setenv=CONF_DIR=' + str(conf.path('aws_target').parent),
                    '--property=KillMode=control-group', '--property=UMask=0077',
                    '--property=UnsetEnvironment=AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN AWS_CONFIG_FILE AWS_PROFILE',
-                   # The installed tree launches the box; the checkout supplies only its source and tests.
+                   # Run the installed worker with the installed account settings.
                    '--working-directory=' + str(Path.home() / '.claude'),
                    sys.executable, '-m', 'scripts.aws_target.cloud_gate', '--worker', str(folder), '--directory', str(directory),
-                   '--sidecar', str(sidecar)]
+                   '--sidecar', str(sidecar), '--settings', str(account_settings_path())]
         with cloud_reservation(repo, sidecar, mode) as reservation:
             request = read(folder / 'request.json') if (folder / 'request.json').exists() else prepare(repo, folder, mode, full, module_time_limit_s)
             save(current, {'attempt': folder.name, **identity})
@@ -559,15 +560,17 @@ def main() -> int:
     _ = parser.add_argument('--worker', required=True, type=Path)
     _ = parser.add_argument('--directory', required=True, type=Path)
     _ = parser.add_argument('--sidecar', required=True, type=Path)
+    _ = parser.add_argument('--settings', type=Path, default=account_settings_path())
     args = parser.parse_args()
     folder = cast(Path, args.worker)
     directory = cast(Path, args.directory)
     with control_lock(folder):
         if (folder / 'outcome.json').exists() and read(folder / 'outcome.json').get('status') != 'pending':
             return 0
-        configuration = conf.read('aws_target')
+        settings_path = cast(Path, args.settings)
+        configuration = conf.read(settings_path)
         api = AwsCli(configuration.text('credentials_profile'), configuration.text('region'), settings().number('api_timeout_s'))
-        worker = GateWorker(api, ledger.CostLedger(directory), conf.path('aws_target'), cast(Path, args.sidecar))
+        worker = GateWorker(api, ledger.CostLedger(directory), settings_path, cast(Path, args.sidecar))
         try:
             outcome = worker.execute(folder, read(folder / 'request.json'), read(folder / 'deployment.json'))
         except SystemExit:
