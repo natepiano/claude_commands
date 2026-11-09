@@ -245,7 +245,7 @@ def blob_texts(repo: Path, blobs: set[str]) -> dict[str, str]:
 
 
 def dirty_paths(repo: Path) -> set[str]:
-    return parse_status_z(git_output(repo, "status", "--porcelain", "-z", "--untracked-files=all"))
+    return parse_status_z(git_output(repo, "--no-optional-locks", "status", "--porcelain", "-z", "--untracked-files=all"))
 
 
 def worktree_files(repo: Path, dirty: set[str]) -> tuple[set[str], dict[str, str]]:
