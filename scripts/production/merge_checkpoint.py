@@ -434,7 +434,7 @@ def branch_keep_reason(request: MergeRequest, branch: str) -> str:
         return "main is long-lived"
     if branch == request.production.merge_branch:
         return "the production merge branch is long-lived"
-    record = staff.snapshot()
+    record = request.staff_record if request.staff_record is not None else staff.snapshot()
     resolver = session_staff.RowResolver(record)
     for row in record.rows:
         if isinstance(row.worktree, staff.PresentWorktree):
