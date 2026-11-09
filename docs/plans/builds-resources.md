@@ -2009,3 +2009,62 @@ Every nextest run that lint starts prints one line after admission: `nextest: <g
 - Tailscale control can list the Mac as online for minutes after it sleeps; an ssh timeout with `online=yes` is the sign.
 
 **Ruled out:** a kernel panic and restart (uptime 21 days); memory pressure as the cause (the pmset log names clamshell sleep for each drop); a nextest concurrency change.
+
+### Phase 91 — The floor alert sends once for each crossing of the line  · status: done
+**Depends on:** none. Merge `origin/builds` first.
+
+**Approved:** builds showrunner, 2026-11-09 ("top priority, a Mac disk defect from natedev. Fix it at the source as a phase."). Order change, builds, 2026-11-09: "Fix the repeat first and send that checkpoint alone: one alert for each crossing of the line, with a margin before it alerts again. Put the margin in config as a new key."
+
+#### As-built
+- `notify_floor_problem` (`scripts/lint/sweep.py`) rearms the phone-floor crossing (`AbovePhoneFloor`) only when free space is above the alert line plus `sweep_phone_rearm_gib`; a reading at that line or inside the margin does not rearm. The rule is the same for natedev and the Mac. Readings 200,140,130,151,140 send one alert; 200,140,160,140 send two.
+- Crossing deliveries (natedev message and phone push) go only while free space is below the alert line. A pending receipt above the line stays pending and sends at the next reading below it.
+- `save_delivery` accepts the natedev crossing receipt only when the delivered message held crossing text; a failure-only message leaves the receipt pending.
+- `config/lint.conf` holds `sweep_phone_rearm_gib=5` (range `0..`). `docs/as-built/build-memory-admission.md` states the rearm rule.
+- Rows in `scripts/lint/test_sweep.py`: `test_crossing_sends_both_channels_once_and_rearms_only_above_the_line`, `test_phone_floor_crossing_sends_once_until_free_space_rises`, `test_crossing_retries_only_the_channel_without_a_receipt`, `test_failure_after_an_interrupted_crossing_receipt_uses_no_crossing_key`.
+
+**Gotchas:** a failure-only notification must not consume the crossing receipt, or the next real crossing sends nothing.
+
+### Phase 92 — The Mac floor sweep trims the mirror targets, and its alert names folder sizes  · status: todo
+**Depends on:** Phase 91 (same file, `scripts/lint/sweep.py`). Merge `origin/builds` first.
+
+**Approved:** builds showrunner, 2026-11-09 (the Mac disk defect, items 1 and 2; order change: after the repeat fix).
+
+#### Work Order
+
+**Goal:** fix two defects in the Mac floor path at their source.
+
+**Measured (natedev, 2026-11-09):** the Mac had 150 GiB free. Each alert said "The cleanup run freed nothing. Folder sizes are unknown." `~/.local/state/mac-test/mirror` held 220 GiB of build output: `hana/target` 156 GiB and `cargo-liner/target` 64 GiB. `config/mac_test.conf` names the mirror root in `sweep_floor_roots`. Phase 91 reads: later floor passes found the mirror targets and removed 0.7 and 1.1 GiB, with one or two targets busy. A claimed mirror that is missing makes `LockedClaims.holds` protect an unrecorded marked target.
+
+**Spec:**
+1. **The floor sweep trims the mirror targets.** Find why the floor pass keeps `hana/target` and `cargo-liner/target`. Write the cause with its evidence in `phases/92/cause.md` in the run folder (Phase 91 notes are in `phases/91/cause.md`). Fix the proven cause, so the sweep removes mirror build output, least recently used first, down to the floor. A target that a live build holds stays. Fix the `LockedClaims.holds` defect.
+2. **The alert names folder sizes on the Mac.** Today the Mac alert reads "Folder sizes are unknown." because the folder choices come only from the natedev disk measurement. Make the Mac alert name its largest folders under its floor roots, with their sizes, from a measurement on the Mac.
+3. Add one table row to the existing test of each behavior. Each row fails before its fix and passes after it.
+4. Update `docs/as-built/build-memory-admission.md` for the changed rules.
+5. Start from the saved patches in `phases/92/` in the run folder when they exist. `test_spec12.patch` passes `"natedev measurement is missing"` to `UnavailableDiskMeasurement`; that type accepts only `"missing"`, `"unreadable"` or `"old shape"`. Change the fixture to `"missing"`. The patch expects a `policy` parameter that this phase adds or adapts.
+
+**Constraints from prior phases:**
+- Phase 91 rule in `notify_floor_problem` and `save_delivery`: rearm only above the line plus `sweep_phone_rearm_gib`, strictly; send crossing text only below the line; accept a crossing receipt only when the delivered message held crossing text. Keep all three.
+- `scripts/copies/copies.py:1819` calls `LockedClaims.holds()` with a lease exemption for remote mirror removal. The `LockedClaims.holds` fix keeps that exemption: idle removal exempts its own lease and keeps a busy sibling.
+
+**Constraints:**
+- Run no cleanup on the Mac, and no gc command of any kind. natedev asks the user whether to clear the two mirror targets now.
+- Read the Mac only with read-only commands. Change no Mac file, setting or claim.
+- Tests make their projects in a tempdir and never touch the real `/tmp`, `~/rust` or Mac home.
+- The alert text `sweep.disk_floor` keeps its approved words. If a fix needs a changed catalog text, post blocked.
+
+**Files:**
+- `scripts/lint/sweep.py` — the floor scan and the folder choices.
+- `scripts/mac_test/floor_claims.py` — the floor claims.
+- `scripts/lint/test_sweep.py`, `scripts/mac_test/test_floor_sweep.py` — the table rows.
+- `docs/as-built/build-memory-admission.md` — the changed rules.
+
+**Workers:** `1 writer + 1 tester`
+- `impl` owns `cause.md`, the source files and the as-built doc, and runs the final suites.
+- `test` owns the test files.
+
+**Acceptance gate:**
+- `cause.md` names the proven cause of the kept targets with its evidence.
+- Each new row fails before its fix and passes after it.
+- The changed test modules pass. Basedpyright reports `0 errors, 0 warnings, 0 notes` for every changed Python file.
+- The Phase 91 tests still pass: `test_crossing_sends_both_channels_once_and_rearms_only_above_the_line`, `test_phone_floor_crossing_sends_once_until_free_space_rises`, `test_crossing_retries_only_the_channel_without_a_receipt` and `test_failure_after_an_interrupted_crossing_receipt_uses_no_crossing_key`.
+- `scripts/copies/test_review_remote_copies.py` passes, with `test_idle_removal_exempts_its_lease_and_keeps_a_busy_sibling`.
