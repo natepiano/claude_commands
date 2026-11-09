@@ -30,11 +30,11 @@ from scripts.production import showrunner_tree
 from scripts.production import tidy_wrapped
 from scripts.production import unit_lookup
 from scripts.production.production_doc import Production, Refusal, production_field, read_production
+from scripts.production.checkpoint_gate import Stop, report
 from scripts.production.merge_checkpoint import (
-                              PromotionAlreadyAtTip, PromotionOriginPushed, PromotionNotPushed,
-                              Stop,
-                              git, good, merged_checkpoints, promote_local_checkout,
-                              pull_mac_checkout, report)
+    PromotionAlreadyAtTip, PromotionOriginPushed, PromotionNotPushed,
+    git, good, merged_checkpoints, promote_local_checkout, pull_mac_checkout,
+)
 from scripts.production import production_doc
 from scripts.production.update_registration import QuestionStaff, RegistrationFailure, judgment_state
 
