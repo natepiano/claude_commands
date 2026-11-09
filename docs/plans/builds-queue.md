@@ -704,6 +704,17 @@ After Phase 30, `build_targets.py` eligible, reserve and release-wait still use 
 
 The user approved aws-unit's design on 2026-11-08. Builds moved it to report, which starts after Phase 36 lands, because both edit memory_feed.py and memory_live.html.
 
+### Phase 39 — The build page shows step names from the config  · status: done
+
+1. **The defect (builds, 2026-11-09; change review C1285 returned).** The build page shows `merge-gate`, not `merge gate`. `scripts/build_queue/memory_feed.py` passes `RECORDED_STEP_NAMES`, an empty map, at five places: `step_text` for swap holds, held rows, running rows and waiters, and `names=` on the `QueueModel`.
+2. **Fix.** The feed calls `read_step_names()` once for each reading and uses that value at all five places. `RECORDED_STEP_NAMES` leaves `memory_feed.py`.
+3. **Unchanged.** Comparisons of `step.step` with raw step names keep the raw name. `/build:queue` already reads the config.
+4. **Hover note.** `progressTip` in `memory_live.html` tested the row name for `merge-gate`. A row name is shown text and can hold a project, so the ordering note now tests `progress.unit === "modules"`.
+5. **Proof.** A row in the existing feed test: a `merge-gate` step shows as `merge gate` in running and waiting rows. The test fails without the fix. The existing expected values that use `RECORDED_STEP_NAMES` change to the config names. Rows in the existing hover test: a `modules` row has the ordering note, and a row with another unit has none.
+
+**Workers:** 1 writer and tester. **Gate:** targeted test, basedpyright 0/0/0, adversary review, page proof.
+**Change-Review:** The build page shows "merge gate" | On natedev, run /build:page and open the link while a merge gate runs or waits | The row says "merge gate", with a space and no hyphen. | after restart
+
 ### Phase 38 — AWS rows on the build page show a progress bar  · status: done
 
 1. **The ask (user, 2026-11-09).** "the word \"running\" is superfluous on the aws rows - if they are there they are running - i would only want to see issues if they are \"not running\" when they should be." The module count "should be small text underneath a progress update bar - similar to the progress update bars on local rows."
