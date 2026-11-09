@@ -155,7 +155,14 @@ class HeldRolePaneTests(HeldRolePaneCase):
         self.assertIn("The work is complete.", first.read_text())
         self.assertIn("The work is complete.", second.read_text())
         self.assertEqual(staff.by_id(instance.lifecycle.staff_id), before)
-        self.assertEqual(len(self.panes.world.launches), 1)
+        if before is None:
+            self.fail("designer row is unavailable")
+        self.assertEqual(self.panes.world.requests[-1][1][:2], ["resume", str(before.current_session)])
+        first_pane, second_pane = [submission[0] for submission in self.panes.command_case.agent.submitted]
+        self.assertNotEqual(first_pane, second_pane)
+        self.assertEqual(self.panes.command_case.agent.row(first_pane).current_session,
+                         self.panes.command_case.agent.row(second_pane).current_session)
+        self.assertEqual(len(self.panes.world.launches), 2)
         self.assertEqual([command[command.index("--target") + 1] for command in self.panes.commands],
                          ["durable-design-role"] * 3)
         self.assertEqual([command[command.index("--policy") + 1] for command in self.panes.commands],
@@ -178,6 +185,7 @@ class HeldRolePaneTests(HeldRolePaneCase):
             self.panes.world.add(parent, "w1:p-showrunner")
             design = self.panes.open("reviewer", bound=False)
             reply = self.panes.resume(design, "reviewer")
+            first_row = self.panes.command_case.agent.row(self.panes.command_case.agent.submitted[-1][0])
             second_reply = self.panes.resume(design, "reviewer")
         self.assertEqual([command[0] for command in self.panes.recorder_commands], ["start-run", "start-phase"])
         self.assertIn("The work is complete.", second_reply.read_text())
@@ -195,11 +203,17 @@ class HeldRolePaneTests(HeldRolePaneCase):
         self.assertEqual(command[command.index("--phase") + 1], "astra-review")
         self.assertIn("The work is complete.", reply.read_text())
         self.assertIsInstance(astra_work.read_header(next(reply.parent.parent.glob("prompts/*.md"))), astra_work.AstraWork)
-        self.assertEqual(len(self.panes.world.launches), 1)
+        self.assertEqual(row, first_row)
+        self.assertEqual(self.panes.world.requests[-1][1][:2], ["resume", str(first_row.current_session)])
+        first_pane, second_pane = [submission[0] for submission in self.panes.command_case.agent.submitted]
+        self.assertNotEqual(first_pane, second_pane)
+        self.assertEqual(self.panes.command_case.agent.row(first_pane), row)
+        self.assertEqual(self.panes.command_case.agent.row(second_pane), row)
+        self.assertEqual(len(self.panes.world.launches), 2)
         ended = design_roles.end(design.placement.design_id + "/reviewer")
         self.assertIsInstance(ended.roles[1].lifecycle, design_roles.RoleEnded)
         self.assertIsNone(staff.by_id(instance.lifecycle.staff_id))
-        self.assertEqual(len(self.panes.world.closed), 1)
+        self.assertEqual(len(self.panes.world.closed), 2)
 
     def test_astra_open_rerun_after_split_reuses_the_same_terminal(self) -> None:
         self.panes.world.interrupt = "split"

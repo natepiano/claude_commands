@@ -669,7 +669,8 @@ class MergeGateRecordedPeakTests(ServiceGateFixture):
         return AdmissionRun(run, output.getvalue(), reservations, sampled_before_reservation, concurrent_starts)
 
     def test_module_above_six_gib_passes_without_a_memory_kill(self) -> None:
-        observed = self.observe_gate({"hooks/test_first.py": 8192.0})
+        """Record a large peak below the configured memory limit."""
+        observed = self.observe_gate({"hooks/test_first.py": 8192.0}, governor_mib=16384)
         self.assertTrue(observed.gate.passed, observed.report)
         job, = observed.gate.jobs
         self.assertEqual((job.returncode, job.killed_for, job.peak_mib), (0, "", 8192.0))

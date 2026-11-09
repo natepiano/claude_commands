@@ -732,11 +732,14 @@ class WorkerPaneTests(StaffTestCase):
         self.assertEqual([command[3] for command in self.prompts()], ["/quit", "/quit"])
 
     def test_close_interrupt_quits_a_busy_worker_and_keeps_its_row(self) -> None:
-        for index, family in enumerate(("claude", "codex"), start=1):
-            with self.subTest(family=family):
-                row = self.worker(family, family=family)
+        cases: tuple[tuple[Literal["claude", "codex"], str], ...] = (
+            ("claude", ""), ("codex", ""), ("claude", "old-owner"), ("codex", "doubled-owner"))
+        for index, (family, old_owner) in enumerate(cases, start=1):
+            with self.subTest(family=family, old_owner=old_owner):
+                row = self.worker(f"{family}-{index}", family=family)
                 pane = f"w1:p{index}"
-                self.world.add(row, pane, family=family)
+                self.world.add(row, pane, family=family,
+                               label=f"{old_owner}-{row.name}" if old_owner else row.name)
                 self.world.locations[pane]["agent_status"] = "working"
                 self.dispatch(row, "impl")
                 before = self.staff_state()
@@ -759,8 +762,10 @@ class WorkerPaneTests(StaffTestCase):
                 self.assertEqual((code, output, errors), (0, "done\n", ""))
                 self.assertEqual(self.staff_state(), before)
                 self.assertNotIn(pane, self.world.foreground)
+                self.assertNotIn(pane, self.world.locations)
+                self.assertIn((pane, "terminal-" + pane), self.world.closed)
         self.assertEqual(self.world.stops, [])
-        self.assertEqual([command[3] for command in self.prompts()], ["/quit", "/quit"])
+        self.assertEqual([command[3] for command in self.prompts()], ["/quit"] * len(cases))
 
     def test_first_admission_uses_the_parent_run_when_two_runs_exist(self) -> None:
         first = self.worker_run("a-first", "unit", self.parent.current_session, transport="herdr")
@@ -1837,13 +1842,13 @@ class WorkerPaneTests(StaffTestCase):
         sibling = staff.update_current_session(sibling.current_session, staff.native_id("11111111-1111-4111-8111-111111112222"))
         fixture_session(selected.current_session, staff.CodexBackend(self.root / "codex"))
         fixture_session(sibling.current_session, staff.CodexBackend(self.root / "codex"))
-        self.world.add(selected, "w2:p9", family="codex", workspace="w2", tab="w2:t2", label="changed")
+        self.world.add(selected, "w1:p9", family="codex", label="changed")
         self.world.add(sibling, "w1:p2", family="codex")
         self.completed_dispatch(selected, "impl")
         result = worker_panes.close(self.parent.id, staff.WorkerName.parse(selected.name))
         self.assertIsInstance(result, worker_panes.Closed)
         self.assertEqual(self.world.stops, [str(selected.current_session)])
-        self.assertEqual(self.world.closed, [("w2:p9", "terminal-w2:p9")])
+        self.assertEqual(self.world.closed, [("w1:p9", "terminal-w1:p9")])
         self.assertEqual(set(self.world.locations), {"w1:p0", "w1:p2"})
         self.assertEqual(self.world.processes[self.world.foreground["w1:p2"][0]].current_identity, sibling.current_session)
 
@@ -2201,10 +2206,25 @@ class WorkerPaneTests(StaffTestCase):
         showrunner = fixture_member("showrunner", name="other-showrunner")
         other = fixture_member("unit", name="other", parent=showrunner.id)
         foreign = fixture_worker(row.name, other.id)
-        self.world.add(foreign, "w1:p1")
-        observed = self.observation(row)
-        self.assertIsInstance(observed, worker_panes.UncertainWorker)
-        self.assertEqual(self.world.commands, [])
+        for native, tab in ((foreign, "w1:t1"), (row, "w1:t5")):
+            with self.subTest(native=native.id, tab=tab):
+                self.world.add(native, "w1:p1", tab=tab, label=row.name)
+                self.world.add(foreign, "w1:p2", tab="w1:t5", label=row.name)
+                observed = self.observation(row)
+                if native == foreign:
+                    self.assertIsInstance(observed, worker_panes.UncertainWorker)
+                before = self.staff_state()
+                for interrupt in (False, True):
+                    with patch.dict(os.environ, {"CODEX_THREAD_ID": self.parent.current_session}):
+                        code, output, errors = self.command("close", *( ["--interrupt"] if interrupt else []), row.name)
+                    reason = ("labelled pane belongs to another native session" if native == foreign
+                              else "worker pane is outside its parent's tabs")
+                    self.assertEqual((code, output, errors), (int(worker_panes.ExitCode.UNCERTAIN), "",
+                        f"anomaly: {row.name}: {reason}; correct the evidence and retry\n"))
+                    self.assertEqual(self.staff_state(), before)
+                    self.assertIn("w1:p1", self.world.locations)
+                    self.assertIn("w1:p2", self.world.locations)
+                self.assertEqual(self.world.commands, [])
 
     def test_codex_launch_thread_without_a_current_rollout_is_unknown(self) -> None:
         row = self.worker(family="codex")

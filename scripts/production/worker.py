@@ -308,6 +308,19 @@ def dispatch(parent: StaffId, name: WorkerName, role: WorkerRole, prompt: Path, 
             if not isinstance(result, DispatchComplete):
                 return result
         _save_reply(destination, result.reply)
+        progress_history.complete_dispatch(session_dir, slot, instance)
+        try:
+            with redirect_stderr(io.StringIO()) as errors:
+                closed = worker_panes.close(parent, name, run=worker_panes.DispatchRun(session_dir), lock=hold)
+            reason = (closed.blocker if isinstance(closed, worker_panes.Kept) else
+                      closed.reason if isinstance(closed, worker_panes.UncertainWorker) else "")
+            if reason:
+                print(f"anomaly: {name.value}: {' '.join(reason.splitlines())}", file=sys.stderr)
+            elif errors.getvalue():
+                print(errors.getvalue(), end="", file=sys.stderr)
+        except (OSError, ValueError, herdr.HerdrFailure, subprocess.SubprocessError,
+                staff.StaffRefused, staff.StaffUnreadable) as error:
+            print(f"anomaly: {name.value}: {' '.join(str(error).splitlines())}", file=sys.stderr)
         return ExitCode.OK
 
 

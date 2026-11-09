@@ -457,13 +457,15 @@ class PaneAstraReviewTests(HeldRolePaneCase):
         self.assertIsNone(staff.by_id(row.id))
         self.assertEqual(len(self.panes.world.closed), 1)
         self.assertEqual((self.panes.command_case.run_dir / "progress_history_state.json").read_bytes(), holder_state)
+        state = read_object(self.panes.root / "astra-run/progress_history_state.json")
+        status = assign.object_map(assign.object_map(state["pass"])[row.name])["status"]
         if not failed:
             reply = (self.panes.root / "astra-run/review.md").read_text().splitlines()
             self.assertEqual(reply[0], "Verdict: clear.")
             self.assertTrue(reply[-1].startswith("DONE "))
-            state = read_object(self.panes.root / "astra-run/progress_history_state.json")
-            self.assertEqual(assign.object_map(assign.object_map(state["pass"])[row.name])["status"], "completed")
+            self.assertEqual(status, "completed")
         else:
+            self.assertEqual(status, "error")
             self.assertIn("pending input is retained", result.stdout + result.stderr)
 
     def test_pane_reviewer_writes_the_reply_and_ends_its_row_and_hold(self) -> None:

@@ -73,6 +73,10 @@ Both callers read the value when they use it.
 `off` disables both pushes. The user can remove this push later.
 `nightly_result_modules=8` limits the failed test modules named in a result push.
 Both values are read at use. The module limit must be a whole number of at least one.
+`memory_stop_reruns=1` sets the reruns alone after a module exceeds `merge_gate_governor_gib` from `build_admission.conf`.
+The gate reads the retry count at use. It must be a whole number of at least zero.
+Each memory stop sends sdlc the module, peak, limit, gate, and next action.
+An exhausted retry count fails the gate. A failed message does not change the result.
 
 ## context_usage.conf
 

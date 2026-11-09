@@ -1959,6 +1959,19 @@ def begin_dispatch(session_dir: Path, *, slot: str, phase: str, role: staff.Work
             fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
 
 
+def complete_dispatch(session_dir: Path, slot: str, instance_id: str) -> None:
+    """Record completion in the slot that dispatch owns."""
+    with (session_dir / ".progress_history.lock").open("a+", encoding="utf-8") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        try:
+            state = _read_state(session_dir)
+            opened = _open_passes(state).get(slot)
+            if opened is not None and opened.get("instance_id") == instance_id:
+                _ = _close_slot_pass(session_dir, state, slot, "completed", plan_history.now_epoch())
+        finally:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+
+
 def mark_pass_refused(session_dir: Path, worker_name: str) -> None:
     """Mark the open pass without closing it or changing its dispatch id."""
     if not _state_path(session_dir).is_file():
