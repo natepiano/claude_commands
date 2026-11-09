@@ -25,43 +25,19 @@ Evidence:
 
 ## Phases
 
-### Phase 1 — Codex workers end turns through a Stop hook  · status: todo
+### Phase 1 — Codex workers end turns through a Stop hook  · status: done
 
-#### Work Order
+#### As-built
 
-**Goal:** A Codex worker's turn end reaches `turn_end.py` through a Codex `Stop` hook on stdin, so no payload size can stop it.
-
-**Spec:**
-1. `scripts/hooks/codex_hooks.py`: add one `HOOKS` entry, `CodexHook("turn-end", PythonHookScript("../herdr/turn_end.py"), "Stop", ...)`. List it with the matcher form Codex reports for `Stop`, the same way `_listed_fields` lists `UserPromptSubmit` with a null matcher.
-2. `scripts/herdr/worker_panes.py`: `_turn_end_arguments("codex")` returns `[]`. A Codex worker launch line has no `-c notify`. The Claude `--settings` Stop hook stays. Fix the `turn_end_command` docstring.
-3. `scripts/herdr/turn_end.py`:
-   1. `hook_event` drops the `agent-turn-complete` branch. A legacy notify payload from a pane launched by older code becomes `WorkerEvent("")` and is ignored. The global Stop hook carries that turn.
-   2. A `Stop` payload with `last_assistant_message: null` gives `reply=""`, never `"None"`.
-   3. `main` gives the payload to the detached `--handle-hook` child on its stdin, not as an argument. The child reads stdin. No payload size reaches argv.
-   4. `main` writes nothing to stdout and never exits 2.
-4. `scripts/herdr/test_pane_launch.py` parses saved launch lines; its `notify` rows stay, because old panes still carry them.
+A Codex worker's turn end reaches `scripts/herdr/turn_end.py` through the `turn-end` Codex `Stop` handler in `scripts/hooks/codex_hooks.py` (null listed matcher, like `UserPromptSubmit`). Codex worker launch lines carry no `-c notify`; `worker_panes._live_policy` still reuses a live pane launched with the old line. `turn_end.main` hands the payload to the detached `--handle-hook` child on stdin, so no payload reaches argv. A null `last_assistant_message` is an empty reply. A legacy `agent-turn-complete` payload is ignored; the global Stop hook carries that turn.
 
 **Files:**
-- `scripts/hooks/codex_hooks.py` — the `turn-end` Stop handler.
-- `scripts/herdr/worker_panes.py` — no Codex notify argument.
-- `scripts/herdr/turn_end.py` — `hook_event`, `main` stdin hand-off.
-- `scripts/hooks/test_codex_hooks.py` — the `turn-end` handler is installed and listed.
-- `scripts/herdr/test_turn_end.py` — a Codex Stop payload row with a null message; a legacy notify payload is ignored; `main` hands a payload over 128 KiB to the child through stdin.
-- `scripts/herdr/test_worker_panes.py` — a Codex launch line has no `notify`.
-- `docs/as-built/long-lived-workers.md` — lines 46 and 116 name `-c notify` and `agent-turn-complete`; the deploy step.
-- `docs/as-built/build-followups-fn-length-hook.md` — the handler count and the `turn-end` handler.
+- `scripts/hooks/codex_hooks.py`, `scripts/herdr/worker_panes.py`, `scripts/herdr/turn_end.py`
+- Tests: `scripts/hooks/test_codex_hooks.py`, `scripts/herdr/test_turn_end.py`, `scripts/herdr/test_worker_panes.py`
+- Docs: `docs/as-built/long-lived-workers.md` (Stop hook deployment), `docs/as-built/build-followups-fn-length-hook.md`
 
-**Workers:** `1 writer` — the change is small and every file depends on the one hook transport.
-- `impl` — all files above.
+**Deploy:** panes-unit runs `codex_hooks.py install` and `check` on natedev and the Mac after main has this change (sdlc, 2026-11-09).
 
-**State:** none in the code. The deploy writes `~/.codex/hooks.json` and its trust through the installer.
+**Gotchas:** every Codex session now runs `turn_end.py` at each turn end; a non-worker turn exits as ignored and adds one line to `~/.local/state/herdr/turn-end-ignored.jsonl`.
 
-**Constraints from prior phases:** herdr-worker-panes Phase 34c added `_ignored` (one JSON line per ignored exit) and the hook-reply completion in `turn_end.handle`. Both stay.
-
-**Acceptance gate:** basedpyright 0/0/0 on every changed module and its callers; `test_codex_hooks`, `test_turn_end`, `test_worker_panes` and `test_pane_launch` green; the targeted test green.
-
-**Deploy:** panes-unit runs `codex_hooks.py install` and `check` on natedev and the Mac after the merge reaches main (sdlc, 2026-11-09).
-
-**Gotchas:**
-- Every Codex session now runs `turn_end.py` at each turn end. A non-worker turn exits as ignored and adds one line to `~/.local/state/herdr/turn-end-ignored.jsonl`.
-- A pane launched before deploy keeps `-c notify`. Its notify payload is ignored, and the Stop hook carries its turn ends.
+**Ruled out:** a test row for a child that exits before it reads stdin (rare; the reviewer probed it; the hook timeout bounds it).
