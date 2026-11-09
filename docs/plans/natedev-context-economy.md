@@ -7,6 +7,7 @@
 ## Delegation Context
 
 - **Project:** `~/.claude` tooling (this repo). The context economy measures what each model request carries, when sessions compact, and which settings each session ran with. It reads its inputs at run time and stores only saved results (natedev, 2026-11-08: "store only what cannot be looked up").
+- **Project started:** 2026-11-08T17:51:02.750+00:00
 - **Stack:** Python 3, standard library only (`json`, `argparse`, `dataclasses`, `statistics`, `subprocess` for `git` and `ssh`, `sqlite3` read-only). basedpyright strict.
 - **Layout:** `scripts/usage/` (new `context_economy.py`, new `context_economy_read.py`); `config/context_economy.conf` (new); `commands/context_economy.md` (new); `docs/as-built/usage-ledger.md`.
 - **Key files:**
@@ -36,7 +37,7 @@
 
 ## Phases
 
-### Phase 1 — Read sessions and settings at run time  · status: todo
+### Phase 1 — Read sessions and settings at run time  · status: done
 **Depends on:** none
 
 #### Work Order
