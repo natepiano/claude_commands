@@ -23,11 +23,6 @@
   - Report additional wait savings and head delay.
   - Revealed by: Phase 30; baseline corrected against the current admission rule.
 
-- [ ] **Make the build_targets.py call from verify.sh cheap: it costs 199 ms of CPU on every step**
-  - Why needed: verify measured `build_targets.py` at 199 ms of CPU each time `verify.sh` starts it, on every step; it is the most costly helper.
-  - Completion condition: the call uses fewer imports or a lighter entry path; the change reports before and after CPU figures for the same call, and the build_targets and verify tests pass.
-  - Revealed by: verify-unit measurement (builds showrunner 2026-10-30: next)
-
 - [ ] **Match trims against each step's recorded Cargo output roots**
   - Target: `scripts/lint/sweep.py` (`RebuildStep`, `read_rebuild_evidence`, `_rebuild_causes`), `scripts/buildlog/step_outputs.py`, and their tests.
   - Dependency: Phase 64's shared root decoding and row facts, with Phase 62's recorded-root safety rules.
