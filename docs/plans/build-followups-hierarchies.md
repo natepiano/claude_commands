@@ -799,42 +799,28 @@ A read-only report. It went to the sdlc showrunner on 2026-11-09, grouped by pro
 
 ### Phase 33 — A run that stops removes its own mark, and workers make folders that delete themselves  · status: done
 
-**Depends on:** Phase 32
+#### As-built
 
-#### Work Order
-
-**Goal:** every way a unit run ends removes that run's run-active mark, also when a later cleanup step fails. Every worker prompt tells the worker that a folder it makes for its own use is made in a `with` block under `TMPDIR`.
-
-**Spec:**
-- Context (user rule, 2026-11-09, via the sdlc showrunner): our processes clean up after themselves, the way tempdir does. A folder a process makes for its own use is made in a `with` block under `TMPDIR` (Python `tempfile.TemporaryDirectory`, Rust `tempfile::TempDir`). Use `scratch.py` only for a folder that must outlive its process, with the reason. Add no check or scan. Add no signal handlers: `TMPDIR` is cleared at reboot, so a kill is rare enough.
-- Phase 32 found (origin/main 4b7ee03d3):
-  1. `scripts/direct/end_session.sh:88` runs `design_roles.py unbind-run "${run}" || exit 1`. When it fails, the script exits before it removes the mark (line 98). The cargo-liner berth run hit this twice on 2026-10-31 (`design_roles: missing or invalid repository`), and a `| tail` on the call hid the exit.
-  2. `progress_history.py finish-run` (`_finish_run`, about line 6568) marks the run finished but never removes the mark. The worker hook path (`assign.py:354`, `finish_run=True`) and the failed-launch path (`assign.py:756`) use it.
-  3. A second `finish-run` on a finished run returns at once (about line 6579), so a retry never removes the mark.
-- One end step owns the mark. Put it beside `activate` in `scripts/lib/unit_runs.py`. Given a run folder, it removes the mark that names that run, and only a mark whose first line still names that run. It works on a retry. For a new run, `activate` records in the run folder which mark it wrote, so the end step finds it without a scan.
-- `finish-run` calls the end step, also when the run is already finished. `end_session.sh` calls the same end step for each run it ends; it does not remove the mark itself.
-- In `end_session.sh`, a failed role cleanup (`unbind-run`) or any other cleanup step does not stop the end step. The script still exits non-zero and prints the failed step when one failed.
-- No pipe hides the exit: in `docs/direct/final_gate_commit.md` (<RunSummary/>) and `docs/direct/launch_implementation.md`, the `end_session.sh` call is one command with no pipe.
-- Worker folder command (user, 2026-11-09, via the sdlc showrunner: "why not give a command that workers use to create temp directories so the command creates the conditions for auto removal - and also the names become consistent for a showrunner-unit-worker hierarchy"). Extend `scripts/lib/scratch.py`; add no new tool. `scratch.py new --worker [--name <word>]` reads the caller's own staff row and makes `<showrunner>-<unit>-<worker>-<suffix>` (with `-<word>` when `--name` is given) under `TMPDIR`. The worker passes nothing else. The folder's task is the worker, so `scratch.py end --task <that worker task>` removes every folder the worker made. A caller with no worker staff row is refused with one line. The worker close at DONE calls that end; phase 33b adds the call after the panes close path lands.
-- Worker prompt rule: in `docs/direct/write_prompt_contract.md`, add one verbatim instruction that every implementation, fix, test, research and review prompt carries (put the review copy in `config/review/code.md`): "Make every folder you need for your own work (a clone, a copy, a download, a trial project) with `~/.claude/scripts/lib/scratch.py new --worker [--name <word>]`. It prints the path, and the folder is removed when your assignment ends. Never make a folder under `/tmp` or `~/rust` by hand." Keep the test instruction at item 6: Python code in our scripts and tests keeps `tempfile.TemporaryDirectory`. Phase 32 traced 7 of 8 leftovers to one-off worker commands.
-- Old marks: about 40 marks under `/tmp/claude/unit/active` stay from runs that ended before this fix. Write a one-off program outside the repository (in the worker's scratch) that calls the new end step once for each mark whose run is finished, or whose director session is not live (`unit_runs.marker_must_stay`). It never touches a mark of a live run. It runs once at deploy, then it is deleted. The worker does not run it; the director names it in the checkpoint notice.
-- Tests: add rows to the existing tests (`scripts/direct/test_end_session.py`, `scripts/lib/test_unit_runs.py`, the `finish-run` tests in `scripts/direct/test_progress_history.py`). Cover: `scratch.py new --worker` makes the named folder under a fixture `TMPDIR` and `end` of the worker task removes it; a caller with no worker row is refused; `finish-run` removes the mark; a retry on a finished run removes a mark that stayed; a failed `unbind-run` still removes the mark and the script exits non-zero; a mark that names another run stays. Tests use fixture folders only, never `/tmp/claude/unit` or a live run.
+- `unit_runs.activate` writes the run-active mark and records the mark path in the run's `active_marker` file. `unit_runs.end(run)` removes the mark only when its content names this run, and it works on a retry. `marker_lock`, a sibling `active.lock`, covers the write and the read, compare and unlink.
+- `finish-run` calls the end step, also on a run that is already finished. `end_session.sh` calls it for each run, and a failed cleanup step does not stop it. The script still exits non-zero. It prints `Unit run ended; marker cleared.`, `Unit run marker remains.` or `No active unit run marker for this session.`
+- `scratch.py new --worker [--name <word>]` reads the caller's staff row and makes `<showrunner>-<unit>-<worker>-<suffix>` under `TMPDIR`. The folder's task is `scratch.worker_task(<staff id>)`. A caller with no worker row is refused with one line.
+- The worker prompt rule in `docs/direct/write_prompt_contract.md` and `config/review/code.md` tells each worker to make its folders with that command. The test instruction stays: Python code in scripts and tests keeps `tempfile.TemporaryDirectory`.
+- `docs/direct/final_gate_commit.md` and `docs/direct/launch_implementation.md` call `end_session.sh` with no pipe.
 
 **Files:**
-- `scripts/lib/unit_runs.py` — the end step; `activate` records its mark.
+- `scripts/lib/unit_runs.py` — the mark write, its record and the end step.
 - `scripts/lib/scratch.py` — `new --worker` and the worker task.
 - `scripts/direct/progress_history.py` — `finish-run` calls the end step.
-- `scripts/direct/end_session.sh` — calls the end step; cleanup failures do not stop it.
-- `docs/direct/final_gate_commit.md`, `docs/direct/launch_implementation.md` — the end call without a pipe.
-- `docs/direct/write_prompt_contract.md`, `config/review/code.md` — the folder rule.
-- `scripts/lib/test_unit_runs.py`, `scripts/direct/test_end_session.py`, `scripts/direct/test_progress_history.py`, `scripts/lib/test_scratch.py` — rows.
+- `scripts/direct/end_session.sh` — calls the end step for each run.
+- `docs/direct/final_gate_commit.md`, `docs/direct/launch_implementation.md`, `docs/direct/write_prompt_contract.md`, `config/review/code.md` — the rules and calls above.
 
-**Workers:** 1 writer; the end step, its callers and the prompt rule are one small change across shared files, so nothing splits.
-- `impl` — all files above.
+**Binds later work:** nothing ends the worker task until the worker close at DONE calls `scratch.py end --task <worker task>`.
 
-**State:** new runs record their mark in the run folder. Old marks get the deploy one-off.
+**Gotchas:**
+- The usage collector ships `scripts/lib/unit_runs.py` to the Mac without its sibling files. Its top level imports only the standard library. `activate` imports `atomic_file` inside the function.
+- Marks from runs that ended before this phase have no record. A one-off program outside the repository ends them once at deploy, and then it is deleted.
 
-**Acceptance gate:** the targeted test is green; basedpyright reports 0 on `scripts/lib` and `scripts/direct`; the new test rows pass.
+**Ruled out:** a scan or sweep for old marks (the user allows no added check); signal handlers (`TMPDIR` is cleared at reboot).
 
 ### Phase 33b — A worker's folders go when its assignment ends  · status: todo
 
