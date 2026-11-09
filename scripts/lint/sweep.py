@@ -164,6 +164,7 @@ import json
 import math
 import os
 import re
+import shlex
 import shutil
 import socket
 import stat
@@ -674,13 +675,40 @@ class AbovePhoneFloor:
 
 
 @dataclass(frozen=True)
+class BelowRearmLine:
+    """No interval above the rearm line has started."""
+
+
+@dataclass(frozen=True)
+class AboveRearmLine:
+    since: float
+
+
+@dataclass(frozen=True)
 class OpenPhoneCrossing:
     identity: str
     natedev: CrossingReceipt = CrossingReceipt.PENDING
     phone: CrossingReceipt = CrossingReceipt.PENDING
+    rearm: BelowRearmLine | AboveRearmLine = BelowRearmLine()
 
 
-PhoneCrossing = AbovePhoneFloor | OpenPhoneCrossing
+class ReturnPushPolicy(Enum):
+    ALLOWED = "allowed"
+    SUPPRESSED = "suppressed"
+
+
+@dataclass(frozen=True)
+class RecoveringPhoneCrossing:
+    """Retire the fall key before the permitted return delivery."""
+
+    identity: str
+    receipt: CrossingReceipt = CrossingReceipt.PENDING
+    retired: bool = False
+    rearm: BelowRearmLine | AboveRearmLine = BelowRearmLine()
+    return_policy: ReturnPushPolicy = ReturnPushPolicy.ALLOWED
+
+
+PhoneCrossing = AbovePhoneFloor | OpenPhoneCrossing | RecoveringPhoneCrossing
 
 
 @dataclass(frozen=True)
@@ -2932,9 +2960,16 @@ def read_floor_record(path: Path) -> NoFloorRecord | FloorRecord:
         saved_channels = cast(dict[str, object], saved_crossing)
         identity = saved_channels.get("identity")
         if isinstance(identity, str) and identity:
+            since = saved_channels.get("rearm_since")
+            rearm = AboveRearmLine(float(since)) if _finite_number(since) else BelowRearmLine()
             try:
-                crossing = OpenPhoneCrossing(identity, CrossingReceipt(saved_channels.get("natedev")),
-                                            CrossingReceipt(saved_channels.get("phone")))
+                if "recovery" in saved_channels:
+                    crossing = RecoveringPhoneCrossing(identity, CrossingReceipt(saved_channels.get("recovery")),
+                                                       saved_channels.get("retired") is True, rearm,
+                                                       ReturnPushPolicy(saved_channels.get("return_policy", "allowed")))
+                else:
+                    crossing = OpenPhoneCrossing(identity, CrossingReceipt(saved_channels.get("natedev")),
+                                                CrossingReceipt(saved_channels.get("phone")), rearm)
             except ValueError:
                 crossing = OpenPhoneCrossing(identity)
     failure: NoFailure | FailurePending | FailureReported = NoFailure()
@@ -2972,11 +3007,20 @@ def write_floor_record(path: Path, record: FloorRecord) -> None:
         "build_cache_bytes": record.build_cache_bytes,
         "last_alert_at": alert_at,
         "last_push_at": push_at,
-        "phone_crossing": ({"identity": record.phone_crossing.identity,
-                            "natedev": record.phone_crossing.natedev.value,
-                            "phone": record.phone_crossing.phone.value}
-                           if isinstance(record.phone_crossing, OpenPhoneCrossing) else "above"),
     }
+    crossing = record.phone_crossing
+    if isinstance(crossing, AbovePhoneFloor):
+        data["phone_crossing"] = "above"
+    else:
+        saved_crossing: dict[str, object] = {"identity": crossing.identity}
+        if isinstance(crossing.rearm, AboveRearmLine):
+            saved_crossing["rearm_since"] = crossing.rearm.since
+        if isinstance(crossing, OpenPhoneCrossing):
+            saved_crossing.update(natedev=crossing.natedev.value, phone=crossing.phone.value)
+        else:
+            saved_crossing.update(recovery=crossing.receipt.value, retired=crossing.retired,
+                                  return_policy=crossing.return_policy.value)
+        data["phone_crossing"] = saved_crossing
     if isinstance(record.failure, FailurePending):
         data["failure"] = {"status": record.failure.event.status, "detail": record.failure.event.detail}
     elif isinstance(record.failure, FailureReported):
@@ -3311,15 +3355,27 @@ def folder_recommendation(choices: FolderChoices, shortfall: int) -> str:
     return f"{action} (recommended): {effect} {gib(largest.bytes)}, which covers the {gib(shortfall)} shortfall."
 
 
-def folder_choice_lines(choices: FolderChoices, shortfall: int, *, path_limit: int) -> list[str]:
-    """Render the session choices with shortened folder labels and their effects."""
+def folder_choice_lines(choices: FolderChoices, shortfall: int, *, folder_count: int) -> list[str]:
+    """List enough measured folders with full paths, within the folder count."""
     if isinstance(choices, UnavailableFolderChoices):
         lines = [folder_recommendation(choices, shortfall), "",
                  "Measure first (recommended): natedev lists folder sizes, then you choose what to delete.", "",
                  "Delete nothing: the disk stays low and builds can fail."]
     else:
-        choices = replace(choices, choices=tuple(replace(item, label=alert_path(item.label, path_limit))
-                                                 for item in choices.choices))
+        shown: list[FolderChoice] = []
+        covered = 0
+        for item in choices.choices:
+            if len(shown) >= folder_count or covered >= shortfall:
+                break
+            if item.bytes <= 0:
+                continue
+            shown.append(item)
+            if item.kind is not FolderChoiceKind.HELD_OUTPUT:
+                covered += item.bytes
+        if shown and not isinstance(choices, HeldOnlyFolderChoices):
+            largest = next(item for item in choices.choices if item.kind is not FolderChoiceKind.HELD_OUTPUT)
+            if largest not in shown:
+                shown[-1] = largest
         effects = {
             FolderChoiceKind.TRASH: "Deleting it removes discarded files.",
             FolderChoiceKind.SCRATCH: "Deleting it removes temporary work; check for work you still need.",
@@ -3328,7 +3384,7 @@ def folder_choice_lines(choices: FolderChoices, shortfall: int, *, path_limit: i
                                          "Cleanup never deletes it. Deleting it removes its files."),
             FolderChoiceKind.HELD_OUTPUT: "A build is using output inside it; deleting it can break that build.",
         }
-        lines = [f"{item.label}: holds {gib(item.bytes)}. {effects[item.kind]}" for item in choices.choices]
+        lines = [f"{item.label}: holds {gib(item.bytes)}. {effects[item.kind]}" for item in shown]
         lines.append(folder_recommendation(choices, shortfall))
         lines.append("Delete nothing: builds can fail when the disk is full.")
     lines.append("natedev checks your choice before it deletes anything.")
@@ -3455,6 +3511,37 @@ def send_floor_alert(message: str, *,
     if isinstance(filesystem, FilesystemFloor) and not filesystem.root_device:
         message = f"Filesystem {filesystem.key} at {filesystem.probe_path}:\n{message}"
     return send_holder_message("natedev", message, repeat=repeat, lint_settings=lint_settings)
+
+
+class FallPushRetirement(Enum):
+    NO_KEPT_PUSH = "no_kept_push"
+    DROPPED_KEPT_PUSH = "dropped_kept_push"
+    FAILED = "failed"
+
+
+def retire_floor_fall(identity: str, *, machine: FloorMachine,
+                      lint_settings: conf.ConfigRead) -> FallPushRetirement:
+    """Retire the fall key on natedev, where silence keeps both machines' pushes."""
+    from scripts.notify import silence
+
+    command = session_send.send_argv("retire", "--to", "user", "--from", "disk_floor", "--key", f"phone:{identity}")
+    if machine is FloorMachine.MAC:
+        remote = ('"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/message/send.py" '
+                  + shlex.join(command[2:]))
+        command = [*silence.SSH, remote]
+    try:
+        result = subprocess.run(command, text=True, capture_output=True,
+                                timeout=send_budget.seconds(lint_settings.number("sweep_sender_timeout_seconds")))
+    except (OSError, subprocess.TimeoutExpired) as error:
+        print(f"lint sweep: cannot retire the fall push: {error}", file=sys.stderr)
+        return FallPushRetirement.FAILED
+    dropped = re.search(r"(?m)^dropped ([0-9]+) kept push(?:es)?$", result.stdout)
+    if result.returncode or dropped is None:
+        print(f"lint sweep: cannot retire the fall push: {result.stderr or result.stdout}", file=sys.stderr)
+    if dropped is None:
+        return FallPushRetirement.FAILED
+    return (FallPushRetirement.DROPPED_KEPT_PUSH if int(dropped.group(1))
+            else FallPushRetirement.NO_KEPT_PUSH)
 
 
 from scripts.message import sessions
@@ -3878,6 +3965,60 @@ def notify_floor_problem(outcome: FloorOutcome | tmp_sweep.SweepAssessment, *, l
         return
     phone_floor = int(lint_settings.number("sweep_phone_floor_gib") * GIB)
     phone_rearm = phone_floor + int(lint_settings.number("sweep_phone_rearm_gib") * GIB)
+    rearm_seconds = lint_settings.number("sweep_phone_rearm_minutes") * 60
+
+    def recover(current: FloorRecord, free: int, save: Callable[[FloorRecord], bool]) -> FloorRecord:
+        crossing = current.phone_crossing
+        if isinstance(crossing, AbovePhoneFloor) or (
+                isinstance(crossing, RecoveringPhoneCrossing) and crossing.receipt is CrossingReceipt.ACCEPTED):
+            return current
+        if free <= phone_rearm:
+            return replace(current, phone_crossing=replace(crossing, rearm=BelowRearmLine()))
+        now = time.time()
+        interval = crossing.rearm if isinstance(crossing.rearm, AboveRearmLine) else AboveRearmLine(now)
+        crossing = replace(crossing, rearm=interval)
+        current = replace(current, phone_crossing=crossing)
+        if now - interval.since < rearm_seconds:
+            return current
+        if isinstance(crossing, OpenPhoneCrossing):
+            policy = (ReturnPushPolicy.ALLOWED if crossing.phone is CrossingReceipt.ACCEPTED
+                      else ReturnPushPolicy.SUPPRESSED)
+            crossing = RecoveringPhoneCrossing(crossing.identity, rearm=interval, return_policy=policy)
+            current = replace(current, phone_crossing=crossing)
+        if not save(current):
+            return current
+        if not crossing.retired:
+            return_policy = crossing.return_policy
+            # Save uncertainty before retirement can remove a kept fall push.
+            crossing = replace(crossing, return_policy=ReturnPushPolicy.SUPPRESSED)
+            current = replace(current, phone_crossing=crossing)
+            if not save(current):
+                return current
+            retired = retire_floor_fall(crossing.identity, machine=machine, lint_settings=lint_settings)
+            if retired is FallPushRetirement.FAILED:
+                return current
+            if (retired is FallPushRetirement.DROPPED_KEPT_PUSH
+                    or return_policy is ReturnPushPolicy.SUPPRESSED):
+                return replace(current, phone_crossing=AbovePhoneFloor())
+            crossing = replace(crossing, retired=True, return_policy=return_policy)
+            current = replace(current, phone_crossing=crossing)
+            if not save(current):
+                return current
+        if crossing.receipt is CrossingReceipt.PENDING and disk_floor_channels() is FloorAlertChannels.NATEDEV_AND_PHONE:
+            if TYPE_CHECKING:
+                from scripts.notify.push_texts import render
+            else:
+                prepare_push_texts()
+                from scripts.notify.push_texts import render
+            phone = render("sweep.disk_floor_recovered", machine=machine.value,
+                           free=gib(free), rearm=gib(phone_rearm), floor=gib(phone_floor))
+            delivery = send_phone_push(phone,
+                repeat=CrossingSendKey(f"phone-recovered:{crossing.identity}",
+                                       lint_settings.number("sweep_crossing_repeat_minutes")), lint_settings=lint_settings)
+            if delivery.accepted:
+                current = replace(current, phone_crossing=replace(crossing, receipt=CrossingReceipt.ACCEPTED))
+            _ = save(current)
+        return current
 
     def finalize(previous: NoFloorRecord | FloorRecord, save: Callable[[FloorRecord], bool]) -> FloorRecord:
         current = floor_record_or_new(previous, after)
@@ -3887,9 +4028,9 @@ def notify_floor_problem(outcome: FloorOutcome | tmp_sweep.SweepAssessment, *, l
                 # Measure inside the record lock. Older callers cannot reset a newer crossing.
                 free = free_bytes(filesystem.probe_path if isinstance(filesystem, FilesystemFloor)
                                   else os.path.expanduser("~"))
-                if free > phone_rearm:
-                    current = replace(current, phone_crossing=AbovePhoneFloor())
-                elif free < phone_floor and isinstance(current.phone_crossing, AbovePhoneFloor):
+                current = recover(current, free, save)
+                crossing = current.phone_crossing
+                if free < phone_floor and isinstance(crossing, (AbovePhoneFloor, RecoveringPhoneCrossing)):
                     current = replace(current, phone_crossing=OpenPhoneCrossing(uuid.uuid4().hex))
             except OSError as error:
                 print(f"lint sweep: cannot measure the phone floor: {error}", file=sys.stderr)
@@ -3917,19 +4058,26 @@ def notify_floor_problem(outcome: FloorOutcome | tmp_sweep.SweepAssessment, *, l
             choices = folder_choices(measurement, protected, shortfall,
                                      now=time.time(), lint_settings=lint_settings, held_targets=held_targets)
 
-        def render(path_limit: int) -> str:
+        def render(folder_count: int) -> str:
             lines: list[str] = []
             if crossing_pending:
                 lines.extend([
                     f"Free disk space fell below the {gib(phone_floor)} alert line. {gib(free)} remains."
                     + (" This is the Mac disk." if machine is FloorMachine.MAC else ""),
                     f"Cleanup removed {gib(removed)}." if removed else "The cleanup run freed nothing.",
-                    *folder_choice_lines(choices, shortfall, path_limit=path_limit),
+                    *folder_choice_lines(choices, shortfall, folder_count=folder_count),
                 ])
             if isinstance(failure, FailurePending):
                 lines.append(f"The {scope.label} failed with status {failure.event.status}. {failure.event.detail}")
             return "\n".join(lines)
-        message = fit_alert_text(render, lint_settings=lint_settings)
+        folder_count = int(lint_settings.number("sweep_alert_folder_count"))
+        message = render(folder_count)
+        while folder_count > 0 and len(message) > lint_settings.whole("sweep_message_limit"):
+            folder_count -= 1
+            message = render(folder_count)
+        if len(message) > lint_settings.whole("sweep_message_limit"):
+            choices = UNAVAILABLE_FOLDER_CHOICES
+            message = render(0)
 
         def save_delivery(delivery: FloorAlertDelivery) -> None:
             nonlocal current
