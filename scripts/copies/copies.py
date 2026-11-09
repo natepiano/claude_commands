@@ -1368,9 +1368,16 @@ def remove_trees(owner: str, repo: RepositoryScope = ALL_REPOSITORIES) -> None:
                 present.append(tree)
             except (CopyError, OSError, scratch.ScratchError) as error:
                 failures.append(str(error))
+        unreachable_hosts: set[str] = set()
         for mirror in mirrors:
             try:
-                remove_remote_mirror(mirror)
+                if mirror.host not in unreachable_hosts:
+                    try:
+                        remove_remote_mirror(mirror)
+                        continue
+                    except RemoteHostUnreachable:
+                        unreachable_hosts.add(mirror.host)
+                defer_remote_removal(mirror)
             except (CopyError, OSError, subprocess.SubprocessError) as error:
                 failures.append(str(error))
                 failure_type = RemoteMirrorKept
@@ -1402,6 +1409,11 @@ def remove_trees(owner: str, repo: RepositoryScope = ALL_REPOSITORIES) -> None:
         raise failure_type("\n".join(failures))
 
 
+class RemoteRemoval(Enum):
+    KEEP = "keep"
+    DEFERRED = "deferred"
+
+
 @dataclass(frozen=True)
 class RemoteMirror:
     """An owner's registered repository copy on a remote host."""
@@ -1411,6 +1423,7 @@ class RemoteMirror:
     host: str
     path: str
     session: str
+    removal: RemoteRemoval = RemoteRemoval.KEEP
 
 
 @dataclass(frozen=True)
@@ -1536,6 +1549,32 @@ def register_remote(mirror: RemoteMirror) -> None:
             "host": mirror.host, "path": mirror.path, "session": mirror.session,
             "holder_pid": os.getpid(), "last_use": time.time(),
         }) + "\n")
+    remove_deferred_mirrors(mirror.host)
+
+
+def defer_remote_removal(mirror: RemoteMirror) -> None:
+    """Keep the removal request until the next use of the host."""
+    with file_lock.exclusive(remote_registry() / "records.lock"):
+        path = remote_record_path(mirror)
+        fields = cast(dict[str, object], json.loads(path.read_text()))
+        fields["removal"] = RemoteRemoval.DEFERRED.value
+        write_text_atomic(path, json.dumps(fields) + "\n")
+    print(f"{mirror.host}:{mirror.path}: removal deferred; removal runs at the next use of the host")
+
+
+def remove_deferred_mirrors(host: str) -> None:
+    """Retry local removal requests after a successful use of the host."""
+    for path in sorted(remote_registry().glob("*.json")):
+        try:
+            mirror = read_remote_mirror(path)
+            if mirror.host != host or mirror.removal is not RemoteRemoval.DEFERRED:
+                continue
+            with remote_lease(mirror):
+                current = read_remote_mirror(path)
+                if current.removal is RemoteRemoval.DEFERRED:
+                    remove_remote_mirror(current)
+        except (CopyError, OSError, subprocess.SubprocessError) as error:
+            print(f"anomaly: deferred mirror removal: {' '.join(str(error).split())}", file=sys.stderr)
 
 
 def unregister_remote(host: str, path: str) -> None:
@@ -1556,7 +1595,8 @@ def read_remote_mirror(path: Path) -> RemoteMirror:
         if not all(isinstance(value, str) for value in values):
             raise ValueError("invalid remote mirror record")
         unit, repo, host, remote, session = cast(list[str], values)
-        return RemoteMirror(unit, SelectedRepository(repo), host, remote, session)
+        return RemoteMirror(unit, SelectedRepository(repo), host, remote, session,
+                            RemoteRemoval(fields.get("removal", "keep")))
     except (OSError, ValueError) as error:
         raise CopyError(f"{path}: repair remote mirror record: {error}") from error
 
@@ -1779,12 +1819,28 @@ def target_mirror_leases(targets: Sequence[str]) -> Generator[frozenset[Path]]:
         yield protected
 
 
+class RemoteHostUnreachable(CopyError):
+    """The removal command could not connect to the mirror host."""
+
+
 def remove_remote_mirror(mirror: RemoteMirror) -> None:
     command = remote_copies_command("mirror-remove", mirror, "--host", mirror.host)
-    answer = subprocess.run(["ssh", "-o", "BatchMode=yes", mirror.host, command],
-                            capture_output=True, text=True, timeout=load_config().git_timeout_seconds)
+    command += '; copies_status=$?; printf "\\nrc=%s\\n" "$copies_status"; exit "$copies_status"'
+    try:
+        answer = subprocess.run(["ssh", "-o", "BatchMode=yes", mirror.host, command],
+                                capture_output=True, text=True, timeout=load_config().git_timeout_seconds)
+    except subprocess.TimeoutExpired as error:
+        raise RemoteHostUnreachable(f"{mirror.host}:{mirror.path}: {error}") from error
     if answer.returncode:
-        raise CopyError(f"{mirror.host}:{mirror.path}: {failure_detail(answer)}")
+        failure = (RemoteHostUnreachable if answer.returncode == 255 and any(
+            text in answer.stderr.lower() for text in (
+                "ssh: connect to host ", "ssh: connect to address ", "ssh: could not resolve hostname ",
+            )) else CopyError)
+        raise failure(f"{mirror.host}:{mirror.path}: {failure_detail(answer)}")
+    status = next((line for line in reversed(answer.stdout.splitlines()) if line.startswith("rc=")), "")
+    if status != "rc=0":
+        detail = status or "remote status is missing"
+        raise CopyError(f"{mirror.host}:{mirror.path}: {detail}; {failure_detail(answer)}")
     unregister_remote(mirror.host, mirror.path)
 
 

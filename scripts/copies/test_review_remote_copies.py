@@ -229,9 +229,11 @@ class RemoteEntryTests(unittest.TestCase):
     def remove_trees_through_cli(self, owner: str) -> None:
         """Run the real remote CLI without another SSH interpreter."""
         def remote_cli(arguments: Sequence[str], **options: object) -> subprocess.CompletedProcess[str]:
-            command = shlex.split(arguments[-1])[2:]
-            return invoke_cli(copies, lambda: copies.main(command), command, os.environ, self.root,
-                              combined_output=not bool(options.get("capture_output")))
+            command = shlex.split(arguments[-1].partition("; copies_status=")[0])[2:]
+            answer = invoke_cli(copies, lambda: copies.main(command), command, os.environ, self.root,
+                                combined_output=not bool(options.get("capture_output")))
+            return subprocess.CompletedProcess(arguments, answer.returncode,
+                                               answer.stdout + f"\nrc={answer.returncode}\n", answer.stderr)
 
         with mock.patch.object(copies, "subprocess", SimpleNamespace(run=remote_cli)):
             copies.remove_trees(owner)
