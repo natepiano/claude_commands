@@ -1906,34 +1906,17 @@ Every nextest run that lint starts prints one line after admission: `nextest: <g
 - The automatic tmp sweep keeps a recent plain file (`RECENT`) and removes an old one by the existing idle limit. A hand cleanup plan (`tmp_sweep.py --plan`) keeps a plain file with reason `NO_END` ("no recorded end permits hand cleanup"). No row says "Not a directory".
 - Rows: `test_scratch` (plain file and folder read `NotRegistered`; a parent without search permission reads `UnreadableRecord`); `test_tmp_sweep` `ScratchRootTests` and `HandCleanupTests --plan`. `docs/as-built/build-memory-admission.md` states the plain-file rule.
 
-### Phase 86 — Mac rebuild works over ssh through a local sshd hop  · status: todo
+### Phase 86 — Mac rebuild works over ssh through a local sshd hop  · status: done
 **Depends on:** none. Repository: nixos (worktree `/home/natepiano/worktrees/nixos-mac-ssh-rebuild`, branch `resources-mac-ssh-rebuild`, from nixos main `590edd7`). The showrunner pushes nixos main; this unit never does.
 
 **Approved:** builds showrunner, 2026-11-08, for the user: "i want to be able to rebuild over ssh - i made the configuration changes to settings that it suggested but it still does not work". Design: natedev.
 
-#### Work Order
-
-**Goal:** the user types `rebuild` in an `ssh mac` session and the Mac switch completes, the same as at the Mac's own terminal.
-
-**Measured (natedev, 2026-11-08):** over `ssh mac` (Tailscale SSH, a child of tailscaled), `rebuild` stops in nix-darwin's `ensureAppManagement`: a touch of `/Applications/Nix Apps/*.app/.DS_Store` fails, and the launchctl manager name is not `Aqua`. The Remote Login switch "Allow full disk access for remote users" covers only Apple's sshd (`modules/darwin/tailscale.nix:96-104`). The user has turned Remote Login on; Apple's sshd answers on 127.0.0.1:22 and on the LAN with password login.
-
-**Spec:**
-1. In `modules/common/rebuild.nix`, on Darwin only: when `rebuild` runs in an ssh session whose server address is not loopback (`SSH_CONNECTION` third field is not `127.0.0.1` or `::1`), it runs itself again through Apple's sshd on localhost with `ssh -t` and the hop key, with the same arguments, and exits with that run's status. The user still types only `rebuild`. At the Mac's terminal, and inside the hop, `rebuild` runs as before. Linux `rebuild` does not change.
-2. A Mac-local hop key: an ed25519 key with no passphrase, made on the Mac at activation when it is not there (owned by the user, mode 0600, under `~/.ssh/`). No private key goes in the repo. The key is authorized only from loopback: `from="127.0.0.1,::1"`. Use nix-darwin `users.users.<user>.openssh.authorizedKeys` when it can take a key made at activation; when it cannot, write the `from=` line at activation to a root-owned file that sshd reads through `AuthorizedKeysFile`, and say which route you took and why. `sudo` inside the hop still asks for the password.
-3. Lock Apple's sshd to localhost through nix-darwin's sshd config (`/etc/ssh/sshd_config.d/`): `AllowUsers <user>@127.0.0.1 <user>@::1`, `PasswordAuthentication no`, `KbdInteractiveAuthentication no`. Remote Login then admits no login from the LAN. Apple's sshd is started by launchd on port 22, so `ListenAddress` does not apply.
-4. Correct `modules/darwin/tailscale.nix` (it says Apple's sshd is off) and any other text this change makes wrong, in the same commit.
-
-**Files:**
-- `modules/common/rebuild.nix`
-- `modules/darwin/ssh.nix`
-- `modules/darwin/tailscale.nix`
-- `modules/darwin/default.nix`
-- `modules/darwin/local-ssh-hop.nix`
-- `modules/linux/ssh.nix`
-
-**Workers:** 1 writer (no separate tester; the repository has no test suite for these modules). `modules/darwin/local-ssh-hop.nix` is new and optional: use it when the key and sshd settings fit better in their own module.
-
-**Acceptance gate:** the Mac system configuration evaluates on natedev (`nix eval` of the darwin toplevel `drvPath`); the generated `rebuild` script passes `bash -n` and shellcheck; the generated sshd drop-in holds the three lines of Spec 3; the activation step makes the key only when it is missing and never prints the private key. The writer gives the exact steps the user runs to take it live, including the first switch, which still meets the old failure until this change is active. The commit is on branch `resources-mac-ssh-rebuild`, not on main.
+#### As-built
+- nixos `0da1eefd4` on branch `resources-mac-ssh-rebuild`; on nixos main as `7e9331f` (showrunner merge).
+- `modules/common/rebuild.nix`: on Darwin, when `SSH_CONNECTION` shows a non-loopback server address, `rebuild` runs itself again with `/usr/bin/ssh -t` to `natemccoy@127.0.0.1`, with the same arguments, and returns that exit status. The hop uses the hop key only (`IdentityAgent=none`, `IdentitiesOnly=yes`, no password), `UserKnownHostsFile=/etc/ssh/rebuild_known_hosts` and `StrictHostKeyChecking=yes`. `UNAME` is set on Linux only.
+- `modules/darwin/ssh.nix`: the `users` activation makes `~/.ssh/id_ed25519_rebuild_localhost` when missing (no passphrase) and writes `/etc/ssh/rebuild_authorized_keys.d/natemccoy` (root-owned) with `from="127.0.0.1,::1"`. nix-darwin's key options read keys at evaluation, so sshd reads this runtime file. The drop-in `/etc/ssh/sshd_config.d/000-rebuild-localhost.conf` sets `AllowUsers natemccoy@127.0.0.1 natemccoy@::1`, no password or keyboard-interactive login, and that `AuthorizedKeysFile`. `postActivation` writes the trust file from `/etc/ssh/ssh_host_*_key.pub`, after nix-darwin's openssh stage makes host keys. With no host key, activation prints one line: run `rebuild` once in the Mac's own Terminal after Remote Login is on.
+- `modules/darwin/tailscale.nix`, `modules/linux/ssh.nix`: Remote Login is on for the loopback hop only.
+- User steps: Remote Login on with "Allow full disk access for remote users"; first `rebuild` in the Mac's Terminal; then `ssh -t mac rebuild`. The live hop result comes from natedev through the showrunner.
 
 ### Phase 87 — The Mac floor alert reaches the user's phone  · status: todo
 **Depends on:** none. Merge `origin/builds` first.
