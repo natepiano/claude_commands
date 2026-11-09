@@ -9,6 +9,8 @@ import io
 import json
 import os
 import select
+import shutil
+import socket
 from pathlib import Path
 import signal
 import subprocess
@@ -100,6 +102,21 @@ class RemoteCopiesTests(unittest.TestCase):
                                  else expected_remote_lease_columns("idle", "-", "-"))
                 self.assertEqual((row["commit"], row["target"]), ("-", "-"))
                 self.assertNotIn(holder.current_session, "\t".join(row.values()))
+        checkout = self.root / "scratch/local/checkout"
+        checkout.mkdir(parents=True)
+        local = copies.RemoteMirror(str(owner.id), copies.SelectedRepository(self.source.name),
+                                    "localhost", str(checkout), holder.current_session)
+        copies.register_remote(local)
+        row = next(row for row in self.list_rows() if row["path"] == str(checkout))
+        self.assertEqual(row["host"], socket.gethostname())
+        self.assertEqual(copies.read_remote_mirror(copies.remote_record_path(local)).host, "localhost")
+        shutil.rmtree(checkout.parent)
+        with copies.local_mirror_lease(checkout, "missing", create=False):
+            self.assertFalse(checkout.parent.exists())
+        with copies.mirror_sweep_leases(self.root / "mirrors"):
+            self.assertFalse(checkout.parent.exists())
+        self.assertFalse(copies.remote_record_path(local).exists())
+        self.assertFalse(any(row["path"] == str(checkout) for row in self.list_rows()))
 
     def test_list_requires_matching_pid_before_naming_the_recorded_holder(self) -> None:
         owner, holder = self.list_members()
@@ -232,11 +249,14 @@ class RemoteCopiesTests(unittest.TestCase):
             self.assertFalse((tree / "untracked.txt").exists())
             stable = tree / "stable.txt"
             os.utime(stable, ns=(1_000_000_000, 1_000_000_000))
-            target = tree / "target/retained"
+            target_root = (tree / "target").resolve()
+            target = target_root / "retained"
             _ = target.write_text("artifact")
         with copies.standing("alpha", self.source, copies.StagedSource(copies.staged_tree(self.source))) as reused:
-            self.assertEqual(reused, tree)
-            self.assertEqual(stable.stat().st_mtime_ns, 1_000_000_000)
+            self.assertNotEqual(reused, tree)
+            self.assertFalse(tree.exists())
+            self.assertEqual((reused / "target").resolve(), target_root)
+            self.assertEqual((reused / "stable.txt").stat().st_mtime_ns, 1_000_000_000)
             self.assertEqual(target.read_text(), "artifact")
         self.assertEqual((index.read_bytes(), index.stat().st_mtime_ns, original.stat().st_mtime_ns), before)
 
@@ -249,6 +269,21 @@ class RemoteCopiesTests(unittest.TestCase):
         self.assertIn("--repository " + self.source.name, receiver)
         self.assertIn("--session holder-session", receiver)
         self.assertIn("--delete", command)
+        self.assertIn("--compress", command)
+        self.assertIn("-rlptc", command)
+        exclude = self.root / "excludes"
+        _ = exclude.write_text("/target/\n")
+        output = self.root / "receiver"
+        for body in ("before", "edited"):
+            with self.subTest(body=body):
+                source = self.source / "same-size.txt"
+                _ = source.write_text(body)
+                os.utime(source, (1_000_000_000, 1_000_000_000))
+                answer = subprocess.run([*command[:-1], f"{output}/"],
+                    capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
+                self.assertEqual(answer.returncode, 0, answer.stdout + answer.stderr)
+                self.assertEqual((output / "same-size.txt").read_text(), body)
+                self.assertEqual((output / "same-size.txt").stat().st_mtime_ns, source.stat().st_mtime_ns)
 
     def test_owner_removal_keeps_another_owner_and_repository(self) -> None:
         mine, other, elsewhere = self.remote(), self.remote("beta", "mirror/beta"), self.remote("alpha", "mirror/else")
@@ -391,7 +426,8 @@ class RemoteCopiesTests(unittest.TestCase):
         with copies.local_mirror_lease(self.mirror, "run-session"):
             with self.assertRaisesRegex(RuntimeError, "cancelled sweep"):
                 with copies.mirror_sweep_leases(self.mirror.parent) as protected:
-                    self.assertEqual(protected, frozenset({self.mirror}))
+                    self.assertEqual(protected.busy, frozenset({self.mirror}))
+                    self.assertEqual(protected.held, frozenset({idle}))
                     with copies.target_mirror_leases([str(self.mirror / "target")]) as linux_protected:
                         self.assertEqual(linux_protected, frozenset({self.mirror}))
                     with file_lock.exclusive(floor_claims.mirror_lock_path(idle), wait=False) as state:
@@ -442,7 +478,7 @@ class RemoteCopiesTests(unittest.TestCase):
 
         def sweep() -> None:
             with copies.mirror_sweep_leases(self.mirror.parent) as protected:
-                self.assertFalse(protected)
+                self.assertFalse(protected.busy)
                 with file_lock.exclusive(self.root / "claims.lock"):
                     with file_lock.exclusive(self.root / "records.lock"):
                         entered.set()
@@ -462,33 +498,29 @@ class RemoteCopiesTests(unittest.TestCase):
         with copies.local_mirror_lease(self.mirror, "admission"):
             pass
 
-    def test_receiver_takes_lease_then_claim_then_record_and_keeps_metadata(self) -> None:
+    def test_receiver_takes_lease_then_reads_claims_then_locks_record_and_keeps_metadata(self) -> None:
         args = copies.CopyArguments()
         args.path, args.action = str(self.mirror), "mirror-receive"
         args.owner, args.repository, args.session = "alpha", "repository", "receiver-session"
         args.command = [sys.executable, "-c", "pass"]
-        claim_held = Event()
+        claims_read = Event()
         real_write = write_text_atomic
 
-        @contextmanager
-        def claims(_timeout: float) -> Generator[floor_claims.LockedClaims]:
+        def claims(_timeout: float) -> floor_claims.ClaimSnapshot:
             with file_lock.exclusive(floor_claims.mirror_lock_path(self.mirror), wait=False) as state:
                 self.assertIs(state, file_lock.LockResult.BUSY)
-            claim_held.set()
-            try:
-                yield floor_claims.LockedClaims(frozenset())
-            finally:
-                claim_held.clear()
+            claims_read.set()
+            return floor_claims.ClaimSnapshot(frozenset())
 
         def record(path: Path, content: str) -> None:
             if path.name == ".copy-record.json":
-                self.assertTrue(claim_held.is_set())
+                self.assertTrue(claims_read.is_set())
                 lock = self.mirror.parent / ("." + self.mirror.name + ".copy-record.lock")
                 with file_lock.exclusive(lock, wait=False) as state:
                     self.assertIs(state, file_lock.LockResult.BUSY)
             real_write(path, content)
 
-        with mock.patch.object(floor_claims, "locked_claims", side_effect=claims), \
+        with mock.patch.object(floor_claims, "read_claims", side_effect=claims), \
                 mock.patch.object(copies, "write_text_atomic", side_effect=record):
             self.assertEqual(copies.mirror_run(args), 0)
         metadata = self.mirror / ".copy-record.json"
@@ -512,13 +544,13 @@ class RemoteCopiesTests(unittest.TestCase):
                 self.assertIn("copies.py mirror-use", copies.remote_use_command(mirror, "true"))
 
     @contextmanager
-    def open_file_process(self, path: Path) -> Generator[subprocess.Popen[str]]:
+    def open_file_process(self, path: Path, mode: str = "r") -> Generator[subprocess.Popen[str]]:
         path.parent.mkdir(parents=True, exist_ok=True)
         _ = path.write_text("held\n")
         child = subprocess.Popen([
             sys.executable, "-c",
-            "import signal,sys; held=open(sys.argv[1]); print('ready',flush=True); signal.pause()",
-            str(path),
+            "import signal,sys; held=open(sys.argv[1],sys.argv[2]); print('ready',flush=True); signal.pause()",
+            str(path), mode,
         ], cwd=self.root, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True)
         try:
             if child.stdout is None:
@@ -531,8 +563,14 @@ class RemoteCopiesTests(unittest.TestCase):
             _ = child.communicate(timeout=10)
 
     def test_open_file_below_mirror_keeps_the_mirror_busy(self) -> None:
-        with self.open_file_process(self.mirror / "target/output"):
-            self.assertTrue(copies.mirror_has_process(self.mirror, copies.scan_mirror_processes((self.mirror,))))
+        for mode in ("r", "w", "r+"):
+            with self.subTest(mode=mode), self.open_file_process(self.mirror / "target/output", mode):
+                self.assertEqual(copies.mirror_has_process(self.mirror,
+                    copies.scan_mirror_processes((self.mirror,))), mode != "r")
+        for how in (tmp_sweep.WORKS_IN, tmp_sweep.MAPS_FILE, tmp_sweep.WRITES_FILE, tmp_sweep.HOLDS_FILE):
+            uses = tmp_sweep.ProcessUsesKnown([(str(self.mirror / "file"), os.getpid() + 1, how)])
+            self.assertEqual(copies.mirror_has_process(self.mirror,
+                copies.MirrorProcessScan(uses, frozenset())), how != tmp_sweep.HOLDS_FILE)
 
     def test_open_file_in_text_prefix_sibling_does_not_keep_the_mirror(self) -> None:
         self.mirror.mkdir(parents=True)
@@ -540,7 +578,7 @@ class RemoteCopiesTests(unittest.TestCase):
             self.assertFalse(copies.mirror_has_process(self.mirror, copies.scan_mirror_processes((self.mirror,))))
 
     def test_process_below_the_filesystem_root_keeps_a_root_mirror(self) -> None:
-        uses = tmp_sweep.ProcessUsesKnown([("/var/tmp/output", os.getpid() + 1, "cwd")])
+        uses = tmp_sweep.ProcessUsesKnown([("/var/tmp/output", os.getpid() + 1, tmp_sweep.WORKS_IN)])
         self.assertTrue(copies.mirror_has_process(Path("/"), copies.MirrorProcessScan(uses, frozenset())))
 
     def test_unavailable_lsof_scan_keeps_the_mirror_busy(self) -> None:

@@ -23,12 +23,12 @@ from unittest import mock
 
 from scripts.buildlog import charts, costs, moments
 from scripts.buildlog.mac_idle_test_support import write_idle_alert, write_idle_config
-from scripts.build_queue import admission_client, admission_code, admission_protocol as wire, cloud_progress, memory_feed, progress_profile, queue_lines, queue_view
+from scripts.build_queue import admission_client, admission_protocol as wire, cloud_progress, memory_feed, progress_profile, queue_lines, queue_view
 from scripts.build_queue.test_queue_view import cloud_reading
 from scripts.build_queue.scope_activity import IdleService, LiveBuildRun, NoLiveBuildRun, ScopeProcess, ScopeProcesses
 from scripts.lint import test_memory_admit as memory_tests
 from scripts.lib import conf, test_hang_guard
-from scripts.lib.build_steps import RECORDED_STEP_NAMES
+from scripts.lib.build_steps import read_step_names
 from scripts.message import unit_labels
 from scripts.lint import memory_admit as gate
 from scripts.lint.memory_test_support import admission_policy_fixture
@@ -323,8 +323,9 @@ class MemoryFeedTests(unittest.TestCase):
             reads[path] += 1
             return original(path)
 
+        names = read_step_names()
         with mock.patch.object(Path, "read_text", new=read):
-            swap = memory_feed.read_swap((queued, queued), {}, 6)
+            swap = memory_feed.read_swap((queued, queued), {}, 6, names)
         assert isinstance(swap, memory_feed.SwapReading)
         rows = {row["name"]: row for row in swap.rows}
         self.assertEqual(rows["agent sessions (2)"]["bytes"], 10 * admission_records.GIB)
@@ -332,7 +333,7 @@ class MemoryFeedTests(unittest.TestCase):
         self.assertEqual(rows["desktop session"]["bytes"], 2 * admission_records.GIB)
         self.assertEqual(rows["system services"]["bytes"], 2 * admission_records.GIB)
         self.assertEqual(rows["hana CI"]["bytes"], admission_records.GIB)
-        self.assertEqual(rows[queue_lines.step_text(queued, RECORDED_STEP_NAMES)]["bytes"], admission_records.GIB)
+        self.assertEqual(rows[queue_lines.step_text(queued, read_step_names())]["bytes"], admission_records.GIB)
         self.assertEqual(rows["not in a group"]["bytes"], admission_records.GIB)
         self.assertEqual(rows["not attributed"]["bytes"], admission_records.GIB)
         self.assertEqual(rows["Total"]["bytes"], swap.used)
@@ -344,7 +345,7 @@ class MemoryFeedTests(unittest.TestCase):
     def test_swap_keeps_the_unattributed_bytes_without_rounding_them_away(self) -> None:
         self.host_swap(2 ** 20, 2 ** 20)
         _ = self.cgroup("system.slice", 2 ** 20 - 7)
-        swap = memory_feed.read_swap((), {}, 6)
+        swap = memory_feed.read_swap((), {}, 6, read_step_names())
         assert isinstance(swap, memory_feed.SwapReading)
         residual = next(row for row in swap.rows if row["kind"] == "unattributed")
         self.assertEqual(residual["bytes"], 7)
@@ -354,7 +355,7 @@ class MemoryFeedTests(unittest.TestCase):
     def test_swap_exposes_a_signed_counter_difference_without_changing_owner_values(self) -> None:
         self.host_swap(2 ** 20, 2 ** 20)
         _ = self.cgroup("system.slice", 2 ** 20 + 7)
-        swap = memory_feed.read_swap((), {}, 6)
+        swap = memory_feed.read_swap((), {}, 6, read_step_names())
         assert isinstance(swap, memory_feed.SwapReading)
         self.assertEqual(swap.rows[0]["bytes"], 2 ** 20 + 7)
         residual = next(row for row in swap.rows if row["kind"] == "unattributed")
@@ -368,7 +369,7 @@ class MemoryFeedTests(unittest.TestCase):
         step = admission_records.RunningStep("", "hana-ci.slice", "service", str(path), 0,
             admission_records.UnownedSliceMemory(admission_records.GIB, cgroup=str(path), owner="hana-ci.slice",
                                     pid=admission_records.PidNotRecorded(), job_state=IdleService()), pid=admission_records.PidNotRecorded())
-        swap = memory_feed.read_swap((step,), {}, 6)
+        swap = memory_feed.read_swap((step,), {}, 6, read_step_names())
         assert isinstance(swap, memory_feed.SwapReading)
         self.assertEqual(swap.rows[0]["name"], "hana CI")
         self.assertEqual(swap.rows[0]["bytes"], admission_records.GIB)
@@ -383,7 +384,7 @@ class MemoryFeedTests(unittest.TestCase):
             steps.append(admission_records.RunningStep(owner, owner, "between steps", str(path), 0,
                 admission_records.UnownedSliceMemory(admission_records.GIB, cgroup=str(path), owner=owner, pid=admission_records.PidNotRecorded()),
                 pid=admission_records.PidNotRecorded()))
-        swap = memory_feed.read_swap(steps, labels, 6)
+        swap = memory_feed.read_swap(steps, labels, 6, read_step_names())
         assert isinstance(swap, memory_feed.SwapReading)
         self.assertEqual({row["name"] for row in swap.rows if row["kind"] == "owner"}, set(labels))
         self.assertTrue(all("between steps" in row["detail"] for row in swap.rows if row["kind"] == "owner"))
@@ -430,30 +431,57 @@ class MemoryFeedTests(unittest.TestCase):
         self.assertIn("TOP_COST_RECENT_DAYS", text)
         self.assertTrue(page["walk"])
 
+    def test_installed_feed_sources_and_startup_files_change_the_fixed_version(self) -> None:
+        installed = self.root / "installed"
+        for relative in memory_feed.FEED_CODE_PATHS:
+            target = installed / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            _ = target.write_text("fixture\n")
+        cases = (
+            ("scripts/build_queue/memory_feed.py", True),
+            ("scripts/buildlog/charts.py", True),
+            ("scripts/buildlog/holds.py", True),
+            ("scripts/build_queue/memory_live.html", True),
+            ("config/memory_feed.conf", True),
+            ("config/build_steps.conf", False),
+            ("scripts/unrelated.py", False),
+        )
+        before = memory_feed.installed_feed_code_version(installed)
+        for relative, changes_version in cases:
+            with self.subTest(path=relative):
+                target = installed / relative
+                target.parent.mkdir(parents=True, exist_ok=True)
+                previous = target.read_text() if target.exists() else ""
+                _ = target.write_text("changed fixture\n")
+                self.assertEqual(memory_feed.installed_feed_code_version(installed) != before, changes_version)
+                _ = target.write_text(previous)
+        (installed / "scripts/build_queue/memory_feed.py").unlink()
+        self.assertEqual(memory_feed.installed_feed_code_version(installed), "")
+
     def test_an_installed_schema_change_requires_a_restart_before_the_next_read(self) -> None:
         installed = self.root / "installed"
         source = installed / "scripts" / "build_queue" / "admission_records.py"
-        for relative in admission_code.ADMISSION_CODE_PATHS:
-            target = installed / "scripts" / relative
+        for relative in memory_feed.FEED_CODE_PATHS:
+            target = installed / relative
             target.parent.mkdir(parents=True, exist_ok=True)
             _ = target.write_text("fixture\n")
         _ = source.write_text("schema = 'before'\n")
-        before = memory_feed.installed_code_version(installed)
+        before = memory_feed.installed_feed_code_version(installed)
 
         def install_schema(seconds: float) -> None:
             self.assertEqual(seconds, 0.125)
             _ = source.write_text("schema = 'after'\n")
-            self.assertNotEqual(memory_feed.installed_code_version(installed), before)
+            self.assertNotEqual(memory_feed.installed_feed_code_version(installed), before)
 
         with (mock.patch.object(admission_client, "view", return_value=captured_reading()) as view,
-              mock.patch.object(memory_feed, "LOADED_ADMISSION_CODE_VERSION", before),
+              mock.patch.object(memory_feed, "LOADED_FEED_CODE_VERSION", before),
               mock.patch.object(time, "sleep", side_effect=install_schema)):
             self.assertEqual(memory_feed.main(["--code-root", str(installed)]), 1)
         view.assert_called_once_with()
-        self.assertNotEqual(memory_feed.installed_code_version(installed), before)
+        self.assertNotEqual(memory_feed.installed_feed_code_version(installed), before)
         changed = replace(captured_reading(), explanation=replace(captured_reading().explanation, now=200_001))
         with (mock.patch.object(admission_client, "view", return_value=changed) as restarted,
-              mock.patch.object(memory_feed, "LOADED_ADMISSION_CODE_VERSION", memory_feed.installed_code_version(installed))):
+              mock.patch.object(memory_feed, "LOADED_FEED_CODE_VERSION", memory_feed.installed_feed_code_version(installed))):
             self.assertEqual(memory_feed.main(["--once", "--code-root", str(installed)]), 0)
         restarted.assert_called_once_with()
         page = cast(dict[str, object], json.loads((self.output / "memory.json").read_text()))
@@ -475,63 +503,69 @@ class MemoryFeedTests(unittest.TestCase):
                 self.assertGreater(page["room"], 0)
 
     def test_a_schema_install_during_import_restarts_a_fresh_interpreter(self) -> None:
-        installed = self.root / "installed"
-        source = Path(memory_feed.__file__).resolve().parents[1]
-        _ = shutil.copytree(source, installed / "scripts", ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
-        probe = textwrap.dedent("""
-            import builtins
-            import json
-            import sys
-            from pathlib import Path
-            from unittest import mock
+        cases = (("scripts.build_queue", "snapshot_codec", "codec"), ("scripts.buildlog", "charts", "charts"))
+        for package, module, alias in cases:
+            with self.subTest(module=module):
+                installed = self.root / "installed" / module
+                source = Path(memory_feed.__file__).resolve().parents[1]
+                _ = shutil.copytree(source, installed / "scripts", ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+                (installed / "config").mkdir()
+                _ = shutil.copyfile(conf.path("memory_feed"), installed / "config/memory_feed.conf")
+                probe = textwrap.dedent("""
+                    import builtins
+                    import json
+                    import sys
+                    from pathlib import Path
+                    from unittest import mock
 
-            root = Path(sys.argv[1])
-            source = root / 'scripts/build_queue/snapshot_codec.py'
-            original_import = builtins.__import__
-            changed = False
-            def install_during_import(name, globals=None, locals=None, fromlist=(), level=0):
-                global changed
-                result = original_import(name, globals, locals, fromlist, level)
-                if name == 'scripts.build_queue' and 'snapshot_codec' in fromlist and not changed:
-                    changed = True
-                    source.write_text(source.read_text() + '\\nfrom dataclasses import dataclass\\n'
-                        '@dataclass(frozen=True)\\nclass InstalledSchemaRevision:\\n    revision: str\\n')
-                return result
-            builtins.__import__ = install_during_import
-            from scripts.build_queue import memory_feed
-            builtins.__import__ = original_import
-            assert changed
-            assert not hasattr(memory_feed.codec, 'InstalledSchemaRevision')
-            with mock.patch.object(memory_feed.admission_client, 'view',
-                    side_effect=AssertionError('The old decoder must not read the queue')):
-                status = memory_feed.main(['--once', '--code-root', str(root)])
-            print(json.dumps({'status': status, 'changed':
-                memory_feed.LOADED_ADMISSION_CODE_VERSION != memory_feed.installed_code_version(root)}))
-            sys.exit(status)
-        """)
-        result = subprocess.run([sys.executable, "-c", probe, str(installed)], cwd=installed,
-            env={**os.environ, "PYTHONPATH": str(installed)}, capture_output=True, text=True,
-            timeout=test_hang_guard.TEST_HANG_GUARD_SECS, check=False)
-        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
-        self.assertEqual(json.loads(result.stdout), {"status": 1, "changed": True})
-        restarted = textwrap.dedent("""
-            import sys
-            from unittest import mock
-            from scripts.build_queue import memory_feed
-            decoded = memory_feed.codec.parse_snapshot_value(
-                {'kind': 'InstalledSchemaRevision', 'revision': 'after'}, memory_feed.codec.InstalledSchemaRevision)
-            with (mock.patch.object(memory_feed, 'report_reading',
-                    return_value=memory_feed.charts.IndexUnavailable('private report fixture')),
-                  mock.patch.object(memory_feed, 'reading', return_value={
-                    'ok': True, 'read_at': 200001, 'decoder_revision': decoded.revision})):
-                sys.exit(memory_feed.main(['--once', '--code-root', sys.argv[1]]))
-        """)
-        result = subprocess.run([sys.executable, "-c", restarted, str(installed)], cwd=installed,
-            env={**os.environ, "PYTHONPATH": str(installed)}, capture_output=True, text=True,
-            timeout=test_hang_guard.TEST_HANG_GUARD_SECS, check=False)
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        page = cast(dict[str, object], json.loads((self.output / "memory.json").read_text()))
-        self.assertEqual(page["decoder_revision"], "after")
+                    root = Path(sys.argv[1])
+                    source = root / sys.argv[2].replace('.', '/') / (sys.argv[3] + '.py')
+                    original_import = builtins.__import__
+                    changed = False
+                    def install_during_import(name, globals=None, locals=None, fromlist=(), level=0):
+                        global changed
+                        result = original_import(name, globals, locals, fromlist, level)
+                        if name == sys.argv[2] and sys.argv[3] in fromlist and not changed:
+                            changed = True
+                            source.write_text(source.read_text() + '\\nfrom dataclasses import dataclass\\n'
+                                '@dataclass(frozen=True)\\nclass InstalledSchemaRevision:\\n    revision: str\\n')
+                        return result
+                    builtins.__import__ = install_during_import
+                    from scripts.build_queue import memory_feed
+                    builtins.__import__ = original_import
+                    assert changed
+                    assert not hasattr(getattr(memory_feed, sys.argv[4]), 'InstalledSchemaRevision')
+                    with mock.patch.object(memory_feed.admission_client, 'view',
+                            side_effect=AssertionError('The old decoder must not read the queue')):
+                        status = memory_feed.main(['--once', '--code-root', str(root)])
+                    print(json.dumps({'status': status, 'changed':
+                        memory_feed.LOADED_FEED_CODE_VERSION != memory_feed.installed_feed_code_version(root)}))
+                    sys.exit(status)
+                """)
+                result = subprocess.run([sys.executable, "-c", probe, str(installed), package, module, alias], cwd=installed,
+                    env={**os.environ, "PYTHONPATH": str(installed)}, capture_output=True, text=True,
+                    timeout=test_hang_guard.TEST_HANG_GUARD_SECS, check=False)
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                self.assertEqual(json.loads(result.stdout), {"status": 1, "changed": True})
+                restarted = textwrap.dedent("""
+                    import sys
+                    from unittest import mock
+                    from scripts.build_queue import memory_feed
+                    decoded = memory_feed.codec.parse_snapshot_value(
+                        {'kind': 'InstalledSchemaRevision', 'revision': 'after'},
+                        getattr(memory_feed, sys.argv[2]).InstalledSchemaRevision)
+                    with (mock.patch.object(memory_feed, 'report_reading',
+                            return_value=memory_feed.charts.IndexUnavailable('private report fixture')),
+                          mock.patch.object(memory_feed, 'reading', return_value={
+                            'ok': True, 'read_at': 200001, 'decoder_revision': decoded.revision})):
+                        sys.exit(memory_feed.main(['--once', '--code-root', sys.argv[1]]))
+                """)
+                result = subprocess.run([sys.executable, "-c", restarted, str(installed), alias], cwd=installed,
+                    env={**os.environ, "PYTHONPATH": str(installed)}, capture_output=True, text=True,
+                    timeout=test_hang_guard.TEST_HANG_GUARD_SECS, check=False)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                page = cast(dict[str, object], json.loads((self.output / "memory.json").read_text()))
+                self.assertEqual(page["decoder_revision"], "after")
 
     def test_queue_priority_reaches_the_feed_and_clears_when_removed(self) -> None:
         base = captured_reading()
@@ -651,24 +685,29 @@ class MemoryFeedTests(unittest.TestCase):
                         self.assertNotIn(field, row)
 
     def test_project_names_follow_the_queue_formatter_for_running_and_waiting_steps(self) -> None:
-        for project, folder in (("known-project", "/fixture"), ("", "/fixture"),
-                                ("", "/absolute/repository")):
-            with self.subTest(project=project, folder=folder):
+        for raw_step, project, folder, expected in (
+            ("nextest", "known-project", "/fixture", "known-project nextest"),
+            ("nextest", "", "/fixture", "nextest"),
+            ("nextest", "", "/absolute/repository", "nextest"),
+            ("merge-gate", "", "/fixture", "merge gate"),
+        ):
+            with self.subTest(step=raw_step, project=project, folder=folder):
                 reading = reservation_reading(project=project)
-                step = replace(reading.view.running[0], folder=folder)
+                step = replace(reading.view.running[0], step=raw_step, folder=folder)
                 explanation_step = replace(reading.explanation.running[0], step=step)
                 reading = replace(reading, view=replace(reading.view, running=(step,)),
                     explanation=replace(reading.explanation, running=(explanation_step,)))
                 reading = with_wait_reason(reading, admission_records.StartSpacingWait(110))
-                waiter = replace(reading.view.waiting[0], project=project, folder=folder)
+                waiter = replace(reading.view.waiting[0], step=raw_step, project=project, folder=folder)
                 reading = replace(reading, view=replace(reading.view, waiting=(waiter,)))
-                with mock.patch.object(admission_client, "view", return_value=reading):
+                with (mock.patch.object(admission_client, "view", return_value=reading),
+                      mock.patch.object(memory_feed, "read_step_names", wraps=read_step_names) as names_read):
                     page = memory_feed.reading()
+                names_read.assert_called_once_with()
                 self.assertEqual(page["walk"][0]["name"],
-                    queue_lines.step_text(reading.view.running[0], RECORDED_STEP_NAMES))
+                    queue_lines.step_text(reading.view.running[0], read_step_names()))
                 self.assertEqual(page["waiters"][0]["name"],
-                    queue_lines.step_text(waiter, RECORDED_STEP_NAMES))
-                expected = "known-project nextest" if project else "nextest"
+                    queue_lines.step_text(waiter, read_step_names()))
                 self.assertEqual(page["walk"][0]["name"], expected)
                 self.assertEqual(page["waiters"][0]["name"], expected)
                 self.assertNotIn(folder, page["walk"][0]["name"])

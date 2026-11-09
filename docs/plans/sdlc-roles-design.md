@@ -1,6 +1,6 @@
 # Duties and names in the development process
 
-> **Status: RECORD — frozen.** This doc records how the duty and name answers were reached. `docs/as-built/roles-and-names.md` states what is true now.
+> **Status: RECORD — frozen.** This doc records how the duty and name answers were reached. `docs/as-built/roles-and-names.md` states what is true now. The baselines, change-file lists and step logs below name files as they stood when measured. `codex_mesh.py`, `mesh_runs.py` and the review pool are removed. Those tables do not say that the files exist now.
 
 Scope: duties and names as `docs/as-built/roles-and-names.md` records them. Duties and names belong here. Structure belongs to hierarchies-unit; designer and reviewer contracts belong to guilds-unit; phase steps and the document pipeline belong to phases-unit; repair rules belong to fix-rounds-unit. This document refers to their work and does not replace it.
 
@@ -948,16 +948,12 @@ R1b and R5b, built in phase 5. A session's name and its role are separate. Every
 | Meaning | Where it lives | Values | Shown job |
 | --- | --- | --- | --- |
 | Organizational role | `RosterEntry.role` in `scripts/message/roster.py` | `showrunner`, `unit director`, `worker`, `freestanding`, `astra-designer`, `astra-reviewer` | `showrunner`, `unit director`; `astra-designer` → `designer`; `astra-reviewer` → `design reviewer`; a worker takes its job from its assignment; `freestanding` has no job |
-| Worker assignment | `role` in each `mesh_roster.json` record | `impl`, `test`, `fix`, `review`; a record with no `role` is unrecorded; any other value is unreadable | `impl`, `test`, `fix` → `worker`; `review` → `code reviewer`; unrecorded or unreadable → no job, with the reason |
+| Worker assignment | `role` on each staff worker row (`scripts/production/staff.py`) | `impl`, `test`, `fix`, `review`; a record with no `role` is unrecorded; any other value is unreadable | `impl`, `test`, `fix` → `worker`; `review` → `code reviewer`; unrecorded or unreadable → no job, with the reason |
 | Guild responsibility | guild records | unchanged | not shown in this phase |
 
 An Astra held role keeps its own assignment state; it is not a worker assignment.
-A unit owns its code reviewers in the worker ledger, role `review`, job key
-`code_reviewer`, slots `review` and `review2`. The first own dispatch adopts the
-unit's leased reviewer on its existing thread before it opens any new reviewer.
-A busy lease reserves `review` while new work uses `review2`. Once moved, the
-worker's transport and history no longer read the archived pool meshes. Legacy
-pool rows remain visible only until the next phase removes their readers.
+A unit owns its code reviewers as staff workers with role `review`, job key
+`code_reviewer`. The leased review pool is removed.
 The name never supplies a role: a record without a role keeps its explicit state.
 
 **Shown name.** Parts join with ` · `. The production part is the production slug. The unit part is the unit name without its `-unit` suffix. The job part is the job word, then the slot or the number that tells several holders apart. An absent part is left out. A session with no production, no unit and no job shows its address.

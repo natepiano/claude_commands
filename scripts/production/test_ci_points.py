@@ -114,6 +114,9 @@ class ValidationObservation(TypedDict):
     push_origin: str
     remote_tip: str
     cargo_target: str
+    local_config: str
+    private_git: bool
+    cache: str
 
 
 @final
@@ -277,6 +280,9 @@ observation = {
     "directory": str(directory), "initial": initial, "validated": validated,
     "origin": origin, "push_origin": git("remote", "get-url", "--push", "origin"), "remote_tip": remote_tip,
     "cargo_target": os.environ.get("CARGO_TARGET_DIR", ""),
+    "local_config": (directory / ".git/config").read_text(),
+    "private_git": (directory / ".git").is_dir(),
+    "cache": str((directory / "target").resolve()),
 }
 (state / "validation-observation.json").write_text(json.dumps(observation))
 with (state / "validation-attempts.jsonl").open("a") as attempts:
@@ -351,7 +357,9 @@ PY
         self.assertEqual(ci_points.read_run(self.state).tip, observed["remote_tip"])
         self.assertTrue(any("--commit" in call and observed["remote_tip"] in call
                             for call in self.calls("gh")), self.calls("gh"))
-        self.assertTrue((Path(observed["directory"]) / ".git").is_dir())
+        self.assertTrue(observed["private_git"])
+        self.assertFalse(Path(observed["directory"]).exists())
+        self.assertTrue(Path(observed["cache"]).is_dir())
 
     def test_a_validation_fix_fast_forwards_an_unchanged_remote_branch(self) -> None:
         initial = self.git("rev-parse", "HEAD")
@@ -372,7 +380,9 @@ PY
         self.assertEqual(self.git("rev-parse", "HEAD"), fixed)
         self.assertEqual(self.git("show", "production:README.md", cwd=self.origin), "validation fix")
         self.assertEqual((self.checkout / "README.md").read_text(), "validation fix\n")
-        self.assertTrue((Path(observed["directory"]) / ".git").is_dir())
+        self.assertTrue(observed["private_git"])
+        self.assertFalse(Path(observed["directory"]).exists())
+        self.assertTrue(Path(observed["cache"]).is_dir())
 
     def test_validation_keeps_the_standing_git_configuration_clean(self) -> None:
         push_origin = self.origin.as_uri()
@@ -384,16 +394,18 @@ PY
         checkout = Path(observed["directory"])
         self.assertEqual(observed["origin"], str(self.origin))
         self.assertEqual(observed["push_origin"], push_origin)
-        self.assertEqual(self.git("config", "--local", "--get", "remote.origin.url", cwd=checkout),
-                         str(self.origin))
-        for key in ("remote.origin.pushurl", "user.name", "user.email"):
-            config = subprocess.run(["git", "config", "--local", "--get", key], cwd=checkout,
-                                    env=self.env, capture_output=True, text=True, check=False)
-            self.assertEqual(config.returncode, 1, (key, config.stdout, config.stderr))
-        before = (checkout / ".git/config").read_bytes()
+        self.assertFalse(checkout.exists())
+        before = observed["local_config"]
+        self.assertIn(str(self.origin), before)
+        for setting in ("pushurl", "pushInsteadOf", "[user]"):
+            self.assertNotIn(setting, before)
         result = self.run_ci("ci", "start", "--state-dir", str(self.state))
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertEqual((checkout / ".git/config").read_bytes(), before)
+        current = self.validation_observation()
+        self.assertNotEqual(current["directory"], observed["directory"])
+        self.assertFalse(Path(current["directory"]).exists())
+        self.assertEqual(current["local_config"], before)
+        self.assertEqual(current["cache"], observed["cache"])
 
     def test_collect_accepts_green_ci_on_the_published_validation_fix(self) -> None:
         self.fixed_commit_validation(fix_commit=True)
@@ -423,7 +435,9 @@ PY
         self.assertEqual(self.git("rev-parse", "production"), fixed)
         self.assertEqual(self.git("rev-parse", "production", cwd=self.origin), fixed)
         self.assertFalse((self.state / "ci_run.json").exists())
-        self.assertTrue((Path(self.validation_observation()["directory"]) / ".git").is_dir())
+        self.assertTrue(self.validation_observation()["private_git"])
+        self.assertFalse(Path(self.validation_observation()["directory"]).exists())
+        self.assertTrue(Path(self.validation_observation()["cache"]).is_dir())
 
         result = self.start_point()
 
@@ -438,8 +452,11 @@ PY
         self.assertIn(f"validation: ok — validated {fixed}; no push; following {fixed}", result.stdout)
         self.assertEqual(ci_points.read_run(self.state).tip, fixed)
         self.assertTrue(any("--commit" in call and fixed in call for call in self.calls("gh")))
-        self.assertTrue(all((Path(attempt["directory"]) / ".git").is_dir() for attempt in attempts))
-        self.assertEqual(len({attempt["directory"] for attempt in attempts}), 1)
+        self.assertTrue(all(attempt["private_git"] for attempt in attempts))
+        self.assertFalse(any(Path(attempt["directory"]).exists() for attempt in attempts))
+        self.assertEqual(len({attempt["directory"] for attempt in attempts}), 2)
+        self.assertEqual(len({attempt["cache"] for attempt in attempts}), 1)
+        self.assertTrue(Path(attempts[0]["cache"]).is_dir())
 
     def test_retry_after_a_failed_push_publishes_the_existing_fix_without_a_sibling_commit(self) -> None:
         initial = self.git("rev-parse", "HEAD")
@@ -459,7 +476,9 @@ PY
         self.assertFalse((self.stub_state / "pushes").exists())
         self.assertFalse((self.state / "ci_run.json").exists())
         self.assertFalse(self.calls("gh"))
-        self.assertTrue((Path(self.validation_observation()["directory"]) / ".git").is_dir())
+        self.assertTrue(self.validation_observation()["private_git"])
+        self.assertFalse(Path(self.validation_observation()["directory"]).exists())
+        self.assertTrue(Path(self.validation_observation()["cache"]).is_dir())
         reject.unlink()
 
         result = self.start_point()
@@ -477,8 +496,11 @@ PY
                       result.stdout)
         self.assertEqual(ci_points.read_run(self.state).tip, fixed)
         self.assertTrue(any("--commit" in call and fixed in call for call in self.calls("gh")))
-        self.assertTrue(all((Path(attempt["directory"]) / ".git").is_dir() for attempt in attempts))
-        self.assertEqual(len({attempt["directory"] for attempt in attempts}), 1)
+        self.assertTrue(all(attempt["private_git"] for attempt in attempts))
+        self.assertFalse(any(Path(attempt["directory"]).exists() for attempt in attempts))
+        self.assertEqual(len({attempt["directory"] for attempt in attempts}), 2)
+        self.assertEqual(len({attempt["cache"] for attempt in attempts}), 1)
+        self.assertTrue(Path(attempts[0]["cache"]).is_dir())
 
     def test_a_later_merge_push_fast_forwards_from_the_published_ci_fix(self) -> None:
         initial = self.git("rev-parse", "HEAD")
@@ -543,7 +565,9 @@ PY
         self.assertEqual((self.stub_state / "pushes").read_text().splitlines(),
                          [f"refs/heads/production {initial} {merged}"])
         self.assertFalse((self.state / "ci_run.json").exists())
-        self.assertTrue((Path(observed["directory"]) / ".git").is_dir())
+        self.assertTrue(observed["private_git"])
+        self.assertFalse(Path(observed["directory"]).exists())
+        self.assertTrue(Path(observed["cache"]).is_dir())
 
     def test_a_validation_fix_cannot_overwrite_a_branch_that_moves_during_validation(self) -> None:
         initial = self.git("rev-parse", "HEAD")
@@ -559,7 +583,9 @@ PY
         self.assertEqual((self.stub_state / "pushes").read_text().splitlines(),
                          [f"refs/heads/production {initial} {observed['remote_tip']}"])
         self.assertFalse((self.state / "ci_run.json").exists())
-        self.assertTrue((Path(observed["directory"]) / ".git").is_dir())
+        self.assertTrue(observed["private_git"])
+        self.assertFalse(Path(observed["directory"]).exists())
+        self.assertTrue(Path(observed["cache"]).is_dir())
 
     def test_validation_uses_a_private_copy_and_leaves_the_production_checkout_unchanged(self) -> None:
         initial = self.git("rev-parse", "HEAD")
@@ -578,9 +604,11 @@ PY
         self.assertEqual(self.git("status", "--porcelain"), before_status)
         self.assertEqual((self.checkout / "README.md").read_bytes(), before_readme)
         self.assertFalse((self.stub_state / "pushes").exists())
-        self.assertTrue((Path(observed["directory"]) / ".git").is_dir())
+        self.assertTrue(observed["private_git"])
+        self.assertFalse(Path(observed["directory"]).exists())
+        self.assertTrue(Path(observed["cache"]).is_dir())
 
-    def test_a_failed_validation_keeps_its_private_checkout_without_pushing(self) -> None:
+    def test_a_failed_validation_keeps_its_cache_without_pushing(self) -> None:
         initial = self.git("rev-parse", "HEAD")
         self.fixed_commit_validation(fail=True)
 
@@ -594,7 +622,9 @@ PY
         self.assertEqual((self.state / "ci_validation.log").read_text(),
                          "=== STEP: validation ===\nFAILED: fixed-commit validation\n")
         observed = self.validation_observation()
-        self.assertTrue((Path(observed["directory"]) / ".git").is_dir())
+        self.assertTrue(observed["private_git"])
+        self.assertFalse(Path(observed["directory"]).exists())
+        self.assertTrue(Path(observed["cache"]).is_dir())
         self.assertEqual(self.git("rev-parse", "production", cwd=self.origin), initial)
         self.assertEqual(self.git("rev-parse", "HEAD"), initial)
         self.assertFalse((self.stub_state / "pushes").exists())

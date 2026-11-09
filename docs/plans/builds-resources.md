@@ -235,6 +235,8 @@ Own what a build may use and when it starts: memory admission and the memory que
    `read_cycle()` (`build_hold.py:978`) returns `HoldCycle | None`, and `cycle_path()` (`build_hold.py:967`) returns `Path | None`, for the same no-current-cycle state.
    Return the existing `NoCycle` (`build_hold.py:84`) from both in place of `None`. Add no second type for this state.
    Update every caller: `read_cycle_for_change()`, and `scripts/production/dailies_render.py` (`read_cycle()` near line 1570, and `hold_line()`'s `cycle: HoldCycle | None = None` at line 1408).
+   Update the test callers too. Six test files narrow the result with `assert cycle is not None`, a check that `NoCycle` passes.
+   Replace each one with `assert isinstance(cycle, build_hold.HoldCycle)`. This change keeps the assertion's intent.
 5. Route callers through the installed copy.
    `memory_gate.sh` and `invoke.sh` use the installed admission client.
    `verify.sh` uses the installed helpers for holds, local release waits, detached runs, Mac idle state and build targets.
@@ -273,6 +275,7 @@ Own what a build may use and when it starts: memory admission and the memory que
 - `scripts/lint/test_memory_admit.py`, `scripts/lint/test_invoke_scope.py` — caller tests.
 - `scripts/build_hold/override_guard.py`, `scripts/build_hold/build_hold.py` — shared guard and hold mutation boundary.
 - `scripts/build_hold/test_override_guard.py`, `scripts/build_hold/test_build_hold.py` — guard and hold recovery tests.
+- `scripts/build_hold/test_hold_enforcer.py`, `scripts/build_targets/test_build_targets.py`, `scripts/direct/test_verify_mac_lifecycle.py`, `scripts/direct/verify_mac_offload_test_support.py`, `scripts/direct/verify_hold_wait_test_support.py` — `read_cycle()` callers that narrow to `HoldCycle`.
 - `scripts/build_queue/queue_view.py`, `scripts/build_queue/queue_card.py` — separate repository and step displays.
 - `scripts/build_queue/test_queue_view.py`, `scripts/build_queue/test_queue_card.py`, `scripts/build_queue/golden/` — display tests and goldens.
 - `scripts/direct/verify.sh`, `scripts/direct/test_verify_checks_fail_closed.py`, `scripts/direct/test_verify_nix_shell.py` — installed helper routing.
@@ -306,6 +309,7 @@ Own what a build may use and when it starts: memory admission and the memory que
   4. `test_release_recovers_recipient_notices_from_a_damaged_referenced_cycle`.
   5. `test_status_names_unreadable_pending_records_and_cycles_without_hiding_them`.
 - Every changed module and caller passes its tests. Basedpyright reports `0 errors, 0 warnings, 0 notes` for those modules.
+- No `read_cycle()` caller checks its result with `is not None` or `is None`, in source or in tests.
 - After installation, query the service and inspect its saved state. Repository and step fields remain separate.
   A checkout mutation attempt refuses before state changes. A private-state attempt still works.
 - Name queue-unit files as `also touches`, tested against `origin/builds-queue`.
@@ -1072,7 +1076,7 @@ The phase stopped at Spec 2. The builds showrunner ruled the `ANON_SHARE` share 
 `scratch.registered_plan(unit)` is the single resolver, using `unit_lookup.unit_parent` with `staff.snapshot`, `phase_table.show_production` and `proposals_table.unit_plan_paths` to locate the registered plan.
 `target` and `hand_over` validate new phase tasks through `plan_history.plan_phases` before creation, adoption or record replacement; missing phases and unreadable plans raise cause-bearing refusals naming a real phase, `gate:<id>` or `--until <when>`.
 `checked_task` stays shape-only for legacy updates, holds and end, so existing invalid phase tasks remain cleanable.
-`tmp_sweep.worker_use` keeps a mesh record's cwd only while its status is `running`; other keeps and the 7-day fallback still apply.
+`tmp_sweep.worker_use` keeps a detached run record's cwd only while its status is `running`; other keeps and the 7-day fallback still apply.
 
 **Files:**
 - `scripts/lib/scratch.py`, `scripts/lib/test_scratch.py` — resolver, assignment guard and private-plan assignment/legacy-cleanup cases.
@@ -1080,9 +1084,9 @@ The phase stopped at Spec 2. The builds showrunner ruled the `ANON_SHARE` share 
 - `scripts/production/test_merge_checkpoint.py` — private `registered_plan` fixture for phase-end cleanup.
 - `docs/as-built/build-memory-admission.md` — scratch task and retention rules.
 
-**Binds later work:** “Test Hana clones go through scratch, and the Mac keeps no idle clone below its floor” uses the single resolver, real registered phase or gate/deadline tasks, shape-only legacy cleanup, private-plan tests and running-only mesh cwd keeps.
+**Binds later work:** “Test Hana clones go through scratch, and the Mac keeps no idle clone below its floor” uses the single resolver, real registered phase or gate/deadline tasks, shape-only legacy cleanup, private-plan tests and running-only detached run cwd keeps.
 
-**Gotchas:** Staff records carry no plan; resolution uses the registered production rather than the caller's checkout. Tests patch `registered_plan` and keep scratch/copy roots private. A paused roster worker or active unit run does not make a finished mesh record's cwd live.
+**Gotchas:** Staff records carry no plan; resolution uses the registered production rather than the caller's checkout. Tests patch `registered_plan` and keep scratch/copy roots private. A paused roster worker or active unit run does not make a finished detached run record's cwd live.
 
 **Ruled out:** A second unit-plan registry; semantic validation on legacy update/end paths.
 
@@ -1677,7 +1681,6 @@ One bad entry in a run marker folder keeps only its own session's runs; every ot
 **Gotchas:**
 - A NUL byte in a marker path makes `os.path.realpath` raise `ValueError`; the per-marker handler catches `OSError`, `UnicodeError` and `ValueError`.
 - The guard reads the director only for a folder not already kept, so a good marker keeps `ACTIVE_MARKER` when another marker is bad.
-- `session_staff.worker_run_index` lists the `active` folder as a run, and the shared roster lock creates `active/mesh_roster.json.lock`; models-rename-track owns that caller.
 
 **Ruled out:** a test that counts director reads (it needs a configured mock).
 
@@ -1859,8 +1862,16 @@ Every nextest run that lint starts prints one line after admission: `nextest: <g
 
 **Constraints from prior phases:**
 - Rounds 1-9 are in `phases/81/mac_link_report.md` in the run folder `/tmp/claude/unit/20523639-3e08-48d6-9277-73e052bca297`. Read it before any new step.
-- builds approved one controlled reproduction on 2026-11-08. The script is `/tmp/claude/scratch/until-2026-11-09T2200Z-resources-p81-repro/reproduce.sh`.
-- builds decided on 2026-11-08 that the reproduction uses one private target at a time. One case needs about 89.06 GiB (source and one debug target). Change the script's room check from four targets to one. Also change its schedule: today it keeps `target-A`, `target-B` and both control targets until the final cleanup (`reproduce.sh` lines 190-204), about 355 GiB. Record each build's result, then remove that private target before the next case or control starts.
+- builds approved one controlled reproduction on 2026-11-08. Its first script no longer exists, because its scratch folder ended. Before the first case, write a new script at `phases/81/reproduce.sh` in the run folder.
+- The script takes the normal Mac claim before its first remote command. At every exit it removes its private folder and releases the claim. `ssh mac` exits 0 on a failure, so the script prints one result line for each step.
+- The script runs this procedure on the Mac, in the private folder `~/.local/state/mac-test/repro81`:
+  1. Use Rust 1.99.0 on arm64 macOS. Keep the measured opt-level, codegen-units, incremental and shared-generics settings.
+  2. Use one small library and one integration-test crate. Start from the `HairlineFade`/`CascadeCombine` resource path.
+  3. Build in series, with no offload, no cleanup, no source copy during a build and no second compiler.
+  4. Sequential case: build one revision, change only the generic body or the caller, and rebuild with the completed incremental history. Its control builds the same changed revision in a new empty target.
+  5. Interrupted case: interrupt an intermediate compile, and then finish the build. Its control runs the same intermediate compile with no interrupt.
+  6. Reduce the source while the same promoted-symbol failure stays.
+- builds decided on 2026-11-08 that the reproduction uses one private target at a time. One case needs about 89.06 GiB (source and one debug target). Before the source copy, the script reads the deployed `sweep_floor_gib` and requires `free - (source_size + debug_size) >= floor`. Record each build's result, then remove that private target before the next case or control starts.
 - The 150 GiB Mac floor stays. So a case needs about 239 GiB free before it starts. The Mac had 238.71 GiB free after the 2026-11-08 core cleanup. Start a case only when the room is there and builds approves the start.
 - Keep sccache and the hana test mirror. Run no gc command on the Mac.
 - New evidence, 2026-11-09 (Phase 92 retrospective): a Mac hana link failed at 11:56 UTC with the same signature, undefined `.llvm.<hash>` symbols in `libhana_conduit`.
@@ -1878,7 +1889,7 @@ Every nextest run that lint starts prints one line after admission: `nextest: <g
 - `docs/as-built/build-memory-admission.md` — the changed rule.
 
 **Workers:** `1 writer + 1 tester`
-- `impl` owns the report, the source files and the as-built doc, and runs the final suites.
+- `impl` owns the report, the reproduction script, the source files and the as-built doc, and runs the final suites.
 - `test` owns the test files.
 
 **Acceptance gate:**
@@ -1891,7 +1902,7 @@ Every nextest run that lint starts prints one line after admission: `nextest: <g
 
 #### As-built
 - nixos branch `resources-mac-floor` (`efdf8bfc1`, on nixos main `064af4a3c`) adds `modules/darwin/disk-floor.nix`: `nate.jobs.disk-floor` runs `sweep.py --floor-only --host mac` on the Mac every 120 s. It is the same command as the on-demand sweep in `offload.ensure_mac_disk_floor()`, so it takes the same mirror leases, both claim locks and the floor lock, and trims only the shortfall below `sweep_floor_gib` (150 GiB). The 100 GiB on-demand trigger is unchanged.
-- The same branch puts `/usr/sbin` on the Mac `jobPath` (`modules/darwin/nate-backend.nix`), after `/usr/bin:/bin`. Before it, launchd jobs found no `lsof`, so tmp-sweep, folder-audit and codex-mesh-sweep kept every entry.
+- The same branch puts `/usr/sbin` on the Mac `jobPath` (`modules/darwin/nate-backend.nix`), after `/usr/bin:/bin`. Before it, launchd jobs found no `lsof`, so tmp-sweep and folder-audit kept every entry.
 - `docs/as-built/build-memory-admission.md` describes the Mac floor job.
 - The job runs only after the showrunner pushes the branch to nixos main and the Mac runs `darwin-rebuild`.
 - No Python change and no new test: the job calls an existing entry point.
@@ -1995,7 +2006,7 @@ Every nextest run that lint starts prints one line after admission: `nextest: <g
 
 **Change-Review:** The queue view, the queue card and the build memory page show no CI keep-aside while a hana CI job runs | Open the queue view while a hana CI job runs | No `CI keep-aside` line shows, and the room counts the CI job once.
 
-Registered jobs already take no margin: `test_registered_and_unregistered_jobs_each_enter_the_cap_once` (`test_memory_admit.py:5990`).
+Registered jobs already take no margin: `test_registered_and_unregistered_jobs_each_enter_the_cap_once` (`test_memory_admit.py:6010`).
 
 ### Phase 89 — The Mac folder audit reads process use and acts  · status: done
 
@@ -2056,14 +2067,14 @@ Registered jobs already take no margin: `test_registered_and_unregistered_jobs_e
 
 #### As-built
 - The floor sweep trims the Mac mirror targets by design: it removes only the shortfall, least recently used first, and never a target a live build holds. On 2026-11-09 both mirror targets held live nextest runs at each scan; later trims took them.
-- `LockedClaims.holds` (`scripts/mac_test/floor_claims.py`) skips a claimed mirror path that does not exist, so a missing unrelated mirror no longer protects a marked target without a copy record. Other claim read errors still protect the target. Remote mirror removal (`scripts/copies/copies.py`) keeps its own lease exemption and still checks sibling leases.
+- `ClaimSnapshot.holds` (`scripts/mac_test/floor_claims.py`) skips missing claimed mirror paths. A missing unrelated mirror does not protect a marked target without a copy record. Other claim read errors still protect the target. Remote mirror removal keeps its own lease exemption and checks sibling leases.
 - While a crossing delivery is pending, the Mac measures each direct folder child of its floor roots (`mac_folder_measurement`, `CurrentMacFolders` in `scripts/lint/sweep.py`). `mac_folder_reclaimable_bytes` counts the blocks that deleting that folder alone frees: an inode counts once only when all its hard links are inside the folder; symlinks are not followed. The alert lists the folders by size and recommends the largest; protected folders keep their labels. No natedev disk snapshot is needed.
 - `notify_floor_problem` takes the machine name from its floor policy; it has no `machine` parameter.
 - `docs/as-built/build-memory-admission.md` states the claim and folder-measurement rules.
 
 **Files:**
 - `scripts/lint/sweep.py` — the Mac folder measurement and the folder choices.
-- `scripts/mac_test/floor_claims.py` — the missing-mirror rule in `LockedClaims.holds`.
+- `scripts/mac_test/floor_claims.py` — the missing-mirror rule in `ClaimSnapshot.holds`.
 - `scripts/lint/test_sweep.py`, `scripts/mac_test/test_floor_sweep.py` — rows in `test_crossing_recommends_one_measured_choice_that_frees_the_shortfall` (Mac rows) and `test_no_proc_mac_sweep_takes_only_the_oldest_shortfall` (mirror row).
 - `docs/as-built/build-memory-admission.md` — the changed rules.
 
@@ -2115,7 +2126,6 @@ Registered jobs already take no margin: `test_registered_and_unregistered_jobs_e
 
 **Ruled out:**
 - A deploy repair for the crossing record: the older and current formats read the same crossing, and the 147.7 GiB alert followed a real rise to 155.23 GiB.
-- A fallback for one folder path longer than the message limit.
 
 ### Phase 95 — Each test folder goes when its test ends  · status: done
 
@@ -2128,3 +2138,51 @@ Registered jobs already take no margin: `test_registered_and_unregistered_jobs_e
 - `scripts/lint/test_build_shape.py` — `IndexStepEvidenceTests` fixture.
 
 **Ruled out:** a check, a scan or a signal handler for leftover folders.
+
+### Phase 96 — The hand cleanup command runs when typed by its path  · status: done
+
+#### As-built
+
+`scripts/lint/tmp_sweep.py` has git mode 100755, so `~/.claude/scripts/lint/tmp_sweep.py --plan <new-plan.json>` runs when typed by its path.
+
+**Files:**
+- `scripts/lint/tmp_sweep.py` — mode only.
+
+**Gotchas:** the small-fix path refuses this file because it imports `scripts/production/staff.py`.
+
+### Phase 97 — A build target command repeats no work at start  · status: done
+
+#### As-built
+
+`eligible` and `release-wait` open `build_targets.conf` once per start. `target_config.command_configuration` keeps one `read_targets` result for one command. The state readers load only when a branch reads state, the AWS ledger loads only when AWS routing is on, and `release-wait` loads the Mac test code only when a target state folder exists. Output lines and exit codes do not change.
+
+Median CPU over 50 starts on the real entry, Mac state folder present: `eligible` 160.887 to 137.673 ms, `release-wait` 106.328 to 101.707 ms. With the folder absent: `eligible` 150.415 to 130.788 ms, `release-wait` 99.996 to 42.445 ms.
+
+**Files:**
+- `scripts/build_targets/build_targets.py` — delayed state reader and ledger loads; `command_configuration` around `eligible` and `release-wait`.
+- `scripts/build_targets/target_config.py` — one-command registry retention; home of `AnyEligibleTarget`, `LocalRequired`, `Routing`, `ANY_ELIGIBLE_TARGET`, `EligibleTarget` and `ExcludedTarget`.
+- `scripts/build_targets/targets.py` — re-exports those eligibility types.
+- `scripts/build_targets/test_build_targets.py` — real-entry rows for one registry open and module absence by branch.
+
+**Binds later work:** `command_release_wait` checks `target_config.ssh_target_state_directory` before it loads `mac_test`.
+
+**Gotchas:** natedev has the Mac state folder, so the rows with the folder present are its normal case.
+
+**Ruled out:** a shared cache of `mac_test.conf`, because it saves 0.8 ms.
+
+### Phase 98 — A build target start loads no sweep, copy or Mac test code it does not use  · status: done
+
+#### As-built
+
+With the Mac state folder present, `eligible` loads no `sweep` or `copies` module. `release-wait` loads no `copies` or whole `mac_test` module. Each move keeps one home for each moved name and adds no guard, check or config key. Median CPU per start over 50 alternating starts, on a merge that includes the `transfers` record: `eligible` falls from 175.239 ms to 128.873 ms, and `release-wait` falls from 150.339 ms to 61.271 ms.
+
+**Files:**
+- `scripts/buildlog/repository.py` — `repo_name`, `git_common_dir`, `source_git_dir`, `borrowed_git_dir`, `local_origin_git_dir` and their path constants.
+- `scripts/lib/copy_record.py` — `AllRepositories`, `SelectedRepository`, `RepositoryScope`, `ALL_REPOSITORIES`.
+- `scripts/mac_test/claim_state.py` — the claim reader, `locked`, `state_paths`, the record types, the block and event types, `record_after_unlock`. `ClaimOwnerRecord` carries `transfers`.
+- `scripts/mac_test/offload.py` — binds `copies` for types only. Each run-time use has a local import.
+- `scripts/build_targets/test_build_targets.py` — the module rows that show each module absent on the named path.
+
+**Gotchas:** `claim_state.record_after_unlock` finds `start_hold_recorder` by name at the call, so that module does not load `mac_test`. A start-cost comparison alternates its two sides in one run and gives each side its own bytecode cache, because machine load changes a separate run by a factor of two.
+
+**Ruled out:** a comparison of unpaired start-cost runs.

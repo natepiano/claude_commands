@@ -97,8 +97,10 @@ class GateBoxTests(unittest.TestCase):
 
     def test_production_boot_stages_and_errors_with_local_stubs(self) -> None:
         stages = ['boot', 'tools ready', 'source ready', 'tests start']
-        for failure in ('', 'nix', 'tools shell', 'tools ready', 'source ready', 'tests start'):
-            with self.subTest(failure=failure), tempfile.TemporaryDirectory() as temporary:
+        cases = [(False, failure) for failure in ('', 'nix', 'tools shell', 'tools ready', 'source ready', 'tests start')]
+        cases.extend(((True, ''), (True, 'tools ready')))
+        for warm, failure in cases:
+            with self.subTest(warm=warm, failure=failure), tempfile.TemporaryDirectory() as temporary:
                 root = Path(temporary)
                 tools, box, repo = root / 'bin', root / 'box', root / 'repo'
                 tools.mkdir()
@@ -186,13 +188,18 @@ else:
                          'log': 'https://fixture.invalid/artifacts/attempt/gate.log',
                          'result': 'https://fixture.invalid/artifacts/attempt/result.json',
                          'boot_error': 'https://fixture.invalid/artifacts/attempt/boot-error.json'}
+                image = root / 'image'
+                image.mkdir()
+                if warm:
+                    _ = (image / 'inputs').write_text(gate_box.image_key(gate_box.image_inputs('f' * 40)))
+                    _ = (image / 'path').write_text(str(tools))
                 script = gate_box.user_data(links, 'f' * 40, 20, 5, 1800)
                 self.assertLess(script.index('push_logs &'), script.rindex('nix --extra-experimental-features'))
                 self.assertNotIn('#awscli2', script)
                 self.assertNotIn('instance-id', script)
                 reply = subprocess.run(['bash', '-c', script], text=True, capture_output=True, check=False,
                     timeout=TEST_HANG_GUARD_SECS, cwd=root, env={**os.environ, 'FIXTURE': str(root),
-                    'GATE_BOX_DIR': str(box), 'FAIL_STAGE': failure, 'PATH': str(tools) + os.pathsep + os.environ['PATH']})
+                    'GATE_BOX_DIR': str(box), 'GATE_IMAGE_DIR': str(image), 'FAIL_STAGE': failure, 'PATH': str(tools) + os.pathsep + os.environ['PATH']})
                 log = (box / 'boot.log').read_text()
                 uploads = [ledger.mapping(cast(object, json.loads(line))) for line in (root / 'uploads').read_text().splitlines()]
                 results = [ledger.mapping(cast(object, json.loads(ledger.text(row, 'body'))))
@@ -217,8 +224,45 @@ else:
                     self.assertTrue(record['dirty'])
                     self.assertEqual(record['dirty_paths'], ['scripts/fixture/test_one.py'])
                     self.assertEqual(record['dirty_path_count'], 1)
-                    self.assertLess(trace.index('upload log'), trace.index('tools shell'))
+                    if warm:
+                        self.assertNotIn('nix', trace)
+                        self.assertLess(trace.index('upload log'), trace.index('runuser'))
+                    else:
+                        self.assertLess(trace.index('upload log'), trace.index('tools shell'))
                     print('Production boot stages: ' + ' -> '.join(stages))
+
+    def test_image_preparation_roots_tools_and_publishes_each_outcome(self) -> None:
+        for failure in (False, True):
+            with self.subTest(failure=failure), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                tools = root / 'bin'
+                tools.mkdir()
+                stub = '#!' + sys.executable + '\n' + r'''import json, os, pathlib, subprocess, sys
+root = pathlib.Path(os.environ['FIXTURE'])
+name, args = pathlib.Path(sys.argv[0]).name, sys.argv[1:]
+if name == 'nix':
+    if os.environ['FAIL_IMAGE'] == 'true': sys.exit(7)
+    sys.exit(subprocess.call(args[args.index('--command') + 1:]))
+if name == 'curl':
+    (root / 'result.json').write_text(sys.stdin.read())
+'''
+                for name in ('nix', 'curl', 'systemd-run', 'nix-store', 'sync'):
+                    path = tools / name
+                    _ = path.write_text(stub)
+                    path.chmod(0o700)
+                inputs = gate_box.image_inputs('f' * 40)
+                script = gate_box.image_user_data(inputs, 'https://fixture.invalid/image.json', 1800000000)
+                reply = subprocess.run(['bash', '-c', script], text=True, capture_output=True, check=False,
+                    timeout=TEST_HANG_GUARD_SECS, env={**os.environ, 'FIXTURE': str(root),
+                    'FAIL_IMAGE': 'true' if failure else 'false', 'GATE_IMAGE_DIR': str(root / 'image'),
+                    'PATH': str(tools) + os.pathsep + os.environ['PATH']})
+                self.assertEqual(reply.returncode, 7 if failure else 0, reply.stderr)
+                self.assertEqual(json.loads((root / 'result.json').read_text()), {'status': 7 if failure else 0})
+                if not failure:
+                    self.assertEqual((root / 'image/inputs').read_text().strip(), gate_box.image_key(inputs))
+                    self.assertIn(str(tools), (root / 'image/path').read_text())
+                self.assertIn('nix-store --add-root', script)
+                self.assertNotIn('source.bundle', script)
 
     def test_result_round_trip_preserves_reruns_and_test_failures(self) -> None:
         first = gate.GateJobResult('fixture', 'test_one.py', 1, 2, 'failed', cpu_seconds=1, peak_mib=3)

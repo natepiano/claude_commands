@@ -35,6 +35,9 @@ if TYPE_CHECKING:
     from scripts.build_hold import build_hold
     from scripts.mac_test import mac_test, offload
     from scripts.message import roster
+    from scripts.build_targets.targets import (
+        AwsStatusRow, Held, RunningJob, TargetState,
+    )
 
 
 class CliArguments(argparse.Namespace):
@@ -118,32 +121,16 @@ def parser() -> argparse.ArgumentParser:
     return root
 
 
-from scripts.build_targets.targets import (
+from scripts.build_targets.target_config import (
     ANY_ELIGIBLE_TARGET,
-    AwsStatusRow,
-    RemovalPending,
-    read_aws_status as read_aws_status,
     ConfigError,
     EligibleTarget,
     ExcludedTarget,
-    ExpiresAt,
-    Free,
-    Held,
-    HolderSession,
-    IdleSince,
     LocalTarget,
     LocalRequired,
-    ReleaseEstimated,
-    Running,
-    RunningJob,
     Routing,
     SshTarget,
-    StateUnreadable,
-    TargetState,
-    Unreachable,
     read_targets,
-    target_state,
-    target_eligibility,
 )
 from scripts.direct.step_selection import Pinned, ROUTED, TargetSelection
 
@@ -152,6 +139,13 @@ class ActiveWaitProcess(TypedDict):
     call_id: str
     pid: int
     proc_start: str
+
+
+def target_state(target: LocalTarget | SshTarget) -> TargetState:
+    """Load the state reader only when the command reads target state."""
+    from scripts.build_targets.targets import target_state as read_target_state
+
+    return read_target_state(target)
 
 
 def local_time(instant: datetime) -> str:
@@ -179,6 +173,7 @@ _NO_UNIT_LABELS: Mapping[RunningJob | Held, roster.UnitLabels] = {}
 def running_job_text(job: RunningJob,
                      labels: Mapping[RunningJob | Held, roster.UnitLabels] = _NO_UNIT_LABELS) -> str:
     from scripts.lib.user_zone import user_zone
+    from scripts.build_targets.targets import IdleSince
 
     text = f"running {display_field(job.what)} since {local_time(job.since)}"
     text += unit_label_suffix(job, labels)
@@ -189,6 +184,10 @@ def running_job_text(job: RunningJob,
 
 def format_state(name: str, state: TargetState,
                  labels: Mapping[RunningJob | Held, roster.UnitLabels] = _NO_UNIT_LABELS) -> str:
+    from scripts.build_targets.targets import (
+        AwsStatusRow, ExpiresAt, Free, ReleaseEstimated, Running, StateUnreadable, Unreachable,
+    )
+
     name = display_field(name)
     if isinstance(state, AwsStatusRow):
         return format_aws_status(state)
@@ -212,6 +211,7 @@ def format_state(name: str, state: TargetState,
 
 def probe_target(target: SshTarget) -> TargetState:
     from scripts.build_targets import target_config
+    from scripts.build_targets.targets import Unreachable
     from scripts.mac_test import offload
 
     if target_config.is_aws_target(target):
@@ -225,6 +225,7 @@ def probe_target(target: SshTarget) -> TargetState:
 
 def format_aws_status(row: AwsStatusRow) -> str:
     from scripts.aws_target import ledger as cost_ledger, measurement
+    from scripts.build_targets.targets import RemovalPending
 
     def at(value: float) -> str:
         return local_time(datetime.fromtimestamp(value, timezone.utc)) if value else 'unavailable'
@@ -264,6 +265,7 @@ def command_status(probe: bool = False) -> int:
     from scripts.buildlog import mac_idle_alert
     from scripts.lib.user_zone import user_zone
     from scripts.message import roster
+    from scripts.build_targets.targets import Held, HolderSession, Running
 
     try:
         targets = read_targets()
@@ -299,6 +301,7 @@ def command_status(probe: bool = False) -> int:
 def command_eligible(
     repo_root: Path, package: str, routing: Routing = ANY_ELIGIBLE_TARGET
 ) -> int:
+    from scripts.build_targets.targets import target_eligibility
 
     try:
         eligibility = target_eligibility(repo_root, package, routing)
@@ -548,12 +551,14 @@ def aws_spending_exclusion(target: SshTarget) -> str:
 def aws_target_spending_exclusion(target: SshTarget) -> str:
     """Read spending permission for a configured AWS target."""
 
-    from scripts.aws_target import config as aws_config, ledger as cost_ledger
+    from scripts.aws_target import config as aws_config
     from scripts.lib import conf
-    from scripts.mac_test import mac_test
 
     if not aws_config.offload_enabled(conf.read(target.settings)):
         return "off"
+    from scripts.aws_target import ledger as cost_ledger
+    from scripts.mac_test import mac_test
+
     decision = cost_ledger.spending_guard(target.settings, mac_test.state_paths(target.name).directory)
     if isinstance(decision, cost_ledger.SpendingAllowed):
         return ""
@@ -613,14 +618,16 @@ def owns_wait_claim(paths: mac_test.StatePaths, repo_root: str, pid: int) -> boo
     start = process_identity.process_start(pid)
     if not isinstance(start, process_identity.Started):
         return False
-    scope = mac_test.target_claim_scope(paths, repo_root)
-    with mac_test.locked(paths.lock):
+    try:
+        scope = mac_test.target_claim_scope(paths, repo_root)
         block = mac_test.blocking_claim_block(paths)
         return any(mac_test.scopes_overlap(claim.scope, scope)
                    and claim.record["pid"] == pid and claim.record["proc_start"] == start.start
                    and ("remote_host" not in claim.record or claim.record.get("cleanup_pending"))
                    and (isinstance(block, mac_test.NoMacBlock) or "remote_host" in claim.record)
                    for claim in mac_test.read_claims(paths))
+    except (OSError, mac_test.StateReadError):
+        return False
 
 
 def cleanup_refused_claims(target: SshTarget, args: CliArguments) -> None:
@@ -681,7 +688,7 @@ def command_reserve(args: CliArguments) -> int:
     destination = Path(args.reservation_file)
     if destination.exists():
         name, separator, settings = destination.read_text().strip().partition("\t")
-        if separator:
+        if separator and (not args.target or name == args.target):
             target = target_config.configured_ssh_target(name)
             if settings != str(target.settings):
                 destination.unlink()
@@ -692,7 +699,7 @@ def command_reserve(args: CliArguments) -> int:
                     from scripts.mac_test import mac_test
 
                     paths = mac_test.state_paths(name)
-                    if (not args.target or name == args.target) and owns_wait_claim(paths, args.repo_root, args.pid):
+                    if owns_wait_claim(paths, args.repo_root, args.pid):
                         return 0
         destination.unlink(missing_ok=True)
     if args.kind not in ("test", "check", "doc", "lint", "example", "build", "final"):
@@ -709,11 +716,18 @@ def command_reserve(args: CliArguments) -> int:
             if config.reason != "off":
                 cleanup_refused_claims(target, args)
             continue
+        if not config.enabled:
+            continue
+        paths = mac_test.state_paths(target.name)
+        owned = owns_wait_claim(paths, args.repo_root, args.pid)
+        if not owned:
+            answer = mac_test.free_now(paths, target.settings, Path(args.repo_root))
+            if answer not in ("free", "busy") and not (answer == "bad" and args.new_step):
+                continue
         policy = offload.mac_step_eligibility(config, Path(args.repo_root), args.package, verb, target.name, kind=args.kind)
         if isinstance(policy, offload.IneligibleMacStep):
             continue
-        paths = mac_test.state_paths(target.name)
-        if owns_wait_claim(paths, args.repo_root, args.pid):
+        if owned:
             write_text_atomic(destination, f"{target.name}\t{target.settings}\n")
             return 0
         if args.recover_only:
@@ -725,9 +739,6 @@ def command_reserve(args: CliArguments) -> int:
             if not retained:
                 busy_mac = busy_mac or target.platform == "macos"
                 continue
-        answer = mac_test.free_now(paths, target.settings, Path(args.repo_root))
-        if answer not in ("free", "busy") and not (answer == "bad" and args.new_step):
-            continue
         if isinstance(offload.probe_reachability(offload.ProcessController(), config), offload.UnreachableHost):
             continue
         claim = mac_test.CliArguments()
@@ -758,13 +769,15 @@ def command_release_wait(pid: int) -> int:
     for target in read_targets():
         if not isinstance(target, SshTarget):
             continue
-        from scripts.mac_test import mac_test
+        from scripts.build_targets import target_config
 
-        paths = mac_test.state_paths(target.name)
-        if not paths.directory.exists():
+        if not target_config.ssh_target_state_directory(target.name).exists():
             continue
-        with mac_test.locked(paths.lock):
-            for claim in mac_test.read_claims(paths):
+        from scripts.mac_test import claim_state
+
+        paths = claim_state.state_paths(target.name)
+        with claim_state.locked(paths.lock):
+            for claim in claim_state.read_claims(paths):
                 if (claim.record["pid"] == pid and claim.record["proc_start"] == start.start
                         and "remote_host" not in claim.record):
                     claim.path.unlink(missing_ok=True)
@@ -916,6 +929,7 @@ def command_wait_local(call_id: str, *, pid: int = 0, leave_hook: str = "", call
     """Wait until no hold applies. An empty caller is verify.sh; any other caller is a lint step."""
 
     from scripts.build_hold import build_hold
+    from scripts.build_targets.targets import Held, StateUnreadable
 
     # This CLI's import root excludes the worker module.
     # Use importlib at the typed provider boundary.
@@ -1038,6 +1052,7 @@ def command_interrupt_local(call_id: str, signal_name: str) -> int:
 def command_check_local(caller: str = "") -> int:
 
     from scripts.build_hold import build_hold
+    from scripts.build_targets.targets import Held, StateUnreadable
 
     try:
         state = target_state(local_target())
@@ -1108,10 +1123,11 @@ def main() -> int:
         return command_recover_probe(args)
     if args.command == "reserve":
         return command_reserve(args)
-    if args.command == "release-wait":
-        return command_release_wait(args.pid)
-    if args.command == "eligible":
-        return command_eligibility(args)
+    if args.command in ("release-wait", "eligible"):
+        from scripts.build_targets import target_config
+
+        with target_config.command_configuration():
+            return command_release_wait(args.pid) if args.command == "release-wait" else command_eligibility(args)
     if args.command == "register-local":
         return command_register_local(args.call_id, pid=args.pid)
     if args.command == "wait-local":

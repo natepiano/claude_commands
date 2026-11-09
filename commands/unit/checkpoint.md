@@ -220,7 +220,7 @@ Loop/verbose only:
    person with no context. "Where" names the machine (natedev or the Mac) and
    the session (a terminal, a showrunner session, a unit session, any Claude
    session). Example:
-   `Change-Review: The unit board shows each unit's phase | In a showrunner session on natedev, type /showrunner:unit_board | Each row has a Phase column`.
+   `Change-Review: The Units table shows each unit's phase | In a showrunner session on natedev, type /showrunner:units | Each row has a Phase column`.
    A line without all three parts is refused.
    Add ` | after <step>` as a fourth field when the change needs a rebuild, restart or deploy.
    Example: `Change-Review: The service shows review links | Open the review page | The links appear | after restart`.

@@ -1145,7 +1145,7 @@ class MacTestCommandTests(NotificationGuardedTestCase):
         self.assertFalse((self.state_directory / "run.json").exists())
 
     def repository(self, name: str) -> Path:
-        """A folder that sweep.repo_name reads as the named repository."""
+        """A folder that repository.repo_name reads as the named repository."""
         directory = self.root / "repositories" / name
         (directory / ".git").mkdir(parents=True)
         return directory
@@ -1218,6 +1218,17 @@ class MacTestCommandTests(NotificationGuardedTestCase):
         hana, liner = self.repository("hana"), self.repository("cargo-liner")
         (hana / "crates").mkdir()
         self.write_config(offload="on")
+        path = self.state_directory / "mirror-busy-hana.until"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        for value, answer in ((str(time.time() + 120), "busy"), (str(time.time() - 1), "free"),
+                              ("nan", "free"), ("invalid", "free")):
+            with self.subTest(backoff=value):
+                _ = path.write_text(value)
+                self.assert_command(self.command("free-now", "--repo-root", str(hana)),
+                                    1 if answer == "busy" else 0, answer + "\n")
+                self.assert_command(self.command("free-now", "--repo-root", str(liner)), 0, "free\n")
+        path.unlink()
+        self.assertEqual(self.logged_arguments("ssh"), [])
         owner = self.start_child()
         self.assert_command(self.claim_in(owner.pid, "hana tests", hana), 0, "claimed\n")
         self.assert_command(self.command("free-now", "--repo-root", str(liner)), 0, "free\n")
@@ -2940,6 +2951,23 @@ class ClaimWatchTests(NotificationGuardedTestCase):
         send.assert_not_called()
         _ = record.pop("idle_since")
         self.assertEqual(self.read_claim(), record)
+
+        with self.subTest(activity_bytes=True):
+            _ = self.write_claim(idle_since="2026-10-13T12:00:00+00:00")
+            with mock.patch.object(subprocess, "run", return_value=subprocess.CompletedProcess(
+                    ["ssh"], 0, stdout="active=3\nwork=3\nrc=0\n", stderr="")):
+                _ = self.watch_once()
+            current = self.read_claim()
+            transfers = cast(list[dict[str, object]], current["transfers"])
+            self.assertEqual(transfers, [{"operation": "ssh_activity",
+                "sent_bytes": len(mac_test.mac_activity_script().encode()),
+                "received_bytes": len("active=3\nwork=3\nrc=0\n".encode()), "complete": True}])
+            args = mac_test.CliArguments()
+            args.pid = os.getpid()
+            output = io.StringIO()
+            with redirect_stdout(output):
+                self.assertEqual(mac_test.command_release(args, self.paths), 0)
+            self.assertEqual(output.getvalue(), "copy_bytes=" + json.dumps(transfers) + "\n")
 
     def test_parked_app_sets_work_idle_without_releasing_claim_and_test_clears_it(self) -> None:
         record = self.write_claim(idle_since="2026-10-13T12:00:00+00:00")

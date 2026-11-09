@@ -100,20 +100,22 @@ class TidyWrappedTests(unittest.TestCase):
                            worktree=staff.RemovedWorktree(remote.local_machine(), self.root / "beta"))
         state = self.state_files("done")
         with copies.standing(str(alpha.id), source, copies.CommittedSource("HEAD")) as unit_tree:
+            unit_tree_cache = (unit_tree / "target").resolve().parent
             with copies.standing(str(owner.id), source, copies.CommittedSource("HEAD")) as production_tree:
-                pass
+                production_tree_cache = (production_tree / "target").resolve().parent
             with copies.standing(str(beta.id), source, copies.CommittedSource("HEAD")) as retired_tree:
-                pass
+                retired_tree_cache = (retired_tree / "target").resolve().parent
             with copies.standing("live", source, copies.CommittedSource("HEAD")) as unrelated:
-                pass
+                unrelated_cache = (unrelated / "target").resolve().parent
             refused = self.run_tidy(doc)
             self.assertEqual(refused.returncode, 1, refused.stdout + refused.stderr)
             self.assertTrue(all(path.exists() for path in state))
         result = self.run_tidy(doc)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        for tree in (unit_tree, production_tree, retired_tree):
+        for tree in (unit_tree, production_tree, retired_tree, unit_tree_cache, production_tree_cache, retired_tree_cache):
             self.assertFalse(tree.exists())
-        self.assertTrue(unrelated.exists())
+        self.assertFalse(unrelated.exists())
+        self.assertTrue(unrelated_cache.is_dir())
         self.assertFalse(any(path.exists() for path in state))
         self.assertEqual(self.run_tidy(doc).returncode, 0)
 
@@ -127,16 +129,19 @@ class TidyWrappedTests(unittest.TestCase):
                                  worktree=staff.RemovedWorktree(remote.local_machine(), self.root / "beta"))
         other = fixture_member("unit", name="live", parent=self.owner("live").id)
         with copies.standing(str(active.id), source, copies.CommittedSource("HEAD")) as unit_tree:
-            pass
+            unit_tree_cache = (unit_tree / "target").resolve().parent
         with copies.standing(str(retired.id), source, copies.CommittedSource("HEAD")) as retired_tree:
-            pass
+            retired_tree_cache = (retired_tree / "target").resolve().parent
         with copies.standing(str(other.id), source, copies.CommittedSource("HEAD")) as unrelated:
-            pass
+            unrelated_cache = (unrelated / "target").resolve().parent
         result = self.run_tidy(doc)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertFalse(unit_tree.exists())
         self.assertFalse(retired_tree.exists())
-        self.assertTrue(unrelated.exists())
+        self.assertFalse(unrelated.exists())
+        self.assertTrue(unrelated_cache.is_dir())
+        self.assertFalse(unit_tree_cache.exists())
+        self.assertFalse(retired_tree_cache.exists())
 
     def test_wrap_keeps_state_until_a_damaged_copy_record_is_repaired(self) -> None:
         source = ImmutableGitSeed.create(self.root, "main", "Cleanup Test",

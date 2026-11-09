@@ -1650,11 +1650,7 @@ def _start_phase(args: argparse.Namespace) -> None:
         if director:
             active_root = os.environ.get("UNIT_ACTIVE_DIR")
             # A temporary run stays within its temporary root unless explicitly configured.
-            marker = unit_runs.marker(director, Path(active_root) if active_root else session_dir.parent / "active")
-            marker.parent.mkdir(parents=True, exist_ok=True)
-            temporary = marker.with_name(f".{marker.name}.{os.getpid()}")
-            _ = temporary.write_text(f"{session_dir}\n", encoding="utf-8")
-            os.replace(temporary, marker)
+            unit_runs.activate(session_dir, director, Path(active_root) if active_root else session_dir.parent / "active")
     _close_active_activity(session_dir, state, "interrupted", "", now)
     state = _read_state(session_dir)
     active = _object_dict(state.get("phase"))
@@ -6577,6 +6573,7 @@ def _finish_run(args: argparse.Namespace) -> None:
         _finish_phase(finish_args)
         state = _read_state(session_dir)
     if _string(state.get("status")) != "active":
+        unit_runs.end(session_dir)
         return
     _close_active_activity(session_dir, state, "interrupted", "", now)
     state = _read_state(session_dir)
@@ -6594,6 +6591,7 @@ def _finish_run(args: argparse.Namespace) -> None:
     state["status"] = run_status
     state["finished_at"] = now
     _write_state(session_dir, state)
+    unit_runs.end(session_dir)
     _refresh_phase_table(session_dir)
 
 

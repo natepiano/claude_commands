@@ -412,7 +412,9 @@ class AccountsTests(unittest.TestCase):
             messagingSocketPath="/fixture.sock", updatedAt=1, tmux="", formerNames=[])
         moves.append_move(moves.FailedMove(at="2026-10-14T12:00:00+00:00", tool="claude",
             subject="moved-session", move_id="move-one", kind="failed", reason="still on claude1"))
-        with (patch.object(sessions, "live_sessions", return_value=[owner]),
+        # Each run stores a usage reading at the current time; the two outputs must match.
+        with (patch.object(accounts, "datetime", RoleWriteTime),
+              patch.object(sessions, "live_sessions", return_value=[owner]),
               patch.object(sessions, "running_sessions", return_value=[owner]),
               patch.object(import_module("scripts.message.sessions"), "live_sessions", return_value=[owner]),
               patch.object(account, "process_config_dir", return_value=account.ConfiguredClaudeFolder(self.main_dir))):

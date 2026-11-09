@@ -19,6 +19,7 @@ from types import ModuleType
 from typing import cast
 from unittest.mock import patch
 
+from scripts.lib.git_test_support import write_fixture_git_config
 
 
 
@@ -146,7 +147,9 @@ class ImmutableGitSeed:
     def create(cls, root: Path, branch: str, author: str, email: str,
                files: Mapping[str, str]) -> ImmutableGitSeed:
         checkout, origin = root / "checkout", root / "origin.git"
-        environment = {**os.environ, "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1"}
+        root.mkdir(parents=True, exist_ok=True)
+        environment = {**os.environ, "GIT_CONFIG_GLOBAL": str(write_fixture_git_config(root)),
+                       "GIT_CONFIG_NOSYSTEM": "1"}
         commands = [["init", "--bare", str(origin)], ["init", "-b", branch, str(checkout)]]
         for arguments in commands:
             _ = subprocess.run(["git", *arguments], env=environment, capture_output=True, check=True)

@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import cast
 
 from scripts.direct import progress_history
-from scripts.lib import atomic_file
+from scripts.lib import atomic_file, scratch
 from scripts.herdr import herdr, worker_panes
 from scripts.production import staff, worker, worker_admission
 
@@ -166,7 +166,8 @@ def _submit_stage(parent: staff.StaffRow, row: staff.StaffRow, state: worker_pan
 
 def _finish_completion(row: staff.StaffRow, parent: staff.StaffRow, run: Path, passed: dict[str, object],
                        instance: str, delivery: progress_history.DispatchDelivery,
-                       completion: progress_history.HookCompletion, state: worker_panes.WorkerPane,
+                       completion: progress_history.HookCompletion,
+                       state: worker_panes.WorkerPane | worker_panes.WorkerNotObserved,
                        hold: worker_panes.WorkerLockHold) -> TurnOutcome:
     from scripts.direct import assign
     from scripts.message import send
@@ -188,6 +189,10 @@ def _finish_completion(row: staff.StaffRow, parent: staff.StaffRow, run: Path, p
     progress_history.complete_dispatch(run, str(passed.get("team_slot", row.name)), instance,
                                        status="completed" if outcome == TurnOutcome.DONE else "error")
     details = list(completion.details)
+    try:
+        _ = scratch.end(scratch.worker_task(row.id))
+    except Exception as error:
+        details.append(f"scratch cleanup failed for {row.name}: {' '.join(str(error).splitlines())}")
     try:
         if not completion.pane_closed:
             with redirect_stderr(io.StringIO()) as diagnostics:
@@ -231,6 +236,32 @@ def _finish_completion(row: staff.StaffRow, parent: staff.StaffRow, run: Path, p
     return outcome
 
 
+def finish_late_completion(row: staff.StaffRow, parent: staff.StaffRow, hold: worker_panes.WorkerLockHold,
+                           new_held_role: str) -> None:
+    """Report the worker's unfinished result before a new dispatch replaces its run link."""
+    recorded = progress_history.recorded_dispatch_run(row.id)
+    if not isinstance(recorded, progress_history.RecordedDispatchRun):
+        return
+    passed = worker_panes.worker_pass(row, recorded.directory)
+    completion = progress_history.hook_completion(passed)
+    if not isinstance(completion, progress_history.HookCompletion) or completion.finished:
+        return
+    delivery = progress_history.dispatch_delivery(passed)
+    same_hold = delivery.actions.held_role == new_held_role
+    instance = str(passed.get("instance_id", ""))
+    late = f"late result of pass {instance} in run {recorded.directory.name}"
+    details = completion.details if late in completion.details else (*completion.details, late)
+    state = worker_panes.observe_worker(parent.id, row, staff.snapshot())
+    try:
+        _ = _finish_completion(row, parent, recorded.directory, passed, instance,
+                               replace(delivery, actions=replace(delivery.actions, end_worker=False)),
+                               replace(completion, pane_closed=True,
+                                       role_released=completion.role_released or same_hold, details=details), state, hold)
+    except (OSError, ValueError, herdr.HerdrFailure, subprocess.SubprocessError,
+            staff.StaffRefused, staff.StaffUnreadable) as error:
+        print(f"anomaly: {row.name}: late result of pass {instance} was not reported: {error}; the result is in {completion.reply_file}", file=sys.stderr)
+
+
 def _ignored(event: WorkerEvent, reason: str, worker_name: str = "unknown") -> TurnOutcome:
     """Save each ignored event for the director without sending a notice."""
     path = herdr.layout_path(herdr.shared_session()).parent / "turn-end-ignored.jsonl"
@@ -253,10 +284,10 @@ def handle(event: WorkerEvent) -> TurnOutcome:
     parent = record.parent_of(row)
     if parent is None:
         return _ignored(event, "the worker has no parent", row.name)
-    run = worker_panes.worker_run(row, record=record)
     with worker_panes.worker_lock(parent.id, staff.WorkerName.parse(row.name), blocking=True) as hold:
         if isinstance(hold, worker_panes.Kept):
             return _ignored(event, f"the worker lock was kept: {hold.blocker}", row.name)
+        run = worker_panes.worker_run(row, record=record)
         passed = worker_panes.worker_pass(row, run)
         completion = progress_history.hook_completion(passed)
         if isinstance(completion, progress_history.HookCompletion) and completion.finished:
