@@ -111,6 +111,24 @@ class PaneRecordTests(unittest.TestCase):
         self.assertEqual(entry.get("plugin_directories"), ["/wanted"])
         self.assertNotIn("/unwanted", pane_record.resume_arguments(entry))
 
+    def test_codex_resume_keeps_the_recorded_policy_after_the_model(self) -> None:
+        policy = ["--sandbox", "read-only", "--ask-for-approval", "never",
+                  "-c", 'model_reasoning_effort="high"',
+                  "-c", "notice.hide_rate_limit_model_nudge=true",
+                  "-c", 'service_tier="default"', "-c", 'notify=["/fixture/notify"]']
+        for model, recorded in (("fixture-model", False), ("fixture-model", True), ("", True)):
+            with self.subTest(model=model, recorded=recorded):
+                entry = pane_record.launch("w1:p2", "codex-thread", str(self.root), {}, ["codex"], kind="codex")
+                entry["model"] = model
+                if recorded:
+                    entry["codex_policy"] = policy.copy()
+                else:
+                    _ = entry.pop("codex_policy", None)
+                expected = ["resume", "codex-thread"] + (["--model", model] if model else [])
+                self.assertEqual(pane_record.resume_arguments(entry), expected + (policy if recorded else []))
+                if recorded:
+                    self.assertEqual(entry.get("codex_policy", []), policy)
+
     def test_plugin_directories_require_nonempty_paths_in_launch_records(self) -> None:
         entry = pane_record.launch("w1:p2", "plugin-session", "/fixture", {}, ["claude"])
         self.records.mkdir()

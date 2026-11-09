@@ -1236,14 +1236,32 @@ class WorkerCommandTests(unittest.TestCase):
         self.assertEqual(len(self.agent.submitted), 1)
         self.assertIsNotNone(staff.by_id(opened.row.id))
 
-    def test_torn_transcript_keeps_the_worker_without_delivery(self) -> None:
-        opened = self.opened()
-        backend = staff.backend(opened.row)
-        assert isinstance(backend, (staff.ClaudeBackend, staff.CodexBackend))
-        path = worker_admission.transcript_source(opened.row, backend)
-        atomic_file.write_text_atomic(path, '{"torn":')
-        self.assertEqual(self.dispatch(), worker.ExitCode.UNCERTAIN)
-        self.assertEqual(self.agent.submitted, [])
+    def test_transcript_failure_reports_whether_the_prompt_was_delivered(self) -> None:
+        for delivered in (False, True):
+            with self.subTest(delivered=delivered):
+                name = "impl2" if delivered else "impl"
+                opened = self.opened(name)
+                backend = staff.backend(opened.row)
+                assert isinstance(backend, (staff.ClaudeBackend, staff.CodexBackend))
+                path = worker_admission.transcript_source(opened.row, backend)
+
+                def tear_transcript() -> None:
+                    atomic_file.write_text_atomic(path, '{"torn":')
+
+                if delivered:
+                    self.agent.during_prompt = tear_transcript
+                    self.agent.finish_after = 1
+                else:
+                    tear_transcript()
+                with redirect_stderr(io.StringIO()) as errors:
+                    self.assertEqual(self.dispatch(name), worker.ExitCode.UNCERTAIN)
+                status = f"prompt delivered to pane {opened.pane}" if delivered else "no prompt sent"
+                self.assertEqual(errors.getvalue(),
+                    f"anomaly: {name}: worker transcript has incomplete records; {status}\n")
+                if delivered:
+                    self.assertEqual([submission[0] for submission in self.agent.submitted], [opened.pane])
+                else:
+                    self.assertEqual(self.agent.submitted, [])
 
     def test_older_incomplete_record_keeps_the_valid_completion_receipt(self) -> None:
         opened = self.opened()

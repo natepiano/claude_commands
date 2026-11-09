@@ -24,116 +24,95 @@
 
 ### Phase 1 — The registry writer reads the branch it fetched  · status: done
 
-**Depends on:** none.
+#### As-built
 
-#### Work Order
-
-**Goal:** A registry edit fast-forwards only to the tip of its own branch, even when another fetch runs in the same checkout.
-
-**Spec:**
-Fault (sdlc, proved 2026-11-08 11:53 EST): `models_registry._fetch` runs `git fetch origin <branch>` and then reads `FETCH_HEAD`. Every fetch in the checkout writes `FETCH_HEAD`. A showrunner fetch of `sdlc-phases` came between the two calls. The catalog sync read that tip as `origin/main` and ran `git merge --ff-only` on live main.
-
-Fix: fetch into the branch's own remote ref and read that ref. Never read `FETCH_HEAD`.
-
-```python
-def _fetch(repo: Path, branch: str) -> str:
-    tracking = f"refs/remotes/origin/{branch}"
-    _ = _git(repo, "fetch", "origin", f"+refs/heads/{branch}:{tracking}")
-    return _git(repo, "rev-parse", "--verify", f"{tracking}^{{commit}}")
-```
-
-Test row: another fetch of a different branch between the fetch and the read does not change the target.
+`models_registry._fetch(repo, branch)` fetches `+refs/heads/<branch>:refs/remotes/origin/<branch>` and returns `rev-parse --verify refs/remotes/origin/<branch>^{commit}`. It never reads `FETCH_HEAD`, because every fetch in the checkout writes `FETCH_HEAD`.
 
 **Files:**
-- `scripts/lib/models_registry.py` — `_fetch` reads its own remote ref.
-- `scripts/agents/test_models_conf_publish.py` — one test row.
+- `scripts/lib/models_registry.py` — `_fetch` reads the branch's own remote ref.
+- `scripts/agents/test_models_conf_publish.py` — a fetch of another branch between the fetch and the read does not change the target.
 
-**Workers:** director fix, agreed with sdlc (sdlc [12423414] named the fix).
+**Gotchas:** with `fetch.prune=true`, this one-ref refspec prunes no other `origin/*` ref (git 2.54.0, checked 2026-11-08). Only a wildcard destination prunes others.
 
-**State:** none.
+### Phase 2 — Codex can read the hooks file again  · status: done
 
-**Acceptance gate:** `scripts.agents.test_models_conf_publish` passes, with the new row; the merge gate passes.
+#### As-built
 
-### Phase 2 — Codex can read the hooks file again  · status: todo
-
-**Depends on:** none. Phase 3 depends on it: the herdr `SessionStart` hook reports a new pane's thread only when Codex can parse the hooks file.
-
-#### Work Order
-
-**Goal:** The Codex hook installer writes every timeout as an integer, so Codex loads the hooks file.
-
-**Spec:**
-Fault (models, proved 2026-11-08 12:22 EST in a scratch pane): Codex 0.167.0 prints `failed to parse hooks config /home/natepiano/.codex1/hooks.json: invalid type: map, expected u64 at line 68 column 9` and runs no hook. Line 68 closes the `scratch-guard` handler, whose timeout is `10.0`. `CodexHook.timeout` returns `copy_guard.hook_timeout()`, a float from `config/copies.conf` `guard_timeout_seconds`. `codex_hooks.py check` lists every handler as absent in `~/.codex`, `~/.codex1` and `~/.codex2`.
-
-Fix: `CodexHook.timeout` returns whole seconds, `math.ceil(hook_timeout())` for `scratch-guard`.
-
-Test row: the installed hooks file carries an integer timeout for each handler.
-
-Live file: install compares timeouts with `==`, and `10.0 == 10` in Python, so install does not rewrite the live file. The live `hooks.json` needs a one-time edit of `10.0` to `10`, then `codex_hooks.py install` in each Codex home to trust the changed handler, then `check`.
+`CodexHook.timeout` returns an `int`. For `scratch-guard` it is `math.ceil(copy_guard.hook_timeout())`. Codex 0.167.0 refuses the whole `hooks.json` when any timeout is not an integer, and then runs no hook, `SessionStart` included.
 
 **Files:**
-- `scripts/hooks/codex_hooks.py` — `CodexHook.timeout` returns an `int`.
-- `scripts/hooks/test_codex_hooks.py` — one test row.
+- `scripts/hooks/codex_hooks.py` — `CodexHook.timeout` returns whole seconds.
+- `scripts/hooks/test_codex_hooks.py` — `install` repairs managed and unmanaged float timeouts.
 
-**Workers:** director fix, agreed with sdlc (sdlc [c09f23e9] named the fix and the test row).
+The same fix also landed from natedev-messaging (`Codex hook install writes integer timeouts`); the merge keeps that version, so this phase adds no change of its own.
 
-**State:** none.
+**Binds later work:** the herdr `SessionStart` hook reports a new Codex pane's thread at the first prompt, not at process start.
 
-**Acceptance gate:** `scripts.hooks.test_codex_hooks` passes, with the new row; the merge gate passes.
+**Gotchas:** `install` rewrites a float timeout in an old `hooks.json` and trusts the changed handler again. natedev and the Mac were migrated by hand on 2026-11-08.
 
-### Phase 3 — A Codex worker launch proves its thread without reading its rollout file  · status: todo
+### Phase 3 — A Codex worker launch proves its thread without reading its rollout file  · status: done
 
-**Depends on:** Phase 2. panes Phase 28f runs after it.
+#### As-built
+
+Inside `herdr.launch_rollout_proof()` (`RolloutProofPhase.LAUNCH`), `herdr.native_process` for `codex` reads no rollout file. `_codex_launch_identity(pid, reported)` decides the thread:
+- With a `resume <id>` argument, a matching pane report gives `PaneSessionReport`; no report or another report gives `LaunchArgument(<id>)`, which `pane_native_process` turns into `UnreportedResume` when unreported.
+- With no `resume` argument, the pane report gives `PaneSessionReport(reported)`; no report raises `Codex launch identity is unavailable`.
+
+Under `RolloutProofPhase.STABLE` the rollout read stays, and `NoOpenCodexRollout` falls back to `_codex_launch_identity`.
+
+In `worker.py` `_dispatch_turn`, a `DispatchEvidenceUnknown` in the wait loop after the prompt is typed prints `anomaly: <worker>: <reason>; prompt delivered to pane <pane>`. The same failure before typing prints `no prompt sent`. Exit codes do not change.
+
+**Files:**
+- `scripts/herdr/herdr.py` — `_codex_launch_identity` and `native_process`.
+- `scripts/herdr/test_herdr.py` — `native_process` rows: stable, new launch with a foreign rollout, new launch with no rollout, resume, resume with a growing rollout.
+- `scripts/production/worker.py` — the wait-loop failure line.
+- `scripts/production/test_worker.py` — a transcript failure before and after delivery.
+
+**Binds later work:** the `RolloutProofPhase.STABLE` read in `herdr.native_process` is the last rollout read on the launch path.
+
+**Gotchas:** the herdr `SessionStart` hook reports a new Codex pane's thread about 2 s after the first prompt, not at process start. A resumed Codex appends to its own rollout file, so a stat, read and second stat of that file fails as "current Codex rollout changed".
+
+### Phase 4 — A restored Codex worker resumes with its full launch policy  · status: done
+
+**Depends on:** none. panes Phase 34 adds a `-c notify=` pair that this record keeps.
 
 #### Work Order
 
-**Goal:** A Codex worker launch publishes the right thread on the first try, for a new and a resumed worker, and a dispatch that typed its prompt never says it did not.
+**Goal:** A Codex worker restored from its pane record resumes with the same launch policy it started with, so the pane worker check finds its policy complete.
 
 **Spec:**
-Faults (sdlc, 2026-11-08):
-1. A resumed worker fails assign with exit 8, `pid N: current Codex rollout changed` (agents fix3, 150 MB rollout, pid 2973548; fix4, 86 MB). A large rollout keeps it failing on retry. `codex_rollout_threads` stats the open rollout, reads its first line and stats it again. A resumed Codex appends to that same file, so the size changes between the two stats.
-2. A new worker fails with `Codex launch identity is unavailable`. Phase 2 found the main cause: Codex could not parse the hooks file, so the herdr `SessionStart` hook never reported the pane's thread. fix5 (pid 3736521) then published `01a1b950…`, a 13 h old thread of another worker, although the process held only its own rollout open.
-3. agents fix3's second resume exited 8 and printed `…; no prompt sent`, but the pane got the prompt and worked on it. `worker.py` `_dispatch_turn` prints `no prompt sent` for `DispatchEvidenceUnknown` also in its wait loop, after `_agent_command(…, "prompt", …)` typed the prompt. A retry then sends the job twice.
+Fault (sdlc asked models to find the cause and fix it where it lives): `scripts/shutdown/pane_record.py` `resume_arguments` resumes Codex with `resume <id>` and `--model <m>` only. The record keeps no `--sandbox`, `--ask-for-approval` or `-c` options. `worker_panes._live_policy` requires `--model`, `--sandbox` and `--ask-for-approval` in the running command, so a restored worker reads `running launch policy is incomplete`. A resumed reviewer also runs without its sandbox and approval policy (cargo-liner defect).
 
-Proved timing (models, 2026-11-08 12:30 EST, scratch pane, `~/.codex2`): herdr records the pane's `agent_session` about 2 s after the first prompt goes in, not at process start. The value equals the thread in the new rollout file name. `worker_panes.first_turn_session` already types a first turn and waits for that report.
+Fix:
+1. `scripts/herdr/pane_launch.py`:
+   - `PaneLaunch` gets `codex_policy: NotRequired[list[str]]`: the Codex policy options of the launch, in launch order, as option and value pairs.
+   - `launch(..., kind="codex")` fills it from the arguments: each `--sandbox <v>`, `--ask-for-approval <v>` and `-c <v>`, also the `--opt=<v>` form. A `kind="claude"` launch does not get the field.
+   - `_validated_launch` accepts the field only as a list of strings.
+2. `scripts/shutdown/pane_record.py` `resume_arguments`: a Codex entry gives `resume <id>`, then `--model <m>` when set, then the recorded `codex_policy` unchanged. An entry without the field gives today's arguments.
 
-Design (panes 28c handoff, accepted by sdlc [1a39967b]):
-1. Inside `herdr.launch_rollout_proof()`, `herdr.native_process` for `codex` reads no rollout file.
-   - With a `resume <id>` argument: the thread is that argument. A matching pane report gives `PaneSessionReport`; no report gives `LaunchArgument`, which `pane_native_process` already turns into `UnreportedResume`. A report that names another thread keeps today's result, `LaunchArgument`.
-   - With no `resume` argument: the thread is the pane report, `PaneSessionReport(reported)`. With no report, raise `Codex launch identity is unavailable`, as today.
-2. Outside the launch proof (`RolloutProofPhase.STABLE`), the rollout read stays in this phase. Phase 5 removes it.
-3. In `worker.py` `_dispatch_turn`, every failure line printed after the prompt was typed says the prompt was delivered and names the pane, for example `anomaly: <worker>: <reason>; prompt delivered to pane <pane>`. Lines printed before typing keep `no prompt sent`. Exit codes do not change.
+Every `-c` pair is kept, so the `model_reasoning_effort`, `notice.hide_rate_limit_model_nudge`, `service_tier` and the later panes Phase 34 `notify` pair all come back on a resume.
 
 Add no other check (user, 2026-11-05 and 2026-11-07).
 
 Test rows:
-- `scripts/herdr/test_herdr.py`, in the existing `native_process` launch tests:
-  1. A new launch with a foreign rollout open publishes the pane's reported thread.
-  2. A new launch with no rollout open publishes the pane's reported thread.
-  3. A resume publishes its argument thread.
-  4. A resume whose only open rollout is its own older file, growing while it is read, proves.
-- `scripts/production/test_worker.py`, in the existing dispatch tests:
-  5. A transcript failure after the prompt is typed reports the prompt as delivered.
+- `scripts/herdr/test_pane_launch.py`, in the existing launch-record tests:
+  1. A Codex launch records its `--sandbox`, `--ask-for-approval` and `-c` pairs in order; a Claude launch records none.
+- `scripts/shutdown/test_pane_record.py`, in the existing resume-argument or Codex record tests:
+  2. A Codex entry with `codex_policy` resumes with `resume <id> --model <m>` followed by the recorded pairs.
 
 **Files:**
-- `scripts/herdr/herdr.py` — `native_process` under `RolloutProofPhase.LAUNCH`.
-- `scripts/herdr/test_herdr.py` — rows 1–4.
-- `scripts/production/worker.py` — `_dispatch_turn` failure lines after typing.
-- `scripts/production/test_worker.py` — row 5.
+- `scripts/herdr/pane_launch.py` — `PaneLaunch.codex_policy`, `launch`, `_validated_launch`.
+- `scripts/herdr/test_pane_launch.py` — row 1.
+- `scripts/shutdown/pane_record.py` — `resume_arguments`.
+- `scripts/shutdown/test_pane_record.py` — row 2.
 
 **Workers:** 2 writers.
-- `impl`: `scripts/herdr/herdr.py`, `scripts/herdr/test_herdr.py` (rows 1–4).
-- `test`, as a writer: `scripts/production/worker.py`, `scripts/production/test_worker.py` (row 5).
+- `impl`: `scripts/herdr/pane_launch.py`, `scripts/herdr/test_pane_launch.py` (row 1).
+- `test`, as a writer: `scripts/shutdown/pane_record.py`, `scripts/shutdown/test_pane_record.py` (row 2).
 
-**State:** none.
+**State:** a new optional field in the retained pane launch record. Old records without it resume as today.
 
-**Acceptance gate:** `scripts.herdr.test_herdr`, `scripts.herdr.test_worker_panes`, `scripts.production.test_worker` and `scripts.production.test_worker_admission` pass; basedpyright is clean on the changed files; the merge gate passes.
-
-### Phase 4 — A restored Codex worker resumes with its full launch policy  · status: todo
-
-**Depends on:** none.
-
-**Spec:** Written at phase start. Source: sdlc asked models to find the cause of `running launch policy is incomplete` and fix it where it lives. `scripts/shutdown/pane_record.py` `resume_arguments` resumes Codex with `resume <id>` and `--model` only, without `--sandbox` and `--ask-for-approval`. `worker_panes._live_policy` then finds the running policy incomplete.
+**Acceptance gate:** `scripts.herdr.test_pane_launch`, `scripts.shutdown.test_pane_record`, `scripts.shutdown.test_stop_resume` and `scripts.herdr.test_worker_panes` pass; basedpyright is clean on the changed files; the merge gate passes.
 
 ### Phase 5 — One way to read a Codex thread  · status: todo
 

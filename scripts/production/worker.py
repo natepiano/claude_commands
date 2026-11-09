@@ -383,7 +383,7 @@ def _dispatch_turn(parent: StaffId, started: worker_panes.OpenWorker, client: he
         state = worker_panes.observe_worker(parent, row, record)
         receipt = dispatch_receipt(row, line, dispatch_id, run=run)
         if isinstance(receipt, DispatchEvidenceUnknown):
-            print(f"anomaly: {name.value}: {receipt.reason}; no prompt sent", file=sys.stderr)
+            print(f"anomaly: {name.value}: {receipt.reason}; prompt delivered to pane {current.pane}", file=sys.stderr)
             return ExitCode.UNCERTAIN
         if isinstance(receipt, DispatchComplete) and (
                 isinstance(state, (worker_panes.StoppedWorker, worker_panes.ClosedWorker))
