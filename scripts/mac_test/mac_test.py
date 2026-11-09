@@ -38,6 +38,7 @@ from scripts.lib import process_start as process_identity
 from scripts.build_targets import target_config
 from scripts.build_targets.target_config import ConfigError
 from scripts.buildlog.mac_idle_alert import MacIdleConfigError, idle_config as idle_config
+from scripts.buildlog import sync as buildlog_sync
 
 if TYPE_CHECKING:
     from scripts.build_hold import build_hold
@@ -72,6 +73,7 @@ class ClaimOwnerRecord(TypedDict):
     repo_key: NotRequired[str]
     repo_name: NotRequired[str]
     slot: NotRequired[int]
+    transfers: NotRequired[list[buildlog_sync.TransferBytes]]
 
 
 class ProcessBoundClaim(ClaimOwnerRecord):
@@ -581,6 +583,8 @@ def read_run(path: Path) -> RunState:
         "worktree": worktree,
         "since": since,
     }
+    if "transfers" in values:
+        record["transfers"] = cast(list[buildlog_sync.TransferBytes], values["transfers"])
     if "holder_session" in values:
         holder_session = required_string(values, "holder_session", path)
         if not holder_session.strip():
@@ -1638,10 +1642,11 @@ printf 'active=%s\nwork=%s\nrc=0\n' "$active_count" "$work_count"
 
 
 def check_mac_activity(config: MacTestConfig, host: str) -> MacActivity:
+    arguments = ["ssh", "-o", "BatchMode=yes", "-o",
+                 f"ConnectTimeout={config.connect_timeout_s:g}", host, mac_activity_script()]
     try:
         result = subprocess.run(
-            ["ssh", "-o", "BatchMode=yes", "-o",
-             f"ConnectTimeout={config.connect_timeout_s:g}", host, mac_activity_script()],
+            arguments,
             stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             text=True, check=False, timeout=10,
         )
@@ -1651,6 +1656,9 @@ def check_mac_activity(config: MacTestConfig, host: str) -> MacActivity:
         return ActivityCheckFailed(f"SSH activity check could not start: {error}")
     except UnicodeError:
         return ActivityCheckFailed("the activity check answer could not be read")
+    ledger = buildlog_sync.active_transfers.get()
+    if isinstance(ledger, buildlog_sync.TransferLedger):
+        ledger.observe("ssh_activity", arguments, result.stdout, result.stderr)
     if result.returncode != 0:
         reason = " ".join(result.stderr.split()) or f"SSH exited {result.returncode}"
         return ActivityCheckFailed(reason)
@@ -1695,15 +1703,20 @@ def claim_watch_pass(paths: StatePaths, config: MacTestConfig) -> bool:
         # The Linux controller must confirm remote cleanup before claim removal.
         return True
     activity: dict[str, MacActivity] = {}
+    traffic: dict[str, buildlog_sync.TransferLedger] = {}
     for claim in claims:
         host = claim_host(claim.record, config)
         if host not in activity:
-            activity[host] = check_mac_activity(config, host)
+            traffic[host] = buildlog_sync.TransferLedger()
+            with buildlog_sync.measure_transfers(traffic[host]):
+                activity[host] = check_mac_activity(config, host)
     now = utc_now()
     watched = False
     for claim in claims:
-        if watch_claim(paths, config, claim, activity[claim_host(claim.record, config)], now):
-            watched = True
+        host = claim_host(claim.record, config)
+        with buildlog_sync.measure_transfers(traffic[host]):
+            if watch_claim(paths, config, claim, activity[host], now):
+                watched = True
     return watched
 
 
@@ -1722,10 +1735,18 @@ def watch_claim(
             return True
         if not run_is_live(current):
             return False
+        changed = False
+        ledger = buildlog_sync.active_transfers.get()
+        if isinstance(ledger, buildlog_sync.TransferLedger) and ledger.transfers:
+            # Charge a shared host query to only one live claim.
+            current["transfers"] = [*current.get("transfers", []), *ledger.transfers]
+            ledger.transfers.clear()
+            changed = True
         if isinstance(activity, ActivityCheckFailed):
+            if changed:
+                write_json(claim.path, current)
             print(f"Mac claim activity check failed: {activity.reason}", flush=True)
             return True
-        changed = False
         if isinstance(activity, MacActive) and activity.work > 0:
             if "work_idle_since" in current:
                 del current["work_idle_since"]
@@ -2280,6 +2301,9 @@ def command_release(args: CliArguments, paths: StatePaths) -> int:
             except StateReadError:
                 continue
             if isinstance(record, dict) and record["pid"] == args.pid:
+                transfers = record.get("transfers", [])
+                if transfers:
+                    print("copy_bytes=" + json.dumps(transfers))
                 path.unlink(missing_ok=True)
         block_present = not isinstance(read_block(paths.block), NoMacBlock)
     if block_present:
