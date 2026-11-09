@@ -305,6 +305,7 @@ class WorkerCommandTests(unittest.TestCase):
     def setUp(self) -> None:
         self.fixture = pane_fixtures.WorkerPaneTests("runTest")
         self.fixture.setUp()
+        _ = (self.fixture.root / "conf/build_targets.conf").write_text("targets=natedev,mac\nkind.natedev=local\nkind.mac=ssh\n")
         self.fixture.world.binary = "/nonexistent/herdr"
         self.addCleanup(self.fixture.doCleanups)
         config = self.fixture.root / "conf/direct.conf"
@@ -1984,6 +1985,16 @@ class WorkerCommandTests(unittest.TestCase):
                 self.assertEqual(anomalies.getvalue().splitlines(),
                     [f"anomaly: {first.name}: {' '.join(str(result).splitlines())}"]
                     if isinstance(result, (OSError, ValueError)) else [])
+        parent = record.parent_of(first)
+        assert parent is not None
+        for machine, expected in (
+                ("natedev", "1 same-name review codex2 - busy\n2 same-name review claude2 - idle\n"),
+                ("mac", "1 same-name review codex2 mac - busy\n2 same-name review claude2 — - idle\n")):
+            with self.subTest(machine=machine):
+                current = staff.by_id(parent.id)
+                assert current is not None
+                _ = staff.set_worktree(parent.id, staff.PresentWorktree(machine, self.fixture.root / parent.name), expected=current.worktree)
+                self.assertEqual(self.command("list", "--all"), (0, expected, ""))
 
     def test_list_all_keeps_a_refused_pass_over_an_equal_time_start_event(self) -> None:
         first, _second, paths = self.recorded_list_fixture()
@@ -2230,6 +2241,19 @@ class WorkerCommandTests(unittest.TestCase):
                 code, output, errors = self.command("list", "--json")
                 self.assertEqual(code, 0, errors)
                 self.assertEqual(cast(list[dict[str, object]], json.loads(output)), [known, fields])
+        code, json_before, errors = self.command("list", "--json")
+        self.assertEqual(code, 0, errors)
+        for machine in ("natedev", "mac"):
+            with self.subTest(machine=machine):
+                parent = self.fixture.parent
+                _ = staff.set_worktree(parent.id, staff.PresentWorktree(machine, self.fixture.root), expected=parent.worktree)
+                code, output, errors = self.command("list")
+                self.assertEqual(code, 0, errors)
+                column = " mac" if machine == "mac" else ""
+                self.assertIn(f" 3 {members[2].name} impl account unknown{column} open exited", output.splitlines())
+                code, output, errors = self.command("list", "--json")
+                self.assertEqual(code, 0, errors)
+                self.assertEqual(json.loads(output), json.loads(json_before))
 
     def test_list_keeps_dispatch_role_separate_from_observation(self) -> None:
         opened = self.opened("impl2", "review")

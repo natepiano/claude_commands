@@ -235,6 +235,12 @@ class WorktreeUnfilled:
     """The transitional record has no worktree fact yet."""
 
 
+def worktree_machine(row: StaffRow) -> str:
+    if isinstance(row.worktree, (PresentWorktree, RemovedWorktree)):
+        return row.worktree.machine
+    return ""
+
+
 @dataclass(frozen=True)
 class LiveDoc:
     machine: str
