@@ -407,10 +407,13 @@ class MergeGateFixture(unittest.TestCase):
         self.state = self.root / "state"
         self.quiet_production = self.root / "quiet-production.md"
         home = self.root / "home"
+        # Disable detached maintenance so Git cannot remove objects during snapshot copies.
+        git_config = root / "git-config"
+        self.write(git_config, "[maintenance]\n\tauto = false\n")
         self.environment = {
             **os.environ, "HOME": str(home), "STAFF_FILE": str(home / "staff.json"), "XDG_STATE_HOME": str(home / "state"),
             "CODEX_HOME": str(home / "codex"), "GIT_CONFIG_NOSYSTEM": "1",
-            "GIT_CONFIG_GLOBAL": os.devnull,
+            "GIT_CONFIG_GLOBAL": str(git_config),
             "PATH": str(self.bin) + os.pathsep + os.environ.get("PATH", ""),
             "MERGE_GATE_TEST_STATE": str(self.state),
             "MERGE_GATE_TEST_REPO": str(SCRIPT.parents[2]),
