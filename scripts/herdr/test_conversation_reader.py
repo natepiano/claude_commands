@@ -13,6 +13,7 @@ from unittest.mock import call, patch
 
 
 from scripts.herdr import herdr
+from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib import operation_deadline
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.message import codex_daemon, sessions
@@ -34,16 +35,26 @@ class ConversationReaderTests(StaffTestCase):
         self.proc.mkdir()
         self.identity = fixture_runtime_id("reader-current")
         self.launched = fixture_runtime_id("reader-launch")
-        _ = cast(object, self.enterContext(patch.dict(os.environ, {"HERDR_PROC": str(self.proc)})))
+        _ = cast(object, self.enterContext(patch.dict(os.environ, {"HERDR_PROC": str(self.proc), "XDG_CONFIG_HOME": str(self.root / "config")})))
         _ = self.enterContext(patch.object(herdr, "_PLATFORM", "linux"))
         _ = self.enterContext(patch.object(sessions, "process_start", return_value="1"))
         _ = self.enterContext(patch.object(sessions, "session_liveness", return_value=sessions.SessionNotLive()))
         _ = self.enterContext(patch.object(codex_daemon, "read_daemons", return_value=[]))
 
+        fake_unit_host.process(os.environ, 998060, 1, ["herdr", "server"], {})
+        fake_unit_host.process(os.environ, 998061, 998060, ["zsh"], {}, session=998061)
+        write_text_atomic(self.proc / "net/unix",
+            f"0: 2 0 00010000 0001 01 600 {self.root}/config/herdr/sessions/agents/herdr.sock\n")
+        descriptors = self.proc / "998060/fd"
+        descriptors.mkdir()
+        (descriptors / "3").symlink_to("socket:[600]")
+
     def codex(self, *, rollout: bool = True, arguments: list[str] | None = None,
               environment: dict[str, str] | None = None, pid: int = 998071) -> None:
-        fake_unit_host.process(os.environ, pid, 1, arguments or ["codex", "resume", self.launched],
-                               environment or {"CODEX_THREAD_ID": self.launched}, cwd=self.root)
+        fake_unit_host.process(os.environ, pid, 998061, arguments or ["codex", "resume", self.launched],
+                               environment or {"CODEX_THREAD_ID": self.launched}, session=998061, cwd=self.root)
+        write_text_atomic(self.proc / str(pid) / "stat",
+            f"{pid} (codex) S 998061 {pid} 998061 1 {pid} " + "0 " * 13 + "1")
         descriptors = self.proc / str(pid) / "fd"
         descriptors.mkdir(exist_ok=True)
         if rollout:

@@ -323,7 +323,9 @@ Shutdown restart uses the shared worker restore.
 Pane worker account moves use the shared stop, resume, and prompt APIs.
 Account moves resume only workers with active dispatches; each move closes an idle worker's pane.
 An idle worker's next assign opens its conversation on the current role account.
-An open worker with an active dispatch keeps its conversation and terminal during an account move.
+A worker pane closes when its agent command returns. The staff row and native conversation remain.
+A resumed worker opens in a new pane after an assign, restore, or account move.
+Unit sessions and side panes keep their shells when their agents end.
 A busy worker receives one prompt to continue the same pass. An idle worker receives no prompt.
 The resume message builder retains the launcher prompt path for restored workers.
 

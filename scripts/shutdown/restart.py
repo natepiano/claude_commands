@@ -186,17 +186,25 @@ def session_launch(identity: str, name: str) -> tuple[Literal["claude", "codex"]
 
 
 @dataclass(frozen=True)
+class PaneConversations:
+    codex: herdr.CodexConversations
+    names: dict[str, str]
+
+
+@dataclass(frozen=True)
 class RestartObservations:
     codex: herdr.CodexConversations
     runs: dict[str, list[str]]
     pane_owners: frozenset[staff.StaffId]
+    pane_names: dict[str, str]
 
 
 def _observations(record: staff.StaffSnapshot, client: herdr.Herdr) -> RestartObservations:
     owners = frozenset(row.id for row in record.rows if row.kind in ("unit", "showrunner")
                        and record.find(kind="worker", parent=row.id))
     runs = unit_runs.held_by_session(os.environ.get("ROSTER_RUN_ROOT"), record=record) if owners else {}
-    return RestartObservations(_codex_conversations(client), runs, owners)
+    panes = _codex_conversations(client)
+    return RestartObservations(panes.codex, runs, owners, panes.names)
 
 
 def _restore_workers(row: staff.StaffRow, record: staff.StaffSnapshot, *,
@@ -418,31 +426,41 @@ def live_members(rows: Iterable[staff.StaffRow], record: staff.StaffSnapshot, *,
     return selected
 
 
-def _codex_conversations(client: herdr.Herdr) -> herdr.CodexConversations:
-    """Use the native pane reader for resumed Codex processes without open rollouts."""
-    observed = herdr.codex_conversations()
-    if not observed.unknown:
-        return observed
-    live = dict(observed.live)
-    unknown = list(observed.unknown)
+def _codex_conversations(client: herdr.Herdr) -> PaneConversations:
+    """Read panes once for native Codex identities and report names."""
+    live: dict[str, tuple[int, ...]] = {}
+    names: dict[str, str] = {}
+    resolved_tabs: set[str] = set()
     try:
         panes = client.listed("pane")
     except (OSError, ValueError, herdr.HerdrFailure):
-        return observed
+        return PaneConversations(herdr.codex_conversations(), names)
+    try:
+        tabs = {herdr.json_text(tab.get("tab_id"), "tab id"):
+                herdr.json_text(tab.get("label") or "", "tab label") for tab in client.listed("tab")}
+    except (OSError, ValueError, herdr.HerdrFailure):
+        tabs = {}
     for pane in panes:
-        if pane.get("agent") != "codex":
-            continue
         try:
             pane_id = herdr.json_text(pane.get("pane_id"), "pane id")
+            tab_name = tabs.get(str(pane.get("tab_id", "")), "")
+            label = herdr.json_text(pane.get("label") or "", "pane label")
+            display = f"{tab_name} {label} ({pane_id})".strip()
+            if identity := herdr.pane_session(pane):
+                names[identity] = display
+            if pane.get("agent") != "codex":
+                continue
             info = herdr.json_object(client.result("pane", "process-info", "--pane", pane_id).get("process_info"),
                                      "native pane processes")
             identity = herdr.pane_native_process(info, "codex", pane).current_identity
-            _ = live.setdefault(identity, ())
-            name = client.pane_tab(pane_id)[2]["name"]
-            unknown = [reason for reason in unknown if reason != f"{name} (Codex thread unknown)"]
+            live[identity] = ()
+            names[identity] = display
+            resolved_tabs.add(f"{tab_name} (Codex thread unknown)")
         except (OSError, ValueError, herdr.HerdrFailure):
             continue
-    return herdr.CodexConversations(live, tuple(unknown))
+    observed = herdr.codex_conversations()
+    return PaneConversations(herdr.CodexConversations(
+        {**live, **observed.live}, tuple(reason for reason in observed.unknown if reason not in resolved_tabs)), names)
 
 
 @herdr.observation_snapshot()
@@ -465,7 +483,8 @@ def live_rows(record: staff.StaffSnapshot, client: herdr.Herdr, *, save_tabs: bo
     owned = {row.current_session for row in record.rows}
     for identity in sorted(candidates.keys() - owned):
         if isinstance(herdr.read_conversation(identity, codex=codex), herdr.LiveConversation):
-            print(f"{' '.join(candidates[identity].splitlines())}: restart anomaly: unassigned live session", file=sys.stderr)
+            print(f"{' '.join(observed.pane_names.get(identity, candidates[identity]).splitlines())}: "
+                  + "restart anomaly: unassigned live session", file=sys.stderr)
     owners = [row for row in record.rows if row.id in observed.pane_owners]
     workers = {state.row.id: state for states in worker_panes.observe_parents(owners, record).values()
                for state in states} if owners else {}
@@ -687,9 +706,9 @@ def restart(*, stop_all: bool = False, dry_run: bool = False, only: tuple[str, .
             blocked_workers.add(child.id)
             selected_sessions.discard(str(child.current_session))
             _anomaly(child, "target process still runs; worker kept pending" if isinstance(fresh, herdr.LiveConversation) else fresh.reason)
-    observed = RestartObservations(herdr.CodexConversations(
+    observed = replace(observed, codex=herdr.CodexConversations(
         {identity: pids for identity, pids in observed.codex.live.items() if identity not in selected_sessions},
-        observed.codex.unknown), observed.runs, observed.pane_owners)
+        observed.codex.unknown))
     present = False
     if holders:
         try:

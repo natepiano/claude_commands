@@ -343,6 +343,10 @@ class WorkerCommandTests(unittest.TestCase):
         self.assertEqual(len(self.fixture.world.launches), before[1] + 1)
         states = {state.row.id: state for state in worker_panes.observe(self.fixture.parent.id, staff.snapshot())}
         self.assertIsInstance(states[busy.row.id], worker_panes.OpenWorker)
+        resumed = states[busy.row.id]
+        assert isinstance(resumed, worker_panes.OpenWorker)
+        self.assertNotEqual(resumed.pane, busy.pane)
+        self.assertNotEqual(resumed.terminal, busy.terminal)
         self.assertIsInstance(states[idle.row.id], worker_panes.ClosedWorker)
         self.assertEqual(states[busy.row.id].row.current_session, busy.row.current_session)
         self.assertEqual(states[idle.row.id].row.current_session, idle.row.current_session)
@@ -832,7 +836,6 @@ class WorkerCommandTests(unittest.TestCase):
                     if closed:
                         self.agent.append(opened.pane, "user", "Detached run: verification\nRun finished: private verification")
                         _ = self.fixture.world.stop(opened.row, self.fixture.world)
-                        del self.fixture.world.locations[opened.pane]
                         atomic_file.write_text_atomic(path, json.dumps(record))
                         self.assertEqual(result.result(timeout=guard.remaining()), worker.ExitCode.NO_DONE)
                     else:
@@ -1415,7 +1418,8 @@ class WorkerCommandTests(unittest.TestCase):
         launches = len(self.fixture.world.launches)
         self.assertEqual(self.dispatch("impl2"), worker.ExitCode.OK)
         self.assertEqual(len(self.fixture.world.launches), launches + 1)
-        self.assertEqual(self.agent.submitted[0][0], second.pane)
+        self.assertNotEqual(self.agent.submitted[0][0], second.pane)
+        self.assertEqual(self.agent.row(self.agent.submitted[0][0]).current_session, second.row.current_session)
 
     def test_all_busy_assignment_names_each_worker_and_refuses(self) -> None:
         for name in ("impl", "impl2"):
@@ -1813,10 +1817,11 @@ class WorkerCommandTests(unittest.TestCase):
         self.assertEqual(reads.count(history), 1)
         self.assertEqual([call.args[0] for call in resolve.call_args_list], ["claude2"])
 
-    def test_list_all_bounds_a_history_when_another_worker_is_absent(self) -> None:
+    def test_list_all_bounds_history_without_a_uuid_creation_time(self) -> None:
         first, _second, paths = self.recorded_list_fixture()
         absent = fixture_worker("absent-worker", self.fixture.parent.id,
-                                runtime_id="00000001-86a0-7000-8000-000000000001")
+                                runtime_id="00000000-0000-4000-8000-000000000001")
+        ancient = self.fixture.worker("old-history-worker")
         other = self.fixture.worker("other-history-worker")
         state = cast(dict[str, object], json.loads(paths[0].read_text()))
         history = self.fixture.root / "bounded-history.jsonl"
@@ -1829,25 +1834,34 @@ class WorkerCommandTests(unittest.TestCase):
             "owner_staff_id": self.fixture.parent.id, "history_file": str(other_history), "pass": {}}))
         atomic_file.write_text_atomic(other_history, json.dumps({"event_type": "pass_started", "worker_id": other.id,
             "pass_kind": "review", "timestamp_epoch": 200, "called_agent": {"family": "codex"}}) + "\n")
-        old = {"event_type": "pass_finished", "worker_id": first.id, "pass_kind": "impl",
+        old = {"event_type": "pass_finished", "worker_id": ancient.id, "pass_kind": "impl",
                "status": "completed", "timestamp_epoch": 1}
-        latest = {**old, "pass_kind": "fix", "timestamp_epoch": 20, "pass_activity": "Latest work."}
-        content = (json.dumps(old) + "\n" + (json.dumps({"event_type": "progress", "timestamp_epoch": 5,
-                   "text": "Earlier progress." * 100}) + "\n") * 200 + json.dumps(latest) + "\n").encode()
+        latest = {**old, "worker_id": first.id, "pass_kind": "fix", "timestamp_epoch": 20, "pass_activity": "Latest work."}
+        content = (json.dumps(old) + "\n" + (json.dumps({"event_type": "pass_finished", "timestamp_epoch": 5,
+                   "worker_id": fixture_runtime_id("unrelated-worker"), "text": "Earlier progress." * 100}) + "\n")
+                   * 200 + json.dumps(latest) + "\n").encode()
         positions: list[int] = []
+        lengths: list[int] = []
         class HistoryReads(io.BytesIO):
             @override
             def read(self, size: int | None = -1) -> bytes:
                 positions.append(self.tell())
-                return super().read(size)
+                data = super().read(size)
+                lengths.append(len(data))
+                return data
         original = cast(Callable[..., object], Path.open)
         def opened(path: Path, *args: object, **kwargs: object) -> object:
             return HistoryReads(content) if path == history else original(path, *args, **kwargs)
-        with patch.object(Path, "open", autospec=True, side_effect=opened):
+        with (patch.object(Path, "open", autospec=True, side_effect=opened),
+              patch.object(json, "loads", wraps=json.loads) as decoded):
             code, output, errors = self.command("list", "--json", "--all")
         self.assertEqual(code, 0, errors)
+        self.assertLessEqual(sum(lengths), 64 * 1024 + 1)
+        self.assertEqual(sum(isinstance(cast(object, call.args[0]), bytes) for call in decoded.call_args_list), 2)
         rows = {str(row["id"]): row for row in cast(list[dict[str, object]], json.loads(output))}
         self.assertEqual((rows[first.id]["role"], rows[first.id]["activity"]), ("fix", "Latest work."))
+        self.assertEqual((rows[first.id]["work"], rows[first.id]["state"]), ("idle", "completed"))
+        self.assertEqual(rows[ancient.id]["state"], "unknown")
         self.assertEqual(rows[absent.id]["state"], "unknown")
         self.assertEqual(rows[other.id]["state"], "active")
         self.assertTrue(positions)
@@ -2040,7 +2054,8 @@ class WorkerCommandTests(unittest.TestCase):
         self.assertEqual(self.command("check")[0], 0)
         _ = self.fixture.world.stop(opened.row, self.fixture.world)
         self.assertEqual(self.command("check")[0], 0)
-        self.fixture.world.unknown[opened.pane] = "process evidence lost"
+        resumed = self.opened()
+        self.fixture.world.unknown[resumed.pane] = "process evidence lost"
         code, output, errors = self.command("check")
         self.assertEqual(code, 1)
         self.assertIn("impl", output)

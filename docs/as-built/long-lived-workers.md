@@ -286,6 +286,11 @@ With unavailable backend evidence, `account` contains `{"state": "AccountUnavail
 It needs no caller row and makes no process, pane, or thread read.
 Its `state` uses the saved dispatch status or staff hold.
 Its `activity` uses the saved pass activity, then its status.
+History lookup resolves fixed manager ids through the staff record, even after a session change.
+History lookup reads the last 64 KiB of each file, plus one byte to skip a leading partial line.
+History-only dispatches outside this window use the same unknown fields as missing dispatches.
+It skips invalid lines and decodes only wanted worker events.
+Stored account history resolves only the unit group and reads its history once.
 Per-manager listing keeps its live observations.
 
 History lookup resolves fixed manager ids through staff, even after a session change.

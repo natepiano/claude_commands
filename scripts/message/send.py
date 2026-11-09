@@ -22,8 +22,9 @@ every message follows are /message (~/.claude/commands/message.md).
 Pane workers use worker:<unit>/<worker>.
 
 Delivery. A Claude recipient is tried through the postmaster outbox first when
-its heartbeat is fresh. Every path without confirmed delivery falls back to a
-headless `claude -p` relay whose one job is a SendMessage call. It runs sonnet in auto mode (haiku cannot run in auto mode),
+its heartbeat is fresh. A proved miss permits a headless `claude -p` relay.
+Unconfirmed postmaster delivery starts no relay and creates no queued copy.
+The relay makes one SendMessage call. It runs sonnet in auto mode (haiku cannot run in auto mode),
 with hooks, MCP and slash commands off and the caller's CLAUDE_* variables
 removed, so it never passes for the session that ran this. Its relay
 name is separate from the sender, who is named in the message. Delivery is read from the
@@ -135,6 +136,7 @@ from contextlib import contextmanager
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timedelta, timezone
 from enum import Enum
+from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, NamedTuple, NoReturn, NotRequired, TypedDict, cast
 
@@ -292,7 +294,7 @@ def is_acknowledged_skip(reason: str) -> bool:
 LogEntry = TypedDict("LogEntry", {"time": str, "machine": str, "from": str, "to": str, "key": str | None,
                                   "summary": str, "text": str, "outcome": Outcome, "detail": str,
                                   "via": NotRequired[Literal["postmaster", "relay", "queue"]],
-                                  "postmaster": NotRequired[Literal["delivered", "unresolved"] | postmaster.PostmasterMiss],
+                                  "postmaster": NotRequired[postmaster.PostmasterStatus],
                                   "seconds": NotRequired[float], "human": NotRequired[bool], "receiver": NotRequired[str],
                                   "sender_native_id": NotRequired[str]})
 
@@ -341,12 +343,40 @@ UnkeyedMessage = TypedDict(
 QueuedMessage = KeyedMessage | UnkeyedMessage
 
 
+class PostmasterOwner(TypedDict):
+    entry_id: str
+    owner_pid: int
+    owner_start: str
+
+
+class ReservedPostmaster(PostmasterOwner):
+    stage: Literal["reserved"]
+
+
+class PublishingPostmaster(PostmasterOwner):
+    stage: Literal["publishing"]
+
+
+class RelayingPostmaster(PostmasterOwner):
+    stage: Literal["relaying"]
+
+
+class ResolvedPostmaster(PostmasterOwner):
+    stage: Literal["resolved"]
+    outcome: Literal["delivered", "queued", "failed", "expired", "withdrawn"]
+
+
+PostmasterReservation = ReservedPostmaster | PublishingPostmaster | RelayingPostmaster | ResolvedPostmaster
+
+
 class PendingDelivery(TypedDict):
     started: str
     limit_seconds: float
+    accepted_before: NotRequired[str]
     owner_pid: NotRequired[int]
     owner_start: NotRequired[str]
     clearing: NotRequired[Emergency]
+    postmaster: NotRequired[PostmasterReservation]
 
 
 class KeyState(TypedDict):
@@ -553,6 +583,17 @@ class PaneTextDelivered(Result):
     """The observed worker pane accepted the text input."""
 
 
+class RecordedDeliveryAcceptance(Result):
+    """This keyed send has durable acceptance; later bookkeeping must not repeat it."""
+
+
+class UnconfirmedPostmasterDelivery(Result):
+    """The postmaster owns delivery; retain the key and do not send again."""
+
+
+POSTMASTER_UNCONFIRMED = "postmaster delivery is unconfirmed; the message may already have arrived; do not resend it by hand"
+
+
 @dataclass(frozen=True)
 class NoClaudeRoute:
     pass
@@ -561,7 +602,7 @@ class NoClaudeRoute:
 @dataclass(frozen=True)
 class ClaudeRoute:
     via: Literal["postmaster", "relay", "queue"]
-    postmaster: Literal["delivered", "unresolved"] | postmaster.PostmasterMiss
+    postmaster: postmaster.PostmasterStatus
     seconds: float
 
 
@@ -799,6 +840,11 @@ def locked() -> Generator[None]:
         yield
 
 
+def write_key_states(states: KeyStates) -> None:
+    """Replace and sync the key records before their next external step."""
+    write_atomic(STATE / "keys.json", json.dumps(states, indent=2, sort_keys=True) + "\n")
+
+
 @contextmanager
 def key_states() -> Generator[KeyStates]:
     """The key states, under the lock, written back on exit when changed."""
@@ -811,7 +857,7 @@ def key_states() -> Generator[KeyStates]:
         before = json.dumps(states, sort_keys=True)
         yield states
         if json.dumps(states, sort_keys=True) != before:
-            write_atomic(path, json.dumps(states, indent=2, sort_keys=True) + "\n")
+            write_key_states(states)
 
 
 def queue_path(key: str) -> Path:
@@ -1278,6 +1324,202 @@ def pending_deliveries(state: KeyState) -> dict[str, PendingDelivery]:
             for recipient, mark in state.get("pending", {}).items()}
 
 
+def release_postmaster_claim(state: KeyState, recipient: str, pending: PendingDelivery) -> None:
+    """Remove the reservation without removing an older accepted timestamp."""
+    _ = state.get("pending", {}).pop(recipient, None)
+    if state["last"].get(recipient) == pending["started"]:
+        if "accepted_before" in pending:
+            state["last"][recipient] = pending["accepted_before"]
+        else:
+            _ = state["last"].pop(recipient, None)
+
+
+class RepeatUnconfirmed(RepeatPending):
+    """Publication can have happened even when its evidence no longer exists."""
+
+
+def resolve_postmaster_claim(states: KeyStates, key: str, recipient: str,
+                             reservation: PostmasterReservation,
+                             outcome: Literal["delivered", "queued", "failed", "expired", "withdrawn"]) -> ResolvedPostmaster:
+    """Persist the definite result before completing or releasing the reservation."""
+    resolved = ResolvedPostmaster(stage="resolved", entry_id=reservation["entry_id"],
+        owner_pid=reservation["owner_pid"], owner_start=reservation["owner_start"], outcome=outcome)
+    marker = pending_deliveries(states[key])[recipient]
+    marker["postmaster"] = resolved
+    write_key_states(states)
+    return resolved
+
+
+def postmaster_claim(states: KeyStates, key: str, recipient: str) -> ClaimGranted | RepeatAccepted | RepeatPending:
+    """Advance only from the saved stage or a definite receipt."""
+    state = states.get(key, {"last": {}})
+    pending = pending_deliveries(state).get(recipient)
+    if pending is None:
+        return ClaimGranted()
+    if "postmaster" not in pending:
+        return ClaimGranted()
+    reservation = pending["postmaster"]
+    if reservation["stage"] == "reserved":
+        if _owner_released(reservation):
+            release_postmaster_claim(state, recipient, pending)
+            return ClaimGranted()
+        return RepeatPending(POSTMASTER_UNCONFIRMED)
+    if reservation["stage"] == "relaying":
+        return (RepeatUnconfirmed(POSTMASTER_UNCONFIRMED) if _owner_released(reservation)
+                else RepeatPending(POSTMASTER_UNCONFIRMED))
+    if reservation["stage"] == "publishing":
+        receipt = postmaster.receipt(STATE, reservation["entry_id"])
+        if isinstance(receipt, postmaster.ResultPending):
+            if postmaster.unpublished(STATE, reservation["entry_id"]):
+                return RepeatUnconfirmed(POSTMASTER_UNCONFIRMED)
+            return RepeatPending(POSTMASTER_UNCONFIRMED)
+        if receipt["outcome"] == "abandoned":
+            return RepeatPending(POSTMASTER_UNCONFIRMED)
+        reservation = resolve_postmaster_claim(states, key, recipient, reservation, receipt["outcome"])
+    if reservation["outcome"] in ("delivered", "queued"):
+        state["last"][recipient] = pending["started"]
+        detail = "delivery" if reservation["outcome"] == "delivered" else "queue acceptance"
+        return RepeatAccepted(f"postmaster confirmed {detail} of entry {reservation['entry_id']}")
+    release_postmaster_claim(state, recipient, pending)
+    return ClaimGranted()
+
+
+def reserve_postmaster_claim(message: Message, at: datetime, limit: float, entry_id: str = "") -> ClaimGranted | RepeatAccepted | RepeatPending:
+    """Persist the reserved stage before any publication work."""
+    if message.key is None:
+        return ClaimGranted()
+    with key_states() as states:
+        state = states.get(message.key, {"last": {}})
+        result = postmaster_claim(states, message.key, message.to)
+        if isinstance(result, ClaimGranted) and entry_id:
+            owner = process_start.process_start(os.getpid())
+            if not isinstance(owner, process_start.Started):
+                return RepeatPending("postmaster owner lifetime is unknown; not yet accepted")
+            states[message.key] = state
+            previous = pending_deliveries(state).get(message.to)
+            if previous is not None and state["last"].get(message.to) == previous["started"]:
+                state["last"][message.to] = at.isoformat()
+            else:
+                _ = state["last"].setdefault(message.to, at.isoformat())
+            attempt = PendingDelivery(
+                started=at.isoformat(), limit_seconds=limit,
+                postmaster=ReservedPostmaster(stage="reserved", entry_id=entry_id,
+                                             owner_pid=os.getpid(), owner_start=owner.start))
+            if previous is not None and "accepted_before" in previous:
+                attempt["accepted_before"] = previous["accepted_before"]
+            state.setdefault("pending", {})[message.to] = attempt
+        return result
+
+
+def publish_postmaster_entry(message: Message, entry_id: str, source: Path, target: Path) -> bool:
+    """Persist publishing before exposing the entry through replacement."""
+    if message.key is None:
+        return postmaster.publish_entry(source, target)
+    with key_states() as states:
+        marker = pending_deliveries(states.get(message.key, {"last": {}})).get(message.to)
+        if marker is None or "postmaster" not in marker:
+            raise ValueError("a later send took the key before publication")
+        reservation = marker["postmaster"]
+        if reservation["entry_id"] != entry_id or not _owns_attempt(reservation):
+            raise ValueError("a later send took the key before publication")
+        marker["postmaster"] = PublishingPostmaster(stage="publishing", entry_id=entry_id,
+            owner_pid=reservation["owner_pid"], owner_start=reservation["owner_start"])
+    os.replace(source, target)
+    return True
+
+
+def cancel_unpublished_postmaster_claim(message: Message, entry_id: str) -> None:
+    """Only the reserved stage permits cancellation as unpublished."""
+    if message.key is None:
+        return
+    with key_states() as states:
+        state = states.get(message.key, {"last": {}})
+        marker = pending_deliveries(state).get(message.to)
+        if marker is not None and "postmaster" in marker:
+            reservation = marker["postmaster"]
+            if (reservation["entry_id"] == entry_id and reservation["stage"] == "reserved"
+                    and _owns_attempt(reservation)):
+                release_postmaster_claim(state, message.to, marker)
+
+
+def record_postmaster_result(message: Message, entry_id: str,
+                             delivery: postmaster.Delivered | postmaster.RelayRequired) -> None:
+    """Persist resolution before the postmaster client removes its receipt."""
+    if message.key is None:
+        return
+    with key_states() as states:
+        marker = pending_deliveries(states.get(message.key, {"last": {}})).get(message.to)
+        if marker is None or "postmaster" not in marker:
+            return
+        reservation = marker["postmaster"]
+        if (reservation["entry_id"] != entry_id or not _owns_attempt(reservation)
+                or reservation["stage"] in ("resolved", "relaying")):
+            return
+        if isinstance(delivery, postmaster.Delivered):
+            _ = resolve_postmaster_claim(states, message.key, message.to, reservation, "delivered")
+        elif reservation["stage"] == "publishing" and delivery.reason in ("failed", "expired", "unclaimed"):
+            _ = resolve_postmaster_claim(states, message.key, message.to, reservation,
+                "withdrawn" if delivery.reason == "unclaimed" else delivery.reason)
+
+
+def finish_postmaster_claim(message: Message, entry_id: str,
+                            delivery: postmaster.Delivered | postmaster.RelayRequired, *, recipient: StableRecipient) -> bool:
+    """Keep fallback ownership under the registered session until delivery ends."""
+    if message.key is None:
+        return True
+    record_postmaster_result(message, entry_id, delivery)
+    with key_states() as states:
+        state = states.get(message.key, {"last": {}})
+        marker = pending_deliveries(state).get(message.to)
+        if marker is None or "postmaster" not in marker:
+            return False
+        reservation = marker["postmaster"]
+        if reservation["entry_id"] != entry_id or not _owns_attempt(reservation):
+            return False
+        if isinstance(delivery, postmaster.Delivered):
+            state["last"][message.to] = marker["started"]
+            previous = state["last"].get(recipient.value)
+            if previous is None or datetime.fromisoformat(previous) <= datetime.fromisoformat(marker["started"]):
+                state["last"][recipient.value] = marker["started"]
+            return True
+        if reservation["stage"] == "publishing":
+            return False
+        marker["postmaster"] = RelayingPostmaster(stage="relaying", entry_id=entry_id,
+            owner_pid=reservation["owner_pid"], owner_start=reservation["owner_start"])
+        return True
+
+
+def complete_postmaster_fallback(message: Message, recipient: StableRecipient, entry_id: str,
+                                 at: datetime, result: Result) -> bool:
+    """Resolve a definite relay result before releasing its durable ownership."""
+    if message.key is None:
+        return True
+    with key_states() as states:
+        state = states.get(message.key, {"last": {}})
+        marker = pending_deliveries(state).get(message.to)
+        if marker is None or "postmaster" not in marker:
+            return False
+        reservation = marker["postmaster"]
+        if (reservation["stage"] != "relaying" or reservation["entry_id"] != entry_id
+                or not _owns_attempt(reservation) or result.outcome not in ("sent", "queued", "failed")):
+            return False
+        outcome: Literal["delivered", "queued", "failed"] = (
+            "delivered" if result.outcome == "sent" else "queued" if result.outcome == "queued" else "failed")
+        _ = resolve_postmaster_claim(states, message.key, message.to, reservation, outcome)
+        later = state["last"].get(recipient.value)
+        if result.outcome in ("sent", "queued"):
+            state["last"][message.to] = marker["started"]
+            newer = later is not None and datetime.fromisoformat(later) > at
+            if not newer:
+                state["last"][recipient.value] = marker["started"]
+            write_key_states(states)
+            _ = state.get("pending", {}).pop(message.to, None)
+            return not newer
+        else:
+            release_postmaster_claim(state, message.to, marker)
+        return True
+
+
 def _owner_released(record: Mapping[str, object]) -> bool:
     """Reclaim only a gone process or a confirmed replacement."""
     pid = record.get("owner_pid")
@@ -1291,7 +1533,7 @@ def _owner_released(record: Mapping[str, object]) -> bool:
 
 
 
-def _owns_attempt(record: PendingDelivery) -> bool:
+def _owns_attempt(record: Mapping[str, object]) -> bool:
     """Only the original live process can complete its owned attempt."""
     if "owner_pid" not in record:
         return True
@@ -1311,7 +1553,7 @@ def _finish_clearing(state: KeyState) -> None:
 
 def claim(message: Message, recipient: StableRecipient, repeat: timedelta | None, at: datetime, *,
           delivery_limit: float,
-          legacy_aliases: tuple[str, ...] = (), live: bool = False,
+          legacy_aliases: tuple[str, ...] = (), live: bool = False, postmaster_recipient: str = "",
           clears_when: str = "", posted_on: str = "", emergency: bool = False) -> ClaimGranted | RepeatAccepted | RepeatPending:
     """Check acceptance before recording an attempt under the stable recipient.
 
@@ -1324,6 +1566,10 @@ def claim(message: Message, recipient: StableRecipient, repeat: timedelta | None
     with key_states() as states:
         state: KeyState = states.get(message.key, {"last": {}})
         _finish_clearing(state)
+        for alias in (postmaster_recipient, recipient.value, *legacy_aliases):
+            recorded = postmaster_claim(states, message.key, alias)
+            if not isinstance(recorded, ClaimGranted):
+                return recorded
         if "acknowledged" in state:
             return RepeatAccepted(acknowledged_skip_reason(message.key, state["acknowledged"]))
         pending = pending_deliveries(state)
@@ -1358,6 +1604,11 @@ def claim(message: Message, recipient: StableRecipient, repeat: timedelta | None
             minutes = repeat.total_seconds() / 60
             return RepeatAccepted(f"key {message.key!r} last sent to {recipient.value} at {last}, inside its {minutes:g}-minute window")
         attempt = PendingDelivery(started=at.isoformat(), limit_seconds=delivery_limit)
+        accepted_before = state["last"].get(recipient.value)
+        previous = pending.get(recipient.value)
+        if (recipient.value == postmaster_recipient and accepted_before is not None
+                and (previous is None or previous["started"] != accepted_before)):
+            attempt["accepted_before"] = accepted_before
         if emergency:
             owner = process_start.process_start(os.getpid())
             if not isinstance(owner, process_start.Started):
@@ -1436,7 +1687,10 @@ def forget_sent(key: str, to: str, at: datetime | None = None) -> None:
         owned = pending_deliveries(state).get(to)
         if at is not None and owned is not None and not _owns_attempt(owned):
             return
-        del state["last"][to]
+        if at is not None and owned is not None and "accepted_before" in owned:
+            state["last"][to] = owned["accepted_before"]
+        else:
+            del state["last"][to]
         if "pending" in state and (at is None or (owned is not None and owned["started"] == at.isoformat())):
             _ = state["pending"].pop(to, None)
             if not state["pending"]:
@@ -3058,10 +3312,15 @@ def _send(options: Options, *, membership: staff.StaffSnapshot) -> Result:
         usage_error(member.reason)
     if isinstance(member, NoStaffRecipient) and destination != options.to:
         member = resolve_staff_recipient(destination, membership, records=records, observed=observed.entries)
-    stable = StableRecipient(options.recipient_identity.name if isinstance(options.recipient_identity, LogicalRecipientIdentity)
-                             else f"staff:{member.id}" if isinstance(member, staff.StaffRow) else options.to)
     registered = sessions.addressed(destination, records)
-    legacy_aliases = (destination,)
+    stable = StableRecipient(options.recipient_identity.name if isinstance(options.recipient_identity, LogicalRecipientIdentity)
+                             else f"staff:{member.id}" if isinstance(member, staff.StaffRow)
+                             else f"session:{registered['sessionId']}" if registered is not None and options.to.startswith("uds:")
+                             else options.to)
+    attempt_recipient = (StableRecipient(f"session:{registered['sessionId']}")
+                         if registered is not None and isinstance(member, NoStaffRecipient)
+                         else stable)
+    legacy_aliases = (destination, stable.value)
     if registered is not None:
         legacy_aliases += (f"session:{registered['sessionId']}", f"uds:{registered['messagingSocketPath']}")
     sender = options.sender or default_sender()
@@ -3089,20 +3348,26 @@ def _send(options: Options, *, membership: staff.StaffSnapshot) -> Result:
     held = None if refused else wrong_template(options, "\n".join((summary, text, action_text)))
     cold_check = options.clears_when if options.text_id == "github.keys_cold" else ""
     identity = replace(message, to=stable.value)
-    if isinstance(options.recipient_identity, LogicalRecipientIdentity) and not emergency:
+    postmaster_identity = replace(identity, to=f"session:{registered['sessionId']}") if registered is not None else identity
+    recorded = reserve_postmaster_claim(postmaster_identity, started, options.timeout)
+    if not isinstance(recorded, ClaimGranted):
+        claim_result = recorded
+    elif isinstance(options.recipient_identity, LogicalRecipientIdentity) and not emergency:
         skip = None if refused or held is not None else confirmed_skip(identity, window, started, live=live)
+        if skip is None and not refused and held is None and postmaster_identity.to != identity.to:
+            skip = confirmed_skip(postmaster_identity, window, started, live=live)
         claim_result = RepeatAccepted(skip) if skip is not None else ClaimGranted()
     else:
         claim_result = ClaimGranted() if refused or held is not None else claim(
-            message, stable, window, started, delivery_limit=send_budget.seconds(options.timeout) if emergency else options.timeout,
-            legacy_aliases=legacy_aliases, live=live, clears_when=options.clears_when if emergency else cold_check,
+            message, attempt_recipient, window, started, delivery_limit=send_budget.seconds(options.timeout) if emergency else options.timeout,
+            legacy_aliases=legacy_aliases, live=live, postmaster_recipient=postmaster_identity.to, clears_when=options.clears_when if emergency else cold_check,
             emergency=emergency,
             posted_on=options.scope.host if isinstance(options.scope, NamedMachine) else machine())
     log_route: Route = NO_CLAUDE_ROUTE
     guarded = repeat_guard.Decision()
     if not refused and held is None and isinstance(claim_result, ClaimGranted) and not isinstance(route, (RecipientLookupFailed, RemoteDelivery)):
         guarded = repeat_guard.check(STATE / "repeats", repeat_guard.Attempt(
-            sender, stable.value,
+            sender, attempt_recipient.value,
             text, machine(), started.timestamp(), options.human or sender.casefold() == USER or options.to == USER))
     if refused:
         result = Result("refused", NO_CLEAR_STEP)
@@ -3110,6 +3375,8 @@ def _send(options: Options, *, membership: staff.StaffSnapshot) -> Result:
         result = Result("held", held)
     elif isinstance(claim_result, RepeatAccepted):
         result = Result("skipped", claim_result.reason)
+    elif isinstance(claim_result, RepeatUnconfirmed):
+        result = UnconfirmedPostmasterDelivery("failed", claim_result.reason)
     elif isinstance(claim_result, RepeatPending):
         result = Result("pending", claim_result.reason)
     elif guarded.held:
@@ -3150,7 +3417,7 @@ def _send(options: Options, *, membership: staff.StaffSnapshot) -> Result:
                 if message.to.startswith("uds:") and recipient is None:
                     return Result("failed", f"{relayed_result.detail}; {dead_socket_reason(message.to)}")
                 queued = replace(message, to=f"session:{recipient['sessionId']}") if recipient is not None else message
-                enqueue(queued, relayed_result.detail, started, recipient=stable, order=order)
+                enqueue(queued, relayed_result.detail, started, recipient=attempt_recipient, order=order)
                 if recipient is None:
                     return Result("queued", f"{relayed_result.detail}; no live session answers to {message.to},"
                                   + " so it is kept under that name")
@@ -3162,7 +3429,7 @@ def _send(options: Options, *, membership: staff.StaffSnapshot) -> Result:
                 "queued",
                 f"no live session answers to {plan.address}, so it is kept under that name",
             )
-            enqueue(message, result.detail, started, recipient=stable, order=order)
+            enqueue(message, result.detail, started, recipient=attempt_recipient, order=order)
             log_route = ClaudeRoute("queue", "unresolved", time.monotonic() - claude_started)
         else:
             live = sessions.live_sessions()
@@ -3172,37 +3439,76 @@ def _send(options: Options, *, membership: staff.StaffSnapshot) -> Result:
                 else postmaster.RegisteredClaudeRecipient(registered)
             )
             if isinstance(postmaster_recipient, postmaster.RegisteredClaudeRecipient):
+                postmaster_identity = replace(identity, to=f"session:{postmaster_recipient.session['sessionId']}")
                 entry_id = postmaster.new_entry_id()
-                delivery = postmaster.attempt(STATE, postmaster_recipient.session, message.sender, entry_id,
-                                              delivered_text(message, entry_id), live)
-                if isinstance(delivery, postmaster.Delivered):
-                    result = Result("sent", f"postmaster; {'verbatim' if delivery.verbatim else 'NOT VERBATIM'}; "
-                                    + f"session:{postmaster_recipient.session['sessionId']}")
-                    log_route = ClaudeRoute("postmaster", "delivered", time.monotonic() - claude_started)
+                try:
+                    reservation = reserve_postmaster_claim(postmaster_identity, started, options.timeout, entry_id)
+                except BaseException:
+                    cancel_unpublished_postmaster_claim(postmaster_identity, entry_id)
+                    raise
+                if not isinstance(reservation, ClaimGranted):
+                    claim_result = reservation
+                    result = (UnconfirmedPostmasterDelivery("failed", reservation.reason)
+                              if isinstance(reservation, RepeatUnconfirmed)
+                              else Result("skipped" if isinstance(reservation, RepeatAccepted) else "pending", reservation.reason))
                 else:
-                    result = relay_and_queue(plan.message, max(1.0, options.timeout - delivery.seconds))
-                    log_route = ClaudeRoute("relay", delivery.reason, time.monotonic() - claude_started)
+                    try:
+                        if key is not None and identity.to != postmaster_identity.to:
+                            forget_sent(key, identity.to, started)
+                        delivery = postmaster.attempt(STATE, postmaster_recipient.session, message.sender, entry_id,
+                                                      delivered_text(message, entry_id), live,
+                                                      deadline=claude_started + options.timeout,
+                                                      publish=partial(publish_postmaster_entry, postmaster_identity, entry_id),
+                                                      resolve=partial(record_postmaster_result, postmaster_identity, entry_id))
+                    except BaseException:
+                        cancel_unpublished_postmaster_claim(postmaster_identity, entry_id)
+                        raise
+                    if isinstance(delivery, postmaster.Delivered):
+                        _ = finish_postmaster_claim(postmaster_identity, entry_id, delivery, recipient=stable)
+                        result = Result("sent", f"postmaster; {'verbatim' if delivery.verbatim else 'NOT VERBATIM'}; "
+                                        + f"session:{postmaster_recipient.session['sessionId']}")
+                        if key is not None:
+                            result = RecordedDeliveryAcceptance(*result)
+                        log_route = ClaudeRoute("postmaster", "delivered", time.monotonic() - claude_started)
+                    elif isinstance(delivery, postmaster.DeliveryUnconfirmed):
+                        result = UnconfirmedPostmasterDelivery("failed", POSTMASTER_UNCONFIRMED)
+                        log_route = ClaudeRoute("postmaster", "claimed-no-result", time.monotonic() - claude_started)
+                    else:
+                        if finish_postmaster_claim(postmaster_identity, entry_id, delivery, recipient=stable):
+                            result = relay_and_queue(plan.message, max(1.0, options.timeout - delivery.seconds))
+                            if not complete_postmaster_fallback(postmaster_identity, stable, entry_id, started, result):
+                                claim_result = RepeatPending("a later send took the key")
+                            elif key is not None and result.outcome in ("sent", "queued"):
+                                result = RecordedDeliveryAcceptance(*result)
+                            log_route = ClaudeRoute("relay", delivery.reason, time.monotonic() - claude_started)
+                        else:
+                            reason = "a later send took the key; no relay or queued copy was started"
+                            claim_result = RepeatPending(reason)
+                            result = Result("failed", reason)
             else:
                 result = relay_and_queue(plan.message, options.timeout)
                 log_route = ClaudeRoute("relay", "unresolved", time.monotonic() - claude_started)
     if result.outcome == "sent" and message.key is not None:
-        _ = remove_queued_key(message.to, message.key, recipient=stable, order=order)
+        _ = remove_queued_key(message.to, message.key, recipient=attempt_recipient, order=order)
         if options.to != message.to:
-            _ = remove_queued_key(options.to, message.key, recipient=stable, order=order)
+            _ = remove_queued_key(options.to, message.key, recipient=attempt_recipient, order=order)
     if isinstance(options.recipient_identity, LogicalRecipientIdentity) and not emergency:
         if (not refused and held is None and isinstance(claim_result, ClaimGranted)
+                and not isinstance(result, RecordedDeliveryAcceptance)
                 and result.outcome in {"sent", "queued", "kept", "replaced", "skipped"}):
             record_acceptance(identity, started)
     else:
         # An undelivered emergency releases its claim for a later attempt.
         # Other queued or kept messages retain their claims until delivery.
         if (key is not None and not refused and held is None and isinstance(claim_result, ClaimGranted)
+                and not isinstance(result, UnconfirmedPostmasterDelivery)
                 and ((emergency and result.outcome != "sent")
                      or result.outcome in {"failed", "refused", "held", "pending"})):
-            forget_sent(key, stable.value, started)
+            forget_sent(key, attempt_recipient.value, started)
         elif (key is not None and not refused and held is None and isinstance(claim_result, ClaimGranted)
+              and not isinstance(result, RecordedDeliveryAcceptance)
               and result.outcome in {"sent", "queued", "kept", "replaced", "skipped"}):
-            accept_sent(key, stable.value, started, delivered=result.outcome == "sent")
+            accept_sent(key, attempt_recipient.value, started, delivered=result.outcome == "sent")
     if message.to == USER and (result.outcome == "failed" or (result.outcome == "held" and isinstance(result.failure, FailedPush))):
         result = user_failure(message, options.action, result, options.need, options.text_id)
     if not options.no_accounting:

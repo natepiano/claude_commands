@@ -80,7 +80,7 @@ class WorkerResumeTests(unittest.TestCase):
         def running(identity: str, pane: str, *, kind: str = "claude"
                     ) -> stop_resume.ClaudeUp | sessions.SessionNotLive:
             self.assertEqual((identity, kind), (opened.row.current_session, "claude"))
-            return (stop_resume.ClaudeUp(identity, pane, "claude") if opened.pane in world.foreground else
+            return (stop_resume.ClaudeUp(identity, pane, "claude") if pane in world.foreground else
                     sessions.SessionNotLive())
 
         with (patch.object(stop_resume, "running_on_account", side_effect=running) as proof,
@@ -89,9 +89,10 @@ class WorkerResumeTests(unittest.TestCase):
             result = stop_resume.resume(str(opened.row.id))
         self.assertIsInstance(result, stop_resume.ClaudeUp)
         assert isinstance(result, stop_resume.ClaudeUp)
-        self.assertEqual((result.session_id, result.pane_id), (opened.row.current_session, opened.pane))
+        self.assertEqual(result.session_id, opened.row.current_session)
+        self.assertNotEqual(result.pane_id, opened.pane)
         self.assertEqual(result.start_state, ClaudeStartState.STARTED)
-        self.assertEqual(proof.call_args.args, (opened.row.current_session, opened.pane))
+        self.assertEqual(proof.call_args.args, (opened.row.current_session, result.pane_id))
 
 
 @final
@@ -145,6 +146,8 @@ class StopResumeTests(unittest.TestCase):
                              current_session=staff.StaffId("native-worker"))
         before = worker_panes.OpenWorker(row, "pane", "terminal", herdr.AgentStatus.WORKING)
         for pane, terminal, activity, conversation, success in (
+                ("", "", herdr.PaneAtShell(), herdr.StoppedConversation(), True),
+                ("", "", herdr.PaneAtShell(), herdr.LiveConversation("claude", (123,)), False),
                 ("pane", "terminal", herdr.PaneAtShell(), herdr.StoppedConversation(), True),
                 ("other-pane", "terminal", herdr.PaneAtShell(), herdr.StoppedConversation(), False),
                 ("pane", "other-terminal", herdr.PaneAtShell(), herdr.StoppedConversation(), False),
@@ -154,7 +157,7 @@ class StopResumeTests(unittest.TestCase):
                   patch.object(staff, "initial_snapshot", return_value=staff.StaffSnapshot((row,))),
                   patch.object(staff, "snapshot", return_value=staff.StaffSnapshot((row,))),
                   patch.object(worker_panes, "observe", side_effect=[[before], [worker_panes.ClosedWorker(row)]]),
-                  patch.object(self.client, "panes", return_value=[{"pane_id": pane, "terminal_id": terminal}]),
+                  patch.object(self.client, "panes", return_value=[{"pane_id": pane, "terminal_id": terminal}] if pane else []),
                   patch.object(self.client, "tab_sessions", return_value=[]),
                   patch.object(self.client, "pane_activity", return_value=activity),
                   patch.object(herdr, "read_conversation", return_value=conversation),

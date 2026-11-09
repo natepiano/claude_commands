@@ -1,1 +1,1 @@
-  1 builds            queue-unit        merge-gate    36              pid 1005 ███████▋ 7.6 ↑ pressure
+  1 builds            queue-unit        merge gate    36              pid 1005 ███████▋ 7.6 ↑ pressure
