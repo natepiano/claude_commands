@@ -331,7 +331,13 @@ A red nightly marker bypasses reuse only in a merge gate.
 An added or removed test folder changes the ledger suite set and prevents reuse of a pass with another suite set.
 
 **Affected modules for targeted tests** (`scripts/production/affected_modules.py`).
-The base is the newest full record on this host with the complete suite set and a commit that is an ancestor of `HEAD`.
+The certified base is the newest full record on this host with the complete suite set and an ancestor of `HEAD`.
+Other candidates are the merge bases of `HEAD` and the origin refs in `landing_branches` in `config/merge_gate.conf`.
+These branches hold commits that passed a merge gate, which runs all modules.
+The selector uses the candidate with the fewest changed paths to `HEAD`.
+A tie keeps the certified base first, then the branch order in the config.
+The selector ignores missing refs and refs without a common ancestor.
+A landing candidate can replace a missing certified base.
 The changed set includes changes from the base to `HEAD`, plus dirty paths.
 A static Python graph selects a test module under four rules:
 
@@ -348,7 +354,7 @@ The cache holds imports and complete path tokens for each test-module blob.
 The current and base graphs share one cache read and one cache update.
 A warm selection reads base blobs only when the cache lacks their facts.
 Dirty sources never enter the cache or cause cache writes.
-A targeted test runs all modules only for `--full`, no certified base, or a graph error.
+A targeted test runs all modules only for `--full`, no base candidate, or a graph error.
 The nightly-red marker widens only a merge gate. It does not block targeted test reuse or selection.
 A targeted test leaves the marker in place, including after `--full`.
 `--full` bypasses reuse in both modes. The marker bypasses reuse only in a merge gate.

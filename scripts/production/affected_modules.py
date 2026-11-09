@@ -19,6 +19,7 @@ import sys
 import tempfile
 from typing import cast
 
+from scripts.lib import conf
 from scripts.production.gate_modules import is_test_module
 from scripts.style.git_process import GitBlob, parse_status_z, parse_tree_listing, read_batch_blob
 
@@ -340,10 +341,25 @@ def select_affected(repo: Path, base: CertifiedBase | NoCertifiedBase,
                     modules: Sequence[Path], dirty: set[str], *,
                     state_dir: Path | None = None) -> AffectedSelection | FullSuite:
     try:
-        if isinstance(base, NoCertifiedBase):
+        candidates = {base.commit: base} if isinstance(base, CertifiedBase) else {}
+        for branch in conf.read("merge_gate").words("landing_branches"):
+            ancestor = subprocess.run(["git", "-C", str(repo), "merge-base", "HEAD",
+                                       f"refs/remotes/origin/{branch}"],
+                                      capture_output=True, text=True, check=False)
+            if ancestor.returncode:
+                continue
+            commit = ancestor.stdout.strip()
+            if commit not in candidates:
+                at = git_output(repo, "show", "-s", "--format=%cI", commit).strip()
+                candidates[commit] = CertifiedBase(commit, at)
+        if not candidates:
             return FullSuite("no certified base")
-        changes = git_output(repo, "diff", "--name-only", "-z", "--no-renames", base.commit, "HEAD")
-        changed = (set(changes.split("\0")) - {""}) | dirty
+        differences: list[tuple[CertifiedBase, set[str]]] = []
+        for candidate in candidates.values():
+            changes = git_output(repo, "diff", "--name-only", "-z", "--no-renames", candidate.commit, "HEAD")
+            differences.append((candidate, set(changes.split("\0")) - {""}))
+        base, committed_changes = min(differences, key=lambda item: len(item[1]))
+        changed = committed_changes | dirty
         paths, blobs = worktree_files(repo, dirty)
         cache_path = state_dir / "affected-module-facts.json" if state_dir is not None else None
         cached = read_fact_cache(cache_path) if cache_path is not None else {}

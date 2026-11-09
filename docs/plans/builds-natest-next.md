@@ -28,6 +28,11 @@ Waiting: `style/test_style_sync.py`, 66.6 CPU s, starts after the style unit's m
 
 ## Items to consider
 
+- [ ] **Shared test setup costs are measured across a whole gate before the next speed phase is picked.**
+  - Target: `scripts/build_queue/admission_test_support.py` and the shared verify fixture modules.
+  - Why needed: `caller_admission()` starts a private server for each fixture, and shared verify cleanup reads process environments across `/proc`. A one-module order misses a cost split over many callers.
+  - Completion condition: admission setup, admission cleanup, seed copies and process cleanup are measured apart from production commands, and each cost is summed across its callers and compared with the highest eligible module.
+  - Revealed by: Phase 110 architect review. Showrunner answer: next (2026-11-09).
 - [ ] **No test fails at cleanup because Git tidies a test repository in the background.**
   - Target: `scripts/test_times/module_run.py` and the gate test environment: set `maintenance.auto false` for every test process (for example through `GIT_CONFIG_COUNT`), not fixture by fixture.
   - Why needed: Phase 81 proved that `git commit` starts a detached `git maintenance run --auto`, and its repack writes into `.git` during `TemporaryDirectory` cleanup. `ImmutableGitSeed.create`, `CargoProjectTests`, `LifecycleFixture` and `MergeGateFixture` still commit in temporary repositories without stopping it.
