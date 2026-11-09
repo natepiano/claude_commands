@@ -1374,37 +1374,27 @@ Moved from builds-resources Phase 27 (builds showrunner, 2026-10-31): one owner 
 
 ### Phase 23 — Detached Python runs have their own group and count in Other  · status: done
 
-**Depends on:** none. The detached runs live in `scripts/agents/detached_runs.py` and `config/detached_runs.conf`. Source: user, 2026-11-06.
+#### As-built
 
-#### Work Order
-
-**Goal:** A detached Python run stays outside the build queue and shows under Other on the memory page. A cargo or lint step inside a detached run still asks the queue and counts as a build.
-
-**Spec:**
-
-1. **User rulings.** "i think the workers detached python tests will almost never be that heavyh weight so it's good that they don't count against the build queue". "yes detached python tests should show under other along with the memory taken by all the agent sessions, browsers, editors, etc." The user approved the group name `builds-detached.slice` on 2026-11-06.
-2. **The group.** The detached run starts in `builds-detached.slice`, a child of `builds.slice`, at the `--slice=builds.slice` argument in `detached_runs.py`. The limits of `builds.slice` still hold it.
-3. **Reader.** The scope reader `unowned_slice_memory` in `memory_admit.py` treats the child group as part of the one builds total, and it makes no row for that group. A reserved cargo step inside it counts once, as a build.
-4. **Page.** `scripts/build_queue/memory_feed.py` makes no row for the group. Its memory reads as Other.
-5. **Trace rule.** Remove only the rule that shows a detached process group as a run because its processes trace to a live run. Keep the service's registered run identity (`admission_service.py:910`), the held-run rows (`queue_view.py:272`) and the card that a person selects by owner (`queue_card.py:217`).
-6. **Proof.** Tests: a Python process in the group reads as Other and has no row; a reserved cargo descendant counts once; a cargo and a lint step inside a detached `verify.sh` ask the queue; a held run keeps its row.
+- `scripts/agents/detached_runs.py` starts each detached run with `--slice=builds-detached.slice`. The dash nests the group under `builds.slice`, so the memory limit and CPU weight of the parent hold it.
+- `unowned_slice_memory` in `memory_admit.py` skips the child group. The memory feed takes build memory from reservation rows, so a detached Python run has no row and counts in Other. A reserved cargo step in the group counts once, as a build.
+- The memory page labels a stray process in `builds.slice` "unowned processes".
+- `scope_activity.py` does not treat a detached run supervisor as a build. The registered run identity, the held-run rows and the card selected by owner stay.
+- `scripts/build_hold/cargo` and `build_hold.py` exclude the nested path. A cargo call in the group takes the hold check and starts a new build scope.
 
 **Files:**
-- `scripts/agents/detached_runs.py`
-- `scripts/agents/test_detached_runs.py`
-- `scripts/lint/memory_admit.py`
-- `scripts/lint/test_memory_admit.py`
-- `scripts/build_queue/memory_feed.py`
-- `scripts/build_queue/test_memory_feed.py`
-- `scripts/build_queue/scope_activity.py`
-- `scripts/build_queue/test_queue_view.py`
-- `docs/as-built/build-memory-admission.md`
+- `scripts/agents/detached_runs.py` — starts detached runs in their group
+- `scripts/lint/memory_admit.py` — `unowned_slice_memory` skips the group
+- `scripts/build_queue/memory_feed.py` — stray-process row label
+- `scripts/build_queue/scope_activity.py` — row detection
+- `scripts/build_hold/cargo`, `scripts/build_hold/build_hold.py` — exclude the nested path
+- `docs/as-built/build-memory-admission.md` — slice table and wrapper paragraph
 
-**Workers:** `1 writer + 1 tester` — `impl` owns the launcher line, the reader and the feed; `test` owns their tests.
+**Binds later work:** a check that means "this process is an admitted build" excludes `/builds.slice/builds-detached.slice/`.
 
-**Gate:** the merge gate, and `basedpyright` 0/0/0 on each changed file and each caller module.
+**Gotchas:** a dash in a slice name nests it. A substring match on `/builds.slice/` also matches the nested path. `scripts/lint/invoke.sh` always starts its own scope and reads no cgroup path.
 
-**Change-Review:** Detached Python runs count in Other | On natedev, open the memory page while a worker's detached Python tests run | The runs show no row, and Other holds their memory.
+**Ruled out:** a row for detached runs in the queue view.
 
 ### Phase 20d — A queue row names the project of its step  · status: done
 
@@ -1431,26 +1421,29 @@ Moved from builds-resources Phase 27 (builds showrunner, 2026-10-31): one owner 
 2. **Source.** Item 2 of the phase 114 follow-up proposals: separate the queue boundary interface from admission imports that ordinary style commands do not use. The next measurement targets are `queue_place` and `admission_records`.
 3. **Order of work.** Measure a disposable prototype first. 18.7 CPU seconds is a ceiling, not a gain. Keep the change only if the measured gain is real; otherwise close the phase with the measurement.
 4. **Coordination.** The style side goes through devtools. The Work Order follows at phase start.
+5. **Code version and type identity (architect review of 23, 2026-11-09).** An import of `queue_place` loads `admission_records` and `memory_admit` today. `ADMISSION_CODE_PATHS` in `scripts/build_queue/admission_code.py` lists files by hand, so a module that the change extracts must join that list, or the admission code version misses it. Types that cross the wire and snapshot boundaries keep one identity. Tests: a changed extracted module changes the version, and a snapshot round trip gives the same types.
 
 ### Phase 10f — The queue names every build folder it makes and deletes it when its work ends  · status: todo
-**Depends on:** none (checkpoint A is on main; checkpoint B changes `scripts/lib/build_folders.py`, the `tmp_sweep` call and `scripts/mac_test/linux_runner.py`). 18c also changes `linux_runner.py`, and 10g changes the offload path. The second to land resolves; the director names the merge owner before the work runs in parallel (architect review of 18, 2026-11-06).
+**Depends on:** none (checkpoint A is on main; checkpoint B changes `scripts/lib/build_folders.py`, the `tmp_sweep` call and `scripts/mac_test/linux_runner.py`). 10g changes the offload path. The second to land resolves; the director names the merge owner before the work runs in parallel (architect review of 18, 2026-11-06). 18c is complete.
 **Why.** The user, 2026-11-03, via the builds showrunner: "our build-queue is supposed to handle making sure we name things and delete them when they are completed". The naming map is a design call that the builds showrunner settles. The showrunner approved it on 2026-11-03 (map and rulings: the 10f design in the unit's phase folder), with one change: a remote mirror ends when its copies.py remote lease from verify P35 ends.
 
 **Scope (showrunner limits, 2026-11-03).** 10f does not change the callers that verify P18 moves to copies.py (merge_gate, bump_gate, fast_track, waiting, the style runs, rust_release). Its sweep never touches copies.py standing checkouts. Two checkpoints:
 1. A: `build_folder_path` is the one name rule; `build_folders.py run --owner O --name N -- CMD` makes a folder, runs CMD in it and deletes it when CMD and its descendants end; `scratch.target` uses the name rule; the scratch guard refuses a clone under a unit or session tmp root and names the command.
 2. B: `build_folders.py sweep` removes a marked folder only when its owner is gone (pid, start time, boot id; a read error keeps it); `tmp_sweep` calls it; one writer makes each removal record below, also for `linux_runner` floor and trim.
 
+**Markers and descendants (architect review of 23, 2026-11-09).** Only `run_build()` writes `OWNER_MARKER` today. The context-managed folders from Phase 37 write none, so the Work Order names each marker producer. A folder stays while a surviving descendant of the dead owner still uses it. Tests: owner death with a live child keeps the folder; unreadable ownership keeps the folder; a standing copy and a folder under an active remote lease are never removed.
+
 **Progress (2026-11-04):** checkpoint A is on main, with the test fixes for a `CONF_DIR` that lacks `build_folders.conf` (`build_folders._settings` then reads the repository file) and config read at use in `tmp_sweep`, `style_sync` and `folder_audit`. Checkpoint B is open.
 
-**Removal record (aws-unit ask via the builds showrunner, 2026-11-03):** each folder removal writes one record with: time, target, host, repository key, slot, folder path, bytes freed, free GiB before and after, and the reason: `floor`, `trim`, or `owner-ended` for a folder that the sweep removes after its owner is gone (architect review of 10q, 2026-11-05). Source today: `scripts/mac_test/linux_runner.py:775-788` removes or trims a slot build folder after each step and prints only `mac_cleanup=0|1|kept` (`offload.py:797` parses it); no record names the folder or the bytes freed. aws-unit's weekly report (cold steps after a floor removal, time lost) reads this record. Test: an owner-ended removal writes one record with reason `owner-ended`, and a standing copy is never removed.
+**Removal record (aws-unit ask via the builds showrunner, 2026-11-03):** each folder removal writes one record with: time, target, host, repository key, slot, folder path, bytes freed, free GiB before and after, and the reason: `floor`, `trim`, or `owner-ended` for a folder that the sweep removes after its owner is gone (architect review of 10q, 2026-11-05). Source today: `scripts/mac_test/linux_runner.py` removes or trims a slot build folder after each step and prints only `mac_cleanup=<result>` (line 839; `offload.py:934` parses it); no record names the folder or the bytes freed. aws-unit's weekly report (cold steps after a floor removal, time lost) reads this record. Test: an owner-ended removal writes one record with reason `owner-ended`, and a standing copy is never removed. One record contract: the floor sweep already records removals through `record_sweep_removal()` (`scripts/lint/sweep.py`) and `record.sweep_trim()` (`scripts/buildlog/record.py`). Extend or reuse that path, including an interrupted write; add no separate journal (architect review of 23, 2026-11-09).
 
 **Workers (checkpoint B):** `1 writer + 1 tester` — `impl` owns `scripts/lib/build_folders.py` (sweep and the record writer), the `tmp_sweep` call and the `linux_runner.py` record call (aws-unit reads the record: name it in the notice); `test` owns `scripts/lib/test_build_folders.py`, the `tmp_sweep` tests and the `linux_runner` record tests. B keeps the standing-copy exclusion and the remote-lease ownership.
 
 ### Phase 10g — The queue decides where every step runs  · status: todo
-**Depends on:** verify-unit's Phase 27 hotfix on builds (the Work Order follows it), 10z and 10x (it changes the admission request and the queue service).
+**Depends on:** 10z and 10x (it changes the admission request and the queue service). verify-unit's Phase 27 hotfix is on builds (`a153ef36a`).
 **Why.** The user, 2026-11-03: "should verify be handling this or should the build queue be handling what goes where - why is verify involved?" Showrunner ruling (builds, 2026-11-03): the queue owns placement; one owner decides where every step runs. Today `verify.sh` picks the host once at start and the queue admits memory only on natedev; at 14:04-14:17 a disk decline sent two hana tests to natedev and nothing sent them back to the free Mac.
 
-**Outline (the Work Order follows at phase start, after verify's Phase 27 hotfix lands):**
+**Outline (the Work Order follows at phase start).** Today's routing already has temporary declines, step eligibility, pins and cloud reservations (`verify.sh`, `build_targets.py`, `admission_service.py`). This phase moves those mechanisms behind one owner and keeps their policies.
 1. A step's admission request carries its eligible hosts (natedev, the Mac, SSH slots) and each host's exclusion reason.
 2. The queue service places each step on the first host that is free for it, and decides again on every pass while the step waits (Mac free, Mac disk over the floor, slot free).
 3. `verify.sh` and the offload path run the step where the queue says; they make no host choice.
@@ -1461,6 +1454,8 @@ Moved from builds-resources Phase 27 (builds showrunner, 2026-10-31): one owner 
 8. **Machine column (Phase 24).** `/build:queue` (`queue_view.py`, `queue_card.py`) and the memory page feed read one `scripts.buildlog.store.host_name()` for every running row. When a step runs on another host, the service reply carries that host on its row, and both views show it in the Machine column. Tests: a running row placed on the Mac shows the Mac's name in the view, the card and the page.
 9. **Host-scoped run identity (architect review of 18, 2026-11-06).** Two hosts can give the same pid and start time; `running_builds()` groups runs by `run_owner(pid, start_time)` today. One named run identity carries the host through placement, sampling, grouping and release. Test: a mixed-host fixture with the same pid and start time on two hosts keeps two runs, with separate accounting and the right Machine labels.
 10. **Workers:** `impl` and `test` for the queue; adapter owners verify-unit (verify.sh routing and offload), aws-unit (target selection) and sdlc (lifecycle callers), agreed at phase start.
+11. **Remote probes stay out of the service loop (architect review of 23, 2026-11-09).** The service must answer within one second. Host evidence arrives asynchronously, with explicit unavailable and stale states, as `OperatingSystemReader` does in `admission_service.py`. Test: a delayed remote probe leaves view, release and local admission requests responsive.
+12. **Submitting owner and remote execution are separate identities (architect review of 23, 2026-11-09).** `wire.Owner` names a local caller, and `_watch_owner()` opens its local pidfd. A host on the run identity does not say which identity controls caller death, remote sampling and release. Define distinct semantic identities. Test: a remote pid cannot bind a local owner watch.
 
 ### Phase 10p — The snapshot client accepts records from an older or a newer admission service  · status: done
 
