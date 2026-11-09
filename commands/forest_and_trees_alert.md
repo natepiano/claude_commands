@@ -45,7 +45,7 @@ Call `ListAgents` once.
 </DiscoverRecipients>
 
 <SendAlerts>
-Send one `SendMessage` per recipient. Independent sends go in the same tool block.
+Send one `SendMessage` per recipient. Independent sends go in the same tool block. A `Remote Control` row is on another machine: send with `send.py --machine <other machine> --to <name> --from "<your session name>" --text "<message>"` (/message) and report its outcome line.
 
 Use `summary`: `forest-and-trees alert to <name>`.
 

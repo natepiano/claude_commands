@@ -70,8 +70,8 @@ class FindingsLedgerFixture(unittest.TestCase):
     @override
     def setUp(self) -> None:
         self.enterContext(patch.dict(os.environ, {"UNIT_SYNC_WRITES": "0"}))
-        _ = shutil.copytree(self.fixture_snapshot, self.fixture_root)
         self.addCleanup(shutil.rmtree, self.fixture_root)
+        _ = shutil.copytree(self.fixture_snapshot, self.fixture_root)
         self.root = self.fixture_root
         self.session_dir = self.root / "session"
         self.history_file = self.root / "history" / "run.jsonl"

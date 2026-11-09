@@ -216,8 +216,8 @@ class VerifyHoldTools(VerifyMacOffloadFixture):
     def setUp(self) -> None:
         self.cleanup_failures = ()
         self.root: Path = self.fixture_root
-        _ = shutil.copytree(self.fixture_seed, self.root, symlinks=True)
         self.addCleanup(shutil.rmtree, self.root)
+        _ = shutil.copytree(self.fixture_seed, self.root, symlinks=True)
         self.addCleanup(self.assert_nothing_outlives)
         self.home: Path = self.root / "home"
         self.bin_directory: Path = self.root / "bin"
@@ -264,13 +264,13 @@ class VerifyHoldWaitFixture(unittest.TestCase):
     @classmethod
     @override
     def setUpClass(cls) -> None:
-        VerifyHoldTools.setUpClass()
         cls.addClassCleanup(VerifyHoldTools.doClassCleanups)
+        VerifyHoldTools.setUpClass()
 
     @override
     def setUp(self) -> None:
-        self.fixture.setUp()
         self.addCleanup(self.fixture_cleanups)
+        self.fixture.setUp()
         root = self.fixture.root
         pressure = root / "memory-pressure"
         write_pressure_reading(pressure)

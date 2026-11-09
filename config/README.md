@@ -272,9 +272,10 @@ The on-demand command and the future timer use `sweep.py --floor-only --host mac
 
 ## aws_target.conf
 
-This file defines the disabled AWS SSH target. `offload=off` prevents work.
-The active target list remains `targets=mac,natedev` in `build_targets.conf`.
-The user completes deployment before target activation.
+This file defines the AWS SSH builder target.
+`offload=off` disables builder routing and controller actions unless the external activation record overrides it.
+`build_targets.conf` lists the active SSH targets.
+Cloud gates use `cloud_gate.conf` and `gate-deployment.json`; they do not depend on `offload`.
 
 `host=aws-build` names the Tailscale SSH host. `region` selects the AWS region.
 The controller reads the instance ID from `deployment.json`.
@@ -283,17 +284,42 @@ The controller reads the instance ID from `deployment.json`.
 A build or final uses AWS only when a flag pins the command.
 An empty `ci_repo` disables GitHub calls.
 
-`monthly_limit_usd=400` is the user's monthly spending limit (approved 2026-11-01). `daily_limit_usd=20` is derived (the monthly limit / 20); the user approved it on 2026-11-03.
+`monthly_limit_usd` and `daily_limit_usd` are the user's spending limits. `aws_target.conf` holds each value on one line.
 The AWS Budget must read `monthly_limit_usd`. Code must never raise either limit.
-The spending reserve is $3. The maximum drain time is 60 minutes.
+The spending reserve and maximum drain time come from `limit_reserve_usd` and `drain_max_minutes`.
 Each repository budget stays within the 32 GiB build budget.
 The fixed and hourly costs are estimates from the design's queue replay.
+
+Cloud gates use `~/.claude/config/aws_target.conf` for the account money check, regardless of the checkout's `CONF_DIR`.
+The route passes this path to the installed worker through `--settings`.
+The worker uses this path for billing reads and ledger reservations.
+The ledger guard also accepts this explicit path.
+`AWS_TARGET_CONFIG` supplies an explicit account config path for fixtures.
+Tests can also pass their own file through `--settings` or the `GateWorker` constructor.
+Reports use the same account config path for money calculations.
+The older builder's SSH eligibility guard retains its target settings.
+
+The installed account file supplies these settings:
+
+- Limits: `daily_limit_usd`, `monthly_limit_usd`, `limit_reserve_usd`, `limit_action`, and `accounting_zone`.
+- Estimates: `fallback_usd_per_hour`, `fixed_usd_per_month`, `retained_storage_usd_per_month`, `root_storage_usd_per_month`, and `ipv4_usd_per_month`.
+- Other estimates: `gp3_iops_usd_per_month`, `gp3_throughput_usd_per_month`, `instance_type`, `spot_max_usd_per_hour`, and `box_minimum_seconds`.
+- Evidence: `price_refresh_seconds`, `price_max_age_seconds`, `observation_max_age_seconds`, `cost_explorer_interval_seconds`, `cost_explorer_lookback_days`, and `cost_explorer_read_usd`.
+- Notices: `notification_recipient`, `notification_timeout_s`, and `notification_retry_s`.
+- AWS access and tags: `credentials_profile`, `region`, `cost_explorer_tag_key`, and `cost_explorer_tag_value`.
+
+The checkout retains its source, module selection, build settings, and settings from `cloud_gate.conf`.
+These include `instance_types`, `clone_url`, `lifetime_minutes`, `module_time_limit_s`, `spot_max_usd_per_hour`, and `attempt_allowance_usd`.
+They also include `log_push_s`, `result_poll_s`, `launch_reply_tries`, `api_timeout_s`, `termination_timeout_s`, and `credential_file`.
+The gate records its own bid and allowance in each reservation.
+The installed account limits decide whether that reservation fits.
 
 The spending guard requires usable live spending settings through `ConfigRead.origin`.
 A missing or malformed live limit refuses spending, even when committed history supplies a usable value.
 `daily_limit_usd` and `monthly_limit_usd` include `limit_reserve_usd` when the guard compares costs.
 Equality refuses deployment, starts and new admission. `limit_action=drain` rejects new work.
-`offload=off` leaves ordinary builds outside accounting and performs no AWS call.
+`offload=off` disables ordinary builder accounting and controller AWS calls when no external activation record overrides it.
+Cloud gates still read account charges and enforce the spending caps.
 
 `accounting_zone` selects day and month boundaries, including clock changes.
 `price_refresh_seconds=3600` bounds reads from the injected price source.
@@ -301,20 +327,50 @@ Equality refuses deployment, starts and new admission. `limit_action=drain` reje
 `observation_max_age_seconds=300` bounds instance state evidence for admission.
 Gaps past this age incur running costs at the fallback price.
 Stale latest evidence refuses admission.
-`cost_explorer_interval_seconds=86400` schedules reconciliation reads.
-`cost_explorer_read_usd=0.01` reserves each scheduled read's cost.
+`cost_explorer_interval_seconds=86400` schedules account billing reads.
+`cost_explorer_lookback_days=7` refreshes the last seven completed UTC days.
+This window captures delayed charges and later changes from AWS.
+`cost_explorer_read_usd=0.01` prices each API page.
 
-The controller reads the previous UTC day's actual charges when the daily read is due.
-Cost Explorer receives date-only UTC bounds. The ledger reconciles the reply against those same bounds.
-Accounting days can overlap these UTC periods.
-`cost_explorer_tag_key=BuildTarget` and `cost_explorer_tag_value=aws-build` select the AWS resource charges.
-The resource deployment must apply this tag to every charged resource.
-Reports and target status read local evidence. They make no AWS call and create no coordination file.
-The controller saves each successful reply in `charges/<day>.json` before reconciliation.
-A retry reads the saved reply and does not repeat the successful query.
-The ledger adds only the reconciliation difference through its existing accounting rule.
-The report shows the actual charge and query cost separately.
-The scheduled query cost already belongs to the estimate. Reconciliation does not add it again.
+Both the controller and the gate worker use one Cost Explorer reader.
+It requests daily `UnblendedCost` and `UsageQuantity` for the account, grouped by `USAGE_TYPE`, and reads every page.
+It excludes `Credit` and `Refund` records, so the amounts show usage before credits.
+It uses no tag filter and needs no tag activation or deployment change.
+`cost_explorer_tag_key=BuildTarget` and `cost_explorer_tag_value=aws-build` still supply the deployment tags.
+The reader saves each day's account total, usage costs, usage quantities, units, provisional flag, and read time in `charges/<day>.json`.
+The saved `excludes_credits` mark identifies usage bills.
+A later scheduled read replaces those values, including zero amounts.
+An old saved format requires an immediate read, regardless of the previous schedule.
+An empty daily reply is an error for both callers.
+The gate cap uses the account amount for each completed UTC day whose bill rounds to at least one cent.
+For an unbilled day, each box uses the newest positive billed Spot rate for its instance type.
+The rate equals the type's daily Spot cost divided by its daily Spot hours.
+The newest day for one type can differ from the newest day for another type.
+A type without a positive billed Spot rate uses its saved `spot_max_usd_per_hour` bid.
+The cap records each box's instance type, applied rate, and rate source.
+`box_minimum_seconds` applies the minimum once per box, including boxes that cross UTC midnight.
+The older builder's complete running intervals receive the same minimum before the code allocates their cost across days.
+The cap reserves open boxes through their expiry and prices finished boxes through their recorded termination.
+The cap replaces each attempt's flat allowance with the newest billed day's non-Spot cost, once per UTC day.
+Bills remain UTC records.
+The daily and monthly cap windows use `accounting_zone`.
+The cap allocates timed compute costs and daily bill amounts to those windows.
+Daily usage also sums spend intervals within the local day bounds, including query fees.
+When no bill exists, the cap retains the configured attempt allowances and resource costs.
+The cap reads the daily limit, monthly limit, and reserve from `aws_target.conf`.
+The ledger adds each Cost Explorer page fee once.
+Existing boxes use their saved start and end times and the instance types in `cloud-gate-launches.jsonl`.
+A box without a saved instance type retains its bid rate.
+No migration is required.
+Reports use the saved AWS bill and label provisional days.
+Reports show today's spend, daily limit, successful launch count, and spend groups with amounts and percentage shares.
+Historical reports omit today's estimated spend.
+The groups are gate compute at 32 CPU, compute at 16 CPU, storage, public IPv4, data transfer, and other.
+Compute at 16 CPU includes gates and the older builder.
+Unbilled days use the label `estimated from the newest bill` when a bill exists.
+Spot compute includes the older Spot builder when it uses the same instance type.
+The cost for each run is a daily allocation: Spot compute divided by successful launches of that type in UTC.
+Reports read local evidence without an AWS call or a coordination file.
 `go-live.json` records the first permitted running observation for the wait comparison.
 
 `### AWS` reports uptime, steps, estimated queue wait saved, cost, and cost per saved hour.
@@ -352,6 +408,20 @@ Replacement uses its saved `DataVolumeId`. Configuration contains no instance or
 Run `scripts/lib/py scripts/aws_target/deploy.py up --approve-resources` to complete the price, bootstrap, stacks, and scaler-key stages.
 The command records stage results and times in `up.json` beside `deployment.json`.
 It checks live state before each stage. It always refreshes the price.
+To inspect builder removal, run `scripts/lib/py scripts/aws_target/deploy.py remove-builder`.
+To remove the builder, run `scripts/lib/py scripts/aws_target/deploy.py remove-builder --approve-destroy`.
+The command disables builder routing and `aws-target.service`, removes its Tailscale device, and removes its compute resources.
+It deletes the retained data volume after the stack update. The `/home` build cache is lost.
+It keeps the stack, Budget, scaler credentials, every gate resource, and `gate-deployment.json`.
+The command preserves spending history and resolves builder observations, pending compute requests, and resource inventory.
+A saved `builder-removal.json` identity supports a repeat after a partial removal.
+Current instance and volume identities take priority over the receipt.
+Removal uses the live CloudFormation template and changes only the builder role, profile, and security group conditions to `Compute`.
+It preserves live gate definitions that differ from the repository template.
+The repository template has the same three conditions for later gate deployment.
+`down --approve-destroy` removes the whole stack, including the gate resources, then deletes the retained volume and Budget.
+It is not the builder-only removal command.
+No removal command changes a tracked configuration value.
 Separate `price`, `bootstrap`, `prepare`, `apply`, and `setup-start` commands remain available.
 The command reads the current Spot price for the configured instance type and zone through `deployment_profile`.
 It writes the price and its read time atomically with mode `0600`.
@@ -376,6 +446,9 @@ The corresponding component keys state each monthly estimate.
 The guard uses the greater of the total and the component sum.
 A priced resource inventory can increase that estimate before deployment.
 Stopped instances continue to incur fixed costs.
+After confirmed builder removal, an inventory with `builder_removed=true` stops applying the builder's configured fixed-cost floor.
+The remaining inventory still prices gate resources.
+A confirmed terminated builder does not accrue later estimated compute costs.
 
 The target directory stores `cost-ledger.json` and `cost-ledger.lock`.
 The ledger retains observations, prices, inventories, reconciliations, decisions and limit events.

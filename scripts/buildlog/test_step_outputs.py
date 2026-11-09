@@ -34,15 +34,13 @@ def output_row(worktree: RecordedRoot, target_directory: RecordedRoot, build_dir
 
 @final
 class RecordedOutputRootsTests(unittest.TestCase):
-    def __init__(self, methodName: str = "runTest") -> None:
-        super().__init__(methodName)
-        self.directory = tempfile.TemporaryDirectory()
-        self.root = Path(self.directory.name).resolve()
-        self.index = self.root / "steps?#.sqlite"
+    root: Path = Path()
+    index: Path = Path()
 
     @override
     def setUp(self) -> None:
-        self.addCleanup(self.directory.cleanup)
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
+        self.index = self.root / "steps?#.sqlite"
         create_step_index(self.index)
 
     def rows(self) -> tuple[RecordedStepOutput, ...]:

@@ -33,7 +33,7 @@ from scripts.production.production_doc import Production, Refusal, production_fi
 from scripts.production.checkpoint_gate import Stop, report
 from scripts.production.merge_checkpoint import (
     PromotionAlreadyAtTip, PromotionOriginPushed, PromotionNotPushed,
-    git, good, merged_checkpoints, promote_local_checkout, pull_mac_checkout,
+    branch_is_landed, git, good, merged_checkpoints, promote_local_checkout, pull_mac_checkout,
 )
 from scripts.production import production_doc
 from scripts.production.update_registration import QuestionStaff, RegistrationFailure, judgment_state
@@ -585,8 +585,7 @@ def wrap(production: Production, lines: list[str], no_ci: bool,
             else:
                 report("worktree", "ok", f"{unit.name} already retired")
                 continue
-            if git(production.checkout, "merge-base", "--is-ancestor", branch_ref,
-                   production.merge_branch).returncode:
+            if not branch_is_landed(production.checkout, branch_ref, production.merge_branch):
                 raise LifecycleStop("worktree", "held", f"{unit.name} branch {unit.branch} is not merged")
             report("worktree", "ok", f"{unit.name} clean and merged")
         _ = checked(production.checkout, "push", "push", "origin", production.merge_branch)
@@ -611,7 +610,10 @@ def wrap(production: Production, lines: list[str], no_ci: bool,
         _ = staff.set_worktree(unit.member.id, staff.RemovedWorktree(local_machine(), unit.worktree),
                                expected=unit.member.worktree)
         if git(production.checkout, "show-ref", "--verify", "--quiet", f"refs/heads/{unit.branch}").returncode == 0:
-            _ = checked(production.checkout, "retire", "branch", "-d", unit.branch)
+            if not branch_is_landed(production.checkout, unit.branch, production.merge_branch):
+                raise LifecycleStop("retire", "held", f"{unit.branch} has work absent from {production.merge_branch}")
+            # The preparation check also accepts equal patches after a cherry-pick.
+            _ = checked(production.checkout, "retire", "branch", "-D", unit.branch)
             report("retire", "ok", f"deleted local {unit.branch}")
         remote = git(production.checkout, "ls-remote", "--exit-code", "--heads", "origin", unit.branch)
         if remote.returncode == 0:
