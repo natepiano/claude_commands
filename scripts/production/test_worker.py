@@ -45,12 +45,15 @@ class DispatchAgent:
     def __init__(self, fixture: pane_fixtures.WorkerPaneTests) -> None:
         self.fixture = fixture
         self.submitted: list[tuple[str, str]] = []
+        self.members: dict[str, staff.StaffId] = {}
         self.replies: list[str] = []
         self.questions: dict[str, str | herdr.HerdrFailure] = {}
         self.answers: list[tuple[str, str]] = []
         self.answer_inputs: dict[str, str] = {}
         self.answer_enters: dict[str, int] = {}
         self.waited: list[str] = []
+        self.start_waits: list[tuple[str, list[str]]] = []
+        self.start_wait_times_out = True
         self.finish_after = 0
         self.wait_count = 0
         self.final = "The work is complete."
@@ -63,9 +66,13 @@ class DispatchAgent:
         self.run_process = cast(Callable[..., subprocess.CompletedProcess[str]], subprocess.run)
 
     def row(self, pane: str) -> staff.StaffRow:
-        pid = self.fixture.world.foreground[pane][0]
-        identity = self.fixture.world.processes[pid].current_identity
-        row = staff.snapshot().by_current_session(identity)
+        record = staff.snapshot()
+        if pane in self.fixture.world.foreground:
+            pid = self.fixture.world.foreground[pane][0]
+            identity = self.fixture.world.processes[pid].current_identity
+            row = record.by_current_session(identity)
+        else:
+            row = record.by_id(self.members[pane])
         assert row is not None
         return row
 
@@ -79,6 +86,7 @@ class DispatchAgent:
                      if isinstance(backend, staff.CodexBackend) else sessions.transcript_locations(process.current_identity))
             path = max(paths, key=lambda source: source.stat().st_mtime)
         else:
+            self.members[pane] = row.id
             backend = staff.backend(row)
             assert isinstance(backend, (staff.ClaudeBackend, staff.CodexBackend))
             if isinstance(backend, staff.ClaudeBackend) and not sessions.transcript_locations(row.current_session):
@@ -178,9 +186,17 @@ class DispatchAgent:
     def run(self, args: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
         if args[0] != "/nonexistent/herdr":
             return self.run_process(args, **kwargs)
+        action, pane = args[4:6]
+        if action == "wait" and "--until" in args:
+            self.start_waits.append((pane, args[6:]))
+            if self.start_wait_times_out:
+                return subprocess.CompletedProcess(args, 1, json.dumps({
+                    "error": {"code": "timeout", "message": "the worker did not start"}}), "")
+            self.error = ""
+            self.fixture.world.locations[pane]["agent_status"] = "working"
+            return subprocess.CompletedProcess(args, 0, "{}", "")
         self.fixture.assertNotIn("--timeout", args)
         self.fixture.assertNotIn("--until", args)
-        action, pane = args[4:6]
         if action == "prompt":
             line = args[6]
             self.fixture.assertEqual(args[-1], "--wait")
@@ -190,7 +206,7 @@ class DispatchAgent:
             if self.interrupt == "prompt":
                 self.interrupt = ""
                 raise OSError("interrupted after prompt")
-            self.fixture.world.locations[pane]["agent_status"] = "working"
+            self.fixture.world.locations[pane]["agent_status"] = "idle" if self.error == "agent_prompt_stalled" else "working"
             if self.finish_after == 0 and not self.error:
                 self.complete(pane)
         elif action == "wait":
@@ -215,6 +231,7 @@ class PaneCommandRouter:
         self.cwd = Path()
         self.commands: list[list[str]] = []
         self.worker_commands: list[list[str]] = []
+        self.recorder_commands: list[list[str]] = []
         self.run_process = cast(Callable[..., subprocess.CompletedProcess[str]], subprocess.run)
 
     def setup(self, case: unittest.TestCase, cwd: Path) -> None:
@@ -236,6 +253,7 @@ class PaneCommandRouter:
             self.worker_commands.append(arguments.copy())
             result = invoke_cli(worker, lambda: worker.main(arguments), arguments, environment, cwd)
         elif path == root / "scripts/direct/progress_history.py":
+            self.recorder_commands.append(arguments.copy())
             result = invoke_recorder(arguments, environment, cwd)
         else:
             return self.run_process(command, **options)
@@ -266,7 +284,8 @@ class WorkerCommandTests(unittest.TestCase):
         self.addCleanup(self.fixture.doCleanups)
         config = self.fixture.root / "conf/direct.conf"
         atomic_file.write_text_atomic(config, config.read_text().replace("WORKER_TRANSPORT=mesh", "WORKER_TRANSPORT=herdr")
-                                      + "# range: 1..600\nWORKER_SETTLE_SECONDS=30\n")
+                                      + "# range: 1..600\nWORKER_SETTLE_SECONDS=30\n"
+                                      + "# range: 1..600\nWORKER_PROMPT_START_SECONDS=60\n")
         self.agent = DispatchAgent(self.fixture)
         self.agent.pane_commands(self)
         self.run_dir = self.fixture.root / "run"
@@ -300,6 +319,24 @@ class WorkerCommandTests(unittest.TestCase):
         return worker.dispatch(self.fixture.parent.id, staff.WorkerName.parse(name), role, self.prompt, dispatch_id,
             session_dir=self.run_dir, slot="impl", phase="8", kind=role,
             launcher_command=["assign.sh", "--phase", "8", "--prompt", str(self.prompt)], reply=self.reply)
+
+    def unfinished_turn(self, role: staff.WorkerRole = "impl") -> None:
+        """Prepare a submitted reply before the launcher completes its pass."""
+        self.agent.interrupt = "prompt"
+        with self.assertRaisesRegex(OSError, "interrupted after prompt"):
+            _ = self.dispatch(role=role)
+        pane = self.agent.submitted[-1][0]
+        self.agent.complete(pane)
+        atomic_file.write_text_atomic(self.reply, self.agent.replies[-1] + "\n")
+
+    def assert_pass_completed(self, previous: bytes) -> None:
+        before = cast(dict[str, dict[str, dict[str, object]]], json.loads(previous))["pass"]["impl"]
+        after = cast(dict[str, dict[str, dict[str, object]]],
+                     json.loads((self.run_dir / "progress_history_state.json").read_text()))["pass"]["impl"]
+        changed = {"status", "finished_at"}
+        self.assertEqual({key: value for key, value in after.items() if key not in changed},
+                         {key: value for key, value in before.items() if key not in changed})
+        self.assertEqual(after["status"], "completed")
 
     def command(self, *args: str) -> tuple[int, str, str]:
         with redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as errors:
@@ -519,6 +556,7 @@ class WorkerCommandTests(unittest.TestCase):
             self.fixture.world.unknown[pane] = reason
         self.fixture.world.process_reads.clear()
         self.fixture.world.reads.clear()
+        panes_before = set(self.fixture.world.locations)
         self.agent.finish_after = 1
         with redirect_stderr(io.StringIO()) as errors:
             code = worker.assign(self.fixture.parent.id, "impl", self.prompt, session_dir=self.run_dir,
@@ -526,11 +564,12 @@ class WorkerCommandTests(unittest.TestCase):
         self.assertEqual(code, worker.ExitCode.OK, errors.getvalue())
         self.assertEqual(len(self.agent.submitted), 1)
         self.assertIn(self.agent.final, self.reply.read_text())
-        self.assertEqual(set(self.fixture.world.process_reads), set(self.fixture.world.locations))
+        self.assertEqual(set(self.fixture.world.process_reads), panes_before)
         self.assertIn(("agent", "list"), self.fixture.world.reads)
         self.assertIn("agent argv is unavailable", errors.getvalue())
         for row in closed:
             self.assertNotIn(f"anomaly: {row.name}:", errors.getvalue())
+        opened = self.opened("impl4")
         self.fixture.world.unknown[opened.pane] = "selected pane evidence is unavailable"
         for label in ("impl4", "unit-impl4"):
             with self.subTest(label=label), redirect_stderr(io.StringIO()) as errors:
@@ -561,33 +600,20 @@ class WorkerCommandTests(unittest.TestCase):
         self.assertEqual(len(self.fixture.world.launches), launches + 1)
         self.assertEqual(self.agent.row("w2:p7"), foreign)
 
-    def test_named_assign_resumes_while_its_codex_rollout_opens(self) -> None:
+    def test_named_assign_resumes_with_its_reported_codex_thread(self) -> None:
         row = self.fixture.worker("impl", family="codex")
         self.fixture.world.add(row, "w1:p1", live=False)
         native_process = self.fixture.world.native_process
-        stat = Path.stat
-        metadata_reads = 0
         published: list[str] = []
-
-        def read_metadata(path: Path, *, follow_symlinks: bool = True) -> os.stat_result:
-            nonlocal metadata_reads
-            value = stat(path, follow_symlinks=follow_symlinks)
-            if path.name == "3" and path.parent.name == "fd":
-                metadata_reads += 1
-                if metadata_reads == 2:
-                    (path.parent / "4").symlink_to(os.readlink(path))
-                    published.append(str(row.current_session))
-            return value
 
         def read_process(pid: int, kind: str, reported: str = "") -> herdr.NativeAgentProcess:
             observed = native_process(pid, kind, reported)
-            if kind == "codex":
-                identity = herdr.codex_rollout_thread(pid)
-                return herdr.NativeAgentProcess(herdr.RolloutThread(identity), observed.started, observed.environment)
+            if kind == "codex" and observed.current_identity not in published:
+                published.append(observed.current_identity)
             return observed
 
         with (patch.object(herdr, "native_process", side_effect=read_process),
-              patch.object(Path, "stat", read_metadata), redirect_stderr(io.StringIO()) as errors):
+              redirect_stderr(io.StringIO()) as errors):
             code = worker.assign(self.fixture.parent.id, "impl", self.prompt, session_dir=self.run_dir,
                 slot="impl", phase="8", kind="impl", name="impl", launcher_command=["assign.sh"], reply=self.reply)
         self.assertEqual(code, worker.ExitCode.OK, errors.getvalue())
@@ -660,11 +686,30 @@ class WorkerCommandTests(unittest.TestCase):
         self.assertEqual(len(self.fixture.world.launches), before)
 
     def test_herdr_dispatch_records_the_worker_staff_id(self) -> None:
-        self.assertEqual(self.dispatch(), worker.ExitCode.OK)
-        pane = self.agent.submitted[0][0]
-        state = cast(dict[str, dict[str, dict[str, object]]],
-                     json.loads((self.run_dir / "progress_history_state.json").read_text()))
-        self.assertEqual(state["pass"]["impl"]["worker_id"], self.agent.row(pane).id)
+        for foreign_tab in (False, True):
+            with self.subTest(foreign_tab=foreign_tab):
+                opened = self.opened("foreign-tab" if foreign_tab else "impl")
+                def relocate(pane: str) -> None:
+                    if foreign_tab:
+                        self.fixture.world.locations[pane]["tab_id"] = "w1:t5"
+                self.agent.after_complete = relocate
+                before = self.fixture.staff_state()
+                with redirect_stderr(io.StringIO()) as errors:
+                    self.assertEqual(self.dispatch(opened.row.name), worker.ExitCode.OK)
+                state = cast(dict[str, dict[str, dict[str, object]]],
+                             json.loads((self.run_dir / "progress_history_state.json").read_text()))
+                self.assertEqual(state["pass"]["impl"]["worker_id"], opened.row.id)
+                self.assertEqual(state["pass"]["impl"]["status"], "completed")
+                self.assertEqual(self.fixture.staff_state(), before)
+                self.assertIn(self.agent.final, self.reply.read_text())
+                if foreign_tab:
+                    self.assertIn(opened.pane, self.fixture.world.locations)
+                    self.assertEqual(errors.getvalue(),
+                                     "anomaly: foreign-tab: worker pane is outside its parent's tabs\n")
+                else:
+                    self.assertIsInstance(self.fixture.observation(opened.row), worker_panes.ClosedWorker)
+                    self.assertNotIn(opened.pane, self.fixture.world.locations)
+                    self.assertEqual(errors.getvalue(), "")
 
     def test_fast_dispatch_writes_reply_without_changing_the_prompt(self) -> None:
         before = self.prompt.read_bytes(), self.prompt.stat().st_mtime_ns
@@ -674,6 +719,23 @@ class WorkerCommandTests(unittest.TestCase):
         self.assertIn("DONE ", self.reply.read_text())
         self.assertEqual((self.prompt.read_bytes(), self.prompt.stat().st_mtime_ns), before)
         self.assertNotIn("--until", self.agent.submitted[0][1])
+        for summary in ("", str(self.run_dir / "durable-reply.md")):
+            with self.subTest(durable_summary=summary):
+                name = "reviewer-default" if not summary else "reviewer-summary"
+                args = assign.Arguments(target="durable-design-role", parent=str(self.fixture.parent.id),
+                    to=name, policy="astra-reviewer", prompt=str(self.prompt), summary=summary,
+                    session_dir=str(self.run_dir), phase="8")
+                router = PaneCommandRouter()
+                with patch.object(subprocess, "run", side_effect=router.run):
+                    self.assertEqual(assign.execute_durable(args), 0)
+                pane = self.agent.submitted[-1][0]
+                row = self.agent.row(pane)
+                self.assertEqual(router.recorder_commands, [])
+                destination = Path(summary) if summary else self.prompt.with_name("prompt_reply.txt")
+                self.assertIn(self.agent.final, destination.read_text())
+                self.assertEqual(worker_panes.worker_pass(row, self.run_dir)["status"], "completed")
+                self.assertEqual(staff.snapshot().by_id(row.id), row)
+                self.assertNotIn(pane, self.fixture.world.locations)
 
     def test_long_dispatch_waits_without_submitting_again(self) -> None:
         self.agent.finish_after = 3
@@ -691,7 +753,7 @@ class WorkerCommandTests(unittest.TestCase):
         self.agent.finish_after = 1
         self.assertEqual(self.dispatch(), worker.ExitCode.OK)
         self.assertEqual(len(self.agent.submitted), 1)
-        self.assertEqual((self.run_dir / "progress_history_state.json").read_bytes(), state)
+        self.assert_pass_completed(state)
 
     def test_dispatch_rerun_after_done_restores_the_reply_once(self) -> None:
         write = atomic_file.write_text_atomic
@@ -824,7 +886,7 @@ class WorkerCommandTests(unittest.TestCase):
         self.assert_detached_dispatch(True, closed=True)
 
     def test_done_after_a_delivered_result_without_a_reply_returns_no_done_after_one_quiet_wait(self) -> None:
-        self.assertEqual(self.dispatch(), worker.ExitCode.OK)
+        self.unfinished_turn()
         pane, line = self.agent.submitted[-1]
         previous = self.reply.read_text()
         self.agent.append(pane, "user", "Detached run: private-check\nRun finished: private verification")
@@ -837,7 +899,7 @@ class WorkerCommandTests(unittest.TestCase):
         self.assertEqual(self.reply.read_text(), previous)
 
     def test_a_delivered_result_can_start_work_after_a_done_state_read(self) -> None:
-        self.assertEqual(self.dispatch(), worker.ExitCode.OK)
+        self.unfinished_turn()
         pane, line = self.agent.submitted[-1]
         self.agent.append(pane, "user", "Detached run: private-check\nRun finished: private verification")
         row = self.agent.row(pane)
@@ -873,7 +935,7 @@ class WorkerCommandTests(unittest.TestCase):
         self.assertIn("DONE ", self.reply.read_text())
 
     def test_a_file_change_starts_another_wait_before_no_done(self) -> None:
-        self.assertEqual(self.dispatch(), worker.ExitCode.OK)
+        self.unfinished_turn()
         pane, line = self.agent.submitted[-1]
         previous = self.reply.read_text()
         self.agent.append(pane, "user", "Detached run: first-check\nRun finished: first verification")
@@ -901,7 +963,7 @@ class WorkerCommandTests(unittest.TestCase):
         self.assertEqual(self.reply.read_text(), previous)
 
     def test_done_with_a_result_absent_from_the_transcript_completes_after_its_run_finishes(self) -> None:
-        self.assertEqual(self.dispatch(), worker.ExitCode.OK)
+        self.unfinished_turn()
         pane, line = self.agent.submitted[-1]
         previous = self.reply.read_text()
         row = self.agent.row(pane)
@@ -944,7 +1006,7 @@ class WorkerCommandTests(unittest.TestCase):
         self.assertEqual(self.reply.read_text(), previous)
 
     def test_a_reply_without_done_with_a_finished_run_absent_from_the_transcript_returns_no_done(self) -> None:
-        self.assertEqual(self.dispatch(), worker.ExitCode.OK)
+        self.unfinished_turn()
         pane, line = self.agent.submitted[-1]
         previous = self.reply.read_text()
         self.agent.without_done = True
@@ -964,7 +1026,7 @@ class WorkerCommandTests(unittest.TestCase):
         self.assertEqual(self.reply.read_text(), previous)
 
     def test_a_reply_after_the_state_read_completes_the_dispatch(self) -> None:
-        self.assertEqual(self.dispatch(), worker.ExitCode.OK)
+        self.unfinished_turn()
         pane, line = self.agent.submitted[-1]
         dispatch_id = line.split("DONE ")[-1].split(".")[0]
         self.agent.append(pane, "user", "Detached run: private-check\nRun finished: private verification")
@@ -995,7 +1057,7 @@ class WorkerCommandTests(unittest.TestCase):
         return directory / f"{run_id}.json", record
 
     def test_stage_two_accepts_a_run_result_delivered_during_stage_one(self) -> None:
-        self.assertEqual(self.dispatch(role="review"), worker.ExitCode.OK)
+        self.unfinished_turn("review")
         pane, line = self.agent.submitted[-1]
         row = self.agent.row(pane)
         dispatch_id = line.split("DONE ")[-1].split(".")[0]
@@ -1034,13 +1096,34 @@ class WorkerCommandTests(unittest.TestCase):
                 self.assertIsInstance(receipt, worker.DispatchWaitingForRuns if pending else worker.DispatchComplete)
 
     def test_stalled_dispatch_returns_stalled_and_never_retypes(self) -> None:
-        self.agent.error = "agent_prompt_stalled"
-        self.assertEqual(self.dispatch(), worker.ExitCode.STALLED)
-        self.assertEqual(len(self.agent.submitted), 1)
-        self.agent.error = ""
-        self.agent.finish_after = 1
-        self.assertEqual(self.dispatch(), worker.ExitCode.OK)
-        self.assertEqual(len(self.agent.submitted), 1)
+        config = self.fixture.root / "conf/direct.conf"
+        settings = config.read_text()
+        for times_out, seconds in ((True, 13), (False, 73)):
+            with self.subTest(times_out=times_out, seconds=seconds):
+                atomic_file.write_text_atomic(config, settings.replace("WORKER_PROMPT_START_SECONDS=60",
+                                                                      f"WORKER_PROMPT_START_SECONDS={seconds}"))
+                name = "timeout" if times_out else "delayed"
+                submitted = len(self.agent.submitted)
+                self.agent.error = "agent_prompt_stalled"
+                self.agent.start_wait_times_out = times_out
+                self.agent.finish_after = 1
+                with redirect_stderr(io.StringIO()) as errors:
+                    self.assertEqual(self.dispatch(name), worker.ExitCode.STALLED if times_out else worker.ExitCode.OK)
+                pane = self.agent.submitted[-1][0]
+                self.assertEqual(self.agent.start_waits[-1], (pane, ["--until", "working", "--until", "blocked",
+                    "--until", "done", "--timeout", str(seconds * 1000)]))
+                self.assertEqual(len(self.agent.submitted), submitted + 1)
+                if times_out:
+                    self.assertIn("the worker did not start", errors.getvalue())
+                    self.assertIn(pane, self.fixture.world.locations)
+                    self.agent.error = ""
+                    self.fixture.world.locations[pane]["agent_status"] = "working"
+                    self.assertEqual(self.dispatch(name), worker.ExitCode.OK)
+                    self.assertEqual(len(self.agent.submitted), submitted + 1)
+                else:
+                    self.assertEqual(errors.getvalue(), "")
+                self.assertIn(self.agent.final, self.reply.read_text())
+                self.assertNotIn(pane, self.fixture.world.locations)
 
     def test_blocked_dispatch_returns_blocked(self) -> None:
         opened = self.opened()
@@ -1057,6 +1140,8 @@ class WorkerCommandTests(unittest.TestCase):
                 expected = visible if isinstance(visible, str) else "anomaly: impl: pane read failed terminal unavailable\n"
                 self.assertEqual(errors.getvalue(), f"question: impl pane {opened.pane}\n" + expected)
                 self.assertEqual(len(self.agent.submitted), 0 if stage == "before" else 1)
+                self.assertIn(opened.pane, self.fixture.world.locations)
+                self.assertEqual(staff.snapshot().by_id(opened.row.id), opened.row)
         self.assertIn(("pane", "read", opened.pane, "--source", "recent", "--lines", "40"), self.fixture.world.commands)
 
     def test_answer_continues_a_blocked_dispatch_and_refuses_another_parents_worker(self) -> None:
@@ -1076,7 +1161,7 @@ class WorkerCommandTests(unittest.TestCase):
                     _ = self.fixture.world.locations[opened.pane].pop("agent_session", None)
                     pid = self.fixture.world.foreground[opened.pane][0]
                     process = self.fixture.world.processes[pid]
-                    self.fixture.world.processes[pid] = replace(process, identity=herdr.RolloutThread(opened.row.current_session))
+                    self.fixture.world.processes[pid] = replace(process, identity=herdr.UnreportedResume(opened.row.current_session))
                 self.assertEqual(self.command("answer", "impl", "--text", answer_text), (0, "done\n", ""))
                 self.assertEqual(len(self.agent.answers), index)
                 self.assertEqual(self.agent.answers[-1][0], opened.pane)
@@ -1093,7 +1178,7 @@ class WorkerCommandTests(unittest.TestCase):
         self.assertIn(self.agent.final, self.reply.read_text())
         assert isinstance(active, progress_history.ActiveDispatch)
         self.assertIn("DONE " + active.instance_id, self.reply.read_text())
-        self.assertEqual(progress_history.active_dispatch(opened.row.id, self.run_dir), active)
+        self.assertIsInstance(progress_history.active_dispatch(opened.row.id, self.run_dir), progress_history.NoActiveDispatch)
         other = fixture_member("unit", name="other-unit", parent=self.fixture.parent.parent)
         foreign = fixture_member("worker", name="foreign", parent=other.id)
         self.fixture.world.add(foreign, "w2:p7", workspace="w2", tab="w2:t2")
@@ -1194,14 +1279,14 @@ class WorkerCommandTests(unittest.TestCase):
                 submitted = len(self.agent.submitted)
                 self.assertEqual(self.dispatch(), worker.ExitCode.OK)
                 row = self.agent.row(self.agent.submitted[-1][0])
-                self.assertEqual(worker_panes.worker_pass(row, self.run_dir)["status"], "active")
+                self.assertEqual(worker_panes.worker_pass(row, self.run_dir)["status"], "completed")
                 launches = len(self.fixture.world.launches)
                 self.assertEqual(worker.assign(self.fixture.parent.id, "fix", self.prompt, session_dir=self.run_dir,
                     slot="impl", phase="8", kind="fix", name="impl", launcher_command=["assign.sh"], reply=self.reply,
                     fix_cause="Repair the reported dispatch failure"), worker.ExitCode.OK)
                 self.assertEqual(worker_panes.worker_pass(row, self.run_dir)["kind"], "fix")
                 self.assertEqual(len(self.agent.submitted), submitted + 2)
-                self.assertEqual(len(self.fixture.world.launches), launches + (effort == "low"))
+                self.assertEqual(len(self.fixture.world.launches), launches + 1)
 
     def test_restore_keeps_an_open_busy_worker_without_sending_a_launcher(self) -> None:
         opened = self.opened()
@@ -1236,14 +1321,32 @@ class WorkerCommandTests(unittest.TestCase):
         self.assertEqual(len(self.agent.submitted), 1)
         self.assertIsNotNone(staff.by_id(opened.row.id))
 
-    def test_torn_transcript_keeps_the_worker_without_delivery(self) -> None:
-        opened = self.opened()
-        backend = staff.backend(opened.row)
-        assert isinstance(backend, (staff.ClaudeBackend, staff.CodexBackend))
-        path = worker_admission.transcript_source(opened.row, backend)
-        atomic_file.write_text_atomic(path, '{"torn":')
-        self.assertEqual(self.dispatch(), worker.ExitCode.UNCERTAIN)
-        self.assertEqual(self.agent.submitted, [])
+    def test_transcript_failure_reports_whether_the_prompt_was_delivered(self) -> None:
+        for delivered in (False, True):
+            with self.subTest(delivered=delivered):
+                name = "impl2" if delivered else "impl"
+                opened = self.opened(name)
+                backend = staff.backend(opened.row)
+                assert isinstance(backend, (staff.ClaudeBackend, staff.CodexBackend))
+                path = worker_admission.transcript_source(opened.row, backend)
+
+                def tear_transcript() -> None:
+                    atomic_file.write_text_atomic(path, '{"torn":')
+
+                if delivered:
+                    self.agent.during_prompt = tear_transcript
+                    self.agent.finish_after = 1
+                else:
+                    tear_transcript()
+                with redirect_stderr(io.StringIO()) as errors:
+                    self.assertEqual(self.dispatch(name), worker.ExitCode.UNCERTAIN)
+                status = f"prompt delivered to pane {opened.pane}" if delivered else "no prompt sent"
+                self.assertEqual(errors.getvalue(),
+                    f"anomaly: {name}: worker transcript has incomplete records; {status}\n")
+                if delivered:
+                    self.assertEqual([submission[0] for submission in self.agent.submitted], [opened.pane])
+                else:
+                    self.assertEqual(self.agent.submitted, [])
 
     def test_older_incomplete_record_keeps_the_valid_completion_receipt(self) -> None:
         opened = self.opened()
@@ -1416,7 +1519,7 @@ class WorkerCommandTests(unittest.TestCase):
         self.assertEqual(code, worker.ExitCode.OK)
         self.assertEqual({row.name for row in staff.snapshot().find(kind="worker", parent=self.fixture.parent.id)},
                          {"impl", "fix", "review", "test"})
-        self.assertEqual(len(self.fixture.world.locations), splits)
+        self.assertEqual(len(self.fixture.world.locations), splits - 1)
         self.assertEqual(len(self.agent.submitted), 2)
 
     def test_named_json_add_reconciles_a_lost_acknowledgment(self) -> None:
@@ -1482,9 +1585,10 @@ class WorkerCommandTests(unittest.TestCase):
         self.assertEqual(len(self.agent.submitted), 1)
         self.assertEqual(self.agent.waited, [submitted_pane])
         self.assertNotEqual(submitted_pane, idle.pane)
+        expected_panes = {pane: location for pane, location in before[2].items() if pane != submitted_pane}
         self.assertEqual((self.fixture.staff_state(), len(self.fixture.world.launches),
-                          self.fixture.world.locations.copy()), before)
-        self.assertEqual((self.run_dir / "progress_history_state.json").read_bytes(), pass_state)
+                          self.fixture.world.locations.copy()), (before[0], before[1], expected_panes))
+        self.assert_pass_completed(pass_state)
         self.assertIn(self.agent.final, self.reply.read_text())
 
     def test_unnamed_retry_after_completion_returns_the_recorded_reply(self) -> None:
@@ -1494,11 +1598,9 @@ class WorkerCommandTests(unittest.TestCase):
         self.assertEqual(self.command(*args), (0, "done\n", ""))
         reply = self.reply.read_bytes()
         self.reply.unlink()
-        with patch.object(sys, "argv", ["progress_history.py", "finish-pass", "--session-dir", str(self.run_dir),
-                                       "--status", "completed"]):
-            progress_history.main()
         submitted_pane = self.agent.submitted[0][0]
-        self.fixture.world.locations[submitted_pane]["agent_status"] = "working"
+        row = self.agent.row(submitted_pane)
+        self.assertNotIn(submitted_pane, self.fixture.world.locations)
         _ = self.opened("impl2")
         before = self.fixture.staff_state(), len(self.fixture.world.launches), self.fixture.world.locations.copy()
         pass_state = (self.run_dir / "progress_history_state.json").read_bytes()
@@ -1506,8 +1608,9 @@ class WorkerCommandTests(unittest.TestCase):
         self.assertEqual(self.reply.read_bytes(), reply)
         self.assertEqual(len(self.agent.submitted), 1)
         self.assertEqual(self.agent.waited, [])
+        self.assertEqual(self.fixture.world.requests[-1][1][:2], ["resume", str(row.current_session)])
         self.assertEqual((self.fixture.staff_state(), len(self.fixture.world.launches),
-                          self.fixture.world.locations.copy()), before)
+                          self.fixture.world.locations.copy()), (before[0], before[1] + 1, before[2]))
         self.assertEqual((self.run_dir / "progress_history_state.json").read_bytes(), pass_state)
 
     def test_role_changes_read_completion_before_recording_the_new_pass(self) -> None:
@@ -1902,7 +2005,7 @@ class WorkerCommandTests(unittest.TestCase):
     def test_text_list_numbers_rows_and_keeps_the_worker_fields(self) -> None:
         self.assertEqual(self.command("list"), (0, "", ""))
         self.assertEqual(self.dispatch("impl01"), worker.ExitCode.OK)
-        self.assertEqual(self.command("list"), (0, "1 impl01 impl OpenWorker done\n", ""))
+        self.assertEqual(self.command("list"), (0, "1 impl01 impl ClosedWorker\n", ""))
         for number in range(2, 11):
             self.assertEqual(self.dispatch(f"impl{number:02}"), worker.ExitCode.OK)
 
@@ -1912,7 +2015,7 @@ class WorkerCommandTests(unittest.TestCase):
         members = staff.snapshot().find(kind="worker", parent=self.fixture.parent.id)
         numbers = [" 1", " 2", " 3", " 4", " 5", " 6", " 7", " 8", " 9", "10"]
         self.assertEqual(output.splitlines(), [
-            f"{number} {row.name} impl OpenWorker done" for number, row in zip(numbers, members, strict=True)])
+            f"{number} {row.name} impl ClosedWorker" for number, row in zip(numbers, members, strict=True)])
 
     def test_list_keeps_dispatch_role_separate_from_observation(self) -> None:
         opened = self.opened("impl2", "review")

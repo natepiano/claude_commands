@@ -1278,6 +1278,10 @@ class PaneObservations:
     replies: dict[tuple[str, tuple[str, ...]], dict[str, object]] = field(default_factory=dict)
     process_batches: set[str] = field(default_factory=set)
 
+    @cached_property
+    def process_places(self) -> dict[int, HerdrPlace]:
+        return herdr_places()
+
 
 _pane_observations: ContextVar[PaneObservations | None] = ContextVar("pane_observations", default=None)
 
@@ -2630,7 +2634,7 @@ def pane_native_process(info: dict[str, object], kind: str,
         if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
             raise HerdrFailure("native process pid is unavailable")
         try:
-            observed = native_process(pid, kind, reported) if reported else native_process(pid, kind)
+            observed = native_process(pid, kind, reported) if kind == "codex" else native_process(pid, kind)
         except (OSError, ValueError) as error:
             raise HerdrFailure(str(error)) from error
         if (kind == "codex" and codex_without_session(info) and "pane_id" in pane
@@ -3378,13 +3382,6 @@ def _process_environment(process: Path) -> dict[str, str]:
 
 
 @dataclass(frozen=True)
-class RolloutThread:
-    """An open rollout proves the current Codex thread."""
-
-    id: str
-
-
-@dataclass(frozen=True)
 class EnvironmentThread:
     """The native Claude runtime identifies its current session."""
 
@@ -3416,7 +3413,7 @@ class UnreportedResume:
 class NativeAgentProcess:
     """Conversation evidence from one process with a stable start time."""
 
-    identity: RolloutThread | EnvironmentThread | LaunchArgument | PaneSessionReport | UnreportedResume
+    identity: EnvironmentThread | LaunchArgument | PaneSessionReport | UnreportedResume
     started: str
     environment: dict[str, str]
 
@@ -3427,115 +3424,12 @@ class NativeAgentProcess:
         return self.identity.id
 
 
-class NoOpenCodexRollout(ValueError):
-    """The stable process holds no rollout file open."""
-
-
 def _process_birth(pid: int) -> str:
     started = (darwin_process_identity(pid).started if _platform() == "darwin"
                else runtime_sessions.process_start(pid))
     if not started:
         raise ValueError(f"pid {pid}: process start is unavailable")
     return started
-
-
-def _open_codex_rollouts(pid: int) -> dict[Path, str]:
-    if _platform() == "darwin":
-        return {path: str(path) for path in darwin_open_files(pid) if path.name.startswith("rollout-")}
-    files: dict[Path, str] = {}
-    for descriptor in (_proc_root() / str(pid) / "fd").iterdir():
-        try:
-            target = os.readlink(descriptor)
-        except FileNotFoundError:
-            continue
-        if Path(target.removesuffix(" (deleted)")).name.startswith("rollout-"):
-            files[descriptor] = target
-    return files
-
-
-class RolloutProofPhase(Enum):
-    STABLE = "stable conversation"
-    LAUNCH = "conversation opening during launch"
-
-
-_rollout_proof_phase: ContextVar[RolloutProofPhase] = ContextVar("rollout_proof_phase", default=RolloutProofPhase.STABLE)
-
-
-@contextmanager
-def launch_rollout_proof() -> Generator[None]:
-    """Allow rollout descriptors to open within the launch proof deadline."""
-    token = _rollout_proof_phase.set(RolloutProofPhase.LAUNCH)
-    try:
-        yield
-    finally:
-        _rollout_proof_phase.reset(token)
-
-
-def codex_rollout_threads(pid: int) -> set[str]:
-    """Read every thread from stable open rollouts of one process."""
-    started = _process_birth(pid)
-    deadline = time.monotonic() + operation_deadline.remaining(PROGRAM_TIMEOUT_SECONDS)
-    while True:
-        files = _open_codex_rollouts(pid)
-        identities: set[str] = set()
-        try:
-            for path in files:
-                before = path.stat()
-                with path.open(encoding="utf-8") as stream:
-                    value = cast(object, json.loads(stream.readline()))
-                after = path.stat()
-                if (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns) != (
-                        after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns):
-                    raise ValueError(f"pid {pid}: current Codex rollout changed")
-                if not isinstance(value, dict):
-                    raise ValueError(f"pid {pid}: current Codex rollout is unreadable")
-                meta = cast(dict[str, object], value)
-                payload = meta.get("payload")
-                if meta.get("type") != "session_meta" or not isinstance(payload, dict):
-                    raise ValueError(f"pid {pid}: current Codex rollout has no session metadata")
-                identity = cast(dict[str, object], payload).get("id")
-                if not isinstance(identity, str):
-                    raise ValueError(f"pid {pid}: current Codex rollout has no identity")
-                try:
-                    identities.add(staff.native_id(identity))
-                except staff.StaffRefused as error:
-                    raise ValueError(f"pid {pid}: current Codex rollout identity is invalid") from error
-        except FileNotFoundError:
-            if _process_birth(pid) != started:
-                raise ValueError(f"pid {pid}: current Codex rollout or process changed")
-            if time.monotonic() >= deadline:
-                raise
-            continue
-        current = _open_codex_rollouts(pid)
-        if _process_birth(pid) != started:
-            raise ValueError(f"pid {pid}: current Codex rollout or process changed")
-        if current == files:
-            break
-        opening = _rollout_proof_phase.get() == RolloutProofPhase.LAUNCH and files.items() < current.items()
-        if (not current.items() < files.items() and not opening) or time.monotonic() >= deadline:
-            raise ValueError(f"pid {pid}: current Codex rollout or process changed")
-    if not files:
-        raise NoOpenCodexRollout(f"pid {pid}: current Codex rollout is unavailable")
-    return identities
-
-
-def codex_rollout_thread(pid: int) -> str:
-    """Prove one current thread for a targeted process action."""
-    identities = codex_rollout_threads(pid)
-    if len(identities) != 1:
-        raise ValueError(f"pid {pid}: current Codex rollout is unavailable or ambiguous")
-    return next(iter(identities))
-
-
-def codex_transcript(pid: int) -> Path:
-    """Find the open transcript of one proved Codex process."""
-    started = _process_birth(pid)
-    files = _open_codex_rollouts(pid)
-    identity = codex_rollout_thread(pid)
-    paths = {Path(target) for target in files.values() if target.endswith(f"-{identity}.jsonl")}
-    if _process_birth(pid) != started or _open_codex_rollouts(pid) != files or len(paths) != 1:
-        raise ValueError(f"pid {pid}: current Codex transcript is unavailable or ambiguous")
-    return next(iter(paths))
 
 
 def codex_resume_thread(pid: int) -> str:
@@ -3566,22 +3460,45 @@ def codex_resume_thread(pid: int) -> str:
     raise ValueError(f"pid {pid}: Codex launch identity is unavailable")
 
 
-def native_process(pid: int, kind: str, reported: str = "") -> NativeAgentProcess:
+def _codex_launch_identity(pid: int, reported: str) -> LaunchArgument | PaneSessionReport:
+    """Use the resume argument or the new conversation's pane report."""
+    try:
+        resume = codex_resume_thread(pid)
+    except ValueError:
+        if not reported:
+            raise
+        return PaneSessionReport(reported)
+    return PaneSessionReport(reported) if reported == resume else LaunchArgument(resume)
+
+
+def codex_pane_process(pid: int, place: HerdrPlace) -> NativeAgentProcess:
+    """Read the report owned by this pane's sole foreground Codex process."""
+    client = Herdr(place.session)
+    info = json_object(client.result("pane", "process-info", "--pane", place.pane).get("process_info"),
+                       "Codex pane process info")
+    foreground = json_items(info.get("foreground_processes"), "Codex foreground processes")
+    if codex_without_session(info) and json_object(foreground[0], "Codex foreground process").get("pid") == pid:
+        pane = client.pane_row(place.pane)
+        if not isinstance(pane, NoPane):
+            try:
+                return pane_native_process(info, "codex", pane)
+            except HerdrFailure as error:
+                raise ValueError(str(error)) from error
+    return native_process(pid, "codex", "")
+
+
+def native_process(pid: int, kind: str, reported: str | PaneNotRead = PANE_NOT_READ) -> NativeAgentProcess:
     """Bind the current identity and account to one unchanged process."""
+    if kind == "codex" and isinstance(reported, PaneNotRead):
+        observed = _pane_observations.get()
+        place = observed.process_places.get(pid, NotInHerdr()) if observed is not None else herdr_place_of(pid)
+        if isinstance(place, HerdrPlace):
+            return codex_pane_process(pid, place)
+        reported = ""
     started = _process_birth(pid)
     environment = process_environment(pid)
     if kind == "codex":
-        try:
-            identity = RolloutThread(codex_rollout_thread(pid))
-        except NoOpenCodexRollout:
-            try:
-                resume = codex_resume_thread(pid)
-            except ValueError:
-                if not reported or _rollout_proof_phase.get() == RolloutProofPhase.LAUNCH:
-                    raise
-                identity = PaneSessionReport(reported)
-            else:
-                identity = PaneSessionReport(reported) if reported == resume else LaunchArgument(resume)
+        identity = _codex_launch_identity(pid, reported if isinstance(reported, str) else "")
     elif kind == "claude":
         try:
             current = staff.runtime_id(pid)
@@ -3672,6 +3589,7 @@ class CodexConversations:
     unknown: tuple[str, ...]
 
 
+@observation_snapshot()
 def codex_conversations(*, wanted: str = "") -> CodexConversations:
     from scripts.lib import unit_runs
     from scripts.message import codex_daemon
@@ -3767,22 +3685,12 @@ def codex_conversations(*, wanted: str = "") -> CodexConversations:
         except ProcessLookupError:
             continue
         except (HerdrFailure, OSError, ValueError):
-            # A server can hold several threads; each open rollout proves its thread.
-            no_rollout = False
-            try:
-                for identity in codex_rollout_threads(pid):
-                    live[identity] = (*live.get(identity, ()), pid)
-                continue
-            except NoOpenCodexRollout:
-                no_rollout = True
-            except (HerdrFailure, OSError, ValueError):
-                pass
             if environment is not None:
                 if "app-server" in arguments:
                     if environment.get("UNIT_RUN_DIR") or pid in server_pids:
-                        # The run read below resolves a server with no open rollout.
+                        # The run read below resolves the threads of a server in a run.
                         continue
-                elif no_rollout and "--no-daemon" not in arguments:
+                elif "--no-daemon" not in arguments:
                     home = Path(environment.get("CODEX_HOME", str(Path.home() / ".codex"))).expanduser()
                     if home in daemon_reads:
                         # A failed daemon read already has one note for its account.
@@ -4772,7 +4680,7 @@ def _darwin_herdr_processes() -> list[HerdrProcess]:
                 pid, environment, lambda ident: by_pid[ident].parent if ident in by_pid else 0)
             if isinstance(place, NotInHerdr):
                 continue
-            marks = _process_marks(pid, environment, list(arguments.argv))
+            marks = _process_marks(pid, environment, list(arguments.argv), place)
             processes.append(HerdrProcess(pid, place, marks,
                                           Path(by_pid[pid].executable).name, _darwin_process_cwd(pid)))
         except (HerdrFailure, subprocess.TimeoutExpired):
@@ -4780,13 +4688,13 @@ def _darwin_herdr_processes() -> list[HerdrProcess]:
     return processes
 
 
-def _process_marks(pid: int, environment: dict[str, str], arguments: list[str]) -> dict[str, str]:
+def _process_marks(pid: int, environment: dict[str, str], arguments: list[str], place: HerdrPlace) -> dict[str, str]:
     """Project proved agent identities for reports; retain membership when proof is unavailable."""
     marks = {key: environment[key] for key in NATIVE_ID_MARKS if key in environment}
     kind = "codex" if is_codex_process(arguments) else "claude" if is_claude_process(arguments) else ""
     if kind:
         try:
-            observed = native_process(pid, kind)
+            observed = codex_pane_process(pid, place) if kind == "codex" else native_process(pid, kind)
             marks["CODEX_THREAD_ID" if kind == "codex" else "CLAUDE_CODE_SESSION_ID"] = observed.current_identity
         except (HerdrFailure, OSError, ValueError):
             return marks
@@ -4866,7 +4774,7 @@ def _scan_herdr_processes() -> list[HerdrProcess]:
                 cwd = str(process.joinpath("cwd").resolve(strict=True))
             except (OSError, ValueError, RuntimeError) as error:
                 cwd = UnreadableCwd(str(error))
-            marks = _process_marks(pid, environment, arguments)
+            marks = _process_marks(pid, environment, arguments, place)
             processes.append(HerdrProcess(pid, place, marks, Path(arguments[0]).name, cwd))
         except (OSError, ValueError, RuntimeError):
             continue

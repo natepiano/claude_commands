@@ -1852,6 +1852,13 @@ Every nextest run that lint starts prints one line after admission: `nextest: <g
 3. Add a test that fails without the fix and passes with it.
 4. Update the as-built doc that describes the changed tooling.
 
+**Constraints from prior phases:**
+- Rounds 1-9 are in `phases/81/mac_link_report.md` in the run folder `/tmp/claude/unit/20523639-3e08-48d6-9277-73e052bca297`. Read it before any new step.
+- builds approved one controlled reproduction on 2026-11-08. The script is `/tmp/claude/scratch/until-2026-11-09T2200Z-resources-p81-repro/reproduce.sh`.
+- builds decided on 2026-11-08 that the reproduction uses one private target at a time. One case needs about 89.06 GiB (source and one debug target). Change the script's room check from four targets to one. Also change its schedule: today it keeps `target-A`, `target-B` and both control targets until the final cleanup (`reproduce.sh` lines 190-204), about 355 GiB. Record each build's result, then remove that private target before the next case or control starts.
+- The 150 GiB Mac floor stays. So a case needs about 239 GiB free before it starts. The Mac had 238.71 GiB free after the 2026-11-08 core cleanup. Start a case only when the room is there and builds approves the start.
+- Keep sccache and the hana test mirror. Run no gc command on the Mac.
+
 **Files:**
 - `scripts/mac_test/offload.py` — the Mac copy, target and cleanup, when the cause is there.
 - `scripts/mac_test/floor_claims.py` — the floor claims, when the cause is there.
@@ -1918,7 +1925,7 @@ Every nextest run that lint starts prints one line after admission: `nextest: <g
 - `modules/darwin/tailscale.nix`, `modules/linux/ssh.nix`: Remote Login is on for the loopback hop only.
 - User steps: Remote Login on with "Allow full disk access for remote users"; first `rebuild` in the Mac's Terminal; then `ssh -t mac rebuild`. The live hop result comes from natedev through the showrunner.
 
-### Phase 87 — The Mac floor alert reaches the user's phone  · status: todo
+### Phase 87 — The Mac floor alert reaches the user's phone  · status: done
 **Depends on:** none. Merge `origin/builds` first.
 
 **Approved:** builds showrunner, 2026-11-08: "Did the Mac floor job send that push? If not, find why and fix it in Phase 85 or a new phase. If it did, tell me its time. Find what besides the 110 GiB hana target holds the other Mac space, from a read-only size list, and send me the top five folders."
@@ -1927,33 +1934,14 @@ Every nextest run that lint starts prints one line after admission: `nextest: <g
 
 **User answer (via builds, 2026-11-08), to "approve the Mac low-disk phone push text?":** "1." builds: "Change the existing sweep.disk_floor text so that the machine name is a value ({machine}), and use it for natedev and the Mac. Add no sweep.disk_floor_mac. Title: "{machine} disk is low; {machine} tests can fail". The body and action are your proposed words, with {machine} in place of "Mac". The natedev push keeps its meaning. Your Phase 87 sends the phone push for the Mac. Put the changed catalog entry in the checkpoint notice."
 
-#### Work Order
+#### As-built
+- The Mac floor pass (`sweep.py --floor-only --host mac`, launchd `org.nixos.disk-floor`) and natedev use one phone-floor crossing path. A non-dry pass under `MacFloor` calls `notify_floor_problem` with `FloorMachine.MAC`; before, only `NatedevFloor` reached it. Each machine keeps its crossing state and receipts in its own `floor.json`.
+- `FloorMachine` (`NATEDEV = "natedev"`, `MAC = "Mac"`) fills `{machine}` in the one `sweep.disk_floor` text: title "{machine} disk is low; {machine} tests can fail". `disk_floor_push` and `fit_disk_floor_push` take `machine`. The natedev session message adds "This is the Mac disk." for the Mac.
+- `send_floor_alert()` sends the session message (exit 0 or 1 accepted); `send_phone_push()` sends the phone push (only exit 0 accepted). Each channel keeps its own receipt. A reading above the alert line rearms both; equality does not.
+- natedev cache size, growth and removal reports stay outside the Mac path.
+- Rows: `test_sweep.py` Mac crossing row. `push_texts_reviewed.json` holds the user's approval of the changed text. `docs/as-built/build-memory-admission.md` states the shared path.
 
-**Goal:** when the Mac's free disk falls below the phone alert line, the user gets one phone push that names folders to delete. The showrunner also gets the five largest Mac folders other than the hana mirror target.
-
-**Measured (resources, 2026-11-08):** the Mac has 134 GiB free on `/System/Volumes/Data`; `sweep_phone_floor_gib` and the Mac sweep floor are both 150 GiB. The hana mirror target holds 110 GiB under a live claim. The Mac launchd job `org.nixos.disk-floor` (nixos `modules/darwin/disk-floor.nix`) runs `sweep.py --floor-only --host mac` every 120 s and is loaded (builds, 2026-11-08). Phase 81 round 4 found that Mac launchd jobs have a PATH without `/usr/sbin`.
-
-**Spec:**
-1. Find out, with read-only commands only, whether the Mac floor job sent the phone push for this crossing, and when. Read the job's log, the sweep's crossing record and the push record (`scripts/lint/sweep.py` `send_floor_alert`, `scripts/notify/`). Change no Mac setting, start no Mac test or build, and run no real sweep.
-2. If no push went, find why, and give the evidence.
-3. Make a read-only size list of the Mac home disk and give the five largest folders other than `~/.local/state/mac-test/mirror/hana/target`, with their sizes. Delete nothing.
-4. If a push should have gone and did not, fix the cause where it lives. If it lives in nixos (`modules/darwin/disk-floor.nix`), say so; the director makes that a nixos branch. Add a row to the existing alert test that fails without the fix.
-5. Correct as-built text that the fix makes wrong.
-6. **The push text.** Change `sweep.disk_floor` in `scripts/notify/push_catalog.py` so the machine name is a value. Add no second entry.
-   - Title: "{machine} disk is low; {machine} tests can fail"
-   - Body: "{machine} has {free} free, below the {floor} alert line, so {machine} test builds can fail. {recommendation}"
-   - Action: "{folder_action}", for example "In the natedev Claude session, say which {machine} folders to delete."
-   - The natedev push fills `natedev`; the Mac floor fills `Mac`. Report whether the change makes the existing approvals stale. Write no approval record.
-
-**Files:**
-- `scripts/lint/sweep.py`
-- `scripts/lint/test_sweep.py`
-- `scripts/notify/push_catalog.py`
-- `docs/as-built/build-memory-admission.md`
-
-**Workers:** 1 writer. The `test` slot takes the writer role: Spec 1 to 3 first (a report, no edits), then Spec 4 and 5 only when the director sends them.
-
-**Acceptance gate:** the report answers Spec 1 to 3 with evidence. When there is a fix: the new row fails before it and passes after; `test_sweep.py` and the targeted test pass; basedpyright reports 0 errors and 0 warnings on the changed Python files.
+**Gotchas:** a changed push text needs a new approval record before a phone push sends. While approval is stale, the natedev message still sends and the phone receipt stays pending.
 
 ### Phase 88 — The hana CI margin key goes after the runner activation  · status: todo
 
@@ -1983,3 +1971,22 @@ Every nextest run that lint starts prints one line after admission: `nextest: <g
 **Gate:** the targeted test, and `basedpyright` 0/0/0 on each changed file and each caller module.
 
 **Change-Review:** none — the queue view shows the same rows; the room rises only when an unregistered job caused the margin. Registered jobs take no margin today (`test_memory_admit.py:5809`).
+
+### Phase 89 — The Mac folder audit reads process use and acts  · status: done
+
+#### As-built
+
+- The Mac folder audit (`org.nixos.folder-audit`) kept every due folder as `maker unknown: no /proc or lsof to show which processes use it` because the old launchd job PATH had no `/usr/sbin`. The job could not start `lsof`, so `folder_audit.process_uses()` returned `ProcessUsesUnavailable`.
+- The Python fallback is correct: `process_uses()` (`scripts/lint/folder_audit.py:325`) calls `tmp_sweep.lsof_paths()` when `/proc` is missing, and `test_lsof_fallback_keeps_used_folders_and_judges_unused_folders` covers it. No Python or test changed.
+- Nixos `efdf8bf` adds `/usr/sbin` after `/usr/bin:/bin` to `jobPath` (`modules/darwin/nate-backend.nix:40`). The loaded job has that PATH. Its plist change time is 2026-11-08 11:04:48 EST. The job has `RunAtLoad=false` and an 86400-second interval, and had zero runs at inspection.
+- The as-built records the cause, the loaded PATH and the closed Phase 44 gap: the old standing `~/rust/hana_catalyst_mac` clone had no lifetime after the runner moved to scratch clones; its 85.8 GiB target was removed on 2026-11-08 with builds' approval. Folder creators register lifetimes; `~/.cache` stays outside every cleanup root.
+- The first audit run after the PATH change goes to builds as a note (removed count, NO_PROC rows). A run that still removes nothing becomes a new phase.
+
+**Files:**
+- `docs/as-built/build-memory-admission.md` — the Mac audit PATH cause, the loaded job PATH and the Phase 44 gap.
+
+**Gotchas:**
+- An ssh shell finds `/usr/sbin/lsof`; a launchd job uses its own explicit PATH. Test a command lookup in the job environment, not over ssh.
+- The plist file time is not the launchd load time; `launchctl print` shows no load time.
+
+**Ruled out:** a Python change or a new test row for the Mac case — the existing fallback test covers the `lsof` path.

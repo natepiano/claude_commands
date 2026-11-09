@@ -215,9 +215,13 @@ def _agent_command(client: herdr.Herdr, worker: worker_panes.OpenWorker, action:
     if not herdr.check_target(str(worker.row.current_session), action="keys",
             place=herdr.HerdrPlace(client.session, worker.pane), terminal=worker.terminal, text=line, client=client):
         raise herdr.HerdrFailure(f"{worker.row.name}: dispatch target is unproved", "wrong_target")
-    arguments = ["agent", action, worker.pane]
+    arguments = ["agent", "wait" if action == "wait-start" else action, worker.pane]
     if action == "prompt":
         arguments.extend((script_prompt(line), "--wait"))
+    elif action == "wait-start":
+        seconds = conf.read("direct").number("WORKER_PROMPT_START_SECONDS")
+        arguments.extend(("--until", "working", "--until", "blocked", "--until", "done",
+                          "--timeout", str(int(seconds * 1000))))
     result = subprocess.run(client.argv(*arguments), text=True, capture_output=True, check=False)
     herdr.require_success(result, f"herdr agent {action}")
 
@@ -308,6 +312,19 @@ def dispatch(parent: StaffId, name: WorkerName, role: WorkerRole, prompt: Path, 
             if not isinstance(result, DispatchComplete):
                 return result
         _save_reply(destination, result.reply)
+        progress_history.complete_dispatch(session_dir, slot, instance)
+        try:
+            with redirect_stderr(io.StringIO()) as errors:
+                closed = worker_panes.close(parent, name, run=worker_panes.DispatchRun(session_dir), lock=hold)
+            reason = (closed.blocker if isinstance(closed, worker_panes.Kept) else
+                      closed.reason if isinstance(closed, worker_panes.UncertainWorker) else "")
+            if reason:
+                print(f"anomaly: {name.value}: {' '.join(reason.splitlines())}", file=sys.stderr)
+            elif errors.getvalue():
+                print(errors.getvalue(), end="", file=sys.stderr)
+        except (OSError, ValueError, herdr.HerdrFailure, subprocess.SubprocessError,
+                staff.StaffRefused, staff.StaffUnreadable) as error:
+            print(f"anomaly: {name.value}: {' '.join(str(error).splitlines())}", file=sys.stderr)
         return ExitCode.OK
 
 
@@ -370,7 +387,12 @@ def _dispatch_turn(parent: StaffId, started: worker_panes.OpenWorker, client: he
                 print(f"{name.value}: agent is {current.status.value}", file=sys.stderr)
                 return ExitCode.BUSY
             try:
-                _agent_command(client, current, "prompt", line)
+                try:
+                    _agent_command(client, current, "prompt", line)
+                except herdr.HerdrFailure as error:
+                    if error.code != "agent_prompt_stalled":
+                        raise
+                    _agent_command(client, current, "wait-start")
             except (herdr.HerdrFailure, subprocess.TimeoutExpired) as error:
                 return _delivery_failure(error, client, current)
     last_wait_was_quiet = False
@@ -383,7 +405,7 @@ def _dispatch_turn(parent: StaffId, started: worker_panes.OpenWorker, client: he
         state = worker_panes.observe_worker(parent, row, record)
         receipt = dispatch_receipt(row, line, dispatch_id, run=run)
         if isinstance(receipt, DispatchEvidenceUnknown):
-            print(f"anomaly: {name.value}: {receipt.reason}; no prompt sent", file=sys.stderr)
+            print(f"anomaly: {name.value}: {receipt.reason}; prompt delivered to pane {current.pane}", file=sys.stderr)
             return ExitCode.UNCERTAIN
         if isinstance(receipt, DispatchComplete) and (
                 isinstance(state, (worker_panes.StoppedWorker, worker_panes.ClosedWorker))

@@ -156,32 +156,26 @@ class CodexProcessThreads:
         from scripts.message import codex_daemon
 
         try:
-            return herdr.codex_rollout_thread(pid)
-        except herdr.NoOpenCodexRollout:
-            pass
-        except (OSError, ValueError, herdr.HerdrFailure):
-            return ""
-        if identity := environment.get("CODEX_THREAD_ID", ""):
-            return identity
-        try:
             try:
                 return herdr.codex_resume_thread(pid)
             except (OSError, ValueError):
                 pass
             place = herdr.herdr_place_of(pid)
             if isinstance(place, herdr.NotInHerdr):
-                return ""
+                return environment.get("CODEX_THREAD_ID", "")
             key = (place.session, place.pane)
             client = herdr.Herdr(place.session)
             if key not in self.foreground_pids:
                 self.foreground_pids[key] = client.pane_codex_pid(place.pane)
             if self.foreground_pids[key] != pid:
-                return ""
+                return environment.get("CODEX_THREAD_ID", "")
             if key not in self.panes:
                 self.panes[key] = herdr.json_object(client.result("pane", "get", place.pane).get("pane"),
                                                   "Codex pane")
             pane = self.panes[key]
             if identity := herdr.pane_session(pane):
+                return identity
+            if identity := environment.get("CODEX_THREAD_ID", ""):
                 return identity
             title = pane.get("terminal_title_stripped")
             if not isinstance(title, str):
@@ -200,7 +194,7 @@ class CodexProcessThreads:
                             self.threads[home][entry.name] = entry.thread_id
             return self.threads[home].get(name, "")
         except (OSError, ValueError, herdr.HerdrFailure):
-            return ""
+            return environment.get("CODEX_THREAD_ID", "")
 
 
     def check(self, pid: int, identity: str) -> session_staff.ReportProcessIdentity:
