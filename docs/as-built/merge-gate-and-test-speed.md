@@ -903,3 +903,71 @@ The cloud state records the phase, vCPU count, failed module count, and update t
 The phases are `requesting`, `setup`, `running`, and `uploading`.
 The route releases cloud admission before local fallback requests memory.
 The route requests no local memory for a cloud gate.
+
+## Verify function tests and process lifetime
+
+`scripts/direct/shell_function_test_support.py` supplies `shell_functions(path, *names)`.
+It extracts named top-level Bash definitions in the requested order and refuses a missing name.
+Fixtures must supply each extracted function's current dependencies from their owning modules.
+For example, `run()` needs `buildlog_step_compiles` from `scripts/lint/invoke.sh`.
+A missing helper produces status 127 and does not test production behavior.
+
+Direct tests call real production functions when no process boundary is part of the assertion.
+`NextestArgumentTests` calls `compose_nextest_args` with the real metadata helpers.
+The real Mac-argument runs retain decline-to-local, busy-result, and plain-package `no_tests` coverage.
+The `no_tests` run observes `--no-tests=warn` at both consumers and counts one call at each.
+A composed argument alone cannot prove what its consumer receives.
+
+`call_mac_functions` supplies private tools and records for real result and retry functions.
+`run_unblocked_step`, `invoke_taplo_at`, and `start_owned_step` provide direct calls for their subjects.
+The lint judgment tests call `run_lint_judgment`, `run_lint_held_sequence`, and `run_lint_sequence` directly.
+`FirstJudgmentRepairTests` calls `first_judgment_permits_repair` with a private log.
+Real verifier cases retain status 1 and signal-status coverage because the hold-stop path depends on status.
+A retry-deadline check retains its real routing path when a direct call would miss a removed consumer check.
+The measurement method and module costs remain in [Verify test cost](../plans/natedev-verify-test-cost.md).
+Compare paired runs under the same load; isolated wall-time changes do not prove a CPU improvement.
+
+Each fixture that reaches repository setup provides a root `Cargo.toml` at its temporary Git top level.
+A no-manifest case calls Bash directly because the inherited `verify()` helper reads the manifest before Bash starts.
+A subprocess with no `cwd` inherits the caller's repository.
+Script-copy fixtures must also copy the helper's current library dependencies.
+DEBUG hooks that observe commands inside moved functions require functrace.
+A hook that matches `BASH_COMMAND` must match the current command text.
+Otherwise the test can wait until its hang guard without reaching its observation.
+
+`VerifyHoldWaitFixture.fixture_cleanups` includes each failed inner cleanup's traceback.
+`reap` reports each remaining PID with its command line.
+`assert_nothing_outlives` fails with those identities after its cleanup attempt.
+`wait_for_marker_exit` observes marked process exit; reaping remains a separate operation.
+`start_memory_queued_lint` parks a real verifier through private zero-memory admission for signal tests.
+A sleep stand-in accelerates only the intended admission poll, while renewer sleeps retain real delays.
+
+`local_hold_environment` restores only keys that it changed.
+It does not clear the whole environment while another thread can read it.
+Both hold-environment contexts use `hold_recorder_exits` before restoring environment or removing the fixture root.
+The helper records each `hold-event-recorder` thread as `HoldRecorderStart` before its `start()` returns.
+It waits for startup, then joins only threads with an assigned `ident`.
+On timeout, it kills recorder children and reports `fixture hold recorder never exited`.
+A detached hold recorder does not carry the normal test process marker.
+Without this wait, a late write can make directory removal fail with `ENOTEMPTY`.
+The next fixture copy can then fail because that directory still exists.
+Deadline tests watch private folders, so another test's event cannot end their wait.
+
+Mac signal-boundary tests control both sides of `MAC_RUNNER_PID=$!` and include TERM and INT.
+They wait for log removal before permitting the delayed runner or tee to continue.
+Their final checks require the signal status, no runner or local work, no token record, and an empty temporary folder.
+Fixed sleeps and retries cannot replace these ordering checks.
+A group-signal test uses `scripts.lib.process_group.send_process_group`.
+
+`OffloadSettingsTests`, `OffloadCommandFixture`, and `RepositorySlotTests` use `copies_environment` for private mirror leases.
+`COPIES_CONFIG` selects that root.
+`CONF_DIR` and a patched `Path.home` cannot replace `COPIES_CONFIG` for this purpose.
+The Linux fake `df` selects units from option arguments only.
+A letter `G` in a mirror path must not select GiB output.
+`LinuxShellTests` need a usable rustup toolchain because they reach real rustc.
+
+The renewer-boundary test observes the exact sleep PID assignment.
+Only the renewer's sleep may stop; inherited jobs must survive.
+Memory-growth reproductions use a bounded scope, such as `MemoryMax=3G` with swap disabled.
+`step_selection.py` must remain cheap because every target command imports it.
+`parse_port_cell` imports `cell_value` locally, so progress-history startup avoids unrelated production and message imports.
