@@ -22,6 +22,14 @@ Read `~/.claude/docs/production_format.md` first. It defines:
 When `PRODUCTION_DOC` carries `**Kind:** style`, read
 `~/.claude/docs/style_production.md` and follow it wherever it differs from this file.
 
+A production document can also name direct style units in its `Style units` table.
+The table assigns each family to one owner and sets each unit's `Open tickets` count, default 1.
+One unit can own all four families.
+These units branch from the branch point and send normal unit checkpoints to this showrunner.
+Merge each ticket checkpoint with the normal unit checkpoint command.
+Then run `style_ledger.py ticket merge --repo <checkout> --id <ticket>`.
+Use the direct sync route in `~/.claude/docs/style_production.md` for main merges.
+
 State:
 
 - `SHOWRUNNER_NAME`, `PRODUCTION_DOC` — read `name` and `doc.path` from your showrunner staff row.
