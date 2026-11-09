@@ -74,6 +74,9 @@ Publication applies only to the real registry under the Git root of `~/.claude`.
 `MODELS_CONFIG_PUBLISH=0` disables publication.
 Other paths use local atomic replacement through `atomic_file.write_text_atomic`.
 The shared writer fetches origin and checks fast-forward safety with a temporary index.
+`models_registry._fetch(repo, branch)` fetches `+refs/heads/<branch>:refs/remotes/origin/<branch>` and reads that ref, never `FETCH_HEAD`.
+Every fetch in the checkout writes `FETCH_HEAD`, so another fetch between the fetch and the read cannot change the target.
+With `fetch.prune=true`, this one-ref refspec prunes no other `origin/*` ref.
 An isolated index and `commit-tree` make a commit containing only `config/models.conf`.
 Its subject is `config(models): <description>`.
 Temporary index folders use the `models-index-` and `models-ff-index-` prefixes.

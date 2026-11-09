@@ -388,6 +388,7 @@ Saved progress state uses the fixed staff reference instead of a copied session 
     A process without an identity reports an unreadable thread when its pane holds staff.
     One staff candidate retains its pane placement with unknown status.
     `CodexProcessThreads.thread` reads resume arguments, the native pane session, and the thread environment in that order.
+    A child Codex inherits its parent's `CODEX_THREAD_ID`, so the environment value never comes before the other two.
     It then reads the terminal title with daemon names.
     These pane sources require this process to be the sole foreground process.
     A client that shares the foreground with another process has no thread. It prints one line and refuses nothing.
