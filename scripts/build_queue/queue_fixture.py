@@ -137,7 +137,7 @@ def write_process(proc: Path, pid: int, used: int = 0, *, parent: int = 1,
         raise OSError("empty fixture process")
     anon = used if anonymous is None else anonymous
     if (directory / "status").write_text(
-            f"VmRSS: {used // 1024} kB\nRssAnon: {anon // 1024} kB\nVmSwap: {swap // 1024} kB\n") <= 0:
+            f"VmRSS: {used // 1024} kB\nRssAnon: {anon // 1024} kB\nRssShmem: 0 kB\nVmSwap: {swap // 1024} kB\n") <= 0:
         raise OSError("empty fixture memory")
 
 
@@ -147,7 +147,7 @@ def write_scope(directory: Path, *, members: tuple[int, ...] = (), current: int 
     directory.mkdir(parents=True, exist_ok=True)
     for name, text in {
         "cgroup.procs": "\n".join(map(str, members)), "cgroup.events": "populated 1\n",
-        "memory.current": str(current), "memory.stat": f"anon {anonymous}\ninactive_file 0\n",
+        "memory.current": str(current), "memory.stat": f"anon {anonymous}\nshmem 0\ninactive_file 0\n",
         "memory.swap.current": str(swap),
     }.items():
         _ = (directory / name).write_text(text)

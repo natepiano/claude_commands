@@ -347,7 +347,7 @@ class QueuePlaceFixture(ExitStack):
     def supply_scope_memory(self, anon_bytes: int, file_bytes: int = 0) -> None:
         read_text = Path.read_text
         guard = gate.check_memory_reading
-        readings = {"memory.stat": f"anon {anon_bytes}\nfile {file_bytes}\ninactive_file 0\n",
+        readings = {"memory.stat": f"anon {anon_bytes}\nshmem 0\nfile {file_bytes}\ninactive_file 0\n",
                     "memory.current": str(anon_bytes + file_bytes), "memory.swap.current": "0"}
 
         def supplied_text(path: Path, *args: object, **kwargs: object) -> str:
@@ -386,7 +386,7 @@ class QueuePlaceTests(unittest.TestCase):
                 with self.subTest(anonymous_available=available):
                     contents = f"file {7 * GIB}\ninactive_file {GIB}\n"
                     if available:
-                        contents += f"anon {3 * GIB}\n"
+                        contents += f"anon {3 * GIB}\nshmem 0\n"
                     _ = (scope / "memory.stat").write_text(contents)
                     samples = root / str(available)
                     samples.mkdir()
@@ -1041,7 +1041,7 @@ class QueuePlaceTests(unittest.TestCase):
             scope = fixture.root / "scope"
             scope.mkdir()
             for name, value in {"cgroup.procs": "123\n", "memory.current": str(GIB),
-                                "memory.swap.current": "0", "memory.stat": f"anon {GIB}\ninactive_file 0\n"}.items():
+                                "memory.swap.current": "0", "memory.stat": f"anon {GIB}\nshmem 0\ninactive_file 0\n"}.items():
                 _ = (scope / name).write_text(value)
             read_fd, write_fd = os.pipe()
             holder = os.fork()

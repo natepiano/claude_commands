@@ -97,7 +97,7 @@ The contract reviewer retains the style assignment.
 - The assigned reviewer owns phase style review; the director, implementation, fix and test workers do not load the guide. The reviewer loads it once per applicable phase under `<StyleReview/>`.
 - A contract file stays the one definition of its tag. Call sites name `<PhaseChecks/>` and `<StyleReview/>` and never restate them.
 - An off check reports `Off`, never clean, and no replacement check runs.
-- A cargo mend `--fix` rollback is a hard stop. `verify.sh` names it (and points at `/mend_fix`), and the repair prompt says to stop and keep the tree for inspection.
+- A cargo mend `--fix` rollback is a hard stop. `verify.sh` names the rollback. The repair prompt says to stop and keep the tree for inspection.
 - `lint` reruns only after a repair changes the tree.
 - An invalid baseline or failed diff leaves style owed; code review still runs.
 - Phase prompts never call `verify.sh final`, raw cargo, or their own cargo flags.

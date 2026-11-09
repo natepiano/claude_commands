@@ -15,6 +15,7 @@ from scripts.build_queue.admission_test_support import AdmissionFixture, only_ad
 from scripts.build_queue.queue_fixture import GOLDEN, NOW, QueueFixture, QueueFixtureTests, queue_read_fixture, with_waiting, write_memory_config
 from scripts.build_queue.queue_lines import plain
 from scripts.build_queue.scope_activity import LiveBuildRun, ScopeProcesses
+from scripts.lib.build_steps import read_step_names
 from scripts.lib.terminal_cells import terminal_width
 from scripts.lint import memory_admit as gate
 from scripts.message.unit_labels import UnitLabels
@@ -37,7 +38,8 @@ class CloudQueueCardTests(unittest.TestCase):
             model = queue_view.QueueModel(reply.reading, {}, admission_records.NoWaiter(), head_facts.PaceUnavailable(),
                 ZoneInfo("UTC"), queue_view.HostLoadUnavailable(), admission_records.NoWaiter())
             text = plain(queue_card.render_selection(model, "private-cloud", 140))
-            for value in ("Cloud", "1 of 9 slots", "private-unit", "merge-gate", "running", "7 of 12 modules", "32 vCPUs"):
+            for value in ("Cloud", "1 of 9 slots", "private-unit", read_step_names().shown("merge-gate"),
+                          "running", "7 of 12 modules", "32 vCPUs"):
                 self.assertIn(value, text)
             self.assertEqual(grant.need, 0)
             fixture.release(grant)
@@ -67,7 +69,8 @@ class CloudQueueCardTests(unittest.TestCase):
     def test_cloud_card_shows_slots_progress_size_elapsed_and_age(self) -> None:
         model, _fixture = self.cloud_model()
         text = plain(queue_card.render_selection(model, "cloud-session", 140))
-        for value in ("Cloud", "1 of 1 slots", "cloud-unit", "merge-gate", "running", "32", "vCPUs", "4 min"):
+        for value in ("Cloud", "1 of 1 slots", "cloud-unit", read_step_names().shown("merge-gate"),
+                      "running", "32", "vCPUs", "4 min"):
             self.assertIn(value, text)
         self.assertRegex(text, r"7(?: of |/)12")
         self.assertIn("no update for 2 min", text)
@@ -78,7 +81,7 @@ class CloudQueueCardTests(unittest.TestCase):
         text = plain(queue_card.render_selection(model, "cloud-waiter", 140))
         self.assertIn("Cloud", text)
         self.assertIn("waiting-unit", text)
-        self.assertIn("targeted-test", text)
+        self.assertIn(read_step_names().shown("targeted-test"), text)
         self.assertIn("waits for a cloud slot: 1 of 1 in use", text)
         self.assertEqual(text + "\n", (GOLDEN / "cloud_wait_card.txt").read_text())
 

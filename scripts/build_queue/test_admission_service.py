@@ -1193,7 +1193,7 @@ class ProgressProfileServiceTests(unittest.TestCase):
             progress.publish_counter(sidecar, progress.ProgressCounter("suites:1", 20, 100))
             _ = fixture.run_pass()
             _ = (scope / "cgroup.procs").write_text(f"{owner.pid}\n")
-            _ = (scope / "memory.stat").write_text(f"anon {GIB}\ninactive_file 0\n")
+            _ = (scope / "memory.stat").write_text(f"anon {GIB}\nshmem 0\ninactive_file 0\n")
             progress.publish_counter(sidecar, progress.ProgressCounter("suites:1", 80, 100))
             _ = fixture.run_pass()
             fixture.release(grant)
@@ -2323,21 +2323,35 @@ class QueueLifecycleTests(unittest.TestCase):
 class CiSliceAdmissionTests(unittest.TestCase):
 
     def test_ci_evidence_does_not_subtract_host_free_memory_twice(self) -> None:
-        with AdmissionFixture() as fixture:
-            _ = (fixture.root / "ci.slice/memory.current").write_text(str(4 * GIB))
-            request = fixture.request(need=18 * GIB)
-            grant = only_admitted(fixture.server.handle_request(request))
-            self.assertEqual(grant.need, 18 * GIB)
-            reply, = fixture.server.handle_request(wire.ViewRequest())
-            assert isinstance(reply, wire.ViewReply)
-            ci, = (step for step in reply.reading.view.running
-                   if isinstance(step.measured, records.UnownedSliceMemory)
-                   and step.measured.cgroup == str(fixture.root / "ci.slice"))
-            assert isinstance(ci.measured, records.UnownedSliceMemory)
-            self.assertEqual(ci.measured.bytes, 4 * GIB)
-            room = reply.reading.explanation.room
-            assert isinstance(room, records.MemoryRoom)
-            self.assertEqual(room.available, 60 * GIB)
+        for shared, ci_bytes, run_bytes in ((0, 4, 0), (4, 0, 4)):
+            with self.subTest(shared=shared), AdmissionFixture() as fixture:
+                _ = (fixture.root / "ci.slice/memory.current").write_text(str(4 * GIB))
+                _ = (fixture.root / "ci.slice/memory.stat").write_text(
+                    f"anon {(4 - shared) * GIB}\nshmem {shared * GIB}\ninactive_file 0\n")
+                request = fixture.request(need=18 * GIB)
+                if shared:
+                    sidecar = fixture.scope(request.owner, folder="ci.slice/job.scope", current=4 * GIB, anonymous=0)
+                    scope = Path(sidecar.read_text())
+                    _ = (scope / "memory.stat").write_text(f"anon 0\nshmem {4 * GIB}\ninactive_file 0\n")
+                    _ = (fixture.root / "ci.slice/cgroup.procs").write_text(str(request.owner.pid))
+                    request = replace(request, sidecar=str(sidecar))
+                grant = only_admitted(fixture.server.handle_request(request))
+                self.assertEqual(grant.need, 18 * GIB)
+                if shared:
+                    _ = fixture.run_pass()
+                reply, = fixture.server.handle_request(wire.ViewRequest())
+                assert isinstance(reply, wire.ViewReply)
+                ci, = (step for step in reply.reading.view.running
+                       if isinstance(step.measured, records.UnownedSliceMemory)
+                       and step.measured.cgroup == str(fixture.root / "ci.slice"))
+                assert isinstance(ci.measured, records.UnownedSliceMemory)
+                self.assertEqual(ci.measured.bytes, ci_bytes * GIB)
+                room = reply.reading.explanation.room
+                assert isinstance(room, records.MemoryRoom)
+                self.assertEqual(room.available, 60 * GIB)
+                self.assertEqual(room.used, run_bytes * GIB)
+                self.assertEqual(room.ci_use, ci_bytes * GIB)
+                self.assertEqual(room.cap, (60 + ci_bytes + run_bytes - 3) * GIB)
 
     def test_missing_ci_limit_does_not_block_grants_or_cleanup(self) -> None:
         with AdmissionFixture() as fixture:
@@ -4855,7 +4869,7 @@ class CutoverServiceTests(unittest.TestCase):
             _ = only_admitted(fixture.server.handle_request(fresh))
             second_scope = Path(fresh.sidecar).read_text().strip()
             _ = (Path(second_scope) / "memory.current").write_text(str(GIB // 2))
-            _ = (Path(second_scope) / "memory.stat").write_text(f"anon {GIB // 2}\ninactive_file 0\n")
+            _ = (Path(second_scope) / "memory.stat").write_text(f"anon {GIB // 2}\nshmem 0\ninactive_file 0\n")
             reused = fixture.request(need=GIB)
             if reused.episode not in fixture.server.reservations:
                 fixture.allow_next_start()

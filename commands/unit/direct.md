@@ -131,11 +131,10 @@ The list uses `worker_panes.observe` for open, stopped, closed, unknown, and inc
 An unknown pane outside this parent's tabs does not make its absent workers uncertain.
 An unknown pane in a parent's tab, or an unreadable parent pane, can leave absence unproved.
 Use `worker.py end <name>` only for permanent removal.
-After accepting a pass, close its pane unless a fix round or next-phase dispatch starts immediately.
-Use `~/.claude/scripts/lib/py ~/.claude/scripts/herdr/worker_panes.py close <name>`.
-The close keeps the thread and staff row; the next assign resumes that thread.
-If a busy worker or live detached run prevents closure, keep the pane. Close it after that work ends.
-The worker command selects idle workers and reuses stopped workers.
+The launcher closes the worker's pane when its pass completes.
+The close keeps the native conversation and staff row.
+The next assign resumes that conversation in a new pane.
+The worker command selects idle workers and resumes stopped workers in new panes.
 Use the short name from `worker.py list` with `--to` when selecting a retained pane worker.
 Keep every busy or unknown worker unchanged.
 The transcript records prompt submission and the matching `DONE <dispatch id>` reply.
@@ -163,13 +162,13 @@ A pane worker has no in-turn compaction option.
 Codex keeps its own full-window limit.
 Do not use mesh claims, mesh roster entries, or phase dispatch locks for this transport.
 
-Shutdown leaves proved stopped workers at the shell and retains their rows and conversations.
+A worker pane closes when its agent command returns. Shutdown retains the worker's row and native conversation.
 Restore resumes only conversations with active dispatches through `worker.py restore`. Idle workers stay closed until their next assign.
 Restore reads the role and active pass from the recorder, then reuses the saved launcher command.
 It reads the transcript before input and never submits the same dispatch twice.
 Account moves resume only workers with active dispatches; each move closes an idle worker's pane.
 An idle worker's next assign opens its conversation on the current role account.
-A stopped worker with an active dispatch keeps its pane and terminal.
+Assign, restore, and account moves resume a stopped worker in a new pane.
 An unknown worker supplies no stopped proof. Inspect its named pane.
 Unrelated proved moves can continue.
 A completed restore or move rerun prints one `unchanged` line and exits 0 without a restart notice.

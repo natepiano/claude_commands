@@ -129,7 +129,7 @@ class QueueEvidenceTests(unittest.TestCase):
         _ = self.running(400, "frame-cost", "clippy", 6.8, 6.1, 60)
         compiler = self.root / "builds.slice/sccache.service"
         compiler.mkdir(parents=True)
-        _ = (compiler / "memory.stat").write_text(f"anon {gib(0.4)}\nfile 0\ninactive_file 0\n")
+        _ = (compiler / "memory.stat").write_text(f"anon {gib(0.4)}\nshmem 0\nfile 0\ninactive_file 0\n")
         _ = (compiler / "memory.current").write_text(str(gib(0.4)))
         self.head_path = self.waiter(500, "inspectors-fix", 11.8, 122)
         self.change_head(need_source="measured", need_runs=7, test_threads=8,
@@ -206,7 +206,7 @@ class QueueEvidenceTests(unittest.TestCase):
             for path in self.directory.glob(pattern):
                 path.unlink()
         compiler = self.root / "builds.slice/sccache.service"
-        _ = (compiler / "memory.stat").write_text("anon 0\nfile 0\ninactive_file 0\n")
+        _ = (compiler / "memory.stat").write_text("anon 0\nshmem 0\nfile 0\ninactive_file 0\n")
         _ = (compiler / "memory.current").write_text("0")
         _ = (self.root / "meminfo").write_text(
             f"MemAvailable: {gib(available) // 1024} kB\nMemTotal: {60 * GIB // 1024} kB\n")
@@ -242,7 +242,7 @@ class QueueEvidenceTests(unittest.TestCase):
                 self.assertIn("merge-holder", text)
                 self.assertEqual(text.count("merge-holder"), 1)
                 self.assertEqual(text.count("other-holder"), 1)
-                self.assertEqual(text.count("anonymous use unavailable"), 1)
+                self.assertEqual(text.count("swap-backed use unavailable"), 1)
                 self.assertNotIn("anonymous use 0.0", text)
                 self.assertNotIn("anonymous use 4.0", text)
                 self.assertIn("room", text)

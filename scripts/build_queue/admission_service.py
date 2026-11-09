@@ -1362,6 +1362,8 @@ class AdmissionServer:
                         ) -> tuple[records.UnownedSliceMemory, ...]:
         owned: set[str] = set()
         scopes: dict[str, str] = {}
+        scope_memory: dict[Path, records.MeasuredMemory] = {}
+        active = {row.get("reservation_id", "") for row in rows}
         for record in self.reservations.values():
             if isinstance(record.place, wire.CloudPlace) and record.sidecar:
                 try:
@@ -1374,6 +1376,8 @@ class AdmissionServer:
             if captured is not None and captured.scope:
                 owned.add(captured.scope)
                 scopes[record.reservation_id] = captured.scope
+                if record.reservation_id in active and isinstance(captured.memory, records.MeasuredMemory):
+                    scope_memory[Path(captured.scope)] = captured.memory
         roots = {row["pid"]: row["start_time"] for row in rows if not scopes.get(row.get("reservation_id", ""))}
         tree_pids = gate.process_tree(roots, dict(evidence.processes))
         result: list[records.UnownedSliceMemory] = []
@@ -1381,18 +1385,22 @@ class AdmissionServer:
             required = not isinstance(memory.job_state, NotServiceSlice)
             if not required and memory.cgroup in owned:
                 continue
+            scoped = [scope_memory[scope] for scope in gate.owned_scope_roots(scope_memory, Path(memory.cgroup))] if required else []
+            scoped_pids = {pid for reading in scoped if isinstance(reading.anonymous_source, records.ScopeSource)
+                           for pid in reading.anonymous_source.members}
             duplicate = [evidence.scope_process_memory[pid]
-                         for pid in evidence.scope_members.get(memory.cgroup, frozenset()) & tree_pids
+                         for pid in (evidence.scope_members.get(memory.cgroup, frozenset()) & tree_pids) - scoped_pids
                          if pid in evidence.scope_process_memory]
             use = sum(item.anonymous.bytes if required and isinstance(item.anonymous, records.AnonymousRunUse)
                       else item.bytes for item in duplicate)
+            use += sum(item.anonymous.bytes for item in scoped if isinstance(item.anonymous, records.AnonymousRunUse))
             job = memory.job_state
             workers = evidence.scope_workers.get(memory.cgroup, frozenset())
             if workers and all(gate.process_tree({pid: evidence.processes[pid].start},
-                               dict(evidence.processes)).intersection(tree_pids) for pid in workers):
+                               dict(evidence.processes)).intersection(tree_pids | scoped_pids) for pid in workers):
                 job = IdleService()
             result.append(replace(memory, bytes=max(0, memory.bytes - use), job_state=job,
-                                  swap_bytes=max(0, memory.swap_bytes - sum(item.swap_bytes for item in duplicate))))
+                                  swap_bytes=max(0, memory.swap_bytes - sum(item.swap_bytes for item in (*duplicate, *scoped)))))
         return tuple(result)
 
     def _sample_runner(self, record: ReservationRecord, use: int, now: float) -> None:

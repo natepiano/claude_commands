@@ -2,7 +2,7 @@
 
 > **Unit:** agents (was shutdown-unit), under sdlc · branch `sdlc-agents` · as-built `docs/as-built/shutdown-and-restart.md`
 
-Earlier phases of this unit are recorded in the as-built and in the branch history. This plan holds Phases 4 to 16.
+Earlier phases of this unit are recorded in the as-built and in the branch history. This plan holds Phases 4 to 17a.
 
 ## Phase 4: herdr's shutdown items and the pane-shell stop — done
 
@@ -101,23 +101,35 @@ Each phase deletes the skill and the code it replaces when it lands. `staff.py` 
 - Worker startup takes the shared run index and the shared Codex snapshot. Restore and stop find a worker's run through one resolver.
 - After a failed worker stop, a worker starts again only when the read proves its old process is gone.
 
-### Phase 12: retire, and resume of a retired unit
+### Phase 12: retire, and resume of a retired unit — done
 
-- `agents retire NAME` removes the unit from active staff. Its row stays only as a retired record. The board does not show it.
+- `agents retire NAME` removes the unit from active staff. Its row stays only as a retired record, and the board does not show it.
 - `agents resume NAME` of a retired unit refuses and names `--retired`. The showrunner asks the user yes or no before it runs `--retired`.
-- Replaces `retire_unit.py` and `resume_unit.py`. Deletes `/showrunner:retire_unit` and `/showrunner:resume_unit`.
-- A restart that cuts a worker off in the middle of a turn leaves a resume step that works. Today the resume note offers the saved assign command. That command exits 3 when the dispatch is already in the transcript and the worker is idle. The resume sends a continue prompt instead (sdlc 2026-11-07).
-- No resume note for a dispatch that is already closed. On 2026-11-07 a note named a fix dispatch that landed five hours before.
+- `retire_unit.py`, `resume_unit.py`, `/showrunner:retire_unit` and `/showrunner:resume_unit` are deleted.
 
-### Phase 13: rename
+### Phase 12a: a worker stopped in the middle of a turn gets a working resume step — done
 
-- `agents rename OLD NEW` for units, showrunners and workers. Workers are in herdr panes, so herdr-unit gives the pane rename.
-- Replaces `rename.py`. Deletes `/showrunner:rename` and `/unit:rename`.
+- When the dispatch is already in the transcript and the worker is idle, the resume sends a continue prompt, not the saved assign command.
+- A dispatch that is already closed gets no resume note.
 
-### Phase 14: move
+### Phase 13: rename — done
 
-- `agents move SESSION_OR_GROUP ACCOUNT`, with natedev's accounts unit. `accounts.py` keeps the account board and the queued moves (`accounts.py next`).
-- Replaces `showrunner_move.py`. Deletes `/showrunner:move`.
+- `agents rename OLD NEW` renames a unit, a showrunner or a worker, `--to-branch` included. A worker's pane label is `<owner>-<name>`, from the one `worker_panes.agent_name` rule.
+- `rename.py`, `/showrunner:rename` and `/unit:rename` are deleted.
+
+### Phase 13a: cancelled
+
+- The one-off conversion of old qualified worker names runs as a program outside the repository (user rule 2026-11-05).
+
+### Phase 13b: two assign defects — done
+
+- A design role dispatch with no summary path ends clean: the reply goes beside the prompt.
+- `agent_name` keeps a name that already starts with `<owner>-`, so a label never gets two owner prefixes.
+
+### Phase 14: move — done
+
+- `agents move SESSION_OR_GROUP ACCOUNT [--dry-run] [--why TEXT]` calls the accounts move. `accounts.py` keeps the account board and the queued moves (`accounts.py next`).
+- `showrunner_move.py` and `/showrunner:move` are deleted.
 
 ### Phase 15: the launch record takes the role account — done
 
@@ -135,3 +147,22 @@ Each phase deletes the skill and the code it replaces when it lands. `staff.py` 
 - A launch by our tools writes Claude trust for the target folder in the target account before it starts. It reuses the `copy_claude_trust` write, in one place. No user step (user rule 2026-11-07: a move or start needs no user work).
 - When trust cannot be written, the launch prints one anomaly line and stops cleanly.
 - Deletes the herdr 23 draft stash in `herdr.py` and its three tests (change row C1211). The user does not want the feature.
+
+### Phase 17: the worker list shows every pane worker without a live scan — done
+
+- `worker.py list --json --all` runs from any caller and lists every pane worker of every manager, with `manager`. It reads the staff record, the dispatch records and the account config once, with no process, herdr or Codex read. 301 rows in 1.03 s on natedev.
+
+### Phase 13c: Codex processes outside panes do not make sessions unknown; restart names live sessions — done
+
+- `herdr.codex_conversations()` counts an unknown Codex process only when it leads its terminal's foreground group and, on Linux, its session leader is a herdr pane shell. A failed process read keeps the entry. Every caller has the rule.
+- An unassigned live session in `agents restart` prints its tab, pane label and pane id.
+
+### Phase 13d: a worker's detached run belongs to that worker — done
+
+- `mesh_runs.py start` reads the caller first. A worker's run always uses that worker's run folder, name and staff id; `--to` is used only for a caller that is not a worker.
+
+### Phase 17a: `worker.py list --json --all` reads a bounded part of the history files
+
+- The list takes 1.8 s on natedev: it reads about 1,270 blocks of 64 KiB from 38 history files and parses about 21,800 events. A worker with no dispatch keeps a file open back to its creation, and a UUIDv4 row keeps it open to the first line.
+- The read cost does not grow with the history. No cache file and no live call.
+- Waits on the models-unit launch proof fix: no worker can start (sdlc 2026-11-08).

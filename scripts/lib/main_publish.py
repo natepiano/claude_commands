@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime, timezone
 import json
 import os
 from pathlib import Path
@@ -44,6 +45,11 @@ class NoPendingMacPull:
 @dataclass(frozen=True)
 class MacPulled:
     """The Mac completed its pull."""
+
+
+@dataclass(frozen=True)
+class MacPullPending:
+    """The Mac is unreachable and its pull is queued."""
 
 
 @dataclass(frozen=True)
@@ -218,3 +224,15 @@ def queue(change: PendingMacPull) -> None:
     # Keep the original zone queue format so installed sync jobs can drain it.
     write_text_atomic(path, json.dumps(dict(zone=change.label, text=change.text,
                                            since=change.since, reason=change.reason), indent=2) + "\n")
+
+
+def queue_pull_only(label: str, reason: str) -> None:
+    """Queue a pull and retain any waiting zone notice."""
+    queue(PendingMacPull(label, "", datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"), reason))
+
+
+def clear_pull_only() -> None:
+    """Clear a completed pull and retain any waiting zone notice."""
+    pending = read_queue()
+    if isinstance(pending, PendingMacPull) and not pending.text:
+        queue_path().unlink(missing_ok=True)

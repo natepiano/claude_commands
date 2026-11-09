@@ -900,3 +900,715 @@ Contract route decisions remain with the current owners.
    gap 0 s; W 2%, D 6%. Total K: 24–36 h. Pin named missing-evidence states.
    Undo: restore manual formatting and remove unused formatter; retain sources.
    Each uses the common sample threshold, recording files and quality gates.
+
+## Step log
+
+### Frozen before sample
+
+The measurement uses phase starts in `[2026-11-03T18:17:52Z, 2026-11-07T23:32:53Z)`.
+The bounds are `[2026-11-03 13:17:52 EST, 2026-11-07 18:32:53 EST)`.
+The start is the main deployment of the staff-lifecycle cut, `3fa44fde1`.
+Postmaster's write-once reply records reached main before that cut.
+Phases 17 and 20 supply no exposure target after the cut.
+The route revision is `7733bee4cdb9d75cd9680482809eff05c1a788e3`.
+It reached main at `2026-11-07T23:32:53Z`, or `2026-11-07 18:32:53 EST`.
+The before anchor is its parent, `e1d8b73ed0274e8fee44952d1dd7500e1e2fdd30`.
+The command uses `--route-revision`; it does not add `--before-at`.
+The reader takes before hashes from that parent's `commands/unit/direct.md` history.
+It selects `BeforeChange` only when the phase starts and finishes with the same recorded before hash.
+A later phase must start with the same hash.
+A phase-plus-gap interval must have one mapped director and no shared-director overlap.
+The phase start selects the window; the gap can end after the upper bound.
+These rules do not select on the token value or a successful process outcome.
+
+The measured script is `/home/natepiano/worktrees/phases/scripts/direct/phase_process.py`.
+Its last path commit is `3e2bf4c3418df4515eb60d53d651237a1a117faa`.
+The file's Git blob is `98bef1370ee83586a43f1b0e12cd16b92b30876e`.
+The measurement worktree HEAD is `96c882a1e44102e44e24fd1a9a13d41d3490fd91`.
+All 18 invocations below exited 0 on 2026-11-08.
+The summary runs reported zero source-record read problems.
+Each summary agrees with its detail run on the trial measures.
+The full output is `/tmp/claude/unit/29fc6964-2d74-4547-8edd-8764df425c44/mesh_runs/20261108T115459-1441441-690a.log`.
+The board records each full invocation before it runs.
+The source run records remain unchanged.
+The two devtools selectors have unavailable compaction counts because their transcript has invalid JSON at line 13452.
+The trial output below retains those missing states.
+
+The nine selectors cover 31 distinct eligible phase instances in nine runs.
+The original command outputs contain 34 detail rows because two selectors overlap.
+The unit tables below contain each of the 31 eligible instances once.
+`remove-running-section-handler` also selects `cargo-liner-handler` phases 66 and 63.
+`sdlc-devtools` also selects `devtools` phase 7n.
+The reader matches `--units` against run-start unit, worktree, branch, and working-directory name.
+Seven selectors supply separate unit measures directly.
+For the two overlapping selectors, the unit summaries below use only that unit's run rows.
+The original commands remain the source for those rows.
+Their selector-level exclusion counts remain separate from the unit measures.
+No per-unit total includes another unit's phase.
+The phase-time tables also contain only the named unit.
+
+Per-unit measure counts:
+
+| Unit | Eligible phase instances | Weighted tokens n | Raw input n | Raw output n | Compactions n | Reload request sizes n |
+| --- | --- | --- | --- | --- | --- | --- |
+| cargo-liner-handler | 2 | 2 | 2 | 2 | 2 | 3 |
+| claude-natedev-builds-natest | 1 | 1 | 1 | 1 | 1 | 3 |
+| claude-natedev-builds-resources | 12 | 10 | 12 | 12 | 12 | 6 |
+| claude-natedev-efficiency | 2 | 2 | 2 | 2 | 2 | 1 |
+| claude-natedev-unit-board | 1 | 1 | 1 | 1 | 1 | 0 |
+| devtools | 1 | 1 | 1 | 1 | 0 | 0 |
+| hana_catalyst-build-speed-tests | 7 | 7 | 7 | 7 | 7 | 3 |
+| remove-running-section-handler | 1 | 1 | 1 | 1 | 1 | 1 |
+| sdlc-devtools | 4 | 3 | 4 | 4 | 0 | 0 |
+
+The raw input, raw output, and compaction columns count phases with recorded values.
+The last column counts requests with a recorded input size, not phases.
+A zero measured count does not prove zero compactions or reloads.
+
+### Matching fields and their sources
+
+| Field | Source and rule |
+| --- | --- |
+| Run, display phase, instance, start | `/home/natepiano/.local/state/plan-delegate/runs/<run>.jsonl`, `phase_started` fields `run_id`, `phase_id`, `phase_instance_id`, and `timestamp`. |
+| Mode | `NotRecorded` for every row. The selected run-start, phase-start, and pass-start events contain no phase mode. The retained phase prompts also supply no phase mode. No current state or branch name substitutes for it. |
+| Scope class | Count distinct paths in the retained Work Order's `Files` list, including a named `Files:` boundary. A cited Git revision can retain that list. Small means 1–5 paths. Medium means 6–20 paths. Large means more than 20 paths. A prompt can name its list in a separate file. The row cites that file. Missing lists remain `NotRecorded`. |
+| Worker model | The matching instance's `pass_started.called_agent` records supply family, model, effort, and pass kind. `unknown` models and absent worker passes become `NotRecorded`. Director models from `run_started.main_agent` do not substitute for worker models. |
+| Gates | The cited Git Work Order, prompt's acceptance or verification section, or retained verification script supplies the required checks. These cells name requirements, not proof that each check passed. Missing gate sources remain `NotRecorded`. |
+| Weighted tokens | Copy the complete `str(row.tokens.weighted)` value from each `--detail trial` row. Keep `Unweighted` states with their reason. Do not use the short summary cells as exact values. |
+
+`work_order_file_targets` counts quoted path references across the prompt, not only its `Files` list.
+It is not the scope count.
+Git retains the resources Work Orders in `docs/plans/builds-resources.md` at their code checkpoints.
+They supply scopes of 2, 1, 1, and 4 paths for phases 54, 73, 74, and 76.
+Each matching row below cites the full checkpoint id and its acceptance requirements.
+I also read each checkpoint's parent.
+Those parent versions contain no reference to the corresponding phase.
+The checkpoint Work Order is the retained source; it is not a separate snapshot from phase start.
+
+The unit-board ad hoc prompt has no Work Order `Files` list.
+Its checkpoint, `d021ff246d48fdc46c8ffed9c6e6afeed8e12853`, also retains no such list or its named plan.
+Its scope therefore stays `NotRecorded`; the checkpoint's changed-file count is not a substitute.
+That checkpoint names `test_progress_history.py`, `test_phase_reservation.py`, and basedpyright as its checks.
+The row cites that commit message and the retained prompt.
+The later `files` artifact alone does not establish a dispatched Work Order's list.
+
+The source for Hana phase 23 is its retained baseline plan.
+I read `dff432ff4905816a0f04ab687ddd16fa6311a37e:docs/hana/tool-based-ui-build-speed-tests.md` again.
+Its Phase 23 Work Order lists only `.config/nextest.toml` and requires the command-palette suite and a Change-Review line.
+That phase names no worker and has no worker pass.
+
+The detail output omits the instance id.
+A display id with several starts inside the window is therefore marked `Ambiguous`.
+The candidate lists below record all its starts inside the window.
+The row tables also retain the instances selected by the reader's start/finish pairing, in detail output order.
+Those paired ids do not make the printed display label unique.
+Phase 5 must retain this ambiguity when it matches samples.
+
+The core keeps its additional tags.
+This measurement moves or deletes no contract section.
+A further cut of the core remains a candidate for the next phase.
+
+### cargo-liner-handler
+
+Frozen invocations:
+
+```sh
+/home/natepiano/.claude/scripts/lib/py /home/natepiano/worktrees/phases/scripts/direct/phase_process.py baseline --exposure before --route-revision 7733bee4cdb9d75cd9680482809eff05c1a788e3 --units cargo-liner-handler --since 2026-11-03T18:17:52Z --until 2026-11-07T23:32:53Z
+/home/natepiano/.claude/scripts/lib/py /home/natepiano/worktrees/phases/scripts/direct/phase_process.py baseline --exposure before --route-revision 7733bee4cdb9d75cd9680482809eff05c1a788e3 --units cargo-liner-handler --since 2026-11-03T18:17:52Z --until 2026-11-07T23:32:53Z --detail trial
+```
+
+Both commands exited 0.
+
+Trial counts, distributions, and excluded states:
+
+```text
+Trial exclusions before exposure filter, selected units and phase starts in [2026-11-03 13:17:52 EST, 2026-11-07 18:32:53 EST): mixed n=0; open unmixed n=0.
+Trial exposure filter: before; select phase starts in [2026-11-03 13:17:52 EST, 2026-11-07 18:32:53 EST); phase-plus-gap end can follow window end.
+Exposure: BeforeChange n=4; AfterChange n=0; ExposureNotRecorded n=8
+Phase-plus-gap exclusions (states can overlap): ExposureNotRecorded: direct.md hash changed during phase n=8; NoFollowingPhase n=1; SharedDirector n=7
+
+Trial measures — eligible phases, natedev only
+Director tokens: phase plus gap; compactions: phase
+measure                n phases  median    p90  total
+weighted tokens               2    4.8M   5.4M   9.5M
+raw input with caches         2   30.4M  32.8M  60.9M
+raw output                    2     87K    95K   174K
+compactions                   2     1.5      2      3
+
+Context size after reload — raw input including caches | [2026-11-03 13:17:52 EST, 2026-11-07 18:32:53 EST)
+measure                                   n reloads  median   p90      total    not recorded
+first request after contract Read result  3          126,885  144,679  392,696  0
+Reload states: NoCompaction n=0 phases; NoReload n=0 compactions; NotRecorded n=0 phases, n=0 requests.
+Weighted states: Unweighted n=0 phases; NotRecorded n=0 phases.
+```
+
+Phase time from the trial's eligible phase-time section:
+
+```text
+Trial phase time per unit — eligible start-selected phases, natedev only | [2026-11-03 13:17:52 EST, 2026-11-07 18:32:53 EST)
+unit                 n phases  median     p90        total  not recorded
+cargo-liner-handler  2         101.9 min  114.9 min  3.4 h  0
+```
+
+Source records:
+
+- `/home/natepiano/.local/state/plan-delegate/runs/be6481c9-047e-4add-83c1-870d55a33343.jsonl`.
+
+Selected phase instances and exact costs:
+
+| Run / display phase | Instance selected by the reader | Start UTC | Weighted tokens | Raw input including caches | Raw output | Compactions | Display match |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `be6481c9-047e-4add-83c1-870d55a33343/66` | `cdf264c2-600a-441d-98f2-90dfb1921426` | `2026-11-07T04:12:39.088+00:00` | `5387968.200000003` | 32783720 | 94848 | 2 | Unique |
+| `be6481c9-047e-4add-83c1-870d55a33343/63` | `7d21bb7f-bd53-4090-a825-d3756ef5f772` | `2026-11-07T07:27:39.440+00:00` | `4148327.3000000007` | 28079781 | 79560 | 1 | Unique |
+
+Matching metadata:
+
+| Phase / instance prefix | Mode | Scope class | Worker model and pass kinds | Source for scope and gates | Gates |
+| --- | --- | --- | --- | --- | --- |
+| 66 / `cdf264c2` | NotRecorded | small (5 paths) | `codex / gpt-6.1-sol / high` (fix, impl, review, test) | `/tmp/claude/unit/be6481c9-047e-4add-83c1-870d55a33343/phases/66/work_order.md` | verify.sh test cargo-handler; verify.sh lint cargo-handler; live shots at 200×50 and 120×40; Change-Review |
+| 63 / `7d21bb7f` | NotRecorded | medium (7 paths) | `codex / gpt-6.1-sol / high` (fix, impl, review) | `/tmp/claude/unit/be6481c9-047e-4add-83c1-870d55a33343/phases/63/implementation_prompt.md` | verify.sh test cargo-handler; verify.sh lint cargo-handler; director live shots; Change-Review |
+
+### claude-natedev-builds-natest
+
+Frozen invocations:
+
+```sh
+/home/natepiano/.claude/scripts/lib/py /home/natepiano/worktrees/phases/scripts/direct/phase_process.py baseline --exposure before --route-revision 7733bee4cdb9d75cd9680482809eff05c1a788e3 --units claude-natedev-builds-natest --since 2026-11-03T18:17:52Z --until 2026-11-07T23:32:53Z
+/home/natepiano/.claude/scripts/lib/py /home/natepiano/worktrees/phases/scripts/direct/phase_process.py baseline --exposure before --route-revision 7733bee4cdb9d75cd9680482809eff05c1a788e3 --units claude-natedev-builds-natest --since 2026-11-03T18:17:52Z --until 2026-11-07T23:32:53Z --detail trial
+```
+
+Both commands exited 0.
+
+Trial counts, distributions, and excluded states:
+
+```text
+Trial exclusions before exposure filter, selected units and phase starts in [2026-11-03 13:17:52 EST, 2026-11-07 18:32:53 EST): mixed n=0; open unmixed n=1.
+Trial exposure filter: before; select phase starts in [2026-11-03 13:17:52 EST, 2026-11-07 18:32:53 EST); phase-plus-gap end can follow window end.
+Exposure: BeforeChange n=51; AfterChange n=0; ExposureNotRecorded n=30
+Phase-plus-gap exclusions (states can overlap): ExposureNotRecorded: direct.md hash changed during phase n=30; NoFollowingPhase n=0; SharedDirector n=80
+
+Trial measures — eligible phases, natedev only
+Director tokens: phase plus gap; compactions: phase
+measure                n phases  median    p90  total
+weighted tokens               1    7.2M   7.2M   7.2M
+raw input with caches         1   50.2M  50.2M  50.2M
+raw output                    1    164K   164K   164K
+compactions                   1       3      3      3
+
+Context size after reload — raw input including caches | [2026-11-03 13:17:52 EST, 2026-11-07 18:32:53 EST)
+measure                                   n reloads  median   p90      total    not recorded
+first request after contract Read result  3          116,514  116,855  349,008  0
+Reload states: NoCompaction n=0 phases; NoReload n=0 compactions; NotRecorded n=0 phases, n=0 requests.
+Weighted states: Unweighted n=0 phases; NotRecorded n=0 phases.
+```
+
+Phase time from the trial's eligible phase-time section:
+
+```text
+Trial phase time per unit — eligible start-selected phases, natedev only | [2026-11-03 13:17:52 EST, 2026-11-07 18:32:53 EST)
+unit                          n phases  median    p90       total     not recorded
+claude-natedev-builds-natest  1         91.2 min  91.2 min  91.2 min  0
+```
+
+Source records:
+
+- `/home/natepiano/.local/state/plan-delegate/runs/2113de4f-9913-485a-9a51-61558bfd81db.jsonl`.
+
+Selected phase instances and exact costs:
+
+| Run / display phase | Instance selected by the reader | Start UTC | Weighted tokens | Raw input including caches | Raw output | Compactions | Display match |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `2113de4f-9913-485a-9a51-61558bfd81db/4` | `c811de0c-5fd1-4cc5-ae39-cc709adeed48` | `2026-11-03T22:41:47.946+00:00` | `7205501.099999997` | 50152481 | 164100 | 3 | Unique |
+
+Matching metadata:
+
+| Phase / instance prefix | Mode | Scope class | Worker model and pass kinds | Source for scope and gates | Gates |
+| --- | --- | --- | --- | --- | --- |
+| 4 / `c811de0c` | NotRecorded | medium (8 paths) | `claude / opus / xhigh` (review); `codex / gpt-6.1-sol / high` (fix, impl, review, test) | `/tmp/claude/unit/2113de4f-9913-485a-9a51-61558bfd81db/phases/4/work_order.md` | buildlog store/record tests; memory_admit and sweep tests; test_times tests; scripts/lib tests; basedpyright; warm query below 1 second; live build-log queries |
+
+### claude-natedev-builds-resources
+
+Frozen invocations:
+
+```sh
+/home/natepiano/.claude/scripts/lib/py /home/natepiano/worktrees/phases/scripts/direct/phase_process.py baseline --exposure before --route-revision 7733bee4cdb9d75cd9680482809eff05c1a788e3 --units claude-natedev-builds-resources --since 2026-11-03T18:17:52Z --until 2026-11-07T23:32:53Z
+/home/natepiano/.claude/scripts/lib/py /home/natepiano/worktrees/phases/scripts/direct/phase_process.py baseline --exposure before --route-revision 7733bee4cdb9d75cd9680482809eff05c1a788e3 --units claude-natedev-builds-resources --since 2026-11-03T18:17:52Z --until 2026-11-07T23:32:53Z --detail trial
+```
+
+Both commands exited 0.
+
+Trial counts, distributions, and excluded states:
+
+```text
+Trial exclusions before exposure filter, selected units and phase starts in [2026-11-03 13:17:52 EST, 2026-11-07 18:32:53 EST): mixed n=0; open unmixed n=0.
+Trial exposure filter: before; select phase starts in [2026-11-03 13:17:52 EST, 2026-11-07 18:32:53 EST); phase-plus-gap end can follow window end.
+Exposure: BeforeChange n=28; AfterChange n=0; ExposureNotRecorded n=7
+Phase-plus-gap exclusions (states can overlap): ExposureNotRecorded: direct.md hash changed during phase n=7; ExposureNotRecorded: next phase starts with a different direct.md hash n=1; NoFollowingPhase n=1; SharedDirector n=17
+
+Trial measures — eligible phases, natedev only
+Director tokens: phase plus gap; compactions: phase
+measure                n phases  median    p90   total
+weighted tokens              10    3.5M   6.4M   37.3M
+raw input with caches        12   26.9M  43.5M  312.8M
+raw output                   12     77K   154K    993K
+compactions                  12       1      3      16
+not recorded: weighted tokens n=2
+
+Context size after reload — raw input including caches | [2026-11-03 13:17:52 EST, 2026-11-07 18:32:53 EST)
+measure                                   n reloads  median   p90      total    not recorded
+first request after contract Read result  6          105,457  114,388  626,763  10
+Reload states: NoCompaction n=3 phases; NoReload n=10 compactions; NotRecorded n=0 phases, n=0 requests.
+Weighted states: Unweighted n=2 phases; NotRecorded n=0 phases.
+NoReload: no contract Read after compact_boundary; n=10
+Unweighted: unweighted model '<synthetic>' at 2026-11-04T10:46:12.506000+00:00; n=1
+Unweighted: unweighted model '<synthetic>' at 2026-11-05T12:59:31.655000+00:00; n=1
+```
+
+Phase time from the trial's eligible phase-time section:
+
+```text
+Trial phase time per unit — eligible start-selected phases, natedev only | [2026-11-03 13:17:52 EST, 2026-11-07 18:32:53 EST)
+unit                             n phases  median    p90        total   not recorded
+claude-natedev-builds-resources  12        66.9 min  107.1 min  12.0 h  0
+```
+
+Source records:
+
+- `/home/natepiano/.local/state/plan-delegate/runs/abea5ffb-4b99-499e-ae41-7ebb04630f9f.jsonl`.
+
+Selected phase instances and exact costs:
+
+| Run / display phase | Instance selected by the reader | Start UTC | Weighted tokens | Raw input including caches | Raw output | Compactions | Display match |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `abea5ffb-4b99-499e-ae41-7ebb04630f9f/54` | `8f40a9b3-095c-4f39-9f9b-d76ba929e188` | `2026-11-04T00:23:23.197+00:00` | `1490333.0999999999` | 10601005 | 25752 | 0 | Unique |
+| `abea5ffb-4b99-499e-ae41-7ebb04630f9f/39` | `ab1eaceb-27a5-48db-a6d7-a60cd02db6e1` | `2026-11-04T10:11:57.870+00:00` | `Unweighted(reasons=("unweighted model '<synthetic>' at 2026-11-04T10:46:12.506000+00:00",))` | 30994317 | 84670 | 2 | Unique |
+| `abea5ffb-4b99-499e-ae41-7ebb04630f9f/56` | `8cb2a737-ecca-4ca0-9546-b73be76cb8ae` | `2026-11-04T13:33:37.312+00:00` | `3104643.8` | 24029824 | 49740 | 1 | Unique |
+| `abea5ffb-4b99-499e-ae41-7ebb04630f9f/61` | `f9d8d345-fea6-49a3-8b68-f9ece2c5185c` | `2026-11-05T01:53:00.673+00:00` | `6395781.399999999` | 41587265 | 128191 | 3 | Unique |
+| `abea5ffb-4b99-499e-ae41-7ebb04630f9f/63` | `afad3c7f-98bc-4542-bf4d-e26e9520977f` | `2026-11-05T03:21:36.283+00:00` | `6362407.5` | 43455879 | 137141 | 2 | Unique |
+| `abea5ffb-4b99-499e-ae41-7ebb04630f9f/64` | `01bb236f-bb60-4bb1-a1c7-ec5505501553` | `2026-11-05T05:13:07.422+00:00` | `7427555.099999994` | 52589276 | 162444 | 3 | Unique |
+| `abea5ffb-4b99-499e-ae41-7ebb04630f9f/69` | `1762ca33-e71b-4b99-82b9-355c6b750dbe` | `2026-11-05T11:33:44.810+00:00` | `Unweighted(reasons=("unweighted model '<synthetic>' at 2026-11-05T12:59:31.655000+00:00",))` | 29533353 | 82185 | 1 | Unique |
+| `abea5ffb-4b99-499e-ae41-7ebb04630f9f/72` | `5d7d517a-aa5f-4c3d-8c3d-d42d5d0b5b19` | `2026-11-05T16:54:30.186+00:00` | `3856336.1000000006` | 29349795 | 72487 | 1 | Unique |
+| `abea5ffb-4b99-499e-ae41-7ebb04630f9f/73` | `5bdfbe23-b06b-4e08-83cd-d09a66eb1259` | `2026-11-05T18:21:09.061+00:00` | `1494287.9000000001` | 10895974 | 29838 | 1 | Unique |
+| `abea5ffb-4b99-499e-ae41-7ebb04630f9f/74` | `0d82e9a8-3357-4fa5-a308-17eeea921cb1` | `2026-11-05T18:44:16.879+00:00` | `730937.7000000003` | 5739953 | 16719 | 0 | Unique |
+| `abea5ffb-4b99-499e-ae41-7ebb04630f9f/57` | `08c575e8-208b-4158-a4c9-fc1ab8f26f40` | `2026-11-05T21:32:07.995+00:00` | `4747762.5` | 24407919 | 154033 | 2 | Unique |
+| `abea5ffb-4b99-499e-ae41-7ebb04630f9f/76` | `01ac0ecc-ba47-4341-9790-24e18ad212bf` | `2026-11-06T01:03:31.345+00:00` | `1643514.8` | 9575680 | 49619 | 0 | Unique |
+
+Matching metadata:
+
+| Phase / instance prefix | Mode | Scope class | Worker model and pass kinds | Source for scope and gates | Gates |
+| --- | --- | --- | --- | --- | --- |
+| 54 / `8f40a9b3` | NotRecorded | small (2 paths) | `codex / gpt-6.1-sol / high` (review) | `git 1278447e8b6427c4d09491c7140d3cdeccaaa916:docs/plans/builds-resources.md`, Phase 54 | test_sweep.py; basedpyright on changed files |
+| 39 / `ab1eaceb` | NotRecorded | small (5 paths) | `claude / opus / xhigh` (review); `codex / gpt-6.1-sol / high` (fix, impl, review, test) | `/tmp/claude/unit/abea5ffb-4b99-499e-ae41-7ebb04630f9f/phases/39/implementation_prompt.md` | memory_admit and build-queue tests; basedpyright; replay report; one-day memory-kill follow-up |
+| 56 / `8cb2a737` | NotRecorded | small (2 paths) | `claude / opus / xhigh` (review); `codex / gpt-6.1-sol / high` (fix, impl, review) | `/tmp/claude/unit/abea5ffb-4b99-499e-ae41-7ebb04630f9f/phases/56/implementation_prompt.md` | build_hold tests; memory_admit tests; basedpyright on modules and callers |
+| 61 / `f9d8d345` | NotRecorded | small (5 paths) | `claude / opus / xhigh` (review); `codex / gpt-6.1-sol / high` (fix, impl, review, test) | `/tmp/claude/unit/abea5ffb-4b99-499e-ae41-7ebb04630f9f/phases/61/implementation_prompt.md` | sweep, tmp_sweep, push_texts tests; basedpyright; three warm floor dry runs below 30 seconds; retained target mapping |
+| 63 / `afad3c7f` | NotRecorded | medium (6 paths) | `claude / opus / xhigh` (review); `codex / gpt-6.1-sol / high` (fix, impl, review, test) | `/tmp/claude/unit/abea5ffb-4b99-499e-ae41-7ebb04630f9f/phases/63/work_order.md` | sweep, tmp_sweep, push_texts tests; basedpyright; Change-Review; delivery and restart cases |
+| 64 / `01bb236f` | NotRecorded | medium (8 paths) | `claude / opus / xhigh` (review); `codex / gpt-6.1-sol / high` (fix, impl, review, test) | `/tmp/claude/unit/abea5ffb-4b99-499e-ae41-7ebb04630f9f/phases/64/implementation_prompt.md` | build_shape, sweep, and memory tests; basedpyright; reader CPU comparison; floor dry run below 30 seconds |
+| 69 / `1762ca33` | NotRecorded | small (4 paths) | `claude / opus / xhigh` (review); `codex / gpt-6.1-sol / high` (fix, impl, review, test) | `/tmp/claude/unit/abea5ffb-4b99-499e-ae41-7ebb04630f9f/phases/69/implementation_prompt.md` | history-decode and evidence-query tests; replay equality; estimate median at most 0.436 seconds |
+| 72 / `5d7d517a` | NotRecorded | small (2 paths) | `claude / opus / xhigh` (review); `codex / gpt-6.1-sol / high` (fix, impl, review) | `/tmp/claude/unit/abea5ffb-4b99-499e-ae41-7ebb04630f9f/phases/72/implementation_prompt.md` | test_tmp_sweep; basedpyright; three named empty-marker and fallback cases |
+| 73 / `5bdfbe23` | NotRecorded | small (1 path) | `codex / gpt-6.1-sol / high` (impl) | `git 9a1ced7c4aeec747360a168eeeb9bc0dc7f75b11:docs/plans/builds-resources.md`, Phase 73 | Report test and folder code with file:line and folder size; per-day cause counts or missing-evidence reasons; proposal code, seconds, disk cost, and config keys |
+| 74 / `0d82e9a8` | NotRecorded | small (1 path) | `codex / gpt-6.1-sol / high` (impl) | `git f3b92b18e78a357215cf0e3594f028bba3f11664:docs/plans/builds-resources.md`, Phase 74 | Report the Mac checkout and target folder; cause with its record or a missing-evidence reason; repeat count; propose a fix only for two or more cases |
+| 57 / `08c575e8` | NotRecorded | small (3 paths) | `claude / opus / xhigh` (review); `codex / gpt-6.1-sol / high` (fix, impl, review, test) | `/tmp/claude/unit/abea5ffb-4b99-499e-ae41-7ebb04630f9f/phases/57/implementation_prompt.md` | measurement tests; basedpyright; wait-overlap comparison with missing-evidence states |
+| 76 / `01ac0ecc` | NotRecorded | small (4 paths) | `claude / opus / xhigh` (review); `codex / gpt-6.1-sol / high` (fix, impl, review, test) | `git 432168bb96d918c90b159c00a4628c49c6b8e882:docs/plans/builds-resources.md`, Phase 76 | test_scratch, test_copies, test_tmp_sweep, test_folder_audit, test_crate_run; basedpyright; distinct task and deadline cases |
+
+### claude-natedev-efficiency
+
+Frozen invocations:
+
+```sh
+/home/natepiano/.claude/scripts/lib/py /home/natepiano/worktrees/phases/scripts/direct/phase_process.py baseline --exposure before --route-revision 7733bee4cdb9d75cd9680482809eff05c1a788e3 --units claude-natedev-efficiency --since 2026-11-03T18:17:52Z --until 2026-11-07T23:32:53Z
+/home/natepiano/.claude/scripts/lib/py /home/natepiano/worktrees/phases/scripts/direct/phase_process.py baseline --exposure before --route-revision 7733bee4cdb9d75cd9680482809eff05c1a788e3 --units claude-natedev-efficiency --since 2026-11-03T18:17:52Z --until 2026-11-07T23:32:53Z --detail trial
+```
+
+Both commands exited 0.
+
+Trial counts, distributions, and excluded states:
+
+```text
+Trial exclusions before exposure filter, selected units and phase starts in [2026-11-03 13:17:52 EST, 2026-11-07 18:32:53 EST): mixed n=0; open unmixed n=0.
+Trial exposure filter: before; select phase starts in [2026-11-03 13:17:52 EST, 2026-11-07 18:32:53 EST); phase-plus-gap end can follow window end.
+Exposure: BeforeChange n=13; AfterChange n=0; ExposureNotRecorded n=3
+Phase-plus-gap exclusions (states can overlap): ExposureNotRecorded: direct.md hash changed during phase n=3; ExposureNotRecorded: next phase starts with a different direct.md hash n=1; NoFollowingPhase n=0; SharedDirector n=13
+
+Trial measures — eligible phases, natedev only
+Director tokens: phase plus gap; compactions: phase
+measure                n phases  median    p90  total
+weighted tokens               2    3.2M   3.8M   6.5M
+raw input with caches         2   19.3M  20.7M  38.6M
+raw output                    2     85K    86K   171K
+compactions                   2     0.5      1      1
+
+Context size after reload — raw input including caches | [2026-11-03 13:17:52 EST, 2026-11-07 18:32:53 EST)
+measure                                   n reloads  median   p90      total    not recorded
+first request after contract Read result  1          101,428  101,428  101,428  0
+Reload states: NoCompaction n=1 phases; NoReload n=0 compactions; NotRecorded n=0 phases, n=0 requests.
+Weighted states: Unweighted n=0 phases; NotRecorded n=0 phases.
+```
+
+Phase time from the trial's eligible phase-time section:
+
+```text
+Trial phase time per unit — eligible start-selected phases, natedev only | [2026-11-03 13:17:52 EST, 2026-11-07 18:32:53 EST)
+unit                       n phases  median    p90       total     not recorded
+claude-natedev-efficiency  2         41.5 min  49.2 min  83.0 min  0
+```
+
+Source records:
+
+- `/home/natepiano/.local/state/plan-delegate/runs/1ce2e169-3129-4f89-b65d-25ead85f2048.jsonl`.
+
+Selected phase instances and exact costs:
+
+| Run / display phase | Instance selected by the reader | Start UTC | Weighted tokens | Raw input including caches | Raw output | Compactions | Display match |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `1ce2e169-3129-4f89-b65d-25ead85f2048/17z` | `0922b6b4-2fb1-46c8-8936-dd40cd6a8b06` | `2026-11-04T14:21:48.239+00:00` | `2676019.6999999993` | 17865912 | 85326 | 1 | Unique |
+| `1ce2e169-3129-4f89-b65d-25ead85f2048/18c` | `f9e6d1c1-4925-4568-bd33-6e36e28e5649` | `2026-11-05T08:14:48.850+00:00` | `3811565.300000001` | 20725805 | 85538 | 0 | Unique |
+
+Matching metadata:
+
+| Phase / instance prefix | Mode | Scope class | Worker model and pass kinds | Source for scope and gates | Gates |
+| --- | --- | --- | --- | --- | --- |
+| 17z / `0922b6b4` | NotRecorded | medium (14 paths) | `codex / gpt-6.1-sol / high` (fix, impl, review) | `/tmp/claude/unit/1ce2e169-3129-4f89-b65d-25ead85f2048/phases/17z/dispatch_1_prompt.txt`; `/tmp/claude/unit/1ce2e169-3129-4f89-b65d-25ead85f2048/phases/17z/files_17z` | basedpyright; git diff --check; verify.py hook tests |
+| 18c / `f9e6d1c1` | NotRecorded | small (5 paths) | `codex / gpt-6.1-sol / high` (fix, impl, review) | `/tmp/claude/unit/1ce2e169-3129-4f89-b65d-25ead85f2048/phases/18c/dispatch_1_prompt.txt`; `/tmp/claude/unit/1ce2e169-3129-4f89-b65d-25ead85f2048/phases/18c/files_18c` | test_scratch_guard, test_codex_hooks, test_hook_dispatch, test_copy_guard in the worktree and baseline clone; basedpyright; git diff --check |
+
+### claude-natedev-unit-board
+
+Frozen invocations:
+
+```sh
+/home/natepiano/.claude/scripts/lib/py /home/natepiano/worktrees/phases/scripts/direct/phase_process.py baseline --exposure before --route-revision 7733bee4cdb9d75cd9680482809eff05c1a788e3 --units claude-natedev-unit-board --since 2026-11-03T18:17:52Z --until 2026-11-07T23:32:53Z
+/home/natepiano/.claude/scripts/lib/py /home/natepiano/worktrees/phases/scripts/direct/phase_process.py baseline --exposure before --route-revision 7733bee4cdb9d75cd9680482809eff05c1a788e3 --units claude-natedev-unit-board --since 2026-11-03T18:17:52Z --until 2026-11-07T23:32:53Z --detail trial
+```
+
+Both commands exited 0.
+
+Trial counts, distributions, and excluded states:
+
+```text
+Trial exclusions before exposure filter, selected units and phase starts in [2026-11-03 13:17:52 EST, 2026-11-07 18:32:53 EST): mixed n=0; open unmixed n=0.
+Trial exposure filter: before; select phase starts in [2026-11-03 13:17:52 EST, 2026-11-07 18:32:53 EST); phase-plus-gap end can follow window end.
+Exposure: BeforeChange n=2; AfterChange n=0; ExposureNotRecorded n=0
+Phase-plus-gap exclusions (states can overlap): ExposureNotRecorded: next phase starts with a different direct.md hash n=1; NoFollowingPhase n=0; SharedDirector n=0
+
+Trial measures — eligible phases, natedev only
+Director tokens: phase plus gap; compactions: phase
+measure                n phases  median   p90  total
+weighted tokens               1    1.1M  1.1M   1.1M
+raw input with caches         1    5.7M  5.7M   5.7M
+raw output                    1     11K   11K    11K
+compactions                   1       0     0      0
+
+Context size after reload — raw input including caches | [2026-11-03 13:17:52 EST, 2026-11-07 18:32:53 EST)
+measure                                   n reloads  median  p90  total  not recorded
+first request after contract Read result  0          —       —    —      0
+Reload states: NoCompaction n=1 phases; NoReload n=0 compactions; NotRecorded n=0 phases, n=0 requests.
+Weighted states: Unweighted n=0 phases; NotRecorded n=0 phases.
+```
+
+Phase time from the trial's eligible phase-time section:
+
+```text
+Trial phase time per unit — eligible start-selected phases, natedev only | [2026-11-03 13:17:52 EST, 2026-11-07 18:32:53 EST)
+unit                       n phases  median    p90       total     not recorded
+claude-natedev-unit-board  1         16.8 min  16.8 min  16.8 min  0
+```
+
+Source records:
+
+- `/home/natepiano/.local/state/plan-delegate/runs/c7e0945c-3a78-4eae-9323-899ca2940c82.jsonl`.
+
+Selected phase instances and exact costs:
+
+| Run / display phase | Instance selected by the reader | Start UTC | Weighted tokens | Raw input including caches | Raw output | Compactions | Display match |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `c7e0945c-3a78-4eae-9323-899ca2940c82/adhoc-reused-phase-reset` | `ee9cdd2a-6fa1-46bb-bcb9-806897dedc11` | `2026-11-04T00:19:47.690+00:00` | `1078853.7000000002` | 5712334 | 11106 | 0 | Unique |
+
+Matching metadata:
+
+| Phase / instance prefix | Mode | Scope class | Worker model and pass kinds | Source for scope and gates | Gates |
+| --- | --- | --- | --- | --- | --- |
+| adhoc-reused-phase-reset / `ee9cdd2a` | NotRecorded | NotRecorded | `codex / gpt-6.1-sol / high` (impl, review) | `/tmp/claude/unit/c7e0945c-3a78-4eae-9323-899ca2940c82/phases/adhoc-reused-phase-reset/impl_prompt.md`; `git show -s --format=%B d021ff246d48fdc46c8ffed9c6e6afeed8e12853` | test_progress_history.py; test_phase_reservation.py; basedpyright |
+
+### devtools
+
+Frozen invocations:
+
+```sh
+/home/natepiano/.claude/scripts/lib/py /home/natepiano/worktrees/phases/scripts/direct/phase_process.py baseline --exposure before --route-revision 7733bee4cdb9d75cd9680482809eff05c1a788e3 --units devtools --since 2026-11-03T18:17:52Z --until 2026-11-07T23:32:53Z
+/home/natepiano/.claude/scripts/lib/py /home/natepiano/worktrees/phases/scripts/direct/phase_process.py baseline --exposure before --route-revision 7733bee4cdb9d75cd9680482809eff05c1a788e3 --units devtools --since 2026-11-03T18:17:52Z --until 2026-11-07T23:32:53Z --detail trial
+```
+
+Both commands exited 0.
+
+Trial counts, distributions, and excluded states:
+
+```text
+Trial exclusions before exposure filter, selected units and phase starts in [2026-11-03 13:17:52 EST, 2026-11-07 18:32:53 EST): mixed n=0; open unmixed n=0.
+Trial exposure filter: before; select phase starts in [2026-11-03 13:17:52 EST, 2026-11-07 18:32:53 EST); phase-plus-gap end can follow window end.
+Exposure: BeforeChange n=39; AfterChange n=0; ExposureNotRecorded n=15
+Phase-plus-gap exclusions (states can overlap): ExposureNotRecorded: direct.md hash changed during phase n=15; NoFollowingPhase n=0; SharedDirector n=53
+
+Trial measures — eligible phases, natedev only
+Director tokens: phase plus gap; compactions: phase
+measure                n phases  median   p90  total
+weighted tokens               1    641K  641K   641K
+raw input with caches         1    5.3M  5.3M   5.3M
+raw output                    1     13K   13K    13K
+compactions                   0       —     —      —
+not recorded: compactions n=1
+
+Context size after reload — raw input including caches | [2026-11-03 13:17:52 EST, 2026-11-07 18:32:53 EST)
+measure                                   n reloads  median  p90  total  not recorded
+first request after contract Read result  0          —       —    —      0
+Reload states: NoCompaction n=0 phases; NoReload n=0 compactions; NotRecorded n=1 phases, n=0 requests.
+Weighted states: Unweighted n=0 phases; NotRecorded n=0 phases.
+transcript NotRecorded: invalid JSON at line 13452; n=1
+```
+
+Phase time from the trial's eligible phase-time section:
+
+```text
+Trial phase time per unit — eligible start-selected phases, natedev only | [2026-11-03 13:17:52 EST, 2026-11-07 18:32:53 EST)
+unit      n phases  median    p90       total     not recorded
+devtools  1         29.4 min  29.4 min  29.4 min  0
+```
+
+Source records:
+
+- `/home/natepiano/.local/state/plan-delegate/runs/fe59e5e3-0e2d-4361-a843-3881414f5f2e.jsonl`.
+
+Selected phase instances and exact costs:
+
+| Run / display phase | Instance selected by the reader | Start UTC | Weighted tokens | Raw input including caches | Raw output | Compactions | Display match |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `fe59e5e3-0e2d-4361-a843-3881414f5f2e/7n` | `8dee922c-8aad-414f-81ff-286b305950b8` | `2026-11-04T12:42:25.947+00:00` | `641383.7999999999` | 5326477 | 12732 | NotRecorded | Ambiguous |
+
+Matching metadata:
+
+| Phase / instance prefix | Mode | Scope class | Worker model and pass kinds | Source for scope and gates | Gates |
+| --- | --- | --- | --- | --- | --- |
+| 7n / `8dee922c` | NotRecorded | small (3 paths) | `codex / gpt-6.1-sol / high` (impl) | `/tmp/claude/unit/fe59e5e3-0e2d-4361-a843-3881414f5f2e/phases/7n/implementation_prompt.md` | test_proposals_table; basedpyright; director merge_gate.py --tests-only |
+
+Ambiguous display label `fe59e5e3-0e2d-4361-a843-3881414f5f2e/7n`: 2 starts fall inside the window.
+
+| Candidate instance | Start UTC |
+| --- | --- |
+| `8dee922c-8aad-414f-81ff-286b305950b8` | `2026-11-04T12:42:25.947+00:00` |
+| `11d57be5-d7c5-4b74-8791-801186db2743` | `2026-11-04T13:12:30.228+00:00` |
+
+### hana_catalyst-build-speed-tests
+
+Frozen invocations:
+
+```sh
+/home/natepiano/.claude/scripts/lib/py /home/natepiano/worktrees/phases/scripts/direct/phase_process.py baseline --exposure before --route-revision 7733bee4cdb9d75cd9680482809eff05c1a788e3 --units hana_catalyst-build-speed-tests --since 2026-11-03T18:17:52Z --until 2026-11-07T23:32:53Z
+/home/natepiano/.claude/scripts/lib/py /home/natepiano/worktrees/phases/scripts/direct/phase_process.py baseline --exposure before --route-revision 7733bee4cdb9d75cd9680482809eff05c1a788e3 --units hana_catalyst-build-speed-tests --since 2026-11-03T18:17:52Z --until 2026-11-07T23:32:53Z --detail trial
+```
+
+Both commands exited 0.
+
+Trial counts, distributions, and excluded states:
+
+```text
+Trial exclusions before exposure filter, selected units and phase starts in [2026-11-03 13:17:52 EST, 2026-11-07 18:32:53 EST): mixed n=0; open unmixed n=0.
+Trial exposure filter: before; select phase starts in [2026-11-03 13:17:52 EST, 2026-11-07 18:32:53 EST); phase-plus-gap end can follow window end.
+Exposure: BeforeChange n=13; AfterChange n=0; ExposureNotRecorded n=10
+Phase-plus-gap exclusions (states can overlap): ExposureNotRecorded: direct.md hash changed during phase n=10; NoFollowingPhase n=1; SharedDirector n=10
+
+Trial measures — eligible phases, natedev only
+Director tokens: phase plus gap; compactions: phase
+measure                n phases  median    p90  total
+weighted tokens               7    1.3M   1.9M   9.1M
+raw input with caches         7    8.2M  12.3M  58.8M
+raw output                    7     26K    50K   201K
+compactions                   7       0      1      3
+
+Context size after reload — raw input including caches | [2026-11-03 13:17:52 EST, 2026-11-07 18:32:53 EST)
+measure                                   n reloads  median   p90      total    not recorded
+first request after contract Read result  3          134,698  138,372  374,221  0
+Reload states: NoCompaction n=4 phases; NoReload n=0 compactions; NotRecorded n=0 phases, n=0 requests.
+Weighted states: Unweighted n=0 phases; NotRecorded n=0 phases.
+```
+
+Phase time from the trial's eligible phase-time section:
+
+```text
+Trial phase time per unit — eligible start-selected phases, natedev only | [2026-11-03 13:17:52 EST, 2026-11-07 18:32:53 EST)
+unit                             n phases  median    p90    total   not recorded
+hana_catalyst-build-speed-tests  7         82.8 min  3.2 h  12.0 h  0
+```
+
+Source records:
+
+- `/home/natepiano/.local/state/plan-delegate/runs/1454cef1-c532-4ac2-a6bf-60b3c552296d.jsonl`.
+
+Selected phase instances and exact costs:
+
+| Run / display phase | Instance selected by the reader | Start UTC | Weighted tokens | Raw input including caches | Raw output | Compactions | Display match |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `1454cef1-c532-4ac2-a6bf-60b3c552296d/22` | `8a68bbbb-08cc-46df-b6c5-854bf244e2d4` | `2026-11-06T17:56:34.830+00:00` | `1031427.0999999999` | 7580208 | 25806 | 0 | Unique |
+| `1454cef1-c532-4ac2-a6bf-60b3c552296d/23` | `c558b946-90dd-4c93-aed2-a67cf604f598` | `2026-11-06T19:20:36.150+00:00` | `773338.9000000001` | 3666435 | 21835 | 1 | Unique |
+| `1454cef1-c532-4ac2-a6bf-60b3c552296d/25` | `fbb0dcc8-a6c0-4549-8b3a-71c01eb00bc7` | `2026-11-06T22:05:25.333+00:00` | `1730577.2999999996` | 10354647 | 49763 | 1 | Unique |
+| `1454cef1-c532-4ac2-a6bf-60b3c552296d/26` | `d2e18204-d91f-4128-92fc-047cf2153dd0` | `2026-11-07T01:16:37.147+00:00` | `1926798.1000000003` | 12323391 | 27310 | 0 | Unique |
+| `1454cef1-c532-4ac2-a6bf-60b3c552296d/27` | `5881a592-5e1a-4873-abfe-2c893fef759e` | `2026-11-07T03:37:06.298+00:00` | `1715623.7999999998` | 10984138 | 36613 | 0 | Unique |
+| `1454cef1-c532-4ac2-a6bf-60b3c552296d/29` | `87558be1-2a41-4e50-9bf1-00cd5ecaaf5a` | `2026-11-07T09:00:55.578+00:00` | `1254388.5000000005` | 8197882 | 24625 | 1 | Unique |
+| `1454cef1-c532-4ac2-a6bf-60b3c552296d/30` | `c5039427-8e79-404b-8b1d-f2c9bde27ae1` | `2026-11-07T10:57:59.391+00:00` | `692195.1` | 5653013 | 14856 | 0 | Unique |
+
+Matching metadata:
+
+| Phase / instance prefix | Mode | Scope class | Worker model and pass kinds | Source for scope and gates | Gates |
+| --- | --- | --- | --- | --- | --- |
+| 22 / `8a68bbbb` | NotRecorded | small (2 paths) | `codex / gpt-6.1-sol / high` (impl, review) | `/tmp/claude/unit/1454cef1-c532-4ac2-a6bf-60b3c552296d/phases/22/implementation_prompt.md` | verify.sh test hana: two named tests before/after; steady_readout_precision and conduit motion pixel suites; verify.sh lint hana |
+| 23 / `c558b946` | NotRecorded | small (1 path) | NotRecorded | `git dff432ff4905816a0f04ab687ddd16fa6311a37e:docs/hana/tool-based-ui-build-speed-tests.md, Phase 23` | verify.sh test hana --filter tool::command_palette::tests; Change-Review |
+| 25 / `fbb0dcc8` | NotRecorded | small (3 paths) | `codex / gpt-6.1-sol / high` (fix, impl) | `/tmp/claude/unit/1454cef1-c532-4ac2-a6bf-60b3c552296d/phases/25/implementation_prompt.md` | Mac g_framing and opening_gap timing before/after; final g_framing suite; verify.sh lint hana; restore temporary nextest config |
+| 26 / `d2e18204` | NotRecorded | small (2 paths) | `codex / gpt-6.1-sol / high` (impl) | `/tmp/claude/unit/1454cef1-c532-4ac2-a6bf-60b3c552296d/phases/26/implementation_prompt.md` | Mac timing trials; full final hana test run for a kept change; lint for changed non-Markdown files; nextest diff check |
+| 27 / `5881a592` | NotRecorded | small (1 paths) | `codex / gpt-6.1-sol / high` (impl, review) | `/tmp/claude/unit/1454cef1-c532-4ac2-a6bf-60b3c552296d/phases/27/implementation_prompt.md` | Mac timing comparison; natedev G-framing trace comparison; final hana suite; lint |
+| 29 / `87558be1` | NotRecorded | small (2 paths) | `codex / gpt-6.1-sol / high` (impl) | `/tmp/claude/unit/1454cef1-c532-4ac2-a6bf-60b3c552296d/phases/29/implementation_prompt.md` | Mac pocket_quiet_frames and camera-panel timing; final pocket, camera-panel, and frame_work suites; lint |
+| 30 / `c5039427` | NotRecorded | small (3 paths) | `codex / gpt-6.1-sol / high` (impl) | `/tmp/claude/unit/1454cef1-c532-4ac2-a6bf-60b3c552296d/phases/30/implementation_prompt.md` | Mac landing/math/card timing; final placement_disk, math_selection_tests, and assembly_face_tests; lint |
+
+### remove-running-section-handler
+
+Frozen invocations:
+
+```sh
+/home/natepiano/.claude/scripts/lib/py /home/natepiano/worktrees/phases/scripts/direct/phase_process.py baseline --exposure before --route-revision 7733bee4cdb9d75cd9680482809eff05c1a788e3 --units remove-running-section-handler --since 2026-11-03T18:17:52Z --until 2026-11-07T23:32:53Z
+/home/natepiano/.claude/scripts/lib/py /home/natepiano/worktrees/phases/scripts/direct/phase_process.py baseline --exposure before --route-revision 7733bee4cdb9d75cd9680482809eff05c1a788e3 --units remove-running-section-handler --since 2026-11-03T18:17:52Z --until 2026-11-07T23:32:53Z --detail trial
+```
+
+Both commands exited 0.
+The selector includes two cargo-liner-handler rows and one remove-running-section-handler row.
+
+Unit-only measures from the exact `--detail trial` rows for run `21496649-0876-4315-8701-05f8943b788f`.
+This run records only branch `remove-running-section-handler` among the selector fields.
+The cargo-liner-handler run records the same branch.
+No accepted selector isolates this run.
+The calculation excludes every row from the other run.
+It uses decimal arithmetic on the printed values, the usual median, and nearest-rank p90 at `ceil(0.9 × n)`.
+A missing value stays missing and does not become zero.
+Tokens cover phase plus gap; compactions cover the phase.
+
+| Measure | n | Median | p90 | Total | Missing |
+| --- | --- | --- | --- | --- | --- |
+| weighted tokens | 1 | 4277661.099999998 | 4277661.099999998 | 4277661.099999998 | 0 |
+| raw input including caches | 1 | 27530888 | 27530888 | 27530888 | 0 |
+| raw output | 1 | 66708 | 66708 | 66708 | 0 |
+| compactions | 1 | 1 | 1 | 1 | 0 |
+| context size after reload (requests) | 1 | 129756 | 129756 | 129756 | 0 |
+
+The row records one compaction and one reload request with input size `129756`.
+
+Selector-level exclusions below include both runs and do not supply the unit-only measures:
+
+```text
+Trial exclusions before exposure filter, selected units and phase starts in [2026-11-03 13:17:52 EST, 2026-11-07 18:32:53 EST): mixed n=0; open unmixed n=1.
+Trial exposure filter: before; select phase starts in [2026-11-03 13:17:52 EST, 2026-11-07 18:32:53 EST); phase-plus-gap end can follow window end.
+Exposure: BeforeChange n=6; AfterChange n=0; ExposureNotRecorded n=9
+Phase-plus-gap exclusions (states can overlap): ExposureNotRecorded: direct.md hash changed during phase n=9; NoFollowingPhase n=1; SharedDirector n=9
+```
+
+Unit-only phase time from the trial's eligible phase-time section:
+
+```text
+Trial phase time per unit — eligible start-selected phases, natedev only | [2026-11-03 13:17:52 EST, 2026-11-07 18:32:53 EST)
+unit                            n phases  median     p90        total     not recorded
+remove-running-section-handler  1         98.9 min   98.9 min   98.9 min  0
+```
+
+Source records:
+
+- `/home/natepiano/.local/state/plan-delegate/runs/21496649-0876-4315-8701-05f8943b788f.jsonl`.
+
+Selected phase instances and exact costs:
+
+| Run / display phase | Instance selected by the reader | Start UTC | Weighted tokens | Raw input including caches | Raw output | Compactions | Display match |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `21496649-0876-4315-8701-05f8943b788f/34` | `f91decaf-0ce8-4242-ba78-c5b9c5d4ba9f` | `2026-11-07T14:31:25.825+00:00` | `4277661.099999998` | 27530888 | 66708 | 1 | Unique |
+
+Matching metadata:
+
+| Phase / instance prefix | Mode | Scope class | Worker model and pass kinds | Source for scope and gates | Gates |
+| --- | --- | --- | --- | --- | --- |
+| 34 / `f91decaf` | NotRecorded | small (1 paths) | NotRecorded | `/tmp/claude/unit/21496649-0876-4315-8701-05f8943b788f/phases/34/work_order.md` | verify.sh test cargo-handler; verify.sh lint cargo-handler; no leftover theme folder |
+
+### sdlc-devtools
+
+Frozen invocations:
+
+```sh
+/home/natepiano/.claude/scripts/lib/py /home/natepiano/worktrees/phases/scripts/direct/phase_process.py baseline --exposure before --route-revision 7733bee4cdb9d75cd9680482809eff05c1a788e3 --units sdlc-devtools --since 2026-11-03T18:17:52Z --until 2026-11-07T23:32:53Z
+/home/natepiano/.claude/scripts/lib/py /home/natepiano/worktrees/phases/scripts/direct/phase_process.py baseline --exposure before --route-revision 7733bee4cdb9d75cd9680482809eff05c1a788e3 --units sdlc-devtools --since 2026-11-03T18:17:52Z --until 2026-11-07T23:32:53Z --detail trial
+```
+
+Both commands exited 0.
+The selector includes devtools phase 7n and four sdlc-devtools instances of phase 3z.
+
+Unit-only measures from the exact `--detail trial` rows for run `c96e80d9-b13e-4c13-aa6e-acfee5cbf068`.
+This run records only branch `sdlc-devtools` among the selector fields.
+The devtools run records the same branch.
+No accepted selector isolates this run.
+The calculation excludes every row from the other run.
+It uses decimal arithmetic on the printed values, the usual median, and nearest-rank p90 at `ceil(0.9 × n)`.
+A missing value stays missing and does not become zero.
+Tokens cover phase plus gap; compactions cover the phase.
+
+| Measure | n | Median | p90 | Total | Missing |
+| --- | --- | --- | --- | --- | --- |
+| weighted tokens | 3 | 1184759.9 | 2952753.1000000006 | 5124183.7000000004 | 1 |
+| raw input including caches | 4 | 13156340 | 19202832 | 53454086 | 0 |
+| raw output | 4 | 37687.5 | 60052 | 158095 | 0 |
+| compactions | 0 | NotRecorded | NotRecorded | NotRecorded | 4 |
+| context size after reload (requests) | 0 | NotRecorded | NotRecorded | NotRecorded | 0 known requests; 4 phase transcripts unavailable |
+
+Weighted tokens have one `Unweighted` row.
+All four phase transcripts are `NotRecorded` because the source transcript has invalid JSON at line 13452.
+
+Selector-level exclusions below include both runs and do not supply the unit-only measures:
+
+```text
+Trial exclusions before exposure filter, selected units and phase starts in [2026-11-03 13:17:52 EST, 2026-11-07 18:32:53 EST): mixed n=0; open unmixed n=0.
+Trial exposure filter: before; select phase starts in [2026-11-03 13:17:52 EST, 2026-11-07 18:32:53 EST); phase-plus-gap end can follow window end.
+Exposure: BeforeChange n=43; AfterChange n=0; ExposureNotRecorded n=19
+Phase-plus-gap exclusions (states can overlap): ExposureNotRecorded: direct.md hash changed during phase n=19; NoFollowingPhase n=0; SharedDirector n=55
+```
+
+Unit-only phase time from the trial's eligible phase-time section:
+
+```text
+Trial phase time per unit — eligible start-selected phases, natedev only | [2026-11-03 13:17:52 EST, 2026-11-07 18:32:53 EST)
+unit           n phases  median    p90       total     not recorded
+sdlc-devtools  4         45.6 min  71.8 min  3.3 h     0
+```
+
+Source records:
+
+- `/home/natepiano/.local/state/plan-delegate/runs/c96e80d9-b13e-4c13-aa6e-acfee5cbf068.jsonl`.
+
+Selected phase instances and exact costs:
+
+| Run / display phase | Instance selected by the reader | Start UTC | Weighted tokens | Raw input including caches | Raw output | Compactions | Display match |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `c96e80d9-b13e-4c13-aa6e-acfee5cbf068/3z` | `6a0e64ae-4f03-4150-8450-b43d2f27fde1` | `2026-11-07T14:50:38.634+00:00` | `Unweighted(reasons=("unweighted model '<synthetic>' at 2026-11-07T15:04:33.511000+00:00",))` | 16569614 | 49306 | NotRecorded | Ambiguous |
+| `c96e80d9-b13e-4c13-aa6e-acfee5cbf068/3z` | `45f60542-0f85-45e3-930a-fc49f24b1d60` | `2026-11-07T15:40:01.193+00:00` | `986670.6999999998` | 7938574 | 22668 | NotRecorded | Ambiguous |
+| `c96e80d9-b13e-4c13-aa6e-acfee5cbf068/3z` | `e1aba65f-e698-43b7-af40-a61b7358521a` | `2026-11-07T16:24:39.606+00:00` | `1184759.9` | 9743066 | 26069 | NotRecorded | Ambiguous |
+| `c96e80d9-b13e-4c13-aa6e-acfee5cbf068/3z` | `7831cad1-29c6-4c9c-adae-243994b25685` | `2026-11-07T20:46:44.300+00:00` | `2952753.1000000006` | 19202832 | 60052 | NotRecorded | Ambiguous |
+
+Matching metadata:
+
+| Phase / instance prefix | Mode | Scope class | Worker model and pass kinds | Source for scope and gates | Gates |
+| --- | --- | --- | --- | --- | --- |
+| 3z / `6a0e64ae` | NotRecorded | NotRecorded | NotRecorded | NotRecorded | NotRecorded |
+| 3z / `45f60542` | NotRecorded | NotRecorded | NotRecorded | NotRecorded | NotRecorded |
+| 3z / `e1aba65f` | NotRecorded | NotRecorded | NotRecorded | NotRecorded | NotRecorded |
+| 3z / `7831cad1` | NotRecorded | NotRecorded | NotRecorded | NotRecorded | NotRecorded |
+
+Ambiguous display label `c96e80d9-b13e-4c13-aa6e-acfee5cbf068/3z`: 7 starts fall inside the window.
+
+| Candidate instance | Start UTC |
+| --- | --- |
+| `6a0e64ae-4f03-4150-8450-b43d2f27fde1` | `2026-11-07T14:50:38.634+00:00` |
+| `45f60542-0f85-45e3-930a-fc49f24b1d60` | `2026-11-07T15:40:01.193+00:00` |
+| `e1aba65f-e698-43b7-af40-a61b7358521a` | `2026-11-07T16:24:39.606+00:00` |
+| `0e291e13-de19-4d17-a994-2918c2924c33` | `2026-11-07T17:04:05.360+00:00` |
+| `53d7ff71-4c79-4c67-9252-70848295e37d` | `2026-11-07T19:47:50.468+00:00` |
+| `7831cad1-29c6-4c9c-adae-243994b25685` | `2026-11-07T20:46:44.300+00:00` |
+| `fd1efb5d-fd26-4783-8501-3c6e755fe9d7` | `2026-11-07T22:09:01.592+00:00` |
+

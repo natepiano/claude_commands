@@ -1497,3 +1497,49 @@ A change review row whose Change text was edited still covers its own change, an
 **Gotchas:** a row does not record its step. With two held steps uncovered, an edited row covers nothing by its hash, and the scan adds a duplicate row rather than hide a change.
 
 **Ruled out:** pairing every `AfterStep` change in commit order — with two steps released out of order, an edited row covers the wrong step and hides the other change.
+
+### Phase 8s — A hold that names any showrunner waits  · status: done
+
+#### As-built
+
+A holding or waiting status that names any showrunner, or a sibling unit, reads as a wait on an outside party, and stall-watch does not bump the unit.
+
+- `scripts/production/stall_watch.py` builds the peers for `status_defers_bump` and `holding_names_outside` from the one staff snapshot of the pass: every `showrunner` row whose worktree is not removed, the unit's sibling units less its own row, the configured session and the production name. `PaneInspection` carries the peers. Showrunner names are read once per pass, and sibling names once per parent.
+- A unit of another production matches as `<name>-unit` through the config pattern.
+- `config/stall_watch.conf` no longer names `natedev` in `external_owner_pattern` or `holding_party_pattern`; the staff record supplies it.
+- Own names still win: `names_outside` is unchanged.
+
+**Files:**
+- `scripts/production/stall_watch.py` — peer names per inspection.
+- `config/stall_watch.conf` — outside-party patterns without fixed showrunner names.
+- `scripts/production/test_stall_watch.py` — a cases table in `test_holding_names_a_peer_or_showrunner_anywhere_in_the_line` (a natedev unit waiting on sdlc waits), and a row in `test_own_work_order_and_own_names_do_not_hold_the_unit` (an unrelated `style` unit in the status still bumps).
+
+**Gotchas:** a sibling unit name that is a common word still defers a bump.
+
+**Ruled out:** every staff name as a peer — many unit names are common words (style, verify, queue) and hide an own-work hold.
+
+### Phase 8t — The units table shows board status, phase work, other work and queued work  · status: done
+
+**Depends on:** none
+
+#### As-built
+
+- `/showrunner:units` prints `| Unit | Status | Phase | Non-Phase Work | Queued |`.
+- `session_state.classify(member, activity)` gives a unit session's state in this order: an exit record gives `exited`; a pause record gives `paused`; no live session gives `exited`; a live `busy` session gives `busy`; else `idle`. The accounts board (`_read_local_role_sessions`) and the units table both call it. The board keeps its account attribution and worker counts in `accounts.py`; its workers role keeps busy and idle only.
+- A live herdr pane process (Claude or Codex) counts as a live session. A unit whose worktree is on another machine, with no hold, shows `on <machine>`.
+- Phase shows `phase <n> of <m> — <task>` for an open plan phase. The task is the newest run's open step, else the phase title. With no open phase the cell keeps the old texts. Each cell is cut to 80 characters with `…`.
+- Non-Phase Work reads only each unit's newest run (`open_unit_runs`). A finished run gives `—`. Otherwise it shows `<phase id>: <open step>` for open phases that are not plan phases, plus ` +<k> more`.
+- `/unit:queue add <text> | done | clear | show` runs `unit_queue.py`. The list is at `UNIT_QUEUE_STATE_DIR/<staff id>.json`, default `~/.local/state/unit-queue/`. The Queued cell shows the first item plus ` +<n> more`, or `—`. An unreadable file gives `queue unreadable` and one stderr line; `clear` does not read the old list, so it repairs the file.
+
+**Files:**
+- `scripts/accounts/session_state.py` — `classify`, `staff_state` and the activity types.
+- `scripts/accounts/accounts.py` — the board calls `classify`.
+- `scripts/production/live_units.py` — `LiveUnit.member`, `staff_status`, pane-process and other-machine status.
+- `scripts/production/unit_phases.py` — the table cells and the newest-run reader.
+- `scripts/production/unit_queue.py`, `commands/unit/queue.md` — the queue.
+- `commands/showrunner/units.md` — the columns and statuses.
+- `docs/as-built/staff-accessors.md` — rows for the two new staff readers.
+
+**Gotchas:** A held astra-role run never records a finish, so it can be a unit's newest run and show in Non-Phase Work.
+
+**Ruled out:** Reading every open run of a unit's current session — old runs never record a finish, so 64 stale runs showed as open.
