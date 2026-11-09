@@ -1887,6 +1887,9 @@ class WorkerCommandTests(unittest.TestCase):
         self.assertEqual(self.agent.submitted, [])
 
     def recorded_list_fixture(self) -> tuple[staff.StaffRow, staff.StaffRow, list[Path]]:
+        _ = self.enterContext(patch.object(worker_panes, "worker_run", return_value=self.run_dir))
+        _ = self.enterContext(patch.object(worker_panes, "worker_dispatch_state",
+                                          return_value=worker_panes.DispatchHoldsWorker("TEST active dispatch")))
         first = self.fixture.worker("same-name")
         manager = fixture_member("showrunner", name="TEST-other-manager")
         second = fixture_worker("same-name", manager.id)
@@ -1945,6 +1948,29 @@ class WorkerCommandTests(unittest.TestCase):
             self.assertEqual(rows[row.id]["role"], "review")
             self.assertEqual(rows[row.id]["activity"], "Check the saved work.")
             self.assertEqual(rows[row.id]["home"], str(Path.home() / ("." + label)))
+        record = staff.local_snapshot()
+        cases: tuple[tuple[worker_panes.WorkerDispatchState | OSError | ValueError, str, str], ...] = (
+            (worker_panes.ReleasedWorkerPass.NO_PROMPT_DELIVERED, "no prompt was delivered", "idle"),
+            (worker_panes.ReleasedWorkerPass.STALE_ACTIVE, "the launcher ended without finishing the pass", "idle"),
+            (worker_panes.ReleasedWorkerPass.ENDED, "the pass ended", "idle"),
+            (worker_panes.DispatchHoldsWorker("a detached run is live"), "active", "busy"),
+            (worker_panes.CompletedWorkerPass("TEST-dispatch"), "completed", "idle"),
+            (OSError("TEST state unreadable\nsecond line"), "active", "busy"),
+            (ValueError("TEST state invalid\nsecond line"), "active", "busy"),
+        )
+        for result, state, work in cases:
+            with self.subTest(result=result):
+                with (patch.object(worker_panes, "worker_run", return_value=self.run_dir) as located,
+                      patch.object(worker_panes, "worker_dispatch_state", side_effect=[result]) as classified,
+                      redirect_stderr(io.StringIO()) as anomalies):
+                    listing = {str(row["id"]): row for row in worker.list_all_workers(record)}
+                self.assertEqual((listing[first.id]["state"], listing[first.id]["work"]), (state, work))
+                self.assertEqual((listing[second.id]["state"], listing[second.id]["work"]), ("completed", "idle"))
+                located.assert_called_once_with(record.by_id(first.id), record=record)
+                classified.assert_called_once_with(record.by_id(first.id), self.run_dir)
+                self.assertEqual(anomalies.getvalue().splitlines(),
+                    [f"anomaly: {first.name}: {' '.join(str(result).splitlines())}"]
+                    if isinstance(result, (OSError, ValueError)) else [])
 
     def test_list_all_keeps_a_refused_pass_over_an_equal_time_start_event(self) -> None:
         first, _second, paths = self.recorded_list_fixture()
@@ -2133,7 +2159,7 @@ class WorkerCommandTests(unittest.TestCase):
         self.assertEqual(self.command("list"), (0, "", ""))
         self.assertEqual(self.dispatch("impl01"), worker.ExitCode.OK)
         self.assertEqual(self.finish("impl01"), turn_end.TurnOutcome.DONE)
-        self.assertEqual(self.command("list"), (0, "1 impl01 impl ClosedWorker\n", ""))
+        self.assertEqual(self.command("list"), (0, "1 impl01 impl account unknown ClosedWorker\n", ""))
         for number in range(2, 11):
             self.assertEqual(self.dispatch(f"impl{number:02}"), worker.ExitCode.OK)
             self.assertEqual(self.finish(f"impl{number:02}"), turn_end.TurnOutcome.DONE)
@@ -2144,7 +2170,20 @@ class WorkerCommandTests(unittest.TestCase):
         members = staff.snapshot().find(kind="worker", parent=self.fixture.parent.id)
         numbers = [" 1", " 2", " 3", " 4", " 5", " 6", " 7", " 8", " 9", "10"]
         self.assertEqual(output.splitlines(), [
-            f"{number} {row.name} impl ClosedWorker" for number, row in zip(numbers, members, strict=True)])
+            f"{number} {row.name} impl account unknown ClosedWorker" for number, row in zip(numbers, members, strict=True)])
+        known: dict[str, object] = {"name": "known", "role": "impl", "account": "codex2", "state": "ClosedWorker"}
+        unknown: dict[str, object] = {"name": "unknown", "role": {"state": "WorkerRoleUnavailable"},
+                                      "account": {"state": "AccountUnavailable"}, "state": "ClosedWorker"}
+        for fields, expected in (
+                (unknown, "role unknown account unknown"),
+                ({key: value for key, value in known.items() if key != "account"}, "impl account unknown"),
+                ({key: value for key, value in known.items() if key != "role"}, "role unknown codex2")):
+            with self.subTest(fields=fields), patch.object(worker, "list_workers", return_value=[known, fields]):
+                self.assertEqual(self.command("list"),
+                                 (0, f"1 known impl codex2 ClosedWorker\n2 {fields['name']} {expected} ClosedWorker\n", ""))
+                code, output, errors = self.command("list", "--json")
+                self.assertEqual(code, 0, errors)
+                self.assertEqual(cast(list[dict[str, object]], json.loads(output)), [known, fields])
 
     def test_list_keeps_dispatch_role_separate_from_observation(self) -> None:
         opened = self.opened("impl2", "review")
@@ -2208,6 +2247,11 @@ class WorkerCommandTests(unittest.TestCase):
         self.assertNotIn("home", listing[0])
         self.assertEqual(listing[0]["role"],
                          {"state": "WorkerRoleUnavailable", "reason": "dispatch role is unavailable"})
+        code, output, errors = self.command("list")
+        self.assertEqual(code, 0, errors)
+        self.assertIn("role unknown", output)
+        self.assertIn("account unknown", output)
+        self.assertNotIn("{", output)
 
     def test_list_scans_runs_once_and_prints_each_run_anomaly_once(self) -> None:
         unit_runs.report_anomaly.cache_clear()

@@ -1,6 +1,8 @@
 """Tree cancellation pauses checkpoint validation without retrying or rolling back."""
 from __future__ import annotations
 
+from scripts.production import checkpoint_gate
+
 from contextlib import redirect_stdout
 from io import StringIO
 import json
@@ -34,12 +36,12 @@ class CheckpointTreeCancelTests(unittest.TestCase):
                         + "would be stale. Resubmit the test when your edits are done.\n"
                         if status == 77 else "a test failed\n", "") for status in statuses]
             output = StringIO()
-            step = merge_checkpoint.CheckpointTestStep("package sample", command, root)
-            with (patch.object(merge_checkpoint, "test_steps", return_value=[step]),
-                  patch.object(merge_checkpoint, "run_test_command", side_effect=results) as run,
+            step = checkpoint_gate.CheckpointTestStep("package sample", command, root)
+            with (patch.object(checkpoint_gate, "test_steps", return_value=[step]),
+                  patch.object(checkpoint_gate, "run_test_command", side_effect=results) as run,
                   patch.object(merge_checkpoint, "undo_unpushed_merge") as undo,
                   redirect_stdout(output)):
-                with self.assertRaises(merge_checkpoint.Stop) as stopped:
+                with self.assertRaises(checkpoint_gate.Stop) as stopped:
                     _ = merge_checkpoint.checkpoint_tests(production, (), "abcdef0123", (),
                             frozenset(), root / "scratch", "merged-head", frozenset())
             self.assertEqual(run.call_count, len(statuses), "cancelled verification was retried")

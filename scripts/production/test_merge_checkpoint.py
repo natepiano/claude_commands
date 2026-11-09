@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from scripts.production import checkpoint_gate
+
 from scripts.shutdown import remote
 
 from scripts.production.staff_test_support import isolated_staff_file, unit_membership, recorded_showrunner
@@ -45,7 +47,7 @@ class CheckpointTestFolderTests(unittest.TestCase):
             _ = (package / "Cargo.toml").write_text('[package]\nname = "aws-routing-proof"\nversion = "0.1.0"\n')
             production = production_doc.ProductionDocument(checkout / "production.md", "fixture", "merge", checkout,
                                                   checkout / "production.log", ZoneInfo("UTC"))
-            steps = merge_checkpoint.test_steps(production, ("scripts/aws_target/proof_crate/src/lib.rs",), ())
+            steps = checkpoint_gate.test_steps(production, ("scripts/aws_target/proof_crate/src/lib.rs",), ())
             self.assertEqual(len(steps), 1)
             self.assertEqual(steps[0].label, "package aws-routing-proof")
             self.assertEqual(steps[0].command[-2:], ["test", "aws-routing-proof"])
@@ -59,7 +61,7 @@ class CheckpointTestFolderTests(unittest.TestCase):
             _ = (package / "Cargo.toml").write_text('[package]\nname = "aws-routing-proof"\nversion = "0.1.0"\n')
             production = production_doc.ProductionDocument(checkout / "production.md", "fixture", "merge", checkout,
                                                   checkout / "production.log", ZoneInfo("UTC"))
-            steps = merge_checkpoint.test_steps(production, ("crates/proof_crate/examples/demo.rs",), ())
+            steps = checkpoint_gate.test_steps(production, ("crates/proof_crate/examples/demo.rs",), ())
             self.assertEqual(len(steps), 2)
             self.assertEqual(steps[1].label, "example aws-routing-proof/demo")
             self.assertEqual(steps[1].command[-4:], ["example", "aws-routing-proof", "--name", "demo"])
@@ -71,7 +73,7 @@ class CheckpointTestFolderTests(unittest.TestCase):
             _ = (checkout / "Cargo.toml").write_text('[workspace]\nmembers = []\n')
             production = production_doc.ProductionDocument(checkout / "production.md", "fixture", "merge", checkout,
                                                   checkout / "production.log", ZoneInfo("UTC"))
-            steps = merge_checkpoint.test_steps(production, ("crates/proof_crate/examples/demo.rs",), ())
+            steps = checkpoint_gate.test_steps(production, ("crates/proof_crate/examples/demo.rs",), ())
             self.assertEqual(steps, [])
 
     def test_package_commands_and_retries_use_the_package_folder(self) -> None:
@@ -100,7 +102,7 @@ class CheckpointTestFolderTests(unittest.TestCase):
                     log = checkout / "test.log"
                     merge_tests = ((sys.executable, "-c", "from pathlib import Path; print(f'merge={Path.cwd()}')"),)
                     with mock.patch.dict(os.environ, {"MERGE_CHECKPOINT_VERIFY": str(verify)}):
-                        _ = merge_checkpoint.run_checkpoint_test_steps(
+                        _ = checkpoint_gate.run_checkpoint_test_steps(
                             production, (relative,), merge_tests, frozenset({"proof_crate"}), frozenset(), log)
                     output = log.read_text()
                     self.assertEqual(output.count(f"test={package}\n"), 2 if retry else 1)
@@ -188,23 +190,43 @@ class MergeCheckpointTests(MergeCheckpointFixture):
                 self.assertEqual(self.events("checkpoint-test"), [])
 
     def test_as_built_merges_after_code_checkpoint_reaches_branch_through_second_parent(self) -> None:
-        first = self.run_checkpoint(self.checkpoint())
-        self.assertEqual(first.process.returncode, 0, first.process.stderr + first.process.stdout)
-        code_merge = self.git("rev-parse", "HEAD")
-        _ = self.git("checkout", "-b", "integration", "HEAD^1")
-        _ = self.git("commit", "--allow-empty", "-m", "Independent integration")
-        _ = self.git("merge", "--no-ff", "-m", "Integrate production", "production")
-        _ = self.git("branch", "-f", "production", "HEAD")
-        _ = self.git("checkout", "production")
-        self.assertNotIn(code_merge, self.git("rev-list", "--first-parent", "HEAD").splitlines())
-        self.assertEqual(self.git("merge-base", "--is-ancestor", code_merge, "production"), "")
-        result = self.run_checkpoint(self.as_built_commit(), "--as-built", review=False)
-        self.assertEqual(result.process.returncode, 0, result.process.stderr + result.process.stdout)
-        self.assertIn("test: ok — as-built has no package tests", result.process.stdout)
-        tree = self.git("ls-tree", "-r", "--name-only", "HEAD")
-        self.assertIn("docs/as-built/alpha.md", tree)
-        self.assertNotIn("docs/plans/alpha.md", tree)
-        self.assertRegex(self.git("log", "-1", "--format=%s"), r"^Merge alpha phase \S+ as-built \(")
+        for merge_production, unmerged_code in ((False, False), (True, False), (True, True)):
+            with self.subTest(merge_production=merge_production, unmerged_code=unmerged_code):
+                shutil.rmtree(self.root)
+                _ = shutil.copytree(self.fixture_snapshot, self.root)
+                self.bind_fixture(self.root)
+                first = self.run_checkpoint(self.checkpoint())
+                self.assertEqual(first.process.returncode, 0, first.process.stderr + first.process.stdout)
+                code_merge = self.git("rev-parse", "HEAD")
+                _ = self.git("checkout", "-b", "integration", "HEAD^1")
+                _ = self.git("commit", "--allow-empty", "-m", "Independent integration")
+                _ = self.git("merge", "--no-ff", "-m", "Integrate production", "production")
+                _ = self.git("branch", "-f", "production", "HEAD")
+                _ = self.git("checkout", "production")
+                self.assertNotIn(code_merge, self.git("rev-list", "--first-parent", "HEAD").splitlines())
+                self.assertEqual(self.git("merge-base", "--is-ancestor", code_merge, "production"), "")
+                closing = self.as_built_commit()
+                if unmerged_code:
+                    closing = self.checkpoint(content="code after the as-built commit\n")
+                if merge_production:
+                    _ = self.git("fetch", "origin", "production", cwd=self.unit)
+                    _ = self.git("merge", "--no-ff", "-m", "Merge production after as-built",
+                                 "origin/production", cwd=self.unit)
+                    _ = self.git("push", "origin", "alpha-branch", cwd=self.unit)
+                    closing = self.git("rev-parse", "HEAD", cwd=self.unit)
+                (self.state / "events.jsonl").unlink()
+                result = self.run_checkpoint(closing, "--as-built", review=False)
+                if unmerged_code:
+                    self.assert_stopped_before_merge(result, "held", "phase 2 code checkpoint has not merged")
+                    self.assertIn("wait for the phase code checkpoint to merge, then resend the shrink",
+                                  result.process.stdout)
+                else:
+                    self.assertEqual(result.process.returncode, 0, result.process.stderr + result.process.stdout)
+                    self.assertIn("test: ok — as-built has no package tests", result.process.stdout)
+                    tree = self.git("ls-tree", "-r", "--name-only", "HEAD")
+                    self.assertIn("docs/as-built/alpha.md", tree)
+                    self.assertNotIn("docs/plans/alpha.md", tree)
+                    self.assertRegex(self.git("log", "-1", "--format=%s"), r"^Merge alpha phase \S+ as-built \(")
 
     def test_checkpoint_merges_into_its_staff_parent_and_ignores_unavailable_worktrees(self) -> None:
         checkpoint = self.checkpoint()
@@ -680,7 +702,7 @@ class TestPassedTests(unittest.TestCase):
 
     def judge(self, status: int, stdout: str, stderr: str = "") -> bool:
         result = subprocess.CompletedProcess(["basedpyright"], status, stdout, stderr)
-        return merge_checkpoint.test_passed(result)
+        return checkpoint_gate.test_passed(result)
 
     def test_clean_basedpyright_requires_status_zero(self) -> None:
         self.assertTrue(self.judge(0, "0 errors, 0 warnings, 0 notes\n", self.VENV))
@@ -692,8 +714,8 @@ class TestPassedTests(unittest.TestCase):
 
     def test_other_commands_pass_only_on_status_zero(self) -> None:
         result = subprocess.CompletedProcess(["python3"], 3, "0 errors, 0 warnings, 0 notes\n", "")
-        self.assertFalse(merge_checkpoint.test_passed(result))
-        self.assertTrue(merge_checkpoint.test_passed(subprocess.CompletedProcess(["python3"], 0, "", "")))
+        self.assertFalse(checkpoint_gate.test_passed(result))
+        self.assertTrue(checkpoint_gate.test_passed(subprocess.CompletedProcess(["python3"], 0, "", "")))
 
 
 @final
@@ -711,17 +733,17 @@ class MacPromotionPathTests(unittest.TestCase):
 
     def test_tilde_mac_path_is_expanded_by_the_mac_shell(self) -> None:
         remote = self.remote_command("mac `~/.claude`")
-        self.assertTrue(remote.startswith('cd "$HOME"/.claude && git pull'), remote)
+        self.assertTrue(remote.startswith('cd "$HOME"/.claude && tip=$(git ls-remote'), remote)
         self.assertNotIn(str(Path.home()) + "/.claude &&", remote)
 
     def test_absolute_mac_path_is_kept(self) -> None:
         remote = self.remote_command("/home/natepiano/.claude, mac /Users/someone/my repo")
-        self.assertTrue(remote.startswith("cd '/Users/someone/my repo' && git pull"), remote)
+        self.assertTrue(remote.startswith("cd '/Users/someone/my repo' && tip=$(git ls-remote"), remote)
 
     def test_mac_pull_queues_only_connection_failures_and_preserves_zone_notices(self) -> None:
         cases = (("offline", 255, "", "", main_publish.MacPullPending),
-                 ("remote failure", 0, "rc=1\n", "", merge_checkpoint.Stop),
-                 ("remote exit 255", 255, "rc=1\n", "", merge_checkpoint.Stop),
+                 ("remote failure", 0, "rc=1\n", "", checkpoint_gate.Stop),
+                 ("remote exit 255", 255, "rc=1\n", "", checkpoint_gate.Stop),
                  ("pulled", 0, "rc=0\n", "", main_publish.MacPulled),
                  ("pulled with zone", 0, "rc=0\n", "Zone changed", main_publish.MacPulled),
                  ("offline with zone", 255, "", "Zone changed", main_publish.MacPullPending))
@@ -742,8 +764,8 @@ class MacPromotionPathTests(unittest.TestCase):
                     waiting = main_publish.PendingMacPull("zone", text, "2026-11-08", "earlier failure")
                     if text or expected is not main_publish.MacPullPending:
                         main_publish.queue(waiting)
-                    if expected is merge_checkpoint.Stop:
-                        with self.assertRaises(merge_checkpoint.Stop):
+                    if expected is checkpoint_gate.Stop:
+                        with self.assertRaises(checkpoint_gate.Stop):
                             _ = merge_checkpoint.pull_mac_checkout(PurePosixPath("~/.claude"), state)
                         self.assertEqual(main_publish.read_queue(), waiting)
                         continue
@@ -804,7 +826,7 @@ print("mac: fixture - sent" if "broadcast.py" in sys.argv[-1] else "rc=0")
                     commands = [cast(list[str], json.loads(line))[-1]
                                 for line in (state / "ssh.log").read_text().splitlines()[before_drain:]]
                     for mac, source in targets:
-                        self.assertTrue(any(f"cd {main_publish.remote_path(mac)} && git pull" in command
+                        self.assertTrue(any(f"cd {main_publish.remote_path(mac)} && tip=$(git ls-remote" in command
                                             and f"natedev:{source} main" in command for command in commands), commands)
                     if text:
                         self.assertTrue(any("broadcast.py" in command and text in command for command in commands), commands)

@@ -932,6 +932,15 @@ def list_all_workers(record: staff.StaffSnapshot) -> list[dict[str, object]]:
         elif isinstance(row.paused, staff.Paused):
             status = "paused"
         work = "busy" if status == "active" else "idle" if status in ("completed", "error", "canceled", "interrupted", "paused", "exited") else "unknown"
+        if status == "active":
+            try:
+                dispatch = worker_panes.worker_dispatch_state(row, worker_panes.worker_run(row, record=record))
+                if isinstance(dispatch, worker_panes.ReleasedWorkerPass):
+                    status, work = dispatch.value, "idle"
+                elif isinstance(dispatch, worker_panes.CompletedWorkerPass):
+                    status, work = "completed", "idle"
+            except (OSError, ValueError) as error:
+                print(f"anomaly: {row.name}: {' '.join(str(error).splitlines())}", file=sys.stderr)
         listing.append(_worker_list_row(row, {"manager": parent.name, "state": status, "work": work,
             "activity": fields.get("activity") or status}))
     return listing
@@ -958,7 +967,9 @@ def _print_workers(listing: list[dict[str, object]], as_json: bool) -> ExitCode:
     else:
         width = len(str(len(listing)))
         for number, fields in enumerate(listing, 1):
-            print(f"{number:>{width}} {fields['name']} {fields['role']} {fields['state']} {fields.get('activity', '')} {fields.get('reason', '')}".rstrip())
+            role = fields["role"] if isinstance(fields.get("role"), str) else "role unknown"
+            account = fields["account"] if isinstance(fields.get("account"), str) else "account unknown"
+            print(f"{number:>{width}} {fields['name']} {role} {account} {fields['state']} {fields.get('activity', '')} {fields.get('reason', '')}".rstrip())
     return ExitCode.OK
 
 
