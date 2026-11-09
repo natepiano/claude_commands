@@ -946,7 +946,21 @@ def list_all_workers(record: staff.StaffSnapshot) -> list[dict[str, object]]:
     return listing
 
 
-def list_workers(parent: StaffId, record: staff.StaffSnapshot) -> list[dict[str, object]]:
+def _worker_pane_state(state: worker_panes.WorkerPane) -> tuple[str, str]:
+    if isinstance(state, worker_panes.OpenWorker):
+        if isinstance(state.row.paused, staff.Paused):
+            return "open", "paused"
+        if isinstance(state.row.exited, staff.Exited):
+            return "open", "exited"
+        return "open", worker_panes.worker_state(state)
+    if isinstance(state, worker_panes.StoppedWorker):
+        return "open", "exited"
+    if isinstance(state, worker_panes.ClosedWorker):
+        return "closed", "-"
+    return "unknown", "-"
+
+
+def list_workers(parent: StaffId, record: staff.StaffSnapshot, *, as_json: bool = True) -> list[dict[str, object]]:
     listing: list[dict[str, object]] = []
     observed = _read_workers(next(row for row in record.rows if row.id == parent), record)
     with progress_history.dispatch_reads(record, observed.runs):
@@ -957,6 +971,8 @@ def list_workers(parent: StaffId, record: staff.StaffSnapshot) -> list[dict[str,
                 fields["activity"] = state.status.value
             if isinstance(state, (worker_panes.ProcessUnknownWorker, worker_panes.UncertainWorker)):
                 fields["reason"] = state.reason
+            if not as_json:
+                fields["pane"], fields["state"] = _worker_pane_state(state)
             listing.append(fields)
     return listing
 
@@ -969,7 +985,13 @@ def _print_workers(listing: list[dict[str, object]], as_json: bool) -> ExitCode:
         for number, fields in enumerate(listing, 1):
             role = fields["role"] if isinstance(fields.get("role"), str) else "role unknown"
             account = fields["account"] if isinstance(fields.get("account"), str) else "account unknown"
-            print(f"{number:>{width}} {fields['name']} {role} {account} {fields['state']} {fields.get('activity', '')} {fields.get('reason', '')}".rstrip())
+            pane = fields.get("pane", "-")
+            state = fields["state"]
+            if pane == "-":
+                state = state if state in ("paused", "exited") else "busy" if state == "active" else "idle"
+            elif pane != "open":
+                account = "-"
+            print(f"{number:>{width}} {fields['name']} {role} {account} {pane} {state} {fields.get('reason', '')}".rstrip())
     return ExitCode.OK
 
 
@@ -1048,7 +1070,7 @@ def main(arguments: list[str] | None = None) -> int:
             print("staff: caller: not opened: caller is not a unit or showrunner", file=sys.stderr)
             return ExitCode.REFUSED
         if args.command == "list":
-            return _print_workers(list_workers(owner.id, record), args.json)
+            return _print_workers(list_workers(owner.id, record, as_json=args.json), args.json)
         if args.command == "check":
             observed = _read_workers(owner, record)
             with progress_history.dispatch_reads(record, observed.runs):
