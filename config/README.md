@@ -272,9 +272,10 @@ The on-demand command and the future timer use `sweep.py --floor-only --host mac
 
 ## aws_target.conf
 
-This file defines the disabled AWS SSH target. `offload=off` prevents work.
-The active target list remains `targets=mac,natedev` in `build_targets.conf`.
-The user completes deployment before target activation.
+This file defines the AWS SSH builder target.
+`offload=off` disables builder routing and controller actions unless the external activation record overrides it.
+`build_targets.conf` lists the active SSH targets.
+Cloud gates use `cloud_gate.conf` and `gate-deployment.json`; they do not depend on `offload`.
 
 `host=aws-build` names the Tailscale SSH host. `region` selects the AWS region.
 The controller reads the instance ID from `deployment.json`.
@@ -317,7 +318,8 @@ The spending guard requires usable live spending settings through `ConfigRead.or
 A missing or malformed live limit refuses spending, even when committed history supplies a usable value.
 `daily_limit_usd` and `monthly_limit_usd` include `limit_reserve_usd` when the guard compares costs.
 Equality refuses deployment, starts and new admission. `limit_action=drain` rejects new work.
-`offload=off` leaves ordinary builds outside accounting and performs no AWS call.
+`offload=off` disables ordinary builder accounting and controller AWS calls when no external activation record overrides it.
+Cloud gates still read account charges and enforce the spending caps.
 
 `accounting_zone` selects day and month boundaries, including clock changes.
 `price_refresh_seconds=3600` bounds reads from the injected price source.
@@ -406,6 +408,20 @@ Replacement uses its saved `DataVolumeId`. Configuration contains no instance or
 Run `scripts/lib/py scripts/aws_target/deploy.py up --approve-resources` to complete the price, bootstrap, stacks, and scaler-key stages.
 The command records stage results and times in `up.json` beside `deployment.json`.
 It checks live state before each stage. It always refreshes the price.
+To inspect builder removal, run `scripts/lib/py scripts/aws_target/deploy.py remove-builder`.
+To remove the builder, run `scripts/lib/py scripts/aws_target/deploy.py remove-builder --approve-destroy`.
+The command disables builder routing and `aws-target.service`, removes its Tailscale device, and removes its compute resources.
+It deletes the retained data volume after the stack update. The `/home` build cache is lost.
+It keeps the stack, Budget, scaler credentials, every gate resource, and `gate-deployment.json`.
+The command preserves spending history and resolves builder observations, pending compute requests, and resource inventory.
+A saved `builder-removal.json` identity supports a repeat after a partial removal.
+Current instance and volume identities take priority over the receipt.
+Removal uses the live CloudFormation template and changes only the builder role, profile, and security group conditions to `Compute`.
+It preserves live gate definitions that differ from the repository template.
+The repository template has the same three conditions for later gate deployment.
+`down --approve-destroy` removes the whole stack, including the gate resources, then deletes the retained volume and Budget.
+It is not the builder-only removal command.
+No removal command changes a tracked configuration value.
 Separate `price`, `bootstrap`, `prepare`, `apply`, and `setup-start` commands remain available.
 The command reads the current Spot price for the configured instance type and zone through `deployment_profile`.
 It writes the price and its read time atomically with mode `0600`.
@@ -430,6 +446,9 @@ The corresponding component keys state each monthly estimate.
 The guard uses the greater of the total and the component sum.
 A priced resource inventory can increase that estimate before deployment.
 Stopped instances continue to incur fixed costs.
+After confirmed builder removal, an inventory with `builder_removed=true` stops applying the builder's configured fixed-cost floor.
+The remaining inventory still prices gate resources.
+A confirmed terminated builder does not accrue later estimated compute costs.
 
 The target directory stores `cost-ledger.json` and `cost-ledger.lock`.
 The ledger retains observations, prices, inventories, reconciliations, decisions and limit events.

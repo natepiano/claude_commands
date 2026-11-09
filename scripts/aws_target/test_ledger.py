@@ -83,6 +83,7 @@ class LedgerTests(CostFixture):
         costs = self.estimate(self.start + 120)
         self.assertEqual(sum(r.end - r.start for r in costs.intervals if r.kind == "instance"), 60)
         self.assertEqual(costs.monthly.usd, Decimal("0.0125"))
+        self.assertEqual(self.estimate(self.start + 86400).monthly.usd, costs.monthly.usd)
 
     def test_unknown_observation_rejection_keeps_evidence_and_allows_later_charging(self) -> None:
         self.running(self.start)
@@ -128,6 +129,15 @@ class LedgerTests(CostFixture):
         self.inventory(self.start)
         self.observe(self.start, "stopped")
         self.assertEqual(self.estimate(self.start + 43200).monthly.usd, Decimal("0.5"))
+
+        self.book.record_inventory(ledger.ResourceInventory(self.start + 43200,
+            (ledger.PricedResource('gate-shared', Decimal(1)),), 'builder removed', builder_removed=True))
+        self.observe(self.start + 43200, 'terminated')
+        self.book = ledger.CostLedger(self.state)
+        self.assertTrue(self.book.read_snapshot().inventories[-1].builder_removed)
+        self.assertEqual(self.estimate(self.start + 86400).monthly.usd, Decimal('0.5') + Decimal(1) / Decimal(62))
+        self.book.record_inventory(ledger.ResourceInventory(self.start + 86400, (), 'no resources', builder_removed=True))
+        self.assertEqual(self.estimate(self.start + 90000).monthly.usd, self.estimate(self.start + 86400).monthly.usd)
 
     def test_price_history_splits_time_and_uses_fallback_after_expiry(self) -> None:
         self.running(self.start)

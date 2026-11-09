@@ -34,6 +34,7 @@ from scripts.aws_target.config import (
     deployment_record, deployment_outputs, read_control_settings, read_deployment_settings, read_settings,
 )
 from scripts.lib import conf
+from scripts.mac_test import mac_test
 from scripts.build_targets import target_config
 from scripts.lib.atomic_file import write_bytes_atomic, write_text_atomic
 
@@ -535,16 +536,18 @@ class Deployment:
             lines.append('stack status is unavailable')
         return AwsUnavailable('\n'.join(lines).replace(notification, '<notification address>'))
 
-    def _update_stack(self, settings: DeploymentSettings, parameters: dict[str, str], *, compute: bool) -> None:
+    def _update_stack(self, settings: DeploymentSettings, parameters: dict[str, str], *, compute: bool,
+                      remove_builder: bool = False) -> None:
         api = self._api(settings)
         stack_id = ledger.text(deployment_record(self.directory), 'stack_id')
         live = self._stack(settings)
+        notification = parameters.get('NotificationEmail') or '<notification address>'
         values: list[dict[str, object]] = [
-            {'ParameterKey': key, 'UsePreviousValue': True} if key in ('Bootstrap', 'AmiId') and live.get('InstanceId')
+            {'ParameterKey': key, 'UsePreviousValue': True} if remove_builder and key != 'EnableCompute' or key in ('Bootstrap', 'AmiId') and live.get('InstanceId')
             else {'ParameterKey': key, 'ParameterValue': value}
             for key, value in {**parameters, 'EnableCompute': str(compute).lower()}.items()
         ]
-        if (self.directory / 'gate-deployment.json').exists():
+        if not remove_builder and (self.directory / 'gate-deployment.json').exists():
             template = ledger.mapping(cast(object, json.loads(TEMPLATE.read_text())))
             values.extend({'ParameterKey': key, 'UsePreviousValue': True}
                           for key in ledger.mapping(template['Parameters']) if key.startswith('Gate') or key == 'EnableGates')
@@ -583,13 +586,18 @@ class Deployment:
             replacements: list[str] = []
             for item in ledger.rows(change, 'Changes'):
                 resource = ledger.mapping(item.get('ResourceChange'))
+                if remove_builder and resource.get('Action') == 'Remove' and resource.get('LogicalResourceId') in (
+                        'Instance', 'DataVolume', 'DataAttachment', 'LaunchTemplate', 'InstanceRole', 'InstanceProfile',
+                        'SecurityGroup', 'ScalerPolicy', 'StopRole', 'BudgetStop', 'StopPolicy'):
+                    continue
                 if resource.get('ResourceType') in protected and (resource.get('Action') == 'Remove'
                         or resource.get('Replacement') in ('True', 'Conditional')):
                     replacements.append(f"{ledger.text(resource, 'LogicalResourceId')} ({ledger.text(resource, 'ResourceType')})")
             if replacements:
                 raise DeploymentRefused('up refuses replacement: ' + ', '.join(replacements)
                                         + '; run deploy.py down --approve-destroy, then deploy.py up --approve-resources')
-            self._before_request(settings, parameters)
+            if not remove_builder:
+                self._before_request(settings, parameters)
             if compute:
                 self._record_compute_request(settings, parameters)
             _ = api.call('execute-change-set', '--stack-name', stack_id, '--change-set-name', name, service='cloudformation')
@@ -605,8 +613,8 @@ class Deployment:
                     pass
             leftover = self._discard_change_set(api, stack_id, name) if created and not executed else ''
             if isinstance(error, ValueError):
-                raise DeploymentRefused((str(error) + leftover).replace(parameters['NotificationEmail'], '<notification address>')) from None
-            failure = self._stack_failure(api, settings, stack_id, started, error, change, parameters['NotificationEmail'])
+                raise DeploymentRefused((str(error) + leftover).replace(notification, '<notification address>')) from None
+            failure = self._stack_failure(api, settings, stack_id, started, error, change, notification)
             raise AwsUnavailable(str(failure) + leftover) from None
 
     def _record_compute_request(self, settings: DeploymentSettings, parameters: dict[str, str]) -> None:
@@ -1003,7 +1011,8 @@ class Deployment:
             inventory = book.read_snapshot().inventories
             resources = tuple(resource for resource in inventory[-1].resources if resource.name != 'gate-shared') if inventory else ()
             book.record_inventory(ledger.ResourceInventory(int(self.clock()), resources + (
-                ledger.PricedResource('gate-shared', money(str(values.number('shared_usd_per_month')))),), 'gate deployment'))
+                ledger.PricedResource('gate-shared', money(str(values.number('shared_usd_per_month')))),), 'gate deployment',
+                builder_removed=bool(inventory and inventory[-1].builder_removed)))
             changes: list[dict[str, object]] = [
                 {'ParameterKey': ledger.text(row, 'ParameterKey'), 'UsePreviousValue': True}
                 for row in ledger.rows(stack, 'Parameters') if ledger.text(row, 'ParameterKey') not in parameters]
@@ -1064,6 +1073,61 @@ class Deployment:
             }
             cloud_gate.save(self.directory / 'gate-deployment.json', manifest)
             print('cloud-gate: deployed')
+        return True
+
+    def remove_builder(self, *, approve_destroy: bool = False) -> bool:
+        if not approve_destroy:
+            print(teardown.BUILDER_DRY_RUN)
+            return True
+        self._check_credentials()
+        settings = read_deployment_settings(self.settings_path, self.directory)
+        api = self._api(settings)
+        removal = teardown.TargetRemoval(self.settings_path, self.directory, self.output, self.admin,
+            api, self.execute, tailnet=box.tailnet_request, clock=self.clock, builder_only=True)
+        with control_lock(self.directory / 'up'):
+            _ = removal.verify()
+            removal.remember()
+            _ = removal.routing()
+            paths = mac_test.state_paths('aws')
+            with mac_test.locked(paths.lock), control_lock(self.directory):
+                if box.running_claims(paths):
+                    raise DeploymentRefused('AWS claims remain live; retry after their completion')
+                _ = removal.devices()
+                stack_id = ledger.text(deployment_record(self.directory), 'stack_id')
+                stack = ledger.rows(api.call('describe-stacks', '--stack-name', stack_id,
+                                            service='cloudformation'), 'Stacks')[0]
+                body = api.call('get-template', '--stack-name', stack_id, service='cloudformation')['TemplateBody']
+                template = ledger.mapping(cast(object, json.loads(body)) if isinstance(body, str) else body)
+                resources = ledger.mapping(template['Resources'])
+                builder_roles = ('InstanceRole', 'InstanceProfile', 'SecurityGroup')
+                needs_update = (self._stack(settings).get('ComputeEnabled') != 'false'
+                                or any(ledger.mapping(resources[name]).get('Condition') != 'Compute' for name in builder_roles))
+                for name in builder_roles:
+                    ledger.mapping(resources[name])['Condition'] = 'Compute'
+                self.output.mkdir(parents=True, exist_ok=True)
+                write_text_atomic(self.output / 'template.json', json.dumps(template) + '\n')
+                parameters = {ledger.text(row, 'ParameterKey'): str(row.get('ParameterValue', ''))
+                              for row in ledger.rows(stack, 'Parameters')}
+                if needs_update:
+                    self._update_stack(settings, parameters, compute=False, remove_builder=True)
+                _ = removal.data_volume()
+                now = int(self.clock())
+                book = ledger.CostLedger(self.directory)
+                book.observe(ledger.InstanceObservation(now, 'terminated', 'confirmed builder removal'), confirms_transition=True)
+                for request in book.pending_compute_requests():
+                    book.resolve_compute_request(request, ledger.ComputeResourcesAbsent(now))
+                inventories = book.read_snapshot().inventories
+                if not inventories or not inventories[-1].builder_removed:
+                    builder_costs = {key for key, _cost in read_settings(self.settings_path).fixed_components}
+                    kept = tuple(resource for resource in inventories[-1].resources
+                                 if resource.name not in builder_costs) if inventories else ()
+                    book.record_inventory(ledger.ResourceInventory(now, kept, 'confirmed builder removal', builder_removed=True))
+                saved = deployment_record(self.directory)
+                saved.update(outputs=self._stack(settings), data_volume_id='')
+                write_text_atomic(self.directory / 'deployment.json', json.dumps(saved, sort_keys=True) + '\n')
+                for name in ('up.json', 'box-tools.json', 'box-shell.json'):
+                    (self.directory / name).unlink(missing_ok=True)
+        print('remove-builder: done; gate resources and gate-deployment.json kept')
         return True
 
     def down(self, *, approve_destroy: bool = False) -> bool:
@@ -1192,7 +1256,7 @@ def main() -> int:
         from scripts.aws_target import gate_trial
         return gate_trial.main(sys.argv[2:], conf.path('aws_target'), target_config.ssh_target_state_directory('aws'))
     parser = argparse.ArgumentParser(description=__doc__)
-    _ = parser.add_argument('command', choices=('secrets', 'up', 'down', 'price', 'prepare', 'apply', 'setup-start', 'bootstrap'))
+    _ = parser.add_argument('command', choices=('secrets', 'up', 'down', 'remove-builder', 'price', 'prepare', 'apply', 'setup-start', 'bootstrap'))
     _ = parser.add_argument('--workload', choices=('rust', 'merge-gates'), default='rust')
     _ = parser.add_argument('--settings', type=Path)
     _ = parser.add_argument('--directory', type=Path)
@@ -1209,6 +1273,8 @@ def main() -> int:
             return 0 if action(approve_resources=args.approve_resources) else 1
         elif args.command == 'down':
             return 0 if deploy.down(approve_destroy=args.approve_destroy) else 1
+        elif args.command == 'remove-builder':
+            return 0 if deploy.remove_builder(approve_destroy=args.approve_destroy) else 1
         elif args.command == 'price':
             print(json.dumps(deploy.price(), sort_keys=True))
         elif args.command == 'bootstrap':
