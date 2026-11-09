@@ -38,6 +38,7 @@ class GateBoxTests(unittest.TestCase):
         self.assertIn('merge_gate.SelectedModules', gate_box.GUEST)
         self.assertIn("'HEAD^{tree}'", gate_box.GUEST)
         self.assertIn("'update-ref', 'refs/remotes/origin/main', gate_request['origin_main']", gate_box.GUEST)
+        self.assertIn("'fetch', str(root / 'source.bundle'), links['commit']", gate_box.GUEST)
 
     def test_production_boot_has_absolute_expiry_and_no_type_package(self) -> None:
         links = {'production': 'true', 'expires': '1800000000', 'step': 'size',
@@ -119,7 +120,8 @@ class GateBoxTests(unittest.TestCase):
                     + 'def completion_record(*args): return {"kind": "gate_run"}\n')
                 _ = (root / 'source.py').write_text(gate_box.GUEST)
                 _ = (root / 'request.json').write_text(json.dumps({
-                    'clone_url': 'https://example.invalid/repo.git', 'origin_main': 'b' * 40, 'modules': []}))
+                    'clone_url': 'https://example.invalid/repo.git', 'origin_main': 'b' * 40, 'modules': [],
+                    'head': 'e' * 40, 'dirty_paths': ['scripts/fixture/test_one.py']}))
                 stub = '#!' + sys.executable + '\n' + r'''import json, os, pathlib, shutil, subprocess, sys
 root = pathlib.Path(os.environ['FIXTURE'])
 name, args = pathlib.Path(sys.argv[0]).name, sys.argv[1:]
@@ -160,6 +162,8 @@ elif name == 'useradd':
 elif name == 'git' and args[0] == 'clone':
     fail('source ready')
     shutil.copytree(root / 'repo', args[-1])
+elif name == 'git' and 'fetch' in args:
+    event('fetch ' + args[-1])
 elif name == 'git' and 'rev-parse' in args:
     print('c' * 40)
 elif name in ('systemd-run', 'loginctl', 'mount', 'chown', 'ln', 'cp', 'shutdown', 'git'):
@@ -177,6 +181,7 @@ else:
                 links = {'production': 'true', 'expires': '1800000000', 'step': 'size', 'region': 'us-west-2',
                          'attempt': 'attempt', 'commit': 'a' * 40, 'tree': 'c' * 40, 'mode': 'merge-gate',
                          'origin': 'https://example.invalid/repo.git', 'guest': 'https://fixture.invalid/requests/attempt.guest.py',
+                         'source': 'https://fixture.invalid/source/snapshot.bundle',
                          'request': 'https://fixture.invalid/requests/attempt.json',
                          'log': 'https://fixture.invalid/artifacts/attempt/gate.log',
                          'result': 'https://fixture.invalid/artifacts/attempt/result.json',
@@ -206,6 +211,12 @@ else:
                     for line in lines:
                         self.assertRegex(line, r'^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ stage=')
                     trace = (root / 'trace').read_text().splitlines()
+                    self.assertIn('fetch ' + links['commit'], trace)
+                    record = ledger.mapping(results[-1]['record'])
+                    self.assertEqual(record['head'], 'e' * 40)
+                    self.assertTrue(record['dirty'])
+                    self.assertEqual(record['dirty_paths'], ['scripts/fixture/test_one.py'])
+                    self.assertEqual(record['dirty_path_count'], 1)
                     self.assertLess(trace.index('upload log'), trace.index('tools shell'))
                     print('Production boot stages: ' + ' -> '.join(stages))
 

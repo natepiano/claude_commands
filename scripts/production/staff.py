@@ -40,6 +40,26 @@ WORKER_ROLES: tuple[WorkerRole, ...] = ("impl", "test", "review", "fix", "astra-
 
 
 @dataclass(frozen=True)
+class KnownWorkerRole:
+    value: WorkerRole
+
+
+@dataclass(frozen=True)
+class WorkerRoleUnknown:
+    """No dispatch has recorded the worker role."""
+
+
+@dataclass(frozen=True)
+class SessionHome:
+    path: Path
+
+
+@dataclass(frozen=True)
+class HomeUnknown:
+    """No pane start has recorded the session home."""
+
+
+@dataclass(frozen=True)
 class ReportsTo:
     id: StaffId
 
@@ -303,6 +323,8 @@ class StaffRow:
 
     paused: Paused | Active = field(default_factory=Active)
     exited: Exited | Active = field(default_factory=Active)
+    role: KnownWorkerRole | WorkerRoleUnknown = field(default_factory=WorkerRoleUnknown, kw_only=True)
+    home: SessionHome | HomeUnknown = field(default_factory=HomeUnknown, kw_only=True)
     unknown_fields: dict[str, object] = field(default_factory=dict, kw_only=True, compare=False)
 
     def reports_to(self, identity: StaffId) -> bool:
@@ -310,6 +332,10 @@ class StaffRow:
 
     def to_json(self) -> dict[str, object]:
         value: dict[str, object] = {**self.unknown_fields, "id": self.id, "kind": self.kind, "name": self.name, "parent": self.parent.id if isinstance(self.parent, ReportsTo) else None, "current_session": self.current_session}
+        if isinstance(self.role, KnownWorkerRole):
+            value["role"] = self.role.value
+        if isinstance(self.home, SessionHome):
+            value["home"] = str(self.home.path)
         if not isinstance(self.worktree, WorktreeUnfilled):
             value["worktree"] = {**self.worktree.unknown_fields, "machine": self.worktree.machine, "path": str(self.worktree.path),
                                  "state": "present" if isinstance(self.worktree, PresentWorktree) else "removed"}
@@ -341,12 +367,26 @@ class StaffRow:
         current = fields.get("current_session", staff_id)
         if not isinstance(current, str) or not _valid_id(current):
             raise StaffUnreadable("invalid current session")
+        role, home = fields.get("role"), fields.get("home")
+        parsed_role = (KnownWorkerRole(role)
+                       if isinstance(role, str) and role in WORKER_ROLES else WorkerRoleUnknown())
+        parsed_home = SessionHome(Path(home)) if isinstance(home, str) and Path(home).is_absolute() else HomeUnknown()
+        known_fields = {"id", "kind", "name", "parent", "current_session", "worktree", "doc", "paused", "exited"}
+        invalid: list[str] = []
+        for key, fact in (("role", parsed_role), ("home", parsed_home)):
+            if isinstance(fact, (KnownWorkerRole, SessionHome)):
+                known_fields.add(key)
+            elif key in fields:
+                invalid.append(key)
+        if invalid:
+            print(f"anomaly: {staff_id}: unknown staff fields: {', '.join(invalid)}", file=sys.stderr)
         worktree, doc = _row_locations(kind, fields)
         return cls(StaffId(staff_id), kind, name,
                    ReportsTo(StaffId(parent)) if isinstance(parent, str) else StaffRoot(), worktree, doc, current_session=StaffId(current),
+                   role=parsed_role, home=parsed_home,
                    paused=Paused.from_json(fields["paused"]) if "paused" in fields else Active(),
                    exited=Exited.from_json(fields["exited"]) if "exited" in fields else Active(),
-                   unknown_fields=_unknown_fields(fields, {"id", "kind", "name", "parent", "current_session", "worktree", "doc", "paused", "exited"}))
+                   unknown_fields=_unknown_fields(fields, known_fields))
 
 
 def _row_locations(kind: str, fields: dict[str, object]) -> tuple[PresentWorktree | RemovedWorktree | WorktreeUnfilled, LiveDoc | WrappedDoc | DocUnfilled]:
@@ -1341,6 +1381,30 @@ def ensure_worker(identity: StaffId, name: str, parent: StaffId) -> StaffRow:
     return _transaction(lambda rows: _ensure_row(rows, "worker", name, ReportsTo(parent), runtime_id=identity))
 
 
+def set_worker_role(identity: StaffId, role: KnownWorkerRole) -> StaffRow:
+    """Record the role of the worker's last launch or dispatch."""
+    if not is_owner():
+        return _remote_row(["set-worker-role", identity, role.value])
+    def edit(rows: list[StaffRow]) -> StaffRow:
+        row = _required(rows, identity)
+        changed = replace(row, role=role)
+        rows[rows.index(row)] = changed
+        return changed
+    return _transaction(edit)
+
+
+def set_home(identity: StaffId, home: SessionHome) -> StaffRow:
+    """Record the home proved by a pane start."""
+    if not is_owner():
+        return _remote_row(["set-home", identity, str(home.path)])
+    def edit(rows: list[StaffRow]) -> StaffRow:
+        row = _required(rows, identity)
+        changed = replace(row, home=home)
+        rows[rows.index(row)] = changed
+        return changed
+    return _transaction(edit)
+
+
 def update_current_session(old_session: StaffId, new_session: StaffId) -> StaffRow:
     """Publish a proved runtime handoff without changing the member or its links."""
     _ = native_id(new_session)
@@ -1811,6 +1875,7 @@ class _Arguments:
     hold_record: str = ""
     runtime_id: str = ""
     new_id: str = ""
+    value: str = ""
     verb: str = ""
     kind: Kind | None = None
     under: str | None = None
@@ -1839,6 +1904,11 @@ def _parser() -> argparse.ArgumentParser:
 
     parser = argparse.ArgumentParser(description=__doc__)
     verbs = parser.add_subparsers(dest="verb", required=True)
+    for command in ("set-worker-role", "set-home"):
+        fact = verbs.add_parser(command, help=argparse.SUPPRESS)
+        _ = fact.add_argument("target")
+        _ = fact.add_argument("value", choices=WORKER_ROLES if command == "set-worker-role" else None)
+        _ = fact.add_argument("--json", action="store_true")
     hold = verbs.add_parser("set-hold", help=argparse.SUPPRESS)
     _ = hold.add_argument("target")
     _ = hold.add_argument("--state", choices=("paused", "exited", "active"), required=True)
@@ -1922,6 +1992,10 @@ def _print_row(row: StaffRow, path: str) -> None:
 
 
 def _mutate(arguments: _Arguments) -> StaffRow | StaffSnapshot | tuple[StaffId, ...] | None:
+    if arguments.verb == "set-worker-role":
+        return set_worker_role(StaffId(arguments.target), KnownWorkerRole(cast(WorkerRole, arguments.value)))
+    if arguments.verb == "set-home":
+        return set_home(StaffId(arguments.target), SessionHome(Path(arguments.value).absolute()))
     if arguments.verb == "set-hold":
         hold = (Paused.from_json(_decode(arguments.hold_record)) if arguments.state == "paused" else
                 Exited.from_json(_decode(arguments.hold_record)) if arguments.state == "exited" else Active())
@@ -2032,7 +2106,7 @@ def _main(arguments: _Arguments) -> int:
     if arguments.row_write and not (arguments.verb in ("retire", "ensure-worker", "update-current-session") or
                                     arguments.verb == "ensure" and arguments.kind == "worker"):
         raise StaffRefused("row writes are for worker admission and retirement")
-    with operation() if is_owner() and not arguments.row_write else nullcontext():
+    with operation() if is_owner() and not arguments.row_write and arguments.verb not in ("set-worker-role", "set-home") else nullcontext():
         result = _mutate(arguments)
     if isinstance(result, tuple):
         print(json.dumps(result))

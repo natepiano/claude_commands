@@ -9,7 +9,7 @@ fi
 # A terminal may omit the installed shell tools and Git from PATH.
 export PATH="$PATH:/run/current-system/sw/bin:/etc/profiles/per-user/${USER:-}/bin:/opt/homebrew/bin:/usr/local/bin"
 tools_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
-scratch=$(mktemp -d /tmp/direct-refusals.XXXXXXXX)
+scratch=$(mktemp -d -t direct-refusals.XXXXXXXX)
 trap 'rm -rf -- "$scratch"' EXIT
 step="scratch setup"
 trap 'printf "FAILED: %s (exit %s)\n" "$step" "$?" >&2' ERR
