@@ -576,7 +576,7 @@ class MemoryFeedTests(unittest.TestCase):
         reading = cloud_reading(reservation_reading())
         first = reading.cloud[0]
         assert isinstance(first.progress, cloud_progress.CloudProgress)
-        cases: tuple[tuple[cloud_progress.CloudState, float, str], ...] = (
+        states: tuple[tuple[cloud_progress.CloudState, float, str], ...] = (
             ("requesting", first.progress.updated_at, "2 min"),
             ("setup", first.progress.updated_at, "2 min"),
             ("running", first.progress.updated_at, "2 min"),
@@ -587,9 +587,16 @@ class MemoryFeedTests(unittest.TestCase):
             ("running", reading.explanation.now - 10800, "3 h"),
             ("running", reading.explanation.now - 172800, "2 d"),
         )
-        for state, updated_at, late_age in cases:
-            with self.subTest(state=state, updated_at=updated_at):
-                cloud = replace(first, progress=replace(first.progress, state=state, updated_at=updated_at))
+        cases: list[tuple[wire.CloudRow, str, str]] = [
+            (replace(first, progress=replace(first.progress, state=state, updated_at=updated_at)), state, late_age)
+            for state, updated_at, late_age in states]
+        cases.extend((
+            (replace(first, progress=cloud_progress.NoCloudProgress("missing")), "progress missing", ""),
+            (replace(first, progress=cloud_progress.NoCloudProgress("unreadable")), "progress unreadable", ""),
+            (replace(first, counter=progress_profile.NoCounter("no cloud counter")), "running", "2 min"),
+        ))
+        for cloud, state, late_age in cases:
+            with self.subTest(state=state, progress=cloud.progress, counter=cloud.counter):
                 current = replace(reading, cloud=(cloud, *reading.cloud[1:]))
                 with (mock.patch.object(admission_client, "view", return_value=current),
                       mock.patch.object(os, "cpu_count", return_value=17)):
@@ -607,12 +614,24 @@ class MemoryFeedTests(unittest.TestCase):
                 local, = [row for row in runs if row.get("kind") != "cloud"]
                 waiter, = [row for row in waits if row.get("kind") == "cloud"]
                 self.assertEqual(remote["machine"], "aws")
-                self.assertEqual(remote["vcpus"], 32)
+                self.assertEqual(remote["vcpus"], 32 if isinstance(cloud.progress, cloud_progress.CloudProgress)
+                                 else {"kind": "UnknownCpuCount"})
                 self.assertEqual(remote["state"], state)
                 self.assertEqual(remote["pid"], 700001)
                 self.assertEqual(remote["started_at"], first.started_at)
-                self.assertIn("7 of 12 modules", str(remote["status"]))
-                self.assertIn("1 failed module", str(remote["status"]))
+                if isinstance(cloud.counter, progress_profile.ProgressCounter):
+                    self.assertEqual(remote["progress"], {"kind": "RowProgress", "phase": "testing",
+                        "unit": "modules", "done": 7, "total": 12, "percent": 100 * 7 / 12})
+                    self.assertIn("7 of 12 modules", str(remote["status"]))
+                else:
+                    self.assertEqual(remote["progress"], {"kind": "NoProgress", "reason": cloud.counter.reason})
+                    self.assertNotIn("modules unknown", str(remote["status"]))
+                if state == "running":
+                    self.assertNotIn("running", str(remote["status"]))
+                else:
+                    self.assertTrue(str(remote["status"]).startswith(state), remote["status"])
+                if isinstance(cloud.progress, cloud_progress.CloudProgress):
+                    self.assertIn("1 failed module", str(remote["status"]))
                 self.assertNotIn("no update for", str(remote["status"]))
                 self.assertEqual(remote["late_age"], late_age)
                 self.assertEqual(remote["stale"], bool(late_age))
@@ -624,6 +643,8 @@ class MemoryFeedTests(unittest.TestCase):
                 self.assertEqual(waiter["late_age"], "")
                 self.assertFalse(waiter["stale"])
                 self.assertEqual(waiter["since"], reading.cloud[1].since)
+                self.assertEqual(waiter["progress"], {"kind": "NoProgress", "reason": "no current counter"})
+                self.assertEqual(waiter["status"], waiter["reason"])
                 self.assertIn("waits for a cloud slot: 1 of 1 in use", str(waiter["reason"]))
                 for row in (remote, waiter):
                     for field in ("used", "counted", "reserved", "need"):
