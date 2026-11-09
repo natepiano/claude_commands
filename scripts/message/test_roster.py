@@ -2643,10 +2643,11 @@ class CodexHolderLabelsTests(unittest.TestCase):
         self.worker_run(run, {"report-test2": {"thread_id": self.thread, "status": "running"}})
         native_process = herdr.native_process
 
-        def fixture_process(pid: int, family: str) -> herdr.NativeAgentProcess:
+        def fixture_process(pid: int, family: str,
+                            reported: str | herdr.PaneNotRead = herdr.PANE_NOT_READ) -> herdr.NativeAgentProcess:
             if pid in self.pane_world.processes:
-                return self.pane_world.native_process(pid, family)
-            return native_process(pid, family)
+                return self.pane_world.native_process(pid, family, reported if isinstance(reported, str) else "")
+            return native_process(pid, family, reported)
 
         pane_patches = [
             cast(object, self.enterContext(mock.patch.object(worker_panes, "_client", return_value=self.pane_world))),

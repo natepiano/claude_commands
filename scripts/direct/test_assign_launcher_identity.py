@@ -23,9 +23,9 @@ class AssignIdentityTests(launcher_fixture.FirstDispatchFixture):
         _ = self.successful("review", "--to", name, "--phase", "8", "--lens", "contract", "--pass", "2")
         self.assertEqual(self.assignment_records(), {name: first})
         self.assertEqual(self.turn_starts, 2)
-        self.assertEqual(len(self.native.fixture.world.launches), 1)
-        command = self.native.fixture.world.requests[0][1]
-        self.assertEqual(command[command.index("--sandbox") + 1], "read-only")
+        self.assertEqual(len(self.native.fixture.world.launches), 2)
+        self.assertEqual([command[command.index("--sandbox") + 1]
+                          for _, command, _ in self.native.fixture.world.requests], ["read-only", "read-only"])
         row = staff.by_id(staff.StaffId(str(first["staff_id"])))
         assert row is not None
         self.assertIsInstance(staff.backend(row), staff.CodexBackend)
@@ -37,9 +37,9 @@ class AssignIdentityTests(launcher_fixture.FirstDispatchFixture):
             _ = self.successful("review", option, "project-review", "--lens", "contract", "--pass", pass_number)
             self.assertEqual(self.turn_starts, int(pass_number))
         self.assertEqual(set(self.assignment_records()), {"project-review"})
-        self.assertEqual(len(self.native.fixture.world.launches), 1)
-        command = self.native.fixture.world.requests[0][1]
-        self.assertEqual(command[command.index("--sandbox") + 1], "read-only")
+        self.assertEqual(len(self.native.fixture.world.launches), 2)
+        self.assertEqual([command[command.index("--sandbox") + 1]
+                          for _, command, _ in self.native.fixture.world.requests], ["read-only", "read-only"])
         turns = [read_object(path) for path in (self.history / "review_turns" / self.session_dir.name).glob("*.json")]
         self.assertEqual(len(turns), 2)
         self.assertTrue(all(turn["arm"] == "own" for turn in turns))

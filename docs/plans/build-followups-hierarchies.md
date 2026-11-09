@@ -752,3 +752,19 @@ The sdlc batch 2 merge brought the 28b pane rule: a worker pane closes when its 
 - `scripts/herdr/worker_panes.py` — a family switch selects its destination after the source release. `start()` closes the source pane if it is still present, retires its launch, reads the evidence again and calls `_destination`. Every switch starts in a new pane. The marker type `DestinationAfterSourceRelease` holds the place of the destination until then.
 - `scripts/herdr/test_worker_panes.py` — the family-switch tables expect a new pane, the source pane close, and a new pane on the retry. A new `exiting` source row covers a source pane that closes by itself.
 - `scripts/direct/test_assign_launcher.py`, `scripts/direct/test_assign_launcher_reuse.py` — a switched or stopped worker resumes in a new pane, not the source pane.
+
+### Phase 30c — final verification after the sdlc batch 3 merge  · status: done
+
+The sdlc batch 3 merge (models 5, panes 28f and 28g) turned four test modules red. Repair them so the full gate is green.
+
+1. `scripts/accounts/test_accounts.py` patches `_worker_status_records`, which the mesh removal deleted. Remove the patch.
+2. `scripts/message/test_roster.py` — the `fixture_process` stand-in must take the pane session that models 5 passes to `native_process`.
+3. `scripts/direct/test_assign_launcher.py`, `test_assign_launcher_identity.py` and `test_assign_launcher_reuse.py` count launches and pane locations that changed when panes 28f closed a done worker's pane. Find the cause and repair it where it lives.
+
+Acceptance: the targeted test, the package import bootstrap and basedpyright are green on the merged tree.
+
+**As-built:**
+- `test_accounts.py` no longer patches the deleted `_worker_status_records`.
+- The `test_roster.py` `fixture_process` stand-in takes the `reported` pane session and passes it to `native_process`.
+- The cause was in `assign.py`. Since panes 28f the worker records a completed pass end and closes its pane. The launcher now records a pass end only as `error`: `failed_pass_command()` replaces `finish_pass_command(status)`.
+- The launcher tests now expect one new pane for each assign after a done pass. The refusal test for an unproved worker is kept.

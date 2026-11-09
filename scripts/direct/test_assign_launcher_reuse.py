@@ -20,11 +20,11 @@ class AssignReuseTests(launcher_fixture.FirstDispatchFixture):
         assert row is not None
         world = self.native.fixture.world
         source_pane = self.native.agent.submitted[-1][0]
-        _ = world.stop(row, world)
+        world.add(row, source_pane, family="codex", live=False)
         _ = self.successful("implement", "--to", name)
         self.assertEqual(self.assignment_records()[name], original)
         self.assertEqual(self.turn_starts, 2)
-        self.assertEqual(len(world.locations), 2)
+        self.assertEqual(len(world.locations), 1)
         destination = world.launches[-1]
         self.assertIsInstance(destination, herdr.SplitPane)
         self.assertNotIn(source_pane, world.locations)
@@ -39,13 +39,16 @@ class AssignReuseTests(launcher_fixture.FirstDispatchFixture):
         _ = self.successful("implement", "--to", name)
         self.assertEqual(self.assignment_records()[name], original)
         self.assertEqual(self.turn_starts, 2)
-        self.assertEqual(len(self.native.fixture.world.locations), 2)
+        self.assertEqual(len(self.native.fixture.world.locations), 1)
 
     def test_an_unproved_native_worker_receives_no_replacement_or_assignment(self) -> None:
         self.first_assignment()
         name, original = next(iter(self.assignment_records().items()))
         world = self.native.fixture.world
-        world.unknown["w1:p1"] = "native process evidence unavailable"
+        opened = worker_panes.start_or_resume(self.native.fixture.parent.id, staff.WorkerName.parse(name), "impl")
+        self.assertIsInstance(opened, worker_panes.OpenWorker)
+        assert isinstance(opened, worker_panes.OpenWorker)
+        world.unknown[opened.pane] = "native process evidence unavailable"
         launches = list(world.launches)
         result = self.launch("implement", "--to", name)
         self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)

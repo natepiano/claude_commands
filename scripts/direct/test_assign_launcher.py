@@ -343,8 +343,19 @@ class PaneReviewLauncherTests(unittest.TestCase):
 
         self.fixture.agent.during_prompt = final_diff_ready
         prompt = self.fixture.prompt.read_bytes()
-        result = self.launch_review()
+        completed_commands: list[list[str]] = []
+        original_call = assign.call
+
+        def observe_call(command: list[str], env: dict[str, str], *, capture: bool = False,
+                         check: bool = True) -> subprocess.CompletedProcess[str]:
+            if "finish-pass" in command and command[-1] == "completed":
+                completed_commands.append(command)
+            return original_call(command, env, capture=capture, check=check)
+
+        with patch.object(assign, "call", side_effect=observe_call):
+            result = self.launch_review()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(completed_commands, [])
         first, second = self.fixture.agent.submitted
         self.assertEqual(first[0], second[0])
         dispatch_id = first[1].split("DONE ")[-1].split(".")[0]
@@ -533,11 +544,13 @@ class AssignLauncherTests(AssignLauncherFixture):
                 passed = assign.object_map(assign.object_map(read_object(
                     self.session_dir / "progress_history_state.json")["pass"])[name])
                 self.assertIn(str(image.resolve()), Path(str(passed["prompt_file"])).read_text())
-                before = moved.to_json(), len(self.native.fixture.world.launches)
+                before = moved.to_json()
+                launches = len(self.native.fixture.world.launches)
                 _ = self.successful("implement", "--to", name)
                 current = staff.by_id(row.id)
                 assert current is not None
-                self.assertEqual((current.to_json(), len(self.native.fixture.world.launches)), before)
+                self.assertEqual(current.to_json(), before)
+                self.assertEqual(len(self.native.fixture.world.launches), launches + 1)
 
 
     def test_incomplete_dispatch_rerun_keeps_its_pass_and_only_waits(self) -> None:
@@ -751,7 +764,7 @@ class AssignLauncherTests(AssignLauncherFixture):
         status = self.session_dir / f"phases/7/{name}_status"
         self.assertEqual(status.read_text(), "error\n")
         ended = [event for event in self.events() if event.get("event_type") == "pass_finished"]
-        self.assertEqual([event["status"] for event in ended], ["error"])
+        self.assertEqual([event["status"] for event in ended], ["error"] if worker_failed else ["completed"])
         ledger.rmdir()
         _ = saved.rename(ledger)
         repaired = self.run_resolution_commands(result.stderr)
@@ -827,12 +840,19 @@ class AssignLauncherTests(AssignLauncherFixture):
         self.assertEqual(self.turn_starts, 1)
 
     def test_assignment_dispatch_uses_the_backend_thread_as_the_published_worker_id(self) -> None:
+        identities: list[str] = []
+
+        def observe_process() -> None:
+            world = self.native.fixture.world
+            pane = self.native.agent.submitted[-1][0]
+            identities.append(world.processes[world.foreground[pane][0]].current_identity)
+
+        self.native.agent.during_prompt = observe_process
         _ = self.successful()
         name, saved = next(iter(self.assignment_records().items()))
-        process = self.native.fixture.world.processes[self.native.fixture.world.foreground["w1:p1"][0]]
         row = staff.by_id(staff.StaffId(str(saved["staff_id"])))
         assert row is not None
-        self.assertEqual(row.current_session, process.current_identity)
+        self.assertEqual(identities, [row.current_session])
         self.assertEqual(row.name, name)
 
     def test_unreadable_staff_starts_no_worker(self) -> None:

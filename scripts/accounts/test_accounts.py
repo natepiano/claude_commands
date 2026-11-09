@@ -738,8 +738,7 @@ class AccountsTests(unittest.TestCase):
                     with (patch.object(staff, "local_snapshot", return_value=snapshot),
                           patch.object(sessions, "running_sessions", return_value=observed),
                           patch.object(pane_launch, "record_directory", return_value=records),
-                          patch.object(accounts, "_session_config_dir", side_effect=live_directory),
-                          patch.object(accounts, "_worker_status_records", return_value=[])):
+                          patch.object(accounts, "_session_config_dir", side_effect=live_directory)):
                         status = accounts.read_status(source=accounts.StoredUsageOnly())
                     role = "units" if kind == "unit" else "showrunners"
                     label = "claude4" if activity else "claude2"
@@ -834,7 +833,6 @@ class AccountsTests(unittest.TestCase):
                     messagingSocketPath="", updatedAt=1, tmux="", formerNames=[], status=activity)
                 with (patch.object(sessions, "running_sessions", return_value=[observed]),
                       patch.object(pane_launch, "record_directory", return_value=records),
-                      patch.object(accounts, "_worker_status_records", return_value=[]),
                       patch.object(accounts, "_session_config_dir", return_value=account.ConfiguredClaudeFolder(self.home / ".claude4"))):
                     reading = accounts.read_status(source=accounts.StoredUsageOnly())
                 document = cast(accounts.StatusDocument, json.loads(accounts.render_status_json(reading)))

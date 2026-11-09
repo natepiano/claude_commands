@@ -254,8 +254,8 @@ class AssignmentResult:
     started_at: float = field(default_factory=time.time)
     style_assignment: NoStyleAssignment | StyleAssignment = field(default_factory=NoStyleAssignment)
 
-    def finish_pass_command(self, status: str) -> list[str]:
-        return [PYTHON, PROGRESS, "finish-pass", "--session-dir", str(self.run), "--status", status]
+    def failed_pass_command(self) -> list[str]:
+        return [PYTHON, PROGRESS, "finish-pass", "--session-dir", str(self.run), "--status", "error"]
 
     def capture_style(self, code: int) -> None:
         assignment = self.style_assignment
@@ -296,8 +296,8 @@ def finish_repair(dispatch: AssignmentResult, code: int) -> bool:
         ledger += ["--edits-landed", "--reason", f"the fix worker exited with code {code}"]
     failed = call(ledger, dispatch.env, check=False).returncode != 0
     commands = [ledger]
-    if dispatch.pass_open:
-        commands.append(dispatch.finish_pass_command("error" if code or failed else "completed"))
+    if dispatch.pass_open and (code or failed):
+        commands.append(dispatch.failed_pass_command())
         failed = call(commands[-1], dispatch.env, check=False).returncode != 0 or failed
     if failed:
         print("assign.sh: repair resolution failed; run these commands:", file=sys.stderr)
@@ -321,13 +321,12 @@ def settle_dispatch(dispatch: AssignmentResult, code: int, completed: bool, show
         _ = summary.write_text(shown + "\n\n" + summary.read_text())
     if dispatch.args.summary:
         _ = Path(dispatch.args.summary).write_text(summary.read_text())
-    outcome = "completed" if completed else "error"
     if not 3 <= code <= 8:
         if dispatch.role == "fix" and dispatch.env.get("UNIT_RESOLVES_ROUND") == "1":
             if not finish_repair(dispatch, 0 if completed else code or 1):
-                completed, code, outcome = False, 1, "error"
-        elif dispatch.pass_open:
-            _ = call(dispatch.finish_pass_command(outcome), dispatch.env)
+                completed, code = False, 1
+        elif dispatch.pass_open and not completed:
+            _ = call(dispatch.failed_pass_command(), dispatch.env)
             dispatch.pass_open = False
     _ = status.write_text("done\n" if completed else "error\n")
     return 0 if completed else code if 3 <= code <= 8 else 2 if code == 2 else 1
@@ -438,7 +437,6 @@ def execute_herdr(args: Arguments, run: Path, phase: str, prompt: Path,
             if args.summary:
                 write_text_atomic(Path(args.summary), summary.read_text())
             record_review(outcome, True, summary)
-            _ = call(outcome.finish_pass_command("completed"), env)
         outcome.capture_style(result.returncode)
         write_text_atomic(status, "done\n" if result.returncode == 0 else "error\n")
         code = result.returncode
