@@ -50,6 +50,7 @@ from scripts.style.finding_sites import (FilingEligibleWithoutHistory as FilingE
                            RenameJudgmentSite as RenameJudgmentSite,
                            SiteEvidence as SiteEvidence, UnchangedSite as UnchangedSite)
 from scripts.style import style_rules
+from scripts.style import style_config
 from scripts.style import approved_renames
 from scripts.style.approved_renames import (AppliedCheck, AppliedInCode, ApprovedRename, BindingProof, BindingRename, FileRename, Folder, MissingFile,
                               NoAppliedCheck, NoOuterBindingBlock, OuterBindingBlocked as OuterBindingBlocked, OuterBindingUnproved as OuterBindingUnproved, RenameNotApplied, applied_check,
@@ -2258,6 +2259,14 @@ MIGRATIONS = {
     """,
     # Assignment checks hold the write lock; batch tickets can share their showrunner.
     37: "DROP INDEX IF EXISTS tickets_one_assigned;",
+    38: """
+        ALTER TABLE ticket_predecessors RENAME TO ticket_predecessors_single;
+        CREATE TABLE ticket_predecessors (
+            ticket TEXT NOT NULL, predecessor TEXT NOT NULL, PRIMARY KEY(ticket, predecessor)
+        );
+        INSERT INTO ticket_predecessors SELECT ticket,predecessor FROM ticket_predecessors_single;
+        DROP TABLE ticket_predecessors_single;
+    """,
     33: """
         CREATE TABLE IF NOT EXISTS rename_outer_binding_blocks (
             finding_id TEXT PRIMARY KEY, name TEXT NOT NULL, line INTEGER NOT NULL, text TEXT NOT NULL
@@ -3461,13 +3470,13 @@ class Ledger:
             return self._ticket(id)["widened"]
 
     def _check_ticket_pipelines(self, unit: str = "") -> None:
-        """Reprove disjointness under the caller's write lock, including its pending writes.
-
-        Both assignment and footprint changes use this boundary. Ordinary tickets read no sources here.
-        """
+        """Check each peer pair with an open ticket under the caller's write lock."""
         pairs = cast(list[tuple[str, str]], self._connection.execute(
-            "SELECT p.predecessor,p.ticket FROM ticket_predecessors p JOIN tickets t ON t.id=p.ticket "
-            + "WHERE t.state IN ('assigned','checkpointed') AND (?='' OR t.unit=?)", (unit, unit),
+            "SELECT p.predecessor,p.ticket FROM ticket_predecessors p "
+            + "JOIN tickets t ON t.id=p.ticket JOIN tickets peer ON peer.id=p.predecessor "
+            + "WHERE t.state<>'dropped' AND peer.state<>'dropped' "
+            + "AND (t.state IN ('assigned','checkpointed') OR peer.state IN ('assigned','checkpointed')) "
+            + "AND (?='' OR t.unit=?)", (unit, unit),
         ).fetchall())
         for predecessor, successor in pairs:
             self._check_ticket_pair(self._ticket(predecessor), self._ticket(successor))
@@ -3523,7 +3532,15 @@ class Ledger:
         if not ticket["base"]:
             raise LedgerError(f"{ticket['id']}: changed paths require a ticket base")
         style_tip = self._style_branch_tip()[1]
-        revisions = (end, f"^{ticket['base']}", *((f"^{style_tip}",) if style_tip else ()))
+        peers = cast(list[tuple[str]], self._connection.execute(
+            "SELECT peer.checkpoint FROM ticket_predecessors p JOIN tickets peer "
+            + "ON peer.id=CASE WHEN p.ticket=? THEN p.predecessor ELSE p.ticket END "
+            + "WHERE (p.ticket=? OR p.predecessor=?) AND peer.checkpoint<>''",
+            (ticket["id"], ticket["id"], ticket["id"]),
+        ).fetchall())
+        imported = {checkpoint for (checkpoint,) in peers if self._is_ancestor(checkpoint, end)}
+        revisions = (end, f"^{ticket['base']}", *(f"^{commit}" for commit in sorted(imported)),
+                     *((f"^{style_tip}",) if style_tip else ()))
         paths = _git_bytes(self.repo, "log", "--no-merges", "--name-only", "--no-renames", "-z",
                            "--format=", *revisions, "--").stdout
         if paths and not paths.endswith(b"\0"):
@@ -3533,26 +3550,38 @@ class Ledger:
     def _check_ticket_pair(self, predecessor: TicketRecord, successor: TicketRecord) -> None:
         """Reprove disjointness from fresh rows and resolved tips; any uncertainty refuses the transaction."""
         try:
-            if predecessor["state"] not in ("checkpointed", "merged") or not predecessor["checkpoint"]:
-                raise LedgerError("predecessor has no waiting or merged checkpoint")
             style_branch, style_tip = self._style_branch_tip()
-            live = {successor["branch"]: _git(self.repo, "rev-parse", "--verify", f"{successor['branch']}^{{commit}}")}
+            live = {ticket["branch"]: _git(self.repo, "rev-parse", "--verify", f"{ticket['branch']}^{{commit}}")
+                    for ticket in (predecessor, successor) if ticket["state"] == "assigned"}
             if style_branch:
                 live[style_branch] = style_tip
             commits = {self.synced_commit(), *live.values()}
             for ticket in (predecessor, successor):
-                if not ticket["base"] or (ticket["state"] == "checkpointed" and not ticket["checkpoint"]):
+                if not ticket["base"] or (ticket["state"] in ("checkpointed", "merged") and not ticket["checkpoint"]):
                     raise LedgerError(f"{ticket['id']}: footprint has no base or checkpoint")
                 commits.add(ticket["base"])
                 if ticket["checkpoint"]:
                     commits.add(ticket["checkpoint"])
-            trees = frozenset(commits)
+            ends: list[str] = []
+            for ticket in (predecessor, successor):
+                paths = self._pipeline_footprint(ticket, frozenset(commits))
+                end = ticket["checkpoint"] or live[ticket["branch"]]
+                if ticket["state"] == "assigned":
+                    from scripts.shutdown import remote
+
+                    location = self.unit_row(ticket["unit"]).worktree
+                    worktree = (location.path if isinstance(location, staff.PresentWorktree)
+                                and location.machine == remote.local_machine() else self.repo)
+                    if worktree.is_dir() and _git(worktree, "rev-parse", "--symbolic-full-name", "HEAD") == ticket["branch"]:
+                        end = style_footprint.worktree_commit(worktree, style_footprint.TicketSourcePaths(tuple(sorted(paths))))
+                ends.append(end)
+            trees = frozenset((*commits, *ends))
             crates = tuple(sorted({crate for commit in trees for crate in self._tip(commit).crate_dirs}, key=len, reverse=True))
             footprints: list[frozenset[str]] = []
-            for ticket in (predecessor, successor):
-                end = ticket["checkpoint"] or live[successor["branch"]]
+            for ticket, end in zip((predecessor, successor), ends, strict=True):
+                paths = self._pipeline_footprint(ticket, trees)
                 actual = self.ticket_changed_paths(ticket, end)
-                footprints.append(self._pipeline_footprint(ticket, trees) | actual)
+                footprints.append(paths | actual)
             waiting, selected = footprints
             overlap = ((waiting & protected_ticket_files(selected, crates))
                        | (selected & protected_ticket_files(waiting, crates)))
@@ -3697,19 +3726,43 @@ class Ledger:
             raise LedgerError(f"{ticket['id']}: cannot become {target} from {state}")
         if target == "assigned":
             active = self._assignment_predecessors(ticket)
-            if active and (len(active) != 1 or active[0]["state"] != "checkpointed"):
-                raise LedgerError(f"{ticket['id']}: unit {ticket['unit']} already has {active[0]['id']} in state {active[0]['state']}")
+            assigned = tuple(peer for peer in active if peer["state"] == "assigned")
+            waiting = sum(peer["state"] == "checkpointed" for peer in active)
+            # Zero assigned tickets fit every positive limit from the configuration contract.
+            if waiting >= 2 or (assigned and len(assigned) >= self._ticket_capacity(ticket["unit"])):
+                held = assigned[0] if assigned else active[0]
+                raise LedgerError(f"{ticket['id']}: unit {ticket['unit']} already has {held['id']} in state {held['state']}")
         if target == "merged":
-            rows = cast(list[tuple[str]], self._connection.execute(
-                "SELECT p.predecessor FROM ticket_predecessors p JOIN tickets t ON t.id=p.predecessor "
-                + "WHERE p.ticket=? AND t.state<>'merged'", (ticket["id"],),
-            ).fetchall())
-            if rows:
-                raise LedgerError(f"{ticket['id']}: waiting for predecessor {rows[0][0]} to merge")
+            waiting = self._ticket_merge_predecessors(ticket)
+            if waiting:
+                raise LedgerError(f"{ticket['id']}: waiting for predecessor {waiting[0]} to merge")
         return False
 
+    def _ticket_capacity(self, unit: str) -> int:
+        """Read the assigned-ticket limit from the unit's production document."""
+        row = self.unit_row(unit)
+        parent = self.staff_resolver().record.parent_of(row)
+        if parent is None or not isinstance(parent.doc, (staff.LiveDoc, staff.WrappedDoc)):
+            raise style_config.StyleConfigError(f"{row.name}: no parent production document")
+        return style_config.read_config(parent.doc.path, unit_branch="").assignment(row.name).open_tickets
+
+    def _ticket_merge_predecessors(self, ticket: TicketRecord) -> tuple[str, ...]:
+        """Return waiting checkpoints that the ticket's checkpoint contains."""
+        if not ticket["checkpoint"] or self.unit_row(ticket["unit"]).kind == "showrunner":
+            return ()
+        peers = cast(list[tuple[str, str]], self._connection.execute(
+            "SELECT id,checkpoint FROM tickets WHERE unit=? AND id<>? AND state='checkpointed' ORDER BY length(id),id",
+            (ticket["unit"], ticket["id"]),
+        ).fetchall())
+        # Unchanged tickets can share one commit. Keep their existing assignment order.
+        older = {row[0] for row in cast(list[tuple[str]], self._connection.execute(
+            "SELECT predecessor FROM ticket_predecessors WHERE ticket=?", (ticket["id"],),
+        ).fetchall())}
+        return tuple(id for id, checkpoint in peers if (id in older if checkpoint == ticket["checkpoint"]
+                     else self._is_ancestor(checkpoint, ticket["checkpoint"])))
+
     def _assignment_predecessors(self, ticket: TicketRecord) -> tuple[TicketRecord, ...]:
-        """Bulk tickets share a holder; ordinary tickets keep the unit's assignment order."""
+        """Return open peers for ordinary tickets; bulk tickets share their showrunner."""
         if (isinstance(self.ticket_batch_owner(ticket["id"]), BatchOwner)
                 and self.unit_row(ticket["unit"]).kind == "showrunner"):
             return ()
@@ -3762,7 +3815,7 @@ class Ledger:
                     except LedgerError as error:
                         raise LedgerError(f"{id}: cannot resolve branch {branch}; waiting for merge: "
                                           + f"{active[0]['id']} checkpointed at {active[0]['checkpoint']}; assignment refused") from error
-                    if assignment_tip != active[0]["checkpoint"] or not assignment_tip:
+                    if len(active) == 1 and active[0]["state"] == "checkpointed" and assignment_tip != active[0]["checkpoint"]:
                         raise LedgerError(f"{id}: branch must start at waiting checkpoint {active[0]['checkpoint']}")
             return False
 
@@ -3838,8 +3891,14 @@ class Ledger:
                 if target == "assigned":
                     active = self._assignment_predecessors(ticket)
                     if active:
-                        _ = self._connection.execute("INSERT INTO ticket_predecessors VALUES (?,?)", (id, active[0]["id"]))
+                        _ = self._connection.executemany("INSERT INTO ticket_predecessors VALUES (?,?)",
+                                                         [(id, peer["id"]) for peer in active])
                         _ = self._connection.execute("UPDATE tickets SET base=? WHERE id=?", (assignment_tip, id))
+                        for peer in active:
+                            if peer["state"] == "assigned" and not peer["base"]:
+                                base = (assignment_tip if peer["branch"] == branch else
+                                        _git(self.repo, "rev-parse", "--verify", f"{peer['branch']}^{{commit}}"))
+                                _ = self._connection.execute("UPDATE tickets SET base=? WHERE id=?", (base, peer["id"]))
                 # Check before merge removes the successor from the open set, after any carried finding moves.
                 if target == "merged":
                     self._check_ticket_pipelines(ticket["unit"])
@@ -4941,7 +5000,7 @@ class Ledger:
         return self._superseded(definitions)
 
     def _obsolete_tickets(self, definitions: Mapping[str, Rule], withdrawal: Withdrawal) -> tuple[TicketRecord, ...]:
-        """Cancel unfinished stale pins and dependent successors; accepted checkpoints stop cancellation."""
+        """Cancel unfinished tickets with stale pins; peer rows do not create build dependencies."""
         rows = cast(list[tuple[str]], self._connection.execute(
             "SELECT id FROM tickets WHERE state IN ('queued','assigned') ORDER BY id").fetchall())
         tickets = tuple(self._ticket(row[0]) for row in rows)
@@ -4953,11 +5012,6 @@ class Ledger:
         obsolete.update(item.finding.build_ticket.ticket for item in withdrawal.withdrawn
                         if isinstance(item.verdict, RuleBodyChanged) and isinstance(item.finding.build_ticket, BuildTicket)
                         and item.finding.build_ticket.ticket in cancellable)
-        dependencies = cast(list[tuple[str, str]], self._connection.execute(
-            "SELECT ticket,predecessor FROM ticket_predecessors").fetchall())
-        while successors := {ticket for ticket, predecessor in dependencies
-                             if predecessor in obsolete and ticket in cancellable} - obsolete:
-            obsolete.update(successors)
         return tuple(ticket for ticket in tickets if ticket["id"] in obsolete)
 
     def _rule_generation_changes(self, definitions: Mapping[str, Rule]) -> tuple[RuleGenerationChange, ...]:
@@ -5002,7 +5056,7 @@ class Ledger:
                         or self._rule_generation_changes(definitions) != generations):
                     raise ChangedBeforeLock("the findings or tickets changed while they were withdrawn; rerun")
                 now = _now()
-                # Drop builds and their dependent tickets before withdrawing their findings, atomically.
+                # Drop obsolete tickets before withdrawing their findings in the same transaction.
                 _ = self._connection.executemany("UPDATE tickets SET state='dropped',updated_at=? WHERE id=?",
                                                  [(now, ticket["id"]) for ticket in cancelled])
                 _ = self._connection.executemany(
@@ -6803,19 +6857,34 @@ class Ledger:
             changes.append(f"style branch {style_branch}")
         with self._connection:
             _ = self._connection.execute("INSERT INTO reconciliation VALUES (1,?) ON CONFLICT(id) DO UPDATE SET branch_point=excluded.branch_point", (branch_point,))
-        with self.git_operation(f"reconcile {style_branch}"):
-            for handoff in self.pending_handoffs():
-                checkpoint = handoff["checkpoint"]
-                if self._is_ancestor(checkpoint, branch_tip):
-                    with self._connection:
-                        _ = self._connection.execute("UPDATE handoffs SET state='merged',merge_commit=?,updated_at=? WHERE checkpoint=?",
-                                                     (self._first_merge(checkpoint, branch_point), _now(), checkpoint))
-                    changes.append(f"hand-off {checkpoint}: {handoff['state']} -> merged")
+        trees = tuple(Path(line.removeprefix("worktree ")) for line in
+                      _git(self.repo, "worktree", "list", "--porcelain").splitlines() if line.startswith("worktree "))
+        direct = False
+        for row in self.staff_resolver().record.find(kind="showrunner"):
+            if not isinstance(row.doc, (staff.LiveDoc, staff.WrappedDoc)) or not row.doc.path.is_file():
+                continue
+            if not any(row.doc.path.is_relative_to(tree) for tree in trees):
+                continue
+            if not any(re.fullmatch(r"#{1,6}\s+Style units\s*#*\s*", line) for line in row.doc.path.read_text().splitlines()):
+                continue
+            if isinstance(style_config.read_config(row.doc.path, unit_branch="").route, style_config.ParentUnitRoute):
+                direct = True
+                break
+        if not direct:
+            with self.git_operation(f"reconcile {style_branch}"):
+                for handoff in self.pending_handoffs():
+                    checkpoint = handoff["checkpoint"]
+                    if self._is_ancestor(checkpoint, branch_tip):
+                        with self._connection:
+                            _ = self._connection.execute("UPDATE handoffs SET state='merged',merge_commit=?,updated_at=? WHERE checkpoint=?",
+                                                         (self._first_merge(checkpoint, branch_point), _now(), checkpoint))
+                        changes.append(f"hand-off {checkpoint}: {handoff['state']} -> merged")
         tickets = cast(list[tuple[str, str, str, str]], self._connection.execute(
             "SELECT id,branch,state,checkpoint FROM tickets WHERE state IN ('assigned','checkpointed') "
-            + "ORDER BY EXISTS(SELECT 1 FROM ticket_predecessors p JOIN tickets prev ON prev.id=p.predecessor "
-            + "WHERE p.ticket=tickets.id AND prev.state='checkpointed'),state,unit,length(id),id",
+            + "ORDER BY state,unit,length(id),id",
         ).fetchall())
+        with self.git_operation(f"reconcile {style_branch}"):
+            tickets.sort(key=lambda row: len(self._ticket_merge_predecessors(self._ticket(row[0]))))
         for id, branch, state, checkpoint in tickets:
             with self.git_operation(f"ticket {id} reconcile"):
                 contained = state == "checkpointed" and self._is_ancestor(checkpoint, style_tip)

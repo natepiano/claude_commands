@@ -20,6 +20,9 @@ from scripts.style import fake_fmt
 from scripts.style.style_child_test_support import style_cli_command
 from scripts.style import mechanical_classes
 from scripts.style import style_ledger
+from scripts.style import style_footprint
+from scripts.style.ledger_test_support import write_style_units
+from scripts.style.style_config import StyleUnitAssignment
 from scripts.style.style_plan_test_support import private_class_catalog, unit_staff_id
 from scripts.style import style_rules
 from scripts.production import unit_config
@@ -99,6 +102,7 @@ class StandingCheckpointTests(unittest.TestCase):
             _ = exclude.write("/docs/product-production.md\n")
         self.write(parent, self.production("main", self.repo))
         self.write(self.doc, self.production("style/main", self.style) + "\n- **Kind:** style\n- **Branch point:** main\n")
+        write_style_units(self.doc, (StyleUnitAssignment("names", ("names", "values", "types", "modules")),))
         _ = recorded_showrunner("sample", parent)
         owner = recorded_showrunner("sample-style", self.doc, parent="sample")
         _ = fixture_unit_location(owner, "names", self.unit)
@@ -169,6 +173,57 @@ class StandingCheckpointTests(unittest.TestCase):
                 result = self.cli("style_ledger.py", "record", "--repo", str(self.unit), "--rule", rule,
                                   "--path", path, "--commit", head, "--verdict", "clean", "--ticket", ticket["id"], "--worker", "test")
                 self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_ticket_candidate_excludes_staged_unstaged_and_untracked_sibling_work(self) -> None:
+        own = "alpha/src/lib.rs"
+        staged = "beta/src/lib.rs"
+        unstaged = "beta/Cargo.toml"
+        untracked = "beta/src/partial.rs"
+        head = self.git(self.unit, "rev-parse", "HEAD")
+        self.write(self.unit / own, "fn value() -> usize { 2 }\n")
+        self.write(self.unit / staged, "fn sibling() {\n")
+        _ = self.git(self.unit, "add", staged)
+        self.write(self.unit / staged, "fn sibling() { unfinished\n")
+        self.write(self.unit / unstaged, "[unfinished\n")
+        self.write(self.unit / untracked, "fn partial(\n")
+        index = Path(self.git(self.unit, "rev-parse", "--path-format=absolute", "--git-path", "index"))
+        before_index = index.read_bytes()
+        before_status = self.git(self.unit, "status", "--porcelain=v1", "-uall")
+        with mock.patch.dict(os.environ, self.env):
+            candidate = style_footprint.worktree_commit(self.unit, style_footprint.TicketSourcePaths((own,)))
+        self.assertEqual(self.git(self.unit, "rev-parse", candidate + "^"), head)
+        self.assertEqual(self.git(self.unit, "diff", "--name-only", head, candidate), own)
+        self.assertEqual(self.git(self.unit, "show", candidate + ":" + own), "fn value() -> usize { 2 }")
+        for path in (staged, unstaged):
+            self.assertEqual(self.git(self.unit, "show", candidate + ":" + path), self.git(self.unit, "show", head + ":" + path))
+        self.assertEqual(self.git(self.unit, "ls-tree", candidate, "--", untracked), "")
+        self.assertEqual(index.read_bytes(), before_index)
+        self.assertEqual(self.git(self.unit, "status", "--porcelain=v1", "-uall"), before_status)
+        self.assertEqual((self.unit / staged).read_text(), "fn sibling() { unfinished\n")
+        self.assertEqual((self.unit / unstaged).read_text(), "[unfinished\n")
+        self.assertEqual((self.unit / untracked).read_text(), "fn partial(\n")
+
+    def test_ticket_candidate_records_a_rename_and_ignores_absent_paths(self) -> None:
+        old = "alpha/src/lib.rs"
+        new = "alpha/src/moved.rs"
+        head = self.git(self.unit, "rev-parse", "HEAD")
+        _ = (self.unit / old).rename(self.unit / new)
+        with mock.patch.dict(os.environ, self.env):
+            candidate = style_footprint.worktree_commit(
+                self.unit, style_footprint.TicketSourcePaths((old, new, "alpha/src/absent.rs")))
+        self.assertEqual(self.git(self.unit, "diff", "--name-status", "--no-renames", head, candidate).splitlines(),
+                         ["D\t" + old, "A\t" + new])
+        self.assertEqual(self.git(self.unit, "show", candidate + ":" + new), self.git(self.unit, "show", head + ":" + old))
+
+    def test_unchanged_ticket_candidate_has_an_exact_parent(self) -> None:
+        head = self.git(self.unit, "rev-parse", "HEAD")
+        with mock.patch.dict(os.environ, self.env):
+            candidate = style_footprint.worktree_commit(
+                self.unit, style_footprint.TicketSourcePaths(("alpha/src/lib.rs",)))
+            self.assertEqual(style_footprint.worktree_commit(self.unit), head)
+        self.assertNotEqual(candidate, head)
+        self.assertEqual(self.git(self.unit, "rev-parse", candidate + "^"), head)
+        self.assertEqual(self.git(self.unit, "diff", "--name-only", head, candidate), "")
 
     def test_approved_non_mechanical_work_passes_both_gates_and_reaches_checkpoint(self) -> None:
         # The ordinary case below exercises the same literal edit through the coverage gate.
