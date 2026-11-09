@@ -333,11 +333,14 @@ Use these fixture rules on Linux and macOS:
 - Build a herdr client only in `setUp`, never as a class attribute: the class body runs at import, before any patched environment. The run-wide `HERDR_BIN` hides such a lookup, so check a new fixture once with an empty `PATH` and no `HERDR_BIN`.
 - Pin the local machine in each fixture that stores staff locations on `natedev`. `HERDR_PLATFORM=linux` selects herdr process evidence, not the staff machine. A subprocess launcher uses `add_unit_test_support.LINUX_LAUNCHER_CLI`. A direct call patches the name the module imported, such as `add_showrunner.local_machine`.
 
-Run these suites on the Mac with a scratch home. Run the command from the root of a copy of the tree under test, not from the Mac's live `~/.claude`, which holds main. Remove the scratch home when the run ends:
+Run these suites on the Mac with a temporary home.
+Run the command from the root of a copy of the tree under test.
+The block removes the temporary home when the tests end:
 
 ```sh
 (
-  test_home=$(mktemp -d) || exit
+  set -e
+  test_home=$(mktemp -d)
   trap 'rm -rf "$test_home"' EXIT
   env -u CLAUDE_CONFIG_DIR -u CLAUDE_CODE_OAUTH_TOKEN -u CODEX_HOME \
     HOME="$test_home" TMPDIR=/private/tmp HERDR_BIN=/nonexistent/herdr \
