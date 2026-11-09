@@ -295,6 +295,27 @@ class NativePaneSessionTests(StaffTestCase):
             self.assertEqual(launch["session_id"], identity)
         self.assertEqual(native.call_args_list, [call(998075, "codex", ""), call(998075, "codex")])
 
+    def test_codex_report_ignores_the_hook_process_in_the_foreground_group(self) -> None:
+        identity = fixture_runtime_id("codex-with-hook")
+        row = {"pane_id": "w1:p1", "session_id": identity}
+        info: dict[str, object] = {"foreground_processes": [
+            {"pid": 998076, "argv": ["python3", str(Path(herdr.__file__).with_name("turn_end.py"))]},
+            {"pid": 998075, "argv": ["codex"]}]}
+        observation = herdr.NativeAgentProcess(herdr.PaneSessionReport(identity), "same-start", {})
+        result = subprocess.CompletedProcess[str]([], 0, json.dumps({"result": {"process_info": info}}), "")
+        client = herdr.Herdr("agents")
+        with patch.object(herdr, "run_program", return_value=result), \
+                patch.object(herdr, "native_process", return_value=observation) as native, \
+                patch.object(client, "result", return_value={"process_info": info}), \
+                patch.object(client, "pane_row", return_value=row), \
+                patch.object(herdr, "Herdr", return_value=client):
+            self.assertEqual(client.native_pane_process("w1:p1", "codex", 1, pane_row=row), observation)
+            self.assertEqual(client.pane_codex_pid("w1:p1"), 998075)
+            self.assertEqual(herdr.codex_pane_process(998075, herdr.HerdrPlace("agents", "w1:p1")), observation)
+        self.assertEqual(native.call_args_list, [call(998075, "codex", identity)] * 2)
+        self.assertFalse(herdr.codex_without_session({"foreground_processes": [
+            {"pid": 998075, "argv": ["codex"]}, {"pid": 998077, "argv": ["codex"]}]}))
+
     def test_native_pane_process_returns_the_proved_account_and_launch_identity_for_the_exact_codex_pid(self) -> None:
         current = fixture_runtime_id("pane-current-thread")
         launch = fixture_runtime_id("pane-launch-thread")

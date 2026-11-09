@@ -7,10 +7,11 @@ except FileNotFoundError:
     pass
 
 import argparse
-from collections.abc import Generator, Iterable
+from collections.abc import Callable, Generator, Iterable
 from contextlib import ExitStack, redirect_stderr
 from dataclasses import dataclass, replace
 from enum import IntEnum
+from importlib import import_module
 import io
 import json
 import os
@@ -327,6 +328,10 @@ def dispatch(parent: StaffId, name: WorkerName, role: WorkerRole, prompt: Path, 
             receipt = dispatch_receipt(row, delivery.line, delivery.completion_id, run=session_dir)
             if isinstance(receipt, DispatchComplete):
                 save_reply(Path(delivery.reply_file), receipt.reply)
+            repeat = cast(Callable[[str, staff.StaffRow, Path, dict[str, object]], None],
+                          import_module("scripts.herdr.turn_end").repeat_completion_notice)
+            repeat(row.name, worker_admission.parent(staff.snapshot(), run=session_dir), session_dir,
+                   worker_panes.worker_pass(row, session_dir))
             return DispatchSubmission.SUBMITTED
         if isinstance(started, StartAtDispatch):
             current_start = worker_panes.start_or_resume(parent, name, role, lock=hold, policy=policy)

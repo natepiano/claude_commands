@@ -59,17 +59,6 @@ class BuildCosts:
     mac_idle: MacIdleEstimate
 
 
-FOOTER = (
-    "Definitions: phase wall time = finish minus phase_started_at; finishes select the window. Costs can overlap.",
-    f"Memory wait = recorded wait; cold = {moments.COLD_BUILD_MIN_CRATES}+ crates; failed = counted nonzero step status or failed CI.",
-    f"Reruns after a pass = same-worker nextest within {moments.SAME_WORKER_REPEAT_SECONDS // 60} min, same recorded tree, worktree, and build input.",
-    "CI = summed job wall time (run wall time if jobs are absent); cancelled = cancelled workflow attempts.",
-    "Mac idle while natedev waits = candidate wait intervals minus Mac execution and recorded holds; missing records remain unknown.",
-)
-OUTPUT_LINE_LIMIT = 24
-MAX_RANKED_ROWS = OUTPUT_LINE_LIMIT - 4 - len(FOOTER) - 1
-
-
 def machine_name(target: str | None, host: str | None, legacy_hosts: dict[str, str]) -> str:
     if target:
         return target
@@ -387,48 +376,3 @@ def aggregate_costs(reading: CostReading, start: datetime, end: datetime) -> Bui
 
 def collect_costs(connection: sqlite3.Connection, start: datetime, end: datetime) -> BuildCosts:
     return aggregate_costs(read_costs(connection, start, end), start, end)
-
-
-def phase_line(label: str, phases: Sequence[moments.ProgressFinish]) -> str:
-    durations = [phase.wall_s for phase in phases if isinstance(phase.wall_s, float)]
-    if not durations:
-        return f"{label}: {len(phases)} finished; median unavailable; p90 unavailable."
-    missing = f"; {len(phases) - len(durations)} without a recorded start" if len(durations) < len(phases) else ""
-    return (f"{label}: {len(phases)} finished; median {moments.nearest_rank(durations, 50):.0f} s/phase; "
-            + f"p90 {moments.nearest_rank(durations, 90):.0f} s/phase{missing}.")
-
-
-def render_costs(build_costs: BuildCosts) -> str:
-    days = (build_costs.end - build_costs.start).total_seconds() / 86400
-    count = len(build_costs.phases)
-    lines = [f"Build costs: {days:g} days ending {build_costs.end.isoformat()}.",
-             phase_line("Hana phases", [phase for phase in build_costs.phases if moments.hana_name(phase.working_dir)]),
-             phase_line("All phases", build_costs.phases), "Cost by machine: hours/day; hours/finished phase."]
-    for row in build_costs.ranked[:MAX_RANKED_ROWS]:
-        per_phase = f"{row.seconds / 3600 / count:.3f} h/phase" if count else "unavailable h/phase (no finished phases)"
-        uncertainty = (f" upper bound; {row.unknown_seconds / 3600 / days:.2f} h/day unknown"
-                       if row.unknown_seconds > 0 else "")
-        if row.missing_waits:
-            uncertainty += f"; subtotal with {row.missing_waits} applicable waits missing"
-        lines.append(f"{row.machine}: {row.cause}: {row.seconds / 3600 / days:.2f} h/day; {per_phase}{uncertainty}.")
-    if len(build_costs.ranked) > MAX_RANKED_ROWS:
-        lines.append(f"{len(build_costs.ranked) - MAX_RANKED_ROWS} smaller machine/cause costs omitted.")
-    if not build_costs.ranked:
-        lines.append("No recorded costs in this window.")
-    lines.extend(FOOTER)
-    return "\n".join(lines)
-
-
-def main(args: list[str]) -> int:
-    from scripts.buildlog.number_option import positive_window
-
-    window = positive_window(args, "--days", 7, "costs", integer=True)
-    if window is None:
-        return 2
-    start, end = window[:2]
-    connection = index.read_only()
-    try:
-        print(render_costs(collect_costs(connection, start, end)))
-    finally:
-        connection.close()
-    return 0
