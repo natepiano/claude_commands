@@ -408,7 +408,17 @@ try {
                 vcpus:running?.querySelector('.vcpus')?.textContent,
                 cloudCard:!!document.querySelector('#cloud'),
                 statusInTable:!!running && !!waiting,
-                cloudMemory:!!runningDetails?.querySelector('.row-progress,.reserved-amount,.used-amount,.b'),
+                cloudMemory:!!runningDetails?.querySelector('.reserved-amount,.used-amount,.b:not(.row-progress)'),
+                progressWidth:runningDetails?.querySelector('.row-progress')?.getBoundingClientRect().width,
+                progressTrackWidth:runningDetails?.querySelector('.progress-track')?.getBoundingClientRect().width,
+                progressInTrack:!!runningDetails?.querySelector('.track .row-progress'),
+                amounts:runningDetails?.querySelector('.amounts')?.textContent,
+                trackText:runningDetails?.querySelector('.track')?.textContent,
+                waitingBar:!!waitingDetails?.querySelector('.row-progress,.progress-track'),
+                height:runningDetails?.getBoundingClientRect().height,
+                tableHeight:running?.getBoundingClientRect().height,
+                tipsMatch:runningDetails?.querySelector('.track')?.dataset.tip===running?.dataset.tip &&
+                  runningDetails?.querySelector('.row-memory')?.dataset.tip===running?.dataset.tip,
                 localMemory:!!document.querySelector('.wrow .track .seg-used'),
                 staleColor:stale?getComputedStyle(stale).color:null,
                 errorColor:(() => {const span=document.createElement('span');span.style.color='var(--cap)';
@@ -420,8 +430,17 @@ try {
             assert.ok(cloudProof.statusInTable,'Cloud work is absent from the main table.');
             assert.equal(cloudProof.machine,'aws');
             assert.equal(cloudProof.vcpus,'32');
-            for(const value of ['running',modules,failed,'no update for '+cloudRow.late_age])
+            assert.ok(!/\brunning\b/.test(cloudProof.running),'The cloud row repeats the running state.');
+            for(const value of [modules,failed,'no update for '+cloudRow.late_age])
               assert.ok(cloudProof.running.includes(value),value+' is absent from the cloud row.');
+            assert.ok(cloudProof.progressInTrack,'The cloud progress line is absent from the track.');
+            assert.ok(Math.abs(cloudProof.progressWidth-cloudProof.progressTrackWidth*cloudRow.progress.percent/100)<1,
+              'The cloud progress width differs from its percent.');
+            assert.ok(cloudProof.amounts.includes(modules),'The cloud module count is absent from the amounts.');
+            assert.equal(cloudProof.trackText,'','The cloud track contains text.');
+            assert.ok(!cloudProof.waitingBar,'The waiting cloud row has a progress line.');
+            assert.ok(Math.abs(cloudProof.height-cloudProof.tableHeight)<1,'The cloud row heights differ.');
+            assert.ok(cloudProof.tipsMatch,'The cloud hover keys differ from the local row keys.');
             assert.equal(cloudProof.place,'cloud');
             assert.equal(cloudProof.waitingMachine,'');
             assert.equal(cloudProof.waitingVcpus,'');
@@ -432,6 +451,15 @@ try {
             assert.ok(cloudProof.localMemory,'The local memory bar is absent.');
             assert.equal(cloudProof.staleColor,cloudProof.errorColor,'The stale age is not red.');
             assert.ok(cloudProof.scroll<=cloudProof.client,'Cloud rows overflow the page.');
+            if(process.env.MEMORY_PAGE_SHOT && theme==='light' && width===1400 && name==='cloud') {
+              const clip=await evaluate(`(() => {
+                const r=document.querySelector('#walk').closest('.card').getBoundingClientRect();
+                return {x:r.left+scrollX,y:r.top+scrollY,width:r.width,height:r.height,scale:1};
+              })()`);
+              const shot=await call('Page.captureScreenshot',{format:'png',captureBeyondViewport:true,clip});
+              await mkdir(dirname(process.env.MEMORY_PAGE_SHOT),{recursive:true});
+              await writeFile(process.env.MEMORY_PAGE_SHOT,Buffer.from(shot.data,'base64'));
+            }
             proof[name]=cloudProof;
             }
             await show(base);
