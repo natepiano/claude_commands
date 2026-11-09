@@ -32,16 +32,27 @@ class MemoryHoverTests(unittest.TestCase):
         self.assertIn("suites:1, 80% done", text)
         self.assertIn("0.5 GiB", text)
         self.assertIn("highest anonymous use in the next 20%", text)
-        hover = cast(list[str], self.page_expression("tipText('row:0', data)", {"walk": [{
-            "name": "merge-gate", "unit": "fixture", "showrunner": "fixture-production",
-            "used": 1, "reserved": 0.5, "counted": 1.5, "queued": True, "keep_text": text,
-            "progress": memory_feed.row_progress(inputs.running)}]}))
-        self.assertEqual(hover[0], "merge-gate · fixture-production")
-        for expected in ("suites:1, 80% done", "0.5 GiB", "highest anonymous use in the next 20%",
-                         "The queue holds this memory for the run.", "\nfixture",
-                         "testing · 8 of 10 modules · 80% done"):
-            with self.subTest(expected=expected):
-                self.assertIn(expected, hover[1])
+        module_counter = memory_feed.row_progress(inputs.running)
+        assert module_counter["kind"] == "RowProgress"
+        test_counter: memory_feed.RowProgress = {**module_counter, "unit": "tests"}
+        for name, counter, ordering_note in (
+            ("merge-gate", module_counter, True),
+            ("merge gate", module_counter, True),
+            ("fixture-project merge gate", module_counter, True),
+            ("merge-gate", test_counter, False),
+        ):
+            with self.subTest(name=name, unit=counter["unit"]):
+                hover = cast(list[str], self.page_expression("tipText('row:0', data)", {"walk": [{
+                    "name": name, "unit": "fixture", "showrunner": "fixture-production",
+                    "used": 1, "reserved": 0.5, "counted": 1.5, "queued": True, "keep_text": text,
+                    "progress": counter}]}))
+                self.assertEqual(hover[0], f"{name} · fixture-production")
+                for expected in ("suites:1, 80% done", "0.5 GiB", "highest anonymous use in the next 20%",
+                                 "The queue holds this memory for the run.", "\nfixture",
+                                 f"testing · 8 of 10 {counter['unit']} · 80% done"):
+                    with self.subTest(expected=expected):
+                        self.assertIn(expected, hover[1])
+                self.assertEqual("Modules start slowest first, so this reads low early." in hover[1], ordering_note)
 
 
     def test_cloud_hover_shows_the_progress_and_reservation(self) -> None:

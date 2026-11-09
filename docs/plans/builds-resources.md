@@ -2128,3 +2128,28 @@ Registered jobs already take no margin: `test_registered_and_unregistered_jobs_e
 - `scripts/lint/test_build_shape.py` — `IndexStepEvidenceTests` fixture.
 
 **Ruled out:** a check, a scan or a signal handler for leftover folders.
+
+### Phase 96 — The hand cleanup command runs when typed by its path  · status: done
+**Depends on:** none in code. Merge `origin/builds` first.
+
+**Approved:** builds, 2026-11-09: "Its row command fails with exit 126 because scripts/lint/tmp_sweep.py is mode 100644. Make the documented command work."
+
+#### Work Order
+
+**Goal:** `~/.claude/scripts/lint/tmp_sweep.py --plan <new-plan.json>` runs when typed by its path.
+
+**Defect:** `scripts/lint/tmp_sweep.py` has a `#!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py` line but file mode 100644, so the shell exits 126. The small-fix path refuses this file because it imports `scripts/production/staff.py`.
+
+**Spec:**
+1. Set the git mode of `scripts/lint/tmp_sweep.py` to 100755.
+2. Change no file text. Add no check.
+
+**Files:**
+- `scripts/lint/tmp_sweep.py`
+
+**Workers:** `1 writer` — the director sets the one mode bit. No test lane: no file text changes.
+
+**Acceptance gate:**
+- `git ls-files -s scripts/lint/tmp_sweep.py` shows 100755.
+- The script started by its path with one unknown argument prints its usage line and exits 2. That path starts no sweep.
+- `scripts/lint/test_tmp_sweep.py` passes through the targeted test.

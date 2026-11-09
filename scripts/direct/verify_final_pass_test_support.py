@@ -25,8 +25,8 @@ class FinalPassFixture(ExampleWorkspaceFixture):
     @override
     def setUpClass(cls) -> None:
         builder = cls()
+        cls.addClassCleanup(builder.doCleanups)
         builder.build_fixture()
-        cls.addClassCleanup(builder.temporary.cleanup)
         cls.fixture_root = Path(builder.temporary.name)
         seed = tempfile.TemporaryDirectory(prefix="final-seed-")
         cls.addClassCleanup(seed.cleanup)
