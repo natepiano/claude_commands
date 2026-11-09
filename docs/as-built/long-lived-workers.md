@@ -532,11 +532,9 @@ With no staff backend entry, `account` is `{"state": "AccountUnavailable", "reas
 It needs no caller row and makes no process, pane, or thread read.
 `state` uses the saved dispatch status or staff hold; `activity` uses the saved pass activity, then its status.
 History lookup resolves fixed manager ids through the staff record, even after a session change.
-It merges history events from newest to oldest across files.
-It stops a file search when newer dispatches supply each worker's state or the remaining events precede each worker's creation.
-A fixed UUIDv7 staff id supplies its first conversation's creation time.
-Older id formats have no creation bound.
-It skips invalid lines and retains history events absent from the current pass slots.
+History lookup reads the last 64 KiB of each file, plus one byte to skip a leading partial line.
+History-only dispatches outside this window use the same unknown fields as missing dispatches.
+It skips invalid lines and decodes only wanted worker events.
 Stored account history resolves only the unit group and reads its history once.
 Per-manager listing keeps its live observations.
 An ended design identity cannot reopen.

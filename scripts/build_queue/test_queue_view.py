@@ -23,6 +23,7 @@ from scripts.build_queue.queue_fixture import (
     ASKING_SESSION, GOLDEN, NOW, QueueFixture, QueueFixtureTests, queue_read_fixture, waiting_rows, with_waiting,
 )
 from scripts.build_queue.queue_lines import json_form, plain, wrap
+from scripts.lib.build_steps import read_step_names
 from scripts.lib.terminal_cells import terminal_width
 from scripts.lint import memory_admit as gate
 from scripts.lint.memory_test_support import fake_memory_readings
@@ -71,6 +72,7 @@ class CloudQueueViewTests(unittest.TestCase):
 
     def test_cloud_group_shows_slots_progress_size_elapsed_and_wait(self) -> None:
         model, _fixture = self.cloud_model()
+        names = read_step_names()
         reading = model.reading
         assert isinstance(reading, wire.CloudQueueRead)
         row = reading.cloud[0]
@@ -83,7 +85,8 @@ class CloudQueueViewTests(unittest.TestCase):
                 text = plain(queue_view.render_view(model, 140))
                 self.assertIn("Cloud", text)
                 self.assertIn("1 of 1 slots", text)
-                for value in ("cloud-unit", "merge-gate", "running", "waiting-unit", "targeted-test", "32", "vCPUs"):
+                for value in ("cloud-unit", names.shown("merge-gate"), "running", "waiting-unit",
+                              names.shown("targeted-test"), "32", "vCPUs"):
                     self.assertIn(value, text)
                 self.assertRegex(text, r"7(?: of |/)12")
                 self.assertIn("4 min", text)
@@ -278,7 +281,8 @@ class QueueViewTests(QueueFixtureTests):
                 queued, = model.reading.view.waiting
                 self.assertEqual((active.project, queued.project), (project, project))
                 self.assertEqual((active.step, queued.step), (step, step))
-                shown = f"{project} {step}" if project else step
+                shown_step = read_step_names().shown(step)
+                shown = f"{project} {shown_step}" if project else shown_step
                 lines = queue_view.render_view(model, 140)
                 active_line, = [plain([line]) for line in lines if f"pid {running.owner.pid}" in plain([line])]
                 waiting_line, = waiting_rows(lines)
@@ -710,12 +714,14 @@ class QueueViewTests(QueueFixtureTests):
             with self.subTest(columns=columns):
                 lines = queue_view.render_view(model, columns)
                 text = plain(lines)
+                header, = [line for line in text.splitlines() if line.lstrip().startswith("# ")]
                 running = [line for line in text.splitlines() if line.startswith("run")]
                 self.assertEqual(len(running), 3)
                 for index, row in enumerate(running):
                     unit = "queue-…" if columns == 60 else "queue-unit"
-                    self.assertEqual(row.split()[:4], ["run", "builds", unit, "merge-gate"])
-                    self.assertEqual(row.split()[4], str(index + 1))
+                    self.assertEqual(row[:header.index("step")].split(), ["run", "builds", unit])
+                    self.assertEqual(row[header.index("step"):header.index("min")].strip(), read_step_names().shown("merge-gate"))
+                    self.assertEqual(row[header.index("min"):].split()[0], str(index + 1))
                     self.assertIn("5.0", row)
                     if columns >= 100:
                         self.assertIn("5.0 / 1.0", row)
@@ -793,11 +799,11 @@ class QueueViewTests(QueueFixtureTests):
                 text = plain(lines)
                 running = "\n".join(line for line in text.splitlines() if line.startswith("run"))
                 queued = "\n".join(waiting_rows(lines))
-                row, = [line for line in running.splitlines() if "merge-gate" in line]
+                row, = [line for line in running.splitlines() if read_step_names().shown("merge-gate") in line]
                 self.assertIn("devtools", row)
                 self.assertIn("5.0 / 1.0", row)
                 self.assertIn("7", row.split())
-                self.assertEqual(row.count("merge-gate"), 1)
+                self.assertEqual(row.count(read_step_names().shown("merge-gate")), 1)
                 queued_row, = waiting_rows(lines)
                 bar_characters = "░█▏▎▍▌▋▊▉"
                 bar_column = terminal_width(row[:next(index for index, char in enumerate(row) if char in bar_characters)])
@@ -1415,8 +1421,11 @@ class CapViewTests(QueueFixtureTests):
         step = replace(model.reading.view.waiting[0], session_name="merge-gate", folder="/tmp/merge-gate", step="merge-gate")
         labels = {**model.labels, step.session_id: UnitLabels("merge-gate", "sdlc", "devtools")}
         model = replace(with_waiting(model, [step]), labels=labels)
-        row, = waiting_rows(queue_view.render_view(model, 140))
-        self.assertEqual(row.split()[1:4], ["sdlc", "devtools", "merge-gate"])
+        lines = queue_view.render_view(model, 140)
+        header, = [line for line in plain(lines).splitlines() if line.lstrip().startswith("# ")]
+        row, = waiting_rows(lines)
+        self.assertEqual(row[:header.index("step")].split()[1:], ["sdlc", "devtools"])
+        self.assertEqual(row[header.index("step"):header.index("min")].strip(), read_step_names().shown("merge-gate"))
 
 
 

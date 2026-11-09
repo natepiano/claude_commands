@@ -953,14 +953,17 @@ def _start_locked(owner: staff.StaffRow, name: WorkerName, role: WorkerRole, pol
             return _uncertain(current.row, "agent stop is incomplete; pane retained")
         current = StoppedWorker(current.row, current.pane, current.terminal)
     if isinstance(current, StoppedWorker):
-        destination = herdr.ExistingPane(current.pane, current.terminal)
-    else:
-        try:
-            destination = _destination(owner, name.value, evidence, client)
-        except conf.Unusable as error:
-            return StartRefused(StartRefusal.INVALID_ROLE_CONFIGURATION, str(error))
-        if isinstance(destination, (StartRefused, UncertainWorker)):
-            return destination
+        if not client.close_tab_confirmed(current.pane, target=str(current.row.current_session), terminal=current.terminal):
+            return _uncertain(current.row, "stopped pane close is incomplete")
+        _retire_launch(current.row, client, record)
+        evidence = _evidence(owner.id, record, client, selection=selection)
+    try:
+        destination = _destination(owner, name.value, evidence, client)
+    except conf.Unusable as error:
+        return StartRefused(StartRefusal.INVALID_ROLE_CONFIGURATION, str(error))
+    if isinstance(destination, (StartRefused, UncertainWorker)):
+        return destination
+    prepared = herdr.WorkerPaneEnvironment(prepared.directory, prepared.env, prepared.unset_environment)
     if isinstance(destination, herdr.ExistingPane):
         panes = client.panes()
         if sum(pane.get("terminal_id") == destination.terminal for pane in panes) != 1:
@@ -1090,12 +1093,13 @@ def close(parent: StaffId, name: WorkerName, *,
                     return _uncertain(row, "agent stop is incomplete; pane retained")
             panes = client.panes()
             matches = [pane for pane in panes if pane.get("terminal_id") == observed.terminal]
-            if len(matches) != 1 or matches[0]["pane_id"] != observed.pane:
-                return _uncertain(row, "terminal moved, disappeared, or duplicated before close")
-            if not isinstance(client.pane_activity(observed.pane), herdr.PaneAtShell):
-                return _uncertain(row, "terminal became busy before close")
-            if not client.close_tab_confirmed(observed.pane, target=str(row.current_session), terminal=observed.terminal):
-                return _uncertain(row, "pane close is incomplete")
+            if matches or any(pane["pane_id"] == observed.pane for pane in panes):
+                if len(matches) != 1 or matches[0]["pane_id"] != observed.pane:
+                    return _uncertain(row, "terminal moved, disappeared, or duplicated before close")
+                if not isinstance(client.pane_activity(observed.pane), herdr.PaneAtShell):
+                    return _uncertain(row, "terminal became busy before close")
+                if not client.close_tab_confirmed(observed.pane, target=str(row.current_session), terminal=observed.terminal):
+                    return _uncertain(row, "pane close is incomplete")
             _retire_launch(row, client, record)
             _layout(parent, evidence)
             return Closed()
