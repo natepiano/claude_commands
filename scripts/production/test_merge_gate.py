@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from scripts.build_queue import admission_records
+
 from scripts.shutdown import remote
 
 import unittest
@@ -19,7 +21,6 @@ from unittest import mock
 from scripts.lib import scratch
 from scripts.production import change_review, merge_gate, staff
 from scripts.production.gate_modules import GateRefused
-from scripts.lint import memory_admit
 from scripts.production.test_change_review import ProducerFixture
 from scripts.production.staff_test_support import (
     fixture_member, fixture_unit_location, isolated_source_readers, isolated_staff_file, recorded_showrunner, source_environment,
@@ -84,7 +85,7 @@ class MergeGateCheckpointTests(MergeGateFixture):
         observed: list[str] = []
 
         def suites(_repo: Path, *_arguments: object, **_keywords: object) -> merge_gate.GateRun:
-            observed.append(os.environ[memory_admit.BUILDLOG_UNIT])
+            observed.append(os.environ[admission_records.BUILDLOG_UNIT])
             return merge_gate.GateRun((), 0, 0, tests_reused=True)
 
         with mock.patch.object(merge_gate, "run_suites", side_effect=suites):
@@ -98,13 +99,13 @@ class MergeGateCheckpointTests(MergeGateFixture):
             for outcome in ("pass", "red", "exception"):
                 with self.subTest(previous=previous, outcome=outcome):
                     if previous is None:
-                        _ = self.environment.pop(memory_admit.BUILDLOG_UNIT, None)
+                        _ = self.environment.pop(admission_records.BUILDLOG_UNIT, None)
                     else:
-                        self.environment[memory_admit.BUILDLOG_UNIT] = previous
+                        self.environment[admission_records.BUILDLOG_UNIT] = previous
                     restored: list[str | None] = []
 
                     def suites(_repo: Path, *_arguments: object, **_keywords: object) -> merge_gate.GateRun:
-                        self.assertEqual(os.environ.get(memory_admit.BUILDLOG_UNIT), "fixture")
+                        self.assertEqual(os.environ.get(admission_records.BUILDLOG_UNIT), "fixture")
                         if outcome == "exception":
                             raise GateRefused("injected suite failure")
                         return merge_gate.GateRun(
@@ -115,7 +116,7 @@ class MergeGateCheckpointTests(MergeGateFixture):
                         try:
                             return checkpoint(arguments)
                         finally:
-                            restored.append(os.environ.get(memory_admit.BUILDLOG_UNIT))
+                            restored.append(os.environ.get(admission_records.BUILDLOG_UNIT))
 
                     with mock.patch.object(merge_gate, "run_suites", side_effect=suites), \
                          mock.patch.object(merge_gate, "merge_checkpoint", side_effect=merge):

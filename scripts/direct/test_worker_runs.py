@@ -10,8 +10,8 @@ from pathlib import Path
 from typing import Literal, cast, override
 from unittest.mock import patch
 
-from scripts.agents.codex_mesh import DETACHED_RUNS_DIR
-from scripts.agents.mesh_runs import RunRecord
+from scripts.agents.worker_lifecycle import DETACHED_RUNS_DIR
+from scripts.agents.detached_runs import RunRecord
 from scripts.direct import worker_runs
 
 

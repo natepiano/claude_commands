@@ -1,6 +1,8 @@
 """A waiting shell keeps its queue place through client failures."""
 from __future__ import annotations
 
+from scripts.build_queue import admission_records
+
 from collections.abc import Callable
 from dataclasses import replace
 from datetime import datetime
@@ -18,13 +20,12 @@ from unittest import mock
 from scripts.build_queue import admission_client as client, admission_protocol as wire
 from scripts.build_queue import snapshot_codec as codec, step_estimator
 from scripts.build_queue.admission_test_support import AdmissionFixture, FakeClock
-from scripts.lint import memory_admit as gate
 
 
 class CheckerCall(TypedDict):
     pid: int
     action: str
-    rows: dict[str, gate.Waiter]
+    rows: dict[str, admission_records.Waiter]
 
 
 def wait_client_main() -> int:
@@ -34,11 +35,11 @@ def wait_client_main() -> int:
     actions = os.environ["TEST_CHECKER_ACTIONS"].split(",")
     clock = FakeClock()
     clock.epoch = time.time()
-    def estimate(argv: list[str], cwd: str, profile: gate.InferFromArgv | gate.StepProfile | gate.ProgramProfile,
-                 now: datetime | Callable[[], datetime], root: Path, policy: gate.AdmissionPolicy, *,
+    def estimate(argv: list[str], cwd: str, profile: admission_records.InferFromArgv | admission_records.StepProfile | admission_records.ProgramProfile,
+                 now: datetime | Callable[[], datetime], root: Path, policy: admission_records.AdmissionPolicy, *,
                  first_peak_bytes: int,
-                 build_history_generation: Callable[[], gate.BuildHistoryGeneration | gate.NoBuildHistoryGeneration]
-                 = gate.no_build_history_generation) -> gate.StepEstimate:
+                 build_history_generation: Callable[[], admission_records.BuildHistoryGeneration | admission_records.NoBuildHistoryGeneration]
+                 = step_estimator.no_build_history_generation) -> step_estimator.StepEstimate:
         _ = argv, cwd, profile, now, root, policy, first_peak_bytes, build_history_generation
         previous = calls.read_text().splitlines() if calls.exists() else []
         action = actions[min(len(previous), len(actions) - 1)]
@@ -50,12 +51,12 @@ def wait_client_main() -> int:
             raise RuntimeError("promoted checker unavailable" if action == "fail" else "")
         if action == "admit":
             path = Path(os.environ["BUILDLOG_MEMINFO"])
-            _ = path.write_text(f"MemTotal: {60 * gate.GIB // 1024} kB\nMemAvailable: {60 * gate.GIB // 1024} kB\n")
+            _ = path.write_text(f"MemTotal: {60 * admission_records.GIB // 1024} kB\nMemAvailable: {60 * admission_records.GIB // 1024} kB\n")
             _ = Path(os.environ["BUILDLOG_MEMORY_PRESSURE"]).write_text("full avg10=0 total=0\nsome avg10=0\n")
-        peak = gate.ExpectedPeak(7 * gate.GIB,
-            cast(gate.NeedSource, "future-source") if action == "unknown" else "measured", 5)
-        return gate.StepEstimate(gate.StepProfile("fixture", "nextest", "tree", peak,
-            estimated_at=clock.now()), gate.ReusableEstimate())
+        peak = admission_records.ExpectedPeak(7 * admission_records.GIB,
+            cast(admission_records.NeedSource, "future-source") if action == "unknown" else "measured", 5)
+        return step_estimator.StepEstimate(admission_records.StepProfile("fixture", "nextest", "tree", peak,
+            estimated_at=clock.now()), step_estimator.ReusableEstimate())
     with mock.patch.object(client, "CLOCK", clock), mock.patch.object(step_estimator, "step_estimate", side_effect=estimate):
         with mock.patch.object(sys, "argv", ["admission_client.py", *sys.argv[2:]]):
             return client.main()
@@ -73,7 +74,7 @@ class AdmissionClientWaitTests(unittest.TestCase):
         self.admission = self.enterContext(AdmissionFixture())
         self.root = self.admission.root
         self.admission.clock.epoch = time.time()
-        self.admission.free(60 * gate.GIB)
+        self.admission.free(60 * admission_records.GIB)
         _ = (self.root / "pressure").write_text("full avg10=10 total=0\nsome avg10=0\n")
         self.grants = []
         self.grant_charges = []
@@ -99,7 +100,7 @@ class AdmissionClientWaitTests(unittest.TestCase):
                 self.grant_charges.append(tuple((record.reservation_id, record.need)
                     for record in self.admission.server.reservations.values()))
             if isinstance(reply, wire.Wait):
-                return replace(reply, reason=gate.EstimateExpired(self.admission.clock.now()))
+                return replace(reply, reason=admission_records.EstimateExpired(self.admission.clock.now()))
             return reply
         self.admission.server.reply_filter = reply_filter
         _ = self.enterContext(self.admission.serving())

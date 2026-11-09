@@ -7,7 +7,7 @@ Each request records token classes, model, effort, and the role held at that tim
 The same store records runs, phases, reviews, findings, checkpoints, compactions, readings, and account-role changes.
 Named SQL queries compare usage across roles, models, and outcomes.
 The assignment log preserves role history independently of temporary run folders.
-The [worker design](long-lived-workers.md#roster-fields) defines the staff references in current run records.
+The [worker design](long-lived-workers.md#staff-membership-and-dispatch) defines the staff references in current run records.
 
 ## How it works
 
@@ -33,11 +33,10 @@ The code that assigns a role records it when it assigns it, in an append-only `<
 | `scripts/direct/prepare_session.sh` | `director`, under `CLAUDE_CODE_SESSION_ID` |
 | `scripts/production/update_registration.py register` | `showrunner`, at every showrunner start and resume |
 | `scripts/direct/claude_worker.py` | Records the dispatch role under the full destination id before delivery. A call without a role records nothing, so the session stays `interactive`. |
-| `scripts/agents/codex_mesh.py` | the worker's role and `--lens` on a new thread and on a follow-up claim; the previous role again when a claim is released |
-| `scripts/direct/review.sh` | Passes `--lens` to `codex_mesh.py`; records each fresh simplify session as `review` with lens `simplify`. |
+| `scripts/direct/review.sh` | Records each fresh review session as `review` with its lens. |
 | `scripts/hooks/session-start-agents-log.py` | `subagent` for a payload with a non-empty `agent_id`, else `interactive` for `session_id`, through `register_default` |
 
-The hook is registered twice in `settings.json`, with the command `"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/hooks/session-start-agents-log.py"`: in the `hooks.SessionStart` entry with no `matcher` (startup, resume, clear, compact) and in a `hooks.SubagentStart` entry with no `matcher`. `SubagentStart` delivers the parent `session_id` and the `agent_id` before the subagent's first request; `SessionStart` does not fire for a subagent. The lens lives only in `agents.jsonl`, never in `mesh_roster.json`.
+The hook is registered twice in `settings.json`, with the command `"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/hooks/session-start-agents-log.py"`: in the `hooks.SessionStart` entry with no `matcher` (startup, resume, clear, compact) and in a `hooks.SubagentStart` entry with no `matcher`. `SubagentStart` delivers the parent `session_id` and the `agent_id` before the subagent's first request; `SessionStart` does not fire for a subagent. The lens lives in `agents.jsonl`.
 
 `backfill` reads surviving run rosters through one staff snapshot.
 It resolves each entry's current session and worker name through staff.
@@ -233,7 +232,7 @@ The script prints nothing when no alert applies.
   The `effective_context_window_percent` value controls usable input space and does not change the compaction limit.
   Source: [ModelInfo::auto_compact_token_limit](https://github.com/openai/codex/blob/rust-v0.166.0/codex-rs/protocol/src/openai_models.rs#L522-L544).
   The script silently omits models with unreadable required values.
-  The usage ledger cannot distinguish mesh threads with launch overrides from pane threads.
+  The usage ledger cannot distinguish historical launch settings from pane settings.
   The script therefore uses the model rule for all threads.
   One unit alert can contain both context findings and waiting findings.
 - **Message**: the first line reports the waiting share or the context finding.
@@ -248,22 +247,6 @@ The script prints nothing when no alert applies.
 ### Timer
 
 The hourly pass lives outside this repository, in `/etc/nixos/modules/linux/usage-collect.nix` (`nate.jobs.usage-collect`, `intervalSeconds = 3600`, `TimeoutStartSec = "45min"`): `exec "$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/usage/collect.py"` with the user's PATH, one hour after the last pass ended and one hour after login. The collector's only message is the waste watch's alert to a showrunner; its output, and any alert with no showrunner, goes to the journal. It takes effect at a NixOS rebuild.
-
-### Worker roster guards in `scripts/agents/codex_mesh.py`
-
-The roster stores the context size that controls launcher compaction.
-Staff resolves the current thread; the assignment log supplies the role.
-The [worker design](long-lived-workers.md#roster-fields) defines the stored fields and ownership rules.
-Conditional writes prevent an earlier thread or compaction from replacing a newer record.
-These writes do not enter the usage store.
-
-- `_update_roster_if_expected(session_dir, name, record, expected) -> bool` compares and writes inside one `fcntl.flock` section.
-  `ExpectedRoster` names the expected thread, active launcher, refusing launcher, absence, ended thread, unchanged revision, or replaced backend.
-  `_write_roster_record` applies the same storage rules to conditional and administrative writes.
-- Every entry carries `revision` (`RosterRevision`), raised by one on each write inside the lock. An entry without one reads as `RosterRevision(0)`. A writer that changes an entry in place calls `_advance_roster_revision(entry)`.
-- `command_compact` reads the revision at its start and writes the new size under `RosterUnchanged`, so a turn that wrote in between keeps its record.
-- `context_tokens` is an integer or `"not_measured_since_compaction"` (`RecordedContextSize = KnownContextSize | NotMeasuredSinceCompaction | ContextSizeUnavailable`). A compaction turn that reports 0 stores the state and prints `compacted <name>: <before> tokens, size not measured until its next turn`. `assign.py` and `review.sh` ignore a non-integer size, so such a worker gets its follow-up with no second compaction. `compact` of such a worker exits 2 with `size not measured since its last compaction; compact refused`.
-- A fork or a follow-up whose name was taken meanwhile releases only its own thread and refuses (`name was taken while the fork ran; fork refused`, `name was taken while the follow-up ran; follow-up did not start`).
 
 ### Key files
 
@@ -282,7 +265,6 @@ These writes do not enter the usage store.
 | `scripts/usage/compaction_replay.py` | Compaction-limit replay |
 | `scripts/whoami/worker_usage.py` | Codex before/after worker readout over the store |
 | `scripts/lib/user_zone.py`, `config/user_zone.conf` | The zone report bounds and times are read in |
-| `scripts/agents/codex_mesh.py` | Worker role and lens recording; roster revision and guarded writes |
 | `scripts/direct/prepare_session.sh`, `scripts/direct/claude_worker.py`, `scripts/production/update_registration.py`, `scripts/direct/review.sh` | Role writers |
 | `/etc/nixos/modules/linux/usage-collect.nix` | Hourly timer |
 | `scripts/usage/test_*.py`, `scripts/whoami/test_worker_usage.py`, `scripts/usage/fixtures/` | Tests over invented logs; expected reports compared whole |

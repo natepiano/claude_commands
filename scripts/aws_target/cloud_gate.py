@@ -16,9 +16,11 @@ import json
 import os
 from pathlib import Path
 import re
+import signal
 import subprocess
 import sys
 import time
+from types import FrameType
 from typing import Literal, cast, final
 from uuid import uuid4
 
@@ -31,7 +33,7 @@ from scripts.build_targets import target_config
 from scripts.buildlog import store
 from scripts.lib import conf
 from scripts.lib.atomic_file import write_text_atomic
-from scripts.lint import memory_admit
+from scripts.build_queue import admission_records
 from scripts.production import affected_modules
 from scripts.production.gate_modules import GateRefused, discover_test_modules
 from scripts.production import merge_gate as gate
@@ -119,12 +121,12 @@ class CloudReservation:
 def cloud_reservation(repo: Path, sidecar: Path, mode: gate.SuiteMode) -> Generator[CloudReservation]:
     """Keep the route's cloud slot until its result or fallback returns."""
     pid = os.getpid()
-    start = memory_admit.process_start_time(pid)
+    start = admission_records.process_start_time(pid)
     if start is None:
         raise GateRefused('The cloud route has no live process identity')
     owner, episode, since = wire.Owner(pid, start), uuid4().hex, time.time()
-    profile = memory_admit.ProgramProfile(mode.value, str(Path(__file__).resolve().parents[2]), str(repo.resolve()),
-        memory_admit.HistoryPeakSizing(0, memory_admit.FirstProgramPeak(0), 0.0))
+    profile = admission_records.ProgramProfile(mode.value, str(Path(__file__).resolve().parents[2]), str(repo.resolve()),
+        admission_records.HistoryPeakSizing(0, admission_records.FirstProgramPeak(0), 0.0))
     def refresh() -> wire.AdmitRequest:
         request = admission_client.step_request([mode.value], str(repo), owner, since, str(sidecar), episode,
             profile, run=wire.RunIdentity(pid, start))
@@ -371,7 +373,11 @@ class GateWorker:
                         break
                     state = self.api.observe(instance, int(self.clock())).state
                     if state not in ('pending', 'running'):
-                        raise ValueError('The instance stopped without a final result')
+                        reply = self.api.call('describe-instances', '--instance-ids', instance)
+                        stopped = ledger.rows(ledger.rows(reply, 'Reservations')[0], 'Instances')[0]
+                        reason = ledger.mapping(stopped.get('StateReason', {}))
+                        detail = ': '.join(ledger.text(reason, key) for key in ('Code', 'Message') if reason.get(key))
+                        raise ValueError('The instance stopped without a final result' + (f' ({detail})' if detail else ''))
                     self.pause(settings().number('result_poll_s'))
                 if not row:
                     raise ValueError('The instance expired without a final result')
@@ -537,6 +543,9 @@ def run_service(repo: Path, folder: Path, request: dict[str, object], command: S
 
 
 def main() -> int:
+    def stop_worker(number: int, _frame: FrameType | None) -> None:
+        raise SystemExit(128 + number)
+    _ = signal.signal(signal.SIGTERM, stop_worker)
     parser = argparse.ArgumentParser(description=__doc__)
     _ = parser.add_argument('--worker', required=True, type=Path)
     _ = parser.add_argument('--directory', required=True, type=Path)

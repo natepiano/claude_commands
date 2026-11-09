@@ -35,16 +35,12 @@ completes.
    both carry the inline Three Gods sentence and the Type Design Contract or
    its allowed pointer.
 5. Apply <LongLivedWorkers/> and launch both workers together, `impl` first, under <ToolingContract/>.
-   For `herdr`, inspect `worker.py list`.
+   Inspect `worker.py list`.
    Omit `--to` for automatic selection, or pass a retained worker's short name.
    The worker command reuses idle or stopped workers and retains their native conversations.
    It refuses selection when all suitable workers are busy.
 
-   For an existing `mesh` pin, run `~/.claude/scripts/lib/py ~/.claude/scripts/agents/codex_mesh.py list --session-dir "${SESSION_DIR}"`.
-   Pass the full registered name with `--to` when the slot has a reusable thread.
-   Omit `--to` only for a new worker allowed by <LongLivedWorkers/>.
-
-   Both transports use these commands; replace each name with its selected transport's name:
+   Use these commands with the selected worker names:
 
    ```sh
    bash ~/.claude/scripts/direct/assign.sh --role implement --to "<impl worker name>" \
@@ -65,12 +61,11 @@ completes.
 7. On completion, read each dispatch's returned status and summary paths.
    Complete the phase only after both workers finish.
    Load the implementation summary into `${IMPL_SUMMARY}` and read the other worker's summary.
-   For an existing mesh pin, these are `impl_status_<slot>` and `impl_summary_<slot>.txt` under `${PHASE_DIR}`.
    Apply <WorkerLaunchFailure/> before reporting a launch error.
    `assign.py` ends a run when its only worker command fails and no pass completed.
    Each recorder slot counts as one worker. A Claude launch must add a `pass_started` event for its slot.
    The director must hold only that run. A launcher signal does not trigger this path.
-   For herdr, only exit 2 qualifies. Exits 3 through 8 retain the run.
+   Only exit 2 qualifies. Exits 3 through 8 retain the run.
    The launcher calls `progress_history.py finish-run --session-dir <run> --status error`, then `end_session.sh`.
    It keeps the launch exit code and the phase reservation. A failed cleanup child reports its error.
    For other genuine errors, cancel early review under <EarlyReviewArm/> and apply <RetainPhaseReservation/>.

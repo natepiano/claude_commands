@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# worker_name.sh — Print the mesh name a worker launches under.
+# worker_name.sh — Print the staff name of a worker.
 #
 # Usage: worker_name.sh <working_dir> <slot> <kind> [prefix]
 #   prefix — replaces the project name
