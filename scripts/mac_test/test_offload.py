@@ -240,6 +240,22 @@ class RunnerCompletionTests(unittest.TestCase):
         self.assertNotIn("link", output.getvalue())
         self.assertNotIn("running on natedev instead", output.getvalue())
 
+        wire = "admission-wait-ended café\r\n"
+        for stream in (io.StringIO(wire), io.BytesIO(wire.encode("utf-8"))):
+            with self.subTest(stream=type(stream).__name__):
+                controller = offload.ProcessController()
+                process = mock.Mock(stdout=stream, wait=mock.Mock(return_value=143))
+                with mock.patch.object(subprocess, "Popen", return_value=process), \
+                     redirect_stdout(io.StringIO()) as streamed:
+                    answer = controller.stream_mac_run(["ssh", "fixture", "run"])
+                self.assertEqual(answer, offload.MissingMacStatus(
+                    "runner exited with status 143 without a final status"))
+                self.assertEqual(streamed.getvalue(), wire.replace("\r\n", "\n"))
+                self.assertEqual(controller.attempt_evidence.traffic.transfers, [{
+                    "operation": "ssh_run", "sent_bytes": 3,
+                    "received_bytes": len(wire.encode("utf-8")), "complete": True,
+                }])
+
     def test_interruption_reports_the_instance_generation_without_claiming_link_loss(self) -> None:
         output = io.StringIO()
         with redirect_stdout(output):
@@ -976,6 +992,8 @@ class OffloadCommandTests(OffloadCommandFixture):
         self.assertFalse(copied)
         self.assertEqual(controller.copy_failure_detail, "copy: rsync: rsync: config denied")
         self.assertEqual(commands[-1][0], "rsync")
+        self.assertIn("--compress", commands[-1])
+        self.assertIn("-rlptc", commands[-1])
 
     def test_each_mac_verb_keeps_arguments_and_names_its_claim(self) -> None:
         self.write_portable_workspace()
@@ -1207,7 +1225,9 @@ class OffloadCommandTests(OffloadCommandFixture):
         self.assertEqual(
             copy["args"],
             [
-                "-rlpc",
+                "-rlptc",
+                "--stats",
+                "--compress",
                 "--delete",
                 receiver_argument,
                 "--exclude=/.mac-test-mirror",
@@ -1243,6 +1263,38 @@ class OffloadCommandTests(OffloadCommandFixture):
         self.assertIn("BUILDLOG_SYNC=1", remote_words)
         self.assertIn("LINT_SWEEP_BUDGET_GIB=64", remote_words)
         self.assertIn(shlex.quote(FILTER), remote)
+
+        stub = self.bin_directory / "command-stub"
+        original = stub.read_text()
+        for stats, sent, received, complete in (
+            ("Total bytes sent: 1,234\nTotal bytes received: 56\n", 1234, 56, True),
+            ("sent 1,234 bytes  received 56 bytes  1.0 bytes/sec\n", 1234, 56, True),
+            ("", 0, 0, False),
+        ):
+            with self.subTest(stats=stats):
+                _ = stub.write_text(original.replace('exit "$rsync_status"',
+                    "printf %s " + shlex.quote(stats) + '; exit "$rsync_status"'))
+                self.fixture["run_lines"] = [{"stream": "stdout", "text": "résultat"},
+                                             {"stream": "stderr", "text": "anomaly"}]
+                self.sync_fixture()
+                answer = self.command(*words, runner_options=("--target", "mac"), call_id="byte-record")
+                self.assertEqual(answer.returncode, 0, answer.stdout)
+                rows = [cast(dict[str, object], json.loads(line))
+                        for path in (self.root / "buildlog").glob("*/*.jsonl")
+                        for line in path.read_text().splitlines()]
+                attempt = [row for row in rows if row.get("kind") == "ssh_attempt"
+                           and row.get("call_id") == "byte-record"][-1]
+                transfers = cast(list[buildlog_sync.TransferBytes], attempt["transfers"])
+                self.assertEqual([entry["operation"] for entry in transfers],
+                                 ["ssh_control", "rsync_source", "ssh_run"])
+                self.assertEqual(transfers[1], {"operation": "rsync_source", "sent_bytes": sent,
+                                               "received_bytes": received, "complete": complete})
+                self.assertEqual(transfers[2]["received_bytes"],
+                    len("résultat\nanomaly\nmac_exit=0\nmac_cleanup=0 32715571 59\n".encode("utf-8")))
+                self.assertEqual(attempt["sent_bytes"], sum(entry["sent_bytes"] for entry in transfers))
+                self.assertEqual(attempt["received_bytes"], sum(entry["received_bytes"] for entry in transfers))
+                self.assertIn("résultat\nanomaly\n", answer.stdout)
+                self.assertNotIn("Total bytes sent", answer.stdout)
 
     def test_non_ascii_ignored_directory_is_in_the_exclude_file(self) -> None:
         _ = (self.repository / ".gitignore").write_text(

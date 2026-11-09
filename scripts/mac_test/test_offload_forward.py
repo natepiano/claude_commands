@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+import json
 import os
 import shlex
 import signal
@@ -10,6 +11,7 @@ import time
 from typing import cast
 
 from scripts.mac_test import offload
+from scripts.buildlog import sync as buildlog_sync
 from scripts.mac_test.offload_test_support import HANA, OffloadCommandFixture
 from scripts.lib import test_hang_guard
 
@@ -143,8 +145,11 @@ class OffloadForwardTests(OffloadCommandFixture):
 
     def test_fetch_publishes_files_before_releasing_claim(self) -> None:
         self.configure_fetch(fetch_contents="PNG bytes\n", fetch_answer="fetch_kib=12\nrc=0")
+        stub = self.bin_directory / "command-stub"
+        _ = stub.write_text(stub.read_text().replace('exit "${pull_status:-0}"',
+            'printf "Total bytes sent: 72\\nTotal bytes received: 128\\n"; exit "${pull_status:-0}"'))
         answer = self.command(
-            "--workspace", runner_options=("--fetch", "target/shots/"), call_id="call-forward",
+            "--workspace", runner_options=("--fetch", "target/shots/", "--target", "mac"), call_id="call-forward",
             subprocess_cli=True, separate_stderr=True,
         )
         self.assertEqual(answer.returncode, 0, answer.stdout + answer.stderr)
@@ -159,9 +164,16 @@ class OffloadForwardTests(OffloadCommandFixture):
         self.assertFalse(self.claim_file.exists())
         self.assertIn("du -sk target/shots", events[-2]["args"][-1])
         pull = events[-1]["args"]
-        self.assertEqual(pull[:4], ["-rlp", "--safe-links", "-e", shlex.join(["ssh", *offload.ssh_options(offload.read_config(self.config_path).connection)])])
+        self.assertEqual(pull[:6], ["-rlp", "--stats", "--compress", "--safe-links", "-e", shlex.join(["ssh", *offload.ssh_options(offload.read_config(self.config_path).connection)])])
         self.assertEqual(pull[-2], "mac:.local/state/mac-test/mirror/hana/target/shots/")
         self.assertTrue(pull[-1].endswith("/fetched/call-forward.partial/target/shots/"))
+        rows = [cast(dict[str, object], json.loads(line))
+                for path in (self.root / "buildlog").glob("*/*.jsonl")
+                for line in path.read_text().splitlines()]
+        attempt = [row for row in rows if row.get("kind") == "ssh_attempt"][-1]
+        transfers = cast(list[buildlog_sync.TransferBytes], attempt["transfers"])
+        self.assertEqual(transfers[-1], {"operation": "rsync_fetch", "sent_bytes": 72,
+                                        "received_bytes": 128, "complete": True})
 
     def test_fetch_missing_does_not_pull(self) -> None:
         self.configure_fetch(fetch_answer="fetch=missing\nrc=0")
