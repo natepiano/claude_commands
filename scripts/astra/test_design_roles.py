@@ -263,7 +263,8 @@ class HeldRolePaneTests(HeldRolePaneCase):
             with self.subTest(phase_already_finished=phase_already_finished), \
                     patch.object(design_roles, "_assign_command", side_effect=dispatch):
                 self.panes.command_case.agent.error = "agent_prompt_stalled"
-                with self.assertRaisesRegex(design_roles.RoleRefused, "agent_prompt_stalled") as refused:
+                self.panes.command_case.agent.start_wait_times_out = True
+                with self.assertRaisesRegex(design_roles.RoleRefused, "the worker did not start") as refused:
                     _ = self.panes.resume(refused_design, "reviewer")
                 if phase_already_finished:
                     self.assertIsInstance(refused.exception.__cause__, design_roles.RoleRefused)
