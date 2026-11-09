@@ -2350,8 +2350,7 @@ def aws_target_section(connection: sqlite3.Connection, day: str, configured: Ssh
     else:
         for reading in snapshot.charge_reads:
             if reading.day == day:
-                lines.append(f'Actual charges: ${reading.actual_usd:.2f}; reconciliation difference '
-                             + f'${reading.difference_usd:.2f}; query cost ${reading.query_usd:.2f}.')
+                lines.extend(aws_report.bill_lines(reading, directory))
         if isinstance(snapshot.go_live_at, int):
             boundary = store.utc_iso(snapshot.go_live_at)
             periods: list[list[object]] = []
