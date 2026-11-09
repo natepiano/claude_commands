@@ -22,6 +22,7 @@ from datetime import datetime, timezone
 from typing import ClassVar, TypedDict, cast, override
 from unittest import mock
 from scripts.style import rules
+from scripts.style.style_config import StyleUnitAssignment
 from scripts.style import style_ledger
 from scripts.style.approved_renames import AppliedCheck, TYPE_NAMED_PARAMETER_RULE
 from scripts.style import style_plan
@@ -42,6 +43,27 @@ STYLE_UNIT_NAMES = (
 )
 
 
+DEFAULT_STYLE_ASSIGNMENTS = tuple(StyleUnitAssignment(family, (family,)) for family in (
+    cast(rules.Family, "names"), cast(rules.Family, "values"),
+    cast(rules.Family, "types"), cast(rules.Family, "modules"),
+))
+
+
+def write_style_units(document: Path, assignments: tuple[StyleUnitAssignment, ...] = DEFAULT_STYLE_ASSIGNMENTS) -> None:
+    """Write the fixture's family assignments with the specified staff names."""
+    table = "\n## Style units\n\n| Unit | Families | Open tickets |\n| --- | --- | --- |\n"
+    table += "".join(f"| {row.unit} | {', '.join(row.families)} | {row.open_tickets} |\n" for row in assignments)
+    text = document.read_text()
+    section = re.search(r"(?m)^## Style units\s*$", text)
+    if section:
+        following = re.search(r"(?m)^#{1,2} ", text[section.end():])
+        end = section.end() + following.start() if following else len(text)
+        text = text[:section.start()] + table.lstrip("\n") + "\n" + text[end:]
+    else:
+        text += table
+    _ = document.write_text(text)
+
+
 def style_unit_id(name: str) -> str:
     """Return the native id supplied by the private style backend."""
     return fixture_runtime_id("style:" + name)
@@ -59,13 +81,14 @@ def ticket_owner_id(reference: str) -> str:
 
 
 @contextmanager
-def style_staff_fixture(root: Path, repo: Path) -> Generator[None]:
+def style_staff_fixture(root: Path, repo: Path,
+                        assignments: tuple[StyleUnitAssignment, ...] = DEFAULT_STYLE_ASSIGNMENTS) -> Generator[None]:
     """Create private ticket owners for the copied repository."""
     with isolated_staff_file(root / "staff.json", {}), mock.patch.dict(os.environ, {"HERDR_BIN": "/nonexistent/herdr"}):
         owner = fixture_member("showrunner", name="sample-style")
         members = (staff.SeedMember("owner", "showrunner", owner.name, owner.id, staff.RootSeedParent()), *(
             staff.SeedMember(name, "unit", name, staff.NewSeedMember(), staff.SeedParent("owner"), style_unit_id(name))
-            for name in STYLE_UNIT_NAMES
+            for name in dict.fromkeys((*STYLE_UNIT_NAMES, *(row.unit for row in assignments)))
         ))
         record = staff.apply_seed(staff.SeedInput(tuple(members)))
         for row in record.find(kind="unit", parent=owner.id):
@@ -73,7 +96,9 @@ def style_staff_fixture(root: Path, repo: Path) -> Generator[None]:
                                   expected=row.worktree)
         document = repo / ".git/style-production.md"
         document.parent.mkdir(exist_ok=True)
-        _ = document.write_text("# Style production\n- **Kind:** style\n- **Branch point:** main\n")
+        _ = document.write_text("# Style production\n- **Kind:** style\n- **Branch point:** main\n" +
+                                f"- **Merge branch:** main\n- **Showrunner checkout:** {repo}\n")
+        write_style_units(document, assignments)
         _ = staff.set_doc(owner.id, staff.LiveDoc(remote.local_machine(), document))
         yield
 
