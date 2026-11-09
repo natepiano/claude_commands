@@ -81,9 +81,9 @@ One row per change, written for a person with no context.
 The change description uses one line. The check and result can use several lines.
 `--check` names the machine (natedev or the Mac), the session (a
 terminal, a showrunner session, a unit session, any Claude session) and what to
-type; `--see` is what the person then sees. Example: `--change "The unit board
+type; `--see` is what the person then sees. Example: `--change "The Units table
 shows each unit's phase" --check "In a showrunner session on natedev, type
-/showrunner:unit_board" --see "Each row has a Phase column"`. The row's How to
+/showrunner:units" --see "Each row has a Phase column"`. The row's How to
 check cell is `<how to try it> You see: <what you see>`. Pass `--merged` when a
 commit holds the change. It prints the new row's id, such as `C12`.
 

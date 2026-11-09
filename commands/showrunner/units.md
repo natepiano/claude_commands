@@ -7,7 +7,7 @@ description: List unit phases and style tickets.
 Run this in the showrunner session. Run
 `"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/production/unit_phases.py"`
 and print its output exactly as it comes, with nothing added. It finds the
-production from this session's update timer. Print its total line too, when present.
+production from this session's staff row. Print its total line too, when present.
 Both tables show only the production's staff units.
 For the phase table, **Status** is `busy`, `idle`, `paused`, `exited`, or `on <machine>`.
 The accounts board uses the same status rule. An exit record gives `exited`.
@@ -18,19 +18,38 @@ With no live session or process, the status is `exited`. Otherwise the live sess
 The style table keeps `active`, `paused` and `exited` from staff records.
 **Unit** is the unit's staff name, including stopped units and units without a session.
 
-For a production without `Kind: style`, the table is `| Unit | Status | Phase | Non-Phase Work | Queued |`:
+For a production without `Kind: style`, the table is:
+`| Unit | Status | Progress | Phase | ETA | Workers | Non-Phase Work | Queued |`.
 
-- **Phase**: `phase <n> of <total> — <step>: <what it does>` for the open phase.
-  The task is the open step of the newest run. With no open step, use the phase title.
-  Cut the cell to 80 characters with `…`. With no open phase, show
-  `between phases, <done> of <total> done`, `not started`, `plan done`,
-  `no phases` or `no plan`.
-- **Non-Phase Work**: the newest open run whose phase is outside the plan,
-  as `<phase id>: <open step>`, cut to 80 characters with `…`.
-  Add ` +<k> more` for other open runs outside the plan. Show `—` when none is open.
-- **Queued**: the first item from the director's `/unit:queue` list,
-  cut to 80 characters with `…`. Add ` +<n> more` for later items.
-  Show `—` when the list is empty.
+1. **Progress** shows `█` done, `▓` open, and `░` todo, followed by `<done>/<total>`.
+   It uses one cell per phase, or 20 equal groups above 20 phases.
+   An open phase takes priority over todo, then done.
+   Repair rounds append ` · fix rounds <n>[ + 1 running]` when the count exceeds zero.
+   When the plan has no phases, an open run supplies Progress and ETA from its recorded phases.
+   A finished newest run supplies neither value.
+   With no recorded phases, Progress gives `—`.
+2. **Phase** shows `phase <n> of <total> — <step>: <task>` for the open phase.
+   The newest run supplies the open step; no step uses the phase title.
+   Other states remain `between phases`, `not started`, `plan done`, `no phases`, and `no plan`.
+3. **ETA** shows the latest stated promise, with ` · late <elapsed>` after that promise passes.
+   An open phase without a promise shows `no ETA`.
+   A predicted plan finish appends ` · ends <time>`.
+   A completed plan adds no finish fact.
+   Times use the production zone: `HH:MM` today, `Sat 18:41` within six days, otherwise `24 Oct`.
+4. **Workers** lists workers with runs before workers that are working.
+   Run states are `waiting on run: <label> <elapsed>`, `result queued: <label>`, and `run gone: <label>`.
+   Idle workers append ` +<n> idle` to a nonempty cell.
+   Closed workers and workers on another machine add nothing.
+5. **Non-Phase Work** shows the newest open phase outside the plan, with ` +<k> more` for other open phases.
+6. **Queued** combines the first `/unit:queue` item and `plan: phase <id>: <title>`.
+   Each part adds ` +<n> more` for later items.
+   Plan work includes every phase that is neither done nor open.
+   It uses the configured plan when that plan has phases; otherwise, it uses the newest run's plan.
+   A missing plan adds nothing; a failed queue read keeps `queue unreadable`.
+
+Phase, ETA, and Workers use at most 80 characters per cell, with `…` for omitted text.
+Queued limits each item or title to 80 characters and keeps its count suffix after the cut.
+Empty cells show `—`.
 
 For `Kind: style`, the table is
 `| Unit | Status | Ticket | Step | ETA | Findings built | Last 24 h | Findings left |`:
@@ -40,7 +59,7 @@ For `Kind: style`, the table is
   the rules list, plus `+<k>` for the rest. Work is `<n> findings` for a
   proposal, `<n> sites` for listed work, or `<n> files` for read or structure
   work; 1 uses the singular. The oldest assigned or checkpointed ticket wins.
-  With no ticket: `idle — <outcome> (<HH:MM>)` from the last refill, else `idle`.
+  With no ticket: `idle (<HH:MM>)` from the last refill, else `idle`.
 - **Step**: in words, what the unit does now. A specific activity text from
   the newest run shows as it is (`testing on the Mac`). Otherwise `impl` →
   `writing <work>`, `fix` → `fixing review findings`, `review` → `reviewing`,
@@ -65,7 +84,7 @@ When `r` is zero, it ends with `no ETA: nothing built in 24 h`. Numbers use
 thousands commas. Times and the date use the production zone.
 
 Read failures that make the table wrong or incomplete appear as `anomaly:` lines below the table.
-Staff name conflicts also produce lines. The command does not scan other processes.
+Staff name conflicts also produce lines. Worker run checks share one process snapshot when needed.
 A process with an identity but no staff row produces no line and cannot use a unit's pane placement.
 A process without an identity reports an unreadable thread when its pane holds staff.
 One staff candidate retains its pane placement with unknown status.

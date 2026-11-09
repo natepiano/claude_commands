@@ -1,4 +1,4 @@
-"""Shared display cells for the unit, style and board views."""
+"""Shared display cells for the unit and style tables."""
 from __future__ import annotations
 
 import json

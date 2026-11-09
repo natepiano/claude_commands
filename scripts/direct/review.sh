@@ -189,7 +189,7 @@ initialize_review_artifacts() {
   echo "$$" > "${ARTIFACT_DIR}/review_pid${SUFFIX}"
 }
 
-# Each review registers its slot on the unit board.
+# Each review registers its slot on the coordination board.
 board_post() {
   [[ -n "${TEAM_SLOT}" ]] || return 0
   bash "${BOARD_HELPER}" post "${SESSION_DIR}" "${TEAM_SLOT}" "$1" "$2" || true

@@ -490,7 +490,8 @@ All follow writes run in one `BEGIN IMMEDIATE` transaction. The write refuses wh
   Ticket ownership uses the fixed staff id.
   Commands resolve names once within their production before they call the ledger.
   A unit rename changes no ticket or sync wait.
-  `board_json.py` joins ticket owners through staff and reads phase records through `phase_table.build_run`.
+  `unit_phases.py` reads staff worktrees for the style table.
+  The style table keeps its ticket, step, ETA, and findings columns.
 
 - A style unit id already starts with `<style showrunner name>-`. Code that builds a worktree, branch or herdr host name from a unit stem goes through `unit_names.branch` (or `worktree`), which returns the stem unchanged when it starts with `<showrunner name>-`; else the prefix doubles. `add_unit.host_session_name` uses this rule. Shutdown restart uses the staff name.
 - Every ledger row and `--rule` uses `Rule.rule_id`.

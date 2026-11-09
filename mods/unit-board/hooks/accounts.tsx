@@ -1,5 +1,5 @@
-import { span, wrapLine } from './board';
-import type { BoardLine, PaneElements } from './board';
+import { span, wrapLine } from './lines';
+import type { BoardLine, PaneElements } from './lines';
 import type { RoleSessionCounts, StoredAccount, StoredAccountsStatus } from '../types/accounts';
 import { cellWidth } from './geometry';
 import type { Tone } from './geometry';

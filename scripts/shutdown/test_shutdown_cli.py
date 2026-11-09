@@ -198,8 +198,8 @@ class RetireUnitTests(unittest.TestCase):
         return PaneWorld()
 
     def test_retirement_retains_the_identity_and_excludes_it_from_active_views(self) -> None:
-        from scripts.direct import board_json
-        from scripts.production import session_staff, showrunners
+        from scripts.production import unit_phases, live_units
+        from scripts.production import session_staff
 
         row = staff.by_id(self.unit_staff_id)
         assert row is not None
@@ -210,9 +210,13 @@ class RetireUnitTests(unittest.TestCase):
             worktree=staff.RemovedWorktree(remote.local_machine(), self.worktree)))
         self.assertNotIn(row.id, {item.id for item in staff.active(record, "unit")})
         self.assertEqual(session_staff.production_members(record)["alpha"], ())
-        runner: showrunners.Showrunner = {"name": "alpha", "doc": str(self.doc),
-            "zone": "America/New_York", "session": "", "socket": ""}
-        self.assertEqual(board_json.build(runner, record=record, pane_rows={})["units"], [])
+        observed = session_staff.group_labeled_sessions((), record=record, sources=session_staff.MemberSources(()))
+        listing = live_units.units_in("alpha", observed)
+        rendered = unit_phases.table(listing, {}, snapshot=record, pane_rows={})
+        self.assertEqual(rendered.splitlines(), [
+            "| Unit | Status | Progress | Phase | ETA | Workers | Non-Phase Work | Queued |",
+            "| --- | --- | --- | --- | --- | --- | --- | --- |",
+        ])
 
 
     def test_retirement_continues_after_a_member_stop_raises(self) -> None:
