@@ -51,6 +51,7 @@ class ShellTests(unittest.TestCase):
             ("tail -n 5 progress", WaitAtom("tail")),
             (f"cat {TASKS}/b37sx2o7k.output", WaitAtom("cat *.output")),
             ("cat /proc/loadavg", WaitAtom("cat /proc/loadavg")),
+            ("cat </proc/loadavg", WaitAtom("cat /proc/loadavg")),
             ("grep -c error /tmp/run.exit", WaitAtom("grep *.exit")),
             ("rg FAILED /tmp/test.out", WaitAtom("rg *.out")),
             ("wc -l /tmp/build.log", WaitAtom("wc *.log")),
@@ -69,6 +70,7 @@ class ShellTests(unittest.TestCase):
 
     def test_working_statements(self) -> None:
         for command in ("cargo build --release", "cat src/main.rs", "grep -rn todo src", "kill 4242",
+                        "cat /tmp/u/phases/compaction-start-marker/implementation_prompt.md",
                         "python3 -m unittest", "tail -5 /tmp/build.log > /tmp/summary.txt",
                         "grep error /tmp/build.log > /tmp/errors.txt", f"{BOARD} post /tmp/board impl note x",
                         f"{BOARD} claim /tmp/board"):
@@ -199,6 +201,9 @@ class ClaudeTests(unittest.TestCase):
              (WaitAtom("sleep"), WaitAtom("tail *.log"))),
             (assistant(tool("Read", file_path=f"{TASKS}/b37sx2o7k.output")), (WaitAtom("Read *.output"),)),
             (assistant(tool("Read", file_path="/home/x/src/main.rs")), (WorkAtom(),)),
+            (assistant(tool("Read", file_path="/tmp/u/phases/compaction-start-marker/implementation_prompt.md")),
+             (WorkAtom(),)),
+            (assistant(tool("Read", file_path="/tmp/marker folder/implementation_prompt.md")), (WorkAtom(),)),
             (assistant(tool("Edit", file_path="a.py")), (WorkAtom(),)),
             (assistant(tool("Bash", command=f'{BOARD} post /tmp/b impl status "ok"')), (StatusAtom(),)),
             (assistant({"type": "text", "text": "sleep 5"}, {"type": "thinking", "thinking": "wait"}), ()),
