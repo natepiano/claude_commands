@@ -2194,3 +2194,50 @@ A changed `config/<name>.conf` selects every test module whose transitive import
 - `scripts/test_times/show.py` — ranked rows and the footnote
 - `scripts/test_times/test_show.py` — the limit, the sum, the footnote values and the history filters, in three existing tests
 - `commands/test_times.md` — the `top` description
+
+
+### Phase 111 — A targeted test runs only what the unit's own change can reach  · status: done
+**Depends on:** none
+
+#### Work Order
+
+**Source:** the user, 2026-11-09: "our goal is dramatically reduced cpu time - also for targeted tests if we can get them to be much tighter on what is the targeted tests to run that would be ideal - i don't know how good we are at targeting tests but we need to be really good". The showrunner: "find why the selection takes nearly all modules for a small change, and make it select only the modules the change can affect", and "judge the changed set".
+
+**Why:** the selector diffs against the newest full pass recorded on this host. Other units' merged work counts as changed, although the merge gate ran all modules before that work landed. Replay of the last 19 unit landings on `builds`, by today's import graph: median 396 changed files, 692 of 743 modules and 5193 CPU s; the same landings with only each unit's own files have median 3 files, 6 modules and 78 CPU s (mean 72 modules, 642 CPU s). A cloud targeted test costs the same selection.
+
+**Goal:** a targeted test's changed set holds only the work that has not landed: the diff from the nearest commit that a merge branch already holds, plus dirty paths.
+
+**Spec:**
+1. In `select_affected` in `scripts/production/affected_modules.py`, choose the base before the diff. The candidates are the certified base when one exists, and `git merge-base HEAD refs/remotes/origin/<branch>` for each branch of the new `landing_branches` key. A branch whose ref is missing or that has no common ancestor gives no candidate.
+2. Use the candidate with the fewest changed paths in `git diff --name-only --no-renames <candidate> HEAD`. On a tie, the certified base comes first, then the config order. Do not diff the same commit twice.
+3. `NoCertifiedBase` with a landing candidate now selects from that candidate. With no candidate at all, the result stays `FullSuite("no certified base")`.
+4. A landing candidate is a `CertifiedBase` with its committer time in `at`, so `report_selection` prints it unchanged.
+5. Dirty paths, removed-file facts (read from the chosen base), the module rules, the fact cache and the graph-error result stay as they are. The caller's signature does not change, so `merge_gate.py` and `cloud_gate.py` take no edit. `SuiteMode.MERGE_GATE` still runs all modules and does not reach this code.
+6. Add `landing_branches=main builds natedev sdlc` to `config/merge_gate.conf` under a `# text:` line and a comment that says what the list is: branches whose commits passed a merge gate. Read it at use through `scripts/lib/conf.py`. The value is split on spaces.
+7. Tests, in `scripts/production/test_affected_modules.py`, on a tempdir repository with refs written under `refs/remotes/origin/`, and with the branch list injected:
+   - A branch that left a landing ref after a certified base: `changed_files` holds only the branch's own files, and a module that only the landed files reach is not selected.
+   - A branch that merged the landing branch (a two-parent commit): the landed files are not changed files, and the branch's own earlier commit still counts.
+   - HEAD at the landing tip with one dirty file: only the dirty file is changed.
+   - No certified base and a landing ref: an `AffectedSelection`. A missing ref keeps the certified base, and no candidate keeps the full suite: use existing tests where they already hold this.
+8. Update `docs/as-built/merge-gate-and-test-speed.md` (the "Affected modules for targeted tests" section) in the same commit: the base rule, the reason (each landing passed a merge gate that runs all modules), and the fallback.
+9. Add no check. Keep the existing tests of the four module rules unchanged.
+
+**Files:**
+- `scripts/production/affected_modules.py` — the base choice
+- `scripts/production/test_affected_modules.py` — the new base cases
+- `scripts/production/test_targeted_test.py` — its fixture sets a private branch list, because the fixture's own `main` has no merge gate pass
+- `config/merge_gate.conf` — `landing_branches`
+- `docs/as-built/merge-gate-and-test-speed.md` — the contract
+
+**Workers:** 1 writer; the files are one change
+- `impl` — all five files
+
+**Constraints from prior phases:**
+- Tests never read or write live state: `~/.claude` main, `~/.local/state/merge-gate`, `/tmp/claude`.
+- A selection reads source without importing it, and a warm selection stays near the cost of today's: one `merge-base` and at most one `diff` for each branch.
+
+**Acceptance gate:**
+- `scripts/production/test_affected_modules.py`, `scripts/production/test_targeted_test.py` and `scripts/aws_target/test_cloud_gate.py` pass.
+- `basedpyright` on the changed Python files prints `0 errors, 0 warnings, 0 notes`.
+- the targeted test green on the phase commit merged with `origin/builds`. Its `affected:` line counts only files that no landing branch holds. This phase edits `config/merge_gate.conf`, so the approved config rule sets its own module count. The replay of 19 landings shows the count for a usual change.
+- The director sends the miss report with the hash: the modules today's rule ran that the new rule skips across the 19 replayed landings, and whether any recorded red module falls among them.
