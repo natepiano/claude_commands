@@ -136,7 +136,9 @@ Each registered Codex home must trust the shared `hooks.json` handlers.
 The installer reports the `turn-end` handler as trusted.
 A worker needs no new launch-line setting to use the installed Stop hook.
 Every Codex session runs the handler at each turn end. A non-worker turn exits as ignored and adds one line to `~/.local/state/herdr/turn-end-ignored.jsonl`.
-A pane launched before the change keeps `-c notify` on its launch line. The handler ignores that payload, and the Stop hook carries the turn.
+A Codex process that started before the Stop hook was installed (2026-11-09 08:27 EST) runs no Stop hook. Measured: such a process finished turns after that time and added no line.
+Close that worker's pane. Its next assign starts a new process that has the hook.
+A pane launched with `-c notify` sends a payload that the handler saves as an ignored line with an empty thread.
 Why: legacy notify passed the payload as one argument, and Linux refuses one argument over 128 KiB. Long-lived threads lost turn ends that way (2026-11-09).
 
 ## Unit code reviewers
