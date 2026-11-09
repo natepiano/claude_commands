@@ -186,6 +186,7 @@ Waiting notices add `; runs <run ids>` to the first line.
 The run ids include received results that still await a worker reply.
 An empty turn reply writes no reply file and adds no `; reply <path>` text.
 Run events retain the last worker reply while a result awaits a reply.
+`reap_orphans` retries a pending completion only after its supervisor is gone.
 A live run reports `waiting on runs`, including when an earlier result awaits a reply.
 A turn without DONE sends one `no DONE` notice when no pending work explains it.
 The notice includes the worker's last reply and leaves the pass active.

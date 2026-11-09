@@ -169,17 +169,52 @@ class SetTests(unittest.TestCase):
         self.assertIn('broadcast.py" --here --from zone --all', calls[-1][-1])
         self.assertFalse(self.queued().exists())
 
+        with self.subTest(queue="legacy pull without checkout fields"):
+            _ = self.queued().write_text(json.dumps({"zone": "legacy", "text": "", "since": "2026-11-01",
+                                                   "reason": "offline"}))
+            shown = self.run_zone()
+            self.assertEqual(shown.returncode, 0, shown.stderr)
+            self.assertIn("mac: took the legacy change", shown.stdout)
+            command = self.log("ssh.log")[-1][-1]
+            self.assertIn('cd "$HOME"/.claude && git pull', command)
+            self.assertIn(f"natedev:{self.checkout} main", command)
+            self.assertFalse(self.queued().exists())
+
+        with self.subTest(queue="zone notice with an explicit default pull"):
+            _ = self.queued().write_text(json.dumps({"zone": "zone", "text": "Zone changed", "since": "2026-11-01",
+                "reason": "offline", "pulls": [{"mac": "~/.claude", "source": str(self.checkout)}]}))
+            before = len(self.log("ssh.log"))
+            shown = self.run_zone()
+            self.assertEqual(shown.returncode, 0, shown.stderr)
+            calls = self.log("ssh.log")[before:]
+            self.assertEqual(sum("git pull" in call[-1] for call in calls), 1)
+            self.assertIn("broadcast.py", calls[-1][-1])
+            self.assertFalse(self.queued().exists())
+
     def test_a_promotion_that_pulled_the_mac_sends_only_the_message(self) -> None:
         _ = (self.fakes / "OFFLINE").write_text("", encoding="utf-8")
         _ = self.run_zone("set", "Curacao")
         (self.fakes / "OFFLINE").unlink()
         before = len(self.log("ssh.log"))
-        drained = self.run_zone("drain", "--pulled")
+        drained = self.run_zone("drain", "--pulled", "~/.claude")
         self.assertIn("mac: took the America/Curacao change", drained.stdout)
         calls = self.log("ssh.log")[before:]
         self.assertEqual(len(calls), 1)
         self.assertIn("broadcast.py", calls[0][-1])
-        self.assertEqual(self.run_zone("drain", "--pulled").stdout, "")
+        self.assertEqual(self.run_zone("drain", "--pulled", "~/.claude").stdout, "")
+
+        with self.subTest(pulled="~/custom checkout"):
+            _ = (self.fakes / "OFFLINE").write_text("")
+            _ = self.run_zone("set", "Paris")
+            before = self.queued().read_bytes()
+            drained = self.run_zone("drain", "--pulled", "~/custom checkout")
+            self.assertEqual(drained.returncode, 0, drained.stderr)
+            self.assertEqual(self.queued().read_bytes(), before)
+            (self.fakes / "OFFLINE").unlink()
+            drained = self.run_zone("drain", "--pulled", "~/custom checkout")
+            self.assertEqual(drained.returncode, 0, drained.stderr)
+            self.assertIn("broadcast.py", self.log("ssh.log")[-1][-1])
+            self.assertFalse(self.queued().exists())
 
     def test_an_ambiguous_name_changes_nothing(self) -> None:
         result = self.run_zone("set", "AST")

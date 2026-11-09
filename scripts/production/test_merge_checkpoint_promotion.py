@@ -17,7 +17,7 @@ import threading
 import time
 import unittest
 from unittest import mock
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import final
 from scripts.production.cli_fixture import production_paths
 from scripts.shutdown import pane_record
@@ -458,7 +458,8 @@ class MergeCheckpointTests(MergeCheckpointFixture):
             self.assertEqual(source, self.promote)
             check_lock("mac")
 
-        def zone() -> None:
+        def zone(mac: PurePosixPath) -> None:
+            self.assertEqual(mac, self.root / "mac-installed")
             check_lock("zone")
 
         with mock.patch.object(merge_checkpoint, "into", side_effect=announce), \
