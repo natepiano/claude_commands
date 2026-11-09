@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from scripts.production import checkpoint_gate
+
 from scripts.shutdown import remote
 
 from scripts.production.fake_unit_host import labeled as labeled_host
@@ -581,7 +583,7 @@ class MergeCheckpointFixture(unittest.TestCase):
         return self.wait_bump_result_at(path)
 
     def wait_bump_result_at(self, path: Path) -> dict[str, object]:
-        wait_until(lambda: path.exists() and merge_checkpoint.read_record(path)["result"] in ("red", "green"), path.parent)
+        wait_until(lambda: path.exists() and checkpoint_gate.read_record(path)["result"] in ("red", "green"), path.parent)
         record = cast(dict[str, object], json.loads(path.read_text()))
         pid = cast(int, record["pid"])
         if pid:

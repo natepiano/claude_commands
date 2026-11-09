@@ -29,6 +29,7 @@ class GuideRerunTests(unittest.TestCase):
             with mock.patch.object(Path, "write_text", stopped):
                 with self.assertRaises(InterruptedError):
                     _ = splitter.write_sections(sections, output)
+            self.assertFalse(output.with_name(".guides.staging").exists())
             self.assertEqual(list(output.glob("*.md")), [])
             self.assertEqual(splitter.write_sections(sections, output), 2)
             self.assertEqual({p.name for p in output.glob("*.md")}, {"One.md", "Two.md"})
