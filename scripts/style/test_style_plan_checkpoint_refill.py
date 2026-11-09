@@ -214,7 +214,7 @@ class StylePlanTests(StylePlanFixture):
         ledger.ticket_checkpoint(successor["id"], checkpoint)
         code, output, error = self.run_next()
         self.assertEqual((code, error), (5, ""))
-        self.assertIn("two open tickets", output)
+        self.assertIn("two waiting checkpoints", output)
         self.assertEqual(self.count_tickets(), 2)
 
     def test_checkpoint_refill_unknown_selected_footprint_waits_without_assignment(self) -> None:

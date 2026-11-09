@@ -642,7 +642,9 @@ Saved progress state uses the fixed staff reference instead of a copied session 
     Otherwise, it shows the newest open phase absent from the plan, followed by ` +<k> more` when needed.
     Queued shows the first queued item, followed by ` +<n> more` when needed.
     An unreadable queue shows `queue unreadable` and prints its path and cause on stderr.
-  - **Style productions:** `production_field(lines, "Kind") == "style"` selects `style_units.table`.
+  - **Style productions:** `Kind: style` selects `style_units.table` for all staff units.
+    Other productions use it for units named in their `Style units` table.
+    `style_config.has_style_units` detects that table; `style_config.read_config` reads its assignments.
     It prints `| Unit | Status | Ticket | Step | ETA | Findings built | Last 24 h | Findings left |`.
     Ticket shows `#<number without unit prefix> · <rule stem> · <crate> · <ticket work>`.
     An empty rule uses the first rules-list stem plus `+<extra count>`.
@@ -652,7 +654,27 @@ Saved progress state uses the fixed staff reference instead of a copied session 
     Otherwise, it shows `idle (<HH:MM>)` with the last refill time, else `idle`.
     `NoTicket` represents a unit with no such ticket.
   - **Style step:** `format_step(step, ticket, idle)` says in words what the unit does now. It takes `open_step` on the newest run. When the step's activity text is not empty and is not a generic word, the cell shows that text, for example `building 5 frontend-boundaries moves`. Otherwise it maps the label: `impl` → `writing <ticket work>`, `fix` → `fixing review findings`, `review` → `reviewing`, `test` → `testing`, `checkpoint sent` → `waiting for the showrunner to merge`. Another label shows as it is; an empty label shows `—`. With no open step, an assigned ticket shows `starting <ticket work>`, a checkpointed ticket shows `waiting for the showrunner to merge`, and a unit with no ticket shows `idle — <last refill outcome>` or `idle`. The full refill outcome appears only in Step, including any sync wait reason. The cell never shows a bare `impl` or `checkpoint sent`. ETA (`eta_cell`) is `current.eta.time` as `HH:MM`, else `—`.
-  - **Style counts:** Findings built is the all-time built count for the unit family; Last 24 h counts findings built in the last 24 h. These two columns and Findings left align right; text columns align left. The recent count uses `built_at`, or `style_ledger.legacy_built_at_sql` on a ledger before schema 25 (`style-showrunner.md`). Findings left (`left_cell(approved, filed, split, now)`) counts filed findings with approved decisions. `FamilyCounts.filed` counts all filed findings of the family. When the two counts are equal the cell shows `<approved>`; otherwise it shows `<approved> approved of <filed> filed`. A recorded split appends `: ready <a> · changed <b> · structure <c> · other <d> (<age>)`. Age counts whole minutes below 60 (`<n> min`), whole hours below 24 (`<n> h`), else whole days (`<n> d`), since `split_at`. A split row with no refill outcome leaves an idle unit as `idle`. Each distinct proposal file is read once. `proposal_issue.decision_answer` decides approval; `rules.style_family` on its unit decides family. A built finding with no decision file uses its build ticket's family. The total line is `All families: <built> findings built · <approved> approved findings left[ of <filed> filed] · <r> built in the last 24 h · ETA at that rate <YYYY-MM-DD>`; `of <filed> filed` shows only when the counts differ. `<filed>` sums `LedgerSnapshot.total_filed`, which counts every filed finding in a ledger, also findings with no resolvable family. The date is now plus `approved / r` days. Zero recent builds ends it with `no ETA: nothing built in 24 h`. Numbers use thousands commas; times and the date use the production zone.
+  - **Style counts:** The production's `Style units` table assigns families to each unit.
+    `style_units.table` sums `FamilyCounts` across those families for each unit row.
+    Findings built counts all built findings; Last 24 h counts findings first built in the last 24 hours.
+    These columns and Findings left align right; text columns align left.
+    The recent count uses `built_at`, with `style_ledger.legacy_built_at_sql` for ledgers before schema 25 (`style-showrunner.md`).
+    Findings left (`left_cell(approved, filed, split, now)`) counts filed findings with approved decisions.
+    `FamilyCounts.filed` counts every filed finding in one family.
+    Equal counts show `<approved>`; unequal counts show `<approved> approved of <filed> filed`.
+    A recorded split appends `: ready <a> · changed <b> · structure <c> · other <d> (<age>)`.
+    Age counts whole minutes below 60 (`<n> min`), whole hours below 24 (`<n> h`), then whole days (`<n> d`), since `split_at`.
+    A split row with no refill outcome leaves an idle unit as `idle`.
+    The reader reads each distinct proposal file once.
+    `proposal_issue.decision_answer` determines approval; the pinned rule blob determines the finding's family.
+    A built finding with no decision file uses its build ticket's family.
+    The total line is:
+    `All families: <built> findings built · <approved> approved findings left[ of <filed> filed] · <r> built in the last 24 h · ETA at that rate <YYYY-MM-DD>`.
+    `of <filed> filed` appears only when the counts differ.
+    `<filed>` sums `LedgerSnapshot.total_filed` across distinct ledgers, including findings with no resolvable family.
+    The date is now plus `approved / r` days.
+    Zero recent builds gives `no ETA: nothing built in 24 h`.
+    Numbers use thousands commas; times and the date use the production zone.
   - **Style reads and tests:** `unit_phases.main` passes each unit's staff worktree to `style_ledger.ledger_location`. A missing plan folder does not affect this lookup. A worktree that cannot be resolved supplies no ledger data for that row. It passes the explicit unit-to-database map to the renderer even when phase records are unavailable. One read-only SQLite connection serves each distinct database; missing databases or tables supply no data. No ledger lock or migration runs. The command overlaps independent reads. `display_cells.py` owns the shared step and escaping helpers used by both tables and `board_json.py`. `style_units.table` requires the keyword argument `ledger_paths` (unit id to database path); it never reads ledger paths from phase records. It also accepts `now`, `zone`, and `decision_folder` for fixed test inputs. Relative proposal paths use that folder; absolute paths stay absolute.
 
 - **A unit's newest run.** `unit_run.py --production <showrunner name> <unit>` prints the run id, machine, and UTC start.

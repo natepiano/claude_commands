@@ -3255,7 +3255,7 @@ def _next_phase(unit: str, plan: Path, repo: Path, run: Path | NoWorkerDispatch)
         waiting = tuple(ticket for ticket in opened if ticket["state"] == "checkpointed")
         if len(waiting) >= 2:
             ticket = waiting[0]
-            return WaitingForMerge(ticket["id"], ticket["checkpoint"], "two open tickets")
+            return WaitingForMerge(ticket["id"], ticket["checkpoint"], "two waiting checkpoints")
         if opened:
             try:
                 peers = tuple(waiting_checkpoint(ledger, ticket, row.branch, concurrent=bool(assigned) or len(opened) > 1)

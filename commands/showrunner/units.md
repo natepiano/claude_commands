@@ -18,7 +18,8 @@ With no live session or process, the status is `exited`. Otherwise the live sess
 The style table keeps `active`, `paused` and `exited` from staff records.
 **Unit** is the unit's staff name, including stopped units and units without a session.
 
-For a production without `Kind: style`, the table is `| Unit | Status | Phase | Non-Phase Work | Queued |`:
+For units outside the `Style units` table in a production without `Kind: style`, the table is:
+`| Unit | Status | Phase | Non-Phase Work | Queued |`
 
 - **Phase**: `phase <n> of <total> — <step>: <what it does>` for the open phase.
   The task is the open step of the newest run. With no open step, use the phase title.
@@ -32,7 +33,7 @@ For a production without `Kind: style`, the table is `| Unit | Status | Phase | 
   cut to 80 characters with `…`. Add ` +<n> more` for later items.
   Show `—` when the list is empty.
 
-For `Kind: style`, the table is
+For `Kind: style` or units named in the production's `Style units` table, the table is
 `| Unit | Status | Ticket | Step | ETA | Findings built | Last 24 h | Findings left |`:
 
 - **Ticket**: `#<n> · <rule> · <crate> · <work>`. The number drops the unit
@@ -48,9 +49,9 @@ For `Kind: style`, the table is
   With no open step: `starting <work>` for an assigned ticket, `waiting for the
   showrunner to merge` for a checkpointed one, else `idle — <outcome>` or `idle`.
 - **ETA**: the current phase ETA as `<HH:MM>`, else `—`.
-- **Findings built**: the all-time built count for the unit's family.
-- **Last 24 h**: findings first built in the last 24 hours.
-- **Findings left**: the family's filed findings with an approved decision:
+- **Findings built**: the all-time built count across the unit's configured families.
+- **Last 24 h**: findings first built in the last 24 hours across those families.
+- **Findings left**: filed findings with an approved decision across those families:
   `<approved>`, or `<approved> approved of <filed> filed` when not all filed
   findings are approved. A recorded split adds `: ready <a> · changed <b> ·
   structure <c> · other <d> (<age>)`. Age is whole minutes below 60 (`<n> min`),
