@@ -2266,47 +2266,28 @@ A changed `config/<name>.conf` selects every test module whose transitive import
 
 ### Phase 114 — A test that starts Python for one function stops loading what the function does not use  · status: done
 
-**Depends on:** none
+#### As-built
 
-#### Work Order
-
-**Source:** next-items item 6a, amended by the architect review of Phases 111-113: "Attribute the measured 268 CPU s of fixture and stub `python -c` calls to their callers." The user, 2026-11-09: "our goal is dramatically reduced cpu time".
-
-**Why:** a whole gate starts 8,775 `python -c` children for 268 CPU s. Most cost 31 ms or less. Seven modules hold the expensive ones, where each child imports a heavy test module to call one function: `buildlog/test_index` 23.4 CPU s over 40 starts, `mac_test/test_linux_runner` 16.1 over 197, `style/test_standing_checkpoint` 14.0 over 46, `buildlog/test_report` 7.8 over 7, `statusline/test_statusline` 7.2 over 20, `buildlog/test_memory_window` 5.0 over 23, `direct/test_claude_worker` 4.9 over 39, and `buildlog/test_mac_report` 4.5 over 6. This is about 83 of the gate's 3,056 CPU s, and a cloud gate pays 1.62 times that.
-
-**Goal:** the eight modules keep every assertion, and their `python -c` children use at least half the CPU they used at the phase base.
-
-**Spec:**
-1. Record the baseline at the phase base with `python3 scripts/test_times/module_cost.py --tree <tree> --commands 30 <folder>/<file>` for each module. Name the command that starts each costly child, and its CPU per start.
-2. `scripts/buildlog/test_index.py`, `test_each_module_uses_a_temporary_log`: start one `lib/py -c` parent. The parent imports `store`, a short list of shared standard-library modules and every non-test module of `scripts/buildlog`, and no module that writes `os.environ` at import. The parent then forks one child per test module. Each child imports its one module and prints `store.root()`. No child inherits the import of another test module, and the test still fails for a module that does not set a temporary log.
-3. `scripts/style/style_child_test_support.py`, `style_cli_command`: leave this site unchanged and report the floor under item 9. Same-load probes show no gain from a smaller bootstrap, because the fake must import `queue_place` to patch it: 206-249 ms per start against 225-247 ms.
-4. `scripts/buildlog/test_report.py`, `probe_cli` and `measure_cli_work`: move `probe_cli` to a new `scripts/buildlog/cli_probe_test_support.py` that imports no test module. Update the bootstrap and `scripts/buildlog/test_mac_report.py`. Keep the instruction-limit measurement unchanged.
-5. `scripts/buildlog/test_memory_window.py`, `configured_host_cli`: the bootstrap imports only what the fixed host name needs.
-6. `scripts/mac_test/test_linux_runner.py`: find what starts the 197 children. Where the child repeats one fixed answer that one test already proves through the real command, give the other tests the fixture's existing fake child, a private `python3` stub on their fixture `PATH`, or one process for the cases. Keep one real run of each generated script.
-7. `scripts/statusline/test_statusline.py` and `scripts/direct/test_claude_worker.py` (`OPEN_WORKER`): find what each child imports. Remove imports that the called function does not need, or run the cases in one child.
-8. A child process stays wherever the test proves something that needs a real process: a new environment, a fresh import, an exit status or a signal.
-9. Where a child needs all that it imports, leave the site and report the measured floor and its largest import.
-10. Change no production file. Add no check. Change no assertion. Keep each test's name and count.
+- `test_each_module_uses_a_temporary_log` in `scripts/buildlog/test_index.py` runs one `lib/py -c` parent. The parent imports each production module named on its command line, with no `try`, then forks one child per test module. Each child imports its test module and prints `store.root()`. The production list comes from the folder listing, without `test_*.py`, `*_test_support.py` and `__init__.py`. Children run one at a time, so wall time rises from 7.1 s to 16.0 s and CPU falls.
+- `CliWork`, `MeasuredCliRun`, `probe_cli` and `measure_cli_work` live in `scripts/buildlog/cli_probe_test_support.py`. `test_report.py` and `test_mac_report.py` import them. The host is read in the parent under `mock.patch.dict(os.environ, environment, clear=True)`.
+- `configured_host_cli` in `test_memory_window.py` receives `configured_local_host()!r` from the parent, and its bootstrap imports only `store`.
+- The fake child in `scripts/mac_test/test_linux_runner.py` matches `argv[1] == "-c"` with `sweep.sweep_workspace` in `argv[2]`, and yields to `use_real_sweep`. Four tests keep `use_real_sweep = True`.
+- Same-load pairs, three rounds, median CPU s: `test_index` 30.7 to 12.0, `test_linux_runner` 27.3 to 13.3, `test_report` 24.8 to 23.1, `test_mac_report` 15.7 to 12.8, `test_memory_window` 7.6 to 7.5; total 106.1 to 68.7. The test names and assertions are the same.
 
 **Files:**
-- `scripts/buildlog/test_index.py`
-- `scripts/buildlog/test_report.py`
-- `scripts/buildlog/test_mac_report.py`
-- `scripts/buildlog/cli_probe_test_support.py` — new
-- `scripts/buildlog/test_memory_window.py`
-- `scripts/mac_test/test_linux_runner.py`
-- `scripts/statusline/test_statusline.py`
-- `scripts/direct/test_claude_worker.py`
+- `scripts/buildlog/test_index.py` — the preloaded parent and its forked children
+- `scripts/buildlog/cli_probe_test_support.py` — the shared CLI probe helpers
+- `scripts/buildlog/test_report.py`, `scripts/buildlog/test_mac_report.py` — use the shared helpers
+- `scripts/buildlog/test_memory_window.py` — the small CLI bootstrap
+- `scripts/mac_test/test_linux_runner.py` — the fake child match
 
-**Workers:** 1 writer; each site is small and one writer holds the measurements
-- `impl` — all the files above
+**Gotchas:**
+- Index isolation must keep a separate test-module import in each child. Sharing that import removes what the test proves.
+- Floors per site, by the largest import: `scripts.buildlog.report` 0.41 s, `scripts.buildlog.memory` 0.19 s, style `queue_place` 0.146 s, statusline `update_registration` 0.30 s, `scripts.accounts.accounts` 0.12 s. Each lower cost needs a production import change.
+- Blanket no-op helpers in `verify.sh` make every test red. Per helper, `record.py` and `progress_history.py` stay green at 171 CPU s per gate, `tree_watch` fails four lint scope tests, and `step_record` is required.
 
-**Constraints from prior phases:**
-- Tests never read or write live state. `build_hold.py` stays frozen.
-- Each owner was told before the edit, under the user's rule on test code.
-
-**Acceptance gate:**
-- Each changed module passes with its previous test count.
-- Same-load pairs against the phase base show at least half the `python -c` CPU summed over the eight modules, or a stated floor for each site that cannot reach it.
-- The targeted test passes on the merged tree.
-- `basedpyright` reports `0 errors, 0 warnings, 0 notes` on the changed files.
+**Ruled out:**
+- A style CLI helper split: 206-249 ms per start against 225-247 ms, because the fake must import `queue_place`.
+- Bytecode work: compiling the whole tree costs 3.4 CPU s, and main-script compile across all starts costs 67.3 CPU s.
+- A preloaded Python start server: tests inspect real process trees, signals and process groups.
+- A test-only path in `verify.sh`: it breaks the one-way rule.

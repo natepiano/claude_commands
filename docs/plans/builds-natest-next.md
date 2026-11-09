@@ -121,6 +121,8 @@ Waiting: `style/test_style_sync.py`, 66.6 CPU s, starts after the style unit's m
   - Profile repeated build-target work before proposing another import change.
   - Verify-unit assesses one helper process for the direct, buildlog and build-folder operations that `verify.sh` starts separately.
   - Queue Phases 30–31 removed the old admission imports. Keep the earlier measurements as history.
+  - Per-helper trial (Phase 114): with `record.py` or `progress_history.py` as a no-op the tests stay green, 171 CPU s per gate. `tree_watch` fails four lint scope tests, 66 CPU s. `step_record` is required.
+  - Builds decided against a test-only path in `verify.sh`. Verify measures after its Phase 42e and moves `progress_history.py` into the helper process if it still costs real CPU.
   - Completion condition: record each owner proposal and landing revision. Measure affected callers before and after each landing under matching conditions.
   - Report CPU and process counts, then update the affected Floors rows. Do not add overlapping command costs.
   - Revealed by: Phase 24, 2026-11-05. Updated from the whole-gate measurement, 2026-11-09.
