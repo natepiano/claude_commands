@@ -45,7 +45,7 @@ Do we have a unit director that is dedicated to, I guess it's showrunners and pr
   - `scripts/direct/progress_history.py` — a unit's phase records and durations
   - `scripts/buildlog/index.py` — build and test runs by repository
   - `scripts/usage/usage_report.py`, `collect.py` — tokens by session
-  - `scripts/agents/codex_mesh.py` — the worker roster
+  - `scripts/production/worker.py` (`list`) — the worker roster
   - `scripts/lib/user_zone.py` — user-facing times
   - `docs/production_format.md`, `commands/showrunner/produce.md`, `commands/unit/direct.md` — the role contracts
   - `~/.claude/docs/decision_criteria.md` — what reaches the user
@@ -696,3 +696,75 @@ Do we have a unit director that is dedicated to, I guess it's showrunners and pr
 - Limit: this protects only processes that start after it lands. No live Mac call was run. The test gives the owner the same input that the remote command gives.
 
 **Files:** `scripts/production/staff.py`, `scripts/production/test_staff.py`, `docs/as-built/staff-accessors.md`.
+
+### Phase 30 — Delete the mesh and rename the detached runs  · status: done
+
+#### As-built
+
+- `codex_mesh.py` and `test_codex_mesh.py` are deleted. No live name holds the word mesh.
+- Detached runs have their own name: `scripts/agents/detached_runs.py`, `scripts/agents/detached_run_process.py`, `config/detached_runs.conf`, and run records in `<run>/detached_runs/`.
+- Shared Codex test fixtures live in `scripts/agents/codex_test_support.py`.
+- A rerun after an unfinished turn keeps the pass and only waits for it. An automatically selected worker gets its pass closed under its real name.
+- A pane family switch (Claude to Codex or back) refuses a busy source and a source with a live detached run, for open and stopped sources. A publication failure stops an `ExistingPane` destination.
+- Native switch records live in their own file. Claude child resume reads only launcher records.
+
+**Files:**
+- `scripts/agents/detached_runs.py` — starts and supervises detached runs, and delivers their results.
+- `scripts/agents/detached_run_process.py` — identifies a live supervisor process.
+- `config/detached_runs.conf` — `LIVE_RUN_LIMIT` and the run settings.
+- `scripts/agents/codex_test_support.py`, `scripts/agents/test_codex_test_support.py` — shared Codex fixtures and their tests.
+- `scripts/herdr/worker_panes.py` — pane worker start, close and family switch.
+- `scripts/production/worker_admission.py` — admission, publication and switch records.
+
+**Gotchas:** detached-run readers do not see `mesh_runs.py` supervisors that started before the rename. Those supervisors finish and deliver. An old prompt that calls `mesh_runs.py start` fails visibly.
+
+**Ruled out:** code to detect pre-rename `mesh_runs.py` supervisors — the case is temporary, and one `ps` check at landing covers it.
+
+### Phase 30a — Close the family-switch gaps for a worker with a closed pane  · status: done
+
+**Depends on:** Phase 30
+
+#### As-built
+
+- A family switch (Claude to Codex or back) runs the same busy-worker and live detached-run checks for every source kind: open, stopped and closed. `_start_locked` calls `can_close` for any current worker. `can_close` takes a `ClosedWorker` through the stopped-worker branch, on the source worker's own run, with the held `WorkerLockHold`. A refusal comes before source release or launch.
+- Cleanup after a failed native proof or a failed publication is keyed on the launch (`launches[-1].pane`), for an existing pane and a new split pane. Right after launch, `start` records the launched terminal and the foreground agent process (pid and start ticks). Cleanup stops the agent only when the same process still runs in the same terminal, and keeps the shell.
+- `scripts/production/worker_admission.py` names the cleanup result: `DestinationStopped`, `DestinationRetained(pane, reason)` and `NoDestinationToStop`, with `CleanupOutcome` as their union. `publish_created` and `switch_worker` take `cleanup: Callable[[str], CleanupOutcome]`. `_cleanup_on_failure` runs the same cleanup around `start` and around publication.
+- When cleanup retains the destination, an ordinary error becomes `AdmissionRefused` that names the pane and the reason, and staff still names the source. `KeyboardInterrupt` and `SystemExit` keep their type; cleanup still runs.
+- `Herdr.pane_agent_process` reports a process that exits during the read as `HerdrFailure` naming the pane.
+
+**Files:**
+- `scripts/herdr/worker_panes.py` — pre-switch checks and launch-keyed cleanup in `_start_locked`; `can_close` accepts `ClosedWorker`.
+- `scripts/production/worker_admission.py` — cleanup outcome types and `_cleanup_on_failure`.
+- `scripts/herdr/herdr.py` — `pane_agent_process` error conversion.
+- `scripts/direct/claude_worker.py`, `scripts/production/staff_test_support.py` — callers that own their cleanup pass `NoDestinationToStop`.
+- `scripts/herdr/test_worker_panes.py`, `scripts/production/test_worker_admission.py`, `scripts/direct/test_claude_worker.py`, `scripts/herdr/test_herdr.py` — source-kind, destination-kind, replacement-agent and retained-pane rows.
+
+**Gotchas:** a failed native proof calls cleanup with an empty identity. Only the recorded launch process protects a replacement agent of the same family in that terminal.
+
+**Ruled out:** code to detect pre-rename `mesh_runs.py` supervisors — the case is temporary, and one `ps` check at landing covers it.
+
+### Phase 30b — final verification after the sdlc batch 2 merge  · status: done
+
+#### As-built
+
+The sdlc batch 2 merge brought the 28b pane rule: a worker pane closes when its agent stops.
+
+- `scripts/herdr/worker_panes.py` — a family switch selects its destination after the source release. `start()` closes the source pane if it is still present, retires its launch, reads the evidence again and calls `_destination`. Every switch starts in a new pane. The marker type `DestinationAfterSourceRelease` holds the place of the destination until then.
+- `scripts/herdr/test_worker_panes.py` — the family-switch tables expect a new pane, the source pane close, and a new pane on the retry. A new `exiting` source row covers a source pane that closes by itself.
+- `scripts/direct/test_assign_launcher.py`, `scripts/direct/test_assign_launcher_reuse.py` — a switched or stopped worker resumes in a new pane, not the source pane.
+
+### Phase 30c — final verification after the sdlc batch 3 merge  · status: done
+
+The sdlc batch 3 merge (models 5, panes 28f and 28g) turned four test modules red. Repair them so the full gate is green.
+
+1. `scripts/accounts/test_accounts.py` patches `_worker_status_records`, which the mesh removal deleted. Remove the patch.
+2. `scripts/message/test_roster.py` — the `fixture_process` stand-in must take the pane session that models 5 passes to `native_process`.
+3. `scripts/direct/test_assign_launcher.py`, `test_assign_launcher_identity.py` and `test_assign_launcher_reuse.py` count launches and pane locations that changed when panes 28f closed a done worker's pane. Find the cause and repair it where it lives.
+
+Acceptance: the targeted test, the package import bootstrap and basedpyright are green on the merged tree.
+
+**As-built:**
+- `test_accounts.py` no longer patches the deleted `_worker_status_records`.
+- The `test_roster.py` `fixture_process` stand-in takes the `reported` pane session and passes it to `native_process`.
+- The cause was in `assign.py`. Since panes 28f the worker records a completed pass end and closes its pane. The launcher now records a pass end only as `error`: `failed_pass_command()` replaces `finish_pass_command(status)`.
+- The launcher tests now expect one new pane for each assign after a done pass. The refusal test for an unproved worker is kept.

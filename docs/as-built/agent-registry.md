@@ -231,10 +231,9 @@ An executable invocation runs `assign_gate.py` before dispatch.
 ### Addressable workers
 
 `assign.sh` is the worker launch entry point.
-`assign.py` reads the run's transport pin.
-A mesh run uses `codex_mesh.py` for Codex workers; a herdr run uses `worker.py` and a pane.
-Claude workers of a mesh run use `scripts/direct/claude_worker.py` in the assign process.
-The [worker design](long-lived-workers.md) owns admission, staff identity, family switches, retries, messages, and server lifecycle.
+`assign.py` submits assignments through native worker panes.
+Live displays read staff membership and pane evidence.
+The [worker design](long-lived-workers.md) describes admission, staff identity, family changes, retries, and messages.
 The plain `codex exec` worker fallback is absent.
 
 `design_roles.py` uses `worker.py add`, `assign`, and `end` for held Astra roles.
@@ -244,12 +243,8 @@ An ad hoc Astra review outside the staff hierarchy uses the one-turn `codex exec
 `side_pane.py` serves ask-a-friend consultations without a staff row.
 The friend launches with the worker policy through `worker_panes.worker_policy`, so it replies with `send.py` and stops at no permission prompt.
 A managed Astra review starts through `assign.sh --role review --operation astra-review`.
-The mesh transport primes, holds, follows, and ends the reviewer through `codex_mesh.py`.
-The herdr transport adds, assigns, and ends the reviewer through `worker.py`.
-The mesh transport keeps the hold until the end of the worker succeeds.
+`worker.py` adds, assigns, and ends the reviewer.
 The pane transport keeps the hold while `assign.sh` runs; after a failed end, the staff row is the record of the reviewer.
-`assign.py` also retains `dispatch`, `adopt`, and `resume-account-move`.
-The two recovery operations remain until Phase 18.
 
 ### Catalog sync (`scripts/agents/sync_codex_catalog.sh`)
 
@@ -313,7 +308,6 @@ Invalid argument counts print usage and return 1.
 |---|---|
 | `assign.py`, `assign_claude.py`, `review.sh` | Share one launch configuration across allocation and delivery. |
 | `workers.py` | Reads a configuration only when it opens a worker. |
-| `codex_mesh.py` | Uses one configuration for each turn submission. |
 | `agent_exec.sh`, `cli_agent.sh` | Resolve task values before removing the operation snapshot. |
 | `unit_effort.py` | Shares one editor base through its command. |
 | `progress_history.py` | Reads the [configuration digest](unit-progress-history.md#configuration-digest) without publication. |

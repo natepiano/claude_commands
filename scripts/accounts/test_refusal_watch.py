@@ -218,7 +218,7 @@ class RefusalWatchTests(unittest.TestCase):
             proc_start="fixture-start", name="owner " + identity, cwd=str(self.home / "checkout"), probe=False,
             status="idle", updated_at=0, model=inventory.ModelName(kind="model", name="opus-real"),
             checkout=inventory.NotACheckout(kind="not a checkout"),
-            run_dirs=[], codex_servers=[], timers=[], config_dir=str(accounts.account_dir(label)))
+            run_dirs=[], timers=[], config_dir=str(accounts.account_dir(label)))
         if host == "unit":
             owner: inventory.Session = inventory.UnitSession(**fields, kind="unit", host=unit_host(
                 kind="unit", production="fixture", unit=identity, doc=str(self.home / "fixture-production.md"), session_name=identity, session_host="herdr",

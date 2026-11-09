@@ -54,10 +54,4 @@ def is_codex_agent(process: Process) -> bool:
     words = process.arguments.split()
     if process.command == "codex":
         return words[1:2] == ["exec"]
-    if not process.command.startswith("python"):
-        return False
-    mesh = next(
-        (index for index, word in enumerate(words) if word.endswith("/codex_mesh.py")),
-        None,
-    )
-    return mesh is not None and words[mesh + 1 : mesh + 2] in (["start"], ["follow"])
+    return False
