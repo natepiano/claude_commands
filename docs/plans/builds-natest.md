@@ -1979,7 +1979,7 @@ A changed `config/<name>.conf` selects every test module whose transitive import
 - A restored seed must call `copies.register_remote` again, because the registry lives outside the copied tree.
 - Other SSH paths in the module stay real.
 
-### Phase 98 — The merge gate resources test never waits out its hang guard  · status: todo
+### Phase 98 — The merge gate resources test never waits out its hang guard  · status: done
 **Depends on:** none
 
 #### Work Order

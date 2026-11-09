@@ -36,7 +36,7 @@ except FileNotFoundError:
 import argparse
 from collections import deque
 from collections.abc import Generator, Sequence
-from contextlib import contextmanager, nullcontext
+from contextlib import ExitStack, contextmanager, nullcontext
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from enum import Enum, auto
@@ -336,16 +336,27 @@ class SharedCPUPool:
     owned: list[SharedCPUSlot] = field(default_factory=list)
 
     def acquire(self) -> SharedCPUSlot:
-        """Wait in the pool's reader queue while no module runs."""
+        """Wait for a CPU slot or cancellation while no module runs."""
         started = time.monotonic()
         print("waits for a CPU slot", flush=True)
         try:
-            token = os.read(self.blocking, 1)
-            if not token:
-                raise GateRefused("shared CPU pool returned no byte")
-            slot = SharedCPUSlot(self.descriptor, token)
-            self.owned.append(slot)
-            return slot
+            with ExitStack() as cleanup:
+                with build_folders.defer_signals():
+                    reader, writer = os.pipe2(os.O_NONBLOCK | os.O_CLOEXEC)
+                    _ = cleanup.callback(os.close, reader)
+                    _ = cleanup.callback(os.close, writer)
+                    previous = signal.set_wakeup_fd(writer)
+                    _ = cleanup.callback(signal.set_wakeup_fd, previous)
+                while True:
+                    readable, _, _ = select.select([self.blocking, reader], [], [])
+                    if reader in readable:
+                        _ = os.read(reader, 4096)
+                    if self.blocking in readable:
+                        # Another gate can take the token after select returns.
+                        with build_folders.defer_signals():
+                            slot = self.try_acquire()
+                        if isinstance(slot, SharedCPUSlot):
+                            return slot
         finally:
             print(f"CPU slot wait ended after {time.monotonic() - started:.3f} s", flush=True)
 
