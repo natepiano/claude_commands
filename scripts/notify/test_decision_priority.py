@@ -93,7 +93,7 @@ class DecisionPriorityTests(unittest.TestCase):
         found = review.held_for("owner")
         assert isinstance(found, review.LiveHold)
         self.assertEqual(found.hold.draft.due, due)
-        with patch.object(silence, "keep", return_value=silence.Kept("until off")) as keep:
+        with patch.object(silence, "keep_here", return_value=silence.Kept("until off")) as keep:
             self.assertEqual(pushover.deliver(found.hold.best_version), 0)
         kept = cast(silence.KeptPush, keep.call_args.args[0])
         self.assertEqual(kept.get("due"), due)

@@ -83,7 +83,7 @@ class TuneTests(PublicationTestCase):
                          "config/example.conf")
         self.assertEqual(repo.git(repo.checkout, "diff", "--cached", "--name-only"), "other.txt")
         self.assertEqual(repo.remote_tip(), repo.head())
-        self.assertIn("git pull -q --ff-only", repo.ssh_log.read_text())
+        self.assertIn("git fetch -q --no-write-fetch-head", repo.ssh_log.read_text())
         self.assertIn(str(repo.checkout), repo.ssh_log.read_text())
         self.assertFalse((repo.root / "state/mac.json").exists())
         self.assertFalse((repo.home / "unexpected-check").exists())
@@ -106,7 +106,7 @@ class TuneTests(PublicationTestCase):
         self.assertEqual(repo.git(repo.origin, "show", "main:config/user_zone.conf"),
                          "zone=America/Curacao")
         self.assertIn("amount=3", repo.git(repo.origin, "show", "main:config/example.conf"))
-        self.assertIn("git pull -q --ff-only", repo.ssh_log.read_text())
+        self.assertIn("git fetch -q --no-write-fetch-head", repo.ssh_log.read_text())
         self.assertFalse((repo.root / "state/mac.json").exists())
 
     def test_already_set_value_prints_one_line_without_a_write_and_completes_the_mac_pull(self) -> None:
@@ -116,7 +116,7 @@ class TuneTests(PublicationTestCase):
         self.assertEqual(result.stdout, "already amount=2\n")
         self.assertEqual(result.stderr, "")
         self.assertEqual(self.snapshot(), before)
-        self.assertIn("git pull -q --ff-only", self.repository.ssh_log.read_text())
+        self.assertIn("git fetch -q --no-write-fetch-head", self.repository.ssh_log.read_text())
 
     def test_ambiguous_base_key_refuses_without_a_write_and_names_both_lines(self) -> None:
         repo = self.repository
@@ -179,7 +179,7 @@ class TuneTests(PublicationTestCase):
         self.assertEqual(self.snapshot(), before)
         ssh_after = self.repository.ssh_log.read_bytes()
         self.assertTrue(ssh_after.startswith(ssh_before))
-        self.assertIn(b"git pull -q --ff-only", ssh_after[len(ssh_before):])
+        self.assertIn(b"git fetch -q --no-write-fetch-head", ssh_after[len(ssh_before):])
 
     def reject_push(self) -> Path:
         hook = self.repository.origin / "hooks/pre-receive"
@@ -205,7 +205,7 @@ class TuneTests(PublicationTestCase):
         self.assertEqual(repo.head(), head)
         self.assertEqual(repo.remote_tip(), head)
         self.assertEqual((repo.config.read_bytes(), repo.config.stat().st_mtime_ns), contents)
-        self.assertIn("git pull -q --ff-only", repo.ssh_log.read_text())
+        self.assertIn("git fetch -q --no-write-fetch-head", repo.ssh_log.read_text())
 
     def test_same_value_rerun_reports_a_push_that_is_still_rejected(self) -> None:
         repo = self.repository
@@ -235,7 +235,7 @@ class TuneTests(PublicationTestCase):
         self.assertEqual(repeated.returncode, 0, repeated.stdout + repeated.stderr)
         self.assertEqual(repeated.stdout, "already amount=3\n")
         self.assertEqual(self.snapshot(), before)
-        self.assertIn("git pull -q --ff-only", repo.ssh_log.read_text())
+        self.assertIn("git fetch -q --no-write-fetch-head", repo.ssh_log.read_text())
 
     def test_same_value_rerun_retries_a_queued_mac_pull_and_clears_the_queue(self) -> None:
         repo = self.repository

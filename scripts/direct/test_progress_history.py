@@ -8,7 +8,7 @@ from scripts.shutdown import remote
 from scripts.lib.stop_injection_test_support import InjectedStop, stop_once
 
 from scripts.lib.test_models_registry import write_registry
-from scripts.lib import models_registry
+from scripts.lib import atomic_file, models_registry
 from scripts.lib import unit_runs
 
 import argparse
@@ -80,7 +80,6 @@ def refresh_phase_table(session_dir: Path) -> None:
 
 class ProgressHistoryTests(unittest.TestCase):
     repository_seed: ClassVar[Path]
-    temporary: tempfile.TemporaryDirectory[str]  # pyright: ignore[reportUninitializedInstanceVariable]
     root: Path  # pyright: ignore[reportUninitializedInstanceVariable]
     history_dir: Path  # pyright: ignore[reportUninitializedInstanceVariable]
     working_dir: Path  # pyright: ignore[reportUninitializedInstanceVariable]
@@ -93,18 +92,14 @@ class ProgressHistoryTests(unittest.TestCase):
     @override
     def setUpClass(cls) -> None:
         super().setUpClass()
-        directory = tempfile.TemporaryDirectory(dir="/tmp")
-        cls.addClassCleanup(directory.cleanup)
-        cls.repository_seed = Path(directory.name)
+        cls.repository_seed = Path(cls.enterClassContext(tempfile.TemporaryDirectory()))
         _ = subprocess.run(["git", "init", "-b", "feature/rubric", str(cls.repository_seed)],
                            check=True, capture_output=True, text=True)
 
     @override
     def setUp(self) -> None:
         self.enterContext(patch.dict(os.environ, {"UNIT_SYNC_WRITES": "0"}))
-        # Socket fixtures need a short path even when the run's TMPDIR is long.
-        self.temporary = tempfile.TemporaryDirectory(dir="/tmp")
-        self.root = Path(self.temporary.name)
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         cache = self.root / "cache"
         seed_interpreter_cache(cache)
         self.enterContext(patch.dict(os.environ, {"CLAUDE_PYTHON": "", "XDG_CACHE_HOME": str(cache)}))
@@ -142,10 +137,6 @@ class ProgressHistoryTests(unittest.TestCase):
             return result
 
         _ = self.enterContext(patch.object(subprocess, "run", side_effect=run))
-
-    @override
-    def tearDown(self) -> None:
-        self.temporary.cleanup()
 
     def test_active_dispatch_returns_saved_launcher(self) -> None:
         from scripts.lib.atomic_file import write_text_atomic
@@ -3568,6 +3559,9 @@ with patch.object(fcntl, "flock", admission):
                              "--worker-id", worker.id, worker_name=worker.name)
         opened, = self.pass_events("dispatch-history", "pass_started")
         self.assertEqual(opened["worker_id"], worker.id)
+        current = staff.by_id(worker.id)
+        assert current is not None
+        self.assertEqual(current.role, staff.KnownWorkerRole("impl"))
         self.finish_slot_pass(run, "impl", "completed", 20_030)
         _ = staff.rename(worker.id, "renamed-worker")
         self.start_slot_pass(run, "impl", "test", 20_040, "gpt-called", 0,
@@ -3835,12 +3829,12 @@ with patch.object(fcntl, "flock", admission):
                 self.start_phase(session, 41_010)
                 command = ["bash", "review.sh", "prompt with spaces", "--phase", "3"]
                 self.start_slot_pass(session, "review", "review", 41_020, "gpt-called", 0,
-                                     "--launcher-command", json.dumps(command), worker_name="review2")
-                path = session / "progress_history_state.json"
-                before = (path.read_bytes(), path.stat().st_mtime_ns)
+                                     "--launcher-command", json.dumps(command), "--launcher-pid", "4321", worker_name="review2")
                 active = self.pass_slots(session)["review"]
-                self.start_slot_pass(session, "review", "review", 41_030, "gpt-new", worker_name="review2")
-                self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns), before)
+                self.assertEqual(active.get("launcher_pid"), 4321)
+                self.start_slot_pass(session, "review", "review", 41_030, "gpt-new", 0,
+                                     "--launcher-pid", "4322", worker_name="review2")
+                active["launcher_pid"] = 4322
                 self.assertEqual(self.pass_slots(session)["review"], active)
                 self.assertEqual(len(self.pass_events(name, "pass_started")), 1)
                 self.assertEqual(self.pass_events(name, "pass_finished"), [])
@@ -3895,6 +3889,23 @@ with patch.object(fcntl, "flock", admission):
         self.assertEqual(len(self.pass_events("invalid-launcher", "pass_started")), 1)
         self.assertEqual(self.pass_events("invalid-launcher", "pass_finished"), [])
 
+    def test_dispatch_replaces_the_worker_role(self) -> None:
+        session = self.start_run("TEST-staff-role", 41_000)
+        self.start_phase(session, 41_010)
+        parent = fixture_member("showrunner", name="TEST-role-parent")
+        member = staff.ensure_worker(staff.native_id(fixture_runtime_id("TEST-role-worker")), "TEST-worker", parent.id)
+        prompt = self.root / "TEST-role-prompt.txt"
+        atomic_file.write_text_atomic(prompt, "Read the requested files.\n")
+        for index, role in enumerate(("review", "test")):
+            with patch.dict(os.environ, {"UNIT_NOW_EPOCH": str(41020 + index * 20)}):
+                _ = progress_history.begin_dispatch(session, slot="TEST-worker", phase="3", role=role,
+                    worker_name=member.name, worker_id=member.id, launcher_command=["assign.sh"],
+                    prompt=prompt, kind="broad", lens="contract")
+            current = staff.by_id(member.id)
+            assert current is not None
+            self.assertEqual(current.to_json().get("role"), role)
+            self.finish_slot_pass(session, "TEST-worker", "completed", 41_030 + index * 20)
+
     def test_dispatch_api_reuses_active_and_completed_passes_after_launcher_loss(self) -> None:
         session = self.start_run("dispatch-api", 41_000)
         self.start_phase(session, 41_010)
@@ -3908,6 +3919,7 @@ with patch.object(fcntl, "flock", admission):
                 worker_id=staff.StaffId(fixture_runtime_id("dispatch-worker")),
                 launcher_command=command, prompt=prompt, kind="broad", lens="contract",
             )
+            self.assertEqual(self.pass_slots(session)["impl2"].get("launcher_pid"), os.getpid())
             path = session / "progress_history_state.json"
             before = (path.read_bytes(), path.stat().st_mtime_ns)
             resumed = progress_history.begin_dispatch(
@@ -8113,18 +8125,17 @@ class PhaseCountTests(unittest.TestCase):
     which under-reported a 68%-complete plan as 36%.
     """
 
-    temporary: tempfile.TemporaryDirectory[str]  # pyright: ignore[reportUninitializedInstanceVariable]
+    root: Path  # pyright: ignore[reportUninitializedInstanceVariable]
 
     @override
     def setUp(self) -> None:
         self.enterContext(patch.dict(os.environ, {"UNIT_SYNC_WRITES": "0"}))
-        self.temporary = tempfile.TemporaryDirectory()
-        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
 
     def _count(self, body: str, phase_percent: int = 0) -> dict[str, object]:
-        plan = Path(self.temporary.name) / "plan.md"
+        plan = self.root / "plan.md"
         _ = plan.write_text(body, encoding="utf-8")
-        environment = dict(os.environ, HOME=self.temporary.name)
+        environment = dict(os.environ, HOME=str(self.root))
         completed = invoke_recorder(
             ["phase-count", "--plan-doc", str(plan), "--phase-percent", str(phase_percent)],
             environment, Path.cwd(), check=True)
@@ -8192,15 +8203,12 @@ class PhaseCountTests(unittest.TestCase):
 
 
 class PublicPhaseHelperTests(unittest.TestCase):
-    temporary: tempfile.TemporaryDirectory[str]  # pyright: ignore[reportUninitializedInstanceVariable]
     root: Path  # pyright: ignore[reportUninitializedInstanceVariable]
 
     @override
     def setUp(self) -> None:
         self.enterContext(patch.dict(os.environ, {"UNIT_SYNC_WRITES": "0"}))
-        self.temporary = tempfile.TemporaryDirectory()
-        self.addCleanup(self.temporary.cleanup)
-        self.root = Path(self.temporary.name)
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
         _ = fixture_member("showrunner", name="phase-helper")
 

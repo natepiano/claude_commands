@@ -46,14 +46,16 @@ class StaffSessionIdentityTests(StaffTestCase):
         runner, unit, worker = self.tree()
         sibling = staff.ensure_worker(staff.native_id(fixture_runtime_id("sibling")), "test", unit.id)
         new_id = fixture_runtime_id("after-clear")
-        environment = {"HERDR_ENV": "1", "HERDR_SESSION": "agents", "HERDR_PANE_ID": "w1:p1"}
+        environment = {"HERDR_ENV": "1", "HERDR_SESSION": "agents", "HERDR_PANE_ID": "w1:p1",
+                       "CLAUDE_CONFIG_DIR": os.environ["CLAUDE_CONFIG_DIR"]}
         payload: dict[str, object] = {
             "hook_event_name": "SessionStart", "source": "clear", "session_id": new_id,
             "cwd": str(self.root),
         }
         launch: dict[str, object] = dict(pane_record.launch(
-            "w1:p1", worker.id, str(self.root), {}, ["claude"],
+            "w1:p1", worker.id, str(self.root), environment, ["claude"],
         ))
+        worker = replace(worker, home=staff.SessionHome(Path(environment["CLAUDE_CONFIG_DIR"])))
         launch.update({"pid": os.getpid(), "proc_start": sessions.process_start(os.getpid())})
         panes = pane_record.record_path("agents")
         self.write_json(panes, {"w1:p1": launch})

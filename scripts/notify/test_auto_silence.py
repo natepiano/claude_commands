@@ -167,7 +167,7 @@ class AutoSilenceTests(unittest.TestCase):
         record = silence.read_state()
         self.assertIsNotNone(record)
         self.assertTrue(record and record["auto"])
-        self.assertEqual(silence.keep(PUSH, "Linux"), silence.Kept("until you are back"))
+        self.assertEqual(silence.keep_here(PUSH), silence.Kept("until you are back"))
         self.now += 3600
         _ = self.main("check")
         self.assertEqual(len(self.pushes), 1)
@@ -193,7 +193,7 @@ class AutoSilenceTests(unittest.TestCase):
                 with redirect_stdout(io.StringIO()):
                     self.assertEqual(auto_silence.check(lambda: self.now, sender), 0)
                 for index in range(count):
-                    _ = silence.keep({**PUSH, "title": f"Build {index} done"}, "Linux")
+                    _ = silence.keep_here({**PUSH, "title": f"Build {index} done"})
                 events.clear()
                 with redirect_stdout(io.StringIO()):
                     self.assertEqual(auto_silence.active(lambda: self.now, sender, self.runner, deliver, UserTypedPrompt("typed")), 0)
@@ -265,7 +265,7 @@ class AutoSilenceTests(unittest.TestCase):
         _ = self.main("45min")
         self.now += 3000
         _ = self.main("check")
-        _ = silence.keep(PUSH, "Linux")
+        _ = silence.keep_here(PUSH)
         before = auto_silence.config_file().read_bytes()
         for source in (PeerPrompt, ScriptPrompt, HarnessNotice, UnknownPrompt):
             with self.subTest(source=source.__name__):
@@ -282,7 +282,7 @@ class AutoSilenceTests(unittest.TestCase):
         self.now += 3000
         _ = self.main("check")
         start = self.events()[0]
-        _ = silence.keep(PUSH, "Linux")
+        _ = silence.keep_here(PUSH)
 
         def sender(argv: Sequence[str]) -> int:
             event = self.events()[-1]
@@ -302,7 +302,7 @@ class AutoSilenceTests(unittest.TestCase):
         _ = self.main("45min")
         self.now += 3000
         _ = self.main("check")
-        _ = silence.keep(PUSH, "Linux")
+        _ = silence.keep_here(PUSH)
         state, kept = silence.state_file().read_bytes(), silence.kept_file().read_bytes()
         with (mock.patch.object(auto_silence, "append_event", side_effect=OSError("disk full")),
               redirect_stderr(io.StringIO())):
@@ -325,7 +325,7 @@ class AutoSilenceTests(unittest.TestCase):
         _ = self.main("45min")
         self.now += 3000
         _ = self.main("check")
-        _ = silence.keep(PUSH, "Linux")
+        _ = silence.keep_here(PUSH)
         with redirect_stdout(io.StringIO()):
             self.assertEqual(auto_silence.active(lambda: self.now, self.sender, self.runner,
                 lambda _push: 1, UserTypedPrompt("typed")), 1)

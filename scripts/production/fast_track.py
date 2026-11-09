@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Check a small worktree patch, push main, and retain it for blind review."""
 from __future__ import annotations
+
 try:
     with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
 except FileNotFoundError:
@@ -31,6 +32,7 @@ from uuid import uuid4
 from scripts.lib import process_group
 
 from scripts.copies import copies
+from scripts.production import checkpoint_gate
 from scripts.lib import build_folders, conf
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.process_failure import failure_detail
@@ -687,7 +689,7 @@ def promote(production: str, repo: Path, commit: str, unit: str) -> None:
                 merge_checkpoint.promote_targets(promotion, "main", commit, source=source, label=f"fast-track {unit}")
         else:
             merge_checkpoint.promote_targets(promotion, "main", commit, source=repo, label=f"fast-track {unit}")
-    except (merge_checkpoint.Stop, copies.CopyError, production_doc.Refusal) as error:
+    except (checkpoint_gate.Stop, copies.CopyError, production_doc.Refusal) as error:
         raise PublishedFailure(str(error)) from error
 
 
@@ -727,7 +729,7 @@ def push_patch(repo: Path, production: str, unit: str, why: str, paths: list[str
                             continue
                         result = subprocess.run(["git", "-C", str(copy), "push", "origin", "HEAD:main"],
                                                 capture_output=True, text=True, check=False)
-                except merge_checkpoint.Stop as error:
+                except checkpoint_gate.Stop as error:
                     raise Refused(str(error)) from error
                 if result.returncode:
                     # A writer outside the shared lock can move origin during push.
