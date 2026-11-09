@@ -604,11 +604,13 @@ Detached command records retain their own process and working directory checks.
 
 ## Pane closure and restore
 
-The director closes a worker pane after it accepts a pass.
+The completion hook closes a worker pane after DONE.
 An immediate repair or phase dispatch can retain the pane.
-A busy worker or live detached run prevents closure.
+A live detached run keeps the pass active, so the hook closes no pane until that run ends.
+The close reads no process. It closes the pane at once.
 Closure keeps the staff row and thread.
 The next assign resumes that thread in a new pane.
+An account move resumes an open or stopped worker in its same pane and closes no pane.
 Restore reopens only workers with active dispatches.
 Idle workers stay closed until their next assign.
 Account moves preserve closed idle workers.

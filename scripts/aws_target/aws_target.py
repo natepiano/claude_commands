@@ -119,6 +119,9 @@ class AwsCli:
             raise AwsUnavailable('instance lifecycle reply is malformed') from error
 
 
+USAGE_ONLY = json.dumps({'Not': {'Dimensions': {'Key': 'RECORD_TYPE', 'Values': ['Credit', 'Refund']}}})
+
+
 def fetch_account_charges(api: AwsCli, start: int, end: int, now: int,
                           read_usd: Decimal) -> tuple[ledger.ChargeRead, ...]:
     """Read daily account costs by usage type and count every API page."""
@@ -128,7 +131,7 @@ def fetch_account_charges(api: AwsCli, start: int, end: int, now: int,
     pages = 0
     while True:
         arguments = ['--time-period', period, '--granularity', 'DAILY', '--metrics', 'UnblendedCost', 'UsageQuantity',
-                     '--group-by', 'Type=DIMENSION,Key=USAGE_TYPE', '--no-paginate']
+                     '--group-by', 'Type=DIMENSION,Key=USAGE_TYPE', '--filter', USAGE_ONLY, '--no-paginate']
         if token:
             arguments.extend(('--next-page-token', token))
         reply = api.call('get-cost-and-usage', *arguments, service='ce')

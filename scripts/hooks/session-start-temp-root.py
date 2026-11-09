@@ -53,6 +53,7 @@ def main() -> int:
     if not isinstance(session_id, str) or not SESSION_ID.fullmatch(session_id) or not env_file:
         return 0
     try:
+        # The session uses this TMPDIR after the startup hook exits.
         path = build_folders.create_build_folder(build_folders.StableOwnerFolder(
             session_id, build_folders.ExplicitBuildParent(temp_parent()), mode=0o700))
         line = export_line(path)

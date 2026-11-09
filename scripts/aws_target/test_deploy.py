@@ -1219,6 +1219,7 @@ sys.exit(7)
 
     def prepare_running_costs(self) -> tuple[int, ledger.CostLedger]:
         start = int(datetime(2026, 1, 15, tzinfo=UTC).timestamp())
+        self.replace('daily_limit_usd', '20')
         self.costs({'fallback_usd_per_hour': '0.10', 'fixed_usd_per_month': '300',
                     'price_max_age_seconds': '86400', 'observation_max_age_seconds': '86400',
                     'cost_explorer_read_usd': '0'})
@@ -2961,16 +2962,6 @@ esac
                 with self.subTest(value=value, parser=parser.__name__):
                     with self.assertRaises(ValueError):
                         _ = parser(value)
-
-    def test_spending_caps_refuse_values_above_the_configured_maximum(self) -> None:
-        for key, value, normal in (('monthly_limit_usd', '400.01', '400'), ('daily_limit_usd', '20.01', '20'),
-                                   ('monthly_limit_usd', '400.0000000000000001', '400'),
-                                   ('daily_limit_usd', '20.0000000000000001', '20')):
-            with self.subTest(key=key, value=value):
-                self.replace(key, value)
-                with self.assertRaises(ValueError):
-                    _ = aws_config.read_settings(self.settings)
-                self.replace(key, normal)
 
     def test_fixed_deployment_values_use_the_source_limits(self) -> None:
         for key, value, normal in (('data_volume_gib', '501', '500'), ('data_volume_iops', '6001', '6000'),

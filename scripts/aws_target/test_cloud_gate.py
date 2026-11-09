@@ -19,7 +19,7 @@ from unittest import mock
 from urllib.parse import parse_qs, urlsplit
 
 from scripts.aws_target import cloud_gate, gate_box, ledger
-from scripts.aws_target.aws_target import AwsCli
+from scripts.aws_target.aws_target import USAGE_ONLY, AwsCli
 from scripts.aws_target.config import read_settings
 from scripts.aws_target.ledger_test_support import CostFixture, account_reply, instant, numeric_settings
 from scripts.build_queue import admission_client, admission_protocol as wire, cloud_progress, progress_profile
@@ -265,12 +265,18 @@ with (mock.patch.object(cloud_gate, 'AwsCli', return_value=api),
         self.assertEqual(reading.estimated_usd, Decimal(0))
         self.assertEqual(reading.actual_usd, Decimal(0))
         commands = [row for row in self.fake.commands if 'get-cost-and-usage' in row]
-        self.assertNotIn('--filter', commands[0])
+        self.assertEqual(commands[0][commands[0].index('--filter') + 1], USAGE_ONLY)
         self.assertEqual(commands[0][commands[0].index('--group-by') + 1], 'Type=DIMENSION,Key=USAGE_TYPE')
-        self.fake.billing_pages = [{'ResultsByTime': []}]
+        self.fake.billing_pages = [account_reply(commands[0], '-0.0000036')]
         worker = cloud_gate.GateWorker(AwsCli('build-scaler', 'fixture-region', 1, execute=self.fake),
                                       self.book, self.settings, self.folder / 'reservation.cgroup',
                                       clock=lambda: self.now + 86400)
+        _ = worker.charges()
+        self.assertLess(min(row.usd for row in self.book.read_snapshot().reconciliations), Decimal(0))
+        self.fake.billing_pages = [{'ResultsByTime': []}]
+        worker = cloud_gate.GateWorker(AwsCli('build-scaler', 'fixture-region', 1, execute=self.fake),
+                                      self.book, self.settings, self.folder / 'reservation.cgroup',
+                                      clock=lambda: self.now + 172800)
         with self.assertRaisesRegex(ValueError, 'daily reply is unavailable'):
             worker.charges()
 
