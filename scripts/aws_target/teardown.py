@@ -6,6 +6,7 @@ from contextlib import ExitStack
 from dataclasses import asdict, dataclass
 from io import StringIO
 import json
+import shutil
 from pathlib import Path
 import subprocess
 import time
@@ -24,7 +25,7 @@ down refuses while an AWS job still runs. Kept claims do not delay down.
 down would delete the aws-build Tailscale device and keep tag:build-aws policy rules.
 down would delete all scaler access keys and remove only the scaler credential profile.
 down would remove compute resources, then the foundation stack and retained Budget.
-down would delete the data volume. The /home build cache is lost.
+down would delete the data volume and the gate image with its snapshot. The /home build cache is lost.
 down would remove deployment.json, up.json, setup proofs, and the prepared bundle.
 down keeps the spend ledger, charge history, disabled routing.json, admin.gpg, and the box image.
 Run deploy.py down --approve-destroy to remove the target.'''
@@ -399,6 +400,22 @@ class TargetRemoval:
         (self.directory / 'deployment.json').unlink(missing_ok=True)
         return changed
 
+    def gate_image(self) -> bool:
+        directory = self.directory / 'gate-image'
+        if not directory.exists():
+            return False
+        from scripts.aws_target.gate_box import GATE_IMAGE_OWNER_TAG
+        box.cleanup_images(self.api, {}, GATE_IMAGE_OWNER_TAG)
+        book = ledger.CostLedger(self.directory)
+        inventories = book.read_snapshot().inventories
+        if inventories and any(item.name == 'gate-image' for item in inventories[-1].resources):
+            previous = inventories[-1]
+            book.record_inventory(ledger.ResourceInventory(int(self.clock()),
+                tuple(item for item in previous.resources if item.name != 'gate-image'), 'gate image removed',
+                builder_removed=previous.builder_removed))
+        shutil.rmtree(directory)
+        return True
+
     def _kept_image(self) -> None:
         path = self.directory / 'image.json'
         if path.exists():
@@ -408,7 +425,7 @@ class TargetRemoval:
     def run(self) -> bool:
         stages = (('routing-off', self.routing), ('tailscale-device', self.devices), ('scaler-keys', self.scaler),
                   ('compute', self.compute), ('foundation', self.foundation), ('retained-resources', self.retained),
-                  ('local-state', self.local_state))
+                  ('gate-image', self.gate_image), ('local-state', self.local_state))
         with control_lock(self.directory / 'up'), ExitStack() as locks:
             try:
                 if self.verify():
