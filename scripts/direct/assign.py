@@ -13,6 +13,7 @@ import re
 import shlex
 import subprocess
 import sys
+import threading
 import time
 from dataclasses import dataclass, field, replace
 from enum import StrEnum
@@ -541,8 +542,18 @@ def execute_consultation(args: Arguments, cwd: Path) -> int:
             return 0
         opened = current
         client = herdr.Herdr(herdr.shared_session())
+        deadline = time.monotonic() + herdr.PROGRAM_TIMEOUT_SECONDS
+        while True:
+            try:
+                thread = client.native_session(current.pane, "codex", max(0, deadline - time.monotonic()))
+                break
+            except (herdr.HerdrFailure, OSError, ValueError, subprocess.SubprocessError):
+                if time.monotonic() >= deadline:
+                    raise
+                _ = threading.Event().wait(max(0, min(0.1, deadline - time.monotonic())))
         process = client.pane_agent_process(current.pane, current.terminal)
-        source = herdr.codex_transcript(process.pid)
+        home = Path(herdr.process_environment(process.pid).get("CODEX_HOME") or Path.home() / ".codex")
+        source = worker_admission.codex_transcript_source(thread, home)
         reply = staff_worker.consultation_reply(client, current.pane, source, question)
         write_text_atomic(Path(args.summary), reply + "\n")
         result = 0
@@ -566,7 +577,7 @@ def execute_consultation(args: Arguments, cwd: Path) -> int:
     return result
 
 
-def execute_durable(args: Arguments, env: dict[str, str]) -> int:
+def execute_durable(args: Arguments) -> int:
     """Start or dispatch a durable role through its explicit target."""
     name = staff.WorkerName.parse(args.to or args.new_worker)
     role = cast(staff.WorkerRole, args.policy)
@@ -585,11 +596,7 @@ def execute_durable(args: Arguments, env: dict[str, str]) -> int:
         slot=name.value, phase=args.phase, kind="astra",
         reply=Path(args.summary) if args.summary else staff_worker.REPLY_BESIDE_PROMPT, policy=policy,
         launcher_command=["bash", str(SCRIPTS / "assign.sh"), *sys.argv[1:]])
-    if result:
-        return result
-    env.update(UNIT_TEAM_ROLE=name.value, UNIT_PASS_OWNER="launcher")
-    return call([PYTHON, PROGRESS, "finish-pass", "--session-dir", args.session_dir,
-                 "--status", "completed"], env, check=False).returncode
+    return result
 
 
 def execute_astra_review_herdr(args: Arguments, run: Path, cwd: Path, prompt: Path,
@@ -620,13 +627,11 @@ def execute_astra_review_herdr(args: Arguments, run: Path, cwd: Path, prompt: Pa
             reply=Path(args.summary), policy=policy, started=current,
             launcher_command=["bash", str(SCRIPTS / "assign.sh"), *sys.argv[1:]])
         env.update(UNIT_PASS_OWNER="launcher", UNIT_TEAM_ROLE=args.new_worker)
-        finished = subprocess.run([PYTHON, PROGRESS, "finish-pass", "--session-dir", str(run),
-                       "--status", "error" if result else "completed"], env=env, text=True,
-                       stderr=subprocess.STDOUT, check=False).returncode
         if result:
+            _ = subprocess.run([PYTHON, PROGRESS, "finish-pass", "--session-dir", str(run),
+                                "--status", "error"], env=env, text=True,
+                               stderr=subprocess.STDOUT, check=False)
             print(f"assign.sh: reviewer dispatch exited {result}; pending input is retained", flush=True)
-        else:
-            result = finished
     except (OSError, ValueError) as error:
         print(f"assign.sh: reviewer role unavailable: {error}", file=sys.stderr)
         result = 1
@@ -712,7 +717,7 @@ def main() -> int:
             refuse("--cwd must be a directory")
         return execute_consultation(args, cwd)
     if args.target == "durable-design-role":
-        return execute_durable(args, env)
+        return execute_durable(args)
     cwd, prompt = Path(args.cwd).expanduser().resolve(), Path(args.prompt).expanduser().resolve()
     if not cwd.is_dir() or not prompt.is_file():
         refuse("--cwd must be a directory and --prompt must be a readable file")

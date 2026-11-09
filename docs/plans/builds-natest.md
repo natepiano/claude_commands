@@ -1896,46 +1896,22 @@ The build queue shows each step by its configured name. `config/build_steps.conf
 **Gotchas:**
 - A shown name can hold a space. Row tests read table cells by header column, not by a whitespace split.
 
-### Phase 94 — The merge gate stops a module that goes above its memory limit  · status: todo
+### Phase 94 — The merge gate stops a module that goes above its memory limit  · status: done
 **Depends on:** none
 
-#### Work Order
+#### As-built
 
-**Source:** the user, 2026-11-08, via sdlc and builds: "yes do that" to the merge gate memory stop. The builds showrunner added: the limit and the retry count go in config, not in code; add rows to the existing merge_gate tests. Background: Phase 92 found a verify module that grew to 27,000.8 MiB in a gate. `SampledRSSAdmission.admits` (`scripts/production/merge_gate.py` near line 291) admits a module with no limit when no other job runs, and nothing stops a module that grows after it starts.
+On a shared machine, a merge gate stops a test module whose own memory sample (resident plus swapped memory of the module and its descendants) goes above `merge_gate_governor_gib` (4 GiB). The stop uses the time-limit path: `killed_for` names the peak and the limit, and `stop_gate_jobs` ends the module. The module runs again alone up to `memory_stop_reruns` times (`config/merge_gate.conf`, 1). These reruns do not count toward `RERUN_LIMIT`, and a further overrun fails the gate. A stopped run records no peak in `module_peak_mib.json`.
 
-**Goal:** A merge gate stops a test module whose own memory goes above the gate's memory limit, runs it again once alone, fails the gate on a second overrun, and tells sdlc each time.
-
-**Spec:**
-1. The limit is the gate's existing memory limit, `merge_gate_governor_gib` in `config/build_admission.conf` (4 GiB now). Read it through the existing `merge_gate_governor_gib()`. Do not add a second limit key.
-2. In the sampling loop, compare each running test module's own sample (`process_memory_mib`: resident plus swapped memory of the module and its descendants) with the limit. When a module goes above it, stop it the way the module time limit does: set `killed_for` to a plain reason that names its peak and the limit, call `stop_gate_jobs([job])`, and print the line. The check applies to every running test module, alone or beside others. The type check job is out of scope.
-3. A memory-stopped module runs again alone, once, through the existing rerun pass. The number of such reruns is a new key in `config/merge_gate.conf`, read at use (`memory_stop_reruns=1`, a whole number of at least 0). A memory stop does not count toward `RERUN_LIMIT`'s "real breakage" count. A module stopped again after its last rerun fails the gate, with its reason in the result.
-4. Each stop sends one peer message to sdlc through `scripts/message/send.py` (`--to sdlc`), the way other scripts send a peer message. The text names the gate (its mode and branch or checkpoint), the module, its peak memory in GiB, the limit, and what happens next: "runs again alone" or "the gate fails". A failed send prints one line in the gate output and does not change the gate result. No stop is silent.
-5. A memory-stopped run does not record its peak in `module_peak_mib.json`, as a killed job does now.
-6. Update the `merge_gate.py` module docstring (line 8 says a memory peak does not kill a job), `config/README.md` (`merge_gate.conf` section), and `docs/as-built/merge-gate-and-test-speed.md` to state the stop, the rerun and the message.
-7. Add rows to the existing tests in `scripts/production/test_merge_gate_suites_resources.py` and `scripts/production/test_merge_gate_suites_reruns.py`: a module above the limit is stopped and passes on its rerun; a module above the limit twice fails the gate; a module beside others above the limit is stopped; a module below the limit is not stopped; each stop sends one message to sdlc with the module, peak and gate; a failed send does not change the result. Use a fake `send.py`, and give the tests a fake memory sample through a test hook in the fixture. Tests never send a real message or read live state.
-8. Add no other guard, refusal or check (user rule, 2026-11-05). This check is the one the user approved.
+Each stop sends sdlc one message through `session_send.send_argv`, after the result is known. It names the gate mode, branch and checkpoint, the module, its peak, the limit, and "runs again alone" or "the gate fails". A failed send prints one line and does not change the gate result.
 
 **Files:**
-- `scripts/production/merge_gate.py`
-- `config/merge_gate.conf`
-- `config/README.md`
-- `docs/as-built/merge-gate-and-test-speed.md`
-- `scripts/production/test_merge_gate_suites_resources.py`
-- `scripts/production/test_merge_gate_suites_reruns.py`
-- `scripts/production/merge_gate_test_support.py`
-- `scripts/production/test_merge_gate_suites_admission.py`
-- `scripts/production/test_merge_gate_test_times.py`
+- `scripts/production/merge_gate.py` — the stop in the sampling loop, `tell_memory_stop`, `can_retry_memory_stop`, the memory rerun pass
+- `config/merge_gate.conf` — `memory_stop_reruns`
+- `config/README.md`, `docs/as-built/merge-gate-and-test-speed.md` — the stop, the rerun and the message
+- `scripts/production/merge_gate_test_support.py` — fake `send.py` (a send-fails file makes it exit 3) and the `sampling_module_memory` hook
+- `scripts/production/test_merge_gate_suites_reruns.py`, `test_merge_gate_suites_resources.py` — stop, rerun, fail and message rows
 
-**Workers:** 1 writer; the stop, its rerun and its tests share one runner loop and one fixture
-- `impl` — `merge_gate.py`, `merge_gate.conf`, `config/README.md`, the as-built doc, the four test files, hub: `merge_gate_test_support.py`
-
-**Constraints from prior phases:**
-- Phase 92: gate `TMPDIR` is `/dev/shm`; `finish_gate_job` kills a module's process group and removes its `TMPDIR` when the module ends.
-- Tests never read or write live state: `~/.claude` main, `~/.local/state/merge-gate`, `/tmp/claude`.
-- Keep the existing rules: the `WholeMachine` mode bypasses the memory governor, and a module that trips the tripwire gets no rerun. A memory stop with a tripwire tells sdlc "the gate fails".
-
-**Acceptance gate:**
-- The new rows fail without the change and pass with it.
-- `test_merge_gate_suites_resources`, `test_merge_gate_suites_reruns`, every other `test_merge_gate*` module and `test_targeted_test` pass.
-- the targeted test green on the phase commit merged with `origin/builds`
-- `basedpyright` on the changed files prints `0 errors, 0 warnings, 0 notes`
+**Gotchas:**
+- `WholeMachine` mode has no admission, so it has no memory stop.
+- A tripwire result never reruns; its memory-stop message says "the gate fails".

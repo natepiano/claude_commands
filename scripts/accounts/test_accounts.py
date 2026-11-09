@@ -717,6 +717,46 @@ class AccountsTests(unittest.TestCase):
             self.assertIn(text, table)
             self.assertIn(text, "\n".join(reading.detail_lines))
 
+        from scripts.production import live_units, unit_phases, unit_lookup
+
+        self.enterContext(patch.dict(os.environ, {"UNIT_HISTORY_DIR": str(self.root / "status-history"),
+                                                "UNIT_QUEUE_STATE_DIR": str(self.root / "unit-queues")}))
+        states = [("busy", "", "busy"), ("idle", "", "idle"), ("shell", "", "idle"),
+                  ("busy", "pause", "paused"), ("", "pause", "paused"),
+                  ("busy", "exit", "exited"), ("", "exit", "exited"),
+                  ("busy", "both", "exited"), ("", "both", "exited"), ("", "", "exited")]
+        for kind in ("unit", "showrunner"):
+            for activity, hold, expected in states:
+                with self.subTest(kind=kind, activity=activity, hold=hold):
+                    source = members[0] if kind == "unit" else next(row for row in membership.rows if row.kind == "showrunner")
+                    member = replace(source, paused=staff.Paused("2026-11-08", "fixture", "hold") if hold in ("pause", "both") else staff.Active(),
+                                     exited=staff.Exited("2026-11-08", "fixture", "stop") if hold in ("exit", "both") else staff.Active())
+                    observed = [sessions.SessionRecord(pid=900, sessionId=member.current_session, name=member.name,
+                        messagingSocketPath="", updatedAt=1, tmux="", formerNames=[], status=activity)] if activity else []
+                    parent = membership.parent_of(member)
+                    snapshot = staff.StaffSnapshot((member, parent) if parent is not None else (member,))
+                    with (patch.object(staff, "local_snapshot", return_value=snapshot),
+                          patch.object(sessions, "running_sessions", return_value=observed),
+                          patch.object(pane_launch, "record_directory", return_value=records),
+                          patch.object(accounts, "_session_config_dir", side_effect=live_directory),
+                          patch.object(accounts, "_worker_status_records", return_value=[])):
+                        status = accounts.read_status(source=accounts.StoredUsageOnly())
+                    role = "units" if kind == "unit" else "showrunners"
+                    label = "claude4" if activity else "claude2"
+                    document = cast(accounts.StatusDocument, json.loads(accounts.render_status_json(status)))
+                    account_row = next(row for row in document["accounts"] if row["label"] == label)
+                    self.assertEqual(account_row["role_counts"][account_row["roles"].index(role)],
+                                     {"busy": int(expected == "busy"), "idle": int(expected == "idle"),
+                                      "paused": int(expected == "paused"), "exited": int(expected == "exited"), "total": 1})
+                    if kind == "unit":
+                        assert parent is not None
+                        listing = unit_lookup.LabeledProductions({}, {parent.name: (member.name,)})
+                        with (patch.object(staff, "snapshot", return_value=snapshot),
+                              patch.object(sessions, "running_sessions", return_value=observed)):
+                            selected = live_units.units_in(parent.name, listing)
+                            rendered = unit_phases.table(selected, {})
+                        self.assertIn(f"| {member.name} | {expected} |", rendered)
+
     def test_native_codex_counts_share_one_conversation_and_activity_read(self) -> None:
         from scripts.herdr import herdr
 
@@ -782,6 +822,26 @@ class AccountsTests(unittest.TestCase):
             {"busy": 1, "idle": 0, "paused": 0, "exited": 0, "total": 1}])
         self.assertEqual(rows["codex2"]["role_counts"], [
             {"busy": 0, "idle": 0, "paused": 0, "exited": 0, "total": 0}])
+
+        claude_worker = fixture_worker("live-claude-worker", member.id)
+        for activity, hold in (("busy", "pause"), ("idle", "exit")):
+            with self.subTest(worker_activity=activity, staff_hold=hold):
+                if hold == "pause":
+                    _ = staff.pause(claude_worker.id, "hold worker")
+                else:
+                    _ = staff.exit(claude_worker.id, "stop worker")
+                observed = sessions.SessionRecord(pid=991, sessionId=claude_worker.current_session, name=claude_worker.name,
+                    messagingSocketPath="", updatedAt=1, tmux="", formerNames=[], status=activity)
+                with (patch.object(sessions, "running_sessions", return_value=[observed]),
+                      patch.object(pane_launch, "record_directory", return_value=records),
+                      patch.object(accounts, "_worker_status_records", return_value=[]),
+                      patch.object(accounts, "_session_config_dir", return_value=account.ConfiguredClaudeFolder(self.home / ".claude4"))):
+                    reading = accounts.read_status(source=accounts.StoredUsageOnly())
+                document = cast(accounts.StatusDocument, json.loads(accounts.render_status_json(reading)))
+                worker_account = next(row for row in document["accounts"] if row["label"] == "claude4")
+                self.assertEqual(worker_account["role_counts"][worker_account["roles"].index("workers")],
+                                 {"busy": int(activity == "busy"), "idle": int(activity == "idle"),
+                                  "paused": 0, "exited": 0, "total": 1})
 
 
 

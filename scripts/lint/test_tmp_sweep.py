@@ -685,7 +685,26 @@ class ScratchRootTests(TmpSweepCase):
         for folder, task in tasks:
             scratch.write_record(folder, task, 0.0)
         self.recent(due / "a")
+        files = ((write(scratch_root / "old.txt"), False),
+                 (write(scratch_root / "recent.json"), True))
+        for file, recent in files:
+            if recent:
+                self.recent(file)
+        planned = self.sweep(dry_run=True)
+        planned_paths = [entry["path"] for entry in planned.deleted]
+        for file, recent in files:
+            with self.subTest(file=file.name, recent=recent):
+                self.assertTrue(file.is_file())
+                if recent:
+                    self.assertIn(str(file), planned.kept.get(tmp_sweep.RECENT, []))
+                    self.assertNotIn(str(file), planned_paths)
+                else:
+                    self.assertIn(str(file), planned_paths)
+                self.assertFalse(any("Not a directory" in reason for reason in planned.kept))
         result = self.sweep()
+        for file, recent in files:
+            with self.subTest(file=file.name, recent=recent):
+                self.assertEqual(file.exists(), recent)
         self.assertFalse(due.exists())
         self.assertFalse(loose.exists())
         for folder in (run, row, later):
@@ -1313,6 +1332,7 @@ class HandCleanupTests(TmpSweepCase):
         ended = self.ended_run("ended")
         paused = self.ended_run("paused")
         write_text_atomic(self.unit / "active" / "paused", str(paused) + "\n")
+        plain = write(self.tmp / "scratch" / "old.txt")
         plan = self.tmp.parent / "plan.json"
         status, output = self.command("--plan", str(plan))
         self.assertEqual(status, 0, output)
@@ -1322,6 +1342,12 @@ class HandCleanupTests(TmpSweepCase):
         self.assertIn(f"keep {paused}: an active run marker", output)
         self.assertIn(f"tmp sweep: plan {plan}", output)
         self.assertEqual(tmp_sweep.planned_removals(plan), [str(ended)])
+        saved = cast(dict[str, object], json.loads(plan.read_text()))
+        entries = cast(list[tmp_sweep.PlanEntry], saved["entries"])
+        self.assertIn(tmp_sweep.PlanEntry(path=str(plain), action="keep",
+            reason=tmp_sweep.CleanupKeepReason.NO_END.value), entries)
+        self.assertFalse(any("Not a directory" in entry["reason"] for entry in entries))
+        self.assertTrue(plain.is_file())
         self.assertFalse(self.state.exists())
 
     def test_age_without_end_evidence_keeps_an_unused_folder(self) -> None:

@@ -4018,9 +4018,14 @@ with patch.object(fcntl, "flock", admission):
         session_dir = self.start_run("reopen", 42_000)
         self.start_phase(session_dir, 42_010)
         self.start_slot_pass(session_dir, "impl", "impl", 42_020)
+        first_instance = str(self.pass_slots(session_dir)["impl"]["instance_id"])
         self.start_slot_pass(session_dir, "test", "fix", 42_030)
         peer_instance = self.pass_slots(session_dir)["test"]["instance_id"]
         self.start_slot_pass(session_dir, "impl", "fix", 42_040)
+        replacement = self.pass_slots(session_dir)["impl"]
+        with self.subTest(late_completion=first_instance):
+            progress_history.complete_dispatch(session_dir, "impl", first_instance)
+            self.assertEqual(self.pass_slots(session_dir)["impl"], replacement)
         finished = self.pass_events("reopen", "pass_finished")
         self.assertEqual(len(finished), 1)
         self.assertEqual(finished[0].get("team_slot"), "impl")

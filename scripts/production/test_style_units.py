@@ -225,6 +225,12 @@ class StyleUnitsTests(unittest.TestCase):
         self.assertIn("| types | paused | idle |", paused)
         _ = staff.resume(self.owners["types"].id)
         self.assertEqual(render_status(), initial)
+        for name in ("names", "types"):
+            with self.subTest(exited=name):
+                _ = staff.exit(self.owners[name].id, "stop the unit")
+                self.assertIn(f"| {name} | exited | idle |", render_status())
+                _ = staff.resume(self.owners[name].id)
+                self.assertEqual(render_status(), initial)
 
     def test_headers_name_the_eta_and_finding_counts(self) -> None:
         self.assertEqual(self.render().splitlines()[:2], [

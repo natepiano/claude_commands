@@ -71,7 +71,6 @@ def complete_session(*, host: object) -> dict[str, object]:
             "dirty": [],
         },
         "run_dirs": [],
-        "codex_servers": [],
         "timers": [],
     }
 

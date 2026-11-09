@@ -953,3 +953,50 @@ From the user (C959, 2026-11-04, through builds): "we are moving to the new buil
 - The summary lists each `/build:queue` item and where the page shows it.
 - No caller of the removed code remains (LSP `findReferences` or `rg`).
 - The unit's targeted test passes; `basedpyright` 0 errors, 0 warnings, 0 notes on the changed Python files.
+
+### Phase 41 — The vault sync keeps the Mac main ref and files its stop question · status: done
+**Depends on:** nothing in this plan. Files: `scripts/buildlog/vault_pull.py`, `scripts/buildlog/test_vault_pull.py`, `config/build_targets.conf`; no other phase touches them.
+
+From the builds showrunner (not the user), 2026-11-08: "C1272 (Mac vault syncs both ways) landed on my validation. One live defect to look at: the 11:00 EST buildlog vault run stopped with 'unknown command error ... cannot lock ref refs/remotes/mac/main' ... Find the cause ... and whether the stop filed a question on natedev's list ... Send me the cause, and a phase if a fix is needed."
+
+From the builds showrunner (not the user), 2026-11-08: "go on Phase 41. The full refspec fixes the cause, and the question production from config is right (a new key needs no go). Add a change row only when the fix is live and the user can check it."
+
+Cause, measured 2026-11-08 on git 2.54.0 in a scratch pair of repositories:
+- The global git config sets `fetch.prune true`. `vault_pull.py:228` fetches `main:refs/remotes/mac/main` from a URL. With a short source name, prune counts the destination ref as stale. Each second fetch deletes `refs/remotes/mac/main`.
+- When the Mac main moved, that fetch fails: `cannot lock ref ... unable to resolve reference ... (unable to update local ref)`. This is the 11:00 stop.
+- When the Mac main did not move, the fetch exits 0 and leaves the ref deleted. The next `merge-base` on the ref then fails.
+- So every second hourly run stops. It is not a race. Runs: 09:58 created the ref, 11:00 stopped, 12:02 created it again.
+- The full source name `refs/heads/main:refs/remotes/mac/main` updates the ref on each of four runs, with prune on.
+
+Question list, measured 2026-11-08:
+- The 11:00 stop filed no question; nothing needs clearing. The 12:02 run printed no "question was not withdrawn", so the ask had failed.
+- `vault_pull.py` passes `--production ~/.claude/docs/plans/natedev-production.md`. The natedev showrunner's staff row names the doc in `worktrees/claude-natedev-trunk`, so `update_registration.py` answers "no showrunner staff row". No vault stop has reached the list since that move.
+- `update_registration.py questions --production natedev` works: the flag takes the production name.
+
+#### Work Order
+
+**Goal:** Each hourly vault run keeps `refs/remotes/mac/main`, and a vault stop puts its question on natedev's list.
+
+**Spec:**
+- The Mac fetch uses the full source name: `refs/heads/main:refs/remotes/mac/main`.
+- A vault question names its production by name, read from `config/build_targets.conf` key `vault.question_production` (value `natedev`) at use. The hard-coded production doc path goes.
+- Replies, printed text, stored state and the question text do not change.
+
+**Files:**
+- `scripts/buildlog/vault_pull.py` — the fetch refspec; the production name from config.
+- `scripts/buildlog/test_vault_pull.py` — rows in the existing tests.
+- `config/build_targets.conf` — `vault.question_production`.
+
+**Workers:** `1 writer`
+- writer — all three files. The tests are small and live beside the change.
+
+**State:** none.
+
+**Constraints from prior phases:** Phase 33: every import uses the repo root. Tunables live in config and are read at use.
+
+**Acceptance gate:**
+- A test runs two syncs in a row with `fetch.prune=true` set on the test repositories, once with a new Mac commit and once with none. Both keep `refs/remotes/mac/main`. Each case fails on the old refspec.
+- The existing registration test reads `--production natedev` from config.
+- The unit's targeted test passes; `basedpyright` 0 errors, 0 warnings, 0 notes on the changed Python files.
+- The first two hourly runs after the merge each print `synced` or `current`.
+- Change-Review: none — the vault sync already recovers each second hour; the user sees no new behavior.

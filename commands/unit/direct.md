@@ -125,10 +125,9 @@ The list uses `worker_panes.observe` for open, stopped, closed, unknown, and inc
 An unknown pane outside this parent's tabs does not make its absent workers uncertain.
 An unknown pane in a parent's tab, or an unreadable parent pane, can leave absence unproved.
 Use `worker.py end <name>` only for permanent removal.
-After accepting a pass, close its pane unless a fix round or next-phase dispatch starts immediately.
-Use `~/.claude/scripts/lib/py ~/.claude/scripts/herdr/worker_panes.py close <name>`.
-The close keeps the thread and staff row; the next assign resumes that thread.
-If a busy worker or live detached run prevents closure, keep the pane. Close it after that work ends.
+The launcher closes the worker's pane when its pass completes.
+The close keeps the native conversation and staff row.
+The next assign resumes that conversation in a new pane.
 The worker command selects idle workers and resumes stopped workers in new panes.
 Use the short name from `worker.py list` with `--to` when selecting a retained pane worker.
 Keep every busy or unknown worker unchanged.

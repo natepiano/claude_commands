@@ -1016,12 +1016,11 @@ def _start_locked(owner: staff.StaffRow, name: WorkerName, role: WorkerRole, pol
             if isinstance(process.start_ticks, herdr.ProcessGenerationUnavailable):
                 raise herdr.HerdrFailure(process.start_ticks.reason)
             launch_processes[launched.pane] = process
-        with herdr.launch_rollout_proof():
-            if not identity and policy.settings.kind == "codex":
-                if isinstance(launched.outcome, herdr.PromptNotSubmitted):
-                    raise herdr.HerdrFailure(launched.outcome.reason)
-                return _codex_start_session(client, launched.pane)
-            return client.native_session(launched.pane, policy.settings.kind, herdr.PROGRAM_TIMEOUT_SECONDS)
+        if not identity and policy.settings.kind == "codex":
+            if isinstance(launched.outcome, herdr.PromptNotSubmitted):
+                raise herdr.HerdrFailure(launched.outcome.reason)
+            return _codex_start_session(client, launched.pane)
+        return client.native_session(launched.pane, policy.settings.kind, herdr.PROGRAM_TIMEOUT_SECONDS)
 
     def cleanup(identity: str) -> worker_admission.CleanupOutcome:
         if not launches:
@@ -1034,8 +1033,7 @@ def _start_locked(owner: staff.StaffRow, name: WorkerName, role: WorkerRole, pol
                 raise herdr.HerdrFailure("launched terminal is missing")
             if observed.get("terminal_id") != terminal:
                 raise herdr.HerdrFailure("launched terminal changed")
-            with herdr.launch_rollout_proof():
-                proved = client.native_session(pane, policy.settings.kind, herdr.PROGRAM_TIMEOUT_SECONDS, pane_row=observed)
+            proved = client.native_session(pane, policy.settings.kind, herdr.PROGRAM_TIMEOUT_SECONDS, pane_row=observed)
             if identity and proved != identity:
                 raise herdr.HerdrFailure("launched agent identity changed")
             process = launch_processes.get(pane)
@@ -1069,8 +1067,7 @@ def _start_locked(owner: staff.StaffRow, name: WorkerName, role: WorkerRole, pol
     launched = launches[-1]
     if isinstance(launched.outcome, herdr.PromptNotSubmitted):
         return IncompleteStart(row, launched.pane, launched.outcome.reason)
-    with herdr.launch_rollout_proof():
-        fresh = _evidence(owner.id, staff.snapshot(), client, selection=selection)
+    fresh = _evidence(owner.id, staff.snapshot(), client, selection=selection)
     result = next((state for state in fresh.states if state.row.id == row.id), None)
     _layout(owner.id, fresh)
     return result if isinstance(result, (OpenWorker, ProcessUnknownWorker, UncertainWorker)) else _uncertain(row, "agent launch is incomplete")
@@ -1086,9 +1083,14 @@ def _retire_launch(row: staff.StaffRow, client: herdr.Herdr, record: staff.Staff
 
 def _close_target(observed: WorkerPane, evidence: PaneEvidence, parent: StaffId,
                   client: herdr.Herdr) -> WorkerPane:
+    parents = evidence.scan.found.get(parent, [])
+    tabs = {_text(pane, "tab_id") for pane in parents} - {""}
+    if isinstance(observed, (OpenWorker, StoppedWorker, ProcessUnknownWorker)):
+        if not any(_text(pane, "pane_id") == observed.pane and _text(pane, "tab_id") in tabs
+                   for pane in evidence.panes):
+            return _uncertain(observed.row, "worker pane is outside its parent's tabs")
     if not isinstance(observed, UncertainWorker) or observed.reason != "labelled recovery pane runs other work":
         return observed
-    parents = evidence.scan.found.get(parent, [])
     if len(parents) != 1:
         return observed
     pane = labelled_pane(evidence.panes, _text(parents[0], "tab_id"), observed.row.name)
@@ -1110,16 +1112,21 @@ def close(parent: StaffId, name: WorkerName, *,
     if row is None:
         _layout(parent, _evidence(parent, record, _client()))
         return Closed()
+    before_quit: StoppedWorker | ClosedWorker = ClosedWorker(row)
     if interrupt:
         client = _client()
-        evidence = _evidence(parent, record, client)
+        evidence = _evidence(parent, record, client, selection=SelectedWorkers(frozenset({name.value})))
         observed = next((item for item in evidence.states if item.row.id == row.id), ClosedWorker(row))
         target = _close_target(observed, evidence, parent, client)
-        if isinstance(target, (UncertainWorker, ProcessUnknownWorker)):
+        if isinstance(target, UncertainWorker):
+            return target
+        if isinstance(target, ProcessUnknownWorker):
             return _uncertain(row, target.reason)
         if isinstance(target, OpenWorker):
             client.quit_agent(target.pane, target.terminal, str(target.row.current_session),
                               conf.read("direct").number("PANE_AGENT_START_SECONDS"))
+        if isinstance(target, (OpenWorker, StoppedWorker)):
+            before_quit = StoppedWorker(row, target.pane, target.terminal)
     with ExitStack() as operations:
         held = operations.enter_context(worker_lock(parent, name, blocking=interrupt)) if isinstance(lock, WorkerLockAtUse) else lock
         if isinstance(held, Kept):
@@ -1129,17 +1136,14 @@ def close(parent: StaffId, name: WorkerName, *,
         with staff.row_operation(str(row.id)):
             client = _client()
             record = staff.snapshot()
-            evidence = _evidence(parent, record, client)
+            evidence = _evidence(parent, record, client, selection=SelectedWorkers(frozenset({name.value})))
             observed = next((item for item in evidence.states if item.row.id == row.id), ClosedWorker(row))
             row = observed.row
-            recovered = isinstance(observed, UncertainWorker) and observed.reason == "labelled recovery pane runs other work"
-            if isinstance(observed, UncertainWorker) and recovered:
-                target = _close_target(observed, evidence, parent, client)
-                if not isinstance(target, OpenWorker):
-                    return observed
-                if not interrupt and not target.status.idle:
-                    return Kept(f"agent state is {target.status.value}")
-                observed = target
+            observed = (replace(before_quit, row=row) if isinstance(before_quit, StoppedWorker)
+                        else _close_target(observed, evidence, parent, client))
+            recovered = isinstance(observed, OpenWorker) and observed.row.current_session != row.current_session
+            if recovered and isinstance(observed, OpenWorker) and not interrupt and not observed.status.idle:
+                return Kept(f"agent state is {observed.status.value}")
             if isinstance(observed, UncertainWorker):
                 return observed
             if isinstance(observed, ClosedWorker):
@@ -1179,8 +1183,10 @@ def close(parent: StaffId, name: WorkerName, *,
 
 def _layout(parent: StaffId, evidence: PaneEvidence) -> None:
     client = _client()
+    parent_tabs = {_text(pane, "tab_id") for pane in evidence.scan.found.get(parent, [])} - {""}
     selected = {item.terminal for item in evidence.states if isinstance(item, (OpenWorker, StoppedWorker))
-                and item.row.reports_to(parent)}
+                and item.row.reports_to(parent) and any(_text(pane, "pane_id") == item.pane
+                and _text(pane, "tab_id") in parent_tabs for pane in evidence.panes)}
     selected.update(evidence.layout_terminals)
     panes = client.panes()
     tabs = {pane.get("tab_id", "") for pane in panes if pane.get("terminal_id", "") in selected}
