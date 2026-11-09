@@ -429,6 +429,33 @@ try {
       }
       await show(base);
 
+      for(const [name,present] of [['mac_idle',true],['good',false]]) {
+        await show(readings[name]);
+        const alert=await evaluate(`(() => {
+          const element=document.querySelector('#mac-idle-alert');
+          const box=element.getBoundingClientRect();
+          const probe=document.createElement('span');probe.style.color='var(--cap)';document.body.append(probe);
+          const errorColor=getComputedStyle(probe).color;probe.remove();
+          return {text:element.textContent,hidden:element.hidden,color:getComputedStyle(element).color,errorColor,
+            height:box.height,bottom:box.bottom,titleTop:document.querySelector('h1').getBoundingClientRect().top,
+            scroll:document.documentElement.scrollWidth,client:document.documentElement.clientWidth};
+        })()`);
+        assert.equal(alert.text,readings[name].mac_idle_alert);
+        assert.equal(alert.hidden,!present);
+        if(present) {
+          assert.match(alert.text,/^MAC IDLE 10 min: 7 steps wait for the Mac\./);
+          assert.equal(alert.color,alert.errorColor,'The Mac idle alert is not red.');
+          assert.ok(alert.height>0 && alert.bottom<=alert.titleTop,'The alert is not above the title.');
+          assert.ok(alert.scroll<=alert.client,'The Mac idle alert overflows the page.');
+        } else assert.equal(alert.height,0,'The clear alert keeps an empty line.');
+        proof[name+'Alert']=alert;
+      }
+      for(const [name,expected] of [['priority',"queue priority: research (the user's bump)"],['good','']]) {
+        await show(readings[name]);
+        assert.equal(await evaluate("document.querySelector('#priority-line').textContent"),expected);
+      }
+      await show(base);
+
       const positions=()=>evaluate(`(() => {
         const row=document.querySelector('.walk-table tr[data-tip^="row:"]');
         return ['.duration','.unit','.pid'].map(selector=>{

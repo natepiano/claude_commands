@@ -39,7 +39,7 @@ def installed_code_version(code_root: Path) -> str:
 
 LOADED_ADMISSION_CODE_VERSION = installed_code_version(installed.code_root)
 
-from scripts.buildlog import charts
+from scripts.buildlog import charts, mac_idle_alert
 from scripts.buildlog.store import host_name
 from scripts.build_queue import progress_profile as progress
 from scripts.build_queue import snapshot_codec as codec
@@ -357,6 +357,8 @@ class MemoryPage(TypedDict):
     waiters: list[WaitRow | CloudWaitRow]
     swap_by: list[SwapRow]
     head_text: str
+    priority_text: str
+    mac_idle_alert: str
     cloud_slots_used: int
     cloud_slots: int
     psi: PressureValues
@@ -919,6 +921,8 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
         "swap_used": gib(swap.used), "swap_total": gib(swap.total),
         "walk": work_rows, "waiters": waiting_rows, "swap_by": swap.rows, "psi": pressure_values,
         "head_text": queue_view.head_text(model),
+        "priority_text": head_facts.priority_text(explanation.priority),
+        "mac_idle_alert": mac_idle_alert.alert_line(mac_idle_alert.state_dir() / "alert.json", time.time(), user_zone()) or "",
         "cloud_slots_used": cloud_slots_used, "cloud_slots": cloud_slots,
         "limits": {"some": policy.some_avg10_limit, "full": policy.full_avg10_limit, "swap": policy.swap_used_limit},
         "report": report_reading(configuration.history_days) if isinstance(report, ReportNotRead) else report,
