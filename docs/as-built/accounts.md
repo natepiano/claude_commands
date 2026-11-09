@@ -179,6 +179,27 @@ Without a queued workers move, provider refusal or unavailable included usage ca
 Credit policy determines whether an exhausted account can continue.
 Worker assignment fallback to Claude remains separate from the selected Codex account.
 Routing returns only when the selected Codex account can work and its refusal has resolved.
+An owned workers refusal with no account capacity enables `no_worker_mode` on the workers-role host, `role_map.ROLE_MAP_HOST`.
+The refusal handler sets this flag independently of the first `NoRoomMove` entry and the Claude assignment switch.
+The saved flag triggers one broadcast to showrunners and unit directors on both machines.
+`config/accounts.conf` supplies `no_worker_mode_on` and `no_worker_mode_off`; `quota-alert` identifies the sender.
+The ON notice directs directors to write code, run tests, and do reviews without assigning workers.
+Successful Codex recovery clears the flag and broadcasts OFF after the workers account and assignment restoration succeed.
+Recovery also clears the flag when no Claude assignment fallback was saved.
+An unfinished Claude switch or failed restoration retains the flag until recovery can finish.
+The state context saves each flag change and releases the lock before it starts a separate broadcast unit.
+The start uses `systemd-run --user --collect --quiet --no-block` with the user manager's environment.
+The unit uses the repository working directory and `scripts/lib/py` to run `scripts/production/broadcast.py`.
+The quota pass waits only for the unit start, so slow peer delivery cannot consume its 30-second budget.
+A failed unit start logs one failure line and has no retry.
+The separate unit records later delivery output in its journal.
+A refresh that clears the flag reports `notes refreshed; workers-back notice sent`.
+The flag survives state reloads and suppresses repeated ON notices during the same episode.
+`agent-notes.timer` starts `agent-notes.service` 30 seconds after the preceding service finishes, with one-second timer accuracy.
+`scripts/maintenance/agent_notes_job.py` runs its quota part after the notes part.
+`config/agent_notes.toml` sets the quota and notes intervals to 120 seconds.
+Normal recovery takes about two to three minutes plus reading, restoration, and broadcast time.
+This interval is not a fixed reset-to-notice deadline; stale readings, failed moves, or interrupted jobs can delay OFF.
 Pane workers move through their dispatch lock, fresh pane evidence, `restart.stop_row`, and `worker_panes.start_or_resume`.
 They keep the same conversation and reuse a stopped pane.
 Only an open pass receives resume text through the shared target check.
