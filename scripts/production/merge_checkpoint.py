@@ -647,15 +647,15 @@ def merge(request: MergeRequest) -> str:
         raise checkpoint_gate.Stop("merge", "held", f"staged paths in merge checkout: {staged.replace(chr(10), ', ')}",
                    "the showrunner will clear unrelated staged paths, then rerun the checkpoint")
     short = request.commit[:7]
-    request.scratch.mkdir(parents=True, exist_ok=True)
-    message_path = request.scratch / f"merge_{short}.msg"
     message = merge_subject(request) + "\n\n" + ("Phase plan shrink." if isinstance(request.kind, ShrinkCommit)
                                                   else "Closing as-built docs." if isinstance(request.kind, AsBuiltCommit)
                                                   else request.delivers)
     if request.trailer:
         message += "\n\n" + "\n".join(request.trailer)
-    _ = message_path.write_text(message + "\n", encoding="utf-8")
-    result = git(checkout, "merge", "--no-ff", "-q", "-F", str(message_path), request.commit)
+    with tempfile.TemporaryDirectory(prefix="merge-message-") as directory:
+        message_path = Path(directory) / f"merge_{short}.msg"
+        _ = message_path.write_text(message + "\n", encoding="utf-8")
+        result = git(checkout, "merge", "--no-ff", "-q", "-F", str(message_path), request.commit)
     if result.returncode:
         raise checkpoint_gate.Stop("merge", "failed", result.stderr.strip() or "merge failed",
                    "the showrunner will inspect the merge failure")

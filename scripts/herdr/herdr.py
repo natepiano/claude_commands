@@ -1897,6 +1897,17 @@ class Herdr:
             return False
         return self._close_pane(pane) and self._pane_closed(pane, terminal)
 
+    def close_terminal_pane(self, pane: str, terminal: str) -> bool:
+        """Close the matching terminal and confirm its removal without a process check."""
+        if not terminal:
+            return False
+        row = self.pane_row(pane)
+        if isinstance(row, NoPane):
+            return self._pane_closed(pane, terminal)
+        if row.get("terminal_id") != terminal:
+            return False
+        return self._close_pane(pane) and self._pane_closed(pane, terminal)
+
     def _pane_closed(self, pane: str, terminal: str) -> bool:
         if any(row["pane_id"] == pane or terminal and row.get("terminal_id") == terminal for row in self.panes()):
             print(f"herdr {self.session}:{pane}: closure is pending; record retained", file=sys.stderr)
@@ -4989,11 +5000,6 @@ class PreparedAgentEnvironment:
 
 
 @dataclass(frozen=True)
-class WorkerPaneEnvironment(PreparedAgentEnvironment):
-    """A worker shell ends when its agent command returns."""
-
-
-@dataclass(frozen=True)
 class NewTab:
     space: str
     title: str
@@ -5147,12 +5153,6 @@ def launch_prepared_agent(name: str, destination: NewTab | SplitPane | ExistingP
                       'unset "${legacy_label%%=*}";; esac; done; '
                       f"cd -- {shlex.quote(str(prepared.directory))} && "
                       f"unset {shlex.join(sorted(key for key in removals if not key.startswith('HERDR_') and re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*', key)))} && export {exports}")
-        if isinstance(prepared, WorkerPaneEnvironment):
-            script += ("\nprecmd_functions=(${precmd_functions:#herdr_worker_exit}); "
-                       "preexec_functions=(${preexec_functions:#herdr_worker_start}); "
-                       "herdr_worker_exit() { exit $?; }; "
-                       "herdr_worker_start() { precmd_functions=(herdr_worker_exit $precmd_functions); }; "
-                       "preexec_functions+=(herdr_worker_start)")
         client.run_in_pane(pane, ["eval", script],
                            terminal=destination.terminal if isinstance(destination, ExistingPane) else "")
         server_name = agent_name if isinstance(agent_name, str) else agent
