@@ -5,6 +5,7 @@ from contextlib import closing
 from datetime import UTC, datetime
 from decimal import Decimal
 import json
+import os
 from pathlib import Path
 import time
 from typing import cast, override
@@ -22,6 +23,7 @@ from scripts.buildlog.test_index import use_test_log
 use_test_log()
 
 from scripts.aws_target import ledger, measurement
+from scripts.aws_target.ledger_test_support import numeric_settings
 from scripts.aws_target.measurement_test_support import DAY, MIDNIGHT, NOW, MeasurementFixture, narrow, read_only_evidence
 
 
@@ -44,10 +46,10 @@ class AwsReportTests(MeasurementFixture):
         _ = cast(object, self.enterContext(mock.patch.object(store, "host_name", return_value="natedev")))
         _ = cast(object, self.enterContext(mock.patch.object(time, "time", return_value=float(NOW))))
 
-    def render(self) -> str:
+    def render(self, day: str = DAY) -> str:
         _ = index.update()
         with closing(index.read_only()) as connection, read_only_evidence(self, self.root):
-            output = report.report(connection, DAY)
+            output = report.report(connection, day)
         return output
 
     def exchange(self, target: str, *, ok: bool, at: int) -> None:
@@ -115,6 +117,16 @@ class AwsReportTests(MeasurementFixture):
         self.assertIn("### AWS: aws", output)
         self.assertIn("### AWS: backup", output)
         self.assertEqual(sum(line.startswith("AWS: up ") for line in output.splitlines()), 2)
+        account = self.root / 'account/aws_target.conf'
+        account.parent.mkdir()
+        _ = account.write_bytes(self.settings.read_bytes())
+        numeric_settings(account, {'daily_limit_usd': '7'})
+        self.costs({'daily_limit_usd': '1'})
+        with self.subTest(settings='installed account'), mock.patch.dict(os.environ, {'AWS_TARGET_CONFIG': str(account)}):
+            output = self.render()
+            self.assertIn('limit $7.00', output)
+            self.assertIn('AWS: up 2.00 h', output)
+            self.assertNotIn('AWS measurement unavailable', output)
 
     def test_instrument_counts_use_targets_while_samples_use_local_hosts(self) -> None:
         self.write_records(
@@ -212,10 +224,13 @@ class AwsReportTests(MeasurementFixture):
             {'time': MIDNIGHT + 86400, 'instance_type': 'm7a.4xlarge', 'result': 'launched'},
         ]
         _ = (self.state / 'cloud-gate-launches.jsonl').write_text(''.join(json.dumps(row) + '\n' for row in launches))
-        usage = (ledger.UsageTypeCost('USE2-SpotUsage:m7a.8xlarge', Decimal('0.06')),
-                 ledger.UsageTypeCost('USW2-SpotUsage:m7a.8xlarge', Decimal('0.02')),
-                 ledger.UsageTypeCost('USE2-SpotUsage:m7a.4xlarge', Decimal('0.03')),
-                 ledger.UsageTypeCost('USE2-EBS:VolumeUsage.gp3', Decimal('2.89')))
+        usage = (ledger.UsageTypeCost('USE2-SpotUsage:m7a.8xlarge', Decimal('0.06'), Decimal('.1'), 'Hrs'),
+                 ledger.UsageTypeCost('USW2-SpotUsage:m7a.8xlarge', Decimal('0.02'), Decimal('.1'), 'Hrs'),
+                 ledger.UsageTypeCost('USE2-SpotUsage:m7a.4xlarge', Decimal('0.03'), Decimal('.1'), 'Hrs'),
+                 ledger.UsageTypeCost('USE2-EBS:VolumeUsage.gp3', Decimal('2.29')),
+                 ledger.UsageTypeCost('USE2-PublicIPv4:InUseAddress', Decimal('.1')),
+                 ledger.UsageTypeCost('USE2-DataTransfer-Out-Bytes', Decimal('.2')),
+                 ledger.UsageTypeCost('USE2-Lambda-Request', Decimal('.3')))
         for provisional in (False, True):
             with self.subTest(provisional=provisional):
                 reading = ledger.ChargeRead(reading.day, at, reading.period_start, reading.period_end,
@@ -231,6 +246,25 @@ class AwsReportTests(MeasurementFixture):
                 self.assertIn('m7a.8xlarge: $0.0800; 2 launched boxes; $0.0400 per run (daily allocation)', output)
                 self.assertIn('m7a.4xlarge: $0.0300; 1 launched boxes; $0.0300 per run (daily allocation)', output)
                 self.assertIn('older Spot builder', output)
+                for group, amount, share in (
+                    ('gate compute at 32 CPU', '.0800', '2.7'), ('compute at 16 CPU', '.0300', '1.0'),
+                    ('storage', '2.2900', '76.3'), ('public IPv4', '.1000', '3.3'),
+                    ('data transfer', '.2000', '6.7'), ('other', '.3000', '10.0')):
+                    self.assertIn(f'| {group} | ${Decimal(amount):.4f} | {share}% |', output)
+                self.assertNotIn("Today's spend", output)
+                with mock.patch.object(time, 'time', return_value=float(at)):
+                    current = self.render('2026-01-16')
+                self.assertIn("Today's spend (UTC 2026-01-16): $2.89; limit $20.00; 1 run; estimated from the newest bill.", current)
+                self.assertIn('Spend (UTC 2026-01-15): $3.00; limit $20.00; 3 runs; AWS bill.', output)
+        for amount in (Decimal('-0.0000036'), Decimal('0.0000036')):
+            with self.subTest(amount=amount):
+                dust = ledger.ChargeRead(reading.day, at, reading.period_start, reading.period_end,
+                    amount, reading.estimated_usd, reading.query_usd, (ledger.UsageTypeCost('storage', amount),))
+                _ = (self.state / 'charges' / f'{dust.day}.json').write_text(json.dumps(ledger.charge_record(dust)))
+                with mock.patch.object(time, 'time', return_value=float(at)):
+                    output = self.render('2026-01-16')
+                self.assertNotIn(f'AWS bill (account, UTC {DAY},', output)
+                self.assertIn('estimated from configured prices', output)
 
     def test_daily_queue_comparison_names_the_unmatched_load(self) -> None:
         self.write_records(

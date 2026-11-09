@@ -127,7 +127,7 @@ def fetch_account_charges(api: AwsCli, start: int, end: int, now: int,
     token = ''
     pages = 0
     while True:
-        arguments = ['--time-period', period, '--granularity', 'DAILY', '--metrics', 'UnblendedCost',
+        arguments = ['--time-period', period, '--granularity', 'DAILY', '--metrics', 'UnblendedCost', 'UsageQuantity',
                      '--group-by', 'Type=DIMENSION,Key=USAGE_TYPE', '--no-paginate']
         if token:
             arguments.extend(('--next-page-token', token))
@@ -142,19 +142,23 @@ def fetch_account_charges(api: AwsCli, start: int, end: int, now: int,
             usage: list[ledger.UsageTypeCost] = []
             for group in ledger.rows(item, 'Groups'):
                 keys = cast(list[str], group['Keys'])
-                cost = ledger.mapping(ledger.mapping(group['Metrics'])['UnblendedCost'])
+                metrics = ledger.mapping(group['Metrics'])
+                cost = ledger.mapping(metrics['UnblendedCost'])
+                quantity = ledger.mapping(metrics['UsageQuantity'])
                 if cost.get('Unit') != 'USD':
                     raise ValueError('Cost Explorer requires USD')
-                usage.append(ledger.UsageTypeCost(keys[0], conf.decimal(ledger.text(cost, 'Amount'))))
+                usage.append(ledger.UsageTypeCost(keys[0], conf.decimal(ledger.text(cost, 'Amount')),
+                                                  conf.decimal(ledger.text(quantity, 'Amount')), ledger.text(quantity, 'Unit')))
             previous = days.get(day)
-            combined: dict[str, Decimal] = {}
+            combined: dict[str, ledger.UsageTypeCost] = {}
             for row in (*previous.usage_types, *usage) if previous else usage:
-                combined[row.usage_type] = combined.get(row.usage_type, Decimal(0)) + row.usd
-            types = tuple(ledger.UsageTypeCost(name, usd) for name, usd in sorted(combined.items()))
+                old = combined.get(row.usage_type, ledger.UsageTypeCost(row.usage_type, Decimal(0)))
+                combined[row.usage_type] = replace(row, usd=old.usd + row.usd, quantity=old.quantity + row.quantity)
+            types = tuple(row for _, row in sorted(combined.items()))
             days[day] = ledger.ChargeRead(day, now,
                 int(datetime.fromisoformat(day).replace(tzinfo=UTC).timestamp()),
                 int(datetime.fromisoformat(ledger.text(bounds, 'End')).replace(tzinfo=UTC).timestamp()),
-                sum(combined.values(), Decimal(0)), Decimal(0), Decimal(0), types,
+                sum((row.usd for row in types), Decimal(0)), Decimal(0), Decimal(0), types,
                 item['Estimated'] is True or bool(previous and previous.provisional))
         token = str(reply.get('NextPageToken', ''))
         if not token:
