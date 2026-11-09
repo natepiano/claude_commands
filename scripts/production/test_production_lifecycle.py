@@ -684,7 +684,7 @@ class LifecycleTests(LifecycleFixture):
             calls = [line for line in self.calls().splitlines() if line.startswith("ssh ")]
             self.assertEqual(len(calls), 1)
             self.assertIn("ssh mac", calls[0])
-            self.assertIn(f"git pull --ff-only natedev:{destination} main", calls[0])
+            self.assertIn(f"git fetch -q --no-write-fetch-head natedev:{destination} main", calls[0])
         _ = (self.state / "mac-rc").write_text("1\n")
         failed = self.run_lifecycle("promote-main", "--no-ci")
         self.assert_step(failed, "failed")

@@ -143,7 +143,7 @@ class SetTests(unittest.TestCase):
                          "zone(America/Curacao): set with /zone (AST)")
         self.assertEqual(self.git(self.checkout, "status", "--short").strip(), "?? other.txt")
         (pull,) = self.log("ssh.log")
-        self.assertIn(f"git pull -q --ff-only natedev:{self.checkout} main", pull[-1])
+        self.assertIn(f"git fetch -q --no-write-fetch-head natedev:{self.checkout} main", pull[-1])
         (sent,) = self.log("broadcast.log")
         self.assertEqual(sent[:4], ["--from", "zone", "--all", sent[3]])
         self.assertIn("now America/Curacao (AST, UTC-04:00); it was America/New_York", sent[3])
@@ -165,7 +165,7 @@ class SetTests(unittest.TestCase):
         self.assertIn("zone: America/Curacao (AST", shown.stdout)
         self.assertIn("mac: took the America/Curacao change queued at", shown.stdout)
         calls = self.log("ssh.log")
-        self.assertIn("git pull", calls[-2][-1])
+        self.assertIn("git fetch -q --no-write-fetch-head", calls[-2][-1])
         self.assertIn('broadcast.py" --here --from zone --all', calls[-1][-1])
         self.assertFalse(self.queued().exists())
 
@@ -176,7 +176,7 @@ class SetTests(unittest.TestCase):
             self.assertEqual(shown.returncode, 0, shown.stderr)
             self.assertIn("mac: took the legacy change", shown.stdout)
             command = self.log("ssh.log")[-1][-1]
-            self.assertIn('cd "$HOME"/.claude && git pull', command)
+            self.assertIn('cd "$HOME"/.claude && tip=$(git ls-remote', command)
             self.assertIn(f"natedev:{self.checkout} main", command)
             self.assertFalse(self.queued().exists())
 
@@ -187,7 +187,7 @@ class SetTests(unittest.TestCase):
             shown = self.run_zone()
             self.assertEqual(shown.returncode, 0, shown.stderr)
             calls = self.log("ssh.log")[before:]
-            self.assertEqual(sum("git pull" in call[-1] for call in calls), 1)
+            self.assertEqual(sum("git fetch -q --no-write-fetch-head" in call[-1] for call in calls), 1)
             self.assertIn("broadcast.py", calls[-1][-1])
             self.assertFalse(self.queued().exists())
 
@@ -261,7 +261,7 @@ class SetTests(unittest.TestCase):
                          self.git(self.checkout, "rev-parse", "origin/main"))
         self.assertEqual(self.git(self.checkout, "show", "origin/main:config/example.conf"),
                          "# range: 1..10\namount=3\n")
-        self.assertIn("git pull -q --ff-only", self.log("ssh.log")[0][-1])
+        self.assertIn("git fetch -q --no-write-fetch-head", self.log("ssh.log")[0][-1])
 
     def test_zone_does_not_pull_the_mac_when_unrelated_local_work_prevents_the_push(self) -> None:
         _ = self.git(self.checkout, "add", "other.txt")

@@ -956,8 +956,7 @@ def pull_mac_checkout(mac: PurePosixPath, source: Path) -> main_publish.MacPulle
         retry_seconds = settings_read.number("MAC_PULL_RETRY_SECONDS")
     except ValueError as error:
         raise Stop("promote", "failed", str(error), "repair the Mac pull configuration and rerun this checkpoint") from error
-    remote = (f"cd {main_publish.remote_path(mac)} && git pull --ff-only "
-              f"natedev:{shlex.quote(str(source))} main; printf 'rc=%s\\n' \"$?\"")
+    remote = main_publish.mac_pull_command(mac, source)
     attempt = 0
     while True:
         result = subprocess.run(["ssh", "mac", remote], capture_output=True, text=True, check=False)
