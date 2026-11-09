@@ -34,7 +34,9 @@ A failed delivery command returns an error.
 The transcript prevents replay.
 A matching final transcript reply proves completion.
 A matching dispatch prompt also permits completion from the hook's own DONE reply before the final transcript record appears.
-The native hook starts one separate handler process and returns.
+The native hook sends its payload to a separate handler through stdin and returns.
+The child reads stdin before it applies the completion rule.
+The payload stays outside the child argument list.
 The handler runs once outside the terminal session.
 The pass retains its id, launcher arguments, reply path, and completion actions.
 The director ends its turn after the assigned synchronous review.
@@ -43,7 +45,8 @@ The notice includes the reply path when the reply has text.
 The director reads that reply when the message resumes it.
 
 `scripts/herdr/turn_end.py` serves both families.
-Codex receives `-c notify=[...]` on its launch line.
+Codex uses the global `Stop` handler installed through `scripts/hooks/codex_hooks.py`.
+Codex worker launch lines contain no `-c notify` argument.
 Claude receives an asynchronous `Stop` command through launch-line `--settings` JSON.
 The launcher changes no account settings file.
 The hook finds the worker through its native conversation id.
@@ -111,13 +114,27 @@ The director sends the final-diff event with `turn_end.py stage-ready <worker>`.
 
 ### Hook input sources
 
-The [Codex notification reference](https://learn.chatgpt.com/docs/config-file/config-advanced#notifications) defines one JSON argument.
-Its fields include `type`, `thread-id`, `turn-id`, `cwd`, `input-messages`, and `last-assistant-message`.
-The event type is `agent-turn-complete`.
+The [Codex Stop reference](https://learn.chatgpt.com/docs/hooks#stop) defines JSON on stdin.
+Its fields include `session_id`, `turn_id`, `cwd`, `hook_event_name`, `stop_hook_active`, `transcript_path`, `model`, and `last_assistant_message`.
+A null `last_assistant_message` becomes an empty reply.
+Saved launch records can retain legacy `notify` arguments.
+The handler ignores their `agent-turn-complete` payloads.
+The global Stop hook supplies completion for those workers.
 The [Claude Stop reference](https://code.claude.com/docs/en/hooks#stop) defines JSON on stdin.
 Its fields include `session_id`, `transcript_path`, `cwd`, `permission_mode`, `hook_event_name`, `stop_hook_active`, and `last_assistant_message`.
 The hook uses the native id to select the worker.
 The hook applies the completion rule described above.
+
+### Stop hook deployment
+
+The director installs the hook after deployment.
+Each registered Codex home must trust the shared `hooks.json` handlers.
+
+1. Set `CODEX_HOME` to the account home and run `scripts/lib/py scripts/hooks/codex_hooks.py install`.
+2. Run `scripts/lib/py scripts/hooks/codex_hooks.py check` with the same `CODEX_HOME`.
+
+The installer reports the `turn-end` handler as trusted.
+A worker needs no new launch-line setting to use the installed Stop hook.
 
 ## Unit code reviewers
 

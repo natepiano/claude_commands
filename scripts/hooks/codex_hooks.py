@@ -6,6 +6,7 @@ SubagentStart. Their `*` matchers cover every session source and subagent type.
 Session sources include startup, resume, clear and compact; they are not tool
 names. PreCompact records the start of manual and automatic compaction.
 UserPromptSubmit and PostCompact clear the session's compaction marker.
+Stop sends worker turn completion to the shared handler.
 Listing and trust use the event, matcher, command and timeout together,
 so two events can share one script without sharing a trust identity.
 """
@@ -99,6 +100,7 @@ HOOKS: tuple[CodexHook, ...] = (
               "UserPromptSubmit", matcher="*"),
     CodexHook("compaction-clear-end", PythonHookScript("compaction-marker-clear.py"),
               "PostCompact", matcher="*"),
+    CodexHook("turn-end", PythonHookScript("../herdr/turn_end.py"), "Stop", matcher="*"),
 )
 
 
@@ -446,7 +448,7 @@ def _restore_moved_trust(
 
 def _listed_fields(hook: CodexHook) -> dict[str, object]:
     return {"command": hook.command, "eventName": hook.listed_event(),
-            "matcher": None if hook.event == "UserPromptSubmit" else hook.matcher,
+            "matcher": None if hook.event in ("UserPromptSubmit", "Stop") else hook.matcher,
             "handlerType": "command", "timeoutSec": hook.timeout}
 
 
