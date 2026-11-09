@@ -24,15 +24,22 @@ The remote registry uses `.remote-mirrors` below the configured copies root.
 Mac, Linux, and AWS copies use the same kind.
 The Mac path uses the validated `MacMirrorRoot` setting.
 
-The mirror lease precedes the floor claim lock.
-The floor claim lock precedes the copy-record lock.
+The mirror lease covers the claim read and the copy-record lock.
+The claim reader releases each admission lock before it returns its snapshot.
+`mirror_metadata_locks` holds only the copy-record lock.
+An outside mirror lease protects task parent removal.
+After acquisition, it rejects a missing or replaced lease path as busy.
+It deletes the outside lease file after parent removal, while both leases remain held.
+The existing sibling lease still protects a live lease from the old code.
 The receiver keeps `.copy-record.json`, `.copy-session`, and `.mac-test-mirror` during rsync deletion.
 Remote commands inherit the mirror lease.
 Process inspection also keeps mirrors with a working directory, a mapped file, or a file open for writing.
 A file open only for reading does not make a mirror busy.
 Unreadable process state prevents removal.
 
-The Mac floor sweep acquires idle mirror leases before the claim lock.
+The Mac floor sweep acquires idle mirror leases before it reads claims.
+It retains these leases through removal.
+It reads claims again before each removal group outside the acquired leases.
 The Linux floor sweep holds mirror leases while it checks and removes idle output.
 Admission takes available slot leases before it selects a claim.
 It releases unused slot leases after claim selection.

@@ -346,14 +346,17 @@ Neither caller has a copy-creation exception.
 `remote_lease_path(mirror)` names the lease beside the mirror's registry record.
 The claim service reads `/proc/locks` once and reports held mirrors by host, path, and session.
 A busy lease reads only its own registry record.
-The mirror lease precedes the floor claim lock, which precedes the copy-record lock.
-`mirror_metadata_locks` holds the claim and record locks inside the mirror lease.
-The remote command starts after these metadata locks close.
+The mirror lease covers the claim read and the copy-record lock.
+`read_claims` returns a snapshot after each short admission lock closes.
+`mirror_metadata_locks` holds only the copy-record lock inside the mirror lease.
+The remote command starts after the record lock closes.
 It retains the mirror lease until it ends.
 
 `mark_mirror` writes the record, session, and mark.
 `floor_claims.read_mirror_record` reads a record path, including removal authority.
-`floor_claims` owns the metadata names and the sibling lock paths.
+`floor_claims` owns the metadata names and mirror lock paths.
+An outside mirror lease survives task parent removal.
+The existing sibling lease remains in use for compatibility with live old leases.
 Content removal deletes metadata last, with the record after the session and mark.
 `remote_rsync` protects these names through explicit exclusions.
 Receive recovery keeps the existing owner and preserves a complete replacement record.
