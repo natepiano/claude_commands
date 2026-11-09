@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, NamedTuple, TypedDict, cast, override
 
 from scripts.production import staff, unit_lookup, staff_sources, unit_config, session_staff
+from scripts.herdr import pane_launch
 from scripts.herdr import herdr
 from scripts.shutdown import remote
 from scripts.lib import git_exclude
@@ -791,7 +792,7 @@ def launch_session(
     pending.parent.mkdir(parents=True, exist_ok=True)
     def published(transcript: herdr.SessionTranscript) -> None:
         write_text_atomic(pending, json.dumps({
-            "session_id": transcript.session_id, "config_dir": str(transcript.config_dir),
+            "session_id": transcript.session_id,
             "prompt": prompt, "launched_at": datetime.now(UTC).isoformat(),
         }) + "\n")
         _ = ensure_staff_unit(request.production, request.unit_id,
@@ -854,7 +855,14 @@ def finish_opening(request: UnitLaunch, marked: LabeledSessionFound) -> herdr.Pr
         if isinstance(observed, sessions.SessionLivenessUnknown):
             raise Refusal(f"cannot tell whether pending session {fields['session_id']} runs: {observed.reason}")
         raise Refusal("pending opening does not name the session that carries the unit's session label")
-    transcript = herdr.SessionTranscript(Path(fields["config_dir"]), fields["session_id"])
+    home = pane_launch.config_home(fields)
+    if isinstance(home, staff.HomeUnknown):
+        from scripts.accounts import accounts
+
+        print(f"anomaly: {fields['session_id']}: session home is unknown; select the normal account", file=sys.stderr)
+        selected = accounts.role_account("unit")
+        home = staff.SessionHome(selected.dir)
+    transcript = herdr.SessionTranscript(home.path, fields["session_id"])
     _ = ensure_staff_unit(request.production, request.unit_id,
         worktree=staff.PresentWorktree(remote.local_machine(), request.worktree.resolve()),
         runtime_id=transcript.session_id)
@@ -1252,12 +1260,13 @@ def ensure_staff_unit(production: Production, unit: str, *,
         if runtime_id and found.row.current_session != staff.native_id(runtime_id):
             raise Refusal(f"{unit}: native session conflicts with retained staff identity")
         if isinstance(worktree, staff.WorktreeUnfilled) or worktree == found.row.worktree:
-            return found.row
-        return staff.set_worktree(found.row.id, worktree, expected=found.row.worktree)
+            return pane_launch.staff_admitted(found.row)
+        return pane_launch.staff_admitted(staff.set_worktree(found.row.id, worktree, expected=found.row.worktree))
     if isinstance(worktree, staff.WorktreeUnfilled):
         raise Refusal(f"unit {unit}: no filled worktree for admission")
     runner = ensure_staff_showrunner(production)
-    return staff.ensure("unit", name=unit_names.name(unit), parent=staff.ReportsTo(runner.id), worktree=worktree, runtime_id=runtime_id)
+    return pane_launch.staff_admitted(staff.ensure("unit", name=unit_names.name(unit), parent=staff.ReportsTo(runner.id),
+                                                  worktree=worktree, runtime_id=runtime_id))
 
 def _main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser()

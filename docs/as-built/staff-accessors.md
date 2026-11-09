@@ -79,6 +79,11 @@ Each checkout therefore uses the same question store.
 
 The write functions are `ensure`, `ensure_worker`, `move`, `rename`, `retire`, and `retire_pending`.
 They also include `set_doc`, `set_worktree`, `update_current_session`, `set_hold`, `pause`, `exit`, and `resume`.
+`set_worker_role` writes the last dispatch role.
+`set_home` writes the home observed at pane start.
+`progress_history.begin_dispatch` writes every dispatch role, including Astra policies.
+The shared pane launch builder uses `set_home`.
+`add_unit.ensure_staff_unit`, worker pane admission, and `staff_sources.ensure_staff_showrunner` complete earlier pane publications.
 
 | File | Access | `staff` calls |
 |---|---|---|
@@ -117,7 +122,7 @@ They also include `set_doc`, `set_worktree`, `update_current_session`, `set_hold
 | `scripts/direct/phase_reservation.py` | read | snapshot, WorktreeUnfilled |
 | `scripts/direct/phase_table.py` | read | active, snapshot |
 | `scripts/direct/plan_history.py` | read | snapshot |
-| `scripts/direct/progress_history.py` | read | active, initial_snapshot, snapshot |
+| `scripts/direct/progress_history.py` | write | active, initial_snapshot, snapshot, set_worker_role |
 | `scripts/direct/recorder_fixture.py` | read | PresentWorktree |
 | `scripts/direct/remove_workers.py` | read | local_snapshot, runtime_id |
 | `scripts/direct/review.sh` | read | local_snapshot, StaffRow |
@@ -129,7 +134,7 @@ They also include `set_doc`, `set_worktree`, `update_current_session`, `set_hold
 | `scripts/hana_shot/hana_shot.py` | read | local_snapshot, runtime_id |
 | `scripts/herdr/herdr.py` | read | active, initial_snapshot, native_id, runtime_id |
 | `scripts/herdr/herdr_sessions.py` | read | initial_snapshot |
-| `scripts/herdr/pane_launch.py` | read | initial_snapshot |
+| `scripts/herdr/pane_launch.py` | write | initial_snapshot, local_snapshot, by_id, set_home |
 | `scripts/herdr/side_pane.py` | read | runtime_id |
 | `scripts/herdr/turn_end.py` | write | snapshot, backend, native_id, runtime_id, retire; worker_admission.parent, find_worker, transcript_source, transcript_entries |
 | `scripts/herdr/worker_panes.py` | write | snapshot, runtime_id, row_operation, slot_operation; worker_admission.publish |
@@ -155,6 +160,7 @@ They also include `set_doc`, `set_worktree`, `update_current_session`, `set_hold
 | `scripts/message/sessions.py` | read | current_session_target |
 | `scripts/message/unit_labels.py` | read | active, snapshot |
 | `scripts/nightly_review/nightly_review.py` | read | active, snapshot |
+| `scripts/nix_env/heal.py` | read | initial_snapshot |
 | `scripts/production/add_showrunner.py` | write | by_id, cli_result, initial_snapshot, native_id, operation, update_current_session |
 | `scripts/production/add_showrunner_test_support.py` | read | staff.json path |
 | `scripts/production/add_unit.py` | write | cli_result, ensure, initial_snapshot, native_id, operation, row_operation, set_worktree |

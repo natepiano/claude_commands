@@ -7,8 +7,8 @@ import shutil
 import subprocess
 import sys
 import unittest
-from datetime import datetime, timezone
 from dataclasses import replace
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import TypedDict, cast, final, override
 from unittest.mock import patch
@@ -469,20 +469,20 @@ class PaneReviewLauncherTests(unittest.TestCase):
         self.assertEqual(self.fixture.agent.submitted, [])
         self.assertEqual((self.phase / "review_status_1").read_text(), "error\n")
 
-    def test_review_incomplete_start_keeps_the_pane_without_either_stage(self) -> None:
+    def test_review_incomplete_start_closes_the_pane_without_either_stage(self) -> None:
         self.fixture.fixture.world.outcome = herdr.PromptNotSubmitted("startup hook failed")
         self.assert_start_not_delivered(worker.ExitCode.UNCERTAIN, "publication failed: startup hook failed")
         self.assertEqual(len(self.fixture.fixture.world.launches), 2)
-        self.assertEqual(self.fixture.fixture.world.closed, [])
+        self.assertEqual(self.fixture.fixture.world.closed, [("w1:p2", "terminal-w1:p2")])
 
-    def test_review_failed_publication_keeps_the_backend_without_either_stage(self) -> None:
+    def test_review_failed_publication_closes_the_backend_without_either_stage(self) -> None:
         rows = staff.snapshot().find(kind="worker", parent=self.fixture.fixture.parent.id)
         with patch.object(staff, "ensure_worker", side_effect=staff.StaffRefused("publication unavailable")):
             self.assert_start_not_delivered(worker.ExitCode.UNCERTAIN, "publication refused: publication unavailable")
         self.assertIn("review: publication failed: staff: review:", (self.phase / "review_agent_1.log").read_text())
         self.assertEqual(staff.snapshot().find(kind="worker", parent=self.fixture.fixture.parent.id), rows)
         self.assertEqual(len(self.fixture.fixture.world.launches), 2)
-        self.assertEqual(self.fixture.fixture.world.closed, [])
+        self.assertEqual(self.fixture.fixture.world.closed, [("w1:p2", "terminal-w1:p2")])
 
     def test_review_admission_failure_sends_neither_stage(self) -> None:
         launches = self.fixture.fixture.world.launches.copy()
@@ -539,14 +539,15 @@ class PaneReviewLauncherTests(unittest.TestCase):
                             self.assertEqual(unit_runs.held(staff.runtime_id(), root, root / "active"), [str(case.fixture.run_dir)])
                             result = invoke_cli(assign, assign.main, arguments, os.environ.copy(), ROOT)
                         self.assertEqual(result.returncode, worker.ExitCode.REFUSED, result.stdout + result.stderr)
-                        self.assertIn("role change blocked by active work: active dispatch has another role",
+                        self.assertIn("role change blocked by active work: submitted pass awaits completion",
                                       (case.phase / "impl_agent_1.log").read_text())
                         self.assertEqual(read_object(state_path)["status"], "active")
                         self.assertEqual(marker.read_text().strip(), str(case.fixture.run_dir))
                         self.assertEqual((case.phase / "impl_status_1").read_text(), "error\n")
                     else:
-                        case.assert_start_not_delivered(worker.ExitCode.REFUSED,
-                            "role change blocked by active work: active dispatch has another role")
+                        with patch("scripts.agents.detached_runs.live_runs", return_value=[object()]):
+                            case.assert_start_not_delivered(worker.ExitCode.REFUSED,
+                                "role change blocked by active work: a detached run is live")
                     self.assertEqual(case.fixture.agent.submitted, submitted)
                     self.assertEqual(progress_history.active_dispatch(opened.row.id, case.fixture.run_dir), active)
                     self.assertEqual(case.fixture.fixture.staff_state(), before)
@@ -632,7 +633,8 @@ class AssignLauncherTests(HookAssignmentFixture):
                 self.assertNotEqual(moved.current_session, row.current_session)
                 self.assertIsInstance(staff.backend(moved), staff.CodexBackend)
                 self.assertEqual(moved.parent, row.parent)
-                self.assertEqual(moved.to_json() | {"current_session": row.current_session}, row.to_json())
+                self.assertEqual(moved.to_json() | {"current_session": row.current_session},
+                                 replace(row, role=staff.KnownWorkerRole("impl")).to_json())
                 self.assertNotEqual(self.native.agent.submitted[-1][0], "w1:p1")
                 self.assertIsInstance(world.launches[-1], herdr.SplitPane)
                 extract = worker_admission.handoff_path(self.session_dir, row)
@@ -699,7 +701,7 @@ class AssignLauncherTests(HookAssignmentFixture):
         self.assertIn(self.native.agent.final, (phase / "impl2_summary.txt").read_text())
         self.assertIn("submitted", (phase / "impl2_agent.log").read_text())
         self.assertEqual(read_object(phase / "dispatch_2_paths.json")["worker"], "impl2")
-        self.assertEqual(staff.by_id(opened.row.id), opened.row)
+        self.assertEqual(staff.by_id(opened.row.id), replace(opened.row, role=staff.KnownWorkerRole("impl")))
 
     def test_assignment_reads_current_model_settings_for_the_next_launch(self) -> None:
         _ = self.successful("implement", "--new-worker", "first")
