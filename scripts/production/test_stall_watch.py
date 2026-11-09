@@ -39,7 +39,7 @@ from scripts.production.staff_test_support import isolated_staff_file, showrunne
 from scripts.production import fake_unit_host
 from scripts.production.fake_unit_host import HostedUnit
 from scripts.herdr import fake_herdr
-from scripts.herdr import herdr
+from scripts.herdr import herdr, worker_panes
 from scripts.production import stall_watch
 from scripts.production.session_pane import HerdrFailure, read_place, agent_status
 from scripts.hooks import context_usage
@@ -2537,20 +2537,51 @@ always=natedev
         self.assertEqual(len(self.sent()), 4)
 
     def test_running_shell_or_worker_launcher_prevents_a_bump(self) -> None:
-        for command in ("bash", "bash scripts/agents/agent_bg.sh"):
-            with self.subTest(command=command):
+        director = next(row for row in staff.find(kind="unit")
+                        if row.current_session == unit_session("unit-one"))
+        pane_worker = fixture_member("worker", name="test", parent=director.id)
+        cases = (
+            ("shell", "bash", herdr.AgentStatus.IDLE, "running"),
+            ("launcher", "bash scripts/agents/agent_bg.sh", herdr.AgentStatus.IDLE, "running"),
+            ("busy pane", "", herdr.AgentStatus.WORKING, "running"),
+            ("idle pane", "", herdr.AgentStatus.IDLE, "idle bump requested"),
+        )
+        for label, command, status, decision in cases:
+            with self.subTest(case=label):
                 self.state.mkdir(exist_ok=True)
                 for path in self.state.glob("*.json"):
                     path.unlink()
                 self.send_log.unlink(missing_ok=True)
-                _ = self.tick(START)
-                worker = subprocess.Popen(["sleep", str(TEST_HANG_GUARD_SECS)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                self.children.append(worker)
-                claude_pid = self.children[0].pid
-                self.process_rows.append(f"{worker.pid} {claude_pid} {command} running")
-                _ = self.tick(START + 300)
-                self.assertEqual(self.sent(), [])
-                _ = self.process_rows.pop()
+                with mock.patch.object(worker_panes, "observe_parents", return_value={}):
+                    initial = self.tick(START)
+                self.assertEqual(initial.returncode, 0, initial.stderr)
+                self.assertIn("inspected showrunner/unit-one: fresh", initial.stdout)
+                if command:
+                    worker = subprocess.Popen(["sleep", str(TEST_HANG_GUARD_SECS)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    self.children.append(worker)
+                    claude_pid = self.children[0].pid
+                    self.process_rows.append(f"{worker.pid} {claude_pid} {command} running")
+                observed: dict[staff.StaffId, list[worker_panes.WorkerPane]] = {
+                    director.id: [worker_panes.OpenWorker(pane_worker, "w2:p1", "worker-terminal", status)]}
+                with mock.patch.object(worker_panes, "observe_parents", return_value=observed):
+                    result = self.tick(START + 300)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn(f"inspected showrunner/unit-one: {decision}", result.stdout)
+                if command:
+                    _ = self.process_rows.pop()
+                if decision == "running":
+                    self.assertEqual(self.sent(), [])
+                    saved = cast(stall_watch.Stretch, json.loads(self.watches["unit-one"].stretch_path.read_text()))
+                    self.assertEqual(saved["since"], START + 300)
+                    with mock.patch.object(worker_panes, "observe_parents", return_value={}):
+                        fresh = self.tick(START + 301)
+                    self.assertEqual(fresh.returncode, 0, fresh.stderr)
+                    self.assertIn("inspected showrunner/unit-one: fresh", fresh.stdout)
+                    self.assertEqual(self.sent(), [])
+                else:
+                    sent = self.sent()
+                    self.assertEqual(len(sent), 2)
+                    self.assertEqual({item["key"].rsplit(":", 1)[-1] for item in sent}, {"bump", "tell"})
 
     def test_work_the_unit_started_outside_its_tree_prevents_a_bump(self) -> None:
         """A build a unit backgrounded is reparented away from its Claude but keeps the unit's marks."""
