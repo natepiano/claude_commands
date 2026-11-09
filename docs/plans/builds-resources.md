@@ -1972,7 +1972,7 @@ Every nextest run that lint starts prints one line after admission: `nextest: <g
 
 **Change-Review:** none — the queue view shows the same rows; the room rises only when an unregistered job caused the margin. Registered jobs take no margin today (`test_memory_admit.py:5809`).
 
-### Phase 89 — The Mac folder audit reads process use and acts  · status: todo
+### Phase 89 — The Mac folder audit reads process use and acts  · status: done
 
 **Depends on:** Phase 87 checkpoint. Approved by builds on 2026-11-08 ("go for the Mac folder audit phase"). Source: Phase 81 Round 9 (`/tmp/claude/unit/20523639-3e08-48d6-9277-73e052bca297/phases/81/mac_link_report.md`).
 
@@ -1985,7 +1985,7 @@ Every nextest run that lint starts prints one line after admission: `nextest: <g
 1. **The cause.** Every Mac audit run logs "0 removed". Each due folder is kept with `maker unknown: no /proc or lsof to show which processes use it` (10,835 rows in `~/Library/Logs/nate-jobs/folder-audit.log`). `lsof -n -P -w -F pfn` runs in a Mac shell in 0.2 s with exit 0. Find why `folder_audit.process_uses()` returns `ProcessUsesUnavailable` in the launchd job (`org.nixos.folder-audit`). Read only on the Mac. Run no audit against the real `/tmp` or `~/rust`.
 2. **The fix.** Fix the cause where it lives. builds' scope: `scripts/lint/folder_audit.py` (and `tmp_sweep.lsof_paths` if the defect is there). If the cause is in the nixos job, report it to the director before any change; nixos pushes go through the showrunner.
 3. **No new roots.** `~/.cache` stays out of every cleanup root. The creator of a folder registers its lifetime.
-4. **Proof.** When a Python defect is fixed, add a row to an existing `test_folder_audit.py` test of the process-use read for the Mac case. No new test file. builds decided on 2026-11-08: with no Python defect, change no Python and add no test row; the existing fallback test covers it. Then the phase ends with the report: the loaded job's PATH, its activation time, and the first audit run after the next Mac switch (removed count, NO_PROC rows). If the loaded job lacks `/usr/sbin`, send builds the nixos facts; builds takes the Mac switch to natedev.
+4. **Proof.** When a Python defect is fixed, add a row to an existing `test_folder_audit.py` test of the process-use read for the Mac case. No new test file. builds decided on 2026-11-08: with no Python defect, change no Python and add no test row; the existing fallback test covers it. Then the phase ends with the report: the loaded job's PATH and its activation time. builds decided on 2026-11-08: do not hold the checkpoint for the first audit run. The director reads that run (removed count, NO_PROC rows) and sends it to builds as a note. If it still removes nothing, builds makes a new phase. If the loaded job lacks `/usr/sbin`, send builds the nixos facts; builds takes the Mac switch to natedev.
 5. **As-built.** Name the Phase 44 gap: the old standing `~/rust/hana_catalyst_mac` clone had no lifetime after the runner moved to scratch clones. The director removed its 85.8 GiB target on 2026-11-08 with builds' go; that closes the gap.
 
 **Constraints from prior phases:**
