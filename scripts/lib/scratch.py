@@ -743,6 +743,9 @@ def checked_removal(path: Path) -> copy_record.Registered | copy_record.NotRegis
 def task_of(path: Path, *,
     scratch_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
 ) -> copy_record.Registered | copy_record.NotRegistered | copy_record.UnreadableRecord:
+    """Read folder task evidence; plain files have no task record."""
+    if os.path.isfile(path):
+        return copy_record.NotRegistered()
     record = copy_record.read_record(path / copy_record.RECORD)
     return pending_removal(path, scratch_settings=scratch_settings) if isinstance(record, copy_record.NotRegistered) else record
 
