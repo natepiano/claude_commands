@@ -344,7 +344,11 @@ A static Python graph selects a test module under four rules:
 1. The test module changed.
 2. The test module directly imports a changed Python file.
 3. The test module names a changed path as a complete token.
-4. The test module shares a folder with a changed Python source file that is not a test module.
+4. The test module shares a folder with a changed non-test Python file and names its stem as a whole word.
+
+The fourth rule counts names in imports, strings, and comments.
+Removed source files also count.
+The selector reads that text only when no earlier rule selects the module.
 
 Only test modules have graph rows. All Python paths can resolve imports.
 A removed Python file uses import facts from the base.

@@ -353,8 +353,7 @@ class AffectedModulesTests(unittest.TestCase):
             with self.subTest(path=path):
                 self.write(path, "# changed\n")
                 _ = self.commit()
-                expected = tuple(self.modules) if path == "scripts/other/conftest.py" else ()
-                self.assertEqual(self.selection().modules, expected)
+                self.assertEqual(self.selection().modules, ())
                 self.certify()
 
     def test_deleted_and_renamed_python_sources_select_direct_importers(self) -> None:
@@ -426,11 +425,23 @@ class AffectedModulesTests(unittest.TestCase):
         self.add_test("checks/test_direct.py", "import scripts.component.subject\n")
         self.add_test("checks/test_indirect.py", "import scripts.adapters.adapter\n")
         self.add_test("component/test_neighbor.py", "VALUE = 1\n")
+        self.add_test("component/test_named.py", "SOURCE = 'subject.py'\n")
+        self.add_test("component/test_plain.py", "import subject\n")
+        self.add_test("component/test_comment.py", "# subject\n")
+        self.add_test("component/test_fragment.py", "SOURCE = 'subjects my_subject subject_helper'\n")
+        self.add_test("checks/test_named.py", "SOURCE = 'subject.py'\n")
         self.certify()
         self.write("scripts/component/subject.py", "VALUE = 2\n")
         _ = self.commit()
-        self.assertCountEqual([path.name for path in self.selection().modules],
-                              ["test_direct.py", "test_neighbor.py"])
+        for removed in (False, True):
+            with self.subTest(removed=removed):
+                if removed:
+                    (self.repo / "scripts/component/subject.py").unlink()
+                    _ = self.commit()
+                self.assertCountEqual(self.selection().modules,
+                                      [self.repo / "scripts" / path for path in
+                                       ("checks/test_direct.py", "component/test_named.py",
+                                        "component/test_plain.py", "component/test_comment.py")])
 
     def test_complete_path_tokens_select_only_the_test_that_names_the_path(self) -> None:
         self.write("config/custom.json", "{}\n")
