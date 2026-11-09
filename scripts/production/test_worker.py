@@ -52,6 +52,8 @@ class DispatchAgent:
         self.answer_inputs: dict[str, str] = {}
         self.answer_enters: dict[str, int] = {}
         self.waited: list[str] = []
+        self.start_waits: list[tuple[str, list[str]]] = []
+        self.start_wait_times_out = True
         self.finish_after = 0
         self.wait_count = 0
         self.final = "The work is complete."
@@ -184,9 +186,17 @@ class DispatchAgent:
     def run(self, args: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
         if args[0] != "/nonexistent/herdr":
             return self.run_process(args, **kwargs)
+        action, pane = args[4:6]
+        if action == "wait" and "--until" in args:
+            self.start_waits.append((pane, args[6:]))
+            if self.start_wait_times_out:
+                return subprocess.CompletedProcess(args, 1, json.dumps({
+                    "error": {"code": "timeout", "message": "the worker did not start"}}), "")
+            self.error = ""
+            self.fixture.world.locations[pane]["agent_status"] = "working"
+            return subprocess.CompletedProcess(args, 0, "{}", "")
         self.fixture.assertNotIn("--timeout", args)
         self.fixture.assertNotIn("--until", args)
-        action, pane = args[4:6]
         if action == "prompt":
             line = args[6]
             self.fixture.assertEqual(args[-1], "--wait")
@@ -196,7 +206,7 @@ class DispatchAgent:
             if self.interrupt == "prompt":
                 self.interrupt = ""
                 raise OSError("interrupted after prompt")
-            self.fixture.world.locations[pane]["agent_status"] = "working"
+            self.fixture.world.locations[pane]["agent_status"] = "idle" if self.error == "agent_prompt_stalled" else "working"
             if self.finish_after == 0 and not self.error:
                 self.complete(pane)
         elif action == "wait":
@@ -274,7 +284,8 @@ class WorkerCommandTests(unittest.TestCase):
         self.addCleanup(self.fixture.doCleanups)
         config = self.fixture.root / "conf/direct.conf"
         atomic_file.write_text_atomic(config, config.read_text().replace("WORKER_TRANSPORT=mesh", "WORKER_TRANSPORT=herdr")
-                                      + "# range: 1..600\nWORKER_SETTLE_SECONDS=30\n")
+                                      + "# range: 1..600\nWORKER_SETTLE_SECONDS=30\n"
+                                      + "# range: 1..600\nWORKER_PROMPT_START_SECONDS=60\n")
         self.agent = DispatchAgent(self.fixture)
         self.agent.pane_commands(self)
         self.run_dir = self.fixture.root / "run"
@@ -1085,13 +1096,34 @@ class WorkerCommandTests(unittest.TestCase):
                 self.assertIsInstance(receipt, worker.DispatchWaitingForRuns if pending else worker.DispatchComplete)
 
     def test_stalled_dispatch_returns_stalled_and_never_retypes(self) -> None:
-        self.agent.error = "agent_prompt_stalled"
-        self.assertEqual(self.dispatch(), worker.ExitCode.STALLED)
-        self.assertEqual(len(self.agent.submitted), 1)
-        self.agent.error = ""
-        self.agent.finish_after = 1
-        self.assertEqual(self.dispatch(), worker.ExitCode.OK)
-        self.assertEqual(len(self.agent.submitted), 1)
+        config = self.fixture.root / "conf/direct.conf"
+        settings = config.read_text()
+        for times_out, seconds in ((True, 13), (False, 73)):
+            with self.subTest(times_out=times_out, seconds=seconds):
+                atomic_file.write_text_atomic(config, settings.replace("WORKER_PROMPT_START_SECONDS=60",
+                                                                      f"WORKER_PROMPT_START_SECONDS={seconds}"))
+                name = "timeout" if times_out else "delayed"
+                submitted = len(self.agent.submitted)
+                self.agent.error = "agent_prompt_stalled"
+                self.agent.start_wait_times_out = times_out
+                self.agent.finish_after = 1
+                with redirect_stderr(io.StringIO()) as errors:
+                    self.assertEqual(self.dispatch(name), worker.ExitCode.STALLED if times_out else worker.ExitCode.OK)
+                pane = self.agent.submitted[-1][0]
+                self.assertEqual(self.agent.start_waits[-1], (pane, ["--until", "working", "--until", "blocked",
+                    "--until", "done", "--timeout", str(seconds * 1000)]))
+                self.assertEqual(len(self.agent.submitted), submitted + 1)
+                if times_out:
+                    self.assertIn("the worker did not start", errors.getvalue())
+                    self.assertIn(pane, self.fixture.world.locations)
+                    self.agent.error = ""
+                    self.fixture.world.locations[pane]["agent_status"] = "working"
+                    self.assertEqual(self.dispatch(name), worker.ExitCode.OK)
+                    self.assertEqual(len(self.agent.submitted), submitted + 1)
+                else:
+                    self.assertEqual(errors.getvalue(), "")
+                self.assertIn(self.agent.final, self.reply.read_text())
+                self.assertNotIn(pane, self.fixture.world.locations)
 
     def test_blocked_dispatch_returns_blocked(self) -> None:
         opened = self.opened()
