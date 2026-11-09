@@ -838,7 +838,7 @@ class FilteredPromiseTests(unittest.TestCase):
 
     def test_legacy_package_selection_recovers_anonymous_peaks_for_an_unseen_filter(self) -> None:
         # These cargo-handler rows supplied the indexed tier on 2026-10-21.
-        # No exact row matches the new filter, so the package p90 sets the promise.
+        # No exact row matches the new filter, so the package ranked peak sets the promise.
         samples = (
             ("v20261021T155249-4110155-296", 833_626_112, 3_038_146_560,
              "light_running_and_waiting_stems"),
@@ -2214,14 +2214,20 @@ class TestPhaseChargeTests(MemoryQueueFixture):
     def test_estimate_codecs_keep_their_domains_and_missing_states(self) -> None:
         bases: tuple[admission_records.NeedBasis | admission_records.BasisNotRecorded, ...] = (
             "measured", "buildlog", "pooled", "fallback", admission_records.BasisNotRecorded(),
-            admission_records.ShapeP90(10, admission_records.FailedPeakFloor(4 * GIB, HISTORY_AT.isoformat()),
+            admission_records.ShapeRankedPeak(10, 10, admission_records.FailedPeakFloor(4 * GIB, HISTORY_AT.isoformat()),
                           admission_records.LegacyDevMultiplierHeadroom(), admission_records.CappedAtBudget(25 * GIB, admission_records.CapNotRecorded())),
+            admission_records.ShapeRankedPeak(20, 50),
             admission_records.ShapeLargest(2, factor=admission_records.ReleaseHeadroom(admission_records.read_memory_config(report=False).release_headroom)), admission_records.ShapeFallback())
         for basis in bases:
             with self.subTest(basis=basis):
                 encoded = gate.need_basis_record(basis)
                 self.assertEqual(gate.read_need_basis(encoded), basis)
                 self.assertEqual(gate.read_test_phase_need(encoded), gate.NoTestPhaseNeed("not_recorded"))
+        legacy_shape = gate.need_basis_record(admission_records.ShapeRankedPeak(14, 50))
+        legacy_shape["kind"] = "shape_p90"
+        del legacy_shape["share_percent"]
+        with patch.object(progress, "peak_share_percent", side_effect=AssertionError("legacy shape read current share")):
+            self.assertEqual(gate.read_need_basis(legacy_shape), admission_records.ShapeRankedPeak(14, 10))
         for need in (self.phase_need, replace(self.phase_need, margin=1.75), gate.NoTestPhaseNeed("no_width"),
                      gate.NoTestPhaseNeed("no_history"), gate.NoTestPhaseNeed("not_recorded")):
             with self.subTest(need=need):
@@ -2730,8 +2736,8 @@ class BuildPromiseFixture(MemoryQueueFixture):
     def estimate(self, shape: BuildShape = RELEASE_SHAPE, *, now: datetime = NOW) -> admission_records.ExpectedPeak:
         return step_estimator.expected_peak(HANA, "build", "test-host", now, self.root, shape=shape, first_peak_bytes=admission_configuration_fixture().program_first_peaks["cargo"])
 
-    def same_shape_basis(self, peak: admission_records.ExpectedPeak) -> admission_records.ShapeP90 | admission_records.ShapeLargest:
-        if not isinstance(peak.basis, (admission_records.ShapeP90, admission_records.ShapeLargest)):
+    def same_shape_basis(self, peak: admission_records.ExpectedPeak) -> admission_records.ShapeRankedPeak | admission_records.ShapeLargest:
+        if not isinstance(peak.basis, (admission_records.ShapeRankedPeak, admission_records.ShapeLargest)):
             self.fail(f"expected a same-shape history basis, got {peak.basis}")
         return peak.basis
 
@@ -2930,13 +2936,17 @@ class BuildShapePromiseTests(BuildPromiseFixture):
         self.assertEqual((peak.bytes, peak.count), (step_estimator.shape_headroom_bytes(9 * GIB, self.release_headroom), 9))
         self.assertIsInstance(peak.basis, admission_records.ShapeLargest)
 
-    def test_ten_same_shape_runs_use_p90(self) -> None:
-        for _ in range(9):
-            self.sample(3)
-        self.sample(10)
-        peak = self.estimate()
-        self.assertEqual((peak.bytes, peak.count), (step_estimator.shape_headroom_bytes(3 * GIB, self.release_headroom), 10))
-        self.assertEqual(peak.basis, admission_records.ShapeP90(10, admission_records.NoFloor(), self.release_headroom, admission_records.UnderBudget()))
+    def test_same_shape_ranked_peak_records_the_selected_share(self) -> None:
+        for value in range(1, 21):
+            self.sample(value)
+        for share, base in ((10, 18), (50, 10)):
+            with self.subTest(share=share):
+                write_memory_config(self.root / "build_admission.conf", peak_history_share_percent=str(share))
+                peak = self.estimate()
+                self.assertEqual((peak.bytes, peak.count),
+                                 (step_estimator.shape_headroom_bytes(base * GIB, self.release_headroom), 20))
+                self.assertEqual(peak.basis,
+                                 admission_records.ShapeRankedPeak(20, share, admission_records.NoFloor(), self.release_headroom, admission_records.UnderBudget()))
 
     def test_profile_fallback_uses_release_builds_and_never_the_dev_pool(self) -> None:
         self.sample(13, shape=build_shape(["cargo", "build", "--release", "--lib"]))
@@ -3420,7 +3430,7 @@ class BuildNeedBasisTests(BuildPromiseFixture):
 
     def test_every_shape_tier_round_trips_with_floor_factor_and_cap(self) -> None:
         floor = admission_records.FailedPeakFloor(16 * GIB, "2026-10-05T12:00:00Z")
-        for basis in (admission_records.ShapeP90(10, floor, self.release_headroom, admission_records.CappedAtBudget(24 * GIB, 21 * GIB)),
+        for basis in (admission_records.ShapeRankedPeak(10, 10, floor, self.release_headroom, admission_records.CappedAtBudget(24 * GIB, 21 * GIB)),
                       admission_records.ShapeLargest(2, floor, self.release_headroom, admission_records.UnderBudget()),
                       admission_records.ShapeLargest(2, factor=admission_records.DevSizeHeadroom(1.25, 2 * GIB)),
                       admission_records.ShapeFallback(admission_records.CappedAtBudget(24 * GIB, 21 * GIB)),
@@ -3468,6 +3478,7 @@ class ProgramProfileTests(MemoryQueueFixture):
 
 
     def test_gate_history_uses_recent_host_peaks_at_p90(self) -> None:
+        write_memory_config(self.root / "build_admission.conf", peak_history_share_percent="10")
         history = gate.admission_dir(self.root) / "anon_peaks.jsonl"
         excluded = [
             {"step": "nextest", "host": "host", "anon_peak_bytes": 100 * GIB, "ended_at": store.utc_iso(HISTORY_AT.timestamp())},
@@ -3475,12 +3486,14 @@ class ProgramProfileTests(MemoryQueueFixture):
             {"step": "merge-gate", "host": "host", "anon_peak_bytes": 100 * GIB,
              "ended_at": store.utc_iso((NOW - timedelta(days=step_estimator.HISTORY_DAYS + 1)).timestamp())},
         ]
-        cases = (
-            (tuple(value * GIB for value in range(1, 11)), 9 * GIB),
+        cases: list[tuple[tuple[int, ...], int]] = [
             ((9 * GIB // 2,) * 20 + (26 * GIB,), 9 * GIB // 2),
-        )
+        ]
+        cases.extend((tuple(value * GIB for value in range(1, count + 1)), ((90 * count + 99) // 100) * GIB)
+                     for count in range(1, 51))
         for peaks, expected in cases:
             with self.subTest(peaks=peaks):
+                self.assertEqual(step_estimator.percentile(list(reversed(peaks))), expected)
                 rows = [{"step": "merge-gate", "host": "host", "anon_peak_bytes": peak,
                          "ended_at": store.utc_iso((NOW - timedelta(hours=1)).timestamp())}
                         for peak in peaks]
@@ -3504,8 +3517,10 @@ class ProgramProfileTests(MemoryQueueFixture):
         profile = admission_records.ProgramProfile("merge-gate", "installed/.claude", "checkout",
             admission_records.HistoryPeakSizing(4 * GIB, admission_records.FirstProgramPeak(4 * GIB),
                 NOW_EPOCH - admission_policy_fixture().timing.estimate_refresh_seconds))
-        def estimate(program: str, host: str, now: datetime, root: Path, cap: int) -> admission_records.MeasuredProgramPeak:
+        def estimate(program: str, host: str, now: datetime, root: Path, cap: int, *,
+                     share_percent: int | progress.ConfiguredPeakShare) -> admission_records.MeasuredProgramPeak:
             self.assertEqual((program, cap, now, root), ("merge-gate", 4 * GIB, NOW, self.root))
+            self.assertIs(share_percent, progress.CONFIGURED_PEAK_SHARE)
             self.assertTrue(host)
             return admission_records.MeasuredProgramPeak(6 * GIB, 2)
         with patch.object(step_estimator, "program_peak_estimate", side_effect=estimate) as refreshed, \
@@ -5694,8 +5709,9 @@ class ConfiguredAdmissionPolicyTests(MemoryQueueFixture):
         with tempfile.TemporaryDirectory() as directory:
             config = Path(directory) / "build_admission.conf"
             for key in ("estimate_refresh_seconds", "slot_gap_seconds", "program_first_peak_gib.cargo",
-                        "ci_memory_margin_gib"):
-                for bad in (None, "invalid"):
+                        "ci_memory_margin_gib", "peak_history_share_percent"):
+                invalid_values = (None, "invalid", "70") if key == "peak_history_share_percent" else (None, "invalid")
+                for bad in invalid_values:
                     with self.subTest(key=key, value=bad), patch.dict(os.environ, {"CONF_DIR": directory}):
                         write_memory_config(config, **{key: bad})
                         result = gate.read_admission_configuration()
@@ -5714,6 +5730,8 @@ class ConfiguredAdmissionPolicyTests(MemoryQueueFixture):
                             self.assertEqual(repaired.config.policy.timing.slot_gap_seconds, 7)
                         elif key == "ci_memory_margin_gib":
                             self.assertEqual(repaired.config.policy.ci_memory_margin_bytes, 7 * GIB)
+                        elif key == "peak_history_share_percent":
+                            self.assertEqual(repaired.peak_history_share_percent, 7)
                         else:
                             self.assertEqual(repaired.config.program_first_peaks["cargo"], 7 * GIB)
 

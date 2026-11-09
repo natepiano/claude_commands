@@ -1990,3 +1990,22 @@ Every nextest run that lint starts prints one line after admission: `nextest: <g
 - The plist file time is not the launchd load time; `launchctl print` shows no load time.
 
 **Ruled out:** a Python change or a new test row for the Mac case — the existing fallback test covers the `lsof` path.
+
+### Phase 90 — Find why the Mac drops off the network under test load, and propose the fix  · status: done
+
+#### As-built
+
+- The Mac drops of 11-08 13:35 EST and 11-09 02:23 EST are clamshell sleep: the MacBook lid was closed with no external display, so macOS slept. It did not restart (uptime 21 days). Tailscale and ssh stop because the Mac sleeps.
+- `pmset -g log` shows `Entering Sleep state due to 'Clamshell Sleep'` at both times. On 11-08 the charger came off at the same moment (`Using Batt`); the Mac woke only at 22:01:45 on `USB-C_plug` and `DarkWake to FullWake`.
+- Short dark wakes (2 to 45 s) explain the brief returns that natedev saw. A 14-minute dark wake (02:48 to 03:02 on 11-09) ran tests with the lid closed and ended in `Dark Wake Thermal Emergency`.
+- At 03:19 on 11-09: `AppleClamshellState = Yes`, only the internal display, AC power, `pmset` `sleep 0`. `sleep 0` does not stop a clamshell sleep.
+- builds accepted the cause and asked the user to open the lid. No config or concurrency change. No lid-state check (builds: no new check without the user's ask).
+
+**Files:** none changed. Records are in the run folder under `phases/90/`.
+
+**Gotchas:**
+- The Mac is a MacBook. A closed lid with no external display sleeps it whatever `pmset sleep` says.
+- `pmset disablesleep 1` with a closed lid is not a fix: the 11-09 thermal emergency shows a closed Mac overheats under test load.
+- Tailscale control can list the Mac as online for minutes after it sleeps; an ssh timeout with `online=yes` is the sign.
+
+**Ruled out:** a kernel panic and restart (uptime 21 days); memory pressure as the cause (the pmset log names clamshell sleep for each drop); a nextest concurrency change.
