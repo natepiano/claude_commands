@@ -256,13 +256,12 @@ def setUpModule() -> None:
 
     unittest.addModuleCleanup(restore_pane_environment)
     # No test sees a real sign-in; the synthetic selection predates every fake server.
-    home = tempfile.TemporaryDirectory(dir="/tmp", prefix="codex-fixture-home-")
+    home = tempfile.TemporaryDirectory(prefix="codex-fixture-home-")
+    unittest.addModuleCleanup(home.cleanup)
     usage = tempfile.TemporaryDirectory()
+    unittest.addModuleCleanup(usage.cleanup)
     restore_usage = set_environment("USAGE_STATE_DIR", usage.name)
     restore_home = set_environment("HOME", home.name)
-    temporary_root = patch.object(tempfile, "tempdir", "/tmp")
-    _ = temporary_root.start()
-    unittest.addModuleCleanup(temporary_root.stop)
     for key in ("CODEX_THREAD_ID", "CLAUDE_CODE_SESSION_ID", "UNIT_RUN_DIR",
                 "PLAN_DELEGATE_RUN_DIR", "PLAN_DELEGATE_BOARD_DIR"):
         unittest.addModuleCleanup(set_environment(key, ""))
@@ -321,8 +320,6 @@ def setUpModule() -> None:
         restore_usage()
         restore_home()
         restore_notes()
-        usage.cleanup()
-        home.cleanup()
 
     unittest.addModuleCleanup(restore)
     # Holderless legacy fixtures have no synthetic ancestry; never inspect this test runner's parents.

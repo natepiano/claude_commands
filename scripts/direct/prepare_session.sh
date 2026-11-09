@@ -28,6 +28,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 "${SCRIPT_DIR}/../lib/py" "${SCRIPT_DIR}/remove_workers.py" || true
 
 SESSION_ID="$(uuidgen | tr '[:upper:]' '[:lower:]')"
+# The unit uses this session folder after preparation exits.
 SESSION_DIR="$("${SCRIPT_DIR}/../lib/py" "${SCRIPT_DIR}/../lib/build_folders.py" stable --unit-root --name "${SESSION_ID}")"
 
 DIRECTOR_SESSION_ID="${CODEX_THREAD_ID:-${CLAUDE_CODE_SESSION_ID:-}}"

@@ -200,6 +200,29 @@ class MergeGateCheckpointTests(MergeGateFixture):
         self.assertRegex(result.stdout, r"(?m)^folder_from_the_checkout: OK \d+\.\d+s$")
         self.assertEqual(self.pass_records()[0]["suites"], ["folder_from_the_checkout"])
 
+    def test_module_folders_are_removed_after_success_and_preparation_error(self) -> None:
+        prepare = merge_gate.test_module_environment
+        for fails in (False, True):
+            with self.subTest(raises=fails):
+                folders: list[Path] = []
+
+                def prepare_module(root: Path, environment: dict[str, str]) -> dict[str, str]:
+                    folders.append(root)
+                    self.assertTrue(root.is_dir())
+                    if fails:
+                        raise RuntimeError("module preparation failed")
+                    return prepare(root, environment)
+
+                with mock.patch.object(merge_gate, "test_module_environment", side_effect=prepare_module):
+                    if fails:
+                        with self.assertRaisesRegex(RuntimeError, "module preparation failed"):
+                            _ = self.run_gate("--tests-only", "--full", type_dirs=())
+                    else:
+                        result = self.run_gate("--tests-only", "--full", type_dirs=())
+                        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertTrue(folders)
+                self.assertTrue(all(not folder.exists() for folder in folders), folders)
+
     def test_nested_modules_run_and_retry_from_their_own_folder_under_the_top_suite(self) -> None:
         nested = self.checkout / "scripts" / "hooks" / "tests" / "test_first.py"
         self.write(nested, SUITE_MODULE)

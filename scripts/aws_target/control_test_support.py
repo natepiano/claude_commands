@@ -17,7 +17,7 @@ from unittest import mock
 from scripts.aws_target import ledger, remote
 from scripts.build_queue import queue_snapshot
 from scripts.mac_test import mac_test
-from scripts.aws_target.ledger_test_support import CostFixture, instant
+from scripts.aws_target.ledger_test_support import CostFixture, account_reply, instant
 from scripts.lint import memory_admit
 from scripts.lint.memory_test_support import admission_policy_fixture, fake_memory_readings
 
@@ -68,7 +68,7 @@ class AwsReplies:
         elif "describe-spot-price-history" in words:
             document = {"SpotPriceHistory": [{"Timestamp": self.generation, "SpotPrice": "0.25"}]}
         elif "get-cost-and-usage" in words:
-            document = {"ResultsByTime": []}
+            document = account_reply(arguments)
         else:
             raise AssertionError(f"Unexpected AWS operation: {words}")
         return subprocess.CompletedProcess(words, 0, json.dumps(document), "")
