@@ -10,6 +10,7 @@ import json
 import os
 from pathlib import Path
 import sqlite3
+import socket
 import subprocess
 import tempfile
 from typing import Literal, TextIO, cast, final, override
@@ -17,7 +18,9 @@ import unittest
 from unittest.mock import patch
 
 from scripts.usage import context_economy as economy
-from scripts.usage.context_economy_read import CompactionEvent, Request, Session, SettingsSet, Start
+from scripts.usage.context_economy_read import (
+    CompactionEvent, MacReadFailed, MacSessions, Request, Session, SettingsSet, SizeNotReported, Start,
+)
 
 
 BEGIN = datetime(2026, 11, 2, tzinfo=timezone.utc)
@@ -50,7 +53,7 @@ def quantity_session() -> Session:
     ], [
         CompactionEvent(at(150), "auto", 1000, 100, "normal"),
         CompactionEvent(at(330), "manual", 2000, 200, "precomputed"),
-        CompactionEvent(at(1590), None, None, None, "unknown"),
+        CompactionEvent(at(1590), None, SizeNotReported(), SizeNotReported(), "unknown"),
     ], [Start(at(0), "startup", "2.1.0")], at(0))
 
 
@@ -113,7 +116,8 @@ class ContextEconomyTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
-        for folder in (self.projects, self.checkout, self.root / "config", self.root / "home", self.store.parent):
+        for folder in (self.projects, self.checkout, self.root / "config", self.root / "home", self.store.parent,
+                       self.root / "codex-sessions"):
             folder.mkdir(parents=True, exist_ok=True)
         self.configure()
         _ = cast(object, self.enterContext(patch.dict(os.environ, {
@@ -121,6 +125,8 @@ class ContextEconomyTests(unittest.TestCase):
             "USAGE_STATE_DIR": str(self.root / "state"), "CONTEXT_ECONOMY_CHECKOUT": str(self.checkout),
             "USER_ZONE": "UTC", "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull,
         })))
+        _ = cast(object, self.enterContext(patch.object(economy, "read_mac", return_value=MacSessions([], []))))
+        _ = cast(object, self.enterContext(patch.object(socket, "gethostname", return_value="fixture")))
 
     def configure(self, *, min_requests: int = 1, active_gap_seconds: int = 600) -> None:
         _ = (self.root / "config/context_economy.conf").write_text(
@@ -131,7 +137,7 @@ class ContextEconomyTests(unittest.TestCase):
 
     def report(self, sessions: list[Session], timeline: list[SettingsSet], *, by: Literal["settings", "week"] = "settings",
                role: str = "") -> economy.Report:
-        return economy.build_report(sessions, timeline, self.store, at(-60), at(14 * 86400), by=by, role=role)
+        return economy.build_report(sessions, {"fixture": timeline}, self.store, at(-60), at(14 * 86400), by=by, role=role)
 
     def record_role(self, session: Session, role: str) -> None:
         with closing(sqlite3.connect(self.store)) as database:
@@ -144,9 +150,12 @@ class ContextEconomyTests(unittest.TestCase):
 
     def cli(self, *arguments: str) -> tuple[int, str, str]:
         output, errors = io.StringIO(), io.StringIO()
+        paths = ["--projects-root", str(self.projects), "--store", str(self.store),
+                 "--checkout", str(self.checkout), "--saved-results", str(self.saved)]
+        if arguments[0] != "trend":
+            paths.extend(("--codex-root", str(self.root / "codex-sessions")))
         with redirect_stdout(output), redirect_stderr(errors):
-            status = economy.main([*arguments, "--projects-root", str(self.projects), "--store", str(self.store),
-                                   "--checkout", str(self.checkout), "--saved-results", str(self.saved)])
+            status = economy.main([*arguments, *paths])
         return status, output.getvalue(), errors.getvalue()
 
     def git(self, *arguments: str, seconds: int = -120) -> str:
@@ -349,6 +358,21 @@ class ContextEconomyTests(unittest.TestCase):
                      "Claude Code version"):
             self.assertIn(name, confounds)
 
+        explicit_null = replace(settings(), commit="explicit-null", values={
+            **settings().values, "precomputeCompactionEnabled": None,
+        })
+        absent = replace(explicit_null, commit="absent", values={
+            key: value for key, value in explicit_null.values.items() if key != "precomputeCompactionEnabled"
+        })
+        for previous, following, changed in ((explicit_null, absent, True), (absent, explicit_null, True),
+                                             (explicit_null, explicit_null, False)):
+            with self.subTest(previous=previous.commit, following=following.commit):
+                before = self.report([sample_session("before", 12)], [previous])
+                after = self.report([sample_session("after", 12, 2)], [following])
+                output = economy.compare_reports(before, after)
+                line = next(line for line in output.splitlines() if line.startswith("confounds:"))
+                self.assertEqual("precomputeCompactionEnabled" in line, changed)
+
     def test_compare_requires_ten_samples_on_both_sides_for_a_percent_change(self) -> None:
         for before_n, after_n, too_few in ((9, 10, True), (10, 9, True), (10, 10, False)):
             with self.subTest(before_n=before_n, after_n=after_n):
@@ -379,6 +403,18 @@ class ContextEconomyTests(unittest.TestCase):
                          (before.settings_values, before.settings_commit, "unit director", MODEL,
                           8, before.cli_versions, before.quantities))
         self.assertEqual({path.name for path in self.saved.iterdir()}, {"before.json"})
+
+        codex = replace(session, machine="mac", family="codex", session_id="codex", agent_id="codex")
+        both = economy.build_report([session, codex], {"fixture": [settings()], "mac": [settings(enabled=False)]},
+                                    self.store, at(0), at(3600))
+        path = economy.save_result("both-machines", both, self.saved)
+        restored = economy.read_result(path)
+        self.assertEqual([(group.machine, group.family, group.requests) for group in restored.groups],
+                         [("fixture", "claude", 8), ("mac", "codex", 8)])
+        self.assertEqual(restored, both)
+        raw = cast(dict[str, object], json.loads(path.read_text(encoding="utf-8")))
+        rows = cast(list[dict[str, object]], raw["groups"])
+        self.assertEqual([(row["machine"], row["family"]) for row in rows], [("fixture", "claude"), ("mac", "codex")])
 
     def test_week_rows_mark_new_settings_versions_and_models_in_their_first_week(self) -> None:
         first = sample_session("week-one", 3)
@@ -475,6 +511,165 @@ class ContextEconomyTests(unittest.TestCase):
         self.assertIn("2026-11-01", output)
         self.assertTrue("-05:00" in output or "EST" in output, output)
         self.assertEqual(len(quantity_rows(output, "context_per_request")), 1, output)
+
+    def test_each_machine_uses_its_own_timeline_for_the_same_commits(self) -> None:
+        on, off = settings(), settings(600, enabled=False)
+        mac_on, mac_off = replace(on, at=at(-120)), replace(off, at=at(1800))
+        local = replace(sample_session("same-id", 4, offset=900), machine="natedev")
+        remote = replace(local, machine="mac")
+        report = economy.build_report([local, remote], {"natedev": [on, off], "mac": [mac_on, mac_off]},
+                                      self.store, at(0), at(3600))
+        self.assertCountEqual([(group.machine, group.settings_commit, group.requests) for group in report.groups],
+                              [("natedev", off.commit, 4), ("mac", on.commit, 4)])
+        self.assertEqual(report.role_quantities["unknown"]["context_per_request"].n, 8)
+        output = economy.render_report(report)
+        rows = quantity_rows(output, "context_per_request")
+        self.assertEqual({row[0] for row in rows}, {"mac", "natedev"})
+        self.assertIn("| machine | family |", output)
+
+    def test_unweighted_models_keep_context_samples_without_cost_samples(self) -> None:
+        session = replace(sample_session("codex", 4), family="codex", requests=[
+            Request(at(60), "gpt-6.1-sol", "0.9", 80, 20, 0, 0, 5),
+            Request(at(120), "codex-model-unweighted", "0.9", 180, 20, 0, 0, 5),
+            Request(at(180), "codex-model-unweighted", "0.9", 280, 20, 0, 0, 5),
+            Request(at(240), "gpt-6.1-sol", "0.9", 380, 20, 0, 0, 5),
+        ], compactions=[CompactionEvent(at(150), None, SizeNotReported(), SizeNotReported(), "unknown")])
+        report = self.report([session], [settings()])
+        groups = {group.model: group for group in report.groups}
+        unknown = groups["codex-model-unweighted"]
+        self.assertEqual(unknown.requests, 2)
+        self.assertEqual(unknown.quantities["context_per_request"].n, 2)
+        self.assertEqual(unknown.quantities["context_per_request"].mean, 250)
+        self.assertEqual(unknown.quantities["cost_per_request"].n, 0)
+        self.assertEqual(unknown.quantities["at_compaction"].n, 0)
+        known = groups["gpt-6.1-sol"].quantities["cost_per_request"]
+        self.assertEqual((known.n, known.mean), (2, 256))
+        self.assertEqual(report.role_quantities["unknown"]["context_per_request"].n, 4)
+        self.assertEqual(report.role_quantities["unknown"]["cost_per_request"].n, 2)
+        output = economy.render_report(report)
+        self.assertIn("cost not weighted: 2 requests (codex-model-unweighted)", output)
+        path = economy.save_result("unweighted", report, self.saved)
+        self.assertEqual(economy.read_result(path), report)
+
+    def test_comparisons_name_one_side_machines_and_families_and_pool_samples(self) -> None:
+        local = sample_session("local", 12)
+        remote = replace(sample_session("remote", 15, 2), machine="mac", family="codex")
+        before = self.report([local], [settings()])
+        after = economy.build_report([local, remote], {"fixture": [settings()], "mac": [settings()]},
+                                     self.store, at(0), at(3600))
+        output = economy.compare_reports(before, after)
+        confounds = next(line for line in output.splitlines() if line.startswith("confounds:"))
+        self.assertIn("machine=mac (current only)", confounds)
+        self.assertIn("family=codex (current only)", confounds)
+        row, = quantity_rows(output, "context_per_request")
+        self.assertIn("12", row)
+        self.assertIn("27", row)
+        reverse = economy.compare_reports(after, before)
+        self.assertIn("machine=mac (saved only)", reverse)
+        self.assertIn("family=codex (saved only)", reverse)
+
+    def test_where_matches_off_sets_across_file_changes_and_explicit_null(self) -> None:
+        on, off = settings(), settings(600, enabled=False)
+        off = replace(off, values={**off.values, "fixtureValue": {"flags": [False, {"enabled": True}], "count": 1}})
+        file_change = replace(off, at=at(1200), commit="file-change", values={
+            **off.values, "commands/unit/direct.md": {"bytes": 200, "sha": "222222222222"},
+        })
+        missing = replace(file_change, at=at(1800), commit="missing-value", values={
+            "precomputeCompactionEnabled": None, "autoCompactWindow": 100000,
+        })
+        absent = replace(missing, at=at(2400), commit="absent-key", values={"autoCompactWindow": 100000})
+        sessions = [sample_session(str(offset), 3, offset=offset) for offset in (0, 600, 1200, 1800, 2400)]
+        timelines = {"fixture": [on, off, file_change, missing, absent]}
+        for predicates, expected in (
+            ([economy.SettingsValueMatch("precomputeCompactionEnabled", False)], {off.commit, file_change.commit}),
+            ([economy.SettingsValueMatch("precomputeCompactionEnabled", None)], {missing.commit}),
+            ([economy.SettingsValueMatch("precomputeCompactionEnabled", 0)], set[str]()),
+            ([economy.SettingsValueMatch("precomputeCompactionEnabled", 1)], set[str]()),
+            ([economy.SettingsValueMatch("fixtureValue", {"flags": [False, {"enabled": True}], "count": 1.0})],
+             {off.commit, file_change.commit}),
+            ([economy.SettingsValueMatch("fixtureValue", {"flags": [0, {"enabled": True}], "count": 1})], set[str]()),
+            ([economy.SettingsValueMatch("fixtureValue", {"flags": [False, {"enabled": 1}], "count": 1})], set[str]()),
+            ([economy.SettingsValueMatch("precomputeCompactionEnabled", False),
+              economy.SettingsValueMatch("commands/unit/direct.md", {"bytes": 200, "sha": "222222222222"})],
+             {file_change.commit}),
+        ):
+            with self.subTest(expected=expected):
+                report = economy.build_report(sessions, timelines, self.store, at(0), at(3600), where=predicates)
+                self.assertEqual({group.settings_commit for group in report.groups}, expected)
+                self.assertEqual(sum(group.requests for group in report.groups), 3 * len(expected))
+
+    def test_cli_where_selects_settings_values_for_report_and_save(self) -> None:
+        session = sample_session("command", 20)
+        self.command_inputs(session)
+        path = self.checkout / "settings.json"
+        first = self.git("rev-parse", "HEAD")
+        tracked = self.checkout / "commands/unit/direct.md"
+        _ = tracked.write_text("The fixture changes the command.\n", encoding="utf-8")
+        _ = self.git("add", ".")
+        _ = self.git("commit", "-m", "Change the tracked command", seconds=300)
+        second = self.git("rev-parse", "HEAD")
+        _ = path.write_text(json.dumps({"precomputeCompactionEnabled": None, "model": MODEL}), encoding="utf-8")
+        _ = self.git("add", ".")
+        _ = self.git("commit", "-m", "Record an explicit null", seconds=600)
+        third = self.git("rev-parse", "HEAD")
+        _ = path.write_text(json.dumps({"model": MODEL}), encoding="utf-8")
+        _ = self.git("add", ".")
+        _ = self.git("commit", "-m", "Remove the fixture setting", seconds=960)
+        session = replace(session, starts=[Start(at(0), "startup", "2.1.0"),
+                                          Start(at(300), "resume", "2.1.0"),
+                                          Start(at(600), "resume", "2.1.0"),
+                                          Start(at(960), "resume", "2.1.0")])
+        window = ["--since", at(0).isoformat(), "--until", at(1260).isoformat()]
+        with patch.object(economy, "read_claude", return_value=[session]):
+            for name, selected, expected, requests in (
+                ("off", "false", {first, second}, 9), ("null", "null", {third}, 6), ("zero", "0", set[str](), 0),
+            ):
+                with self.subTest(name=name):
+                    predicates = ["--where", f"precomputeCompactionEnabled={selected}", "--where", f'model="{MODEL}"']
+                    status, output, errors = self.cli("report", *window, *predicates)
+                    self.assertEqual(status, 0, output + errors)
+                    self.assertEqual(len(quantity_rows(output, "context_per_request")), len(expected), output)
+                    status, output, errors = self.cli("save", name, *window, *predicates)
+                    self.assertEqual(status, 0, output + errors)
+                    restored = economy.read_result(self.saved / f"{name}.json")
+                    self.assertEqual({group.settings_commit for group in restored.groups}, expected)
+                    self.assertEqual(sum(group.requests for group in restored.groups), requests)
+
+    def test_cli_calls_each_reader_once_and_filters_families_after_collection(self) -> None:
+        local = sample_session("local", 3)
+        codex = replace(sample_session("codex", 4, 2), family="codex")
+        remote = replace(sample_session("remote", 5, 3), machine="mac", family="codex")
+        self.command_inputs(local)
+        for family, expected in (("all", [("claude", 3), ("codex", 4), ("codex", 5)]),
+                                 ("claude", [("claude", 3)]), ("codex", [("codex", 4), ("codex", 5)])):
+            with self.subTest(family=family):
+                with (patch.object(socket, "gethostname", return_value="fixture"),
+                      patch.object(economy, "read_claude", return_value=[local]) as claude_read,
+                      patch.object(economy, "read_codex", return_value=[codex]) as codex_read,
+                      patch.object(economy, "read_mac", return_value=MacSessions([remote], [settings()])) as mac_read):
+                    status, output, errors = self.cli("save", family, "--family", family,
+                                                      "--since", at(0).isoformat(), "--until", at(3600).isoformat())
+                self.assertEqual(status, 0, output + errors)
+                restored = economy.read_result(self.saved / f"{family}.json")
+                self.assertCountEqual([(group.family, group.requests) for group in restored.groups], expected)
+                claude_read.assert_called_once()
+                codex_read.assert_called_once_with([self.root / "codex-sessions"], at(0), at(3600), "fixture")
+                mac_read.assert_called_once_with(at(0), at(3600))
+
+    def test_a_failed_mac_read_keeps_local_numbers_and_an_empty_mac_is_successful(self) -> None:
+        self.command_inputs(sample_session("command", 12))
+        for mac, message in ((MacReadFailed("fixture connection failed"), "mac: fixture connection failed"),
+                             (MacSessions([], []), "")):
+            with self.subTest(mac=mac):
+                with patch.object(economy, "read_mac", return_value=mac):
+                    status, output, errors = self.cli("report", "--since", at(0).isoformat(),
+                                                      "--until", at(3600).isoformat())
+                self.assertEqual(status, 0, output + errors)
+                self.assertEqual(len(quantity_rows(output, "context_per_request")), 1, output)
+                if message:
+                    self.assertIn(message, output)
+                else:
+                    self.assertNotIn("mac:", output)
 
 
 if __name__ == "__main__":

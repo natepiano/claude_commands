@@ -8,7 +8,7 @@ except FileNotFoundError:
 
 import argparse
 from collections import defaultdict
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
 import json
@@ -26,9 +26,9 @@ from scripts.lib.user_zone import user_zone
 from scripts.usage import collect, weights
 from scripts.usage.agents_log import state_dir
 from scripts.usage.context_economy_read import (
-    CompactionEvent, Request, Session, SettingsSet, Start,
+    CompactionEvent, MacReadFailed, MacSessions, Request, Session, SettingsSet, Start,
     SettingsUnknown, configured_checkout, label, read_claude, role_of,
-    settings_for, settings_timeline,
+    read_codex, read_mac, settings_for, settings_timeline, timeline_start,
 )
 
 
@@ -50,7 +50,15 @@ class QuantitySummary:
 
 
 @dataclass(frozen=True)
+class SettingsValueMatch:
+    key: str
+    value: object
+
+
+@dataclass(frozen=True)
 class GroupResult:
+    machine: str
+    family: Literal["claude", "codex"]
     settings_label: str
     settings_values: dict[str, object]
     settings_commit: str
@@ -69,6 +77,7 @@ class Report:
     groups: list[GroupResult]
     left_out: int
     role_quantities: dict[str, dict[str, QuantitySummary]] = field(default_factory=dict)
+    unweighted_models: dict[str, int] = field(default_factory=dict)
 
 
 def summarize(values: Sequence[float]) -> QuantitySummary:
@@ -121,8 +130,12 @@ def _measurements(session: Session, active_gap_seconds: int, *, starts: Sequence
     compactions = sorted(session.compactions, key=lambda event: event.at)
     result: list[_Measurement] = []
     for request in requests:
-        result.extend((_Measurement(request.at, request.model, "context_per_request", float(request.context)),
-                       _Measurement(request.at, request.model, "cost_per_request", _cost(request))))
+        result.append(_Measurement(request.at, request.model, "context_per_request", float(request.context)))
+        try:
+            cost = _cost(request)
+        except weights.UnweightedModel:
+            continue
+        result.append(_Measurement(request.at, request.model, "cost_per_request", cost))
     starts = sorted(starts, key=lambda start: start.at)
     for index, start in enumerate(starts):
         following = [request for request in requests if request.at >= start.at
@@ -132,7 +145,7 @@ def _measurements(session: Session, active_gap_seconds: int, *, starts: Sequence
             result.append(_Measurement(first.at, first.model, "fresh_start", float(first.context)))
     for event in compactions:
         model = _event_model(event, requests)
-        if event.pre_tokens is not None:
+        if isinstance(event.pre_tokens, int):
             result.append(_Measurement(event.at, model, "at_compaction", float(event.pre_tokens)))
         following = [request for request in requests if request.at >= event.at]
         if following:
@@ -200,12 +213,13 @@ class _GroupSamples:
     quantities: dict[str, list[float]] = field(default_factory=lambda: {name: [] for name in QUANTITIES})
 
 
-def _group_at(groups: dict[tuple[str, str, str], _GroupSamples], settings: SettingsSet | SettingsUnknown,
+def _group_at(groups: dict[tuple[str, Literal["claude", "codex"], str, str, str], _GroupSamples],
+              session: Session, settings: SettingsSet | SettingsUnknown,
               timeline: Sequence[SettingsSet], at: datetime, role: str, model: str,
               by: Literal["settings", "week"]) -> _GroupSamples:
     commit = settings.commit if isinstance(settings, SettingsSet) else "unknown"
     bucket = _week(at) if by == "week" else commit
-    group = groups.setdefault((bucket, role, model), _GroupSamples())
+    group = groups.setdefault((session.machine, session.family, bucket, role, model), _GroupSamples())
     if commit not in group.commits:
         group.labels.append(_settings_name(settings, timeline))
         group.commits.append(commit)
@@ -214,17 +228,22 @@ def _group_at(groups: dict[tuple[str, str, str], _GroupSamples], settings: Setti
     return group
 
 
-def build_report(sessions: Sequence[Session], timeline: Sequence[SettingsSet], store: Path,
+def build_report(sessions: Sequence[Session], timelines: Mapping[str, Sequence[SettingsSet]], store: Path,
                  since: datetime, until: datetime, *, by: Literal["settings", "week"] = "settings",
-                 role: str = "", settings_label: str = "") -> Report:
+                 role: str = "", family: Literal["claude", "codex", "all"] = "all",
+                 where: Sequence[SettingsValueMatch] = ()) -> Report:
     """Measure whole sessions and assign each measurement the settings at its latest start."""
     configuration = conf.read("context_economy")
     minimum = configuration.whole("min_requests")
     active_gap = configuration.whole("active_gap_seconds")
-    groups: dict[tuple[str, str, str], _GroupSamples] = {}
+    groups: dict[tuple[str, Literal["claude", "codex"], str, str, str], _GroupSamples] = {}
     role_samples: dict[str, dict[str, list[float]]] = {}
+    unweighted_models: dict[str, int] = defaultdict(int)
     left_out = 0
     for session in sessions:
+        if family != "all" and session.family != family:
+            continue
+        timeline = timelines.get(session.machine, ())
         session_role = role_of(store, session.machine, session.family, session.session_id, session.agent_id)
         if role and role != session_role:
             continue
@@ -237,10 +256,14 @@ def build_report(sessions: Sequence[Session], timeline: Sequence[SettingsSet], s
             continue
         for request in session.requests:
             settings = _settings_at(session, request.at, timeline)
-            if settings_label and settings_label != _settings_name(settings, timeline):
+            if not _matches(settings, where):
                 continue
-            group = _group_at(groups, settings, timeline, request.at, session_role, request.model, by)
+            group = _group_at(groups, session, settings, timeline, request.at, session_role, request.model, by)
             group.requests += 1
+            try:
+                _ = weights.weights_at(request.model, request.at)
+            except weights.UnweightedModel:
+                unweighted_models[request.model] += 1
             if request.cli_version:
                 group.versions.add(request.cli_version)
             starts = [start for start in session.starts if start.at <= request.at]
@@ -252,20 +275,38 @@ def build_report(sessions: Sequence[Session], timeline: Sequence[SettingsSet], s
                                      starts=[start for start in session.starts if start.at >= since])
         for measurement in measurements:
             settings = _settings_at(session, measurement.at, timeline)
-            if settings_label and settings_label != _settings_name(settings, timeline):
+            if not _matches(settings, where):
                 continue
-            group = _group_at(groups, settings, timeline, measurement.at, session_role, measurement.model, by)
+            group = _group_at(groups, session, settings, timeline, measurement.at, session_role, measurement.model, by)
             group.quantities[measurement.quantity].append(measurement.value)
             samples = role_samples.setdefault(session_role, {quantity: [] for quantity in QUANTITIES})
             samples[measurement.quantity].append(measurement.value)
-    results = [GroupResult("; ".join(group.labels), group.values, ",".join(group.commits),
+    results = [GroupResult(machine, group_family, "; ".join(group.labels), group.values, ",".join(group.commits),
                            bucket if by == "week" else "", group_role, model, group.requests,
                            tuple(sorted(group.versions)),
                            {name: summarize(values) for name, values in group.quantities.items()})
-               for (bucket, group_role, model), group in sorted(groups.items())]
+               for (machine, group_family, bucket, group_role, model), group in sorted(groups.items())]
     return Report(since, until, results, left_out,
                   {group_role: {name: summarize(values) for name, values in samples.items()}
-                   for group_role, samples in role_samples.items()})
+                   for group_role, samples in role_samples.items()}, dict(unweighted_models))
+
+
+def _matches(settings: SettingsSet | SettingsUnknown, where: Sequence[SettingsValueMatch]) -> bool:
+    values = settings.values if isinstance(settings, SettingsSet) else {}
+    return all(match.key in values and _json_equal(values[match.key], match.value) for match in where)
+
+
+def _json_equal(left: object, right: object) -> bool:
+    """Keep booleans separate from numbers throughout a JSON value."""
+    if isinstance(left, bool) or isinstance(right, bool):
+        return type(left) is type(right) and left == right
+    if isinstance(left, dict) and isinstance(right, dict):
+        first, second = cast(dict[str, object], left), cast(dict[str, object], right)
+        return first.keys() == second.keys() and all(_json_equal(value, second[key]) for key, value in first.items())
+    if isinstance(left, list) and isinstance(right, list):
+        before, after = cast(list[object], left), cast(list[object], right)
+        return len(before) == len(after) and all(_json_equal(a, b) for a, b in zip(before, after))
+    return left == right
 
 
 def _value(value: float, quantity: str) -> str:
@@ -284,7 +325,7 @@ def _window(report: Report) -> str:
 
 
 def _week_marks(groups: Sequence[GroupResult]) -> dict[str, str]:
-    seen_settings: set[str] = set()
+    seen_settings: set[tuple[str, str]] = set()
     seen_versions: set[str] = set()
     seen_models: set[str] = set()
     marks: dict[str, list[str]] = defaultdict(list)
@@ -292,9 +333,9 @@ def _week_marks(groups: Sequence[GroupResult]) -> dict[str, str]:
         if not group.week:
             continue
         for commit, name in zip(group.settings_commit.split(","), group.settings_label.split("; ")):
-            if commit not in seen_settings:
+            if (group.machine, commit) not in seen_settings:
                 marks[group.week].append("new settings: " + name)
-                seen_settings.add(commit)
+                seen_settings.add((group.machine, commit))
         for version in group.cli_versions:
             if version not in seen_versions:
                 marks[group.week].append("new CLI: " + version)
@@ -307,17 +348,20 @@ def _week_marks(groups: Sequence[GroupResult]) -> dict[str, str]:
 
 def render_report(report: Report) -> str:
     lines = ["Window: " + _window(report), f"left out: {report.left_out} sessions below min_requests"]
+    if report.unweighted_models:
+        count = sum(report.unweighted_models.values())
+        lines.append(f"cost not weighted: {count} requests ({', '.join(sorted(report.unweighted_models))})")
     marks = _week_marks(report.groups)
     weekly = any(group.week for group in report.groups)
     for quantity in QUANTITIES:
         lines.extend(("", "### " + quantity,
-                      "| " + ("week | " if weekly else "") + "settings | role | model | n | median | mean | p25 | p75 |",
-                      "| " + ("--- | " if weekly else "") + "--- | --- | --- | ---: | ---: | ---: | ---: | ---: |"))
+                      "| " + ("week | " if weekly else "") + "machine | family | settings | role | model | n | median | mean | p25 | p75 |",
+                      "| " + ("--- | " if weekly else "") + "--- | --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: |"))
         for group in report.groups:
             summary = group.quantities[quantity]
             values = [_value(value, quantity) if summary.n else "—"
                       for value in (summary.median, summary.mean, summary.p25, summary.p75)]
-            columns = [group.settings_label, group.role, group.model, str(summary.n), *values]
+            columns = [group.machine, group.family, group.settings_label, group.role, group.model, str(summary.n), *values]
             if weekly:
                 columns.insert(0, group.week)
             lines.append("| " + " | ".join(_cell(column) for column in columns) + " |")
@@ -334,13 +378,14 @@ def save_result(name: str, report: Report, folder: Path) -> Path:
     """Write one result with exclusive creation; an existing result remains unchanged."""
     path = folder / (name + ".json")
     groups: list[dict[str, object]] = [{
+        "machine": group.machine, "family": group.family,
         "settings_label": group.settings_label, "settings_values": group.settings_values,
         "settings_commit": group.settings_commit, "week": group.week, "role": group.role, "model": group.model,
         "requests": group.requests, "cli_versions": group.cli_versions,
         "quantities": {quantity: _summary_data(summary) for quantity, summary in group.quantities.items()},
     } for group in report.groups]
     data = {"name": name, "window": {"since": report.since.isoformat(), "until": report.until.isoformat()},
-            "left_out": report.left_out, "groups": groups,
+            "left_out": report.left_out, "groups": groups, "unweighted_models": report.unweighted_models,
             "role_quantities": {role: {quantity: _summary_data(summary) for quantity, summary in quantities.items()}
                                 for role, quantities in report.role_quantities.items()}}
     folder.mkdir(parents=True, exist_ok=True)
@@ -373,22 +418,26 @@ def read_result(path: Path) -> Report:
     groups: list[GroupResult] = []
     for raw in cast(list[object], data["groups"]):
         group = _object(raw)
-        groups.append(GroupResult(cast(str, group["settings_label"]), _object(group["settings_values"]),
+        groups.append(GroupResult(cast(str, group["machine"]), cast(Literal["claude", "codex"], group["family"]),
+            cast(str, group["settings_label"]), _object(group["settings_values"]),
             cast(str, group["settings_commit"]), cast(str, group["week"]), cast(str, group["role"]),
             cast(str, group["model"]), cast(int, group["requests"]), tuple(cast(list[str], group["cli_versions"])),
             {name: _summary(value) for name, value in _object(group["quantities"]).items()}))
     return Report(datetime.fromisoformat(cast(str, window["since"])), datetime.fromisoformat(cast(str, window["until"])),
                   groups, cast(int, data["left_out"]),
                   {role: {name: _summary(value) for name, value in _object(quantities).items()}
-                   for role, quantities in _object(data["role_quantities"]).items()})
+                   for role, quantities in _object(data["role_quantities"]).items()},
+                  {model: cast(int, count) for model, count in _object(data["unweighted_models"]).items()})
 
 
 def _confounds(saved: Report, current: Report) -> list[str]:
     names = sorted({key for report in (saved, current) for group in report.groups for key in group.settings_values})
     differences: list[str] = []
     for name in names:
-        before = {json.dumps(group.settings_values.get(name), sort_keys=True) for group in saved.groups}
-        after = {json.dumps(group.settings_values.get(name), sort_keys=True) for group in current.groups}
+        before = {(name in group.settings_values, json.dumps(group.settings_values.get(name), sort_keys=True))
+                  for group in saved.groups}
+        after = {(name in group.settings_values, json.dumps(group.settings_values.get(name), sort_keys=True))
+                 for group in current.groups}
         if before != after:
             differences.append(name)
     if {version for group in saved.groups for version in group.cli_versions} != {
@@ -396,6 +445,12 @@ def _confounds(saved: Report, current: Report) -> list[str]:
         differences.append("Claude Code version")
     if {group.model for group in saved.groups} != {group.model for group in current.groups}:
         differences.append("model")
+    for dimension, before, after in (
+        ("machine", {group.machine for group in saved.groups}, {group.machine for group in current.groups}),
+        ("family", {group.family for group in saved.groups}, {group.family for group in current.groups}),
+    ):
+        differences.extend(f"{dimension}={value} (saved only)" for value in sorted(before - after))
+        differences.extend(f"{dimension}={value} (current only)" for value in sorted(after - before))
     return list(dict.fromkeys(differences))
 
 
@@ -447,7 +502,9 @@ class _Arguments(argparse.Namespace):
     until: str = ""
     role: str = ""
     by: Literal["settings", "week"] = "settings"
-    settings: str = ""
+    family: Literal["claude", "codex", "all"] = "all"
+    where: list[SettingsValueMatch]
+    codex_root: list[Path]
     projects_root: Path
     store: Path
     checkout: Path
@@ -459,6 +516,18 @@ class _Arguments(argparse.Namespace):
         self.store = collect.store_path()
         self.checkout = configured_checkout()
         self.saved_results = state_dir() / "context_economy"
+        self.where = []
+        self.codex_root = []
+
+
+def _where(value: str) -> SettingsValueMatch:
+    key, separator, raw = value.partition("=")
+    if not separator or not key:
+        raise argparse.ArgumentTypeError("use <key>=<json>")
+    try:
+        return SettingsValueMatch(key, cast(object, json.loads(raw)))
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(str(error)) from error
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -473,12 +542,14 @@ def _parser() -> argparse.ArgumentParser:
         if command != "trend":
             _ = subcommand.add_argument("--since", default="")
             _ = subcommand.add_argument("--until", default="")
+            _ = subcommand.add_argument("--family", choices=("claude", "codex", "all"), default="all")
+            _ = subcommand.add_argument("--codex-root", type=Path, action="append", default=argparse.SUPPRESS)
         if command in ("report", "trend"):
             _ = subcommand.add_argument("--role", default="")
         if command == "report":
             _ = subcommand.add_argument("--by", choices=("settings", "week"), default="settings")
-        if command == "save":
-            _ = subcommand.add_argument("--settings", default="")
+        if command in ("report", "save"):
+            _ = subcommand.add_argument("--where", type=_where, action="append", default=argparse.SUPPRESS)
     return parser
 
 
@@ -487,17 +558,6 @@ def _bound(value: str, fallback: datetime) -> datetime:
         return fallback
     at = datetime.fromisoformat(value.replace("Z", "+00:00"))
     return at.replace(tzinfo=user_zone()) if at.tzinfo is None else at
-
-
-def _timeline_start(sessions: Sequence[Session], since: datetime) -> datetime:
-    anchors = [since]
-    for session in sessions:
-        earlier = [start.at for start in session.starts if start.at < since]
-        if earlier:
-            anchors.append(max(earlier))
-        elif isinstance(session.first_record_at, datetime):
-            anchors.append(session.first_record_at)
-    return min(anchors)
 
 
 def main(argv: Sequence[str] = ()) -> int:
@@ -509,15 +569,25 @@ def main(argv: Sequence[str] = ()) -> int:
         now = datetime.now(user_zone())
         since = _bound(args.since, now - timedelta(days=7))
         until = _bound(args.until, now)
-        sessions = read_claude(args.projects_root, since, until, socket.gethostname())
-        timeline = settings_timeline(args.checkout, _timeline_start(sessions, since), until)
-        report = build_report(sessions, timeline, args.store, since, until,
-                              by=args.by, role=args.role, settings_label=args.settings)
+        machine = socket.gethostname()
+        sessions = read_claude(args.projects_root, since, until, machine)
+        roots = args.codex_root or sorted(Path.home().glob(".codex*/sessions"))
+        sessions.extend(read_codex(roots, since, until, machine))
+        timelines = {machine: settings_timeline(args.checkout, timeline_start(sessions, since), until)}
+        mac = read_mac(since, until)
+        if isinstance(mac, MacSessions):
+            sessions.extend(mac.sessions)
+            for remote_machine in {session.machine for session in mac.sessions} or {"mac"}:
+                timelines[remote_machine] = mac.timeline
+        report = build_report(sessions, timelines, args.store, since, until,
+                              by=args.by, role=args.role, family=args.family, where=args.where)
         if args.command == "save":
             print(save_result(args.name, report, args.saved_results))
         elif args.command == "compare":
             print(compare_reports(read_result(args.saved_results / (args.name + ".json")), report))
         else:
+            if isinstance(mac, MacReadFailed):
+                print(f"mac: {mac.reason}")
             print(render_report(report))
     except (OSError, ValueError) as error:
         print(f"context_economy: {error}", file=sys.stderr)

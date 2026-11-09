@@ -91,7 +91,7 @@
 
 **Ruled out:** settings segments per start, each with its own `min_requests` (a session counts once, as a whole).
 
-### Phase 3 — Mac sessions and Codex workers  · status: todo
+### Phase 3 — Mac sessions and Codex workers  · status: done
 **Depends on:** Phase 2
 
 #### Work Order

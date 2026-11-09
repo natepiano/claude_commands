@@ -12,14 +12,13 @@ import json
 import os
 from pathlib import Path
 import re
+import shlex
 import sqlite3
 import subprocess
 from typing import Literal, cast
 
 from scripts.lib import conf
-from scripts.usage import collect
-from scripts.usage.rollouts import parse_timestamp
-from scripts.usage.usage_report import open_read_store
+from scripts.usage.rollouts import decode_rollout, is_compaction, parse_timestamp, timestamp_of, token_usage
 
 
 _CLI_VERSION = re.compile(rb'"version"\s*:\s*"([^"\\]*)"')
@@ -42,11 +41,16 @@ class Request:
 
 
 @dataclass(frozen=True)
+class SizeNotReported:
+    """The transcript does not report this compaction size."""
+
+
+@dataclass(frozen=True)
 class CompactionEvent:
     at: datetime
     trigger: str | None
-    pre_tokens: int | None
-    post_tokens: int | None
+    pre_tokens: int | SizeNotReported
+    post_tokens: int | SizeNotReported
     kind: Literal["precomputed", "normal", "unknown"]
 
 
@@ -85,6 +89,20 @@ class SettingsSet:
 @dataclass(frozen=True)
 class SettingsUnknown:
     """The timeline has no settings set at or before this start."""
+
+
+@dataclass(frozen=True)
+class MacSessions:
+    sessions: list[Session]
+    timeline: list[SettingsSet]
+
+
+@dataclass(frozen=True)
+class MacReadFailed:
+    reason: str
+
+
+MacRead = MacSessions | MacReadFailed
 
 
 @dataclass
@@ -131,11 +149,11 @@ def _request(record: dict[str, object], at: datetime) -> Request:
 def _compaction(record: dict[str, object], at: datetime) -> CompactionEvent:
     metadata = record.get("compactMetadata")
     if not isinstance(metadata, dict):
-        return CompactionEvent(at, None, None, None, "unknown")
+        return CompactionEvent(at, None, SizeNotReported(), SizeNotReported(), "unknown")
     values = cast(dict[str, object], metadata)
     trigger, pre, post = values.get("trigger"), values.get("preTokens"), values.get("postTokens")
     return CompactionEvent(at, trigger if isinstance(trigger, str) else None,
-        pre if type(pre) is int else None, post if type(post) is int else None,
+        pre if type(pre) is int else SizeNotReported(), post if type(post) is int else SizeNotReported(),
         "precomputed" if values.get("precomputed") is True else "normal")
 
 
@@ -213,6 +231,65 @@ def read_claude(projects_root: Path, since: datetime, until: datetime, machine: 
     return sessions
 
 
+def _read_codex_file(path: Path, since: datetime, until: datetime, machine: str) -> list[Session]:
+    identity, model = "", ""
+    version: str | None = None
+    first: datetime | SessionBeginningUnknown = SessionBeginningUnknown.UNRECORDED
+    requests: list[Request] = []
+    compactions: list[CompactionEvent] = []
+    starts: dict[datetime, Start] = {}
+    previous_total: dict[str, object] = {}
+    with path.open(encoding="utf-8") as stream:
+        for line in stream:
+            record = decode_rollout(line)
+            if record is None:
+                continue
+            payload = _object(cast(object, record.get("payload")))
+            at = timestamp_of(record)
+            if at is not None and isinstance(first, SessionBeginningUnknown):
+                first = at
+            if record.get("type") == "session_meta":
+                identity = _text(payload.get("id")) or identity
+                value = payload.get("cli_version")
+                version = value if isinstance(value, str) else None
+                opening = parse_timestamp(payload.get("timestamp")) or at
+                if opening is not None and opening not in starts:
+                    starts[opening] = Start(opening, "resume" if starts else "startup", version)
+            elif record.get("type") == "turn_context":
+                model = _text(payload.get("model"))
+            usage = token_usage(record)
+            repeated = False
+            if usage is not None:
+                total = _object(_object(payload.get("info")).get("total_token_usage"))
+                repeated = bool(total) and total == previous_total
+                if total:
+                    previous_total = total
+            if at is None or not since <= at < until:
+                continue
+            if usage is not None and not repeated:
+                requests.append(Request(at, model, version, usage.uncached_input, usage.cached_input,
+                                        0, 0, usage.output))
+            if is_compaction(record):
+                compactions.append(CompactionEvent(at, None, SizeNotReported(), SizeNotReported(), "unknown"))
+    earlier = [start for start in starts.values() if start.at < since]
+    in_window = [start for start in starts.values() if since <= start.at < until]
+    retained = [*sorted(earlier, key=lambda start: start.at)[-1:], *sorted(in_window, key=lambda start: start.at)]
+    if not identity or not (requests or compactions or in_window):
+        return []
+    return [Session(machine, "codex", identity, identity, requests, compactions, retained, first)]
+
+
+def read_codex(sessions_roots: Sequence[Path], since: datetime, until: datetime, machine: str) -> list[Session]:
+    """Read each resolved rollout once, also when numbered homes link the same sessions."""
+    since, until = _utc(since), _utc(until)
+    paths = sorted({path.resolve() for root in sessions_roots for path in root.rglob("*.jsonl")})
+    sessions: list[Session] = []
+    for path in paths:
+        if path.stat().st_mtime >= since.timestamp():
+            sessions.extend(_read_codex_file(path, since, until, machine))
+    return sessions
+
+
 def configured_checkout() -> Path:
     """Resolve the command's checkout without overriding an explicit reader argument."""
     return Path(os.environ.get("CONTEXT_ECONOMY_CHECKOUT") or Path.home() / ".claude")
@@ -245,7 +322,7 @@ def _settings_values(commit: str, blobs: dict[tuple[str, str], bytes],
                      keys: tuple[str, ...], files: tuple[str, ...]) -> dict[str, object]:
     content = blobs.get((commit, "settings.json"), b"{}")
     settings = _object(cast(object, json.loads(content)))
-    values: dict[str, object] = {key: settings.get(key) for key in keys}
+    values: dict[str, object] = {key: settings[key] for key in keys if key in settings}
     for path in files:
         content = blobs.get((commit, path), b"")
         values[path] = ({"bytes": len(content), "sha": hashlib.sha256(content).hexdigest()[:12]}
@@ -289,12 +366,17 @@ def settings_for(session_start: datetime, timeline: Sequence[SettingsSet]) -> Se
 def label(current: SettingsSet, previous: SettingsSet | SettingsUnknown) -> str:
     """Name each tracked value that changed from the preceding settings set."""
     before = previous.values if isinstance(previous, SettingsSet) else {}
-    return ", ".join(f"{key}={json.dumps(value, ensure_ascii=False, separators=(',', ':'))}"
-                     for key, value in current.values.items() if key not in before or before[key] != value)
+    changes = [f"{key}={json.dumps(value, ensure_ascii=False, separators=(',', ':'))}"
+               for key, value in current.values.items() if key not in before or before[key] != value]
+    changes.extend(f"{key}=<absent>" for key in before if key not in current.values)
+    return ", ".join(changes)
 
 
 def role_of(store: Path, machine: str, family: str, session_id: str, agent_id: str) -> str:
     """Read the latest matching ledger role without creating or changing the store."""
+    from scripts.usage import collect
+    from scripts.usage.usage_report import open_read_store
+
     if not store.is_file():
         return "unknown"
     if family == "claude":
@@ -311,3 +393,183 @@ def role_of(store: Path, machine: str, family: str, session_id: str, agent_id: s
             return "unknown"
         value = cast(object, row["role"])
         return value if isinstance(value, str) and value else "unknown"
+
+
+def _session_data(session: Session) -> dict[str, object]:
+    return {
+        "type": "session", "machine": session.machine, "family": session.family,
+        "session_id": session.session_id, "agent_id": session.agent_id,
+        "first_record_at": session.first_record_at.isoformat() if isinstance(session.first_record_at, datetime) else None,
+        "requests": [{"at": request.at.isoformat(), "model": request.model, "cli_version": request.cli_version,
+                      "input": request.input, "cache_read": request.cache_read,
+                      "cache_write_5m": request.cache_write_5m, "cache_write_1h": request.cache_write_1h,
+                      "output": request.output} for request in session.requests],
+        "starts": [{"at": start.at.isoformat(), "source": start.source, "cli_version": start.cli_version}
+                   for start in session.starts],
+        "compactions": [{"at": event.at.isoformat(), "trigger": event.trigger, "kind": event.kind,
+                         "pre_tokens": event.pre_tokens if isinstance(event.pre_tokens, int) else None,
+                         "post_tokens": event.post_tokens if isinstance(event.post_tokens, int) else None}
+                        for event in session.compactions],
+    }
+
+
+def _wire_object(value: object) -> dict[str, object]:
+    if not isinstance(value, dict):
+        raise ValueError("Mac data must contain an object")
+    return cast(dict[str, object], value)
+
+
+def _wire_list(value: object) -> list[object]:
+    if not isinstance(value, list):
+        raise ValueError("Mac data must contain a list")
+    return cast(list[object], value)
+
+
+def _wire_text(value: object) -> str:
+    if not isinstance(value, str):
+        raise ValueError("Mac data must contain text")
+    return value
+
+
+def _wire_optional_text(value: object) -> str | None:
+    return None if value is None else _wire_text(value)
+
+
+def _wire_count(value: object) -> int:
+    if type(value) is not int or value < 0:
+        raise ValueError("Mac data must contain a whole number")
+    return value
+
+
+def _wire_time(value: object) -> datetime:
+    at = parse_timestamp(_wire_text(value))
+    if at is None:
+        raise ValueError("Mac data has an invalid timestamp")
+    return at
+
+
+def _wire_request(value: object) -> Request:
+    row = _wire_object(value)
+    return Request(_wire_time(row["at"]), _wire_text(row["model"]), _wire_optional_text(row["cli_version"]),
+                   *(_wire_count(row[name]) for name in
+                     ("input", "cache_read", "cache_write_5m", "cache_write_1h", "output")))
+
+
+def _wire_compaction(value: object) -> CompactionEvent:
+    row = _wire_object(value)
+    kind = row["kind"]
+    if kind not in ("precomputed", "normal", "unknown"):
+        raise ValueError("Mac data has an invalid compaction kind")
+    pre, post = row["pre_tokens"], row["post_tokens"]
+    return CompactionEvent(_wire_time(row["at"]), _wire_optional_text(row["trigger"]),
+        SizeNotReported() if pre is None else _wire_count(pre),
+        SizeNotReported() if post is None else _wire_count(post), kind)
+
+
+def _wire_start(value: object) -> Start:
+    row = _wire_object(value)
+    source = row["source"]
+    if source not in ("startup", "resume"):
+        raise ValueError("Mac data has an invalid start source")
+    return Start(_wire_time(row["at"]), source,
+                 _wire_optional_text(row["cli_version"]))
+
+
+def _wire_session(row: dict[str, object]) -> Session:
+    family = row["family"]
+    if family not in ("claude", "codex"):
+        raise ValueError("Mac data has an invalid session family")
+    first = row["first_record_at"]
+    return Session(_wire_text(row["machine"]), family,
+        _wire_text(row["session_id"]), _wire_text(row["agent_id"]),
+        [_wire_request(value) for value in _wire_list(row["requests"])],
+        [_wire_compaction(value) for value in _wire_list(row["compactions"])],
+        [_wire_start(value) for value in _wire_list(row["starts"])],
+        SessionBeginningUnknown.UNRECORDED if first is None else _wire_time(first))
+
+
+def _mac_reply(output: str) -> MacSessions:
+    sessions: list[Session] = []
+    timeline: list[SettingsSet] = []
+    timeline_read = False
+    for line in output.splitlines():
+        row = _wire_object(cast(object, json.loads(line)))
+        if row["type"] == "timeline" and not timeline_read:
+            for value in _wire_list(row["entries"]):
+                entry = _wire_object(value)
+                timeline.append(SettingsSet(_wire_time(entry["at"]), _wire_text(entry["commit"]),
+                                            _wire_object(entry["values"])))
+            timeline_read = True
+        elif row["type"] == "session" and timeline_read:
+            sessions.append(_wire_session(row))
+        else:
+            raise ValueError("Mac data has an invalid record type or order")
+    if not timeline_read:
+        raise ValueError("Mac data has no timeline")
+    return MacSessions(sessions, timeline)
+
+
+def timeline_start(sessions: Sequence[Session], since: datetime) -> datetime:
+    """Include the settings anchor that each session needs before the report window."""
+    anchors = [since]
+    for session in sessions:
+        earlier = [start.at for start in session.starts if start.at < since]
+        if earlier:
+            anchors.append(max(earlier))
+        elif isinstance(session.first_record_at, datetime):
+            anchors.append(session.first_record_at)
+    return min(anchors)
+
+
+def emit_mac(request: dict[str, object]) -> None:
+    """Read both families and the checkout timeline in the remote process."""
+    since, until = _wire_time(request["since"]), _wire_time(request["until"])
+    projects = _wire_text(request["projects_root"])
+    checkout = _wire_text(request["checkout"])
+    roots = [Path(_wire_text(value)) for value in _wire_list(request["codex_roots"])]
+    sessions = read_claude(Path(projects) if projects else Path.home() / ".claude/projects", since, until, "mac")
+    sessions.extend(read_codex(roots or sorted(Path.home().glob(".codex*/sessions")), since, until, "mac"))
+    timeline = settings_timeline(Path(checkout) if checkout else configured_checkout(), timeline_start(sessions, since), until)
+    print(json.dumps({"type": "timeline", "entries": [
+        {"at": entry.at.isoformat(), "commit": entry.commit, "values": entry.values} for entry in timeline]}), flush=True)
+    for session in sessions:
+        print(json.dumps(_session_data(session)), flush=True)
+
+
+def _mac_payload(since: datetime, until: datetime) -> str:
+    root = Path(__file__).resolve().parents[2]
+    modules = {name: (root / path).read_text(encoding="utf-8") for name, path in (
+        ("scripts.lib.conf", "scripts/lib/conf.py"),
+        ("scripts.usage.rollouts", "scripts/usage/rollouts.py"),
+        ("scripts.usage.context_economy_read", "scripts/usage/context_economy_read.py"),
+    )}
+    return json.dumps({"modules": modules, "since": since.isoformat(), "until": until.isoformat(),
+        "projects_root": os.environ.get("CONTEXT_ECONOMY_MAC_PROJECTS_ROOT", ""),
+        "codex_roots": _wire_list(cast(object, json.loads(os.environ.get("CONTEXT_ECONOMY_MAC_CODEX_ROOTS", "[]")))),
+        "checkout": os.environ.get("CONTEXT_ECONOMY_MAC_CHECKOUT", "")})
+
+
+def _mac_command() -> list[str]:
+    from scripts.usage.collect import MAC_HOST, bootstrap_program
+
+    program = bootstrap_program("sys.modules['scripts.usage.context_economy_read'].emit_mac(request)")
+    configured = os.environ.get("CONTEXT_ECONOMY_MAC_COMMAND", "")
+    if configured:
+        return [*(_wire_text(value) for value in _wire_list(cast(object, json.loads(configured)))), program]
+
+    return ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", "-o", "ServerAliveInterval=5",
+            "-o", "ServerAliveCountMax=1", os.environ.get("CONTEXT_ECONOMY_MAC_HOST", MAC_HOST),
+            shlex.join(("python3", "-c", program))]
+
+
+def read_mac(since: datetime, until: datetime) -> MacRead:
+    """Use one remote process and return a failure without discarding local sessions."""
+    try:
+        result = subprocess.run(_mac_command(), input=_mac_payload(since, until),
+                                capture_output=True, text=True, encoding="utf-8", check=False,
+                                timeout=conf.read("context_economy").whole("mac_timeout_seconds"))
+        if result.returncode:
+            return MacReadFailed(result.stderr.strip() or f"remote reader exited {result.returncode}")
+        return _mac_reply(result.stdout)
+    except (OSError, subprocess.SubprocessError, ValueError, KeyError) as error:
+        return MacReadFailed(str(error))
