@@ -1624,3 +1624,44 @@ Set `TMPDIR` to a shared runner-owned directory if `PrivateTmp` hides the defaul
 For example, `/run/build-admission/ci/<uid>` uses mode `0755` and the runner's ownership.
 The fixed slice limits remain `MemoryMax=34G` and `MemorySwapMax=2G`.
 The service authorization and protocol must be live before runner socket access starts.
+
+## Test selection and fresh-build evidence
+
+`scripts/build_queue/step_estimator.py` owns the test-history selection and freshness checks.
+`verify_test_selection` returns `PackageTestSelection(package, filters)` only for the whole positive expression that verify emits.
+It accepts a package with one `test()` predicate or a union of those predicates.
+A bare package expression selects a full package run.
+Every other expression gives `BroadTestSelection`.
+Negation cannot supply an exact filter key.
+`test_selection` parses package, scope, and canonical sorted filters together.
+A package-less filtered run keeps broad filtered history.
+Waiter estimates reuse a selection only when package and filters match.
+
+`filtered_history_peak` uses the larger exact-filter and package-filtered anonymous p90.
+It then tries indexed exact-filter peaks, indexed package peaks, and package check/build compile peaks.
+Indexed peaks use `ANON_SHARE`.
+Without usable compile history, it uses `FILTERED_FLOOR`, which is 1 GiB.
+A full-suite estimate does not cap this compile estimate.
+The recorded package, filters, and scope take priority over values recovered from argv.
+
+`is_fresh_test` reads the last completed nextest step for the same worktree, package, and scope.
+That step must have the same `test_build_key` and either status 0 or a positive test count.
+It must end less than 24 hours before the estimate.
+Both Cargo output roots must still exist.
+No matching deletion record or later sweep with unknown or positive freed bytes may invalidate them.
+A read error, malformed JSONL tail, missing key, or unknown output roots rejects freshness.
+`current_worktree_steps` uses an index prefix only after validating its file marks and then reads the JSONL tail.
+The index cannot hide a newer step.
+
+`fresh_test_peak` uses completed zero-compile measurements from the same package and scope.
+It tries exact-filter anonymous and indexed history before package history.
+It joins anonymous rows by call id and keeps the 1 GiB floor.
+`NoFreshHistory` returns the estimate to its compile-history path.
+Fresh waiters receive another estimate at each check.
+
+`TreeInputs.keys` writes the build key and both output roots through `VERIFY_TEST_BUILD_INPUTS_FILE`.
+The key excludes run-only filters and result-environment values.
+It retains Cargo inputs and `NEXTEST_CARGO_PROFILE`.
+`record.py` stores `test_build_key` only when source stays unchanged during nextest.
+Rows without a key cannot prove a fresh build.
+The broader `BUILDLOG_TREE` field cannot replace this key.

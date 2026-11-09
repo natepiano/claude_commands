@@ -960,8 +960,8 @@ printf '%s\n' "$BUILDLOG_TARGET_FOLDER"
             self.assertIn("waiting for memory since ", first_message)
             self.assertFalse(marker.exists())
             _ = threading.Event().wait(1.1)
-            released_at = time.time()
             _ = meminfo.write_text("MemAvailable: 12582912 kB\n")
+            released_at = meminfo.stat().st_mtime
             output, remaining_errors = process.communicate(timeout=test_hang_guard.TEST_HANG_GUARD_SECS)
             errors = first_message + remaining_errors
         finally:

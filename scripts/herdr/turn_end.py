@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import cast
 
 from scripts.direct import progress_history
+from scripts.lib import atomic_file
 from scripts.lib.process_failure import failure_detail
 from scripts.herdr import herdr, worker_panes
 from scripts.production import staff, worker, worker_admission
@@ -85,16 +86,16 @@ def _friend_pending(client: herdr.Herdr, state: worker_panes.WorkerPane | worker
     return False
 
 
-def _notify(row: staff.StaffRow, parent: staff.StaffRow, phase: str, outcome: TurnOutcome,
+def _notify(worker_name: str, parent: staff.StaffRow, phase: str, outcome: TurnOutcome,
             path: Path, details: str) -> None:
     backend = staff.backend(parent)
     address = ("codex:" if isinstance(backend, staff.CodexBackend) else "session:") + str(parent.current_session)
     scripts = Path(__file__).resolve().parents[1]
-    message = f"{row.name}: phase {phase}: {outcome.value}; reply {path}"
+    message = f"{worker_name}: phase {phase}: {outcome.value}; reply {path}"
     if details:
         message += "\n" + details
     result = subprocess.run([str(scripts / "lib/py"), str(scripts / "message/send.py"),
-        "--to", address, "--from", row.name, "--text", message], text=True, capture_output=True, check=False)
+        "--to", address, "--from", worker_name, "--text", message], text=True, capture_output=True, check=False)
     if result.returncode:
         raise ValueError(failure_detail(result))
 
@@ -110,15 +111,29 @@ def _kept_pane_anomaly(row: staff.StaffRow, state: worker_panes.WorkerPane | wor
     return message
 
 
-def _send_notice(row: staff.StaffRow, parent: staff.StaffRow, run: Path, passed: dict[str, object],
+def _send_notice(worker_name: str, parent: staff.StaffRow, run: Path, passed: dict[str, object],
                  instance: str, outcome: TurnOutcome, path: Path, reply: str, details: str) -> None:
     stamp = hashlib.sha256((outcome.value + "\n" + reply).encode()).hexdigest()
     if passed.get("hook_notice") == stamp:
         return
     phase = passed.get("phase", {})
     phase_id = str(cast(dict[str, object], phase).get("id", "")) if isinstance(phase, dict) else ""
-    _notify(row, parent, phase_id, outcome, path, details)
+    _notify(worker_name, parent, phase_id, outcome, path, details)
     progress_history.record_dispatch_notice(run, instance, stamp)
+
+
+def repeat_completion_notice(worker_name: str, parent: staff.StaffRow, run: Path,
+                             passed: dict[str, object]) -> None:
+    """Send the saved completion once for an explicit completed-dispatch rerun."""
+    delivery = progress_history.dispatch_delivery(passed)
+    completion = progress_history.hook_completion(passed)
+    outcome = TurnOutcome(completion.outcome) if isinstance(completion, progress_history.HookCompletion) else TurnOutcome.DONE
+    path = Path(completion.reply_file if isinstance(completion, progress_history.HookCompletion) else delivery.reply_file)
+    details = "\n".join(completion.details) if isinstance(completion, progress_history.HookCompletion) else ""
+    repeated = {key: value for key, value in passed.items() if key != "hook_notice"}
+    _send_notice(worker_name, parent, run, repeated, str(passed["instance_id"]), outcome, path, path.read_text(), details)
+    if delivery.actions.status_file:
+        atomic_file.write_text_atomic(Path(delivery.actions.status_file), "done\n")
 
 
 def _submit_stage(parent: staff.StaffRow, row: staff.StaffRow, state: worker_panes.WorkerPane,
@@ -138,7 +153,7 @@ def _submit_stage(parent: staff.StaffRow, row: staff.StaffRow, state: worker_pan
     path = Path(delivery.reply_file)
     path = path.with_name(path.stem + "_turn" + path.suffix)
     worker.save_reply(path, details)
-    _send_notice(row, parent, run, passed, instance, outcome, path, details, details)
+    _send_notice(row.name, parent, run, passed, instance, outcome, path, details, details)
     return outcome
 
 
@@ -194,8 +209,9 @@ def _finish_completion(row: staff.StaffRow, parent: staff.StaffRow, run: Path, p
             completion = replace(completion, outcome=TurnOutcome.ERROR, details=(*completion.details, reason))
             outcome = TurnOutcome.ERROR
             details.append(reason)
-        progress_history.save_hook_completion(run, instance, completion)
-    _send_notice(row, parent, run, passed, instance, outcome, path, path.read_text(), "\n".join(details))
+    completion = replace(completion, details=tuple(details))
+    progress_history.save_hook_completion(run, instance, completion)
+    _send_notice(row.name, parent, run, passed, instance, outcome, path, path.read_text(), "\n".join(details))
     if completion.pane_closed and completion.role_released:
         if delivery.actions.end_worker:
             _ = staff.retire(row.id)
@@ -281,7 +297,7 @@ def handle(event: WorkerEvent) -> TurnOutcome:
             progress_history.save_hook_completion(run, instance, completion)
             return _finish_completion(row, parent, run, passed, instance, delivery, completion, state, hold)
         details = "\n".join(anomalies) or reply
-        _send_notice(row, parent, run, passed, instance, outcome, path, reply, details)
+        _send_notice(row.name, parent, run, passed, instance, outcome, path, reply, details)
         return outcome
 
 

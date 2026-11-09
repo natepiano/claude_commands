@@ -3357,17 +3357,21 @@ A Codex launch reads its thread only from its own process (`native_process(pid, 
 
 **Gotchas:** live check 2026-11-08 02:17 EST: `close --interrupt` on a working reviewer printed `done` in 7 s, and its follower exited 3.
 
-### Phase 41 — A pane worker compacts at the cheaper limit · status: todo
+### Phase 41 — A pane worker compacts at the cheaper limit · status: done
 
-**Depends on:** Phase 40 (both edit the pane worker launch) and Phase 34 (item 5 adds the between-turn compaction that this phase measures; pane dispatch does not read `UNIT_COMPACT_ABOVE_TOKENS` before it). sdlc [6ed41bd7], [82aaadcb], 2026-11-07.
+#### As-built
 
-Report: A pane worker's Codex launch sets the auto-compact limit from config, near 200k tokens, well above the post-compaction floor (about 100k). Report the value and the measured floor to sdlc. Cost measure (natedev via sdlc [82aaadcb], 2026-11-07): since Phase 35, pane workers compact near the full 500k window; a fix worker ran 61 requests between 250k and 343k tokens. Measure quota per request at a 200k limit and at full-window compaction, put the cheaper point in config, and send sdlc both numbers with the hash.
+`UNIT_COMPACT_ABOVE_TOKENS` in `config/direct.conf` is 200000 (was 100000). `worker._compact_before_dispatch` reads it between turns, after a closed conversation reopens and before the next prompt is typed (Phase 34 item 5). No code changed.
 
-**Decision (sdlc [b384f355], 2026-11-08):** compaction runs between turns only (Phase 34 item 5). This phase sets `UNIT_COMPACT_ABOVE_TOKENS` to the measured cheaper point; it adds no launch limit. One long turn can grow past the point until it ends; Codex's own full-window compaction covers it. Send natedev both numbers and the main hash.
+Measurement (2026-11-09, sdlc [b384f355]): a replay of 36,115 pane worker requests from 189 Codex rollouts since 2026-11-07, reading only `token_count` events. Median context after a compaction: 94,144 tokens. Estimated cost per request, with weights 1 uncached input, 0.05 cached input and 5 output: 20,583 at 200k, 22,563 at the full window, 94,402 at 100k. 200k is cheaper than the full window in every sensitivity case. When compaction chances are sparse, 100k and 200k differ by less than 1%.
 
-**Constraint from Phase 28f:** a done worker's pane closes after each pass, and its next pass resumes the same conversation in a new pane (`scripts/astra/test_design_roles.py:160`). Run the threshold compaction after the saved conversation reopens and before the next prompt is typed. Test row: complete and close one pass, resume its conversation in a new pane, compact above the limit, and keep the native identity.
+**Files:**
+- `config/direct.conf` — the value and its comment.
+- Test row (existing): `scripts/production/test_worker.py` `test_closed_conversation_compacts_before_the_next_dispatch` closes a pass, reopens the conversation in a new pane, compacts above the limit and keeps the native identity.
 
-The Work Order is written at the phase start.
+**Binds later work:** a limit at or below the post-compaction floor compacts again at once; keep the limit well above that floor.
+
+**Gotchas:** compaction costs and the full-window cutoff are model assumptions; token records carry no dispatch boundaries. The floor of newer sessions is lower (median 39,275), so the cheaper point can move.
 
 ### Phase 38 — One worker's assign reads only its own pane and row · status: done
 
@@ -3433,15 +3437,66 @@ A question has no outcome of its own (sdlc [cb2d951c]): the worker writes it in 
 - An identical rerun of a completed dispatch returns `submitted`, and no message follows (Phase 34a).
 - A test fixture that fakes a turn end calls `turn_end.handle`; otherwise the pane stays open and the next dispatch reuses it.
 
-### Phase 34a — Turn-end gaps from the Phase 34 live proof  · status: todo
+### Phase 34a — Turn-end gaps from the Phase 34 live proof  · status: done
 
-**Depends on:** Phase 34. sdlc [958d0e42], 2026-11-09.
+#### As-built
 
-1. **A new Codex worker's first dispatch exits 8.** `assign.sh --new-worker` on a Codex worker gives `Codex launch identity is unavailable` and exit 8; the pane shows Codex ready with no job. The next dispatch to the same worker works. The 28f proof saw the same.
-2. **A run outside the run root is never completed.** `worker_panes.worker_run` finds a worker's run only among runs held by the parent session under `/tmp/claude/unit`. A dispatch with `--session-dir` elsewhere submits, and the hook never completes it.
-3. **An identical rerun gets no message.** `worker.dispatch` returns `SUBMITTED` for a dispatch that matches a completed pass (same slot, phase, role, prompt and launcher command) and types nothing. No turn ends, so no message reaches the director.
+A new Codex worker's first dispatch submits its job. `herdr._codex_foreground(info)` leaves out the turn-end hook process (program path ends `scripts/herdr/turn_end.py`; the program is argv[1] for a python argv[0], else argv[0]) and returns the one process left only when it is Codex. `native_pane_process`, `codex_without_session` and `codex_pane_process` use it. Cause: the warm-up turn's hook process shared the pane's foreground group, so the launch identity read saw two processes.
 
-The Work Order is written at the phase start.
+The hook completes a dispatch outside the run root. `progress_history.begin_dispatch` links `<staff dir>/dispatches/<staff id>` to the run's `progress_history_state.json` (atomic temp symlink and replace). `recorded_dispatch_run(worker_id)` returns `RecordedDispatchRun(directory)` or `DispatchRunNotRecorded.MISSING`; `worker_panes.worker_run` uses it first, then the held runs.
+
+An identical rerun of a completed dispatch sends the saved completion notice again and types nothing. `turn_end.repeat_completion_notice(worker_name, parent, run, passed)` resends through `_send_notice` and writes `done` to the status file. `worker.dispatch` (completed match) and `assign.execute_astra_review_herdr` (completed path) call it. The hook saves the completion with its kept-pane anomaly before it sends, so the rerun repeats the same text.
+
+**Files:**
+- `scripts/herdr/herdr.py` — `_codex_foreground`.
+- `scripts/direct/progress_history.py` — `_link_dispatch_state`, `recorded_dispatch_run`, `RecordedDispatchRun`, `DispatchRunNotRecorded`.
+- `scripts/herdr/worker_panes.py` — `worker_run` reads the recorded run first.
+- `scripts/herdr/turn_end.py` — `repeat_completion_notice`; `_notify` and `_send_notice` take `worker_name: str`.
+- `scripts/production/worker.py`, `scripts/direct/assign.py` — the completed-rerun paths.
+- Tests: `scripts/herdr/test_herdr.py` (`test_codex_report_ignores_the_hook_process_in_the_foreground_group`), `scripts/herdr/test_turn_end.py` (`test_turn_end_completes_a_dispatch_outside_the_run_root`, `test_completed_rerun_repeats_the_saved_kept_pane_anomaly`), `scripts/production/test_worker.py` (`test_completed_dispatch_rerun_repeats_its_notice_without_typing`, `test_first_codex_dispatch_keeps_its_identity_during_the_warmup_hook`), `scripts/direct/test_assign_launcher.py` (`test_completed_astra_review_rerun_repeats_its_notice_without_typing`, a notice-failure row in the completed-launcher retry test).
+- Docs: `docs/as-built/herdr-adoption.md`, `docs/as-built/long-lived-workers.md`.
+
+**Binds later work:** code that finds a dispatch's run reads `recorded_dispatch_run` first. A pane identity read excludes the turn-end hook process.
+
+**Gotchas:** the send repeat guard (`config/send_repeat_guard.conf`) holds a third identical message to one receiver in 30 minutes, so a third identical rerun notice is held. The short `bash lib/py turn_end.py` window before exec is not excluded from the foreground read. A rerun notice runs in the director's process; Phase 34b item 4 fixes its sender.
+
+**Ruled out:** a wait or retry for the first-launch identity — the cause was the hook process in the foreground group.
+
+### Phase 34b — A turn end while a final run is live  · status: todo
+
+**Depends on:** Phase 34a. sdlc [03851fa8] and [429a1166], 2026-11-09.
+
+1. **Exit-3 recovery cannot record a finished pass.** fastest-unit Phase 52: the worker wrote `DONE f82a956c` in its pane, and lint and tests passed. The launcher exited 3: the worker ended a turn while its detached final run was live. The documented exit-3 recovery then failed twice with exit 2: first `last turn does not end with the dispatch DONE line`, then `launcher has not recorded a completed pass` (`worker_panes._idle_checks`; the pass is recorded as `error`). Fix it where it lives.
+2. **Each turn end sends a new identical notice.** fix-rounds Phase 10l: the turn-end hook sent `phase 10l: waiting on run reply; reply .../claude-build-followups-sdlc-fix-rounds-study_reply_turn.txt` three times to one session, 03:44 to 03:52 EST; the send repeat guard held the third copy. Send one notice per pass state.
+3. **WAITING_ON_REPLY with an empty reply while a final run is live.** In the same pass, `reply_turn.txt` held 1 byte while gate run 20261109T034623 was live; the final reply ended with DONE and the status is `done`. Evidence: `/tmp/claude/unit/e325ab73-1e3b-4649-88f2-c29cf0dda72f/phases/10l/`.
+4. **A rerun notice names the director as sender.** Phase 34a's `turn_end.repeat_completion_notice` runs in the director's process, so send.py names the director's session as the sender. sdlc [b44cd730], 2026-11-09.
+
+#### Work Order
+
+**Goal:** A turn end during a live final run records the finished pass, and each pass state sends one notice from the worker.
+
+**Spec:**
+
+1. Item 1: find where exit 3 and the two exit-2 refusals come from. Evidence: `/tmp/claude/unit/e700519d-30f7-47eb-94c7-97082b8f7750/phases/52/` (`pane_reply.txt`, `status.txt`, the impl2 status and log). Fix the cause where it lives, so the worker's later `DONE` turn completes the pass and the pane can close.
+2. Item 2: the hook sends a notice only when the pass state changes. A turn end with the same outcome and the same reply sends nothing.
+3. Item 3: find why the turn reply was 1 byte and the outcome `WAITING_ON_REPLY` while a run was live. Fix the cause, so the outcome is `WAITING_ON_RUNS` with the real reply.
+4. Item 4: a rerun notice names the worker as its sender, the same as the hook's notice.
+5. Update `docs/as-built/long-lived-workers.md` and `docs/as-built/herdr-adoption.md` where they state the changed behavior.
+6. Add no check, refusal, validation, retry or wait that this list does not name.
+
+**Files:**
+
+- `scripts/herdr/turn_end.py`, `scripts/herdr/test_turn_end.py` — notice once per pass state, sender, run-live outcome.
+- `scripts/herdr/worker_panes.py`, `scripts/herdr/test_worker_panes.py` — close checks for a pass that ends after a live run.
+- `scripts/production/worker.py`, `scripts/production/test_worker.py` — receipt and rerun path.
+- `scripts/direct/progress_history.py`, `scripts/direct/test_progress_history.py` — pass status after exit 3.
+- `scripts/direct/assign.py`, `scripts/direct/assign_launcher_test_support.py`, `scripts/direct/test_assign_launcher.py` — exit-3 path and Astra rerun.
+- `scripts/agents/detached_runs.py`, `scripts/agents/test_detached_runs.py` — run-finished delivery, only if the cause is there.
+- `docs/as-built/long-lived-workers.md`, `docs/as-built/herdr-adoption.md` — the changed behavior.
+
+**Workers:** `1 writer` — `hook34`, which holds the Phase 34 and 34a design.
+
+**State:** none new.
 
 ### Phase 42 — A renamed unit keeps its workers  · status: done
 
