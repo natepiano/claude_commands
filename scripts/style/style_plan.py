@@ -39,6 +39,7 @@ from scripts.copies import copies
 from scripts.direct import phase_reservation
 from scripts.lib import berth_board
 from scripts.lib.git_blob import git_blob_id
+from scripts.lib.process_failure import failure_detail
 from scripts.style import coverage_report
 from scripts.style import bulk_rename
 from scripts.style import finding_sites
@@ -3207,7 +3208,7 @@ def restore_ticket_worker(run: Path, worktree: Path, plan: Path, ticket_id: str,
     for command in commands:
         result = subprocess.run(command, cwd=worktree, capture_output=True, text=True, check=False)
         if result.returncode:
-            raise style_ledger.LedgerError(result.stderr.strip() or result.stdout.strip() or "worker dispatch failed")
+            raise style_ledger.LedgerError(failure_detail(result) or "worker dispatch failed")
 
 
 def _next_phase(unit: str, plan: Path, repo: Path, run: Path | NoWorkerDispatch) -> NextPhase:
