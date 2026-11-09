@@ -3427,7 +3427,7 @@ The user (2026-11-07, through sdlc [4fdbe4b7]): "yes i definitely want this - ke
 7. **Submission and completion are two outcomes (plan review after Phase 32).** Today `assign.py` reads a successful dispatch return as completion, and its Astra path ends the worker and releases the role. Give submission and completion named outcomes. The completion actions (finish the pass, end or release a held role) move to the hook. Tests: after submission returns, the pass stays active and the role stays held. **Constraint from Phase 28f:** `worker.dispatch` (`scripts/production/worker.py:310`), not `assign.py`, now records `completed` (`progress_history.complete_dispatch(run, slot, instance_id)`) and closes the pane under one worker lock. The launcher's only pass-end record is `finish-pass --status error` for a failed managed Astra review (`assign.py` `execute_astra_review_herdr`), before `worker.py end`. That record moves to the hook with the no-DONE outcome: record `error` before `worker.py end`, and release the hold only after the end succeeds. A managed review hold (`astra_roles.hold` with `ExecProcess`) ends when the launcher exits; give it a named dispatch lifetime that survives the launcher's exit and ends through the hook. Tests: terminal no DONE records `error` before the end; the hold is released after a successful end and kept when the end fails; `live_roles` keeps the hold after the launcher exits.
 8. **One completion rule (plan review after Phase 32).** The C1210 exception is in `_dispatch_turn` after a quiet wait, not in `dispatch_receipt`, which returns `DispatchWaitingForRuns` when a finished run's result is absent. Extract one completion decision before the wait is deleted. The hook and a detached run's completion both call it; 6.4's tests go through both.
 9. **Default policy is a named state.** `worker.dispatch` and `worker_panes.start_or_resume` take `LaunchPolicy | None`, where `None` means the role's configured policy. When this phase changes those signatures, replace `None` with a named state (for example `ConfiguredRolePolicy`).
-10. **A slow start is not a stall (Phase 28e, folded in by sdlc [57452db1]).** When `assign.sh` types the job, herdr's `agent_prompt_stalled` (no working state within 5000 ms) is not a failure. The transcript records submission (`dispatch_receipt`); read it and return the submitted outcome. Test row: herdr reports the prompt stalled, the prompt is in the transcript, and the submission succeeds.
+10. **A slow start is not a stall (Phase 28e, folded in by sdlc [57452db1]).** When `assign.sh` types the job, herdr's `agent_prompt_stalled` (no working state within 5000 ms) is not a failure. The transcript records submission (`dispatch_receipt`); read it and return the submitted outcome. Test row: herdr reports the prompt stalled, the prompt is in the transcript, and the submission succeeds. Phase 28g added a configured start wait (`WORKER_PROMPT_START_SECONDS`, `_agent_command` `wait-start`) on the current dispatch path; at the merge keep this item's code and remove that key and action if nothing reads them.
 
 **Constraint from Phases 28 and 28a:** a blocked worker gives exit 4, prints `question: <worker> pane <pane>` and the pane lines (`worker._blocked_question`), and the director answers with `worker.py answer`. (1) Only a Codex worker stops on a question: a Claude pane worker has no `AskUserQuestion` tool (28a director proof). A Codex question ends no turn, so give the blocked state its own event to the director (herdr pane state `blocked`). Question handling is Codex-only. The 28a Codex answer proof passed; the Claude completion proof is Phase 28d's, so this phase depends on 28d before Claude completion moves into the Stop hook. (2) A turn end without `DONE` is not always a question: a pending detached run, a pending friend reply and `NO_DONE` are other outcomes. Name each outcome. Test that pending work keeps its pass id and saved launcher arguments, sends no question or recovery message, and submits no second prompt; after a friend's reply and the matching `DONE`, the same pass completes.
 
@@ -3634,22 +3634,19 @@ Case (natedev, 2026-11-08): accounts phase 1 sent jobs to two resumed Codex work
 
 `herdr.py:2376` (`submit_opening_prompt`) already treats `agent_prompt_stalled` as no failure and goes on to its transcript proof. This phase does not edit `herdr.py`.
 
-#### Work Order
+#### As-built
 
-**Goal:** a resumed worker that shows working later than 5 s after its prompt completes its pass. A worker that never starts its turn still exits 5.
+- `worker._dispatch_turn` (`scripts/production/worker.py`): when `herdr agent prompt --wait` raises `agent_prompt_stalled`, it runs `_agent_command(..., "wait-start")`. That is `herdr agent wait <pane> --until working --until blocked --until done --timeout <ms>`, with the ms from `WORKER_PROMPT_START_SECONDS`. A match goes on to the existing wait loop. A timeout or other herdr error goes to `_delivery_failure` (timeout: exit 5).
+- `config/direct.conf`: `WORKER_PROMPT_START_SECONDS=60`, range 1..600.
+- `herdr.py` is unchanged: `submit_opening_prompt` already treats the stall as no failure.
 
-**Spec:**
+**Files:**
+- `scripts/production/worker.py` — `_agent_command` `wait-start`; `_dispatch_turn` stall path.
+- `config/direct.conf` — `WORKER_PROMPT_START_SECONDS`.
+- `docs/as-built/herdr-adoption.md` — the start window.
+- Tests: `scripts/production/test_worker.py` (`test_stalled_dispatch_returns_stalled_and_never_retypes`: a delayed start and a start timeout).
 
-1. `config/direct.conf`: add `WORKER_PROMPT_START_SECONDS=60`, range 1..600, with the comment "Seconds a worker has to start its turn after a prompt." Put it after `WORKER_SETTLE_SECONDS`.
-2. `worker._dispatch_turn` (`scripts/production/worker.py`): when `_agent_command(..., "prompt", line)` raises `HerdrFailure` with code `agent_prompt_stalled`, run `herdr agent wait <pane> --until working --until blocked --until done --timeout <ms>`. Read the ms from `WORKER_PROMPT_START_SECONDS` through `conf.read("direct")`. On a match, go on to the existing wait loop. On a timeout or other failure, return through `_delivery_failure` as today.
-3. Use one place for the herdr call: the existing `_agent_command` or `Herdr` client path. Do not add a second subprocess call site.
-4. Test rows in `scripts/production/test_worker.py`: (a) herdr reports the prompt stalled, the start wait then sees working, and the pass completes with exit 0; (b) herdr reports the prompt stalled and the start wait times out: exit 5. Add the rows to the existing stall test, not a new test class.
-5. Docs: `docs/as-built/herdr-adoption.md` names the start window and its config key where it describes the dispatch prompt.
-6. Add no check, refusal, validation, retry or wait that this list does not name.
-
-**Files:** `config/direct.conf`, `scripts/production/worker.py`, `scripts/production/test_worker.py`, `docs/as-built/herdr-adoption.md`.
-
-**Phase 34 merge note:** Phase 34 returns at submission and treats the stall as submitted. At the Phase 34 merge, keep the Phase 34 code and remove `WORKER_PROMPT_START_SECONDS` if nothing reads it.
+**Binds later work:** Phase 34 returns at submission and treats the stall as submitted. At the Phase 34 merge, keep the Phase 34 code and remove `WORKER_PROMPT_START_SECONDS` and the `wait-start` action if nothing reads them.
 
 ## Reference
 
