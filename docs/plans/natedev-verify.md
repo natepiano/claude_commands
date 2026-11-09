@@ -1135,6 +1135,184 @@ Checkpoint `1f9e9c484` on `verify-not-mac-wait`, merged to builds as `a62793f07`
 - `test_verify_token_reclaim.py` matches the exact command text in `start_token_renewer`. A change to that line must update the hook, or the test waits to its 600 s timeout.
 - Reproduce memory growth only in `systemd-run --user --scope -p MemoryMax=3G -p MemorySwapMax=0`.
 
+### Phase 41s — A worktree and its branch end when their work lands  · status: done
+
+**Depends on:** none.
+
+#### As-built
+
+- `scripts/worktree/worktrees.py` has one CLI command, `make <path> <branch>`. `make_worktree.sh <path> <branch>` calls it. There is no `end` or `sweep` command, no timer and no cleanup path.
+- `make` runs `git worktree add`, then writes a `WorktreeRecord` to `~/.local/state/worktrees/made/<sha256 of the path>.json` (`WORKTREES_STATE_DIR` overrides the folder). The record holds `version`, `path`, `branch`, `repo`, `base`, `merge_branch`, `owner` and `made_at`. A failed record write removes the new tree and branch.
+- `owner` and `merge_branch` come from the caller's staff row (`member_by_folder`, then `merge_branch`). With no row, `merge_branch` is the `origin/HEAD` name and `owner` is `""`. A repository with no `origin/HEAD` records an empty merge branch, so no production merge ends that tree.
+- `landed(record) -> Landed | NotLanded(commits, paths)` reads `origin/<merge_branch>`. A commit counts as landed when `git cherry` marks it `-`, when it is a merge commit, or when it changes only `docs/plans/` paths. Each non-plan path changed since `base` must match the merge branch, or the merge branch must have changed it after the branch's last commit.
+- `end_landed(repo, merge_branch) -> list[Ended | Kept]` runs in `merge_checkpoint.py` after the merge-branch push reports `ok`, and each result is a `worktrees` step line. It keeps a tree that a staff row holds, a dirty tree, a tree whose HEAD is not the recorded branch, and a tree whose work has not landed. A `Kept` never fails the merge. Otherwise it removes the tree, deletes the branch local and on origin, then deletes the record. A missing tree, branch or remote branch is not an error, so the next merge finishes an end that stopped halfway.
+- The main checkout comes from the first entry of `git worktree list`. Git errors use `failure_detail`.
+
+**Files:**
+- `scripts/worktree/worktrees.py` — `make`, the record, the landing rule and `end_landed`.
+- `scripts/worktree/make_worktree.sh` — calls `worktrees.py make`.
+- `scripts/production/merge_checkpoint.py` — calls `end_landed` after its push (owner: sdlc).
+- `scripts/worktree/test_worktrees.py` — the record, landing, keep and end rows.
+- `scripts/production/test_merge_checkpoint.py` — the merge row (owner: sdlc).
+- `config/copies.conf` — allows `worktree/worktrees.py`, which makes original work trees.
+- `docs/as-built/staff-accessors.md` — lists `worktrees.py` as a staff reader.
+
+**Binds later work:** `config/copies.conf` keeps `allow.worktree/worktrees.py`. `test_original_worktree_helper_is_allowed_but_bare_worktree_add_is_refused` sets a private `WORKTREES_STATE_DIR`. A new worktree for unit work comes from `make_worktree.sh`, so the production merge can end it.
+
+**Gotchas:**
+- The copy guard's repository scan and failure-stream rule read every script, so a new module that makes a tree needs a copies allow-list entry.
+- A test that calls `make_worktree.sh` must set `WORKTREES_STATE_DIR`, or it writes a record into the real state folder.
+
+**Ruled out:** an `end` command, a sweep, a timer, and a call from `end_session.sh` or the phase-start merge — the user wants the landing step to end a tree, not a cleanup tool.
+
+### Phase 41t — The copy guard refuses only what makes a repository tree  · status: done
+
+**Depends on:** none.
+
+#### As-built
+
+- `shell_syntax` gives each word one of two states: a literal word or an expanded word. `copy_guard` turns them into `KnownArgument` and `UnknownArgument`, and an expanded word keeps its known text. After a lexer error, `readable_program` continues at the next `;`, `&`, `|` or newline, so a bad span does not hide the commands after it. No `bash -n` subprocess runs per hook call.
+- An expansion in an interpreter program is an unknown word, not an unknown program. `ExpandedProgramInput` sits beside `LiteralProgramInput`. Joined Python text keeps its known parts, and an attached `-c` with an expansion is a program. Python that does not parse passes, except an expanded program that holds a tree-making word: that one gets `cannot parse Python program`.
+- `refusal()`, the argv branch of `hook_refusal()` and `TreeCreation.__str__()` add the `copies.py` instruction only to a tree-making operation. An unresolved input gets a message that names what the guard could not read. A known tree-making operation keeps its refusal when an unresolved input comes before it in the same command.
+- A later assignment replaces an earlier one. `if`, `case`, `&&`, `||` and loop branches merge their values into `ArgumentChoices`; nested choices flatten and repeat values drop. `guard_choice_limit` (`config/copies.conf`, 32) bounds the combinations read for one command; above it the value is an `UnresolvedChoices`, so a tree-making position keeps its refusal.
+- The 22 commands of the phase command list give their expected results, and all 268 refused transcript commands pass. `scan_scripts` on `scripts/` reports no findings.
+- Four `scripts/direct` test flakes are closed: the run-place package root, the ssh-target claim in a child process, fixed clocks in the step record, and the hold-events environment restore. `local_hold_environment` restores only the keys it changed, in place of `mock.patch.dict`, which cleared `os.environ` while the `admission-readings` thread read it.
+
+**Files:**
+- `scripts/copies/shell_syntax.py` — word states and lexer recovery.
+- `scripts/copies/copy_guard.py` — program inputs, refusal text, branch value merges and the choice bound.
+- `scripts/copies/copies.py` — `guard_choice_limit()`: reads `config_settings()`, with a fallback to the repository `config/copies.conf` when the key is missing.
+- `config/copies.conf` — `guard_choice_limit=32` with its comment.
+- `scripts/copies/test_copy_guard.py` — command rows and `test_branch_arguments_require_linear_invocation_work`, which counts `inspect_invocation` calls.
+- `scripts/direct/verify_hold_wait_test_support.py`, `test_verify_hold_events.py`, `test_verify_run_place.py`, `test_verify_ssh_targets_retained.py`, `test_step_record.py` — the flake fixes.
+
+**Binds later work:** a new copies config key follows the required-key form of `guard_choice_limit()`. A guard change keeps `scan_scripts` on `scripts/` under one second per file, and keeps `test_branch_arguments_require_linear_invocation_work` green.
+
+**Gotchas:**
+- Without the bound, branch-aware merges grow as a product of branches and variables: `scripts/rust_style/load-rust-style.sh` took 63 s of CPU against a 10 s hook budget.
+- The hold-events cause is a race found by reading the code; no process that outlives the test was found.
+- Above the bound, a choice-limited interpreter program is refused even when it makes no tree; the phase "A command that makes no tree passes at the copy guard's branch limit" removes that refusal.
+
+### Phase 41v — A command that makes no tree passes at the copy guard's branch limit  · status: done
+
+**Depends on:** 41t.
+
+#### As-built
+
+- Above `guard_choice_limit`, `UnresolvedChoices` keeps the texts of the dropped values in `choice_texts`. `_retained_choice_texts` collects them in one linear walk, with no combinations, so the work for one command stays linear in branches and variables.
+- An interpreter program built from such a word is a `ProgramWithChoiceTexts(text, choice_texts)`, read like an expanded program. `eval`, `bash -c` and `python -c` accept it.
+- The guard refuses it with "cannot resolve interpreter program choices" only when the known text or a kept text holds a tree-making word: `TREE_COMMAND`, or `copytree|clone_from|worktree|Repo.clone` for Python (`_tree_making_text`). A program with no tree word passes, so a long branch command that only prints runs.
+- A known tree-making operation keeps its refusal, and an unknown word in a tree-making position keeps `cannot resolve executable name`.
+
+**Files:**
+- `scripts/copies/copy_guard.py` — choice text retention and the narrowed program refusal.
+- `scripts/copies/test_copy_guard.py` — above-choice-limit rows: shell printf passes; shell clone, shell runner, copytree, git options and a 33-arm `eval` refuse.
+
+**Binds later work:** a guard change keeps `test_branch_arguments_require_linear_invocation_work` green and keeps the above-choice-limit rows.
+
+**Gotchas:**
+- A tree word split between a literal and a dropped value (`gi${v}` with `t` in a dropped value) passes above the limit.
+- `python3 -c "shutil.copytree('$UNSET', ...)"` and `bash -c "$UNSET/git -C . clone . dest"` pass; their top-level forms refuse. Recorded in the next-items file.
+
+**Ruled out:** refuse every choice-limited program — that is the false refusal this phase removes.
+
+### Phase 41u — copies.py list shows remote mirrors  · status: done
+
+**Depends on:** 41t. Runs after 41v.
+
+#### Work Order
+
+**Source:** builds, 2026-11-08, moving queue-unit Phase 17 to this unit. Queue order was 18c, then 16, then 17. Builds rulings of 2026-11-05: the verify 35b unit keeps the 26 simplify items; the copy start object scan moved to natest's copies.py Git-work speed phase. On `copies.py` the second lander resolves.
+
+**Goal:** `copies.py list` answers who holds a mirror.
+
+**Spec:**
+1. **List.** `copies.py list` prints a header row with labeled columns, the number column included: owner, repository, host, path and session. It shows remote mirrors. The owner column shows the current staff name, looked up from the row id; a role owner shows its role name. Today it shows local standing checkouts only and skips `.remote-mirrors` (`list_trees`, `copies.py:1038`). Local rows keep the facts they show today: commit, busy state, holder pid and target size. `test_list_reports_tree_owner_repo_commit_busy_pid_and_target_size` keeps its assertions.
+2. **Holder states (architect review of queue 18, 2026-11-06).** `RemoteMirror.session` stays stored after `remote_lease()` ends, so it can name a former holder. The session column names a holder only with live lease evidence. A mirror is in one of three named states: held (the holder's current staff name, read from its session), idle, or unavailable.
+   - **A live lease does not prove the stored holder (architect review of 41t, 2026-11-08).** A run takes `remote_lease()` (`offload.py:2333`) before it publishes its session with `register_remote()` (`offload.py:2124`). During admission and copy, the record can still name the former holder. `register_remote()` (`copies.py:1357`) already stores `holder_pid` (`os.getpid()`). Name the holder only when the lease pid from `held_flock_keys` equals the record's `holder_pid`. When the pids differ, or the record has no `holder_pid`, the mirror is held with the holder not yet recorded. Prove on the real call path that the lease and the registration come from one process.
+   - **Holder name (architect review of 41t).** The stored session is a session id or `pid-<pid>` (`holder_session()`, `offload.py:2447`), not a staff row id. Look up the name with `staff.local_snapshot().by_current_session()` (`scripts/production/staff.py:484`). Convert its `None` result, or a staff read error, into a named holder-name-unavailable state at that boundary. A held mirror with an unavailable holder name stays held.
+   - `held_remote_mirrors()` (`copies.py:1340`) returns `()` when `/proc/locks` cannot be read, and `file_lock.lock_holder()` returns `None` for several outcomes. Neither tells idle from unavailable.
+   - Add a list reader in `copies.py` that reads `file_lock.held_flock_keys` once and calls `file_lock.device_key` per mirror. An unreadable lock table makes every mirror unavailable. A missing lease file makes the mirror idle. Any other read error makes it unavailable.
+   - Do not change `held_remote_mirrors()`, `lock_holder()` or `scripts/lib/file_lock.py`; their other callers keep their behavior.
+3. **Owner and holder are two columns (architect review of queue 18c, 2026-11-07).** `request_mirror` carries an owner and a holder as two values (`offload.py:2342`). The owner column shows the mirror's owner. The session column shows the live holder. Each has its own display rule. A role owner keeps its fixed role name.
+4. **Owner name states (architect review of queue 18c).** `owner_name` returns the raw row id when the staff read fails or the row is missing (`copies.py:84`). The list must not show a row id. The owner is in one of these named states: a current staff name, a role name, or unavailable. An unavailable owner keeps its row in the list and keeps its lease state.
+   - `owner_name()` also gives names to `tree_paths()` (`copies.py:431`) and `_scratch_gate_word()` (`copies.py:559`), so a change to its fallback can move checkout folders. Do not change `owner_name()`. Add a list-only owner display result with the three states, convert a missing staff row at that boundary, and keep the stored owner identity.
+5. **Proof.** List tests for remote-only records and for mixed local and remote records. Lease-state tests for held, idle and unavailable, with a former holder that the list does not name. A renamed owner with a different live holder shows the new owner name and the holder. A missing staff row shows the owner as unavailable, keeps the row and keeps its lease state. Lease-evidence tests: a missing lease file shows idle; an unreadable lock table shows unavailable; on macOS, where `/proc/locks` does not exist, the list shows unavailable and does not fail. A test proves that `tree_paths()` and `_scratch_gate_word()` give the same folders as before. Holder tests: a held lease whose pid differs from the record's `holder_pid` does not name the stored session; a held lease with no staff row for the holder session stays held with the holder name unavailable.
+
+**Files:**
+- `scripts/copies/copies.py` — the list.
+- `scripts/copies/test_copies.py`, `scripts/copies/test_remote_copies.py` — the tests.
+
+**Constraints from prior phases:**
+- Phase 41t: `guard_choice_limit()` (`copies.py:301`) reads `config_settings()` and falls back to the repository `config/copies.conf` when the key is missing. A new copies key follows the same required-key form. Keep the key, the fallback and the bound.
+- Phase 41t: `test_branch_arguments_require_linear_invocation_work` in `test_copy_guard.py` stays green.
+
+**Workers:** 1 writer + 1 tester — `impl` owns `copies.py`; `test` owns `test_copies.py` and `test_remote_copies.py`.
+
+**Acceptance gate:**
+- The copies suites pass, `test_copy_guard.py` included; `basedpyright` reports 0 errors and 0 warnings on the changed files.
+- The director runs the targeted test.
+- Change-Review: `copies.py list` output.
+
+### Phase 41w — Two helper starts in the verify wait tests load less  · status: todo
+
+**Depends on:** none. Runs after 41u.
+
+#### Work Order
+
+**Source:** builds, 2026-11-08, from natest's measurement on scratch copies (natest run `/tmp/claude/unit/2113de4f-9913-485a-9a51-61558bfd81db/phases/95/behavior_map.md`, sections "Target prototype" and "Recorder prototype"). The showrunner gives the user the before and after numbers.
+
+**Goal:** `test_verify_wait_holder.py` uses less CPU per run, with every target decision and recorder result unchanged.
+
+**Spec:**
+1. **Target selection.** Move `Routed`, `Pinned`, `TargetSelection` and `ROUTED` (`step_record.py:273-283`) to a new small module `scripts/direct/step_selection.py`. `step_record.py` and `build_targets.py` (`build_targets.py:148`) import them from there, so a `build_targets.py` start no longer loads the full step recorder. Measured on a scratch copy: 2.4 CPU s less per run of `test_verify_wait_holder.py`.
+2. **Recorder import.** Move the `cell_value` import (`unit_config.py:22`) from module scope into `unit_config.parse_port_cell` (`unit_config.py:75`), its only use in that file. A recorder start then does not load the production document and showrunner modules. Measured on a scratch copy: 1.6 CPU s less per run.
+3. **Callers.** Tests that name these types (`test_verify_routing_rule.py:24`, `test_step_record.py`, `test_verify_step_state.py`) import them from `step_selection.py`. Keep one definition of each type.
+4. **Measure.** The director runs `~/.claude/scripts/lib/py scripts/test_times/module_cost.py --tree <tree> --tests 40 --commands 10 direct/test_verify_wait_holder.py` three times on the phase-start tree and three times on the final tree, and reports the median CPU s of each.
+
+**Files:**
+- `scripts/direct/step_selection.py` — the new selection types module.
+- `scripts/direct/step_record.py` — imports the selection types.
+- `scripts/build_targets/build_targets.py` — imports the selection types (owned by another unit; the checkpoint notice names it).
+- `scripts/production/unit_config.py` — the local `cell_value` import (owned by another unit; the checkpoint notice names it).
+- `scripts/direct/test_verify_routing_rule.py`, `scripts/direct/test_step_record.py`, `scripts/direct/test_verify_step_state.py` — import changes only.
+
+**Constraints from prior phases:**
+- Phase 41p: each `build_targets.py` subcommand imports only what it uses. Keep that form.
+
+**Workers:** 1 writer — `impl` owns every file above. The work is import moves; no test lane.
+
+**Acceptance gate:**
+- `test_verify_wait_holder.py`, `test_step_record.py`, `test_verify_routing_rule.py`, `test_verify_step_state.py`, `test_build_targets.py` and `test_unit_config.py` pass with no assertion changed; `basedpyright` reports 0 errors and 0 warnings on the changed files.
+- The director runs the targeted test and the before and after measurement of Spec item 4.
+
+### Phase 41x — The final gate runs the repository's own gate in a repository with no Cargo  · status: todo
+
+**Depends on:** none. Runs after 41w.
+
+#### Work Order
+
+**Source:** builds, 2026-11-08, an anomaly from sdlc. In the `~/.claude` models unit worktree (at 3535b65d7), `verify.sh final` exits 2 with `could not find Cargo.toml`. It did not block that unit.
+
+**Goal:** a unit run in a repository with no `Cargo.toml` reaches its final gate with a gate that fits the repository, and `verify.sh` names the cause in one line when it is called there.
+
+**Spec:**
+1. **Cause.** <FinalGate/> step 1 (`docs/direct/final_gate_commit.md:11`) launches `verify.sh final` in every repository. `verify.sh` is the Cargo verifier: in a repository with no `Cargo.toml`, cargo prints `could not find Cargo.toml` and `verify.sh` exits 2. The writer confirms this on the real path before the edit and quotes the line that runs cargo.
+2. **Final gate.** <FinalGate/> step 1 launches `verify.sh final` only in a Cargo repository (a `Cargo.toml` at the repository root). In a repository with no `Cargo.toml`, it runs that repository's unit gate. If config already names a unit gate per repository, the doc names that config. Otherwise it names the `~/.claude` gate, `targeted_test.py --checkout <tree>`, with no other repository. Step 2's failure path applies to both gates.
+3. **verify.sh.** In a repository with no `Cargo.toml`, each `verify.sh` command exits 2 before any cargo call, with one line: `verify.sh: <root> has no Cargo.toml; verify.sh checks Cargo repositories only`.
+4. **Proof.** One row in the existing test that runs `verify.sh` in a temporary repository: a git repository with no `Cargo.toml` gets exit 2, the line from item 3, and no cargo start. The row fails on the current tree.
+
+**Files:**
+- `docs/direct/final_gate_commit.md` — the gate choice (owned by sdlc; the checkpoint notice names it).
+- `scripts/direct/verify.sh` — the early exit.
+- the existing `scripts/direct/test_verify_*.py` test that runs `verify.sh` in a temporary repository — the row.
+
+**Workers:** 1 writer — `impl` owns every file above.
+
+**Acceptance gate:**
+- The changed test module passes with no assertion changed; `basedpyright` reports 0 errors and 0 warnings on the changed test file.
+- The director runs the targeted test.
+
 ### Phase 41c — Send a lint that waits for memory to a free Mac  · status: done
 
 #### As-built

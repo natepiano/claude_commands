@@ -17,7 +17,7 @@ import tempfile
 import threading
 import time
 import unittest
-from collections.abc import Callable, Generator
+from collections.abc import Callable, Generator, Mapping
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
@@ -68,9 +68,25 @@ class CallWithHoldWait(CallRecord):
 def read_cycle_file(path: Path) -> build_hold.HoldCycle:
     return cast(build_hold.HoldCycle, json.loads(path.read_text()))
 
+
+@contextmanager
+def local_hold_environment(environment: Mapping[str, str]) -> Generator[None, None, None]:
+    """Restore changed keys without clearing the admission reader's environment."""
+    previous_values = {name: os.environ[name] for name in environment if name in os.environ}
+    try:
+        os.environ.update(environment)
+        yield
+    finally:
+        for name in environment:
+            if name in previous_values:
+                os.environ[name] = previous_values[name]
+            else:
+                _ = os.environ.pop(name, None)
+
+
 def grant_call(path: Path) -> None:
     release = path.parent.parent
-    with mock.patch.dict(os.environ, {
+    with local_hold_environment({
         "BUILD_HOLD_DIR": str(release.parent / "build-hold"),
         "BUILD_HOLD_RELEASE_DIR": str(release),
         "UNIT_ACTIVE_DIR": str(release.parent / "active"),
@@ -83,7 +99,7 @@ def grant_call(path: Path) -> None:
 
 def change_cycle(path: Path, change: Callable[[build_hold.HoldCycle], None]) -> None:
     release = path.parent.parent
-    with mock.patch.dict(os.environ, {
+    with local_hold_environment({
         "BUILD_HOLD_DIR": str(release.parent / "build-hold"),
         "BUILD_HOLD_RELEASE_DIR": str(release),
         "UNIT_ACTIVE_DIR": str(release.parent / "active"),
