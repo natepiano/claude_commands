@@ -1915,3 +1915,41 @@ Each stop sends sdlc one message through `session_send.send_argv`, after the res
 **Gotchas:**
 - `WholeMachine` mode has no admission, so it has no memory stop.
 - A tripwire result never reruns; its memory-stop message says "the gate fails".
+
+### Phase 95 — The verify wait-holder test file uses half its CPU  · status: done
+**Depends on:** none
+
+#### Work Order
+
+**Source:** the phase backlog (`docs/plans/builds-natest-next.md`, Order item 6, amended by the Phase 93 architect review). `show.py top` at 11:00 EST on 2026-11-08 ranks `direct/test_verify_wait_holder.py` fourth, at 113.531 CPU s median over five gates. The three above it are held: `types/basedpyright` (never), `direct/test_assign_launcher.py` (Phase 89, blocked), `agents/test_codex_mesh.py` (retires). The builds showrunner gave the go on 2026-11-08.
+
+**Goal:** `scripts/direct/test_verify_wait_holder.py` (29 tests, 113.5 CPU s gate median) uses half its CPU, or a measured floor shows why it cannot, with every checked behavior kept.
+
+**Spec:**
+1. Follow the Speed method. Measure CPU with `module_cost.py --tests 10 --commands 10` on the merged tree first. Name each test's CPU, and each real process that it starts (`verify.sh`, `bash`, `python3`, `build_targets.py`, `mac_test.py`).
+2. Write a behavior map: one row for each assertion, with the behavior it checks. No assertion is removed or weakened.
+3. Move a test to a direct call only where a narrow function already exists. Keep the real event pipe and process checks for holder changes, reservation races, the pinned wait and queue age.
+4. Hold each case dominated by real `build_targets.py` commands for verify's import change, and each routing decision with no narrow function for verify's function change. Write the floor for each held case with its CPU s, and send the director an architecture proposal with its measured gain.
+5. Share setup across a class where the tests do not change it (`setUpClass`, one seeded tree copied per test). Give each changed support file one owner. Read the importers of a changed support file before you change it; every importer stays green.
+6. Add no guard, refusal or check (user rule, 2026-11-05).
+
+**Files:**
+- `scripts/direct/test_verify_wait_holder.py`
+- `scripts/direct/verify_token_wait_test_support.py`
+- `scripts/direct/verify_hold_wait_test_support.py`
+
+**Workers:** 1 writer; one test file and its two fixtures do not split
+- `impl` — `test_verify_wait_holder.py`, hub: `verify_token_wait_test_support.py`, `verify_hold_wait_test_support.py`
+
+**Constraints from prior phases:**
+- Phase 76: the verify hold and token wait fixtures make no live `/tmp/claude/unit` read.
+- Phase 91: `VerifySshTargetsFixture.control_admission_clock()` freezes the admission client clock for result tests; the leave hook retrying a free non-Mac target while local admission waits is the intended policy (verify-unit, 2026-11-08). Fix such flakes in tests, not in `verify.sh`.
+- `docs/plans/natedev-verify-test-cost.md` holds the verify test cost method and the file order.
+- Tests never read or write live state: `~/.claude` main, `~/.local/state/merge-gate`, `/tmp/claude`.
+
+**Acceptance gate:**
+- The behavior map has a row for each assertion. No assertion is removed.
+- CPU s, processes, execs and wall s before and after, from `module_cost.py` and same-load pairs, in the checkpoint notice.
+- The changed file and every importer of a changed support file pass.
+- the targeted test green on the phase commit merged with `origin/builds`
+- `basedpyright` on the changed files prints `0 errors, 0 warnings, 0 notes`
