@@ -200,7 +200,7 @@ For active process redesigns, as we are currently undergoing with promotions and
 
 **Gotchas:** A Python 3.10 interpreter cannot run `findings.py` or `progress_history.py`; `lib/py` skips it. A cache file under the old `python3-3.10` key is not read.
 
-### Phase 7 — Did the changes cut rounds and keep the work  · status: todo
+### Phase 7 — Did the changes cut rounds and keep the work  · status: done
 **Depends on:** Phase 5, Phase 6 (it redefines the `history.py rounds` medians and shares)
 **Blocked by:** for each adopted proposal, 30 completed, non-mixed exposed phases that started after the time Phase 5 records, zero-repair phases included, with exposure as that proposal's **Measure** defines it.
 
