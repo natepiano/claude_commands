@@ -711,6 +711,7 @@ def refresh_remotes(tree: Path, source: Path) -> None:
 
     source_references = references(source, refs, "refs/heads")
     current_refs = references(tree, "refs/remotes/origin", "refs/remotes/source")
+    mappings: list[str] = []
     for remote, remote_url, source_refs in (("origin", url, refs), ("source", str(source), "refs/heads")):
         mapping = f"+{source_refs}/*:refs/remotes/{remote}/*"
         for key, value in ((f"remote.{remote}.url", remote_url),
@@ -725,7 +726,9 @@ def refresh_remotes(tree: Path, source: Path) -> None:
         if current != expected:
             # Pruning keeps symbolic HEAD refs. Remove them before copying the source's refs.
             _ = git(tree, "update-ref", "--no-deref", "-d", prefix + "HEAD")
-            _ = git(tree, "fetch", "-q", "--prune", "--", str(source), mapping)
+            mappings.append(mapping)
+    if mappings:
+        _ = git(tree, "fetch", "-q", "--prune", "--", str(source), *mappings)
 
 
 def final_object_store(store: Path) -> Path:
