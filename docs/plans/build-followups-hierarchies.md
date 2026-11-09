@@ -768,3 +768,28 @@ Acceptance: the targeted test, the package import bootstrap and basedpyright are
 - The `test_roster.py` `fixture_process` stand-in takes the `reported` pane session and passes it to `native_process`.
 - The cause was in `assign.py`. Since panes 28f the worker records a completed pass end and closes its pane. The launcher now records a pass end only as `error`: `failed_pass_command()` replaces `finish_pass_command(status)`.
 - The launcher tests now expect one new pane for each assign after a done pass. The refusal test for an unproved worker is kept.
+
+### Phase 31 — A bare worker name reaches only the sender's own unit's worker  · status: done
+
+#### Work Order
+
+**Goal:** `send.py --to <bare worker name>` from a worker or a unit director reaches the worker of that name in the sender's own unit, and fails as ambiguous when the sender's unit has no such worker and other units do. It never picks another unit's worker.
+
+**Spec:**
+- Defect (builds showrunner, 2026-11-09): worker `impl2` of builds' `report` unit ran `send.py --to test2`. The message reached `sdlc/hierarchies/test2`, not `builds/report/test2`. Staff holds three workers named `test2`: under `report`, `panes` and `hierarchies`.
+- Find the path that picked `hierarchies/test2`. Start at `send.resolve_staff_recipient` (`scripts/message/send.py:2109`) and the roster lookup that runs before it (`resolve_recipient`, about line 2259, and the observed roster match). Name the cause in the summary.
+- Rule for a bare worker name: resolve it among the workers of the sender's own unit first. The sender's unit is the sender itself when it is a unit director, and the sender's parent director when the sender is a worker. If that unit has no worker of that name, never select another unit's worker by the bare name: when only other units' workers match, fail as ambiguous with the existing ambiguity message, and list the full paths. A bare name that matches a non-worker row (a unit or a showrunner) keeps its current behavior. A full path (`<unit>/<worker>`, `<production>/<unit>/<worker>`, `worker:<unit>/<worker>`) keeps its current behavior.
+- One resolution rule for all callers. Do not copy the rule into a second place. Repair it where the defect lives.
+- Add rows to the existing send tests. Do not add a new test file. Cover: a worker sender with a same-unit match and a second unit's row of the same name; a unit director sender; a worker sender whose unit has no such worker while one other unit does (fails, no delivery), and while two other units do (ambiguous); and a full path that still reaches another unit's worker.
+- Tests use fixture staff and fixture rosters only. No live unit, pane or session.
+
+**Files:**
+- `scripts/message/send.py` — bare worker name resolution.
+- `scripts/message/test_send*.py` — rows added to the existing tests that cover recipient resolution.
+
+**Workers:** 1 writer; the fix and its test rows touch one module and its tests, so nothing splits.
+- `impl` — `scripts/message/send.py` and its existing test files.
+
+**State:** none.
+
+**Acceptance gate:** the send tests pass; the targeted test is green; basedpyright reports 0 on `scripts/message`.
