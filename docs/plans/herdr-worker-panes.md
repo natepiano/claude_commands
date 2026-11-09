@@ -3423,7 +3423,7 @@ A question has no outcome of its own (sdlc [cb2d951c]): the worker writes it in 
 - `scripts/production/worker.py` — `dispatch`, `dispatch_turn`, `DispatchSubmission`, `_compact_before_dispatch`.
 - `scripts/direct/progress_history.py` — `DispatchDelivery`, `CompletionActions`, `HookCompletion`, `save_hook_completion`, `ActiveDispatch`.
 - `scripts/direct/assign.py`, `assign.sh`; `scripts/herdr/worker_panes.py` (`turn_end_command`); `scripts/agents/detached_runs.py`; `scripts/astra/astra_review.py`, `design_roles.py`.
-- Docs: `commands/unit/direct.md`, `commands/unit/worker.md`, `commands/showrunner/worker.md`, `docs/direct/launch_implementation.md`, `dual_review.md`, `early_review.md`, `docs/as-built/long-lived-workers.md`, `herdr-adoption.md`.
+- Docs: `commands/unit/direct.md`, `commands/unit/worker.md`, `commands/showrunner/worker.md`, `docs/direct/launch_implementation.md`, `dual_review.md`, `early_review.md`, `docs/as-built/long-lived-workers.md`, `herdr-adoption.md`, `staff-accessors.md` (the hook's row).
 - Tests: `scripts/production/test_worker.py`, `scripts/direct/test_assign_launcher*.py` (the shared fixture `assign_launcher_test_support.py` calls the completion hook), `test_progress_history.py`, `scripts/astra/test_astra_review.py`, `test_design_roles.py`, `scripts/herdr/test_worker_panes.py`, `scripts/agents/test_detached_runs.py`.
 
 **Binds later work:** a director ends its turn after a dispatch and acts on the hook message. Completion code runs only in the hook path; the launcher never waits on a worker.
