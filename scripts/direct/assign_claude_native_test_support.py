@@ -72,6 +72,7 @@ class ClaudeLauncherFixture(support.AssignClaudeLauncherFixture):
     @override
     def setUp(self) -> None:
         self.root: Path = self.fixture_root
+        self.addCleanup(shutil.rmtree, self.fixture_root)
         _ = shutil.copytree(self.fixture_snapshot, self.root)
         self.history_dir: Path = self.root / "history"
         self.working_dir: Path = self.root / "project"
@@ -80,10 +81,6 @@ class ClaudeLauncherFixture(support.AssignClaudeLauncherFixture):
         self.assign_script: Path = self.root / "scripts/direct/assign.sh"
         _ = self.staff_parent
         _ = (self.root / "claude-bin").write_text(self.cli_shim())
-
-    @override
-    def tearDown(self) -> None:
-        shutil.rmtree(self.root)
 
     def cli_shim(self) -> str:
         return CLAUDE_REPLY_SHIM.replace("__PYTHON__", shlex.quote(sys.executable))
