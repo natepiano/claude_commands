@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import json
+import io
 import os
+from contextlib import redirect_stdout
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -135,6 +137,29 @@ class MemoryFeedTests(unittest.TestCase):
                 _ = self.configuration.write_text(remaining)
                 with conf.diagnostics(report=False), self.assertRaisesRegex(conf.Unusable, key):
                     _ = memory_feed.read_configuration(conf.read(self.configuration))
+
+    def test_link_prints_the_configured_folder_with_the_review_host_and_port(self) -> None:
+        root = self.root / "review-links"
+        folder = root / "fixture folder"
+        _ = self.configuration.write_text(f"output_folder={folder}\n")
+        _ = (self.root / "review_links.conf").write_text("# whole: 1..65535\nserver_port=9432\n")
+        output = io.StringIO()
+        with (mock.patch.dict(os.environ, {"REVIEW_LINKS_ROOT": str(root), "REVIEW_LINKS_HOST": "fixture.example."}),
+              mock.patch.object(memory_feed, "publish_page", side_effect=AssertionError("The link must not publish the page")),
+              redirect_stdout(output)):
+            self.assertEqual(memory_feed.main(["link"]), 0)
+        self.assertEqual(output.getvalue(), "http://fixture.example:9432/fixture%20folder/memory_live.html\n")
+        self.assertFalse(root.exists())
+
+    def test_link_refuses_a_folder_outside_the_review_root_with_one_plain_line(self) -> None:
+        root = self.root / "review-links"
+        output = io.StringIO()
+        with (mock.patch.dict(os.environ, {"REVIEW_LINKS_ROOT": str(root), "REVIEW_LINKS_HOST": "fixture.example"}),
+              redirect_stdout(output)):
+            self.assertEqual(memory_feed.main(["link"]), 1)
+        self.assertEqual(len(output.getvalue().splitlines()), 1)
+        self.assertTrue(output.getvalue().startswith("Build page link: "))
+        self.assertFalse(self.output.exists())
 
     def test_start_publishes_the_page_before_the_first_queue_reading(self) -> None:
         def view() -> gate.QueueRead:

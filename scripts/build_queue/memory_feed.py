@@ -51,6 +51,7 @@ from scripts.message import unit_labels
 from scripts.lib import conf
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.user_zone import user_zone
+from scripts.review_links import review_link
 
 GIB = 1024 ** 3
 CI_CGROUP = Path("/sys/fs/cgroup/hana.slice/hana-ci.slice")
@@ -66,17 +67,23 @@ class FeedConfiguration:
     report_refresh_seconds: int
 
 
+def configured_output_folder(settings: conf.ConfigRead) -> Path:
+    """Expand the configured page folder."""
+    return Path(os.path.expandvars(settings.text("output_folder"))).expanduser()
+
+
 def read_configuration(settings: conf.ConfigRead | conf.UseConfiguredValue = conf.UseConfiguredValue.CURRENT) -> FeedConfiguration:
     """Read the page settings from one configuration."""
     if isinstance(settings, conf.UseConfiguredValue):
         settings = conf.read("memory_feed")
-    return FeedConfiguration(Path(os.path.expandvars(settings.text("output_folder"))).expanduser(),
+    return FeedConfiguration(configured_output_folder(settings),
                              settings.number("interval_seconds"), settings.whole("history_days"),
                              settings.whole("swap_rows"), settings.whole("report_refresh_seconds"))
 
 
 class PageArguments(CodeRootArguments):
     once: bool = False
+    command: Literal["feed", "link"] = "feed"
 
 
 def page_arguments(argv: Sequence[str]) -> PageArguments:
@@ -84,7 +91,22 @@ def page_arguments(argv: Sequence[str]) -> PageArguments:
     _ = parser.add_argument("--once", action="store_true", help="Write one reading and exit.")
     _ = parser.add_argument("--code-root", type=Path, default=PageArguments.code_root,
                             help="Read the installed admission code from this repository.")
+    commands = parser.add_subparsers(dest="command")
+    _ = commands.add_parser("link", help="Print the build memory page link.")
+    parser.set_defaults(command="feed")
     return parser.parse_args(argv, namespace=PageArguments())
+
+
+def page_link() -> int:
+    """Print the configured page URL without publishing a reading."""
+    try:
+        folder = configured_output_folder(conf.read("memory_feed")).resolve()
+        url = review_link.snapshot_url(review_link.review_root().resolve(), folder / "memory_live.html")
+    except review_link.SNAPSHOT_ERRORS as error:
+        print(f"Build page link: {error}")
+        return 1
+    print(url)
+    return 0
 
 
 def publish_page(configuration: FeedConfiguration) -> None:
@@ -691,6 +713,8 @@ def page_json(payload: MemoryPage | RetainedReading | PageUnavailable) -> str:
 
 def main(argv: Sequence[str]) -> int:
     args = page_arguments(argv)
+    if args.command == "link":
+        return page_link()
     configuration = read_configuration()
     publish_page(configuration)
     target = configuration.output_folder / "memory.json"
