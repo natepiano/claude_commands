@@ -504,7 +504,6 @@ def preflight(request: RequestedUnitLaunch, selected: ClaudeLaunchAccount, *,
     plan_context: ProductionPlanRequired | ExistingConversationPlan = ProductionPlanRequired()
     if (isinstance(existing, ExistingUnitRow)
             and isinstance(request.session, ResumedSession)
-            and isinstance(request.session.handoff, ResumeStoppedSession)
             and request.plan_cell == existing.plan):
         plan_context = ExistingConversationPlan()
     if isinstance(request.session, ResumedSession) and isinstance(existing, ExistingUnitRow):

@@ -98,11 +98,10 @@ def _committed(doc: Path) -> None:
 
 
 def check_director(name: str, marked: unit_lookup.LabeledSession, claude: unit_lookup.LiveClaude,
-                   worktree: Path, document: Path) -> None:
-    """Require an idle director, a clean worktree, and a committed document."""
+                   worktree: Path) -> None:
+    """Require an idle director and a clean worktree."""
     _quiet(name, marked, claude)
     _settled(name, claude, worktree)
-    _committed(document)
 
 
 def checked(name: str, child_name: str, doc: Path, *,
@@ -148,7 +147,8 @@ def checked(name: str, child_name: str, doc: Path, *,
     if marked is None or not isinstance(marked.claude, unit_lookup.LiveClaude):
         raise Refusal(f"{name} has no live session under {parent.name}")
     claude = marked.claude
-    check_director(name, marked, claude, worktree, child.doc)
+    check_director(name, marked, claude, worktree)
+    _committed(child.doc)
     # Only the unit's herdr tab will end before the same-named destination starts.
     directory = showrunner_account_directory()
     ending = add_showrunner.EndingUnitTab(marked.place.pane)
