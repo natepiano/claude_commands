@@ -25,6 +25,7 @@ from unittest import mock
 from scripts.build_queue import admission_protocol as wire
 from scripts.build_queue.admission_test_support import AdmissionFixture, caller_admission, only_admitted
 from scripts.lib import build_folders
+from scripts.lib.git_test_support import write_fixture_git_config
 from scripts.lint import memory_admit, sweep
 from scripts.lint.memory_test_support import fake_memory_readings, write_config_fixture
 from scripts.production import merge_gate, staff, targeted_test
@@ -407,9 +408,7 @@ class MergeGateFixture(unittest.TestCase):
         self.state = self.root / "state"
         self.quiet_production = self.root / "quiet-production.md"
         home = self.root / "home"
-        # Disable detached maintenance so Git cannot remove objects during snapshot copies.
-        git_config = root / "git-config"
-        self.write(git_config, "[maintenance]\n\tauto = false\n")
+        git_config = write_fixture_git_config(root.parent)
         self.environment = {
             **os.environ, "HOME": str(home), "STAFF_FILE": str(home / "staff.json"), "XDG_STATE_HOME": str(home / "state"),
             "CODEX_HOME": str(home / "codex"), "GIT_CONFIG_NOSYSTEM": "1",
