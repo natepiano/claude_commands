@@ -1282,31 +1282,22 @@ Checkpoint `1f9e9c484` on `verify-not-mac-wait`, merged to builds as `a62793f07`
 
 ### Phase 41x — The final gate runs the repository's own gate in a repository with no Cargo  · status: done
 
-**Depends on:** none. Runs after 41y.
+#### As-built
 
-#### Work Order
-
-**Source:** builds, 2026-11-08, an anomaly from sdlc. In the `~/.claude` models unit worktree (at 3535b65d7), `verify.sh final` exits 2 with `could not find Cargo.toml`. It did not block that unit.
-
-**Goal:** a unit run in a repository with no `Cargo.toml` reaches its final gate with a gate that fits the repository, and `verify.sh` names the cause in one line when it is called there.
-
-**Spec:**
-1. **Cause.** <FinalGate/> step 1 (`docs/direct/final_gate_commit.md:11`) launches `verify.sh final` in every repository. `verify.sh` is the Cargo verifier: in a repository with no `Cargo.toml`, cargo prints `could not find Cargo.toml` and `verify.sh` exits 2. The writer confirms this on the real path before the edit and quotes the line that runs cargo.
-2. **Final gate.** <FinalGate/> step 1 launches `verify.sh final` only in a Cargo repository (a `Cargo.toml` at the repository root). In a repository with no `Cargo.toml`, it runs that repository's unit gate. If config already names a unit gate per repository, the doc names that config. Otherwise it names the `~/.claude` gate, `targeted_test.py --checkout <tree>`, with no other repository. Step 2's failure path applies to both gates.
-3. **verify.sh.** In a repository with no `Cargo.toml`, each `verify.sh` command that reaches repository setup exits 2 before any cargo call, with one line: `verify.sh: <root> has no Cargo.toml; verify.sh checks Cargo repositories only`. The paths that run before repository setup keep their current results: help (`-h`, `--help`, `help <command>`, the case block after the comment "Help returns before environment setup"), the `final-pass` refusal and the `final --saved` query (after the comment "Read-only queries run before environment setup").
-4. **Proof.** One row in `test_verify_check_no_library.py`: a real git repository with no `Cargo.toml` gets exit 2, the line from item 3, and no cargo start. Run `verify.sh` with a direct Bash call: the inherited `verify()` helper (`verify_examples_test_support.py`) reads `Cargo.toml` before it starts Bash and raises `FileNotFoundError` without one, and its git command is a stub. The row asserts that both the cargo call log and the cargo metadata call log stay empty. The row fails on the current tree.
+- `verify.sh` reads the git top level after the help, `final-pass` refusal and `final --saved` exits, before environment setup. When that root has no `Cargo.toml`, it prints `verify.sh: <root> has no Cargo.toml; verify.sh checks Cargo repositories only` and exits 2, before any cargo call.
+- <FinalGate/> step 1 (`docs/direct/final_gate_commit.md`) runs `verify.sh final` only with a root `Cargo.toml`. Otherwise it runs the repository's unit gate; for `~/.claude` that is `~/.claude/scripts/lib/py ~/.claude/scripts/production/targeted_test.py --checkout <tree>`. Step 2's failure path covers either gate.
+- `test_verify_check_no_library.py` has a `has_manifest` table. Its False row runs `verify.sh final` with direct Bash in a real git repository with no `Cargo.toml`, and asserts exit 2, the exact line, and empty cargo and metadata call logs.
 
 **Files:**
-- `docs/direct/final_gate_commit.md` — the gate choice (owned by sdlc; the checkpoint notice names it).
-- `scripts/direct/verify.sh` — the early exit.
-- `scripts/direct/test_verify_check_no_library.py` — the row. Its `DevFeatureFixture` (`verify_dev_features_test_support.py:74`) runs `verify.sh` in a temporary workspace.
+- `scripts/direct/verify.sh` — the root `Cargo.toml` check.
+- `docs/direct/final_gate_commit.md` — the gate choice (owned by sdlc).
+- `scripts/direct/test_verify_check_no_library.py` — the `has_manifest` rows.
+- `scripts/lint/test_invoke_scope.py`, `scripts/direct/test_verify_nix_shell.py`, `scripts/direct/test_verify_run_place.py` — their projects have a root `Cargo.toml`; `test_verify_run_place.py` runs each start in a temporary git repository.
 
-**Workers:** 1 writer — `impl` owns every file above.
-
-**Acceptance gate:**
-- The changed test module passes with no assertion changed; `basedpyright` reports 0 errors and 0 warnings on the changed test file.
-- The existing help and saved-pass tests pass unchanged: `test_verify_verbs.py` and `test_verify_final_pass.py`.
-- The director runs the targeted test.
+**Gotchas:**
+- A test that drives `verify.sh` past repository setup needs a root `Cargo.toml` at its git top level. A `subprocess.Popen` with no `cwd` inherits the `~/.claude` checkout, which has none.
+- The inherited `verify()` helper (`verify_examples_test_support.py`) reads `Cargo.toml` before it starts Bash, so a no-manifest case calls Bash directly.
+- No config names a per-repository unit gate; the doc names the `~/.claude` gate.
 
 ### Phase 41z — A stop before the Mac runner starts holds under load  · status: todo
 
@@ -1320,9 +1311,9 @@ Checkpoint `1f9e9c484` on `verify-not-mac-wait`, merged to builds as `a62793f07`
 
 **Spec:**
 1. **Reproduce.** Run `test_verify_mac_signal_boundaries.py` repeatedly under CPU load until the failure shows. One way to make the load is several copies of the module at once, each through `scripts/test_times/module_run.py`, inside one detached run with `timeout` (at most 15 minutes). The cloud gate runs up to 16 test modules at once.
-2. **Cause.** Name why the runner starts after the TERM: the test's ordering (`send_signal`, then the `continue-runner` release), the `before_mac_runner` DEBUG trap, or the TERM handling in `verify.sh` before the `"$MAC_RUNNER"` call. Put the evidence in the summary.
+2. **Cause.** Name why the runner starts after the TERM: the test's ordering (`send_signal`, then the `continue-runner` release), the `before_mac_runner` DEBUG trap, or the TERM handling in `verify.sh` before the `"$MAC_RUNNER"` call. Put the evidence in the summary. One window to check first: `verify.sh` starts the runner subshell with `&`, then sets `MAC_RUNNER_PID=$!` (line 2112). `forward_mac_runner_signal` (line 1985) kills the child only when `MAC_RUNNER_PID` is set. A TERM between the start and that assignment stops the parent and leaves the paused subshell, which runs the runner when released.
 3. **Fix the cause where it lives.** When the defect is in `verify.sh`, a TERM that arrives before the runner command stops `verify.sh` before that command runs. When the defect is in the test, the test waits for an event that proves `verify.sh` holds the TERM before it releases the runner. Add no retry, no sleep, and do not raise a time limit.
-4. **Proof.** Under the load from item 1, the module passes 20 runs in a row on the final tree. Before the fix, the same load gives at least one failure, or the summary says why the failure did not show.
+4. **Proof.** Under the load from item 1, the module passes 20 runs in a row on the final tree. Before the fix, the same load gives at least one failure, or the summary says why the failure did not show. The signal tests cover a TERM that arrives before the parent sets `MAC_RUNNER_PID` and one that arrives after it. A handshake that waits until after the assignment covers only the second case.
 
 **Files:**
 - `scripts/direct/test_verify_mac_signal_boundaries.py` — the signal boundary tests.
