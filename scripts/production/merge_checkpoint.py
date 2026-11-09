@@ -817,7 +817,7 @@ def push_rollback(production: ProductionDocument, before_merge_tip: str) -> Gene
     old_origin = good(git(production.checkout, "rev-parse", f"origin/{production.merge_branch}"), "push")
     try:
         yield
-    except (Stop, OSError):
+    except (Stop, OSError, ValueError):
         if before_merge_tip:
             undo_failed_push(production, old_origin, before_merge_tip)
         raise
@@ -850,21 +850,21 @@ def tested_main_push(production: ProductionDocument, tested_tip: str,
                      *, follow_main: bool = True) -> Generator[str]:
     """Hold the main lock for publication after tests cover the latest main."""
     checkout = production.checkout
-    while True:
-        with main_push_lock(checkout):
-            if not follow_main:
-                yield tested_tip
-                return
-            _ = good(git(checkout, "fetch", "origin", "main"), "push")
-            if git(checkout, "merge-base", "--is-ancestor", "origin/main", tested_tip).returncode == 0:
-                yield tested_tip
-                return
-        with push_rollback(production, before_merge_tip):
+    with push_rollback(production, before_merge_tip):
+        while True:
+            with main_push_lock(checkout):
+                if not follow_main:
+                    yield tested_tip
+                    return
+                _ = good(git(checkout, "fetch", "origin", "main"), "push")
+                if git(checkout, "merge-base", "--is-ancestor", "origin/main", tested_tip).returncode == 0:
+                    yield tested_tip
+                    return
             merge_main(production)
-        tip = good(git(checkout, "rev-parse", "HEAD"), "test")
-        paths = tuple(good(git(checkout, "diff", "--name-only", tested_tip, tip), "test").splitlines())
-        retest(paths, tip)
-        tested_tip = tip
+            tip = good(git(checkout, "rev-parse", "HEAD"), "test")
+            paths = tuple(good(git(checkout, "diff", "--name-only", tested_tip, tip), "test").splitlines())
+            retest(paths, tip)
+            tested_tip = tip
 
 
 def refresh_pushed_tip(production: ProductionDocument, tip: str) -> str:

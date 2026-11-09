@@ -303,24 +303,53 @@ raise SystemExit(1 if (state / "red").exists() else 0)
                         self.assertEqual(self.git("status", "--porcelain"), "")
 
     def test_failed_push_preserves_the_merge_branches_unpublished_tip(self) -> None:
-        self.write(self.checkout, "local-only.txt", "local commit must survive\n")
-        _ = self.git("add", "local-only.txt")
-        _ = self.git("commit", "-m", "local merge branch work not on origin")
-        before = self.git("rev-parse", "HEAD")
-        remote = self.git("rev-parse", "origin/production")
-        self.assertNotEqual(before, remote)
-        main = self.push_main_change("main-only.txt", "independent main work\n")
-        checkpoint = self.checkpoint()
-        hook = self.origin / "hooks/pre-receive"
-        _ = hook.write_text("#!/bin/sh\nexit 1\n")
-        hook.chmod(0o755)
-        result = self.run_checkpoint(checkpoint)
-        self.assertEqual(result.process.returncode, 1, result.process.stdout + result.process.stderr)
-        self.assertIn("push: failed", result.process.stdout)
-        self.assertEqual(self.git("rev-parse", "HEAD"), before)
-        self.assertEqual((self.checkout / "local-only.txt").read_text(), "local commit must survive\n")
-        self.assertEqual(self.git("rev-parse", "refs/heads/production", cwd=self.origin), remote)
-        self.assertEqual(self.git("rev-parse", "refs/heads/main", cwd=self.origin), main)
+        for failure in ("push", "final-fetch"):
+            with self.subTest(failure=failure):
+                shutil.rmtree(self.root)
+                _ = shutil.copytree(self.fixture_snapshot, self.root)
+                self.bind_fixture(self.root)
+                self.write(self.checkout, "local-only.txt", "local commit must survive\n")
+                _ = self.git("add", "local-only.txt")
+                _ = self.git("commit", "-m", "local merge branch work not on origin")
+                before = self.git("rev-parse", "HEAD")
+                remote = self.git("rev-parse", "origin/production")
+                self.assertNotEqual(before, remote)
+                main = self.push_main_change("main-only.txt", "independent main work\n")
+                checkpoint = self.checkpoint()
+                if failure == "push":
+                    hook = self.origin / "hooks/pre-receive"
+                    _ = hook.write_text("#!/bin/sh\nexit 1\n")
+                    hook.chmod(0o755)
+                else:
+                    real_git = shutil.which("git")
+                    self.executable(self.bin / "checkpoint-test", STUB + '''
+import subprocess
+tip = subprocess.run(["git", "rev-parse", "HEAD"], check=True, capture_output=True, text=True).stdout.strip()
+(state / "tested-tip").write_text(tip)
+''')
+                    self.executable(self.bin / "git", f'''#!/usr/bin/env python3
+import os
+from pathlib import Path
+import sys
+state = Path(os.environ["CHECKPOINT_TEST_STATE"])
+if sys.argv[-3:] == ["fetch", "origin", "main"] and (state / "tested-tip").exists():
+    print("fixture final fetch failed", file=sys.stderr)
+    raise SystemExit(1)
+os.execv({real_git!r}, [{real_git!r}, *sys.argv[1:]])
+''')
+                result = self.run_checkpoint(checkpoint)
+                self.assertEqual(result.process.returncode, 1, result.process.stdout + result.process.stderr)
+                self.assertIn("push: failed", result.process.stdout)
+                if failure == "final-fetch":
+                    self.assertIn("test: ok", result.process.stdout)
+                    self.assertIn("fixture final fetch failed", result.process.stdout)
+                    tested_tip = (self.state / "tested-tip").read_text()
+                    self.assertEqual(self.git("merge-base", "--is-ancestor", checkpoint, tested_tip), "")
+                    self.assertEqual(self.git("merge-base", "--is-ancestor", main, tested_tip), "")
+                self.assertEqual(self.git("rev-parse", "HEAD"), before)
+                self.assertEqual((self.checkout / "local-only.txt").read_text(), "local commit must survive\n")
+                self.assertEqual(self.git("rev-parse", "refs/heads/production", cwd=self.origin), remote)
+                self.assertEqual(self.git("rev-parse", "refs/heads/main", cwd=self.origin), main)
 
     def import_production_paths(self, *, review_rows: bool = True) -> Path:
         self.write(self.other, "outside/imported.txt", "other production\n")
