@@ -8,28 +8,35 @@ sit under `${SESSION_DIR}/phases/<id>/` and never overwrite each other.
 from __future__ import annotations
 
 import subprocess
-import json
 import tempfile
 import unittest
 from pathlib import Path
+from functools import cached_property
 from typing import override
 
+from scripts.production import staff
+from scripts.production.staff_test_support import StaffTestCase, fixture_worker, unit_membership
 from scripts.hooks import direct_run
 
 CLEAR = Path(__file__).with_name("clear_phase_review.sh")
 
 
-class PhaseArtifactTests(unittest.TestCase):
+class PhaseArtifactTests(StaffTestCase):
     temporary: tempfile.TemporaryDirectory[str]  # pyright: ignore[reportUninitializedInstanceVariable]
     session: Path  # pyright: ignore[reportUninitializedInstanceVariable]
 
+    @cached_property
+    def parent(self) -> staff.StaffRow:
+        return unit_membership("phase", "review")
+
     @override
     def setUp(self) -> None:
+        super().setUp()
         self.temporary = tempfile.TemporaryDirectory()
         self.session = Path(self.temporary.name) / "run"
         for phase in ("3", "4"):
             (self.session / "phases" / phase).mkdir(parents=True)
-        _ = (self.session / "progress_history_state.json").write_text("{}", encoding="utf-8")
+        self.write_json(self.session / "progress_history_state.json", {"owner_staff_id": self.parent.id})
 
     @override
     def tearDown(self) -> None:
@@ -41,7 +48,11 @@ class PhaseArtifactTests(unittest.TestCase):
         return path
 
     def test_clearing_a_phase_review_leaves_the_phase_beside_it(self) -> None:
-        _ = self.write("mesh_roster.json", json.dumps({"project-review": {"role": "review"}}))
+        reviewer = fixture_worker("project-review", self.parent.id)
+        self.write_json(self.session / "progress_history_state.json", {
+            "owner_staff_id": self.parent.id,
+            "pass": {"review": {"instance_id": "review-pass", "worker_id": reviewer.id,
+                                  "kind": "review", "status": "completed"}}})
         cleared = [self.write(f"phases/3/{name}") for name in ("review_prompt_1_adversary.md",
                                                                 "review_findings_1_adversary.txt",
                                                                 "review_status_adversary", "project-review_status_adversary", "ux_shots_1.txt")]

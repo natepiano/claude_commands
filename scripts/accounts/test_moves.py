@@ -17,13 +17,15 @@ from typing import Literal, TextIO, cast, override
 from unittest.mock import patch
 
 from scripts.accounts.home_test_support import scratch_account_home
-from scripts.accounts import accounts, moves, role_map, worker_names
+from scripts.accounts import accounts, moves, pane_moves, role_map, worker_names
+from scripts.herdr import worker_panes
+from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib import unit_runs
-from scripts.production import session_staff, staff
+from scripts.production import staff, session_staff
 from scripts.production.staff_test_support import (
     StaffTestCase, fixture_member, fixture_worker, fixture_runtime_id,
 )
-from scripts.shutdown import inventory, stop_results, stop_resume
+from scripts.shutdown import inventory, stop_results
 from scripts.whoami import agent_accounts, note_file
 from scripts.whoami.account_test_support import create_claude_account, write_codex_auth
 
@@ -680,7 +682,6 @@ class WorkerGroupPendingTests(StaffTestCase):
     @override
     def setUp(self) -> None:
         super().setUp()
-        _ = self.enterContext(patch.object(unit_runs, "worker_transport", return_value="mesh"))
         _ = self.enterContext(patch.object(unit_runs, "RUN_ROOT", self.root / "runs"))
         _ = self.enterContext(patch.object(unit_runs, "FORMER_RUN_ROOT", self.root / "former-runs"))
         _ = cast(object, self.enterContext(patch.dict(os.environ, {"UNIT_RUN_DIR": "", "PLAN_DELEGATE_BOARD_DIR": ""})))
@@ -710,17 +711,20 @@ class WorkerGroupPendingTests(StaffTestCase):
         _ = self.enterContext(patch.object(accounts, "_codex_live", return_value=report))
         self.stop_requests.clear()
         self.failed_worker = ""
-        _ = self.enterContext(patch.object(stop_resume, "stop", side_effect=self.stop_worker))
+        patches = [
+            cast(object, self.enterContext(patch.object(pane_moves, "_move_locked", side_effect=self.stop_worker))),
+            cast(object, self.enterContext(patch.object(worker_panes, "worker_run", return_value=self.root / "pane-run"))),
+        ]
+        self.addCleanup(patches.clear)
         _ = self.enterContext(patch.object(accounts, "SCRIPTS", self.root / "no-launchers"))
 
-    def stop_worker(self, reference: str, kind: str = "") -> stop_resume.Stopped | stop_resume.StopFailed:
-        self.stop_requests.append(reference)
-        if reference == self.failed_worker:
-            return stop_resume.StopFailed(reference, "source process could not stop")
-        row = staff.by_id(staff.StaffId(reference))
-        assert row is not None
-        self.assertIn(kind, ("", staff.snapshot().backends[row.id].family))
-        return stop_resume.Stopped(row.current_session, 987654)
+    def stop_worker(self, move: pane_moves.WorkerMove,
+                    hold: worker_panes.WorkerLockHold) -> accounts.SessionMoveOutcome:
+        del hold
+        self.stop_requests.append(move.row.id)
+        if move.row.id == self.failed_worker:
+            return accounts.SessionMoveRefused(move.row.id, "source process could not stop")
+        return stop_results.ResumePending(move.row.id, move.target, "destination is not ready")
 
     def worker(self, name: str, family: Literal["claude", "codex"]) -> tuple[staff.StaffRow, Path]:
         owner = fixture_member("showrunner", name="history-owner")
@@ -731,10 +735,10 @@ class WorkerGroupPendingTests(StaffTestCase):
             row = fixture_worker(name, unit.id, backend=backend)
         run = self.root / "old-runs" / name
         run.mkdir(parents=True)
-        _ = (run / "mesh_roster.json").write_text(json.dumps({name: {"staff_id": row.id, "status": "done"}}))
-        _ = session_staff.read_worker_roster(run / "mesh_roster.json")
+        write_text_atomic(run / "progress_history_state.json", json.dumps({"owner_staff_id": unit.id}))
         _ = staff.update_current_session(unit.current_session, staff.native_id(fixture_runtime_id("replacement director")))
         return row, run
+
 
     def test_account_moves_stop_fixed_workers_and_keep_pending_rows_in_both_families(self) -> None:
         for family in ("claude", "codex"):
@@ -746,7 +750,7 @@ class WorkerGroupPendingTests(StaffTestCase):
                     result = accounts.move_workers(target, dry_run=True)
                     assert isinstance(result, accounts.GroupMoveDryRun)
                     same_family = target.startswith(family)
-                    preview = (f"would stop; restart on {target} stays pending" if same_family
+                    preview = (f"would stop and resume the same conversation on {target} in its worker pane" if same_family
                                else f"not moved: cannot restart on {target} through assign.sh")
                     self.assertEqual(result.lines, (f"{row.name} ({row.id}): {preview}",))
                     self.assertIn(str(row.id), "\n".join(result.lines))
@@ -756,8 +760,8 @@ class WorkerGroupPendingTests(StaffTestCase):
                     self.assertEqual(self.stop_requests, [])
                     inbox = session_staff.inbox_path(row.id)
                     inbox.parent.mkdir(parents=True, exist_ok=True)
-                    _ = inbox.write_text('{"messages": ["held assignment"], "accepting_messages": true}')
-                    reference = (run / "mesh_roster.json").read_bytes(), inbox.read_bytes()
+                    write_text_atomic(inbox, '{"messages": ["held assignment"], "accepting_messages": true}')
+                    reference = (run / "progress_history_state.json").read_bytes(), inbox.read_bytes()
                     saved = self.staff_file.read_bytes()
                     with redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as errors:
                         code = accounts.main(["move", "workers", target])
@@ -765,7 +769,7 @@ class WorkerGroupPendingTests(StaffTestCase):
                     self.assertEqual(self.stop_requests, [row.id] if same_family else [])
                     self.assertEqual(staff.by_id(row.id), row)
                     self.assertEqual(self.staff_file.read_bytes(), saved)
-                    self.assertEqual(((run / "mesh_roster.json").read_bytes(), inbox.read_bytes()), reference)
+                    self.assertEqual(((run / "progress_history_state.json").read_bytes(), inbox.read_bytes()), reference)
                     self.assertEqual(session_staff.worker_directory(staff.local_snapshot(), row.id), self.root)
                     lines = (output.getvalue() + errors.getvalue()).splitlines()
                     self.assertEqual(len(lines), 1, lines)
@@ -774,8 +778,8 @@ class WorkerGroupPendingTests(StaffTestCase):
                     if same_family:
                         self.assertIn("pending", lines[0])
                     else:
-                        self.assertIn(f"cannot restart on {target} through assign.sh; source remains running", lines[0])
-                    _ = staff.retire(row.id)
+                        self.assertIn(f"cannot restart on {target} through assign.sh", lines[0])
+                    self.assertEqual(staff.retire(row.id), row)
 
     def test_one_failed_stop_reports_the_worker_and_keeps_other_moves_pending(self) -> None:
         for failure in ("stop", "locked"):
@@ -786,7 +790,7 @@ class WorkerGroupPendingTests(StaffTestCase):
                 saved = {path: path.read_bytes() for run in (failed_run, healthy_run) for path in run.iterdir()}
                 before = self.staff_file.read_bytes()
                 self.failed_worker = failed.id
-                lock_path = self.staff_file.parent / "rows" / f"{failed.id}.lock"
+                lock_path = self.staff_file.parent / "locks" / f"{failed.id}.lock"
                 lock_path.parent.mkdir(parents=True, exist_ok=True)
                 with lock_path.open("a") as lock:
                     if failure == "locked":
@@ -806,7 +810,7 @@ class WorkerGroupPendingTests(StaffTestCase):
                 failed_line = next(line for line in lines if str(failed.id) in line)
                 healthy_line = next(line for line in lines if str(healthy.id) in line)
                 self.assertIn("source process could not stop" if failure == "stop"
-                              else "another operation holds this row", failed_line)
+                              else "dispatch lock is held", failed_line)
                 self.assertIn("pending", healthy_line)
                 self.assertIn("claude1", healthy_line)
                 _ = staff.retire(failed.id)

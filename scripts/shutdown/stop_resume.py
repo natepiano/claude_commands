@@ -19,7 +19,7 @@ from dataclasses import asdict, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from collections.abc import Callable, Generator, Mapping
+from collections.abc import Generator, Mapping
 from contextlib import ExitStack, contextmanager, redirect_stdout
 from contextvars import ContextVar
 from io import StringIO
@@ -183,7 +183,7 @@ def _record_launches(selected: list[str]) -> None:
         print(f"stop: launch note anomaly: {error}", file=sys.stderr)
 
 
-def release_source(row: StaffRow, runs: Callable[[], tuple[Path, ...]], backend: ClaudeBackend | CodexBackend | BackendUnavailable) -> SourceRelease:
+def release_source(row: StaffRow, backend: ClaudeBackend | CodexBackend | BackendUnavailable) -> SourceRelease:
     """Resolve native stop evidence before creating the destination."""
     from scripts.production import staff
 
@@ -191,26 +191,18 @@ def release_source(row: StaffRow, runs: Callable[[], tuple[Path, ...]], backend:
     result = stop(row.id, kind)
     if isinstance(result, SessionNotFound):
         return SourceUnresolved(f"{row.id}: lifecycle could not resolve the staff reference; check the staff row and retry")
-    if isinstance(result, StopUnproved):
-        herdr.conversation_note(herdr.UnknownConversation(result.reason))
-    if isinstance(result, (NotRunning, StopUnproved)) and isinstance(backend, staff.CodexBackend):
-        stop_mesh = cast(Callable[[staff.StaffRow, tuple[Path, ...]], SourceRelease],
-                         import_module("scripts.agents.codex_mesh").stop_worker_for_switch)
-        released = stop_mesh(row, runs())
-        return released if isinstance(released, SourceReleased) else replace(released, reason=f"{released.reason}; inspect the source session and retry")
     if isinstance(result, StopFailed):
         return SourceReleaseUnknown(f"{result.reason}; inspect the source session and retry")
     return SourceReleased()
 
 
 def stop(session: str, kind: str = "", *, deadline: float = math.inf,
-         codex: herdr.CodexConversations | None = None,
-         runs: dict[str, list[str]] | None = None) -> StopResult:
+         codex: herdr.CodexConversations | None = None) -> StopResult:
     from scripts.production import staff
 
     try:
         with operation_deadline.within(deadline), staff.row_operation(session):
-            shared: StopReadArguments = {"codex": codex, "runs": runs} if codex is not None or runs is not None else {}
+            shared: StopReadArguments = {"codex": codex} if codex is not None else {}
             return _stop_recorded(session, kind, **shared)
     except TimeoutError as error:
         reason = str(error)
@@ -218,8 +210,7 @@ def stop(session: str, kind: str = "", *, deadline: float = math.inf,
 
 
 def _stop_recorded(session: str, kind: str = "", *,
-                   codex: herdr.CodexConversations | None = None,
-                   runs: dict[str, list[str]] | None = None) -> StopResult:
+                   codex: herdr.CodexConversations | None = None) -> StopResult:
     """Stop on purpose; retain its launch for an explicit resume, not crash recovery."""
     from scripts.herdr import worker_panes
     from scripts.production import staff
@@ -229,10 +220,7 @@ def _stop_recorded(session: str, kind: str = "", *,
     except (OSError, ValueError):
         record = staff.StaffSnapshot(())
     row = record.by_member_reference(session)
-    from scripts.lib import unit_runs
-    parent = record.parent_of(row) if row is not None else None
-    pane_worker = row is not None and row.kind == "worker" and (parent is None or
-        unit_runs.worker_transport(worker_panes.worker_run(parent, record=record, scanned=runs)) == "herdr")
+    pane_worker = row is not None and row.kind == "worker"
     before = next((item for item in worker_panes.observe(row.parent.id, record) if item.row.id == row.id), None
                   ) if pane_worker and row is not None and isinstance(row.parent, staff.ReportsTo) else None
     if isinstance(before, (worker_panes.ProcessUnknownWorker, worker_panes.UncertainWorker)):
@@ -389,32 +377,22 @@ def _stop(session: str, kind: str = "", *,
 
 
 def stop_unit_workers(unit: StaffId, record: StaffSnapshot, *,
-                      codex: herdr.CodexConversations | None = None,
-                      runs: dict[str, list[str]] | None = None) -> list[str]:
+                      codex: herdr.CodexConversations | None = None) -> list[str]:
     """Stop the selected workers concurrently and retain every staff row."""
     from scripts.agents import worker_lifecycle
     from scripts.herdr import worker_panes
-    from scripts.lib import unit_runs
     from scripts.shutdown import restart
 
-    holder = record.by_id(unit)
     if not record.find(kind="worker", parent=unit):
         return []
     try:
         deadline = worker_lifecycle.effective_deadline()
-        if holder is not None:
-            run = worker_panes.worker_run(holder, record=record, scanned=runs)
-            if unit_runs.worker_transport(run) == "mesh":
-                from scripts.agents import codex_mesh
-
-                codex_mesh._pause_roster(str(run), stop_servers=True, deadline=deadline)  # pyright: ignore[reportPrivateUsage]
-                return []
         states = worker_panes.observe(unit, record)
         unresolved = [f"{item.row.name}: {item.reason}" for item in states
                       if isinstance(item, (worker_panes.ProcessUnknownWorker, worker_panes.UncertainWorker))]
         live = [item for item in states if isinstance(item, worker_panes.OpenWorker)]
         client = herdr.Herdr(herdr.shared_session())
-        shared: StopReadArguments = {"codex": codex, "runs": runs} if codex is not None or runs is not None else {}
+        shared: StopReadArguments = {"codex": codex} if codex is not None else {}
         with ThreadPoolExecutor(max_workers=max(1, len(live))) as pool:
             futures = [(item, pool.submit(restart.stop_row, item.row, client,
                 deadline=deadline, **shared)) for item in live]

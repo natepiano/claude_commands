@@ -29,7 +29,6 @@ class RemoveRunScratchTests(unittest.TestCase):
     def setUp(self) -> None:
         root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
         self.enterContext(isolated_staff_file(root / "staff.json", {}))
-        self.enterContext(mock.patch.dict(os.environ, {"UNIT_WORKERS_STATE": str(root / "unit-workers")}))
         owner = fixture_member("showrunner", name="demo")
         self.owner_id = fixture_member("unit", name="builders", parent=owner.id).id
 
@@ -92,13 +91,13 @@ class RemoveRunScratchTests(unittest.TestCase):
         run, _ = self.make_run()
         checkout = run / "phases" / "p4" / "gate"
         command_cwd = checkout / "target"
-        records = run / "mesh_runs"
+        records = run / "detached_runs"
         records.mkdir()
         record = records / "verify.json"
         child = subprocess.Popen([sys.executable, "-c", "import sys; sys.stdin.read()",
-                                  "mesh_runs.py", "supervise", str(record)], stdin=subprocess.PIPE)
+                                  "detached_runs.py", "supervise", str(record)], stdin=subprocess.PIPE)
         self.addCleanup(lambda: child.communicate(timeout=TEST_HANG_GUARD_SECS))
-        environment = {"UNIT_WORKERS_STATE": str(run.parent / "unit-workers"), "CODEX_HOME": str(run.parent / "codex")}
+        environment = {"CODEX_HOME": str(run.parent / "codex")}
         _ = self.enterContext(isolated_staff_file(run.parent / "staff.json", environment))
         owner = fixture_member("showrunner", name="demo")
         parent = fixture_member("unit", name="builders", parent=owner.id,
@@ -107,11 +106,6 @@ class RemoveRunScratchTests(unittest.TestCase):
         member = fixture_worker("w7", parent.id, backend=staff.CodexBackend(Path(environment["CODEX_HOME"])))
         _ = record.write_text(json.dumps({"status": "running", "pid": child.pid, "worker": "w7", "staff_id": member.id}))
         with mock.patch.dict(os.environ, environment):
-            store = workers.UnitWorkerLedger(workers.ledger_path("demo", "builders"))
-            with store.locked() as ledger:
-                ledger.workers["w7"] = workers.UnitWorker("w7", "impl", "codex", "sol", "high", {},
-                    workers.CodexThread(member.current_session, str(run.parent / "codex")), workers.Paused(),
-                    [workers.WorkerEvent("opened", "fixture", str(run), 1_793_188_800.0, {})], staff_id=member.id)
             result = subprocess.run([sys.executable, str(SCRIPT), str(run)], capture_output=True,
                                     text=True, timeout=TEST_HANG_GUARD_SECS, check=False)
             self.assertEqual(result.returncode, 0, result.stderr)

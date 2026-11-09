@@ -608,7 +608,7 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
                 name, detail = row["name"], row["detail"]
             if not service and isinstance(memory, admission_records.UnownedSliceMemory) and isinstance(memory.activity, ScopeProcesses) and memory.bytes < GIB // 2:
                 program = memory.activity.program
-                group = "Codex servers" if program in ("codex", "codex-real", "mesh_runs.py") else "worker background runs"
+                group = "Codex servers" if program in ("codex", "codex-real", "detached_runs.py") else "worker background runs"
                 row["detail"] = " · ".join(part for part in (detail, program) if part)
                 groups.setdefault(group, []).append(row)
             else:

@@ -39,7 +39,6 @@ class StopReadArguments(TypedDict, total=False):
     """Forward shared observations only when the caller supplies them."""
 
     codex: herdr.CodexConversations | None
-    runs: dict[str, list[str]] | None
 
 
 @dataclass(frozen=True)
@@ -78,9 +77,6 @@ class WorkerPanes(Protocol):
     def observe(self, parent: staff.StaffId, record: staff.StaffSnapshot) -> list[WorkerRow]: ...
     def observe_parents(self, parents: list[staff.StaffRow], record: staff.StaffSnapshot
                         ) -> dict[staff.StaffId, list[WorkerRow]]: ...
-    def worker_run(self, member: staff.StaffRow, *,
-                   record: staff.StaffSnapshot | unit_runs.RunStaffAtUse = unit_runs.RunStaffAtUse.LOCAL,
-                   scanned: dict[str, list[str]] | None = None) -> Path: ...
 
 
 class WorkerRestore(Protocol):
@@ -98,11 +94,9 @@ class AgentsCommand(Protocol):
 class MemberLifecycle(Protocol):
     def detach(self, arguments: list[str], task: str, *, program: Path) -> Path: ...
     def stop(self, session: str, *, deadline: float,
-             codex: herdr.CodexConversations | None = None,
-             runs: dict[str, list[str]] | None = None) -> StopResult: ...
+             codex: herdr.CodexConversations | None = None) -> StopResult: ...
     def stop_unit_workers(self, unit: staff.StaffId, record: staff.StaffSnapshot, *,
-                          codex: herdr.CodexConversations | None = None,
-                          runs: dict[str, list[str]] | None = None) -> list[str]: ...
+                          codex: herdr.CodexConversations | None = None) -> list[str]: ...
 
 
 worker_panes = cast(WorkerPanes, cast(object, import_module("scripts.herdr.worker_panes")))
@@ -133,8 +127,7 @@ def _anomaly(row: staff.StaffRow, error: object) -> None:
 
 
 def stop_row(row: staff.StaffRow, client: herdr.Herdr, *, deadline: float = math.inf,
-             codex: herdr.CodexConversations | None = None,
-             runs: dict[str, list[str]] | None = None) -> bool:
+             codex: herdr.CodexConversations | None = None) -> bool:
     with operation_deadline.within(deadline):
         try:
             panes = [pane for pane in client.panes() if pane["session_id"] == row.current_session]
@@ -152,7 +145,7 @@ def stop_row(row: staff.StaffRow, client: herdr.Herdr, *, deadline: float = math
         except (herdr.HerdrFailure, OSError, ValueError) as error:
             _anomaly(row, error)
             return False
-        shared: StopReadArguments = {"codex": codex, "runs": runs} if codex is not None or runs is not None else {}
+        shared: StopReadArguments = {"codex": codex} if codex is not None else {}
         result = stop_resume.stop(str(row.current_session), deadline=deadline, **shared)
         if isinstance(result, (Stopped, NotRunning)):
             return True
@@ -192,10 +185,6 @@ def session_launch(identity: str, name: str) -> tuple[Literal["claude", "codex"]
     raise OSError(f"no transcript for {identity}")
 
 
-def pane_workers(row: staff.StaffRow) -> bool:
-    return unit_runs.worker_transport(worker_panes.worker_run(row)) != "mesh"
-
-
 @dataclass(frozen=True)
 class PaneConversations:
     codex: herdr.CodexConversations
@@ -211,16 +200,11 @@ class RestartObservations:
 
 
 def _observations(record: staff.StaffSnapshot, client: herdr.Herdr) -> RestartObservations:
-    owners = [row for row in record.rows if row.kind in ("unit", "showrunner")
-              and any(child.parent == staff.ReportsTo(row.id) for child in record.rows)]
+    owners = frozenset(row.id for row in record.rows if row.kind in ("unit", "showrunner")
+                       and record.find(kind="worker", parent=row.id))
     runs = unit_runs.held_by_session(os.environ.get("ROSTER_RUN_ROOT"), record=record) if owners else {}
-    pane_owners: set[staff.StaffId] = set()
-    for row in owners:
-        directory = worker_panes.worker_run(row, record=record, scanned=runs)
-        if unit_runs.worker_transport(directory) != "mesh":
-            pane_owners.add(row.id)
     panes = _codex_conversations(client)
-    return RestartObservations(panes.codex, runs, frozenset(pane_owners), panes.names)
+    return RestartObservations(panes.codex, runs, owners, panes.names)
 
 
 def _restore_workers(row: staff.StaffRow, record: staff.StaffSnapshot, *,
@@ -238,8 +222,8 @@ def _restore_workers(row: staff.StaffRow, record: staff.StaffSnapshot, *,
             codex=observed.codex if observed is not None else herdr.CodexLaunchRead.CURRENT)
     elif row.kind in ("unit", "showrunner") and any(
             child.kind == "worker" and child.parent == staff.ReportsTo(row.id) for child in record.rows
-            ) and (pane_workers(row) if observed is None else row.id in observed.pane_owners):
-        result = (worker.restore(row.id) if observed is None else
+            ):
+        result = (worker.restore(row.id, record=record) if observed is None else
                   worker.restore(row.id, record=record, runs=observed.runs, codex=observed.codex))
     else:
         return ""
@@ -512,6 +496,8 @@ def live_rows(record: staff.StaffSnapshot, client: herdr.Herdr, *, save_tabs: bo
     selected = live_members(candidates_rows, record, resolver=resolver, codex=codex, account=account)
     if isinstance(account, AllRestartAccounts):
         selected.extend(active_workers)
+    positions = {row.id: index for index, row in enumerate(record.rows)}
+    selected.sort(key=lambda row: positions[row.id])
     if save_tabs:
         try:
             client.save_layout()
@@ -654,7 +640,7 @@ def restart(*, stop_all: bool = False, dry_run: bool = False, only: tuple[str, .
     for row in selected:
         parent = record.parent_of(row) if row.kind == "worker" else None
         holder = (parent if worker_scope is WorkerRestartScope.FOLLOW_OWNER
-                  and parent is not None and parent.id in selected_ids and parent.id in observed.pane_owners else row)
+                  and parent is not None and parent.id in selected_ids else row)
         holders[holder.id] = holder
         members_by_holder.setdefault(holder.id, []).append(str(row.id))
     callers = {os.environ.get("CLAUDE_CODE_SESSION_ID"), os.environ.get("CODEX_THREAD_ID")} - {None, ""}
@@ -677,11 +663,11 @@ def restart(*, stop_all: bool = False, dry_run: bool = False, only: tuple[str, .
                 recorded.set()
                 workers: tuple[staff.StaffId, ...] = ()
                 if worker_scope is WorkerRestartScope.FOLLOW_OWNER and holder.kind in ("unit", "showrunner"):
-                    unresolved = stop_resume.stop_unit_workers(holder.id, record, codex=observed.codex, runs=observed.runs)
+                    unresolved = stop_resume.stop_unit_workers(holder.id, record, codex=observed.codex)
                     if unresolved and holder.id in observed.pane_owners:
                         workers = tuple(child.id for child in record.find(kind="worker", parent=holder.id)
                                         if child.id in selected_ids)
-                return stop_row(holder, client, codex=observed.codex, runs=observed.runs), workers
+                return stop_row(holder, client, codex=observed.codex), workers
         finally:
             recorded.set()
 
