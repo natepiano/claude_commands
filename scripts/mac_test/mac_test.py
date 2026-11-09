@@ -2339,6 +2339,10 @@ def free_now(
         claims = read_claims(paths)
     except (OSError, StateReadError):
         return "state"
+    repository_name = sweep.repo_name(str(repo_root))
+    if repository_name is not None and isinstance(
+            offload.read_mirror_busy(time.time(), repository_name, paths.target), offload.ActiveBackoff):
+        return "busy"
     scopes: tuple[ClaimScope, ...] = (scope,)
     if not target_config.uses_legacy_mac_layout(paths.platform) and isinstance(scope, RepositoryScope):
         try:
@@ -2354,7 +2358,6 @@ def free_now(
         return "busy"
     if isinstance(offload.read_failed_probe(paths.target), offload.FailedProbe):
         return "bad"
-    repository_name = sweep.repo_name(str(repo_root))
     if repository_name is not None and offload.linux_version_decline_path(paths.target, repository_name).exists():
         return "bad"
     return "free"

@@ -2766,6 +2766,11 @@ def shrink_floor(
                             break
                         if not group_unchanged(group):
                             continue
+                        if isinstance(policy, MacFloor) and not dry_run:
+                            current_claims = policy.claims_before_removal(paired_roots)
+                            if current_claims:
+                                busy.update(current_claims)
+                                break
                         attempted.append(group)
                         account = reclaim(group, scan, remaining, dry_run, lint_settings=lint_settings)
                         if isinstance(account, ConfirmedDeletion) and account.removed:
@@ -3665,8 +3670,9 @@ class MacFloor:
     """Only marked output inside the three approved Mac roots can be removed."""
 
     roots: tuple[str, ...]
-    claims: floor_claims.LockedClaims
+    claims: floor_claims.ClaimSnapshot
     mirror: Path
+    busy_mirrors: frozenset[Path] = frozenset()
     leased_mirrors: frozenset[Path] = frozenset()
 
     def allows(self, target: str) -> bool:
@@ -3692,7 +3698,7 @@ class MacFloor:
         paths = tmp_sweep.lsof_paths(tuple(str(Path(root).expanduser().resolve()) for root in self.roots))
         for root in targets:
             if (not self.allows(root) or self.claims.holds(root, self.mirror)
-                    or any(Path(root).resolve().is_relative_to(mirror.resolve()) for mirror in self.leased_mirrors)
+                    or any(Path(root).resolve().is_relative_to(mirror.resolve()) for mirror in self.busy_mirrors)
                     or isinstance(paths, tmp_sweep.ProcessUsesUnavailable)):
                 result[root] = LockHeld("Mac claim or process use is busy or unreadable")
             else:
@@ -3701,6 +3707,16 @@ class MacFloor:
                         result[root] = TargetUse(pid, how)
                         break
         return result
+
+    def claims_before_removal(self, targets: Sequence[str]) -> dict[str, LockHeld]:
+        """Read claims again for output outside the acquired mirror leases."""
+        uncovered = [target for target in targets if not any(
+            Path(target).resolve().is_relative_to(mirror.resolve()) for mirror in self.leased_mirrors)]
+        if not uncovered:
+            return {}
+        claims = floor_claims.read_claims(conf.read("mac_test").number("probe_timeout_s"))
+        return {target: LockHeld("Mac claim is busy or unreadable") for target in uncovered
+                if claims.holds(target, self.mirror)}
 
 
 class NatedevFloor(Enum):
@@ -4900,10 +4916,10 @@ def main(argv: list[str]) -> int:
                 mac_floor, mac_roots = mac_floor_settings(mac_settings, mirror_root=mirror_root)
                 lint_settings = conf.read("lint")
                 timeout = mac_settings.number("probe_timeout_s")
-            with copies.mirror_sweep_leases(mirror_root.local_path()) as protected:
-                with floor_claims.locked_claims(timeout) as claims:
-                    return hold_floor(mac_floor, dry_run, lint_settings=lint_settings,
-                                      policy=MacFloor(mac_roots, claims, mirror_root.local_path(), protected))
+            with copies.mirror_sweep_leases(mirror_root.local_path()) as leases:
+                claims = floor_claims.read_claims(timeout)
+                return hold_floor(mac_floor, dry_run, lint_settings=lint_settings,
+                                  policy=MacFloor(mac_roots, claims, mirror_root.local_path(), leases.busy, leases.held))
         except conf.Unusable as error:
             print(f"lint sweep: {error}", file=sys.stderr)
             return 2
