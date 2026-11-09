@@ -1260,58 +1260,70 @@ Checkpoint `1f9e9c484` on `verify-not-mac-wait`, merged to builds as `a62793f07`
 
 ### Phase 41y — No process outlives the hold event tests under load  · status: done
 
-**Depends on:** none. Runs after 41w.
+#### As-built
+
+- `VerifyHoldWaitFixture.fixture_cleanups` fails with the inner cleanup failure text. `VerifyHoldTools` records each failed cleanup's traceback in `cleanup_failures`.
+- `reap` returns pid to command line. `assert_nothing_outlives` fails with "processes outlived the test:" and each pid with its command line.
+- `hold_recorder_exits(timeout)` (`verify_mac_offload_test_support.py`) records each `hold-event-recorder` thread that a hold call starts, as a `HoldRecorderStart`. On exit it waits for each start to finish, then joins each started thread within the timeout. On timeout it kills the recorder children and fails with "fixture hold recorder never exited". `local_hold_environment` and `hold_environment` both wrap their yield in it, so no recorder runs after the fixture restores its environment.
+- The hold-event deadline test watches a private folder, so events from other tests under the shared temporary folder do not end its wait.
+- Under a load of up to 16 module processes, `test_verify_hold_events.py` and `test_verify_hold_memory.py` each pass 20 runs of 20.
+
+**Files:**
+- `scripts/direct/verify_hold_wait_test_support.py` — cleanup failure text; `local_hold_environment` waits for hold recorders.
+- `scripts/direct/verify_mac_offload_test_support.py` — `hold_recorder_exits`, `HoldRecorderStart`, `reap` with command lines.
+- `scripts/direct/test_verify_hold_events.py` — the release-record table; the deadline test's private folder.
+- `scripts/direct/test_verify_mac_fixture.py` — the `delayed_start` table row for the recorder wait.
+
+**Gotchas:**
+- `build_hold.start_recorder` starts a detached `record.py hold-event` child with the caller's `BUILDLOG_DIR` and no `TEST_RUNNER_STATE`, so the marker wait cannot see it. A fixture that points `BUILDLOG_DIR` under a root it removes must wait for the recorder thread. Otherwise a late write makes `rmtree` fail with ENOTEMPTY, the root stays, and the next `copytree` raises `FileExistsError`.
+- A recorder thread is recorded before its `start()` returns; join only a thread whose `ident` is set.
+
+**Ruled out:** a change to `build_hold.start_recorder` — the recorder detaches by design, so the fixture waits for it.
+
+### Phase 41x — The final gate runs the repository's own gate in a repository with no Cargo  · status: done
+
+#### As-built
+
+- `verify.sh` reads the git top level after the help, `final-pass` refusal and `final --saved` exits, before environment setup. When that root has no `Cargo.toml`, it prints `verify.sh: <root> has no Cargo.toml; verify.sh checks Cargo repositories only` and exits 2, before any cargo call.
+- <FinalGate/> step 1 (`docs/direct/final_gate_commit.md`) runs `verify.sh final` only with a root `Cargo.toml`. Otherwise it runs the repository's unit gate; for `~/.claude` that is `~/.claude/scripts/lib/py ~/.claude/scripts/production/targeted_test.py --checkout <tree>`. Step 2's failure path covers either gate.
+- `test_verify_check_no_library.py` has a `has_manifest` table. Its False row runs `verify.sh final` with direct Bash in a real git repository with no `Cargo.toml`, and asserts exit 2, the exact line, and empty cargo and metadata call logs.
+
+**Files:**
+- `scripts/direct/verify.sh` — the root `Cargo.toml` check.
+- `docs/direct/final_gate_commit.md` — the gate choice (owned by sdlc).
+- `scripts/direct/test_verify_check_no_library.py` — the `has_manifest` rows.
+- `scripts/lint/test_invoke_scope.py`, `scripts/direct/test_verify_nix_shell.py`, `scripts/direct/test_verify_run_place.py` — their projects have a root `Cargo.toml`; `test_verify_run_place.py` runs each start in a temporary git repository.
+
+**Gotchas:**
+- A test that drives `verify.sh` past repository setup needs a root `Cargo.toml` at its git top level. A `subprocess.Popen` with no `cwd` inherits the `~/.claude` checkout, which has none.
+- The inherited `verify()` helper (`verify_examples_test_support.py`) reads `Cargo.toml` before it starts Bash, so a no-manifest case calls Bash directly.
+- No config names a per-repository unit gate; the doc names the `~/.claude` gate.
+
+### Phase 41z — A stop before the Mac runner starts holds under load  · status: todo
+
+**Depends on:** none. Runs after 41x.
 
 #### Work Order
 
-**Source:** builds, 2026-11-08. `direct/test_verify_hold_events.py` `test_local_admission_without_inotify_polls_until_release` failed on its first run with "a fixture cleanup failed; a process may have outlived the test", then passed alone. Two cloud-gate cases on 2026-11-08: phase-tables 11f3e4 (15:33) and build-report 857554. A third case, cloud gate 349fd6: in `direct/test_verify_hold_memory.py`, `holder_joining` failed its cleanup the same way, and its fixture root under `/dev/shm` stayed. The next test then failed with `FileExistsError` in `shutil.copytree` (`VerifyHoldTools.setUp`, `verify_hold_wait_test_support.py:213`). The module passed alone.
+**Source:** verify-unit, 2026-11-09, the targeted test after the builds merge at e85fd02a6. `direct/test_verify_mac_signal_boundaries.py` failed 2 of 5 tests on its first run, then passed alone. `test_signal_before_runner_start_removes_result_without_local_work` and `test_check_stop_before_delayed_tee_opens_leaves_no_temp_log` both failed at `self.assertFalse((self.runner_state / "runner-started").exists())` (line 101): the Mac runner started after the test sent SIGTERM. The merge did not change this module or `verify.sh`. Builds routed it to this unit.
 
-**Goal:** the hold event tests leave no process behind under load, and a cleanup failure names each process that outlived the test.
+**Goal:** a TERM that reaches `verify.sh` before the Mac runner command stops `verify.sh` before that command runs, on every run under load.
 
 **Spec:**
-1. **Message.** `VerifyHoldWaitFixture.fixture_cleanups` (`verify_hold_wait_test_support.py:322`) asserts that `self.fixture.doCleanups()` returns true. That call drops the inner failure, so the report loses the survivor list from `assert_nothing_outlives` (`verify_mac_offload_test_support.py:1119`). Make the outer failure carry the inner failure text: each survivor with its command line.
-2. **Reproduce.** Run `test_verify_hold_events.py` and `test_verify_hold_memory.py` repeatedly under CPU load until the failure shows. Name the process that outlives the test, the code that starts it, and why it is still alive after the marker wait. Say why the `holder_joining` fixture root stayed after its cleanup failed. Put the evidence in the summary.
-3. **Fix the cause where it lives.** Change the code that leaves the process behind. If the process detaches by design, the fixture waits for its exit event, as it does for lint recorders. Add no retry, and do not raise a time limit.
-4. **Proof.** Under the load from item 2, each of the two modules passes 20 runs in a row on the final tree. Before the fix, the same load gives at least one failure, or the summary says why the failure did not show.
+1. **Reproduce.** Run `test_verify_mac_signal_boundaries.py` repeatedly under CPU load until the failure shows. One way to make the load is several copies of the module at once, each through `scripts/test_times/module_run.py`, inside one detached run with `timeout` (at most 15 minutes). The cloud gate runs up to 16 test modules at once.
+2. **Cause.** Name why the runner starts after the TERM: the test's ordering (`send_signal`, then the `continue-runner` release), the `before_mac_runner` DEBUG trap, or the TERM handling in `verify.sh` before the `"$MAC_RUNNER"` call. Put the evidence in the summary. One window to check first: `verify.sh` starts the runner subshell with `&`, then sets `MAC_RUNNER_PID=$!` (line 2112). `forward_mac_runner_signal` (line 1985) kills the child only when `MAC_RUNNER_PID` is set. A TERM between the start and that assignment stops the parent and leaves the paused subshell, which runs the runner when released.
+3. **Fix the cause where it lives.** When the defect is in `verify.sh`, a TERM that arrives before the runner command stops `verify.sh` before that command runs. When the defect is in the test, the test waits for an event that proves `verify.sh` holds the TERM before it releases the runner. Add no retry, no sleep, and do not raise a time limit.
+4. **Proof.** Under the load from item 1, the module passes 20 runs in a row on the final tree. Before the fix, the same load gives at least one failure, or the summary says why the failure did not show. The signal tests cover a TERM that arrives before the parent sets `MAC_RUNNER_PID` and one that arrives after it. A handshake that waits until after the assignment covers only the second case.
 
 **Files:**
-- `scripts/direct/verify_hold_wait_test_support.py` — the cleanup message.
-- `scripts/direct/verify_mac_offload_test_support.py` — the outlive check, if the fix is a fixture wait.
-- `scripts/direct/test_verify_hold_events.py` — the deadline test watches a private parent folder, so directory events from tests that run beside it under load do not end its wait early.
-
-The file that starts the surviving process is not known yet. Item 2 names it; the director adds it to the file set, and the checkpoint notice names its owner.
+- `scripts/direct/test_verify_mac_signal_boundaries.py` — the signal boundary tests.
+- `scripts/direct/verify.sh` — the TERM handling before the Mac runner call, if the cause is there.
 
 **Workers:** 1 writer — `impl` owns every file above.
 
 **Acceptance gate:**
-- `test_verify_hold_events.py` and the other `verify_hold_wait_test_support.py` users pass with no assertion changed; `basedpyright` reports 0 errors and 0 warnings on the changed files.
-- The director runs the targeted test.
-
-### Phase 41x — The final gate runs the repository's own gate in a repository with no Cargo  · status: todo
-
-**Depends on:** none. Runs after 41y.
-
-#### Work Order
-
-**Source:** builds, 2026-11-08, an anomaly from sdlc. In the `~/.claude` models unit worktree (at 3535b65d7), `verify.sh final` exits 2 with `could not find Cargo.toml`. It did not block that unit.
-
-**Goal:** a unit run in a repository with no `Cargo.toml` reaches its final gate with a gate that fits the repository, and `verify.sh` names the cause in one line when it is called there.
-
-**Spec:**
-1. **Cause.** <FinalGate/> step 1 (`docs/direct/final_gate_commit.md:11`) launches `verify.sh final` in every repository. `verify.sh` is the Cargo verifier: in a repository with no `Cargo.toml`, cargo prints `could not find Cargo.toml` and `verify.sh` exits 2. The writer confirms this on the real path before the edit and quotes the line that runs cargo.
-2. **Final gate.** <FinalGate/> step 1 launches `verify.sh final` only in a Cargo repository (a `Cargo.toml` at the repository root). In a repository with no `Cargo.toml`, it runs that repository's unit gate. If config already names a unit gate per repository, the doc names that config. Otherwise it names the `~/.claude` gate, `targeted_test.py --checkout <tree>`, with no other repository. Step 2's failure path applies to both gates.
-3. **verify.sh.** In a repository with no `Cargo.toml`, each `verify.sh` command exits 2 before any cargo call, with one line: `verify.sh: <root> has no Cargo.toml; verify.sh checks Cargo repositories only`.
-4. **Proof.** One row in the existing test that runs `verify.sh` in a temporary repository: a git repository with no `Cargo.toml` gets exit 2, the line from item 3, and no cargo start. The row fails on the current tree.
-
-**Files:**
-- `docs/direct/final_gate_commit.md` — the gate choice (owned by sdlc; the checkpoint notice names it).
-- `scripts/direct/verify.sh` — the early exit.
-- `scripts/direct/test_verify_check_no_library.py` — the row. Its `DevFeatureFixture` (`verify_dev_features_test_support.py:74`) runs `verify.sh` in a temporary workspace.
-
-**Workers:** 1 writer — `impl` owns every file above.
-
-**Acceptance gate:**
-- The changed test module passes with no assertion changed; `basedpyright` reports 0 errors and 0 warnings on the changed test file.
+- `test_verify_mac_signal_boundaries.py` passes with no assertion changed; `basedpyright` reports 0 errors and 0 warnings on each changed Python file.
+- When `verify.sh` changes: `bash -n scripts/direct/verify.sh` passes, `shellcheck scripts/direct/verify.sh` shows no new finding, and `test_verify_verbs.py` and `test_verify_mac_only.py` pass.
 - The director runs the targeted test.
 
 ### Phase 41c — Send a lint that waits for memory to a free Mac  · status: done

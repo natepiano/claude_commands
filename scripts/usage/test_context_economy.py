@@ -16,6 +16,7 @@ import tempfile
 from typing import Literal, TextIO, cast, final, override
 import unittest
 from unittest.mock import patch
+from zoneinfo import ZoneInfo
 
 from scripts.usage import context_economy as economy
 from scripts.usage.context_economy_read import (
@@ -472,18 +473,30 @@ class ContextEconomyTests(unittest.TestCase):
                 self.assertEqual(path.read_bytes(), original)
 
     def test_cli_compare_reads_the_saved_result_and_prints_both_sample_sizes(self) -> None:
-        self.command_inputs(sample_session("command", 15, 2))
+        session = replace(sample_session("command", 15, 2),
+                          starts=[Start(at(0), "startup", "2.1.0"), Start(at(600), "resume", "2.1.0")])
+        self.command_inputs(session)
+        _ = (self.checkout / "settings.json").write_text(json.dumps({
+            "autoCompactWindow": 100000, "precomputeCompactionEnabled": True, "model": MODEL,
+        }), encoding="utf-8")
+        _ = self.git("add", ".")
+        _ = self.git("commit", "-m", "Enable the fixture setting", seconds=600)
         baseline = self.report([sample_session("before", 12)], [settings(enabled=False)])
         path = economy.save_result("baseline", baseline, self.saved)
         original = path.read_bytes()
-        status, output, errors = self.cli("compare", "baseline", "--since", at(0).isoformat(),
-                                          "--until", at(3600).isoformat())
-        self.assertEqual(status, 0, output + errors)
-        rows = quantity_rows(output, "context_per_request")
-        self.assertEqual(len(rows), 1, output)
-        self.assertIn("12", rows[0])
-        self.assertIn("15", rows[0])
-        self.assertEqual(path.read_bytes(), original)
+        cases: tuple[tuple[list[str], int], ...] = (
+            ([], 15), (["--where", "precomputeCompactionEnabled=false"], 9),
+            (["--where", "precomputeCompactionEnabled=true", "--where", f'model="{MODEL}"'], 6),
+        )
+        for predicates, current_n in cases:
+            with self.subTest(predicates=predicates):
+                status, output, errors = self.cli("compare", "baseline", "--family", "claude", *predicates,
+                                                  "--since", at(0).isoformat(), "--until", at(3600).isoformat())
+                self.assertEqual(status, 0, output + errors)
+                rows = quantity_rows(output, "context_per_request")
+                self.assertEqual(len(rows), 1, output)
+                self.assertEqual(rows[0][-2:], ["12", str(current_n)])
+                self.assertEqual(path.read_bytes(), original)
 
     def test_cli_trend_uses_saved_time_order_after_the_source_files_are_gone(self) -> None:
         self.command_inputs(sample_session("command", 12))
@@ -492,6 +505,9 @@ class ContextEconomyTests(unittest.TestCase):
                          since=at(86400), until=at(2 * 86400))
         first_path = economy.save_result("z-earlier", first, self.saved)
         second_path = economy.save_result("a-later", second, self.saved)
+        legacy = cast(dict[str, object], json.loads(first_path.read_text(encoding="utf-8")))
+        del legacy["mac"]
+        _ = first_path.write_text(json.dumps(legacy), encoding="utf-8")
         before = {path: path.read_bytes() for path in (first_path, second_path)}
         for transcript in self.projects.rglob("*.jsonl"):
             transcript.unlink()
@@ -501,6 +517,11 @@ class ContextEconomyTests(unittest.TestCase):
         self.assertIn("100", output)
         self.assertIn("200", output)
         self.assertEqual({path: path.read_bytes() for path in before}, before)
+        columns = next(line for line in output.splitlines() if line.startswith("| result |")).strip("|").split("|")
+        mac_column = [column.strip() for column in columns].index("mac")
+        for name in ("z-earlier", "a-later"):
+            row = next(line for line in output.splitlines() if line.startswith(f"| {name} |"))
+            self.assertEqual(row.strip("|").split("|")[mac_column].strip(), "")
 
     def test_cli_report_uses_the_user_zone_and_leaves_no_saved_result(self) -> None:
         self.command_inputs(sample_session("command", 12))
@@ -658,8 +679,11 @@ class ContextEconomyTests(unittest.TestCase):
 
     def test_a_failed_mac_read_keeps_local_numbers_and_an_empty_mac_is_successful(self) -> None:
         self.command_inputs(sample_session("command", 12))
-        for mac, message in ((MacReadFailed("fixture connection failed"), "mac: fixture connection failed"),
-                             (MacSessions([], []), "")):
+        for name, mac, message, expected_mac in (
+            ("mac-failed", MacReadFailed("fixture connection failed"), "mac: fixture connection failed",
+             {"state": "failed", "reason": "fixture connection failed"}),
+            ("mac-read", MacSessions([], []), "", {"state": "read"}),
+        ):
             with self.subTest(mac=mac):
                 with patch.object(economy, "read_mac", return_value=mac):
                     status, output, errors = self.cli("report", "--since", at(0).isoformat(),
@@ -670,6 +694,126 @@ class ContextEconomyTests(unittest.TestCase):
                     self.assertIn(message, output)
                 else:
                     self.assertNotIn("mac:", output)
+                with patch.object(economy, "read_mac", return_value=mac):
+                    status, output, errors = self.cli("save", name, "--since", at(0).isoformat(),
+                                                      "--until", at(3600).isoformat())
+                self.assertEqual(status, 0, output + errors)
+                path = self.saved / f"{name}.json"
+                saved = cast(dict[str, object], json.loads(path.read_text(encoding="utf-8")))
+                self.assertEqual(saved["mac"], expected_mac)
+                self.assertEqual(output.splitlines(), [str(path), message] if message else [str(path)])
+                restored = economy.read_result(path)
+                self.assertEqual(sum(group.requests for group in restored.groups), 12)
+        self.configure(min_requests=20)
+        for name, mac in (("empty-failed", MacReadFailed("fixture connection failed")),
+                          ("empty-read", economy.MacReadSucceeded())):
+            empty = replace(self.report([sample_session("below-threshold", 12)], [settings()]), mac=mac)
+            _ = economy.save_result(name, empty, self.saved)
+        status, output, errors = self.cli("trend")
+        self.assertEqual(status, 0, output + errors)
+        columns = next(line for line in output.splitlines() if line.startswith("| result |")).strip("|").split("|")
+        mac_column = [column.strip() for column in columns].index("mac")
+        for name, expected in (("mac-failed", "mac failed"), ("mac-read", ""),
+                               ("empty-failed", "mac failed"), ("empty-read", "")):
+            row = next(line for line in output.splitlines() if line.startswith(f"| {name} |"))
+            cells = [cell.strip() for cell in row.strip("|").split("|")]
+            self.assertEqual(cells[mac_column], expected)
+            if name.startswith("empty-"):
+                names = [column.strip() for column in columns]
+                self.assertEqual(cells[names.index("requests")], "0")
+                self.assertEqual(cells[names.index("fresh_start"):], [""] * 8)
+        status, output, errors = self.cli("trend", "--role", "unknown")
+        self.assertEqual(status, 0, output + errors)
+        self.assertNotIn("| empty-failed |", output)
+        self.assertNotIn("| empty-read |", output)
+
+    def test_last_week_saves_the_complete_user_week_once(self) -> None:
+        self.command_inputs(sample_session("command", 12))
+        for moment, zone, name, beginning, end in (
+            ("2026-11-09T03:30:00+00:00", "America/New_York", "week-2026-W44",
+             "2026-10-26T00:00:00-04:00", "2026-11-02T00:00:00-05:00"),
+            ("2026-11-09T12:00:00+00:00", "UTC", "week-2026-W45",
+             "2026-11-02T00:00:00+00:00", "2026-11-09T00:00:00+00:00"),
+            ("2027-01-01T12:00:00+00:00", "UTC", "week-2026-W52",
+             "2026-12-21T00:00:00+00:00", "2026-12-28T00:00:00+00:00"),
+            ("2027-01-04T05:30:00+00:00", "America/New_York", "week-2026-W53",
+             "2026-12-28T00:00:00-05:00", "2027-01-04T00:00:00-05:00"),
+        ):
+            with self.subTest(moment=moment, zone=zone):
+                now = datetime.fromisoformat(moment).astimezone(ZoneInfo(zone))
+                since, until = datetime.fromisoformat(beginning), datetime.fromisoformat(end)
+                first_request = replace(request(0, 1), at=since + timedelta(days=2, hours=12))
+                second_request = replace(request(0, 2), at=first_request.at + timedelta(minutes=1))
+                session = replace(sample_session("week", 2), requests=[first_request, second_request],
+                                  starts=[Start(since, "startup", "2.1.0")], first_record_at=since)
+                with (patch.dict(os.environ, {"USER_ZONE": zone}),
+                      patch.object(economy, "current_time", return_value=now),
+                      patch.object(economy, "read_claude", return_value=[session]) as read):
+                    status, output, errors = self.cli("save", "--last-week")
+                self.assertEqual(status, 0, output + errors)
+                path = self.saved / f"{name}.json"
+                self.assertEqual(output.splitlines(), [str(path)])
+                restored = economy.read_result(path)
+                self.assertEqual((restored.since.isoformat(), restored.until.isoformat()), (beginning, end))
+                self.assertEqual(sum(group.requests for group in restored.groups), 2)
+                self.assertEqual(restored.role_quantities["unknown"]["context_per_request"].mean, 150)
+                read.assert_called_once_with(self.projects, since, until, "fixture")
+                original = path.read_bytes()
+                with (patch.dict(os.environ, {"USER_ZONE": zone}),
+                      patch.object(economy, "current_time", return_value=now),
+                      patch.object(economy, "read_claude", side_effect=AssertionError("The saved week must need no input.")),
+                      patch.object(economy, "read_codex", side_effect=AssertionError("The saved week must need no input.")),
+                      patch.object(economy, "read_mac", side_effect=AssertionError("The saved week must need no input."))):
+                    status, output, errors = self.cli("save", "--last-week")
+                self.assertEqual(status, 0, output + errors)
+                self.assertEqual(output.splitlines(), [str(path)])
+                self.assertEqual(path.read_bytes(), original)
+
+                legacy = cast(dict[str, object], json.loads(path.read_text(encoding="utf-8")))
+                del legacy["mac"]
+                _ = path.write_text(json.dumps(legacy), encoding="utf-8")
+                original = path.read_bytes()
+                with (patch.dict(os.environ, {"USER_ZONE": zone}),
+                      patch.object(economy, "current_time", return_value=now),
+                      patch.object(economy, "read_claude", side_effect=AssertionError("The old week must need no input.")),
+                      patch.object(economy, "read_codex", side_effect=AssertionError("The old week must need no input.")),
+                      patch.object(economy, "read_mac", side_effect=AssertionError("The old week must need no input."))):
+                    status, output, errors = self.cli("save", "--last-week")
+                self.assertEqual(status, 0, output + errors)
+                self.assertEqual(output.splitlines(), [str(path)])
+                self.assertEqual(path.read_bytes(), original)
+
+                for outcome in (MacReadFailed("fixture Mac still asleep"), MacSessions([], [])):
+                    with self.subTest(outcome=outcome):
+                        failed = {**legacy, "mac": {"state": "failed", "reason": "fixture Mac asleep"}}
+                        _ = path.write_text(json.dumps(failed), encoding="utf-8")
+                        original = path.read_bytes()
+                        changed = replace(session, requests=[replace(first_request, input=300, cache_read=0,
+                            cache_write_5m=0, cache_write_1h=0), replace(second_request, input=400, cache_read=0,
+                            cache_write_5m=0, cache_write_1h=0)])
+                        with (patch.dict(os.environ, {"USER_ZONE": zone}),
+                              patch.object(economy, "current_time", return_value=now),
+                              patch.object(economy, "read_claude", return_value=[changed]) as reread,
+                              patch.object(economy, "read_mac", return_value=outcome) as mac_read):
+                            status, output, errors = self.cli("save", "--last-week")
+                        self.assertEqual(status, 0, output + errors)
+                        reread.assert_called_once_with(self.projects, since, until, "fixture")
+                        mac_read.assert_called_once_with(since, until)
+                        if isinstance(outcome, MacReadFailed):
+                            self.assertEqual(path.read_bytes(), original)
+                            self.assertEqual(output.splitlines(), [str(path), "mac: fixture Mac still asleep"])
+                        else:
+                            self.assertEqual(output.splitlines(), [str(path)])
+                            refreshed = economy.read_result(path)
+                            self.assertIsInstance(refreshed.mac, economy.MacReadSucceeded)
+                            self.assertEqual(refreshed.role_quantities["unknown"]["context_per_request"].mean, 350)
+
+        for arguments in (("extra-name",), ("--since", at(0).isoformat()), ("--until", at(3600).isoformat()),
+                          ("--where", "precomputeCompactionEnabled=false"), ("--family", "claude"), ("--family", "codex")):
+            with self.subTest(arguments=arguments):
+                status, output, errors = self.cli("save", "--last-week", *arguments)
+                self.assertEqual(status, 2, output + errors)
+                self.assertIn("save --last-week", errors)
 
 
 if __name__ == "__main__":

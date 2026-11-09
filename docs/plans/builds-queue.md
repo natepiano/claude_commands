@@ -406,7 +406,7 @@ Phase 18c makes the staff row id the copy owner, under its `RoleOwner` boundary 
 
 **Ruled out:** a reader in main code that skips stored `suites:2` records.
 
-### Phase 21 — Each moved admission name has one import path  · status: todo
+### Phase 21 — Each moved admission name has one import path  · status: moved to report (11-08)
 
 **Depends on:** 10o, and resources 0dfe65382 on the builds branch, because that branch conflicts in `memory_admit.py`. Source: builds showrunner, 2026-11-06 02:2x EST (design call).
 
@@ -558,7 +558,7 @@ Phase 18c makes the staff row id the copy owner, under its `RoleOwner` boundary 
 
 **Ruled out:** a service lock; saving a pending change.
 
-### Phase 16 — The copy guard refuses only what makes a repository tree  · status: todo
+### Phase 16 — The copy guard refuses only what makes a repository tree  · status: moved to verify (11-08)
 
 **Depends on:** 18c, and verify P35 on GitHub builds, which hands `scripts/copies/` to queue-unit and edits `copy_guard.py`. Order of the copies items: 18c, then 16, then 17 (Phase 18 retrospective). The builds ruling of 2026-11-05 stands: "A broken guard is fixed at once".
 
@@ -581,7 +581,7 @@ Phase 18c makes the staff row id the copy owner, under its `RoleOwner` boundary 
 
 **Acceptance gate:** copies and hook suites pass; basedpyright 0/0/0. Change-Review: a command that the guard refused now runs.
 
-### Phase 17 — copies.py list shows remote mirrors  · status: todo
+### Phase 17 — copies.py list shows remote mirrors  · status: done by verify 41u (11-08)
 
 **Depends on:** 18c, 16 and verify P35 on GitHub builds. Builds rulings, 2026-11-05. The verify 35b unit keeps the 26 simplify items. The copy start object scan moved to natest's copies.py Git-work speed phase (builds, 2026-11-05). On `copies.py` the second lander resolves.
 
@@ -646,7 +646,7 @@ Phase 18c makes the staff row id the copy owner, under its `RoleOwner` boundary 
 
 **Acceptance gate:** the merge gate; basedpyright 0/0/0 on each changed file; adversary and contract reviews.
 
-### Phase 27 — The build memory page feed is a boot service  · status: todo
+### Phase 27 — The build memory page feed is a boot service  · status: done
 
 **Depends on:** the memory page legend change now with the impl worker (the same two files). 10m keeps its other items.
 
@@ -700,6 +700,39 @@ After Phase 30, `build_targets.py` eligible, reserve and release-wait still use 
 4. **Measure.** CPU (user + system, children counted) and wall per start, 15 interleaved runs before and after, on top of 41p.
 5. **Proof.** An import test for each moved import. The existing tests of each changed module pass.
 
+### Phase 35 — Cloud gates are work rows on /build:queue and the build page  · status: moved to report (11-08)
+
+The user approved aws-unit's design on 2026-11-08. Builds moved it to report, which starts after Phase 36 lands, because both edit memory_feed.py and memory_live.html.
+
+### Phase 36 — Swap by group adds up to the swap bar  · status: done
+
+1. **The ask (user via builds, 2026-11-08).** The bar said 23.8 of 38.2 GiB swap used; the groups summed to about 0.3 GiB. Add a Total row so the rows add up to the bar, show the real owner of the gap, and give the three "between steps" rows labels that tell them apart.
+2. **Cause (measured 11:2x EST).** The groups list only build-queue steps. memory.swap.current by cgroup: user.slice 24.3 GiB, of which app.slice/app-agents.slice 19.3 GiB across about 187 agent session scopes (0.3-0.4 GiB each); other app.slice 3.1 GiB; builds.slice 0.88; session.slice 0.69; system.slice 0.27; hana.slice 0.19. SwapCached is 15 MiB.
+3. **Rule.** The feed reads swap by owner from the cgroup tree, from the same reading as the bar. Build steps keep their rows. Other swap goes to named owners: agent sessions (count), other apps (by app), desktop session, system services, hana CI. The rest, not charged to any group read, is one row "not in a group". A Total row equals the bar's used value.
+4. **Labels.** A held reservation with no current step names its owner as the row name and "between steps" as the detail.
+5. **Both views.** The build page and any text view of swap groups show the same rows and Total.
+6. **Proof.** Tests: groups plus "not in a group" equal the used value; agent scopes group into one row with a count; a between-steps hold names its owner.
+
+**Workers:** 1 writer and tester. **Gate:** targeted test, basedpyright 0/0/0, adversary review, page proof.
+
+### Phase 34 — One command prints the build page link  · status: done
+
+1. **The ask (builds, 2026-11-08).** Report Phase 26 needs a command that returns the memory page link. Phase 10m built the feed and page but no command. The user named it `/build:page` (2026-11-08).
+2. **The command.** `commands/build/page.md` runs `scripts/build_queue/memory_feed.py link`, which prints the page URL from `output_folder` in `config/memory_feed.conf`.
+3. **One URL rule.** The URL comes from the review-link rule in `scripts/review_links/review_link.py` (host, port, path), through one shared function, not a copy.
+4. **Proof.** A test: the printed link names the configured folder and `memory_live.html`, with the review-link host and port.
+
+**Workers:** 1 writer and tester. **Gate:** targeted test, basedpyright 0/0/0, adversary review.
+
+### Phase 33 — Runaway runs never set a progress bin  · status: done
+
+1. **The defect (user, 2026-11-08 09:55).** Merge gates kept 15.3 GiB and blocked the queue. Phase 28 progress bins take the 2nd-highest run (`progress_profile_rank=2`). Two runaway gate runs (25.4 and 16.5 GiB, the verify.sh trap defect) were in one key, so every bin took a runaway value for 14 days. The director purged both records by hand (backups in `~/.local/state/buildlog/admission-purge-2026-11-08/`).
+2. **One rule for peak history (builds, 2026-11-08).** A ranked pick takes the Nth-highest value with N = max(floor, share of the values), capped at the count. The share is a new key in `config/build_admission.conf`, starting at 10%; no share value is in the code.
+3. **Progress bins** use floor = `progress_profile_rank`. **Program peaks** (the Phase 32 p90 and the other `step_estimator.percentile` callers) use floor 1, which gives the same result as today's p90 at a 10% share.
+4. **Proof.** Rows in the existing tests: two runaway runs in one key do not set any bin; a key with few runs still uses `progress_profile_rank`; the program p90 result does not change at 10%.
+
+**Workers:** 1 writer and tester. **Gate:** targeted test, basedpyright 0/0/0, adversary review.
+
 ### Phase 32 — A merge gate claims the memory its runs used  · status: done
 
 1. **The ask (builds, 2026-11-08 06:50).** `step_estimator.py:244` `program_peak_estimate` returns `FirstProgramPeak` for every `merge-gate`, so admission claims the fixed 4 GiB. A herdr merge gate peaked at 26.4 GiB anonymous while admission counted 4 GiB; natedev went into earlyoom and hana's gate was killed twice. Evidence: `/tmp/claude/unit/20523639-3e08-48d6-9277-73e052bca297/phases/83/memory_kill_report.md`.
@@ -750,7 +783,7 @@ After Phase 30, `build_targets.py` eligible, reserve and release-wait still use 
 
 **Workers:** `impl` owns `scripts/build_queue/memory_feed.py` and `scripts/build_queue/memory_live.html`; `test` owns `scripts/build_queue/test_memory_*.py` and the browser proof from item 11. report-unit owns `charts.page_data` in `scripts/buildlog` and its tests (report Phase 15).
 
-### Phase 10n — /build:queue retires when the build page covers it  · status: todo
+### Phase 10n — /build:queue retires when the build page covers it  · status: moved to report (11-08)
 
 **Depends on:** 10m.
 
@@ -1244,7 +1277,7 @@ Moved from builds-resources Phase 27 (builds showrunner, 2026-10-31): one owner 
 
 **Ruled out:** a fixed 57G limit (user, 2026-11-05: "57GiB is impossible if we're running other programs"); a runner client that reads config or history; a copy of client code in `/etc/nixos`; an optional profile on `AdmitRequest` in place of a named request.
 
-### Phase 22 — The hana CI margin key goes after the runner activation  · status: todo
+### Phase 22 — The hana CI margin key goes after the runner activation  · status: moved to resources (11-08)
 
 **Depends on:** 10d, natedev's confirmation that the runners are active behind the cargo front, and the user's approval of a config key deletion. Source: the accounting transition of the CI queue phase, moved here at its shrink (director call, packaging).
 
