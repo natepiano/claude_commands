@@ -1786,7 +1786,7 @@ The staff, add-unit and fast-track test modules use less CPU, with all 14,774 as
 **Ruled out:**
 - One Git seed per module: the seeds were already built once per class.
 
-### Phase 89 — The main assign launcher test file uses half its CPU  · status: todo
+### Phase 89 — The main assign launcher test file uses half its CPU  · status: done
 **Depends on:** Phase 68
 
 #### Work Order
@@ -2048,3 +2048,41 @@ A changed `config/<name>.conf` selects every test module whose transitive import
 
 **Gotchas:**
 - Three tests keep a real process through `process_boundary`: pane labels, Darwin process identity and an unreadable observation.
+
+### Phase 102 — The verify result environment tests use half their CPU  · status: todo
+**Depends on:** none
+
+#### Work Order
+
+**Source:** the backlog rank rule (next items, item 2 and item 6). On 2026-11-09 03:58 EST (`show.py top`, rows as of 03:52 EST), `direct/test_verify_result_environment.py` is the highest module by median CPU that no phase holds and that has no floor: 44.7 CPU s per gate, 7 tests. Higher rows are held, done or at a floor: `test_assign_launcher.py` (Phase 89), `test_verify_wait_holder.py` (Phase 95 floor), `test_style_sync.py` (devtools), `test_review_remote_copies.py` (Phase 97), `test_verify_mac_only.py` and `test_verify_ssh_targets_routing.py` (the `build_hold` chain floor), `test_crate_run.py` (Phase 77 floor), `test_fast_track.py` (floor), `test_assign_claude.py` (Phase 99), `test_direct_turn_wait_hooks.py` (Phase 100), `test_herdr.py` (Phase 101).
+
+**Goal:** `scripts/direct/test_verify_result_environment.py` uses half its current CPU, or a measured floor shows why it cannot, with every checked behavior kept.
+
+**Spec:**
+1. Follow the Speed method. Measure CPU with `module_cost.py --tests 10 --commands 10` first. Name each test's CPU, and each real process that it starts.
+2. Start with the slowest test in the 03:47 EST gate: `test_result_values_distinguish_unset_empty_and_changed_values_in_saved_passes` (11.5 s of 27.1 s). Then `test_mac_routes_carry_result_values_and_fixed_terminal_values` (4.6 s) and `test_changed_forwarded_value_reaches_the_mac_and_runs_again` (2.9 s). Find what each one runs: real `verify.sh` runs, fake cargo, the Mac offload fixture.
+3. A behavior that is a decision of `scripts/direct/result_environment.py` gets a direct call of that function. Keep a real `verify.sh` run for each behavior that only the script path proves (a value reaching cargo, a pass reused or run again).
+4. Write a behavior map with a row for each assertion before you change a test.
+5. `scripts/direct/test_verify_routing_rule.py` imports `FIXED_ENVIRONMENT` from this module. It stays green. Do not edit `verify_mac_offload_test_support.py` or `memory_test_support.py`; a cut there goes to the director as a proposal.
+6. Cases dominated by real `build_targets.py` commands are held for verify's import change (next items, item 6). Name them in the floor; do not cut them.
+7. If only a production change can cut a cost, write the floor and send the director an architecture proposal with its measured gain. The owner of `verify.sh` and `result_environment.py` is verify-unit.
+8. Add no guard, refusal or check (user rule, 2026-11-05).
+
+**Files:**
+- `scripts/direct/test_verify_result_environment.py`
+
+**Workers:** 1 writer; one test file
+- `impl` — `test_verify_result_environment.py`
+
+**Constraints from prior phases:**
+- Phase 95: real target, reservation and recorder commands limit `test_verify_wait_holder.py`. verify-unit owns the target-selection and recorder import proposals. Do not repeat those proposals; cite them when the same cost limits this module.
+- Phase 97 and Phase 100: an in-process call of a real entry cut CPU and kept the code path. Tests that assert on a process boundary kept a real process.
+- Phase 89 runs beside this phase and holds `scripts/direct/test_assign_launcher.py` and `scripts/direct/assign_launcher_test_support.py`. Do not edit them.
+- Tests never read or write live state: `~/.claude` main, `~/.local/state/merge-gate`, `/tmp/claude`. State the filesystem basis of each pair.
+
+**Acceptance gate:**
+- The behavior map has a row for each assertion. No assertion is removed.
+- CPU s, processes, execs and wall s before and after, from `module_cost.py` and same-load pairs, in the checkpoint notice.
+- The changed file and `test_verify_routing_rule.py` pass.
+- the targeted test green on the phase commit merged with `origin/builds`
+- `basedpyright` on the changed files prints `0 errors, 0 warnings, 0 notes`
