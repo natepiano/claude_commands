@@ -14,7 +14,7 @@ class TagInventoryTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
-        self.temporary = tempfile.TemporaryDirectory(dir="/tmp/claude")
+        self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
         self.root = Path(self.temporary.name)
 

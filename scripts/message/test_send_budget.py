@@ -34,8 +34,8 @@ class SendBudgetTests(unittest.TestCase):
             config = Path(directory) / "send.conf"
             _ = config.write_text(config.read_text().replace("delivery_timeout=40", "delivery_timeout=120")
                                   .replace("kill_grace=10", "kill_grace=80"))
-            self.assertEqual(send_budget.user_seconds(60), 400)
-            self.assertEqual(send_budget.user_seconds(180), 460)
+            self.assertEqual(send_budget.user_seconds(60), 413)
+            self.assertEqual(send_budget.user_seconds(180), 473)
 
     def test_remote_transport_setting_changes_both_sender_budgets_without_reload(self) -> None:
         with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {"CONF_DIR": directory}):

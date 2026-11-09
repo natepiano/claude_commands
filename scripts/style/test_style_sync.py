@@ -351,6 +351,8 @@ class StyleSyncTests(unittest.TestCase):
         for name in ("send", "postmaster", "codex_daemon"):
             source = Path(__file__).resolve().parents[2] / "config" / f"{name}.conf"
             _ = (config / source.name).write_text(source.read_text())
+        postmaster_config = config / "postmaster.conf"
+        _ = postmaster_config.write_text(postmaster_config.read_text().replace("claim_grace_seconds=15.0", "claim_grace_seconds=2.0"))
         with mock.patch.dict(os.environ, {"CONF_DIR": str(config)}):
             budgets: list[float] = []
             for grace in (10, 80):
@@ -375,7 +377,7 @@ class StyleSyncTests(unittest.TestCase):
                 source = Path(__file__).resolve().parents[2] / "config/postmaster.conf"
                 _ = (config / "postmaster.conf").write_text(source.read_text()
                     .replace("wait_seconds=3.0", f"wait_seconds={wait}")
-                    .replace("claim_grace_seconds=2.0", f"claim_grace_seconds={grace}"))
+                    .replace("claim_grace_seconds=15.0", f"claim_grace_seconds={grace}"))
                 with (mock.patch.object(style_sync, "runner_value", return_value="session:fixture"),
                       mock.patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "SENT: fixture")) as sender):
                     self.assertEqual(style_sync.handoff_notice("style", "parent", "checkpoint"), "sent")

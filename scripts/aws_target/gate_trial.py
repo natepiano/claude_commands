@@ -221,7 +221,7 @@ class GateTrial:
     def projection(self, prices: Prices, step: str) -> float:
         lifetime = conf.read(self.settings.path).whole('gate_trial_lifetime_minutes') * 60
         return (prices.lifetime(lifetime, self.settings.root_gib) * (2 if step == 'start' else 1)
-                + prices.put * (5 + math.floor(lifetime / self.option('log_push_s')) * (2 if step == 'start' else 1))
+                + prices.put * (5 + (2 if step == 'start' else 1) + math.floor(lifetime / self.option('log_push_s')) * (2 if step == 'start' else 1))
                 + prices.get * (lifetime * 2 / self.option('poll_pause_s') + 100))
 
     def reserve_attempt(self, identity: tuple[int, int], projected: float, reserve: float) -> bool:
@@ -633,7 +633,7 @@ class GateTrial:
                     self.finish_times(attempt)
                     with self.changed:
                         self.spent += sum(row.dollars for row in rows)
-                        self.puts += 2 if step == 'size' else 4
+                        self.puts += 3 if step == 'size' else 6
                         self.puts += math.floor(lifetime / self.option('log_push_s')) * sum(
                             bool(row.instance_id and row.request_at) for row in rows)
                         _ = self.reservations.pop(identity, None)

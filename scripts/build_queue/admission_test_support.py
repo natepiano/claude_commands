@@ -638,7 +638,7 @@ class AdmissionFixture(ExitStack):
     def compiler(self, used: int) -> None:
         path = self.root / "builds.slice/sccache.service/memory.stat"
         path.parent.mkdir(parents=True, exist_ok=True)
-        _ = path.write_text(f"anon {used}\ninactive_file 0\n")
+        _ = path.write_text(f"anon {used}\nshmem 0\ninactive_file 0\n")
         _ = (path.parent / "memory.current").write_text(str(used))
 
     def history(self) -> list[dict[str, object]]:
