@@ -7,6 +7,7 @@ import os
 import subprocess
 import sys
 import unittest
+from tempfile import TemporaryDirectory
 from pathlib import Path
 from dataclasses import replace
 from typing import cast, final, override
@@ -106,6 +107,37 @@ class TurnEndTests(unittest.TestCase):
                     self.assertEqual(len(self.case.agent.notices), notices + 1)
                     self.assertEqual(turn_end.handle(turn_end.hook_event(payload)), turn_end.TurnOutcome.IGNORED)
                 self.assertEqual(staff.by_id(row.id), row)
+
+    def test_turn_end_completes_a_dispatch_outside_the_run_root(self) -> None:
+        opened = self.case.opened()
+        original_run = self.case.run_dir
+        original_state = (original_run / "progress_history_state.json").read_bytes()
+        outside = Path(self.enterContext(TemporaryDirectory(prefix="outside-worker-run-")))
+        atomic_file.write_text_atomic(outside / "progress_history_state.json", original_state.decode())
+        self.case.run_dir = outside
+        self.assertIs(self.case.dispatch(), worker.DispatchSubmission.SUBMITTED)
+        self.assertEqual(worker_panes.worker_run(opened.row), outside)
+        self.assertEqual(len(self.case.fixture.world.launches), 1)
+        self.assertEqual(self.case.finish(), turn_end.TurnOutcome.DONE)
+        self.assertEqual(worker_panes.worker_pass(opened.row, outside)["status"], "completed")
+        self.assertEqual((original_run / "progress_history_state.json").read_bytes(), original_state)
+        self.assertEqual(len(self.case.agent.notices), 1)
+        self.assertIn("phase 8: done", self.case.agent.notices[0])
+        self.assertNotIn(opened.pane, self.case.fixture.world.locations)
+
+    def test_completed_rerun_repeats_the_saved_kept_pane_anomaly(self) -> None:
+        self.assertIs(self.case.dispatch(), worker.DispatchSubmission.SUBMITTED)
+        pane = self.case.agent.submitted[-1][0]
+        self.case.fixture.world.unknown[pane] = "worker process is unreadable"
+        self.assertEqual(self.case.finish(), turn_end.TurnOutcome.DONE)
+        notice, = self.case.agent.notices
+        self.assertIn(f"anomaly: impl: worker process is unreadable; kept pane {pane}", notice)
+        reply = self.case.reply.read_bytes(), self.case.reply.stat().st_mtime_ns
+        self.assertIs(self.case.dispatch(), worker.DispatchSubmission.SUBMITTED)
+        self.assertEqual(self.case.agent.notices, [notice, notice])
+        self.assertEqual(len(self.case.agent.submitted), 1)
+        self.assertIn(pane, self.case.fixture.world.locations)
+        self.assertEqual((self.case.reply.read_bytes(), self.case.reply.stat().st_mtime_ns), reply)
 
     def test_a_director_or_an_idle_worker_hook_changes_no_pass(self) -> None:
         row = self.case.opened().row

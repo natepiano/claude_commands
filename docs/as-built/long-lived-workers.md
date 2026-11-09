@@ -43,9 +43,25 @@ The director reads that reply when the message resumes it.
 Codex receives `-c notify=[...]` on its launch line.
 Claude receives an asynchronous `Stop` command through launch-line `--settings` JSON.
 The launcher changes no account settings file.
-The hook finds the worker through its native conversation id and reads its active pass.
+The hook finds the worker through its native conversation id.
+It follows a per-worker link to the dispatch's existing state file.
+The link lives in `dispatches/<staff id>` beside the staff record.
+This lookup includes dispatches outside the run root.
+Older workers without a link use the held-run lookup.
 A session without a worker pass changes nothing.
 A later event retries unfinished completion steps for a completed pass.
+
+An identical rerun of a completed dispatch sends one completion message through the hook's notice code.
+It saves the reply without typing another prompt.
+This rule also applies to a completed managed Astra review.
+The saved completion includes the reason and pane for a close anomaly.
+A successful completed rerun sets its status file to `done` after it sends the notice.
+Native duplicate hook events still send no second message.
+
+A new Codex worker has no resume argument.
+Its pane session report supplies the first native identity.
+The identity reader excludes only `scripts/herdr/turn_end.py` from the foreground process count.
+Every other foreground process prevents the pane report from proving a sole Codex process.
 
 `worker.dispatch_receipt` owns the completion rule.
 A live detached run holds DONE. A finished run permits completion with an anomaly for an absent transcript result.
