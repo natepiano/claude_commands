@@ -9,6 +9,7 @@ import json
 import os
 import re
 import sqlite3
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -42,7 +43,8 @@ def unit(name: str, claude: unit_lookup.Claude | None) -> live_units.LiveUnit:
     activity = (session_state.LiveActivity("idle") if isinstance(claude, unit_lookup.LiveClaude)
                 else session_state.NoLiveSession())
     observed = unit_lookup.LabeledSession(name, claude, HerdrPlace(f"label-of-{name}", "w1:p1")) if claude is not None else None
-    return live_units.LiveUnit(name, observed, status=session_state.classify(member, activity), member=member)
+    machine = member.worktree.machine if isinstance(member, staff.StaffRow) and isinstance(member.worktree, staff.PresentWorktree) else ""
+    return live_units.LiveUnit(name, observed, status=session_state.classify(member, activity), member=member, machine=machine)
 
 
 def live(name: str) -> unit_lookup.LiveClaude:
@@ -68,6 +70,10 @@ class UnitPhasesTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        config = self.root / "table-conf"
+        _ = cast(object, shutil.copytree(Path(__file__).resolve().parents[2] / "config", config))
+        _ = cast(object, self.enterContext(patch.dict(os.environ, {"CONF_DIR": str(config)})))
+        _ = self.enterContext(patch("socket.gethostname", return_value="natedev"))
         _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
         from scripts.message import process_table
         sessions = self.root / "sessions"
@@ -278,14 +284,30 @@ class UnitPhasesTests(unittest.TestCase):
     def test_table_has_one_row_per_unit_and_escapes_pipes(self) -> None:
         owner = fixture_member("showrunner", name="table-owner")
         for name in ("one", "two"):
-            _ = fixture_member("unit", name=name, parent=owner.id)
+            _ = fixture_member("unit", name=name, parent=owner.id,
+                               worktree=staff.PresentWorktree("natedev", self.root / name))
         records: dict[str, object] = {"one": {"current": {"phase": "1", "of": 2, "title": "a|b"}, "phases": phase_rows("running", "todo")}}
-        self.assertEqual(unit_phases.table([unit("one", live("a|b")), unit("two", None)], records), "\n".join([
-            "| Unit | Status | Phase | Non-Phase Work | Queued |",
-            "| --- | --- | --- | --- | --- |",
-            "| one | idle | phase 1 of 2 — a\\|b | — | — |",
-            "| two | exited | — | — | — |",
-        ]))
+        for machine in ("natedev", "mac"):
+            with self.subTest(machine=machine):
+                units = [unit("one", live("a|b")), unit("two", None)._replace(machine=machine)]
+                column = " Machine |" if machine == "mac" else ""
+                separator = " --- |" if machine == "mac" else ""
+                first_machine = " natedev |" if machine == "mac" else ""
+                second_machine = " mac |" if machine == "mac" else ""
+                self.assertEqual(unit_phases.table(units, records), "\n".join([
+                    f"| Unit | Status |{column} Phase | Non-Phase Work | Queued |",
+                    f"| --- | --- |{separator} --- | --- | --- |",
+                    f"| one | idle |{first_machine} phase 1 of 2 — a\\|b | — | — |",
+                    f"| two | exited |{second_machine} — | — | — |",
+                ]))
+
+        config = self.root / "table-conf/build_targets.conf"
+        configured = config.read_text()
+        _ = config.write_text(configured.replace("kind.natedev=local", "kind.natedev=ssh\nkind.fixture-home=local"))
+        selected = unit("one", live("a|b"))._replace(machine="fixture-home")
+        self.assertEqual(unit_phases.table([selected], records).splitlines()[0],
+                         "| Unit | Status | Phase | Non-Phase Work | Queued |")
+        _ = config.write_text(configured)
 
         records = {"one": {"current": None, "phases": phase_rows("todo")}}
         self.assertIn("| one | idle | not started | — | — |",
@@ -345,13 +367,13 @@ class UnitPhasesTests(unittest.TestCase):
         codex = unit_lookup.LabeledSession("first", unit_lookup.ClaudeUnknown("no Claude registry record"),
             HerdrPlace("codex", "w1:p1"), process=unit_lookup.ObservedProcess(41, "codex"),
             identity=unit_lookup.LiveSession(first.current_session))
-        away = "mac" if remote.local_machine() != "mac" else "natedev"
         for observed, machine, hold, expected in (
-                (codex, remote.local_machine(), "", "idle"),
-                (None, remote.local_machine(), "", "exited"),
-                (None, away, "", f"on {away}"),
-                (None, away, "pause", "paused"),
-                (None, away, "exit", "exited")):
+                (codex, "natedev", "", "idle"),
+                (None, "natedev", "", "exited"),
+                (codex, "mac", "", "idle"),
+                (None, "mac", "", "exited"),
+                (None, "mac", "pause", "paused"),
+                (None, "mac", "exit", "exited")):
             with self.subTest(process=observed, machine=machine, hold=hold):
                 member = replace(first, worktree=staff.PresentWorktree(machine, self.root),
                     paused=staff.Paused("2026-11-08", "fixture", "pause") if hold == "pause" else staff.Active(),
@@ -362,7 +384,16 @@ class UnitPhasesTests(unittest.TestCase):
                 with (patch.object(staff, "snapshot", return_value=snapshot) as staff_read,
                       patch.object(sessions, "running_sessions", return_value=[])):
                     units = live_units.units_in(owner.name, listing)
-                    self.assertIn(f"| first | {expected} | — | — | — |", unit_phases.table(units, {}))
+                    self.assertEqual(units[0].status, expected)
+                    self.assertEqual(units[0].machine, machine)
+                    output = unit_phases.table(units, {})
+                    if machine == "mac":
+                        self.assertIn("| Unit | Status | Machine | Phase | Non-Phase Work | Queued |", output)
+                        self.assertIn(f"| first | {expected} | mac | — | — | — |", output)
+                        self.assertIn("| second | exited | — | — | — | — |", output)
+                    else:
+                        self.assertNotIn("Machine", output)
+                        self.assertIn(f"| first | {expected} | — | — | — |", output)
                 staff_read.assert_called_once_with()
 
     def test_read_failures_print_below_the_table_and_send_one_configured_message(self) -> None:
@@ -588,8 +619,8 @@ class UnitPhasesTests(unittest.TestCase):
                   "types": {"unavailable": "worktree cannot be read"}})),
               contextlib.redirect_stdout(output)):
             self.assertEqual(unit_phases.main(["--production", "show"]), 0)
-        self.assertIn("| names | active | #12 · read · alpha · 1 finding | starting 1 finding | — | 0 | 0 | 1 |", output.getvalue())
-        self.assertIn("| types | active | idle | idle | — | 0 | 0 | 0 |", output.getvalue())
+        self.assertIn("| names | idle | #12 · read · alpha · 1 finding | starting 1 finding | — | 0 | 0 | 1 |", output.getvalue())
+        self.assertIn("| types | idle | idle | idle | — | 0 | 0 | 0 |", output.getvalue())
 
     def test_production_of_reads_the_staff_row_addressed_to_the_session(self) -> None:
         doc = self.root / "show-production.md"

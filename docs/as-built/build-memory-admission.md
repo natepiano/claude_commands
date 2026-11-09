@@ -45,7 +45,10 @@ The service removes the progress files when the reservation ends.
 
 The queue pane and the build page show each cloud gate in the main table.
 A running row shows machine `aws` and its vCPU count.
-The last column shows the state, module count, and failed modules.
+The queue pane's last column shows the state, module count, and failed modules.
+On the build page, a cloud row with a module counter draws the local rows' progress line.
+Small text under the line shows the module count and failed modules.
+The page omits the state `running` and shows any other state first.
 A waiting row shows `cloud` in the # column and its slot wait text.
 Its machine and vCPU cells stay blank.
 The Head line shows `cloud N of M slots`.
@@ -1731,3 +1734,8 @@ It retains Cargo inputs and `NEXTEST_CARGO_PROFILE`.
 `record.py` stores `test_build_key` only when source stays unchanged during nextest.
 Rows without a key cannot prove a fresh build.
 The broader `BUILDLOG_TREE` field cannot replace this key.
+
+The merge gate and style lint own private folders through `build_folders.temporary_build_folder`.
+The contexts remove these folders after success or an exception.
+Style review keeps its input folder for the review worker and finish command.
+Session TMPDIRs and unit session folders remain for later session commands.

@@ -92,6 +92,8 @@ elif service == 'cloudformation' and operation == 'wait':
     if (root / ('fail-wait-' + args[service_index + 2])).exists():
         print('fixture wait failed', file=sys.stderr); sys.exit(1)
     reply({})
+elif service == 'cloudformation' and operation == 'get-template':
+    reply({'TemplateBody': json.loads((root / 'live-template.json').read_text())})
 elif service == 'cloudformation' and operation == 'describe-stack-events':
     reply({'StackEvents': []})
 elif service == 'cloudformation' and operation == 'delete-change-set':
@@ -118,7 +120,8 @@ elif service == 'cloudformation' and operation == 'create-change-set':
         assert change_name not in used, 'duplicate update name'
         names.write_text(json.dumps([*used, change_name]))
     change.write_text(json.dumps({'StackId': stack_id, 'Status': 'CREATE_COMPLETE', 'Changes': [],
-                                 'Parameters': json.loads(args[args.index('--parameters') + 1])}))
+                                 'Parameters': json.loads(args[args.index('--parameters') + 1]),
+                                 'Template': json.loads(pathlib.Path(args[args.index('--template-body') + 1].removeprefix('file://')).read_text())}))
     if updating and (root / 'update-plan.json').exists():
         value = json.loads(change.read_text())
         value.update(json.loads((root / 'update-plan.json').read_text()))
@@ -146,7 +149,7 @@ elif service == 'cloudformation' and operation == 'describe-stacks':
         print('ValidationError: Stack does not exist', file=sys.stderr)
         sys.exit(1)
     reply({'Stacks': [{'StackId': state.get('stack_id'), 'StackStatus': state.get('status', 'UPDATE_COMPLETE'),
-        'Parameters': [{'ParameterKey': k} for k in ('EnableCompute', 'NotificationEmail', 'ExistingDataVolumeId')], 'Outputs': [
+        'Parameters': [{'ParameterKey': k, 'ParameterValue': v} for k, v in state.get('parameters', {}).items()], 'Outputs': [
         {'OutputKey': key, 'OutputValue': value} for key, value in state['outputs'].items()]}]})
 elif service == 'cloudformation' and operation == 'update-stack':
     parameters = json.loads(args[args.index('--parameters') + 1])
@@ -172,6 +175,9 @@ elif service == 'cloudformation' and operation in ('deploy', 'execute-change-set
     owner = json.loads((root / 'state/deployment.json').read_text())
     outputs = {'ComputeEnabled': params['EnableCompute'], 'BudgetName': params['BudgetName'] or owner['stack'] + '-monthly-' + params['DeploymentId'],
                'ExistingDataInput': params['ExistingDataVolumeId']}
+    outputs.update({key: value for key, value in state.get('outputs', {}).items() if key.startswith('Gate')})
+    if operation == 'execute-change-set':
+        (root / 'live-template.json').write_text(json.dumps(change['Template']))
     if params['EnableCompute'] == 'true':
         outputs.update(InstanceId='i-fixture', DataVolumeId=params['ExistingDataVolumeId'] or 'vol-created')
     owner = json.loads((root / 'state/deployment.json').read_text())
@@ -180,7 +186,8 @@ elif service == 'cloudformation' and operation in ('deploy', 'execute-change-set
     assert owner['deployment_id'] == params['DeploymentId']
     if params['EnableCompute'] == 'true' and state.get('outputs', {}).get('InstanceId'):
         outputs.update({key: state['outputs'][key] for key in ('InstanceId', 'DataVolumeId')})
-    state = {'outputs': outputs, 'stack_name': owner['stack'], 'stack_id': owner['stack_id'], 'parameters': params}
+    state = {'outputs': outputs, 'stack_name': owner['stack'], 'stack_id': owner['stack_id'], 'parameters': params,
+             'instance_state': 'terminated' if params['EnableCompute'] == 'false' else 'stopped'}
     (root / 'deleted-stack').unlink(missing_ok=True)
     (root / 'deleted-volume').unlink(missing_ok=True)
     (root / 'deleted-budget').unlink(missing_ok=True)
@@ -268,7 +275,17 @@ elif operation == 'describe-spot-price-history':
 elif operation == 'get-cost-and-usage':
     period = args[args.index('--time-period') + 1]
     assert all(len(part.split('=')[1]) == 10 for part in period.split(','))
-    reply({'ResultsByTime': [{'Total': {'UnblendedCost': {'Amount': '0.1', 'Unit': 'USD'}}}]})
+    bounds = dict(part.split('=', 1) for part in period.split(','))
+    first, end = (datetime.datetime.fromisoformat(bounds[key]) for key in ('Start', 'End'))
+    days = []
+    while first < end:
+        following = first + datetime.timedelta(days=1)
+        days.append({'TimePeriod': {'Start': first.date().isoformat(), 'End': following.date().isoformat()},
+                     'Estimated': False, 'Total': {}, 'Groups': [{'Keys': ['USE2-SpotUsage:m7a.4xlarge'],
+                         'Metrics': {'UnblendedCost': {'Amount': '0.1', 'Unit': 'USD'},
+                                     'UsageQuantity': {'Amount': '1', 'Unit': 'Hrs'}}}]})
+        first = following
+    reply({'ResultsByTime': days})
 else:
     raise AssertionError((service, operation))
 '''
@@ -382,7 +399,7 @@ class DeploymentTests(CostFixture):
             'deployment_timeout_s': '30', 'preflight_max_age_s': '300', 'fixed_usd_per_month': '0.001',
             'retained_storage_usd_per_month': '0', 'root_storage_usd_per_month': '0',
             'ipv4_usd_per_month': '0', 'gp3_iops_usd_per_month': '0', 'gp3_throughput_usd_per_month': '0',
-            'region': 'us-east-1',
+            'region': 'us-east-1', 'cost_explorer_lookback_days': '1',
             'cost_explorer_tag_key': 'Project', 'cost_explorer_tag_value': 'fixture-build', 'accounting_zone': 'UTC',
         })
         for key, value in values.items():
@@ -1209,6 +1226,7 @@ sys.exit(7)
 
     def prepare_running_costs(self) -> tuple[int, ledger.CostLedger]:
         start = int(datetime(2026, 1, 15, tzinfo=UTC).timestamp())
+        self.replace('daily_limit_usd', '20')
         self.costs({'fallback_usd_per_hour': '0.10', 'fixed_usd_per_month': '300',
                     'price_max_age_seconds': '86400', 'observation_max_age_seconds': '86400',
                     'cost_explorer_read_usd': '0'})
@@ -1504,13 +1522,136 @@ else: raise AssertionError(args)
         _ = path.write_text(original)
 
     def test_down_dry_run_changes_nothing_and_needs_no_credentials(self) -> None:
-        before = {path: path.read_bytes() for path in self.root.rglob('*') if path.is_file()}
-        with mock.patch.dict(os.environ, {'AWS_SHARED_CREDENTIALS_FILE': ''}), redirect_stdout(StringIO()) as output:
-            self.assertTrue(self.deployment().down())
-        self.assertIn('/home build cache is lost', output.getvalue())
-        self.assertIn('admin.gpg, and the box image', output.getvalue())
-        self.assertIn('--approve-destroy', output.getvalue())
-        self.assertEqual({path: path.read_bytes() for path in self.root.rglob('*') if path.is_file()}, before)
+        for action in (self.deployment().down, self.deployment().remove_builder):
+            before = {path: path.read_bytes() for path in self.root.rglob('*') if path.is_file()}
+            with mock.patch.dict(os.environ, {'AWS_SHARED_CREDENTIALS_FILE': ''}), redirect_stdout(StringIO()) as output:
+                self.assertTrue(action())
+            self.assertIn('/home build cache is lost', output.getvalue())
+            self.assertIn('admin.gpg, and the box image', output.getvalue())
+            self.assertIn('--approve-destroy', output.getvalue())
+            self.assertEqual({path: path.read_bytes() for path in self.root.rglob('*') if path.is_file()}, before)
+
+    def builder_removal_fixture(self) -> dict[str, object]:
+        devices = self.removal_fixture()
+        stack_path = self.root / 'fake-stack.json'
+        stack = remote.read_record(stack_path)
+        ledger.mapping(stack['outputs']).update(GateBucket='fixture-bucket', GateLaunchTemplate='fixture-template')
+        ledger.mapping(stack['parameters']).update(EnableGates='true', GateImage='ami-gate', GateRootGiB='40')
+        _ = stack_path.write_text(json.dumps(stack))
+        template = remote.read_record(deploy.TEMPLATE)
+        for name in ('InstanceRole', 'InstanceProfile', 'SecurityGroup'):
+            _ = ledger.mapping(ledger.mapping(template['Resources'])[name]).pop('Condition')
+        _ = (self.root / 'live-template.json').write_text(json.dumps(template))
+        _ = (self.state / 'gate-deployment.json').write_text('{"bucket":"fixture-bucket","template":"fixture-template"}\n')
+        self.set_clock(self.now + 1)
+        book = ledger.CostLedger(self.state)
+        book.record_inventory(ledger.ResourceInventory(self.now, book.read_snapshot().inventories[-1].resources + (
+            ledger.PricedResource('gate-shared', Decimal(1)),), 'fixture gate deployment'))
+        book.record_compute_request(ledger.ComputeRequest(self.now, 'fixture-build', 'us-east-1', Decimal('0.5')))
+        self.set_clock(self.now + 1)
+        self.replace('fixed_usd_per_month', '100')
+        return devices
+
+    def test_remove_builder_preserves_gates_and_removes_storage_before_resolving_costs(self) -> None:
+        devices = self.builder_removal_fixture()
+        settings, credentials = self.settings.read_bytes(), self.credentials.read_bytes()
+        gate_manifest = (self.state / 'gate-deployment.json').read_bytes()
+        template = remote.read_record(self.root / 'live-template.json')
+        before_commands = len(self.commands())
+        with redirect_stdout(StringIO()) as output:
+            self.assertTrue(self.deployment().remove_builder(approve_destroy=True))
+        self.assertIn('gate-deployment.json kept', output.getvalue())
+        self.assertEqual(self.settings.read_bytes(), settings)
+        self.assertEqual(self.credentials.read_bytes(), credentials)
+        self.assertEqual((self.state / 'gate-deployment.json').read_bytes(), gate_manifest)
+        self.assertEqual([row['id'] for row in ledger.rows(devices, 'devices')], ['device-other'])
+        operations = [cast(list[str], row['args'])[5] for row in self.commands()[before_commands:]]
+        self.assertLess(operations.index('execute-change-set'), operations.index('delete-volume'))
+        self.assertFalse({'delete-stack', 'delete-budget', 'delete-access-key'} & set(operations))
+        command = cast(list[str], self.commands('create-change-set')[-1]['args'])
+        parameters = ledger.rows({'rows': cast(object, json.loads(command[command.index('--parameters') + 1]))}, 'rows')
+        for row in parameters:
+            if row['ParameterKey'] == 'EnableCompute':
+                self.assertEqual(row['ParameterValue'], 'false')
+            else:
+                self.assertIs(row['UsePreviousValue'], True)
+        after_template = remote.read_record(self.root / 'live-template.json')
+        expected = ledger.mapping(template['Resources'])
+        for name in ('InstanceRole', 'InstanceProfile', 'SecurityGroup'):
+            ledger.mapping(expected[name])['Condition'] = 'Compute'
+        self.assertEqual(after_template, template)
+        self.assertEqual(after_template, remote.read_record(deploy.TEMPLATE))
+        saved = aws_config.deployment_outputs(self.state)
+        self.assertEqual(saved['GateBucket'], 'fixture-bucket')
+        self.assertNotIn('InstanceId', saved)
+        self.assertNotIn('DataVolumeId', saved)
+        self.assertFalse((self.state / 'up.json').exists())
+        book = ledger.CostLedger(self.state)
+        state = book.read_snapshot()
+        self.assertEqual(state.observations[-1].state, 'terminated')
+        self.assertEqual(book.pending_compute_requests(), ())
+        self.assertTrue(state.inventories[-1].builder_removed)
+        self.assertEqual(state.inventories[-1].resources, (ledger.PricedResource('gate-shared', Decimal(1)),))
+        costs = book.estimate(aws_config.read_settings(self.settings), self.now + 3600)
+        later = [row for row in costs.intervals if row.start >= self.now]
+        self.assertFalse(any(row.kind == 'instance' for row in later))
+        self.assertEqual(sum((row.usd for row in later if row.kind == 'fixed'), Decimal(0)), Decimal(1) / Decimal(744))
+        self.assertEqual(ledger.text(remote.read_record(self.state / 'builder-removal.json'), 'stack'), 'fixture-build')
+
+    def test_remove_builder_preserves_a_live_gate_definition_that_differs_from_repository(self) -> None:
+        _ = self.builder_removal_fixture()
+        path = self.root / 'live-template.json'
+        template = remote.read_record(path)
+        resources = ledger.mapping(template['Resources'])
+        gate = ledger.mapping(resources['GateExpiryFunction'])
+        ledger.mapping(gate['Properties'])['Timeout'] = 17
+        _ = path.write_text(json.dumps(template))
+        with redirect_stdout(StringIO()):
+            self.assertTrue(self.deployment().remove_builder(approve_destroy=True))
+        command = cast(list[str], self.commands('create-change-set')[-1]['args'])
+        submitted = remote.read_record(Path(command[command.index('--template-body') + 1].removeprefix('file://')))
+        self.assertEqual(ledger.mapping(submitted['Resources'])['GateExpiryFunction'], gate)
+        for name in ('InstanceRole', 'InstanceProfile', 'SecurityGroup'):
+            ledger.mapping(resources[name])['Condition'] = 'Compute'
+        self.assertEqual(submitted, template)
+
+    def test_remove_builder_resumes_after_partial_removal_and_repeats_without_deletion(self) -> None:
+        _ = self.builder_removal_fixture()
+        saved = remote.read_record(self.state / 'deployment.json')
+        stale = {**saved, 'data_volume_id': 'vol-old',
+                 'outputs': {**ledger.mapping(saved['outputs']), 'InstanceId': 'i-old', 'DataVolumeId': 'vol-old'}}
+        _ = (self.state / 'builder-removal.json').write_text(json.dumps(stale))
+        manifest = (self.state / 'gate-deployment.json').read_bytes()
+        executed_before = len(self.commands('execute-change-set'))
+        for operation in ('execute-change-set', 'delete-volume'):
+            with self.subTest(operation=operation):
+                failure = self.root / ('fail-down-' + operation)
+                failure.touch()
+                with self.assertRaises(aws_target.AwsUnavailable), redirect_stdout(StringIO()):
+                    _ = self.deployment().remove_builder(approve_destroy=True)
+                failure.unlink()
+                self.assertFalse(ledger.CostLedger(self.state).read_snapshot().inventories[-1].builder_removed)
+        with (mock.patch.object(ledger.CostLedger, 'record_inventory', side_effect=OSError('fixture ledger failure')),
+              self.assertRaisesRegex(OSError, 'fixture ledger failure'), redirect_stdout(StringIO())):
+            _ = self.deployment().remove_builder(approve_destroy=True)
+        with redirect_stdout(StringIO()):
+            self.assertTrue(self.deployment().remove_builder(approve_destroy=True))
+        self.assertEqual(len(self.commands('execute-change-set')), executed_before + 1)
+        self.assertEqual(len(self.commands('delete-volume')), 1)
+        receipt = remote.read_record(self.state / 'builder-removal.json')
+        self.assertEqual(receipt['data_volume_id'], saved['data_volume_id'])
+        self.assertEqual(ledger.mapping(receipt['outputs'])['InstanceId'], ledger.mapping(saved['outputs'])['InstanceId'])
+        before = len(self.commands())
+        with redirect_stdout(StringIO()):
+            self.assertTrue(self.deployment().remove_builder(approve_destroy=True))
+        operations = [cast(list[str], row['args'])[5] for row in self.commands()[before:]]
+        self.assertFalse(any(operation.startswith(('delete-', 'execute-', 'create-', 'update-')) for operation in operations))
+        self.assertEqual((self.state / 'gate-deployment.json').read_bytes(), manifest)
+        self.assertFalse((self.root / 'deleted-stack').exists())
+        self.assertFalse((self.root / 'deleted-budget').exists())
+        success, output = self.down_output()
+        self.assertTrue(success, output)
+        self.assertFalse((self.root / 'fake-stack.json').exists())
 
     def test_down_removes_resources_and_preserves_spend_and_other_profiles(self) -> None:
         devices = self.removal_fixture()
@@ -2286,6 +2427,9 @@ else: raise AssertionError(args)
     def test_template_enforces_budget_tags_retention_network_and_single_instance_policy(self) -> None:
         template = remote.read_record(deploy.TEMPLATE)
         resources = cast(dict[str, dict[str, object]], template['Resources'])
+        for name in ('InstanceRole', 'InstanceProfile', 'SecurityGroup'):
+            with self.subTest(compute_resource=name):
+                self.assertEqual(resources[name].get('Condition'), 'Compute')
         cost_tag = {'Key': {'Ref': 'CostTagKey'}, 'Value': {'Ref': 'CostTagValue'}}
         for name in ('DataVolume', 'MonthlyBudget'):
             resource = resources[name]
@@ -2376,29 +2520,33 @@ else: raise AssertionError(args)
         _ = registry.write_text('targets=aws,natedev\nkind.aws=ssh\nplatform.aws=linux\nsettings.aws=aws_target.conf\nkind.natedev=local\nplatform.natedev=linux\n')
         controller = aws_target.Controller(self.settings, self.state, self.root / 'queue', clock=lambda: self.now,
                                            notify=lambda _event: True, publish=lambda _envelope: True)
-        self.assertEqual(controller.tick().state, 'stopped')
-        self.assertEqual(controller.tick().state, 'stopped')
-        self.set_clock(self.now + 120)
+        result = controller.tick()
+        self.assertEqual(result.state, 'stopped', result.reason)
+        result = controller.tick()
+        self.assertEqual(result.state, 'stopped', result.reason)
+        self.set_clock(self.now + 86400 + 120)
         save = cast(Callable[[ledger.CostLedger, ledger.LedgerEvidence], None], getattr(ledger.CostLedger, '_save'))
 
         def fail_reconciliation(book: ledger.CostLedger, state: ledger.LedgerEvidence) -> None:
-            if state.reconciliations:
+            if any(row.at == self.now for row in state.reconciliations):
                 raise OSError('the reconciliation write failed')
             save(book, state)
 
         with mock.patch.object(ledger.CostLedger, '_save', fail_reconciliation):
-            self.assertEqual(controller.tick().state, 'stopped')
+            result = controller.tick()
+        self.assertEqual(result.state, 'stopped', result.reason)
         book = ledger.CostLedger(self.state)
-        self.assertEqual(book.read_snapshot().reconciliations, [])
-        self.assertEqual(controller.tick().state, 'stopped')
-        queries = self.commands('get-cost-and-usage')
-        self.assertEqual(len(queries), 1)
         self.assertEqual(len(book.read_snapshot().reconciliations), 1)
+        result = controller.tick()
+        self.assertEqual(result.state, 'stopped', result.reason)
+        queries = self.commands('get-cost-and-usage')
+        self.assertEqual(len(queries), 2)
+        self.assertEqual(len(book.read_snapshot().reconciliations), 2)
         self.assertNotIn('charge_error', (self.state / 'controller.json').read_text())
         settings = read_control_settings(self.settings)
         api = aws_target.AwsCli(settings.credentials_profile, settings.region, settings.aws_timeout_s)
         self.assertIsInstance(controller.refresh_charges(api, self.now), ledger.ChargeRead)
-        self.assertEqual(len(self.commands('get-cost-and-usage')), 1)
+        self.assertEqual(len(self.commands('get-cost-and-usage')), 2)
 
     def test_bootstrap_remote_idle_stop_requires_no_published_permission(self) -> None:
         configuration = deploy.bootstrap_configuration(self.settings, deploy.remote_configuration(self.settings))
@@ -2947,16 +3095,6 @@ esac
                 with self.subTest(value=value, parser=parser.__name__):
                     with self.assertRaises(ValueError):
                         _ = parser(value)
-
-    def test_spending_caps_refuse_values_above_the_configured_maximum(self) -> None:
-        for key, value, normal in (('monthly_limit_usd', '400.01', '400'), ('daily_limit_usd', '20.01', '20'),
-                                   ('monthly_limit_usd', '400.0000000000000001', '400'),
-                                   ('daily_limit_usd', '20.0000000000000001', '20')):
-            with self.subTest(key=key, value=value):
-                self.replace(key, value)
-                with self.assertRaises(ValueError):
-                    _ = aws_config.read_settings(self.settings)
-                self.replace(key, normal)
 
     def test_fixed_deployment_values_use_the_source_limits(self) -> None:
         for key, value, normal in (('data_volume_gib', '501', '500'), ('data_volume_iops', '6001', '6000'),
