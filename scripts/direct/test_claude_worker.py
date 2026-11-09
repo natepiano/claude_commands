@@ -245,6 +245,7 @@ class NativeClaudeWorkerTests(StaffTestCase):
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 sent = cast(dict[str, object], json.loads(self.fixture.sent.read_text()))
                 self.assertEqual(sent["role"], "impl")
+                self.assertEqual(cast(dict[str, object], sent["row"]).get("role"), "impl")
                 history = agents_log.assignments(agents_log.state_dir() / "agents.jsonl")
                 self.assertEqual(history.assignments[self.fixture.identity][-1].role, "impl")
                 row = staff.by_current_session(self.fixture.identity)

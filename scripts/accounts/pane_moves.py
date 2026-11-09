@@ -16,7 +16,6 @@ from scripts.lib import conf
 from scripts.lib.resume_message import AccountMove, BusyPass, resume_message
 from scripts.production import session_staff, staff
 from scripts.shutdown import restart, stop_resume, stop_results
-from scripts.whoami import agent_accounts
 
 WorkerStartFailure = (worker_panes.IncompleteStart | worker_panes.AdmissionRefused | worker_panes.UnpublishedWorker
                       | worker_panes.ProcessUnknownWorker | worker_panes.UncertainWorker | worker_panes.StartRefused)
@@ -50,10 +49,6 @@ def _failed(row: staff.StaffRow, result: WorkerStartFailure) -> accounts.Session
 
 def _confirm(move: WorkerMove, common: moves.MoveCommon) -> None:
     confirmed = moves.ConfirmedMove(**common, kind="confirmed", worker=move.row.name, run=str(move.run))
-    if move.family == "codex":
-        confirmed["home"] = str(agent_accounts.codex_account_home(move.target).home)
-    else:
-        confirmed["config_dir"] = str(accounts.claude_account_dir(move.target))
     moves.append_move(confirmed)
 
 

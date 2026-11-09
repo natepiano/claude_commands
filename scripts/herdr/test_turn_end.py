@@ -583,7 +583,7 @@ class TurnEndTests(unittest.TestCase):
             before = hold.read_bytes()
             self.assertIsInstance(progress_history.active_dispatch(row.id, self.case.run_dir), progress_history.ActiveDispatch)
             self.assertEqual(hold.read_bytes(), before)
-            self.assertEqual(staff.by_id(row.id), row)
+            self.assertEqual(staff.by_id(row.id), replace(row, role=staff.KnownWorkerRole("astra-reviewer")))
             self.case.agent.complete(self.case.agent.submitted[-1][0])
             self.assertEqual(self.case.finish(row.name), turn_end.TurnOutcome.DONE)
             self.assertFalse(hold.exists())

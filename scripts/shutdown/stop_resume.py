@@ -42,6 +42,7 @@ from scripts.shutdown import member_account, pane_record
 from scripts.shutdown.launch_names import LaunchNames, LaunchNamesNotRead
 from scripts.shutdown.codex_trust import trust_arguments
 from scripts.herdr import pane_launch
+from scripts.production import staff
 from scripts.lib.resume_message import (
     AccountMove, NO_ACCOUNT_MOVE, BusyPass, NO_OWN_PASS, launcher_prompt,
     ResumeWorkers as ResumeWorkers,
@@ -244,8 +245,9 @@ def _stop_recorded(session: str, kind: str = "", *,
         try:
             owner = herdr.shared_session()
             for pane, entry in pane_record.read(owner).items():
-                if entry["session_id"] == result.session_id:
-                    pane_record.end(owner, pane, result.session_id)
+                member = record.by_member_reference(entry["session_id"])
+                if entry["session_id"] == result.session_id or (member is not None and member.current_session == result.session_id):
+                    pane_record.end(owner, pane, result.session_id, record=record)
         except (OSError, ValueError) as error:
             print(f"{result.session_id}: stop note anomaly: {error}", file=sys.stderr)
     return result
@@ -432,15 +434,28 @@ def _pane_environment(tab: herdr.TabSession, entry: pane_record.PaneLaunch) -> t
     return unset, environment
 
 
+def _launch_home(entry: pane_record.PaneLaunch) -> staff.SessionHome:
+    """Use the selected launch environment, retained home, or normal account."""
+    kind = pane_launch.agent_kind(entry)
+    directory = entry["environment"].get("CODEX_HOME" if kind == "codex" else "CLAUDE_CONFIG_DIR", "")
+    home = staff.SessionHome(Path(directory)) if directory else pane_launch.config_home(entry)
+    if isinstance(home, staff.HomeUnknown):
+        print(f"anomaly: {entry['session_id']}: session home is unknown; select the normal account", file=sys.stderr)
+        selected = member_account.resume_account(kind)
+        return staff.SessionHome(selected.dir if isinstance(selected, accounts.NamedAccount) else selected.home)
+    return home
+
+
 def _pane_command(tab: herdr.TabSession, entry: pane_record.PaneLaunch, account: str) -> list[str]:
     """Build the account command for a shell in another pane."""
     unset, environment = _pane_environment(tab, entry)
     kind = pane_launch.agent_kind(entry)
     if kind == "claude":
-        herdr.trust_claude_launch(Path(entry["cwd"]), Path(entry["config_dir"]))
+        home = environment.get("CLAUDE_CONFIG_DIR") or str(_launch_home(entry).path)
+        herdr.trust_claude_launch(Path(entry["cwd"]), Path(home))
     program = [sys.executable, str(SCRIPTS / "accounts/accounts.py"), "exec", account]
     if kind == "codex":
-        environment["CODEX_HOME"] = entry["config_dir"]
+        environment["CODEX_HOME"] = environment.get("CODEX_HOME") or str(_launch_home(entry).path)
         program = ["codex"]
     return ["env", *(argument for key in unset for argument in ("-u", key)),
             *(f"{key}={value}" for key, value in environment.items()),
@@ -466,9 +481,10 @@ def _exec_in_own_pane(tab: herdr.TabSession, entry: pane_record.PaneLaunch,
         for key in prepared.remove:
             _ = environment.pop(key, None)
         environment.update(prepared.variables)
-        herdr.trust_claude_launch(Path(entry["cwd"]), Path(entry["config_dir"]))
+        home = environment.get("CLAUDE_CONFIG_DIR") or str(_launch_home(entry).path)
+        herdr.trust_claude_launch(Path(entry["cwd"]), Path(home))
     else:
-        environment["CODEX_HOME"] = entry["config_dir"]
+        environment["CODEX_HOME"] = environment.get("CODEX_HOME") or str(_launch_home(entry).path)
     program = resolve_program(kind, environment=environment)
     command = [program, *trust_arguments(kind, entry["cwd"], pane_record.resume_arguments(entry))]
     if message and kind == "claude":
@@ -477,9 +493,16 @@ def _exec_in_own_pane(tab: herdr.TabSession, entry: pane_record.PaneLaunch,
     row = staff.initial_snapshot().by_member_reference(entry["session_id"])
     if row is not None and isinstance(row.exited, staff.Exited):
         _ = staff.resume(str(row.id))
+    if row is not None and kind == "codex":
+        try:
+            _ = staff.set_home(row.id, staff.SessionHome(Path(environment["CODEX_HOME"]).absolute()))
+        except (staff.StaffUnreadable, staff.StaffNotFound) as error:
+            print(f"anomaly: {row.id}: pane home is unavailable: {error}", file=sys.stderr)
     try:
         os.execvpe(program, command, staff.child_environment(environment))
     except OSError:
+        if row is not None and kind == "codex" and isinstance(row.home, staff.SessionHome):
+            _ = staff.set_home(row.id, row.home)
         if row is not None and isinstance(row.exited, staff.Exited):
             _ = staff.set_hold(str(row.id), row.exited)
         raise
@@ -504,7 +527,8 @@ def _start_session(tab: herdr.TabSession, entry: pane_record.PaneLaunch, account
     settings = conf.read("shutdown")
     start_seconds = settings.number("START_SECONDS")
     _ = settings.number("STAY_SECONDS")
-    transcript = herdr.SessionTranscript(Path(entry["config_dir"]), entry["session_id"])
+    home = str(_launch_home(entry).path)
+    transcript = herdr.SessionTranscript(Path(home), entry["session_id"])
     cursor: herdr.TranscriptCursor | herdr.UnspecifiedPromptTranscript = herdr.UnspecifiedPromptTranscript()
     if message:
         cursor = herdr.TranscriptCursor(transcript, datetime.now(timezone.utc))
@@ -752,8 +776,12 @@ def _resume_once(session: str, *, why: str, to: str | None = None, requester: st
         entry["environment"] = names.environment(entry)
         from scripts.whoami.account import named_account_environment
 
-        source = Path(entry["config_dir"])
-        source_label = agent_accounts.codex_home_role_label(source) if kind == "codex" else accounts.claude_config_label(source)
+        source = pane_launch.config_home(entry, record=names.tab_record)
+        source_label = ""
+        if isinstance(source, staff.SessionHome):
+            source_label = agent_accounts.codex_home_role_label(source.path) if kind == "codex" else accounts.claude_config_label(source.path)
+        else:
+            print(f"anomaly: {identity}: session home is unknown; select the normal account", file=sys.stderr)
         selected = member_account.resume_account(kind, row if row is not None else SESSION_WITHOUT_STAFF_ROW, to=to or "")
         copied_from = ""
         if isinstance(selected, accounts.CodexWorkersAccount):
@@ -762,13 +790,17 @@ def _resume_once(session: str, *, why: str, to: str | None = None, requester: st
         else:
             target_dir, label = selected.dir, selected.label
             account_environment = named_account_environment(target_dir)
-        entry["config_dir"] = str(target_dir)
         entry["environment"] = {**entry["environment"], **account_environment}
-        if original is not None and Path(original.entry["config_dir"]) != target_dir:
-            try:
-                pane_record.write(client.session, pane_launch.without_staff_labels(entry))
-            except (OSError, ValueError) as error:
-                print(f"{identity}: account record anomaly: {error}", file=sys.stderr)
+        if row is None:
+            entry["config_dir"] = str(target_dir)
+            previous_home = pane_launch.config_home(original.entry, record=names.tab_record) if original is not None else staff.HomeUnknown()
+            if original is not None and (not isinstance(previous_home, staff.SessionHome) or previous_home.path != target_dir):
+                try:
+                    pane_record.write(client.session, pane_launch.without_staff_labels(entry))
+                except (OSError, ValueError) as error:
+                    print(f"{identity}: account record anomaly: {error}", file=sys.stderr)
+        else:
+            _ = entry.pop("config_dir", None)
         if isinstance(tab, SessionNotFound):
             space = herdr.row_workspace(row or STAFF_ROOT, names.tab_record, entry["name"])
             with herdr.restore_staff(names.tab_record, labels=names.labels):
@@ -804,13 +836,13 @@ def _resume_once(session: str, *, why: str, to: str | None = None, requester: st
                                      workers=workers, own_pass=own) if (kind != "codex" or row is not None) and (
                                          row is None or row.kind != "worker" or isinstance(own, BusyPass)) else ""
         if os.environ.get("HERDR_PANE_ID") == tab.pane_id:
-            with pane_record.locked(client.session):
-                entries = pane_record.read_strict(client.session)
-                pending = pane_launch.without_staff_labels(entry)
-                pending["session_id"] = original.entry["session_id"] if original is not None else (
-                    row.id if row is not None else identity)
-                entries[tab.pane_id] = pending
-                pane_record.save(client.session, entries)
+            if row is None:
+                with pane_record.locked(client.session):
+                    entries = pane_record.read_strict(client.session)
+                    pending = pane_launch.without_staff_labels(entry)
+                    pending["session_id"] = original.entry["session_id"] if original is not None else identity
+                    entries[tab.pane_id] = pending
+                    pane_record.save(client.session, entries)
             attempt_pane = tab.pane_id
             _exec_in_own_pane(tab, entry, label, message)
         started: herdr.AgentLaunched | sessions.LiveSessionProcess
@@ -826,6 +858,11 @@ def _resume_once(session: str, *, why: str, to: str | None = None, requester: st
                 int(operation_deadline.remaining(conf.read("shutdown").number("START_SECONDS")) * 1000), agent=entry["name"] or identity)
             if isinstance(launched.outcome, herdr.PromptNotSubmitted):
                 raise herdr.HerdrFailure(launched.outcome.reason)
+            if row is not None:
+                try:
+                    _ = staff.set_home(row.id, staff.SessionHome(target_dir.absolute()))
+                except (staff.StaffUnreadable, staff.StaffNotFound) as error:
+                    print(f"anomaly: {row.id}: pane home is unavailable: {error}", file=sys.stderr)
             if message:
                 client.prompt(tab.pane_id, message, target=identity)
             started = launched
@@ -1012,10 +1049,13 @@ def _request_move(reference: str, identity: str, target: str, why: str, cause: m
         entries = [entry for entry in names.history if entry["session_id"] in
                    (identity, row.id if row is not None else identity) or entry["name"] == reference]
         saved = max(entries, key=lambda entry: entry["written_at"], default=None)
-        if saved is not None and saved["config_dir"]:
-            home = Path(saved["config_dir"])
+        directory = pane_launch.config_home(saved if saved is not None else {"session_id": identity}, record=names.tab_record)
+        if isinstance(directory, staff.SessionHome):
+            home = directory.path
             label = note_file.parse_account_label(home.name.removeprefix("."))
             previous = label.label if isinstance(label, note_file.NumberedAccountLabel) else moves.HomeAccountUnresolved(home)
+        else:
+            print(f"anomaly: {identity}: session home is unknown; retain the normal source account", file=sys.stderr)
     request: moves.RequestedMove = {"kind": "requested", "at": datetime.now(timezone.utc).isoformat(),
         "move_id": uuid4().hex, "tool": tool, "subject": f"{identity}: {row.name}" if row is not None else reference,
         "from": previous, "to": target, "why": why, "window": "unknown", "cause": cause}
@@ -1047,11 +1087,9 @@ def _record_move_outcome(request: moves.RequestedMove, result: ClaudeUp | StopFa
     try:
         entry: moves.ConfirmedMove | moves.FailedMove
         if isinstance(result, ClaudeUp):
-            from scripts.accounts import accounts
-
             entry = moves.ConfirmedMove(kind="confirmed", at=datetime.now(timezone.utc).isoformat(),
                 move_id=request["move_id"], tool=request["tool"], subject=request["subject"],
-                worker=request["subject"].split(": ", 1)[-1], config_dir=str(accounts.account_dir(result.account)))
+                worker=request["subject"].split(": ", 1)[-1])
         else:
             reason = f"{result.name}: session not found" if isinstance(result, SessionNotFound) else result.reason
             entry = moves.FailedMove(kind="failed", at=datetime.now(timezone.utc).isoformat(),

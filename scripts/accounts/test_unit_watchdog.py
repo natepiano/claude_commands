@@ -31,13 +31,13 @@ from scripts.accounts import test_refusal_watch as fixtures
 from scripts.production import fake_unit_host, showrunners, staff
 from scripts.message import sessions as reader_sessions
 from scripts.shutdown.remote import local_machine
-from scripts.production.staff_test_support import isolated_staff_file, showrunner_relationship, unit_membership, recorded_unit
+from scripts.production.staff_test_support import isolated_staff_file, showrunner_relationship, recorded_unit
 from scripts.shutdown import stop_resume
 from scripts.shutdown.launch_names import LaunchNames, LaunchNamesNotRead
 from scripts.shutdown import pane_record as hook_pane_record
 
 from scripts.shutdown import inventory, pane_record
-from scripts.herdr import herdr
+from scripts.herdr import herdr, pane_launch
 from scripts.message import sessions
 from scripts.production import unit_lookup
 from scripts.whoami import quota_alert
@@ -103,6 +103,7 @@ class UnitWatchdogTests(unittest.TestCase):
         self.pending = []
         self.finish_jobs = True
         _ = self.enterContext(patch.object(staff, "local_snapshot", side_effect=self.current_staff))
+        _ = self.enterContext(patch.object(staff, "initial_snapshot", side_effect=self.current_staff))
         _ = self.enterContext(patch.object(pane_record, "RECORD_DIR", self.home / "panes"))
         _ = self.enterContext(patch.object(hook_pane_record, "RECORD_DIR", self.home / "panes"))
         _ = self.enterContext(patch.object(stop_resume, "resume", side_effect=self.resume))
@@ -132,7 +133,9 @@ class UnitWatchdogTests(unittest.TestCase):
     def write_doc(self) -> None:
         for name in self.units:
             tree = self.home / name
-            member = recorded_unit("fixture", name, tree, self.doc, plan="docs/plan.md")
+            member = next((row for row in self.fixture.membership().find(kind="unit") if row.name == name), None)
+            if member is None:
+                member = recorded_unit("fixture", name, tree, self.doc, plan="docs/plan.md")
             if name in self.retired:
                 _ = staff.set_worktree(member.id, staff.RemovedWorktree(local_machine(), tree), expected=member.worktree)
             tree.mkdir(exist_ok=True)
@@ -365,17 +368,16 @@ class UnitWatchdogTests(unittest.TestCase):
     def test_explicit_resume_after_public_stop_allows_recovery_of_a_later_crash(self) -> None:
         owner = self.add_unit("alpha")
         self.assertEqual(accounts.group_accounts().get("units"), "claude2")
-        member = unit_membership("fixture", "alpha")
+        member = next(row for row in self.fixture.membership().find(kind="unit") if row.name == "alpha")
         record = staff.StaffSnapshot(tuple(
-            replace(row, id=staff.StaffId(owner["session_id"]),
-                    current_session=staff.StaffId(owner["session_id"])) if row.id == member.id else row
+            replace(row, current_session=staff.StaffId(owner["session_id"])) if row.id == member.id else row
             for row in staff.snapshot().rows))
 
         def start(tab: herdr.TabSession, entry: pane_record.PaneLaunch, label: str, message: str) -> sessions.LiveSessionProcess:
             self.assertIn("maintenance", message)
             self.assertEqual((tab.pane_id, entry["session_id"], label), ("alpha", "alpha", "claude2"))
             environment = {**entry["environment"], "HERDR_ENV": "1", "HERDR_SESSION": "shared",
-                           "HERDR_PANE_ID": tab.pane_id, "CLAUDE_CONFIG_DIR": entry["config_dir"]}
+                           "HERDR_PANE_ID": tab.pane_id, "CLAUDE_CONFIG_DIR": entry["environment"]["CLAUDE_CONFIG_DIR"]}
             payload = json.dumps({"session_id": "alpha", "cwd": owner["cwd"]})
             with (patch.dict(os.environ, environment),
                   patch.object(os, "getppid", return_value=owner["pid"]),
@@ -405,7 +407,7 @@ class UnitWatchdogTests(unittest.TestCase):
         self.assertIsInstance(result, stop_resume.ClaudeUp)
         entry = pane_record.read("shared")["alpha"]
         self.assertFalse(entry.get("ended", False))
-        self.assertEqual((entry["session_id"], entry["config_dir"]), ("alpha", str(config)))
+        self.assertEqual((entry["session_id"], str(cast(staff.SessionHome, pane_launch.config_home(entry)).path)), (member.id, str(config)))
         self.assertFalse(any(name.startswith("SHOWRUNNER_") for name in entry["environment"]))
         self.die("alpha")
         for minute in (0, 2, 4):
@@ -530,7 +532,7 @@ class UnitWatchdogTests(unittest.TestCase):
              ('' + 'SHOWRUNNER_' + 'UNIT_ID'): "alpha"}, ["claude", "-n", "alpha"])
         pane_record.write("shared", moved)
         self.die("alpha")
-        self.assertEqual(pane_record.launch_for_session("alpha"), moved)
+        self.assertEqual(pane_record.launch_for_session("alpha"), pane_record.read("shared")["new-alpha"])
         self.assertEqual(self.pass_at(0), [])
         self.assertEqual(self.pending, [])
         self.assertEqual(unit_watchdog._read_state()["alpha"]["first_seen"], NOW.isoformat())  # pyright: ignore[reportPrivateUsage]
@@ -560,7 +562,7 @@ class UnitWatchdogTests(unittest.TestCase):
                     self.assertEqual(self.pending, [])
                     _ = self.pass_at(2)
                     self.assertEqual(len(self.pending), 1)
-                    self.assertEqual(self.pending[0][self.pending[0].index("--recover") + 2], str(unit_membership("fixture", "alpha").id))
+                    self.assertEqual(self.pending[0][self.pending[0].index("--recover") + 2], str(next(row for row in self.fixture.membership().find(kind="unit") if row.name == "alpha").id))
                     _ = self.pass_at(4)
                 self.assertEqual(self.commands, [["resume", "alpha", "--to", "claude4", "--only", "alpha"]])
                 self.commands.clear()
@@ -584,7 +586,8 @@ class UnitWatchdogTests(unittest.TestCase):
     def test_queued_recovery_keeps_the_account_of_the_latest_move_launch(self) -> None:
         _ = self.queued_unit()
         entry = pane_record.read("shared")["alpha"]
-        entry["config_dir"] = str(accounts.account_dir("claude2"))
+        entry = pane_record.launch(entry["pane_id"], entry["session_id"], entry["cwd"],
+            {"CLAUDE_CONFIG_DIR": str(accounts.account_dir("claude2"))}, ["claude", "-n", entry["name"]])
         pane_record.write("shared", entry)
         with patch.object(staff, "snapshot", side_effect=self.current_staff):
             source = unit_watchdog._sources()[("fixture", "alpha")]  # pyright: ignore[reportPrivateUsage]
@@ -878,7 +881,8 @@ class UnitWatchdogTests(unittest.TestCase):
         self.assertEqual(len(self.fixture.moves.calls), 1)
         self.assertEqual(accounts.group_accounts().get("units"), "claude2")
         entry = pane_record.read("shared")["alpha"]
-        entry["config_dir"] = str(accounts.account_dir("claude2"))
+        entry = pane_record.launch(entry["pane_id"], entry["session_id"], entry["cwd"],
+            {"CLAUDE_CONFIG_DIR": str(accounts.account_dir("claude2"))}, ["claude", "-n", entry["name"]])
         pane_record.write("shared", entry)
         self.die("alpha")
         _ = self.pass_at(2)
@@ -1128,7 +1132,7 @@ class UnitWatchdogTests(unittest.TestCase):
         offset = command.index("--recover")
         if newer_launch:
             self.assertEqual(pane_record.read("shared")["alpha"]["model"], "sonnet")
-            self.assertEqual(command[offset + 4], str(unit_membership("fixture", "alpha").id))
+            self.assertEqual(command[offset + 4], str(next(row for row in self.fixture.membership().find(kind="unit") if row.name == "alpha").id))
         self.finish_jobs = True
         _ = self.pass_at(6)
         self.assertEqual({item["sessionId"] for item in self.fixture.live}, {"alpha"})

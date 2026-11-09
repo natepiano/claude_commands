@@ -166,6 +166,34 @@ class HeldRolePaneTests(HeldRolePaneCase):
                 self.assertIsNone(staff.by_id(instance.lifecycle.staff_id))
                 self.assertEqual(staff.snapshot().find(kind="worker"), [])
 
+    def test_durable_dispatch_records_both_astra_policies_through_the_recorder(self) -> None:
+        from scripts.direct import progress_history
+
+        for role in ("designer", "reviewer"):
+            with self.subTest(role=role):
+                design = self.panes.open(role)
+                instance = next(item for item in design.roles if item.role == role)
+                assert isinstance(instance.lifecycle, design_roles.RoleOpen)
+                row = staff.by_id(instance.lifecycle.staff_id)
+                assert row is not None
+                member_id = row.id
+                command = self.panes.assign
+
+                def assigned(arguments: list[str]) -> subprocess.CompletedProcess[str]:
+                    self.assertEqual(staff.by_id(member_id), row)
+                    return command(arguments)
+
+                with (patch.object(design_roles, "_assign_command", side_effect=assigned),
+                      patch.object(progress_history, "begin_dispatch", wraps=progress_history.begin_dispatch) as dispatch,
+                      patch.object(staff, "set_worker_role", wraps=staff.set_worker_role) as writer):
+                    _ = self.panes.resume(design, role)
+                dispatch.assert_called_once()
+                self.assertEqual(dispatch.call_args.kwargs["role"], "astra-" + role)
+                writer.assert_called_once_with(row.id, staff.KnownWorkerRole(cast(staff.WorkerRole, "astra-" + role)))
+                saved = staff.by_id(row.id)
+                assert saved is not None
+                self.assertEqual(saved.role, staff.KnownWorkerRole(cast(staff.WorkerRole, "astra-" + role)))
+
     def test_held_designer_dispatches_through_worker_and_keeps_one_identity(self) -> None:
         design = self.panes.open("designer")
         instance = design.roles[0]
@@ -173,13 +201,12 @@ class HeldRolePaneTests(HeldRolePaneCase):
         if not isinstance(instance.lifecycle, design_roles.RoleOpen):
             self.fail("designer did not publish its worker")
         before = staff.by_id(instance.lifecycle.staff_id)
+        assert before is not None
         first = self.panes.resume(design, "designer")
         second = self.panes.resume(design, "designer")
         self.assertIn("The work is complete.", first.read_text())
         self.assertIn("The work is complete.", second.read_text())
-        self.assertEqual(staff.by_id(instance.lifecycle.staff_id), before)
-        if before is None:
-            self.fail("designer row is unavailable")
+        self.assertEqual(staff.by_id(instance.lifecycle.staff_id), replace(before, role=staff.KnownWorkerRole("astra-designer")))
         self.assertEqual(self.panes.world.requests[-1][1][:2], ["resume", str(before.current_session)])
         first_pane, second_pane = [submission[0] for submission in self.panes.command_case.agent.submitted]
         self.assertNotEqual(first_pane, second_pane)
@@ -344,6 +371,7 @@ class HeldRolePaneTests(HeldRolePaneCase):
         if not isinstance(instance.lifecycle, design_roles.RoleOpen):
             self.fail("designer did not publish its worker")
         row = staff.by_id(instance.lifecycle.staff_id)
+        assert row is not None
         self.panes.world.reads.clear()
         launches = len(self.panes.world.launches)
         before_prompt: list[tuple[str, ...]] = []
@@ -359,7 +387,7 @@ class HeldRolePaneTests(HeldRolePaneCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.panes.finish(design, "designer")
         self.assertIn("The work is complete.", reply.read_text())
-        self.assertEqual(staff.by_id(instance.lifecycle.staff_id), row)
+        self.assertEqual(staff.by_id(instance.lifecycle.staff_id), replace(row, role=staff.KnownWorkerRole("astra-designer")))
         self.assertEqual(len(self.panes.world.launches), launches)
         self.assertEqual(sum(request[:2] == ("agent", "list") for request in before_prompt), 1)
         inventory = next(index for index, request in enumerate(before_prompt) if request[:2] == ("agent", "list"))

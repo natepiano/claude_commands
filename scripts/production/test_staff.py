@@ -91,6 +91,53 @@ def concurrent_ensure(
 
 
 class NativeRuntimeIdentityTests(StaffCommandTestCase):
+    def test_old_row_keeps_unknown_role_and_home_absent(self) -> None:
+        _, _, member = self.tree()
+        value = member.to_json()
+        self.assertNotIn("role", value)
+        self.assertNotIn("home", value)
+        decoded = staff.StaffRow.from_json(value)
+        self.assertEqual(decoded.to_json(), value)
+        self.assertEqual(staff.snapshot().by_id(member.id), decoded)
+        before = self.staff_file.read_bytes()
+        with redirect_stderr(io.StringIO()):
+            staff._transaction(lambda rows: None)  # pyright: ignore[reportPrivateUsage]
+        self.assertEqual(self.staff_file.read_bytes(), before)
+
+    def test_staff_admission_does_not_read_pane_publications(self) -> None:
+        from scripts.herdr import pane_launch
+
+        _, parent, member = self.tree()
+        with mock.patch.object(pane_launch, "staff_admitted", wraps=pane_launch.staff_admitted) as publication:
+            _ = staff.ensure("agent", name="TEST-no-pane-read", runtime_id=fixture_runtime_id("TEST-no-pane-read"))
+            _ = staff.ensure_worker(staff.native_id(fixture_runtime_id("TEST-no-worker-pane-read")), "TEST-new", parent.id)
+            _ = staff.update_current_session(member.current_session, staff.native_id(fixture_runtime_id("TEST-next-native")))
+        publication.assert_not_called()
+
+    def test_invalid_role_and_home_preserve_the_staff_file_and_raw_values(self) -> None:
+        runner, _, member = self.tree()
+        document = cast(dict[str, object], json.loads(self.staff_file.read_text()))
+        rows = cast(list[dict[str, object]], document["rows"])
+        fields = next(row for row in rows if row["id"] == member.id)
+        fields.update(role="future-worker-role", home="relative-home")
+        self.write_json(self.staff_file, document)
+        with redirect_stderr(io.StringIO()) as errors:
+            record = staff.snapshot()
+        current = record.by_id(member.id)
+        assert current is not None
+        self.assertIsInstance(current.role, staff.WorkerRoleUnknown)
+        self.assertIsInstance(current.home, staff.HomeUnknown)
+        self.assertEqual(current.unknown_fields, {"role": "future-worker-role", "home": "relative-home"})
+        self.assertEqual(current.to_json(), fields)
+        self.assertEqual(record.by_id(runner.id), runner)
+        self.assertEqual(len(errors.getvalue().splitlines()), 1)
+        with redirect_stderr(io.StringIO()):
+            _ = staff.rename(member.id, "TEST-renamed")
+        saved_document = cast(dict[str, object], json.loads(self.staff_file.read_text()))
+        saved_rows = cast(list[dict[str, object]], saved_document["rows"])
+        saved = next(row for row in saved_rows if row["id"] == member.id)
+        self.assertEqual(saved, {**fields, "name": "TEST-renamed"})
+
     def test_running_claude_registry_identifies_a_worker_before_its_first_transcript(self) -> None:
         runner = fixture_member("showrunner", name="sdlc")
         unit = fixture_member("unit", name="models", parent=runner.id)
@@ -784,7 +831,8 @@ class StaffTests(StaffCommandTestCase):
             launch = pane_launch.launch("w1:p1", owner.id, str(module_root), {}, ["claude"])
             path = pane_launch.record_directory() / "agents.json"
             pane_launch.write(path, launch)
-            self.assertEqual(staff.snapshot().by_id(owner.id), owner)
+            self.assertEqual(staff.snapshot().by_id(owner.id), replace(owner,
+                home=staff.SessionHome(Path.home() / ".claude")))
             self.assertEqual(pane_launch.read_strict(path)["w1:p1"]["session_id"], owner.id)
         self.assertTrue((module_root / "staff.json").is_file())
         self.assertEqual((folder_bytes(inherited_staff), folder_bytes(inherited_launches)), before)

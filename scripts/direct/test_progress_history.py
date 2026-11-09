@@ -8,7 +8,7 @@ from scripts.shutdown import remote
 from scripts.lib.stop_injection_test_support import InjectedStop, stop_once
 
 from scripts.lib.test_models_registry import write_registry
-from scripts.lib import models_registry
+from scripts.lib import atomic_file, models_registry
 from scripts.lib import unit_runs
 
 import argparse
@@ -3568,6 +3568,9 @@ with patch.object(fcntl, "flock", admission):
                              "--worker-id", worker.id, worker_name=worker.name)
         opened, = self.pass_events("dispatch-history", "pass_started")
         self.assertEqual(opened["worker_id"], worker.id)
+        current = staff.by_id(worker.id)
+        assert current is not None
+        self.assertEqual(current.role, staff.KnownWorkerRole("impl"))
         self.finish_slot_pass(run, "impl", "completed", 20_030)
         _ = staff.rename(worker.id, "renamed-worker")
         self.start_slot_pass(run, "impl", "test", 20_040, "gpt-called", 0,
@@ -3835,12 +3838,12 @@ with patch.object(fcntl, "flock", admission):
                 self.start_phase(session, 41_010)
                 command = ["bash", "review.sh", "prompt with spaces", "--phase", "3"]
                 self.start_slot_pass(session, "review", "review", 41_020, "gpt-called", 0,
-                                     "--launcher-command", json.dumps(command), worker_name="review2")
-                path = session / "progress_history_state.json"
-                before = (path.read_bytes(), path.stat().st_mtime_ns)
+                                     "--launcher-command", json.dumps(command), "--launcher-pid", "4321", worker_name="review2")
                 active = self.pass_slots(session)["review"]
-                self.start_slot_pass(session, "review", "review", 41_030, "gpt-new", worker_name="review2")
-                self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns), before)
+                self.assertEqual(active.get("launcher_pid"), 4321)
+                self.start_slot_pass(session, "review", "review", 41_030, "gpt-new", 0,
+                                     "--launcher-pid", "4322", worker_name="review2")
+                active["launcher_pid"] = 4322
                 self.assertEqual(self.pass_slots(session)["review"], active)
                 self.assertEqual(len(self.pass_events(name, "pass_started")), 1)
                 self.assertEqual(self.pass_events(name, "pass_finished"), [])
@@ -3895,6 +3898,23 @@ with patch.object(fcntl, "flock", admission):
         self.assertEqual(len(self.pass_events("invalid-launcher", "pass_started")), 1)
         self.assertEqual(self.pass_events("invalid-launcher", "pass_finished"), [])
 
+    def test_dispatch_replaces_the_worker_role(self) -> None:
+        session = self.start_run("TEST-staff-role", 41_000)
+        self.start_phase(session, 41_010)
+        parent = fixture_member("showrunner", name="TEST-role-parent")
+        member = staff.ensure_worker(staff.native_id(fixture_runtime_id("TEST-role-worker")), "TEST-worker", parent.id)
+        prompt = self.root / "TEST-role-prompt.txt"
+        atomic_file.write_text_atomic(prompt, "Read the requested files.\n")
+        for index, role in enumerate(("review", "test")):
+            with patch.dict(os.environ, {"UNIT_NOW_EPOCH": str(41020 + index * 20)}):
+                _ = progress_history.begin_dispatch(session, slot="TEST-worker", phase="3", role=role,
+                    worker_name=member.name, worker_id=member.id, launcher_command=["assign.sh"],
+                    prompt=prompt, kind="broad", lens="contract")
+            current = staff.by_id(member.id)
+            assert current is not None
+            self.assertEqual(current.to_json().get("role"), role)
+            self.finish_slot_pass(session, "TEST-worker", "completed", 41_030 + index * 20)
+
     def test_dispatch_api_reuses_active_and_completed_passes_after_launcher_loss(self) -> None:
         session = self.start_run("dispatch-api", 41_000)
         self.start_phase(session, 41_010)
@@ -3908,6 +3928,7 @@ with patch.object(fcntl, "flock", admission):
                 worker_id=staff.StaffId(fixture_runtime_id("dispatch-worker")),
                 launcher_command=command, prompt=prompt, kind="broad", lens="contract",
             )
+            self.assertEqual(self.pass_slots(session)["impl2"].get("launcher_pid"), os.getpid())
             path = session / "progress_history_state.json"
             before = (path.read_bytes(), path.stat().st_mtime_ns)
             resumed = progress_history.begin_dispatch(
