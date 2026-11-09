@@ -2019,7 +2019,7 @@ A changed `config/<name>.conf` selects every test module whose transitive import
 **Gotchas:**
 - A merged-capture caller must get `stderr=None`; `invoke_cli` merges the streams itself.
 
-### Phase 100 — The director turn-wait hook tests use half their CPU  · status: todo
+### Phase 100 — The director turn-wait hook tests use half their CPU  · status: done
 **Depends on:** none
 
 #### Work Order
