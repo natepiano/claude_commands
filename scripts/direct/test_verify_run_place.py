@@ -69,11 +69,16 @@ fi
 
     def start(self, script: Path, name: str,
               **changes: str) -> subprocess.Popen[str]:
+        repository = script.parents[2] / "repository"
+        repository.mkdir()
+        _ = (repository / "Cargo.toml").write_text("[workspace]\n")
+        _ = subprocess.run(["git", "init", "--quiet"], cwd=repository, check=True,
+                           capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS)
         environment = {**os.environ, "IN_NIX_SHELL": "fixture", "CODEX_THREAD_ID": "",
                        "UNIT_DETACHED_RUN": "", **changes}
         _ = environment.pop("PYTHONPATH", None)
         _ = environment.pop("BUILDLOG_RUN", None)
-        process = subprocess.Popen(["bash", str(script), name], env=environment,
+        process = subprocess.Popen(["bash", str(script), name], cwd=repository, env=environment,
                                    stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                    text=True, start_new_session=True)
         self.addCleanup(self.stop, process)

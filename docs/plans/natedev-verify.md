@@ -1280,7 +1280,7 @@ Checkpoint `1f9e9c484` on `verify-not-mac-wait`, merged to builds as `a62793f07`
 
 **Ruled out:** a change to `build_hold.start_recorder` — the recorder detaches by design, so the fixture waits for it.
 
-### Phase 41x — The final gate runs the repository's own gate in a repository with no Cargo  · status: todo
+### Phase 41x — The final gate runs the repository's own gate in a repository with no Cargo  · status: done
 
 **Depends on:** none. Runs after 41y.
 
@@ -1306,6 +1306,33 @@ Checkpoint `1f9e9c484` on `verify-not-mac-wait`, merged to builds as `a62793f07`
 **Acceptance gate:**
 - The changed test module passes with no assertion changed; `basedpyright` reports 0 errors and 0 warnings on the changed test file.
 - The existing help and saved-pass tests pass unchanged: `test_verify_verbs.py` and `test_verify_final_pass.py`.
+- The director runs the targeted test.
+
+### Phase 41z — A stop before the Mac runner starts holds under load  · status: todo
+
+**Depends on:** none. Runs after 41x.
+
+#### Work Order
+
+**Source:** verify-unit, 2026-11-09, the targeted test after the builds merge at e85fd02a6. `direct/test_verify_mac_signal_boundaries.py` failed 2 of 5 tests on its first run, then passed alone. `test_signal_before_runner_start_removes_result_without_local_work` and `test_check_stop_before_delayed_tee_opens_leaves_no_temp_log` both failed at `self.assertFalse((self.runner_state / "runner-started").exists())` (line 101): the Mac runner started after the test sent SIGTERM. The merge did not change this module or `verify.sh`. Builds routed it to this unit.
+
+**Goal:** a TERM that reaches `verify.sh` before the Mac runner command stops `verify.sh` before that command runs, on every run under load.
+
+**Spec:**
+1. **Reproduce.** Run `test_verify_mac_signal_boundaries.py` repeatedly under CPU load until the failure shows. One way to make the load is several copies of the module at once, each through `scripts/test_times/module_run.py`, inside one detached run with `timeout` (at most 15 minutes). The cloud gate runs up to 16 test modules at once.
+2. **Cause.** Name why the runner starts after the TERM: the test's ordering (`send_signal`, then the `continue-runner` release), the `before_mac_runner` DEBUG trap, or the TERM handling in `verify.sh` before the `"$MAC_RUNNER"` call. Put the evidence in the summary.
+3. **Fix the cause where it lives.** When the defect is in `verify.sh`, a TERM that arrives before the runner command stops `verify.sh` before that command runs. When the defect is in the test, the test waits for an event that proves `verify.sh` holds the TERM before it releases the runner. Add no retry, no sleep, and do not raise a time limit.
+4. **Proof.** Under the load from item 1, the module passes 20 runs in a row on the final tree. Before the fix, the same load gives at least one failure, or the summary says why the failure did not show.
+
+**Files:**
+- `scripts/direct/test_verify_mac_signal_boundaries.py` — the signal boundary tests.
+- `scripts/direct/verify.sh` — the TERM handling before the Mac runner call, if the cause is there.
+
+**Workers:** 1 writer — `impl` owns every file above.
+
+**Acceptance gate:**
+- `test_verify_mac_signal_boundaries.py` passes with no assertion changed; `basedpyright` reports 0 errors and 0 warnings on each changed Python file.
+- When `verify.sh` changes: `bash -n scripts/direct/verify.sh` passes, `shellcheck scripts/direct/verify.sh` shows no new finding, and `test_verify_verbs.py` and `test_verify_mac_only.py` pass.
 - The director runs the targeted test.
 
 ### Phase 41c — Send a lint that waits for memory to a free Mac  · status: done
