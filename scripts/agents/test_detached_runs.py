@@ -969,6 +969,10 @@ class PaneRunDeliveryTests(unittest.TestCase):
             self.assertEqual(len(calls), 2)
             self.assertEqual(errors.getvalue().count("anomaly:"), 1)
             self.assertIn("director unavailable", errors.getvalue())
+            with patch.object(detached_run_process, "supervises", return_value=True) as supervises:
+                self.assertEqual(detached_runs.reap_orphans(str(self.run_dir)), [])
+                self.assertEqual(len(calls), 2)
+                supervises.assert_called_once_with(DEAD_PID, Path(records[0]["log"]).with_suffix(".json"))
             self.assertEqual(detached_runs.reap_orphans(str(self.run_dir)), [])
             self.assertEqual(len(calls), 3)
             self.assertEqual(detached_runs.reap_orphans(str(self.run_dir)), [])
