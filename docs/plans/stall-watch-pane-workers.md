@@ -50,34 +50,18 @@ Phase 1: sdlc [63b1adde] 2026-11-09. Since panes 34, a dispatch returns at once 
 
 ### Phase 2 — Stall watch counts a live detached run of a worker as running work  · status: done
 
-**Depends on:** Phase 1.
+#### As-built
 
-#### Work Order
-
-**Goal:** stall watch reports a unit director as `running`, and sends no idle bump, while a detached run of one of that director's workers is live.
-
-**Spec:**
-1. Cause: a worker that starts a long command through `detached_runs.py start` ends its turn and waits for the result. Its pane then reads idle, so `worker_panes.worker_state` is not `busy`. The run's supervisor is not a descendant of the director and does not carry the director's session id, so `work_running` does not find it.
-2. Fix: in the per-unit decision, `running_work` is also true when a worker whose staff parent is the unit director's staff row has a live detached run. Live means `detached_runs.live_runs(<run folder>/detached_runs, <worker staff name>)` returns a record. This is the call `worker_panes._idle_checks` uses to keep a worker pane open. Add no second liveness rule.
-3. The run folder is the director's unfinished held run folder, which the per-unit decision already finds through `runs.unfinished_held_run(row.current_session)`. `unit_lookup.HeldRun` carries that folder as `folder: Path`, because a held folder can be a verified marker target outside `unit_runs.run_roots()`; a folder rebuilt from the history name misses it. Do not scan the run folders again for each unit. Do not change `unit_runs`, `worker_panes` or `detached_runs`.
-4. Check the detached runs only when the unit has no process work and no busy pane worker. A unit with no staff workers causes no read.
-5. A failed read (an unreadable records folder or record) counts as no detached work. It prints one `stall-watch: detached runs:` stderr line with the unit name, and the cycle continues.
-6. The rest of the decision stays: a `running` result resets the idle stretch as process work and pane work do.
+- In the per-unit decision of `stall_watch.watch_pass`, a unit director with no process work and no busy pane worker is `running`, and gets no idle bump, when a staff worker whose parent is the director has a live detached run. Live is `detached_runs.live_runs(<held run folder>/detached_runs, <worker name>)`, the call `worker_panes` uses to keep a worker pane open; there is no second liveness rule.
+- `has_live_detached_worker_run(parent: staff.StaffRow, run: unit_lookup.HeldRun, record: staff.StaffSnapshot) -> bool` reads `run.folder / "detached_runs"`. A director with no staff workers causes no read. A missing folder is no detached work.
+- `unit_lookup.HeldRun` carries `folder: Path`, the held run folder that `HeldRunLookup.unfinished_held_run` found.
+- A failed read (`OSError` or `ValueError`) counts as no detached work and prints one `stall-watch: detached runs: <unit>: <error>` stderr line.
 
 **Files:**
-- `scripts/production/stall_watch.py` — the detached run check and its use in the per-unit decision.
-- `scripts/production/unit_lookup.py` — `HeldRun.folder`.
-- `scripts/production/test_stall_watch.py` — table rows for the new cases.
+- `scripts/production/stall_watch.py` — the detached run check and its use in the per-unit decision
+- `scripts/production/unit_lookup.py` — `HeldRun.folder`
+- `scripts/production/test_stall_watch.py` — live, finished, and outside-the-run-roots detached run rows in `test_running_shell_or_worker_launcher_prevents_a_bump`
 
-**Workers:** `1 writer + 1 tester`.
-- `impl` — `scripts/production/stall_watch.py`, `scripts/production/unit_lookup.py`.
-- `test` — `scripts/production/test_stall_watch.py`: add rows to the existing case table in `test_running_shell_or_worker_launcher_prevents_a_bump`, from the Spec alone. Rows: a director whose idle pane worker has a live detached run gives `running` and no bump; a director whose worker has only a finished detached run record gets the idle bump as today. Fake the detached run read at the `detached_runs.live_runs` boundary; read no live state.
+**Gotchas:** `Path.glob` in `live_runs` hides folder errors, so the helper opens the folder with `os.scandir` first. A held run folder can be a verified marker target outside `unit_runs.run_roots()`, so it cannot be rebuilt from the history name.
 
-**State:** none.
-
-**Constraints from prior phases:** Phase 1 reads the panes once per cycle through `read_busy_pane_worker_parents` and skips the read when no watched director has staff workers. An existing test counts shared-session pane reads per cycle; keep that count. Run tests as `scripts/lib/py -m unittest scripts.production.test_stall_watch` from the worktree root. Imports are package-qualified.
-
-**Acceptance gate:**
-1. `scripts/lib/py -m unittest scripts.production.test_stall_watch` passes, with the new rows.
-2. `basedpyright scripts/production/stall_watch.py scripts/production/test_stall_watch.py` gives `0 errors, 0 warnings, 0 notes`.
-3. The director's merge gate (`merge_gate.py --tests-only`) and `basedpyright scripts/direct scripts/production` pass before the hash.
+**Ruled out:** rebuilding the folder from `HeldRun.path.stem` under `unit_runs.run_roots()` — it misses marker targets outside the roots.
