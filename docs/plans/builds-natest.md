@@ -2048,42 +2048,21 @@ A changed `config/<name>.conf` selects every test module whose transitive import
 - Direct policy calls for the remaining cases: they cannot prove Cargo input, cache reuse or remote command input.
 
 ### Phase 103 — The progress history tests use half their CPU  · status: done
-**Depends on:** none
 
-#### Work Order
+#### As-built
 
-**Source:** next items, items 2 and 6a. On 2026-11-09 04:40 EST (`show.py top`), `direct/test_progress_history.py` is an eligible top module: 41.9 CPU s per gate, 284 tests. The profile on a copy of `ab2db04d7` (`module_cost.py --tests 10 --commands 10`) measured 41.8 CPU s, 2124 processes and 60.2 wall s. The supervisor process holds 16.7 CPU s of in-process test work. The removable fixture cost is in child starts: `phase_table.py` 39 starts and 9.0 CPU s, `findings.py` 46 starts and 3.4 CPU s, `python3 -c` 150 starts and 2.8 CPU s, `progress_history.py` 9 starts and 2.0 CPU s, `git` 1186 starts and 1.1 CPU s.
-
-**Goal:** `scripts/direct/test_progress_history.py` uses half its current CPU, or a measured floor shows why it cannot, with every checked behavior kept.
-
-**Spec:**
-1. Follow the Speed method. Measure CPU with `module_cost.py --tests 10 --commands 10` first. Name each test's CPU, and each real process that it starts.
-2. Find what starts each `phase_table.py` process: the recorder's own refresh (`progress_history.py` `_refresh_phase_table`) or the test. Run a refresh in process where the test does not assert on the process boundary.
-3. Run `findings.py` and `progress_history.py` command calls in process through `scripts/production/cli_fixture.py` `invoke_cli`, as `scripts/direct/findings_test_support.py` and Phase 89 do. Keep a real process for each behavior that only a process proves: concurrent writers, exit codes across a process, any cwd or environment that the entry reads at start.
-4. Find what the 150 `python3 -c` starts run. Move each one in process when the test does not assert on a separate interpreter.
-5. Share expensive setup: build a seed Git repository once and copy it for each test, where tests make the same repository.
-6. Write a behavior map with a row for each assertion before you change a test. The module has 284 tests: group rows by test class and helper where the assertions are the same.
-7. Do not change `scripts/direct/progress_history.py`, `phase_table.py` or `findings.py`. sdlc owns them. If only a production change can cut a cost, write the floor and send the director an architecture proposal with its measured gain.
-8. Add no guard, refusal or check (user rule, 2026-11-05).
+- `test_progress_history.py` runs `phase_table.py` in process: a `subprocess.run` side effect in setUp sends only `phase_table.py` commands to `invoke_cli(phase_table, phase_table.main, ...)`; every other command runs as a real process.
+- Findings calls use `invoke_findings`, and recorder calls such as `phase-count` use `invoke_recorder`. setUp seeds the interpreter cache with `seed_interpreter_cache`.
+- setUpClass builds one seed Git repository (`git init -b feature/rubric`). setUp copies it with `shutil.copytree`.
+- Real processes stay for concurrent writers, cold imports and the recorder refusal. All 286 tests, 1,020 assertion rows and 6 embedded assertions are kept.
+- CPU under module_cost (no bytecode writes): 61.5 -> 26.1 s sequential, 41.8 -> 17.7 s pair median (57.6% less); processes 2124 -> 1757; execs 2231 -> 1871. Pairs on `/tmp` with a warm bytecode cache: 24.8 -> 17.1 s (31% less).
 
 **Files:**
-- `scripts/direct/test_progress_history.py`
+- `scripts/direct/test_progress_history.py` — progress history recorder tests
 
-**Workers:** 1 writer; one test file
-- `impl` — `test_progress_history.py`
-
-**Constraints from prior phases:**
-- Phase 89, Phase 97 and Phase 100: an in-process call of a real entry through `invoke_cli` cut CPU and kept the code path. Tests that assert on a process boundary kept a real process.
-- Phase 104 runs beside this phase and holds `scripts/aws_target/test_box.py`. Do not edit it.
-- Tests never read or write live state: `~/.claude` main, `~/.local/state/merge-gate`, `/tmp/claude`. State the filesystem basis of each pair.
-
-**Acceptance gate:**
-- The behavior map has a row for each assertion. No assertion is removed.
-- CPU s, processes, execs and wall s before and after, from `module_cost.py` and same-load pairs, in the checkpoint notice.
-- The changed file passes, and every module that imports a changed helper passes.
-- the targeted test green on the phase commit merged with `origin/builds`
-- `basedpyright` on the changed files prints `0 errors, 0 warnings, 0 notes`
-- Floors: a floor claim adds a row to the next-items Floors table with its revision, roots, cache state, limiting operation, owner and revisit condition.
+**Gotchas:**
+- `invoke_cli` ignores the `timeout` argument of the routed `phase_table.py` calls.
+- Fewer child starts save more CPU with no bytecode writes than with a warm cache. State the bytecode condition with each measurement.
 
 ### Phase 104 — The AWS box tests use half their CPU  · status: todo
 **Depends on:** none
@@ -2111,7 +2090,7 @@ A changed `config/<name>.conf` selects every test module whose transitive import
 
 **Constraints from prior phases:**
 - Phase 97 and Phase 100: an in-process call of a real entry cut CPU and kept the code path. Tests that assert on a process boundary kept a real process.
-- Phase 103 runs beside this phase and holds `scripts/direct/test_progress_history.py`. Do not edit it.
+- Phase 103 is done. A process start costs more with no bytecode writes, so start cuts gain more there: 57.6% less CPU in worker pairs with no bytecode writes, 31% less in director pairs on `/tmp` with a warm bytecode cache. The notice reports both conditions.
 - Tests never read or write live state: `~/.claude` main, `~/.local/state/merge-gate`, `/tmp/claude`. State the filesystem basis of each pair.
 
 **Acceptance gate:**
