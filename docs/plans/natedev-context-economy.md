@@ -116,10 +116,10 @@ The report covers Claude sessions on the Mac and Codex worker threads on both ma
 **Gotchas:**
 - Codex rollouts repeat a `token_count` record with the same total (6 of 297 in one rollout).
 - On 11-08 the Mac's 18 Claude sessions were all under `min_requests` 20, so the report showed no Mac rows; the Mac has no Codex sessions.
-- `scripts.usage.test_context_economy` takes about 300 s (git fixture repositories).
+- `scripts.usage.test_context_economy` takes about 1.4 s (24 tests, measured 2026-11-09).
 - A Codex request before the first `turn_context` has a blank model; none seen in 40 real rollouts.
 
-### Phase 4 — The command, the as-built and the first saved results  · status: todo
+### Phase 4 — The command, the as-built and the first saved results  · status: done
 **Depends on:** Phase 3
 
 #### Work Order
@@ -138,7 +138,7 @@ The report covers Claude sessions on the Mac and Codex worker threads on both ma
    - the `cost not weighted:` line, and the `left out:` line (it counts whole sessions under `min_requests`);
    - saved results, their names, `save --last-week`, how a comparison names confounds, and the measured run time.
 5. The precompute experiment uses `--family claude` in every save, threshold read and comparison: Codex has no precompute setting, and the Codex sessions on natedev take the same settings timeline.
-6. Save `precompute-on-2026-11` with `--family claude --where precomputeCompactionEnabled=true` over the 11-08 sessions that ran with it on.
+6. Save `precompute-on-2026-11` with `--family claude --since 2026-11-01 --until 2026-11-08T12:36`. Precompute ON is the Claude Code default: `settings.json` had no `precomputeCompactionEnabled` key until commit 46471082e (2026-11-08 12:36) set it to `false`. `--where` cannot select an absent key, and every request before that commit ran with it on.
 7. Save `precompute-off-2026-11` with `--family claude --where precomputeCompactionEnabled=false` from the first day where `requests_per_cycle` for role `director` has n of 30 or more. Until that day, report the n and save nothing.
 8. Transcripts can be removed by Claude Code (`cleanupPeriodDays`), so the trend lives in saved results. A `nate.jobs.context-economy` entry in `/etc/nixos` runs `save --last-week` once a day (`intervalSeconds = 86400`): the first run in a new week saves the last week, and a missed day or a restart loses no week. The job owner is natedev's user; it writes only `week-*` files under `<state_dir()>/context_economy/` and sends no message. The director commits it on a nixos branch and sends the branch and hash to natedev, which pushes it.
 
@@ -164,7 +164,7 @@ The report covers Claude sessions on the Mac and Codex worker threads on both ma
 - `python3 -m unittest scripts.usage.test_context_economy` passes.
 - `basedpyright scripts/usage` reports 0 errors and 0 warnings.
 - `/context_economy` with no arguments and `/context_economy --family claude` both print the report.
-- `/context_economy compare precompute-on-2026-11 --family claude` prints every quantity with both n and a `confounds:` line.
+- `/context_economy compare precompute-on-2026-11 --family claude --where precomputeCompactionEnabled=false` prints every quantity with both n and a `confounds:` line.
 - `/context_economy save precompute-on-2026-11` a second time refuses and leaves the file unchanged.
 - A saved file holds the `mac` field; `trend` shows `mac failed` for a result saved with the Mac asleep (a test, or a live save with `CONTEXT_ECONOMY_MAC_COMMAND` set to a failing command).
 - `/etc/nixos` evaluates with the new job (`nix flake check` or the repo's own check), and the job's command runs once by hand and writes one `week-*` file; a second run exits 0 and writes nothing.
