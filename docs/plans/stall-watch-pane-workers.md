@@ -32,30 +32,16 @@ sdlc [63b1adde] 2026-11-09. Since panes 34, a dispatch returns at once and no di
 
 ### Phase 1 — Stall watch counts a busy pane worker as running work  · status: done
 
-#### Work Order
+#### As-built
 
-**Goal:** stall watch reports a unit director as `running`, and sends no idle bump, while a pane worker of that director is busy.
-
-**Spec:**
-1. Cause: `work_running(pid, rows, session_id)` (`scripts/production/stall_watch.py:313`) finds work only in the director's process descendants and in processes with the director's native session id. A pane worker runs in its own herdr pane with its own session, so it is neither.
-2. Fix: in the per-unit decision (`stall_watch.py`, the `running_work = work_running(pid, rows, session_id)` line near 1364), `running_work` is also true when a pane worker whose staff parent is the unit director's staff row is busy. Busy means `worker_panes.worker_state(observed) == "busy"`. Use `worker_panes.observe_parents(parents, record)` with the cycle's `staff.StaffSnapshot` (`record`). Add no second busy rule.
-3. One pane read per cycle, and only when needed: read the panes at most once in a cycle, the first time a unit has no process work. Units that need no read cause no read.
-4. A failed pane read counts as no pane work, so the cycle keeps its current behavior. `worker_panes` reports a failed read itself: one `anomaly:` line per worker, and each worker reads as unknown, which is not busy. Only an error that reaches the stall watch (such as an unreadable shared-session file) prints one `stall-watch:` stderr line.
-5. The rest of the decision stays: a `running` result resets the idle stretch as it does for process work today.
+- In the per-unit decision of `stall_watch.watch_pass`, a unit director with no process work is `running`, and gets no idle bump, when a pane worker whose staff parent is the director is busy. Busy is `worker_panes.worker_state(observed) == "busy"`; there is no second busy rule. A `running` result resets the idle stretch, as process work does.
+- `read_busy_pane_worker_parents(parents: tuple[staff.StaffRow, ...], record: staff.StaffSnapshot) -> BusyPaneWorkerParents` makes one `worker_panes.observe_parents` read for all director rows of the cycle. The cycle holds `PaneWorkersUnread` until the first unit without process work needs the answer, then reuses it. It skips the read when no watched director has staff workers.
+- A failed pane read counts as no pane work. `worker_panes` reports it with its own `anomaly:` lines and unknown workers; the stall watch prints one `stall-watch: pane workers:` line only for an error that reaches it, such as an unreadable shared-session file.
 
 **Files:**
-- `scripts/production/stall_watch.py` — the pane worker check and its use in the per-unit decision.
-- `scripts/production/test_stall_watch.py` — table rows for the new cases.
+- `scripts/production/stall_watch.py` — the pane worker check and its use in the per-unit decision
+- `scripts/production/test_stall_watch.py` — busy and idle pane rows in `test_running_shell_or_worker_launcher_prevents_a_bump`
 
-**Workers:** `1 writer + 1 tester`.
-- `impl` — `scripts/production/stall_watch.py`.
-- `test` — `scripts/production/test_stall_watch.py`: add rows to the existing test of the per-unit decision (running, fresh, idle bump), from the Spec alone. Rows: a director with a busy pane worker and no process work gives `running` and no bump; a director with only an idle pane worker gets the idle bump as today. Fake the pane read at the `worker_panes` boundary; read no live pane.
+**Gotchas:** an existing test counts shared-session pane reads per cycle; a read for directors with no workers breaks it.
 
-**State:** none.
-
-**Constraints from prior phases:** none. Run test modules alone; tests run as `scripts/lib/py -m unittest scripts.production.test_stall_watch` from the worktree root (the worktree launcher, not `~/.claude/scripts/lib/py`, which imports the installed modules). Each entry file loads `scripts/lib/package_root.py` through its 4-line `try` block; imports are package-qualified (`from scripts.herdr import worker_panes`).
-
-**Acceptance gate:**
-1. `scripts/lib/py -m unittest scripts.production.test_stall_watch` passes, with the new rows.
-2. `basedpyright scripts/production/stall_watch.py scripts/production/test_stall_watch.py` gives `0 errors, 0 warnings, 0 notes`.
-3. The director's merge gate (`merge_gate.py --tests-only`) and `basedpyright scripts/direct scripts/production` pass before the hash.
+**Ruled out:** changing `worker_panes` to raise a failed read to the caller — the fix is a `worker_panes` call only.
