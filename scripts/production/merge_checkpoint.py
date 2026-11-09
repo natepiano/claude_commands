@@ -399,10 +399,12 @@ def ancestry(request: MergeRequest) -> bool:
     already = git(checkout, "merge-base", "--is-ancestor", request.commit,
                   request.production.merge_branch).returncode == 0
     if not isinstance(request.kind, CodeCheckpoint):
+        _ = good(git(checkout, "fetch", "origin", "+refs/heads/main:refs/remotes/origin/main"), "ancestry")
         closing = good(git(checkout, "rev-list", "--first-parent", "--no-merges", "-n", "1",
                            request.commit), "ancestry")
-        if good(git(checkout, "rev-list", "--no-merges",
-                    f"{request.production.merge_branch}..{closing}^"), "ancestry"):
+        unmerged = good(git(checkout, "rev-list", "--no-merges",
+                            f"{request.production.merge_branch}..{request.commit}", "^origin/main"), "ancestry").splitlines()
+        if any(commit != closing for commit in unmerged):
             raise checkpoint_gate.Stop("ancestry", "held", f"phase {request.phase} code checkpoint has not merged",
                        "wait for the phase code checkpoint to merge, then resend the shrink")
     checkpoint_gate.report("ancestry", "ok", f"checkpoint exists and is on {origin_branch}" +
@@ -575,15 +577,15 @@ def merge(request: MergeRequest) -> str:
         raise checkpoint_gate.Stop("merge", "held", f"staged paths in merge checkout: {staged.replace(chr(10), ', ')}",
                    "the showrunner will clear unrelated staged paths, then rerun the checkpoint")
     short = request.commit[:7]
-    request.scratch.mkdir(parents=True, exist_ok=True)
-    message_path = request.scratch / f"merge_{short}.msg"
     message = merge_subject(request) + "\n\n" + ("Phase plan shrink." if isinstance(request.kind, ShrinkCommit)
                                                   else "Closing as-built docs." if isinstance(request.kind, AsBuiltCommit)
                                                   else request.delivers)
     if request.trailer:
         message += "\n\n" + "\n".join(request.trailer)
-    _ = message_path.write_text(message + "\n", encoding="utf-8")
-    result = git(checkout, "merge", "--no-ff", "-q", "-F", str(message_path), request.commit)
+    with tempfile.TemporaryDirectory(prefix="merge-message-") as directory:
+        message_path = Path(directory) / f"merge_{short}.msg"
+        _ = message_path.write_text(message + "\n", encoding="utf-8")
+        result = git(checkout, "merge", "--no-ff", "-q", "-F", str(message_path), request.commit)
     if result.returncode:
         raise checkpoint_gate.Stop("merge", "failed", result.stderr.strip() or "merge failed",
                    "the showrunner will inspect the merge failure")

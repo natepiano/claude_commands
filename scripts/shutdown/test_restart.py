@@ -886,9 +886,9 @@ class WorkerRestartTests(unittest.TestCase):
               patch.object(restart, "session_launch", wraps=restart.session_launch) as generic,
               redirect_stdout(io.StringIO())):
             resumed_pane = restart.start_row(opened.row, staff.snapshot(), world)
-        self.assertNotEqual(resumed_pane, opened.pane)
-        self.assertNotEqual(world.locations[resumed_pane]["terminal_id"], opened.terminal)
-        self.assertIn((opened.pane, opened.terminal), world.closed)
+        self.assertEqual(resumed_pane, opened.pane)
+        self.assertEqual(world.locations[resumed_pane]["terminal_id"], opened.terminal)
+        self.assertEqual(world.closed, [])
         self.assertEqual(staff.snapshot().by_id(opened.row.id), replace(opened.row, role=staff.KnownWorkerRole("review")))
         restore.assert_called_once()
         self.assertEqual(restore.call_args.args, (self.case.fixture.parent.id,))
@@ -931,9 +931,9 @@ class WorkerRestartTests(unittest.TestCase):
             resumed_pane = restart.start_row(selected.row, staff.snapshot(), world,
                 target_account=accounts.CodexWorkersAccount("codex2", destination),
                 worker_scope=restart.WorkerRestartScope.SELECTED_ROWS)
-        self.assertNotEqual(resumed_pane, selected.pane)
-        self.assertNotEqual(world.locations[resumed_pane]["terminal_id"], selected.terminal)
-        self.assertIn((selected.pane, selected.terminal), world.closed)
+        self.assertEqual(resumed_pane, selected.pane)
+        self.assertEqual(world.locations[resumed_pane]["terminal_id"], selected.terminal)
+        self.assertEqual(world.closed, [])
         self.assertEqual(staff.snapshot().by_id(selected.row.id), replace(selected.row, role=staff.KnownWorkerRole("impl")))
         self.assertIn(selected.row.current_session, world.requests[-1][1])
         self.assertEqual(len(world.launches), before + 1)
@@ -958,9 +958,9 @@ class WorkerRestartTests(unittest.TestCase):
               redirect_stdout(io.StringIO())):
             resumed_pane = restart.start_row(opened.row, staff.snapshot(), world,
                 target_account=selected, worker_scope=restart.WorkerRestartScope.SELECTED_ROWS)
-        self.assertNotEqual(resumed_pane, opened.pane)
-        self.assertNotEqual(world.locations[resumed_pane]["terminal_id"], opened.terminal)
-        self.assertIn((opened.pane, opened.terminal), world.closed)
+        self.assertEqual(resumed_pane, opened.pane)
+        self.assertEqual(world.locations[resumed_pane]["terminal_id"], opened.terminal)
+        self.assertEqual(world.closed, [])
         self.assertEqual(staff.snapshot().by_id(opened.row.id), replace(opened.row, role=staff.KnownWorkerRole("impl")))
         self.assertIs(cast(object, restore.call_args.kwargs["account"]), selected)
         resolve.assert_not_called()
@@ -2452,7 +2452,7 @@ class RestartTests(RestartTestCase):
 
 
 class RetainedSplitRestartTests(RestartTestCase):
-    def test_interrupted_restart_keeps_the_director_and_reopens_worker_panes(self) -> None:
+    def test_interrupted_restart_keeps_the_director_and_resumes_workers_in_their_panes(self) -> None:
         from scripts.direct import progress_history
         from scripts.herdr.test_worker_panes import PaneWorld
         from scripts.lib.test_models_registry import registry_text
@@ -2549,12 +2549,13 @@ class RetainedSplitRestartTests(RestartTestCase):
         self.assertEqual(len(world.locations), len(original))
         self.assertEqual(world.launches[0], herdr.ExistingPane("w1:p0", "terminal-w1:p0"))
         self.assertEqual(len(world.launches), len(original))
-        self.assertTrue(all(isinstance(destination, herdr.SplitPane) for destination in world.launches[1:]))
-        self.assertCountEqual(world.closed, [(pane, cast(str, terminal)) for pane, terminal in original.items() if pane != "w1:p0"])
+        self.assertCountEqual(world.launches[1:], [herdr.ExistingPane(pane, cast(str, terminal))
+                                                 for pane, terminal in original.items() if pane != "w1:p0"])
+        self.assertEqual(world.closed, [])
         places = {world.processes[process[0]].current_identity: pane for pane, process in world.foreground.items()}
         for row in children:
-            self.assertNotIn(places[row.current_session], original)
-            self.assertNotIn(world.locations[places[row.current_session]]["terminal_id"], original.values())
+            self.assertIn(places[row.current_session], original)
+            self.assertEqual(world.locations[places[row.current_session]]["terminal_id"], original[places[row.current_session]])
             self.assertEqual(staff.snapshot().by_id(row.id), replace(row, role=staff.KnownWorkerRole("impl")))
         self.assertEqual({world.processes[pid].current_identity for pid, _family, _arguments in world.foreground.values()},
                          {row.current_session for row in (holder, *children)})
