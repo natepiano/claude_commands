@@ -40,27 +40,11 @@ Prototype, 2026-11-09, in a copy of the tree at `fcd332bc3`. The median of 15 st
 
 **Depends on:** none
 
-#### Work Order
+#### As-built
 
-**Goal:** `import scripts.statusline.counts_row` does not load `scripts.production.merge_checkpoint` or `scripts.production.merge_gate`.
-
-**Spec:**
-
-1. In `scripts/production/update_registration.py`, remove the module-level `from scripts.production.merge_checkpoint import merged_checkpoints`.
-2. Put that same import as the first statement of `state_block`, the only caller.
-3. Add no test, check, scan or new helper. The showrunner set this boundary. Keep every existing assertion.
+`update_registration.state_block` imports `merged_checkpoints` in its body, as its first statement. `state_block` is the only caller in the module. `import scripts.statusline.counts_row` loads neither `scripts.production.merge_checkpoint` nor `scripts.production.merge_gate`.
 
 **Files:**
-- `scripts/production/update_registration.py` — the import
+- `scripts/production/update_registration.py` — the function-level import
 
-**Workers:** 1 writer — one small edit; nothing splits.
-- `impl` — the file above.
-
-**State:** none — the phase moves one import.
-
-**Constraints from prior phases:** none.
-
-**Acceptance gate:**
-- The Test command above passes.
-- `basedpyright` on the file gives `0 errors, 0 warnings, 0 notes`.
-- From the worktree root, `python3 -c "import sys, scripts.statusline.counts_row as c; sys.exit('scripts.production.merge_gate' in sys.modules)"` exits 0.
+**Ruled out:** a new test or check for the boundary; the showrunner set no new check.
