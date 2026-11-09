@@ -905,3 +905,31 @@ The build log index uses WAL mode, so a spilled update takes no exclusive lock a
 
 **Gotchas:**
 - The kernel stamps file times from a coarse clock that can be one tick behind `time.time()`. A test that compares a file time with `time.time()` fails now and then; a cloud gate saw a 0.16 ms miss.
+
+### Phase 43 — The build page proof removes the folders it makes · status: done
+**Depends on:** none.
+
+From the builds showrunner (not the user), 2026-11-09, for the user rule of 2026-11-09 "our processes clean up after themselves, as tempdir does" (report `/tmp/claude/leftover_sources_2026-11-09.md`, section builds, item 2).
+
+#### Work Order
+
+**Goal:** `memory_page_proof.mjs` removes each temporary folder it makes when the proof ends, on pass and on failure.
+
+**Spec:**
+- Line 13: with no `argv[2]`, the proof makes `memory-page-proof-*` with `mkdtemp`. Remove it with `rm(..., {recursive:true, force:true})` in a `finally` that covers all work after the `mkdtemp`. A folder given as `argv[2]` belongs to the caller and stays.
+- Line 90: the `memory-proof-chrome-*` profile. Today the `finally` at line 597 removes it only after the `try` at line 98 starts. Make the removal cover every exit after its `mkdtemp`.
+- The success line names `output` only when the caller gave a folder; a removed folder is not named.
+- No check, scan or signal handler.
+
+**Files:**
+- `scripts/build_queue/memory_page_proof.mjs`
+
+**Workers:** `1 writer`
+- writer — `memory_page_proof.mjs`; runs the proof.
+
+**State:** none.
+
+**Acceptance gate:**
+- The proof passes with no argument, and no `memory-page-proof-*` or `memory-proof-chrome-*` folder from that run remains in `$TMPDIR`.
+- The proof passes with a folder argument; that folder and its `proof.json` stay.
+- A proof that fails (for example `CHROME=/nonexistent`) leaves no folder of its own.
