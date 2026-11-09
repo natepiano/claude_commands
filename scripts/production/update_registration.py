@@ -28,7 +28,6 @@ from typing import NamedTuple, NotRequired, TypedDict, cast
 
 from scripts.production.production_doc import Production, Refusal, read_production
 from scripts.production.checkpoint_gate import report
-from scripts.production.merge_checkpoint import merged_checkpoints
 
 from scripts.production import showrunners, session_staff, showrunner_tree, staff, unit_lookup
 from scripts.production.proposals_folder import issues_folder
@@ -1310,6 +1309,8 @@ def withdraw(production: Production, words: str, *, identities: QuestionStaff | 
 
 
 def state_block(production: Production, state: ShowrunnerState, timestamp: str) -> str:
+    from scripts.production.merge_checkpoint import merged_checkpoints
+
     judgments = {unit.unit: unit for unit in state.units}
     unit_lines: list[str] = []
     record = staff.snapshot()
