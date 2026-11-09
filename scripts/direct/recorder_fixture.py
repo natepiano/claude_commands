@@ -78,9 +78,7 @@ class LauncherFixture(unittest.TestCase):
     @override
     def setUpClass(cls) -> None:
         super().setUpClass()
-        seed_directory = tempfile.TemporaryDirectory()
-        cls.addClassCleanup(seed_directory.cleanup)
-        cls.fixture_seed = Path(seed_directory.name)
+        cls.fixture_seed = Path(cls.enterClassContext(tempfile.TemporaryDirectory()))
         seed = cls("runTest")
         seed.root = cls.fixture_seed
         seed.prepare_fixture()
