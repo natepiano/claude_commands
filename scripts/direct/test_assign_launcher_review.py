@@ -16,6 +16,8 @@ from scripts.production import staff, worker
 from scripts.herdr import turn_end, worker_panes
 from scripts.production.cli_fixture import invoke_cli
 from scripts.direct.assign_launcher_test_support import ROOT, read_object
+from scripts.lib.atomic_file import write_text_atomic
+from scripts.lib.git_test_support import commit_repository
 
 setUpModule = codex_fixture.setUpModule
 
@@ -53,6 +55,50 @@ class PaneAstraReviewTests(HeldRolePaneCase):
             "--new-worker", "astra-reviewer", "--session-dir", str(run), "--cwd", str(self.panes.root),
             "--prompt", str(self.panes.command_case.prompt), "--summary", str(run / "review.md")],
             os.environ.copy(), ROOT)
+
+    def test_named_review_done_records_the_status_style_and_one_notice(self) -> None:
+        project = self.panes.root / "project"
+        project.mkdir()
+        _ = subprocess.run(["git", "init", "-q", str(project)], check=True, capture_output=True)
+        write_text_atomic(project / "design.md", "The first design.\n")
+        baseline = commit_repository(project, "Record the first design.", "design.md")
+        write_text_atomic(project / "design.md", "The next design.\n")
+        case = self.panes.command_case
+        write_text_atomic(case.prompt, "Phase 8 — Workers\nReview the assigned change.\n")
+        opened = case.opened()
+        _ = progress_history.begin_dispatch(case.run_dir, slot="impl", phase="8", role="impl",
+            worker_name="impl", worker_id=opened.row.id, launcher_command=["implementation"],
+            prompt=case.prompt, kind="impl", lens="")
+        for lens, style in (("adversary", False), ("contract", True)):
+            with self.subTest(lens=lens, style=style):
+                name = "models-review-" + lens
+                case.agent.final = ("<!-- phase-style-review:start -->\nStyle review: Pass\n"
+                                    "<!-- phase-style-review:end -->\nAPPROVE")
+                arguments = ["--role", "review", "--to", name, "--lens", lens, "--pass", "1",
+                             "--phase", "8", "--session-dir", str(case.run_dir), "--cwd", str(project),
+                             "--prompt", str(case.prompt)]
+                if style:
+                    arguments += ["--style-since", baseline]
+                notices = len(case.agent.notices)
+                result = invoke_cli(assign, assign.main, arguments, os.environ.copy(), project)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                pane = case.agent.submitted[-1][0]
+                row = case.agent.row(pane)
+                active = progress_history.active_dispatch(row.id, case.run_dir)
+                assert isinstance(active, progress_history.ActiveDispatch)
+                for expected in (turn_end.TurnOutcome.DONE, turn_end.TurnOutcome.IGNORED):
+                    self.assertEqual(case.finish(name), expected)
+                    self.assertEqual(len(case.agent.notices), notices + 1)
+                passed = worker_panes.worker_pass(row, case.run_dir)
+                self.assertEqual(passed["status"], "completed")
+                delivery = progress_history.dispatch_delivery(passed)
+                self.assertEqual(Path(delivery.actions.status_file).read_text(), "done\n")
+                self.assertTrue(Path(delivery.reply_file).read_text().endswith(f"DONE {active.instance_id}\n"))
+                self.assertIn(f"{name}: phase 8: done", case.agent.notices[-1])
+                if style:
+                    saved = read_object(case.run_dir / "phases/8/style_review_state.json")
+                    self.assertEqual(saved["state"], "complete")
+                    self.assertEqual(saved["in_flight"], False)
 
     def assert_review_lifetime(self, failed: bool) -> None:
         records: list[dict[str, object]] = []
