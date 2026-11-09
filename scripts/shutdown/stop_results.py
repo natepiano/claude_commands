@@ -117,7 +117,7 @@ StopResult = Stopped | NotRunning | StopFailed | SessionNotFound
 
 @dataclass(frozen=True)
 class SourceReleased:
-    """Every applicable source server released the native session."""
+    """The native source conversation is proved stopped."""
 
 
 @dataclass(frozen=True)
@@ -131,4 +131,4 @@ class SourceReleaseUnknown:
 
 
 SourceRelease = SourceReleased | SourceUnresolved | SourceReleaseUnknown
-ReleaseSource = Callable[["StaffRow", Callable[[], tuple[Path, ...]], "ClaudeBackend | CodexBackend | BackendUnavailable"], SourceRelease]
+ReleaseSource = Callable[["StaffRow", "ClaudeBackend | CodexBackend | BackendUnavailable"], SourceRelease]

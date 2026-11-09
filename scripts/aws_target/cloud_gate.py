@@ -16,9 +16,11 @@ import json
 import os
 from pathlib import Path
 import re
+import signal
 import subprocess
 import sys
 import time
+from types import FrameType
 from typing import Literal, cast, final
 from uuid import uuid4
 
@@ -371,7 +373,11 @@ class GateWorker:
                         break
                     state = self.api.observe(instance, int(self.clock())).state
                     if state not in ('pending', 'running'):
-                        raise ValueError('The instance stopped without a final result')
+                        reply = self.api.call('describe-instances', '--instance-ids', instance)
+                        stopped = ledger.rows(ledger.rows(reply, 'Reservations')[0], 'Instances')[0]
+                        reason = ledger.mapping(stopped.get('StateReason', {}))
+                        detail = ': '.join(ledger.text(reason, key) for key in ('Code', 'Message') if reason.get(key))
+                        raise ValueError('The instance stopped without a final result' + (f' ({detail})' if detail else ''))
                     self.pause(settings().number('result_poll_s'))
                 if not row:
                     raise ValueError('The instance expired without a final result')
@@ -537,6 +543,9 @@ def run_service(repo: Path, folder: Path, request: dict[str, object], command: S
 
 
 def main() -> int:
+    def stop_worker(number: int, _frame: FrameType | None) -> None:
+        raise SystemExit(128 + number)
+    _ = signal.signal(signal.SIGTERM, stop_worker)
     parser = argparse.ArgumentParser(description=__doc__)
     _ = parser.add_argument('--worker', required=True, type=Path)
     _ = parser.add_argument('--directory', required=True, type=Path)

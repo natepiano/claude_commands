@@ -28,7 +28,6 @@ from scripts.production import fake_unit_host
 from scripts.production import fake_showrunner
 from scripts.production import showrunners, staff
 from scripts.production.staff_test_support import StaffTestCase, fixture_member, fixture_runtime_id, fixture_worker
-from scripts.lib import unit_runs
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.herdr import herdr, worker_panes
 from scripts.message import process_table, roster
@@ -37,7 +36,6 @@ from scripts.message.sessions import SessionRecord
 from scripts.production.showrunners import Showrunner
 
 SCRIPT = Path(__file__).with_name("codex_winddown.py")
-MESH = "/run/current-system/sw/bin/python3 /home/u/.claude/scripts/direct/../agents/codex_mesh.py"
 NOTIFIER_STUB = """print -r -- "notifier $*" >> "$LOG"
 case $1 in new) mkdir -p "$NOTIFIER_STATE_DIR/$2" ;; remove) rm -rf "$NOTIFIER_STATE_DIR/$2" ;; esac
 """
@@ -463,7 +461,7 @@ class CountTests(unittest.TestCase):
 
     def test_an_agent_belongs_to_its_nearest_named_session(self) -> None:
         table = {10: Process(10, 1, "claude", "claude"), 20: Process(20, 10, "claude", "claude"),
-                 30: Process(30, 20, "bash", "bash assign.sh --role implement"), 40: Process(40, 30, "python3", f"{MESH} start"),
+                 30: Process(30, 20, "bash", "bash assign.sh --role implement"), 40: Process(40, 30, "codex", "codex exec task"),
                  50: Process(50, 1, "codex", "codex exec")}
         counts = codex_winddown.agent_counts(table, {10: "showrunner", 20: "trunk"})
         self.assertEqual(counts, {"trunk": 1, codex_winddown.NO_SESSION: 1})
@@ -668,7 +666,7 @@ class MessageTests(unittest.TestCase):
         self.assertIn("launch Claude agents for short time frames", log)
 
     def test_the_user_is_told_once_when_a_wind_down_reaches_no_agents(self) -> None:
-        agent = (f"{os.getpid()} 1 claude claude", f"40 {os.getpid()} python3 {MESH} start --name a")
+        agent = (f"{os.getpid()} 1 claude claude", f"40 {os.getpid()} codex codex exec task")
         self.set_processes(*agent)
         _ = self.run_script("start", "--from", "natedev")
         self.assertIn("hana - 1 - ETA Unmeasured", self.run_script("count", "hana").stdout)
@@ -705,7 +703,7 @@ class PaneCountTests(StaffTestCase):
         )
         for state, expected, reason in cases:
             error = io.StringIO()
-            with self.subTest(state=state), mock.patch.object(unit_runs, "parent_transport", return_value="herdr"), mock.patch.object(
+            with self.subTest(state=state), mock.patch.object(
                     worker_panes, "observe_parents", return_value={parent.id: [state]}), mock.patch.object(
                     codex_winddown, "live_sessions", return_value=[]), mock.patch.object(
                     process_table, "snapshot", return_value={}), mock.patch.object(
@@ -716,19 +714,6 @@ class PaneCountTests(StaffTestCase):
             if reason:
                 self.assertIn("reader", error.getvalue())
                 self.assertIn(reason, error.getvalue())
-
-    def test_mesh_counts_keep_process_ownership_without_a_pane_read(self) -> None:
-        parent = fixture_member("unit", name="mesh-unit", parent=fixture_member("showrunner", name="mesh-runner").id, worktree=staff.PresentWorktree(remote.local_machine(), self.root))
-        worker = fixture_worker("reader", parent.id)
-        table = {10: Process(10, 1, "claude", "claude"), 20: Process(20, 10, "codex", "codex exec task")}
-        with mock.patch.object(unit_runs, "parent_transport", return_value="mesh"), mock.patch.object(
-                worker_panes, "observe_parents", side_effect=AssertionError("mesh pane read")), mock.patch.object(
-                codex_winddown, "live_sessions", return_value=[{"pid": 10, "name": "mesh-unit"}]), mock.patch.object(
-                process_table, "snapshot", return_value=table):
-            counts = codex_winddown.current_counts()
-        self.assertEqual(counts, {"mesh-unit": 1})
-        self.assertFalse((self.root / "worker_transport").exists())
-        self.assertNotIn(worker.name, counts)
 
     def test_unreachable_owner_names_the_cause(self) -> None:
         error = io.StringIO()

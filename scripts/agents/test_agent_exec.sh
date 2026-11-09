@@ -317,6 +317,15 @@ result = claude_worker.open_worker(turn)
 raise SystemExit(result.code if isinstance(result, claude_worker.NotDelivered) else 0)
 PYTHON
 }
+recorded_worker_session() {
+    "$SCRIPT_DIR/../lib/py" - "$WORKING_DIR" "$1" <<'PYTHON'
+import sys
+from pathlib import Path
+from scripts.production import worker_admission
+worker = worker_admission.member(Path(sys.argv[1]), sys.argv[2])
+print(worker.current_session if worker is not None else "")
+PYTHON
+}
 cat > "$TEST_DIR/bin/claude-bg" <<'EOF'
 #!/usr/bin/env bash
 printf '%s\n' "$CLAUDE_CONFIG_DIR" > "$TEST_CLAUDE_HOME_FILE"
@@ -332,14 +341,14 @@ export FAKE_CLAUDE_SESSION_ID=abcdef12-0000-4000-8000-000000000001
 CLAUDE_BIN="$TEST_DIR/bin/claude-bg" run_background_fixture \
     fixture-worker "$WORKING_DIR" "$WORKING_DIR" "$PROMPT_FILE" "$TEST_DIR/summary" "$LOG_FILE" 1
 assert_equal "background worker ignored the named Claude account" "$HOME/.claude4" "$(cat "$TEST_CLAUDE_HOME_FILE")"
-assert_equal "background worker did not launch" "$FAKE_CLAUDE_SESSION_ID" "$("$SCRIPT_DIR/../lib/py" "$SCRIPT_DIR/../production/worker_fill.py" member --run "$WORKING_DIR" --name fixture-worker | cut -d " " -f2)"
+assert_equal "background worker did not launch" "$FAKE_CLAUDE_SESSION_ID" "$(recorded_worker_session fixture-worker)"
 
 # A caller's helper does not opt in to the workers route.
 export FAKE_CLAUDE_SESSION_ID=abcdef12-0000-4000-8000-000000000002
 CLAUDE_BIN="$TEST_DIR/bin/claude-bg" run_background_fixture \
     fixture-friend "$WORKING_DIR" "$WORKING_DIR" "$PROMPT_FILE" "$TEST_DIR/friend-summary" "$LOG_FILE" 0
 assert_equal "friend took the workers account" "$HOME/.claude2" "$(cat "$TEST_CLAUDE_HOME_FILE")"
-assert_equal "friend did not launch" "$FAKE_CLAUDE_SESSION_ID" "$("$SCRIPT_DIR/../lib/py" "$SCRIPT_DIR/../production/worker_fill.py" member --run "$WORKING_DIR" --name fixture-friend | cut -d " " -f2)"
+assert_equal "friend did not launch" "$FAKE_CLAUDE_SESSION_ID" "$(recorded_worker_session fixture-friend)"
 
 # CLI assignments also come from the registry.
 write_test_registry "$MODELS_CONFIG_FILE" --update cli.claude/commit_prep=opus:max
