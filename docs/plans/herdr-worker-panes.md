@@ -3357,7 +3357,7 @@ A Codex launch reads its thread only from its own process (`native_process(pid, 
 
 **Gotchas:** live check 2026-11-08 02:17 EST: `close --interrupt` on a working reviewer printed `done` in 7 s, and its follower exited 3.
 
-### Phase 41 — A pane worker compacts at the cheaper limit · status: todo
+### Phase 41 — A pane worker compacts at the cheaper limit · status: done
 
 **Depends on:** Phase 40 (both edit the pane worker launch) and Phase 34 (item 5 adds the between-turn compaction that this phase measures; pane dispatch does not read `UNIT_COMPACT_ABOVE_TOKENS` before it). sdlc [6ed41bd7], [82aaadcb], 2026-11-07.
 
