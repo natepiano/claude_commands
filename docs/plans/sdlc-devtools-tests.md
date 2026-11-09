@@ -1517,3 +1517,44 @@ A holding or waiting status that names any showrunner, or a sibling unit, reads 
 **Gotchas:** a sibling unit name that is a common word still defers a bump.
 
 **Ruled out:** every staff name as a peer — many unit names are common words (style, verify, queue) and hide an own-work hold.
+
+### Phase 8t — The units table shows board status, phase work, other work and queued work  · status: done
+
+**Depends on:** none
+
+Source: sdlc [b507e219], from the user via natedev. The messaging unit showed `no phases | —` while it ran two named phases outside its plan, with two items queued.
+
+#### Work Order
+
+**Goal:** `/showrunner:units` shows each unit's status with the accounts board's categories, its plan phase and task in one column, its non-phase work, and the work it has queued.
+
+**Spec:**
+1. One classifier gives a unit session's state: `busy`, `idle`, `paused` or `exited`. Test in this order: an exit record gives `exited`; a pause record gives `paused`; no live session gives `exited`; a live session with status `busy` gives `busy`; else `idle`. A paused member usually has no live process, so the pause test comes first (accounts [ce67669d]). Keep the board's account attribution and its worker counts in `accounts.py`; they are not staff-row states. Put it in a new module `scripts/accounts/session_state.py`. The accounts board (`_read_local_role_sessions` in `scripts/accounts/accounts.py`) and `scripts/production/unit_phases.py` both call it. No second copy of the rule stays. The board now also counts a paused unit or showrunner as `paused`.
+2. The table is `| Unit | Status | Phase | Non-Phase Work | Queued |`. Status is the state from item 1.
+3. Phase: for an open plan phase, `phase <n> of <m> — <task>`. The task is the open step of the newest run, as `<step>: <what it does>`. With no open step, the task is the phase title. Cut the cell to 80 characters with `…`. With no open phase, keep the old texts (`between phases, <done> of <total> done`, `not started`, `plan done`, `no phases`, `no plan`) and show no task.
+4. Non-Phase Work: the unit's open runs whose phase id is not a phase of its plan. Show `<phase id>: <open step>` for the newest such run, cut to 80 characters with `…`; add ` +<k> more` for other open runs of that kind. Show `—` when there is none.
+5. Queued: one short ordered list per unit that its director writes. A new script `scripts/production/unit_queue.py` stores it in `UNIT_QUEUE_STATE_DIR`, default `~/.local/state/unit-queue/<staff id>.json`, and finds the caller's unit from its staff row. Subcommands: `add --text "<item>"` appends, `done` removes the first item, `clear` removes all, `show` prints the list. The cell shows the first item, cut to 80 characters with `…`, plus ` +<n> more`; `—` when empty.
+6. A new command `commands/unit/queue.md` (`/unit:queue add <text> | done | clear | show`) runs the script. Write it in STE, in the style of `commands/unit/question.md`.
+7. Update `commands/showrunner/units.md` for the new columns and statuses. The style production table does not change.
+
+**Files:**
+- `scripts/accounts/session_state.py`
+- `scripts/accounts/accounts.py`
+- `scripts/production/unit_phases.py`
+- `scripts/production/live_units.py`
+- `scripts/production/unit_queue.py`
+- `commands/unit/queue.md`
+- `commands/showrunner/units.md`
+- `scripts/production/test_unit_phases.py`
+- `scripts/accounts/test_accounts.py`
+- `scripts/production/test_unit_queue.py`
+
+**Workers:** 1 writer. The classifier, the table and the queue share one table test file, and the change is small.
+
+**State:** `UNIT_QUEUE_STATE_DIR/<staff id>.json` — the unit's queued items, written only by `unit_queue.py`.
+
+**Test:** add rows to the existing unit_phases and accounts tests for each status, each Phase form, Non-Phase Work and Queued; a new `test_unit_queue.py` covers add, done, clear and show. Run each changed test module with `~/.claude/scripts/lib/py -m unittest <module>` from the worktree root.
+
+**Lint:** `basedpyright` on every changed Python file gives `0 errors, 0 warnings, 0 notes`.
+
+**Acceptance gate:** a unit that runs a phase outside its plan with two queued items shows its status, its non-phase work and `<first item> +1 more`; the board and the units table give the same state for the same session; both sdlc Merge tests lines pass.
