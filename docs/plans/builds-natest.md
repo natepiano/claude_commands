@@ -2222,46 +2222,24 @@ A changed `config/<name>.conf` selects every test module whose transitive import
 
 
 ### Phase 112 — A targeted test skips folder neighbors that do not name the changed file  · status: done
-**Depends on:** none
 
-#### Work Order
+#### As-built
 
-**Source:** the user, 2026-11-09: "our goal is dramatically reduced cpu time - also for targeted tests if we can get them to be much tighter on what is the targeted tests to run that would be ideal - i don't know how good we are at targeting tests but we need to be really good". The showrunner: "make it select only the modules the change can affect".
-
-**Why:** a changed non-test Python file selects every test module in its folder. Most of those modules have no link to the file. Replay of the last 19 unit landings on `builds`: today's rule selects a mean 91 modules and 768 CPU s; with the folder rule limited to modules that name the changed file, a mean 68 modules and 590 CPU s (median 77 to 64 CPU s). With no folder rule at all the mean is 67 modules and 581 CPU s, so this limit keeps nearly the full gain and keeps the modules with a real link.
-
-**Goal:** a changed non-test Python file selects a test module of its folder only when that module names the file's stem.
-
-**Spec:**
-1. In `select_affected` in `scripts/production/affected_modules.py`, replace the condition `str(Path(path).parent) in folders`. Collect the stems of the changed non-test Python files for each folder. Removed files count, as they do today.
-2. A test module in such a folder is selected by this rule only when its source text holds one of its folder's stems as a whole word (`\b<stem>\b`). An import, a string such as `"subject.py"`, and a comment each count.
-3. Read the source text only for a module in such a folder that no earlier rule selected. A read or decode error stays in the existing graph-error result.
-4. Do not change the other module rules, the base choice or the fact cache. Do not change the transitive config rule: a question about it is with the user.
-5. Tests, in `scripts/production/test_affected_modules.py`:
-   - Change `test_direct_imports_and_same_folder_select_without_a_second_import_step`: the existing neighbor names no changed file and is no longer selected. Add a neighbor that holds the bare string `subject.py` and a neighbor that imports `subject` by a plain name. Both are selected.
-   - Add one row: a module in another folder that holds the stem is not selected by this rule.
-   - Change `test_unreferenced_inputs_select_only_tests_in_a_changed_python_folder`: a changed `scripts/other/conftest.py` selects no module, because no neighbor names `conftest`.
-   - Add one row: a removed source file selects a same-folder module that names its stem.
-6. Update the fourth rule in `docs/as-built/merge-gate-and-test-speed.md` (the "Affected modules for targeted tests" section) in the same commit.
-7. Add no check.
+- In `select_affected` in `scripts/production/affected_modules.py`, a changed non-test Python file selects a test module of its folder only when that module's text holds the file's stem as a whole word. Imports, strings and comments each count. Removed files count.
+- The selector reads the text only for a module in such a folder that no earlier rule selected. A read or decode error gives the existing graph-error result.
+- The other module rules, the base choice and the fact cache are unchanged.
+- Replay of 19 landings on `builds`: mean 91 to 68 modules, mean 768 to 590 CPU s, median 77 to 64 CPU s. With no folder rule at all the mean is 67 modules and 581 CPU s.
 
 **Files:**
 - `scripts/production/affected_modules.py` — the folder rule
-- `scripts/production/test_affected_modules.py` — the changed row and the new rows
+- `scripts/production/test_affected_modules.py` — the changed rows and the new rows
 - `scripts/production/test_targeted_test.py` — the fixture's folder neighbor names the changed file
 - `docs/as-built/merge-gate-and-test-speed.md` — the fourth rule
 
-**Workers:** 1 writer; the files are one change
-- `impl` — all four files
+**Gotchas:**
+- A test that reaches a changed sibling only through a helper, and does not name it, is not selected. The merge gate still runs it.
+- The transitive config rule now holds most of the targeted cost: two `config/lint.conf` edits ran 580 modules each, 86% of the replay's CPU. A question to the user about it is open.
 
-**Constraints from prior phases:**
-- Tests never read or write live state: `~/.claude` main, `~/.local/state/merge-gate`, `/tmp/claude`.
-- A selection reads source without importing it.
-- The merge gate always runs all modules. A targeted miss costs one later failed merge gate and cannot land a defect.
-
-**Acceptance gate:**
-- `scripts/production/test_affected_modules.py`, `scripts/production/test_targeted_test.py` and `scripts/aws_target/test_cloud_gate.py` pass.
-- `basedpyright` on the changed Python files prints `0 errors, 0 warnings, 0 notes`.
-- The targeted test is green on the phase commit merged with `origin/builds`.
-- The replay of 19 landings is the module-count evidence: mean 91 to 68 modules, mean 768 to 590 CPU s.
-- The director sends the miss report with the hash: of the recorded red modules 11-04 to 11-09 that the new limit skips, 55 also passed on the same commit, 41 also failed on another commit within 12 hours, and 4 failed on one commit only.
+**Ruled out:**
+- A measured per-module file map: the name check keeps nearly the same gain with much less work.
+- Config selection by changed key: replay gain is small (590 to 569 CPU s), because `scripts/lint/sweep.py` alone reaches 477 test modules by imports.
