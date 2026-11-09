@@ -2145,41 +2145,16 @@ A changed `config/<name>.conf` selects every test module whose transitive import
 - The architect's reword of the Phase 106 Floors row: the showrunner said to keep that row as it is.
 
 ### Phase 108 — The hook dispatch tests use half their CPU  · status: done
-**Depends on:** none
 
-#### Work Order
+#### As-built
 
-**Source:** item 6a rank refresh, 2026-11-09. `module_cost.py` on `e8089d128`: `hooks/test_hook_dispatch.py` uses 46.3 CPU s, the highest eligible module above the 30 CPU s stop line. Two tests use 34.9 CPU s: `test_registered_dispatch_distinguishes_literal_and_executable_substitutions` (18.7 s) and `test_recorded_commands_and_interpreter_descriptor_context_matrix` (16.2 s). The module starts `hook_dispatch.py` 152 times for 23.9 CPU s.
-
-**Goal:** `scripts/hooks/test_hook_dispatch.py` uses half its CPU or less, with every checked behavior kept.
-
-**Spec:**
-1. Follow the Speed method. Measure CPU with `module_cost.py --tests 10 --commands 10` on the phase base first. Name each test's CPU, and each real process that it starts.
-2. The four matrix tests in `CopyGuardDispatchTests` start one `hook_dispatch.py` process for each case of `shell_policy_cases`, `argv_policy_cases`, `unresolved_policy_cases` and `repair_policy_cases`. `scripts/copies/test_copy_guard.py` already checks each case against `copy_guard` in process. The dispatcher tests prove that the registered dispatcher, with all its `pre_tool_use` hooks, gives the same exit code, stderr and stdout. Keep that proof for each case.
-3. Run the cases with fewer process starts. Options: one driver process for each test that runs every case through the real dispatcher entry, or an in-process call on the main thread with `invoke_cli` (`scripts/production/cli_fixture.py`). Measure each option you try. Keep the real dispatcher table and the real hooks.
-4. Keep a real `hook_dispatch.py` process for each behavior that only a process proves: the exit code, the stdin read, the stdout and stderr streams, and the settings registration. Keep one real start for each outcome class: refusal, pass, and unresolved operation.
-5. `run_hook` installs signal and alarm handlers. Python allows that only on the main thread. Run no dispatcher call from another thread.
-6. Write a behavior map with a row for each assertion before you change a test.
-7. Do not change `scripts/hooks/hook_dispatch.py`, `scripts/copies/copy_guard.py`, `scripts/copies/test_copy_guard.py` or other files outside this test. If only a production change can cut a cost, write the floor and send the director an architecture proposal with its measured gain.
-8. Add no guard, refusal or check (user rule, 2026-11-05).
+- `CopyGuardDispatchTests.dispatch_cases` sends a list of Bash payloads through the real `hook_dispatch.main` and the registered hooks in one isolated main-thread driver process. `invoke_cli` captures each case's return code, stdout and stderr. A driver crash fails the test with the driver stderr.
+- Three matrix tests use it: registered dispatch, interpreter vectors with unresolved programs, and recorded commands. Real dispatcher process starts stay for the refusal, pass and first unresolved case.
+- All 39 tests, 136 matrix cases and 95 assertions are kept. Sequential `module_cost`: 47.1 -> 13.4 CPU s, processes 411 -> 280.
+- Director pairs on base `5db3e42fd`: `/tmp` with a warm bytecode cache 26.9 -> 10.3 CPU s (62% less); `/dev/shm` with no bytecode writes 36.7 -> 12.2 CPU s (67% less).
 
 **Files:**
-- `scripts/hooks/test_hook_dispatch.py`
-- `docs/plans/builds-natest-next.md` — a Floors row only, when the module stops above half its CPU
+- `scripts/hooks/test_hook_dispatch.py` — hook dispatcher tests; `dispatch_cases` groups matrix cases in one driver
 
-**Workers:** 1 writer; one test file
-- `impl` — `test_hook_dispatch.py`, the Floors row
-
-**Constraints from prior phases:**
-- Phase 107: the change page tests run `change_page.py` in process; the remaining limit is CLI startup cost (sdlc).
-- Phase 105: `invoke_cli` restores signal handlers (`cli_fixture.py:133`), and Python allows that only on the main thread. It also changes the process cwd, environment and streams.
-- Phase 103: a process start costs more with no bytecode writes. Report pairs with no bytecode writes and on `/tmp` with a warm bytecode cache.
-- `IsolatedHookTests.setUp` gives each test a temporary `HOME`, `TMPDIR` and state paths. Keep that isolation for each case. Tests never read or write live state: `~/.claude` main, `~/.local/state/merge-gate`, `/tmp/claude`. State the filesystem basis of each pair.
-
-**Acceptance gate:**
-- The behavior map has a row for each assertion. No assertion is removed.
-- CPU s, processes, execs and wall s before and after, from `module_cost.py` and same-load pairs against the phase base, in the checkpoint notice.
-- The changed file passes.
-- the targeted test green on the phase commit merged with `origin/builds`
-- `basedpyright` on the changed file prints `0 errors, 0 warnings, 0 notes`
-- Floors: a row for the module when it stops above half its CPU, with the limiting operation.
+**Gotchas:**
+- Cases in one driver share `sys.modules`. `hook_dispatch._execute` loads each hook as a fresh module, so hook globals do not carry; keep HOME, PATH and cwd the same for all cases of one driver.
