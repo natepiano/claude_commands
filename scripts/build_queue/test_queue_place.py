@@ -35,7 +35,7 @@ from scripts.buildlog import store
 from scripts.lint.memory_test_support import commit_config_fixture, fake_memory_readings, gate_isolation_environment
 from scripts.build_queue.queue_fixture import write_memory_config
 
-GIB = gate.GIB
+GIB = records.GIB
 CHILD = "import sys; data=sys.stdin.buffer.read(); sys.stdout.buffer.write(data); sys.exit(int(sys.argv[1]))"
 LIFELINE_WAIT = "os.read(int(os.environ['QUEUE_TEST_LIFELINE']), 1)"
 BLOCKING_CHILD = "import os,sys; print('ready', flush=True); " + LIFELINE_WAIT
@@ -290,7 +290,7 @@ class QueuePlaceFixture(ExitStack):
         path = self.proc / str(pid) / "stat"
         fields = path.read_text().rsplit(") ", 1)[1].split()
         fields[1] = str(os.getpid() if parent is None else parent)
-        fields[19] = gate.process_start_time(pid) or "gone"
+        fields[19] = records.process_start_time(pid) or "gone"
         _ = path.write_text(f"{pid} (fixture) {' '.join(fields)}\n")
 
     def stop_children(self) -> None:
@@ -302,7 +302,7 @@ class QueuePlaceFixture(ExitStack):
                 if stream is not None:
                     stream.close()
 
-    def reservation(self) -> tuple[Path, gate.Reservation]:
+    def reservation(self) -> tuple[Path, records.Reservation]:
         record, = self.admission.server.reservations.values()
         path, row = Path(record.path), service.reservation_row(record)
         if not row.get("reservation_id"):
@@ -311,7 +311,7 @@ class QueuePlaceFixture(ExitStack):
 
     def history(self) -> list[dict[str, object]]:
         path = self.directory / "anon_peaks.jsonl"
-        return list(gate.anonymous_history_rows(path))
+        return list(step_estimator.anonymous_history_rows(path))
 
     def seed(self, values: list[int], *, program: str = "rust-analyzer", host: str = "") -> None:
         with (self.directory / "anon_peaks.jsonl").open("a") as output:
@@ -406,14 +406,14 @@ class QueuePlaceTests(unittest.TestCase):
                         self.assertEqual(list(samples.iterdir()), [])
 
     def test_program_admission_carries_the_unit_override(self) -> None:
-        with QueuePlaceFixture() as fixture, mock.patch.dict(os.environ, {gate.BUILDLOG_UNIT: "queue-unit"}):
+        with QueuePlaceFixture() as fixture, mock.patch.dict(os.environ, {records.BUILDLOG_UNIT: "queue-unit"}):
             with queue.queue_place("rust-analyzer", fixture.root):
                 _, row = fixture.reservation()
                 self.assertIn("queue_waiter", row)
                 assert "queue_waiter" in row
                 waiter = row["queue_waiter"]
                 self.assertEqual(waiter.get("unit"), "queue-unit")
-                self.assertEqual(waiter.get("session_id"), gate.waiter_identity("", "")["session_id"])
+                self.assertEqual(waiter.get("session_id"), records.waiter_identity("", "")["session_id"])
 
     def analyzer(self, fixture: QueuePlaceFixture, source: str) -> Path:
         executable = fixture.root / "rust-analyzer"
@@ -632,7 +632,7 @@ class QueuePlaceTests(unittest.TestCase):
                 if not stopped.wait(15):
                     raise AssertionError("the sampler barrier exceeded its test deadline")
 
-            def release_after_descendant_exit(path: str, status: int, configuration: gate.MemoryConfig | wire.CleanupTiming) -> None:
+            def release_after_descendant_exit(path: str, status: int, configuration: records.MemoryConfig | wire.CleanupTiming) -> None:
                 if fork_during_scope_read:
                     self.assertTrue(raced_scope_read, "cleanup did not read the scope before release")
                     scope_pids = {int(pid) for procs in Path(scope_name).rglob("cgroup.procs")
@@ -667,7 +667,7 @@ class QueuePlaceTests(unittest.TestCase):
                     fork_and_exit()
                     self.assertEqual(child.wait(timeout=3), 0, "the leader did not preserve its exit status")
                     self.assertNotIn(str(descendant), snapshot.split(), "the snapshot already contained the child")
-                    self.assertIsNone(gate.process_start_time(leader), "the parent still had a process identity")
+                    self.assertIsNone(records.process_start_time(leader), "the parent still had a process identity")
                 return snapshot
 
             try:
@@ -697,9 +697,9 @@ class QueuePlaceTests(unittest.TestCase):
                             self.assertIn(str(descendant), (directory / "cgroup.procs").read_text().split())
                         self.assertFalse(place.path.with_suffix(".max").exists(), "a sample escaped the barrier")
                         memory = gate.reservation_memory(place.path, row, datetime.now(UTC),
-                            gate.process_table(fixture.proc), fixture.proc, gate.read_memory_config().policy)
-                        self.assertIsInstance(memory, gate.MeasuredMemory)
-                        assert isinstance(memory, gate.MeasuredMemory)
+                            gate.process_table(fixture.proc), fixture.proc, records.read_memory_config().policy)
+                        self.assertIsInstance(memory, records.MeasuredMemory)
+                        assert isinstance(memory, records.MeasuredMemory)
                         self.assertEqual(memory.bytes, 3 * GIB)
                         place.observe(3 * GIB, 3 * GIB)
                         reservation_id = str(row.get("reservation_id", ""))
@@ -756,7 +756,7 @@ class QueuePlaceTests(unittest.TestCase):
     def test_running_program_is_stopped_before_its_place_is_released(self) -> None:
         with QueuePlaceFixture() as fixture:
             release = client.release
-            def release_after_stop(path: str, status: int, configuration: gate.MemoryConfig | wire.CleanupTiming) -> None:
+            def release_after_stop(path: str, status: int, configuration: records.MemoryConfig | wire.CleanupTiming) -> None:
                 self.assertIsNotNone(child.poll(), "reservation released while its program still ran")
                 _ = release(path, status, configuration)
             with mock.patch.object(client, "release", side_effect=release_after_stop) as released:
@@ -801,7 +801,7 @@ class QueuePlaceTests(unittest.TestCase):
                 if current == 3 * GIB:
                     sampled.set()
 
-            def release_after_descendant_exit(path: str, status: int, configuration: gate.MemoryConfig | wire.CleanupTiming) -> None:
+            def release_after_descendant_exit(path: str, status: int, configuration: records.MemoryConfig | wire.CleanupTiming) -> None:
                 self.assertTrue(select.select([descriptor], [], [], 0)[0],
                                 "reservation released while its descendant still ran")
                 _ = release(path, status, configuration)
@@ -874,9 +874,9 @@ class QueuePlaceTests(unittest.TestCase):
                 self.assertEqual(Path(row["sidecar"]).read_text(), "")
                 self.assertIsInstance(gate.reservation_lifetime(row, True), gate.LiveOwnerProcess)
                 memory = gate.reservation_memory(path, row, datetime.now(UTC), gate.process_table(fixture.proc),
-                                                 fixture.proc, gate.read_memory_config().policy)
-                self.assertIsInstance(memory, gate.MeasuredMemory)
-                assert isinstance(memory, gate.MeasuredMemory)
+                                                 fixture.proc, records.read_memory_config().policy)
+                self.assertIsInstance(memory, records.MeasuredMemory)
+                assert isinstance(memory, records.MeasuredMemory)
                 self.assertEqual(memory.bytes, GIB)
                 self.assertIsNone(child.poll())
                 place.observe(GIB, GIB)
@@ -912,7 +912,7 @@ class QueuePlaceTests(unittest.TestCase):
         with QueuePlaceFixture() as fixture:
             write_memory_config(fixture.config, **{"program_first_peak_gib.rust-analyzer": "abc"})
             diagnostics = io.StringIO()
-            with mock.patch.object(records, "_warned_configuration_diagnostics", set[gate.ConfigurationDiagnostic]()), \
+            with mock.patch.object(records, "_warned_configuration_diagnostics", set[records.ConfigurationDiagnostic]()), \
                  mock.patch.object(client, "admit", wraps=client.admit) as checked, redirect_stderr(diagnostics):
                 for _ in range(2):
                     with self.assertRaises(queue.QueuePlaceRefused) as refused:
