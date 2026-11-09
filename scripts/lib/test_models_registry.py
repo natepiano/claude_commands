@@ -194,6 +194,33 @@ class LaunchSettingsTests(unittest.TestCase):
             self.assertEqual(os.environ["AGENTS_CALLER_FAMILY"], "claude")
             self.assertEqual(os.environ["AGENTS_CALLER_ASSIGNMENT"], "caller")
 
+            configuration = models_registry.launch_configuration(os.environ)
+            _ = write_registry(self.path, {"assignments": {"direct": "codex"}})
+            for inherited, expected in ((False, first), (True, second)):
+                environment = configuration.environment(os.environ) if inherited else dict(os.environ)
+                with self.subTest(inherited=inherited), patch.dict(os.environ, environment):
+                    self.assertEqual(models_registry.launch_settings("direct", "impl"), expected)
+
+    def test_launch_settings_starts_no_python_registry_process(self) -> None:
+        from scripts.lib import models_registry
+
+        _ = write_registry(self.path)
+        text = self.path.read_text()
+        log = self.root / "python-processes"
+        probe = self.root / "process-probe"
+        probe.mkdir()
+        _ = (probe / "sitecustomize.py").write_text(
+            "import sys\n"
+            + f"with open({str(log)!r}, 'a') as output: output.write(sys.argv[0] + '\\n')\n")
+        for comment_length in (0, 70_000):
+            with self.subTest(comment_length=comment_length):
+                _ = self.path.write_text("#" + "x" * comment_length + "\n" + text)
+                _ = log.write_text("")
+                with patch.dict(os.environ, {"PYTHONPATH": str(probe) + os.pathsep + os.environ.get("PYTHONPATH", "")}):
+                    settings = models_registry.launch_settings("direct", "impl")
+                self.assertEqual(tuple(settings), self.shell_settings("direct", "impl"))
+                self.assertEqual(log.read_text(), "")
+
     def test_invalid_launch_rows_fail_before_a_launcher_can_use_them(self) -> None:
         from scripts.lib import models_registry
 

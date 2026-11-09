@@ -1897,6 +1897,17 @@ class Herdr:
             return False
         return self._close_pane(pane) and self._pane_closed(pane, terminal)
 
+    def close_terminal_pane(self, pane: str, terminal: str) -> bool:
+        """Close the matching terminal and confirm its removal without a process check."""
+        if not terminal:
+            return False
+        row = self.pane_row(pane)
+        if isinstance(row, NoPane):
+            return self._pane_closed(pane, terminal)
+        if row.get("terminal_id") != terminal:
+            return False
+        return self._close_pane(pane) and self._pane_closed(pane, terminal)
+
     def _pane_closed(self, pane: str, terminal: str) -> bool:
         if any(row["pane_id"] == pane or terminal and row.get("terminal_id") == terminal for row in self.panes()):
             print(f"herdr {self.session}:{pane}: closure is pending; record retained", file=sys.stderr)
@@ -2176,10 +2187,10 @@ class Herdr:
         """Return the sole foreground Codex PID, or zero for other foreground work."""
         info = json_object(self.result("pane", "process-info", "--pane", pane).get("process_info"),
                            "pane process info")
-        if not codex_without_session(info):
+        foreground = _codex_foreground(info)
+        if len(foreground) != 1:
             return 0
-        foreground = json_items(info.get("foreground_processes"), "native foreground processes")
-        pid = json_object(foreground[0], "native foreground process").get("pid")
+        pid = foreground[0].get("pid")
         if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
             raise HerdrFailure("native process pid is unavailable")
         return pid
@@ -2618,11 +2629,22 @@ def pane_session(row: Mapping[str, object]) -> str:
     return session if isinstance(session, str) else ""
 
 
+def _codex_foreground(info: dict[str, object]) -> list[dict[str, object]]:
+    """Select a sole Codex process after excluding the turn-end hook."""
+    foreground: list[dict[str, object]] = []
+    for value in json_items(info.get("foreground_processes"), "native foreground processes"):
+        process = json_object(value, "native foreground process")
+        arguments = _foreground_arguments(process)
+        program = (arguments[1] if len(arguments) > 1 and Path(arguments[0]).name.startswith("python")
+                   else arguments[0] if arguments else "")
+        if Path(program).parts[-3:] != ("scripts", "herdr", "turn_end.py"):
+            foreground.append(process)
+    return foreground if len(foreground) == 1 and is_codex_process(_foreground_arguments(foreground[0])) else []
+
+
 def codex_without_session(info: dict[str, object]) -> bool:
     """Identify one foreground Codex that can supply a session report."""
-    foreground = json_items(info.get("foreground_processes"), "native foreground processes")
-    return len(foreground) == 1 and is_codex_process(
-        _foreground_arguments(json_object(foreground[0], "native foreground process")))
+    return len(_codex_foreground(info)) == 1
 
 
 def pane_native_process(info: dict[str, object], kind: str,
@@ -3481,8 +3503,8 @@ def codex_pane_process(pid: int, place: HerdrPlace) -> NativeAgentProcess:
     client = Herdr(place.session)
     info = json_object(client.result("pane", "process-info", "--pane", place.pane).get("process_info"),
                        "Codex pane process info")
-    foreground = json_items(info.get("foreground_processes"), "Codex foreground processes")
-    if codex_without_session(info) and json_object(foreground[0], "Codex foreground process").get("pid") == pid:
+    foreground = _codex_foreground(info)
+    if len(foreground) == 1 and foreground[0].get("pid") == pid:
         pane = client.pane_row(place.pane)
         if not isinstance(pane, NoPane):
             try:
@@ -4978,11 +5000,6 @@ class PreparedAgentEnvironment:
 
 
 @dataclass(frozen=True)
-class WorkerPaneEnvironment(PreparedAgentEnvironment):
-    """A worker shell ends when its agent command returns."""
-
-
-@dataclass(frozen=True)
 class NewTab:
     space: str
     title: str
@@ -5136,12 +5153,6 @@ def launch_prepared_agent(name: str, destination: NewTab | SplitPane | ExistingP
                       'unset "${legacy_label%%=*}";; esac; done; '
                       f"cd -- {shlex.quote(str(prepared.directory))} && "
                       f"unset {shlex.join(sorted(key for key in removals if not key.startswith('HERDR_') and re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*', key)))} && export {exports}")
-        if isinstance(prepared, WorkerPaneEnvironment):
-            script += ("\nprecmd_functions=(${precmd_functions:#herdr_worker_exit}); "
-                       "preexec_functions=(${preexec_functions:#herdr_worker_start}); "
-                       "herdr_worker_exit() { exit $?; }; "
-                       "herdr_worker_start() { precmd_functions=(herdr_worker_exit $precmd_functions); }; "
-                       "preexec_functions+=(herdr_worker_start)")
         client.run_in_pane(pane, ["eval", script],
                            terminal=destination.terminal if isinstance(destination, ExistingPane) else "")
         server_name = agent_name if isinstance(agent_name, str) else agent

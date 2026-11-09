@@ -16,6 +16,7 @@ import sys
 import tempfile
 import threading
 import time
+import traceback
 import unittest
 from collections.abc import Callable, Generator, Mapping
 from contextlib import contextmanager
@@ -27,7 +28,9 @@ from unittest import mock
 from scripts.build_hold import build_hold
 from scripts.direct.recorder_fixture import invoke_recorder, record_wait_workers
 from scripts.production.staff_test_support import fixture_runtime_id
-from scripts.direct.verify_mac_offload_test_support import VerifyMacOffloadFixture, CallRecord, CARGO_STUB, wait_for_marker_exit
+from scripts.direct.verify_mac_offload_test_support import (
+    VerifyMacOffloadFixture, CallRecord, CARGO_STUB, hold_recorder_exits, wait_for_marker_exit,
+)
 from scripts.direct.local_release_wait import RELEASE_CHANGES, LocalReleaseEvents, local_release_waiter
 from scripts.lib import inotify
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
@@ -74,7 +77,8 @@ def local_hold_environment(environment: Mapping[str, str]) -> Generator[None, No
     previous_values = {name: os.environ[name] for name in environment if name in os.environ}
     try:
         os.environ.update(environment)
-        yield
+        with hold_recorder_exits():
+            yield
     finally:
         for name in environment:
             if name in previous_values:
@@ -172,6 +176,7 @@ class VerifyHoldTools(VerifyMacOffloadFixture):
     fixture_root: ClassVar[Path]
     fixture_seed: ClassVar[Path]
     fixture_environment: ClassVar[dict[str, str]]
+    cleanup_failures: tuple[str, ...] = ()
 
     @classmethod
     @override
@@ -209,6 +214,7 @@ class VerifyHoldTools(VerifyMacOffloadFixture):
 
     @override
     def setUp(self) -> None:
+        self.cleanup_failures = ()
         self.root: Path = self.fixture_root
         _ = shutil.copytree(self.fixture_seed, self.root, symlinks=True)
         self.addCleanup(shutil.rmtree, self.root)
@@ -221,6 +227,17 @@ class VerifyHoldTools(VerifyMacOffloadFixture):
         self.cargo_events_path: Path = self.root / "cargo-events.jsonl"
         self.environment: dict[str, str] = self.fixture_environment.copy()
         _ = caller_admission(self, self.root, self.environment)
+
+    @override
+    def addCleanup[**P](self, function: Callable[P, object], /, *args: P.args, **kwargs: P.kwargs) -> None:
+        def recorded_cleanup() -> None:
+            try:
+                _ = function(*args, **kwargs)
+            except BaseException:
+                self.cleanup_failures += (traceback.format_exc(),)
+                raise
+
+        super().addCleanup(recorded_cleanup)
 
     @override
     def stop_verify(self, process: subprocess.Popen[str]) -> None:
@@ -320,9 +337,7 @@ exit "$status"
         _ = self.cycle_file.write_text(json.dumps(cycle))
 
     def fixture_cleanups(self) -> None:
-        # Outside a run, doCleanups keeps a failed cleanup to itself:
-        # a process the fixture found outliving the test fails this one.
-        self.assertTrue(self.fixture.doCleanups(), "a fixture cleanup failed; a process may have outlived the test")
+        self.assertTrue(self.fixture.doCleanups(), "a fixture cleanup failed:\n" + "\n".join(self.fixture.cleanup_failures))
 
     def start(self, *arguments: str) -> subprocess.Popen[str]:
         process = self.fixture.start_verify(*arguments)

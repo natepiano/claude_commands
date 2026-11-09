@@ -154,19 +154,63 @@ These all use this path: effort changes (`unit_effort.py`), promotion, relays an
 
 ### Worker questions
 
+A worker puts its question in its reply and ends the turn.
+The turn hook sends that reply to the director.
+An unexpected screen prompt ends no turn, and the director finds it only when it reads the pane.
+
 `worker.py assign` returns exit 4 when a worker asks a question or is blocked, including before dispatch submission.
 It prints `question: <worker> pane <pane>` and the pane's recent visible lines.
 Exit 6 means busy before submission.
 
 1. Read the question text after the `question:` line.
 2. Run `worker.py answer <name> --text "<answer>"` from the director's session.
-3. Rerun that worker's saved `launcher_command` from `<run>/progress_history_state.json`.
+3. End the director turn until the completion hook sends its next message.
 
 A blocked Codex worker receives `shift+left`, the answer through `pane send-text`, and two `enter` keys.
 Herdr checks the target before each key.
 Idle workers and blocked Claude workers use `agent prompt`.
 The command refuses workers held by another parent.
-The saved launcher reads the transcript and waits for `DONE <dispatch id>` without submitting the dispatch again.
+A repeated saved launcher reads the transcript and returns without another submission.
+For a completed dispatch, each explicit rerun sends one completion notice through the shared hook code.
+Each completion notice ends its first line with `; pass <dispatch instance id>`.
+An explicit rerun repeats the saved completion text with the same pass id.
+This rule also applies to a completed managed Astra review.
+The saved completion preserves the reason and pane for a close anomaly.
+A successful completed rerun sets its status file to `done` after it sends the notice.
+Each notice names the worker and uses its native identity, including reruns from the director.
+The saved completion supplies the sender identity for a retired managed Astra reviewer.
+The sender identity remains the same after a session change and retirement.
+Turn and run events send one notice when the outcome, reply, or run ids change.
+An unchanged outcome, reply, and run ids send no notice.
+Waiting notices add `; runs <run ids>` to the first line.
+The run ids include received results that still await a worker reply.
+An empty turn reply writes no reply file and adds no `; reply <path>` text.
+Run events retain the last worker reply while a result awaits a reply.
+`reap_orphans` retries a pending completion only after its supervisor is gone.
+A live run reports `waiting on runs`, including when an earlier result awaits a reply.
+A turn without DONE sends one `no DONE` notice when no pending work explains it.
+The notice includes the worker's last reply and leaves the pass active.
+Named adversary and contract reviews record `done` through the same hook.
+The hook also saves an assigned style review result.
+Each ignored event appends one JSON line to `$XDG_STATE_HOME/herdr/turn-end-ignored.jsonl`.
+The default path is `~/.local/state/herdr/turn-end-ignored.jsonl`.
+Each line records the time, exit reason, event kind, thread id, and worker name when known.
+This diagnostic changes no outcome and sends no notice.
+A refused launcher retry retains the existing pass and its run, including a run with one worker.
+A later DONE reply corrects a launcher error for the same pass and permits pane closure.
+The review trial uses the latest completion duration for each pass.
+The hook follows the worker's link to its existing pass state, including runs outside the run root.
+Exit 0 means submitted. The turn hook records completion and sends the director its reply path.
+
+Pane starts record the account folder in the staff row's `home` through `staff.set_home`.
+Account moves and restarts use the same pane publication call.
+A pane launch retains `config_dir` only when the session has no staff row.
+`pane_launch.config_home` reads a staffed session's `home` or the unstaffed launch's `config_dir`.
+`stop_resume.py` uses this reader for retained accounts.
+The launch environment carries the selected target account until the start hook publishes its home.
+`add_unit.ensure_staff_unit` calls `pane_launch.staff_admitted` after unit admission.
+Worker pane admission and `staff_sources.ensure_staff_showrunner` use the same completion call.
+These calls complete a pane publication that preceded its staff row.
 
 ### Matching a running session to its staff row
 
@@ -180,6 +224,9 @@ The saved launcher reads the transcript and waits for `DONE <dispatch id>` witho
 
 Claude processes use their Claude session id.
 Codex processes use their Codex thread id.
+A fresh Codex uses its pane session report before it has a resume argument.
+The identity reader excludes only `scripts/herdr/turn_end.py` from the foreground process count.
+Every other foreground process prevents the pane report from proving a sole Codex process.
 Copied `STAFF_ID` values, folders, names, and retired pane marks do not select rows.
 `RecordedLabels.resolve` and `StaffLabels.environment` remove retired identity from the environment.
 `session_staff.LaunchMembership` resolves a saved staff reference to the current native runtime id.
@@ -247,7 +294,7 @@ The command waits for the showrunner's registration before it attaches the child
   - A legacy tmux host restarts into `SharedHerdrTab`, with no window step.
   - Ghostty and Zed hosts, and a Mac `terminal` host, restart into `SharedHerdrTab`. For a Ghostty or Mac `terminal` host, a live supervisor then runs `herdr session attach <shared>` in the same window; a Zed host, or one whose supervisor is gone, gets a new window unless a client is already attached.
 - **`_herdr_launch` steps.**
-  1. Build the environment: a `MoveResumeAccount` takes `prepared_account(target, resume=True)` and refuses `AccountRefused`; a retained account takes `named_account_environment(config_dir)`.
+  1. Build the environment: a `MoveResumeAccount` takes `prepared_account(target, resume=True)` and refuses `AccountRefused`; a retained account uses the home from `pane_launch.config_home`.
   2. Write Claude folder trust in the target account before starting Claude. A failed write prints one anomaly and prevents the start.
   3. Call `restore_server(name, 90_000, session_kind=...)`.
   4. Refuse when `server_environment` holds `CLAUDE_CODE_OAUTH_TOKEN` or a `prepared.remove` name.
@@ -286,11 +333,14 @@ Use these fixture rules on Linux and macOS:
 - Build a herdr client only in `setUp`, never as a class attribute: the class body runs at import, before any patched environment. The run-wide `HERDR_BIN` hides such a lookup, so check a new fixture once with an empty `PATH` and no `HERDR_BIN`.
 - Pin the local machine in each fixture that stores staff locations on `natedev`. `HERDR_PLATFORM=linux` selects herdr process evidence, not the staff machine. A subprocess launcher uses `add_unit_test_support.LINUX_LAUNCHER_CLI`. A direct call patches the name the module imported, such as `add_showrunner.local_machine`.
 
-Run these suites on the Mac with a scratch home. Run the command from the root of a copy of the tree under test, not from the Mac's live `~/.claude`, which holds main. Remove the scratch home when the run ends:
+Run these suites on the Mac with a temporary home.
+Run the command from the root of a copy of the tree under test.
+The block removes the temporary home when the tests end:
 
 ```sh
 (
-  test_home=$(mktemp -d) || exit
+  set -e
+  test_home=$(mktemp -d)
   trap 'rm -rf "$test_home"' EXIT
   env -u CLAUDE_CONFIG_DIR -u CLAUDE_CODE_OAUTH_TOKEN -u CODEX_HOME \
     HOME="$test_home" TMPDIR=/private/tmp HERDR_BIN=/nonexistent/herdr \
@@ -312,27 +362,36 @@ Run these suites on the Mac with a scratch home. Run the command from the root o
 - Trust counts only on an exact key: the folder, its toplevel, or its main checkout. An accepted ancestor folder never counts.
 - The trust survey prints only the key, accepted and kind fields of `.claude.json`, never any other field.
 - One prompt per launch, never sent twice. `agent start` carries no prompt; the opening prompt goes through `agent prompt` once the agent is ready. Callers choose `OpeningPrompt` or `NoOpeningPrompt` explicitly.
-- Prompt input requires an agent status of `working`, `idle`, or `done` and an empty visible composer. An absent `interactive_ready` permits input. A boolean value controls input. A non-boolean value prints one readiness anomaly and prevents input. No Remote Control turn is required. A matching new user turn in the destination transcript proves submission. An unreadable transcript prevents a retry. Both `idle` and `done` permit retyping after the settle time.
+- Prompt input requires an agent status of `working`, `idle`, or `done` and an empty visible composer. An absent `interactive_ready` permits input. A boolean value controls input. A non-boolean value prints one readiness anomaly and prevents input. No Remote Control turn is required. Successful worker prompt delivery returns the launcher before the transcript must contain the prompt. A matching transcript prompt prevents replay. A matching final transcript reply proves completion. With a matching transcript prompt, the hook can use its own DONE reply before the final transcript record appears. A live detached run still holds completion. A failed delivery command returns an error. An unreadable transcript prevents a retry. Both `idle` and `done` permit retyping after the settle time.
 - Each composer read uses `pane read --source visible --format ansi` and removes faint text. SGR 2 starts faint text. SGR 22 or 0 ends faint text. The parser skips colour arguments for SGR 38, 48, and 58. A faint hint can appear in an empty composer.
 
-Worker dispatch sends its prompt once with `agent prompt --wait`.
-If herdr reports `agent_prompt_stalled`, dispatch waits for working, blocked, or done.
-`WORKER_PROMPT_START_SECONDS` sets this start window to 60 seconds by default.
-A start timeout returns exit 5.
+The turn hook closes a completed pane at once after DONE.
+The close retains the staff row and conversation.
+The next assign resumes the conversation in a new pane.
+The close reads no agent state, dispatch state, transcript, detached run, or foreground activity to permit closure.
+It sends no graceful quit and calls no process check before closure.
 
-The launcher records a completed pass, ends the worker's agent, and closes its pane.
-The close retains the staff row and native conversation.
-The next assign resumes that conversation in a new pane.
-Restore reopens only workers with active dispatches. Idle workers stay closed until their next assign.
+The close keeps these identity and completion rules:
+
+1. Match the pane's terminal id to the terminal from the evidence read.
+2. Exclude a labelled pane that another staff session owns.
+3. Acquire the worker lock with blocking enabled.
+4. Confirm removal with `_pane_closed`; report "pane close is incomplete" if the pane remains.
+
+A labelled pane in the parent's tab is a stopped worker when no other staff session owns it.
+Its foreground process does not change that state.
+A stopped worker resumes in its existing pane without a foreground activity read.
+A failed family change closes a new destination pane after it stops the agent.
+Restore resumes only workers with active dispatches.
+Idle workers remain closed until their next assign.
 Shutdown restart uses the shared worker restore.
-Pane worker account moves use the shared stop, resume, and prompt APIs.
-Account moves resume only workers with active dispatches; each move closes an idle worker's pane.
-An idle worker's next assign opens its conversation on the current role account.
-A worker pane closes when its agent command returns. The staff row and native conversation remain.
-A resumed worker opens in a new pane after an assign, restore, or account move.
-Unit sessions and side panes keep their shells when their agents end.
-A busy worker receives one prompt to continue the same pass. An idle worker receives no prompt.
+Account moves stop and resume open workers in the same pane, including workers without active dispatches.
+An account move closes no worker pane and runs no close check.
+A closed worker without an active dispatch has nothing to move.
+A busy worker receives one prompt to continue the same pass.
+An idle worker receives no prompt.
 The resume message builder retains the launcher prompt path for restored workers.
+Every pane keeps its shell when its agent ends.
 
 - `start_agent` gets the agent's arguments only, never the binary. Every herdr launcher builds from structured parts (`ResumeParts`, argument lists), never a shell string.
 - One herdr session, `agents` (user, 2026-10-26). Every launcher opens a tab there with `start_server(shared_session())` and `open_tab`. Probes and live checks run as tabs there too, never in a server of their own. `_require_shared` refuses a server start under any other name, and `test_one_session.py` fails on code that starts one or tells the user to attach to one.
@@ -421,6 +480,7 @@ The resume message builder retains the launcher prompt path for restored workers
 ## Ruled out
 
 - The earlier worker trial used headless Codex threads. Current workers use staff membership and interactive panes.
+- Shell waits for pane workers. Launch-line Codex notify and Claude Stop hooks now report turn results.
 - Installing herdr's Claude integration. It writes `~/.claude` hooks and settings that every session loads.
 - Ancestor folder keys as trust, and a trusted default start folder. Nothing records which folder the user last worked in, and a session opened somewhere unasked is worse than one prompt.
 - A separate Codex trust check during crash restore. Restore resumes the saved conversation in its recorded folder.
@@ -438,7 +498,7 @@ The resume message builder retains the launcher prompt path for restored workers
 ## Why
 
 - **One herdr session, one tab per Claude session (user, 2026-10-26).** One attach shows every session, with one workspace per production. `attach <tab>` and `attach-remote` focus the named tab first, so an attach still opens the session the user names. A tab has its session's name, so `list` and attach lines need no lookup table. A stop closes one tab and changes nothing else in the session.
-- **Codex workers stay headless.** App-server threads ask for no trust and already report through the worker ledger. Only Claude sessions, which the user watches, need a terminal.
+- **Native pane workers report through hooks.** Assignment returns after submission. The hook completes the pass and resumes the director with one message.
 - **Launches write trust.** The shared writer grants the exact repository key before Claude starts. A failed write prints one anomaly and prevents the start.
 - **Unique tab names.** A tab name is a session name, so two sessions must never share one. A taken `--name` refuses, and a generated name moves to the next suffix. Every launcher adopts the one shared server, so only the tab name must be unique.
 - **Socket ownership as identity.** Argv and `HERDR_SESSION` both mislead (attach-started servers, inherited variables). The process holding the listening socket cannot.

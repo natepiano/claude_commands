@@ -1,2 +1,2 @@
 Cloud · 1 of 1 slots
-   cloud-unit · merge gate · running · 7 of 12 modules · 32 vCPUs · elapsed 4 min · 1 failed module · no update for 2 minutes
+   cloud-unit · merge gate · running · 7 of 12 modules · 32 vCPUs · elapsed 4 min · 1 failed module · no update for 2 min

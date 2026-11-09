@@ -133,14 +133,16 @@ td small { color: var(--ink-3); }
 h3 { margin: 12px 0 4px; font-size: 0.88rem; font-weight: 600; }
 .swaprows { display: grid; grid-template-columns: minmax(0, max-content) max-content minmax(0, 1fr); gap: 2px 8px; }
 .swaprows .row { display: grid; grid-template-columns: subgrid; grid-column: 1 / -1; align-items: baseline; padding: 3px 0; border-radius: 6px; cursor: help; font-size: 0.88rem; }
+.swaprows .row.smaller .name { overflow: visible; white-space: normal; }
+.swaprows .row.smaller summary { padding: 0; }
+.swap-members { white-space: normal; overflow-wrap: anywhere; color: var(--ink-2); }
+.swaprows .row.total { border-top: 1px solid var(--line); margin-top: 4px; font-weight: 600; }
 .swaprows .row:hover { background: var(--free); }
 .swaprows .row .name { max-width: min(20rem, 42vw); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .swaprows .row small { color: var(--ink-2); font-size: inherit; min-width: 0; overflow-wrap: anywhere; }
 .swaprows .row .v { font-variant-numeric: tabular-nums; font-weight: 600; white-space: nowrap; }
 .error { color: var(--cap); font-weight: 600; }
 .walk-head { display: flex; align-items: baseline; gap: 12px; margin-bottom: 8px; }
-.cloud-row { min-width: 0; padding: 10px 0; border-bottom: 1px solid var(--line); font-size: 0.88rem; line-height: 1.5; overflow-wrap: anywhere; }
-.cloud-row:last-child { border-bottom: 0; }
 .walk-sum { margin-left: auto; color: var(--ink-2); font-size: 0.86rem; }
 .walk { position: relative; display: grid; grid-template-columns: minmax(0, 1fr); gap: 10px; }
 .walk-chart { margin-right: var(--details); }
@@ -154,6 +156,8 @@ h3 { margin: 12px 0 4px; font-size: 0.88rem; font-weight: 600; }
 .row-label .name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .row-label .owner { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--ink-2); font-size: 0.75rem; }
 .row-memory { min-width: 0; }
+.cloud-status .track { height: auto; min-height: 18px; overflow: visible; overflow-wrap: anywhere; line-height: 1.3; }
+.cloud-status .cap { color: var(--cap); }
 .amounts { position: relative; height: 16px; margin-top: 2px; color: var(--ink-2); font-size: 0.7rem; line-height: 14px; font-variant-numeric: tabular-nums; }
 .bar-amount { position: absolute; white-space: nowrap; cursor: help; }
 .wrow.room .row-heading { font-size: 0.75rem; gap: 8px; justify-content: space-between; }
@@ -173,7 +177,8 @@ h3 { margin: 12px 0 4px; font-size: 0.88rem; font-weight: 600; }
 .walk-table tbody th { color: inherit; font-weight: 400; }
 .walk-table .duration { width: var(--duration); min-width: var(--duration); }
 .walk-table .machine { width: var(--machine); min-width: var(--machine); }
-.walk-table .duration, .walk-table .pid { font-variant-numeric: tabular-nums; }
+.walk-table .duration, .walk-table .pid, .walk-table .vcpus { font-variant-numeric: tabular-nums; }
+.walk-table .duration, .walk-table .pid, .walk-table .vcpus { text-align: right; }
 .walk-table .cell-text { display: block; max-width: 8rem; overflow: hidden; text-overflow: ellipsis; }
 .walk.beside .walk-table { position: absolute; top: 0; left: var(--table-left); }
 .walk.beside .wrow.room, .walk.beside .wrow.wait-first,
@@ -184,6 +189,7 @@ h3 { margin: 12px 0 4px; font-size: 0.88rem; font-weight: 600; }
 }
 .walk.beside .wrow.room::before, .walk.beside .wrow.wait-first::before { top: var(--divider-top, 0px); }
 .walk.stacked .step { display: table-cell; }
+.walk.stacked .walk-table { width: 100%; overflow-x: auto; }
 .walk.stacked .walk-table .cell-text { max-width: min(6rem, var(--table-label, 6rem)); }
 .walk.measuring .step { display: none; }
 .walk.measuring .walk-table .cell-text { max-width: 8rem; }
@@ -254,6 +260,7 @@ body.queue-unavailable .status, body.queue-unavailable .card { display: none; }
 </head>
 <body>
 <main>
+  <p class="error" id="mac-idle-alert" role="status" hidden></p>
   <h1>Build memory on natedev</h1>
   <div class="queue-error" id="queue-error" role="status"></div>
   <div class="status"><div class="status-content"><span class="dot" id="dot"></span><span id="status">Reading…</span><a class="pill" id="pill" href="#swap" data-tip="pill"><span class="pd"></span><span id="pill-t">pressure –</span></a></div></div>
@@ -307,13 +314,10 @@ body.queue-unavailable .status, body.queue-unavailable .card { display: none; }
   <section class="card">
     <div class="walk-head"><span class="section-head" data-tip="walkhead">Running, in start order</span><span class="walk-sum num" id="walk-sum" data-tip="walksum"></span></div>
     <div class="walk" id="walk"></div>
+    <p class="report-window" id="priority-line"></p>
+    <p class="report-window" id="head-line"></p>
     <p class="pressure-reason" id="cap-reason"></p>
     <div class="wait-reasons" id="wait-reasons"></div>
-  </section>
-
-  <section class="card" id="cloud" hidden>
-    <div class="walk-head"><span class="section-head" id="cloud-heading"></span></div>
-    <div id="cloud-rows"></div>
   </section>
 
   <section class="card" id="leftovers" hidden>
@@ -399,7 +403,7 @@ function rowUnit(row) {
   return row.ci ? visibleDetail(row) : /\.(slice|service)\b/.test(row.unit || "") ? row.name : row.unit || "";
 }
 function rowOwner(row, waiting = false) {
-  if (!waiting && (!row.queued || row.name === "between steps")) {
+  if (row.kind !== "cloud" && !waiting && (!row.queued || row.between_steps)) {
     return visibleDetail(row);
   }
   const owner = publicText(row.showrunner || "");
@@ -413,6 +417,10 @@ function rowMemory(tip, bars = "") {
   return `<div class="row-memory" data-tip="${tip}"><div class="track" data-tip="${tip}">${bars}</div>` +
     `<div class="amounts"></div></div>`;
 }
+function cloudStatus(row) {
+  return `<div class="row-memory cloud-status"><div class="track">${esc(row.status)}` +
+    (row.stale ? ` · <span class="cap">no update for ${esc(row.late_age)}</span>` : "") + `</div><div class="amounts"></div></div>`;
+}
 function progressTip(row) {
   const progress = row.progress;
   if (!progress || progress.kind !== "RowProgress") return "";
@@ -423,11 +431,12 @@ function rawTipText(key, d) {
   const [kind, i] = key.split(":");
   if (kind === "swap") {
     const r = d.swap_by[+i];
-    return r ? [`${r.name} · ${f1(r.swap)} GiB in swap`, `${r.detail}. Pages of this group that the system moved to disk. The queue does not count swap as build memory.`] : ["", ""];
+    return r ? [`${r.name} · ${f1(r.swap)} GiB in swap`, `${r.bytes} B. ${r.detail}. Pages of this group that the system moved to disk. The queue does not count swap as build memory.`] : ["", ""];
   }
   if (kind === "row") {
     const r = d.walk[+i];
     if (!r) return ["", ""];
+    if (r.kind === "cloud") return [`${r.name} · ${rowOwner(r)}`, `${r.status}. Machine: aws. No local memory reservation.`];
     if (r.ci) return [`${r.name} · ${rowOwner(r)} · ${r.detail}`, [r.unit, r.keep_text].filter(Boolean).join("\n") + progressTip(r)];
     const when = r.started_at ? `Started ${ago(r.started_at, d.read_at)} ago. ` : "";
     const res = !recorded(r.used) ? `Run use unavailable: ${r.used.reason}. Reserved ${f1(r.reserved)} GiB.` : r.reserved > 0 ? `It uses ${f1(r.used)} GiB. It reserves ${f1(r.reserved)} GiB. The queue counts ${f1(r.counted)} GiB.` : `It uses ${f1(r.used)} GiB. It reserves no memory.`;
@@ -442,6 +451,7 @@ function rawTipText(key, d) {
   if (kind === "wait") {
     const w = d.waiters[+i];
     if (!w) return ["", ""];
+    if (w.kind === "cloud") return [`Waits · ${w.name} · ${rowOwner(w, true)}`, `${w.reason}. No local memory reservation.`];
     return [`Waits · ${w.name} · ${rowOwner(w, true)}`, `Needs ${f1(w.need)} GiB. Waiting for ${ago(w.since, d.read_at)}. Reason: ${w.reason}.`];
   }
   return TIPS[key](d);
@@ -517,6 +527,8 @@ function render(d) {
     recordReadFailure("The queue did not answer.");
     return;
   }
+  $("mac-idle-alert").textContent = d.mac_idle_alert;
+  $("mac-idle-alert").hidden = !d.mac_idle_alert;
   $("room-equation").textContent = roomEquation(d);
   document.body.classList.remove("queue-unavailable");
   const t = d.total;
@@ -555,20 +567,23 @@ function render(d) {
 
 
   renderWalk(d);
-  renderCloud(d);
   renderSwap(d);
   renderLeftovers(d);
   renderReport(d.report);
 }
 
-function renderCloud(d) {
-  const rows = d.cloud || [];
-  $("cloud").hidden = rows.length === 0;
-  $("cloud-heading").textContent = d.cloud_heading || "";
-  $("cloud-rows").innerHTML = rows.map(text => `<div class="cloud-row">${esc(text)}</div>`).join("");
+function swapAmount(bytes) {
+  const amount = Math.abs(bytes);
+  if (amount >= 1024 ** 3) return `${f1(bytes / 1024 ** 3)} GiB`;
+  if (amount >= 1024 ** 2) return `${f1(bytes / 1024 ** 2)} MiB`;
+  if (amount >= 1024) return `${f1(bytes / 1024)} KiB`;
+  return `${bytes} B`;
 }
-
+const swapView = new Map();
 function renderSwap(d) {
+  for (const details of document.querySelectorAll("#swaprows details")) {
+    swapView.set(details.dataset.ownerKey, details.open);
+  }
   const lv = level(d);
   $("pill").className = `pill ${lv}`;
   $("pill-t").textContent = ({ ok: "no memory pressure", warn: "memory pressure near limit", hold: "pressure: queue holds", neutral: "stall not recorded" })[lv];
@@ -585,14 +600,11 @@ function renderSwap(d) {
     $(`limit-${k}`).textContent = `Queue holds at ${lim}%`;
   }
   placeLimitLabels();
-  const sorted = d.swap_by.map((row, index) => ({row, index}))
-    .filter(({row}) => Math.round(row.swap * 1024) > 0)
-    .sort((a, b) => b.row.swap - a.row.swap);
-  const visible = sorted.slice(0, d.swap_rows);
-  const rest = sorted.slice(visible.length);
-  $("swaprows").innerHTML = visible
-    .map(({row: r, index: i}) => `<div class="row" data-tip="swap:${i}"><span class="name">${esc(publicText(r.name))}</span><span class="v">${memoryAmount(r.swap)}</span><small>${esc(visibleDetail(r))}</small></div>`).join("") +
-    (rest.length ? `<div class="row"><span class="name">${rest.length} smaller groups</span><span class="v">${memoryAmount(rest.reduce((sum, item) => sum + item.row.swap, 0))}</span></div>` : "");
+  $("swaprows").innerHTML = d.swap_by.map((row, index) =>
+    `<div class="row ${row.kind}" data-tip="swap:${index}" data-bytes="${row.bytes}"><span class="name">${row.kind === "smaller" ? `<details data-owner-key="${esc(row.kind)}"><summary><span class="chev">▶</span>${esc(row.name)}</summary><div class="swap-members">${row.detail.split("; ").map(part => `<div>${esc(part)}</div>`).join("")}</div></details>` : esc(row.name)}</span><span class="v">${swapAmount(row.bytes)}</span><small>${row.kind === "smaller" ? "" : esc(visibleDetail(row))}</small></div>`).join("");
+  for (const details of document.querySelectorAll("#swaprows details")) {
+    details.open = swapView.get(details.dataset.ownerKey) === true;
+  }
 }
 
 function renderLeftovers(d) {
@@ -733,23 +745,27 @@ function renderWalk(d) {
   const scale = d.total;
   const pct = (v) => `${v / scale * 100}%`;
   const tableRows = [];
-  const cells = (name, duration, machine, unit, pid, tip, className = "") => {
-    tableRows.push(`<tr class="${className}" data-tip="${tip}"><th scope="row" class="step"><span class="cell-text">${esc(name)}</span></th>` +
-      `<td class="duration">${esc(duration || "—")}</td><td class="machine">${esc(machine || "—")}</td><td class="unit"><span class="cell-text">${esc(publicText(unit || ""))}</span></td>` +
+  const cells = (place, name, duration, machine, vcpus, unit, pid, tip, className = "") => {
+    tableRows.push(`<tr class="${className}" data-tip="${tip}"><td class="place">${esc(place)}</td><th scope="row" class="step"><span class="cell-text">${esc(name)}</span></th>` +
+      `<td class="duration">${esc(duration || "—")}</td><td class="machine">${esc(machine || (className.startsWith("wait") ? "" : "—"))}</td><td class="vcpus">${typeof vcpus === "number" ? vcpus : className.startsWith("wait") ? "" : "—"}</td><td class="unit"><span class="cell-text">${esc(publicText(unit || ""))}</span></td>` +
       `<td class="pid">${typeof pid === "number" ? pid : "—"}</td></tr>`);
   };
   const running = d.walk.map((row, index) => ({row, index}));
-  const ordered = [...running.filter(({row}) => row.queued && !row.ci), ...running.filter(({row}) => row.ci)];
+  const ordered = [...running.filter(({row}) => row.kind === "cloud" || row.queued && !row.ci), ...running.filter(({row}) => row.ci)];
   const rows = ordered.map(({row: r, index: i}) => {
     const idleCI = r.ci && visibleDetail(r) === "idle";
-    cells(r.name, idleCI ? "" : r.started_at ? ago(r.started_at, d.read_at) : r.state || "", r.machine, idleCI ? "" : rowUnit(r), r.pid, `row:${i}`);
-    return `<div class="wrow" data-tip="row:${i}" data-run="${i}">${rowLabel(r.name, r.ci ? "" : rowOwner(r))}` + rowMemory(`row:${i}`) + `</div>`;
+    cells("run", r.name, idleCI ? "" : r.started_at ? ago(r.started_at, d.read_at) : r.state || "", r.machine, r.vcpus, idleCI ? "" : rowUnit(r), r.pid, `row:${i}`);
+    return `<div class="wrow${r.kind === "cloud" ? " cloud-work" : ""}" data-tip="row:${i}" data-run="${i}">${rowLabel(r.name, r.ci ? "" : rowOwner(r))}` +
+      (r.kind === "cloud" ? cloudStatus(r) : rowMemory(`row:${i}`)) + `</div>`;
   });
-  cells("Next step room", "", "", "", null, "room", "room");
+  cells("", "Next step room", "", "", null, "", null, "room", "room");
   rows.push(`<div class="wrow room">${rowLabel("Next step room")}` + rowMemory("room") + `</div>`);
+  let localPosition = 0;
   d.waiters.forEach((w, i) => {
-    cells(w.name, `waits ${ago(w.since, d.read_at)}`, "", w.detail, w.pid, `wait:${i}`, `wait${i === 0 ? " wait-first" : ""}`);
-    rows.push(`<div class="wrow wait${i === 0 ? " wait-first" : ""}" data-tip="wait:${i}">${rowLabel(w.name, rowOwner(w, true))}` + rowMemory(`wait:${i}`) +
+    const place = w.kind === "cloud" ? "cloud" : String(++localPosition);
+    cells(place, w.name, `waits ${ago(w.since, d.read_at)}`, w.machine || "", null, w.detail, w.pid, `wait:${i}`, `wait${i === 0 ? " wait-first" : ""}`);
+    rows.push(`<div class="wrow wait${i === 0 ? " wait-first" : ""}${w.kind === "cloud" ? " cloud-work" : ""}" data-tip="wait:${i}">${rowLabel(w.name, rowOwner(w, true))}` +
+      (w.kind === "cloud" ? cloudStatus(w) : rowMemory(`wait:${i}`)) +
       `</div>`);
   });
   if (hasCap(d)) rows.push(`<div class="walk-bud" style="left:calc(var(--amt) + var(--gap) + (100% - var(--amt) - var(--gap)) * ${d.cap / scale})"></div>`);
@@ -757,7 +773,7 @@ function renderWalk(d) {
   $("walk").innerHTML = `<div class="walk-chart"><div class="walk-chart-head"><span class="report-window">Used · reserved</span></div>${rows.join("")}` +
     `<div class="walk-axis num"><span></span><div class="ticks" id="ticks" data-tip="ticks"></div></div></div>` +
     `<div class="walk-table"><table aria-label="Running and waiting steps"><thead><tr>` +
-    `<th scope="col" class="step">Step</th><th scope="col" class="duration">Duration</th><th scope="col" class="machine">Machine</th><th scope="col" class="unit">Unit</th>` +
+    `<th scope="col" class="place">#</th><th scope="col" class="step">Step</th><th scope="col" class="duration">Duration</th><th scope="col" class="machine">Machine</th><th scope="col" class="vcpus">vCPU</th><th scope="col" class="unit">Unit</th>` +
     `<th scope="col" class="pid">Pid</th></tr></thead><tbody>${tableRows.join("")}</tbody></table></div>`;
   const step = 6;
   const ticks = [];
@@ -769,6 +785,8 @@ function renderWalk(d) {
   $("ticks").innerHTML = lowerTicks.join("");
   $("ticks-top").innerHTML = ticks.join("");
   $("walk-sum").textContent = !hasCap(d) ? `${f1(d.taken)} GiB taken · cap unavailable` : `${f1(d.taken)} of ${f1(d.cap)} GiB taken`;
+  $("priority-line").textContent = d.priority_text || "";
+  $("head-line").textContent = d.head_text || "";
   $("wait-reasons").innerHTML = d.waiters.map(waiter =>
     `<p class="wait-reason"><strong>${esc(waiter.name)}</strong> · ${esc(waiter.reason)}</p>`).join("");
   fitLabels();
@@ -828,9 +846,9 @@ function fitWalkDetails() {
   measureColumn("duration");
   measureColumn("machine");
   context.font = getComputedStyle(walk.querySelector(".amounts")).font;
-  const amountGroups = latest.walk.filter(row => row.queued || row.ci)
+  const amountGroups = latest.walk.filter(row => row.kind !== "cloud" && (row.queued || row.ci))
     .map(row => [useValue(row), row.ci ? latest.ci_kept : row.reserved].filter(value => value > 0));
-  amountGroups.push([latest.room], ...latest.waiters.map(row => [row.need]));
+  amountGroups.push([latest.room], ...latest.waiters.filter(row => row.kind !== "cloud").map(row => [row.need]));
   const amountWidth = Math.max(...amountGroups.map(values => values.reduce((sum, value) =>
     sum + context.measureText(memoryAmount(value)).width, 0) + LABEL_GAP * Math.max(0, values.length - 1)));
   const minimumTrackWidth = Math.max(MIN_TRACK_WIDTH, (amountWidth + LABEL_GAP + 1) / (capFraction || 1));
@@ -860,7 +878,7 @@ function fitWalkDetails() {
   measureColumn("duration");
   measureColumn("machine");
   if (!beside) {
-    const fixedWidth = ["duration", "machine", "pid"].reduce((width, name) =>
+    const fixedWidth = ["place", "duration", "machine", "vcpus", "pid"].reduce((width, name) =>
       width + table.querySelector(`th.${name}`).getBoundingClientRect().width, 0);
     const padding = ["step", "unit"].reduce((width, name) =>
       width + parseFloat(getComputedStyle(table.querySelector(`th.${name}`)).paddingRight), 0);
@@ -872,6 +890,14 @@ function fitWalkDetails() {
       ? walk.getBoundingClientRect().right - naturalWidth
       : range.left + range.width * capFraction + 0.5 + TABLE_CAP_GAP;
     walk.style.setProperty("--table-left", `${tableLeft - walk.getBoundingClientRect().left}px`);
+  }
+  for (const row of walk.querySelectorAll(".wrow.cloud-work")) {
+    const metadata = table.querySelector(`tr[data-tip="${row.dataset.tip}"]`);
+    row.style.minHeight = "";
+    metadata.style.height = "";
+    const height = Math.ceil(Math.max(row.getBoundingClientRect().height, metadata.getBoundingClientRect().height));
+    row.style.minHeight = `${height}px`;
+    metadata.style.height = `${height}px`;
   }
 }
 
@@ -912,6 +938,7 @@ function placeMemoryBars(d) {
   const reserveScale = d.shown_reserved > 0 ? reserved / d.shown_reserved : 0;
   for (const row of document.querySelectorAll(".wrow[data-run]")) {
     const index = Number(row.dataset.run), run = d.walk[index];
+    if (run.kind === "cloud") continue;
     let bars;
     const amounts = [];
     if (run.ci) {
@@ -949,6 +976,7 @@ function placeMemoryBars(d) {
   }
   for (const row of document.querySelectorAll(".wrow.wait")) {
     const waiter = d.waiters[Number(row.dataset.tip.split(":")[1])];
+    if (waiter.kind === "cloud") continue;
     const waitWidth = Math.min(end, waiter.need * unit);
     const waitAt = !hasCap(d) ? roomAt : end - waitWidth;
     const drawnWidth = !hasCap(d) ? Math.max(0, Math.min(waitWidth, end - waitAt)) : waitWidth;

@@ -8,7 +8,7 @@ Run `scripts/lib/py scripts/production/worker.py` from the unit's session.
 The caller's native identity selects the parent.
 Use the supplied arguments: `$ARGUMENTS`.
 
-1. Use `list [--json]` to show names, dispatch roles, worker states, and activity. Text rows start with row numbers.
+1. Use `list [--json] [--all]` to show worker rows. Text columns show number, name, role, account, Pane, and State. Closed panes show `-` for account and State. Uncertain panes show `unknown` and retain their reason. `--all` uses saved dispatches and shows `-` for Pane. JSON output stays unchanged.
 2. Use `add <role> [--name <name>] [--json]` to create a worker or reconcile named creation.
 3. Use `end <name>` to close a worker and remove its row after confirmed closure.
 4. Use `restore` to reopen only workers with active dispatches on their recorded native sessions.
@@ -38,11 +38,21 @@ When the stop budget is unusable, `worker.py end` prints the configuration refus
 The worker row stays.
 Correct the named configuration and run `end <name>` again.
 
-Exit codes: `0` complete, `1` check failure, `2` refusal, `3` missing `DONE`, `5` stalled, `7` kept, `8` uncertain.
-Exit 6 means busy before submission. Exit 4 means the worker asks a question or is blocked.
+For assignment, exit 0 means submitted. The pass and any held role stay active.
+The launcher returns at once. End the director turn after any assigned synchronous review.
+The turn hook saves the result, completes the pass, and sends the director its reply path.
+The hook closes the completed pane and keeps its native conversation.
+A live run or pending friend reply retains the same pass without another prompt.
+Other codes: `1` check failure, `2` refusal, `4` Codex question, `6` busy, `7` retained, `8` uncertain.
+Successful delivery returns the launcher before the transcript must contain the prompt.
+A failed delivery command returns an error.
+The transcript prevents replay and proves completion.
 
-1. Read `question: <worker> pane <pane>` and the question text.
-2. Run `worker.py answer <name> --text "<answer>"`.
-3. Rerun that worker's saved `launcher_command` from `<run>/progress_history_state.json`.
+A worker puts its question in its reply and ends the turn.
+An unexpected screen prompt ends no turn, and the director finds it only when it reads the pane.
 
-The rerun reads the transcript and waits for `DONE <dispatch id>` without submitting the dispatch again.
+1. Read the question in the worker reply.
+2. Answer with `worker.py answer <name> --text "<answer>"`.
+3. End the director turn until the next hook message.
+
+A repeated saved launcher reads the receipt and returns without another submission.

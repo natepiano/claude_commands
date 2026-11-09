@@ -16,9 +16,11 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 from types import FrameType
 from typing import Literal, cast, final
@@ -358,26 +360,29 @@ class GateWorker:
                 self.size_vcpus = int(ledger.text(arguments, 'InstanceType').split('.')[1].removesuffix('xlarge')) * 4
                 cloud_progress.publish(self.sidecar, cloud_progress.CloudProgress('setup', self.size_vcpus, 0, self.clock()))
                 while self.clock() < ledger.instant(request, 'expires'):
-                    bucket = ledger.text(deployment, 'bucket')
-                    if self.download(bucket, prefix + '/gate.log', folder / 'gate.log'):
-                        self.publish_log(folder)
-                    if self.download(bucket, prefix + '/boot-error.json', folder / 'boot-error.json'):
-                        raise ValueError(ledger.text(read(folder / 'boot-error.json'), 'error'))
-                    if self.download(bucket, prefix + '/result.json', folder / 'remote-result.json'):
-                        if not self.download(bucket, prefix + '/gate.log', folder / 'gate.log'):
-                            raise ValueError('The final log is absent')
-                        result = read(folder / 'remote-result.json')
-                        validate_result(result, request)
-                        row = result
-                        self.publish_log(folder)
-                        break
-                    state = self.api.observe(instance, int(self.clock())).state
-                    if state not in ('pending', 'running'):
-                        reply = self.api.call('describe-instances', '--instance-ids', instance)
-                        stopped = ledger.rows(ledger.rows(reply, 'Reservations')[0], 'Instances')[0]
-                        reason = ledger.mapping(stopped.get('StateReason', {}))
-                        detail = ': '.join(ledger.text(reason, key) for key in ('Code', 'Message') if reason.get(key))
-                        raise ValueError('The instance stopped without a final result' + (f' ({detail})' if detail else ''))
+                    try:
+                        bucket = ledger.text(deployment, 'bucket')
+                        if self.download(bucket, prefix + '/gate.log', folder / 'gate.log'):
+                            self.publish_log(folder)
+                        if self.download(bucket, prefix + '/boot-error.json', folder / 'boot-error.json'):
+                            raise ValueError(ledger.text(read(folder / 'boot-error.json'), 'error'))
+                        if self.download(bucket, prefix + '/result.json', folder / 'remote-result.json'):
+                            if not self.download(bucket, prefix + '/gate.log', folder / 'gate.log'):
+                                raise ValueError('The final log is absent')
+                            result = read(folder / 'remote-result.json')
+                            validate_result(result, request)
+                            row = result
+                            self.publish_log(folder)
+                            break
+                        state = self.api.observe(instance, int(self.clock())).state
+                        if state not in ('pending', 'running'):
+                            reply = self.api.call('describe-instances', '--instance-ids', instance)
+                            stopped = ledger.rows(ledger.rows(reply, 'Reservations')[0], 'Instances')[0]
+                            reason = ledger.mapping(stopped.get('StateReason', {}))
+                            detail = ': '.join(ledger.text(reason, key) for key in ('Code', 'Message') if reason.get(key))
+                            raise ValueError('The instance stopped without a final result' + (f' ({detail})' if detail else ''))
+                    except subprocess.TimeoutExpired:
+                        continue
                     self.pause(settings().number('result_poll_s'))
                 if not row:
                     raise ValueError('The instance expired without a final result')
@@ -433,34 +438,48 @@ def import_record(folder: Path, row: dict[str, object]) -> None:
     save(folder / 'imported.json', {'id': record['id']})
 
 
+def working_tree(repo: Path) -> tuple[str, set[str]]:
+    dirty = affected_modules.dirty_paths(repo)
+    if not dirty:
+        return gate.checked_git(repo, 'rev-parse', 'HEAD^{tree}'), dirty
+    with tempfile.TemporaryDirectory(prefix='cloud-gate-index-') as temporary:
+        index = Path(temporary) / 'index'
+        _ = shutil.copyfile(gate.checked_git(repo, 'rev-parse', '--path-format=absolute', '--git-path', 'index'), index)
+        environment = {**os.environ, 'GIT_INDEX_FILE': str(index)}
+        _ = subprocess.run(['git', 'add', '-A'], cwd=repo, env=environment, check=True, capture_output=True)
+        tree = subprocess.run(['git', 'write-tree'], cwd=repo, env=environment, check=True, capture_output=True, text=True)
+        return tree.stdout.strip(), dirty
+
+
 def prepare(repo: Path, folder: Path, mode: gate.SuiteMode, full: bool, limit: float) -> dict[str, object]:
-    commit = gate.checked_git(repo, 'rev-parse', 'HEAD')
-    tree = gate.checked_git(repo, 'rev-parse', 'HEAD^{tree}')
-    if affected_modules.dirty_paths(repo):
-        raise GateRefused('The cloud gate requires a clean tested tree')
+    head = gate.checked_git(repo, 'rev-parse', 'HEAD')
+    tree, dirty = working_tree(repo)
+    commit = gate.checked_git(repo, 'commit-tree', tree, '-p', head, '-m', 'Cloud gate snapshot') if dirty else head
     modules = discover_test_modules(repo)
     if mode is gate.SuiteMode.TARGETED_TEST and not full:
-        book = gate.PassedTreeLedger(repo, 'tests-only', gate.CleanTestTree(tree, commit), sorted({s for s, _ in modules}))
-        selection = affected_modules.select_affected(repo, book.certified_base(), [p for _, p in modules], set(), state_dir=gate.gate_state_dir())
+        tested_tree = gate.UnrecordableTestTree('checkout is dirty', tuple(sorted(dirty))) if dirty else gate.CleanTestTree(tree, head)
+        book = gate.PassedTreeLedger(repo, 'tests-only', tested_tree, sorted({s for s, _ in modules}))
+        selection = affected_modules.select_affected(repo, book.certified_base(), [p for _, p in modules], dirty, state_dir=gate.gate_state_dir())
         gate.report_selection(selection, len(modules))
         if isinstance(selection, affected_modules.AffectedSelection):
             modules = [(s, p) for s, p in modules if p in selection.modules]
-    refs = ['HEAD']
     origin_main = gate.checked_git(repo, 'rev-parse', 'refs/remotes/origin/main')
-    branch = gate.git(repo, 'symbolic-ref', '--quiet', 'HEAD').stdout.strip()
-    if branch:
-        refs.append(branch)
     origin = gate.checked_git(repo, 'remote', 'get-url', 'origin')
     from urllib.parse import urlsplit
     if urlsplit(origin).password or urlsplit(origin).query or ('://' in origin and urlsplit(origin).username):
         raise GateRefused('The origin URL must contain no credential')
     folder.mkdir(parents=True, exist_ok=True)
     source_key = ''
-    if int(gate.checked_git(repo, 'rev-list', '--count', 'HEAD', '--not', 'refs/remotes/origin/main')):
-        _ = gate.checked_git(repo, 'bundle', 'create', str(folder / 'source.bundle'), *refs, '--not', 'refs/remotes/origin/main')
+    if int(gate.checked_git(repo, 'rev-list', '--count', commit, '--not', 'refs/remotes/origin/main')):
+        ref = 'refs/cloud-gates/' + folder.name
+        _ = gate.checked_git(repo, 'update-ref', ref, commit)
+        try:
+            _ = gate.checked_git(repo, 'bundle', 'create', str(folder / 'source.bundle'), ref, '--not', 'refs/remotes/origin/main')
+        finally:
+            _ = gate.checked_git(repo, 'update-ref', '-d', ref)
         digest = sha256((folder / 'source.bundle').read_bytes()).hexdigest()
         source_key = 'source/' + digest + '.bundle'
-    request: dict[str, object] = {'attempt': folder.name, 'commit': commit, 'tree': tree, 'origin': origin,
+    request: dict[str, object] = {'attempt': folder.name, 'commit': commit, 'head': head, 'tree': tree, 'dirty_paths': sorted(dirty), 'origin': origin,
         'origin_main': origin_main, 'clone_url': settings().text('clone_url'),
         'mode': mode.value, 'modules': [str(p.relative_to(repo)) for _, p in modules], 'source_key': source_key,
         'expires': int(time.time()) + settings().whole('lifetime_minutes') * 60,
@@ -473,7 +492,8 @@ def run(repo: Path, *, mode: gate.SuiteMode, full: bool, module_time_limit_s: fl
         service: Callable[[Sequence[str]], int] = lambda command: subprocess.call(command)) -> LocalFallback | CloudCompleted:
     try:
         return run_cloud(repo, mode=mode, full=full, module_time_limit_s=module_time_limit_s, service=service)
-    except (OSError, ValueError, KeyError, TypeError, AwsUnavailable, subprocess.SubprocessError, GateRefused) as error:
+    except (OSError, ValueError, KeyError, TypeError, AwsUnavailable, subprocess.SubprocessError,
+            GateRefused, affected_modules.GraphError) as error:
         return LocalFallback(str(error))
 
 
@@ -489,7 +509,7 @@ def run_cloud(repo: Path, *, mode: gate.SuiteMode, full: bool, module_time_limit
     root = Path(gate.checked_git(repo, 'rev-parse', '--path-format=absolute', '--git-path', 'cloud-gates'))
     with control_lock(root):
         current = root / 'current.json'
-        tree = gate.checked_git(repo, 'rev-parse', 'HEAD^{tree}')
+        tree, _dirty = working_tree(repo)
         previous = read(current) if current.exists() else {}
         identity: dict[str, object] = {'tree': tree, 'commit': gate.checked_git(repo, 'rev-parse', 'HEAD'),
                                       'mode': mode.value, 'full': full, 'module_time_limit_s': module_time_limit_s}
@@ -535,7 +555,7 @@ def run_service(repo: Path, folder: Path, request: dict[str, object], command: S
         validate_result(row, request)
     except (ValueError, KeyError, TypeError) as error:
         return LocalFallback(str(error))
-    if gate.checked_git(repo, 'rev-parse', 'HEAD') != request['commit']:
+    if gate.checked_git(repo, 'rev-parse', 'HEAD') != request['head']:
         return LocalFallback('The checkout changed during the cloud attempt')
     import_record(folder, row)
     print((folder / 'gate.log').read_text(), end='', flush=True)
@@ -559,7 +579,13 @@ def main() -> int:
         configuration = conf.read('aws_target')
         api = AwsCli(configuration.text('credentials_profile'), configuration.text('region'), settings().number('api_timeout_s'))
         worker = GateWorker(api, ledger.CostLedger(directory), conf.path('aws_target'), cast(Path, args.sidecar))
-        save(folder / 'outcome.json', worker.execute(folder, read(folder / 'request.json'), read(folder / 'deployment.json')))
+        try:
+            outcome = worker.execute(folder, read(folder / 'request.json'), read(folder / 'deployment.json'))
+        except SystemExit:
+            save(folder / 'outcome.json', {
+                'status': 'fallback', 'reason': 'The worker stopped, so its instance was terminated'})
+            raise
+        save(folder / 'outcome.json', outcome)
     return 0
 
 

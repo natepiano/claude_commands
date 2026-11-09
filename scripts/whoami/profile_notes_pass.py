@@ -2,8 +2,7 @@
 """Profile the notes timer without changing notes, accounts or session state.
 
 Only the director runs this against a live HOME. Run from the timer's environment:
-  python3 scripts/whoami/profile_notes_pass.py --stats /tmp/claude/notes.prof \
-      --scratch /tmp/claude/notes-profile
+  python3 scripts/whoami/profile_notes_pass.py --stats /tmp/claude/notes.prof
 
 Action counters include zeroes. Read-only children run normally; only their first
 two command words appear in the report. Pass messages and child output stay private.
@@ -253,19 +252,6 @@ def state_copies(pass_: NotesPass) -> tuple[StateCopy, ...]:
         StateCopy(pass_.outage, "_path", state_path(pass_.outage, "_path", True), True),
         StateCopy(pass_.accounts, "login_renewals_file", state_path(pass_.accounts, "login_renewals_file", True), True),
     )
-
-
-SCRATCH_ROOT = Path("/tmp/claude")
-
-
-def private_scratch(directory: Path) -> Path:
-    resolved = directory.resolve()
-    root = SCRATCH_ROOT.resolve()
-    if not resolved.is_relative_to(root) or resolved == root:
-        raise ValueError("--scratch must be a private directory below /tmp/claude/")
-    resolved.mkdir(mode=0o700, parents=True, exist_ok=True)
-    # Each invocation gets fresh copies, even when two profiles share --scratch.
-    return Path(tempfile.mkdtemp(prefix="notes-pass-", dir=resolved))
 
 
 def copy_state(source: Path, destination: Path) -> None:
@@ -629,11 +615,12 @@ def readonly_child(words: tuple[str, ...]) -> bool:
         return False
 
 
-def profile_pass(stats: Path, scratch: Path, peer_python: Mapping[str, str] = NO_PEER_PYTHON) -> Measurements:
-    private = private_scratch(scratch)
+def profile_pass(stats: Path, peer_python: Mapping[str, str] = NO_PEER_PYTHON) -> Measurements:
     measurements = Measurements(peer_python=dict(peer_python))
     profiler = cProfile.Profile(timer=time.process_time)
     with ExitStack() as stack:
+        # Each pass gets fresh state copies, removed when the pass ends.
+        private = Path(stack.enter_context(tempfile.TemporaryDirectory(prefix="notes-pass-")))
         _ = stack.enter_context(patch.object(sys, "dont_write_bytecode", True))
         pass_ = load_pass()
         redirect_state(pass_, private, stack)
@@ -674,13 +661,12 @@ def profile_pass(stats: Path, scratch: Path, peer_python: Mapping[str, str] = NO
 def main(arguments: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     _ = parser.add_argument("--stats", required=True, type=Path)
-    _ = parser.add_argument("--scratch", required=True, type=Path)
     _ = parser.add_argument("--peer-python", action="append", default=[], metavar="HOST=/nix/store/.../bin/python3",
                             help="pin each peer interpreter; remote reads are refused without it")
     options = parser.parse_args(arguments)
     try:
         peers = dict(value.split("=", 1) for value in cast(list[str], options.peer_python))
-        _ = profile_pass(cast(Path, options.stats), cast(Path, options.scratch), peers)
+        _ = profile_pass(cast(Path, options.stats), peers)
     except (OSError, ValueError) as error:
         print(f"profile_notes_pass: {error}", file=sys.stderr)
         return 1

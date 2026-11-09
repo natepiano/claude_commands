@@ -31,7 +31,7 @@ class AssignClaudeLauncherWorkerTests(ClaudeLauncherFixture):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         current = self.recorded_worker(run)
         self.assertNotEqual(current.current_session, old.current_session)
-        self.assertEqual(current, replace(old, current_session=current.current_session))
+        self.assertEqual(current, replace(old, current_session=current.current_session, role=staff.KnownWorkerRole("impl")))
         rows = cast(list[dict[str, object]], json.loads((self.root / "staff-at-work.json").read_text()))
         self.assertIn(current.to_json(), rows)
         prompt = (self.root / "opening-message.txt").read_text()

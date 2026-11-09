@@ -29,12 +29,13 @@ from scripts.buildlog import treekey
 from scripts.direct import progress_history
 from scripts.lib import conf, unit_runs
 from scripts.lib.atomic_file import write_text_atomic
+from scripts.herdr import turn_end
 from scripts.herdr import test_worker_panes as pane_support
 from scripts.message import send
 from scripts.lib.test_hang_guard import LauncherHangGuard
 from scripts.lib.socket_test_support import short_socket_directory
 from scripts.message.repeat_guard_test_support import install_guard_test_budget
-from scripts.production import staff, session_staff, worker_admission
+from scripts.production import staff, session_staff, test_worker, worker_admission
 from scripts.production.staff_test_support import StaffTestCase, fixture_runtime_id, fixture_session
 
 WORKER = "unit-impl"
@@ -554,6 +555,34 @@ sys.exit(1)
         _ = another.write_text(path.read_text())
         self.assertFalse(detached_run_process.supervises(original["pid"], another))
         self.assertFalse(detached_run_process.supervises(os.getpid(), path))
+        alias = self.root / "record-alias.json"
+        alias.symlink_to(path)
+        for recorded in (alias, Path(os.path.relpath(path))):
+            with self.subTest(recorded=recorded):
+                with patch.object(detached_run_process, "process_args",
+                                  return_value=["python", "detached_runs.py", "supervise", str(recorded)]):
+                    self.assertTrue(detached_run_process.supervises(4321, path))
+        command = ["assign.py", "impl", "prompt with spaces"]
+        for arguments, matches in ((["python", "/fixture/assign.py", *command[1:]], True),
+                                   ([], False),
+                                   (["python", "/fixture/other.py", *command[1:]], False),
+                                   (["python", "/fixture/assign.py", "review", command[2]], False)):
+            with self.subTest(arguments=arguments):
+                with patch.object(detached_run_process, "process_args", return_value=arguments):
+                    self.assertEqual(detached_run_process.runs_command(4321, command), matches)
+        for argument in ("prompt with spaces", "prompt  with  spaces"):
+            with self.subTest(argument=argument):
+                output = subprocess.CompletedProcess(["ps"], 0, f"python /fixture/assign.py impl {argument}\n", "")
+                with (patch.object(Path, "exists", return_value=False),
+                      patch.object(subprocess, "run", return_value=output)):
+                    self.assertTrue(detached_run_process.runs_command(4321, ["assign.py", "impl", argument]))
+        record = self.root / "run folder/r1.json"
+        for tail, matches in (("", True), (" backup.json", False)):
+            with self.subTest(tail=tail):
+                output = subprocess.CompletedProcess(["ps"], 0, f"python detached_runs.py supervise {record}{tail}\n", "")
+                with (patch.object(Path, "exists", return_value=False),
+                      patch.object(subprocess, "run", return_value=output)):
+                    self.assertEqual(detached_run_process.supervises(4321, record), matches)
 
     def test_a_live_supervisor_is_not_ended(self) -> None:
         path = self.live_run(["bash", "verify.sh", "check"])
@@ -842,9 +871,9 @@ class PaneRunDeliveryTests(unittest.TestCase):
         _ = self.fixture.worker_run("a-first", "unit", self.fixture.parent.current_session,
                                 director_run=True)
         self.fixture.world.add(self.fixture.worker("test", family="codex"), "w1:p3", family="codex")
-        cases = (("detached-command-owner", "w1:p1", False), ("test2", "w1:p2", False),
-                 ("implicit-command-owner", "w1:p4", True))
-        for name, pane, implicit in cases:
+        cases = (("detached-command-owner", "w1:p1", False, False), ("test2", "w1:p2", False, False),
+                 ("implicit-command-owner", "w1:p4", True, False), ("completed-owner", "w1:p5", False, True))
+        for name, pane, implicit, completed in cases:
             with self.subTest(name=name, implicit=implicit):
                 row = self.fixture.worker(name, family="codex")
                 self.fixture.world.add(row, pane, family="codex")
@@ -887,6 +916,24 @@ class PaneRunDeliveryTests(unittest.TestCase):
                 self.assertIsInstance(active, progress_history.ActiveDispatch)
                 assert isinstance(active, progress_history.ActiveDispatch)
                 self.assertEqual(active.instance_id, dispatch_id)
+                if completed:
+                    agent = test_worker.DispatchAgent(self.fixture)
+                    agent.pane_commands(self)
+                    line = f"Read the unchanged prompt file {json.dumps(str(prompt))}. End your final reply with DONE {dispatch_id}."
+                    reply = self.fixture.root / "finished-reply.txt"
+                    progress_history.save_dispatch_delivery(self.run_dir, dispatch_id,
+                        progress_history.DispatchDelivery(line, dispatch_id, str(reply)))
+                    agent.append(pane, "user", line)
+                    agent.append(pane, "assistant", "The command is complete.\nDONE " + dispatch_id)
+                    self.fixture.world.locations[pane]["agent_status"] = "done"
+                    with patch.object(subprocess, "run", side_effect=agent.run), patch.dict(os.environ, {"BUILDLOG_SCOPE": "0"}):
+                        self.assertEqual(detached_runs.main(["supervise", str(path)]), 0)
+                    self.assertIsInstance(progress_history.active_dispatch(row.id, self.run_dir), progress_history.NoActiveDispatch)
+                    self.assertTrue(reply.read_text().endswith(f"DONE {dispatch_id}\n"))
+                    self.assertEqual(len(agent.notices), 1)
+                    self.assertIn("phase 40: done", agent.notices[0])
+                    self.assertIn(f"; pass {dispatch_id}", agent.notices[0])
+                    self.assertNotIn(pane, self.fixture.world.locations)
 
     def test_native_caller_ignores_inherited_session_and_run(self) -> None:
         row = self.fixture.worker(family="claude")
@@ -928,6 +975,41 @@ class PaneRunDeliveryTests(unittest.TestCase):
         self.assertEqual(len(self.notices), 1)
         self.assertIn("FAIL (exit 9)", self.notices[0][1])
         self.assertEqual(detached_runs.reap_orphans(str(self.run_dir)), [])
+
+    def test_a_failed_completion_event_keeps_other_orphans_and_retries_next_pass(self) -> None:
+        row = self.fixture.worker(family="codex")
+        records = [self.record(row, name) for name in ("first-result", "second-result")]
+        for record in records:
+            record["pid"] = DEAD_PID
+            record["command"] = ["echo", record["run_id"]]
+            write_text_atomic(Path(record["log"]).with_suffix(".json"), json.dumps(record))
+        complete = turn_end.run_finished
+        calls: list[str] = []
+
+        def fail_once(thread: str) -> None:
+            calls.append(thread)
+            if len(calls) == 1:
+                raise ValueError("director unavailable")
+            complete(thread)
+
+        with patch.object(turn_end, "run_finished", side_effect=fail_once), contextlib.redirect_stderr(io.StringIO()) as errors:
+            self.assertEqual(detached_runs.reap_orphans(str(self.run_dir)), ["first-result", "second-result"])
+            self.assertEqual(len(calls), 2)
+            self.assertEqual(errors.getvalue().count("anomaly:"), 1)
+            self.assertIn("director unavailable", errors.getvalue())
+            with patch.object(detached_run_process, "supervises", return_value=True) as supervises:
+                self.assertEqual(detached_runs.reap_orphans(str(self.run_dir)), [])
+                self.assertEqual(len(calls), 2)
+                supervises.assert_called_once_with(DEAD_PID, Path(records[0]["log"]).with_suffix(".json"))
+            self.assertEqual(detached_runs.reap_orphans(str(self.run_dir)), [])
+            self.assertEqual(len(calls), 3)
+            self.assertEqual(detached_runs.reap_orphans(str(self.run_dir)), [])
+            self.assertEqual(len(calls), 3)
+        self.assertEqual(len(self.notices), 2)
+        for record in records:
+            finished = cast(dict[str, object], json.loads(Path(record["log"]).with_suffix(".json").read_text()))
+            self.assertEqual(finished["status"], "finished")
+            self.assertFalse(finished["completion_pending"])
 
     def test_delayed_transcript_publication_retypes_without_a_receipt(self) -> None:
         row = self.fixture.worker(family="codex")

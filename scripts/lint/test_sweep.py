@@ -1695,6 +1695,15 @@ class FloorTests(SweepCase):
         self.assertTrue(all(protected not in text for text in holder_messages))
         self.assertTrue(protected_file.exists())
         self.assertTrue(busy_file.exists())
+        with (mock.patch.object(sweep, "process_uses", return_value={protected: use, busy: use}),
+              mock.patch.object(sweep, "send_floor_alert", return_value=DELIVERED_NATEDEV_ALERT),
+              mock.patch.object(sweep, "send_holder_message", return_value=DELIVERED_NATEDEV_ALERT),
+              mock.patch.object(sweep, "notify_floor_problem", wraps=sweep.notify_floor_problem) as notify):
+            status, _ = self.hold(base, 10 * GIB, [0], dry_run=False, recorded=False)
+        self.assertEqual(status, 0)
+        outcome = cast(sweep.FloorOutcome, notify.call_args.args[0])
+        self.assertCountEqual(outcome.held_targets, (protected, busy))
+        self.assertIn(protected, dict(outcome.protected))
 
     def test_unavailable_index_uses_saved_roots_after_the_checkout_is_gone(self) -> None:
         base = self.base()
@@ -3164,10 +3173,13 @@ class FloorTests(SweepCase):
                 fcntl.flock(holder, fcntl.LOCK_SH)
                 return result
             with (mock.patch.object(sweep, "scan_floor_roots", side_effect=start_after_scan),
-                  mock.patch.object(sweep, "send_floor_alert", return_value=DELIVERED_NATEDEV_ALERT)):
+                  mock.patch.object(sweep, "send_floor_alert", return_value=DELIVERED_NATEDEV_ALERT),
+                  mock.patch.object(sweep, "notify_floor_problem", wraps=sweep.notify_floor_problem) as notify):
                 status, text = self.hold(base, 10 * GIB, [10 * GIB - SIZE, 10 * GIB - SIZE], recorded=True)
             self.assertEqual(status, 0, text)
             self.assertTrue(output.exists())
+            outcome = cast(sweep.FloorOutcome, notify.call_args.args[0])
+            self.assertCountEqual(outcome.held_targets, (str(tree.parent),))
 
     def test_outside_link_leaves_floor_exhausted_and_sends_alert(self) -> None:
         base = self.base()
@@ -3831,7 +3843,9 @@ class FloorTests(SweepCase):
 
     def test_crossing_sends_both_channels_once_and_rearms_only_above_the_line(self) -> None:
         with self.crossing_delivery({}) as delivery:
-            for free, expected in ((200, 0), (140, 2), (130, 2), (150, 2), (140, 2), (151, 2), (140, 4)):
+            _ = write_config_fixture(conf.path("lint"), "sweep_phone_rearm_gib=5\n")
+            for free, expected in ((200, 0), (140, 2), (130, 2), (150, 2), (140, 2), (151, 2), (140, 2),
+                                   (155, 2), (140, 2), (160, 2), (140, 4)):
                 with self.subTest(free=free, expected=expected):
                     self.finalize_crossing(free)
                     self.assertEqual(len(delivery.attempts), expected)
@@ -3842,14 +3856,24 @@ class FloorTests(SweepCase):
 
     def test_crossing_retries_only_the_channel_without_a_receipt(self) -> None:
         for failed in ("user", "natedev"):
-            with self.subTest(failed=failed), self.crossing_delivery({failed: [3, 0]}) as delivery:
-                self.finalize_crossing(140)
-                self.assertEqual([attempt.recipient for attempt in delivery.attempts], ["natedev", "user"])
-                self.finalize_crossing(130)
-                self.assertEqual([attempt.recipient for attempt in delivery.attempts], ["natedev", "user", failed])
-                self.finalize_crossing(120)
-                self.assertEqual(len(delivery.attempts), 3)
-                self.assertEqual(sum(attempt.accepted for attempt in delivery.attempts), 2)
+            for margin_readings, retry_free in (((), 130), ((151, 150, 155), 140)):
+                with (self.subTest(failed=failed, margin_readings=margin_readings),
+                      self.crossing_delivery({failed: [3, 0]}) as delivery):
+                    _ = write_config_fixture(conf.path("lint"), "sweep_phone_rearm_gib=5\n")
+                    self.finalize_crossing(140)
+                    self.assertEqual([attempt.recipient for attempt in delivery.attempts], ["natedev", "user"])
+                    receipts = self.saved_receipts()
+                    for free in margin_readings:
+                        with self.subTest(free=free):
+                            self.finalize_crossing(free)
+                            self.assertEqual([attempt.recipient for attempt in delivery.attempts], ["natedev", "user"])
+                            self.assertEqual(self.saved_receipts(), receipts)
+                    self.finalize_crossing(retry_free)
+                    self.assertEqual([attempt.recipient for attempt in delivery.attempts], ["natedev", "user", failed])
+                    self.assertIn(f"{retry_free:.1f} GiB", delivery.attempts[-1].text)
+                    self.finalize_crossing(120)
+                    self.assertEqual(len(delivery.attempts), 3)
+                    self.assertEqual(sum(attempt.accepted for attempt in delivery.attempts), 2)
 
     def test_saved_crossing_receipts_suppress_sends_after_a_restart(self) -> None:
         run = subprocess.run
@@ -4040,32 +4064,116 @@ with mock.patch.object(sweep, "free_bytes", return_value=130 * sweep.GIB), mock.
                 self.assertEqual(message.splitlines(), lines)
 
     def test_crossing_recommends_one_measured_choice_that_frees_the_shortfall(self) -> None:
-        with self.crossing_delivery({}) as delivery:
-            measurement = sweep.AvailableDiskMeasurement(datetime.now(UTC), sweep.NoEarlierDiskMeasurement(), [
-                sweep.OutsideCacheDirectory("/tmp/claude/large/target", 180 * GIB, 0, sweep.NoLargestGrowingChild()),
-                sweep.OutsideCacheDirectory("/tmp/claude/small/target", 20 * GIB, 0, sweep.NoLargestGrowingChild()),
-            ], 0)
-            with (mock.patch.object(sweep, "read_disk_measurement", return_value=measurement),
-                  mock.patch.object(sweep, "folder_choices", wraps=sweep.folder_choices) as choices):
-                self.finalize_crossing(140, removed=2 * GIB)
-            choices.assert_called_once()
-            recommendation = ("Review /tmp/claude/large/target first (recommended): deleting it frees 180.0 GiB, "
-                              "which covers the 10.0 GiB shortfall.")
-            text = phone_text(delivery.attempts)
-            self.assertIn(recommendation, text)
-            self.assertNotIn("/tmp/claude/small/target", text)
-            self.assertIn("In the natedev Claude session, say which natedev folders to delete.", text)
-            message = delivery.attempts[0].text
-            lines = [
-                "Free disk space fell below the 150.0 GiB alert line. 140.0 GiB remains.",
-                "Cleanup removed 2.0 GiB.",
-                "/tmp/claude/large/target: holds 180.0 GiB. Deleting it removes its contents; their use is unknown.",
-                "/tmp/claude/small/target: holds 20.0 GiB. Deleting it removes its contents; their use is unknown.",
-                recommendation,
-                "Delete nothing: builds can fail when the disk is full.",
-                "natedev checks your choice before it deletes anything.",
-            ]
-            self.assertEqual(message.splitlines(), lines)
+        for machine, links in (("natedev", "none"), ("Mac", "none"),
+                               ("Mac", "external"), ("Mac", "internal"),
+                               ("Mac", "held-next"), ("Mac", "held-insufficient"),
+                               ("Mac", "held-only"), ("natedev", "held-next")):
+            with self.subTest(machine=machine, links=links), self.crossing_delivery({}) as delivery:
+                held_targets: tuple[str, ...] = ()
+                if machine == "Mac":
+                    root = delivery.base / "mac-folders"
+                    large = root / "large"
+                    small = root / "small"
+                    _ = write(large / "output", 64 * 1024 * 1024)
+                    _ = write(small / "output", 16 * 1024 * 1024)
+                    free = 150 * GIB - SIZE
+                    large_size, small_size = "0.1 GiB", "0.0 GiB"
+                    measurement = sweep.UnavailableDiskMeasurement("missing")
+                    if links == "external":
+                        os.link(large / "output", small / "shared-output")
+                        _ = write(large / "private-output", 32 * 1024 * 1024)
+                        free = 150 * GIB - 64 * 1024 * 1024
+                        large_size = "0.0 GiB"
+                    elif links == "internal":
+                        _ = write(large / "output", 96 * 1024 * 1024)
+                        (large / "deps").mkdir()
+                        os.link(large / "output", large / "deps" / "output")
+                        free = 150 * GIB - 96 * 1024 * 1024
+                    elif links == "held-insufficient":
+                        free = 120 * GIB
+                        large_size, small_size = "180.0 GiB", "20.0 GiB"
+                else:
+                    large = (delivery.base / "large" if links == "held-next"
+                             else Path("/tmp/claude/large/target"))
+                    small = (delivery.base / "small" if links == "held-next"
+                             else Path("/tmp/claude/small/target"))
+                    free = 140 * GIB
+                    large_size, small_size = "180.0 GiB", "20.0 GiB"
+                    measurement = sweep.AvailableDiskMeasurement(datetime.now(UTC), sweep.NoEarlierDiskMeasurement(), [
+                        sweep.OutsideCacheDirectory(str(large), 180 * GIB, 0, sweep.NoLargestGrowingChild()),
+                        sweep.OutsideCacheDirectory(str(small), 20 * GIB, 0, sweep.NoLargestGrowingChild()),
+                    ], 0)
+                if links.startswith("held-"):
+                    held_targets = (str(large / "target"),)
+                    if links == "held-only":
+                        held_targets += (str(small / "target"),)
+                mac_measurement = (mock.patch.object(sweep, "mac_folder_measurement", return_value=sweep.CurrentMacFolders((
+                    sweep.FolderChoice(str(large), 180 * GIB, sweep.FolderChoiceKind.OTHER),
+                    sweep.FolderChoice(str(small), 20 * GIB, sweep.FolderChoiceKind.OTHER),
+                ))) if links == "held-insufficient" else nullcontext())
+                with (mock.patch.object(sweep, "read_disk_measurement", return_value=measurement),
+                      mock.patch.object(sweep, "folder_choices", wraps=sweep.folder_choices) as choices,
+                      mac_measurement):
+                    if machine == "Mac":
+                        policy = sweep.MacFloor((str(large.parent),), floor_claims.LockedClaims(frozenset()),
+                                                large.parent / "mirror")
+                        with mock.patch.object(sweep, "free_bytes", return_value=free):
+                            sweep.notify_floor_problem(sweep.FloorOutcome(
+                                tmp_sweep.CompletedSweepAssessment(0), after=free, removed=2 * GIB,
+                                held_targets=held_targets),
+                                lint_settings=conf.read("lint"), policy=policy)
+                    elif held_targets:
+                        with mock.patch.object(sweep, "free_bytes", return_value=free):
+                            sweep.notify_floor_problem(sweep.FloorOutcome(
+                                tmp_sweep.CompletedSweepAssessment(0), after=free, removed=2 * GIB,
+                                held_targets=held_targets), lint_settings=conf.read("lint"))
+                    else:
+                        self.finalize_crossing(140, removed=2 * GIB)
+                choices.assert_called_once()
+                shortfall = sweep.gib(150 * GIB - free)
+                if links == "held-only":
+                    recommendation = ("Every measured folder holds output a build is using. "
+                                      "The sweep frees it when the build ends.")
+                elif links == "held-insufficient":
+                    recommendation = (f"The largest folder is {small} at {small_size}. "
+                                      + f"Deleting it frees only part of the {shortfall} shortfall.")
+                elif links == "held-next":
+                    recommendation = (f"Review {small} first (recommended): deleting it frees {small_size}, "
+                                      + f"which covers the {shortfall} shortfall.")
+                elif links == "external":
+                    recommendation = (f"The largest folder is {large} at {large_size}. "
+                                      + f"Deleting it frees only part of the {shortfall} shortfall.")
+                else:
+                    recommendation = (f"Review {large} first (recommended): deleting it frees {large_size}, "
+                                      + f"which covers the {shortfall} shortfall.")
+                text = phone_text(delivery.attempts)
+                if links in ("external", "held-insufficient"):
+                    self.assertNotIn("which covers", text)
+                    self.assertIn(recommendation[:-1] + "; the natedev session lists every folder.", text)
+                else:
+                    self.assertIn(recommendation, text)
+                if links.startswith("held-"):
+                    self.assertNotIn(f"Review {large} first (recommended)", text)
+                else:
+                    self.assertNotIn(str(small), text)
+                if links == "held-only":
+                    self.assertIn("In the natedev Claude session, reply delete nothing.", text)
+                else:
+                    self.assertIn(f"In the natedev Claude session, say which {machine} folders to delete.", text)
+                message = delivery.attempts[0].text
+                held_effect = "A build is using output inside it; deleting it can break that build."
+                other_effect = "Deleting it removes its contents; their use is unknown."
+                lines = [
+                    f"Free disk space fell below the 150.0 GiB alert line. {sweep.gib(free)} remains."
+                    + (" This is the Mac disk." if machine == "Mac" else ""),
+                    "Cleanup removed 2.0 GiB.",
+                    f"{large}: holds {large_size}. " + (held_effect if held_targets else other_effect),
+                    f"{small}: holds {small_size}. " + (held_effect if links == "held-only" else other_effect),
+                    recommendation,
+                    "Delete nothing: builds can fail when the disk is full.",
+                    "natedev checks your choice before it deletes anything.",
+                ]
+                self.assertEqual(message.splitlines(), lines)
 
     def test_crossing_names_the_largest_choice_when_no_choice_frees_enough(self) -> None:
         with self.crossing_delivery({}) as delivery:
@@ -4170,31 +4278,56 @@ with mock.patch.object(sweep, "free_bytes", return_value=130 * sweep.GIB), mock.
             self.assertIn("their use is unknown", message)
 
     def test_failure_after_an_interrupted_crossing_receipt_uses_no_crossing_key(self) -> None:
-        replies: dict[str, list[int]] = {}
-        with self.crossing_delivery(replies) as delivery:
-            save = sweep.write_floor_record
+        for crossing_start, failure_free in (("interrupted receipt", 140), ("failed delivery", 151)):
+            replies: dict[str, list[int]] = {} if crossing_start == "interrupted receipt" else {"natedev": [3]}
+            with self.subTest(crossing_start=crossing_start), self.crossing_delivery(replies) as delivery:
+                _ = write_config_fixture(conf.path("lint"), "sweep_phone_rearm_gib=5\n")
+                if crossing_start == "interrupted receipt":
+                    save = sweep.write_floor_record
 
-            def stop_after_send(path: Path, record: sweep.FloorRecord) -> None:
-                if delivery.attempts:
-                    raise RuntimeError("fixture stops before receipt save")
-                save(path, record)
+                    def stop_after_send(path: Path, record: sweep.FloorRecord) -> None:
+                        if delivery.attempts:
+                            raise RuntimeError("fixture stops before receipt save")
+                        save(path, record)
 
-            with mock.patch.object(sweep, "write_floor_record", side_effect=stop_after_send):
-                with self.assertRaisesRegex(RuntimeError, "before receipt save"):
+                    with mock.patch.object(sweep, "write_floor_record", side_effect=stop_after_send):
+                        with self.assertRaisesRegex(RuntimeError, "before receipt save"):
+                            self.finalize_crossing(140)
+                    self.assertEqual([attempt.recipient for attempt in delivery.attempts], ["natedev"])
+                    self.assertTrue(delivery.attempts[0].accepted)
+                else:
                     self.finalize_crossing(140)
-            self.assertEqual([attempt.recipient for attempt in delivery.attempts], ["natedev"])
-            self.assertTrue(delivery.attempts[0].accepted)
-            replies["natedev"] = [3, 0]
-            with mock.patch.object(sweep, "free_bytes", return_value=140 * GIB):
-                for expected in (sweep.FailurePending, sweep.FailureReported):
-                    sweep.notify_floor_problem(tmp_sweep.CompletedSweepAssessment(1),
-                        detail="new failed pass", lint_settings=conf.read("lint"))
-                    attempt = delivery.attempts[-1]
-                    self.assertEqual(attempt.key, "")
-                    self.assertIn("new failed pass", attempt.text)
-                    self.assertIsInstance(self.saved_record().failure, expected)
-            self.assertEqual([attempt.recipient for attempt in delivery.attempts], ["natedev"] * 3)
-            self.assertEqual([attempt.accepted for attempt in delivery.attempts], [True, False, True])
+                    self.assertEqual([attempt.recipient for attempt in delivery.attempts], ["natedev", "user"])
+                    self.assertEqual(self.saved_receipts(), (sweep.CrossingReceipt.PENDING, sweep.CrossingReceipt.ACCEPTED))
+                replies["natedev"] = [3, 0]
+                with mock.patch.object(sweep, "free_bytes", return_value=failure_free * GIB):
+                    for expected in (sweep.FailurePending, sweep.FailureReported):
+                        sweep.notify_floor_problem(tmp_sweep.CompletedSweepAssessment(1),
+                            detail="new failed pass", lint_settings=conf.read("lint"))
+                        attempt = delivery.attempts[-1]
+                        self.assertEqual(attempt.key, "")
+                        self.assertIn("new failed pass", attempt.text)
+                        self.assertIsInstance(self.saved_record().failure, expected)
+                        if crossing_start == "failed delivery":
+                            self.assertNotIn("Free disk space fell", attempt.text)
+                            self.assertEqual(self.saved_receipts(),
+                                             (sweep.CrossingReceipt.PENDING, sweep.CrossingReceipt.ACCEPTED))
+                if crossing_start == "interrupted receipt":
+                    self.assertEqual([attempt.recipient for attempt in delivery.attempts], ["natedev"] * 3)
+                    self.assertEqual([attempt.accepted for attempt in delivery.attempts], [True, False, True])
+                else:
+                    self.assertEqual([attempt.recipient for attempt in delivery.attempts],
+                                     ["natedev", "user", "natedev", "natedev"])
+                    self.assertEqual([attempt.accepted for attempt in delivery.attempts], [False, True, False, True])
+                    before_retry = len(delivery.attempts)
+                    self.finalize_crossing(140)
+                    self.finalize_crossing(130)
+                    self.assertEqual([attempt.recipient for attempt in delivery.attempts[before_retry:]], ["natedev"])
+                    retry = delivery.attempts[before_retry]
+                    self.assertTrue(retry.accepted)
+                    self.assertIn("Free disk space fell", retry.text)
+                    self.assertIn("140.0 GiB remains", retry.text)
+                    self.assertEqual(self.saved_receipts(), (sweep.CrossingReceipt.ACCEPTED, sweep.CrossingReceipt.ACCEPTED))
 
     def test_unsaved_crossings_use_one_fixed_natedev_key_and_no_phone(self) -> None:
         with self.crossing_delivery({}) as delivery:
@@ -4244,27 +4377,34 @@ with mock.patch.object(sweep, "free_bytes", return_value=130 * sweep.GIB), mock.
 
     def test_phone_floor_crossing_sends_once_until_free_space_rises(self) -> None:
         for machine in ("natedev", "Mac"):
-            with (self.subTest(machine=machine), self.crossing_delivery({}) as delivery,
-                  mock.patch.object(tmp_sweep, "lsof_paths", return_value=tmp_sweep.ProcessUsesKnown([]))):
-                base = delivery.base
-                policy = (sweep.MacFloor((str(base),), floor_claims.LockedClaims(frozenset()), base / "mirror")
-                          if machine == "Mac" else sweep.NatedevFloor.CURRENT)
-                send = cast(mock.Mock, sweep.send_floor_alert)
-                for free, expected in ((200, 0), (140, 1), (130, 1), (151, 1), (140, 2)):
-                    self.assertEqual(self.hold(base, 300 * GIB, [free * GIB, free * GIB],
-                                               recorded=True, policy=policy)[0], 0)
-                    messages = phone_calls(send)
-                    self.assertEqual(len(messages), expected)
-                    for call in messages:
-                        self.assertIn("Free disk space fell", call)
-                    self.assertEqual(sum(attempt.recipient == "user" for attempt in delivery.attempts), expected)
-                self.assertEqual(self.saved_receipts(), (sweep.CrossingReceipt.ACCEPTED, sweep.CrossingReceipt.ACCEPTED))
-                text = phone_text(delivery.attempts)
-                self.assertIn(f"{machine} disk is low; {machine} tests can fail", text)
-                self.assertIn(f"{machine} has 140.0 GiB free", text)
-                self.assertIn(f"so {machine} test builds can fail", text)
-                if machine == "Mac":
-                    self.assertIn("This is the Mac disk.", messages[-1])
+            for reason, margin, readings in (
+                ("below the rearm line", 5, ((200, 0), (140, 1), (130, 1), (151, 1), (140, 1))),
+                ("above the rearm line", 5, ((200, 0), (140, 1), (160, 1), (140, 2))),
+                ("at the rearm line", 5, ((200, 0), (140, 1), (155, 1), (140, 1))),
+                ("configured margin", 12, ((200, 0), (140, 1), (160, 1), (140, 1))),
+            ):
+                with (self.subTest(machine=machine, reason=reason), self.crossing_delivery({}) as delivery,
+                      mock.patch.object(tmp_sweep, "lsof_paths", return_value=tmp_sweep.ProcessUsesKnown([]))):
+                    base = delivery.base
+                    _ = write_config_fixture(conf.path("lint"), f"sweep_phone_rearm_gib={margin}\n")
+                    policy = (sweep.MacFloor((str(base),), floor_claims.LockedClaims(frozenset()), base / "mirror")
+                              if machine == "Mac" else sweep.NatedevFloor.CURRENT)
+                    send = cast(mock.Mock, sweep.send_floor_alert)
+                    for free, expected in readings:
+                        self.assertEqual(self.hold(base, 300 * GIB, [free * GIB, free * GIB],
+                                                   recorded=True, policy=policy)[0], 0)
+                        messages = phone_calls(send)
+                        self.assertEqual(len(messages), expected)
+                        for call in messages:
+                            self.assertIn("Free disk space fell", call)
+                        self.assertEqual(sum(attempt.recipient == "user" for attempt in delivery.attempts), expected)
+                    self.assertEqual(self.saved_receipts(), (sweep.CrossingReceipt.ACCEPTED, sweep.CrossingReceipt.ACCEPTED))
+                    text = phone_text(delivery.attempts)
+                    self.assertIn(f"{machine} disk is low; {machine} tests can fail", text)
+                    self.assertIn(f"{machine} has 140.0 GiB free", text)
+                    self.assertIn(f"so {machine} test builds can fail", text)
+                    if machine == "Mac":
+                        self.assertIn("This is the Mac disk.", phone_calls(send)[-1])
 
     def test_phone_floor_crossing_retries_a_failed_delivery(self) -> None:
         with self.crossing_delivery({"natedev": [3, 0], "user": [3, 0]}) as delivery:
@@ -6480,18 +6620,29 @@ class MacFloorTests(SweepCase):
         self.assertIn("ClaimStateUnreadable", result.stderr)
 
     def test_no_proc_mac_sweep_takes_only_the_oldest_shortfall(self) -> None:
-        base = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
-        old_tree, old = cargo_target(base, "old", APP, time.time() - 3 * DAY)
-        new_tree, newer = cargo_target(base, "new", DEMO, time.time() - DAY)
-        for tree, age in ((old_tree, 3 * DAY), (new_tree, DAY)):
-            stamp = tree.parent / sweep.USE_STAMP
-            _ = stamp.write_text("")
-            os.utime(stamp, (time.time() - age, time.time() - age))
-        with mock.patch.object(sweep, "process_uses", side_effect=AssertionError("Mac must use claims and lsof")):
-            text = self.mac_hold(self.policy(base), 1)
-        self.assertFalse(old.exists())
-        self.assertTrue(newer.exists())
-        self.assertIn("busy_targets_skipped=0", text)
+        for layout, claims, busy in (
+            ("standing", frozenset[str](), 0),
+            ("mirror", frozenset({"cargo-port", "held"}), 1),
+        ):
+            with self.subTest(layout=layout):
+                base = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
+                root = base / "mirror" if layout == "mirror" else base
+                old_tree, old = cargo_target(root, "old", APP, time.time() - 3 * DAY)
+                new_tree, newer = cargo_target(root, "new", DEMO, time.time() - DAY)
+                held_tree, held = cargo_target(root, "held", TOOL, time.time() - 4 * DAY)
+                for tree, age in ((old_tree, 3 * DAY), (new_tree, DAY), (held_tree, 4 * DAY)):
+                    marker = (tree.parent.parent / floor_claims.MIRROR_MARK
+                              if layout == "mirror" else tree.parent / sweep.USE_STAMP)
+                    _ = marker.write_text("")
+                    os.utime(marker, (time.time() - age, time.time() - age))
+                if layout == "standing":
+                    _ = held_tree.parent.joinpath(sweep.USE_STAMP).unlink()
+                with mock.patch.object(sweep, "process_uses", side_effect=AssertionError("Mac must use claims and lsof")):
+                    text = self.mac_hold(self.policy(base, claims), 1)
+                self.assertFalse(old.exists())
+                self.assertTrue(newer.exists())
+                self.assertTrue(held.exists())
+                self.assertIn(f"busy_targets_skipped={busy}", text)
 
     def test_mac_dry_run_lists_targets_and_deletes_nothing(self) -> None:
         base = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()

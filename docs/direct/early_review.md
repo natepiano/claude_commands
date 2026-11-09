@@ -1,100 +1,62 @@
 # Early review
 
 <EarlyReviewArm>
-Launch the blind reviewer while the writer is still running, so both finish
-together instead of back to back. Evaluate only at a Codex poll timeout or a
-requested <ProgressReport/>, and arm only when all of these hold: an implementation or fix dispatch is
-active; `EARLY_REVIEW=none`; the completed dispatch would receive a worker
-review — <DualReview/> pass 1 or a closure review; **pass-internal** completion
-of that dispatch is at least 75%; and at least ten minutes of writer time still
-remain.
+The reviewer reads the partial change while the implementation worker continues.
+The hook submits Stage 2 after the director publishes the final diff.
 
-Read completion from that report's or poll's evidence — the heartbeat shows the worker
-running its listed verification commands, or the diff already covers essentially
-all Work Order (or fix batch) files — and the remainder from how long the pass
-has already run against that estimate. Ten minutes left at 75% means a pass of
-roughly forty minutes or longer, so most implementations and nearly every repair
-arm nothing and review synchronously; that is the intended outcome, not a missed
-opportunity. A behavior-preserving repair never arms — documentation,
-formatting, lint guidance, an agreed trivial rename — and neither does one whose
-batch sits in paths narrow enough that <FixDispatch/> will close it on a
-contained diff; that judgment is the unit director's own reading of the batch, as
-no task name carries it. When the two estimates disagree, or either rests on no
-evidence, do nothing; the synchronous path still exists.
+Arm one adversary review only when all conditions hold:
 
-At an eligible point, in that same turn:
+- An implementation or fix dispatch is active.
+- `EARLY_REVIEW=none`.
+- The completed dispatch requires <DualReview/> or <ClosureReview/>.
+- The worker has completed at least 75% of its pass.
+- At least ten minutes of work remain.
 
-1. Increment `${REVIEW_PASS}` now; <DualReview/> will not increment it again.
-2. **Delete every stale delivery artifact and prove they are gone.**
-   A resumed or repeated phase reuses `${PHASE_DIR}`, so an earlier delivery's
-   artifacts can already sit on disk under the exact names this launch will
-   poll.
+Use the worker's report, heartbeat, and diff as evidence.
+Do not arm a behavior-preserving repair or a repair with a narrow path set.
+Launch the contract review after completion under <DualReview/>.
+
+1. Set `REVIEW_PASS` to the next review index.
+2. Remove earlier final diffs and ready sentinels from `${PHASE_DIR}`.
 
    `rm -f "${PHASE_DIR}"/final_diff_*.diff "${PHASE_DIR}"/final_diff_*.ready`
 
-   Clear the whole glob, not just the current index — later passes in this phase
-   collide the same way — then confirm no sentinel remains before continuing. A
-   stale sentinel releases the reviewer onto a previous phase's diff, which
-   returns a confident and entirely false blocker saying the phase implemented
-   nothing; and because the sentinel is what releases `assign.sh` to call
-   `start-pass`, it opens the review pass while the writer is still running, so
-   the recorder closes the live implementation pass as `interrupted` and refuses
-   every later `progress` call in that phase. Both failures are silent until the
-   false verdict or the refused call.
-3. Apply <ReviewDiffContract/> to the current partial tree. The worker has
-   named no created files yet, so that check is vacuous; the snapshot is
-   expected to be incomplete.
-4. Use the unit's own reviewer under <TeamReview/>. Save its slot as
-   `${EARLY_REVIEW_SLOT}` from the dispatch result.
-   Write the applicable early-form prompt — the `adversary`
-   lens of
-   <BroadReviewPrompt/> for pass 1, <ClosureReview/> for a fix — including the
-   completion estimate, the partial diff, and the exact final-diff and
-   ready-sentinel paths below. **Only the adversary arms early.** It is the lens
-   that gains most from the extra time, and arming both against a partial
-   tree would double the exposure to the void verdict below; `contract`
-   launches at completion under <DualReview/> step 3.
-5. Launch `assign.sh --role review --lens adversary --pass "${REVIEW_PASS}"
-   --phase "<phase id>" --session-dir "${SESSION_DIR}" --cwd "${WORKING_DIR}"
-   --prompt <early prompt> --early-ready "${PHASE_DIR}/final_diff_${REVIEW_PASS}.ready"`
-   under <DispatchContract/>. Save the handle as `${REVIEW_DISPATCH_HANDLE}`
-   and set `EARLY_REVIEW=launched`. Leave `${DISPATCH_HANDLE}` untouched.
-6. Before the recorder call in <ProgressReport/> step 5, put the reviewer in
-   the round table:
+3. Apply <ReviewDiffContract/> to the partial change.
+4. Select the unit reviewer under <TeamReview/>.
+5. Save its worker name as `${EARLY_REVIEW_SLOT}`.
+6. Write the early prompt under <BroadReviewPrompt/> or <ClosureReview/>.
+7. Include the estimate, partial diff, final diff path, and ready sentinel path in the prompt.
+8. Submit the review under <DispatchContract/>.
 
-   `~/.claude/scripts/lib/py ~/.claude/scripts/direct/progress_history.py arm-review --session-dir "${SESSION_DIR}" --worker "<review worker name>" --phase-id "<phase id>" --activity "<what this reviewer is checking>" --called-task direct.review [--lens adversary]`
+   `assign.sh --role review --to "${EARLY_REVIEW_SLOT}" --lens adversary --pass "${REVIEW_PASS}" --phase "<phase id>" --session-dir "${SESSION_DIR}" --cwd "${WORKING_DIR}" --prompt <early prompt> --early-ready "${PHASE_DIR}/final_diff_${REVIEW_PASS}.ready"`
 
-   Pass the same lens and phase the launch carries, and no lens where the
-   launch carries none: the marker names the status and pid files it will watch for, and a
-   marker watching the unsuffixed pair while the launcher writes the suffixed
-   one retires the row on its first tick, reporting a live reviewer as gone.
-   It is a presentation marker, not a pass event, so it cannot forge anything
-   convergence counts. It resolves the same reviewer `assign.sh` will, retires
-   its row when `assign.sh` errors or its process is gone, and is superseded
-   when the sentinel lets `assign.sh` open the real pass. The two running rows
-   are the announcement, and they carry what a sentence cannot: which agent each
-   one is, when it started, and how long it has been going.
+9. Set `EARLY_REVIEW=launched`.
+10. End the turn after submission.
 
-The extra argument defers `assign.sh`'s `start-pass` until the sentinel appears,
-so the implementation pass and the review pass never overlap in the recorder. At
-most one early launch per dispatch; otherwise review runs synchronously, as it
-always may — early launch is opportunistic, never required.
+The launcher records the pass and returns after submission.
+The hook keeps the pass active between Stage 1 and Stage 2.
+No launcher watches the sentinel.
+
+After the implementation completes:
+
+1. Write the final diff to `${PHASE_DIR}/final_diff_${REVIEW_PASS}.diff` under <ReviewDiffContract/>.
+2. Limit a closure review to its paths under <ClosureReview/>.
+3. Create `${PHASE_DIR}/final_diff_${REVIEW_PASS}.ready` after the diff is fully written.
+4. Send the ready event for the reviewer.
+
+   `~/.claude/scripts/lib/py ~/.claude/scripts/herdr/turn_end.py stage-ready "${EARLY_REVIEW_SLOT}"`
+
+5. End the turn until the hook sends the review result.
+
+The ready event and the Stage 1 hook use the same pass.
+Either event can arrive first.
+The hook submits Stage 2 once both the Stage 1 reply and the sentinel exist.
 
 | Event | Required action |
 | --- | --- |
-| Primary completes | After <LaunchImplementation/> step 7, write the final diff to `${PHASE_DIR}/final_diff_${REVIEW_PASS}.diff` — a closure review stays limited to its paths per <ClosureReview/> — then create `${PHASE_DIR}/final_diff_${REVIEW_PASS}.ready`. **Never create the sentinel before the diff is fully written.** `assign.sh`'s run then sends the reviewer its Stage 2. |
-| Primary errors, or the run stops | Kill the early reviewer. If the sentinel exists, close its pass with `UNIT_TEAM_ROLE=${EARLY_REVIEW_SLOT} … finish-pass --status canceled --orphaned-launcher` per <PassOwnership/>; skip this call if the launcher opened no pass. Before the sentinel no pass was recorded, so record nothing — a pre-sentinel kill counts toward no advisory, including the blind-review cancellation one. |
-| Reviewer errors before delivery | Report it in one line, clear `${REVIEW_DISPATCH_HANDLE}` and `${EARLY_REVIEW_SLOT}`, set `EARLY_REVIEW=none`, and leave the numbered artifacts. The primary continues and is reviewed synchronously at completion under the next `${REVIEW_PASS}` index. |
-| A verdict arrives before delivery | **It is void.** The reviewer cannot have read a diff that does not exist yet, so discard its findings entirely rather than reading them as evidence: open nothing in the ledger, preempt nothing, route no blocker into a fix dispatch. Say in one line that it is discarded and why, then follow the reviewer-error row. A void verdict is often fluent and specific — a stale diff supports confident claims about missing work — so the check is the timing, never how convincing the text reads. |
+| The implementation fails or stops | End the reviewer under <PassOwnership/>. Cancel its active pass. Clear `EARLY_REVIEW` and `${EARLY_REVIEW_SLOT}`. |
+| The reviewer fails before delivery | Report the failure. Clear `EARLY_REVIEW` and `${EARLY_REVIEW_SLOT}`. Start the next review index after implementation completes. |
+| A verdict arrives before the final diff | Discard the verdict. Record no finding from it. Follow the reviewer failure action. |
 
-Every path that ends an early launch before its real pass starts also drops the
-row it was given:
-
-`~/.claude/scripts/lib/py ~/.claude/scripts/direct/progress_history.py disarm-review --session-dir "${SESSION_DIR}" --reason "<canceled|reviewer error|void verdict>"`
-
-Run it alongside clearing `${REVIEW_DISPATCH_HANDLE}`, `${EARLY_REVIEW_SLOT}`,
-and `EARLY_REVIEW`. The
-row would retire itself at the next report anyway; this is how the reason
-reaches the record, and it is what lets that report state the reason rather
-than infer one.
+Keep the numbered artifacts when an early review fails.
 </EarlyReviewArm>

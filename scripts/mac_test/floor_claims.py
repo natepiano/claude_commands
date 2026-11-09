@@ -123,7 +123,14 @@ class LockedClaims:
                         return fields.get("repo") in self.repositories
                     except (OSError, ValueError):
                         return True
-            return any(path.is_relative_to((mirror / name).resolve(strict=True)) for name in self.repositories)
+            for name in self.repositories:
+                try:
+                    claimed = (mirror / name).resolve(strict=True)
+                except FileNotFoundError:
+                    continue
+                if path.is_relative_to(claimed):
+                    return True
+            return False
         except (OSError, RuntimeError):
             return True
 

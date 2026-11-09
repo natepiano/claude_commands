@@ -18,7 +18,7 @@ import time
 
 from scripts.build_queue import head_facts, admission_client, admission_protocol
 from scripts.build_queue.queue_card import select_waiters
-from scripts.build_queue.queue_lines import json_form, plain
+from scripts.build_queue.queue_lines import json_form
 from scripts.build_queue.queue_evidence import step_labels
 from scripts.build_queue.queue_view import QueueModel, HostLoad, HostLoadUnavailable, UnknownCpuCount, render_view
 from scripts.build_queue.queue_lines import Span
@@ -136,6 +136,9 @@ def main() -> int:
         columns: int = default_columns()
         words: list[str] = []
     arguments = parser.parse_args(namespace=Arguments())
+    if not arguments.json:
+        print("build queue: the queue view is on the build page; run /build:page")
+        return 3
     if arguments.columns < 1:
         parser.error("--columns must be positive")
     words = arguments.words
@@ -164,7 +167,7 @@ def main() -> int:
         if alert is not None:
             lines.insert(0, (Span(alert, "error", bold=True),))
         print(json.dumps(json_form(lines, arguments.columns, reading.explanation.now),
-                         ensure_ascii=False, separators=(",", ":")) if arguments.json else plain(lines))
+                         ensure_ascii=False, separators=(",", ":")))
     except admission_protocol.AdmissionUnavailable as error:
         print(f"build queue: admission service unavailable: {error.reason}", file=sys.stderr)
         return 2

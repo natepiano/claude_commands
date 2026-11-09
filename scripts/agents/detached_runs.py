@@ -28,6 +28,7 @@ import sys
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from importlib import import_module
 from pathlib import Path
 from types import FrameType
 from typing import Literal, NotRequired, TypedDict, cast
@@ -88,6 +89,7 @@ class RunRecord(TypedDict):
     finished_at: NotRequired[str]
     delivery: NotRequired[str]
     # Set when the run ended without its supervisor: "supervisor gone".
+    completion_pending: NotRequired[bool]
     ended: NotRequired[str]
 
 
@@ -138,7 +140,6 @@ def _run_worker(record: RunRecord, membership: staff.StaffSnapshot) -> staff.Sta
     member = membership.by_id(staff.StaffId(record.get("staff_id", "")))
     if member is None or member.kind != "worker":
         reason = f"{record['worker']}: detached run has no worker staff row"
-        print(f"anomaly: {reason}", file=sys.stderr)
         return RunWorkerUnavailable(reason)
     return member
 
@@ -220,7 +221,13 @@ def _reap_orphans_locked(runs: Path, worker: str = "") -> list[str]:
                if (raw := worker_lifecycle.read_json_object(path)).get("run_id")]
     reaped: list[str] = []
     for path, raw in records:
-        if (worker and raw.get("worker") != worker) or not _orphaned(path, raw, now):
+        if worker and raw.get("worker") != worker:
+            continue
+        if raw.get("status") == "finished" and raw.get("completion_pending"):
+            if not detached_run_process.supervises(_integer(raw.get("pid")), path):
+                _finish_record(path, _read_record(path))
+            continue
+        if not _orphaned(path, raw, now):
             continue
         claim = path.with_suffix(".reap")
         try:
@@ -246,11 +253,32 @@ def _reap_orphans_locked(runs: Path, worker: str = "") -> list[str]:
                 "status": "finished", "ended": "supervisor gone", "delivery": delivery,
                 "finished_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
             })
-            _write_record(path, record)
+            _finish_record(path, record)
             reaped.append(record["run_id"])
         finally:
             claim.unlink(missing_ok=True)
     return reaped
+
+
+def _finish_record(path: Path, record: RunRecord) -> None:
+    """Keep a failed completion event available without blocking other records."""
+    record["completion_pending"] = True
+    _write_record(path, record)
+    try:
+        _complete_worker_dispatch(record)
+    except Exception as error:
+        print(f"anomaly: {record['run_id']}: completion event failed: {error}", file=sys.stderr)
+    else:
+        record["completion_pending"] = False
+        _write_record(path, record)
+
+
+def _complete_worker_dispatch(record: RunRecord) -> None:
+    """Recheck the pass after the finished record becomes visible."""
+    member = _run_worker(record, staff.local_snapshot())
+    if isinstance(member, staff.StaffRow):
+        complete = cast(Callable[[str], None], import_module("scripts.herdr.turn_end").run_finished)
+        complete(str(member.current_session))
 
 
 def live_twin(runs: Path, worker: str, command: list[str], tree_key: str) -> RunRecord | None:
@@ -488,6 +516,7 @@ def deliver(record: RunRecord, result: CommandResult) -> str:
     membership = staff.local_snapshot()
     member = _run_worker(record, membership)
     if isinstance(member, RunWorkerUnavailable):
+        print(f"anomaly: {member.reason}", file=sys.stderr)
         return "finished: worker retired"
     from scripts.message import send
 
@@ -575,7 +604,7 @@ def command_supervise(args: argparse.Namespace) -> int:
         "status": "finished", "exit_code": exit_code,
         "finished_at": datetime.now(timezone.utc).isoformat(timespec="seconds"), "delivery": delivery,
     })
-    _write_record(record_path, record)
+    _finish_record(record_path, record)
     return 0
 
 
