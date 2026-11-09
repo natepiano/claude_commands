@@ -304,8 +304,8 @@ class SeededExampleWorkspaceFixture(ExampleWorkspaceFixture):
     @override
     def setUpClass(cls) -> None:
         builder = ExampleWorkspaceFixture()
-        builder.setUp()
         cls.addClassCleanup(builder.doCleanups)
+        builder.setUp()
         cls.fixture_root = builder.root
         seed = cls.enterClassContext(tempfile.TemporaryDirectory(prefix="example-workspace-seed-"))
         cls.fixture_seed = Path(seed) / "seed"

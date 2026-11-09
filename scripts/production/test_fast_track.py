@@ -277,7 +277,6 @@ class FastTrackTests(MergeCheckpointFixture):
             "FAST_TRACK_STATE_DIR": str(self.records_dir),
             "FAST_TRACK_TEST_EVENTS": str(self.events_path), "FAST_TRACK_TEST_CONTROL": str(self.control),
             "FAST_TRACK_TEST_LOCK": str(common / "main-push.lock"),
-            "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1",
         })
         with patch.dict(os.environ, {"CONF_DIR": str(REPOSITORY / "config")}):
             settings_read = conf.read("fast_track")

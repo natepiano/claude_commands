@@ -425,7 +425,7 @@ function progressTip(row) {
   const progress = row.progress;
   if (!progress || progress.kind !== "RowProgress") return "";
   const counter = `${progress.phase} · ${progress.done} of ${progress.total} ${progress.unit} · ${Math.round(progress.percent)}% done`;
-  return `\n${counter}` + (row.name === "merge-gate" ? "\nModules start slowest first, so this reads low early." : "");
+  return `\n${counter}` + (progress.unit === "modules" ? "\nModules start slowest first, so this reads low early." : "");
 }
 function rawTipText(key, d) {
   const [kind, i] = key.split(":");

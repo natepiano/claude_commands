@@ -275,6 +275,7 @@ class ProductionDoc:
     machine: str
     path: Path
     owner: staff.StaffRow
+    text: str
 
 
 @dataclass(frozen=True)
@@ -472,7 +473,7 @@ class RowResolver:
         if isinstance(doc, staff.DocUnfilled):
             return LocationUnfilled("the production document is not recorded")
         state, text = self._fact(doc.machine, "file", doc.path)
-        return ProductionDoc(doc.machine, doc.path, owner) if state == "value" else DocumentUnavailable(text)
+        return ProductionDoc(doc.machine, doc.path, owner, text) if state == "value" else DocumentUnavailable(text)
 
     def merge_branch(self, row: staff.StaffRow) -> Branch | BranchUnreadable:
         doc = self.production_doc(row)
