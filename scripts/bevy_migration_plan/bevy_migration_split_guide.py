@@ -17,6 +17,8 @@ import re
 import shutil
 import subprocess
 import sys
+from collections.abc import Generator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import NamedTuple, cast
 
@@ -132,6 +134,18 @@ class GuidePublication:
         self.staging: Path = live.with_name(f".{live.name}.staging")
         self.previous: Path = live.with_name(f".{live.name}.previous")
 
+    @contextmanager
+    def stage(self) -> Generator[Path]:
+        """Remove incomplete staging files on exit and preserve complete sets for recovery."""
+        if self.staging.exists():
+            shutil.rmtree(self.staging)
+        self.staging.mkdir()
+        try:
+            yield self.staging
+        finally:
+            if self.staging.exists() and not (self.staging / COMPLETION).is_file():
+                shutil.rmtree(self.staging)
+
     def recover(self) -> None:
         if not self.live.exists() and self.previous.exists():
             if (self.staging / COMPLETION).is_file():
@@ -150,25 +164,23 @@ def write_sections(sections: list[Section], output_dir: Path) -> int:
     publication = GuidePublication(output_dir)
     publication.recover()
     output_dir.parent.mkdir(parents=True, exist_ok=True)
-    if publication.staging.exists():
-        shutil.rmtree(publication.staging)
-    publication.staging.mkdir()
-    manifest: dict[str, str] = {}
-    for section in sections:
-        filename = section.filename
-        counter = 1
-        while filename in manifest:
-            filename = f"{section.filename.rsplit('.', 1)[0]}_{counter}.md"
-            counter += 1
-        filepath = publication.staging / filename
-        _ = filepath.write_text(section.content)
-        manifest[filename] = hashlib.sha256(filepath.read_bytes()).hexdigest()
-    _ = (publication.staging / COMPLETION).write_text(json.dumps(manifest, sort_keys=True) + "\n")
-    if output_dir.exists():
-        os.replace(output_dir, publication.previous)
-    os.replace(publication.staging, output_dir)
-    if publication.previous.exists():
-        shutil.rmtree(publication.previous)
+    with publication.stage() as staging:
+        manifest: dict[str, str] = {}
+        for section in sections:
+            filename = section.filename
+            counter = 1
+            while filename in manifest:
+                filename = f"{section.filename.rsplit('.', 1)[0]}_{counter}.md"
+                counter += 1
+            filepath = staging / filename
+            _ = filepath.write_text(section.content)
+            manifest[filename] = hashlib.sha256(filepath.read_bytes()).hexdigest()
+        _ = (staging / COMPLETION).write_text(json.dumps(manifest, sort_keys=True) + "\n")
+        if output_dir.exists():
+            os.replace(output_dir, publication.previous)
+        os.replace(staging, output_dir)
+        if publication.previous.exists():
+            shutil.rmtree(publication.previous)
     return len(manifest)
 
 
