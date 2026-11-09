@@ -2149,30 +2149,13 @@ Registered jobs already take no margin: `test_registered_and_unregistered_jobs_e
 - `scripts/notify/test_push_texts.py` passes for every text except `sweep.disk_floor_recovered`, which waits on the user's approval.
 
 ### Phase 95 — Each test folder goes when its test ends  · status: done
-**Depends on:** none in code. Runs after Phase 94. Merge `origin/builds` first.
 
-**Approved:** builds, 2026-11-09, user rule: "our processes clean up after themselves, as tempdir does." Report `/tmp/claude/leftover_sources_2026-11-09.md`, section "builds", item 2: "resources fixtures made in constructors". builds: "Make each test folder in a with block or in the test's own setUp/addCleanup, so each folder goes when its test ends. Add no check or scan. Add no signal handlers."
+#### As-built
 
-#### Work Order
-
-**Goal:** each test folder in these two test classes is made when its test starts and removed when that test ends.
-
-**Defect:** two test classes make a `tempfile.TemporaryDirectory()` in `__init__` and register its cleanup later in `setUp()`. `unittest` builds every test instance when it loads the module. A test that is loaded but does not run (a name filter, a skip, a `setUpClass` failure, an interrupt) never calls `setUp()`, so its folder stays in `/tmp`.
-- `scripts/buildlog/test_step_outputs.py:39` — `RecordedOutputRootsTests.__init__`.
-- `scripts/lint/test_build_shape.py:83` — `IndexStepEvidenceTests.__init__`.
-
-**Spec:**
-1. Remove the `__init__` overrides. In `setUp()`, make the folder with `self.enterContext(tempfile.TemporaryDirectory())` and set the attributes that depend on it there.
-2. Keep every test and every assertion. Change no test behavior.
-3. Add no check, scan or signal handler.
+`RecordedOutputRootsTests` and `IndexStepEvidenceTests` have no `__init__`. Each `setUp()` makes its folder with `self.enterContext(tempfile.TemporaryDirectory())` and sets the attributes that depend on that folder. A test that loads and does not run makes no folder, and each folder goes when its test ends. `before` and `cutoff` in `IndexStepEvidenceTests` are class constants.
 
 **Files:**
-- `scripts/buildlog/test_step_outputs.py`
-- `scripts/lint/test_build_shape.py`
+- `scripts/buildlog/test_step_outputs.py` — `RecordedOutputRootsTests` fixture.
+- `scripts/lint/test_build_shape.py` — `IndexStepEvidenceTests` fixture.
 
-**Workers:** `1 writer` — `impl` owns both files. No test lane: the change is to test fixtures.
-
-**Acceptance gate:**
-- `python3 -m unittest discover -s scripts/buildlog -p test_step_outputs.py` and `python3 -m unittest discover -s scripts/lint -p test_build_shape.py` pass with the same test count as before.
-- A load of each module with a name filter that runs one test leaves no new folder in the temporary directory.
-- Basedpyright reports `0 errors, 0 warnings, 0 notes` for both files.
+**Ruled out:** a check, a scan or a signal handler for leftover folders.
