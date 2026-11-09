@@ -10,23 +10,24 @@ from collections.abc import Callable, Generator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
-from decimal import Decimal
 from hashlib import sha256
 import json
 import os
 from pathlib import Path
 import re
+import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 from types import FrameType
 from typing import Literal, cast, final
 from uuid import uuid4
 
 from scripts.aws_target import gate_box, ledger
-from scripts.aws_target.aws_target import AwsCli, AwsUnavailable, control_lock
-from scripts.aws_target.config import money, read_settings
+from scripts.aws_target.aws_target import AwsCli, AwsUnavailable, control_lock, fetch_account_charges
+from scripts.aws_target.config import account_settings_path, money, read_settings
 from scripts.build_queue import admission_client, admission_protocol as wire, cloud_progress, progress_profile
 from scripts.build_queue.queue_place import defer_cleanup_signals
 from scripts.build_targets import target_config
@@ -166,21 +167,11 @@ class GateWorker:
         cloud_progress.publish(self.sidecar, log_cloud_progress(text, self.size_vcpus, self.clock()))
 
     def charges(self) -> None:
-        def fetch(start: int, end: int) -> Decimal:
+        now = int(self.clock())
+        def fetch(start: int, end: int) -> tuple[ledger.ChargeRead, ...]:
             policy = read_settings(self.settings_path)
-            period = ','.join((f'Start={datetime.fromtimestamp(start, UTC):%Y-%m-%d}',
-                               f'End={datetime.fromtimestamp(end, UTC):%Y-%m-%d}'))
-            reply = self.api.call('get-cost-and-usage', '--time-period', period, '--granularity', 'DAILY',
-                                  '--metrics', 'UnblendedCost', '--filter', json.dumps({'Tags': {
-                                      'Key': policy.cost_explorer_tag_key, 'Values': [policy.cost_explorer_tag_value]}}), service='ce')
-            total = Decimal(0)
-            for row in ledger.rows(reply, 'ResultsByTime'):
-                cost = ledger.mapping(ledger.mapping(row['Total'])['UnblendedCost'])
-                if cost.get('Unit') != 'USD':
-                    raise ValueError('Cost Explorer did not return USD')
-                total += money(ledger.text(cost, 'Amount'))
-            return total
-        _ = self.book.refresh_charges(self.settings_path, int(self.clock()), fetch, gate_workload=True)
+            return fetch_account_charges(self.api, start, end, now, policy.cost_explorer_read_usd)
+        _ = self.book.refresh_charges(self.settings_path, now, fetch, gate_workload=True)
 
     def upload(self, bucket: str, key: str, path: Path) -> None:
         _ = self.api.call('put-object', '--bucket', bucket, '--key', key, '--body', str(path), service='s3api')
@@ -278,6 +269,8 @@ class GateWorker:
                     'TagSpecifications': [{'ResourceType': kind, 'Tags': tags} for kind in ('instance', 'volume')],
                     'UserData': gate_box.user_data(links, ledger.text(deployment, 'revision'), lifetime,
                               settings().number('log_push_s'), float(str(request['module_time_limit_s'])))}
+                if deployment.get('image'):
+                    arguments['ImageId'] = ledger.text(deployment, 'image')
                 launch = {'variant': offset, 'arguments': arguments}
                 save(path, launch)
             self.size_vcpus = int(ledger.text(arguments, 'InstanceType').split('.')[1].removesuffix('xlarge')) * 4
@@ -290,7 +283,7 @@ class GateWorker:
                 if len(instances) == 1:
                     instance = ledger.text(instances[0], 'InstanceId')
                     save(path, {**launch, 'instance': instance})
-                    self.book.resolve_gate(ledger.text(request, 'attempt'), ledger.GateRunning(instance))
+                    self.book.resolve_gate(ledger.text(request, 'attempt'), ledger.GateRunning(instance), instance_type=size)
                     return instance
                 raise AwsUnavailable('The expired launch remains unconfirmed')
             try:
@@ -322,7 +315,7 @@ class GateWorker:
                 raise AwsUnavailable('The launch reply has no unique instance')
             instance = ledger.text(instances[0], 'InstanceId')
             save(path, {**launch, 'instance': instance})
-            self.book.resolve_gate(ledger.text(request, 'attempt'), ledger.GateRunning(instance))
+            self.book.resolve_gate(ledger.text(request, 'attempt'), ledger.GateRunning(instance), instance_type=size)
             return instance
         self.book.resolve_gate(ledger.text(request, 'attempt'), ledger.GateAbsent(int(self.clock())))
         return LocalFallback('Spot capacity is unavailable at both sizes')
@@ -338,7 +331,8 @@ class GateWorker:
                 reservation = self.book.reserve_gate(self.settings_path, ledger.GateReservation(
                     attempt, int(self.clock()), ledger.instant(request, 'expires'),
                     money(str(settings().number('spot_max_usd_per_hour'))),
-                    money(str(settings().number('attempt_allowance_usd')))))
+                    money(str(settings().number('attempt_allowance_usd'))),
+                    instance_type=settings().words('instance_types')[0]))
                 if isinstance(reservation, ledger.GateCapReached):
                     return {'status': 'fallback', 'reason': reservation.reason}
                 bucket = ledger.text(deployment, 'bucket')
@@ -436,34 +430,48 @@ def import_record(folder: Path, row: dict[str, object]) -> None:
     save(folder / 'imported.json', {'id': record['id']})
 
 
+def working_tree(repo: Path) -> tuple[str, set[str]]:
+    dirty = affected_modules.dirty_paths(repo)
+    if not dirty:
+        return gate.checked_git(repo, 'rev-parse', 'HEAD^{tree}'), dirty
+    with tempfile.TemporaryDirectory(prefix='cloud-gate-index-') as temporary:
+        index = Path(temporary) / 'index'
+        _ = shutil.copyfile(gate.checked_git(repo, 'rev-parse', '--path-format=absolute', '--git-path', 'index'), index)
+        environment = {**os.environ, 'GIT_INDEX_FILE': str(index)}
+        _ = subprocess.run(['git', 'add', '-A'], cwd=repo, env=environment, check=True, capture_output=True)
+        tree = subprocess.run(['git', 'write-tree'], cwd=repo, env=environment, check=True, capture_output=True, text=True)
+        return tree.stdout.strip(), dirty
+
+
 def prepare(repo: Path, folder: Path, mode: gate.SuiteMode, full: bool, limit: float) -> dict[str, object]:
-    commit = gate.checked_git(repo, 'rev-parse', 'HEAD')
-    tree = gate.checked_git(repo, 'rev-parse', 'HEAD^{tree}')
-    if affected_modules.dirty_paths(repo):
-        raise GateRefused('The cloud gate requires a clean tested tree')
+    head = gate.checked_git(repo, 'rev-parse', 'HEAD')
+    tree, dirty = working_tree(repo)
+    commit = gate.checked_git(repo, 'commit-tree', tree, '-p', head, '-m', 'Cloud gate snapshot') if dirty else head
     modules = discover_test_modules(repo)
     if mode is gate.SuiteMode.TARGETED_TEST and not full:
-        book = gate.PassedTreeLedger(repo, 'tests-only', gate.CleanTestTree(tree, commit), sorted({s for s, _ in modules}))
-        selection = affected_modules.select_affected(repo, book.certified_base(), [p for _, p in modules], set(), state_dir=gate.gate_state_dir())
+        tested_tree = gate.UnrecordableTestTree('checkout is dirty', tuple(sorted(dirty))) if dirty else gate.CleanTestTree(tree, head)
+        book = gate.PassedTreeLedger(repo, 'tests-only', tested_tree, sorted({s for s, _ in modules}))
+        selection = affected_modules.select_affected(repo, book.certified_base(), [p for _, p in modules], dirty, state_dir=gate.gate_state_dir())
         gate.report_selection(selection, len(modules))
         if isinstance(selection, affected_modules.AffectedSelection):
             modules = [(s, p) for s, p in modules if p in selection.modules]
-    refs = ['HEAD']
     origin_main = gate.checked_git(repo, 'rev-parse', 'refs/remotes/origin/main')
-    branch = gate.git(repo, 'symbolic-ref', '--quiet', 'HEAD').stdout.strip()
-    if branch:
-        refs.append(branch)
     origin = gate.checked_git(repo, 'remote', 'get-url', 'origin')
     from urllib.parse import urlsplit
     if urlsplit(origin).password or urlsplit(origin).query or ('://' in origin and urlsplit(origin).username):
         raise GateRefused('The origin URL must contain no credential')
     folder.mkdir(parents=True, exist_ok=True)
     source_key = ''
-    if int(gate.checked_git(repo, 'rev-list', '--count', 'HEAD', '--not', 'refs/remotes/origin/main')):
-        _ = gate.checked_git(repo, 'bundle', 'create', str(folder / 'source.bundle'), *refs, '--not', 'refs/remotes/origin/main')
+    if int(gate.checked_git(repo, 'rev-list', '--count', commit, '--not', 'refs/remotes/origin/main')):
+        ref = 'refs/cloud-gates/' + folder.name
+        _ = gate.checked_git(repo, 'update-ref', ref, commit)
+        try:
+            _ = gate.checked_git(repo, 'bundle', 'create', str(folder / 'source.bundle'), ref, '--not', 'refs/remotes/origin/main')
+        finally:
+            _ = gate.checked_git(repo, 'update-ref', '-d', ref)
         digest = sha256((folder / 'source.bundle').read_bytes()).hexdigest()
         source_key = 'source/' + digest + '.bundle'
-    request: dict[str, object] = {'attempt': folder.name, 'commit': commit, 'tree': tree, 'origin': origin,
+    request: dict[str, object] = {'attempt': folder.name, 'commit': commit, 'head': head, 'tree': tree, 'dirty_paths': sorted(dirty), 'origin': origin,
         'origin_main': origin_main, 'clone_url': settings().text('clone_url'),
         'mode': mode.value, 'modules': [str(p.relative_to(repo)) for _, p in modules], 'source_key': source_key,
         'expires': int(time.time()) + settings().whole('lifetime_minutes') * 60,
@@ -476,7 +484,8 @@ def run(repo: Path, *, mode: gate.SuiteMode, full: bool, module_time_limit_s: fl
         service: Callable[[Sequence[str]], int] = lambda command: subprocess.call(command)) -> LocalFallback | CloudCompleted:
     try:
         return run_cloud(repo, mode=mode, full=full, module_time_limit_s=module_time_limit_s, service=service)
-    except (OSError, ValueError, KeyError, TypeError, AwsUnavailable, subprocess.SubprocessError, GateRefused) as error:
+    except (OSError, ValueError, KeyError, TypeError, AwsUnavailable, subprocess.SubprocessError,
+            GateRefused, affected_modules.GraphError) as error:
         return LocalFallback(str(error))
 
 
@@ -492,7 +501,7 @@ def run_cloud(repo: Path, *, mode: gate.SuiteMode, full: bool, module_time_limit
     root = Path(gate.checked_git(repo, 'rev-parse', '--path-format=absolute', '--git-path', 'cloud-gates'))
     with control_lock(root):
         current = root / 'current.json'
-        tree = gate.checked_git(repo, 'rev-parse', 'HEAD^{tree}')
+        tree, _dirty = working_tree(repo)
         previous = read(current) if current.exists() else {}
         identity: dict[str, object] = {'tree': tree, 'commit': gate.checked_git(repo, 'rev-parse', 'HEAD'),
                                       'mode': mode.value, 'full': full, 'module_time_limit_s': module_time_limit_s}
@@ -508,10 +517,10 @@ def run_cloud(repo: Path, *, mode: gate.SuiteMode, full: bool, module_time_limit
                    '--setenv=CONF_DIR=' + str(conf.path('aws_target').parent),
                    '--property=KillMode=control-group', '--property=UMask=0077',
                    '--property=UnsetEnvironment=AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN AWS_CONFIG_FILE AWS_PROFILE',
-                   # The installed tree launches the box; the checkout supplies only its source and tests.
+                   # Run the installed worker with the installed account settings.
                    '--working-directory=' + str(Path.home() / '.claude'),
                    sys.executable, '-m', 'scripts.aws_target.cloud_gate', '--worker', str(folder), '--directory', str(directory),
-                   '--sidecar', str(sidecar)]
+                   '--sidecar', str(sidecar), '--settings', str(account_settings_path())]
         with cloud_reservation(repo, sidecar, mode) as reservation:
             request = read(folder / 'request.json') if (folder / 'request.json').exists() else prepare(repo, folder, mode, full, module_time_limit_s)
             save(current, {'attempt': folder.name, **identity})
@@ -538,7 +547,7 @@ def run_service(repo: Path, folder: Path, request: dict[str, object], command: S
         validate_result(row, request)
     except (ValueError, KeyError, TypeError) as error:
         return LocalFallback(str(error))
-    if gate.checked_git(repo, 'rev-parse', 'HEAD') != request['commit']:
+    if gate.checked_git(repo, 'rev-parse', 'HEAD') != request['head']:
         return LocalFallback('The checkout changed during the cloud attempt')
     import_record(folder, row)
     print((folder / 'gate.log').read_text(), end='', flush=True)
@@ -553,15 +562,17 @@ def main() -> int:
     _ = parser.add_argument('--worker', required=True, type=Path)
     _ = parser.add_argument('--directory', required=True, type=Path)
     _ = parser.add_argument('--sidecar', required=True, type=Path)
+    _ = parser.add_argument('--settings', type=Path, default=account_settings_path())
     args = parser.parse_args()
     folder = cast(Path, args.worker)
     directory = cast(Path, args.directory)
     with control_lock(folder):
         if (folder / 'outcome.json').exists() and read(folder / 'outcome.json').get('status') != 'pending':
             return 0
-        configuration = conf.read('aws_target')
+        settings_path = cast(Path, args.settings)
+        configuration = conf.read(settings_path)
         api = AwsCli(configuration.text('credentials_profile'), configuration.text('region'), settings().number('api_timeout_s'))
-        worker = GateWorker(api, ledger.CostLedger(directory), conf.path('aws_target'), cast(Path, args.sidecar))
+        worker = GateWorker(api, ledger.CostLedger(directory), settings_path, cast(Path, args.sidecar))
         try:
             outcome = worker.execute(folder, read(folder / 'request.json'), read(folder / 'deployment.json'))
         except SystemExit:

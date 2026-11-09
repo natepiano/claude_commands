@@ -24,6 +24,7 @@ from scripts.production.rename_test_support import bind_staff_fixture
 from scripts.production.staff_test_support import fixture_member, fixture_runtime_id, StaffTestCase
 from scripts.production import staff, unit_config, fake_unit_host
 from scripts.lib.atomic_file import write_text_atomic
+from scripts.lib.git_test_support import write_fixture_git_config
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.shutdown import shutdown
 from scripts.shutdown import pane_record
@@ -67,8 +68,8 @@ class UnitRenameFixture(StaffTestCase):
         super().setUp()
         # Git worktrees and production docs embed absolute paths. Each independent
         # copy returns to the seed's original path, with its own refs and origin.
-        _ = shutil.copytree(self.fixture_snapshot, self.fixture_root)
         self.addCleanup(shutil.rmtree, self.fixture_root)
+        _ = shutil.copytree(self.fixture_snapshot, self.fixture_root)
         self.bind_fixture(self.fixture_root)
         bind_staff_fixture(self, self.env, {SLUG: ("alpha", "mul_add")},
                            locations={(SLUG, "alpha"): self.rust / "claude-demo-alpha",
@@ -115,7 +116,7 @@ class UnitRenameFixture(StaffTestCase):
             "FAKE_HERDR_LOG": str(self.root / "herdr.jsonl"),
             "FAKE_HERDR_RESPONSES": str(self.root / "herdr-responses.json"),
             "CLAUDE_CODE_SESSION_ID": "", "USER_ZONE": "UTC", "UNIT_SYNC_WRITES": "0",
-            "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_CONFIG_GLOBAL": str(write_fixture_git_config(self.root.parent)), "GIT_CONFIG_NOSYSTEM": "1",
             "GIT_TERMINAL_PROMPT": "0", "GIT_OPTIONAL_LOCKS": "0",
         })
 
@@ -127,7 +128,7 @@ class UnitRenameFixture(StaffTestCase):
         _ = self.git("init", "--bare", str(self.origin))
         _ = self.git("init", "-b", SLUG)
         for key, value in (("user.name", "Unit Rename Test"), ("user.email", "rename@example.invalid"),
-                           ("gc.auto", "0"), ("maintenance.auto", "false")):
+                           ("gc.auto", "0")):
             _ = self.git("config", key, value)
         _ = self.git("remote", "add", "origin", str(self.origin))
         self.write(self.doc, self.production_doc())

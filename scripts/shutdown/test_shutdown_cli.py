@@ -51,6 +51,7 @@ from scripts.production.staff_test_support import (
     unit_membership,
 )
 from scripts.shutdown import shutdown, remote, stop_resume, restart, pane_record as staff_pane_record, pane_record
+from scripts.shutdown.stop_results import StopResult
 
 from scripts.production import rename_test_support as support
 from scripts.production.rename_test_support import (
@@ -638,6 +639,29 @@ class RetireUnitTests(unittest.TestCase):
             code = shutdown.main(["retire", str(self.unit_staff_id), *arguments])
         return code, output.getvalue()
 
+    def remote_call(self, args: list[str], stdin: str = "", limit: remote.RemoteCallLimit = remote.STANDARD_TIME_LIMIT) -> tuple[int, str]:
+        del limit
+        output = io.StringIO()
+        receiver = "mac"
+        row = staff.by_id(self.unit_staff_id)
+        if row is not None and not isinstance(row.worktree, staff.WorktreeUnfilled) and row.worktree.machine != "mac":
+            receiver = "nates-macbook-pro.example.net"
+        with (mock.patch.object(sys, "stdin", io.StringIO(stdin)),
+              mock.patch.object(shutdown, "local_machine", return_value=receiver),
+              mock.patch.object(remote, "local_machine", return_value=receiver),
+              mock.patch.object(shutdown, "other_machine", return_value="natedev"),
+              mock.patch.dict(os.environ, {"SHUTDOWN_STATE_DIR": str(self.root / "remote-shutdown")}),
+              redirect_stdout(output)):
+            code = shutdown.main(args)
+        return code, output.getvalue()
+
+    def move_to_other_machine(self, machine: str = "mac") -> staff.StaffRow:
+        row = staff.by_id(self.unit_staff_id)
+        assert row is not None
+        row = staff.set_worktree(row.id, staff.PresentWorktree(machine, self.worktree), expected=row.worktree)
+        _ = self.enterContext(mock.patch.object(shutdown, "run_remote", side_effect=self.remote_call))
+        return row
+
     def stops(self) -> list[list[str]]:
         return self.calls.copy()
 
@@ -721,19 +745,29 @@ class RetireUnitTests(unittest.TestCase):
 
 
     def test_refuses_uncommitted_work_and_an_unmerged_checkpoint_and_changes_nothing(self) -> None:
-        _ = (self.worktree / "late.txt").write_text("late\n", encoding="utf-8")
-        _ = git(self.worktree, "add", "late.txt")
-        _ = git(self.worktree, "commit", "-q", "-m", "checkpoint(alpha): the late work")
-        _ = (self.worktree / "draft.txt").write_text("draft\n", encoding="utf-8")
-        before = self.doc.read_text(encoding="utf-8")
+        for machine in (remote.local_machine(), "mac"):
+            with self.subTest(machine=machine):
+                case = self if machine == remote.local_machine() else RetireUnitTests()
+                if case is not self:
+                    case.setUp()
+                    self.addCleanup(case.doCleanups)
+                    _ = case.move_to_other_machine()
+                _ = (case.worktree / "late.txt").write_text("late\n", encoding="utf-8")
+                _ = git(case.worktree, "add", "late.txt")
+                _ = git(case.worktree, "commit", "-q", "-m", "checkpoint(alpha): the late work")
+                _ = (case.worktree / "draft.txt").write_text("draft\n", encoding="utf-8")
+                before = case.doc.read_text(encoding="utf-8")
 
-        code, output = self.retire()
+                code, output = case.retire()
 
-        self.assertEqual(code, 1)
-        self.assertIn(f"refused: uncommitted work in {self.worktree}: draft.txt", output)
-        self.assertEqual(self.calls, [])
-        self.assertTrue(self.worktree.is_dir())
-        self.assertEqual(self.doc.read_text(encoding="utf-8"), before)
+                case.assertEqual(code, 1)
+                case.assertIn(f"refused: uncommitted work in {case.worktree}: draft.txt", output)
+                case.assertEqual(case.calls, [])
+                case.assertTrue(case.worktree.is_dir())
+                case.assertEqual(case.doc.read_text(encoding="utf-8"), before)
+
+                case.assertIn("unmerged commits on alpha-branch", output)
+                case.assertIsInstance(case.unit_worktree(), staff.PresentWorktree)
 
     def test_the_recorders_project_started_line_is_not_uncommitted_work(self) -> None:
         plan = self.worktree / "work.txt"
@@ -750,24 +784,121 @@ class RetireUnitTests(unittest.TestCase):
 
 
     def test_retires_a_unit_with_a_seat_a_worker_and_a_reviewer(self) -> None:
-        code, output = self.retire()
+        for machine in (remote.local_machine(), "mac", "NaTeS-MacBook-Pro.LOCAL"):
+            with self.subTest(machine=machine):
+                case = self if machine == remote.local_machine() else RetireUnitTests()
+                if case is not self:
+                    case.setUp()
+                    self.addCleanup(case.doCleanups)
+                    _ = case.move_to_other_machine(machine)
+                code, output = case.retire()
 
-        self.assertEqual(code, 0, output)
-        self.assertEqual(self.stops(), [
-            ["stop_resume.stop", DIRECTOR],
-            ["stop_resume.stop", SEAT],
-            ["build_hold.py", "release", "--holder", DIRECTOR],
-        ])
-        self.assertIn("alpha retired", output)
-        self.assertEqual(self.unit_worktree(), staff.RemovedWorktree(remote.local_machine(), self.worktree))
-        row = staff.by_id(self.unit_staff_id)
-        assert row is not None
-        self.assertEqual(row.current_session, DIRECTOR)
-        self.assertEqual(git(self.checkout, "status", "--porcelain", "--untracked-files=no"), "")
-        self.assertFalse(self.worktree.exists())
-        self.assertEqual(git(self.checkout, "branch", "--list", "alpha-branch"), "")
-        self.assertEqual(git(self.checkout, "ls-remote", "--heads", "origin", "alpha-branch"), "")
+                case.assertEqual(code, 0, output)
+                case.assertEqual(case.stops(), [
+                    ["stop_resume.stop", DIRECTOR],
+                    ["stop_resume.stop", SEAT],
+                    ["build_hold.py", "release", "--holder", DIRECTOR],
+                ])
+                case.assertIn("alpha retired", output)
+                case.assertEqual(case.unit_worktree(), staff.RemovedWorktree(machine, case.worktree))
+                row = staff.by_id(case.unit_staff_id)
+                assert row is not None
+                case.assertEqual(row.current_session, DIRECTOR)
+                case.assertEqual(git(case.checkout, "status", "--porcelain", "--untracked-files=no"), "")
+                case.assertFalse(case.worktree.exists())
+                case.assertEqual(git(case.checkout, "branch", "--list", "alpha-branch"), "")
+                case.assertEqual(git(case.checkout, "ls-remote", "--heads", "origin", "alpha-branch"), "")
 
+
+    def test_remote_retirement_retries_failed_steps_without_retiring_the_staff_row(self) -> None:
+        for failure in ("stop", "remove", "branch", "origin", "ssh", "answer", "hold", "journal", "journal removal"):
+            with self.subTest(failure=failure):
+                case = RetireUnitTests()
+                case.setUp()
+                try:
+                    row = case.move_to_other_machine()
+                    remove = shutdown.retirement_remove
+                    def blocked_remove(unit: shutdown.RetiringUnit, *, settings: conf.ConfigRead) -> list[str]:
+                        case.assertEqual(remote.local_machine(), "mac")
+                        if failure == "remove":
+                            return ["fixture removal failed"]
+                        if failure == "origin":
+                            _ = git(case.checkout, "worktree", "remove", "--force", str(case.worktree))
+                            _ = git(case.checkout, "branch", "-D", "alpha-branch")
+                            return ["fixture branch deletion failed"]
+                        result = remove(unit, settings=settings)
+                        return ["fixture completion failed"] if failure == "branch" else result
+                    def stop(identity: str, *, deadline: float = math.inf) -> StopResult:
+                        case.assertEqual(remote.local_machine(), "mac")
+                        if failure == "stop":
+                            return stop_resume.StopFailed(identity, "fixture stop failed")
+                        return case.stop_session(identity, deadline=deadline)
+                    with (mock.patch.object(shutdown, "retirement_remove", side_effect=blocked_remove),
+                          mock.patch.object(stop_resume, "stop", side_effect=stop),
+                          mock.patch.object(shutdown, "run_remote", side_effect=case.remote_call) as ssh,
+                          mock.patch.object(shutdown, "retirement_holds", wraps=shutdown.retirement_holds) as holds):
+                        if failure in ("ssh", "answer"):
+                            ssh.side_effect = None
+                            ssh.return_value = (255, "") if failure == "ssh" else (0, "unreadable answer")
+                        if failure == "hold":
+                            holds.side_effect = None
+                            holds.return_value = (DIRECTOR,)
+                        if failure == "journal":
+                            _ = git(case.checkout, "worktree", "remove", "--force", str(case.worktree))
+                            code, output = case.retire()
+                            case.assertEqual(code, 0, output)
+                            case.assertEqual(output.count("anomaly:"), 1, output)
+                            case.assertIn("branch is unknown", output)
+                            case.assertEqual(case.unit_worktree(), staff.RemovedWorktree("mac", case.worktree))
+                            case.assertEqual(case.stops()[:2], [["stop_resume.stop", DIRECTOR], ["stop_resume.stop", SEAT]])
+                            case.assertNotEqual(git(case.checkout, "ls-remote", "--heads", "origin", "alpha-branch"), "")
+                            continue
+                        if failure == "journal removal":
+                            unlink = Path.unlink
+                            journal = case.root / "remote-shutdown/retire-worktrees" / f"{row.id}.json"
+                            def refuse_journal(path: Path, missing_ok: bool = False) -> None:
+                                if path == journal:
+                                    case.assertIsInstance(case.unit_worktree(), staff.RemovedWorktree)
+                                    raise PermissionError("fixture journal removal failed")
+                                unlink(path, missing_ok=missing_ok)
+                            with mock.patch.object(Path, "unlink", refuse_journal):
+                                code, output = case.retire()
+                            case.assertEqual(code, 0, output)
+                            case.assertEqual(output.count("anomaly:"), 1, output)
+                            case.assertIn("fixture journal removal failed", output)
+                            case.assertTrue(journal.exists())
+                            before = case.stops()
+                            case.assertEqual(case.retire(), (0, "unchanged\n"))
+                            case.assertEqual(case.stops(), before)
+                            case.assertFalse(journal.exists())
+                            continue
+                        code, output = case.retire()
+                    case.assertNotEqual(code, 0, output)
+                    case.assertNotIn("alpha retired", output)
+                    case.assertEqual(staff.by_id(row.id), row)
+                    case.assertIsInstance(unit_config.read_parked(row.id, cleanup=False), unit_config.ConfigMissing)
+                    case.assertEqual(case.worktree.exists(), failure not in ("branch", "origin"))
+                    journal = case.root / "remote-shutdown/retire-worktrees" / f"{row.id}.json"
+                    if failure == "origin":
+                        commit = git(case.checkout, "commit-tree", "main^{tree}", "-p", "main", "-m", "unmerged remote work")
+                        _ = git(case.checkout, "push", "-q", "origin", f"{commit}:refs/heads/alpha-branch")
+                        code, output = case.retire()
+                        case.assertEqual(code, 1, output)
+                        case.assertIn("refused: unmerged commits on alpha-branch", output)
+                        case.assertEqual(staff.by_id(row.id), row)
+                        case.assertTrue(journal.exists())
+                        case.assertIn(commit, git(case.checkout, "ls-remote", "--heads", "origin", "alpha-branch"))
+                        _ = git(case.checkout, "merge", "-q", "--ff-only", commit)
+                    code, output = case.retire()
+                    case.assertEqual(code, 0, output)
+                    case.assertFalse(case.worktree.exists())
+                    case.assertEqual(case.unit_worktree(), staff.RemovedWorktree("mac", case.worktree))
+                    case.assertFalse(journal.exists())
+                    before = case.stops()
+                    case.assertEqual(case.retire(), (0, "unchanged\n"))
+                    case.assertEqual(case.stops(), before)
+                finally:
+                    case.doCleanups()
 
     def outside_director(self) -> Path:
         self.claude = []

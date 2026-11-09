@@ -100,7 +100,7 @@ class RowResolverTests(StaffTestCase):
                 ("shared-fixture",)))
             self.assertEqual(resolver.unit_config(fixture.worker), resolver.unit_config(fixture.unit))
             self.assertEqual(resolver.production_doc(fixture.unit),
-                             session_staff.ProductionDoc("natedev", fixture.doc, fixture.runner))
+                             session_staff.ProductionDoc("natedev", fixture.doc, fixture.runner, "# Production\n"))
             self.assertEqual(resolver.merge_branch(fixture.unit), session_staff.Branch("merge-from-git"))
             self.assertIsInstance(resolver.unit_state(fixture.unit), session_staff.ActiveUnit)
             self.assertEqual(resolver.member_by_folder("natedev", fixture.worktree),
@@ -112,7 +112,8 @@ class RowResolverTests(StaffTestCase):
         worker = replace(fixture.worker, parent=staff.ReportsTo(fixture.runner.id))
         resolver = session_staff.RowResolver(staff.StaffSnapshot((fixture.runner, fixture.unit, worker)))
         self.assertIsInstance(resolver.unit_config(worker), session_staff.NoUnitConfig)
-        self.assertEqual(resolver.production_doc(worker), session_staff.ProductionDoc("natedev", fixture.doc, fixture.runner))
+        self.assertEqual(resolver.production_doc(worker),
+                         session_staff.ProductionDoc("natedev", fixture.doc, fixture.runner, "# Production\n"))
 
     def test_unfilled_locations_keep_explicit_incomplete_outcomes(self) -> None:
         runner, unit, worker = self.tree()
@@ -222,7 +223,8 @@ class RowResolverTests(StaffTestCase):
             self.assertIsInstance(config, unit_config.UnitConfig)
             assert isinstance(config, unit_config.UnitConfig)
             self.assertEqual(config.plan, unit_config.StandbyPlan())
-            self.assertEqual(resolver.production_doc(first), session_staff.ProductionDoc("mac", fixture.doc, runner))
+            self.assertEqual(resolver.production_doc(first),
+                             session_staff.ProductionDoc("mac", fixture.doc, runner, "# Production\n"))
             self.assertEqual(resolver.merge_branch(first), session_staff.Branch("merge-from-git"))
         self.assertEqual(len(transports), 1)
 

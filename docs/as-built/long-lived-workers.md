@@ -630,6 +630,24 @@ It stores none of these three fields.
 Unavailable backend evidence gives `account` the `AccountUnavailable` state and its cause.
 That row has no `home` field.
 
+`worker.py list` text rows read `<n> <name> <role> <account>[ <machine>] <pane> <state>[ <reason>]`.
+`_worker_pane_state` is the one mapping from an observed worker to its pane and state words.
+
+| Observed worker | Pane | State |
+| --- | --- | --- |
+| `OpenWorker` | `open` | `paused` or `exited` from the staff row, else `busy`, `idle` or `unknown` |
+| `StoppedWorker` | `open` | `exited` |
+| `ClosedWorker` | `closed` | `-` |
+| Any other class | `unknown` | `-`, and the row keeps its reason |
+
+A row whose pane is not open prints `-` for the account.
+`list --all` prints `-` for the pane and the account, and a state from the dispatch status.
+`display_cells.machine_column` decides the machine field.
+The field shows only when a row uses a machine other than the home machine in `config/build_targets.conf`.
+A worker uses the machine of its parent's worktree.
+`list_workers(as_json=False)` replaces the `state` key with the column word, so the key holds the observed class name only in JSON output.
+`list --json` and `list --json --all` have no pane column and no machine field.
+
 ## Assignment settings and command files
 
 Pane workers have no option for compaction during a turn.

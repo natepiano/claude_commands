@@ -3395,6 +3395,27 @@ class ServiceTests(unittest.TestCase):
             self.assertEqual(fixture.server.handle_request(release), [wire.Ok()])
             self.assertEqual(fixture.state_text(), state)
 
+            for process in ("current", "fresh"):
+                with self.subTest(process=process):
+                    if process == "current":
+                        fixture.restart()
+                        restored = wire.encode_record(fixture.server.ledger[release.request_id].reply)
+                    else:
+                        result = subprocess.run([sys.executable, "-c", "\n".join((
+                            "import sys",
+                            "from scripts.build_queue import admission_protocol as wire",
+                            "from scripts.build_queue.admission_test_support import AdmissionFixture",
+                            "with AdmissionFixture() as fixture:",
+                            "    (fixture.state_dir / 'state.json').write_text(sys.stdin.read())",
+                            "    fixture.restart()",
+                            "    print(wire.encode_record(fixture.server.ledger['release-once'].reply))",
+                        ))], input=state, capture_output=True, text=True,
+                            cwd=Path(__file__).resolve().parents[2],
+                            timeout=test_hang_guard.TEST_HANG_GUARD_SECS, check=False)
+                        self.assertEqual(result.returncode, 0, result.stderr)
+                        restored = result.stdout.strip()
+                    self.assertEqual(restored, wire.encode_record(wire.Ok()))
+
     def test_restart_thirty_waiters_keeps_places_and_order_fields(self) -> None:
         with AdmissionFixture() as fixture:
             fixture.free(0)

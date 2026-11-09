@@ -270,8 +270,8 @@ class AddUnitTestCase(ShutdownTestCase):
     def setUp(self) -> None:
         super().setUp()
         self.staff = StaffTestCase()
-        self.staff.setUp()
         self.addCleanup(self.staff.doCleanups)
+        self.staff.setUp()
         _ = self.enterContext(patch.object(names, "load_names", return_value=fixture_names()))
         _ = self.enterContext(patch.object(sessions, "process_start", side_effect=fixture_process_start))
         _ = self.enterContext(patch.object(runtime_sessions, "process_start", side_effect=fixture_process_start))

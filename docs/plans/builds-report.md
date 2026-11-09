@@ -206,7 +206,9 @@ Method (side A and side B 1 already ran this way; keep it):
 4. Run each verify.sh call with `--local`, `--no-cache` and the measurement reason, on natedev only.
 5. Record wall, build, test, wait and load per run. Exclude an interrupted run.
 6. Each incremental run alternates adding and removing one comment in `crates/hana/src/environment/constants.rs`, a leaf module of the hana binary. Both sides use the same edit sequence; side B starts from the original file.
-7. The completed runs, the clone path and the run receipts are in `report-unit-dylib-ab.md` at the worktree root. Read it first and run only the missing runs.
+7. The completed runs are in `report-unit-dylib-ab.md` at the worktree root. Read it first and run only the missing runs.
+8. The missing runs are side B incremental tests 2 and 3. The B2 run `20261103T221339-813897-4c39` ended with exit 143 while it waited for memory, so it is not a sample. Its record and log are in `/tmp/claude/unit/b090f8f1-cf8e-4d44-8e52-b223d94de9cc/mesh_runs/`. Check that record again before you select the runs.
+9. The clone at `/tmp/claude/unit/b090f8f1-cf8e-4d44-8e52-b223d94de9cc/dylib_ab/hana` no longer exists (checked 2026-11-09). `target-a` and `target-b` remain beside it. Make a new clone at the same commit in that folder. If the target folders are gone, the side B runs need a new cold build first.
 
 Completion gate: add one row to `docs/plans/builds-report-rounds.md` with the hana commit, the settings of each side, the measured times, the limits and the conclusion. Mark it as a controlled A/B result, not a phase-time measurement over ten hana phases. Record the `record.py` commit of each run: Phase 16 cut its CPU per step. If runs used different versions, say so; do not repeat completed runs for that reason.
 
@@ -905,3 +907,31 @@ The build log index uses WAL mode, so a spilled update takes no exclusive lock a
 
 **Gotchas:**
 - The kernel stamps file times from a coarse clock that can be one tick behind `time.time()`. A test that compares a file time with `time.time()` fails now and then; a cloud gate saw a 0.16 ms miss.
+
+### Phase 43 — The build page proof removes the folders it makes · status: done
+
+#### As-built
+
+- `memory_page_proof.mjs` removes its `memory-page-proof-*` output folder and its `memory-proof-chrome-*` profile when the proof ends, on pass and on failure.
+- A folder given as `argv[2]` belongs to the caller and stays. The success line names `output` only for that folder.
+- The script has no folder scan and no signal handler.
+
+**Files:**
+- `scripts/build_queue/memory_page_proof.mjs` — the build page proof.
+
+**Gotchas:**
+- Chrome refuses a long temporary socket path. Run the proof under a short `$TMPDIR` when the default path is long.
+
+### Phase 44 — A vault stop files a question only when the next hourly try also stops · status: done
+
+#### As-built
+
+- The Mac script's `retry_git` prints Git output only for the final failure: exhausted lock retries, or an error that is not a lock. A vault stop shows the Git error once.
+- `_vault_locked` files a question only when an outage was already open before the run, for every stop cause. A first stop opens the outage with `asked` false.
+- The 24-hour Mac unreachable grace still applies. A failed `ask` retries on the next run. A good sync after a first stop files no question and withdraws none.
+- Any run of `buildlog vault` counts as the next try, also a manual one.
+- Exit codes did not change. The rule has no config key: one try is not a tunable.
+
+**Files:**
+- `scripts/buildlog/vault_pull.py` — the sync and its question rule.
+- `scripts/buildlog/test_vault_pull.py` — the rule for each stop cause, and the single error line.
