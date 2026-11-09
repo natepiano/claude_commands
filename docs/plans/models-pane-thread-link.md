@@ -74,45 +74,19 @@ In `worker.py` `_dispatch_turn`, a `DispatchEvidenceUnknown` in the wait loop af
 
 ### Phase 4 — A restored Codex worker resumes with its full launch policy  · status: done
 
-**Depends on:** none. panes Phase 34 adds a `-c notify=` pair that this record keeps.
+#### As-built
 
-#### Work Order
+`PaneLaunch.codex_policy: NotRequired[list[str]]` holds the Codex launch's `--sandbox`, `--ask-for-approval` and `-c` option and value pairs in launch order. `pane_launch.launch(..., kind="codex")` fills it from the paired and the `--opt=<v>` forms, stops at `--`, and does not record a `-c projects=...` pair. A Claude launch has no field. `_validated_launch` accepts the field only as a list of strings.
 
-**Goal:** A Codex worker restored from its pane record resumes with the same launch policy it started with, so the pane worker check finds its policy complete.
-
-**Spec:**
-Fault (sdlc asked models to find the cause and fix it where it lives): `scripts/shutdown/pane_record.py` `resume_arguments` resumes Codex with `resume <id>` and `--model <m>` only. The record keeps no `--sandbox`, `--ask-for-approval` or `-c` options. `worker_panes._live_policy` requires `--model`, `--sandbox` and `--ask-for-approval` in the running command, so a restored worker reads `running launch policy is incomplete`. A resumed reviewer also runs without its sandbox and approval policy (cargo-liner defect).
-
-Fix:
-1. `scripts/herdr/pane_launch.py`:
-   - `PaneLaunch` gets `codex_policy: NotRequired[list[str]]`: the Codex policy options of the launch, in launch order, as option and value pairs.
-   - `launch(..., kind="codex")` fills it from the arguments: each `--sandbox <v>`, `--ask-for-approval <v>` and `-c <v>`, also the `--opt=<v>` form. A `kind="claude"` launch does not get the field.
-   - `_validated_launch` accepts the field only as a list of strings.
-2. `scripts/shutdown/pane_record.py` `resume_arguments`: a Codex entry gives `resume <id>`, then `--model <m>` when set, then the recorded `codex_policy` unchanged. An entry without the field gives today's arguments.
-
-Every `-c` pair is kept, so the `model_reasoning_effort`, `notice.hide_rate_limit_model_nudge`, `service_tier` and the later panes Phase 34 `notify` pair all come back on a resume.
-
-Add no other check (user, 2026-11-05 and 2026-11-07).
-
-Test rows:
-- `scripts/herdr/test_pane_launch.py`, in the existing launch-record tests:
-  1. A Codex launch records its `--sandbox`, `--ask-for-approval` and `-c` pairs in order; a Claude launch records none.
-- `scripts/shutdown/test_pane_record.py`, in the existing resume-argument or Codex record tests:
-  2. A Codex entry with `codex_policy` resumes with `resume <id> --model <m>` followed by the recorded pairs.
+`pane_record.resume_arguments` gives `resume <id>`, then `--model <m>` when set, then the recorded pairs unchanged. A record without the field resumes with `resume <id>` and `--model <m>` only. A restored worker passes `worker_panes._live_policy`, and every `-c` pair (`model_reasoning_effort`, `notice.hide_rate_limit_model_nudge`, `service_tier`, the panes `notify` pair) comes back on a resume.
 
 **Files:**
 - `scripts/herdr/pane_launch.py` — `PaneLaunch.codex_policy`, `launch`, `_validated_launch`.
-- `scripts/herdr/test_pane_launch.py` — row 1.
+- `scripts/herdr/test_pane_launch.py` — launch-record rows: Claude, Codex paired, Codex `=` form, a restored-process argv with the trust override.
 - `scripts/shutdown/pane_record.py` — `resume_arguments`.
-- `scripts/shutdown/test_pane_record.py` — row 2.
+- `scripts/shutdown/test_pane_record.py` — resume rows with and without a recorded policy and a model.
 
-**Workers:** 2 writers.
-- `impl`: `scripts/herdr/pane_launch.py`, `scripts/herdr/test_pane_launch.py` (row 1).
-- `test`, as a writer: `scripts/shutdown/pane_record.py`, `scripts/shutdown/test_pane_record.py` (row 2).
-
-**State:** a new optional field in the retained pane launch record. Old records without it resume as today.
-
-**Acceptance gate:** `scripts.herdr.test_pane_launch`, `scripts.shutdown.test_pane_record`, `scripts.shutdown.test_stop_resume` and `scripts.herdr.test_worker_panes` pass; basedpyright is clean on the changed files; the merge gate passes.
+**Gotchas:** `codex_trust.trust_arguments` puts `-C <root> -c projects={<root>={trust_level="trusted"}}` before every Codex resume, and the record of a restored process is read from that full argv. A recorded `projects` pair would come after the new one and win after a folder move, so the record leaves it out.
 
 ### Phase 5 — One way to read a Codex thread  · status: todo
 
