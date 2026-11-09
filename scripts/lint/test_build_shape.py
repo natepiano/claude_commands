@@ -78,16 +78,13 @@ class BuildShapeTests(unittest.TestCase):
 
 @final
 class IndexStepEvidenceTests(unittest.TestCase):
-    def __init__(self, methodName: str = "runTest") -> None:
-        super().__init__(methodName)
-        self.directory = tempfile.TemporaryDirectory()
-        self.index = Path(self.directory.name) / "steps.sqlite"
-        self.before = datetime(2026, 10, 30, 9, tzinfo=UTC)
-        self.cutoff = self.before - timedelta(days=14)
+    index: Path = Path()
+    before: datetime = datetime(2026, 10, 30, 9, tzinfo=UTC)
+    cutoff: datetime = before - timedelta(days=14)
 
     @override
     def setUp(self) -> None:
-        self.addCleanup(self.directory.cleanup)
+        self.index = Path(self.enterContext(tempfile.TemporaryDirectory())) / "steps.sqlite"
         create_step_index(self.index)
 
     def evidence(self, *call_ids: str, step: str = "build") -> dict[tuple[str, str], StepEvidence]:
