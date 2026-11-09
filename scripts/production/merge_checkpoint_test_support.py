@@ -271,6 +271,11 @@ class MergeCheckpointFixture(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
+        def cleanup() -> None:
+            if self.fixture_root.exists():
+                shutil.rmtree(self.fixture_root)
+
+        self.addCleanup(cleanup)
         # Git's linked worktree metadata names absolute paths. Each case gets
         # private files, refs and origin restored at the seed's original path.
         if self._testMethodName == "runTest" and self.fixture_root.exists():
@@ -278,12 +283,6 @@ class MergeCheckpointFixture(unittest.TestCase):
             # outer fixture is unused; each matrix cell restores a fresh seed.
             shutil.rmtree(self.fixture_root)
         _ = shutil.copytree(self.fixture_snapshot, self.fixture_root)
-
-        def cleanup() -> None:
-            if self.fixture_root.exists():
-                shutil.rmtree(self.fixture_root)
-
-        self.addCleanup(cleanup)
         self.bind_fixture(self.fixture_root)
         _ = self.enterContext(isolated_staff_file(Path(self.env["STAFF_FILE"]), self.env))
 
