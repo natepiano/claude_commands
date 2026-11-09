@@ -1258,25 +1258,26 @@ Checkpoint `1f9e9c484` on `verify-not-mac-wait`, merged to builds as `a62793f07`
 
 **Ruled out:** removing the `step_record` re-exports — `aws_target.py` and `test_control.py` import the types from there.
 
-### Phase 41y — No process outlives the hold event tests under load  · status: todo
+### Phase 41y — No process outlives the hold event tests under load  · status: done
 
 **Depends on:** none. Runs after 41w.
 
 #### Work Order
 
-**Source:** builds, 2026-11-08. `direct/test_verify_hold_events.py` `test_local_admission_without_inotify_polls_until_release` failed on its first run with "a fixture cleanup failed; a process may have outlived the test", then passed alone. Two cloud-gate cases on 2026-11-08: phase-tables 11f3e4 (15:33) and build-report 857554.
+**Source:** builds, 2026-11-08. `direct/test_verify_hold_events.py` `test_local_admission_without_inotify_polls_until_release` failed on its first run with "a fixture cleanup failed; a process may have outlived the test", then passed alone. Two cloud-gate cases on 2026-11-08: phase-tables 11f3e4 (15:33) and build-report 857554. A third case, cloud gate 349fd6: in `direct/test_verify_hold_memory.py`, `holder_joining` failed its cleanup the same way, and its fixture root under `/dev/shm` stayed. The next test then failed with `FileExistsError` in `shutil.copytree` (`VerifyHoldTools.setUp`, `verify_hold_wait_test_support.py:213`). The module passed alone.
 
 **Goal:** the hold event tests leave no process behind under load, and a cleanup failure names each process that outlived the test.
 
 **Spec:**
 1. **Message.** `VerifyHoldWaitFixture.fixture_cleanups` (`verify_hold_wait_test_support.py:322`) asserts that `self.fixture.doCleanups()` returns true. That call drops the inner failure, so the report loses the survivor list from `assert_nothing_outlives` (`verify_mac_offload_test_support.py:1119`). Make the outer failure carry the inner failure text: each survivor with its command line.
-2. **Reproduce.** Run `test_verify_hold_events.py` repeatedly under CPU load until the failure shows. Name the process that outlives the test, the code that starts it, and why it is still alive after the marker wait. Put the evidence in the summary.
+2. **Reproduce.** Run `test_verify_hold_events.py` and `test_verify_hold_memory.py` repeatedly under CPU load until the failure shows. Name the process that outlives the test, the code that starts it, and why it is still alive after the marker wait. Say why the `holder_joining` fixture root stayed after its cleanup failed. Put the evidence in the summary.
 3. **Fix the cause where it lives.** Change the code that leaves the process behind. If the process detaches by design, the fixture waits for its exit event, as it does for lint recorders. Add no retry, and do not raise a time limit.
-4. **Proof.** Under the load from item 2, the module passes 20 runs in a row on the final tree. Before the fix, the same load gives at least one failure, or the summary says why the failure did not show.
+4. **Proof.** Under the load from item 2, each of the two modules passes 20 runs in a row on the final tree. Before the fix, the same load gives at least one failure, or the summary says why the failure did not show.
 
 **Files:**
 - `scripts/direct/verify_hold_wait_test_support.py` — the cleanup message.
 - `scripts/direct/verify_mac_offload_test_support.py` — the outlive check, if the fix is a fixture wait.
+- `scripts/direct/test_verify_hold_events.py` — the deadline test watches a private parent folder, so directory events from tests that run beside it under load do not end its wait early.
 
 The file that starts the surviving process is not known yet. Item 2 names it; the director adds it to the file set, and the checkpoint notice names its owner.
 
