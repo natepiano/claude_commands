@@ -1085,7 +1085,7 @@ def _publication_docs(production: Path, record: staff.StaffSnapshot) -> list[Pat
 def checkpoint_producers(record: staff.StaffSnapshot) -> dict[str, tuple[staff.StaffId | UnknownProducer, str]]:
     """Read each checkpoint's recorded owner once for a publication scan."""
     recorded: dict[str, tuple[staff.StaffId | UnknownProducer, str]] = {}
-    events, _ = load_events({"checkpoint"})
+    events, _ = load_events({"checkpoint"}, record=record)
     for event in events:
         checkpoint = event.get("checkpoint_commit")
         if not isinstance(checkpoint, str):
