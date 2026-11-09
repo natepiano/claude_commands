@@ -24,6 +24,8 @@ from typing import TypedDict, cast, final, override
 from unittest import mock
 
 from scripts.style import style_sync
+from scripts.style import style_plan
+from scripts.style.style_child_test_support import unqueued_style_children
 from scripts.style.add_style import NoStyleProduction, standing_style_production
 from scripts.copies import copies
 from scripts.lib import scratch
@@ -328,18 +330,66 @@ class StyleSyncTests(unittest.TestCase):
 
     def test_direct_own_tree_comparison_uses_the_unit_branch_and_records_main(self) -> None:
         self.direct_production()
-        with style_ledger.open_ledger(self.repo) as ledger:
-            ledger.set_tip(self.tip, "main")
-        _ = (self.repo / "src/lib.rs").write_text("fn changed() {}\n")
-        _ = self.git("commit", "-qam", "Change main")
-        tip = self.git("rev-parse", "HEAD")
-        arguments = ["own-handoff", "--repo", str(self.repo), "--tip", tip,
-                     "--style-branch", "main", "--unit", "names"]
-        with redirect_stdout(io.StringIO()):
-            self.assertEqual(style_sync.main(arguments), 0)
-        with style_ledger.open_ledger(self.repo) as ledger, closing(sqlite3.connect(ledger.database)) as connection:
-            self.assertEqual(ledger.synced_commit(), tip)
-            self.assertEqual(connection.execute("SELECT style_branch FROM sync").fetchone(), ("refs/heads/main",))
+        _ = self.enterContext(unqueued_style_children())
+        worktree = self.root / "direct-names"
+        rule = "global:rust/names.md"
+        _ = (self.root / "nate_style/rust/names.md").write_text("---\ntier: C\nfamily: names\ninput_scope: file\n---\n# Names\n")
+        run = self.root / "run"
+        journal = style_ledger.publication_path(worktree, "publication.json")
+
+        def assign(ticket: str, source: str) -> None:
+            with style_ledger.open_ledger(worktree) as ledger:
+                ledger.ticket_add(ticket, ticket_owner_id("names"), "read", "names", ".", [source], [rule])
+                ledger.ticket_assign(ticket, "unit-names")
+                _ = ledger.ticket_base(ticket)
+                head = style_sync.git(worktree, "rev-parse", "HEAD")
+                blob = ledger.pinned_rule_texts(ticket)[0].blob
+                ledger.record(rule, source, head, blob, "clean", ticket=ticket, worker="test")
+
+        unlink = Path.unlink
+        def stop_before_journal_removal(path: Path, missing_ok: bool = False) -> None:
+            if path == journal:
+                raise RuntimeError("publication stopped after checkpoint record")
+            unlink(path, missing_ok=missing_ok)
+
+        for case, interrupted in (("ordinary merge", False), ("stopped publication", True)):
+            with self.subTest(case=case), mock.patch.object(
+                    style_plan, "run_verification_step", return_value=subprocess.CompletedProcess([], 0)):
+                with style_ledger.open_ledger(self.repo) as ledger:
+                    ledger.set_tip(self.tip, "main")
+                if interrupted:
+                    assign("3001", "src/lib.rs")
+                    with mock.patch.object(Path, "unlink", stop_before_journal_removal):
+                        with self.assertRaisesRegex(RuntimeError, "publication stopped after checkpoint record"):
+                            _ = style_plan.publish_checkpoint(worktree, "3001", run, "1", "First checkpoint\n")
+                    self.assertTrue(journal.exists())
+                    with style_ledger.open_ledger(worktree) as ledger:
+                        self.assertEqual(ledger.ticket_get("3001")["state"], "checkpointed")
+                    self.assertEqual(style_sync.git(worktree, "status", "--porcelain"), "")
+                _ = (self.repo / "src/lib.rs").write_text(f"fn changed_{int(interrupted)}() {{}}\n")
+                if interrupted:
+                    _ = (self.repo / "src/later.rs").write_text("fn later() {}\n")
+                    _ = self.git("add", "src/later.rs")
+                _ = self.git("commit", "-qam", "Change main")
+                tip = self.git("rev-parse", "HEAD")
+                arguments = ["own-handoff", "--repo", str(self.repo), "--tip", tip,
+                             "--style-branch", "main", "--unit", "names"]
+                with redirect_stdout(io.StringIO()):
+                    self.assertEqual(style_sync.main(arguments), 0)
+                with style_ledger.open_ledger(self.repo) as ledger, closing(sqlite3.connect(ledger.database)) as connection:
+                    self.assertEqual(ledger.synced_commit(), tip)
+                    self.assertEqual(connection.execute("SELECT style_branch FROM sync").fetchone(), ("refs/heads/main",))
+                if interrupted:
+                    self.assertEqual(style_sync.git(worktree, "merge-base", "HEAD", tip), tip)
+                    self.assertFalse(journal.exists())
+                    _ = self.git("merge", "--no-edit", "unit-names")
+                    with style_ledger.open_ledger(worktree) as ledger:
+                        _ = ledger.ticket_merge("3001")
+                    assign("3002", "src/later.rs")
+                    checkpoint = style_plan.publish_checkpoint(worktree, "3002", run, "2", "Later checkpoint\n")
+                    self.assertEqual(style_sync.git(worktree, "rev-parse", "HEAD"), checkpoint)
+                    with style_ledger.open_ledger(worktree) as ledger:
+                        self.assertEqual(ledger.ticket_get("3002")["checkpoint"], checkpoint)
 
     def test_processed_tip_does_not_skip_a_second_direct_units_main_merge(self) -> None:
         self.direct_production()

@@ -23,7 +23,7 @@ For `**Kind:** style`, that procedure takes precedence over `commands/showrunner
 | `scripts/style/candidate_generators.py` | `CandidatesSpec`, 15 generator kinds, `enumerate_candidates` (no cap) |
 | `scripts/style/style_ledger.py` | The ledger: cells, judgments, lint runs, tickets, hand-offs, held findings, declaration follow, CLI |
 | `scripts/style/finding_sites.py` | Site evidence for an open finding after its file changed: `UnchangedSite`, `NeedsJudgment`; cached source, item and owner indexes per blob |
-| `scripts/style/style_plan.py` | Refill (`next-phase`), publication coordinator (`checkpoint`), ticket gate (`gate`), `sync-unit`, `queue`, ticket selection, phase text |
+| `scripts/style/style_plan.py` | Refill (`next-phase`), publication coordinator (`checkpoint`), ticket gate (`gate`), `queue`, ticket selection, phase text |
 | `scripts/style/style_config.py` | `Style units` reader, family ownership, ticket capacity and merge route |
 | `scripts/style/mechanical_classes.toml`, `mechanical_classes.py` | The classes of change a unit applies without the user (`pure-move`, `stale-allow-lint`, `binding-rename`): name, proof, rules, summary; the loader `classes()` and `explained_files` |
 | `scripts/style/style_footprint.py` | Mechanical-fix filter (`check`), lexical Rust tokenizer, item starts (`item_starts`), module paths (`crate_module`, `resolved_module`, `use_trees`), canonical comparison (`canonical_code`, `comment_gaps`, `sorted_use_groups`) |
@@ -369,13 +369,12 @@ The message is `waiting on the showrunner: sync | board | ticket <id> merge`.
 A sync message or `ticket <id> merged; refill.` resumes a sync wait.
 A sync message or any showrunner message resumes a board wait.
 The message `ticket <id> merged; refill.` resumes a ticket wait.
-Exit 6 runs `style_plan.py sync-unit --repo <unit worktree> --unit <unit>`, then refill.
-A pending sync stops assignments while assigned workers finish. Report a refused merge to the receiving showrunner.
+Exit 6 uses the configured sync route below.
+A pending sync stops new assignments while assigned workers finish.
 A standing plan never runs FinalGate, RunAsBuilt, final PeriodicCI, CICleanup, RunSummary or shrink.
 
-- Units coordinate incoming merges through `style_plan.py sync-unit`.
-  The style showrunner route uses a fast-forward from the style branch.
-  The direct route uses a normal unit merge from the branch point through `style_sync.py`.
+Follow `~/.claude/docs/style_production.md`, section Sync, for the Style showrunner route or Direct route.
+
 - Checkpoint: use `style_plan.py checkpoint --repo R --ticket T --session-dir S --phase P --message-file M`.
   The publication lock serializes checkpoint publication.
   With N=1 and one assigned ticket, the gate and verification use the editing tree.

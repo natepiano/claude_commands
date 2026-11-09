@@ -319,12 +319,9 @@ A run that stopped, failed, or waits on a decision has no finish in its record, 
    dispatch (user, 2026-10-16), and when the showrunner asks:
    `git fetch origin <merge branch> && git merge --no-ff -m "merge(<plan-slug>): <merge branch> at <short hash> — <reason>" origin/<merge branch>`.
    Resolve conflicts on your side, build and test, then continue.
-   Standing style units use `style_plan.py sync-unit --repo <unit-worktree> --unit <unit>` to coordinate incoming merges.
+   Standing style units use the configured sync route.
    A pending sync stops new assignments while assigned workers finish.
-   With a style showrunner, sync uses a fast-forward from the style merge branch.
-   Report a refused fast-forward to that showrunner.
-   Without a style showrunner, use the normal unit merge through the direct route in `style_sync.py`.
-   See `docs/style_production.md`, Sync.
+   Follow `~/.claude/docs/style_production.md`, section Sync, for the Style showrunner route or Direct route.
 6. **Start order.** The showrunner records a start-order wait as an owed action in its notes.
    Use `cargo-berth sequence` for merge order.
 7. **What a phase fixes** (user, 2026-09-28 and 2026-10-01). Reviews, design

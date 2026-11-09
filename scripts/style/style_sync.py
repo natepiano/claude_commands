@@ -35,6 +35,7 @@ from scripts.message import send_result, send_budget, session_send
 from scripts.production import showrunners
 from scripts.style import style_ledger
 from scripts.style import style_config
+from scripts.style import style_plan
 from scripts.style.unit_files import changed_files
 from scripts.lib.process_failure import failure_detail
 from scripts.lib import scratch
@@ -230,6 +231,7 @@ def own_handoff(repo: Path, tip: str, style_branch: str, unit: str = "") -> int:
     if isinstance(sync, DirectUnitSync):
         style_branch = sync.route.receiving_branch
         with style_ledger.publication_lock(sync.worktree), style_ledger.open_ledger(repo) as ledger:
+            _ = style_plan.recover_publication(sync.worktree, ledger)
             opened = ledger.ticket_open(str(sync.unit))
             if any(ticket["state"] == "assigned" for ticket in opened) or changed_files(sync.worktree):
                 ledger.wait_for_sync(str(sync.unit))

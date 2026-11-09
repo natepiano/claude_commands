@@ -31,8 +31,12 @@ Refill assigns up to N disjoint tickets. The footprint proof runs at assignment,
 | 3 | `waiting for sync` or `waiting for structure: <crates>`; report the printed line once to the showrunner and end the turn with `— blocked: waiting on the showrunner: sync`. Refill on its sync message or any `ticket <id> merged; refill.`. |
 | 4 | `waiting for board`; report `board unavailable: <reason>` once and end the turn with `— blocked: waiting on the showrunner: board`. Refill on the next sync or showrunner message. |
 | 5 | `waiting for merge: <id>`; report once and end the turn with `— blocked: waiting on the showrunner: ticket <id> merge`. Refill on `ticket <id> merged; refill.` |
-| 6 | `merge the style branch first: <n> cells judged at <unit tip> wait for <style branch>`. Run `style_plan.py sync-unit --repo <unit-worktree> --unit <unit>`, then refill. A pending sync stops new assignments while assigned workers finish. Report a refused merge once to the showrunner. |
+| 6 | `merge the style branch first: <n> cells judged at <unit tip> wait for <style branch>`. Follow the sync routes below. |
 | Other nonzero | Report the error and retain the ticket; repair it before refill. |
+
+A pending sync stops new assignments while assigned workers finish.
+
+Follow `~/.claude/docs/style_production.md`, section Sync, for the Style showrunner route or Direct route.
 
 A standing plan never closes its run: skip FinalGate, RunAsBuilt, the final
 PeriodicCI, CICleanup and RunSummary. Never stage or shrink the excluded plan,

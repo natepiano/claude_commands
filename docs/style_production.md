@@ -349,9 +349,8 @@ modules unit's structure tickets merge
 `board unavailable: <reason>`; 5 means
 `waiting for merge: <ticket> checkpointed at <commit7>`; 6 means
 `merge the style branch first: <n> cells judged at <unit tip7> wait for <style branch>`.
-On 6, run `style_plan.py sync-unit --repo <unit-worktree> --unit <unit>`, then refill.
+On 6, follow the configured route in [Sync](#sync), then refill.
 A pending sync stops new assignments while assigned workers finish.
-Report a refused merge to the receiving showrunner.
 Unknown reservation
 availability stops selection without recording work. `queue` is a read-only
 preview and also returns 4 when the board is unavailable.
@@ -517,7 +516,7 @@ Main enters the unit branch through the normal unit merge in `style_sync.py`.
 
 1. Run `style_sync.py resume --repo <unit-worktree> --production <unit> --branch-point <branch point> --style-branch <parent merge branch>` at startup.
    This reconciles the direct route without sending hand-offs.
-2. On a sync notice, run `style_sync.py own-handoff --repo <unit-worktree> --unit <unit> --tip <tip> --style-branch <parent merge branch>`.
+2. On a sync notice or refill exit 6, run `style_sync.py own-handoff --repo <unit-worktree> --unit <unit> --tip <tip> --style-branch <parent merge branch>`.
    The command holds the publication lock during the unit merge.
    Exit 4 means assigned tickets or local changes prevent the merge; let the workers finish before repeating it.
    Exit 0 records the matching unit tree as synced and needs no new lint run.
@@ -527,10 +526,14 @@ Main enters the unit branch through the normal unit merge in `style_sync.py`.
    Then run `style_ledger.py set-tip --repo <unit-worktree> --tip <tip> --style-branch <parent merge branch>`.
    Run `style_ledger.py tip done --repo <unit-worktree> --tip <tip>`, then refill.
 
-Use `style_plan.py sync-unit --repo <unit-worktree> --unit <unit>` for a coordinated main merge between publications.
-A pending sync stops new assignments while assigned workers finish.
-
 ### Style showrunner route
+
+For refill exit 6, the unit director follows these steps:
+
+1. Wait until the assigned workers finish.
+2. Run `git -C <unit-worktree> fetch origin <style merge branch> && git -C <unit-worktree> merge --ff-only origin/<style merge branch>`.
+3. Report a refused fast-forward or an unchanged HEAD once to the style showrunner.
+4. Refill after a successful fast-forward that changes HEAD.
 
 Every successful parent merge runs the best-effort notification:
 
