@@ -187,6 +187,14 @@ The run ids include received results that still await a worker reply.
 An empty turn reply writes no reply file and adds no `; reply <path>` text.
 Run events retain the last worker reply while a result awaits a reply.
 A live run reports `waiting on runs`, including when an earlier result awaits a reply.
+A turn without DONE sends one `no DONE` notice when no pending work explains it.
+The notice includes the worker's last reply and leaves the pass active.
+Named adversary and contract reviews record `done` through the same hook.
+The hook also saves an assigned style review result.
+Each ignored event appends one JSON line to `$XDG_STATE_HOME/herdr/turn-end-ignored.jsonl`.
+The default path is `~/.local/state/herdr/turn-end-ignored.jsonl`.
+Each line records the time, exit reason, event kind, thread id, and worker name when known.
+This diagnostic changes no outcome and sends no notice.
 A refused launcher retry retains the existing pass and its run, including a run with one worker.
 A later DONE reply corrects a launcher error for the same pass and permits pane closure.
 The review trial uses the latest completion duration for each pass.
@@ -340,7 +348,7 @@ Run these suites on the Mac with a scratch home. Run the command from the root o
 - Trust counts only on an exact key: the folder, its toplevel, or its main checkout. An accepted ancestor folder never counts.
 - The trust survey prints only the key, accepted and kind fields of `.claude.json`, never any other field.
 - One prompt per launch, never sent twice. `agent start` carries no prompt; the opening prompt goes through `agent prompt` once the agent is ready. Callers choose `OpeningPrompt` or `NoOpeningPrompt` explicitly.
-- Prompt input requires an agent status of `working`, `idle`, or `done` and an empty visible composer. An absent `interactive_ready` permits input. A boolean value controls input. A non-boolean value prints one readiness anomaly and prevents input. No Remote Control turn is required. Successful worker prompt delivery returns the launcher before the transcript must contain the prompt. A matching transcript prompt prevents replay. The matching final reply proves completion. A failed delivery command returns an error. An unreadable transcript prevents a retry. Both `idle` and `done` permit retyping after the settle time.
+- Prompt input requires an agent status of `working`, `idle`, or `done` and an empty visible composer. An absent `interactive_ready` permits input. A boolean value controls input. A non-boolean value prints one readiness anomaly and prevents input. No Remote Control turn is required. Successful worker prompt delivery returns the launcher before the transcript must contain the prompt. A matching transcript prompt prevents replay. A matching final transcript reply proves completion. With a matching transcript prompt, the hook can use its own DONE reply before the final transcript record appears. A live detached run still holds completion. A failed delivery command returns an error. An unreadable transcript prevents a retry. Both `idle` and `done` permit retyping after the settle time.
 - Each composer read uses `pane read --source visible --format ansi` and removes faint text. SGR 2 starts faint text. SGR 22 or 0 ends faint text. The parser skips colour arguments for SGR 38, 48, and 58. A faint hint can appear in an empty composer.
 
 The turn hook closes a completed pane after DONE.

@@ -3488,7 +3488,7 @@ Live proof (2026-11-09 05:10-05:14 EST, one new Codex worker, two passes with a 
 
 **Gotchas:** inside one pass, a wait with an unchanged outcome, reply and run ids sends nothing. Until this code is on main, the live hook still sends the old text, so the repeat guard can still hold done notices.
 
-### Phase 34c — Worker-pane anomalies from the builds report  · status: todo
+### Phase 34c — Worker-pane anomalies from the builds report  · status: done
 
 **Depends on:** Phase 34b (same hook and close code). sdlc [c2b76faf], 2026-11-09, from the builds showrunner's report.
 
