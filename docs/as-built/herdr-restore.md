@@ -102,12 +102,13 @@ Settings entry for the user, one more SessionEnd item:
   `WORKER_FIRST_TURN_SECONDS` (`config/direct.conf`). `worker_panes.start_or_resume` then publishes
   the staff row from the pane's `agent_session`.
 - A known identity launches with `resume <id>` and gets no first turn.
-- `herdr.pane_native_process` is the one reader of pane membership. For one foreground `codex`:
-  - an open rollout proves the pane;
+- `herdr.pane_native_process` reads pane membership for one foreground `codex`:
   - an `agent_session` equal to the row's `current_session` proves the pane;
   - a `resume` argument proves the pane when the report is empty (`UnreportedResume`: a resumed
     Codex reports nothing before its first prompt) or equals the argument;
   - a report that names another session proves nothing, and so does a pane row that cannot be read.
+- `herdr.native_process` uses the resume argument or the pane report. It reads no open rollout file.
+- Callers without a report use the process's own pane report through the same reader.
 - `PANE_AGENT_START_SECONDS` is the one launch deadline, for a worker and for a side pane.
 - `herdr.child_environment` removes `NO_COLOR`. With it, Claude draws no SGR, and `_composer_input`
   reads the faint placeholder as typed text.

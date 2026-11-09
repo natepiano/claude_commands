@@ -1160,6 +1160,25 @@ Before arming, each selected folder prints `would remove`.
 The first dry runs on 2026-10-27 found 106 loose folders on natedev and 13 on the Mac.
 They selected 36 and eight folders for removal.
 
+Phase 44 moved the Mac runner from the standing `~/rust/hana_catalyst_mac` clone to scratch clones.
+The old standing clone had no lifetime after that change.
+The director removed its 85.8 GiB target on 2026-11-08 with builds' approval.
+That removal closes the Phase 44 gap for the old target.
+Each folder creator must register its lifetime.
+`~/.cache` remains outside the Mac cleanup roots.
+
+The Mac audit log last changed on 2026-11-07 at 14:13:40 EST.
+Its saved runs predate the deployed `/usr/sbin` PATH repair.
+The old launchd PATH could not resolve the system `lsof`.
+The audit therefore kept due folders because process use was unavailable.
+The loaded `org.nixos.folder-audit` job now includes `/usr/sbin` in its PATH.
+Its plist has a change time of 2026-11-08 at 11:04:48 EST.
+The inspection does not expose the exact job load time.
+The 2026-11-08 inspection reports zero runs and no previous exit for the loaded job.
+The job has `RunAtLoad=false` and an 86400-second interval.
+No audit result after the PATH repair exists in that inspection.
+The next scheduled result must establish the removed count and the count of unavailable process-use rows.
+
 The maker is the earliest-started session whose own command creates the folder.
 The audit uses the scratch guard's `commands()` and `targets()` parser and resolves targets against the transcript row's `cwd`.
 Read-only commands, command output and message text do not prove ownership.
@@ -1422,10 +1441,11 @@ The job uses the mirror leases and claim locks above, plus the shared floor lock
 It trims only the shortfall below `sweep_floor_gib`, without an offload request.
 `ensure_mac_disk_floor()` keeps its 100 GiB on-demand trigger.
 
-The launchd job PATH includes `/usr/sbin` after `/usr/bin:/bin`.
-This lets the floor, scratch and folder-audit jobs find the system `lsof`.
+Nixos commit `efdf8bf` adds `/usr/sbin` after `/usr/bin:/bin` in the launchd job PATH.
+The loaded folder-audit job includes that PATH at the 2026-11-08 inspection.
+This PATH lets the floor, scratch and folder-audit jobs find the system `lsof`.
 The floor job writes both output streams to `~/Library/Logs/nate-jobs/disk-floor.log`.
-The nixos patch must be applied and nix-darwin activated before this job runs.
+Nix-darwin activation deploys the job definition and its PATH.
 The Mac floor finalizer uses the shared crossing path above and saves its receipts on the Mac.
 Its session message goes to natedev; its phone title and body name `Mac`.
 

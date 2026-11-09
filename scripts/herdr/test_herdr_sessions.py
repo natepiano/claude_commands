@@ -139,7 +139,6 @@ class HerdrSessionsTests(unittest.TestCase):
               patch.object(unit_runs, "ASTRA_RUN_ROOT", self.root / "astra"),
               patch.object(herdr, "_process_arguments", side_effect=read_arguments),
               patch.object(herdr, "native_process", side_effect=native),
-              patch.object(herdr, "codex_rollout_threads", side_effect=herdr.NoOpenCodexRollout()),
               patch.object(herdr, "_process_display_name", side_effect=display),
               patch.object(herdr.Herdr, "result", side_effect=AssertionError("no server call")),
               patch("scripts.agents.codex_mesh.loaded_threads", side_effect=OSError("fixture"))):
@@ -829,7 +828,7 @@ class StandaloneLaunchTests(unittest.TestCase):
                                         "foreground_processes": [{"pid": 101, "name": "claude", "argv": ["claude"]}]}}}))
         def native_process(pid: int, kind: str) -> herdr.NativeAgentProcess:
             self.assertEqual((pid, kind), (101, "claude"))
-            return herdr.NativeAgentProcess(herdr.RolloutThread("recorded-id"), "fixture-start", {})
+            return herdr.NativeAgentProcess(herdr.EnvironmentThread("recorded-id"), "fixture-start", {})
         _ = self.enterContext(patch.object(herdr, "native_process", side_effect=native_process))
         self.responses["--session agents agent get w1:p1"] = CommandResponse(code=0, stdout=json.dumps({
             "result": {"agent": {"agent_status": "idle"}}}))
