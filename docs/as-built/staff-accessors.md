@@ -177,6 +177,7 @@ The shared pane launch builder uses `set_home`.
 | `scripts/production/footer_counts.py` | read | snapshot |
 | `scripts/production/live_units.py` | read | snapshot |
 | `scripts/production/log_backup.py` | read | none (StaffRefused, StaffUnreadable exceptions) |
+| `scripts/production/checkpoint_gate.py` | read | snapshot |
 | `scripts/production/merge_checkpoint.py` | read | snapshot |
 | `scripts/production/merge_checkpoint_test_support.py` | write | native_id, update_current_session |
 | `scripts/production/bump_gate.py` | read | read_production.owner.id |

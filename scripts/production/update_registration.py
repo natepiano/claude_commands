@@ -27,7 +27,8 @@ from dataclasses import dataclass
 from typing import NamedTuple, NotRequired, TypedDict, cast
 
 from scripts.production.production_doc import Production, Refusal, read_production
-from scripts.production.merge_checkpoint import merged_checkpoints, report
+from scripts.production.checkpoint_gate import report
+from scripts.production.merge_checkpoint import merged_checkpoints
 
 from scripts.production import showrunners, session_staff, showrunner_tree, staff, unit_lookup
 from scripts.production.proposals_folder import issues_folder
