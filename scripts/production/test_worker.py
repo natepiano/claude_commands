@@ -2175,6 +2175,19 @@ class WorkerCommandTests(unittest.TestCase):
         numbers = [" 1", " 2", " 3", " 4", " 5", " 6", " 7", " 8", " 9", "10"]
         self.assertEqual(output.splitlines(), [
             f"{number} {row.name} impl account unknown ClosedWorker" for number, row in zip(numbers, members, strict=True)])
+        known: dict[str, object] = {"name": "known", "role": "impl", "account": "codex2", "state": "ClosedWorker"}
+        unknown: dict[str, object] = {"name": "unknown", "role": {"state": "WorkerRoleUnavailable"},
+                                      "account": {"state": "AccountUnavailable"}, "state": "ClosedWorker"}
+        for fields, expected in (
+                (unknown, "role unknown account unknown"),
+                ({key: value for key, value in known.items() if key != "account"}, "impl account unknown"),
+                ({key: value for key, value in known.items() if key != "role"}, "role unknown codex2")):
+            with self.subTest(fields=fields), patch.object(worker, "list_workers", return_value=[known, fields]):
+                self.assertEqual(self.command("list"),
+                                 (0, f"1 known impl codex2 ClosedWorker\n2 {fields['name']} {expected} ClosedWorker\n", ""))
+                code, output, errors = self.command("list", "--json")
+                self.assertEqual(code, 0, errors)
+                self.assertEqual(cast(list[dict[str, object]], json.loads(output)), [known, fields])
 
     def test_list_keeps_dispatch_role_separate_from_observation(self) -> None:
         opened = self.opened("impl2", "review")

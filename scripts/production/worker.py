@@ -968,9 +968,9 @@ def _print_workers(listing: list[dict[str, object]], as_json: bool) -> ExitCode:
     else:
         width = len(str(len(listing)))
         for number, fields in enumerate(listing, 1):
-            role = fields["role"] if isinstance(fields["role"], str) else "role unknown"
-            account = "" if isinstance(fields["account"], str) else " account unknown"
-            print(f"{number:>{width}} {fields['name']} {role}{account} {fields['state']} {fields.get('activity', '')} {fields.get('reason', '')}".rstrip())
+            role = fields["role"] if isinstance(fields.get("role"), str) else "role unknown"
+            account = fields["account"] if isinstance(fields.get("account"), str) else "account unknown"
+            print(f"{number:>{width}} {fields['name']} {role} {account} {fields['state']} {fields.get('activity', '')} {fields.get('reason', '')}".rstrip())
     return ExitCode.OK
 
 
