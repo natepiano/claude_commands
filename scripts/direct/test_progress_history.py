@@ -6457,7 +6457,14 @@ with patch.object(fcntl, "flock", admission):
         ))
         self.assertIsNone(state["phase"])
 
-    def test_start_phase_finds_a_standing_plan_phase_by_its_title_id(self) -> None:
+        _ = self.run_command(
+            "start-phase", "--session-dir", str(session_dir), "--phase-id", "final",
+            "--phase-title", "Final gate", at=70_000,
+        )
+        phase = cast(dict[str, object], self.read_state(session_dir)["phase"])
+        self.assertEqual(phase["id"], "final")
+
+    def test_start_phase_accepts_a_standing_ticket_id_outside_the_numbered_plan(self) -> None:
         session_dir = self.start_run("standing", 0)
         plan_path = self.working_dir / "docs" / "standing.md"
         # style_plan.py next-phase writes the ticket id as the title, not the number.
@@ -6474,6 +6481,7 @@ with patch.object(fcntl, "flock", admission):
         ))
         phase = cast(dict[str, object], state["phase"])
         self.assertEqual(phase["id"], "types-unit-201")
+        self.assertIn("| 0 of 1 done |", self.run_progress(session_dir, 80_000))
 
     def test_the_header_names_a_worktree_once_when_its_branch_shares_the_name(
         self,
