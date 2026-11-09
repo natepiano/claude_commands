@@ -28,7 +28,6 @@ if __name__ == "__main__":
     bootstrap = argparse.ArgumentParser(add_help=False)
     _ = bootstrap.add_argument("--code-root", type=Path, default=Path(__file__).resolve().parents[2])
     installed, _remaining = bootstrap.parse_known_args(namespace=installed)
-    sys.path.insert(0, str(installed.code_root))
 
 from scripts.build_queue import admission_code
 
