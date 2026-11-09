@@ -3,16 +3,25 @@ from __future__ import annotations
 
 import json
 import os
-from typing import ClassVar
+from pathlib import Path
+from typing import ClassVar, override
 from unittest import mock
 
 from scripts.production import merge_gate
 from scripts.production.affected_modules import NoCertifiedBase
 from scripts.production.merge_gate_test_support import MergeGateFixture, SUITE_MODULE, gate_suites
+from scripts.lint.memory_test_support import write_config_fixture
 
 
 class TargetedTestTests(MergeGateFixture):
     suite_mode: ClassVar[merge_gate.SuiteMode] = merge_gate.SuiteMode.TARGETED_TEST
+
+    @override
+    def setUp(self) -> None:
+        super().setUp()
+        # The fixture's main branch has no merge gate pass.
+        _ = write_config_fixture(Path(self.environment["CONF_DIR"]) / "merge_gate.conf",
+                                 "landing_branches=fixture-landing\n")
 
     def test_a_changed_suite_set_cannot_reuse_or_certify_an_old_full_pass(self) -> None:
         first = self.run_gate()
