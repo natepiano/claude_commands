@@ -99,6 +99,16 @@ class MeasurementTests(MeasurementFixture):
                     left, right = ledger.period_bounds(date.fromisoformat(day), settings.accounting_zone)
                     self.assertEqual(result.usd, ledger.period_cost(full.intervals, left, right))
 
+        reading = ledger.ChargeRead(DAY, now, start, end, Decimal(24), Decimal(0), Decimal(1),
+                                   (ledger.UsageTypeCost('storage', Decimal(24)),))
+        _ = book.refresh_charges(self.settings, now, lambda _start, _end: (reading,))
+        with read_only_evidence(self, self.state):
+            for day, expected in (('2026-01-14', Decimal(25)), (DAY, Decimal(24)), ('2026-01-16', Decimal(1))):
+                with self.subTest(day=day, source='account bill'):
+                    result = narrow(self, measurement.daily_usage(
+                        self.settings, self.state, day, now), measurement.DailyUsage)
+                    self.assertEqual(result.usd, expected)
+
     def test_uptime_includes_pending_and_stopping_and_caps_stale_evidence(self) -> None:
         self.costs({"observation_max_age_seconds": "60"})
         book = self.book()
@@ -393,6 +403,8 @@ class MeasurementTests(MeasurementFixture):
         self.assertIn('get-cost-and-usage', arguments)
         self.assertEqual(arguments[arguments.index('--filter') + 1], aws_target.USAGE_ONLY)
         self.assertIn('--no-paginate', arguments)
+        self.assertEqual(arguments[arguments.index('--metrics') + 1:arguments.index('--group-by')],
+                         ['UnblendedCost', 'UsageQuantity'])
         self.assertEqual(arguments[arguments.index('--group-by') + 1], 'Type=DIMENSION,Key=USAGE_TYPE')
         _ = measurement.read_measurement(self.settings, self.state, NOW + 86401)
         self.assertEqual(len(calls), 2)
@@ -401,7 +413,7 @@ class MeasurementTests(MeasurementFixture):
         _ = controller.refresh_charges(api, NOW + 2 * 86400)
         replaced = ledger.read_charge(self.state / 'charges' / '2026-01-15.json')
         self.assertEqual(replaced.actual_usd, Decimal('2.50'))
-        self.assertEqual(replaced.usage_types, (ledger.UsageTypeCost('USE2-SpotUsage:m7a.4xlarge', Decimal('2.50')),))
+        self.assertEqual(replaced.usage_types, (ledger.UsageTypeCost('USE2-SpotUsage:m7a.4xlarge', Decimal('2.50'), Decimal(2), 'Hrs'),))
         self.assertEqual(replaced.at, NOW + 2 * 86400)
         self.assertEqual(len(calls), 4)
         self.assertEqual(sum(row.query_usd for row in self.book().read_snapshot().reconciliations), Decimal('0.04'))

@@ -57,8 +57,8 @@ class UnitTransferFixture(StaffTestCase):
     def setUp(self) -> None:
         super().setUp()
         # Preserve absolute Git worktree and document paths, with private writable copies.
-        _ = shutil.copytree(self.snapshot, self.fixture_root)
         self.addCleanup(shutil.rmtree, self.fixture_root)
+        _ = shutil.copytree(self.snapshot, self.fixture_root)
         self.bind_fixture(self.fixture_root)
         bind_staff_fixture(self, self.env, {"demo": ("alpha", "beta"), "other": ("gamma",)},
                            locations={("demo", "alpha"): self.unit,

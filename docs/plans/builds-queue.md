@@ -704,6 +704,30 @@ After Phase 30, `build_targets.py` eligible, reserve and release-wait still use 
 
 The user approved aws-unit's design on 2026-11-08. Builds moved it to report, which starts after Phase 36 lands, because both edit memory_feed.py and memory_live.html.
 
+### Phase 39 — The build page shows step names from the config  · status: done
+
+1. **The defect (builds, 2026-11-09; change review C1285 returned).** The build page shows `merge-gate`, not `merge gate`. `scripts/build_queue/memory_feed.py` passes `RECORDED_STEP_NAMES`, an empty map, at five places: `step_text` for swap holds, held rows, running rows and waiters, and `names=` on the `QueueModel`.
+2. **Fix.** The feed calls `read_step_names()` once for each reading and uses that value at all five places. `RECORDED_STEP_NAMES` leaves `memory_feed.py`.
+3. **Unchanged.** Comparisons of `step.step` with raw step names keep the raw name. `/build:queue` already reads the config.
+4. **Hover note.** `progressTip` in `memory_live.html` tested the row name for `merge-gate`. A row name is shown text and can hold a project, so the ordering note now tests `progress.unit === "modules"`.
+5. **Proof.** A row in the existing feed test: a `merge-gate` step shows as `merge gate` in running and waiting rows. The test fails without the fix. The existing expected values that use `RECORDED_STEP_NAMES` change to the config names. Rows in the existing hover test: a `modules` row has the ordering note, and a row with another unit has none.
+
+**Workers:** 1 writer and tester. **Gate:** targeted test, basedpyright 0/0/0, adversary review, page proof.
+**Change-Review:** The build page shows "merge gate" | On natedev, run /build:page and open the link while a merge gate runs or waits | The row says "merge gate", with a space and no hyphen. | after restart
+
+### Phase 38 — AWS rows on the build page show a progress bar  · status: done
+
+1. **The ask (user, 2026-11-09).** "the word \"running\" is superfluous on the aws rows - if they are there they are running - i would only want to see issues if they are \"not running\" when they should be." The module count "should be small text underneath a progress update bar - similar to the progress update bars on local rows."
+2. **Bar.** A cloud row with a module counter draws the same progress track and line as a local row, in the testing color, in the same layout pass. The feed gives the cloud row the `progress` field that local rows have: `RowProgress` with phase `testing` and unit `modules`, or `NoProgress` with the counter's reason. The cloud counter's phase is `modules`, so `row_progress` does not map it as it stands.
+3. **Text.** Small text in the row's `.amounts` line, under the bar: the module count, then the failed-module count when it is above zero, then "no update for <age>" in the cap color when the row is late. The word "running" never shows. Another state (`requesting`, `setup`, `uploading`, `progress missing`, `progress unreadable`) shows first, because the row is not running. "modules unknown" never shows.
+4. **Waiting rows.** A cloud row that waits for a slot draws no bar. Its reason stays as the same small text.
+5. **Hover.** The row tip keeps the machine and reservation sentence, and it adds the local rows' progress line. A row with no text shows no stray period.
+6. **Not in this phase.** The `/build:queue` terminal table keeps its text. The user named the page.
+7. **Proof.** A row in `test_cloud_rows_share_the_feed_without_memory_reservations` for each state and for a row with no counter. `memory_page_proof.mjs` checks the bar width, the text under the bar and the absence of "running", and it writes a shot.
+
+**Workers:** 1 writer and tester. **Gate:** targeted test, basedpyright 0/0/0, adversary review, page proof.
+**Change-Review:** AWS rows show a progress bar | On natedev, run /build:page and open the link while a cloud gate runs | Each AWS row has a progress line with small text such as "443 of 702 modules" under it, and the word "running" is gone.
+
 ### Phase 37 — Build folders delete themselves when their process ends  · status: done
 
 1. **The rule (user via builds, 2026-11-09).** Our processes clean up after themselves, as `tempfile.TemporaryDirectory` does. Source: `/tmp/claude/leftover_sources_2026-11-09.md`, section "builds", item 2; detail in `/tmp/claude/leftover_sources_2026-11-09_detail.txt` lines 321-400.

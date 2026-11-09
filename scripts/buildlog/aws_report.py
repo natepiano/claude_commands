@@ -29,6 +29,8 @@ def bill_lines(reading: ChargeRead, directory: Path) -> list[str]:
     """Show the account bill and allocate daily Spot compute across launched boxes."""
     if not reading.account_bill:
         return ['AWS bill: unavailable; the saved reading uses the old format.']
+    if not ledger.is_billed_day(reading):
+        return []
     state = 'provisional' if reading.provisional else 'reported'
     at = datetime.fromtimestamp(reading.at, UTC).isoformat()
     lines = [f'AWS bill (account, UTC {reading.day}, {state}): ${reading.actual_usd:.2f}; '
@@ -52,6 +54,19 @@ def bill_lines(reading: ChargeRead, directory: Path) -> list[str]:
         lines.append(f'AWS bill Spot compute, {instance_type}: ${usd:.4f}; {boxes} launched boxes; {allocation}.')
     if compute:
         lines.append('Account Spot compute can include the older Spot builder. Per-run costs use the daily allocation.')
+    return lines
+
+
+def spend_lines(spend: ledger.DailySpend, limit: Decimal, *, today: bool) -> list[str]:
+    label = "Today's spend" if today else 'Spend'
+    runs = 'run' if spend.runs == 1 else 'runs'
+    lines = [f'{label} (UTC {spend.day}): ${spend.usd:.2f}; limit ${limit:.2f}; '
+             + f'{spend.runs} {runs}; {spend.source}.', '',
+             '| Spend group | Amount | Share |', '|---|---:|---:|']
+    for row in spend.groups:
+        share = row.usd * 100 / spend.usd if spend.usd else Decimal(0)
+        lines.append(f'| {row.group} | ${row.usd:.4f} | {share:.1f}% |')
+    lines.extend(('', f'Ledger query fees: ${spend.query_usd:.2f}.', ''))
     return lines
 
 

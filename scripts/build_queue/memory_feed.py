@@ -47,7 +47,7 @@ from scripts.build_queue.queue_evidence import ci_amount as ci_bytes_text, room_
 from scripts.build_queue import admission_client, admission_protocol as wire, head_facts, queue_view
 from scripts.build_queue.queue_lines import age, plain, step_text
 from scripts.build_queue.queue_view import reason_phrase
-from scripts.lib.build_steps import RECORDED_STEP_NAMES
+from scripts.lib.build_steps import StepNames, read_step_names
 from scripts.build_queue.scope_activity import LiveBuildRun, NotServiceSlice, ScopeProcesses
 from scripts.build_queue import admission_records
 from scripts.lint import memory_admit as gate
@@ -274,6 +274,7 @@ class CloudWorkRow(TypedDict):
     vcpus: int | queue_view.UnknownCpuCount
     state: str
     status: str
+    progress: RowProgress | NoProgress
     stale: bool
     late_age: str
 
@@ -534,6 +535,13 @@ def row_progress(steps: Sequence[admission_records.RunningStep]) -> RowProgress 
     return {"kind": "NoProgress", "reason": reason}
 
 
+def cloud_row_progress(counter: progress.ProgressCounter | progress.NoCounter) -> RowProgress | NoProgress:
+    if isinstance(counter, progress.NoCounter):
+        return {"kind": "NoProgress", "reason": counter.reason}
+    return {"kind": "RowProgress", "phase": "testing", "done": counter.done,
+            "total": counter.total, "percent": counter.percent, "unit": "modules"}
+
+
 def run_keep_text(hold: admission_records.RunKeepAside, steps: Sequence[admission_records.RunningStep]) -> str:
     lines = [keep_aside_text(hold)]
     for step in steps:
@@ -674,7 +682,7 @@ class SwapReadingPass:
 
 
 def read_swap(steps: Sequence[admission_records.RunningStep], labels: Mapping[str, unit_labels.UnitLabels],
-              row_limit: int) -> SwapReading | SwapUnavailable:
+              row_limit: int, names: StepNames) -> SwapReading | SwapUnavailable:
     """Account for host swap with disjoint cgroup owners and an explicit difference."""
     owners: dict[Path, tuple[str, str]] = {}
     for step in steps:
@@ -691,7 +699,7 @@ def read_swap(steps: Sequence[admission_records.RunningStep], labels: Mapping[st
             continue
         if path.is_relative_to(CGROUP) and path.name not in SWAP_OWNER_SLICES:
             identity = step_labels(step, labels)
-            name, detail = step_text(step, RECORDED_STEP_NAMES), identity.session
+            name, detail = step_text(step, names), identity.session
             if step.step == SWAP_NAMES["between"]:
                 name, detail = identity.session or str(path.name), SWAP_NAMES["between"]
             elif isinstance(memory, admission_records.UnownedSliceMemory):
@@ -739,6 +747,7 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
             report: ReportSections | charts.IndexUnavailable | ReportNotRead = ReportNotRead.VALUE) -> MemoryPage:
     if isinstance(configuration, conf.UseConfiguredValue):
         configuration = read_configuration()
+    names = read_step_names()
     parsed = admission_client.view()
     explanation = parsed.explanation
     captured = explanation.room
@@ -778,7 +787,7 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
         metadata = step if step is not None else run_steps.get(hold.memory.owner)
         identity = step_labels(metadata, labels) if metadata is not None else unit_labels.UnitLabels("")
         unit = identity.unit
-        name = step_text(step, RECORDED_STEP_NAMES) if step is not None else identity.session or hold.memory.owner
+        name = step_text(step, names) if step is not None else identity.session or hold.memory.owner
         detail = unit if step is not None else SWAP_NAMES["between"]
         use = gib(hold.memory.use.bytes) if isinstance(hold.memory.use, admission_records.AnonymousRunUse) else hold.memory.use
         run = hold.memory.run
@@ -795,7 +804,7 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
         step = entry.step
         memory = step.measured
         identity = step_labels(step, labels)
-        name, detail = step_text(step, RECORDED_STEP_NAMES), identity.unit
+        name, detail = step_text(step, names), identity.unit
         unit, state = detail, ""
         if isinstance(memory, (admission_records.UnownedSliceMemory, admission_records.CompilerServiceMemory)):
             service = (isinstance(memory, admission_records.CompilerServiceMemory)
@@ -858,7 +867,7 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
         reason = reason_phrase(waiter.reason, parsed.view.waiting)
         if isinstance(waiter.reason, admission_records.BehindHead):
             reason = "head protection · " + reason
-        waiters.append({"name": step_text(waiter, RECORDED_STEP_NAMES), "showrunner": identity.showrunner, "unit": identity.unit, "pid": (waiter.run.pid if isinstance(waiter.run, LiveBuildRun) else waiter.pid), "detail": identity.unit,
+        waiters.append({"name": step_text(waiter, names), "showrunner": identity.showrunner, "unit": identity.unit, "pid": (waiter.run.pid if isinstance(waiter.run, LiveBuildRun) else waiter.pid), "detail": identity.unit,
                         "need": gib(waiter.need), "since": waiter.since,
                         "reason": reason,
                         "fits": need <= captured.signed_room})
@@ -866,7 +875,7 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
     waiting_rows: list[WaitRow | CloudWaitRow] = list(waiters)
     model = queue_view.QueueModel(
         parsed, labels, admission_records.NoWaiter(), head_facts.PaceUnavailable(), ZoneInfo("UTC"),
-        queue_view.HostLoadUnavailable(), admission_records.NoWaiter(), names=RECORDED_STEP_NAMES)
+        queue_view.HostLoadUnavailable(), admission_records.NoWaiter(), names=names)
     cloud_slots_used = 0
     cloud_slots = 0
     if isinstance(parsed, wire.CloudQueueRead):
@@ -882,7 +891,8 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
                 "showrunner": identity.showrunner, "unit": identity.unit, "pid": cloud.owner.pid,
                 "detail": identity.unit, "machine": "" if isinstance(cloud.wait, wire.CloudSlotWait) else "aws",
                 "vcpus": information.vcpus,
-                "state": information.state, "status": plain([queue_view.cloud_status(cloud, information)]),
+                "state": information.state, "status": plain([queue_view.cloud_page_status(cloud, information)]),
+                "progress": cloud_row_progress(cloud.counter),
                 "stale": isinstance(information.update, queue_view.CloudUpdateLate)
                          and not isinstance(cloud.wait, wire.CloudSlotWait),
                 "late_age": queue_view.cloud_update_age(information.update.seconds)
@@ -897,7 +907,7 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
                         for entry in queue_view.waiting_builds(model)]
     pressure = explanation.decided_from.pressure
     policy = explanation.policy.pressure
-    swap = read_swap(parsed.view.running, labels, configuration.swap_rows)
+    swap = read_swap(parsed.view.running, labels, configuration.swap_rows, names)
     if isinstance(swap, SwapUnavailable):
         raise RuntimeError(swap.reason)
     pressure_values = read_stalls()

@@ -85,6 +85,12 @@ class GateTerminated:
 
 
 @dataclass(frozen=True)
+class BoxRate:
+    usd_per_hour: Decimal
+    source: str
+
+
+@dataclass(frozen=True)
 class GateReservation:
     attempt: str
     at: int
@@ -92,6 +98,8 @@ class GateReservation:
     usd_per_hour: Decimal
     allowance_usd: Decimal
     state: GateLaunchPending | GateRunning | GateAbsent | GateTerminated = GateLaunchPending()
+    instance_type: str = ''
+    rate: BoxRate = BoxRate(Decimal(0), 'not priced')
 
 
 @dataclass(frozen=True)
@@ -122,6 +130,7 @@ class ResourceInventory:
     at: int
     resources: tuple[PricedResource, ...]
     source: str
+    builder_removed: bool = False
 
 
 @dataclass(frozen=True)
@@ -145,6 +154,8 @@ class CostReconciliation:
 class UsageTypeCost:
     usage_type: str
     usd: Decimal
+    quantity: Decimal = Decimal(0)
+    unit: str = ''
 
 
 @dataclass(frozen=True)
@@ -338,7 +349,7 @@ def _decode(row: dict[str, object]) -> LedgerEvidence:
         observations,
         [PriceSample(instant(r, "at"), money(text(r, "usd_per_hour")), text(r, "source")) for r in rows(row, "prices")],
         [ResourceInventory(instant(r, "at"), tuple(PricedResource(text(p, "name"), money(text(p, "usd_per_month")))
-                                                 for p in rows(r, "resources")), text(r, "source"))
+                                                 for p in rows(r, "resources")), text(r, "source"), r.get("builder_removed") is True)
          for r in rows(row, "inventories")],
         [CostReconciliation(instant(r, "at"), instant(r, "period_start"), instant(r, "period_end"),
                             conf.decimal(text(r, "usd")), text(r, "source"), money(str(r.get("query_usd", "0"))),
@@ -388,12 +399,15 @@ def _decode(row: dict[str, object]) -> LedgerEvidence:
             raise LedgerUnavailable('unknown gate reservation state')
         evidence.gate_reservations.append(GateReservation(
             text(item, 'attempt'), instant(item, 'at'), instant(item, 'expires'),
-            money(text(item, 'usd_per_hour')), money(text(item, 'allowance_usd')), gate_state))
+            money(text(item, 'usd_per_hour')), money(text(item, 'allowance_usd')), gate_state,
+            str(item.get('instance_type', '')),
+            BoxRate(money(str(item.get('applied_usd_per_hour', item['usd_per_hour']))),
+                    str(item.get('rate_source', 'spot_max_usd_per_hour')))))
     if len({r.attempt for r in evidence.gate_reservations}) != len(evidence.gate_reservations):
         raise LedgerUnavailable('duplicate gate attempt')
     for inventory in evidence.inventories:
         names = [resource.name for resource in inventory.resources]
-        if not names or len(set(names)) != len(names):
+        if not names and not inventory.builder_removed or len(set(names)) != len(names):
             raise LedgerUnavailable("expected distinct priced resources")
     states: dict[int, str] = {}
     for observation in evidence.observations:
@@ -419,7 +433,8 @@ def _encode(state: LedgerEvidence) -> dict[str, object]:
         "observations": [{"at": r.at, "state": r.state, "source": r.source} for r in state.observations],
         "prices": [{"at": r.at, "usd_per_hour": str(r.usd_per_hour), "source": r.source} for r in state.prices],
         "inventories": [{"at": r.at, "source": r.source,
-                         "resources": [{"name": p.name, "usd_per_month": str(p.usd_per_month)} for p in r.resources]}
+                         "resources": [{"name": p.name, "usd_per_month": str(p.usd_per_month)} for p in r.resources],
+                         **({"builder_removed": True} if r.builder_removed else {})}
                         for r in state.inventories],
         "reconciliations": [{"at": r.at, "period_start": r.period_start, "period_end": r.period_end,
                              "usd": str(r.usd), "source": r.source, "query_usd": str(r.query_usd),
@@ -433,7 +448,8 @@ def _encode(state: LedgerEvidence) -> dict[str, object]:
         "charge_refresh_at": state.charge_refresh_at,
         'gate_reservations': [
             {'attempt': r.attempt, 'at': r.at, 'expires': r.expires, 'usd_per_hour': str(r.usd_per_hour),
-             'allowance_usd': str(r.allowance_usd), 'state':
+             'allowance_usd': str(r.allowance_usd), 'instance_type': r.instance_type,
+             'applied_usd_per_hour': str(r.rate.usd_per_hour), 'rate_source': r.rate.source, 'state':
              {'kind': 'pending'} if isinstance(r.state, GateLaunchPending) else
              {'kind': 'running', 'instance_id': r.state.instance_id} if isinstance(r.state, GateRunning) else
              {'kind': 'absent', 'at': r.state.at} if isinstance(r.state, GateAbsent) else
@@ -494,7 +510,8 @@ def _charges(state: LedgerEvidence, settings: SpendingSettings, now: int, *,
     if any(r.at > pricing_end for r in (*inventories, *observations, *prices)) or (require_fresh and any(
             r.at > now for r in state.reconciliations)):
         raise LedgerUnavailable("cost evidence is from the future")
-    if require_fresh and observations and now - observations[-1].at > settings.observation_max_age_seconds:
+    if (require_fresh and observations and observations[-1].state != "terminated"
+            and now - observations[-1].at > settings.observation_max_age_seconds):
         raise LedgerUnavailable("instance state evidence is stale")
     local = datetime.fromtimestamp(now, settings.accounting_zone)
     month_start = int(local.replace(day=1, hour=0, minute=0, second=0, microsecond=0).timestamp())
@@ -510,7 +527,8 @@ def _charges(state: LedgerEvidence, settings: SpendingSettings, now: int, *,
     for index in range(inventory_index, len(inventories)):
         inventory = inventories[index]
         end = inventories[index + 1].at if index + 1 < len(inventories) else pricing_end
-        monthly = max(settings.fixed_usd_per_month, sum((p.usd_per_month for p in inventory.resources), Decimal(0)))
+        monthly = max(Decimal(0) if inventory.builder_removed else settings.fixed_usd_per_month,
+                      sum((p.usd_per_month for p in inventory.resources), Decimal(0)))
         for start, stop in _days(max(inventory.at, window_start), end, settings.accounting_zone):
             intervals.append(ChargedInterval(start, stop, monthly * Decimal(stop - start)
                                              / Decimal(_month_seconds(start, settings.accounting_zone)), inventory.source, "fixed"))
@@ -527,7 +545,8 @@ def _charges(state: LedgerEvidence, settings: SpendingSettings, now: int, *,
         if end <= window_start:
             continue
         confirmed_end = min(end, observation.at + settings.observation_max_age_seconds)
-        fallback(confirmed_end, end)
+        if observation.state != "terminated":
+            fallback(confirmed_end, end)
         if observation.state not in ("running", "pending", "stopping"):
             continue
         begin = max(observation.at, window_start)
@@ -561,13 +580,16 @@ def _charges(state: LedgerEvidence, settings: SpendingSettings, now: int, *,
         for left, right in _days(start, end, settings.accounting_zone):
             intervals.append(ChargedInterval(left, right, rate * Decimal(right - left)
                                              / Decimal(3600), 'unconfirmed compute request', 'instance'))
+    for charge in gate_compute_intervals(state, pricing_end, settings.box_minimum_seconds):
+        if charge.start == charge.end:
+            if charge.start >= window_start:
+                intervals.append(charge)
+        else:
+            for left, right in _days(max(charge.start, window_start), charge.end, settings.accounting_zone):
+                intervals.append(replace(charge, start=left, end=right, usd=_overlap(charge, left, right)))
     for reservation in state.gate_reservations:
         if isinstance(reservation.state, GateAbsent):
             continue
-        end = min(pricing_end, reservation.state.at) if isinstance(reservation.state, GateTerminated) else pricing_end
-        for left, right in _days(max(reservation.at, window_start), end, settings.accounting_zone):
-            intervals.append(ChargedInterval(left, right, reservation.usd_per_hour * Decimal(right - left)
-                                             / Decimal(3600), 'gate:' + reservation.attempt, 'instance'))
         if window_start <= reservation.at < pricing_end:
             intervals.append(ChargedInterval(reservation.at, reservation.at, reservation.allowance_usd,
                                              'gate storage and transfer:' + reservation.attempt, 'fixed'))
@@ -635,7 +657,8 @@ def read_charge(path: Path) -> ChargeRead:
     reading = ChargeRead(text(row, 'day'), instant(row, 'at'), instant(row, 'period_start'),
                          instant(row, 'period_end'), conf.decimal(text(row, 'actual_usd')),
                          money(text(row, 'estimated_usd')), money(text(row, 'query_usd')),
-                         tuple(UsageTypeCost(text(item, 'usage_type'), conf.decimal(text(item, 'usd')))
+                         tuple(UsageTypeCost(text(item, 'usage_type'), conf.decimal(text(item, 'usd')),
+                                             conf.decimal(str(item.get('quantity', '0'))), str(item.get('unit', '')))
                                for item in rows(row, 'usage_types')) if 'usage_types' in row else (),
                          row.get('provisional', True) is True, row.get('excludes_credits') is True)
     if reading.period_end <= reading.period_start or reading.period_end > reading.at:
@@ -647,15 +670,207 @@ def charge_record(reading: ChargeRead) -> dict[str, object]:
     return {'day': reading.day, 'at': reading.at, 'period_start': reading.period_start,
             'period_end': reading.period_end, 'actual_usd': str(reading.actual_usd),
             'estimated_usd': str(reading.estimated_usd), 'query_usd': str(reading.query_usd),
-            **({'usage_types': [{'usage_type': item.usage_type, 'usd': str(item.usd)} for item in reading.usage_types],
+            **({'usage_types': [{'usage_type': item.usage_type, 'usd': str(item.usd),
+                                'quantity': str(item.quantity), 'unit': item.unit} for item in reading.usage_types],
                 'provisional': reading.provisional, 'excludes_credits': True} if reading.account_bill else {})}
+
+
+SPEND_GROUPS = ('gate compute at 32 CPU', 'compute at 16 CPU', 'storage', 'public IPv4', 'data transfer', 'other')
+
+
+@dataclass(frozen=True)
+class SpendGroupCost:
+    group: str
+    usd: Decimal
+
+
+@dataclass(frozen=True)
+class DailySpend:
+    day: str
+    source: str
+    groups: tuple[SpendGroupCost, ...]
+    runs: int
+    query_usd: Decimal = Decimal(0)
+    intervals: tuple[ChargedInterval, ...] = ()
+
+    @property
+    def usd(self) -> Decimal:
+        return sum((row.usd for row in self.groups), Decimal(0))
+
+
+def spend_group(usage_type: str) -> str:
+    """Assign each AWS usage type to one spend group."""
+    if 'SpotUsage:' in usage_type or 'BoxUsage:' in usage_type:
+        size = usage_type.partition(':')[2]
+        if size.endswith('.8xlarge'):
+            return SPEND_GROUPS[0]
+        if size.endswith('.4xlarge'):
+            return SPEND_GROUPS[1]
+    lowered = usage_type.lower()
+    if any(name in lowered for name in ('ebs:', 'timedstorage', 'storageusage', 'volumeusage', 'snapshotusage')):
+        return 'storage'
+    if 'publicipv4' in lowered:
+        return 'public IPv4'
+    if any(name in lowered for name in ('datatransfer', 'dataxfer', 'aws-out-bytes', 'aws-in-bytes', 'regional-bytes')):
+        return 'data transfer'
+    return 'other'
+
+
+def is_billed_day(reading: ChargeRead) -> bool:
+    """A bill must round to at least one cent."""
+    return reading.account_bill and reading.actual_usd.quantize(Decimal('.01')) >= Decimal('.01')
+
+
+def box_rate(readings: Sequence[ChargeRead], instance_type: str, fallback: Decimal, now: int) -> BoxRate:
+    """Use the newest completed bill with a positive Spot rate for this instance type."""
+    for reading in sorted(readings, key=lambda row: row.day, reverse=True):
+        if not is_billed_day(reading) or reading.period_end > now:
+            continue
+        rows_for_type = [row for row in reading.usage_types
+                         if row.usage_type.partition('SpotUsage:')[2] == instance_type and instance_type]
+        hours = sum((row.quantity for row in rows_for_type), Decimal(0))
+        usd = sum((row.usd for row in rows_for_type), Decimal(0))
+        if hours > 0 and usd > 0:
+            return BoxRate(usd / hours, 'AWS bill ' + reading.day)
+    return BoxRate(fallback, 'spot_max_usd_per_hour')
+
+
+def box_cost(rate: BoxRate, running_seconds: int, minimum_seconds: int) -> Decimal:
+    """Price one box with the configured minimum running time."""
+    return rate.usd_per_hour * Decimal(max(minimum_seconds, running_seconds)) / Decimal(3600)
+
+
+def gate_compute_intervals(state: LedgerEvidence, now: int, minimum_seconds: int, *,
+                           reserve: bool = False) -> tuple[ChargedInterval, ...]:
+    intervals: list[ChargedInterval] = []
+    for reservation in state.gate_reservations:
+        if isinstance(reservation.state, GateAbsent) or reservation.at > now:
+            continue
+        end = min(now, reservation.state.at) if isinstance(reservation.state, GateTerminated) else (
+            max(now, reservation.expires) if reserve else now)
+        rate = reservation.rate if reservation.rate.source != 'not priced' else BoxRate(reservation.usd_per_hour, 'spot_max_usd_per_hour')
+        intervals.append(ChargedInterval(reservation.at, end, box_cost(rate, end - reservation.at, minimum_seconds),
+                                         'gate:' + reservation.attempt, 'instance'))
+    return tuple(intervals)
+
+
+def older_compute_intervals(intervals: Sequence[ChargedInterval], rate: BoxRate,
+                             minimum_seconds: int) -> tuple[ChargedInterval, ...]:
+    """Price each complete lifetime of the older builder before allocating its cost across days."""
+    lifetimes: list[ChargedInterval] = []
+    for row in sorted((row for row in intervals if row.kind == 'instance'), key=lambda row: row.start):
+        if lifetimes and lifetimes[-1].end == row.start:
+            lifetimes[-1] = replace(lifetimes[-1], end=row.end)
+        else:
+            lifetimes.append(row)
+    return tuple(replace(row, usd=box_cost(rate, row.end - row.start, minimum_seconds), source=rate.source)
+                 for row in lifetimes)
+
+
+def spending_periods(intervals: Sequence[ChargedInterval], zone: ZoneInfo) -> tuple[dict[str, Decimal], dict[str, Decimal]]:
+    """Allocate charges to the configured accounting days and months."""
+    daily: dict[str, Decimal] = {}
+    monthly: dict[str, Decimal] = {}
+    for charge in intervals:
+        spans = ((charge.start, charge.end),) if charge.start == charge.end else _days(charge.start, charge.end, zone)
+        for start, end in spans:
+            day = datetime.fromtimestamp(start, zone).date().isoformat()
+            usd = charge.usd if start == end else _overlap(charge, start, end)
+            daily[day] = daily.get(day, Decimal(0)) + usd
+            monthly[day[:7]] = monthly.get(day[:7], Decimal(0)) + usd
+    return daily, monthly
+
+
+def gate_spend_days(state: LedgerEvidence, settings: SpendingSettings, readings: Sequence[ChargeRead], now: int, *,
+                    reserve: bool = False) -> tuple[DailySpend, ...]:
+    """Use account bills for completed days and bill rates for unbilled days."""
+    zone = ZoneInfo('UTC')
+    today = datetime.fromtimestamp(now, zone).date()
+    local = datetime.fromtimestamp(now, settings.accounting_zone)
+    month_start, _ = period_bounds(local.date().replace(day=1), settings.accounting_zone)
+    first = min(today.replace(day=1), datetime.fromtimestamp(month_start, zone).date())
+    last_at = max((r.expires for r in state.gate_reservations
+                   if not isinstance(r.state, (GateAbsent, GateTerminated))), default=now) if reserve else now
+    last = datetime.fromtimestamp(max(now, last_at - 1), zone).date()
+    bills = {r.day: r for r in readings if is_billed_day(r) and r.period_end <= now}
+    if bills:
+        first = min(first, date.fromisoformat(min(bills)))
+    latest = max(bills.values(), key=lambda row: row.day, default=None)
+    base = _charges(replace(state, gate_reservations=[]), replace(settings, accounting_zone=zone), now,
+                    require_fresh=False)
+    older = tuple(row for row in base.intervals if row.kind == 'instance')
+    if latest is not None:
+        rate = box_rate(readings, settings.instance_type, settings.spot_max_usd_per_hour, now)
+        older = older_compute_intervals(older, rate, settings.box_minimum_seconds)
+    gate_compute = {row.source: row for row in gate_compute_intervals(state, now, settings.box_minimum_seconds, reserve=reserve)}
+    days: list[DailySpend] = []
+    for offset in range((last - first).days + 1):
+        day = first + timedelta(days=offset)
+        key = day.isoformat()
+        start, end = period_bounds(day, zone)
+        stop = end if reserve else min(now, end)
+        groups: dict[str, Decimal] = dict.fromkeys(SPEND_GROUPS, Decimal(0))
+        intervals: list[ChargedInterval] = []
+
+        def include(charge: ChargedInterval) -> None:
+            if charge.start == charge.end:
+                if start <= charge.start < end:
+                    intervals.append(charge)
+            elif charge.start < end and charge.end > start:
+                intervals.append(replace(charge, start=max(start, charge.start), end=min(end, charge.end),
+                                         usd=_overlap(charge, start, end)))
+
+        for charge in base.intervals:
+            if charge.kind == 'explorer':
+                include(charge)
+        query_usd = period_cost(tuple(row for row in base.intervals if row.kind == 'explorer'), start, end)
+        bill = bills.get(key)
+        runs = sum(start <= r.at < end and isinstance(r.state, (GateRunning, GateTerminated))
+                   for r in state.gate_reservations)
+        if bill is not None:
+            for row in bill.usage_types:
+                groups[spend_group(row.usage_type)] += row.usd
+            groups['other'] += bill.actual_usd - sum(groups.values(), Decimal(0))
+            include(ChargedInterval(start, end, bill.actual_usd, 'AWS bill', 'reconciliation'))
+            source = 'AWS bill'
+        else:
+            source = 'estimated from the newest bill' if latest is not None else 'estimated from configured prices'
+            if latest is not None:
+                for row in latest.usage_types:
+                    if 'SpotUsage:' not in row.usage_type:
+                        groups[spend_group(row.usage_type)] += row.usd
+                groups['other'] += latest.actual_usd - sum((row.usd for row in latest.usage_types), Decimal(0))
+                include(ChargedInterval(start, end, sum(groups.values(), Decimal(0)), 'newest bill non-compute', 'fixed'))
+            else:
+                groups['storage'] += period_cost(tuple(row for row in base.intervals if row.kind != 'explorer'
+                                                       and row.kind != 'instance'), start, end)
+                for charge in base.intervals:
+                    if charge.kind not in ('explorer', 'instance'):
+                        include(charge)
+            groups[spend_group('SpotUsage:' + settings.instance_type)] += period_cost(older, start, end)
+            for charge in older:
+                include(charge)
+            for reservation in state.gate_reservations:
+                if isinstance(reservation.state, GateAbsent) or reservation.at > stop:
+                    continue
+                charge = gate_compute['gate:' + reservation.attempt]
+                groups[spend_group('SpotUsage:' + reservation.instance_type)] += _overlap(charge, start, end)
+                include(charge)
+                if latest is None and start <= reservation.at < end:
+                    groups['other'] += reservation.allowance_usd
+                    include(ChargedInterval(reservation.at, reservation.at, reservation.allowance_usd,
+                                             'gate storage and transfer:' + reservation.attempt, 'fixed'))
+        days.append(DailySpend(key, source, tuple(SpendGroupCost(group, usd) for group, usd in groups.items()),
+                              runs, query_usd, tuple(intervals)))
+    return tuple(days)
 
 
 def _reserved_fixed_costs(state: LedgerEvidence, settings: SpendingSettings, costs: CostEstimate) -> tuple[Decimal, Decimal]:
     """Reserve each period's known fixed costs before the first resource allocation."""
     local = datetime.fromtimestamp(costs.at, settings.accounting_zone)
     inventory = max(state.inventories, key=lambda item: item.at)
-    monthly = max(settings.fixed_usd_per_month, sum((p.usd_per_month for p in inventory.resources), Decimal(0)))
+    monthly = max(Decimal(0) if inventory.builder_removed else settings.fixed_usd_per_month,
+                      sum((p.usd_per_month for p in inventory.resources), Decimal(0)))
     day_start, day_end = period_bounds(local.date(), settings.accounting_zone)
     denominator = Decimal(_month_seconds(costs.at, settings.accounting_zone))
     daily_accrued = sum((r.usd for r in costs.intervals if r.kind == "fixed"
@@ -673,8 +888,13 @@ def gate_future_periods(state: LedgerEvidence, settings: SpendingSettings, now: 
     for reservation in state.gate_reservations:
         if isinstance(reservation.state, (GateAbsent, GateTerminated)):
             continue
+        rate = reservation.rate if reservation.rate.source != 'not priced' else BoxRate(reservation.usd_per_hour, 'spot_max_usd_per_hour')
+        future = box_cost(rate, reservation.expires - reservation.at, settings.box_minimum_seconds)
+        if now >= reservation.at:
+            future -= box_cost(rate, now - reservation.at, settings.box_minimum_seconds)
+        remaining = max(0, reservation.expires - max(now, reservation.at))
         for left, right in _days(max(now, reservation.at), reservation.expires, settings.accounting_zone):
-            cost = reservation.usd_per_hour * Decimal(right - left) / Decimal(3600)
+            cost = max(Decimal(0), future) * Decimal(right - left) / Decimal(remaining)
             day = datetime.fromtimestamp(left, settings.accounting_zone).strftime('%Y-%m-%d')
             daily[day] = daily.get(day, Decimal(0)) + cost
             monthly[day[:7]] = monthly.get(day[:7], Decimal(0)) + cost
@@ -767,6 +987,37 @@ class CostLedger:
         _ = _decode(document)
         write_text_atomic(self.path, json.dumps(document, sort_keys=True) + "\n")
 
+    def read_bills(self) -> tuple[ChargeRead, ...]:
+        return tuple(read_charge(path) for path in sorted((self.directory / 'charges').glob('*.json')))
+
+    def launches(self) -> tuple[dict[str, object], ...]:
+        path = self.directory / 'cloud-gate-launches.jsonl'
+        return tuple(mapping(cast(object, json.loads(line))) for line in path.read_text().splitlines()) if path.exists() else ()
+
+    def _price_gates(self, state: LedgerEvidence, readings: Sequence[ChargeRead], now: int) -> None:
+        launches = {str(row.get('attempt', '')): row for row in reversed(self.launches()) if row.get('result') == 'launched'}
+        priced: list[GateReservation] = []
+        for reservation in state.gate_reservations:
+            launch = launches.get(reservation.attempt)
+            size = text(launch, 'instance_type') if launch is not None else reservation.instance_type
+            at = int(float(str(launch['time']))) if launch is not None else reservation.at
+            priced.append(replace(reservation, at=at, instance_type=size,
+                                  rate=box_rate(readings, size, reservation.usd_per_hour, now)))
+        state.gate_reservations = priced
+
+    def spend_days(self, settings: SpendingSettings, now: int) -> tuple[DailySpend, ...]:
+        state = self.read_snapshot()
+        readings = self.read_bills()
+        self._price_gates(state, readings, now)
+        days = gate_spend_days(state, settings, readings, now)
+        launches = self.launches()
+        logged_attempts = {str(row.get('attempt', '')) for row in launches if row.get('result') == 'launched'}
+        return tuple(replace(day, runs=sum(row.get('result') == 'launched'
+            and datetime.fromtimestamp(float(str(row['time'])), ZoneInfo('UTC')).date().isoformat() == day.day
+            for row in launches) + sum(r.attempt not in logged_attempts and isinstance(r.state, (GateRunning, GateTerminated))
+                and datetime.fromtimestamp(r.at, ZoneInfo('UTC')).date().isoformat() == day.day
+                for r in state.gate_reservations)) for day in days)
+
     def reserve_gate(self, settings_path: Path, request: GateReservation) -> GateReserved | GateCapReached:
         """Reserve gate costs under the shared Rust accounting lock."""
         with self._locked() as state:
@@ -776,24 +1027,34 @@ class CostLedger:
             settings = read_settings(settings_path)
             costs = _charges(state, settings, request.at, current_window=True, require_fresh=False)
             state.gate_reservations.append(request)
-            daily, monthly = gate_future_periods(state, settings, request.at)
+            readings = self.read_bills()
+            self._price_gates(state, readings, request.at)
+            days = gate_spend_days(state, settings, readings, request.at, reserve=True)
             fixed_daily, fixed_monthly = _reserved_fixed_costs(state, settings, costs)
+            if any(is_billed_day(r) and r.period_end <= request.at for r in readings):
+                fixed_daily = fixed_monthly = Decimal(0)
+            today = datetime.fromtimestamp(request.at, settings.accounting_zone).date().isoformat()
+            daily, monthly = spending_periods(tuple(charge for day in days for charge in day.intervals), settings.accounting_zone)
+            reason = ''
             for day, amount in daily.items():
-                accrued = costs.daily.usd if day == costs.daily.day else Decimal(0)
-                if accrued + amount + fixed_daily + settings.limit_reserve_usd >= settings.daily_limit_usd:
-                    return GateCapReached('daily_limit')
-            for month, amount in monthly.items():
-                accrued = costs.monthly.usd if month == costs.monthly.month else Decimal(0)
-                if accrued + amount + fixed_monthly + settings.limit_reserve_usd >= settings.monthly_limit_usd:
-                    return GateCapReached('monthly_limit')
+                if day >= today and amount + fixed_daily + settings.limit_reserve_usd >= settings.daily_limit_usd:
+                    reason = 'daily_limit'
+            if not reason and any(amount + fixed_monthly + settings.limit_reserve_usd >= settings.monthly_limit_usd
+                                  for month, amount in monthly.items() if month >= today[:7]):
+                reason = 'monthly_limit'
+            if reason:
+                state.gate_reservations = [r for r in state.gate_reservations if r.attempt != request.attempt]
+                self._save(state)
+                return GateCapReached(reason)
             self._save(state)
-            return GateReserved(request)
+            return GateReserved(state.gate_reservations[-1])
 
-    def resolve_gate(self, attempt: str, outcome: GateRunning | GateAbsent | GateTerminated) -> None:
+    def resolve_gate(self, attempt: str, outcome: GateRunning | GateAbsent | GateTerminated, *, instance_type: str = '') -> None:
         """Release a reservation only after AWS confirms its final state."""
         with self._locked() as state:
-            state.gate_reservations = [replace(r, state=outcome) if r.attempt == attempt else r
+            state.gate_reservations = [replace(r, state=outcome, instance_type=instance_type or r.instance_type) if r.attempt == attempt else r
                                        for r in state.gate_reservations]
+            self._price_gates(state, self.read_bills(), int(time.time()) if isinstance(outcome, GateRunning) else outcome.at)
             self._save(state)
 
     def observe(self, observation: InstanceObservation, *, confirms_transition: bool = False) -> None:
@@ -838,7 +1099,8 @@ class CostLedger:
             self._save(state)
 
     def record_inventory(self, inventory: ResourceInventory) -> None:
-        if not inventory.resources or len({p.name for p in inventory.resources}) != len(inventory.resources):
+        if (not inventory.resources and not inventory.builder_removed
+                or len({p.name for p in inventory.resources}) != len(inventory.resources)):
             raise LedgerUnavailable("expected distinct priced resources")
         with self._locked() as state:
             if any(r.at == inventory.at and r != inventory for r in state.inventories):

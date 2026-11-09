@@ -209,8 +209,8 @@ class VerifyLintScopeFixture(unittest.TestCase):
             _ = caller_admission(self, self.root, self.environment)
             return
         self.root = self.fixture_root
-        _ = shutil.copytree(self.fixture_seed, self.root, symlinks=True)
         self.addCleanup(shutil.rmtree, self.root)
+        _ = shutil.copytree(self.fixture_seed, self.root, symlinks=True)
         self.config = self.root / "lint.conf"
         self.events = self.root / "cargo-events.jsonl"
         self.taplo_events = self.root / "taplo-events.jsonl"
