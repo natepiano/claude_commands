@@ -116,7 +116,8 @@ class RemoteEntryTests(unittest.TestCase):
             self.assertFalse(marker.exists())
             shutil.rmtree(parent)
 
-        with mock.patch.object(scratch, "remove", side_effect=use_during_removal):
+        with (mock.patch.object(scratch, "save_cargo_outputs", return_value=()),
+              mock.patch.object(scratch, "remove", side_effect=use_during_removal)):
             self.assertEqual(copies.mirror_remove(mirror_arguments(task_mirror, "mirror-remove")), 0)
         self.assertEqual(len(use_results), 1)
         self.assertFalse(checkout.parent.exists())
