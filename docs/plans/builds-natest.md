@@ -2124,43 +2124,37 @@ A changed `config/<name>.conf` selects every test module whose transitive import
 **Ruled out:**
 - A source-stamp path change in the queue client: about 0.5 CPU s (3%) of gain, with a path-equivalence risk across platforms (showrunner, 2026-11-09).
 
-### Phase 107 — The change page tests drop the processes kept at the floor  · status: todo
-**Depends on:** none
+### Phase 107 — The change page tests drop the processes kept at the floor  · status: done
 
-#### Work Order
+#### As-built
 
-**Source:** the showrunner, 2026-11-09: devtools `52256c239` makes `change_page.py` save a verdict and close a feature-log proposal through library calls in its own process. sdlc measured the CPU per verdict at 24.4 s before and 11.4 s after. The Phase 105 Floors row kept real `change_review.py` and `feature_log.py` processes for calls from HTTP worker threads. The showrunner asks for a new measure on top of that change and the removal of the kept processes where the test can now run in process.
-
-**Goal:** `scripts/review_links/test_change_page.py` starts no process that the in-process change page calls made unneeded, and its CPU is measured against the Phase 105 floor, with every checked behavior kept.
-
-**Spec:**
-1. Follow the Speed method. Measure CPU with `module_cost.py --tests 10 --commands 10` on the phase base first. Name each test's CPU, and each real process that it starts.
-2. Find each remaining `change_review.py`, `feature_log.py` and `change_page.py` start, and the thread that makes it. Remove each start that only the test fixture makes.
-3. Remove the fixture route for HTTP worker-thread calls when no such call remains. Keep `invoke_cli` for main-thread calls only.
-4. Keep a real process for each behavior that only a process proves: an exit code across a process, any cwd or environment that the entry reads at start. Keep each `@process_boundary` case that still proves such a behavior.
-5. Update the behavior map from Phase 105 with a row for each assertion before you change a test.
-6. Do not change `scripts/review_links/change_page.py`, `scripts/production/change_review.py`, `scripts/feature_log/feature_log.py` or other production files. sdlc owns them. If only a production change can cut a cost, write the floor and send the director an architecture proposal with its measured gain.
-7. Add no guard, refusal or check (user rule, 2026-11-05).
+- `test_change_page.py` no longer patches `subprocess.run` with an adapter. devtools `52256c239` makes `change_page.py` call `change_review` and `feature_log` in its own process, so the adapter had no route left.
+- Five tests lost obsolete `@process_boundary` marks; none of them reaches `self.command`. Two marked tests keep six real `change_page.py` starts: exit status, saved state across restarts, and publication from startup paths.
+- All 139 tests and 832 assertions are kept. Processes: 879 -> 879.
+- The phase base `ea13a357b` was already at the floor. Worker pairs: `/dev/shm` with no bytecode writes 10.384 -> 10.388 CPU s; `/tmp` with a warm bytecode cache 7.022 -> 7.004 CPU s. No gain is claimed.
 
 **Files:**
-- `scripts/review_links/test_change_page.py`
-- `docs/plans/builds-natest-next.md` — the Floors row only
+- `scripts/review_links/test_change_page.py` — change page tests; adapter and five marks removed
+- `docs/plans/builds-natest-next.md` — Floors row for the change page tests
 
-**Workers:** 1 writer; one test file
-- `impl` — `test_change_page.py`, the Floors row
+**Gotchas:**
+- A floor that waits on another unit's change needs a remeasure when that change reaches builds; the gain can already be taken.
 
-**Constraints from prior phases:**
-- Phase 105: `test_change_page.py` copies one seed repository per test. Its `run` side effect sends main-thread test-owned CLI calls through `invoke_cli`, and calls from other threads, `@process_boundary` cases and other commands through the real process. 7 `@process_boundary` tests, 139 tests and 829 assertions.
-- Phase 105 floor: 17.7 CPU s pair median, base `befc1a04a`, /tmp roots, warm bytecode cache; 18.0 CPU s with no bytecode writes on /dev/shm roots.
-- devtools `52256c239` also edited `test_change_page.py`. Build on its version.
-- `invoke_cli` restores signal handlers (`cli_fixture.py:133`), and Python allows that only on the main thread. It also changes the process cwd, environment and streams. Check the thread of each routed call; a worker-thread call routed in process was the Phase 105 review blocker.
-- Phase 103: a process start costs more with no bytecode writes. Report pairs with no bytecode writes and on `/tmp` with a warm bytecode cache.
-- Tests never read or write live state: `~/.claude` main, `~/.local/state/merge-gate`, `/tmp/claude`. State the filesystem basis of each pair.
+**Ruled out:**
+- A deferred `feature_log` import in `change_page.py`: no CPU gain in three pairs per condition.
+- The architect's reword of the Phase 106 Floors row: the showrunner said to keep that row as it is.
 
-**Acceptance gate:**
-- The behavior map has a row for each assertion. No assertion is removed.
-- CPU s, processes, execs and wall s before and after, from `module_cost.py` and same-load pairs against the phase base, in the checkpoint notice.
-- The changed file passes.
-- the targeted test green on the phase commit merged with `origin/builds`
-- `basedpyright` on the changed file prints `0 errors, 0 warnings, 0 notes`
-- Floors: the Phase 105 change page row is replaced with the new figures, or removed when no floor remains.
+### Phase 108 — The hook dispatch tests use half their CPU  · status: done
+
+#### As-built
+
+- `CopyGuardDispatchTests.dispatch_cases` sends a list of Bash payloads through the real `hook_dispatch.main` and the registered hooks in one isolated main-thread driver process. `invoke_cli` captures each case's return code, stdout and stderr. A driver crash fails the test with the driver stderr.
+- Three matrix tests use it: registered dispatch, interpreter vectors with unresolved programs, and recorded commands. Real dispatcher process starts stay for the refusal, pass and first unresolved case.
+- All 39 tests, 136 matrix cases and 95 assertions are kept. Sequential `module_cost`: 47.1 -> 13.4 CPU s, processes 411 -> 280.
+- Director pairs on base `5db3e42fd`: `/tmp` with a warm bytecode cache 26.9 -> 10.3 CPU s (62% less); `/dev/shm` with no bytecode writes 36.7 -> 12.2 CPU s (67% less).
+
+**Files:**
+- `scripts/hooks/test_hook_dispatch.py` — hook dispatcher tests; `dispatch_cases` groups matrix cases in one driver
+
+**Gotchas:**
+- Cases in one driver share `sys.modules`. `hook_dispatch._execute` loads each hook as a fresh module, so hook globals do not carry; keep HOME, PATH and cwd the same for all cases of one driver.
