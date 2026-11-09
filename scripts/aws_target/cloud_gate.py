@@ -373,7 +373,11 @@ class GateWorker:
                         break
                     state = self.api.observe(instance, int(self.clock())).state
                     if state not in ('pending', 'running'):
-                        raise ValueError('The instance stopped without a final result')
+                        reply = self.api.call('describe-instances', '--instance-ids', instance)
+                        stopped = ledger.rows(ledger.rows(reply, 'Reservations')[0], 'Instances')[0]
+                        reason = ledger.mapping(stopped.get('StateReason', {}))
+                        detail = ': '.join(ledger.text(reason, key) for key in ('Code', 'Message') if reason.get(key))
+                        raise ValueError('The instance stopped without a final result' + (f' ({detail})' if detail else ''))
                     self.pause(settings().number('result_poll_s'))
                 if not row:
                     raise ValueError('The instance expired without a final result')
