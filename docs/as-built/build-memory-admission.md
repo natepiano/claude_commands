@@ -1237,6 +1237,11 @@ Natedev also records cache sizes, growth and removal accounting. These reports s
 `send_floor_alert()` delivers the session message; exit 0 or 1 counts as accepted.
 `send_phone_push()` delivers the separate phone push; only exit 0 counts as accepted.
 Folder choices come from `disk.json` as `AvailableDiskMeasurement | UnavailableDiskMeasurement`.
+The choices use the same held-output rule as the Mac choices described below.
+`FloorOutcome.held_targets` carries live-use paths, including protected targets with live use.
+The floor pass sets these paths when it sends the notification.
+It includes live use found during the deletion checks after the scan and includes paired output roots.
+`HeldOnlyFolderChoices` identifies a measurement that contains no folder without held output.
 `buildlog disk` records large directories outside Cargo targets, their growth and their largest child.
 It also records `outside_build_cache_totals` and `previous_measured_at`.
 `send.py`'s `log.jsonl` lines carry `text`.
@@ -1482,8 +1487,16 @@ Each size estimates the file blocks that deleting that folder alone frees.
 An inode counts once only when every hard link is inside that folder.
 An inode with a link outside the folder counts zero.
 The measurement does not follow directory symlinks.
-The alert lists these folders from largest to smallest and recommends the largest folder.
-Protected folders keep their protected labels.
+The alert lists these folders from largest to smallest.
+The floor pass carries held target paths separately from folders with no recorded evidence.
+Live process use, Mac claims, mirror leases, build holds, busy judgment locks, and held cargo locks identify held output.
+A folder that contains held output, lies inside held output, or equals held output gets the held label.
+The comparison uses resolved paths after home expansion and compares path components.
+The held label takes priority over the protected label.
+The alert recommends the largest folder without held output.
+If that folder cannot cover the shortfall, the alert names its size and the partial result.
+If every measured folder holds output, the alert says the sweep frees it when the build ends.
+The session keeps the choice to delete nothing.
 The measurement reads the Mac folders directly and needs no natedev disk snapshot.
 The finalizer derives the machine name from its floor policy.
 Unreadable folders can make the measured sizes incomplete.

@@ -2295,9 +2295,11 @@ def _disarm_review(args: argparse.Namespace) -> None:
     )
 
 
-def _load_events(event_types: Collection[str] = ()) -> tuple[list[dict[str, object]], int]:
+def load_events(event_types: Collection[str] = (), *,
+                record: staff.StaffSnapshot | None = None) -> tuple[list[dict[str, object]], int]:
     events: list[dict[str, object]] = []
-    record = staff.initial_snapshot()
+    if record is None:
+        record = staff.initial_snapshot()
     ignored = 0
     runs_dir = plan_history.history_root() / "runs"
     wanted = re.compile(r'"event_type"\s*:\s*"(?:' + "|".join(map(re.escape, event_types)) + r')"')
@@ -2327,7 +2329,7 @@ def _load_events(event_types: Collection[str] = ()) -> tuple[list[dict[str, obje
 def events_for_worktrees(worktrees: tuple[Path, ...], event_types: frozenset[str]) -> list[dict[str, object]]:
     """Read selected records once for the units' current staff worktrees."""
     directories = {str(worktree.resolve()) for worktree in worktrees}
-    return sorted((event for event in _load_events(event_types)[0] if event.get("working_dir") in directories),
+    return sorted((event for event in load_events(event_types)[0] if event.get("working_dir") in directories),
                   key=lambda event: _number(event.get("timestamp_epoch")))
 
 
@@ -2670,7 +2672,7 @@ def _calibrate(args: argparse.Namespace) -> None:
     if not 0 <= candidate <= 100:
         raise SystemExit("--candidate-percent must be between 0 and 100")
     cap_stage = _arg_string(args, "cap_stage")
-    events, ignored = _load_events()
+    events, ignored = load_events()
     scopes = _calibration_scopes(_calibration_samples(events), state, cap_stage)
     scope, samples = _matching_scope(scopes, candidate)
     bias, support = _smoothed_bias(scopes, candidate)
@@ -2937,9 +2939,8 @@ def _run_events(state: dict[str, object], *,
                 ) -> list[dict[str, object]]:
     """Every event this run recorded, oldest first.
 
-    Scoped to the one run rather than `_load_events`' whole history: the stage
-    table describes the phase in front of the reader, and reading every past run
-    to build it would grow with the machine's history instead of the phase.
+    Read only this run for its phase table.
+    The read cost depends on this run's history.
     """
     history_file = _string(state.get("history_file"))
     if not history_file:
@@ -5834,7 +5835,7 @@ def resolve_checkpoint(commit: str, working_dir: Path, phase_id: str) -> (
     ResolvedCheckpointPhase | UnresolvedWaitAttribution
 ):
     """Match a full checkpoint, including finished instances, across durable runs."""
-    events, ignored = _load_events()
+    events, ignored = load_events()
     phases = [event for event in events if event.get("event_type") == "phase_started"
               and _string(event.get("working_dir"))
               and Path(_string(event.get("working_dir"))).resolve() == working_dir.resolve()
@@ -6345,7 +6346,7 @@ def _read_waits(args: argparse.Namespace) -> None:
             candidate.get("run_id") in run_ids for candidate in
             _attribution_candidates(wait)))
     else:
-        events, ignored = _load_events()
+        events, ignored = load_events()
         events.extend(_external_wait_events())
     without_id = [event for event in events
                   if event.get("event_type") in ("wait_started", "wait_finished", "wait_unclosed", "wait_not_recorded")
@@ -6712,7 +6713,7 @@ def _review_trial(args: argparse.Namespace) -> None:
 
 
 def _aggregate(args: argparse.Namespace) -> None:
-    events, ignored = _load_events()
+    events, ignored = load_events()
     samples = _calibration_samples(events)
     requested_percent = _arg_integer(args, "percent", -1)
     grouped: dict[tuple[int, str], list[CalibrationSample]] = defaultdict(list)

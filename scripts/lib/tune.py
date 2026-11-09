@@ -8,7 +8,7 @@ except FileNotFoundError:
 
 import argparse
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import platform
 import shlex
 import sys
@@ -77,7 +77,8 @@ def _publish(args: RequestedValueChange, checkout: Path, *, already: bool) -> in
         if not already:
             print("mac: pulled")
     else:
-        main_publish.queue_pull_only(f"{args.file}.{args.key}", outcome.reason)
+        main_publish.queue_pull_only(f"{args.file}.{args.key}", outcome.reason,
+                                     pulls=(main_publish.MacCheckoutPull(PurePosixPath("~/.claude"), checkout),))
         print(f"mac: queued ({outcome.reason}); the 15-minute sync sends it when the Mac wakes")
     return 0
 

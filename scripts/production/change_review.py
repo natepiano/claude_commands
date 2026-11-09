@@ -21,6 +21,7 @@ except FileNotFoundError:
 
 import argparse
 import fcntl
+import json
 import os
 import re
 import shlex
@@ -35,7 +36,8 @@ from pathlib import Path
 from typing import TypeVar, cast
 
 from scripts.lib.atomic_file import write_text_atomic  # noqa: E402
-from scripts.lib import scratch  # noqa: E402
+from scripts.lib import scratch, unit_runs  # noqa: E402
+from scripts.direct.progress_history import load_events  # noqa: E402
 from scripts.lib import urgency  # noqa: E402
 from scripts.lib.user_zone import user_zone  # noqa: E402
 
@@ -1027,21 +1029,6 @@ def _branches_from_units(pairs: Iterable[tuple[Path, staff.StaffRow]],
     return found
 
 
-def _publication_branches(production: Path, record: staff.StaffSnapshot) -> dict[str, UnitSource]:
-    """Resolve live units before retired units, with scoped units first in each group."""
-    pairs = _document_units(_publication_docs(production, record), record)
-    scoped = {pair[1].id for pair in pairs}
-    machine = remote.local_machine()
-    resolver = session_staff.RowResolver(record)
-    for row in record.find(kind="unit"):
-        if row.id in scoped or isinstance(row.worktree, staff.WorktreeUnfilled) or row.worktree.machine != machine:
-            continue
-        doc = resolver.production_doc(row)
-        pairs.append((doc.path if isinstance(doc, session_staff.ProductionDoc) else production, row))
-    pairs.sort(key=lambda pair: isinstance(pair[1].worktree, staff.RemovedWorktree))
-    return _branches_from_units(pairs, record)
-
-
 def _owner_of(commit: Commit, branches: dict[str, UnitSource]) -> Path | None:
     """The production of the unit whose branch the checkpoint names, or None for another commit."""
     found = _CHECKPOINT.match(commit.subject)
@@ -1095,21 +1082,49 @@ def _publication_docs(production: Path, record: staff.StaffSnapshot) -> list[Pat
     return scope_docs(production, below=True, record=record)
 
 
+def checkpoint_producers(record: staff.StaffSnapshot) -> dict[str, tuple[staff.StaffId | UnknownProducer, str]]:
+    """Read each checkpoint's recorded owner once for a publication scan."""
+    recorded: dict[str, tuple[staff.StaffId | UnknownProducer, str]] = {}
+    events, _ = load_events({"checkpoint"}, record=record)
+    for event in events:
+        checkpoint = event.get("checkpoint_commit")
+        if not isinstance(checkpoint, str):
+            continue
+        owner = event.get("owner_staff_id")
+        if isinstance(owner, str) and owner:
+            producer: staff.StaffId | UnknownProducer = staff.StaffId(owner)
+        else:
+            unit = record.unit_by_worktree(remote.local_machine(), Path(str(event.get("working_dir", ""))))
+            producer = unit.id if unit is not None else UNKNOWN_PRODUCER
+        recorded[checkpoint] = producer, str(event.get("unit", ""))
+    return recorded
+
+
 def publication_changes(commits: list[Commit], production: Path, *,
                         record: staff.StaffSnapshot | None = None,
-                        known_producer: staff.StaffId | UnknownProducer = UNKNOWN_PRODUCER) -> list[PublicationChange]:
-    """Resolve the selected review changes, their units, and their producers."""
+                        known_producer: staff.StaffId | UnknownProducer = UNKNOWN_PRODUCER,
+                        recorded_producers: Mapping[str, tuple[staff.StaffId | UnknownProducer, str]] | None = None) -> list[PublicationChange]:
+    """Use checkpoint owners first, then the producer recorded for this merge."""
     record = staff.snapshot() if record is None else record
-    branches = _publication_branches(production, record)
+    recorded = checkpoint_producers(record) if recorded_producers is None else recorded_producers
     machine = remote.local_machine()
+    sources: dict[staff.StaffId, UnitSource] = {}
+    for member in record.find(kind="unit"):
+        tree = member.worktree
+        if isinstance(tree, staff.WorktreeUnfilled) or tree.machine != machine:
+            continue
+        owner = record.parent_of(member)
+        doc = owner.doc.path if owner is not None and isinstance(owner.doc, (staff.LiveDoc, staff.WrappedDoc)) else production
+        sources[member.id] = UnitSource(doc, tree.path if isinstance(tree, staff.PresentWorktree) else MissingUnitWorktree(),
+                                       member.name, member.id)
     changes: list[PublicationChange] = []
     for commit, item in _checkpoint_entries(commits):
-        match = _CHECKPOINT.match(commit.subject)
-        source = branches.get(match["branch"]) if match is not None else None
+        identity, name = recorded.get(commit.sha, (known_producer, ""))
+        if isinstance(identity, UnknownProducer):
+            identity = known_producer
+        source = sources.get(identity) if isinstance(identity, str) else None
         producer = producer_for(source, record, machine) if source is not None else UNKNOWN_PRODUCER
-        if isinstance(known_producer, str) and (source is None or source.producer == known_producer):
-            producer = known_producer
-        name = source.name if source is not None and source.name else match["branch"] if match is not None else ""
+        name = source.name if source is not None else name
         changes.append(PublicationChange(item, source if source is not None else UnresolvedSource(), producer, commit.sha, name))
     return changes
 
@@ -1588,6 +1603,22 @@ class KnownMergeProducer:
     producer: staff.StaffId
 
 
+def record_merge_producer(known: KnownMergeProducer) -> None:
+    """Store the producer supplied by the request when its merge is made."""
+    path = unit_runs.history_root() / "merge_producers" / f"{known.merge}.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    write_text_atomic(path, json.dumps({"producer": known.producer}) + "\n")
+
+
+def merge_producer(merge: str) -> staff.StaffId | UnknownProducer:
+    """Read the producer recorded when this merge was made."""
+    path = unit_runs.history_root() / "merge_producers" / f"{merge}.json"
+    if not path.exists():
+        return UNKNOWN_PRODUCER
+    saved = cast(dict[str, str], json.loads(path.read_text(encoding="utf-8")))
+    return staff.StaffId(saved["producer"])
+
+
 @dataclass(frozen=True)
 class ReadinessScan:
     """Scan published merges for changes that need no further step."""
@@ -1647,6 +1678,7 @@ def list_ready(repo: Path, production: Path, merge_branch: str, *,
     outside_refs = set(reviewed_merge_refs(repo, lambda: outside_docs, record=record))
     rows: list[str] = []
     matched_step = False
+    recorded = checkpoint_producers(record)
     for entry in merges:
         merge, subject = entry.split("\t", 1)
         if any(subject.endswith(f" into {ref.removeprefix('origin/')}") for ref in outside_refs):
@@ -1673,8 +1705,20 @@ def list_ready(repo: Path, production: Path, merge_branch: str, *,
 
         producer = (known_producer.producer
                     if isinstance(known_producer, KnownMergeProducer) and known_producer.merge == merge
-                    else UNKNOWN_PRODUCER)
-        for change in publication_changes(commits, production, record=record, known_producer=producer):
+                    else merge_producer(merge))
+        producers = dict(recorded)
+        ancestry: Mapping[str, tuple[str, ...]] = commits[0].ancestry if commits else {}
+        for inner, parents in reversed(tuple(ancestry.items())):
+            if len(parents) < 2:
+                continue
+            inner_producer = merge_producer(inner)
+            if isinstance(inner_producer, UnknownProducer):
+                continue
+            for checkpoint in _git(repo, "rev-list", parents[1], f"^{parents[0]}", "--").splitlines():
+                if checkpoint not in producers or isinstance(producers[checkpoint][0], UnknownProducer):
+                    producers[checkpoint] = inner_producer, ""
+        for change in publication_changes(commits, production, record=record, known_producer=producer,
+                                          recorded_producers=producers):
             readiness = change.item.readiness
             if isinstance(selection, CompletedStep) and isinstance(readiness, AfterStep) and readiness.step == selection.step:
                 matched_step = True
