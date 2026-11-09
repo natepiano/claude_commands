@@ -3256,19 +3256,16 @@ The merge of sdlc 9b30ae594 (agents 12) at the Phase 28 start joined restore: ea
 
 **Ruled out:** a `ctrl+s` restore after a proved submit — it made each delivery wait for the turn end.
 
-### Phase 31 — A message to a pane worker goes to its pane  · status: todo
+### Phase 31 — A message to a pane worker goes to its pane  · status: done
 
-**Depends on:** Phase 29 and Phase 28 (it runs after 28: hierarchies Phase 30 waits on 28 and 29; herdr, 2026-11-08 [0124959b]). Phase 19 waits for this phase.
+**Depends on:** Phase 29 and Phase 28. Done by hierarchies Phase 30 (main fd3838627, 2026-11-08); this phase wrote no code. sdlc [97126f92].
 
-sdlc reported a defect from hana (2026-11-07): `send.py --codex` to an idle pane worker fails with exit 3, `FAILED: codex_mesh.py send: codex_mesh: tool-based-ui-demo-fix2 is ended; message not delivered`. `send.py` (`codex`, `scripts/message/send.py:2234`) still sends every Codex message through `codex_mesh.py send`, which reads the old mesh roster entry as ended. sdlc's rule: `send.py` delivers to a pane worker through the one pane delivery function that assign uses, with no second copy. The `codex_mesh` route goes with Phase 19.
+Case (hana, 2026-11-07): `send.py --codex` to an idle pane worker failed with exit 3, because `send.py` sent every Codex message through `codex_mesh.py send`.
 
-The second case (a Codex session in a pane, such as morty) moved to Phase 37 (sdlc [787d4c6f], 2026-11-07: start it now). This phase reuses the pane recipient that Phase 37 adds.
+#### As-built
 
-**Constraint from Phase 37:** `send.py` has one pane submit helper, `_prompt_pane(place, text, *, target, timeout)` (herdr `prompt` with `SubmitStarts`); `deliver_worker_text` and `CodexPaneRecipient` both call it. Route a pane worker's `--codex` message through `deliver_worker_text` or that helper; add no second submit. A staff row with no live roster entry resolves to `ClaudeRecipient` only when the notifier registry holds its running Claude record; otherwise to `QueuedStaffRecipient`. An explicit `codex:` address with no live daemon or pane fails before that queue.
-
-**Constraint from Phase 32:** every launch destination runs `Herdr.run_in_pane`, which waits for an empty shell. A test fake pane shows an empty shell before the agent starts, or the test patches `Herdr.run_in_pane` in setUp.
-
-The Work Order is written at the phase start.
+- hierarchies Phase 30 removed the mesh: `send.py --codex`, `CODEX_MESH`, `codex()`, `CodexWorkerRecipient` and `MeshWorker` are gone; `scripts/agents/mesh_runs.py` is now `scripts/agents/detached_runs.py`.
+- `send.py` resolves a local staff worker to `PaneWorkerRecipient` (`scripts/message/send.py:2280`). Delivery uses the one pane submit path that assign uses.
 
 ### Phase 33 — A worker's newest pass decides its close  · status: done
 
