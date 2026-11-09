@@ -3800,6 +3800,7 @@ def notify_floor_problem(outcome: FloorOutcome | tmp_sweep.SweepAssessment, *, l
     if not root_scope and not assessment.status and not path.exists():
         return
     phone_floor = int(lint_settings.number("sweep_phone_floor_gib") * GIB)
+    phone_rearm = phone_floor + int(lint_settings.number("sweep_phone_rearm_gib") * GIB)
 
     def finalize(previous: NoFloorRecord | FloorRecord, save: Callable[[FloorRecord], bool]) -> FloorRecord:
         current = floor_record_or_new(previous, after)
@@ -3809,7 +3810,7 @@ def notify_floor_problem(outcome: FloorOutcome | tmp_sweep.SweepAssessment, *, l
                 # Measure inside the record lock. Older callers cannot reset a newer crossing.
                 free = free_bytes(filesystem.probe_path if isinstance(filesystem, FilesystemFloor)
                                   else os.path.expanduser("~"))
-                if free > phone_floor:
+                if free > phone_rearm:
                     current = replace(current, phone_crossing=AbovePhoneFloor())
                 elif free < phone_floor and isinstance(current.phone_crossing, AbovePhoneFloor):
                     current = replace(current, phone_crossing=OpenPhoneCrossing(uuid.uuid4().hex))
@@ -3823,9 +3824,10 @@ def notify_floor_problem(outcome: FloorOutcome | tmp_sweep.SweepAssessment, *, l
             failure = NoFailure()
         current = replace(current, failure=failure)
         crossing = current.phone_crossing if root_scope else AbovePhoneFloor()
-        natedev_pending = isinstance(crossing, OpenPhoneCrossing) and crossing.natedev is CrossingReceipt.PENDING
-        phone_due = (isinstance(crossing, OpenPhoneCrossing) and crossing.phone is CrossingReceipt.PENDING
-                     and not assessment.status)
+        natedev_pending = (free < phone_floor and isinstance(crossing, OpenPhoneCrossing)
+                           and crossing.natedev is CrossingReceipt.PENDING)
+        phone_due = (free < phone_floor and isinstance(crossing, OpenPhoneCrossing)
+                     and crossing.phone is CrossingReceipt.PENDING and not assessment.status)
         phone_pending = phone_due and disk_floor_channels() is FloorAlertChannels.NATEDEV_AND_PHONE
         crossing_pending = natedev_pending or phone_pending
         pending_failure = isinstance(failure, FailurePending)
@@ -3856,7 +3858,8 @@ def notify_floor_problem(outcome: FloorOutcome | tmp_sweep.SweepAssessment, *, l
             receipt = current.phone_crossing
             if isinstance(receipt, OpenPhoneCrossing):
                 receipt = replace(receipt,
-                                  natedev=CrossingReceipt.ACCEPTED if delivery.natedev.accepted else receipt.natedev,
+                                  natedev=(CrossingReceipt.ACCEPTED if natedev_pending and delivery.natedev.accepted
+                                           else receipt.natedev),
                                   phone=CrossingReceipt.ACCEPTED if delivery.phone.accepted else receipt.phone)
                 current = replace(current, phone_crossing=receipt)
             if delivery.natedev.accepted and isinstance(current.failure, FailurePending):

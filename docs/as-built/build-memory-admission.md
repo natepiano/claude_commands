@@ -1212,7 +1212,11 @@ The message names the Mac when its disk is low.
 A current `sweep.disk_floor` text approval also permits one phone push per episode.
 The push names the machine and recommends one measured folder, or asks for measurements when folder sizes are unavailable.
 Each channel keeps its own receipt; a failed channel can retry without repeating the accepted delivery.
-A reading above the alert line rearms both channels. Equality does not rearm them.
+A reading above the alert line plus `sweep_phone_rearm_gib` rearms both channels.
+Equality with that boundary does not rearm them.
+`config/lint.conf` sets the margin to 5 GiB beside `sweep_phone_floor_gib`.
+With the 150 GiB alert line, free space must exceed 155 GiB before a later crossing can send another alert.
+The same rule applies to natedev and the Mac.
 While text approval is stale, the natedev message still sends and the phone receipt stays pending.
 The phone channel can send that pending episode after the showrunner records the new approval.
 
