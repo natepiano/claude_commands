@@ -173,7 +173,6 @@ Uncommitted work or an unmerged checkpoint prevents removal.
 Retire records a removed worktree in staff and parks `.unit.toml` under the fixed staff id.
 It releases holds, reservations, and Mac claims.
 It stops worker agents and retains their rows, native conversations, and stopped panes for restore.
-Only an existing run pinned to `mesh` uses the retained worker-end path.
 `/agents resume NAME --retired` restores the worktree and resumes the director and its retained workers.
 The showrunner asks the user yes or no before it runs `--retired`.
 

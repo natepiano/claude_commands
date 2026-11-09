@@ -8,10 +8,10 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from scripts.build_hold.override_guard import require_checkout
-    from scripts.lint.memory_admit import AdmissionPolicy, MemoryConfig, read_memory_config as read_fixture_config
+    from scripts.build_queue.admission_records import AdmissionPolicy, MemoryConfig, read_memory_config as read_fixture_config
 else:
     from scripts.build_hold.override_guard import require_checkout
-    from scripts.lint.memory_admit import read_memory_config as read_fixture_config
+    from scripts.build_queue.admission_records import read_memory_config as read_fixture_config
 
 require_checkout(Path(__file__))
 
@@ -129,7 +129,7 @@ def private_ci_environment(root: Path) -> dict[str, str]:
     """Keep CI slice readings inside the private fixture."""
     ci = root / "ci.slice"
     ci.mkdir(exist_ok=True)
-    for name, value in (("memory.current", "0"), ("memory.stat", "inactive_file 0\n"), ("memory.max", str(40 * 1024**3)), ("cgroup.procs", "")):
+    for name, value in (("memory.current", "0"), ("memory.stat", "anon 0\nshmem 0\ninactive_file 0\n"), ("memory.max", str(40 * 1024**3)), ("cgroup.procs", "")):
         path = ci / name
         if not path.exists():
             _ = path.write_text(value)

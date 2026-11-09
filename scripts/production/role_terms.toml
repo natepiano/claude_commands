@@ -87,11 +87,6 @@ reason = "Recorded command output with transport placeholders."
 
 [[terms.kept_contexts]]
 path = "docs/as-built/shutdown-and-restart.md"
-text = "`codex_mesh: <seat>: <reason>`"
-reason = "Command diagnostic placeholders; the transport contract stays unchanged."
-
-[[terms.kept_contexts]]
-path = "docs/as-built/shutdown-and-restart.md"
 text = "`<seat> (<role>, was working): <command>`"
 reason = "Resume command output placeholder."
 

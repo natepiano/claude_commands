@@ -343,8 +343,28 @@ def encode_record(value: object) -> str:
     return json.dumps(codec.snapshot_value(value), separators=(",", ":"), ensure_ascii=False, allow_nan=False)
 
 
+def _read_wire_record(record: dict[str, object]) -> dict[str, object]:
+    # Phase 33: older clients sent ShapeP90 with a fixed ten-percent share.
+    if record.get("kind") == "ShapeP90":
+        return {**record, "kind": "ShapeRankedPeak", "share_percent": 10}
+    return record
+
+
+def _write_wire_record(value: object) -> object:
+    if isinstance(value, list):
+        return [_write_wire_record(item) for item in cast(list[object], value)]
+    if not isinstance(value, dict):
+        return value
+    record = {key: _write_wire_record(item) for key, item in cast(dict[str, object], value).items()}
+    # Phase 33: a config change introduces other shares after deployment of the new service.
+    if record.get("kind") == "ShapeRankedPeak" and record.get("share_percent") == 10:
+        record["kind"] = "ShapeP90"
+        del record["share_percent"]
+    return record
+
+
 def parse_record(text: str, schema: type[T]) -> T:
-    value = cast(object, json.loads(text))
+    value = cast(object, json.loads(text, object_hook=_read_wire_record))
     return cast(T, codec.parse_snapshot_value(value, schema))
 
 
@@ -352,12 +372,13 @@ def _encode(value: object, variants: dict[str, type], version: int = VERSION) ->
     name = next((name for name, schema in variants.items() if type(value) is schema), None)
     if name is None:
         raise ValueError("unknown admission message")
-    return encode_record({"v": version, "type": name, "data": value}) + "\n"
+    data = _write_wire_record(codec.snapshot_value(value))
+    return encode_record({"v": version, "type": name, "data": data}) + "\n"
 
 
 def _parse(line: str | bytes, variants: dict[str, type]) -> tuple[int, object]:
     try:
-        value = cast(object, json.loads(line))
+        value = cast(object, json.loads(line, object_hook=_read_wire_record))
         if not isinstance(value, dict):
             raise ValueError("invalid admission envelope")
         envelope = cast(dict[str, object], value)

@@ -151,10 +151,12 @@
       "Bash(git push --force*)",
       "Bash(git push * --force*)",
       "Bash(git push -f*)",
-      "Bash(git push * -f*)",
+      "Bash(git push * -f)",
+      "Bash(git push * -f *)",
       "Bash(git push --mirror*)",
       "Bash(git push * --mirror*)",
-      "Bash(git push * +*)",
+      "Bash(git push * +refs/*)",
+      "Bash(git push * +HEAD*)",
       "Bash(git push * :main*)",
       "Bash(git push * --delete main*)",
       "Bash(git push --delete * main*)",
@@ -238,6 +240,16 @@
     "nightly_review": "user-invocable-only"
   },
   "hooks": {
+    "PostCompact": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$HOME/.claude/scripts/lib/py\" \"$HOME/.claude/scripts/hooks/compaction-marker-clear.py\""
+          }
+        ]
+      }
+    ],
     "PostToolUse": [
       {
         "matcher": "Bash",
@@ -254,6 +266,16 @@
             "type": "command",
             "command": "\"$HOME/.claude/scripts/lib/py\" \"$HOME/.claude/scripts/hooks/hook_dispatch.py\" post_tool_use",
             "timeout": 2430
+          }
+        ]
+      }
+    ],
+    "PreCompact": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$HOME/.claude/scripts/lib/py\" \"$HOME/.claude/scripts/hooks/pre-compact-marker.py\" --family claude"
           }
         ]
       }
@@ -386,7 +408,7 @@
           {
             "type": "command",
             "command": "\"$HOME/.claude/scripts/lib/py\" \"$HOME/.claude/scripts/hooks/hook_dispatch.py\" stop",
-            "timeout": 1840
+            "timeout": 1850
           },
           {
             "type": "command",
@@ -528,5 +550,6 @@
   "voiceEnabled": true,
   "feedbackSurveyState": {
     "lastShownTime": 1754090074729
-  }
+  },
+  "precomputeCompactionEnabled": false
 }

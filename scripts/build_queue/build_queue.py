@@ -23,6 +23,7 @@ from scripts.build_queue.queue_evidence import step_labels
 from scripts.build_queue.queue_view import QueueModel, HostLoad, HostLoadUnavailable, UnknownCpuCount, render_view
 from scripts.build_queue.queue_lines import Span
 from scripts.buildlog.mac_idle_alert import alert_line, state_dir
+from scripts.build_queue import admission_records
 from scripts.lint import memory_admit
 from scripts.lib.user_zone import user_zone
 from scripts.message import unit_labels
@@ -63,8 +64,8 @@ class NoWaitingStep:
 def bump(selector: str, actor: str) -> int:
     reading = memory_admit.queue_read()
     labels = unit_labels.unit_labels_for([step.session_id for step in reading.view.waiting], os.environ)
-    model = QueueModel(reading, labels, memory_admit.NoWaiter(), head_facts.PaceUnavailable(), user_zone(),
-                       HostLoadUnavailable(), memory_admit.NoWaiter())
+    model = QueueModel(reading, labels, admission_records.NoWaiter(), head_facts.PaceUnavailable(), user_zone(),
+                       HostLoadUnavailable(), admission_records.NoWaiter())
     matches = select_waiters(model, selector)
     if not matches:
         print(f"build queue: no waiting step matches {selector}")
@@ -105,7 +106,7 @@ def main() -> int:
             print("build queue: use /build:queue bump <position|session|folder>")
             return 3
         try:
-            actor = memory_admit.queue_command_actor()
+            actor = admission_records.queue_command_actor()
             if sys.argv[1] == "bump" and len(sys.argv) == 3:
                 return bump(sys.argv[2], actor)
             elif sys.argv[1] == "clear" and len(sys.argv) == 2:
@@ -144,15 +145,15 @@ def main() -> int:
         reading = admission_client.mine(caller()) if words == ["mine"] else memory_admit.queue_read()
         if words == ["mine"]:
             words = [caller()]
-        facts = head_facts.read_head_facts(reading) if words else memory_admit.NoWaiter()
+        facts = head_facts.read_head_facts(reading) if words else admission_records.NoWaiter()
         ids = [step.session_id for step in (*reading.view.running, *reading.view.waiting)]
         ids.extend(head_facts.session_ids(facts))
         labels = unit_labels.unit_labels_for(ids, os.environ)
         pace = head_facts.read_pace(reading.explanation.now) if words else head_facts.PaceUnavailable()
         load = read_host_load() if words else HostLoadUnavailable()
-        release = memory_admit.smallest_head_release(reading.explanation) if words else memory_admit.NoWaiter()
+        release = memory_admit.smallest_head_release(reading.explanation) if words else admission_records.NoWaiter()
         model = QueueModel(reading, labels, facts, pace, user_zone(), load, release,
-                           ci_memory_slice=memory_admit.read_memory_config().ci_memory_slice)
+                           ci_memory_slice=admission_records.read_memory_config().ci_memory_slice)
         lines = render_view(model, arguments.columns, colour=arguments.json, you=arguments.you,
                             selector=words[0] if words else "")
         if words:

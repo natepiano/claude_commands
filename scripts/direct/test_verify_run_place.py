@@ -37,6 +37,7 @@ class VerifyRunPlaceTests(unittest.TestCase):
         library = scripts / "lib"
         library.mkdir()
         (library / "py").symlink_to(sys.executable)
+        (library / "package_root.py").symlink_to(VERIFY.parent.parent / "lib/package_root.py")
         (library / "build_folders.py").symlink_to(VERIFY.parent.parent / "lib/build_folders.py")
         lint = scripts / "lint"
         lint.mkdir()
@@ -52,8 +53,8 @@ if not sys.stdin.readline():
 ''')
         prefix, command_marker, dispatch = VERIFY.read_text().partition('\nCMD="${1:-}"\n')
         self.assertTrue(command_marker, 'verify.sh startup marker is missing: CMD="${1:-}"')
-        _, detach_marker, after_detach_marker = dispatch.partition('\nMESH_RUNS_SCRIPT=')
-        self.assertTrue(detach_marker, "verify.sh startup marker is missing: MESH_RUNS_SCRIPT=")
+        _, detach_marker, after_detach_marker = dispatch.partition('\nDETACHED_RUNS_SCRIPT=')
+        self.assertTrue(detach_marker, "verify.sh startup marker is missing: DETACHED_RUNS_SCRIPT=")
         detach_and_identity, shift_marker, _ = after_detach_marker.partition('\nshift\n')
         self.assertTrue(shift_marker, "verify.sh startup marker is missing: shift after the run identity")
         script = direct / "verify.sh"
@@ -68,10 +69,16 @@ fi
 
     def start(self, script: Path, name: str,
               **changes: str) -> subprocess.Popen[str]:
+        repository = script.parents[2] / "repository"
+        repository.mkdir()
+        _ = (repository / "Cargo.toml").write_text("[workspace]\n")
+        _ = subprocess.run(["git", "init", "--quiet"], cwd=repository, check=True,
+                           capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS)
         environment = {**os.environ, "IN_NIX_SHELL": "fixture", "CODEX_THREAD_ID": "",
                        "UNIT_DETACHED_RUN": "", **changes}
+        _ = environment.pop("PYTHONPATH", None)
         _ = environment.pop("BUILDLOG_RUN", None)
-        process = subprocess.Popen(["bash", str(script), name], env=environment,
+        process = subprocess.Popen(["bash", str(script), name], cwd=repository, env=environment,
                                    stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                    text=True, start_new_session=True)
         self.addCleanup(self.stop, process)
@@ -149,7 +156,7 @@ with Path(os.environ["DETACHED_INPUT"]).open("r") as input_stream:
             self.addCleanup(os.close, input_fd)
             self.addCleanup(os.close, output_fd)
             process = self.start(script, "detached", CODEX_THREAD_ID="fixture",
-                                 VERIFY_MESH_RUNS_SCRIPT=str(launcher), DETACHED_INPUT=str(incoming),
+                                 VERIFY_DETACHED_RUNS_SCRIPT=str(launcher), DETACHED_INPUT=str(incoming),
                                  DETACHED_OUTPUT=str(outgoing), DETACHED_ERROR=str(fixture.root / "detached.err"))
             output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
             self.assertEqual(process.returncode, 0, output + errors)

@@ -140,8 +140,9 @@ class CappedAtBudget:
 
 
 @dataclass(frozen=True)
-class ShapeP90:
+class ShapeRankedPeak:
     runs: int
+    share_percent: int
     floor: FailedPeakFloor | NoFloor = NoFloor()
     factor: HeadroomRule = NoHeadroom()
     cap: CappedAtBudget | UnderBudget = UnderBudget()
@@ -159,7 +160,7 @@ class ShapeLargest:
 class ShapeFallback:
     cap: CappedAtBudget | UnderBudget = UnderBudget()
 
-ShapeNeedBasis = ShapeP90 | ShapeLargest | ShapeFallback
+ShapeNeedBasis = ShapeRankedPeak | ShapeLargest | ShapeFallback
 
 NeedBasis = LegacyNeedSource | ShapeNeedBasis
 
@@ -285,7 +286,7 @@ class ExpectedPeak:
     basis: NeedBasis | BasisNotRecorded = BasisNotRecorded()
 
     def __post_init__(self) -> None:
-        if self.source == "shape" and not isinstance(self.basis, (ShapeP90, ShapeLargest, ShapeFallback)):
+        if self.source == "shape" and not isinstance(self.basis, (ShapeRankedPeak, ShapeLargest, ShapeFallback)):
             raise ValueError("a shape estimate needs its shape basis")
         if isinstance(self.basis, BasisNotRecorded):
             if self.source in ("measured", "buildlog", "pooled", "fallback"):
@@ -362,6 +363,7 @@ class PidNotRecorded:
 
 @dataclass(frozen=True)
 class ProcessAnonymousUse:
+    """Retain one process's resident swap-backed use or its unavailable reading."""
     pid: int
     use: AnonymousRunUse | RunUseUnavailable
 
@@ -385,10 +387,10 @@ class NoSource:
 @dataclass(frozen=True)
 class MeasuredMemory:
     bytes: int
-    anonymous: AnonymousRunUse | RunUseUnavailable = field(default_factory=lambda: RunUseUnavailable("anonymous use unavailable"), kw_only=True)
+    anonymous: AnonymousRunUse | RunUseUnavailable = field(default_factory=lambda: RunUseUnavailable("swap-backed use unavailable"), kw_only=True)
     anonymous_source: ScopeSource | ProcessSource | NoSource = field(default_factory=NoSource, kw_only=True)
     promise: MemoryPromise = NoPromise()
-    # Swap stays separate from anonymous use.
+    # Swapped bytes stay separate from resident swap-backed use.
     swap_bytes: int = 0
     observed_peak: int = 0
     # An existing peak file could not be read; its promise remains a floor.
@@ -577,6 +579,7 @@ def queue_command_actor() -> str:
 
 @dataclass(frozen=True)
 class AnonymousRunUse:
+    """Count resident anon plus shmem bytes, without swap; the codec uses this name."""
     bytes: int
 
 
@@ -641,7 +644,7 @@ class MemoryRoom:
 
     @property
     def cap_use(self) -> int:
-        """Return the anonymous use and CI use shown inside the cap."""
+        """Return the swap-backed use and CI use shown inside the cap."""
         return self.used + self.ci_use
 
     @property

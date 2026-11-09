@@ -3,16 +3,15 @@ from __future__ import annotations
 
 import json
 import os
-import subprocess
 from pathlib import Path
 from scripts.whoami.account_test_support import write_codex_auth
-from typing import cast
+from typing import ClassVar, cast
 
 from scripts.direct import assign_claude_test_support as support
-from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib.test_models_registry import RegistryReadProbe
 from scripts.lib import models_registry
 from scripts.production import staff
+from scripts.production.cli_fixture import process_boundary
 
 
 def configure_pane_account(home: Path, notes: Path) -> None:
@@ -29,6 +28,9 @@ def configure_pane_account(home: Path, notes: Path) -> None:
 
 
 class AssignClaudeLauncherWorkerTests(support.AssignClaudeLauncherFixture):
+    direct_cli_calls: ClassVar[bool] = True
+
+    @process_boundary
     def test_term_after_the_start_banner_stops_the_unpublished_session(self) -> None:
         session = self.start_phase("term-after-banner")
         backend = self.root / "claude-bin"
@@ -58,6 +60,7 @@ class AssignClaudeLauncherWorkerTests(support.AssignClaudeLauncherFixture):
         self.assertEqual(finished["status"], "error")
         self.assertEqual((session / "impl_status_impl").read_text(), "error\n")
 
+    @process_boundary
     def test_term_during_the_worker_wait_ends_the_agent_and_records_failure(self) -> None:
         session = self.start_phase("term-during-wait")
         stub = self.root / "claude-bin"
@@ -98,8 +101,7 @@ exec python3 "$TEST_WAIT_HELPER" "$STUB_CLAUDE_ROOT/never-release"
             "    baseline = session / 'phases/3/phase_baseline'",
             "    (root / 'worker-models-path').write_text(settings['MODELS_CONFIG_FILE'])\n"
             + "    baseline = session / 'phases/3/phase_baseline'"))
-        result = subprocess.run(self.assign_command(session), env=configuration.environment(environment),
-                                capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
+        result = self.run_assignment(self.assign_command(session), configuration.environment(environment))
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual((self.root / "worker-models-path").read_text(), str(custom.resolve()))
 
@@ -119,8 +121,7 @@ exec python3 "$TEST_WAIT_HELPER" "$STUB_CLAUDE_ROOT/never-release"
         }))
         sender = self.root / "opening-send.py"
         _ = sender.write_text(sender.read_text().replace("print('SENT: fixture')", "raise SystemExit(2)"))
-        result = subprocess.run(self.assign_command(session), env=environment,
-                                text=True, capture_output=True, check=False, timeout=TEST_HANG_GUARD_SECS)
+        result = self.run_assignment(self.assign_command(session), environment)
         self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
         self.assertFalse(marker.exists(), result.stdout + result.stderr)
         state = cast(dict[str, object], json.loads((session / "progress_history_state.json").read_text()))
@@ -131,6 +132,7 @@ exec python3 "$TEST_WAIT_HELPER" "$STUB_CLAUDE_ROOT/never-release"
         self.assertEqual(worker.parent, staff.ReportsTo(staff.native_id(self.staff_parent)))
         self.assertTrue(worker.current_session)
 
+    @process_boundary
     def test_delivery_has_assign_as_its_only_launcher_parent(self) -> None:
         session = self.start_phase("one-launcher")
         sender = self.root / "opening-send.py"
@@ -153,13 +155,12 @@ exec python3 "$TEST_WAIT_HELPER" "$STUB_CLAUDE_ROOT/never-release"
         self.assertNotEqual(sender_pid, launcher_pid)
         self.assertNotIn("agent_bg.sh", processes[parent_pid][1])
 
+    @process_boundary
     def test_implementation_reads_one_registry_snapshot_across_its_child_processes(self) -> None:
         session = self.start_phase("registry-snapshot")
         environment = self.environment()
         probe = RegistryReadProbe(self.root, Path(environment["MODELS_CONFIG_FILE"]))
-        result = subprocess.run(
-            self.assign_command(session),
-            env=probe.environment(environment), capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS)
+        result = self.run_assignment(self.assign_command(session), probe.environment(environment))
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(len(probe.reads()), 1, probe.reads())
 
@@ -168,10 +169,7 @@ exec python3 "$TEST_WAIT_HELPER" "$STUB_CLAUDE_ROOT/never-release"
         session_dir = self.start_phase("director")
         environment = self.environment()
         environment["CLAUDE_CODE_SESSION_ID"] = "sid-director"
-        result = subprocess.run(
-            self.assign_command(session_dir),
-            check=False, capture_output=True, text=True, env=environment, timeout=TEST_HANG_GUARD_SECS,
-        )
+        result = self.run_assignment(self.assign_command(session_dir), environment)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.recorded_worker(session_dir).parent, staff.ReportsTo(staff.native_id(self.staff_parent)))
 
@@ -187,6 +185,7 @@ exec python3 "$TEST_WAIT_HELPER" "$STUB_CLAUDE_ROOT/never-release"
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual((session / "wait-context").read_text(), f"{session}|impl")
 
+    @process_boundary
     def test_new_launch_keeps_heartbeat_watcher_output(self) -> None:
         watcher = self.root / "scripts/agents/heartbeat_watch.sh"
         _ = watcher.write_text(
@@ -203,13 +202,9 @@ exec python3 "$TEST_WAIT_HELPER" "$STUB_CLAUDE_ROOT/never-release"
         self.assertIn("heartbeat watcher output", result.stdout)
 
     def test_a_launch_naming_its_phase_writes_in_that_phase_directory(self) -> None:
-        # Two phases running the same role each name their own, so neither overwrites the
-        # other's status, summary or log, and the name stays off the worker's address.
+        # Each phase keeps its own artifacts and the same worker address.
         session_dir = self.start_phase("phase-directory")
-        result = subprocess.run(
-            self.assign_command(session_dir, "--phase", "3"),
-            check=False, capture_output=True, text=True, env=self.environment(), timeout=TEST_HANG_GUARD_SECS,
-        )
+        result = self.run_assignment(self.assign_command(session_dir, "--phase", "3"), self.environment())
         self.assertEqual(result.returncode, 0, result.stderr)
         phase_dir = session_dir / "phases" / "3"
         self.assertEqual((phase_dir / "impl_status_impl").read_text(encoding="utf-8").strip(), "implemented")
@@ -257,39 +252,34 @@ exec python3 "$TEST_WAIT_HELPER" "$STUB_CLAUDE_ROOT/never-release"
     def test_phase_claim_precedes_the_claude_worker_open(self) -> None:
         session = self.start_phase("claim-before-open")
         environment, calls = self.claim_fixture(session, "clear")
-        result = subprocess.run(self.assign_command(session, "--phase", "3"),
-                                capture_output=True, text=True, check=False, env=environment,
-                                timeout=TEST_HANG_GUARD_SECS)
+        result = self.run_assignment(self.assign_command(session, "--phase", "3"), environment)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(calls.read_text().splitlines(), ["sid-director.phase-3 check reviewed.txt --json"])
         state = (session / "phases/3/delegated_phase_reservation_state.json").read_text()
         self.assertIn('"r1"', state)
-        self.assertEqual((session / "mesh_events.txt").read_text().splitlines(), ["claim", "open"])
+        self.assertEqual((session / "dispatch_events.txt").read_text().splitlines(), ["claim", "open"])
 
     def test_refused_phase_claim_prevents_the_claude_worker_open(self) -> None:
         session = self.start_phase("claim-refused")
         environment, calls = self.claim_fixture(session, "blocked")
-        result = subprocess.run(self.assign_command(session, "--phase", "3"),
-                                capture_output=True, text=True, check=False, env=environment,
-                                timeout=TEST_HANG_GUARD_SECS)
+        result = self.run_assignment(self.assign_command(session, "--phase", "3"), environment)
         self.assertEqual(result.returncode, 1, result.stderr)
         self.assertIn("phase 3 could not claim its files", result.stderr)
         self.assertEqual(len(calls.read_text().splitlines()), 1)
-        self.assertEqual((session / "mesh_events.txt").read_text().splitlines(), ["claim"])
+        self.assertEqual((session / "dispatch_events.txt").read_text().splitlines(), ["claim"])
         self.assertEqual(self.launch_records(session, "pass_started"), [])
 
     def test_unreadable_ledger_allows_the_worker_with_the_claim_pending(self) -> None:
         session = self.start_phase("claim-unreadable")
         environment, calls = self.claim_fixture(session, "ledger_unreadable")
-        result = subprocess.run(self.assign_command(session, "--phase", "3"),
-                                capture_output=True, text=True, check=False, env=environment,
-                                timeout=TEST_HANG_GUARD_SECS)
+        result = self.run_assignment(self.assign_command(session, "--phase", "3"), environment)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(len(calls.read_text().splitlines()), 1)
         state = (session / "phases/3/delegated_phase_reservation_state.json").read_text()
         self.assertIn("enrolled_awaiting_first_touch", state)
-        self.assertEqual((session / "mesh_events.txt").read_text().splitlines(), ["claim", "open"])
+        self.assertEqual((session / "dispatch_events.txt").read_text().splitlines(), ["claim", "open"])
 
+    @process_boundary
     def test_new_worker_identity_precedes_the_heartbeat_watcher(self) -> None:
         session = self.start_phase("identity-before-heartbeat")
         watcher = self.root / "scripts/agents/heartbeat_watch.sh"

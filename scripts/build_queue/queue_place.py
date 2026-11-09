@@ -21,6 +21,8 @@ import time
 from typing import BinaryIO, TypedDict, Unpack
 
 from scripts.lib import build_folders, atomic_file, conf
+from scripts.build_queue import admission_records
+from scripts.build_queue import step_estimator
 from scripts.lint import memory_admit
 from scripts.build_queue import admission_client, admission_protocol as wire
 import uuid
@@ -117,7 +119,7 @@ def probe_scope_prefix() -> list[str]:
     return prefix
 
 
-def wait_reasons(result: memory_admit.AdmissionWaitSnapshot) -> tuple[str, ...]:
+def wait_reasons(result: admission_records.AdmissionWaitSnapshot) -> tuple[str, ...]:
     return admission_client.wait_reasons(result)
 
 
@@ -188,13 +190,13 @@ class StartedProgram:
 
 def scope_start(sidecar: Path, holder_pid: int, holder_start: str, argv: Sequence[str]) -> None:
     """Publish the scope and confirm its holder before the program starts."""
-    if memory_admit.process_start_time(holder_pid) != holder_start:
+    if admission_records.process_start_time(holder_pid) != holder_start:
         raise QueuePlaceRefused("the queue place holder exited before scope startup")
     for line in Path("/proc/self/cgroup").read_text().splitlines():
         if line.startswith("0::") and "/builds.slice/" in line:
             scope = Path("/sys/fs/cgroup") / line[3:].lstrip("/")
             atomic_file.atomic_sample(sidecar, str(scope) + "\n")
-            if memory_admit.process_start_time(holder_pid) != holder_start:
+            if admission_records.process_start_time(holder_pid) != holder_start:
                 raise QueuePlaceRefused("the queue place holder exited during scope publication")
             os.execvp(argv[0], list(argv))
     raise QueuePlaceRefused("the program did not enter its memory scope")
@@ -242,7 +244,7 @@ class QueuePlace:
     status: int = 1
     program: ProgramNotStarted | StartedProgram = field(default_factory=ProgramNotStarted, init=False)
     on_started: Callable[[], None] = no_hold_wait
-    configuration: memory_admit.MemoryConfig | wire.RunnerExecutionTiming = field(kw_only=True, repr=False)
+    configuration: admission_records.MemoryConfig | wire.RunnerExecutionTiming = field(kw_only=True, repr=False)
     purpose: ProgramPurpose = field(default=ProgramPurpose.BATCH, kw_only=True)
     arguments: tuple[str, ...] = field(default=(), kw_only=True)
     _samples: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
@@ -282,7 +284,7 @@ class QueuePlace:
                 raise QueuePlaceRefused(
                     "the queued program requires a memory scope; set BUILDLOG_SCOPE=0 only for tests")
         holder_pid = os.getpid()
-        holder_start = memory_admit.process_start_time(holder_pid)
+        holder_start = admission_records.process_start_time(holder_pid)
         if holder_start is None:
             raise QueuePlaceRefused("the queue place holder has no live process identity")
         command = ([*prefix, str(Path(__file__).resolve().parents[1] / "lib/py"), str(Path(__file__).resolve()), "--scope-start", str(self.sidecar),
@@ -296,7 +298,7 @@ class QueuePlace:
                 tracking = ProgramTree(process.pid)
                 if self.purpose == ProgramPurpose.RUNNER:
                     tracking.adopter = wire.Owner(holder_pid, holder_start)
-                start = memory_admit.process_start_time(process.pid)
+                start = admission_records.process_start_time(process.pid)
                 if start is not None:
                     tracking.observed[process.pid] = start
             sampler = (UnmeasuredProbe() if self.purpose == ProgramPurpose.PROBE else
@@ -318,7 +320,7 @@ class QueuePlace:
                 scope = self.sidecar.read_text().strip()
                 if scope:
                     reading = memory_admit.slice_working_set(Path(scope))
-                    if isinstance(reading.anonymous, memory_admit.AnonymousRunUse):
+                    if isinstance(reading.anonymous, admission_records.AnonymousRunUse):
                         self.observe(reading.anonymous.bytes, reading.anonymous.bytes)
                 elif isinstance(tracking, ProgramTree):
                     members = program_members(tracking, self.sidecar)
@@ -330,7 +332,7 @@ class QueuePlace:
                                     if pid in processes and processes[pid].start == start}
                     reading = memory_admit.process_memory(matching, proc)
                     if self.purpose == ProgramPurpose.RUNNER:
-                        if isinstance(reading.anonymous, memory_admit.AnonymousRunUse):
+                        if isinstance(reading.anonymous, admission_records.AnonymousRunUse):
                             self.observe(reading.anonymous.bytes, reading.anonymous.bytes)
                     else:
                         self.observe(reading.bytes, reading.bytes)
@@ -356,7 +358,7 @@ class QueuePlace:
                     number = signal.SIGKILL if time.monotonic() >= deadline else signal.SIGTERM
                     for pid, start in members.items():
                         try:
-                            if memory_admit.process_start_time(pid) == start:
+                            if admission_records.process_start_time(pid) == start:
                                 os.kill(pid, number)
                         except ProcessLookupError:
                             pass
@@ -380,7 +382,7 @@ def _stop_holder(number: int, _frame: object) -> None:
 
 @contextmanager
 def queue_place(program: str | Sequence[str], repo: Path, *, batch: bool = False,
-                sizing: memory_admit.HistoryPeakSizing | ConfiguredFirstPeak = CONFIGURED_FIRST_PEAK,
+                sizing: admission_records.HistoryPeakSizing | ConfiguredFirstPeak = CONFIGURED_FIRST_PEAK,
                 before_check: Callable[[], None] = no_hold_wait) -> Generator[QueuePlace]:
     """Use full commands for purpose selection; retain named batch reservations."""
     # A name requests a batch place. A complete command permits purpose selection.
@@ -392,14 +394,14 @@ def queue_place(program: str | Sequence[str], repo: Path, *, batch: bool = False
             arguments = tuple(program)
             purpose = program_purpose(arguments, batch=batch)
             name = Path(program[0]).name
-        config = memory_admit.memory_config()
+        config = step_estimator.memory_config()
     except conf.Unusable as error:
         raise QueuePlaceRefused(str(error)) from error
     if purpose == ProgramPurpose.BATCH and isinstance(sizing, ConfiguredFirstPeak):
         first = config.program_first_peaks.get(name)
         if first is None:
             raise QueuePlaceRefused(f"no first peak for {name} in build_admission.conf [memory]; {conf.path('build_admission')}: program_first_peak_gib.{name} is missing or invalid")
-        sizing = memory_admit.HistoryPeakSizing(first, memory_admit.FirstProgramPeak(first), 0.0)
+        sizing = admission_records.HistoryPeakSizing(first, admission_records.FirstProgramPeak(first), 0.0)
     pid = os.getpid()
     with build_folders.temporary_build_folder(build_folders.UniqueBuildFolder(prefix=build_folders.FOLDER_PREFIXES["queue-place"])) as temporary:
         sidecar = temporary / "program.cgroup"
@@ -412,8 +414,8 @@ def queue_place(program: str | Sequence[str], repo: Path, *, batch: bool = False
             grant: wire.Admitted | UnreservedProgram = UnreservedProgram()
             if purpose == ProgramPurpose.BATCH:
                 assert not isinstance(sizing, ConfiguredFirstPeak)
-                profile = memory_admit.ProgramProfile(name, str(Path.home() / ".claude"), str(repo.resolve()), sizing)
-                start = memory_admit.process_start_time(pid)
+                profile = admission_records.ProgramProfile(name, str(Path.home() / ".claude"), str(repo.resolve()), sizing)
+                start = admission_records.process_start_time(pid)
                 if start is None:
                     raise QueuePlaceRefused("owner no longer exists")
                 owner, episode, since = wire.Owner(pid, start), uuid.uuid4().hex, time.time()

@@ -16,9 +16,11 @@ import json
 import os
 from pathlib import Path
 import re
+import signal
 import subprocess
 import sys
 import time
+from types import FrameType
 from typing import Literal, cast, final
 from uuid import uuid4
 
@@ -31,7 +33,7 @@ from scripts.build_targets import target_config
 from scripts.buildlog import store
 from scripts.lib import conf
 from scripts.lib.atomic_file import write_text_atomic
-from scripts.lint import memory_admit
+from scripts.build_queue import admission_records
 from scripts.production import affected_modules
 from scripts.production.gate_modules import GateRefused, discover_test_modules
 from scripts.production import merge_gate as gate
@@ -119,12 +121,12 @@ class CloudReservation:
 def cloud_reservation(repo: Path, sidecar: Path, mode: gate.SuiteMode) -> Generator[CloudReservation]:
     """Keep the route's cloud slot until its result or fallback returns."""
     pid = os.getpid()
-    start = memory_admit.process_start_time(pid)
+    start = admission_records.process_start_time(pid)
     if start is None:
         raise GateRefused('The cloud route has no live process identity')
     owner, episode, since = wire.Owner(pid, start), uuid4().hex, time.time()
-    profile = memory_admit.ProgramProfile(mode.value, str(Path(__file__).resolve().parents[2]), str(repo.resolve()),
-        memory_admit.HistoryPeakSizing(0, memory_admit.FirstProgramPeak(0), 0.0))
+    profile = admission_records.ProgramProfile(mode.value, str(Path(__file__).resolve().parents[2]), str(repo.resolve()),
+        admission_records.HistoryPeakSizing(0, admission_records.FirstProgramPeak(0), 0.0))
     def refresh() -> wire.AdmitRequest:
         request = admission_client.step_request([mode.value], str(repo), owner, since, str(sidecar), episode,
             profile, run=wire.RunIdentity(pid, start))
@@ -203,12 +205,23 @@ class GateWorker:
         raise AwsUnavailable('Termination is unconfirmed; the expiry function still owns cleanup')
 
     def reconcile(self) -> None:
-        """Close reservations after the expiry function confirms termination."""
+        """Resolve expired launches and observe known gate instances."""
         for reservation in self.book.read_snapshot().gate_reservations:
             if isinstance(reservation.state, ledger.GateRunning):
                 instance = reservation.state.instance_id
                 if self.api.observe(instance, int(self.clock())).state == 'terminated':
                     self.book.resolve_gate(reservation.attempt, ledger.GateTerminated(int(self.clock()), instance))
+            elif isinstance(reservation.state, ledger.GateLaunchPending) and reservation.expires <= int(self.clock()):
+                reply = self.api.call('describe-instances', '--filters', 'Name=tag:GateAttempt,Values=' + reservation.attempt)
+                instances = [instance for group in ledger.rows(reply, 'Reservations')
+                             for instance in ledger.rows(group, 'Instances')]
+                if not instances:
+                    self.book.resolve_gate(reservation.attempt, ledger.GateAbsent(int(self.clock())))
+                else:
+                    instance = ledger.text(instances[0], 'InstanceId')
+                    terminated = ledger.text(ledger.mapping(instances[0]['State']), 'Name') == 'terminated'
+                    self.book.resolve_gate(reservation.attempt,
+                        ledger.GateTerminated(int(self.clock()), instance) if terminated else ledger.GateRunning(instance))
 
     def record_launch(self, request: dict[str, object], size: str, zone: str,
                       result: Literal['launched', 'refused'], reason: str = '') -> None:
@@ -235,22 +248,27 @@ class GateWorker:
                 arguments = ledger.mapping(launch['arguments'])
             else:
                 lifetime = max(1, (ledger.instant(request, 'expires') - int(self.clock()) + 59) // 60)
-                prefix = ledger.text(deployment, 'artifact_prefix') + '__INSTANCE_ID__/' + ledger.text(request, 'attempt')
+                prefix = 'artifacts/' + ledger.text(request, 'attempt')
                 links = {key: ledger.text(request, key) for key in ('attempt', 'commit', 'tree', 'mode', 'origin')}
-                bucket = 's3://' + ledger.text(deployment, 'bucket')
+                credentials = self.api.call('export-credentials', '--format', 'process', service='configure')
+                signing = gate_box.SigningKey(ledger.text(credentials, 'AccessKeyId'), ledger.text(credentials, 'SecretAccessKey'),
+                    ledger.text(credentials, 'SessionToken') if 'SessionToken' in credentials else '')
+                at = int(self.clock())
+                def url(method: str, key: str) -> str:
+                    return gate_box.presign(method, ledger.text(deployment, 'bucket') + '.s3.' + self.api.region + '.amazonaws.com',
+                        key, self.api.region, signing, datetime.fromtimestamp(at, UTC), max(1, ledger.instant(request, 'expires') - at))
                 links.update(production='true', step='size', expires=str(request['expires']),
-                             guest=bucket + '/requests/' + ledger.text(request, 'attempt') + '.guest.py',
-                             request=bucket + '/requests/' + ledger.text(request, 'attempt') + '.json',
-                             log='s3://' + ledger.text(deployment, 'bucket') + '/' + prefix + '/gate.log',
-                             result='s3://' + ledger.text(deployment, 'bucket') + '/' + prefix + '/result.json')
+                             guest=url('GET', 'requests/' + ledger.text(request, 'attempt') + '.guest.py'),
+                             request=url('GET', 'requests/' + ledger.text(request, 'attempt') + '.json'),
+                             log=url('PUT', prefix + '/gate.log'), result=url('PUT', prefix + '/result.json'),
+                             boot_error=url('PUT', prefix + '/boot-error.json'))
                 if request['source_key']:
-                    links['source'] = bucket + '/' + ledger.text(request, 'source_key')
+                    links['source'] = url('GET', ledger.text(request, 'source_key'))
                 policy = read_settings(self.settings_path)
                 tags = [{'Key': 'GateDeployment', 'Value': ledger.text(deployment, 'deployment_id')},
                         {'Key': 'Workload', 'Value': 'cloud-claude-gate'}, {'Key': 'Name', 'Value': 'cloud-claude-gate'}, {'Key': 'GateAttempt', 'Value': ledger.text(request, 'attempt')},
                         {'Key': 'ExpiresAt', 'Value': str(request['expires'])},
                         {'Key': policy.cost_explorer_tag_key, 'Value': policy.cost_explorer_tag_value}]
-                import base64
                 arguments: dict[str, object] = {
                     'LaunchTemplate': {'LaunchTemplateId': deployment['template'], 'Version': deployment['version']},
                     'MinCount': 1, 'MaxCount': 1, 'ClientToken': ledger.text(request, 'attempt') + '-' + str(offset),
@@ -258,8 +276,8 @@ class GateWorker:
                     'NetworkInterfaces': [{'DeviceIndex': 0, 'SubnetId': subnet['id'],
                                            'Groups': [deployment['security_group']], 'AssociatePublicIpAddress': True}],
                     'TagSpecifications': [{'ResourceType': kind, 'Tags': tags} for kind in ('instance', 'volume')],
-                    'UserData': base64.b64encode(gate_box.user_data(links, ledger.text(deployment, 'revision'), lifetime,
-                              settings().number('log_push_s'), float(str(request['module_time_limit_s']))).encode()).decode()}
+                    'UserData': gate_box.user_data(links, ledger.text(deployment, 'revision'), lifetime,
+                              settings().number('log_push_s'), float(str(request['module_time_limit_s'])))}
                 launch = {'variant': offset, 'arguments': arguments}
                 save(path, launch)
             self.size_vcpus = int(ledger.text(arguments, 'InstanceType').split('.')[1].removesuffix('xlarge')) * 4
@@ -334,26 +352,35 @@ class GateWorker:
             if isinstance(launched, LocalFallback):
                 return {'status': 'fallback', 'reason': launched.reason}
             instance = launched
-            prefix = ledger.text(deployment, 'artifact_prefix') + instance + '/' + attempt
+            prefix = 'artifacts/' + attempt
             try:
                 arguments = ledger.mapping(read(folder / 'launch.json')['arguments'])
                 self.size_vcpus = int(ledger.text(arguments, 'InstanceType').split('.')[1].removesuffix('xlarge')) * 4
                 cloud_progress.publish(self.sidecar, cloud_progress.CloudProgress('setup', self.size_vcpus, 0, self.clock()))
                 while self.clock() < ledger.instant(request, 'expires'):
-                    bucket = ledger.text(deployment, 'bucket')
-                    if self.download(bucket, prefix + '/gate.log', folder / 'gate.log'):
-                        self.publish_log(folder)
-                    if self.download(bucket, prefix + '/result.json', folder / 'remote-result.json'):
-                        if not self.download(bucket, prefix + '/gate.log', folder / 'gate.log'):
-                            raise ValueError('The final log is absent')
-                        result = read(folder / 'remote-result.json')
-                        validate_result(result, request)
-                        row = result
-                        self.publish_log(folder)
-                        break
-                    state = self.api.observe(instance, int(self.clock())).state
-                    if state not in ('pending', 'running'):
-                        raise ValueError('The instance stopped without a final result')
+                    try:
+                        bucket = ledger.text(deployment, 'bucket')
+                        if self.download(bucket, prefix + '/gate.log', folder / 'gate.log'):
+                            self.publish_log(folder)
+                        if self.download(bucket, prefix + '/boot-error.json', folder / 'boot-error.json'):
+                            raise ValueError(ledger.text(read(folder / 'boot-error.json'), 'error'))
+                        if self.download(bucket, prefix + '/result.json', folder / 'remote-result.json'):
+                            if not self.download(bucket, prefix + '/gate.log', folder / 'gate.log'):
+                                raise ValueError('The final log is absent')
+                            result = read(folder / 'remote-result.json')
+                            validate_result(result, request)
+                            row = result
+                            self.publish_log(folder)
+                            break
+                        state = self.api.observe(instance, int(self.clock())).state
+                        if state not in ('pending', 'running'):
+                            reply = self.api.call('describe-instances', '--instance-ids', instance)
+                            stopped = ledger.rows(ledger.rows(reply, 'Reservations')[0], 'Instances')[0]
+                            reason = ledger.mapping(stopped.get('StateReason', {}))
+                            detail = ': '.join(ledger.text(reason, key) for key in ('Code', 'Message') if reason.get(key))
+                            raise ValueError('The instance stopped without a final result' + (f' ({detail})' if detail else ''))
+                    except subprocess.TimeoutExpired:
+                        continue
                     self.pause(settings().number('result_poll_s'))
                 if not row:
                     raise ValueError('The instance expired without a final result')
@@ -481,7 +508,8 @@ def run_cloud(repo: Path, *, mode: gate.SuiteMode, full: bool, module_time_limit
                    '--setenv=CONF_DIR=' + str(conf.path('aws_target').parent),
                    '--property=KillMode=control-group', '--property=UMask=0077',
                    '--property=UnsetEnvironment=AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN AWS_CONFIG_FILE AWS_PROFILE',
-                   '--working-directory=' + str(Path(__file__).resolve().parents[2]),
+                   # The installed tree launches the box; the checkout supplies only its source and tests.
+                   '--working-directory=' + str(Path.home() / '.claude'),
                    sys.executable, '-m', 'scripts.aws_target.cloud_gate', '--worker', str(folder), '--directory', str(directory),
                    '--sidecar', str(sidecar)]
         with cloud_reservation(repo, sidecar, mode) as reservation:
@@ -518,6 +546,9 @@ def run_service(repo: Path, folder: Path, request: dict[str, object], command: S
 
 
 def main() -> int:
+    def stop_worker(number: int, _frame: FrameType | None) -> None:
+        raise SystemExit(128 + number)
+    _ = signal.signal(signal.SIGTERM, stop_worker)
     parser = argparse.ArgumentParser(description=__doc__)
     _ = parser.add_argument('--worker', required=True, type=Path)
     _ = parser.add_argument('--directory', required=True, type=Path)
@@ -531,7 +562,13 @@ def main() -> int:
         configuration = conf.read('aws_target')
         api = AwsCli(configuration.text('credentials_profile'), configuration.text('region'), settings().number('api_timeout_s'))
         worker = GateWorker(api, ledger.CostLedger(directory), conf.path('aws_target'), cast(Path, args.sidecar))
-        save(folder / 'outcome.json', worker.execute(folder, read(folder / 'request.json'), read(folder / 'deployment.json')))
+        try:
+            outcome = worker.execute(folder, read(folder / 'request.json'), read(folder / 'deployment.json'))
+        except SystemExit:
+            save(folder / 'outcome.json', {
+                'status': 'fallback', 'reason': 'The worker stopped, so its instance was terminated'})
+            raise
+        save(folder / 'outcome.json', outcome)
     return 0
 
 

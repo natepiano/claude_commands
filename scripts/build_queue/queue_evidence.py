@@ -10,11 +10,13 @@ from scripts.build_queue import head_facts, queue_lines
 from scripts.build_queue.queue_lines import age, field
 from scripts.build_queue.scope_activity import IdleService, LiveBuildRun, NotServiceSlice, RunningServiceJob
 from scripts.lib.build_steps import StepNames
+from scripts.build_queue import admission_records
+from scripts.build_queue import step_estimator
 from scripts.lint import memory_admit as gate
 from scripts.message import unit_labels
 
 
-def step_labels(step: gate.WaitingStep | gate.RunningStep,
+def step_labels(step: admission_records.WaitingStep | admission_records.RunningStep,
                 labels: Mapping[str, unit_labels.UnitLabels]) -> unit_labels.UnitLabels:
     identity = labels.get(step.session_id)
     unit = gate.queue_unit(step.unit, step.session_id, labels)
@@ -24,65 +26,65 @@ def step_labels(step: gate.WaitingStep | gate.RunningStep,
     return unit_labels.UnitLabels(fallback, unit=unit or "—")
 
 
-def step_pid_text(step: gate.WaitingStep | gate.RunningStep) -> str:
+def step_pid_text(step: admission_records.WaitingStep | admission_records.RunningStep) -> str:
     """Format the captured run pid or the captured process pid."""
     return pid_text(step.run.pid if isinstance(step.run, LiveBuildRun) else step.pid)
 
 
-def pid_text(pid: int | gate.PidNotRecorded) -> str:
+def pid_text(pid: int | admission_records.PidNotRecorded) -> str:
     return f"pid {pid}" if isinstance(pid, int) else "pid —"
 
 
 def gib(value: int) -> str:
-    return f"{value / gate.GIB:.1f} GiB"
+    return f"{value / admission_records.GIB:.1f} GiB"
 
 
 def ci_amount(value: int) -> str:
     """Show CI use under 0.1 GiB in MiB, so idle CI never reads 0.0 GiB."""
-    return f"{value * 1024 / gate.GIB:.0f} MiB" if value < gate.GIB // 10 else gib(value)
+    return f"{value * 1024 / admission_records.GIB:.0f} MiB" if value < admission_records.GIB // 10 else gib(value)
 
 
-def need_text(source: gate.RecordedNeed | gate.NeedSourceNotRecorded, *,
+def need_text(source: admission_records.RecordedNeed | admission_records.NeedSourceNotRecorded, *,
               zone: ZoneInfo) -> str:
-    if isinstance(source, gate.NeedSourceNotRecorded):
+    if isinstance(source, admission_records.NeedSourceNotRecorded):
         return "source not recorded"
     basis = source.basis
-    if isinstance(basis, (gate.ShapeP90, gate.ShapeLargest, gate.ShapeFallback)):
-        if isinstance(basis, gate.ShapeP90):
-            text = f"same-shape p90 of {basis.runs} runs"
-        elif isinstance(basis, gate.ShapeLargest):
+    if isinstance(basis, (admission_records.ShapeRankedPeak, admission_records.ShapeLargest, admission_records.ShapeFallback)):
+        if isinstance(basis, admission_records.ShapeRankedPeak):
+            text = f"same-shape peak of {basis.runs} runs, excluding the highest {basis.share_percent}%"
+        elif isinstance(basis, admission_records.ShapeLargest):
             text = f"same-shape largest peak of {basis.runs} runs"
         else:
             text = "same-shape fallback: no runs; heavier of fallback and same-profile builds"
         text += f", last {source.history_days} days"
-        if isinstance(basis, gate.ShapeFallback):
+        if isinstance(basis, admission_records.ShapeFallback):
             text += "; no headroom factor"
         else:
-            if isinstance(basis.floor, gate.FailedPeakFloor):
+            if isinstance(basis.floor, admission_records.FailedPeakFloor):
                 text += (f"; failed-build floor {gib(basis.floor.peak)} from "
                          + head_facts.clock(datetime.fromisoformat(basis.floor.ended_at).timestamp(), zone, seconds=False))
             else:
                 text += "; no failed-build floor"
-            if isinstance(basis.factor, gate.ReleaseHeadroom):
+            if isinstance(basis.factor, admission_records.ReleaseHeadroom):
                 text += f"; release headroom × {basis.factor.factor:.3f}"
-            elif isinstance(basis.factor, gate.DevSizeHeadroom):
+            elif isinstance(basis.factor, admission_records.DevSizeHeadroom):
                 text += (f"; dev size headroom × {basis.factor.factor:.3f}"
                          + f" + margin {gib(basis.factor.margin_bytes)}")
-            elif isinstance(basis.factor, gate.LegacyDevMultiplierHeadroom):
+            elif isinstance(basis.factor, admission_records.LegacyDevMultiplierHeadroom):
                 text += f"; dev promise factor × {basis.factor.factor:.3f}"
             else:
                 text += "; no headroom factor"
-        if isinstance(basis.cap, gate.CappedAtBudget):
-            limit = ("an unrecorded amount" if isinstance(basis.cap.cap, gate.CapNotRecorded)
+        if isinstance(basis.cap, admission_records.CappedAtBudget):
+            limit = ("an unrecorded amount" if isinstance(basis.cap.cap, admission_records.CapNotRecorded)
                      else gib(basis.cap.cap))
             text += f"; limited to {limit} at that time (uncut {gib(basis.cap.uncapped)})"
         else:
             text += "; uncut estimate"
         return text
     if source.source == "measured":
-        text = f"measured process-memory p90 of {source.runs} runs"
+        text = f"measured process-memory estimate from {source.runs} runs"
     elif source.source == "buildlog":
-        text = f"build-log peak × {gate.ANON_SHARE:.2f} of {source.runs} runs"
+        text = f"build-log peak × {step_estimator.ANON_SHARE:.2f} of {source.runs} runs"
     elif source.source == "pooled":
         text = f"pooled over all repos, {source.runs} runs"
     elif source.source == "fallback":
@@ -99,19 +101,19 @@ def need_text(source: gate.RecordedNeed | gate.NeedSourceNotRecorded, *,
     return text
 
 
-def room_text(room: gate.MemoryRoom | gate.ReadingUnavailable) -> str:
+def room_text(room: admission_records.MemoryRoom | admission_records.ReadingUnavailable) -> str:
     """Show the calculation from the last admission pass."""
-    if isinstance(room, gate.ReadingUnavailable):
+    if isinstance(room, admission_records.ReadingUnavailable):
         return "Cap unavailable: " + room.reason
     if isinstance(room.cap, int):
         ci_use = f" + CI use {ci_amount(room.ci_use)}" if room.ci_use else ""
         calculation = f"Cap {gib(room.cap)}; anonymous use {gib(room.used)}{ci_use} + free {gib(room.available)}"
     else:
         missing = "; ".join(f"{run.owner}: {run.use.reason}" for run in room.cap.runs
-                            if isinstance(run.use, gate.RunUseUnavailable))
+                            if isinstance(run.use, admission_records.RunUseUnavailable))
         calculation = "Cap unavailable"
         if missing:
-            calculation += f": anonymous use unavailable for {missing}"
+            calculation += f": swap-backed use unavailable for {missing}"
         calculation += f"; free {gib(room.available)}"
     ci = f" (CI keep-aside {gib(room.ci_keep_aside.bytes)})" if room.ci_keep_aside.bytes > 0 else ""
     text = (f"{calculation} "
@@ -121,28 +123,29 @@ def room_text(room: gate.MemoryRoom | gate.ReadingUnavailable) -> str:
     return text
 
 
-def room_check_text(check: gate.RoomCheck) -> str:
+def room_check_text(check: admission_records.RoomCheck) -> str:
     relation = "<=" if check.need <= check.room else ">"
     result = "pass" if check.passes else "held"
     basis = check.basis
-    exception = ("; starts alone" if isinstance(basis, gate.StartsAlone) else
-                 "; within held slot" if isinstance(basis, gate.WithinSlot) else
-                 "; head override" if isinstance(basis, gate.OverrideRoom) else "")
+    exception = ("; starts alone" if isinstance(basis, admission_records.StartsAlone) else
+                 "; within held slot" if isinstance(basis, admission_records.WithinSlot) else
+                 "; head override" if isinstance(basis, admission_records.OverrideRoom) else "")
     return f"Room: need {gib(check.need)} {relation} room {gib(max(0, check.room))}: {result}{exception}"
 
 
-def keep_aside_text(run: gate.RunKeepAside) -> str:
-    use = gib(run.memory.use.bytes) if isinstance(run.memory.use, gate.AnonymousRunUse) else "unavailable: " + run.memory.use.reason
-    return (f"need {gib(run.memory.need)}; anonymous use {use}; held slot {gib(run.memory.held)}; "
+def keep_aside_text(run: admission_records.RunKeepAside) -> str:
+    use = (f"anonymous use {gib(run.memory.use.bytes)}" if isinstance(run.memory.use, admission_records.AnonymousRunUse)
+           else f"swap-backed use unavailable: {run.memory.use.reason}")
+    return (f"need {gib(run.memory.need)}; {use}; held slot {gib(run.memory.held)}; "
             f"kept aside {gib(run.bytes)}")
 
 
-def pressure_text(pressure: gate.MemoryPressure | gate.PressureUnavailable, policy: gate.AdmissionPolicy) -> str:
-    if isinstance(pressure, gate.PressureUnavailable):
+def pressure_text(pressure: admission_records.MemoryPressure | admission_records.PressureUnavailable, policy: admission_records.AdmissionPolicy) -> str:
+    if isinstance(pressure, admission_records.PressureUnavailable):
         return pressure.reason
     values = (f"memory pressure: full avg10 {pressure.full_avg10:.1f}%, "
               + f"some avg10 {pressure.some_avg10:.1f}%, swap used {pressure.swap_used_percent:.1f}%")
-    if isinstance(pressure.condition, gate.PressureConditionNotRecorded):
+    if isinstance(pressure.condition, admission_records.PressureConditionNotRecorded):
         return values + "; condition not recorded by service"
     if pressure.condition == "swap":
         return (values + f"; starts when swap is at most {policy.pressure.swap_used_limit:g}% "
@@ -150,13 +153,13 @@ def pressure_text(pressure: gate.MemoryPressure | gate.PressureUnavailable, poli
     return values + f"; starts below full avg10 {policy.pressure.full_avg10_limit:.1f}%"
 
 
-def estimate_refresh_text(reason: gate.EstimateExpired, zone: ZoneInfo) -> str:
+def estimate_refresh_text(reason: admission_records.EstimateExpired, zone: ZoneInfo) -> str:
     return ("the estimate expired at "
             + head_facts.clock(reason.estimated_at, zone, seconds=False)
             + "; the client refreshes it through the admission service")
 
 
-def release_text(release: gate.HeadAfterEnd, explanation: gate.QueueExplanation,
+def release_text(release: gate.HeadAfterEnd, explanation: admission_records.QueueExplanation,
                  labels: Mapping[str, unit_labels.UnitLabels], zone: ZoneInfo, *, names: StepNames) -> str:
     if isinstance(release, gate.HeadRelease):
         if not release.ended:
@@ -169,27 +172,27 @@ def release_text(release: gate.HeadAfterEnd, explanation: gate.QueueExplanation,
         if isinstance(release, gate.HeadStartsAt):
             starts_at = head_facts.clock(release.at, zone, zone_name=True)
             text += ("; then " if release.ended else "; ") + f"start spacing permits it at {starts_at}"
-    elif isinstance(release, gate.EstimateExpired):
+    elif isinstance(release, admission_records.EstimateExpired):
         text = estimate_refresh_text(release, zone)
     elif isinstance(release, gate.HeadStillHeld):
         pressure = release.decision.pressure
-        causes = (pressure.reason if cause == "pressure" and isinstance(pressure, gate.PressureUnavailable) else cause
+        causes = (pressure.reason if cause == "pressure" and isinstance(pressure, admission_records.PressureUnavailable) else cause
                   for cause in release.causes)
         text = "all running steps ending still leaves " + ", ".join(causes) + " holding the head"
-    elif isinstance(release, gate.TokenWaitersOnly):
+    elif isinstance(release, admission_records.TokenWaitersOnly):
         text = "all waiting steps are waiting for the cargo token"
-    elif isinstance(release, gate.ReadingUnavailable):
+    elif isinstance(release, admission_records.ReadingUnavailable):
         text = release.reason
     else:
         text = "nothing waits"
     head = explanation.head
-    if (isinstance(head, gate.HeadExplanation) and isinstance(head.cause, gate.MemoryPressure)
+    if (isinstance(head, admission_records.HeadExplanation) and isinstance(head.cause, admission_records.MemoryPressure)
             and not isinstance(release, gate.HeadStartsAt)):
         text += "; the pressure hold must also clear"
     return text
 
 
-def service_activity_text(memory: gate.CompilerServiceMemory | gate.UnownedSliceMemory, now: float) -> str:
+def service_activity_text(memory: admission_records.CompilerServiceMemory | admission_records.UnownedSliceMemory, now: float) -> str:
     """Describe the recorded service state at the pass time."""
     state = memory.job_state
     if isinstance(state, NotServiceSlice):
@@ -200,38 +203,38 @@ def service_activity_text(memory: gate.CompilerServiceMemory | gate.UnownedSlice
     return "idle"
 
 
-def service_text(memory: gate.CompilerServiceMemory | gate.UnownedSliceMemory, now: float) -> str:
+def service_text(memory: admission_records.CompilerServiceMemory | admission_records.UnownedSliceMemory, now: float) -> str:
     """Show service RAM and swap with the job state from the same pass."""
-    if isinstance(memory, gate.UnownedSliceMemory) and memory.diagnostic:
+    if isinstance(memory, admission_records.UnownedSliceMemory) and memory.diagnostic:
         return f"{pid_text(memory.pid)} · {field(memory.owner)}: unavailable; {memory.diagnostic}"
     activity = service_activity_text(memory, now)
-    if isinstance(memory, gate.UnownedSliceMemory):
+    if isinstance(memory, admission_records.UnownedSliceMemory):
         name, amount = memory.owner, ci_amount(memory.bytes)
     else:
         name, amount = "sccache.service", gib(memory.bytes)
     return f"{pid_text(memory.pid)} · {field(name)}: {activity}; {amount} RAM; {gib(memory.swap_bytes)} swapped"
 
 
-def running_text(running: gate.ExplainedRunningStep, explanation: gate.QueueExplanation,
+def running_text(running: admission_records.ExplainedRunningStep, explanation: admission_records.QueueExplanation,
                  labels: Mapping[str, unit_labels.UnitLabels], zone: ZoneInfo, *, names: StepNames) -> str:
     memory = running.step.measured
-    if isinstance(memory, gate.CompilerServiceMemory) or (
-            isinstance(memory, gate.UnownedSliceMemory) and isinstance(memory.job_state, (IdleService, RunningServiceJob))):
-        ci = explanation.room.ci_keep_aside.bytes if isinstance(explanation.room, gate.MemoryRoom) else 0
-        extra = f"; CI keep-aside {gib(ci)}" if ci and isinstance(memory, gate.UnownedSliceMemory) else ""
+    if isinstance(memory, admission_records.CompilerServiceMemory) or (
+            isinstance(memory, admission_records.UnownedSliceMemory) and isinstance(memory.job_state, (IdleService, RunningServiceJob))):
+        ci = explanation.room.ci_keep_aside.bytes if isinstance(explanation.room, admission_records.MemoryRoom) else 0
+        extra = f"; CI keep-aside {gib(ci)}" if ci and isinstance(memory, admission_records.UnownedSliceMemory) else ""
         return service_text(memory, explanation.now) + extra
     identity = step_labels(running.step, labels)
     admitted = running.admitted_at
-    started = ("admission time unknown" if isinstance(admitted, gate.AdmissionTimeNotRecorded) else
+    started = ("admission time unknown" if isinstance(admitted, admission_records.AdmissionTimeNotRecorded) else
                f"admitted {head_facts.clock(admitted, zone, seconds=False)} ({age(admitted, explanation.now)} min ago)")
-    using = gib(running.measured) if isinstance(running.step.measured, gate.MeasuredMemory) else "—"
-    swap = f"; {gib(memory.swap_bytes)} swapped" if isinstance(memory, gate.MeasuredMemory) and memory.swap_bytes else ""
+    using = gib(running.measured) if isinstance(running.step.measured, admission_records.MeasuredMemory) else "—"
+    swap = f"; {gib(memory.swap_bytes)} swapped" if isinstance(memory, admission_records.MeasuredMemory) and memory.swap_bytes else ""
     owner = running.owner
     room = explanation.room
-    keep = next((entry for entry in room.runs if entry.memory.owner == owner), None) if isinstance(room, gate.MemoryRoom) else None
+    keep = next((entry for entry in room.runs if entry.memory.owner == owner), None) if isinstance(room, admission_records.MemoryRoom) else None
     evidence = keep_aside_text(keep) if keep is not None else f"anonymous use {using}; no accepted run hold"
     phase = ""
-    if isinstance(memory, gate.MeasuredMemory) and isinstance(memory.peak_history, gate.TestPhaseStarted):
+    if isinstance(memory, admission_records.MeasuredMemory) and isinstance(memory.peak_history, admission_records.TestPhaseStarted):
         observed = memory.peak_history
         phase = (f"; tests started: need {gib(gate.test_phase_charge(observed))} "
                  f"(test peak {gib(observed.peak_so_far)}, history {gib(observed.need.bytes)} x {observed.need.margin:g})")
@@ -239,8 +242,8 @@ def running_text(running: gate.ExplainedRunningStep, explanation: gate.QueueExpl
             + evidence + phase + swap)
 
 
-def need_details(source: gate.RecordedNeed | gate.NeedSourceNotRecorded) -> str:
-    if isinstance(source, gate.NeedSourceNotRecorded):
+def need_details(source: admission_records.RecordedNeed | admission_records.NeedSourceNotRecorded) -> str:
+    if isinstance(source, admission_records.NeedSourceNotRecorded):
         return "Package, filters and width: not recorded"
     filters = ", ".join(source.filters) if source.filters else "none"
     package = source.package or "not recorded"

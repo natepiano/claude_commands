@@ -4,17 +4,20 @@ from __future__ import annotations
 
 import ctypes
 import errno
+import json
 import os
 from pathlib import Path
 import tempfile
 import threading
 import time
 import unittest
+from typing import cast
 from unittest import mock
 
 from scripts.direct.verify_hold_wait_test_support import (
     VerifyHoldWaitFixture,
     grant_call,
+    local_hold_environment,
     read_cycle_file,
     release_registered_call,
 )
@@ -23,6 +26,21 @@ from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
 class VerifyHoldWaitTests(VerifyHoldWaitFixture):
+    def test_hold_release_records_before_the_fixture_restores_its_environment(self) -> None:
+        environments: tuple[tuple[str, dict[str, str]], ...] = (("ambient", {}), ("marked", self.fixture.environment))
+        for count, (name, environment) in enumerate(environments, 1):
+            with self.subTest(environment=name):
+                self.hold()
+                with local_hold_environment(environment):
+                    grant_call(self.cycle_file)
+                recorded: list[tuple[object, object]] = []
+                for path in (self.fixture.root / "buildlog").rglob("*.jsonl"):
+                    for line in path.read_text().splitlines():
+                        row = cast(dict[str, object], json.loads(line))
+                        if row.get("kind") == "hold_event":
+                            recorded.append((row.get("event"), row.get("holder")))
+                self.assertEqual(recorded, [("ended", "hana")] * count)
+
     def test_local_admission_waits_for_release_notifications_instead_of_sleeping(self) -> None:
         from scripts.build_targets import build_targets
         from scripts.direct.local_release_wait import LocalReleaseEvents
@@ -31,7 +49,7 @@ class VerifyHoldWaitTests(VerifyHoldWaitFixture):
         def grant_on_notification(_seconds: float) -> None:
             grant_call(self.cycle_file)
 
-        with mock.patch.dict(os.environ, self.fixture.environment), \
+        with local_hold_environment(self.fixture.environment), \
              mock.patch.object(time, "sleep", side_effect=AssertionError("local admission must wake on release")), \
              mock.patch.object(LocalReleaseEvents, "wait", side_effect=grant_on_notification) as waiting:
             self.assertEqual(build_targets.command_wait_local("notification-call"), 0)
@@ -44,7 +62,7 @@ class VerifyHoldWaitTests(VerifyHoldWaitFixture):
         def release_on_poll(_seconds: float) -> None:
             grant_call(self.cycle_file)
 
-        with mock.patch.dict(os.environ, self.fixture.environment):
+        with local_hold_environment(self.fixture.environment):
             with mock.patch.object(ctypes, "CDLL", return_value=object()), \
                  mock.patch.object(time, "sleep", side_effect=release_on_poll) as polling:
                 self.assertEqual(build_targets.command_wait_local("polling-call"), 0)
@@ -114,7 +132,8 @@ class ReleaseDeadlineTests(unittest.TestCase):
         from scripts.direct.local_release_wait import LocalReleaseEvents
 
         with tempfile.TemporaryDirectory() as temporary:
-            directory = Path(temporary)
+            directory = Path(temporary) / "watched"
+            directory.mkdir()
             with LocalReleaseEvents(directory, directory) as waiter:
                 waiter.arm()
                 noise = directory / ".noise"

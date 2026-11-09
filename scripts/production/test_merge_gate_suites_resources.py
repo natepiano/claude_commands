@@ -1,6 +1,8 @@
 """Merge gate suites contracts."""
 
 from __future__ import annotations
+from scripts.build_queue import admission_records
+
 from scripts.build_queue import queue_place, admission_protocol as wire
 
 import unittest
@@ -52,13 +54,71 @@ class CpuUsageTest(unittest.TestCase):
 if __name__ == "__main__":
     Path(sys.argv[2]).write_text(str(spin_cpu(float(sys.argv[1]))))
 '''
-from scripts.lint import memory_admit
 from scripts.lib import copy_record, scratch
 from scripts.message.process_test_support import OwnedTestProcesses
 
 
 @final
 class MergeGateResourcesTests(GateSuitesFixture):
+    @gate_suites("lib", "hooks")
+    def test_memory_limit_stops_only_the_over_limit_module_beside_others(self) -> None:
+        self.configure_gate("merge_gate_governor_gib=2")
+        self.record_module_peaks({
+            "lib/test_first.py": 100.0, "lib/test_second.py": 100.0, "hooks/test_first.py": 100.0,
+        })
+        output = io.StringIO()
+        with mock.patch.dict(os.environ, self.environment), self.sampling_module_memory({
+                "lib/test_first.py": (2560.0, 64.0),
+                "lib/test_second.py": (2048.0,),
+                "hooks/test_first.py": (32.0,),
+        }) as started, redirect_stdout(output):
+            run = merge_gate.run_suites(self.checkout, max_running_jobs=3)
+        self.assertTrue(run.passed, output.getvalue())
+        stopped = [job for job in started if job.killed_for]
+        self.assertEqual([(job.suite, job.module) for job in stopped], [("lib", "test_first.py")])
+        self.assertEqual(stopped[0].process.returncode, -signal.SIGTERM)
+        self.assert_process_stopped(stopped[0].process.pid)
+        events = self.module_events()
+        initial = [event for event in events[:3] if event["event"] == "start"]
+        self.assertEqual(len(initial), 3, events)
+        self.assertEqual([event["event"] for event in events[-2:]], ["start", "finish"])
+        self.assertEqual(events[-2]["module"], "test_first.py")
+        peaks = merge_gate.read_measures(self.state / "runner/module_peak_mib.json")
+        self.assertEqual(peaks, {"lib/test_first.py": 64.0, "lib/test_second.py": 2048.0, "hooks/test_first.py": 32.0})
+        self.assertIn("peak memory 2.500 GiB exceeds the memory limit of 2 GiB", output.getvalue())
+        messages = [call for call in self.calls() if call["tool"] == "send.py"]
+        self.assertEqual(len(messages), 1)
+        self.assertEqual(messages[0]["args"][:2], ["--to", "sdlc"])
+        text = messages[0]["args"][messages[0]["args"].index("--text") + 1]
+        for detail in ("lib/test_first.py", "2.500 GiB", "limit 2 GiB", "merge-gate", "integration", "runs again alone"):
+            self.assertIn(detail, text)
+
+    def test_memory_stop_fails_even_when_the_module_exits_zero(self) -> None:
+        for exit_status in (0, 5):
+            with self.subTest(exit_status=exit_status):
+                self.restore_fixture(("hooks",))
+                module = self.checkout / "scripts/hooks/test_first.py"
+                self.write(module, module.read_text().replace(
+                    '        if (state / "sample-module-memory").exists():',
+                    '        def exit_zero(signum, frame):\n'
+                    + '            del signum, frame\n'
+                    + '            print("Ran 0 tests in 0.000s", flush=True)\n'
+                    + '            print("NO TESTS RAN", flush=True)\n'
+                    + f'            os._exit({exit_status})\n'
+                    + '        signal.signal(signal.SIGTERM, exit_zero)\n'
+                    + '        if (state / "sample-module-memory").exists():', 1))
+                self.configure_gate("merge_gate_governor_gib=4")
+                output = io.StringIO()
+                with mock.patch.dict(os.environ, self.environment), \
+                        self.sampling_module_memory({"hooks/test_first.py": (5120.0,)}), redirect_stdout(output):
+                    run = merge_gate.run_suites(self.checkout)
+                self.assertFalse(run.passed, output.getvalue())
+                self.assertEqual(len(run.executions), 2)
+                for result in run.executions:
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn("peak memory 5.000 GiB", result.killed_for)
+                self.assertIn("the gate fails", [call for call in self.calls() if call["tool"] == "send.py"][-1]["args"][-1])
+
     @gate_suites("hooks")
     def test_idle_gate_blocks_for_one_slot_and_reports_one_wait(self) -> None:
         for hold_during_wait in (False, True):
@@ -66,24 +126,25 @@ class MergeGateResourcesTests(GateSuitesFixture):
                 self.restore_fixture(("hooks",))
                 self.supply_jobserver(b"")
                 waiting = threading.Event()
-                read = os.read
+                select_ready = select.select
                 acquire = merge_gate.SharedCPUPool.acquire
                 blocking: list[bool] = []
                 held = False
                 hold_waits: list[bool] = []
 
                 def acquire_slot(pool: merge_gate.SharedCPUPool) -> merge_gate.SharedCPUSlot:
-                    def observe(descriptor: int, count: int) -> bytes:
+                    def observe_wait(readers: list[int], writers: list[int], errors: list[int],
+                                     timeout: float | None = None) -> tuple[list[int], list[int], list[int]]:
                         nonlocal held
-                        if descriptor == pool.blocking:
-                            blocking.append(os.get_blocking(descriptor))
+                        if pool.blocking in readers:
+                            blocking.append(os.get_blocking(pool.blocking))
                             self.assertFalse(signal.pthread_sigmask(signal.SIG_BLOCK, set()).intersection(
                                 {signal.SIGTERM, signal.SIGHUP, signal.SIGINT}))
                             held = hold_during_wait
                             waiting.set()
-                        return read(descriptor, count)
+                        return select_ready(readers, writers, errors, timeout)
 
-                    with mock.patch.object(os, "read", side_effect=observe):
+                    with mock.patch.object(select, "select", side_effect=observe_wait):
                         return acquire(pool)
 
                 def release_hold() -> None:
@@ -115,40 +176,63 @@ class MergeGateResourcesTests(GateSuitesFixture):
                 self.assertEqual(self.jobserver_tokens(), b"Q")
 
     def test_stop_during_a_blocking_read_returns_every_owned_slot(self) -> None:
-        self.supply_jobserver(b"A")
-        waiting = threading.Event()
-        read = os.read
+        for delivery in ("before_wait", "process", "sender_thread"):
+            with self.subTest(delivery=delivery):
+                self.supply_jobserver(b"A")
+                waiting = threading.Event()
+                select_ready = select.select
 
-        def observe(descriptor: int, count: int) -> bytes:
-            waiting.set()
-            return read(descriptor, count)
+                def stop() -> None:
+                    self.assertTrue(waiting.wait(TEST_HANG_GUARD_SECS))
+                    if delivery == "process":
+                        os.kill(os.getpid(), signal.SIGTERM)
+                    elif delivery == "sender_thread":
+                        signal.pthread_kill(threading.get_ident(), signal.SIGTERM)
 
-        def stop() -> None:
-            self.assertTrue(waiting.wait(TEST_HANG_GUARD_SECS))
-            os.kill(os.getpid(), signal.SIGTERM)
+                with ThreadPoolExecutor(max_workers=1) as executor:
+                    stopped = executor.submit(stop)
+                    with mock.patch.dict(os.environ, self.environment), merge_gate.rollback_signals(), \
+                            self.assertRaisesRegex(GateRefused, "interrupted by SIGTERM"):
+                        with merge_gate.shared_cpu_pool() as pool:
+                            assert isinstance(pool, merge_gate.SharedCPUPool)
+                            self.assertIsInstance(pool.try_acquire(), merge_gate.SharedCPUSlot)
+                            blocking_descriptor = pool.blocking
 
-        with ThreadPoolExecutor(max_workers=1) as executor:
-            stopped = executor.submit(stop)
-            with mock.patch.dict(os.environ, self.environment), merge_gate.rollback_signals(), \
-                    self.assertRaisesRegex(GateRefused, "interrupted by SIGTERM"):
-                with merge_gate.shared_cpu_pool() as pool:
-                    assert isinstance(pool, merge_gate.SharedCPUPool)
-                    self.assertIsInstance(pool.try_acquire(), merge_gate.SharedCPUSlot)
-                    with mock.patch.object(os, "read", side_effect=observe):
-                        _ = pool.acquire()
-            _ = stopped.result(timeout=TEST_HANG_GUARD_SECS)
-        self.assertEqual(self.jobserver_tokens(), b"A")
+                            def observe_wait(readers: list[int], writers: list[int], errors: list[int],
+                                             timeout: float | None = None) -> tuple[list[int], list[int], list[int]]:
+                                if blocking_descriptor in readers:
+                                    waiting.set()
+                                    if delivery == "before_wait":
+                                        os.kill(os.getpid(), signal.SIGTERM)
+                                return select_ready(readers, writers, errors, timeout)
+
+                            with mock.patch.object(select, "select", side_effect=observe_wait):
+                                _ = pool.acquire()
+                    _ = stopped.result(timeout=TEST_HANG_GUARD_SECS)
+                self.assertEqual(self.jobserver_tokens(), b"A")
 
     def test_stop_after_blocking_acquisition_returns_the_new_slot_too(self) -> None:
-        self.supply_jobserver(b"A\0")
-        with mock.patch.dict(os.environ, self.environment), merge_gate.rollback_signals(), \
-                self.assertRaisesRegex(GateRefused, "interrupted by SIGTERM"):
-            with merge_gate.shared_cpu_pool() as pool:
-                assert isinstance(pool, merge_gate.SharedCPUPool)
-                self.assertIsInstance(pool.try_acquire(), merge_gate.SharedCPUSlot)
-                _ = pool.acquire()
-                os.kill(os.getpid(), signal.SIGTERM)
-        self.assertEqual(self.jobserver_tokens(), b"A\0")
+        for delivery in ("read", "return"):
+            with self.subTest(delivery=delivery):
+                self.supply_jobserver(b"A\0")
+                read = os.read
+                with mock.patch.dict(os.environ, self.environment), merge_gate.rollback_signals(), \
+                        self.assertRaisesRegex(GateRefused, "interrupted by SIGTERM"):
+                    with merge_gate.shared_cpu_pool() as pool:
+                        assert isinstance(pool, merge_gate.SharedCPUPool)
+                        self.assertIsInstance(pool.try_acquire(), merge_gate.SharedCPUSlot)
+                        token_descriptor = pool.descriptor
+
+                        def interrupt_read(descriptor: int, count: int) -> bytes:
+                            token = read(descriptor, count)
+                            if descriptor == token_descriptor and delivery == "read":
+                                os.kill(os.getpid(), signal.SIGTERM)
+                            return token
+
+                        with mock.patch.object(os, "read", side_effect=interrupt_read):
+                            _ = pool.acquire()
+                        os.kill(os.getpid(), signal.SIGTERM)
+                self.assertEqual(self.jobserver_tokens(), b"A\0")
 
     def test_interrupt_after_reaping_preserves_status_and_cpu_and_allows_cleanup(self) -> None:
         jobs: list[merge_gate.RunningGateJob] = []
@@ -330,7 +414,7 @@ class MergeGateResourcesTests(GateSuitesFixture):
                 with self.assertRaises(BlockingIOError):
                     fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
 
-        def observed(result: memory_admit.AdmissionWaitSnapshot) -> None:
+        def observed(result: admission_records.AdmissionWaitSnapshot) -> None:
             nonlocal admitted
             admitted = result.decision.state == "admit"
             if result.decision.state == "hold":

@@ -102,7 +102,6 @@ def run_review(review: Path, prompt: str, log: Path) -> int:
     caller = staff.snapshot().by_current_session(manager) if manager else None
     target = "consultation-pane"
     if caller is not None and caller.kind in ("unit", "showrunner"):
-        write_text_atomic(log.parent / "worker_transport", unit_runs.parent_transport(caller.current_session) + "\n")
         target = "staff-worker"
     write_text_atomic(log.parent / "prompt.md", prompt)
     return _managed_review(review, log, target)
