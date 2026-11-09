@@ -2056,14 +2056,14 @@ Registered jobs already take no margin: `test_registered_and_unregistered_jobs_e
 
 #### As-built
 - The floor sweep trims the Mac mirror targets by design: it removes only the shortfall, least recently used first, and never a target a live build holds. On 2026-11-09 both mirror targets held live nextest runs at each scan; later trims took them.
-- `LockedClaims.holds` (`scripts/mac_test/floor_claims.py`) skips a claimed mirror path that does not exist, so a missing unrelated mirror no longer protects a marked target without a copy record. Other claim read errors still protect the target. Remote mirror removal (`scripts/copies/copies.py`) keeps its own lease exemption and still checks sibling leases.
+- `ClaimSnapshot.holds` (`scripts/mac_test/floor_claims.py`) skips missing claimed mirror paths. A missing unrelated mirror does not protect a marked target without a copy record. Other claim read errors still protect the target. Remote mirror removal keeps its own lease exemption and checks sibling leases.
 - While a crossing delivery is pending, the Mac measures each direct folder child of its floor roots (`mac_folder_measurement`, `CurrentMacFolders` in `scripts/lint/sweep.py`). `mac_folder_reclaimable_bytes` counts the blocks that deleting that folder alone frees: an inode counts once only when all its hard links are inside the folder; symlinks are not followed. The alert lists the folders by size and recommends the largest; protected folders keep their labels. No natedev disk snapshot is needed.
 - `notify_floor_problem` takes the machine name from its floor policy; it has no `machine` parameter.
 - `docs/as-built/build-memory-admission.md` states the claim and folder-measurement rules.
 
 **Files:**
 - `scripts/lint/sweep.py` — the Mac folder measurement and the folder choices.
-- `scripts/mac_test/floor_claims.py` — the missing-mirror rule in `LockedClaims.holds`.
+- `scripts/mac_test/floor_claims.py` — the missing-mirror rule in `ClaimSnapshot.holds`.
 - `scripts/lint/test_sweep.py`, `scripts/mac_test/test_floor_sweep.py` — rows in `test_crossing_recommends_one_measured_choice_that_frees_the_shortfall` (Mac rows) and `test_no_proc_mac_sweep_takes_only_the_oldest_shortfall` (mirror row).
 - `docs/as-built/build-memory-admission.md` — the changed rules.
 

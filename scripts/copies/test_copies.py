@@ -493,7 +493,7 @@ class StandingTests(unittest.TestCase):
         processes = copies.MirrorProcessScan(tmp_sweep.ProcessUsesKnown([]), frozenset())
         with (mock.patch.object(copies, "scan_mirror_processes", return_value=processes),
               mock.patch.object(copies, "mirror_metadata_locks",
-                                return_value=nullcontext(floor_claims.LockedClaims(frozenset()))),
+                                return_value=nullcontext(floor_claims.ClaimSnapshot(frozenset()))),
               mock.patch.object(scratch, "remove", side_effect=delete)):
             result = self.cli("mirror-remove", "--path", str(checkout), "--owner", "clone-owner",
                               "--repository", "hana", "--session", "fixture")

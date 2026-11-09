@@ -558,9 +558,40 @@ Existing waits keep their place on natedev until then.
 Below the required floor, it runs one shared floor sweep and reads free space again.
 The per-host `floor-sweep-<host>.lock` serializes sweeps.
 A caller that finds a running sweep waits for its result.
-The sweep runs without admission or claim locks.
+The sweep holds no admission or claim lock during removal.
+`floor_claims.serve()` reads claims and mirror leases under `state.lock`.
+It builds the reply under the lock and prints after the lock closes.
+It exits without reading stdin.
+`read_claims()` closes both reader processes before it returns a `ClaimSnapshot`.
+A lost SSH session cannot retain the state lock while the sweep runs.
+An unavailable or unreadable claim reply protects all output.
+
+`mirror_sweep_leases()` reports acquired leases separately from busy mirrors.
+The sweep keeps busy mirrors and holds acquired leases through removal.
+For output outside those leases, it reads claims again immediately before each removal group.
+A new claim or an unreadable reply keeps that output.
+Cargo locks, scratch busy locks, and process checks retain their existing roles.
+
+| Path class | Protection during removal |
+| --- | --- |
+| Mirror build units, orphan files, and whole targets | The sweep holds the Mac-side mirror lease. |
+| Registered mirror clones outside the mirror root | The sweep holds their registered Mac-side mirror leases. |
+| Marked gate caches and other output outside acquired leases | The sweep reads claims again before each removal group and retains existing output locks. |
+| `mirror-remove` payload, metadata, and removal authority | `local_mirror_lease` covers the operation; the record lock serializes metadata changes. |
+| A registered task clone's parent folder | An outside mirror lease survives parent removal and blocks concurrent `mirror-use`. No parent busy lock applies. |
+| `mirror-receive` cleanup of interrupted removal | The mirror lease and record lock cover the old payload and metadata. |
+| Natedev floor output | Existing build holds, mirror leases, process checks, scratch locks, and Cargo locks apply. |
 `mirror_root.py` reads the one `mirror_root` setting for offload and sweep.
 `free_now` reads local records only and starts no sweep or SSH request.
+
+`local_mirror_lease` first takes an outside lease, then the existing sibling lease.
+The outside file uses the mirror path hash and sits beside the task parent.
+After acquisition, the lease compares the open file inode with the path inode.
+A missing path or a changed inode causes the existing busy refusal.
+When task removal deletes the parent, lease cleanup deletes the outside file before it closes either lease.
+Both lease descriptors pass to remote commands.
+Task removal can delete the sibling lease and record lock while the outside lease remains locked.
+The sibling lease path stays unchanged, so a live lease from the old code still blocks removal.
 
 A disk decline remains retryable through the local queue leave hook.
 The step record retains `NatedevOnly("disk")` for idle-alert evidence.
@@ -575,9 +606,19 @@ A successful claim creates `MAC_WAIT_CLAIM_FILE`.
 A refused claim keeps the local queue place.
 `release_wait_claim` releases unused claims after an attempt and during cleanup.
 An unlocked `free-now` read cannot replace this claim handoff.
+`build_targets.command_reserve()` reads `free_now` before it tries `state.lock`.
+A block or an active backoff returns without waiting for that lock.
+`owns_wait_claim()` reads ownership without a lock before `free_now`.
+Unreadable state means the caller does not own the claim.
+A published reservation retains success during backoff.
+Without a published reservation, an owned wait claim still passes the policy check.
+The policy check refuses backoff without waiting for `state.lock`.
+A block refuses a plain owned claim.
+A retained remote cleanup claim keeps success under a block.
+A published reservation checks ownership before it returns success.
 
 `blocking_claim_block` applies the shared block rule to claim reuse and transfer.
-A reservation cannot override a later block from another session.
+A plain reservation cannot override a later block from another session.
 Each new step releases the previous step's reservation before local waits.
 
 ## Mirror refusal times
