@@ -1921,6 +1921,17 @@ def _start_pass(args: argparse.Namespace) -> None:
     slots = _pass_slots(state)
     slots[team_slot] = current_pass
     _write_state(session_dir, state)
+    worker_id = staff.StaffId(_optional_arg(args, "worker_id"))
+    if worker_id and pass_kind in staff.WORKER_ROLES:
+        role = staff.KnownWorkerRole(pass_kind)
+        try:
+            row = staff.initial_snapshot().by_id(worker_id)
+            if row is None:
+                print(f"anomaly: {worker_id}: worker role has no staff row", file=sys.stderr)
+            elif row.role != role:
+                _ = staff.set_worker_role(worker_id, role)
+        except (staff.StaffUnreadable, staff.StaffNotFound) as error:
+            print(f"anomaly: {worker_id}: {error}", file=sys.stderr)
     event = _event(state, "pass_started", now, current_pass)
     event["launch_check"] = launch_check
     event["config_digest"] = _config_digest()
@@ -1964,14 +1975,6 @@ def begin_dispatch(session_dir: Path, *, slot: str, phase: str, role: staff.Work
         fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
         try:
             _start_pass(args)
-            try:
-                row = staff.initial_snapshot().by_id(worker_id)
-                if row is None:
-                    print(f"anomaly: {worker_id}: worker role has no staff row", file=sys.stderr)
-                elif row.role != staff.KnownWorkerRole(role):
-                    _ = staff.set_worker_role(worker_id, staff.KnownWorkerRole(role))
-            except (staff.StaffUnreadable, staff.StaffNotFound) as error:
-                print(f"anomaly: {worker_id}: {error}", file=sys.stderr)
             return _string(_pass_slots(_read_state(session_dir))[slot]["instance_id"])
         finally:
             fcntl.flock(lock.fileno(), fcntl.LOCK_UN)

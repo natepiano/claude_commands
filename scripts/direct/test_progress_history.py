@@ -3545,6 +3545,9 @@ with patch.object(fcntl, "flock", admission):
                              "--worker-id", worker.id, worker_name=worker.name)
         opened, = self.pass_events("dispatch-history", "pass_started")
         self.assertEqual(opened["worker_id"], worker.id)
+        current = staff.by_id(worker.id)
+        assert current is not None
+        self.assertEqual(current.role, staff.KnownWorkerRole("impl"))
         self.finish_slot_pass(run, "impl", "completed", 20_030)
         _ = staff.rename(worker.id, "renamed-worker")
         self.start_slot_pass(run, "impl", "test", 20_040, "gpt-called", 0,

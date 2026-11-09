@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 from datetime import datetime, timezone
+from dataclasses import replace
 from unittest.mock import patch
 from scripts.usage import agents_log
 from scripts.direct.assign_claude_native_test_support import ClaudeLauncherFixture
@@ -74,7 +75,7 @@ class AssignClaudeLauncherWorkerTests(ClaudeLauncherFixture):
         self.assertEqual(result.stderr.splitlines(),
                          [f"anomaly: {row.name}: {record_path}: worker state unreadable: fixture dispatch read failed"])
         self.assertEqual(len(transcript.read_text().splitlines()), 2)
-        self.assertEqual(self.recorded_worker(run), row)
+        self.assertEqual(self.recorded_worker(run), replace(row, role=staff.KnownWorkerRole("impl")))
 
     def test_family_switch_continues_after_an_unknown_dispatch_state(self) -> None:
         run = self.start_phase("switch-unknown-record")

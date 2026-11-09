@@ -214,13 +214,15 @@ def _run(launch: ClaudeLaunch) -> int:
         name = child(["bash", str(SCRIPTS / "worker_name.sh"), str(launch.cwd), launch.slot, launch.role, prefix],
                      capture=True).stdout.strip()
     try:
-        _ = worker_admission.admit(name, launch.run)
+        allowed = worker_admission.admit(name, launch.run)
     except worker_admission.AdmissionRefused as error:
         _fail(str(error))
     _ = child([PYTHON, str(SCRIPTS / "worker_state.py"), str(launch.run)])
     directory.mkdir(parents=True, exist_ok=True)
+    slot = allowed.slot
     if isinstance(worker, ClaudeFollowUp) and _switch(launch, name):
         worker = NewClaudeWorker()
+        slot = worker_admission.NewWorkerSlot()
     if isinstance(worker, ClaudeFollowUp):
         _claim(launch, name, env)
     if not claim_phase(launch.run, launch.phase, launch.cwd, log, status, launch.slot, env):
@@ -231,6 +233,7 @@ def _run(launch: ClaudeLaunch) -> int:
         f"task={task}\nfamily=claude\nagent={launch.model}\neffort={launch.effort}\n")
     progress = launch.run / "progress_history_state.json"
     phase_options = ["--phase-id", launch.phase] if launch.phase else []
+    worker_options = ["--worker-id", slot.row.id] if isinstance(slot, worker_admission.ExistingWorkerSlot) else []
     env["UNIT_PASS_OWNER"] = "launcher"
     if progress.is_file():
         started = child([PYTHON, str(SCRIPTS / "progress_history.py"), "start-pass", "--session-dir", str(launch.run),
@@ -238,7 +241,7 @@ def _run(launch: ClaudeLaunch) -> int:
             "--fix-pass", str(launch.fix_pass), "--activity", launch.role, "--called-task", task,
             "--worker-name", name, "--called-family", "claude", "--called-model", launch.model,
             "--called-effort", launch.effort or "unset", "--launcher-command", json.dumps(launch.command),
-            *phase_options], check=False)
+            *phase_options, *worker_options], check=False)
         if started.returncode:
             print(f"ERROR: unable to record the {launch.role} pass start.", file=sys.stderr)
             _ = status.write_text("error\n")
