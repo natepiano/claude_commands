@@ -13,8 +13,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Literal, NotRequired, TypedDict, cast
 
-from scripts.agents.codex_mesh import DETACHED_RUNS_DIR
-from scripts.agents.mesh_runs import RunRecord
+from scripts.agents.worker_lifecycle import DETACHED_RUNS_DIR
+from scripts.agents.detached_runs import RunRecord
 from scripts.agents import worker_lifecycle
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.production import staff

@@ -74,6 +74,12 @@ def _record_activity(session_id: str, source: str, prompt: str) -> None:
 
 def main() -> None:
     payload = cast(PromptPayload, json.loads(sys.stdin.read()))
+    try:
+        from scripts.hooks.compaction_marker import clear
+
+        clear(payload.get("session_id", ""))
+    except Exception:
+        pass
     if "agent_id" in payload:
         return
     session_id = payload.get("session_id", "")

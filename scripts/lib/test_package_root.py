@@ -44,7 +44,7 @@ class PackageRootTests(unittest.TestCase):
         entries = (
             "message/send.py", "production/update_registration.py",
             "production/change_review.py", "style/style_sync.py",
-            "direct/board_json.py", "agents/mesh_runs.py", "hooks/herdr_tab_title.py",
+            "direct/board_json.py", "agents/detached_runs.py", "hooks/herdr_tab_title.py",
             "accounts/new_account.py", "whoami/codex_pacer.py", "lib/scratch.py",
         )
         environment = {name: value for name, value in os.environ.items() if name != "PYTHONPATH"}

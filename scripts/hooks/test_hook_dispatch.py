@@ -39,6 +39,7 @@ LEGACY: dict[str, tuple[tuple[str, str, float], ...]] = {
         ("post-tool-use-banned-words.py", "", 600),
     ),
     "stop": (
+        ("compaction-marker-clear.py", "", 10),
         ("stop-conversation-pause.py", "", 600),
         ("stop-assistant-prose-banned-words.py", "", 600),
         ("stop-context-deferral.py", "", 10),

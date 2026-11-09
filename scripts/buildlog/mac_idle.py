@@ -26,7 +26,7 @@ from scripts.buildlog import store
 SCRIPTS = Path(__file__).resolve().parents[1]
 
 if TYPE_CHECKING:
-    from scripts.lint import memory_admit
+    from scripts.build_queue import admission_records
     from scripts.direct import step_record
     from scripts.mac_test import mac_test
     from scripts.buildlog import mac_idle_alert
@@ -148,7 +148,7 @@ def belongs_to(process: LiveProcess, call: VerifyCall, live: dict[int, LiveProce
 
 @dataclass(frozen=True)
 class AdmissionWaiters:
-    waiters: list[memory_admit.Waiter]
+    waiters: list[admission_records.Waiter]
 
 
 @dataclass(frozen=True)
@@ -166,7 +166,7 @@ def admission_waiters() -> AdmissionWaiters | AdmissionQueryFailed:
 
 
 def _waiting_evidence(call: VerifyCall, live: dict[int, LiveProcess],
-                      waiters: list[memory_admit.Waiter]) -> str:
+                      waiters: list[admission_records.Waiter]) -> str:
     children = {pid: child for pid, child in live.items() if belongs_to(child, call, live)}
     for row in waiters:
         pid = row["pid"]

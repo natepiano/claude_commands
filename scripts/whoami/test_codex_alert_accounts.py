@@ -733,8 +733,8 @@ always=director
         source = self.account(1)
         readings = self.readings(source, self.report(source, 0))
         note = self.note(1, "active", 0)
-        commands = (("director-a", "impl", "codex_mesh start --prompt 'first task'"),
-                    ("director-b", "test", "codex_mesh follow --to test --prompt 'second task'"))
+        commands = (("director-a", "impl", "worker.py assign impl 'first task'"),
+                    ("director-b", "test", "worker.py assign test 'second task'"))
         with patch.object(quota_alert, "relay", return_value=None) as relay:
             for director, worker, command in commands:
                 log = quota_alert.blocked([note], source, self.now, codex_readings=readings,

@@ -372,7 +372,7 @@ def common_session(session_id: str, name: str | None = None, *, cwd: str | None 
         "name": name or session_id, "cwd": cwd or f"/tmp/{session_id}",
         "status": "idle", "updated_at": 0, "probe": False,
         "model": model or inventory.NoReplyYet(kind="no reply yet"),
-        "checkout": checkout(), "run_dirs": list(run_dirs or []), "codex_servers": [], "timers": [],
+        "checkout": checkout(), "run_dirs": list(run_dirs or []), "timers": [],
     }
 
 
@@ -581,7 +581,7 @@ class MixedRestartTests(ShutdownTestCase):
     def linux_commands(self, commands: tuple[str, ...], surviving: frozenset[int]) -> None:
         self.assertEqual(herdr._PLATFORM, "linux")  # pyright: ignore[reportPrivateUsage]
         self.assertEqual(sys.platform, "linux")
-        from scripts.agents import codex_mesh
+        from scripts.herdr import worker_panes
         from scripts.herdr.test_worker_panes import PaneWorld
 
         root = Path(self.enterContext(tempfile.TemporaryDirectory(prefix="mixed-", dir="/tmp")))
@@ -603,20 +603,18 @@ class MixedRestartTests(ShutdownTestCase):
         doc = root / "production.md"
         write_text_atomic(doc, "# Fixture\n")
         show = fixture_member("showrunner", name="mixed-show", doc=staff.LiveDoc(remote.local_machine(), doc))
-        (root / "mesh").mkdir()
-        mesh = fixture_member("unit", name="mixed-mesh", parent=show.id,
-            worktree=staff.PresentWorktree(remote.local_machine(), root / "mesh"))
-        seat = fixture_member("worker", name="mixed-seat", parent=mesh.id)
+        (root / "other").mkdir()
+        other = fixture_member("unit", name="mixed-other", parent=show.id,
+            worktree=staff.PresentWorktree(remote.local_machine(), root / "other"))
+        seat = fixture_member("worker", name="mixed-seat", parent=other.id)
         owner = fixture_member("unit", name="mixed-pane", parent=show.id, worktree=directory)
         workers = [fixture_member("worker", name=name, parent=owner.id,
             backend=staff.CodexBackend(root / ".codex1")) for name in ("impl", "review")]
-        rows = [show, mesh, seat, owner, *workers]
+        rows = [show, other, seat, owner, *workers]
         run = root / "runs/pane"
-        mesh_run = root / "runs/mesh"
-        write_text_atomic(mesh_run / "worker_transport", "mesh\n")
-        write_text_atomic(mesh_run / "progress_history_state.json", json.dumps({"owner_staff_id": mesh.id,
-            "main_agent": {"session_id": mesh.current_session}, "pass": {}, "events": []}))
-        write_text_atomic(run / "worker_transport", "herdr\n")
+        other_run = root / "runs/other"
+        write_text_atomic(other_run / "progress_history_state.json", json.dumps({"owner_staff_id": other.id,
+            "main_agent": {"session_id": other.current_session}, "pass": {}, "events": []}))
         write_text_atomic(run / "progress_history_state.json", json.dumps({"owner_staff_id": owner.id,
             "phase": {"id": "work", "instance_id": "active", "status": "active", "started_at": 1},
             "main_agent": {"session_id": owner.current_session, "family": "claude"},
@@ -672,7 +670,7 @@ class MixedRestartTests(ShutdownTestCase):
             pid = live.get(pane, unconfirmed.get(pane, shell))
             argv = (proc / str(pid) / "cmdline").read_text().strip("\0").split("\0")
             return {"process_info": {"shell_pid": shell, "foreground_process_group_id": pid,
-                "foreground_processes": [{"pid": pid, "name": argv[0], "argv": argv, "cwd": str(root / "mesh" if pane == "w1:p1" else root)}]}}
+                "foreground_processes": [{"pid": pid, "name": argv[0], "argv": argv, "cwd": str(root / "other" if pane == "w1:p1" else root)}]}}
 
         def reply(request: dict[str, object]) -> dict[str, object]:
             method = str(request.get("method", ""))
@@ -797,7 +795,6 @@ class MixedRestartTests(ShutdownTestCase):
             with (patch.object(unit_runs, "held_by_session", wraps=unit_runs.held_by_session) as searches,
                   patch.object(herdr, "codex_conversations", wraps=herdr.codex_conversations) as scans,
                   patch.object(herdr, "_scan_herdr_processes", wraps=herdr._scan_herdr_processes) as processes,  # pyright: ignore[reportPrivateUsage]
-                  patch.object(codex_mesh, "_pause_roster") as pause,
                   patch.object(worker_panes, "start_or_resume", wraps=worker_panes.start_or_resume) as starts,
                   patch.object(pane_record, "seed", wraps=pane_record.seed) as seeds,
                   patch.object(herdr.Herdr, "order_tabs", autospec=True, side_effect=herdr.Herdr.order_tabs) as orders,
@@ -817,7 +814,7 @@ class MixedRestartTests(ShutdownTestCase):
             # Stop uses direct pane reads. Restart also classifies tabs for ordering.
             self.assertEqual((searches.call_count, scans.call_count, processes.call_count),
                              (1, 1, int(command == "restart")), command)
-            pause.assert_called_once()
+            self.assertNotIn("w1:p2", launches)
             self.assertCountEqual(signals, [991100 + index for index in (0, 1, 3, 4, 5)])
             self.assertEqual(len(launches), 5 if command == "restart" else 0)
             self.assertEqual(len(live), 5 if command == "restart" else 0)
@@ -1176,8 +1173,7 @@ class RestartTests(RestartTestCase):
         child = replace(self.rows[1], kind="worker", parent=staff.ReportsTo(owner.id))
         record = staff.StaffSnapshot((owner, child))
         with (patch.object(staff, "snapshot", return_value=record),
-              patch.object(restart, "pane_workers", return_value=True),
-              patch.object(worker, "_read_workers", return_value=worker.MeshWorkerRows([])),
+              patch.object(worker, "_read_workers", return_value=worker.PaneWorkerStates([], [])),
               redirect_stdout(io.StringIO()) as output):
             _ = restart._restore_workers(owner, record)  # pyright: ignore[reportPrivateUsage]
         self.assertEqual(output.getvalue().splitlines(), [f"{owner.name}: workers unchanged"])
@@ -1302,7 +1298,6 @@ class RestartTests(RestartTestCase):
             with (self.subTest(selected=selected.id),
                   patch.object(staff, "initial_snapshot", return_value=record),
                   patch.object(restart, "live_rows", return_value=list(record.rows)),
-                  patch.object(unit_runs, "worker_transport", return_value="herdr"),
                   patch.object(restart.stop_resume, "stop_unit_workers") as stop_workers,
                   patch.object(restart, "stop_row") as stop,
                   patch.object(restart, "start_row", return_value="w1:p1") as start,
@@ -1334,15 +1329,13 @@ class RestartTests(RestartTestCase):
         self.assertEqual(len(errors.getvalue().splitlines()), 1)
 
     def test_account_filters_partition_an_owner_and_its_workers_by_their_own_accounts(self) -> None:
-
         self.account_processes()
         owner = self.rows[0]
         children = tuple(replace(row, kind="worker", parent=staff.ReportsTo(owner.id)) for row in self.rows[1:])
         record = staff.StaffSnapshot((owner, *children))
         states = [worker_panes.OpenWorker(row, f"w1:p{index}", f"terminal-{index}", herdr.AgentStatus.IDLE)
                   for index, row in enumerate(children, 1)]
-        with (patch.object(unit_runs, "worker_transport", return_value="herdr"),
-              patch.object(worker_panes, "observe_parents", return_value={owner.id: states})):
+        with patch.object(worker_panes, "observe_parents", return_value={owner.id: states}):
             for label, expected in (("claude3", [owner]), ("claude2", list(children))):
                 with self.subTest(account=label):
                     self.assertEqual(restart.live_rows(record, herdr.Herdr("agents"),
@@ -1764,7 +1757,8 @@ class RestartTests(RestartTestCase):
         for identity, label, unavailable in ((str(self.rows[0].current_session), "live", False), (None, "live", False),
                                            (str(self.rows[0].current_session), None, False), (None, "live", True)):
             with (patch.object(staff, "initial_snapshot", return_value=staff.StaffSnapshot(self.rows)),
-                  patch.object(unit_runs, "worker_transport", return_value="mesh"),
+                  patch.object(restart.worker_panes, "observe_parents", return_value={self.rows[0].id: [
+                      worker_panes.OpenWorker(self.rows[1], "worker-pane", "worker-terminal", herdr.AgentStatus.IDLE)]}),
                   patch.object(herdr.Herdr, "panes", return_value=[{**self.panes()[0], "session_id": identity}],
                                side_effect=herdr.HerdrFailure("socket unavailable") if unavailable else None),
                   patch.object(herdr, "saved_layout", return_value=layout),
@@ -2411,7 +2405,6 @@ class RestartTests(RestartTestCase):
         self.running.clear()
         shutdown_record.save([str(holder.id), str(child.id)])
         with (patch.object(staff, "initial_snapshot", return_value=record),
-              patch.object(unit_runs, "worker_transport", return_value="herdr"),
               patch.object(worker, "restore", side_effect=[worker.ExitCode.UNCERTAIN, worker.ExitCode.OK]) as restore):
             self.assertEqual(restart.restart(), 0)
             self.assertEqual(shutdown_record.read(), [str(holder.id), str(child.id)])
@@ -2441,7 +2434,6 @@ class RestartTests(RestartTestCase):
 
         shutdown_record.save([str(row.id) for row in record.rows])
         with (patch.object(staff, "initial_snapshot", return_value=record),
-              patch.object(unit_runs, "worker_transport", return_value="herdr"),
               patch.object(worker, "restore", side_effect=restore)):
             self.assertEqual(restart.restart(), 0)
             self.assertEqual(len(shutdown_record.read()), 3)
@@ -2453,9 +2445,7 @@ class RestartTests(RestartTestCase):
 
         child = children[0]
         self.running.add(str(child.current_session))
-
         with (patch.object(staff, "initial_snapshot", return_value=record),
-              patch.object(unit_runs, "worker_transport", return_value="herdr"),
               patch.object(worker_panes, "observe") as observe):
             self.assertTrue(restart.stop_row(child, herdr.Herdr("fixture")))
         observe.assert_not_called()
@@ -2501,7 +2491,6 @@ class RetainedSplitRestartTests(RestartTestCase):
             "phase": {"id": "earlier", "title": "Earlier", "instance_id": "earlier-phase",
                       "started_at": 1, "status": "active"},
             "pass": {}, "history_file": str(run / "history.jsonl")}))
-        write_text_atomic(run / "worker_transport", "herdr\n")
         prompt = run / "prompt.md"
         write_text_atomic(prompt, "Preserve the source behavior.\n")
         for row in children:

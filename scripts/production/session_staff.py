@@ -8,7 +8,6 @@ except FileNotFoundError:
 import sys
 import fcntl
 import json
-import os
 import shlex
 import subprocess
 import tomllib
@@ -18,10 +17,7 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import TYPE_CHECKING, NamedTuple, cast
-
-if TYPE_CHECKING:
-    from scripts.agents.worker_lifecycle import WorkerStateFile
+from typing import NamedTuple, cast
 
 from scripts.production import staff
 from scripts.production.session_labels import StaffLabels
@@ -192,7 +188,6 @@ def _worker_runs(record: staff.StaffSnapshot, rows: Iterable[staff.StaffRow]) ->
         records: dict[staff.StaffId, dict[str, object]] = {}
         try:
             entries = [cast(object, json.loads(path.read_text())) for path in run.glob("impl_worker_*.json")]
-            entries.extend(read_worker_roster(run / "mesh_roster.json").values())
             records = {staff.StaffId(value): cast(dict[str, object], entry) for entry in entries if isinstance(entry, dict)
                        and isinstance(value := cast(dict[str, object], entry).get("staff_id"), str)}
         except (OSError, ValueError) as error:
@@ -215,8 +210,6 @@ def worker_run_index(record: staff.StaffSnapshot) -> dict[staff.StaffId, tuple[P
 
 def pane_parents(record: staff.StaffSnapshot) -> list[staff.StaffRow]:
     """Select local parents whose workers use panes."""
-    from scripts.lib import unit_runs
-
     parents = {row.parent.id for row in record.find(kind="worker") if isinstance(row.parent, staff.ReportsTo)}
     found: list[staff.StaffRow] = []
     for row in record.rows:
@@ -226,11 +219,7 @@ def pane_parents(record: staff.StaffSnapshot) -> list[staff.StaffRow]:
         if (isinstance(location, (staff.LiveDoc, staff.WrappedDoc, staff.PresentWorktree, staff.RemovedWorktree))
                 and location.machine == remote.local_machine()):
             found.append(row)
-    if not found:
-        return []
-    scanned = unit_runs.held_by_session(os.environ.get("ROSTER_RUN_ROOT"), record=record)
-    return [row for row in found
-            if unit_runs.parent_transport(row.current_session, scanned=scanned, record=record) == "herdr"]
+    return found
 
 
 def worker_name(entry: Mapping[str, object], record: staff.StaffSnapshot | None = None) -> str:
@@ -249,10 +238,6 @@ def stored_worker_records(entries: Mapping[str, object]) -> dict[str, object]:
     return {name: {key: value for key, value in cast(dict[str, object], raw).items()
                    if key not in WORKER_FACT_KEYS}
             for name, raw in entries.items() if isinstance(raw, dict)}
-
-
-def publish_worker_roster(handle: WorkerStateFile, roster: Mapping[str, object]) -> None:
-    handle.publish(json.dumps(stored_worker_records(roster), indent=2, sort_keys=True))
 
 
 def read_worker_roster(path: Path) -> dict[str, object]:
@@ -987,15 +972,7 @@ def inbox_path(identity: staff.StaffId) -> Path:
 
 def worker_inbox_path(session_dir: str | Path, name: str) -> Path:
     """Select the fixed staff inbox or the unpublished admission inbox."""
-    from scripts.agents import worker_lifecycle
     folder = Path(session_dir)
-    roster = worker_lifecycle.read_worker_state(folder / "mesh_roster.json")
-    raw = roster.get(name)
-    if isinstance(raw, dict):
-        entry = cast(dict[str, object], raw)
-        reference = entry.get("staff_id")
-        if isinstance(reference, str) and reference:
-            return inbox_path(staff.native_id(reference))
     find_member = cast(Callable[[Path, str], staff.StaffRow | None],
                        import_module("scripts.production.worker_admission").member)
     member = find_member(folder, name)

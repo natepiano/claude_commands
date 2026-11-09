@@ -22,7 +22,6 @@ from unittest.mock import patch
 from scripts.herdr import herdr
 from scripts.herdr import herdr_sessions
 from scripts.message import sessions, codex_daemon
-from scripts.lib import unit_runs
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.herdr.fake_herdr import CommandResponse
 from scripts.message.sessions import SessionRecord, UnreadableSessionRecord, read_session
@@ -113,10 +112,6 @@ class HerdrSessionsTests(unittest.TestCase):
         write_text_atomic(self.proc / "105/stat", "105 (fixture) S 100 105 100 1 103 " + "0 " * 14)
         write_text_atomic(self.proc / "106/stat", "106 (fixture) S 100 106 100 0 -1 " + "0 " * 14)
         write_text_atomic(self.proc / "108/stat", "108 (fixture) S 100 108 100 0 -1 " + "0 " * 14)
-        root = self.root / "runs"
-        run = root / "TEST-run"
-        run.mkdir(parents=True)
-        write_text_atomic(run / unit_runs.SERVER_FILE, "{}")
         daemon = codex_daemon.CodexDaemon(self.root / "account", self.root / "socket")
         arguments = herdr._process_arguments  # pyright: ignore[reportPrivateUsage]
 
@@ -135,19 +130,15 @@ class HerdrSessionsTests(unittest.TestCase):
 
         with (patch.object(codex_daemon, "read_daemons", return_value=[
                   codex_daemon.DaemonRead(daemon, codex_daemon.DaemonUnreadable("fixture"))]),
-              patch.object(unit_runs, "run_roots", return_value=(root,)),
-              patch.object(unit_runs, "ASTRA_RUN_ROOT", self.root / "astra"),
               patch.object(herdr, "_process_arguments", side_effect=read_arguments),
               patch.object(herdr, "native_process", side_effect=native),
               patch.object(herdr, "_process_display_name", side_effect=display),
-              patch.object(herdr.Herdr, "result", side_effect=AssertionError("no server call")),
-              patch("scripts.agents.codex_mesh.loaded_threads", side_effect=OSError("fixture"))):
+              patch.object(herdr.Herdr, "result", side_effect=AssertionError("no server call"))):
             observed = herdr.codex_conversations()
         self.assertCountEqual(observed.unknown, [
             "TEST-pane-103 (Codex thread unknown)", "TEST-pane-104 (Codex thread unknown)",
             "TEST-pane-107 (process argv unknown)",
-            f"{daemon.home} (Codex daemon unknown: fixture)",
-            "TEST-run (Codex hosted threads unknown: fixture)"])
+            f"{daemon.home} (Codex daemon unknown: fixture)"])
 
     def test_darwin_unknown_codex_requires_a_foreground_group_and_keeps_failed_reads(self) -> None:
         processes = [herdr._UserProcess(pid, 1, "codex", herdr.UnreadableProcessArguments("fixture"))  # pyright: ignore[reportPrivateUsage]
@@ -164,8 +155,6 @@ class HerdrSessionsTests(unittest.TestCase):
               patch.object(herdr, "_darwin_processes", return_value=processes),
               patch.object(herdr, "run_program", side_effect=read),
               patch.object(codex_daemon, "read_daemons", return_value=[]),
-              patch.object(unit_runs, "run_roots", return_value=()),
-              patch.object(unit_runs, "ASTRA_RUN_ROOT", self.root / "astra"),
               patch.object(herdr, "_process_display_name", side_effect=str)):
             observed = herdr.codex_conversations()
         self.assertEqual(observed.unknown, ("102 (Codex argv unknown)", "103 (Codex argv unknown)"))

@@ -25,7 +25,6 @@ from scripts.build_queue import admission_records as records
 from scripts.build_queue import progress_profile as progress
 from scripts.build_queue import queue_place
 from scripts.build_queue import step_estimator
-from scripts.lint import memory_admit
 from scripts.lib.descendants import adopt_descendants
 
 
@@ -93,7 +92,7 @@ def end_with_front(front_pid: int) -> None:
 
 def run_cargo(command: str, arguments: Sequence[str], child_path: str) -> int:
     pid = os.getpid()
-    start = memory_admit.process_start_time(pid)
+    start = records.process_start_time(pid)
     if start is None:
         raise RuntimeError("cargo admission owner has no process identity")
     argv = [command, *arguments]

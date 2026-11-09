@@ -1382,14 +1382,14 @@ The order stays: admit, `worker_state.py`, switch check, claim, `phase_reservati
 
 #### As-built
 
-`scripts/direct/claude_worker.py` holds each step of a Claude worker launch and has no `__main__`. `assign_claude._run` calls `open_worker(turn)` or `follow_up(turn, native_id)`, then `wait_for_turn(turn, delivered)`, all in the assign process. `ClaudeTurn` holds the inputs of one turn. A launch returns `Delivered(native_id, turns_before, launch_environment)`, `Unchanged` or `NotDelivered(code)`; `TurnsNotCounted` is the turn count of a new session. `scripts/agents/agent_bg.sh`, `worker_fill.py coordinate-claude`, `assign_gate.PYTHON_HOPS` and `AGENT_BG_WORKERS` do not exist.
+`scripts/direct/claude_worker.py` holds each step of a Claude worker launch and has no `__main__`. `assign_claude._run` calls `open_worker(turn)` or `follow_up(turn, native_id)`, then `wait_for_turn(turn, delivered)`, all in the assign process. `ClaudeTurn` holds the inputs of one turn. A launch returns `Delivered(native_id, turns_before, launch_environment)`, `Unchanged` or `NotDelivered(code)`; `TurnsNotCounted` is the turn count of a new session. `scripts/agents/agent_bg.sh`, `assign_gate.PYTHON_HOPS` and `AGENT_BG_WORKERS` do not exist.
 
 `worker_admission.switch_worker` keeps its `start` and `dispatch` callbacks. The account step calls `accounts.account_for_unscoped_launch`. One `nix_env.ensure` serves the settings and the start. The id comes only from the `backgrounded` line of the banner, and `_registered` waits `CLAUDE_WORKER_REGISTER_WAIT_SECS` for the full id. `agents_log.append` runs before delivery, and delivery is one child: `send.py --to session:<id> --from launcher --file <prompt>`, with `CLAUDE_WORKER_SEND_SCRIPT` as its test override. `wait_for_turn` parses `claude agents --json` and `claude logs` in process each `CLAUDE_WORKER_POLL_SECS`, which `UNIT_WORKER_POLL_SECS` overrides.
 
 `assign_claude._run` runs `_record` in `finally` around the launch, before `heartbeat_watch.sh`, and writes nothing when no session is published. A signal after the banner stops the unpublished session with `claude stop`. Exit codes: 127 no binary, 2 refused or not delivered, 1 no banner, gone with no summary or any other launch error, 143, 130 and 129 on a signal. An unreadable log gives the fallback summary. A transcript record with no message object does not count as a turn.
 
 **Files:**
-- `scripts/direct/claude_worker.py`, `scripts/direct/assign_claude.py`, `scripts/direct/assign_gate.py`, `scripts/production/worker_fill.py`, `config/direct.conf` — the launch.
+- `scripts/direct/claude_worker.py`, `scripts/direct/assign_claude.py`, `scripts/direct/assign_gate.py`, `config/direct.conf` — the launch.
 - `scripts/direct/test_claude_worker.py`, `scripts/direct/test_assign_claude.py` — moved launcher behaviors and regression tests; other launcher tests use `fixtures/background.sh` or `assign.sh` with the fixture Claude binary.
 
 **Binds later work:** the recorder and resolver children of `assign_claude._run` are the remaining launcher Python, with `send.py` (180 ms) and the `heartbeat_watch.sh` digest (24 ms each minute).
@@ -1406,16 +1406,17 @@ A Codex worker whose launcher and app-server died recovers on its recorded threa
 - `assign.py` `claim_worker` calls `codex_mesh.py reopen` for an `ended` worker, and for a worker in `ROSTER_LIVE` or `WAITING_CAPACITY` whose launcher is not attached (`codex_mesh.worker_launcher_attached`).
 - `command_reopen` accepts `WAITING_CAPACITY` and sets `dead_launcher_recovery` on the paused entry. A follow-up with that mark refuses a replacement thread when `thread/resume` fails.
 - `codex_mesh.command_end` keeps the staff row and thread id; a second `end` on an ended worker retries the cleanup. `workers.ending_worker` records the end and keeps the worker in the unit ledger.
-- Each caller that removes a worker for good retires the row itself: unit retirement (`workers.end_unit`), `remove_workers.py`, `worker.py end`, `worker_fill.end_friend` (after `command_end` returns 0; on `staff.StaffRefused` it stops the server, then returns 1) and `assign.py` `execute_astra_review` (end, release the role, then retire through `session_staff.worker_row`).
+- Unit retirement stops workers through `stop_resume.stop_unit_workers`.
+- `remove_workers.py` resolves staff membership before it calls the worker command.
+- The held `worker.py` and `assign.py` callers retain their mesh interfaces until round 2.
 - The account move tries each recorded server, the recorded port first, and uses the one that has the thread loaded. When `_server_availability` cannot prove that no server holds the thread, it refuses.
 
 **Files:**
 - `scripts/direct/assign.py` — reopen on a dead launcher; the Astra reviewer retire.
 - `scripts/agents/codex_mesh.py` — end keeps the row; the recovery mark; the account move server choice.
 - `scripts/direct/workers.py` — the unit ledger keeps ended workers.
-- `scripts/production/worker_fill.py` — the end-friend retire.
 - `docs/as-built/long-lived-workers.md`, `docs/as-built/session-roster.md` — end, reopen and retire rules.
-- `scripts/direct/test_assign_launcher_reuse.py`, `scripts/agents/test_codex_mesh.py`, `scripts/ask_a_friend/test_end_friend.py`, `scripts/direct/test_workers.py`, `scripts/astra/test_astra_review.py` — the tests.
+- `scripts/direct/test_assign_launcher_reuse.py`, `scripts/agents/test_codex_mesh.py`, `scripts/direct/test_workers.py`, `scripts/astra/test_astra_review.py` — the tests.
 
 **Binds later work:** `codex_mesh.py end` never retires a staff row; a new caller that ends a worker for good retires it after `end` exits 0.
 
@@ -1497,6 +1498,21 @@ A change review row whose Change text was edited still covers its own change, an
 **Gotchas:** a row does not record its step. With two held steps uncovered, an edited row covers nothing by its hash, and the scan adds a duplicate row rather than hide a change.
 
 **Ruled out:** pairing every `AfterStep` change in commit order — with two steps released out of order, an edited row covers the wrong step and hides the other change.
+
+## Phase 30 consumer conversion
+
+Live readers use staff membership and backend evidence.
+The board, roster and sweep use pane observations.
+Shutdown keeps Claude child commands in `ClaudeChildResume`.
+`refusal_watch.py` owns `QUOTA_REFUSAL`.
+The unused `worker_fill.py` and its test are removed.
+
+Round 2 removes the held launcher and shutdown dependencies.
+It deletes `codex_mesh.py`, allocation helpers and worker ledgers.
+It removes `PausedSeat`, transport pins and `unit_runs.worker_transport`.
+It moves sandbox constants into `worker_panes.py`.
+It renames the detached command modules, config and record folder.
+Historical readers keep completed run rosters.
 
 ### Phase 8s — A hold that names any showrunner waits  · status: done
 

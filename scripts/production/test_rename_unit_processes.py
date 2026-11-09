@@ -27,7 +27,6 @@ from scripts.lint.memory_test_support import config_environment
 from scripts.shutdown.unit_staff_test_support import PARENTS, isolated_parents
 
 SLUG = "demo"
-WATCHER = 'while kill -0 "$1"; do sleep "$5"; "$4" "$0" idle-stop --session-dir "$3" --pid "$1" --port "$2"; done'
 
 
 def setUpModule() -> None:
@@ -60,31 +59,25 @@ class RunProcessTests(StaffTestCase):
         other = self.root / "claude-demo-beta"
         mine = self.run_folder("run-a", self.unit_folder)
         theirs = self.run_folder("run-b", other)
-        lint = ["python3", "mesh_runs.py", "supervise", str(self.run_record(mine, "lint", 101))]
+        lint = ["python3", "detached_runs.py", "supervise", str(self.run_record(mine, "lint", 101))]
         _ = self.run_record(mine, "test", 104)
         self.processes = {
             # The unit's detached lint run: the supervisor leads its session, verify.sh and tee are in it.
             101: FakeProcess(self.unit_folder, 101, lint),
             102: FakeProcess(self.unit_folder, 101, ["bash", "verify.sh", "lint", "pkg"]),
             103: FakeProcess(self.unit_folder, 101, ["tee", "-a", "run.log"]),
-            # The idle-stop watcher of the run's stopped app-server, and its sleep.
-            201: FakeProcess(self.unit_folder, 201, self.watcher(mine)),
-            202: FakeProcess(self.unit_folder, 201, ["sleep", "300"]),
-            # A record whose pid now names another process; another unit's watcher; the user's shell.
             104: FakeProcess(self.unit_folder, 104, ["cargo", "build"]),
-            203: FakeProcess(self.unit_folder, 203, self.watcher(theirs)),
             900: FakeProcess(self.unit_folder, 900, ["zsh"]),
             # Another unit's detached run, in its own worktree.
-            301: FakeProcess(other, 301, ["python3", "mesh_runs.py", "supervise",
+            301: FakeProcess(other, 301, ["python3", "detached_runs.py", "supervise",
                                           str(self.run_record(theirs, "lint", 301))]),
             302: FakeProcess(other, 301, ["bash", "verify.sh", "lint", "pkg"]),
         }
-        self.enterContext(mock.patch.dict(os.environ, {"RETIRE_UNIT_RUN_ROOT": str(self.root / "runs"),
-            "UNIT_WORKERS_STATE": str(self.root / "unit-workers")}))
+        self.enterContext(mock.patch.dict(os.environ, {"RETIRE_UNIT_RUN_ROOT": str(self.root / "runs")}))
         _ = self.enterContext(mock.patch.object(unit_move, "processes_inside", self.inside))
         _ = self.enterContext(mock.patch.object(shutdown, "retirement_command_line", self.arguments))
-        from scripts.agents import mesh_run_process
-        _ = self.enterContext(mock.patch.object(mesh_run_process, "process_args", self.arguments))
+        from scripts.agents import detached_run_process
+        _ = self.enterContext(mock.patch.object(detached_run_process, "process_args", self.arguments))
         _ = self.enterContext(mock.patch.object(os, "getsid", self.session))
         _ = self.enterContext(mock.patch.object(os, "kill", self.kill))
         _ = self.enterContext(mock.patch.object(unit_lookup, "labeled_session", return_value=None))
@@ -105,17 +98,11 @@ class RunProcessTests(StaffTestCase):
         parent = worker_admission.parent(staff.local_snapshot(), run=folder)
         member = fixture_worker(folder.name + "-" + label, parent.id, backend=staff.CodexBackend(self.root / "codex"))
         _ = path.write_text(json.dumps({"status": "running", "pid": pid, "label": label, "staff_id": member.id}))
-        roster = folder / "mesh_roster.json"
-        entries = cast(dict[str, object], json.loads(roster.read_text())) if roster.exists() else {}
-        entries[member.name] = {"staff_id": member.id, "status": "done"}
-        _ = roster.write_text(json.dumps(entries))
         return path
 
-    def watcher(self, folder: Path) -> list[str]:
-        return ["sh", "-c", WATCHER, str(shutdown.MESH.resolve()), "900", "51101", str(folder.resolve()),
-                "python3", "300"]
 
-    def no_units(self, _production_name: str) -> dict[str, object]:
+    def no_units(self, production_name: str) -> dict[str, object]:
+        del production_name
         return {}
 
     def inside(self, worktree: Path) -> list[int]:
@@ -147,40 +134,8 @@ class RunProcessTests(StaffTestCase):
         self.assertTrue(settings)
         self.assertTrue(all(value is settings[0] for value in settings))
 
-    def test_dead_server_watchers_and_their_children_need_no_matching_run_folder(self) -> None:
-        for folder in (self.root / "runs/run-b", self.root / "elsewhere/run-a", self.root / "gone"):
-            for shell in ("sh", "/bin/sh"):
-                with self.subTest(folder=folder, shell=shell):
-                    arguments = self.watcher(folder)
-                    arguments[0], arguments[4] = shell, "555"
-                    self.processes[203] = FakeProcess(self.unit_folder, 203, arguments)
-                    self.processes[204] = FakeProcess(self.unit_folder, 203, ["sleep", "300"])
-                    found = shutdown.retirement_run_processes(self.unit_folder, [203, 204])
-                    self.assertEqual(set(found), {203, 204})
-                    for name in found.values():
-                        self.assertIn("app-server watcher 203 of dead server 555", name)
-        self.assertEqual(self.signalled, [])
 
-    def test_a_live_servers_watcher_still_needs_matching_run_history(self) -> None:
-        cases: tuple[tuple[Path, set[int]], ...] = (
-            (self.root / "runs/run-a", {203}), (self.root / "runs/run-b", set()),
-            (self.root / "elsewhere/run-a", set()), (self.root / "gone", set()))
-        for folder, expected in cases:
-            with self.subTest(folder=folder):
-                self.processes[203] = FakeProcess(self.unit_folder, 203, self.watcher(folder))
-                self.assertEqual(set(shutdown.retirement_run_processes(self.unit_folder, [203])), expected)
-        self.assertEqual(self.signalled, [])
 
-    def test_dead_server_watcher_requires_the_mesh_entry_point_and_valid_server_pid(self) -> None:
-        for index, value in ((0, "bash"), (1, "-x"), (2, "echo idle"),
-                             (3, str(self.root / "codex_mesh.py")), (4, "bad"), (4, "0"), (4, "-1")):
-            with self.subTest(index=index, value=value):
-                arguments = self.watcher(self.root / "gone")
-                arguments[4] = "555"
-                arguments[index] = value
-                self.processes[203] = FakeProcess(self.unit_folder, 203, arguments)
-                self.assertEqual(shutdown.retirement_run_processes(self.unit_folder, [203]), {})
-        self.assertEqual(self.signalled, [])
 
 
 class RunRecordLookupTests(StaffTestCase):
