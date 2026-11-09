@@ -285,6 +285,7 @@ under that directory. This avoids half-applied durable-state writes.
 
 - Run pane assignments in the foreground. They return after submission.
 - Run `verify.sh final` through its detached verification path.
+- Each folder or file you make on another machine (the Mac) needs automatic removal. Use a `with` block or a `scratch.py` task with an end. Never use a fixed path such as `~/.cache`.
 - Saved run output (traces, captures, logs) stays under a few GB: read each run
   and delete it before the next. A disk-floor sweeper keeps 300 GiB free on `/`
   by deleting only the shortfall, least recently used build output first, never

@@ -25,7 +25,7 @@ from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.test_models_registry import write_registry
 from scripts.production import fake_unit_host, staff, test_worker as worker_fixture, worker, worker_admission
 from scripts.production.cli_fixture import invoke_cli
-from scripts.production.staff_test_support import fixture_session, fixture_runtime_id, fixture_worker, transcript_fixture
+from scripts.production.staff_test_support import fixture_session, fixture_runtime_id, fixture_worker, foreign_hostname, transcript_fixture
 from scripts.message import send, sessions
 from scripts.shutdown import stop_resume
 from scripts.usage import agents_log
@@ -171,7 +171,9 @@ class FailedLaunchRunTests(HookAssignmentFixture):
         replies = read_object(responses)
         replies["--session agents pane list"] = {"code": 0, "stdout": '{"result": {"panes": []}}'}
         _ = responses.write_text(json.dumps(replies))
-        _ = cast(object, self.enterContext(patch.dict(os.environ, cleanup_environment)))
+        _ = cast(object, self.enterContext(patch.dict(os.environ, {**cleanup_environment, "GATE_TEST_HOST": "natedev"})))
+        # The cleanup children read the real hostname, and the fixture rows name natedev.
+        _ = self.enterContext(foreign_hostname())
 
         def fail_after_pane_exit() -> None:
             pane = self.native.agent.submitted[-1][0]

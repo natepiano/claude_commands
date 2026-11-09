@@ -822,7 +822,7 @@ A read-only report. It went to the sdlc showrunner on 2026-11-09, grouped by pro
 
 **Ruled out:** a scan or sweep for old marks (the user allows no added check); signal handlers (`TMPDIR` is cleared at reboot).
 
-### Phase 33b — A worker's folders go when its assignment ends  · status: todo
+### Phase 33b — A worker's folders go when its assignment ends  · status: done
 
 **Depends on:** Phase 33, and the panes unit's close-at-once phase (the worker close at DONE) merged into sdlc.
 
