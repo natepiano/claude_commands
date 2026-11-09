@@ -2,6 +2,7 @@
 """Tests for scratch.py: folders that belong to a task and go when it ends."""
 from __future__ import annotations
 
+import errno
 import json
 import fcntl
 import os
@@ -1025,6 +1026,14 @@ print(scratch.target('gate:proof', 'tree', False))
         self.assertRegex(path.name, r"^run-2a858b68-0f9a-4af2-b3cf-a776e6b180cb-gate-[a-z0-9]{6}$")
         record = cast(dict[str, object], json.loads((path / copy_record.RECORD).read_text()))
         self.assertEqual((record["task"], record["maker"]), (RUN, MAKER_ID))
+
+    def test_a_failed_record_write_removes_the_folder_new_made(self) -> None:
+        with (
+            mock.patch.object(scratch, "write_record", side_effect=OSError(errno.ENOSPC, "no space")),
+            self.assertRaises(OSError),
+        ):
+            _ = scratch.new(RUN, "gate")
+        self.assertEqual(list((self.base / "scratch").iterdir()), [])
 
     def test_a_visible_repro_goes_where_cargo_port_lists_it(self) -> None:
         self.assertEqual(scratch.new(ROW, "demo", visible=True), self.base / "repro" / "cargo-liner-C54-demo")
