@@ -2246,41 +2246,67 @@ A changed `config/<name>.conf` selects every test module whose transitive import
 
 
 ### Phase 113 — A private admission server costs less to start and to keep running  · status: done
-**Depends on:** none
 
-#### Work Order
+#### As-built
 
-**Source:** the showrunner, 2026-11-09: "Add-on 1: next (measure shared setup across a whole gate before you pick the slow-module phase)", and "Phase 113 (shared admission setup and process scans) is yours: go." The user: "our goal is dramatically reduced cpu time".
-
-**Why:** the private admission server runs in 179 modules. Whole-gate measurement on natedev at low load, 739 modules: setup 28.0 CPU s, loop 25.9 CPU s, cleanup 3.1 CPU s. Two parts of that are waste. First, `AdmissionServer._source_stamps` resolves every loaded module path at each fixture start: 7 of 13 ms per fixture, because a test process makes many servers and each one resolves the same paths. Second, the loop polls at 10 ms: 4.55 ms of CPU per idle second, against 1.60 at 50 ms. A test thread that needs a turn waits for the poll to end, a median 7 ms now. A longer poll needs a wake so that the test thread does not wait longer.
-
-The process scans stay as they are. 77% of a scan is the kernel reading each process's environment, a cost set by the process count on the host: a rewrite with `os` calls saves 23%, and a cloud box runs fewer processes than natedev's 999.
-
-**Goal:** the fixture resolves the module paths once per process, and the private loop wakes for a test thread or a stop in place of a 10 ms poll.
-
-**Spec:**
-All changes are in `scripts/build_queue/admission_test_support.py`.
-1. Add the named value `SERVING_POLL_SECONDS = 0.05`. `serve()` calls `self.server.run_once(SERVING_POLL_SECONDS)`.
-2. Override `_source_stamps` in `ObservedAdmissionServer`. Keep one class-level record: the `len(sys.modules)` it was computed at and the set of paths from `super()._source_stamps()`. When the count is unchanged, return a new stamp for each kept path with `self._stamp(path)`. When the count changed, call `super()._source_stamps()`, keep its paths and return its result.
-3. `serve()` sets `self.loop_permission.serves_loop = True` as its first statement. A thread that has this mark is the loop thread.
-4. Add a plain `threading.Lock` called `self.turn_gate`. In `loop_turn()`, a call at depth 0 takes `turn_gate`, then `loop_access`, then releases `turn_gate`. A call at depth above 0 does not take `turn_gate`, because its thread already holds `loop_access`. Keep the `TEST_HANG_GUARD_SECS` timeout and the existing message form on both acquires.
-5. `ObservedAdmissionServer` owns the wake. It sets `self.wake_lock`, a `threading.Lock`, before `super().__init__`. It overrides `close` to run `super().close()` while it holds `wake_lock`. Its `wake_loop` method holds `wake_lock` and calls `os.eventfd_write(self.priority_events, 1)` when `self.closed` is false. A wake then cannot write a descriptor that a restart closed. While it holds `turn_gate`, a depth-0 caller that does not have the `serves_loop` mark calls `self.server.wake_loop()` when serving is active. The loop thread then ends its poll and releases `loop_access`, and the waiter takes it. The loop waits on `turn_gate` while a waiter holds it. This order closes the race where a wake lands before the waiter blocks.
-6. In the `finally` of `serving()`, after `stopped.set()`, call `self.server.wake_loop()`. A stop then does not wait for the poll.
-7. Change no production file. Add no check. Do not change a test assertion.
+- `ObservedAdmissionServer` in `scripts/build_queue/admission_test_support.py` keeps one class-level record of source paths, keyed by the count of `sys.modules`. A fixture start with an unchanged count stamps the kept paths and resolves none.
+- `SERVING_POLL_SECONDS` is 0.05. `serve()` marks its thread with `serves_loop`, and `serving()` wakes the loop at stop through `wake_loop`.
+- `loop_turn` takes `turn_gate` at depth 0, wakes the loop when the caller is not the loop thread, then takes `loop_access`. A nested call skips `turn_gate`.
+- `wake_loop` and `close` both hold `wake_lock`, so a wake cannot write a descriptor that a restart closed.
+- Same-load measurement, three rounds: setup plus close 13.4-13.7 ms to 6.0-6.3 ms, idle loop 1.8-3.3 ms/s to 1.1-1.7 ms/s, median turn wait 7.04 ms to 0.02-0.03 ms. Gate estimate: about 27 of 3,056 CPU s.
 
 **Files:**
 - `scripts/build_queue/admission_test_support.py` — the poll value, the path record, the turn gate and the wakes
 
-**Workers:** 1 writer; the work is one file
-- `impl` — the file above
+**Gotchas:**
+- Shared fixtures are a small part of a gate. Python child processes are 57% of gate CPU, and the helper chain per `verify.sh` call is about 18%.
+
+**Ruled out:**
+- Rewriting the process scans with `os` calls: it saves 23%, because the kernel read of each process environment is 77% of a scan.
+
+### Phase 114 — A test that starts Python for one function stops loading what the function does not use  · status: done
+
+**Depends on:** none
+
+#### Work Order
+
+**Source:** next-items item 6a, amended by the architect review of Phases 111-113: "Attribute the measured 268 CPU s of fixture and stub `python -c` calls to their callers." The user, 2026-11-09: "our goal is dramatically reduced cpu time".
+
+**Why:** a whole gate starts 8,775 `python -c` children for 268 CPU s. Most cost 31 ms or less. Seven modules hold the expensive ones, where each child imports a heavy test module to call one function: `buildlog/test_index` 23.4 CPU s over 40 starts, `mac_test/test_linux_runner` 16.1 over 197, `style/test_standing_checkpoint` 14.0 over 46, `buildlog/test_report` 7.8 over 7, `statusline/test_statusline` 7.2 over 20, `buildlog/test_memory_window` 5.0 over 23, `direct/test_claude_worker` 4.9 over 39, and `buildlog/test_mac_report` 4.5 over 6. This is about 83 of the gate's 3,056 CPU s, and a cloud gate pays 1.62 times that.
+
+**Goal:** the eight modules keep every assertion, and their `python -c` children use at least half the CPU they used at the phase base.
+
+**Spec:**
+1. Record the baseline at the phase base with `python3 scripts/test_times/module_cost.py --tree <tree> --commands 30 <folder>/<file>` for each module. Name the command that starts each costly child, and its CPU per start.
+2. `scripts/buildlog/test_index.py`, `test_each_module_uses_a_temporary_log`: start one `lib/py -c` parent. The parent imports `store`, a short list of shared standard-library modules and every non-test module of `scripts/buildlog`, and no module that writes `os.environ` at import. The parent then forks one child per test module. Each child imports its one module and prints `store.root()`. No child inherits the import of another test module, and the test still fails for a module that does not set a temporary log.
+3. `scripts/style/style_child_test_support.py`, `style_cli_command`: leave this site unchanged and report the floor under item 9. Same-load probes show no gain from a smaller bootstrap, because the fake must import `queue_place` to patch it: 206-249 ms per start against 225-247 ms.
+4. `scripts/buildlog/test_report.py`, `probe_cli` and `measure_cli_work`: move `probe_cli` to a new `scripts/buildlog/cli_probe_test_support.py` that imports no test module. Update the bootstrap and `scripts/buildlog/test_mac_report.py`. Keep the instruction-limit measurement unchanged.
+5. `scripts/buildlog/test_memory_window.py`, `configured_host_cli`: the bootstrap imports only what the fixed host name needs.
+6. `scripts/mac_test/test_linux_runner.py`: find what starts the 197 children. Where the child repeats one fixed answer that one test already proves through the real command, give the other tests the fixture's existing fake child, a private `python3` stub on their fixture `PATH`, or one process for the cases. Keep one real run of each generated script.
+7. `scripts/statusline/test_statusline.py` and `scripts/direct/test_claude_worker.py` (`OPEN_WORKER`): find what each child imports. Remove imports that the called function does not need, or run the cases in one child.
+8. A child process stays wherever the test proves something that needs a real process: a new environment, a fresh import, an exit status or a signal.
+9. Where a child needs all that it imports, leave the site and report the measured floor and its largest import.
+10. Change no production file. Add no check. Change no assertion. Keep each test's name and count.
+
+**Files:**
+- `scripts/buildlog/test_index.py`
+- `scripts/buildlog/test_report.py`
+- `scripts/buildlog/test_mac_report.py`
+- `scripts/buildlog/cli_probe_test_support.py` — new
+- `scripts/buildlog/test_memory_window.py`
+- `scripts/mac_test/test_linux_runner.py`
+- `scripts/statusline/test_statusline.py`
+- `scripts/direct/test_claude_worker.py`
+
+**Workers:** 1 writer; each site is small and one writer holds the measurements
+- `impl` — all the files above
 
 **Constraints from prior phases:**
-- Tests never read or write live state: `~/.claude` main, `~/.local/state/merge-gate`, `/tmp/claude`.
-- `build_hold.py` stays frozen.
-- The owner of this file was told before the edit, under the user's rule on test code.
+- Tests never read or write live state. `build_hold.py` stays frozen.
+- Each owner was told before the edit, under the user's rule on test code.
 
 **Acceptance gate:**
-- `scripts/build_queue/test_admission_service*.py` and the other modules that use `serving()` or `caller_admission` pass. The targeted test selects them.
-- `basedpyright` on the changed file prints `0 errors, 0 warnings, 0 notes`.
-- The targeted test is green on the phase commit merged with `origin/builds`.
-- The director measures on one tree, at one load, before and after: fixture setup plus cleanup falls from 13.3 ms; idle loop CPU falls from 4.55 ms per second; a test thread's median wait for a turn while serving falls from 7 ms.
+- Each changed module passes with its previous test count.
+- Same-load pairs against the phase base show at least half the `python -c` CPU summed over the eight modules, or a stated floor for each site that cannot reach it.
+- The targeted test passes on the merged tree.
+- `basedpyright` reports `0 errors, 0 warnings, 0 notes` on the changed files.
