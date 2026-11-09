@@ -2064,39 +2064,57 @@ A changed `config/<name>.conf` selects every test module whose transitive import
 - `invoke_cli` ignores the `timeout` argument of the routed `phase_table.py` calls.
 - Fewer child starts save more CPU with no bytecode writes than with a warm cache. State the bytecode condition with each measurement.
 
-### Phase 104 — The AWS box tests use half their CPU  · status: todo
+### Phase 104 — The AWS box tests use half their CPU  · status: done
+
+#### As-built
+
+- `test_box.py` runs the fake aws and ssh tools in process. setUp replaces `aws_target.subprocess` with a namespace whose `run` is `run_tool`, except for cases marked `@process_boundary`.
+- `run_tool` resolves the tool with `shutil.which`. A tool in the test's own `bin` folder runs the compiled fake source (`FAKE_CODE`) through `invoke_cli`; any other tool runs through the real `subprocess.run`. It sets `result.args` and calls `check_returncode` when `check` is set.
+- `@process_boundary` keeps a real process for stdin and exit-status cases, such as the SSM stdin key test and the refusal stderr test.
+- All 61 test bodies and 337 assertions are kept. 46 moved cases fail when the production function under test is broken. `test_deploy.py` passes.
+- CPU in worker pairs on tmpfs with no bytecode writes: 136.1 -> 9.2 s pair median (93.2% less); 98.4 -> 8.7 s sequential; processes 1296 -> 150; execs 1297 -> 151. Pairs on `/tmp` with a warm bytecode cache: 24.3 -> 3.2 s CPU (86.8% less), 24.5 -> 3.4 s wall.
+
+**Files:**
+- `scripts/aws_target/test_box.py` — box command tests; fake tools run in process
+
+**Gotchas:**
+- `invoke_cli` restores signal handlers and changes the process cwd, environment and streams. Call it only for sequential calls on the main thread.
+
+### Phase 105 — The change page tests use half their CPU  · status: todo
 **Depends on:** none
 
 #### Work Order
 
-**Source:** next items, items 2 and 6a. On 2026-11-09 04:40 EST (`show.py top`), `aws_target/test_box.py` is the top eligible module: 43.3 CPU s per gate, 61 tests. The profile on a copy of `ab2db04d7` (`module_cost.py --tests 10 --commands 10`) measured 37.7 CPU s, 1296 processes and 41.8 wall s. The supervisor holds 1.9 CPU s. Almost all other CPU is in the fake tools: each test writes a Python shim for `aws`, `ssh`, `git`, `nix`, `tailscale`, `systemctl`, `bash`, `rustc`, `cargo`, `cargo-nextest` and `cargo-mend` into its own `bin` folder, and each call starts a new interpreter (for example 73, 68 and 67 `aws` starts in single tests, about 20 ms of CPU each).
+**Source:** next items, items 2 and 6a. On 2026-11-09 05:26 EST (`show.py top`), `review_links/test_change_page.py` is the top eligible module: 41.4 CPU s per gate, 139 tests. `style/test_bulk_run.py` ranks first at 41.9, but its profile measured 22.5 CPU s, below the 30 CPU s stop line. The profile on a copy of `f04341475` (`module_cost.py --tests 10 --commands 10`) measured 30.7 CPU s, 3040 processes and 33.6 wall s for the change page module. The removable fixture cost is in child Python starts: `change_review.py` 61 starts and 13.3 CPU s, `change_page.py` 13 starts and 8.0 CPU s, `feature_log.py` 88 starts and 4.0 CPU s, `git` 2877 starts and 1.8 CPU s. The slowest tests are the two answer-question tests (2.5 CPU s each).
 
-**Goal:** `scripts/aws_target/test_box.py` uses half its current CPU, or a measured floor shows why it cannot, with every checked behavior kept.
+**Goal:** `scripts/review_links/test_change_page.py` uses half its current CPU, or a measured floor shows why it cannot, with every checked behavior kept.
 
 **Spec:**
-1. Follow the Speed method. Measure CPU with `module_cost.py --tests 10 --commands 10` first. Name each test's CPU, and each fake tool start per test.
-2. Start with the slowest tests in the profile: `test_up_records_all_box_stages_and_resumes_after_configuration_failure` (4.5 CPU s), `test_checks_compare_plain_environment_versions_without_another_repository` (3.6) and `test_stopped_setup_rechecks_changed_system_and_local_versions` (2.7).
-3. Cut the cost of the fake tool starts. Options, in order: run the fake in process where `box.py` reaches the tool through a replaceable runner (for example `aws_target.py`'s run function), and keep a real process for each behavior that only a process proves (the `box.py` `Popen` path with stdin, an exit code, an environment the tool reads); make each shim start cheaper (fewer imports, `-S`/`-I`); share one `bin` folder for the module.
-4. `scripts/aws_target/test_deploy.py` imports `FAKE`, `SYSTEM`, `FakeMonotonicClock`, `FakeTailnet` and `write_aws_claim` from this module. It stays green, and its fake keeps the same behavior.
-5. Write a behavior map with a row for each assertion before you change a test. For each check that moves in process, show on a tempdir copy that breaking the function under test fails the new test.
-6. Do not change `scripts/aws_target/box.py`, `aws_target.py` or other production files. aws-unit owns them. If only a production change can cut a cost, write the floor and send the director an architecture proposal with its measured gain.
+1. Follow the Speed method. Measure CPU with `module_cost.py --tests 10 --commands 10` first. Name each test's CPU, and each real process that it starts.
+2. Find what starts each `change_review.py` process: `change_page.py` production code or the test. Run it in process through `scripts/production/cli_fixture.py` `invoke_cli` where the test does not assert on the process boundary, as Phase 103 did for `phase_table.py` with a `subprocess.run` side effect that routes only that command.
+3. Run the test's own `change_page.py` and `feature_log.py` command calls in process through `invoke_cli`. Keep a real process for each behavior that only a process proves: an interrupt between steps, an exit code across a process, any cwd or environment that the entry reads at start.
+4. Share expensive setup: build a seed Git repository once and copy it for each test, where tests make the same repository.
+5. Write a behavior map with a row for each assertion before you change a test. Group rows by test class and helper where the assertions are the same.
+6. Do not change `scripts/review_links/change_page.py`, `scripts/production/change_review.py`, `scripts/feature_log/feature_log.py` or other production files. sdlc owns them. If only a production change can cut a cost, write the floor and send the director an architecture proposal with its measured gain.
 7. Add no guard, refusal or check (user rule, 2026-11-05).
 
 **Files:**
-- `scripts/aws_target/test_box.py`
+- `scripts/review_links/test_change_page.py`
 
 **Workers:** 1 writer; one test file
-- `impl` — `test_box.py`
+- `impl` — `test_change_page.py`
 
 **Constraints from prior phases:**
-- Phase 97 and Phase 100: an in-process call of a real entry cut CPU and kept the code path. Tests that assert on a process boundary kept a real process.
-- Phase 103 is done. A process start costs more with no bytecode writes, so start cuts gain more there: 57.6% less CPU in worker pairs with no bytecode writes, 31% less in director pairs on `/tmp` with a warm bytecode cache. The notice reports both conditions.
+- Phase 89, Phase 97, Phase 100 and Phase 103: an in-process call of a real entry through `invoke_cli` cut CPU and kept the code path. Tests that assert on a process boundary kept a real process.
+- Phase 103: a process start costs more with no bytecode writes, so start cuts gain more there. Report pairs with no bytecode writes and on `/tmp` with a warm bytecode cache.
+- Phase 104 is complete: the fake aws and ssh tools of `scripts/aws_target/test_box.py` run in process through `invoke_cli`. Keep its files and `scripts/production/cli_fixture.py` outside this phase's edits.
+- `invoke_cli` restores signal handlers (`cli_fixture.py:133`), and Python allows that only on the main thread. It also changes the process cwd, environment and streams. `serve.py` answers HTTP verdict calls on worker threads (`ThreadingHTTPServer`). Call `invoke_cli` only for sequential calls on the main thread, and keep a real process for each call made from an HTTP worker thread or beside another request. A change to the shared helper goes to the director as a proposal.
 - Tests never read or write live state: `~/.claude` main, `~/.local/state/merge-gate`, `/tmp/claude`. State the filesystem basis of each pair.
 
 **Acceptance gate:**
 - The behavior map has a row for each assertion. No assertion is removed.
 - CPU s, processes, execs and wall s before and after, from `module_cost.py` and same-load pairs, in the checkpoint notice.
-- The changed file and `test_deploy.py` pass.
+- The changed file passes, and every module that imports a changed helper passes.
 - the targeted test green on the phase commit merged with `origin/builds`
 - `basedpyright` on the changed files prints `0 errors, 0 warnings, 0 notes`
 - Floors: a floor claim adds a row to the next-items Floors table with its revision, roots, cache state, limiting operation, owner and revisit condition.

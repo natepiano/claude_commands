@@ -152,6 +152,7 @@ class StopResumeTests(unittest.TestCase):
                 ("other-pane", "terminal", herdr.PaneAtShell(), herdr.StoppedConversation(), False),
                 ("pane", "other-terminal", herdr.PaneAtShell(), herdr.StoppedConversation(), False),
                 ("pane", "terminal", herdr.PaneRunning(("busy",)), herdr.StoppedConversation(), False),
+                ("pane", "terminal", herdr.PaneRunning(("codex", "python")), herdr.StoppedConversation(), False),
                 ("pane", "terminal", herdr.PaneAtShell(), herdr.LiveConversation("claude", (123,)), False)):
             with (self.subTest(pane=pane, terminal=terminal, activity=activity),
                   patch.object(staff, "initial_snapshot", return_value=staff.StaffSnapshot((row,))),
@@ -164,6 +165,11 @@ class StopResumeTests(unittest.TestCase):
                   patch.object(stop_resume, "_stop", return_value=stop_resume.Stopped("native-worker", 123))):
                 result = stop_resume.stop(row.id)
                 self.assertEqual(isinstance(result, stop_resume.Stopped), success)
+                if isinstance(activity, herdr.PaneRunning):
+                    self.assertIsInstance(result, stop_resume.StopFailed)
+                    assert isinstance(result, stop_resume.StopFailed)
+                    self.assertIn("pane pane", result.reason)
+                    self.assertIn(f"foreground processes: {', '.join(activity.commands)}", result.reason)
 
     def test_worker_stop_rejects_an_unreadable_retained_pane(self) -> None:
         row = staff.StaffRow(staff.StaffId("fixed-worker"), "worker", "impl", staff.ReportsTo(staff.StaffId("holder")),
