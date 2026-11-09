@@ -43,6 +43,7 @@ from scripts.lint.test_memory_admit import HISTORY_APPEND_STOPS, stop_history_ap
 from scripts.lint.memory_test_support import config_environment, write_config_fixture
 from scripts.buildlog.step_outputs_test_support import create_step_index, record_root_attempt
 from scripts.buildlog import index as build_index
+from scripts.buildlog import repository
 from scripts.lib import test_hang_guard
 if TYPE_CHECKING:
     from scripts.copies import copies
@@ -7212,10 +7213,10 @@ class RepoNameTests(unittest.TestCase):
         git("add", "-A", cwd=repo)
         git("commit", "-q", "-m", "first", cwd=repo)
         git("worktree", "add", "-q", "-b", "trunk", str(base / "tool-based-ui-trunk"), cwd=repo)
-        self.assertEqual(sweep.repo_name(str(repo)), "hana")
-        self.assertEqual(sweep.repo_name(str(repo / "crates")), "hana")
-        self.assertEqual(sweep.repo_name(str(base / "tool-based-ui-trunk")), "hana")
-        self.assertIsNone(sweep.repo_name(str(base)))
+        self.assertEqual(repository.repo_name(str(repo)), "hana")
+        self.assertEqual(repository.repo_name(str(repo / "crates")), "hana")
+        self.assertEqual(repository.repo_name(str(base / "tool-based-ui-trunk")), "hana")
+        self.assertIsNone(repository.repo_name(str(base)))
 
     def test_a_shared_clone_names_the_repo_it_borrows_objects_from(self) -> None:
         base = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
@@ -7227,10 +7228,10 @@ class RepoNameTests(unittest.TestCase):
         git("commit", "-q", "-m", "first", cwd=repo)
         git("clone", "-q", "--shared", str(repo), str(base / "land60"), cwd=base)
         git("clone", "-q", "--shared", str(base / "land60"), str(base / "mergeclone"), cwd=base)
-        self.assertEqual(sweep.repo_name(str(base / "land60")), "hana")
-        self.assertEqual(sweep.repo_name(str(base / "mergeclone")), "hana")
+        self.assertEqual(repository.repo_name(str(base / "land60")), "hana")
+        self.assertEqual(repository.repo_name(str(base / "mergeclone")), "hana")
         git("clone", "-q", str(base / "mergeclone"), str(base / "clone88ci"), cwd=base)
-        self.assertEqual(sweep.repo_name(str(base / "clone88ci")), "hana")
+        self.assertEqual(repository.repo_name(str(base / "clone88ci")), "hana")
 
 
 if __name__ == "__main__":

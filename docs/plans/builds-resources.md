@@ -2170,15 +2170,15 @@ Median CPU over 50 starts on the real entry, Mac state folder present: `eligible
 
 **Ruled out:** a shared cache of `mac_test.conf`, because it saves 0.8 ms.
 
-### Phase 98 — A build target start loads no sweep, copy or Mac test code it does not use  · status: todo
+### Phase 98 — A build target start loads no sweep, copy or Mac test code it does not use  · status: done
 
-**Depends on:** verify's Phase 42c on `builds` (verify tells resources when it lands), and Phase 97. Merge `origin/builds` first.
+**Depends on:** Phase 97. The builds showrunner ordered the start before verify's Phase 42c lands on `builds`. The blind review ran before the merge. Merge `origin/builds` when builds says that 42c landed, port its `transfers` field, read the port closed, and then run the checkpoint.
 
 **Approved:** builds showrunner, 2026-11-09 ("agree the change with its owner first"). verify-unit, 2026-11-09: "agree to all three rows, and you write them after 42c lands."
 
 #### Work Order
 
-**Goal:** `eligible` and `release-wait` with Mac state present load no `sweep`, `copies` or whole `mac_test` module.
+**Goal:** `eligible` with the Mac state present loads no `sweep` or `copies` module. `release-wait` with the Mac state present loads no `copies` or whole `mac_test` module.
 
 **Measured:** Phase 97's profile, as upper bounds that overlap: the `sweep` import 32 ms on `eligible`, the `copies` import 24 ms on `eligible` and 27 ms on `release-wait`, and the `mac_test` import 62 ms on `release-wait`.
 
@@ -2200,8 +2200,11 @@ Median CPU over 50 starts on the real entry, Mac state folder present: `eligible
 - `scripts/copies/copies.py`
 - `scripts/lib/copy_record.py`
 - `scripts/mac_test/mac_test.py`
+- `scripts/mac_test/claim_state.py`
 - `scripts/build_targets/build_targets.py`
 - `scripts/build_targets/test_build_targets.py`
+- `scripts/lint/test_sweep.py`
+- `scripts/mac_test/test_mac_test.py`
 
 **Workers:** `1 writer + 1 tester`
 - `impl` owns the production files.

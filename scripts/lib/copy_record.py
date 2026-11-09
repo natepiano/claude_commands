@@ -84,3 +84,21 @@ def read_record(path: Path) -> Registered | NotRegistered | UnreadableRecord:
     if not isinstance(task, str) or not TASK.fullmatch(task):
         return UnreadableRecord(f"repair record {path}: invalid task")
     return Registered(task, fields)
+
+
+@dataclass(frozen=True)
+class AllRepositories:
+    """Remove copies from every repository."""
+
+
+@dataclass(frozen=True)
+class SelectedRepository:
+    """Remove copies from one repository identity."""
+
+    name: str
+
+
+RepositoryScope = AllRepositories | SelectedRepository
+
+
+ALL_REPOSITORIES = AllRepositories()
