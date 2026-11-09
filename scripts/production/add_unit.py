@@ -271,6 +271,13 @@ def git(production: Production, *args: str, check: bool = True) -> subprocess.Co
                           capture_output=True, check=check)
 
 
+def require_merge_branch(production: Production) -> None:
+    """Require the parent checkout on its merge branch before any change."""
+    branch = git(production, "branch", "--show-current").stdout.strip()
+    if branch != production.merge_branch:
+        raise Refusal(f"Showrunner checkout is not on {production.merge_branch}")
+
+
 def relative_plan(production: Production, raw: str) -> Path:
     path = Path(raw).expanduser()
     resolved = (path if path.is_absolute() else production.checkout / path).resolve()
@@ -488,9 +495,7 @@ def preflight(request: RequestedUnitLaunch, selected: ClaudeLaunchAccount, *,
     member = checked_unit_member(production, request.unit, record,
                                  identity=(session_staff.LiveSession(request.session.session_id)
                                            if isinstance(request.session, ResumedSession) else session_staff.NO_SESSION))
-    branch = git(production, "branch", "--show-current").stdout.strip()
-    if branch != production.merge_branch:
-        raise Refusal(f"Showrunner checkout is not on {production.merge_branch}")
+    require_merge_branch(production)
     try:
         _ = production.doc.relative_to(production.checkout)
     except ValueError as error:

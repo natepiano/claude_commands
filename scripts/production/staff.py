@@ -1429,24 +1429,54 @@ def update_current_session(old_session: StaffId, new_session: StaffId) -> StaffR
         return _transaction(edit)
 
 
-def promote_unit(identity: StaffId, *, name: str, parent: StaffId, doc: LiveDoc) -> StaffRow:
-    """The same native session changes role without acquiring another identity."""
+@dataclass(frozen=True)
+class ShowrunnerRole:
+    name: str
+    parent: StaffId
+    doc: LiveDoc
+
+
+@dataclass(frozen=True)
+class UnitRole:
+    name: str
+    parent: StaffId
+    worktree: PresentWorktree
+
+
+def change_director(identity: StaffId, destination: ShowrunnerRole | UnitRole) -> StaffRow:
+    """Change a director's role and preserve its identity and workers."""
+    promoting = isinstance(destination, ShowrunnerRole)
+    location = destination.doc if isinstance(destination, ShowrunnerRole) else destination.worktree
     if not is_owner():
-        return _remote_row(["promote-unit", identity, "--name", name, "--parent", parent,
-                            "--machine", doc.machine, "--path", str(doc.path)])
+        return _remote_row(["promote-unit" if promoting else "demote-showrunner", identity,
+                            "--name", destination.name, "--parent", destination.parent,
+                            "--machine", location.machine, "--path", str(location.path)])
     def edit(rows: list[StaffRow]) -> StaffRow:
         row = _required(rows, identity)
-        if row.kind == "showrunner":
-            if (row.name, row.parent, row.doc) != (name, ReportsTo(parent), doc):
-                raise StaffRefused(f"{identity}: promotion destination conflicts")
+        kind: Kind = "showrunner" if promoting else "unit"
+        source = "unit" if promoting else "showrunner"
+        changed = replace(row, kind=kind, name=destination.name, parent=ReportsTo(destination.parent),
+                          worktree=WORKTREE_UNFILLED if promoting else cast(UnitRole, destination).worktree,
+                          doc=cast(ShowrunnerRole, destination).doc if promoting else DOC_UNFILLED)
+        if row.kind == kind:
+            if row != changed:
+                raise StaffRefused(f"{identity}: director destination conflicts")
             return row
-        if row.kind != "unit":
-            raise StaffRefused(f"{identity}: promotion requires a unit")
-        promoted = replace(row, kind="showrunner", name=name, parent=ReportsTo(parent),
-                           worktree=WORKTREE_UNFILLED, doc=doc)
-        rows[rows.index(row)] = promoted
-        return promoted
+        if row.kind != source:
+            raise StaffRefused(f"{identity}: role change requires a {source}")
+        rows[rows.index(row)] = changed
+        if not promoting:
+            # A unit cannot own other directors. Its workers retain their parent.
+            rows[:] = [replace(child, parent=changed.parent)
+                       if child.parent == ReportsTo(identity) and child.kind in {"unit", "showrunner"}
+                       else child for child in rows]
+        return changed
     return _transaction(edit)
+
+
+def promote_unit(identity: StaffId, *, name: str, parent: StaffId, doc: LiveDoc) -> StaffRow:
+    """Promote the same session through the shared director writer."""
+    return change_director(identity, ShowrunnerRole(name, parent, doc))
 
 
 def publish_native_ids(expected: StaffSnapshot, identities: Mapping[StaffId, StaffId],
@@ -1940,13 +1970,14 @@ def _parser() -> argparse.ArgumentParser:
     _ = session_parser.add_argument("--json", action="store_true")
     _ = session_parser.add_argument("--row-write", action="store_true", help=argparse.SUPPRESS)
     _ = add.add_argument("--runtime-id", default="")
-    promotion = verbs.add_parser("promote-unit", help=argparse.SUPPRESS)
-    _ = promotion.add_argument("target")
-    _ = promotion.add_argument("--name", required=True)
-    _ = promotion.add_argument("--parent", required=True)
-    _ = promotion.add_argument("--machine", required=True)
-    _ = promotion.add_argument("--path", required=True)
-    _ = promotion.add_argument("--json", action="store_true")
+    for command in ("promote-unit", "demote-showrunner"):
+        director = verbs.add_parser(command, help=argparse.SUPPRESS)
+        _ = director.add_argument("target")
+        _ = director.add_argument("--name", required=True)
+        _ = director.add_argument("--parent", required=True)
+        _ = director.add_argument("--machine", required=True)
+        _ = director.add_argument("--path", required=True)
+        _ = director.add_argument("--json", action="store_true")
     restore_parser = verbs.add_parser("restore-unit", help=argparse.SUPPRESS)
     _ = restore_parser.add_argument("target")
     _ = restore_parser.add_argument("--machine", required=True)
@@ -2036,6 +2067,10 @@ def _mutate(arguments: _Arguments) -> StaffRow | StaffSnapshot | tuple[StaffId, 
         assert arguments.parent is not None
         return promote_unit(StaffId(arguments.target), name=arguments.name, parent=StaffId(arguments.parent),
                             doc=LiveDoc(arguments.machine, Path(arguments.path)))
+    if arguments.verb == "demote-showrunner":
+        assert arguments.parent is not None
+        return change_director(StaffId(arguments.target), UnitRole(arguments.name, StaffId(arguments.parent),
+                               PresentWorktree(arguments.machine, Path(arguments.path))))
     if arguments.verb == "restore-unit":
         return restore_unit(StaffId(arguments.target), PresentWorktree(arguments.machine, Path(arguments.path)))
     if arguments.verb == "rename":

@@ -10,6 +10,7 @@ import argparse
 import json
 from dataclasses import replace
 from datetime import datetime
+from enum import Enum
 import re
 import subprocess
 import sys
@@ -116,6 +117,41 @@ def doc_status(lines: list[str]) -> ProductionPlanned | ProductionRunning | Prod
     return ProductionWrapped()
 
 
+def unit_branch(row: staff.StaffRow, resolver: session_staff.RowResolver) -> session_staff.Branch | session_staff.BranchUnreadable | session_staff.LocationUnfilled | session_staff.RetiredFactsUnavailable:
+    """Read the parked branch first, then use the staff location."""
+    parked = unit_config.read_parked(row.id, cleanup=False)
+    if isinstance(parked, unit_config.UnitConfig) and isinstance(parked.retired, unit_config.RetiredSession):
+        return session_staff.Branch(parked.retired.branch.value)
+    return resolver.unit_branch(row)
+
+
+class BranchMergeState(Enum):
+    MERGED = "merged"
+    UNMERGED = "unmerged"
+    ABSENT = "absent"
+
+
+def branch_merge_state(production: Production, branch: str) -> BranchMergeState:
+    """Check the local branch, then origin, then absence."""
+    local = git(production.checkout, "show-ref", "--verify", "--quiet", f"refs/heads/{branch}")
+    if local.returncode == 0:
+        branch_ref = branch
+    elif local.returncode != 1:
+        raise LifecycleStop("worktree", "failed", local.stderr.strip() or f"show-ref exited {local.returncode}")
+    else:
+        remote = git(production.checkout, "ls-remote", "--exit-code", "--heads", "origin", branch)
+        if remote.returncode == 2:
+            return BranchMergeState.ABSENT
+        if remote.returncode:
+            raise LifecycleStop("worktree", "failed", remote.stderr.strip() or f"ls-remote exited {remote.returncode}")
+        branch_ref = f"refs/remotes/origin/{branch}"
+        _ = checked(production.checkout, "worktree", "fetch", "origin", f"+refs/heads/{branch}:{branch_ref}")
+    result = git(production.checkout, "merge-base", "--is-ancestor", branch_ref, production.merge_branch)
+    if result.returncode not in (0, 1):
+        raise LifecycleStop("worktree", "failed", result.stderr.strip() or f"merge-base exited {result.returncode}")
+    return BranchMergeState.UNMERGED if result.returncode else BranchMergeState.MERGED
+
+
 def units(runner: staff.StaffRow, record: staff.StaffSnapshot) -> tuple[UnitRow, ...]:
     """The runner's unit rows in staff order; a parked retirement names the branch, else git does."""
     resolver = session_staff.RowResolver(record)
@@ -131,14 +167,10 @@ def units(runner: staff.StaffRow, record: staff.StaffSnapshot) -> tuple[UnitRow,
         name = row.name
         if isinstance(row.worktree, staff.WorktreeUnfilled):
             raise LifecycleStop("retire", "held", f"{name}: worktree is unfilled")
-        parked = unit_config.read_parked(row.id, cleanup=False)
-        if isinstance(parked, unit_config.UnitConfig) and isinstance(parked.retired, unit_config.RetiredSession):
-            branch = parked.retired.branch.value
-        else:
-            found = resolver.unit_branch(row)
-            if not isinstance(found, session_staff.Branch):
-                raise LifecycleStop("retire", "held", f"{name}: {found.reason}")
-            branch = found.name
+        found = unit_branch(row, resolver)
+        if not isinstance(found, session_staff.Branch):
+            raise LifecycleStop("retire", "held", f"{name}: {found.reason}")
+        branch = found.name
         parsed.append(UnitRow(name, row, row.worktree.path, branch))
     return tuple(parsed)
 
@@ -572,21 +604,11 @@ def wrap(production: Production, lines: list[str], no_ci: bool,
                 worktree_status = checked(unit.worktree, "worktree", "status", "--short")
                 if worktree_status:
                     raise LifecycleStop("worktree", "failed", f"{unit.name} at {unit.worktree} is dirty: {worktree_status}")
-            local = git(production.checkout, "show-ref", "--verify", "--quiet", f"refs/heads/{unit.branch}")
-            remote = git(production.checkout, "ls-remote", "--exit-code", "--heads", "origin", unit.branch)
-            if remote.returncode not in (0, 2):
-                raise LifecycleStop("worktree", "failed", remote.stderr.strip() or f"ls-remote exited {remote.returncode}")
-            if local.returncode == 0:
-                branch_ref = unit.branch
-            elif remote.returncode == 0:
-                branch_ref = f"refs/remotes/origin/{unit.branch}"
-                _ = checked(production.checkout, "worktree", "fetch", "origin",
-                            f"+refs/heads/{unit.branch}:{branch_ref}")
-            else:
+            merged = branch_merge_state(production, unit.branch)
+            if merged is BranchMergeState.ABSENT:
                 report("worktree", "ok", f"{unit.name} already retired")
                 continue
-            if git(production.checkout, "merge-base", "--is-ancestor", branch_ref,
-                   production.merge_branch).returncode:
+            if merged is BranchMergeState.UNMERGED:
                 raise LifecycleStop("worktree", "held", f"{unit.name} branch {unit.branch} is not merged")
             report("worktree", "ok", f"{unit.name} clean and merged")
         _ = checked(production.checkout, "push", "push", "origin", production.merge_branch)
