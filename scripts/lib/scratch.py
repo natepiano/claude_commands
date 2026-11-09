@@ -653,7 +653,11 @@ def new(task: str = "", word: str = "", visible: bool = False, now: float | None
     path = target(task, word, visible, scratch_settings=scratch_settings)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.mkdir()
-    write_record(path, task, moment, throwaway=throwaway, scratch_settings=scratch_settings)
+    try:
+        write_record(path, task, moment, throwaway=throwaway, scratch_settings=scratch_settings)
+    except BaseException:
+        shutil.rmtree(path, ignore_errors=True)
+        raise
     return path
 
 

@@ -91,7 +91,9 @@ class WorkerResumeTests(unittest.TestCase):
         self.assertIsInstance(result, stop_resume.ClaudeUp)
         assert isinstance(result, stop_resume.ClaudeUp)
         self.assertEqual(result.session_id, opened.row.current_session)
-        self.assertNotEqual(result.pane_id, opened.pane)
+        self.assertEqual(result.pane_id, opened.pane)
+        self.assertEqual(world.locations[result.pane_id]["terminal_id"], opened.terminal)
+        self.assertEqual(world.closed, [])
         self.assertEqual(result.start_state, ClaudeStartState.STARTED)
         self.assertEqual(proof.call_args.args, (opened.row.current_session, result.pane_id))
 

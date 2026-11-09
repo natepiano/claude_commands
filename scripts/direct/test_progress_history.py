@@ -80,7 +80,6 @@ def refresh_phase_table(session_dir: Path) -> None:
 
 class ProgressHistoryTests(unittest.TestCase):
     repository_seed: ClassVar[Path]
-    temporary: tempfile.TemporaryDirectory[str]  # pyright: ignore[reportUninitializedInstanceVariable]
     root: Path  # pyright: ignore[reportUninitializedInstanceVariable]
     history_dir: Path  # pyright: ignore[reportUninitializedInstanceVariable]
     working_dir: Path  # pyright: ignore[reportUninitializedInstanceVariable]
@@ -93,18 +92,14 @@ class ProgressHistoryTests(unittest.TestCase):
     @override
     def setUpClass(cls) -> None:
         super().setUpClass()
-        directory = tempfile.TemporaryDirectory(dir="/tmp")
-        cls.addClassCleanup(directory.cleanup)
-        cls.repository_seed = Path(directory.name)
+        cls.repository_seed = Path(cls.enterClassContext(tempfile.TemporaryDirectory()))
         _ = subprocess.run(["git", "init", "-b", "feature/rubric", str(cls.repository_seed)],
                            check=True, capture_output=True, text=True)
 
     @override
     def setUp(self) -> None:
         self.enterContext(patch.dict(os.environ, {"UNIT_SYNC_WRITES": "0"}))
-        # Socket fixtures need a short path even when the run's TMPDIR is long.
-        self.temporary = tempfile.TemporaryDirectory(dir="/tmp")
-        self.root = Path(self.temporary.name)
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         cache = self.root / "cache"
         seed_interpreter_cache(cache)
         self.enterContext(patch.dict(os.environ, {"CLAUDE_PYTHON": "", "XDG_CACHE_HOME": str(cache)}))
@@ -142,10 +137,6 @@ class ProgressHistoryTests(unittest.TestCase):
             return result
 
         _ = self.enterContext(patch.object(subprocess, "run", side_effect=run))
-
-    @override
-    def tearDown(self) -> None:
-        self.temporary.cleanup()
 
     def test_active_dispatch_returns_saved_launcher(self) -> None:
         from scripts.lib.atomic_file import write_text_atomic
@@ -8148,18 +8139,17 @@ class PhaseCountTests(unittest.TestCase):
     which under-reported a 68%-complete plan as 36%.
     """
 
-    temporary: tempfile.TemporaryDirectory[str]  # pyright: ignore[reportUninitializedInstanceVariable]
+    root: Path  # pyright: ignore[reportUninitializedInstanceVariable]
 
     @override
     def setUp(self) -> None:
         self.enterContext(patch.dict(os.environ, {"UNIT_SYNC_WRITES": "0"}))
-        self.temporary = tempfile.TemporaryDirectory()
-        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
 
     def _count(self, body: str, phase_percent: int = 0) -> dict[str, object]:
-        plan = Path(self.temporary.name) / "plan.md"
+        plan = self.root / "plan.md"
         _ = plan.write_text(body, encoding="utf-8")
-        environment = dict(os.environ, HOME=self.temporary.name)
+        environment = dict(os.environ, HOME=str(self.root))
         completed = invoke_recorder(
             ["phase-count", "--plan-doc", str(plan), "--phase-percent", str(phase_percent)],
             environment, Path.cwd(), check=True)
@@ -8227,15 +8217,12 @@ class PhaseCountTests(unittest.TestCase):
 
 
 class PublicPhaseHelperTests(unittest.TestCase):
-    temporary: tempfile.TemporaryDirectory[str]  # pyright: ignore[reportUninitializedInstanceVariable]
     root: Path  # pyright: ignore[reportUninitializedInstanceVariable]
 
     @override
     def setUp(self) -> None:
         self.enterContext(patch.dict(os.environ, {"UNIT_SYNC_WRITES": "0"}))
-        self.temporary = tempfile.TemporaryDirectory()
-        self.addCleanup(self.temporary.cleanup)
-        self.root = Path(self.temporary.name)
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
         _ = fixture_member("showrunner", name="phase-helper")
 

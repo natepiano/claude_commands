@@ -157,7 +157,8 @@ All main-path tests remain.
 
 Tests run outside the lock.
 The checkpoint push, interrupted promotion, and child handoff share this loop.
-`push_rollback` restores the run's original tip on `Stop`, `OSError`, or `ValueError` before publication when origin still has its old tip.
+`push_rollback` restores the original tip before publication when origin retains its old tip.
+It handles `checkpoint_gate.Stop`, `OSError`, and `ValueError`.
 The loop's yield lies outside its preparation rollback scope.
 Each caller therefore retains its own push rollback policy.
 A rejected resumed handoff keeps its existing unpublished merge.
@@ -230,7 +231,8 @@ The promoted checkout supplies the repository for a promotion-only scan.
 | `scripts/direct/progress_history.py` | Phase boundaries, launch checks, shared history reads, and review trial output. |
 | `docs/direct/repair_rounds.md` | Repair judgment and dispatch instructions. |
 | `docs/direct/write_prompt_contract.md` | Worker prompt and test contracts. |
-| `scripts/production/merge_checkpoint.py` | Checkpoint preparation, tests, rollback, push, promotion, and row publication. |
+| `scripts/production/merge_checkpoint.py` | Checkpoint preparation, rollback, push, promotion, and row publication. |
+| `scripts/production/checkpoint_gate.py` | Shared checkpoint tests, gate records, locks, and result delivery. |
 | `scripts/production/change_review.py` | Commit selection, recorded producers, production routing, and repeat-safe row insertion. |
 | `scripts/lib/main_publish.py`, `zone.py`, `tune.py` | Configuration publication and the shared Mac queue. |
 | `scripts/production/unit_phases.py`, `live_units.py` | Staff unit tables and actionable anomaly reporting. |

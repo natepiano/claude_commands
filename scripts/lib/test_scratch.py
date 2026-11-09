@@ -2,6 +2,7 @@
 """Tests for scratch.py: folders that belong to a task and go when it ends."""
 from __future__ import annotations
 
+import errno
 import json
 import io
 import fcntl
@@ -1081,6 +1082,14 @@ print(scratch.target('gate:proof', 'tree', False))
             with self.subTest(identity=identity), mock.patch.dict(os.environ, {"CODEX_THREAD_ID": identity}), redirect_stderr(io.StringIO()) as errors:
                 self.assertEqual(scratch.main(["new", "--worker"]), 2)
                 self.assertEqual(errors.getvalue().splitlines(), ["scratch: --worker requires the caller's worker staff row"])
+
+    def test_a_failed_record_write_removes_the_folder_new_made(self) -> None:
+        with (
+            mock.patch.object(scratch, "write_record", side_effect=OSError(errno.ENOSPC, "no space")),
+            self.assertRaises(OSError),
+        ):
+            _ = scratch.new(RUN, "gate")
+        self.assertEqual(list((self.base / "scratch").iterdir()), [])
 
     def test_a_visible_repro_goes_where_cargo_port_lists_it(self) -> None:
         self.assertEqual(scratch.new(ROW, "demo", visible=True), self.base / "repro" / "cargo-liner-C54-demo")

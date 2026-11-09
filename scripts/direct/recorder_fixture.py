@@ -68,7 +68,6 @@ if (_fixture_os.environ.get("TEST_LEGACY_LAUNCH") == "1"
 class LauncherFixture(unittest.TestCase):
     """Prepare one seed per launcher class and give every test a private copy."""
     fixture_seed: ClassVar[Path]
-    temporary: tempfile.TemporaryDirectory[str]  # pyright: ignore[reportUninitializedInstanceVariable]
     root: Path = Path()
     history_dir: Path = Path()
     working_dir: Path = Path()
@@ -79,26 +78,19 @@ class LauncherFixture(unittest.TestCase):
     @override
     def setUpClass(cls) -> None:
         super().setUpClass()
-        seed_directory = tempfile.TemporaryDirectory()
-        cls.addClassCleanup(seed_directory.cleanup)
-        cls.fixture_seed = Path(seed_directory.name)
+        cls.fixture_seed = Path(cls.enterClassContext(tempfile.TemporaryDirectory()))
         seed = cls("runTest")
         seed.root = cls.fixture_seed
         seed.prepare_fixture()
 
     @override
     def setUp(self) -> None:
-        self.temporary = tempfile.TemporaryDirectory()
-        self.root = Path(self.temporary.name)
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         # Private files and Git objects/index/refs: mutations never reach another test.
         _ = shutil.copytree(self.fixture_seed, self.root, dirs_exist_ok=True)
         self.history_dir = self.root / "history"
         self.working_dir = self.root / "project"
         self.config_file = self.root / "direct.conf"
-
-    @override
-    def tearDown(self) -> None:
-        self.temporary.cleanup()
 
     def prepare_fixture(self) -> None:
         raise NotImplementedError("the launcher fixture must prepare its seed")
