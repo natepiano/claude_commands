@@ -8,7 +8,7 @@
   - Completion condition: the test module ends with no child process left; a test checks the process tree after the module ends.
   - Revealed by: Phase 3t (sdlc [3129d2dd] placed it next).
 - [ ] **One pane scan for rename displays**
-  - Target: `scripts/shutdown/shutdown.py` (`rename_repair_displays`), `scripts/herdr/herdr.py` (`Herdr.retitle_row`, `Herdr.scan_row_panes`).
+  - Target: `scripts/agents/shutdown.py` (`rename_repair_displays`), `scripts/herdr/herdr.py` (`Herdr.retitle_row`, `Herdr.scan_row_panes`).
   - Why needed: `rename_repair_displays` and `retitle_row` use separate implementations to match panes to native sessions.
   - Completion condition: both functions use one pane-scan implementation. Keep session-record updates, pane titles, tab labels, workspace labels, native-session proof and anomaly output. Test these behaviors through rename.
   - Revealed by: herdr-unit (sdlc [16a2cfa0] placed it next, after 3t).
@@ -18,7 +18,7 @@
   - Completion condition: preserve both fields through the planning handoff. Pass `--port` and repeated `--responsibility` options to `add_unit.py`. Keep saved `.unit.toml` precedence. Test the handoff and final record.
   - Revealed by: herdr-unit (sdlc [16a2cfa0], [7694b0f3]); Phase 3y architect review.
 - [ ] **Use the existing active and idle worker resume states**
-  - Target: `scripts/shutdown/inventory.py` (`worker_resumes`), `scripts/lib/resume_message.py` (`PausedSeat`, `resume_worker_command`), and their tests.
+  - Target: `scripts/agents/inventory.py` (`worker_resumes`), `scripts/lib/resume_message.py` (`PausedSeat`, `resume_worker_command`), and their tests.
   - Why needed: `Resumable` and `Idle` already distinguish the states, but `PausedSeat.turn_live` repeats that distinction.
   - Completion condition: remove `turn_live` and use the existing states. Preserve active-worker commands, idle-worker text, and existing threads. Test both states through `stop_resume`.
   - Revealed by: models-unit Phase 3s simplify lens; target corrected by the Phase 8g architect review.

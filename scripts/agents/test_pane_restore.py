@@ -21,18 +21,18 @@ from scripts.production.rename_test_support import FolderMoveBackend, FolderMove
 from scripts.production.cli_fixture import invoke_cli
 from scripts.accounts import accounts
 from scripts.whoami import agent_accounts
-from scripts.shutdown import restart
+from scripts.agents import restart
 from scripts.production import staff, session_staff
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib import unit_runs
-from scripts.shutdown import pane_record as restart_records
+from scripts.agents import pane_record as restart_records
 from scripts.production.staff_test_support import StaffTestCase, fixture_member, fixture_runtime_id
 from scripts.message import sessions as runtime_sessions
 from scripts.production import unit_move
 
-from scripts.shutdown import pane_restore
+from scripts.agents import pane_restore
 from scripts.herdr import herdr, worker_panes  # noqa: E402
-from scripts.shutdown import pane_record  # noqa: E402
+from scripts.agents import pane_record  # noqa: E402
 from scripts.herdr import pane_launch
 from scripts.message import sessions  # noqa: E402
 
@@ -225,7 +225,7 @@ class PaneRestoreTests(unittest.TestCase):
             return self.row
         _ = self.enterContext(mock.patch.object(staff, "set_home", side_effect=set_home))
         _ = self.enterContext(mock.patch.object(staff, "initial_snapshot", side_effect=lambda: staff.StaffSnapshot((self.row,))))
-        _ = self.enterContext(mock.patch("scripts.shutdown.remote.local_machine", return_value="natedev"))
+        _ = self.enterContext(mock.patch("scripts.agents.remote.local_machine", return_value="natedev"))
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"CONF_DIR": str(configuration)})))
         _ = self.enterContext(mock.patch.object(herdr.Herdr, "saved_row_tab", return_value=herdr.NewTab("demo", "alpha")))
         _ = self.enterContext(mock.patch.object(herdr.Herdr, "remember_row_tab"))
@@ -524,7 +524,7 @@ class RestoreStaffNamesTests(StaffTestCase):
         _ = self.enterContext(mock.patch.object(herdr.nix_env, "ensure", side_effect=no_envrc))
         _ = self.enterContext(mock.patch.object(restart_records, "RECORD_DIR", self.root / "saved-panes"))
         _ = self.enterContext(mock.patch.object(accounts, "accounts_home", return_value=self.root))
-        _ = self.enterContext(mock.patch("scripts.shutdown.remote.local_machine", return_value=machine))
+        _ = self.enterContext(mock.patch("scripts.agents.remote.local_machine", return_value=machine))
         _ = self.enterContext(mock.patch.object(herdr.Herdr, "saved_row_tab",
             side_effect=saved_tab))
         _ = self.enterContext(mock.patch.object(herdr.Herdr, "remember_row_tab"))
@@ -991,7 +991,7 @@ class CodexPaneRestoreTests(FolderMoveFixture):
 
     def test_missing_pane_recovery_retires_its_source_before_the_next_folder_move(self) -> None:
         from scripts.accounts import accounts
-        from scripts.shutdown import stop_resume
+        from scripts.agents import stop_resume
 
         backend = self.folder_backend("claude", live=False)
         original = pane_record.read("agents")["w1:p1"]

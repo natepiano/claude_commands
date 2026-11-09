@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import Protocol, cast
 
 from scripts.lib import detached
-from scripts.shutdown.stop_results import shutdown_state_root
+from scripts.agents.stop_results import shutdown_state_root
 from scripts.production import session_pane
 from scripts.message import sessions
 from scripts.herdr.herdr import AgentBlocked

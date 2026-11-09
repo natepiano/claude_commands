@@ -17,7 +17,7 @@ from scripts.direct import worker_runs
 from scripts.production import staff
 from scripts.production.staff_test_support import StaffTestCase, fixture_member, fixture_worker
 from scripts.herdr import herdr, worker_panes
-from scripts.shutdown import remote
+from scripts.agents import remote
 
 
 class WorkerRunsTests(unittest.TestCase):

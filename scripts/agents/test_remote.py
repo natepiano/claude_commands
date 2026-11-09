@@ -11,8 +11,8 @@ from pathlib import Path
 from typing import TypedDict, cast, final, override
 from unittest.mock import patch
 
-from scripts.shutdown.test_support import linux_process_fixture, ShutdownSendLeaf, ShutdownTestCase
-from scripts.shutdown import remote
+from scripts.agents.test_support import linux_process_fixture, ShutdownSendLeaf, ShutdownTestCase
+from scripts.agents import remote
 
 
 class SshInvocation(TypedDict):
@@ -117,7 +117,7 @@ raise SystemExit(int(os.environ.get("SHUTDOWN_TEST_SSH_STATUS", "0")))
         self.assertNotIn("ServerAliveCountMax=4", called["arguments"])
         command = called["arguments"][5]
         self.assertIn('"$HOME/.claude/scripts/lib/py"', command)
-        self.assertIn('"$HOME/.claude/scripts/shutdown/shutdown.py"', command)
+        self.assertIn('"$HOME/.claude/scripts/agents/shutdown.py"', command)
         self.assertIn("status claude2 --json", command)
         self.assertTrue(command.endswith('; printf "rc=%s\\n" $?'))
 

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from scripts.shutdown import remote
+from scripts.agents import remote
 
 import io
 import fcntl
@@ -26,25 +26,25 @@ from unittest.mock import Mock, call, patch
 
 from scripts.accounts import accounts, moves
 from scripts.whoami import account, agent_accounts
-from scripts.shutdown import restart, stop_resume, stop_results
+from scripts.agents import restart, stop_resume, stop_results
 from scripts.lib import agent_program, atomic_file, conf, operation_deadline, unit_runs
 from scripts.herdr import worker_panes
-from scripts.shutdown.stop_results import ClaudeStartState, StopResult
+from scripts.agents.stop_results import ClaudeStartState, StopResult
 
-from scripts.shutdown.stop_results import SourceReleased, SourceReleaseUnknown
-from scripts.shutdown.launch_names import LaunchNames
+from scripts.agents.stop_results import SourceReleased, SourceReleaseUnknown
+from scripts.agents.launch_names import LaunchNames
 from scripts.production import showrunners, staff, staff_sources, stall_watch, worker_admission
 from scripts.lib.resume_message import ClaudeChildResume
 from scripts.production.staff_test_support import StaffTestCase, fixture_member, fixture_worker, isolated_staff_file
 from scripts.usage import agents_log
 from scripts.herdr import herdr, pane_launch
-from scripts.shutdown import pane_record, shutdown
+from scripts.agents import pane_record, shutdown
 from scripts.message import sessions
 from scripts.message import sessions as runtime_sessions
 from scripts.production import unit_lookup, test_worker
 from scripts.direct import progress_history
 from scripts.lib.test_models_registry import write_registry
-from scripts.shutdown.test_pane_restore import FakeClient
+from scripts.agents.test_pane_restore import FakeClient
 
 RUN_IN_PANE = herdr.Herdr.run_in_pane
 
@@ -1127,7 +1127,7 @@ class StopResumeTests(unittest.TestCase):
         self.assertFalse(pane_record.read("agents")["w1:p2"].get("ended", False))
 
     def test_unknown_name_lists_only_close_local_units_and_showrunners(self) -> None:
-        from scripts.shutdown import remote
+        from scripts.agents import remote
 
         machine = remote.local_machine()
         rows = (
@@ -1874,7 +1874,7 @@ class StopResumeTests(unittest.TestCase):
     def test_launch_deletion_after_stop_cannot_lose_the_old_alerts_cancellation(self) -> None:
         log, row = self.prompt_retirement_fixture(alerted=True)
         self.assertEqual(stop_resume.stop("alpha"), stop_resume.NotRunning("019b3a40-4250-7000-8000-000000000102"))
-        # retire_unit removes launch records after stop and before the next watcher pass.
+        # Launch deletion must preserve pending prompt cancellation.
         pane_record.record_path("agents").unlink()
         self.drain_prompt_cancellations()
         self.assertEqual(json.loads(log.read_text()), ["retire", "--to", "user", "--from", "stall-watch",

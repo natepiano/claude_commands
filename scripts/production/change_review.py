@@ -45,7 +45,7 @@ from scripts.production import issues  # noqa: E402
 from scripts.production.proposals_folder import owner_docs, scope_docs  # noqa: E402
 from scripts.production import change_routing, session_staff, showrunner_tree, staff, unit_config, unit_lookup
 from scripts.production.production_doc import Refusal, production_field
-from scripts.shutdown import remote
+from scripts.agents import remote
 
 TRAILER = "Change-Review"
 COVERS = f"{TRAILER}-Covers"

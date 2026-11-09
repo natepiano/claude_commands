@@ -5,7 +5,7 @@ The saved launch selects each conversation and account.
 
 ## Pane launch record
 
-- `scripts/shutdown/pane_record.py` keeps one file per herdr session,
+- `scripts/agents/pane_record.py` keeps one file per herdr session,
   `~/.local/state/herdr-panes/<session>.json` (`HERDR_PANE_RECORD_DIR` in tests), keyed by
   `HERDR_PANE_ID`.
 - Each entry holds the pane's Claude launch: the account folder (`CLAUDE_CONFIG_DIR`), the cwd,
@@ -41,7 +41,7 @@ The [launch-name policy](shutdown-and-restart.md#launch-names) supplies current 
   conversation id from `<config>/sessions/<pid>.json`. It needs no
   `report-agent-session`: a restore takes the id from the entry and checks herdr's
   `agent_session` only when the pane has one.
-- `scripts/shutdown/pane_restore.py [--session NAME] [--dry-run]` first starts or adopts the shared server.
+- `scripts/agents/pane_restore.py [--session NAME] [--dry-run]` first starts or adopts the shared server.
   It resumes staff rows through `restart.start_row`.
   For a worker row, `start_row` resumes only that worker through `worker.restore` with the worker launch policy and the saved account. An idle worker prints `<name>: closed; its next assign resumes it` and stays closed.
   It resumes saved panes without staff rows through `herdr.launch_agent`.

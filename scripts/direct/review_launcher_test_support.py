@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from scripts.shutdown import remote
+from scripts.agents import remote
 
 from scripts.lib import test_hang_guard
 from scripts.lib.test_models_registry import ExactRows, registry_text
@@ -162,9 +162,9 @@ class ReviewLauncherFixture(LauncherFixture):
                              self.root / "scripts/production" / name)
         for directory, names in (("usage", ("agents_log.py",)),
                                  ("herdr", ("place.py", "pane_launch.py")),
-                                 ("shutdown", ("remote.py",))):
+                                 ("agents", ("remote.py",))):
             destination = self.root / "scripts" / directory
-            destination.mkdir()
+            destination.mkdir(exist_ok=True)
             for name in names:
                 _ = shutil.copy2(DIRECT_DIR.parent / directory / name, destination / name)
         _ = shutil.copy2(DIRECT_DIR.parent / "lib/git_exclude.py", lib / "git_exclude.py")

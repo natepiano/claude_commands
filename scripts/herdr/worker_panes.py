@@ -359,7 +359,7 @@ def agent_inventory(client: herdr.Herdr) -> list[herdr.AgentOccupant]:
 
 
 def _stop_row(row: staff.StaffRow, client: herdr.Herdr, *, deadline: float) -> bool:
-    stop = cast(Callable[..., bool], import_module("scripts.shutdown.restart").stop_row)
+    stop = cast(Callable[..., bool], import_module("scripts.agents.restart").stop_row)
     return stop(row, client, deadline=deadline)
 
 

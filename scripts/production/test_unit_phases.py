@@ -1,7 +1,7 @@
 """Tests for each unit's staff name, phase and task."""
 from __future__ import annotations
 
-from scripts.shutdown import remote
+from scripts.agents import remote
 
 import contextlib
 import io

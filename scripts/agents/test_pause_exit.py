@@ -6,6 +6,7 @@ import io
 import sys
 import subprocess
 import time
+from dataclasses import replace
 from functools import cached_property
 from contextlib import redirect_stdout
 from typing import cast, final, override
@@ -13,13 +14,14 @@ from unittest import mock
 
 from scripts.accounts import accounts
 from scripts.herdr import herdr
+from scripts.message import sessions
 from scripts.production import live_units, staff, unit_lookup, worker
 from scripts.lib.resume_message import BusyPass, NoOwnPass
 from scripts.production.cli_fixture import invoke_cli
 from scripts.production.staff_test_support import CHECKOUT, StaffTestCase, fixture_member
-from scripts.shutdown import pane_record, restart_support, shutdown, stop_resume, remote
-from scripts.shutdown.stop_resume import stop as stop_session
-from scripts.shutdown.stop_results import StopResult
+from scripts.agents import pane_record, restart_support, shutdown, stop_resume, remote
+from scripts.agents.stop_resume import stop as stop_session
+from scripts.agents.stop_results import ClaudeStartState, StopResult
 
 
 @final
@@ -38,6 +40,9 @@ class PauseExitTests(StaffTestCase):
         _ = self.enterContext(mock.patch.object(accounts, "prepare_claude_launch",
             return_value=accounts.PreparedAccount({}, frozenset())))
         _ = self.enterContext(mock.patch.object(herdr, "trust_claude_launch"))
+        _ = self.enterContext(mock.patch.object(stop_resume, "running_on_account",
+            return_value=stop_resume.ClaudeUp(self.unit.current_session, "w1:p1", "claude2",
+                start_state=ClaudeStartState.ALREADY_RUNNING)))
         _ = self.enterContext(mock.patch("scripts.lib.agent_program.resolve_program", return_value=str(self.root / "TEST-agent")))
 
     @cached_property
@@ -266,13 +271,42 @@ class PauseExitTests(StaffTestCase):
                 self.assertEqual(events, ["task", "task", "stop"])
 
     def test_resume_of_a_paused_unit_removes_the_pause_and_sends_one_continuation(self) -> None:
-        _ = staff.pause(str(self.unit.id), "maintenance")
-        result = self.agents("resume", self.unit.name)
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(self.current(), self.unit)
-        self.start.assert_not_called()
-        self.send.assert_called_once()
-        self.assertIn("Continue", cast(str, self.send.call_args.args[2]))
+        for original, observed in (
+                (self.unit, stop_resume.ClaudeUp(self.unit.current_session, "w1:p1", "claude2",
+                    start_state=ClaudeStartState.ALREADY_RUNNING)),
+                (self.unit, sessions.SessionNotLive()),
+                (replace(self.unit, worktree=staff.PresentWorktree(remote.other_machine(), self.root)), sessions.SessionNotLive()),
+                (replace(self.owner, doc=staff.LiveDoc(remote.other_machine(), self.root / "TEST-production.md")),
+                    sessions.SessionNotLive()),
+                (replace(self.owner, doc=staff.WrappedDoc(remote.other_machine(), self.root / "TEST-production.md")),
+                    sessions.SessionNotLive())):
+            for target in ((), ("--to", "claude4")):
+                with self.subTest(row=original, observed=observed, target=target):
+                    record = staff.snapshot()
+                    _ = self.write_document({"schema": record.schema, "rows": [
+                        original.to_json() if row.id == original.id else row.to_json() for row in record.rows]})
+                    _ = staff.pause(str(original.id), "maintenance")
+                    self.start.reset_mock()
+                    self.send.reset_mock()
+                    def start(session: str, *, why: str, to: str | None) -> stop_resume.ClaudeUp:
+                        self.assertEqual((session, why), (str(original.id), "resumed by name"))
+                        self.assertEqual(staff.by_id(original.id), original)
+                        return stop_resume.ClaudeUp(original.current_session, "w1:p1", to or "claude2")
+                    self.start.side_effect = start
+                    with mock.patch.object(stop_resume, "running_on_account", return_value=observed) as running:
+                        result = self.agents("resume", str(original.id), *target)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(staff.by_id(original.id), original)
+                    if isinstance(observed, sessions.SessionNotLive) and original == self.unit:
+                        self.start.assert_called_once_with(str(original.id), why="resumed by name",
+                                                           to=target[1] if target else None)
+                        self.send.assert_not_called()
+                    else:
+                        self.start.assert_not_called()
+                        self.send.assert_called_once()
+                        self.assertIn("Continue", cast(str, self.send.call_args.args[2]))
+                    if original != self.unit:
+                        running.assert_not_called()
 
     def test_resume_of_an_exited_unit_uses_the_shared_resume_and_removes_the_exit(self) -> None:
         self.save_exit()
@@ -284,11 +318,25 @@ class PauseExitTests(StaffTestCase):
 
     def test_a_failed_resume_keeps_the_exit_record(self) -> None:
         self.save_exit()
-        self.start.return_value = stop_resume.ResumeFailed(self.unit.current_session, "fixture failure")
-        result = self.agents("resume", self.unit.name)
-        self.assertEqual(result.returncode, 1, result.stderr)
-        self.assertIn("exited", self.current().to_json())
-        self.start.assert_called_once_with(str(self.unit.id), why="resumed by name", to=None)
+        exited = self.current().exited
+        assert isinstance(exited, staff.Exited)
+        paused = staff.Paused(exited.since, exited.by, exited.why)
+        failure = stop_resume.ResumeFailed(self.unit.current_session, "fixture failure")
+        for hold, outcome, code in ((exited, failure, 1), (paused, failure, 1),
+                                    (paused, staff.StaffRefused("TEST row is locked"), 2)):
+            with self.subTest(hold=hold, outcome=outcome):
+                held = staff.set_hold(str(self.unit.id), hold)
+                self.start.reset_mock()
+                self.start.side_effect = outcome if isinstance(outcome, staff.StaffRefused) else None
+                self.start.return_value = outcome
+                with mock.patch.object(stop_resume, "running_on_account", return_value=sessions.SessionNotLive()):
+                    result = self.agents("resume", self.unit.name)
+                self.assertEqual(result.returncode, code, result.stderr)
+                self.assertEqual(self.current(), held)
+                if isinstance(hold, staff.Exited):
+                    self.assertIn("exited", self.current().to_json())
+                self.start.assert_called_once_with(str(self.unit.id), why="resumed by name", to=None)
+                self.send.assert_not_called()
 
     def test_the_old_staff_pause_and_resume_commands_are_deleted(self) -> None:
         for command in ("pause", "resume"):

@@ -17,7 +17,7 @@ from unittest import mock
 from scripts.lib.test_models_registry import write_registry
 from scripts.accounts.home_test_support import scratch_accounts_config
 from scripts.message import send_budget
-from scripts.shutdown import remote
+from scripts.agents import remote
 from scripts.whoami import quota_alert_test_support as support
 from scripts.whoami import quota_alert
 from scripts.notify import review

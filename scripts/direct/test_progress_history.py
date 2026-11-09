@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-from scripts.shutdown import remote
+from scripts.agents import remote
 
 from scripts.lib.stop_injection_test_support import InjectedStop, stop_once
 

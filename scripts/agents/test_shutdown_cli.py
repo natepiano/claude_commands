@@ -50,8 +50,8 @@ from scripts.production.staff_test_support import (
     CHECKOUT,
     unit_membership,
 )
-from scripts.shutdown import shutdown, remote, stop_resume, restart, pane_record as staff_pane_record, pane_record
-from scripts.shutdown.stop_results import StopResult
+from scripts.agents import shutdown, remote, stop_resume, restart, pane_record as staff_pane_record, pane_record
+from scripts.agents.stop_results import StopResult
 
 from scripts.production import rename_test_support as support
 from scripts.production.rename_test_support import (
@@ -63,7 +63,7 @@ from scripts.production.rename_unit_test_support import FolderRenameFixture, Fol
 
 class AgentsUsageTests(unittest.TestCase):
     def test_status_excludes_a_retired_unit_whose_process_still_runs(self) -> None:
-        from scripts.shutdown.test_inventory import InventoryTests, TARGET_LOGIN, UNIT_ID, DESKTOP_ID
+        from scripts.agents.test_inventory import InventoryTests, TARGET_LOGIN, UNIT_ID, DESKTOP_ID
         from scripts.whoami.account import Account
 
         fixture = InventoryTests()
@@ -780,6 +780,39 @@ class RetireUnitTests(unittest.TestCase):
                 case.assertIn("unmerged commits on alpha-branch", output)
                 case.assertIsInstance(case.unit_worktree(), staff.PresentWorktree)
 
+        for unmerged, tail_match, fetch_tags in ((False, False, False), (True, False, False),
+                                                (True, True, False), (False, False, True)):
+            with self.subTest(origin_merge_branch=True, unmerged=unmerged, tail_match=tail_match, fetch_tags=fetch_tags):
+                case = RetireUnitTests()
+                case.setUp()
+                try:
+                    if not tail_match:
+                        _ = git(case.checkout, "push", "-q", "origin", "main")
+                    _ = git(case.checkout, "branch", "-m", "main", "local-checkout")
+                    _ = git(case.checkout, "update-ref", "-d", "refs/remotes/origin/main")
+                    if unmerged:
+                        write_text_atomic(case.worktree / "late.txt", "late\n")
+                        _ = git(case.worktree, "add", "late.txt")
+                        _ = git(case.worktree, "commit", "-q", "-m", "checkpoint(alpha): the late work")
+                    commit = git(case.worktree, "rev-parse", "HEAD")
+                    if tail_match:
+                        _ = git(case.checkout, "push", "-q", "origin", f"{commit}:refs/heads/a/main")
+                    if fetch_tags:
+                        _ = git(case.checkout, "config", "remote.origin.tagOpt", "--tags")
+                        _ = git(case.checkout, "push", "-q", "origin", f"{commit}:refs/tags/TEST-origin-tag")
+                        case.assertEqual(git(case.checkout, "for-each-ref", "refs/tags/TEST-origin-tag"), "")
+                    unit = shutdown.retirement_find_unit("alpha", "alpha")
+                    refusals = shutdown.retirement_refusals(unit, settings=conf.read("production"))
+                    case.assertEqual(refusals, [f"unmerged commits on alpha-branch: {commit}"] if unmerged else [])
+                    case.assertEqual(git(case.checkout, "branch", "--list", "main"), "")
+                    case.assertEqual(git(case.checkout, "for-each-ref", "refs/remotes/origin/main"), "")
+                    if fetch_tags:
+                        case.assertEqual(git(case.checkout, "for-each-ref", "refs/tags/TEST-origin-tag"), "")
+                    case.assertEqual(case.calls, [])
+                    case.assertTrue(case.worktree.is_dir())
+                finally:
+                    case.doCleanups()
+
     def test_the_recorders_project_started_line_is_not_uncommitted_work(self) -> None:
         plan = self.worktree / "work.txt"
         recorded = plan.read_text(encoding="utf-8") + "- **Project started:** 2026-10-18T22:00:00-04:00\n"
@@ -1358,7 +1391,7 @@ class ResumeUnitTests(unittest.TestCase):
             "def launch(arguments):",
             "    name = arguments[arguments.index('--production') + 1]",
             "    row = add_unit.ensure_staff_unit(read_production(name), arguments[2])",
-            "    from scripts.shutdown import pane_record",
+            "    from scripts.agents import pane_record",
             f"    pane_record.write('agents', pane_record.launch('w1:p1', {DIRECTOR!r}, {str(self.worktree)!r}, {{}}, ['claude']))",
             "    print(row.id)", "    return 0",
             "with patch.object(add_unit, '_main', side_effect=launch):",
@@ -2679,7 +2712,7 @@ class FolderRenameTests(FolderRenameFixture):
 
     def test_same_name_with_unit_suffix_changes_nothing(self) -> None:
         from scripts.production import unit_move
-        from scripts.shutdown import shutdown
+        from scripts.agents import shutdown
 
         displays = RenameDisplays(self.owner)
         displays.pane = displays.tab = self.owner.name
@@ -2755,7 +2788,7 @@ class FolderRenameTests(FolderRenameFixture):
 
     def test_same_name_writes_nothing_and_moves_nothing(self) -> None:
         from scripts.production import unit_move
-        from scripts.shutdown import shutdown
+        from scripts.agents import shutdown
 
         before = file_versions(self.root)
         with (mock.patch.object(shutdown, "rename_repair_displays", return_value=False),
@@ -2769,7 +2802,7 @@ class FolderRenameTests(FolderRenameFixture):
 
     def test_new_name_preserves_the_folder_parent_and_branch_prefix(self) -> None:
         from dataclasses import replace
-        from scripts.shutdown import shutdown
+        from scripts.agents import shutdown
 
         with (FolderSessionFixture(self.owner, live=False).installed(),
               mock.patch.object(shutdown, "rename_repair_displays", return_value=False)):
@@ -2785,7 +2818,7 @@ class FolderRenameTests(FolderRenameFixture):
 
     def test_unmatched_folder_stays_and_reports_one_anomaly_while_branch_moves(self) -> None:
         from dataclasses import replace
-        from scripts.shutdown import shutdown
+        from scripts.agents import shutdown
 
         original = self.source
         self.source = original.with_name("unmatched")

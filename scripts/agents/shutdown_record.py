@@ -15,7 +15,7 @@ from typing import cast
 
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.production import staff, session_staff
-from scripts.shutdown.stop_results import shutdown_state_root
+from scripts.agents.stop_results import shutdown_state_root
 
 
 def row_folder(row: staff.StaffRow, record: staff.StaffSnapshot, *,
@@ -30,7 +30,7 @@ def row_folder(row: staff.StaffRow, record: staff.StaffSnapshot, *,
     if isinstance(row.doc, (staff.LiveDoc, staff.WrappedDoc)):
         return row.doc.machine, row.doc.path.parent
     if row.kind == "agent":
-        from scripts.shutdown import remote
+        from scripts.agents import remote
 
         return remote.local_machine(), Path.home()
     document = facts.production_doc(row)

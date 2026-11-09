@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 from collections.abc import Generator
-from contextlib import ExitStack, contextmanager, redirect_stdout
+from contextlib import ExitStack, contextmanager, redirect_stderr, redirect_stdout
 import fcntl
 import io
 import json
@@ -22,7 +22,8 @@ import unittest
 from unittest import mock
 
 from scripts.copies import copies
-from scripts.copies.copies_test_support import copies_environment, fake_remote_removal
+from scripts.copies.copies_test_support import copies_environment, fake_remote_removal, publish_mirror
+from scripts.copies.remote_test_support import local_remote_transport, warm_claim_servers
 from scripts.lib import conf, file_lock
 from scripts.lib.py_floor_test_support import seed_interpreter_cache
 from scripts.lib.atomic_file import write_text_atomic
@@ -292,6 +293,81 @@ class RemoteCopiesTests(unittest.TestCase):
         remove.assert_called_once_with(mine)
         self.assertEqual(copies.owned_remote_mirrors("alpha"), [elsewhere])
         self.assertEqual(copies.owned_remote_mirrors("beta"), [other])
+
+    def test_owner_removal_defers_only_connection_failures(self) -> None:
+        cases: tuple[tuple[str, int, str, str], ...] = (
+            ("connect", 255, "", "ssh: connect to host host port 22: Connection timed out"),
+            ("dns", 255, "", "ssh: Could not resolve hostname host: Name or service not known"),
+            ("timeout", 255, "", ""),
+            ("refused", 2, "", "mirror is busy"),
+            ("authentication", 255, "", "host: Permission denied (publickey)."),
+            ("remote-refused", 0, "rc=2\n", "mirror is busy"),
+            ("missing-status", 0, "", "remote status is missing"),
+        )
+        for cause, status, remote_output, detail in cases:
+            with self.subTest(cause=cause), mock.patch.dict(os.environ, copies_environment(self.root / cause)):
+                mirrors = [self.remote(path=f"mirror/{cause}-{index}") for index in range(2)]
+                for mirror in mirrors:
+                    copies.register_remote(mirror)
+                output = io.StringIO()
+                answer = subprocess.CompletedProcess(["ssh"], status, remote_output, detail)
+                failure = subprocess.TimeoutExpired("ssh", 10) if cause == "timeout" else None
+                with mock.patch.object(subprocess, "run", return_value=answer, side_effect=failure) as run, \
+                        redirect_stdout(output):
+                    for attempt in range(2):
+                        if cause in ("refused", "authentication", "remote-refused", "missing-status"):
+                            with self.assertRaises(copies.RemoteMirrorKept) as refused:
+                                copies.remove_trees("alpha")
+                            self.assertIn(detail, str(refused.exception))
+                        else:
+                            copies.remove_trees("alpha")
+                            self.assertEqual(run.call_count, attempt + 1)
+                for mirror in mirrors:
+                    fields = cast(dict[str, object], json.loads(copies.remote_record_path(mirror).read_text()))
+                    if cause in ("refused", "authentication", "remote-refused", "missing-status"):
+                        self.assertNotIn("removal", fields)
+                    else:
+                        self.assertEqual(fields["removal"], "deferred")
+                        self.assertIn(f"{mirror.host}:{mirror.path}", output.getvalue())
+                        self.assertIn("next use of the host", output.getvalue())
+                    copies.unregister_remote(mirror.host, mirror.path)
+
+    def test_registration_retries_deferred_removal_without_removing_a_reused_mirror(self) -> None:
+        for action in ("remove", "reuse", "refused", "remote-refused", "missing-status"):
+            root = self.root / action
+            root.mkdir()
+            with self.subTest(action=action), local_remote_transport(root), warm_claim_servers(), ExitStack() as contexts:
+                mirror = self.remote(path=str(root / "mirror"))
+                self.assertEqual(publish_mirror(mirror), 0)
+                payload = Path(mirror.path) / "saved-work"
+                write_text_atomic(payload, "retained work\n")
+                path = copies.remote_record_path(mirror)
+                fields = cast(dict[str, object], json.loads(path.read_text()))
+                fields["removal"] = "deferred"
+                write_text_atomic(path, json.dumps(fields) + "\n")
+                active = mirror if action == "reuse" else self.remote(path=str(root / "active"))
+                if action == "refused":
+                    contexts.enter_context(copies.local_mirror_lease(Path(mirror.path), "busy-worker"))
+                if action in ("remote-refused", "missing-status"):
+                    remote_output = "rc=2\n" if action == "remote-refused" else ""
+                    _ = contexts.enter_context(mock.patch.object(subprocess, "run", return_value=
+                        subprocess.CompletedProcess(["ssh"], 0, remote_output, "mirror is busy")))
+                error = io.StringIO()
+                with redirect_stderr(error):
+                    copies.register_remote(active)
+                if action == "remove":
+                    self.assertEqual(copies.owned_remote_mirrors("alpha"), [active])
+                    self.assertFalse(Path(mirror.path).exists())
+                elif action == "reuse":
+                    self.assertNotIn("removal", cast(dict[str, object], json.loads(path.read_text())))
+                    self.assertEqual(payload.read_text(), "retained work\n")
+                    self.assertEqual(error.getvalue(), "")
+                else:
+                    self.assertEqual(cast(dict[str, object], json.loads(path.read_text()))["removal"], "deferred")
+                    self.assertEqual(payload.read_text(), "retained work\n")
+                    self.assertEqual(len(error.getvalue().splitlines()), 1)
+                    self.assertIn("anomaly:", error.getvalue())
+                    self.assertIn(mirror.path, error.getvalue())
 
     def test_busy_owner_removal_names_holder_and_path(self) -> None:
         mirror = self.remote()
@@ -645,7 +721,7 @@ exec(compile(program, '<remote-probe>', 'exec'))
     def test_allow_list_keeps_only_original_copy_makers(self) -> None:
         settings = conf.read(Path(__file__).resolve().parents[2] / "config/copies.conf").values()
         entries = {key.removeprefix("allow.") for key in settings if key.startswith("allow.")}
-        self.assertEqual(entries, {"copies/copies.py", "production/add_unit.py", "shutdown/shutdown.py",
+        self.assertEqual(entries, {"copies/copies.py", "production/add_unit.py", "agents/shutdown.py",
             "style/add_style.py", "worktree/make_worktree.sh", "worktree/worktrees.py",
             "bevy_migration_plan/bevy_migration_ensure_repo.sh"})
 

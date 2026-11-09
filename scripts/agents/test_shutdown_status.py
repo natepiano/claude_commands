@@ -17,13 +17,13 @@ from contextlib import redirect_stderr, redirect_stdout
 from typing import cast, final, override
 from unittest.mock import patch
 
-from scripts.shutdown.test_support import ShutdownSendLeaf, ShutdownTestCase
+from scripts.agents.test_support import ShutdownSendLeaf, ShutdownTestCase
 from scripts.production.staff_test_support import fixture_member, fixture_worker
-from scripts.shutdown import shutdown, restart, shutdown_record, stop_resume, inventory
+from scripts.agents import shutdown, restart, shutdown_record, stop_resume, inventory
 from scripts.herdr import herdr, worker_panes
 from scripts.production import staff, session_staff
 from scripts.whoami.account import UnreadableAccount
-from scripts.shutdown.inventory import Inventory
+from scripts.agents.inventory import Inventory
 
 
 LOGIN = "owner@example.com"
@@ -32,7 +32,7 @@ LOGIN = "owner@example.com"
 def action_line(label: str, verb: str, names: str, machine: str = "natedev") -> str:
     identities = ",".join(name + "-id" for name in names.split(", "))
     return (f"  {label}: in a terminal on {machine}: ~/.claude/scripts/lib/py "
-        f"~/.claude/scripts/shutdown/shutdown.py {verb} {LOGIN} --here --only {identities} · {names}")
+        f"~/.claude/scripts/agents/shutdown.py {verb} {LOGIN} --here --only {identities} · {names}")
 
 
 def empty_inventory(machine: str = "natedev") -> Inventory:
@@ -91,7 +91,7 @@ class ShutdownStatusTests(ShutdownTestCase):
         idle = worker_panes.OpenWorker(row, "w1:p1", "agents", herdr.AgentStatus.IDLE)
         with (patch.object(session_staff, "pane_parents", return_value=[parent]),
               patch.object(worker_panes, "observe_parents", side_effect=[{parent.id: [busy]}, {parent.id: [idle]}]),
-              patch("scripts.shutdown.shutdown.time.sleep") as delay,
+              patch("scripts.agents.shutdown.time.sleep") as delay,
               redirect_stdout(io.StringIO()) as output):
             shutdown.wait_for_workers(record)
         delay.assert_called_once_with(1)

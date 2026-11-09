@@ -31,8 +31,8 @@ class StatusDiscoveryTests(StaffTestCase):
 
 
     def test_codex_launch_membership_keeps_its_native_environment_without_a_claude_identity(self) -> None:
-        from scripts.shutdown import pane_record
-        from scripts.shutdown.launch_names import LaunchNames
+        from scripts.agents import pane_record
+        from scripts.agents.launch_names import LaunchNames
 
         fixture = self.row_production()
         launch = pane_record.launch("w1:p1", fixture.unit.id, str(fixture.worktree),
@@ -61,8 +61,8 @@ class StatusDiscoveryTests(StaffTestCase):
         self.assertEqual(entry["session_id"], fixture.unit.current_session)
 
     def test_record_membership_derives_staff_marks_only_at_launch(self) -> None:
-        from scripts.shutdown import pane_record
-        from scripts.shutdown.launch_names import LaunchNames
+        from scripts.agents import pane_record
+        from scripts.agents.launch_names import LaunchNames
 
         fixture = self.row_production()
         entry = pane_launch.launch("w1:p1", fixture.unit.current_session, str(fixture.worktree),
@@ -75,7 +75,7 @@ class StatusDiscoveryTests(StaffTestCase):
 
     def test_repair_removes_saved_staff_marks_and_keeps_pane_data(self) -> None:
         from scripts.message import sessions
-        from scripts.shutdown import pane_record
+        from scripts.agents import pane_record
 
         fixture = self.row_production()
         entry = pane_launch.launch("w1:p1", fixture.unit.current_session, str(fixture.worktree),

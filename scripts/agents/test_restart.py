@@ -1,7 +1,7 @@
 """Restart staff rows without a session journal."""
 from __future__ import annotations
 
-from scripts.shutdown import remote
+from scripts.agents import remote
 
 import io
 import math
@@ -24,24 +24,24 @@ from typing import Literal, cast, override
 from dataclasses import replace
 from unittest.mock import call, patch
 
-from scripts.shutdown import inventory
+from scripts.agents import inventory
 from scripts.herdr import herdr, pane_launch, worker_panes
 from scripts.message import sessions
-from scripts.shutdown import restart, shutdown
-from scripts.shutdown.unit_staff_test_support import unit_host
+from scripts.agents import restart, shutdown
+from scripts.agents.unit_staff_test_support import unit_host
 from scripts.production import fake_unit_host, session_staff, staff, worker
 from scripts.production import test_worker
 from scripts.accounts import accounts
 from scripts.whoami import agent_accounts, note_file
 from scripts.whoami.account import Account, UnknownAccountName
 from scripts.message import codex_daemon
-from scripts.shutdown import shutdown_record, stop_resume, pane_record
+from scripts.agents import shutdown_record, stop_resume, pane_record
 from scripts.lib import file_lock, unit_runs
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.production.staff_test_support import fixture_member
 from scripts.herdr.fake_herdr import herdr_listener
 from scripts.direct import progress_history
-from scripts.shutdown.test_support import ShutdownTestCase, registry_confirmation
+from scripts.agents.test_support import ShutdownTestCase, registry_confirmation
 
 LAUNCH_PREPARED_AGENT = herdr.launch_prepared_agent
 STOP_SESSION = stop_resume.stop
@@ -427,7 +427,7 @@ class SessionLaunchTests(RestartTestCase):
         (project / f"{identity}.jsonl").touch()
         output = io.StringIO()
         with (patch.object(pane_record, "RECORD_DIR", records),
-              patch("scripts.shutdown.restart.sessions.config_dirs", return_value=[config]),
+              patch("scripts.agents.restart.sessions.config_dirs", return_value=[config]),
               patch.object(restart, "named_account_environment", return_value={"CLAUDE_CONFIG_DIR": "/account"}),
               redirect_stderr(output)):
             kind, environment, arguments = restart.session_launch(identity, "current-name")
@@ -731,7 +731,20 @@ class MixedRestartTests(ShutdownTestCase):
                 request = cast(dict[str, object], json.loads(self.rfile.readline()))
                 with lock:
                     response = reply(request)
-                _ = self.wfile.write((json.dumps({"result": response}) + "\n").encode())
+                try:
+                    _ = self.wfile.write((json.dumps({"result": response}) + "\n").encode())
+                except BrokenPipeError:
+                    pass
+
+        for failure in (None, BrokenPipeError("client closed")):
+            with self.subTest(client_failure=failure):
+                handler = object.__new__(Handler)
+                handler.rfile = io.BytesIO(b'{}\n')
+                stream = io.BytesIO()
+                handler.wfile = stream
+                with patch.object(stream, "write", side_effect=failure, wraps=stream.write):
+                    handler.handle()
+                self.assertEqual(stream.getvalue(), b"" if failure else b'{"result": {}}\n')
 
         endpoint = root / "config/herdr/sessions/agents/herdr.sock"
         endpoint.parent.mkdir(parents=True)

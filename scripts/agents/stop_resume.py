@@ -38,9 +38,9 @@ from scripts.production.staff import STAFF_ROOT
 from scripts.whoami import agent_accounts, note_file
 from scripts.lib import conf, operation_deadline
 from scripts.message import session_send
-from scripts.shutdown import member_account, pane_record
-from scripts.shutdown.launch_names import LaunchNames, LaunchNamesNotRead
-from scripts.shutdown.codex_trust import trust_arguments
+from scripts.agents import member_account, pane_record
+from scripts.agents.launch_names import LaunchNames, LaunchNamesNotRead
+from scripts.agents.codex_trust import trust_arguments
 from scripts.herdr import pane_launch
 from scripts.production import staff
 from scripts.lib.resume_message import (
@@ -50,7 +50,7 @@ from scripts.lib.resume_message import (
     resume_message as resume_message,
     resume_worker_command as resume_worker_command,
 )
-from scripts.shutdown.stop_results import (
+from scripts.agents.stop_results import (
     Stopped as Stopped, NotRunning as NotRunning, StopFailed as StopFailed,
     SESSION_WITHOUT_STAFF_ROW,
     StopUnproved as StopUnproved,
@@ -59,10 +59,10 @@ from scripts.shutdown.stop_results import (
     ResumeResult as ResumeResult, StopResult, SourceRelease, SourceReleased, SourceUnresolved, SourceReleaseUnknown,
 )
 from scripts.message import sessions
-from scripts.shutdown.stop_results import shutdown_state_root
+from scripts.agents.stop_results import shutdown_state_root
 
 if TYPE_CHECKING:
-    from scripts.shutdown.restart import StopReadArguments
+    from scripts.agents.restart import StopReadArguments
     from scripts.herdr import worker_panes
     from scripts.production.staff import StaffRow, StaffSnapshot, ClaudeBackend, CodexBackend, BackendUnavailable, StaffId
 
@@ -397,7 +397,7 @@ def stop_unit_workers(unit: StaffId, record: StaffSnapshot, *,
     """Stop the selected workers concurrently and retain every staff row."""
     from scripts.agents import worker_lifecycle
     from scripts.herdr import worker_panes
-    from scripts.shutdown import restart
+    from scripts.agents import restart
 
     if not record.find(kind="worker", parent=unit):
         return []
@@ -628,7 +628,7 @@ def _member_machine(member: StaffRow) -> str:
 
 def _nearby_resume_names(reference: str, names: LaunchNames) -> list[str]:
     """Select close names from local units and showrunners."""
-    from scripts.shutdown import remote
+    from scripts.agents import remote
 
     machine = remote.local_machine()
     return sorted({row.name for row in names.tab_record.rows
@@ -674,7 +674,7 @@ def _unrecorded_codex_launch(identity: str) -> pane_record.PaneLaunch | SessionN
     path = next((agent_accounts.codex_home() / "sessions").glob(f"**/rollout-*{identity}.jsonl"), None)
     if path is None:
         return SessionNotFound(identity)
-    restart = cast(RowStarter, cast(object, import_module("scripts.shutdown.restart")))
+    restart = cast(RowStarter, cast(object, import_module("scripts.agents.restart")))
     try:
         kind, environment, arguments = restart.session_launch(identity, identity)
     except OSError:
@@ -696,7 +696,7 @@ def _resume(session: str, *, why: str = "resumed by name", to: str | None = None
     if len(matches) > 1:
         return ResumeFailed(session, f"ambiguous name; candidates: {candidates}")
     if matches:
-        from scripts.shutdown import remote
+        from scripts.agents import remote
 
         member = matches[0]
         machine = _member_machine(member)
@@ -770,7 +770,7 @@ def _resume_once(session: str, *, why: str, to: str | None = None, requester: st
         if entry is None:
             if row is None:
                 return SessionNotFound(session)
-            restart = cast(RowStarter, cast(object, import_module("scripts.shutdown.restart")))
+            restart = cast(RowStarter, cast(object, import_module("scripts.agents.restart")))
             pane = restart.start_row(row, names.tab_record, client, target_account=to or "")
             result = running_on_account(identity, pane)
             if isinstance(result, ClaudeUp):
@@ -986,7 +986,7 @@ def _early_exit(identity: str, pane: str, account: str, elapsed: float, *, reque
     from datetime import datetime, timezone
     from scripts.whoami import quota_alert
     from scripts.lib.probe_session import PROBE_ENV
-    from scripts.shutdown import remote
+    from scripts.agents import remote
 
     try:
         record = staff.snapshot()

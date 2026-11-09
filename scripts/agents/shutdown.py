@@ -44,7 +44,7 @@ from scripts.production import (
 from scripts.production.production_doc import Production, Refusal, read_production
 from scripts.production.rename_state import RenameRefused, production_journal, read_json, write_json
 from scripts.lib.atomic_file import write_text_atomic
-from scripts.shutdown import (
+from scripts.agents import (
     restart,
     restart_support,
     shutdown_record,
@@ -53,7 +53,7 @@ from scripts.shutdown import (
     remote,
     pane_record,
 )
-from scripts.shutdown.inventory import (
+from scripts.agents.inventory import (
     CheckoutState,
     Host,
     InvalidInventory,
@@ -62,8 +62,8 @@ from scripts.shutdown.inventory import (
     inventory,
     parse_inventory,
 )
-from scripts.shutdown.remote import other_machine, run_remote as run_remote, local_machine
-from scripts.shutdown.stop_results import StopResult, ResumeResult
+from scripts.agents.remote import other_machine, run_remote as run_remote, local_machine
+from scripts.agents.stop_results import StopResult, ResumeResult
 from scripts.whoami import agent_accounts, note_file
 from scripts.whoami.account import (
     Account,
@@ -281,6 +281,19 @@ def _finish_tasks(row: staff.StaffRow, record: staff.StaffSnapshot) -> None:
     wait_for_workers(staff.StaffSnapshot(tuple(children)))
 
 
+def _worktree_is_remote(row: staff.StaffRow) -> bool:
+    return not isinstance(row.worktree, staff.WorktreeUnfilled) and not unit_machine_is_local(row.worktree.machine)
+
+
+def _paused_resume_needs_message(row: staff.StaffRow) -> bool:
+    remote = (_worktree_is_remote(row) if not isinstance(row.worktree, staff.WorktreeUnfilled) else
+              isinstance(row.doc, (staff.LiveDoc, staff.WrappedDoc)) and not unit_machine_is_local(row.doc.machine))
+    return isinstance(row.paused, staff.Paused) and (remote or isinstance(
+        stop_resume.running_on_account(str(row.current_session), "",
+            kind="codex" if isinstance(staff.backend(row), staff.CodexBackend) else "claude"),
+        stop_resume.ClaudeUp))
+
+
 def _lifecycle(options: CommandLine) -> int:
     from scripts.production import session_staff
 
@@ -309,7 +322,7 @@ def _lifecycle(options: CommandLine) -> int:
                 print(f"{row.name}: retired; use agents resume {row.name} --retired", file=sys.stderr)
                 code = 2
                 continue
-            if isinstance(row.paused, staff.Paused):
+            if _paused_resume_needs_message(row):
                 _ = staff.resume(str(row.id))
                 delivery = _message(row, "Continue where you stopped. Resume your existing workers. Do not open new workers.")
                 if restart_support.message_was_delivered(delivery):
@@ -318,14 +331,22 @@ def _lifecycle(options: CommandLine) -> int:
                     _ = staff.set_hold(str(row.id), row.paused)
                     code = 1
             else:
-                result = stop_resume.resume(str(row.id), why=options.why, to=options.to)
-                if isinstance(result, stop_resume.ClaudeUp) and isinstance(row.exited, staff.Exited):
-                    _ = staff.resume(str(row.id))
-                code = max(code, _result_code(result))
+                started = False
+                try:
+                    if isinstance(row.paused, staff.Paused):
+                        _ = staff.resume(str(row.id))
+                    result = stop_resume.resume(str(row.id), why=options.why, to=options.to)
+                    started = isinstance(result, stop_resume.ClaudeUp)
+                    if started and isinstance(row.exited, staff.Exited):
+                        _ = staff.resume(str(row.id))
+                    code = max(code, _result_code(result))
+                finally:
+                    if not started and isinstance(row.paused, staff.Paused):
+                        _ = staff.set_hold(str(row.id), row.paused)
             continue
         already_exited = options.command == "exit" and isinstance(row.exited, staff.Exited)
         held = row if already_exited else staff.pause(str(row.id), options.why)
-        remote_exit = options.command == "exit" and not isinstance(row.worktree, staff.WorktreeUnfilled) and not unit_machine_is_local(row.worktree.machine)
+        remote_exit = options.command == "exit" and _worktree_is_remote(row)
         if options.finish_step and not remote_exit:
             _finish_tasks(row, record)
         if remote_exit:
@@ -832,6 +853,24 @@ def retirement_find_unit(production_name: str, given: str, *,
 def retirement_last_session(unit: RetiringUnit) -> str:
     return unit.staff_member.current_session
 
+def retirement_branch_commits(unit: RetiringUnit, branch: str, *, settings: conf.ConfigRead) -> list[str]:
+    commits: list[str] = []
+    branch_ref = f"refs/heads/{branch}"
+    observed = retirement_git(unit, "show-ref", "--verify", "--quiet", branch_ref, settings=settings)
+    if observed.returncode == 0:
+        commits.append(branch_ref)
+    elif observed.returncode != 1:
+        raise OSError(retirement_failure(observed))
+    remote = retirement_git(unit, "ls-remote", "--exit-code", "--heads", "origin", branch_ref, settings=settings)
+    if remote.returncode not in (0, 2):
+        raise OSError(retirement_failure(remote))
+    if remote.returncode == 0:
+        fetched = retirement_git(unit, "fetch", "--no-tags", "--no-write-fetch-head", "--refmap=", "-q", "origin", branch_ref, settings=settings)
+        if fetched.returncode:
+            raise OSError(retirement_failure(fetched))
+        commits.append(remote.stdout.split()[0])
+    return commits
+
 def retirement_refusals(unit: RetiringUnit, *, settings: conf.ConfigRead, check_absent_branch: bool = False) -> list[str]:
     """Keep uncommitted work and commits outside the merge branch."""
     present = unit.worktree.is_dir()
@@ -846,26 +885,13 @@ def retirement_refusals(unit: RetiringUnit, *, settings: conf.ConfigRead, check_
                  if not (line[:2] == " M" and retirement_recorder_line_only(unit.worktree, line[3:], settings=settings))]
         if paths:
             found.append(f"uncommitted work in {unit.worktree}: {', '.join(paths)}")
-    refs: list[str] = []
-    if unit.branch:
-        branch_ref = f"refs/heads/{unit.branch}"
-        observed = retirement_git(unit, "show-ref", "--verify", "--quiet", branch_ref, settings=settings)
-        if observed.returncode == 0:
-            refs.append(branch_ref)
-        elif observed.returncode != 1:
-            raise OSError(retirement_failure(observed))
-    elif present:
-        refs.append("HEAD")
-    remote = retirement_git(unit, "ls-remote", "--exit-code", "--heads", "origin", unit.branch, settings=settings)
-    if remote.returncode not in (0, 2):
-        raise OSError(retirement_failure(remote))
-    if remote.returncode == 0:
-        fetched = retirement_git(unit, "fetch", "--no-write-fetch-head", "--refmap=", "-q", "origin", unit.branch, settings=settings)
-        if fetched.returncode:
-            raise OSError(retirement_failure(fetched))
-        refs.append(remote.stdout.split()[0])
+    refs = (retirement_branch_commits(unit, unit.branch, settings=settings) if unit.branch else
+            ["HEAD"] if present else [])
+    merge_refs = retirement_branch_commits(unit, unit.production.merge_branch, settings=settings)
+    if not merge_refs:
+        raise OSError(f"merge branch {unit.production.merge_branch} is absent from origin and this clone")
     for ref in refs:
-        commits = retirement_git(unit, "rev-list", "--no-merges", ref, "--not", unit.production.merge_branch, settings=settings)
+        commits = retirement_git(unit, "rev-list", "--no-merges", ref, "--not", *merge_refs, settings=settings)
         if commits.returncode:
             raise OSError(retirement_failure(commits))
         if commits.stdout.strip():

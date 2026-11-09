@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from scripts.shutdown import remote
+from scripts.agents import remote
 
 from scripts.style.ledger_test_support import ticket_owner_id
 
@@ -290,7 +290,7 @@ class StyleLedgerTicketsTests(LedgerTestCase):
         second = fixture_member("unit", name=first.name, parent=other_parent.id,
             worktree=staff.PresentWorktree(remote.local_machine(), self.root / "other-names"))
         ledger = self.ledger()
-        with mock.patch("scripts.shutdown.remote.local_machine", return_value=remote.local_machine()):
+        with mock.patch("scripts.agents.remote.local_machine", return_value=remote.local_machine()):
             for row in (first, second):
                 self.assertIsInstance(row.worktree, staff.PresentWorktree)
                 assert isinstance(row.worktree, staff.PresentWorktree)

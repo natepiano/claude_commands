@@ -8,9 +8,9 @@ from pathlib import Path
 from typing import override
 from unittest.mock import patch
 
-from scripts.shutdown import inventory
-from scripts.shutdown import test_inventory as fixtures
-from scripts.shutdown.test_support import ShutdownTestCase
+from scripts.agents import inventory
+from scripts.agents import test_inventory as fixtures
+from scripts.agents.test_support import ShutdownTestCase
 
 
 class ProbeInventoryTests(ShutdownTestCase):

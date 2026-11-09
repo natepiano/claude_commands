@@ -38,7 +38,7 @@ from scripts.lib.user_zone import user_zone_name  # noqa: E402
 from scripts.message.sessions import SessionRecord, messaging_socket_exists  # noqa: E402
 from scripts.lib.session_paths import sessions_directory as sessions_directory
 from scripts.production import staff  # noqa: E402
-from scripts.shutdown import remote  # noqa: E402
+from scripts.agents import remote  # noqa: E402
 
 RULES = "Read the Nested showrunners rules in ~/.claude/commands/showrunner/produce.md."
 

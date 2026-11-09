@@ -17,14 +17,14 @@ from pathlib import Path
 from typing import Never, cast, override
 from unittest.mock import patch
 
-from scripts.shutdown import remote
-from scripts.shutdown import remote_control
-from scripts.shutdown import restart
+from scripts.agents import remote
+from scripts.agents import remote_control
+from scripts.agents import restart
 from scripts.herdr import herdr
-from scripts.shutdown import restart_support
-from scripts.shutdown import shutdown
+from scripts.agents import restart_support
+from scripts.agents import shutdown
 from scripts.message import sessions
-from scripts.shutdown.unit_staff_test_support import isolated_parents
+from scripts.agents.unit_staff_test_support import isolated_parents
 from scripts.production.staff_test_support import isolated_staff_file, showrunner_relationship
 
 

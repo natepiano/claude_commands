@@ -20,7 +20,7 @@ from unittest.mock import patch
 
 from scripts.whoami.note_file import note_name
 
-from scripts.shutdown import inventory
+from scripts.agents import inventory
 from scripts.message import sessions
 from scripts.production import showrunners
 from scripts.production.staff_test_support import recorded_showrunner
@@ -29,9 +29,9 @@ from scripts.whoami import agent_accounts
 from scripts.accounts import accounts, refusals
 from scripts.accounts.home_test_support import scratch_accounts_config
 from scripts.accounts.move_test_support import FakeSessionMoves, MoveCall
-from scripts.shutdown import stop_resume
-from scripts.shutdown.test_restart import showrunner, top_level, unit
-from scripts.shutdown.test_support import ShutdownTestCase
+from scripts.agents import stop_resume
+from scripts.agents.test_restart import showrunner, top_level, unit
+from scripts.agents.test_support import ShutdownTestCase
 
 # Hang guard: natedev reached load 136 on 2026-10-29; scheduling delays are not failures.
 HANG_GUARD_SECONDS = 300

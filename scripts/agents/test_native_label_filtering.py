@@ -6,7 +6,7 @@ from unittest.mock import patch
 
 from scripts.production.staff_test_support import StaffTestCase
 from scripts.herdr import pane_launch
-from scripts.shutdown import pane_record
+from scripts.agents import pane_record
 
 
 class NativeLabelFilteringTests(StaffTestCase):

@@ -28,7 +28,7 @@ from scripts.lib import copy_record
 from scripts.production import (
     showrunners, staff, change_routing, merge_checkpoint, session_staff, production_doc, unit_config, unit_lookup,
 )
-from scripts.shutdown import remote
+from scripts.agents import remote
 from scripts.production.production_doc import Production
 from zoneinfo import ZoneInfo
 from scripts.production.staff_test_support import fixture_member, fixture_runtime_id, recorded_showrunner, recorded_unit

@@ -30,14 +30,14 @@ from scripts.production import tidy_wrapped  # noqa: E402
 from scripts.production import unit_lookup  # noqa: E402
 from scripts.herdr import pane_launch
 from scripts.herdr import herdr  # noqa: E402
-from scripts.shutdown import pane_record  # noqa: E402
+from scripts.agents import pane_record  # noqa: E402
 from scripts.lib.process_failure import failure_detail  # noqa: E402
 from scripts.production.rename_state import RenameRefused, read_json, write_json  # noqa: E402
 from scripts.lib import conf  # noqa: E402
 from scripts.agents import worker_lifecycle  # noqa: E402
 from scripts.message import sessions  # noqa: E402
 from scripts.production import staff  # noqa: E402
-from scripts.shutdown import remote  # noqa: E402
+from scripts.agents import remote  # noqa: E402
 
 BERTH_KEY = "cargoBerthTarget"
 
@@ -536,7 +536,7 @@ def _move_folder(unit: staff.StaffId, destination: Path, *, branch: str | KeepBr
             _check_move_deadline()
             _ = locks.enter_context(staff.row_operation(str(member.id)))
         # The delayed import avoids the restart module's dependency on unit_move.
-        restart = import_module("scripts.shutdown.restart")
+        restart = import_module("scripts.agents.restart")
         live_members = cast(Callable[[Iterable[staff.StaffRow], staff.StaffSnapshot], list[staff.StaffRow]], restart.live_members)
         stop_row = cast(Callable[[staff.StaffRow, herdr.Herdr], bool], restart.stop_row)
         start_row = cast(Callable[[staff.StaffRow, staff.StaffSnapshot, herdr.Herdr], str], restart.start_row)

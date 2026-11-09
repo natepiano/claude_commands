@@ -25,7 +25,7 @@ from scripts.lib import berth_board
 from scripts.style import rules
 from scripts.style import style_ledger
 from scripts.style import unit_files
-from scripts.shutdown import remote
+from scripts.agents import remote
 from scripts.production import staff
 from scripts.production.staff_test_support import fixture_member, fixture_unit_location, recorded_showrunner
 

@@ -41,7 +41,7 @@ def run_remote(
 ) -> tuple[int, str]:
     """Run shutdown.py remotely, trusting its explicit trailer rather than ssh's status."""
     arguments = " ".join(shlex.quote(argument) for argument in args)
-    remote_command = '"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/shutdown/shutdown.py"'
+    remote_command = '"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/agents/shutdown.py"'
     if arguments:
         remote_command += f" {arguments}"
     remote_command += '; printf "rc=%s\\n" $?'
