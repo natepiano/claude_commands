@@ -971,3 +971,8 @@ Only the renewer's sleep may stop; inherited jobs must survive.
 Memory-growth reproductions use a bounded scope, such as `MemoryMax=3G` with swap disabled.
 `step_selection.py` must remain cheap because every target command imports it.
 `parse_port_cell` imports `cell_value` locally, so progress-history startup avoids unrelated production and message imports.
+
+The merge gate owns module folders through `temporary_build_folder` contexts.
+The contexts remove folders after success or an exception.
+Style lint uses the same context and keeps its standing Cargo target.
+Style review keeps its input folder because the review worker reads it after preparation exits.

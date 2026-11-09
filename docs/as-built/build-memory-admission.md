@@ -1221,13 +1221,28 @@ The message names the Mac when its disk is low.
 A current `sweep.disk_floor` text approval also permits one phone push per episode.
 The push names the machine and recommends one measured folder, or asks for measurements when folder sizes are unavailable.
 Each channel keeps its own receipt; a failed channel can retry without repeating the accepted delivery.
-A reading above the alert line plus `sweep_phone_rearm_gib` rearms both channels.
-Equality with that boundary does not rearm them.
-`config/lint.conf` sets the margin to 5 GiB beside `sweep_phone_floor_gib`.
-With the 150 GiB alert line, free space must exceed 155 GiB before a later crossing can send another alert.
+Every pass must read above the alert line plus `sweep_phone_rearm_gib` for `sweep_phone_rearm_minutes` before the crossing rearms.
+The crossing record keeps the first above-line time under the record lock.
+A reading at or below that boundary restarts the interval.
+`config/lint.conf` sets the margin to 5 GiB and the interval to 60 minutes.
+With the 150 GiB alert line, free space must stay above 155 GiB for 60 minutes.
+Rearm sends one `sweep.disk_floor_recovered` phone push after an accepted fall push.
+The return receipt and its stable key prevent accepted return delivery from repeating.
+A failed return delivery retries above the rearm line.
+A later fall starts a new episode even when the previous return receipt stays pending.
+At recovery, `disk_floor` retires every open crossing's `phone:<identity>` fall key on natedev, which owns the silence queue.
+This includes a crossing whose fall phone receipt stays pending.
+The Mac reaches this retirement through ssh natedev.
+If retirement drops a kept fall push, the fall never reached the user and no return push sends.
+The reported dropped count determines this result even when the retire command exits with an error.
+A retire attempt without a dropped count suppresses the return push in the saved crossing state.
+The next pass retries retirement; a completed retry closes that crossing without a return push.
+Only an accepted fall and a first retire result of zero dropped pushes permit a return push.
+An episode with a pending fall phone receipt gets no return push.
 The same rule applies to natedev and the Mac.
 While text approval is stale, the natedev message still sends and the phone receipt stays pending.
 The phone channel can send that pending episode after the showrunner records the new approval.
+The return text needs its own approval before delivery.
 
 Natedev also records cache sizes, growth and removal accounting. These reports stay outside the Mac path:
 
@@ -1488,6 +1503,12 @@ An inode counts once only when every hard link is inside that folder.
 An inode with a link outside the folder counts zero.
 The measurement does not follow directory symlinks.
 The alert lists these folders from largest to smallest.
+It lists only enough folders to cover the shortfall, up to `sweep_alert_folder_count`, which defaults to three.
+Held folder lines count toward this limit, but held bytes do not cover the shortfall.
+Zero-byte folders do not appear.
+Folder paths stay complete; home-relative paths may use `~`.
+When the session text exceeds its limit, the alert lists fewer folders and does not shorten their paths.
+If the full recommendation still exceeds the limit, the session text asks for measurements and names no folder.
 The floor pass carries held target paths separately from folders with no recorded evidence.
 Live process use, Mac claims, mirror leases, build holds, busy judgment locks, and held cargo locks identify held output.
 A folder that contains held output, lies inside held output, or equals held output gets the held label.
@@ -1710,3 +1731,8 @@ It retains Cargo inputs and `NEXTEST_CARGO_PROFILE`.
 `record.py` stores `test_build_key` only when source stays unchanged during nextest.
 Rows without a key cannot prove a fresh build.
 The broader `BUILDLOG_TREE` field cannot replace this key.
+
+The merge gate and style lint own private folders through `build_folders.temporary_build_folder`.
+The contexts remove these folders after success or an exception.
+Style review keeps its input folder for the review worker and finish command.
+Session TMPDIRs and unit session folders remain for later session commands.
