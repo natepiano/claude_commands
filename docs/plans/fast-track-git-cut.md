@@ -36,32 +36,6 @@ The item in `docs/plans/sdlc-devtools-tests-next.md`: `reconcile` repeats `rev-p
 
 **Depends on:** none
 
-#### Work Order
+#### As-built
 
-**Goal:** `scripts.production.test_fast_track` and the copies tests start fewer Git processes and spend less time in Git, with the same behavior.
-
-**Spec:**
-
-1. Measure first. Put a `git` shim in a temporary folder outside the repo, first on `PATH`. The shim appends its arguments to a log file, then runs the real Git. Run each Test command and record the Git process count, the count for each subcommand and the wall time. Run the same measurement after the last edit. Delete the shim and the logs after the last measurement.
-2. In `scripts/production/fast_track.py`, make one Git runner type the only place that starts a Git process. Every Git call in the file goes through it, including the direct `subprocess.run` calls. Create the runner at the entry point and pass it down.
-3. In `reconcile`, read each ref and each object once. The runner may keep a cache of ref and object reads for one `reconcile` pass. An `update-ref` or any other write through the runner must drop or update each cached entry that the write makes stale. A cached value must never hide a ref that another process moved during a step that needs a fresh value, such as a compare-and-swap or a push.
-4. In `scripts/copies/copies.py`, make the remote refresh fetch each remote once for one refresh.
-5. Add no check, scan or gate. Keep every existing assertion. Tests keep real Git.
-
-**Files:**
-- `scripts/production/fast_track.py` — the Git runner and `reconcile`
-- `scripts/production/test_fast_track.py` — only the changes that the runner requires
-- `scripts/copies/copies.py` — the remote refresh
-- `scripts/copies/test_copies.py`, `scripts/copies/test_remote_copies.py`, `scripts/copies/test_review_remote_copies.py` — only the changes that the refresh requires
-
-**Workers:** 1 writer — the item takes one new worker.
-- `impl` — the files above.
-
-**State:** none — the phase changes how Git is called and writes no new lasting state.
-
-**Constraints from prior phases:** none.
-
-**Acceptance gate:**
-- The two Test commands above pass.
-- `basedpyright` on the changed files gives `0 errors, 0 warnings, 0 notes`.
-- The summary gives the before and after Git process count, the count for each subcommand and the wall time, for each Test command. The `fast_track` Git process count and the `copies` fetch count are lower after the change.
+`GitRunner` in `scripts/production/fast_track.py` is the only place that starts Git. It keeps successful reads of objects addressed by full hash for one `reconcile` pass. Reads of refs and ancestry stay fresh. `refresh_remotes` in `scripts/copies/copies.py` makes one fetch for both mappings. Checkpoint 0be4e208c.
