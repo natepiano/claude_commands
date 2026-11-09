@@ -73,6 +73,7 @@ class TargetedTestTests(MergeGateFixture):
     def test_a_nightly_red_marker_keeps_selection_by_the_four_rules(self) -> None:
         subject = self.checkout / "scripts/hooks/affected_subject.py"
         self.write(subject, "VALUE = 1\n")
+        self.write(self.checkout / "scripts/hooks/test_first.py", SUITE_MODULE + "\n# affected_subject\n")
         self.write(self.checkout / "scripts/lib/test_first.py", "import scripts.hooks.affected_subject\n" + SUITE_MODULE)
         self.write(self.checkout / "scripts/message/test_first.py", 'SUBJECT = "assets/changed.txt"\n' + SUITE_MODULE)
         self.write(self.checkout / "scripts/message/test_unrelated.py", SUITE_MODULE)

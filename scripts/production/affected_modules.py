@@ -378,15 +378,23 @@ def select_affected(repo: Path, base: CertifiedBase | NoCertifiedBase,
             old_graph = graph_for_files(repo, old_paths, old_blobs, set(), cached, worktree=False).imports
             retained.update(source_blobs(old_paths, old_blobs))
         retain_facts(cache_path, cached, before, retained)
-        folders = {str(Path(path).parent) for path in python if not is_test_module(path)}
+        folder_stems: dict[str, set[str]] = defaultdict(set)
+        for source in python:
+            if not is_test_module(source):
+                folder_stems[str(Path(source).parent)].add(Path(source).stem)
         selected: list[Path] = []
         for module in modules:
             path = module.relative_to(repo).as_posix()
             if (path in changed or graph.imports.get(path, set()) & python
                     or old_graph.get(path, set()) & removed or graph.tokens.get(path, frozenset()) & changed
-                    or config_reads.get(path, set()) & configs
-                    or str(Path(path).parent) in folders):
+                    or config_reads.get(path, set()) & configs):
                 selected.append(module)
+                continue
+            stems = folder_stems.get(str(Path(path).parent), set())
+            if stems:
+                text = module.read_text(encoding="utf-8")
+                if any(re.search(rf"\b{re.escape(stem)}\b", text) for stem in stems):
+                    selected.append(module)
         return AffectedSelection(base, tuple(sorted(changed)), tuple(selected))
     except (GraphError, OSError, ValueError, SyntaxError) as error:
         return FullSuite(f"graph error: {error}")
