@@ -82,6 +82,7 @@ The shared pane launch builder uses `set_home`.
 | `scripts/accounts/accounts.py` | read | local_snapshot |
 | `scripts/accounts/pane_moves.py` | read | local_snapshot, WorkerName.parse |
 | `scripts/accounts/refusal_watch.py` | read | initial_snapshot |
+| `scripts/accounts/session_state.py` | read | StaffRow, Exited, Paused |
 | `scripts/accounts/unit_watchdog.py` | read | active, initial_snapshot, snapshot |
 | `scripts/agents/codex_mesh.py` | read | native_id, runtime_id, snapshot |
 | `scripts/agents/mesh_runs.py` | read | local_snapshot |
@@ -202,6 +203,7 @@ The shared pane launch builder uses `set_home`.
 | `scripts/production/unit_lookup.py` | read | snapshot |
 | `scripts/production/unit_move.py` | write | folder_move_path, native_id, set_worktree, snapshot |
 | `scripts/production/unit_phases.py` | read | snapshot |
+| `scripts/production/unit_queue.py` | read | local_snapshot, by_current_session, caller_identity, StaffId |
 | `scripts/production/unit_run.py` | read | snapshot |
 | `scripts/production/unit_status.sh` | read | snapshot |
 | `scripts/production/unit_status_test_support.py` | write | set_doc, set_worktree |

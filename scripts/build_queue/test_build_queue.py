@@ -130,7 +130,7 @@ class QueueTests(NotificationGuardedTestCase):
             rows = text.splitlines()
             running = [line for line in rows if line.lstrip().startswith("run")]
             self.assertEqual(len(running), 3)
-            self.assertTrue(all("builds" in row and "queue-unit" in row and "merge-gate" in row for row in running))
+            self.assertTrue(all("builds" in row and "queue-unit" in row and read_step_names().shown("merge-gate") in row for row in running))
             self.assertTrue(all("0.9 / 5.1" in row for row in running))
             positions = re.findall(r"^\s*(\d+)[ ▸]", text, re.MULTILINE)
             self.assertEqual(positions, [str(index) for index in range(1, 33)])
@@ -802,7 +802,7 @@ class QueueTests(NotificationGuardedTestCase):
         text = plain(queue_card.render_selection(model, "first", 400))
         row = next(row for row in text.splitlines() if "Selected running step:" in row)
         self.assertIn("8.0", row)
-        self.assertIn("anonymous use unavailable:", row)
+        self.assertIn("swap-backed use unavailable:", row)
         self.assertNotIn("second", text)
         self.assertNotIn("two", text)
         self.assertNotIn("anonymous use 0.0 GiB", row)

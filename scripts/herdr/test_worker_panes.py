@@ -49,6 +49,8 @@ class PaneWorld(herdr.Herdr):
         self.processes: dict[int, herdr.NativeAgentProcess] = {}
         self.foreground: dict[str, tuple[int, str, list[str]]] = {}
         self.shells: dict[str, int] = {}
+        self.exiting_panes: set[str] = set()
+        self.used_panes: set[str] = set()
         self.unknown: dict[str, str] = {}
         self.commands: list[tuple[str, ...]] = []
         self.reads: list[tuple[str, ...]] = []
@@ -106,6 +108,7 @@ class PaneWorld(herdr.Herdr):
     def add(self, row: staff.StaffRow, pane: str, *, live: bool = True,
             family: Literal["claude", "codex"] = "claude", terminal: str = "",
             label: str = "", workspace: str = "w1", tab: str = "w1:t1") -> None:
+        self.used_panes.add(pane)
         previous = [identity for identity, value in self.locations.items() if value["tab_id"] == tab]
         self.locations[pane] = {"pane_id": pane, "terminal_id": terminal or "terminal-" + pane,
                                 "workspace_id": workspace, "tab_id": tab, "label": label or row.name,
@@ -162,7 +165,7 @@ class PaneWorld(herdr.Herdr):
 
     def activate(self, identity: str, pane: str, family: Literal["claude", "codex"]) -> None:
         pid = 998600 + len(self.processes)
-        native = herdr.EnvironmentThread(identity) if family == "claude" else herdr.RolloutThread(identity)
+        native = herdr.EnvironmentThread(identity) if family == "claude" else herdr.PaneSessionReport(identity)
         environment = {"UNIT_RUN_DIR": run} if (run := os.environ.get("UNIT_RUN_DIR")) else {}
         self.processes[pid] = herdr.NativeAgentProcess(native, "fixture-generation", environment)
         self.foreground[pane] = pid, family, [family, "--resume" if family == "claude" else "resume", identity]
@@ -189,7 +192,7 @@ class PaneWorld(herdr.Herdr):
         for pane, (agent_pid, _, _) in tuple(self.foreground.items()):
             if pid == agent_pid:
                 self.stops.append(self.processes[pid].identity.id)
-                del self.foreground[pane]
+                self.end_agent(pane)
 
     def native_process(self, pid: int, kind: str, reported: str = "") -> herdr.NativeAgentProcess:
         if self.foreground and kind not in ("claude", "codex"):
@@ -247,7 +250,7 @@ class PaneWorld(herdr.Herdr):
         self.launch_timeouts.append(timeout_ms)
         self.requests.append((kind, agent_arguments.copy(), prepared.env.copy()))
         if isinstance(destination, herdr.SplitPane):
-            pane = "w1:p" + str(1 + max((int(identity.split(":p")[-1]) for identity in self.locations
+            pane = "w1:p" + str(1 + max((int(identity.split(":p")[-1]) for identity in self.used_panes
                                          if identity.split(":p")[-1].isdigit()), default=0))
             anchor = self.locations[destination.of_pane]
             self.locations[pane] = {**anchor, "pane_id": pane, "label": destination.label,
@@ -258,6 +261,9 @@ class PaneWorld(herdr.Herdr):
             pane = destination.pane
             if pane in self.foreground:
                 raise AssertionError("cannot launch in a busy pane")
+        self.used_panes.add(pane)
+        if isinstance(prepared, herdr.WorkerPaneEnvironment):
+            self.exiting_panes.add(pane)
         if self.interrupt == "split":
             self.interrupt = ""
             raise OSError("interrupted after split")
@@ -269,6 +275,8 @@ class PaneWorld(herdr.Herdr):
         process_root = self.process_root / str(pid)
         process_root.mkdir(parents=True, exist_ok=True)
         write_text_atomic(process_root / "stat", f"{pid} (fixture) S " + "0 " * 18 + "1\n")
+        write_text_atomic(process_root / "environ",
+                          "\0".join(f"{key}={value}" for key, value in self.processes[pid].environment.items()) + "\0")
         self.foreground[pane] = pid, family, [kind, *agent_arguments]
         if kind == "codex" and "resume" not in agent_arguments:
             process = self.processes[pid]
@@ -279,20 +287,26 @@ class PaneWorld(herdr.Herdr):
             source = Path(prepared.env["CODEX_HOME"]) / "sessions" / f"{identity}.jsonl"
             if not source.read_text():
                 write_text_atomic(source, json.dumps({"type": "session_meta", "payload": {"id": identity}}) + "\n")
-            rollout = source.with_name(f"rollout-fixture-{identity}.jsonl")
-            rollout.unlink(missing_ok=True)
-            rollout.symlink_to(source)
-            descriptors = process_root / "fd"
-            descriptors.mkdir(exist_ok=True)
-            descriptor = descriptors / "3"
-            descriptor.unlink(missing_ok=True)
-            descriptor.symlink_to(rollout)
         if self.interrupt == "agent":
             self.interrupt = ""
             raise OSError("interrupted after agent start")
         if self.disappear_after_launch:
             del self.locations[pane]
         return herdr.AgentLaunched(pane, self.outcome)
+
+    def remove_pane(self, pane: str) -> None:
+        self.closed.append((pane, str(self.locations[pane]["terminal_id"])))
+        self.remove_leaf(pane)
+        del self.locations[pane]
+        _ = self.foreground.pop(pane, None)
+        self.exiting_panes.discard(pane)
+
+    def end_agent(self, pane: str) -> None:
+        del self.foreground[pane]
+        if pane in self.exiting_panes:
+            self.remove_pane(pane)
+        else:
+            self.locations[pane]["agent_status"] = "done"
 
     def stop(self, row: staff.StaffRow, client: herdr.Herdr, *, deadline: float = math.inf) -> bool:
         if client is not self:
@@ -301,7 +315,7 @@ class PaneWorld(herdr.Herdr):
         self.stops.append(str(row.current_session))
         for pane, (pid, _, _) in tuple(self.foreground.items()):
             if self.processes[pid].current_identity == row.current_session:
-                del self.foreground[pane]
+                self.end_agent(pane)
         return True
 
     @override
@@ -359,15 +373,11 @@ class PaneWorld(herdr.Herdr):
         del deadline
         self.commands.append(arguments)
         if arguments[:2] == ("pane", "close"):
-            self.closed.append((arguments[2], str(self.locations[arguments[2]]["terminal_id"])))
-            self.remove_leaf(arguments[2])
-            _ = self.locations.pop(arguments[2])
-            _ = self.foreground.pop(arguments[2], None)
+            self.remove_pane(arguments[2])
         elif arguments[:2] == ("agent", "prompt") and arguments[2] in self.foreground:
             pane = arguments[2]
             if arguments[3] == "/quit":
-                del self.foreground[pane]
-                self.locations[pane]["agent_status"] = "done"
+                self.end_agent(pane)
                 return ""
             pid = self.foreground[pane][0]
             process = self.processes[pid]
@@ -771,11 +781,14 @@ class WorkerPaneTests(StaffTestCase):
         self.assertEqual([command[3] for command in self.prompts()], ["/quit", "/quit"])
 
     def test_close_interrupt_quits_a_busy_worker_and_keeps_its_row(self) -> None:
-        for index, family in enumerate(("claude", "codex"), start=1):
-            with self.subTest(family=family):
-                row = self.worker(family, family=family)
+        cases: tuple[tuple[Literal["claude", "codex"], str], ...] = (
+            ("claude", ""), ("codex", ""), ("claude", "old-owner"), ("codex", "doubled-owner"))
+        for index, (family, old_owner) in enumerate(cases, start=1):
+            with self.subTest(family=family, old_owner=old_owner):
+                row = self.worker(f"{family}-{index}", family=family)
                 pane = f"w1:p{index}"
-                self.world.add(row, pane, family=family)
+                self.world.add(row, pane, family=family,
+                               label=f"{old_owner}-{row.name}" if old_owner else row.name)
                 self.world.locations[pane]["agent_status"] = "working"
                 self.dispatch(row, "impl")
                 before = self.staff_state()
@@ -798,8 +811,10 @@ class WorkerPaneTests(StaffTestCase):
                 self.assertEqual((code, output, errors), (0, "done\n", ""))
                 self.assertEqual(self.staff_state(), before)
                 self.assertNotIn(pane, self.world.foreground)
+                self.assertNotIn(pane, self.world.locations)
+                self.assertIn((pane, "terminal-" + pane), self.world.closed)
         self.assertEqual(self.world.stops, [])
-        self.assertEqual([command[3] for command in self.prompts()], ["/quit", "/quit"])
+        self.assertEqual([command[3] for command in self.prompts()], ["/quit"] * len(cases))
 
     def test_first_admission_uses_the_parent_run_when_two_runs_exist(self) -> None:
         first = self.worker_run("a-first", "unit", self.parent.current_session, transport="herdr")
@@ -914,6 +929,7 @@ class WorkerPaneTests(StaffTestCase):
             self.assertIsInstance(opened, worker_panes.OpenWorker)
             before = self.staff_state()
             launches = self.world.launches.copy()
+            closes = self.world.closed.copy()
             with worker_panes.worker_lock(self.parent.id, name) as competing:
                 self.assertIsInstance(competing, worker_panes.Kept)
             self.assertIsInstance(worker_panes.close(self.parent.id, name), worker_panes.Kept)
@@ -921,7 +937,7 @@ class WorkerPaneTests(StaffTestCase):
             self.assertIsInstance(refused, worker_panes.StartRefused)
             self.assertEqual(self.staff_state(), before)
             self.assertEqual(self.world.launches, launches)
-            self.assertEqual(self.world.closed, [])
+            self.assertEqual(self.world.closed, closes)
             self.assertEqual(self.world.stops, [])
 
     def test_creation_holder_acquires_the_published_fixed_id_lock(self) -> None:
@@ -960,10 +976,10 @@ class WorkerPaneTests(StaffTestCase):
             changed = worker_panes.start_or_resume(self.parent.id, name, "review", lock=hold)
         self.assertIsInstance(changed, worker_panes.OpenWorker)
         assert isinstance(changed, worker_panes.OpenWorker)
-        self.assertEqual((changed.row.id, changed.row.current_session, changed.terminal),
-                         (opened.row.id, opened.row.current_session, opened.terminal))
+        self.assertEqual(changed.row, opened.row)
+        self.assertNotEqual(changed.terminal, opened.terminal)
         self.assertEqual(self.world.stops, [opened.row.current_session])
-        self.assertEqual(self.world.closed, [])
+        self.assertEqual(self.world.closed, [(opened.pane, opened.terminal)])
         self.assertEqual(self.world.requests[-1][1][self.world.requests[-1][1].index("--sandbox") + 1], "read-only")
 
     def test_policy_change_passes_the_configured_monotonic_deadline_to_stop(self) -> None:
@@ -1176,7 +1192,7 @@ class WorkerPaneTests(StaffTestCase):
         self.assertEqual(self.world.stops, [])
         self.assertEqual(self.world.closed, [])
 
-    def test_policy_change_restarts_in_place_with_an_unreadable_launch_environment(self) -> None:
+    def test_policy_change_opens_a_new_pane_with_an_unreadable_launch_environment(self) -> None:
         first = self.start()
         assert isinstance(first, worker_panes.OpenWorker)
         _ = self.recorded_dispatch(first.row, "completed", at=10)
@@ -1187,16 +1203,17 @@ class WorkerPaneTests(StaffTestCase):
         changed = self.start(role="review")
         self.assertIsInstance(changed, worker_panes.OpenWorker)
         assert isinstance(changed, worker_panes.OpenWorker)
-        self.assertEqual((changed.row, changed.pane, changed.terminal), (first.row, first.pane, first.terminal))
-        self.assertEqual(self.world.launches[-1], herdr.ExistingPane(first.pane, first.terminal))
+        self.assertEqual(changed.row, first.row)
+        self.assertNotEqual(changed.terminal, first.terminal)
+        self.assertIsInstance(self.world.launches[-1], herdr.SplitPane)
         self.assertEqual(len(self.world.launches), 2)
         self.assertEqual(self.world.stops, [str(first.row.current_session)])
-        self.assertEqual(self.world.closed, [])
+        self.assertEqual(self.world.closed, [(first.pane, first.terminal)])
         arguments = self.world.requests[-1][1]
         self.assertEqual(arguments[:2], ["resume", str(first.row.current_session)])
         self.assertEqual(arguments[arguments.index("--sandbox") + 1], "read-only")
 
-    def test_run_handoff_resumes_in_place_with_the_current_run_environment_once(self) -> None:
+    def test_run_handoff_opens_a_new_pane_with_the_current_run_environment_once(self) -> None:
         row = self.worker("retained", family="codex")
         self.world.add(row, "w1:p1", live=False, family="codex")
         first = self.start(row.name)
@@ -1212,16 +1229,18 @@ class WorkerPaneTests(StaffTestCase):
             _ = self.run_state()
             unit_runs.activate(run_b, self.parent.current_session)
             resumed = self.start(row.name)
-            self.assertEqual(resumed, first)
-            self.assertEqual(self.world.launches, [
-                herdr.ExistingPane(first.pane, first.terminal),
-                herdr.ExistingPane(first.pane, first.terminal)])
+            self.assertIsInstance(resumed, worker_panes.OpenWorker)
+            assert isinstance(resumed, worker_panes.OpenWorker)
+            self.assertEqual(resumed.row, first.row)
+            self.assertNotEqual(resumed.terminal, first.terminal)
+            self.assertEqual(len(self.world.launches), 2)
+            self.assertTrue(all(isinstance(destination, herdr.SplitPane) for destination in self.world.launches))
             self.assertEqual(self.world.stops, [str(row.current_session)])
-            self.assertEqual(self.world.closed, [])
+            self.assertEqual(self.world.closed, [("w1:p1", "terminal-w1:p1"), (first.pane, first.terminal)])
             self.assertEqual(self.world.requests[-1][1][:2], ["resume", str(row.current_session)])
             self.assertEqual(self.world.requests[-1][2]["UNIT_RUN_DIR"], str(run_b))
             repeated = self.start(row.name)
-            self.assertEqual(repeated, first)
+            self.assertEqual(repeated, resumed)
             self.assertEqual(len(self.world.launches), 2)
             self.assertEqual(self.world.stops, [str(row.current_session)])
 
@@ -1236,11 +1255,12 @@ class WorkerPaneTests(StaffTestCase):
         config = self.root / "conf/direct.conf"
         write_text_atomic(config, config.read_text().replace("UNIT_COMPACT_ABOVE_TOKENS=43000",
                                                              "UNIT_COMPACT_ABOVE_TOKENS=67000"))
-        del self.world.foreground[first.pane]
+        self.world.end_agent(first.pane)
         resumed = self.start("reviewer", "review")
         self.assertIsInstance(resumed, worker_panes.OpenWorker)
         assert isinstance(resumed, worker_panes.OpenWorker)
-        self.assertEqual((resumed.row, resumed.pane, resumed.terminal), (first.row, first.pane, first.terminal))
+        self.assertEqual(resumed.row, first.row)
+        self.assertNotEqual(resumed.terminal, first.terminal)
         arguments = self.world.requests[-1][1]
         self.assertEqual(arguments[:2], ["resume", str(first.row.current_session)])
         self.assertFalse(any("model_auto_compact_token_limit" in argument for argument in arguments))
@@ -1256,11 +1276,12 @@ class WorkerPaneTests(StaffTestCase):
                 self.assertIsInstance(first, worker_panes.OpenWorker)
                 assert isinstance(first, worker_panes.OpenWorker)
                 self.assertNotIn("--cd", self.world.requests[-1][1])
-                del self.world.foreground[first.pane]
+                self.world.end_agent(first.pane)
                 resumed = self.start(first.row.name)
                 self.assertIsInstance(resumed, worker_panes.OpenWorker)
                 assert isinstance(resumed, worker_panes.OpenWorker)
-                self.assertEqual((resumed.row, resumed.pane, resumed.terminal), (first.row, first.pane, first.terminal))
+                self.assertEqual(resumed.row, first.row)
+                self.assertNotEqual(resumed.terminal, first.terminal)
                 arguments = self.world.requests[-1][1]
                 if family == "codex":
                     self.assertEqual(arguments[:2], ["resume", str(first.row.current_session)])
@@ -1311,7 +1332,8 @@ class WorkerPaneTests(StaffTestCase):
         changed = self.start(role="review")
         self.assertIsInstance(changed, worker_panes.OpenWorker)
         assert isinstance(changed, worker_panes.OpenWorker)
-        self.assertEqual((changed.row, changed.pane, changed.terminal), (result.row, result.pane, result.terminal))
+        self.assertEqual(changed.row, result.row)
+        self.assertNotEqual(changed.terminal, result.terminal)
         arguments = self.world.requests[-1][1]
         self.assertFalse(any("model_auto_compact_token_limit" in argument for argument in arguments))
         self.assertEqual(arguments[arguments.index("--sandbox") + 1], "read-only")
@@ -1534,19 +1556,19 @@ class WorkerPaneTests(StaffTestCase):
         self.assertIsInstance(second, worker_panes.OpenWorker)
         self.assertEqual(self.world.launches[1], herdr.SplitPane(first.pane, "down", 0.75, "unit-second"))
 
-    def test_start_rerun_after_agent_exit_resumes_current_session_in_the_same_terminal(self) -> None:
+    def test_start_rerun_after_agent_exit_closes_the_old_shell_and_opens_a_new_pane(self) -> None:
         row = self.worker(family="codex")
         self.world.add(row, "w1:p1", live=False)
         result = self.start()
         self.assertIsInstance(result, worker_panes.OpenWorker)
         assert isinstance(result, worker_panes.OpenWorker)
         self.assertEqual((result.row.id, result.row.current_session, result.pane, result.terminal),
-                         (row.id, row.current_session, "w1:p1", "terminal-w1:p1"))
-        self.assertEqual(self.world.launches, [herdr.ExistingPane("w1:p1", "terminal-w1:p1")])
+                         (row.id, row.current_session, "w1:p2", "terminal-w1:p2"))
+        self.assertEqual(self.world.launches, [herdr.SplitPane("w1:p0", "right", 0.667, "unit-impl2")])
         self.assertEqual(self.world.requests[0][1][:2], ["resume", row.current_session])
         self.assertIn("--no-daemon", self.world.requests[0][1])
         self.assertEqual(self.prompts(), [])
-        self.assertEqual(self.world.closed, [])
+        self.assertEqual(self.world.closed, [("w1:p1", "terminal-w1:p1")])
 
     def test_incomplete_start_keeps_the_agent_and_does_not_launch_twice(self) -> None:
         _ = write_registry(self.root / "conf/models.conf", {"assignments": {"direct": "claude"}}, update=True)
@@ -1807,19 +1829,21 @@ class WorkerPaneTests(StaffTestCase):
                     result = self.start(row.name, account=selected)
                 self.assertIsInstance(result, worker_panes.OpenWorker)
                 assert isinstance(result, worker_panes.OpenWorker)
-                self.assertEqual((result.row.current_session, result.pane), (row.current_session, pane))
+                self.assertEqual(result.row.current_session, row.current_session)
+                self.assertNotEqual(result.pane, pane)
                 self.assertEqual(self.world.requests[-1][2]["CODEX_HOME" if family == "codex" else
                                                           "CLAUDE_CONFIG_DIR"], str(destination))
                 codex.assert_not_called()
                 claude.assert_not_called()
 
-    def test_each_family_resumes_on_destination_and_source_accounts_in_one_terminal(self) -> None:
+    def test_each_family_resumes_on_destination_and_source_accounts_in_new_panes(self) -> None:
         for family in ("claude", "codex"):
             with self.subTest(family=family):
                 _ = write_registry(self.root / "conf/models.conf", {"assignments": {"direct": family}})
                 row = self.worker("account-" + family, family=family)
                 pane = "w1:p-" + family
                 self.world.add(row, pane, live=False)
+                closed_before = len(self.world.closed)
                 for label in (family + "2", family + "1"):
                     target = self.root / label
                     with (patch.object(agent_accounts, "codex_account_home",
@@ -1830,14 +1854,16 @@ class WorkerPaneTests(StaffTestCase):
                         result = self.start(row.name, account=worker_panes.DestinationWorkerAccount(label))
                     self.assertIsInstance(result, worker_panes.OpenWorker)
                     assert isinstance(result, worker_panes.OpenWorker)
-                    self.assertEqual((result.row.current_session, result.pane, result.terminal),
-                                     (row.current_session, pane, "terminal-" + pane))
+                    self.assertEqual(result.row.current_session, row.current_session)
+                    self.assertNotEqual(result.pane, pane)
+                    self.assertNotEqual(result.terminal, "terminal-" + pane)
                     arguments, environment = self.world.requests[-1][1:]
                     self.assertIn(row.current_session, arguments)
                     self.assertEqual(environment["CODEX_HOME" if family == "codex" else "CLAUDE_CONFIG_DIR"], str(target))
                     self.assertNotIn("STAFF_ID", environment)
-                    del self.world.foreground[pane]
-                self.assertEqual(self.world.closed, [])
+                    pane = result.pane
+                    self.world.end_agent(pane)
+                self.assertEqual(len(self.world.closed), closed_before + 3)
 
     def test_completed_dispatch_can_change_policy_in_both_directions_without_changing_identity(self) -> None:
         result = self.start()
@@ -1851,12 +1877,14 @@ class WorkerPaneTests(StaffTestCase):
                 changed = self.start(role=requested)
                 self.assertIsInstance(changed, worker_panes.OpenWorker)
                 assert isinstance(changed, worker_panes.OpenWorker)
-                self.assertEqual((changed.row, changed.pane, changed.terminal), (first.row, first.pane, first.terminal))
+                self.assertEqual(changed.row, first.row)
+                self.assertNotEqual(changed.terminal, result.terminal)
                 arguments = self.world.requests[-1][1]
                 self.assertEqual(arguments[arguments.index("--sandbox") + 1], sandbox)
                 result = changed
         self.assertEqual(self.world.stops, [str(first.row.current_session)] * 2)
-        self.assertEqual(self.world.closed, [])
+        self.assertEqual(len(self.world.closed), 2)
+        self.assertNotIn(first.pane, self.world.locations)
 
     def test_native_ids_with_equal_first_32_characters_stop_only_the_selected_worker(self) -> None:
         selected = self.worker("selected", family="codex")
@@ -1865,13 +1893,13 @@ class WorkerPaneTests(StaffTestCase):
         sibling = staff.update_current_session(sibling.current_session, staff.native_id("11111111-1111-4111-8111-111111112222"))
         fixture_session(selected.current_session, staff.CodexBackend(self.root / "codex"))
         fixture_session(sibling.current_session, staff.CodexBackend(self.root / "codex"))
-        self.world.add(selected, "w2:p9", family="codex", workspace="w2", tab="w2:t2", label="changed")
+        self.world.add(selected, "w1:p9", family="codex", label="changed")
         self.world.add(sibling, "w1:p2", family="codex")
         self.completed_dispatch(selected, "impl")
         result = worker_panes.close(self.parent.id, staff.WorkerName.parse(selected.name))
         self.assertIsInstance(result, worker_panes.Closed)
         self.assertEqual(self.world.stops, [str(selected.current_session)])
-        self.assertEqual(self.world.closed, [("w2:p9", "terminal-w2:p9")])
+        self.assertEqual(self.world.closed, [("w1:p9", "terminal-w1:p9")])
         self.assertEqual(set(self.world.locations), {"w1:p0", "w1:p2"})
         self.assertEqual(self.world.processes[self.world.foreground["w1:p2"][0]].current_identity, sibling.current_session)
 
@@ -1990,9 +2018,9 @@ class WorkerPaneTests(StaffTestCase):
         result = self.start()
         self.assertIsInstance(result, worker_panes.OpenWorker)
         assert isinstance(result, worker_panes.OpenWorker)
-        self.assertEqual((result.row, result.pane, result.terminal), (row, "w1:p1", "terminal-w1:p1"))
-        self.assertEqual(self.world.launches, [herdr.ExistingPane("w1:p1", "terminal-w1:p1")])
-        self.assertEqual(self.world.closed, [])
+        self.assertEqual((result.row, result.pane, result.terminal), (row, "w1:p2", "terminal-w1:p2"))
+        self.assertEqual(self.world.launches, [herdr.SplitPane("w1:p0", "right", 0.667, "unit-impl2")])
+        self.assertEqual(self.world.closed, [("w1:p1", "terminal-w1:p1")])
 
     def test_new_worker_split_follows_the_lowest_pane_after_close_and_resume(self) -> None:
         first = self.start("a")
@@ -2050,8 +2078,15 @@ class WorkerPaneTests(StaffTestCase):
         with patch.object(self.world, "socket_request", side_effect=interrupt):
             with self.assertRaises(OSError):
                 _ = self.start("c")
+        started = self.observation(row)
+        self.assertIsInstance(started, worker_panes.OpenWorker)
+        assert isinstance(started, worker_panes.OpenWorker)
+        column = cast(dict[str, object], clean["w1:t1"]["second"])
+        bottom = cast(dict[str, object], column["second"])
+        cast(dict[str, object], bottom["second"])["pane_id"] = started.pane
         result = self.start("c")
         self.assertIsInstance(result, worker_panes.OpenWorker)
+        self.assertEqual(result, started)
         self.assertEqual(self.world.layouts, clean)
         self.assertEqual(len(self.world.launches), 4)
 
@@ -2222,10 +2257,25 @@ class WorkerPaneTests(StaffTestCase):
         showrunner = fixture_member("showrunner", name="other-showrunner")
         other = fixture_member("unit", name="other", parent=showrunner.id)
         foreign = fixture_worker(row.name, other.id)
-        self.world.add(foreign, "w1:p1")
-        observed = self.observation(row)
-        self.assertIsInstance(observed, worker_panes.UncertainWorker)
-        self.assertEqual(self.world.commands, [])
+        for native, tab in ((foreign, "w1:t1"), (row, "w1:t5")):
+            with self.subTest(native=native.id, tab=tab):
+                self.world.add(native, "w1:p1", tab=tab, label=row.name)
+                self.world.add(foreign, "w1:p2", tab="w1:t5", label=row.name)
+                observed = self.observation(row)
+                if native == foreign:
+                    self.assertIsInstance(observed, worker_panes.UncertainWorker)
+                before = self.staff_state()
+                for interrupt in (False, True):
+                    with patch.dict(os.environ, {"CODEX_THREAD_ID": self.parent.current_session}):
+                        code, output, errors = self.command("close", *( ["--interrupt"] if interrupt else []), row.name)
+                    reason = ("labelled pane belongs to another native session" if native == foreign
+                              else "worker pane is outside its parent's tabs")
+                    self.assertEqual((code, output, errors), (int(worker_panes.ExitCode.UNCERTAIN), "",
+                        f"anomaly: {row.name}: {reason}; correct the evidence and retry\n"))
+                    self.assertEqual(self.staff_state(), before)
+                    self.assertIn("w1:p1", self.world.locations)
+                    self.assertIn("w1:p2", self.world.locations)
+                self.assertEqual(self.world.commands, [])
 
     def test_codex_launch_thread_without_a_current_rollout_is_unknown(self) -> None:
         row = self.worker(family="codex")

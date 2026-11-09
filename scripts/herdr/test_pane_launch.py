@@ -4,7 +4,7 @@ from __future__ import annotations
 import unittest
 import tempfile
 from pathlib import Path
-from typing import override
+from typing import Literal, override
 from unittest.mock import patch
 
 
@@ -24,8 +24,30 @@ class LaunchEnvironmentTests(unittest.TestCase):
         _ = self.enterContext(isolated_staff_file(Path(directory) / "staff.json", {}))
 
     def test_launch_does_not_retain_staff_environment(self) -> None:
-        entry = pane_launch.launch("pane", "native", "/work", {"SHOWRUNNER_UNIT": "demo"}, ["claude"])
-        self.assertEqual(entry["environment"], {})
+        policy = ["--sandbox", "read-only", "-c", 'model_reasoning_effort="high"',
+                  "--ask-for-approval", "never", "-c", "notice.hide_rate_limit_model_nudge=true",
+                  "-c", 'service_tier="fast"', "-c", 'notify=["python3","notify.py"]']
+        rows: tuple[tuple[Literal["claude", "codex"], list[str], list[str]], ...] = (
+            ("claude", ["claude"], []),
+            ("codex", ["codex", "--model", "sol", *policy], policy),
+            ("codex", ["codex", "--sandbox=read-only", '-c=model_reasoning_effort="high"',
+                       "--ask-for-approval=never", "-c", "notice.hide_rate_limit_model_nudge=true",
+                       '-c=service_tier="fast"', '-c=notify=["python3","notify.py"]'], policy),
+            ("codex", ["codex", "-C", "/work", "-c", 'projects={"/old"={trust_level="trusted"}}',
+                       '-c=projects={"/older"={trust_level="trusted"}}', "resume", "native", "--model", "m", *policy], policy),
+        )
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "panes.json"
+            for kind, arguments, expected in rows:
+                with self.subTest(kind=kind, arguments=arguments):
+                    entry = pane_launch.launch("pane", "native", "/work", {"SHOWRUNNER_UNIT": "demo"}, arguments, kind=kind)
+                    self.assertEqual(entry["environment"], {})
+                    pane_launch.save(path, {"pane": entry})
+                    retained = pane_launch.read_strict(path)["pane"]
+                    if kind == "codex":
+                        self.assertEqual(retained.get("codex_policy"), expected)
+                    else:
+                        self.assertNotIn("codex_policy", retained)
 
     def test_shutdown_launch_removes_retired_identity_before_the_locked_launch(self) -> None:
         entry = pane_record.launch("pane", "native", "/work", {"SHOWRUNNER_UNIT": "demo"}, ["claude"])

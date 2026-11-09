@@ -314,7 +314,7 @@ def table(units: list[live_units.LiveUnit], records: dict[str, object], *, doc: 
         idle = f"idle ({clock(refill.at, zone)})" if refill else "idle"
         idle_step = f"idle — {refill.outcome}" if refill else "idle"
         left = left_cell(counts.left, counts.filed, snapshot.splits.get(unit.unit, style_ledger.NoSplitRecorded()), now)
-        cells = (holder.name if holder is not None else unit.unit, unit.status, ticket_cell(ticket) if isinstance(ticket, Ticket) else idle,
+        cells = (holder.name if holder is not None else unit.unit, unit.staff_status, ticket_cell(ticket) if isinstance(ticket, Ticket) else idle,
                  format_step(open_steps[unit.unit], ticket, idle_step), eta_cell(records.get(unit.unit), zone),
                  f"{counts.built:,}", f"{counts.recent:,}", left)
         lines.append("| " + " | ".join(display_cells.escaped(cell) for cell in cells) + " |")

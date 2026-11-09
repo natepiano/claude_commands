@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING, BinaryIO, Self, cast, override
 import unittest
 from unittest import mock
 
+from scripts.lib import conf
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 if TYPE_CHECKING:
@@ -330,6 +331,7 @@ from scripts.buildlog import index
 with socket.socket(fileno=int(sys.argv[2])) as event, index.update_lock():
     connection = index.open_for_update(index.index_path())
     try:
+        connection.execute("PRAGMA locking_mode = EXCLUSIVE").close()
         connection.execute("BEGIN EXCLUSIVE").close()
         event.sendall(b'W')
         event.recv(1)
@@ -347,6 +349,10 @@ with socket.socket(fileno=int(sys.argv[2])) as event, index.update_lock():
             )
             try:
                 self.assertEqual(event.recv(1), b"W")
+                with closing(sqlite3.connect(show.index.read_only_uri(self.log), uri=True,
+                        timeout=conf.read("buildlog").number("INDEX_READ_WAIT_SECONDS"))) as reader:
+                    with self.assertRaisesRegex(sqlite3.OperationalError, "database is locked"):
+                        reader.execute("SELECT COUNT(*) FROM gate_modules").close()
                 with mock.patch.dict(os.environ, {"TEST_LOCKED_INDEX": "1"}), \
                         self.report_process(wait_for_refresh=False) as (process, refresh):
                     try:
@@ -373,12 +379,15 @@ with socket.socket(fileno=int(sys.argv[2])) as event, index.update_lock():
         select_index = show.index.complete_gate_index_in
         selected = Event()
         locked = Event()
+        reader_checked = Event()
 
         def hold_lock_after_selection() -> None:
             self.assertTrue(selected.wait(TEST_HANG_GUARD_SECS))
             with closing(sqlite3.connect(index_path_in(self.log))) as writer:
+                writer.execute("PRAGMA locking_mode = EXCLUSIVE").close()
                 writer.execute("BEGIN EXCLUSIVE").close()
                 locked.set()
+                self.assertTrue(reader_checked.wait(TEST_HANG_GUARD_SECS))
                 # Hold the lock longer than the selection timeout.
                 time.sleep(0.2)
                 writer.execute("COMMIT").close()
@@ -387,6 +396,13 @@ with socket.socket(fileno=int(sys.argv[2])) as event, index.update_lock():
             path = select_index(root)
             selected.set()
             self.assertTrue(locked.wait(TEST_HANG_GUARD_SECS))
+            try:
+                with closing(sqlite3.connect(show.index.read_only_uri(self.log), uri=True,
+                        timeout=conf.read("buildlog").number("INDEX_READ_WAIT_SECONDS"))) as reader:
+                    with self.assertRaisesRegex(sqlite3.OperationalError, "database is locked"):
+                        reader.execute("SELECT COUNT(*) FROM gate_modules").close()
+            finally:
+                reader_checked.set()
             return path
 
         with ThreadPoolExecutor(max_workers=1) as pool:
@@ -396,6 +412,7 @@ with socket.socket(fileno=int(sys.argv[2])) as event, index.update_lock():
                     status, output, errors = report_without_update("top")
             finally:
                 selected.set()
+                reader_checked.set()
                 writer.result(timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(status, 0, errors)
         self.assertIn("tools/test_alpha.py", output.split("unmeasured:")[0])

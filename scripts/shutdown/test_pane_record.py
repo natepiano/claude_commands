@@ -160,6 +160,24 @@ class PaneRecordTests(unittest.TestCase):
         self.assertEqual(entry.get("plugin_directories"), ["/wanted"])
         self.assertNotIn("/unwanted", pane_record.resume_arguments(entry))
 
+    def test_codex_resume_keeps_the_recorded_policy_after_the_model(self) -> None:
+        policy = ["--sandbox", "read-only", "--ask-for-approval", "never",
+                  "-c", 'model_reasoning_effort="high"',
+                  "-c", "notice.hide_rate_limit_model_nudge=true",
+                  "-c", 'service_tier="default"', "-c", 'notify=["/fixture/notify"]']
+        for model, recorded in (("fixture-model", False), ("fixture-model", True), ("", True)):
+            with self.subTest(model=model, recorded=recorded):
+                entry = pane_record.launch("w1:p2", "codex-thread", str(self.root), {}, ["codex"], kind="codex")
+                entry["model"] = model
+                if recorded:
+                    entry["codex_policy"] = policy.copy()
+                else:
+                    _ = entry.pop("codex_policy", None)
+                expected = ["resume", "codex-thread"] + (["--model", model] if model else [])
+                self.assertEqual(pane_record.resume_arguments(entry), expected + (policy if recorded else []))
+                if recorded:
+                    self.assertEqual(entry.get("codex_policy", []), policy)
+
     def test_plugin_directories_require_nonempty_paths_in_launch_records(self) -> None:
         entry = pane_record.launch("w1:p2", "plugin-session", "/fixture", {}, ["claude"])
         self.records.mkdir()
@@ -203,20 +221,14 @@ class PaneRecordTests(unittest.TestCase):
     def seed_foreground(self, kind: Literal["claude", "codex"], reference: str,
                         rows: tuple[staff.StaffRow, ...] = ()) -> str:
         process = self.root / "proc/4242"
-        (process / "fd").mkdir(parents=True, exist_ok=True)
-        if kind == "codex" and rows:
-            identity = fixture_runtime_id("pane-record-codex")
-            rollout = self.root / f"rollout-{identity}.jsonl"
-            write_text_atomic(rollout, json.dumps({"type": "session_meta", "payload": {"id": identity}}) + "\n")
-            descriptor = process / "fd/7"
-            descriptor.unlink(missing_ok=True)
-            descriptor.symlink_to(rollout)
+        process.mkdir(parents=True, exist_ok=True)
         config = self.root / ".claude3"
         (config / "sessions").mkdir(parents=True, exist_ok=True)
         _ = (config / "sessions/4242.json").write_text(json.dumps({"sessionId": "claude-thread"}))
         _ = (process / "environ").write_bytes(
             f"CODEX_HOME={self.root / '.codex2'}\0CLAUDE_CONFIG_DIR={config}\0UNRELATED=secret\0".encode())
-        client = FakeClient([{"pane_id": "w2C:p1", "label": None, "workspace_id": "w2C"}])
+        client = FakeClient([{"pane_id": "w2C:p1", "label": None, "workspace_id": "w2C",
+                              "session_id": fixture_runtime_id("pane-record-codex") if kind == "codex" and rows else ""}])
         arguments = ["codex"] if kind == "codex" else ["claude", "-n", "claude-name", "--model", "opus"]
         client.process_info = {"foreground_processes": [{"pid": 4242, "argv": arguments, "cwd": str(self.root)}]}
         write_text_atomic(process / "cmdline", "\0".join(arguments))
@@ -230,6 +242,7 @@ class PaneRecordTests(unittest.TestCase):
               mock.patch.object(runtime_sessions, "process_start", return_value="fixture-start"),
               mock.patch.object(staff, "initial_snapshot", return_value=staff.StaffSnapshot(rows)),
               mock.patch.object(herdr, "Herdr", return_value=client),
+              mock.patch.object(herdr, "herdr_place_of", return_value=herdr.HerdrPlace("agents", "w2C:p1")),
               mock.patch.object(client, "pane_tab", return_value=("morty", 1, {"name": reference})),
               redirect_stdout(output)):
             if kind == "codex" and rows:

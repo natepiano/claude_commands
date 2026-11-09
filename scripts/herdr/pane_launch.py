@@ -37,6 +37,7 @@ class PaneLaunch(TypedDict):
     cwd: str
     name: str
     model: str
+    codex_policy: NotRequired[list[str]]
     plugin_directories: NotRequired[list[str]]
     remote_control: bool
     environment: dict[str, str]
@@ -148,6 +149,10 @@ def _validated_launch(path: Path, pane_id: str, value: object, *, required_strin
                 or not all(isinstance(directory, str) and directory
                            for directory in cast(list[object], directories))):
             raise ValueError(f"{location}: plugin_directories must contain nonempty paths")
+    if "codex_policy" in launch:
+        policy = launch["codex_policy"]
+        if not isinstance(policy, list) or not all(isinstance(value, str) for value in cast(list[object], policy)):
+            raise ValueError(f"{location}: codex_policy must contain strings")
     return cast(PaneLaunch, cast(object, launch))
 
 
@@ -456,7 +461,7 @@ def launch(pane_id: str, session_id: str, cwd: str, environment: Mapping[str, st
     config_dir = (environment.get("CODEX_HOME") or str(Path.home() / ".codex") if kind == "codex"
                   else environment.get("CLAUDE_CONFIG_DIR") or str(Path.home() / ".claude"))
     parsed = parse_claude_arguments(arguments)
-    return _record_home({
+    entry: PaneLaunch = {
         "kind": kind,
         "pane_id": pane_id,
         "session_id": session_id,
@@ -470,4 +475,17 @@ def launch(pane_id: str, session_id: str, cwd: str, environment: Mapping[str, st
         "flags_read": bool(arguments),
         "ended": False,
         "written_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-    })
+    }
+    if kind == "codex":
+        policy: list[str] = []
+        options = iter(arguments[1:])
+        for argument in options:
+            if argument == "--":
+                break
+            option, equals, value = argument.partition("=")
+            if option in {"--sandbox", "--ask-for-approval", "-c"}:
+                value = value if equals else next(options, "")
+                if option != "-c" or not value.startswith("projects="):
+                    policy.extend((option, value))
+        entry["codex_policy"] = policy
+    return _record_home(entry)

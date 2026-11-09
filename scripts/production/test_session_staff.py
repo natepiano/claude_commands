@@ -162,7 +162,7 @@ class StatusDiscoveryTests(StaffTestCase):
                   mock.patch.object(herdr, "process_environment", return_value={}),
                   mock.patch.object(process_table, "snapshot", return_value={
                       910001: process_table.Process(910001, 1, "codex", "codex")}),
-                  mock.patch.object(herdr, "codex_rollout_thread", side_effect=PermissionError("rollout denied")),
+                  mock.patch.object(herdr, "codex_resume_thread", side_effect=PermissionError("thread read denied")),
                   labels.anomalies(staff_sources.CodexProcessThreads().check) as lines):
                 grouped = labels.group_labeled_sessions([unknown], record=staff.snapshot(),
                                                         sources=labels.MemberSources(launches))
@@ -265,7 +265,6 @@ class StatusDiscoveryTests(StaffTestCase):
             return identity == morty
 
         with (mock.patch.object(herdr, "shared_session", return_value=place.session),
-              mock.patch.object(herdr, "codex_rollout_thread", side_effect=herdr.NoOpenCodexRollout("no rollout")),
               mock.patch.object(herdr, "process_environment", return_value={}),
               mock.patch.object(herdr, "herdr_place_of", return_value=place),
               mock.patch.object(herdr.Herdr, "result", return_value={

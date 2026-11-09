@@ -48,7 +48,7 @@ from scripts.whoami import agent_accounts  # noqa: E402
 from scripts.whoami import note_file  # noqa: E402
 from scripts.whoami import usage_store  # noqa: E402
 from scripts.accounts import refusals  # noqa: E402
-from scripts.accounts import moves, worker_names, role_map  # noqa: E402
+from scripts.accounts import moves, worker_names, role_map, session_state  # noqa: E402
 from scripts.accounts.refusals import (  # noqa: E402
     KnownReset as KnownReset, NoResetKnown as NoResetKnown,
     ReadingWindow as ReadingWindow, NoWindow as NoWindow, FreshReading as FreshReading,
@@ -4906,7 +4906,14 @@ def _read_local_role_sessions(groups: GroupAccounts, *, include_workers: bool = 
             group = role
             members[group].append(LiveGroupMember(identity, session["name"], group, directory))
         if role and directory is not None:
-            counts.setdefault((directory, role), {})[identity] = "busy" if session.get("status") == "busy" else "idle"
+            if role == "workers":
+                state = "busy" if session.get("status") == "busy" else "idle"
+            else:
+                member_row = member.row if isinstance(member, session_staff.MemberFound) else owner
+                state = session_state.classify(
+                    member_row if member_row is not None else session_state.UnrecordedStaff(),
+                    session_state.LiveActivity(session.get("status", "")))
+            counts.setdefault((directory, role), {})[identity] = state
     # A member without a live session belongs to its selected role account.
     for member in (*staff.active(membership, "unit"), *staff.active(membership, "showrunner")):
         if member.current_session in live or not local_member(member):
@@ -4916,8 +4923,9 @@ def _read_local_role_sessions(groups: GroupAccounts, *, include_workers: bool = 
         if not isinstance(selected, str):
             continue
         directory = account_dir(selected)
-        counts.setdefault((directory, role), {})[str(member.id)] = "exited"
-        session_lines.append(f"session {member.current_session} ({member.name}): {selected}; exited")
+        state = session_state.classify(member, session_state.NoLiveSession())
+        counts.setdefault((directory, role), {})[str(member.id)] = state
+        session_lines.append(f"session {member.current_session} ({member.name}): {selected}; {state}")
     from scripts.message.unit_labels import MeshWorker, listed_mesh_worker
 
     continuation_lines: list[str] = []

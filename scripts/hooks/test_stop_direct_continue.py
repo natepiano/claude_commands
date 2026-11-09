@@ -52,7 +52,7 @@ class DirectorStopFixture:
 
 @contextmanager
 def director_stop_fixture() -> Generator[DirectorStopFixture]:
-    with tempfile.TemporaryDirectory(prefix="stop-hook-", dir="/tmp/claude") as temporary:
+    with tempfile.TemporaryDirectory(prefix="stop-hook-") as temporary:
         root = Path(temporary)
         run = root / "run"
         run.mkdir()
