@@ -2194,3 +2194,28 @@ A changed `config/<name>.conf` selects every test module whose transitive import
 - `scripts/test_times/show.py` — ranked rows and the footnote
 - `scripts/test_times/test_show.py` — the limit, the sum, the footnote values and the history filters, in three existing tests
 - `commands/test_times.md` — the `top` description
+
+
+### Phase 111 — A targeted test runs only what the unit's own change can reach  · status: done
+
+#### As-built
+
+- `select_affected` in `scripts/production/affected_modules.py` builds its base candidates from the certified base, when one exists, and `git merge-base HEAD refs/remotes/origin/<branch>` for each branch of `landing_branches` in `config/merge_gate.conf`. A missing ref or a branch with no common ancestor gives no candidate.
+- It compares each distinct commit once and takes the candidate with the fewest changed paths. On a tie the certified base comes first, then the config order. With no candidate the result is `FullSuite("no certified base")`.
+- A landing candidate is a `CertifiedBase` with its committer time, so `report_selection` prints it unchanged. Each landing passed a merge gate that runs all modules, so landed work is not this unit's change.
+- `SuiteMode.MERGE_GATE` still runs all modules. Dirty paths, removed-file facts, the module rules and the fact cache are unchanged, and `merge_gate.py` and `cloud_gate.py` take no edit.
+- Replay of 19 landings on `builds`: the old rule selects a median 692 of 743 modules and 5193 CPU s, and the new rule a median 6 modules and 78 CPU s (mean 72 modules, 642 CPU s).
+
+**Files:**
+- `scripts/production/affected_modules.py` — the base choice
+- `config/merge_gate.conf` — `landing_branches`
+- `docs/as-built/merge-gate-and-test-speed.md` — the base rule, its reason and the fallback
+- `scripts/production/test_affected_modules.py` — landing bases, a merge with a landing branch, a dirty file at the tip, and candidate priority
+- `scripts/production/test_targeted_test.py` — the fixture sets a private branch list
+
+**Gotchas:**
+- An edit of `config/merge_gate.conf` alone selects 429 modules through the approved transitive config rule.
+- A missing `landing_branches` key gives a full suite through the graph-error result.
+
+**Ruled out:**
+- The import closure in place of the same-folder rule: replay selects more modules (596 against 426 on one 39-file run).
