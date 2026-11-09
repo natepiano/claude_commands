@@ -576,6 +576,13 @@ sys.exit(1)
                 with (patch.object(Path, "exists", return_value=False),
                       patch.object(subprocess, "run", return_value=output)):
                     self.assertTrue(detached_run_process.runs_command(4321, ["assign.py", "impl", argument]))
+        record = self.root / "run folder/r1.json"
+        for tail, matches in (("", True), (" backup.json", False)):
+            with self.subTest(tail=tail):
+                output = subprocess.CompletedProcess(["ps"], 0, f"python detached_runs.py supervise {record}{tail}\n", "")
+                with (patch.object(Path, "exists", return_value=False),
+                      patch.object(subprocess, "run", return_value=output)):
+                    self.assertEqual(detached_run_process.supervises(4321, record), matches)
 
     def test_a_live_supervisor_is_not_ended(self) -> None:
         path = self.live_run(["bash", "verify.sh", "check"])

@@ -33,7 +33,7 @@ def runs_command(pid: int, command: Sequence[str]) -> bool:
 
     def matches(index: int, expected: Sequence[str]) -> bool:
         if not expected:
-            return True
+            return not isinstance(observed, ProcessCommandText) or index == len(parts)
         ends = range(index + 1, len(parts) + 1) if isinstance(observed, ProcessCommandText) else (index + 1,)
         for end in ends:
             actual = separator.join(parts[index:end])
