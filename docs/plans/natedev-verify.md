@@ -1197,44 +1197,24 @@ Checkpoint `1f9e9c484` on `verify-not-mac-wait`, merged to builds as `a62793f07`
 
 **Depends on:** 41t.
 
-#### Work Order
+#### As-built
 
-**Source:** phase 41t architect review, 2026-11-08. This is a defect in what 41t shipped, so it runs before 41u.
-
-**Goal:** a command that makes no repository tree passes the copy guard, also when its variable values go above `guard_choice_limit`.
-
-**Spec:**
-1. **Defect.** The command below gets `unresolved relevant operation: cannot resolve interpreter program choices`. Four or five such `if` assignments pass.
-   ```
-   if test condition; then value0=left; else value0=right; fi; … (six such assignments, value0 to value5) …; bash -c "printf %s ${value0}${value1}${value2}${value3}${value4}${value5}"
-   ```
-   Cause: 2^6 combinations go above `guard_choice_limit=32` (`config/copies.conf`). `_choice_vectors` (`copy_guard.py:137`) puts an `UnresolvedChoices` word in place of the values. `_program_input` (`copy_guard.py:211`) makes it a `ChoiceLimitedProgramInput`. `copy_guard.py:364` then refuses each such program, also one that parses and holds no tree-making operation. The 41t round 3 spec asked for an unknown word above the limit, not a refusal of the whole program.
-2. **Required.** Read a choice-limited program the same way as an expanded program (`ExpandedProgramInput`): inspect its known text, and treat the unresolved part as an unknown word.
-   - A known tree-making operation keeps its refusal.
-   - An unknown word in a tree-making position, for example the command name before `clone`, keeps its refusal.
-   - A Python program that does not parse keeps the `cannot parse Python program` rule of `ExpandedProgramInput` (`copy_guard.py:355`).
-   - If `ChoiceLimitedProgramInput` then has no behavior that `ExpandedProgramInput` does not have, remove it.
-3. **Bound.** The work for one command stays linear in branches and variables.
+- Above `guard_choice_limit`, `UnresolvedChoices` keeps the texts of the dropped values in `choice_texts`. `_retained_choice_texts` collects them in one linear walk, with no combinations, so the work for one command stays linear in branches and variables.
+- An interpreter program built from such a word is a `ProgramWithChoiceTexts(text, choice_texts)`, read like an expanded program. `eval`, `bash -c` and `python -c` accept it.
+- The guard refuses it with "cannot resolve interpreter program choices" only when the known text or a kept text holds a tree-making word: `TREE_COMMAND`, or `copytree|clone_from|worktree|Repo.clone` for Python (`_tree_making_text`). A program with no tree word passes, so a long branch command that only prints runs.
+- A known tree-making operation keeps its refusal, and an unknown word in a tree-making position keeps `cannot resolve executable name`.
 
 **Files:**
-- `scripts/copies/copy_guard.py` — the program input rule.
-- `scripts/copies/test_copy_guard.py` — the rows.
+- `scripts/copies/copy_guard.py` — choice text retention and the narrowed program refusal.
+- `scripts/copies/test_copy_guard.py` — above-choice-limit rows: shell printf passes; shell clone, shell runner, copytree, git options and a 33-arm `eval` refuse.
 
-**Constraints from prior phases:**
-- Phase 41t: `guard_choice_limit()` (`copies.py:301`) reads `config_settings()` and falls back to the repository `config/copies.conf` when the key is missing. Keep the key and the fallback.
-- Phase 41t: `test_branch_arguments_require_linear_invocation_work` counts `inspect_invocation` calls. It stays green with no change to its bound.
-- Phase 41t: every command in `refused_commands.md` gives its expected result, and all 268 corpus commands in `transcript_refusals.jsonl` pass. `scan_scripts` on `scripts/` reports no findings.
+**Binds later work:** a guard change keeps `test_branch_arguments_require_linear_invocation_work` green and keeps the above-choice-limit rows.
 
-**Workers:** 1 writer — `impl` owns `copy_guard.py` and `test_copy_guard.py`.
+**Gotchas:**
+- A tree word split between a literal and a dropped value (`gi${v}` with `t` in a dropped value) passes above the limit.
+- `python3 -c "shutil.copytree('$UNSET', ...)"` and `bash -c "$UNSET/git -C . clone . dest"` pass; their top-level forms refuse. Recorded in the next-items file.
 
-**Acceptance gate:**
-- New rows in the existing branch-row test of `test_copy_guard.py`, each with six two-value `if` assignments:
-  - `bash -c "printf %s <the six values>"` passes. This row fails on the 41t tree.
-  - `bash -c "git clone <the six values> dest"` refuses and names `copies.py`.
-  - Values `git` or `echo`, and `bash -c "$runner clone source destination"`, refuses.
-- The copies and hook suites pass; `basedpyright` reports 0 errors and 0 warnings on the changed files.
-- The director runs the targeted test.
-- Change-Review: a long branch command that the guard refused now runs.
+**Ruled out:** refuse every choice-limited program — that is the false refusal this phase removes.
 
 ### Phase 41u — copies.py list shows remote mirrors  · status: todo
 

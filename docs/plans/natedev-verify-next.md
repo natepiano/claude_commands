@@ -101,3 +101,11 @@
 **Needed:**
 1. Measure a live stopped call. Record whether a step member outlives the token release.
 2. Only if one does: wait for the whole step process group before the token releases, with a test that fails on the old code.
+
+## The copy guard refuses an unset source or git path inside a program
+
+**Source:** builds (showrunner), 2026-11-08, settled as `next`: "build it only when a real session makes a tree that way. The guard is already large, and no session writes these forms." Found in the phase 41v review; the 41t tree gives the same result.
+
+**Today:** `python3 -c "import shutil;shutil.copytree('$UNSET', '/tmp/o')"` passes, while `cp -r "$UNSET" dest` refuses with `cannot resolve recursive copy source`. `bash -c "$UNSET_DIR/git -C . clone . /tmp/o"` passes, because the unknown-executable check in `_operation` (`scripts/copies/copy_guard.py`) does not skip git options before `clone`; the top-level form refuses with `cannot resolve executable name`.
+
+**Needed:** only when a real session makes a tree in one of these forms. Then both commands refuse, and the copy guard command list and transcript corpus keep their results.
