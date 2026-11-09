@@ -9,6 +9,7 @@ from scripts.production import staff
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -214,6 +215,92 @@ class MergeCheckpointTests(MergeCheckpointFixture):
         result = self.run_checkpoint(checkpoint)
         self.assertEqual(result.process.returncode, 0, result.process.stdout + result.process.stderr)
         self.assertEqual(self.git("rev-parse", "HEAD^2"), checkpoint)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            snapshot = Path(temporary) / "snapshot"
+            _ = shutil.copytree(self.root, snapshot)
+            for outcome in ("green", "red", "conflict", "resume", "moving-green", "moving-red"):
+                with self.subTest(main=outcome):
+                    shutil.rmtree(self.root)
+                    _ = shutil.copytree(snapshot, self.root)
+                    self.bind_fixture(self.root)
+                    (self.state / "events.jsonl").unlink()
+                    relative = "src/alpha.txt" if outcome == "conflict" else "crates/main-proof/Cargo.toml"
+                    content = "main side\n" if outcome == "conflict" else '[package]\nname = "main-proof"\nversion = "0.1.0"\n'
+                    main = self.push_main_change(relative, content)
+                    checkpoint = self.checkpoint(content="later unit change\n")
+                    before = self.git("rev-parse", "HEAD")
+                    origin_tip = self.git("rev-parse", "production", cwd=self.origin)
+                    observer = STUB + '''
+import fcntl
+import subprocess
+tip = subprocess.run(["git", "rev-parse", "HEAD"], check=True, capture_output=True, text=True).stdout.strip()
+common = subprocess.run(["git", "rev-parse", "--git-common-dir"], check=True, capture_output=True, text=True).stdout.strip()
+with (Path(common) / "main-push.lock").open("a") as lock:
+    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+with (state / "tested-tips").open("a") as output:
+    output.write(tip + "\\n")
+if name == "checkpoint-test" and (state / "move-main").exists() and not (state / "moved-main").exists():
+    writer = Path((state / "move-main").read_text())
+    manifest = writer / "crates/later-main/Cargo.toml"
+    manifest.parent.mkdir(parents=True)
+    manifest.write_text('[package]\\nname = "later-main"\\nversion = "0.1.0"\\n')
+    for args in (["add", "crates/later-main"], ["commit", "-m", "Main moves during checkpoint tests"], ["push", "origin", "main"]):
+        subprocess.run(["git", *args], cwd=writer, check=True, capture_output=True)
+    moved = subprocess.run(["git", "rev-parse", "HEAD"], cwd=writer, check=True, capture_output=True, text=True).stdout.strip()
+    (state / "moved-main").write_text(moved)
+if (state / "second-red").exists() and (state / "moved-main").exists():
+    moved = (state / "moved-main").read_text()
+    if subprocess.run(["git", "merge-base", "--is-ancestor", moved, tip]).returncode == 0:
+        raise SystemExit(1)
+raise SystemExit(1 if (state / "red").exists() else 0)
+'''
+                    for name in ("checkpoint-test", "verify.sh"):
+                        self.executable(self.bin / name, observer)
+                    if outcome == "red":
+                        _ = (self.state / "red").touch()
+                    if outcome.startswith("moving-"):
+                        _ = (self.state / "move-main").write_text(str(self.root / "main-fix-writer"))
+                    if outcome == "moving-red":
+                        _ = (self.state / "second-red").touch()
+                    if outcome == "resume":
+                        _ = self.git("merge", "--no-ff", "-m", "Merge interrupted checkpoint", checkpoint)
+                    result = self.run_checkpoint(checkpoint, phase="3")
+                    if outcome.startswith("moving-"):
+                        tips = (self.state / "tested-tips").read_text().splitlines()
+                        moved = (self.state / "moved-main").read_text()
+                        self.assertEqual(len(set(tips)), 2)
+                        self.assertNotEqual(merge_checkpoint.git(self.checkout, "merge-base", "--is-ancestor", moved, tips[0]).returncode, 0)
+                        self.assertEqual(self.git("merge-base", "--is-ancestor", moved, tips[-1]), "")
+                        self.assertIn(["test", "later-main"], self.events("verify.sh"))
+                        if outcome == "moving-red":
+                            self.assertIn("red: failed", result.process.stdout)
+                            self.assertEqual(self.git("rev-parse", "HEAD"), before)
+                        else:
+                            self.assertEqual(result.process.returncode, 0, result.process.stdout + result.process.stderr)
+                            self.assertEqual(self.git("rev-parse", "production", cwd=self.origin), tips[-1])
+                    elif outcome == "conflict":
+                        self.assertIn("push: held — origin/main conflicts: src/alpha.txt", result.process.stdout)
+                        self.assertIn("merge origin/main into the merge branch, resolve the conflict, and run the push again",
+                                      result.process.stdout)
+                        self.assertEqual(self.events("checkpoint-test"), [])
+                        self.assertEqual(self.git("rev-parse", "HEAD"), before)
+                    else:
+                        tips = (self.state / "tested-tips").read_text().splitlines()
+                        self.assertEqual(len(set(tips)), 1)
+                        self.assertEqual(self.git("merge-base", "--is-ancestor", main, tips[0]), "")
+                        self.assertEqual(self.git("merge-base", "--is-ancestor", checkpoint, tips[0]), "")
+                        self.assertIn(["test", "main-proof"], self.events("verify.sh"))
+                        if outcome == "red":
+                            self.assertIn("red: failed", result.process.stdout)
+                            self.assertEqual(self.git("rev-parse", "HEAD"), before)
+                        else:
+                            self.assertEqual(result.process.returncode, 0, result.process.stdout + result.process.stderr)
+                            self.assertEqual(self.git("rev-parse", "production", cwd=self.origin), tips[0])
+                    if outcome in ("red", "conflict", "moving-red"):
+                        self.assertEqual(result.process.returncode, 1, result.process.stdout + result.process.stderr)
+                        self.assertEqual(self.git("rev-parse", "production", cwd=self.origin), origin_tip)
+                        self.assertEqual(self.git("status", "--porcelain"), "")
 
     def test_failed_push_preserves_the_merge_branches_unpublished_tip(self) -> None:
         self.write(self.checkout, "local-only.txt", "local commit must survive\n")

@@ -18,7 +18,7 @@ from scripts.production.production_doc import read_new_production
 # Importable once merge_checkpoint has put scripts/lib on the path.
 
 
-from scripts.production.merge_checkpoint_test_support import DELIVERS, MergeCheckpointFixture, PARALLEL, SCRIPT, STARTED, TRIAL, configure_test_environment
+from scripts.production.merge_checkpoint_test_support import DELIVERS, MergeCheckpointFixture, PARALLEL, SCRIPT, STARTED, STUB, TRIAL, configure_test_environment
 
 
 def setUpModule() -> None:
@@ -179,6 +179,27 @@ class MergeCheckpointTests(MergeCheckpointFixture):
             "notify", "--repo-dir", str(self.checkout), "--branch", "production", "--tip", tip,
         ]])
         self.assertEqual((self.state / "notified-tip").read_text(), tip)
+        with self.subTest(refresh="main moved"):
+            main = self.push_main_change("crates/main-proof/Cargo.toml",
+                                         '[package]\nname = "main-proof"\nversion = "0.1.0"\n')
+            observer = STUB + '''
+import fcntl
+import subprocess
+tip = subprocess.run(["git", "rev-parse", "HEAD"], check=True, capture_output=True, text=True).stdout.strip()
+common = subprocess.run(["git", "rev-parse", "--git-common-dir"], check=True, capture_output=True, text=True).stdout.strip()
+with (Path(common) / "main-push.lock").open("a") as lock:
+    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+(state / "refreshed-test-tip").write_text(tip)
+'''
+            for name in ("verify.sh", "checkpoint-test"):
+                self.executable(self.bin / name, observer)
+            production = read_new_production(self.doc, "example")
+            with mock.patch.dict(os.environ, self.env):
+                refreshed = merge_checkpoint.refresh_pushed_tip(production, tip)
+            self.assertEqual(refreshed, (self.state / "refreshed-test-tip").read_text())
+            self.assertEqual(self.git("rev-parse", "production", cwd=self.origin), refreshed)
+            self.assertEqual(self.git("merge-base", "--is-ancestor", main, refreshed), "")
+            self.assertIn(["test", "main-proof"], self.events("verify.sh"))
     def test_style_notification_failure_does_not_fail_a_pushed_checkpoint(self) -> None:
         _ = (self.state / "fail-style_sync.py").touch()
         result = self.run_checkpoint(self.checkpoint())
@@ -241,6 +262,7 @@ class MergeCheckpointTests(MergeCheckpointFixture):
             with self.subTest(may_undo=may_undo):
                 with self.assertRaises(merge_checkpoint.Stop) as stopped:
                     if may_undo:
+                        _ = merge_checkpoint.prepare_checkpoint(production, before)
                         _ = merge_checkpoint.push_git(production, True)
                     else:
                         _ = merge_checkpoint.refresh_pushed_tip(production, before)
