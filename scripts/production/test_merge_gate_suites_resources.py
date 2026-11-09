@@ -1,6 +1,8 @@
 """Merge gate suites contracts."""
 
 from __future__ import annotations
+from scripts.build_queue import admission_records
+
 from scripts.build_queue import queue_place, admission_protocol as wire
 
 import unittest
@@ -52,13 +54,71 @@ class CpuUsageTest(unittest.TestCase):
 if __name__ == "__main__":
     Path(sys.argv[2]).write_text(str(spin_cpu(float(sys.argv[1]))))
 '''
-from scripts.lint import memory_admit
 from scripts.lib import copy_record, scratch
 from scripts.message.process_test_support import OwnedTestProcesses
 
 
 @final
 class MergeGateResourcesTests(GateSuitesFixture):
+    @gate_suites("lib", "hooks")
+    def test_memory_limit_stops_only_the_over_limit_module_beside_others(self) -> None:
+        self.configure_gate("merge_gate_governor_gib=2")
+        self.record_module_peaks({
+            "lib/test_first.py": 100.0, "lib/test_second.py": 100.0, "hooks/test_first.py": 100.0,
+        })
+        output = io.StringIO()
+        with mock.patch.dict(os.environ, self.environment), self.sampling_module_memory({
+                "lib/test_first.py": (2560.0, 64.0),
+                "lib/test_second.py": (2048.0,),
+                "hooks/test_first.py": (32.0,),
+        }) as started, redirect_stdout(output):
+            run = merge_gate.run_suites(self.checkout, max_running_jobs=3)
+        self.assertTrue(run.passed, output.getvalue())
+        stopped = [job for job in started if job.killed_for]
+        self.assertEqual([(job.suite, job.module) for job in stopped], [("lib", "test_first.py")])
+        self.assertEqual(stopped[0].process.returncode, -signal.SIGTERM)
+        self.assert_process_stopped(stopped[0].process.pid)
+        events = self.module_events()
+        initial = [event for event in events[:3] if event["event"] == "start"]
+        self.assertEqual(len(initial), 3, events)
+        self.assertEqual([event["event"] for event in events[-2:]], ["start", "finish"])
+        self.assertEqual(events[-2]["module"], "test_first.py")
+        peaks = merge_gate.read_measures(self.state / "runner/module_peak_mib.json")
+        self.assertEqual(peaks, {"lib/test_first.py": 64.0, "lib/test_second.py": 2048.0, "hooks/test_first.py": 32.0})
+        self.assertIn("peak memory 2.500 GiB exceeds the memory limit of 2 GiB", output.getvalue())
+        messages = [call for call in self.calls() if call["tool"] == "send.py"]
+        self.assertEqual(len(messages), 1)
+        self.assertEqual(messages[0]["args"][:2], ["--to", "sdlc"])
+        text = messages[0]["args"][messages[0]["args"].index("--text") + 1]
+        for detail in ("lib/test_first.py", "2.500 GiB", "limit 2 GiB", "merge-gate", "integration", "runs again alone"):
+            self.assertIn(detail, text)
+
+    def test_memory_stop_fails_even_when_the_module_exits_zero(self) -> None:
+        for exit_status in (0, 5):
+            with self.subTest(exit_status=exit_status):
+                self.restore_fixture(("hooks",))
+                module = self.checkout / "scripts/hooks/test_first.py"
+                self.write(module, module.read_text().replace(
+                    '        if (state / "sample-module-memory").exists():',
+                    '        def exit_zero(signum, frame):\n'
+                    + '            del signum, frame\n'
+                    + '            print("Ran 0 tests in 0.000s", flush=True)\n'
+                    + '            print("NO TESTS RAN", flush=True)\n'
+                    + f'            os._exit({exit_status})\n'
+                    + '        signal.signal(signal.SIGTERM, exit_zero)\n'
+                    + '        if (state / "sample-module-memory").exists():', 1))
+                self.configure_gate("merge_gate_governor_gib=4")
+                output = io.StringIO()
+                with mock.patch.dict(os.environ, self.environment), \
+                        self.sampling_module_memory({"hooks/test_first.py": (5120.0,)}), redirect_stdout(output):
+                    run = merge_gate.run_suites(self.checkout)
+                self.assertFalse(run.passed, output.getvalue())
+                self.assertEqual(len(run.executions), 2)
+                for result in run.executions:
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn("peak memory 5.000 GiB", result.killed_for)
+                self.assertIn("the gate fails", [call for call in self.calls() if call["tool"] == "send.py"][-1]["args"][-1])
+
     @gate_suites("hooks")
     def test_idle_gate_blocks_for_one_slot_and_reports_one_wait(self) -> None:
         for hold_during_wait in (False, True):
@@ -330,7 +390,7 @@ class MergeGateResourcesTests(GateSuitesFixture):
                 with self.assertRaises(BlockingIOError):
                     fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
 
-        def observed(result: memory_admit.AdmissionWaitSnapshot) -> None:
+        def observed(result: admission_records.AdmissionWaitSnapshot) -> None:
             nonlocal admitted
             admitted = result.decision.state == "admit"
             if result.decision.state == "hold":

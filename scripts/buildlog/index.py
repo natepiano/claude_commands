@@ -32,7 +32,7 @@ from scripts.buildlog import store, parse
 from scripts.lib import conf
 from scripts.test_times.gate_record import TYPE_CHECK_JOB
 
-SCHEMA_VERSION = 34
+SCHEMA_VERSION = 36
 
 
 # These indexes support repeated queries over the current schema.
@@ -151,8 +151,8 @@ STEP_COLUMNS: list[Column] = [
     ("test_build_key", "TEXT", "verify test Cargo build-input key, excluding nextest run-only selection; NULL for older or changed builds"),
     ("scope_resources", "TEXT", "JSON own-scope CPU (excludes sccache.service compiles) and IO counters"),
     ("target", "TEXT", "the configured build target; NULL for legacy records"),
-    ("target_directory", "TEXT NOT NULL", "resolved Cargo artifact root, or unknown for older records"),
-    ("build_directory", "TEXT NOT NULL", "resolved Cargo intermediate root; artifact root for legacy records"),
+    ("target_directory", "TEXT NOT NULL", "resolved Cargo artifact root; unknown when the record has no output pair"),
+    ("build_directory", "TEXT NOT NULL", "resolved Cargo intermediate root; unknown when the record has no output pair"),
     ("build_history_group", "TEXT", "real folder or legacy checkout group; NULL for none or unresolved"),
     ("identity_derived", "INTEGER NOT NULL DEFAULT 0", "1 when the index derives the repository key from the call"),
 ]
@@ -219,6 +219,7 @@ GATE_MODULE_COLUMNS: list[Column] = [
     ("attempt", "INTEGER", "execution number from 1; includes hold restarts and reruns"),
     ("restart", "TEXT", "hold when a build hold stopped the attempt; empty otherwise"),
     ("times_missing", "TEXT", "reason test times are missing; empty when present"),
+    ("log", "TEXT", "gzipped output of a failed attempt; empty otherwise"),
     ("wall_s", "REAL", "wall time of the module"),
     ("cpu_s", "REAL", "user and system CPU seconds"),
     ("peak_mib", "REAL", "peak memory in MiB"),
@@ -699,10 +700,17 @@ def open_for_update(path: Path) -> sqlite3.Connection:
     tables = {row[0] for row in cast(list[tuple[str]], connection.execute(
         "SELECT name FROM sqlite_master WHERE type = 'table'"
     ).fetchall())}
-    if version != SCHEMA_VERSION or not (set(TABLES) | set(BOOKKEEPING_TABLES)).issubset(tables):
+    rebuild = version != SCHEMA_VERSION or not (set(TABLES) | set(BOOKKEEPING_TABLES)).issubset(tables)
+    if rebuild:
         connection.close()
         remove_index(path)
         connection = sqlite3.connect(path, timeout=BUSY_TIMEOUT_MS / 1000, isolation_level=None)
+    # WAL spill takes no exclusive database lock, so readers do not wait.
+    mode = cast(tuple[str], connection.execute("PRAGMA journal_mode = WAL").fetchone())[0]
+    if mode != "wal":
+        connection.close()
+        raise sqlite3.OperationalError(f"Cannot enable WAL journal mode: {mode}")
+    if rebuild:
         _ = connection.execute("BEGIN IMMEDIATE")
         create_schema(connection)
         _ = connection.execute("COMMIT")
@@ -714,6 +722,8 @@ def open_for_update(path: Path) -> sqlite3.Connection:
             _ = connection.execute(statement)
     spill_pages = conf.read("buildlog").whole("INDEX_SPILL_PAGES")
     connection.execute(f"PRAGMA cache_spill = {spill_pages}").close()
+    # SQLite reads the flag through 8 bits; ON enables spill and keeps the threshold.
+    connection.execute("PRAGMA cache_spill = ON").close()
     _ = connection.execute(f"PRAGMA busy_timeout = {BUSY_TIMEOUT_MS}")
     return connection
 
@@ -866,7 +876,9 @@ def add_step(connection: sqlite3.Connection, record: dict[str, object], src: str
     charge_bytes = charge_bytes if type(charge_bytes) is int else None
     target_dir = record.get("target_dir") or store.UNKNOWN_IDENTITY
     folder = target_dir if isinstance(target_dir, str) and Path(target_dir).is_absolute() else None
-    target_directory = record.get("target_directory") or folder or store.UNKNOWN_IDENTITY
+    target_directory, build_directory = record.get("target_directory"), record.get("build_directory")
+    if not target_directory or not build_directory:
+        target_directory = build_directory = store.UNKNOWN_IDENTITY
     checkout = record.get("worktree") or record.get("cwd")
     key = (build_keys(cast(list[str], argv))
            if isinstance(argv, list) and all(isinstance(word, str) for word in cast(list[object], argv))
@@ -880,7 +892,7 @@ def add_step(connection: sqlite3.Connection, record: dict[str, object], src: str
         "worktree_name": folder_name(record.get("worktree")),
         "target_dir": target_dir or store.UNKNOWN_IDENTITY,
         "target_directory": target_directory,
-        "build_directory": record.get("build_directory") or target_directory,
+        "build_directory": build_directory,
         "repo_identity": record.get("repo_identity") or store.UNKNOWN_IDENTITY,
         "identity_derived": 0,
         "target_folder": folder,

@@ -1070,118 +1070,243 @@ Checkpoint `1f9e9c484` on `verify-not-mac-wait`, merged to builds as `a62793f07`
 
 **Ruled out:** a new timer; an SSH call from `free_now`; the timed backoff for a version mismatch (it stops every repository on the target).
 
-### Phase 41n — One build_targets.py start per verify.sh step  · status: todo
+### Phase 41p — Each build_targets.py subcommand imports only what it uses  · status: done
 
 **Depends on:** Phase 41e.
 
-#### Work Order
+#### As-built
 
-**Source:** builds showrunner, 2026-11-07 17:50, ruling option B. natest measured about 6 `build_targets.py` starts per `verify.sh` start, each about 0.71 CPU s, almost all imports (`targets` 375 ms, `build_hold` 218 ms, `roster` 206 ms, `admission_service` 193 ms, `mac_test` 125 ms). In `test_verify_mac_only.py`, 84 starts cost 60 of 96.5 CPU s.
-
-**Goal:** a `verify.sh` step reads its initial routing facts from one `build_targets.py` start, as one JSON answer. Calls at a later time boundary stay separate.
-
-**Calls and their time boundaries** (`scripts/direct/verify.sh` at fe32afe8f):
-
-| Call | Boundary | Disposition |
-| --- | --- | --- |
-| `eligible`, `initialize_step_record` (line 2271) | step start | goes into the new command |
-| `register-local`, first routing check (line 2250) | step start, no wait before it | goes into the new command where the route needs it |
-| pinned `eligible`, first pass (line 2675) | step start, repeats the initial read | reuses the initial answer |
-| `reserve` (printed at line 2549) | changes claim ownership | stays separate |
-| pinned `eligible`, later passes (line 2675) | after a target wait | stays separate and fresh |
-| `register-local`, later checks (line 2250) | during routing and between steps | stays separate |
-| eligibility refresh in `run_step` (line 695) | before a later step, only when a listed mark exists | stays separate |
-| `release-wait` (line 2525) | releases a reservation | stays separate |
-| `interrupt-local` (line 1638) | cleanup | stays separate |
-| `wait-local` (line 3186) | blocking wait and its leave hook | stays separate |
-
-**Spec:**
-
-1. Add one `build_targets.py` command that returns the initial routing facts as one JSON object. Name its result type `StepStartFacts`.
-2. Include the routing decision, its reason, and the ordered target rows: name, eligibility, exclusion reason, settings path and platform.
-3. Include each evaluated target's `FreeNowAnswer`. Show capacity that was not read with an explicit variant (as `CapacityNotRead` does), not a null.
-4. Include the initial local hold admission result and its diagnostic when the route needs that check. Keep admission statuses 0, 10 and 12 and their effects. Use an explicit variant for "not checked".
-5. Include the probe mark paths and the remote verb-to-kind map that `final` needs.
-6. `verify.sh` decodes the JSON once. Start no interpreter for each field.
-7. The first pass of a pinned wait reuses the initial answer. Later passes read fresh eligibility.
-8. Take no reservation at step start, before the cache decision, or before the previous step's reservation is released.
-9. Keep target order, claim adoption, busy claim handling, refusals, diagnostics and exit statuses.
-10. Read `free_now` once per target eligibility evaluation, and pass that answer through Mac eligibility.
-11. Keep the fresh capacity checks at later reservation boundaries.
-12. Keep `--new-step` on the initial read, and the mark-triggered refresh before later steps.
-13. Start at most one recovery per target at a time. Start none on pinned reads or waiting retries.
-14. Keep recovery's script copy, tree copy, claim ownership, interrupt cleanup and repository decline retention.
-15. Keep each old subcommand that other callers use.
-16. Add no per-subcommand lazy imports (builds' ruling: option B, not A).
-17. Reuse what still applies from old Phase 1 (766b3e87d): `VERIFY_PY_TRACE=<file>` writes one line per helper start. `verify_metadata.py` is already on `builds`.
-18. In the checkpoint summary, list each remaining `BUILD_TARGETS_SCRIPT` call and its boundary.
+- `build_targets.py` loads project modules (`build_hold`, `mac_test`, `offload`, `roster`, `aws_target`, `buildlog`, `target_config` and the lib helpers) inside the functions that use them. The module top keeps only stdlib modules: those already loaded by argparse, dataclasses, contextvars, pathlib and typing (`os`, `sys`, `io`, `time`, `contextlib`, `collections.abc`, `importlib`, `types`, `typing`), and cheap ones (`json`, `fcntl`, `signal`, `datetime`, `decimal`, `calendar`). `subprocess` loads inside its users.
+- `command_eligibility(args)` holds the `eligible` flag handling.
+- `command_wait_local` loads `release_waiter` through `importlib`, because this CLI's import root excludes the worker module.
+- `targets.py`: `target_state` dispatches to `local_hold_state` (loads `build_hold` only) and `ssh_target_state` (claim records); `read_aws_status` loads its AWS and record modules inside. No `sys.path` inserts remain.
+- Same-load interleaved pairs, median CPU per start: `eligible` 0.79 → 0.59 s, `reserve` 0.79 → 0.60 s, `release-wait` 0.71 → 0.55 s. Output, exit status and side effects are unchanged.
 
 **Files:**
-- `scripts/direct/verify.sh`
-- `scripts/build_targets/build_targets.py`
-- `scripts/mac_test/test_failed_probe_mark.py` — its observer at line 587 matches the literal `eligible` command
-- `scripts/build_targets/test_step_start_facts.py` — new tests
+- `scripts/build_targets/build_targets.py` — the CLI, with function-level project imports.
+- `scripts/build_targets/targets.py` — target state readers, split into local and SSH state.
+- `scripts/build_targets/test_build_targets.py` — the mac_test-once test reads an SSH target state before it counts loads.
 
-**Workers:** 1 writer: a new worker, not fix16 (builds, 2026-11-07 18:40).
+**Gotchas:**
+- Import of `build_targets` alone loads no `mac_test`. A test that counts `mac_test` loads must first call `target_state` with an SSH target.
+- Compare CPU only in interleaved pairs under the same load. Test-module CPU is noisy under a changing load; per-start CPU is the stable measure.
 
-**Constraints from prior phases:**
-- Read for the contract, without edits: `scripts/build_targets/targets.py`, `scripts/mac_test/mac_test.py`, `scripts/mac_test/offload.py`.
-- `initialize_step_record` runs once per call. `run_step` reads eligibility again only when a listed mark exists.
-- The probe mark paths hold the target failure marks and this repository's version decline records.
-- Pinned eligibility starts no recovery, also on repeated reads during a wait.
-- Recovery keeps the repository decline record after a good probe.
-- A test cleanup that signals a process group uses `scripts.lib.process_group.send_process_group`. The process-group guard in `lib/test_process_group.py` fails on a raw `os.killpg`.
-- natest owns the `test_verify*` files. Put new tests in a new file. Name natest in the notice for any change to its files.
-- Add no guard, refusal or check that this Spec does not ask for.
-- Tests use a temporary state folder.
+**Ruled out:** one step-start JSON command for all step facts (starts per step local 1→1, pinned SSH 4→3, Mac-only 3→3; `test_verify_mac_only.py` CPU −2.8%).
 
-**Acceptance gate:**
-- `VERIFY_PY_TRACE` counts, before and after, for the same uncached local, pinned SSH and Mac-only fixtures. One initial facts command runs before the first routing wait or target run. Count reservation, release, interrupt and wait commands on their own lines. Report every helper start, so the JSON decode hides no cost.
-- The first pinned pass starts no second eligibility command. A target change forced during a wait reaches the next pass.
-- Local admission results 0, 10 and 12 keep their diagnostics.
-- Target order, settings paths, exclusion reasons and the `final` remote kind map match the old output.
-- A cache hit takes no reservation. The previous step's reservation is released before the next one starts.
-- One capacity read per eligibility evaluation while recovery changes the claim state.
-- Phase 41e's recovery, capacity order, status and repository decline tests pass, with the `test_failed_probe_mark.py` observer moved to the new command.
-- The CPU of `test_verify_mac_only.py`, measured before and after under the same load, goes down. Report both numbers.
-- `test_verify_wait_holder.py`, `test_failed_probe_mark.py`, `test_ssh_eligibility.py`, `test_build_targets.py` and `test_verify_ssh_targets.py` pass.
-- `bash -n`, shellcheck with no new findings, and basedpyright 0/0/0 on the changed Python files.
-- The director runs the targeted test (`targeted_test.py`) before the checkpoint.
+### Phase 41q — Load mac_test and offload only for an SSH target  · status: done
 
-### Phase 41o — Remove the socket close race in the token release test  · status: todo
+**Depends on:** Phase 41p.
 
-**Depends on:** Phase 41e.
+#### As-built
+
+- `build_targets.py` imports `mac_test` and `offload` only inside the SSH target loops of `reserve` and `release-wait`, the saved-reservation branch, and the `eligible` output-file flag branches.
+- `target_eligibility` (`targets.py`) returns every target as eligible when all are Linux. Otherwise `mac_policy_eligibility` imports `offload` and applies the Mac policy checks.
+- `mac_test.py` imports `build_hold` under `TYPE_CHECKING` and inside `read_claim_block`, `block_duration`, `block_belongs_to` and `bind_instance_generation`; `sweep` inside `free_now`. `offload.py` imports `sweep` inside its users and `buildlog.record` inside its attempt recorder.
+- Median CPU per start, five interleaved pairs on the merged tree: local-only `eligible` 0.26 → 0.10 s, `reserve` 0.29 → 0.09 s, `release-wait` 0.30 → 0.09 s. SSH-target `eligible` 0.29 → 0.29 s, `reserve` 0.32 → 0.30 s, `release-wait` 0.30 → 0.22 s.
+- queue Phase 31 already broke the `offload → sweep → tmp_sweep → session_staff → unit_config → production_doc → showrunners` chain. No measured command loads `showrunners`, `design_roles` or `admission_service`.
+
+**Files:**
+- `scripts/build_targets/build_targets.py` — SSH imports inside their branches.
+- `scripts/build_targets/targets.py` — `mac_policy_eligibility`.
+- `scripts/mac_test/mac_test.py`, `scripts/mac_test/offload.py` — function-level imports of hold, sweep and attempt-record modules.
+- `scripts/build_targets/test_build_targets.py` — `test_local_commands_omit_ssh_modules`: four fresh-process cases (bare eligible, kind eligible, release-wait, filtered reserve).
+
+**Gotchas:**
+- SSH `eligible` still needs the repository policy and sweep helpers, so its CPU does not change.
+- Phase 41p's removal of the `sys.path` inserts broke `linux_runner.trim_build_folder`, whose child imported bare `sweep` and `conf`. devtools Phase 3z fixed it on builds (the child runs `scripts/lib/py` with package imports). A `sys.path` insert can hide a bare import elsewhere; run the `mac_test` modules after an import change.
+
+### Phase 41r — Stop two verify test modules from growing without limit  · status: done
+
+**Depends on:** none.
+
+#### As-built
+
+- Cause: in `start_token_renewer` (`verify.sh`), the INT/TERM/HUP trap ran `kill $(jobs -p); wait`. At shutdown the bare `wait` met pipeline jobs that were not children of the renewer subshell. It printed `wait: pid ... is not a child of this shell` without end. The run log, step output and `lint_invoke` log in the tmpfs `TMPDIR` grew to about 1 GB each under a 3G cap, then OOM. This matches the 27.0 GiB and 9.4 GiB gate kills of 2026-11-08 11:19 UTC.
+- The trap now stops and waits only for the renewer's own sleep. The loop records `$!` before each `sleep &` and sets a launch flag. A signal that arrives after the fork and before `renew_sleep_pid=$!` takes the new `$!`.
+- Five capped runs of each module peak at 149 MiB (memory handoff) and 122 MiB (local release), from cgroup `memory.peak` with tmpfs pages.
+
+**Files:**
+- `scripts/direct/verify.sh` — the renewer trap.
+- `scripts/direct/test_verify_mac_local_release.py` — `test_renewer_cleanup_keeps_inherited_jobs`: cleanup stops the renewer's sleep and keeps a job it did not start.
+- `scripts/direct/test_verify_token_reclaim.py` — the DEBUG hook sends TERM at `renew_sleep_pid=$!`.
+
+**Gotchas:**
+- A bare `wait` or `kill $(jobs -p)` in a subshell trap reaches jobs the subshell did not start. Name the PID.
+- `test_verify_token_reclaim.py` matches the exact command text in `start_token_renewer`. A change to that line must update the hook, or the test waits to its 600 s timeout.
+- Reproduce memory growth only in `systemd-run --user --scope -p MemoryMax=3G -p MemorySwapMax=0`.
+
+### Phase 41s — A worktree and its branch end when their work lands  · status: done
+
+**Depends on:** none.
+
+#### As-built
+
+- `scripts/worktree/worktrees.py` has one CLI command, `make <path> <branch>`. `make_worktree.sh <path> <branch>` calls it. There is no `end` or `sweep` command, no timer and no cleanup path.
+- `make` runs `git worktree add`, then writes a `WorktreeRecord` to `~/.local/state/worktrees/made/<sha256 of the path>.json` (`WORKTREES_STATE_DIR` overrides the folder). The record holds `version`, `path`, `branch`, `repo`, `base`, `merge_branch`, `owner` and `made_at`. A failed record write removes the new tree and branch.
+- `owner` and `merge_branch` come from the caller's staff row (`member_by_folder`, then `merge_branch`). With no row, `merge_branch` is the `origin/HEAD` name and `owner` is `""`. A repository with no `origin/HEAD` records an empty merge branch, so no production merge ends that tree.
+- `landed(record) -> Landed | NotLanded(commits, paths)` reads `origin/<merge_branch>`. A commit counts as landed when `git cherry` marks it `-`, when it is a merge commit, or when it changes only `docs/plans/` paths. Each non-plan path changed since `base` must match the merge branch, or the merge branch must have changed it after the branch's last commit.
+- `end_landed(repo, merge_branch) -> list[Ended | Kept]` runs in `merge_checkpoint.py` after the merge-branch push reports `ok`, and each result is a `worktrees` step line. It keeps a tree that a staff row holds, a dirty tree, a tree whose HEAD is not the recorded branch, and a tree whose work has not landed. A `Kept` never fails the merge. Otherwise it removes the tree, deletes the branch local and on origin, then deletes the record. A missing tree, branch or remote branch is not an error, so the next merge finishes an end that stopped halfway.
+- The main checkout comes from the first entry of `git worktree list`. Git errors use `failure_detail`.
+
+**Files:**
+- `scripts/worktree/worktrees.py` — `make`, the record, the landing rule and `end_landed`.
+- `scripts/worktree/make_worktree.sh` — calls `worktrees.py make`.
+- `scripts/production/merge_checkpoint.py` — calls `end_landed` after its push (owner: sdlc).
+- `scripts/worktree/test_worktrees.py` — the record, landing, keep and end rows.
+- `scripts/production/test_merge_checkpoint.py` — the merge row (owner: sdlc).
+- `config/copies.conf` — allows `worktree/worktrees.py`, which makes original work trees.
+- `docs/as-built/staff-accessors.md` — lists `worktrees.py` as a staff reader.
+
+**Binds later work:** `config/copies.conf` keeps `allow.worktree/worktrees.py`. `test_original_worktree_helper_is_allowed_but_bare_worktree_add_is_refused` sets a private `WORKTREES_STATE_DIR`. A new worktree for unit work comes from `make_worktree.sh`, so the production merge can end it.
+
+**Gotchas:**
+- The copy guard's repository scan and failure-stream rule read every script, so a new module that makes a tree needs a copies allow-list entry.
+- A test that calls `make_worktree.sh` must set `WORKTREES_STATE_DIR`, or it writes a record into the real state folder.
+
+**Ruled out:** an `end` command, a sweep, a timer, and a call from `end_session.sh` or the phase-start merge — the user wants the landing step to end a tree, not a cleanup tool.
+
+### Phase 41t — The copy guard refuses only what makes a repository tree  · status: done
+
+**Depends on:** none.
+
+#### As-built
+
+- `shell_syntax` gives each word one of two states: a literal word or an expanded word. `copy_guard` turns them into `KnownArgument` and `UnknownArgument`, and an expanded word keeps its known text. After a lexer error, `readable_program` continues at the next `;`, `&`, `|` or newline, so a bad span does not hide the commands after it. No `bash -n` subprocess runs per hook call.
+- An expansion in an interpreter program is an unknown word, not an unknown program. `ExpandedProgramInput` sits beside `LiteralProgramInput`. Joined Python text keeps its known parts, and an attached `-c` with an expansion is a program. Python that does not parse passes, except an expanded program that holds a tree-making word: that one gets `cannot parse Python program`.
+- `refusal()`, the argv branch of `hook_refusal()` and `TreeCreation.__str__()` add the `copies.py` instruction only to a tree-making operation. An unresolved input gets a message that names what the guard could not read. A known tree-making operation keeps its refusal when an unresolved input comes before it in the same command.
+- A later assignment replaces an earlier one. `if`, `case`, `&&`, `||` and loop branches merge their values into `ArgumentChoices`; nested choices flatten and repeat values drop. `guard_choice_limit` (`config/copies.conf`, 32) bounds the combinations read for one command; above it the value is an `UnresolvedChoices`, so a tree-making position keeps its refusal.
+- The 22 commands of the phase command list give their expected results, and all 268 refused transcript commands pass. `scan_scripts` on `scripts/` reports no findings.
+- Four `scripts/direct` test flakes are closed: the run-place package root, the ssh-target claim in a child process, fixed clocks in the step record, and the hold-events environment restore. `local_hold_environment` restores only the keys it changed, in place of `mock.patch.dict`, which cleared `os.environ` while the `admission-readings` thread read it.
+
+**Files:**
+- `scripts/copies/shell_syntax.py` — word states and lexer recovery.
+- `scripts/copies/copy_guard.py` — program inputs, refusal text, branch value merges and the choice bound.
+- `scripts/copies/copies.py` — `guard_choice_limit()`: reads `config_settings()`, with a fallback to the repository `config/copies.conf` when the key is missing.
+- `config/copies.conf` — `guard_choice_limit=32` with its comment.
+- `scripts/copies/test_copy_guard.py` — command rows and `test_branch_arguments_require_linear_invocation_work`, which counts `inspect_invocation` calls.
+- `scripts/direct/verify_hold_wait_test_support.py`, `test_verify_hold_events.py`, `test_verify_run_place.py`, `test_verify_ssh_targets_retained.py`, `test_step_record.py` — the flake fixes.
+
+**Binds later work:** a new copies config key follows the required-key form of `guard_choice_limit()`. A guard change keeps `scan_scripts` on `scripts/` under one second per file, and keeps `test_branch_arguments_require_linear_invocation_work` green.
+
+**Gotchas:**
+- Without the bound, branch-aware merges grow as a product of branches and variables: `scripts/rust_style/load-rust-style.sh` took 63 s of CPU against a 10 s hook budget.
+- The hold-events cause is a race found by reading the code; no process that outlives the test was found.
+- Above the bound, a choice-limited interpreter program is refused even when it makes no tree; the phase "A command that makes no tree passes at the copy guard's branch limit" removes that refusal.
+
+### Phase 41v — A command that makes no tree passes at the copy guard's branch limit  · status: done
+
+**Depends on:** 41t.
+
+#### As-built
+
+- Above `guard_choice_limit`, `UnresolvedChoices` keeps the texts of the dropped values in `choice_texts`. `_retained_choice_texts` collects them in one linear walk, with no combinations, so the work for one command stays linear in branches and variables.
+- An interpreter program built from such a word is a `ProgramWithChoiceTexts(text, choice_texts)`, read like an expanded program. `eval`, `bash -c` and `python -c` accept it.
+- The guard refuses it with "cannot resolve interpreter program choices" only when the known text or a kept text holds a tree-making word: `TREE_COMMAND`, or `copytree|clone_from|worktree|Repo.clone` for Python (`_tree_making_text`). A program with no tree word passes, so a long branch command that only prints runs.
+- A known tree-making operation keeps its refusal, and an unknown word in a tree-making position keeps `cannot resolve executable name`.
+
+**Files:**
+- `scripts/copies/copy_guard.py` — choice text retention and the narrowed program refusal.
+- `scripts/copies/test_copy_guard.py` — above-choice-limit rows: shell printf passes; shell clone, shell runner, copytree, git options and a 33-arm `eval` refuse.
+
+**Binds later work:** a guard change keeps `test_branch_arguments_require_linear_invocation_work` green and keeps the above-choice-limit rows.
+
+**Gotchas:**
+- A tree word split between a literal and a dropped value (`gi${v}` with `t` in a dropped value) passes above the limit.
+- `python3 -c "shutil.copytree('$UNSET', ...)"` and `bash -c "$UNSET/git -C . clone . dest"` pass; their top-level forms refuse. Recorded in the next-items file.
+
+**Ruled out:** refuse every choice-limited program — that is the false refusal this phase removes.
+
+### Phase 41u — copies.py list shows remote mirrors  · status: done
+
+#### As-built
+
+- `copies.py list` prints a tab-separated header `number owner repository host path session commit state holder_pid target`. Local standing checkouts come first; remote mirrors follow, sorted by host and path. Local rows show the host from `socket.gethostname()` and keep commit, busy state, holder pid and target size.
+- An unreadable `.gate.json` keeps a numbered row: owner `unavailable`, repository from the tree's parent folder, state `unreadable`, other facts `-`. The error goes to stderr as `<tree>: <error>`.
+- Owner column: `OwnerDisplay` is `CurrentStaffOwnerName`, `RoleOwnerName` or `OwnerNameUnavailable`, from `list_owner_name(owner, staff_names)`. An unavailable owner keeps its row and its lease state. `owner_name()` is unchanged, so `tree_paths()` and `_scratch_gate_word()` keep their folders.
+- `ListStaffNames` reads `staff.local_snapshot()` at most once per list call, and only when a row needs it (`UnreadStaffNames`, `AvailableStaffNames`, `UnavailableStaffNames`). Owner and session columns resolve from that one snapshot.
+- Lease state: `list_remote_leases(mirrors, staff_names)` reads `file_lock.held_flock_keys()` once and calls `file_lock.device_key` per mirror. The result is `HeldMirrorLease(pid, holder)`, `IdleMirrorLease` or `UnavailableMirrorLease`. An OSError on the lock table makes every mirror unavailable; `FileNotFoundError` on the lease file means idle; any other OSError means unavailable. On macOS, with no `/proc/locks`, every mirror lists as unavailable.
+- Holder: `_list_holder_name` names the holder only when the lease pid equals the record's `holder_pid` (`CurrentHolderName`); otherwise `HolderNotRecorded` (`not recorded`). A held lease with no staff row for its session stays held with `HolderNameUnavailable`. `held_remote_mirrors()`, `lock_holder()` and `scripts/lib/file_lock.py` are unchanged.
+
+**Files:**
+- `scripts/copies/copies.py` — the list, owner display, lease and holder states.
+- `scripts/copies/test_copies.py` — local list rows, the unreadable-record row, folder-name stability.
+- `scripts/copies/test_remote_copies.py` — remote-only and mixed rows, lease, holder and owner states; `expected_remote_lease_columns` names the `/proc/locks` platform choice once.
+- `docs/as-built/gate-checkouts.md` — the `list` paragraph.
+
+**Gotchas:** holder identity rests on pid equality between the lease and `holder_pid`; one process takes the lease and registers on the real path.
+
+**Ruled out:** a process or lease generation check for the holder — pid reuse inside one run's lease-to-register window only changes list output.
+
+### Phase 41w — Two helper starts in the verify wait tests load less  · status: done
+
+#### As-built
+
+- `scripts/direct/step_selection.py` holds `Routed`, `Pinned`, `TargetSelection` and `ROUTED`. It imports only `dataclasses`.
+- `build_targets.py` imports the selection types from `step_selection`. A `build_targets.py` start does not load `step_record`, `boot_identity` or `process_start`.
+- `step_record.py` re-exports the selection types (`X as X`) after its `__main__` fast path, for `scripts/aws_target/aws_target.py` and `test_control.py`. Each type has one definition.
+- `unit_config.parse_port_cell` imports `cell_value` locally. A `progress_history.py` start does not load `production_doc`, `showrunners` or `session_send`.
+- `test_verify_wait_holder.py` under machine load: median 83.6 CPU s before, 58.4 after (three runs each, wide spread). Median per start: `build_targets.py` 12.5 to 8.7 CPU s; `progress_history.py` 21.1 to 15.5 CPU s.
+
+**Files:**
+- `scripts/direct/step_selection.py` — the target selection types.
+- `scripts/direct/step_record.py` — re-exports the selection types.
+- `scripts/build_targets/build_targets.py` — imports the selection types from `step_selection`.
+- `scripts/production/unit_config.py` — the local `cell_value` import in `parse_port_cell`.
+- `scripts/direct/test_verify_routing_rule.py`, `scripts/direct/test_step_record.py`, `scripts/direct/test_verify_step_state.py` — import the selection types from `step_selection`.
+
+**Gotchas:** `step_selection.py` loads on every `build_targets.py` start; an import added there costs every start.
+
+**Ruled out:** removing the `step_record` re-exports — `aws_target.py` and `test_control.py` import the types from there.
+
+### Phase 41y — No process outlives the hold event tests under load  · status: done
+
+#### As-built
+
+- `VerifyHoldWaitFixture.fixture_cleanups` fails with the inner cleanup failure text. `VerifyHoldTools` records each failed cleanup's traceback in `cleanup_failures`.
+- `reap` returns pid to command line. `assert_nothing_outlives` fails with "processes outlived the test:" and each pid with its command line.
+- `hold_recorder_exits(timeout)` (`verify_mac_offload_test_support.py`) records each `hold-event-recorder` thread that a hold call starts, as a `HoldRecorderStart`. On exit it waits for each start to finish, then joins each started thread within the timeout. On timeout it kills the recorder children and fails with "fixture hold recorder never exited". `local_hold_environment` and `hold_environment` both wrap their yield in it, so no recorder runs after the fixture restores its environment.
+- The hold-event deadline test watches a private folder, so events from other tests under the shared temporary folder do not end its wait.
+- Under a load of up to 16 module processes, `test_verify_hold_events.py` and `test_verify_hold_memory.py` each pass 20 runs of 20.
+
+**Files:**
+- `scripts/direct/verify_hold_wait_test_support.py` — cleanup failure text; `local_hold_environment` waits for hold recorders.
+- `scripts/direct/verify_mac_offload_test_support.py` — `hold_recorder_exits`, `HoldRecorderStart`, `reap` with command lines.
+- `scripts/direct/test_verify_hold_events.py` — the release-record table; the deadline test's private folder.
+- `scripts/direct/test_verify_mac_fixture.py` — the `delayed_start` table row for the recorder wait.
+
+**Gotchas:**
+- `build_hold.start_recorder` starts a detached `record.py hold-event` child with the caller's `BUILDLOG_DIR` and no `TEST_RUNNER_STATE`, so the marker wait cannot see it. A fixture that points `BUILDLOG_DIR` under a root it removes must wait for the recorder thread. Otherwise a late write makes `rmtree` fail with ENOTEMPTY, the root stays, and the next `copytree` raises `FileExistsError`.
+- A recorder thread is recorded before its `start()` returns; join only a thread whose `ident` is set.
+
+**Ruled out:** a change to `build_hold.start_recorder` — the recorder detaches by design, so the fixture waits for it.
+
+### Phase 41x — The final gate runs the repository's own gate in a repository with no Cargo  · status: todo
+
+**Depends on:** none. Runs after 41y.
 
 #### Work Order
 
-**Source:** builds showrunner, 2026-11-07. natest saw `scripts/direct/test_verify_token_release.py` fail once with `BrokenPipeError` at a socket send. It passed when run alone. devtools 8r fixed a like failure in `test_claude_worker`, but that does not prove the same cause here.
+**Source:** builds, 2026-11-08, an anomaly from sdlc. In the `~/.claude` models unit worktree (at 3535b65d7), `verify.sh final` exits 2 with `could not find Cargo.toml`. It did not block that unit.
 
-**Goal:** remove the reported socket close race, and keep token release, the step failure status and process cleanup.
-
-**Facts found (review of fe32afe8f):** `test_verify_token_release.py` holds no socket call. Its fixture starts the private admission server through `caller_admission`. The server sends at `admission_service.py:2192`, and line 2205 already catches `BrokenPipeError`. `scripts/lib/test_hang_guard.py` sends on a timer socket and catches `OSError`.
+**Goal:** a unit run in a repository with no `Cargo.toml` reaches its final gate with a gate that fits the repository, and `verify.sh` names the cause in one line when it is called there.
 
 **Spec:**
-
-1. Get the original traceback from natest or the run record. Name the send that raised it.
-2. Find the order of events that closes the other end first. Prove it with a forced order, with no repeat loop and no timing sleep.
-3. Fix the cause where it is: in the fixture if the fixture closes early, in the code if the code sends after a stop.
-4. Do not retry the send, and do not catch `BrokenPipeError` in the test.
+1. **Cause.** <FinalGate/> step 1 (`docs/direct/final_gate_commit.md:11`) launches `verify.sh final` in every repository. `verify.sh` is the Cargo verifier: in a repository with no `Cargo.toml`, cargo prints `could not find Cargo.toml` and `verify.sh` exits 2. The writer confirms this on the real path before the edit and quotes the line that runs cargo.
+2. **Final gate.** <FinalGate/> step 1 launches `verify.sh final` only in a Cargo repository (a `Cargo.toml` at the repository root). In a repository with no `Cargo.toml`, it runs that repository's unit gate. If config already names a unit gate per repository, the doc names that config. Otherwise it names the `~/.claude` gate, `targeted_test.py --checkout <tree>`, with no other repository. Step 2's failure path applies to both gates.
+3. **verify.sh.** In a repository with no `Cargo.toml`, each `verify.sh` command that reaches repository setup exits 2 before any cargo call, with one line: `verify.sh: <root> has no Cargo.toml; verify.sh checks Cargo repositories only`. The paths that run before repository setup keep their current results: help (`-h`, `--help`, `help <command>`, the case block after the comment "Help returns before environment setup"), the `final-pass` refusal and the `final --saved` query (after the comment "Read-only queries run before environment setup").
+4. **Proof.** One row in `test_verify_check_no_library.py`: a real git repository with no `Cargo.toml` gets exit 2, the line from item 3, and no cargo start. Run `verify.sh` with a direct Bash call: the inherited `verify()` helper (`verify_examples_test_support.py`) reads `Cargo.toml` before it starts Bash and raises `FileNotFoundError` without one, and its git command is a stub. The row asserts that both the cargo call log and the cargo metadata call log stay empty. The row fails on the current tree.
 
 **Files:**
-- `scripts/direct/test_verify_token_release.py` — natest owns it; name natest in the notice
-- `scripts/direct/verify_token_wait_test_support.py` — fixture setup, process cleanup, caller lifetime
-- `scripts/build_queue/admission_test_support.py` — private server lifetime and thread failures (queue owns it)
-- `scripts/build_queue/admission_service.py` — the socket send and disconnect handling (queue owns it)
-- `scripts/build_queue/admission_client.py` — request sends and transport errors (queue owns it)
-- `scripts/lib/test_hang_guard.py` — the timer socket send
+- `docs/direct/final_gate_commit.md` — the gate choice (owned by sdlc; the checkpoint notice names it).
+- `scripts/direct/verify.sh` — the early exit.
+- `scripts/direct/test_verify_check_no_library.py` — the row. Its `DevFeatureFixture` (`verify_dev_features_test_support.py:74`) runs `verify.sh` in a temporary workspace.
 
-**Workers:** 1 writer.
+**Workers:** 1 writer — `impl` owns every file above.
 
 **Acceptance gate:**
-- A test forces the failing order. It fails before the fix and passes after it, with no repeat and no sleep.
-- Token release, the step failure status and process cleanup are asserted in that test.
-- After that proof, `test_verify_token_release.py` passes 50 runs in a row under load.
-- The director runs the targeted test (`targeted_test.py`) before the checkpoint.
+- The changed test module passes with no assertion changed; `basedpyright` reports 0 errors and 0 warnings on the changed test file.
+- The existing help and saved-pass tests pass unchanged: `test_verify_verbs.py` and `test_verify_final_pass.py`.
+- The director runs the targeted test.
 
 ### Phase 41c — Send a lint that waits for memory to a free Mac  · status: done
 

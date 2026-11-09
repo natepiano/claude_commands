@@ -12,6 +12,7 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import unittest
@@ -23,6 +24,7 @@ from scripts.shutdown import pane_record
 from zoneinfo import ZoneInfo
 from scripts.direct.wait_for_test_state import wait_until
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.lib import main_publish
 from scripts.message import sessions
 
 from scripts.production.merge_checkpoint import promote, request_from
@@ -41,6 +43,9 @@ MERGED_AT = datetime(2026, 10, 6, 12, tzinfo=ZoneInfo("America/Los_Angeles"))
 
 def setUpModule() -> None:
     configure_test_environment()
+    state = tempfile.TemporaryDirectory()
+    unittest.addModuleCleanup(state.cleanup)
+    unittest.enterModuleContext(mock.patch.dict(os.environ, {"ZONE_STATE": state.name}))
 
 
 @final
@@ -175,7 +180,7 @@ class MergeCheckpointTests(MergeCheckpointFixture):
         (self.state / "slow-delivery").touch()
         command = (
             "import sys\nfrom pathlib import Path\n"
-            "sys.path.insert(0, sys.argv[1])\nimport merge_checkpoint as checkpoint\n"
+            'with open(Path(sys.argv[1]).parents[1] / "scripts/lib/package_root.py") as package_root: exec(package_root.read(), {"__file__": package_root.name})\nfrom scripts.production import merge_checkpoint as checkpoint\n'
             "path = Path(sys.argv[2])\ncheckpoint.send_result(path, checkpoint.read_record(path))\n"
         )
         output = self.enterContext((self.state / "slow-delivery.log").open("w"))
@@ -773,6 +778,27 @@ with lock.open("a") as held:
         self.assertIn(f"into: {self.checkout} (production)", result.process.stdout)
         self.assertIn(f"into: {self.promote} (main)", result.process.stdout)
         self.assertNotIn("into: " + str(self.root / "mac-installed"), result.process.stdout)
+        with self.subTest(mac="unreachable"):
+            self.env["ZONE_STATE"] = str(self.root / "zone")
+            self.executable(self.bin / "ssh", STUB.replace('if name == "ssh":\n',
+                'if name == "ssh":\n'
+                + '    print("connection timed out", file=sys.stderr)\n'
+                + '    raise SystemExit(255)\n'))
+            with mock.patch.object(merge_checkpoint, "send_queued_zone") as send_zone:
+                completed = self.run_checkpoint(sha)
+            self.assertEqual(completed.process.returncode, 0, completed.process.stdout + completed.process.stderr)
+            self.assertIn("promote: ok — mac unreachable, pull pending", completed.process.stdout)
+            self.assertNotIn("into: " + str(self.root / "mac-installed"), completed.process.stdout)
+            self.assertEqual(self.git("rev-parse", "HEAD", cwd=self.promote), self.git("rev-parse", "HEAD"))
+            self.assertIn("merged as", self.log.read_text())
+            send_zone.assert_not_called()
+            with mock.patch.dict(os.environ, self.env):
+                pending = main_publish.read_queue()
+            self.assertIsInstance(pending, main_publish.PendingMacPull)
+            assert isinstance(pending, main_publish.PendingMacPull)
+            self.assertEqual(pending.text, "")
+            self.assertIn("connection timed out", pending.reason)
+
     def test_mac_pull_retries_once_then_succeeds(self) -> None:
         config = self.root / "merge_checkpoint.conf"
         _ = config.write_text("# whole: 1..\nMAC_PULL_TRIES=3\n# range: 0..\nMAC_PULL_RETRY_SECONDS=0\n")

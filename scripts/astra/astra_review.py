@@ -22,7 +22,6 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.astra import astra_work, design_roles  # noqa: E402
 from scripts.lib import unit_runs
 from scripts.production import staff
@@ -103,7 +102,6 @@ def run_review(review: Path, prompt: str, log: Path) -> int:
     caller = staff.snapshot().by_current_session(manager) if manager else None
     target = "consultation-pane"
     if caller is not None and caller.kind in ("unit", "showrunner"):
-        write_text_atomic(log.parent / "worker_transport", unit_runs.parent_transport(caller.current_session) + "\n")
         target = "staff-worker"
     write_text_atomic(log.parent / "prompt.md", prompt)
     return _managed_review(review, log, target)

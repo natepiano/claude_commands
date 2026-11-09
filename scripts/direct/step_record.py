@@ -253,6 +253,12 @@ if __name__ == "__main__":
 
 
 from dataclasses import dataclass
+from scripts.direct.step_selection import (
+    Pinned as Pinned,
+    ROUTED as ROUTED,
+    Routed as Routed,
+    TargetSelection as TargetSelection,
+)
 
 
 @dataclass(frozen=True)
@@ -267,20 +273,6 @@ class AnyTarget:
 
 
 RunsOn = NatedevOnly | AnyTarget
-
-
-@dataclass(frozen=True)
-class Routed:
-    pass
-
-
-@dataclass(frozen=True)
-class Pinned:
-    target: str
-
-
-TargetSelection = Routed | Pinned
-ROUTED = Routed()
 
 
 @dataclass(frozen=True)

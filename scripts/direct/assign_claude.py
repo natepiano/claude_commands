@@ -12,6 +12,7 @@ from pathlib import Path
 from types import FrameType
 from typing import NoReturn, TypedDict, cast
 
+from scripts.agents import worker_lifecycle
 from scripts.direct import claude_worker, phase_reservation, worker_state
 from scripts.lib import models_registry
 from scripts.lib.atomic_file import write_text_atomic
@@ -87,7 +88,8 @@ def _record(launch: ClaudeLaunch, name: str) -> bool:
             path, identity, session = _identity(launch, name)
             if not session:
                 return False
-            _ = path.write_text(json.dumps(identity))
+            with worker_lifecycle.locked_state(path) as state:
+                state.publish(json.dumps({**state.read_object(), **identity}))
             return True
     except Exception:
         return False
@@ -206,7 +208,7 @@ def _run(launch: ClaudeLaunch) -> int:
     else:
         board_log = launch.run / "board.log"
         try:
-            prefix = launch.run.name if f"mesh={launch.run.name}-" in board_log.read_text() else ""
+            prefix = launch.run.name if f"worker={launch.run.name}-" in board_log.read_text() else ""
         except OSError:
             prefix = ""
         name = child(["bash", str(SCRIPTS / "worker_name.sh"), str(launch.cwd), launch.slot, launch.role, prefix],
@@ -245,7 +247,7 @@ def _run(launch: ClaudeLaunch) -> int:
     beat("header", f"{tag} (claude/{launch.model}:{launch.effort or 'unset'})", launch.role)
     note = f"follow-up to {name}" if isinstance(worker, ClaudeFollowUp) else "launcher up"
     board("register", f"{launch.role} {note} (claude/{launch.model}:{launch.effort or 'unset'}); "
-          + f"mesh={name}; reach=SendMessage; role={launch.role}; status in impl_status_{launch.slot}")
+          + f"worker={name}; reach=SendMessage; role={launch.role}; status in impl_status_{launch.slot}")
     env["UNIT_RUN_DIR"] = str(launch.run)
     build_folders = str(SCRIPTS / "../lib/build_folders.py")
     env["TMPDIR"] = child([PYTHON, build_folders, "run-temp-path", str(launch.run)], capture=True).stdout.strip()

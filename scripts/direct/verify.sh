@@ -472,7 +472,6 @@ else:
     with open(filename, "rb") as script:
         source = script.read()
     sys.argv = arguments
-    sys.path.insert(0, os.path.dirname(os.path.abspath(filename)))
 module = types.ModuleType("__main__")
 module.__file__ = filename
 sys.modules["__main__"] = module
@@ -851,7 +850,7 @@ except (OSError, ValueError):
     sys.exit(2)
 print(",".join(features))
 if len(sys.argv) > 2 and sys.argv[2] in ("test", "final"):
-    sys.path.insert(0, str(Path(sys.argv[3]).resolve().parents[2]))
+    with open(Path(sys.argv[3]).resolve().parents[2] / "scripts/lib/package_root.py") as package_root: exec(package_root.read(), {"__file__": package_root.name})
     from scripts.direct.result_environment import read_policy
     policy = read_policy()
     print(" ".join(policy.forwarded_names))
@@ -1285,24 +1284,24 @@ case "$CMD" in
     *) usage; exit 2 ;;
 esac
 
-# A Codex mesh worker's command dies with its turn, and a worker that waits on
-# one spends a model call per wait. So a worker's call detaches: mesh_runs.py
+# A native worker's command dies with its turn, and a worker that waits on
+# one spends a model call per wait. So a worker's call detaches: detached_runs.py
 # runs this same call under a supervisor outside the worker's process group,
 # returns at once, and sends the result to the worker as its next message.
-# Exit 3 means the caller is not a mesh worker; this call then runs attached.
+# Exit 3 means the caller is not a registered worker; this call then runs attached.
 # Exit 4 refuses the run at its live-run limit; never run that command attached.
 # The detached run sets UNIT_DETACHED_RUN, so it does not detach again.
-MESH_RUNS_SCRIPT="${VERIFY_MESH_RUNS_SCRIPT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../agents" && pwd)/mesh_runs.py}"
+DETACHED_RUNS_SCRIPT="${VERIFY_DETACHED_RUNS_SCRIPT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../agents" && pwd)/detached_runs.py}"
 if [[ -z "${UNIT_DETACHED_RUN:-}" && -n "${CODEX_THREAD_ID:-}" ]]; then
     VERIFY_SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
     DETACH_STATUS=0
-    "$PY" "$MESH_RUNS_SCRIPT" start --label "verify.sh ${VERIFY_ORIGINAL_ARGS[*]-}" -- \
+    "$PY" "$DETACHED_RUNS_SCRIPT" start --label "verify.sh ${VERIFY_ORIGINAL_ARGS[*]-}" -- \
         bash "$VERIFY_SELF" ${VERIFY_ORIGINAL_ARGS[@]+"${VERIFY_ORIGINAL_ARGS[@]}"} || DETACH_STATUS=$?
     case "$DETACH_STATUS" in
         0) exit 0 ;;
         3) ;;
         4) exit 4 ;;
-        *) echo "verify.sh: mesh_runs.py could not detach this run (exit $DETACH_STATUS); running attached" >&2 ;;
+        *) echo "verify.sh: detached_runs.py could not detach this run (exit $DETACH_STATUS); running attached" >&2 ;;
     esac
 fi
 
@@ -1395,7 +1394,7 @@ import sys
 from uuid import UUID
 
 kind, payload, board_name, hold_name, recorder, repository = sys.argv[1:]
-sys.path.insert(0, str(Path(recorder).resolve().parents[2]))
+with open(Path(recorder).resolve().parents[2] / "scripts/lib/package_root.py") as package_root: exec(package_root.read(), {"__file__": package_root.name})
 
 
 def text(value):
@@ -1427,18 +1426,13 @@ if kind == "token":
     if payload == "director":
         owner = unit_runs.director(board)
     elif payload and payload != "unknown":
-        roster = fields(read(board / "mesh_roster.json"))
-        matches = [entry for name, entry in roster.items() if isinstance(entry, dict)
-                   and name == payload]
+        matches = []
         if not matches:
             for path in board.glob("impl_worker_*.json"):
                 worker = fields(read(path))
                 if (text(worker.get("slot")) == payload
                         or path.stem == "impl_worker_" + payload):
                     matches.append(worker)
-        if not matches:
-            matches = [entry for entry in roster.values() if isinstance(entry, dict)
-                       and entry.get("slot") == payload]
         state = fields(read(board / "progress_history_state.json"))
         if matches:
             reference = text(matches[0].get("staff_id")) if len(matches) == 1 else ""
@@ -1834,7 +1828,7 @@ doc_tree() {
     VERIFY_PY_HELPER=DOC_TREE_PY "$PY" - "$BUILD_FOLDERS_SCRIPT" <<'PYDOC'
 from pathlib import Path
 import sys
-sys.path.insert(0, str(Path(sys.argv[1]).resolve().parents[2]))
+with open(Path(sys.argv[1]).resolve().parents[2] / "scripts/lib/package_root.py") as package_root: exec(package_root.read(), {"__file__": package_root.name})
 from scripts.copies import copies
 print(copies.staged_tree(Path.cwd()))
 PYDOC
@@ -2101,7 +2095,6 @@ with open(3, "rb") as handoff:
             name, value = entry.split(b"=", 1)
             os.environb[name] = value
 sys.argv = sys.argv[1:]
-sys.path.insert(0, os.path.dirname(os.path.abspath(sys.argv[0])))
 runpy.run_path(sys.argv[0], run_name="__main__")
 '
     (
@@ -3558,7 +3551,7 @@ command = sys.argv[3:]
 def shell_status(status: int) -> int:
     return status if status >= 0 else 128 - status
 
-sys.path.insert(0, str(Path(os.environ["VERIFY_PROCESS_GROUP_LIB"]).resolve().parents[1]))
+with open(Path(os.environ["VERIFY_PROCESS_GROUP_LIB"]) / "package_root.py") as package_root: exec(package_root.read(), {"__file__": package_root.name})
 from scripts.lib.process_start import Started, process_start, process_start_format
 
 def identity(pid):
@@ -3625,10 +3618,29 @@ start_token_renewer() {
     renew_token || return 1
     local renew_parent=${BASHPID:-$$}
     (
-        trap 'kill $(jobs -p) 2>/dev/null || true; wait; exit 0' INT TERM HUP
+        local renew_sleep_pid="" renew_previous_pid="" renew_sleep_starting=0
+        # Bash can retain pipeline jobs that this subshell cannot wait for.
+        # Stop and collect only the sleep that this renewer started.
+        trap '
+            trap "" INT TERM HUP
+            # Bash sets $! before it can run this trap after the sleep starts.
+            if (( renew_sleep_starting )) && [[ "${!:-}" != "$renew_previous_pid" ]]; then
+                renew_sleep_pid=$!
+            fi
+            if [[ -n "$renew_sleep_pid" ]]; then
+                kill "$renew_sleep_pid" 2>/dev/null || true
+                wait "$renew_sleep_pid" 2>/dev/null || true
+            fi
+            exit 0
+        ' INT TERM HUP
         while kill -0 "$$" 2>/dev/null && kill -0 "$renew_parent" 2>/dev/null; do
+            renew_previous_pid=${!:-}
+            renew_sleep_starting=1
             sleep "$TOKEN_RENEW_S" &
-            wait "$!" || break
+            renew_sleep_pid=$!
+            renew_sleep_starting=0
+            wait "$renew_sleep_pid" || break
+            renew_sleep_pid=""
             renew_token || break
         done
     ) &
@@ -4095,7 +4107,7 @@ run_lint_sequence() {
                 exit "$mend_status"
             fi
             if grep -qiE 'rolled back|revert' "$MEND_LOG"; then
-                echo "verify.sh: cargo mend --fix rolled its rewrites back; the tree reproduces it — run /mend_fix" >&2
+                echo "verify.sh: cargo mend --fix rolled its rewrites back; stop and keep the tree for inspection" >&2
             else
                 echo "verify.sh: cargo mend --fix failed; see the output above" >&2
             fi
@@ -4253,9 +4265,10 @@ case "$CMD" in
     final)
         if [[ -n "$PINNED_TARGET" || "$MAC_ONLY" == 1 || "$LOCAL_ONLY" == 1 ]]; then
             VERIFY_PY_HELPER=FINAL_CLEAN_TREE_PY "$PY" -c '
+from pathlib import Path
 import sys
-sys.path.insert(0, sys.argv[1])
-from final_pass import clean_tree
+with open(Path(sys.argv[1]).resolve().parent / "lib/package_root.py") as package_root: exec(package_root.read(), {"__file__": package_root.name})
+from scripts.direct.final_pass import clean_tree
 clean_tree()
 ' "${FINAL_PASS_SCRIPT%/*}" || exit 2
         fi

@@ -6,17 +6,33 @@ Pool maintenance paths do not dispatch new reviews.
 
 ## What it is
 
-A set of Python (standard library) scripts in `scripts/production/` that run the fixed, repeatable steps of a production, so a showrunner and its unit directors have little left to remember. One command starts a unit: with a written plan, with a brief the unit director turns into a plan, or on standby. One command merges a checkpoint: ancestry, scope, conflicts, merge, tests, push, promotion to the installed checkouts and the Mac, the review-ledger row and the log line. Other commands open, promote and wrap a production; register its scheduled updates and write its times, log lines and open questions; build the dailies input from the status script; count CI points and log the first review-watch alert once; and do the mechanical part of waits and renames. A unit director ends each phase in one fixed order: the code commit first, then the shrink in its own commit beside the next phase. Unit directors take their model and effort from `config/models.conf`. The stall watch and the status script treat a unit that is waiting on someone else as waiting, not stalled. A unit marked retired in the production doc drops out of the status script, the dailies, the waits and the stall watch, and a `simple` dailies gives each unit that only waits one line in a group.
+The Python scripts in `scripts/production/` run production commands with the standard library.
+They start units, merge checkpoints, promote results, record questions, and prepare reports.
+Staff owns production and unit identity.
+The commands read unit settings from `.unit.toml`.
+Command documents define decisions that require judgment.
 
-The problem it solves is the number of manual steps a showrunner has to carry. Each of these was a list in `commands/showrunner/produce.md` that the showrunner had to run by hand, in the right order, on every merge and every tick. The commands now hold the mechanics. The command docs keep only the decisions that need judgment.
+Each command performs repeatable steps and reports a named result.
+The showrunner uses those results to decide the next action.
 
 ### Shared conventions
 
 - **Production-doc reader** (`scripts/production/production_doc.py`): `read_production(name, record=None)` finds the showrunner staff row.
   The row's `name` is the production name. Its `doc.path` selects the document.
   `Production` holds `doc`, `name`, `merge_branch`, `checkout`, `log` and `zone`.
+  It also retains the resolved staff row as `owner`.
+  `ProductionDocument` holds an unbound document; `for_owner` produces a `Production`.
   The reader takes `Merge branch`, `Showrunner checkout` and `Log` from that document.
   `Log` must remain relative to the showrunner checkout.
+
+Staff supplies unit membership, order, names, parents, and locations.
+Git supplies the current branch.
+`.unit.toml` supplies the plan, port, and responsibilities.
+Responsibilities name duties, such as nightly review; they do not restrict changed paths.
+Production documents contain no Units table.
+A plan has no production-name header; its unit's staff parent selects the production.
+`unit_lookup.doc_owner` resolves a document owner, and `StaffSnapshot.parent_of` resolves a parent.
+Callers share one staff snapshot within an operation.
 
 - **Retired units**: `agents retire NAME` records a completed retirement as a `RemovedWorktree`.
   The row stays in `staff.json` with its fixed identity and parent.
@@ -50,7 +66,10 @@ Resume restores the folder from the merge branch and resumes `current_session`.
 
 ### Unit start: `add_unit.py` and `/showrunner:add_unit`
 
-`add_unit.py --production <showrunner name> <name> (--plan <path> | --brief <words> | --standby) [--permanent] [--account <label>] [--model <model>] [--port N] [--owns <paths>] [--resume <sessionId> --cwd <dir>] [--timeout S] [--check]`, run through `scripts/lib/py`.
+`add_unit.py` runs through `scripts/lib/py`.
+It takes `--production <showrunner name>` and the unit name.
+Its mode is `--plan <path>`, `--brief <words>`, or `--standby`.
+Other options include `--permanent`, `--account`, `--model`, `--port`, `--resume`, `--cwd`, `--timeout`, and `--check`.
 
 - **Request.** `launch_request` keeps the requested staff name. It creates no suffix or alias. `UnitLaunchConfiguration` carries the production, branch, worktree, plan, port, session, timeout, and responsibilities. A resumed session requires `--cwd` and `--plan`.
   Shutdown restart resumes staff sessions directly. It does not call `add_unit.py`.
@@ -85,9 +104,64 @@ Resume restores the folder from the merge branch and resumes `current_session`.
   New work uses the plan, brief, or standby prompt. A normal unit resume keeps its existing admission path.
   Shutdown restart bypasses this path and sends no work prompt.
 
-- **Unit status.** A unit's run state is stored nowhere. `unit_lookup.read_run_states() -> RunStates` builds one snapshot per stall-watch tick, watchdog pass or dailies call from the `/unit:direct` run records (`runs/*.jsonl` under `unit_runs.history_root()`). It reads only each file's first line: a JSON object with `event_type == run_started` and a nonempty `working_dir` is a candidate. For each recorded worktree spelling it keeps the largest numeric `run_started_at` (booleans and nonnumbers count as zero), then reads backwards in growing blocks from that file's end to the last JSON object. Middle events are not parsed. A partial first line skips the file; a partial last line falls back to the preceding JSON object. `snapshot.state(worktree) -> UnitState` resolves the staff worktree before lookup; no record is `standing-by`, a last event of `run_finished` is `run-finished`, anything else is `running`. `snapshot.records` also holds the record path and state by exact recorded `working_dir`, preserving `unit_move`'s string matching. `run_state(worktree) -> UnitState` remains a one-call wrapper. Unreadable records raise `OSError`; bad UTF-8 in a line read raises `UnicodeError`. The stall watch reports `units: their run state is unknown` once and leaves every unit alone for that tick. `showrunners.py status` and `showrunners.py ready` still parse their old arguments, do nothing and exit 0, because sessions started before 2026-10-08 hold text that calls them; delete both once no such session is left. Consequences: a standing-by unit handed work is watched for stalls only from the start of its run; a run that died without its finish event reads as running until the next run in that worktree.
+- **Unit run status.** `unit_lookup.read_run_states(record=...)` joins each run owner to its current staff folder.
+  `RunStates.state(worktree)` returns `standing-by`, `running`, or `run-finished` from the newest matching run.
+  A missing record gives `standing-by`.
+  The reader uses the first run event and last valid JSON event.
+  It skips a partial first line and ignores a partial final line.
+  Unreadable records retain their error for the caller.
+  The stall watch uses the current director's held runs, as described under Calibration and gotchas.
 
 - **Callers.** `produce.md` calls `add_unit.py --production <showrunner name> <staff name> --plan <unit plan>`. A waiting unit uses `--standby`. Promotion uses the same staff name with `--resume`, `--cwd`, and `--plan`. The showrunner first uses `--check`, then closes the old session and runs the launch.
+
+### Shared runtime configuration
+
+`scripts/lib/conf.py` owns Python reads of `config/*.conf`.
+`conf.read(file) -> ConfigRead` reads and parses one file for a pass.
+Callers pass that read to helpers instead of reading each setting again.
+`ConfigRead` provides `text`, `number`, `whole`, `words`, `values`, and `origin(key, convert)`.
+`UseConfiguredValue.CURRENT` selects a fresh read when a helper receives no operation read.
+It lives beside `ConfigRead` in `conf.py`.
+Helpers use `ConfigRead | UseConfiguredValue` with that named default.
+Each new `conf.read` observes the file again.
+Fault recovery occurs when a setting is used.
+
+The reader ignores section headers and text after `#`.
+The first key wins, and `key.<host>` overrides `key`.
+The comment immediately above a key defines its whole-number range, numeric range, or allowed words.
+An invalid setting warns on stderr and uses the newest usable committed value under that revision's limits.
+No usable value raises `conf.Unusable` with the source, key, and reason.
+`ConfigRead.origin` returns live, recovered, or unavailable evidence without printing a warning.
+The [accounts configuration section](accounts.md#runtime-configuration-and-constraints) defines repository defaults and explicit-folder behavior.
+`conf.sh` supports bash 3.2 and zsh.
+Its `conf_value` uses shell builtins for valid integer and text settings and calls Python when validation needs it.
+
+`/tune` publishes one user-approved setting through `scripts/lib/tune.py`.
+It validates the requested value and refuses an uncommitted edit to that setting's file.
+It preserves the line's comments and spacing.
+The commit uses `tune(<file>): <key> <old> -> <new>` and a `User-Approved:` trailer.
+A same-value retry finishes publication without another commit.
+`scripts/lib/main_publish.py` supplies the shared publication path for `/tune` and `/zone`.
+It accepts unpublished subjects beginning `tune(`, `zone(`, or `user zone: `.
+It refuses another unpublished commit before changing the setting.
+It fetches main and rebases pending publisher commits when a fast-forward fails.
+The rebase uses `--no-autostash --no-update-refs --empty=drop`.
+A conflict names the commit and files, aborts the rebase, and preserves main.
+After publication, the Mac pulls or receives a queued pull.
+
+`showrunners.timer_scratch` uses the showrunner's fixed staff id to find its timer.
+It returns `TimerConfigurationUnreadable`, `TimerTargetUnresolved`, `TimerScratchAbsent`, or `TimerScratchFound`.
+`adopt_session_state` reports an unreadable timer and continues.
+
+### Unit work queue
+
+`/unit:queue add <text>`, `done`, `clear`, and `show` call `scripts/production/unit_queue.py`.
+The list uses `UNIT_QUEUE_STATE_DIR/<staff id>.json`, default `~/.local/state/unit-queue/`.
+`add` appends one normalized text item.
+`done` removes the first item.
+`clear` writes an empty list without reading a damaged old file.
+Writes use the list lock and atomic publication.
+The queue survives a unit rename because its key is the fixed staff id.
 
 ### Director model and effort: `config/models.conf`
 
@@ -132,7 +206,33 @@ Each local Promote checkout must exist before the command pushes.
   `Parallel: unknown` is refused with instructions to add the plan's `**Depends on:**` lines and rerun `check_parallel`.
   `--cancel-prior` is refused with `Push: git`.
   `MergeRequest.delivers` and `excluded` use `str`, with `""` for an absent value.
-- **User bump.** `--bump` accepts only a code checkpoint; it refuses `--shrink`, `--as-built` and `--from-child`. Scope, conflict and overlap checks stay. It skips tests before the push, records “gate after push”, starts `bump_gate.py --record <step record>` after the push and before promotion, and returns without waiting. The runner makes a shared Git clone, checks out the pushed tip detached, and uses the same checkpoint steps, pass rule, flake rule and named-test retries as a normal merge. It removes the clone when the run ends. The `bump-gate` record from `checkpoint_step_record` keeps the test plan, tip, start time, process identity, result and `bump-gate.log` path. A rerun reuses a live gate or a completed result for the same tip; a dead gate with no result starts again, checked with the existing session process identity functions. Red sends the failed step, known failing test names, tip and log path to the owning unit and showrunner through `send.py`; green sends one line to the showrunner. A failed send is logged and retried once. `MERGE_CHECKPOINT_SEND` selects the sender in fixtures.
+- **User bump.** `--bump` accepts only code checkpoints.
+  It refuses `--shrink`, `--as-built`, and `--from-child` before merging.
+  The normal path checks still apply.
+  Tests wait until after the push, including on a retry between merge and push.
+  `start_gate` starts `bump_gate.py --record <step record>` before promotion.
+  The checkpoint does not wait for its result.
+  `copies.standing` supplies a checkout of the recorded pushed tip.
+  `run_checkpoint_test_steps` supplies the shared test, flake, and retry rules.
+  The production checkout retains flake notes, and `bump-gate.log` retains output.
+  The record holds the test plan, tip, runner pid and start, result, detail, and successful recipients.
+  A live runner prevents another launch; unknown liveness holds the gate.
+  A dead runner without a result permits another launch.
+  Completion and delivery compare the current tip, pid, and process start under `record_lock`.
+  A replaced runner cannot publish a result or deliver a notice.
+  Red results reach the unit and showrunner; green results reach the showrunner.
+  Delivery resolves current sessions from the recorded fixed owner and unit ids.
+  Each successful recipient is saved, and a failed send gets one retry.
+  `MERGE_CHECKPOINT_SEND` selects the sender for tests.
+
+- **Publication locks.** The gate-record lock precedes `main_push_lock`.
+  The checkpoint releases the gate-record lock before local promotion.
+  It retains `main-push.lock` through the last local push to main.
+  Mac pulls and result delivery occur after that lock is released.
+  Publication records survive promotion failure.
+  A style notice becomes complete only after successful delivery.
+  A completed child handoff retry changes nothing and sends no second notice.
+  Local and Mac promotion use the [shared edited-path check](merge-gate-and-test-speed.md#the-gate-scriptsproductionmerge_gatepy).
 - **Review numbers.** The unit obtains `--review-trial` from `progress_history.py review-trial`.
   [Review regime records](review-regime-trial.md) define the counts, times, types, and checkpoint parser.
 - **Held simplify items.** The checkpoint notice carries each held item and its ledger reference.
@@ -154,7 +254,11 @@ Each local Promote checkout must exist before the command pushes.
      A pass alone continues with a LOG note in this case, or when Known flakes lists the package.
      Otherwise, confirm that `HEAD` is this merge and is not on origin, then use `reset --keep HEAD~1`.
   8. *push and promote*. `GitPush` merges `origin/main` with `--no-ff` when it has diverged, then pushes the merge branch. A failed merge always runs `git merge --abort`, including during a repeated promotion. Conflicts produce `push: held` with the conflicting paths, separated by commas. A repeated promotion keeps HEAD and the work tree as they were before the push step. When rollback is allowed and origin did not move, the push step also resets the checkpoint merge. The message asks the unit to merge `origin/main` into the merge branch, resolve the conflict, and run the push again. A merge failure without conflicting paths stays failed. Other push failures use the same rollback rule. `ValidateAndPush`: `validate_and_push.sh --quick --to <merge branch> --fix-commit "ci(<showrunner name>): format fixes after <unit> phase <N>" [--cancel-prior]`, reset to origin on failure. Then each **Promote** checkout through `promote_local_checkout(checkout, merge_branch, tip)`: it must be on `main`; `merge --ff-only <tip>`, where tip is the pushed merge-branch tip; push `main` only when `main ^origin/main ^origin/<merge branch>` is empty. Then the Mac through `pull_mac_checkout(mac, source)`: `ssh mac "cd <mac> && git pull --ff-only natedev:<first Promote checkout> main; printf 'rc=%s\n' $?"`, judged by the printed `rc=`. Failed Mac pulls use up to `MAC_PULL_TRIES=3` total attempts with `MAC_PULL_RETRY_SECONDS=2` seconds between attempts, read from `config/merge_checkpoint.conf` for each pull (`MERGE_CHECKPOINT_CONFIG` selects another file).
-  9. *record*: for a code checkpoint, `review_regime.py add --unit --plan <the unit's Plan cell> --phase --regime --started --merged <merge commit time> --holds --merge-defects` plus the five review numbers and any `--excluded`. The ledger names a row by unit, plan and phase (2026-10-12), because a unit that runs a second plan starts again at phase 1; then the LOG line `- HH:MM <zone>: <unit> phase <N> (<hash>) merged as <merge hash>; <tests> green; pushed[; promoted]`. A LOG that already has this line skips the step.
+  9. Record the code checkpoint's review ledger row and production log line.
+     `review_regime.py add` uses the configured plan, unit, phase, merge time, review numbers, and optional exclusion.
+     The ledger key includes unit, plan, and phase.
+     The LOG line identifies the checkpoint, merge, tests, push, and promotion.
+     An existing matching log line skips the write.
 - **Merge report.** Step 8 prints `into: <path> (<branch>) — <why>; unblocks: <what>` as it reaches each place: the merge-branch checkout (`the merge branch collects every unit's checkpoints`; unblocks `<gate id>: <Waiting cell>` for each Gates row whose **Waits on** is `<unit> phase <N>`, else `no gate`), then each Promote checkout and the Mac (`sessions on <machine> run the installed commands from it`; unblocks `the live gate of <unit> phase <N>`). Only a code checkpoint's first merge names a gate.
 - **Re-run.** A hash already merged reads `PushedTip | NotYetPushed` from origin, skips the push when pushed, and re-runs every promotion, each a no-op at the tip. A merge not yet pushed is one a killed run left untested, so the re-run runs its merge tests first, and red undoes the merge as on a first run. A failed promote is re-run with the same command.
 - **Change review** (`scripts/production/change_review.py`).
@@ -188,11 +292,18 @@ Each local Promote checkout must exist before the command pushes.
   A step with no matching line gives an error.
   `add --merged` and `live` share the ancestor check and refusal text.
   `append` and `drift` are removed.
-  Git trailers hold waiting changes; the phase adds no store or waiting section.
+  Git trailers hold waiting changes.
 
   A row in either section covers the same change when its merge contains the checkpoint.
   A row without a known merge also covers the change.
   A later fix can add a new row with the same words.
+  `_merge_covered` reserves text matches before pairing unused rows by this merge's hash.
+  It pairs ready changes first, in commit order.
+  It pairs held changes only when every remaining held change names one step.
+  `list_ready` supplies all changes routed to each list, including for a selected `live` step.
+  Each unused row covers at most one remaining change.
+  Several uncovered held steps prevent hash pairing because a row stores no step.
+  That case can add a duplicate row; it must not hide another change.
   The directory lock covers the missing-row check and the row write.
   A merge with one existing line adds only its missing lines.
   A repeated call adds nothing.
@@ -254,6 +365,13 @@ Each local Promote checkout must exist before the command pushes.
 
 The showrunner still judges, before the call: the other units' overlap notice, new public items without a consumer, the design check. After it: `<ChangeReviewFeatureLog/>` for a merge in `~/rust/hana` or `~/rust/hana_catalyst` (one feature-log proposal per change-review row; `docs/as-built/feature-log.md`), then `<ClearGate/>`, `<CrossUnitChange/>`, `<CIPoint/>` and the review watch. It sends the script's `send <unit>:` line and puts every `into:` line in the user update, adding one in the same form for each unit worktree it then merges the merge branch into. A change for the user to check is never an open question: it goes on the change review list, and `<CloseChangeReview/>` takes the user's verdict for every production, with feature-log calls only where the project closes out by change review (Hana and `~/.claude`).
 
+### Smoke launch
+
+`smoke_launch.sh` resolves its checkout to an absolute path before any folder change.
+`checkout_cargo` runs `cargo build` and `cargo metadata` through `direnv exec` from that checkout.
+The checkout's `.cargo/config.toml` applies even when another folder calls the script.
+The caller's working directory stays unchanged.
+
 ### Production open, promote and wrap: `production_lifecycle.py`
 
 `production_lifecycle.py load|open|promote-main|wrap --production <showrunner name> [--no-ci] …`. `--no-ci` makes the CI, smoke-launch and Mac-run steps print `<step>: ok — skipped: no CI` and is refused together with a verdict flag.
@@ -272,12 +390,31 @@ The showrunner still judges, before the call: the other units' overlap notice, n
 
 - `time <ISO or HH:MM>` prints `time: ok — HH:MM <zone>` in the user's zone, never UTC.
 
-- `log "<event>" [--state <file>] [--before-compaction]` appends `- HH:MM <zone>: <event>`. On every tenth event line and with `--before-compaction` it also writes `### STATE <time>`: one `<unit>: <phase>; last merged <git hash>|none; waits on <wait>` line per Units row (phase and wait from `--state`, keyed by session, `not stated` when absent), `Merges accepted but held: …` and `Open for the user: …` from `OUTSTANDING`. The state file's `next` list (one-line text each) becomes a `Next: a; b` line, or `Next: none`.
+- `log "<event>" [--state <file>] [--before-compaction]` appends the event with the user-zone time.
+  Every tenth event and each explicit compaction log also writes a STATE block.
+  The block lists staff units with their phase, last merge, and wait.
+  Missing judgment fields show `not stated`.
+  It also records held merges, open user items, and the state's current `next` list.
 - **Compaction hooks**: `scripts/hooks/showrunner-compaction.py` acts only for a session named by a production update timer (`showrunners.production_of`). On SessionStart `compact` or `resume`, it names `/showrunner:produce <doc> resume`, unless the resuming prompt already runs it. The command prints the current `next` list from the state file. The showrunner acts on that list first. PreCompact writes no state block. A showrunner can still run `log --before-compaction` by hand. Compaction runs by itself during work. The per-call context message is off in `config/context_usage.conf`. With `message = on`, the hook uses its existing thresholds and showrunner text.
 
-- `questions [--state <file>]` stores `open_for_user` in `OUTSTANDING` (`~/.local/state/showrunner/outstanding/<showrunner name>.json`), reviews each new question and prints `questions: ok — recorded`. `OUTSTANDING` is rewritten only when `--state` has an `open_for_user` key, keeping each item's earlier `since`; an invalid `--state` file fails the step. Until 2026-10-18 this verb was `footer` and also rendered the reply footer; the footer and its switch are gone (user: "i want footers gone for good").
+- `questions [--state <file>]` applies the state's `open_for_user` items.
+  Questions use `QuestionRecord` files; reminder strings use `OUTSTANDING`.
+  `OUTSTANDING` is `<SHOWRUNNER_STATE_DIR>/outstanding/<showrunner staff id>.json`.
+  A missing `open_for_user` key preserves the existing items.
+  A new question requires its full text and a review result before storage.
 
-- `ask --text "<one line>" --question "<full>" [--unit <unit>] [--urgency <level> [--due <date>]]` (`/unit:question`, `/showrunner:question`, 2026-10-28) adds one item to `OUTSTANDING` without a reply to the user. It refuses a `--unit` that is not a Units row, an item text that fails the plumbing check, and a text already open. It runs the question review before it takes the lock, then writes the item with `asked_by` (the unit, else `showrunner`) and its review result, records it in the history, and prints `filed question: <text>` and `ask: ok`. A held review exits 2 with `question held for review: …` and writes nothing.
+- `ask --text "<one line>" --question "<full>" [--unit <unit>]` files a reviewed question without a reply to the user.
+  The unit must belong to the production in staff.
+  The writer stores the asker's fixed staff id in `asked_by`.
+  A held review refuses before any write.
+  `QuestionRecord(path, owner, asker, item, status)` stores the canonical question.
+  `question_folder` uses the owner row's document to resolve its Proposals folder.
+  Without that field, it uses `<SHOWRUNNER_STATE_DIR>/<showrunner staff id>/questions`.
+  A missing showrunner owner gives `QuestionOwnerUnavailable`.
+  A unit rename rewrites no question record.
+  `questions-table` lists the open questions for `/showrunner:questions`.
+  `migrate-questions` converts legacy outstanding questions once; a repeated conversion changes nothing.
+  Wrapping a production closes its questions before state cleanup.
 - `answer --item <words>` removes one matching item from this production or a production below it.
   The item's text must equal or contain `<words>`.
   More or fewer than one match exits 2.
@@ -285,33 +422,60 @@ The showrunner still judges, before the call: the other units' overlap notice, n
   It then prints `answer: ok — <showrunner name>: <text>`.
 - `withdraw --item <text>` removes one open item with exactly that text from this production or a production below it.
   Use `update_registration.py withdraw --item <text>` when the cause of a filed item is gone.
-  It records no answer and relays nothing.
+  It writes a `withdrawn` time to the history and writes no answered record.
+  It sends no relay line.
   It prints `withdraw: ok — <showrunner name>: <text>`.
-- **Filed items stay.** `questions` keeps a stored item with `asked_by` when the new `open_for_user` omits it.
-  It prints `questions: kept — <text>: asked by <unit>; …`.
-  The item leaves only through `answer` or `withdraw`.
-  `open` and `next` show `asked by <unit>` after the item's time.
-  `ask`, `answer`, `withdraw`, `questions` and `mark-important` read and write `OUTSTANDING` under an exclusive `flock`.
-  Each process takes the lock once on `<showrunner name>.lock` beside `OUTSTANDING`.
-- `--state` is `SHOWRUNNER_STATE` (`<SCRATCH>/showrunner_state.json`): optional `units` (`{unit, phase, wait}`), `merges_held` (text list) and `open_for_user` (a one-line reminder string, or `{text, after?: YYYY-MM-DDTHH:MM, question?}`). An unknown key or wrong type fails the step, and every item is validated before anything is written. A new object item must carry `question`; `questions --state` reviews it with `review.review_question`, prints `reviewed question: <text>`, and a failed review refuses the whole registration with nothing written. The Stop hook then blocks a reply that lacks the reviewed text, until one reply carries it, or that asks the user anything unregistered. The question review is in `docs/as-built/message-clarity.md`.
+- **Filed items stay.** Registration retains an omitted item that has `asked_by`.
+  Only `answer` or `withdraw` removes that filed item.
+  The item lock uses the showrunner's fixed staff id beside `OUTSTANDING`.
+  Each operation reads one staff snapshot and resolves current names from fixed ids.
+- `--state` selects `showrunner_state.json` in the production session state directory.
+  It accepts unit judgments, held merges, and `open_for_user` items.
+  Reminder items contain one line.
+  Question objects can contain text, a due time, and the full question.
+  Unknown keys or wrong types refuse before writes.
+  New questions require review.
+  The showrunner carries the reviewed text in its reply.
+  The [question review design](message-clarity.md#question-review-in-showrunner-replies) defines the review.
 
 ### Dailies: `dailies_input.py` and `dailies_render.py`
 
 `dailies_input.py --production <showrunner name> --status <file> --judgment <file> --state-dir <dir> --out <file> --render-state <file> [--length gantt|simple|page|elaborate] [--holders <dir>] [--notifier <path>] [--user-run] [--at <time>]` writes `dailies_input.json` from the saved `unit_status.sh` output plus the showrunner's judgment file. `dailies.md` runs it, then `dailies_render.py <out> --state <render-state> --log <LOG> --outstanding <OUTSTANDING>`. The scheduled prompt saves `<SCRATCH>/unit_status.txt` and runs `/showrunner:dailies gantt`. `--notifier` takes one script path and exists for tests; the default is the `notifier.sh` beside the builder, so `dailies.md` passes none. The call it documented until 2026-10-08, `--notifier <NOTIFIER>`, failed as written: `NOTIFIER` is two words (`zsh …/notifier.sh`), refused by the argument parser unquoted and run as one file name quoted.
 
 - **Units.** `units_from_doc` reads `unit_lookup.doc_units`, so the builder asks for no status block and no judgment for a retired unit. The judgment's `unit` is the staff unit id, never the session's current name; status blocks and phase records join on it. A unit with no readable folder or branch is reported and left out.
-- **Status parse.** The file starts `at … / HH:MM UTC`; each `== <session>` opens a block; a session outside the live Units rows, a retired unit's among them (`unknown unit <session>`), a duplicate, a missing block or an unclosed `=== DECISION …` block is refused. Each block is `SessionGone | ClaudeNotRunning | Running` plus flags `FormWaiting | Decision | StillWaiting | Block | TicksFailing`; every other line is `Activity(text)`. It prints `flags first: <session>: …` for session gone, Claude not running, form, decision and a usage limit, and sets `needs_user` for a form, decision or still-waiting flag the judgment left unset.
+- **Status parse.** Each `== <session>` opens a unit block after the file's timestamp.
+  Unknown sessions, duplicate blocks, missing blocks, and unclosed decision blocks refuse the input.
+  Staff supplies the live unit membership.
+  Parsed states distinguish a missing session, stopped Claude, and running Claude.
+  Form, decision, waiting, block, and usage-limit flags precede activity lines.
+  A form, decision, or waiting flag supplies `needs_user` when the judgment omits it.
 - **Filled by the builder:** `length`, `zone`, each unit's `unit`, a matching numbered open phase's absent `started` and ETA fields, `build_hold` (true for every unit except a holder's own, which gets `holds_builds: true` in its place, while holder files exist in `--holders`, default `~/.local/state/build-hold/`; a judgment that supplies it, or markers and holders that disagree, is refused), the `Review watch` topic (via `ci_points.review_watch`, until the line starts `acknowledged`), the `Bevy upgrade` topic (via `bevy_upgrade_watch`, while [the Bevy upgrade watch](bevy-upgrade.md) is open or its lookup fails), the `Merge branch` topic (only when held, testing or not pushed), and `next_run`. A judgment value wins; an ETA `time` or `none` keeps the record out entirely. The builder names five required judgment fields itself (`project`, `phase`, `started`, `held`, `update`), with `started` satisfied by the matching record; the renderer names the rest. `then` passes through unchanged.
 - **ETA.** `phase_table.py show --production-doc <doc> --json` is called once. Its offset-aware times are converted to the user's zone. A record is used only when its open phase is numeric, has the matching running plan row, and its number equals the judgment's `Phase <N>`; the title and total remain the judgment's. The record supplies the start, ETA, range, percent, first stated target, the repair rounds started since that first statement (`eta.fixes`) and reason, each overwritten by a judgment value, so the pane needs no ETA line. A stated basis is collapsed to one line; a projection says `it is now projected from <N>% done`. Every other case follows the pane path unchanged: `unit_status.sh`'s last three distinct ETA lines, normalized by `in_report_zone`. Both paths finish as `EtaNone | EtaStale | EtaPassed | EtaFresh`; a source over an hour old gets `detail: set HH:MM`, and a stale or passed ETA queues one `request /unit:eta: <unit>` per `<unit>|<phase>`. A held, unchanged ETA stays fresh unless already requested. For a record-backed ETA, `eta_seen.json.text` is its User-zone `YYYY-MM-DDTHH:MM`; the first such build adopts older screen text as unchanged, keeps its `first_seen` and `requested`, and replaces only the text. Screen-backed entries retain the captured line and `also` lines. `requested` survives either path. A timed record also writes `eta.stated` as its stated or projected source minute in the user's zone; `record_eta_stated` substitutes the target minute only when the source would make a bare clock resolve to the wrong day. `record_eta_range` omits both recorded range ends when the renderer would place either on the wrong day. No time means no `stated`.
-- **Order.** After `read_production` come live units (it makes no write before its checks; pruning retired notes moved to `prune_phase_notes.py` on the agent-notes job (originally the snapshot timer on 2026-10-13), `phase-tables.md` → Pruning). A show failure prints `phase tables: unavailable — <reason>` and the report continues. Only a unit whose records could not be read takes its ETA from the status capture and its start from the judgment. Then come the one show call, judgment, build hold, review watch, the Bevy upgrade lookup (`bevy upgrade: unavailable — <reason>` on a failure, and the report continues), merge branch, `validate_report` (the renderer's `parse_report`), `check_render_state`, the clock, and the remaining writes (the `request /unit:eta:` lines, then `eta_seen.json` through the same locked `waiting.update_state`, ORing `requested`; `--out`). A refusal leaves the notifier, `--out` and `eta_seen.json` untouched and prints no request. The clock is `notifier.sh status` on a tick and `notifier.sh restart showrunner-<showrunner name>` under `--user-run`, which first creates `LOG`, then appends the `next_due=` line to it.
+- **Order.** The builder reads the production, units, phase tables, and judgment before changing the report state.
+  Unavailable phase data produces a diagnostic and uses the status capture and supplied judgment.
+  The builder then reads holds, review watches, Bevy status, counts, and merge state.
+  It validates the report and render state before restarting the update clock.
+  ETA requests and output writes follow those checks.
+  A refusal preserves the clock, output, and ETA request state.
+  A user-run report restarts `showrunner-<staff id>` and appends its next due time to LOG.
 - **Production counts (2026-10-10).** `dailies_counts.production_counts(staff_id)` reads `config/dailies.conf` (`DAILIES_COUNTS_CONFIG`, else `~/.claude/config/dailies.conf`) and returns the production's `[{"label", "count"}]`, or `{"label", "not_found": true}` for a missing file, a `files` glob whose folder is missing, or a missing issues folder. Each line is `<staff id>.<label>=lines <file> <regex>` (`re.search` per line), `files <glob>` (regular files only) or `issues <folder> <tag>` (open issues directly in the folder whose tags hold the tag, read by `issues.open_issues`), with `~` expanded and the label's hyphens read as spaces. `dailies_input.py` puts a non-empty list in the input as `counts`. On `CountsFailure`, a bad line, it prints `counts: unavailable — dailies.conf line <n>: …` and builds the report without counts. `dailies_render.parse_report` reads `counts` into `ProductionCount(label, number | None)` and refuses a count that is not a whole number of 0 or more. `render` prints `counts: <label> <n> · …` just above the chart in every length.
 - **Renderer state check.** `dailies_render.check_render_state(value, state_path, at=None) -> StateClear | StateRefused(field, why)` wraps the renderer's private `load_state`, `resolve_eta_moments`, `check_changes` and `check_idle`.
 - **`then`.** `parse_upcoming_work` accepts only a non-empty list of one-line items and returns `UpcomingWork(items) | NoUpcomingWork()`. A string, an item chaining phases (`, then `, `; then`, ` then Phase`, any case) and an item with two `Phase <N>:` heads are refused, naming the item's index. Each item passes `check_words` and `check_then_order` (a leading `<N>:` or `<N>–<M>:` label is this plan's phase even when the item names another plan's doc). A follow-up needs an item naming `the plan at Phase <N>` or `plan done`; a last phase needs the list. `simple` prints `- then: <first item>`; `page` and `elaborate` print each item as `  - <item>` under `- then:`; a single item stays on the `- then:` line.
 - **One ETA moment.** `Previous = LastUnitReport(phase, eta: LastReportedEta(text, moment) | NoLastReportedEta, held, first) | NoLastUnitReport`. `resolve_eta_moment` reads a time that names no day on the day it was stated, before anything else: `parse_time(time, eta.stated)`, where `stated` is the builder's anchor: a screen line's `first_seen`, or for a record the source or the corrective target minute described above (2026-10-08). The stated moment comes before the last report's because the same clock stated again a day later is a new time: kept on the equal text, an Oct 6 16:00 target resolved to Oct 5 and read as unchanged and overdue. With no `stated` (an input written by hand) or a `+N` time, it keeps the last moment when the ETA text equals the last report's for the same phase (`same_phase` compares titles after `: `, so a renumber keeps it), at any later time and across midnight; a changed text resolves by `parse_time`. `parse_range_end` puts `earliest` and `latest` on the resolved ETA's own day, then moves one a day so that earliest is at or before the ETA and latest at or after; a `+N` end counts days from the report. Placed from the report's time, the latest end of an ETA that had passed landed a day late. Read against the report's own time instead, a held unit's ETA from hours ago came out as tomorrow. A `+N` time still counts days from the report. `resolve_eta_moments` runs once per report, and the change check and note (`unchanged, overdue`; `overdue` alone when there is no last ETA to compare with and the moment has passed), display, ordering, chart row, saved state (`eta`, `eta_text`), `log_line` and first-ETA drift all read its result. A saved entry with no `eta_text` reads as `NoLastReportedEta`.
 - **`idle`.** A unit takes an optional `idle` object, `{"waits_for": "<what it waits for>", "until": "YYYY-MM-DDTHH:MM"}`, which the showrunner's judgment supplies only while the unit waits on a clock gate, a data window or another unit with nothing of its own running; a unit with no known return time gets none. `parse_idle(fields: JsonMap, where: str) -> IdleWait | NotIdle` reads it at every length into `Unit.idle`. `IdleWait(waits_for: str, until: datetime)` and `NotIdle()` are frozen dataclasses. Absent or `null` is `NotIdle`; otherwise the keys are exactly `waits_for` and `until`, `until` matches `STARTED`, and `waits_for` is at most `IDLE_LIMIT` characters and passes `check_words`. `check_idle(report: Report, now: datetime) -> None` raises `InputError` naming `units[{index}].idle.until` when `until <= now`. `main` and `check_render_state` (as `StateRefused`) both call it after `check_changes`, so the builder refuses a passed `until` before it changes the clock.
-- **Finished units (2026-10-08).** `units_from_doc` gives each `UnitRow` its `run: UnitState`, from `RunStates.state(<Worktree cell>)` on one `unit_lookup.read_run_states()` snapshot shared by all rows; unreadable run records refuse the step. `run` drops every unit whose run is `RUN_FINISHED` and whose status block has no `WAITS_ON_USER` flag (`FormWaiting`, `Decision`, `StillWaiting`), from `units` and `blocks` both, before the `flags first:` lines and the judgment check, and prints `status: ok — left out, run finished and nothing waiting on the user: <units>`. Such a unit needs no judgment entry and has no section and no chart row; an entry supplied for it is not read. A finished unit that shows a form or an open question keeps its place and needs its entry, at every tick until it is answered: `unit_status.sh` prints a question as a `DECISION` block once and as `STILL WAITING` from then on, and both count. `WAITS_ON_USER` is the one list of what waits on the user, shared with the `needs_user` rule; the two had drifted, so a finished unit left the report at the second tick of its open question. A conversation-pause turn after a gate has no turn-end line, so the gate stays the unit's last word in the status read. Since the lookup change a finished unit on standby is in the status again, which is what made the builder ask for entries nobody could write.
+- **Finished units.** The builder shares one run-state snapshot across staff units.
+  It excludes a finished unit when its status has no form, decision, or waiting flag for the user.
+  An excluded unit needs no judgment entry and has no chart row.
+  A finished unit with a user question remains visible until the question is answered.
+  `WAITS_ON_USER` supplies the shared flag set for visibility and `needs_user`.
 - **No unit to mark under a build hold (2026-10-12).** A report renders when a hold is active and no unit can be marked: every unit was left out, or every unit in it holds the builds itself. Before, the builder refused both with `holder files and unit markers disagree`, and behind that check the renderer refused again (its own comparison, `input.units … cannot be empty`, and a chart that failed on no rows). The builder's comparison is gone: it writes the markers itself from the holder files and refuses a supplied one, so it could fail only in these two cases. For each unit under an active hold it writes `build_hold: true`, or `holds_builds: true` when the unit's session name or unit name is a holder's; a holder is named by its session, which the renderer never sees. `parse_report` builds `holding` (units with `holds_builds`, or named as a holder) and refuses `holder files are active but no unit is marked` only when some unit is outside it; `holds the build hold itself` uses the same set. An empty unit list is accepted. `render` draws the chart only when it has a row; with no unit and no production below it writes `NO_ROWS` ("No unit is working: every run has finished.") in the chart's place. `last_report` then saves `units: 0` and no rows, so a parent's row for it reads `0 units, 0 held`. Seen on hanadocs-info under another session's hold, with its only unit's run finished.
-- **One user-zone setting (2026-10-12).** `config/user_zone.conf` holds `zone=<IANA name>` (America/New_York), and `scripts/lib/user_zone.py` is the one reader: `user_zone()`, `user_zone_name()` and `zone_label()` for Python, and run as a script it prints the name for shell and skill text (`TZ="$(… user_zone.py)" date '+%H:%M %Z'`). It reads the file at each call, so an edit needs no restart. With no file or no `zone=` line the zone is America/New_York; a name that is not a zone is refused with its source named. `USER_ZONE` in the environment wins over the file, and `USER_ZONE_CONF` points at another file. Scripts import it by adding `scripts/lib` to `sys.path`, or as `scripts.lib.user_zone` where the file already imports `scripts.*`. Labels come from the zone (`%Z`). Gotchas: a test file whose expected text is Pacific pins `USER_ZONE=America/Los_Angeles` in a module-level `setUpModule`, so no saved expected output changed. A time stored without an offset keeps the zone it was recorded in: the model study's roster columns stay Pacific (`RECORDED_ZONE` in `turns.py`), and reading them in the user's zone would move the instant three hours. A production still takes its zone from its doc's `User zone` line. `buildlog report` and `mac-report` show times in the caller's `TZ`, so their skills pass the helper's zone as a `TZ=` prefix. Displays that call `astimezone()` with no zone follow the machine's own zone, not this setting. `scripts/lib/test_user_zone.py` fails when a script outside its `NAMES_A_ZONE` list hands a named zone to `ZoneInfo`, sets `TZ=` to one, or writes a zone label after a time format.
+- **User zone.** `scripts.lib.user_zone` supplies `user_zone`, `user_zone_name`, and `zone_label`.
+  `config/user_zone.conf` supplies the configured zone.
+  `USER_ZONE` overrides that value, and `USER_ZONE_CONF` selects another file.
+  Production documents do not select a zone.
+  Scripts use package imports; shell displays call the helper through `scripts/lib/py`.
+  A stored time retains its original zone when that zone identifies the recorded instant.
+  Tests select a private zone when their expected output requires it.
 - **`/zone` (2026-10-21).** `commands/zone.md` runs `scripts/lib/zone.py`. Bare, it prints the zone, its label, its UTC offset and the time now. `set NAME` resolves NAME (`resolve`): an exact IANA name, else the one zone whose city matches (case, accents, `_` and spaces ignored), else the one zone that uses the label now or in six months; more than one match, or none, is refused with exit 2, the matches grouped by UTC offset. Then, on natedev only: the checkout of `user_zone.CONF` must be on main and take `origin/main` as a fast-forward; the `zone=` line is rewritten (comments kept) and committed with `--only` that file, subject `user zone: <zone> (<label>), set with /zone`; `main_publish.commit` compares the named file with HEAD when `git commit` fails. If `git diff --quiet HEAD -- <conf>` exits 0, it keeps the new text and prints `anomaly: git commit: <error>; the commit exists` to stderr. Any other result restores the old text and refuses the change. It returns the short HEAD, so `/zone` and `/tune` continue to push. `main` is pushed only when every commit origin lacks has that subject. The Mac pulls as a promotion does (`ssh mac … git pull --ff-only natedev:<checkout> main`, judged by `rc=`), and `broadcast.py --from zone --all` tells both machines. When the Mac pull fails, the change and its message go to `<XDG_STATE_HOME>/zone/mac.json`, and the broadcast runs `--here`. A bare `zone.py` pulls and sends a queued change; `merge_checkpoint.promote` runs `zone.py drain --pulled` after each Mac pull, which sends only the message. `ZONE_SSH`, `ZONE_BROADCAST` and `ZONE_STATE` replace ssh, broadcast.py and the queue folder in `scripts/lib/test_zone.py`.
   A rerun checks the config against HEAD. It commits an uncommitted zone even when the stored zone already equals the request.
 - **Status line assignment.** `statusline.sh` sends the native session ID and staff data to `scripts/statusline/assignment.py`.
@@ -387,11 +551,11 @@ Saved progress state uses the fixed staff reference instead of a copied session 
     A process with an identity but no staff row produces no line and cannot use a unit's pane placement.
     A process without an identity reports an unreadable thread when its pane holds staff.
     One staff candidate retains its pane placement with unknown status.
-    `CodexProcessThreads.thread` reads the open rollout first.
-    With no open rollout, it reads the thread environment and resume arguments.
-    It then reads the native pane session and the terminal title with daemon names, only when this process is the pane's one foreground process.
+    `CodexProcessThreads.thread` reads resume arguments, the native pane session, and the thread environment in that order.
+    A child Codex inherits its parent's `CODEX_THREAD_ID`, so the environment value never comes before the other two.
+    It then reads the terminal title with daemon names.
+    These pane sources require this process to be the sole foreground process.
     A client that shares the foreground with another process has no thread. It prints one line and refuses nothing.
-    Other rollout read failures stop identity recovery.
     The worker scanner uses this reader before it joins the current thread to its staff row.
     A missing pane launch record does not make a resolved staff worker unknown.
     `send.morty_stamp` matches Morty's thread against `MORTY_NATIVE_ID` from `config/send.conf`.
@@ -409,13 +573,19 @@ Saved progress state uses the fixed staff reference instead of a copied session 
     `agents resume --production <showrunner name>` resumes the production's units.
     `since` uses the user zone. `by` uses the caller's staff name.
     Staff row copies retain the hold fields.
-  - **Phase productions:** `| Unit | Status | Phase | Task |`.
-    Phase comes from `phase_table.show_production`.
-    It shows `<n> of <total> · <title>`, `between phases, <done> of <total> done`, `not started`, `plan done`, `no phases` or `no plan`.
-    Task shows the newest run's open activity (`<label>: <text>`), else its open pass (`<kind>: <activity>`).
-    Phase start or finish clears the task.
-    The cell shows at most 80 characters, with `…` for longer tasks.
-    No open step shows `—`.
+  - **Phase productions:** `| Unit | Status | Phase | Non-Phase Work | Queued |`.
+    Status uses the [shared session classifier](accounts.md#status-counts-and-notes).
+    A live Claude or Codex pane supplies live evidence.
+    An active unit on another machine shows `on <machine>`.
+    Phase shows `phase <n> of <m> — <task>`.
+    The task uses the newest plan run's open step, then the phase title.
+    Other phase states include `between phases`, `not started`, `plan done`, `no phases`, and `no plan`.
+    Cells limit task text to 80 characters and end longer text with `…`.
+    Non-Phase Work reads only the unit's newest run.
+    A finished run gives `—`.
+    Otherwise, it shows the newest open phase absent from the plan, followed by ` +<k> more` when needed.
+    Queued shows the first queued item, followed by ` +<n> more` when needed.
+    An unreadable queue shows `queue unreadable` and prints its path and cause on stderr.
   - **Style productions:** `production_field(lines, "Kind") == "style"` selects `style_units.table`.
     It prints `| Unit | Status | Ticket | Step | ETA | Findings built | Last 24 h | Findings left |`.
     Ticket shows `#<number without unit prefix> · <rule stem> · <crate> · <ticket work>`.
@@ -429,7 +599,16 @@ Saved progress state uses the fixed staff reference instead of a copied session 
   - **Style counts:** Findings built is the all-time built count for the unit family; Last 24 h counts findings built in the last 24 h. These two columns and Findings left align right; text columns align left. The recent count uses `built_at`, or `style_ledger.legacy_built_at_sql` on a ledger before schema 25 (`style-showrunner.md`). Findings left (`left_cell(approved, filed, split, now)`) counts filed findings with approved decisions. `FamilyCounts.filed` counts all filed findings of the family. When the two counts are equal the cell shows `<approved>`; otherwise it shows `<approved> approved of <filed> filed`. A recorded split appends `: ready <a> · changed <b> · structure <c> · other <d> (<age>)`. Age counts whole minutes below 60 (`<n> min`), whole hours below 24 (`<n> h`), else whole days (`<n> d`), since `split_at`. A split row with no refill outcome leaves an idle unit as `idle`. Each distinct proposal file is read once. `proposal_issue.decision_answer` decides approval; `rules.style_family` on its unit decides family. A built finding with no decision file uses its build ticket's family. The total line is `All families: <built> findings built · <approved> approved findings left[ of <filed> filed] · <r> built in the last 24 h · ETA at that rate <YYYY-MM-DD>`; `of <filed> filed` shows only when the counts differ. `<filed>` sums `LedgerSnapshot.total_filed`, which counts every filed finding in a ledger, also findings with no resolvable family. The date is now plus `approved / r` days. Zero recent builds ends it with `no ETA: nothing built in 24 h`. Numbers use thousands commas; times and the date use the production zone.
   - **Style reads and tests:** `unit_phases.main` passes each unit's staff worktree to `style_ledger.ledger_location`. A missing plan folder does not affect this lookup. A worktree that cannot be resolved supplies no ledger data for that row. It passes the explicit unit-to-database map to the renderer even when phase records are unavailable. One read-only SQLite connection serves each distinct database; missing databases or tables supply no data. No ledger lock or migration runs. The command overlaps independent reads. `display_cells.py` owns the shared step and escaping helpers used by both tables and `board_json.py`. `style_units.table` requires the keyword argument `ledger_paths` (unit id to database path); it never reads ledger paths from phase records. It also accepts `now`, `zone`, and `decision_folder` for fixed test inputs. Relative proposal paths use that folder; absolute paths stay absolute.
 
-- **A unit's newest run (`unit_run.py --production <showrunner name> <unit> [--root <history root>] [--no-mac]`, run through `scripts/lib/py`).** Prints `<run id>\t<natedev|mac>\t<run_started_at as ISO-8601 UTC>`, exit 0. The run id is the run file's stem, which is the session directory's name. The worktree comes from the unit's staff row through `unit_lookup.local_worktree`; an unreadable or missing row exits 1 with `unit_run: <error>`. History root: `--root`, else `UNIT_HISTORY_DIR`, else `~/.local/state/unit-history` (`~/.local/state/plan-delegate` until `unit_runs.py move-history` moves it). Among `runs/*.jsonl` whose `run_started` event's `working_dir` equals the staff worktree after `os.path.normpath`, the greatest numeric `run_started_at` wins, ties to the first sorted name. An unreadable file, or one with no matching `run_started`, is skipped; a file counts once its `run_started` line reads, and undecodable bytes after it do not demote it, since skipping it would name an older run's session directory. With no local match and no `--no-mac`, one batch-mode `ssh` to `collect.MAC_HOST` (30 s limit) runs the same scan on the Mac; a failure prints `unit_run: Mac unavailable: <reason>` and counts as no match. No match anywhere exits 1 with `unit_run: no run found for <unit> in <worktree>`. `test_unit_run.py` (16 tests) covers the Mac path with a fake `ssh` on `PATH`.
+- **A unit's newest run.** `unit_run.py --production <showrunner name> <unit>` prints the run id, machine, and UTC start.
+  Staff supplies the current unit folder.
+  Each candidate `run_started` event resolves its owner through staff before the reader compares that folder.
+  The newest numeric start wins; sorted file order settles equal starts.
+  Invalid or unreadable files are skipped.
+  The scan stops after the first valid run-start event in each file.
+  `--root` selects the history root, then `UNIT_HISTORY_DIR`, then the configured history default.
+  With no local match, the reader queries the Mac unless `--no-mac` is present.
+  An unavailable Mac prints its cause.
+  No matching run exits 1 with the unit and folder in the diagnostic.
 
 - **Open proposals table (`proposals_table.py [--production <showrunner name>]`, `/showrunner:proposals`, user 2026-10-12).** Prints one Markdown table, `| Proposed by | Proposal | Date | State |`, of every proposal still open for the user. It reads only, and finds the doc as the units table does. Three sources, in this order:
   - **Issues** (2026-10-15, replacing the `proposals/index.md` table and the `docs/plans/proposal-*.md` scan): each `*.md` directly in the issues folder that the optional `- **Proposals:**` line names, of the production doc only (`proposals_folder.scope_docs`; the productions below list their own, user 2026-10-27), a file read once (`issues_folder`; a relative folder is taken from the showrunner checkout; without the line there are no issue rows). Subfolders hold research notes and are not read. `issues.py` reads the frontmatter between the leading `---` lines, a list inline (`[issue, proposal]`) or as `- item` lines, and strips quotes and a wiki link's brackets, keeping its alias over its target (`"[[2026-10-09]]"` reads `2026-10-09`). A row shows while `status` is `open` and `tags` holds `proposal`; rows sort by `date_created`. Proposed by is `proposed_by`, else `—`; the Proposal is the file's name; the Date is `date_created`.
@@ -438,7 +617,10 @@ Saved progress state uses the fixed staff reference instead of a copied session 
 
   **State** says what the user can do, never a bare `next` (user 2026-10-12: "next after what?"). An issue that `proposal_issue.proposal_progress` reads as `InProgress` (its approval is recorded, or it has no answer and its `stage` is `active`) reads `in progress by <unit>` (`in progress` with no `unit`); else `waiting for your review`, as does a backlog line marked proposed. The waiting rows (issues and proposed backlog lines) come first in `scripts/lib/urgency.py` order (level from `review_urgency`, value the score of the proposed stars, prerequisite the first `depends_on`), then the in-progress ones, oldest first. A deferred backlog line reads `deferred until you ask for it`. An add-on is the showrunner's to settle (user 2026-10-12, below), so it reads `the showrunner decides: build, save for later, or drop`: the unit sends its add-ons to the showrunner, which answers `current`, `next` or `drop` for each.
 
-  A unit's worktree is taken from its plan path in `phase_table.show_production`. The Proposed by and Proposal cells are cut at 110 characters and State at 140. With no rows it prints `no open proposals`.
+  Staff supplies the unit's worktree.
+  `proposals_table.table` reads `title_width` and `state_width` through one `conf.read("proposals_table")`.
+  The configured values are 110 and 140 characters.
+  With no rows, it prints `no open proposals`.
 
 - **Nightly list (`scripts/nightly_review/candidates.py`, `/showrunner:nightly`, user 2026-10-12).** Prints one Markdown table, `| Pick | Night | Area | Candidate | Gain per week | State |`, of every nightly-review candidate still open. The ledger (`nightly-review/ledger.md` under `XDG_STATE_HOME`, else `~/.local/state`) is the one record. A night's proposal and each of its Also found and Noted items is a line of its own, `- <night> <scope>[, also found|, noted]: <title> [gain/week: <gain>] — <state>`, open while it ends `proposed` or `deferred`. Printing changes no file but the vault note below.
   Recording prints and flushes new entries before it publishes the complete ledger atomically. An interrupted print leaves them available on retry. A partial final candidate from an interrupted append is replaced on rerun; proposed, deferred, accepted, declined, done and relayed states count as recorded, including the dated outcomes written by `/next`.
@@ -491,7 +673,9 @@ Copied pane marks do not select rows.
 
 ## Invariants
 
-- The production doc is read only through `read_production`, `production_field`, `cell_value` and `unit_rows` (the retired readers read through `unit_rows`); Units rows are read cell by cell, since real rows are backticked and carry commentary.
+- `production_doc.py` owns production field reads.
+  Staff supplies membership and order; `.unit.toml` supplies unit settings.
+  Reports retain `UnitMetadata.problems` when only some unit facts are available.
 
 
 - Git and the unit records supply merged state. Unit renames do not require a commit subject reader. The checkpoint command still writes merge subjects for people.
@@ -512,6 +696,14 @@ Copied pane marks do not select rows.
 
 - The stall watch skips standing-by units, finished runs and retired rows before any bump or idle notice. A pause or external-owner wait always resets the stretch. Waiting kinds and future stated holds also reset the stretch. Only `COMPACTION_WAKE_KIND` (`blocked`) can enter the idle path at or above `context_usage.handoff_threshold(window)`. That path sends one bump and one showrunner tell per stretch. The watcher reads `context_near_compaction` only for a blocked turn. It uses the context hook's bounded transcript-tail reading and model-specific handoff threshold from `scripts/hooks/context_usage.py`. Missing or unreadable usage keeps the wait quiet. The turn-end pattern uses `WAITING_KINDS` and `HOLDING_KIND`, so the pattern and wait test use the same kinds. A one-line reply can have a `●` or `⏺` bullet before the turn end.
 
+- **Outside waits.** The stall watch reads every active showrunner name from the pass's staff snapshot.
+  It also reads the unit's sibling names, excluding the unit itself, once per parent.
+  `PaneInspection.peers` carries those names with the configured session and production name.
+  A holding or waiting status that names one of those outside parties prevents a bump.
+  Complete own names still take precedence.
+  Unrelated unit names are excluded because common names can hide the unit's own work.
+  A common-word sibling name can still defer a bump.
+
 - Unit directors launch only on Claude. `production` has only `[production.claude]`; `claude --resume` never runs without resolved flags.
 
 - `models_config.sh` is bash only (call it through `bash -c`) and must keep working under `/bin/bash` 3.2 (no associative arrays, no `${var,,}`).
@@ -526,7 +718,7 @@ Copied pane marks do not select rows.
   The [configuration lifetime](agent-registry.md#configuration-lifetimes) keeps settings consistent across helper processes.
   Tests use private `MODELS_CONFIG_FILE`, `CODEX_CONFIG_FILE`, `CODEX_MODELS_CACHE_FILE`, and `CODEX_CATALOG_SYNC_STATE_FILE` paths.
 
-- A re-run of `add_unit.py` must name its original mode; the mode comes from the commit subject, then the Plan cell, then the stub.
+- A re-run of `add_unit.py` must name its original mode; the mode comes from the commit subject, then the configured plan, then the stub.
 
 - `ssh`'s own exit status is always 0 here; the Mac pull is read from the `rc=` line it prints. The Mac pulls from `natedev:<first Promote checkout>`.
 
@@ -575,11 +767,13 @@ Copied pane marks do not select rows.
 ## Why
 
 - **Scripts hold mechanics; command docs hold judgment.** Each showrunner step was given a script-or-judgment verdict. Script: zone time, log and STATE, questions, open/load/wrap, registration and prompt, merge/test/push/promote/record, CI counting and collection, review-watch escalation, gate notices, scratch tests, wait ages, agenda thresholds, rename search, the dailies input. Judgment: relaying the user's words, verifying a unit's claims, compacting a blocked pane, the overlap notice and restructure holds, whether a new public item has a consumer, design-check freshness and defects, the repair owner for red CI, classifying a wait as code, files or preference, landing order, permission blocks, close-out approvals, open topics and who acts next, `then` and goal text, and phone-alert urgency and wording.
-- **The mode is in the commit subject**, not a Units column: the subject already records it, and a pre-filled Units row is adopted, never rewritten to the script's form.
+- `recorded_mode` reads the add-unit commit subject, then the configured plan, then the brief stub.
+  Existing staff membership remains authoritative.
 - **Code commit before the shrink.** The code-ready notice can go out the moment the phase's code commits; the shrink runs beside the next phase's workers and lands as a plan-doc-only merge with no tests, ledger row or CI count.
 - **Merged state comes from Git.** Git ancestry identifies merged checkpoints. Unit records supply phase starts and checkpoint identities. Commit subjects supply no state.
 - **A finished run is a named state.** `run-finished` is read from the run record's `run_finished` event; the stall watch reads that named variant and does not infer completion from production-row prose.
-- **The Units row is the one retired marker.** Every reader of the Units table follows it, and the status script finds the production doc on its own through the showrunner's staff row, so retiring a unit changes no caller's command line. The marker counts only at the start of the Plan cell because a live unit's Plan cell can use the word in its commentary.
+- `RemovedWorktree` marks retirement on the retained staff row.
+  Status readers exclude retired units without changing command arguments.
 - **A live unit's wait on a retired unit still prints.** Hiding it would hide a stuck unit.
 - **`merge_checkpoint.py`, `ci_points.py` and `production_lifecycle.py` do not skip retired rows.** A retired unit sends no checkpoint, and the wrap already passes a unit whose branch is gone.
 - **No named type carries an activity's phase.** `_event` already stamps the phase in state on every event.
@@ -591,7 +785,11 @@ Copied pane marks do not select rows.
 - **No `[production.codex]`** and no Codex director: unit directors launch only on Claude. Pinning a one-family function keeps every-function switches (`/default_models` "all on codex") from breaking director launches.
 - **Unit directors default to `opus:xhigh`** (the user, 2026-10-07, moved back from `sonnet:xhigh`). Test fixtures write their own rows, so they test that a row changes the launch, not the live default.
 - **The showrunner settles a unit's designs and add-ons (user, 2026-10-12: "when it comes to designs you absolutely should be able to tell units what to do and change. I do not have to be the one to approve").** A unit in a production brings a design choice, a Pending decision about how something is built, and its pending add-ons to the showrunner, whose answer settles them; the showrunner may also change a unit's design unasked. The user keeps two kinds: an action that cannot be undone, and a choice only they know the answer to. The rule is written once per reader: `docs/production_format.md` → `<ProductionUnit/>` item 2 for the unit, `/unit:add_ons` → `<ReviewPendingAddOns/>` for the add-on message and its answer, and `/showrunner:produce` → Throughout → Designs and add-ons for the showrunner. A run outside a production still asks the user. `docs/decision_criteria.md` is unchanged.
-- **Open questions show only as a count (user, 2026-10-12; the reply side changed 2026-10-18).** A showrunner records each question in `open_for_user` before it asks, then asks it once in full with its reviewed text. After that only the status line's counts row (`For you: …`, `docs/as-built/shutdown-and-restart.md`) shows them, as a count of the `OUTSTANDING` items now due across the productions its session runs. No reply carries a footer or a `Waiting on:` block. The full list is given only when the user asks (`update_registration.py open`). The dailies' sections on what needs the user are unchanged.
+- **Open question display.** The showrunner files each reviewed question before asking it once in full.
+  Later replies carry no question footer.
+  The status line shows the number of due items across that session's productions.
+  The full list appears when the user requests it.
+  Dailies retain their user-action sections.
 - **Rebuild items share one cache with Morty.** The `For you:` row puts adhoc items first, then questions, changes and rebuild items.
   Rebuild items read `rebuild natedev` and `rebuild mac`.
   The background check compares each running system outPath with the system from the configured main ref.

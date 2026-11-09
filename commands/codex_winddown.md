@@ -22,7 +22,6 @@ Counts use the shared worker observation and show open panes with their status.
 Stopped panes count as stopped; closed panes count as closed.
 Unknown and incomplete observations retain their reasons and do not prove that a worker stopped.
 An unreadable staff record produces a problem, not an empty count.
-Only an existing run pinned to `mesh` uses its retained roster and server display.
 
 Every one of these messages reaches showrunners and unit directors directly (`broadcast.py`); pass none of them on. A showrunner sent a **Codex count** runs the command it names and pastes its output word for word as the reply.
 

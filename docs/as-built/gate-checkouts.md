@@ -190,8 +190,14 @@ The next standing use resets its tree.
   --repo ~/worktrees/claude-build-followups-verify
 ```
 
-`list` prints one row per tree: path, owner, repo, commit, busy or idle, last
-holder pid, and target size. `remove` removes the caller's trees
+`list` prints a header row, then one numbered row per local tree and per
+remote mirror. The columns are number, owner, repository, host, path, session,
+commit, state, holder pid and target size. The owner column shows the current
+staff name, a role name, or `unavailable`. A local row shows its commit, busy
+or idle, the last holder pid and the target size. A remote row shows `held`,
+`idle` or `unavailable`. A held row names the holder session only when the
+lease pid equals the recorded `holder_pid`; otherwise it shows `not recorded`.
+`remove` removes the caller's trees
 across all repositories. An optional `--repo R` limits removal to that repository.
 The Python API accepts only a `RepositoryScope` value for `repo`.
 `copies.remove_trees(owner)` uses `AllRepositories()` by default.
@@ -265,7 +271,6 @@ The guard distinguishes no forbidden operation, a specific detected repository-t
 | `scripts/copies/copies.py` | Creates fresh checkouts, standing checkouts, remote mirrors, and registered test clones. |
 | `scripts/production/add_unit.py` | Creates original unit worktrees. |
 | `scripts/shutdown/shutdown.py` | Restores original unit worktrees. |
-| `scripts/berth_fix/launch.sh` | Creates a standing original fixer worktree, not a build copy. |
 | `scripts/style/add_style.py` | Creates a unit's original checkout, like `add_unit.py`. |
 | `scripts/bevy_migration_plan/bevy_migration_ensure_repo.sh` | Clones external upstream at a version, not a copy of our work. |
 | `scripts/worktree/make_worktree.sh` | Makes an original work worktree, not a build copy. |

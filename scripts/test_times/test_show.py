@@ -14,7 +14,6 @@ import select
 import socket
 import sqlite3
 import subprocess
-import sys
 import tempfile
 from threading import Event
 import time
@@ -22,6 +21,7 @@ from typing import TYPE_CHECKING, BinaryIO, Self, cast, override
 import unittest
 from unittest import mock
 
+from scripts.lib import conf
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 if TYPE_CHECKING:
@@ -33,9 +33,8 @@ if TYPE_CHECKING:
     from scripts.production.gate_modules import discover_test_modules
     from scripts.test_times import gate_record, show
     from scripts.test_times.gate_record import GateRun, ModuleRun, TestTime
-    from scripts.test_times.gate_record_test_support import gate_run, remove_run_measurements
+    from scripts.test_times.gate_record_test_support import fixture_executions, gate_run, remove_run_measurements
 else:
-    # Import show first because it adds the build log folder to the import path.
     from scripts.test_times import gate_record, show
     from scripts.buildlog import parse, record, repository, store
     from scripts.buildlog.index import index_path_in
@@ -44,7 +43,7 @@ else:
     from scripts.lint.memory_test_support import write_config_fixture
     from scripts.production.gate_modules import discover_test_modules
     from scripts.test_times.gate_record import GateRun, ModuleRun, TestTime
-    from scripts.test_times.gate_record_test_support import gate_run, remove_run_measurements
+    from scripts.test_times.gate_record_test_support import fixture_executions, gate_run, remove_run_measurements
 
 EPOCH = datetime(2026, 11, 3, 14, 30, tzinfo=UTC).timestamp()
 HOST = store.host_name()
@@ -58,7 +57,6 @@ from pathlib import Path
 import runpy
 import socket
 import sys
-sys.path.insert(0, sys.argv[1])
 report = runpy.run_path(str(Path(sys.argv[1]) / 'scripts/test_times/show.py'))
 main = report['main']
 main.__globals__['TOOL_REPOSITORY'] = Path(sys.argv[2])
@@ -123,6 +121,7 @@ def module_run(module: str, wall_s: float, *, suite: str = "tools", attempt: int
         "wall_s": wall_s, "cpu_s": wall_s / 2, "peak_mib": 12.0, "status": status,
         "tests_run": 0 if missing else 13, "failures": int(status != 0), "errors": 0, "skipped": 0,
         "tests_s": 0.0 if missing else wall_s / 4, "tests": list(tests), "restart": restart, "times_missing": missing,
+        "log": "",
     }
 
 
@@ -203,7 +202,7 @@ class TestTimesTests(unittest.TestCase):
         }
         with mock.patch.object(record, "new_id", return_value=f"history-{self.next_id}"), \
                 mock.patch.object(socket, "gethostname", return_value=host):
-            gate_record.write_gate_run(run)
+            gate_record.write_gate_run(run, fixture_executions(run))
 
     def report(self, *arguments: str) -> str:
         status, output, errors = run(*arguments)
@@ -216,7 +215,7 @@ class TestTimesTests(unittest.TestCase):
         event, child_event = socket.socketpair()
         event.settimeout(TEST_HANG_GUARD_SECS)
         process = subprocess.Popen(
-            [sys.executable, "-c", REPORT_PROCESS, str(Path(__file__).resolve().parents[2]),
+            [str(Path(__file__).resolve().parents[1] / "lib/py"), "-c", REPORT_PROCESS, str(Path(__file__).resolve().parents[2]),
              str(self.repo), changed_table, str(child_event.fileno()),
              *(arguments or ("top", "--repo", str(self.repo)))],
             cwd=self.root, env=dict(os.environ), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -271,7 +270,6 @@ class TestTimesTests(unittest.TestCase):
         program = """
 import socket
 import sys
-sys.path.insert(0, sys.argv[1])
 from scripts.buildlog import index
 with socket.socket(fileno=int(sys.argv[2])) as event, index.update_lock():
     connection = index.open_for_update(index.index_path())
@@ -288,7 +286,7 @@ with socket.socket(fileno=int(sys.argv[2])) as event, index.update_lock():
         with event, child_event:
             event.settimeout(TEST_HANG_GUARD_SECS)
             writer = subprocess.Popen(
-                [sys.executable, "-c", program, str(Path(__file__).resolve().parents[2]),
+                [str(Path(__file__).resolve().parents[1] / "lib/py"), "-c", program, str(Path(__file__).resolve().parents[2]),
                  str(child_event.fileno())], env=dict(os.environ), pass_fds=(child_event.fileno(),),
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             )
@@ -329,11 +327,11 @@ with socket.socket(fileno=int(sys.argv[2])) as event, index.update_lock():
         program = """
 import socket
 import sys
-sys.path.insert(0, sys.argv[1])
 from scripts.buildlog import index
 with socket.socket(fileno=int(sys.argv[2])) as event, index.update_lock():
     connection = index.open_for_update(index.index_path())
     try:
+        connection.execute("PRAGMA locking_mode = EXCLUSIVE").close()
         connection.execute("BEGIN EXCLUSIVE").close()
         event.sendall(b'W')
         event.recv(1)
@@ -345,12 +343,16 @@ with socket.socket(fileno=int(sys.argv[2])) as event, index.update_lock():
         with event, child_event:
             event.settimeout(TEST_HANG_GUARD_SECS)
             writer = subprocess.Popen(
-                [sys.executable, "-c", program, str(Path(__file__).resolve().parents[2]),
+                [str(Path(__file__).resolve().parents[1] / "lib/py"), "-c", program, str(Path(__file__).resolve().parents[2]),
                  str(child_event.fileno())], env=dict(os.environ), pass_fds=(child_event.fileno(),),
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             )
             try:
                 self.assertEqual(event.recv(1), b"W")
+                with closing(sqlite3.connect(show.index.read_only_uri(self.log), uri=True,
+                        timeout=conf.read("buildlog").number("INDEX_READ_WAIT_SECONDS"))) as reader:
+                    with self.assertRaisesRegex(sqlite3.OperationalError, "database is locked"):
+                        reader.execute("SELECT COUNT(*) FROM gate_modules").close()
                 with mock.patch.dict(os.environ, {"TEST_LOCKED_INDEX": "1"}), \
                         self.report_process(wait_for_refresh=False) as (process, refresh):
                     try:
@@ -377,12 +379,15 @@ with socket.socket(fileno=int(sys.argv[2])) as event, index.update_lock():
         select_index = show.index.complete_gate_index_in
         selected = Event()
         locked = Event()
+        reader_checked = Event()
 
         def hold_lock_after_selection() -> None:
             self.assertTrue(selected.wait(TEST_HANG_GUARD_SECS))
             with closing(sqlite3.connect(index_path_in(self.log))) as writer:
+                writer.execute("PRAGMA locking_mode = EXCLUSIVE").close()
                 writer.execute("BEGIN EXCLUSIVE").close()
                 locked.set()
+                self.assertTrue(reader_checked.wait(TEST_HANG_GUARD_SECS))
                 # Hold the lock longer than the selection timeout.
                 time.sleep(0.2)
                 writer.execute("COMMIT").close()
@@ -391,6 +396,13 @@ with socket.socket(fileno=int(sys.argv[2])) as event, index.update_lock():
             path = select_index(root)
             selected.set()
             self.assertTrue(locked.wait(TEST_HANG_GUARD_SECS))
+            try:
+                with closing(sqlite3.connect(show.index.read_only_uri(self.log), uri=True,
+                        timeout=conf.read("buildlog").number("INDEX_READ_WAIT_SECONDS"))) as reader:
+                    with self.assertRaisesRegex(sqlite3.OperationalError, "database is locked"):
+                        reader.execute("SELECT COUNT(*) FROM gate_modules").close()
+            finally:
+                reader_checked.set()
             return path
 
         with ThreadPoolExecutor(max_workers=1) as pool:
@@ -400,6 +412,7 @@ with socket.socket(fileno=int(sys.argv[2])) as event, index.update_lock():
                     status, output, errors = report_without_update("top")
             finally:
                 selected.set()
+                reader_checked.set()
                 writer.result(timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(status, 0, errors)
         self.assertIn("tools/test_alpha.py", output.split("unmeasured:")[0])

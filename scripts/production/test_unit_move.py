@@ -3,7 +3,6 @@ from __future__ import annotations
 
 from scripts.shutdown import remote
 
-import argparse
 import io
 import json
 import os
@@ -18,19 +17,17 @@ from typing import Literal, cast
 from unittest import mock
 
 from scripts.accounts import accounts
-from scripts.agents import codex_mesh
-from scripts.direct import progress_history
-from scripts.lib import models_registry
-from scripts.lib.test_models_registry import registry_text
 from scripts.message import sessions
 from scripts.production import session_staff, staff, unit_move
 from scripts.production.add_unit_test_support import AddUnitTestCase
 from scripts.production.cli_fixture import invoke_cli
 from scripts.production.rename_unit_test_support import FolderRenameFixture, FolderSessionFixture
 from scripts.production.rename_rerun_test_support import file_versions, saved_fixture
-from scripts.production.staff_test_support import fixture_member, fixture_runtime_id, fixture_worker
+from scripts.production.staff_test_support import fixture_member, fixture_worker
 from scripts.shutdown import pane_record, restart, shutdown_record
 from scripts.herdr import herdr
+from scripts.herdr.test_worker_panes import PaneWorld
+from scripts.lib.atomic_file import write_text_atomic
 
 
 def setUpModule() -> None:
@@ -171,14 +168,15 @@ class UnitFolderMoveTests(FolderRenameFixture):
                         self.assertEqual(result.stderr, "")
                     self.assert_finished_rerun(backend)
 
-    def test_history_mesh_and_launch_files_keep_their_bytes_and_times(self) -> None:
+    def test_history_and_launch_files_keep_their_bytes_and_times(self) -> None:
         files = (self.records / "agents.json", self.root / "runs/mesh_roster.json",
-                 self.root / "runs/progress_history_state.json", self.root / "history.jsonl")
+                 self.root / "runs/progress_history_state.json",
+                 self.root / "history.jsonl")
         text = json.dumps({"session_id": self.owner.current_session, "cwd": str(self.source),
                            "branch": "cargo-liner-source", "queued_message": "Keep this task"}) + "\n"
         for path in files:
             path.parent.mkdir(parents=True, exist_ok=True)
-            _ = path.write_text(text)
+            write_text_atomic(path, text)
         before = [(path.read_bytes(), path.stat().st_mtime_ns) for path in files]
         backend = FolderSessionFixture(self.owner, live=True)
         with backend.installed():
@@ -478,10 +476,6 @@ class UnitFolderMoveTests(FolderRenameFixture):
     def test_missing_launch_record_prints_one_line_and_finishes_the_move(self) -> None:
         self.test_missing_launch_record_finishes_the_move_without_writing_one()
 
-    def test_failed_worker_pause_prints_one_line_and_finishes_the_move(self) -> None:
-        with mock.patch.object(codex_mesh, "command_stop", return_value=1) as pause:
-            self.test_running_unit_stops_moves_and_resumes_current_session()
-        pause.assert_not_called()
 
     def test_crash_after_git_move_finishes_staff_paths_and_starts_the_unit(self) -> None:
         backend = FolderSessionFixture(self.owner, live=False)
@@ -608,16 +602,6 @@ class UnitFolderMoveTests(FolderRenameFixture):
                 self.assertEqual((backend.starts, backend.stops), ([], []))
                 restore()
 
-    def test_each_run_mesh_is_paused_when_the_unit_has_two_histories(self) -> None:
-        paths = tuple(self.root / "runs" / name / "mesh_roster.json" for name in ("first", "second"))
-        for path in paths:
-            path.parent.mkdir(parents=True)
-            _ = path.write_text('{"queued_message": "Keep this task"}\n')
-        before = [(path.read_bytes(), path.stat().st_mtime_ns) for path in paths]
-        with mock.patch.object(codex_mesh, "command_stop") as pause:
-            self.test_move_reads_only_members_and_resumes_their_current_sessions()
-        pause.assert_not_called()
-        self.assertEqual([(path.read_bytes(), path.stat().st_mtime_ns) for path in paths], before)
 
     def test_stopped_unit_with_a_closed_pane_moves_records_without_starting(self) -> None:
         self.test_stopped_unit_with_a_closed_pane_stays_stopped()
@@ -683,69 +667,62 @@ class UnitFolderMoveTests(FolderRenameFixture):
         self.test_running_unit_stops_moves_and_resumes_current_session()
         self.assertEqual(file_versions(self.records), before)
 
+    def test_folder_move_resumes_the_unit_and_keeps_a_live_idle_worker_closed(self) -> None:
+        world = PaneWorld()
+        world.setup(self)
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(self.home / ".claude")})))
+        config = self.root / "conf/direct.conf"
+        write_text_atomic(config.with_name("production.conf"), self.configuration.read_text())
+        write_text_atomic(config, config.read_text().replace("WORKER_TRANSPORT=mesh", "WORKER_TRANSPORT=herdr"))
+        idle = fixture_worker("idle", self.owner.id)
+        world.add(self.owner, "w1:p0")
+        world.add(idle, "w1:p1")
+        backend = FolderSessionFixture(self.owner, live=True)
+        real_start = restart.start_row
+
+        def live_members(rows: Iterable[staff.StaffRow], _record: staff.StaffSnapshot) -> list[staff.StaffRow]:
+            identities = {world.processes[pid].current_identity for pid, _, _ in world.foreground.values()}
+            return [row for row in rows if row.current_session in identities]
+
+        def start(row: staff.StaffRow, record: staff.StaffSnapshot, client: herdr.Herdr) -> str:
+            if row.kind == "worker":
+                return real_start(row, record, client)
+            pane = backend.start(row, record, client)
+            world.activate(row.current_session, "w1:p0", "claude")
+            return pane
+
+        def stop(row: staff.StaffRow, client: herdr.Herdr) -> bool:
+            if row.id == self.owner.id:
+                _ = backend.stop(row, client)
+            return world.stop(row, client)
+
+        with (mock.patch.object(restart, "live_members", side_effect=live_members),
+              mock.patch.object(restart, "stop_row", side_effect=stop),
+              mock.patch.object(restart, "start_row", side_effect=start),
+              mock.patch.object(herdr, "read_conversation", return_value=herdr.StoppedConversation()),
+              mock.patch.object(herdr.Herdr, "panes", wraps=world.panes),
+              mock.patch.object(os, "kill", side_effect=world.signal)):
+            result = self.move_folder()
+        self.assertEqual((result.returncode, result.stderr), (0, ""))
+        self.assert_moved(backend)
+        self.assertEqual(backend.stops, [self.owner.current_session])
+        self.assertEqual(len(backend.starts), 1)
+        self.assertIn("idle: closed; its next assign resumes it\n", result.stdout)
+        self.assertIn("w1:p0", world.foreground)
+        self.assertNotIn("w1:p1", world.foreground)
+        self.assertEqual(world.launches, [])
+
     def test_folder_move_resumes_the_same_worker_thread_with_the_staff_folder(self) -> None:
         self.test_move_reads_only_members_and_resumes_their_current_sessions()
 
 
-    def test_next_worker_dispatch_uses_the_moved_run_folder(self) -> None:
-        from scripts.agents import codex_mesh
-
-        run = self.root / "runs/move-run"
-        run.mkdir(parents=True)
-        _ = (run / "progress_history_state.json").write_text(json.dumps({
-            "owner_staff_id": str(self.owner.id), "status": "active", "run_id": "move-run",
-            "plan_doc": "kept.txt", "branch": "cargo-liner-source"}))
-        backend = FolderSessionFixture(self.owner, live=False)
-        with backend.installed():
-            result = self.move_folder()
-        self.assertEqual(result.returncode, 0, result.stderr)
-        native = fixture_runtime_id("worker-after-folder-move")
-        state = cast(Callable[[Path], dict[str, object]], getattr(progress_history, "_read_state"))(run)
-        requests: list[tuple[str, dict[str, object]]] = []
-
-        def request(_client: object, method: str, params: dict[str, object], **_options: object) -> dict[str, object]:
-            requests.append((method, params.copy()))
-            return {"thread": {"id": native}} if method == "thread/start" else {"turn": {"id": "first-turn"}}
-
-        client = mock.Mock()
-        client.configure_mock(**{"call.return_value": {"result": {}}})
-        def model(command: list[str], **options: object) -> subprocess.CompletedProcess[str]:
-            del options
-            self.assertEqual(command[:2], ["bash", "-c"])
-            self.assertIn("agents_resolve", command[2])
-            output = "gpt-fixture\nhigh\n" if "mesh-turn" in command else "codex gpt-fixture high default\n"
-            return subprocess.CompletedProcess(command, 0, output, "")
-
-        inherited = models_registry.LaunchModelConfiguration(self.root / "models.conf", registry_text(), ())
-        configuration = models_registry.launch_configuration(inherited.environment(os.environ))
-        with (mock.patch.dict(os.environ, configuration.environment(os.environ)),
-              mock.patch.object(subprocess, "run", side_effect=model),
-              mock.patch.object(codex_mesh, "workers_home", return_value=self.root / "home/.codex2"),
-              mock.patch.object(codex_mesh, "ensure_server", return_value=(12345, False)) as server,
-              mock.patch.object(codex_mesh, "Client", return_value=client),
-              mock.patch.object(codex_mesh, "_bind_serving_server"),
-              mock.patch.object(codex_mesh, "_serving_request", side_effect=request)):
-            opened = codex_mesh.open_unit_worker(str(run), "impl1", "impl", configuration=configuration)
-            self.assertEqual(session_staff.worker_session(opened, staff.local_snapshot()), native)
-            self.assertEqual(server.call_args.kwargs["cwd"], str(self.destination))
-            self.assertEqual(requests[0][1]["cwd"], str(self.destination))
-            arguments = argparse.Namespace(turn_cwd=state["working_dir"], session_dir=str(run), name="impl1",
-                                           model="gpt-fixture", effort="high", service_tier="default")
-            start = cast(Callable[..., str], getattr(codex_mesh, "_start_turn"))
-            with mock.patch.object(codex_mesh, "_turn_service_tier", return_value="default"):
-                self.assertEqual(start(client, arguments, native, codex_mesh.WORKER_SANDBOX, "Continue the task."), "first-turn")
-        self.assertEqual(requests[-1][0], "turn/start")
-        self.assertEqual(requests[-1][1]["cwd"], str(self.destination))
-        worker = staff.snapshot().by_current_session(native)
-        self.assertIsInstance(worker, staff.StaffRow)
-        assert isinstance(worker, staff.StaffRow)
-        self.assertEqual(worker.parent, staff.ReportsTo(self.owner.id))
 
 
 class FolderBranchRecoveryTests(FolderRenameFixture):
     def assert_recovery(self, step: str) -> None:
         from contextlib import ExitStack
-        from scripts.production import rename, unit_move as moving
+        from scripts.production import unit_move as moving
+        from scripts.shutdown import shutdown
         from scripts.shutdown import restart
 
         class InterruptedMove(BaseException):
@@ -784,7 +761,7 @@ class FolderBranchRecoveryTests(FolderRenameFixture):
                 raise InterruptedMove()
             return result
 
-        with backend.installed(), mock.patch.object(rename, "repair_displays", return_value=False):
+        with backend.installed(), mock.patch.object(shutdown, "rename_repair_displays", return_value=False):
             with ExitStack() as interruptions:
                 _ = interruptions.enter_context(mock.patch.object(moving, "git", side_effect=git))
                 _ = interruptions.enter_context(mock.patch.object(staff, "set_worktree", side_effect=publish))
@@ -825,14 +802,14 @@ class FolderBranchRecoveryTests(FolderRenameFixture):
         self.assert_recovery("start")
 
     def test_both_native_families_resume_current_session_without_a_launch_record(self) -> None:
-        from scripts.production import rename
+        from scripts.shutdown import shutdown
 
         for kind in ("claude", "codex"):
             with self.subTest(kind=kind), saved_fixture(self.root) as restore:
                 self.transcript(kind)
                 self.assertEqual(list(self.records.iterdir()), [])
                 backend = FolderSessionFixture(self.owner, live=True)
-                with backend.installed(), mock.patch.object(rename, "repair_displays", return_value=False):
+                with backend.installed(), mock.patch.object(shutdown, "rename_repair_displays", return_value=False):
                     result = self.command()
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(backend.resumes, [(kind,
@@ -845,13 +822,13 @@ class FolderBranchRecoveryTests(FolderRenameFixture):
                 restore()
 
     def test_dirty_work_does_not_refuse_a_nondestructive_move(self) -> None:
-        from scripts.production import rename
+        from scripts.shutdown import shutdown
 
         _ = (self.source / "kept.txt").write_text("Keep the uncommitted edit.\n")
         _ = (self.source / "draft.md").write_text("Keep the untracked draft.\n")
         tip = self.git("rev-parse", "HEAD", cwd=self.source)
         backend = FolderSessionFixture(self.owner, live=True)
-        with backend.installed(), mock.patch.object(rename, "repair_displays", return_value=False):
+        with backend.installed(), mock.patch.object(shutdown, "rename_repair_displays", return_value=False):
             result = self.command()
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual((self.destination / "kept.txt").read_text(), "Keep the uncommitted edit.\n")
@@ -860,14 +837,14 @@ class FolderBranchRecoveryTests(FolderRenameFixture):
         self.assertEqual(len(backend.starts), 1)
 
     def test_existing_target_refuses_without_overwriting_any_file(self) -> None:
-        from scripts.production import rename
+        from scripts.shutdown import shutdown
 
         self.destination.mkdir()
         marker = self.destination / "owned-by-another-unit.txt"
         _ = marker.write_text("Keep this destination.\n")
         before = file_versions(self.destination)
         backend = FolderSessionFixture(self.owner, live=True)
-        with backend.installed(), mock.patch.object(rename, "repair_displays", return_value=False):
+        with backend.installed(), mock.patch.object(shutdown, "rename_repair_displays", return_value=False):
             result = self.command()
         self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(file_versions(self.destination), before)
@@ -878,12 +855,12 @@ class FolderBranchRecoveryTests(FolderRenameFixture):
 
     def test_same_row_lock_refuses_without_stopping_or_moving(self) -> None:
         import fcntl
-        from scripts.production import rename
+        from scripts.shutdown import shutdown
 
         backend = FolderSessionFixture(self.owner, live=True)
         lock = self.staff_file.parent / "rows" / f"{self.owner.id}.lock"
         lock.parent.mkdir(parents=True, exist_ok=True)
-        with (backend.installed(), mock.patch.object(rename, "repair_displays", return_value=False),
+        with (backend.installed(), mock.patch.object(shutdown, "rename_repair_displays", return_value=False),
               lock.open("a") as handle):
             fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
             before = file_versions(self.root)
@@ -895,10 +872,10 @@ class FolderBranchRecoveryTests(FolderRenameFixture):
         self.assertFalse(self.destination.exists())
 
     def test_stopped_unit_moves_its_row_and_branch_and_stays_stopped(self) -> None:
-        from scripts.production import rename
+        from scripts.shutdown import shutdown
 
         backend = FolderSessionFixture(self.owner, live=False)
-        with backend.installed(), mock.patch.object(rename, "repair_displays", return_value=False):
+        with backend.installed(), mock.patch.object(shutdown, "rename_repair_displays", return_value=False):
             result = self.command()
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(backend.starts, [])
@@ -1019,7 +996,8 @@ class FolderMoveReviewTests(FolderRenameFixture):
         self.assertEqual(staff.by_id(self.owner.id), replace(self.owner, parent=staff.ReportsTo(parent.id)))
 
     def test_f006_hard_kill_states_finish_without_cleanup_or_automatic_starts(self) -> None:
-        from scripts.production import rename, unit_move
+        from scripts.production import unit_move
+        from scripts.shutdown import shutdown
 
         for step in ("stop", "move", "publish"):
             with self.subTest(step=step), saved_fixture(self.root) as restore, ExitStack() as recovery:
@@ -1034,7 +1012,7 @@ class FolderMoveReviewTests(FolderRenameFixture):
                     _ = staff.set_worktree(self.owner.id, staff.PresentWorktree(remote.local_machine(), self.destination),
                                            expected=self.owner.worktree)
                 backend = FolderSessionFixture(self.owner, live=False)
-                with backend.installed(), mock.patch.object(rename, "repair_displays", return_value=False):
+                with backend.installed(), mock.patch.object(shutdown, "rename_repair_displays", return_value=False):
                     result = self.command()
                     self.assertEqual(result.returncode, 0, result.stderr)
                     self.assertFalse(self.source.exists())
@@ -1060,11 +1038,11 @@ class FolderMoveReviewTests(FolderRenameFixture):
 
     def test_f006_failed_start_reports_the_restart_command_immediately(self) -> None:
         from scripts.lint.memory_test_support import write_config_fixture
-        from scripts.production import rename
+        from scripts.shutdown import shutdown
 
         _ = write_config_fixture(self.configuration, "RENAME_LIVE_WAIT_SECONDS=0.01\nRENAME_POLL_SECONDS=0.001\n")
         backend = FolderSessionFixture(self.owner, live=True)
-        with (backend.installed(), mock.patch.object(rename, "repair_displays", return_value=False),
+        with (backend.installed(), mock.patch.object(shutdown, "rename_repair_displays", return_value=False),
               mock.patch.object(restart, "start_row", side_effect=OSError("fixture launch failure")) as start):
             result = self.command()
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -1215,7 +1193,7 @@ class FolderMoveReviewTests(FolderRenameFixture):
             self.assertNotEqual(pending_types[0], pending_types[1])
 
     def test_git_timeout_reports_a_rename_error_and_a_move_anomaly(self) -> None:
-        from scripts.production import rename
+        from scripts.shutdown import shutdown
 
         real_git = unit_move.git
         def git(folder: Path, *arguments: str) -> str:
@@ -1227,7 +1205,7 @@ class FolderMoveReviewTests(FolderRenameFixture):
                 _ = recovery.callback(restore)
                 backend = FolderSessionFixture(self.owner, live=False)
                 with (backend.installed(), mock.patch.object(unit_move, "git", side_effect=git),
-                      mock.patch.object(rename, "repair_displays", return_value=False)):
+                      mock.patch.object(shutdown, "rename_repair_displays", return_value=False)):
                     if entry == "rename":
                         result = self.command()
                     else:

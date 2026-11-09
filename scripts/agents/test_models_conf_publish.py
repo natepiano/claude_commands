@@ -15,7 +15,6 @@ from pathlib import Path
 from typing import Literal, final, override
 from unittest import mock
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.lib import models_registry, atomic_file  # noqa: E402
 from scripts.lib.test_models_registry import ExactRows, registry_text, write_registry  # noqa: E402
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS  # noqa: E402
@@ -509,11 +508,11 @@ models_registry.store_registry(p, text, text.replace('impl=gpt-a:high', 'impl=gp
 
     def test_the_showrunner_effort_writer_publishes_the_director_launch_row(self) -> None:
         before = self.dirty_state()
-        program = ("import os, sys; sys.path.insert(0,sys.argv[1]); import unit_effort; "
+        program = ("from scripts.production import unit_effort; import os, sys; "
                    + "from scripts.lib import models_registry; "
                    + "problem=unit_effort.set_row('opus','max',models_registry.edit_base(os.environ)); "
                    + "print(problem); sys.exit(bool(problem))")
-        result = self.command(sys.executable, "-c", program, str(REPO / "scripts/production"))
+        result = self.command(str(REPO / "scripts/lib/py"), "-c", program)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assert_published(before, "director=opus:max")
         self.assertEqual(self.git("rev-list", "--count", f"{self.initial}..HEAD").strip(), "1")
@@ -586,6 +585,28 @@ models_registry.store_registry(p, text, text.replace('impl=gpt-a:high', 'impl=gp
         self.assertEqual(self.registry.read_bytes(), registry_bytes)
         self.assertEqual(index.read_bytes(), index_bytes)
         self.assertEqual(self.git("rev-parse", "HEAD").strip(), self.initial)
+
+    def test_another_fetch_between_the_fetch_and_the_read_does_not_change_the_target(self) -> None:
+        _ = self.git("checkout", "-b", "phases", cwd=self.competitor)
+        _ = (self.competitor / "phases.txt").write_text("another branch\n")
+        _ = self.git("add", "phases.txt", cwd=self.competitor)
+        _ = self.git("commit", "-m", "another branch", cwd=self.competitor)
+        _ = self.git("push", "origin", "phases", cwd=self.competitor)
+        program = "\n".join((
+            "from pathlib import Path",
+            "from scripts.lib import models_registry",
+            "real = models_registry._git",
+            "def peer(repo, *arguments, **options):",
+            "    output = real(repo, *arguments, **options)",
+            "    if arguments[:1] == ('fetch',):",
+            "        _ = real(repo, 'fetch', 'origin', 'phases')",
+            "    return output",
+            "models_registry._git = peer",
+            "print(models_registry._fetch(Path.cwd(), 'main'))",
+        ))
+        result = self.command(sys.executable, "-c", program)
+        self.assert_ok(result)
+        self.assertEqual(result.stdout.strip(), self.initial)
 
     def assert_unfinished_merge_is_refused(self, *, ahead: bool, unmerged: bool,
                                           merge_head_present: bool = True) -> None:

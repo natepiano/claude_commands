@@ -1,14 +1,13 @@
 # Unit and showrunner rename
 
-`scripts/production/rename.py plan|apply <old> <new>` renames a unit or showrunner.
-`plan <old> <new>` reads the request without writing.
-`apply <old> <new>` calls `staff.rename` before the display repair.
-The shared `rename.repair_displays` selects the row's current native session.
+`agents rename OLD NEW` renames a unit, showrunner, or worker.
+The command calls `staff.rename` before display repair.
+`shutdown.rename_repair_displays` selects the row's current native session.
 It keeps panes that run another session.
 
 The command accepts a staff id, `showrunner/name`, or a bare name.
 A bare name first selects the calling showrunner or its own units.
-If none matches, the command searches all showrunner and unit rows.
+If none matches, the command searches all showrunner, unit, and worker rows.
 Several matches require a staff id or `showrunner/name`.
 A same-name request repairs differing names.
 It prints `unchanged` only when the row and all available names agree.
@@ -41,12 +40,11 @@ The showrunner path creates no commit and makes no push.
 ## Unit branch move
 
 Units accept `--to-branch <name>` without `--to-doc`.
-`apply handler handler --to-branch cargo-liner-handler` changes only the branch.
+`agents rename handler handler --to-branch cargo-liner-handler` changes only the branch.
 A changed unit name also changes the matching folder suffix.
 The explicit branch replaces the branch suffix change.
 Every unit branch change pushes the target with `--set-upstream` before live sessions resume.
 The explicit refspec `<branch>:refs/heads/<branch>` prevents push configuration from changing the target.
-`plan` shows the source and target branch names.
 Units and showrunners use the same branch name and collision checks.
 
 1. Save the unit move through `unit_move.prepare_move`.
@@ -64,6 +62,13 @@ The command refuses a different requested branch while a move remains pending.
 The refusal names the pending branch.
 The command refuses `--to-doc` for a unit.
 
+## Workers
+
+A worker rename retains its staff id, current conversation, parent, and backend.
+The existing `staff.rename` writer calls `Herdr.retitle_row` for workers.
+It renames proved worker panes and keeps their shared tab and workspace names.
+An unavailable display produces one anomaly line after the staff rename.
+
 ## Scope and tests
 
 Timers and stores keep their staff ids during a rename.
@@ -71,5 +76,5 @@ The command edits no document fields, plan headers, prose, marks, or history.
 Unit renames change matching folder and branch suffixes unless `--to-branch` supplies the branch; see `unit-rename.md`.
 Folder-only moves use `unit_move.py move-folder --unit <staff id> --to <path>`.
 
-`test_rename*.py` uses private staff records, temporary files, and a fake herdr.
+`scripts/shutdown/test_shutdown_cli.py` uses private staff records, temporary files, and a fake herdr.
 The tests cover row rename, display repair, optional moves, and recovery after an interruption.

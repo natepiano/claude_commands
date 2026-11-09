@@ -374,7 +374,8 @@ the log does not record that connection. Journal retention also limits the evide
 - The guard lines stay first in `verify.sh` and `memory_gate.sh`, above every line that reads `HOME` or a listed variable. The guard runs at an entry point, never inside a function that reads a directory: `dailies_input.py` sets `BUILD_HOLD_DIR` in its own process on every run.
 - Callers and `override_guard.sh` arrive in one commit: a tree with the callers and without the guard refuses every build. `mac_test.py` and `offload.py` run on the Mac too, so its checkout takes the same commit before the next Mac test.
 - `MACOSX_DEPLOYMENT_TARGET` stays at 12.0 or above and follows the value hana's development shell exports on the Mac; `offload.py` and `mac_run.sh` carry the same value.
-- A module added to `scripts/build_hold`, `scripts/build_targets`, `scripts/buildlog` or `scripts/lint` shares no name with one in the others: importing `build_hold`, `targets` or `offload` puts several of them on `sys.path`.
+- Repository imports use package names such as `scripts.build_hold.build_hold`.
+  Modules in different packages can share a filename without import-path changes.
 
 ### Copy records and lifetime
 

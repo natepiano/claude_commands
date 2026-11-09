@@ -4,31 +4,32 @@ from __future__ import annotations
 
 from contextlib import redirect_stderr
 import io
+import json
 import os
-import sys
 from pathlib import Path
 import tempfile
 import unittest
-from typing import TYPE_CHECKING
+from typing import cast
 from unittest import mock
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
-if TYPE_CHECKING:
-    from ..lib import conf
-    from . import mac_idle_alert
-    from .test_index import use_test_log
-    from .mac_idle_test_support import write_idle_config
-    from ..lint.memory_test_support import commit_config_fixture
-else:
-    from scripts.lib import conf
-    from scripts.buildlog import mac_idle_alert
-    from scripts.buildlog.test_index import use_test_log
-    from scripts.buildlog.mac_idle_test_support import write_idle_config
-    from scripts.lint.memory_test_support import commit_config_fixture
+from scripts.lib import conf
+from scripts.buildlog import mac_idle_alert
+from scripts.buildlog.test_index import use_test_log
+from scripts.buildlog.mac_idle_test_support import write_idle_alert, write_idle_config
+from scripts.lint.memory_test_support import commit_config_fixture
 
 
 use_test_log()
+
+
+class SavedAlertTests(unittest.TestCase):
+    def test_alert_without_cause_change_time_is_unreadable(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = write_idle_alert(Path(directory), 1600)
+            row = cast(dict[str, object], json.loads(path.read_text()))
+            del row["changed"]
+            _ = path.write_text(json.dumps(row))
+            self.assertEqual(mac_idle_alert.read_alert(path), mac_idle_alert.UnreadableAlert("invalid changed"))
 
 
 class MacIdleConfigTests(unittest.TestCase):

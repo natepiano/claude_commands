@@ -426,8 +426,8 @@ def fast_check(repo: Path, paths: list[str], config: FastTrackLimits) -> None:
             root = temporary / str(number)
             root.mkdir()
             isolated = merge_gate.test_module_environment(root, environment)
-            check_command([sys.executable, "-m", "unittest", "discover", "-s", str(module.parent),
-                           "-p", module.name], repo, isolated, deadline, empty_suite=True)
+            check_command([str(repo / "scripts/lib/py"), "-m", "unittest",
+                           ".".join(module.with_suffix("").parts)], repo, isolated, deadline, empty_suite=True)
             for marker in (root / "build-tool-calls.jsonl", root / "live-memory-reads.jsonl"):
                 if marker.exists() and marker.stat().st_size:
                     raise Refused(f"fast check tripwire: {marker.read_text()}")

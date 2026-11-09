@@ -19,7 +19,6 @@ except FileNotFoundError:
     pass
 
 import argparse
-import fcntl
 import json
 import os
 import sys
@@ -30,12 +29,7 @@ from enum import Enum
 from functools import cache
 from pathlib import Path
 from importlib import import_module
-from typing import TYPE_CHECKING, Literal, NamedTuple, cast
-
-if __name__ == "unit_runs":
-    _ = sys.modules.setdefault("scripts.lib.unit_runs", sys.modules[__name__])
-elif __name__ == "scripts.lib.unit_runs":
-    _ = sys.modules.setdefault("unit_runs", sys.modules[__name__])
+from typing import TYPE_CHECKING, NamedTuple, cast
 
 if TYPE_CHECKING:
     from scripts.production import staff
@@ -55,7 +49,6 @@ LIVE_HEARTBEAT_SECS = 600
 # Names the run's history, whose first line is the `run_started` event `start-run` writes.
 STATE_FILE = "progress_history_state.json"
 OWNER_FIELD = "owner_staff_id"
-SERVER_FILE = "mesh_server.json"
 # Every run's durable history: runs/, review_turns/, archives. The former name is read until
 # `unit_runs.py move-history` moves the folder; a test or a scratch run names its own with
 # UNIT_HISTORY_DIR. Both sit under the state folder, read at each call, since a caller may change HOME.
@@ -85,14 +78,14 @@ def run_owner(fields: Mapping[str, object], record: staff.StaffSnapshot) -> staf
     reference = fields.get(OWNER_FIELD)
     if isinstance(reference, str) and reference:
         row = record.by_id(staff.StaffId(reference))
-        if row is None or row.kind != "unit":
+        if row is None or row.kind not in ("unit", "showrunner"):
             raise staff.StaffUnreadable(f"run owner {reference}: unit staff row is unavailable")
         return row
     identity = fields.get("main_agent")
     agent = cast(dict[str, object], identity) if isinstance(identity, dict) else {}
     reference = agent.get("session_id") or fields.get("owner_session") or fields.get("director_session")
     row = record.owner_of(reference) if isinstance(reference, str) and reference else None
-    return row if row is not None and row.kind == "unit" else RunOwnerUnrecorded("run has no unit staff owner")
+    return row if row is not None and row.kind in ("unit", "showrunner") else RunOwnerUnrecorded("run has no unit staff owner")
 
 
 def environ(name: str) -> str:
@@ -115,62 +108,18 @@ def run_temp_path(run: Path) -> Path:
     return run / RUN_TEMP_NAME
 
 
-def worker_transport(run: Path) -> Literal["mesh", "herdr"]:
-    """Pin the configured worker transport for this run."""
-    from scripts.lib import conf
-    from scripts.lib.atomic_file import write_text_atomic
-
-    run.mkdir(parents=True, exist_ok=True)
-    pin = run / "worker_transport"
-    with (run / "worker_transport.lock").open("a") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
-        try:
-            selected = pin.read_text(encoding="utf-8").strip()
-        except FileNotFoundError:
-            selected = conf.read("direct").text("WORKER_TRANSPORT")
-            selected = _transport(selected, run)
-            if selected == "mesh":
-                print("unit_runs: new runs require herdr; refusing a new mesh pin", file=sys.stderr)
-                raise SystemExit(2)
-            write_text_atomic(pin, selected + "\n")
-        return _transport(selected, pin)
 
 
-def _transport(selected: str, source: str | Path) -> Literal["mesh", "herdr"]:
-    if selected not in ("mesh", "herdr"):
-        raise ValueError(f"{source}: invalid worker transport: {selected}")
-    return selected
 
 
-class NoRunPin(Enum):
-    ABSENT = "the run has no transport pin"
 
 
-def run_pin(run: Path) -> Literal["mesh", "herdr"] | NoRunPin:
-    """Read a run's transport pin without writing it."""
-    pin = run / "worker_transport"
-    try:
-        return _transport(pin.read_text(encoding="utf-8").strip(), pin)
-    except FileNotFoundError:
-        return NoRunPin.ABSENT
 
 
 class RunStaffAtUse(Enum):
     LOCAL = "read the local staff record"
 
 
-def parent_transport(session_id: str, *, scanned: dict[str, list[str]] | None = None,
-                     record: staff.StaffSnapshot | RunStaffAtUse = RunStaffAtUse.LOCAL
-                     ) -> Literal["mesh", "herdr"]:
-    """Read the first held run's pin, or current configuration, without writing."""
-    from scripts.lib import conf
-
-    runs = held(session_id, os.environ.get("ROSTER_RUN_ROOT"), scanned=scanned, record=record)
-    if runs:
-        selected = run_pin(Path(runs[0]))
-        if not isinstance(selected, NoRunPin):
-            return selected
-    return _transport(conf.read("direct").text("WORKER_TRANSPORT"), "config/direct.conf")
 
 
 def activate(run: Path, session_id: str) -> None:
@@ -289,14 +238,6 @@ def _has_resumable_workers(run: Path, *, record: staff.StaffSnapshot | RunStaffA
                 return True
         except OSError:
             continue
-    roster = read_record(run / "mesh_roster.json")
-    if any(
-        isinstance(entry, dict)
-        and (cast(dict[str, object], entry).get("status") in tuple(worker_state.ROSTER_LIVE)
-             or cast(dict[str, object], entry).get("paused_turn") is True)
-        for entry in roster.values()
-    ):
-        return True
     if not names:
         return False
     snapshot = staff.local_snapshot() if isinstance(record, RunStaffAtUse) else record
@@ -312,7 +253,7 @@ def held_by_session(root_override: str | Path | None = None, *,
     """Read each run's director once, in root and name order."""
     found: dict[str, list[str]] = {}
     for folder in run_folders(root_override):
-        if any((folder / name).is_file() for name in (STATE_FILE, "mesh_roster.json")):
+        if (folder / STATE_FILE).is_file():
             found.setdefault(director(folder, record=record), []).append(str(folder))
     return found
 
@@ -325,8 +266,9 @@ def held(session_id: str, root_override: str | Path | None = None,
     if not session_id:
         return []
     folders = held_by_session(root_override, record=record) if scanned is None else scanned
+    active = Path(root_override) / "active" if root_override is not None and active_override is None else active_override
     try:
-        lines = marker(session_id, active_override).read_text(encoding="utf-8").splitlines()
+        lines = marker(session_id, active).read_text(encoding="utf-8").splitlines()
     except (OSError, UnicodeError):
         lines = []
     runs: list[str] = []
@@ -440,13 +382,6 @@ def _held_main(argv: list[str]) -> int:
 
 
 def main(argv: list[str]) -> int:
-    if len(argv) == 2 and argv[0] == "worker-transport":
-        try:
-            print(worker_transport(Path(argv[1])))
-        except (OSError, ValueError) as error:
-            print(f"unit_runs: {error}", file=sys.stderr)
-            return 2
-        return 0
     if len(argv) == 3 and argv[0] == "activate":
         try:
             activate(Path(argv[1]), argv[2])
@@ -462,7 +397,7 @@ def main(argv: list[str]) -> int:
     if argv == ["move-history"]:
         return move_history(time.time())
     if argv != ["removal-check"]:
-        print("usage: unit_runs.py removal-check | history-root | move-history | activate <run folder> <session id> | held <session id> | worker-transport <run folder>",
+        print("usage: unit_runs.py removal-check | history-root | move-history | activate <run folder> <session id> | held <session id>",
               file=sys.stderr)
         return 2
     from scripts.message.sessions import running_sessions

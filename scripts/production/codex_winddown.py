@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Wind Codex agents down on every showrunner, and count the ones still running.
 
-A running Codex agent is one live `codex_mesh.py start|follow` turn or one plain
+A running Codex agent is one native pane process or one plain
 `codex exec`. It belongs to the nearest ancestor that is a named Claude session.
 """
 from __future__ import annotations
@@ -29,7 +29,6 @@ from pathlib import Path
 from typing import Final, Literal, cast
 from zoneinfo import ZoneInfo
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from scripts.production import broadcast
 from scripts.message import process_table
@@ -413,7 +412,6 @@ def announce_quiet(running: int | QuietCountObservation) -> None:
                 _ = notice.write_text("sent\n", encoding="utf-8")
                 return
         machine = socket.gethostname()
-        sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "notify"))
         from scripts.notify.push_texts import render, user_send_argv
         from scripts.notify import review
 

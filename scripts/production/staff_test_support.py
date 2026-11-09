@@ -6,24 +6,31 @@ import io
 import json
 import os
 import pwd
+import runpy
 import shlex
 import shutil
+import signal
 import socket
 import subprocess
+from subprocess import Popen as start_staff_owner
 from subprocess import run as run_fixture_git
 import sys
 import tempfile
+import time
+import traceback
 import unittest
 from collections.abc import Generator
 from contextlib import AbstractContextManager, ExitStack, contextmanager, redirect_stderr, redirect_stdout
 from io import IOBase
 from datetime import UTC, datetime
 from dataclasses import dataclass, replace
+from functools import cached_property
 from pathlib import Path
-from typing import Literal, cast, override
+from typing import Literal, TextIO, TypedDict, cast, override
 from unittest import mock
 from uuid import NAMESPACE_URL, uuid5
 
+from scripts.lib import process_group
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.socket_test_support import short_socket_directory
 from scripts.production import staff
@@ -209,7 +216,7 @@ def dispatch(published):
     assert staff.by_id(row.id) == published.row
     return admission.SwitchState.ASSIGNMENT_ACCEPTED
 with patch.object(stop_resume, "stop", return_value=stop_resume.Stopped(row.current_session, 987654)):
-    admission.switch_worker(allowed, "codex", start=start, dispatch=dispatch, cleanup=lambda identity: None)
+    admission.switch_worker(allowed, "codex", start=start, dispatch=dispatch, cleanup=lambda identity: admission.NoDestinationToStop())
 '''
 
 
@@ -468,7 +475,9 @@ def source_environment(source: Path) -> dict[str, str]:
 
 
 OWNER_CLI = """import os, runpy, sys
-sys.path.insert(0, os.environ['STAFF_TEST_CHECKOUT'])
+from pathlib import Path
+with open(Path(os.environ['STAFF_TEST_CHECKOUT']) / "scripts/lib/package_root.py") as package_root:
+    exec(package_root.read(), {"__file__": package_root.name})
 from scripts.production.staff_test_support import STAFF_SCRIPT, isolated_source_readers, observe_operation_lock
 observe_operation_lock()
 # Import platform-dependent Python support before selecting fake Mac transport.
@@ -549,9 +558,10 @@ def isolated_source_readers() -> Generator[None]:
 # canned response, so remote reads, writes, and error mapping must all agree.
 FAKE_SSH = """import json, os, runpy, shlex, sys
 from pathlib import Path
-sys.path.insert(0, os.environ['STAFF_TEST_CHECKOUT'])
+with open(Path(os.environ['STAFF_TEST_CHECKOUT']) / "scripts/lib/package_root.py") as package_root:
+    exec(package_root.read(), {"__file__": package_root.name})
+from scripts.lib import process_group
 from scripts.lib.atomic_file import write_text_atomic
-from scripts.production.staff_test_support import source_environment
 arguments = sys.argv[1:]
 log = Path(os.environ['STAFF_TEST_SSH_LOG'])
 previous = log.read_text() if log.exists() else ''
@@ -572,11 +582,23 @@ if command[:2] != ['~/.claude/scripts/lib/py', '~/.claude/scripts/production/sta
     raise SystemExit('unexpected remote Python or staff script')
 if '--json' not in command[2:]:
     raise SystemExit('remote staff call requires --json')
+if os.environ.get('STAFF_TEST_OWNER_PORT') and not os.environ.get('STAFF_TEST_LOCK_NOTICE'):
+    import socket
+    request = dict(arguments=[os.environ['STAFF_TEST_SCRIPT'], *command[2:]], environment=dict(os.environ),
+                   directory=os.getcwd(), stdin=sys.stdin.read())
+    with socket.create_connection(('127.0.0.1', int(os.environ['STAFF_TEST_OWNER_PORT']))) as connection:
+        with connection.makefile('rwb') as channel:
+            channel.write(json.dumps(request).encode() + b'\\n')
+            channel.flush()
+            result = json.loads(channel.readline())
+    sys.stdout.write(result['stdout'])
+    sys.stderr.write(result['stderr'])
+    raise SystemExit(result['status'])
+from scripts.production.staff_test_support import source_environment
 os.environ['STAFF_FILE'] = os.environ['STAFF_TEST_OWNER_FILE']
 source = Path(os.environ['STAFF_TEST_OWNER_SOURCE'])
 os.environ.update(source_environment(source))
 sys.platform = 'linux'
-sys.path.insert(0, os.environ['STAFF_TEST_CHECKOUT'])
 sys.argv = [os.environ['STAFF_TEST_SCRIPT'], *command[2:]]
 from scripts.production.staff_test_support import isolated_source_readers, observe_operation_lock
 from scripts.production import staff_sources
@@ -598,11 +620,130 @@ class RowProductionFixture:
     name: str
 
 
+class StaffOwnerRequest(TypedDict):
+    arguments: list[str]
+    environment: dict[str, str]
+    directory: str
+    stdin: str
+
+
+def run_staff_owner_request(connection: socket.socket, request: StaffOwnerRequest) -> None:
+    """Run one CLI request in its own child of the warm owner."""
+    environment = request["environment"]
+    environment["STAFF_FILE"] = environment["STAFF_TEST_OWNER_FILE"]
+    environment.update(source_environment(Path(environment["STAFF_TEST_OWNER_SOURCE"])))
+    os.environ.clear()
+    os.environ.update(environment)
+    tempfile.tempdir = None
+    os.chdir(request["directory"])
+    sys.argv = request["arguments"]
+    sys.stdin = io.StringIO(request["stdin"])
+    sys.platform = "linux"
+    output, errors = io.StringIO(), io.StringIO()
+    status = 0
+    with redirect_stdout(output), redirect_stderr(errors), isolated_source_readers():
+        observe_operation_lock()
+        try:
+            _ = runpy.run_path(sys.argv[0], run_name="__main__")
+        except SystemExit as result:
+            status = result.code if isinstance(result.code, int) else 0 if result.code is None else 1
+            if isinstance(result.code, str):
+                print(result.code, file=sys.stderr)
+        except BaseException:
+            traceback.print_exc()
+            status = 1
+    with connection.makefile("wb") as channel:
+        _ = channel.write(json.dumps(dict(status=status, stdout=output.getvalue(), stderr=errors.getvalue())).encode() + b"\n")
+        channel.flush()
+
+
+STAFF_OWNER_SERVER = r'''
+import json
+import os
+import socket
+import sys
+from pathlib import Path
+
+with open(Path(os.environ['STAFF_TEST_CHECKOUT']) / "scripts/lib/package_root.py") as package_root:
+    exec(package_root.read(), {"__file__": package_root.name})
+children = []
+with socket.socket() as listener:
+    listener.bind(('127.0.0.1', 0))
+    listener.listen()
+    print(listener.getsockname()[1], flush=True)
+    while True:
+        with listener.accept()[0] as connection:
+            with connection.makefile('rb') as channel:
+                request = json.loads(channel.readline())
+            if request is None:
+                break
+            from scripts.production.staff_test_support import run_staff_owner_request
+            from scripts.production import staff_sources
+            pid = os.fork()
+            if pid == 0:
+                listener.close()
+                try:
+                    run_staff_owner_request(connection, request)
+                finally:
+                    connection.close()
+                    os._exit(0)
+            children.append(pid)
+for pid in children:
+    os.waitpid(pid, 0)
+'''
+
+
+class SharedStaffOwner:
+    """Own one lazy import cache and all request children for a test."""
+
+    def __init__(self, root: Path) -> None:
+        self.root: Path = root
+        self.lifetime: ExitStack = ExitStack()
+
+    @cached_property
+    def port(self) -> str:
+        script = self.root / "fake-staff-owner.py"
+        write_text_atomic(script, STAFF_OWNER_SERVER)
+        errors = self.lifetime.enter_context((self.root / "fake-staff-owner.log").open("w"))
+        process = self.lifetime.enter_context(start_staff_owner(
+            [sys.executable, str(script)], cwd=self.root,
+            env={**os.environ, "TMPDIR": str(self.root)},
+            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=errors, text=True,
+            start_new_session=True,
+        ))
+        port = cast(TextIO, process.stdout).readline().strip()
+
+        def stop() -> None:
+            deadline = time.monotonic() + TEST_HANG_GUARD_SECS
+            try:
+                with socket.create_connection(("127.0.0.1", int(port)), timeout=TEST_HANG_GUARD_SECS) as connection:
+                    connection.sendall(b"null\n")
+                _ = process.wait(timeout=max(0, deadline - time.monotonic()))
+            except (OSError, subprocess.TimeoutExpired):
+                try:
+                    process_group.send_process_group(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                _ = process.wait()
+
+        _ = self.lifetime.callback(stop)
+        return port
+
+    def close(self) -> None:
+        self.lifetime.close()
+
+
 class StaffTestCase(unittest.TestCase):
     root: Path = Path()
     staff_file: Path = Path()
     mac_file: Path = Path()
     ssh_log: Path = Path()
+
+    @cached_property
+    def shared_owner(self) -> SharedStaffOwner:
+        owner = SharedStaffOwner(self.root)
+        self.addCleanup(owner.close)
+        return owner
 
     def staff_state(self) -> tuple[bytes, int]:
         return self.staff_file.read_bytes(), self.staff_file.stat().st_mtime_ns
@@ -633,7 +774,7 @@ class StaffTestCase(unittest.TestCase):
             "STAFF_TEST_OWNER_FILE": str(self.staff_file),
             "STAFF_TEST_CHECKOUT": str(CHECKOUT),
             "STAFF_TEST_SCRIPT": str(STAFF_SCRIPT),
-            "STAFF_TEST_SSH_FAIL": "",
+            "STAFF_TEST_SSH_FAIL": "", "STAFF_TEST_OWNER_PORT": "",
             "STAFF_TEST_SSH_EXIT": "255",
             "STAFF_TEST_SSH_REASON": "ssh: connection refused",
             "STAFF_TEST_PLATFORM": "linux",
@@ -661,6 +802,8 @@ class StaffTestCase(unittest.TestCase):
             "STAFF_TEST_PLATFORM": "linux" if machine == "natedev" else "darwin",
             "HERDR_SESSION": "agents",
         })
+        if machine == "mac":
+            environment["STAFF_TEST_OWNER_PORT"] = self.shared_owner.port
         with ExitStack() as contexts:
             _ = contexts.enter_context(isolated_staff_file(
                 self.staff_file if machine == "natedev" else self.mac_file, environment,
@@ -882,17 +1025,21 @@ class StaffTestCase(unittest.TestCase):
         })
         return path
 
-    def worker_run(self, production_name: str, unit: str, director: str) -> Path:
-        """A unit run with actual state, roster, server and director records."""
+    def worker_run(self, production_name: str, unit: str, director: str, *,
+                   passes: tuple[dict[str, object], ...] = (), director_run: bool = False) -> Path:
+        """Create private run evidence for a director and its worker passes."""
         run = Path(os.environ["ROSTER_RUN_ROOT"]) / f"{production_name}-{unit}"
         run.mkdir(parents=True, exist_ok=True)
         self.write_json(run / "progress_history_state.json", {
             "production": production_name, "unit": unit,
             "main_agent": {"family": "claude", "session_id": director},
+            "pass": {str(passed["worker_name"]): passed for passed in passes},
         })
         write_text_atomic(run / "director", director + "\n")
-        self.write_json(run / "mesh_roster.json", {})
-        self.write_json(run / "mesh_server.json", {"pid": os.getpid(), "port": 12345, "codex_home": str(self.root / "codex")})
+        if director_run:
+            from scripts.lib import unit_runs
+
+            write_text_atomic(unit_runs.marker(director), str(run) + "\n")
         return run
 
     @contextmanager

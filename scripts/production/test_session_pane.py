@@ -8,7 +8,6 @@ import math
 import os
 import socket
 import subprocess
-import sys
 import tempfile
 import time
 import unittest
@@ -19,8 +18,6 @@ from scripts.lib.script_envelope import script_prompt
 from typing import cast, override
 from unittest import mock
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "herdr"))
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "message"))
 
 from scripts.lib.socket_test_support import short_socket_directory
 from scripts.production import session_pane
@@ -304,7 +301,7 @@ class SessionPaneTests(unittest.TestCase):
 
         def native(pid: int, kind: str) -> herdr.NativeAgentProcess:
             self.assertEqual((pid, kind), (998042, "claude"))
-            return herdr.NativeAgentProcess(herdr.RolloutThread(replacement), "replacement-generation", {})
+            return herdr.NativeAgentProcess(herdr.EnvironmentThread(replacement), "replacement-generation", {})
 
         with (mock.patch.object(session_pane, "Herdr", return_value=client),
               mock.patch.object(client, "run", side_effect=transport),
@@ -346,7 +343,7 @@ class SessionPaneTests(unittest.TestCase):
 
         def native(pid: int, kind: str) -> herdr.NativeAgentProcess:
             self.assertEqual((pid, kind), (998042, "claude"))
-            return herdr.NativeAgentProcess(herdr.RolloutThread(observed), "private-generation", {})
+            return herdr.NativeAgentProcess(herdr.EnvironmentThread(observed), "private-generation", {})
 
         def send(verb: str, target: str) -> None:
             if verb == "type":

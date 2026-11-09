@@ -1,4 +1,4 @@
-"""Astra role records from local mesh and process fixtures, without a live Codex."""
+"""Astra role records from durable roles and process fixtures, without a live Codex."""
 from __future__ import annotations
 
 import json
@@ -10,12 +10,10 @@ import sys
 import tempfile
 import unittest
 from dataclasses import replace
-from datetime import datetime, timedelta
 from pathlib import Path
 from typing import cast, override
 from unittest import mock
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.production import staff
 from scripts.production.staff_test_support import StaffTestCase, fixture_member, fixture_worker, fixture_runtime_id
 from scripts.astra import astra_roles  # noqa: E402
@@ -32,7 +30,7 @@ class AstraRolesTests(StaffTestCase):
     parent: staff.StaffRow  # pyright: ignore[reportUninitializedInstanceVariable]
     root: Path = Path()
     state: Path = Path()
-    mesh_run: Path = Path()
+    run_folder: Path = Path()
     home: Path = Path()
     environment: dict[str, str] = {}
 
@@ -40,8 +38,8 @@ class AstraRolesTests(StaffTestCase):
     def setUp(self) -> None:
         super().setUp()
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
-        self.state, self.mesh_run, self.home = (self.root / name for name in ("roles", "mesh", "codex-home"))
-        self.mesh_run.mkdir()
+        self.state, self.run_folder, self.home = (self.root / name for name in ("roles", "run", "codex-home"))
+        self.run_folder.mkdir()
         self.home.mkdir()
         self.environment = {**os.environ, "ASTRA_ROLES_STATE": str(self.state), "HOME": str(self.root), "CODEX_HOME": str(self.home),
                             "DESIGN_ROLES_STATE": str(self.root / "design-roles"),
@@ -55,31 +53,23 @@ class AstraRolesTests(StaffTestCase):
                             "0e3914a9-be3f-5be4-bbeb-c3f72d8e0ec8", "2ebb1f2e-e51d-5245-8cbd-8202f40c042e",
                             "4f832112-25a1-5946-bf2c-52640f8daba4")):
             _ = fixture_worker(("project-astra-designer", "lasting-astra-designer", "worker-a-astra-reviewer", "worker-b-astra-reviewer", "worker-c-astra-reviewer")[number], self.parent.id, runtime_id=label, backend=staff.CodexBackend(self.home))
-        self.roster("running")
-        _ = (self.mesh_run / "mesh_server.json").write_text(json.dumps({"codex_home": str(self.home)}))
 
-    def roster(self, status: str, thread: str = "5048811c-26db-50f1-bf82-b3c52202e7ff", *, launcher_pid: int = 0) -> None:
-        row = staff.local_snapshot().by_current_session(thread)
-        assert row is not None
-        _ = (self.mesh_run / "mesh_roster.json").write_text(json.dumps({
-            "project-astra-designer": {"staff_id": row.id,
-                               "status": status, "launcher_pid": launcher_pid},
-        }))
 
     def command(self, *arguments: str) -> subprocess.CompletedProcess[str]:
         return subprocess.run([sys.executable, str(SCRIPT), *arguments], env=self.environment,
                               capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
 
-    def hold_mesh(self, *arguments: str) -> subprocess.CompletedProcess[str]:
-        return self.command("hold", "designer", "--session-dir", str(self.mesh_run),
-                            "--worker", "project-astra-designer", *arguments)
+
+    def hold_process(self) -> subprocess.CompletedProcess[str]:
+        return self.command("hold", "designer", "--staff-id", "5048811c-26db-50f1-bf82-b3c52202e7ff",
+                            "--pid", str(os.getpid()))
 
     def records(self) -> list[dict[str, object]]:
         shown = self.command("list", "--json")
         self.assertEqual(shown.returncode, 0, shown.stderr)
         return cast(list[dict[str, object]], json.loads(shown.stdout))
 
-    def test_durable_lifetime_round_trip_survives_failed_mesh_and_ends_only_with_its_instance(self) -> None:
+    def test_durable_lifetime_round_trip_survives_closed_pane_and_ends_only_with_its_instance(self) -> None:
         design_id = "00000000-0000-4000-8000-000000000066"
         design = design_roles.HeldDesign(design_roles.DesignPlacement(design_id, "fixture-host", 2), "fixture-repo",
             str(self.root), str(self.root / "design.md"), "design", "2026-10-21T12:00:00+00:00",
@@ -88,10 +78,6 @@ class AstraRolesTests(StaffTestCase):
              design_roles.RoleInstance("reviewer", "unused-reviewer", design_roles.RoleNotOpened())))
         with mock.patch.dict(os.environ, self.environment):
             design_roles._save(design)  # pyright: ignore[reportPrivateUsage]
-            mesh = design_roles.mesh_directory(design_id)
-            mesh.mkdir(parents=True)
-            _ = (mesh / "mesh_roster.json").write_text(json.dumps({"lasting-astra-designer": {
-                "staff_id": "99340615-2159-5777-b1c8-71572890df55", "status": "failed"}}))
             held = astra_roles.hold("designer", astra_roles.HeldDesignRole(design_id, "designer"),
                                     "99340615-2159-5777-b1c8-71572890df55")
             assert not isinstance(held, astra_roles.HoldWorkerUnavailable)
@@ -118,7 +104,7 @@ class AstraRolesTests(StaffTestCase):
                 "00000000-0000-4000-8000-000000000067", "reviewer"), "0e3914a9-be3f-5be4-bbeb-c3f72d8e0ec8")
             path = self.state / "0e3914a9-be3f-5be4-bbeb-c3f72d8e0ec8.json"
             valid = cast(dict[str, object], json.loads(path.read_text()))
-            for changes in ({"pid": os.getpid()}, {"session_dir": str(self.mesh_run), "worker": "project-astra-designer"},
+            for changes in ({"pid": os.getpid()}, {"session_dir": str(self.run_folder), "worker": "project-astra-designer"},
                             {"role_id": "designer"}, {"design_id": ""}, {"extra": "unknown"}):
                 with self.subTest(changes=changes), contextlib.redirect_stderr(io.StringIO()) as errors:
                     _ = path.write_text(json.dumps({**valid, **changes}))
@@ -127,28 +113,7 @@ class AstraRolesTests(StaffTestCase):
                     self.assertIn(str(path), errors.getvalue())
                     self.assertTrue(path.exists())
 
-    def test_mesh_hold_reads_the_thread_and_account_and_defaults_to_the_calling_manager(self) -> None:
-        self.environment["CLAUDE_CODE_SESSION_ID"] = "7dae38b9-c962-5494-a4ac-57639298e4d1"
-        held = self.hold_mesh()
-        self.assertEqual(held.returncode, 0, held.stderr)
-        path = self.state / "5048811c-26db-50f1-bf82-b3c52202e7ff.json"
-        record = cast(dict[str, object], json.loads(path.read_text()))
-        self.assertEqual({key: value for key, value in record.items() if key != "held_at"}, {
-            "staff_id": "5048811c-26db-50f1-bf82-b3c52202e7ff", "session_dir": str(self.mesh_run), "worker": "project-astra-designer", "pid": None,
-        })
-        self.assertEqual(datetime.fromisoformat(str(record["held_at"])).utcoffset(), timedelta(0))
-        self.assertEqual([entry.name for entry in self.state.iterdir()], [path.name])
 
-    def test_a_missing_worker_or_thread_is_refused_without_a_record(self) -> None:
-        for roster in ({}, {"project-astra-designer": {"status": "running"}},
-                       {"project-astra-designer": {"thread_id": "", "status": "running"}}):
-            with self.subTest(roster=roster):
-                _ = (self.mesh_run / "mesh_roster.json").write_text(json.dumps(roster))
-                result = self.hold_mesh()
-                self.assertEqual(result.returncode, 2, result.stderr)
-                self.assertEqual(len(result.stderr.strip().splitlines()), 1)
-                self.assertIn("project-astra-designer", result.stderr)
-                self.assertFalse(list(self.state.glob("*.json")))
     def test_durable_hold_without_a_worker_returns_the_unavailable_reason(self) -> None:
         identity = fixture_runtime_id("absent-held-worker")
         with mock.patch.dict(os.environ, self.environment), contextlib.redirect_stderr(io.StringIO()) as errors:
@@ -160,26 +125,10 @@ class AstraRolesTests(StaffTestCase):
         self.assertIn(held.reason, errors.getvalue())
         self.assertEqual(list(self.state.glob("*.json")), [])
 
-    def test_live_mesh_state_tracks_busy_and_idle_statuses(self) -> None:
-        self.assertEqual(self.hold_mesh().returncode, 0)
-        for status, state in (("running", "busy"), ("waiting_capacity", "busy"), ("idle", "idle"), ("done", "idle")):
-            with self.subTest(status=status):
-                self.roster(status, launcher_pid=os.getpid() if state == "busy" else 0)
-                records = self.records()
-                self.assertEqual(len(records), 1)
-                self.assertEqual((records[0]["staff_id"], records[0]["state"]), ("5048811c-26db-50f1-bf82-b3c52202e7ff", state))
 
-    def test_ended_and_failed_workers_remove_their_records(self) -> None:
-        for status in ("ended", "failed"):
-            with self.subTest(status=status):
-                self.roster("running")
-                self.assertEqual(self.hold_mesh().returncode, 0)
-                self.roster(status)
-                self.assertEqual(self.records(), [])
-                self.assertFalse((self.state / "5048811c-26db-50f1-bf82-b3c52202e7ff.json").exists())
 
     def test_malformed_records_are_reported_once_and_keep_valid_roles(self) -> None:
-        self.assertEqual(self.hold_mesh().returncode, 0)
+        self.assertEqual(self.hold_process().returncode, 0)
         valid = cast(dict[str, object], json.loads((self.state / "5048811c-26db-50f1-bf82-b3c52202e7ff.json").read_text()))
         malformed: list[dict[str, object]] = []
         for key in valid:
@@ -206,61 +155,19 @@ class AstraRolesTests(StaffTestCase):
             self.assertEqual(sum(str(path) in line for line in lines), 1)
             self.assertTrue(path.exists())
 
-    def test_live_roles_name_the_mesh_worker_and_exec_process_lifetimes(self) -> None:
-        self.assertEqual(self.hold_mesh().returncode, 0)
+    def test_live_roles_keep_each_exec_process_lifetime(self) -> None:
+        self.assertEqual(self.hold_process().returncode, 0)
         self.assertEqual(self.command("hold", "reviewer", "--staff-id", "2ebb1f2e-e51d-5245-8cbd-8202f40c042e", "--pid", str(os.getpid())).returncode, 0)
         with mock.patch.dict(os.environ, self.environment):
             roles = astra_roles.live_roles(staff.snapshot())
         self.assertCountEqual([role["lifetime"] for role in roles], [
-            astra_roles.MeshWorker(str(self.mesh_run), "project-astra-designer"), astra_roles.ExecProcess(os.getpid()),
+            astra_roles.ExecProcess(os.getpid()), astra_roles.ExecProcess(os.getpid()),
         ])
         for role in roles:
             self.assertTrue({"session_dir", "worker", "pid"}.isdisjoint(role))
 
-    def test_a_missing_run_or_worker_removes_the_hold_silently(self) -> None:
-        for missing in ("run", "worker"):
-            with self.subTest(missing=missing):
-                self.mesh_run.mkdir(exist_ok=True)
-                self.roster("running")
-                _ = (self.mesh_run / "mesh_server.json").write_text(json.dumps({"codex_home": str(self.home)}))
-                self.assertEqual(self.hold_mesh().returncode, 0)
-                if missing == "run":
-                    for path in self.mesh_run.iterdir():
-                        path.unlink()
-                    self.mesh_run.rmdir()
-                else:
-                    _ = (self.mesh_run / "mesh_roster.json").write_text("{}")
-                shown = self.command("list", "--json")
-                self.assertEqual(shown.returncode, 0, shown.stderr)
-                self.assertEqual(shown.stderr, "")
-                self.assertEqual(cast(object, json.loads(shown.stdout)), [])
-                self.assertFalse((self.state / "5048811c-26db-50f1-bf82-b3c52202e7ff.json").exists())
 
-    def test_an_unreadable_roster_keeps_the_hold_and_reports_its_file(self) -> None:
-        self.assertEqual(self.hold_mesh().returncode, 0)
-        for text in ("{not json", "[]"):
-            with self.subTest(text=text):
-                _ = (self.mesh_run / "mesh_roster.json").write_text(text)
-                shown = self.command("list", "--json")
-                self.assertEqual(shown.returncode, 0, shown.stderr)
-                self.assertEqual(cast(object, json.loads(shown.stdout)), [])
-                self.assertEqual(len(shown.stderr.splitlines()), 1)
-                self.assertIn("5048811c-26db-50f1-bf82-b3c52202e7ff.json", shown.stderr)
-                self.assertTrue((self.state / "5048811c-26db-50f1-bf82-b3c52202e7ff.json").exists())
-        roster = self.mesh_run / "mesh_roster.json"
-        roster.unlink()
-        roster.mkdir()
-        shown = self.command("list", "--json")
-        self.assertEqual(shown.returncode, 0, shown.stderr)
-        self.assertEqual(cast(object, json.loads(shown.stdout)), [])
-        self.assertEqual(len(shown.stderr.splitlines()), 1)
-        self.assertIn("5048811c-26db-50f1-bf82-b3c52202e7ff.json", shown.stderr)
-        self.assertTrue((self.state / "5048811c-26db-50f1-bf82-b3c52202e7ff.json").exists())
 
-    def test_a_starting_mesh_worker_is_busy(self) -> None:
-        self.assertEqual(self.hold_mesh().returncode, 0)
-        self.roster("starting", launcher_pid=os.getpid())
-        self.assertEqual(self.records()[0]["state"], "busy")
 
     def test_a_process_role_is_busy_until_its_pid_exits_then_its_record_is_removed(self) -> None:
         process = subprocess.Popen([sys.executable, "-c", "import sys; sys.stdin.read()"], stdin=subprocess.PIPE)
@@ -297,7 +204,7 @@ class AstraRolesTests(StaffTestCase):
         self.assertEqual(roles, [])
 
     def test_release_removes_a_record_and_is_safe_to_repeat(self) -> None:
-        self.assertEqual(self.hold_mesh().returncode, 0)
+        self.assertEqual(self.hold_process().returncode, 0)
         for _attempt in range(2):
             result = self.command("release", "5048811c-26db-50f1-bf82-b3c52202e7ff")
             self.assertEqual(result.returncode, 0, result.stderr)

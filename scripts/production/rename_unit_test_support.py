@@ -25,11 +25,11 @@ from scripts.production.staff_test_support import fixture_member, fixture_runtim
 from scripts.production import staff, unit_config, fake_unit_host
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
-from scripts.production import rename
+from scripts.shutdown import shutdown
 from scripts.shutdown import pane_record
 from scripts.style import style_ledger
 
-SCRIPT = Path(__file__).with_name("rename.py")
+SCRIPT = Path(__file__).resolve().parents[1] / "shutdown/shutdown.py"
 SLUG = "demo"
 
 
@@ -194,9 +194,9 @@ class UnitRenameFixture(StaffTestCase):
         return result.stdout.strip()
 
 
-    def rename(self, action: str, old: str = "alpha", new: str = "gamma", *,
+    def rename(self, old: str = "alpha", new: str = "gamma", *,
                refuse: str = "") -> subprocess.CompletedProcess[str]:
-        arguments = [action, f"{SLUG}/{old}", new]
+        arguments = ["rename", f"{SLUG}/{old}", new]
         return self.invoke(arguments, refuse=refuse)
 
     def invoke(self, arguments: list[str], *, cwd: Path | None = None,
@@ -218,7 +218,7 @@ class UnitRenameFixture(StaffTestCase):
         # These values are normally bound at interpreter startup. Rebind them for
         # each invocation, including tests that change the shutdown stand-in.
         with mock.patch.object(subprocess, "run", run):
-            return invoke_cli(rename, lambda: rename.main(arguments), arguments,
+            return invoke_cli(shutdown, lambda: shutdown.main(arguments), arguments,
                               self.env, cwd or self.checkout, production_state=True)
 
     def assert_ok(self, result: subprocess.CompletedProcess[str]) -> None:
@@ -338,9 +338,9 @@ class FolderRenameFixture(StaffTestCase):
         return result.stdout.strip()
 
     def command(self, *, new: str = "") -> subprocess.CompletedProcess[str]:
-        from scripts.production import rename as folder_rename
+        from scripts.shutdown import shutdown as folder_rename
 
-        arguments = ["apply", f"folder-production/{self.old_name}", new or self.new_name]
+        arguments = ["rename", f"folder-production/{self.old_name}", new or self.new_name]
         return invoke_cli(folder_rename, lambda: folder_rename.main(arguments), arguments,
                           dict(os.environ), self.checkout)
 
@@ -356,14 +356,6 @@ class FolderRenameFixture(StaffTestCase):
             "CLAUDE_CONFIG_DIR": str(self.home / ".claude"), "CLAUDE_CODE_SESSION_ID": self.owner.current_session}
         fake_unit_host.process(os.environ, pid, 998040 if live else 1, arguments if live else [],
                                environment, cwd=folder.path)
-        descriptor = self.root / "proc" / str(pid) / "fd/4"
-        descriptor.parent.mkdir(exist_ok=True)
-        descriptor.unlink(missing_ok=True)
-        if live and kind == "codex":
-            record = self.root / "rollout-folder-current.jsonl"
-            _ = record.write_text(json.dumps({"type": "session_meta", "payload": {
-                "id": self.owner.current_session}}) + "\n")
-            descriptor.symlink_to(record)
 
     def transcript(self, kind: Literal["claude", "codex"]) -> None:
         for directory in (self.home / ".claude", self.home / ".codex"):

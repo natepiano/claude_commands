@@ -3,8 +3,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
-import base64
-import gzip
 import hashlib
 import hmac
 import json
@@ -16,12 +14,14 @@ if TYPE_CHECKING:
     from scripts.production.merge_gate import GateRun
 
 from scripts.lib import conf
+from scripts.test_times import gate_record
 
 
 @dataclass(frozen=True, repr=False)
 class SigningKey:
     access: str
     secret: str
+    token: str = ''
 
 
 def presign(method: str, host: str, key: str, region: str, credentials: SigningKey,
@@ -32,6 +32,8 @@ def presign(method: str, host: str, key: str, region: str, credentials: SigningK
     parameters = {'X-Amz-Algorithm': 'AWS4-HMAC-SHA256',
                   'X-Amz-Credential': f'{credentials.access}/{scope}',
                   'X-Amz-Date': stamp, 'X-Amz-Expires': str(expires), 'X-Amz-SignedHeaders': 'host'}
+    if credentials.token:
+        parameters['X-Amz-Security-Token'] = credentials.token
     query = '&'.join(f'{quote(k, safe="")}={quote(v, safe="")}' for k, v in sorted(parameters.items()))
     path = '/' + quote(key, safe='/~')
     canonical = f'{method}\n{path}\n{query}\nhost:{host}\n\nhost\nUNSIGNED-PAYLOAD'
@@ -44,36 +46,23 @@ def presign(method: str, host: str, key: str, region: str, credentials: SigningK
 
 
 # This program runs inside the instance's tool shell, not on natedev.
-GUEST = r'''import contextlib, json, os, pathlib, sqlite3, subprocess, sys, threading, time, traceback, urllib.request
-root = pathlib.Path('/var/lib/gate-trial')
+GUEST = r'''import contextlib, json, os, pathlib, sqlite3, subprocess, sys, threading, time, traceback
+root = pathlib.Path(os.environ.pop('GATE_BOX_DIR', '/var/lib/gate-trial'))
+os.environ.pop('box_dir', None)
 links = json.loads((root / 'links.json').read_text())
 if links.get('production'):
-    request = urllib.request.Request('http://169.254.169.254/latest/api/token', method='PUT',
-                                     headers={'X-aws-ec2-metadata-token-ttl-seconds': '60'})
-    with urllib.request.urlopen(request, timeout=5) as response:
-        token = response.read().decode()
-    request = urllib.request.Request('http://169.254.169.254/latest/meta-data/instance-id',
-                                     headers={'X-aws-ec2-metadata-token': token})
-    with urllib.request.urlopen(request, timeout=5) as response:
-        instance = response.read().decode()
-    links = {key: value.replace('__INSTANCE_ID__', instance) if isinstance(value, str) else value
-             for key, value in links.items()}
-    (root / 'instance-id').write_text(instance)
+    gate_request = json.loads((root / 'request.json').read_text())
 links['boot'] = 'warm' if (root / 'prepared').exists() else 'cold'
 result = {'nix_ready_at': time.time(), 'verdict': 'ready', 'tests': 0, 'skips': 0, 'failed_modules': [], 'memory_peak_bytes': None}
 log = root / 'gate.log'
+def stage(name):
+    with (root / 'boot.log').open('a') as output:
+        output.write(time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()) + ' stage=' + name + '\n')
 def get(url, destination):
-    if url.startswith('s3://'):
-        subprocess.run(['aws', 's3', 'cp', url, str(destination), '--only-show-errors'], check=True)
-    else:
-        with urllib.request.urlopen(url, timeout=60) as response:
-            destination.write_bytes(response.read())
+    subprocess.run(['curl', '--fail', '--silent', '--show-error', '--max-time', '60', url, '-o', str(destination)], check=True)
 def put(url, content):
-    if url.startswith('s3://'):
-        subprocess.run(['aws', 's3', 'cp', '-', url, '--only-show-errors'], input=content, check=True)
-        return
-    with urllib.request.urlopen(urllib.request.Request(url, data=content, method='PUT'), timeout=30) as response:
-        response.read()
+    subprocess.run(['curl', '--fail', '--silent', '--show-error', '--max-time', '30', '-X', 'PUT', '--data-binary', '@-', url],
+                   input=content, check=True)
 def publish(name):
     put(links[name], json.dumps(result).encode())
 def busy_cpu_seconds():
@@ -104,18 +93,24 @@ try:
         result['tools_ready_at'] = time.time()
         links['boot'] = 'warm' if (root / 'prepared').exists() else 'cold'
     else:
-        get(links['source'], root / 'source.bundle')
-        subprocess.run(['git', 'clone', str(root / 'source.bundle'), str(root / 'repo')], check=True)
         repo = root / 'repo'
+        if links.get('production'):
+            subprocess.run(['git', 'clone', gate_request['clone_url'], str(repo)], check=True)
+            if links.get('source'):
+                get(links['source'], root / 'source.bundle')
+                subprocess.run(['git', '-C', str(repo), 'fetch', str(root / 'source.bundle'), 'HEAD'], check=True)
+            subprocess.run(['git', '-C', str(repo), 'update-ref', 'refs/remotes/origin/main', gate_request['origin_main']], check=True)
+        else:
+            get(links['source'], root / 'source.bundle')
+            subprocess.run(['git', 'clone', str(root / 'source.bundle'), str(repo)], check=True)
         subprocess.run(['git', '-C', str(repo), 'checkout', '--detach', links['commit']], check=True)
         if links.get('production'):
             from subprocess import check_output
             tree = check_output(['git', '-C', str(repo), 'rev-parse', 'HEAD^{tree}'], text=True).strip()
             if tree != links['tree']:
                 raise ValueError('The source tree differs from the request')
-            subprocess.run(['git', '-C', str(repo), 'fetch', str(root / 'source.bundle'),
-                            '+refs/remotes/origin/*:refs/remotes/origin/*'], check=True)
             subprocess.run(['git', '-C', str(repo), 'remote', 'set-url', 'origin', links['origin']], check=True)
+        stage('source ready')
         home = pathlib.Path.home() / '.claude'
         home.mkdir(exist_ok=True)
         (home / 'config').symlink_to(repo / 'config', target_is_directory=True)
@@ -125,8 +120,8 @@ try:
         os.environ['HERDR_BIN'] = '/nonexistent/herdr'
         timings = {}
         if 'module_seconds' in links:
-            with urllib.request.urlopen(links['module_seconds'], timeout=60) as response:
-                timings = json.loads(response.read())
+            get(links['module_seconds'], root / 'module_seconds.json')
+            timings = json.loads((root / 'module_seconds.json').read_text())
         result['tools_ready_at'] = time.time()
         result['module_time_limit_s'] = links['module_time_limit_s']
         result['max_running_jobs'] = os.cpu_count() or 1
@@ -134,6 +129,7 @@ try:
         sample_memory()
         memory_thread = threading.Thread(target=monitor_memory, args=(memory_stop,), daemon=True)
         memory_thread.start()
+        stage('tests start')
         with log.open('w') as output, contextlib.redirect_stdout(output), contextlib.redirect_stderr(output):
             with merge_gate.rollback_signals():
                 cpu_started = busy_cpu_seconds()
@@ -141,7 +137,7 @@ try:
                 if links.get('production'):
                     gate = merge_gate.run_suites(repo, full=True, machine=merge_gate.WholeMachine(timings),
                                                 module_time_limit_s=links['module_time_limit_s'],
-                                                selected=merge_gate.SelectedModules(tuple(json.loads(links['modules']))),
+                                                selected=merge_gate.SelectedModules(tuple(gate_request['modules'])),
                                                 mode=merge_gate.SuiteMode(links['mode']))
                 else:
                     gate = merge_gate.run_suites(repo, full=True, machine=merge_gate.WholeMachine(timings),
@@ -207,13 +203,8 @@ finally:
 
 
 def log_upload(links: dict[str, str]) -> str:
-    if links.get('production'):
-        prefix, suffix = links['log'].split('__INSTANCE_ID__')
-        destination = shlex.quote(prefix) + '"$(cat /var/lib/gate-trial/instance-id)"' + shlex.quote(suffix)
-        transfer = f'aws s3 cp - {destination} --only-show-errors'
-    else:
-        transfer = f'curl --fail --silent --show-error --max-time 30 -X PUT --data-binary @- {shlex.quote(links["log"])}'
-    return f'''{{ cat /var/lib/gate-trial/boot.log /var/lib/gate-trial/gate.log /var/lib/gate-trial/timeline.log 2>/dev/null || :
+    transfer = f'curl --fail --silent --show-error --max-time 30 -X PUT --data-binary @- {shlex.quote(links["log"])}'
+    return f'''{{ cat "${{box_dir:-/var/lib/gate-trial}}/boot.log" "${{box_dir:-/var/lib/gate-trial}}/gate.log" "${{box_dir:-/var/lib/gate-trial}}/timeline.log" 2>/dev/null || :
     ps -eo etimes,pcpu,rss,args --sort=-etimes 2>/dev/null | awk '!/curl/ {{print substr($0,1,200); if (++n==60) exit}}' || :
     printf '\\n'
     date -u '+UTC: %Y-%m-%dT%H:%M:%SZ'
@@ -229,7 +220,7 @@ def log_push_loop(links: dict[str, str], interval_s: float) -> str:
         set -- $(cpu_ticks)
         busy=$(awk -v total="$(($1-previous_total))" -v idle="$(($2-previous_idle))" 'BEGIN {{printf "%.2f", (total>0 ? 100*(total-idle)/total : 0)}}')
         previous_total=$1 previous_idle=$2
-        printf '%s loadavg=%s %s processes=%s cpu_busy_percent=%s\\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$(cat /proc/loadavg)" "$(awk '/^MemAvailable:/' /proc/meminfo)" "$(ps -e --no-headers | wc -l)" "$busy" >> /var/lib/gate-trial/timeline.log || :
+        printf '%s loadavg=%s %s processes=%s cpu_busy_percent=%s\\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$(cat /proc/loadavg)" "$(awk '/^MemAvailable:/' /proc/meminfo)" "$(ps -e --no-headers | wc -l)" "$busy" >> "${{box_dir:-/var/lib/gate-trial}}/timeline.log" || :
         {log_upload(links)}
     done
 }}
@@ -240,18 +231,18 @@ log_push_pid=$!
 
 def boot_trap(links: dict[str, str]) -> str:
     """Publish a shell failure before the tool shell can publish a result."""
-    cold = links['result'] if links['step'] == 'size' else links['ready-cold']
-    warm = links['result'] if links['step'] == 'size' else links['ready-warm']
+    cold = links.get('boot_error', links['result']) if links['step'] == 'size' else links['ready-cold']
+    warm = links.get('boot_error', links['result']) if links['step'] == 'size' else links['ready-warm']
     return f'''boot_failed() {{
     status=$?
     trap - EXIT
     if [ -n "${{log_push_pid:-}}" ]; then kill "$log_push_pid" 2>/dev/null || :; fi
     if [ "$status" -ne 0 ]; then
         destination={shlex.quote(cold)}
-        if [ -e /var/lib/gate-trial/prepared ]; then destination={shlex.quote(warm)}; fi
+        if [ -e "${{box_dir:-/var/lib/gate-trial}}/prepared" ]; then destination={shlex.quote(warm)}; fi
         {log_upload(links)}
-        printf '{{"verdict":"error","error":"Tool preparation failed (exit %s)"}}' "$status" > /var/lib/gate-trial/boot-error.json
-        curl --fail --silent --show-error --max-time 30 -X PUT --data-binary @/var/lib/gate-trial/boot-error.json "$destination" || :
+        printf '{{"verdict":"error","error":"Tool preparation failed (exit %s)"}}' "$status" > "${{box_dir:-/var/lib/gate-trial}}/boot-error.json"
+        curl --fail --silent --show-error --max-time 30 -X PUT --data-binary @"${{box_dir:-/var/lib/gate-trial}}/boot-error.json" "$destination" || :
     fi
     exit "$status"
 }}
@@ -264,37 +255,46 @@ def user_data(links: dict[str, str], revision: str, lifetime_minutes: int, log_p
     """Run directly in amazon-init on each boot."""
     packages = conf.read_or_repository('cloud_gate').words('packages')
     tools = ' '.join(shlex.quote(f'github:NixOS/nixpkgs/{revision}#{name}') for name in packages)
-    session = (log_push_loop(links, log_push_s) if links.get('production') else '') + f'''ln -sf "$(command -v bash)" /bin/bash
+    def download(key: str, name: str) -> str:
+        url, destination = shlex.quote(links[key]), '"$box_dir/' + name + '"'
+        return f'curl --fail --silent --show-error --max-time 60 {url} -o {destination}\n'
+    downloads = download('guest', 'guest.py')
+    if 'request' in links:
+        downloads += download('request', 'request.json')
+    session = '''printf '%s stage=tools ready\\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+''' + downloads + f'''ln -sf "$(command -v bash)" /bin/bash
 ln -sf "$(command -v zsh)" /bin/zsh
-mkdir -p /run/gate-trial-bin
-cp -a /run/current-system/sw/bin/. /run/gate-trial-bin/
-ln -sf "$(command -v python3)" /run/gate-trial-bin/python3
-ln -sf "$(command -v chromium)" /run/gate-trial-bin/google-chrome
-mount --bind /run/gate-trial-bin /run/current-system/sw/bin
-chown -R gate-trial:users /var/lib/gate-trial
+mkdir -p "$box_dir/tool-profile"
+cp -a /run/current-system/sw/bin/. "$box_dir/tool-profile/"
+ln -sf "$(command -v python3)" "$box_dir/tool-profile/python3"
+ln -sf "$(command -v chromium)" "$box_dir/tool-profile/google-chrome"
+mount --bind "$box_dir/tool-profile" /run/current-system/sw/bin
+chown -R gate-trial:users "$box_dir"
 runuser -u gate-trial -- env HOME=/home/gate-trial XDG_RUNTIME_DIR=/run/user/$(id -u gate-trial) DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$(id -u gate-trial)/bus bash -c '
 tool_path=$PATH
 unset __NIXOS_SET_ENVIRONMENT_DONE __ETC_PROFILE_SOURCED
 . /etc/profile
 export PATH="$tool_path:$PATH"
-exec python3 /var/lib/gate-trial/guest.py'
+exec python3 "$box_dir/guest.py"'
 {('shutdown -h now' if links.get('production') else '')}
 '''
     deadline = (f'systemd-run --unit=cloud-gate-expiry --on-calendar=@{int(links["expires"])} /run/current-system/sw/bin/shutdown -h now'
                 if links.get('production') else f'shutdown -h +{lifetime_minutes}')
-    guest_script = f"printf '%s' {shlex.quote(base64.b64encode(gzip.compress(GUEST.encode(), mtime=0)).decode())} | base64 -d | gzip -d > /var/lib/gate-trial/guest.py"
     return f'''#!/bin/sh
 {deadline}
 set -eu
 umask 077
-mkdir -p /var/lib/gate-trial
-exec > /var/lib/gate-trial/boot.log 2>&1
-export PATH=/run/current-system/sw/bin:$PATH
-{'' if links.get('production') else log_push_loop(links, log_push_s)}{boot_trap(links)}cat > /var/lib/gate-trial/links.json <<'GATE_LINKS'
+box_dir=${{GATE_BOX_DIR:-/var/lib/gate-trial}}
+export box_dir GATE_BOX_DIR="$box_dir"
+mkdir -p "$box_dir"
+exec > "$box_dir/boot.log" 2>&1
+export PATH=$PATH:/run/current-system/sw/bin
+{boot_trap(links)}printf '%s stage=boot\\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+{log_upload(links)}
+{log_push_loop(links, log_push_s)}cat > "$box_dir/links.json" <<'GATE_LINKS'
 {json.dumps({**links, 'module_time_limit_s': module_time_limit_s})}
 GATE_LINKS
-{guest_script}
-touch /var/lib/gate-trial/timeline.log
+touch "$box_dir/timeline.log"
 id -u gate-trial >/dev/null 2>&1 || useradd -m -g users gate-trial
 loginctl enable-linger gate-trial
 export PYTHONUNBUFFERED=1
@@ -319,7 +319,6 @@ def decode_run(value: object) -> GateRun:
     """Validate the transferred result before computing its verdict."""
     from scripts.aws_target.ledger import mapping, rows, text
     from scripts.production.merge_gate import GateRun, GateJobResult, GateJobKind
-    from scripts.test_times import gate_record
     import math
     from typing import cast
 
@@ -353,20 +352,23 @@ def decode_run(value: object) -> GateRun:
                    row['selection_certified'] is True, tuple(job(item) for item in rows(row, 'executions')))
 
 
+def execution_records(value: GateRun) -> list[gate_record.Execution]:
+    """Keep every attempt's output for the gate record writer."""
+    return [gate_record.Execution(job.suite, job.module, job.seconds, job.cpu_seconds, job.peak_mib,
+                                  job.returncode, job.restart, job.times, job.output)
+            for job in value.executions or value.jobs]
+
+
 def completion_record(value: object, attempt: str, commit: str, tree: str, host: str,
                       started: float, ended: float, mode: str) -> dict[str, object]:
     """Return an explicit buildlog record with the remote host identity."""
     from datetime import UTC
     from scripts.buildlog import record
     from scripts.production.merge_gate import GateRun
-    from scripts.test_times import gate_record
     import os
     if not isinstance(value, GateRun):
         raise TypeError('expected a completed gate')
-    modules = gate_record.module_runs([
-        gate_record.Execution(job.suite, job.module, job.seconds, job.cpu_seconds, job.peak_mib,
-                              job.returncode, job.restart, job.times)
-        for job in value.executions or value.jobs], gate_record.slow_test_s())
+    modules = gate_record.module_runs(execution_records(value), gate_record.slow_test_s())
     suites = [{'suite': suite, 'wall_s': max((job.seconds for job in value.jobs if job.suite == suite), default=0),
                'status': int(any(job.returncode for job in value.jobs if job.suite == suite))}
               for suite in sorted({job.suite for job in value.jobs})]

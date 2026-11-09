@@ -158,7 +158,7 @@ test_inherited_editor_writes_without_catalog_sync() (
     MODELS_REGISTRY_EDIT_BASE="$("$SCRIPT_DIR/../lib/py" - "$SCRIPT_DIR/../.." <<'PYTHON'
 import os, sys
 from pathlib import Path
-sys.path.insert(0, sys.argv[1])
+with open(sys.argv[1] + "/scripts/lib/package_root.py") as package_root: exec(package_root.read(), {"__file__": package_root.name})
 from scripts.lib.models_registry import RegistryEditBase
 path = Path(os.environ["MODELS_CONFIG_FILE"])
 print(RegistryEditBase(path, path.read_text(), ()).environment({})["MODELS_REGISTRY_EDIT_BASE"])
@@ -801,7 +801,7 @@ write_test_registry "$TEST_DIR/tierset.conf" --replace-provided-sections \
     kept.codex/check=gpt-test:high \
     kept.claude/work=opus:max \
     kept.claude/check=opus:max \
-    'kept.options/codex_mesh=1    # another launch flag' \
+    'kept.options/other_flag=1    # another launch flag' \
     'kept.options/codex_service_tier=flex    # tuned' \
     bare.codex/work=gpt-test:high \
     bare.claude/work=opus:max \
@@ -836,7 +836,7 @@ assert_registry_matches "$expected" || fail "function tier changed rows other th
 sed '/^codex_service_tier=flex/d' "$before" > "$expected"
 agents_set_service_tier inherit kept
 assert_registry_matches "$expected" || fail "inherit removed more than the tier key"
-[[ "$(_models_registry_get kept.options codex_mesh)" == "1" ]] || fail "inherit dropped another launch flag"
+[[ "$(_models_registry_get kept.options other_flag)" == "1" ]] || fail "inherit dropped another launch flag"
 
 # A row key beats its function's key; inherit on the row falls back to it.
 write_fixture "$TEST_DIR/tierset.conf"

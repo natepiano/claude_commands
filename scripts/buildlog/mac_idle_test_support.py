@@ -7,16 +7,13 @@ import subprocess
 import sys
 import unittest
 from collections.abc import Callable, Generator, Sequence
-from typing import TYPE_CHECKING, ParamSpec, TypeVar, cast, override
+from typing import ParamSpec, TypeVar, cast, override
 from unittest import mock
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
-if TYPE_CHECKING:
-    from ..lint.memory_test_support import write_config_fixture
-else:
-    from scripts.lint.memory_test_support import write_config_fixture
+from scripts.lint.memory_test_support import write_config_fixture
 
 
 def write_idle_config(directory: Path, overrides: str = "") -> Path:
@@ -31,7 +28,7 @@ def write_idle_alert(directory: Path, now: float, *, written_age: float = 0) -> 
     directory.mkdir(parents=True, exist_ok=True)
     path = directory / "alert.json"
     _ = path.write_text(json.dumps({
-        "version": 1, "written": now - written_age, "state": "idle", "since": now - 600,
+        "version": 1, "written": now - written_age, "state": "idle", "since": now - 600, "changed": now - 600,
         "waiting": 7, "cause": "blocked", "holder": "research", "detail": "P15 F11 L0 run",
         "until": 0, "messaged": True, "pushed": False,
     }))
@@ -86,14 +83,9 @@ class NotificationGuardedTestCase(unittest.TestCase):
         _ = self.enterContext(mock.patch.object(subprocess, "Popen", side_effect=guarded_transport(subprocess.Popen)))
 
 
-if TYPE_CHECKING:
-    from ..message import send, sessions
-    from ..lib import process_start
-    from ..production import staff
-else:
-    from scripts.message import send, sessions
-    from scripts.lib import process_start
-    from scripts.production import staff
+from scripts.message import send, sessions
+from scripts.lib import process_start
+from scripts.production import staff
 
 
 def no_checkpoint() -> None:
@@ -146,13 +138,18 @@ def private_sender_acceptance(state: Path, *, before_accept: Callable[[], None] 
         after_accept()
         return 0, "accepted by private transport", ""
 
-    def discover(address: str, _scope: send.RecipientResolutionScope,
-                 _observed: object, **_kwargs: object) -> send.DeliveryRoute:
-        return send.CodexWorkerRecipient(address, "fixture", str(state / "seat"))
+    def discover(address: str, *arguments: object, **keywords: object) -> send.DeliveryRoute:
+        del arguments, keywords
+        return send.ClaudeRecipient(address)
+
+    def relay(message: send.Message, timeout: float) -> send.Result:
+        code, output, errors = send.run([message.to], "", timeout)
+        return send.Result("sent" if code == 0 else "failed", output or errors)
 
     with mock.patch.object(staff, "snapshot", return_value=staff.StaffSnapshot(())), \
          mock.patch.object(process_start, "process_start", side_effect=sender_process_start), \
          mock.patch.object(sessions, "running_sessions", return_value=[]), \
          mock.patch.object(send, "STATE", state), mock.patch.object(send, "wrong_template", return_value=None), mock.patch.object(send, "run", side_effect=transport), \
-         mock.patch.object(send, "resolve_recipient", side_effect=discover):
+         mock.patch.object(send, "resolve_recipient", side_effect=discover), \
+         mock.patch.object(send, "relay", side_effect=relay):
         yield fixture

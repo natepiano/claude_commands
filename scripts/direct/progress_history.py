@@ -30,14 +30,13 @@ from functools import cache
 from pathlib import Path
 from typing import Literal, NoReturn, TypedDict, cast
 
-if not __package__:
-    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.agents import worker_lifecycle  # noqa: E402
 from scripts.direct import findings, phase_reservation, plan_history, recorder_state  # noqa: E402
 from scripts.direct.recorder_state import OPEN_PHASES_KEY as OPEN_PHASES_KEY  # noqa: E402
 from scripts.direct.tag_inventory import contract_table_paths  # noqa: E402
-from scripts.lib import models_registry, unit_runs
+from scripts.lib import models_registry, unit_runs  # noqa: E402
 from scripts.lib.atomic_file import write_text_atomic  # noqa: E402
+from scripts.lib.intervals import merged_spans  # noqa: E402
 from scripts.lib.probe_session import PROBE_ENV  # noqa: E402
 from scripts.lib.user_zone import user_zone  # noqa: E402
 from scripts.production import session_staff, staff, unit_config  # noqa: E402
@@ -1960,6 +1959,19 @@ def begin_dispatch(session_dir: Path, *, slot: str, phase: str, role: staff.Work
             fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
 
 
+def complete_dispatch(session_dir: Path, slot: str, instance_id: str) -> None:
+    """Record completion in the slot that dispatch owns."""
+    with (session_dir / ".progress_history.lock").open("a+", encoding="utf-8") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        try:
+            state = _read_state(session_dir)
+            opened = _open_passes(state).get(slot)
+            if opened is not None and opened.get("instance_id") == instance_id:
+                _ = _close_slot_pass(session_dir, state, slot, "completed", plan_history.now_epoch())
+        finally:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+
+
 def mark_pass_refused(session_dir: Path, worker_name: str) -> None:
     """Mark the open pass without closing it or changing its dispatch id."""
     if not _state_path(session_dir).is_file():
@@ -2667,12 +2679,9 @@ def _work_seconds(
         # History with no windows says nothing about idleness, so the wall clock stands.
         return max(0, int(until - started_at))
     work, idle_from = 0.0, started_at
-    for start, end in sorted(windows):
-        if start > idle_from:
-            work += min(start - idle_from, IDLE_GRACE_SECONDS)
-        if end > idle_from:
-            work += end - max(start, idle_from)
-            idle_from = end
+    for start, end in merged_spans(windows):
+        work += min(start - idle_from, IDLE_GRACE_SECONDS) + end - start
+        idle_from = end
     if until > idle_from:
         work += min(until - idle_from, IDLE_GRACE_SECONDS)
     return int(work)
@@ -4422,15 +4431,11 @@ def _run_plan_path(state: dict[str, object]) -> Path | None:
 
 
 def _with_unlisted_phase(counts: dict[str, object], state: dict[str, object], counted: Path) -> dict[str, object]:
-    """The counts with the run's phase added when the plan has no heading for it.
-
-    Start-phase refuses such a phase, so this only covers a phase opened before that
-    rule. Without it a report reads "19 of 31 done" beside "Phase 32".
-    """
+    """Add a numbered run phase when the plan has no heading for it."""
     phase = _object_dict(state.get("phase"))
     phase_id = _string(phase.get("id")) if phase is not None else ""
     order = counts.get("order")
-    if (phase is None or phase_id in ("", "ad hoc") or not isinstance(order, list)
+    if (phase is None or re.fullmatch(plan_history.PHASE_ID, phase_id) is None or not isinstance(order, list)
             or _run_plan_path(state) != counted or _plan_lists_phase(counted, phase_id)):
         return counts
     finished = _string(phase.get("status")) == "completed"
@@ -4445,19 +4450,20 @@ def _with_unlisted_phase(counts: dict[str, object], state: dict[str, object], co
 
 
 def _plan_lists_phase(plan: Path, phase_id: str) -> bool:
-    """Whether a heading names `phase_id` by its number or, as a standing plan writes
-    `### Phase 201 — types-unit-201`, by the first word of its title."""
+    """Return whether a numbered heading names `phase_id`."""
     try:
         phases, _ = plan_history.plan_phase_details(plan)
     except OSError:
         return False
-    return any(phase_id in (phase["id"], *phase["title"].split()[:1]) for phase in phases)
+    return any(phase_id == phase["id"] for phase in phases)
 
 
 def _phase_missing_from_plan(state: dict[str, object], phase_id: str) -> Path | None:
-    """The run's plan when it lists phases and none of them is `phase_id`."""
+    """Return the run's plan when it lacks the requested numbered phase."""
+    if re.fullmatch(plan_history.PHASE_ID, phase_id) is None:
+        return None
     plan = _run_plan_path(state)
-    if plan is None or phase_id == "ad hoc":
+    if plan is None:
         return None
     listed = _count_plan_phases(plan).get("available") is not True or _plan_lists_phase(plan, phase_id)
     return None if listed else plan

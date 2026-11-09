@@ -131,7 +131,7 @@ sha=$(git -C $repo rev-parse --verify "$sha^{commit}") || exit 2
 # When the source already holds the commit, no bundle is needed.
 clone_task=gate:mac-run-${sha}-$$
 copies_script=$lib/../copies/copies.py
-copy_owner=$(python3 -c 'import sys; from pathlib import Path; sys.path.insert(0, str(Path(sys.argv[1]).resolve().parents[2])); from scripts.copies import copies; print(copies.source_owner(Path(sys.argv[2])))' $copies_script $repo) || exit 4
+copy_owner=$("$lib/py" -c 'import sys; from pathlib import Path; from scripts.copies import copies; print(copies.source_owner(Path(sys.argv[2])))' $copies_script $repo) || exit 4
 copy_owner_arg=${(q)copy_owner}
 copy_session=${owner:-pid-$$}
 copy_session_arg=${(q)copy_session}

@@ -16,8 +16,9 @@ import sys
 import tempfile
 import threading
 import time
+import traceback
 import unittest
-from collections.abc import Callable, Generator
+from collections.abc import Callable, Generator, Mapping
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
@@ -27,11 +28,12 @@ from unittest import mock
 from scripts.build_hold import build_hold
 from scripts.direct.recorder_fixture import invoke_recorder, record_wait_workers
 from scripts.production.staff_test_support import fixture_runtime_id
-from scripts.direct.verify_mac_offload_test_support import VerifyMacOffloadFixture, CallRecord, CARGO_STUB, wait_for_marker_exit
+from scripts.direct.verify_mac_offload_test_support import (
+    VerifyMacOffloadFixture, CallRecord, CARGO_STUB, hold_recorder_exits, wait_for_marker_exit,
+)
 from scripts.direct.local_release_wait import RELEASE_CHANGES, LocalReleaseEvents, local_release_waiter
 from scripts.lib import inotify
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
-from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.shell_test_support import shell_functions
 
 
@@ -68,9 +70,26 @@ class CallWithHoldWait(CallRecord):
 def read_cycle_file(path: Path) -> build_hold.HoldCycle:
     return cast(build_hold.HoldCycle, json.loads(path.read_text()))
 
+
+@contextmanager
+def local_hold_environment(environment: Mapping[str, str]) -> Generator[None, None, None]:
+    """Restore changed keys without clearing the admission reader's environment."""
+    previous_values = {name: os.environ[name] for name in environment if name in os.environ}
+    try:
+        os.environ.update(environment)
+        with hold_recorder_exits():
+            yield
+    finally:
+        for name in environment:
+            if name in previous_values:
+                os.environ[name] = previous_values[name]
+            else:
+                _ = os.environ.pop(name, None)
+
+
 def grant_call(path: Path) -> None:
     release = path.parent.parent
-    with mock.patch.dict(os.environ, {
+    with local_hold_environment({
         "BUILD_HOLD_DIR": str(release.parent / "build-hold"),
         "BUILD_HOLD_RELEASE_DIR": str(release),
         "UNIT_ACTIVE_DIR": str(release.parent / "active"),
@@ -83,7 +102,7 @@ def grant_call(path: Path) -> None:
 
 def change_cycle(path: Path, change: Callable[[build_hold.HoldCycle], None]) -> None:
     release = path.parent.parent
-    with mock.patch.dict(os.environ, {
+    with local_hold_environment({
         "BUILD_HOLD_DIR": str(release.parent / "build-hold"),
         "BUILD_HOLD_RELEASE_DIR": str(release),
         "UNIT_ACTIVE_DIR": str(release.parent / "active"),
@@ -157,6 +176,7 @@ class VerifyHoldTools(VerifyMacOffloadFixture):
     fixture_root: ClassVar[Path]
     fixture_seed: ClassVar[Path]
     fixture_environment: ClassVar[dict[str, str]]
+    cleanup_failures: tuple[str, ...] = ()
 
     @classmethod
     @override
@@ -184,6 +204,7 @@ class VerifyHoldTools(VerifyMacOffloadFixture):
         cls.fixture_environment = {
             **builder.environment,
             "IN_NIX_SHELL": "pure",
+            "UNIT_DETACHED_RUN": "1",
             "ROSTER_RUN_ROOT": str(builder.root / "unit"),
             "UNIT_RUN_ROOT": str(builder.root / "unit"),
             "SCRATCH_ROOT": str(builder.root / "scratch"),
@@ -193,6 +214,7 @@ class VerifyHoldTools(VerifyMacOffloadFixture):
 
     @override
     def setUp(self) -> None:
+        self.cleanup_failures = ()
         self.root: Path = self.fixture_root
         _ = shutil.copytree(self.fixture_seed, self.root, symlinks=True)
         self.addCleanup(shutil.rmtree, self.root)
@@ -205,6 +227,17 @@ class VerifyHoldTools(VerifyMacOffloadFixture):
         self.cargo_events_path: Path = self.root / "cargo-events.jsonl"
         self.environment: dict[str, str] = self.fixture_environment.copy()
         _ = caller_admission(self, self.root, self.environment)
+
+    @override
+    def addCleanup[**P](self, function: Callable[P, object], /, *args: P.args, **kwargs: P.kwargs) -> None:
+        def recorded_cleanup() -> None:
+            try:
+                _ = function(*args, **kwargs)
+            except BaseException:
+                self.cleanup_failures += (traceback.format_exc(),)
+                raise
+
+        super().addCleanup(recorded_cleanup)
 
     @override
     def stop_verify(self, process: subprocess.Popen[str]) -> None:
@@ -304,9 +337,7 @@ exit "$status"
         _ = self.cycle_file.write_text(json.dumps(cycle))
 
     def fixture_cleanups(self) -> None:
-        # Outside a run, doCleanups keeps a failed cleanup to itself:
-        # a process the fixture found outliving the test fails this one.
-        self.assertTrue(self.fixture.doCleanups(), "a fixture cleanup failed; a process may have outlived the test")
+        self.assertTrue(self.fixture.doCleanups(), "a fixture cleanup failed:\n" + "\n".join(self.fixture.cleanup_failures))
 
     def start(self, *arguments: str) -> subprocess.Popen[str]:
         process = self.fixture.start_verify(*arguments)
@@ -395,7 +426,6 @@ if sys.argv[1] == "eligible":
     if {runs_on!r} == "any_target":
         print("mac\\teligible\\t-\\t" + os.environ["MAC_TEST_CONFIG"] + "\\tmacos")
 else:
-    sys.path.insert(0, {str(TARGETS.parent)!r})
     runpy.run_path({str(TARGETS)!r}, run_name="__main__")
 ''')
         self.fixture.environment["BUILD_TARGETS_SCRIPT"] = str(targets)
@@ -403,7 +433,6 @@ else:
     def record_phase(self) -> Path:
         session = self.fixture.root / "unit-run"
         record_wait_workers(self.fixture.root, session, self.fixture.environment, {"fixture-impl": "thread-impl"})
-        write_text_atomic(session / "worker_transport", "mesh\n")
         self.fixture.environment.update({"UNIT_RUN_DIR": str(session), "UNIT_PHASE_ID": "closed-server-phase",
                                          "UNIT_TEAM_ROLE": "impl", "CODEX_THREAD_ID": fixture_runtime_id("thread-impl"),
                                          "UNIT_PASS_OWNER": "launcher",

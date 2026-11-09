@@ -103,7 +103,7 @@ def _validate(turn: ClaudeTurn, environment: Mapping[str, str]) -> str:
         print(f"claude_worker: prompt file not found: {turn.prompt}", file=sys.stderr)
         raise _LaunchFailed(2)
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}", turn.name):
-        print(f"claude_worker: invalid mesh name '{turn.name}'.", file=sys.stderr)
+        print(f"claude_worker: invalid worker name '{turn.name}'.", file=sys.stderr)
         raise _LaunchFailed(2)
     return binary
 
@@ -274,14 +274,7 @@ def open_worker(turn: ClaudeTurn) -> Delivered | Unchanged | NotDelivered:
                 published = True
                 if not created:
                     if worker_admission.dispatch_record(allowed.run, allowed.name, report_anomaly=False).state is worker_admission.SwitchState.DISPATCH_IN_FLIGHT:
-                        try:
-                            source = worker_admission.transcript_source(worker.row, staff.ClaudeBackend())
-                        except ValueError as error:
-                            if str(error) != "no source transcript found":
-                                raise
-                            entries = ()
-                        else:
-                            entries = worker_admission.transcript_entries(source, set())
+                        entries = worker_admission.conversation_entries(worker.row, staff.ClaudeBackend(), set())
                         torn = False
                         for entry in entries:
                             if isinstance(entry, worker_admission.TornTranscriptRecord):
@@ -303,7 +296,7 @@ def open_worker(turn: ClaudeTurn) -> Delivered | Unchanged | NotDelivered:
                 return worker_admission.SwitchState.ASSIGNMENT_ACCEPTED
 
             _ = worker_admission.switch_worker(allowed, "claude", start=start, dispatch=dispatch,
-                                               cleanup=lambda identity: None, request=request)
+                                               cleanup=lambda identity: worker_admission.NoDestinationToStop(), request=request)
             return delivered
         except _LaunchFailed as error:
             return NotDelivered(error.code)

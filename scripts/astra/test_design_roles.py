@@ -1,4 +1,4 @@
-"""Exercise durable design identity with local stores and a recording mesh transport."""
+"""Exercise durable design identity with local stores and private pane fixtures."""
 from __future__ import annotations
 
 from scripts.production import staff, worker_admission
@@ -9,7 +9,6 @@ from scripts.production.staff_test_support import (
 
 from scripts.lib.signal_test_support import install_signal_pid_guard
 from scripts.lib.atomic_file import write_text_atomic
-from scripts.lib.server_test_support import owned_server_record
 from scripts.lib.test_models_registry import write_registry
 
 import ast
@@ -32,7 +31,9 @@ from scripts.accounts import role_map  # noqa: E402
 from scripts.agents import worker_lifecycle  # noqa: E402
 from scripts.lib.code_kind import is_test_code  # noqa: E402
 from scripts.astra import astra_work, design_roles  # noqa: E402
-from scripts.astra.design_role_test_support import HeldRolePaneCase, write_empty_binding_record, write_mesh_server_record
+from scripts.direct import recorder_state
+from scripts.astra.design_role_test_support import HeldRolePaneCase, write_empty_binding_record
+from scripts.herdr import worker_panes
 from scripts.herdr.test_worker_panes import PaneWorld
 from scripts.whoami import agent_accounts  # noqa: E402
 from scripts.lib.stop_injection_test_support import InjectedStop, stop_once
@@ -108,9 +109,6 @@ class HeldRolePaneTests(HeldRolePaneCase):
                                            reason="publish context", binding=self.panes.binding)
         self.assertEqual(rebound, design)
         self.assertEqual(errors.getvalue(), "")
-        context = cast(dict[str, object], json.loads(
-            (design_roles.mesh_directory(design.placement.design_id) / "design_context.json").read_text()))
-        self.assertEqual(context["generation"], design.placement.generation)
 
     def test_another_holder_reuses_dispatches_and_ends_the_recorded_worker(self) -> None:
         parent = self.panes.command_case.fixture.parent
@@ -137,12 +135,14 @@ class HeldRolePaneTests(HeldRolePaneCase):
                     reply = self.panes.resume(reopened, role)
                     self.assertIn("The work is complete.", reply.read_text())
                     ended = design_roles.end(design.placement.design_id + "/" + role)
+                    if bound:
+                        self.assertEqual(self.panes.recorder_commands, [])
                 self.assertIsInstance(next(item for item in ended.roles if item.role == role).lifecycle,
                                       design_roles.RoleEnded)
                 self.assertIsNone(staff.by_id(instance.lifecycle.staff_id))
                 self.assertEqual(staff.snapshot().find(kind="worker"), [])
 
-    def test_mesh_default_held_designer_dispatches_through_worker_and_keeps_one_identity(self) -> None:
+    def test_held_designer_dispatches_through_worker_and_keeps_one_identity(self) -> None:
         design = self.panes.open("designer")
         instance = design.roles[0]
         self.assertIsInstance(instance.lifecycle, design_roles.RoleOpen)
@@ -154,7 +154,14 @@ class HeldRolePaneTests(HeldRolePaneCase):
         self.assertIn("The work is complete.", first.read_text())
         self.assertIn("The work is complete.", second.read_text())
         self.assertEqual(staff.by_id(instance.lifecycle.staff_id), before)
-        self.assertEqual(len(self.panes.world.launches), 1)
+        if before is None:
+            self.fail("designer row is unavailable")
+        self.assertEqual(self.panes.world.requests[-1][1][:2], ["resume", str(before.current_session)])
+        first_pane, second_pane = [submission[0] for submission in self.panes.command_case.agent.submitted]
+        self.assertNotEqual(first_pane, second_pane)
+        self.assertEqual(self.panes.command_case.agent.row(first_pane).current_session,
+                         self.panes.command_case.agent.row(second_pane).current_session)
+        self.assertEqual(len(self.panes.world.launches), 2)
         self.assertEqual([command[command.index("--target") + 1] for command in self.panes.commands],
                          ["durable-design-role"] * 3)
         self.assertEqual([command[command.index("--policy") + 1] for command in self.panes.commands],
@@ -176,9 +183,25 @@ class HeldRolePaneTests(HeldRolePaneCase):
                 patch.dict(os.environ, {"CODEX_THREAD_ID": "", "CLAUDE_CODE_SESSION_ID": str(parent.current_session)}):
             self.panes.world.add(parent, "w1:p-showrunner")
             design = self.panes.open("reviewer", bound=False)
+            directory = design_roles.design_directory(design.placement.design_id)
+            open_during_turn: list[list[str]] = []
+            self.panes.command_case.agent.during_prompt = lambda: open_during_turn.append(
+                recorder_state.read_open_phase_ids(directory))
             reply = self.panes.resume(design, "reviewer")
+            first_row = self.panes.command_case.agent.row(self.panes.command_case.agent.submitted[-1][0])
+            self.assertEqual(recorder_state.read_open_phase_ids(directory), [])
             second_reply = self.panes.resume(design, "reviewer")
-        self.assertEqual([command[0] for command in self.panes.recorder_commands], ["start-run", "start-phase"])
+            self.assertEqual(recorder_state.read_open_phase_ids(directory), [])
+        self.assertEqual(open_during_turn, [["astra-review"], ["astra-review"]])
+        self.assertEqual([command[0] for command in self.panes.recorder_commands],
+                         ["start-run", "start-phase", "finish-phase", "start-phase", "finish-phase"])
+        state = worker_lifecycle.read_worker_state(directory / "progress_history_state.json")
+        history = Path(cast(str, state["history_file"]))
+        events = [cast(dict[str, object], json.loads(line)) for line in history.read_text().splitlines()]
+        self.assertEqual([event["status"] for event in events if event["event_type"] == "phase_finished"],
+                         ["completed", "completed"])
+        self.assertEqual(sum(event["event_type"] == "run_started" for event in events), 1)
+        self.assertEqual(state["status"], "active")
         self.assertIn("The work is complete.", second_reply.read_text())
         instance = design.roles[1]
         if not isinstance(instance.lifecycle, design_roles.RoleOpen):
@@ -194,11 +217,64 @@ class HeldRolePaneTests(HeldRolePaneCase):
         self.assertEqual(command[command.index("--phase") + 1], "astra-review")
         self.assertIn("The work is complete.", reply.read_text())
         self.assertIsInstance(astra_work.read_header(next(reply.parent.parent.glob("prompts/*.md"))), astra_work.AstraWork)
-        self.assertEqual(len(self.panes.world.launches), 1)
+        self.assertEqual(row, first_row)
+        self.assertEqual(self.panes.world.requests[-1][1][:2], ["resume", str(first_row.current_session)])
+        first_pane, second_pane = [submission[0] for submission in self.panes.command_case.agent.submitted]
+        self.assertNotEqual(first_pane, second_pane)
+        self.assertEqual(self.panes.command_case.agent.row(first_pane), row)
+        self.assertEqual(self.panes.command_case.agent.row(second_pane), row)
+        self.assertEqual(len(self.panes.world.launches), 2)
+        with stop_once(design_roles, "_recorder_command", when="before"), self.assertRaises(InjectedStop):
+            _ = design_roles.end(design.placement.design_id + "/reviewer")
+        self.assertEqual(worker_lifecycle.read_worker_state(directory / "progress_history_state.json")["status"],
+                         "active")
         ended = design_roles.end(design.placement.design_id + "/reviewer")
         self.assertIsInstance(ended.roles[1].lifecycle, design_roles.RoleEnded)
         self.assertIsNone(staff.by_id(instance.lifecycle.staff_id))
-        self.assertEqual(len(self.panes.world.closed), 1)
+        self.assertEqual(len(self.panes.world.closed), 2)
+        finished = worker_lifecycle.read_worker_state(directory / "progress_history_state.json")
+        self.assertEqual(finished["status"], "completed")
+        events = [cast(dict[str, object], json.loads(line)) for line in history.read_text().splitlines()]
+        self.assertEqual([event["status"] for event in events if event["event_type"] == "run_finished"],
+                         ["completed"])
+        saved_history = history.read_bytes()
+        _ = design_roles.end(design.placement.design_id + "/reviewer")
+        self.assertEqual(history.read_bytes(), saved_history)
+        self.assertEqual(worker_lifecycle.read_worker_state(directory / "progress_history_state.json"), finished)
+
+        refused_document = self.panes.root / "refused-review.md"
+        write_text_atomic(refused_document, "# Refused review\n")
+        refused_design = design_roles.open_role("private-repo", refused_document.name, "reviewer", "design")
+        refused_directory = design_roles.design_directory(refused_design.placement.design_id)
+        self.panes.command_case.agent.during_prompt = lambda: open_during_turn.append(
+            recorder_state.read_open_phase_ids(refused_directory))
+        for phase_already_finished in (False, True):
+            def dispatch(arguments: list[str]) -> subprocess.CompletedProcess[str]:
+                result = self.panes.assign(arguments)
+                if phase_already_finished:
+                    self.panes.record(["finish-phase", "--session-dir", str(refused_directory),
+                                       "--phase-id", "astra-review", "--status", "error"])
+                return result
+
+            with self.subTest(phase_already_finished=phase_already_finished), \
+                    patch.object(design_roles, "_assign_command", side_effect=dispatch):
+                self.panes.command_case.agent.error = "agent_prompt_stalled"
+                self.panes.command_case.agent.start_wait_times_out = True
+                with self.assertRaisesRegex(design_roles.RoleRefused, "the worker did not start") as refused:
+                    _ = self.panes.resume(refused_design, "reviewer")
+                if phase_already_finished:
+                    self.assertIsInstance(refused.exception.__cause__, design_roles.RoleRefused)
+                    self.assertIn("Phase astra-review is not open", str(refused.exception.__cause__))
+                pane = self.panes.command_case.agent.submitted[-1][0]
+                self.panes.world.locations[pane]["agent_status"] = "idle"
+                self.assertEqual(recorder_state.read_open_phase_ids(refused_directory), [])
+        self.assertEqual(open_during_turn, [["astra-review"]] * 4)
+        refused_state = worker_lifecycle.read_worker_state(refused_directory / "progress_history_state.json")
+        refused_history = Path(cast(str, refused_state["history_file"]))
+        refused_events = [cast(dict[str, object], json.loads(line))
+                          for line in refused_history.read_text().splitlines()]
+        self.assertEqual([event["status"] for event in refused_events if event["event_type"] == "phase_finished"],
+                         ["error", "error"])
 
     def test_astra_open_rerun_after_split_reuses_the_same_terminal(self) -> None:
         self.panes.world.interrupt = "split"
@@ -373,8 +449,10 @@ class DurableRolesTests(HeldRolePaneCase):
         def native_start(identity: str, pane: str, family: Literal["claude", "codex"]) -> None:
             label = str(self.panes.world.locations[pane]["label"])
             role: Role = "reviewer" if "reviewer" in label else "designer"
-            if label.startswith("astra-"):
-                existing = staff.snapshot().by_current_session(identity)
+            membership = staff.snapshot()
+            if any(label.startswith(worker_panes.agent_name(owner, "astra-"))
+                   for owner in membership.rows if owner.kind in ("unit", "showrunner")):
+                existing = membership.by_current_session(identity)
                 if existing is None:
                     identity = fixture_runtime_id("astra-" + role if not any(
                         item[0] == role for item in self.launches) else label)
@@ -492,19 +570,6 @@ class DurableRolesTests(HeldRolePaneCase):
     def assign_command(self, arguments: list[str]) -> subprocess.CompletedProcess[str]:
         result = self.panes.assign(arguments)
         if "--new-worker" in arguments and result.returncode == 0:
-            fields = cast(dict[str, str], json.loads(result.stdout))
-            row = staff.by_id(staff.StaffId(fields["id"]))
-            assert row is not None
-            design_id = row.name.removeprefix("astra-").rsplit("-", 1)[0]
-            design = design_roles.read_design(design_id)
-            role = next(instance.role for instance in design.roles if instance.name == row.name)
-            mesh = design_roles.mesh_directory(design.placement.design_id)
-            path = mesh / "mesh_roster.json"
-            roster = cast(dict[str, object], json.loads(path.read_text())) if path.exists() else {}
-            roster[row.name] = {"staff_id": row.id, "status": "done", "launcher_pid": 0,
-                                "held_design_id": design.placement.design_id, "held_role": role}
-            write_text_atomic(path, json.dumps(roster))
-            self.enterContext(write_mesh_server_record(mesh, self.root / "codex-home"))
             if self.lose_creation_ack:
                 self.lose_creation_ack = False
                 raise TimeoutError("creation acknowledgement lost")
@@ -673,8 +738,6 @@ class DurableRolesTests(HeldRolePaneCase):
         self.assertEqual(rebound.placement.generation, 2)
         self.assertEqual(rebound.roles, design.roles)
         self.assertFalse(transition.exists())
-        context = cast(dict[str, object], json.loads((design_roles.mesh_directory(identifier) / "design_context.json").read_text()))
-        self.assertEqual(context["generation"], 2)
         self.assertEqual(len(world.launches), 1)
 
     def test_pane_end_rerun_after_transport_failure_keeps_then_finishes_its_transition(self) -> None:
@@ -743,32 +806,8 @@ class DurableRolesTests(HeldRolePaneCase):
         self.assertEqual(moved.placement.generation, 2)
         self.assertEqual(moved.roles, design.roles)
         self.assertFalse(transition.exists())
-        context = cast(dict[str, object], json.loads((design_roles.mesh_directory(identifier) / "design_context.json").read_text()))
-        self.assertEqual(context["cwd"], str(destination))
         self.assertEqual(len(world.launches), 1)
 
-    def test_sibling_mesh_activity_or_claim_blocks_dispatch_and_keeps_the_binding(self) -> None:
-        design = self.open_designer()
-        design = design_roles.open_role("fixture-repo", "design.md", "reviewer", "design",
-                                        binding=self.binding(self.run_a))
-        roster = design_roles.mesh_directory(design.placement.design_id) / "mesh_roster.json"
-        entries = cast(dict[str, dict[str, object]], json.loads(roster.read_text()))
-        path = design_roles.design_directory(design.placement.design_id) / "design.json"
-        for transport in ("mesh", "herdr"):
-            _ = (self.run_a / "worker_transport").write_text(transport + "\n")
-            for status, claim in (("running", ""), ("done", "review-in-progress")):
-                with self.subTest(transport=transport, status=status, claim=claim):
-                    entries[self.instance(design, "reviewer").name]["status"] = status
-                    _ = roster.write_text(json.dumps(entries))
-                    fields = cast(dict[str, object], json.loads(path.read_text()))
-                    roles = cast(list[dict[str, object]], fields["roles"])
-                    roles[1]["assignment_claim"] = claim
-                    _ = path.write_text(json.dumps(fields))
-                    before = design_roles.read_design(design.placement.design_id)
-                    with self.assertRaisesRegex(design_roles.RoleRefused, "role is busy"):
-                        _ = self.resume(before, "designer")
-                    self.assertEqual(design_roles.read_design(design.placement.design_id), before)
-                    self.assertEqual(self.dispatches, [])
 
     def test_busy_sibling_does_not_stop_selected_role_dispatch(self) -> None:
         design = self.open_designer()
@@ -776,9 +815,6 @@ class DurableRolesTests(HeldRolePaneCase):
                                         binding=self.binding(self.run_a))
         world = self.panes.world
         world.locations["w1:p2"]["agent_status"] = "working"
-        roster = design_roles.mesh_directory(design.placement.design_id) / "mesh_roster.json"
-        _ = roster.write_text("{}")
-        _ = (self.run_a / "worker_transport").write_text("herdr\n")
         reply = self.resume(design, "designer")
         self.assertEqual(reply.read_text(), "Saved reply from " + self.launches[0][1])
         current = design_roles.read_design(design.placement.design_id)
@@ -791,9 +827,6 @@ class DurableRolesTests(HeldRolePaneCase):
                                         binding=self.binding(self.run_a))
         world = self.panes.world
         world.unknown["w1:p2"] = "sibling process evidence is unreadable"
-        roster = design_roles.mesh_directory(design.placement.design_id) / "mesh_roster.json"
-        _ = roster.write_text("{}")
-        _ = (self.run_a / "worker_transport").write_text("herdr\n")
         rebound = design_roles.rebind(design.placement.design_id, expected_generation=1,
                                       reason="next phase", binding=self.binding(self.run_b))
         self.assertEqual(design_roles.read_design(design.placement.design_id).binding, self.binding(self.run_b))
@@ -860,20 +893,6 @@ class DurableRolesTests(HeldRolePaneCase):
                             for path in design_roles.state_root().glob("*/design.json")
                             for role in design_roles.read_design(path.parent.name).roles if role.role == "designer"))
 
-    def test_damaged_design_roster_refuses_publication_without_erasing_ownership(self) -> None:
-        design = self.open_designer()
-        path = design_roles.mesh_directory(design.placement.design_id) / "mesh_roster.json"
-        for damaged in ("", '{"designer":', "not JSON", "[]", '{"designer": []}'):
-            with self.subTest(damaged=damaged):
-                _ = path.write_text(damaged)
-                with self.assertRaises(Exception) as refused:
-                    with design_roles._edit_roster(design.placement.design_id) as roster:  # pyright: ignore[reportPrivateUsage]
-                        roster["replacement"] = {"thread_id": "fresh", "status": "done"}
-                self.assertEqual(type(refused.exception).__name__, "WorkerStateUnreadable")
-                self.assertIn(str(path), str(refused.exception))
-                self.assertEqual(path.read_text(), damaged)
-                self.assertEqual(design_roles.read_design(design.placement.design_id), design)
-        self.assertEqual(len(self.launches), 1)
 
     def test_design_ownership_read_names_damaged_state_instead_of_decoding_it_as_empty(self) -> None:
         design = self.open_designer()
@@ -1299,7 +1318,6 @@ class DurableRolesTests(HeldRolePaneCase):
         design = self.open_designer()
         path = damage_binding_repository(design)
         directory = path.parent
-        mesh = design_roles.mesh_directory(design.placement.design_id)
         command = ["rebind", design.placement.design_id, "--expected-generation", "1",
                    "--unbind", "--reason", "finish interrupted repair"]
         atomic = design_roles._atomic  # pyright: ignore[reportPrivateUsage]
@@ -1317,9 +1335,6 @@ class DurableRolesTests(HeldRolePaneCase):
         committed = design_roles.read_design(design.placement.design_id)
         self.assertEqual(committed.placement.generation, 2)
         self.assertIsInstance(committed.binding, design_roles.DesignUnbound)
-        if stop_at == "design_context.json":
-            # The earlier writer removed this marker before publishing the context.
-            (directory / "transition.json").unlink(missing_ok=True)
         # Force recovery to prove it republishes the census, rather than reading an old hold.
         (self.root / "holds/9309c903-5894-501a-8aa7-f33ea912e074.json").unlink(missing_ok=True)
         output, error = io.StringIO(), io.StringIO()
@@ -1332,13 +1347,10 @@ class DurableRolesTests(HeldRolePaneCase):
         self.assertEqual(repaired, committed)
         self.assertEqual(self.panes.world.stops, [])
         self.assertEqual(self.panes.world.closed, [])
-        context = cast(dict[str, object], json.loads((mesh / "design_context.json").read_text()))
-        self.assertEqual(context["generation"], 2)
-        self.assertEqual(context["binding"], {"kind": "DesignUnbound"})
         self.assertEqual([record["thread_id"] for record in astra_roles.live_roles(staff.snapshot())], ["9309c903-5894-501a-8aa7-f33ea912e074"])
         self.assertFalse((directory / "transition.json").exists())
         unchanged = {item: (item.read_bytes(), item.stat().st_mtime_ns)
-                     for item in (path, mesh / "design_context.json", self.root / "holds/9309c903-5894-501a-8aa7-f33ea912e074.json")}
+                     for item in (path, self.root / "holds/9309c903-5894-501a-8aa7-f33ea912e074.json")}
         closed = list(self.panes.world.closed)
         with redirect_stdout(io.StringIO()):
             self.assertEqual(design_roles.main(command), 0)
@@ -1347,9 +1359,6 @@ class DurableRolesTests(HeldRolePaneCase):
 
     def test_repair_retry_finishes_publication_after_the_design_save(self) -> None:
         self.assert_interrupted_repair_finishes_publication("design.json")
-
-    def test_repair_retry_finishes_a_failed_launch_context_publication(self) -> None:
-        self.assert_interrupted_repair_finishes_publication("design_context.json")
 
 
     def test_markerless_repair_retry_finishes_census_before_reporting_success(self) -> None:
@@ -1532,13 +1541,10 @@ class DurableRolesTests(HeldRolePaneCase):
         row_id = cast(design_roles.RoleOpen, self.instance(design, "designer").lifecycle).staff_id
         pane = next(pane for pane, process in self.panes.world.foreground.items()
                     if self.panes.world.processes[process[0]].current_identity == row_id)
-        roster = design_roles.mesh_directory(design.placement.design_id) / "mesh_roster.json"
-        before = roster.read_bytes()
         self.panes.world.locations[pane]["agent_status"] = "working"
         self.assertEqual([role["state"] for role in astra_roles.live_roles(staff.snapshot())], ["busy"])
         _ = self.panes.world.foreground.pop(pane)
         self.assertEqual([role["state"] for role in astra_roles.live_roles(staff.snapshot())], ["idle"])
-        self.assertEqual(roster.read_bytes(), before)
 
 
     def test_durable_hold_survives_run_removal_and_keeps_one_census_edge(self) -> None:
@@ -1553,10 +1559,10 @@ class DurableRolesTests(HeldRolePaneCase):
         workers = record.find(kind="worker", parent=parent.id)
         self.assertEqual([(worker.current_session, worker.parent) for worker in workers],
                          [("9309c903-5894-501a-8aa7-f33ea912e074", staff.ReportsTo(parent.id))])
-        self.assertEqual([(role["manager"], role["thread_id"], role["role"], role["codex_home"], role["state"])
+        self.assertEqual([(role["manager"], role["thread_id"], role["role"], role["state"])
                           for role in records],
                          [('17759e5d-1377-577b-b283-19888bbfc1f5', "9309c903-5894-501a-8aa7-f33ea912e074",
-                           "designer", str(self.root / "codex-home"), "idle")])
+                           "designer", "idle")])
         self.assertEqual(design_roles.read_design(design.placement.design_id).placement.design_id, design.placement.design_id)
 
     def test_rebind_keeps_the_pane_and_account_and_uses_the_current_phase(self) -> None:
@@ -1581,10 +1587,8 @@ class DurableRolesTests(HeldRolePaneCase):
         with self.assertRaisesRegex(design_roles.RoleRefused, "generation"):
             _ = design_roles.rebind(design.placement.design_id, expected_generation=2, reason="stale",
                              binding=self.binding(self.run_b))
-        roster = design_roles.mesh_directory(design.placement.design_id) / "mesh_roster.json"
-        entries = cast(dict[str, dict[str, object]], json.loads(roster.read_text()))
-        entries[self.instance(design, "designer").name]["status"] = "running"
-        _ = roster.write_text(json.dumps(entries))
+        busy = replace(design, roles=(replace(design.roles[0], assignment_claim="active-dispatch"), design.roles[1]))
+        design_roles._save(busy)  # pyright: ignore[reportPrivateUsage]
         with self.assertRaisesRegex(design_roles.RoleRefused, "busy"):
             _ = design_roles.rebind(design.placement.design_id, expected_generation=1, reason="busy",
                              binding=self.binding(self.run_b))
@@ -1678,25 +1682,6 @@ class DurableRolesTests(HeldRolePaneCase):
         self.assertIn(design.placement.design_id, [entry["design_id"] for entry in entries])
         self.assertIn(str(bad), str(inventory["problems"]))
 
-    def test_inventory_reports_paused_and_failed_threads_with_the_holder_route(self) -> None:
-        design = self.open_designer()
-        mesh = design_roles.mesh_directory(design.placement.design_id)
-        name = self.instance(design, "designer").name
-        marker = mesh / (name + ".account-move.json")
-        _ = marker.write_text("{}")
-        paused = cast(list[dict[str, object]], design_roles.list_roles()["roles"])
-        designer = next(row for row in paused if row["role"] == "designer")
-        self.assertEqual(designer["lifecycle"], {"kind": "RolePausedForMove", "staff_id": "9309c903-5894-501a-8aa7-f33ea912e074"})
-        self.assertNotIn("holder_reach", designer)
-        marker.unlink()
-        roster = cast(dict[str, dict[str, object]], json.loads((mesh / "mesh_roster.json").read_text()))
-        roster[name]["status"] = "failed"
-        _ = (mesh / "mesh_roster.json").write_text(json.dumps(roster))
-        failed = cast(list[dict[str, object]], design_roles.list_roles()["roles"])
-        designer = next(row for row in failed if row["role"] == "designer")
-        self.assertEqual(cast(dict[str, object], designer["lifecycle"])["kind"], "RoleNeedsRecovery")
-        self.assertEqual(cast(dict[str, object], designer["lifecycle"])["staff_id"], "9309c903-5894-501a-8aa7-f33ea912e074")
-        self.assertEqual(self.dispatches, [])
 
     def test_patch_checks_use_the_current_run_and_refuse_stale_or_mixed_paths(self) -> None:
         design = self.open_designer()
@@ -1764,10 +1749,6 @@ class DurableRolesTests(HeldRolePaneCase):
         self.assertEqual(design_roles.main(arguments), 0)
         self.assertEqual(design_roles.read_design(identifier), saved)
         self.assertFalse((design_roles.design_directory(identifier) / "transition.json").exists())
-        context = cast(dict[str, object], json.loads(
-            (design_roles.mesh_directory(identifier) / "design_context.json").read_text()))
-        self.assertEqual(context["generation"], saved.placement.generation)
-        self.assertEqual(context["binding"], {"kind": "DesignUnbound"})
         self.assertEqual(saved.roles, design.roles)
         self.assertEqual(len(self.launches), 1)
 
@@ -1809,7 +1790,6 @@ class DurableRolesTests(HeldRolePaneCase):
         self.assertEqual(len(self.launches), 2)
 
 
-
     def test_a_unit_transfer_moves_the_holder_to_the_receiving_production(self) -> None:
 
         design = self.open_designer()
@@ -1824,7 +1804,6 @@ class DurableRolesTests(HeldRolePaneCase):
         self.assertEqual(design_roles.read_design(design.placement.design_id).roles, design.roles)
         self.assertEqual(self.dispatches[-1][1], '9309c903-5894-501a-8aa7-f33ea912e074')
         self.assertEqual(len(self.launches), 1)
-
 
 
     def test_unit_rename_skips_another_units_damaged_record(self) -> None:
@@ -1916,15 +1895,12 @@ class DurableRolesTests(HeldRolePaneCase):
                     for path in (directory / folder).rglob("*") if path.is_file()}
         authority_before = self.authority("lookup", {"repository_id": "fixture-repo", "document": "design.md",
                                                    "host": "natedev"})
-        mesh = design_roles.mesh_directory(design_id)
-        process = self.enterContext(owned_server_record(mesh / "mesh_server.json"))
         _ = self.panes.world.foreground.pop("w1:p1")
         _ = self.panes.world.foreground.pop("w1:p2")
         first = design_roles.end(design_id + "/designer")
         self.assertIsInstance(self.instance(first, "designer").lifecycle, design_roles.RoleEnded)
         self.assertIsInstance(self.instance(first, "reviewer").lifecycle, design_roles.RoleOpen)
         self.assertEqual(len(self.panes.world.closed), 1)
-        self.assertIsNone(process.poll())
         reviewer = cast(design_roles.RoleOpen, self.instance(first, "reviewer").lifecycle)
         self.assertIsNotNone(staff.by_id(reviewer.staff_id))
         ended = design_roles.end(design_id + "/reviewer")
@@ -1961,8 +1937,6 @@ class DurableRolesTests(HeldRolePaneCase):
         with patch.object(staff.StaffSnapshot, 'by_id', return_value=None):
             with self.assertRaisesRegex(design_roles.RoleRefused, 'parent is unavailable'):
                 _ = design_roles.worker_parent(design, 'designer', staff.snapshot())
-
-
 
 
 if __name__ == "__main__":

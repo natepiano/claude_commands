@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager, ExitStack, redirect_stderr, redirect_stdout
-from collections.abc import Callable, Generator, Mapping
+from collections.abc import Callable, Generator
 from dataclasses import dataclass, field
 from enum import StrEnum
 import io
@@ -102,10 +102,31 @@ class PublishedWorker:
     handoff: FamilyHandoff = field(default_factory=NoFamilyHandoff)
 
 
+@dataclass(frozen=True)
+class DestinationStopped:
+    """Cleanup stopped the destination agent and kept its shell."""
+
+
+@dataclass(frozen=True)
+class DestinationRetained:
+    """Cleanup could not safely stop the destination agent."""
+
+    pane: str
+    reason: str
+
+
+@dataclass(frozen=True)
+class NoDestinationToStop:
+    """No destination started, or the caller owns its cleanup."""
+
+
+CleanupOutcome = DestinationStopped | DestinationRetained | NoDestinationToStop
+
+
 def parent(record: staff.StaffSnapshot, sources: session_staff.MemberSources | None = None, *,
            staff_id: str = "", production: str = "", unit: str = "",
-           run: Path | None = None, roster: Mapping[str, object] | None = None) -> staff.StaffRow:
-    """Resolve the recorded run owner before the roster and caller."""
+           run: Path | None = None) -> staff.StaffRow:
+    """Resolve the recorded run owner before the caller."""
     if run is not None:
         try:
             state = worker_lifecycle.read_json_object(run / unit_runs.STATE_FILE)
@@ -124,15 +145,6 @@ def parent(record: staff.StaffSnapshot, sources: session_staff.MemberSources | N
             found = sources.member(session_staff.UnitMember(production, unit), record)
             if isinstance(found, session_staff.MemberFound):
                 return found.row
-    if run is not None:
-        entries = roster if roster is not None else worker_lifecycle.read_worker_state(run / "mesh_roster.json")
-        for raw in entries.values():
-            if not isinstance(raw, dict):
-                continue
-            child = record.by_id(staff.StaffId(str(cast(dict[str, object], raw).get("staff_id", ""))))
-            owner = record.parent_of(child) if child is not None else None
-            if owner is not None:
-                return owner
     row = record.owner_of(staff_id) if staff_id else None
     if row is not None and row.kind in ("unit", "showrunner"):
         return row
@@ -144,31 +156,13 @@ def parent(record: staff.StaffSnapshot, sources: session_staff.MemberSources | N
     error = RunOwnerUnavailable if run is not None else ValueError
     if unit or production:
         raise error(f"no unit staff row for {unit}" if unit else f"no showrunner staff row for {production}")
-    raise error(f"this run has no owner because {unit_runs.STATE_FILE} and mesh_roster.json name no unit, production or staff row"
+    raise error(f"this run has no owner because {unit_runs.STATE_FILE} names no staff row"
                 if run is not None else "the caller has no staff row and names no unit or production")
 
 
 def find_worker(record: staff.StaffSnapshot, owner: staff.StaffId, name: str) -> staff.StaffRow | None:
     """Find the named worker under its staff parent."""
     return next((row for row in record.find(kind="worker", parent=owner) if row.name == name), None)
-
-
-def resolve_roster(run: Path, entries: dict[str, object]) -> dict[str, object]:
-    """Add staff references to old entries through the run's unit and worker name."""
-    missing = [(name, cast(dict[str, object], raw)) for name, raw in entries.items()
-               if isinstance(raw, dict) and "staff_id" not in raw]
-    if not missing:
-        return entries
-    record = staff.local_snapshot()
-    try:
-        owner = parent(record, staff_id=staff.runtime_id(), run=run, roster=entries)
-    except ValueError:
-        return entries
-    for name, entry in missing:
-        row = find_worker(record, owner.id, name)
-        if row is not None:
-            entry["staff_id"] = row.id
-    return entries
 
 
 def admit(name: str, run: Path, *, reference: str = "") -> WorkerStartAllowed:
@@ -198,19 +192,28 @@ def member(run: Path, name: str, record: staff.StaffSnapshot | None = None) -> s
     return find_worker(record, owner.id, name)
 
 
+def codex_transcript_source(thread_id: str, home: Path) -> Path:
+    """Find the newest transcript for the named Codex thread and account."""
+    paths = [path for folder in ("sessions", "archived_sessions")
+             for path in (home / folder).rglob(f"*{thread_id}.jsonl")]
+    if not paths:
+        raise ValueError("no source transcript found")
+    return max(paths, key=lambda path: path.stat().st_mtime)
+
+
 def transcript_source(row: staff.StaffRow, backend: staff.ClaudeBackend | staff.CodexBackend) -> Path:
     if isinstance(backend, staff.CodexBackend):
-        paths = [path for folder in ("sessions", "archived_sessions")
-                 for path in (backend.codex_home / folder).rglob(f"*{row.current_session}.jsonl")]
-    else:
-        from scripts.message import sessions
-        paths = sessions.transcript_locations(row.current_session)
+        return codex_transcript_source(row.current_session, backend.codex_home)
+    from scripts.message import sessions
+    paths = sessions.transcript_locations(row.current_session)
     if not paths:
         raise ValueError("no source transcript found")
     return max(paths, key=lambda path: path.stat().st_mtime)
 
 
 def transcript_entry(fields: dict[str, object], changed: set[str]) -> str:
+    if isinstance(fields.get("message"), dict) and fields.get("type") not in ("user", "assistant"):
+        return ""
     raw = fields.get("message", fields.get("payload", {}))
     if not isinstance(raw, dict):
         return ""
@@ -252,6 +255,18 @@ def transcript_entries(source: Path, changed: set[str]) -> Generator[str | TornT
                 continue
             if isinstance(fields, dict):
                 yield transcript_entry(cast(dict[str, object], fields), changed)
+
+
+def conversation_entries(row: staff.StaffRow, backend: staff.ClaudeBackend | staff.CodexBackend,
+                         changed: set[str]) -> Generator[str | TornTranscriptRecord]:
+    """Read a conversation; Claude has no entries before its first transcript."""
+    try:
+        source = transcript_source(row, backend)
+    except ValueError as error:
+        if isinstance(backend, staff.ClaudeBackend) and str(error) == "no source transcript found":
+            return
+        raise
+    yield from transcript_entries(source, changed)
 
 
 def handoff_path(run: Path, row: staff.StaffRow) -> Path:
@@ -314,9 +329,14 @@ def assignment_id(prompt: Path) -> str:
     return hashlib.sha256(str(prompt.resolve()).encode() + str(prompt.stat().st_mtime_ns).encode() + prompt.read_bytes()).hexdigest()
 
 
+def switch_record_path(run: Path, name: str) -> Path:
+    """Keep native switch state separate from saved Claude launcher records."""
+    return run / f"native_switch_{name}.json"
+
+
 def dispatch_record(run: Path, name: str, *, report_anomaly: bool = True) -> DispatchRecord:
-    entry = session_staff.read_worker_roster(run / "mesh_roster.json").get(name)
-    fields = cast(dict[str, object], entry) if isinstance(entry, dict) else {}
+    path = switch_record_path(run, name)
+    fields = worker_lifecycle.read_worker_state(path)
     try:
         return DispatchRecord(str(fields.get("assignment_id", "")),
                               SwitchState(fields.get("dispatch_state", SwitchState.NO_RECORD)))
@@ -336,27 +356,32 @@ def dispatch_pending(run: Path, name: str, prompt: Path) -> bool:
 
 
 def record_dispatch(allowed: WorkerStartAllowed, request: str, state: SwitchState, *, expected_request: str = "") -> None:
-    with worker_lifecycle.locked_state(allowed.run / "mesh_roster.json") as handle:
-        entries = handle.read_object()
-        previous = entries.get(allowed.name, {})
-        entry = dict(cast(dict[str, object], previous)) if isinstance(previous, dict) else {}
+    path = switch_record_path(allowed.run, allowed.name)
+    with worker_lifecycle.locked_state(path) as handle:
+        entry = handle.read_object()
         if expected_request and entry.get("assignment_id") != expected_request:
             return
         entry.update(assignment_id=request, dispatch_state=state)
         if isinstance(allowed.slot, ExistingWorkerSlot):
             entry["staff_id"] = allowed.slot.row.id
-        entries[allowed.name] = entry
-        session_staff.publish_worker_roster(handle, entries)
+        handle.publish(json.dumps(entry, indent=2, sort_keys=True))
 
 
 def publish_created(allowed: WorkerStartAllowed, identity: str,
-                    cleanup: Callable[[str], str | None]) -> PublishedWorker:
-    try:
+                    cleanup: Callable[[str], CleanupOutcome]) -> PublishedWorker:
+    with _cleanup_on_failure(cleanup, identity):
         return publish(allowed, identity)
+
+
+@contextmanager
+def _cleanup_on_failure(cleanup: Callable[[str], CleanupOutcome], identity: str = "") -> Generator[None]:
+    """Use the same cleanup for failed launch proof and failed publication."""
+    try:
+        yield
     except BaseException as error:
-        detail = cleanup(identity)
-        if detail and isinstance(error, AdmissionRefused):
-            raise AdmissionRefused(f"{error}{detail}") from error
+        outcome = cleanup(identity)
+        if isinstance(outcome, DestinationRetained) and isinstance(error, Exception):
+            raise AdmissionRefused(f"{error}; destination pane {outcome.pane} retained: {outcome.reason}") from error
         raise
 
 
@@ -381,7 +406,7 @@ def worker_operation(allowed: WorkerStartAllowed) -> Generator[None]:
 def switch_worker(allowed: WorkerStartAllowed, family: str, *,
                   start: Callable[[FamilyHandoff], str],
                   dispatch: Callable[[PublishedWorker], SwitchState] | DispatchOwner,
-                  cleanup: Callable[[str], str | None], request: str = "") -> PublishedWorker:
+                  cleanup: Callable[[str], CleanupOutcome], request: str = "") -> PublishedWorker:
     """Hold the row through publication and dispatch acceptance, then release it."""
     with worker_operation(allowed):
         handoff: FamilyHandoff = NoFamilyHandoff()
@@ -415,13 +440,15 @@ def switch_worker(allowed: WorkerStartAllowed, family: str, *,
             if row is not None and not same:
                 handoff = extract_transcript(row, allowed.run, backend)
                 release_source = cast(ReleaseSource, import_module("scripts.shutdown.stop_resume").release_source)
-                released = release_source(row, lambda: (allowed.run, *session_staff.worker_run_index(record).get(allowed.lock_reference, ())), backend)
+                released = release_source(row, backend)
                 if not isinstance(released, SourceReleased):
                     raise AdmissionRefused(released.reason)
                 retry = True
             if retry and prior.assignment_id != request:
                 record_dispatch(allowed, request, SwitchState.CREATION_INTENT_RECORDED)
-            row = publish_created(allowed, start(handoff), cleanup).row
+            with _cleanup_on_failure(cleanup):
+                identity = start(handoff)
+            row = publish_created(allowed, identity, cleanup).row
         published = PublishedWorker(row, handoff)
         if not isinstance(dispatch, DispatchOwner):
             state = dispatch(published)

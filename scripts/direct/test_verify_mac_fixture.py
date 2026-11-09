@@ -58,7 +58,6 @@ class VerifyMacFixtureTests(VerifyMacOffloadFixture):
                         "BUILDLOG_HOLD_WAIT_FILE": str(root / "hold-wait"),
                         "TEST_REAL_TARGETS": str(VERIFY.parent.parent / "build_targets/build_targets.py")}), \
                         mock.patch.object(sys, "argv", ["targets-wrapper", command, *arguments]), \
-                        mock.patch.object(sys, "path", sys.path.copy()), \
                         mock.patch.object(runpy, "run_path", side_effect=SystemExit(10)):
                     with mock.patch("scripts.lib.atomic_file.os.replace", side_effect=interrupt_publication):
                         with self.assertRaisesRegex(OSError, "interrupted publication"):
@@ -115,51 +114,90 @@ class VerifyMacFixtureTests(VerifyMacOffloadFixture):
         self.assertFalse(reached.exists())
 
     def test_hold_fixture_reaps_its_recorders_without_waiting_for_an_existing_recorder(self) -> None:
-        # The real hold dispatcher starts this child and its reaper. Only a
-        # join at the fixture boundary releases the child to write completion.
-        tree = self.root / "record-tree/scripts"
-        (tree / "build_hold").mkdir(parents=True)
-        (tree / "buildlog").mkdir()
-        (tree / "lib").symlink_to(VERIFY.parent.parent / "lib", target_is_directory=True)
-        release, completed = self.root / "recorder-release", self.root / "recorder-completed"
-        self.write_executable(tree / "buildlog/record.py", f'''
+        for delayed_start in (False, True):
+            with self.subTest(delayed_start=delayed_start):
+                tree = self.root / f"record-tree-{delayed_start}/scripts"
+                (tree / "build_hold").mkdir(parents=True)
+                (tree / "buildlog").mkdir()
+                (tree / "lib").symlink_to(VERIFY.parent.parent / "lib", target_is_directory=True)
+                release = tree.parent / "recorder-release"
+                completed = tree.parent / "recorder-completed"
+                self.write_executable(tree / "buildlog/record.py", f'''
 from pathlib import Path
 from scripts.direct.wait_for_test_state import wait_for_file
 wait_for_file(Path({str(release)!r}))
 Path({str(completed)!r}).touch()
 ''')
-        outside_release = threading.Event()
-        outside = threading.Thread(target=outside_release.wait, name="hold-event-recorder", daemon=True)
-        outside.start()
-        original_join = threading.Thread.join
-        owned: list[threading.Thread] = []
+                outside_release = threading.Event()
+                outside = threading.Thread(target=outside_release.wait, name="hold-event-recorder", daemon=True)
+                outside.start()
+                original_join = threading.Thread.join
+                original_start = threading.Thread.start
+                original_wait = threading.Event.wait
+                owner = threading.current_thread()
+                starting, allow_start, closing = threading.Event(), threading.Event(), threading.Event()
+                owned: list[threading.Thread] = []
+                failures: list[BaseException] = []
 
-        def release_on_join(thread: threading.Thread, timeout: float | None = None) -> None:
-            if thread.name == "hold-event-recorder":
-                self.assertIsNot(thread, outside, "fixture tried to wait for a recorder it did not start")
-                owned.append(thread)
-                release.touch()
-            original_join(thread, timeout)
+                def release_on_join(thread: threading.Thread, timeout: float | None = None) -> None:
+                    if thread.name == "hold-event-recorder":
+                        self.assertIsNot(thread, outside, "fixture tried to wait for a recorder it did not start")
+                        owned.append(thread)
+                        release.touch()
+                    original_join(thread, timeout)
 
-        existing = set(threading.enumerate())
-        try:
-            with mock.patch.object(build_hold, "__file__", str(tree / "build_hold/build_hold.py")), \
-                    mock.patch.object(threading.Thread, "join", release_on_join):
-                with self.hold_environment():
-                    _ = build_hold.start_hold(Path(self.environment["BUILD_HOLD_DIR"]),
-                        build_hold.HolderIdentity("hana", "hana"), "fixture recording", build_hold.NoReleaseEta(),
-                        datetime.now().astimezone())
-                self.assertTrue(completed.exists(), "fixture returned while its recorder still owned its files")
-            self.assertEqual(len(owned), 1)
-            self.assertFalse(owned[0].is_alive())
-            self.assertTrue(outside.is_alive())
-        finally:
-            release.touch()
-            outside_release.set()
-            for thread in threading.enumerate():
-                if thread is outside or (thread not in existing and thread.name == "hold-event-recorder"):
-                    original_join(thread, TEST_HANG_GUARD_SECS)
-                    self.assertFalse(thread.is_alive())
+                def delay_recorder_start(thread: threading.Thread) -> None:
+                    if delayed_start and thread.name == "hold-event-recorder":
+                        starting.set()
+                        if not allow_start.wait(TEST_HANG_GUARD_SECS):
+                            raise AssertionError("fixture never waited for recorder startup")
+                    original_start(thread)
+
+                def release_start_on_wait(event: threading.Event, timeout: float | None = None) -> bool:
+                    if threading.current_thread() is owner and closing.is_set():
+                        allow_start.set()
+                    return original_wait(event, timeout)
+
+                def dispatch() -> None:
+                    try:
+                        _ = build_hold.start_hold(Path(self.environment["BUILD_HOLD_DIR"]),
+                            build_hold.HolderIdentity(f"hana-{delayed_start}", "hana"), "fixture recording", build_hold.NoReleaseEta(),
+                            datetime.now().astimezone())
+                    except BaseException as error:
+                        failures.append(error)
+
+                launcher = threading.Thread(target=dispatch, name="fixture-hold-start")
+                existing = set(threading.enumerate())
+                try:
+                    with mock.patch.object(build_hold, "__file__", str(tree / "build_hold/build_hold.py")), \
+                            mock.patch.object(threading.Thread, "join", release_on_join), \
+                            mock.patch.object(threading.Thread, "start", delay_recorder_start), \
+                            mock.patch.object(threading.Event, "wait", release_start_on_wait):
+                        with self.hold_environment():
+                            if delayed_start:
+                                launcher.start()
+                                self.assertTrue(starting.wait(TEST_HANG_GUARD_SECS), "recorder startup did not begin")
+                            else:
+                                dispatch()
+                            closing.set()
+                        self.assertTrue(completed.exists(), "fixture returned while its recorder still owned its files")
+                    if delayed_start:
+                        original_join(launcher, TEST_HANG_GUARD_SECS)
+                        self.assertFalse(launcher.is_alive())
+                    self.assertEqual(failures, [])
+                    self.assertEqual(len(owned), 1)
+                    self.assertFalse(owned[0].is_alive())
+                    self.assertTrue(outside.is_alive())
+                finally:
+                    allow_start.set()
+                    release.touch()
+                    outside_release.set()
+                    if launcher.ident is not None:
+                        original_join(launcher, TEST_HANG_GUARD_SECS)
+                    for thread in threading.enumerate():
+                        if thread is outside or (thread not in existing and thread.name == "hold-event-recorder"):
+                            original_join(thread, TEST_HANG_GUARD_SECS)
+                            self.assertFalse(thread.is_alive())
 
     def test_hold_fixture_timeout_reaps_all_children_and_owned_threads_before_restoring_home(self) -> None:
         tree = self.root / "blocked-record-tree/scripts"

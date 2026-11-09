@@ -25,7 +25,7 @@ With no JSON and no errors, stdout stays empty.
 
 Execution uses importlib's bytecode cache with a fresh __main__ module because
 compiling the largest hooks exceeds 2 ms. Streams (including stdin.buffer), file
-descriptors, argv, environment, cwd, import path and signal handlers are isolated.
+descriptors, argv, environment, cwd and signal handlers are isolated.
 Alarm calls inside a hook are multiplexed with its outer deadline, so a hook's
 own SIGALRM handler and shorter budget work without cancelling our timeout.
 The outer timeout in settings.json covers the largest sum of matching hook budgets
@@ -75,7 +75,6 @@ class CopyPolicyHook:
 
     @property
     def timeout(self) -> float:
-        sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
         from scripts.copies.copy_guard import hook_timeout
         return hook_timeout()
 
@@ -112,6 +111,7 @@ POST_TOOL_USE = (
     HookSpec("post-tool-use-sendmessage-miss.py", "SendMessage"),
 )
 STOP = (
+    HookSpec("compaction-marker-clear.py", None, 10),
     HookSpec("stop-conversation-pause.py", None),
     HookSpec("stop-assistant-prose-banned-words.py", None),
     HookSpec("stop-context-deferral.py", None, 10),
@@ -279,8 +279,8 @@ def run_hook(path: Path, payload: str, timeout: float | Callable[[], float] = 60
     """Execute a script, retaining output only if it completes within budget."""
     path = path.resolve()
     streams = sys.stdin, sys.stdout, sys.stderr
-    argv, environment, search_path = sys.argv, os.environ, sys.path
-    original_environment, original_search_path = dict(environment), list(search_path)
+    argv, environment = sys.argv, os.environ
+    original_environment = dict(environment)
     handlers = _signal_handlers()
     cwd = os.open(".", os.O_RDONLY)
     exit_code = 0
@@ -300,7 +300,6 @@ def run_hook(path: Path, payload: str, timeout: float | Callable[[], float] = 60
             _ = os.dup2(stderr.fileno(), 2)
             sys.stdin, sys.stdout, sys.stderr = stdin, hook_stdout, hook_stderr
             sys.argv = [str(path)]
-            sys.path = [str(path.parent), *original_search_path]
             try:
                 with _alarm_budget(timeout() if callable(timeout) else timeout):
                     _execute(path)
@@ -325,8 +324,7 @@ def run_hook(path: Path, payload: str, timeout: float | Callable[[], float] = 60
                 _try_cleanup(hook_stderr.close)
                 _try_cleanup(stdout.flush)
                 _try_cleanup(stderr.flush)
-                sys.argv, sys.path = argv, search_path
-                search_path[:] = original_search_path
+                sys.argv = argv
                 os.environ = environment
                 _try_cleanup(environment.clear)
                 _try_cleanup(lambda: environment.update(original_environment))

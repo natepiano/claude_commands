@@ -51,7 +51,7 @@ A change that old code cannot read safely requires a new schema number.
 `WorkerObservation.identity` is `ClaudeSession`, `CodexThread`, or `BackendUnavailable`.
 
 Run records identify workers through fixed staff references.
-The [worker lifecycle](long-lived-workers.md#roster-fields) defines their stored fields.
+The [worker lifecycle](long-lived-workers.md#staff-membership-and-dispatch) defines their stored fields.
 Its [admission boundary](long-lived-workers.md#staff-identity-and-admission) publishes the current runtime.
 
 `set_worktree` compares an expected `PresentWorktree`, `RemovedWorktree`, or `WorktreeUnfilled` under the staff lock.
@@ -61,6 +61,19 @@ A row lock protects one member during a worker change.
 It also removes the [operation configuration](agent-registry.md#agent-environment-boundary).
 Staff lock and remote waits read `OPERATION_LOCK_SECONDS` and `REMOTE_SECONDS` from `config/staff.conf` at use.
 Each wait uses the smaller configured limit or remaining operation deadline.
+
+## Production document lookup
+
+`StaffSnapshot.by_doc(machine, path)` prefers an exact document path.
+Otherwise, it compares the Git common directory and repository-relative document path.
+`_document_checkout` reads `.git`, `gitdir:`, and `commondir` without a subprocess.
+It returns `CheckoutDocument`, `OutsideGitCheckout`, or `UnreadableGitCheckout`.
+A document outside Git matches only an exact path.
+Unreadable metadata for the requested document raises `StaffRefused`.
+Unreadable metadata for another candidate causes the lookup to skip that candidate.
+Several repository matches raise `StaffRefused` with the matching staff ids.
+Question writers resolve relative folders from the selected owner's document.
+Each checkout therefore uses the same question store.
 
 ## Accessor table
 
@@ -77,9 +90,10 @@ They also include `set_doc`, `set_worktree`, `update_current_session`, `set_hold
 | `scripts/accounts/accounts.py` | read | local_snapshot |
 | `scripts/accounts/pane_moves.py` | read | local_snapshot, WorkerName.parse |
 | `scripts/accounts/refusal_watch.py` | read | initial_snapshot |
+| `scripts/accounts/session_state.py` | read | StaffRow, Exited, Paused |
 | `scripts/accounts/unit_watchdog.py` | read | active, initial_snapshot, snapshot |
-| `scripts/agents/codex_mesh.py` | read | native_id, runtime_id, snapshot |
-| `scripts/agents/mesh_runs.py` | read | local_snapshot |
+| `scripts/agents/codex_test_support.py` | read | CodexBackend (fixture) |
+| `scripts/agents/detached_runs.py` | read | local_snapshot |
 | `scripts/agents/test_agent_exec.sh` | read | staff.json (shell) |
 | `scripts/astra/astra_review.py` | read | runtime_id |
 | `scripts/astra/astra_roles.py` | read | local_snapshot |
@@ -99,24 +113,25 @@ They also include `set_doc`, `set_worktree`, `update_current_session`, `set_hold
 | `scripts/direct/assign_launcher_test_support.py` | write | by_id, local_snapshot, rename, set_worktree |
 | `scripts/direct/board_json.py` | read | active, snapshot |
 | `scripts/direct/claude_worker.py` | read | runtime_id |
+| `scripts/direct/clear_phase_review.sh` | read | local_snapshot |
 | `scripts/direct/phase_reservation.py` | read | snapshot, WorktreeUnfilled |
 | `scripts/direct/phase_table.py` | read | active, snapshot |
 | `scripts/direct/plan_history.py` | read | snapshot |
 | `scripts/direct/progress_history.py` | read | active, initial_snapshot, snapshot |
 | `scripts/direct/recorder_fixture.py` | read | PresentWorktree |
-| `scripts/direct/remove_workers.py` | write | local_snapshot, retire |
+| `scripts/direct/remove_workers.py` | read | local_snapshot, runtime_id |
 | `scripts/direct/review.sh` | read | local_snapshot, StaffRow |
 | `scripts/direct/review_launcher_test_support.py` | write | local_snapshot, native_id, update_current_session |
 | `scripts/direct/verify.sh` | read | snapshot, by_id, StaffId, StaffRow |
 | `scripts/direct/worker_runs.py` | read | StaffId, StaffSnapshot |
-| `scripts/direct/workers.py` | read | initial_snapshot |
+| `scripts/direct/worker_state.py` | read | StaffRow |
+| `scripts/direct/workers.py` | read | initial_snapshot, local_snapshot |
 | `scripts/hana_shot/hana_shot.py` | read | local_snapshot, runtime_id |
 | `scripts/herdr/herdr.py` | read | active, initial_snapshot, native_id, runtime_id |
 | `scripts/herdr/herdr_sessions.py` | read | initial_snapshot |
 | `scripts/herdr/pane_launch.py` | read | initial_snapshot |
 | `scripts/herdr/side_pane.py` | read | runtime_id |
 | `scripts/herdr/worker_panes.py` | write | snapshot, runtime_id, row_operation, slot_operation; worker_admission.publish |
-| `scripts/hierarchies/worker_adoption.py` | read | local_snapshot, row_operation, ReportsTo, StaffId |
 | `scripts/hooks/conversation_pause.py` | read | snapshot; LiveDoc, WrappedDoc |
 | `scripts/hooks/conversation_pause_test_support.py` | write | LiveDoc; fixture_member calls ensure |
 | `scripts/hooks/herdr_tab_title.py` | read | snapshot |
@@ -172,11 +187,10 @@ They also include `set_doc`, `set_worktree`, `update_current_session`, `set_hold
 | `scripts/production/proposals_folder.py` | read | initial_snapshot |
 | `scripts/production/proposals_table.py` | read | none (StaffSnapshot type) |
 | `scripts/production/prune_phase_notes.py` | read | snapshot |
-| `scripts/production/rename.py` | write | by_id, cli_result, operation, rename, row_operation, set_doc, snapshot |
 | `scripts/production/rename_state.py` | read | snapshot |
 | `scripts/production/rename_test_support.py` | write | find, native_id, operation, set_worktree, update_current_session |
 | `scripts/production/rename_unit_test_support.py` | read | snapshot |
-| `scripts/shutdown/shutdown.py` | write | cli_result, initial_snapshot, operation, operation_fds, restore_unit, set_worktree, snapshot |
+| `scripts/shutdown/shutdown.py` | write | by_id, cli_result, initial_snapshot, operation, operation_fds, rename, restore_unit, row_operation, set_doc, set_worktree, snapshot |
 | `scripts/production/session_labels.py` | read | snapshot |
 | `scripts/production/session_staff.py` | read | active, snapshot |
 | `scripts/production/showrunner_parent.py` | write | cli_result, move, operation, snapshot |
@@ -197,6 +211,7 @@ They also include `set_doc`, `set_worktree`, `update_current_session`, `set_hold
 | `scripts/production/unit_lookup.py` | read | snapshot |
 | `scripts/production/unit_move.py` | write | folder_move_path, native_id, set_worktree, snapshot |
 | `scripts/production/unit_phases.py` | read | snapshot |
+| `scripts/production/unit_queue.py` | read | local_snapshot, by_current_session, caller_identity, StaffId |
 | `scripts/production/unit_run.py` | read | snapshot |
 | `scripts/production/unit_status.sh` | read | snapshot |
 | `scripts/production/unit_status_test_support.py` | write | set_doc, set_worktree |
@@ -205,7 +220,6 @@ They also include `set_doc`, `set_worktree`, `update_current_session`, `set_hold
 | `scripts/production/waiting.py` | read | snapshot |
 | `scripts/production/worker.py` | write | backend, snapshot, runtime_id, row_operation, retire |
 | `scripts/production/worker_admission.py` | write | by_current_session, ensure_worker, native_id, runtime_id, snapshot, update_current_session |
-| `scripts/production/worker_fill.py` | write | ensure_worker, native_id, snapshot |
 | `scripts/review_links/change_browser.py` | read | none (ReportsTo type) |
 | `scripts/review_links/change_page.py` | read | snapshot |
 | `scripts/shutdown/inventory.py` | read | local_snapshot |
@@ -237,9 +251,10 @@ They also include `set_doc`, `set_worktree`, `update_current_session`, `set_hold
 | `scripts/usage/outcomes.py` | read | snapshot |
 | `scripts/usage/usage_report.py` | read | snapshot |
 | `scripts/usage/waste_watch.py` | read | snapshot |
+| `scripts/worktree/worktrees.py` | read | snapshot, StaffSnapshot, StaffAbsent, StaffRefused |
 | `~/rust/cargo-liner-handler/crates/cargo-handler/src/census/hierarchy.rs` | read | StaffFileReader reads staff.json (Rust, direct) |
 
-165 accessors: 32 write, 132 read, 1 owner.
+172 accessors: 30 write, 141 read, 1 owner.
 
 ## Approved copies
 

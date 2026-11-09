@@ -7,14 +7,12 @@ except FileNotFoundError:
     pass
 
 import argparse
-from datetime import datetime, timezone
 import os
 from pathlib import Path
 import platform
 import shlex
 import sys
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.lib import conf, main_publish
 from scripts.lib.conf import Unusable, check
 from scripts.lib.atomic_file import write_text_atomic
@@ -75,15 +73,11 @@ def _publish(args: RequestedValueChange, checkout: Path, *, already: bool) -> in
     outcome = main_publish.pull_mac(checkout, ssh_program=os.environ.get("ZONE_SSH") or "ssh",
                                     time_limit=MAC_PULL_LIMIT)
     if isinstance(outcome, main_publish.MacPulled):
-        pending = main_publish.read_queue()
-        if isinstance(pending, main_publish.PendingMacPull) and not pending.text:
-            main_publish.queue_path().unlink(missing_ok=True)
+        main_publish.clear_pull_only()
         if not already:
             print("mac: pulled")
     else:
-        main_publish.queue(main_publish.PendingMacPull(
-            label=f"{args.file}.{args.key}", text="",
-            since=datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"), reason=outcome.reason))
+        main_publish.queue_pull_only(f"{args.file}.{args.key}", outcome.reason)
         print(f"mac: queued ({outcome.reason}); the 15-minute sync sends it when the Mac wakes")
     return 0
 

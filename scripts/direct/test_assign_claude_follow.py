@@ -52,6 +52,7 @@ class AssignClaudeLauncherWorkerTests(ClaudeLauncherFixture):
         run = self.start_phase("unreadable-dispatch")
         transcript = self.claude_worker(run)
         row = self.recorded_worker(run)
+        record_path = worker_admission.switch_record_path(run, row.name)
         modules = self.root / "read-failure"
         modules.mkdir()
         _ = (modules / "sitecustomize.py").write_text("\n".join((
@@ -59,9 +60,9 @@ class AssignClaudeLauncherWorkerTests(ClaudeLauncherFixture):
             "from pathlib import Path",
             "read_text = Path.read_text",
             "def read(path, *args, **kwargs):",
-            f"    if path == Path({str(run / 'mesh_roster.json')!r}) and any(frame.function == '_switch' for frame in inspect.stack()) and any(frame.function == 'dispatch_record' for frame in inspect.stack()):",
+            f"    if path == Path({str(record_path)!r}) and any(frame.function == 'dispatch_record' for frame in inspect.stack()) and any(frame.function == '_read_validated_json' for frame in inspect.stack()):",
             "        Path.read_text = read_text",
-            "        raise PermissionError('fixture roster read failed')",
+            "        raise PermissionError('fixture dispatch read failed')",
             "    return read_text(path, *args, **kwargs)",
             "Path.read_text = read",
         )))
@@ -71,7 +72,7 @@ class AssignClaudeLauncherWorkerTests(ClaudeLauncherFixture):
             result = self.worker_launch(run, to="fixture-impl", behavior="complete")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(result.stderr.splitlines(),
-                         [f"anomaly: {row.name}: {run / 'mesh_roster.json'}: worker state unreadable: fixture roster read failed"])
+                         [f"anomaly: {row.name}: {record_path}: worker state unreadable: fixture dispatch read failed"])
         self.assertEqual(len(transcript.read_text().splitlines()), 2)
         self.assertEqual(self.recorded_worker(run), row)
 
@@ -85,7 +86,8 @@ class AssignClaudeLauncherWorkerTests(ClaudeLauncherFixture):
             row = staff.update_current_session(old.current_session, identity)
         source, evidence = transcript_fixture(row, staff.CodexBackend(self.root / ".codex"))
         _ = (run / "impl_worker_impl.json").write_text(json.dumps({"staff_id": row.id, "slot": "impl", "model": "gpt-6"}))
-        _ = (run / "mesh_roster.json").write_text(json.dumps({row.name: {"staff_id": row.id, "status": "done", "dispatch_state": "invalid"}}))
+        record_path = worker_admission.switch_record_path(run, row.name)
+        _ = record_path.write_text(json.dumps({"dispatch_state": "invalid"}))
         modules = stopped_worker_module(self.root / "switch-modules")
         environment = self.environment()
         environment["PYTHONPATH"] = os.pathsep.join((str(modules), str(CHECKOUT)))
@@ -110,15 +112,15 @@ class AssignClaudeLauncherWorkerTests(ClaudeLauncherFixture):
         original = sender.read_text()
         probe = "\n".join((
             "import json, os, sys",
-            f"sys.path.insert(0, {str(Path(__file__).resolve().parents[2])!r})",
+            f"with open({str(Path(__file__).resolve().parents[2] / 'scripts/lib/package_root.py')!r}) as package_root: exec(package_root.read(), {{'__file__': package_root.name}})",
             "from pathlib import Path",
-            "from scripts.agents import codex_mesh",
-            "from scripts.direct import workers",
+            "from scripts.herdr import worker_panes",
+
             "from scripts.production import staff",
             "identity = 'abc12345-2222-4333-8444-555555555555'",
             "member = staff.by_current_session(identity)",
             "assert member is not None",
-            "role = workers._worker_task_role({'staff_id': member.id}, staff.local_snapshot(), codex_mesh.task_assignments())",
+            "role = worker_panes.dispatch_role(member)",
             f"Path({str(self.root / 'delivered-role.json')!r}).write_text(json.dumps(role))",
         ))
         _ = sender.write_text(original.replace("import sys", probe + "\nimport sys", 1))

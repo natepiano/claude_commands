@@ -27,6 +27,23 @@ Telemetry does not stop the launch.
 
 ## Event model
 
+`owner_staff_id` is the run's owner field.
+Owner lookup uses a fixed staff id and reads the current unit or showrunner row.
+Older records can resolve their director's session identity at the history boundary.
+Saved event names remain historical text.
+Active readers obtain the current folder through `plan_history.staff_directory`.
+They do not route through saved folder copies or an absolute plan path.
+`start-run` with a plan calls `unit_config.set_plan` on the unit's existing `.unit.toml`.
+Staff stores neither the plan nor the port.
+
+`progress_history.last_dispatch(worker_id)` returns `RecordedDispatch` or `NoDispatchRecorded`.
+It finds the newest open or finished dispatch across the worker parent's runs.
+A recorded worker id takes precedence over a legacy pass name.
+`DispatchDetailNotRecorded.UNRECORDED` represents an absent dispatch field.
+The result includes the phase instance and status.
+Resume messages use these settings to construct `assign.sh` commands.
+`write_review_turn` owns review-turn records.
+
 Schema version 1 records these event types:
 
 - `run_started` / `run_finished`
@@ -239,6 +256,7 @@ as slow, not where it is cut off.
 
 A ledger batch with a started fix pass counts as one repair round. Relaunches of that batch add no round.
 A dispatch alone adds no round. Passes without a ledger batch add no round to `repair_round`.
+A refused launch spends no fix attempt or repair budget.
 `history.py rounds` still reports their overlap groups, including gate, merge and live work.
 `dispatch` records the batch before the worker launch. Its `round` is a stable audit number.
 `repair_round` uses the fix pass history and its `launch_check.fix_cause.round` ledger number. Missing pass history gives no repair rounds.
@@ -249,6 +267,12 @@ The first batch without a refund sets the budget's original finding count.
 The consecutive-fix advisory counts each ledger batch once per worker. Refunded batches add no fix to that count.
 
 ## Commands
+
+`findings.py close-route --from` accepts the exact key printed by the routed-work list.
+The key is `<run id>:<phase instance id>:<finding id>`.
+A route created before its phase record uses `<run id>::<finding id>`.
+The parser requires three parts and nonblank run and finding ids.
+It accepts an empty phase instance id and preserves the `finding_route_closed` event format.
 
 ```text
 findings.py open --session-dir <dir> [--phase <id>] --severity blocker|minor|nit --title <text> --caught-by worker|main|both [--file <path>] [--line <N>] [--detail <text>]

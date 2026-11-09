@@ -58,7 +58,6 @@ class AssignClaudeLauncherWorkerTests(ClaudeLauncherFixture):
             "CLAUDE_CONFIG_DIR": account["CLAUDE_CONFIG_DIR"] or str(self.root / ".claude"),
         }):
             self.assertIsInstance(staff.local_snapshot().backends[self.recorded_worker(run, "fix").id], staff.ClaudeBackend)
-        self.assertFalse((run / "mesh_roster.json").exists())
 
     def test_claude_fresh_refusal_preserves_artifacts_and_opens_no_pass_or_process(self) -> None:
         run = self.start_phase("claude-admission-refusal")

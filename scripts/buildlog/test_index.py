@@ -13,7 +13,7 @@ import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import cast, override
 from unittest import mock
@@ -24,8 +24,11 @@ from scripts.buildlog import parse
 from scripts.buildlog import store
 from scripts.buildlog import report
 from scripts.buildlog import record as recorder
+from scripts.buildlog import step_outputs
 from scripts.lib import test_hang_guard
+from scripts.lib import conf
 from scripts.lint.memory_test_support import write_config_fixture
+from scripts.lint import sweep
 from scripts.test_times.gate_record_test_support import gate_run
 from scripts.buildlog.record import TARGET_DIR_UNSET
 from scripts.buildlog.store import UNKNOWN_IDENTITY
@@ -218,7 +221,7 @@ class LogIsolationTests(unittest.TestCase):
             [str(CLI.parents[1] / "lib/py"), "-c",
              "import os; from scripts.buildlog import test_index; print({key: os.environ[key] "
              + "for key in test_index.COORDINATION_VARIABLES if key in os.environ})"],
-            cwd=Path(__file__).parent, env=environment, capture_output=True, text=True,
+            cwd=Path(__file__).resolve().parents[2], env=environment, capture_output=True, text=True,
             timeout=test_hang_guard.TEST_HANG_GUARD_SECS,
         )
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -237,7 +240,7 @@ class LogIsolationTests(unittest.TestCase):
                     + "importlib.import_module(sys.argv[1]); print(store.root())",
                     "scripts.buildlog." + module.stem,
                 ],
-                cwd=module.parent,
+                cwd=Path(__file__).resolve().parents[2],
                 env=environment,
                 capture_output=True,
                 text=True,
@@ -276,6 +279,41 @@ class IndexTests(unittest.TestCase):
         point_root_at(self, self.root)
         self.host_file = self.root / "natedev" / "2026-10.jsonl"
         self.host_file.parent.mkdir(parents=True)
+
+    def test_update_enables_the_configured_spill_threshold(self) -> None:
+        spill_pages = conf.read("buildlog").whole("INDEX_SPILL_PAGES")
+        with closing(index.open_for_update(index.index_path())) as writer:
+            self.assertEqual(writer.execute("PRAGMA cache_spill").fetchone(), (spill_pages,))
+
+    def test_update_uses_wal_for_new_and_existing_indexes(self) -> None:
+        with closing(index.open_for_update(index.index_path())) as writer:
+            self.assertEqual(writer.execute("PRAGMA journal_mode").fetchone(), ("wal",))
+        with closing(sqlite3.connect(index.index_path())) as writer:
+            self.assertEqual(writer.execute("PRAGMA journal_mode = DELETE").fetchone(), ("delete",))
+        with closing(index.open_for_update(index.index_path())) as writer:
+            self.assertEqual(writer.execute("PRAGMA journal_mode").fetchone(), ("wal",))
+
+    def test_read_only_returns_committed_rows_during_spill_and_after_writer_closes(self) -> None:
+        wal = Path(str(index.index_path()) + "-wal")
+        with closing(index.open_for_update(index.index_path())) as writer:
+            writer.execute("INSERT INTO meta (key, value) VALUES ('retained', 'committed')").close()
+            writer.execute("PRAGMA cache_size = 10").close()
+            writer.execute("PRAGMA cache_spill = 10").close()
+            writer.execute("PRAGMA cache_spill = ON").close()
+            before = wal.stat().st_size if wal.exists() else 0
+            writer.execute("BEGIN IMMEDIATE").close()
+            try:
+                writer.executemany("INSERT INTO meta (key, value) VALUES (?, ?)",
+                                   ((f"pending-{number}", "x" * 4096) for number in range(100))).close()
+                with self.subTest("WAL grows before commit"):
+                    self.assertGreater(wal.stat().st_size if wal.exists() else 0, before)
+                with mock.patch.object(index, "BUSY_TIMEOUT_MS", 100), closing(index.read_only()) as reader:
+                    self.assertEqual(reader.execute("SELECT COUNT(*) FROM meta").fetchone(), (1,))
+            finally:
+                writer.execute("ROLLBACK").close()
+        self.assertFalse(wal.exists())
+        with closing(index.read_only()) as reader:
+            self.assertEqual(reader.execute("SELECT COUNT(*) FROM meta").fetchone(), (1,))
 
     def test_complete_update_time_rolls_back_with_a_failed_update(self) -> None:
         self.write(self.host_file, step("retained"))
@@ -877,15 +915,61 @@ class IndexTests(unittest.TestCase):
                         build_directory="/intermediates"),
                    step("same", target_directory="/output", build_directory="/output"),
                    step("legacy", target_dir="/legacy-output"),
+                   step("override", target_dir="/override-output",
+                        argv=["cargo", "build", "--target-dir", "/override-output"]),
+                   step("target-only", target_directory="/artifacts"),
+                   step("build-only", build_directory="/intermediates"),
                    step("unknown"))
-        self.assertEqual(index.update(), 4)
+        self.assertEqual(index.update(), 7)
         self.assertEqual(self.rows(
             "SELECT id, target_directory, build_directory FROM steps ORDER BY id"), [
-                ("legacy", "/legacy-output", "/legacy-output"),
+                ("build-only", UNKNOWN_IDENTITY, UNKNOWN_IDENTITY),
+                ("legacy", UNKNOWN_IDENTITY, UNKNOWN_IDENTITY),
+                ("override", UNKNOWN_IDENTITY, UNKNOWN_IDENTITY),
                 ("same", "/output", "/output"),
                 ("split", "/artifacts", "/intermediates"),
+                ("target-only", UNKNOWN_IDENTITY, UNKNOWN_IDENTITY),
                 ("unknown", UNKNOWN_IDENTITY, UNKNOWN_IDENTITY),
             ])
+
+    def test_steps_without_output_pairs_do_not_add_recorded_cargo_mappings(self) -> None:
+        config = configure_cleanup(self, self.root)
+        _ = write_config_fixture(config / "lint.conf")
+        self.enterContext(mock.patch.dict(os.environ, {"LINT_SWEEP_STATE_DIR": str(self.root / "sweep-state")}))
+        override = self.root / "override-output"
+        plain = self.root / "plain-output"
+        started = (sweep.TARGET_OVERRIDE_RECORDER_CUT + timedelta(seconds=1)).isoformat()
+        self.write(self.host_file,
+                   step("override", target_dir=str(override), started_at=started,
+                        argv=["cargo", "build", "--target-dir", str(override)]),
+                   step("plain", target_dir=str(plain), started_at=started,
+                        argv=["cargo", "build"]))
+        self.assertEqual(index.update(), 2)
+        outputs = step_outputs.recorded_output_roots(index.index_path(), "natedev")
+        assert isinstance(outputs, step_outputs.RecordedStepOutputs)
+        self.assertEqual(len(outputs.rows), 2)
+        with mock.patch.object(store, "host_name", return_value="natedev"):
+            mappings = sweep.discover_cargo_outputs([], lint_settings=conf.read("lint"))[1]
+        pairs = {(item.target_directory, item.build_directory) for item in mappings.workspaces}
+        for output in outputs.rows:
+            with self.subTest(target_folder=output.target_folder):
+                assert isinstance(output.target_folder, step_outputs.AbsoluteRecordedRoot)
+                self.assertNotIn((output.target_folder.path, output.target_folder.path), pairs)
+
+    def test_schema_bump_rebuilds_inferred_output_pairs_from_unchanged_log(self) -> None:
+        self.write(self.host_file, step("inferred", target_dir="/legacy-output"))
+        original = self.host_file.read_bytes()
+        with mock.patch.object(index, "SCHEMA_VERSION", 34):
+            self.assertEqual(index.update(), 1)
+            old_index = index.index_path()
+        with closing(sqlite3.connect(old_index)) as connection, connection:
+            connection.execute(
+                "UPDATE steps SET target_directory = target_dir, build_directory = target_dir"
+            ).close()
+        self.assertEqual(index.update(), 1)
+        self.assertEqual(self.rows("SELECT target_directory, build_directory FROM steps"),
+                         [(UNKNOWN_IDENTITY, UNKNOWN_IDENTITY)])
+        self.assertEqual(self.host_file.read_bytes(), original)
 
     def test_test_phase_charge_bytes_rank_steps_and_preserve_null_for_older_rows(self) -> None:
         self.write(self.host_file,

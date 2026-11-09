@@ -8,6 +8,7 @@ from pathlib import Path
 from uuid import uuid4
 
 from scripts.accounts import accounts, moves, refusal_watch
+from scripts.agents.worker_lifecycle import WorkerStateUnreadable
 from scripts.accounts.accounts import SessionMoveOutcome
 from scripts.herdr import herdr, worker_panes
 from scripts.direct import progress_history
@@ -92,12 +93,9 @@ def _continue_pass(move: WorkerMove, opened: worker_panes.OpenWorker, source: st
                            target=str(move.row.current_session))
 
 
-def _recover_source(move: WorkerMove, source: str, original: worker_panes.OpenWorker | worker_panes.StoppedWorker | worker_panes.ClosedWorker,
-                    role: staff.WorkerRole, hold: worker_panes.WorkerLockHold) -> str:
+def _recover_source(move: WorkerMove, source: str, role: staff.WorkerRole, hold: worker_panes.WorkerLockHold) -> str:
     fresh = _observe(move)
-    terminal = original.terminal if isinstance(original, (worker_panes.OpenWorker, worker_panes.StoppedWorker)) else ""
-    if not (isinstance(fresh, worker_panes.StoppedWorker) and (not terminal or fresh.terminal == terminal)
-            or isinstance(fresh, worker_panes.ClosedWorker) and isinstance(original, worker_panes.ClosedWorker)):
+    if not isinstance(fresh, (worker_panes.StoppedWorker, worker_panes.ClosedWorker)):
         return "source not started; no fresh proof that the target process is absent"
     rollback = worker_panes.start_or_resume(move.parent, staff.WorkerName.parse(move.row.name), role,
                 account=worker_panes.DestinationWorkerAccount(source), lock=hold)
@@ -117,8 +115,8 @@ def _resume_destination(move: WorkerMove, source: str, state: worker_panes.OpenW
         stop_seconds = sum(settings.whole(key) for key in ("STOP_GRACE_SECONDS", "KILL_GRACE_SECONDS", "MOVE_STOP_MARGIN_SECONDS"))
         stopped = restart.stop_row(move.row, move.client, deadline=time.monotonic() + stop_seconds)
         fresh = _observe(move)
-        if not stopped or not isinstance(fresh, worker_panes.StoppedWorker) or fresh.terminal != terminal:
-            reason = "anomaly: stop did not prove the same worker terminal at its shell"
+        if not stopped or not isinstance(fresh, (worker_panes.StoppedWorker, worker_panes.ClosedWorker)):
+            reason = "anomaly: stop did not prove the worker stopped"
             moves.append_move(moves.FailedMove(**common, kind="failed", reason=reason))
             return accounts.SessionMoveRefused(move.row.id, reason)
     result = worker_panes.start_or_resume(move.parent, staff.WorkerName.parse(move.row.name), role,
@@ -129,7 +127,7 @@ def _resume_destination(move: WorkerMove, source: str, state: worker_panes.OpenW
         _continue_pass(move, result, source, move.target)
         return stop_results.ClaudeUp(move.row.id, result.pane, move.target, elapsed_seconds=elapsed_seconds)
     failure = _failed(move.row, result)
-    reason = f"{failure.reason}; {_recover_source(move, source, state, role, hold)}"
+    reason = f"{failure.reason}; {_recover_source(move, source, role, hold)}"
     moves.append_move(moves.FailedMove(**common, kind="failed", reason=reason))
     return replace(failure, reason=reason)
 
@@ -169,7 +167,10 @@ def _move_locked(move: WorkerMove, hold: worker_panes.WorkerLockHold) -> Session
 
 def run_for_worker(row: staff.StaffRow, record: staff.StaffSnapshot) -> Path:
     parent = record.parent_of(row)
-    return worker_panes.worker_run(parent) if parent is not None else Path()
+    try:
+        return worker_panes.worker_run(row, record=record) if parent is not None else Path()
+    except WorkerStateUnreadable as error:
+        raise ValueError(f"anomaly: {error}") from error
 
 
 def move_worker(row: staff.StaffRow, record: staff.StaffSnapshot, target: str, why: str, run: Path) -> SessionMoveOutcome:

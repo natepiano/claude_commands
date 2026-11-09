@@ -39,7 +39,6 @@ class StopReadArguments(TypedDict, total=False):
     """Forward shared observations only when the caller supplies them."""
 
     codex: herdr.CodexConversations | None
-    runs: dict[str, list[str]] | None
 
 
 @dataclass(frozen=True)
@@ -78,13 +77,12 @@ class WorkerPanes(Protocol):
     def observe(self, parent: staff.StaffId, record: staff.StaffSnapshot) -> list[WorkerRow]: ...
     def observe_parents(self, parents: list[staff.StaffRow], record: staff.StaffSnapshot
                         ) -> dict[staff.StaffId, list[WorkerRow]]: ...
-    def worker_run(self, parent: staff.StaffRow, *,
-                   record: staff.StaffSnapshot | unit_runs.RunStaffAtUse = unit_runs.RunStaffAtUse.LOCAL,
-                   scanned: dict[str, list[str]] | None = None) -> Path: ...
 
 
 class WorkerRestore(Protocol):
     def restore(self, parent: staff.StaffId, *, record: staff.StaffSnapshot | None = None,
+                only: frozenset[staff.StaffId] | Literal["all"] = "all", account: str | accounts.AccountSelection = "",
+                started_panes: dict[staff.StaffId, str] | Literal["discard"] = "discard",
                 runs: dict[str, list[str]] | None = None,
                 codex: herdr.CodexConversations | herdr.CodexLaunchRead = herdr.CodexLaunchRead.CURRENT) -> int: ...
 
@@ -96,11 +94,9 @@ class AgentsCommand(Protocol):
 class MemberLifecycle(Protocol):
     def detach(self, arguments: list[str], task: str, *, program: Path) -> Path: ...
     def stop(self, session: str, *, deadline: float,
-             codex: herdr.CodexConversations | None = None,
-             runs: dict[str, list[str]] | None = None) -> StopResult: ...
+             codex: herdr.CodexConversations | None = None) -> StopResult: ...
     def stop_unit_workers(self, unit: staff.StaffId, record: staff.StaffSnapshot, *,
-                          codex: herdr.CodexConversations | None = None,
-                          runs: dict[str, list[str]] | None = None) -> list[str]: ...
+                          codex: herdr.CodexConversations | None = None) -> list[str]: ...
 
 
 worker_panes = cast(WorkerPanes, cast(object, import_module("scripts.herdr.worker_panes")))
@@ -131,8 +127,7 @@ def _anomaly(row: staff.StaffRow, error: object) -> None:
 
 
 def stop_row(row: staff.StaffRow, client: herdr.Herdr, *, deadline: float = math.inf,
-             codex: herdr.CodexConversations | None = None,
-             runs: dict[str, list[str]] | None = None) -> bool:
+             codex: herdr.CodexConversations | None = None) -> bool:
     with operation_deadline.within(deadline):
         try:
             panes = [pane for pane in client.panes() if pane["session_id"] == row.current_session]
@@ -150,7 +145,7 @@ def stop_row(row: staff.StaffRow, client: herdr.Herdr, *, deadline: float = math
         except (herdr.HerdrFailure, OSError, ValueError) as error:
             _anomaly(row, error)
             return False
-        shared: StopReadArguments = {"codex": codex, "runs": runs} if codex is not None or runs is not None else {}
+        shared: StopReadArguments = {"codex": codex} if codex is not None else {}
         result = stop_resume.stop(str(row.current_session), deadline=deadline, **shared)
         if isinstance(result, (Stopped, NotRunning)):
             return True
@@ -190,8 +185,10 @@ def session_launch(identity: str, name: str) -> tuple[Literal["claude", "codex"]
     raise OSError(f"no transcript for {identity}")
 
 
-def pane_workers(row: staff.StaffRow) -> bool:
-    return unit_runs.worker_transport(worker_panes.worker_run(row)) != "mesh"
+@dataclass(frozen=True)
+class PaneConversations:
+    codex: herdr.CodexConversations
+    names: dict[str, str]
 
 
 @dataclass(frozen=True)
@@ -199,30 +196,40 @@ class RestartObservations:
     codex: herdr.CodexConversations
     runs: dict[str, list[str]]
     pane_owners: frozenset[staff.StaffId]
+    pane_names: dict[str, str]
 
 
 def _observations(record: staff.StaffSnapshot, client: herdr.Herdr) -> RestartObservations:
-    owners = [row for row in record.rows if row.kind in ("unit", "showrunner")
-              and any(child.parent == staff.ReportsTo(row.id) for child in record.rows)]
+    owners = frozenset(row.id for row in record.rows if row.kind in ("unit", "showrunner")
+                       and record.find(kind="worker", parent=row.id))
     runs = unit_runs.held_by_session(os.environ.get("ROSTER_RUN_ROOT"), record=record) if owners else {}
-    pane_owners: set[staff.StaffId] = set()
-    for row in owners:
-        directory = worker_panes.worker_run(row, record=record, scanned=runs)
-        if unit_runs.worker_transport(directory) != "mesh":
-            pane_owners.add(row.id)
-    return RestartObservations(_codex_conversations(client), runs, frozenset(pane_owners))
+    panes = _codex_conversations(client)
+    return RestartObservations(panes.codex, runs, owners, panes.names)
 
 
 def _restore_workers(row: staff.StaffRow, record: staff.StaffSnapshot, *,
-                     observed: RestartObservations | None = None) -> None:
+                     observed: RestartObservations | None = None,
+                     target_account: str | accounts.AccountSelection = "") -> str:
     worker = cast(WorkerRestore, cast(object, import_module("scripts.production.worker")))
-    if row.kind in ("unit", "showrunner") and any(
+    started_panes: dict[staff.StaffId, str] = {}
+    if row.kind == "worker":
+        parent = record.parent_of(row)
+        if parent is None:
+            return ""
+        result = worker.restore(parent.id, record=record, only=frozenset({row.id}), started_panes=started_panes,
+            account=target_account,
+            runs=observed.runs if observed is not None else None,
+            codex=observed.codex if observed is not None else herdr.CodexLaunchRead.CURRENT)
+    elif row.kind in ("unit", "showrunner") and any(
             child.kind == "worker" and child.parent == staff.ReportsTo(row.id) for child in record.rows
-            ) and (pane_workers(row) if observed is None else row.id in observed.pane_owners):
-        result = (worker.restore(row.id) if observed is None else
+            ):
+        result = (worker.restore(row.id, record=record) if observed is None else
                   worker.restore(row.id, record=record, runs=observed.runs, codex=observed.codex))
-        if result != 0:
-            raise OSError("worker restore is incomplete")
+    else:
+        return ""
+    if result != 0:
+        raise OSError("worker restore is incomplete")
+    return started_panes.get(row.id, "")
 
 
 def pane_holds_other_work(client: herdr.Herdr, pane_id: str, identity: str) -> bool:
@@ -246,12 +253,15 @@ def start_row(row: staff.StaffRow, record: staff.StaffSnapshot, client: herdr.He
         live = (herdr.read_conversation(str(row.current_session)) if observed is None else
                 herdr.read_conversation(str(row.current_session), codex=observed.codex))
         if isinstance(live, herdr.LiveConversation):
-            if worker_scope is WorkerRestartScope.FOLLOW_OWNER:
-                _restore_workers(row, record, **({"observed": observed} if observed is not None else {}))
+            if row.kind != "worker" and worker_scope is WorkerRestartScope.FOLLOW_OWNER:
+                _ = (_restore_workers(row, record) if observed is None else
+                     _restore_workers(row, record, observed=observed))
             print(f"{row.name}: unchanged")
             return ""
         if isinstance(live, herdr.UnknownConversation):
             herdr.conversation_note(live)
+        if row.kind == "worker":
+            return _restore_workers(row, record, observed=observed, target_account=target_account)
         machine, folder = shutdown_record.row_folder(row, record, resolver=resolver)
         from scripts.shutdown import remote
         if machine != remote.local_machine():
@@ -297,7 +307,8 @@ def start_row(row: staff.StaffRow, record: staff.StaffSnapshot, client: herdr.He
                    herdr.read_conversation(str(row.current_session), kind, codex=observed.codex))
         if isinstance(current, herdr.LiveConversation):
             if worker_scope is WorkerRestartScope.FOLLOW_OWNER:
-                _restore_workers(row, record, **({"observed": observed} if observed is not None else {}))
+                _ = (_restore_workers(row, record) if observed is None else
+                     _restore_workers(row, record, observed=observed))
             print(f"{row.name}: unchanged")
             return ""
         if isinstance(current, herdr.UnknownConversation) and not isinstance(live, herdr.UnknownConversation):
@@ -333,7 +344,8 @@ def start_row(row: staff.StaffRow, record: staff.StaffSnapshot, client: herdr.He
         except (OSError, ValueError, herdr.HerdrFailure, subprocess.SubprocessError) as error:
             _anomaly(row, error)
         if worker_scope is WorkerRestartScope.FOLLOW_OWNER:
-            _restore_workers(row, record, **({"observed": observed} if observed is not None else {}))
+            _ = (_restore_workers(row, record) if observed is None else
+                 _restore_workers(row, record, observed=observed))
         print(f"{row.name}: restarted")
         return result.pane
 
@@ -414,31 +426,41 @@ def live_members(rows: Iterable[staff.StaffRow], record: staff.StaffSnapshot, *,
     return selected
 
 
-def _codex_conversations(client: herdr.Herdr) -> herdr.CodexConversations:
-    """Use the native pane reader for resumed Codex processes without open rollouts."""
-    observed = herdr.codex_conversations()
-    if not observed.unknown:
-        return observed
-    live = dict(observed.live)
-    unknown = list(observed.unknown)
+def _codex_conversations(client: herdr.Herdr) -> PaneConversations:
+    """Read panes once for native Codex identities and report names."""
+    live: dict[str, tuple[int, ...]] = {}
+    names: dict[str, str] = {}
+    resolved_tabs: set[str] = set()
     try:
         panes = client.listed("pane")
     except (OSError, ValueError, herdr.HerdrFailure):
-        return observed
+        return PaneConversations(herdr.codex_conversations(), names)
+    try:
+        tabs = {herdr.json_text(tab.get("tab_id"), "tab id"):
+                herdr.json_text(tab.get("label") or "", "tab label") for tab in client.listed("tab")}
+    except (OSError, ValueError, herdr.HerdrFailure):
+        tabs = {}
     for pane in panes:
-        if pane.get("agent") != "codex":
-            continue
         try:
             pane_id = herdr.json_text(pane.get("pane_id"), "pane id")
+            tab_name = tabs.get(str(pane.get("tab_id", "")), "")
+            label = herdr.json_text(pane.get("label") or "", "pane label")
+            display = f"{tab_name} {label} ({pane_id})".strip()
+            if identity := herdr.pane_session(pane):
+                names[identity] = display
+            if pane.get("agent") != "codex":
+                continue
             info = herdr.json_object(client.result("pane", "process-info", "--pane", pane_id).get("process_info"),
                                      "native pane processes")
             identity = herdr.pane_native_process(info, "codex", pane).current_identity
-            _ = live.setdefault(identity, ())
-            name = client.pane_tab(pane_id)[2]["name"]
-            unknown = [reason for reason in unknown if reason != f"{name} (Codex thread unknown)"]
+            live[identity] = ()
+            names[identity] = display
+            resolved_tabs.add(f"{tab_name} (Codex thread unknown)")
         except (OSError, ValueError, herdr.HerdrFailure):
             continue
-    return herdr.CodexConversations(live, tuple(unknown))
+    observed = herdr.codex_conversations()
+    return PaneConversations(herdr.CodexConversations(
+        {**live, **observed.live}, tuple(reason for reason in observed.unknown if reason not in resolved_tabs)), names)
 
 
 @herdr.observation_snapshot()
@@ -461,7 +483,8 @@ def live_rows(record: staff.StaffSnapshot, client: herdr.Herdr, *, save_tabs: bo
     owned = {row.current_session for row in record.rows}
     for identity in sorted(candidates.keys() - owned):
         if isinstance(herdr.read_conversation(identity, codex=codex), herdr.LiveConversation):
-            print(f"{' '.join(candidates[identity].splitlines())}: restart anomaly: unassigned live session", file=sys.stderr)
+            print(f"{' '.join(observed.pane_names.get(identity, candidates[identity]).splitlines())}: "
+                  + "restart anomaly: unassigned live session", file=sys.stderr)
     owners = [row for row in record.rows if row.id in observed.pane_owners]
     workers = {state.row.id: state for states in worker_panes.observe_parents(owners, record).values()
                for state in states} if owners else {}
@@ -473,6 +496,8 @@ def live_rows(record: staff.StaffSnapshot, client: herdr.Herdr, *, save_tabs: bo
     selected = live_members(candidates_rows, record, resolver=resolver, codex=codex, account=account)
     if isinstance(account, AllRestartAccounts):
         selected.extend(active_workers)
+    positions = {row.id: index for index, row in enumerate(record.rows)}
+    selected.sort(key=lambda row: positions[row.id])
     if save_tabs:
         try:
             client.save_layout()
@@ -615,7 +640,7 @@ def restart(*, stop_all: bool = False, dry_run: bool = False, only: tuple[str, .
     for row in selected:
         parent = record.parent_of(row) if row.kind == "worker" else None
         holder = (parent if worker_scope is WorkerRestartScope.FOLLOW_OWNER
-                  and parent is not None and parent.id in selected_ids and parent.id in observed.pane_owners else row)
+                  and parent is not None and parent.id in selected_ids else row)
         holders[holder.id] = holder
         members_by_holder.setdefault(holder.id, []).append(str(row.id))
     callers = {os.environ.get("CLAUDE_CODE_SESSION_ID"), os.environ.get("CODEX_THREAD_ID")} - {None, ""}
@@ -638,11 +663,11 @@ def restart(*, stop_all: bool = False, dry_run: bool = False, only: tuple[str, .
                 recorded.set()
                 workers: tuple[staff.StaffId, ...] = ()
                 if worker_scope is WorkerRestartScope.FOLLOW_OWNER and holder.kind in ("unit", "showrunner"):
-                    unresolved = stop_resume.stop_unit_workers(holder.id, record, codex=observed.codex, runs=observed.runs)
+                    unresolved = stop_resume.stop_unit_workers(holder.id, record, codex=observed.codex)
                     if unresolved and holder.id in observed.pane_owners:
                         workers = tuple(child.id for child in record.find(kind="worker", parent=holder.id)
                                         if child.id in selected_ids)
-                return stop_row(holder, client, codex=observed.codex, runs=observed.runs), workers
+                return stop_row(holder, client, codex=observed.codex), workers
         finally:
             recorded.set()
 
@@ -681,9 +706,9 @@ def restart(*, stop_all: bool = False, dry_run: bool = False, only: tuple[str, .
             blocked_workers.add(child.id)
             selected_sessions.discard(str(child.current_session))
             _anomaly(child, "target process still runs; worker kept pending" if isinstance(fresh, herdr.LiveConversation) else fresh.reason)
-    observed = RestartObservations(herdr.CodexConversations(
+    observed = replace(observed, codex=herdr.CodexConversations(
         {identity: pids for identity, pids in observed.codex.live.items() if identity not in selected_sessions},
-        observed.codex.unknown), observed.runs, observed.pane_owners)
+        observed.codex.unknown))
     present = False
     if holders:
         try:
@@ -705,7 +730,7 @@ def restart(*, stop_all: bool = False, dry_run: bool = False, only: tuple[str, .
                     raise OSError(fresh.reason)
                 if isinstance(fresh, herdr.LiveConversation):
                     if worker_scope is WorkerRestartScope.FOLLOW_OWNER:
-                        _restore_workers(current, current_record, observed=observed)
+                        _ = _restore_workers(current, current_record, observed=observed)
                     print(f"{current.name}: unchanged")
                     return
             facts = session_staff.RowResolver(current_record)

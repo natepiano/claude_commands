@@ -130,13 +130,14 @@ class MemoryWindowTests(unittest.TestCase):
     def test_window_report_uses_the_recorded_cap_and_room_formatter(self) -> None:
         from scripts.build_queue import queue_snapshot
         from scripts.build_queue.queue_evidence import room_text
+        from scripts.build_queue import admission_records
         from scripts.lint import memory_admit as gate
 
         self.stub_journal(early=[], kernel=[])
         start, end = datetime.fromisoformat(START_UTC), datetime.fromisoformat(END_UTC)
-        configuration = gate.read_memory_config()
-        inputs = gate.QueueInputs([], (), (), gate.HostMemory(30 * GIB, 60 * GIB),
-            gate.NoPressureHold(), gate.ReadyToStart(), gate.NoHeadAdmissionOverride(), start.timestamp())
+        configuration = admission_records.read_memory_config()
+        inputs = admission_records.QueueInputs([], (), (), admission_records.HostMemory(30 * GIB, 60 * GIB),
+            admission_records.NoPressureHold(), admission_records.ReadyToStart(), admission_records.NoHeadAdmissionOverride(), start.timestamp())
         directory = self.root / "admission"
         directory.mkdir(parents=True)
         queue_snapshot.write_queue_snapshot(directory, inputs, configuration.policy)

@@ -19,6 +19,7 @@ import subprocess
 import sys
 import tempfile
 from threading import Event
+from types import SimpleNamespace
 from typing import ClassVar, TextIO, cast, final, override
 import unittest
 from unittest import mock
@@ -37,17 +38,21 @@ from scripts.mac_test import offload
 from scripts.mac_test import mac_test
 from scripts.mac_test import floor_claims
 from scripts.build_targets import target_config
-from scripts.production.cli_fixture import ImmutableGitSeed
+from scripts.production.cli_fixture import ImmutableGitSeed, invoke_cli
 
 
 @final
 class RemoteEntryTests(unittest.TestCase):
     source_seed: ClassVar[ImmutableGitSeed]
+    interruption_root: ClassVar[Path]
+    interruption_seeds: ClassVar[dict[tuple[str, str], Path]]
 
     @classmethod
     @override
     def setUpClass(cls) -> None:
         root = Path(cls.enterClassContext(tempfile.TemporaryDirectory())).resolve()
+        cls.interruption_root = root / "interruptions"
+        cls.interruption_seeds = {}
         with local_remote_transport(root):
             cls.source_seed = ImmutableGitSeed.create(root, "main", "Copy Tests", "copy@example.invalid",
                                                      {"Cargo.toml": "[workspace]\n", "source.txt": "content\n"})
@@ -221,7 +226,40 @@ class RemoteEntryTests(unittest.TestCase):
         self.assertTrue(Path(other.path).exists())
         self.assertEqual(copies.owned_remote_mirrors("beta-unit"), [other])
 
+    def remove_trees_through_cli(self, owner: str) -> None:
+        """Run the real remote CLI without another SSH interpreter."""
+        def remote_cli(arguments: Sequence[str], **options: object) -> subprocess.CompletedProcess[str]:
+            command = shlex.split(arguments[-1])[2:]
+            return invoke_cli(copies, lambda: copies.main(command), command, os.environ, self.root,
+                              combined_output=not bool(options.get("capture_output")))
+
+        with mock.patch.object(copies, "subprocess", SimpleNamespace(run=remote_cli)):
+            copies.remove_trees(owner)
+
+    def save_interrupted_mirror(self, mirror: copies.RemoteMirror, key: tuple[str, str]) -> None:
+        """Keep the real interrupted files as an immutable class seed."""
+        seed = self.interruption_root / key[0] / key[1]
+        seed.mkdir(parents=True)
+        _ = shutil.copytree(Path(mirror.path), seed / "tree")
+        _ = shutil.copyfile(floor_claims.removal_authority_path(Path(mirror.path)), seed / "authority")
+        self.interruption_seeds[key] = seed
+
+    def restore_interrupted_mirror(self, mirror: copies.RemoteMirror, key: tuple[str, str]) -> Path:
+        """Restore private files and register this case with its real path."""
+        seed = self.interruption_seeds[key]
+        tree = Path(mirror.path)
+        if tree.exists():
+            shutil.rmtree(tree)
+        _ = shutil.copytree(seed / "tree", tree)
+        authority = floor_claims.removal_authority_path(tree)
+        _ = shutil.copyfile(seed / "authority", authority)
+        copies.register_remote(mirror)
+        return authority
+
     def interrupt_mirror_removal(self, mirror: copies.RemoteMirror, moment: str) -> Path:
+        key = (moment, "removal")
+        if key in self.interruption_seeds:
+            return self.restore_interrupted_mirror(mirror, key)
         self.assertEqual(publish_mirror(mirror), 0)
         tree = Path(mirror.path)
         payload = tree / "old-payload"
@@ -246,6 +284,7 @@ class RemoteEntryTests(unittest.TestCase):
         authority = tree.parent / ("." + tree.name + ".copy-removing.json")
         self.assertTrue(authority.exists())
         self.assertEqual((tree / ".copy-record.json").exists(), moment == "payload")
+        self.save_interrupted_mirror(mirror, key)
         return authority
 
     def test_receive_refills_interrupted_removal_before_another_owner_uses_and_removes(self) -> None:
@@ -344,8 +383,12 @@ assert Path(sys.argv[1]).read_text() == 'complete replacement'
                 copies.register_remote(replace(original, owner=expected_owner))
                 copies.remove_trees(expected_owner)
 
-    def interrupt_receive_recovery(self, original: copies.RemoteMirror, stage: str) -> None:
+    def interrupt_receive_recovery(self, original: copies.RemoteMirror, moment: str, stage: str) -> None:
         tree = Path(original.path)
+        key = (moment, stage)
+        if key in self.interruption_seeds:
+            _ = self.restore_interrupted_mirror(original, key)
+            return
         authority = tree.parent / ("." + tree.name + ".copy-removing.json")
         receive = mirror_arguments(replace(original, owner="beta", session="beta-session"), "mirror-receive")
         clear = copies.clear_mirror_content
@@ -372,6 +415,7 @@ assert Path(sys.argv[1]).read_text() == 'complete replacement'
               mock.patch.object(Path, "unlink", autospec=True, side_effect=unlink_authority),
               self.assertRaisesRegex(InterruptedError, "receive stopped")):
             _ = copies.mirror_run(receive)
+        self.save_interrupted_mirror(original, key)
 
     def test_registered_owner_removes_after_each_receive_recovery_interruption(self) -> None:
         for moment in ("payload", "record"):
@@ -379,8 +423,8 @@ assert Path(sys.argv[1]).read_text() == 'complete replacement'
                 with self.subTest(moment=moment, stage=stage):
                     original = self.mirror_record(path=self.mirror.parent / f"{moment}-{stage}")
                     authority = self.interrupt_mirror_removal(original, moment)
-                    self.interrupt_receive_recovery(original, stage)
-                    copies.remove_trees("alpha")
+                    self.interrupt_receive_recovery(original, moment, stage)
+                    self.remove_trees_through_cli("alpha")
                     self.assertFalse(Path(original.path).exists())
                     self.assertFalse(authority.exists())
                     self.assertEqual(copies.owned_remote_mirrors("alpha"), [])
@@ -391,7 +435,7 @@ assert Path(sys.argv[1]).read_text() == 'complete replacement'
                 with self.subTest(moment=moment, stage=stage):
                     original = self.mirror_record(path=self.mirror.parent / f"{moment}-{stage}")
                     authority = self.interrupt_mirror_removal(original, moment)
-                    self.interrupt_receive_recovery(original, stage)
+                    self.interrupt_receive_recovery(original, moment, stage)
                     receive = mirror_arguments(replace(original, owner="beta"), "mirror-receive")
                     self.assertEqual(copies.mirror_run(receive), 0)
                     tree = Path(original.path)
@@ -400,7 +444,7 @@ assert Path(sys.argv[1]).read_text() == 'complete replacement'
                     self.assertEqual(record["repo"], original.repository.name)
                     self.assertTrue((tree / ".mac-test-mirror").exists())
                     self.assertFalse(authority.exists())
-                    copies.remove_trees("alpha")
+                    self.remove_trees_through_cli("alpha")
                     self.assertFalse(tree.exists())
 
     def test_sweep_finds_mirror_after_each_receive_recovery_interruption(self) -> None:
@@ -409,7 +453,7 @@ assert Path(sys.argv[1]).read_text() == 'complete replacement'
                 with self.subTest(moment=moment, stage=stage):
                     original = self.mirror_record(path=self.mirror.parent / f"{moment}-{stage}")
                     _ = self.interrupt_mirror_removal(original, moment)
-                    self.interrupt_receive_recovery(original, stage)
+                    self.interrupt_receive_recovery(original, moment, stage)
                     tree = Path(original.path)
                     with copies.local_mirror_lease(tree, "active-session", create=False):
                         with copies.mirror_sweep_leases(tree.parent) as protected:

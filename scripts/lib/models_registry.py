@@ -19,8 +19,6 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Literal, NamedTuple, cast, final
 
-if __package__ in (None, ""):
-    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.lib.process_failure import failure_detail
 from scripts.lib.atomic_file import write_text_atomic
 
@@ -326,8 +324,10 @@ def _publish_repository(path: Path) -> SharedRegistry | UnpublishedRegistry:
 
 
 def _fetch(repo: Path, branch: str) -> str:
-    _ = _git(repo, "fetch", "origin", branch)
-    return _git(repo, "rev-parse", "FETCH_HEAD")
+    """Read the branch tip from its own remote ref; every fetch in the checkout writes FETCH_HEAD."""
+    tracking = f"refs/remotes/origin/{branch}"
+    _ = _git(repo, "fetch", "origin", f"+refs/heads/{branch}:{tracking}")
+    return _git(repo, "rev-parse", "--verify", f"{tracking}^{{commit}}")
 
 
 def _preflight_fast_forward(repo: Path, target: str, *, replace_registry: bool,

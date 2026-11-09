@@ -25,6 +25,7 @@ import unittest
 import contextlib
 from contextlib import contextmanager
 from collections.abc import Callable, Generator, Sequence
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import ClassVar, TypedDict, cast, override
@@ -43,9 +44,8 @@ VERIFY = Path(__file__).with_name("verify.sh")
 
 def invoke_mac_claim(arguments: list[str], environment: dict[str, str], cwd: Path) -> subprocess.CompletedProcess[str]:
     """Run the real claim CLI; its copy signals still cross the process boundary."""
-    with mock.patch.object(sys, "path", [str(VERIFY.parent.parent / "mac_test"), *sys.path]):
-        from scripts.mac_test import mac_test
-        return invoke_cli(mac_test, mac_test.main, arguments, environment, cwd)
+    from scripts.mac_test import mac_test
+    return invoke_cli(mac_test, mac_test.main, arguments, environment, cwd)
 
 
 def stub_build_tool_path(directory: Path) -> str:
@@ -132,7 +132,7 @@ def wait_for_marker_exit(marker: str, timeout: float) -> set[int]:
     return processes_carrying(marker)
 
 
-def reap(marker: str) -> set[int]:
+def reap(marker: str) -> dict[int, str]:
     """Kill every process carrying `marker` and wait until none is left.
 
     verify.sh runs each step in its own process group and its step owner in
@@ -140,12 +140,16 @@ def reap(marker: str) -> set[int]:
     running under init. A stopped process cannot fork or exit, so stopping
     each one found until a scan finds no new one catches the whole tree.
     """
-    stopped: set[int] = set()
-    while fresh := processes_carrying(marker) - stopped:
+    stopped: dict[int, str] = {}
+    while fresh := processes_carrying(marker) - stopped.keys():
         for pid in fresh:
             with contextlib.suppress(ProcessLookupError):
                 os.kill(pid, signal.SIGSTOP)
-        stopped |= fresh
+            try:
+                arguments = (Path("/proc") / str(pid) / "cmdline").read_bytes().split(b"\0")
+                stopped[pid] = shlex.join(os.fsdecode(word) for word in arguments if word)
+            except OSError as error:
+                stopped[pid] = f"command unavailable: {error}"
     for pid in stopped:
         with contextlib.suppress(ProcessLookupError):
             os.kill(pid, signal.SIGKILL)
@@ -160,6 +164,68 @@ def reap(marker: str) -> set[int]:
         finally:
             os.close(descriptor)
     return stopped
+
+
+@dataclass(frozen=True)
+class HoldRecorderStart:
+    """Track a recorder thread until its start call finishes."""
+
+    thread: threading.Thread
+    finished: threading.Event
+
+
+@contextmanager
+def hold_recorder_exits(timeout: float = TEST_HANG_GUARD_SECS) -> Generator[None, None, None]:
+    """Wait for hold recorders before their fixture environment is restored."""
+    children: list[subprocess.Popen[bytes]] = []
+    starts: list[HoldRecorderStart] = []
+    launch = cast(Callable[..., subprocess.Popen[bytes]], subprocess.Popen)
+    start = threading.Thread.start
+
+    def launch_owned(*arguments: object, **options: object) -> subprocess.Popen[bytes]:
+        process = launch(*arguments, **options)
+        children.append(process)
+        return process
+
+    def start_owned(thread: threading.Thread) -> None:
+        if thread.name != "hold-event-recorder":
+            start(thread)
+            return
+        recorder = HoldRecorderStart(thread, threading.Event())
+        starts.append(recorder)
+        try:
+            start(thread)
+        finally:
+            recorder.finished.set()
+
+    with mock.patch.object(subprocess, "Popen", side_effect=launch_owned), \
+         mock.patch.object(threading.Thread, "start", start_owned):
+        try:
+            yield
+        finally:
+            timed_out = False
+            for recorder in starts:
+                deadline = time.monotonic() + timeout
+                if not recorder.finished.wait(timeout=max(0, deadline - time.monotonic())):
+                    timed_out = True
+                    continue
+                if recorder.thread.ident is None:
+                    timed_out = True
+                    continue
+                recorder.thread.join(timeout=max(0, deadline - time.monotonic()))
+                timed_out |= recorder.thread.is_alive()
+            if timed_out:
+                for process in children:
+                    if process.poll() is None:
+                        process.terminate()
+                for process in children:
+                    if process.poll() is None:
+                        process.kill()
+                    _ = process.wait()
+                for recorder in starts:
+                    if recorder.thread.ident is not None:
+                        recorder.thread.join()
+                raise AssertionError("fixture hold recorder never exited")
 
 
 class CargoEvent(TypedDict):
@@ -273,7 +339,7 @@ if arguments[:2] == ["nextest", "run"] and os.environ.get("TEST_CARGO_HOLD") == 
     signal.signal(signal.SIGTERM, stop)
     print("   Compiling sample v0.1.0", flush=True)
     (root / "cargo-compiling").write_text(f"{os.getpid()}\n", encoding="utf-8")
-    sys.path.insert(0, str(Path(os.environ["TEST_WAIT_HELPER"]).resolve().parents[2]))
+    with open(Path(os.environ["TEST_WAIT_HELPER"]).resolve().parents[2] / "scripts/lib/package_root.py") as package_root: exec(package_root.read(), {"__file__": package_root.name})
     from scripts.direct.wait_for_test_state import wait_for_file
     wait_for_file(root / "cargo-release")
     if os.environ.get("TEST_CARGO_STARTING", "1") == "1":
@@ -384,7 +450,7 @@ if "--copy" in arguments:
     (root / "copy-started.tmp").write_text(str(os.getpid()), encoding="utf-8")
     os.replace(root / "copy-started.tmp", root / "copy-started")
     if os.environ.get("TEST_COPY_WAIT") == "1":
-        sys.path.insert(0, str(Path(os.environ["TEST_WAIT_HELPER"]).resolve().parents[2]))
+        with open(Path(os.environ["TEST_WAIT_HELPER"]).resolve().parents[2] / "scripts/lib/package_root.py") as package_root: exec(package_root.read(), {"__file__": package_root.name})
         from scripts.direct.wait_for_test_state import wait_for_file
         wait_for_file(root / "copy-release")
     result.write_text("mac=" + os.environ.get("TEST_COPY_MAC", "failed") + "\nreason=\nseconds="
@@ -420,7 +486,7 @@ if os.environ.get("TEST_RUNNER_BUSY_UNTIL") and not Path(os.environ["TEST_RUNNER
     raise SystemExit(75)
 if attempt > 1 and os.environ.get("TEST_RUNNER_PAUSE_RETRY") == "1":
     (root / "retry-running").write_text("running\n")
-    sys.path.insert(0, str(Path(os.environ["TEST_WAIT_HELPER"]).resolve().parents[2]))
+    with open(Path(os.environ["TEST_WAIT_HELPER"]).resolve().parents[2] / "scripts/lib/package_root.py") as package_root: exec(package_root.read(), {"__file__": package_root.name})
     from scripts.direct.wait_for_test_state import wait_for_file
     wait_for_file(root / "continue-retry")
 
@@ -477,7 +543,7 @@ import runpy
 import sys
 import time
 
-sys.path.insert(0, str(Path(os.environ["TEST_REAL_TARGETS"]).resolve().parents[2]))
+with open(Path(os.environ["TEST_REAL_TARGETS"]).resolve().parents[2] / "scripts/lib/package_root.py") as package_root: exec(package_root.read(), {"__file__": package_root.name})
 from scripts.lib.atomic_file import write_text_atomic
 
 command = sys.argv[1]
@@ -488,7 +554,6 @@ if command == "wait-local" and os.environ.get("TEST_LOCAL_WAIT_SECONDS") and not
     with Path(os.environ["BUILDLOG_HOLD_WAIT_FILE"]).open("a") as output:
         output.write(os.environ["TEST_LOCAL_WAIT_SECONDS"] + "\n")
     write_text_atomic(root / "local-wait-added", "added\n")
-sys.path.insert(0, str(Path(os.environ["TEST_REAL_TARGETS"]).parent))
 status = 0
 try:
     runpy.run_path(os.environ["TEST_REAL_TARGETS"], run_name="__main__")
@@ -588,7 +653,7 @@ if sys.argv[1:2] == ["call"]:
              "copy_natedev_s": os.environ.get("BUILDLOG_MAC_COPY_NATEDEV_S", "")}
     with (Path(os.environ["TEST_RUNNER_STATE"]) / "routing-records.jsonl").open("a") as output:
         output.write(json.dumps(event) + "\n")
-sys.path.insert(0, str(Path(os.environ["TEST_REAL_RECORD"]).parent))
+with open(Path(os.environ["TEST_REAL_RECORD"]).resolve().parents[2] / "scripts/lib/package_root.py") as package_root: exec(package_root.read(), {"__file__": package_root.name})
 runpy.run_path(os.environ["TEST_REAL_RECORD"], run_name="__main__")
 '''
 
@@ -1050,21 +1115,6 @@ exit 99
 
     @contextmanager
     def hold_environment(self, timeout: float = TEST_HANG_GUARD_SECS) -> Generator[None, None, None]:
-        children: list[subprocess.Popen[bytes]] = []
-        threads: list[threading.Thread] = []
-        launch = cast(Callable[..., subprocess.Popen[bytes]], subprocess.Popen)
-        start = threading.Thread.start
-
-        def launch_owned(*arguments: object, **options: object) -> subprocess.Popen[bytes]:
-            process = launch(*arguments, **options)
-            children.append(process)
-            return process
-
-        def start_owned(thread: threading.Thread) -> None:
-            if thread.name == "hold-event-recorder":
-                threads.append(thread)
-            start(thread)
-
         with mock.patch.dict(os.environ, {name: self.environment[name] for name in (
             "HOME", "XDG_STATE_HOME", "XDG_CACHE_HOME",
             "BUILD_HOLD_DIR", "BUILD_HOLD_RELEASE_DIR", "UNIT_ACTIVE_DIR",
@@ -1073,28 +1123,8 @@ exit 99
                                           "BUILDLOG_CALL_ID": "", "BUILDLOG_CALLER": ""}), \
              mock.patch.object(build_hold, "socket_for", return_value=build_hold.RecipientLive("/test/socket")), \
              mock.patch.object(build_hold, "send_release", return_value=build_hold.ReleaseDelivered()), \
-             mock.patch.object(subprocess, "Popen", side_effect=launch_owned), \
-             mock.patch.object(threading.Thread, "start", start_owned):
-            try:
-                yield
-            finally:
-                timed_out = False
-                for thread in threads:
-                    thread.join(timeout=timeout)
-                    timed_out |= thread.is_alive()
-                if timed_out:
-                    # Stop every child before restoring HOME or reporting the
-                    # timeout, including children owned by later reapers.
-                    for process in children:
-                        if process.poll() is None:
-                            process.terminate()
-                    for process in children:
-                        if process.poll() is None:
-                            process.kill()
-                        _ = process.wait()
-                    for thread in threads:
-                        thread.join()
-                self.assertFalse(timed_out, "fixture hold recorder never exited")
+             hold_recorder_exits(timeout):
+            yield
 
     def release_local_hold(self) -> None:
         with self.hold_environment():
@@ -1127,7 +1157,8 @@ exit 99
         _ = wait_for_marker_exit(self.child_marker(), TEST_HANG_GUARD_SECS)
         survivors = reap(self.child_marker())
         if survivors:
-            self.fail(f"processes outlived the test: {sorted(survivors)}")
+            commands = "\n".join(f"{pid}: {command}" for pid, command in sorted(survivors.items()))
+            self.fail(f"processes outlived the test:\n{commands}")
 
     def start_routing(self, reason: str = "busy", *, pause_retry: bool = False,
                       step_sleep: bool = False, once: Path | None = None) -> subprocess.Popen[str]:

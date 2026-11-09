@@ -146,18 +146,16 @@ Phase 18c makes the staff row id the copy owner, under its `RoleOwner` boundary 
 
 #### As-built
 
-- One process holds one `store` module object, whichever name imports it first. The buildlog and lint modules import the bare `store`; `head_facts.py`, `admission_service.py`, `admission_client.py` and `merge_gate.py` import `scripts.buildlog.store`.
-- `scripts/buildlog/store.py` registers itself as `sys.modules["store"]` when it loads. It registers `scripts.buildlog.store` and sets the package attribute `store` only when `scripts.buildlog` is already loaded. It searches for and imports nothing at load.
-- `scripts/buildlog/__init__.py` makes `scripts.buildlog` a regular package. At load it adopts a bare `store` module from its own directory: it registers it as `scripts.buildlog.store` and sets the package attribute. A `store` from another checkout is not adopted.
+- Phase 33 replaces the two module names with `scripts.buildlog.store` in every caller.
+- Phase 33 removes the aliases and `scripts/buildlog/__init__.py`.
+- `scripts/buildlog/test_repo_root_imports.py` checks the script entries from an unrelated working folder.
 
 **Files:**
-- `scripts/buildlog/store.py` — registers its module under both names.
-- `scripts/buildlog/__init__.py` — adopts a bare-first store from the same directory.
-- `scripts/buildlog/test_store_identity.py` — six fresh-interpreter cases: bare first, package first, `import sweep`, bare then dotted attribute, the index import order from a cwd outside the repository, and an unrelated raising `scripts/__init__.py`.
+- `scripts/buildlog/store.py` — callers use its repository module name.
 
-**Binds later work:** packaging or import changes in `scripts/buildlog` keep `__init__.py` and both import forms (`import store` and `from scripts.buildlog import store`).
+**Binds later work:** callers import `scripts.buildlog.store` from the repo root.
 
-**Gotchas:** a namespace package runs no code at load. A dotted child already in `sys.modules` makes `import scripts.buildlog.store` skip the parent's initializer, so store.py adds the dotted name only after the package exists. Deleting an alias from `sys.modules` and importing again makes a new module (a reload); no caller does that.
+**Gotchas:** `scripts.buildlog` is a namespace package. It has no initializer or module aliases.
 
 **Ruled out:** record.py's `__package__` check (head_facts keeps a set `__package__` under sweep); a `find_spec` search or package import from store.py (it shadows modules through `sys.path` and runs an unrelated `scripts/__init__.py` from the cwd).
 

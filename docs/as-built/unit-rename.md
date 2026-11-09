@@ -1,6 +1,6 @@
 # Unit rename
 
-`rename.py plan|apply <old> <new>` renames one staff unit.
+`agents rename OLD NEW` renames one staff unit.
 The command reads the unit from its staff row.
 Use a staff id, `showrunner/name`, or a unique name; see `production-rename.md`.
 It keeps the staff id, current session, parent, and recorded role.
@@ -26,9 +26,13 @@ The move limits come from `config/production.conf` at use.
 
 Use `unit_move.py move-folder --unit <staff id> --to <path>` to move only the folder.
 The command refuses an existing destination or a concurrent row operation.
+An open phase does not prevent a folder move.
+Staff remains the folder source for runs, panes, recovery, and resume.
+Claude transcripts and Codex threads retain their native ids and existing transcript locations.
+The shared restart path can resume a previously live unit without an older launch record.
 
 ## Tests
 
-The `test_rename_unit*.py` modules cover row names, display repair, moves, and stopped-session recovery.
+`scripts/shutdown/test_shutdown_cli.py` covers row names, display repair, moves, and stopped-session recovery.
 The `test_unit_move.py` module covers interruption recovery across the folder and branch operations.
 Tests use private staff records and fake process and terminal evidence.

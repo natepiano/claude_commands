@@ -10,7 +10,6 @@ import time
 from pathlib import Path
 from typing import NamedTuple, TypedDict, cast
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.production import staff
 from scripts.lib import unit_runs  # noqa: E402
 from scripts.production import session_staff  # noqa: E402
@@ -32,8 +31,9 @@ RATE_FACTOR_LIMIT = 2.0
 # commit annotation instead. Counting on the status marker alone silently
 # ignores every already-archived phase, which is how a 67%-complete plan once
 # reported 36%. Match the `Phase <id>` heading itself and classify after.
+PHASE_ID = r"\d+[a-z]?"
 PHASE_HEADING_PATTERN = re.compile(
-    r"^(?P<hashes>#{2,4})[ \t]+Phase[ \t]+(?P<id>\d+[a-z]?)\b(?P<rest>[^\n]*)$",
+    r"^(?P<hashes>#{2,4})[ \t]+Phase[ \t]+(?P<id>" + PHASE_ID + r")\b(?P<rest>[^\n]*)$",
     re.MULTILINE,
 )
 PHASE_STATUS_PATTERN = re.compile(r"·[ \t]*status:[ \t]*(?P<status>todo|done)\b")

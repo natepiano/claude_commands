@@ -44,7 +44,7 @@ WAIT_SHARE_LIMIT = 0.10
 # than the showrunner turn the alert costs.
 MINIMUM_WEIGHTED = 1_000_000
 # Codex uses each model's compaction limit. Five consecutive requests above that limit trigger an alert.
-# The usage ledger cannot distinguish mesh threads with launch overrides from pane threads.
+# The usage ledger cannot distinguish historical launch settings from pane settings.
 CONTEXT_RUN = 5
 WORKER_ROLES = frozenset({"impl", "test", "fix", "review", "worker"})
 ALERT_INTERVAL = timedelta(hours=6)

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from functools import cached_property
+from contextlib import suppress
 from dataclasses import dataclass
 
 import json
@@ -13,6 +14,7 @@ import signal
 from typing import cast, override
 from unittest.mock import patch
 
+from scripts.direct import worker_state
 from scripts.lib import models_registry
 from scripts.direct import claude_worker
 from scripts.lib.test_models_registry import write_registry
@@ -27,7 +29,7 @@ from scripts.lib.socket_test_support import ShortUnixSocket
 
 BACKEND = '''import json, os, sys, socket
 from pathlib import Path
-sys.path.insert(0, os.environ["FIXTURE_CHECKOUT"])
+with open(Path(os.environ["FIXTURE_CHECKOUT"]) / "scripts/lib/package_root.py") as package_root: exec(package_root.read(), {"__file__": package_root.name})
 log = Path(os.environ["FIXTURE_BACKEND_LOG"])
 with log.open("a") as output:
     output.write(json.dumps({"arguments": sys.argv[1:], "STAFF_ID": os.environ.get("STAFF_ID", ""),
@@ -61,9 +63,8 @@ print("backgrounded · " + os.environ["FIXTURE_NATIVE_ID"][:8] + " · fresh-impl
 
 SEND = '''import json, os, sys, socket
 from pathlib import Path
-sys.path.insert(0, os.environ["FIXTURE_CHECKOUT"])
+with open(Path(os.environ["FIXTURE_CHECKOUT"]) / "scripts/lib/package_root.py") as package_root: exec(package_root.read(), {"__file__": package_root.name})
 from scripts.production import staff
-from scripts.direct import workers
 from scripts.usage import agents_log
 try:
     history = agents_log.assignments(agents_log.state_dir() / "agents.jsonl")
@@ -73,8 +74,9 @@ row = staff.by_current_session(os.environ["FIXTURE_NATIVE_ID"])
 if row is None:
     raise SystemExit("opening prompt preceded staff publication")
 prompt = Path(sys.argv[sys.argv.index("--file") + 1]).read_text()
+roles = history.assignments.get(row.current_session, ())
 Path(os.environ["FIXTURE_SENT"]).write_text(json.dumps({"arguments": sys.argv[1:], "row": row.to_json(), "prompt": prompt,
-    "role": workers._worker_task_role({"staff_id": row.id}, staff.local_snapshot(), history)}))
+    "role": roles[-1].role if roles else ""}))
 if os.environ.get("FIXTURE_GATE"):
     with socket.socket(socket.AF_UNIX) as gate:
         gate.connect(os.environ["FIXTURE_GATE"])
@@ -174,8 +176,10 @@ class NativeClaudeWorkerTests(StaffTestCase):
 
     def clear_worker(self, row: staff.StaffRow) -> None:
         self.fixture.registry.unlink()
+        with patch.dict(os.environ, {"CODEX_THREAD_ID": self.fixture.unit.current_session}):
+            path = worker_state.worker_record_path(self.fixture.run_dir, row.name, row.name)
         _ = staff.retire(row.id)
-        (self.fixture.run_dir / "mesh_roster.json").unlink(missing_ok=True)
+        path.unlink(missing_ok=True)
 
     def command(self) -> list[str]:
         return worker_command("fresh-impl", self.fixture.run_dir, self.fixture.work,
@@ -274,9 +278,9 @@ class NativeClaudeWorkerTests(StaffTestCase):
                 before = self.staff_file.read_bytes()
                 parent = self.root / ("cancel-parent" if cancel else "complete-parent")
                 parent.mkdir()
-                roster = parent / "mesh_roster.json"
-                _ = roster.write_text('{"parent": {"staff_id": "parent-worker"}}\n')
-                saved = roster.read_bytes()
+                record_path = parent / "progress_history_state.json"
+                _ = record_path.write_text('{"parent": {"staff_id": "parent-worker"}}\n')
+                saved = record_path.read_bytes()
                 stopped = self.root / ("cancel-stopped.json" if cancel else "complete-stopped.json")
                 self.fixture.backend_log.unlink(missing_ok=True)
                 modules = stopped_worker_module(self.root / ("cancel-modules" if cancel else "complete-modules"))
@@ -298,10 +302,8 @@ class NativeClaudeWorkerTests(StaffTestCase):
                             launcher_pid = int(delivery.recv(32))
                             if cancel:
                                 os.kill(launcher_pid, signal.SIGTERM)
-                                try:
+                                with suppress(BrokenPipeError, ConnectionResetError):
                                     delivery.sendall(b"1")
-                                except (BrokenPipeError, ConnectionResetError):
-                                    pass
                             else:
                                 delivery.sendall(b"1")
                         if not cancel:
@@ -316,13 +318,14 @@ class NativeClaudeWorkerTests(StaffTestCase):
                             send_process_group(launcher.pid, signal.SIGKILL)
                             _ = launcher.communicate(timeout=TEST_HANG_GUARD_SECS)
                     self.assertEqual(launcher.returncode, 143 if cancel else 0, output + errors)
-                record = cast(dict[str, dict[str, object]], json.loads((self.fixture.run_dir / "mesh_roster.json").read_text()))
-                self.assertEqual(record["fresh-impl"]["dispatch_state"], "sending" if cancel else "accepted")
+                path = worker_admission.switch_record_path(self.fixture.run_dir, "fresh-impl")
+                record = cast(dict[str, object], json.loads(path.read_text()))
+                self.assertEqual(record["dispatch_state"], "sending" if cancel else "accepted")
                 row = staff.by_current_session(self.fixture.identity)
                 assert row is not None
                 self.assertEqual(json.loads(stopped.read_text()), old.to_json())
                 self.assertEqual({path.name: path.read_bytes() for path in parent.iterdir()},
-                                 {"mesh_roster.json": saved})
+                                 {"progress_history_state.json": saved})
                 self.assert_only_current_session_changed(before, old, self.fixture.identity)
                 sent = cast(dict[str, object], json.loads(self.fixture.sent.read_text()))
                 prompt = str(sent["prompt"])
@@ -402,13 +405,22 @@ if len(sys.argv) > 1 and sys.argv[0] == "-c":
         self.assertEqual(len(self.backend_calls()), 1)
 
     def test_publication_refusal_stops_only_the_created_backend_and_reports_failed_cleanup(self) -> None:
-        result = self.launch(FIXTURE_REFUSE_PUBLICATION="1", FIXTURE_STOP_EXIT="1")
-        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
-        self.assertIn(self.fixture.identity, result.stderr)
-        calls = self.backend_calls()
-        self.assertEqual(len(calls), 2)
-        self.assertEqual(calls[1]["arguments"], ["stop", self.fixture.identity[:8]])
-        self.assertFalse(self.fixture.sent.exists())
-        self.assertIsNone(staff.by_id(staff.StaffId(self.fixture.identity)))
-        self.assertIn("cleanup unproved", result.stderr)
-        self.assertEqual(json.loads(self.fixture.registry.read_text())["sessionId"], self.fixture.identity)
+        for stop_exit in (1, 0):
+            with self.subTest(stop_exit=stop_exit):
+                lock = self.staff_file.with_name(self.staff_file.name + ".lock")
+                if lock.is_dir():
+                    lock.rmdir()
+                self.fixture.backend_log.unlink(missing_ok=True)
+                result = self.launch(FIXTURE_REFUSE_PUBLICATION="1", FIXTURE_STOP_EXIT=str(stop_exit))
+                self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                self.assertIn(self.fixture.identity, result.stderr)
+                calls = self.backend_calls()
+                self.assertEqual(len(calls), 2)
+                self.assertEqual(calls[1]["arguments"], ["stop", self.fixture.identity[:8]])
+                self.assertFalse(self.fixture.sent.exists())
+                self.assertIsNone(staff.by_id(staff.StaffId(self.fixture.identity)))
+                if stop_exit:
+                    self.assertIn("cleanup unproved", result.stderr)
+                else:
+                    self.assertNotIn("cleanup unproved", result.stderr)
+                self.assertEqual(json.loads(self.fixture.registry.read_text())["sessionId"], self.fixture.identity)
