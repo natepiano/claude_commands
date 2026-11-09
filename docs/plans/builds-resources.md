@@ -2091,62 +2091,31 @@ Registered jobs already take no margin: `test_registered_and_unregistered_jobs_e
 **Gotchas:** held paths taken at the first scan miss a live use that `shrink_floor` finds later; compute them from the final `busy` map. The no-evidence branch walks `_build_trees` only when a cargo lock is held.
 
 ### Phase 94 — Each fall below the floor line gives one phone push, and the return gives one more  · status: done
-**Depends on:** Phase 93 (same file, `scripts/lint/sweep.py`). Merge `origin/builds` first.
 
-**Approved:** builds added Spec 7 and 8 on 2026-11-09 ("Both go in the phase 94 checkpoint"); a new config key needs no user go. The user, via natedev and the builds showrunner, 2026-11-09: "I got about 8 pushovers for Mac being below 150gib. All by less than 2gib. This is unhelpful. A single notice is fine. And a notice when we are back for good above 150. But telling me over and over is not helpful." builds, 2026-11-09: "Each fall gives exactly two pushes: one at the fall below 150 GiB and one at the return above 155 GiB. Nothing between them."
+#### As-built
 
-#### Work Order
-
-**Goal:** each fall of free space below the phone alert line gives exactly two phone pushes for that machine: one at the fall, and one when free space returns above the rearm line (`sweep_phone_floor_gib` plus `sweep_phone_rearm_gib`, today 155 GiB). Nothing is sent between them.
-
-**Defect:** on 2026-11-09 the user got about 8 Mac pushes, each less than 2 GiB below 150 GiB. One came at 149.8 GiB after the Mac had the Phase 91 rearm rule (Mac HEAD 9b15a1923 contains d7c726761; `sweep_phone_rearm_gib=5` is present). The Phase 91 rule (`notify_floor_problem`, `scripts/lint/sweep.py:3859`) opens an `OpenPhoneCrossing` only from `AbovePhoneFloor` and rearms only above the rearm line, so a repeat means the crossing state did not hold. The Mac floor pass runs from two paths: the Mac launchd job `org.nixos.disk-floor` and the natedev ssh call in `scripts/mac_test/offload.py:1564` (`sweep.py --floor-only --host mac`).
-
-**Spec:**
-1. **Cause, read-only first.** Write `phases/94/cause.md` in the run folder before any source edit.
-   - List each Mac push of 2026-11-09 from the natedev push records, with its time and free space.
-   - Read the Mac crossing state (`floor_record_path()` and its scope record) and say which file each path reads and writes. Compare the environment (`HOME`, state folders) of the launchd job and the ssh call.
-   - Read `root_scope` in `notify_floor_problem` for the Mac filesystem: a pass that is not root scope keeps no crossing state.
-   - For each push, say whether it repeated a crossing that had already alerted, and why. Give one line per proven cause with its evidence, and name the candidates ruled out.
-   - Mac commands are read-only: `ssh mac` with `cat`, `ls`, `stat` or a log read of named files. Change nothing on the Mac, start no Mac test, and run no sweep without `--dry-run`. `ssh mac` exits 0 even on failure: print a sentinel and check it.
-2. **Fix the cause where it lives.** Every path that sends a machine's floor push reads and writes one crossing state for that machine, under its record lock. A second path, a lost receipt or a non-root-scope pass cannot open a second crossing while one is open. If the cause lives in a file outside **Files**, name it in `cause.md` and post blocked before you edit it.
-3. **Return push.** When an open crossing whose fall push was sent rearms (free space above the rearm line), send one phone push. Add the catalog entry `sweep.disk_floor_recovered` in `scripts/notify/push_catalog.py`: sender `disk_floor`, need `note`, no action. Proposed words: title `{machine} disk space is back`; body `{machine} has {free} free, above the {rearm} line. The next fall below {floor} sends one alert.` Keep the return receipt in the same crossing state, so a retry sends it once and a lost delivery retries until accepted. No return push goes for a crossing whose fall push was never sent. The rule is the same for natedev and the Mac.
-4. **Text approval.** A new text needs the user's approval. Run `~/.claude/scripts/lib/py scripts/notify/review.py texts --id sweep.disk_floor_recovered` without `--approve`, three times, and report each verdict. Write no approval record, and never pass `--approve` or `--user-spec`. Do not change `sweep.disk_floor`.
-5. **Tests.** Each row fails before the fix and passes after it.
-   - One machine, readings 200, 149.8, 148.5, 149.9, 148.2, then 156 for 60 minutes, then 149 GiB: exactly three pushes — a fall push at 149.8, a return push after 60 minutes above 155, and a fall push at 149.
-   - Readings that stay between 150 and 155 after a fall send nothing; a reading at exactly 155 does not rearm.
-   - A failed return delivery retries at the next pass above the line and then sends nothing more.
-   - The proven cause from step 1: a row that drives both paths (or the lost state) and gets one fall push.
-   - Keep the Phase 91 rows (`test_crossing_sends_both_channels_once_and_rearms_only_above_the_line`, `test_phone_floor_crossing_sends_once_until_free_space_rises`, `test_crossing_retries_only_the_channel_without_a_receipt`, `test_failure_after_an_interrupted_crossing_receipt_uses_no_crossing_key`). Any change to an existing assertion needs the director's approval first.
-6. Update `docs/as-built/build-memory-admission.md` for the two-push rule and the cause fix.
-7. **Deploy repeat** (builds, 2026-11-09, from natedev): the Mac alerted again at 147.7 GiB after Phases 92 and 93 reached the Mac. Free space stayed at 148 to 150 GiB all morning, with no rise above 155 GiB between alerts. Find how the crossing state behaves across a deploy: for example, a changed receipt key, or a state file that the new code does not read as an open crossing. Fix it so that a deploy never opens a second crossing while one is open. Write the proof in `cause.md`. Test row: an open crossing written before a deploy, then a pass below the line after the deploy, gives no push.
-8. **Folder list** (builds, 2026-11-09, from natedev): the alert listed 31 folders, 20 of them at 0.0 GiB, and cut paths to `~/.…/cargo-liner`. Show only the largest folders that together cover the shortfall, largest first, at most `sweep_alert_folder_count` folders. Never show a folder of 0 bytes. Show each path in full (home-relative with `~` is allowed); never cut a path with `…`. If a text limit is reached, show fewer folders, not shorter paths. Add the new key to `config/lint.conf`: `sweep_alert_folder_count=3`, `# range: 3..5`. Test rows: a list with zero-byte folders and more folders than the count shows only the covering folders, at most the count, with full paths; a long path shows in full.
-9. **Quiet hours** (builds, 2026-11-09, from the user via natedev): when quiet hours end, the held pushes of one alert kind collapse to the latest state: one push, or none when free space is back above the line. The silence queue in `scripts/notify` belongs to sdlc. This phase makes the `disk_floor` sender ready for it with the current API. When an open crossing rearms, run `send.py retire --to user --from disk_floor --key <the crossing's fall key>` before the return push. A kept fall push is then dropped (`silence.drop`). If the retire reports a dropped kept push, the fall never reached the user: send no return push and close the crossing. Run the retire on the machine whose silence queue holds the push; name that machine in `cause.md`. Keep one stable fall key per crossing for the retire. `--clears-when` is not used: `send.py` accepts it only with `--need blocked`. Test rows: a fall kept by silence and then a rise above the rearm line gives a retire and no return push; a fall that was delivered gives the return push.
-10. **Back for good** (builds, 2026-11-09, answer A): the Mac rose to 155.23 GiB at 07:33–09:26 and fell to 147.7 GiB; the 5 GiB margin alone does not mean "back for good". Add the key `sweep_phone_rearm_minutes=60` to `config/lint.conf` (`# range: 0..`). An open crossing rearms, and sends the return push, only after every pass for 60 minutes reads above the rearm line. A pass at or below the rearm line restarts the 60 minutes. Keep the time of the first pass above the rearm line in the crossing state, under its record lock. Test rows: this morning's readings 155.23, 154.47, 150.86, then 147.7 give no return push and no second fall push; 60 minutes of passes above 155 give one return push; a dip to 155 or lower at minute 59 gives no return push.
-
-**Constraints from prior phases:**
-- Phase 91 rule in `notify_floor_problem` and `save_delivery`: rearm only above the line plus `sweep_phone_rearm_gib`, strictly; send crossing text only below the line; accept a crossing receipt only when the delivered message held crossing text. Keep all three.
-- Phase 93: `notify_floor_problem` receives `FloorOutcome.held_targets`; held folders are never recommended. Keep it.
-- Phase 92: `notify_floor_problem` takes the machine from its `policy`.
-
-**Constraints:**
-- Tests make their folders in a tempdir and never touch the real `/tmp`, `~/rust` or Mac home.
-- Never run the real sweep without `--dry-run`.
+- Each fall of free space below `sweep_phone_floor_gib` (150 GiB) gives one fall push for that machine, and the return gives one `sweep.disk_floor_recovered` push. No push goes between them. The rule is the same for natedev and the Mac.
+- `notify_floor_problem` rearms a crossing only when every pass during `sweep_phone_rearm_minutes` (60) reads strictly above the line plus `sweep_phone_rearm_gib` (155 GiB). `AboveRearmLine.since` keeps the first above-line time under the record lock. A reading at or below 155 GiB restarts the interval.
+- `RecoveringPhoneCrossing` holds the return receipt, the retirement result and `ReturnPushPolicy`. The fall key is `phone:<identity>` and the return key is `phone-recovered:<identity>`. A failed return delivery retries above the rearm line and a repeat is stopped by the receipt. A later fall opens a new episode even when the prior return receipt is pending.
+- At recovery, `retire_floor_fall` retires the crossing's fall key on natedev, which owns the silence queue. The Mac reaches natedev through `silence.SSH`. A dropped kept push means no return push and the crossing closes, even when the retire exits with an error. A retire with no count suppresses the return push in saved state, and the next pass retries. Only an accepted fall and a first retire result of zero dropped permit a return push.
+- The alert folder list shows only the largest folders that cover the shortfall, at most `sweep_alert_folder_count` (3, range 3..5). It never shows 0-byte folders and shows each path in full (`~` allowed). At the text limit it shows fewer folders. `notify_floor_problem` falls back to `UNAVAILABLE_FOLDER_CHOICES`.
+- Both Mac floor paths, the launchd job and the ssh call, read and write the same `floor.json` under one `floor-alert.lock`.
 
 **Files:**
-- `scripts/lint/sweep.py` — crossing state, return push, the cause fix.
-- `scripts/lint/test_sweep.py` — the crossing rows.
+- `scripts/lint/sweep.py` — crossing states, timed rearm, return push, fall-key retirement, folder list.
+- `scripts/lint/test_sweep.py` — return, retirement, lost-receipt, timed-rearm and folder-list rows.
 - `scripts/notify/push_catalog.py` — `sweep.disk_floor_recovered`.
+- `scripts/notify/push_texts_reviewed.json` — approval records for the natedev and Mac return examples.
+- `config/lint.conf` — `sweep_phone_rearm_minutes`, `sweep_alert_folder_count`.
 - `docs/as-built/build-memory-admission.md` — the two-push rule and the folder list.
-- `config/lint.conf` — the new keys `sweep_alert_folder_count` and `sweep_phone_rearm_minutes`.
 
-**Workers:** `1 writer + 1 tester`
-- `impl` owns `sweep.py`, `push_catalog.py`, `config/lint.conf` and the as-built doc, writes `cause.md`, and runs the final suites.
-- `test` owns `test_sweep.py`.
+**Gotchas:**
+- The approval record for the return text carries the reviewer's objection to a push that asks for no action. The user approved the words on 2026-11-09.
+- A pending fall phone receipt gets no return push.
 
-**Acceptance gate:**
-- The new rows fail before the fix and pass after it.
-- `scripts/lint/test_sweep.py` and `scripts/mac_test/test_floor_sweep.py` pass. Basedpyright reports `0 errors, 0 warnings, 0 notes` for every changed Python file.
-- `scripts/notify/test_push_texts.py` passes for every text except `sweep.disk_floor_recovered`, which waits on the user's approval.
+**Ruled out:**
+- A deploy repair for the crossing record: the older and current formats read the same crossing, and the 147.7 GiB alert followed a real rise to 155.23 GiB.
+- A fallback for one folder path longer than the message limit.
 
 ### Phase 95 — Each test folder goes when its test ends  · status: done
 
