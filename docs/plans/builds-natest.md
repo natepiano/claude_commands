@@ -2029,7 +2029,7 @@ A changed `config/<name>.conf` selects every test module whose transitive import
 **Gotchas:**
 - Three tests keep a real process through `process_boundary`: pane labels, Darwin process identity and an unreadable observation.
 
-### Phase 102 — The verify result environment tests use half their CPU  · status: todo
+### Phase 102 — The verify result environment tests use half their CPU  · status: done
 **Depends on:** none
 
 #### Work Order
