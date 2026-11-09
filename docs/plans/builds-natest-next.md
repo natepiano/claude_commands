@@ -7,7 +7,7 @@ The phase backlog of natest-unit. At each phase end, rank modules by median CPU 
 Median CPU per gate, from `show.py top --limit 400` on 2026-11-06. The speed phases confirm their targets at dispatch.
 
 1. Phases 65, 64, 66, 55, 63, 70 and 71 are complete, and they form one tip.
-2. Phases 69, 44, 97 and 99 are complete. Phase 97: `copies/test_review_remote_copies.py`, 45.8 to 21.7 CPU s in pairs. Phase 99 reports `direct/test_assign_claude.py` at 49.3 to 14.9 CPU s in module_cost. Its pairs report 43.4 to 22.4 CPU s and 59.7 to 33.0 wall s. Refresh the CPU ranking after Phase 102 closes. Exclude modules with an accepted floor until their stated revisit condition occurs. Add the next eligible speed phase before the last todo phase starts. Phase 100 is complete: `hooks/test_direct_turn_wait_hooks.py`, 26.1 to 3.9 CPU s in pairs. Phase 101 is complete: `herdr/test_herdr.py`, 26.0 to 5.7 CPU s in pairs (78% less).
+2. Phases 69, 44, 97 and 99 are complete. Phase 97: `copies/test_review_remote_copies.py`, 45.8 to 21.7 CPU s in pairs. Phase 99 reports `direct/test_assign_claude.py` at 49.3 to 14.9 CPU s in module_cost. Its pairs report 43.4 to 22.4 CPU s and 59.7 to 33.0 wall s. Phases 102, 103 and 104 are complete. Refresh the CPU ranking after each checkpoint, and apply item 6a to choose the phase after Phase 105. Exclude modules with an accepted floor until their stated revisit condition occurs. Add the next eligible speed phase before the last todo phase starts. Phase 100 is complete: `hooks/test_direct_turn_wait_hooks.py`, 26.1 to 3.9 CPU s in pairs. Phase 101 is complete: `herdr/test_herdr.py`, 26.0 to 5.7 CPU s in pairs (78% less).
 3. Phase 67 follows Phase 82: lint judgment and the parser cases, previously 231 CPU s. Its required functions already exist on origin/builds. The four SSH target files, previously 146.1 CPU s, still wait for verify's remaining import and function changes (Phase 66 floor).
 4. Phase 63 is complete. Phase 70 reports the token order hang; its cause stays open. Read the call output and queue files at its next recurrence.
 5. Phase 72 complete; the lifecycle writer and the first admission stack stay unproved. Phase 73 makes no code change: verify-unit owns the surviving token-renewal delay, and the Mac case needs no edit because queue lacked Phase 63's marker wait.
@@ -73,7 +73,7 @@ Held: `style/test_style_sync.py`, 66.6 CPU s; devtools holds it. Never: `types/b
 - [ ] **Each improved module keeps a reference time.**
   - Target: `scripts/test_times/show.py`, `config/test_times.conf`
   - Why needed: the gate's slowdown warning compares with a rolling median, which slowly accepts a slowdown as normal (Astra plan review, 2026-11-04).
-  - Completion condition: each module a speed phase improved has its after median, CPU time, revision and load stored as a reference. A gate median 20% over it is reported at phase start and starts an investigation. A measure at comparable load confirms a slowdown before another speed phase is selected.
+  - Completion condition: store each improved module's after median, CPU time, revision, load, filesystem roots and bytecode cache conditions. Compare gate readings only under comparable conditions. Report a confirmed increase above 20% at phase start, and investigate it before another speed phase is selected.
   - Revealed by: Astra plan review; starts after Phase 14 lands (showrunner ruling 2026-11-04).
 - [x] **`mac_run.sh` uses the sourced configuration reader.**
   - Target: `scripts/production/mac_run.sh` (recent owner: builds-resources)
