@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import io
 import fcntl
 import os
 import subprocess
@@ -12,7 +13,7 @@ import time
 import unittest
 from collections.abc import Generator, Iterator
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import contextmanager
+from contextlib import contextmanager, redirect_stdout, redirect_stderr
 from pathlib import Path
 from threading import Event, current_thread
 from typing import cast, override
@@ -27,7 +28,10 @@ from scripts.lib import conf
 from scripts.lint.memory_test_support import config_environment, write_config_fixture
 from scripts.message import sessions
 from scripts.production import staff
-from scripts.production.staff_test_support import StaffTestCase, fixture_runtime_id
+from scripts.production.staff_test_support import (
+    StaffTestCase, fixture_runtime_id, fixture_member, fixture_worker, isolated_staff_file,
+    source_environment, isolated_source_readers,
+)
 
 MAKER_ID = fixture_runtime_id("scratch-Claude-session")
 
@@ -1025,6 +1029,58 @@ print(scratch.target('gate:proof', 'tree', False))
         self.assertRegex(path.name, r"^run-2a858b68-0f9a-4af2-b3cf-a776e6b180cb-gate-[a-z0-9]{6}$")
         record = cast(dict[str, object], json.loads((path / copy_record.RECORD).read_text()))
         self.assertEqual((record["task"], record["maker"]), (RUN, MAKER_ID))
+
+    def test_worker_folders_end_together_under_the_recorded_worker_task(self) -> None:
+        parent = self.base / "worker-tmp"
+        with (isolated_staff_file(self.base / "worker-staff.json", {}),
+              mock.patch.dict(os.environ, source_environment(self.base / "sources")),
+              isolated_source_readers(), mock.patch.dict(os.environ, {"TMPDIR": str(parent)})):
+            showrunner = fixture_member("showrunner", name="sdlc")
+            unit = fixture_member("unit", name="hierarchies", parent=showrunner.id)
+            worker = fixture_worker("impl", unit.id)
+            peer = fixture_worker("review", unit.id)
+            made: list[Path] = []
+            peer_paths: list[Path] = []
+            jobs = ((worker, ""), (worker, "clone"), (peer, ""))
+            program = Path(__file__).resolve().parents[2] / "scripts/lib/py"
+
+            def create(job: tuple[staff.StaffRow, str]) -> subprocess.CompletedProcess[str]:
+                owner, name = job
+                return subprocess.run([str(program), "-m", "scripts.lib.scratch", "new", "--worker",
+                                       *(["--name", name] if name else [])], capture_output=True, text=True,
+                                      env={**os.environ, "CODEX_THREAD_ID": owner.current_session}, timeout=30)
+
+            with ThreadPoolExecutor(max_workers=len(jobs)) as processes:
+                results = list(processes.map(create, jobs))
+            for (owner, name), result in zip(jobs, results, strict=True):
+                with self.subTest(owner=owner.name, name=name):
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    path = Path(result.stdout.strip())
+                    self.assertEqual(path.parent, parent)
+                    self.assertRegex(path.name, rf"^sdlc-hierarchies-{owner.name}-[a-z0-9]{{6}}" + ("-clone$" if name else "$"))
+                    record = scratch.task_of(path)
+                    self.assertIsInstance(record, copy_record.Registered)
+                    assert isinstance(record, copy_record.Registered)
+                    self.assertEqual((record.task, record.fields["maker"]), (scratch.worker_task(owner.id), owner.id))
+                    if owner == worker:
+                        _ = (path / "trial.txt").write_text("worker output")
+                        made.append(path)
+                    else:
+                        peer_paths.append(path)
+                        _ = (path / "peer.txt").write_text("peer output")
+            kept = peer_paths[0]
+            # Removal uses the recorded paths even after TMPDIR changes.
+            with mock.patch.dict(os.environ, {"TMPDIR": str(self.base / "next-tmp")}), redirect_stdout(io.StringIO()) as removed:
+                self.assertEqual(scratch.main(["end", "--task", scratch.worker_task(worker.id)]), 0)
+            self.assertEqual(sorted(removed.getvalue().splitlines()), sorted(f"removed {path}" for path in made))
+            self.assertEqual(list(parent.iterdir()), [kept])
+            self.assertEqual((kept / "peer.txt").read_text(), "peer output")
+
+    def test_worker_creation_refuses_a_caller_without_a_worker_row(self) -> None:
+        for identity in (MAKER_ID, fixture_runtime_id("unknown-worker")):
+            with self.subTest(identity=identity), mock.patch.dict(os.environ, {"CODEX_THREAD_ID": identity}), redirect_stderr(io.StringIO()) as errors:
+                self.assertEqual(scratch.main(["new", "--worker"]), 2)
+                self.assertEqual(errors.getvalue().splitlines(), ["scratch: --worker requires the caller's worker staff row"])
 
     def test_a_visible_repro_goes_where_cargo_port_lists_it(self) -> None:
         self.assertEqual(scratch.new(ROW, "demo", visible=True), self.base / "repro" / "cargo-liner-C54-demo")

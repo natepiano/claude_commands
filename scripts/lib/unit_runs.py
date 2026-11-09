@@ -19,17 +19,21 @@ except FileNotFoundError:
     pass
 
 import argparse
+import fcntl
 import json
 import os
 import sys
 import time
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Generator, Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import Enum
 from functools import cache
 from pathlib import Path
 from importlib import import_module
 from typing import TYPE_CHECKING, NamedTuple, cast
+
+from scripts.lib.atomic_file import write_text_atomic
 
 if TYPE_CHECKING:
     from scripts.production import staff
@@ -48,6 +52,7 @@ HEARTBEAT = "heartbeat.log"
 LIVE_HEARTBEAT_SECS = 600
 # Names the run's history, whose first line is the `run_started` event `start-run` writes.
 STATE_FILE = "progress_history_state.json"
+ACTIVE_MARKER_FILE = "active_marker"
 OWNER_FIELD = "owner_staff_id"
 # Every run's durable history: runs/, review_turns/, archives. The former name is read until
 # `unit_runs.py move-history` moves the folder; a test or a scratch run names its own with
@@ -122,13 +127,44 @@ class RunStaffAtUse(Enum):
 
 
 
-def activate(run: Path, session_id: str) -> None:
+@contextmanager
+def marker_lock(path: Path) -> Generator[None]:
+    """Serialize marker publication and removal outside the marker folder."""
+    directory = path.parent.resolve()
+    lock_path = directory.with_name(directory.name + ".lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        yield
+
+
+def activate(run: Path, session_id: str, active_override: str | Path | None = None) -> None:
     """Write the current marker and remove the former marker."""
-    current, *former = active_dirs()
+    current, *former = active_dirs(active_override)
     current.mkdir(parents=True, exist_ok=True)
-    _ = (current / session_id).write_text(f"{run}\n", encoding="utf-8")
+    path = current / session_id
+    with marker_lock(path):
+        write_text_atomic(run / ACTIVE_MARKER_FILE, f"{path.resolve()}\n")
+        write_text_atomic(path, f"{run}\n")
     for directory in former:
-        (directory / session_id).unlink(missing_ok=True)
+        if directory.is_dir():
+            with marker_lock(directory / session_id):
+                (directory / session_id).unlink(missing_ok=True)
+
+
+def end(run: Path) -> None:
+    """Remove only the recorded marker whose first line still names this run."""
+    try:
+        recorded = (run / ACTIVE_MARKER_FILE).read_text(encoding="utf-8").splitlines()
+        if not recorded:
+            return
+        path = Path(recorded[0])
+        with marker_lock(path):
+            target = path.read_text(encoding="utf-8").splitlines()
+            if target and Path(target[0]).resolve() == run.resolve():
+                path.unlink(missing_ok=True)
+    except FileNotFoundError:
+        return
 
 
 def history_root() -> Path:
@@ -382,6 +418,13 @@ def _held_main(argv: list[str]) -> int:
 
 
 def main(argv: list[str]) -> int:
+    if len(argv) == 2 and argv[0] == "end":
+        try:
+            end(Path(argv[1]))
+        except (OSError, UnicodeError) as error:
+            print(f"unit_runs: marker not removed: {error}", file=sys.stderr)
+            return 1
+        return 0
     if len(argv) == 3 and argv[0] == "activate":
         try:
             activate(Path(argv[1]), argv[2])
@@ -397,7 +440,7 @@ def main(argv: list[str]) -> int:
     if argv == ["move-history"]:
         return move_history(time.time())
     if argv != ["removal-check"]:
-        print("usage: unit_runs.py removal-check | history-root | move-history | activate <run folder> <session id> | held <session id>",
+        print("usage: unit_runs.py removal-check | history-root | move-history | activate <run folder> <session id> | end <run folder> | held <session id>",
               file=sys.stderr)
         return 2
     from scripts.message.sessions import running_sessions

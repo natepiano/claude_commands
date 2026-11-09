@@ -797,7 +797,7 @@ A read-only report. It went to the sdlc showrunner on 2026-11-09, grouped by pro
 
 **Gotchas:** a `TemporaryDirectory` block does not run on SIGTERM unless the process turns the signal into an exception. The showrunner ruled this out of scope: `TMPDIR` is cleared at reboot.
 
-### Phase 33 — A run that stops removes its own mark, and workers make folders that delete themselves  · status: todo
+### Phase 33 — A run that stops removes its own mark, and workers make folders that delete themselves  · status: done
 
 **Depends on:** Phase 32
 
@@ -815,17 +815,19 @@ A read-only report. It went to the sdlc showrunner on 2026-11-09, grouped by pro
 - `finish-run` calls the end step, also when the run is already finished. `end_session.sh` calls the same end step for each run it ends; it does not remove the mark itself.
 - In `end_session.sh`, a failed role cleanup (`unbind-run`) or any other cleanup step does not stop the end step. The script still exits non-zero and prints the failed step when one failed.
 - No pipe hides the exit: in `docs/direct/final_gate_commit.md` (<RunSummary/>) and `docs/direct/launch_implementation.md`, the `end_session.sh` call is one command with no pipe.
-- Worker prompt rule: in `docs/direct/write_prompt_contract.md`, replace the test-only instruction at item 6 (about line 88) with one verbatim instruction that every implementation, fix, test and research prompt carries: "A folder you make for your own use (a clone, a test project, a copy, a download) is made in a `with` block under `TMPDIR` (Python `tempfile.TemporaryDirectory`, Rust `tempfile::TempDir`), which removes it when the block ends. Never make one under `/tmp` or `~/rust` by hand. Use `scratch.py` only for a folder that must outlive your command, and say why in your summary. Never commit a test project to the repo." Put the same sentence in the review standing instructions (`config/review/code.md`). Phase 32 traced 7 of 8 leftovers to one-off worker commands.
+- Worker folder command (user, 2026-11-09, via the sdlc showrunner: "why not give a command that workers use to create temp directories so the command creates the conditions for auto removal - and also the names become consistent for a showrunner-unit-worker hierarchy"). Extend `scripts/lib/scratch.py`; add no new tool. `scratch.py new --worker [--name <word>]` reads the caller's own staff row and makes `<showrunner>-<unit>-<worker>-<suffix>` (with `-<word>` when `--name` is given) under `TMPDIR`. The worker passes nothing else. The folder's task is the worker, so `scratch.py end --task <that worker task>` removes every folder the worker made. A caller with no worker staff row is refused with one line. The worker close at DONE calls that end; phase 33b adds the call after the panes close path lands.
+- Worker prompt rule: in `docs/direct/write_prompt_contract.md`, add one verbatim instruction that every implementation, fix, test, research and review prompt carries (put the review copy in `config/review/code.md`): "Make every folder you need for your own work (a clone, a copy, a download, a trial project) with `~/.claude/scripts/lib/scratch.py new --worker [--name <word>]`. It prints the path, and the folder is removed when your assignment ends. Never make a folder under `/tmp` or `~/rust` by hand." Keep the test instruction at item 6: Python code in our scripts and tests keeps `tempfile.TemporaryDirectory`. Phase 32 traced 7 of 8 leftovers to one-off worker commands.
 - Old marks: about 40 marks under `/tmp/claude/unit/active` stay from runs that ended before this fix. Write a one-off program outside the repository (in the worker's scratch) that calls the new end step once for each mark whose run is finished, or whose director session is not live (`unit_runs.marker_must_stay`). It never touches a mark of a live run. It runs once at deploy, then it is deleted. The worker does not run it; the director names it in the checkpoint notice.
-- Tests: add rows to the existing tests (`scripts/direct/test_end_session.py`, `scripts/lib/test_unit_runs.py`, the `finish-run` tests in `scripts/direct/test_progress_history*.py`). Cover: `finish-run` removes the mark; a retry on a finished run removes a mark that stayed; a failed `unbind-run` still removes the mark and the script exits non-zero; a mark that names another run stays. Tests use fixture folders only, never `/tmp/claude/unit` or a live run.
+- Tests: add rows to the existing tests (`scripts/direct/test_end_session.py`, `scripts/lib/test_unit_runs.py`, the `finish-run` tests in `scripts/direct/test_progress_history.py`). Cover: `scratch.py new --worker` makes the named folder under a fixture `TMPDIR` and `end` of the worker task removes it; a caller with no worker row is refused; `finish-run` removes the mark; a retry on a finished run removes a mark that stayed; a failed `unbind-run` still removes the mark and the script exits non-zero; a mark that names another run stays. Tests use fixture folders only, never `/tmp/claude/unit` or a live run.
 
 **Files:**
 - `scripts/lib/unit_runs.py` — the end step; `activate` records its mark.
+- `scripts/lib/scratch.py` — `new --worker` and the worker task.
 - `scripts/direct/progress_history.py` — `finish-run` calls the end step.
 - `scripts/direct/end_session.sh` — calls the end step; cleanup failures do not stop it.
 - `docs/direct/final_gate_commit.md`, `docs/direct/launch_implementation.md` — the end call without a pipe.
 - `docs/direct/write_prompt_contract.md`, `config/review/code.md` — the folder rule.
-- `scripts/lib/test_unit_runs.py`, `scripts/direct/test_end_session.py`, `scripts/direct/test_progress_history*.py` — rows.
+- `scripts/lib/test_unit_runs.py`, `scripts/direct/test_end_session.py`, `scripts/direct/test_progress_history.py`, `scripts/lib/test_scratch.py` — rows.
 
 **Workers:** 1 writer; the end step, its callers and the prompt rule are one small change across shared files, so nothing splits.
 - `impl` — all files above.
@@ -833,3 +835,33 @@ A read-only report. It went to the sdlc showrunner on 2026-11-09, grouped by pro
 **State:** new runs record their mark in the run folder. Old marks get the deploy one-off.
 
 **Acceptance gate:** the targeted test is green; basedpyright reports 0 on `scripts/lib` and `scripts/direct`; the new test rows pass.
+
+### Phase 33b — A worker's folders go when its assignment ends  · status: todo
+
+**Depends on:** Phase 33, and the panes unit's close-at-once phase (the worker close at DONE) merged into sdlc.
+
+#### Work Order
+
+**Goal:** when a worker's assignment ends with DONE, every folder it made with `scratch.py new --worker` is removed.
+
+**Spec:**
+- Merge origin/sdlc after the panes close-at-once phase lands there.
+- In the panes close path that runs at DONE, add one call: `scratch.py end --task <the worker task>` for that worker. It removes only that worker's folders. A failed end prints one line and does not stop the close.
+- Add a row to the existing close-path test: a worker folder made before DONE is gone after the close.
+- Worker prompt rule, remote case (sdlc showrunner, 2026-11-09: a hana worker built a 10G clone in the Mac `~/.cache` and removed nothing). Add this sentence after the phase 33 rule in `docs/direct/write_prompt_contract.md` and in `config/review/code.md`: "A folder or file you make on another machine (the Mac) follows the same rule: make it in a `with` block or a `scratch.py` task with an end, and never use a fixed path such as `~/.cache`."
+- Director rule, remote case (sdlc showrunner, 2026-11-09: the cargo-liner `~/.cache` leftovers on the Mac came from one-off director commands). Add one bullet to <ToolingContract/> in `commands/unit/direct.md`: "A folder or file you make on another machine (the Mac) belongs to a `with` block or a `scratch.py` task with an end. Never use a fixed path such as `~/.cache`."
+- Add no check or scan.
+
+**Files:**
+- `scripts/herdr/turn_end.py` — the close at DONE (about line 192, where `worker_panes.close` runs); the panes phase may move it, then follow it — one end call.
+- `scripts/herdr/test_turn_end.py` — one row.
+- `docs/direct/write_prompt_contract.md` — the remote sentence.
+- `config/review/code.md` — the remote sentence.
+- `commands/unit/direct.md` — the director bullet.
+
+**Workers:** 1 writer; one call, one test row and one sentence in three docs.
+- `impl` — all five files.
+
+**State:** none.
+
+**Acceptance gate:** the targeted test is green; basedpyright reports 0 on the changed files.
