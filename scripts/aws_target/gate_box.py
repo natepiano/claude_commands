@@ -8,7 +8,7 @@ import hmac
 import json
 import shlex
 from urllib.parse import quote
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 if TYPE_CHECKING:
     from scripts.production.merge_gate import GateRun
@@ -253,10 +253,63 @@ trap boot_failed EXIT
 '''
 
 
+GATE_IMAGE_OWNER_TAG = 'cloud-claude-gate-image'
+
+
+def image_inputs(revision: str) -> dict[str, object]:
+    """Keep image identity independent of the gate source code."""
+    return {'revision': revision, 'packages': list(conf.read_or_repository('cloud_gate').words('packages'))}
+
+
+def image_key(inputs: dict[str, object]) -> str:
+    return hashlib.sha256(json.dumps(inputs, sort_keys=True).encode()).hexdigest()
+
+
+def image_user_data(inputs: dict[str, object], result_url: str, expires: int) -> str:
+    """Prepare only the package profile on the temporary image box."""
+    packages = cast(list[str], inputs['packages'])
+    tools = ' '.join(shlex.quote(f'github:NixOS/nixpkgs/{inputs["revision"]}#{name}') for name in packages)
+    prepare = f'''set -eu
+mkdir -p "$image_dir/roots"
+root_number=0
+old_ifs=$IFS
+IFS=:
+for tool_path in $PATH; do
+    case "$tool_path" in
+        /nix/store/*/bin)
+            root_number=$((root_number+1))
+            nix-store --add-root "$image_dir/roots/$root_number" --realise "${{tool_path%/bin}}"
+            ;;
+    esac
+done
+IFS=$old_ifs
+printf '%s\\n' "$PATH" > "$image_dir/path"
+printf '%s\\n' {shlex.quote(image_key(inputs))} > "$image_dir/inputs"
+sync
+'''
+    return f'''#!/bin/sh
+systemd-run --unit=cloud-gate-image-expiry --on-calendar=@{expires} /run/current-system/sw/bin/shutdown -h now
+set -eu
+image_dir=${{GATE_IMAGE_DIR:-/opt/cloud-claude-gate}}
+export image_dir
+mkdir -p "$image_dir"
+exec > "$image_dir/build.log" 2>&1
+publish_image() {{
+    status=$?
+    trap - EXIT
+    printf '{{"status":%s}}' "$status" | curl --fail --silent --show-error --max-time 30 -X PUT --data-binary @- {shlex.quote(result_url)}
+    exit "$status"
+}}
+trap publish_image EXIT
+nix --extra-experimental-features 'nix-command flakes' shell {tools} --command bash -ec {shlex.quote(prepare)}
+'''
+
+
 def user_data(links: dict[str, str], revision: str, lifetime_minutes: int, log_push_s: float,
               module_time_limit_s: float) -> str:
     """Run directly in amazon-init on each boot."""
-    packages = conf.read_or_repository('cloud_gate').words('packages')
+    inputs = image_inputs(revision)
+    packages = cast(list[str], inputs['packages'])
     tools = ' '.join(shlex.quote(f'github:NixOS/nixpkgs/{revision}#{name}') for name in packages)
     def download(key: str, name: str) -> str:
         url, destination = shlex.quote(links[key]), '"$box_dir/' + name + '"'
@@ -301,6 +354,12 @@ touch "$box_dir/timeline.log"
 id -u gate-trial >/dev/null 2>&1 || useradd -m -g users gate-trial
 loginctl enable-linger gate-trial
 export PYTHONUNBUFFERED=1
+image_dir=${{GATE_IMAGE_DIR:-/opt/cloud-claude-gate}}
+if [ "$(cat "$image_dir/inputs" 2>/dev/null)" = {shlex.quote(image_key(inputs))} ]; then
+    export PATH="$(cat "$image_dir/path"):$PATH"
+    bash -ec {shlex.quote(session)}
+    exit
+fi
 nix --extra-experimental-features 'nix-command flakes' shell {tools} --command bash -ec {shlex.quote(session)}
 '''
 
