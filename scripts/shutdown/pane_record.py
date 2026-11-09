@@ -94,13 +94,7 @@ def publication_for_session(session_id: str, *, record: staff.StaffSnapshot | No
 
     owner = (staff.initial_snapshot() if record is None else record).by_current_session(session_id)
     reference = owner.id if owner is not None else session_id
-    matches = [pane_launch.LaunchPublication(path, entry)
-               for path in sorted(record_directory().glob("*.json"))
-               for entry in pane_launch.read_strict(path).values()
-               if entry["session_id"] in (reference, session_id)]
-    if not matches:
-        return None
-    return max(matches, key=lambda publication: publication.entry["written_at"])
+    return pane_launch.newest_publication(record_directory(), (reference, session_id))
 
 
 def resume_launch(entry: PaneLaunch) -> PaneLaunch:

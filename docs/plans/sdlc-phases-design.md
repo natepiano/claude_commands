@@ -111,11 +111,15 @@ and `Contract size summary → lines per file` / `bytes per file`.
 
 ## Baseline
 
-Scope: `scripts/history/rounds.py` now supplies phase boundaries and fix worker
-time. Open and mixed phases are counted apart. A closure review stays in the
-review row; a ledger-only repair round adds a round but no fix worker seconds.
-Repair coverage stays under fix even for a finish-only pass record. Merge
-activity outside that repair interval remains merge coverage.
+The saved baseline uses the round definition of its measurement.
+Current `scripts/history/rounds.py` supplies phase boundaries and fix worker time.
+Open and mixed phases are counted apart.
+A closure review remains in the review row.
+A dispatch without an eligible fix pass adds no repair round.
+Started passes with one ledger batch count once across relaunches.
+Legacy passes without a ledger number group by overlap.
+Repair coverage stays under fix, including a finish-only pass record.
+Merge activity outside that interval remains merge coverage.
 A late document has a separate detail state. A plan is `doc after dispatch`
 only when all named first commits are recorded and the earliest is after
 dispatch. Exclude that negative-lead plan from lead-time costs and rankings.

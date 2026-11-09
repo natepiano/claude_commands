@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from scripts.production import checkpoint_gate
+
 from contextlib import redirect_stdout
 from io import StringIO
 import os
@@ -273,7 +275,7 @@ with (Path(common) / "main-push.lock").open("a") as lock:
         before_files = {path: (self.checkout / path).read_bytes() for path in ("src/alpha.txt", "src/beta.txt")}
         for may_undo in (False, True):
             with self.subTest(may_undo=may_undo):
-                with self.assertRaises(merge_checkpoint.Stop) as stopped:
+                with self.assertRaises(checkpoint_gate.Stop) as stopped:
                     if may_undo:
                         _ = merge_checkpoint.prepare_checkpoint(production, before)
                         _ = merge_checkpoint.push_git(production, True)
@@ -282,7 +284,7 @@ with (Path(common) / "main-push.lock").open("a") as lock:
                 error = stopped.exception
                 output = StringIO()
                 with redirect_stdout(output):
-                    merge_checkpoint.report(error.step, error.state, error.detail)
+                    checkpoint_gate.report(error.step, error.state, error.detail)
                 self.assertIn("push: held", output.getvalue())
                 self.assertIn("src/alpha.txt, src/beta.txt", output.getvalue())
                 self.assertIn("merge origin/main into the merge branch", error.message)

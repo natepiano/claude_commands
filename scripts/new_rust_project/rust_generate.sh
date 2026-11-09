@@ -98,10 +98,9 @@ complete_generation() {
 }
 
 generate_project() {
-  local parent stage
+  local parent
   parent="$(dirname "$DEST")"
   GENERATION_STATE="$parent/.$NAME.rust-generate"
-  stage="$parent/.$NAME.rust-generate-work"
   mkdir -p "$parent"
   if [[ -f "$GENERATION_STATE" ]]; then
     if [[ "$(sed -n '1p' "$GENERATION_STATE")" != "$GENERATION_OPTIONS" ]]; then
@@ -133,15 +132,16 @@ generate_project() {
     [[ -f "$TEMPLATE_DIR/cargo-generate.toml" ]] || {
       echo "Error: template not found at $TEMPLATE_DIR" >&2; exit 1
     }
-    # Only unpublished template output is disposable. The ownership record is
-    # saved before generation; the final destination is published in one move.
-    rm -rf "$stage"
-    mkdir "$stage"
-    cargo generate --path "$TEMPLATE_DIR" --silent --name "$NAME" \
-      --destination "$stage" --define "bevy=$BEVY" "$@" "--$CRATE_TYPE"
-    publish_file "$stage/$NAME/.rust-generate-owner" printf '%s\n' "$GENERATION_TOKEN"
-    mv "$stage/$NAME" "$DEST"
-    rmdir "$stage"
+    # Remove the stage on every exit. Keep it next to the destination
+    # so publication uses one rename.
+    (
+      stage="$(mktemp -d "$parent/.$NAME.rust-generate-work.XXXXXX")"
+      trap 'rm -rf "$stage"' EXIT
+      cargo generate --path "$TEMPLATE_DIR" --silent --name "$NAME" \
+        --destination "$stage" --define "bevy=$BEVY" "$@" "--$CRATE_TYPE"
+      publish_file "$stage/$NAME/.rust-generate-owner" printf '%s\n' "$GENERATION_TOKEN"
+      mv "$stage/$NAME" "$DEST"
+    )
   fi
 }
 

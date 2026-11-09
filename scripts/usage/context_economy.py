@@ -9,12 +9,14 @@ except FileNotFoundError:
 import argparse
 from collections import defaultdict
 from collections.abc import Mapping, Sequence
+from contextlib import closing
 from dataclasses import dataclass, field, replace
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import json
 import os
 from pathlib import Path
 import socket
+import sqlite3
 import statistics
 import sys
 import tempfile
@@ -570,6 +572,8 @@ def _where(value: str) -> SettingsValueMatch:
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
+    hourly = commands.add_parser("hourly")
+    _ = hourly.add_argument("--store", type=Path, default=argparse.SUPPRESS)
     for command in ("report", "save", "compare", "trend"):
         subcommand = commands.add_parser(command)
         for path in ("projects-root", "store", "checkout", "saved-results"):
@@ -604,6 +608,54 @@ def current_time() -> datetime:
     return datetime.now(user_zone())
 
 
+@dataclass(frozen=True)
+class _HourlyRow:
+    label: str
+    units: float
+    cost: float
+    cost_per_unit: float
+
+    def line(self) -> str:
+        return (f"| {self.label} | {self.units:g} | {self.cost / 1e6:.1f}M | {self.cost_per_unit / 1e6:.2f}M |")
+
+
+def hourly_rates(store: Path) -> str:
+    """Read the unit director cost of each complete hour from the ledger, without session logs."""
+    from scripts.usage.usage_report import open_read_store
+
+    configuration = conf.read("context_economy")
+    recent_hours = configuration.whole("hourly_recent_hours")
+    baseline_days = configuration.whole("hourly_baseline_days")
+    dated = weights.sql_weights("t.model", "t.at")
+    with closing(open_read_store(store)) as database:
+        newest = cast(str | None, cast(sqlite3.Row, database.execute("SELECT max(at) AS newest FROM turns").fetchone())["newest"])
+        if newest is None:
+            return "No requests in the ledger."
+        as_of = datetime.fromisoformat(newest).astimezone(timezone.utc)
+        end = as_of.replace(minute=0, second=0, microsecond=0)
+        recent = end - timedelta(hours=recent_hours)
+        rows = cast(list[sqlite3.Row], database.execute(
+            "SELECT substr(t.at, 1, 13) AS hour, count(DISTINCT t.machine || ' ' || t.agent_id) AS units, "
+            + "sum(t.input + w.cached * t.cache_read + w.write_5m * t.cache_write_5m "
+            + "+ w.write_1h * t.cache_write_1h + w.output * t.output) AS cost "
+            + f"FROM turns t JOIN ({dated.entries}) w ON w.weight_entry = {dated.active_entry} "
+            + "WHERE t.role = 'director' AND t.at >= ? AND t.at < ? GROUP BY hour ORDER BY hour",
+            ((recent - timedelta(days=baseline_days)).isoformat(), end.isoformat())).fetchall())
+    zone = user_zone()
+    hours = [(datetime.fromisoformat(cast(str, row["hour"]) + ":00:00+00:00"), cast(int, row["units"]), cast(float, row["cost"]))
+             for row in rows]
+    baseline = [(units, cost, cost / units) for at, units, cost in hours if at < recent]
+    table = ["| hour | active units | cost per hour | cost per unit per hour |", "| --- | ---: | ---: | ---: |"]
+    if baseline:
+        summaries = [summarize([float(row[column]) for row in baseline]) for column in range(3)]
+        table.append(_HourlyRow("normal (median)", *(summary.median for summary in summaries)).line())
+        table.append(_HourlyRow("busy (p75)", *(summary.p75 for summary in summaries)).line())
+    table.extend(_HourlyRow(at.astimezone(zone).strftime("%a %H:00"), units, cost, cost / units).line()
+                 for at, units, cost in hours if at >= recent)
+    return (f"Ledger as of {as_of.astimezone(zone):%a %H:%M %Z}. The hour in progress is not shown. "
+            + f"Normal and busy cover the {baseline_days} days before these hours.\n\n" + "\n".join(table))
+
+
 def last_week(now: datetime) -> tuple[str, datetime, datetime]:
     """Name the previous complete ISO week and retain its local midnight bounds."""
     local = now.astimezone(user_zone())
@@ -618,6 +670,9 @@ def main(argv: Sequence[str] = ()) -> int:
     try:
         if args.command == "trend":
             print(trend(args.saved_results, args.role))
+            return 0
+        if args.command == "hourly":
+            print(hourly_rates(args.store))
             return 0
         now = current_time()
         retry_week = False
@@ -670,7 +725,7 @@ def main(argv: Sequence[str] = ()) -> int:
             if isinstance(mac, MacReadFailed):
                 print(f"mac: {mac.reason}")
             print(render_report(report))
-    except (OSError, ValueError) as error:
+    except (OSError, ValueError, sqlite3.Error) as error:
         print(f"context_economy: {error}", file=sys.stderr)
         return 2
     return 0
