@@ -1635,9 +1635,9 @@ def merge_checkpoint(args: GateArguments) -> int:
     if refused := change_review.missing(commits):
         raise GateRefused(f"checkpoint commits without a {change_review.TRAILER} line: "
                           + "; ".join(refused) + "; " + change_review.HELD_NEXT_STEP)
+    producer = change_review.unit_producer(args.unit)
     if review_list is not None:
         try:
-            producer = change_review.unit_producer(args.unit)
             _ = change_review.publication_changes(commits, production, known_producer=producer)
         except (change_review.ChangeReviewError, OSError) as error:
             raise GateRefused(f"{error}: the staff record is read before the merge") from error
@@ -1651,7 +1651,6 @@ def merge_checkpoint(args: GateArguments) -> int:
             raise GateRefused(f"merge failed; conflicts: {conflicts or '(none)'}; {result.stderr.strip()}"
                               + (f"; abort failed: {abort.stderr.strip()}" if abort.returncode else ""))
         merged = checked_git(repo, "rev-parse", "HEAD")
-        producer = change_review.unit_producer(args.unit)
         if isinstance(producer, str):
             change_review.record_merge_producer(change_review.KnownMergeProducer(merged, producer))
         if merged != baseline:
@@ -1682,7 +1681,6 @@ def merge_checkpoint(args: GateArguments) -> int:
     if args.promote:
         promote(args)
     if review_list is not None:
-        producer = change_review.unit_producer(args.unit)
         record_changes(repo, review_list, production, str(args.merge_branch),
                        known_producer=change_review.KnownMergeProducer(merged, producer)
                        if isinstance(producer, str) else producer)
