@@ -4845,22 +4845,22 @@ def _read_local_role_sessions(groups: GroupAccounts, *, include_workers: bool = 
     inputs = {sessions.sessions_dir(), pane_launch.record_directory()}
     counts: dict[tuple[Path, str], dict[str, str]] = {}
     launches: dict[str, pane_launch.PaneLaunch] = {}
-    for path in pane_launch.record_directory().glob("*.json"):
-        inputs.add(path)
-        try:
-            entries = pane_launch.read_valid_entries(path)
-        except (OSError, ValueError):
-            continue
-        for launch in entries.values():
-            previous = launches.get(launch["session_id"])
-            if previous is None or previous["written_at"] < launch["written_at"]:
-                launches[launch["session_id"]] = launch
     try:
         membership = staff.local_snapshot()
     except staff.StaffUnreadable as error:
         if not isinstance(error.__cause__, FileNotFoundError):
             print(f"accounts: unit counts are incomplete: {error}", file=sys.stderr)
         membership = staff.StaffSnapshot(())
+    for path in pane_launch.record_directory().glob("*.json"):
+        inputs.add(path)
+        try:
+            entries = pane_launch.read_valid_entries(path, record=membership)
+        except (OSError, ValueError):
+            continue
+        for launch in entries.values():
+            previous = launches.get(launch["session_id"])
+            if previous is None or previous["written_at"] < launch["written_at"]:
+                launches[launch["session_id"]] = launch
     inputs.update(Path(path) for path in membership.inputs)
     machine = _session_counts_machine()
 

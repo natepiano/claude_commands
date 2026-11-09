@@ -22,7 +22,9 @@ from typing import cast, override
 from unittest import mock
 
 from scripts.buildlog import charts, costs, moments
-from scripts.build_queue import admission_client, admission_code, admission_protocol as wire, memory_feed, queue_lines, queue_view
+from scripts.buildlog.mac_idle_test_support import write_idle_alert, write_idle_config
+from scripts.build_queue import admission_client, admission_code, admission_protocol as wire, cloud_progress, memory_feed, progress_profile, queue_lines, queue_view
+from scripts.build_queue.test_queue_view import cloud_reading
 from scripts.build_queue.scope_activity import IdleService, LiveBuildRun, NoLiveBuildRun, ScopeProcess, ScopeProcesses
 from scripts.lint import test_memory_admit as memory_tests
 from scripts.lib import conf, test_hang_guard
@@ -40,6 +42,15 @@ def captured_reading(*, running: tuple[admission_records.RunningStep, ...] = ())
     inputs = admission_records.QueueInputs([], running, (), admission_records.HostMemory(30 * admission_records.GIB, 60 * admission_records.GIB),
         admission_records.NO_PRESSURE_HOLD, admission_records.ReadyToStart(), admission_records.NoHeadAdmissionOverride(), 200_000)
     return gate.queue_read_from(inputs, admission_policy_fixture())
+
+
+def with_queue_priority(reading: admission_records.QueueRead) -> admission_records.QueueRead:
+    """Add a private user priority to the reading."""
+    priority: admission_records.QueuePriority = {
+        "unit": "research", "why": "the user's bump", "set_at": reading.explanation.now,
+        "set_by": "fixture-user", "transition": admission_records.SettledPriority(),
+    }
+    return replace(reading, explanation=replace(reading.explanation, priority=priority))
 
 
 def report_fixture(*, empty: bool = False) -> charts.PageData:
@@ -103,6 +114,7 @@ class MemoryFeedTests(unittest.TestCase):
             "NOTIFIER_SESSIONS_DIR": str(self.root / "sessions"),
             "STAFF_FILE": str(self.root / "staff.json"),
             "USER_ZONE": "UTC",
+            "MAC_IDLE_STATE_DIR": str(self.root / "mac-idle"),
         })))
         _ = self.enterContext(mock.patch.object(admission_client, "view",
             side_effect=AssertionError("The test must supply a private queue reading")))
@@ -521,6 +533,102 @@ class MemoryFeedTests(unittest.TestCase):
         page = cast(dict[str, object], json.loads((self.output / "memory.json").read_text()))
         self.assertEqual(page["decoder_revision"], "after")
 
+    def test_queue_priority_reaches_the_feed_and_clears_when_removed(self) -> None:
+        base = captured_reading()
+        cases = ((with_queue_priority(base), "queue priority: research (the user's bump)"), (base, ""))
+        for reading, expected in cases:
+            with self.subTest(expected=expected):
+                with mock.patch.object(admission_client, "view", return_value=reading):
+                    payload = memory_feed.reading()
+                self.assertEqual(payload["priority_text"], expected)
+
+    def test_mac_idle_alert_reaches_the_feed_and_clears_with_the_watch_state(self) -> None:
+        _ = write_idle_config(self.root)
+        reading = captured_reading()
+        now = reading.explanation.now
+        cases = (
+            ("idle", 0, "MAC IDLE 10 min: 7 steps wait for the Mac. Blocked by research since "
+                + "07:23 (P15 F11 L0 run); /build:mac unblock clears it."),
+            ("busy", 0, ""),
+            ("unreachable", 0, "MAC UNREACHABLE until 07:38: 7 steps wait for the Mac."),
+            ("unreadable", 0, "MAC IDLE WATCH: Mac state unreadable: P15 F11 L0 run."),
+            ("idle", 301, "MAC IDLE WATCH: no reading since 07:28; check buildlog-sample.timer."),
+            ("absent", 0, ""),
+        )
+        for state, written_age, expected in cases:
+            with self.subTest(state=state, written_age=written_age):
+                path = write_idle_alert(self.root / "mac-idle", now, written_age=written_age)
+                if state == "absent":
+                    path.unlink()
+                else:
+                    saved = cast(dict[str, object], json.loads(path.read_text()))
+                    saved.update(state=state, until=now + 300)
+                    _ = path.write_text(json.dumps(saved))
+                with mock.patch.object(admission_client, "view", return_value=reading), \
+                     mock.patch.object(time, "time", return_value=now):
+                    page = memory_feed.reading()
+                payload = cast(dict[str, object], json.loads(memory_feed.page_json(page)))
+                self.assertEqual(payload["mac_idle_alert"], expected)
+
+    def test_cloud_rows_share_the_feed_without_memory_reservations(self) -> None:
+        _ = (self.root / "cloud_gate.conf").write_text(
+            "[cloud_gate]\n# range: 5e-324..\nlog_push_s=5\n")
+        reading = cloud_reading(reservation_reading())
+        first = reading.cloud[0]
+        assert isinstance(first.progress, cloud_progress.CloudProgress)
+        cases: tuple[tuple[cloud_progress.CloudState, float, str], ...] = (
+            ("requesting", first.progress.updated_at, "2 min"),
+            ("setup", first.progress.updated_at, "2 min"),
+            ("running", first.progress.updated_at, "2 min"),
+            ("uploading", first.progress.updated_at, "2 min"),
+            ("running", 0.0, "1 min"),
+            ("running", reading.explanation.now, ""),
+            ("running", reading.explanation.now - 45, "45 s"),
+            ("running", reading.explanation.now - 10800, "3 h"),
+            ("running", reading.explanation.now - 172800, "2 d"),
+        )
+        for state, updated_at, late_age in cases:
+            with self.subTest(state=state, updated_at=updated_at):
+                cloud = replace(first, progress=replace(first.progress, state=state, updated_at=updated_at))
+                current = replace(reading, cloud=(cloud, *reading.cloud[1:]))
+                with (mock.patch.object(admission_client, "view", return_value=current),
+                      mock.patch.object(os, "cpu_count", return_value=17)):
+                    page = memory_feed.reading()
+                text = memory_feed.page_json(page)
+                payload = cast(dict[str, object], json.loads(text))
+                self.assertNotIn("cloud", payload)
+                self.assertNotIn("cloud_heading", payload)
+                self.assertEqual(page["cloud_slots_used"], 1)
+                self.assertEqual(page["cloud_slots"], 1)
+                self.assertIn("cloud 1 of 1 slots", page["head_text"])
+                runs = cast(list[dict[str, object]], payload["walk"])
+                waits = cast(list[dict[str, object]], payload["waiters"])
+                remote, = [row for row in runs if row.get("kind") == "cloud"]
+                local, = [row for row in runs if row.get("kind") != "cloud"]
+                waiter, = [row for row in waits if row.get("kind") == "cloud"]
+                self.assertEqual(remote["machine"], "aws")
+                self.assertEqual(remote["vcpus"], 32)
+                self.assertEqual(remote["state"], state)
+                self.assertEqual(remote["pid"], 700001)
+                self.assertEqual(remote["started_at"], first.started_at)
+                self.assertIn("7 of 12 modules", str(remote["status"]))
+                self.assertIn("1 failed module", str(remote["status"]))
+                self.assertNotIn("no update for", str(remote["status"]))
+                self.assertEqual(remote["late_age"], late_age)
+                self.assertEqual(remote["stale"], bool(late_age))
+                self.assertEqual(local["machine"], "fixture")
+                self.assertEqual(local["vcpus"], 17)
+                self.assertGreater(float(str(local["reserved"])), 0)
+                self.assertEqual(waiter["pid"], 700002)
+                self.assertEqual(waiter["machine"], "")
+                self.assertEqual(waiter["late_age"], "")
+                self.assertFalse(waiter["stale"])
+                self.assertEqual(waiter["since"], reading.cloud[1].since)
+                self.assertIn("waits for a cloud slot: 1 of 1 in use", str(waiter["reason"]))
+                for row in (remote, waiter):
+                    for field in ("used", "counted", "reserved", "need"):
+                        self.assertNotIn(field, row)
+
     def test_project_names_follow_the_queue_formatter_for_running_and_waiting_steps(self) -> None:
         for project, folder in (("known-project", "/fixture"), ("", "/fixture"),
                                 ("", "/absolute/repository")):
@@ -604,7 +712,9 @@ class MemoryFeedTests(unittest.TestCase):
         reading = replace(reading, explanation=replace(reading.explanation, room=room))
         with mock.patch.object(admission_client, "view", return_value=reading):
             page = memory_feed.reading()
-        self.assertEqual(page["walk"][0]["used"], missing)
+        run_row = page["walk"][0]
+        assert "used" in run_row
+        self.assertEqual(run_row["used"], missing)
         self.assertIn("RunUseUnavailable", memory_feed.page_json(page))
 
     def test_one_report_call_supplies_both_sections(self) -> None:
@@ -680,6 +790,15 @@ def write_browser_fixture(folder: Path) -> None:
             ("head", admission_records.BehindHead("first", 1, "head-session")),
         ):
             readings[name] = with_wait_reason(base, reason)
+        _ = (fixture.root / "cloud_gate.conf").write_text(
+            "[cloud_gate]\n# range: 5e-324..\nlog_push_s=5\n")
+        cloud = cloud_reading(with_wait_reason(base, admission_records.StartSpacingWait(110)))
+        readings["cloud"] = cloud
+        first = cloud.cloud[0]
+        assert isinstance(first.progress, cloud_progress.CloudProgress)
+        readings["cloud_zero"] = replace(cloud, cloud=(replace(first,
+            progress=replace(first.progress, updated_at=0.0, failed_modules=123456),
+            counter=progress_profile.ProgressCounter("modules", 123456, 999999)), *cloud.cloud[1:]))
         room = base.explanation.room
         assert isinstance(room, admission_records.MemoryRoom)
         missing = replace(room.runs[0].memory, use=admission_records.RunUseUnavailable("private memory.stat is missing"))
@@ -692,6 +811,15 @@ def write_browser_fixture(folder: Path) -> None:
         for name, reading in readings.items():
             with mock.patch.object(admission_client, "view", return_value=reading):
                 pages[name] = json.loads(memory_feed.page_json(memory_feed.reading(configuration)))
+        readings["priority"] = with_queue_priority(base)
+        with mock.patch.object(admission_client, "view", return_value=readings["priority"]):
+            pages["priority"] = json.loads(memory_feed.page_json(memory_feed.reading(configuration)))
+        _ = write_idle_config(fixture.root)
+        _ = write_idle_alert(fixture.root / "mac-idle", base.explanation.now)
+        with mock.patch.object(admission_client, "view", return_value=base), \
+             mock.patch.object(time, "time", return_value=base.explanation.now):
+            pages["mac_idle"] = json.loads(memory_feed.page_json(memory_feed.reading(configuration)))
+        (fixture.root / "mac-idle" / "alert.json").unlink()
         for name, report in (("empty_report", report_fixture(empty=True)),
                              ("missing_report", charts.IndexUnavailable("private index is missing"))):
             with (mock.patch.object(charts, "page_data", return_value=report),

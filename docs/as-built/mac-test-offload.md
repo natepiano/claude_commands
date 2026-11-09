@@ -2,7 +2,7 @@
 
 ## What it is
 
-`verify.sh test` tries the first free eligible build target: the Mac first; a Mac pass or failure ends the call. It waits when every eligible target is held or full. The Mac takes one claim per repository: a hana run and a cargo-liner run can share it, two runs of one repository never do. A block is the Mac's hold: it admits its holder session's own claims and refuses other sessions' new claims for every repository, turns off hana's CI use of the Mac, names skipped macOS runs on release, and sends its holder one free message when existing work ends. Expiry attempts to remove the block; a failed CI restore leaves it in force. A claim whose Mac has run nothing for 15 minutes is released and its holder told. Each offloaded run removes the mirror's build output afterwards only when the Mac is below its free-space floor. `buildlog costs` ranks costs by machine. The `buildlog` CLI retains coordination state, hold intervals, and detailed Mac step tables.
+`verify.sh test` tries the first free eligible build target: the Mac first; a Mac pass or failure ends the call. It waits when every eligible target is held or full. The Mac takes one claim per repository: a hana run and a cargo-liner run can share it, two runs of one repository never do. A block is the Mac's hold: it admits its holder session's own claims and refuses other sessions' new claims for every repository, turns off hana's CI use of the Mac, names skipped macOS runs on release, and sends its holder one free message when existing work ends. Expiry attempts to remove the block; a failed CI restore leaves it in force. A claim whose Mac has run nothing for 15 minutes is released and its holder told. Each offloaded run removes the mirror's build output afterwards only when the Mac is below its free-space floor. `buildlog charts` opens the shared build page. The `buildlog` CLI retains coordination state, hold intervals, and detailed Mac step tables.
 
 `test`, `check`, `doc`, `example`, and lint judgments use the first eligible target from their first step.
 The default target order is Mac, natedev, AWS.
@@ -38,7 +38,7 @@ An idle alert marker does not control admission.
 Blocks, live repository claims, and retry delays still apply.
 Tree repair steps remain local.
 
-Lint during a hold keeps local `cargo fmt` and `taplo fmt`. It then runs `mend-check` (`mend --fail-on-warn`) and clippy judgment (`--workspace --all-targets --all-features -- -D warnings`) on the Mac. A lint can use this sequence when its first `mend --fix` waits for memory and a Mac becomes free. A clean judgment ends the call without local repairs. A Mac finding from this memory transition returns the lint to the natedev queue for `mend --fix`. A busy Mac or a `linux_only.<repo>` exclusion keeps the lint on natedev. Writing steps always run on natedev. Their leave hooks remain disabled while the commands run. Local formatting uses the protected `local_noncompiling` record state, including when a hold starts during formatting. The mirror never writes changes back. A finding must be fixed locally; a Linux-only lint error can appear later at the merge gate (accepted by the user, 2026-10-28). A local step stopped for a new hold is routed again after the stop, rather than counted as a completed failure.
+Lint during a hold keeps local `cargo fmt` and `taplo fmt`. It then runs `mend-check` (`mend --fail-on-warn`) and clippy judgment (`--workspace --all-targets --all-features -- -D warnings`) on the Mac. A lint can use this sequence when its first `mend --fix` waits for memory and a Mac becomes free. A clean judgment ends the call without local repairs. A Mac finding from this memory transition returns the lint to the natedev queue for `mend --fix`. A busy Mac or a `linux_only.<repo>` exclusion keeps the lint on natedev. Writing steps always run on natedev. Their leave hooks remain disabled while the commands run. Local formatting uses the protected `local_noncompiling` record state, including when a hold starts during formatting. The mirror never writes changes back. A finding must be fixed locally; a Linux-only lint error can appear later at the merge gate. A local step stopped for a new hold is routed again after the stop, rather than counted as a completed failure.
 
 ## How it works
 
@@ -89,7 +89,11 @@ The check counts live steps that can use a Mac.
 It accepts `AnyTarget` records with Mac targets.
 The step must have state `waiting_hold` or `waiting_mac`.
 The check validates the owner PID and process start time.
-It preserves P10 admission reads and excludes permanent local declines.
+It reads admission waiters and excludes permanent local declines.
+A disk exclusion remains `NatedevOnly("disk")`.
+The watch counts that reason in `waiting_hold`, `waiting_mac`, and `on_natedev`.
+It displays `Mac disk exclusion` and names sufficient Mac disk space as the clearing condition.
+Other `natedev_only` reasons do not count.
 
 The `[mac_idle]` section of `config/mac_test.conf` supplies these defaults:
 
@@ -102,12 +106,25 @@ The `[mac_idle]` section of `config/mac_test.conf` supplies these defaults:
 | `send_timeout_s` | 180 | Timeout for a phone send |
 
 The shared configuration reader supplies these values at use.
-`mac_test.read_config()` uses the same idle decoder.
+The idle watch reads the `[mac_idle]` section directly.
+`mac_test.read_config` validates idle settings only for macOS targets.
+Linux target configuration reads omit that validation.
 `CONF_DIR` selects the configuration folder.
 `MAC_TEST_CONFIG` can select the idle watch's configuration file.
 Missing or invalid override values use the shipped configuration.
 A typed configuration error names a key that has no usable value.
 Views show that error as `MAC IDLE WATCH`.
+
+`calls_past_wait_limit` tracks each call by call id and process start in `wait_starts.json`.
+It keeps the first observed wait start until that call leaves the waiting set.
+Only calls past `alert_seconds` contribute to counts, disk details, notifications, and per-call causes.
+An unreadable `updated` timestamp counts as past the limit.
+A retry can rewrite the step state every 180 seconds, so its mtime cannot measure total wait age.
+
+`admission_waiters` returns `AdmissionWaiters` or `AdmissionQueryFailed`.
+A query failure appears in `SavedAlert.admission_error` and stderr while independent checks continue.
+A later successful sample removes that error.
+Malformed numeric protocol values become `AdmissionUnavailable` at the admission boundary.
 
 The watch sends the builds showrunner one message after `alert_seconds` while eligible steps wait.
 It resolves the address with `showrunners.py address builds`.
@@ -179,7 +196,9 @@ A pending or active block is one footer item after the build-hold lines: `Mac bl
 
 ### The offload runner — `scripts/mac_test/offload.py`
 
-Nextest accepts repeated `--env NAME` arguments and one `--fetch FOLDER` argument. Other verbs and `--copy` refuse these arguments.
+Nextest accepts repeated `--env NAME` arguments and one `--fetch FOLDER` argument.
+A nextest copy accepts `--env` for its test environment. It refuses `--fetch`.
+Other verbs refuse these arguments.
 The runner forwards only named variables. Quoted assignments precede the fixed runner assignments, so the fixed assignments take priority.
 A fetch folder must have a plain relative path. The runner removes that folder in the mirror before the test starts.
 After a reported test result, the runner measures the folder and copies it before releasing the claim.
@@ -221,8 +240,30 @@ It does not prove a link failure.
 The attempt record keeps the reason.
 An interruption marker reports the instance generation.
 
-- `offload.py run --repo-root DIR [--package PKG] [--verb nextest|check|clippy|mend-check|doc] --call-id ID [--settings FILE] [--last-decline busy|blocked] [--filter-run] [--result FILE] -- <verb arguments>` exits 0 on a Mac pass, 75 for local fallback, and the step's own status on a Mac failure. The default verb is `nextest`. Claims use `--what "<verb> <package or workspace>"`. `lint check` runs Cargo check; `lint mend-check` runs mend with `--fail-on-warn`; remote doc sets `LINT_CONFIG_FORCE=1`. Workspace verbs use the same manifest-based Linux-only check as `eligible --kind`. `--settings` selects that target's config. `--last-decline` suppresses an unchanged retry notice. `write_result` writes `mac=`, `reason=`, `seconds=` from `PassedOnMac | FailedOnMac | NoTestMatchedOnMac | LostMacRun | DeclinedMacRun | BusyMacDecline`. A busy result alone adds `holder=`: the claim's `what`, `leftovers`, or `unreadable`; `KnownMacJob | LostRunLeftovers | UnreadableMacHolder` gives that value its meaning. Missing or contradictory results are unusable. Declined, lost and invalid results return the record to `waiting_mac` before the next wait.
-- Declines print `mac_test: not running on the Mac (<reason>)`: `off`, `repo`, `linux_only`, `backoff`; claim `blocked`, `busy`, `state`; probe `unreachable` (with backoff), `disk`; then `copy`. The claim gates work; the probe has no process-count, load or power check: a Mac on battery runs tests (user, 2026-10-18). An app open on the Mac does not exclude a test.
+The runner command has this form:
+
+```sh
+offload.py run --repo-root DIR [--package PKG] \
+  [--verb nextest|check|clippy|mend-check|doc|build] --call-id ID \
+  [--settings FILE] [--last-decline busy|blocked] [--filter-run] \
+  [--result FILE] -- <verb arguments>
+```
+
+A remote pass exits 0. A permitted local fallback exits 75.
+A remote failure returns the step's own status.
+The default verb is `nextest`.
+Claims use the verb and the package name, or `workspace`.
+Remote doc sets `LINT_CONFIG_FORCE=1`.
+Workspace verbs use the same manifest-based Linux-only check as eligibility.
+`--settings` selects the target's configuration.
+`--last-decline` suppresses an unchanged retry notice.
+
+`write_result` writes `mac`, `reason`, and `seconds` from the typed run outcome.
+A busy result adds `holder`: its known job, `leftovers`, or `unreadable`.
+Missing or contradictory results are unusable.
+Declined, lost, and invalid results return the step to its waiting state.
+
+- Declines print `mac_test: not running on the Mac (<reason>)`: `off`, `repo`, `linux_only`, `backoff`; claim `blocked`, `busy`, `state`; probe `unreachable` (with backoff), `disk`; then `copy`. The claim gates work; the probe has no process-count, load or power check: a Mac on battery runs tests. An app open on the Mac does not exclude a test.
 - The probe reads the hostname and free GiB against `free_floor_gib`, with no power or process check. Coordination records decide whether the Mac is held or busy.
 - `copies.remote_rsync` builds the refresh command for the configured mirror root.
   It excludes `/.git`, `/target/`, ignored paths, and the metadata that copies.py owns.
@@ -266,7 +307,11 @@ The defaults are `TERM=xterm-256color`, `COLORTERM=truecolor`, `TERM_PROGRAM=ver
 The rule includes local tests and the test step of `final`.
 Test keys hold configured fixed values, instead of the caller's terminal values.
 
-`VERIFY_RESULT_ENV_NAMES` and `VERIFY_RESULT_ENV_PREFIXES` select other exported values for test verdict and tree content keys.
+`result_environment.py` reads `VERIFY_RESULT_ENV_NAMES`, `VERIFY_RESULT_ENV_PREFIXES`, and `VERIFY_TEST_FIXED_ENV` from `config/direct.conf` at use.
+The selected name defaults include `NO_COLOR`, `CLICOLOR`, `CLICOLOR_FORCE`, `FORCE_COLOR`, `CI`, `TZ`, `LANG`, and the configured `LC_` categories.
+`LC_TERMINAL` and `LC_TERMINAL_VERSION` are excluded.
+The prefix defaults are `HANA_`, `WGPU_`, `BEVY_`, `INSTA_`, and `TRACE_`.
+These values enter test verdict and tree-content keys.
 Unset and empty values differ. These new inputs leave build keys and other command keys unchanged.
 A remote nextest run clears each selected name the call did not set, then applies the call's values.
 Mac and SSH nextest runs receive these values and `RUST_LOG`, `RUST_BACKTRACE`, and `RUST_LIB_BACKTRACE`.
@@ -280,10 +325,29 @@ A test failure retains the runner's status. No forwarded name, value or folder i
 A new admission wait clears an inherited queue identity. A rejoining step restores its own identity after sourcing the gate.
 An interrupted run stops and reaps both log readers after recording its result. This also handles a blocked output pipe.
 
-- `--local "<why>"` sets `LOCAL_ONLY` and records `declined` / `local_flag`, with the reason exported as `BUILDLOG_LOCAL_REASON`. It takes the next argument as a required reason and exits 2 before any work when that is missing, blank or starts with `--`. It also exits 2 before any work when the reason names a reservation: any of the whole words reserve, reserved, reservation, hold, holds, held, blocked, claim, claims, busy, showrunner or ruling, in any case. The message points to `/build:hold hold <why> target mac`, the one way to keep tests off the Mac. A reservation in a `--local` reason is recorded nowhere and never ends: on 2026-10-18 a unit's 'Mac reserved for demo', a day old, kept its tests waiting on a held natedev while the Mac was free (user, 2026-10-18). The reason never enters `tree_key` or the cargo words. Use it only for a test that must run on Linux. Otherwise, when the runner exists, `try_mac_test()` runs between the first cache lookup and the cargo token: `"$PY" "$MAC_RUNNER" run --repo-root <top level> --package <pkg> --call-id "$BUILDLOG_CALL_ID" --result <temp file> [--filter-run] -- "${NEXTEST_ARGS[@]}"` (`compose_nextest_args()` builds the words; `VERIFY_MAC_RUNNER` substitutes the runner in tests).
+- `--local "<why>"` pins execution to natedev and records `declined` / `local_flag` with `BUILDLOG_LOCAL_REASON`.
+  The reason must be present, nonblank, and must not start with `--`.
+  Reservation words also refuse with exit 2 before work starts.
+  The words are reserve, reserved, reservation, hold, holds, held, blocked, claim, claims, busy, showrunner, and ruling.
+  The refusal points to `/build:hold hold <why> target mac` for a reservation.
+  The reason does not enter the tree key or Cargo arguments.
+  `compose_nextest_args` constructs nextest arguments for `try_mac_test`.
+  `VERIFY_MAC_RUNNER` supplies a runner stand-in in tests.
+
 - `declined` and `lost` allow a local run. No usable result is recorded as `declined` / `runner`. While natedev waits for memory or a hold, each temporary result keeps the Mac leave hook. Routing and local waits share `remember_mac_retry` and `mac_retry_hook`: `busy` and `blocked` use the normal poll; other temporary results, including `lost` and `runner`, set a monotonic deadline 180 s after the attempt ends. Each repeated result sets a new deadline. One stderr line explains the delay per call. A local step that can start proceeds at once. Permanent exclusions (`no_tests`, `off`, `repo`, `linux_only`, `local_flag`) stop Mac retries. A target excluded by configuration is never tried. A `passed` ends the call (`verify.sh: PASS on the Mac (macOS), so nothing ran on natedev.`), exit 0, recorded as `passed_full`, or `passed_filter` on a `--filter` run. Its output is captured and kept as the call's pass record, marked `host=mac` and judged on the tree read just before the Mac run; an edit made meanwhile leaves nothing recorded. A `--local` call does not reuse a `host=mac` record; its natedev pass replaces it. `failed` records the call and exits with the runner's status.
 - `verify.sh` and `invoke.sh` create a missing `$TMPDIR` before temp files are made. The lint CLI gets the same setup when it sources `invoke.sh`.
-- A signal is forwarded to the runner by `forward_mac_runner_signal()` and waited for; the exit is 128 plus the signal, and the interrupted call writes its last Mac result to the call record.
+- A signal is forwarded to the runner by `forward_mac_runner_signal()` and waited for; the exit is 128 plus the signal, and the interrupted call writes its last Mac result to the call record. INT goes to the runner as TERM. The handler and `cancel_tree_run` find the runner through `find_mac_runner_pid`, which also sees a runner started before `MAC_RUNNER_PID` is set.
+  `find_mac_runner_pid` runs in the calling shell.
+  During launch, it uses `$!` only when `MAC_RUNNER_LAUNCHING=1` and that job differs from `MAC_RUNNER_PRIOR_JOB`.
+  The handlers therefore cover both sides of `MAC_RUNNER_PID=$!`.
+  A subshell would lose this job state.
+  Job control around the runner fork would permit SIGTTIN during a terminal read.
+
+  Each remote runner opens its log on descriptor 9 before either tee starts.
+  Both tees append through `/dev/fd/9`.
+  Removal closes descriptor 9 before unlinking the log, so a late tee cannot recreate the name.
+  `record_mac_pass` closes the descriptor before reading, moving, or removing the log.
+
 - Routing reads configured targets through `targets.py`. `verify.sh` waits on held natedev, or tries the Mac while natedev is held; it never falls back to a held target. While both are unavailable it prints `verify.sh: natedev is held by <holder> for <reason>.` and `verify.sh: waiting for the Mac (<reason>) or natedev's release.`, once and again only on change. A local run prints `verify.sh: running on natedev`. Calls carry `mac`, `mac_reason`, `local_reason`, `mac_s`, `mac_holder`, `target` and `hold_wait_s`; `BUILDLOG_MAC_HOLDER` carries the busy holder, is never exported, and is cleared when a later answer is no longer busy. An interrupted retry keeps the earlier decline and holder.
 
 ### The showrunner's Mac build — `scripts/production/mac_run.sh`
@@ -304,9 +368,32 @@ After any temporary Mac result at the start of a `verify.sh test` call, the call
 - **Outcomes.** A copy failure or pass wins: the watcher checks that the step's group leader still runs (not reaped, not a zombie, same start time, still its own group), creates `<info>.stopped`, SIGTERMs the group and writes `copy=won`, `mac=`, `reason=`, `seconds=`, `runner_status=`, `stopped_natedev=1`, then exits. If the leader is gone, natedev finished first: `natedev_won`. A runner exit 143 the watcher did not cause means a new test took the Mac: `gave_way`. `declined` with `no_tests`, `off`, `repo` or `linux_only` ends copies; any other decline, `lost`, or an unusable result lets the call become a candidate again. verify's TERM or loss of the verify parent stops a running copy (TERM, 60 s, then kill) as `natedev_won`; a copy that ended before the TERM keeps its outcome, except a win, which stopped nothing and is `natedev_won`. The result file always carries `copy=`, `copy_s=` (seconds copies held the Mac), `copy_count=` and `natedev_s_at_end=` (seconds since the step's first cargo line when the result was decided), all empty when no copy started.
 - **verify.sh.** `run()` writes the info file and, after a failed attempt with `.stopped` present, returns at once (no memory-kill retry). `VERIFY_CALL_STARTED` is `EPOCHREALTIME` at call start. After `run_nextest` returns, `stop_copy_watch` TERMs and waits for the watcher and folds its result into `BUILDLOG_MAC_COPY` (last outcome), `BUILDLOG_MAC_COPY_COUNT` and `BUILDLOG_MAC_COPY_S` (summed over leave-hook passes) and `BUILDLOG_MAC_COPY_NATEDEV_S`, passed by `note_event`. Only `copy=won` with `stopped_natedev=1` and a nonzero step status acts: `finish_copy_win` sets the `BUILDLOG_MAC*` words and `BUILDLOG_TARGET=mac`, and ends as `try_mac_test` does (failure: removes the run log and exits with its status; pass: the run log, holding both machines' output, becomes the `host=mac` pass record, `passed_full` or `passed_filter`, exit 0). A `won` that did not stop natedev is recorded as `natedev_won`. `verify_cleanup` calls `stop_copy_watch` first, so an interrupt (after `verify_interrupted` stops the step group) also stops the copy.
 
+`start_copy_watch` passes the launching shell's `BASHPID` as required `--parent-pid`.
+The Bash fallback uses an executed child shell's `PPID`.
+`$$` would identify the outer shell inside a subshell.
+`Wakeup.stop_requested` stops when `os.getppid()` differs from the supplied parent, including on its first check.
+A missing parent argument exits 2 and writes no result.
+
 ### Build log and report — `scripts/buildlog/`
 
-- The index is at schema 21. `calls` carries `mac` (`passed_full`, `passed_filter`, `failed`, `lost`, `declined`; `passed` before 2026-10-16 meant natedev confirmed the pass), `mac_reason`, `local_reason`, `mac_s`, `mac_holder`, `target` and `hold_wait_s`, and for a Mac copy of a still-compiling natedev test `copy` (the last copy's outcome: `won`, `natedev_won`, `gave_way`, `declined` or `lost`, plus `passed_full` before 2026-10-16; empty when no copy started), `copy_s` (seconds copies held the Mac, summed), `copy_count` (copies started) and `copy_natedev_s` (seconds the natedev nextest step had run, from its first cargo line, when the result was decided). verify.sh passes them as `BUILDLOG_MAC_COPY`, `BUILDLOG_MAC_COPY_S`, `BUILDLOG_MAC_COPY_COUNT` and `BUILDLOG_MAC_COPY_NATEDEV_S`; `record.py call` stores them, and rows from before schema 17 read NULL. Mac steps have `caller = verify-mac` and the natedev call's id from `BUILDLOG_CALL_ID`; they reach natedev through `buildlog sync`. NULL `mac_holder` reads `holder not recorded`; known jobs, lost-run leftovers and unreadable holders are counted separately below the busy cause without changing the usable share.
+Call records carry `mac`, `mac_reason`, `local_reason`, `mac_s`, `mac_holder`, `target`, and `hold_wait_s`.
+`mac` is `passed_full`, `passed_filter`, `failed`, `lost`, or `declined`.
+Readers retain legacy result words for existing records.
+
+| Copy field | Meaning |
+| --- | --- |
+| `copy` | Last outcome: won, natedev_won, gave_way, declined, or lost. Empty means no copy started. |
+| `copy_s` | Sum of seconds that copies held the Mac. |
+| `copy_count` | Number of copies started. |
+| `copy_natedev_s` | Local nextest seconds from its first Cargo line until the copy decision. |
+
+Verify passes these values through the matching `BUILDLOG_MAC_COPY*` variables to `record.py call`.
+Older rows without these fields read as NULL.
+Remote steps carry caller `verify-mac` and the controller's `BUILDLOG_CALL_ID`.
+`buildlog sync` brings their rows to natedev.
+A NULL holder reads `holder not recorded`.
+Reports separate known jobs, leftovers, and unreadable holders without changing usable-share calculations.
+
 - `COUNTED_FAILURE` (`status != 0 AND NOT (caller IS 'verify-mac' AND step IS 'nextest' AND status = 4) AND NOT (host IS 'natedev' AND step IS 'nextest' AND call_id IN (SELECT id FROM calls WHERE copy = 'won'))`) drives `step_days.failed`, the `failures` view, the Mac table's Failed, each step table's Failed and the lead block's `Failed steps`. A Mac "no tests to run" keeps raw status 4 without counting as a failure, and a natedev nextest step stopped because its call's Mac copy finished first keeps its raw status (usually 143) without counting either: the stop is the copy's win, not a test result, and the Mac's own step carries the call's real result. The Summary's successes and failures split stays on raw status.
 - `report.py`'s step tables, Rebuilds, Memory pressure, Power profile, lead counts and Summary count `host = 'natedev'` through `mac_outcome.natedev_step_predicate(step)`, so callers there carry no host suffix. `mac_section(connection, day)` follows `Tests by target` as `### Mac`: `Caller | Kind | Runs | Failed | Avg | p95 | Range | Build | Tests | Tests failed`, one row per caller and kind over every step with `host <> 'natedev'`, offloaded or started on the Mac directly, busiest first. `verify-mac` reads `verify.sh offload`; other callers keep their `caller_label` text. Failed uses `COUNTED_FAILURE`; Build is the mean `finished_s`; a missing test fact shows `—`. A `Mac total: <n> steps, <time>; <n> failed.` line and a Source line close it; a day with no Mac steps prints `No steps recorded on the Mac.` `report.py` excludes Mac-only calls through `natedev_call_predicate`, and shares the result rules in `mac_outcome.offload_record` with `mac_report.py`. Its lead block gives the Mac usable share and current holds. `tests_by_target_lines` prints `Tests by target`: `Package | Mac ran | Mac passed | Mac failed | Mac p50 | natedev ran | natedev p50 | Did not reach the Mac`. The Waiting table has `Held target`, apart from memory admission. `/build:mac_report` gives windows, decline causes and busy holders, local reasons, usable share and the same-tree failure count.
 - `### Mac copies` follows `### Mac`: `Package | Copies | Mac won | natedev won | Gave way | Other | Est. saved | Mac time on copies that did not win`, over the day's test calls with a `copy` word. Copies sums `copy_count`; the outcome columns count calls by their last copy's outcome; Other is `declined`, `lost` and the older `passed_full`; the last column sums `copy_s` of calls whose copy did not win. The lead block ends with `Mac copies: <won> of <started> finished first, about <time> saved (estimated).` A day with no copy prints `Mac copies: none started.` in the section's place and no lead line. A copy-won call counts as Mac ran in `Tests by target` but not as a natedev run (its natedev step was stopped, so its wall time is no natedev run's) and not in `natedev runs avoided`, so a win is counted once, in Mac copies.
@@ -343,10 +430,9 @@ Both values use the existing configuration reader.
 ## Calibration and gotchas
 
 - The mirror copy is `rsync -rlpc`: checksums, no modification times. A touch-only edit never reaches the Mac; time a rebuild with a content edit.
-- Measured on hana `46b8c87e5`: Mac cold build 12 min 35 s against natedev's 5 min 39 s; rebuild after a content edit to `crates/hana/src/tool/surface.rs` 37.28 s on the Mac (tree copy 4.2 s) against 52.05 s on natedev. The hana build folder measured 42.18 GiB untrimmed. A cold Mac hana build in the build log takes about 1760 s against a 141 s warm median.
 - GitHub lists hana's macOS job only after `macOS: Runner Availability` completes, and lists it at once as completed/skipped while the switch is off. A pending block therefore also waits on queued runs that have not reached that job.
 - A lost run whose cleanup cannot confirm the end keeps its claim. A remote claimant takes it over with exit 13 and checks the stored host. Remaining work declines `busy`; an unreadable host or failed check declines `unreachable` and starts the unreachable backoff. Both keep the claim. Stderr says `mac_test: <N> leftover processes of a lost run are still on the Mac; it stays busy until they end`, or `mac_test: could not confirm that a lost run's leftovers ended: <reason>; the Mac stays busy`.
-- A non-interactive bash starts an `&` child with `SIGINT` ignored; `offload.py run` restores the default, or a forwarded interrupt would be dropped. A terminal interrupt reaches the runner twice (process group and forward).
+- A non-interactive bash starts an `&` child with `SIGINT` ignored, so a forwarded INT is lost until `offload.py run` installs its own handlers. `verify.sh` therefore forwards INT as TERM. A terminal interrupt reaches the runner twice: INT from the process group and TERM from the forward.
 - The message and session lookup run outside `state.lock`; send.py can take 40 s.
 - The activity check counts any of the user's processes whose executable path contains `/target/`, so an app the user runs from a build folder on the Mac keeps a claim alive. The user's shells under the Mac's clones do not count.
 - Offloaded Mac nextest rows in the build log have an empty `repo`; filter them with `coalesce(repo,'')=''` and `host <> 'natedev'`. The log carries two Mac host names (`Mac` and `Nates-MacBook-Pro-2023`), so Mac selection is `host <> 'natedev'`, never one name.
@@ -356,15 +442,24 @@ Both values use the existing configuration reader.
 
 ## Why
 
-- A Mac pass ends the call: before CI, either machine answers a test, and CI is the protection (user, 2026-10-16: "a full test run that passes on the mac should end the call - our ci is the thing that protects us from issues ultimately"). natedev had rerun 178 full Mac passes from 2026-10-09 to 2026-10-16 and disagreed twice, at a cost of hours of natedev time a day. `--local` remains for a test that cannot pass on macOS.
-- The block turns CI's Mac use off rather than racing it, and waits for CI's job to finish, because a test run and a CI job on the Mac at once corrupt each other's timings and memory.
-- One CI rule (busy until the macOS job is listed completed) replaced a two-job rule after live runs showed how GitHub lists the job.
-- A claim is per repository because two repositories' runs share no mirror or build folder, while one repository's two runs would share both. The leftover check is scoped the same way, since it kills what it finds.
-- Remote claims keep the job and host until a successful leftover check, so an ordinary probe needs no process count. The two leftover selectors catch both mirror paths in argv and work running from a mirror directory.
-- An idle claim ends by itself because a session that claims the Mac and then stops using it turned every eligible test away as `busy`. The watcher releases on its own read-only activity check, never on the leftover check's answer, which kills what it finds; it tells only the holder, the one who can act.
-- Build output is kept above the disk floor because a cold rebuild costs far more than natedev's run; deleting after every run and a size-capped trim were ruled out.
-- No revision counter on `block.json`: every writer holds a lock. The footer reads `block.json` directly, never `status`, which takes a lock and can call `gh`.
-- The Mac copy exists because the user decided on 2026-10-16, "yes - build it this way - and make sure that you can track on report on the times we were able to get a test done faster with the copy". A natedev test that waited for a busy Mac often still compiles when the Mac frees; a copy then turns the idle Mac into an earlier result, and giving way to any new test keeps Mac-first routing unchanged for the next call.
+A remote result ends the step without a local confirmation run.
+CI checks platform differences.
+`--local` selects tests that require Linux.
+
+A repository claim protects its mirror and build output from concurrent runs of that repository.
+Different repositories can share the Mac because their mirrors and build output differ.
+The leftover check uses the same repository scope because it stops matching processes.
+
+The CI block prevents local offload from competing with CI on the Mac.
+An idle claim watcher releases unused claims and tells the holder.
+An unreachable Mac keeps a remote claim until cleanup can confirm that its work ended.
+
+The disk floor preserves useful build output while enough free space remains.
+A Mac copy can finish a local compiling test earlier.
+A new non-copy job can preempt that copy to preserve normal routing priority.
+
+All block writers hold their coordination lock.
+The footer reads the block file directly, without a lock, GitHub request, or message.
 
 ## Registered remote mirrors
 
@@ -399,7 +494,8 @@ It prints the tree identity and checkout path on separate lines.
 `verify.sh` reads both lines.
 The private index folder uses the configured `prefixes.copies-index` name through `build_folders.temporary_build_folder`.
 The copy owner holds the lease until the verify shell closes its input descriptor.
-Both routes use the staged copy and keep the existing target directory.
+Both routes use the staged snapshot.
+Local rustdoc keeps the original target directory. Remote rustdoc uses its mirror's build output.
 The source index remains unchanged.
 A pass record still requires the original staged tree identity after the step.
 The token boundary, local repair rule, and step records remain in verify.sh.
@@ -436,3 +532,31 @@ Target status reports a failed probe as unreachable.
 The reach error shows only the last nonempty stderr line.
 A fixed target returns when the next new step probes it.
 Existing waits keep their place on natedev until then.
+
+### Disk floor recovery
+
+`ensure_mac_disk_floor` returns `MacDiskReady`, `SweepShort`, or `SweepFailed`.
+Below the required floor, it runs one shared floor sweep and reads free space again.
+The per-host `floor-sweep-<host>.lock` serializes sweeps.
+A caller that finds a running sweep waits for its result.
+The sweep runs without admission or claim locks.
+`mirror_root.py` reads the one `mirror_root` setting for offload and sweep.
+`free_now` reads local records only and starts no sweep or SSH request.
+
+A disk decline remains retryable through the local queue leave hook.
+The step record retains `NatedevOnly("disk")` for idle-alert evidence.
+Permanent exclusions stop remote retries.
+Every claim and command still checks AWS spending rules.
+
+### Queue claim handoff
+
+The memory wait leave hook uses `mac_test.py claim-wait` under `state.lock`.
+A successful claim creates `MAC_WAIT_CLAIM_FILE`.
+`offload.py run --claim-owner-pid` adopts that claim through `claim --from-pid` and `adopt_wait_claim`.
+A refused claim keeps the local queue place.
+`release_wait_claim` releases unused claims after an attempt and during cleanup.
+An unlocked `free-now` read cannot replace this claim handoff.
+
+`blocking_claim_block` applies the shared block rule to claim reuse and transfer.
+A reservation cannot override a later block from another session.
+Each new step releases the previous step's reservation before local waits.
