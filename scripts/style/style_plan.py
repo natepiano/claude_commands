@@ -8,6 +8,7 @@ except FileNotFoundError:
     pass
 
 import argparse
+import fcntl
 import json
 import math
 import os
@@ -23,7 +24,7 @@ import tomllib
 from collections import Counter, defaultdict
 from collections.abc import Generator, Mapping
 from contextlib import closing, contextmanager
-from dataclasses import dataclass, field, replace
+from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime
 from enum import Enum
 from itertools import accumulate
@@ -34,6 +35,8 @@ from typing import Literal, assert_never, cast, override
 
 SCRIPTS = Path(__file__).resolve().parents[1]
 
+from scripts.copies import copies
+from scripts.direct import phase_reservation
 from scripts.lib import berth_board
 from scripts.lib.git_blob import git_blob_id
 from scripts.style import coverage_report
@@ -130,6 +133,13 @@ class PhaseWritten:
 @dataclass(frozen=True)
 class Resumed:
     ticket_id: str
+
+
+@dataclass(frozen=True)
+class PhasesReady:
+    written: tuple[str, ...]
+    resumed: tuple[str, ...]
+    unclassified: int = 0
 
 
 @dataclass(frozen=True)
@@ -353,7 +363,7 @@ class BusyFiles:
         return path in self.paths or any(reservation.blocks(path) for reservation in self.board.reservations())
 
 
-NextPhase = (PhaseWritten | Resumed | RepairFirst | WaitingForMerge | WaitingForSync | WaitingForStructure
+NextPhase = (PhaseWritten | Resumed | PhasesReady | RepairFirst | WaitingForMerge | WaitingForSync | WaitingForStructure
              | MergeStyleBranchFirst | berth_board.BoardUnavailable)
 
 
@@ -1127,31 +1137,230 @@ def run_verification_step(repo: Path, stage: str, package: str) -> subprocess.Co
                           cwd=repo, check=False)
 
 
+@dataclass(frozen=True)
+class TicketSourceView:
+    repo: Path
+    commit: str
+    isolated: bool
+
+
+def ticket_paths(ledger: style_ledger.Ledger, ticket: style_ledger.TicketRecord, repo: Path) -> tuple[str, ...]:
+    """Use the ledger's conservative footprint for snapshots and worker authority."""
+    commits = frozenset(commit for commit in (ticket["base"], ticket["checkpoint"],
+                        git(repo, "rev-parse", "HEAD").strip(), ledger.synced_commit()) if commit)
+    paths = ledger._pipeline_footprint(ticket, commits)  # pyright: ignore[reportPrivateUsage]
+    return tuple(sorted(paths))
+
+
+def ticket_snapshot(ledger: style_ledger.Ledger, ticket: style_ledger.TicketRecord, repo: Path) -> str:
+    """Capture only the ticket's conservative edit paths."""
+    return style_footprint.worktree_commit(repo, style_footprint.TicketSourcePaths(ticket_paths(ledger, ticket, repo)))
+
+
+def isolated_ticket_source(ledger: style_ledger.Ledger, ticket: style_ledger.TicketRecord) -> bool:
+    assigned = sum(item["state"] == "assigned" for item in ledger.ticket_open(ticket["unit"]))
+    config = style_config.config_for_unit(ticket["unit"], ledger.staff_resolver().record)
+    return assigned > 1 or config.assignment(ledger.unit_name(ticket["unit"])).open_tickets > 1
+
+
+@contextmanager
+def candidate_source(repo: Path, ticket: style_ledger.TicketRecord, commit: str) -> Generator[TicketSourceView]:
+    """Use the unit's reused copy with the candidate changes visible against its parent."""
+    with publication_path(repo, "candidate.lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        with copies.standing("style-" + ticket["unit"], repo, copies.CommittedSource(commit)) as tree:
+            _ = git(tree, "config", "user.name", "Style gate")
+            _ = git(tree, "config", "user.email", "style-gate@example.invalid")
+            parent = git(tree, "rev-parse", commit + "^").strip()
+            _ = git(tree, "update-ref", "HEAD", parent, commit)
+            yield TicketSourceView(tree, commit, True)
+
+
+@contextmanager
+def ticket_source(ledger: style_ledger.Ledger, repo: Path, ticket_id: str) -> Generator[TicketSourceView]:
+    ticket = ledger.ticket_get(ticket_id)
+    if isolated_ticket_source(ledger, ticket):
+        commit = ticket_snapshot(ledger, ticket, repo)
+        with candidate_source(repo, ticket, commit) as view:
+            yield view
+    else:
+        yield TicketSourceView(repo, "HEAD", False)
+
+
 def verify_ticket(repo: Path, ticket_id: str) -> int:
-    """Run check, lint and test once each; verify.sh owns verification input identity."""
+    """Run the existing verification stages against the selected source view."""
+    with style_ledger.open_ledger(repo) as ledger, ticket_source(ledger, repo, ticket_id) as view:
+        return verify_source(ledger, repo, ticket_id, view)
+
+
+def verify_source(ledger: style_ledger.Ledger, repo: Path, ticket_id: str, view: TicketSourceView) -> int:
+    ticket = ledger.ticket_get(ticket_id)
+    if ticket["state"] != "assigned":
+        raise style_ledger.LedgerError(f"{ticket_id}: verification requires an assigned ticket")
+    snapshot = view.commit if view.isolated else style_footprint.worktree_commit(repo)
+    tree = git(repo, "rev-parse", f"{snapshot}^{{tree}}").strip()
+    sources = style_footprint.RevisionTree(ledger.repo, snapshot)
+    changed = ledger.ticket_changed_paths(ticket, snapshot)
+    if any(path.endswith((".rs", "Cargo.toml", "Cargo.lock")) and sources.crate(path) != ticket["crate"]
+           for path in changed if path):
+        raise style_ledger.LedgerError(f"{ticket_id}: verification crosses crate boundaries")
+    manifest: dict[str, object] = tomllib.loads(sources.text(str(PurePosixPath(ticket["crate"]) / "Cargo.toml")))
+    package_table = manifest.get("package")
+    package = cast(dict[str, object], package_table).get("name", "") if isinstance(package_table, dict) else ""
+    if not isinstance(package, str) or not package:
+        raise style_ledger.LedgerError(f"{ticket_id}: no package to verify")
+    for stage in ("check", "lint", "test"):
+        status = run_verification_step(view.repo, stage, package).returncode
+        if status:
+            return status
+        current = ticket_snapshot(ledger, ticket, repo) if view.isolated else style_footprint.worktree_commit(repo)
+        if git(repo, "rev-parse", f"{current}^{{tree}}").strip() != tree:
+            raise style_ledger.LedgerError(f"{ticket_id}: tree changed during {stage}")
+    return 0
+
+
+@dataclass(frozen=True)
+class PendingPublication:
+    ticket: str
+    branch: str
+    parent: str
+    commit: str
+    paths: tuple[str, ...]
+    session_dir: str
+    phase: str
+
+
+def publication_path(repo: Path, name: str) -> Path:
+    return Path(git(repo, "rev-parse", "--path-format=absolute", "--git-path", "style-" + name).strip())
+
+
+@contextmanager
+def publication_lock(repo: Path) -> Generator[None]:
+    """Serialize branch movement, index updates, checkpoint records and reservation release."""
+    with publication_path(repo, "publication.lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        yield
+
+
+def update_ticket_index(repo: Path, publication: PendingPublication) -> None:
+    """Replace only the ticket's index entries with its published entries."""
+    paths = [":(literal)" + path for path in publication.paths]
+    current = git(repo, "ls-files", "-z", "--", *paths).split("\0")
+    entries = ["0 " + "0" * 40 + "\t" + path + "\0" for path in current if path]
+    for entry in git(repo, "ls-tree", "-rz", publication.commit, "--", *paths).split("\0"):
+        if entry:
+            metadata, path = entry.split("\t", 1)
+            mode, _, blob = metadata.split()
+            entries.append(f"{mode} {blob}\t{path}\0")
+    result = subprocess.run(["git", "-C", str(repo), "update-index", "-z", "--index-info"],
+                            input="".join(entries), capture_output=True, text=True, check=False)
+    if result.returncode:
+        raise style_ledger.LedgerError(result.stderr.strip())
+
+
+def complete_publication(repo: Path, ledger: style_ledger.Ledger, publication: PendingPublication) -> str:
+    """Recover the publication before another publication can move HEAD."""
+    head = git(repo, "rev-parse", "HEAD").strip()
+    if head == publication.parent:
+        ledger.check_ticket_pipeline(publication.ticket)
+        _ = git(repo, "update-ref", publication.branch, publication.commit, publication.parent)
+    elif head != publication.commit:
+        raise style_ledger.LedgerError("publication recovery requires its parent or checkpoint at HEAD")
+    update_ticket_index(repo, publication)
+    directory = phase_reservation.phase_directory(Path(publication.session_dir), publication.phase)
+    state = phase_reservation.read_state(directory)
+    if state.get("kind") == phase_reservation.ACTIVE:
+        phase_reservation.committed(directory, publication.commit, publication.ticket, repo)
+    ledger.ticket_checkpoint(publication.ticket, publication.commit, publication.session_dir, publication.phase)
+    if state.get("kind") in (phase_reservation.ACTIVE, phase_reservation.PENDING):
+        _ = phase_reservation.release_held(directory, publication.ticket, publication.commit)
+    publication_path(repo, "publication.json").unlink()
+    _ = git(repo, "update-ref", "-d", "refs/style-publication/" + publication.branch.removeprefix("refs/heads/"), publication.commit)
+    return publication.commit
+
+
+def recover_publication(repo: Path, ledger: style_ledger.Ledger) -> str:
+    path = publication_path(repo, "publication.json")
+    if not path.exists():
+        return ""
+    record = cast(dict[str, object], json.loads(path.read_text()))
+    publication = PendingPublication(str(record["ticket"]), str(record["branch"]), str(record["parent"]), str(record["commit"]),
+                                     tuple(cast(list[str], record["paths"])), str(record["session_dir"]), str(record["phase"]))
+    return complete_publication(repo, ledger, publication)
+
+
+@contextmanager
+def checkpoint_source(ledger: style_ledger.Ledger, repo: Path, ticket: style_ledger.TicketRecord,
+                      snapshot: str) -> Generator[TicketSourceView]:
+    if isolated_ticket_source(ledger, ticket):
+        with candidate_source(repo, ticket, snapshot) as view:
+            yield view
+    else:
+        yield TicketSourceView(repo, snapshot, False)
+
+
+def publish_checkpoint(repo: Path, ticket_id: str, session_dir: Path, phase: str, message: str) -> str:
+    """Publish the gated candidate and release its reservation before another publication."""
+    repo = repo.resolve()
     with style_ledger.open_ledger(repo) as ledger:
-        ticket = ledger.ticket_get(ticket_id)
-        if ticket["state"] != "assigned":
-            raise style_ledger.LedgerError(f"{ticket_id}: verification requires an assigned ticket")
-        snapshot = style_footprint.worktree_commit(repo)
-        tree = git(repo, "rev-parse", f"{snapshot}^{{tree}}").strip()
-        sources = style_footprint.RevisionTree(repo, snapshot)
-        changed = ledger.ticket_changed_paths(ticket, snapshot)
-        if any(path.endswith((".rs", "Cargo.toml", "Cargo.lock")) and sources.crate(path) != ticket["crate"]
-               for path in changed if path):
-            raise style_ledger.LedgerError(f"{ticket_id}: verification crosses crate boundaries")
-        manifest: dict[str, object] = tomllib.loads(sources.text(str(PurePosixPath(ticket["crate"]) / "Cargo.toml")))
-        package_table = manifest.get("package")
-        package = cast(dict[str, object], package_table).get("name", "") if isinstance(package_table, dict) else ""
-        if not isinstance(package, str) or not package:
-            raise style_ledger.LedgerError(f"{ticket_id}: no package to verify")
-        for stage in ("check", "lint", "test"):
-            status = run_verification_step(repo, stage, package).returncode
+        with publication_lock(repo):
+            _ = recover_publication(repo, ledger)
+            ticket = ledger.ticket_get(ticket_id)
+            if ticket["state"] == "checkpointed":
+                return ticket["checkpoint"]
+            ledger.check_ticket_pipeline(ticket_id)
+            snapshot = ticket_snapshot(ledger, ticket, repo)
+            parent = git(repo, "rev-parse", snapshot + "^").strip()
+        # Verification holds the reused copy, without holding the publication lock.
+        with checkpoint_source(ledger, repo, ticket, snapshot) as view:
+            status = gate_source(ledger, view.repo, ticket_id, parent if view.isolated else "")
+            if not status:
+                status = verify_source(ledger, repo, ticket_id, view)
+            if not status:
+                if view.isolated:
+                    status = run_verification_step(view.repo, "doc", "").returncode
+                else:
+                    with candidate_source(repo, ticket, snapshot) as documentation:
+                        status = run_verification_step(documentation.repo, "doc", "").returncode
             if status:
-                return status
-            current = style_footprint.worktree_commit(repo)
-            if git(repo, "rev-parse", f"{current}^{{tree}}").strip() != tree:
-                raise style_ledger.LedgerError(f"{ticket_id}: tree changed during {stage}")
+                raise style_ledger.LedgerError(f"{ticket_id}: checkpoint gate exited {status}")
+        with publication_lock(repo):
+            _ = recover_publication(repo, ledger)
+            current = ticket_snapshot(ledger, ticket, repo)
+            if (git(repo, "rev-parse", "HEAD").strip() != parent
+                    or git(repo, "rev-parse", current + "^{tree}").strip()
+                    != git(repo, "rev-parse", snapshot + "^{tree}").strip()):
+                raise style_ledger.LedgerError("ticket source changed during verification; repeat checkpoint")
+            ledger.check_ticket_pipeline(ticket_id)
+            tree = git(repo, "rev-parse", snapshot + "^{tree}").strip()
+            made = subprocess.run(["git", "-C", str(repo), "commit-tree", tree, "-p", parent],
+                                  input=message, text=True, capture_output=True, check=False)
+            if made.returncode:
+                raise style_ledger.LedgerError(made.stderr.strip())
+            commit = made.stdout.strip()
+            paths = ledger._pipeline_footprint(ticket, frozenset({parent, snapshot}))  # pyright: ignore[reportPrivateUsage]
+            publication = PendingPublication(ticket_id, git(repo, "symbolic-ref", "HEAD").strip(), parent,
+                                             commit, tuple(sorted(paths)), str(session_dir.resolve()), phase)
+            _ = git(repo, "update-ref", "refs/style-publication/" + publication.branch.removeprefix("refs/heads/"), commit)
+            atomic_write(publication_path(repo, "publication.json"), json.dumps(asdict(publication)).encode())
+            return complete_publication(repo, ledger, publication)
+
+
+def sync_unit(repo: Path, unit: str) -> int:
+    """Merge the configured branch after assigned tickets and source changes finish."""
+    with style_ledger.open_ledger(repo) as ledger, publication_lock(repo):
+        _ = recover_publication(repo, ledger)
+        config = style_config.config_for_unit(unit, ledger.staff_resolver().record)
+        unit_id = str(next(row.staff_id for row in unit_worktrees(config.route.doc) if row.unit == unit))
+        if any(ticket["state"] == "assigned" for ticket in ledger.ticket_open(unit_id)) or changed_files(repo):
+            ledger.wait_for_sync(unit_id)
+            return 4
+        target = style_ledger.pushed_branch_point_tip(repo, config.route.branch_point)
+        _ = git(repo, "merge", "--no-edit", target)
+        for ticket in ledger.ticket_open(unit_id):
+            ledger.check_ticket_pipeline(ticket["id"])
+        publication_path(repo, "pending-sync").unlink(missing_ok=True)
+        ledger.clear_sync_wait(unit_id)
         return 0
 
 
@@ -1202,82 +1411,12 @@ def approved_documentation_sites(ledger: style_ledger.Ledger, ticket_id: str,
 
 
 def gate(repo: Path, ticket_id: str) -> int:
-    """Exit 0 when the change may commit, 1 for a review result, 2 when the gate could not run."""
+    """Run the existing gate against the selected source view."""
     try:
         with style_ledger.open_ledger(repo) as ledger:
             ledger.check_ticket_pipeline(ticket_id)
-            origin = ledger.ticket_origin(ticket_id)
-            if isinstance(origin, style_ledger.SelectedByCoverage):
-                # The worktree is what the checkpoint commits: a removed cell's path is looked for there, its removal in HEAD.
-                missing = ledger.unjudged_ticket_cells(ticket_id, "HEAD", lambda path: os.path.lexists(repo / path))
-                if missing:
-                    for cell in missing:
-                        print(f"unjudged: {cell.rule} {cell.path}")
-                    return 1
-                base = coverage_footprint_base(repo, ledger, origin.base)
-                approval_arguments = [argument for site in approved_documentation_sites(ledger, ticket_id, base)
-                                      for argument in ("--approved-documentation-site", site.path, str(site.line), site.text)]
-                result = subprocess.run([str(SCRIPTS / "lib/py"), str(SCRIPTS / "style/style_footprint.py"), "check",
-                                         "--repo", str(repo), "--base", base, "--worktree", *approval_arguments], check=False)
-                if result.returncode != 0:
-                    return 2 if result.returncode == 2 else 1
-                return format_check(repo)
-            approved = approved_ticket(ledger, ticket_id, origin)
-            findings, moves, allowed = approved.findings, approved.moves, set(approved.allowed)
-            # A widened path is allowed as it is; the rename and move checks below do not read it.
-            outside = changed_files(repo) - allowed - set(origin.widened)
-            pairs = approved_rename_pairs(findings)
-            bindings = binding_pairs(findings)
-            if outside:
-                outside -= mechanical_files(repo, frozenset(PurePosixPath(finding.rule.partition(":")[2]).stem
-                                                            for finding in findings), bindings)
-            if outside:
-                unique = unique_rename_mentions(repo, pairs, allowed) if pairs else frozenset[ApprovedRename]()
-                modified = modified_reference_files(repo)
-                refused = [path for path in sorted(outside)
-                           if path not in modified or not (approved_reference_file(repo, path, pairs, unique)
-                                                           or approved_module_file(repo, path, moves, pairs))]
-                if refused:
-                    raise style_ledger.LedgerError("files outside approved findings: " + ", ".join(
-                        outside_refusal(path, moves) for path in refused))
-            # A finding path is free, and a renamed file that another finding names moves under that approval.
-            free = {finding.path for finding in findings
-                    if not isinstance(file_rename(finding.kind, finding.path, finding.after), FileRename)}
-            # A rename with its old file still there and no new file is not applied: the check below reports it.
-            changed = [moved for moved in moves if not {moved.old, moved.new} & free
-                       and (os.path.lexists(repo / moved.new) or not os.path.lexists(repo / moved.old))
-                       and not approved_renamed_file(repo, moved, moves, pairs)]
-            if changed:
-                raise style_ledger.LedgerError("renamed files with other changes: " + ", ".join(
-                    f"{moved.new} (renamed from {moved.old}: change is not only the rename)" for moved in changed))
-            binding_checks = binding_worktree_checks(repo, bindings, origin.base)
-            admission_failures: list[tuple[style_ledger.HeldFinding, OuterBindingBlocked | OuterBindingUnproved]] = []
-            for finding in findings:
-                current = worktree_file(repo, finding.path)
-                source = current.decode(errors="replace") if isinstance(current, bytes) else approved_renames.CurrentRenameSourceUnavailable()
-                admission = ledger.local_rename_admission(finding, finding.path, source,
-                                                          companions=tuple(pair for pair in bindings.get(finding.path, ())
-                                                                           if isinstance(binding_checks[finding.path][pair], AppliedInCode)))
-                if isinstance(admission, OuterBindingBlocked | OuterBindingUnproved):
-                    admission_failures.append((finding, admission))
-            blocked = tuple(admission_failures)
-            if blocked:
-                for finding, check in blocked:
-                    ledger.record_rename_block(finding.finding_id, check)
-                    print(f"review: {finding.finding_id}: {check.reason} in {finding.path}")
-                return 1
-            unapplied = tuple(finding for finding in findings if isinstance(
-                binding_checks[finding.path][rename] if isinstance(rename := binding_rename(
-                    finding.kind, finding.before, finding.after, finding.line, finding.text), BindingRename)
-                else worktree_check(repo, finding), RenameNotApplied))
-            if unapplied:
-                for finding in unapplied:
-                    print(f"review: {finding.finding_id}: {finding.before} -> {finding.after} not applied in {finding.path}")
-                return 1
-            if format_check(repo):
-                return 1
-            print("approved proposal")
-            return 0
+            with ticket_source(ledger, repo, ticket_id) as view:
+                return gate_source(ledger, view.repo, ticket_id, git(repo, "rev-parse", view.commit + "^").strip() if view.isolated else "")
     except (OSError, sqlite3.Error, style_ledger.CheckCouldNotRun, style_footprint.CheckCouldNotRun,
             mechanical_classes.ClassListError) as error:
         print(f"error: {error}")
@@ -1285,6 +1424,83 @@ def gate(repo: Path, ticket_id: str) -> int:
     except ValueError as error:
         print(f"review: {error}")
         return 1
+
+
+
+def gate_source(ledger: style_ledger.Ledger, repo: Path, ticket_id: str, source_base: str = "") -> int:
+    """Read source from repo and approvals from the original ledger."""
+    origin = ledger.ticket_origin(ticket_id)
+    if isinstance(origin, style_ledger.SelectedByCoverage):
+        # The worktree is what the checkpoint commits: a removed cell's path is looked for there, its removal in HEAD.
+        missing = ledger.unjudged_ticket_cells(ticket_id, "HEAD", lambda path: os.path.lexists(repo / path))
+        if missing:
+            for cell in missing:
+                print(f"unjudged: {cell.rule} {cell.path}")
+            return 1
+        base = source_base or coverage_footprint_base(repo, ledger, origin.base)
+        approval_arguments = [argument for site in approved_documentation_sites(ledger, ticket_id, base)
+                              for argument in ("--approved-documentation-site", site.path, str(site.line), site.text)]
+        result = subprocess.run([str(SCRIPTS / "lib/py"), str(SCRIPTS / "style/style_footprint.py"), "check",
+                                 "--repo", str(repo), "--base", base, "--worktree", *approval_arguments], check=False)
+        if result.returncode != 0:
+            return 2 if result.returncode == 2 else 1
+        return format_check(repo)
+    approved = approved_ticket(ledger, ticket_id, origin)
+    findings, moves, allowed = approved.findings, approved.moves, set(approved.allowed)
+    # A widened path is allowed as it is; the rename and move checks below do not read it.
+    outside = changed_files(repo) - allowed - set(origin.widened)
+    pairs = approved_rename_pairs(findings)
+    bindings = binding_pairs(findings)
+    if outside:
+        outside -= mechanical_files(repo, frozenset(PurePosixPath(finding.rule.partition(":")[2]).stem
+                                                    for finding in findings), bindings)
+    if outside:
+        unique = unique_rename_mentions(repo, pairs, allowed) if pairs else frozenset[ApprovedRename]()
+        modified = modified_reference_files(repo)
+        refused = [path for path in sorted(outside)
+                   if path not in modified or not (approved_reference_file(repo, path, pairs, unique)
+                                                   or approved_module_file(repo, path, moves, pairs))]
+        if refused:
+            raise style_ledger.LedgerError("files outside approved findings: " + ", ".join(
+                outside_refusal(path, moves) for path in refused))
+    # A finding path is free, and a renamed file that another finding names moves under that approval.
+    free = {finding.path for finding in findings
+            if not isinstance(file_rename(finding.kind, finding.path, finding.after), FileRename)}
+    # A rename with its old file still there and no new file is not applied: the check below reports it.
+    changed = [moved for moved in moves if not {moved.old, moved.new} & free
+               and (os.path.lexists(repo / moved.new) or not os.path.lexists(repo / moved.old))
+               and not approved_renamed_file(repo, moved, moves, pairs)]
+    if changed:
+        raise style_ledger.LedgerError("renamed files with other changes: " + ", ".join(
+            f"{moved.new} (renamed from {moved.old}: change is not only the rename)" for moved in changed))
+    binding_checks = binding_worktree_checks(repo, bindings, origin.base)
+    admission_failures: list[tuple[style_ledger.HeldFinding, OuterBindingBlocked | OuterBindingUnproved]] = []
+    for finding in findings:
+        current = worktree_file(repo, finding.path)
+        source = current.decode(errors="replace") if isinstance(current, bytes) else approved_renames.CurrentRenameSourceUnavailable()
+        admission = ledger.local_rename_admission(finding, finding.path, source,
+                                                  companions=tuple(pair for pair in bindings.get(finding.path, ())
+                                                                   if isinstance(binding_checks[finding.path][pair], AppliedInCode)))
+        if isinstance(admission, OuterBindingBlocked | OuterBindingUnproved):
+            admission_failures.append((finding, admission))
+    blocked = tuple(admission_failures)
+    if blocked:
+        for finding, check in blocked:
+            ledger.record_rename_block(finding.finding_id, check)
+            print(f"review: {finding.finding_id}: {check.reason} in {finding.path}")
+        return 1
+    unapplied = tuple(finding for finding in findings if isinstance(
+        binding_checks[finding.path][rename] if isinstance(rename := binding_rename(
+            finding.kind, finding.before, finding.after, finding.line, finding.text), BindingRename)
+        else worktree_check(repo, finding), RenameNotApplied))
+    if unapplied:
+        for finding in unapplied:
+            print(f"review: {finding.finding_id}: {finding.before} -> {finding.after} not applied in {finding.path}")
+        return 1
+    if format_check(repo):
+        return 1
+    print("approved proposal")
+    return 0
 
 
 CARGO_FMT_CHECK = ("cargo", "+nightly", "fmt", "--all", "--check", "--verbose", "--message-format", "short",
@@ -2111,8 +2327,16 @@ def write_phase(ledger: style_ledger.Ledger, ticket: style_ledger.TicketRecord, 
     waived = _waived_ticket_findings(ledger, ticket, rule_paths)
     review = ticket_review_scope(ledger.repo, ticket, held) if ticket["kind"] == "proposal" else ReviewScope.PRODUCTION
     phase = phase_text(ticket, texts, plan, delegation_context(text), held, file_windows, crate_targets, cells, waived, review)
+    if any(match.group("id") == ticket["id"] and "status: todo" not in match.group(0).splitlines()[0]
+           for match in PHASE.finditer(text)):
+        return
     if any(match.group("id") == ticket["id"] for match in PHASE.finditer(text)):
-        updated = PHASE.sub(lambda match: phase if match.group("id") == ticket["id"] else match.group(0), text)
+        def restored_phase(match: re.Match[str]) -> str:
+            if match.group("id") != ticket["id"]:
+                return match.group(0)
+            suffix = match.group(0)[len(match.group(0).rstrip()):]
+            return phase.rstrip() + (suffix if "\n" in suffix else "\n")
+        updated = PHASE.sub(restored_phase, text)
         if updated != text:
             atomic_write(plan, updated.encode())
         return
@@ -2340,11 +2564,28 @@ class WaitingCheckpoint:
         return NoCheckpointBlock()
 
 
+@dataclass(frozen=True)
+class OpenTicketFootprints(WaitingCheckpoint):
+    peers: tuple[WaitingCheckpoint, ...] = ()
+
+    @override
+    def check(self, files: tuple[str, ...]) -> WaitingForMerge | NoCheckpointBlock:
+        for peer in self.peers:
+            result = peer.check(files)
+            if isinstance(result, WaitingForMerge):
+                return result
+        return NoCheckpointBlock()
+
+
 def waiting_checkpoint(ledger: style_ledger.Ledger, ticket: style_ledger.TicketRecord,
-                       branch: str) -> WaitingCheckpoint:
-    checkpoint = git(ledger.repo, "rev-parse", "--verify", f"{ticket['checkpoint']}^{{commit}}").strip()
+                       branch: str, *, concurrent: bool = False) -> WaitingCheckpoint:
+    revision = ticket["checkpoint"] or branch
+    checkpoint = git(ledger.repo, "rev-parse", "--verify", f"{revision}^{{commit}}").strip()
     base = unit_base(ledger.repo, branch)
-    if not isinstance(base, UnitBranchTip) or base.commit != checkpoint:
+    if not isinstance(base, UnitBranchTip):
+        raise style_ledger.LedgerError("unit branch has no tip")
+    if (not concurrent and base.commit != checkpoint) or subprocess.run(["git", "-C", str(ledger.repo), "merge-base", "--is-ancestor", checkpoint, base.commit],
+                                                       capture_output=True, check=False).returncode != 0:
         raise style_ledger.LedgerError("unit branch is not at the waiting checkpoint")
     edits = EditedFiles(ledger.repo, ledger, UnitBranchTip(checkpoint))
     origin = ledger.ticket_origin(ticket["id"])
@@ -2599,12 +2840,14 @@ def _select_phase(
                         continue
                     if extra["family"] != ticket["family"]:
                         continue
+                    if style_config.config_for_unit(unit, ledger.staff_resolver().record).assignment(ledger.unit_name(unit)).open_tickets > 1:
+                        continue
                     ledger.ticket_drop(extra["id"])
                     print(f"dropped {extra['id']}: files busy")
                 if isinstance(origin, style_ledger.ApprovedProposal):
                     for issue in origin.issues:
                         style_proposals.proposal_command("start", str(issue))
-                write_phase(ledger, next(ticket for ticket in ledger.ticket_open(unit) if ticket["state"] == "assigned"), plan, text)
+                write_phase(ledger, ledger.ticket_get(ticket["id"]), plan, text)
                 return PhaseWritten(ticket["id"])
             ledger.ticket_drop(ticket["id"])
             reason = ((f"{uncertain[0]} has a path attribute the rename gate cannot read" if uncertain
@@ -2660,7 +2903,7 @@ def _select_phase(
                                   [dict(rule=site.rule, path=site.path, line=site.line, text=site.text) for site in selected.sites],
                                   cells=selected.cells)
             ledger.ticket_assign(ticket_id, branch)
-            write_phase(ledger, next(ticket for ticket in ledger.ticket_open(unit) if ticket["state"] == "assigned"), plan, text)
+            write_phase(ledger, ledger.ticket_get(ticket_id), plan, text)
             return PhaseWritten(ticket_id)
         return overlap_wait if isinstance(overlap_wait, WaitingForMerge) else NoAvailableWork()
 
@@ -2876,7 +3119,7 @@ def _select_phase(
         ledger.ticket_assign(ticket_id, branch)
         for decision in batch.decisions:
             style_proposals.proposal_command("start", str(decision))
-        write_phase(ledger, next(ticket for ticket in ledger.ticket_open(unit) if ticket["state"] == "assigned"), plan, text)
+        write_phase(ledger, ledger.ticket_get(ticket_id), plan, text)
         if closed:
             style_proposals.renumber()
         return PhaseWritten(ticket_id)
@@ -2944,7 +3187,50 @@ def select_family_work(ledger: style_ledger.Ledger, unit: str, branch: str, plan
     return replace(result, families=tuple(family_idle_reason(family, result) for family in families))
 
 
-def next_phase(unit: str, plan: Path, repo: Path) -> NextPhase:
+@dataclass(frozen=True)
+class NoWorkerDispatch:
+    """The caller manages the unit's worker dispatch."""
+
+
+_NO_WORKER_DISPATCH = NoWorkerDispatch()
+
+
+def restore_ticket_worker(run: Path, worktree: Path, plan: Path, ticket: style_ledger.TicketRecord,
+                          authorized: tuple[str, ...]) -> None:
+    """Restore one ticket's phase and submit only a missing or failed worker dispatch."""
+    match = next(match for match in PHASE.finditer(plan.read_text()) if match.group("id") == ticket["id"])
+    phase = re.search(r"^### Phase (\d+)", match.group(0))
+    assert phase is not None
+    phase_id = phase.group(1)
+    slot = "style-ticket-" + ticket["id"]
+    directory = phase_reservation.phase_directory(run, phase_id)
+    directory.mkdir(parents=True, exist_ok=True)
+    prompt = directory / "ticket-work-order.md"
+    if not prompt.exists():
+        atomic_write(prompt, match.group(0).encode())
+    paths = directory / "ticket-paths.txt"
+    atomic_write(paths, ("\n".join(authorized) + "\n").encode())
+    record_path = run / "progress_history_state.json"
+    record = cast(dict[str, object], json.loads(record_path.read_text())) if record_path.exists() else {}
+    passes = cast(dict[str, dict[str, object]], record.get("pass", {}))
+    passed = passes.get(slot, {})
+    commands: list[list[str]] = []
+    if not record:
+        commands.append([str(SCRIPTS / "lib/py"), str(SCRIPTS / "direct/progress_history.py"), "start-run",
+                         "--session-dir", str(run), "--working-dir", str(worktree)])
+    commands.append([str(SCRIPTS / "lib/py"), str(SCRIPTS / "direct/progress_history.py"), "start-phase",
+                     "--session-dir", str(run), "--phase-id", phase_id, "--phase-title", ticket["id"]])
+    if passed.get("status") not in ("active", "completed"):
+        commands.append(["bash", str(SCRIPTS / "direct/assign.sh"), "--role", "implement", "--new-worker", slot,
+                     "--session-dir", str(run), "--phase", phase_id, "--prompt", str(prompt),
+                     "--cwd", str(worktree), "--paths", str(paths)])
+    for command in commands:
+        result = subprocess.run(command, cwd=worktree, capture_output=True, text=True, check=False)
+        if result.returncode:
+            raise style_ledger.LedgerError(result.stderr.strip() or result.stdout.strip() or "worker dispatch failed")
+
+
+def _next_phase(unit: str, plan: Path, repo: Path, run: Path | NoWorkerDispatch) -> NextPhase:
     plan, repo = plan.expanduser().resolve(), repo.expanduser().resolve()
     resolver = session_staff.RowResolver(staff.snapshot())
     config = style_config.config_for_unit(unit, resolver.record)
@@ -2958,8 +3244,6 @@ def next_phase(unit: str, plan: Path, repo: Path) -> NextPhase:
     original = plan.read_text()
     settings = unit_plan_settings(original, repo)
     scope = settings.pilot_scope
-    if any("repair" in line.lower() and re.search(r"status:\s*todo", line) for line in original.splitlines() if line.startswith("### Phase ")):
-        return RepairFirst()
     with style_ledger.open_ledger(repo, resolver=resolver) as ledger:
         unit = str(row.staff_id)
         definitions = {rule.rule_id: rule for rule in rules.load_rules(repo)}
@@ -2973,28 +3257,35 @@ def next_phase(unit: str, plan: Path, repo: Path) -> NextPhase:
         opened = ledger.ticket_open(unit)
         predecessor: WaitingCheckpoint | NoCheckpointBlock = NoCheckpointBlock()
         assigned = tuple(ticket for ticket in opened if ticket["state"] == "assigned")
-        if opened and not assigned:
-            ticket = opened[0]
-            if len(opened) >= 2:
-                return WaitingForMerge(ticket["id"], ticket["checkpoint"], "two open tickets")
-            try:
-                predecessor = waiting_checkpoint(ledger, ticket, row.branch)
-            except (OSError, ValueError, style_ledger.LedgerError, subprocess.CalledProcessError) as error:
-                return WaitingForMerge(ticket["id"], ticket["checkpoint"], f"footprint unknown: {error}")
-        if assigned:
-            ticket = assigned[0]
+        limit = config.assignment(row.unit).open_tickets
+        for ticket in assigned:
             try:
                 ledger.check_ticket_pipeline(ticket["id"])
             except (OSError, ValueError, subprocess.CalledProcessError) as error:
-                waiting = next((item for item in opened if item["state"] == "checkpointed"), ticket)
-                return WaitingForMerge(waiting["id"], waiting["checkpoint"], f"footprint unknown: {error}")
+                return WaitingForMerge(ticket["id"], ticket["checkpoint"], f"footprint unknown: {error}")
             origin = ledger.ticket_origin(ticket["id"])
             if isinstance(origin, style_ledger.ApprovedProposal):
                 for issue in origin.issues:
                     style_proposals.proposal_command("start", str(issue))
             write_phase(ledger, ticket, plan, text)
-            ledger.clear_sync_wait(unit)
-            return Resumed(ticket["id"])
+            text = plan.read_text()
+        if isinstance(run, Path):
+            for ticket in assigned:
+                restore_ticket_worker(run, row.worktree, plan, ticket, ticket_paths(ledger, ticket, row.worktree))
+        waiting = tuple(ticket for ticket in opened if ticket["state"] == "checkpointed")
+        if len(waiting) >= 2:
+            ticket = waiting[0]
+            return WaitingForMerge(ticket["id"], ticket["checkpoint"], "two open tickets")
+        if opened:
+            try:
+                peers = tuple(waiting_checkpoint(ledger, ticket, row.branch, concurrent=bool(assigned) or len(opened) > 1)
+                              for ticket in opened)
+                first = next(iter(peers))
+                predecessor = (first if len(peers) == 1 else OpenTicketFootprints(
+                    first.ticket_id, first.commit, first.files, first.crates, peers))
+            except (OSError, ValueError, subprocess.CalledProcessError) as error:
+                ticket = next(iter(opened))
+                return WaitingForMerge(ticket["id"], ticket["checkpoint"], f"footprint unknown: {error}")
         try:
             tip = synced_tip(ledger)
         except style_ledger.LedgerError as error:
@@ -3008,6 +3299,22 @@ def next_phase(unit: str, plan: Path, repo: Path) -> NextPhase:
                 return WaitingForMerge(predecessor.ticket_id, predecessor.commit, f"footprint unknown: {changes_on_main.reason}")
             ledger.wait_for_sync(unit)
             return WaitingForSync(0, f"touched set unknown: {changes_on_main.reason}")
+        if assigned and changes_on_main.paths:
+            atomic_write(publication_path(row.worktree, "pending-sync"), (changes_on_main.pushed_tip + "\n").encode())
+            if len(assigned) >= limit:
+                ledger.clear_sync_wait(unit)
+                return Resumed(assigned[0]["id"])
+            ledger.wait_for_sync(unit)
+            return WaitingForSync(0, "main moved while tickets are assigned")
+        if publication_path(row.worktree, "pending-sync").exists():
+            if len(assigned) >= limit:
+                ledger.clear_sync_wait(unit)
+                return Resumed(assigned[0]["id"])
+            ledger.wait_for_sync(unit)
+            return WaitingForSync(0, "queued main sync")
+        if len(assigned) >= limit:
+            ledger.clear_sync_wait(unit)
+            return Resumed(assigned[0]["id"])
         # The catalog read above serves reconciliation and both refill passes.
         def select(busy: BusyFiles) -> PhaseWritten | NoAvailableWork | WaitingForStructure | MergeStyleBranchFirst | WaitingForSync | WaitingForMerge:
             try:
@@ -3056,6 +3363,38 @@ def next_phase(unit: str, plan: Path, repo: Path) -> NextPhase:
             if isinstance(selected, WaitingForStructure | WaitingForSync):
                 return selected
             return WaitingForSync(len(ledger.unclassified_rules()), families=selected.families)
+
+
+def next_phase(unit: str, plan: Path, repo: Path, run: Path | NoWorkerDispatch = _NO_WORKER_DISPATCH) -> NextPhase:
+    original = plan.expanduser().read_text()
+    if any("repair" in line.lower() and re.search(r"status:\s*todo", line)
+           for line in original.splitlines() if line.startswith("### Phase ")):
+        return RepairFirst()
+    config = style_config.config_for_unit(unit, staff.snapshot())
+    limit = config.assignment(unit).open_tickets
+    unit_id = str(next(row.staff_id for row in unit_worktrees(config.route.doc) if row.unit == unit))
+    with style_ledger.open_ledger(repo) as ledger:
+        resumed = tuple(ticket["id"] for ticket in ledger.ticket_open(unit_id) if ticket["state"] == "assigned")
+    written: list[str] = []
+    unclassified = 0
+    result = _next_phase(unit, plan, repo, run)
+    while isinstance(result, PhaseWritten):
+        written.append(result.ticket_id)
+        unclassified = max(unclassified, result.unclassified)
+        with style_ledger.open_ledger(repo) as ledger:
+            if isinstance(run, Path):
+                ticket = ledger.ticket_get(result.ticket_id)
+                worktree = plan.resolve().parents[3]
+                restore_ticket_worker(run, worktree, plan, ticket, ticket_paths(ledger, ticket, worktree))
+            assigned = sum(ticket["state"] == "assigned" for ticket in ledger.ticket_open(unit_id))
+        if assigned >= limit:
+            break
+        result = _next_phase(unit, plan, repo, run)
+    if limit == 1 and len(resumed) <= 1:
+        return PhaseWritten(written[0], unclassified) if written else result
+    if written or resumed and isinstance(result, Resumed):
+        return PhasesReady(tuple(written), resumed, max(unclassified, getattr(result, "unclassified", 0)))
+    return result
 
 
 class SplitRankExemptions(style_proposals.RankExemptions):
@@ -3281,7 +3620,7 @@ def split_line(unit: str, result: style_ledger.RecordedSplit, minutes: float) ->
 
 def refill_outcome(result: NextPhase) -> str:
     match result:
-        case PhaseWritten():
+        case PhaseWritten() | PhasesReady():
             return "phase written"
         case Resumed():
             return "resumed"
@@ -3311,12 +3650,22 @@ def main(argv: list[str]) -> int:
     _ = refill.add_argument("--unit", required=True)
     _ = refill.add_argument("--plan", type=Path, required=True)
     _ = refill.add_argument("--repo", type=Path, required=True)
+    _ = refill.add_argument("--session-dir", default="")
     ticket_gate = sub.add_parser("gate")
     _ = ticket_gate.add_argument("--repo", type=Path, required=True)
     _ = ticket_gate.add_argument("--ticket", required=True)
     verification = sub.add_parser("verify")
     _ = verification.add_argument("--repo", type=Path, required=True)
     _ = verification.add_argument("--ticket", required=True)
+    checkpoint = sub.add_parser("checkpoint")
+    _ = checkpoint.add_argument("--repo", type=Path, required=True)
+    _ = checkpoint.add_argument("--ticket", required=True)
+    _ = checkpoint.add_argument("--session-dir", required=True)
+    _ = checkpoint.add_argument("--phase", required=True)
+    _ = checkpoint.add_argument("--message-file", type=Path, required=True)
+    sync = sub.add_parser("sync-unit")
+    _ = sync.add_argument("--repo", type=Path, required=True)
+    _ = sync.add_argument("--unit", required=True)
     queue = sub.add_parser("queue")
     _ = queue.add_argument("--repo", type=Path, required=True)
     _ = queue.add_argument("--unit")
@@ -3337,6 +3686,11 @@ def main(argv: list[str]) -> int:
         print(split_line(args.unit, result, (time.monotonic() - began) / 60))
         return 0
     try:
+        if args.command == "checkpoint":
+            print(publish_checkpoint(args.repo, args.ticket, Path(args.session_dir), args.phase, args.message_file.read_text()))
+            return 0
+        if args.command == "sync-unit":
+            return sync_unit(args.repo, args.unit)
         if args.command == "gate":
             return gate(args.repo, args.ticket)
         if args.command == "verify":
@@ -3369,10 +3723,11 @@ def main(argv: list[str]) -> int:
                                                     scopes, base, options.first_files, definitions, cells):
                         print(f"{row.unit}: {ticket.kind} {ticket.crate} {ticket.rule or ','.join(ticket.rules)} — {len(ticket.files)} files: {', '.join(ticket.files)}")
             return 0
-        result = next_phase(args.unit, args.plan, args.repo)
+        result = (next_phase(args.unit, args.plan, args.repo, Path(args.session_dir)) if args.session_dir
+                  else next_phase(args.unit, args.plan, args.repo))
         style_ledger.record_refill(args.repo, args.unit, refill_outcome(result))
         # Catalog warnings still apply when a read can start immediately.
-        if isinstance(result, PhaseWritten | WaitingForSync | WaitingForStructure):
+        if isinstance(result, PhaseWritten | PhasesReady | WaitingForSync | WaitingForStructure):
             unclassified = result.unclassified
         else:
             unclassified = 0
@@ -3381,6 +3736,12 @@ def main(argv: list[str]) -> int:
         if isinstance(result, WaitingForSync | WaitingForMerge | WaitingForStructure | MergeStyleBranchFirst) and result.families:
             print("no available work: " + ", ".join(f"{item.family} {' '.join(item.reason.split())}" for item in result.families))
         match result:
+            case PhasesReady(written, resumed):
+                for ticket_id in resumed:
+                    print(f"resume {ticket_id}")
+                for ticket_id in written:
+                    print(f"phase written: {ticket_id}")
+                return 0
             case PhaseWritten(ticket_id):
                 print(f"phase written: {ticket_id}")
             case Resumed(ticket_id):
@@ -3418,6 +3779,9 @@ class PlanArguments(argparse.Namespace):
     files: list[str] = []
     reason: str = ""
     by: str = ""
+    session_dir: str = ""
+    phase: str = ""
+    message_file: Path = Path()
     timeout_minutes: float = 90
 
 

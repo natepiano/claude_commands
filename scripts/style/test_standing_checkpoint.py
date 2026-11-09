@@ -16,9 +16,11 @@ from pathlib import Path
 from unittest import mock
 from typing import cast, final, override
 
+from scripts.direct import phase_reservation
 from scripts.style import fake_fmt
-from scripts.style.style_child_test_support import style_cli_command
+from scripts.style.style_child_test_support import style_cli_command, unqueued_style_children
 from scripts.style import mechanical_classes
+from scripts.style import style_plan
 from scripts.style import style_ledger
 from scripts.style import style_footprint
 from scripts.style.ledger_test_support import write_style_units
@@ -173,6 +175,111 @@ class StandingCheckpointTests(unittest.TestCase):
                 result = self.cli("style_ledger.py", "record", "--repo", str(self.unit), "--rule", rule,
                                   "--path", path, "--commit", head, "--verdict", "clean", "--ticket", ticket["id"], "--worker", "test")
                 self.assertEqual(result.returncode, 0, result.stderr)
+
+    def parallel_tickets(self) -> tuple[style_ledger.TicketRecord, style_ledger.TicketRecord]:
+        write_style_units(self.doc, (StyleUnitAssignment("names", ("names", "values", "types", "modules"), 2),))
+        _ = self.enterContext(unqueued_style_children())
+        self.env["SCRATCH_COPIES_ROOT"] = str(self.root / "copies")
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, self.env)))
+        result = self.refill()
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        with style_ledger.open_ledger(self.unit) as ledger:
+            first, second = ledger.ticket_open(unit_staff_id("names"))
+        for ticket in (first, second):
+            self.record_ticket_verdicts(ticket)
+        return first, second
+
+    def publish(self, ticket: str) -> str:
+        return style_plan.publish_checkpoint(self.unit, ticket, self.root / "run", ticket, "Checkpoint test\n")
+
+    def test_publication_preserves_partial_sibling_bytes_and_index_entries(self) -> None:
+        first, second = self.parallel_tickets()
+        own, sibling = first["files"][0], second["files"][0]
+        self.write(self.unit / own, "fn value() -> usize {\n        1\n}\n")
+        self.write(self.unit / sibling, "fn unfinished(\n")
+        _ = self.git(self.unit, "add", sibling)
+        self.write(self.unit / sibling, "fn unfinished( with_more_bytes\n")
+        extra = str(Path(sibling).parent / "partial.rs")
+        self.write(self.unit / extra, "fn partial(\n")
+        before_entry = self.git(self.unit, "ls-files", "--stage", "--", sibling)
+        before_bytes = {path: (self.unit / path).read_bytes() for path in (sibling, extra)}
+        def verify_source(tree: Path, stage: str, package: str) -> subprocess.CompletedProcess[bytes]:
+            self.assertNotEqual(tree, self.unit)
+            self.assertEqual((tree / sibling).read_text(), "fn value() -> usize {\n    1\n}\n")
+            self.assertFalse((tree / extra).exists())
+            return subprocess.CompletedProcess([stage, package], 0)
+        with mock.patch.object(style_plan, "run_verification_step", side_effect=verify_source) as verify:
+            checkpoint = self.publish(first["id"])
+        self.assertEqual(self.git(self.unit, "rev-parse", "HEAD"), checkpoint)
+        self.assertEqual(self.git(self.unit, "diff-tree", "--no-commit-id", "--name-only", "-r", checkpoint), own)
+        self.assertEqual(self.git(self.unit, "ls-files", "--stage", "--", sibling), before_entry)
+        self.assertEqual({path: (self.unit / path).read_bytes() for path in before_bytes}, before_bytes)
+        self.assertEqual(self.git(self.unit, "diff", "--cached", "--name-only", "--", own), "")
+        self.assertEqual([call.args[1] for call in verify.call_args_list], ["check", "lint", "test", "doc"])
+        trees = {call.args[0] for call in verify.call_args_list}
+        self.assertEqual(len(trees), 1)
+        self.assertNotIn(self.unit, trees)
+
+    def test_lower_capacity_keeps_existing_tickets_on_candidate_sources(self) -> None:
+        first, second = self.parallel_tickets()
+        write_style_units(self.doc, (StyleUnitAssignment("names", ("names", "values", "types", "modules")),))
+        self.write(self.unit / first["files"][0], "fn value() -> usize {\n        1\n}\n")
+        self.write(self.unit / second["files"][0], "fn unfinished(\n")
+        with style_ledger.open_ledger(self.unit) as ledger:
+            self.assertTrue(style_plan.isolated_ticket_source(ledger, first))
+        self.assertEqual(style_plan.gate(self.unit, first["id"]), 0)
+
+    def test_publication_recovers_a_crash_before_branch_movement(self) -> None:
+        first, _ = self.parallel_tickets()
+        path = first["files"][0]
+        self.write(self.unit / path, "fn value() -> usize {\n        1\n}\n")
+        before = self.git(self.unit, "rev-parse", "HEAD")
+        with mock.patch.object(style_plan, "run_verification_step", return_value=subprocess.CompletedProcess([], 0)), \
+                mock.patch.object(style_plan, "complete_publication", side_effect=RuntimeError("crash")):
+            with self.assertRaisesRegex(RuntimeError, "crash"):
+                _ = self.publish(first["id"])
+        self.assertEqual(self.git(self.unit, "rev-parse", "HEAD"), before)
+        journal = style_plan.publication_path(self.unit, "publication.json")
+        pending = cast(dict[str, str], json.loads(journal.read_text()))["commit"]
+        self.assertEqual(self.publish(first["id"]), pending)
+        self.assertFalse(journal.exists())
+        self.assertEqual(self.git(self.unit, "rev-list", "--count", before + "..HEAD"), "1")
+
+    def test_publication_recovers_after_branch_movement_and_releases_at_its_checkpoint(self) -> None:
+        first, second = self.parallel_tickets()
+        self.write(self.unit / first["files"][0], "fn value() -> usize {\n        1\n}\n")
+        directory = phase_reservation.phase_directory(self.root / "run", first["id"])
+        directory.mkdir(parents=True)
+        state = {"kind": phase_reservation.ACTIVE, "active_phase_reservation": {"reservation_id": "a"}}
+        self.write(directory / phase_reservation.STATE_FILE, json.dumps(state))
+        with mock.patch.object(style_plan, "run_verification_step", return_value=subprocess.CompletedProcess([], 0)), \
+                mock.patch.object(style_plan, "update_ticket_index", side_effect=RuntimeError("crash")):
+            with self.assertRaisesRegex(RuntimeError, "crash"):
+                _ = self.publish(first["id"])
+        checkpoint = self.git(self.unit, "rev-parse", "HEAD")
+        released: list[str] = []
+        def release(phase_dir: Path, ticket: str, merged: str) -> str:
+            self.assertEqual(ticket, first["id"])
+            self.assertEqual(self.git(self.unit, "rev-parse", "HEAD"), checkpoint)
+            self.assertEqual(merged, checkpoint)
+            released.append(ticket)
+            _ = phase_reservation.clear(phase_dir, checkpoint, self.unit)
+            return "a"
+        with mock.patch.object(phase_reservation, "release_held", side_effect=release):
+            self.assertEqual(self.publish(first["id"]), checkpoint)
+        self.assertEqual(released, [first["id"]])
+        with style_ledger.open_ledger(self.unit) as ledger:
+            self.assertEqual(ledger.ticket_get(second["id"])["state"], "assigned")
+
+    def test_publication_follows_finish_order(self) -> None:
+        first, second = self.parallel_tickets()
+        for ticket in (first, second):
+            self.write(self.unit / ticket["files"][0], "fn value() -> usize {\n        1\n}\n")
+        with mock.patch.object(style_plan, "run_verification_step", return_value=subprocess.CompletedProcess([], 0)):
+            second_commit = self.publish(second["id"])
+            first_commit = self.publish(first["id"])
+        self.assertEqual(self.git(self.unit, "rev-parse", first_commit + "^"), second_commit)
+        self.assertEqual(self.git(self.unit, "diff-tree", "--no-commit-id", "--name-only", "-r", first_commit), first["files"][0])
 
     def test_ticket_candidate_excludes_staged_unstaged_and_untracked_sibling_work(self) -> None:
         own = "alpha/src/lib.rs"

@@ -95,29 +95,25 @@ Loop/verbose only:
    says drift requires a live session mapping, active coordination-run marker,
    or `CARGO_BERTH_RUN`. Exit `6` has already spent the engine's single
    ten-second deadline: invoke no retry.
-6. **Standing plans:** rerun the ticket's
-   `~/.claude/scripts/lib/py ~/.claude/scripts/style/style_plan.py gate --repo . --ticket <id>`
-   before staging. Exit 1 is a review: it retains the reservation and returns
-   to repair. Exit 2 means the gate could not run (`error: <reason>`, such as a
-   locked ledger): retain the reservation, do not repair, and rerun the gate.
-   If the same error comes back, stop and report it.
-   On exit 0, stage only this phase's code paths from
-   `git status --porcelain`, handling renamed paths as pairs; never name the
-   plan doc, `docs/style-production/` or pinned rule files in `git add`.
-   Commit exactly the gated tree once using the message below, then capture
-   and persist its full id through the durable transition below, adding
-   `--ticket <ticket>`: the record then holds the reservation for that
-   ticket's merge, and this checkpoint releases nothing. Before marking
-   the phase done, run
-   `~/.claude/scripts/lib/py ~/.claude/scripts/style/style_ledger.py ticket checkpoint --repo . --id <ticket> --commit <captured code commit> --session-dir "${SESSION_DIR}" --phase <phase id>`.
-   The ledger keeps the run folder and phase, and `ticket merge` releases the
-   held reservation from them. berth's release counts when its protected tip
-   is the checkpoint, or a later commit of the unit's branch, such as a merge
-   of style/main, that the style branch tip contains.
-   If recording fails, retain the commit and reservation, repair the ticket
-   record, and do not create another commit.
+6. **Standing plans:** write the checkpoint message below to a file.
+   Run the publication coordinator:
+   `~/.claude/scripts/lib/py ~/.claude/scripts/style/style_plan.py checkpoint --repo . --ticket <ticket> --session-dir "${SESSION_DIR}" --phase <phase id> --message-file <message file>`.
+   The coordinator gates the ticket's candidate and publishes it with an expected-HEAD update.
+   It updates only the ticket's index entries and records the checkpoint.
+   It releases the reservation while HEAD names that checkpoint.
+   The next publication waits for release confirmation.
+   Other workers continue to edit their assigned paths.
+   With N=1 and one assigned ticket, the gate and verification use the editing tree.
+   Otherwise, they use the unit's reused candidate copy.
+   Keep the ledger and approval documents in the original repository.
+   Never stage the plan, `docs/style-production/`, or pinned rule files.
+   On failure, retain the reservation and repeat the same coordinator command after repair.
+   A retained publication record completes the same checkpoint without another commit.
+   Before refill, use `next-phase --session-dir "${SESSION_DIR}"` to restore every ticket's phase and worker.
+   Use `style_plan.py sync-unit --repo . --unit <unit>` for a main merge.
+   Pending sync stops new assignments while assigned workers finish.
 
-   **No-change standing ticket:** with every cell recorded `clean`, `exception`
+   **N=1 no-change standing ticket:** with one assigned ticket and every cell recorded `clean`, `exception`
    or `held` at the unit's HEAD and no tracked diff, make no commit. Capture
    `git rev-parse HEAD` once and require
    `git merge-base --is-ancestor <captured HEAD> refs/heads/<style merge branch>`.
@@ -255,14 +251,12 @@ Loop/verbose only:
    durable state remains.
 7. Read and validate the durable record again.
 
-   For a standing ticket with a pending release record, finish any interrupted
-   `ticket checkpoint` using that record's `checkpoint_commit` before marking
-   the phase done; repeating the same checkpoint is safe.
+   For a standing ticket with a retained publication record, repeat the coordinator command before marking the phase done.
    A no-change ticket is already `merged` and needs no repeated transition.
 
    | State | Action |
    | --- | --- |
-   | `CheckpointCommittedAwaitingReleaseConfirmation` naming `held_for_ticket` | A standing ticket's reservation stays held: invoke no release and keep the record. `style_ledger.py ticket merge` releases it. Mark the phase done and continue at step 8. |
+   | `CheckpointCommittedAwaitingReleaseConfirmation` naming `held_for_ticket` | Repeat the standing ticket coordinator command. Mark the phase done after release confirmation. |
    | `CheckpointCommittedAwaitingReleaseConfirmation` | Read its reservation id and `checkpoint_commit` from the read-back `CheckpointReleaseConfirmationPending`, then invoke `/sync release` exactly once. |
    | No record, and `reservation_released` names the checkpoint | A no-change ticket's merge released it: invoke no release. |
    | `Active` | Step 6's durable transition did not complete: do not invoke release; apply <RetainPhaseReservation/>. |
